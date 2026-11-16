@@ -5,21 +5,28 @@
 //! idempotent upsert, so `rebuild` and incremental convergence never duplicate
 //! rows (GC-DM-01).
 
-use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
+use sea_orm::{ConnectionTrait, DatabaseConnection, Statement, TransactionTrait};
 
 use super::{episode::Episode, error::MemoryError};
 
+/// Publish the complete batch atomically, including every evidence and path row.
+/// A failed write leaves the previously committed projection unchanged.
 pub async fn project_episodes(
     conn: &DatabaseConnection,
     episodes: &[Episode],
 ) -> Result<(), MemoryError> {
+    let transaction = conn.begin().await?;
     for episode in episodes {
-        project_episode(conn, episode).await?;
+        project_episode(&transaction, episode).await?;
     }
+    transaction.commit().await?;
     Ok(())
 }
 
-async fn project_episode(conn: &DatabaseConnection, episode: &Episode) -> Result<(), MemoryError> {
+async fn project_episode<C: ConnectionTrait>(
+    conn: &C,
+    episode: &Episode,
+) -> Result<(), MemoryError> {
     let backend = conn.get_database_backend();
     conn.execute_raw(Statement::from_sql_and_values(
         backend,
@@ -129,44 +136,50 @@ pub struct RebuildReport {
 /// `memory_projection_state` row (GC-DM-01). The projection domain equals the
 /// horizon window; rows whose change is no longer in the window are aged out,
 /// and rows that no longer satisfy the terminal predicate are revoked.
+/// Source-read or publication errors preserve the previous committed projection
+/// and its state; no partially rebuilt generation is left in storage.
 pub async fn rebuild(
     conn: &DatabaseConnection,
     repo_id: &str,
     horizon: usize,
 ) -> Result<RebuildReport, MemoryError> {
-    use sea_orm::{Statement, Value};
+    // Finish source reads before replacing any committed projection. Publishing
+    // rows and their state together also rolls back a late persistence failure.
+    let episodes = derive_commit_episodes(conn, repo_id, horizon).await?;
+    let operations = commit_operations(conn, repo_id).await?;
+    let transaction = conn.begin().await?;
 
-    // Clear the repo's project rows so rebuild converges on the horizon window.
+    // Clear the repo's projected rows so rebuild converges on the horizon window.
     for (table, has_episode_id) in [
         ("memory_episode_path", true),
         ("memory_episode_evidence", true),
     ] {
         if has_episode_id {
-            conn.execute_raw(Statement::from_sql_and_values(
-                conn.get_database_backend(),
-                format!(
-                    "DELETE FROM `{table}` WHERE `{table}`.episode_id IN \
+            transaction
+                .execute_raw(Statement::from_sql_and_values(
+                    transaction.get_database_backend(),
+                    format!(
+                        "DELETE FROM `{table}` WHERE `{table}`.episode_id IN \
                      (SELECT episode_id FROM `memory_episode` WHERE repo_id = ?)"
-                ),
-                [repo_id.to_string().into()],
-            ))
-            .await?;
+                    ),
+                    [repo_id.to_string().into()],
+                ))
+                .await?;
         }
     }
-    conn.execute_raw(Statement::from_sql_and_values(
-        conn.get_database_backend(),
-        "DELETE FROM `memory_episode` WHERE `repo_id` = ?",
-        [repo_id.to_string().into()],
-    ))
-    .await?;
+    transaction
+        .execute_raw(Statement::from_sql_and_values(
+            transaction.get_database_backend(),
+            "DELETE FROM `memory_episode` WHERE `repo_id` = ?",
+            [repo_id.to_string().into()],
+        ))
+        .await?;
 
-    let episodes = derive_commit_episodes(conn, repo_id, horizon).await?;
     let projected = episodes.len();
     for episode in &episodes {
-        project_episode(conn, episode).await?;
+        project_episode(&transaction, episode).await?;
     }
 
-    let operations = commit_operations(conn, repo_id).await?;
     let fingerprint = commit_fingerprint(&operations);
     let horizon_truncated = projected >= horizon;
     let report = RebuildReport {
@@ -177,24 +190,25 @@ pub async fn rebuild(
         aged_out_count: 0,
     };
 
-    conn.execute_raw(Statement::from_sql_and_values(
-        conn.get_database_backend(),
-        "INSERT OR REPLACE INTO `memory_projection_state` \
+    transaction
+        .execute_raw(Statement::from_sql_and_values(
+            transaction.get_database_backend(),
+            "INSERT OR REPLACE INTO `memory_projection_state` \
          (`repo_id`, `source_kind`, `cursor_json`, `fingerprint`, `rules_version`, \
           `schema_version`, `horizon_truncated`, `revoked_count`, `aged_out_count`, \
           `rebuilt_at`) VALUES (?, 'commit', '{}', ?, 1, 1, ?, ?, ?, \
           CAST(strftime('%s','now') AS INTEGER))",
-        [
-            repo_id.to_string().into(),
-            fingerprint.into(),
-            i64::from(horizon_truncated).into(),
-            report.revoked_count.into(),
-            report.aged_out_count.into(),
-        ],
-    ))
-    .await?;
+            [
+                repo_id.to_string().into(),
+                fingerprint.into(),
+                i64::from(horizon_truncated).into(),
+                report.revoked_count.into(),
+                report.aged_out_count.into(),
+            ],
+        ))
+        .await?;
 
-    let _: Value = Value::Int(Some(0));
+    transaction.commit().await?;
     Ok(report)
 }
 
@@ -261,4 +275,169 @@ async fn commit_operations<C: sea_orm::ConnectionTrait>(
         .into_iter()
         .map(|op| (op.op_id, op.status, op.end_ts))
         .collect())
+}
+
+#[cfg(test)]
+mod atomicity_tests {
+    use sea_orm::{Database, DatabaseConnection, DbBackend};
+
+    use super::*;
+    use crate::internal::ai::memory::{EvidenceEdge, Outcome, PathRow, SourceKind, content_digest};
+
+    async fn database() -> DatabaseConnection {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        db.execute_unprepared("PRAGMA foreign_keys = ON")
+            .await
+            .unwrap();
+        db.execute_unprepared(include_str!(
+            "../../../../sql/migrations/2026092901_memory_core.sql"
+        ))
+        .await
+        .unwrap();
+        db.execute_unprepared(include_str!(
+            "../../../../sql/migrations/2026092902_memory_path_search.sql"
+        ))
+        .await
+        .unwrap();
+        db
+    }
+
+    fn episode(key: &str) -> Episode {
+        let mut episode = Episode {
+            episode_id: Episode::compute_episode_id("repo", SourceKind::Commit, key),
+            repo_id: "repo".to_string(),
+            source_kind: SourceKind::Commit,
+            source_key: key.to_string(),
+            outcome: Outcome::Succeeded,
+            actor: None,
+            started_at: 1,
+            ended_at: 2,
+            anchor_commit: None,
+            change_id: None,
+            title: format!("old {key}"),
+            body: "original".to_string(),
+            content_digest: String::new(),
+            producer: "derived-v1",
+            rules_version: 1,
+            evidence: vec![EvidenceEdge {
+                kind: "commit".to_string(),
+                ref_id: "source".to_string(),
+                link_confidence: "identity".to_string(),
+                resolution_status: "resolved".to_string(),
+            }],
+            paths: vec![PathRow {
+                code_path: b"src/lib.rs".to_vec(),
+                change_kind: "modified".to_string(),
+                blob_oid_at_end: Some("original-blob".to_string()),
+                ended_at: 2,
+            }],
+        };
+        episode.content_digest = content_digest(&episode);
+        episode
+    }
+
+    async fn snapshot(db: &DatabaseConnection) -> Vec<String> {
+        let mut rows = Vec::new();
+        for sql in [
+            "SELECT episode_id || ':' || title || ':' || body || ':' || content_digest AS value FROM memory_episode ORDER BY episode_id",
+            "SELECT episode_id || ':' || ordinal || ':' || ref_id AS value FROM memory_episode_evidence ORDER BY episode_id, ordinal",
+            "SELECT episode_id || ':' || hex(code_path) || ':' || change_kind || ':' || COALESCE(blob_oid_at_end, '') AS value FROM memory_episode_path ORDER BY episode_id, code_path",
+            "SELECT episode_id || ':' || title || ':' || body || ':' || paths_text AS value FROM memory_episode_search_doc ORDER BY episode_id",
+            "SELECT repo_id || ':' || source_kind || ':' || fingerprint || ':' || rebuilt_at AS value FROM memory_projection_state ORDER BY repo_id, source_kind",
+        ] {
+            rows.push(sql.to_string());
+            for row in db
+                .query_all_raw(Statement::from_string(DbBackend::Sqlite, sql))
+                .await
+                .unwrap()
+            {
+                rows.push(row.try_get("", "value").unwrap());
+            }
+        }
+        rows
+    }
+
+    async fn seed(db: &DatabaseConnection) {
+        project_episodes(db, &[episode("saved")]).await.unwrap();
+        db.execute_unprepared("INSERT INTO memory_episode_search_doc (episode_id, title, body, paths_text) SELECT episode_id, title, body, 'src/lib.rs' FROM memory_episode").await.unwrap();
+        db.execute_unprepared("INSERT INTO memory_projection_state VALUES ('repo', 'commit', '{}', 'previous-generation', 1, 1, 0, 0, 0, 123)").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_batch_restores_replaced_episode_and_children() {
+        let db = database().await;
+        seed(&db).await;
+        let before = snapshot(&db).await;
+        let mut replacement = episode("saved");
+        replacement.title = "replacement".to_string();
+        replacement.evidence[0].ref_id = "new-source".to_string();
+        replacement.paths[0].blob_oid_at_end = Some("new-blob".to_string());
+        replacement.content_digest = content_digest(&replacement);
+        let mut invalid = episode("invalid");
+        invalid.paths[0].change_kind = "invalid-kind".to_string();
+        let error = project_episodes(&db, &[replacement, invalid])
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("CHECK constraint failed"),
+            "must reach the invalid path write, got {error}"
+        );
+        assert_eq!(
+            snapshot(&db).await,
+            before,
+            "a rejected batch must leave the complete prior projection intact"
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_batch_replaces_children_without_leaving_old_edges() {
+        let db = database().await;
+        seed(&db).await;
+        let mut replacement = episode("saved");
+        replacement.evidence.clear();
+        replacement.paths.clear();
+        replacement.title = "replacement".to_string();
+        replacement.content_digest = content_digest(&replacement);
+        project_episodes(&db, &[replacement]).await.unwrap();
+        let current = super::super::reader::list_episodes(&db, "repo")
+            .await
+            .unwrap();
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0].title, "replacement");
+        assert!(current[0].evidence.is_empty());
+        assert!(current[0].paths.is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_source_read_keeps_previous_generation() {
+        let db = database().await;
+        seed(&db).await;
+        let before = snapshot(&db).await;
+        // This fixture intentionally lacks change_revision: a source-read error
+        // must not delete a previously successful projection.
+        let error = rebuild(&db, "repo", 100).await.unwrap_err();
+        assert!(
+            matches!(&error, MemoryError::Change(_)),
+            "must reach the source read, got {error}"
+        );
+        assert_eq!(snapshot(&db).await, before);
+    }
+
+    #[tokio::test]
+    async fn failed_state_publication_rolls_back_projection_deletes() {
+        let db = database().await;
+        seed(&db).await;
+        // A valid empty source window needs no Git object reads.
+        db.execute_unprepared("CREATE TABLE change_identity (change_id TEXT, repo_id TEXT); CREATE TABLE change_revision (change_id TEXT, commit_oid TEXT, created_op_id TEXT, visibility TEXT, revision_ordinal INTEGER); CREATE TABLE ai_operation_link (operation_id TEXT PRIMARY KEY, change_id TEXT, session_id TEXT, run_id TEXT, tool_invocation_id TEXT, intent_id TEXT, repo_id TEXT, worktree_id TEXT, workspace_id TEXT, lease_generation INTEGER, config_provenance_digest TEXT, redaction_version TEXT)").await.unwrap();
+        db.execute_unprepared("CREATE TRIGGER reject_state BEFORE INSERT ON memory_projection_state BEGIN SELECT RAISE(ABORT, 'injected state publication failure'); END").await.unwrap();
+        let before = snapshot(&db).await;
+        let error = rebuild(&db, "repo", 100).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("injected state publication failure"),
+            "must reach the publication failure, got {error}"
+        );
+        assert_eq!(snapshot(&db).await, before);
+    }
 }

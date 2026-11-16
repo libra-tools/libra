@@ -32,6 +32,8 @@ with `LBR-MEMORY-001` unless you pass `--allow-stale`. With `--allow-stale`
 the JSON envelope marks `"stale": true` and human output prints a banner; with
 it unset, the projection is refreshed on the next `libra memory rebuild`.
 
+A rebuild derives its input before replacing the stored projection. Episode, evidence, path, and projection-state writes commit in one transaction. If source loading or persistence fails, the last committed projection and its state remain available; the usual freshness checks still apply. Fix the reported error and retry `libra memory rebuild`.
+
 ## Subcommands
 
 | Subcommand | Description |
