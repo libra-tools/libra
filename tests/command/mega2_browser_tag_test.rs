@@ -275,7 +275,7 @@ fn t_opens_the_panel_and_asks_for_page_one_only() {
 }
 
 #[tokio::test]
-async fn open_fetch_is_one_anonymous_get() {
+async fn open_fetch_is_one_token_bearing_get() {
     let server = MockTagServer::start(1);
     let tag_client = client(&server, true);
     let mut state = state(&server);
@@ -290,9 +290,10 @@ async fn open_fetch_is_one_anonymous_get() {
     for key in ["page=1", "per_page=20", "path=%2F"] {
         assert!(captured.target.contains(key), "{}", captured.target);
     }
-    assert!(
-        !captured.headers.contains_key("authorization"),
-        "list stays anonymous"
+    assert_eq!(
+        captured.headers.get("authorization").map(String::as_str),
+        Some("Bearer tok"),
+        "list carries the optional session token"
     );
     let panel = state.panel.as_ref().expect("panel");
     assert_eq!(panel.total, 1);
