@@ -247,7 +247,7 @@ Libra 当前 AI 对象更偏向工作流执行：Intent、Plan、Task、Run、Pa
 
 `research-git` 的 symbol mapping 只覆盖 Python top-level function/class（`astmap.py`），`toggles.py` 的注释开关也只识别 Python `#`——窄，但 capture→recall→regenerate 闭环完整。
 
-Libra 这边的事实需要更新：它**已经有** tree-sitter 符号抽取器（`tools/semantic/extractor.rs`，Rust grammar，输出带 kind/scope/range/confidence 的 `SemanticSymbol`）。所以“缺 symbol slice service”是高估——但也不要读成“已备第二语言”：`Cargo.toml:125-127` 虽挂了 `tree-sitter` / `tree-sitter-bash` / `tree-sitter-rust`，**bash grammar 的唯一使用者是 `src/internal/ai/sandbox/command_safety.rs:11`（shell 命令安全解析），与符号抽取无关**；`SemanticLanguage` 仍只有 `Rust` 一个变体，`language_for_path` 只认 `.rs`，`query/` 下只有 `rust.scm`。真实差距是：
+Libra 这边的事实需要更新：它**已经有** tree-sitter 符号抽取器（`tools/semantic/extractor.rs`，Rust grammar，输出带 kind/scope/range/confidence 的 `SemanticSymbol`）。所以“缺 symbol slice service”是高估——但也不要读成“已备第二语言”：直接依赖只保留仍被引用的 `tree-sitter` / `tree-sitter-bash`（未使用的 `tree-sitter-rust` 已移除）。**bash grammar 的唯一使用者是 `src/internal/ai/sandbox/command_safety.rs:11`（shell 命令安全解析），与符号抽取无关**；`SemanticLanguage` 仍只有 `Rust` 一个变体，`language_for_path` 只认 `.rs`，`query/` 下只有 `rust.scm`。真实差距是：
 
 1. 把现有 extractor 从 Rust 扩到 TS/Python/Markdown/SQL（多 grammar 或 LSP 路线）。
 2. 把它包成一个 capsule 用得上的 **slice/anchor 服务**（给定 diff hunk → (file, symbol, anchor, code, kind)）。

@@ -1422,7 +1422,7 @@ fn record_objects_storage_ambient_discovery() {
 
 /// Resolve object storage for a caller that can handle configuration failure.
 ///
-/// This does not read or write [`OBJECTS_STORAGE_CACHE`]. [`try_objects_storage`]
+/// This does not read or write `OBJECTS_STORAGE_CACHE`. [`try_objects_storage`]
 /// remains the cached entry. A rejected configuration is not inserted.
 pub fn resolve_configured_objects_storage()
 -> Result<ClientStorage, crate::utils::client_storage::StorageConfigFailure> {
