@@ -58,6 +58,8 @@ Nowledge 定向检索已尝试，服务连接被环境阻止；本计划依据�
 
 ### SP-09 审计记录交付收口（EX-SP-09-CLOSE-01）
 
+**依赖与文档 warning 清理（2026-11-16 12:22 UTC）：** homepage 现为 `https://libra.tools`。未使用的五个直接依赖已删除，`sea-bae` 0.2.2 去掉 `proc-macro-error2` warning，私有 rustdoc 链接改为纯文本。本地全 target check、严格 Clippy、denied private-link rustdoc 均无 warning。这不改变冻结性能矩阵，也不代表整轮性能审计完成。
+
 **rustdoc 断链跟进（2026-11-16 09:33 UTC）：** `e39e86f` 的 CI `compat-clippy` 在文档步骤失败，唯一错误是 `v2/fetch.rs` 链接私有函数 `command::fetch::read_fetch_stream_for_kind`。已去掉链接、保留函数名。本地带 `-D rustdoc::broken_intra_doc_links` 的 `cargo doc --no-deps --all-features` exit0。四个 private-link warning 仍在，当前门不拒绝。全量结果以新 head 的实际 CI 为准。
 
 **PR #1058 CI 恢复（2026-11-16 07:39 UTC）：** 已同步 `origin/main` `4e53393aef9480e2b510e1fe2371977a09783920`，保留原 SP-09 审计及上游状态记录。历史 `compat-scoped-input-windows` 的实际编译错误是 `tests/command/agent_roster_test.rs` 无条件使用 Unix `Permissions::from_mode`；`compat-owner-liveness-macos` 在首个精确测试冷构建 53m40s 后被 60 分钟作业取消。两者已由上游 `292e5edf7`、`36323df63` 修复，随后 `0520d8061` 按维护者指令移除平台与 live job；本次沿用该现行 workflow，不恢复已移除作业，也不把移除记为测试通过。当前 main run `43787918610` 的 rustfmt、`collapsible_if` 与四项协议测试失败已在本 head 修复：仓外协议版本读取使用 `ConfigKv::get_best_effort`，强制 legacy 的 v2-only 广告在 pull 保持 `LBR-NET-002`。仓外 focused 32/32、nightly fmt 与严格 Clippy 均 exit0；本机全量 nextest 保持 not-run。最终 head CI 与合并回执待实际运行后回填。原性能数据仍绑定冻结候选，旧失败记录保留；本次不代表整轮性能审计、最终 ER-05 或延期发布/网站事项完成。

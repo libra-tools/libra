@@ -68,7 +68,7 @@ pub struct FetchResponse {
 /// Build the pkt-line body of a v2 `fetch` request.
 ///
 /// `depth` and `shallow` require the server's `fetch=shallow` feature; without
-/// it the request fails typed ([`MissingShallowCapability`]) before any bytes
+/// it the request fails typed (`MissingShallowCapability`) before any bytes
 /// are sent, mirroring the v0 capability check.
 pub fn build_request(
     advertisement: &Advertisement,
@@ -237,7 +237,7 @@ fn trim_newline(payload: &[u8]) -> &[u8] {
 /// Parse a complete v2 fetch response body.
 ///
 /// Used by unit tests and by callers that buffer the whole response; the
-/// streaming path shares [`SectionReader`] with [`adapt_response_stream`].
+/// streaming path shares `SectionReader` with [`adapt_response_stream`].
 pub fn parse_response(mut body: Bytes) -> Result<FetchResponse, io::Error> {
     let mut reader = SectionReader::default();
     while !body.is_empty() {
