@@ -3,6 +3,7 @@
 mod builder;
 mod genealogy;
 mod identity;
+pub mod import;
 mod resolve;
 mod store;
 mod workflows;
