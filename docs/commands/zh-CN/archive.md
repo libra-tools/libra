@@ -67,7 +67,9 @@ libra archive --add-file=RELEASE_NOTES.txt -o release.tar HEAD
 
 成功时，`libra archive` 会把归档字节写到 stdout，或写到 `--output <FILE>` 指定的路径。它不会额外打印成功消息。
 
-Tar 归档会保留普通文件、可执行文件 mode、符号链接、嵌套路径、空文件和 Unicode 文件名。Zip 归档会先在内存中构建，因为 zip writer 需要可 seek 输出，然后再刷新到请求的目标。
+Tar 归档会保留普通文件、可执行文件 mode、符号链接、嵌套路径、空文件和 Unicode 文件名。当归档路径（应用 `--prefix` 后）或符号链接目标超过固定 header 的 100-byte 字段时，`tar`、`tar.gz` 和 `tar.bz2` writer 会使用 GNU LongName/LongLink 扩展。常见 tar reader 可以列出并解出完整逻辑名称与目标，不会因该固定字段限制而拒绝它们；仓库、输入规模与宿主文件系统限制仍然适用。这种可互通的 GNU 编码不承诺与 `git archive` 的 pax header 逐 byte 相同。
+
+Zip 归档会先在内存中构建，因为 zip writer 需要可 seek 输出，然后再刷新到请求的目标。
 
 ## 错误处理
 

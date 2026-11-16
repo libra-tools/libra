@@ -8,10 +8,12 @@
 
 ```
 libra config <subcommand> [options]
-libra config set [--global | --system] [--add] [--encrypt] [--plaintext] [--stdin] <key> [<value>]
-libra config get [--global | --system] [--all] [--reveal] [--regexp] [-d <default>] <key>
-libra config list [--global | --system] [--name-only] [--show-origin] [--vault] [--ssh-keys] [--gpg-keys]
-libra config unset [--global | --system] [--all] <key>
+libra config set [--global | --system] [--add | --append] [--all] [--value <pattern>] [--fixed-value] [--encrypt] [--plaintext] [--stdin] <key> [<value>]
+libra config get [--global | --system] [--all] [--reveal] [--regexp] [--value <pattern>] [--fixed-value] [--show-origin] [--show-scope] [-d <default>] <key>
+libra config list [--global | --system] [--name-only] [--show-origin] [--show-scope] [--vault] [--ssh-keys] [--gpg-keys]
+libra config unset [--global | --system] [--all] [--value <pattern>] [--fixed-value] <key>
+libra config rename-section [--global | --system] <old> <new>
+libra config remove-section [--global | --system] <name>
 libra config import [--global]
 libra config path [--global | --system]
 libra config generate-ssh-key --remote <name>
@@ -251,6 +253,13 @@ attestation；这也不是完整健康诊断。默认 doctor 的只读报告与 
 | `--encrypt` | 即使 key 不匹配敏感 key 启发式，也强制 vault 加密 |
 | `--plaintext` | 新键即使看起来敏感也以明文存储；拒绝替换已有加密值或 vault 内部／secret 键 |
 | `--stdin` | 从 stdin 读取值，而不是位置参数（适合在 CI/CD 中管道传 secrets） |
+| `--all` | 替换该 key 的所有既有值（Git `config set --all` / `--replace-all`） |
+| `--value <pattern>` | 只替换匹配该模式的值（默认正则；配合 `--fixed-value` 为逐字节比较） |
+| `--fixed-value` | 将 value-pattern 视为字面字节串而非正则 |
+| `--append` | Git 2.46+ 拼写；`--add` 的别名 |
+
+`rename-section <old> <new>` 与 `remove-section <name>` 也可作为子命令使用，与 legacy
+`--rename-section` / `--remove-section` 等价。
 
 `set` 替换普通的已加密键时，会使用所选 local 或 global 作用域的 vault 保持值加密，
 包括 ASCII 大小写回退。精确键优先于其他拼写；精确键有多个值时仍需先 `unset-all`
@@ -290,6 +299,10 @@ libra config set vault.env.GEMINI_API_KEY
 | `--reveal` | 对加密条目显示实际解密值（会阻止内部 vault 凭据，如 `vault.roottoken_enc`） |
 | `--regexp` | 将 `<key>` 视为正则表达式，并返回所有匹配条目 |
 | `-d`, `--default <value>` | key 未找到时返回此值（而不是报错） |
+| `--value <pattern>` | 只返回匹配该模式的值（默认正则；配合 `--fixed-value` 为逐字节比较） |
+| `--fixed-value` | 将 value-pattern 视为字面字节串而非正则 |
+| `--show-origin` | 为每条记录添加来源前缀（`file:<数据库路径>`） |
+| `--show-scope` | 为每条记录添加作用域前缀（`local`、`global` 或 `system`） |
 
 ```bash
 # 简单 get
@@ -345,6 +358,8 @@ libra config list --ssh-keys
 | 标志 | 说明 |
 |------|------|
 | `--all` | 移除该 key 的所有值（用于多值 key） |
+| `--value <pattern>` | 只移除匹配该模式的值（默认正则；配合 `--fixed-value` 为逐字节比较） |
+| `--fixed-value` | 将 value-pattern 视为字面字节串而非正则 |
 
 ```bash
 # 移除一个 key
@@ -485,17 +500,17 @@ libra config remove-gpg-key --force
 | `--get-all` | `get --all <key>` |
 | `--unset` | `unset <key>` |
 | `--unset-all` | `unset --all <key>` |
-| `-l`, `--list` | `list` |
+| `-l`, `--list` | `list`——列出配置条目。未指定作用域时按 system → global → local 顺序（作用域内按插入顺序）列出全部作用域；指定作用域时（`--local`、`--global`、`--system`）仅列出该作用域。 |
 | `--add` | `set --add <key> <value>` |
 | `--import` | `import` |
-| `--get-regexp <pattern>` | `get --regexp <pattern>`——操作数是**正则**，因此 `^user` 这类不含点的模式合法；完全不匹配时退出码 1 |
+| `--get-regexp <pattern>` | `get --regexp <pattern>`——操作数是**正则**，匹配的键值对以空格分隔输出（`key value`），保持插入与作用域顺序；完全不匹配时退出码 1 |
 | `--get <key> [<value-pattern>]` | 给出 value-pattern 时按值（正则）筛选 |
 | `--unset <key> [<value-pattern>]` | 只删除匹配的值；无匹配时退出码 5 |
 | `--show-origin` | 读取/列表输出 `file:<数据库路径>` 前缀（Git 打印 `file:<配置文件路径>`；Libra 配置在 SQLite） |
 | `--show-scope` | 读取/列表输出 `local`/`global`/`system` 前缀（对齐 Git） |
 | `--replace-all <key> <value>` | 用单个值替换该 key 的所有既有值 |
-| `--file <path>` | 读取 Git 风格 INI 文件而非存储（只读：`--get`、`--get-all`、`--get-regexp`、`--list`） |
-| `--type=<bool\|int\|path\|bool-or-str\|bool-or-int>`、`--bool`、`--int`、`--path` | 读取（`--get`/`--get-all`/`--get-regexp`）**与设置**时规范化值：bool 变体 → `true`/`false`；int 支持可选 k/m/g（1024 倍率）；path 展开开头的 `~`/`~/`。设置时在存储前校验+规范化（与 git `config --type` 一致：`yes` → `true`、`1k` → `1024`），非法值报错且不写入。非 get/set 模式会被拒绝（exit 129）。 |
+| `--file <path>` | 读取或写入 Git 风格 INI 文件而非存储。读取：`--get`、`--get-all`、`--get-regexp`、`--list`。写入：`set`、`--add`、value-pattern set、`--replace-all`、`--unset`、`--unset-all`、`--remove-section`、`--rename-section`（Git 放置/引号规则，`<path>.lock` + rename 原子替换并保留权限）。写入 stdin（`--file -`）与 vault 参数（`--encrypt`/`--plaintext`/`--stdin`）会被拒绝。 |
+| `--type=<bool\|int\|path\|bool-or-str\|bool-or-int\|color>`、`--bool`、`--int`、`--path` | 读取（`--get`/`--get-all`/`--get-regexp`/`--list`）**与设置**时规范化值：bool 变体 → `true`/`false`；int 支持可选 k/m/g（1024 倍率）；path 展开开头的 `~`/`~/`；`color` 读取时输出 Git 的 ANSI 转义序列，写入时校验并存储原始拼写（存 `red` 而非 `\x1b[31m`），`--list --type=color` 仅保留可解析的值；`expiry-date` 读取时输出 Unix 时间戳（相对 `<n>.<unit>.ago`、`never`/`false` → 0、`now`/`all` → 远期哨兵值、`today`/`yesterday`/`tomorrow`/`noon`/`midnight`，以及 ISO 8601/`YYYY-MM-DD`/RFC 2822 绝对日期），写入时校验并存储原始拼写，`--list --type=expiry-date` 仅保留可解析的值。设置时在存储前校验+规范化（与 git `config --type` 一致：`yes` → `true`、`1k` → `1024`），非法值报错且不写入。非 get/set/list 模式会被拒绝（exit 129）。 |
 | `--remove-section <name>` | 在一个事务内删除 section `<name>` 的 key，采用 Git 的 section/subsection 身份（`--remove-section branch` 删 `branch.<key>` 但不动 `branch.feature.*` 子节）。section 不存在 → exit 128。 |
 | `--rename-section <old> <new>` | 把 section `<old>` 的 key 搬到 `<new>`，保留每个值及其加密标志。源不存在 → exit 128；新旧同名 → exit 2；目标 section 已存在则拒绝 → exit 128。 |
 
@@ -504,6 +519,7 @@ libra config remove-gpg-key --force
 | 标志 | 说明 |
 |------|------|
 | `-d`, `--default <value>` | key 未找到时使用的默认值（Git 兼容位置模式） |
+| `--name-only` | 仅输出变量名，适用于 `--list` 与 `--get-regexp`（配合 `-z` 时输出 `name\0`） |
 | `-z`, `--null` | NUL 分隔输出记录（`git config -z`）：`--get`/`--get-all` 输出 `value\0`；`--get-regexp`/`--list` 输出 `key\nvalue\0`；`--name-only` 输出 `key\0`；`--show-origin` 前缀 `origin\0`。`--json` 优先。仅作用于标准 config 输出；与 `--ssh-keys`/`--gpg-keys`/`--vault` 组合会被拒绝（exit 129）。 |
 | `--json` | 输出结构化 JSON |
 | `--quiet` | 抑制人类可读输出 |
@@ -528,7 +544,7 @@ libra config path
 Jane Doe
 ```
 
-**`list`** 打印 key-value 对：
+**`list`** 打印 key-value 对（未指定作用域时默认按 system → global → local 顺序，作用域内按插入顺序）：
 
 ```
 user.name=Jane Doe
@@ -549,6 +565,13 @@ global  user.email=jane@example.com
 user.name
 user.email
 core.editor
+```
+
+**`get-regexp`** 打印匹配的键值对，以空格分隔（`key value`），保持插入与作用域顺序：
+
+```
+user.name Jane Doe
+user.email jane@example.com
 ```
 
 **`set`** 成功时不打印任何内容（退出码 0）。
@@ -649,6 +672,11 @@ libra config remove-gpg-key --force
 - 默认 scope 是 local（`.libra/libra.db`）
 - `--global` 使用 `<XDG_CONFIG_HOME 或 ~/.config>/libra/config.db`（legacy `~/.libra/config.db` 在首次访问迁移之前仍作为回退）
 - `--system` 使用 `/etc/libra/config.db`（可经 `LIBRA_CONFIG_SYSTEM_DB` 覆盖）；级联优先级最低，写入通常需要提升权限，且该作用域拒绝 vault 加密密钥（见设计动机）
+
+显式指定作用域（`--system`、`--global`）时的读取错误行为：
+- 配置存储不存在时：`--get*` 以退出码 1 静默失败（无 stderr；带 `--default` 时输出默认值并退出 0），`--list` 以退出码 128 失败（`fatal: unable to read config file '<path>': No such file or directory`，`LBR-IO-001`）。
+- 配置存储不可读（如权限被拒）时：`--get*` 向 stderr 输出 `warning: unable to access '<path>': Permission denied` 并以退出码 1 结束（或输出默认值），`--list` 以退出码 128 失败（`fatal: unable to access '<path>': Permission denied`，`LBR-IO-001`）。
+- 级联读取（未传作用域 flag）时，缺失的 global/system 存储与不可读/不支持的 system 存储会被跳过。
 
 ## 历史 `code.defaultProvider` 键
 
@@ -781,6 +809,7 @@ Git 在 key 未找到时以代码 1 退出，这在脚本中与其他错误难�
 | `LBR-CLI-003` | key 未找到且未提供 `--default` | 用 `libra config list` 检查 key 名称 |
 | `LBR-CLI-002` | 使用了 `edit` 子命令（不支持） | 使用 `set`、`get`、`unset`、`list` 子命令 |
 | `LBR-IO-001` | 读取配置数据库失败 | 检查 `.libra/libra.db` 的文件权限 |
+| `LBR-IO-001` | 显式作用域的配置存储缺失或不可读（`--system --list`、`--global --list`） | 检查配置数据库是否存在及其文件权限 |
 | `LBR-IO-002` | 写入配置数据库失败 | 检查文件权限和磁盘空间 |
 
 ## 兼容性说明

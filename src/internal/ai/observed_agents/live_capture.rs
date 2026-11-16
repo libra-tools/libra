@@ -1361,7 +1361,7 @@ mod tests {
             let db = kind.as_db_str();
             assert_eq!(
                 live_capture_for(kind).is_some(),
-                registration_for(kind).hook_installable || kind == AgentKind::Pi,
+                registration_for(kind).hook_installable,
                 "{db}: live capture must exist exactly for hook-installable kinds"
             );
             let binding = LiveCaptureBinding::for_kind(db, kind);

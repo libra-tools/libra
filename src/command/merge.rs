@@ -864,6 +864,10 @@ pub(crate) enum PullMergeError {
     UnresolvedConflicts,
     #[error("uncommitted changes, cannot merge")]
     DirtyWorktree,
+    #[error(
+        "cannot inspect worktree before merge: {0}; fix the unreadable or unsafe path and retry"
+    )]
+    WorktreeCheck(String),
     #[error("untracked working tree file would be overwritten by merge: {path}")]
     UntrackedOverwrite { path: String },
     #[error("non-fast-forward merge refused (current {current}, target {target})")]
@@ -923,6 +927,15 @@ pub(crate) enum PullMergeError {
 }
 
 pub(crate) type MergeError = PullMergeError;
+
+fn merge_worktree_check_error(error: switch::SwitchError) -> PullMergeError {
+    match error {
+        switch::SwitchError::DirtyUnstaged | switch::SwitchError::DirtyUncommitted => {
+            PullMergeError::DirtyWorktree
+        }
+        other => PullMergeError::WorktreeCheck(other.to_string()),
+    }
+}
 
 impl From<PullMergeError> for CliError {
     fn from(error: PullMergeError) -> Self {
@@ -1055,7 +1068,7 @@ impl From<PullMergeError> for CliError {
             ) => CliError::command_usage(error.to_string())
                 .with_stable_code(StableErrorCode::CliInvalidArguments)
                 .with_hint("fix the offending value with 'libra config <key> <value>'"),
-            PullMergeError::StateLoad(..) | PullMergeError::IndexLoad(..) => {
+            PullMergeError::StateLoad(..) | PullMergeError::IndexLoad(..) | PullMergeError::WorktreeCheck(..) => {
                 CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
             }
             PullMergeError::StateSave(..)
@@ -1871,7 +1884,7 @@ async fn run_octopus_merge(
     let result: Result<PullMergeSummary, PullMergeError> = async {
         switch::ensure_clean_status(output)
             .await
-            .map_err(|_| PullMergeError::DirtyWorktree)?;
+            .map_err(merge_worktree_check_error)?;
         let current_index = Index::load(path::index())
             .map_err(|error| PullMergeError::IndexLoad(error.to_string()))?;
         let paths_to_write = worktree_paths_to_write(&tree.items);
@@ -1969,13 +1982,13 @@ async fn run_octopus_merge(
             run_pre_merge_commit_hook(output).await?;
             switch::ensure_clean_status(output)
                 .await
-                .map_err(|_| PullMergeError::DirtyWorktree)?;
+                .map_err(merge_worktree_check_error)?;
             ensure_no_untracked_conflicts(&current_index, &paths_to_write, &gitlink_paths)?;
             refuse_symlink_traversal(&util::working_dir(), &paths_to_write, &removals)?;
             let message = run_merge_message_hooks(&resolved_message, output).await?;
             switch::ensure_clean_status(output)
                 .await
-                .map_err(|_| PullMergeError::DirtyWorktree)?;
+                .map_err(merge_worktree_check_error)?;
             ensure_no_untracked_conflicts(&current_index, &paths_to_write, &gitlink_paths)?;
             refuse_symlink_traversal(&util::working_dir(), &paths_to_write, &removals)?;
             message
@@ -3202,7 +3215,7 @@ async fn perform_ours_merge(
     if !options.dry_run {
         switch::ensure_clean_status(options.output)
             .await
-            .map_err(|_| PullMergeError::DirtyWorktree)?;
+            .map_err(merge_worktree_check_error)?;
     }
 
     let head_name = current_head_name().await?;
@@ -3296,11 +3309,11 @@ async fn perform_ours_merge(
         run_pre_merge_commit_hook(options.output).await?;
         switch::ensure_clean_status(options.output)
             .await
-            .map_err(|_| PullMergeError::DirtyWorktree)?;
+            .map_err(merge_worktree_check_error)?;
         let message = run_merge_message_hooks(&resolved_message, options.output).await?;
         switch::ensure_clean_status(options.output)
             .await
-            .map_err(|_| PullMergeError::DirtyWorktree)?;
+            .map_err(merge_worktree_check_error)?;
         message
     } else {
         resolved_message
@@ -3352,7 +3365,7 @@ async fn perform_three_way_merge(
     if !options.dry_run {
         switch::ensure_clean_status(options.output)
             .await
-            .map_err(|_| PullMergeError::DirtyWorktree)?;
+            .map_err(merge_worktree_check_error)?;
     }
 
     let head_name = current_head_name().await?;
@@ -3755,7 +3768,7 @@ async fn perform_three_way_merge(
         run_pre_merge_commit_hook(options.output).await?;
         switch::ensure_clean_status(options.output)
             .await
-            .map_err(|_| PullMergeError::DirtyWorktree)?;
+            .map_err(merge_worktree_check_error)?;
         // The hook may create an untracked path after the merge result was
         // computed. Recheck before saving the commit or moving HEAD; relying
         // on the reset-time guard would detect the collision too late and
@@ -3767,7 +3780,7 @@ async fn perform_three_way_merge(
         let message = run_merge_message_hooks(&resolved_message, options.output).await?;
         switch::ensure_clean_status(options.output)
             .await
-            .map_err(|_| PullMergeError::DirtyWorktree)?;
+            .map_err(merge_worktree_check_error)?;
         ensure_no_untracked_conflicts(&current_index, &paths_to_write, &gitlink_paths)?;
         refuse_symlink_traversal(&util::working_dir(), &paths_to_write, &flat_removals)?;
         message
@@ -4698,7 +4711,7 @@ async fn apply_fast_forward_merge(
 ) -> Result<(), PullMergeError> {
     switch::ensure_clean_status(output)
         .await
-        .map_err(|_| PullMergeError::DirtyWorktree)?;
+        .map_err(merge_worktree_check_error)?;
     let (target_items, target_gitlinks) = commit_tree_split(&target_commit)?;
     let current_index =
         Index::load(path::index()).map_err(|error| PullMergeError::IndexLoad(error.to_string()))?;
@@ -9086,7 +9099,7 @@ async fn perform_incremental_three_way_merge(
         run_pre_merge_commit_hook(options.output).await?;
         switch::ensure_clean_status(options.output)
             .await
-            .map_err(|_| PullMergeError::DirtyWorktree)?;
+            .map_err(merge_worktree_check_error)?;
         // The hook may have created an untracked path — under an adopted
         // subtree included — after the first check: recompute, do not reuse.
         ensure_no_untracked_conflicts(
@@ -9097,7 +9110,7 @@ async fn perform_incremental_three_way_merge(
         let message = run_merge_message_hooks(&resolved_message, options.output).await?;
         switch::ensure_clean_status(options.output)
             .await
-            .map_err(|_| PullMergeError::DirtyWorktree)?;
+            .map_err(merge_worktree_check_error)?;
         ensure_no_untracked_conflicts(
             &current_index,
             &adopted_aware_write_paths(&mut source, &merged_items, &introduced, &current_index)?,
@@ -10764,6 +10777,10 @@ mod tests {
     /// the merge phase of `pull`.
     #[test]
     fn pull_merge_error_display_pins_each_variant() {
+        assert_eq!(
+            PullMergeError::WorktreeCheck("unsafe symbolic link".into()).to_string(),
+            "cannot inspect worktree before merge: unsafe symbolic link; fix the unreadable or unsafe path and retry"
+        );
         assert_eq!(
             PullMergeError::InvalidTarget("a/b".to_string()).to_string(),
             "a/b - not something we can merge",

@@ -13,8 +13,9 @@ libra cache info
 ## Description
 
 `cache info` reports the resolved storage/cache tunables, in the same way the
-tiered storage backend resolves them (environment first, then the global config
-DB), so the reported values match what the backend uses:
+tiered storage backend resolves them. For each setting, resolution checks the
+process environment first, then the repository's `vault.env.*` entries, then
+the global config DB, so the reported values match what the backend uses:
 
 - **storage** — the raw `LIBRA_STORAGE_TYPE` value (`local` only when unset;
   otherwise your exact value, e.g. `s3` / `r2` — a wrong-case `R2` is shown
@@ -24,26 +25,41 @@ DB), so the reported values match what the backend uses:
   applies before connecting (non-empty bucket, parseable `LIBRA_STORAGE_ENDPOINT`,
   non-empty `LIBRA_STORAGE_ACCESS_KEY` / `LIBRA_STORAGE_SECRET_KEY`). So a
   wrong-case `R2`, an empty key, or a malformed endpoint reports non-tiered.
-  That report does not mean `ClientStorage::init` built a writable local backend. Those
-  confirmed settings make object commands fail and name only the setting.
-  `LIBRA_STORAGE_TYPE=local` still warns and stays local. An unreadable
-  repository database, or a resolver that does not return, fails the object
-  command. `ClientStorage::init` does not build a writable local backend for
-  that case, names only the setting, and does not keep the client in the
-  process object cache. A repository database that is merely held by another
-  writer is first retried, for about 5 seconds in total per process. An unreadable global config store, after the repository
-  has no type, stays on the historical local backend so existing objects can
-  still be read. The next call reads the setting again after the repository
-  database is repaired. In text output the unreadable-global-store degrade, the `LIBRA_STORAGE_TYPE=local`
-  warning and its empty-bucket warning print a `Warning:` line on stderr and do not trip
-  `--exit-code-on-warning`. Under `--json`/`--machine` they never reach stderr:
-  the message joins the invocation's warning buffer and `--exit-code-on-warning`
-  exits 9 (`LBR-WARN-001`); `status` lists the `local` and empty-bucket warnings
-  as `repository_preflight` entries. A future global schema, an exact `local` value, and a
-  readable unset type stay local and can still be cached. Confirmed unusable settings
-  stay out of that cache. The cache tunables only take effect when tiered; a
-  local-only repository caches nothing. An actual connection additionally needs
-  valid credentials, which this static report does not validate.
+  That report does not mean `ClientStorage::init` built a writable local backend.
+  Object commands reject confirmed unusable settings, and their errors identify
+  the setting name without exposing its value. When command-level checks permit
+  storage initialization, `LIBRA_STORAGE_TYPE=local` warns and stays local. If
+  the repository database cannot be read, or the
+  resolver worker exits before returning the `LIBRA_STORAGE_TYPE` result,
+  object commands fail closed, report only `LIBRA_STORAGE_TYPE`, and do not
+  build writable local storage or cache that client. A repository database
+  held by another writer is retried for about 5 seconds in total per process;
+  after it is repaired, the next object command reads the setting again.
+  When the repository has no storage type but the global config store is
+  unreadable, object commands that initialize storage use the historical local
+  backend so existing objects remain readable. `cache info` resolves its
+  settings directly and exits non-zero if a setting lookup fails. `cache evict`
+  resolves the default budget before initializing storage, so a failed budget
+  lookup exits early; `--max-size` skips only that budget lookup. In text
+  output, object commands that use the local fallback print a `Warning:` line
+  on stderr for the unreadable-global-store degrade, the
+  `LIBRA_STORAGE_TYPE=local` warning, or its empty-bucket warning, without
+  triggering `--exit-code-on-warning`. Under `--json`/`--machine`, those
+  messages go into the invocation's warning buffer instead; the flag exits 9
+  (`LBR-WARN-001`). Structured `status` preflight lists the `local` and
+  empty-bucket warnings. It fails closed if its own required config lookup
+  cannot read the global store, so that lookup failure is not a preflight
+  warning. For object commands that pass their command-level checks, a future
+  global schema, an exact `local` value, and a readable unset type stay local
+  and can still be cached. Remote-facing commands such as `fetch`, `pull`, and
+  `clone` may fail closed before that fallback when global storage configuration
+  may be needed; those commands also reject an explicit
+  `LIBRA_STORAGE_TYPE=local`. See [fetch](fetch.md#global-config-schema-guard)
+  for those restrictions.
+  Confirmed unusable settings stay out of that cache. The cache tunables only
+  take effect when tiered; a local-only repository caches nothing. An actual
+  connection additionally needs valid credentials, which this static report
+  does not validate.
 - **threshold** — the small/large object threshold in bytes
   (`LIBRA_STORAGE_THRESHOLD`, default 1 MiB). Objects at or above this size are
   LRU-cached rather than stored permanently.
@@ -89,8 +105,8 @@ leading probe failures abort the run with nothing deleted. `--dry-run` writes no
 reports the outcome (probes still run); `--min-age` (default 600s) skips
 freshly materialized objects. Reads of evicted objects self-heal
 transparently from the durable tier (re-verified, re-cached) — but are
-unavailable offline. A confirmed remote setting that cannot be read fails `cache evict` instead of
-reporting that nothing is evictable. Local-only repositories have nothing evictable; the
+unavailable offline. A confirmed remote setting that cannot be read fails
+`cache evict` instead of reporting that nothing is evictable. Local-only repositories have nothing evictable; the
 offline read policy refuses (probes impossible). Background use:
 `libra maintenance run --task cache-evict` (not in the default task set).
 Residual risk (documented): presence is not integrity — a corrupt remote

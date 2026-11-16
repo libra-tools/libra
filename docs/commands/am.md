@@ -109,6 +109,10 @@ branch tip unchanged and keeps the series resumable:
 Use `--skip` to discard the current patch and continue with the next one, or
 `--abort` to discard the entire series and restore the pre-`am` state.
 
+## Line-ending comparison
+
+The clean-worktree preflight honors explicit `text`/`eol` rules, so an equivalent CRLF representation does not prevent applying a mail patch. Actual unstaged changes and existing sequence/conflict state retain their normal protection. `text=auto` uses the same comparison with binary detection and protection for historical CRLF index content. See [add](add.md) for `--renormalize`, bounded index evidence reads and remaining configuration limits.
+
 ## Options
 
 | Option | Meaning |

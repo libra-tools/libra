@@ -13,6 +13,8 @@ libra describe [OPTIONS] [COMMIT]
 
 ## Description
 
+The `--dirty` suffix uses explicit `text`/`eol` clean comparison for tracked regular files. Equivalent CRLF/LF bytes alone do not append the suffix; actual content, mode/type and staged changes still do. `text=auto` uses the same comparison with binary detection and protection for historical CRLF index content. See [add](add.md) for `--renormalize`, bounded index evidence reads and remaining configuration limits.
+
 `libra describe` walks the commit ancestry graph (BFS) from the given commit
 (default `HEAD`) to find the closest tag. In a shallow clone, commits listed in
 `.libra/shallow` are treated as roots (`--contains` also stops at those

@@ -1637,12 +1637,7 @@ mod tests {
 
     #[cfg(unix)]
     fn cov2_real_checkpoint_helper() -> std::path::PathBuf {
-        let executable = std::env::current_exe().unwrap();
-        let program = executable
-            .parent()
-            .and_then(Path::parent)
-            .unwrap()
-            .join("libra");
+        let program = crate::utils::test::real_libra_helper_binary();
         assert!(
             program.is_file(),
             "build the same-source Libra helper before this test"

@@ -16,6 +16,8 @@ libra checkout [<tree-ish>] [--] <pathspec>...
 
 ## 说明
 
+分支检出的干净度预检使用显式 `text`/`eol` clean 比较，等价 CRLF/LF 内容不会造成假脏拒绝。这只改变预检的比较方式，不新增 checkout/smudge 的 CRLF 写回，也不削弱真实编辑的保护。 `text=auto` 同样使用该比较链路，并保留二进制探测和历史 CRLF 索引保护；`--renormalize`、索引读取额度及剩余配置边界见 [add](add.md)。
+
 `libra checkout` 是一个 Git 兼容表面，内部委托给 `switch` 和 `restore`。它支持最常见的 `git checkout` 模式：显示当前分支、切换到已有分支、用 `-` 返回上一个 checkout 目标、用 `-b` 从 HEAD 或显式 start-point 创建新分支、用 `-B` 从 HEAD 或显式 start-point 强制创建/重置分支、用 `--orphan` 创建 unborn orphan 分支、自动跟踪远程分支，以及在存在显式 `--` 分隔符时恢复路径。
 
 在本地分支或 detached checkout 中，包括显式创建/重置分支（`-b` / `-B`），Libra 不管理子模块内容。如果目标需要移除或替换已跟踪的 gitlink（模式 `160000`），且对应目录非空，命令会在更改 HEAD、分支引用、reflog、索引或工作树前以 `LBR-CONFLICT-002` 拒绝。`--force` 也不能绕过此检查。请先将目录内的文件安全移到其他位置，再重试。Libra 创建的空目录占位符可以正常移除。这是 Libra 的保护边界；Git 的默认 checkout 则可能保留非空子模块目录。远程自动跟踪是独立的组合操作：其后续 `pull` 有自己的失败行为，不受上述前置检查保证覆盖。

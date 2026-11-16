@@ -88,6 +88,9 @@ class Fake:
     def run(self, run_id):
         return next(x for x in self.entries if x["id"] == run_id)
 
+    def has_jobs(self, run_id):
+        return False
+
 
 def invoke(fake):
     return cancel.cleanup(fake, CTX, clock=fake.clock.now, pause=fake.clock.sleep)
@@ -337,6 +340,39 @@ class CleanupTests(unittest.TestCase):
         with patch.dict(cancel.os.environ, {"GITHUB_EVENT_NAME": "push", "GITHUB_REF": "refs/heads/main", "GITHUB_REPOSITORY": "bad", "GITHUB_SHA": B, "GITHUB_RUN_ID": "200"}):
             with self.assertRaisesRegex(RuntimeError, "invalid"):
                 cancel.main()
+
+    def test_api_unqueued_409_raises_specific_error(self):
+        unqueued = subprocess.CompletedProcess(
+            [], 1, "", 'gh: Cannot cancel a workflow run that has not been queued yet. (HTTP 409)'
+        )
+        with patch.object(cancel.subprocess, "run", return_value=unqueued):
+            with self.assertRaisesRegex(cancel.UnqueuedConflictError, "HTTP 409"):
+                cancel.GitHub("libra-tools/libra").api("POST", "repos/libra-tools/libra/actions/runs/10/force-cancel")
+
+    def test_unqueued_409_zombie_run_is_skipped_after_force_window(self):
+        class Zombie(Fake):
+            def cancel(self, run_id, force=False):
+                raise cancel.UnqueuedConflictError("cancel conflict: HTTP 409 (not queued yet)")
+        fake = Zombie([run(10, status="queued")])
+        result = invoke(fake)
+        self.assertTrue(result["settled"])
+        self.assertEqual(result["skipped"], [10])
+        self.assertEqual(result["remaining"], [])
+        self.assertEqual(result["errors"], {})
+        self.assertGreaterEqual(fake.clock.now(), cancel.FORCE_AFTER_SECONDS)
+
+    def test_unqueued_409_with_jobs_is_not_skipped(self):
+        class Busy(Fake):
+            def cancel(self, run_id, force=False):
+                raise cancel.UnqueuedConflictError("cancel conflict: HTTP 409 (not queued yet)")
+            def has_jobs(self, run_id):
+                return True
+        fake = Busy([run(10, status="queued")])
+        result = invoke(fake)
+        self.assertFalse(result["settled"])
+        self.assertEqual(result["skipped"], [])
+        self.assertEqual(result["remaining"], [10])
+        self.assertIn(10, result["errors"])
 
 
 if __name__ == "__main__":

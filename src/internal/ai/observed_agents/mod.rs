@@ -284,10 +284,7 @@ pub(crate) fn live_capture_for(
 /// kind is hook-installable. Integration tests call this instead of the
 /// crate-private lookup.
 pub fn live_capture_matches_hook_installable(kind: AgentKind) -> bool {
-    // PI-36 registers Pi before it becomes supported; PI-06 removes the
-    // pre-support exception and returns to plain equality.
-    live_capture_for(kind).is_some()
-        == (registration_for(kind).hook_installable || kind == AgentKind::Pi)
+    live_capture_for(kind).is_some() == registration_for(kind).hook_installable
 }
 
 struct GrokObservedAgent;

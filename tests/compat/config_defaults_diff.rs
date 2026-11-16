@@ -37,18 +37,21 @@ fn diff_context_config_cascades_accepts_git_integers_and_cli_wins() {
     let global = stdout_trim(&fixture.success(&repo, &["diff"]));
     assert!(global.contains(" l4"), "global context 1: {global}");
     assert!(
-        !global.contains(" l3"),
+        !global.lines().any(|line| line == " l3"),
         "global must override system: {global}"
     );
 
     fixture.success(&repo, &["config", "diff.context", "0"]);
     let local_zero = stdout_trim(&fixture.success(&repo, &["diff"]));
-    assert!(!local_zero.contains(" l4"), "zero context: {local_zero}");
+    assert!(
+        !local_zero.lines().any(|line| line == " l4"),
+        "zero context: {local_zero}"
+    );
     fixture.success(&repo, &["config", "diff.context", "2"]);
     let local = stdout_trim(&fixture.success(&repo, &["diff"]));
     assert!(local.contains(" l3"), "local context 2: {local}");
     assert!(
-        !local.contains(" l2"),
+        !local.lines().any(|line| line == " l2"),
         "local must override global: {local}"
     );
 

@@ -30,6 +30,10 @@ class RateLimitError(ApiError):
     pass
 
 
+class UnqueuedConflictError(ApiError):
+    pass
+
+
 class Superseded(RuntimeError):
     pass
 
@@ -91,6 +95,8 @@ class GitHub:
                     raise ApiError(f"{method} {path}: invalid JSON") from error
             stderr = process.stderr.lower()
             if method == "POST" and "http 409" in stderr:
+                if "not been queued yet" in stderr:
+                    raise UnqueuedConflictError("cancel conflict: HTTP 409 (not queued yet)")
                 raise ApiError("cancel conflict: HTTP 409")
             transient = any(f"http {code}" in stderr for code in (429, 500, 502, 503, 504))
             transient = transient or ("http 403" in stderr and "rate limit" in stderr)
@@ -118,6 +124,10 @@ class GitHub:
 
     def run(self, run_id: int) -> dict:
         return self.api("GET", f"{self.base}/actions/runs/{run_id}")
+
+    def has_jobs(self, run_id: int) -> bool:
+        data = self.api("GET", f"{self.base}/actions/runs/{run_id}/jobs?per_page=1")
+        return bool(data.get("total_count", 0))
 
     def cancel(self, run_id: int, force: bool = False) -> None:
         suffix = "force-cancel" if force else "cancel"
@@ -225,6 +235,7 @@ def cleanup(client: GitHub, context: Context, clock=time.monotonic, pause=time.s
     attempts: dict[int, Attempt] = {}
     requested: set[int] = set()
     forced: set[int] = set()
+    skipped: set[int] = set()
     relation_cache: dict[str, str] = {}
     last_remaining: list[int] = []
     last_errors: dict[int, str] = {}
@@ -234,6 +245,7 @@ def cleanup(client: GitHub, context: Context, clock=time.monotonic, pause=time.s
         check_head(client, context, pause)
         scan = client.active_runs()
         candidates, errors = candidate_ids(client, context, scan, relation_cache)
+        candidates = [run_id for run_id in candidates if run_id not in skipped]
         now = clock()
         for run_id in candidates:
             attempt = attempts.setdefault(run_id, Attempt())
@@ -267,13 +279,30 @@ def cleanup(client: GitHub, context: Context, clock=time.monotonic, pause=time.s
                 raise
             except ApiError as error:
                 try:
-                    finished = client.run(run_id).get("status") == "completed"
+                    run_info = client.run(run_id)
+                    finished = run_info.get("status") == "completed"
                 except RateLimitError:
                     raise
                 except ApiError as recheck_error:
                     errors[run_id] = f"cancel and status recheck failed: {recheck_error}"
                     continue
                 if not finished:
+                    if (
+                        force
+                        and isinstance(error, UnqueuedConflictError)
+                        and run_info.get("status") == "queued"
+                    ):
+                        try:
+                            has_jobs = client.has_jobs(run_id)
+                        except RateLimitError:
+                            raise
+                        except ApiError:
+                            has_jobs = True
+                        if not has_jobs:
+                            skipped.add(run_id)
+                            errors.pop(run_id, None)
+                            print(f"skipped_zombie_run run_id={run_id} reason=unqueued_409")
+                            continue
                     errors[run_id] = str(error)
                     # GitHub can return 409 while a prior cancellation is in
                     # progress. Start the same bounded escalation clock.
@@ -282,22 +311,32 @@ def cleanup(client: GitHub, context: Context, clock=time.monotonic, pause=time.s
                         attempt.last_normal_at = now
         # Keep the last observed state: the API budget must not be used for a
         # new scan after its deadline has expired.
-        last_remaining = candidates
+        remaining = [run_id for run_id in candidates if run_id not in skipped]
+        last_remaining = remaining
         last_errors = errors
         last_overflow = scan.overflow
-        if candidates or errors or scan.overflow:
+        if remaining or errors or scan.overflow:
             last_activity = clock()
             clean_scans = 0
         else:
             clean_scans += 1
             if clean_scans >= 2 and clock() - start >= QUIET_SECONDS and clock() - last_activity >= QUIET_SECONDS:
-                return {"requested": sorted(requested), "forced": sorted(forced), "remaining": [], "errors": {}, "overflow": False, "settled": True}
-        interval = ACTIVE_POLL_SECONDS if candidates or errors or scan.overflow else QUIET_POLL_SECONDS
+                return {
+                    "requested": sorted(requested),
+                    "forced": sorted(forced),
+                    "skipped": sorted(skipped),
+                    "remaining": [],
+                    "errors": {},
+                    "overflow": False,
+                    "settled": True,
+                }
+        interval = ACTIVE_POLL_SECONDS if remaining or errors or scan.overflow else QUIET_POLL_SECONDS
         pause(min(interval, max(0, deadline - clock())))
 
     return {
         "requested": sorted(requested),
         "forced": sorted(forced),
+        "skipped": sorted(skipped),
         "remaining": sorted(last_remaining),
         "errors": last_errors,
         "overflow": last_overflow,

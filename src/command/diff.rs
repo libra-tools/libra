@@ -327,6 +327,19 @@ pub struct DiffArgs {
     #[clap(short = 'X', long, value_name = "PARAM", num_args = 0..=1, default_missing_value = "", require_equals = true)]
     pub dirstat: Option<String>,
 
+    /// Synonym for `--dirstat=cumulative` (enables `--dirstat` when given alone).
+    #[clap(long)]
+    pub cumulative: bool,
+
+    /// Plumbing raw output: full-length object ids and full-width zero ids for
+    /// the missing side (used by `diff-index`/`diff-files`).
+    #[clap(long = "plumbing-raw", hide = true)]
+    pub plumbing_raw: bool,
+
+    /// Plumbing `-p --raw`: print the raw records before the patch.
+    #[clap(long = "plumbing-raw-with-patch", hide = true)]
+    pub plumbing_raw_with_patch: bool,
+
     /// Output only the last line of `--stat`: the files-changed / insertions /
     /// deletions summary.
     #[clap(long)]
@@ -843,6 +856,14 @@ pub async fn execute_safe(args: DiffArgs, output: &OutputConfig) -> CliResult<()
             "files".to_string()
         } else {
             format!("files,{param}")
+        };
+        args.dirstat = Some(merged);
+    }
+    // `--cumulative` is Git's synonym for `--dirstat=cumulative`.
+    if args.cumulative {
+        let merged = match args.dirstat.take() {
+            Some(param) if !param.is_empty() => format!("{param},cumulative"),
+            _ => "cumulative".to_string(),
         };
         args.dirstat = Some(merged);
     }
@@ -2352,7 +2373,7 @@ fn apply_pickaxe(
     pickaxe: Option<&DiffPickaxe>,
     first_map: &HashMap<PathBuf, ObjectHash>,
     second_map: &HashMap<PathBuf, ObjectHash>,
-    worktree_entries: &HashMap<PathBuf, ObjectHash>,
+    worktree_entries: &WorktreeContents,
     textconv_counts: &HashMap<String, (usize, usize)>,
 ) -> Result<(), DiffError> {
     let Some(pickaxe) = pickaxe else {
@@ -2376,7 +2397,7 @@ fn apply_pickaxe(
             return Ok(Vec::new());
         };
         if worktree_entries.get(&path) == Some(hash) {
-            read_worktree_blob_content(&path)
+            worktree_entries.read(&path, hash)
         } else {
             load_repo_blob_content(hash)
         }
@@ -2645,16 +2666,61 @@ fn append_mode_only_changes(
     files.sort_by(|left, right| left.path.cmp(&right.path));
 }
 
-/// Normalize built-in patch mode headers from the directional tree/index/worktree
-/// metadata. `git_internal` compares blob ids and can render `100644` even when
-/// the real filepair is executable; keeping that placeholder would make ordinary
-/// and `--full-index` patches disagree with `--raw` and external-diff metadata.
+/// Select the worktree representation explicitly. Raw plumbing, external
+/// drivers and textconv retain their inputs; built-in content comparison uses
+/// the same clean bytes as add. Recorded objects never pass through this view.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct WorktreeContents {
+    entries: HashMap<PathBuf, ObjectHash>,
+    selected_index: HashMap<PathBuf, ObjectHash>,
+    clean: bool,
+}
+
+impl WorktreeContents {
+    fn get(&self, path: &Path) -> Option<&ObjectHash> {
+        self.entries.get(path)
+    }
+
+    fn read(&self, path: &Path, expected: &ObjectHash) -> Result<Vec<u8>, DiffError> {
+        if !self.clean {
+            return read_worktree_blob_content(&path.to_path_buf());
+        }
+        let absolute = util::workdir_to_absolute(path);
+        let bytes = crate::utils::worktree_conversion::read_clean_blob_bytes(
+            &absolute,
+            crate::utils::worktree_conversion::CleanMode::Normal,
+            || {
+                crate::command::status_io_worker::index_has_text_crlf(
+                    self.selected_index.get(path).copied(),
+                )
+            },
+        )
+        .map_err(|error| DiffError::FileRead {
+            path: absolute.display().to_string(),
+            detail: error.to_string(),
+        })?;
+        // Zero denotes a stat-only plumbing candidate, not a content hash.
+        if *expected != ObjectHash::zero_for_kind(git_internal::hash::get_hash_kind())
+            && calculate_object_hash(ObjectType::Blob, &bytes) != *expected
+        {
+            return Err(DiffError::FileRead {
+                path: absolute.display().to_string(),
+                detail: "worktree content or attributes changed during diff; retry the command"
+                    .to_string(),
+            });
+        }
+        Ok(bytes)
+    }
+}
+
+type WorktreeContentCache = Rc<RefCell<HashMap<(PathBuf, ObjectHash), Vec<u8>>>>;
+
 #[derive(Debug)]
 pub(crate) struct DiffSide {
     label: String,
     blobs: Vec<(PathBuf, ObjectHash)>,
     modes: HashMap<PathBuf, u32>,
-    worktree_entries: HashMap<PathBuf, ObjectHash>,
+    worktree_entries: WorktreeContents,
     is_worktree: bool,
 }
 
@@ -2673,21 +2739,51 @@ fn get_files_blobs(
         .ok()
         .and_then(|index_path| std::fs::metadata(index_path).ok())
         .and_then(|meta| meta.modified().ok());
-    files
+    let workdir = util::working_dir();
+    let conversion = crate::command::status_io_worker::ConversionScan::new(&workdir, index)
+        .map_err(|error| DiffError::FileRead {
+            path: workdir.display().to_string(),
+            detail: error.to_string(),
+        })?;
+    let (sources_before, policy_valid) =
+        conversion
+            .probe(None)
+            .map_err(|error| DiffError::FileRead {
+                path: workdir.display().to_string(),
+                detail: error.to_string(),
+            })?;
+    let blobs = files
         .iter()
         .filter(|path| !ignore::should_ignore(path, policy, index))
         .map(|p| {
-            if let Some(hash) = index_hash_if_worktree_stat_matches(p, index, index_file_mtime) {
+            if policy_valid
+                && let Some(hash) = index_hash_if_worktree_stat_matches(p, index, index_file_mtime)
+            {
                 return Ok((p.to_owned(), hash));
             }
             let path = util::workdir_to_absolute(p);
-            let data = read_worktree_blob_bytes(&path).map_err(|e| DiffError::FileRead {
-                path: path.display().to_string(),
-                detail: e.to_string(),
-            })?;
-            Ok((p.to_owned(), calculate_object_hash(ObjectType::Blob, &data)))
+            let hash = conversion
+                .hash(&path)
+                .map_err(|error| DiffError::FileRead {
+                    path: path.display().to_string(),
+                    detail: error.to_string(),
+                })?;
+            Ok((p.to_owned(), hash))
         })
-        .collect()
+        .collect::<Result<Vec<_>, DiffError>>()?;
+    let (sources_after, _) = conversion
+        .probe(None)
+        .map_err(|error| DiffError::FileRead {
+            path: workdir.display().to_string(),
+            detail: error.to_string(),
+        })?;
+    if sources_after != sources_before {
+        return Err(DiffError::FileRead {
+            path: workdir.display().to_string(),
+            detail: "attributes changed during diff; retry the command".to_string(),
+        });
+    }
+    Ok(blobs)
 }
 
 /// Stat-based worktree side for the plumbing `diff-files`/`diff-index`
@@ -2716,11 +2812,15 @@ fn get_files_blobs_stat_only(
                 && entry.flags.intent_to_add
             {
                 let absolute = util::workdir_to_absolute(p);
-                let data =
-                    read_worktree_blob_bytes(&absolute).map_err(|e| DiffError::FileRead {
-                        path: absolute.display().to_string(),
-                        detail: e.to_string(),
-                    })?;
+                let data = crate::utils::worktree_conversion::read_clean_blob_bytes(
+                    &absolute,
+                    crate::utils::worktree_conversion::CleanMode::Normal,
+                    || crate::command::status_io_worker::index_has_text_crlf(Some(entry.hash)),
+                )
+                .map_err(|e| DiffError::FileRead {
+                    path: absolute.display().to_string(),
+                    detail: e.to_string(),
+                })?;
                 return Ok((p.to_owned(), calculate_object_hash(ObjectType::Blob, &data)));
             }
             // Stat differs: report the all-zero worktree sha without hashing.
@@ -3379,7 +3479,7 @@ fn apply_textconv(
     path_commands: &HashMap<String, (Option<String>, Option<String>)>,
     first_map: &HashMap<PathBuf, ObjectHash>,
     second_map: &HashMap<PathBuf, ObjectHash>,
-    worktree_entries: &HashMap<PathBuf, ObjectHash>,
+    worktree_entries: &WorktreeContents,
     context: usize,
     ws_normalize: Option<fn(&str) -> String>,
     ignore_blank: bool,
@@ -3645,7 +3745,7 @@ fn force_text_for_bare_binary(
     files: &mut [DiffFileStat],
     first_map: &HashMap<PathBuf, ObjectHash>,
     second_map: &HashMap<PathBuf, ObjectHash>,
-    worktree_entries: &HashMap<PathBuf, ObjectHash>,
+    worktree_entries: &WorktreeContents,
     context: usize,
     diff_algorithm: &DiffAlgorithm,
 ) -> Result<(), DiffError> {
@@ -3655,7 +3755,7 @@ fn force_text_for_bare_binary(
             return Ok(Vec::new());
         };
         if worktree_entries.get(&pb) == Some(hash) {
-            read_worktree_blob_content(&pb)
+            worktree_entries.read(&pb, hash)
         } else {
             load_repo_blob_content(hash)
         }
@@ -3708,7 +3808,7 @@ fn apply_binary_detection(
     files: &mut [DiffFileStat],
     first_map: &HashMap<PathBuf, ObjectHash>,
     second_map: &HashMap<PathBuf, ObjectHash>,
-    worktree_entries: &HashMap<PathBuf, ObjectHash>,
+    worktree_entries: &WorktreeContents,
     textconv_paths: &std::collections::HashSet<String>,
     want_patch: bool,
 ) -> Result<bool, DiffError> {
@@ -3719,7 +3819,7 @@ fn apply_binary_detection(
             return Ok(Vec::new());
         };
         if worktree_entries.get(&pb) == Some(hash) {
-            read_worktree_blob_content(&pb)
+            worktree_entries.read(&pb, hash)
         } else {
             load_repo_blob_content(hash)
         }
@@ -4026,8 +4126,8 @@ fn first_trailing_blank_line(text: &str) -> Option<usize> {
 fn annotate_diff_check_trailing_blanks(
     files: &mut [DiffFileStat],
     second_map: &HashMap<PathBuf, ObjectHash>,
-    worktree_entries: &HashMap<PathBuf, ObjectHash>,
-    worktree_cache: &Rc<RefCell<HashMap<ObjectHash, Vec<u8>>>>,
+    worktree_entries: &WorktreeContents,
+    worktree_cache: &WorktreeContentCache,
     repo_cache: &Rc<RefCell<HashMap<ObjectHash, Vec<u8>>>>,
 ) -> Result<(), DiffError> {
     for file in files {
@@ -4038,13 +4138,13 @@ fn annotate_diff_check_trailing_blanks(
         };
         let bytes = worktree_cache
             .borrow()
-            .get(hash)
+            .get(&(path.clone(), *hash))
             .cloned()
             .or_else(|| repo_cache.borrow().get(hash).cloned())
             .map(Ok)
             .unwrap_or_else(|| {
                 if worktree_entries.get(&path) == Some(hash) {
-                    read_worktree_blob_content(&path)
+                    worktree_entries.read(&path, hash)
                 } else {
                     load_repo_blob_content(hash)
                 }
@@ -4138,6 +4238,16 @@ fn abbreviated_raw_id(id: Option<ObjectHash>) -> String {
         full.get(..7).unwrap_or(&full).to_string()
     })
     .unwrap_or_else(|| "0000000".to_string())
+}
+
+/// Raw object id: 7-char abbreviation for porcelain, or the full 40/64-hex id
+/// (zero-filled for a missing side) for plumbing raw output.
+fn raw_id(id: Option<ObjectHash>, full: bool) -> String {
+    if !full {
+        return abbreviated_raw_id(id);
+    }
+    id.map(|hash| hash.to_string())
+        .unwrap_or_else(|| ObjectHash::zero_str(git_internal::hash::get_hash_kind()).to_string())
 }
 
 fn raw_mode(mode: Option<u32>) -> String {
@@ -4562,7 +4672,10 @@ pub(crate) fn compute_unified_hunks(
             let indexed =
                 anchored_indexed_changes(&old_records, &new_records, &new_records, anchors);
             let changes = materialize_indexed_changes(&indexed, &old_lines, &new_lines);
-            assemble_unified_hunks(&changes, context, old_text.len() + new_text.len())
+            append_function_context(
+                assemble_unified_hunks(&changes, context, old_text.len() + new_text.len()),
+                new_text,
+            )
         }
         _ => {
             let diff = TextDiff::configure()
@@ -4572,9 +4685,42 @@ pub(crate) fn compute_unified_hunks(
                 .iter_all_changes()
                 .map(|c| (c.tag(), c.value().trim_end_matches(['\r', '\n'])))
                 .collect();
-            assemble_unified_hunks(&changes, context, old_text.len() + new_text.len())
+            append_function_context(
+                assemble_unified_hunks(&changes, context, old_text.len() + new_text.len()),
+                new_text,
+            )
         }
     }
+}
+
+/// Append Git's function-context suffix to each hunk header using the shared
+/// `utils::funcname` rule (ADR-LG-08 item 2 / M-GCTX X5).
+fn append_function_context(hunks: String, new_text: &str) -> String {
+    let lines: Vec<&str> = new_text.lines().collect();
+    let mut out = String::new();
+    for line in hunks.split_inclusive('\n') {
+        let (content, newline) = match line.strip_suffix('\n') {
+            Some(content) => (content, "\n"),
+            None => (line, ""),
+        };
+        if let Some(rest) = content.strip_prefix("@@ ")
+            && let Some((spans, suffix)) = rest.split_once(" @@")
+            && suffix.trim().is_empty()
+            && let Some(start) = spans
+                .split_whitespace()
+                .find_map(|span| span.strip_prefix('+'))
+                .and_then(|span| span.split(',').next())
+                .and_then(|span| span.parse::<usize>().ok())
+            && let Some(index) = start.checked_sub(2)
+            && let Some(name) = crate::utils::funcname::function_name_for_path("", &lines, index)
+        {
+            out.push_str(&format!("@@ {spans} @@ {name}{newline}"));
+            continue;
+        }
+        out.push_str(content);
+        out.push_str(newline);
+    }
+    out
 }
 
 /// Normalizer for `-w` / `--ignore-all-space`: drop every whitespace character
@@ -4959,7 +5105,10 @@ fn compute_unified_hunks_ignore_blank_inner(
         let new_start = if new_count == 0 { s2 } else { s2 + 1 };
         let _ = writeln!(
             out,
-            "@@ -{old_start},{old_count} +{new_start},{new_count} @@"
+            "{}",
+            crate::utils::diff_format::format_hunk_header(
+                old_start, old_count, new_start, new_count,
+            )
         );
 
         // Emit body: context, then each group's deletions and insertions in order.
@@ -5175,7 +5324,8 @@ fn flush_unified_hunk<'a>(
     let new_start = new_first.unwrap_or(*last_new_seen);
     let _ = writeln!(
         out,
-        "@@ -{old_start},{old_count} +{new_start},{new_count} @@"
+        "{}",
+        crate::utils::diff_format::format_hunk_header(old_start, old_count, new_start, new_count)
     );
 
     for &e in cur_hunk.iter() {
@@ -5245,6 +5395,9 @@ pub(crate) async fn staged_diff_text() -> Result<String, DiffError> {
         summary: false,
         dirstat: None,
         dirstat_by_file: None,
+        cumulative: false,
+        plumbing_raw: false,
+        plumbing_raw_with_patch: false,
         stat_name_width: None,
         inter_hunk_context: None,
         ignore_matching_lines: None,
@@ -5326,17 +5479,73 @@ fn moved_line_bodies(diff_text: &str) -> std::collections::HashSet<&str> {
 /// Render `--shortstat`: just the trailing summary line of `--stat`, omitting
 /// the insertion/deletion clause when its count is zero (matching Git, which
 /// shows e.g. ` 1 file changed, 2 insertions(+)` with no deletions clause).
+/// Rewrite `@@ -a,b +c,d @@` lines to Git's canonical form (ADR-LG-04).
+///
+/// `git_internal` always prints explicit counts. Git omits `,1` and, for an
+/// empty side at the start of the file, anchors at 0 (`+0,0`). A zero-count
+/// side is anchored at the line before the hunk; when the hunk starts at line
+/// 1 on the other side, that anchor is 0.
+pub(crate) fn canonicalize_hunk_headers(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for line in raw.split_inclusive('\n') {
+        let (content, newline) = match line.strip_suffix('\n') {
+            Some(content) => (content, "\n"),
+            None => (line, ""),
+        };
+        if let Some(rebuilt) = rebuild_hunk_header(content) {
+            out.push_str(&rebuilt);
+            out.push_str(newline);
+        } else {
+            out.push_str(content);
+            out.push_str(newline);
+        }
+    }
+    out
+}
+
+fn parse_hunk_span(spec: &str, sign: char) -> Option<(usize, usize)> {
+    let spec = spec.strip_prefix(sign)?;
+    match spec.split_once(',') {
+        Some((start, count)) => Some((start.parse().ok()?, count.parse().ok()?)),
+        None => Some((spec.parse().ok()?, 1)),
+    }
+}
+
+fn rebuild_hunk_header(line: &str) -> Option<String> {
+    let rest = line.strip_prefix("@@ ")?;
+    let (spans, suffix) = rest.split_once(" @@")?;
+    let mut parts = spans.split_whitespace();
+    let old = parts.next()?;
+    let new = parts.next()?;
+    let (old_start, old_count) = parse_hunk_span(old, '-')?;
+    let (new_start, new_count) = parse_hunk_span(new, '+')?;
+    let anchor = |start: usize, count: usize, other_start: usize| -> usize {
+        if count == 0 && start == 1 && other_start == 1 {
+            0
+        } else {
+            start
+        }
+    };
+    let old_start = anchor(old_start, old_count, new_start);
+    let new_start = anchor(new_start, new_count, old_start);
+    Some(format!(
+        "{}{suffix}",
+        crate::utils::diff_format::format_hunk_header(old_start, old_count, new_start, new_count)
+    ))
+}
+
 fn parse_diff_item(item: &git_internal::diff::DiffItem) -> DiffFileStat {
-    let status = parse_diff_status(&item.data);
-    let (insertions, deletions) = count_hunk_line_changes(&item.data);
+    let data = canonicalize_hunk_headers(&item.data);
+    let status = parse_diff_status(&data);
+    let (insertions, deletions) = count_hunk_line_changes(&data);
 
     DiffFileStat {
         path: item.path.clone(),
         status: status.to_string(),
         insertions,
         deletions,
-        hunks: parse_diff_hunks(&item.data),
-        raw_diff: item.data.clone(),
+        hunks: parse_diff_hunks(&data),
+        raw_diff: data,
         rename_from: None,
         similarity: None,
         binary: None,
@@ -6576,6 +6785,21 @@ mod test {
         );
         index.save(crate::utils::path::index()).unwrap();
 
+        // Stat alone cannot prove equivalence under the current attributes.
+        let paths = [PathBuf::from("tracked.txt")];
+        assert_eq!(
+            get_files_blobs(&paths, &index, IgnorePolicy::Respect).unwrap(),
+            vec![(PathBuf::from("tracked.txt"), worktree_hash)]
+        );
+        // Install the certificate normally recorded by a clean status scan.
+        // The deliberately different hash above makes reuse observable here.
+        let conversion =
+            crate::command::status_io_worker::ConversionScan::new(&util::working_dir(), &index)
+                .unwrap();
+        let (sources, _) = conversion.probe(None).unwrap();
+        conversion.probe(Some(&sources)).unwrap();
+        assert!(conversion.probe(None).unwrap().1);
+
         let blobs = get_files_blobs(
             &[PathBuf::from("tracked.txt")],
             &index,
@@ -6584,5 +6808,11 @@ mod test {
         .unwrap();
 
         assert_eq!(blobs, vec![(PathBuf::from("tracked.txt"), indexed_hash)]);
+
+        fs::write(".gitattributes", "*.txt text\n").unwrap();
+        assert_eq!(
+            get_files_blobs(&paths, &index, IgnorePolicy::Respect).unwrap(),
+            vec![(PathBuf::from("tracked.txt"), worktree_hash)]
+        );
     }
 }

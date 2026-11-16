@@ -24,6 +24,26 @@ list their entries and blobs print their text content (or a binary summary).
 When stdout is piped and the downstream command exits early, `libra show` exits quietly without
 printing panic/backtrace or `Broken pipe` diagnostics.
 
+### Default layout
+
+The default header keeps the blank line between the `Date:` line and the
+indented commit message. `--oneline`, `--pretty`, and `--format` are
+last-one-wins.
+
+### Tree objects
+
+`libra show <tree-ish>` accepts a tree id, `<rev>^{tree}`, or `<rev>:<dir>` and
+prints Git's short tree form: `tree <name as given>`, a blank line, then one
+entry name per line in tree order. Subtrees carry a trailing `/`
+(`dir1/`); the listing is not recursive. `--json` keeps the richer
+`{mode, object_type, hash, name}` entry schema.
+
+```bash
+libra show 'HEAD^{tree}'
+libra show HEAD:dir1
+libra show <tree-oid>
+```
+
 ## Options
 
 | Flag | Short | Description |
@@ -32,14 +52,14 @@ printing panic/backtrace or `Broken pipe` diagnostics.
 | `--no-patch` | `-s` | Skip patch output and only show object metadata. |
 | `--oneline` | | Shorthand for `--pretty=oneline` -- prints hash and subject on one line. |
 | `--pretty <FORMAT>` | | Format the commit header with a preset (`oneline`, `short`, `full`, `fuller`, `reference`, `raw`) or a `%`-placeholder template (`format:`/`tformat:`/bare). Uses the same custom placeholders as `libra log --format`, including `%b`, `%B`, `%n`, ASCII/control `%xNN`, `%%`, `%aI`, `%cI`, `%at`, `%ct`, `%D`, `%m`, and color placeholders. |
-| `--format <FORMAT>` | | Alias for `--pretty=<FORMAT>` (Git's `--format`). Mutually exclusive with `--pretty`. |
+| `--format <FORMAT>` | | Alias for `--pretty=<FORMAT>` (Git's `--format`). `--oneline`, `--pretty`, and `--format` are last-one-wins. |
 | `--date <FORMAT>` | | Select the human date mode (`default`, `short`, `iso`, `iso-strict`, `rfc`, `unix`, or `raw`). Overrides `log.date`. |
 | `--abbrev-commit` | | Abbreviate the commit object name in the default header to a 7-character prefix. |
 | `--no-abbrev-commit` | | Show the full (unabbreviated) commit object name, countermanding an earlier `--abbrev-commit` (last one wins). The full hash is the default, so on its own this is a no-op. |
 | `--name-only` | | Show only changed file names (no diff hunks). |
 | `--name-status` | | Show changed file names prefixed by a status letter (`A`/`M`/`D`), tab-separated. |
 | `--raw` | | Show the raw diff format `:<old-mode> <new-mode> <old-sha> <new-sha> <status>\t<path>` (object ids abbreviated to 7) instead of a patch, like `git show --raw`. |
-| `--stat` | | Show diff statistics (insertions / deletions per file). |
+| `--stat` | | Show the shared Git-style diffstat (per-file bar plus `N files changed, X insertions(+), Y deletions(-)`), identical to `log --stat` / `diff --stat`. |
 | `--patch-with-stat` | | Show the diffstat block followed by the full patch (Git's legacy synonym for `-p --stat`). |
 | `--summary` | | Show a condensed summary of created and deleted files (their mode and path), like `git show --summary`. Created/deleted files only — no rename/copy detection. |
 | `--no-expand-tabs` | | Do not expand tabs in the commit message. Accepted no-op: Libra's show prints tabs verbatim. |

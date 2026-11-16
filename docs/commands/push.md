@@ -508,6 +508,7 @@ trigger a fuzzy match suggestion via edit distance.
 | Remote unpack failed | `LBR-NET-002` | 128 | "retry or check server logs" |
 | Remote ref update rejected | `LBR-NET-002` | 128 | "check branch protection rules" |
 | Unexpected receive-pack status line / missing status-report flush | `LBR-NET-002` | 128 | "check the remote Git service or proxy response and retry" |
+| Remote only advertises Git wire protocol v2 | `LBR-NET-002` | 128 | "check the remote Git service or proxy response and retry" |
 | Network error | `LBR-NET-001` | 128 | "check network connectivity and retry" |
 | LFS upload failed | `LBR-NET-001` | 128 | "check LFS endpoint configuration" |
 | Tracking ref update failed | `LBR-IO-002` | 128 | -- |

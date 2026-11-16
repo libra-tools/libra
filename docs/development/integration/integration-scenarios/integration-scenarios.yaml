@@ -62,6 +62,12 @@ notes: |
   Wave 3 requires `gh` auth + create/delete private repo permission.
   All scenarios must follow the §3.3.1 canonical libra()/gitfix() isolation
   template in the md (env -i + SAFE_PATH + TMPDIR + RUN_ROOT).
+  I1062-06 explicit text/eol diff coverage remains Cargo-only in command_test:
+  command::diff_test::i1062_ and
+  command::diff_plumbing_test::i1062_plumbing_explicit_conversion_matches_git_modes.
+  These cover clean content, history, errors and special inputs, plus SHA-1/SHA-256
+  plumbing mode/exit parity and zero-OID per-path cache isolation. Git raw output
+  uses --abbrev=7 to match Libra's existing width. No new cli.* scenario is added.
   Cargo-only compatibility targets are not duplicated as runner scenarios;
   P2-02 mailinfo, P2-03 format-patch interoperability, and P2-04's explicit
   non-sending send-email policy are registered through compat_mailinfo_basic,

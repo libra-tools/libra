@@ -18,6 +18,8 @@ libra commit --no-agent-trailer -m <MESSAGE>
 
 ## 说明
 
+`commit -a` 自动暂存已跟踪文件时使用显式 `text`/`eol` clean 比较。单纯 CRLF/LF 表示差异不会产生内容修改，也不会使本应为空的提交得以创建。真实编辑通过与 `add` 相同的转换暂存。 `text=auto` 同样使用该比较链路，并保留二进制探测和历史 CRLF 索引保护；`--renormalize`、索引读取额度及剩余配置边界见 [add](add.md)。
+
 `libra commit` 从已暂存更改创建新提交，构建 tree 和 commit 对象，验证消息（包括可选的 conventional commit 格式，以及通过 vault 进行 GPG 签名），并更新 HEAD 和 refs。
 
 该命令读取索引以确定哪些文件已暂存，构造与暂存内容匹配的 tree 对象层级，使用提供的消息和 author/committer 元数据创建 commit 对象，并推进当前分支 ref。启用 vault signing 时，提交会自动进行 GPG 签名。除非用 `--no-verify` 绕过，否则会运行 `.libra/hooks` 的 commit 生命周期。
@@ -155,7 +157,7 @@ libra commit -m "fix(auth): handle expired tokens" --conventional
 
 ### `-a, --all`
 
-提交前自动暂存已修改或已删除的已跟踪文件。等价于在 `libra commit` 前运行 `libra add -u`。不会添加新的未跟踪文件。文件 mode 遵循 `core.filemode`：为 `true`（Unix 默认）时，仅 mode 变化也会被提交；为 `false` 时忽略该变化（非法值会使提交 fail-closed）。
+提交前自动暂存已修改或已删除的已跟踪文件。等价于在 `libra commit` 前运行 `libra add -u`。不会添加新的未跟踪文件。文件 mode 遵循 `core.filemode`：为 `true`（Unix 默认）时，仅 mode 变化也会被提交；为 `false` 时忽略该变化（非法值会使提交 fail-closed）。与 Git 一致，`-a` 还会重新记录内容未变的已跟踪文件的索引 stat，因此仅被 touch 过的文件在提交后不会再被 `diff-files`/`diff-index` 报告。与 Git 不同：Git 在提交被拒绝时会回滚这次刷新，而 Libra 在提交执行前就写入索引（与自动暂存的内容一致），所以即使 `commit -a` 随后以 `nothing to commit` 结束，刷新后的 stat 也会保留。
 
 删除**最后一个**被跟踪文件仍是真实变更：即使索引因此变为空，`commit -a`（或 `libra add -A && libra commit`）也会记录该删除，而非报 `nothing to commit, working tree clean`（issue #497）。已暂存的删除永远不会被误判为“真正空的仓库”——后一种情形下 `commit` 仍会报 `nothing to commit (create/copy files and use 'libra add' to track)`。
 

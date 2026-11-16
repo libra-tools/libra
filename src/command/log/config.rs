@@ -48,7 +48,7 @@ pub(super) async fn resolve_log_config(
     })
 }
 
-async fn read_log_config(key: &'static str) -> CliResult<Option<String>> {
+pub(super) async fn read_log_config(key: &'static str) -> CliResult<Option<String>> {
     read_cascaded_config_value_strict(LocalIdentityTarget::CurrentRepo, key)
         .await
         .map_err(|error| {

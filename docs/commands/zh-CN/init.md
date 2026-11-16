@@ -134,24 +134,27 @@ libra init --template /path/to/template
 libra init --template=            # 完全不使用模板
 ```
 
-### `--shared <MODE>`
+### `--shared[=<MODE>]`
 
-指定仓库将在多个用户之间共享（镜像 Git 的 `--shared` 标志，用于组权限）。支持
-`false`、`umask`、`true`、`group`、`all`、`world`、`everybody`，或 `0770`
-这类 4 位八进制模式。
+指定仓库将在多个用户之间共享（镜像 Git 的 `--shared` 标志，用于组权限）。无值传入 `--shared` 时默认取 `group`；指定模式时须以 `--shared=<MODE>` 传入。支持 `false`、`umask`、`no`、`off`、`0`、`true`、`group`、`yes`、`on`、`1`、`all`、`world`、`everybody`、`2`，或 `0660`、`0640`、`0600`、`0664` 等八进制文件模式。
 
-`true` 会规范化为 `group`；`world` 与 `everybody` 会规范化为 `all`。只要显式
-传入 `--shared`，Libra 就会把规范化后的值写入 `core.sharedRepository`，因此
-fresh init 与 reinit 之后都可以用 `libra config get core.sharedRepository` 观察当前
-shared 模式。
+`group`/`true`/`1` 在 `core.sharedRepository` 中保存为 `1`；`all`/`world`/`everybody`/`2` 保存为 `2`；八进制模式与 `0666` 按位与掩码后以 `0%o` 格式持久化（如 `0660`）。`umask`/`false`/`0` 不持久化 `core.sharedRepository`，且在重新初始化时移除已存值。旧版 Libra 写入的值（`group`、`all`、`umask`、`false`、`0775`）继续兼容读取并在重新初始化时改写为 Git 表示。未显式传入 `--shared` 时，按 `local` -> `global` -> `system` 读取 `core.sharedRepository`。
 
-Numeric mode 会在任何仓库布局写入前预校验。当前 Libra 会把 numeric mode 直接应用到仓库目录和文件，因此 owner 必须保留 `rwx`，且 group/other 任一类只要获得 read 或 write 权限，就必须同时具备对应的 execute bit 以保证目录可遍历。`0660` 这类不可遍历模式会以 `LBR-CLI-002` 拒绝，并且不会留下半初始化的 `.libra` 目录。
+八进制模式会在任何仓库布局写入前校验文件 owner 必须具备读写权限（`mode & 0600 == 0600`）。缺少 owner 读/写权限的模式（如 `0400`、`0200`）会在创建任何文件前以 `LBR-CLI-002` 拒绝。
+
+文件与目录的权限计算完全对齐 Git `calc_shared_perm`：
+- 普通文件叠加共享位（`group` 对应 `0660`，`all`/`everybody` 对应 `0664`；八进制模式替换低 9 位）。可执行文件将读位复制到执行位（`mode |= (mode & 0444) >> 2`）。
+- 目录额外将读位复制到执行位以保证可遍历，且在存在组访问权限时（`group`、`all` 或包含组读/写的八进制模式）添加 setgid 位（`02000`）。
+- 所配置的共享模式对 init 之后的全部新写入生效：新松散对象（`0444`/`0440`）与 fanout 目录（`2775`/`2750`）、repack 产生的 `.pack` 与 `.idx`（`0444`）、仓库数据库 `libra.db` 及其 SQLite sidecar（`0664`/`0640`），以及 `index` 文件（`0664`/`0640`）。
+- 私有签名库 `vault.db` 及其 SQLite sidecar 始终排除在权限放宽之外，保持 owner-only。
+- 权限扫描过程中绝不跟随存储目录内的符号链接。
 
 将 Git 转换到已存在的 bare 目标时，`--shared` 仅更新目标目录及本次新建的仓库条目；已有用户文件的权限保持不变。
 
 ```bash
-libra init --shared group shared-repo
-libra init --shared 0770 shared-repo
+libra init --shared shared-repo
+libra init --shared=group shared-repo
+libra init --shared=0660 shared-repo
 ```
 
 ### `--ref-format <FORMAT>`
@@ -284,7 +287,7 @@ jj（`jj git init`）包装 Git 后端，不创建自己的对象存储；它将
 | 初始分支名 | `git init -b <name>` / `--initial-branch` | 无直接标志（使用 `trunk()` revset config） | `libra init -b <name>` / `--initial-branch` |
 | 对象哈希格式 | `git init --object-format=sha256` | 从 Git 后端继承 | `libra init --object-format sha256` |
 | 模板目录 | `git init --template=<dir>` | N/A | `libra init --template <dir>` |
-| 共享权限 | `git init --shared[=<mode>]` | N/A | `libra init --shared <mode>` |
+| 共享权限 | `git init --shared[=<mode>]` | N/A | `libra init --shared[=<mode>]` |
 | 独立存储目录 | `git init --separate-git-dir=<dir>` | `jj git init --colocate` | 已移除 |
 | 从 Git 仓库导入 | N/A（使用 `git clone --local`） | `jj git init --git-repo <path>` | `libra init --from-git-repository <path>` |
 | Vault / 签名 bootstrap | N/A（手动 GPG/SSH 设置） | N/A | `libra init --vault <bool>`（默认：true） |

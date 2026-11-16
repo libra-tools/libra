@@ -29,6 +29,12 @@ Notes 作为 blob objects 存储在 notes ref 下（默认 `refs/notes/commits`�
 
 裸 `libra notes`、`list`、`show`、`get-ref` 以及 `prune --dry-run` 不会写入 Operation v2 记录。`add`、`append`、`edit`、`copy`、`remove`、`merge` 以及不带 `--dry-run` 的 `prune` 仍各记录一笔（`libra op log --command notes`）。
 
+### 复用 note 内容
+
+`notes add`/`append` 支持 `-C <object>`（`--reuse-message`）直接复用对象 blob 字节作为 note，
+`-c <object>`（`--reedit-message`）以其预填编辑器；`-C`/`-c` 与 `-m`/`-F` 按命令行顺序拼接。
+`notes list` 输出完整 40/64 位对象 id。
+
 ## 选项
 
 | 标志 | 长参数 | 值 | 说明 |

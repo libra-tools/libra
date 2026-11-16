@@ -57,6 +57,36 @@ Pathspec arguments filter the diff to only show changes in matching files or dir
 When stdout is piped and the downstream command exits early, stdout `BrokenPipe` is treated as
 normal pipeline termination; no panic/backtrace or `Broken pipe` diagnostic is printed.
 
+### Explicit line-ending attributes
+
+For repository worktree comparisons, explicit `text`, `eol=lf`, and `eol=crlf`
+attributes use the same clean bytes as `add`: CRLF pairs become LF. Thus an LF
+index blob and an equivalent CRLF worktree file produce no patch, statistics,
+or difference exit status. Real edits remain visible, including in rename
+matching. Attribute changes invalidate the stat shortcut; an unreadable file
+or attribute source is an error, not a clean result.
+
+`-text` preserves bytes. `text=auto` also cleans text input with binary detection and historical CRLF index protection; see [add](add.md) for limits. Stored
+index/tree blobs are never converted: `--cached` and tree-to-tree comparisons
+retain historical content. LFS uses its pointer for the original payload;
+symlink targets, external diff/textconv inputs, and `--no-index` retain their
+existing byte contracts. Comparison does not rewrite files, index entries, or
+stored objects.
+
+In legacy symlink worktrees, content comparisons read `info/attributes` from the resolved metadata directory. Attribute files must be readable regular files; symlink attribute files are rejected.
+
+## Canonical patch format
+
+Unified hunk headers follow Git's canonical form on every patch surface (`diff`,
+`diff --cached`, `show`, `log -p`, `format-patch`, `diff-files`/`diff-tree -p`,
+`stash show -p`): a one-line side omits `,1` (`@@ -1 +1 @@`), an empty side
+anchors at the preceding line and uses 0 at the start of a file
+(`@@ -0,0 +1,3 @@`, `@@ -1 +0,0 @@`), and otherwise the form is
+`@@ -<start>,<count> +<start>,<count> @@`. Only a truly deleted file renders
+`deleted file mode` and `+++ /dev/null`; a file emptied but still present keeps
+`+++ b/<path>`. `libra apply` and `libra am` accept both this canonical form and
+older explicit-count headers.
+
 ## Options
 
 | Option | Short | Long | Description |
@@ -92,7 +122,7 @@ normal pipeline termination; no panic/backtrace or `Broken pipe` diagnostic is p
 | Ignore blank lines | | `--ignore-blank-lines` | Ignore changes whose lines are all blank (truly empty): a change consisting only of added/removed empty lines is not reported (an added/deleted file whose only content is blank lines is still listed with zero counts), while a blank line near a real edit is shown in full. Re-diffs affected files (so `--stat`/`--name-only`/`--numstat`/JSON reflect the result); honors `-U<n>`. Composes with a whitespace flag (`-w`/`-b`/`--ignore-space-at-eol`/`--ignore-cr-at-eol`): under any whitespace flag an all-whitespace line counts as blank (matching Git's `xdl_blankline`). |
 | Shortstat | | `--shortstat` | Show only the trailing summary line of `--stat` (files changed / insertions / deletions), omitting a clause when its count is zero. |
 | Summary | | `--summary` | Show a condensed summary of created/deleted files, detected renames, and mode changes (rename detection is on by default; `diff.renames=false` or `--no-renames` disables it). Plain content-only edits produce no line. |
-| Directory stat | `-X` | `--dirstat[=<param>,...]` | Show a per-directory distribution of changes instead of the patch. Parameters: `changes` (default), `lines`, `files`, `noncumulative` (default), `cumulative`, and a percentage cut-off (default 3%). Requires `=` for the value. |
+| Directory stat | `-X` | `--dirstat[=<param>,...]` | Show a per-directory distribution of changes instead of the patch. Parameters: `changes` (default; byte damage), `lines`, `files`, `noncumulative` (default), `cumulative`, and a percentage cut-off (default 3%, truncated after one decimal). Requires `=` for the value. `--cumulative` is a standalone synonym for `--dirstat=cumulative`; `--dirstat-by-file` is `--dirstat=files`. Only non-top-level directories are listed. |
 | Directory stat by file | | `--dirstat-by-file[=<param>]` | Count changes by FILE rather than by changed line; identical to `--dirstat=files[,<param>]` (`<param>` accepts the same `cumulative`/percentage values). |
 | No-index | | `--no-index` | Diff two filesystem paths directly, without the index or a repository. Recurses directories, pairs same-named entries, and exits 1 on differences. |
 | No patch | `-s` | `--no-patch` | Suppress the patch (diff body). Combine with `--exit-code` for a status-only check. |

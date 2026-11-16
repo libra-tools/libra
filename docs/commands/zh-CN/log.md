@@ -55,6 +55,20 @@ libra log --abbrev-commit
 libra log --abbrev 8
 ```
 
+### `--no-abbrev`
+
+`--no-abbrev` 在人类可读输出中显示完整对象名，包括 `--oneline`、`%h`、
+`%p`、`--parents` 和范围内的 `--children` 对象名。它独立于
+`--abbrev-commit` 和 `--oneline`。与 `--abbrev=<N>` 同时使用时，后出现的
+选项生效；`--no-abbrev` 可以重复使用。JSON 的 `short_hash` 仍保持 7 个字符。
+
+```bash
+libra log --no-abbrev --oneline
+libra log --no-abbrev --abbrev=10 --oneline
+```
+
+直接给 `--no-abbrev` 传值会以 `LBR-CLI-002` 拒绝（退出码 129）。
+
 ### `--no-abbrev-commit`
 
 显示完整提交哈希。覆盖 `--abbrev-commit`。
@@ -92,18 +106,28 @@ libra log --pretty=reference
 `format:`、`tformat:`、`%` 占位符的非空自定义模板。空值与未知的裸预设名
 会在输出前以 `LBR-CLI-002` 失败；显式 CLI 格式会绕过对应配置键。
 
+### 默认布局
+
+默认 `medium` 与 `short`/`full`/`fuller`/`raw` 预设在每个提交记录之间输出一个空行，
+最后一个记录后不输出空行。`Date:` 行使用 Git 默认形式，日期不补零
+（`Fri Jan 2 00:00:00 2026 +0000`）。`oneline`、`reference` 与自定义
+`--format`/`--pretty` 记录之间仅一个换行、不插入空行。`--oneline`、`--pretty`、
+`--format` 按命令行顺序后者生效，而非互斥；`show` 保留头部与缩进消息之间的空行。
+
 ### `--date=<format>`
 
 选择人类输出中的作者/提交者日期格式。支持 `default`、`short`、
 `iso`/`iso8601`、`iso-strict`/`iso8601-strict`、`rfc`/`rfc2822`、`unix`
-与 `raw`。`log.date` 为人类 `log`/`show` 输出提供默认值，显式 `--date`
+与 `raw`，以及 `format:<strftime>`（按 `strftime` 格式渲染日期）。
+`log.date` 为人类 `log`/`show` 输出提供默认值，显式 `--date`
 优先。当前 renderer 尚未实现的合法 Git 模式（`relative`、`human`、
-`local`、`format:*`、`auto:*`）在配置中会明确报错，而不是静默忽略。
+`local`、`auto:*`）在配置中会明确报错，而不是静默忽略。
 结构化 JSON 日期继续使用 schema 规定的 RFC3339 表示。
 
 ```bash
 libra log --date=iso-strict
 libra log --pretty='format:%ad %s' --date=unix
+libra log --date='format:%Y-%m-%d'
 ```
 
 ### `-p, --patch`
@@ -115,9 +139,29 @@ libra log -p
 libra log -p -- src/main.rs
 ```
 
+### `-s, --no-patch`
+
+抑制 diff 输出。此选项可重复；每次出现都会清除它之前给出的 diff 输出
+格式：`-p`/`--patch`、`--stat`、`--shortstat`、`--patch-with-stat`、
+`--name-only` 和 `--name-status`。最后一次 `-s`/`--no-patch` 之后给出的
+格式仍生效。处于生效状态的 `--name-only` 或 `--name-status` 与生效中的
+`-s`/`--no-patch` 冲突；两个 name 选项按顺序处理后若仍同时生效，也会报错。
+之后的 `--stat` 等 diff 格式会清除 `-s`，此时可以输出 name 结果。冲突返回
+`LBR-CLI-002`（退出码 129）。之后出现的 `-s` 会清除之前的 name 选项。
+
+```bash
+libra log -s -1
+libra log -p -s --stat
+libra log -s --stat --name-only                # 接受；显示变更路径
+libra log --name-only --name-status            # 报错
+libra log -s --name-only --no-patch            # 接受；--name-only 已清除
+libra log -s --name-only                       # 报错
+```
+
 ### `--name-only`
 
-只显示每个提交中已更改文件的名称。
+只显示每个提交中已更改文件的名称。此选项不能在 `-s`/`--no-patch` 仍生效时
+保持生效，也不能与仍生效的 `--name-status` 同时使用。
 
 ```bash
 libra log --name-only
@@ -125,7 +169,8 @@ libra log --name-only
 
 ### `--name-status`
 
-显示每个提交中已更改文件的名称和状态（added/modified/deleted）。
+显示每个提交中已更改文件的名称和状态（added/modified/deleted）。此选项不能在
+`-s`/`--no-patch` 仍生效时保持生效，也不能与仍生效的 `--name-only` 同时使用。
 
 ```bash
 libra log --name-status
@@ -164,29 +209,52 @@ libra log --reverse --oneline
 libra log --follow src/main.rs
 ```
 
-### `--author <PATTERN>`
+### `--author <PATTERN>` / `--committer <PATTERN>`
 
-只显示作者姓名或 email 匹配给定模式的提交。
+只显示作者（`--author`）或提交者（`--committer`）姓名或 email 匹配给定模式的提交。
+`--author` 和 `--committer` 可重复。同一字段内的多个模式是「或」；字段之间、
+以及字段与消息过滤之间是「且」。重复 `--author` 不改变 `--all-match` 对
+`--grep` 模式的作用。匹配仍为对 `Name <email>` 的大小写不敏感子串。
 
 ```bash
 libra log --author alice
 libra log --author "alice@example.com"
+libra log --author alice --author bob       # 任一作者模式命中即可
+libra log --committer alice --committer bob
 ```
 
-### `--grep <PATTERN>` / `-i` / `--invert-grep`
+### Notes 显示
 
-按提交消息过滤。`--grep` 保留消息包含该（大小写敏感）子串的提交；`-i` /
-`--regexp-ignore-case` 改为大小写不敏感匹配（author/committer 在 Libra 中本就大小写不敏感）；
-`--invert-grep` 保留消息**不**匹配的提交。
+内置格式（以及默认 full 格式）默认显示提交 notes：消息后空一行、`Notes:`，正文每行缩进 4 个空格；非默认 ref 显示 `Notes (<short-ref>):`。`--notes[=<ref>]` / `--show-notes[=<ref>]` 显式选择 ref（给出 ref 时不再隐式包含默认 ref），`--no-notes` 关闭，`notes.displayRef` 追加 ref，`core.notesRef` 改变默认 ref。自定义 `--format` 仅通过 `%N` 显示 note 原文（无 note 时为空）；`--json` 增加可选 `notes` 数组且不改变既有字段。
+
+### `--grep <PATTERN>` / `--all-match` / `-i` / `--invert-grep`
+
+按提交消息过滤。可重复指定 `--grep`，默认任一模式匹配即可；`--all-match`
+要求每个模式都匹配且不接受值；无模式时不筛选。传入
+`--all-match=<value>` 会被拒绝。默认方言为 POSIX BRE（与 Git 相同）；
+`--fixed-strings` 按字面匹配，`--extended-regexp` 使用 POSIX ERE，
+`--basic-regexp` 显式选择默认方言（最后出现的方言选项生效）。
+`-i` / `--regexp-ignore-case` 让所有模式大小写不敏感；
+`--invert-grep` 保留一个模式都未匹配的提交，并优先于 `--all-match`。
+
+方言：默认 POSIX BRE（`+`、`(`/`)`、`.` 按 Git BRE 语义）；`-F`/`--fixed-strings`
+为字面串，`-E`/`--extended-regexp` 为 ERE，`--basic-regexp` 显式选择 BRE，
+`-P`/`--perl-regexp` 使用 `fancy-regex` Perl 引擎（支持环视与反向引用；`\K`、递归与 `(*VERB)` 为用法错误）。后出现的标志生效。
+未给方言标志时按级联读取 `grep.patternType`（basic/extended/fixed）与
+`grep.extendedRegexp`。
 
 搜索范围包括提交标题、正文和 trailer；嵌入的 PGP/SSH 签名头不参与匹配，
 `-i` 和 `--invert-grep` 也遵循同一范围。实际消息中的文本仍可搜索。
-人类输出、`--json` 和 `--machine` 使用相同筛选范围。空 `--grep` 模式保持不过滤消息的既有行为。
+人类输出、`--json` 和 `--machine` 使用相同筛选范围。空模式匹配所有消息，因此与
+`--invert-grep` 组合时没有提交通过。所有模式会在筛选开始前编译；多个模式
+都无效时，报告命令行中第一个无效模式。
 实际消息开头的空格、tab 和空行仍可搜索。
 此处识别紧跟 committer 的 gpgsig/gpgsig-sha256 签名头；其他导入头顺序（例如 encoding 在 gpgsig 前）沿用既有解析行为。
 
 ```bash
 libra log --grep "fix(" -n 20
+libra log --grep fix --grep docs      # 任一模式匹配
+libra log --all-match --grep fix --grep docs
 libra log --grep fix -i              # 大小写不敏感
 libra log --grep WIP --invert-grep   # 隐藏 WIP 提交
 ```
@@ -224,7 +292,7 @@ libra log --pretty=%P -1
 
 ### `--format <FORMAT>`
 
-`--pretty=<FORMAT>` 的别名（Git 的 `--format`）。接受与 `--pretty` 相同的预设名和 `%` 占位符模板。与 `--pretty` 互斥。
+`--pretty=<FORMAT>` 的别名（Git 的 `--format`）。接受与 `--pretty` 相同的预设名和 `%` 占位符模板。`--oneline`、`--pretty`、`--format` 按命令行顺序后者生效。
 
 ```bash
 libra log --format="%h %s"
@@ -234,6 +302,7 @@ libra log --format=oneline
 ### `--decorate[=<style>]`
 
 在提交旁打印 ref 名称（分支、标签）。样式：`short`（默认）、`full`、`no`。
+人类可读输出中的装饰按完整引用名的逆序列出，`HEAD` 位于最前。`HEAD` 只标在它指向的提交上，即使范围、`--reverse` 或 `--skip` 从别处开始。`--json` 的 `refs` 数组保持原有顺序。
 
 ```bash
 libra log --decorate
@@ -248,13 +317,33 @@ libra log --decorate=full
 libra log --no-decorate
 ```
 
+### `--decorate-refs <PATTERN>` / `--decorate-refs-exclude <PATTERN>`
+
+只装饰匹配任一给定模式的 ref，或隐藏匹配任一排除模式的 ref。两个选项都可重复；每个值是一个完整模式（逗号是字面字符），带隐式的 refs/ 前缀，且只匹配完整引用名。含 `*`、`?` 或 `[` 的模式是通配匹配；否则匹配完整引用名或恰好止于 `/` 组件边界的模式前缀。排除优先于包含。`HEAD` 以字面名 `HEAD` 参与同一过滤：只有 `HEAD` 与其指向的分支都通过过滤时才显示 `HEAD -> <branch>`；否则 `HEAD` 单独显示，分支若通过过滤则按自己的排序位置显示。
+
+```bash
+libra log --decorate --decorate-refs='tags/*'
+libra log --decorate --decorate-refs='heads/aa' --decorate-refs='tags/t1'
+libra log --decorate --decorate-refs-exclude='heads/*'
+```
+
+迁移说明：依赖旧短名或逗号拆分匹配的模式需要改写，例如 `origin/*` 改为 `remotes/origin/*`，`refs/tags/v1,refs/tags/v2` 改为重复给出两个 `--decorate-refs`。
+
 ### `--graph`
 
-绘制基于文本的提交历史图形表示，直观显示分支和合并。
+按 Git 的列分配规则绘制基于文本的提交历史图形：分叉以 `|/` 汇合，双亲合并输出
+`|\`，octopus 合并输出 `*-.` 及其展开行。`--graph` 隐含 Git 的拓扑（图）顺序：
+提交只在其全部子提交之后输出；时间并列时按图顺序栈（最近就绪者优先）。`--date-order`
+与 `--author-date-order` 可接受，但当前复用同一图顺序。
+
+`--all` 从 `refs/` 下的全部引用（本地与远程跟踪分支、tag、`refs/notes/*`）以及
+`HEAD` 按引用名顺序播种。Libra 自身的 notes 后端把 notes 存在 SQLite 而非 notes 提交，
+因此只有导入的 notes 引用会贡献提交。
 
 ```bash
 libra log --graph
 libra log --oneline --graph
+libra log --graph --all
 ```
 
 ### 修订范围（位置参数或 `--range <SPEC>`）
@@ -526,7 +615,7 @@ Libra 将 `--graph` 实现为基于文本的 ASCII/Unicode 图渲染器，类似
 | Oneline 格式 | `git log --oneline` | 默认格式为 oneline | `libra log --oneline` |
 | 缩写哈希 | `git log --abbrev-commit` | 默认 | `libra log --abbrev-commit` |
 | 缩写长度 | `git log --abbrev=<N>` | N/A | `libra log --abbrev <N>` |
-| 完整哈希 | `git log --no-abbrev-commit` | `jj log --no-short-hash` | `libra log --no-abbrev-commit` |
+| 完整哈希 | `git log --no-abbrev` | `jj log --no-short-hash` | `libra log --no-abbrev` / `--no-abbrev-commit` |
 | 显示 patch | `git log -p` | `jj diff -r <rev>`（单独命令） | `libra log -p` / `--patch` |
 | 仅名称 | `git log --name-only` | N/A | `libra log --name-only` |
 | 名称和状态 | `git log --name-status` | N/A | `libra log --name-status` |
@@ -565,6 +654,10 @@ Libra 将 `--graph` 实现为基于文本的 ASCII/Unicode 图渲染器，类似
 | 空分支或空 HEAD | `LBR-REPO-003` | 128 | "create a commit first before running 'libra log'" |
 | 无效日期参数 | `LBR-CLI-002` | 129 | -- |
 | 无效 `--decorate` 选项 | `LBR-CLI-002` | 129 | -- |
+| `--all-match` 传入值 | `LBR-CLI-002` | 129（Git：128） | Libra：`error: unexpected value '1' for '--all-match' found; no more were expected`；Git：`fatal: unrecognized argument: --all-match=1` |
+| 无效 `--grep` 模式（多个无效模式时报告第一个） | `LBR-CLI-002` | 129（Git：128） | Libra：`fatal: invalid --grep pattern '<pattern>': …`；Git：`fatal: command line, '<pattern>': …` |
+| `--no-abbrev` 传入值 | `LBR-CLI-002` | 129 | -- |
+| name 输出选项与生效中的 `-s`/`--no-patch` 冲突，或两个 name 选项仍同时生效 | `LBR-CLI-002` | 129 | -- |
 | 无效对象名 | `LBR-CLI-003` | 129 | "check the revision name and try again" |
 | 无法解析的位置 revision（拼写护栏） | `LBR-CLI-002` | 129 | "unknown revision or path not in the working tree" |
 | 歧义短对象名 | `LBR-CLI-003` | 129 | "The candidates are: ..."（每个候选一行 `<abbrev> <type>`） |

@@ -6609,12 +6609,7 @@ pub(crate) mod tests {
 
         std::fs::remove_file(f.root.path().join("provider-source.jsonl")).unwrap();
         f.db.execute_unprepared("VACUUM").await.unwrap();
-        let executable = std::env::current_exe().unwrap();
-        let helper = executable
-            .parent()
-            .and_then(std::path::Path::parent)
-            .unwrap()
-            .join("libra");
+        let helper = crate::utils::test::real_libra_helper_binary();
         assert!(helper.is_file(), "built Libra helper is unavailable");
         // The proof is that one audited replay completes. The full lib suite
         // can starve the checkpoint write until a 10 s budget elapses before
@@ -8037,12 +8032,7 @@ pub(crate) mod tests {
                 capture_scope::CaptureCommitDeadline,
             };
             let deadline = CaptureCommitDeadline::from_budget(Duration::from_secs(60)).unwrap();
-            let executable = std::env::current_exe().unwrap();
-            let helper = executable
-                .parent()
-                .and_then(std::path::Path::parent)
-                .unwrap()
-                .join("libra");
+            let helper = crate::utils::test::real_libra_helper_binary();
             assert!(helper.is_file(), "built Libra helper is unavailable");
             crate::internal::ai::authorized_read::with_test_helper_program(
                 helper,

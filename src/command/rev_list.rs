@@ -120,19 +120,39 @@ pub struct RevListArgs {
     #[clap(long, value_name = "PATTERN")]
     pub grep: Vec<String>,
 
-    /// Treat `--grep` as a literal fixed string (Git's `--fixed-strings`).
-    #[clap(long = "fixed-strings", overrides_with_all = ["grep_extended", "grep_basic"])]
+    /// Treat `--grep` as a literal fixed string (Git's `-F`/`--fixed-strings`).
+    #[clap(
+        short = 'F',
+        long = "fixed-strings",
+        overrides_with_all = ["grep_extended", "grep_basic", "grep_perl"]
+    )]
     pub grep_fixed: bool,
 
     /// Use POSIX extended regular expressions for `--grep` (Git's
-    /// `--extended-regexp`).
-    #[clap(long = "extended-regexp", overrides_with_all = ["grep_fixed", "grep_basic"])]
+    /// `-E`/`--extended-regexp`).
+    #[clap(
+        short = 'E',
+        long = "extended-regexp",
+        overrides_with_all = ["grep_fixed", "grep_basic", "grep_perl"]
+    )]
     pub grep_extended: bool,
 
     /// Use POSIX basic regular expressions for `--grep` (the default dialect;
     /// accepted for Git parity).
-    #[clap(long = "basic-regexp", overrides_with_all = ["grep_fixed", "grep_extended"])]
+    #[clap(
+        long = "basic-regexp",
+        overrides_with_all = ["grep_fixed", "grep_extended", "grep_perl"]
+    )]
     pub grep_basic: bool,
+
+    /// Use Perl-compatible regular expressions for `--grep` (Git's
+    /// `-P`/`--perl-regexp`; the engine lands in a later release).
+    #[clap(
+        short = 'P',
+        long = "perl-regexp",
+        overrides_with_all = ["grep_fixed", "grep_extended", "grep_basic"]
+    )]
+    pub grep_perl: bool,
 
     /// Match `--grep` case-insensitively (Git's `--regexp-ignore-case`).
     #[clap(short = 'i', long = "regexp-ignore-case")]
@@ -381,7 +401,7 @@ async fn resolve_rev_list(args: &RevListArgs) -> CliResult<RevListOutput> {
     let time_window = rev_list_time_window(args)?;
     let author_filter = rev_list_author_filter(args);
     let committer_filter = rev_list_committer_filter(args);
-    let message_filter = rev_list_message_filter(args)?;
+    let message_filter = rev_list_message_filter(args).await?;
     let parent_filter = parent_count_filter(args);
 
     let mut commits = commits

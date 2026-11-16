@@ -71,6 +71,10 @@ impl ObservedAgent for PiObservedAgent {
     fn protected_dirs(&self) -> &'static [&'static str] {
         &[".pi"]
     }
+
+    fn as_hooks(&self) -> Option<&dyn crate::internal::ai::hooks::provider::HookProvider> {
+        Some(crate::internal::ai::hooks::providers::pi_provider())
+    }
 }
 
 /// Default bound on directory entries one discovery walk inspects.

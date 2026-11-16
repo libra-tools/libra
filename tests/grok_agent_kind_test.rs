@@ -181,7 +181,7 @@ async fn grok_agent_kind_round_trip_and_check() {
     assert!(!row.launchable_investigate);
     assert_eq!(
         supported_slugs(),
-        vec!["claude-code", "codex", "opencode", "grok", "hermes"]
+        vec!["claude-code", "codex", "opencode", "grok", "hermes", "pi"]
     );
 
     let summary = deadline_provider_extraction_summary(AgentKind::Grok, b"thought-canary");

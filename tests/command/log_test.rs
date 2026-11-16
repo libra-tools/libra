@@ -2,7 +2,7 @@
 //!
 //! **Layer:** L1 — deterministic, no external dependencies.
 
-use std::{cmp::min, fs, str::FromStr};
+use std::{cmp::min, fs, io::Write, str::FromStr};
 
 use clap::Parser;
 use git_internal::{
@@ -57,6 +57,1235 @@ fn test_log_cli_empty_repository_returns_fatal_128() {
     assert_eq!(
         stderr,
         "fatal: your current branch 'main' does not have any commits yet\nError-Code: LBR-REPO-003\n\nHint: create a commit first before running 'libra log'."
+    );
+}
+
+fn lo_f1_repo() -> tempfile::TempDir {
+    lo_f1_repo_with_dates("2026-01-02T03:04:05Z", "2026-01-02T03:04:05Z")
+}
+
+fn lo_f1_repo_with_dates(author_timestamp: &str, committer_timestamp: &str) -> tempfile::TempDir {
+    lo_f1_repo_with_dates_and_committers(author_timestamp, committer_timestamp, None)
+}
+
+fn lo_f1_repo_with_distinct_committers() -> tempfile::TempDir {
+    let repo = lo_f1_repo_with_dates_and_committers(
+        "2026-01-02T03:04:05Z",
+        "2026-01-02T03:04:05Z",
+        Some(["Xx Committer", "A U Thor", "A U Thor", "A U Thor"]),
+    );
+
+    fs::OpenOptions::new()
+        .append(true)
+        .open(repo.path().join("file"))
+        .expect("open file")
+        .write_all(b"a\n")
+        .expect("append file");
+    assert_cli_success(
+        &run_libra_command(&["add", "file"], repo.path()),
+        "add unmatched committer commit",
+    );
+    assert_cli_success(
+        &run_libra_command_with_env(
+            &["commit", "-m", "unmatched", "--no-verify"],
+            repo.path(),
+            &[
+                ("GIT_AUTHOR_DATE", "2026-01-02T03:04:05Z"),
+                ("GIT_COMMITTER_DATE", "2026-01-02T03:04:05Z"),
+                ("GIT_COMMITTER_NAME", "Other Committer"),
+                ("GIT_COMMITTER_EMAIL", "other@example.com"),
+            ],
+        ),
+        "commit with unmatched committer",
+    );
+
+    repo
+}
+
+fn lo_f1_repo_with_dates_and_committers(
+    author_timestamp: &str,
+    committer_timestamp: &str,
+    committer_names: Option<[&str; 4]>,
+) -> tempfile::TempDir {
+    let repo = tempdir().expect("tempdir");
+    init_repo_via_cli(repo.path());
+
+    assert_cli_success(
+        &run_libra_command(&["config", "user.name", "A U Thor"], repo.path()),
+        "configure user.name",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "user.email", "author@example.com"], repo.path()),
+        "configure user.email",
+    );
+
+    let commits = [
+        ("initial", None),
+        ("second", Some("With * Asterisk <xyzzy@frotz.com>")),
+        ("third", None),
+        ("fourth", Some("Night Fall <nitfol@frobozz.com>")),
+    ];
+
+    for (index, (message, author)) in commits.into_iter().enumerate() {
+        fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(repo.path().join("file"))
+            .expect("open file")
+            .write_all(b"a\n")
+            .expect("append file");
+        assert_cli_success(
+            &run_libra_command(&["add", "file"], repo.path()),
+            "add file",
+        );
+
+        let mut args = vec!["commit", "-m", message, "--no-verify"];
+        if let Some(author) = author {
+            args.extend(["--author", author]);
+        }
+        let mut commit_env = vec![
+            ("GIT_AUTHOR_DATE", author_timestamp),
+            ("GIT_COMMITTER_DATE", committer_timestamp),
+        ];
+        if let Some(committer_name) = committer_names.map(|names| names[index]) {
+            commit_env.push(("GIT_COMMITTER_NAME", committer_name));
+            commit_env.push(("GIT_COMMITTER_EMAIL", "committer@example.com"));
+        }
+        assert_cli_success(
+            &run_libra_command_with_env(&args, repo.path(), &commit_env),
+            "commit with fixed date",
+        );
+    }
+
+    repo
+}
+
+fn lo_f2_repo() -> tempfile::TempDir {
+    let repo = tempdir().expect("tempdir");
+    init_repo_via_cli(repo.path());
+
+    assert_cli_success(
+        &run_libra_command(&["config", "user.name", "A U Thor"], repo.path()),
+        "configure user.name",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "user.email", "author@example.com"], repo.path()),
+        "configure user.email",
+    );
+
+    for (contents, subject) in [("1", "one"), ("2", "two")] {
+        fs::write(repo.path().join("f"), contents).expect("write fixture file");
+        assert_cli_success(
+            &run_libra_command(&["add", "f"], repo.path()),
+            "stage fixture file",
+        );
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", subject, "--no-verify"], repo.path()),
+            "commit fixture file",
+        );
+    }
+
+    for branch in ["aa", "zz"] {
+        assert_cli_success(
+            &run_libra_command(&["branch", branch], repo.path()),
+            "create fixture branch",
+        );
+    }
+    assert_cli_success(
+        &run_libra_command(&["tag", "t2"], repo.path()),
+        "create lightweight fixture tag",
+    );
+    assert_cli_success(
+        &run_libra_command(&["tag", "-m", "ann", "t1"], repo.path()),
+        "create annotated fixture tag",
+    );
+
+    fs::write(repo.path().join("f"), "3").expect("write fixture file");
+    assert_cli_success(
+        &run_libra_command(&["add", "f"], repo.path()),
+        "stage fixture file",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "three", "--no-verify"], repo.path()),
+        "commit fixture file",
+    );
+
+    for branch in ["octopus-a", "octopus-b"] {
+        assert_cli_success(
+            &run_libra_command(&["branch", branch], repo.path()),
+            "create fixture branch",
+        );
+    }
+    assert_cli_success(
+        &run_libra_command(&["tag", "reach"], repo.path()),
+        "create fixture tag",
+    );
+
+    repo
+}
+
+const LO01_REFUSAL_MESSAGE: &str =
+    "options '--name-only', '--name-status', '--check', and '-s' cannot be used together";
+
+#[derive(Clone, Copy)]
+enum Lo01RefusalPredicate {
+    Message,
+    Code,
+    Exit,
+    Stdout,
+    Json,
+    MachineLines,
+    MachineJson,
+}
+
+fn lo01_assert_refusal_gate(args: &[&str], predicate: Lo01RefusalPredicate) {
+    let repo = lo_f1_repo();
+    let mut command_args = match predicate {
+        Lo01RefusalPredicate::Json => vec!["--json"],
+        Lo01RefusalPredicate::MachineLines | Lo01RefusalPredicate::MachineJson => {
+            vec!["--machine"]
+        }
+        _ => Vec::new(),
+    };
+    command_args.extend_from_slice(args);
+    let output = run_libra_command(&command_args, repo.path());
+
+    match predicate {
+        Lo01RefusalPredicate::Message => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let expected = format!("fatal: {LO01_REFUSAL_MESSAGE}");
+            assert_eq!(stderr.lines().next(), Some(expected.as_str()));
+        }
+        Lo01RefusalPredicate::Code => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(stderr.lines().nth(1), Some("Error-Code: LBR-CLI-002"));
+        }
+        Lo01RefusalPredicate::Exit => assert_eq!(output.status.code(), Some(129)),
+        Lo01RefusalPredicate::Stdout => assert!(output.stdout.is_empty()),
+        Lo01RefusalPredicate::Json => {
+            let actual: serde_json::Value =
+                serde_json::from_slice(&output.stderr).expect("expected JSON error on stderr");
+            assert_eq!(
+                actual,
+                serde_json::json!({
+                    "ok": false,
+                    "error_code": "LBR-CLI-002",
+                    "category": "cli",
+                    "exit_code": 129,
+                    "severity": "fatal",
+                    "message": LO01_REFUSAL_MESSAGE,
+                })
+            );
+        }
+        Lo01RefusalPredicate::MachineLines => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(stderr.lines().count(), 1);
+        }
+        Lo01RefusalPredicate::MachineJson => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let actual: serde_json::Value =
+                serde_json::from_str(stderr.lines().next().expect("expected machine error line"))
+                    .expect("expected machine error JSON");
+            assert_eq!(
+                actual,
+                serde_json::json!({
+                    "ok": false,
+                    "error_code": "LBR-CLI-002",
+                    "category": "cli",
+                    "exit_code": 129,
+                    "severity": "fatal",
+                    "message": LO01_REFUSAL_MESSAGE,
+                })
+            );
+        }
+    }
+}
+
+macro_rules! log_refusal_gates {
+    ($(($name:ident, [$($arg:expr),+ $(,)?], $predicate:ident)),+ $(,)?) => {
+        $(
+            #[allow(non_snake_case)]
+            #[test]
+            fn $name() {
+                lo01_assert_refusal_gate(
+                    &[$($arg),+],
+                    Lo01RefusalPredicate::$predicate,
+                );
+            }
+        )+
+    };
+}
+
+log_refusal_gates! {
+    (lo01_s_then_name_only__msg, ["log", "-1", "--format=%s", "-s", "--name-only"], Message),
+    (lo01_s_then_name_only__code, ["log", "-1", "--format=%s", "-s", "--name-only"], Code),
+    (lo01_s_then_name_only__exit, ["log", "-1", "--format=%s", "-s", "--name-only"], Exit),
+    (lo01_s_then_name_only__stdout, ["log", "-1", "--format=%s", "-s", "--name-only"], Stdout),
+    (lo01_s_then_name_only__json, ["log", "-1", "--format=%s", "-s", "--name-only"], Json),
+    (lo01_s_then_name_only__machine_lines, ["log", "-1", "--format=%s", "-s", "--name-only"], MachineLines),
+    (lo01_s_then_name_only__machine_json, ["log", "-1", "--format=%s", "-s", "--name-only"], MachineJson),
+
+    (lo01_no_patch_then_name_status__msg, ["log", "-1", "--format=%s", "--name-status", "--no-patch", "--name-status"], Message),
+    (lo01_no_patch_then_name_status__code, ["log", "-1", "--format=%s", "--name-status", "--no-patch", "--name-status"], Code),
+    (lo01_no_patch_then_name_status__exit, ["log", "-1", "--format=%s", "--name-status", "--no-patch", "--name-status"], Exit),
+    (lo01_no_patch_then_name_status__stdout, ["log", "-1", "--format=%s", "--name-status", "--no-patch", "--name-status"], Stdout),
+    (lo01_no_patch_then_name_status__json, ["log", "-1", "--format=%s", "--name-status", "--no-patch", "--name-status"], Json),
+    (lo01_no_patch_then_name_status__machine_lines, ["log", "-1", "--format=%s", "--name-status", "--no-patch", "--name-status"], MachineLines),
+    (lo01_no_patch_then_name_status__machine_json, ["log", "-1", "--format=%s", "--name-status", "--no-patch", "--name-status"], MachineJson),
+
+    (lo01_name_only_and_name_status__msg, ["log", "-1", "--format=%s", "--name-only", "--name-status"], Message),
+    (lo01_name_only_and_name_status__code, ["log", "-1", "--format=%s", "--name-only", "--name-status"], Code),
+    (lo01_name_only_and_name_status__exit, ["log", "-1", "--format=%s", "--name-only", "--name-status"], Exit),
+    (lo01_name_only_and_name_status__stdout, ["log", "-1", "--format=%s", "--name-only", "--name-status"], Stdout),
+    (lo01_name_only_and_name_status__json, ["log", "-1", "--format=%s", "--name-only", "--name-status"], Json),
+    (lo01_name_only_and_name_status__machine_lines, ["log", "-1", "--format=%s", "--name-only", "--name-status"], MachineLines),
+    (lo01_name_only_and_name_status__machine_json, ["log", "-1", "--format=%s", "--name-only", "--name-status"], MachineJson),
+}
+
+const LO02_REFUSAL_MESSAGE: &str =
+    "unexpected value '5' for '--no-abbrev' found; no more were expected";
+
+#[derive(Clone, Copy)]
+enum Lo02RefusalPredicate {
+    Message,
+    Code,
+    Exit,
+    Stdout,
+    Json,
+    MachineLines,
+    MachineJson,
+}
+
+fn lo02_assert_refusal_gate(args: &[&str], predicate: Lo02RefusalPredicate) {
+    let repo = lo_f1_repo();
+    let mut command_args = match predicate {
+        Lo02RefusalPredicate::Json => vec!["--json"],
+        Lo02RefusalPredicate::MachineLines | Lo02RefusalPredicate::MachineJson => {
+            vec!["--machine"]
+        }
+        _ => Vec::new(),
+    };
+    command_args.extend_from_slice(args);
+    let output = run_libra_command(&command_args, repo.path());
+
+    match predicate {
+        Lo02RefusalPredicate::Message => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let expected = format!("error: {LO02_REFUSAL_MESSAGE}");
+            assert_eq!(stderr.lines().next(), Some(expected.as_str()));
+        }
+        Lo02RefusalPredicate::Code => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(stderr.lines().nth(1), Some("Error-Code: LBR-CLI-002"));
+        }
+        Lo02RefusalPredicate::Exit => assert_eq!(output.status.code(), Some(129)),
+        Lo02RefusalPredicate::Stdout => assert!(output.stdout.is_empty()),
+        Lo02RefusalPredicate::Json => {
+            let actual: serde_json::Value =
+                serde_json::from_slice(&output.stderr).expect("expected JSON error on stderr");
+            assert_eq!(actual["ok"], false);
+            assert_eq!(actual["error_code"], "LBR-CLI-002");
+            assert_eq!(actual["category"], "cli");
+            assert_eq!(actual["exit_code"], 129);
+            assert_eq!(actual["severity"], "error");
+            assert_eq!(actual["message"], LO02_REFUSAL_MESSAGE);
+            assert!(actual["usage"].as_str().is_some());
+        }
+        Lo02RefusalPredicate::MachineLines => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(stderr.lines().count(), 1);
+        }
+        Lo02RefusalPredicate::MachineJson => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let actual: serde_json::Value =
+                serde_json::from_str(stderr.lines().next().expect("expected machine error line"))
+                    .expect("expected machine error JSON");
+            assert_eq!(actual["error_code"], "LBR-CLI-002");
+            assert_eq!(actual["severity"], "error");
+            assert_eq!(actual["message"], LO02_REFUSAL_MESSAGE);
+            assert!(actual["usage"].as_str().is_some());
+        }
+    }
+}
+
+macro_rules! log_no_abbrev_refusal_gates {
+    ($(($name:ident, $predicate:ident)),+ $(,)?) => {
+        $(
+            #[allow(non_snake_case)]
+            #[test]
+            fn $name() {
+                lo02_assert_refusal_gate(
+                    &["log", "--no-abbrev=5", "--oneline", "-1"],
+                    Lo02RefusalPredicate::$predicate,
+                );
+            }
+        )+
+    };
+}
+
+log_no_abbrev_refusal_gates! {
+    (lo02_no_abbrev_with_value__msg, Message),
+    (lo02_no_abbrev_with_value__code, Code),
+    (lo02_no_abbrev_with_value__exit, Exit),
+    (lo02_no_abbrev_with_value__stdout, Stdout),
+    (lo02_no_abbrev_with_value__json, Json),
+    (lo02_no_abbrev_with_value__machine_lines, MachineLines),
+    (lo02_no_abbrev_with_value__machine_json, MachineJson),
+}
+
+const LO03_ALL_MATCH_WITH_VALUE_MESSAGE: &str =
+    "unexpected value '1' for '--all-match' found; no more were expected";
+const LO03_INVALID_PATTERN_MESSAGE: &str = "invalid --grep pattern 'a\\(': regex parse error:";
+
+#[derive(Clone, Copy)]
+enum Lo03RefusalPredicate {
+    Message,
+    Code,
+    Exit,
+    Stdout,
+    Json,
+    JsonMessage,
+    MachineLines,
+    MachineJson,
+}
+
+fn lo03_assert_refusal_gate(
+    args: &[&str],
+    expected_message: &str,
+    predicate: Lo03RefusalPredicate,
+) {
+    let repo = lo_f1_repo();
+    let mut command_args = match predicate {
+        Lo03RefusalPredicate::Json | Lo03RefusalPredicate::JsonMessage => vec!["--json"],
+        Lo03RefusalPredicate::MachineLines | Lo03RefusalPredicate::MachineJson => {
+            vec!["--machine"]
+        }
+        _ => Vec::new(),
+    };
+    command_args.extend_from_slice(args);
+    let output = run_libra_command(&command_args, repo.path());
+
+    match predicate {
+        Lo03RefusalPredicate::Message => {
+            let prefix = if expected_message.starts_with("unexpected value") {
+                "error: "
+            } else {
+                "fatal: "
+            };
+            let expected = format!("{prefix}{expected_message}");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(stderr.lines().next(), Some(expected.as_str()));
+        }
+        Lo03RefusalPredicate::Code => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.contains("Error-Code: LBR-CLI-002"));
+        }
+        Lo03RefusalPredicate::Exit => assert_eq!(output.status.code(), Some(129)),
+        Lo03RefusalPredicate::Stdout => assert!(output.stdout.is_empty()),
+        Lo03RefusalPredicate::Json => {
+            let actual: serde_json::Value =
+                serde_json::from_slice(&output.stderr).expect("expected JSON error on stderr");
+            assert_eq!(actual["ok"], false);
+            assert_eq!(actual["error_code"], "LBR-CLI-002");
+            assert_eq!(actual["exit_code"], 129);
+        }
+        Lo03RefusalPredicate::JsonMessage => {
+            let actual: serde_json::Value =
+                serde_json::from_slice(&output.stderr).expect("expected JSON error on stderr");
+            assert!(
+                actual["message"]
+                    .as_str()
+                    .is_some_and(|message| message.starts_with(expected_message))
+            );
+        }
+        Lo03RefusalPredicate::MachineLines => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(stderr.lines().count(), 1);
+        }
+        Lo03RefusalPredicate::MachineJson => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let actual: serde_json::Value =
+                serde_json::from_str(stderr.lines().next().expect("expected machine error line"))
+                    .expect("expected machine error JSON");
+            assert_eq!(actual["error_code"], "LBR-CLI-002");
+            assert!(
+                actual["message"]
+                    .as_str()
+                    .is_some_and(|message| message.starts_with(expected_message))
+            );
+        }
+    }
+}
+
+macro_rules! log_lo03_refusal_gates {
+    ($(($name:ident, $args:expr, $message:expr, $predicate:ident)),+ $(,)?) => {
+        $(
+            #[allow(non_snake_case)]
+            #[test]
+            fn $name() {
+                lo03_assert_refusal_gate(
+                    &$args,
+                    $message,
+                    Lo03RefusalPredicate::$predicate,
+                );
+            }
+        )+
+    };
+}
+
+log_lo03_refusal_gates! {
+    (lo03_all_match_with_value__msg, ["log", "--all-match=1", "-1"], LO03_ALL_MATCH_WITH_VALUE_MESSAGE, Message),
+    (lo03_all_match_with_value__code, ["log", "--all-match=1", "-1"], LO03_ALL_MATCH_WITH_VALUE_MESSAGE, Code),
+    (lo03_all_match_with_value__exit, ["log", "--all-match=1", "-1"], LO03_ALL_MATCH_WITH_VALUE_MESSAGE, Exit),
+    (lo03_all_match_with_value__stdout, ["log", "--all-match=1", "-1"], LO03_ALL_MATCH_WITH_VALUE_MESSAGE, Stdout),
+    (lo03_all_match_with_value__json, ["log", "--all-match=1", "-1"], LO03_ALL_MATCH_WITH_VALUE_MESSAGE, Json),
+    (lo03_all_match_with_value__machine_lines, ["log", "--all-match=1", "-1"], LO03_ALL_MATCH_WITH_VALUE_MESSAGE, MachineLines),
+    (lo03_all_match_with_value__machine_json, ["log", "--all-match=1", "-1"], LO03_ALL_MATCH_WITH_VALUE_MESSAGE, MachineJson),
+
+    (lo03_invalid_later_pattern__msg, ["log", "--format=%s", "--grep=", "--grep=a\\("], LO03_INVALID_PATTERN_MESSAGE, Message),
+    (lo03_invalid_later_pattern__code, ["log", "--format=%s", "--grep=", "--grep=a\\("], LO03_INVALID_PATTERN_MESSAGE, Code),
+    (lo03_invalid_later_pattern__exit, ["log", "--format=%s", "--grep=", "--grep=a\\("], LO03_INVALID_PATTERN_MESSAGE, Exit),
+    (lo03_invalid_later_pattern__stdout, ["log", "--format=%s", "--grep=", "--grep=a\\("], LO03_INVALID_PATTERN_MESSAGE, Stdout),
+    (lo03_invalid_later_pattern__json, ["log", "--format=%s", "--grep=", "--grep=a\\("], LO03_INVALID_PATTERN_MESSAGE, Json),
+    (lo03_invalid_later_pattern__json_msg, ["log", "--format=%s", "--grep=", "--grep=a\\("], LO03_INVALID_PATTERN_MESSAGE, JsonMessage),
+    (lo03_invalid_later_pattern__machine_lines, ["log", "--format=%s", "--grep=", "--grep=a\\("], LO03_INVALID_PATTERN_MESSAGE, MachineLines),
+    (lo03_invalid_later_pattern__machine_json, ["log", "--format=%s", "--grep=", "--grep=a\\("], LO03_INVALID_PATTERN_MESSAGE, MachineJson),
+
+    (lo03_first_invalid_pattern_reported__msg, ["log", "--format=%s", "--grep=a\\(", "--grep=b\\{"], LO03_INVALID_PATTERN_MESSAGE, Message),
+    (lo03_first_invalid_pattern_reported__code, ["log", "--format=%s", "--grep=a\\(", "--grep=b\\{"], LO03_INVALID_PATTERN_MESSAGE, Code),
+    (lo03_first_invalid_pattern_reported__exit, ["log", "--format=%s", "--grep=a\\(", "--grep=b\\{"], LO03_INVALID_PATTERN_MESSAGE, Exit),
+    (lo03_first_invalid_pattern_reported__stdout, ["log", "--format=%s", "--grep=a\\(", "--grep=b\\{"], LO03_INVALID_PATTERN_MESSAGE, Stdout),
+    (lo03_first_invalid_pattern_reported__json, ["log", "--format=%s", "--grep=a\\(", "--grep=b\\{"], LO03_INVALID_PATTERN_MESSAGE, Json),
+    (lo03_first_invalid_pattern_reported__json_msg, ["log", "--format=%s", "--grep=a\\(", "--grep=b\\{"], LO03_INVALID_PATTERN_MESSAGE, JsonMessage),
+    (lo03_first_invalid_pattern_reported__machine_lines, ["log", "--format=%s", "--grep=a\\(", "--grep=b\\{"], LO03_INVALID_PATTERN_MESSAGE, MachineLines),
+    (lo03_first_invalid_pattern_reported__machine_json, ["log", "--format=%s", "--grep=a\\(", "--grep=b\\{"], LO03_INVALID_PATTERN_MESSAGE, MachineJson),
+}
+
+fn lo03_log_subjects(filters: &[&str]) -> Vec<String> {
+    let repo = lo_f1_repo();
+    let mut args = vec!["log", "--format=%s"];
+    args.extend_from_slice(filters);
+    let output = run_libra_command(&args, repo.path());
+    assert_cli_success(&output, "log grep filter");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn lo03_multi_grep_union() {
+    assert_eq!(
+        lo03_log_subjects(&["--grep=i", "--grep=r"]),
+        vec!["fourth", "third", "initial"]
+    );
+}
+
+#[test]
+fn lo03_all_match_intersection() {
+    assert_eq!(
+        lo03_log_subjects(&["--all-match", "--grep=i", "--grep=r"]),
+        vec!["third"]
+    );
+}
+
+#[test]
+fn lo03_all_match_three_patterns() {
+    assert!(lo03_log_subjects(&["--all-match", "--grep=i", "--grep=r", "--grep=x"]).is_empty());
+}
+
+#[test]
+fn lo03_empty_pattern_inverted() {
+    assert!(lo03_log_subjects(&["--grep=", "--invert-grep"]).is_empty());
+}
+
+#[test]
+fn lo03_empty_pattern_in_union() {
+    assert_eq!(
+        lo03_log_subjects(&["--grep=", "--grep=xyz"]),
+        vec!["fourth", "third", "second", "initial"]
+    );
+}
+
+#[test]
+fn lo03_all_match_with_empty_pattern() {
+    assert_eq!(
+        lo03_log_subjects(&["--all-match", "--grep=", "--grep=r"]),
+        vec!["fourth", "third"]
+    );
+}
+
+#[test]
+fn lo03_invert_multi_grep() {
+    assert_eq!(
+        lo03_log_subjects(&["--invert-grep", "--grep=i", "--grep=r"]),
+        vec!["second"]
+    );
+}
+
+#[test]
+fn lo03_invert_ignores_all_match() {
+    assert_eq!(
+        lo03_log_subjects(&["--invert-grep", "--all-match", "--grep=i", "--grep=r"]),
+        vec!["second"]
+    );
+}
+
+#[test]
+fn lo03_ignore_case_all_match() {
+    assert_eq!(
+        lo03_log_subjects(&["-i", "--grep=I", "--grep=R", "--all-match"]),
+        vec!["third"]
+    );
+}
+
+#[test]
+fn lo03_fixed_strings_multi() {
+    assert_eq!(
+        lo03_log_subjects(&["--fixed-strings", "--grep=.", "--grep=r"]),
+        vec!["fourth", "third"]
+    );
+}
+
+#[test]
+fn lo03_all_match_without_patterns() {
+    assert_eq!(
+        lo03_log_subjects(&["--all-match"]),
+        vec!["fourth", "third", "second", "initial"]
+    );
+}
+
+#[test]
+fn lo03_all_match_invert_without_patterns() {
+    assert_eq!(
+        lo03_log_subjects(&["--all-match", "--invert-grep"]),
+        vec!["fourth", "third", "second", "initial"]
+    );
+}
+
+#[test]
+fn lo03_repeated_all_match() {
+    assert_eq!(
+        lo03_log_subjects(&["--all-match", "--all-match", "--grep=i", "--grep=r"]),
+        vec!["third"]
+    );
+}
+
+#[test]
+fn lo03_json_all_match() {
+    let repo = lo_f1_repo();
+    let json_output = run_libra_command(
+        &["--json", "log", "--all-match", "--grep=i", "--grep=r"],
+        repo.path(),
+    );
+    assert_cli_success(&json_output, "JSON log grep filter");
+    let machine_output = run_libra_command(
+        &["--machine", "log", "--all-match", "--grep=i", "--grep=r"],
+        repo.path(),
+    );
+    assert_cli_success(&machine_output, "machine log grep filter");
+    let json = parse_json_stdout(&json_output);
+    let machine_json = parse_json_stdout(&machine_output);
+    let subjects_from_output = |json: &serde_json::Value| {
+        json["data"]["commits"]
+            .as_array()
+            .expect("commits should be an array")
+            .iter()
+            .map(|commit| {
+                commit["subject"]
+                    .as_str()
+                    .expect("commit subject should be a string")
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        (
+            subjects_from_output(&json),
+            subjects_from_output(&machine_json)
+        ),
+        (vec!["third".to_string()], vec!["third".to_string()])
+    );
+}
+
+fn lo04_log_subjects(filters: &[&str]) -> Vec<String> {
+    let repo = lo_f1_repo();
+    lo04_log_subjects_in_repo(&repo, filters)
+}
+
+fn lo04_log_subjects_in_repo(repo: &tempfile::TempDir, filters: &[&str]) -> Vec<String> {
+    lo04_log_subjects_with_command(repo, "log", filters)
+}
+
+fn lo04_log_subjects_with_command(
+    repo: &tempfile::TempDir,
+    command: &str,
+    filters: &[&str],
+) -> Vec<String> {
+    let mut args = vec![command, "--format=%s"];
+    args.extend_from_slice(filters);
+    let output = run_libra_command(&args, repo.path());
+    assert_cli_success(&output, "log identity filter");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn lo04_multi_author_union() {
+    assert_eq!(
+        lo04_log_subjects(&["--author=Thor", "--author=Aster"]),
+        vec!["third", "second", "initial"]
+    );
+}
+
+#[test]
+fn lo04_all_match_multi_author_union() {
+    assert_eq!(
+        lo04_log_subjects(&["--all-match", "--author=Thor", "--author=Aster"]),
+        vec!["third", "second", "initial"]
+    );
+}
+
+#[test]
+fn lo04_grep_and_author_intersection() {
+    assert_eq!(
+        lo04_log_subjects(&["--author=A U Thor", "--grep=r"]),
+        vec!["third"]
+    );
+}
+
+#[test]
+fn lo04_grep_union_and_author() {
+    assert_eq!(
+        lo04_log_subjects(&["--author=A U Thor", "--grep=s", "--grep=l"]),
+        vec!["initial"]
+    );
+}
+
+#[test]
+fn lo04_all_match_grep_with_author_union() {
+    assert_eq!(
+        lo04_log_subjects(&["--all-match", "--author=Thor", "--author=Night", "--grep=i"]),
+        vec!["third", "initial"]
+    );
+}
+
+#[test]
+fn lo04_grep_with_author_union() {
+    assert_eq!(
+        lo04_log_subjects(&["--author=Thor", "--author=Night", "--grep=i"]),
+        vec!["third", "initial"]
+    );
+}
+
+#[test]
+fn lo04_all_match_full_intersection() {
+    assert_eq!(
+        lo04_log_subjects(&["--all-match", "--author=A U Thor", "--grep=i", "--grep=r"]),
+        vec!["third"]
+    );
+}
+
+#[test]
+fn lo04_multi_committer_union() {
+    let repo = lo_f1_repo_with_distinct_committers();
+    assert_eq!(
+        lo04_log_subjects_in_repo(&repo, &["--committer=Thor", "--committer=xx"]),
+        vec!["fourth", "third", "second", "initial"]
+    );
+}
+
+#[test]
+fn lo04_author_union_and_committer() {
+    let repo = lo_f1_repo_with_distinct_committers();
+    assert_eq!(
+        lo04_log_subjects_in_repo(
+            &repo,
+            &["--author=Night", "--author=Aster", "--committer=Thor"]
+        ),
+        vec!["fourth", "second"]
+    );
+}
+
+#[test]
+fn lo05_short_decoration_order() {
+    let repo = lo_f2_repo();
+    let output = run_libra_command(&["log", "--decorate=short", "--format=%s%d"], repo.path());
+    assert_cli_success(&output, "log with short decorations");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "three (HEAD -> main, tag: reach, octopus-b, octopus-a)\ntwo (tag: t2, tag: t1, zz, aa)\none\n"
+    );
+}
+
+#[test]
+fn lo05_full_decoration_order() {
+    let repo = lo_f2_repo();
+    let output = run_libra_command(&["log", "--decorate=full", "--format=%s%d"], repo.path());
+    assert_cli_success(&output, "log with full decorations");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "three (HEAD -> refs/heads/main, tag: refs/tags/reach, refs/heads/octopus-b, refs/heads/octopus-a)\ntwo (tag: refs/tags/t2, tag: refs/tags/t1, refs/heads/zz, refs/heads/aa)\none\n"
+    );
+}
+
+#[test]
+fn lo05_oneline_decoration_order() {
+    let repo = lo_f2_repo();
+    let output = run_libra_command(&["log", "--decorate=short", "--oneline", "-2"], repo.path());
+    assert_cli_success(&output, "log oneline with decorations");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let second_line = stdout.lines().nth(1).expect("expected a second log line");
+    let (_, decoration_and_subject) = second_line
+        .split_once(' ')
+        .expect("expected a commit hash followed by a space");
+    assert_eq!(decoration_and_subject, "(tag: t2, tag: t1, zz, aa) two");
+}
+
+#[test]
+fn lo05_percent_big_d_order() {
+    let repo = lo_f2_repo();
+    let output = run_libra_command(
+        &["log", "--decorate=short", "--format=%s%D", "-1"],
+        repo.path(),
+    );
+    assert_cli_success(&output, "log with raw decoration placeholder");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "threeHEAD -> main, tag: reach, octopus-b, octopus-a\n"
+    );
+}
+
+#[test]
+fn lo05_json_refs_order_unchanged() {
+    let repo = lo_f2_repo();
+    let output = run_libra_command(&["--json", "log", "-1"], repo.path());
+    assert_cli_success(&output, "JSON log with refs");
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("expected JSON log output");
+    assert_eq!(
+        json["data"]["commits"][0]["refs"],
+        serde_json::json!(["HEAD -> main", "tag: reach", "octopus-a", "octopus-b"])
+    );
+}
+
+#[test]
+fn log_identity_patterns_support_separated_values_and_history_alias() {
+    let repo = lo_f1_repo_with_distinct_committers();
+    let output = run_libra_command(
+        &[
+            "--max-connections",
+            "2",
+            "--color",
+            "history",
+            "--format=%s",
+            "--committer",
+            "Thor",
+            "--committer",
+            "xx",
+            "--",
+        ],
+        repo.path(),
+    );
+    assert_cli_success(&output, "history with repeated committer patterns");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect::<Vec<_>>(),
+        vec!["fourth", "third", "second", "initial"]
+    );
+}
+
+#[test]
+fn log_identity_repeated_committer_patterns_filter_json_union() {
+    let repo = lo_f1_repo_with_distinct_committers();
+    let output = run_libra_command(
+        &["--json", "log", "--committer=Thor", "--committer=xx"],
+        repo.path(),
+    );
+    assert_cli_success(&output, "JSON log with repeated committer patterns");
+    let json = parse_json_stdout(&output);
+    let commits = json["data"]["commits"]
+        .as_array()
+        .expect("commits should be an array");
+    let subjects = commits
+        .iter()
+        .map(|commit| {
+            commit["subject"]
+                .as_str()
+                .expect("subject should be a string")
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(subjects, ["fourth", "third", "second", "initial"]);
+    assert_eq!(json["data"]["total"], 4);
+}
+
+fn lo02_rev_parse(repo: &tempfile::TempDir, revision: &str) -> String {
+    let output = run_libra_command(&["rev-parse", revision], repo.path());
+    assert_cli_success(&output, "rev-parse");
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+fn lo02_log_stdout(repo: &tempfile::TempDir, args: &[&str]) -> String {
+    let output = run_libra_command(args, repo.path());
+    assert_cli_success(&output, "log");
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+#[test]
+fn lo02_no_abbrev_oneline_full() {
+    let repo = lo_f1_repo();
+    let full = lo02_rev_parse(&repo, "HEAD");
+
+    assert_eq!(
+        lo02_log_stdout(&repo, &["log", "--no-abbrev", "--oneline", "-1"]),
+        format!("{full} fourth\n")
+    );
+}
+
+#[test]
+fn lo02_abbrev_commit_then_no_abbrev() {
+    let repo = lo_f1_repo();
+    let full = lo02_rev_parse(&repo, "HEAD");
+
+    assert_eq!(
+        lo02_log_stdout(
+            &repo,
+            &["log", "--abbrev-commit", "--no-abbrev", "--oneline", "-1"]
+        ),
+        format!("{full} fourth\n")
+    );
+}
+
+#[test]
+fn lo02_no_abbrev_then_abbrev_commit() {
+    let repo = lo_f1_repo();
+    let full = lo02_rev_parse(&repo, "HEAD");
+
+    assert_eq!(
+        lo02_log_stdout(
+            &repo,
+            &["log", "--no-abbrev", "--abbrev-commit", "--oneline", "-1"]
+        ),
+        format!("{full} fourth\n")
+    );
+}
+
+#[test]
+fn lo02_abbrev_n_then_no_abbrev() {
+    let repo = lo_f1_repo();
+    let full = lo02_rev_parse(&repo, "HEAD");
+
+    assert_eq!(
+        lo02_log_stdout(
+            &repo,
+            &["log", "--abbrev=10", "--no-abbrev", "--oneline", "-1"]
+        ),
+        format!("{full} fourth\n")
+    );
+}
+
+#[test]
+fn lo02_no_abbrev_then_abbrev_n() {
+    let repo = lo_f1_repo();
+    let full = lo02_rev_parse(&repo, "HEAD");
+
+    assert_eq!(
+        lo02_log_stdout(
+            &repo,
+            &["log", "--no-abbrev", "--abbrev=10", "--oneline", "-1"]
+        ),
+        format!("{} fourth\n", &full[..10])
+    );
+}
+
+#[test]
+fn lo02_no_abbrev_format_h_p() {
+    let repo = lo_f1_repo();
+    let full = lo02_rev_parse(&repo, "HEAD");
+    let parent = lo02_rev_parse(&repo, "HEAD~1");
+
+    assert_eq!(
+        lo02_log_stdout(&repo, &["log", "--no-abbrev", "--format=%h %p", "-1"]),
+        format!("{full} {parent}\n")
+    );
+}
+
+#[test]
+fn lo02_no_abbrev_parents_oneline() {
+    let repo = lo_f1_repo();
+    let full = lo02_rev_parse(&repo, "HEAD");
+    let parent = lo02_rev_parse(&repo, "HEAD~1");
+
+    assert_eq!(
+        lo02_log_stdout(
+            &repo,
+            &["log", "--no-abbrev", "--parents", "--oneline", "-1"]
+        ),
+        format!("{full} {parent} fourth\n")
+    );
+}
+
+#[test]
+fn lo02_no_abbrev_children_oneline() {
+    let repo = lo_f1_repo();
+    let child = lo02_rev_parse(&repo, "HEAD");
+    let parent = lo02_rev_parse(&repo, "HEAD~1");
+
+    let output = lo02_log_stdout(
+        &repo,
+        &["log", "--no-abbrev", "--children", "--oneline", "-2"],
+    );
+    let parent_line = output
+        .lines()
+        .find(|line| line.starts_with(&parent))
+        .expect("the selected parent commit should be shown");
+
+    assert_eq!(parent_line, format!("{parent} {child} third"));
+}
+
+#[test]
+fn lo02_repeated_no_abbrev() {
+    let repo = lo_f1_repo();
+    let full = lo02_rev_parse(&repo, "HEAD");
+
+    assert_eq!(
+        lo02_log_stdout(
+            &repo,
+            &["log", "--no-abbrev", "--no-abbrev", "--oneline", "-1"]
+        ),
+        format!("{full} fourth\n")
+    );
+}
+
+#[test]
+fn lo02_json_short_hash_unchanged() {
+    let repo = lo_f1_repo();
+    let full = lo02_rev_parse(&repo, "HEAD");
+    let output = run_libra_command(&["--json", "log", "--no-abbrev", "-1"], repo.path());
+    assert_cli_success(&output, "json log --no-abbrev");
+    let json = parse_json_stdout(&output);
+
+    assert_eq!(json["data"]["commits"][0]["short_hash"], &full[..7]);
+}
+
+fn lo01_log_output(args: &[&str]) -> std::process::Output {
+    let repo = lo_f1_repo();
+    run_libra_command(args, repo.path())
+}
+
+#[test]
+fn lo01_no_patch_then_stat_shows_stat() {
+    let output = lo01_log_output(&["log", "-1", "--format=%s", "--no-patch", "--stat", "--stat"]);
+    assert_cli_success(&output, "log --no-patch --stat");
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|line| line.starts_with(" 1 file changed"))
+    );
+}
+
+#[test]
+fn lo01_s_then_shortstat_shows_shortstat() {
+    let output = lo01_log_output(&[
+        "log",
+        "-1",
+        "--format=%s",
+        "-s",
+        "--shortstat",
+        "--shortstat",
+    ]);
+    assert_cli_success(&output, "log -s --shortstat");
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|line| line.starts_with(" 1 file changed"))
+    );
+}
+
+#[test]
+fn lo01_no_patch_then_patch_with_stat_shows_patch() {
+    let output = lo01_log_output(&[
+        "log",
+        "-1",
+        "--format=%s",
+        "--no-patch",
+        "--patch-with-stat",
+        "--patch-with-stat",
+    ]);
+    assert_cli_success(&output, "log --no-patch --patch-with-stat");
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|line| line == "diff --git a/file b/file")
+    );
+}
+
+#[test]
+fn lo01_patch_no_patch_stat_drops_patch() {
+    let output = lo01_log_output(&["log", "-1", "--format=%s", "-p", "--no-patch", "--stat"]);
+    assert_cli_success(&output, "log -p --no-patch --stat");
+    assert!(
+        !String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|line| line.starts_with("diff --git"))
+    );
+}
+
+#[test]
+fn lo01_name_only_then_no_patch_is_silent() {
+    let output = lo01_log_output(&["log", "-1", "--format=%s", "--name-only", "--no-patch"]);
+    assert_cli_success(&output, "log --name-only --no-patch");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "fourth\n");
+}
+
+#[test]
+fn lo01_repeated_no_patch_accepted() {
+    let output = lo01_log_output(&["log", "-1", "--format=%s", "-s", "-s"]);
+    assert_cli_success(&output, "log -s -s");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "fourth\n");
+}
+
+#[test]
+fn lo01_stat_then_no_patch_is_silent() {
+    let output = lo01_log_output(&["log", "-1", "--format=%s", "--stat", "--no-patch"]);
+    assert_cli_success(&output, "log --stat --no-patch");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "fourth\n");
+}
+
+#[test]
+fn lo01_patch_then_no_patch_is_silent() {
+    let output = lo01_log_output(&["log", "-1", "--format=%s", "-p", "--no-patch"]);
+    assert_cli_success(&output, "log -p --no-patch");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "fourth\n");
+}
+
+#[test]
+fn lo01_trailing_no_patch_clears_name_only() {
+    let output = lo01_log_output(&[
+        "log",
+        "-1",
+        "--format=%s",
+        "-s",
+        "--name-only",
+        "--no-patch",
+    ]);
+    assert_cli_success(&output, "log -s --name-only --no-patch");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "fourth\n");
+}
+
+#[test]
+fn lo01_combined_short_flags() {
+    let output = lo01_log_output(&["log", "-1", "--format=%s", "-sp"]);
+    assert_cli_success(&output, "log -sp");
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|line| line == "diff --git a/file b/file")
+    );
+}
+
+#[test]
+fn lo01_no_format_flags_is_plain() {
+    let output = lo01_log_output(&["log", "-1", "--format=%s"]);
+    assert_cli_success(&output, "log without diff format flags");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "fourth\n");
+}
+
+#[test]
+fn lo01_stat_alone_shows_stat() {
+    let output = lo01_log_output(&["log", "-1", "--format=%s", "--stat"]);
+    assert_cli_success(&output, "log --stat");
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|line| line.starts_with(" 1 file changed"))
+    );
+}
+
+#[test]
+fn lo01_patch_alone_shows_patch() {
+    let output = lo01_log_output(&["log", "-1", "--format=%s", "-p", "-p"]);
+    assert_cli_success(&output, "log -p");
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|line| line == "diff --git a/file b/file")
+    );
+}
+
+#[test]
+fn lo01_stat_clears_no_patch_before_repeated_name_only() {
+    let output = lo01_log_output(&[
+        "log",
+        "-1",
+        "--format=%s",
+        "-s",
+        "--stat",
+        "--name-only",
+        "--name-only",
+    ]);
+    assert_cli_success(&output, "log -s --stat --name-only --name-only");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "fourth\n\nfile\n");
+}
+
+#[test]
+fn lo00_date_format_committer_date() {
+    let repo = lo_f1_repo();
+    let output = run_libra_command(
+        &["log", "--format=%cd", "--date=format:%Y-%m-%d", "-1"],
+        repo.path(),
+    );
+    assert_cli_success(&output, "log --date=format:%Y-%m-%d");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "2026-01-02\n");
+}
+
+#[test]
+fn lo00_date_format_with_space_both_dates() {
+    let repo = lo_f1_repo_with_dates("2026-01-02T03:04:05Z", "2026-01-03T04:05:06Z");
+    let output = run_libra_command(
+        &["log", "--format=%ad|%cd", "--date=format:%Y/%m/%d %H", "-1"],
+        repo.path(),
+    );
+    assert_cli_success(&output, "log --date=format:%Y/%m/%d %H");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "2026/01/02 03|2026/01/03 04\n"
+    );
+}
+
+#[test]
+fn lo00_date_format_medium_header() {
+    let repo = lo_f1_repo();
+    let output = run_libra_command(&["log", "--date=format:%Y-%m-%d", "-1"], repo.path());
+    assert_cli_success(&output, "log --date=format:%Y-%m-%d");
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|line| line == "Date:   2026-01-02"),
+        "unexpected log output: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
+fn lo00_date_format_fuller_header() {
+    let repo = lo_f1_repo();
+    let output = run_libra_command(
+        &["log", "--pretty=fuller", "--date=format:%F", "-1"],
+        repo.path(),
+    );
+    assert_cli_success(&output, "log --pretty=fuller --date=format:%F");
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|line| line == "AuthorDate: 2026-01-02"),
+        "unexpected log output: {}",
+        String::from_utf8_lossy(&output.stdout)
     );
 }
 
@@ -1629,9 +2858,9 @@ async fn test_log_graph() {
     let commit_hash = ObjectHash::from_str(&commit_id).unwrap();
     let commit = load_object::<Commit>(&commit_hash).unwrap();
 
-    let prefix = graph_state.render(&commit);
-    assert!(!prefix.is_empty());
-    assert!(prefix.contains('*'));
+    let rendered = graph_state.render(&commit);
+    assert!(!rendered.prefix.is_empty());
+    assert!(rendered.prefix.contains('*'));
 }
 
 #[tokio::test]
@@ -1725,8 +2954,8 @@ async fn test_log_graph_simple_chain() {
     let mut graph_state = libra::command::log::GraphState::new();
 
     for commit in reachable_commits.iter().take(2) {
-        let prefix = graph_state.render(commit);
-        assert!(prefix.starts_with("* ") || prefix.contains("* "));
+        let rendered = graph_state.render(commit);
+        assert!(rendered.prefix.starts_with("* ") || rendered.prefix.contains("* "));
     }
 }
 
@@ -1790,8 +3019,8 @@ async fn test_log_stat_and_graph_combined() {
     assert_eq!(stats.len(), 1);
 
     let mut graph_state = libra::command::log::GraphState::new();
-    let prefix = graph_state.render(&commit);
-    assert!(!prefix.is_empty());
+    let rendered = graph_state.render(&commit);
+    assert!(!rendered.prefix.is_empty());
 }
 
 fn run_log_cmd(args: &[&str], cwd: &std::path::Path) -> (std::process::ExitStatus, String, String) {
@@ -2129,17 +3358,17 @@ fn test_log_json_oneline_flag_does_not_alter_schema() {
 #[test]
 fn test_log_args_grep() {
     let args = LogArgs::parse_from(["libra", "--grep", "fix"]);
-    assert_eq!(args.grep, Some("fix".to_string()));
+    assert_eq!(args.grep, vec!["fix".to_string()]);
 
     let args = LogArgs::parse_from(["libra"]);
-    assert_eq!(args.grep, None);
+    assert!(args.grep.is_empty());
 }
 
 // Test grep combined with other arguments
 #[test]
 fn test_grep_with_other_args() {
     let args = LogArgs::parse_from(["libra", "--grep", "feature", "--oneline", "-n", "5"]);
-    assert_eq!(args.grep, Some("feature".to_string()));
+    assert_eq!(args.grep, vec!["feature".to_string()]);
     assert!(args.oneline);
     assert_eq!(args.number, Some(5));
 }
@@ -2148,14 +3377,14 @@ fn test_grep_with_other_args() {
 #[test]
 fn test_grep_case_sensitive() {
     let args = LogArgs::parse_from(["libra", "--grep", "FIX"]);
-    assert_eq!(args.grep, Some("FIX".to_string()));
+    assert_eq!(args.grep, vec!["FIX".to_string()]);
 }
 
 // Test empty string grep
 #[test]
 fn test_grep_empty_string() {
     let args = LogArgs::parse_from(["libra", "--grep", ""]);
-    assert_eq!(args.grep, Some("".to_string()));
+    assert_eq!(args.grep, vec!["".to_string()]);
 }
 
 // Test graph with grep combination
@@ -2163,7 +3392,7 @@ fn test_grep_empty_string() {
 fn test_graph_with_grep() {
     let args = LogArgs::parse_from(["libra", "--graph", "--grep", "fix"]);
     assert!(args.graph);
-    assert_eq!(args.grep, Some("fix".to_string()));
+    assert_eq!(args.grep, vec!["fix".to_string()]);
 }
 
 // Integration test: verify actual filtering behavior
@@ -2788,9 +4017,22 @@ fn log_format_is_alias_for_pretty() {
         String::from_utf8_lossy(&fmt.stdout)
     );
 
-    // `--format` and `--pretty` are mutually exclusive.
-    let both = run_libra_command(&["log", "--format=%s", "--pretty=%s", "-1"], p);
-    assert!(!both.status.success(), "--format conflicts with --pretty");
+    // ADR-LG-05 item 2: `--oneline`, `--pretty`, and `--format` are
+    // last-one-wins rather than mutually exclusive.
+    let pretty_last = run_libra_command(&["log", "--format=%H", "--pretty=%s", "-1"], p);
+    assert_cli_success(&pretty_last, "log --format then --pretty");
+    assert_eq!(
+        String::from_utf8_lossy(&pretty_last.stdout).trim(),
+        "base",
+        "--pretty after --format wins"
+    );
+    let format_last = run_libra_command(&["log", "--pretty=%s", "--format=%H", "-1"], p);
+    assert_cli_success(&format_last, "log --pretty then --format");
+    assert_eq!(
+        String::from_utf8_lossy(&format_last.stdout).trim().len(),
+        40,
+        "--format after --pretty wins"
+    );
 }
 
 #[test]
@@ -3006,11 +4248,11 @@ fn log_no_expand_tabs_flag_is_accepted_noop() {
 }
 
 #[test]
-fn log_no_notes_flag_is_accepted_noop() {
+fn log_no_notes_flag_hides_default_notes() {
     let repo = create_committed_repo_via_cli();
     let p = repo.path();
-    // Attach a note; Libra's log never displays notes inline, so the flag is a
-    // no-op whether or not a note exists.
+    // ADR-LG-03: built-in formats show notes by default, so `--no-notes` is no
+    // longer a no-op — it suppresses the block that plain `log` now displays.
     assert!(
         run_libra_command(&["notes", "add", "-m", "a note", "HEAD"], p)
             .status
@@ -3019,17 +4261,19 @@ fn log_no_notes_flag_is_accepted_noop() {
 
     let plain = run_libra_command(&["log"], p);
     assert_cli_success(&plain, "log");
+    assert!(
+        String::from_utf8_lossy(&plain.stdout).contains("Notes:"),
+        "plain log shows the default note block"
+    );
+    assert!(
+        String::from_utf8_lossy(&plain.stdout).contains("    a note"),
+        "plain log shows the note body"
+    );
     let out = run_libra_command(&["log", "--no-notes"], p);
     assert_cli_success(&out, "log --no-notes");
-    assert_eq!(
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&plain.stdout),
-        "log --no-notes matches plain log (no-op)"
-    );
-    // Sanity: the note is not shown by plain log either.
     assert!(
-        !String::from_utf8_lossy(&plain.stdout).contains("a note"),
-        "Libra log does not display notes inline"
+        !String::from_utf8_lossy(&out.stdout).contains("Notes:"),
+        "log --no-notes suppresses the note block"
     );
 }
 
@@ -4586,4 +5830,891 @@ fn log_ineligible_all_multiple_tips_walk_full_history() {
     assert_loads(repo.path(), &["log", "-n", "1", "main", "side"], tips);
     let all = rev_list_count(repo.path(), &["--all"]);
     assert_loads(repo.path(), &["log", "--all", "-n", "1"], all);
+}
+
+/// LO-06 reuses fixture F2: the `HEAD` decoration may appear only on the
+/// commit HEAD points to, whatever range, order or limit the log renders.
+fn lo06_log_stdout(repo: &tempfile::TempDir, args: &[&str]) -> String {
+    let output = run_libra_command(args, repo.path());
+    assert_cli_success(&output, "log with decorations");
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+#[test]
+fn lo06_head_absent_outside_range() {
+    let repo = lo_f2_repo();
+    assert_eq!(
+        lo06_log_stdout(
+            &repo,
+            &["log", "--decorate=short", "--format=%s%d", "-1", "HEAD~1"]
+        ),
+        "two (tag: t2, tag: t1, zz, aa)\n"
+    );
+}
+
+#[test]
+fn lo06_reverse_keeps_head_on_head_commit() {
+    let repo = lo_f2_repo();
+    assert_eq!(
+        lo06_log_stdout(
+            &repo,
+            &["log", "--decorate=short", "--format=%s%d", "--reverse"]
+        ),
+        "one\ntwo (tag: t2, tag: t1, zz, aa)\nthree (HEAD -> main, tag: reach, octopus-b, octopus-a)\n"
+    );
+}
+
+#[test]
+fn lo06_skip_does_not_move_head() {
+    let repo = lo_f2_repo();
+    assert_eq!(
+        lo06_log_stdout(
+            &repo,
+            &["log", "--decorate=short", "--format=%s%d", "--skip=1"]
+        ),
+        "two (tag: t2, tag: t1, zz, aa)\none\n"
+    );
+}
+
+#[test]
+fn lo06_other_branch_has_no_head() {
+    let repo = lo_f2_repo();
+    assert_eq!(
+        lo06_log_stdout(&repo, &["log", "--decorate=short", "--format=%s%d", "zz"]),
+        "two (tag: t2, tag: t1, zz, aa)\none\n"
+    );
+}
+
+#[test]
+fn lo06_detached_head_on_its_commit() {
+    let repo = lo_f2_repo();
+    assert_cli_success(
+        &run_libra_command(&["switch", "--detach", "HEAD~1"], repo.path()),
+        "detach HEAD~1",
+    );
+    assert_eq!(
+        lo06_log_stdout(&repo, &["log", "--decorate=short", "--format=%s%d", "main"]),
+        "three (tag: reach, octopus-b, octopus-a, main)\ntwo (HEAD, tag: t2, tag: t1, zz, aa)\none\n"
+    );
+}
+
+/// LO-07 decoration-filter gates: fixture F2, `log --decorate=short
+/// --format=%s%d -1 HEAD~1` plus the given options; the expected stdout is
+/// the row value plus `\n`. Options are passed literally, never through a
+/// shell.
+fn lo07_decoration_output(options: &[&str]) -> String {
+    let repo = lo_f2_repo();
+    let mut args = vec!["log", "--decorate=short", "--format=%s%d", "-1", "HEAD~1"];
+    args.extend_from_slice(options);
+    let output = run_libra_command(&args, repo.path());
+    assert_cli_success(&output, "log with decoration filters");
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+#[test]
+fn lo07_glob_shorthand_heads() {
+    assert_eq!(
+        lo07_decoration_output(&["--decorate-refs=heads/a*"]),
+        "two (aa)\n"
+    );
+}
+
+#[test]
+fn lo07_glob_full_heads() {
+    assert_eq!(
+        lo07_decoration_output(&["--decorate-refs=refs/heads/*"]),
+        "two (zz, aa)\n"
+    );
+}
+
+#[test]
+fn lo07_short_name_glob_does_not_match() {
+    assert_eq!(lo07_decoration_output(&["--decorate-refs=a*"]), "two\n");
+}
+
+#[test]
+fn lo07_star_matches_all_refs() {
+    assert_eq!(
+        lo07_decoration_output(&["--decorate-refs=*"]),
+        "two (tag: t2, tag: t1, zz, aa)\n"
+    );
+}
+
+#[test]
+fn lo07_shorthand_tag_exact() {
+    assert_eq!(
+        lo07_decoration_output(&["--decorate-refs=tags/t2"]),
+        "two (tag: t2)\n"
+    );
+}
+
+#[test]
+fn lo07_prefix_respects_component_boundary() {
+    assert_eq!(
+        lo07_decoration_output(&["--decorate-refs=refs/heads/a"]),
+        "two\n"
+    );
+}
+
+#[test]
+fn lo07_shorthand_namespace_prefix() {
+    assert_eq!(
+        lo07_decoration_output(&["--decorate-refs=heads"]),
+        "two (zz, aa)\n"
+    );
+}
+
+#[test]
+fn lo07_trailing_slash_stripped() {
+    assert_eq!(
+        lo07_decoration_output(&["--decorate-refs=refs/heads/"]),
+        "two (zz, aa)\n"
+    );
+}
+
+#[test]
+fn lo07_question_mark_glob() {
+    assert_eq!(
+        lo07_decoration_output(&["--decorate-refs=tags/t?"]),
+        "two (tag: t2, tag: t1)\n"
+    );
+}
+
+#[test]
+fn lo07_star_crosses_slash() {
+    assert_eq!(
+        lo07_decoration_output(&["--decorate-refs=*t1"]),
+        "two (tag: t1)\n"
+    );
+}
+
+#[test]
+fn lo07_bracket_class_glob() {
+    assert_eq!(
+        lo07_decoration_output(&["--decorate-refs=heads/[a]a"]),
+        "two (aa)\n"
+    );
+}
+
+#[test]
+fn lo07_repeated_include_union() {
+    assert_eq!(
+        lo07_decoration_output(&["--decorate-refs=heads/aa", "--decorate-refs=tags/t1"]),
+        "two (tag: t1, aa)\n"
+    );
+}
+
+#[test]
+fn lo07_comma_is_literal() {
+    assert_eq!(
+        lo07_decoration_output(&["--decorate-refs=heads/aa,tags/t1"]),
+        "two\n"
+    );
+}
+
+#[test]
+fn lo07_empty_include_matches_all_refs() {
+    assert_eq!(
+        lo07_decoration_output(&["--decorate-refs="]),
+        "two (tag: t2, tag: t1, zz, aa)\n"
+    );
+}
+
+#[test]
+fn lo07_exclude_glob() {
+    assert_eq!(
+        lo07_decoration_output(&["--decorate-refs-exclude=heads/*"]),
+        "two (tag: t2, tag: t1)\n"
+    );
+}
+
+#[test]
+fn lo07_exclude_short_name_no_match() {
+    assert_eq!(
+        lo07_decoration_output(&["--decorate-refs-exclude=aa"]),
+        "two (tag: t2, tag: t1, zz, aa)\n"
+    );
+}
+
+#[test]
+fn lo07_repeated_exclude() {
+    assert_eq!(
+        lo07_decoration_output(&[
+            "--decorate-refs-exclude=heads/aa",
+            "--decorate-refs-exclude=tags/t1"
+        ]),
+        "two (tag: t2, zz)\n"
+    );
+}
+
+#[test]
+fn lo07_include_then_exclude() {
+    assert_eq!(
+        lo07_decoration_output(&[
+            "--decorate-refs=heads/*",
+            "--decorate-refs-exclude=heads/z*"
+        ]),
+        "two (aa)\n"
+    );
+}
+
+#[test]
+fn lo07_exclude_beats_include() {
+    assert_eq!(
+        lo07_decoration_output(&[
+            "--decorate-refs=heads/aa",
+            "--decorate-refs-exclude=heads/aa"
+        ]),
+        "two\n"
+    );
+}
+
+#[test]
+fn lo07_empty_exclude_drops_all_refs() {
+    assert_eq!(
+        lo07_decoration_output(&["--decorate-refs-exclude="]),
+        "two\n"
+    );
+}
+
+#[test]
+fn lo07_class_with_regex_set_operator() {
+    assert_eq!(
+        lo07_decoration_output(&["--decorate-refs=heads/[a&&b]a"]),
+        "two (aa)\n"
+    );
+}
+
+#[test]
+fn lo07_posix_class() {
+    assert_eq!(
+        lo07_decoration_output(&["--decorate-refs=heads/[[:alpha:]][[:alpha:]]"]),
+        "two (zz, aa)\n"
+    );
+}
+
+#[test]
+fn lo07_backslash_escape_in_glob() {
+    assert_eq!(
+        lo07_decoration_output(&["--decorate-refs=heads/\\a*"]),
+        "two (aa)\n"
+    );
+}
+
+#[test]
+fn lo07_backslash_without_glob_is_literal_prefix() {
+    assert_eq!(
+        lo07_decoration_output(&["--decorate-refs=heads/\\aa"]),
+        "two\n"
+    );
+}
+
+#[test]
+fn lo07_unterminated_class_matches_nothing() {
+    assert_eq!(
+        lo07_decoration_output(&["--decorate-refs=heads/a["]),
+        "two\n"
+    );
+}
+
+/// LO-08 gates: `HEAD` passes the same decoration filters as any other
+/// decoration, and `HEAD -> <branch>` needs both `HEAD` and the branch.
+fn lo08_decoration_output(options: &[&str]) -> String {
+    let repo = lo_f2_repo();
+    let mut args = vec!["log", "--decorate=short", "--format=%s%d", "-1"];
+    args.extend_from_slice(options);
+    let output = run_libra_command(&args, repo.path());
+    assert_cli_success(&output, "log with HEAD decoration filters");
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+#[test]
+fn lo08_include_head_only() {
+    assert_eq!(
+        lo08_decoration_output(&["--decorate-refs=HEAD"]),
+        "three (HEAD)\n"
+    );
+}
+
+#[test]
+fn lo08_exclude_head() {
+    assert_eq!(
+        lo08_decoration_output(&["--decorate-refs-exclude=HEAD"]),
+        "three (tag: reach, octopus-b, octopus-a, main)\n"
+    );
+}
+
+#[test]
+fn lo08_include_heads_drops_head() {
+    assert_eq!(
+        lo08_decoration_output(&["--decorate-refs=refs/heads"]),
+        "three (octopus-b, octopus-a, main)\n"
+    );
+}
+
+#[test]
+fn lo08_exclude_current_branch_keeps_bare_head() {
+    assert_eq!(
+        lo08_decoration_output(&["--decorate-refs-exclude=refs/heads/main"]),
+        "three (HEAD, tag: reach, octopus-b, octopus-a)\n"
+    );
+}
+
+#[test]
+fn lo08_head_and_branch_compose_arrow() {
+    assert_eq!(
+        lo08_decoration_output(&["--decorate-refs=HEAD", "--decorate-refs=heads/main"]),
+        "three (HEAD -> main)\n"
+    );
+}
+
+#[test]
+fn lo08_include_and_exclude_without_head() {
+    assert_eq!(
+        lo08_decoration_output(&[
+            "--decorate-refs=heads/*",
+            "--decorate-refs-exclude=heads/oc*"
+        ]),
+        "three (main)\n"
+    );
+}
+
+#[test]
+fn lo08_exclude_all_refs_keeps_head() {
+    assert_eq!(
+        lo08_decoration_output(&["--decorate-refs-exclude=*"]),
+        "three (HEAD)\n"
+    );
+}
+
+#[test]
+fn lo08_detached_head_filtered_out() {
+    let repo = lo_f2_repo();
+    assert_cli_success(
+        &run_libra_command(&["switch", "--detach", "HEAD"], repo.path()),
+        "detach HEAD",
+    );
+    let output = run_libra_command(
+        &[
+            "log",
+            "--decorate=short",
+            "--format=%s%d",
+            "-1",
+            "--decorate-refs=refs/heads",
+        ],
+        repo.path(),
+    );
+    assert_cli_success(&output, "detached HEAD with head-only ref filter");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "three (octopus-b, octopus-a, main)\n"
+    );
+}
+
+/// LG-01 (M-GREP G1..G10): `--grep` dialect, multi-pattern, and scope matrix.
+#[test]
+#[serial(cwd)]
+fn test_log_grep_pattern_types_matrix() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    // Four commits whose subjects exercise the matrix.
+    for (file, message) in [
+        ("a.txt", "init"),
+        ("b.txt", "fooXbar"),
+        ("c.txt", "c++ (fix)"),
+        ("d.txt", "foo.bar aaa"),
+    ] {
+        fs::write(p.join(file), format!("{file}\n")).unwrap();
+        assert_cli_success(&run_libra_command(&["add", file], p), "add");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", message, "--no-verify"], p),
+            "commit",
+        );
+    }
+
+    let subjects = |args: &[&str]| -> Vec<String> {
+        let out = run_libra_command(args, p);
+        assert_cli_success(&out, "log grep");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect()
+    };
+
+    // G1: BRE treats `+`/`(`/`)` literally, so the whole subject matches.
+    assert_eq!(
+        subjects(&["log", "--format=%s", "--grep", "c++ (fix)"]),
+        vec!["c++ (fix)"]
+    );
+    // G2: `.` is the BRE any-char operator.
+    assert_eq!(
+        subjects(&["log", "--format=%s", "--grep", "foo.bar"]),
+        vec!["foo.bar aaa", "fooXbar"]
+    );
+    // G3: `a+` is a literal BRE, so nothing matches; `-E` makes it ERE.
+    assert!(subjects(&["log", "--format=%s", "--grep", "a+"]).is_empty());
+    let extended = subjects(&["log", "--format=%s", "-E", "--grep", "a+"]);
+    assert!(extended.contains(&"foo.bar aaa".to_string()));
+    assert!(extended.contains(&"fooXbar".to_string()));
+    // G4: fixed strings bypass the regex engine.
+    assert_eq!(
+        subjects(&["log", "--format=%s", "-F", "--grep", "foo.bar"]),
+        vec!["foo.bar aaa"]
+    );
+    assert_eq!(
+        subjects(&[
+            "log",
+            "--format=%s",
+            "--fixed-strings",
+            "--grep",
+            "c++ (fix)"
+        ]),
+        vec!["c++ (fix)"]
+    );
+    // G5: explicit basic dialect and the Perl dialect (LG-14 engine).
+    let basic = subjects(&["log", "--format=%s", "--basic-regexp", "--grep", r"a\+"]);
+    assert!(basic.contains(&"foo.bar aaa".to_string()));
+    assert!(basic.contains(&"fooXbar".to_string()));
+    let perl = run_libra_command(&["log", "--grep", "a{2,}", "-P", "--format=%s", "HEAD"], p);
+    assert_cli_success(&perl, "log -P --grep");
+    let perl_text = String::from_utf8_lossy(&perl.stdout);
+    assert_eq!(perl_text.trim(), "foo.bar aaa", "{perl_text}");
+    // G6: `--all-match` requires every pattern; the default is any.
+    assert_eq!(
+        subjects(&[
+            "log",
+            "--format=%s",
+            "--all-match",
+            "--grep",
+            "foo",
+            "--grep",
+            "aaa"
+        ]),
+        vec!["foo.bar aaa"]
+    );
+    let any = subjects(&["log", "--format=%s", "--grep", "foo", "--grep", "aaa"]);
+    assert!(any.contains(&"foo.bar aaa".to_string()));
+    assert!(any.contains(&"fooXbar".to_string()));
+    // G10: an invalid BRE is a CLI usage error naming the pattern.
+    let invalid = run_libra_command(&["log", "--grep", r"a\(", "HEAD"], p);
+    assert_eq!(invalid.status.code(), Some(129));
+    let stderr = String::from_utf8_lossy(&invalid.stderr);
+    assert!(stderr.contains("invalid --grep pattern"), "{stderr}");
+    assert!(stderr.contains(r"a\("), "{stderr}");
+}
+
+/// LG-02 (M-NOTES N1..N9): default notes display, switches, `%N`, and JSON.
+#[test]
+#[serial(cwd)]
+fn test_log_displays_notes_matrix() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+
+    // N1: a default-ref note is displayed by the built-in format.
+    assert_cli_success(
+        &run_libra_command(&["notes", "add", "-m", "note body"], p),
+        "add default note",
+    );
+    let default_log = run_libra_command(&["log", "-1"], p);
+    assert_cli_success(&default_log, "log -1");
+    let text = String::from_utf8_lossy(&default_log.stdout);
+    assert!(text.contains("\nNotes:\n"), "{text:?}");
+    assert!(text.contains("    note body"), "{text:?}");
+
+    // N2: --no-notes suppresses the block.
+    let no_notes = run_libra_command(&["log", "-1", "--no-notes"], p);
+    assert_cli_success(&no_notes, "log --no-notes");
+    let text = String::from_utf8_lossy(&no_notes.stdout);
+    assert!(!text.contains("Notes:"), "{text:?}");
+
+    // N3: --notes / --show-notes re-enable it.
+    for flag in ["--notes", "--show-notes"] {
+        let out = run_libra_command(&["log", "-1", flag], p);
+        assert_cli_success(&out, "log notes flag");
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("Notes:"),
+            "{flag}: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+
+    // N4: another ref renders its short name and only its note.
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "notes",
+                "--ref",
+                "refs/notes/other",
+                "add",
+                "-m",
+                "other body",
+            ],
+            p,
+        ),
+        "add other note",
+    );
+    let other = run_libra_command(&["log", "-1", "--notes=other"], p);
+    assert_cli_success(&other, "log --notes=other");
+    let text = String::from_utf8_lossy(&other.stdout);
+    assert!(text.contains("Notes (other):"), "{text:?}");
+    assert!(text.contains("other body"), "{text:?}");
+    assert!(!text.contains("note body"), "{text:?}");
+
+    // N5/N6: `%N` expands the note; a custom format suppresses the block.
+    let placeholder = run_libra_command(&["log", "-1", "--format=%s%n%N"], p);
+    assert_cli_success(&placeholder, "log %N");
+    let text = String::from_utf8_lossy(&placeholder.stdout);
+    assert!(text.contains("note body"), "{text:?}");
+    assert!(!text.contains("Notes:"), "{text:?}");
+
+    // N9: JSON gains a `notes` array without removing existing fields.
+    let json = run_libra_command(&["--machine", "log", "-1"], p);
+    assert_cli_success(&json, "machine log");
+    let parsed: serde_json::Value = serde_json::from_slice(&json.stdout).expect("json");
+    let entry = &parsed["data"]["commits"][0];
+    assert_eq!(entry["notes"][0], "note body");
+    assert!(entry["hash"].is_string(), "existing fields preserved");
+}
+
+/// LG-02 (M-NOTES N8): `t3301` notes-display ports.
+#[test]
+#[serial(cwd)]
+fn test_t3301_notes_display_ports() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["notes", "add", "-m", "Reviewed-by: Alice"], p),
+        "notes add",
+    );
+
+    // t3301:64 — `git log --format=%N` expands the note on HEAD.
+    let fmt = run_libra_command(&["log", "-1", "--format=%N"], p);
+    assert_cli_success(&fmt, "log %N");
+    assert!(
+        String::from_utf8_lossy(&fmt.stdout).contains("Reviewed-by: Alice"),
+        "{}",
+        String::from_utf8_lossy(&fmt.stdout)
+    );
+
+    // t3301:154 — default `log` shows the note block.
+    let default_log = run_libra_command(&["log", "-1"], p);
+    assert!(String::from_utf8_lossy(&default_log.stdout).contains("Notes:"));
+
+    // t3301:282 — `--no-notes` hides it again.
+    let hidden = run_libra_command(&["log", "-1", "--no-notes"], p);
+    assert!(!String::from_utf8_lossy(&hidden.stdout).contains("Notes:"));
+}
+
+/// LG-05 (M-LAYOUT L1): default log layout matches Git — unpadded day, one
+/// blank line between commits, and no blank line after the final commit.
+#[test]
+#[serial(cwd)]
+fn test_log_default_layout_matches_git() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    // Rewrite the base commit with a single-digit day so the padding rule is
+    // observable (`Fri Jan 2 ...`, not `Fri Jan 02 ...`).
+    fs::write(p.join("tracked.txt"), "one\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "tracked.txt"], p), "add one");
+    assert_cli_success(
+        &run_libra_command_with_env(
+            &["commit", "-m", "second", "--no-verify"],
+            p,
+            &[
+                ("GIT_AUTHOR_DATE", "2026-01-02T00:00:00Z"),
+                ("GIT_COMMITTER_DATE", "2026-01-02T00:00:00Z"),
+            ],
+        ),
+        "commit with fixed date",
+    );
+
+    let out = run_libra_command(&["log", "-2"], p);
+    assert_cli_success(&out, "log -2");
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        text.contains("Date:   Fri Jan 2 00:00:00 2026 +0000"),
+        "unpadded day: {text:?}"
+    );
+    assert!(
+        !text.contains("Jan 02"),
+        "day must not be zero-padded: {text:?}"
+    );
+    // Exactly one blank line between the two commit records.
+    let between = text.split("commit ").nth(2).expect("second commit record");
+    assert!(
+        between.starts_with(|c: char| c.is_ascii_alphanumeric()),
+        "blank line separates records: {text:?}"
+    );
+    let separator_count = text.matches("\n\ncommit ").count();
+    assert_eq!(
+        separator_count, 1,
+        "one blank line between commits: {text:?}"
+    );
+    // No trailing blank line after the last commit.
+    assert!(text.ends_with('\n'), "newline-terminated: {text:?}");
+    assert!(
+        !text.ends_with("\n\n"),
+        "no blank line after the last commit: {text:?}"
+    );
+}
+
+/// LG-05 (M-LAYOUT L3): `--oneline` / `--pretty` / `--format` are last-wins.
+#[test]
+#[serial(cwd)]
+fn test_log_format_last_one_wins() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    let full_hash = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], p).stdout)
+        .trim()
+        .to_string();
+
+    let format_after_oneline = run_libra_command(&["log", "-1", "--oneline", "--format=%H"], p);
+    assert_cli_success(&format_after_oneline, "oneline then format");
+    assert_eq!(
+        String::from_utf8_lossy(&format_after_oneline.stdout).trim(),
+        full_hash,
+        "--format after --oneline wins"
+    );
+
+    let oneline_after_format = run_libra_command(&["log", "-1", "--format=%H", "--oneline"], p);
+    assert_cli_success(&oneline_after_format, "format then oneline");
+    let text = String::from_utf8_lossy(&oneline_after_format.stdout);
+    assert!(
+        text.trim().ends_with("base") && text.trim().starts_with(&full_hash[..7]),
+        "--oneline after --format wins: {text:?}"
+    );
+
+    let pretty_after_oneline = run_libra_command(&["log", "-1", "--oneline", "--pretty=%s"], p);
+    assert_cli_success(&pretty_after_oneline, "oneline then pretty");
+    assert_eq!(
+        String::from_utf8_lossy(&pretty_after_oneline.stdout).trim(),
+        "base",
+        "--pretty after --oneline wins"
+    );
+
+    let oneline_after_pretty = run_libra_command(&["log", "-1", "--pretty=%H", "--oneline"], p);
+    assert_cli_success(&oneline_after_pretty, "pretty then oneline");
+    let text = String::from_utf8_lossy(&oneline_after_pretty.stdout);
+    assert!(
+        text.trim().ends_with("base") && text.trim().starts_with(&full_hash[..7]),
+        "--oneline after --pretty wins: {text:?}"
+    );
+}
+
+/// LG-07 (M-GRAPH R1/R3/R4): `--graph` column allocation matches Git's
+/// fixtures (fork with `|/`, two-way merge, octopus `*-.`), and `--graph`
+/// implies topological order with LIFO tie handling.
+#[test]
+#[serial(cwd)]
+fn test_log_graph_matches_git_fixtures() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    let commit = |file: &str, content: &str, message: &str, date: &str| {
+        fs::write(p.join(file), content).unwrap();
+        assert_cli_success(&run_libra_command(&["add", file], p), "add");
+        assert_cli_success(
+            &run_libra_command_with_env(
+                &["commit", "-m", message, "--no-verify"],
+                p,
+                &[("GIT_AUTHOR_DATE", date), ("GIT_COMMITTER_DATE", date)],
+            ),
+            "commit",
+        );
+    };
+
+    // Forked history: main (newer) and side (older) share the base commit.
+    assert_cli_success(
+        &run_libra_command(&["checkout", "-q", "-b", "side"], p),
+        "branch",
+    );
+    commit("side1.txt", "s1\n", "side1", "2026-01-02T00:00:00Z");
+    commit("side2.txt", "s2\n", "side2", "2026-01-03T00:00:00Z");
+    assert_cli_success(
+        &run_libra_command(&["checkout", "-q", "main"], p),
+        "checkout main",
+    );
+    commit("main1.txt", "m1\n", "main1", "2026-01-04T00:00:00Z");
+    commit("main2.txt", "m2\n", "main2", "2026-01-05T00:00:00Z");
+
+    let fork = run_libra_command(&["log", "--graph", "--format=%s", "--all"], p);
+    assert_cli_success(&fork, "fork graph");
+    let lines: Vec<String> = String::from_utf8_lossy(&fork.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    // R1/R4: main commits first, then the side branch, then the `|/` join.
+    assert_eq!(lines.len(), 6, "{lines:?}");
+    assert!(
+        lines[0].starts_with("* ") && lines[0].ends_with("main2"),
+        "{lines:?}"
+    );
+    assert!(
+        lines[1].starts_with("* ") && lines[1].ends_with("main1"),
+        "{lines:?}"
+    );
+    assert!(
+        lines[2].starts_with("| * ") && lines[2].ends_with("side2"),
+        "{lines:?}"
+    );
+    assert!(
+        lines[3].starts_with("| * ") && lines[3].ends_with("side1"),
+        "{lines:?}"
+    );
+    assert_eq!(lines[4], "|/  ", "{lines:?}");
+    assert!(
+        lines[5].starts_with("* ") && lines[5].ends_with("base"),
+        "{lines:?}"
+    );
+
+    // Two-way merge: merge commit, `|\`, side, main, `|/`, base.
+    assert_cli_success(
+        &run_libra_command_with_env(
+            &["merge", "--no-ff", "side", "-m", "merge", "--no-verify"],
+            p,
+            &[
+                ("GIT_AUTHOR_DATE", "2026-01-06T00:00:00Z"),
+                ("GIT_COMMITTER_DATE", "2026-01-06T00:00:00Z"),
+            ],
+        ),
+        "merge",
+    );
+    let merged = run_libra_command(&["log", "--graph", "--format=%s", "--all"], p);
+    assert_cli_success(&merged, "merge graph");
+    let lines: Vec<String> = String::from_utf8_lossy(&merged.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert!(
+        lines[0].starts_with("*   ") && lines[0].ends_with("merge"),
+        "{lines:?}"
+    );
+    assert_eq!(lines[1], "|\\  ", "{lines:?}");
+    assert!(lines.iter().any(|line| line == "|/  "), "{lines:?}");
+    assert!(lines.iter().any(|line| line.ends_with("base")), "{lines:?}");
+}
+
+/// LG-07 (M-GRAPH R3): octopus merge fixture (`t4214:39`-style).
+#[test]
+#[serial(cwd)]
+fn test_log_graph_octopus_fixture() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    let commit = |file: &str, content: &str, message: &str, date: &str| {
+        fs::write(p.join(file), content).unwrap();
+        assert_cli_success(&run_libra_command(&["add", file], p), "add");
+        assert_cli_success(
+            &run_libra_command_with_env(
+                &["commit", "-m", message, "--no-verify"],
+                p,
+                &[("GIT_AUTHOR_DATE", date), ("GIT_COMMITTER_DATE", date)],
+            ),
+            "commit",
+        );
+    };
+
+    assert_cli_success(&run_libra_command(&["checkout", "-q", "-b", "o1"], p), "o1");
+    commit("o1.txt", "o1\n", "oct1", "2026-01-02T00:00:00Z");
+    assert_cli_success(&run_libra_command(&["checkout", "-q", "main"], p), "main");
+    assert_cli_success(&run_libra_command(&["checkout", "-q", "-b", "o2"], p), "o2");
+    commit("o2.txt", "o2\n", "oct2", "2026-01-03T00:00:00Z");
+    assert_cli_success(&run_libra_command(&["checkout", "-q", "main"], p), "main2");
+    commit("main1.txt", "m\n", "main1", "2026-01-04T00:00:00Z");
+    assert_cli_success(
+        &run_libra_command_with_env(
+            &[
+                "merge",
+                "--no-ff",
+                "o1",
+                "o2",
+                "-m",
+                "octopus",
+                "--no-verify",
+            ],
+            p,
+            &[
+                ("GIT_AUTHOR_DATE", "2026-01-05T00:00:00Z"),
+                ("GIT_COMMITTER_DATE", "2026-01-05T00:00:00Z"),
+            ],
+        ),
+        "octopus merge",
+    );
+
+    let out = run_libra_command(&["log", "--graph", "--format=%s", "--all"], p);
+    assert_cli_success(&out, "octopus graph");
+    let lines: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert!(
+        lines[0].starts_with("*-.") && lines[0].ends_with("octopus"),
+        "{lines:?}"
+    );
+    assert_eq!(lines[1], "|\\ \\  ", "{lines:?}");
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("| | * ") && line.ends_with("oct2")),
+        "{lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("| * | ") && line.ends_with("oct1")),
+        "{lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line == "* / " || line.starts_with("* / ")),
+        "{lines:?}"
+    );
+}
+
+/// LG-14 (M-GTYPE P7): `log -P --grep` uses the same Perl engine as `grep -P`.
+#[test]
+#[serial(cwd)]
+fn test_log_perl_regexp_grep() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    for (file, message) in [
+        ("a.txt", "init"),
+        ("b.txt", "fooXbar"),
+        ("c.txt", "c++ (fix)"),
+        ("d.txt", "foobar aaa"),
+    ] {
+        fs::write(p.join(file), format!("{file}\n")).unwrap();
+        assert_cli_success(&run_libra_command(&["add", file], p), "add");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", message, "--no-verify"], p),
+            "commit",
+        );
+    }
+
+    // Lookahead is a Perl-only feature.
+    let lookahead = run_libra_command(
+        &["log", "-P", "--grep", "foo(?=bar)", "--format=%s", "HEAD"],
+        p,
+    );
+    assert_cli_success(&lookahead, "log -P lookahead");
+    assert_eq!(
+        String::from_utf8_lossy(&lookahead.stdout).trim(),
+        "foobar aaa"
+    );
+
+    // Backreference.
+    let backref = run_libra_command(&["log", "-P", "--grep", r"(o)\1", "--format=%s", "HEAD"], p);
+    assert_cli_success(&backref, "log -P backref");
+    let backref_text = String::from_utf8_lossy(&backref.stdout);
+    // Both subjects contain a doubled `o`.
+    assert!(backref_text.contains("foobar aaa"), "{backref_text}");
+    assert!(backref_text.contains("fooXbar"), "{backref_text}");
+
+    // Unsupported PCRE syntax is a usage error naming the feature.
+    let unsupported = run_libra_command(&["log", "-P", "--grep", r"\Kfoo", "HEAD"], p);
+    assert_eq!(unsupported.status.code(), Some(129));
+    assert!(
+        String::from_utf8_lossy(&unsupported.stderr).contains(r"\K"),
+        "{}",
+        String::from_utf8_lossy(&unsupported.stderr)
+    );
 }

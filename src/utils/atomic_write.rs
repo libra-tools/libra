@@ -103,7 +103,24 @@ where
 
     let mut writer = crate::utils::atomic_stream::StreamingAtomicFile::new_in(parent, fsync)?;
     writer.write_all(bytes)?;
-    writer.persist_with_post_replace_hook(path, post_replace)
+    writer.persist_with_post_replace_hook(path, post_replace)?;
+
+    // IN-06: Adjust shared repository permissions for created files and directories
+    if let Some(shared_mode) = crate::utils::shared_perm::get_shared_mode_for_path(path)?
+        && !matches!(shared_mode, crate::utils::shared_perm::SharedMode::Umask)
+    {
+        let is_loose_object = path
+            .parent()
+            .and_then(|p| p.parent())
+            .is_some_and(|p| p.file_name() == Some(std::ffi::OsStr::new("objects")));
+        if is_loose_object {
+            crate::utils::shared_perm::adjust_shared_perm_for_object(path, &shared_mode)?;
+        } else {
+            crate::utils::shared_perm::adjust_shared_perm(path, &shared_mode)?;
+        }
+    }
+
+    Ok(())
 }
 
 /// Create `dir` and any missing ancestors, fsyncing each newly-created

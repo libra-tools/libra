@@ -1554,7 +1554,7 @@ fn test_diff_unified_zero_context_anchors_pure_insert_delete() {
     std::fs::write(p.join("f.txt"), "a\nb\nX\nc\n").unwrap();
     let s = diff_u0();
     assert!(
-        s.contains("@@ -2,0 +3,1 @@"),
+        s.contains("@@ -2,0 +3 @@"),
         "insert-middle anchors at -2,0:\n{s}"
     );
 
@@ -1563,7 +1563,7 @@ fn test_diff_unified_zero_context_anchors_pure_insert_delete() {
     std::fs::write(p.join("f.txt"), "X\na\nb\n").unwrap();
     let s = diff_u0();
     assert!(
-        s.contains("@@ -0,0 +1,1 @@"),
+        s.contains("@@ -0,0 +1 @@"),
         "insert-at-start anchors at -0,0:\n{s}"
     );
 
@@ -1572,7 +1572,7 @@ fn test_diff_unified_zero_context_anchors_pure_insert_delete() {
     std::fs::write(p.join("f.txt"), "a\nc\n").unwrap();
     let s = diff_u0();
     assert!(
-        s.contains("@@ -2,1 +1,0 @@"),
+        s.contains("@@ -2 +1,0 @@"),
         "delete-middle anchors at +1,0:\n{s}"
     );
 
@@ -1596,11 +1596,11 @@ fn test_diff_unified_zero_context_anchors_pure_insert_delete() {
     std::fs::write(p.join("f.txt"), "b\nX\nc\n").unwrap();
     let s = diff_u0();
     assert!(
-        s.contains("@@ -1,1 +0,0 @@"),
+        s.contains("@@ -1 +0,0 @@"),
         "first hunk deletes `a` at -1,1 +0,0:\n{s}"
     );
     assert!(
-        s.contains("@@ -2,0 +2,1 @@"),
+        s.contains("@@ -2,0 +2 @@"),
         "second hunk anchors after the separator line (-2,0 +2,1):\n{s}"
     );
 }
@@ -3682,4 +3682,496 @@ fn diff_bare_color_flag_means_always() {
         let out = run_libra_command(&["diff", value], root);
         super::assert_cli_success(&out, value);
     }
+}
+
+#[test]
+fn i1062_explicit_diff_clean_and_real_edits_in_both_formats() {
+    use super::add_test::{i1062_ok, i1062_run};
+    for format in ["sha1", "sha256"] {
+        let temp = super::status_test::i1062_committed_scripts(format);
+        let repo = temp.path().join("repo");
+        let index = fs::read(repo.join(".libra/index")).unwrap();
+        for args in [
+            vec!["diff"],
+            vec!["diff", "--stat"],
+            vec!["diff", "--numstat"],
+            vec!["diff", "--quiet"],
+            vec!["diff", "--exit-code"],
+            vec!["diff", "--raw"],
+        ] {
+            assert!(i1062_ok(&repo, &args).is_empty(), "{format}: {args:?}");
+        }
+        let json: serde_json::Value =
+            serde_json::from_slice(&i1062_ok(&repo, &["--json", "diff"])).unwrap();
+        assert_eq!(json["data"]["files_changed"], 0);
+        fs::write(repo.join("probe.ps1"), b"one\r\nedited\r\n").unwrap();
+        let patch = i1062_ok(&repo, &["diff", "--full-index", "--", "probe.ps1"]);
+        assert!(!patch.contains(&b'\r'), "{format}: {patch:?}");
+        let patch = String::from_utf8(patch).unwrap();
+        assert!(patch.contains("-two\n+edited\n"), "{patch}");
+        assert_eq!(
+            i1062_ok(&repo, &["diff", "--numstat", "--", "probe.ps1"]),
+            b"1\t1\tprobe.ps1\n"
+        );
+        for flag in ["--quiet", "--exit-code"] {
+            assert_eq!(
+                i1062_run(&repo, &["diff", flag, "--", "probe.ps1"])
+                    .status
+                    .code(),
+                Some(1)
+            );
+        }
+        assert_eq!(fs::read(repo.join(".libra/index")).unwrap(), index);
+        assert_eq!(
+            fs::read(repo.join("probe.ps1")).unwrap(),
+            b"one\r\nedited\r\n"
+        );
+    }
+}
+
+#[test]
+fn i1062_explicit_diff_attribute_change_invalidates_stat_match() {
+    use super::add_test::i1062_ok;
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    fs::create_dir(&repo).unwrap();
+    i1062_ok(&repo, &["init"]);
+    i1062_ok(&repo, &["config", "user.name", "EOL"]);
+    i1062_ok(&repo, &["config", "user.email", "eol@example.test"]);
+    fs::write(repo.join(".gitattributes"), "*.ps1 text eol=crlf\n").unwrap();
+    fs::write(repo.join("probe.ps1"), b"one\r\ntwo\r\n").unwrap();
+    i1062_ok(&repo, &["add", "."]);
+    i1062_ok(&repo, &["commit", "--no-verify", "-m", "scripts"]);
+    i1062_ok(&repo, &["status", "--porcelain"]);
+    assert!(i1062_ok(&repo, &["diff", "--", "probe.ps1"]).is_empty());
+    let before = fs::metadata(repo.join("probe.ps1"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    fs::write(repo.join(".gitattributes"), "*.ps1 -text\n").unwrap();
+    assert!(!i1062_ok(&repo, &["diff", "--", "probe.ps1"]).is_empty());
+    assert_eq!(
+        fs::metadata(repo.join("probe.ps1"))
+            .unwrap()
+            .modified()
+            .unwrap(),
+        before
+    );
+    fs::write(repo.join(".gitattributes"), "*.ps1 text eol=crlf\n").unwrap();
+    assert!(i1062_ok(&repo, &["diff", "--", "probe.ps1"]).is_empty());
+}
+
+#[test]
+fn i1062_explicit_diff_keeps_index_and_tree_history_raw() {
+    use super::add_test::i1062_ok;
+    let temp = super::status_test::i1062_committed_scripts("sha1");
+    let repo = temp.path().join("repo");
+    fs::write(repo.join(".gitattributes"), "*.ps1 -text\n").unwrap();
+    i1062_ok(&repo, &["add", ".gitattributes", "probe.ps1"]);
+    i1062_ok(&repo, &["commit", "--no-verify", "-m", "historical CRLF"]);
+    fs::write(repo.join(".gitattributes"), "*.ps1 text\n").unwrap();
+    i1062_ok(&repo, &["add", "--renormalize", "probe.ps1"]);
+    let staged = i1062_ok(&repo, &["diff", "--cached", "--", "probe.ps1"]);
+    assert!(!staged.is_empty());
+    i1062_ok(&repo, &["commit", "--no-verify", "-m", "normalize"]);
+    let historical = i1062_ok(&repo, &["diff", "HEAD~1", "HEAD", "--", "probe.ps1"]);
+    assert_eq!(historical, staged);
+    fs::remove_file(repo.join(".gitattributes")).unwrap();
+    fs::create_dir(repo.join(".gitattributes")).unwrap();
+    assert_eq!(
+        i1062_ok(&repo, &["diff", "HEAD~1", "HEAD", "--", "probe.ps1"]),
+        historical
+    );
+    assert!(i1062_ok(&repo, &["diff", "--cached", "--", "probe.ps1"]).is_empty());
+}
+
+#[test]
+fn i1062_failure_diff_attribute_read_cannot_be_clean_success() {
+    use super::add_test::i1062_run;
+    let temp = super::status_test::i1062_committed_scripts("sha1");
+    let repo = temp.path().join("repo");
+    let index = fs::read(repo.join(".libra/index")).unwrap();
+    fs::remove_file(repo.join(".gitattributes")).unwrap();
+    fs::create_dir(repo.join(".gitattributes")).unwrap();
+    for flag in ["--quiet", "--exit-code", "--stat"] {
+        let output = i1062_run(&repo, &["diff", flag, "--", "probe.ps1"]);
+        assert_eq!(output.status.code(), Some(128), "{flag}: {:?}", output);
+        assert!(String::from_utf8_lossy(&output.stderr).contains(".gitattributes"));
+    }
+    assert_eq!(fs::read(repo.join(".libra/index")).unwrap(), index);
+    assert_eq!(fs::read(repo.join("probe.ps1")).unwrap(), b"one\r\ntwo\r\n");
+}
+
+#[test]
+fn i1062_content_view_rename_uses_clean_bytes() {
+    use super::add_test::i1062_ok;
+    let temp = super::status_test::i1062_committed_scripts("sha1");
+    let repo = temp.path().join("repo");
+    fs::rename(repo.join("probe.ps1"), repo.join("moved.ps1")).unwrap();
+    i1062_ok(&repo, &["add", "-N", "moved.ps1"]);
+    let patch = String::from_utf8(i1062_ok(&repo, &["diff", "--find-renames=100%"])).unwrap();
+    assert!(patch.contains("similarity index 100%"), "{patch}");
+    assert!(
+        patch.contains("rename from probe.ps1\nrename to moved.ps1"),
+        "{patch}"
+    );
+    assert!(!patch.contains("@@"), "{patch}");
+    assert!(!patch.contains('\r'), "{patch}");
+}
+
+#[cfg(unix)]
+#[test]
+fn i1062_content_view_external_and_textconv_keep_raw_inputs() {
+    use super::add_test::i1062_ok;
+    let temp = super::status_test::i1062_committed_scripts("sha1");
+    let repo = temp.path().join("repo");
+    fs::write(repo.join("probe.ps1"), b"one\r\nedited\r\n").unwrap();
+    let driver = temp.path().join("external.sh");
+    let capture = temp.path().join("external-input");
+    fs::write(
+        &driver,
+        format!(
+            "cat \"$5\" > '{}'\nprintf 'external output\\n'\n",
+            capture.display()
+        ),
+    )
+    .unwrap();
+    i1062_ok(
+        &repo,
+        &[
+            "config",
+            "diff.external",
+            &format!("sh '{}'", driver.display()),
+        ],
+    );
+    assert_eq!(
+        i1062_ok(&repo, &["diff", "--", "probe.ps1"]),
+        b"external output\n"
+    );
+    assert_eq!(fs::read(&capture).unwrap(), b"one\r\nedited\r\n");
+    i1062_ok(&repo, &["config", "--unset", "diff.external"]);
+    let converter = temp.path().join("textconv.sh");
+    fs::write(
+        &converter,
+        format!("cp \"$1\" '{}'\ncat \"$1\"\n", capture.display()),
+    )
+    .unwrap();
+    i1062_ok(
+        &repo,
+        &[
+            "config",
+            "diff.bytes.textconv",
+            &format!("sh '{}'", converter.display()),
+        ],
+    );
+    fs::write(
+        repo.join(".gitattributes"),
+        "*.ps1 text eol=crlf diff=bytes\n",
+    )
+    .unwrap();
+    i1062_ok(&repo, &["diff", "--", "probe.ps1"]);
+    assert_eq!(fs::read(&capture).unwrap(), b"one\r\nedited\r\n");
+}
+
+#[test]
+fn i1062_content_view_lfs_pointer_uses_raw_payload_digest() {
+    use super::add_test::i1062_ok;
+    let temp = super::status_test::i1062_committed_scripts("sha1");
+    let repo = temp.path().join("repo");
+    fs::write(
+        repo.join(".gitattributes"),
+        "*.ps1 filter=lfs text eol=crlf\n",
+    )
+    .unwrap();
+    i1062_ok(&repo, &["add", ".gitattributes", "probe.ps1"]);
+    i1062_ok(&repo, &["commit", "--no-verify", "-m", "LFS script"]);
+    assert!(i1062_ok(&repo, &["diff", "--", "probe.ps1"]).is_empty());
+    fs::write(repo.join("probe.ps1"), b"one\ntwo\n").unwrap();
+    let patch = String::from_utf8(i1062_ok(&repo, &["diff", "--", "probe.ps1"])).unwrap();
+    let old = hex::encode(ring::digest::digest(
+        &ring::digest::SHA256,
+        b"one\r\ntwo\r\n",
+    ));
+    let new = hex::encode(ring::digest::digest(&ring::digest::SHA256, b"one\ntwo\n"));
+    assert!(patch.contains(&format!("-oid sha256:{old}")), "{patch}");
+    assert!(patch.contains(&format!("+oid sha256:{new}")), "{patch}");
+    assert!(patch.contains("-size 10\n"), "{patch}");
+    assert!(patch.contains("+size 8\n"), "{patch}");
+}
+
+#[cfg(unix)]
+#[test]
+fn i1062_content_view_symlink_target_is_not_normalized() {
+    use super::add_test::{i1062_ok, i1062_run};
+    let temp = super::status_test::i1062_committed_scripts("sha1");
+    let repo = temp.path().join("repo");
+    std::os::unix::fs::symlink("target\r\n", repo.join("link.ps1")).unwrap();
+    i1062_ok(&repo, &["add", "link.ps1"]);
+    let index = fs::read(repo.join(".libra/index")).unwrap();
+    assert!(i1062_ok(&repo, &["diff", "--", "link.ps1"]).is_empty());
+    fs::remove_file(repo.join("link.ps1")).unwrap();
+    std::os::unix::fs::symlink("target\n", repo.join("link.ps1")).unwrap();
+    assert_eq!(
+        i1062_run(&repo, &["diff", "--quiet", "--", "link.ps1"])
+            .status
+            .code(),
+        Some(1)
+    );
+    assert_eq!(
+        i1062_ok(&repo, &["diff", "--name-status", "--", "link.ps1"]),
+        b"M\tlink.ps1\n"
+    );
+    assert_eq!(fs::read(repo.join(".libra/index")).unwrap(), index);
+}
+
+#[test]
+fn i1062_content_view_no_index_keeps_filesystem_bytes() {
+    use super::add_test::i1062_run;
+    let temp = super::status_test::i1062_committed_scripts("sha1");
+    let repo = temp.path().join("repo");
+    fs::write(repo.join("left.ps1"), b"one\ntwo\n").unwrap();
+    fs::write(repo.join("right.ps1"), b"one\r\ntwo\r\n").unwrap();
+    let diff = i1062_run(&repo, &["diff", "--no-index", "left.ps1", "right.ps1"]);
+    assert_eq!(diff.status.code(), Some(1), "{diff:?}");
+    assert!(!diff.stdout.is_empty());
+}
+
+#[test]
+fn i861_tc1324_own_add_then_mixed_endings_is_clean() {
+    use super::add_test::{i861_repo, i1062_index_oid, i1062_ok};
+    for format in ["sha1", "sha256"] {
+        let temp = i861_repo(format, "crlf.txt text=auto\n");
+        let repo = temp.path().join("repo");
+        std::fs::write(repo.join("crlf.txt"), b"Hello\r\nWorld\r\n").unwrap();
+        i1062_ok(&repo, &["add", ".gitattributes", "crlf.txt"]);
+        let oid = i1062_index_oid(&repo, "crlf.txt");
+        assert_eq!(
+            i1062_ok(&repo, &["cat-file", "-p", &oid]),
+            b"Hello\nWorld\n"
+        );
+        std::fs::write(repo.join("crlf.txt"), b"Hello\r\nWorld\n").unwrap();
+        let before = std::fs::read(repo.join(".libra/index")).unwrap();
+        for args in [
+            vec!["diff", "--quiet", "crlf.txt"],
+            vec!["diff", "--exit-code", "crlf.txt"],
+            vec!["diff", "crlf.txt"],
+        ] {
+            assert!(i1062_ok(&repo, &args).is_empty(), "{format}: {args:?}");
+        }
+        assert_eq!(std::fs::read(repo.join(".libra/index")).unwrap(), before);
+        assert_eq!(
+            std::fs::read(repo.join("crlf.txt")).unwrap(),
+            b"Hello\r\nWorld\n"
+        );
+    }
+}
+
+#[test]
+fn i861_real_change_renders_clean_bytes_and_remains_dirty() {
+    use super::add_test::{i1062_ok, i1062_run};
+    let temp = super::status_test::i861_committed_scripts("sha256");
+    let repo = temp.path().join("repo");
+    std::fs::write(repo.join("probe.ps1"), b"one\r\nchanged\r\n").unwrap();
+    let patch = i1062_ok(&repo, &["diff", "--", "probe.ps1"]);
+    let text = String::from_utf8(patch).unwrap();
+    assert!(
+        text.contains("-two\n") && text.contains("+changed\n"),
+        "{text}"
+    );
+    assert!(!text.contains('\r'));
+    assert_eq!(
+        i1062_run(&repo, &["diff", "--quiet", "probe.ps1"])
+            .status
+            .code(),
+        Some(1)
+    );
+}
+
+#[test]
+fn i861_history_guard_does_not_normalize_recorded_objects() {
+    use super::add_test::{i861_repo, i1062_index_oid, i1062_ok, i1062_run};
+    let temp = i861_repo("sha1", "* -text\n");
+    let repo = temp.path().join("repo");
+    std::fs::write(repo.join("probe.txt"), b"one\r\ntwo\r\n").unwrap();
+    i1062_ok(&repo, &["add", "."]);
+    i1062_ok(&repo, &["commit", "--no-verify", "-m", "raw history"]);
+    let historical = i1062_index_oid(&repo, "probe.txt");
+    std::fs::write(repo.join(".gitattributes"), "* text=auto\n").unwrap();
+    i1062_ok(&repo, &["diff", "--quiet", "probe.txt"]);
+    std::fs::write(repo.join("probe.txt"), b"one\r\ntwo\n").unwrap();
+    assert_eq!(
+        i1062_run(&repo, &["diff", "--quiet", "probe.txt"])
+            .status
+            .code(),
+        Some(1)
+    );
+    i1062_ok(&repo, &["add", "--renormalize", "probe.txt"]);
+    assert!(!i1062_ok(&repo, &["diff", "--cached", "--", "probe.txt"]).is_empty());
+    assert_eq!(
+        i1062_ok(&repo, &["cat-file", "-p", &historical]),
+        b"one\r\ntwo\r\n"
+    );
+    i1062_ok(&repo, &["commit", "--no-verify", "-m", "normalize"]);
+    assert!(!i1062_ok(&repo, &["diff", "HEAD~1", "HEAD", "--", "probe.txt"]).is_empty());
+}
+
+#[test]
+fn i861_failure_index_read_is_not_quiet_success_or_deletion() {
+    use super::add_test::{i861_damage_index_blob, i1062_run};
+    for corrupt in [false, true] {
+        let temp = super::status_test::i861_committed_scripts("sha1");
+        let repo = temp.path().join("repo");
+        let before = std::fs::read(repo.join(".libra/index")).unwrap();
+        i861_damage_index_blob(&repo, "probe.ps1", corrupt);
+        for args in [
+            vec!["diff", "--quiet", "probe.ps1"],
+            vec!["diff", "probe.ps1"],
+        ] {
+            let output = i1062_run(&repo, &args);
+            assert!(!output.status.success(), "{output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("index object"),
+                "{output:?}"
+            );
+        }
+        assert_eq!(std::fs::read(repo.join(".libra/index")).unwrap(), before);
+    }
+}
+
+/// LG-03 (M-HUNK H1..H5): canonical hunk headers across output surfaces.
+#[test]
+#[serial(cwd)]
+fn test_diff_hunk_headers_match_git_matrix() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+
+    // H4: single-line modification -> `@@ -1 +1 @@`.
+    fs::write(p.join("tracked.txt"), "changed\n").unwrap();
+    let out = run_libra_command(&["diff"], p);
+    assert_cli_success(&out, "diff single-line modify");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("@@ -1 +1 @@"), "{text}");
+
+    // H3: an emptied-but-present file keeps `+++ b/<path>` and `@@ -1 +0,0 @@`.
+    fs::write(p.join("tracked.txt"), "").unwrap();
+    let out = run_libra_command(&["diff"], p);
+    assert_cli_success(&out, "diff emptied");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("+++ b/tracked.txt"), "{text}");
+    assert!(text.contains("@@ -1 +0,0 @@"), "{text}");
+    assert!(!text.contains("+++ /dev/null"), "{text}");
+    assert!(!text.contains("deleted file mode"), "{text}");
+
+    // Restore the tracked file to HEAD's content so the new-file cases start
+    // from a clean tree (no commit needed — it is already committed).
+    fs::write(p.join("tracked.txt"), "tracked\n").unwrap();
+
+    // H1: a new one-line file via intent-to-add -> `@@ -0,0 +1 @@`.
+    fs::write(p.join("new.txt"), "x\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "-N", "new.txt"], p), "add -N");
+    let out = run_libra_command(&["diff"], p);
+    assert_cli_success(&out, "diff new one-line file");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("@@ -0,0 +1 @@"), "{text}");
+
+    // H1: a new three-line file -> `@@ -0,0 +1,3 @@`.
+    fs::write(p.join("three.txt"), "a\nb\nc\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "-N", "three.txt"], p),
+        "add -N three",
+    );
+    let out = run_libra_command(&["diff"], p);
+    assert_cli_success(&out, "diff new three-line file");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("@@ -0,0 +1,3 @@"), "{text}");
+
+    // H2: a deleted file -> `deleted file mode`, `+++ /dev/null`, `@@ -1 +0,0 @@`.
+    fs::remove_file(p.join("tracked.txt")).unwrap();
+    let out = run_libra_command(&["diff"], p);
+    assert_cli_success(&out, "diff deleted file");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("deleted file mode"), "{text}");
+    assert!(text.contains("+++ /dev/null"), "{text}");
+    assert!(text.contains("@@ -1 +0,0 @@"), "{text}");
+}
+
+/// LG-08 (M-DIRSTAT R1–R4): `--dirstat` matrices match Git (`t4047` ports).
+#[test]
+#[serial(cwd)]
+fn test_diff_dirstat_matrix() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    let write = |path: &str, content: &str| {
+        fs::create_dir_all(p.join(path).parent().unwrap()).unwrap();
+        fs::write(p.join(path), content).unwrap();
+    };
+    write("dir1/sub/x", "a\nb\nc\n");
+    write("dir1/sub/y", "a\nb\nc\n");
+    write("dir1/new.txt", "old\n");
+    write("dir2/z", "a\nb\n");
+    assert_cli_success(&run_libra_command(&["add", "-A"], p), "add base");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], p),
+        "commit base",
+    );
+
+    write("dir1/sub/x", "a\nb\nc\nd\ne\nf\n");
+    write("dir1/sub/y", "a\nb\nc\nd\ne\nf\n");
+    write("dir1/new.txt", "a\nb\n");
+    write("dir2/z", "a\nb\nc\n");
+
+    let run = |args: &[&str]| -> String {
+        let out = run_libra_command(args, p);
+        assert_cli_success(&out, "diff dirstat");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    // R1: default `changes` uses Git's byte damage.
+    assert_eq!(
+        run(&["diff", "--dirstat"]),
+        "  54.5% dir1/sub/\n  36.3% dir1/\n   9.0% dir2/\n"
+    );
+    // R2: `files,0` counts files with a 0% threshold.
+    assert_eq!(
+        run(&["diff", "--dirstat=files,0"]),
+        "  50.0% dir1/sub/\n  25.0% dir1/\n  25.0% dir2/\n"
+    );
+    // R3: `--cumulative` keeps child counts in the parent total.
+    assert_eq!(
+        run(&["diff", "--dirstat", "--cumulative"]),
+        "  54.5% dir1/sub/\n  90.9% dir1/\n   9.0% dir2/\n"
+    );
+    // R4: `-X` is the short form; `--dirstat-by-file` is `files`.
+    assert_eq!(
+        run(&["diff", "-X"]),
+        "  54.5% dir1/sub/\n  36.3% dir1/\n   9.0% dir2/\n"
+    );
+    assert_eq!(
+        run(&["diff", "--dirstat-by-file"]),
+        "  50.0% dir1/sub/\n  25.0% dir1/\n  25.0% dir2/\n"
+    );
+}
+
+/// LG-16 (M-GCTX X5): unified hunk headers share the default function rule.
+#[test]
+#[serial(cwd)]
+fn test_diff_hunk_header_function_context() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    let mut content = String::new();
+    for number in 1..=8 {
+        content.push_str(&format!("{number}\n"));
+    }
+    content.push_str("g\nx\nz\n");
+    fs::write(p.join("f.txt"), &content).unwrap();
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], p), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], p),
+        "commit",
+    );
+    fs::write(p.join("f.txt"), content.replace("\nx\nz\n", "\nx\nw\n")).unwrap();
+    let out = run_libra_command(&["diff", "-U1", "f.txt"], p);
+    assert_cli_success(&out, "diff -U1");
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(text.contains("@@ -10,2 +10,2 @@ g"), "{text}");
 }

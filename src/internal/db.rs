@@ -305,6 +305,11 @@ async fn get_or_init_db_conn_instance(db_path: PathBuf) -> io::Result<DbConn> {
         ));
     }
 
+    if !schema_upgrade_allowed() {
+        drop(connections);
+        return open_database_without_migrations(&db_path).await;
+    }
+
     if let Some(conn) = connections.get(&db_path) {
         let conn = conn.clone();
         drop(connections);
@@ -508,6 +513,7 @@ where
     match callback(&txn).await {
         Ok(value) => {
             txn.commit().await.map_err(TransactionError::Connection)?;
+            adjust_db_shared_permissions_if_shared();
             Ok(value)
         }
         Err(err) => {
@@ -540,6 +546,21 @@ pub async fn get_db_conn_instance() -> DbConn {
 /// The connection is cached, so concurrent callers see the same handle.
 /// Returns `Err(IOError)` when the file is missing or the schema migrations
 /// fail.
+/// When `false`, every connection acquisition for the rest of this process
+/// opens the database WITHOUT applying pending migrations. The CLI sets this
+/// for read-only commands (e.g. `hash-object` without `--write`) so their
+/// config/filter reads never upgrade the on-disk schema.
+static ALLOW_SCHEMA_UPGRADE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+pub(crate) fn set_schema_upgrade_allowed(allowed: bool) {
+    ALLOW_SCHEMA_UPGRADE.store(allowed, std::sync::atomic::Ordering::SeqCst);
+}
+
+pub(crate) fn schema_upgrade_allowed() -> bool {
+    ALLOW_SCHEMA_UPGRADE.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 pub async fn get_db_conn_instance_for_path(db_path: &Path) -> io::Result<DbConn> {
     get_or_init_db_conn_instance(db_path.to_path_buf()).await
 }
@@ -881,7 +902,22 @@ fn error_chain_text(error: &anyhow::Error) -> String {
 /// - Returns `Ok(())` if the database file was created and the schema was set up successfully.
 /// - Returns an `IOError` if the database file already exists, or if there was an error creating the file or setting up the schema.
 pub async fn create_database(db_path: &str) -> io::Result<DatabaseConnection> {
-    create_database_for_role(db_path, DatabaseRole::Repository).await
+    let conn = create_database_for_role(db_path, DatabaseRole::Repository).await?;
+    let path = Path::new(db_path);
+    if let Ok(Some(shared_mode)) = crate::utils::shared_perm::get_shared_mode_for_path(path) {
+        let _ = crate::utils::shared_perm::adjust_shared_perm_for_db(path, &shared_mode);
+    }
+    Ok(conn)
+}
+
+fn adjust_db_shared_permissions_if_shared() {
+    if let Ok(storage) = crate::utils::util::try_request_storage_path() {
+        let db_path = storage.join("libra.db");
+        if let Ok(Some(shared_mode)) = crate::utils::shared_perm::get_shared_mode_for_path(&db_path)
+        {
+            let _ = crate::utils::shared_perm::adjust_shared_perm_for_db(&db_path, &shared_mode);
+        }
+    }
 }
 
 #[cfg(test)]

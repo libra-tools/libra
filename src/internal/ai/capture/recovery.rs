@@ -1071,12 +1071,7 @@ mod tests {
                 &self,
                 deadline: CaptureCommitDeadline,
             ) -> Result<ArtifactRecoveryOutcome> {
-                let executable = std::env::current_exe().unwrap();
-                let helper = executable
-                    .parent()
-                    .and_then(Path::parent)
-                    .unwrap()
-                    .join("libra");
+                let helper = crate::utils::test::real_libra_helper_binary();
                 assert!(
                     helper.is_file(),
                     "build the existing Libra object-I/O test helper before this mechanism fixture"

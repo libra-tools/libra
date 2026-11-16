@@ -347,13 +347,18 @@ pub fn ask_basic_auth() -> BasicAuth {
 
 /// Calculate the hash of a file blob
 /// - for `lfs` file: calculate hash of the pointer data
+///
+/// Every read failure — including an LFS-tracked file that is unreadable or
+/// vanishes under the read — is returned as `Err`, never a panic, so racy
+/// worktree scans (refresh, the stat-refresh smudge pass) can degrade to
+/// "content unknown" (issues/479 FX-479-03 review R2-P1-1).
 pub fn calc_file_blob_hash(path: impl AsRef<Path>) -> io::Result<ObjectHash> {
     let path = path.as_ref();
     if fs::symlink_metadata(path)?.file_type().is_symlink() {
         return Ok(Blob::from_content_bytes(read_symlink_blob_bytes(path)?).id);
     }
     if utils::lfs::is_lfs_tracked(path) {
-        let (pointer, _) = utils::lfs::generate_pointer_file(path);
+        let (pointer, _) = utils::lfs::generate_pointer_file_result(path)?;
         return Ok(Blob::from_content(&pointer).id);
     }
 

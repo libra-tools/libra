@@ -168,13 +168,7 @@ impl BeneathAttributeCache {
         }
 
         let (contents, descriptor_fingerprint) =
-            match read_regular_beneath_attribute_source(root, source) {
-                Ok(contents) => contents,
-                Err(error) if is_absent_beneath_attribute_source(&error) => {
-                    return Ok(Arc::new(Vec::new()));
-                }
-                Err(error) => return Err(error),
-            };
+            read_regular_beneath_attribute_source(root, source)?;
         let contents = String::from_utf8_lossy(&contents);
         let rules = Arc::new(parse_attribute_contents(&contents, base));
         #[cfg(test)]
@@ -440,6 +434,307 @@ pub fn all_attribute_states_for_path(path: &Path) -> BTreeMap<String, AttributeS
     states
 }
 
+/// Resolve attributes for a blob write without treating a failed source read
+/// as an absent rule. Source precedence and parsing match the ordinary reader;
+/// worktree sources are opened beneath one pinned worktree root.
+pub(crate) fn try_all_attribute_states_beneath(
+    workdir: &Path,
+    root: &fs::File,
+    relative: &Path,
+) -> io::Result<BTreeMap<String, AttributeState>> {
+    if relative.is_absolute()
+        || relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "attribute lookup requires a canonical relative file path",
+        ));
+    }
+    attribute_states_beneath_with_context(
+        workdir,
+        root,
+        relative,
+        &ConversionAttributeContext::capture(workdir)?,
+        None,
+        false,
+    )
+}
+
+/// Captured by the repository caller, never rediscovered from a helper's cwd.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ConversionAttributeContext {
+    pub configured: Option<PathBuf>,
+    pub info: Vec<PathBuf>,
+}
+
+impl ConversionAttributeContext {
+    pub(crate) fn capture(workdir: &Path) -> io::Result<Self> {
+        let mut info = util::worktree_info_file_paths(workdir, "attributes");
+        let native = workdir.join(util::ROOT_DIR).join("info/attributes");
+        let native_position = info.iter().position(|path| path == &native);
+        let gitdir = match crate::internal::worktree_scope::WorktreeScope::request_scope()
+            .filter(|scope| scope.worktree_root == workdir)
+        {
+            Some(scope) => Some(scope.gitdir),
+            None if native_position.is_some() => Some(
+                fs::canonicalize(workdir.join(util::ROOT_DIR)).map_err(|error| {
+                    io::Error::new(
+                        error.kind(),
+                        format!(
+                            "resolve attributes metadata for '{}': {error}; check the worktree layout",
+                            workdir.display()
+                        ),
+                    )
+                })?,
+            ),
+            None => None,
+        };
+        if let Some(gitdir) = gitdir {
+            // Repository discovery accepts legacy .libra symlinks. Use that
+            // resolved gitdir; do not traverse the symlink beneath a worktree
+            // root or relax no-follow checks for attribute files themselves.
+            // The unpinned fallback resolves only this exact metadata path,
+            // never a parent repository if the marker disappears meanwhile.
+            let source = gitdir.join("info/attributes");
+            match native_position {
+                Some(position) => info[position] = source,
+                None => info.insert(0, source),
+            }
+        }
+        Ok(Self {
+            configured: util::optional_cascaded_config_path(CORE_ATTRIBUTES_FILE_KEY, workdir),
+            info,
+        })
+    }
+}
+
+pub(crate) fn attribute_states_beneath_with_context(
+    workdir: &Path,
+    root: &fs::File,
+    relative: &Path,
+    context: &ConversionAttributeContext,
+    session: Option<u64>,
+    killable: bool,
+) -> io::Result<BTreeMap<String, AttributeState>> {
+    if relative.is_absolute()
+        || relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|part| !matches!(part, std::path::Component::Normal(_)))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "conversion requires a canonical relative path",
+        ));
+    }
+    let absolute = workdir.join(relative);
+    let mut sources = Vec::new();
+    if let Some(configured) = &context.configured {
+        sources.push(AttributeSource {
+            path: configured.clone(),
+            base: workdir.to_path_buf(),
+        });
+    }
+    for directory in attribute_dirs(workdir, &absolute) {
+        for name in [GIT_ATTRIBUTES_FILE, LIBRA_ATTRIBUTES_FILE] {
+            sources.push(AttributeSource {
+                path: directory.join(name),
+                base: directory.clone(),
+            });
+        }
+    }
+    sources.extend(context.info.iter().map(|path| AttributeSource {
+        path: path.clone(),
+        base: workdir.to_path_buf(),
+    }));
+    let root_identity = beneath_root_identity(workdir, root)?;
+    BENEATH_ATTRIBUTE_CACHE.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.as_ref().is_none_or(|cache| cache.root != root_identity || cache.session != session) {
+            *slot = Some(BeneathAttributeCache::new(root_identity, session));
+        }
+        let cache = slot.as_mut().ok_or_else(|| io::Error::other("conversion attribute cache unavailable"))?;
+        let mut states = BTreeMap::new();
+        for source in sources {
+            let rules = if let Ok(relative) = source.path.strip_prefix(workdir) {
+                strict_source_rules(root, relative, &source.base, cache, killable)
+            } else {
+                // The caller explicitly supplies external config/info sources.
+                // Worktree rules cannot choose an external file capability.
+                let parent = source.path.parent().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "attributes file has no parent"))?;
+                let name = source.path.file_name().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "attributes file has no name"))?;
+                match crate::utils::beneath::open_root(parent) {
+                    Ok(external_root) => {
+                        let contents = read_strict_attribute_source(&external_root, Path::new(name))?;
+                        Ok(contents.map(|bytes| Arc::new(parse_attribute_contents(&String::from_utf8_lossy(&bytes), &source.base))))
+                    },
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+                    Err(error) => Err(error),
+                }
+            }.map_err(|error| io::Error::new(error.kind(), format!("read attributes source '{}': {error}; check that it is a readable regular file", source.path.display())))?;
+            let Some(rules) = rules else { continue; };
+            for rule in rules.iter() {
+                if !attribute_rule_matches_file(rule, &absolute) { continue; }
+                for assignment in &rule.assignments {
+                    if assignment.state == AttributeState::Unspecified {
+                        states.remove(&assignment.name);
+                    } else {
+                        states.insert(assignment.name.clone(), assignment.state.clone());
+                    }
+                }
+            }
+        }
+        Ok(states)
+    })
+}
+
+/// Metadata for every possible source, including absent files. Directory
+/// enumeration comes from tracked paths, so no unbounded worktree walk is
+/// needed, and deleting a source changes the digest just like editing it.
+pub(crate) fn conversion_sources_fingerprint(
+    workdir: &Path,
+    root: &fs::File,
+    directories: &[PathBuf],
+    context: &ConversionAttributeContext,
+) -> io::Result<String> {
+    let mut hash = ring::digest::Context::new(&ring::digest::SHA256);
+    hash.update(format!("conversion-v2:{:?}", beneath_root_identity(workdir, root)?).as_bytes());
+    let mut sources = Vec::new();
+    sources.extend(context.configured.iter().cloned());
+    for directory in directories {
+        for name in [GIT_ATTRIBUTES_FILE, LIBRA_ATTRIBUTES_FILE] {
+            sources.push(workdir.join(directory).join(name));
+        }
+    }
+    sources.extend(context.info.iter().cloned());
+    for source in sources {
+        let bytes = crate::internal::worktree_io::protocol::path_to_bytes(&source);
+        hash.update(&(bytes.len() as u64).to_le_bytes());
+        hash.update(&bytes);
+        let stat = if let Ok(relative) = source.strip_prefix(workdir) {
+            crate::utils::beneath::lstat_beneath(root, relative)
+        } else {
+            let parent = source.parent().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "attributes source has no parent",
+                )
+            })?;
+            let name = source.file_name().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "attributes source has no name")
+            })?;
+            crate::utils::beneath::open_root(parent).and_then(|external_root| {
+                hash.update(
+                    format!("{:?}", beneath_root_identity(parent, &external_root)?).as_bytes(),
+                );
+                crate::utils::beneath::lstat_beneath(&external_root, Path::new(name))
+            })
+        };
+        match stat {
+            Ok(stat) if stat.is_file => {
+                hash.update(format!("{:?}", BeneathSourceFingerprint::from(&stat)).as_bytes())
+            }
+            Ok(_) => {
+                // Inspect the source using the killable path, retaining FIFO
+                // timeout behavior instead of treating non-regular as absent.
+                if let Ok(relative) = source.strip_prefix(workdir) {
+                    read_beneath_attribute_source(root, relative)?;
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "attributes source '{}' is not a readable regular file",
+                        source.display()
+                    ),
+                ));
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) =>
+            {
+                hash.update(b"absent")
+            }
+            Err(error) => {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!(
+                        "cannot inspect attributes source '{}': {error}",
+                        source.display()
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(hex::encode(hash.finish().as_ref()))
+}
+
+fn strict_source_rules(
+    root: &fs::File,
+    source: &Path,
+    base: &Path,
+    cache: &mut BeneathAttributeCache,
+    killable: bool,
+) -> io::Result<Option<Arc<Vec<AttributeRule>>>> {
+    let stat = match crate::utils::beneath::lstat_beneath(root, source) {
+        Ok(stat) => stat,
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    if !stat.is_file {
+        if !killable || stat.is_symlink || stat.mode & 0o170000 == 0o040000 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "not a regular attributes file; replace it with a readable regular file",
+            ));
+        }
+        // Preserve FIFO deadline behavior: only the recyclable helper can
+        // attempt this open. No failed source becomes an empty rule set.
+        return read_beneath_attribute_source(root, source).map(|bytes| {
+            Some(Arc::new(parse_attribute_contents(
+                &String::from_utf8_lossy(&bytes),
+                base,
+            )))
+        });
+    }
+    cache
+        .regular_source_rules(root, source, base, BeneathSourceFingerprint::from(&stat))
+        .map(Some)
+}
+
+fn read_strict_attribute_source(root: &fs::File, source: &Path) -> io::Result<Option<Vec<u8>>> {
+    let stat = match crate::utils::beneath::lstat_beneath(root, source) {
+        Ok(stat) => stat,
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    if !stat.is_file {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "not a regular attributes file; replace it with a readable regular file",
+        ));
+    }
+    read_regular_beneath_attribute_source(root, source).map(|(contents, _)| Some(contents))
+}
+
 pub fn is_lfs_tracked(path: &Path) -> bool {
     matches!(
         attribute_state_for_path("filter", path),
@@ -634,11 +929,14 @@ fn read_regular_beneath_attribute_source(
     })?;
     let before = crate::utils::beneath::RawLstat::from_metadata(&file.metadata()?)?;
     let mut contents = Vec::new();
-    io::Read::read_to_end(&mut file, &mut contents)?;
+    io::Read::read_to_end(
+        &mut io::Read::take(&mut file, before.len.saturating_add(1)),
+        &mut contents,
+    )?;
     let after = crate::utils::beneath::RawLstat::from_metadata(&file.metadata()?)?;
     let before_fingerprint = BeneathSourceFingerprint::from(&before);
     let after_fingerprint = BeneathSourceFingerprint::from(&after);
-    if before_fingerprint != after_fingerprint {
+    if before_fingerprint != after_fingerprint || contents.len() as u64 != before.len {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(

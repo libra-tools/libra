@@ -58,6 +58,8 @@ Nowledge 定向检索已尝试，服务连接被环境阻止；本计划依据�
 
 ### SP-09 审计记录交付收口（EX-SP-09-CLOSE-01）
 
+**PR #1058 CI 恢复（2026-11-16 07:39 UTC）：** 已同步 `origin/main` `4e53393aef9480e2b510e1fe2371977a09783920`，保留原 SP-09 审计及上游状态记录。历史 `compat-scoped-input-windows` 的实际编译错误是 `tests/command/agent_roster_test.rs` 无条件使用 Unix `Permissions::from_mode`；`compat-owner-liveness-macos` 在首个精确测试冷构建 53m40s 后被 60 分钟作业取消。两者已由上游 `292e5edf7`、`36323df63` 修复，随后 `0520d8061` 按维护者指令移除平台与 live job；本次沿用该现行 workflow，不恢复已移除作业，也不把移除记为测试通过。当前 main run `43787918610` 的 rustfmt、`collapsible_if` 与四项协议测试失败已在本 head 修复：仓外协议版本读取使用 `ConfigKv::get_best_effort`，强制 legacy 的 v2-only 广告在 pull 保持 `LBR-NET-002`。仓外 focused 32/32、nightly fmt 与严格 Clippy 均 exit0；本机全量 nextest 保持 not-run。最终 head CI 与合并回执待实际运行后回填。原性能数据仍绑定冻结候选，旧失败记录保留；本次不代表整轮性能审计、最终 ER-05 或延期发布/网站事项完成。
+
 **本次构建版工具例外（2026-11-05 01:27:09 UTC）：** 用户随后明确要求“用本机 Build 的 Libra 解决冲突，然后提交推送”，本次授权取代此前暂缓提交时的工具选择，不修改仓库通用规则。仅使用已在本机验证的冻结 0.30.152 二进制 `/data/libra-performance/sp09-20261104/bin/libra-candidate`（SHA-256 `ad3612fdec4117ec2248a696c88073a6cb0fedad183d955cddfbd191cea8d446`）完成本次冲突解决、签名+DCO提交、推送和核验；不覆盖系统安装。开始前 branch 为 `codex/SP-09`、HEAD 为 f2e7a278，三文件改动仍在；PR #1058 已与 main 冲突，需保全本卡和上游记录后重新验收新 head，旧性能证据仍绑定原冻结源码，不外推至同步后的主线。
 
 **冲突恢复与最终树验证（2026-11-05 01:41:57 UTC）：** 精确备份三文件、保存原 HEAD 归档与 stash 后，fetch 上游至 `9766c98c02abd8f7e77b4bc80d3327f95c009a80`；native merge 仅在 `plan-status.md` 首段冲突，保留 SP-09 和上游资格记录两侧内容并清除标记。合并树的 nightly fmt exit0（16.235s）与 stable 严格 all-targets/all-features Clippy exit0（273.386s）；733 个生产源码/build 路径与原冻结候选逐字节一致，变动为上游测试与文档，不新增本卡产品修改。签名+DCO合并提交 `fc1540622c3ec677d86dce7622c392da4b7c180d` 的父提交为原 `f2e7a278` 和该上游，保留原签名历史。

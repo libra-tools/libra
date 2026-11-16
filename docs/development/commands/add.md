@@ -4,6 +4,27 @@
 
 `libra add` 的目标是把工作区中的文件变化写入索引，为下一次 `libra commit` 准备快照。实现需要覆盖路径规格、忽略规则、`--dry-run` 预览、`--refresh` 重新检查已跟踪条目、`-A` 全量暂存以及 LFS 指针文件暂存，同时保证路径解析不会越过仓库根目录。
 
+### 显式 text/eol 的存储语义
+
+普通 add、交互暂存的工作区输入及 `--renormalize` 通过共享 worktree_conversion
+读取原语应用显式 `text`/`eol` 策略，仅将成对 CRLF 转为 LF，保持孤立 CR、其它字节和
+末尾换行状态。索引 stat 仍描述磁盘文件，blob OID 按转换后字节及其长度计算；历史对象
+和源文件只读。`-text`、无转换规则、LFS 与 symlink 各保留既有
+语义。属性来源读取失败不得当作未设置规则；默认 add 失败不发布部分 index，显式
+`--ignore-errors` 继续沿用逐文件失败语义。
+
+验证覆盖 `command_test::command::add_test::i1062_explicit_` 的真实 CLI、SHA-1/SHA-256、
+历史对象与工作区不变，以及 `i1062_conversion_failure_` 的索引原子性和错误说明。
+
+
+### 自动文本转换
+
+`text=auto`（可搭配 eol）与显式策略共用 worktree_conversion；流式统计 CRLF、孤立 CR、NUL、可打印/非打印字节，跨块保留 CR，并按固定 Git 规则忽略末尾 SUB。普通模式仅在非二进制 CRLF 输入上惰性检查 index stage 0、缺失时 stage 2 的实际 blob；历史非二进制 CRLF 阻止转换。`--renormalize` 跳过历史保护，仍保留二进制探测。
+
+只读比较和暂存传递同一已加载 index 上下文；对象只在现有 killable helper 内使用 local-only typed bounded reader，单对象证据限 32 MiB，不 hydrate、不创建对象目录、不缓存正文。缺失/损坏/超额报错，不映射成工作区删除。库调用沿用调用线程后备读取，不占用不可终止 dispatcher slot。conversion-v2 属性源指纹同时使旧 stat 证书和 dirty cache 失效；有效 warm stat 路径不新增对象读取。
+
+新增 `i861_auto_` / `i861_failure_`、共享消费者与 TC-1324 两轨验证。无属性 autocrlf、safecrlf、自定义过滤器和 checkout smudge 仍不在支持范围。
+
 ## 对比 Git 与兼容性
 
 - 兼容级别：`partial`。sparse-checkout flag unsupported
@@ -88,3 +109,9 @@ flowchart TD
 - 2026-09-20（plan issues/470 FM-04）：`check_file_status`/`stage_a_file` 将「仅 mode 变化」（`core.fileMode=true` 且普通文件 owner-execute 位与索引不同、内容未变）视为已修改并重写条目；`--dry-run` 预览同源。
 - 2026-09-20（plan-20260918 WT-05，`-N` 暂时隐藏）：新增 `-N/--intent-to-add`——按 pathspec 命中的未跟踪路径写入空 blob（`e69de29…`）+ 零 stat + index v3 `intent_to_add` 扩展位，已跟踪路径 no-op，未命中 pathspec 保持 128 零写入，`--dry-run` 只预览（`add: <path>`）；`AddOutput.intent_to_add` 承载 JSON 字段；真实暂存路径改用 `index_ext::update_preserving_file_mode_except_intent` 清除该位（ADR-SW-03），全部清除后索引回 v2。
 - 2026-10-18（plan-20260918 WT-06/WT-07）：公开 `-N`；补齐 intent-to-add 的展示面与写入消费面——`status` 单独返回 `intent_to_add`（不再落到 modified），porcelain v1/v2/长格式/JSON 对齐 Git；`diff` 的 index 侧跳过占位（`--cached` 为空、worktree 视图为新文件），`diff-files` 新增 `--name-status`；`write-tree`/`commit`/`utils::tree` 跳过占位，`commit -a` 用 `update_preserving_file_mode_except_intent` 清除标志；`stash push` 以 `LBR-CONFLICT-002` 拒绝；`rm --cached` 可移除、非 cached 仍按 Git 文案拒绝。
+
+## 显式换行比较（#1062）
+
+候选分类也使用 clean 表示。只修改属性、目标文件 stat 不变时，已跟踪文件仍可能需要重新暂存；单纯 CRLF/LF 表示差异不会报告为内容修改。`--renormalize` 仍强制重新处理已跟踪文件。比较过程不改写工作区文件。
+
+调用现有共享状态入口并消费 `worktree_conversion` 的显式策略；保留原始快照/物化 API，未将其它命令的 raw blob 读取批量改成 clean。属性版本变化及读取失败不得复用旧的 clean 结论。回归位于既有 `command_test` 对应模块的 `i1062_` 用例（am 为 `worktree_isolation_test`）。

@@ -7,9 +7,10 @@ Restore working tree files or index entries from a source.
 ## Synopsis
 
 ```
-libra restore [--source <tree-ish>] [--staged] [--worktree] <pathspec>...
-libra restore (--ours | --theirs | --merge | --conflict <style>) <pathspec>...
-libra restore --ignore-unmerged [--source <tree-ish>] <pathspec>...
+libra restore [--source <tree-ish>] [--staged] [--worktree] [<pathspec>...]
+libra restore (--ours | --theirs | --merge | --conflict <style>) [<pathspec>...]
+libra restore --ignore-unmerged [--source <tree-ish>] [<pathspec>...]
+libra restore --pathspec-from-file <FILE> [OPTIONS]
 ```
 
 ## Description
@@ -28,17 +29,18 @@ memory cost of rebuilding a delta chain is never written to the index). Their
 stat fields stay zeroed, so the next `libra status` re-checks the worktree
 content. When `--staged` and `--worktree` are combined, Libra records a
 worktree stat only after the materialized path still hashes to the source blob
-and its metadata remains stable across the hash. This records the actual file
-length for LFS-smudged files, including verified payloads whose timestamps
-must remain untrusted; a changed or racy path keeps zeroed stat fields
-so status cannot trust a mismatched snapshot. Symlink metadata is read without
-following the link. Ordinary files are re-hashed after atomic publication;
-refreshing stat alone does not add paths to the reported restored-file list. On non-Unix platforms,
-volatile stat fields remain zeroed because creation time cannot prove that
-content stayed unchanged; the observed worktree size is retained and status
-compares content.
+and its metadata remains stable across the hash. For LFS-smudged files, the
+index records the payload's actual length rather than the pointer length. On
+Unix, volatile stat fields are retained only when the generated LFS pointer
+hash matches the source blob and metadata stays stable; a hash/read failure, a
+mismatch, or a race leaves those fields zeroed so status rechecks the content.
+Symlink metadata is read without following the link. Ordinary files are
+re-hashed after atomic publication; refreshing stat alone does not add paths to
+the reported restored-file list. On non-Unix platforms, volatile stat fields
+remain zeroed because creation time cannot prove that content stayed
+unchanged; the observed worktree size is retained and status compares content.
 
-The `<pathspec>` argument is required and accepts one or more file paths or directory paths. The special path `.` restores all files. Pathspecs use Libra's shared Git-style matcher: plain pathspecs match a file or directory prefix, wildcard pathspecs are supported, and the high-value magic forms `:(top)`, `:/`, `:(glob)`, `:(literal)`, `:(icase)`, `:(exclude)`, `:!`, and `:^` are honored. Exclude pathspecs subtract from the positive selection, pathspec matching follows `core.ignorecase` when enabled, and wildcard-looking pathspecs also match an exact path or directory prefix with the same literal text.
+Provide one or more positional pathspecs, or use `--pathspec-from-file <FILE>`; at least one source is required. When the file option is given, its contents replace any positional pathspecs, and `-` reads from stdin. The special path `.` restores all files. Pathspecs use Libra's shared Git-style matcher: plain pathspecs match a file or directory prefix, wildcard pathspecs are supported, and the high-value magic forms `:(top)`, `:/`, `:(glob)`, `:(literal)`, `:(icase)`, `:(exclude)`, `:!`, and `:^` are honored. Exclude pathspecs subtract from the positive selection, pathspec matching follows `core.ignorecase` when enabled, and wildcard-looking pathspecs also match an exact path or directory prefix with the same literal text.
 
 When a source commit contains files that do not exist in the current worktree, those files are created. In the default (`--no-overlay`) mode, when the current worktree contains tracked files that do not exist in the source, those files are deleted so the target matches the source exactly; with `--overlay` those source-absent tracked paths are left in place instead. The output reports both `restored_files` and `deleted_files` separately.
 
@@ -66,7 +68,7 @@ Restored files carry the source entry's permission bits: `100755` is created exe
 
 | Option | Short | Long | Description |
 |--------|-------|------|-------------|
-| Pathspec | | positional (required) | One or more files or directories to restore. Supports shared pathspec magic. Use `.` for all files. |
+| Pathspec | | positional (optional with `--pathspec-from-file`) | One or more files or directories to restore. Supports shared pathspec magic. Use `.` for all files. |
 | Source | `-s` | `--source <tree-ish>` | Restore from the specified commit or tree-ish instead of the default source. When omitted, the default source depends on the mode: index for worktree restore, HEAD for staged restore. |
 | Staged | `-S` | `--staged` | Restore the index (unstage files). Defaults the source to HEAD if `--source` is not given. |
 | Worktree | `-W` | `--worktree` | Restore the working tree. This is the default when `--staged` is not given. |

@@ -62,3 +62,6 @@ target*
 
 # Agent
 .teamx
+
+# Local long-task runtime output
+/tmp/

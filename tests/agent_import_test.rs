@@ -5943,17 +5943,17 @@ fn pi_discovery_keeps_pi_unsupported() {
     };
 
     let row = registration_for(AgentKind::Pi);
-    assert!(!row.supported);
-    assert_eq!(row.support_wave, None);
+    assert!(row.supported);
+    assert_eq!(row.support_wave, Some("pi"));
     assert!(!row.transcript_readable);
-    assert!(!row.hook_installable);
+    assert!(row.hook_installable);
     assert!(!row.launchable_review && !row.launchable_investigate);
-    assert!(!row.capabilities.hooks);
-    assert!(!supported_slugs().contains(&"pi"));
+    assert!(row.capabilities.hooks);
+    assert!(supported_slugs().contains(&"pi"));
     assert!(!is_preview(AgentKind::Pi));
     assert!(live_capture_matches_hook_installable(AgentKind::Pi));
     let agent = agent_for(AgentKind::Pi);
-    assert!(agent.as_hooks().is_none());
+    assert!(agent.as_hooks().is_some());
     assert!(
         agent
             .read_transcript(&AgentSessionCtx {
@@ -8482,17 +8482,15 @@ fn pi_explicit_import_stores_one_partial_checkpoint_and_replays_as_noop() {
     );
 
     let registration = registration_for(AgentKind::Pi);
-    assert!(!registration.supported);
-    assert!(!registration.hook_installable);
+    assert!(registration.supported);
+    assert!(registration.hook_installable);
     let listed = fixture.run(&["agent", "list", "--json"]);
     assert!(listed.status.success(), "{}", describe(&listed));
     assert!(
-        !String::from_utf8_lossy(&listed.stdout).contains("\"pi\""),
+        String::from_utf8_lossy(&listed.stdout).contains("\"pi\""),
         "{}",
         describe(&listed)
     );
-    let enabled = fixture.run(&["agent", "add", "pi"]);
-    assert!(!enabled.status.success(), "{}", describe(&enabled));
 }
 
 /// PI-10 AC2: an import uses only the PI-33 snapshot. When its frame refuses

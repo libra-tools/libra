@@ -46,3 +46,10 @@
 
 - 改进本命令前先阅读 [docs/development/commands/_general.md](_general.md)。
 - 补丁解析/应用必须继续走 `diffy`（与 `merge`/`merge-file` 一致）；写入模式落地时必须实现临时文件 + 原子 rename + 失败清理，绝不留部分写入。
+
+- 2026-11-13（#478 LG-11，ADR-LG-07 第 1–3 条）：默认应用在全部准备/检查通过后原子写出工作树（多文件补丁任一失败零写入）；新增 `--numstat`（`ins\tdel\tpath`，二进制 `-\t-`）、`--summary`（create/delete/mode change）与 `--apply`（与报告同用时先报告后应用）；`--stat` 对齐 Git 的名称/计数列宽并省略零插入/删除子句；`-R/--reverse` 回归。测试：`test_apply_worktree_and_reports_matrix`（t4106:15、t4102:38 移植）、`apply_test` 18/18、`compat_mail_am_basic` 41/41。
+
+- 2026-11-13（#478 LG-12，ADR-LG-07 第 3、4 条）：`--index` 在准备前校验每条受影响路径的工作树字节与索引 blob 一致（不一致报 `<path>: does not match index`、exit 128、零写入），成功后写工作树并暂存；`--cached` 只把补丁结果写入索引（`Blob` + `IndexEntry`，不触碰工作树），与 `--index` 互斥；`--include`/`--exclude` 改为按 argv 顺序首个匹配决定（Git wildmatch，`--exclude=* --include=a.txt` 跳过、反之应用）；过滤后空补丁 exit 0 且零输出。测试：`test_apply_index_cached_and_filters_matrix`（B1–B5）。
+
+- 2026-11-13（#478 LG-13，ADR-LG-07 第 5 条）：`--3way` 隐含 `--index`（`--cached` 除外）；前像 blob 可解析时用 `diffy::merge_bytes` 合并 recorded-base/ours/theirs——干净合并记录并在应用后向 stderr 输出 `Applied patch to '<path>' cleanly.` 且暂存结果；冲突写出 markers 并写 stage 1/2/3 未合并索引，退出 1；前像缺失仍失败零写入。`--3way --cached` 只写索引。测试：`test_apply_three_way_matrix`（C1–C4），`apply_test` 20/20、`merge_test` 314/314、`compat_mail_am_basic` 41/41。
+
