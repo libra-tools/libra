@@ -1265,11 +1265,13 @@ mod pkt_line_boundary_tests {
         server.stop().await;
     }
 
-    /// A server that ignores an explicit legacy request and sends v2 must
-    /// retain the protocol-mismatch diagnosis, without leaking capabilities.
+    /// A legacy-forced client must reject a v2-only advertisement before
+    /// opening a v2 session. The default is now v2, so this regression pins
+    /// `protocol.version=0`; the `version 2` line must never be parsed as a
+    /// reference or reported as a connectivity failure.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial(cwd, env)]
-    async fn pkt_line_protocol_v2_advertisement_reports_unsupported_remote() {
+    async fn pkt_line_forced_legacy_rejects_v2_only_advertisement() {
         let _config = crate::utils::test::ConfigDbFixture::new().unwrap();
         let mut server = TestServer::start(ResponseMode::ProtocolV2Advertisement).await;
         for command in ["fetch", "clone", "ls-remote", "pull"] {

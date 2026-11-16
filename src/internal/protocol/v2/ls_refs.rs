@@ -56,7 +56,7 @@ pub struct LsRefsResult {
 impl LsRefsResult {
     /// Capability lines derived from the response, v0-shaped.
     ///
-    /// `symref=HEAD:<target>` is what [`crate::command::fetch::resolve_remote_default_branch`]
+    /// `symref=HEAD:<target>` is what `command::fetch::resolve_remote_default_branch`
     /// and `ls-remote --symref` consume, so an `ls-refs` answer feeds the
     /// existing reference machinery without a second transport concept.
     pub fn derived_capabilities(&self) -> Vec<String> {

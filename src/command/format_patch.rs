@@ -433,6 +433,30 @@ pub async fn execute(args: FormatPatchArgs) {
     }
 }
 
+/// Reject CLI-only conflicts before repository preflight can write repair state.
+pub(crate) fn validate_cli_args(args: &FormatPatchArgs) -> CliResult<()> {
+    // Check CLI-only conflicts before config fills subject_prefix. A configured
+    // prefix is harmless under -k; an explicit (even empty) CLI prefix is not.
+    if args.keep_subject {
+        let conflict = if args.numbered {
+            Some("options '-n' and '-k' cannot be used together")
+        } else if args.subject_prefix.is_some()
+            || args.rfc.as_ref().is_some_and(|marker| !marker.is_empty())
+        {
+            Some("options '--subject-prefix/--rfc' and '-k' cannot be used together")
+        } else {
+            None
+        };
+        if let Some(message) = conflict {
+            return Err(
+                CliError::fatal(message).with_stable_code(StableErrorCode::CliInvalidArguments)
+            );
+        }
+    }
+
+    Ok(())
+}
+
 /// # Side Effects
 /// - Reads commit, tree, and blob objects from the object store.
 /// - When `--stdout` is not set, creates patch files (suffix from `--suffix`,
@@ -452,6 +476,8 @@ pub async fn execute_safe(mut args: FormatPatchArgs, output: &OutputConfig) -> C
     if util::require_repo().is_err() {
         return Err(CliError::from(FormatPatchError::NotInRepo));
     }
+
+    validate_cli_args(&args)?;
 
     resolve_format_config(&mut args).await?;
 

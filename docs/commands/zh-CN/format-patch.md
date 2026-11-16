@@ -55,7 +55,7 @@ Merge commits 默认跳过。当 revision range 解析为零个提交时，命�
 | `--ignore-if-in-upstream` | | 抑制 stable patch-id 已出现在 range 排除侧的 commits | false |
 | `--src-prefix <PREFIX>` / `--dst-prefix <PREFIX>` | | 替换默认 `a/` 与 `b/` diff path prefixes | `a/`、`b/` |
 | `-p`, `--no-stat` | | 抑制 diffstat 摘要 | false |
-| `--keep-subject` | `-k` | 逐字保留 commit subject，不添加 `[PATCH]` 前缀或 `n/m` 计数 | false |
+| `--keep-subject` | `-k` | 逐字保留 commit subject，不添加 `[PATCH]` 前缀或 `n/m` 计数；与显式 `-n`、非空 `--rfc`、`--subject-prefix`（含空前缀）互斥；配置的 `format.subjectPrefix` 不冲突 | false |
 | `--suffix <SFX>` | | 生成 patch 的文件名后缀（例如 `.txt`）；`--numbered-files` 下忽略 | `.patch` |
 | `--zero-commit` | | 在每个 patch 的 `From <hash>` envelope line 中使用全零 hash | false |
 | `--signature <SIGNATURE>` | | 放在每个 patch 和 cover letter 的 `-- ` 行之后的文本 | libra version |
@@ -146,6 +146,7 @@ unified diff
 |------|-----------------|
 | 不在 Libra 仓库中 | `LBR-REPO-001` |
 | 未知 revision | `LBR-CLI-003` |
+| `-k` 与 `-n`、非空 `--rfc` 或显式 `--subject-prefix` 冲突 | `LBR-CLI-002`（退出 129；Git 退出 128），诊断列出冲突参数，不写入补丁 |
 | `--base` 不是 series 的祖先 | `LBR-CLI-003`（退出 128） |
 | `--base=auto`（不支持） | `LBR-CLI-002`（退出 129） |
 | 输出文件写入失败 | `LBR-IO-002` |

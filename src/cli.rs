@@ -3591,6 +3591,9 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
     if let Commands::Tag(tag_args) = &args.command {
         command::tag::validate_cli_args(tag_args)?;
     }
+    if let Commands::FormatPatch(format_patch_args) = &args.command {
+        command::format_patch::validate_cli_args(format_patch_args)?;
+    }
     let require_complete_object_index = command_requires_complete_object_index(&args.command);
     let preflight = command_preflight(&args.command, args.json.is_some() || args.machine)?;
     // ADR-IG-04 (issue #487): an interrupted Git conversion leaves a

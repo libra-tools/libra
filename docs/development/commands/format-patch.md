@@ -93,3 +93,7 @@ flowchart TD
 ## Blake3 仓库
 
 当 `core.objectformat` 为 `blake3` 时，`--base` 的 prerequisite-patch-id 使用 BLAKE3 摘要（64 位十六进制），而不是 SHA-1 仓所用的 Git stable patch-id 组合器。
+
+### `-k` 的 CLI 冲突检查（FP-03）
+
+在配置填充 `subject_prefix` 前检查显式参数：`-k` 与 `-n`、非空 `--rfc`、显式 `--subject-prefix`（包括空值）互斥，以 `fatal` + `LBR-CLI-002` 退出 129（Git 为 128），且在创建目录、写补丁或 stdout 之前失败。配置 `format.subjectPrefix` 不冲突；`--rfc=` 和 `--rfc --no-rfc` 可与 `-k` 并用。测试 `fp03_*` 分别验证消息、稳定码、退出码、空 stdout、完整文件快照、JSON 与 machine 输出，并核对测试集合。
