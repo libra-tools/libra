@@ -42,15 +42,17 @@ The universal libra knowledge (layout, CLI entry points, test layers, hard rules
 cargo +nightly fmt --all
 
 # Lint (the real gate)
-LIBRA_SKIP_WEB_BUILD=1 cargo clippy --all-targets --all-features -- -D warnings
+cargo clippy --all-targets --all-features -- -D warnings
 
 # Fast check
-LIBRA_SKIP_WEB_BUILD=1 cargo check
-
-# Tests
-cargo test --all
-cargo test --test <target> -- --test-threads=1
+cargo check
 ```
+
+### Tests
+
+This file is not an independent acceptance policy. If `AGENTS.md` exists, read its **Testing Guidelines**; if `CLAUDE.md` exists, read its **Quality Acceptance Criteria**. If a task card has been selected, follow that card and its plan; do not assume a task card exists. If `docs/development/plan/plan-template.md` exists and governs the selected work, follow **ER-13** / **ER-14**. If some resources are absent, follow the applicable guidance that is available. If no project test guidance exists, identify and run the tests appropriate for this project's changes when feasible, and report what actually ran and what remains unrun; do not treat an example command as universal acceptance.
+
+In Further reading, every listed path is read only when that file exists in the current project. The Libra source repository's `CLAUDE.md` uses this exact uppercase spelling.
 
 ## Core rules enforced in this repository
 
@@ -71,10 +73,10 @@ Update in order:
 
 ## Further reading (inside this repo)
 
-- `AGENTS.md` — primary agent guidance
-- `Claude.md` — contributor setup, env vars, test layers
-- `COMPATIBILITY.md`
-- `docs/development/tracing/agent.md`
+- `AGENTS.md` — primary agent guidance, when present in this project
+- `CLAUDE.md` — contributor setup, env vars, test layers, when present in this project
+- `COMPATIBILITY.md` — when present in this project
+- `docs/development/tracing/agent.md` — when present in this project
 
 Activate with `/skill libra` inside `libra code`.
 

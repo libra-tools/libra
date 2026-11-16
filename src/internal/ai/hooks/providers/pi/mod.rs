@@ -4,19 +4,21 @@
 //! forwards the ADR-PI-06 envelope to `libra agent hooks pi observe`. The
 //! receiver lowers that camelCase frame to the shared envelope before the
 //! generic checks and records it through the existing agent-traces ingest.
-//! Installing the asset through `libra agent enable`, the subprocess
-//! resource contract, event correlation and the run terminal belong to
-//! PI-14, PI-13, PI-12 and PI-19. Pi stays unsupported and not
-//! hook-installable.
+//! The extension bounds its child processes (PI-13) and the receiver keys
+//! every recorded event by a stable native field (PI-12, see [`parser`]).
+//! Installing the asset through `libra agent enable` and the run terminal
+//! belong to PI-14 and PI-19. Pi stays unsupported and not hook-installable.
 
 pub mod parser;
 pub mod settings;
 
-use anyhow::{Result, bail};
+use std::path::Path;
+
+use anyhow::{Context, Result};
 
 use super::super::{
     lifecycle::{LifecycleEvent, LifecycleEventKind, SessionHookEnvelope},
-    provider::{HookProvider, ProviderHookCommand, ProviderInstallOptions},
+    provider::{HookProvider, ProviderHookCommand, ProviderInstallOptions, ToolLinkKeys},
 };
 
 pub static PI_PROVIDER: PiProvider = PiProvider;
@@ -59,30 +61,58 @@ impl HookProvider for PiProvider {
         parser::pi_event_is_ingested(hook_event_name)
     }
 
-    /// Stable native keys arrive with PI-12. Until then every delivery is
-    /// its own action.
+    /// Every replay identity field the Pi envelope carries. Which one
+    /// applies depends on the event, see [`Self::dedup_identity_keys_for_event`].
     fn dedup_identity_keys(&self) -> &'static [&'static str] {
-        &[]
+        &["toolCallId", "frameId"]
     }
 
+    /// Keyed by event name rather than lifecycle kind: `tool_call` and
+    /// `tool_result` are both `ToolUse` but keep separate phases, and an
+    /// event without a key here stays its own action on every delivery.
     fn dedup_identity_keys_for_event(
         &self,
-        _hook_event_name: &str,
+        hook_event_name: &str,
         _event_kind: LifecycleEventKind,
     ) -> &'static [&'static str] {
-        &[]
+        parser::pi_replay_identity_keys(hook_event_name)
     }
 
-    fn install_hooks(&self, _options: &ProviderInstallOptions) -> Result<()> {
-        bail!("Pi hook installation is not available yet; Pi is not a supported agent")
+    /// A tool event's `toolCallId` and `parentToolCallId` (PI-37). A nested
+    /// call's parent identity is built from the parent's own `toolCallId`,
+    /// so it equals the identity the parent call is recorded with.
+    fn tool_link_keys(&self, hook_event_name: &str) -> Option<ToolLinkKeys> {
+        matches!(hook_event_name, "tool_call" | "tool_result").then_some(ToolLinkKeys {
+            tool: "toolCallId",
+            parent: "parentToolCallId",
+        })
+    }
+
+    fn install_hooks(&self, options: &ProviderInstallOptions) -> Result<()> {
+        let project = std::env::current_dir()
+            .context("cannot determine the project directory for the Pi extension")?;
+        let binary = options
+            .binary_path
+            .as_deref()
+            .map(Path::new)
+            .map(Path::to_path_buf)
+            .or_else(|| std::env::current_exe().ok())
+            .context("cannot determine the libra binary path for the Pi extension")?;
+        settings::write_owned_pi_asset(&project, &binary)?;
+        Ok(())
     }
 
     fn uninstall_hooks(&self) -> Result<()> {
-        bail!("Pi hook installation is not available yet; Pi is not a supported agent")
+        let project = std::env::current_dir()
+            .context("cannot determine the project directory for the Pi extension")?;
+        settings::remove_owned_pi_asset(&project)?;
+        Ok(())
     }
 
     fn hooks_are_installed(&self) -> Result<bool> {
-        Ok(false)
+        let project = std::env::current_dir()
+            .context("cannot determine the project directory for the Pi extension")?;
+        Ok(settings::pi_asset_ownership(&project)? == settings::PiAssetOwnership::Owned)
     }
 }
 

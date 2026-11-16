@@ -4,6 +4,8 @@
 //! and it does not substitute a stub server. Secret values stay out of
 //! assertions and logs.
 
+#![cfg(unix)]
+
 use std::{env, path::PathBuf};
 
 /// Environment names required by GC-LTR-LIVE. Values are checked for

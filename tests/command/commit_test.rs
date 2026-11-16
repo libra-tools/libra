@@ -3932,3 +3932,46 @@ fn commit_partial_commit_options_are_classified() {
     );
     assert_eq!(index_before, fs::read(root.join(".libra/index")).unwrap());
 }
+
+#[test]
+fn i1062_consumer_commit_all_does_not_create_representation_only_commit() {
+    eol_consumer_commit_all_does_not_create_representation_only_commit(false);
+}
+
+#[test]
+fn i861_consumer_commit_all_does_not_create_representation_only_commit() {
+    eol_consumer_commit_all_does_not_create_representation_only_commit(true);
+}
+
+fn eol_consumer_commit_all_does_not_create_representation_only_commit(auto: bool) {
+    use super::{
+        add_test::{i1062_ok, i1062_run},
+        status_test::i1062_committed_scripts,
+    };
+    let temp = if auto {
+        super::status_test::i861_committed_scripts("sha1")
+    } else {
+        i1062_committed_scripts("sha1")
+    };
+    let repo = temp.path().join("repo");
+    let before = i1062_ok(&repo, &["rev-parse", "HEAD"]);
+    let output = i1062_run(
+        &repo,
+        &["commit", "-a", "--no-verify", "-m", "no content change"],
+    );
+    assert!(
+        !output.status.success(),
+        "empty commit must still be rejected: {output:?}"
+    );
+    assert_eq!(i1062_ok(&repo, &["rev-parse", "HEAD"]), before);
+    assert_eq!(
+        std::fs::read(repo.join("probe.ps1")).unwrap(),
+        b"one\r\ntwo\r\n"
+    );
+    std::fs::write(repo.join("probe.ps1"), b"real change\r\n").unwrap();
+    i1062_ok(
+        &repo,
+        &["commit", "-a", "--no-verify", "-m", "real content change"],
+    );
+    assert_ne!(i1062_ok(&repo, &["rev-parse", "HEAD"]), before);
+}

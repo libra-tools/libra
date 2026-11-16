@@ -104,6 +104,43 @@ fn log_file_writes_tracing_without_stderr() {
 }
 
 #[test]
+fn console_tracing_preserves_structured_streams() {
+    let repo = tempdir().unwrap();
+    init_repo_with_commit_via_cli(repo.path());
+    let filter = [("LIBRA_LOG", "libra::command::diff=debug")];
+    let human = run_with_envs(&["--progress=none", "diff"], repo.path(), &filter);
+    assert_cli_success(&human, "human diff with tracing");
+    assert!(
+        human.stdout.is_empty(),
+        "clean diff stdout must remain empty"
+    );
+    assert!(
+        String::from_utf8_lossy(&human.stderr).contains("diff args"),
+        "human tracing must remain observable on stderr"
+    );
+
+    for flag in [
+        "--json",
+        "--json=compact",
+        "--json=ndjson",
+        "--machine",
+        "-J",
+        "-Jq",
+    ] {
+        let output = run_with_envs(&[flag, "diff"], repo.path(), &filter);
+        assert_cli_success(&output, "structured diff with tracing");
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .expect("structured diff stdout must contain exactly one JSON response");
+        assert_eq!(json["ok"], true, "structured diff with {flag}: {json}");
+        assert!(
+            output.stderr.is_empty(),
+            "structured stderr with {flag}: {:?}",
+            output.stderr
+        );
+    }
+}
+
+#[test]
 fn invalid_log_file_does_not_fall_back_to_stderr_tracing() {
     let repo = tempdir().unwrap();
     init_repo_with_commit_via_cli(repo.path());

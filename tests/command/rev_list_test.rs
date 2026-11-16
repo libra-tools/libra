@@ -1740,3 +1740,44 @@ fn rev_list_full_path_options_unchanged() {
         "left-right prefix retained: {lr}"
     );
 }
+
+/// LG-01 (M-GREP G9): `rev-list --grep` matches `log --grep` semantics.
+#[test]
+#[serial(cwd)]
+fn test_rev_list_grep_matches_log_semantics() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    for (file, message) in [
+        ("a.txt", "init"),
+        ("b.txt", "fooXbar"),
+        ("c.txt", "c++ (fix)"),
+        ("d.txt", "foo.bar aaa"),
+    ] {
+        fs::write(p.join(file), format!("{file}\n")).unwrap();
+        assert_cli_success(&run_libra_command(&["add", file], p), "add");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", message, "--no-verify"], p),
+            "commit",
+        );
+    }
+
+    // BRE literal `c++ (fix)`: exactly the one matching commit.
+    let rev = run_libra_command(&["rev-list", "--grep", "c++ (fix)", "HEAD"], p);
+    assert_cli_success(&rev, "rev-list --grep");
+    assert_eq!(String::from_utf8_lossy(&rev.stdout).lines().count(), 1);
+
+    // `-E a+` is ERE: every subject containing an `a` matches (the fixture's
+    // initial `base` commit included).
+    let ere = run_libra_command(&["rev-list", "-E", "--grep", "a+", "HEAD"], p);
+    assert_cli_success(&ere, "rev-list -E --grep");
+    assert_eq!(String::from_utf8_lossy(&ere.stdout).lines().count(), 3);
+
+    // `-F foo.bar` is a fixed string: one commit.
+    let fixed = run_libra_command(&["rev-list", "-F", "--grep", "foo.bar", "HEAD"], p);
+    assert_cli_success(&fixed, "rev-list -F --grep");
+    assert_eq!(String::from_utf8_lossy(&fixed.stdout).lines().count(), 1);
+
+    // Invalid BRE is a 129 usage error.
+    let invalid = run_libra_command(&["rev-list", "--grep", r"a\(", "HEAD"], p);
+    assert_eq!(invalid.status.code(), Some(129));
+}

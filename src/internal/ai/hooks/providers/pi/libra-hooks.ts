@@ -6,6 +6,7 @@
 // stores lifecycle metadata only. A delivery error is ignored, and each
 // delivery is bounded in time, attempts and concurrent children.
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 
 const LIBRA_COMMAND = __LIBRA_COMMAND_JSON__;
 // The child carries its own capture budget, shorter than the delivery
@@ -19,7 +20,7 @@ const LIBRA_ARGS = [
   "pi",
   "observe",
 ];
-const ENVELOPE_SCHEMA = 1;
+const ENVELOPE_SCHEMA = 3;
 const OBSERVED_EVENTS = [
   "session_start",
   "session_shutdown",
@@ -34,15 +35,48 @@ function nullableText(value) {
   return typeof value === "string" && value !== "" ? value : null;
 }
 
-function envelope(event, payload, ctx) {
+// The run outcome is tracked here, not by the receiver: every frame is a new
+// `libra agent hooks` process, so only the extension sees the whole run. A
+// run starts at `before_agent_start`, each `turn_end` updates its outcome,
+// and `agent_settled` reports it once and clears it. Sharing the map on
+// globalThis keeps one view across reloaded copies in the same Pi process.
+const RUN_STATE = Symbol.for("libra.pi-hooks.runs");
+const runState = (globalThis[RUN_STATE] ??= new Map());
+
+function trackRunOutcome(event, payload, sessionId) {
+  if (event === "before_agent_start") {
+    runState.set(sessionId, null);
+    return null;
+  }
+  if (event === "turn_end") {
+    const outcome = payload?.outcome;
+    runState.set(
+      sessionId,
+      outcome === "completed" || outcome === "error" ? outcome : null,
+    );
+    return null;
+  }
+  if (event === "agent_settled") {
+    const outcome = runState.get(sessionId) ?? null;
+    runState.delete(sessionId);
+    return outcome;
+  }
+  return null;
+}
+
+function envelope(event, payload, ctx, runOutcome) {
   const manager = ctx.sessionManager;
   const sessionId = manager.getSessionId();
   if (typeof sessionId !== "string" || sessionId === "") {
     return undefined;
   }
+  // frameId identifies this frame: the receiver keys a session start and a
+  // user run start by it, so it is new for every frame, including frames
+  // from another Pi process, and a delivery retry sends the same frame.
   const frame = {
     schema: ENVELOPE_SCHEMA,
     event,
+    frameId: randomUUID(),
     sessionId,
     sessionFile: nullableText(manager.getSessionFile()),
     cwd: ctx.cwd,
@@ -76,6 +110,7 @@ function envelope(event, payload, ctx) {
       break;
     case "agent_settled":
       frame.aborted = payload.aborted === true;
+      frame.outcome = runOutcome ?? null;
       break;
     default:
       return undefined;
@@ -91,9 +126,9 @@ function envelope(event, payload, ctx) {
 // extension: a delivery or retry that would exceed it is dropped, never
 // queued, so Pi's loop is never held and no frame is kept.
 //
-// Only a child that never started is retried: the receiver has no replay
-// identity yet, so a child that ran, even one that exited non-zero or was
-// killed, may already have recorded the event and is never run again. A
+// Only a child that never started is retried: a child that ran, even one
+// that exited non-zero or was killed, may already have recorded the event
+// and is never run again. A
 // spawn that throws synchronously fails the same way every time and is not
 // retried either. A failed kill is retried exactly once. When Pi exits
 // normally every running child is killed; if Pi dies without running any
@@ -226,7 +261,12 @@ function observe(event, payload, ctx) {
     if (typeof ctx?.isProjectTrusted !== "function" || ctx.isProjectTrusted() !== true) {
       return;
     }
-    const frame = envelope(event, payload, ctx);
+    const sessionId = ctx?.sessionManager?.getSessionId();
+    const runOutcome =
+      typeof sessionId === "string" && sessionId !== ""
+        ? trackRunOutcome(event, payload, sessionId)
+        : null;
+    const frame = envelope(event, payload, ctx, runOutcome);
     if (frame !== undefined) {
       deliver(frame);
     }

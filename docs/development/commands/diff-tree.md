@@ -36,3 +36,5 @@
 
 - 改进本命令前先阅读 [docs/development/commands/_general.md](_general.md)。
 - 必须继续复用 `command::diff` 引擎，不得新建第二套 diff 实现。
+
+- 2026-11-13（#478 LG-09，ADR-LG-06 第 2、4 条）：默认输出改为 Git 的非递归 raw（根 tree 的 blob/tree 条目，完整 40/64 位 OID，缺失侧 `000000`+全零 id），`-r` 递归 blob、`-t` 递归时附 tree 条目；新增单提交形式（`<commit>` 先输出提交 id，再与第一父提交非递归 diff）、`--no-commit-id`、`--root`（根提交对空 tree 全量创建）；`-p` 继续委托共享 diff 引擎并保留 id 行，raw 走 `diff_plumbing` 原生渲染。回归：`test_diff_tree_raw_and_patch_matrix`。

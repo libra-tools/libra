@@ -46,7 +46,7 @@ pub(super) async fn import_global_from_git_fixture() {
             );
 
             let result = exec_config(vec!["config", "--global", "import"]).await;
-            assert!(result.is_ok());
+            assert!(result.is_ok(), "config --global import failed: {result:?}");
 
             let imported_name = config::ScopedConfig::get(config::ConfigScope::Global, "user.name")
                 .await

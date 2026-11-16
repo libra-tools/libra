@@ -95,6 +95,15 @@ thread_local! {
     static IGNORE_OP_EPOCH: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
+/// Restore a pooled worker's previous epoch even if matching unwinds.
+struct IgnoreOpEpochGuard(u64);
+
+impl Drop for IgnoreOpEpochGuard {
+    fn drop(&mut self) {
+        IGNORE_OP_EPOCH.with(|cell| cell.set(self.0));
+    }
+}
+
 fn lock_secure_ignore_walk() -> std::sync::MutexGuard<'static, SecureIgnoreWalkRegistry> {
     match SECURE_IGNORE_WALK.lock() {
         Ok(guard) => guard,
@@ -3258,6 +3267,77 @@ pub fn check_gitignore_bounded_as_dir(workdir: &Path, path: &Path, is_dir: bool)
     Some(answer)
 }
 
+/// Immutable ignore rules for the immediate children of one entered directory.
+/// Construction performs all filesystem I/O under the status deadline; matching
+/// afterwards uses only the captured rules and layer snapshot.
+pub(crate) struct DirectoryIgnoreContext {
+    workdir: PathBuf,
+    matchers: Vec<Arc<Gitignore>>,
+    layers: crate::internal::layer::ExclusionSnapshot,
+}
+
+impl DirectoryIgnoreContext {
+    /// Match an absolute, lexically contained path against the captured rules.
+    /// Callers must not substitute a relative path or a path outside `workdir`.
+    pub(crate) fn is_ignored(&self, path: &Path, is_dir: bool) -> bool {
+        debug_assert!(path.is_absolute() && path.starts_with(&self.workdir));
+        if path_has_git_dir_component(&self.workdir, path) {
+            return true;
+        }
+        if !self.layers.is_empty()
+            && let Ok(relative) = path.strip_prefix(&self.workdir)
+            && let Some(key) = crate::internal::layer::normalize_key(relative)
+            && self.layers.is_owned(&key)
+        {
+            return true;
+        }
+        self.matchers
+            .iter()
+            .find_map(|matcher| ignore_verdict_as_dir(matcher, &self.workdir, path, is_dir))
+            .unwrap_or(false)
+    }
+}
+
+/// Load every applicable source, including `dir`'s own ignore files, even if all
+/// children are tracked. The existing walk epoch keeps beneath reads scoped to
+/// this invocation and prevents late workers from poisoning another walk.
+pub(crate) fn directory_ignore_context_bounded(
+    workdir: &Path,
+    dir: &Path,
+) -> io::Result<DirectoryIgnoreContext> {
+    prewarm_ignore_config(workdir);
+    let workdir = workdir.to_path_buf();
+    let target = dir.join(".libra-ignore-context");
+    let epoch = secure_ignore_walk_epoch();
+    let layers = crate::internal::layer::ExclusionSnapshot::for_request();
+    let context = crate::command::status_probe::with_io_deadline(move || {
+        let _guard = IgnoreOpEpochGuard(IGNORE_OP_EPOCH.with(|cell| cell.replace(epoch)));
+        let matchers = ignore_sources_for_target(&workdir, &target)
+            .into_iter()
+            .map(|source| {
+                source
+                    .preloaded
+                    .unwrap_or_else(|| cached_ignore_file(&source.path, &source.base))
+            })
+            .collect();
+        DirectoryIgnoreContext {
+            workdir,
+            matchers,
+            layers,
+        }
+    })
+    .map_err(|()| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "directory ignore sources exceeded the status I/O deadline",
+        )
+    })?;
+    if ignore_read_failed_for_walk(epoch) {
+        return Err(io::Error::other("directory ignore source unreadable"));
+    }
+    Ok(context)
+}
+
 /// Resolve the DATABASE-backed part of the ignore configuration on the
 /// CALLING thread.
 ///
@@ -3605,7 +3685,28 @@ fn ignore_verdict_as_dir(
     target_file: &Path,
     is_dir: bool,
 ) -> Option<bool> {
-    ignore_match_info_as_dir(ignore, work_dir, target_file, is_dir).map(|info| info.ignored)
+    // Boolean checks must not recover verbose pattern line numbers: that path
+    // reopens the source by pathname and performs I/O after the beneath read.
+    let verdict = |matched| match matched {
+        Match::Ignore(_) => Some(true),
+        Match::Whitelist(_) => Some(false),
+        Match::None => None,
+    };
+    if let Some(answer) = verdict(ignore.matched(target_file, is_dir)) {
+        return Some(answer);
+    }
+    // The target itself was already checked above, including is_dir=true.
+    let mut parent = target_file.parent().unwrap_or(work_dir);
+    while parent.starts_with(work_dir) {
+        if let Some(answer) = verdict(ignore.matched(parent, true)) {
+            return Some(answer);
+        }
+        let Some(next) = parent.parent() else {
+            break;
+        };
+        parent = next;
+    }
+    None
 }
 
 fn ignore_match_info(
@@ -5836,6 +5937,48 @@ mod test {
     }
 
     // ── RV-01 / RV-02 resolver parity unit tests ──
+
+    #[test]
+    fn status_ignore_context_epoch_guard_restores_on_unwind() {
+        let _outer = IgnoreOpEpochGuard(IGNORE_OP_EPOCH.with(|cell| cell.replace(17)));
+        let result = std::panic::catch_unwind(|| {
+            let _inner = IgnoreOpEpochGuard(IGNORE_OP_EPOCH.with(|cell| cell.replace(29)));
+            panic!("exercise epoch guard unwind restoration");
+        });
+        assert!(result.is_err());
+        assert_eq!(IGNORE_OP_EPOCH.with(|cell| cell.get()), 17);
+    }
+
+    #[test]
+    fn status_ignore_context_matches_captured_rules_without_source_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let deep = root.join("deep");
+        let build = |base: &Path, name: &str, rules: &[&str]| {
+            let mut builder = GitignoreBuilder::new(base);
+            for rule in rules {
+                builder.add_line(Some(base.join(name)), rule).unwrap();
+            }
+            Arc::new(builder.build().unwrap())
+        };
+        // No source file or child exists. Classification is entirely in memory,
+        // including parent-directory matches and nearest-source whitelists.
+        let context = DirectoryIgnoreContext {
+            workdir: root.clone(),
+            matchers: vec![
+                build(&deep, ".libraignore", &["!keep.tmp", "cache/"]),
+                build(&root, ".gitignore", &["*.tmp"]),
+            ],
+            layers: crate::internal::layer::ExclusionSnapshot::default(),
+        };
+        for _ in 0..100 {
+            assert!(!context.is_ignored(&deep.join("keep.tmp"), false));
+            assert!(context.is_ignored(&deep.join("drop.tmp"), false));
+            assert!(context.is_ignored(&deep.join("cache/child"), false));
+            assert!(context.is_ignored(&root.join(".git/config"), false));
+            assert!(!context.is_ignored(&deep.join("plain"), false));
+        }
+    }
 
     /// Stage `path` with `content` (no commit) for index-path resolver tests.
     async fn stage_file_for_resolver_test(path: &str, content: &str) {

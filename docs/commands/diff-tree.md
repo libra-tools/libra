@@ -7,8 +7,8 @@ rename defaults.
 ## Synopsis
 
 ```
-libra diff-tree [-r] [-p] [-s] [--raw] [--name-only] [--name-status] [--exit-code] [--quiet] [-c]
-                <tree-a> <tree-b> [-- <path>...]
+libra diff-tree [-r] [-t] [-p] [-s] [--raw] [--name-only] [--name-status] [--exit-code] [--quiet] [-c]
+                [--root] [--no-commit-id] <tree-a> [<tree-b>] [-- <path>...]
 ```
 
 ## Description
@@ -19,14 +19,27 @@ it diffs the two tree-ish arguments (commits or tree ids). Path limiters go afte
 such as `libra --json diff-tree ...` still apply.
 
 Like Git's plumbing, the **default output is raw** (`:<old-mode> <new-mode>
-<old-sha> <new-sha> <status>\t<path>`). Pass `-p` for a patch.
+<old-sha> <new-sha> <status>\t<path>`) and **non-recursive**: the two-tree form
+compares the root trees, so a changed directory appears as a single `040000`
+record unless `-r` is given. `<tree-a>` alone is Git's single-commit form: it
+prints the commit id line and diffs the commit against its first parent
+(non-recursive). `--no-commit-id` suppresses that line. `--root` shows an
+initial commit as a creation diff against the empty tree; without it a root
+commit prints only the id line. `-t` includes tree entries while recursing.
+
+Raw records use full object ids (40-hex SHA-1 or 64-hex SHA-256) and `000000`
+modes / zero ids for the missing side. Pass `-p` for a patch (which implies
+recursion).
 
 ## Options
 
 | Option | Description | Example |
 |--------|-------------|---------|
-| `<tree-a> <tree-b>` | The two tree-ish to compare. | `libra diff-tree HEAD~1 HEAD` |
-| `-r` | Recurse into subtrees. Libra always recurses, so this is a no-op. | `libra diff-tree -r a b` |
+| `<tree-a> [<tree-b>]` | Two tree-ish to compare, or one commit to diff against its first parent. | `libra diff-tree HEAD~1 HEAD` |
+| `-r` | Recurse into subtrees; the default is non-recursive. | `libra diff-tree -r a b` |
+| `-t` | Include tree entries while recursing (implies `-r`). | `libra diff-tree -r -t a b` |
+| `--root` | Show an initial commit as a creation diff against the empty tree. | `libra diff-tree -r --root <root>` |
+| `--no-commit-id` | Suppress the commit id line in the single-commit form. | `libra diff-tree --no-commit-id HEAD` |
 | `-p`, `--patch` | Emit a patch instead of raw records. | `libra diff-tree -p a b` |
 | `--raw` | Force raw records (the default). | `libra diff-tree --raw a b` |
 | `--name-only` | Print changed path names only. | `libra diff-tree --name-only a b` |
@@ -38,7 +51,7 @@ Like Git's plumbing, the **default output is raw** (`:<old-mode> <new-mode>
 | `-- <path>...` | Limit the diff to paths. | `libra diff-tree a b -- src/` |
 | `--json` / `--machine` | Structured diff output (same envelope as `diff`). | `libra --json diff-tree a b` |
 
-The remaining porcelain flag surface (`-t`/`--stdin`) is not exposed.
+The remaining porcelain flag surface (`--stdin`, `-m`, `--cc` combined rendering) is not exposed.
 
 ## Exit codes
 

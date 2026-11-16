@@ -26,20 +26,14 @@ impl LeaseFilePermissions {
         let Some(value) = value else {
             return Ok(Self::Umask);
         };
-        let normalized = value.trim().to_ascii_lowercase();
-        match normalized.as_str() {
-            "false" | "no" | "off" | "umask" | "0" => Ok(Self::Umask),
-            "true" | "yes" | "on" | "group" | "1" => Ok(Self::Add(0o660)),
-            "all" | "world" | "everybody" | "2" => Ok(Self::Add(0o664)),
-            numeric if numeric.len() == 4 && numeric.starts_with('0') => {
-                let bits = u32::from_str_radix(&numeric[1..], 8)
-                    .map_err(|_| invalid_shared_repository(value))?;
-                if bits & 0o600 != 0o600 {
-                    return Err(invalid_shared_repository(value));
-                }
+        match crate::utils::shared_perm::SharedMode::parse(value) {
+            Ok(crate::utils::shared_perm::SharedMode::Umask) => Ok(Self::Umask),
+            Ok(crate::utils::shared_perm::SharedMode::Group) => Ok(Self::Add(0o660)),
+            Ok(crate::utils::shared_perm::SharedMode::All) => Ok(Self::Add(0o664)),
+            Ok(crate::utils::shared_perm::SharedMode::Numeric { bits, .. }) => {
                 Ok(Self::Exact(bits & 0o666))
             }
-            _ => Err(invalid_shared_repository(value)),
+            Err(_) => Err(invalid_shared_repository(value)),
         }
     }
 
@@ -246,6 +240,9 @@ fn open_files_with_permissions(
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
         Err(error) => return Err(storage_error("create directory for", info, error)),
     }
+    if let Ok(Some(shared)) = crate::utils::shared_perm::get_shared_mode_for_path(info) {
+        let _ = crate::utils::shared_perm::adjust_shared_perm(info, &shared);
+    }
     let parent = open_parent(info)?;
     let file = open_leaf(&parent, path, permissions.creation_mode())?;
     if !metadata(&file, path)?.is_file() {
@@ -265,6 +262,9 @@ fn open_repository_files(
     path: &Path,
     permissions: LeaseFilePermissions,
 ) -> Result<(File, File), OperationError> {
+    if let Ok(Some(shared)) = crate::utils::shared_perm::get_shared_mode_for_path(parent_path) {
+        let _ = crate::utils::shared_perm::adjust_shared_perm(parent_path, &shared);
+    }
     let parent = open_parent(parent_path)?;
     let file = {
         #[cfg(unix)]

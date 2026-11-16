@@ -168,7 +168,7 @@ Git 的 blame 默认使用 HEAD，并要求 `git blame --contents <file>` 才能
 | 不把 root 当边界 | `--root`（no-op；root 已按普通提交显示） | `--root` | N/A |
 | 忽略空白 | `-w` / `--ignore-whitespace`（ignore-all-whitespace） | `-w` | N/A |
 | Porcelain 格式 | `-p` / `--porcelain` / `--line-porcelain` | `-p` / `--porcelain` / `--line-porcelain` | N/A |
-| 增量输出 | 不支持 | `--incremental` | N/A |
+| 增量输出 | `--incremental`（头部/元数据/`boundary`/`filename`，无内容行） | `--incremental` | N/A |
 | 评分阈值 | 不支持 | `-M` / `-C`（移动/复制检测） | N/A |
 | 忽略修订 | 不支持 | `--ignore-rev` / `--ignore-revs-file` | N/A |
 | 工作树内容 | 不支持 | `--contents <file>` | N/A |

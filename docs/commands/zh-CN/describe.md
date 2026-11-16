@@ -12,6 +12,8 @@ libra describe [OPTIONS] [COMMIT]
 
 ## 说明
 
+`--dirty` 后缀对已跟踪普通文件使用显式 `text`/`eol` clean 比较。仅有等价的 CRLF/LF 字节差异时不附加后缀；真实内容、模式、类型或暂存变化仍会附加。 `text=auto` 同样使用该比较链路，并保留二进制探测和历史 CRLF 索引保护；`--renormalize`、索引读取额度及剩余配置边界见 [add](add.md)。
+
 `libra describe` 从给定提交（默认 `HEAD`）开始遍历提交祖先图（BFS），查找最近的标签。浅克隆中，`.libra/shallow` 列出的提交视为根（`--contains` 同样在边界停止）。损坏的 `.libra/shallow` fail-closed（`LBR-REPO-002`）。输出遵循 Git 的 describe 格式：
 
 - 精确匹配：`v1.2.3`

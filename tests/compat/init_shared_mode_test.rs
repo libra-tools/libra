@@ -65,16 +65,10 @@ impl CliFixture {
     }
 
     fn init_with_shared(&self, mode: &str) {
+        let shared = format!("--shared={mode}");
         self.success(
             &self.root,
-            &[
-                "init",
-                "--vault",
-                "false",
-                "--shared",
-                mode,
-                self.repo.to_str().expect("utf8 repo"),
-            ],
+            &["init", &shared, self.repo.to_str().expect("utf8 repo")],
         );
     }
 
@@ -101,41 +95,22 @@ fn stdout_trim(output: &Output) -> String {
 }
 
 #[test]
-fn init_rejects_non_traversable_numeric_shared_mode_without_partial_repo() {
+fn init_accepts_numeric_shared_mode_without_traversal_bits() {
     let fixture = CliFixture::new();
     fs::create_dir_all(&fixture.repo).expect("create target dir");
 
-    let output = fixture.run(
+    // Git masks --shared=<octal> with 0666 and only requires owner rw
+    // (0600); it does not require traverse bits. Libra matches Git here.
+    fixture.success(
         &fixture.root,
         &[
             "init",
-            "--vault",
-            "false",
-            "--shared",
-            "0660",
+            "--shared=0660",
             fixture.repo.to_str().expect("utf8 repo"),
         ],
     );
-
-    assert!(
-        !output.status.success(),
-        "init --shared=0660 unexpectedly succeeded\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("LBR-CLI-002"),
-        "expected invalid-arguments code, got stderr:\n{stderr}"
-    );
-    assert!(
-        stderr.contains("directories traversable"),
-        "diagnostic should name the directory traversal contract:\n{stderr}"
-    );
-    assert!(
-        !fixture.repo.join(".libra").exists(),
-        "invalid numeric --shared must not leave a partial .libra directory"
-    );
+    assert_eq!(fixture.shared_repository_config(), "0660");
+    assert!(fixture.repo.join(".libra").exists());
 }
 
 #[test]
@@ -143,7 +118,7 @@ fn init_persists_directory_safe_numeric_shared_mode() {
     let fixture = CliFixture::new();
     fixture.init_with_shared("0770");
 
-    assert_eq!(fixture.shared_repository_config(), "0770");
+    assert_eq!(fixture.shared_repository_config(), "0660");
 
     #[cfg(unix)]
     {
@@ -162,11 +137,11 @@ fn init_persists_directory_safe_numeric_shared_mode() {
 fn init_persists_group_and_all_shared_modes() {
     let group = CliFixture::new();
     group.init_with_shared("group");
-    assert_eq!(group.shared_repository_config(), "group");
+    assert_eq!(group.shared_repository_config(), "1");
 
     let all = CliFixture::new();
     all.init_with_shared("all");
-    assert_eq!(all.shared_repository_config(), "all");
+    assert_eq!(all.shared_repository_config(), "2");
 }
 
 #[test]
@@ -174,25 +149,17 @@ fn reinit_updates_shared_repository_config() {
     let fixture = CliFixture::new();
     fixture.success(
         &fixture.root,
-        &[
-            "init",
-            "--vault",
-            "false",
-            fixture.repo.to_str().expect("utf8 repo"),
-        ],
+        &["init", fixture.repo.to_str().expect("utf8 repo")],
     );
 
     fixture.success(
         &fixture.root,
         &[
             "init",
-            "--vault",
-            "false",
-            "--shared",
-            "group",
+            "--shared=group",
             fixture.repo.to_str().expect("utf8 repo"),
         ],
     );
 
-    assert_eq!(fixture.shared_repository_config(), "group");
+    assert_eq!(fixture.shared_repository_config(), "1");
 }

@@ -17,6 +17,184 @@ use libra::{
 
 use super::*;
 
+#[test]
+fn status_ignore_context_nested_rules_and_tracked_files() {
+    let repo = tempdir().unwrap();
+    init_repo_via_cli(repo.path());
+    configure_identity_via_cli(repo.path());
+    fs::create_dir_all(repo.path().join("deep/inner")).unwrap();
+    fs::write(repo.path().join("deep/inner/tracked.txt"), "base\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "deep/inner/tracked.txt"], repo.path()),
+        "stage tracked ignore fixture",
+    );
+    fs::write(repo.path().join("deep/inner/tracked.txt"), "changed\n").unwrap();
+    fs::write(repo.path().join(".gitignore"), "*.tmp\n").unwrap();
+    fs::write(repo.path().join("deep/.gitignore"), "!keep.tmp\n").unwrap();
+    fs::write(
+        repo.path().join("deep/inner/.libraignore"),
+        "tracked.txt\nhidden.txt\n",
+    )
+    .unwrap();
+    for name in ["keep.tmp", "drop.tmp", "hidden.txt", "visible.txt"] {
+        fs::write(repo.path().join("deep/inner").join(name), "payload\n").unwrap();
+    }
+    let output = run_libra_command(
+        &[
+            "status",
+            "--porcelain",
+            "--ignored",
+            "-uall",
+            "--no-renames",
+        ],
+        repo.path(),
+    );
+    assert_cli_success(&output, "nested ignore context");
+    let text = String::from_utf8(output.stdout).unwrap();
+    for row in [
+        "AM deep/inner/tracked.txt",
+        "?? deep/inner/keep.tmp",
+        "?? deep/inner/visible.txt",
+        "!! deep/inner/drop.tmp",
+        "!! deep/inner/hidden.txt",
+    ] {
+        assert!(
+            text.lines().any(|line| line == row),
+            "missing {row}: {text}"
+        );
+    }
+    assert!(!text.contains("!! deep/inner/tracked.txt"), "{text}");
+}
+
+#[test]
+fn status_ignore_context_invalid_source_in_empty_directory_is_reported() {
+    // A FIFO is not necessary to make an ignore source unreadable: a directory
+    // in its place fails the beneath regular-file check on every supported OS.
+    // No regular file is present to trigger a per-file ignore lookup.
+    for relative in [".gitignore", "deep/.gitignore"] {
+        let repo = tempdir().unwrap();
+        init_repo_via_cli(repo.path());
+        fs::create_dir_all(repo.path().join(relative)).unwrap();
+        let output = run_libra_command(&["--json", "status", "-uall"], repo.path());
+        assert_cli_success(&output, "status with an unreadable directory ignore source");
+        let doc: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            doc["data"]["base_scan_complete"], false,
+            "{relative}: {doc}"
+        );
+        assert!(
+            doc["data"]["io_blocked"]
+                .as_array()
+                .is_some_and(|events| !events.is_empty()),
+            "{relative}: ignore failure must survive without regular children: {doc}"
+        );
+        if relative.starts_with("deep/") {
+            let output = run_libra_command(&["--json", "status", "--no-renames"], repo.path());
+            assert_cli_success(&output, "normal visibility preserves ignore error taxonomy");
+            let doc: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert!(
+                doc["data"]["io_blocked"]
+                    .as_array()
+                    .is_some_and(|events| events.iter().any(|event| {
+                        event["path"]["display"] == "deep" && event["reason"] == "io_timeout"
+                    })),
+                "normal mode must retain the parent version's io_timeout: {doc}"
+            );
+        }
+    }
+}
+
+#[test]
+fn status_ignore_context_global_info_and_directory_precedence() {
+    let repo = tempdir().unwrap();
+    let config = tempdir().unwrap();
+    init_repo_via_cli(repo.path());
+    let excludes = config.path().join("excludes");
+    fs::write(&excludes, "*.tmp\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(
+            &["config", "core.excludesFile", excludes.to_str().unwrap()],
+            repo.path(),
+        ),
+        "configure isolated global excludes file",
+    );
+    fs::write(repo.path().join(".libra/info/exclude"), "!info.tmp\n").unwrap();
+    fs::create_dir(repo.path().join("deep")).unwrap();
+    fs::write(repo.path().join("deep/.gitignore"), "!keep.tmp\ninfo.tmp\n").unwrap();
+    fs::write(repo.path().join("deep/.libraignore"), "!info.tmp\n").unwrap();
+    for path in [
+        "info.tmp",
+        "drop.tmp",
+        "deep/info.tmp",
+        "deep/keep.tmp",
+        "deep/drop.tmp",
+    ] {
+        fs::write(repo.path().join(path), "payload\n").unwrap();
+    }
+    let output = run_libra_command(
+        &["status", "--porcelain", "--ignored", "-uall"],
+        repo.path(),
+    );
+    assert_cli_success(&output, "ignore source precedence");
+    let text = String::from_utf8(output.stdout).unwrap();
+    for row in [
+        "?? info.tmp",
+        "!! drop.tmp",
+        "?? deep/info.tmp",
+        "?? deep/keep.tmp",
+        "!! deep/drop.tmp",
+    ] {
+        assert!(
+            text.lines().any(|line| line == row),
+            "missing {row}: {text}"
+        );
+    }
+}
+
+#[test]
+fn status_ignore_context_tracked_only_directory_still_validates_sources() {
+    let repo = tempdir().unwrap();
+    init_repo_via_cli(repo.path());
+    fs::create_dir(repo.path().join("deep")).unwrap();
+    fs::write(repo.path().join("deep/.gitignore"), "# valid\n").unwrap();
+    fs::write(repo.path().join("deep/tracked.txt"), "base\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "deep"], repo.path()),
+        "stage every file in the directory",
+    );
+    fs::write(repo.path().join("deep/.gitignore"), [0xff]).unwrap();
+    let output = run_libra_command(&["--json", "status", "-uall"], repo.path());
+    assert_cli_success(&output, "tracked short circuit preserves ignore errors");
+    let doc: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(doc["data"]["base_scan_complete"], false, "{doc}");
+    assert!(
+        doc["data"]["io_blocked"]
+            .as_array()
+            .is_some_and(|events| !events.is_empty()),
+        "{doc}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn status_ignore_context_symlink_source_cannot_escape() {
+    let repo = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    init_repo_via_cli(repo.path());
+    fs::create_dir_all(repo.path().join("deep")).unwrap();
+    fs::write(outside.path().join("rules"), "visible.txt\n").unwrap();
+    std::os::unix::fs::symlink(
+        outside.path().join("rules"),
+        repo.path().join("deep/.gitignore"),
+    )
+    .unwrap();
+    fs::write(repo.path().join("deep/visible.txt"), "visible\n").unwrap();
+    let output = run_libra_command(&["--json", "status", "-uall"], repo.path());
+    assert_cli_success(&output, "status rejects an escaping ignore source");
+    let doc: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(doc["data"]["base_scan_complete"], false, "{doc}");
+}
+
 async fn status_execute(args: StatusArgs, writer: &mut impl Write) {
     status_execute_inner(args, writer)
         .await
@@ -4571,4 +4749,245 @@ fn status_storage_scope_config_rejection_is_not_success() {
         "a rejected storage configuration must not become a successful status: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+/// The same committed fixture is reused by the status/consumer regressions.
+pub(super) fn i1062_committed_scripts(format: &str) -> tempfile::TempDir {
+    eol_committed_scripts(format, false)
+}
+
+pub(super) fn i861_committed_scripts(format: &str) -> tempfile::TempDir {
+    eol_committed_scripts(format, true)
+}
+
+fn eol_committed_scripts(format: &str, auto: bool) -> tempfile::TempDir {
+    use super::add_test::i1062_ok;
+    let temp = tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    fs::create_dir(&repo).unwrap();
+    i1062_ok(&repo, &["init", "--object-format", format]);
+    i1062_ok(&repo, &["config", "user.name", "EOL test"]);
+    i1062_ok(&repo, &["config", "user.email", "eol@example.test"]);
+    fs::write(
+        repo.join(".gitattributes"),
+        if auto {
+            "*.ps1 text=auto eol=crlf\n*.bat text=auto eol=lf\n*.cmd text=auto\n"
+        } else {
+            "*.ps1 text eol=crlf\n*.bat text eol=lf\n*.cmd eol=crlf\n"
+        },
+    )
+    .unwrap();
+    for name in ["probe.ps1", "probe.bat", "probe.cmd"] {
+        fs::write(repo.join(name), b"one\ntwo\n").unwrap();
+    }
+    i1062_ok(&repo, &["add", "."]);
+    i1062_ok(&repo, &["commit", "--no-verify", "-m", "scripts"]);
+    for name in ["probe.ps1", "probe.bat", "probe.cmd"] {
+        fs::write(repo.join(name), b"one\r\ntwo\r\n").unwrap();
+    }
+    temp
+}
+
+#[test]
+fn i1062_status_explicit_representation_is_clean_in_both_hash_formats() {
+    eol_status_explicit_representation_is_clean_in_both_hash_formats(false);
+}
+
+#[test]
+fn i861_status_explicit_representation_is_clean_in_both_hash_formats() {
+    eol_status_explicit_representation_is_clean_in_both_hash_formats(true);
+}
+
+fn eol_status_explicit_representation_is_clean_in_both_hash_formats(auto: bool) {
+    use super::add_test::i1062_ok;
+    for format in ["sha1", "sha256"] {
+        let temp = if auto {
+            super::status_test::i861_committed_scripts(format)
+        } else {
+            i1062_committed_scripts(format)
+        };
+        let repo = temp.path().join("repo");
+        let output = i1062_ok(&repo, &["status", "--porcelain", "--untracked-files=no"]);
+        assert!(
+            output.is_empty(),
+            "{format}: {}",
+            String::from_utf8_lossy(&output)
+        );
+        for mode in ["--scan", "--check-dirty"] {
+            let doc: serde_json::Value =
+                serde_json::from_slice(&i1062_ok(&repo, &["--json", "status", mode])).unwrap();
+            assert_eq!(doc["data"]["is_clean"], true, "{format}: {mode}: {doc}");
+        }
+        for name in ["probe.ps1", "probe.bat", "probe.cmd"] {
+            assert_eq!(fs::read(repo.join(name)).unwrap(), b"one\r\ntwo\r\n");
+        }
+    }
+}
+
+#[test]
+fn i1062_status_attribute_removal_invalidates_clean_snapshot() {
+    use super::add_test::i1062_ok;
+    let temp = i1062_committed_scripts("sha1");
+    let repo = temp.path().join("repo");
+    i1062_ok(&repo, &["add", "probe.ps1", "probe.bat", "probe.cmd"]);
+    let before = fs::metadata(repo.join("probe.ps1"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    i1062_ok(&repo, &["--json", "status", "--scan"]);
+    fs::remove_file(repo.join(".gitattributes")).unwrap();
+    let output = String::from_utf8(i1062_ok(
+        &repo,
+        &["status", "--porcelain", "--untracked-files=no"],
+    ))
+    .unwrap();
+    assert!(
+        output.lines().any(|line| line == " M probe.ps1"),
+        "{output}"
+    );
+    let doc: serde_json::Value =
+        serde_json::from_slice(&i1062_ok(&repo, &["--json", "status", "--check-dirty"])).unwrap();
+    assert!(
+        doc["data"]["unstaged"]["modified"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|path| path == "probe.ps1"),
+        "{doc}"
+    );
+    assert_eq!(
+        fs::metadata(repo.join("probe.ps1"))
+            .unwrap()
+            .modified()
+            .unwrap(),
+        before
+    );
+}
+
+#[test]
+fn i1062_status_real_content_type_mode_and_deletion_remain_visible() {
+    use super::add_test::i1062_ok;
+    let temp = i1062_committed_scripts("sha1");
+    let repo = temp.path().join("repo");
+    fs::write(repo.join("probe.ps1"), b"one\r\nchanged\r\n").unwrap();
+    fs::remove_file(repo.join("probe.cmd")).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        i1062_ok(&repo, &["config", "core.fileMode", "true"]);
+        fs::set_permissions(repo.join("probe.bat"), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let output =
+        String::from_utf8(i1062_ok(&repo, &["status", "--porcelain", "--no-renames"])).unwrap();
+    assert!(
+        output.lines().any(|line| line == " M probe.ps1"),
+        "{output}"
+    );
+    assert!(
+        output.lines().any(|line| line == " D probe.cmd"),
+        "{output}"
+    );
+    #[cfg(unix)]
+    {
+        assert!(
+            output.lines().any(|line| line == " M probe.bat"),
+            "{output}"
+        );
+        fs::remove_file(repo.join("probe.bat")).unwrap();
+        std::os::unix::fs::symlink("one\ntwo\n", repo.join("probe.bat")).unwrap();
+        let output =
+            String::from_utf8(i1062_ok(&repo, &["status", "--porcelain", "--no-renames"])).unwrap();
+        assert!(
+            output.lines().any(|line| line.ends_with(" probe.bat")
+                && (line.starts_with(" M") || line.starts_with(" T"))),
+            "{output}"
+        );
+    }
+}
+
+#[test]
+fn i1062_status_valid_policy_stat_hits_do_not_read_content() {
+    eol_status_valid_policy_stat_hits_do_not_read_content(false);
+}
+
+#[test]
+fn i861_status_valid_policy_stat_hits_do_not_read_content() {
+    eol_status_valid_policy_stat_hits_do_not_read_content(true);
+}
+
+fn eol_status_valid_policy_stat_hits_do_not_read_content(auto: bool) {
+    use super::add_test::{i1062_command, i1062_ok};
+    let temp = tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    fs::create_dir(&repo).unwrap();
+    i1062_ok(&repo, &["init"]);
+    i1062_ok(&repo, &["config", "user.name", "EOL test"]);
+    i1062_ok(&repo, &["config", "user.email", "eol@example.test"]);
+    fs::write(repo.join("probe.ps1"), b"one\ntwo\n").unwrap();
+    fs::write(
+        repo.join(".gitattributes"),
+        if auto {
+            "*.ps1 text=auto\n"
+        } else {
+            "*.ps1 text eol=crlf\n"
+        },
+    )
+    .unwrap();
+    i1062_ok(&repo, &["add", "."]);
+    i1062_ok(&repo, &["commit", "--no-verify", "-m", "base"]);
+    i1062_ok(&repo, &["status", "--porcelain", "--untracked-files=no"]);
+    let run = || {
+        i1062_command(&repo, &["status", "--porcelain", "--untracked-files=no"])
+            .env("LIBRA_TEST", "1")
+            .env("LIBRA_TEST_CONVERSION_HASH_FAIL", "*")
+            .env("LIBRA_TEST_SLOW_OBJECT_READ_MS", "20000")
+            .output()
+            .unwrap()
+    };
+    let output = run();
+    assert!(
+        output.status.success(),
+        "stat-valid unchanged paths must not attempt content reads: {output:?}"
+    );
+    assert!(output.stdout.is_empty());
+    fs::write(repo.join(".gitattributes"), "*.ps1 -text\n").unwrap();
+    assert!(
+        !run().status.success(),
+        "attribute change must invalidate the old stat proof"
+    );
+    i1062_ok(&repo, &["status", "--porcelain", "--untracked-files=no"]);
+    fs::write(repo.join(".libra/conversion-stat-v1"), "partial").unwrap();
+    assert!(
+        !run().status.success(),
+        "a partial proof must require content verification"
+    );
+}
+
+pub(super) fn i1062_fast_forward_scripts() -> (tempfile::TempDir, Vec<u8>) {
+    eol_fast_forward_scripts(false)
+}
+
+pub(super) fn i861_fast_forward_scripts() -> (tempfile::TempDir, Vec<u8>) {
+    eol_fast_forward_scripts(true)
+}
+
+fn eol_fast_forward_scripts(auto: bool) -> (tempfile::TempDir, Vec<u8>) {
+    use super::add_test::i1062_ok;
+    let temp = eol_committed_scripts("sha1", auto);
+    let repo = temp.path().join("repo");
+    // Branch setup uses the committed LF representation; the CRLF variant is
+    // introduced only once the source/target history is ready for the test.
+    for name in ["probe.ps1", "probe.bat", "probe.cmd"] {
+        fs::write(repo.join(name), b"one\ntwo\n").unwrap();
+    }
+    i1062_ok(&repo, &["switch", "-c", "upstream"]);
+    fs::write(repo.join("upstream.txt"), "upstream\n").unwrap();
+    i1062_ok(&repo, &["add", "upstream.txt"]);
+    i1062_ok(&repo, &["commit", "--no-verify", "-m", "upstream"]);
+    let tip = i1062_ok(&repo, &["rev-parse", "HEAD"]);
+    i1062_ok(&repo, &["switch", "main"]);
+    for name in ["probe.ps1", "probe.bat", "probe.cmd"] {
+        fs::write(repo.join(name), b"one\r\ntwo\r\n").unwrap();
+    }
+    (temp, tip)
 }

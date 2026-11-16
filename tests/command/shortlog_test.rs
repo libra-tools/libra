@@ -1102,3 +1102,50 @@ Date:   Fri Jun 26 10:00:01 2026 +0000
         "only Bob remains after --author=Bob: {json}"
     );
 }
+
+/// LG-20 (M-SLOG S1–S3): ranges, multiple revisions, exclusions, `--all`, and
+/// `-- <path>` selection (t4201:203 port).
+#[test]
+#[serial(cwd)]
+fn test_shortlog_revision_ranges_matrix() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    for index in 1..=4 {
+        let file = format!("f{index}.txt");
+        fs::write(p.join(&file), format!("c{index}\n")).unwrap();
+        assert_cli_success(&run_libra_command(&["add", &file], p), "add");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", &format!("c{index}"), "--no-verify"], p),
+            "commit",
+        );
+    }
+
+    let run = |args: &[&str]| {
+        let out = run_libra_command(args, p);
+        assert_cli_success(&out, "shortlog");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    // S1: `A..B` selects the commits after A (2 commits).
+    assert!(run(&["shortlog", "-s", "HEAD~2..HEAD"]).contains('2'));
+    let detailed = run(&["shortlog", "HEAD~2..HEAD"]);
+    assert!(detailed.contains("c4"), "{detailed}");
+    assert!(detailed.contains("c3"), "{detailed}");
+    assert!(!detailed.contains("c2"), "{detailed}");
+
+    // S2: multiple revisions union; `^` excludes an ancestor closure.
+    let multi = run(&["shortlog", "-s", "HEAD~3", "HEAD"]);
+    assert_eq!(multi.split_whitespace().next(), Some("5"), "{multi}");
+    let exclude = run(&["shortlog", "-s", "^HEAD~1", "HEAD"]);
+    assert_eq!(exclude.split_whitespace().next(), Some("1"), "{exclude}");
+
+    // S3: `--all` covers every ref; `-- <path>` limits the selection.
+    let all = run(&["shortlog", "-s", "--all"]);
+    assert_eq!(all.split_whitespace().next(), Some("5"), "{all}");
+    let path = run(&["shortlog", "-s", "HEAD", "--", "f1.txt"]);
+    assert_eq!(path.split_whitespace().next(), Some("1"), "{path}");
+
+    // t4201:203 port: an empty range produces no authors.
+    let empty = run(&["shortlog", "-s", "HEAD..HEAD"]);
+    assert!(empty.trim().is_empty(), "{empty}");
+}

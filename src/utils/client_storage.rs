@@ -367,14 +367,21 @@ fn open_index_repair_lock_file(path: &Path) -> io::Result<fs::File> {
 
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
+        if let Ok(Some(shared)) = crate::utils::shared_perm::get_shared_mode_for_path(parent) {
+            let _ = crate::utils::shared_perm::adjust_shared_perm(parent, &shared);
+        }
     }
-    fs::OpenOptions::new()
+    let file = fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
         .mode(0o600)
-        .open(path)
+        .open(path)?;
+    if let Ok(Some(shared)) = crate::utils::shared_perm::get_shared_mode_for_path(path) {
+        let _ = crate::utils::shared_perm::adjust_shared_perm(path, &shared);
+    }
+    Ok(file)
 }
 
 #[cfg(windows)]
@@ -804,6 +811,13 @@ fn persist_index_repair_marker_under_lock(msg: &IndexUpdateMsg) -> io::Result<Pa
     )?;
     writer.write_all(&bytes)?;
     writer.persist(&marker_path)?;
+    if let Ok(Some(shared)) = crate::utils::shared_perm::get_shared_mode_for_path(&marker_path) {
+        let _ = crate::utils::shared_perm::adjust_shared_perm(&staging_dir, &shared);
+        if let Some(parent) = marker_path.parent() {
+            let _ = crate::utils::shared_perm::adjust_shared_perm(parent, &shared);
+        }
+        let _ = crate::utils::shared_perm::adjust_shared_perm(&marker_path, &shared);
+    }
     Ok(marker_path)
 }
 

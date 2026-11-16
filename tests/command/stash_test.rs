@@ -2764,3 +2764,45 @@ fn test_stash_push_refuses_intent_to_add_entry() {
         "W7 worktree must be untouched"
     );
 }
+
+#[test]
+fn i1062_consumer_stash_does_not_save_representation_only_changes() {
+    eol_consumer_stash_does_not_save_representation_only_changes(false);
+}
+
+#[test]
+fn i861_consumer_stash_does_not_save_representation_only_changes() {
+    eol_consumer_stash_does_not_save_representation_only_changes(true);
+}
+
+fn eol_consumer_stash_does_not_save_representation_only_changes(auto: bool) {
+    use super::{add_test::i1062_ok, status_test::i1062_committed_scripts};
+    let temp = if auto {
+        super::status_test::i861_committed_scripts("sha1")
+    } else {
+        i1062_committed_scripts("sha1")
+    };
+    let repo = temp.path().join("repo");
+    for args in [
+        vec!["stash", "push"],
+        vec!["stash", "push", "--keep-index"],
+        vec!["stash", "push", "--", "probe.ps1"],
+    ] {
+        let output = i1062_ok(&repo, &args);
+        assert!(
+            String::from_utf8_lossy(&output).contains("No local changes to save"),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output)
+        );
+        let list: serde_json::Value =
+            serde_json::from_slice(&i1062_ok(&repo, &["--json", "stash", "list"])).unwrap();
+        assert_eq!(list["data"]["entries"], serde_json::json!([]), "{list}");
+    }
+    assert_eq!(
+        std::fs::read(repo.join("probe.ps1")).unwrap(),
+        b"one\r\ntwo\r\n"
+    );
+    std::fs::write(repo.join("probe.ps1"), b"real change\r\n").unwrap();
+    i1062_ok(&repo, &["stash", "push"]);
+    assert!(!i1062_ok(&repo, &["stash", "list"]).is_empty());
+}

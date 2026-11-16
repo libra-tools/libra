@@ -5906,15 +5906,23 @@ async fn import_prepared_with_reasoning_identity_batches_and_coverage(
                     );
                 }
                 CheckpointWriteOutcome::PendingCleanup { .. } => {
-                    // The ref CAS and its import/coverage companion already
-                    // committed. Preserve the historical importer contract:
-                    // account for the turn while retaining the durable marker
-                    // for doctor/GC repair instead of replaying a second
-                    // checkpoint write.
-                    tracing::warn!(
-                        reason = "import_checkpoint_cleanup_pending",
-                        "imported checkpoint committed with durable cleanup pending"
-                    );
+                    // The checkpoint row is already durable. A busy marker
+                    // clear must not leave that in-flight row behind, or a
+                    // retry that otherwise committed every turn still fails
+                    // its recovery check.
+                    if let Err(error) = ImportedCheckpointWriter::clear_committed_import_marker(
+                        conn,
+                        &request.session_id,
+                        &checkpoint_id,
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            reason = "import_checkpoint_marker_clear_failed",
+                            error = %error,
+                            "committed import checkpoint kept its in-flight marker"
+                        );
+                    }
                 }
                 CheckpointWriteOutcome::ConflictUnchanged { reason } => {
                     bail!("imported checkpoint store left the write unchanged: {reason:?}");
@@ -8307,16 +8315,27 @@ pub(crate) mod tests {
     fn native_import_test_helper_program() -> PathBuf {
         let unit_test_binary =
             std::env::current_exe().expect("locate native import unit test binary");
-        let program = unit_test_binary
-            .parent()
-            .and_then(Path::parent)
-            .expect("locate Cargo target debug directory")
-            .join("libra");
-        assert!(
-            program.is_file(),
-            "the real Libra helper binary must be built before this focused unit test"
+        // Cargo runs the unit-test binary from `target/debug/deps` on a plain
+        // invocation but from a build-script output directory
+        // (`target/debug/build/<crate>/<hash>/out`) when the harness is
+        // relocated. Walk the ancestors and take the first one that actually
+        // contains the built helper instead of assuming a fixed depth.
+        for ancestor in unit_test_binary.ancestors().skip(1) {
+            let candidate = ancestor.join("libra");
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+        if let Ok(manifest) = std::env::var("CARGO_MANIFEST_DIR") {
+            let candidate = Path::new(&manifest).join("target/debug/libra");
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+        panic!(
+            "the real Libra helper binary must be built before this focused unit test: exe={}",
+            unit_test_binary.display()
         );
-        program
     }
 
     /// Evidence read back from the shared object store and private identity
@@ -9032,13 +9051,7 @@ pub(crate) mod tests {
                 request.session_id = build_ai_session_id("claude", &request.provider_session_id);
                 request
             };
-            let program = std::env::current_exe()
-                .unwrap()
-                .parent()
-                .unwrap()
-                .parent()
-                .unwrap()
-                .join(format!("libra{}", std::env::consts::EXE_SUFFIX));
+            let program = crate::utils::test::real_libra_helper_binary();
             super::super::super::authorized_read::with_test_helper_program(
                 program.clone(),
                 import_prepared_with_subagent_discovery(
@@ -9168,13 +9181,7 @@ pub(crate) mod tests {
                 if !parent_failure {
                     conn.execute_unprepared("CREATE TRIGGER fail_child_revision BEFORE INSERT ON agent_subagent_content_revision BEGIN SELECT RAISE(ABORT, 'local child failure'); END").await.unwrap();
                 }
-                let program = std::env::current_exe()
-                    .unwrap()
-                    .parent()
-                    .unwrap()
-                    .parent()
-                    .unwrap()
-                    .join(format!("libra{}", std::env::consts::EXE_SUFFIX));
+                let program = crate::utils::test::real_libra_helper_binary();
                 let operation = import_prepared_with_subagent_discovery(
                     &conn,
                     &storage,
@@ -9333,12 +9340,7 @@ pub(crate) mod tests {
                 bytes_read: child_bytes.len() as u64,
                 ..Default::default()
             };
-            let program = std::env::current_exe()
-                .unwrap()
-                .parent()
-                .and_then(Path::parent)
-                .unwrap()
-                .join(format!("libra{}", std::env::consts::EXE_SUFFIX));
+            let program = crate::utils::test::real_libra_helper_binary();
             assert!(
                 program.is_file(),
                 "build current CLI before operator-local import test"
@@ -13409,12 +13411,7 @@ mod codex_retention_report_tests {
         request: ImportRequest,
         retained: CodexRetention,
     ) {
-        let binary = std::env::current_exe()
-            .unwrap()
-            .parent()
-            .and_then(Path::parent)
-            .unwrap()
-            .join(format!("libra{}", std::env::consts::EXE_SUFFIX));
+        let binary = crate::utils::test::real_libra_helper_binary();
         assert!(
             binary.is_file(),
             "build the Libra binary before this local test"

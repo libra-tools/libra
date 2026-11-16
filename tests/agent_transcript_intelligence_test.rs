@@ -1639,15 +1639,15 @@ fn pi_coverage_normalizer_records_readable_thinking_as_pi_reasoning() {
 
 /// PI-34 AC3: Pi stays unsupported.
 #[test]
-fn pi_coverage_normalizer_keeps_pi_unsupported() {
+fn pi_coverage_normalizer_reports_the_supported_row() {
     use libra::internal::ai::observed_agents::{registration_for, supported_slugs};
 
     let row = registration_for(AgentKind::Pi);
-    assert!(!row.supported);
-    assert!(!row.hook_installable);
+    assert!(row.supported);
+    assert!(row.hook_installable);
     assert!(!row.launchable_review && !row.launchable_investigate);
     assert!(!row.transcript_readable);
-    assert!(!supported_slugs().contains(&"pi"));
+    assert!(supported_slugs().contains(&"pi"));
 }
 
 /// PI-34 AC4: a turn whose messages were not read faithfully is
@@ -5871,7 +5871,7 @@ fn pi_bounded_capture_wiring_reads_no_file_sql_or_lease() {
             for (relative, pin) in [
                 (
                     "src/internal/ai/observed_agents/builtin/pi.rs",
-                    "078c32c31dca094c4e6eb1dfc56db505c9e0c397fc69cdb7fb97cd60bb279176",
+                    "b384fc0b84429d0dd64907dc77b3753e87a7c41331af56b9d8e6c1a79ed81102",
                 ),
                 (
                     "src/internal/ai/capture/snapshot.rs",

@@ -16,7 +16,7 @@ In a shallow clone, commits listed in `.libra/shallow` are treated as roots:
 blame does not follow their parents. A corrupt `.libra/shallow` file fails
 closed (`LBR-REPO-002`).
 
-The output format matches Git's blame format for familiarity: a short hash, author name (truncated to 15 characters), date, line number, and line content on each line.
+The output format matches Git's blame format for familiarity: a short hash, author name (column sized to the longest author/email in the output), date, line number, and line content on each line.
 
 For large files, the `-L` option restricts output to a specific line range, reducing both computation time and output volume.
 
@@ -36,10 +36,10 @@ For large files, the `-L` option restricts output to a specific line range, redu
 | Abbrev | | `--abbrev <N>` | Use N hex digits for the abbreviated commit hash (ignored with `-l`). |
 | Root | | `--root` | Do not treat root commits as boundaries. Accepted no-op: Libra's blame never prefixes boundary/root commits with `^`, so root commits already appear as normal commits. |
 | Ignore whitespace | `-w` | `--ignore-whitespace` | Ignore whitespace when comparing the parent's and child's versions of a line, so a whitespace-only change is attributed to the older commit. Matches Git's `-w` (ignore-all-whitespace) semantics. |
-| Detect moves | `-M` | | Re-attribute lines that moved from another file in a parent revision (one-step scan of parent trees; a documented narrowing of Git's recursive detection). |
-| Detect copies | `-C` | | Detect lines copied from other files. Shares the parent-tree scan with `-M`; repeatable (each extra `-C` widens nothing further today). |
-| Date mode | | `--date=<MODE>` | Date rendering mode for the author column (`default` / `short` / `iso` / `iso-strict` / `rfc` / `unix` / `raw` / `format:<strftime>`). |
-| Incremental | | `--incremental` | Emit the incremental format (porcelain shape with per-line headers). |
+| Detect moves | `-M[<score>]` | | Re-attribute lines moved within the file from a parent revision (default score 20 alphanumeric characters). |
+| Detect copies | `-C[<score>]` | | Detect lines copied from other files (repeatable; extra levels currently share the same parent-tree scan). Porcelain `filename` points at the source file. |
+| Date mode | | `--date=<MODE>` | Date rendering mode for the author column (`default` / `short` / `iso` / `iso-strict` / `rfc` / `relative` / `local` / `unix` / `raw` / `format:<strftime>`). |
+| Incremental | | `--incremental` | Emit Git's incremental format: `<oid> <orig-line> <final-line> <count>` headers, commit metadata, `boundary`, and a trailing `filename`; no content lines. |
 | Porcelain | `-p` | `--porcelain` | Machine-readable porcelain output (commit metadata once per commit). |
 | JSON | | `--json` | Emit structured JSON output. |
 | Quiet | | `--quiet` | Validate inputs but suppress all blame output. |
@@ -182,7 +182,7 @@ The commit argument is positional (second argument after the file path) rather t
 | Don't treat root as boundary | `--root` (no-op; root already shown as normal) | `--root` | N/A |
 | Ignore whitespace | `-w` / `--ignore-whitespace` (ignore-all-whitespace) | `-w` | N/A |
 | Porcelain format | `-p` / `--porcelain` / `--line-porcelain` (no original line numbers, `boundary`, or `previous` metadata) | `-p` / `--porcelain` / `--line-porcelain` | N/A |
-| Incremental output | Not supported | `--incremental` | N/A |
+| Incremental output | `--incremental` (header/metadata/boundary/filename, no content lines) | `--incremental` | N/A |
 | Score threshold | Not supported | `-M` / `-C` (move/copy detection) | N/A |
 | Ignore revisions | Not supported | `--ignore-rev` / `--ignore-revs-file` | N/A |
 | Working tree contents | Not supported | `--contents <file>` | N/A |

@@ -224,15 +224,12 @@ fn ls_tree_recursive_t_includes_tree_entries() {
 
 #[test]
 fn ls_tree_directory_filter_lists_one_level_by_default() {
-    let repo = setup_ls_tree_repo();
-
-    let output = run_libra_command(&["ls-tree", "HEAD", "src"], repo.path());
-    assert_cli_success(&output, "ls-tree HEAD src should succeed");
-    let stdout = stdout_string(&output);
-
-    assert!(stdout.contains("\tsrc/lib.rs\n"));
-    assert!(stdout.contains("\tsrc/nested\n"));
-    assert!(!stdout.contains("\tsrc/nested/deep.txt\n"));
+    let repo = setup_issue1057_repo();
+    assert_issue1057_listing(
+        repo.path(),
+        &["ls-tree", "HEAD", "dir"],
+        issue1057_golden("root"),
+    );
 }
 
 #[test]
@@ -584,4 +581,689 @@ fn test_ls_tree_rev_path_navigates_into_subtree() {
             .success(),
         "a missing path errors"
     );
+}
+
+// Recorded from Git 6de20f6092dcf9bdb1c8efe03db4b70c82b423dd; the plan
+// binds every sample to its byte count and SHA-256. Never derive these from Libra.
+const ISSUE1057_GOLDEN: &[(&str, usize, &str)] = &[
+    (
+        "root",
+        57,
+        "c9de48a7d325ca3fda206a1342e841a9a4d3940adf0b69de6e2fe9f0e9c21450",
+    ),
+    (
+        "slash",
+        127,
+        "0cfa1f84cf536f15a0b8f44babaeb5625eb27db6b538d72fa23644ca1b580ff5",
+    ),
+    (
+        "mixed",
+        127,
+        "0cfa1f84cf536f15a0b8f44babaeb5625eb27db6b538d72fa23644ca1b580ff5",
+    ),
+    (
+        "mixed-reverse",
+        127,
+        "0cfa1f84cf536f15a0b8f44babaeb5625eb27db6b538d72fa23644ca1b580ff5",
+    ),
+    (
+        "gitlink-slash",
+        60,
+        "02a1b9beec221b1c393c3bc3f69744c60e1ae2239da4d0e71fc64c152f09d66d",
+    ),
+    (
+        "recursive",
+        132,
+        "a90aa272fe774245babd86bfa98b266b0560893a473e08b5803bdad05c953de1",
+    ),
+    (
+        "t",
+        57,
+        "c9de48a7d325ca3fda206a1342e841a9a4d3940adf0b69de6e2fe9f0e9c21450",
+    ),
+    (
+        "recursive-t",
+        253,
+        "7802185b8dc9040c6945d238357309513981268356dfd8a0113ee696ec0c5bea",
+    ),
+    (
+        "dir-dot",
+        127,
+        "0cfa1f84cf536f15a0b8f44babaeb5625eb27db6b538d72fa23644ca1b580ff5",
+    ),
+    (
+        "dir-dot-slash",
+        127,
+        "0cfa1f84cf536f15a0b8f44babaeb5625eb27db6b538d72fa23644ca1b580ff5",
+    ),
+    (
+        "root-dot",
+        235,
+        "9506223ded550c9170133b5162178854d1e29cf363755365517ebcd9f54345a7",
+    ),
+    (
+        "root-dot-slash",
+        235,
+        "9506223ded550c9170133b5162178854d1e29cf363755365517ebcd9f54345a7",
+    ),
+    (
+        "nested-t",
+        121,
+        "25333f9abfb440a4112826caeb4d5b385f7df56ad8a96f09c8702e471ce85b58",
+    ),
+    (
+        "nested-t-slash",
+        190,
+        "625d390dc5b1ecc215a0d13a22b3c533d6bda53d08caea859a2f0cda7265a5bd",
+    ),
+    (
+        "nested-r-t",
+        190,
+        "625d390dc5b1ecc215a0d13a22b3c533d6bda53d08caea859a2f0cda7265a5bd",
+    ),
+    (
+        "t-slash",
+        184,
+        "9f90c078fe0d1542d835c897011121cd38e401ee84478fc720a0d5d3d8cb966a",
+    ),
+    (
+        "t-blob",
+        120,
+        "8c45524bf7ad201828547bb06bd3488505e516fbecd551b5eb05586c01021918",
+    ),
+    (
+        "t-deep-blob",
+        190,
+        "625d390dc5b1ecc215a0d13a22b3c533d6bda53d08caea859a2f0cda7265a5bd",
+    ),
+    (
+        "full-name",
+        64,
+        "f260adea835b2b85a89962f59ded7361d8f0128363ee353488a5afef3e1f41b0",
+    ),
+    (
+        "dot",
+        119,
+        "69b3b664e57c1fd52fbc176ce518306c354f57ca01e9d40fc8d50cc5cbd6cded",
+    ),
+    (
+        "subdir-plain",
+        60,
+        "c0f8fc162e2a2bcf25d5faf497a6ba3cc5dba81fc4e667d614918310274cbfd4",
+    ),
+    (
+        "subdir-slash",
+        65,
+        "43654d95e3202ad5c98e7fee1393560198574cf3a3c87a02bc8439844f71beb5",
+    ),
+    (
+        "subdir-full-tree",
+        57,
+        "c9de48a7d325ca3fda206a1342e841a9a4d3940adf0b69de6e2fe9f0e9c21450",
+    ),
+    (
+        "dot-dir",
+        57,
+        "c9de48a7d325ca3fda206a1342e841a9a4d3940adf0b69de6e2fe9f0e9c21450",
+    ),
+    (
+        "overlap-child",
+        127,
+        "0cfa1f84cf536f15a0b8f44babaeb5625eb27db6b538d72fa23644ca1b580ff5",
+    ),
+    (
+        "slash-overlap-child",
+        127,
+        "0cfa1f84cf536f15a0b8f44babaeb5625eb27db6b538d72fa23644ca1b580ff5",
+    ),
+    (
+        "recursive-slash",
+        132,
+        "a90aa272fe774245babd86bfa98b266b0560893a473e08b5803bdad05c953de1",
+    ),
+    (
+        "recursive-t-slash",
+        253,
+        "7802185b8dc9040c6945d238357309513981268356dfd8a0113ee696ec0c5bea",
+    ),
+    (
+        "t-overlap-child",
+        184,
+        "9f90c078fe0d1542d835c897011121cd38e401ee84478fc720a0d5d3d8cb966a",
+    ),
+    (
+        "size",
+        102,
+        "464f4b734a2a36eff08fcf505082d50df527900825c84143a3f42f15f4062cc3",
+    ),
+    (
+        "size-six",
+        34,
+        "ee027933988caf703904b93fa400a34024f4186d1f95fcf43570ba3e83645ee0",
+    ),
+    (
+        "capture",
+        248,
+        "b75c0853ebdc15d4e6eb0da2d18d35ae16047c2a41e36a0410242df8805ffc42",
+    ),
+];
+
+fn issue1057_golden(name: &str) -> &'static [u8] {
+    use sha2::{Digest, Sha256};
+    let bytes: &'static [u8] = match name {
+        "root" => b"040000 tree 0057ceb4b6bcb4f4166bcd617df7b4477a116273\tdir\n",
+        "slash" => b"040000 tree fb5a86199f63243160ee5b463d2cd5c36fafeb6d\tdir/nested\n100644 blob c1b0730e0133447badcfd47fd144e254807b06e1\tdir/other\n",
+        "mixed" => b"040000 tree fb5a86199f63243160ee5b463d2cd5c36fafeb6d\tdir/nested\n100644 blob c1b0730e0133447badcfd47fd144e254807b06e1\tdir/other\n",
+        "mixed-reverse" => b"040000 tree fb5a86199f63243160ee5b463d2cd5c36fafeb6d\tdir/nested\n100644 blob c1b0730e0133447badcfd47fd144e254807b06e1\tdir/other\n",
+        "gitlink-slash" => b"160000 commit 1111111111111111111111111111111111111111\tlink\n",
+        "recursive" => b"100644 blob ce013625030ba8dba906f756967f9e9ca394464a\tdir/nested/file\n100644 blob c1b0730e0133447badcfd47fd144e254807b06e1\tdir/other\n",
+        "t" => b"040000 tree 0057ceb4b6bcb4f4166bcd617df7b4477a116273\tdir\n",
+        "recursive-t" => b"040000 tree 0057ceb4b6bcb4f4166bcd617df7b4477a116273\tdir\n040000 tree fb5a86199f63243160ee5b463d2cd5c36fafeb6d\tdir/nested\n100644 blob ce013625030ba8dba906f756967f9e9ca394464a\tdir/nested/file\n100644 blob c1b0730e0133447badcfd47fd144e254807b06e1\tdir/other\n",
+        "dir-dot" => b"040000 tree fb5a86199f63243160ee5b463d2cd5c36fafeb6d\tdir/nested\n100644 blob c1b0730e0133447badcfd47fd144e254807b06e1\tdir/other\n",
+        "dir-dot-slash" => b"040000 tree fb5a86199f63243160ee5b463d2cd5c36fafeb6d\tdir/nested\n100644 blob c1b0730e0133447badcfd47fd144e254807b06e1\tdir/other\n",
+        "root-dot" => b"040000 tree 0057ceb4b6bcb4f4166bcd617df7b4477a116273\tdir\n100644 blob e69de29bb2d1d6434b8b29ae775ad8c2e48c5391\tempty\n100644 blob 5630165e4a6c588e6657164f014b0afc169f29e4\tlarge\n160000 commit 1111111111111111111111111111111111111111\tlink\n",
+        "root-dot-slash" => b"040000 tree 0057ceb4b6bcb4f4166bcd617df7b4477a116273\tdir\n100644 blob e69de29bb2d1d6434b8b29ae775ad8c2e48c5391\tempty\n100644 blob 5630165e4a6c588e6657164f014b0afc169f29e4\tlarge\n160000 commit 1111111111111111111111111111111111111111\tlink\n",
+        "nested-t" => b"040000 tree 0057ceb4b6bcb4f4166bcd617df7b4477a116273\tdir\n040000 tree fb5a86199f63243160ee5b463d2cd5c36fafeb6d\tdir/nested\n",
+        "nested-t-slash" => b"040000 tree 0057ceb4b6bcb4f4166bcd617df7b4477a116273\tdir\n040000 tree fb5a86199f63243160ee5b463d2cd5c36fafeb6d\tdir/nested\n100644 blob ce013625030ba8dba906f756967f9e9ca394464a\tdir/nested/file\n",
+        "nested-r-t" => b"040000 tree 0057ceb4b6bcb4f4166bcd617df7b4477a116273\tdir\n040000 tree fb5a86199f63243160ee5b463d2cd5c36fafeb6d\tdir/nested\n100644 blob ce013625030ba8dba906f756967f9e9ca394464a\tdir/nested/file\n",
+        "t-slash" => b"040000 tree 0057ceb4b6bcb4f4166bcd617df7b4477a116273\tdir\n040000 tree fb5a86199f63243160ee5b463d2cd5c36fafeb6d\tdir/nested\n100644 blob c1b0730e0133447badcfd47fd144e254807b06e1\tdir/other\n",
+        "t-blob" => b"040000 tree 0057ceb4b6bcb4f4166bcd617df7b4477a116273\tdir\n100644 blob c1b0730e0133447badcfd47fd144e254807b06e1\tdir/other\n",
+        "t-deep-blob" => b"040000 tree 0057ceb4b6bcb4f4166bcd617df7b4477a116273\tdir\n040000 tree fb5a86199f63243160ee5b463d2cd5c36fafeb6d\tdir/nested\n100644 blob ce013625030ba8dba906f756967f9e9ca394464a\tdir/nested/file\n",
+        "full-name" => b"040000 tree fb5a86199f63243160ee5b463d2cd5c36fafeb6d\tdir/nested\n",
+        "dot" => b"040000 tree fb5a86199f63243160ee5b463d2cd5c36fafeb6d\tnested\n100644 blob c1b0730e0133447badcfd47fd144e254807b06e1\tother\n",
+        "subdir-plain" => b"040000 tree fb5a86199f63243160ee5b463d2cd5c36fafeb6d\tnested\n",
+        "subdir-slash" => b"100644 blob ce013625030ba8dba906f756967f9e9ca394464a\tnested/file\n",
+        "subdir-full-tree" => b"040000 tree 0057ceb4b6bcb4f4166bcd617df7b4477a116273\tdir\n",
+        "dot-dir" => b"040000 tree 0057ceb4b6bcb4f4166bcd617df7b4477a116273\tdir\n",
+        "overlap-child" => b"040000 tree fb5a86199f63243160ee5b463d2cd5c36fafeb6d\tdir/nested\n100644 blob c1b0730e0133447badcfd47fd144e254807b06e1\tdir/other\n",
+        "slash-overlap-child" => b"040000 tree fb5a86199f63243160ee5b463d2cd5c36fafeb6d\tdir/nested\n100644 blob c1b0730e0133447badcfd47fd144e254807b06e1\tdir/other\n",
+        "recursive-slash" => b"100644 blob ce013625030ba8dba906f756967f9e9ca394464a\tdir/nested/file\n100644 blob c1b0730e0133447badcfd47fd144e254807b06e1\tdir/other\n",
+        "recursive-t-slash" => b"040000 tree 0057ceb4b6bcb4f4166bcd617df7b4477a116273\tdir\n040000 tree fb5a86199f63243160ee5b463d2cd5c36fafeb6d\tdir/nested\n100644 blob ce013625030ba8dba906f756967f9e9ca394464a\tdir/nested/file\n100644 blob c1b0730e0133447badcfd47fd144e254807b06e1\tdir/other\n",
+        "t-overlap-child" => b"040000 tree 0057ceb4b6bcb4f4166bcd617df7b4477a116273\tdir\n040000 tree fb5a86199f63243160ee5b463d2cd5c36fafeb6d\tdir/nested\n100644 blob c1b0730e0133447badcfd47fd144e254807b06e1\tdir/other\n",
+        "size" => b"      -|-|      -|dir\n      0|0|      0|empty\n10000000|10000000|10000000|large\n      -|-|      -|link\n",
+        "size-six" => b"      6|6|      6|dir/nested/file\n",
+        "capture" => b"ce013625030ba8dba906f756967f9e9ca394464a\tdir/nested/file\x00c1b0730e0133447badcfd47fd144e254807b06e1\tdir/other\x00e69de29bb2d1d6434b8b29ae775ad8c2e48c5391\tempty\x005630165e4a6c588e6657164f014b0afc169f29e4\tlarge\x001111111111111111111111111111111111111111\tlink\x00",
+        _ => panic!("unknown issue1057 golden: {name}"),
+    };
+    let (_, len, sha) = ISSUE1057_GOLDEN
+        .iter()
+        .find(|row| row.0 == name)
+        .expect("registered golden");
+    assert_eq!(bytes.len(), *len, "golden {name} length");
+    assert_eq!(
+        format!("{:x}", Sha256::digest(bytes)),
+        *sha,
+        "golden {name} digest"
+    );
+    bytes
+}
+
+fn setup_issue1057_repo() -> tempfile::TempDir {
+    let repo = tempdir().expect("create issue1057 repo");
+    let p = repo.path();
+    init_repo_via_cli(p);
+    configure_identity_via_cli(p);
+    fs::create_dir_all(p.join("dir/nested")).expect("create directories");
+    fs::write(p.join("dir/nested/file"), b"hello\n").expect("write six-byte blob");
+    fs::write(p.join("dir/other"), b"x").expect("write other blob");
+    fs::write(p.join("empty"), b"").expect("write empty blob");
+    fs::File::create(p.join("large"))
+        .expect("create large blob")
+        .set_len(10_000_000)
+        .expect("size large blob");
+    assert_cli_success(
+        &run_libra_command(&["add", "dir", "empty", "large"], p),
+        "add fixture",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                "160000,1111111111111111111111111111111111111111,link",
+            ],
+            p,
+        ),
+        "add gitlink",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "fixture", "--no-verify"], p),
+        "commit fixture",
+    );
+    repo
+}
+
+fn assert_issue1057_listing(cwd: &std::path::Path, args: &[&str], expected: &[u8]) {
+    let output = run_libra_command(args, cwd);
+    assert_cli_success(&output, &format!("issue1057 {args:?}"));
+    assert_eq!(output.stdout, expected, "issue1057 {args:?}");
+}
+
+#[test]
+fn ls_tree_issue1057_full_name_directory() {
+    let repo = setup_issue1057_repo();
+    assert_issue1057_listing(
+        &repo.path().join("dir"),
+        &["ls-tree", "--full-name", "HEAD", "nested"],
+        issue1057_golden("full-name"),
+    );
+}
+
+#[test]
+fn ls_tree_issue1057_trailing_slash() {
+    let repo = setup_issue1057_repo();
+    assert_issue1057_listing(
+        repo.path(),
+        &["ls-tree", "HEAD", "dir/"],
+        issue1057_golden("slash"),
+    );
+}
+
+#[test]
+fn ls_tree_issue1057_mixed_directory() {
+    let repo = setup_issue1057_repo();
+    assert_issue1057_listing(
+        repo.path(),
+        &["ls-tree", "HEAD", "dir", "dir//"],
+        issue1057_golden("mixed"),
+    );
+}
+
+#[test]
+fn ls_tree_issue1057_recursive() {
+    let repo = setup_issue1057_repo();
+    assert_issue1057_listing(
+        repo.path(),
+        &["ls-tree", "-r", "HEAD", "dir"],
+        issue1057_golden("recursive"),
+    );
+}
+
+#[test]
+fn ls_tree_issue1057_t_without_recursive() {
+    let repo = setup_issue1057_repo();
+    assert_issue1057_listing(
+        repo.path(),
+        &["ls-tree", "-t", "HEAD", "dir"],
+        issue1057_golden("t"),
+    );
+}
+
+#[test]
+fn ls_tree_issue1057_recursive_t() {
+    let repo = setup_issue1057_repo();
+    assert_issue1057_listing(
+        repo.path(),
+        &["ls-tree", "-r", "-t", "HEAD", "dir"],
+        issue1057_golden("recursive-t"),
+    );
+}
+
+#[test]
+fn ls_tree_issue1057_root_directory() {
+    let repo = setup_issue1057_repo();
+    assert_issue1057_listing(
+        repo.path(),
+        &["ls-tree", "HEAD", "dir"],
+        issue1057_golden("root"),
+    );
+}
+
+#[test]
+fn ls_tree_issue1057_subdir_dot() {
+    let repo = setup_issue1057_repo();
+    assert_issue1057_listing(
+        &repo.path().join("dir"),
+        &["ls-tree", "HEAD", "."],
+        issue1057_golden("dot"),
+    );
+}
+
+#[test]
+fn ls_tree_issue1057_mixed_reverse() {
+    let repo = setup_issue1057_repo();
+    assert_issue1057_listing(
+        repo.path(),
+        &["ls-tree", "HEAD", "dir//", "dir"],
+        issue1057_golden("mixed-reverse"),
+    );
+}
+
+#[test]
+fn ls_tree_issue1057_gitlink_slash() {
+    let repo = setup_issue1057_repo();
+    assert_issue1057_listing(
+        repo.path(),
+        &["ls-tree", "HEAD", "link/"],
+        issue1057_golden("gitlink-slash"),
+    );
+}
+
+#[test]
+fn ls_tree_issue1057_trailing_dot() {
+    let repo = setup_issue1057_repo();
+    assert_issue1057_listing(
+        repo.path(),
+        &["ls-tree", "HEAD", "dir/."],
+        issue1057_golden("dir-dot"),
+    );
+    assert_issue1057_listing(
+        repo.path(),
+        &["ls-tree", "HEAD", "dir/./"],
+        issue1057_golden("dir-dot-slash"),
+    );
+    assert_issue1057_listing(
+        repo.path(),
+        &["ls-tree", "HEAD", "."],
+        issue1057_golden("root-dot"),
+    );
+    assert_issue1057_listing(
+        repo.path(),
+        &["ls-tree", "HEAD", "./"],
+        issue1057_golden("root-dot-slash"),
+    );
+}
+
+#[test]
+fn ls_tree_issue1057_nested_t() {
+    let repo = setup_issue1057_repo();
+    assert_issue1057_listing(
+        repo.path(),
+        &["ls-tree", "-t", "HEAD", "dir/nested"],
+        issue1057_golden("nested-t"),
+    );
+    assert_issue1057_listing(
+        repo.path(),
+        &["ls-tree", "-t", "HEAD", "dir/nested/"],
+        issue1057_golden("nested-t-slash"),
+    );
+    assert_issue1057_listing(
+        repo.path(),
+        &["ls-tree", "-r", "-t", "HEAD", "dir/nested"],
+        issue1057_golden("nested-r-t"),
+    );
+}
+
+#[test]
+fn ls_tree_issue1057_t_slash_and_blob() {
+    let repo = setup_issue1057_repo();
+    assert_issue1057_listing(
+        repo.path(),
+        &["ls-tree", "-t", "HEAD", "dir/"],
+        issue1057_golden("t-slash"),
+    );
+    assert_issue1057_listing(
+        repo.path(),
+        &["ls-tree", "-t", "HEAD", "dir/other"],
+        issue1057_golden("t-blob"),
+    );
+    assert_issue1057_listing(
+        repo.path(),
+        &["ls-tree", "-t", "HEAD", "dir/nested/file"],
+        issue1057_golden("t-deep-blob"),
+    );
+}
+
+#[test]
+fn ls_tree_issue1057_subdir_paths() {
+    let repo = setup_issue1057_repo();
+    assert_issue1057_listing(
+        &repo.path().join("dir"),
+        &["ls-tree", "HEAD", "nested"],
+        issue1057_golden("subdir-plain"),
+    );
+    assert_issue1057_listing(
+        &repo.path().join("dir"),
+        &["ls-tree", "HEAD", "nested/"],
+        issue1057_golden("subdir-slash"),
+    );
+    assert_issue1057_listing(
+        &repo.path().join("dir"),
+        &["ls-tree", "--full-tree", "HEAD", "dir"],
+        issue1057_golden("subdir-full-tree"),
+    );
+    assert_issue1057_listing(
+        repo.path(),
+        &["ls-tree", "HEAD", "./dir"],
+        issue1057_golden("dot-dir"),
+    );
+}
+
+#[test]
+fn ls_tree_issue1057_overlap_paths() {
+    let repo = setup_issue1057_repo();
+    assert_issue1057_listing(
+        repo.path(),
+        &["ls-tree", "HEAD", "dir", "dir/other"],
+        issue1057_golden("overlap-child"),
+    );
+    assert_issue1057_listing(
+        repo.path(),
+        &["ls-tree", "HEAD", "dir/", "dir/other"],
+        issue1057_golden("slash-overlap-child"),
+    );
+    assert_issue1057_listing(
+        repo.path(),
+        &["ls-tree", "-r", "HEAD", "dir/"],
+        issue1057_golden("recursive-slash"),
+    );
+    assert_issue1057_listing(
+        repo.path(),
+        &["ls-tree", "-r", "-t", "HEAD", "dir/"],
+        issue1057_golden("recursive-t-slash"),
+    );
+    assert_issue1057_listing(
+        repo.path(),
+        &["ls-tree", "-t", "HEAD", "dir", "dir/other"],
+        issue1057_golden("t-overlap-child"),
+    );
+}
+
+#[test]
+fn ls_tree_issue1057_json() {
+    let repo = setup_issue1057_repo();
+    let output = run_libra_command(&["--json", "ls-tree", "HEAD", "dir"], repo.path());
+    assert_cli_success(&output, "issue1057 JSON directory");
+    let golden = std::str::from_utf8(issue1057_golden("root")).expect("UTF-8 golden");
+    let expected: Vec<_> = golden.lines().map(|line| {
+        let (metadata, path) = line.split_once('\t').expect("tree record");
+        let fields: Vec<_> = metadata.split_whitespace().collect();
+        serde_json::json!({"mode": fields[0], "object_type": fields[1], "object": fields[2], "path": path})
+    }).collect();
+    let json = parse_json_stdout(&output);
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["command"], "ls-tree");
+    assert_eq!(json["data"]["entries"], serde_json::json!(expected));
+}
+
+fn issue1057_size_column(name: &str, path: &str, column: usize) -> &'static [u8] {
+    issue1057_golden(name)
+        .split(|b| *b == b'\n')
+        .find(|line| line.rsplit(|b| *b == b'|').next() == Some(path.as_bytes()))
+        .expect("size golden path")
+        .split(|b| *b == b'|')
+        .nth(column)
+        .expect("size column")
+}
+
+fn issue1057_missing_blob(repo: &std::path::Path) {
+    let oid = blob_hash_for(repo, "dir/nested/file");
+    fs::remove_file(loose_object_path(repo, &oid)).expect("remove fixture blob");
+}
+
+#[test]
+fn ls_tree_issue1057_size_unpadded() {
+    let repo = setup_issue1057_repo();
+    let expected = [
+        issue1057_size_column("size-six", "dir/nested/file", 1),
+        b"\n",
+    ]
+    .concat();
+    assert_issue1057_listing(
+        repo.path(),
+        &[
+            "ls-tree",
+            "--format=%(objectsize)",
+            "HEAD",
+            "dir/nested/file",
+        ],
+        &expected,
+    );
+    // Exercise the storage request through the CLI for zero, seven-column and
+    // wider sizes as well as tree/gitlink placeholders and repeated atoms.
+    assert_issue1057_listing(
+        repo.path(),
+        &[
+            "ls-tree",
+            "--format=%(objectsize:padded)|%(objectsize)|%(objectsize:padded)|%(path)",
+            "HEAD",
+            "dir",
+            "empty",
+            "large",
+            "link",
+        ],
+        issue1057_golden("size"),
+    );
+    assert_issue1057_listing(
+        repo.path(),
+        &[
+            "ls-tree",
+            "--format=%(objectsize:padded)|%(objectsize)|%(objectsize:padded)|%(path)",
+            "HEAD",
+            "dir/nested/file",
+        ],
+        issue1057_golden("size-six"),
+    );
+}
+
+#[test]
+fn ls_tree_issue1057_size_plain_tree() {
+    let repo = setup_issue1057_repo();
+    let expected = [issue1057_size_column("size", "dir", 1), b"\n"].concat();
+    assert_issue1057_listing(
+        repo.path(),
+        &["ls-tree", "--format=%(objectsize)", "HEAD", "dir"],
+        &expected,
+    );
+}
+
+#[test]
+fn ls_tree_issue1057_size_plain_gitlink() {
+    let repo = setup_issue1057_repo();
+    let expected = [issue1057_size_column("size", "link", 1), b"\n"].concat();
+    assert_issue1057_listing(
+        repo.path(),
+        &["ls-tree", "--format=%(objectsize)", "HEAD", "link"],
+        &expected,
+    );
+}
+
+#[test]
+fn ls_tree_issue1057_size_error() {
+    let repo = setup_issue1057_repo();
+    issue1057_missing_blob(repo.path());
+    for format in [
+        "--format=%(objectsize)",
+        "--format=%(objectsize:padded)",
+        "-l",
+    ] {
+        let out = run_libra_command(&["ls-tree", format, "HEAD", "dir/nested/file"], repo.path());
+        assert_eq!(out.status.code(), Some(128), "{format}");
+        assert!(out.stdout.is_empty(), "no partial listing on size failure");
+        let (_, report) = parse_cli_error_stderr(&out.stderr);
+        assert_eq!(report.error_code, "LBR-IO-001");
+    }
+    let out = run_libra_command(
+        &["--json", "ls-tree", "-l", "HEAD", "dir/nested/file"],
+        repo.path(),
+    );
+    assert!(!out.status.success(), "JSON -l still reads sizes");
+    let (_, report) = parse_cli_error_stderr(&out.stderr);
+    assert_eq!(report.error_code, "LBR-IO-001");
+}
+
+#[test]
+fn ls_tree_issue1057_size_not_requested() {
+    let repo = setup_issue1057_repo();
+    issue1057_missing_blob(repo.path());
+    assert_issue1057_listing(
+        repo.path(),
+        &["ls-tree", "--format=%(path)", "HEAD", "dir/nested/file"],
+        b"dir/nested/file\n",
+    );
+}
+
+fn assert_issue1057_json_without_size(repo: &std::path::Path) {
+    let output = run_libra_command(
+        &[
+            "--json",
+            "ls-tree",
+            "--format=%(objectsize:padded)",
+            "HEAD",
+            "dir/nested/file",
+        ],
+        repo,
+    );
+    assert_cli_success(&output, "JSON ignores size atom");
+    let json = parse_json_stdout(&output);
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["command"], "ls-tree");
+    assert_eq!(
+        json["data"],
+        serde_json::json!({
+            "treeish": "HEAD", "root_tree": root_tree_hash(repo), "recursive": false,
+            "entries": [{"mode": "100644", "object_type": "blob",
+                "object": blob_hash_for(repo, "dir/nested/file"), "path": "dir/nested/file"}]
+        })
+    );
+}
+
+#[test]
+fn ls_tree_issue1057_size_json_format() {
+    let repo = setup_issue1057_repo();
+    assert_issue1057_json_without_size(repo.path());
+    let out = run_libra_command(
+        &["--json", "ls-tree", "-l", "HEAD", "dir/nested/file"],
+        repo.path(),
+    );
+    assert_cli_success(&out, "JSON -l includes size");
+    assert_eq!(parse_json_stdout(&out)["data"]["entries"][0]["size"], 6);
+}
+
+#[test]
+fn ls_tree_issue1057_capture_format() {
+    let repo = setup_issue1057_repo();
+    assert_issue1057_listing(
+        repo.path(),
+        &[
+            "ls-tree",
+            "-r",
+            "-z",
+            "--format=%(objectname)%x09%(path)",
+            "HEAD",
+        ],
+        issue1057_golden("capture"),
+    );
+}
+
+#[test]
+fn ls_tree_issue1057_unknown_size_atom() {
+    let repo = setup_issue1057_repo();
+    let args = [
+        "ls-tree",
+        "--format=%(objectsize:bogus)",
+        "HEAD",
+        "dir/nested/file",
+    ];
+    assert_issue1057_listing(repo.path(), &args, b"%(objectsize:bogus)\n");
+    issue1057_missing_blob(repo.path());
+    assert_issue1057_listing(repo.path(), &args, b"%(objectsize:bogus)\n");
+}
+
+#[test]
+fn ls_tree_issue1057_size_json_missing_blob() {
+    let repo = setup_issue1057_repo();
+    issue1057_missing_blob(repo.path());
+    assert_issue1057_json_without_size(repo.path());
 }

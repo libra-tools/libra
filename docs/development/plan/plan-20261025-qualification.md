@@ -1,3 +1,158 @@
+> **2026-11-05 04:05:44 UTC ER-03：隔离整合与资格恢复家族 REL-QUAL-11。** 用户明确采用 `/Volumes/Data/gitmono/.worktrees/libra-qualification-upstream`，替代旧原工作区整合位置；原库并发写者完整保留，本任务未写入。已通过原生 fetch、精确三路径备份/restore、clean 检查与 `pull --ff-only` 接入上游 `292e5edf771fd8e56034aa5e4307f4f998947812` / 0.30.154，仅五个上游路径变化。本地 Pi 重复补丁未提交/推送，三路径备份 manifest `da290f6704a6a254b1603dc466a957d667489381134a61094389b0da1d3cddb9`。FIX10 改为具名来源接收文档子卡；两个新确证缺陷分别由 FIX11/FIX12 修复，唯一 code-only 集成点 REL-QUAL-11 承载 C/D，避免已知故障之间的交付循环。登记先于产品修改；用户免交叉 Review，非 PASS。
+
+旧 FIX10 attempt2 完整终态 native0，11276 passed（60 slow、1 flaky）、51 ignored、至少47项测试体运行时 skip、0 LEAK；wrapper 拒绝验收。日志 `026893572d97b11c93dbd2846f59b9cf2817dcc2135207c9ff49d739d9a81473`，2200个隔离输入及 H1/DB/env/277 PG/7容器不变，owned/unattributed=0。bare reinit 首次 fatal working-copy scan/status io worker、第二次成功；16次独立 CLI 诊断未复现原报错，具体触发文件/时序仍 unknown，但16/16快照实际收进 bare 的 DB/objects/锁。归属 `6dfad524db2cd5d121bec7196bd8c4254f27998e6c7752481d7d7c43f0da1376`。
+
+旧上游2ec base `41949163692` 为6 success/2 failure；Linux `126989025321` 为11294 passed/8 MCP failed/49 ignored，原日志 `564c41299f87e98508486df85c243fdd102bf001ce4e45cdd2fba4b8b83022dd`。同源 Linux arm64 二进制 `cf9ea1f1336e0783a91cab2c0bccc52cd2d95b431c39d8de458882efcf105fb2` 两次受控复现64线程EAGAIN/037、2/16/32成功；VmSize2620748KiB、RSS约45MiB、RLIMIT_AS2684354560bytes。归属 `98f4071778d441c19554721d195e57f119422961470edc5e59aaf3518206f6e2`；原x64宿主实况未捕获。首轮后检因原库自己的 native pull 导致 observer status超时60秒，STOP原件保留且未干预该进程；随后只重跑预构建二进制探针（未重复Cargo/full），driver0，先持久化baseline/native exit，严格资源/源/副本后检不变。新上游 base `41962202639`、CodeQL `41962202375` 尚未观察最终成功。旧FIX10窗口到此以失败及诊断收口，不续窗；新卡采用下述独立预算，H1/H2与历史风险均保留。原始记录位于仓外 `.fixtures/libra-qualification-fix10/attempt2/`，这些是取证路径而非可移植公开链接。
+
+> **2026-11-05 02:54:00 UTC FIX-LTR-10 同轴导入补正：** 逐一检查非 Unix 编译后发现正向用例的专用 `run_libra_command_with_env` 导入也须受 `#[cfg(unix)]` 限定；Windows job 明确 `RUSTFLAGS=-D warnings`，不能留下 unused import。本次仅在同一测试文件拆分并限定该导入，测试体及产品仍不变。旧 attempt1 由 root 核 PID/start/PGID/cwd 后仅向自有 nextest PGID `80784` 发 SIGTERM；原生终态 exit100，8988/11276 已运行且均 passed（22 slow、1 LEAK），51 ignored，2288未运行，不能称 full PASS。终态日志 SHA256 `c4bf51fc43f459d7af620af380719910bfed89b584eb6975903529d36ad193ee`；隔离输入/H1/DB/env/PG/容器后检不变，owned cleanup 与 unattributed 均0，原库所有者的活动改动另记观察。三份旧候选和 STOP 原件保留，原10800秒 FIX10 总窗口及600秒后检预留不重置；新最终输入重新跑完整既定门，仍不发布未交接 LTR-10 候选。用户免 Review，不记 PASS。
+
+> **2026-11-05 02:33:46 UTC FIX-LTR-10 Windows 编译恢复：** 当前上游 `2ecfc55a5aee81087908080f62fc5f1d1591f77b` 的 base `41949163692` / Windows job `126989025419` 实际 failure：新增 Pi 正向安装用例无条件引用 `std::os::unix::fs::PermissionsExt` 与 `Permissions::from_mode`，造成 `command_test` 编译 E0433/E0599；尚未执行所选 init 路径安全用例。原日志 SHA256 `92de538d3d56594e6c337d3694f221849436cc0399184874e6a130c9ed9f6df2`，不是本地 LTR-10 候选引入。用户已选择隔离区 `/Volumes/Data/gitmono/.worktrees/libra-qualification-upstream` 作为整合位置，原 `/Volumes/Data/gitmono/libra` 继续由其所有者使用，本任务无写入。LTR-10 七个候选文件按 SHA/mode 保存在仓外 `.fixtures/ltr10-binding/candidate-before-fix10/MANIFEST.json`，原生精确 restore 后新修复仅占下列三路径；不随该修复推送未交接的 family child。Review 按用户指令豁免，不能记 PASS。
+
+此前同源 LTR-10 候选本地全量原生退出 0，11276 passed（24 slow、1 LEAK）、51 ignored，至少47项运行时 skip；doc、network 3/3、release build 均原生退出0，binary `6911910eb8066be7484edfd47e4160507aecd458531e9919923511716cff4abf`。全量 wrapper 的额外 LEAK 拒绝与原库外部快进、build wrapper 的原库4个活动文件变更均保留 STOP；2200个隔离输入、H1/DB/env/PG/容器未变，按既有 A9 准则的分别归属收据和单例1/1诊断不抹除原记录。汇总 `be00ffd8a36d766dc34bc1dc78de2c79efc30afd83febba7e9ce7e678776b909`；这不是本修复新字节的 C/D。`RISK-LTR-NEXTEST-LEAK-PI153`（owner=root，open observational，实际 FD 持有者/原因 unknown）及 A8 deadline flaky 风险保留。最新 CodeQL `41949163651` 两 job 和 Code Quality `41949163431` success，base 有上述 failure，资格与 H2 尚未闭合。
+
+### Task FIX-LTR-10: 接收上游 Pi Windows 编译修复
+
+**Task type:** `docs`  
+**Lifecycle / Acceptance:** `in-progress` / `locally-accepted`；上游 Windows D 与本地 Pi 单例已成功；本家族最终 C/D 尚待。  
+**Description:** 本地重复补丁已撤下且精确备份。消费上游 `292e5edf771fd8e56034aa5e4307f4f998947812`（0.30.154）的平台条件修复：保留跨平台 bare/explicit-enable 断言，只将 Unix 安装段及专属导入限定为 Unix。本卡改为具名来源接收/证据子卡，不冒称本任务实现或发布了该提交。  
+**Out of scope:** 不重新修改 Pi 测试、不改产品平台支持、不重放已失败全量来抹除 flaky、不自行 bump/tag/Release。  
+**Acceptance criteria:**
+- [x] AC-1：保存原 Windows E0433/E0599、两次本地窗口及精确补丁备份；核上游五路径与原生整合收据，重复补丁不进入交付。
+- [ ] AC-2：真实 Windows job 的编译及既有选择器成功；本地 Unix Pi 原用例仍非零执行；上游来源和最终家族 SHA 分别记录。
+- [ ] AC-3：本卡精确文档包含于 `REL-QUAL-11` 的最终 C、signed+DCO 与适用 D；不以旧失败窗口替代，不提前解除 H2/来源交接。
+**Verification:**
+- [x] VER-1：实际上游提交差异、native fetch/restore/fast-forward 原件；Pi 单例与完整 roster 模块。
+- [ ] VER-2：真实 Windows run/job/head/终态，以及 `REL-QUAL-11` 最终源绑定收据。
+**Dependencies:** GOV-LTR-CO-01；上游已合入实现；由 REL-QUAL-11 串行承载最终验收。  
+**Implementation write set:** 本计划；`plan-status.md` 的本计划行。  
+**Release boundary / Version:** `no-release documentation child of REL-QUAL-11` / N/A。  
+**Full-suite trigger:** 随唯一集成点 T-2，不把原 FIX10 full 的 1 flaky 改成通过。  
+**Docs and compatibility impact:** 来源和状态事实；不更改公共 CLI/网站语义。  
+**Security / Performance / Rollback:** 延续下述家族资源与预算约束；仅撤回本卡未交付的文档增量。  
+**Granularity:** docs；AC=3；VER=2；prod-files=0；scope=S；landing=1；self-contained=yes；deps=明确；release=REL-QUAL-11；writeset=2；exception=用户免 Review，非 PASS。
+
+**来源接收证据（2026-11-05 UTC）：** 上游 base `41962202639` / `compat-scoped-input-windows` job `127030932665` 在 `292e5edf771fd8e56034aa5e4307f4f998947812` 完成 success（04:12:29Z），编译、四个 exact fixture、原生 Windows capture/lease/release binary 步骤均 success。本地同源 Pi 用例 `pi_supported_enable_disable_and_bare_skip` 1/1 passed、native0、后检不变、owned/unattributed=0；日志 SHA256 `f30f48e4308bf36b9fe11d7902f8c93be54cf79eb927e0c06556f6ff9f5f7d70`。该来源证据不代替家族最终 C/D；upstream 其余 job 尚在运行。
+
+本地完整 `command::agent_roster_test::` 10/10 passed、native0、后检不变；日志 `cc2d11d3ee9c0e456a31eaa0b7a5e15f7dea8f27a58758daa57f5f9e9a342584`。最新原生 fetch exit0，HEAD=origin/main=292e5edf，无待重基上游差异。新增 FIX11 测试首次运行停在误将 ObjectHash JSON 当字符串的辅助函数（非有效 RED，原件保留）；修正为实际 ObjectHash 反序列化后 bare RED 命中 `BARE_SNAPSHOT_METADATA`（exit100，日志 `a724deab1106f904c35784dcd02941e6bfd687c09e2408442922ec258661ea5a`），普通工作区对照 1/1 passed（日志 `93fc6947b5d5d67e397b81333bbca0885e8fa1315e83152ef176746fa2c73be8`）。产品未改，总预算未重置；测试文件不进入本来源接收文档子提交。
+
+### Task FIX-LTR-11: bare 仓库快照排除元数据目录
+
+**Task type:** `implementation`  
+**Lifecycle / Acceptance:** `in-progress` / `locally-accepted`；A/B 完成，本地 signed+DCO 子提交 `dfed4cbca17624daf7a9b9a2a42e15514cdc780f` 已核 VALIDSIG；家族最终 C/D 待。  
+**Description:** 已用同一 0.30.153 二进制在 16 个独立 bare 仓库实测：操作快照的 untracked manifest 收入 `libra.db`、`objects/` 和内部锁路径。bare 无工作树，扫描不得把仓库元数据当作工作区内容。按请求固定的仓库身份判定 bare，空工作区扫描仍保留已有 HEAD、引用、原始 index/facet 和操作日志流程。  
+**Out of scope:** 不改 worker wire 错误编码、不吞 I/O 错误、不放宽时间/并发、不改普通工作区 ignore/layer/gitlink/稀疏规则；原 full 的具体出错文件和时序仍 unknown。  
+**Acceptance criteria:**
+- [x] AC-1：新增真实 CLI 用例先在未修复产品上失败于 `BARE_SNAPSHOT_METADATA`；修复后 SHA-1/SHA-256、`repo.git`/`.libra` 两种 bare 名称的 untracked manifest 与 working-copy tree 为空，元数据文件留在原位。
+- [x] AC-2：普通工作区对照仍保存可见文件及其原始内容；不会因 bare 判定而停用所有工作区快照。
+- [x] AC-3：原 bare reinit 身份保存用例和现有 snapshot/head/ignore/gitlink 用例通过；权威元数据验证与操作记录未绕过。
+**Verification:**
+- [x] VER-1：`command::init_test::bare_reinit_snapshot_excludes_repository_metadata`（new）真实 RED/GREEN；`command::init_test::worktree_reinit_snapshot_keeps_visible_files`（new）及原 `init_bare_reinit_tops_up_and_preserves_state`。
+- [x] VER-2：完整 `command::init_test::` 和 `internal::operation::snapshot::` 选择器实际非零通过；最终全量由 REL-QUAL-11 承载。
+**Dependencies:** 当前上游 0.30.154；已保存的 bare 实测归属；无 FIX12 代码依赖，交付由共同集成点承载。  
+**Implementation write set:** `src/internal/operation/snapshot.rs`；`tests/command/init_test.rs`；本计划；`plan-status.md` 本计划行。  
+**Release boundary / Version:** `code-only family child of REL-QUAL-11` / N/A；精确本地 signed+DCO，不单独 push。  
+**Full-suite trigger:** T-2 在集成点完整执行；本卡 RED/GREEN 不替代。  
+**Docs and compatibility impact:** 恢复 `docs/commands/init.md` 已有“bare 无 working tree”契约；公共参数/错误码/网站契约不扩张，协调文档同卡更新。  
+**Security and privacy:** 元数据不可进入普通工作区快照；判定使用固定仓库，不能读取其它工作区/全局配置决定 bare；保留权威数据损坏的既有拒绝。  
+**Performance budget:** 计入下述单一家族窗口；不增加扫描遍历、未界定重试或新后台任务。  
+**Rollback mode:** 未推送本地子提交 `revert`；集成点交付后 forward-only。  
+**Granularity:** implementation；AC=3；VER=2；prod-files=1；scope=S；landing=1；self-contained=yes；deps=明确；release=REL-QUAL-11；writeset=4；exception=用户免 Review，非 PASS。
+
+**实际 A/B 证据（2026-11-05T04:23:39.737015+00:00）：** FIX10 文档子提交 `bc9568e85a9baaa1c85cd4bf5ce2b1f4d0a66246` 已精确 signed+DCO，离线 GPG VALIDSIG 核验通过；首次核验误读尚未提交前的292e上游导致NO_PUBKEY，原件保留，提交结束后按精确 child ID 重新核验成功，不改写提交。FIX11 产品改动仅 snapshot.rs：用请求固定的存储 DB 读取 core.bare、共用 Git bool 解析、保留 linked-worktree 扫描，bare 返回空文件扫描；capture 中 HEAD、原始 index 和 facet 处理保留。新增测试先 RED，再 GREEN；首轮测试 helper 错误与修正记录见 FIX10，不当产品 RED。
+
+- `fix11-red2`：native100；Summary [   8.193s] 1 test run: 0 passed, 1 failed, 4692 skipped；日志 SHA256 `a724deab1106f904c35784dcd02941e6bfd687c09e2408442922ec258661ea5a`。
+- `fix11-control-before`：native0；Summary [  13.156s] 1 test run: 1 passed, 4692 skipped；日志 SHA256 `93fc6947b5d5d67e397b81333bbca0885e8fa1315e83152ef176746fa2c73be8`。
+- `fix11-green`：native0；Summary [   4.836s] 1 test run: 1 passed, 4692 skipped；日志 SHA256 `ce91fd059e3e9b24f0117b9f730e427b79d744538e5c4ebd16762421994496e7`。
+- `fix11-init-module`：native0；Summary [  30.608s] 49 tests run: 49 passed, 4644 skipped；日志 SHA256 `b8752fc63fad7ac170e49c42f199ce5db931c40520848e436933969e0248a5d4`。
+- `fix11-snapshot-module`：native0；Summary [   9.595s] 67 tests run: 67 passed, 4782 skipped；日志 SHA256 `b9f9feeb689f4c74d00c4a823b101dba1af6023331568178cbadd1903f05676d`。
+- `fix11-clippy`：native0；strict Clippy -D warnings 成功；日志 SHA256 `27df8846d0074a811b8c0f67d5dda4e0c9fdc6a1be53bb67b4dbf874e79233f8`。
+
+所有已列本地门隔离源码/H1/DB/env/PG/容器后检不变，owned/unattributed=0；未重复失败全量，未重置家族预算。原先 bare fatal 的具体文件/时序仍 unknown；当前修复只对已证实元数据纳入缺陷负责。用户免 Review，非 PASS；未推送、非 complete。
+
+### Task FIX-LTR-12: 限定私有 MCP read-worker 的运行时线程数
+
+**Task type:** `implementation`  
+**Lifecycle / Acceptance:** `in-progress` / `locally-accepted`；A/B 完成；本地 signed+DCO 子提交 `1dd29dbe9537bfd9940abbcbbb5f0549d8815126` 已核 VALIDSIG；家族最终 C/D 待，LEAK 观察项保留。  
+**Description:** Linux arm64 的两次同二进制诊断中，2/16/32 Tokio workers 成功，64 workers 在既有 2.5 GiB RLIMIT_AS 附近仅余约 692 KiB，RSS 约 45 MiB，SQLite worker 创建线程返回 `Io(EAGAIN)` 和 `LBR-AGENT-037`，与原 x64 CI 的错误签名一致。仅在私有 read-worker 创建 Tokio runtime 前固定小线程池；普通 CLI/MCP server 继续使用原策略。原 x64 机器的 CPU/进程/内存实况未捕获，不将本机诊断冒称原机器跟踪。  
+**Out of scope:** 不提高/移除 RLIMIT_AS、RSS 限制、deadline；不改 read-only/schema/对象修复拒绝、子进程回收、CI 并发或测试重试；不把全部 SQLx I/O 错误当 SQLite 锁。  
+**Acceptance criteria:**
+- [x] AC-1：新增 Linux 实际 MCP 用例在高 `TOKIO_WORKER_THREADS` 下先失败、修复后成功返回 SHA-256 仓库身份；私有 worker 的限制不依赖宿主 CPU 数，普通 CLI/MCP server 策略不变。
+- [x] AC-2：既有四个 MCP target 的成功、响应边界、脱敏、内存/deadline/回收与只读拒绝测试通过；不得以跳过数据库验证取得绿色结果。
+- [ ] AC-3：同一最终 Linux 二进制的受控资源诊断成功且保持原资源限制，原失败和首次后检 observer timeout 均保留；真实 Linux main D 成功。
+**Verification:**
+- [x] VER-1：`agent_mcp_exec_test::read_worker_runtime_is_bounded_on_large_hosts`（new, Linux）RED/GREEN；原四 target：`agent_mcp_exec_test`、`agent_mcp_envelope_test`、`agent_mcp_limits_test`、`agent_mcp_conformance_test`。
+- [ ] VER-2：受控 2/16/32/64 线程诊断、Vm/RSS/limits 与 owned container 退出收据；实际 Linux CI 的对应测试和全量终态。容器诊断不替代双 env C 或真实 x64 D。
+**Dependencies:** 当前上游 0.30.154；已保存的 Linux 失败及两次受控复现；无 FIX11 代码依赖，交付由共同集成点承载。  
+**Implementation write set:** `src/cli.rs`；`src/internal/ai/mcp_server/exec.rs`（仅纠正错误归因注释，原执行策略不变）；`tests/agent_mcp_exec_test.rs`；本计划；`plan-status.md` 本计划行。  
+**Release boundary / Version:** `code-only family child of REL-QUAL-11` / N/A；精确本地 signed+DCO，不单独 push。  
+**Full-suite trigger:** T-2 在集成点完整执行。  
+**Docs and compatibility impact:** 内部运行时资源修复；无新公共参数或网站契约，错误归因注释与协调文档同步。  
+**Security and privacy:** 既有只读/内存/超时/回收边界完整保留；诊断只用生成数据、不向容器装入云凭据。  
+**Performance budget:** 计入单一家族窗口；线程数固定，不放宽请求内任何预算。  
+**Rollback mode:** 未推送本地子提交 `revert`；集成点交付后 forward-only。  
+**Granularity:** implementation；AC=3；VER=2；prod-files=2（其中1仅注释）；scope=M；landing=1；self-contained=yes；deps=明确；release=REL-QUAL-11；writeset=5；exception=用户免 Review，非 PASS。
+
+**实际 A/B 证据（2026-11-05T04:31:52.839157+00:00）：** 新 Linux 用例在未修复产品上真实失败于 `MCP_WORKER_RUNTIME`、`LBR-AGENT-037`、SQLx Io(EAGAIN)，native101；修复后同用例1/1成功。产品仅在创建私有 read-worker runtime 前固定2个 Tokio workers，普通CLI/server仍使用默认策略；exec.rs只纠正错误归因注释，既有内存/deadline/只读/回收策略不变。
+
+- `fix12-linux-red`：native101；Linux 定向用例或诊断，原件记录于同名目录；日志 SHA256 `24fac1bfd00aba101827f31b07fe7ad6c59fef194a91a613c0080c7a8279f858`。
+- `fix12-linux-green`：native0；Linux 定向用例或诊断，原件记录于同名目录；日志 SHA256 `c91ec50c87f5f6723b4ff06372700ededce977276f85db1fa8db8d3e4d176a85`。
+- `fix12-linux-probe`：native0；Linux 定向用例或诊断，原件记录于同名目录；日志 SHA256 `7a5abe7f2b33abf47d6d0eed240f6d82bf5748ee55695991d900d7375b7921d9`。
+- `fix12-linux-observed`：native0；Linux 定向用例或诊断，原件记录于同名目录；日志 SHA256 `0ff4889c1133e1ee641a24462b26bd0caed42ee1e942da2f5ad217bc0d28ef5a`。
+- `fix12-mcp-targets`：native0；Summary [  32.440s] 31 tests run: 31 passed (1 leaky), 0 skipped；日志 SHA256 `6e89fb42c89ed46db74d2a5d4c1a630c3583aaaf4b90db93a55249392227362a`。
+- `fix12-leak-diagnostic`：native0；Summary [   1.157s] 1 test run: 1 passed, 6 skipped；日志 SHA256 `e6e4e0407c09a436c77f9960bae8e130ea67eadaca04b898a071fc45d733bbea`。
+- `fix12-clippy`：native0；严格 Clippy 成功；日志 SHA256 `4c7b3f2399b21844c8ac33ae5f4f0b9680c033434ab6d7a93bcf14b2f446e77c`。
+
+同一最终 Linux binary `fe5f58d58d26dd9e13ea8dad5bc12fe4feadec85166fc32d0c1a496d93ff57b6` 在2/16/32/64环境线程设置下的blob8请求全部成功；首次2/64瞬时进程采样缺失保留。只对同一预构建binary追加既有sleep200ms诊断后，四组均采到4总线程、VmSize377132KiB、RSS39060–39072KiB，RLIMIT_AS仍2684354560bytes；未重跑Cargo/full、未调整产品限制。Mac四target31/31 passed含1 LEAK（tools_list_matches_2025_06_18_schema），native0，source/protected后检不变，owned/unattributed=0；单例1/1定向诊断无LEAK，不能抹除原标记。该tools/list流程不调用私有read-worker，helper会wait_with_output；实际原FD持有者/原因仍unknown，登记 `RISK-LTR-NEXTEST-LEAK-MCP154`（root，open observational），按既有A9准则随最终full分别审计。真实x64 main D尚待，容器诊断不替代。用户免Review，非PASS。
+
+### Task REL-QUAL-11: 资格恢复家族最终整合
+
+**Task type:** `release`（code-only）  
+**Lifecycle / Acceptance:** `in-progress` / 空；三子提交已精确签名，最终冻结树 C 尚待，main D 未触发。  
+**Description:** 唯一交付者 root 串行执行 FIX10 来源接收、FIX11 bare 修复、FIX12 MCP 修复；分别保留各卡 A/B 和精确本地 signed+DCO 子提交，再对最终合树执行一次完整 C 与真实 D。此家族解决当前共享资格来源的两个独立阻塞，避免一张卡的 D 被另一项已知失败阻塞而形成循环；不并入未交接 LTR 产品候选。  
+**Acceptance criteria:**
+- [ ] AC-1：FIX10/11/12 的具名行为和证据完成；旧 STOP、flaky、ignored、运行时 skip、LEAK 风险分别保留，源码/测试/收据身份一致。
+- [ ] AC-2：最终冻结树完成 fmt、严格 Clippy、双 env 完整 nextest、doc、network 原三例、release build；无失败/flaky/retry 和实际遗留进程；LEAK 按既有 A9 准则单独取证，不冒称其根因已知。
+- [ ] AC-3：最新上游受控重基、签名/DCO/精确树验证、非强制推送及实际 main base/CodeQL 等适用 D 成功，Windows 与 Linux 的原阻塞均真正闭合；H1 与跨仓 H2 独立验收。
+**Verification:**
+- [ ] VER-1：逐卡 A/B 原件、最新 upstream 差异及 signed 子提交；默认套件的实际 case/ignored/运行时跳过清单和资源后检。
+- [ ] VER-2：最终 commit/ref/run/job 与实际结论；source/binary/contract 三摘要和受控隔离区身份写入后继交接写集，不倒写冻结树伪称已测。
+**Dependencies / Release family:** `FIX-LTR-10 -> FIX-LTR-11 -> FIX-LTR-12 -> REL-QUAL-11` 为共享写集的串行顺序，产品修复之间无虚假行为依赖；三子卡唯一 carrier=REL-QUAL-11。  
+**Implementation write set:** 本计划；`plan-status.md` 本计划行；只集成上述子卡精确提交，不新增产品代码。  
+**Release boundary / Version:** `code-only integration point` / N/A；不 bump/tag/GitHub Release，沿用上游版本面；最新原生 fetch/rebase、signed+DCO、保留签名提交的非强制 main 交付与真实适用 CI。  
+**Full-suite trigger:** T-2，必须双 env `cargo nextest run --all --no-fail-fast --retries 2`；fmt/Clippy/doc/network/build 同样在最终树运行。  
+**Docs and compatibility impact:** 仅来源资格协调与真实证据；不解除尚未执行的 LTR H2/H4/H5。  
+**Security and privacy:** 用户批准的整合位置为 `/Volumes/Data/gitmono/.worktrees/libra-qualification-upstream`；原 `/Volumes/Data/gitmono/libra` 由其所有者使用，本任务不写入。原库 VCS busy/改动只记观察项，不能因 observer timeout 阻断对隔离区/H1/全局与仓库 DB/env/277 PG/7 容器的严格后检。所有 baseline 与原生命令退出在后检前持久化，失败仍保留 STOP；只回收已核 identity 的自有资源。
+**Performance budget:** 旧 FIX10 窗口以失败及诊断收口，不续窗。上述新确证缺陷的家族共用一次 10800 秒本地窗口，从首个新 RED Cargo 命令起算，含全部 A/B/C 与 600 秒后检预留；Cargo jobs=4、现有 nextest 并发/重试/测试 deadline 不变，Linux 有界诊断串行计入。失败先保留/归属；无根因修正不盲重跑全量，不自动扩窗；远端 CI 等待另记，不消耗本地窗口。  
+**Rollback mode:** 集成点推送前仅撤销本家族精确本地增量；推送后 forward-only，不改原用户库。  
+**Granularity:** release；AC=3；VER=2；prod-files=0；scope=S；landing=1；self-contained=yes；deps=三具名子卡；release=唯一集成点；writeset=2；exception=用户明确免交叉 Review，不记 PASS。
+
+
+**最终 C 输入冻结（2026-11-05T04:34:11.267112+00:00）：** 隔离 main 的子提交序列为 `bc9568e85a9baaa1c85cd4bf5ce2b1f4d0a66246`（FIX10 docs）→`dfed4cbca17624daf7a9b9a2a42e15514cdc780f`（FIX11 bare）→`1dd29dbe9537bfd9940abbcbbb5f0549d8815126`（FIX12 MCP）。三个提交均精确写集、signed+DCO、本机离线GPG实际VALIDSIG，未推送；原库无写入。最新 native fetch exit0，origin/main仍292e5edf，与子链基底一致，无需重放；04:33 UTC GitHub main独立查询同SHA。当前仅本计划及plan-status本计划行收束，Rust产品/测试字节与各子卡已测输入相同。C按fmt→strictClippy→实际nextest listing→双env full→doc→原network3→release build执行；listing按当前平台实际统计，禁止沿用旧11276硬编码。所有阶段与后检计入04:06:43起的同一10800秒窗口（含600秒后检预留），没有续窗。当前文字仅登记输入和顺序，不预填结果；最终C/D及集成提交身份由仓外原件和后继具名交接写集补记。Review按用户指令免除，非PASS；本家族不bump/tag/Release，不混入LTR10七文件候选。
+
+
+> **2026-11-04 UTC FIX09 与 A9 资格证据（终态文档 D 待）：** FIX09 原测试缺陷及两次 RED 均保留；修复仅令沙箱测试内嵌套 commit 显式 `--no-gpg-sign -s`，不放宽沙箱或修改用户签名默认。签名+DCO `6819631a1d23b6110b250f8a0a1f347b2525f997` 已由上游合并，提交本机公钥实际 VALIDSIG，GitHub `unknown_key` 不称 verified。原提交自身 base run `41887408072` 部分 job cancelled，原事实不改；包含其代码的当前 `c426de6977678a60bef0d89f032c162a90686bbf` 在同树本机 A9 六阶段均 exit0：fmt、strict Clippy、双环境全量 11274/11274 passed（39 slow、0 flaky/重试/leak，50 原 ignored）、doc、network 3/3、release build；候选 binary SHA256 `cb4a08b6f90395b4ce78604dda44792d2114f8f82f3be53d6acd850d20fba26e`，terminal `8724bb2a67e1005dd5e4444c8066c4124822164c404a4eb7fd617721345fac0c`，源、用户数据、H1 后检不变。全量输出逐项审计至少 47 项测试体自行跳过，非相关功能覆盖；审计 `5ee8eca75340c4c58691069d442ce43e5e470c7524dfb55374884d8dbff43fea`，较早 v1–v3 解析错误原件保留。当前树实际 main base `41897658714` 八 job 全 success、CodeQL `41897658711` 和 Code Quality `41897658299` 均 success，收据 `6551724b02d2ffc2e2ef08912d7e8373fe9d051dfdba3325a849a283eb62b978`；历史 v0.30.92 原 base attempt1 failure 仍保留，同 SHA/ref attempt2 实际 success，F2 根因 unknown，缺失 user-decisions.json 原件未伪造。用户明确免交叉 Review，不声称审查 PASS；本段自身提交、其适用 D 与原工作区受控整合仍待，`DEP-QUAL-HANDOFF` / `DEP-TR-QUAL-REPAIRS` 尚未解除，A8 flaky 风险仍 open，H1/LTR live 不由本窗口替代。
+
+> **2026-11-04 UTC 来源资格恢复新增 FIX-LTR-09：** 最新上游 `a0632237f596ffbcbeadb98e3c386b6dc58209a8` 的本地 A5 窗口在 nextest 10947/11274 run、10946 passed、1 failed、50 原 ignored 时 STOP，327 未运行；fmt/Clippy exit 0，后续 doc/network/build 未执行，终态 SHA256 `007d4c52ac54233dd70640459fc9986fd7b6f9826e03117a24f9f91ff599e0dd`，资源后检不变。最终失败 `rebase_exec_failure_stops_and_continue_retries_the_command` 是沙箱内嵌套 `libra commit` 请求默认签名，而 macOS sandbox 凭据读保护拒绝访问该测试 HOME 的 vault key；在安全短 `/private/tmp` 与 `/Volumes/Data` 两种独立目录复现。新增下列 test-only 修复卡，先保留原 RED，再验证明确无签名的嵌套提交不影响原 rebase 断言；不放宽沙箱或用户的签名策略。A1/A2/A3/A5 FAIL、A4 定向失败与旧 v0.30.92 D failure 均保留，新的来源窗口尚未准入；用户明确豁免交叉 Review，不冒称 PASS。
+
+### Task FIX-LTR-09: 隔离 rebase exec 回归测试的嵌套签名
+
+**Task type:** `implementation`  
+**Lifecycle / Acceptance:** `in-progress` / `locally-accepted`（两次定向 RED 保留，修复后单例 1/1、同 target 32/32；FIX-LTR-09 签名+DCO 提交 `6819631a1d23b6110b250f8a0a1f347b2525f997` 已合入当前上游；A9 最终来源树本地六阶段 exit0，当前树 main D 成功。终态文档自身提交及其 D、原工作区受控整合仍待，不提前记 complete）。
+**Current evidence:** 两个未修改源码的单例失败收据 `f60ebeda31b53bab26e62c5c35d6f2e97e67f8ce7423971d577d0ea9fbecdcb2` / `25fee5d188c7272724d7b44cacbe92585a967168d46b995d7e9bc05501b29895`；修复后单例 1/1 `864bf8b0925a69968abb001b2f9c2bace3296acf6a7edd82d4dc67e24a35da88`、完整 target 32/32 `27313e43b0aae0c74f16c409539d0cd90ce5ef15796a1de691ff5356d506b522`；测试文件 SHA256 `8a1978974f8b60514aca6790e21d0094a245d3bf645b6cf020aa684828143e68`。仅测试命令增加 `--no-gpg-sign`，未改断言或沙箱。  
+**Description:** 在 `rebase_exec_failure_stops_and_continue_retries_the_command` 的测试命令中对嵌套测试提交显式传 `--no-gpg-sign`，使该 rebase 重试/引用更新用例不依赖沙箱禁止读取的 vault 私钥；保持 DCO、全部断言和沙箱凭据保护不变。  
+**Out of scope:** 产品源码、沙箱策略、真实用户默认签名、其它测试及既有结果。  
+**Acceptance criteria:** 原用例三次最终失败及两个单项 RED 保留；目标用例在新源码、隔离双 env 和原 sandbox 下实际通过；原 exit 23、LBR-CONFLICT-002、continue、HEAD/ref 与文件断言保持；默认签名及凭据保护不改；完成同树 fmt、strict Clippy、双 env 全量 nextest、doc、network 三例、release build、签名+DCO code-only 提交及适用 main D。  
+**Verification:** 原选择器 `cargo nextest run --test compat_noninteractive_history_controls -E 'test(=rebase_exec_failure_stops_and_continue_retries_the_command)' --no-fail-fast --retries 0`；整个相同测试 target；随后最终树资格全部原门，记录 ignored、运行时 skip 和实际环境。  
+**Dependencies:** A5 STOP/受保护资源后检、当前源码与共享写集核验、GOV-LTR-CO-01；后续 `DEP-QUAL-HANDOFF` 仍需旧版 D 归属和资格终态登记。  
+**Implementation write set:** `tests/compat/noninteractive_history_controls_test.rs`；协调写集 `docs/development/plan/plan-20261025-qualification.md`，其余计划索引由最终交接按精确前像整合。  
+**Release boundary / Version:** `code-only independent` / `N/A`，不 bump/tag/Release；提交前原生 fetch/rebase 并重新核受影响门；受控 signed+DCO 与适用 PR/main D。  
+**Full-suite trigger:** 测试逻辑变更触发 T-1/T-4；最终来源树须执行本计划双环境全量、doc、network 和 build；纯文档后补按模板 v2.16 执行文档校验及适用 D。
+**Docs and compatibility impact:** 产品行为、CLI、全局配置及网站无变更；本计划和 `plan-status.md` 仅记录真实证据与未完成边界。
+**Security and privacy:** 只改变测试用嵌套提交，不读取或输出 vault 私钥；保留真实 sandbox、受保护数据及 H1 服务。
+**Performance budget:** 不改变产品运行路径；按资格窗口 10800 秒含后检执行。
+**Estimated scope / Granularity:** `S`；一个测试命令、同测试目标与协调文档，code-only independent。
+**Rollback mode:** `revert`；不清理既有资源，不改变 H1 服务或历史结果。
+
 > **2026-10-31 15:28 UTC GOV C3 本地结果对资格入口：** GOV-LTR-CO-01 在 f9 同树的唯一 C3 focused1/1、原双 env full11083/11083（25原 ignored、0失败/FLAKY/retry）实际 exit0；原 terminal `09b87ad5…`、full `d52f56fb…`，源/全库 DB/stash 后检同一。成功 Summary 解析审计 v1 假阴性 exit1 原件保留，v2 exit0/25 ignored 逐名同一；39个既有条件性运行时跳过不计相应功能覆盖。回填后七文档 B/VER7/fmt 已按最终字节 exit0（仓外 `governance-final-docs-c3/final-3/` 原件）；fresh upstream 差异、精确签名提交/推送及适用 main D 待，故 `DEP-QUAL-CODEONLY-GOV` 仍 incoming；本资格计划来源最终窗口、H1 和旧 v0.30.92 base D FAIL 均未通过。C1/P1/C2 STOP 与 R4 OAuth 无判词保留；用户仅 GOV 后续 Claude Review 豁免，不构成资格审查 PASS。精确哈希/计数见 `plan-20261015.md` GOV 卡。
 
 > **2026-10-31 14:35 UTC GOV C2 STOP 对资格入口：** P2 两相完整前检 exit0，唯一 C2 claim 后 focused1/1 PASS，但 full 仅6539/11083运行、6469 PASS/70 FAIL/1 FLAKY/25原 ignored，4544因控制器进程扫描竞态发出的 SIGTERM 未运行；child umask0002 造成组可写 `.libra`/Pi UnsafeDirectory/模式断言失败。C2 controller exit1/STOP，原件 raw `5aede707…`、terminal `4aecb6d4…`，源/DB/stash后检同一；C3 尚属一次新恢复候选、未claim。旧 C1/P1/C2 STOP 保留，用户仅 GOV 本轮免 Claude、R4 OAuth 无 PASS，`DEP-QUAL-CODEONLY-GOV` 仍 incoming；本资格计划、H1、旧 base D FAIL 均未通过。精确收据见 `plan-20261015.md` GOV 卡。

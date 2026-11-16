@@ -822,3 +822,29 @@ fn test_describe_contains_merge_first_parent_and_lightweight() {
         "with --first-parent, a second-parent-only commit must not be named"
     );
 }
+
+#[test]
+fn i1062_consumer_describe_dirty_uses_clean_representation() {
+    eol_consumer_describe_dirty_uses_clean_representation(false);
+}
+
+#[test]
+fn i861_consumer_describe_dirty_uses_clean_representation() {
+    eol_consumer_describe_dirty_uses_clean_representation(true);
+}
+
+fn eol_consumer_describe_dirty_uses_clean_representation(auto: bool) {
+    use super::{add_test::i1062_ok, status_test::i1062_committed_scripts};
+    let temp = if auto {
+        super::status_test::i861_committed_scripts("sha1")
+    } else {
+        i1062_committed_scripts("sha1")
+    };
+    let repo = temp.path().join("repo");
+    i1062_ok(&repo, &["tag", "-a", "eol-base", "-m", "base"]);
+    let clean = i1062_ok(&repo, &["describe", "--dirty"]);
+    assert_eq!(String::from_utf8(clean).unwrap().trim(), "eol-base");
+    std::fs::write(repo.join("probe.ps1"), b"real change\r\n").unwrap();
+    let dirty = i1062_ok(&repo, &["describe", "--dirty"]);
+    assert_eq!(String::from_utf8(dirty).unwrap().trim(), "eol-base-dirty");
+}

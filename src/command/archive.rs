@@ -460,22 +460,37 @@ fn tar_entry_type(mode: &TreeItemMode) -> tar::EntryType {
     }
 }
 
-/// Apply symlink-specific tar header fields and finalize their checksum.
-fn configure_tar_symlink_header(
+const TAR_LINK_NAME_FIELD_LEN: usize = 100;
+
+/// Append a symlink without normalizing its target. Long targets use a GNU
+/// LongLink extension whose payload is the original byte sequence plus NUL.
+fn append_tar_symlink<W: Write>(
+    builder: &mut tar::Builder<W>,
     header: &mut tar::Header,
     archive_path: &Path,
-    data: Vec<u8>,
-) -> Result<(), CliError> {
-    header.set_link_name_literal(&data).map_err(|error| {
-        CliError::fatal(format!(
-            "invalid symlink target for '{}': {error}",
-            archive_path.display()
-        ))
-        .with_stable_code(StableErrorCode::IoWriteFailed)
-    })?;
-    header.set_size(0);
-    header.set_cksum();
-    Ok(())
+    target: &[u8],
+) -> std::io::Result<()> {
+    if let Err(error) = header.set_link_name_literal(target) {
+        if target.len() <= TAR_LINK_NAME_FIELD_LEN || target.contains(&0) {
+            return Err(error);
+        }
+
+        let mut long_header = tar::Header::new_gnu();
+        long_header.set_uid(0);
+        long_header.set_gid(0);
+        long_header.set_mode(0o644);
+        long_header.set_mtime(0);
+        long_header.set_size(target.len() as u64 + 1);
+        long_header.set_entry_type(tar::EntryType::GNULongLink);
+        if let Some(gnu) = long_header.as_gnu_mut() {
+            gnu.name[..b"././@LongLink".len()].copy_from_slice(b"././@LongLink");
+        }
+        long_header.set_cksum();
+        let long_data = std::io::Read::chain(target, std::io::Read::take(std::io::repeat(0), 1));
+        builder.append(&long_header, long_data)?;
+    }
+
+    builder.append_data(header, archive_path, std::io::empty())
 }
 
 /// Write a tar archive of the given entries to `writer`. All entries share the
@@ -486,7 +501,7 @@ fn write_tar_archive<W: Write>(
     prefix: Option<&Path>,
     writer: W,
     mtime: i64,
-) -> Result<(), CliError> {
+) -> Result<W, CliError> {
     let mut builder = tar::Builder::new(writer);
 
     for entry in entries {
@@ -496,46 +511,62 @@ fn write_tar_archive<W: Write>(
         let entry_type = tar_entry_type(&entry.mode);
 
         let mut header = tar::Header::new_gnu();
-        header.set_path(&archive_path).map_err(|error| {
-            CliError::fatal(format!(
-                "invalid archive path '{}': {error}",
-                archive_path.display()
-            ))
-            .with_stable_code(StableErrorCode::IoWriteFailed)
-        })?;
-        header.set_size(data.len() as u64);
+        header.set_size(if entry_type == tar::EntryType::Symlink {
+            0
+        } else {
+            data.len() as u64
+        });
         header.set_mode(mode);
         header.set_mtime(mtime.max(0) as u64);
         header.set_entry_type(entry_type);
-        header.set_cksum();
 
         if entry_type == tar::EntryType::Symlink {
-            configure_tar_symlink_header(&mut header, &archive_path, data)?;
-            builder.append(&header, std::io::empty()).map_err(|error| {
+            append_tar_symlink(&mut builder, &mut header, &archive_path, &data).map_err(
+                |error| {
+                    CliError::fatal(format!(
+                        "failed to write symlink '{}': {error}",
+                        archive_path.display()
+                    ))
+                    .with_stable_code(StableErrorCode::IoWriteFailed)
+                },
+            )?;
+            continue;
+        }
+
+        builder
+            .append_data(&mut header, &archive_path, data.as_slice())
+            .map_err(|error| {
                 CliError::fatal(format!(
-                    "failed to write symlink '{}': {error}",
+                    "failed to write entry '{}': {error}",
                     archive_path.display()
                 ))
                 .with_stable_code(StableErrorCode::IoWriteFailed)
             })?;
-            continue;
-        }
-
-        builder.append(&header, data.as_slice()).map_err(|error| {
-            CliError::fatal(format!(
-                "failed to write entry '{}': {error}",
-                archive_path.display()
-            ))
-            .with_stable_code(StableErrorCode::IoWriteFailed)
-        })?;
     }
 
-    builder.finish().map_err(|error| {
+    builder.into_inner().map_err(|error| {
         CliError::fatal(format!("failed to finalize archive: {error}"))
             .with_stable_code(StableErrorCode::IoWriteFailed)
-    })?;
+    })
+}
 
-    Ok(())
+/// Flush buffered archive output and surface errors that a drop would ignore.
+fn flush_archive_writer<W: Write>(mut writer: W, format: &str) -> Result<(), CliError> {
+    writer.flush().map_err(|error| {
+        CliError::fatal(format!("failed to flush {format} archive: {error}"))
+            .with_stable_code(StableErrorCode::IoWriteFailed)
+    })
+}
+
+/// Finish and flush a plain tar output stream.
+fn write_tar_output<W: Write>(
+    entries: &[ArchiveEntry],
+    prefix: Option<&Path>,
+    writer: W,
+    mtime: i64,
+) -> Result<(), CliError> {
+    let writer = write_tar_archive(entries, prefix, writer, mtime)?;
+    flush_archive_writer(writer, "tar")
 }
 
 /// Write a gzip-compressed tar archive.
@@ -549,7 +580,12 @@ fn write_tar_gz_archive<W: Write>(
     // flate2 accepts levels 0-9 (0 = no compression); default is 6.
     let compression = level.map(Compression::new).unwrap_or_default();
     let gz = GzEncoder::new(writer, compression);
-    write_tar_archive(entries, prefix, gz, mtime)
+    let gz = write_tar_archive(entries, prefix, gz, mtime)?;
+    let writer = gz.finish().map_err(|error| {
+        CliError::fatal(format!("failed to finalize tar.gz archive: {error}"))
+            .with_stable_code(StableErrorCode::IoWriteFailed)
+    })?;
+    flush_archive_writer(writer, "tar.gz")
 }
 
 /// Write a bzip2-compressed tar archive.
@@ -565,7 +601,12 @@ fn write_tar_bz2_archive<W: Write>(
         .map(|l| bzip2::Compression::new(l.clamp(1, 9)))
         .unwrap_or_default();
     let bz = BzEncoder::new(writer, compression);
-    write_tar_archive(entries, prefix, bz, mtime)
+    let bz = write_tar_archive(entries, prefix, bz, mtime)?;
+    let writer = bz.finish().map_err(|error| {
+        CliError::fatal(format!("failed to finalize tar.bz2 archive: {error}"))
+            .with_stable_code(StableErrorCode::IoWriteFailed)
+    })?;
+    flush_archive_writer(writer, "tar.bz2")
 }
 
 /// Determine external Unix attributes for a zip entry.
@@ -756,7 +797,7 @@ fn create_archive(
         ArchiveFormat::Tar => {
             // Plain tar is uncompressed; the level is not applicable.
             let writer = open_output(output)?;
-            write_tar_archive(entries, prefix, writer, mtime)
+            write_tar_output(entries, prefix, writer, mtime)
         }
         ArchiveFormat::TarGz => {
             let writer = open_output(output)?;
@@ -1112,29 +1153,23 @@ mod tests {
         assert!(!buf.is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
-    fn configure_tar_symlink_header_recomputes_readable_checksum() {
-        let mut header = tar::Header::new_gnu();
-        header
-            .set_path("readme-link")
-            .expect("valid symlink test path");
-        header.set_size("README.md".len() as u64);
-        header.set_mode(tar_entry_mode(&TreeItemMode::Link));
-        header.set_mtime(0);
-        header.set_entry_type(tar::EntryType::Symlink);
-        header.set_cksum();
-
-        configure_tar_symlink_header(&mut header, Path::new("readme-link"), b"README.md".to_vec())
-            .expect("configure symlink header");
-
+    fn write_tar_archive_preserves_non_utf8_symlink_target_bytes() {
+        let mut target = vec![0xff];
+        target.extend_from_slice(b"//./");
+        target.extend(std::iter::repeat_n(b'x', 120));
+        assert!(target.len() > 100);
+        let entries = [ArchiveEntry {
+            path: PathBuf::from("link"),
+            source: ArchiveSource::Inline(target.clone()),
+            mode: TreeItemMode::Link,
+        }];
         let mut buf = Vec::new();
-        {
-            let mut builder = tar::Builder::new(&mut buf);
-            builder
-                .append(&header, std::io::empty())
-                .expect("append symlink header");
-            builder.finish().expect("finish symlink tar");
-        }
+
+        write_tar_archive(&entries, None, &mut buf, 0).expect("write non-UTF-8 symlink target");
+        assert_eq!(&buf[..b"././@LongLink".len()], b"././@LongLink");
+        assert_eq!(buf[156], b'K');
 
         let mut archive = tar::Archive::new(buf.as_slice());
         let mut entries = archive.entries().expect("read symlink tar entries");
@@ -1142,37 +1177,16 @@ mod tests {
             .next()
             .expect("symlink tar should contain one entry")
             .expect("parse symlink tar entry");
-
         assert_eq!(entry.header().entry_type(), tar::EntryType::Symlink);
+        assert_eq!(entry.size(), 0);
         assert_eq!(
             entry
                 .link_name_bytes()
                 .expect("read symlink target")
                 .as_ref(),
-            b"README.md"
+            target.as_slice()
         );
         assert!(entries.next().is_none());
-    }
-
-    #[test]
-    fn configure_tar_symlink_header_preserves_non_utf8_target_bytes() {
-        let mut header = tar::Header::new_gnu();
-        header
-            .set_path("link")
-            .expect("valid non-utf8 symlink test path");
-        header.set_size(2);
-        header.set_mode(tar_entry_mode(&TreeItemMode::Link));
-        header.set_mtime(0);
-        header.set_entry_type(tar::EntryType::Symlink);
-        header.set_cksum();
-
-        configure_tar_symlink_header(&mut header, Path::new("link"), vec![0xff, b'x'])
-            .expect("configure non-utf8 symlink header");
-
-        assert_eq!(
-            header.link_name_bytes().expect("link bytes").as_ref(),
-            &[0xff, b'x']
-        );
     }
 
     #[test]
@@ -1198,6 +1212,177 @@ mod tests {
         assert_eq!(zip_unix_mode(&TreeItemMode::Blob), 0o100644);
         assert_eq!(zip_unix_mode(&TreeItemMode::BlobExecutable), 0o100755);
         assert_eq!(zip_unix_mode(&TreeItemMode::Link), 0o120000);
+    }
+
+    #[test]
+    fn archive_issue1059_long_name_write_error_is_propagated() {
+        #[derive(Debug)]
+        struct FailingWriter;
+
+        impl Write for FailingWriter {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("injected long-name writer failure"))
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let archive_path = "long/".to_owned() + &"p".repeat(120) + "/file.txt";
+        let entries = [ArchiveEntry {
+            path: PathBuf::from(&archive_path),
+            source: ArchiveSource::Inline(b"content".to_vec()),
+            mode: TreeItemMode::Blob,
+        }];
+
+        let error = write_tar_archive(&entries, None, FailingWriter, 0)
+            .expect_err("the injected writer failure must be returned");
+
+        assert_eq!(error.stable_code(), StableErrorCode::IoWriteFailed);
+        let message = error.to_string();
+        assert!(message.contains(&archive_path), "{message}");
+        assert!(
+            message.contains("injected long-name writer failure"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn archive_issue1059_nul_symlink_target_is_rejected_before_write() {
+        for mut target in [b"bad\0target".to_vec(), vec![b'x'; 120]] {
+            if target.len() > 100 {
+                target.push(0);
+            }
+            let mut buf = Vec::new();
+            let mut builder = tar::Builder::new(&mut buf);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(0);
+            header.set_entry_type(tar::EntryType::Symlink);
+
+            let error = append_tar_symlink(
+                &mut builder,
+                &mut header,
+                Path::new("link"),
+                target.as_slice(),
+            )
+            .expect_err("NUL in a symlink target must be rejected");
+            assert_eq!(error.kind(), std::io::ErrorKind::Other);
+            assert!(builder.get_ref().is_empty());
+        }
+    }
+
+    #[test]
+    fn archive_issue1059_flush_error_is_propagated() {
+        #[derive(Debug)]
+        struct FlushFailWriter;
+
+        impl Write for FlushFailWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::Error::other("injected deferred flush failure"))
+            }
+        }
+
+        let entries = [ArchiveEntry {
+            path: PathBuf::from("long/".to_owned() + &"p".repeat(120) + "/file.txt"),
+            source: ArchiveSource::Inline(b"content".to_vec()),
+            mode: TreeItemMode::Blob,
+        }];
+        let error = write_tar_output(&entries, None, FlushFailWriter, 0)
+            .expect_err("the deferred flush failure must be returned");
+
+        assert_eq!(error.stable_code(), StableErrorCode::IoWriteFailed);
+        assert!(
+            error
+                .to_string()
+                .contains("injected deferred flush failure")
+        );
+    }
+
+    #[test]
+    fn archive_issue1059_compressed_finalize_errors_are_propagated() {
+        #[derive(Debug)]
+        struct RecordingWriter(std::rc::Rc<std::cell::RefCell<Vec<usize>>>);
+
+        impl Write for RecordingWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.borrow_mut().push(buf.len());
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        #[derive(Debug)]
+        struct FailOnCallWriter(usize);
+
+        impl Write for FailOnCallWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                if self.0 == 0 {
+                    return Err(std::io::Error::other("injected compressor trailer failure"));
+                }
+                self.0 -= 1;
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let entries = [ArchiveEntry {
+            path: PathBuf::from("long/".to_owned() + &"p".repeat(120) + "/file.txt"),
+            source: ArchiveSource::Inline(b"content".to_vec()),
+            mode: TreeItemMode::Blob,
+        }];
+
+        let gzip_calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        write_tar_gz_archive(&entries, None, RecordingWriter(gzip_calls.clone()), None, 0)
+            .expect("record gzip write calls");
+        let gzip_error = write_tar_gz_archive(
+            &entries,
+            None,
+            FailOnCallWriter(gzip_calls.borrow().len() - 1),
+            None,
+            0,
+        )
+        .expect_err("gzip trailer failure must be returned");
+        assert_eq!(gzip_error.stable_code(), StableErrorCode::IoWriteFailed);
+        assert!(
+            gzip_error
+                .to_string()
+                .contains("failed to finalize tar.gz archive")
+        );
+
+        let bzip2_calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        write_tar_bz2_archive(
+            &entries,
+            None,
+            RecordingWriter(bzip2_calls.clone()),
+            None,
+            0,
+        )
+        .expect("record bzip2 write calls");
+        let bzip2_error = write_tar_bz2_archive(
+            &entries,
+            None,
+            FailOnCallWriter(bzip2_calls.borrow().len() - 1),
+            None,
+            0,
+        )
+        .expect_err("bzip2 trailer failure must be returned");
+        assert_eq!(bzip2_error.stable_code(), StableErrorCode::IoWriteFailed);
+        assert!(
+            bzip2_error
+                .to_string()
+                .contains("failed to finalize tar.bz2 archive")
+        );
     }
 
     #[test]

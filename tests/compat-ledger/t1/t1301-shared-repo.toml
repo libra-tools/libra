@@ -1,0 +1,332 @@
+# Compatibility evidence for upstream t1301-shared-repo.sh (Issue #473 IN-12).
+# 22 scenarios covering shared permissions and forced modes.
+
+[[scenario]]
+id = "t1301-shared-repo::shared-0400-faulty-permission-u-w"
+category = "direct"
+command_status = "partial"
+surface_compatibility = "git-compatible"
+surface_evidence = "COMPATIBILITY.md:165"
+reason = "Shared repository permission calculation, persistence, and modes verified."
+owner = "libra-compat"
+review_date = "2026-11-13"
+upstream_revision = "1630431f326e15fcde608827b5ff38422528eb59"
+upstream_file = "t1301-shared-repo.sh"
+libra_command = "init"
+libra_surface = "--shared"
+libra_tests = ["command::shared_repo_test::test_t1301_ports"]
+
+[[scenario]]
+id = "t1301-shared-repo::shared-1-does-not-clear-bits-preset-by-umask-002"
+category = "direct"
+command_status = "partial"
+surface_compatibility = "git-compatible"
+surface_evidence = "COMPATIBILITY.md:165"
+reason = "Shared repository permission calculation, persistence, and modes verified."
+owner = "libra-compat"
+review_date = "2026-11-13"
+upstream_revision = "1630431f326e15fcde608827b5ff38422528eb59"
+upstream_file = "t1301-shared-repo.sh"
+libra_command = "init"
+libra_surface = "--shared"
+libra_tests = ["command::shared_repo_test::test_t1301_ports"]
+
+[[scenario]]
+id = "t1301-shared-repo::shared-1-does-not-clear-bits-preset-by-umask-022"
+category = "direct"
+command_status = "partial"
+surface_compatibility = "git-compatible"
+surface_evidence = "COMPATIBILITY.md:165"
+reason = "Shared repository permission calculation, persistence, and modes verified."
+owner = "libra-compat"
+review_date = "2026-11-13"
+upstream_revision = "1630431f326e15fcde608827b5ff38422528eb59"
+upstream_file = "t1301-shared-repo.sh"
+libra_command = "init"
+libra_surface = "--shared"
+libra_tests = ["command::shared_repo_test::test_t1301_ports"]
+
+[[scenario]]
+id = "t1301-shared-repo::shared-all"
+category = "direct"
+command_status = "partial"
+surface_compatibility = "git-compatible"
+surface_evidence = "COMPATIBILITY.md:165"
+reason = "Shared repository permission calculation, persistence, and modes verified."
+owner = "libra-compat"
+review_date = "2026-11-13"
+upstream_revision = "1630431f326e15fcde608827b5ff38422528eb59"
+upstream_file = "t1301-shared-repo.sh"
+libra_command = "init"
+libra_surface = "--shared"
+libra_tests = ["command::shared_repo_test::test_t1301_ports"]
+
+[[scenario]]
+id = "t1301-shared-repo::template-cannot-set-core-bare"
+category = "direct"
+command_status = "partial"
+surface_compatibility = "git-compatible"
+surface_evidence = "COMPATIBILITY.md:165"
+reason = "Shared repository permission calculation, persistence, and modes verified."
+owner = "libra-compat"
+review_date = "2026-11-13"
+upstream_revision = "1630431f326e15fcde608827b5ff38422528eb59"
+upstream_file = "t1301-shared-repo.sh"
+libra_command = "init"
+libra_surface = "--shared"
+libra_tests = ["command::shared_repo_test::test_t1301_ports"]
+
+[[scenario]]
+id = "t1301-shared-repo::update-server-info-honors-core-sharedrepository"
+category = "blocked"
+command_status = "partial"
+surface_compatibility = "deferred"
+surface_evidence = "COMPATIBILITY.md:165"
+reason = "update-server-info dumb HTTP server info file generation is deferred."
+owner = "libra-compat"
+review_date = "2026-11-13"
+upstream_revision = "1630431f326e15fcde608827b5ff38422528eb59"
+upstream_file = "t1301-shared-repo.sh"
+libra_command = "init"
+libra_surface = "init"
+blocked_by = ["support update-server-info"]
+
+[[scenario]]
+id = "t1301-shared-repo::shared-0660-r-r-ro"
+category = "direct"
+command_status = "partial"
+surface_compatibility = "git-compatible"
+surface_evidence = "COMPATIBILITY.md:165"
+reason = "Shared repository permission calculation, persistence, and modes verified."
+owner = "libra-compat"
+review_date = "2026-11-13"
+upstream_revision = "1630431f326e15fcde608827b5ff38422528eb59"
+upstream_file = "t1301-shared-repo.sh"
+libra_command = "init"
+libra_surface = "--shared"
+libra_tests = ["command::shared_repo_test::test_t1301_ports"]
+
+[[scenario]]
+id = "t1301-shared-repo::shared-0640-r-r-ro"
+category = "direct"
+command_status = "partial"
+surface_compatibility = "git-compatible"
+surface_evidence = "COMPATIBILITY.md:165"
+reason = "Shared repository permission calculation, persistence, and modes verified."
+owner = "libra-compat"
+review_date = "2026-11-13"
+upstream_revision = "1630431f326e15fcde608827b5ff38422528eb59"
+upstream_file = "t1301-shared-repo.sh"
+libra_command = "init"
+libra_surface = "--shared"
+libra_tests = ["command::shared_repo_test::test_t1301_ports"]
+
+[[scenario]]
+id = "t1301-shared-repo::shared-0600-r-ro"
+category = "direct"
+command_status = "partial"
+surface_compatibility = "git-compatible"
+surface_evidence = "COMPATIBILITY.md:165"
+reason = "Shared repository permission calculation, persistence, and modes verified."
+owner = "libra-compat"
+review_date = "2026-11-13"
+upstream_revision = "1630431f326e15fcde608827b5ff38422528eb59"
+upstream_file = "t1301-shared-repo.sh"
+libra_command = "init"
+libra_surface = "--shared"
+libra_tests = ["command::shared_repo_test::test_t1301_ports"]
+
+[[scenario]]
+id = "t1301-shared-repo::shared-0666-r-r-r-ro"
+category = "direct"
+command_status = "partial"
+surface_compatibility = "git-compatible"
+surface_evidence = "COMPATIBILITY.md:165"
+reason = "Shared repository permission calculation, persistence, and modes verified."
+owner = "libra-compat"
+review_date = "2026-11-13"
+upstream_revision = "1630431f326e15fcde608827b5ff38422528eb59"
+upstream_file = "t1301-shared-repo.sh"
+libra_command = "init"
+libra_surface = "--shared"
+libra_tests = ["command::shared_repo_test::test_t1301_ports"]
+
+[[scenario]]
+id = "t1301-shared-repo::shared-0664-r-r-r-ro"
+category = "direct"
+command_status = "partial"
+surface_compatibility = "git-compatible"
+surface_evidence = "COMPATIBILITY.md:165"
+reason = "Shared repository permission calculation, persistence, and modes verified."
+owner = "libra-compat"
+review_date = "2026-11-13"
+upstream_revision = "1630431f326e15fcde608827b5ff38422528eb59"
+upstream_file = "t1301-shared-repo.sh"
+libra_command = "init"
+libra_surface = "--shared"
+libra_tests = ["command::shared_repo_test::test_t1301_ports"]
+
+[[scenario]]
+id = "t1301-shared-repo::shared-0660-rw-rw-rw"
+category = "direct"
+command_status = "partial"
+surface_compatibility = "git-compatible"
+surface_evidence = "COMPATIBILITY.md:165"
+reason = "Shared repository permission calculation, persistence, and modes verified."
+owner = "libra-compat"
+review_date = "2026-11-13"
+upstream_revision = "1630431f326e15fcde608827b5ff38422528eb59"
+upstream_file = "t1301-shared-repo.sh"
+libra_command = "init"
+libra_surface = "--shared"
+libra_tests = ["command::shared_repo_test::test_t1301_ports"]
+
+[[scenario]]
+id = "t1301-shared-repo::shared-0640-rw-r-rw"
+category = "direct"
+command_status = "partial"
+surface_compatibility = "git-compatible"
+surface_evidence = "COMPATIBILITY.md:165"
+reason = "Shared repository permission calculation, persistence, and modes verified."
+owner = "libra-compat"
+review_date = "2026-11-13"
+upstream_revision = "1630431f326e15fcde608827b5ff38422528eb59"
+upstream_file = "t1301-shared-repo.sh"
+libra_command = "init"
+libra_surface = "--shared"
+libra_tests = ["command::shared_repo_test::test_t1301_ports"]
+
+[[scenario]]
+id = "t1301-shared-repo::shared-0600-rw-rw"
+category = "direct"
+command_status = "partial"
+surface_compatibility = "git-compatible"
+surface_evidence = "COMPATIBILITY.md:165"
+reason = "Shared repository permission calculation, persistence, and modes verified."
+owner = "libra-compat"
+review_date = "2026-11-13"
+upstream_revision = "1630431f326e15fcde608827b5ff38422528eb59"
+upstream_file = "t1301-shared-repo.sh"
+libra_command = "init"
+libra_surface = "--shared"
+libra_tests = ["command::shared_repo_test::test_t1301_ports"]
+
+[[scenario]]
+id = "t1301-shared-repo::shared-0666-rw-rw-rw-rw"
+category = "direct"
+command_status = "partial"
+surface_compatibility = "git-compatible"
+surface_evidence = "COMPATIBILITY.md:165"
+reason = "Shared repository permission calculation, persistence, and modes verified."
+owner = "libra-compat"
+review_date = "2026-11-13"
+upstream_revision = "1630431f326e15fcde608827b5ff38422528eb59"
+upstream_file = "t1301-shared-repo.sh"
+libra_command = "init"
+libra_surface = "--shared"
+libra_tests = ["command::shared_repo_test::test_t1301_ports"]
+
+[[scenario]]
+id = "t1301-shared-repo::shared-0664-rw-rw-r-rw"
+category = "direct"
+command_status = "partial"
+surface_compatibility = "git-compatible"
+surface_evidence = "COMPATIBILITY.md:165"
+reason = "Shared repository permission calculation, persistence, and modes verified."
+owner = "libra-compat"
+review_date = "2026-11-13"
+upstream_revision = "1630431f326e15fcde608827b5ff38422528eb59"
+upstream_file = "t1301-shared-repo.sh"
+libra_command = "init"
+libra_surface = "--shared"
+libra_tests = ["command::shared_repo_test::test_t1301_ports"]
+
+[[scenario]]
+id = "t1301-shared-repo::info-refs-respects-umask-in-unshared-repo"
+category = "direct"
+command_status = "partial"
+surface_compatibility = "git-compatible"
+surface_evidence = "COMPATIBILITY.md:165"
+reason = "Shared repository permission calculation, persistence, and modes verified."
+owner = "libra-compat"
+review_date = "2026-11-13"
+upstream_revision = "1630431f326e15fcde608827b5ff38422528eb59"
+upstream_file = "t1301-shared-repo.sh"
+libra_command = "init"
+libra_surface = "--shared"
+libra_tests = ["command::shared_repo_test::test_t1301_ports"]
+
+[[scenario]]
+id = "t1301-shared-repo::forced-modes"
+category = "direct"
+command_status = "partial"
+surface_compatibility = "git-compatible"
+surface_evidence = "COMPATIBILITY.md:165"
+reason = "Shared repository permission calculation, persistence, and modes verified."
+owner = "libra-compat"
+review_date = "2026-11-13"
+upstream_revision = "1630431f326e15fcde608827b5ff38422528eb59"
+upstream_file = "t1301-shared-repo.sh"
+libra_command = "init"
+libra_surface = "--shared"
+libra_tests = ["command::shared_repo_test::test_t1301_ports"]
+
+[[scenario]]
+id = "t1301-shared-repo::remote-init-does-not-use-config-from-cwd"
+category = "direct"
+command_status = "partial"
+surface_compatibility = "git-compatible"
+surface_evidence = "COMPATIBILITY.md:165"
+reason = "Shared repository permission calculation, persistence, and modes verified."
+owner = "libra-compat"
+review_date = "2026-11-13"
+upstream_revision = "1630431f326e15fcde608827b5ff38422528eb59"
+upstream_file = "t1301-shared-repo.sh"
+libra_command = "init"
+libra_surface = "--shared"
+libra_tests = ["command::shared_repo_test::test_t1301_ports"]
+
+[[scenario]]
+id = "t1301-shared-repo::re-init-respects-core-sharedrepository-local"
+category = "direct"
+command_status = "partial"
+surface_compatibility = "git-compatible"
+surface_evidence = "COMPATIBILITY.md:165"
+reason = "Shared repository permission calculation, persistence, and modes verified."
+owner = "libra-compat"
+review_date = "2026-11-13"
+upstream_revision = "1630431f326e15fcde608827b5ff38422528eb59"
+upstream_file = "t1301-shared-repo.sh"
+libra_command = "init"
+libra_surface = "--shared"
+libra_tests = ["command::shared_repo_test::test_t1301_ports"]
+
+[[scenario]]
+id = "t1301-shared-repo::re-init-respects-core-sharedrepository-remote"
+category = "direct"
+command_status = "partial"
+surface_compatibility = "git-compatible"
+surface_evidence = "COMPATIBILITY.md:165"
+reason = "Shared repository permission calculation, persistence, and modes verified."
+owner = "libra-compat"
+review_date = "2026-11-13"
+upstream_revision = "1630431f326e15fcde608827b5ff38422528eb59"
+upstream_file = "t1301-shared-repo.sh"
+libra_command = "init"
+libra_surface = "--shared"
+libra_tests = ["command::shared_repo_test::test_t1301_ports"]
+
+[[scenario]]
+id = "t1301-shared-repo::template-can-set-core-sharedrepository"
+category = "direct"
+command_status = "partial"
+surface_compatibility = "git-compatible"
+surface_evidence = "COMPATIBILITY.md:165"
+reason = "Shared repository permission calculation, persistence, and modes verified."
+owner = "libra-compat"
+review_date = "2026-11-13"
+upstream_revision = "1630431f326e15fcde608827b5ff38422528eb59"
+upstream_file = "t1301-shared-repo.sh"
+libra_command = "init"
+libra_surface = "--shared"
+libra_tests = ["command::shared_repo_test::test_t1301_ports"]

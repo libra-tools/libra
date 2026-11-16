@@ -518,6 +518,7 @@ impl LocalClient {
                     capabilities,
                     shallow_boundaries: Vec::new(),
                     hash_kind,
+                    version: super::ProtocolVersion::V0,
                 })
             }
             RepoType::LibraRepo => {
@@ -574,6 +575,7 @@ impl LocalClient {
                         capabilities,
                         shallow_boundaries: Vec::new(),
                         hash_kind: repo_hash_kind,
+                        version: super::ProtocolVersion::V0,
                     })
                 })
                 .await

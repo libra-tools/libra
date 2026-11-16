@@ -8016,6 +8016,69 @@ fn json_io_blocked_staged_field_survives_subdirectory() {
     );
 }
 
+/// A failed global attributes proof disables stat reuse without hiding the
+/// readable part of the worktree or permitting a partial cache write.
+#[test]
+#[cfg(unix)]
+fn i1062_status_blocked_attributes_preserve_readable_changes() {
+    let repo = tempdir().expect("temp repo");
+    init_repo_via_cli(repo.path());
+    configure_identity_via_cli(repo.path());
+    let locked = repo.path().join("locked");
+    fs::create_dir(&locked).unwrap();
+    fs::write(repo.path().join(".gitattributes"), "*.txt text eol=crlf\n").unwrap();
+    fs::write(locked.join("inside.txt"), "base\n").unwrap();
+    fs::write(repo.path().join("outside.txt"), "base\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "."], repo.path()),
+        "stage fixture",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], repo.path()),
+        "commit fixture",
+    );
+    fs::write(locked.join("inside.txt"), "inside edit\r\n").unwrap();
+    fs::write(repo.path().join("outside.txt"), "outside edit\r\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["status", "--scan"], repo.path()),
+        "seed both dirty rows",
+    );
+    for mode in [None, Some("--scan"), Some("--check-dirty")] {
+        let mut args = vec!["--json", "status"];
+        args.extend(mode);
+        lock_dir(&locked);
+        let out = run_libra_command(&args, repo.path());
+        unlock_dir(&locked);
+        assert_cli_success(&out, "blocked attributes keep the JSON partial contract");
+        let doc: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+        let data = &doc["data"];
+        assert_eq!(data["complete"], false, "{mode:?}: {doc}");
+        assert_eq!(data["is_clean"], false, "{mode:?}: {doc}");
+        assert!(
+            data["unstaged"]["modified"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|path| path == "outside.txt"),
+            "readable changes survive the failed attributes proof: {mode:?}: {doc}"
+        );
+        let blocked = data["io_blocked"].as_array().unwrap();
+        assert!(!blocked.is_empty(), "{mode:?}: {doc}");
+        assert!(
+            blocked.iter().all(|event| event["path"]["display"] != "."),
+            "path-local failures retain their actual paths: {mode:?}: {doc}"
+        );
+        if mode == Some("--scan") {
+            assert_eq!(data["cache_written"], false, "{doc}");
+        }
+        assert_eq!(
+            fs::read(repo.path().join("outside.txt")).unwrap(),
+            b"outside edit\r\n",
+            "comparison never rewrites the readable file"
+        );
+    }
+}
+
 /// §B.3.3: a hung worktree read is reclaimed and reported as
 /// `io_timeout` instead of hanging `status` forever. The deadline is
 /// injected (debug-only) and tripped with a FIFO, which blocks

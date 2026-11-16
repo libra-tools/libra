@@ -1259,7 +1259,9 @@ fn map_merge_error_to_cli(error: &merge::PullMergeError) -> CliError {
         merge::PullMergeError::InvalidAutostashConfig(..) => CliError::failure(error.to_string())
             .with_stable_code(StableErrorCode::RepoStateInvalid)
             .with_hint("set merge.autostash to true/false (or remove it)"),
-        merge::PullMergeError::StateLoad(..) | merge::PullMergeError::IndexLoad(..) => {
+        merge::PullMergeError::StateLoad(..)
+        | merge::PullMergeError::IndexLoad(..)
+        | merge::PullMergeError::WorktreeCheck(..) => {
             CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
         }
         merge::PullMergeError::StateSave(..)

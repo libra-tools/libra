@@ -1912,3 +1912,71 @@ fn add_with_empty_editor_buffer_aborts() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// LG-21 (M-NOTESC C1–C4): `-C`/`-c` blob reuse and full-OID `notes list`.
+#[test]
+#[serial(cwd)]
+fn test_notes_blob_reuse_and_list_output() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    let blob_path = p.join("blob.txt");
+    fs::write(&blob_path, "blob note").unwrap();
+    let blob = String::from_utf8_lossy(
+        &run_libra_command(&["hash-object", "-w", blob_path.to_str().unwrap()], p).stdout,
+    )
+    .trim()
+    .to_string();
+    assert_eq!(blob.len(), 40, "blob oid: {blob}");
+
+    // C1: `-C` reuses the blob content.
+    assert_cli_success(
+        &run_libra_command(&["notes", "add", "-f", "-C", &blob, "HEAD"], p),
+        "notes add -C",
+    );
+    let shown = run_libra_command(&["notes", "show", "HEAD"], p);
+    assert_eq!(String::from_utf8_lossy(&shown.stdout), "blob note");
+
+    // C2: `-c` reuses and edits (editor `true` keeps the text).
+    let reedit = run_libra_command_with_env(
+        &["notes", "add", "-f", "-c", &blob, "HEAD"],
+        p,
+        &[("GIT_EDITOR", "true")],
+    );
+    assert_cli_success(&reedit, "notes add -c");
+    let shown = run_libra_command(&["notes", "show", "HEAD"], p);
+    assert_eq!(String::from_utf8_lossy(&shown.stdout), "blob note");
+
+    // C3: `-m` composes with `-C`; `append -C` appends the same blob.
+    assert_cli_success(
+        &run_libra_command(
+            &["notes", "add", "-f", "-m", "first", "-C", &blob, "HEAD"],
+            p,
+        ),
+        "notes add -m -C",
+    );
+    let combined =
+        String::from_utf8_lossy(&run_libra_command(&["notes", "show", "HEAD"], p).stdout)
+            .into_owned();
+    assert!(combined.contains("first"), "{combined}");
+    assert!(combined.contains("blob note"), "{combined}");
+    assert_cli_success(
+        &run_libra_command(&["notes", "append", "-C", &blob, "HEAD"], p),
+        "notes append -C",
+    );
+    let appended =
+        String::from_utf8_lossy(&run_libra_command(&["notes", "show", "HEAD"], p).stdout)
+            .into_owned();
+    assert_eq!(appended.matches("blob note").count(), 2, "{appended}");
+
+    // C4: `notes list` prints full 40-character object ids.
+    let list = run_libra_command(&["notes", "list"], p);
+    assert_cli_success(&list, "notes list");
+    let list_text = String::from_utf8_lossy(&list.stdout).into_owned();
+    let fields: Vec<&str> = list_text.split_whitespace().collect();
+    assert_eq!(fields.len(), 2, "{list_text}");
+    assert_eq!(fields[0].len(), 40, "{list_text}");
+    assert_eq!(fields[1].len(), 40, "{list_text}");
+    let scoped = run_libra_command(&["notes", "list", "HEAD"], p);
+    assert_cli_success(&scoped, "notes list HEAD");
+    assert_eq!(String::from_utf8_lossy(&scoped.stdout).trim().len(), 40);
+}

@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 //! plan-20260926 DM-02: commit/change Episode derivation and projection.
 //!
 //! These integration tests derive Episodes from a real repository (created via

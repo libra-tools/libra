@@ -5503,6 +5503,10 @@ mod tests {
                 "attributes",
                 "leaf literal of the `info/attributes` source; the parent `info` directory is the actual storage-relative path",
             ),
+            (
+                "info/attributes",
+                "repository-local attribute rules read through the resolved gitdir; path patterns and conversion attributes do not root Git objects",
+            ),
             ("hooks", "hook scripts"),
             ("code", "`libra code` control/session surface (§C.4.1.1)"),
             ("service", "service control files (§C.4.1.1)"),

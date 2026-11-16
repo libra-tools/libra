@@ -66,6 +66,22 @@ Set the length of abbreviated commit hashes.
 libra log --abbrev 8
 ```
 
+### `--no-abbrev`
+
+`--no-abbrev` shows full object names in human-readable output, including
+`--oneline`, `%h`, `%p`, `--parents`, and in-range `--children` IDs. It is
+independent of `--abbrev-commit` and `--oneline`. When combined with
+`--abbrev=<N>`, the last option wins; repeated `--no-abbrev` options are
+accepted. JSON `short_hash` remains seven characters.
+
+```bash
+libra log --no-abbrev --oneline
+libra log --no-abbrev --abbrev=10 --oneline
+```
+
+Passing a value directly to `--no-abbrev` is rejected with `LBR-CLI-002`
+(exit code 129).
+
 ### `--no-abbrev-commit`
 
 Show full commit hashes. Overrides `--abbrev-commit`.
@@ -121,6 +137,17 @@ template using `format:`, `tformat:`, or a `%` placeholder. Empty values and
 unknown bare preset names fail before output with `LBR-CLI-002`; an explicit
 CLI format bypasses the matching config key.
 
+### Default layout
+
+The default (`medium`) and the `short`/`full`/`fuller`/`raw` presets print one
+blank line between commit records and none after the last one. The `Date:` line
+uses Git's default form with an unpadded day of month
+(`Fri Jan 2 00:00:00 2026 +0000`). `oneline`, `reference`, and custom
+`--format`/`--pretty` records are separated by a single newline and print no
+blank line. `--oneline`, `--pretty`, and `--format` are last-one-wins rather
+than mutually exclusive, and `show` keeps the blank line between its header and
+the indented message.
+
 ### `--date=<format>`
 
 Select the human-readable author/committer date mode. Supported modes are
@@ -150,15 +177,29 @@ libra log -p -- src/main.rs
 
 ### `-s, --no-patch`
 
-Suppress diff output (patch/stat/shortstat), countermanding an earlier `-p`.
+Suppress diff output. This option can be repeated; each occurrence clears the diff output formats given before it
+(`-p`/`--patch`, `--stat`, `--shortstat`,
+`--patch-with-stat`, `--name-only`, and `--name-status`). Formats given after the
+last `-s`/`--no-patch` remain effective. An active `--name-only` or
+`--name-status` conflicts with active `-s`/`--no-patch`; the two name options
+also conflict when both remain active after applying the option order. A later
+diff format such as `--stat` clears `-s`, so name output can follow it. These
+conflicts fail with `LBR-CLI-002` (exit code 129). A later `-s` clears earlier
+name options, so a cleared option does not conflict.
 
 ```bash
 libra log -s -1
+libra log -p -s --stat
+libra log -s --name-only                       # error
+libra log -s --stat --name-only                # accepted; shows changed paths
+libra log --name-only --name-status            # error
+libra log -s --name-only --no-patch            # accepted; --name-only is cleared
 ```
 
 ### `--name-only`
 
-Show only the names of changed files for each commit.
+Show only the names of changed files for each commit. It cannot remain active
+while `-s`/`--no-patch` is active or together with `--name-status`.
 
 ```bash
 libra log --name-only
@@ -167,6 +208,8 @@ libra log --name-only
 ### `--name-status`
 
 Show names and status (added/modified/deleted) of changed files for each commit.
+It cannot remain active while `-s`/`--no-patch` is active or together with
+`--name-only`.
 
 ```bash
 libra log --name-status
@@ -211,39 +254,70 @@ libra log --reverse --oneline
 libra log --follow src/main.rs
 ```
 
-### `--author <PATTERN>`
+### `--author <PATTERN>` / `--committer <PATTERN>`
 
-Filter commits to only those whose author name or email matches the given pattern.
+Filter commits to those whose author (`--author`) or committer (`--committer`)
+name or email matches the given pattern. `--author` and `--committer` may be
+repeated. Patterns within one field are OR-matched; fields are ANDed with each
+other and with message filters. Repeating `--author` does not alter how
+`--all-match` treats `--grep` patterns. Matching is a case-insensitive substring
+against `Name <email>`.
 
 ```bash
 libra log --author alice
 libra log --author "alice@example.com"
+libra log --author alice --author bob       # either author may match
+libra log --committer alice --committer bob
 ```
 
-### `--grep <PATTERN>` / `-i` / `--invert-grep`
+### Notes display
 
-Filter commits by message. The default dialect is POSIX basic regex (Git's
-default), so plain text matches literally and `+`, `(`/`)`, `.` behave as Git's
-BRE does. `--fixed-strings` treats the pattern as a literal, `--extended-regexp`
-uses POSIX ERE, and `--basic-regexp` selects the default dialect explicitly
-(last flag wins). `-i` / `--regexp-ignore-case` makes the match case-insensitive
+Built-in formats (and the default full format) show commit notes by default:
+a blank line, then `Notes:`, then the note body indented four spaces. A
+non-default ref renders `Notes (<short-ref>):`. `--notes[=<ref>]` /
+`--show-notes[=<ref>]` select refs explicitly (giving a ref replaces the
+implicit default), `--no-notes` suppresses them, `notes.displayRef` appends a
+ref, and `core.notesRef` changes the default ref. A custom `--format` shows
+notes only through `%N` (the note text, empty when absent); `--json` adds an
+optional `notes` array without changing existing fields.
+
+### `--grep <PATTERN>` / `--all-match` / `-i` / `--invert-grep`
+
+Repeated --grep patterns match if any pattern matches. The default dialect is
+POSIX basic regex (Git's default), so plain text matches literally and `+`,
+`(`/`)`, `.` behave as Git's BRE does. `--all-match` requires every pattern to
+match and takes no value; without any patterns it does not filter. Supplying a
+value with `--all-match=<value>` is rejected. `-F`/`--fixed-strings` treats each
+pattern as a literal, `-E`/`--extended-regexp` uses POSIX ERE, `--basic-regexp`
+selects the default dialect explicitly, and `-P`/`--perl-regexp` is accepted but
+uses the `fancy-regex` Perl engine (lookahead and backreferences; `\K`, recursion and `(*VERB)` are usage errors). The last flag wins.
+When no dialect flag is given, `grep.patternType` (basic/extended/fixed) and
+`grep.extendedRegexp` apply from the local→global→system cascade. `-i` /
+`--regexp-ignore-case` makes all grep matches case-insensitive
 (author/committer matching is already case-insensitive in Libra).
-`--invert-grep` keeps commits whose message does *not* match.
+`--invert-grep` keeps commits matching none of the patterns and takes
+precedence over `--all-match`.
 
 The search covers the commit subject, body, and trailers. PGP or SSH signatures in
 a `gpgsig` or `gpgsig-sha256` header immediately after `committer` are excluded, including with `-i` and `--invert-grep`; text in
 the actual message remains searchable. This applies to human, `--json`, and
-`--machine` output. An empty `--grep` pattern leaves message filtering disabled.
+`--machine` output. An empty `--grep` pattern matches every message; with
+`--invert-grep` it therefore leaves no commits. All patterns are compiled
+before filtering starts, and multiple invalid patterns report the first invalid
+one in command-line order.
 Leading spaces, tabs, and blank lines in the actual message remain searchable.
 Other imported header layouts (such as `encoding` before `gpgsig`) retain the
 existing parsing behavior.
 
 ```bash
 libra log --grep "fix(" -n 20
+libra log --grep fix --grep docs      # any pattern may match
+libra log --all-match --grep fix --grep docs
 libra log --grep fix -i              # case-insensitive
 libra log --grep WIP --invert-grep   # hide WIP commits
-libra log --extended-regexp --grep 'fix\([0-9]+\)'   # ERE dialect
-libra log --fixed-strings --grep 'c++ (fix)'           # literal pattern
+libra log -E --grep 'fix\([0-9]+\)'   # ERE dialect
+libra log -F --grep 'c++ (fix)'        # literal pattern
+libra log --basic-regexp --grep 'a\+'  # explicit BRE
 ```
 
 ### `--trailer <KEY[=VALUE]>` / `--only-trailers` (Libra extensions)
@@ -308,7 +382,7 @@ libra log --pretty=%P -1
 ### `--format <FORMAT>`
 
 Alias for `--pretty=<FORMAT>` (Git's `--format`). Accepts the same preset names and
-`%`-placeholder templates as `--pretty`. Mutually exclusive with `--pretty`.
+`%`-placeholder templates as `--pretty`. `--oneline`, `--pretty`, and `--format` are last-one-wins (the last one on the command line selects the format).
 
 ```bash
 libra log --format="%h %s"
@@ -318,6 +392,7 @@ libra log --format=oneline
 ### `--decorate[=<style>]`
 
 Print ref names (branches, tags) next to commits. Styles: `short` (default), `full`, `no`.
+Human-readable decorations are listed in the reverse order of their full ref names, with `HEAD` first. `HEAD` is shown only on the commit that HEAD points to, even when the range, `--reverse` or `--skip` starts elsewhere. The `--json` `refs` array keeps its existing order.
 
 ```bash
 libra log --decorate
@@ -334,22 +409,45 @@ libra log --no-decorate
 
 ### `--decorate-refs <PATTERN>` / `--decorate-refs-exclude <PATTERN>`
 
-Restrict decorations to refs matching any comma-separated fnmatch pattern, or
-hide matching refs. Both match against the full ref name and the short name.
+Restrict decorations to refs matching any of the given patterns, or hide refs
+matching any of the exclude patterns. Both options are repeatable; every value
+is one complete pattern (commas are literal) with an implicit refs/ prefix, and
+the pattern matches the full ref name only. A pattern with `*`, `?` or `[` is a
+wildcard match; otherwise it matches the exact ref name or a prefix that ends
+at a `/` component boundary. Exclude patterns win over include patterns. `HEAD` is filtered by its literal
+name like any other decoration: `HEAD -> <branch>` is shown only when both HEAD and
+the branch pass the filters; otherwise `HEAD` appears alone and the branch keeps
+its own sorted position when it passes.
 
 ```bash
-libra log --decorate --decorate-refs='refs/tags/*'
-libra log --decorate --decorate-refs-exclude='origin/*'
+libra log --decorate --decorate-refs='tags/*'
+libra log --decorate --decorate-refs='heads/aa' --decorate-refs='tags/t1'
+libra log --decorate --decorate-refs-exclude='heads/*'
 ```
+
+Migration: patterns that used the old short-name or comma-split matching must
+be rewritten. `origin/*` becomes `remotes/origin/*`, `refs/tags/v1,refs/tags/v2`
+becomes `--decorate-refs='tags/v1' --decorate-refs='tags/v2'`.
 
 ### `--graph`
 
-Draw a text-based graphical representation of the commit history, showing branching and
-merging visually.
+Draw a text-based graphical representation of the commit history using Git's
+column-allocation rules: branch forks collapse with `|/`, two-way merges print
+`|\`, and octopus merges print `*-.` plus their expansion rows. `--graph`
+implies Git's topological (graph) order, so a commit is printed only after all
+of its children; equal-date commits follow the graph-order stack (the most
+recently ready commit first). `--date-order` and `--author-date-order` are
+accepted but currently use the same graph order.
+
+`--all` seeds the walk from every ref under `refs/` (local and remote-tracking
+branches, tags, and `refs/notes/*` references) plus `HEAD`, in refname order.
+Libra's own notes backend stores notes in SQLite rather than a notes commit, so
+only imported notes refs contribute commits.
 
 ```bash
 libra log --graph
 libra log --oneline --graph
+libra log --graph --all
 ```
 
 ### Revision ranges (positional or `--range <SPEC>`)
@@ -733,7 +831,7 @@ flag only affects the human rendering layer.
 | Oneline format | `git log --oneline` | Default format is oneline | `libra log --oneline` |
 | Abbreviated hash | `git log --abbrev-commit` | Default | `libra log --abbrev-commit` |
 | Abbrev length | `git log --abbrev=<N>` | N/A | `libra log --abbrev <N>` |
-| Full hash | `git log --no-abbrev-commit` | `jj log --no-short-hash` | `libra log --no-abbrev-commit` |
+| Full hash | `git log --no-abbrev` | `jj log --no-short-hash` | `libra log --no-abbrev` / `--no-abbrev-commit` |
 | Show patch | `git log -p` | `jj diff -r <rev>` (separate cmd) | `libra log -p` / `--patch` |
 | Name only | `git log --name-only` | N/A | `libra log --name-only` |
 | Name and status | `git log --name-status` | N/A | `libra log --name-status` |
@@ -770,6 +868,10 @@ flag only affects the human rendering layer.
 | Empty branch or empty HEAD | `LBR-REPO-003` | 128 | "create a commit first before running 'libra log'" |
 | Invalid date argument | `LBR-CLI-002` | 129 | -- |
 | Invalid `--decorate` option | `LBR-CLI-002` | 129 | -- |
+| `--all-match` supplied with a value | `LBR-CLI-002` | 129 (Git: 128) | Libra: `error: unexpected value '1' for '--all-match' found; no more were expected`; Git: `fatal: unrecognized argument: --all-match=1` |
+| Invalid `--grep` pattern (first invalid pattern is reported) | `LBR-CLI-002` | 129 (Git: 128) | Libra: `fatal: invalid --grep pattern '<pattern>': …`; Git: `fatal: command line, '<pattern>': …` |
+| `--no-abbrev` supplied with a value | `LBR-CLI-002` | 129 | -- |
+| A name output option conflicts with active `-s`/`--no-patch`, or both name options remain active | `LBR-CLI-002` | 129 | -- |
 | Invalid object name | `LBR-CLI-003` | 129 | "check the revision name and try again" |
 | Unresolvable positional revision (typo guard) | `LBR-CLI-002` | 129 | "unknown revision or path not in the working tree" |
 | Ambiguous short object name | `LBR-CLI-003` | 129 | "The candidates are: ..." (one `<abbrev> <type>` line per candidate) |

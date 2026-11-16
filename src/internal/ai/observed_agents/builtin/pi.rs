@@ -71,6 +71,10 @@ impl ObservedAgent for PiObservedAgent {
     fn protected_dirs(&self) -> &'static [&'static str] {
         &[".pi"]
     }
+
+    fn as_hooks(&self) -> Option<&dyn crate::internal::ai::hooks::provider::HookProvider> {
+        Some(crate::internal::ai::hooks::providers::pi_provider())
+    }
 }
 
 /// Default bound on directory entries one discovery walk inspects.
@@ -405,6 +409,22 @@ fn attribute_candidate(
         return Err(PiSkipReason::InvalidSessionId);
     }
     Ok((session_id.to_owned(), cwd))
+}
+
+/// PI-35: open one Pi session directory through the same provider-root and
+/// no-follow rules as PI-02 discovery. `Ok(None)` means the path is not
+/// inside the configured Pi provider root.
+#[cfg(unix)]
+pub(crate) fn open_pi_provider_directory_for_source(path: &Path) -> Result<Option<std::fs::File>> {
+    super::super::transcript_source::open_provider_directory_for_discovery(
+        super::super::agent_for(AgentKind::Pi),
+        path,
+    )
+}
+
+/// PI-35: Pi's session-id grammar, shared with PI-15.
+pub(crate) fn pi_session_id_is_valid(id: &str) -> bool {
+    is_pi_session_id(id)
 }
 
 /// Pi's session id grammar, `^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$`

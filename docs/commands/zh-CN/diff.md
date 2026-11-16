@@ -42,6 +42,24 @@ Pathspec 参数会将 diff 过滤为只显示匹配文件或目录中的更改�
 
 当 stdout 被管道连接且下游命令提前退出时，stdout `BrokenPipe` 会被视为正常管道终止；不会打印 panic/backtrace 或 `Broken pipe` 诊断。
 
+### 显式行尾属性
+
+仓库内的工作区比较按显式 `text`、`eol=lf`、`eol=crlf` 属性使用与 `add` 相同的 clean 内容，将 CRLF 对转换为 LF。因此，LF 索引 blob 与等价的 CRLF 工作区文件不会产生补丁、统计或差异退出码；真实编辑与重命名匹配仍使用转换后内容。属性变更会使 stat 快路失效；文件或属性源无法读取时返回错误，不得当作干净结果。
+
+`-text` 保留原始字节，`text=auto` 同时支持文本转换、二进制探测和历史 CRLF 索引保护，限制见 [add](add.md)。已存储的索引和 tree blob 不做转换，`--cached` 与树对树比较保留历史含义。LFS 使用原始载荷的指针；符号链接目标、外部 diff/textconv 输入和 `--no-index` 保留既有字节契约。比较不会改写文件、索引条目或存储对象。
+
+旧版符号链接工作树的内容比较从已解析的元数据目录读取 `info/attributes`。属性文件必须是可读的普通文件；属性文件自身的符号链接会被拒绝。
+
+## 规范补丁格式
+
+所有补丁输出面（`diff`、`diff --cached`、`show`、`log -p`、`format-patch`、
+`diff-files`/`diff-tree -p`、`stash show -p`）的 unified hunk 头采用 Git 规范形式：
+单行侧省略 `,1`（`@@ -1 +1 @@`），空侧锚定在前一行、文件开头为 0
+（`@@ -0,0 +1,3 @@`、`@@ -1 +0,0 @@`），其余为
+`@@ -<start>,<count> +<start>,<count> @@`。只有真正删除的文件输出
+`deleted file mode` 与 `+++ /dev/null`；内容被清空但文件仍存在时保持
+`+++ b/<path>`。`libra apply` 与 `libra am` 同时接受该规范形式与旧版显式计数头。
+
 ## 选项
 
 | 选项 | 短选项 | 长选项 | 说明 |
@@ -76,6 +94,7 @@ Pathspec 参数会将 diff 过滤为只显示匹配文件或目录中的更改�
 | 忽略行尾回车 | | `--ignore-cr-at-eol` | 忽略行尾回车：CRLF↔LF-only 的变更被丢弃；行尾空格或行中 `\r` 的变更仍显示。最弱空白标志——被 `-w`/`-b`/`--ignore-space-at-eol` 各自涵盖且组合时后者优先。（对 Git 的近似：比较前剥除全部尾部 CR，而非 Git 非传递的「允许各留一个 CR」规则——仅病态多 CR 结尾有别，日常 CRLF 场景与 Git 一致。） |
 | 忽略空白行 | | `--ignore-blank-lines` | 忽略全为空白（真正空）行的变更：仅由增删空行构成的变更不报告（若新增/删除的文件内容全为空行，仍以零计数列出该文件），而紧邻真实编辑的空行则完整显示。重新 diff 受影响文件（故 `--stat`/`--name-only`/`--numstat`/JSON 反映结果）；遵循 `-U<n>`。与空白标志（`-w`/`-b`/`--ignore-space-at-eol`/`--ignore-cr-at-eol`）复合：任一空白标志下全空白行即视为空行（匹配 Git `xdl_blankline`）。 |
 | 按文件目录统计 | | `--dirstat-by-file[=<param>]` | 按**文件数**（而非变更行数）统计目录分布，等价于 `--dirstat=files[,<param>]`（`<param>` 接受同样的 `cumulative`/百分比取值）。 |
+| 累积目录统计 | | `--cumulative` | 等价于 `--dirstat=cumulative`；单独给出时启用 `--dirstat`。`changes`（默认）按字节 damage 统计，`lines` 按增删行数（二进制按每 64 字节折算），`files` 按文件数；只列出非顶层目录，百分比默认阈值 3%（截断到一位小数）。 |
 | Shortstat | | `--shortstat` | 只显示 `--stat` 的汇总行（文件数/插入/删除），零项省略对应子句。 |
 | Summary | | `--summary` | 显示创建/删除、已检测重命名及 mode 变更的精简摘要（默认开启重命名检测；`diff.renames=false` 或 `--no-renames` 可关闭）。纯内容修改不产生行。 |
 | No patch | `-s` | `--no-patch` | 抑制 patch（diff 主体）。与 `--exit-code` 组合做状态检查。 |

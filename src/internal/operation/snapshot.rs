@@ -41,7 +41,7 @@ use super::{
 };
 use crate::{
     internal::{
-        config::ConfigKv,
+        config::{ConfigKv, parse_git_bool},
         worktree_io::{
             default_worktree_io,
             executor::WorktreeIo,
@@ -259,6 +259,19 @@ impl WorkspaceSnapshotter {
     }
 
     async fn scan_working_copy_until(&self, deadline: Instant) -> Result<ScanResult, ScanError> {
+        if self.is_bare().await? {
+            // Bare storage is not a working tree. In particular, its database,
+            // object store and locks must never become untracked file blobs.
+            // capture_inner still validates HEAD and captures the raw index
+            // and state facets independently of this empty file scan.
+            return Ok(ScanResult {
+                tracked: BTreeMap::new(),
+                untracked: BTreeMap::new(),
+                completeness: Completeness::Full,
+                bytes: 0,
+                reused_index_oid: BTreeSet::new(),
+            });
+        }
         let index_path = self.scope.gitdir.join("index");
         let index_file_mtime = fs::metadata(&index_path)
             .ok()
@@ -399,6 +412,32 @@ impl WorkspaceSnapshotter {
             bytes,
             reused_index_oid,
         })
+    }
+
+    async fn is_bare(&self) -> Result<bool, ScanError> {
+        if self.scope.scope.worktree_id().is_some() {
+            return Ok(false);
+        }
+        // Read only this request's repository. The directory name cannot
+        // classify `init --bare .libra`, and global config is not authoritative.
+        let db_path = self.scope.storage.join(util::DATABASE);
+        let db = crate::internal::db::get_db_conn_instance_for_path(&db_path).await?;
+        let entry = ConfigKv::get_with_conn(&db, "core.bare")
+            .await
+            .map_err(|error| {
+                io::Error::other(format!("cannot read repository core.bare: {error}"))
+            })?;
+        match entry {
+            Some(entry) => parse_git_bool(&entry.value).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid repository core.bare value",
+                )
+                .into()
+            }),
+            // Older repositories may predate the flag; use the pinned layout.
+            None => Ok(self.scope.worktree_root == self.scope.storage),
+        }
     }
 
     async fn autocrlf_enabled(&self) -> bool {

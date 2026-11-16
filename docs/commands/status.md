@@ -12,6 +12,10 @@ libra status [OPTIONS] [pathspec]...
 
 ## Description
 
+Tracked regular files use the same explicit `text`/`eol` clean conversion as `add`: CRLF pairs compare as LF, while lone CR bytes are preserved. This applies to default status, `--scan`, and `--check-dirty`, including porcelain and JSON output. Attribute changes invalidate earlier clean conclusions even if the target file's stat is unchanged. Mode/type changes, deletions and real content edits remain visible; unreadable attributes produce an error or `io_blocked`, never a clean conclusion. An unreadable directory does not hide changes in other readable files. JSON retains the partial result with the affected paths in `io_blocked`; `--scan` and `--check-dirty` leave the prior dirty-cache snapshot unchanged when inspection is incomplete. `text=auto` uses the same comparison with binary detection and protection for historical CRLF index content. See [add](add.md) for `--renormalize`, bounded index evidence reads and remaining configuration limits.
+
+Legacy symlink worktrees support read-only `status`, using `info/attributes` from their resolved metadata directory. Repository mutations still require layout migration. An attribute file that is itself a symlink, or cannot be read, produces an error rather than being treated as absent.
+
 `libra status` shows the state of the working tree and staging area: which files are staged
 for the next commit, which have modifications not yet staged, and which are untracked. It also
 reports the current branch, detached HEAD state, and upstream tracking information.
@@ -284,9 +288,10 @@ libra status --find-renames=75
 
 ### Warnings and exit arbitration
 
-Every structured warning is a `{code, message, source}` triple drawn from one frozen
-schema — there is no bypass stderr-only channel; repository-level preflight advisories from
-other subsystems are folded into the same list (see below):
+Every entry in the structured `data.warnings[]` list is a
+`{code, message, source}` triple drawn from one frozen schema. Text mode also
+has an object-storage degrade warning that can be written directly to stderr
+without appearing in that list; its behavior is described below.
 
 | Code | Source | Meaning |
 |------|--------|---------|
@@ -307,23 +312,26 @@ other subsystems are folded into the same list (see below):
 | `repository_preflight` | `config` | A repository-level advisory raised before the command ran, or under `--json`/`--machine` before the status scan (e.g. a pending durable object-index repair, or object storage degrading to local under `LIBRA_STORAGE_TYPE=local`) |
 | `upstream_counts_unavailable` | `metadata` | The upstream ahead/behind counts could not be computed (a commit in either history, or the shallow boundary list, could not be read); the counts are omitted, never guessed |
 
-The `source` column is a frozen enum: `config`, `probe`, `rename_detect`, `worktree`,
-`metadata`, `cache`. `probe` and `rename_detect` are deliberately distinct — a `probe`
-warning means candidates may never have been *seen*, while `rename_detect` means they were
-seen but could not be scored. `config` covers repository-level advisories that are not tied to a scan — currently the
-`repository_preflight` row above. Config *resolution* itself never warns: an invalid value
-fails closed instead of degrading. The one exception is the object-storage degrade, which
-structured status resolves before its scan and reports as `repository_preflight`.
+The `source` column is a frozen enum: `config`, `probe`, `rename_detect`,
+`worktree`, `metadata`, `cache`. `probe` and `rename_detect` are deliberately
+distinct — a `probe` warning means candidates may never have been *seen*,
+while `rename_detect` means they were seen but could not be scored. `config`
+covers repository-level advisories that are not tied to a scan — currently the
+`repository_preflight` row above. Config *resolution* itself never warns: an
+invalid value fails closed instead of degrading. Structured status resolves
+object storage before its scan and reports a storage degrade as
+`repository_preflight`.
 
-Repository-level preflight advisories from other subsystems (for example a pending durable
-object-index repair, emitted before any command runs) follow the SAME delivery matrix as status
-warnings: printed on stderr in text modes, and carried in `data.warnings[]` as
-`repository_preflight` / `config` under `--json` — where stderr stays clean. That keeps the rule
-exact: exit 9 always corresponds to at least one entry in the structured list, so a `--json`
-consumer never has to read stderr to learn why its exit code changed. The object-storage
-degrade is the text-mode exception: there it prints its own `Warning:` line only when status
-lazily opens object storage (for example a full scan with commits, or upstream ahead/behind
-counts) and does not trip `--exit-code-on-warning`.
+Repository-level preflight advisories from other subsystems (for example a
+pending durable object-index repair, emitted before any command runs) follow
+the same delivery matrix as status warnings: printed on stderr in text modes,
+and carried in `data.warnings[]` as `repository_preflight` / `config` under
+`--json` or `--machine`, where stderr stays clean. In structured modes, every
+warning that triggers `--exit-code-on-warning` is present in `data.warnings[]`,
+so consumers do not need to inspect stderr. In text modes, object storage is
+opened lazily; a storage degrade may then print its own `Warning:` line to
+stderr (for example during a full scan with commits or upstream ahead/behind
+counts), and this text-only warning does not trigger `--exit-code-on-warning`.
 
 Human/short/porcelain modes print status warnings as `warning: …` on stderr (even under
 `--quiet`); `--json` carries them in `data.warnings[]` and keeps stderr

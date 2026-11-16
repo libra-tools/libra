@@ -10,6 +10,10 @@ libra pull [--ff-only] [--ff] [--no-ff] [--squash] [--no-commit] [--commit] [--a
 
 ## 说明
 
+属性来源不可读或工作区路径不安全时，预检以 `LBR-IO-001` 停止，并保留具体原因，便于修复后重试。
+
+`pull` 使用的 merge 预检遵循显式 `text`/`eol` clean 比较。工作区 CRLF 转换后等于索引 LF 内容时，不会阻止 `pull --ff-only`；真实本地修改仍会拒绝不安全的整合。fetch 与 merge 策略不变。 `text=auto` 同样使用该比较链路，并保留二进制探测和历史 CRLF 索引保护；`--renormalize`、索引读取额度及剩余配置边界见 [add](add.md)。
+
 `libra pull` 组合了 `fetch` 和 `libra merge` 使用的同一合并引擎。它下载新对象，更新远程跟踪引用，然后将选中的 upstream 集成到当前分支。远程 URL 指向 Git v2 bundle 时，每次 pull 都会重新读取该文件，替换 bundle 后可以快进当前分支。
 
 使用 `--rebase`（`-r`）时，集成步骤会改为在获取到的 upstream tip 之上重放仅本地提交。这等价于 `libra fetch` 后跟 `libra rebase <upstream>`。

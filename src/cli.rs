@@ -978,8 +978,20 @@ pub enum Bisect {
 /// - Returns `CliError::fatal` if the runtime itself cannot be constructed (extremely
 ///   unlikely outside of OOM scenarios).
 pub fn parse(args: Option<&[&str]>) -> CliResult<()> {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
+    let argv: Vec<std::ffi::OsString> = match args {
+        Some(args) => args.iter().map(std::ffi::OsString::from).collect(),
+        None => env::args_os().collect(),
+    };
+    let mut runtime_builder = tokio::runtime::Builder::new_multi_thread();
+    runtime_builder.enable_all();
+    if crate::internal::ai::mcp_server::exec::is_read_worker_argv(&argv) {
+        // The private worker serves one read under an address-space ceiling.
+        // A host-sized runtime can exhaust that ceiling before SQLx starts
+        // its SQLite thread. Explicit sizing also overrides the inherited
+        // TOKIO_WORKER_THREADS value; ordinary CLI/server sizing is unchanged.
+        runtime_builder.worker_threads(2);
+    }
+    let runtime = runtime_builder
         .build()
         .map_err(|e| CliError::fatal(format!("failed to create tokio runtime: {e}")))?;
 
@@ -1347,7 +1359,11 @@ fn find_subcommand_index(args: &[std::ffi::OsString]) -> Option<(usize, bool)> {
                 None
             };
         }
-        if matches!(arg, "--color" | "--progress") {
+        if arg == "--color" {
+            i += 1;
+            continue;
+        }
+        if matches!(arg, "--progress" | "--max-connections") {
             i = (i + 2).min(args.len());
             continue;
         }
@@ -1364,6 +1380,80 @@ fn find_subcommand_index(args: &[std::ffi::OsString]) -> Option<(usize, bool)> {
         i += 1;
     }
     None
+}
+
+fn normalize_log_identity_patterns(
+    args: Vec<std::ffi::OsString>,
+) -> (Vec<std::ffi::OsString>, command::log::LogIdentityFilters) {
+    let Some((command_index, _)) = find_subcommand_index(&args) else {
+        return (args, command::log::LogIdentityFilters::default());
+    };
+    if !matches!(
+        args.get(command_index).and_then(|value| value.to_str()),
+        Some("log" | "hist" | "history")
+    ) {
+        return (args, command::log::LogIdentityFilters::default());
+    }
+
+    let mut rewritten = args[..=command_index].to_vec();
+    let mut identity_filters = command::log::LogIdentityFilters::default();
+    let mut author_seen = false;
+    let mut committer_seen = false;
+    let mut index = command_index + 1;
+    while index < args.len() {
+        let Some(token) = args[index].to_str() else {
+            rewritten.push(args[index].clone());
+            index += 1;
+            continue;
+        };
+        if token == "--" {
+            rewritten.extend(args[index..].iter().cloned());
+            break;
+        }
+
+        if let Some(pattern) = token.strip_prefix("--author=") {
+            identity_filters.authors.push(pattern.to_string());
+            if !author_seen {
+                rewritten.push(args[index].clone());
+                author_seen = true;
+            }
+            index += 1;
+            continue;
+        }
+        if let Some(pattern) = token.strip_prefix("--committer=") {
+            identity_filters.committers.push(pattern.to_string());
+            if !committer_seen {
+                rewritten.push(args[index].clone());
+                committer_seen = true;
+            }
+            index += 1;
+            continue;
+        }
+
+        let flag = match token {
+            "--author" => Some((&mut author_seen, &mut identity_filters.authors)),
+            "--committer" => Some((&mut committer_seen, &mut identity_filters.committers)),
+            _ => None,
+        };
+        if let (Some((seen, patterns)), Some(pattern)) = (flag, args.get(index + 1))
+            && let Some(pattern) = pattern.to_str()
+            && !pattern.starts_with('-')
+        {
+            patterns.push(pattern.to_string());
+            if !*seen {
+                rewritten.push(args[index].clone());
+                rewritten.push(args[index + 1].clone());
+                *seen = true;
+            }
+            index += 2;
+            continue;
+        }
+
+        rewritten.push(args[index].clone());
+        index += 1;
+    }
+
+    (rewritten, identity_filters)
 }
 
 fn is_short_number_flag(arg: &str) -> bool {
@@ -3348,6 +3438,7 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
         &<Cli as clap::CommandFactory>::command(),
     );
     let argv = rewrite_bare_stash_args(status_resolution.argv.clone())?;
+    let (argv, log_identity_filters) = normalize_log_identity_patterns(argv);
     // Same reasoning as above, for the consumers below that inspect argv.
     let utf8_argv = utf8_argv_view(&argv);
     reject_unsupported_single_dash_control(&utf8_argv)?;
@@ -3368,6 +3459,23 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
             }
             _ => return Err(classify_parse_error(&argv, &err)),
         },
+    };
+    let log_diff_format_positions = if matches!(&args.command, Commands::Log(_)) {
+        let parsed_matches = <Cli as clap::CommandFactory>::command()
+            .try_get_matches_from(argv.clone())
+            .map_err(|error| {
+                CliError::fatal(format!(
+                    "failed to recover log option order after successful CLI parsing: {error}"
+                ))
+                .with_stable_code(crate::utils::error::StableErrorCode::InternalInvariant)
+            })?;
+        let log_matches = parsed_matches.subcommand_matches("log").ok_or_else(|| {
+            CliError::fatal("failed to recover parsed `log` command options")
+                .with_stable_code(crate::utils::error::StableErrorCode::InternalInvariant)
+        })?;
+        Some(command::log::diff_format_positions(log_matches))
+    } else {
+        None
     };
     // Managed hook callbacks run beneath their provider's short timeout.
     // Establish the dual-clock deadline immediately after argv parsing, then
@@ -3493,6 +3601,11 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
         && let Some(refusal) = interrupted_conversion_refusal(storage)
     {
         return Err(refusal);
+    }
+    if preflight.storage.is_some() {
+        // Read-only commands (hash-object without --write, verify-pack) must
+        // never migrate the on-disk schema through a config/filter read.
+        crate::internal::db::set_schema_upgrade_allowed(preflight.upgrade_schema);
     }
     if let Some(storage) = preflight.storage.as_deref() {
         if preflight.set_hash_kind {
@@ -3708,7 +3821,19 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
             Commands::LsFiles(cmd_args) => {
                 command::ls_files::execute_safe(cmd_args, &output).await?
             }
-            Commands::Log(cmd_args) => command::log::execute_safe(cmd_args, &output).await?,
+            Commands::Log(cmd_args) => {
+                let positions = log_diff_format_positions.ok_or_else(|| {
+                    CliError::fatal("failed to recover parsed `log` option order")
+                        .with_stable_code(crate::utils::error::StableErrorCode::InternalInvariant)
+                })?;
+                command::log::execute_safe_with_positions_and_identity_filters(
+                    cmd_args,
+                    &output,
+                    positions,
+                    log_identity_filters,
+                )
+                .await?
+            }
             Commands::Logfile(cmd_args) => {
                 command::logfile::execute_safe(cmd_args, &output).await?
             }

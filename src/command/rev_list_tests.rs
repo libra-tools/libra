@@ -235,14 +235,15 @@ fn test_commit_matches_parent_count_filter() {
     assert!(!commit_matches_parent_count(&merge, single_parent));
 }
 
-#[test]
-fn test_commit_matches_message_uses_regex_or_semantics() {
+#[tokio::test]
+async fn test_commit_matches_message_uses_regex_or_semantics() {
     let mut commit = test_commit(test_hash(0x40), 1);
     commit.message = "Alpha topic".to_string();
     let args =
         RevListArgs::try_parse_from(["rev-list", "--grep", "Beta", "--grep", "Alpha.*topic"])
             .unwrap();
     let filter = rev_list_message_filter(&args)
+        .await
         .expect("valid grep regex")
         .expect("grep filter should be present");
 
@@ -250,6 +251,7 @@ fn test_commit_matches_message_uses_regex_or_semantics() {
 
     let args = RevListArgs::try_parse_from(["rev-list", "--grep", "alpha"]).unwrap();
     let filter = rev_list_message_filter(&args)
+        .await
         .expect("valid grep regex")
         .expect("grep filter should be present");
 

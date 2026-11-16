@@ -164,3 +164,9 @@ P1-05e R21 补强：bounded packed-object 读取改走专用 uncached 递归解�
 commit reads the in-progress merge state for parents and message
 NothingToCommit 按工作树状态分型
 --allow-empty-message 同时绕过空消息与模板未编辑检查
+
+## 显式换行比较（#1062）
+
+`commit -a` 自动暂存已跟踪文件时使用显式 `text`/`eol` clean 比较。单纯 CRLF/LF 表示差异不会产生内容修改，也不会使本应为空的提交得以创建。真实编辑通过与 `add` 相同的转换暂存。 `text=auto` 同样使用该比较链路，并保留二进制探测和历史 CRLF 索引保护；`--renormalize`、索引读取额度及剩余配置边界见 [add](add.md)。
+
+调用现有共享状态入口并消费 `worktree_conversion` 的显式策略；保留原始快照/物化 API，未将其它命令的 raw blob 读取批量改成 clean。属性版本变化及读取失败不得复用旧的 clean 结论。回归位于既有 `command_test` 对应模块的 `i1062_` 用例（am 为 `worktree_isolation_test`）。

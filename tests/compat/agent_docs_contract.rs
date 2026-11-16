@@ -1837,9 +1837,12 @@ fn pi_observe_docs_disclose_trust_gate_and_no_install() {
             &[
                 "`libra agent hooks pi observe`",
                 "only while Pi reports the project as trusted",
-                "stores only lifecycle metadata",
-                "no Pi content",
-                "`agent enable` does not install that extension yet",
+                "stores lifecycle metadata for the session start, each run started by a user message, and tool events",
+                "each run started by a user message",
+                "the run terminal",
+                "commits one checkpoint from the session file on a non-aborted settle",
+                "keeps the redacted prompts, answers and thinking as partial and unproven data",
+                "`libra agent enable --agent pi` installs the Libra-owned project extension",
             ][..],
         ),
         (
@@ -1848,9 +1851,10 @@ fn pi_observe_docs_disclose_trust_gate_and_no_install() {
             &[
                 "`libra agent hooks pi observe`",
                 "只在 Pi 报告项目受信时",
-                "只为会话开始与 tool 事件保存生命周期元数据",
-                "不保存任何 Pi 内容",
-                "`agent enable` 暂不安装该 extension",
+                "receiver 为会话开始与 tool 事件保存生命周期元数据",
+                "在未中止的 settle 上从会话文件提交一个 checkpoint",
+                "以 partial、unproven 数据保留脱敏后的提示、回答与 thinking",
+                "`libra agent enable --agent pi` 安装 Libra 自有的项目 extension",
             ][..],
         ),
         (
@@ -1859,7 +1863,7 @@ fn pi_observe_docs_disclose_trust_gate_and_no_install() {
             &[
                 "`agent hooks pi observe`",
                 "while the project is trusted",
-                "`agent enable` does not install the extension yet",
+                "`agent enable --agent pi` installs",
             ][..],
         ),
         (
@@ -1868,6 +1872,10 @@ fn pi_observe_docs_disclose_trust_gate_and_no_install() {
             &[
                 "`HookProvider::lower_native_frame`",
                 "`write_owned_pi_asset`",
+                "`remove_owned_pi_asset`",
+                "`diagnose_pi_project`",
+                "read_pi_session_source_until",
+                "`PiLiveCapture`",
             ][..],
         ),
         (
@@ -1887,7 +1895,8 @@ fn pi_observe_docs_disclose_trust_gate_and_no_install() {
         }
     }
     // The observe hook stores lifecycle metadata, so no page may still say
-    // that only the explicit import stores Pi sessions at all.
+    // that only the explicit import stores Pi sessions at all, or that the
+    // hook records only the session start and tool events.
     for (label, document, stale) in [
         (
             "docs/commands/agent.md",
@@ -1914,10 +1923,21 @@ fn pi_observe_docs_disclose_trust_gate_and_no_install() {
             AGENT_DEV_DOC,
             "only the explicit import of PI-10 stores its sessions.",
         ),
+        // PI-12 records a user message's run start too.
+        (
+            "docs/commands/agent.md",
+            AGENT_CMD_DOC_EN,
+            "lifecycle metadata for the session start and tool events",
+        ),
+        (
+            "docs/commands/zh-CN/agent.md",
+            AGENT_CMD_DOC_ZH,
+            "只为会话开始与 tool 事件保存",
+        ),
     ] {
         assert!(
             !document.contains(stale),
-            "{label} still says only the import stores Pi sessions: {stale}"
+            "{label} still carries a stale Pi observe sentence: {stale}"
         );
     }
 }

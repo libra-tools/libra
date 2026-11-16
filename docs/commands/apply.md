@@ -6,9 +6,9 @@ Git-compatible subset of `git apply`.
 ## Synopsis
 
 ```
-libra apply [--check] [--stat] [-R] [--3way] [--index]
-            [--include=<pat>...] [--exclude=<pat>...] [--directory=<dir>]
-            [-p<n>] [<patch>...]
+libra apply [--check] [--stat | --numstat | --summary] [--apply] [-R]
+            [--3way] [--index] [--include=<pat>...] [--exclude=<pat>...]
+            [--directory=<dir>] [-p<n>] [<patch>...]
 ```
 
 ## Description
@@ -24,6 +24,9 @@ are given), splits them into per-file sections, and for each file:
    first write), then atomically replaces each target.
 
 Without `--check` the working tree is written. `--check` validates only.
+`--stat`, `--numstat`, and `--summary` print a report and do not apply unless
+`--apply` is also given (in which case the report is printed first, then the
+patch is applied). `-R`/`--reverse` applies the patch backwards.
 A patch that does not apply reports the first failing target and exits 1 without
 writing.
 
@@ -38,10 +41,16 @@ Patches larger than 64 MiB are rejected.
 | Option | Description | Example |
 |--------|-------------|---------|
 | `--check` | Validate without writing. | `libra apply --check fix.patch` |
-| `--stat` | Print a diffstat and exit without applying. | `libra apply --stat fix.patch` |
+| `--stat` | Print a Git-style diffstat and exit without applying. | `libra apply --stat fix.patch` |
+| `--numstat` | Print `insertions\tdeletions\tpath` and exit without applying. | `libra apply --numstat fix.patch` |
+| `--summary` | Print create/delete/mode-change lines and exit without applying. | `libra apply --summary fix.patch` |
+| `--apply` | Apply even with a report flag: print the report first, then apply. | `libra apply --stat --apply fix.patch` |
 | `-R`, `--reverse` | Apply the patch in reverse (swap old/new sides). | `libra apply -R fix.patch` |
-| `--3way` | Three-way fallback using the patch's `index` blobs when a hunk does not apply; conflicting merges leave markers and warn. | `libra apply --3way fix.patch` |
-| `--index` | Stage the patched paths after writing. | `libra apply --index fix.patch` |
+| `--3way` | Three-way fallback using the patch's `index` blobs when a hunk does not apply. A clean merge prints `Applied patch to '<path>' cleanly.`, stages the result (implies `--index`), and exits 0; a conflict writes markers plus unmerged stages and exits 1; a missing pre-image blob fails without writing. | `libra apply --3way fix.patch` |
+| `--index` | Require the working tree to match the index for every touched path (`<path>: does not match index` otherwise, with no writes), then update both. | `libra apply --index fix.patch` |
+| `--cached` | Update only the index; never touch the working tree. Incompatible with `--index`. | `libra apply --cached fix.patch` |
+`--include`/`--exclude` are matched in command-line order and the first matching pattern decides (Git wildmatch).
+
 | `--include=<pat>` | Only apply sections whose target matches the pattern. | `libra apply --include='src/*' fix.patch` |
 | `--exclude=<pat>` | Skip sections whose target matches the pattern. | `libra apply --exclude='docs/*' fix.patch` |
 | `--directory=<dir>` | Prepend a directory to every patched path (it must exist). | `libra apply --directory=build fix.patch` |

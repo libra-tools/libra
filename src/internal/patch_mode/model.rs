@@ -214,7 +214,9 @@ pub fn split_hunk(hunk: &Hunk) -> Option<Vec<Hunk>> {
         let lead_new = new_lines_in(&hunk.lines[start..range.start]);
         let old_start = old_cursor.saturating_sub(lead_old);
         let new_start = new_cursor.saturating_sub(lead_new);
-        let header = format!("@@ -{old_start},{old_count} +{new_start},{new_count} @@");
+        let header = crate::utils::diff_format::format_hunk_header(
+            old_start, old_count, new_start, new_count,
+        );
         let island_old = old_lines_in(&hunk.lines[range.clone()]);
         let island_new = new_lines_in(&hunk.lines[range.clone()]);
         consumed_old += island_old;

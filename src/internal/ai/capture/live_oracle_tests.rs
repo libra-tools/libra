@@ -106,12 +106,7 @@ impl Drop for OracleEnvGuard {
 /// `libra` binary Cargo builds beside this test executable. It is launched
 /// once up front so first-launch OS checks cannot consume the export budget.
 fn oracle_helper_program() -> PathBuf {
-    let program = std::env::current_exe()
-        .expect("locate the unit-test executable")
-        .parent()
-        .and_then(Path::parent)
-        .map(|profile| profile.join("libra"))
-        .expect("unit-test executable lives in a Cargo profile directory");
+    let program = crate::utils::test::real_libra_helper_binary();
     assert!(
         program.is_file(),
         "the OpenCode leg needs the `libra` binary next to the unit-test executable; \

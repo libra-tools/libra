@@ -139,9 +139,11 @@ pub fn parse_edited_buffer(text: &str, original: &Hunk) -> Result<EditedHunk, Pa
     let (old_lines, new_lines) = line_counts(&parsed.lines);
     parsed.old_lines = old_lines;
     parsed.new_lines = new_lines;
-    parsed.header = format!(
-        "@@ -{},{} +{},{} @@",
-        parsed.old_start, parsed.old_lines, parsed.new_start, parsed.new_lines
+    parsed.header = crate::utils::diff_format::format_hunk_header(
+        parsed.old_start,
+        parsed.old_lines,
+        parsed.new_start,
+        parsed.new_lines,
     );
     if let Some(suffix) = original
         .header

@@ -1,8 +1,9 @@
-//! Read-only worktree and object-store request handler.
+//! Capability-bound worktree comparison and object-store request handler.
 //!
 //! This module owns the actual capability-bound filesystem operations used by
 //! the bounded executor. It deliberately depends on utilities and the wire
-//! protocol only, so it can be reused by status and other read-only callers.
+//! protocol only. Conversion-state requests may maintain a disposable stat
+//! certificate; object and worktree content requests remain read-only.
 
 use std::{
     cell::RefCell,
@@ -12,9 +13,10 @@ use std::{
 };
 
 use super::protocol::{
-    CapRequest, CapturedStat, Dirent, FRAME_CAP, IoEvent, IoRequest, ObjectBlobStatus,
-    ObjectStoreCapability, ReadDirListing, WireResult, WorktreeRootCapability, bytes_to_path,
-    kind_to_u8, path_to_bytes, read_frame, wire_result, write_frame,
+    CapRequest, CapturedStat, ConversionIndex, ConversionStateResult, Dirent, FRAME_CAP, IoEvent,
+    IoRequest, ObjectBlobStatus, ObjectStoreCapability, ReadDirListing, WireResult,
+    WorktreeRootCapability, bytes_to_path, kind_to_u8, path_to_bytes, read_frame, wire_result,
+    write_frame,
 };
 
 pub(crate) const WORKER_ARG: &str = "--libra-internal-status-io-worker";
@@ -42,8 +44,12 @@ fn seal_worktree_capability(request: &IoRequest) -> io::Result<Option<WorktreeRo
         | IoRequest::CanonicalizePair { root, .. }
         | IoRequest::ReadDir { root, .. }
         | IoRequest::FileBlobHash { root, .. }
+        | IoRequest::CleanFileBlobHash { root, .. }
+        | IoRequest::ConversionState { root, .. }
         | IoRequest::MarkerProbe { root, .. } => root,
-        IoRequest::ReadObjectBlob { .. } | IoRequest::Shutdown => return Ok(None),
+        IoRequest::ReadObjectBlob { .. }
+        | IoRequest::ReadConversionIndex { .. }
+        | IoRequest::Shutdown => return Ok(None),
     };
     HELPER_WORKTREE_CAPABILITY.with(|slot| {
         if let Some((cached_root, capability)) = slot.borrow().as_ref()
@@ -252,6 +258,93 @@ pub(crate) fn handle_request(request: IoRequest, stdout: &mut impl Write) -> io:
                 },
             };
             write_frame(stdout, &IoEvent::DoneHash { hex: result })?;
+        }
+        IoRequest::CleanFileBlobHash {
+            path,
+            hash_kind,
+            root_session,
+            attributes,
+            index,
+            ..
+        } => {
+            write_frame(stdout, &IoEvent::Begin)?;
+            let capability = worktree_capability
+                .as_ref()
+                .ok_or_else(|| io::Error::other("missing conversion worktree capability"))?;
+            let relative = capability.relative(&bytes_to_path(&path))?;
+            let result = (|| {
+                apply_hash_kind(&hash_kind)?;
+                let root = crate::utils::beneath::open_root(capability.root())?;
+                crate::utils::worktree_conversion::hash_clean_blob_beneath(
+                    capability.root(),
+                    &root,
+                    &relative,
+                    &attributes,
+                    (root_session != 0).then_some(root_session),
+                    || read_conversion_index_local(index.as_ref()),
+                )
+                .map(|hash| hash.to_string())
+            })();
+            let detail = result.as_ref().err().map(ToString::to_string);
+            write_frame(
+                stdout,
+                &IoEvent::DoneCleanHash {
+                    hex: wire_result(result),
+                    detail,
+                },
+            )?;
+        }
+        IoRequest::ConversionState {
+            directories,
+            attributes,
+            cache_root,
+            index_key,
+            record,
+            ..
+        } => {
+            write_frame(stdout, &IoEvent::Begin)?;
+            let capability = worktree_capability
+                .as_ref()
+                .ok_or_else(|| io::Error::other("missing conversion worktree capability"))?;
+            let result = (|| {
+                let root = crate::utils::beneath::open_root(capability.root())?;
+                let directories = directories
+                    .iter()
+                    .map(|bytes| bytes_to_path(bytes))
+                    .collect::<Vec<_>>();
+                crate::utils::worktree_conversion::conversion_stat_certificate(
+                    capability.root(),
+                    &root,
+                    &directories,
+                    &attributes,
+                    &bytes_to_path(&cache_root),
+                    &index_key,
+                    record.as_deref(),
+                )
+                .map(|(sources, valid)| ConversionStateResult::Attributes { sources, valid })
+            })();
+            let detail = result.as_ref().err().map(ToString::to_string);
+            write_frame(
+                stdout,
+                &IoEvent::DoneConversionState {
+                    result: wire_result(result),
+                    detail,
+                },
+            )?;
+        }
+        IoRequest::ReadConversionIndex { index, hash_kind } => {
+            write_frame(stdout, &IoEvent::Begin)?;
+            let result = apply_hash_kind(&hash_kind)
+                .and_then(|()| read_conversion_index_local(Some(&index)))
+                .map(|has_text_crlf| ConversionStateResult::IndexBlob { has_text_crlf });
+            let detail = result.as_ref().err().map(ToString::to_string);
+            write_frame(
+                stdout,
+                &IoEvent::DoneConversionState {
+                    result: wire_result(result),
+                    detail,
+                },
+            )?;
         }
         IoRequest::ReadObjectBlob {
             oid,
@@ -618,6 +711,36 @@ fn maybe_test_slow_object_read(oid: &str) {
         return;
     }
     std::thread::sleep(Duration::from_millis(ms));
+}
+
+/// Auto history proof is bounded in the helper and never hydrates or creates
+/// storage. A missing index object is an error, not proof of LF content.
+pub(crate) fn read_conversion_index_local(index: Option<&ConversionIndex>) -> io::Result<bool> {
+    use git_internal::internal::object::types::ObjectType;
+
+    use crate::utils::client_storage::ClientStorage;
+    const MAX_INDEX_PROOF_BYTES: u64 = 32 * 1024 * 1024;
+    let Some(index) = index else {
+        return Ok(false);
+    };
+    let read = || -> io::Result<bool> {
+        maybe_test_slow_object_read(&index.oid);
+        let hash =
+            crate::internal::object_format::parse_repo_oid(&index.oid).map_err(io::Error::other)?;
+        let capability = ObjectStoreCapability::seal(&bytes_to_path(&index.objects_root))?;
+        let storage =
+            ClientStorage::init_local_existing_with_alternates(capability.root().to_path_buf());
+        let (bytes, kind) = storage
+            .get_typed_with_limit(&hash, MAX_INDEX_PROOF_BYTES)
+            .map_err(io::Error::other)?;
+        Ok(kind == ObjectType::Blob && crate::utils::worktree_conversion::has_text_crlf(&bytes))
+    };
+    // Do not expose NotFound: status would otherwise classify a missing index
+    // object as a deleted worktree path.
+    read().map_err(|error| io::Error::other(format!(
+        "cannot inspect index object {} for automatic line-ending conversion: {error}; restore readable local objects within the 32 MiB evidence limit, or use add --renormalize to explicitly replace historical content",
+        index.oid
+    )))
 }
 
 pub(crate) fn read_object_blob_request(

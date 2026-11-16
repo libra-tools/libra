@@ -21,6 +21,8 @@ libra commit --no-agent-trailer -m <MESSAGE>
 
 ## Description
 
+Automatic tracked-file staging with `commit -a` uses explicit `text`/`eol` clean comparison. A CRLF/LF representation difference alone does not create a content change or permit an otherwise empty commit. Real edits are staged through the same conversion used by `add`. `text=auto` uses the same comparison with binary detection and protection for historical CRLF index content. See [add](add.md) for `--renormalize`, bounded index evidence reads and remaining configuration limits.
+
 `libra commit` creates a new commit from staged changes, builds tree and commit objects,
 validates messages (including optional conventional commit format and GPG signing via vault),
 and updates HEAD and refs.
@@ -288,7 +290,11 @@ Automatically stage tracked files that have been modified or deleted before comm
 Equivalent to running `libra add -u` before `libra commit`. Does not add new untracked files.
 File modes follow `core.filemode`: with `true` (the Unix default) a mode-only change to a
 tracked regular file is committed too, while `false` ignores it (an invalid value fails the
-commit closed).
+commit closed). Like Git, `-a` also re-records the index stat of tracked files whose content is
+unchanged, so a file that was only touched is not reported by `diff-files`/`diff-index` after
+the commit. Unlike Git, which rolls the refresh back when the commit is refused, Libra writes
+the index before the commit runs (as it does for auto-staged content), so the refreshed stat is
+kept even when `commit -a` then stops with `nothing to commit`.
 
 Removing the LAST tracked file is still a real change to commit: even though the index
 becomes empty, `commit -a` (or `libra add -A && libra commit`) records the deletion rather

@@ -197,7 +197,7 @@ fn open_lock_file(path: &Path) -> CliResult<File> {
             .with_stable_code(StableErrorCode::IoWriteFailed)
         })?;
     }
-    File::options()
+    let file = File::options()
         .create(true)
         .truncate(false)
         .write(true)
@@ -208,7 +208,11 @@ fn open_lock_file(path: &Path) -> CliResult<File> {
                 path.display()
             ))
             .with_stable_code(StableErrorCode::IoWriteFailed)
-        })
+        })?;
+    if let Ok(Some(shared)) = crate::utils::shared_perm::get_shared_mode_for_path(path) {
+        let _ = crate::utils::shared_perm::adjust_shared_perm(path, &shared);
+    }
+    Ok(file)
 }
 
 /// Refuse when the pathname we just opened resolves to a DIFFERENT file than

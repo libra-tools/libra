@@ -55,6 +55,14 @@ pub enum NotesSubcommand {
         #[clap(short = 'F', long)]
         file: Vec<String>,
 
+        /// Reuse the blob content of the given object as the note.
+        #[clap(short = 'C', long = "reuse-message", value_name = "OBJECT")]
+        reuse_message: Vec<String>,
+
+        /// Reuse the blob content of the given object and edit it.
+        #[clap(short = 'c', long = "reedit-message", value_name = "OBJECT")]
+        reedit_message: Option<String>,
+
         /// Overwrite an existing note
         #[clap(short, long)]
         force: bool,
@@ -72,6 +80,14 @@ pub enum NotesSubcommand {
         /// Read note message from file (- for stdin)
         #[clap(short = 'F', long)]
         file: Vec<String>,
+
+        /// Reuse the blob content of the given object as the appended text.
+        #[clap(short = 'C', long = "reuse-message", value_name = "OBJECT")]
+        reuse_message: Vec<String>,
+
+        /// Reuse the blob content of the given object and edit it.
+        #[clap(short = 'c', long = "reedit-message", value_name = "OBJECT")]
+        reedit_message: Option<String>,
     },
     /// Set (replace) an object's note, creating it if absent
     Edit {
@@ -294,6 +310,8 @@ pub async fn execute_safe(
             object,
             message: _,
             file: _,
+            reuse_message: _,
+            reedit_message: _,
             force,
         } => {
             let target = object.as_deref().unwrap_or("HEAD");
@@ -302,7 +320,7 @@ pub async fn execute_safe(
             // was not given, abort early (before opening the editor) just as the
             // `-m` path would.
             let content = if note_content_parts_present(argv) {
-                build_note_content(argv)?
+                build_note_content(argv).await?
             } else {
                 let initial = match notes::show(notes_ref, Some(target)).await {
                     Ok((_, object, note)) => {
@@ -334,11 +352,13 @@ pub async fn execute_safe(
             object,
             message: _,
             file: _,
+            reuse_message: _,
+            reedit_message: _,
         } => {
             let target = object.as_deref().unwrap_or("HEAD");
             // Without `-m`/`-F`, compose the appended text in an editor.
             let new_content = if note_content_parts_present(argv) {
-                build_note_content(argv)?
+                build_note_content(argv).await?
             } else {
                 compose_note_via_editor("", target).await?
             };
@@ -372,7 +392,7 @@ pub async fn execute_safe(
             // `-m`/`-F`, open an editor pre-filled with the existing note.
             let target = object.as_deref().unwrap_or("HEAD");
             let content = if note_content_parts_present(argv) {
-                build_note_content(argv)?
+                build_note_content(argv).await?
             } else {
                 let existing = match notes::show(notes_ref, Some(target)).await {
                     Ok((_, _, note)) => note,
@@ -511,6 +531,8 @@ pub async fn execute_safe(
 enum ContentPart {
     Message(String),
     File(String),
+    Reuse(String),
+    Reedit(String),
 }
 
 /// Walk the raw process arguments to rebuild the original `-m`/`-F` occurrence
@@ -544,13 +566,50 @@ fn ordered_content_parts(argv: &[String]) -> Vec<ContentPart> {
             parts.push(ContentPart::Message(val.to_string()));
         } else if let Some(val) = arg.strip_prefix("--file=") {
             parts.push(ContentPart::File(val.to_string()));
+        } else if arg == "-C" || arg == "--reuse-message" {
+            i += 1;
+            if i < argv.len() {
+                parts.push(ContentPart::Reuse(argv[i].clone()));
+            }
+        } else if arg == "-c" || arg == "--reedit-message" {
+            i += 1;
+            if i < argv.len() {
+                parts.push(ContentPart::Reedit(argv[i].clone()));
+            }
+        } else if let Some(val) = arg.strip_prefix("--reuse-message=") {
+            parts.push(ContentPart::Reuse(val.to_string()));
+        } else if let Some(val) = arg.strip_prefix("--reedit-message=") {
+            parts.push(ContentPart::Reedit(val.to_string()));
+        } else if let Some(val) = arg.strip_prefix("-C")
+            && !val.is_empty()
+        {
+            parts.push(ContentPart::Reuse(val.to_string()));
+        } else if let Some(val) = arg.strip_prefix("-c")
+            && !val.is_empty()
+        {
+            parts.push(ContentPart::Reedit(val.to_string()));
         }
         i += 1;
     }
     parts
 }
 
-fn build_note_content(argv: &[String]) -> CliResult<String> {
+async fn reused_blob_text(object: &str) -> CliResult<String> {
+    let hash = crate::utils::util::resolve_object_spec_typed(object)
+        .await
+        .map_err(|error| {
+            CliError::fatal(format!("invalid object '{object}': {error}"))
+                .with_stable_code(StableErrorCode::CliInvalidTarget)
+        })?;
+    let blob = crate::command::load_object::<git_internal::internal::object::blob::Blob>(&hash)
+        .map_err(|error| {
+            CliError::fatal(format!("failed to load object '{object}': {error}"))
+                .with_stable_code(StableErrorCode::RepoCorrupt)
+        })?;
+    Ok(String::from_utf8_lossy(&blob.data).into_owned())
+}
+
+async fn build_note_content(argv: &[String]) -> CliResult<String> {
     let ordered = ordered_content_parts(argv);
 
     let mut parts: Vec<String> = Vec::new();
@@ -558,6 +617,11 @@ fn build_note_content(argv: &[String]) -> CliResult<String> {
     for part in &ordered {
         match part {
             ContentPart::Message(msg) => parts.push(msg.clone()),
+            ContentPart::Reuse(object) => parts.push(reused_blob_text(object).await?),
+            ContentPart::Reedit(object) => {
+                let initial = reused_blob_text(object).await?;
+                parts.push(compose_note_via_editor(&initial, object).await?);
+            }
             ContentPart::File(file_path) => {
                 let data = if file_path == "-" {
                     std::io::read_to_string(std::io::stdin())
@@ -725,14 +789,10 @@ fn render_output(result: &NotesOutput, output: &OutputConfig) -> CliResult<()> {
         } => {
             for entry in notes {
                 match &entry.note_hash {
-                    Some(hash) if *object_scoped => println!("{}", short_display_hash(hash)),
-                    Some(hash) => println!(
-                        "{} {}",
-                        short_display_hash(hash),
-                        short_display_hash(&entry.annotated_object)
-                    ),
+                    Some(hash) if *object_scoped => println!("{hash}"),
+                    Some(hash) => println!("{hash} {}", entry.annotated_object),
                     None if *object_scoped => println!("(none)"),
-                    None => println!("(none) {}", short_display_hash(&entry.annotated_object)),
+                    None => println!("(none) {}", entry.annotated_object),
                 }
             }
         }

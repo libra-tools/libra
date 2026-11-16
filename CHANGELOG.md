@@ -20,6 +20,10 @@
   still refuses a `/.traces/` locator, and a Mega2 code mirror still fetches
   branch tips only. This note records the code delivery. It is not a GitHub
   Release, and the live HTTP/SSH audit is not claimed here.
+- `traces search` and `traces transcript` now call Mega2's mounted per-stream
+  routes: `search` requires `--stream` (unsupported filters are refused
+  locally; the route owns the body budget), and `transcript` accepts an
+  optional `--session` and resolves it from the checkpoint when omitted.
 
 ### Changed
 
@@ -36,6 +40,15 @@
   to zero bytes as `D`; both are modifications (`M`) with an all-zero worktree
   id, matching Git. The status letter now follows entry presence, never content
   emptiness (issues/479 DF-01, TC-0044).
+- `add <pathspec>`, `add -u`, `add -A` and `commit -a` now re-record the `stat`
+  of matched tracked files whose content is unchanged, as Git does. Before, a
+  file touched without a content change stayed stat-dirty after staging, so
+  `diff-files` / `diff-index` kept reporting it as `M` with an all-zero worktree
+  id right after `add` or `commit -a` (issues/479 TC-0044, upstream
+  `t3700-add.sh#24`; the `add -u` half of #660).
+- `add --refresh` no longer prints `refreshed N file(s)` when stdout is
+  redirected or piped; like every other successful `add`, the summary is
+  TTY-only (or `-v`), so scripts see Git's empty stdout (#659, TC-0021).
 - `update-ref --stdin -z` now uses Git's wire format: NUL separates a command's
   **arguments** (`create <ref> NUL <newvalue> NUL`) instead of terminating
   records, so Git-generated input parses, values may contain spaces (for example
@@ -55,6 +68,30 @@
   Libra has no assume-unchanged semantics, so its refresh clears the bit from
   every stage-0 entry it examines. Git's `--refresh` keeps the bit; Libra's
   does not. See `docs/commands/update-index.md`.
+
+## [0.30.146] — 2026-11-03
+
+### Changed
+
+- Release record for issues/479 UR-01. `update-ref --stdin -z` separates
+  fields with NUL, so `create <ref> NUL <oid> NUL` succeeds and a value
+  may contain spaces. That behavior shipped before v0.30.134.
+  v0.30.145 is the Pi live-event release and is not part of this plan.
+
+## [0.30.144] — 2026-11-03
+
+### Changed
+
+- Release record for issues/479 SR-01. `symbolic-ref -d` and `--delete`
+  delete a symbolic ref, and refuse `HEAD` and a non-symbolic ref. That
+  behavior shipped before v0.30.134.
+
+## [0.30.143] — 2026-11-03
+
+### Changed
+
+- Release record for issues/479 UI-03. `update-index` accepts `--chmod`,
+  `--info-only`, and `--verbose`. That behavior shipped before v0.30.134.
 
 ## [0.30.142] — 2026-11-03
 

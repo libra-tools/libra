@@ -56,4 +56,8 @@ git format-patch -1 --stdout | libra apply --check
 | 检查补丁 | `libra apply --check p` | `git apply --check p` |
 | 路径剥离 | `libra apply --check -p0 p` | `git apply --check -p0 p` |
 
-差异与延后项：真正应用补丁（不带 `--check`）、`--index` / `--cached`、`--3way`、`--reverse`、`--unidiff-zero`、二进制补丁、rename/mode hunk 暂不支持。绝不写入冲突标记 —— `--check` 只报告。
+默认会先完整准备补丁再原子写入工作树；`--check` 只校验。`--stat`/`--numstat`/`--summary`
+只输出报告，配合 `--apply` 时先报告再应用。`--index` 要求受影响路径的工作树与索引一致
+（否则 `<path>: does not match index` 且零写入），成功后同时更新索引与工作树；`--cached`
+只更新索引。`--include`/`--exclude` 按命令行顺序首个匹配决定是否使用该路径。`-R` 反向应用。
+仍未实现：`--unidiff-zero`、部分 `--whitespace`/`--reject` 细节。

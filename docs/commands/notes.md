@@ -39,6 +39,13 @@ Omitting a subcommand defaults to `list`.
 
 Bare `libra notes`, `list`, `show`, `get-ref`, and `prune --dry-run` do not record an Operation v2 entry. `add`, `append`, `edit`, `copy`, `remove`, `merge`, and `prune` without `--dry-run` still record one (`libra op log --command notes`).
 
+### Reusing note content
+
+`notes add`/`append` accept `-C <object>` (`--reuse-message`) to reuse the
+object's blob bytes as the note, and `-c <object>` (`--reedit-message`) to reuse
+them as an editor prefill. `-C`/`-c` compose with `-m`/`-F` in command-line
+order. `notes list` prints full 40/64-character object ids.
+
 ## Options
 
 | Flag | Long | Value | Description |

@@ -97,6 +97,7 @@ impl BundleClient {
             capabilities: vec![format!("object-format={format}")],
             shallow_boundaries: Vec::new(),
             hash_kind,
+            version: super::ProtocolVersion::V0,
         })
     }
 

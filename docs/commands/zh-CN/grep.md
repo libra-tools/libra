@@ -12,7 +12,7 @@ libra grep -f <file> [-- <pathspec>...]
 
 ## 说明
 
-`libra grep` 在已跟踪文件中搜索文本模式。默认搜索工作树，但也可以搜索索引（`--cached`）或特定修订（`--tree <revision>`）。除非指定 `--fixed-string`，否则模式按正则表达式解释。
+`libra grep` 在已跟踪文件中搜索文本模式。默认搜索工作树，但也可以搜索索引（`--cached`）或特定修订（`--tree <revision>`）。除非指定 `--fixed-strings`，否则模式按正则表达式解释。
 
 可以通过多个 `-e` 标志提供多个模式，或通过 `-f` 从文件读取。存在多个活动模式时，只要某个文件至少有一行匹配任一模式，该文件即匹配（OR 语义）。使用 `--all-match` 时，只有每个模式都至少在该文件中匹配一次，文件才会被包含（模式之间的 AND 语义，不是行之间的 AND）。
 
@@ -26,6 +26,12 @@ libra grep -f <file> [-- <pathspec>...]
 
 退出码遵循 Git 的 grep 合同：有匹配时退出 0；没有选中匹配时退出 1，且不打印错误诊断；grep 命令错误（例如无效正则、不支持的 `-P`、缺失 pattern 文件或无效 `--tree` 修订）退出 2。仓库模式在 Libra 仓库外运行等仓库预检错误仍使用标准 Libra fatal 退出码。
 
+## 布尔表达式
+
+`-e` 模式（与位置模式）由 `--and`、`--or`、`--not` 与括号 `(` `)` 组成布尔表达式；
+优先级 `--not` > `--and` > `--or`，相邻操作数之间为隐式 `--or`。语法错误
+（悬空运算符、括号不配对、空分组）为用法错误且零输出。
+
 ## 选项
 
 | 标志 | 短选项 | 长选项 | 说明 |
@@ -34,7 +40,10 @@ libra grep -f <file> [-- <pathspec>...]
 | Regexp | `-e` | `--regexp <PATTERN>` | 添加要搜索的模式。可多次指定。 |
 | Pattern file | `-f` | `--file <FILE>` | 从文件读取模式，每行一个。可多次指定。 |
 | All match | | `--all-match` | 要求所有模式都至少在一个文件中匹配一次，该文件才会被包含。 |
-| Fixed string | `-F` | `--fixed-string` | 将模式视为字面字符串，而不是正则表达式。 |
+| 显示函数 | `-p` | `--show-function` | 在每个匹配行前输出最近的函数头，格式 `<path>=<header>`。 |
+| 函数上下文 | `-W` | `--function-context` | 输出匹配所在函数的完整范围（函数头 `=`、非匹配行 `-`、匹配行 `:`）。 |
+| 数字上下文 | `-<n>` | | 等价于 `-C <n>`（`-1`..`-9`），后出现的上下文标志生效。 |
+| Fixed string | `-F` | `--fixed-strings` | 将模式视为字面字符串，而不是正则表达式。 |
 | Ignore case | `-i` | `--ignore-case` | 执行大小写不敏感匹配。 |
 | Count | `-c` | `--count` | 只显示每个文件的匹配行数。 |
 | Files with matches | `-l` | `--files-with-matches` | 只显示包含匹配的文件名。 |
@@ -83,7 +92,7 @@ $ libra grep -e "TODO" -e "FIXME" --all-match
 $ libra grep -f patterns.txt
 ```
 
-**`-F` / `--fixed-string`**
+**`-F` / `--fixed-strings`**
 
 将模式视为字面字符串。适合搜索包含正则元字符的字符串：
 
@@ -359,7 +368,7 @@ Git 的位置语法（`git grep <pattern> <revision>`）是常见困惑来源，
 
 ### 为什么默认正则？
 
-正则表达式是代码搜索的标准模式语言。多数开发者期望 `grep` 支持正则，Libra 遵循此约定。当正则元字符会造成问题时，可以使用 `--fixed-string` 标志进行字面搜索。
+正则表达式是代码搜索的标准模式语言。多数开发者期望 `grep` 支持正则，Libra 遵循此约定。当正则元字符会造成问题时，可以使用 `--fixed-strings` 标志进行字面搜索。
 
 ### 这与 Git 和 jj 如何比较？
 
@@ -375,7 +384,7 @@ jj 没有内置 grep 命令。用户需要使用外部工具进行文本搜索�
 | 额外模式 | `-e` / `--regexp` | `-e` | N/A |
 | 模式文件 | `-f` / `--file` | `-f` | N/A |
 | All match | `--all-match` | `--all-match` | N/A |
-| 字面字符串 | `-F` / `--fixed-string` | `-F` / `--fixed-strings` | N/A |
+| 字面字符串 | `-F` / `--fixed-strings` | `-F` / `--fixed-strings` | N/A |
 | 忽略大小写 | `-i` / `--ignore-case` | `-i` / `--ignore-case` | N/A |
 | Count | `-c` / `--count` | `-c` / `--count` | N/A |
 | 有匹配的文件 | `-l` / `--files-with-matches` | `-l` / `--files-with-matches` | N/A |

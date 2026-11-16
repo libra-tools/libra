@@ -2,15 +2,15 @@
 
 Internal entry point invoked by external AI agent hook configurations
 that capture lifecycle events (session start, prompt submission, tool
-use, model updates, compaction, stop, session end) into the libra
-session store. Operators almost never type `libra hooks ...` directly —
-the hook configs installed by `libra agent enable` reference these
-sub-commands.
+use, permissions, sub-agent boundaries, model updates, compaction, stop,
+and session end) into the Libra session store. Operators almost never
+type `libra hooks ...` directly — the hook configs installed by
+`libra agent enable` reference these subcommands.
 
 ## Synopsis
 
 ```
-libra hooks claude   {session-start|prompt|tool-use|model-update|compaction|stop|session-end}
+libra hooks claude   {session-start|prompt|tool-use|model-update|compaction|stop|session-end|observe}
 libra hooks codex    {session-start|prompt|tool-use|permission-request|compaction|stop|session-end|subagent-start|subagent-end}
 libra hooks gemini   <event>   # rejected with a hint: gemini is uninstall-only (AG-17)
 ```
@@ -42,11 +42,13 @@ project `.claude/settings.json` by `libra agent enable --agent
 claude-code`, and `libra hooks codex <verb>` (AG-19) is the stable
 surface written into `$CODEX_HOME/hooks.json` by `libra agent enable
 --agent codex`. Both record into the AgentTraces capture store
-(`refs/libra/traces`); claude's historical routing into the
+(`refs/libra/traces`); Claude's historical routing into the
 `refs/libra/intent` writer was retired by the Task A6.5 local capture
 smoke, which requires installed hooks to surface in `libra agent
-session/checkpoint list`. Codex additionally emits native sub-agent
-boundaries (`subagent-start` / `subagent-end`).
+session/checkpoint list`. Codex installs native `PermissionRequest` and
+sub-agent boundary events; Claude installs its safely supported
+`PermissionRequest`, `SubagentStart`, and `SubagentStop` events through
+`observe`.
 
 The installer appends a hidden, bounded `--capture-budget-ms` argument to
 each managed command: it derives the value from the provider handler timeout
@@ -293,22 +295,26 @@ Claude Code recognizes the following lifecycle verbs:
 | `compaction` | Provider compacted its in-memory context |
 | `stop` | User pressed Esc / hit the Stop button mid-turn |
 | `session-end` | Session closed cleanly |
+| `observe` | Other safely installable Claude events, including `PermissionRequest`, `SubagentStart`, and `SubagentStop`; the original provider event name is carried in the JSON payload |
 
 For Claude Code the `tool-use` verb is installed for **both** `PreToolUse`
 (fired before a tool runs — an early liveness signal) and `PostToolUse`
 (fired after the tool returns); both map to the `ToolUse` lifecycle event,
 which refreshes the active session's liveness (last-event) state via the
 capture/traces path but does **not** write a committed checkpoint —
-checkpoints are materialized only at `stop` / `session-end`. No `Subagent*`
-boundary event is registered for Claude (only Codex emits native sub-agent
-boundaries), so Claude's on-disk sub-agent content is captured as `unresolved`.
+checkpoints are materialized only at `stop` / `session-end`. Each
+`SubagentStart` and `SubagentStop` callback writes a separate
+`scope='subagent'` checkpoint; Claude receives them through `observe`, while
+Codex uses its `subagent-start` / `subagent-end` verbs.
 
 ### Codex
 
 Codex has eleven native event names, collapsed to nine command verbs. It has
 no `ModelUpdate` event: configuring `model-update` for Codex is unsupported
-and can be skipped as an unknown callback. `PermissionRequest` and the two
-native sub-agent boundaries are Codex-specific capture events.
+and can be skipped as an unknown callback. Its `PermissionRequest` and two
+native sub-agent events map to the Codex-specific `permission-request`,
+`subagent-start`, and `subagent-end` command verbs; Claude records its
+corresponding supported events through `observe`.
 
 | Codex event name(s) | Installed command verb |
 |---------------------|------------------------|
@@ -369,8 +375,9 @@ libra hooks codex subagent-start
 #   libra hooks gemini <event>  ->  'libra agent remove gemini'
 ```
 
-The Claude Code hook config installed by `libra agent enable --agent
-claude` looks roughly like:
+The following excerpt shows the core Claude Code hooks and the `observe`
+handlers for permission requests and sub-agent boundaries. Enable may install
+other safely supported events as well.
 
 ```json
 {
@@ -379,7 +386,10 @@ claude` looks roughly like:
     "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "<absolute-libra-path> hooks claude prompt --capture-budget-ms 29000", "timeout": 30, "statusMessage": "libra capture"}]}],
     "PreToolUse": [{"hooks": [{"type": "command", "command": "<absolute-libra-path> hooks claude tool-use --capture-budget-ms 29000", "timeout": 30, "statusMessage": "libra capture"}]}],
     "PostToolUse": [{"hooks": [{"type": "command", "command": "<absolute-libra-path> hooks claude tool-use --capture-budget-ms 29000", "timeout": 30, "statusMessage": "libra capture"}]}],
+    "PermissionRequest": [{"hooks": [{"type": "command", "command": "<absolute-libra-path> hooks claude observe --capture-budget-ms 29000", "timeout": 30, "statusMessage": "libra capture"}]}],
     "Stop": [{"hooks": [{"type": "command", "command": "<absolute-libra-path> hooks claude stop --capture-budget-ms 29000", "timeout": 30, "statusMessage": "libra capture"}]}],
+    "SubagentStart": [{"hooks": [{"type": "command", "command": "<absolute-libra-path> hooks claude observe --capture-budget-ms 29000", "timeout": 30, "statusMessage": "libra capture"}]}],
+    "SubagentStop": [{"hooks": [{"type": "command", "command": "<absolute-libra-path> hooks claude observe --capture-budget-ms 29000", "timeout": 30, "statusMessage": "libra capture"}]}],
     "SessionEnd": [{"hooks": [{"type": "command", "command": "<absolute-libra-path> hooks claude session-end --capture-budget-ms 9000", "statusMessage": "libra capture"}]}]
   }
 }

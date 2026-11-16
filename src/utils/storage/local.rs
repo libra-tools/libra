@@ -3927,6 +3927,51 @@ mod tests {
             "mkdir failure must name the operation: {rendered}"
         );
     }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_shared_repository_put_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        use crate::utils::shared_perm::{
+            SharedMode, clear_cached_repo_shared_mode, set_cached_repo_shared_mode,
+        };
+
+        let _kind = git_internal::hash::set_hash_kind_for_test(HashKind::Sha1);
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let storage_root = temp.path().join(".libra");
+        let objects_dir = storage_root.join("objects");
+        fs::create_dir_all(&objects_dir).expect("create objects dir");
+        fs::write(storage_root.join("libra.db"), b"dummy").expect("write db");
+
+        // Set cached shared mode to Group
+        set_cached_repo_shared_mode(storage_root.clone(), Some(SharedMode::Group));
+
+        let storage = LocalStorage::try_new(objects_dir.clone()).expect("storage");
+        let payload = b"shared object content";
+        let object = ObjectHash::from_type_and_data(ObjectType::Blob, payload);
+        let written_path = storage
+            .put(&object, payload, ObjectType::Blob)
+            .await
+            .expect("put object");
+
+        let obj_path = PathBuf::from(written_path);
+        assert!(obj_path.exists());
+        let obj_mode = fs::metadata(&obj_path).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(
+            obj_mode, 0o444,
+            "loose object mode must be 0444 in shared repo"
+        );
+
+        let parent_dir = obj_path.parent().unwrap();
+        let dir_mode = fs::metadata(parent_dir).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(
+            dir_mode, 0o2775,
+            "fanout directory mode must be 2775 in shared repo"
+        );
+
+        clear_cached_repo_shared_mode(Some(&storage_root));
+    }
 }
 
 #[cfg(test)]

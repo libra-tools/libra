@@ -1,5 +1,34 @@
 //! Test support utilities including change-dir guards, repository setup/cleanup helpers, fixture copying, and isolated command execution helpers.
 
+/// Resolve the real `libra` binary for unit tests that re-exec it.
+///
+/// Cargo 1.100 places a package's test harness under
+/// `target/<profile>/build/<pkg>/<hash>/out`, so walking up a fixed two
+/// levels no longer reaches `target/<profile>`. Walk the ancestors and take
+/// the first directory that actually contains the built binary.
+pub fn real_libra_helper_binary() -> std::path::PathBuf {
+    let exe = std::env::current_exe().expect("locate the unit test binary");
+    let name = format!("libra{}", std::env::consts::EXE_SUFFIX);
+    for ancestor in exe.ancestors().skip(1) {
+        let candidate = ancestor.join(&name);
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    if let Ok(manifest) = std::env::var("CARGO_MANIFEST_DIR") {
+        let candidate = std::path::Path::new(&manifest)
+            .join("target/debug")
+            .join(&name);
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    panic!(
+        "the real Libra helper binary must be built before this focused unit test: exe={}",
+        exe.display()
+    );
+}
+
 use std::{
     cell::Cell,
     env,

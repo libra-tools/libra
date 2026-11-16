@@ -3069,13 +3069,7 @@ mod tests {
     }
 
     fn helper() -> PathBuf {
-        let executable = std::env::current_exe().unwrap();
-        let path = executable
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join(format!("libra{}", std::env::consts::EXE_SUFFIX));
+        let path = crate::utils::test::real_libra_helper_binary();
         assert!(
             path.is_file(),
             "build current-source Libra before local index tests"

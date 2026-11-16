@@ -779,6 +779,16 @@ impl SshClient {
         self
     }
 
+    /// Use `path` verbatim as the remote repository argument.
+    ///
+    /// URL parsing strips the leading `/` of an ordinary repository path.
+    /// A Mega2 traces locator must keep it: the server only resolves
+    /// `/.traces/...` and refuses the relative spelling.
+    pub(crate) fn with_literal_repo_path(mut self, path: String) -> Self {
+        self.repo_path = path;
+        self
+    }
+
     /// Hold a temporary SSH private key file for the lifetime of the client.
     pub fn with_temp_key_file(mut self, temp_key_file: NamedTempFile) -> Self {
         self.temp_key_file = Some(temp_key_file);
@@ -994,6 +1004,17 @@ impl SshClient {
                         None,
                     )
                 })?;
+            // A service that refuses the request answers with one `ERR`
+            // packet instead of an advertisement (Git reports it as a
+            // remote error). Surface its text rather than a truncated read.
+            if buf.len() == 4
+                && let Some(message) = data.strip_prefix(b"ERR ")
+            {
+                return Err(IoError::other(format!(
+                    "remote error: {}",
+                    String::from_utf8_lossy(message).trim_end()
+                )));
+            }
             buf.extend_from_slice(&data);
         }
         Ok(buf.freeze())
@@ -1138,6 +1159,33 @@ impl SshClient {
         depth: Option<usize>,
         expected_boundaries: Option<&[String]>,
     ) -> Result<FetchStream, IoError> {
+        self.upload_pack_exchange(expected_boundaries, |discovery| {
+            generate_upload_pack_content_with_capabilities(
+                have,
+                want,
+                shallow,
+                depth,
+                &discovery.capabilities,
+            )
+        })
+        .await
+    }
+
+    /// Send a caller-built upload-pack request after the advertisement and
+    /// stream the raw response. The Mega2 traces fetch uses this because the
+    /// TraceRepo accepts only the capabilities it advertised.
+    pub(crate) async fn upload_pack_raw(&self, body: Bytes) -> Result<FetchStream, IoError> {
+        self.upload_pack_exchange(None, move |_| Ok(body)).await
+    }
+
+    async fn upload_pack_exchange<F>(
+        &self,
+        expected_boundaries: Option<&[String]>,
+        make_body: F,
+    ) -> Result<FetchStream, IoError>
+    where
+        F: FnOnce(&DiscoveryResult) -> Result<Bytes, IoError>,
+    {
         let mut child = self.spawn_service(ServiceType::UploadPack).await?;
         let advertisement = {
             let stdout = child
@@ -1181,13 +1229,7 @@ impl SshClient {
         }
 
         // Send the upload-pack request
-        let body = match generate_upload_pack_content_with_capabilities(
-            have,
-            want,
-            shallow,
-            depth,
-            &discovery.capabilities,
-        ) {
+        let body = match make_body(&discovery) {
             Ok(body) => body,
             Err(error) => {
                 return Err(

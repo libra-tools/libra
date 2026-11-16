@@ -1562,25 +1562,25 @@ async fn pi_role_stub_refuses_every_read_and_install() {
 
     let row = registration_for(AgentKind::Pi);
     assert!(row.registered);
-    assert!(!row.supported);
-    assert_eq!(row.support_wave, None);
+    assert!(row.supported);
+    assert_eq!(row.support_wave, Some("pi"));
     assert!(!row.transcript_readable);
-    assert!(!row.hook_installable);
+    assert!(row.hook_installable);
     assert!(!row.installed);
     assert!(!row.launchable_review);
     assert!(!row.launchable_investigate);
     assert!(!row.external_binary);
-    assert!(!row.capabilities.hooks);
-    assert!(row.config_paths.is_empty());
-    assert!(!supported_slugs().contains(&"pi"));
-    assert!(matches!(lookup_cli_slug("pi"), SlugLookup::Known(found) if !found.supported));
+    assert!(row.capabilities.hooks);
+    assert_eq!(row.config_paths, [".pi/extensions/libra-hooks.ts"]);
+    assert!(supported_slugs().contains(&"pi"));
+    assert!(matches!(lookup_cli_slug("pi"), SlugLookup::Known(found) if found.supported));
     assert!(!is_preview(AgentKind::Pi));
     assert!(live_capture_matches_hook_installable(AgentKind::Pi));
     assert!(skill_registry_for(AgentKind::Pi).is_empty());
     assert!(truncator_for(AgentKind::Pi).is_none());
     let agent = agent_for(AgentKind::Pi);
     assert_eq!(agent.provider_kind(), AgentKind::Pi);
-    assert!(agent.as_hooks().is_none());
+    assert!(agent.as_hooks().is_some());
     assert_eq!(agent.protected_dirs(), &[".pi"]);
     let read = agent
         .read_transcript(&AgentSessionCtx {
@@ -1635,18 +1635,17 @@ async fn pi_role_stub_refuses_every_read_and_install() {
             "{args:?} changed a file"
         );
     };
-    let unsupported = [
-        "agent 'pi' is not in the supported roster",
-        "cannot be enabled or install hooks",
-    ];
-    refuses_without_writes(&["agent", "enable", "--agent", "pi"], &unsupported);
-    refuses_without_writes(&["agent", "add", "pi"], &unsupported);
-    let no_hooks = [
-        "agent 'pi' is not in the supported roster",
-        "has no hooks to remove",
-    ];
-    refuses_without_writes(&["agent", "disable", "--agent", "pi"], &no_hooks);
-    refuses_without_writes(&["agent", "remove", "pi"], &no_hooks);
+    // Nothing is installed, so disabling is an idempotent no-op with no writes;
+    // CLI enable/disable installation is covered by agent_roster_test.
+    for args in [
+        &["agent", "disable", "--agent", "pi"][..],
+        &["agent", "remove", "pi"][..],
+    ] {
+        let before = repo.files();
+        let disabled = repo.run(args);
+        assert!(disabled.status.success(), "{args:?}");
+        assert_eq!(changed(&before), Vec::<String>::new(), "{args:?} wrote");
+    }
     refuses_without_writes(
         &["agent", "import", "--agent", "pi", "--all"],
         &["Pi import requires --path to one <timestamp>_<session-id>.jsonl session file"],
@@ -1673,7 +1672,10 @@ async fn pi_role_stub_refuses_every_read_and_install() {
     let listing: serde_json::Value =
         serde_json::from_slice(&listed.stdout).expect("agent list --json");
     let agents = listing["data"]["agents"].as_array().expect("agents array");
-    assert!(!agents.iter().any(|agent| agent["slug"] == "pi"));
+    assert!(
+        agents.iter().any(|agent| agent["slug"] == "pi"),
+        "the supported roster now includes pi: {listing}"
+    );
     assert_eq!(
         changed(&before),
         Vec::<String>::new(),

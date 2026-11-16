@@ -1,6 +1,11 @@
 //! Integration smoke tests for the `archive` command output formats.
 
-use std::{fs, io::Read, path::Path};
+use std::{
+    fs,
+    io::Read,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 use super::*;
 
@@ -948,4 +953,396 @@ fn archive_infers_format_from_output_extension() {
         Some(&[0x50, 0x4b][..]),
         "the explicit --format=tar must produce a TAR, not a ZIP"
     );
+}
+
+#[cfg_attr(not(unix), allow(dead_code))]
+#[derive(Debug)]
+struct LogicalTarEntry {
+    path: PathBuf,
+    link_target: Option<PathBuf>,
+    size: u64,
+    content: Vec<u8>,
+}
+
+fn parse_tar_entries<R: Read>(reader: R) -> Vec<LogicalTarEntry> {
+    let mut archive = tar::Archive::new(reader);
+    archive
+        .entries()
+        .expect("failed to read logical tar entries")
+        .map(|entry| {
+            let mut entry = entry.expect("failed to parse logical tar entry");
+            let path = entry
+                .path()
+                .expect("failed to parse logical tar entry path")
+                .into_owned();
+            let link_target = entry
+                .link_name()
+                .expect("failed to parse logical tar link target")
+                .map(|target| target.into_owned());
+            let size = entry.size();
+            let mut content = Vec::new();
+            entry
+                .read_to_end(&mut content)
+                .expect("failed to read logical tar entry content");
+            LogicalTarEntry {
+                path,
+                link_target,
+                size,
+                content,
+            }
+        })
+        .collect()
+}
+
+fn decode_tar_entries(format: &str, data: &[u8]) -> Vec<LogicalTarEntry> {
+    match format {
+        "tar" => parse_tar_entries(data),
+        "tar.gz" => parse_tar_entries(flate2::read::GzDecoder::new(data)),
+        "tar.bz2" => parse_tar_entries(bzip2::read::BzDecoder::new(data)),
+        other => panic!("unsupported tar test format: {other}"),
+    }
+}
+
+fn logical_tar_entry<'a>(entries: &'a [LogicalTarEntry], path: &Path) -> &'a LogicalTarEntry {
+    entries
+        .iter()
+        .find(|entry| entry.path == path)
+        .unwrap_or_else(|| panic!("missing logical tar entry {}", path.display()))
+}
+
+fn system_tar_list(archive: &Path) -> Vec<String> {
+    let output = Command::new("tar")
+        .arg("-tf")
+        .arg(archive)
+        .output()
+        .expect("system tar is required for archive interoperability tests");
+    assert!(
+        output.status.success(),
+        "system tar -tf failed for {}: {}",
+        archive.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("system tar listed non-UTF-8 fixture paths")
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+fn commit_archive_fixture(repo: &Path, paths: &[&str]) {
+    for path in paths {
+        assert_cli_success(
+            &run_libra_command(&["add", path], repo),
+            &format!("failed to add archive fixture {path}"),
+        );
+    }
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "archive fixture", "--no-verify"], repo),
+        "failed to commit archive fixture",
+    );
+}
+
+fn issue1059_long_path() -> String {
+    "aaaaaaaaaa/bbbbbbbbbbbbbbbbbbbb/cccccccccccccccccccccccccccccc/dddddddddddddddddddddddddddddddddddddddddddd/file.txt".to_owned()
+}
+
+fn issue1059_long_prefix() -> String {
+    format!("{}/{}", "p".repeat(55), "q".repeat(55))
+}
+
+#[test]
+fn archive_issue1059_long_tar_path_roundtrip() {
+    let repo = tempdir().expect("failed to create long-path archive repository");
+    init_repo_via_cli(repo.path());
+    configure_identity_via_cli(repo.path());
+
+    let issue_path = issue1059_long_path();
+    assert_eq!(issue_path.len(), 116);
+    #[cfg(unix)]
+    let nested_path = format!(
+        "{}/{}",
+        (0..6)
+            .map(|index| format!("{index:02}-{}", "nested".repeat(8)))
+            .collect::<Vec<_>>()
+            .join("/"),
+        "file.txt"
+    );
+    #[cfg(unix)]
+    {
+        assert!(nested_path.len() > 255);
+        assert!(nested_path.len() < 4096);
+    }
+
+    let issue_content = b"issue 1059 long path\n";
+    let fixtures = vec![(issue_path.clone(), issue_content.as_slice())];
+    #[cfg(unix)]
+    let fixtures = {
+        let mut fixtures = fixtures;
+        fixtures.push((
+            nested_path.clone(),
+            b"beyond the ustar prefix range\n".as_slice(),
+        ));
+        fixtures
+    };
+    for (path, content) in &fixtures {
+        let disk_path = repo.path().join(path);
+        fs::create_dir_all(disk_path.parent().expect("long fixture has a parent"))
+            .expect("failed to create long fixture directory");
+        fs::write(disk_path, content).expect("failed to write long fixture");
+    }
+    let fixture_paths: Vec<&str> = fixtures.iter().map(|(path, _)| path.as_str()).collect();
+    commit_archive_fixture(repo.path(), &fixture_paths);
+
+    let archive = repo.path().join("long-paths.tar");
+    let output = run_libra_command(
+        &[
+            "archive",
+            "--format=tar",
+            "-o",
+            archive
+                .to_str()
+                .expect("archive output path should be UTF-8"),
+            "HEAD",
+        ],
+        repo.path(),
+    );
+    assert_cli_success(&output, "archive long paths");
+
+    let entries = parse_tar_entries(read_bytes(&archive).as_slice());
+    for (path, content) in &fixtures {
+        let entry = logical_tar_entry(&entries, Path::new(path));
+        assert_eq!(entry.content, *content, "wrong content for {path}");
+    }
+
+    let listed = system_tar_list(&archive);
+    for (path, _) in &fixtures {
+        assert!(
+            listed.iter().any(|listed_path| listed_path == path),
+            "system tar did not list complete path {path}: {listed:?}"
+        );
+    }
+}
+
+#[test]
+fn archive_issue1059_long_prefix_roundtrip() {
+    let repo = tempdir().expect("failed to create long-prefix archive repository");
+    init_repo_via_cli(repo.path());
+    configure_identity_via_cli(repo.path());
+    let path = "short.txt";
+    let content = b"long prefix content\n";
+    fs::write(repo.path().join(path), content).expect("failed to write prefix fixture");
+    commit_archive_fixture(repo.path(), &[path]);
+
+    let prefix = issue1059_long_prefix();
+    assert_eq!(prefix.len(), 111);
+    let archive = repo.path().join("long-prefix.tar");
+    let output = run_libra_command(
+        &[
+            "archive",
+            "--format=tar",
+            "--prefix",
+            &prefix,
+            "-o",
+            archive
+                .to_str()
+                .expect("archive output path should be UTF-8"),
+            "HEAD",
+        ],
+        repo.path(),
+    );
+    assert_cli_success(&output, "archive with long prefix");
+
+    let expected_path = Path::new(&prefix).join(path);
+    let entries = parse_tar_entries(read_bytes(&archive).as_slice());
+    assert_eq!(logical_tar_entry(&entries, &expected_path).content, content);
+    let listed = system_tar_list(&archive);
+    assert!(
+        listed
+            .iter()
+            .any(|listed_path| Path::new(listed_path) == expected_path),
+        "system tar did not preserve long prefix: {listed:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn archive_issue1059_long_symlink_roundtrip() {
+    let repo = tempdir().expect("failed to create long-symlink archive repository");
+    init_repo_via_cli(repo.path());
+    configure_identity_via_cli(repo.path());
+
+    let long_target = format!("{}//./{}/target.txt", "t".repeat(53), "u".repeat(55));
+    assert_eq!(long_target.len(), 123);
+    std::os::unix::fs::symlink(&long_target, repo.path().join("short-link"))
+        .expect("failed to create long-target symlink");
+    std::os::unix::fs::symlink("dir//./target", repo.path().join("separator-link"))
+        .expect("failed to create separator-heavy symlink");
+
+    let long_link_path = format!("{}/{}/link", "a".repeat(50), "b".repeat(55));
+    assert!(long_link_path.len() > 100);
+    let long_link_disk_path = repo.path().join(&long_link_path);
+    fs::create_dir_all(
+        long_link_disk_path
+            .parent()
+            .expect("long link fixture has a parent"),
+    )
+    .expect("failed to create long-link directory");
+    std::os::unix::fs::symlink("destination.txt", &long_link_disk_path)
+        .expect("failed to create long-path symlink");
+    let combined_link_path = format!("{long_link_path}-combined");
+    std::os::unix::fs::symlink(&long_target, repo.path().join(&combined_link_path))
+        .expect("failed to create long-path-and-target symlink");
+    commit_archive_fixture(
+        repo.path(),
+        &[
+            "short-link",
+            "separator-link",
+            &long_link_path,
+            &combined_link_path,
+        ],
+    );
+
+    let archive = repo.path().join("long-symlinks.tar");
+    let output = run_libra_command(
+        &[
+            "archive",
+            "--format=tar",
+            "-o",
+            archive
+                .to_str()
+                .expect("archive output path should be UTF-8"),
+            "HEAD",
+        ],
+        repo.path(),
+    );
+    assert_cli_success(&output, "archive long symlinks");
+
+    let entries = parse_tar_entries(read_bytes(&archive).as_slice());
+    let short_link = logical_tar_entry(&entries, Path::new("short-link"));
+    assert_eq!(
+        short_link.link_target.as_deref(),
+        Some(Path::new(&long_target))
+    );
+    assert_eq!(short_link.size, 0);
+    assert!(short_link.content.is_empty());
+    let separator_link = logical_tar_entry(&entries, Path::new("separator-link"));
+    assert_eq!(
+        separator_link.link_target.as_deref(),
+        Some(Path::new("dir//./target"))
+    );
+    assert_eq!(separator_link.size, 0);
+    let long_link = logical_tar_entry(&entries, Path::new(&long_link_path));
+    assert_eq!(
+        long_link.link_target.as_deref(),
+        Some(Path::new("destination.txt"))
+    );
+    assert_eq!(long_link.size, 0);
+    let combined_link = logical_tar_entry(&entries, Path::new(&combined_link_path));
+    assert_eq!(
+        combined_link.link_target.as_deref(),
+        Some(Path::new(&long_target))
+    );
+    assert_eq!(combined_link.size, 0);
+
+    let extract = repo.path().join("extracted");
+    fs::create_dir(&extract).expect("failed to create extraction directory");
+    let output = Command::new("tar")
+        .arg("-xf")
+        .arg(&archive)
+        .arg("-C")
+        .arg(&extract)
+        .output()
+        .expect("system tar is required for symlink interoperability tests");
+    assert!(
+        output.status.success(),
+        "system tar -xf failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_link(extract.join("short-link")).expect("read extracted long target"),
+        PathBuf::from(&long_target)
+    );
+    assert_eq!(
+        fs::read_link(extract.join("separator-link")).expect("read separator-heavy target"),
+        PathBuf::from("dir//./target")
+    );
+    assert_eq!(
+        fs::read_link(extract.join(&long_link_path)).expect("read extracted long link path"),
+        PathBuf::from("destination.txt")
+    );
+    assert_eq!(
+        fs::read_link(extract.join(&combined_link_path)).expect("read combined long link"),
+        PathBuf::from(&long_target)
+    );
+}
+
+#[test]
+fn archive_issue1059_compressed_long_paths() {
+    let repo = tempdir().expect("failed to create compressed long-path archive repository");
+    init_repo_via_cli(repo.path());
+    configure_identity_via_cli(repo.path());
+
+    let path = issue1059_long_path();
+    let content = b"compressed long path and prefix\n";
+    let disk_path = repo.path().join(&path);
+    fs::create_dir_all(disk_path.parent().expect("long fixture has a parent"))
+        .expect("failed to create compressed fixture directory");
+    fs::write(disk_path, content).expect("failed to write compressed fixture");
+    #[cfg(unix)]
+    let long_target = format!("{}//./{}/target.txt", "t".repeat(53), "u".repeat(55));
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&long_target, repo.path().join("long-link"))
+        .expect("failed to create compressed long-target symlink");
+    #[cfg(unix)]
+    let fixture_paths = vec![path.as_str(), "long-link"];
+    #[cfg(not(unix))]
+    let fixture_paths = vec![path.as_str()];
+    commit_archive_fixture(repo.path(), &fixture_paths);
+
+    let prefix = issue1059_long_prefix();
+    let expected_path = Path::new(&prefix).join(&path);
+    #[cfg(unix)]
+    let expected_link_path = Path::new(&prefix).join("long-link");
+    for (format, extension) in [("tar", "tar"), ("tar.gz", "tar.gz"), ("tar.bz2", "tar.bz2")] {
+        let archive = repo.path().join(format!("long-path.{extension}"));
+        let output = run_libra_command(
+            &[
+                "archive",
+                "--format",
+                format,
+                "--prefix",
+                &prefix,
+                "-o",
+                archive
+                    .to_str()
+                    .expect("archive output path should be UTF-8"),
+                "HEAD",
+            ],
+            repo.path(),
+        );
+        assert_cli_success(&output, &format!("archive long path as {format}"));
+        let entries = decode_tar_entries(format, &read_bytes(&archive));
+        assert_eq!(
+            logical_tar_entry(&entries, &expected_path).content,
+            content,
+            "wrong {format} content"
+        );
+        #[cfg(unix)]
+        {
+            let link = logical_tar_entry(&entries, &expected_link_path);
+            assert_eq!(
+                link.link_target.as_deref(),
+                Some(Path::new(&long_target)),
+                "wrong {format} symlink target"
+            );
+            assert_eq!(link.size, 0);
+        }
+        let listed = system_tar_list(&archive);
+        assert!(
+            listed
+                .iter()
+                .any(|listed_path| Path::new(listed_path) == expected_path),
+            "system tar could not list {format} long path: {listed:?}"
+        );
+    }
 }

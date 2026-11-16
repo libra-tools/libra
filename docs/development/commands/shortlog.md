@@ -64,3 +64,6 @@ flowchart TD
 - 改进本命令前，必须先阅读并遵循 [docs/development/commands/_general.md](_general.md)；这是命令设计、实现、测试和文档同步的强制要求。
 - 任何行为变更都要先核对实现源码，再同步 `COMPATIBILITY.md`、`docs/commands/<cmd>.md` 和相关测试。
 - 新增 Git 兼容参数时必须明确 tier、错误码、JSON/机器输出契约和回归测试。
+
+- 2026-11-13（#478 LG-20，ADR-LG-12 第 1 条）：`shortlog` 修订参数改为可重复的 `REVISION...`，支持 `A..B`/`A...B`/`^A`/多个修订，新增 `--all`（branches+tags+HEAD）与 `-- <path>`（`get_changed_files_for_commit` 过滤）；选择统一走 `log::walk_date_priority`；stdin 模式仍为 DEFER-08。测试：`test_shortlog_revision_ranges_matrix`（S1–S3、t4201:203）、`shortlog_test` 20/20。
+

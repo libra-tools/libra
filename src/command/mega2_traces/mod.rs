@@ -23,7 +23,7 @@ use crate::{
                 RESPONSE_BYTES_MAX, SEARCH_LIMIT_DEFAULT, SEARCH_LIMIT_MAX, TEXT_BYTES_DEFAULT,
                 TEXT_BYTES_MAX,
             },
-            mega2_traces_git::{self, ArchiveObject},
+            mega2_traces_git,
             mega2_tree::validate_server_url,
         },
     },
@@ -33,6 +33,7 @@ use crate::{
     },
 };
 
+pub(crate) mod git;
 mod search;
 
 #[derive(Args, Debug)]
@@ -210,6 +211,9 @@ pub struct TranscriptArgs {
     pub endpoint: EndpointArgs,
     #[arg(long, value_name = "UUID")]
     pub stream: String,
+    /// Session UUID. When omitted it is resolved from the checkpoint.
+    #[arg(long, value_name = "ID")]
+    pub session: Option<String>,
     #[arg(long, value_name = "ID")]
     pub checkpoint: String,
     #[arg(long, value_name = "BYTES")]
@@ -338,14 +342,14 @@ async fn sessions(args: SessionArgs, output: &OutputConfig) -> CliResult<()> {
     let since = optional_time(args.since.as_deref())?;
     let until = optional_time(args.until.as_deref())?;
     mega2_traces::validate_time_window(since, until).map_err(argument_error)?;
-    let since_wire = utc_bound(args.since.as_deref())?;
-    let until_wire = utc_bound(args.until.as_deref())?;
     let limit = count(
         "limit",
         args.limit,
         METADATA_LIMIT_DEFAULT,
         METADATA_LIMIT_MAX,
     )?;
+    let since_wire = utc_bound(args.since.as_deref())?;
+    let until_wire = utc_bound(args.until.as_deref())?;
     let mut owned = vec![("limit".to_string(), limit.to_string())];
     push_owned(&mut owned, "since", since_wire);
     push_owned(&mut owned, "until", until_wire);
@@ -367,9 +371,13 @@ async fn show(args: ShowArgs, output: &OutputConfig) -> CliResult<()> {
         ));
     }
     let path = if let Some(checkpoint) = args.checkpoint.as_deref() {
+        // The checkpoint detail route is session-scoped; resolve the owning
+        // session when the caller did not supply one (the flags stay mutually
+        // exclusive).
+        let session = resolve_checkpoint_session(&args.endpoint, &args.stream, checkpoint).await?;
         format!(
-            "/api/v1/traces/streams/{}/checkpoints/{checkpoint}",
-            args.stream
+            "/api/v1/traces/streams/{}/sessions/{}/checkpoints/{checkpoint}",
+            args.stream, session
         )
     } else if let Some(session) = args.session.as_deref() {
         format!("/api/v1/traces/streams/{}/sessions/{session}", args.stream)
@@ -406,8 +414,6 @@ async fn search_command(args: SearchArgs, output: &OutputConfig) -> CliResult<()
     let since = optional_time(args.since.as_deref())?;
     let until = optional_time(args.until.as_deref())?;
     mega2_traces::validate_time_window(since, until).map_err(argument_error)?;
-    let since_wire = utc_bound(args.since.as_deref())?;
-    let until_wire = utc_bound(args.until.as_deref())?;
     let limit = count("limit", args.limit, SEARCH_LIMIT_DEFAULT, SEARCH_LIMIT_MAX)?;
     let max_bytes = count(
         "max_bytes",
@@ -415,37 +421,121 @@ async fn search_command(args: SearchArgs, output: &OutputConfig) -> CliResult<()
         TEXT_BYTES_DEFAULT,
         TEXT_BYTES_MAX,
     )?;
-    let resolved = get_json(
-        &args.endpoint,
-        "/api/v1/traces/targets/resolve",
-        &[("path", args.target.as_str())],
-    )
-    .await?;
-    let target_id = resolved
-        .get("target_id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| {
-            CliError::fatal("target resolve response has no target_id".to_string())
-                .with_stable_code(StableErrorCode::CliInvalidTarget)
-        })?
-        .to_string();
-    let mut owned = vec![
-        ("target_id".to_string(), target_id),
+    let Some(stream) = args.stream.clone() else {
+        return Err(CliError::fatal(
+            "the mounted traces search route needs --stream <UUID>".to_string(),
+        )
+        .with_stable_code(StableErrorCode::CliInvalidArguments));
+    };
+    for (name, present) in [
+        ("source", args.source.is_some()),
+        ("session", args.session.is_some()),
+        ("agent", args.agent.is_some()),
+        ("since", args.since.is_some()),
+        ("until", args.until.is_some()),
+        ("code_commit", args.code_commit.is_some()),
+    ] {
+        if present {
+            return Err(CliError::fatal(format!(
+                "--{name} is not available on the per-stream traces search route"
+            ))
+            .with_stable_code(StableErrorCode::CliInvalidArguments));
+        }
+    }
+    // The mounted per-stream route owns the body budget; `max_bytes` is
+    // validated locally against the same fixed limits but is not a request
+    // parameter (the route rejects unknown parameters).
+    let _ = max_bytes;
+    let mut owned: Vec<(String, String)> = vec![
         ("q".to_string(), args.query),
         ("limit".to_string(), limit.to_string()),
-        ("max_bytes".to_string(), max_bytes.to_string()),
     ];
-    push_owned(&mut owned, "source", args.source);
-    push_owned(&mut owned, "stream", args.stream);
-    push_owned(&mut owned, "session", args.session);
-    push_owned(&mut owned, "agent", args.agent);
-    push_owned(&mut owned, "since", since_wire);
-    push_owned(&mut owned, "until", until_wire);
-    push_owned(&mut owned, "code_commit", args.code_commit);
     push_owned(&mut owned, "cursor", args.cursor);
     let query = borrowed(&owned);
-    let body = get_json(&args.endpoint, "/api/v1/traces/search", &query).await?;
+    let path = format!("/api/v1/traces/streams/{stream}/search");
+    let body = get_json(&args.endpoint, &path, &query).await?;
     emit_report("search", body, output)
+}
+
+/// Resolve the session that owns `checkpoint` by paging the mounted sessions
+/// and checkpoints routes. The transcript route requires the session UUID.
+async fn resolve_checkpoint_session(
+    endpoint: &EndpointArgs,
+    stream: &str,
+    checkpoint: &str,
+) -> CliResult<String> {
+    let mut sessions_cursor: Option<String> = None;
+    loop {
+        let mut owned: Vec<(String, String)> =
+            vec![("limit".to_string(), METADATA_LIMIT_MAX.to_string())];
+        if let Some(cursor) = sessions_cursor.clone() {
+            owned.push(("cursor".to_string(), cursor));
+        }
+        let query: Vec<(&str, &str)> = owned
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect();
+        let path = format!("/api/v1/traces/streams/{stream}/sessions");
+        let body = get_json(endpoint, &path, &query).await?;
+        let sessions = body
+            .get("items")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for session in sessions {
+            let Some(session_id) = session.get("session_id").and_then(Value::as_str) else {
+                continue;
+            };
+            if checkpoint_belongs_to_session(endpoint, stream, session_id, checkpoint).await? {
+                return Ok(session_id.to_string());
+            }
+        }
+        match body.get("next_cursor").and_then(Value::as_str) {
+            Some(cursor) if !cursor.is_empty() => sessions_cursor = Some(cursor.to_string()),
+            _ => break,
+        }
+    }
+    Err(CliError::fatal(format!(
+        "no session in stream {stream} contains checkpoint {checkpoint}"
+    ))
+    .with_stable_code(StableErrorCode::CliInvalidTarget))
+}
+
+async fn checkpoint_belongs_to_session(
+    endpoint: &EndpointArgs,
+    stream: &str,
+    session: &str,
+    checkpoint: &str,
+) -> CliResult<bool> {
+    let mut cursor: Option<String> = None;
+    loop {
+        let mut owned: Vec<(String, String)> =
+            vec![("limit".to_string(), METADATA_LIMIT_MAX.to_string())];
+        if let Some(cursor) = cursor.clone() {
+            owned.push(("cursor".to_string(), cursor));
+        }
+        let query: Vec<(&str, &str)> = owned
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect();
+        let path = format!("/api/v1/traces/streams/{stream}/sessions/{session}/checkpoints");
+        let body = get_json(endpoint, &path, &query).await?;
+        let items = body
+            .get("items")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if items
+            .iter()
+            .any(|item| item.get("checkpoint_id").and_then(Value::as_str) == Some(checkpoint))
+        {
+            return Ok(true);
+        }
+        match body.get("next_cursor").and_then(Value::as_str) {
+            Some(next) if !next.is_empty() => cursor = Some(next.to_string()),
+            _ => return Ok(false),
+        }
+    }
 }
 
 async fn transcript(args: TranscriptArgs, output: &OutputConfig) -> CliResult<()> {
@@ -464,9 +554,13 @@ async fn transcript(args: TranscriptArgs, output: &OutputConfig) -> CliResult<()
         .iter()
         .map(|(key, value)| (key.as_str(), value.as_str()))
         .collect();
+    let session = match args.session.clone() {
+        Some(session) => session,
+        None => resolve_checkpoint_session(&args.endpoint, &args.stream, &args.checkpoint).await?,
+    };
     let path = format!(
-        "/api/v1/traces/streams/{}/checkpoints/{}/transcript",
-        args.stream, args.checkpoint
+        "/api/v1/traces/streams/{}/sessions/{}/checkpoints/{}/transcript",
+        args.stream, session, args.checkpoint
     );
     let body = get_json(&args.endpoint, &path, &query).await?;
     emit_report("transcript", body, output)
@@ -476,6 +570,7 @@ async fn fetch_command(args: FetchArgs, output: &OutputConfig) -> CliResult<()> 
     let workdir = std::env::current_dir().map_err(|error| {
         CliError::fatal(format!("cannot resolve the working directory: {error}"))
     })?;
+    let locator = mega2_traces::by_scope_git_path(&args.stream).map_err(argument_error)?;
     let url_key = format!("remote.{}.url", args.remote);
     let stored = crate::command::agent::mega2_stream::repository_config_at(&workdir, &url_key)
         .await
@@ -486,6 +581,7 @@ async fn fetch_command(args: FetchArgs, output: &OutputConfig) -> CliResult<()> 
             args.remote
         )));
     };
+    let ssh = remote_url.starts_with("ssh://");
     let token = resolve_token(
         args.token_file.as_deref(),
         std::env::var(crate::internal::protocol::mega2_auth::ENV_TOKEN_VAR)
@@ -493,93 +589,15 @@ async fn fetch_command(args: FetchArgs, output: &OutputConfig) -> CliResult<()> 
             .as_deref(),
         args.token.as_deref(),
     )?;
-    if token.is_none() {
+    if token.is_none() && !ssh {
         return Err(CliError::fatal(
             "anonymous traces fetch is refused; no archive ref was written".to_string(),
         )
         .with_stable_code(StableErrorCode::AuthMissingCredentials));
     }
-    let remote_url_parsed = Url::parse(&remote_url).map_err(|_| {
-        CliError::fatal(format!(
-            "remote URL {remote_url:?} is not an HTTP(S) or SSH Mega2 endpoint"
-        ))
-        .with_stable_code(StableErrorCode::CliInvalidTarget)
-    })?;
-    if remote_url_parsed.scheme() == "ssh" {
-        let locator = mega2_traces_git::ssh_stream_locator(&remote_url, &args.stream)
-            .map_err(argument_error)?;
-        return Err(CliError::fatal(format!(
-            "SSH traces discovery located {locator} but no authenticated git advertisement was read; no archive ref was written"
-        ))
-        .with_stable_code(StableErrorCode::CliInvalidTarget));
-    }
     let authority = mega2_traces_git::transport_authority(&remote_url).map_err(|message| {
         CliError::fatal(message).with_stable_code(StableErrorCode::CliInvalidTarget)
     })?;
-    let base = remote_http_origin(&remote_url)?;
-    let endpoint = EndpointArgs {
-        server: base,
-        token_file: args.token_file,
-        token: args.token,
-    };
-    let capabilities = get_json(&endpoint, "/api/v1/traces/capabilities", &[]).await?;
-    let protocol = capabilities
-        .get("protocol")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    if protocol != PROTOCOL_ID {
-        return Err(CliError::fatal(format!(
-            "traces server protocol {protocol:?} is not {PROTOCOL_ID}"
-        ))
-        .with_stable_code(StableErrorCode::CliInvalidTarget));
-    }
-    let server_id = capabilities
-        .get("server_id")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            CliError::fatal(
-                "authenticated capabilities response has no server_id; no archive ref was written"
-                    .to_string(),
-            )
-            .with_stable_code(StableErrorCode::CliInvalidTarget)
-        })?
-        .to_string();
-    let fingerprint = mega2_traces_git::server_fingerprint(&server_id, &authority);
-    let fingerprint_key = format!("libra.traces.remote.{}.fingerprint", args.remote);
-    let stored_fingerprint =
-        crate::command::agent::mega2_stream::repository_config_at(&workdir, &fingerprint_key)
-            .await
-            .map_err(|error| CliError::fatal(error.to_string()))?;
-    mega2_traces_git::fingerprint_conflict(stored_fingerprint.as_deref(), &fingerprint)
-        .map_err(argument_error)?;
-    let path = format!("/api/v1/traces/streams/{}/archive", args.stream);
-    let body = get_json(&endpoint, &path, &[]).await?;
-    if let Some(announced) = body.get("stream").and_then(Value::as_str)
-        && announced != args.stream
-    {
-        return Err(CliError::fatal(format!(
-            "archive stream {announced} does not match requested stream {}",
-            args.stream
-        ))
-        .with_stable_code(StableErrorCode::CliInvalidTarget));
-    }
-    let hash_kind = match body.get("hash_kind").and_then(Value::as_str) {
-        Some("sha1") => HashKind::Sha1,
-        Some("sha256") => HashKind::Sha256,
-        Some(other) => {
-            return Err(CliError::fatal(format!(
-                "archive hash kind {other:?} is not sha1 or sha256"
-            ))
-            .with_stable_code(StableErrorCode::RepoCorrupt));
-        }
-        None => {
-            return Err(
-                CliError::fatal("archive response has no hash_kind".to_string())
-                    .with_stable_code(StableErrorCode::RepoCorrupt),
-            );
-        }
-    };
     let repository_format =
         crate::command::agent::mega2_stream::repository_config_at(&workdir, "core.objectformat")
             .await
@@ -594,21 +612,62 @@ async fn fetch_command(args: FetchArgs, output: &OutputConfig) -> CliResult<()> 
             .with_stable_code(StableErrorCode::RepoCorrupt));
         }
     };
+
+    let client = git::open_client(
+        &remote_url,
+        &args.remote,
+        &locator,
+        if ssh { None } else { token.as_ref() },
+        output,
+    )
+    .await?;
+    let discovery = git::discover(&client, crate::git_protocol::ServiceType::UploadPack).await?;
+    let advertisement = discovery.capabilities.join(" ");
+    if !mega2_traces::advertisement_has_traces_v1(&advertisement) {
+        return Err(CliError::fatal(format!(
+            "remote did not advertise {}; no archive ref was written",
+            mega2_traces::CAPABILITY
+        ))
+        .with_stable_code(StableErrorCode::CliInvalidTarget));
+    }
+    let server_id = mega2_traces_git::bind_authenticated_discovery(&advertisement, &args.stream)
+        .map_err(|message| {
+            CliError::fatal(format!("{message}; no archive ref was written"))
+                .with_stable_code(StableErrorCode::CliInvalidTarget)
+        })?;
+    let fingerprint = mega2_traces_git::server_fingerprint(&server_id, &authority);
+    let fingerprint_key = format!("libra.traces.remote.{}.fingerprint", args.remote);
+    let stored_fingerprint =
+        crate::command::agent::mega2_stream::repository_config_at(&workdir, &fingerprint_key)
+            .await
+            .map_err(|error| CliError::fatal(error.to_string()))?;
+    mega2_traces_git::fingerprint_conflict(stored_fingerprint.as_deref(), &fingerprint)
+        .map_err(argument_error)?;
+    let hash_kind = match discovery.hash_kind {
+        git_internal::hash::HashKind::Sha1 => HashKind::Sha1,
+        git_internal::hash::HashKind::Sha256 => HashKind::Sha256,
+        other => {
+            return Err(CliError::fatal(format!(
+                "archive object format {other:?} is not sha1 or sha256"
+            ))
+            .with_stable_code(StableErrorCode::RepoCorrupt));
+        }
+    };
     mega2_traces_git::reject_hash_conversion(hash_kind, repository_kind).map_err(|message| {
         CliError::fatal(message).with_stable_code(StableErrorCode::RepoCorrupt)
     })?;
-    let tip = body
-        .get("tip")
-        .and_then(Value::as_str)
+    let tip = discovery
+        .refs
+        .iter()
+        .find(|reference| reference.name() == "refs/libra/traces")
+        .map(|reference| reference.hash().to_string())
         .ok_or_else(|| {
-            CliError::fatal("archive response has no tip".to_string())
-                .with_stable_code(StableErrorCode::RepoCorrupt)
-        })?
-        .to_string();
-    let objects = parse_archive_objects(body.get("objects"))?;
-    mega2_traces_git::validate_archive(&objects, &tip, hash_kind, &args.stream).map_err(
-        |message| CliError::fatal(message).with_stable_code(StableErrorCode::RepoCorrupt),
-    )?;
+            CliError::fatal(format!(
+                "stream {} has no accepted tip; no archive ref was written",
+                args.stream
+            ))
+            .with_stable_code(StableErrorCode::RepoNotFound)
+        })?;
     let ref_name = mega2_traces_git::archive_tracking_ref(&args.remote, &args.stream, hash_kind)
         .map_err(argument_error)?;
     if mega2_traces_git::forbids_local_traces_ref(&ref_name) {
@@ -616,7 +675,33 @@ async fn fetch_command(args: FetchArgs, output: &OutputConfig) -> CliResult<()> 
             "refusing to publish a fetch onto refs/heads/traces or refs/libra/traces".to_string(),
         ));
     }
+
+    let request = git::upload_request(&tip, hash_kind);
+    let pack = git::retry_busy(|| git::read_upload_response(&client, request.clone())).await?;
+    let installed = crate::command::fetch::install_fetched_pack(&pack, discovery.hash_kind)
+        .await
+        .map_err(|error| {
+            CliError::fatal(format!(
+                "the traces archive pack failed verification: {error}; no archive ref was written"
+            ))
+            .with_stable_code(StableErrorCode::RepoCorrupt)
+        })?;
+    let tip_oid = crate::internal::object_format::parse_repo_oid(&tip).map_err(|error| {
+        CliError::fatal(format!("advertised tip {tip} is invalid: {error}"))
+            .with_stable_code(StableErrorCode::RepoCorrupt)
+    })?;
+    match crate::internal::tag::load_object_trait(&tip_oid).await {
+        Ok(crate::internal::tag::TagObject::Commit(_)) => {}
+        _ => {
+            return Err(CliError::fatal(format!(
+                "archive tip {tip} is not a commit in the received pack; no archive ref was written"
+            ))
+            .with_stable_code(StableErrorCode::RepoCorrupt));
+        }
+    }
     publish_archive_ref(&ref_name, &tip).await?;
+    let objects = installed.objects;
+    drop(installed);
     record_config(
         &format!("libra.traces.archive.{}.ref", args.stream),
         &ref_name,
@@ -642,6 +727,7 @@ async fn fetch_command(args: FetchArgs, output: &OutputConfig) -> CliResult<()> 
             "stream": args.stream,
             "hash_kind": hash_kind.as_str(),
             "server_id": server_id,
+            "objects": objects,
         }),
         output,
     )
@@ -653,60 +739,6 @@ async fn record_config(key: &str, value: &str) -> CliResult<()> {
         .map_err(|error| CliError::fatal(format!("cannot record {key}: {error}")))
 }
 
-fn parse_archive_objects(value: Option<&Value>) -> CliResult<Vec<ArchiveObject>> {
-    let Some(items) = value.and_then(Value::as_array) else {
-        return Err(
-            CliError::fatal("archive response has no objects".to_string())
-                .with_stable_code(StableErrorCode::RepoCorrupt),
-        );
-    };
-    let mut objects = Vec::with_capacity(items.len());
-    for item in items {
-        let id = item
-            .get("id")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let kind = item
-            .get("kind")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        if kind.is_empty() {
-            return Err(CliError::fatal("archive object has no kind".to_string())
-                .with_stable_code(StableErrorCode::RepoCorrupt));
-        }
-        let payload = item
-            .get("payload")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .as_bytes()
-            .to_vec();
-        let links = item
-            .get("links")
-            .and_then(Value::as_array)
-            .map(|links| {
-                links
-                    .iter()
-                    .filter_map(|link| link.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let scope = item
-            .get("scope")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        objects.push(ArchiveObject {
-            id,
-            kind,
-            payload,
-            links,
-            scope,
-        });
-    }
-    Ok(objects)
-}
-
 async fn publish_archive_ref(name: &str, tip: &str) -> CliResult<()> {
     let connection = get_db_conn_instance().await;
     let transaction = begin_write_transaction(&connection)
@@ -714,7 +746,21 @@ async fn publish_archive_ref(name: &str, tip: &str) -> CliResult<()> {
         .map_err(|error| {
             CliError::fatal(format!("cannot start the archive ref transaction: {error}"))
         })?;
-    use sea_orm::{ActiveModelTrait, ActiveValue::Set};
+    use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter};
+    // Re-fetching the same stream moves its archive ref; it never adds a
+    // second row with the same name.
+    if let Err(error) = reference::Entity::delete_many()
+        .filter(reference::Column::Name.eq(name))
+        .filter(reference::Column::Kind.eq(ConfigKind::Branch))
+        .filter(reference::Column::Remote.is_null())
+        .exec(&transaction)
+        .await
+    {
+        let _ = transaction.rollback().await;
+        return Err(CliError::fatal(format!(
+            "cannot replace archive ref '{name}': {error}"
+        )));
+    }
     let inserted = reference::ActiveModel {
         name: Set(Some(name.to_string())),
         kind: Set(ConfigKind::Branch),
@@ -735,21 +781,6 @@ async fn publish_archive_ref(name: &str, tip: &str) -> CliResult<()> {
         .await
         .map_err(|error| CliError::fatal(format!("cannot commit archive ref '{name}': {error}")))?;
     Ok(())
-}
-
-fn remote_http_origin(remote_url: &str) -> CliResult<String> {
-    let url = Url::parse(remote_url).map_err(|_| {
-        CliError::fatal(format!(
-            "remote URL {remote_url:?} is not an HTTP(S) Mega2 endpoint"
-        ))
-        .with_stable_code(StableErrorCode::CliInvalidTarget)
-    })?;
-    let port = url
-        .port()
-        .map(|port| format!(":{port}"))
-        .unwrap_or_default();
-    let host = url.host_str().unwrap_or("");
-    Ok(format!("{}://{host}{port}", url.scheme()))
 }
 
 fn optional_time(value: Option<&str>) -> CliResult<Option<i64>> {

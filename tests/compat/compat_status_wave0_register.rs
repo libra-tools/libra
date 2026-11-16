@@ -57,7 +57,17 @@ const BENIGN_FN_ATTRIBUTES: &[&str] = &[
 /// `#![cfg(...)]`/`#![cfg_attr(...)]` would compile the whole file away
 /// while source collection still counts every declaration, so anything
 /// outside this list panics.
-const BENIGN_INNER_ATTRIBUTES: &[&str] = &["doc", "allow", "expect", "deny", "warn"];
+const BENIGN_INNER_ATTRIBUTES: &[&str] = &[
+    "doc",
+    "allow",
+    "expect",
+    "deny",
+    "warn",
+    // `#![recursion_limit]` only relaxes the compiler's macro expansion
+    // budget; it cannot hide, rename or generate a test, so it is benign
+    // for the wave-0 register.
+    "recursion_limit",
+];
 
 fn attribute_name(attribute: &syn::Attribute) -> String {
     attribute
