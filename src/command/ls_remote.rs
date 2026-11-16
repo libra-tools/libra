@@ -1256,17 +1256,19 @@ mod pkt_line_boundary_tests {
         server.stop().await;
     }
 
-    /// A v2-only remote must be reported as such by every discovery command:
-    /// the `version 2` line is not a reference, so the old
-    /// `Invalid object id 'version'` diagnosis must never come back.
+    /// A legacy-forced client must reject a v2-only advertisement before
+    /// opening a v2 session. The default is now v2, so this regression pins
+    /// `protocol.version=0`; the `version 2` line must never be parsed as a
+    /// reference or reported as a connectivity failure.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial(cwd, env)]
-    async fn pkt_line_protocol_v2_advertisement_reports_unsupported_remote() {
+    async fn pkt_line_forced_legacy_rejects_v2_only_advertisement() {
         let mut server = TestServer::start(ResponseMode::ProtocolV2Advertisement).await;
         for command in ["fetch", "clone", "ls-remote", "pull"] {
             let repo = tempdir().unwrap();
             setup_with_new_libra_in(repo.path()).await;
             let _cwd = ChangeDirGuard::new(repo.path());
+            ConfigKv::set("protocol.version", "0", false).await.unwrap();
             if matches!(command, "fetch" | "pull") {
                 ConfigKv::set("remote.origin.url", &server.url, false)
                     .await

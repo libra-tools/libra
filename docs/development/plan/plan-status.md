@@ -1,3 +1,34 @@
+> **2026-11-16 12:22 UTC SP-09 元数据清理：** `Cargo.toml` homepage 改为 `https://libra.tools`，消除与 repository 相同的冗余 warning。移除未引用依赖 `infer`、`mime_guess`、`pager`、`tokio-tungstenite`、`tree-sitter-rust`；`sea-bae` 升至 0.2.2，去掉 `proc-macro-error2` 的 future-incompat warning。四处指向私有项的 rustdoc 链接改为纯文本。`cargo check --all-targets --all-features`、严格 Clippy 与带 private-link deny 的 rustdoc 均 exit0 且无 warning。
+
+> **2026-11-16 09:33 UTC SP-09 rustdoc 跟进：** head `e39e86f` 的 `compat-clippy` 在 intra-doc 链接失败：`src/internal/protocol/v2/fetch.rs` 指向私有 `read_fetch_stream_for_kind`。已改为纯文本引用。本地 `RUSTDOCFLAGS="-D rustdoc::broken_intra_doc_links" cargo doc --no-deps --all-features` exit0。其余私有链接仍是 warning，不在拒绝门内。`compat-offline-core` 当时仍在跑，推送后由新 head 重跑；旧失败不改写为通过。
+
+> **2026-11-16 07:39 UTC SP-09 CI 恢复（待最终 head）：** 已同步 origin/main `4e53393a`。历史 Windows 失败是 `command_test` 对 Unix `Permissions::from_mode` 的无条件编译；历史 macOS 作业在 53m40s 冷构建后被 60 分钟取消。当前上游已分别由 `292e5edf7` 与 `36323df63` 修复，并在 `0520d8061` 按维护者指令移除平台/live CI，故本次不恢复这些作业、不把移除写成通过。另修当前 main D 的协议回归：仓外读取改用 `ConfigKv::get_best_effort`，强制 v0 的 v2 广告拒绝在 pull 映射为 `LBR-NET-002`，并收敛 `collapsible_if`。仓外 focused 32/32 通过；fmt/严格 Clippy exit0。本机 nextest 全量仍 not-run，旧失败记录保留；最终 PR head CI 与合并待实际结果，不代表整轮性能审计完成。
+
+> **2026-11-05 01:41:57 UTC SP-09 冲突已恢复：** 同步上游9766c98，plan-status首段冲突两侧记录均保留；native signed+DCO merge提交fc154062（父f2e7a278与9766c98）保留历史。合并树fmt exit0/16.235s、严格all-targets/all-features Clippy exit0/273.386s，733生产/build路径与冻结候选一致。stash原子拒绝后保留原件，从三方备份生成补丁，经Libra apply --check后应用并核字节；上游nextest --force已保留，剩余自有变化仅两文档。最终差异复核、签名提交推送与新head CI待，不把旧失败改写为通过。
+
+> **2026-11-05 01:27:09 UTC SP-09 工具例外与冲突恢复：** 用户明确授权本次使用本机构建Libra解决冲突并提交推送；已核验冻结0.30.152二进制SHA为ad3612fdec4117ec2248a696c88073a6cb0fedad183d955cddfbd191cea8d446，不替换系统安装。当前codex/SP-09/f2e7a278保有三文件CI修复与记录，PR1058与main冲突。先备份与精确stash，再同步上游并保全双方记录；最终验证、PGP+DCO提交、推送与新head CI待，旧矩阵不冒称覆盖新主线。
+
+> **2026-11-05 00:22:46 UTC SP-09 补充定向通过：** Wave0原失败单例精确重跑1/1、check-ignore12/12、status-errors14/14，全部exit0，原件SHA已入日期计划；保留原全模块174/175失败，不冒充同轮175/175或根因已关闭。用户更新后的系统PATH Libra --version/status均SIGILL(-4)，构建版仅测试限制保留，CI修复三文件仍未提交推送；PR1058新增main冲突，旧offline-core失败仍在。只读半小时监控继续，不合并失败或冲突head。
+
+> **2026-11-05 00:08:45 UTC SP-09 交付阻塞：** CI修复三文件未提交/推送，HEAD仍f2e7a278，PR1058 offline-core旧失败仍在。系统Libra0.30.143暂存报hash worker returned no result；用户授权的官方0.30.152升级因pre-install probe SIGILL拒绝，原安装保留。用户明确不豁免构建版仅测试限制，故保留修复、暂缓提交推送，不合并失败head。原定向终态util72/72、status74/74、Wave0 174通过/1失败（fixture暂存读取LIBRA_STORAGE_TYPE配置失败），check-ignore未跑；另启精确复现与check-ignore/status-errors，结果待，不记全绿。原done/complete仅审计记录交付口径不变。
+
+> **2026-11-04 16:29:48 UTC SP-09 CI 修复提交门通过：** nightly fmt exit0/167.496s、stable严格all-targets/all-features Clippy exit0/761.276s，原件SHA已入日期计划；加上实际workflow四场景GREEN与独立Codex PASS，本地修复门已齐。现依用户授权签名提交推送并恢复每半小时监控，新head全量CI仍待，不合并失败或缺覆盖head。
+
+> **2026-11-04 16:16:56 UTC SP-09 CI 修复验证：** workflow实际shell四场景GREEN，旧版本RED已复现；本机Codex只读独立review PASS/无P0P1P2（原件SHA入日期计划），没有冒称reviewer运行测试。fmt/严格Clippy补跑终态待，未提交推送，新head实际CI待；通过后依用户已有授权签名提交推送并恢复半小时监控，不合并失败head。
+
+> **2026-11-04 16:12:30 UTC SP-09 CI 修复跟进：** PR #1058 head f2e7a278 的其余检查成功，offline-core在nextest安装因已有不同版本二进制exit101、全量与特性测试skipped。用户已授权每半小时监控、失败修复提交推送、成功合并；本次扩写集至base.yml与两份计划文档，精确回补上游a0632237的--force bootstrap，不安装本机nextest、不发布版本。隔离假Cargo已复现不同版本RED，其余三场景符合预期；修复后验证、独立评审、新head实际CI待，不将历史失败改写为通过。原done/complete仍仅审计记录交付口径。
+
+> **2026-11-04 14:23:13 UTC SP-09 用户指令收口：** 用户明确要求“设置卡片状态为已完成，然后提交，推送”，随后追加创建PR授权；按 EX-SP-09-CLOSE-01 登记 `done / complete`，仅本次审计记录交付。矩阵/独立复算/补充语义与计数整改已有实证，fmt/严格Clippy exit0；定向仍在首次编译，补充status-errors、最终评审、最终PR全量与原发布继承缺口均未记通过，原未满足AC保留。授权精确提交两计划文档、推送 `codex/SP-09` 并创建PR，不合并/关闭Issue/发布，不宣称整轮最终验收完成。Review.md已按用户后续指令删除，不纳入提交。
+
+> **2026-11-04 14:15:50 UTC SP-09 Review 整改：** 用户 Review 的2P1/2P2已核实：原trace重计，撤回pack211→206结论（对象库两边均206），ignore含.gitignore/.libraignore/exclude后normal为437→415，旧原件保留，热点AC撤勾待复核。新增48份未计时输出匹配原样本SHA、3份精确refresh回执及51缺记录负例均PASS，独立复算再验通过；原性能样本未变。采样器已补断言；定向worker补充status_error_test过滤器需待旧worker结束另跑，尚未算通过；总览SP07/08与SP08 C/D已对齐，旧汇总标历史。fmt和严格Clippy实际exit0，定向/最终review/远端全量仍待，`in-progress / 空`。Review.md当时为用户未跟踪文件，随后已按用户明确指令删除，不纳入写集。
+
+> **2026-11-04 12:44:51 UTC SP-09 矩阵通过：** 完整16格/1200调用/960正式样本，独立复算 PASS；default 中位数下降62.81%–72.83%，refreshed下降31.86%–63.27%，320/320候选配对更快，候选/Git仍32.11×–44.32×。clean预检、跨工具/索引语义及原始输出/index稳定性通过；独立文件调用profiling只用于次数，SP-04与三个DEFER维持defer并记录依据。原件在外接盘，摘要与SHA入日期计划。Clippy/定向回归已启动但未取得终态，ignore/错误/安全、评审和最终PR全量仍待；保持 `in-progress / 空`，不提交推送。
+
+> **2026-11-04 12:12:31 UTC SP-09 构建完成：** stable 1.99.1、独立 target、`--release --locked`、并发 2；基线 `8abdcf7` exit0/2798.163s/SHA `d295395780d436275abc2346f2319fe457c57e3d70a8f3d3f325ef07751b3e1f`，候选 `016ce4a` exit0/3800.075s/SHA `ad3612fdec4117ec2248a696c88073a6cb0fedad183d955cddfbd191cea8d446`。二进制已冻结，完整矩阵已启动；不并行编译干扰计时。矩阵、Clippy、定向回归、评审和最终 PR CI 尚未通过，保持 `in-progress / 空`。
+
+> **2026-11-04 10:30:32 UTC SP-09 准备进展：** 公开 fixture mirror 已下载并确认 2,125 tracked paths；前置 SP-01/02/03/05/06/07/08 的 PR 与 Issue 已核，SP-02/03/05/06/07/08 对应最终 PR 均 11 项成功，SP-01 既有 offline-core FAIL/例外与 #656 OPEN 保留。用户授权的 32 项原生构建依赖已安装，物料缓存仍在外接盘；nightly fmt 准备检查通过。基线 `8abdcf7` 与候选 `016ce4a` 独立构建进行中，矩阵未运行。候选 main run 41804426064 因已有 nextest 二进制而安装失败，全量及特性测试未执行，macOS cancelled；不计 PASS，不扩大本卡写集修 CI。保持 `in-progress / 空`，最终 PR 全量与评审待。
+
+> **2026-11-04 10:19:32 UTC SP-09 开工：** `codex/SP-09`，`in-progress / 空`，源码起点 `016ce4a86b988d668fda7b2bf7e446c9ab491555`。用户授权审计与本地执行，锁定 status 性能计划及本文件两路径。前置 SP-08 PR #1023 已合并、最终 PR 11 项检查成功，#648 已关闭；main 构建 cancelled 仍不计 PASS。物料统一放 `/data/libra-performance/`（`/dev/sda` ext4）；本机约 14.86 GiB，不安装/运行 nextest。用户批准 EX-SP-09-CI-01，由最终 PR CI 承担全量验收；未通过或覆盖不足不得 complete。矩阵、本地质量门、评审与远端交付均待，不提交/推送/发布。
 **2026-11-14 16:01 UTC 第四次并发强制回退（收口后）：** 收口提交 `1a221a781` 推送后，远端 `main` 于 16:00:58Z 被并发代理再次 `--force` 回退到 `fdd1f1951`，丢弃含 LTR-08/LTR-09 formal close 的 24 个提交；对应精确 tip 的 `Check, Build and Test` run `43611900133` 因回退被 `Cancel superseded` 取消（rustfmt 已 in_progress，其余未执行）。已从本地完整历史快进恢复（`fdd1f1951..1a221a781`），恢复后 `HEAD...origin/main` = `0 0`。该回退不由本计划发起；LTR-08 的适用 main D 仍为覆盖代码树的 run `43598604901`（`2fee95e9e`），回退不改变已取得的代码树与 live 证据。
 
 **2026-11-14 16:0x UTC LTR-08 / LTR-09 formal close：** 在专用部署上补齐 SSH traces 面后（storage-only 下用 `[[git.push_tokens]]` 的 `trace-ssh-key:<id>` 命名 + `static_push_token`/`mono_account` 双绑定，`ssh_receive_pack` 只约束代码 receive-pack），单次 `cargo nextest run --release --run-ignored only --test command_test -E 'test(command::mega2_traces_live_test)'` 得 **25 passed / 0 failed / 4989 skipped**（EXIT 0，日志 SHA256 `12c03a927b8722560db8e617f6cf96c072209b0a210d580fc6e0f68d5b5a3297`），安装 binary 为最终树 release 产物 `1bcfa7af…`；同契约与 Mega2 `v0.43.0` 的 `6bdb9404…` 逐字节一致；main D 为 run `43598604901`。LTR-08 的 7 项 AC 与 4 项 VER 全部有证据并勾选，转 `done`/`complete`；LTR-09 的 4 项 AC 与 2 项 VER 全勾，`C/D coverage from: LTR-08` 成立，一并转 `done`/`complete`。计划内仅剩 `LTR-00` 作为 `blocked/空` 的历史取消卡（`DEFER-LTR-06`）。

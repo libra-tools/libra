@@ -56,7 +56,7 @@ pub struct LsRefsResult {
 impl LsRefsResult {
     /// Capability lines derived from the response, v0-shaped.
     ///
-    /// `symref=HEAD:<target>` is what [`crate::command::fetch::resolve_remote_default_branch`]
+    /// `symref=HEAD:<target>` is what `command::fetch::resolve_remote_default_branch`
     /// and `ls-remote --symref` consume, so an `ls-refs` answer feeds the
     /// existing reference machinery without a second transport concept.
     pub fn derived_capabilities(&self) -> Vec<String> {
@@ -72,13 +72,13 @@ impl LsRefsResult {
 /// The body is `command=ls-refs`, the client capability block, a delim-pkt,
 /// the arguments and a flush-pkt. `object-format` is only sent for a non-SHA-1
 /// repository, and only when the server advertised the capability.
-pub fn build_request(
-    advertisement: &Advertisement,
-    options: &LsRefsOptions,
-) -> Bytes {
+pub fn build_request(advertisement: &Advertisement, options: &LsRefsOptions) -> Bytes {
     let mut body = BytesMut::new();
     add_pkt_line_string(&mut body, "command=ls-refs\n".to_string());
-    add_pkt_line_string(&mut body, format!("agent=libra/{}\n", env!("CARGO_PKG_VERSION")));
+    add_pkt_line_string(
+        &mut body,
+        format!("agent=libra/{}\n", env!("CARGO_PKG_VERSION")),
+    );
     if let Some(capability) = object_format_capability(advertisement, advertisement.hash_kind) {
         add_pkt_line_string(&mut body, capability);
     }
@@ -103,10 +103,7 @@ pub fn build_request(
 ///
 /// SHA-1 is the protocol default, so it is never announced; a server that did
 /// not advertise `object-format` never receives the line either.
-fn object_format_capability(
-    advertisement: &Advertisement,
-    hash_kind: HashKind,
-) -> Option<String> {
+fn object_format_capability(advertisement: &Advertisement, hash_kind: HashKind) -> Option<String> {
     match hash_kind {
         HashKind::Sha1 => None,
         _ => advertisement
@@ -137,9 +134,10 @@ pub fn parse_response(mut body: Bytes, hash_kind: HashKind) -> Result<LsRefsResu
                     continue;
                 }
                 if line.starts_with("unborn ") || line == "unborn" {
-                    if let Some(target) = line.split(' ').find_map(|field| {
-                        field.strip_prefix("symref-target:")
-                    }) {
+                    if let Some(target) = line
+                        .split(' ')
+                        .find_map(|field| field.strip_prefix("symref-target:"))
+                    {
                         result.head_symref = Some(target.to_string());
                     }
                     continue;
@@ -164,11 +162,15 @@ fn parse_ref_line(
     let raw_oid = fields
         .next()
         .filter(|field| !field.is_empty())
-        .ok_or_else(|| GitError::NetworkError("missing object id in ls-refs response".to_string()))?;
+        .ok_or_else(|| {
+            GitError::NetworkError("missing object id in ls-refs response".to_string())
+        })?;
     let refname = fields
         .next()
         .filter(|field| !field.is_empty())
-        .ok_or_else(|| GitError::NetworkError("missing ref name in ls-refs response".to_string()))?;
+        .ok_or_else(|| {
+            GitError::NetworkError("missing ref name in ls-refs response".to_string())
+        })?;
     let hash = validate_discovery_oid(hash_kind, raw_oid)?;
     result.refs.push(DiscoveredReference {
         _hash: hash,
@@ -176,10 +178,10 @@ fn parse_ref_line(
     });
     for attribute in fields {
         let Some(peeled) = attribute.strip_prefix("peeled:") else {
-            if let Some(target) = attribute.strip_prefix("symref-target:") {
-                if refname == "HEAD" {
-                    result.head_symref = Some(target.to_string());
-                }
+            if let Some(target) = attribute.strip_prefix("symref-target:")
+                && refname == "HEAD"
+            {
+                result.head_symref = Some(target.to_string());
             }
             continue;
         };
@@ -246,7 +248,10 @@ mod tests {
 
         assert!(text.starts_with("0014command=ls-refs\n"), "text={text:?}");
         assert!(text.contains(&format!("agent=libra/{}\n", env!("CARGO_PKG_VERSION"))));
-        assert!(text.contains("000bunborn\n"), "unborn feature text={text:?}");
+        assert!(
+            text.contains("000bunborn\n"),
+            "unborn feature text={text:?}"
+        );
         let delimiter = text.find("0001").expect("delim-pkt separates sections");
         let arguments = text.find("0009peel\n").expect("peel argument");
         assert!(delimiter < arguments, "delim must precede arguments");
@@ -355,7 +360,11 @@ mod tests {
             "1 refs/heads/main".to_string(),
             format!("{} refs/heads/main", "z".repeat(40)),
             format!("sha256:{} refs/heads/main", "1".repeat(64)),
-            format!("{} refs/heads/main peeled:{}", "1".repeat(40), "z".repeat(40)),
+            format!(
+                "{} refs/heads/main peeled:{}",
+                "1".repeat(40),
+                "z".repeat(40)
+            ),
         ] {
             let error = parse_response(response(&[&line]), HashKind::Sha1)
                 .expect_err("invalid object ids must fail closed");
@@ -383,8 +392,8 @@ mod tests {
         // A truncated frame is a protocol error, not a panic.
         let mut body = BytesMut::new();
         body.extend_from_slice(b"0008ab");
-        let error = parse_response(body.freeze(), HashKind::Sha1)
-            .expect_err("truncated frame must fail");
+        let error =
+            parse_response(body.freeze(), HashKind::Sha1).expect_err("truncated frame must fail");
         assert!(error.to_string().contains("pkt-line"));
     }
 

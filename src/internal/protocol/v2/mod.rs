@@ -203,7 +203,10 @@ mod tests {
         add_flush_pkt(&mut body);
         add_pkt_line_string(
             &mut body,
-            format!("{} HEAD\0side-band-64k symref=HEAD:refs/heads/main\n", "1".repeat(40)),
+            format!(
+                "{} HEAD\0side-band-64k symref=HEAD:refs/heads/main\n",
+                "1".repeat(40)
+            ),
         );
         add_flush_pkt(&mut body);
         assert!(!is_v2_advertisement(&body.freeze()));
@@ -262,7 +265,10 @@ mod tests {
             &["object-format=sha256", "object-format=sha256"],
         );
         let error = parse_advertisement(body).expect_err("conflicting formats must fail closed");
-        assert_eq!(error.to_string(), "Network Error: Conflicting object-format capabilities");
+        assert_eq!(
+            error.to_string(),
+            "Network Error: Conflicting object-format capabilities"
+        );
     }
 
     #[test]
@@ -280,10 +286,7 @@ mod tests {
     #[test]
     fn rejects_v0_advertisement_and_section_markers() {
         let mut v0 = BytesMut::new();
-        add_pkt_line_string(
-            &mut v0,
-            format!("{} HEAD\0side-band-64k\n", "1".repeat(40)),
-        );
+        add_pkt_line_string(&mut v0, format!("{} HEAD\0side-band-64k\n", "1".repeat(40)));
         add_flush_pkt(&mut v0);
         assert_eq!(
             parse_advertisement(v0.freeze())

@@ -440,10 +440,8 @@ impl HttpsClient {
             advertisement.capabilities.len(),
             crate::internal::object_format::as_str(advertisement.hash_kind)
         );
-        let request = v2::ls_refs::build_request(
-            &advertisement,
-            &v2::ls_refs::LsRefsOptions::complete(),
-        );
+        let request =
+            v2::ls_refs::build_request(&advertisement, &v2::ls_refs::LsRefsOptions::complete());
         let response = self.post_ls_refs(request).await?;
         let refs = v2::ls_refs::parse_response(response, advertisement.hash_kind)?;
         v2::ls_refs::validate_ref_names(&refs)?;
@@ -586,7 +584,9 @@ impl HttpsClient {
         &self,
         body: bytes::Bytes,
     ) -> Result<FetchStream, IoError> {
-        let stream = self.post_upload_pack_inner(body, ProtocolVersion::V2).await?;
+        let stream = self
+            .post_upload_pack_inner(body, ProtocolVersion::V2)
+            .await?;
         Ok(v2::fetch::adapt_response_stream(stream))
     }
 
@@ -690,15 +690,17 @@ async fn preferred_protocol_version(service: ServiceType) -> ProtocolVersion {
     if service != ServiceType::UploadPack {
         return ProtocolVersion::V0;
     }
-    let configured = match crate::internal::config::ConfigKv::get(PROTOCOL_VERSION_CONFIG_KEY).await {
-        Ok(entry) => entry.map(|entry| entry.value.trim().to_string()),
-        Err(error) => {
-            // A config read failure must not silently disable v2: log and keep
-            // the documented default so the fetch still works.
-            tracing::debug!("could not read {PROTOCOL_VERSION_CONFIG_KEY}: {error}");
-            None
-        }
-    };
+    let configured =
+        match crate::internal::config::ConfigKv::get_best_effort(PROTOCOL_VERSION_CONFIG_KEY).await
+        {
+            Ok(entry) => entry.map(|entry| entry.value.trim().to_string()),
+            Err(error) => {
+                // A config read failure must not silently disable v2: log and keep
+                // the documented default so the fetch still works.
+                tracing::debug!("could not read {PROTOCOL_VERSION_CONFIG_KEY}: {error}");
+                None
+            }
+        };
     match configured.as_deref() {
         Some(other) if protocol_version_for_value(other).is_none() => {
             emit_warning(format!(
@@ -793,7 +795,7 @@ mod tests {
         Router,
         body::Bytes as BodyBytes,
         extract::State,
-        http::{HeaderMap, header, HeaderValue},
+        http::{HeaderMap, HeaderValue, header},
         routing::{get, post},
     };
     use bytes::BytesMut;
@@ -867,10 +869,7 @@ mod tests {
                 "a".repeat(40)
             ),
         );
-        add_pkt_line_string(
-            &mut body,
-            format!("{} refs/heads/main\n", "a".repeat(40)),
-        );
+        add_pkt_line_string(&mut body, format!("{} refs/heads/main\n", "a".repeat(40)));
         add_flush_pkt(&mut body);
         body.to_vec()
     }
@@ -881,10 +880,7 @@ mod tests {
             &mut body,
             format!("{} HEAD symref-target:refs/heads/main\n", "a".repeat(40)),
         );
-        add_pkt_line_string(
-            &mut body,
-            format!("{} refs/heads/main\n", "a".repeat(40)),
-        );
+        add_pkt_line_string(&mut body, format!("{} refs/heads/main\n", "a".repeat(40)));
         add_pkt_line_string(
             &mut body,
             format!(
@@ -961,7 +957,9 @@ mod tests {
             )
             .with_state(state);
         tokio::spawn(async move {
-            axum::serve(listener, app).await.expect("serve mock smart HTTP");
+            axum::serve(listener, app)
+                .await
+                .expect("serve mock smart HTTP");
         });
         (
             Url::parse(&format!("http://{addr}/repo/")).expect("mock repository URL"),
