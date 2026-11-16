@@ -1,6 +1,6 @@
 //! plan-20260912 MB-10: `tag_router` transport contract.
 //!
-//! Mock family: list page (GET + required query keys, anonymous), create
+//! Mock family: list page (GET + required query keys, optional Bearer token), create
 //! lightweight vs annotated, delete, 401 on create, 403 on a path-scoped
 //! token for create and delete, hostile name, and the wrong-method
 //! POST-list rejection (405) proving the client only ever uses GET.
@@ -223,7 +223,7 @@ fn client(server: &MockTagServer, with_token: bool) -> Mega2TagClient {
 }
 
 #[tokio::test]
-async fn list_uses_get_with_the_three_required_keys_and_no_authorization() {
+async fn list_uses_get_with_the_three_required_keys_and_the_optional_token() {
     let server = MockTagServer::start(ok_respond);
     let client = client(&server, true);
     let page = client.list_tags(1, 50, "/").await.expect("list succeeds");
@@ -243,9 +243,10 @@ async fn list_uses_get_with_the_three_required_keys_and_no_authorization() {
     for key in ["page=1", "per_page=50", "path=%2F"] {
         assert!(captured.target.contains(key), "{}", captured.target);
     }
-    assert!(
-        !captured.headers.contains_key("authorization"),
-        "list is anonymous: {:?}",
+    assert_eq!(
+        captured.headers.get("authorization").map(String::as_str),
+        Some("Bearer tag-token"),
+        "list carries the optional token: {:?}",
         captured.headers
     );
     assert_eq!(server.requests(), 1, "one page per request");

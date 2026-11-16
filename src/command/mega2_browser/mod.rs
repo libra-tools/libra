@@ -861,12 +861,12 @@ pub async fn run(
     color_enabled: bool,
 ) -> CliResult<()> {
     ensure_tty()?;
-    let session = Mega2TreeSession::new(server)?;
+    let session = Mega2TreeSession::with_token(server, token.clone())?;
     let mut state = BrowserState::new(session, start_path, git_ref.map(str::to_string))?;
     let entry_client = Mega2EntryClient::new(server, token.clone())?;
     let mutate_client = Mega2MutateClient::new(server, token.clone())?;
-    let tag_client = Mega2TagClient::new(server, token)?;
-    let blob_client = Mega2BlobClient::new(server)?;
+    let tag_client = Mega2TagClient::new(server, token.clone())?;
+    let blob_client = Mega2BlobClient::new_with_token(server, token)?;
     let mut guard = TerminalGuard::enter()?;
 
     state.fetch_current().await?;

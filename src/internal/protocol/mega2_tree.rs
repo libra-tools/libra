@@ -1,20 +1,20 @@
 //! Bounded, fail-closed client for the mega2 storage-only `GET /api/v1/tree` listing.
 //!
 //! plan-20260912 MB-01: one level per navigation; only `data.tree_items` is consumed;
-//! server-provided `path` is a receipt, never navigation authority. The client sends
-//! no Authorization header, refuses redirects/proxies, enforces finite connect/request/
-//! body limits and returns a deterministic, validated listing.
+//! server-provided `path` is a receipt, never navigation authority. The client attaches
+//! an optional `Authorization: Bearer` token, refuses redirects/proxies, enforces finite
+//! connect/request/body limits and returns a deterministic, validated listing.
 
 use std::{
     collections::{BTreeSet, VecDeque},
     time::Duration,
 };
 
-use reqwest::StatusCode;
+use reqwest::{StatusCode, header::AUTHORIZATION};
 use serde::Deserialize;
 use url::Url;
 
-use super::mega2_diag;
+use super::{mega2_auth::Mega2Token, mega2_diag};
 use crate::utils::error::{CliError, CliResult, StableErrorCode};
 
 /// Fixed per-request deadline (connect and total request). MB-01 Performance budget.
@@ -85,8 +85,14 @@ struct WireTreeItem {
 }
 
 /// Validates the user-supplied server base URL:
-/// https, or http with a loopback host; no userinfo, query or fragment.
-pub fn validate_server_url(raw: &str) -> CliResult<Url> {
+/// https, or http with a loopback host or a caller-supplied token;
+/// no userinfo, query or fragment.
+///
+/// `has_token` carries the credential decision of the caller: plain `http` is
+/// accepted for any host only when a token is present. Without one the URL is
+/// still refused before any request, and the error names the missing token so
+/// it is distinguishable from a malformed-address rejection.
+pub fn validate_server_url(raw: &str, has_token: bool) -> CliResult<Url> {
     // Never echo `raw`: an unparsable value can still carry credentials
     // (`https://user:secret@host:badport`), and the credential check below only
     // runs on a parsed URL. `url::ParseError` renders a fixed reason without input.
@@ -105,10 +111,15 @@ pub fn validate_server_url(raw: &str) -> CliResult<Url> {
             );
         }
     };
-    if loopback_http && !is_loopback_host(url.host_str()) {
+    if loopback_http && !is_loopback_host(url.host_str()) && !has_token {
         return Err(
-            CliError::fatal("mega2 server URL over http must be a loopback address")
-                .with_stable_code(StableErrorCode::CliInvalidTarget),
+            CliError::fatal(
+                "mega2 server URL over http on a non-loopback host requires a token",
+            )
+            .with_stable_code(StableErrorCode::CliInvalidTarget)
+            .with_hint(
+                "provide a token with --token-file <path> (or LIBRA_MEGA2_TOKEN); without one, https:// or a loopback http:// host is required",
+            ),
         );
     }
     if !url.username().is_empty() || url.password().is_some() {
@@ -138,6 +149,14 @@ pub fn validate_server_url(raw: &str) -> CliResult<Url> {
         .with_stable_code(StableErrorCode::CliInvalidTarget));
     }
     Ok(url)
+}
+
+/// Whether a validated server URL points at a loopback host.
+///
+/// Used by the command layer to warn when a token is about to travel over
+/// plain `http` to a non-loopback host.
+pub fn is_loopback_server(url: &Url) -> bool {
+    is_loopback_host(url.host_str())
 }
 
 fn is_loopback_host(host: Option<&str>) -> bool {
@@ -288,17 +307,33 @@ impl ListingCache {
 pub struct Mega2TreeClient {
     base: Url,
     http: reqwest::Client,
+    token: Option<Mega2Token>,
 }
 
 impl Mega2TreeClient {
-    /// Builds the client with the default [`REQUEST_TIMEOUT`].
+    /// Builds an anonymous client with the default [`REQUEST_TIMEOUT`].
     pub fn new(server_url: &str) -> CliResult<Self> {
         Self::with_timeouts(server_url, REQUEST_TIMEOUT)
     }
 
-    /// Test seam: same builder with a caller-provided deadline.
+    /// Builds a client that attaches `token` (when present) as one
+    /// `Authorization: Bearer` header, with the default [`REQUEST_TIMEOUT`].
+    pub fn new_with_token(server_url: &str, token: Option<Mega2Token>) -> CliResult<Self> {
+        Self::with_timeouts_and_token(server_url, token, REQUEST_TIMEOUT)
+    }
+
+    /// Test seam: anonymous builder with a caller-provided deadline.
     pub fn with_timeouts(server_url: &str, timeout: Duration) -> CliResult<Self> {
-        let base = validate_server_url(server_url)?;
+        Self::with_timeouts_and_token(server_url, None, timeout)
+    }
+
+    /// Test seam: same builder with an optional token and a caller-provided deadline.
+    pub fn with_timeouts_and_token(
+        server_url: &str,
+        token: Option<Mega2Token>,
+        timeout: Duration,
+    ) -> CliResult<Self> {
+        let base = validate_server_url(server_url, token.is_some())?;
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .no_proxy()
@@ -309,11 +344,17 @@ impl Mega2TreeClient {
                 CliError::fatal("cannot build the mega2 HTTP client")
                     .with_stable_code(StableErrorCode::InternalInvariant)
             })?;
-        Ok(Self { base, http })
+        Ok(Self { base, http, token })
+    }
+
+    /// Whether this client will attach an `Authorization` header.
+    pub fn has_token(&self) -> bool {
+        self.token.is_some()
     }
 
     /// One GET per listing: `{base}/api/v1/tree?path=<normalized>[&refs=<ref>]`.
-    /// No Authorization header; response body bounded by [`MAX_RESPONSE_BYTES`].
+    /// The optional token becomes exactly one `Authorization: Bearer` header;
+    /// response body bounded by [`MAX_RESPONSE_BYTES`].
     pub async fn fetch_listing(&self, path: &str, git_ref: Option<&str>) -> CliResult<Listing> {
         mega2_diag::run(mega2_diag::TREE, self.fetch_listing_scoped(path, git_ref)).await
     }
@@ -332,7 +373,13 @@ impl Mega2TreeClient {
             url.query_pairs_mut().append_pair("refs", git_ref);
         }
 
-        let response = mega2_diag::send(self.http.get(url), transport_error).await?;
+        let response = {
+            let mut request = self.http.get(url);
+            if let Some(token) = &self.token {
+                request = request.header(AUTHORIZATION, format!("Bearer {}", token.expose()));
+            }
+            mega2_diag::send(request, transport_error).await?
+        };
         let status = response.status();
         match status {
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
@@ -469,6 +516,15 @@ impl Mega2TreeSession {
     pub fn new(server_url: &str) -> CliResult<Self> {
         Ok(Self {
             client: Mega2TreeClient::new(server_url)?,
+            cache: ListingCache::new(),
+            request_count: 0,
+        })
+    }
+
+    /// Builds a session whose listing requests carry `token` when present.
+    pub fn with_token(server_url: &str, token: Option<Mega2Token>) -> CliResult<Self> {
+        Ok(Self {
+            client: Mega2TreeClient::new_with_token(server_url, token)?,
             cache: ListingCache::new(),
             request_count: 0,
         })
@@ -643,22 +699,52 @@ mod tests {
         format!(r#"{{"name":"{name}","path":"/","content_type":"{content_type}"}}"#)
     }
 
-    // ---- URL validation (AC-1 / AC-2) ----
+    // ---- URL validation: address + credential matrix (issue #18) ----
 
     #[test]
-    fn url_accepts_https_and_loopback_http_only() {
-        assert!(validate_server_url("https://example.com").is_ok());
-        assert!(validate_server_url("https://example.com:8443").is_ok());
-        assert!(validate_server_url("http://127.0.0.1:8080").is_ok());
-        assert!(validate_server_url("http://localhost:8080").is_ok());
-        assert!(validate_server_url("http://[::1]:8080").is_ok());
+    fn url_accepts_https_and_loopback_http_without_a_token() {
+        assert!(validate_server_url("https://example.com", false).is_ok());
+        assert!(validate_server_url("https://example.com:8443", false).is_ok());
+        assert!(validate_server_url("http://127.0.0.1:8080", false).is_ok());
+        assert!(validate_server_url("http://localhost:8080", false).is_ok());
+        assert!(validate_server_url("http://[::1]:8080", false).is_ok());
     }
 
     #[test]
-    fn url_rejects_insecure_or_ambiguous_forms() {
-        for bad in [
+    fn non_loopback_http_is_accepted_only_with_a_token() {
+        for host in [
             "http://example.com",
+            "http://example.com:8080",
             "http://192.168.1.10",
+        ] {
+            assert!(
+                validate_server_url(host, true).is_ok(),
+                "{host} should be accepted with a token"
+            );
+            let err = validate_server_url(host, false).expect_err(host);
+            assert_eq!(
+                err.stable_code(),
+                StableErrorCode::CliInvalidTarget,
+                "{host}"
+            );
+            assert!(
+                err.message().contains("requires a token"),
+                "missing-token error must name the token: {}",
+                err.message()
+            );
+            assert!(
+                err.hints()
+                    .iter()
+                    .any(|hint| hint.as_str().contains("--token-file")),
+                "missing-token error must hint at --token-file: {:?}",
+                err.hints()
+            );
+        }
+    }
+
+    #[test]
+    fn url_rejects_ambiguous_forms_even_with_a_token() {
+        for bad in [
             "ftp://example.com",
             "https://user:pass@example.com",
             "https://example.com/path",
@@ -666,12 +752,14 @@ mod tests {
             "https://example.com#frag",
             "not a url",
         ] {
-            let err = validate_server_url(bad).expect_err(bad);
-            assert_eq!(
-                err.stable_code(),
-                StableErrorCode::CliInvalidTarget,
-                "{bad}"
-            );
+            for has_token in [false, true] {
+                let err = validate_server_url(bad, has_token).expect_err(bad);
+                assert_eq!(
+                    err.stable_code(),
+                    StableErrorCode::CliInvalidTarget,
+                    "{bad} (has_token={has_token})"
+                );
+            }
         }
     }
 
@@ -680,7 +768,7 @@ mod tests {
     #[test]
     fn url_parse_error_does_not_echo_input() {
         let raw = "https://user:MARKER@mega2.example.com:notaport";
-        let err = validate_server_url(raw).expect_err("unparsable port");
+        let err = validate_server_url(raw, true).expect_err("unparsable port");
         assert_eq!(err.stable_code(), StableErrorCode::CliInvalidTarget);
         assert!(
             !err.message().contains("MARKER"),

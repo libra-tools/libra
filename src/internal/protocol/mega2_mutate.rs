@@ -337,7 +337,7 @@ impl Mega2MutateClient {
             ))
             .with_stable_code(StableErrorCode::Unsupported));
         }
-        let base = validate_server_url(server_url)?;
+        let base = validate_server_url(server_url, token.is_some())?;
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .no_proxy()
