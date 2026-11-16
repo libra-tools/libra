@@ -58,6 +58,8 @@ Nowledge 定向检索已尝试，服务连接被环境阻止；本计划依据�
 
 ### SP-09 审计记录交付收口（EX-SP-09-CLOSE-01）
 
+**rustdoc 断链跟进（2026-11-16 09:33 UTC）：** `e39e86f` 的 CI `compat-clippy` 在文档步骤失败，唯一错误是 `v2/fetch.rs` 链接私有函数 `command::fetch::read_fetch_stream_for_kind`。已去掉链接、保留函数名。本地带 `-D rustdoc::broken_intra_doc_links` 的 `cargo doc --no-deps --all-features` exit0。四个 private-link warning 仍在，当前门不拒绝。全量结果以新 head 的实际 CI 为准。
+
 **PR #1058 CI 恢复（2026-11-16 07:39 UTC）：** 已同步 `origin/main` `4e53393aef9480e2b510e1fe2371977a09783920`，保留原 SP-09 审计及上游状态记录。历史 `compat-scoped-input-windows` 的实际编译错误是 `tests/command/agent_roster_test.rs` 无条件使用 Unix `Permissions::from_mode`；`compat-owner-liveness-macos` 在首个精确测试冷构建 53m40s 后被 60 分钟作业取消。两者已由上游 `292e5edf7`、`36323df63` 修复，随后 `0520d8061` 按维护者指令移除平台与 live job；本次沿用该现行 workflow，不恢复已移除作业，也不把移除记为测试通过。当前 main run `43787918610` 的 rustfmt、`collapsible_if` 与四项协议测试失败已在本 head 修复：仓外协议版本读取使用 `ConfigKv::get_best_effort`，强制 legacy 的 v2-only 广告在 pull 保持 `LBR-NET-002`。仓外 focused 32/32、nightly fmt 与严格 Clippy 均 exit0；本机全量 nextest 保持 not-run。最终 head CI 与合并回执待实际运行后回填。原性能数据仍绑定冻结候选，旧失败记录保留；本次不代表整轮性能审计、最终 ER-05 或延期发布/网站事项完成。
 
 **本次构建版工具例外（2026-11-05 01:27:09 UTC）：** 用户随后明确要求“用本机 Build 的 Libra 解决冲突，然后提交推送”，本次授权取代此前暂缓提交时的工具选择，不修改仓库通用规则。仅使用已在本机验证的冻结 0.30.152 二进制 `/data/libra-performance/sp09-20261104/bin/libra-candidate`（SHA-256 `ad3612fdec4117ec2248a696c88073a6cb0fedad183d955cddfbd191cea8d446`）完成本次冲突解决、签名+DCO提交、推送和核验；不覆盖系统安装。开始前 branch 为 `codex/SP-09`、HEAD 为 f2e7a278，三文件改动仍在；PR #1058 已与 main 冲突，需保全本卡和上游记录后重新验收新 head，旧性能证据仍绑定原冻结源码，不外推至同步后的主线。

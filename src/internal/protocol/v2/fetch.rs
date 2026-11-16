@@ -7,7 +7,7 @@
 //! `packfile` section always carries sideband-encoded (`%x01-03`) data.
 //!
 //! [`adapt_response_stream`] turns that framing into the v0 framing that
-//! [`crate::command::fetch::read_fetch_stream_for_kind`] already understands:
+//! `command::fetch::read_fetch_stream_for_kind` already understands:
 //! `shallow`/`unshallow` lines become pkt-lines and the packfile sideband frames
 //! pass through unchanged. The downstream consumer keeps its single, tested
 //! implementation of sideband demultiplexing, pack completion tracking and
