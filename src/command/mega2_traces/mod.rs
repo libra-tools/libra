@@ -829,7 +829,8 @@ fn count(name: &str, value: Option<u64>, default: u64, max: u64) -> CliResult<u6
 }
 
 async fn get_json(endpoint: &EndpointArgs, path: &str, query: &[(&str, &str)]) -> CliResult<Value> {
-    let server = validate_server_url(&endpoint.server)?;
+    // Traces keeps its own (loopback-only) plain-http policy: no token opt-in.
+    let server = validate_server_url(&endpoint.server, false)?;
     let token = resolve_token(
         endpoint.token_file.as_deref(),
         std::env::var(crate::internal::protocol::mega2_auth::ENV_TOKEN_VAR)

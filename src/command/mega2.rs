@@ -323,15 +323,25 @@ pub async fn execute_safe(args: Mega2Args, output: &OutputConfig) -> CliResult<(
 }
 
 async fn execute_browser(args: BrowserArgs, output: &OutputConfig) -> CliResult<()> {
+    // ADR-MB-03 precedence: --token-file → LIBRA_MEGA2_TOKEN → --token. Resolve
+    // before validation: a token is what admits plain http on a non-loopback
+    // host, and it is carried by read and write requests alike.
+    let (token, _source) =
+        resolve_token_from_process(args.token_file.as_deref(), args.token.as_deref())?;
     // Validation happens before any terminal change or network request.
-    let url = validate_server_url(&args.server)?;
+    let url = validate_server_url(&args.server, token.is_some())?;
+    if url.scheme() == "http" && !crate::internal::protocol::mega2_tree::is_loopback_server(&url) {
+        eprintln!(
+            "warning: mega2 token will be sent over plain http to a non-loopback host; prefer https:// on untrusted networks"
+        );
+    }
     let path = normalize_path(&args.path)?;
     let server = canonical_server(&url);
     let git_ref = args.git_ref.as_deref();
 
     // Non-interactive path: an operation flag, or a machine output mode
-    // without one (which lists PATH). The registry's class rules — including
-    // the refusal of token flags — run there, before the one request.
+    // without one (which lists PATH). The registry's class rules run there,
+    // before the one request.
     if let Some(operation) = args
         .operation
         .selected(&args.tag)?
@@ -341,8 +351,7 @@ async fn execute_browser(args: BrowserArgs, output: &OutputConfig) -> CliResult<
             server: &server,
             path: &path,
             git_ref,
-            token_file: args.token_file.as_deref(),
-            token: args.token.as_deref(),
+            token: token.as_ref(),
         };
         return noninteractive::execute(operation, &invocation, output).await;
     }
@@ -354,10 +363,6 @@ async fn execute_browser(args: BrowserArgs, output: &OutputConfig) -> CliResult<
         .with_stable_code(StableErrorCode::CliInvalidArguments)
         .with_hint("run `libra --machine mega2 browser --server <base-url>` for NDJSON output"));
     }
-
-    // ADR-MB-03 precedence: --token-file → LIBRA_MEGA2_TOKEN → --token.
-    let (token, _source) =
-        resolve_token_from_process(args.token_file.as_deref(), args.token.as_deref())?;
 
     crate::command::mega2_browser::run(
         &server,
@@ -375,9 +380,9 @@ mod tests {
 
     #[test]
     fn canonical_server_drops_trailing_slash_and_keeps_port() {
-        let url = validate_server_url("https://mega2.example.com/").expect("valid url");
+        let url = validate_server_url("https://mega2.example.com/", false).expect("valid url");
         assert_eq!(canonical_server(&url), "https://mega2.example.com");
-        let loopback = validate_server_url("http://127.0.0.1:8080").expect("valid loopback");
+        let loopback = validate_server_url("http://127.0.0.1:8080", false).expect("valid loopback");
         assert_eq!(canonical_server(&loopback), "http://127.0.0.1:8080");
     }
 

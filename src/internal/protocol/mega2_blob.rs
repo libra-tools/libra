@@ -1,11 +1,16 @@
-//! Anonymous, bounded text previews from Mega2's storage-only `/api/v1/blob`.
+//! Bounded text previews from Mega2's storage-only `/api/v1/blob`.
+//!
+//! An optional token becomes exactly one `Authorization: Bearer` header; without
+//! a token the request stays anonymous.
 
 use std::time::Duration;
 
+use reqwest::header::AUTHORIZATION;
 use serde::Deserialize;
 use url::Url;
 
 use super::{
+    mega2_auth::Mega2Token,
     mega2_diag,
     mega2_tree::{MAX_RESPONSE_BYTES, REQUEST_TIMEOUT, normalize_path, validate_server_url},
 };
@@ -17,6 +22,7 @@ pub const BLOB_ROUTE: &str = "/api/v1/blob";
 pub struct Mega2BlobClient {
     base: Url,
     http: reqwest::Client,
+    token: Option<Mega2Token>,
 }
 
 #[derive(Deserialize)]
@@ -30,8 +36,20 @@ impl Mega2BlobClient {
         Self::with_timeout(server, REQUEST_TIMEOUT)
     }
 
+    pub fn new_with_token(server: &str, token: Option<Mega2Token>) -> CliResult<Self> {
+        Self::with_timeout_and_token(server, token, REQUEST_TIMEOUT)
+    }
+
     pub fn with_timeout(server: &str, timeout: Duration) -> CliResult<Self> {
-        let base = validate_server_url(server)?;
+        Self::with_timeout_and_token(server, None, timeout)
+    }
+
+    pub fn with_timeout_and_token(
+        server: &str,
+        token: Option<Mega2Token>,
+        timeout: Duration,
+    ) -> CliResult<Self> {
+        let base = validate_server_url(server, token.is_some())?;
         let http = reqwest::Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
@@ -39,7 +57,12 @@ impl Mega2BlobClient {
             .timeout(timeout)
             .build()
             .map_err(|_| protocol_error("cannot build the file preview client"))?;
-        Ok(Self { base, http })
+        Ok(Self { base, http, token })
+    }
+
+    /// Whether this client will attach an `Authorization` header.
+    pub fn has_token(&self) -> bool {
+        self.token.is_some()
     }
 
     pub async fn fetch(&self, path: &str, git_ref: Option<&str>) -> CliResult<String> {
@@ -69,7 +92,11 @@ impl Mega2BlobClient {
         if let Some(git_ref) = git_ref.filter(|value| !value.is_empty()) {
             url.query_pairs_mut().append_pair("refs", git_ref);
         }
-        let mut response = mega2_diag::send(self.http.get(url), transport_error).await?;
+        let mut request = self.http.get(url);
+        if let Some(token) = &self.token {
+            request = request.header(AUTHORIZATION, format!("Bearer {}", token.expose()));
+        }
+        let mut response = mega2_diag::send(request, transport_error).await?;
         let status = response.status();
         if !status.is_success() {
             return Err(CliError::fatal(format!(
