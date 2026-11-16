@@ -76,8 +76,8 @@ metadata and file previews rather than local tree objects. For local object insp
 ## Synopsis
 
 ```
-libra mega2 browser --server <BASE-URL> [PATH] [--ref <COMMIT-OR-TAG>] [--json|--machine]
-libra mega2 browser --server <BASE-URL> [PATH] [--ref <COMMIT-OR-TAG>] --list [--json|--machine]
+libra mega2 browser --server <BASE-URL> [PATH] [--ref <COMMIT-OR-TAG>] [--token-file <PATH> | --token <TOKEN>] [--json|--machine]
+libra mega2 browser --server <BASE-URL> [PATH] [--ref <COMMIT-OR-TAG>] --list [--token-file <PATH> | --token <TOKEN>] [--json|--machine]
 ```
 
 ## Description
@@ -85,22 +85,27 @@ libra mega2 browser --server <BASE-URL> [PATH] [--ref <COMMIT-OR-TAG>] --list [-
 The command validates every input **before** touching the terminal or the
 network:
 
-- `--server` must be `https://…`, or `http://…` only when the host is loopback
-  (`127.0.0.1`, `::1`, `localhost`). Credentials (userinfo), query strings,
-  fragments and a base path are rejected; the client always appends
-  the fixed `/api/v1/tree` and `/api/v1/blob` read routes.
+- `--server` must be `https://…` for any host, or `http://…` when the host is
+  loopback (`127.0.0.1`, `::1`, `localhost`) **or** a token is supplied.
+  Plain-http to a non-loopback host is therefore admitted by the token, not by
+  the address; without a token it is refused before any request with
+  `LBR-CLI-002`, and the message names the missing token so it is
+  distinguishable from a malformed-address rejection. Credentials (userinfo),
+  query strings, fragments and a base path are rejected; the client always
+  appends the fixed `/api/v1/tree` and `/api/v1/blob` read routes.
 - `PATH` must be rooted (`/` by default) and may not contain `.`/`..`
   components, NUL, control characters or platform separators.
 - `--ref` selects a commit or tag to list; when omitted the server's default
   revision is used.
 
-Expanding or reloading a directory sends one anonymous `GET /api/v1/tree`.
-Selecting a file sends one anonymous `GET /api/v1/blob?path=…&refs=…` (the `refs`
-parameter is omitted without `--ref`). Moving among directories, collapsing
-branches, and scrolling already loaded content are local operations.
-No `Authorization` header is attached to either read route, no repository is opened (the
-command works outside a repository), and no local state — index, object store,
-database, configuration — is read or written.
+Expanding or reloading a directory sends one `GET /api/v1/tree`, carrying the
+optional token as one `Authorization: Bearer` header. Selecting a file sends one
+`GET /api/v1/blob?path=…&refs=…` with the same optional header (the `refs`
+parameter is omitted without `--ref`). With no token the reads stay anonymous
+and no `Authorization` header is attached. Moving among directories, collapsing
+branches, and scrolling already loaded content are local operations. No
+repository is opened (the command works outside a repository), and no local
+state — index, object store, database, configuration — is read or written.
 
 The client is bounded: it disables redirects and proxies, applies a 10-second
 timeout, caps the response body at 1 MiB and the listing at 2000 entries, and
@@ -250,12 +255,14 @@ Every non-interactive call follows the same rules:
   (nothing with `--quiet`). On failure stdout is empty and the error goes to
   stderr: the JSON error envelope with `--json`/`--machine` (see
   [Machine error details](#machine-error-details)), the human error otherwise.
-- **Credentials.** Read operations refuse token flags: they are anonymous,
-  reject `--token` and `--token-file` (`LBR-CLI-002`, no request) and ignore
-  `LIBRA_MEGA2_TOKEN`. Write operations, in human and machine mode alike, take
-  at most one token — `--token-file`, then `LIBRA_MEGA2_TOKEN`, then `--token`
-  — and send it as one `Authorization: Bearer` header; with no source they
-  write anonymously (for `push_auth=none` servers). The token is never
+- **Credentials.** Read and write operations alike take at most one optional
+  token — `--token-file`, then `LIBRA_MEGA2_TOKEN`, then `--token` — and send
+  it as one `Authorization: Bearer` header on every request (tree, blob,
+  entry, mutate, tag). With no source, reads and writes stay anonymous (writes
+  work for `push_auth=none` servers). A token is required only to admit plain
+  `http` on a non-loopback host; without one the address is refused. When a
+  token is about to travel over plain http to a non-loopback host, a one-line
+  warning goes to stderr and the request still proceeds. The token is never
   persisted or printed, not even when the server rejects it.
 - **One operation, no `--ref` on writes.** Combining two operation flags is a
   usage error (`LBR-CLI-002`), and so is `--ref` with a write operation:
@@ -397,8 +404,9 @@ Errors:
 | HTTP 404: NAME or PATH does not exist | `LBR-NET-002` | `http_status: 404` |
 | HTTP 401 / 403 / 409, other failures, unknown outcomes | as for `--create-dir` | as for `--create-dir` |
 
-`--list-tags` lists one page of root tags with one anonymous
-`GET /api/v1/tags/list` (query `page`, `per_page` and `path=/`). `--page`
+`--list-tags` lists one page of root tags with one
+`GET /api/v1/tags/list` (query `page`, `per_page` and `path=/`), carrying the
+optional token when one is supplied and staying anonymous otherwise. `--page`
 (1–1000, default 1) and `--per-page` (1–100, default 20, the interactive
 panel's page size) choose the page; both are refused without `--list-tags`.
 Each tag prints as `<name>  <object_type>  <tagger>`, followed by its message
@@ -437,7 +445,7 @@ and differ from page to page, and `has_next` inherits that. Errors:
 | `--page` outside 1–1000 or `--per-page` outside 1–100 | `LBR-CLI-002` | none (no request) |
 | `--page` or `--per-page` without `--list-tags` | `LBR-CLI-002` | none (no request) |
 | A malformed PATH (not rooted, or with `.`/`..` components) | `LBR-CLI-003` | none (no request) |
-| A rooted PATH other than `/`, `--ref`, a token flag, or another operation flag | `LBR-CLI-002` | none (no request) |
+| A rooted PATH other than `/`, `--ref`, or another operation flag | `LBR-CLI-002` | none (no request) |
 | HTTP, transport or response failures | the failure's stable code (see Machine error details) | `http_status` or `transport` |
 
 `--create-tag <NAME>` creates root tag NAME with one `POST /api/v1/tags`
@@ -527,12 +535,13 @@ paths to configured monorepo roots; selecting `/artifact` creates beneath that
 root without attempting a new top-level path. Raw server error bodies are not
 displayed, to avoid leaking secrets.
 
-Write tokens are read, in order of precedence, from `--token-file <path>`,
-then the `LIBRA_MEGA2_TOKEN` environment variable, then `--token` (visible in
-shell history — prefer the first two). The same rule applies to the
-non-interactive write operations (see above). Read operations refuse token
-flags: `--json`/`--machine` without a write flag and `--list` take no
-credentials.
+The token is read, in order of precedence, from `--token-file <path>`, then the
+`LIBRA_MEGA2_TOKEN` environment variable, then `--token` (visible in shell
+history — prefer the first two). The same rule applies to the non-interactive
+operations and to read commands: `--json`/`--machine` without a write flag and
+`--list` attach the token when one is supplied and stay anonymous otherwise.
+Supplying a token is what admits plain `http` on a non-loopback host; else the
+address must be `https://` or loopback `http://`.
 
 ### Deleting, moving and renaming (`d`, `m`, `e`, interactive only)
 
@@ -562,7 +571,7 @@ directory for move).
 
 ### Tag panel (`t`, interactive only)
 
-`t` opens the tag panel and performs exactly **one** anonymous
+`t` opens the tag panel and performs exactly **one**
 `GET /api/v1/tags/list` for page 1 (the three required query keys are
 `page`, `per_page`, `path`; this MVP always uses the repository root
 `path=/`). `n`/`p` request the explicit next/previous page — one request per
@@ -574,16 +583,16 @@ directory listing reappears unchanged.
 
 Tag names are validated with the server's rules before any request (non-empty,
 at most 255 bytes, no `..`, `@{`, `//`, no `.lock` suffix and no
-whitespace/control/forbidden characters). Listing is anonymous; create and
-delete reuse the session write token from ADR-MB-03. Rendered tag fields
-(tagger, message) are sanitized so hostile server strings cannot control the
-terminal. The panel operates root tags only.
+whitespace/control/forbidden characters). Listing carries the same optional
+session token as create and delete (ADR-MB-03) and stays anonymous without
+one. Rendered tag fields (tagger, message) are sanitized so hostile server
+strings cannot control the terminal. The panel operates root tags only.
 
 ## Options
 
 | Option | Description |
 |--------|-------------|
-| `--server <BASE-URL>` | Mega2 server base URL (required). HTTPS, or loopback HTTP. |
+| `--server <BASE-URL>` | Mega2 server base URL (required). HTTPS for any host; plain HTTP for loopback hosts, or for any host when a token is supplied. |
 | `[PATH]` | Rooted directory to list, or the parent for a directory write; defaults to `/`. Tag operations accept only `/`. |
 | `--ref <COMMIT-OR-TAG>` | Optional commit or tag to list. |
 | `--list` | List PATH once without a terminal: plain-text lines, or the JSON payload with `--json`/`--machine`. |
@@ -597,8 +606,8 @@ terminal. The panel operates root tags only.
 | `--create-tag <NAME>` | Create root tag NAME without a terminal (one POST): lightweight, or annotated with `--message`. |
 | `--message <TEXT>` | With `--create-tag`: the annotated tag's message (non-empty, at most 1024 bytes, no control characters). |
 | `--delete-tag <NAME>` | Delete root tag NAME without a terminal (one DELETE, no confirmation). |
-| `--token-file <PATH>` | Write operations (interactive or non-interactive): read the write token from a file (highest precedence). Refused by read operations. |
-| `--token <TOKEN>` | Write operations: inline write token (lowest precedence; visible in shell history — prefer `--token-file`). Refused by read operations. |
+| `--token-file <PATH>` | Read and write operations (interactive or non-interactive): read the token from a file (highest precedence). It also admits plain HTTP on a non-loopback host. |
+| `--token <TOKEN>` | Read and write operations: inline token (lowest precedence; visible in shell history — prefer `--token-file`). |
 | `--json[=<FORMAT>]` | Global flag: one request, JSON envelope (`pretty`/`compact`/`ndjson`). |
 | `--machine` | Global flag: strict NDJSON machine mode for automation. |
 
@@ -607,6 +616,7 @@ terminal. The panel operates root tags only.
 | Situation | Stable behavior |
 |-----------|-----------------|
 | Invalid invocation (bad URL, unrooted path, missing `--server`) | Usage error, no request |
+| Plain HTTP on a non-loopback host without a token | `LBR-CLI-002` before any request; the message names the missing token and hints at `--token-file` |
 | Interactive mode without a TTY | Refused before any terminal change or request; hint to use `--json` |
 | Network unavailable / timeout | Stable network error, no response body echoed |
 | HTTP 4xx/5xx or a redirect | Stable error naming the status; the body is never printed |
@@ -642,7 +652,8 @@ never include the response body, the server URL or a token; see
 - One request per directory expansion/reload or file selection; moving between
   directory rows and collapsing branches sends none. No recursive prefetch,
   background task, or cache that outlives the process.
-- Browse is read-only and anonymous. A confirmed `a` adds at most one
+- Browse is read-only and sends the optional token when one is supplied. A
+  confirmed `a` adds at most one
   `create-entry` POST plus one reload GET; `d`/`m`/`e` likewise add one
   `delete-entry`/`move-entry` POST plus one parent reload GET (a cross-parent
   move from a nested branch adds one root reload). No recursive or
