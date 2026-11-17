@@ -2,7 +2,7 @@
 
 **模板版本:** `v2.16`。本计划不在 v2.16 具名 `code-only` 范围内，按普通发布合同执行：会推送的独立卡与家族发布点各自 `patch + 1` 并走 ER-08。
 
-**状态:** 未启动。全部任务卡 `Lifecycle=pending`、`Acceptance` 为空。本文只规划，不宣称实现。
+**状态:** 实施中。CQ-01 为 `Lifecycle=done`、`Acceptance=complete`。其余任务卡仍为 `pending` / 空。用户要求每张卡在 `main` 上提交并推送，因此这次执行不遵守 REL-CQ-01 的“子卡不推送”。
 
 ## 文档职责
 
@@ -281,7 +281,7 @@ ER-01..ER-14 按模板 v2.16 执行，本文不削弱。补充：
 
 **Task type:** `migration`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `complete`
 
 **Description:** 增加 `DatabaseRole::Capture` 和 `.libra/private/capture.db`，把现有捕获目录拷贝进去，并提供唯一打开入口 `capture_store`。本卡不切换生产调用点，也不删除 `libra.db` 里的原表。
 
@@ -301,18 +301,18 @@ ER-01..ER-14 按模板 v2.16 执行，本文不削弱。补充：
 
 **Acceptance criteria:**
 
-- [ ] 新仓库创建 `.libra/private/`（0700）和 `capture.db`，其 `schema_versions` 与仓库库分开。
-- [ ] Capture migration 不修改 Repository、GlobalConfig、SystemConfig 的 receipt。
-- [ ] 拷贝可重入：第二次执行不增加行数。
-- [ ] `capture.db` schema 过新时只拒绝该文件，同一夹具的 `libra.db` 仍能打开。
-- [ ] 本卡结束后 `libra.db` 的 `schema_versions` 最大值与拷贝前相同，旧表仍在。
-- [ ] 生产调用点还没有改走 `capture_store`。本卡测试是唯一调用者。
+- [x] 新仓库创建 `.libra/private/`（0700）和 `capture.db`，其 `schema_versions` 与仓库库分开。
+- [x] Capture migration 不修改 Repository、GlobalConfig、SystemConfig 的 receipt。
+- [x] 拷贝可重入：第二次执行不增加行数。
+- [x] `capture.db` schema 过新时只拒绝该文件，同一夹具的 `libra.db` 仍能打开。
+- [x] 本卡结束后 `libra.db` 的 `schema_versions` 最大值与拷贝前相同，旧表仍在。
+- [x] 生产调用点还没有改走 `capture_store`。本卡测试是唯一调用者。
 
 **Verification:**
 
-- [ ] `source .env.test && cargo nextest run -E 'test(/^capture_db_/)'`（new：角色、四库隔离、重入拷贝、未来 schema、仓库 schema 版本不变）
-- [ ] `if rg -n 'capture_store::' src --glob '!src/internal/ai/capture/store.rs'; then echo 'FAIL: production caller'; exit 1; else rc=$?; if [ "$rc" -ne 1 ]; then echo "ERROR: rg failed with exit $rc"; exit "$rc"; fi; echo 'OK: zero hits'; fi`
-- [ ] `source .env.test && cargo nextest run --test compat_global_config_schema_future`
+- [x] `source .env.test && cargo nextest run -E 'test(/^capture_db_/)'`（new：角色、四库隔离、重入拷贝、未来 schema、仓库 schema 版本不变）
+- [x] `if rg -n 'capture_store::' src --glob '!src/internal/ai/capture/store.rs'; then echo 'FAIL: production caller'; exit 1; else rc=$?; if [ "$rc" -ne 1 ]; then echo "ERROR: rg failed with exit $rc"; exit "$rc"; fi; echo 'OK: zero hits'; fi`
+- [x] `source .env.test && cargo nextest run --test compat_global_config_schema_future`
 
 **Full-suite trigger:** `N/A`（family child，不执行 C 组）
 
@@ -851,7 +851,13 @@ Result 只允许 `PASS` 或 `FAIL`。R7 是当前结论。
 
 ## 实施证据汇总
 
-尚无实施证据。后续测试计数、SHA、run ID 与门结果只写在本节，不另建文件。
+### CQ-01（2026-11-17 04:03:53 UTC）
+
+先 `cargo test --test db_migration_test --test compat_global_config_schema_future --no-run`，再运行这两个产物。`db_migration_test` 里 `capture_db_*` 6 项通过，另有 `role_scope::database_role_manifest_is_total_and_disjoint` 与 `every_migration_sql_file_is_referenced_by_the_registry` 各 1 项通过。`compat_global_config_schema_future` 54 项通过，0 失败。全工作区 `cargo nextest` 会先编译每一个测试产物；那次编译把负载打到 450 后已停止，不把未跑完的 nextest 算通过。`rg` 在 `store.rs` 以外的 `src` 中找不到 `capture_store::`。`cargo +nightly fmt --all --check` exit 0。版本仍是 `0.30.207`。
+
+穷尽匹配同时改了 `src/internal/config.rs` 和 `src/utils/client_storage.rs`。Repository 打开臂的原文未改。`2026111601` 没有进入 Repository 的 `builtin_migrations()`，`libra.db` 里的捕获表也没有删除。
+
+这次执行按用户要求把子卡推到 `main`。REL-CQ-01 原文仍要求子卡留在本地，直到 CQ-04。
 
 ## 完成判据
 

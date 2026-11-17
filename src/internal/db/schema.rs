@@ -25,6 +25,8 @@ pub enum DatabaseRole {
     GlobalConfig,
     SystemConfig,
     Derived,
+    /// Catalog file `.libra/private/capture.db`. Opened only by the capture store.
+    Capture,
 }
 
 impl fmt::Display for DatabaseRole {
@@ -34,6 +36,7 @@ impl fmt::Display for DatabaseRole {
             Self::GlobalConfig => "global configuration",
             Self::SystemConfig => "system configuration",
             Self::Derived => "derived",
+            Self::Capture => "capture",
         })
     }
 }
@@ -42,12 +45,13 @@ impl fmt::Display for DatabaseRole {
 pub enum SchemaLedger {
     Repository,
     Configuration,
+    Capture,
 }
 
 impl SchemaLedger {
     pub fn table_name(self) -> &'static str {
         match self {
-            Self::Repository => "schema_versions",
+            Self::Repository | Self::Capture => "schema_versions",
             Self::Configuration => "configuration_schema_versions",
         }
     }
@@ -82,6 +86,13 @@ CREATE TABLE IF NOT EXISTS configuration_schema_versions (
 
 const CONFIGURATION_BASE_VERSION: i64 = 2026090601;
 const CONFIGURATION_BASE_NAME: &str = "configuration_base";
+
+/// Capture catalog schema. This receipt lives only in `capture.db`.
+pub const CAPTURE_SCHEMA_VERSION: i64 = 2026111601;
+pub const CAPTURE_SCHEMA_NAME: &str = "capture_database";
+pub const CAPTURE_DATABASE_SQL: &str =
+    include_str!("../../../sql/migrations/2026111601_capture_database.sql");
+const CAPTURE_ROLES: &[DatabaseRole] = &[DatabaseRole::Capture];
 
 /// An explicit-mutation-only compatibility migration, deliberately excluded
 /// from automatic migrations and bootstraps. The legacy namespace must remain
@@ -256,6 +267,15 @@ fn build_schema_manifest() -> SchemaManifest {
             down: None,
         },
     });
+    migrations.push(ScopedMigration {
+        roles: CAPTURE_ROLES,
+        migration: Migration {
+            version: CAPTURE_SCHEMA_VERSION,
+            name: CAPTURE_SCHEMA_NAME,
+            up: CAPTURE_DATABASE_SQL,
+            down: None,
+        },
+    });
     SchemaManifest {
         migrations,
         bootstraps: BOOTSTRAPS,
@@ -268,6 +288,7 @@ pub fn ledger_for_role(role: DatabaseRole) -> io::Result<SchemaLedger> {
     match role {
         DatabaseRole::Repository => Ok(SchemaLedger::Repository),
         DatabaseRole::GlobalConfig | DatabaseRole::SystemConfig => Ok(SchemaLedger::Configuration),
+        DatabaseRole::Capture => Ok(SchemaLedger::Capture),
         DatabaseRole::Derived => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "derived databases are owned by their subsystem; use its schema API instead of runtime migrations",
@@ -302,11 +323,12 @@ pub fn top_ups_for_role(role: DatabaseRole) -> impl Iterator<Item = SchemaTopUp>
 pub fn latest_schema_version_for_role(role: DatabaseRole) -> io::Result<Option<i64>> {
     // Validate once per role, not on every cache hit or configuration lookup.
     // All successful subsequent inspections perform only the two SQL queries.
-    static LATEST: [OnceLock<Result<Option<i64>, String>>; 3] = [const { OnceLock::new() }; 3];
+    static LATEST: [OnceLock<Result<Option<i64>, String>>; 4] = [const { OnceLock::new() }; 4];
     let index = match role {
         DatabaseRole::Repository => 0,
         DatabaseRole::GlobalConfig => 1,
         DatabaseRole::SystemConfig => 2,
+        DatabaseRole::Capture => 3,
         DatabaseRole::Derived => return ledger_for_role(role).map(|_| None),
     };
     LATEST[index]
@@ -419,9 +441,11 @@ fn require_configuration_role(role: DatabaseRole) -> io::Result<()> {
 fn registered_receipts(ledger: SchemaLedger) -> &'static BTreeMap<i64, &'static str> {
     static REPOSITORY_RECEIPTS: OnceLock<BTreeMap<i64, &'static str>> = OnceLock::new();
     static CONFIGURATION_RECEIPTS: OnceLock<BTreeMap<i64, &'static str>> = OnceLock::new();
+    static CAPTURE_RECEIPTS: OnceLock<BTreeMap<i64, &'static str>> = OnceLock::new();
     let (cache, role) = match ledger {
         SchemaLedger::Repository => (&REPOSITORY_RECEIPTS, DatabaseRole::Repository),
         SchemaLedger::Configuration => (&CONFIGURATION_RECEIPTS, DatabaseRole::GlobalConfig),
+        SchemaLedger::Capture => (&CAPTURE_RECEIPTS, DatabaseRole::Capture),
     };
     cache.get_or_init(|| {
         migrations_for_role(role)
@@ -699,12 +723,23 @@ pub(crate) async fn initialize_configuration_ledger_for_repair(
     Ok(())
 }
 
+fn reject_direct_capture_open(role: DatabaseRole) -> io::Result<()> {
+    if role == DatabaseRole::Capture {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "capture databases open only through the capture store",
+        ));
+    }
+    Ok(())
+}
+
 async fn open_literal_connection(
     db_path: &Path,
     busy_timeout: Duration,
     role: DatabaseRole,
     read_only: bool,
 ) -> io::Result<DatabaseConnection> {
+    reject_direct_capture_open(role)?;
     ledger_for_role(role)?;
     // Absolute paths also prevent a relative filename starting with `file:`
     // from being interpreted as a SQLite URI (SQLITE_OPEN_URI is enabled).
@@ -817,6 +852,7 @@ async fn establish_connection_within_for_role(
     open_timeout: Duration,
     role: DatabaseRole,
 ) -> io::Result<DatabaseConnection> {
+    reject_direct_capture_open(role)?;
     ledger_for_role(role)?;
     let conn = super::open_connection_without_schema_management_within(
         db_path,
@@ -836,6 +872,7 @@ pub async fn inspect_database_schema_for_role(
     db_path: &Path,
     role: DatabaseRole,
 ) -> io::Result<SchemaCompatibility> {
+    reject_direct_capture_open(role)?;
     ledger_for_role(role)?;
     let conn = super::open_database_without_migrations(db_path).await?;
     let result = inspect_schema_for_connection(&conn, role).await;
@@ -849,6 +886,7 @@ pub async fn upgrade_database_schema_for_role(
     db_path: &Path,
     role: DatabaseRole,
 ) -> io::Result<SchemaUpgradeReport> {
+    reject_direct_capture_open(role)?;
     ledger_for_role(role)?;
     let conn = super::open_database_without_migrations(db_path).await?;
     let result = upgrade_connection_for_role(&conn, role).await;
@@ -870,6 +908,7 @@ async fn upgrade_connection_with_policy(
     role: DatabaseRole,
     policy: SchemaPolicy,
 ) -> io::Result<SchemaUpgradeReport> {
+    reject_direct_capture_open(role)?;
     let ledger = ledger_for_role(role)?;
     inspect_supported_schema(conn, role, policy).await?;
     if ledger == SchemaLedger::Repository {
@@ -967,6 +1006,7 @@ pub async fn create_database_for_role(
     db_path: &str,
     role: DatabaseRole,
 ) -> io::Result<DatabaseConnection> {
+    reject_direct_capture_open(role)?;
     ledger_for_role(role)?;
     std::fs::OpenOptions::new()
         .write(true)

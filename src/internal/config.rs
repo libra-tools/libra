@@ -2704,8 +2704,8 @@ async fn open_scoped_config_reader(
             schema::check_configuration_schema(&conn, role).await?;
             Ok(conn)
         }
-        DatabaseRole::Derived => Err(anyhow!(
-            "derived databases cannot supply configuration defaults; select the owning configuration scope"
+        DatabaseRole::Derived | DatabaseRole::Capture => Err(anyhow!(
+            "{role} databases cannot supply configuration defaults; select the owning configuration scope"
         )),
     }
 }

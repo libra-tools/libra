@@ -42,6 +42,7 @@ pub(crate) mod runtime_scope;
 pub(crate) mod scope_binding;
 pub mod snapshot;
 pub(crate) mod state;
+pub mod store;
 pub(crate) mod summary;
 #[doc(hidden)]
 pub mod test_support;

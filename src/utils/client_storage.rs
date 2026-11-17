@@ -1376,6 +1376,7 @@ impl GlobalConfigSchemaFuture {
             DatabaseRole::SystemConfig => "system",
             DatabaseRole::Repository => "repository",
             DatabaseRole::Derived => "derived",
+            DatabaseRole::Capture => "capture",
         }
     }
 }
@@ -3814,7 +3815,7 @@ async fn read_config_env_value_once(
             })?;
             (conn, "local")
         }
-        DatabaseRole::SystemConfig | DatabaseRole::Derived => {
+        DatabaseRole::SystemConfig | DatabaseRole::Derived | DatabaseRole::Capture => {
             return Err(format!(
                 "{role} cannot supply storage credentials; use local or global configuration"
             )

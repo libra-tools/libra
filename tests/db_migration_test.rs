@@ -4,12 +4,23 @@
 //! `tempfile::tempdir()` so the cases neither pollute each other nor
 //! depend on the embedded canonical bootstrap path.
 
-use std::{ffi::OsStr, panic::AssertUnwindSafe, path::PathBuf};
+use std::{
+    ffi::OsStr,
+    os::unix::fs::PermissionsExt,
+    panic::AssertUnwindSafe,
+    path::{Path, PathBuf},
+    process::Command,
+    sync::atomic::Ordering,
+    time::Duration,
+};
 
 use git_internal::hash::{HashKind, ObjectHash};
 use libra::{
     internal::{
-        ai::history::{agent_sessions_for_commit, link_agent_sessions_to_commit},
+        ai::{
+            capture::store::{self, CAPTURE_COPY_BATCH, CAPTURE_COPY_BATCH_PEAK},
+            history::{agent_sessions_for_commit, link_agent_sessions_to_commit},
+        },
         db::{
             self, DatabaseRole, SchemaCompatibility,
             migration::{
@@ -7593,4 +7604,397 @@ async fn agent_kind_check_rebuild_leaves_ordinary_migrations_on_the_pool() {
         .find(|migration| migration.version == HERMES_CHECK_VERSION)
         .expect("hermes migration");
     assert!(hermes.up.contains("RAISE(ABORT"));
+}
+
+async fn capture_has_table(conn: &DatabaseConnection, table: &str) -> bool {
+    conn.query_one_raw(Statement::from_sql_and_values(
+        conn.get_database_backend(),
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1",
+        [table.into()],
+    ))
+    .await
+    .unwrap()
+    .is_some()
+}
+
+async fn capture_count(conn: &DatabaseConnection, table: &str) -> i64 {
+    let row = conn
+        .query_one_raw(Statement::from_string(
+            conn.get_database_backend(),
+            format!("SELECT COUNT(*) FROM \"{table}\""),
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    row.try_get_by_index(0).unwrap()
+}
+
+async fn capture_schema_max(conn: &DatabaseConnection) -> Option<i64> {
+    db::schema::current_schema_version_for_role(conn, DatabaseRole::Repository)
+        .await
+        .unwrap()
+}
+
+fn capture_storage(dir: &Path) -> PathBuf {
+    let storage = dir.join(".libra");
+    std::fs::create_dir_all(&storage).unwrap();
+    storage
+}
+
+async fn capture_repository(dir: &Path) -> PathBuf {
+    let storage = capture_storage(dir);
+    let database = storage.join("libra.db");
+    db::create_database(database.to_str().unwrap())
+        .await
+        .unwrap();
+    storage
+}
+
+async fn insert_capture_sessions(database: &Path, count: usize, payload: &str) {
+    let conn = db::establish_connection(database.to_str().unwrap())
+        .await
+        .unwrap();
+    for index in 0..count {
+        conn.execute_raw(Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            "INSERT INTO agent_session (
+                session_id, agent_kind, provider_session_id, state, working_dir,
+                metadata_json, started_at, last_event_at
+             ) VALUES (?, 'claude_code', ?, 'active', '/work', ?, ?, ?)",
+            [
+                format!("session-{index}").into(),
+                format!("provider-{index}").into(),
+                payload.into(),
+                (index as i64).into(),
+                (index as i64).into(),
+            ],
+        ))
+        .await
+        .unwrap();
+    }
+    conn.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn capture_db_new_repository_creates_private_capture_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = capture_repository(dir.path()).await;
+    let before = capture_schema_max(
+        &db::establish_connection(storage.join("libra.db").to_str().unwrap())
+            .await
+            .unwrap(),
+    )
+    .await;
+    let capture = store::open(&storage, Duration::from_secs(5)).await.unwrap();
+    let private_dir = storage.join("private");
+    let mode = std::fs::metadata(&private_dir)
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o700);
+    let file_mode = std::fs::metadata(private_dir.join("capture.db"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(file_mode, 0o600);
+    assert_eq!(
+        db::schema::current_schema_version_for_role(&capture, DatabaseRole::Capture)
+            .await
+            .unwrap(),
+        Some(db::schema::CAPTURE_SCHEMA_VERSION)
+    );
+    assert_eq!(
+        capture_schema_max(
+            &db::establish_connection(storage.join("libra.db").to_str().unwrap())
+                .await
+                .unwrap()
+        )
+        .await,
+        before
+    );
+    let journal: String = capture
+        .query_one_raw(Statement::from_string(
+            capture.get_database_backend(),
+            "PRAGMA journal_mode".to_owned(),
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get_by_index(0)
+        .unwrap();
+    assert_eq!(journal.to_ascii_lowercase(), "delete");
+    let synchronous: i64 = capture
+        .query_one_raw(Statement::from_string(
+            capture.get_database_backend(),
+            "PRAGMA synchronous".to_owned(),
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get_by_index(0)
+        .unwrap();
+    assert_eq!(synchronous, 2);
+    let databases: i64 = capture
+        .query_one_raw(Statement::from_string(
+            capture.get_database_backend(),
+            "SELECT COUNT(*) FROM pragma_database_list".to_owned(),
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get_by_index(0)
+        .unwrap();
+    assert_eq!(databases, 1);
+    assert!(capture_has_table(&capture, "agent_session").await);
+    assert!(
+        !builtin_migrations()
+            .iter()
+            .any(|migration| migration.version == db::schema::CAPTURE_SCHEMA_VERSION)
+    );
+    assert_eq!(
+        db::schema::migrations_for_role(DatabaseRole::Capture)
+            .iter()
+            .map(|migration| migration.version)
+            .collect::<Vec<_>>(),
+        vec![db::schema::CAPTURE_SCHEMA_VERSION]
+    );
+    for role in [
+        DatabaseRole::Repository,
+        DatabaseRole::GlobalConfig,
+        DatabaseRole::SystemConfig,
+        DatabaseRole::Derived,
+    ] {
+        assert!(
+            db::schema::migrations_for_role(role)
+                .iter()
+                .all(|migration| migration.version != db::schema::CAPTURE_SCHEMA_VERSION),
+            "{role} must not receive the capture receipt"
+        );
+    }
+    let refused = dir.path().join("refused-capture.db");
+    let error = db::create_database_for_role(refused.to_str().unwrap(), DatabaseRole::Capture)
+        .await
+        .expect_err("repository creation must not open the capture role");
+    assert!(error.to_string().contains("capture store"));
+    assert!(!refused.exists());
+}
+
+#[tokio::test]
+async fn capture_db_copy_is_reentrant_and_batched() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = capture_repository(dir.path()).await;
+    let repository = storage.join("libra.db");
+    let payload = "t".repeat(1024);
+    insert_capture_sessions(&repository, CAPTURE_COPY_BATCH + 1, &payload).await;
+    CAPTURE_COPY_BATCH_PEAK.store(0, Ordering::Relaxed);
+    let capture = store::open(&storage, Duration::from_secs(30))
+        .await
+        .unwrap();
+    assert_eq!(
+        capture_count(&capture, "agent_session").await,
+        (CAPTURE_COPY_BATCH + 1) as i64
+    );
+    assert_eq!(
+        CAPTURE_COPY_BATCH_PEAK.load(Ordering::Relaxed),
+        CAPTURE_COPY_BATCH
+    );
+    let again = store::copy_catalog_from_repository(&capture, &repository)
+        .await
+        .unwrap();
+    let _ = again;
+    assert_eq!(
+        capture_count(&capture, "agent_session").await,
+        (CAPTURE_COPY_BATCH + 1) as i64
+    );
+    assert_eq!(
+        capture_count(
+            &db::establish_connection(repository.to_str().unwrap())
+                .await
+                .unwrap(),
+            "agent_session"
+        )
+        .await,
+        (CAPTURE_COPY_BATCH + 1) as i64
+    );
+    let reopened = store::open(&storage, Duration::from_secs(30))
+        .await
+        .unwrap();
+    assert_eq!(
+        capture_count(&reopened, "agent_session").await,
+        (CAPTURE_COPY_BATCH + 1) as i64
+    );
+}
+
+#[tokio::test]
+async fn capture_db_copy_keeps_rows_guarded_by_tombstones() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = capture_repository(dir.path()).await;
+    let repository = storage.join("libra.db");
+    insert_capture_sessions(&repository, 1, "{}").await;
+    let conn = db::establish_connection(repository.to_str().unwrap())
+        .await
+        .unwrap();
+    conn.execute_raw(Statement::from_string(
+        conn.get_database_backend(),
+        "INSERT INTO agent_import_tombstone (
+            tombstone_id, agent_kind, provider_session_id, erased_session_id, erased_at
+         ) VALUES ('tomb-1', 'claude_code', 'provider-0', 'session-0', 1)"
+            .to_owned(),
+    ))
+    .await
+    .unwrap();
+    conn.close().await.unwrap();
+    let capture = store::open(&storage, Duration::from_secs(30))
+        .await
+        .expect("tombstoned catalog rows must copy");
+    assert_eq!(capture_count(&capture, "agent_session").await, 1);
+    assert_eq!(capture_count(&capture, "agent_import_tombstone").await, 1);
+}
+
+#[tokio::test]
+async fn capture_db_future_schema_rejects_only_capture_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = capture_repository(dir.path()).await;
+    let capture = store::open(&storage, Duration::from_secs(5)).await.unwrap();
+    capture
+        .execute_raw(Statement::from_sql_and_values(
+            capture.get_database_backend(),
+            "INSERT INTO schema_versions (version, name, applied_at) VALUES (?, 'future-capture', ?)",
+            [2099010101_i64.into(), "2000-01-01T00:00:00Z".into()],
+        ))
+        .await
+        .unwrap();
+    capture.close().await.unwrap();
+    let refused = store::open(&storage, Duration::from_secs(5))
+        .await
+        .expect_err("a newer capture schema must be refused");
+    let message = refused.to_string();
+    assert!(message.contains("capture database"), "{message}");
+    assert!(message.contains("newer"), "{message}");
+    assert!(!message.contains("repository database schema"), "{message}");
+    let repository = db::establish_connection(storage.join("libra.db").to_str().unwrap())
+        .await
+        .expect("the repository database still opens");
+    assert!(capture_schema_max(&repository).await.is_some());
+    repository.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn capture_db_old_reader_schema_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let global = dir.path().join("global.db");
+    let system = dir.path().join("system.db");
+    let derived = dir.path().join("derived.db");
+    let global_conn =
+        db::create_database_for_role(global.to_str().unwrap(), DatabaseRole::GlobalConfig)
+            .await
+            .unwrap();
+    let system_conn =
+        db::create_database_for_role(system.to_str().unwrap(), DatabaseRole::SystemConfig)
+            .await
+            .unwrap();
+    let global_before =
+        db::schema::current_schema_version_for_role(&global_conn, DatabaseRole::GlobalConfig)
+            .await
+            .unwrap();
+    let system_before =
+        db::schema::current_schema_version_for_role(&system_conn, DatabaseRole::SystemConfig)
+            .await
+            .unwrap();
+    global_conn.close().await.unwrap();
+    system_conn.close().await.unwrap();
+    std::fs::write(&derived, b"derived-unchanged").unwrap();
+    let global_bytes = std::fs::read(&global).unwrap();
+    let system_bytes = std::fs::read(&system).unwrap();
+    let storage = capture_repository(dir.path()).await;
+    let repository = db::establish_connection(storage.join("libra.db").to_str().unwrap())
+        .await
+        .unwrap();
+    let repository_before = capture_schema_max(&repository).await;
+    repository.close().await.unwrap();
+    let capture = store::open(&storage, Duration::from_secs(5)).await.unwrap();
+    capture.close().await.unwrap();
+    let repository = db::establish_connection(storage.join("libra.db").to_str().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(capture_schema_max(&repository).await, repository_before);
+    assert!(capture_has_table(&repository, "agent_session").await);
+    repository.close().await.unwrap();
+    let global_conn =
+        db::establish_connection_for_role(global.to_str().unwrap(), DatabaseRole::GlobalConfig)
+            .await
+            .unwrap();
+    let system_conn =
+        db::establish_connection_for_role(system.to_str().unwrap(), DatabaseRole::SystemConfig)
+            .await
+            .unwrap();
+    assert_eq!(
+        db::schema::current_schema_version_for_role(&global_conn, DatabaseRole::GlobalConfig)
+            .await
+            .unwrap(),
+        global_before
+    );
+    assert_eq!(
+        db::schema::current_schema_version_for_role(&system_conn, DatabaseRole::SystemConfig)
+            .await
+            .unwrap(),
+        system_before
+    );
+    assert_eq!(std::fs::read(&global).unwrap(), global_bytes);
+    assert_eq!(std::fs::read(&system).unwrap(), system_bytes);
+    assert_eq!(std::fs::read(&derived).unwrap(), b"derived-unchanged");
+}
+
+#[tokio::test]
+async fn capture_db_status_does_not_open_capture_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&repo).unwrap();
+    let bin = env!("CARGO_BIN_EXE_libra");
+    let mut init = Command::new(bin);
+    init.env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("LIBRA_CONFIG_GLOBAL_DB", home.join("global.db"))
+        .env("LIBRA_CONFIG_SYSTEM_DB", home.join("system.db"))
+        .env("LIBRA_TEST", "1")
+        .current_dir(&repo)
+        .arg("init");
+    let init = init.output().unwrap();
+    assert!(
+        init.status.success(),
+        "init failed: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    let mut status = Command::new(bin);
+    status
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("LIBRA_CONFIG_GLOBAL_DB", home.join("global.db"))
+        .env("LIBRA_CONFIG_SYSTEM_DB", home.join("system.db"))
+        .env("LIBRA_TEST", "1")
+        .current_dir(&repo)
+        .arg("status");
+    let status = status.output().unwrap();
+    assert!(
+        status.status.success(),
+        "status failed: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    assert!(
+        !repo
+            .join(".libra")
+            .join("private")
+            .join("capture.db")
+            .exists()
+    );
 }
