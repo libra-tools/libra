@@ -2032,3 +2032,56 @@ fn test_revert_restores_executable_bit() {
         "revert must restore the execute bit"
     );
 }
+
+/// Reverting an older commit rebuilds directory trees that have never been
+/// stored. Those intermediate trees must be written before the index loads them;
+/// otherwise revert fails with "Can't find specific object".
+#[test]
+fn revert_of_a_nested_change_stores_the_rebuilt_directory() {
+    let repo = create_committed_repo_via_cli();
+    let root = repo.path();
+    fs::create_dir(root.join("src")).unwrap();
+    fs::write(root.join("src/a.txt"), "one\n").unwrap();
+    fs::write(root.join("src/b.txt"), "keep\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "src/a.txt", "src/b.txt"], root),
+        "add nested base",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "nested base", "--no-verify"], root),
+        "commit nested base",
+    );
+    fs::write(root.join("src/a.txt"), "two\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "src/a.txt"], root),
+        "add nested change",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "nested change", "--no-verify"], root),
+        "commit nested change",
+    );
+    let reverted = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], root).stdout)
+        .trim()
+        .to_string();
+    fs::write(root.join("src/c.txt"), "later\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "src/c.txt"], root),
+        "add later nested file",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "later nested file", "--no-verify"], root),
+        "commit later nested file",
+    );
+
+    let output = run_libra_command(&["revert", "-n", &reverted], root);
+    assert_cli_success(&output, "revert nested non-HEAD commit");
+    assert_eq!(fs::read_to_string(root.join("src/a.txt")).unwrap(), "one\n");
+    assert_eq!(
+        fs::read_to_string(root.join("src/b.txt")).unwrap(),
+        "keep\n"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("src/c.txt")).unwrap(),
+        "later\n"
+    );
+}

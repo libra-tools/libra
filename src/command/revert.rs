@@ -1679,6 +1679,12 @@ async fn build_tree_from_map(
         }
         for (subdir, subdir_files) in subdirs {
             let subdir_tree = build_subtree(&subdir_files.into_iter().collect(), modes, &subdir)?;
+            // The root tree is stored by the caller. Every directory below it is a new
+            // object whenever the revert changes a nested file, and the index rebuild
+            // loads those trees by id. Leaving them unsaved makes `revert` of any
+            // non-HEAD commit fail with "Can't find specific object".
+            save_object(&subdir_tree, &subdir_tree.id)
+                .map_err(|e| RevertError::SaveObject(e.to_string()))?;
             tree_items.push(git_internal::internal::object::tree::TreeItem {
                 mode: git_internal::internal::object::tree::TreeItemMode::Tree,
                 name: file_name_to_utf8(&subdir)?,
