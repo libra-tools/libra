@@ -23,6 +23,7 @@ async fn ctx() -> BridgeContext {
         .await
         .expect("apply migrations");
     BridgeContext {
+        repo: conn.clone(),
         conn,
         repository_id: "repo-1".into(),
         worktree_id: None,
@@ -277,11 +278,13 @@ async fn status_get_totals_are_repository_scoped() {
 
     // Two repositories share one database; both open sessions and write events.
     let repo1 = BridgeContext {
+        repo: conn.clone(),
         conn: conn.clone(),
         repository_id: "repo-1".into(),
         worktree_id: None,
     };
     let repo2 = BridgeContext {
+        repo: conn.clone(),
         conn: conn.clone(),
         repository_id: "repo-2".into(),
         worktree_id: None,

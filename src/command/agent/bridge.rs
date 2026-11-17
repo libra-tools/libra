@@ -26,7 +26,7 @@ use crate::{
             transport::{BridgeHandler, run},
             workspace::dispatch as dispatch_workspace,
         },
-        db::get_db_conn_instance,
+        db,
     },
     utils::{error::CliResult, output::OutputConfig},
 };
@@ -116,12 +116,26 @@ pub async fn execute_safe(args: BridgeArgs, _output: &OutputConfig) -> CliResult
         ));
     }
 
-    let conn = get_db_conn_instance().await;
-    let repository_id = resolve_repository_id(&conn).await.map_err(|msg| {
+    let repo = db::open_cached_repository(&crate::utils::path::database())
+        .await
+        .map_err(|error| {
+            crate::utils::error::CliError::fatal(format!(
+                "libra agent bridge: failed to open repository database: {error}"
+            ))
+        })?;
+    let repository_id = resolve_repository_id(&repo).await.map_err(|msg| {
         crate::utils::error::CliError::fatal(format!("libra agent bridge: {msg}"))
     })?;
+    let conn = crate::internal::ai::capture::store::open_current()
+        .await
+        .map_err(|error| {
+            crate::utils::error::CliError::fatal(format!(
+                "libra agent bridge: failed to open the capture database: {error}"
+            ))
+        })?;
 
     let ctx = BridgeContext {
+        repo,
         conn,
         repository_id,
         // Worktree binding is refined in LB-06; the bridge command currently

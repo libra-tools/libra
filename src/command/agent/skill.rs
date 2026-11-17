@@ -20,12 +20,12 @@ use serde::Serialize;
 
 use super::checkpoint::{encode_page_cursor, load_checkpoint_metadata_blob, resolve_page_limit};
 use crate::{
-    internal::{
-        ai::observed_agents::{
+    internal::ai::{
+        capture::store,
+        observed_agents::{
             AgentKind, DiscoveredSkill, IndexedSkillEvent, SKILL_PROJECTION_SCHEMA_VERSION,
             SkillEventProjection, SkillQuery, discover_skills,
         },
-        db::get_db_conn_instance,
     },
     utils::{
         error::{CliError, CliResult},
@@ -221,7 +221,9 @@ async fn search(args: SkillSearchArgs, output: &OutputConfig) -> CliResult<()> {
 /// checkpoint).
 async fn build_projection(session: Option<&str>) -> CliResult<SkillEventProjection> {
     let mut projection = SkillEventProjection::new();
-    let conn = get_db_conn_instance().await;
+    let conn = store::open_current().await.map_err(|error| {
+        CliError::fatal(format!("failed to open the capture database: {error}"))
+    })?;
     if !super::checkpoint::table_exists(&conn, "agent_checkpoint").await? {
         return Ok(projection);
     }

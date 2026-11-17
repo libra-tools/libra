@@ -52,6 +52,7 @@ async fn bridge_ctx() -> BridgeContext {
         .await
         .expect("apply migrations");
     BridgeContext {
+        repo: conn.clone(),
         conn,
         repository_id: REPO_ID.into(),
         worktree_id: None,

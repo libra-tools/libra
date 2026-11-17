@@ -18,11 +18,11 @@ use sea_orm::{
 use serde::Serialize;
 
 use crate::{
-    internal::{ai::observed_agents::CoverageSchemaVersion, db::get_db_conn_instance_for_path},
+    internal::ai::{capture::store, observed_agents::CoverageSchemaVersion},
     utils::{
         error::{CliError, CliResult, StableErrorCode},
         output::{OutputConfig, emit_json_data},
-        util::{DATABASE, try_get_storage_path},
+        util::try_get_storage_path,
     },
 };
 
@@ -142,8 +142,7 @@ pub async fn execute_safe(args: GraphArgs, output: &OutputConfig) -> CliResult<(
 }
 
 async fn load_agent_graph(storage_root: &Path, session_id: &str) -> CliResult<AgentGraphOutput> {
-    let db_path = storage_root.join(DATABASE);
-    let connection = get_db_conn_instance_for_path(&db_path)
+    let connection = store::open(storage_root, std::time::Duration::from_secs(30))
         .await
         .map_err(|_| graph_store_error("open the repository capture catalog"))?;
     let transaction = connection

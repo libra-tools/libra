@@ -23,7 +23,7 @@ use super::{
 };
 use crate::{
     command::load_object,
-    internal::db::get_db_conn_instance,
+    internal::ai::capture::store,
     utils::{
         error::{CliError, CliResult, StableErrorCode, emit_post_envelope_warning},
         object_ext::TreeExt,
@@ -266,7 +266,9 @@ async fn list(args: CheckpointListArgs, output: &OutputConfig) -> CliResult<()> 
     // is a pure usage error.
     let cursor = args.cursor.as_deref().map(decode_page_cursor).transpose()?;
 
-    let conn = get_db_conn_instance().await;
+    let conn = store::open_current().await.map_err(|error| {
+        CliError::fatal(format!("failed to open the capture database: {error}"))
+    })?;
     if !table_exists(&conn, "agent_checkpoint").await? {
         return emit_list(
             &CheckpointListPage {
@@ -328,7 +330,9 @@ async fn list(args: CheckpointListArgs, output: &OutputConfig) -> CliResult<()> 
 }
 
 async fn show(args: CheckpointShowArgs, output: &OutputConfig) -> CliResult<()> {
-    let conn = get_db_conn_instance().await;
+    let conn = store::open_current().await.map_err(|error| {
+        CliError::fatal(format!("failed to open the capture database: {error}"))
+    })?;
     if !table_exists(&conn, "agent_checkpoint").await? {
         return Err(CliError::fatal(format!(
             "no checkpoint matches '{}': agent_checkpoint table not yet present (run `libra init`?)",
@@ -424,7 +428,9 @@ fn checkpoint_show_store_inconsistent() -> CliError {
 /// transcripts untouched, and leaves HEAD plus `refs/heads/*` untouched per
 /// `docs/development/commands/_general.md` §7.3.
 async fn rewind(args: CheckpointRewindArgs, output: &OutputConfig) -> CliResult<()> {
-    let conn = get_db_conn_instance().await;
+    let conn = store::open_current().await.map_err(|error| {
+        CliError::fatal(format!("failed to open the capture database: {error}"))
+    })?;
     if !table_exists(&conn, "agent_checkpoint").await? {
         return Err(CliError::fatal(format!(
             "no checkpoint matches '{}': agent_checkpoint table not yet present (run `libra init`?)",
@@ -669,7 +675,9 @@ impl TranscriptTruncationOutcome {
 async fn truncate_agent_transcript_for_checkpoint(
     checkpoint_id: &str,
 ) -> TranscriptTruncationOutcome {
-    let conn = get_db_conn_instance().await;
+    let Ok(conn) = store::open_current().await else {
+        return TranscriptTruncationOutcome::Failed;
+    };
     truncate_agent_transcript_for_checkpoint_with_conn(&conn, checkpoint_id).await
 }
 
@@ -691,7 +699,7 @@ async fn lookup_truncation_support(
 
 /// Connection-bound core of [`truncate_agent_transcript_for_checkpoint`].
 /// Extracted so fixture tests can run against an in-memory SQLite without
-/// the process-wide `get_db_conn_instance` singleton.
+/// an injected connection, including an in-memory fixture.
 async fn truncate_agent_transcript_for_checkpoint_with_conn(
     conn: &sea_orm::DatabaseConnection,
     checkpoint_id: &str,
@@ -906,7 +914,9 @@ pub(crate) async fn resolve_checkpoint_input_spec(
 async fn export(args: super::CheckpointExportArgs, output: &OutputConfig) -> CliResult<()> {
     use crate::internal::ai::observed_agents::compliance::max_transcript_read_bytes;
 
-    let conn = get_db_conn_instance().await;
+    let conn = store::open_current().await.map_err(|error| {
+        CliError::fatal(format!("failed to open the capture database: {error}"))
+    })?;
     if args.reasoning_artifact.is_some() {
         return export_reasoning_artifact(&conn, &args, output).await;
     }

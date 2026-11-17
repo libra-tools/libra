@@ -331,15 +331,16 @@ async fn link_count<C: ConnectionTrait>(conn: &C, oid: ObjectHash) -> Result<i64
 
 /// Apply a page prepared outside the writer lock. A changed HEAD invalidates
 /// the evidence rather than applying it to a different branch.
-pub async fn inspect_prepared<C: ConnectionTrait>(
-    conn: &C,
+pub async fn inspect_prepared<R: ConnectionTrait, C: ConnectionTrait>(
+    repo: &R,
+    catalog: &C,
     storage_root: &Path,
     scope: &CaptureScope,
     page: u16,
     repair: bool,
     prepared: &PreparedPage,
 ) -> Result<CommitRecoveryReport> {
-    if repair && current_head(conn, scope).await?.0 != prepared.head {
+    if repair && current_head(repo, scope).await?.0 != prepared.head {
         bail!("current HEAD changed during commit-link inspection; retry doctor --repair");
     }
     let mut report = CommitRecoveryReport::new(page);
@@ -402,7 +403,7 @@ pub async fn inspect_prepared<C: ConnectionTrait>(
     };
     if repair
         && scope
-            .assert_workspace_fence_live_for_commit(conn)
+            .assert_workspace_fence_live_for_commit(repo)
             .await
             .is_err()
     {
@@ -411,10 +412,10 @@ pub async fn inspect_prepared<C: ConnectionTrait>(
     }
     report.repair_applied = repair;
     for ((_, session_id), oid) in candidates {
-        if link_exists(conn, &session_id, oid).await? {
+        if link_exists(catalog, &session_id, oid).await? {
             continue;
         }
-        if !session_eligible(conn, &session_id, scope).await? {
+        if !session_eligible(catalog, &session_id, scope).await? {
             report.rejected_links += 1;
             continue;
         }
@@ -426,13 +427,13 @@ pub async fn inspect_prepared<C: ConnectionTrait>(
             report.more_missing_links = true;
             break;
         }
-        if link_count(conn, oid).await? >= 64 {
+        if link_count(catalog, oid).await? >= 64 {
             report.rejected_links += 1;
             continue;
         }
-        let inserted = conn
+        let inserted = catalog
             .execute_raw(Statement::from_sql_and_values(
-                conn.get_database_backend(),
+                catalog.get_database_backend(),
                 "INSERT INTO agent_session_commit (session_id, hash_kind, commit_oid)
              VALUES (?, ?, ?) ON CONFLICT(session_id, hash_kind, commit_oid) DO NOTHING",
                 [
@@ -455,14 +456,15 @@ pub async fn inspect_prepared<C: ConnectionTrait>(
 /// Called only after doctor has committed repaired DAO rows. A fresh writer
 /// transaction fences erase and append while the now-durable links are checked
 /// again. Never remove prepared evidence before its replacement row commits.
-pub async fn reclaim_reconciled<C: ConnectionTrait>(
-    conn: &C,
+pub async fn reclaim_reconciled<R: ConnectionTrait, C: ConnectionTrait>(
+    repo: &R,
+    catalog: &C,
     storage_root: &Path,
     scope: &CaptureScope,
     prepared: &PreparedPage,
 ) -> Result<usize> {
-    scope.assert_workspace_fence_live_for_commit(conn).await?;
-    if current_head(conn, scope).await?.0 != prepared.head {
+    scope.assert_workspace_fence_live_for_commit(repo).await?;
+    if current_head(repo, scope).await?.0 != prepared.head {
         bail!("current HEAD changed before agent commit journal cleanup; retry doctor --repair");
     }
     let (records, bad_tail) = commit_journal::read(storage_root)?;
@@ -483,8 +485,8 @@ pub async fn reclaim_reconciled<C: ConnectionTrait>(
         }
         let mut complete = true;
         for session_id in &record.session_ids {
-            if !session_owned_and_not_erased(conn, session_id, scope).await?
-                || !link_exists(conn, session_id, commit.id).await?
+            if !session_owned_and_not_erased(catalog, session_id, scope).await?
+                || !link_exists(catalog, session_id, commit.id).await?
             {
                 complete = false;
                 break;

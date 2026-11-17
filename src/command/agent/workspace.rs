@@ -7,7 +7,7 @@ use clap::{Args, Subcommand};
 
 use crate::{
     internal::{
-        db::get_db_conn_instance,
+        db,
         workspace::{WorkspaceListQuery, WorkspaceRecord, WorkspaceState, WorkspaceStore},
     },
     utils::{
@@ -110,7 +110,9 @@ async fn list(args: WorkspaceListArgs, output: &OutputConfig) -> CliResult<()> {
         limit: args.limit,
         cursor: args.cursor,
     };
-    let conn = get_db_conn_instance().await;
+    let conn = db::open_cached_repository(&crate::utils::path::database())
+        .await
+        .map_err(|error| CliError::fatal(format!("failed to open repository database: {error}")))?;
     let page = WorkspaceStore::list_with_conn(&conn, &query)
         .await
         .map_err(|error| CliError::fatal(format!("failed to list workspace records: {error}")))?;
@@ -146,7 +148,9 @@ async fn list(args: WorkspaceListArgs, output: &OutputConfig) -> CliResult<()> {
 }
 
 async fn show(args: WorkspaceShowArgs, output: &OutputConfig) -> CliResult<()> {
-    let conn = get_db_conn_instance().await;
+    let conn = db::open_cached_repository(&crate::utils::path::database())
+        .await
+        .map_err(|error| CliError::fatal(format!("failed to open repository database: {error}")))?;
     let record = WorkspaceStore::get_with_conn(&conn, &args.workspace_id)
         .await
         .map_err(|error| CliError::fatal(format!("failed to read workspace record: {error}")))?

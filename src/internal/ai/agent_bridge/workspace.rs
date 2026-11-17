@@ -169,7 +169,7 @@ async fn workspace_claim(
     }
     .with_owner(WorkspaceOwnerKind::Agent, session.agent_id.clone());
 
-    let lease = WorkspaceStore::acquire(&ctx.conn, &acquire, now_ms())
+    let lease = WorkspaceStore::acquire(&ctx.repo, &acquire, now_ms())
         .await
         .map_err(|err| map_workspace_error(err, "workspace.claim"))?;
 
@@ -200,7 +200,7 @@ async fn workspace_renew(
         )));
     }
 
-    let renewed = WorkspaceStore::renew_with_conn(&ctx.conn, &lease, lease_ttl_ms, now_ms())
+    let renewed = WorkspaceStore::renew_with_conn(&ctx.repo, &lease, lease_ttl_ms, now_ms())
         .await
         .map_err(|err| map_workspace_error(err, "workspace.renew"))?;
 
@@ -223,7 +223,7 @@ async fn workspace_release(
         )));
     }
 
-    WorkspaceStore::release_with_conn(&ctx.conn, &lease, now_ms())
+    WorkspaceStore::release_with_conn(&ctx.repo, &lease, now_ms())
         .await
         .map_err(|err| map_workspace_error(err, "workspace.release"))?;
 
@@ -268,7 +268,7 @@ fn lease_to_json(lease: &WorkspaceLease, session_id: &str) -> Value {
 /// context against the store's canonical identity). Kept as a small helper so
 /// the adapter never trusts a request-supplied repo id.
 pub async fn trusted_repo_identity(ctx: &BridgeContext) -> Result<RepoIdentity, BridgeError> {
-    let identity = RepoIdentity::resolve(&ctx.conn)
+    let identity = RepoIdentity::resolve(&ctx.repo)
         .await
         .map_err(|err| map_workspace_error(err, "resolve repository identity"))?;
     if identity.as_str() != ctx.repository_id {

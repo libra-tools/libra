@@ -2778,9 +2778,12 @@ pub fn run_import_index_repair_helper(input: &[u8]) -> Result<Vec<u8>> {
         .build()
         .context("start internal import index repair runtime")?;
     let response = runtime.block_on(async {
-        let conn = db::get_db_conn_instance_for_path(&storage_root.join(util::DATABASE))
-            .await
-            .context("open repository database for import index repair")?;
+        let conn = crate::internal::ai::capture::store::open(
+            &storage_root,
+            std::time::Duration::from_secs(30),
+        )
+        .await
+        .context("open capture database for import index repair")?;
         Ok::<_, anyhow::Error>(
             match super::doctor::repair_session_object_index(
                 &conn,
@@ -2928,11 +2931,122 @@ async fn persist_import_index_barrier<C: ConnectionTrait>(
     Ok(())
 }
 
+async fn set_import_index_barrier_pending_split(
+    capture: &DatabaseConnection,
+    barrier: &ImportIndexBarrier,
+    identity: Option<&ImportIdentityFence>,
+) -> Result<()> {
+    let repo = db::repository_peer(capture)
+        .await
+        .context("open repository database for import object-index partial finalization")?;
+    if let Err(error) = barrier
+        .capture_scope
+        .assert_workspace_fence_live(&repo)
+        .await
+    {
+        return Err(error).context(
+            "verify capture workspace lease before marking import object-index repair pending",
+        );
+    }
+    if let Some(identity) = identity {
+        if barrier.capture_scope.workspace_id.is_some() {
+            let live = repo
+                .query_one_raw(Statement::from_sql_and_values(
+                    repo.get_database_backend(),
+                    "SELECT 1 FROM workspace_record
+                     WHERE workspace_id = ? AND repo_id = ? AND lease_fence = ?
+                       AND state IN ('provisioning', 'active', 'releasing')
+                       AND lease_owner IS NOT NULL
+                       AND lease_expires_at > (unixepoch('now') * 1000)",
+                    [
+                        barrier.capture_scope.workspace_id.clone().into(),
+                        barrier.capture_scope.repo_id.clone().into(),
+                        barrier.capture_scope.workspace_fence.into(),
+                    ],
+                ))
+                .await
+                .context("verify workspace lease before marking import identity partial")?;
+            if live.is_none() {
+                anyhow::bail!(
+                    "verify capture workspace lease before marking import object-index repair pending"
+                );
+            }
+        }
+        capture
+            .execute_raw(Statement::from_sql_and_values(
+                capture.get_database_backend(),
+                "UPDATE agent_import_identity
+                 SET state = 'partial', last_error_code = 'LBR-AGENT-018', updated_at = ?
+                 WHERE identity_id = ? AND fence_token = ? AND state = 'committed'
+                   AND scope_state = 'scoped' AND repo_id = ? AND worktree_id = ?
+                   AND workspace_id IS ? AND workspace_fence IS ?",
+                [
+                    Utc::now().timestamp_millis().into(),
+                    identity.identity_id.clone().into(),
+                    identity.fence_token.into(),
+                    barrier.capture_scope.repo_id.clone().into(),
+                    barrier.capture_scope.worktree_id.clone().into(),
+                    barrier.capture_scope.workspace_id.clone().into(),
+                    barrier.capture_scope.workspace_fence.into(),
+                ],
+            ))
+            .await
+            .context("mark exact import identity partial after object-index barrier failure")?;
+    }
+    let txn = db::begin_write_transaction(&repo)
+        .await
+        .context("begin import object-index partial finalization")?;
+    if let Err(error) = lock_import_index_barrier_row(&txn, &barrier.session_id).await {
+        txn.rollback().await.ok();
+        return Err(error);
+    }
+    let mut marker = match read_owned_import_index_barrier(&txn, barrier).await {
+        Ok(marker) => marker,
+        Err(error) => {
+            txn.rollback().await.ok();
+            return Err(error);
+        }
+    };
+    if let Some(identity) = identity {
+        if identity.identity_id != marker.identity_id {
+            txn.rollback().await.ok();
+            anyhow::bail!("import object-index barrier identity changed before finalization");
+        }
+        marker.fence_token = Some(identity.fence_token);
+    }
+    marker.state = "repair_pending".to_string();
+    marker.lease_expires_at = 0;
+    if let Err(error) = persist_import_index_barrier(&txn, &barrier.session_id, &marker).await {
+        txn.rollback().await.ok();
+        return Err(error);
+    }
+    if let Err(error) = barrier
+        .capture_scope
+        .assert_workspace_fence_live_for_commit(&txn)
+        .await
+    {
+        txn.rollback().await.ok();
+        return Err(error).context(
+            "verify capture workspace lease before committing import object-index partial finalization",
+        );
+    }
+    txn.commit()
+        .await
+        .context("commit import object-index partial finalization")?;
+    Ok(())
+}
+
 async fn set_import_index_barrier_pending(
     conn: &DatabaseConnection,
     barrier: &ImportIndexBarrier,
     identity: Option<&ImportIdentityFence>,
 ) -> Result<()> {
+    if !db::connection_has_table(conn, "config_kv")
+        .await
+        .unwrap_or(false)
+    {
+        return set_import_index_barrier_pending_split(conn, barrier, identity).await;
+    }
     let txn = db::begin_write_transaction(conn)
         .await
         .context("begin import object-index partial finalization")?;
@@ -3005,7 +3119,10 @@ async fn clear_import_index_barrier(
     conn: &DatabaseConnection,
     barrier: &ImportIndexBarrier,
 ) -> Result<()> {
-    let txn = db::begin_write_transaction(conn)
+    let repo = db::repository_peer(conn)
+        .await
+        .context("open repository database to retire the import object-index barrier")?;
+    let txn = db::begin_write_transaction(&repo)
         .await
         .context("begin completed import object-index barrier retirement")?;
     if let Err(error) = barrier
@@ -3094,9 +3211,34 @@ async fn acquire_import_index_barrier_transaction(
         "historical import request has no workspace scope; rerun `libra agent import` from the intended workspace",
     )?;
     let now_ms = Utc::now().timestamp_millis();
+    let catalog_separated = !db::connection_has_table(conn, "config_kv")
+        .await
+        .unwrap_or(false);
+    let metadata = if catalog_separated {
+        let tombstone = conn
+            .query_one_raw(Statement::from_sql_and_values(
+                conn.get_database_backend(),
+                "SELECT 1 FROM agent_import_tombstone
+             WHERE agent_kind = ? AND provider_session_id = ?",
+                [
+                    request.agent_kind.as_db_str().into(),
+                    request.provider_session_id.clone().into(),
+                ],
+            ))
+            .await
+            .context("check import tombstone before object-index barrier acquisition")?;
+        if tombstone.is_some() {
+            return Err(ImportError::Erased.into());
+        }
+        db::repository_peer(conn)
+            .await
+            .context("open repository database for import object-index barrier")?
+    } else {
+        conn.clone()
+    };
     let txn = tokio::time::timeout_at(
         tokio::time::Instant::from_std(monotonic_deadline),
-        db::begin_write_transaction(conn),
+        db::begin_write_transaction(&metadata),
     )
     .await
     .map_err(|_| anyhow::Error::from(ImportError::DeadlineExceeded))?
@@ -3121,25 +3263,29 @@ async fn acquire_import_index_barrier_transaction(
         txn.rollback().await.ok();
         return Err(error);
     }
-    let tombstone = match await_import_precommit_read_until(monotonic_deadline, async {
-        txn.query_one_raw(Statement::from_sql_and_values(
-            txn.get_database_backend(),
-            "SELECT 1 FROM agent_import_tombstone
+    let tombstone = if catalog_separated {
+        None
+    } else {
+        match await_import_precommit_read_until(monotonic_deadline, async {
+            txn.query_one_raw(Statement::from_sql_and_values(
+                txn.get_database_backend(),
+                "SELECT 1 FROM agent_import_tombstone
              WHERE agent_kind = ? AND provider_session_id = ?",
-            [
-                request.agent_kind.as_db_str().into(),
-                request.provider_session_id.clone().into(),
-            ],
-        ))
+                [
+                    request.agent_kind.as_db_str().into(),
+                    request.provider_session_id.clone().into(),
+                ],
+            ))
+            .await
+            .context("check import tombstone before object-index barrier acquisition")
+        })
         .await
-        .context("check import tombstone before object-index barrier acquisition")
-    })
-    .await
-    {
-        Ok(tombstone) => tombstone,
-        Err(error) => {
-            txn.rollback().await.ok();
-            return Err(error);
+        {
+            Ok(tombstone) => tombstone,
+            Err(error) => {
+                txn.rollback().await.ok();
+                return Err(error);
+            }
         }
     };
     if tombstone.is_some() {
@@ -4249,11 +4395,17 @@ pub async fn execute_safe(args: ImportArgs, output: &OutputConfig) -> CliResult<
             .await
             .map_err(|error| index_import_read_error(&error, deadline))?;
     }
-    let conn = db::get_db_conn_instance_for_path(&storage_root.join(util::DATABASE))
+    let repo = db::open_cached_repository(&storage_root.join(util::DATABASE))
         .await
         .map_err(|error| CliError::fatal(format!("failed to open repository database: {error}")))?;
+    let conn = crate::internal::ai::capture::store::open(
+        &storage_root,
+        std::time::Duration::from_secs(30),
+    )
+    .await
+    .map_err(|error| CliError::fatal(format!("failed to open the capture database: {error}")))?;
     let capture_scope =
-        await_import_precommit_read_until(deadline, CaptureScope::resolve(&conn, &repo_root))
+        await_import_precommit_read_until(deadline, CaptureScope::resolve(&repo, &repo_root))
             .await
             .map_err(|error| {
                 if index_mode {
@@ -7399,9 +7551,12 @@ mod tests {
         let conn = crate::internal::db::create_database(&db_path.to_string_lossy())
             .await
             .expect("create import barrier lock database");
-        let lock_conn = crate::internal::db::establish_connection(&db_path.to_string_lossy())
-            .await
-            .expect("open independent import barrier lock connection");
+        let lock_conn = crate::internal::db::open_repository_with_busy_timeout(
+            &db_path.to_string_lossy(),
+            std::time::Duration::from_secs(30),
+        )
+        .await
+        .expect("open independent import barrier lock connection");
         let source_id = format!("source/hmac-v2/{}", "c".repeat(64));
         let request = ImportRequest {
             agent_kind: AgentKind::ClaudeCode,

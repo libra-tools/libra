@@ -40,11 +40,14 @@ use serde::{Deserialize, Serialize};
 use super::CleanArgs;
 use crate::{
     internal::{
-        ai::history::{
-            CheckpointPruneGuardError, HistoryManager, SubagentContentReservationPruneGuard,
+        ai::{
+            capture::store,
+            history::{
+                CheckpointPruneGuardError, HistoryManager, SubagentContentReservationPruneGuard,
+            },
         },
         branch::TRACES_BRANCH,
-        db::get_db_conn_instance,
+        db,
     },
     utils::{
         client_storage::ClientStorage,
@@ -227,7 +230,9 @@ pub async fn execute_safe(args: CleanArgs, output: &OutputConfig) -> CliResult<(
             crate::utils::error::StableErrorCode::ConflictOperationBlocked,
         )?;
     }
-    let conn = get_db_conn_instance().await;
+    let conn = store::open_current().await.map_err(|error| {
+        CliError::fatal(format!("failed to open the capture database: {error}"))
+    })?;
     let backend = conn.get_database_backend();
 
     if !table_exists(&conn, "agent_checkpoint").await? {
@@ -1089,7 +1094,13 @@ async fn reclaim_findings_objects(
     // something to reclaim — it is far too expensive to run per candidate.
     let reachable = crate::command::maintenance::collect_reachable_objects(&storage).await?;
 
-    let db_conn = get_db_conn_instance().await;
+    let db_conn = db::open_cached_repository(&crate::utils::path::database())
+        .await
+        .map_err(|error| {
+            CliError::fatal(format!(
+                "failed to open repository database for findings index cleanup: {error}"
+            ))
+        })?;
     // The index row goes either way: it is a sync/visibility artifact, not
     // the object, and `agent doctor` rebuilds it from the run manifest.
     let oids: Vec<String> = candidates.iter().cloned().collect();

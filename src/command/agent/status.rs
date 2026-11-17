@@ -9,9 +9,9 @@ use sea_orm::{ConnectionTrait, Statement};
 use serde::Serialize;
 
 use crate::{
-    internal::{
-        ai::capture::diagnostics::{self, CaptureDiagnostics},
-        db::get_db_conn_instance,
+    internal::ai::capture::{
+        diagnostics::{self, CaptureDiagnostics},
+        store,
     },
     utils::{
         error::{CliError, CliResult},
@@ -33,7 +33,9 @@ struct StatusOutput {
 }
 
 pub async fn execute_safe(_args: StatusArgs, output: &OutputConfig) -> CliResult<()> {
-    let conn = get_db_conn_instance().await;
+    let conn = store::open_current().await.map_err(|error| {
+        CliError::fatal(format!("failed to open the capture database: {error}"))
+    })?;
     let backend = conn.get_database_backend();
     let capture_diagnostics = util::try_get_storage_path(None)
         .map(|storage| diagnostics::summarize(&storage))

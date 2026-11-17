@@ -42,6 +42,23 @@ pub fn capture_database_path(storage_root: &Path) -> PathBuf {
     storage_root.join("private").join("capture.db")
 }
 
+/// Busy timeout for command-path capture opens.
+pub const COMMAND_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Open the capture database for the current repository.
+///
+/// The storage root is the parent of [`crate::utils::path::database`].
+pub async fn open_current() -> io::Result<DatabaseConnection> {
+    let database = crate::utils::path::database();
+    let Some(storage) = database.parent() else {
+        return Err(io::Error::new(
+            ErrorKind::NotFound,
+            "repository database path has no parent directory",
+        ));
+    };
+    open(storage, COMMAND_BUSY_TIMEOUT).await
+}
+
 /// Open the capture database for `storage_root` (the `.libra` directory).
 ///
 /// Creates `.libra/private` (mode `0700` on Unix) and `capture.db` when they
@@ -63,6 +80,26 @@ pub async fn open(storage_root: &Path, busy_timeout: Duration) -> io::Result<Dat
         write_copy_receipt(&conn).await?;
     }
     Ok(conn)
+}
+
+/// Open an existing capture database without creating it or copying rows.
+///
+/// A missing file is [`ErrorKind::NotFound`]. Schema repair and the catalog
+/// copy stay on [`open`]. This is still the capture-store entry: callers do
+/// not open `.libra/private/capture.db` themselves.
+pub async fn open_readonly(
+    storage_root: &Path,
+    busy_timeout: Duration,
+) -> io::Result<DatabaseConnection> {
+    let db_path = capture_database_path(storage_root);
+    if !db_path.is_file() {
+        return Err(io::Error::new(
+            ErrorKind::NotFound,
+            "capture database is not present",
+        ));
+    }
+    reject_symlink(&db_path)?;
+    connect_capture_file(&db_path, busy_timeout, true).await
 }
 
 /// Copy capture-catalog rows from a repository database into an open capture
@@ -695,7 +732,15 @@ async fn assert_single_database(conn: &DatabaseConnection, role: &str) -> io::Re
 }
 
 async fn connect_capture(db_path: &Path, busy_timeout: Duration) -> io::Result<DatabaseConnection> {
-    if !db_path.exists() {
+    connect_capture_file(db_path, busy_timeout, false).await
+}
+
+async fn connect_capture_file(
+    db_path: &Path,
+    busy_timeout: Duration,
+    read_only: bool,
+) -> io::Result<DatabaseConnection> {
+    if !read_only && !db_path.exists() {
         create_private_file(db_path)?;
     }
     let filename = std::path::absolute(db_path).map_err(|error| {
@@ -721,13 +766,19 @@ async fn connect_capture(db_path: &Path, busy_timeout: Duration) -> io::Result<D
     options.sqlx_logging(false);
     options.map_sqlx_sqlite_pool_opts(db::sqlite_pool_options);
     options.map_sqlx_sqlite_opts(move |opts| {
-        opts.filename(&filename)
-            .read_only(false)
+        let opts = opts
+            .filename(&filename)
+            .read_only(read_only)
             .create_if_missing(false)
             .busy_timeout(busy_timeout)
-            .synchronous(sea_orm::sqlx::sqlite::SqliteSynchronous::Full)
-            .journal_mode(sea_orm::sqlx::sqlite::SqliteJournalMode::Delete)
-            .foreign_keys(true)
+            .foreign_keys(true);
+        // A read-only open cannot apply journal or synchronous pragmas.
+        if read_only {
+            opts
+        } else {
+            opts.synchronous(sea_orm::sqlx::sqlite::SqliteSynchronous::Full)
+                .journal_mode(sea_orm::sqlx::sqlite::SqliteJournalMode::Delete)
+        }
     });
     Database::connect(options).await.map_err(|error| {
         io::Error::other(format!(

@@ -59,7 +59,7 @@ pub(super) async fn process_ai_intent_ingress(
 
     let process_cwd = runtime_scope.worktree_root;
     let storage_path = runtime_scope.storage_path;
-    let config_conn = db::get_db_conn_instance_for_path(&storage_path.join(util::DATABASE))
+    let config_conn = db::open_cached_repository(&storage_path.join(util::DATABASE))
         .await
         .map_err(|err| anyhow!("failed to open libra database for hook configuration: {err}"))?;
     set_hash_kind_from_connection(&config_conn)

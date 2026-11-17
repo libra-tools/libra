@@ -18,6 +18,7 @@ async fn ctx() -> BridgeContext {
         .await
         .expect("apply migrations");
     BridgeContext {
+        repo: conn.clone(),
         conn,
         repository_id: "repo-1".into(),
         worktree_id: None,
@@ -106,11 +107,13 @@ async fn checkpoint_reads_are_repository_scoped() {
         .await
         .expect("apply migrations");
     let c1 = BridgeContext {
+        repo: conn.clone(),
         conn: conn.clone(),
         repository_id: "repo-1".into(),
         worktree_id: None,
     };
     let c2 = BridgeContext {
+        repo: conn.clone(),
         conn: conn.clone(),
         repository_id: "repo-2".into(),
         worktree_id: None,

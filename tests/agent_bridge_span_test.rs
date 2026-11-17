@@ -89,6 +89,7 @@ fn capture(input: &str, repo_id: &str) -> (String, String) {
         run_builtin_migrations(&db).await.expect("apply migrations");
 
         let handler = IngressBridgeHandler::new(BridgeContext {
+            repo: db.clone(),
             conn: db.clone(),
             repository_id: repo_id.to_string(),
             worktree_id: None,

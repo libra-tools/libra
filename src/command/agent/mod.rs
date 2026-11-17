@@ -49,6 +49,9 @@ mod session;
 mod skill;
 mod status;
 
+#[cfg(test)]
+mod capture_store_reader_test;
+
 /// Entry for the hidden detached recovery child, recognized before normal
 /// command startup. It is intentionally silent and content-free.
 pub(crate) async fn run_capture_recovery_worker() -> CliResult<()> {

@@ -596,6 +596,61 @@ pub async fn open_cached_repository(db_path: &Path) -> io::Result<DbConn> {
     get_db_conn_instance_for_path(db_path).await
 }
 
+/// Whether `table` is present in this connection's `sqlite_master`.
+pub async fn connection_has_table(conn: &impl ConnectionTrait, table: &str) -> Result<bool, DbErr> {
+    let row = conn
+        .query_one_raw(Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1",
+            [table.into()],
+        ))
+        .await?;
+    Ok(row.is_some())
+}
+
+/// Repository connection paired with `conn`.
+///
+/// A combined database (the repository file, or an injected test database that
+/// still contains `config_kv`) is its own peer. A capture-only connection is
+/// paired with the current repository's `libra.db`. The two files are never
+/// attached.
+pub async fn repository_peer(conn: &DatabaseConnection) -> io::Result<DatabaseConnection> {
+    if connection_has_table(conn, "config_kv")
+        .await
+        .map_err(|err| io::Error::other(err.to_string()))?
+    {
+        Ok(conn.clone())
+    } else {
+        open_cached_repository(&path::database()).await
+    }
+}
+
+/// Writer lock for either database.
+///
+/// Repository connections lock `config_kv`. Capture connections have no
+/// `config_kv`, so they lock `schema_versions` with an empty update. A missing
+/// `config_kv` on a repository connection stays a hard failure inside
+/// [`begin_write_transaction`].
+pub async fn begin_catalog_or_repository_write(
+    conn: &DatabaseConnection,
+) -> Result<sea_orm::DatabaseTransaction, DbErr> {
+    if connection_has_table(conn, "config_kv").await? {
+        return begin_write_transaction(conn).await;
+    }
+    let txn = conn.begin().await?;
+    if txn
+        .execute_unprepared("UPDATE `schema_versions` SET `version` = `version` WHERE 0")
+        .await
+        .is_err()
+    {
+        let _ = txn.rollback().await;
+        return Err(DbErr::Custom(
+            "capture catalog transaction could not start".to_string(),
+        ));
+    }
+    Ok(txn)
+}
+
 /// Close and remove the cached shared pool for a SQLite file. A caller that
 /// deletes the file must wait for this result, especially on Windows.
 pub async fn close_cached_db_conn_instance_for_path(db_path: &Path) -> io::Result<()> {

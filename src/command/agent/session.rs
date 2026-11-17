@@ -20,18 +20,16 @@ use super::{
     checkpoint::{PAGE_SCHEMA_VERSION, decode_page_cursor, encode_page_cursor, resolve_page_limit},
 };
 use crate::{
-    internal::{
-        ai::{
-            capture::{
-                catalog::{
-                    CAPTURE_DIAGNOSTIC_METADATA_CAP_BYTES, CaptureCatalogStore,
-                    CaptureTerminalDiagnostic,
-                },
-                summary::{SessionSummaryRead, SessionSummaryView},
+    internal::ai::{
+        capture::{
+            catalog::{
+                CAPTURE_DIAGNOSTIC_METADATA_CAP_BYTES, CaptureCatalogStore,
+                CaptureTerminalDiagnostic,
             },
-            observed_agents::{AgentKind, TRANSCRIPT_READ_HARD_CAP_BYTES},
+            store,
+            summary::{SessionSummaryRead, SessionSummaryView},
         },
-        db::get_db_conn_instance,
+        observed_agents::{AgentKind, TRANSCRIPT_READ_HARD_CAP_BYTES},
     },
     utils::{
         error::{CliError, CliResult},
@@ -427,7 +425,9 @@ async fn list(args: SessionListArgs, output: &OutputConfig) -> CliResult<()> {
     // is a pure usage error.
     let cursor = args.cursor.as_deref().map(decode_page_cursor).transpose()?;
 
-    let conn = get_db_conn_instance().await;
+    let conn = store::open_current().await.map_err(|error| {
+        CliError::fatal(format!("failed to open the capture database: {error}"))
+    })?;
     let backend = conn.get_database_backend();
 
     if !table_exists(&conn, "agent_session").await? {
@@ -513,7 +513,9 @@ async fn list(args: SessionListArgs, output: &OutputConfig) -> CliResult<()> {
 }
 
 async fn show(args: SessionShowArgs, output: &OutputConfig) -> CliResult<()> {
-    let conn = get_db_conn_instance().await;
+    let conn = store::open_current().await.map_err(|error| {
+        CliError::fatal(format!("failed to open the capture database: {error}"))
+    })?;
     let backend = conn.get_database_backend();
 
     if !table_exists(&conn, "agent_session").await? {
@@ -773,18 +775,42 @@ async fn read_session_commit_links<C: ConnectionTrait>(
     else {
         return SessionCommitLinks::unavailable(page);
     };
-    let Ok(scope) =
-        crate::internal::ai::capture_scope::CaptureScope::resolve(conn, &worktree_root).await
-    else {
-        return SessionCommitLinks::unavailable(page);
-    };
-    if scope
-        .assert_workspace_fence_live_for_commit(conn)
+    // Scope and the workspace lease live in the repository database. Session
+    // and commit-link rows live on `conn`, which is the capture catalog once
+    // those files are separate. A combined connection still resolves both.
+    let on_repository = crate::internal::db::connection_has_table(conn, "config_kv")
         .await
-        .is_err()
-    {
-        return SessionCommitLinks::unavailable(page);
-    }
+        .unwrap_or(false);
+    let scope = if on_repository {
+        let Ok(scope) =
+            crate::internal::ai::capture_scope::CaptureScope::resolve(conn, &worktree_root).await
+        else {
+            return SessionCommitLinks::unavailable(page);
+        };
+        if scope
+            .assert_workspace_fence_live_for_commit(conn)
+            .await
+            .is_err()
+        {
+            return SessionCommitLinks::unavailable(page);
+        }
+        scope
+    } else {
+        let Ok(repo) =
+            crate::internal::db::open_cached_repository(&crate::utils::path::database()).await
+        else {
+            return SessionCommitLinks::unavailable(page);
+        };
+        let Ok(scope) =
+            crate::internal::ai::capture_scope::CaptureScope::resolve(&repo, &worktree_root).await
+        else {
+            return SessionCommitLinks::unavailable(page);
+        };
+        if scope.assert_workspace_fence_live(&repo).await.is_err() {
+            return SessionCommitLinks::unavailable(page);
+        }
+        scope
+    };
     let mut values = vec![session_id.into()];
     values.extend(scope.sql_values());
     let Ok(owner) = conn
@@ -895,13 +921,17 @@ fn emit_summary(summary: &SessionSummaryView) {
 }
 
 async fn stop(args: SessionStopArgs, output: &OutputConfig) -> CliResult<()> {
-    let conn = get_db_conn_instance().await;
+    let conn = store::open_current().await.map_err(|error| {
+        CliError::fatal(format!("failed to open the capture database: {error}"))
+    })?;
     let result = mutate_session_state(&conn, &args.session_id, SessionMutationKind::Stop).await?;
     emit_session_mutation(&result, output)
 }
 
 async fn resume(args: SessionResumeArgs, output: &OutputConfig) -> CliResult<()> {
-    let conn = get_db_conn_instance().await;
+    let conn = store::open_current().await.map_err(|error| {
+        CliError::fatal(format!("failed to open the capture database: {error}"))
+    })?;
     let result = mutate_session_state(&conn, &args.session_id, SessionMutationKind::Resume).await?;
     emit_session_mutation(&result, output)
 }

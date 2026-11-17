@@ -1262,14 +1262,29 @@ pub(crate) async fn latest_session_metadata_in_snapshot(
 ) -> ReaderResult<Option<CheckpointMetadataRead>> {
     use sea_orm::{ConnectionTrait, Statement};
     budget.check()?;
-    let row = txn.query_one_raw(Statement::from_sql_and_values(
-        txn.get_database_backend(),
+    // A combined database still observes the row and object format in one
+    // statement. A capture-only snapshot has no `config_kv`, so the format
+    // comes from the repository file. The two files are never attached.
+    let on_repository = crate::internal::db::connection_has_table(txn, "config_kv")
+        .await
+        .map_err(|_| CheckpointReaderError::CatalogUnavailable)?;
+    let sql = if on_repository {
         "SELECT substr(c.checkpoint_id,1,129) AS checkpoint_id, substr(c.tree_oid,1,66) AS tree_oid, substr(c.metadata_blob_oid,1,66) AS metadata_oid, \
          (SELECT substr(value,1,17) FROM config_kv WHERE key='core.objectformat' ORDER BY id DESC LIMIT 1) AS format, \
          (SELECT encrypted FROM config_kv WHERE key='core.objectformat' ORDER BY id DESC LIMIT 1) AS encrypted \
-         FROM agent_checkpoint c WHERE c.session_id=? AND c.scope='committed' ORDER BY c.created_at DESC,c.checkpoint_id DESC LIMIT 1",
-        [session_id.into()],
-    )).await.map_err(|_| CheckpointReaderError::CatalogUnavailable)?;
+         FROM agent_checkpoint c WHERE c.session_id=? AND c.scope='committed' ORDER BY c.created_at DESC,c.checkpoint_id DESC LIMIT 1"
+    } else {
+        "SELECT substr(c.checkpoint_id,1,129) AS checkpoint_id, substr(c.tree_oid,1,66) AS tree_oid, substr(c.metadata_blob_oid,1,66) AS metadata_oid \
+         FROM agent_checkpoint c WHERE c.session_id=? AND c.scope='committed' ORDER BY c.created_at DESC,c.checkpoint_id DESC LIMIT 1"
+    };
+    let row = txn
+        .query_one_raw(Statement::from_sql_and_values(
+            txn.get_database_backend(),
+            sql,
+            [session_id.into()],
+        ))
+        .await
+        .map_err(|_| CheckpointReaderError::CatalogUnavailable)?;
     budget.check()?;
     let Some(row) = row else {
         return Ok(None);
@@ -1278,12 +1293,17 @@ pub(crate) async fn latest_session_metadata_in_snapshot(
         .try_get_by("checkpoint_id")
         .map_err(|_| role_proof_error())?;
     validate_checkpoint_id(&checkpoint_id)?;
-    let format: Option<String> = row
-        .try_get_by("format")
-        .map_err(|_| CheckpointReaderError::UnknownLayout)?;
-    let encrypted: Option<i64> = row
-        .try_get_by("encrypted")
-        .map_err(|_| CheckpointReaderError::UnknownLayout)?;
+    let (format, encrypted) = if on_repository {
+        let format: Option<String> = row
+            .try_get_by("format")
+            .map_err(|_| CheckpointReaderError::UnknownLayout)?;
+        let encrypted: Option<i64> = row
+            .try_get_by("encrypted")
+            .map_err(|_| CheckpointReaderError::UnknownLayout)?;
+        (format, encrypted)
+    } else {
+        repository_object_format(storage).await?
+    };
     if encrypted.is_some_and(|value| value != 0) {
         return Err(CheckpointReaderError::UnknownLayout);
     }
@@ -1383,14 +1403,19 @@ pub(crate) async fn load_checkpoint_catalog(
                     .map(|row| row.try_get::<String, _>("name"))
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(|_| CheckpointReaderError::UnknownLayout)?;
+                if !names.iter().any(|name| name == "config_kv") {
+                    return Err(CheckpointReaderError::UnknownLayout);
+                }
+                if crate::internal::ai::capture::store::capture_database_path(storage).is_file() {
+                    let (format, encrypted) = object_format_on_sqlx(&mut connection).await?;
+                    return capture_checkpoint_catalog(storage, checkpoint_id, format, encrypted)
+                        .await;
+                }
                 if !names.iter().any(|name| name == "agent_checkpoint") {
                     return Err(CheckpointReaderError::fatal(format!(
                         "no checkpoint matches '{checkpoint_id}': agent_checkpoint table not yet present \
                          (run `libra init`?)"
                     )));
-                }
-                if !names.iter().any(|name| name == "config_kv") {
-                    return Err(CheckpointReaderError::UnknownLayout);
                 }
                 // One statement observes the named row and its format in the same
                 // SQLite read snapshot. Bounded substrings avoid allocating an
@@ -1471,6 +1496,129 @@ pub(crate) async fn load_checkpoint_catalog(
         return Err(CheckpointReaderError::CatalogUnavailable);
     }
     result
+}
+
+async fn repository_object_format(storage: &Path) -> ReaderResult<(Option<String>, Option<i64>)> {
+    use sea_orm::{ConnectionTrait, Statement};
+
+    let path = storage.join(crate::utils::util::DATABASE);
+    let Some(path) = path.to_str() else {
+        return Err(CheckpointReaderError::CatalogUnavailable);
+    };
+    let conn = crate::internal::db::open_connection_without_schema_management(
+        path,
+        Duration::from_millis(200),
+    )
+    .await
+    .map_err(|_| CheckpointReaderError::CatalogUnavailable)?;
+    let row = conn
+        .query_one_raw(Statement::from_string(
+            conn.get_database_backend(),
+            "SELECT substr(value, 1, 17) AS format, encrypted \
+             FROM config_kv WHERE key = 'core.objectformat' ORDER BY id DESC LIMIT 1"
+                .to_owned(),
+        ))
+        .await
+        .map_err(|_| CheckpointReaderError::CatalogUnavailable)?;
+    let Some(row) = row else {
+        return Ok((None, None));
+    };
+    Ok((
+        row.try_get_by("format")
+            .map_err(|_| CheckpointReaderError::UnknownLayout)?,
+        row.try_get_by("encrypted")
+            .map_err(|_| CheckpointReaderError::UnknownLayout)?,
+    ))
+}
+
+async fn object_format_on_sqlx(
+    connection: &mut sea_orm::sqlx::sqlite::SqliteConnection,
+) -> ReaderResult<(Option<String>, Option<i64>)> {
+    use sea_orm::sqlx::Row;
+
+    let row = sea_orm::sqlx::query(
+        "SELECT substr(value, 1, 17) AS format, encrypted \
+         FROM config_kv WHERE key = 'core.objectformat' ORDER BY id DESC LIMIT 1",
+    )
+    .fetch_optional(&mut *connection)
+    .await
+    .map_err(|_| CheckpointReaderError::CatalogUnavailable)?;
+    let Some(row) = row else {
+        return Ok((None, None));
+    };
+    Ok((
+        row.try_get("format")
+            .map_err(|_| CheckpointReaderError::UnknownLayout)?,
+        row.try_get("encrypted")
+            .map_err(|_| CheckpointReaderError::UnknownLayout)?,
+    ))
+}
+
+async fn capture_checkpoint_catalog(
+    storage: &Path,
+    checkpoint_id: &str,
+    format: Option<String>,
+    encrypted: Option<i64>,
+) -> ReaderResult<CheckpointCatalog> {
+    use sea_orm::{ConnectionTrait, Statement};
+
+    if encrypted.is_some_and(|value| value != 0) {
+        return Err(CheckpointReaderError::UnknownLayout);
+    }
+    let kind = match format {
+        Some(format) => crate::internal::object_format::parse_config_value(&format)
+            .map_err(|_| CheckpointReaderError::UnknownLayout)?,
+        None => HashKind::Sha1,
+    };
+    let capture =
+        crate::internal::ai::capture::store::open_readonly(storage, Duration::from_millis(200))
+            .await
+            .map_err(|_| CheckpointReaderError::CatalogUnavailable)?;
+    if !crate::internal::db::connection_has_table(&capture, "agent_checkpoint")
+        .await
+        .map_err(|_| CheckpointReaderError::CatalogUnavailable)?
+    {
+        return Err(CheckpointReaderError::fatal(format!(
+            "no checkpoint matches '{checkpoint_id}': agent_checkpoint table not yet present \
+             (run `libra init`?)"
+        )));
+    }
+    let rows = capture
+        .query_all_raw(Statement::from_sql_and_values(
+            capture.get_database_backend(),
+            "SELECT substr(checkpoint_id, 1, 129) AS checkpoint_id, substr(tree_oid, 1, 66) AS tree_oid \
+             FROM agent_checkpoint WHERE checkpoint_id = ? LIMIT 2",
+            [checkpoint_id.into()],
+        ))
+        .await
+        .map_err(|_| CheckpointReaderError::CatalogUnavailable)?;
+    if rows.is_empty() {
+        return Err(CheckpointReaderError::fatal(format!(
+            "no checkpoint matches id '{checkpoint_id}'; list captured checkpoints with \
+             `libra agent checkpoint list`"
+        )));
+    }
+    if rows.len() != 1 {
+        return Err(CheckpointReaderError::RoleProof);
+    }
+    let row = &rows[0];
+    let actual_id: String = row
+        .try_get_by("checkpoint_id")
+        .map_err(|_| CheckpointReaderError::RoleProof)?;
+    if actual_id != checkpoint_id {
+        return Err(CheckpointReaderError::RoleProof);
+    }
+    let tree_oid: String = row
+        .try_get_by("tree_oid")
+        .map_err(|_| CheckpointReaderError::RoleProof)?;
+    let tree_oid = crate::internal::object_format::parse_hex_for_kind(kind, &tree_oid)
+        .map_err(|_| CheckpointReaderError::ObjectIntegrity)?;
+    Ok(CheckpointCatalog {
+        storage: storage.to_path_buf(),
+        checkpoint_id: actual_id,
+        tree_oid,
+        kind,
+    })
 }
 
 fn validate_checkpoint_id(id: &str) -> ReaderResult<()> {

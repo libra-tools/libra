@@ -416,7 +416,7 @@ ER-01..ER-14 按模板 v2.16 执行，本文不削弱。补充：
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `complete`
 
 **Description:** 把已经列出的 Agent 命令和 intent hook 的捕获读取改为 `capture_store`。本卡不删除 `libra.db` 里的旧表。
 
@@ -435,15 +435,15 @@ ER-01..ER-14 按模板 v2.16 执行，本文不削弱。补充：
 
 **Acceptance criteria:**
 
-- [ ] 写集中的 12 个生产文件通过 `capture_store` 读写捕获目录。
-- [ ] 这 12 个文件不再调用仓库连接帮助函数。
-- [ ] 本卡结束时 `libra.db` 里的捕获表还在。
-- [ ] 开工时写集外若还有生产读路径，先按 ER-03 拆卡。
+- [x] 写集中的 12 个生产文件通过 `capture_store` 读写捕获目录。
+- [x] 这 12 个文件不再调用仓库连接帮助函数。
+- [x] 本卡结束时 `libra.db` 里的捕获表还在。
+- [x] 开工时写集外若还有生产读路径，先按 ER-03 拆卡。
 
 **Verification:**
 
-- [ ] `source .env.test && cargo nextest run -E 'test(/^capture_store_reader_/)'`（new：12 个入口的连接归属）
-- [ ] `if rg -n 'establish_connection|get_db_conn' src/command/agent/status.rs src/command/agent/skill.rs src/command/agent/checkpoint.rs src/command/agent/bridge.rs src/command/agent/clean.rs src/command/agent/mega2_stream.rs src/command/agent/graph.rs src/command/agent/import.rs src/command/agent/doctor.rs src/command/agent/workspace.rs src/command/agent/session.rs src/internal/ai/hooks/intent.rs; then echo 'FAIL: repository connection remains'; exit 1; else rc=$?; if [ "$rc" -ne 1 ]; then echo "ERROR: rg failed with exit $rc"; exit "$rc"; fi; echo 'OK: zero hits'; fi`
+- [x] `source .env.test && cargo nextest run -E 'test(/^capture_store_reader_/)'`（new：12 个入口的连接归属）
+- [x] `if rg -n 'establish_connection|get_db_conn' src/command/agent/status.rs src/command/agent/skill.rs src/command/agent/checkpoint.rs src/command/agent/bridge.rs src/command/agent/clean.rs src/command/agent/mega2_stream.rs src/command/agent/graph.rs src/command/agent/import.rs src/command/agent/doctor.rs src/command/agent/workspace.rs src/command/agent/session.rs src/internal/ai/hooks/intent.rs; then echo 'FAIL: repository connection remains'; exit 1; else rc=$?; if [ "$rc" -ne 1 ]; then echo "ERROR: rg failed with exit $rc"; exit "$rc"; fi; echo 'OK: zero hits'; fi`
 
 **Full-suite trigger:** `N/A`
 
@@ -868,6 +868,18 @@ Result 只允许 `PASS` 或 `FAIL`。R7 是当前结论。
 `ingest_agent_traces` 把 hash kind、scope、展示预算和恢复提示留在 `libra.db`，目录和 export-job lease 写入 `capture.db`。`capture.db` 没有 `config_kv`，目录事务用 `schema_versions` 的空更新拿写锁；带 `config_kv` 的连接仍走 `begin_write_transaction`。仓库打开包装在 `src/internal/db.rs`，这样八个文件不必写出被守卫拒绝的函数名。`src/internal/ai/capture/` 里没有别的生产文件直接打开仓库库，所以没有拆卡。命令读路径仍用 `libra.db`，留到 CQ-03。`libra.db` 的捕获表没有删除。
 
 Clippy `--all-targets --all-features -D warnings` 先指出 CQ-01 留下的两处 `collapsible_if`（`store.rs`）和一处 `let_unit_value`（`tests/db_migration_test.rs`）。这两处已在本卡收掉，行为不变。收掉之后同一条 Clippy 命令 exit 0。
+
+### CQ-03（2026-11-17 06:47:53 UTC）
+
+`cargo test --lib capture_store_reader_ --jobs 6 -- --test-threads=1`：2 通过，0 失败。没有跑全工作区 `cargo nextest`，因为那次编译会先构建每一个测试产物。十二个命令和 intent 文件对 `establish_connection|get_db_conn` 的 `rg` 打印 `OK: zero hits`。`cargo +nightly fmt --all --check` exit 0。`cargo clippy --all-targets --all-features -- -D warnings` exit 0。版本仍是 `0.30.207`。
+
+`capture_store_reader_commands_read_capture_database` 先删掉 `libra.db` 里的 `agent_*` 表，再调用生产的 status、session list、checkpoint list、doctor、graph、skill search 和 clean。新行只在 `capture.db`。`load_checkpoint_catalog` 也读到这条只存在于 `capture.db` 的检查点。`libra.db` 的 `schema_versions` 最大值不变，捕获表没有删除。mega2 和 workspace 仍打开 `libra.db`，并且不会创建 `capture.db`。
+
+带 `config_kv` 的连接仍把目录和仓库看成同一个库。分开之后，import 屏障和对象索引修复不再是跨库原子事务，doctor 的子恢复检查在拿住 `metadata_kv` 锁之后另开捕获连接。两个库不 ATTACH。
+
+写集外的 `checkpoint_reader` 是生产目录读者。没有另开任务卡。`capture.db` 存在时经 `capture_store::open_readonly` 读目录行，对象格式仍从 `libra.db` 读取；文件不存在时仍读仓库库里的旧表。另外扩大的文件是 `src/internal/db.rs` 的 peer 帮助函数、`store.rs` 的 `open_current` 与 `open_readonly`、`BridgeContext.repo` 和对应测试字面量、`agent_bridge/workspace.rs`、`commit_recovery` 的双连接签名，以及 `capture_store_reader_test.rs`。
+
+这次执行按用户要求把子卡推到 `main`。REL-CQ-01 原文仍要求子卡留在本地，直到 CQ-04。
 
 ## 完成判据
 

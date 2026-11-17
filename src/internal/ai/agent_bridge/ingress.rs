@@ -20,7 +20,11 @@ use super::{
 /// (GC-LB-06/07). The request body never supplies these.
 #[derive(Debug, Clone)]
 pub struct BridgeContext {
+    /// Capture catalog (`agent_bridge_*`, checkpoints, sessions).
     pub conn: DatabaseConnection,
+    /// Repository metadata (`config_kv`, `workspace_record`). Never attached
+    /// to `conn`. A combined test database may use the same pool for both.
+    pub repo: DatabaseConnection,
     pub repository_id: String,
     pub worktree_id: Option<String>,
 }

@@ -22,6 +22,7 @@ async fn ctx() -> BridgeContext {
         .await
         .expect("apply migrations");
     BridgeContext {
+        repo: conn.clone(),
         conn,
         repository_id: "repo-1".into(),
         worktree_id: None,
@@ -162,6 +163,7 @@ async fn symlink_and_repository_identity_are_rejected() {
 
     // (a) A relative path must be rejected, even with a MATCHING repo context.
     let good = BridgeContext {
+        repo: conn.clone(),
         conn: conn.clone(),
         repository_id: "repo-real".into(),
         worktree_id: None,
@@ -186,6 +188,7 @@ async fn symlink_and_repository_identity_are_rejected() {
     // a DIFFERENT repo than the store's `libra.repoid` cannot acquire a
     // workspace (the adapter cross-checks the canonical identity).
     let spoofed = BridgeContext {
+        repo: conn.clone(),
         conn: conn.clone(),
         repository_id: "repo-spoofed".into(),
         worktree_id: None,

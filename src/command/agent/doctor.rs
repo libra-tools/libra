@@ -138,7 +138,7 @@ use crate::{
             traces,
         },
         config::ConfigKv,
-        db::get_db_conn_instance_for_path,
+        db,
         model::reference::{self, ConfigKind},
     },
     utils::{
@@ -498,13 +498,27 @@ async fn collect_codex_reconciliation(
         .iter()
         .map(|thread| thread.id.as_str())
         .collect::<Vec<_>>();
+    let scope = match crate::internal::db::repository_peer(&conn).await {
+        Ok(repo) => match CaptureScope::resolve(&repo, &root).await {
+            Ok(scope) => scope,
+            Err(_) => {
+                return CodexReconciliationReport::unavailable(
+                    page,
+                    "scope_or_catalog_unavailable",
+                );
+            }
+        },
+        Err(_) => {
+            return CodexReconciliationReport::unavailable(page, "scope_or_catalog_unavailable");
+        }
+    };
     let txn = match conn.begin().await {
         Ok(txn) => txn,
         Err(_) => return CodexReconciliationReport::unavailable(page, "catalog_unavailable"),
     };
     let mut metadata_remaining = 8 * 1024 * 1024;
     let prepared = tokio::time::timeout_at(tokio::time::Instant::from_std(end), async {
-        let scope = CaptureScope::resolve(&txn, &root).await?;
+        let scope = scope.clone();
         let states = CaptureCatalogStore::reconciliation_catalog_in_snapshot(
             &txn,
             &scope,
@@ -1057,10 +1071,13 @@ pub async fn execute_safe(args: DoctorArgs, output: &OutputConfig) -> CliResult<
     // `LBR-REPO-001` / `LBR-REPO-003` mapping; this fallback keeps the same
     // stable codes for in-process callers.
     let storage = util::try_get_storage_path(None).map_err(doctor_storage_resolution_error)?;
-    let conn = get_db_conn_instance_for_path(&storage.join(util::DATABASE))
+    let repo = db::open_cached_repository(&storage.join(util::DATABASE))
         .await
         .map_err(|error| doctor_database_open_error(error.kind()))?;
-    pin_doctor_hash_kind(&conn).await?;
+    let conn = crate::internal::ai::capture::store::open(&storage, Duration::from_secs(30))
+        .await
+        .map_err(|error| doctor_database_open_error(error.kind()))?;
+    pin_doctor_hash_kind(&repo).await?;
     let schema_present = table_exists(&conn, "agent_session").await?
         && table_exists(&conn, "agent_checkpoint").await?;
 
@@ -1149,7 +1166,7 @@ pub async fn execute_safe(args: DoctorArgs, output: &OutputConfig) -> CliResult<
     .await?;
     let findings_store = scan_agent_findings(&conn, schema_present, args.repair).await?;
     let task_workspaces = scan_task_workspaces(&storage);
-    let legacy_code_residue = scan_legacy_code_residue(&conn).await?;
+    let legacy_code_residue = scan_legacy_code_residue(&repo).await?;
 
     let codex_reconciliation = match args.codex_index_backup {
         Some(backup) => Some(
@@ -1195,7 +1212,7 @@ pub async fn execute_safe(args: DoctorArgs, output: &OutputConfig) -> CliResult<
             });
         let scope = match worktree_root {
             Some(worktree_root) => {
-                crate::internal::ai::capture_scope::CaptureScope::resolve(&conn, &worktree_root)
+                crate::internal::ai::capture_scope::CaptureScope::resolve(&repo, &worktree_root)
                     .await
                     .ok()
             }
@@ -1203,7 +1220,7 @@ pub async fn execute_safe(args: DoctorArgs, output: &OutputConfig) -> CliResult<
         };
         if let Some(scope) = scope {
             let prepared = crate::internal::ai::commit_recovery::prepare_page(
-                &conn,
+                &repo,
                 &storage,
                 &scope,
                 args.commit_link_page,
@@ -1211,11 +1228,11 @@ pub async fn execute_safe(args: DoctorArgs, output: &OutputConfig) -> CliResult<
             .await;
             if let Ok(prepared) = prepared {
                 let report = if args.repair {
-                    let txn = crate::internal::db::begin_write_transaction(&conn)
+                    let txn = crate::internal::db::begin_catalog_or_repository_write(&conn)
                 .await
-                .map_err(|_| CliError::fatal("agent doctor could not lock the repository for commit-link repair; retry after other writers finish".to_string()))?;
+                .map_err(|_| CliError::fatal("agent doctor could not lock the capture catalog for commit-link repair; retry after other writers finish".to_string()))?;
                     let mut report = crate::internal::ai::commit_recovery::inspect_prepared(
-                &txn, &storage, &scope, args.commit_link_page, true, &prepared,
+                &repo, &txn, &storage, &scope, args.commit_link_page, true, &prepared,
             ).await.map_err(|error| CliError::fatal(format!(
                 "agent commit-link repair could not complete: {error:#}; keep the local journal and retry after checking the repository"
             )))?;
@@ -1225,8 +1242,10 @@ pub async fn execute_safe(args: DoctorArgs, output: &OutputConfig) -> CliResult<
                     if !report.journal_unavailable && !report.permission_blocked {
                         let cleanup = async {
                             let cleanup_txn =
-                                crate::internal::db::begin_write_transaction(&conn).await?;
+                                crate::internal::db::begin_catalog_or_repository_write(&conn)
+                                    .await?;
                             crate::internal::ai::commit_recovery::reclaim_reconciled(
+                                &repo,
                                 &cleanup_txn,
                                 &storage,
                                 &scope,
@@ -1244,6 +1263,7 @@ pub async fn execute_safe(args: DoctorArgs, output: &OutputConfig) -> CliResult<
                     report
                 } else {
                     crate::internal::ai::commit_recovery::inspect_prepared(
+                        &repo,
                         &conn,
                         &storage,
                         &scope,
@@ -1312,7 +1332,7 @@ pub async fn execute_safe(args: DoctorArgs, output: &OutputConfig) -> CliResult<
                 return Err(CliError::fatal("agent commit journal reset refused: repair, scope, lease, journal cleanup, or current-page inspection is incomplete; resolve the reported condition and inspect other worktrees/pages before retrying".to_string()));
             }
         }
-        let txn = crate::internal::db::begin_write_transaction(&conn)
+        let txn = crate::internal::db::begin_write_transaction(&repo)
             .await
             .map_err(|_| CliError::fatal("agent doctor could not lock the repository for explicit journal reset; retry after other writers finish".to_string()))?;
         if reset_baseline.is_none()
@@ -2212,7 +2232,7 @@ pub(crate) async fn run_pending_artifact_worker() -> CliResult<()> {
     let Some(database_path) = database_path.to_str() else {
         return Ok(());
     };
-    let Ok(conn) = crate::internal::db::open_connection_without_schema_management(
+    let Ok(repo) = crate::internal::db::open_connection_without_schema_management(
         database_path,
         Duration::from_millis(200),
     )
@@ -2220,9 +2240,14 @@ pub(crate) async fn run_pending_artifact_worker() -> CliResult<()> {
     else {
         return Ok(());
     };
+    let Ok(capture) =
+        crate::internal::ai::capture::store::open(&storage, Duration::from_millis(200)).await
+    else {
+        return Ok(());
+    };
     let schema_present = match (
-        table_exists(&conn, "agent_session").await,
-        table_exists(&conn, "agent_checkpoint").await,
+        table_exists(&capture, "agent_session").await,
+        table_exists(&capture, "agent_checkpoint").await,
     ) {
         (Ok(true), Ok(true)) => true,
         (Ok(false), _) | (_, Ok(false)) => false,
@@ -2238,27 +2263,27 @@ pub(crate) async fn run_pending_artifact_worker() -> CliResult<()> {
     if !schema_present {
         return Ok(());
     }
-    if pin_doctor_hash_kind(&conn).await.is_err() {
+    if pin_doctor_hash_kind(&repo).await.is_err() {
         return Ok(());
     }
     let observed_at_ms = Utc::now().timestamp_millis();
-    let repo = match crate::internal::workspace::RepoIdentity::resolve(&conn).await {
-        Ok(repo) => repo,
+    let identity = match crate::internal::workspace::RepoIdentity::resolve(&repo).await {
+        Ok(identity) => identity,
         Err(_) => return Ok(()),
     };
     let root = util::request_working_dir();
-    let scope = match crate::internal::ai::capture_scope::CaptureScope::resolve(&conn, &root).await
+    let scope = match crate::internal::ai::capture_scope::CaptureScope::resolve(&repo, &root).await
     {
-        Ok(scope) if scope.repo_id == repo.as_str() => scope,
+        Ok(scope) if scope.repo_id == identity.as_str() => scope,
         _ => return Ok(()),
     };
     // An expired or released workspace fence gives this worker no authority
     // to mutate candidates. Return before queueing so an early stale candidate
     // cannot block later worktrees or candidates until the lease is renewed.
-    if scope.assert_workspace_fence_live(&conn).await.is_err() {
+    if scope.assert_workspace_fence_live(&repo).await.is_err() {
         return Ok(());
     }
-    let catalog = CaptureCatalogStore::new(conn.clone());
+    let catalog = CaptureCatalogStore::new(capture.clone());
     let mut batch = ArtifactReplayBatch::new();
     let deadline = match batch.deadline() {
         Ok(deadline) => deadline.monotonic(),
@@ -2268,7 +2293,7 @@ pub(crate) async fn run_pending_artifact_worker() -> CliResult<()> {
         if std::time::Instant::now() >= deadline {
             break;
         }
-        let queue = match conn.begin().await {
+        let queue = match repo.begin().await {
             Ok(txn) => match pending::pending_candidates_for_scope(&txn, &scope).await {
                 Ok(queue) => match txn.commit().await {
                     Ok(()) => queue,
@@ -2288,7 +2313,7 @@ pub(crate) async fn run_pending_artifact_worker() -> CliResult<()> {
         }
         for header in queue.headers {
             if std::time::Instant::now() >= deadline
-                || scope.assert_workspace_fence_live(&conn).await.is_err()
+                || scope.assert_workspace_fence_live(&repo).await.is_err()
             {
                 tracing::warn!(target: "agent.capture.recovery", reason = "workspace_lease_expired", "capture recovery stopped because the current workspace lease is no longer live");
                 stop_after_round = true;
@@ -2307,7 +2332,8 @@ pub(crate) async fn run_pending_artifact_worker() -> CliResult<()> {
                 Ok(Some(recovery)) => recovery,
                 Ok(None) => {
                     if !quarantine_worker_candidate(
-                        &conn,
+                        &repo,
+                        &capture,
                         &scope,
                         &header.binding.checkpoint_id,
                         Some(deadline),
@@ -2329,7 +2355,8 @@ pub(crate) async fn run_pending_artifact_worker() -> CliResult<()> {
                 }
                 Err(error) if is_permanent_worker_candidate_error(&error) => {
                     if !quarantine_worker_candidate(
-                        &conn,
+                        &repo,
+                        &capture,
                         &scope,
                         &header.binding.checkpoint_id,
                         Some(deadline),
@@ -2362,7 +2389,7 @@ pub(crate) async fn run_pending_artifact_worker() -> CliResult<()> {
                 };
                 if let Err(error) =
                     crate::internal::ai::subagent_content::recover_terminal_children(
-                        &conn,
+                        &capture,
                         &storage,
                         &recovery,
                         child_deadline,
@@ -2390,7 +2417,8 @@ pub(crate) async fn run_pending_artifact_worker() -> CliResult<()> {
                     }
                 };
                 match quarantine_worker_candidate_with_children(
-                    &conn,
+                    &repo,
+                    &capture,
                     &scope,
                     recovery.checkpoint_id(),
                     Some(deadline),
@@ -2425,7 +2453,7 @@ pub(crate) async fn run_pending_artifact_worker() -> CliResult<()> {
                 }
             };
             let replay_disposition = replay_capture_artifact(
-                &conn,
+                &capture,
                 &mut finding,
                 &recovery,
                 observed_at_ms,
@@ -2444,7 +2472,8 @@ pub(crate) async fn run_pending_artifact_worker() -> CliResult<()> {
                         }
                     };
                     match quarantine_worker_candidate_with_children(
-                        &conn,
+                        &repo,
+                        &capture,
                         &scope,
                         recovery.checkpoint_id(),
                         Some(deadline),
@@ -2511,20 +2540,29 @@ enum WorkerCandidateQuarantine {
 }
 
 async fn quarantine_worker_candidate(
-    conn: &DatabaseConnection,
+    repo: &DatabaseConnection,
+    catalog: &DatabaseConnection,
     scope: &CaptureScope,
     checkpoint_id: &str,
     deadline: Option<std::time::Instant>,
 ) -> bool {
     matches!(
-        quarantine_worker_candidate_with_children(conn, scope, checkpoint_id, deadline, None,)
-            .await,
+        quarantine_worker_candidate_with_children(
+            repo,
+            catalog,
+            scope,
+            checkpoint_id,
+            deadline,
+            None,
+        )
+        .await,
         WorkerCandidateQuarantine::Quarantined
     )
 }
 
 async fn quarantine_worker_candidate_with_children(
-    conn: &DatabaseConnection,
+    repo: &DatabaseConnection,
+    catalog: &DatabaseConnection,
     scope: &CaptureScope,
     checkpoint_id: &str,
     deadline: Option<std::time::Instant>,
@@ -2533,7 +2571,10 @@ async fn quarantine_worker_candidate_with_children(
     if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
         return WorkerCandidateQuarantine::Failed;
     }
-    let Ok(txn) = conn.begin().await else {
+    // The pending queue lives in repository `metadata_kv`. Child session
+    // rows live only in the capture catalog. Hold the queue lock, then read
+    // children on a separate connection. The two databases are never attached.
+    let Ok(txn) = repo.begin().await else {
         return WorkerCandidateQuarantine::Failed;
     };
     if txn
@@ -2550,9 +2591,35 @@ async fn quarantine_worker_candidate_with_children(
         && !recovery.superseded()
         && !recovery.quarantined()
     {
-        match crate::internal::ai::capture::catalog::child_recovery_is_pending(&txn, recovery, pair)
-            .await
-        {
+        // A combined fixture keeps catalog rows on the repository
+        // transaction. A separated capture file is read on its own
+        // connection so this checkout cannot deadlock the pool.
+        let catalog_separated =
+            match crate::internal::db::connection_has_table(catalog, "config_kv").await {
+                Ok(has_repository_tables) => !has_repository_tables,
+                Err(_) => {
+                    let _ = txn.rollback().await;
+                    return WorkerCandidateQuarantine::Failed;
+                }
+            };
+        let pending = if catalog_separated {
+            let Ok(catalog_txn) = catalog.begin().await else {
+                let _ = txn.rollback().await;
+                return WorkerCandidateQuarantine::Failed;
+            };
+            let pending = crate::internal::ai::capture::catalog::child_recovery_is_pending(
+                &catalog_txn,
+                recovery,
+                pair,
+            )
+            .await;
+            let _ = catalog_txn.rollback().await;
+            pending
+        } else {
+            crate::internal::ai::capture::catalog::child_recovery_is_pending(&txn, recovery, pair)
+                .await
+        };
+        match pending {
             Ok(true) => {
                 let _ = txn.rollback().await;
                 return WorkerCandidateQuarantine::ChildPending;
@@ -2678,6 +2745,12 @@ async fn scan_checkpoint_store(
         report.note = Some("agent schema not present (run `libra init`?)".to_string());
         return Ok(report);
     }
+    let index_conn = crate::internal::db::repository_peer(conn).await.map_err(|_| {
+        CliError::fatal(
+            "agent doctor could not open the repository database for object index checks; rerun doctor"
+                .to_string(),
+        )
+    })?;
     let repo_path = match util::try_get_storage_path(None) {
         Ok(path) => path,
         Err(_) => {
@@ -3301,7 +3374,7 @@ async fn scan_checkpoint_store(
     }
 
     // ---- Class 3: checkpoint objects missing from object_index ---------
-    let repo_id = resolve_repo_id(conn).await;
+    let repo_id = resolve_repo_id(&index_conn).await;
     // RG-05: prove artifact role closure, decoded size and complete SHA-256
     // in the registered bounded helper. Its response carries no ciphertext.
     // A bad declaration is manual-only: never repair indexes from its claims.
@@ -3339,7 +3412,8 @@ async fn scan_checkpoint_store(
             let mut inconsistent = check.artifacts.is_none();
             if let Some(artifacts) = check.artifacts {
                 for artifact in artifacts {
-                    let indexed = object_index_row_shape(conn, &artifact.oid, &repo_id).await?;
+                    let indexed =
+                        object_index_row_shape(&index_conn, &artifact.oid, &repo_id).await?;
                     if !indexed.is_some_and(|(kind, size)| {
                         kind == "blob" && u64::try_from(size).ok() == Some(artifact.byte_len)
                     }) {
@@ -3424,7 +3498,7 @@ async fn scan_checkpoint_store(
                 }
             };
             if let Some((existing_type, existing_size)) =
-                object_index_row_shape(conn, &oid, &repo_id).await?
+                object_index_row_shape(&index_conn, &oid, &repo_id).await?
             {
                 // A row that exists but drifted from the writer's
                 // semantics (e.g. a transcript blob indexed as a generic
@@ -3968,7 +4042,14 @@ async fn plan_codex_legacy_reasoning_revisions(
     plans: &mut Vec<RepairPlan>,
     notes: &mut Vec<String>,
 ) {
-    let scope = match CaptureScope::resolve(conn, &util::request_working_dir()).await {
+    let scope_conn = match crate::internal::db::repository_peer(conn).await {
+        Ok(peer) => peer,
+        Err(_) => {
+            notes.push("Codex legacy reasoning revision scan could not resolve the current scope; no legacy revisions were planned".to_string());
+            return;
+        }
+    };
+    let scope = match CaptureScope::resolve(&scope_conn, &util::request_working_dir()).await {
         Ok(scope) => scope,
         Err(_) => {
             notes.push("Codex legacy reasoning revision scan could not resolve the current scope; no legacy revisions were planned".to_string());
@@ -4256,7 +4337,16 @@ async fn execute_repair(
     };
     if let Some(recovery) = finalizer_recovery {
         let root = util::request_working_dir();
-        match CaptureScope::resolve(conn, &root).await {
+        let repo = match crate::internal::db::repository_peer(conn).await {
+            Ok(repo) => repo,
+            Err(_) => {
+                finding.detail.push_str(
+                    "; current capture scope could not be verified; repair was deferred without changing the artifact",
+                );
+                return;
+            }
+        };
+        match CaptureScope::resolve(&repo, &root).await {
             Ok(scope) if &scope != recovery.scope() => {
                 finding.detail.push_str(
                     "; retained terminal capture belongs to a different worktree/workspace scope and was not replayed or charged against this worktree's recovery budget",
@@ -4264,7 +4354,7 @@ async fn execute_repair(
                 return;
             }
             Ok(scope) => {
-                if scope.assert_workspace_fence_live(conn).await.is_err() {
+                if scope.assert_workspace_fence_live(&repo).await.is_err() {
                     finding.detail.push_str(
                         "; current workspace lease could not be verified; repair was deferred without changing the artifact",
                     );
@@ -4483,13 +4573,21 @@ async fn execute_repair(
             .await;
 
             if replay_disposition == ArtifactReplayDisposition::PermanentFailure
-                && let Ok(scope) = CaptureScope::resolve(conn, &util::request_working_dir()).await
+                && let Ok(repo) = crate::internal::db::repository_peer(conn).await
+                && let Ok(scope) = CaptureScope::resolve(&repo, &util::request_working_dir()).await
                 && &scope == recovery.scope()
                 && let Some(pair) = child_recovery_deadline
             {
                 match quarantine_worker_candidate_with_children(
-                    conn, &scope, recovery.checkpoint_id(), Some(pair.monotonic()), Some((recovery, pair)),
-                ).await {
+                    &repo,
+                    conn,
+                    &scope,
+                    recovery.checkpoint_id(),
+                    Some(pair.monotonic()),
+                    Some((recovery, pair)),
+                )
+                .await
+                {
                     WorkerCandidateQuarantine::Quarantined => finding.detail.push_str(
                         "; failed automatic candidate was retained in quarantine for operator inspection",
                     ),
@@ -4767,11 +4865,33 @@ async fn doctor_catalog_repair_scope_for_session(
 }
 
 async fn assert_doctor_catalog_repair_scope_live(
-    txn: &DatabaseTransaction,
+    txn: &impl ConnectionTrait,
     scope: &DoctorCatalogRepairScope,
     operation: &'static str,
 ) -> Result<()> {
     if let DoctorCatalogRepairScope::Scoped(scope) = scope {
+        if scope.assert_workspace_fence_live(txn).await.is_ok() {
+            return Ok(());
+        }
+        let workspace_table = txn
+            .query_one_raw(Statement::from_sql_and_values(
+                txn.get_database_backend(),
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'workspace_record' LIMIT 1",
+                [],
+            ))
+            .await
+            .ok()
+            .flatten();
+        if workspace_table.is_none() {
+            let repo = crate::internal::db::open_cached_repository(&crate::utils::path::database())
+                .await
+                .context("open repository database to verify the capture workspace lease")?;
+            scope
+                .assert_workspace_fence_live(&repo)
+                .await
+                .with_context(|| format!("verify capture workspace lease before {operation}"))?;
+            return Ok(());
+        }
         scope
             .assert_workspace_fence_live(txn)
             .await
@@ -4785,7 +4905,7 @@ async fn begin_doctor_catalog_repair_transaction(
     session_id: &str,
     operation: &'static str,
 ) -> Result<(DatabaseTransaction, DoctorCatalogRepairScope)> {
-    let txn = crate::internal::db::begin_write_transaction(conn)
+    let txn = crate::internal::db::begin_catalog_or_repository_write(conn)
         .await
         .with_context(|| format!("begin {operation}"))?;
     let scope = match doctor_catalog_repair_scope_for_session(&txn, session_id).await {
@@ -4814,10 +4934,37 @@ async fn commit_doctor_catalog_repair_transaction(
         && let DoctorCatalogRepairScope::Scoped(scope) = scope
         && let Err(error) = scope.assert_workspace_fence_live_for_commit(&txn).await
     {
-        txn.rollback().await.ok();
-        return Err(error).with_context(|| {
-            format!("verify capture workspace lease before committing {operation}")
-        });
+        let workspace_table = txn
+            .query_one_raw(Statement::from_sql_and_values(
+                txn.get_database_backend(),
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'workspace_record' LIMIT 1",
+                [],
+            ))
+            .await
+            .ok()
+            .flatten();
+        if workspace_table.is_some() {
+            txn.rollback().await.ok();
+            return Err(error).with_context(|| {
+                format!("verify capture workspace lease before committing {operation}")
+            });
+        }
+        let repo =
+            match crate::internal::db::open_cached_repository(&crate::utils::path::database()).await
+            {
+                Ok(repo) => repo,
+                Err(open_error) => {
+                    txn.rollback().await.ok();
+                    return Err(open_error)
+                        .context("open repository database to verify the capture workspace lease");
+                }
+            };
+        if let Err(peer_error) = scope.assert_workspace_fence_live(&repo).await {
+            txn.rollback().await.ok();
+            return Err(peer_error).with_context(|| {
+                format!("verify capture workspace lease before committing {operation}")
+            });
+        }
     }
     txn.commit()
         .await
@@ -4868,7 +5015,7 @@ async fn repair_update_checkpoint_catalog_row(
     traces_commit: &str,
 ) -> Result<bool> {
     const OPERATION: &str = "doctor stale checkpoint catalog-row repair";
-    let txn = crate::internal::db::begin_write_transaction(conn)
+    let txn = crate::internal::db::begin_catalog_or_repository_write(conn)
         .await
         .with_context(|| format!("begin {OPERATION}"))?;
     let row = match txn
@@ -5697,6 +5844,12 @@ async fn scan_agent_findings(
         report.note = Some("agent schema not present (run `libra init`?)".to_string());
         return Ok(report);
     }
+    let index_conn = crate::internal::db::repository_peer(conn).await.map_err(|_| {
+        CliError::fatal(
+            "agent doctor could not open the repository database for object index checks; rerun doctor"
+                .to_string(),
+        )
+    })?;
     let repo_path = match util::try_get_storage_path(None) {
         Ok(path) => path,
         Err(_) => {
@@ -5718,7 +5871,7 @@ async fn scan_agent_findings(
     let reader = ObjectReader {
         repo_path: repo_path.clone(),
     };
-    let repo_id = resolve_repo_id(conn).await;
+    let repo_id = resolve_repo_id(&index_conn).await;
     let runs_root = repo_path.join("sessions").join("agent-runs");
     let runs_root_dir = match crate::utils::object::open_directory_tree_no_follow(&runs_root) {
         Ok(directory) => directory,
@@ -5878,7 +6031,7 @@ async fn scan_agent_findings(
                         },
                     )?;
                     insert_object_index_row(
-                        conn,
+                        &index_conn,
                         &findings_oid,
                         AGENT_FINDINGS_OTYPE,
                         bytes.len() as i64,
@@ -5955,7 +6108,7 @@ async fn scan_agent_findings(
                 continue;
             }
         };
-        let shape = object_index_row_shape(conn, &findings_oid, &repo_id).await?;
+        let shape = object_index_row_shape(&index_conn, &findings_oid, &repo_id).await?;
         // The o_type is cosmetic here: doctor enumerates findings from the
         // MANIFEST (`findings_oid`), not from `object_index`, and cloud sync
         // does not filter by o_type. The shared index consumer also refuses to
@@ -5971,7 +6124,7 @@ async fn scan_agent_findings(
             let repaired = if repair {
                 if shape.is_some() {
                     update_object_index_row_shape(
-                        conn,
+                        &index_conn,
                         &findings_oid,
                         AGENT_FINDINGS_OTYPE,
                         o_size,
@@ -5986,7 +6139,7 @@ async fn scan_agent_findings(
                     })?;
                 } else {
                     insert_object_index_row(
-                        conn,
+                        &index_conn,
                         &findings_oid,
                         AGENT_FINDINGS_OTYPE,
                         o_size,
@@ -6135,7 +6288,10 @@ async fn repair_object_index_rows_atomically(
     repo_id: &str,
 ) -> Result<()> {
     const OPERATION: &str = "doctor object-index repair";
-    let txn = crate::internal::db::begin_write_transaction(conn)
+    let index = crate::internal::db::repository_peer(conn)
+        .await
+        .context("open repository database for doctor object-index repair")?;
+    let txn = crate::internal::db::begin_write_transaction(&index)
         .await
         .with_context(|| format!("begin {OPERATION}"))?;
 
@@ -6174,11 +6330,231 @@ pub(crate) struct SessionObjectIndexRepairRequest<'a> {
     pub(crate) capture_scope: &'a CaptureScope,
 }
 
+async fn repair_session_object_index_split(
+    capture: &DatabaseConnection,
+    repo_path: &Path,
+    request: SessionObjectIndexRepairRequest<'_>,
+) -> anyhow::Result<usize> {
+    let SessionObjectIndexRepairRequest {
+        session_id,
+        marker_owner,
+        marker_generation,
+        agent_kind,
+        provider_session_id,
+        capture_scope,
+    } = request;
+    let tombstone = capture
+        .query_one_raw(Statement::from_sql_and_values(
+            capture.get_database_backend(),
+            "SELECT 1 FROM agent_import_tombstone
+             WHERE agent_kind = ? AND provider_session_id = ?",
+            [agent_kind.into(), provider_session_id.into()],
+        ))
+        .await
+        .context("check erasure tombstone during import object-index repair")?;
+    if tombstone.is_some() {
+        bail!("session was erased while its import object-index repair was pending");
+    }
+    let session = capture
+        .query_one_raw(Statement::from_sql_and_values(
+            capture.get_database_backend(),
+            "SELECT agent_kind, provider_session_id FROM agent_session WHERE session_id = ?",
+            [session_id.into()],
+        ))
+        .await
+        .context("validate session ownership during import object-index repair")?;
+    if let Some(session) = session {
+        let stored_agent_kind: String = session
+            .try_get_by("agent_kind")
+            .context("decode repair session agent kind")?;
+        let stored_provider_session_id: String = session
+            .try_get_by("provider_session_id")
+            .context("decode repair provider session id")?;
+        if stored_agent_kind != agent_kind || stored_provider_session_id != provider_session_id {
+            bail!("session ownership changed while import object-index repair was pending");
+        }
+    }
+    let rows = capture
+        .query_all_raw(Statement::from_sql_and_values(
+            capture.get_database_backend(),
+            "SELECT checkpoint_id, tree_oid, traces_commit
+             FROM agent_checkpoint
+             WHERE session_id = ?
+             ORDER BY created_at, checkpoint_id
+             LIMIT ?",
+            [
+                session_id.into(),
+                i64::try_from(MAX_IMPORT_INDEX_REPAIR_CHECKPOINTS + 1)
+                    .context("import index repair checkpoint bound overflow")?
+                    .into(),
+            ],
+        ))
+        .await
+        .context("load checkpoints for import object-index repair")?;
+    if rows.len() > MAX_IMPORT_INDEX_REPAIR_CHECKPOINTS {
+        bail!(
+            "session exceeds the bounded import object-index repair limit; run `libra agent doctor --repair`"
+        );
+    }
+    let repo = crate::internal::db::repository_peer(capture)
+        .await
+        .context("open repository database for import object-index repair")?;
+    let txn = crate::internal::db::begin_write_transaction(&repo)
+        .await
+        .context("begin fenced import object-index repair")?;
+    if let Err(error) = capture_scope.assert_workspace_fence_live(&txn).await {
+        txn.rollback().await.ok();
+        return Err(error)
+            .context("verify capture workspace lease before import object-index repair");
+    }
+    let locked = txn
+        .execute_raw(Statement::from_sql_and_values(
+            txn.get_database_backend(),
+            "UPDATE metadata_kv SET updated_at = updated_at
+             WHERE scope = 'agent_import_index_repair'
+               AND target = ? AND key = 'object-index-v1'",
+            [session_id.into()],
+        ))
+        .await
+        .context("lock import object-index repair marker")?;
+    if locked.rows_affected() != 1 {
+        bail!("import object-index repair marker disappeared or is no longer owned");
+    }
+    let marker = txn
+        .query_one_raw(Statement::from_sql_and_values(
+            txn.get_database_backend(),
+            "SELECT value FROM metadata_kv
+             WHERE scope = 'agent_import_index_repair'
+               AND target = ? AND key = 'object-index-v1'",
+            [session_id.into()],
+        ))
+        .await
+        .context("read fenced import object-index repair marker")?
+        .context("import object-index repair marker disappeared after lock")?;
+    let marker_value: String = marker
+        .try_get_by("value")
+        .context("decode fenced import object-index repair marker")?;
+    let marker_json: serde_json::Value = serde_json::from_str(&marker_value)
+        .context("decode fenced import object-index repair marker JSON")?;
+    let marker_scope = marker_json
+        .get("capture_scope")
+        .cloned()
+        .context("import object-index repair marker has no capture scope")
+        .and_then(|value| {
+            serde_json::from_value::<CaptureScope>(value)
+                .context("decode import object-index repair marker capture scope")
+        })?;
+    if marker_json.get("owner").and_then(serde_json::Value::as_str) != Some(marker_owner)
+        || marker_json
+            .get("generation")
+            .and_then(serde_json::Value::as_str)
+            != Some(marker_generation)
+        || marker_json
+            .get("agent_kind")
+            .and_then(serde_json::Value::as_str)
+            != Some(agent_kind)
+        || marker_json
+            .get("provider_session_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(provider_session_id)
+        || marker_scope != *capture_scope
+    {
+        bail!("import object-index repair marker ownership changed");
+    }
+    import_index_repair_test_pause_after_lock()?;
+    let reader = ObjectReader {
+        repo_path: repo_path.to_path_buf(),
+    };
+    let repo_id = resolve_repo_id(&txn).await;
+    let mut validation_budget = ObjectIndexValidationBudget::new();
+    let mut seen = BTreeSet::new();
+    let validated_targets = (|| -> anyhow::Result<Vec<(String, &'static str, i64)>> {
+        let mut targets_to_write = Vec::new();
+        for row in rows {
+            let checkpoint_id: String = row
+                .try_get_by("checkpoint_id")
+                .context("decode import index repair checkpoint id")?;
+            let tree_oid: String = row
+                .try_get_by("tree_oid")
+                .context("decode import index repair root tree")?;
+            let traces_commit: String = row
+                .try_get_by("traces_commit")
+                .context("decode import index repair traces commit")?;
+            let sweep = sweep_e4_checkpoint_objects(&reader, &tree_oid, &checkpoint_id);
+            if !sweep.manifest_present {
+                continue;
+            }
+            if !sweep.missing.is_empty() {
+                bail!(
+                    "checkpoint {checkpoint_id} is missing object-store data required for index repair: {}; run `libra agent doctor --repair`",
+                    sweep.missing.join(", ")
+                );
+            }
+            let mut targets = vec![(traces_commit, "commit")];
+            targets.extend(
+                sweep
+                    .present
+                    .into_iter()
+                    .map(|object| (object.oid, object.o_type)),
+            );
+            for (oid, o_type) in targets {
+                if !seen.insert(oid.clone()) {
+                    continue;
+                }
+                let hash = crate::internal::object_format::parse_repo_oid(&oid)
+                    .map_err(|_| anyhow::anyhow!("invalid checkpoint object identifier"))?;
+                let size = validation_budget
+                    .validate(&reader, &hash, expected_git_object_type(o_type))
+                    .context("integrity-check checkpoint object for index repair")?;
+                targets_to_write.push((oid, o_type, size));
+            }
+        }
+        Ok(targets_to_write)
+    })();
+    let validated_targets = match validated_targets {
+        Ok(targets) => targets,
+        Err(error) => {
+            txn.rollback().await.ok();
+            return Err(error);
+        }
+    };
+    let mut repaired = 0_usize;
+    for (oid, o_type, size) in validated_targets {
+        match object_index_row_shape(&txn, &oid, &repo_id)
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?
+        {
+            Some((existing_type, existing_size))
+                if existing_type == o_type && existing_size == size => {}
+            Some(_) => {
+                update_object_index_row_shape(&txn, &oid, o_type, size, &repo_id)
+                    .await
+                    .with_context(|| format!("repair object-index row {oid}"))?;
+                repaired = repaired.saturating_add(1);
+            }
+            None => {
+                insert_object_index_row(&txn, &oid, o_type, size, &repo_id)
+                    .await
+                    .with_context(|| format!("insert object-index row {oid}"))?;
+                repaired = repaired.saturating_add(1);
+            }
+        }
+    }
+    commit_session_object_index_repair(txn, capture_scope).await?;
+    Ok(repaired)
+}
+
 pub(crate) async fn repair_session_object_index(
     conn: &DatabaseConnection,
     repo_path: &Path,
     request: SessionObjectIndexRepairRequest<'_>,
 ) -> anyhow::Result<usize> {
+    if !crate::internal::db::connection_has_table(conn, "config_kv")
+        .await
+        .unwrap_or(false)
+    {
+        return repair_session_object_index_split(conn, repo_path, request).await;
+    }
     let SessionObjectIndexRepairRequest {
         session_id,
         marker_owner,
@@ -7397,6 +7773,7 @@ mod tests {
         store.apply(&request).await.unwrap();
         assert_eq!(
             quarantine_worker_candidate_with_children(
+                &conn,
                 &conn,
                 &scope,
                 recovery.checkpoint_id(),

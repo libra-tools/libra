@@ -403,7 +403,7 @@ async fn open_repository(workdir: &Path) -> Result<DatabaseConnection, Mega2Stre
         ))
     })?;
     let database = storage.join(DATABASE);
-    db::get_db_conn_instance_for_path(&database)
+    db::open_cached_repository(&database)
         .await
         .map_err(|error| {
             Mega2StreamError::Store(format!(
