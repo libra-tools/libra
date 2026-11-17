@@ -57,6 +57,7 @@ use crate::{
                 },
                 scope_binding::{ActiveRepositoryFailureClass, active_repository_failure},
                 state::{CapturePhase, CheckpointWrite, LifecycleReducerInput, reduce_lifecycle},
+                store as capture_store,
             },
             capture_scope::{CaptureCommitDeadline, CaptureScope},
             hooks::{
@@ -302,7 +303,7 @@ pub(crate) async fn ingest_agent_traces(
             }
         })
         .transpose()?;
-    let conn = if let Some(deadline) = ingress_command.deadline() {
+    let (repo_conn, capture_busy_timeout) = if let Some(deadline) = ingress_command.deadline() {
         let terminal = ingress_command.event_kind() == LifecycleEventKind::SessionEnd;
         let remaining = deadline
             .monotonic()
@@ -336,36 +337,40 @@ pub(crate) async fn ingest_agent_traces(
         // the closed class renders as the path-free `LBR-IO-001`
         // newer-binary remedy. Only the lock wait is bounded by the hook's
         // database slice; migration DDL itself is not pre-empted.
-        db::establish_connection_with_busy_timeout(database_path, busy_timeout)
+        // Repository metadata stays on libra.db. The catalog connection is
+        // opened separately below.
+        let conn = db::open_repository_with_busy_timeout(database_path, busy_timeout)
             .await
             .map_err(|err| {
                 active_repository_failure(ActiveRepositoryFailureClass::for_database_open(
                     err.kind(),
                 ))
-            })?
+            })?;
+        (conn, busy_timeout)
     } else {
-        db::get_db_conn_instance_for_path(&database_path)
+        let conn = db::open_cached_repository(&database_path)
             .await
             .map_err(|err| {
                 active_repository_failure(ActiveRepositoryFailureClass::for_database_open(
                     err.kind(),
                 ))
-            })?
+            })?;
+        (conn, db::DEFAULT_CONNECTION_TIMEOUT)
     };
     await_agent_traces_pure_read_until(
         setup_read_deadline,
         "failed to configure hash kind from repo config",
-        set_hash_kind_from_connection(&conn),
+        set_hash_kind_from_connection(&repo_conn),
     )
     .await?;
     let repo_root = runtime_scope.worktree_root;
     let scope = await_agent_traces_pure_read_until(
         setup_read_deadline,
         "resolve capture scope from hook database",
-        CaptureScope::resolve(&conn, &repo_root),
+        CaptureScope::resolve(&repo_conn, &repo_root),
     )
     .await?;
-    if !admit_display_batch(&conn, &ingress_command).await? {
+    if !admit_display_batch(&repo_conn, &ingress_command).await? {
         ingest_span.record("partial", true);
         tracing::warn!(
             target: "agent.hook.ingest",
@@ -379,7 +384,7 @@ pub(crate) async fn ingest_agent_traces(
         match await_agent_traces_pure_read_until(
             setup_read_deadline,
             "inspect bounded capture recovery hint",
-            crate::internal::ai::capture::pending::has_pending_hint(&conn, &scope),
+            crate::internal::ai::capture::pending::has_pending_hint(&repo_conn, &scope),
         )
         .await
         {
@@ -408,14 +413,22 @@ pub(crate) async fn ingest_agent_traces(
         }
     }
 
+    // Catalog writes, including the export-job lease, go to capture.db.
+    // libra.db keeps hash kind, scope, the display budget, and the recovery
+    // hint. The two files are never attached.
+    let capture_conn = capture_store::open(&storage_path, capture_busy_timeout)
+        .await
+        .map_err(|err| {
+            active_repository_failure(ActiveRepositoryFailureClass::for_database_open(err.kind()))
+        })?;
     ingest_agent_traces_payload_with_scope(
         ingress_command,
         binding,
-        &conn,
+        &capture_conn,
         Some(&storage_path),
         &scope,
         ingest_span,
-        &ExportJobLeaseStore::new(&conn),
+        &ExportJobLeaseStore::new(&capture_conn),
     )
     .await
 }

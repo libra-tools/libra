@@ -182,6 +182,29 @@ pub async fn establish_connection_with_lock_timeout(
         .await
 }
 
+/// Open the repository database (`libra.db`) with a caller-specified busy timeout.
+///
+/// Capture catalog I/O does not use this entry. Capture modules keep
+/// repository metadata on this connection and open `.libra/private/capture.db`
+/// separately.
+pub async fn open_repository_with_busy_timeout(
+    db_path: &str,
+    busy_timeout: Duration,
+) -> Result<DatabaseConnection, IOError> {
+    establish_connection_with_busy_timeout(db_path, busy_timeout).await
+}
+
+/// Open the repository database (`libra.db`) with a lock-only timeout.
+///
+/// See [`open_repository_with_busy_timeout`]. The open budget stays the
+/// ordinary connection timeout; `lock_timeout` bounds only lock waits.
+pub async fn open_repository_with_lock_timeout(
+    db_path: &str,
+    lock_timeout: Duration,
+) -> Result<DatabaseConnection, IOError> {
+    establish_connection_with_lock_timeout(db_path, lock_timeout).await
+}
+
 /// Open a SQLite connection WITHOUT inspecting or migrating the schema.
 ///
 /// For best-effort READ paths that must never mutate the store they read
@@ -563,6 +586,14 @@ pub(crate) fn schema_upgrade_allowed() -> bool {
 
 pub async fn get_db_conn_instance_for_path(db_path: &Path) -> io::Result<DbConn> {
     get_or_init_db_conn_instance(db_path.to_path_buf()).await
+}
+
+/// Cached open of the repository database (`libra.db`).
+///
+/// See [`open_repository_with_busy_timeout`]. Capture catalog I/O does not
+/// use this entry.
+pub async fn open_cached_repository(db_path: &Path) -> io::Result<DbConn> {
+    get_db_conn_instance_for_path(db_path).await
 }
 
 /// Close and remove the cached shared pool for a SQLite file. A caller that

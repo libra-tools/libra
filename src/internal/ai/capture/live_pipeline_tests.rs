@@ -6598,3 +6598,193 @@ mod codex_terminal_local {
         );
     }
 }
+
+/// Production hook ingest writes the catalog only to `.libra/private/capture.db`.
+///
+/// The fixture removes every `agent_*` table from `libra.db` before the
+/// shipped `ingest_agent_traces` entry runs. That file still supplies
+/// repository metadata. This fixture is test-only: production still keeps
+/// the old tables until a later card deletes them.
+#[tokio::test]
+async fn capture_store_writer_hook_catalog_lands_in_capture_database() {
+    let repo = tempfile::tempdir().expect("create capture-store writer repository");
+    crate::utils::test::setup_with_new_libra_in(repo.path()).await;
+    let storage = repo.path().join(".libra");
+    let database = storage.join(crate::utils::util::DATABASE);
+    let database_path = database
+        .to_str()
+        .expect("repository database path is utf-8");
+    let repo_conn = crate::internal::db::open_repository_with_busy_timeout(
+        database_path,
+        std::time::Duration::from_secs(30),
+    )
+    .await
+    .expect("open repository database before dropping capture tables");
+    let backend = repo_conn.get_database_backend();
+    let schema_before = repo_conn
+        .query_one_raw(Statement::from_string(
+            backend,
+            "SELECT MAX(version) AS version FROM schema_versions".to_string(),
+        ))
+        .await
+        .expect("read repository schema version")
+        .expect("repository schema version row")
+        .try_get_by::<Option<i64>, _>("version")
+        .expect("decode repository schema version");
+    repo_conn
+        .execute_raw(Statement::from_string(
+            backend,
+            "PRAGMA foreign_keys = OFF".to_string(),
+        ))
+        .await
+        .expect("disable foreign keys before dropping capture tables");
+    let names = repo_conn
+        .query_all_raw(Statement::from_string(
+            backend,
+            "SELECT type, name FROM sqlite_master \
+             WHERE type IN ('table', 'trigger') \
+               AND (name LIKE 'agent\\_%' ESCAPE '\\' \
+                    OR tbl_name LIKE 'agent\\_%' ESCAPE '\\')"
+                .to_string(),
+        ))
+        .await
+        .expect("list capture tables in the repository database");
+    assert!(
+        !names.is_empty(),
+        "the repository fixture must start with capture tables so the drop is real"
+    );
+    for row in names {
+        let kind: String = row.try_get_by("type").expect("capture object type");
+        let name: String = row.try_get_by("name").expect("capture object name");
+        assert!(
+            name.chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_'),
+            "unexpected capture object name {name}"
+        );
+        let statement = match kind.as_str() {
+            "table" => format!("DROP TABLE \"{name}\""),
+            "trigger" => format!("DROP TRIGGER IF EXISTS \"{name}\""),
+            _ => panic!("unexpected sqlite_master type {kind}"),
+        };
+        repo_conn
+            .execute_raw(Statement::from_string(backend, statement))
+            .await
+            .unwrap_or_else(|error| panic!("drop capture object {name}: {error}"));
+    }
+    let remaining = repo_conn
+        .query_one_raw(Statement::from_string(
+            backend,
+            "SELECT COUNT(*) AS n FROM sqlite_master \
+             WHERE type = 'table' AND name LIKE 'agent\\_%' ESCAPE '\\'"
+                .to_string(),
+        ))
+        .await
+        .expect("count remaining capture tables")
+        .expect("remaining capture table count")
+        .try_get_by::<i64, _>("n")
+        .expect("decode remaining capture table count");
+    assert_eq!(remaining, 0, "libra.db must not keep capture tables");
+
+    let worktree = repo
+        .path()
+        .to_str()
+        .expect("worktree path is utf-8")
+        .to_string();
+    let payload = ingest_envelope("SessionStart", "S-cq02-writer", json!({}));
+    let outcome = CaptureIngressCommand::from_payload(
+        &payload,
+        ProviderHookCommand::SessionStart,
+        LifecycleEventKind::SessionStart,
+        claude_provider(),
+        None,
+        |_| {
+            Ok(CaptureIngressBinding::new(
+                worktree.clone(),
+                [0xA5; 32],
+                CaptureRuntimeScope::new(storage.clone(), repo.path().to_path_buf()),
+            ))
+        },
+    )
+    .expect("lower capture-store writer fixture");
+    let CaptureIngressOutcome::Command(command) = outcome else {
+        panic!("capture-store writer fixture must lower to a command");
+    };
+    let binding = LiveCaptureBinding::resolve(claude_provider());
+    let ingest_span = new_ingest_span(command.hook_command(), claude_provider());
+    ingest_agent_traces(command, binding, &ingest_span)
+        .await
+        .expect("hook ingest writes the catalog through the capture store");
+
+    let schema_after = repo_conn
+        .query_one_raw(Statement::from_string(
+            backend,
+            "SELECT MAX(version) AS version FROM schema_versions".to_string(),
+        ))
+        .await
+        .expect("re-read repository schema version")
+        .expect("repository schema version row")
+        .try_get_by::<Option<i64>, _>("version")
+        .expect("decode repository schema version");
+    assert_eq!(
+        schema_after, schema_before,
+        "writing the catalog must not advance the repository schema"
+    );
+    let still_gone = repo_conn
+        .query_one_raw(Statement::from_string(
+            backend,
+            "SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'agent_session'"
+                .to_string(),
+        ))
+        .await
+        .expect("confirm agent_session stayed out of libra.db")
+        .expect("agent_session presence row")
+        .try_get_by::<i64, _>("n")
+        .expect("decode agent_session presence");
+    assert_eq!(still_gone, 0, "the catalog row must not land in libra.db");
+
+    let capture =
+        crate::internal::ai::capture::store::open(&storage, std::time::Duration::from_secs(30))
+            .await
+            .expect("reopen capture.db");
+    let capture_backend = capture.get_database_backend();
+    let databases = capture
+        .query_one_raw(Statement::from_string(
+            capture_backend,
+            "SELECT COUNT(*) AS n FROM pragma_database_list".to_string(),
+        ))
+        .await
+        .expect("count attached databases")
+        .expect("database list row")
+        .try_get_by::<i64, _>("n")
+        .expect("decode database list count");
+    assert_eq!(databases, 1, "capture.db must not attach libra.db");
+    let row = capture
+        .query_one_raw(Statement::from_sql_and_values(
+            capture_backend,
+            "SELECT agent_kind, state, provider_session_id, working_dir \
+             FROM agent_session WHERE provider_session_id = ?",
+            ["S-cq02-writer".into()],
+        ))
+        .await
+        .expect("query capture catalog")
+        .expect("session row exists only in capture.db");
+    assert_eq!(
+        row.try_get_by::<String, _>("agent_kind")
+            .expect("agent_kind"),
+        "claude_code"
+    );
+    assert_eq!(
+        row.try_get_by::<String, _>("state").expect("state"),
+        "active"
+    );
+    assert_eq!(
+        row.try_get_by::<String, _>("provider_session_id")
+            .expect("provider_session_id"),
+        "S-cq02-writer"
+    );
+    assert_eq!(
+        row.try_get_by::<String, _>("working_dir")
+            .expect("working_dir"),
+        worktree
+    );
+}

@@ -547,13 +547,13 @@ async fn table_exists(conn: &DatabaseConnection, table: &str) -> io::Result<bool
 async fn ensure_capture_schema(conn: &DatabaseConnection) -> io::Result<()> {
     let current = schema::current_schema_version_for_role(conn, DatabaseRole::Capture).await?;
     let latest = schema::latest_schema_version_for_role(DatabaseRole::Capture)?;
-    if let Some(current) = current {
-        if latest.is_none_or(|latest| current > latest) {
-            return Err(io::Error::other(format!(
-                "capture database schema version {current} is newer than this Libra binary supports (latest supported: {}); install a newer Libra binary. The repository database was not changed",
-                schema_version_text(latest)
-            )));
-        }
+    if let Some(current) = current
+        && latest.is_none_or(|latest| current > latest)
+    {
+        return Err(io::Error::other(format!(
+            "capture database schema version {current} is newer than this Libra binary supports (latest supported: {}); install a newer Libra binary. The repository database was not changed",
+            schema_version_text(latest)
+        )));
     }
     if current == latest && current.is_some() {
         return Ok(());
@@ -810,13 +810,13 @@ fn create_private_file(path: &Path) -> io::Result<()> {
 }
 
 fn reject_symlink(path: &Path) -> io::Result<()> {
-    if let Ok(metadata) = fs::symlink_metadata(path) {
-        if metadata.file_type().is_symlink() {
-            return Err(io::Error::new(
-                ErrorKind::AlreadyExists,
-                "capture database path is a symlink; remove it and retry",
-            ));
-        }
+    if let Ok(metadata) = fs::symlink_metadata(path)
+        && metadata.file_type().is_symlink()
+    {
+        return Err(io::Error::new(
+            ErrorKind::AlreadyExists,
+            "capture database path is a symlink; remove it and retry",
+        ));
     }
     Ok(())
 }

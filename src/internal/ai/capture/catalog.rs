@@ -6674,11 +6674,51 @@ async fn begin_catalog_write_transaction(
     deadline: Option<CaptureCommitDeadline>,
 ) -> Result<DatabaseTransaction, CaptureCatalogError> {
     run_catalog_begin_until(deadline, async {
-        db::begin_write_transaction(conn)
-            .await
-            .map_err(|_| CaptureCatalogError::TransactionStart)
+        // `begin_write_transaction` takes its writer lock with `config_kv`.
+        // That table stays in `libra.db`. A catalog transaction on
+        // `capture.db` uses `schema_versions`, which exists in both files and
+        // changes no row (`WHERE 0`).
+        if catalog_connection_has_repository_lock_table(conn).await? {
+            db::begin_write_transaction(conn)
+                .await
+                .map_err(|_| CaptureCatalogError::TransactionStart)
+        } else {
+            begin_capture_file_write_transaction(conn).await
+        }
     })
     .await
+}
+
+async fn catalog_connection_has_repository_lock_table(
+    conn: &DatabaseConnection,
+) -> Result<bool, CaptureCatalogError> {
+    let row = conn
+        .query_one_raw(Statement::from_string(
+            conn.get_database_backend(),
+            "SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'config_kv'"
+                .to_string(),
+        ))
+        .await
+        .map_err(|_| CaptureCatalogError::TransactionStart)?;
+    Ok(row.is_some())
+}
+
+async fn begin_capture_file_write_transaction(
+    conn: &DatabaseConnection,
+) -> Result<DatabaseTransaction, CaptureCatalogError> {
+    let txn = conn
+        .begin()
+        .await
+        .map_err(|_| CaptureCatalogError::TransactionStart)?;
+    if txn
+        .execute_unprepared("UPDATE `schema_versions` SET `version` = `version` WHERE 0")
+        .await
+        .is_err()
+    {
+        let _ = txn.rollback().await;
+        return Err(CaptureCatalogError::TransactionStart);
+    }
+    Ok(txn)
 }
 
 /// Gate each dispatchable catalog mutation after its read-only preflight. The
@@ -9601,12 +9641,10 @@ mod tests {
         conn.execute_unprepared("PRAGMA journal_mode = WAL")
             .await
             .unwrap();
-        let contender = db::establish_connection_with_busy_timeout(
-            path.to_str().unwrap(),
-            Duration::from_secs(5),
-        )
-        .await
-        .unwrap();
+        let contender =
+            db::open_repository_with_busy_timeout(path.to_str().unwrap(), Duration::from_secs(5))
+                .await
+                .unwrap();
         contender
             .execute_unprepared("PRAGMA busy_timeout = 0")
             .await

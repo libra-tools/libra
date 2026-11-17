@@ -6636,7 +6636,7 @@ mod tests {
         committed_marker.commit = Some("e69de29bb2d1d6434b8b29ae775ad8c2e48c5391".to_string());
         committed_marker.oids = vec!["e69de29bb2d1d6434b8b29ae775ad8c2e48c5391".to_string()];
 
-        let locker = crate::internal::db::establish_connection_with_lock_timeout(
+        let locker = crate::internal::db::open_repository_with_lock_timeout(
             database_path
                 .to_str()
                 .expect("marker refresh database path is utf-8"),
@@ -6868,7 +6868,7 @@ mod tests {
         .await
         .expect("seed checkpoint deadline workspace lease");
 
-        let locker = crate::internal::db::establish_connection_with_lock_timeout(
+        let locker = crate::internal::db::open_repository_with_lock_timeout(
             database_path
                 .to_str()
                 .expect("checkpoint deadline database path is utf-8"),

@@ -7800,10 +7800,9 @@ async fn capture_db_copy_is_reentrant_and_batched() {
         CAPTURE_COPY_BATCH_PEAK.load(Ordering::Relaxed),
         CAPTURE_COPY_BATCH
     );
-    let again = store::copy_catalog_from_repository(&capture, &repository)
+    store::copy_catalog_from_repository(&capture, &repository)
         .await
         .unwrap();
-    let _ = again;
     assert_eq!(
         capture_count(&capture, "agent_session").await,
         (CAPTURE_COPY_BATCH + 1) as i64

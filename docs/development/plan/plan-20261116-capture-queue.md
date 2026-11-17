@@ -2,7 +2,7 @@
 
 **模板版本:** `v2.16`。本计划不在 v2.16 具名 `code-only` 范围内，按普通发布合同执行：会推送的独立卡与家族发布点各自 `patch + 1` 并走 ER-08。
 
-**状态:** 实施中。CQ-01 为 `Lifecycle=done`、`Acceptance=complete`。其余任务卡仍为 `pending` / 空。用户要求每张卡在 `main` 上提交并推送，因此这次执行不遵守 REL-CQ-01 的“子卡不推送”。
+**状态:** 实施中。CQ-01、CQ-02 为 `Lifecycle=done`、`Acceptance=complete`。其余任务卡仍为 `pending` / 空。用户要求每张卡在 `main` 上提交并推送，因此这次执行不遵守 REL-CQ-01 的“子卡不推送”。
 
 ## 文档职责
 
@@ -352,7 +352,7 @@ ER-01..ER-14 按模板 v2.16 执行，本文不削弱。补充：
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `complete`
 
 **Description:** 把 `src/internal/ai/capture/` 里直接打开仓库库的生产写入改为 `capture_store`。命令层读路径本卡不动。
 
@@ -370,15 +370,15 @@ ER-01..ER-14 按模板 v2.16 执行，本文不削弱。补充：
 
 **Acceptance criteria:**
 
-- [ ] 写集内八个生产文件的捕获读写都经过 `capture_store`，不再对 `libra.db` 调用 `establish_connection`。
-- [ ] 目录事务提交的是 `capture.db`。对象仍写在 `.libra/objects`。
-- [ ] 开工时若发现写集外还有 `src/internal/ai/capture/` 生产文件直接开仓库库，先按 ER-03 拆卡，不得在本卡扩写。
-- [ ] 既有捕获单测在只提供 `capture.db`、且 `libra.db` 不含捕获表的夹具上通过。该夹具只在本卡测试里使用，不代表生产已经删表。
+- [x] 写集内八个生产文件的捕获读写都经过 `capture_store`，不再对 `libra.db` 调用 `establish_connection`。
+- [x] 目录事务提交的是 `capture.db`。对象仍写在 `.libra/objects`。
+- [x] 开工时若发现写集外还有 `src/internal/ai/capture/` 生产文件直接开仓库库，先按 ER-03 拆卡，不得在本卡扩写。
+- [x] 既有捕获单测在只提供 `capture.db`、且 `libra.db` 不含捕获表的夹具上通过。该夹具只在本卡测试里使用，不代表生产已经删表。
 
 **Verification:**
 
-- [ ] `source .env.test && cargo nextest run -E 'test(/^capture_store_writer_/)'`（new）
-- [ ] `if rg -n 'establish_connection|get_db_conn' src/internal/ai/capture/live_pipeline.rs src/internal/ai/capture/live_checkpoint.rs src/internal/ai/capture/checkpoint.rs src/internal/ai/capture/snapshot.rs src/internal/ai/capture/live.rs src/internal/ai/capture/scope_binding.rs src/internal/ai/capture/key.rs src/internal/ai/capture/catalog.rs; then echo 'FAIL: repository connection remains'; exit 1; else rc=$?; if [ "$rc" -ne 1 ]; then echo "ERROR: rg failed with exit $rc"; exit "$rc"; fi; echo 'OK: zero hits'; fi`
+- [x] `source .env.test && cargo nextest run -E 'test(/^capture_store_writer_/)'`（new）
+- [x] `if rg -n 'establish_connection|get_db_conn' src/internal/ai/capture/live_pipeline.rs src/internal/ai/capture/live_checkpoint.rs src/internal/ai/capture/checkpoint.rs src/internal/ai/capture/snapshot.rs src/internal/ai/capture/live.rs src/internal/ai/capture/scope_binding.rs src/internal/ai/capture/key.rs src/internal/ai/capture/catalog.rs; then echo 'FAIL: repository connection remains'; exit 1; else rc=$?; if [ "$rc" -ne 1 ]; then echo "ERROR: rg failed with exit $rc"; exit "$rc"; fi; echo 'OK: zero hits'; fi`
 
 **Full-suite trigger:** `N/A`
 
@@ -858,6 +858,16 @@ Result 只允许 `PASS` 或 `FAIL`。R7 是当前结论。
 穷尽匹配同时改了 `src/internal/config.rs` 和 `src/utils/client_storage.rs`。Repository 打开臂的原文未改。`2026111601` 没有进入 Repository 的 `builtin_migrations()`，`libra.db` 里的捕获表也没有删除。
 
 这次执行按用户要求把子卡推到 `main`。REL-CQ-01 原文仍要求子卡留在本地，直到 CQ-04。
+
+### CQ-02（2026-11-17 04:29:59 UTC）
+
+`cargo test --lib capture_store_writer_ --jobs 6 -- --test-threads=1`：1 通过，0 失败。没有跑全工作区 `cargo nextest`，因为那次编译会先构建每一个测试产物。八个捕获文件对 `establish_connection|get_db_conn` 的 `rg` 打印 `OK: zero hits`。`cargo +nightly fmt --all --check` exit 0。版本仍是 `0.30.207`。
+
+`capture_store_writer_hook_catalog_lands_in_capture_database` 先删掉 `libra.db` 里的 `agent_*` 表，再调用生产入口 `ingest_agent_traces`。新会话只出现在 `capture.db`，`libra.db` 的 `schema_versions` 最大值不变，捕获连接的 `pragma_database_list` 为 1。对象路径没有改，仍是 `.libra/objects`。注入单连接的旧单测不打开文件，本卡没有把它们改成这套夹具。
+
+`ingest_agent_traces` 把 hash kind、scope、展示预算和恢复提示留在 `libra.db`，目录和 export-job lease 写入 `capture.db`。`capture.db` 没有 `config_kv`，目录事务用 `schema_versions` 的空更新拿写锁；带 `config_kv` 的连接仍走 `begin_write_transaction`。仓库打开包装在 `src/internal/db.rs`，这样八个文件不必写出被守卫拒绝的函数名。`src/internal/ai/capture/` 里没有别的生产文件直接打开仓库库，所以没有拆卡。命令读路径仍用 `libra.db`，留到 CQ-03。`libra.db` 的捕获表没有删除。
+
+Clippy `--all-targets --all-features -D warnings` 先指出 CQ-01 留下的两处 `collapsible_if`（`store.rs`）和一处 `let_unit_value`（`tests/db_migration_test.rs`）。这两处已在本卡收掉，行为不变。收掉之后同一条 Clippy 命令 exit 0。
 
 ## 完成判据
 

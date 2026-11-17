@@ -1931,7 +1931,7 @@ mod tests {
         crate::utils::test::setup_with_new_libra_in(repo.path()).await;
         let storage = repo.path().join(".libra");
         let database = storage.join(util::DATABASE);
-        let conn = db::get_db_conn_instance_for_path(&database)
+        let conn = db::open_cached_repository(&database)
             .await
             .expect("open isolated commitment database");
         let scope = CaptureScope::resolve(&conn, repo.path())
@@ -1972,7 +1972,7 @@ mod tests {
         crate::utils::test::setup_with_new_libra_in(repo.path()).await;
         let storage = repo.path().join(".libra");
         let database = storage.join(util::DATABASE);
-        let conn = db::get_db_conn_instance_for_path(&database)
+        let conn = db::open_cached_repository(&database)
             .await
             .expect("open isolated commitment-domain database");
         let scope = CaptureScope::resolve(&conn, repo.path())
