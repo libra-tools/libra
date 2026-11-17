@@ -326,6 +326,98 @@ struct DoctorReport {
     /// HM-08: Hermes exporter trust is source-qualified and is not a native
     /// origin claim. Hook install stays disabled.
     hermes_export: crate::internal::ai::observed_agents::hermes_export::HermesBridgeStatus,
+    /// plan-20261116 CQ-06: realtime capture queue backlog (counts only).
+    capture_queue: CaptureQueueReport,
+}
+
+/// Realtime capture queue backlog under `.libra/private/capture-spool/`.
+/// Doctor only stats directory entries: it never reads an envelope, never
+/// takes the consumer lock, and never stores or moves a queued event.
+#[derive(Debug, Default, Serialize)]
+struct CaptureQueueReport {
+    ready: CaptureQueueDirCount,
+    quarantine: CaptureQueueDirCount,
+}
+
+/// Files and bytes in one queue directory. The scan visits at most
+/// [`CAPTURE_QUEUE_COUNT_LIMIT`] directory entries of any kind; when more
+/// remain, `at_least` marks `files` and `bytes` as lower bounds.
+/// `unavailable` means the directory or one of its entries could not be read.
+#[derive(Debug, Default, Serialize)]
+struct CaptureQueueDirCount {
+    files: u64,
+    bytes: u64,
+    at_least: bool,
+    unavailable: bool,
+}
+
+const CAPTURE_QUEUE_COUNT_LIMIT: u64 = 1024;
+
+impl CaptureQueueDirCount {
+    fn scan(dir: &std::path::Path) -> Self {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Self::default();
+            }
+            Err(_) => {
+                return Self {
+                    unavailable: true,
+                    ..Self::default()
+                };
+            }
+        };
+        let mut count = Self::default();
+        let mut visited = 0_u64;
+        for entry in entries {
+            // The budget is entries visited, not regular files found, so a
+            // directory full of other entries is still bounded.
+            if visited >= CAPTURE_QUEUE_COUNT_LIMIT {
+                count.at_least = true;
+                break;
+            }
+            visited += 1;
+            let Ok(entry) = entry else {
+                count.unavailable = true;
+                continue;
+            };
+            // `DirEntry::metadata` does not follow a symlink.
+            match entry.metadata() {
+                Ok(metadata) if metadata.is_file() => {
+                    count.files += 1;
+                    count.bytes = count.bytes.saturating_add(metadata.len());
+                }
+                Ok(_) => {}
+                Err(_) => count.unavailable = true,
+            }
+        }
+        count
+    }
+
+    fn describe(&self) -> String {
+        if self.unavailable && self.files == 0 {
+            return "unreadable".to_string();
+        }
+        let bound = if self.at_least { "at least " } else { "" };
+        let mut text = format!("{bound}{} files, {bound}{} bytes", self.files, self.bytes);
+        if self.unavailable {
+            text.push_str(" (some entries unreadable)");
+        }
+        text
+    }
+}
+
+impl CaptureQueueReport {
+    fn scan(storage: &std::path::Path) -> Self {
+        Self {
+            ready: CaptureQueueDirCount::scan(&crate::internal::ai::capture::spool::ready_dir(
+                storage,
+            )),
+            quarantine: CaptureQueueDirCount::scan(
+                &crate::internal::ai::capture::spool::quarantine_dir(storage),
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -1076,7 +1168,7 @@ pub async fn execute_safe(args: DoctorArgs, output: &OutputConfig) -> CliResult<
         .map_err(|error| doctor_database_open_error(error.kind()))?;
     let conn = crate::internal::ai::capture::store::open(&storage, Duration::from_secs(30))
         .await
-        .map_err(|error| doctor_database_open_error(error.kind()))?;
+        .map_err(|error| doctor_capture_open_error(&error))?;
     pin_doctor_hash_kind(&repo).await?;
     let schema_present = table_exists(&conn, "agent_session").await?
         && table_exists(&conn, "agent_checkpoint").await?;
@@ -1384,6 +1476,7 @@ pub async fn execute_safe(args: DoctorArgs, output: &OutputConfig) -> CliResult<
             task_workspaces,
             legacy_code_residue,
             hermes_export,
+            capture_queue: CaptureQueueReport::scan(&storage),
         },
         output,
     )
@@ -1805,6 +1898,40 @@ fn doctor_database_open_error(kind: std::io::ErrorKind) -> CliError {
         "agent doctor could not open the repository database; if it was written by a newer \
          Libra, install a newer Libra binary; otherwise restore repository storage, then rerun \
          doctor",
+    )
+    .with_stable_code(StableErrorCode::IoReadFailed)
+}
+
+/// Path-free mapping for a failed capture-database open. The capture
+/// catalog is `.libra/private/capture.db`, not the repository database: a
+/// schema written by a newer Libra (`LBR-AGENT-048`), a busy database
+/// (`LBR-AGENT-047`) and a damaged or unreadable file (`LBR-IO-001`) each get
+/// their own remedy, and none of them names the repository database.
+fn doctor_capture_open_error(error: &std::io::Error) -> CliError {
+    use crate::internal::ai::capture::drain::{CaptureDatabaseBusy, CaptureSchemaTooNew};
+
+    let classified = crate::internal::ai::capture::drain::classify_capture_open(error);
+    if classified.downcast_ref::<CaptureSchemaTooNew>().is_some() {
+        return CliError::fatal(
+            "agent doctor could not open the capture database (.libra/private/capture.db): it \
+             was written by a newer Libra; install the current Libra release, then rerun \
+             `libra agent doctor`",
+        )
+        .with_stable_code(StableErrorCode::CaptureSchemaTooNew);
+    }
+    if classified.downcast_ref::<CaptureDatabaseBusy>().is_some() {
+        return CliError::fatal(
+            "agent doctor could not open the capture database (.libra/private/capture.db): it \
+             is busy; rerun `libra agent doctor` after other Libra commands in this repository \
+             finish",
+        )
+        .with_stable_code(StableErrorCode::CaptureDatabaseBusy);
+    }
+    CliError::fatal(
+        "agent doctor could not open the capture database (.libra/private/capture.db): the file \
+         is damaged or unreadable; the repository database is not affected. Restore \
+         .libra/private/capture.db from a backup (or move it aside to start an empty capture \
+         catalog), then rerun `libra agent doctor`",
     )
     .with_stable_code(StableErrorCode::IoReadFailed)
 }
@@ -7051,6 +7178,11 @@ fn emit_report(report: &DoctorReport, output: &OutputConfig) -> CliResult<()> {
     println!("Stopped sessions     : {}", report.stopped_sessions);
     println!("Orphan checkpoints   : {}", report.orphan_checkpoints);
     println!(
+        "Capture queue        : ready {}; quarantine {}",
+        report.capture_queue.ready.describe(),
+        report.capture_queue.quarantine.describe()
+    );
+    println!(
         "Codex diagnostics    : {}",
         report.capture_diagnostics.describe()
     );
@@ -7500,6 +7632,36 @@ mod tests {
     use sea_orm::{Database, DbBackend};
 
     use super::*;
+
+    /// plan-20261116 CQ-06: the queue scan visits at most 1024 entries of any
+    /// kind, counts only regular files, and reports a larger directory as a
+    /// lower bound. Local capture test (`LIBRA_RUN_CAPTURE_TESTS=1`).
+    #[test]
+    fn capture_spool_doctor_scan_is_bounded_by_entries_visited() {
+        if !crate::internal::ai::capture::spool::capture_tests_enabled(
+            "capture_spool_doctor_scan_is_bounded_by_entries_visited",
+        ) {
+            return;
+        }
+        let dir = tempfile::tempdir().expect("queue dir");
+        for index in 0..CAPTURE_QUEUE_COUNT_LIMIT + 1 {
+            std::fs::create_dir(dir.path().join(format!("sub-{index:04}"))).expect("subdir");
+        }
+        let count = CaptureQueueDirCount::scan(dir.path());
+        assert_eq!(count.files, 0, "directories are not queue files");
+        assert!(count.at_least, "more than 1024 entries is a lower bound");
+
+        let small = tempfile::tempdir().expect("queue dir");
+        std::fs::write(small.path().join("1-a~k"), b"abc").expect("file");
+        std::fs::create_dir(small.path().join("nested")).expect("subdir");
+        let count = CaptureQueueDirCount::scan(small.path());
+        assert_eq!((count.files, count.bytes, count.at_least), (1, 3, false));
+        assert_eq!(
+            CaptureQueueDirCount::scan(&small.path().join("missing")).files,
+            0,
+            "a missing queue directory is an empty queue"
+        );
+    }
 
     #[cfg(feature = "test-live-agent")]
     #[test]

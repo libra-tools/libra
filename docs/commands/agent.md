@@ -275,6 +275,18 @@ for example after upgrading, run `libra __capture-spool-drain` from the
 repository root; it prints nothing on success, never prints envelope contents,
 and exits non-zero when it moved an event to `quarantine/`.
 `libra agent import` still writes `capture.db` directly and does not queue.
+`libra agent doctor` reports the queue backlog: the human output has a
+`Capture queue` line, and `--json` has `capture_queue.ready` and
+`capture_queue.quarantine`, each with `files`, `bytes`, `at_least` and
+`unavailable` (an empty queue is `0`, not an omitted field). Doctor only stats
+directory entries: it never reads, stores or moves a queued event, never waits
+for or takes the consumer lock, and stops counting at 1024 entries per
+directory (`at_least: true`, printed as "at least"). Neither output contains a
+file path or envelope content. When doctor cannot open
+`.libra/private/capture.db` it names the capture database, not the repository
+database: a schema written by a newer Libra fails with `LBR-AGENT-048`, a busy
+database with `LBR-AGENT-047`, and a damaged or unreadable file with
+`LBR-IO-001`, each with its own remedy.
 
 `libra agent workspace list|show` is the read-only machine interface over
 the workspace registry (`workspace_record`): every linked worktree, task

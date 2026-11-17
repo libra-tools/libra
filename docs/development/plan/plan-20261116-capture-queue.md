@@ -2,7 +2,7 @@
 
 **模板版本:** `v2.16`。本计划不在 v2.16 具名 `code-only` 范围内，按普通发布合同执行：会推送的独立卡与家族发布点各自 `patch + 1` 并走 ER-08。
 
-**状态:** 实施中。CQ-01、CQ-02、CQ-03、CQ-07、CQ-04、CQ-05 为 `Lifecycle=done`、`Acceptance=complete`。CQ-06 为 `pending` / 空。FIX-CQ-01（CQ-02/CQ-03/CQ-07 拆库回归）随 CQ-05 关闭。FIX-CQ-02（cloud sync/restore 未读 `capture.db`）已修复，作为 CQ-06 之前的独立提交交付。用户要求每张卡在 `main` 上提交并推送，因此这次执行不遵守 REL-CQ-01 的“子卡不推送”。用户另要求捕获相关的新测试不进入 GitHub Actions，以本地运行为准：这些测试由 `LIBRA_RUN_CAPTURE_TESTS=1` 门控，CI 中打印 `skipped`。
+**状态:** 实施中（收口全量待跑）。CQ-01、CQ-02、CQ-03、CQ-07、CQ-04、CQ-05、CQ-06 均为 `Lifecycle=done`、`Acceptance=complete`。FIX-CQ-01（CQ-02/CQ-03/CQ-07 拆库回归）随 CQ-05 关闭。FIX-CQ-02（cloud sync/restore 未读 `capture.db`）已修复，作为 CQ-06 之前的独立提交交付。用户要求每张卡在 `main` 上提交并推送，因此这次执行不遵守 REL-CQ-01 的“子卡不推送”。用户另要求捕获相关的新测试不进入 GitHub Actions，以本地运行为准：这些测试由 `LIBRA_RUN_CAPTURE_TESTS=1` 门控，CI 中打印 `skipped`。
 
 ## 文档职责
 
@@ -107,6 +107,7 @@
 | 2026-11-16 13:17:14 UTC | Codex R6 FAIL | `tmp/` 改为在 `capacity.lock` 内 `O_EXCL` 创建，锁外才写内容，避免并发创建越过 64 | 无拆卡 | ADR-CQ-02、CQ-05 AC/预算、故障矩阵、容量表 |
 | 2026-11-17 16:55:05 UTC | CQ-05 实施 | 消费者重放使用自己的捕获期限（提供方自管导出窗口的沿用其预算，其余 30 秒），数据库等待用满该期限；消费者只继承白名单环境变量（含提供方目录、沙箱、对象存储），丢弃 API key；`__capture-spool-drain` 在有信封进入 `quarantine/` 时非零退出；入队前只用文件元数据检查 `libra.db` 是否存在（`LBR-REPO-002`/`LBR-IO-001`），schema 过新由消费者报告。新增调试构建测试缝 `LIBRA_TEST=1` + `LIBRA_TEST_CAPTURE_SPOOL_NO_CONSUMER=1`。捕获新测试以 `LIBRA_RUN_CAPTURE_TESTS=1` 门控，不进入 GitHub Actions | 无拆卡；新增 FIX-CQ-01 | CQ-05 写集、ADR-CQ-03、修复登记、实施证据汇总 |
 | 2026-11-17 20:52:53 UTC | FIX-CQ-02 | `cloud sync`/`cloud restore` 改从 `capture.db` 读写目录，`libra.db` 只留 ref 与对象索引；冻结对两个库各做变更检测 | 无拆卡 | 修复登记、实施证据汇总 |
+| 2026-11-17 21:50:12 UTC | CQ-06 实施 | doctor 报告 `capture.db` 可否打开（schema 过新、库忙、损坏三种文案与码）与 `ready`/`quarantine` 文件数和字节数（只 stat、上限 1024） | 无拆卡 | CQ-06 卡片、实施证据汇总 |
 
 ## 已决议设计决策
 
@@ -699,7 +700,7 @@ D 组三条不计入 VER。它们是 ER-04 的远端门。
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `complete`
 
 **Description:** `libra agent doctor` 报告 `capture.db` 是否可打开，以及 spool 的 `ready/`、`quarantine/` 文件数和字节数。它不消费队列，也不在诊断时抢占消费者锁。
 
@@ -716,14 +717,14 @@ D 组三条不计入 VER。它们是 ER-04 的远端门。
 
 **Acceptance criteria:**
 
-- [ ] doctor 打开的是 `capture.db`。打不开时说明捕获库，而不是仓库库；schema 过新与文件损坏的文案不同。
-- [ ] 输出包含 `ready` 与 `quarantine` 的文件数和字节数。空队列是 0，不是省略。
-- [ ] doctor 运行期间，已持有队列锁的消费者不会被 doctor 打断，doctor 也不等待该锁。
-- [ ] 人读输出与 `--json` 都包含上述计数，且 JSON 不包含文件绝对路径或信封内容。
+- [x] doctor 打开的是 `capture.db`。打不开时说明捕获库，而不是仓库库；schema 过新与文件损坏的文案不同。
+- [x] 输出包含 `ready` 与 `quarantine` 的文件数和字节数。空队列是 0，不是省略。
+- [x] doctor 运行期间，已持有队列锁的消费者不会被 doctor 打断，doctor 也不等待该锁。
+- [x] 人读输出与 `--json` 都包含上述计数，且 JSON 不包含文件绝对路径或信封内容。
 
 **Verification:**
 
-- [ ] `source .env.test && cargo nextest run --test agent_doctor_repair_test capture_spool_doctor_`（new：人读与 JSON 计数、不抢消费者锁、schema 过新与损坏文案）
+- [x] `source .env.test && cargo nextest run --test agent_doctor_repair_test capture_spool_doctor_`（new：人读与 JSON 计数、不抢消费者锁、schema 过新与损坏文案）
 
 **Full-suite trigger:** `none`
 
@@ -853,6 +854,7 @@ Result 只允许 `PASS` 或 `FAIL`。R7 是计划文本的当前结论。R9 是 
 | R13 | R12 修复 | PASS | P0=0，P1=0。R12 四项确认关闭；已核对 doctor class 2（`missing_catalog_row`）能识别并用 `--repair` 重建 ref 可达而目录缺行的检查点，cleanup-pending marker 不会挡住该修复 | P2 一项：验证清单勾选了带 `^` 锚点的原命令，实际证据来自不带锚点的命令。已改为不勾原命令，另列实际执行的命令 | Codex exec，只读，2026-11-17 |
 | F1 | FIX-CQ-02 | FAIL | P0=0。代码路由被确认（目录走目录连接，ref 与对象索引留在 `libra.db`，冻结对两个库都做检测，restore 先仓库后目录取锁）。P1：守卫修正后未重跑双环境全量 | P2：状态行写成“已独立提交” | Codex exec，只读，2026-11-17。已重跑全量并改写状态行 |
 | F2 | FIX-CQ-02 复核 | PASS | P0=0，P1=0。全量 11841 项全部通过（1 项无关 flaky 重试通过），状态行不再声称已提交 | 无 P2 | Codex exec，只读，2026-11-17 |
+| C1 | CQ-06 实现 | PASS | P0=0，P1=0。四项 AC、只 stat 的预算、无路径/内容、文档与 0.30.210 版本面均确认 | P2 一项：1024 上限按普通文件数计，非文件目录项不受限。已改为按访问的目录项计数，并加单测 `capture_spool_doctor_scan_is_bounded_by_entries_visited` | Codex exec，只读，2026-11-17 |
 
 ## 修复登记
 
@@ -941,6 +943,12 @@ Clippy `--all-targets --all-features -D warnings` 先指出 CQ-01 留下的两�
 ### FIX-CQ-02（2026-11-17 20:52:53 UTC）
 
 改动只在 `src/command/cloud.rs`、`src/command/cloud/{agent_capture,sync,snapshot,restore}.rs` 与 `tests/compat/agent_architecture_guard.rs`（RG-05 摘要）。用户可见行为不变（`cloud` 文档不提库文件名，未改）；没有新稳定码、新 `--test` target 或版本变化。本地验证：`cargo nextest run -E 'test(/cloud/) | test(=hermes_observe_checkpoint_exports_nonempty_reasoning) | binary(agent_cloud_tombstone_test) | binary(cloud_storage_backup_test)'` 209 项全部通过，其中两项新单测覆盖拆库仓库的冻结与恢复。全量 `source .env.test && source .env.live-test && cargo nextest run --all --no-fail-fast --retries 2`：11841 项，11840 通过，唯一失败是 `compat_agent_architecture_guard::private_capture_identity_has_no_source_opener` 对 `cloud/agent_capture.rs` 序列化区的 RG-05 摘要固定——本修复改了该区，已在守卫中注明 FIX-CQ-02 范围并更新摘要，该 target 重跑 65/65 通过。CQ-05 起一直失败的 `hermes_observe_checkpoint_exports_nonempty_reasoning` 在此全量中通过。守卫修正后按 Codex 要求重跑同一双环境全量：11841 项全部通过，51 跳过；其中 `command_test::command::init_from_git_test::init_from_git_rejects_blake3_object_format` 首次失败、重试通过（nextest 记为 flaky），与本修复无关。
+
+### CQ-06（2026-11-17 21:50:12 UTC）
+
+`libra agent doctor` 经 `capture::store::open` 打开 `capture.db`；打不开时按 `drain::classify_capture_open` 分类：schema 由更新版本写入报 `LBR-AGENT-048`，库忙报 `LBR-AGENT-047`，文件损坏或不可读报 `LBR-IO-001`，三种文案都点名 `.libra/private/capture.db`，不提仓库库。报告新增 `capture_queue.ready` / `capture_queue.quarantine`（`files`、`bytes`、`at_least`、`unavailable`）与人读行 `Capture queue`；只对目录项 `stat`（`DirEntry::metadata`，不跟随 symlink），每个目录最多访问 1024 个目录项（任何类型都计入，只统计普通文件）即停并置 `at_least`，不读文件内容，不取消费者锁。`docs/commands/agent.md`、zh-CN 页与 `docs/error-codes.md`（047/048 增加 doctor 触发情形）已更新；`COMPATIBILITY.md` 为 `N/A`（只加诊断字段，兼容矩阵未承诺 doctor 字段集合）。网站 `../libra-backend` 的 agent 页已在本地 `cf` 工作区修改；该仓库的提交与推送被本次会话的自动权限拒绝，留给操作者。
+
+本机验证：`source .env.test && cargo nextest run --test agent_doctor_repair_test capture_spool_doctor_` 3 项全部通过（计数与 JSON 无路径/内容、不等待也不动消费者锁、schema 过新与损坏文案）；`cargo nextest run --lib capture_spool_doctor_` 1 项通过（扫描按目录项计数的上限）；同时跑 `agent_doctor_repair_test` 全部、`compat_version_surface_sync`、`compat_error_codes_doc_sync` 共 50 项全部通过。新测试以 `LIBRA_RUN_CAPTURE_TESTS=1` 门控，不进 GitHub Actions。`cargo +nightly fmt --all --check` exit 0；`cargo clippy --all-targets --all-features -- -D warnings` exit 0；rustdoc 断链检查 exit 0。卡片 Full-suite trigger 为 `none`；计划收口全量随后运行。版本面 `0.30.209` → `0.30.210`（`Cargo.toml`、`install.sh`、`install.ps1`，`Cargo.lock` 经 `cargo update -p libra --offline`）。
 
 ## 完成判据
 

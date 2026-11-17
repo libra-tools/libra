@@ -230,7 +230,14 @@ hook 拉起一个分离的消费者。每个仓库同时只有一个消费者，
 hook 在本 hook 的整个捕获预算内（最多 30 秒）一直占着队列锁（`LBR-AGENT-049`）。
 需要手动入库时（例如升级之后），在仓库根执行 `libra __capture-spool-drain`；
 成功时它不打印任何内容，也从不输出信封正文；有信封被移入 `quarantine/` 时以非零退出。`libra agent import` 仍直接写
-`capture.db`，不经过队列。
+`capture.db`，不经过队列。`libra agent doctor` 报告队列积压：人读输出有一行
+`Capture queue`，`--json` 有 `capture_queue.ready` 与 `capture_queue.quarantine`，
+各含 `files`、`bytes`、`at_least`、`unavailable`（空队列是 `0`，不省略）。doctor
+只对目录项做 stat：不读取、不入库、不移动任何排队事件，不等待也不抢占消费者锁，
+每个目录数到 1024 项即停止（`at_least: true`，人读输出写“at least”）。两种输出都
+不含文件路径或信封内容。doctor 打不开 `.libra/private/capture.db` 时，报告的是捕获
+库而不是仓库库：库 schema 由更新版本写入时报 `LBR-AGENT-048`，库忙时报
+`LBR-AGENT-047`，文件损坏或不可读时报 `LBR-IO-001`，各自给出不同的处理办法。
 
 `libra agent workspace list|show` 是 workspace 注册表（`workspace_record`）的
 只读机器接口：agent runtime 关联过的每个 linked worktree、task worktree 或

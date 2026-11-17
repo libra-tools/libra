@@ -5412,3 +5412,202 @@ fn opencode_config_path_type_is_visible() {
         drop(listener);
     }
 }
+
+/// plan-20261116 CQ-06: capture-queue doctor tests run locally only. They
+/// print `skipped` unless `LIBRA_RUN_CAPTURE_TESTS=1`, which GitHub Actions
+/// never sets.
+fn capture_doctor_tests_enabled(name: &str) -> bool {
+    if std::env::var_os("LIBRA_RUN_CAPTURE_TESTS").is_some_and(|value| value == "1") {
+        return true;
+    }
+    eprintln!("skipped ({name}: set LIBRA_RUN_CAPTURE_TESTS=1 to run local capture tests)");
+    false
+}
+
+/// The queue directories as the realtime hook creates them (mode 0700).
+fn capture_spool_dirs(repo: &DoctorRepo) -> (PathBuf, PathBuf) {
+    let spool = repo.repo.join(".libra/private/capture-spool");
+    let ready = spool.join("ready");
+    let quarantine = spool.join("quarantine");
+    for dir in [&ready, &quarantine] {
+        std::fs::create_dir_all(dir).expect("create capture queue directory");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        for dir in [
+            repo.repo.join(".libra/private"),
+            spool.clone(),
+            ready.clone(),
+            quarantine.clone(),
+        ] {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+                .expect("make capture queue directory private");
+        }
+    }
+    (ready, quarantine)
+}
+
+/// CQ-06: doctor reports the ready and quarantine backlog in both outputs.
+/// An empty queue is `0`, not an omitted field. Doctor only stats entries: the
+/// files stay in place, and neither output carries a path or envelope bytes.
+#[test]
+fn capture_spool_doctor_reports_queue_counts_in_text_and_json() {
+    if !capture_doctor_tests_enabled("capture_spool_doctor_reports_queue_counts_in_text_and_json") {
+        return;
+    }
+    let repo = DoctorRepo::init();
+    let empty = repo.doctor_json(false);
+    for dir in ["ready", "quarantine"] {
+        for field in ["files", "bytes"] {
+            assert_eq!(
+                empty["capture_queue"][dir][field],
+                json!(0),
+                "an empty {dir} queue reports 0 {field}: {empty}"
+            );
+        }
+        assert_eq!(empty["capture_queue"][dir]["at_least"], json!(false));
+    }
+
+    let (ready, quarantine) = capture_spool_dirs(&repo);
+    std::fs::write(ready.join("0-a~k1"), b"CQ6").expect("ready file");
+    std::fs::write(ready.join("1-b~k2"), b"CQ6-C").expect("ready file");
+    std::fs::write(quarantine.join("1-c~k3"), b"CQ6-ENV").expect("quarantine file");
+
+    let report = repo.doctor_json(false);
+    let queue = &report["capture_queue"];
+    assert_eq!(queue["ready"]["files"], json!(2), "{queue}");
+    assert_eq!(queue["ready"]["bytes"], json!(8), "{queue}");
+    assert_eq!(queue["quarantine"]["files"], json!(1), "{queue}");
+    assert_eq!(queue["quarantine"]["bytes"], json!(7), "{queue}");
+    let json_text = report.to_string();
+    assert!(
+        !json_text.contains("CQ6"),
+        "envelope bytes leaked: {json_text}"
+    );
+    assert!(
+        !json_text.contains(&repo.repo.display().to_string()),
+        "doctor JSON must not carry an absolute queue path: {json_text}"
+    );
+
+    let human = repo.run(&["agent", "doctor"], None);
+    assert!(human.status.success(), "{}", describe(&human));
+    let text = String::from_utf8_lossy(&human.stdout);
+    assert!(
+        text.contains("Capture queue        : ready 2 files, 8 bytes; quarantine 1 files, 7 bytes"),
+        "{text}"
+    );
+    assert!(!text.contains("CQ6"), "{text}");
+    assert_eq!(
+        std::fs::read_dir(&ready).unwrap().count(),
+        2,
+        "doctor must not consume ready/"
+    );
+    assert_eq!(std::fs::read_dir(&quarantine).unwrap().count(), 1);
+}
+
+/// CQ-06: doctor neither waits for nor disturbs a consumer that holds the
+/// queue lock.
+#[cfg(unix)]
+#[test]
+fn capture_spool_doctor_does_not_wait_for_the_consumer_lock() {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    if !capture_doctor_tests_enabled("capture_spool_doctor_does_not_wait_for_the_consumer_lock") {
+        return;
+    }
+    let repo = DoctorRepo::init();
+    let (ready, _) = capture_spool_dirs(&repo);
+    std::fs::write(ready.join("1-a~held"), b"held").expect("ready file");
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(repo.repo.join(".libra/private/capture-spool-consumer.lock"))
+        .expect("open consumer lock");
+    lock.try_lock().expect("hold the consumer lock");
+
+    let started = std::time::Instant::now();
+    let report = repo.doctor_json(false);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(20),
+        "doctor must not wait for the consumer lock"
+    );
+    assert_eq!(report["capture_queue"]["ready"]["files"], json!(1));
+    assert_eq!(
+        std::fs::read_dir(&ready).unwrap().count(),
+        1,
+        "doctor must not store or move a queued event"
+    );
+    // The consumer still owns its lock after doctor ran.
+    let contender = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(repo.repo.join(".libra/private/capture-spool-consumer.lock"))
+        .expect("reopen consumer lock");
+    assert!(
+        contender.try_lock().is_err(),
+        "doctor must not have released or taken over the consumer lock"
+    );
+    drop(lock);
+}
+
+/// CQ-06: a capture database that doctor cannot open is named as the capture
+/// database. A schema written by a newer Libra and a damaged file get
+/// different remedies and stable codes; neither blames the repository database.
+#[test]
+fn capture_spool_doctor_names_the_capture_database_when_it_cannot_open_it() {
+    if !capture_doctor_tests_enabled(
+        "capture_spool_doctor_names_the_capture_database_when_it_cannot_open_it",
+    ) {
+        return;
+    }
+    let repo = DoctorRepo::init();
+    // The first doctor run creates `capture.db`.
+    let _ = repo.doctor_json(false);
+    let capture = repo.repo.join(".libra/private/capture.db");
+    assert!(capture.is_file(), "doctor must have created capture.db");
+
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    runtime.block_on(async {
+        use sea_orm::{ConnectionTrait, Database};
+        let conn = Database::connect(format!("sqlite://{}", capture.display()))
+            .await
+            .expect("open capture.db");
+        conn.execute_unprepared(
+            "INSERT INTO schema_versions (version, name, applied_at) VALUES (2099010101, 'future_capture_schema', 0)",
+        )
+        .await
+        .expect("record a future capture schema version");
+        conn.close().await.expect("close capture.db");
+    });
+    let newer = repo.run(&["agent", "doctor"], None);
+    assert!(!newer.status.success(), "{}", describe(&newer));
+    let newer_text = String::from_utf8_lossy(&newer.stderr).into_owned();
+    assert!(newer_text.contains("LBR-AGENT-048"), "{newer_text}");
+    assert!(newer_text.contains("capture database"), "{newer_text}");
+    assert!(newer_text.contains("newer Libra"), "{newer_text}");
+    assert!(
+        !newer_text.contains("could not open the repository database"),
+        "{newer_text}"
+    );
+
+    std::fs::write(
+        &capture,
+        b"this is not a SQLite database at all, only bytes",
+    )
+    .expect("damage capture.db");
+    let damaged = repo.run(&["agent", "doctor"], None);
+    assert!(!damaged.status.success(), "{}", describe(&damaged));
+    let damaged_text = String::from_utf8_lossy(&damaged.stderr).into_owned();
+    assert!(damaged_text.contains("LBR-IO-001"), "{damaged_text}");
+    assert!(damaged_text.contains("capture database"), "{damaged_text}");
+    assert!(damaged_text.contains("damaged"), "{damaged_text}");
+    assert!(!damaged_text.contains("newer Libra"), "{damaged_text}");
+    assert!(
+        !damaged_text.contains(&repo.repo.display().to_string()),
+        "{damaged_text}"
+    );
+}
