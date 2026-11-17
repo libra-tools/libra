@@ -13,6 +13,8 @@
 
 ## 设计方案
 
+- 后续 stash 写入同样遵循共享策略：`utils::object::write_git_object` 在临时对象发布前设置只读对象权限，并通过目录句柄设置 fanout 权限；`stash::ensure_stash_directories` 逐级处理 `logs`、`logs/refs`、`refs`，拒绝共享目录的符号链接，不遍历或放宽 vault 路径。非共享对象仍保留 `0666 & umask` 契约。
+
 - 入口与分发：已公开接入 `src/cli.rs::Commands`；已由 `src/command/mod.rs` 导出。CLI 层在 `src/cli.rs` 把解析后的参数交给命令模块，命令模块负责把领域错误转换为 `CliError` / `CliResult`。
 - 源码分层：主要实现文件为 `src/command/init.rs`。参数/子命令类型包括：`InitArgs`；输出、错误或状态类型包括：`InitError`、`InitOutput`；主要执行函数包括：`execute`、`execute_safe`。
 - 执行路径：`execute_safe` 负责 CLI 安全包装、错误映射和输出配置；引用路径会读取或更新 SQLite refs、HEAD 与 reflog；数据库路径会通过 SeaORM/SQLite 或 D1 客户端持久化元数据；AI 路径会读写 session、checkpoint、thread graph 或 agent profile 状态。

@@ -6,13 +6,14 @@
 //! and the rules shared by a class are implemented once in this module, driven
 //! by the row's class, never per operation (ADR-MN-08, GC-MN-11): no terminal
 //! and no stdin; local validation first, then exactly one request with no
-//! reload, preflight or retry; token flags refused where the class takes none;
-//! write operations refuse `--ref`. Success prints the shared JSON envelope
+//! reload, preflight or retry; write operations refuse `--ref`. Read and write
+//! operations accept an optional token and carry it as one Bearer header.
+//! Success prints the shared JSON envelope
 //! with `data.operation`, or a sanitized plain-text summary (nothing under
 //! `--quiet`); failures go through the shared error exit and leave stdout
 //! empty.
 
-use std::{io::Write, path::Path};
+use std::io::Write;
 
 use serde::Serialize;
 
@@ -20,7 +21,7 @@ use super::{sanitize, tag_panel::MAX_TAG_MESSAGE_BYTES};
 use crate::{
     command::mega2::browser_data,
     internal::protocol::{
-        mega2_auth::{Mega2Token, resolve_token_from_process},
+        mega2_auth::Mega2Token,
         mega2_diag::{self, Endpoint},
         mega2_entry::{Mega2EntryClient, RemoteCreateReceipt},
         mega2_mutate::{
@@ -47,18 +48,6 @@ const COMMAND: &str = "mega2 browser";
 pub enum Access {
     Read,
     Write,
-}
-
-impl Access {
-    /// Whether operations of this class take credentials (ADR-MN-05): read
-    /// operations are anonymous; write operations take at most one token from
-    /// `--token-file` → `LIBRA_MEGA2_TOKEN` → `--token`.
-    fn takes_credentials(self) -> bool {
-        match self {
-            Access::Read => false,
-            Access::Write => true,
-        }
-    }
 }
 
 /// The remote surface an operation acts on.
@@ -215,22 +204,9 @@ pub struct Invocation<'a> {
     /// Normalized, rooted PATH.
     pub path: &'a str,
     pub git_ref: Option<&'a str>,
-    /// `--token-file`, if given.
-    pub token_file: Option<&'a Path>,
-    /// `--token`, if given.
-    pub token: Option<&'a str>,
-}
-
-impl Invocation<'_> {
-    fn has_token_flags(&self) -> bool {
-        self.token_file.is_some() || self.token.is_some()
-    }
-
-    /// The write token by ADR-MB-03 precedence (`--token-file` →
-    /// `LIBRA_MEGA2_TOKEN` → `--token`); `None` sends the write anonymously.
-    fn write_token(&self) -> CliResult<Option<Mega2Token>> {
-        resolve_token_from_process(self.token_file, self.token).map(|(token, _source)| token)
-    }
+    /// The resolved token by ADR-MB-03 precedence (`--token-file` →
+    /// `LIBRA_MEGA2_TOKEN` → `--token`); `None` sends the request anonymously.
+    pub token: Option<&'a Mega2Token>,
 }
 
 /// Runs one non-interactive operation: class rules, one request, output.
@@ -241,16 +217,12 @@ pub async fn execute(
 ) -> CliResult<()> {
     let spec = operation.spec()?;
     check_class_rules(spec, invocation)?;
-    // ADR-MN-05: credentials are decided by class, once, before any request;
-    // read operations never reach the resolver (and never read the env var).
-    let token = if spec.access.takes_credentials() {
-        invocation.write_token()?
-    } else {
-        None
-    };
+    // Issue #18: the token is optional for every operation; reads attach it
+    // exactly like writes, so a token-gated server works for both.
+    let token = invocation.token.cloned();
     match operation {
         Operation::List => {
-            let mut session = Mega2TreeSession::new(invocation.server)?;
+            let mut session = Mega2TreeSession::with_token(invocation.server, token)?;
             let listing = session.fetch(invocation.path, invocation.git_ref).await?;
             if output.is_json() {
                 let data = browser_data(
@@ -437,9 +409,8 @@ fn emit_write<T: Serialize, R: Serialize>(
 /// - R10b: read tag operations refuse `--ref` as well: tags are not listed
 ///   per revision;
 /// - R10a: tag operations act on root tags only, so PATH must be `/`;
-/// - R5a/R5b: read operations take no credentials, so they refuse the token
-///   flags and never read `LIBRA_MEGA2_TOKEN` (R6); write operations resolve
-///   their token in [`Invocation::write_token`] (R9a–R9c).
+/// - R5a/R5b/R6: read and write operations alike take one optional token,
+///   resolved once in the command layer (R9a–R9c).
 fn check_class_rules(spec: &OperationSpec, invocation: &Invocation<'_>) -> CliResult<()> {
     if spec.access == Access::Write && invocation.git_ref.is_some() {
         return Err(CliError::fatal(format!(
@@ -464,15 +435,6 @@ fn check_class_rules(spec: &OperationSpec, invocation: &Invocation<'_>) -> CliRe
         ))
         .with_stable_code(StableErrorCode::CliInvalidArguments)
         .with_hint("omit PATH or pass /"));
-    }
-    if invocation.has_token_flags() && !spec.access.takes_credentials() {
-        return Err(CliError::fatal(
-            "mega2 browser: read operations take no credentials; --token/--token-file only apply to write operations",
-        )
-        .with_stable_code(StableErrorCode::CliInvalidArguments)
-        .with_hint(
-            "remove the token flags, or run the interactive browser (no operation flag, no --json/--machine) to write",
-        ));
     }
     Ok(())
 }
@@ -834,15 +796,15 @@ mod tests {
         assert_eq!(spec.endpoint, mega2_diag::DELETE_TAG);
     }
 
-    /// MN-11: token flags are refused for read operations only.
+    /// Issue #18: a token is accepted by read and write operations alike.
     #[test]
-    fn token_gate_accepts_write_operations_only() {
+    fn token_gate_accepts_read_and_write_operations() {
+        let token = Mega2Token::new("t").expect("token");
         let invocation = Invocation {
             server: "https://mega2.example.com",
             path: "/",
             git_ref: None,
-            token_file: None,
-            token: Some("t"),
+            token: Some(&token),
         };
         let list = Operation::List.spec().expect("list is registered");
         let create_dir = Operation::CreateDir {
@@ -850,13 +812,8 @@ mod tests {
         }
         .spec()
         .expect("create-dir is registered");
-        assert_eq!(
-            (
-                check_class_rules(list, &invocation).is_err(),
-                check_class_rules(create_dir, &invocation).is_ok()
-            ),
-            (true, true)
-        );
+        assert!(check_class_rules(list, &invocation).is_ok());
+        assert!(check_class_rules(create_dir, &invocation).is_ok());
     }
 
     /// MN-03: the `create-dir` payload keeps local `target` and server
@@ -989,7 +946,6 @@ mod tests {
             server: "https://mega2.example.com",
             path: "/",
             git_ref: None,
-            token_file: None,
             token: None,
         };
         let tags = |total| TagPage {

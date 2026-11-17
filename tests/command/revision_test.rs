@@ -154,3 +154,210 @@ fn revision_replace_change_invalidates_index() {
         "stable once rebuilt under the new replace set"
     );
 }
+
+// Synthetic raw Git commits exercise the importer without manufacturing change
+// rows or pretending that a past agent successfully tested these commits.
+fn history_import_fixture() -> (tempfile::TempDir, serde_json::Value) {
+    use sha2::{Digest, Sha256};
+    let repo = tempfile::tempdir().unwrap();
+    let p = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["init", "--vault", "false"], p),
+        "init history fixture",
+    );
+    let write = |kind: &str, body: &str| {
+        let output =
+            run_libra_command_with_stdin(&["hash-object", "-w", "-t", kind, "--stdin"], p, body);
+        assert_cli_success(&output, "write raw historical object");
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    };
+    let tree = write("tree", "");
+    let root_body = format!(
+        "tree {tree}\nauthor fixture <fixture@example.invalid> 1 +0000\ncommitter fixture <fixture@example.invalid> 1 +0000\n\nlegacy root\n"
+    );
+    let root = write("commit", &root_body);
+    let tip_body = format!(
+        "tree {tree}\nparent {root}\nauthor fixture <fixture@example.invalid> 2 +0000\ncommitter fixture <fixture@example.invalid> 2 +0000\n\nlegacy tip\n"
+    );
+    let tip = write("commit", &tip_body);
+    assert_cli_success(
+        &run_libra_command(&["update-ref", "refs/heads/main", &tip], p),
+        "set historical base",
+    );
+    let identity = run_libra_command(&["config", "get", "--local", "libra.repoid"], p);
+    assert_cli_success(&identity, "repository identity");
+    let repo_id = String::from_utf8(identity.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    let mut commits = vec![root.clone(), tip.clone()];
+    commits.sort();
+    let commit_digest = format!(
+        "{:x}",
+        Sha256::digest(format!("{}\n", commits.join("\n")).as_bytes())
+    );
+    let objects = serde_json::json!([
+        {"oid":tree,"kind":"tree","size":0},
+        {"oid":root,"kind":"commit","size":root_body.len()},
+        {"oid":tip,"kind":"commit","size":tip_body.len()}
+    ]);
+    let mut lines: Vec<_> = objects
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| {
+            format!(
+                "{} {} {}\n",
+                o["oid"].as_str().unwrap(),
+                o["kind"].as_str().unwrap(),
+                o["size"].as_u64().unwrap()
+            )
+        })
+        .collect();
+    lines.sort();
+    let object_digest = format!("{:x}", Sha256::digest(lines.concat().as_bytes()));
+    let manifest = serde_json::json!({
+        "schema_version":1,"repo_id":repo_id,"object_format":"sha1","base_commit":tip,
+        "visibility_policy":"strict_time","cutoff_ms":2000,
+        "commit_oids":commits,"commit_inventory_sha256":commit_digest,
+        "objects":objects,"object_inventory_sha256":object_digest,"shallow_cuts":[],
+        "sources":[{"commit_oid":root,"available_at_ms":1000},{"commit_oid":tip,"available_at_ms":2000}]
+    });
+    (repo, manifest)
+}
+
+#[test]
+fn revision_import_materializes_unknown_history_and_is_idempotent() {
+    let (repo, manifest) = history_import_fixture();
+    let path = repo.path().join("history.json");
+    fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    let args = [
+        "--json",
+        "revision",
+        "import",
+        "--manifest",
+        path.to_str().unwrap(),
+    ];
+    let first = run_libra_command(&args, repo.path());
+    assert_cli_success(&first, "import historical commits");
+    assert_eq!(parse_json_stdout(&first)["data"]["imported"], 2);
+    let rebuilt = run_libra_command(&["--json", "memory", "rebuild"], repo.path());
+    assert_cli_success(&rebuilt, "derive imported history");
+    assert_eq!(parse_json_stdout(&rebuilt)["data"]["projected"], 2);
+    let listing = run_libra_command(&["--json", "memory", "list"], repo.path());
+    assert_cli_success(&listing, "list imported history");
+    let json = parse_json_stdout(&listing);
+    for episode in json["data"]["episodes"].as_array().unwrap() {
+        let shown = run_libra_command(
+            &[
+                "--json",
+                "memory",
+                "show",
+                episode["episode_id"].as_str().unwrap(),
+            ],
+            repo.path(),
+        );
+        assert_cli_success(&shown, "show imported history");
+        let shown = parse_json_stdout(&shown);
+        assert_eq!(shown["data"]["outcome"], "unknown", "{shown}");
+    }
+    let repeat = run_libra_command(&args, repo.path());
+    assert_cli_success(&repeat, "repeat identical import");
+    let repeat = parse_json_stdout(&repeat);
+    assert_eq!(repeat["data"]["imported"], 0);
+    assert_eq!(repeat["data"]["reused"], 2);
+    assert_eq!(
+        repeat["data"]["mappings"],
+        parse_json_stdout(&first)["data"]["mappings"]
+    );
+    // A no-op import must not invalidate the already-built generation.
+    assert_cli_success(
+        &run_libra_command(&["--json", "memory", "list"], repo.path()),
+        "read after idempotent import",
+    );
+    let (other, _) = history_import_fixture();
+    let wrong_repo = run_libra_command(&args, other.path());
+    assert_eq!(wrong_repo.status.code(), Some(128));
+    assert!(String::from_utf8_lossy(&wrong_repo.stderr).contains("another repository"));
+    let mut narrower = manifest.clone();
+    narrower["sources"].as_array_mut().unwrap().pop();
+    let narrow_path = repo.path().join("narrow-history.json");
+    fs::write(&narrow_path, serde_json::to_vec(&narrower).unwrap()).unwrap();
+    let omitted = run_libra_command(
+        &[
+            "revision",
+            "import",
+            "--manifest",
+            narrow_path.to_str().unwrap(),
+        ],
+        repo.path(),
+    );
+    assert_eq!(omitted.status.code(), Some(128));
+    assert!(String::from_utf8_lossy(&omitted.stderr).contains("omitted from this cutoff"));
+    assert_cli_success(
+        &run_libra_command(&["--json", "memory", "list"], repo.path()),
+        "a refused cutoff must preserve the previously admitted generation",
+    );
+    let mut hostile = manifest.clone();
+    hostile["\u{1b}[2Jforged"] = serde_json::json!(true);
+    let hostile_path = repo.path().join("hostile-history.json");
+    fs::write(&hostile_path, serde_json::to_vec(&hostile).unwrap()).unwrap();
+    let rejected = run_libra_command(
+        &[
+            "revision",
+            "import",
+            "--manifest",
+            hostile_path.to_str().unwrap(),
+        ],
+        repo.path(),
+    );
+    assert_eq!(rejected.status.code(), Some(128));
+    let stderr = String::from_utf8_lossy(&rejected.stderr);
+    assert!(stderr.contains("unknown field"));
+    assert!(
+        !stderr.contains("\u{1b}[2J"),
+        "manifest field escaped into terminal output"
+    );
+}
+
+#[tokio::test]
+async fn revision_import_rolls_back_the_first_revision_when_the_second_fails() {
+    use sea_orm::{ConnectionTrait, DbBackend, Statement};
+    let (repo, manifest) = history_import_fixture();
+    let path = repo.path().join("history.json");
+    fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    let database = libra::internal::db::establish_connection(
+        repo.path().join(".libra/libra.db").to_str().unwrap(),
+    )
+    .await
+    .unwrap();
+    let failing_oid = manifest["sources"][1]["commit_oid"].as_str().unwrap();
+    database.execute_unprepared(&format!("CREATE TRIGGER reject_history_revision BEFORE INSERT ON change_revision WHEN NEW.commit_oid = '{failing_oid}' BEGIN SELECT RAISE(ABORT, 'injected second revision failure'); END")).await.unwrap();
+    let output = run_libra_command(
+        &[
+            "--json",
+            "revision",
+            "import",
+            "--manifest",
+            path.to_str().unwrap(),
+        ],
+        repo.path(),
+    );
+    assert_eq!(output.status.code(), Some(128));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("injected second revision failure"));
+    for table in ["change_identity", "change_revision"] {
+        let row = database
+            .query_one_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                format!("SELECT count(*) AS count FROM {table}"),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.try_get::<i64>("", "count").unwrap(),
+            0,
+            "partial source rows survived in {table}"
+        );
+    }
+}

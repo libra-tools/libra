@@ -296,6 +296,8 @@ Rebase output omits `merge` and includes `rebase`:
 
 ## Error Handling
 
+When `protocol.version=0` explicitly selects legacy discovery but the server replies with a protocol v2 advertisement, `pull` reports `LBR-NET-002` with the protocol compatibility hint, consistent with `fetch`, `clone`, and `ls-remote`. It does not send a subsequent upload-pack request.
+
 Every `PullError` variant maps to an explicit `StableErrorCode`. Fetch, merge, and rebase sub-errors are forwarded with a `phase` detail for diagnostics.
 
 | Scenario | Error Code | Exit | Hint |

@@ -2386,7 +2386,14 @@ async fn operation_metadata_for_command(
     command: &Commands,
     utf8_argv: &[String],
 ) -> crate::internal::operation::OperationMetaV2 {
-    let command_name = if matches!(command, Commands::Stash(Stash::Pop { .. })) {
+    let command_name = if matches!(
+        command,
+        Commands::Revision(command::revision::RevisionArgs {
+            command: command::revision::RevisionCommand::Import { .. },
+        })
+    ) {
+        crate::internal::change::import::IMPORT_COMMAND.to_string()
+    } else if matches!(command, Commands::Stash(Stash::Pop { .. })) {
         "stash pop".to_string()
     } else {
         utf8_argv
@@ -2419,7 +2426,18 @@ async fn operation_metadata_for_command(
         Commands::Stash(Stash::Pop { .. }) => "stash pop mutation".to_string(),
         _ => format!("{command_name} mutation"),
     };
+    // A successful import must verify this exact digest again before writing.
+    // Read/parse failures leave no digest, so the command fails closed.
+    let args_digest = match command {
+        Commands::Revision(command::revision::RevisionArgs {
+            command: command::revision::RevisionCommand::Import { manifest },
+        }) => crate::internal::change::import::read_manifest(manifest)
+            .map(|(_, digest)| digest)
+            .ok(),
+        _ => None,
+    };
     crate::internal::operation::OperationMetaV2 {
+        args_digest,
         command_name: Some(command_name),
         description: Some(description),
         actor: Some(operation_actor_for_metadata().await),
@@ -3590,6 +3608,9 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
     }
     if let Commands::Tag(tag_args) = &args.command {
         command::tag::validate_cli_args(tag_args)?;
+    }
+    if let Commands::FormatPatch(format_patch_args) = &args.command {
+        command::format_patch::validate_cli_args(format_patch_args)?;
     }
     let require_complete_object_index = command_requires_complete_object_index(&args.command);
     let preflight = command_preflight(&args.command, args.json.is_some() || args.machine)?;

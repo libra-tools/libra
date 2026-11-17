@@ -358,7 +358,7 @@ GK-06 的纯解析隔离、GK-07 的 bytes API 是源码交付事实；其原时
 3. **ER-03：** 开工前核对审计表与该卡 `Granularity`。范围变大就先改计划。
 4. **ER-04：** A 组是该卡 Verification 里的 focused 命令。B 组按 Task type。C 组由会发版的卡执行，顺序是：版本面 parity、`patch + 1`、工具链刷新 `Cargo.lock`、fmt、clippy、按 ER-13 的测试、`cargo build --release`、安装、精确 `libra add`、`libra commit -s`、推送 feature branch、`gh pr create`、同一 head SHA 上 `base.yml` 与 CodeQL 全绿、`gh pr merge --squash`、先 `libra fetch origin`，让 squash merge SHA 在本地可解析。再执行 `libra tag -s -m "Release v${VERSION}" "v${VERSION}" "$MERGE_SHA"`。`-m` 使它成为 annotated tag，`-s` 用仓库 vault 对它签名。`docs/commands/tag.md` 写明没有 `-a`/`-m`/`-F` 时只创建未签名的轻量 tag，且 `-s` 必须和 `-m` 一起用。然后 `libra tag -v "v${VERSION}"` 必须退出 0，再 `libra push origin "v${VERSION}"`，最后 `gh release create "v${VERSION}" --verify-tag`。不使用 GitHub API 创建的未签名轻量 tag。D 组是推送之后的远端证据：`release.yml` 四平台与安装脚本、CodeQL、Homebrew、manifest，按 D-CAP-STD 登记 workflow、job、event/ref 和 SHA。`locally-accepted` 不是完成。有 D 组时先停在 `remote-pending`。
 5. **ER-05：** 实现和本地验收之后做 Codex review，直到字面 PASS。P0/P1 必须关闭。
-6. **ER-06 / ER-06a：** 用户可见行为只在 GK-05 出现。该卡同批改 EN、zh-CN、开发文档、`COMPATIBILITY.md` 和网站 `agent.en.md`。网站写入前确认 `/Volumes/Sea/libra-backend` 的 VCS 与 `cf`。
+6. **ER-06 / ER-06a：** 用户可见行为只在 GK-05 出现。该卡同批改 EN、zh-CN、开发文档、`COMPATIBILITY.md` 和网站 `agent.en.md`。网站写入前确认 `../libra-backend` 的 VCS 与 `cf`。
 7. **ER-07：** `libra add <相关路径>` 然后 `libra commit -s`。提交后用同一 SHA 检查 `gpgsig` 与 `Signed-off-by`。不用 `commit -a`，本仓库没有 `git commit -S`。
 8. **ER-08：** GK-01..GK-05 各自 `PATCH + 1`，同步 `compat_version_surface_sync` 报告的三处版本面。不手改 `Cargo.lock`。
 9. **ER-09：** push 不是 fast-forward 时先拉再验。认证失败不盲重试。
@@ -399,7 +399,7 @@ G-01..G-11 与模板相同。本计划的取值如下。
 | DEP-GK-BASE | incoming | 跨计划 | plan-20260924 ACF-09 与 plan-20260925 SCAP-01/02 | 选中卡的执行者 | 开工时两卡仍为 done/complete，且 `CaptureFinalizePolicy` 可注入 | plan-status 对应行 | 缺失则 GK-02 及之后 blocked；GK-00/GK-01 仍可做 |
 | DEP-GK-DB | incoming | 跨计划 | plan-20260910 MIG-02/03 的 role manifest，以及 ADR-CAP-CHECK 的专用连接是否已在源码可用 | schema 执行者 | Repository-only、Global/System 零写可被现有测试证明 | `src/internal/db/migration.rs:615-653` 一带的 runner；开工重读 | 专用 CHECK 路径不存在则 GK-01 blocked，不在池内事务里 DROP 父表 |
 | DEP-GK-WRITE | incoming | 跨计划 | plan-20260904、plan-20260905、plan-20260911、plan-20261018-hermes-capture 的共享 capture / registry / agent 文档写集 | 选中卡的执行者 | `libra status --short --branch` 显示目标文件没有别人的未交接改动 | 上述计划的写集节 | 脏或 in-progress 则停。对方计划正文未列出本计划时，本计划仍然避让 |
-| DEP-GK-DOC | incoming | 外部仓库 | `/Volumes/Sea/libra-backend` 的 `cf` 与 `commands/agent.en.md` | 文档执行者 | 写入前按 ER-06a 记录 VCS 与 `cf`；typecheck/build 通过后才推 | 四 provider 契约第 10 条 | 分支或工作区不允许写入则该卡停在 locally-accepted，不假装网站已更新 |
+| DEP-GK-DOC | incoming | 外部仓库 | `../libra-backend` 的 `cf` 与 `commands/agent.en.md` | 文档执行者 | 写入前按 ER-06a 记录 VCS 与 `cf`；typecheck/build 通过后才推 | 四 provider 契约第 10 条 | 分支或工作区不允许写入则该卡停在 locally-accepted，不假装网站已更新 |
 | DEP-GK-RELEASE | incoming | 发布 | D-CAP-STD 的签名 tag、base.yml、codeql、release.yml | 单一发布者 | 固定 source SHA 的 job 全绿才把 Acceptance 标 complete | plan-20260904 D-CAP-STD | 失败前滚；未触发不算通过 |
 
 ## 实施顺序
@@ -877,7 +877,7 @@ Hook：`transcript_path` 是会话自己的 `updates.jsonl`。daemon 路由可�
 
 **Deliverables:** N/A
 
-**Implementation write set:** `src/internal/ai/observed_agents/registry.rs`（同一行把 `supported`、`hook_installable` 设为 true，`support_wave=grok`，并改写「凡 supported 必为 first_batch」的断言，使 `grok` 除外、原来三名不变）；`src/internal/ai/observed_agents/mod.rs` 用专用 struct 替换 GK-01 的 `PreviewAgent` 静态，覆盖 `as_hooks()` 与 `stability()`，并把 `live_capture_for` 设为 `Some`；不改 `preview.rs`；`src/command/agent/list.rs`；`src/command/agent/mod.rs` 的 enable 门与写死三名的测试；`src/command/agent/hooks.rs` 的 grok 回调分发；`docs/commands/agent.md`；`docs/commands/zh-CN/agent.md`；`docs/development/commands/agent.md`；`docs/development/tracing/agent.md`；`COMPATIBILITY.md`；`/Volumes/Sea/libra-backend/apps/tanstack-app/content/docs/commands/agent.en.md`；`tests/compat/agent_capability_matrix_pin.rs`；`tests/compat/agent_docs_contract.rs`；`tests/grok_capture_test.rs` 只追加 live 臂用例。本计划与 `plan-status.md` 只更新本卡状态。
+**Implementation write set:** `src/internal/ai/observed_agents/registry.rs`（同一行把 `supported`、`hook_installable` 设为 true，`support_wave=grok`，并改写「凡 supported 必为 first_batch」的断言，使 `grok` 除外、原来三名不变）；`src/internal/ai/observed_agents/mod.rs` 用专用 struct 替换 GK-01 的 `PreviewAgent` 静态，覆盖 `as_hooks()` 与 `stability()`，并把 `live_capture_for` 设为 `Some`；不改 `preview.rs`；`src/command/agent/list.rs`；`src/command/agent/mod.rs` 的 enable 门与写死三名的测试；`src/command/agent/hooks.rs` 的 grok 回调分发；`docs/commands/agent.md`；`docs/commands/zh-CN/agent.md`；`docs/development/commands/agent.md`；`docs/development/tracing/agent.md`；`COMPATIBILITY.md`；`../libra-backend/apps/tanstack-app/content/docs/commands/agent.en.md`；`tests/compat/agent_capability_matrix_pin.rs`；`tests/compat/agent_docs_contract.rs`；`tests/grok_capture_test.rs` 只追加 live 臂用例。本计划与 `plan-status.md` 只更新本卡状态。
 
 **Release write set:** Inherited
 

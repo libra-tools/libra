@@ -69,7 +69,7 @@ body, and series metadata.
 | `--ignore-if-in-upstream` | | Suppress commits whose stable patch-id already appears on the excluded side of the range | false |
 | `--src-prefix <PREFIX>` / `--dst-prefix <PREFIX>` | | Replace the default `a/` and `b/` diff path prefixes | `a/`, `b/` |
 | `-p`, `--no-stat` | | Suppress the diffstat summary | false |
-| `--keep-subject` | `-k` | Keep the commit subject byte-identical: no `[PATCH]` prefix and no `n/m` counter is added (Git's contract). Without it, a leading bracket group in the subject is stripped before the prefix is added | false |
+| `--keep-subject` | `-k` | Keep the commit subject byte-identical: no `[PATCH]` prefix and no `n/m` counter is added (Git's contract). Conflicts with explicit `-n`, non-empty `--rfc`, and `--subject-prefix` (including an empty prefix); a configured `format.subjectPrefix` does not conflict. Without it, a leading bracket group in the subject is stripped before the prefix is added | false |
 | `--suffix <SFX>` | | Filename suffix for generated patches (e.g. `.txt`); ignored under `--numbered-files` | `.patch` |
 | `--zero-commit` | | Use an all-zero hash in each patch's `From <hash>` envelope line | false |
 | `--signature <SIGNATURE>` | | Text placed after the `-- ` line of each patch and the cover letter | libra version |
@@ -185,6 +185,7 @@ stdout follows Libra's normal quiet BrokenPipe behavior.
 |----------|-----------------|
 | Not in a Libra repository | `LBR-REPO-001` |
 | Unknown revision | `LBR-CLI-003` |
+| `-k` with `-n`, non-empty `--rfc`, or explicit `--subject-prefix` | `LBR-CLI-002` (exit 129; Git exits 128). The diagnostic names the options that cannot be used together; no patches are written |
 | `--base` is not an ancestor of the series | `LBR-CLI-003` (exit 128) |
 | `--base=auto` (unsupported) | `LBR-CLI-002` (exit 129) |
 | `--relative`, `--all` (unsupported) | `LBR-UNSUPPORTED-001` (exit 128) |

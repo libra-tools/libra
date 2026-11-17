@@ -316,6 +316,43 @@ pub fn adjust_shared_perm(_path: &Path, _shared: &SharedMode) -> io::Result<()> 
     Ok(())
 }
 
+/// Adjust a shared directory through a pinned handle without following symlinks.
+#[cfg(unix)]
+pub(crate) fn adjust_shared_directory(path: &Path, shared: &SharedMode) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    if matches!(shared, SharedMode::Umask) || is_owner_only_path(path) {
+        return Ok(());
+    }
+    let contextual = |error: io::Error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "cannot set shared permissions on directory '{}': {error}",
+                path.display()
+            ),
+        )
+    };
+    // Pin every path component: a replaced or symlinked directory must not
+    // redirect chmod to an unrelated filesystem object.
+    let directory =
+        crate::utils::object::open_directory_tree_no_follow(path).map_err(contextual)?;
+    let metadata = directory.metadata().map_err(contextual)?;
+    let current = metadata.permissions().mode();
+    let target = calc_shared_perm(current, true, shared);
+    if (current & 0o7777) != (target & 0o7777) {
+        directory
+            .set_permissions(fs::Permissions::from_mode(target))
+            .map_err(contextual)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn adjust_shared_directory(_path: &Path, _shared: &SharedMode) -> io::Result<()> {
+    Ok(())
+}
+
 /// Adjust permissions for a loose object file and its parent fanout directory.
 pub fn adjust_shared_perm_for_object(path: &Path, shared: &SharedMode) -> io::Result<()> {
     if matches!(shared, SharedMode::Umask) {
@@ -417,6 +454,33 @@ pub fn adjust_shared_perm_for_index(index_path: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_directory_rejects_symlinks_and_preserves_private_paths() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let temp = tempfile::tempdir().unwrap();
+        let outside = temp.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o700)).unwrap();
+        let link = temp.path().join("linked");
+        symlink(&outside, &link).unwrap();
+        let error = adjust_shared_directory(&link, &SharedMode::Group).unwrap_err();
+        assert!(error.to_string().contains(link.to_str().unwrap()));
+        assert_eq!(
+            fs::metadata(&outside).unwrap().permissions().mode() & 0o7777,
+            0o700
+        );
+        let private = temp.path().join("vault.db");
+        fs::write(&private, b"private").unwrap();
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o600)).unwrap();
+        adjust_shared_directory(&private, &SharedMode::Group).unwrap();
+        assert_eq!(
+            fs::metadata(&private).unwrap().permissions().mode() & 0o7777,
+            0o600
+        );
+    }
 
     #[test]
     fn test_calc_shared_perm_table() {

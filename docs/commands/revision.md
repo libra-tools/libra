@@ -9,6 +9,7 @@ Revision ordinal index (a Libra extension, lore.md §1.16, porting Lore's
 libra revision find --number <N> [--ref <branch>]
 libra revision number <commitish> [--ref <branch>]
 libra revision index [--ref <branch>] [--rebuild]
+libra revision import --manifest <file>
 ```
 
 ## Description
@@ -62,3 +63,59 @@ libra --json revision number HEAD        # structured output
 Nearest Git analogues: `git rev-list --first-parent --count <oid>` (reverse
 direction) and `<tip>~<k>` suffix arithmetic (forward). Classified
 `intentionally-different` in [`COMPATIBILITY.md`](../../COMPATIBILITY.md).
+
+## Offline history import
+
+`revision import --manifest <file>` records immutable Git commits as durable
+change facts for the current repository and frozen HEAD. Ordinary clone and
+`revision index` do not perform this import. `memory rebuild` can then derive
+commit Episodes from the imported changes.
+
+The version 1 JSON manifest contains `schema_version`, `repo_id`,
+`object_format`, `base_commit`, `visibility_policy`, `cutoff_ms`, `commit_oids`,
+`commit_inventory_sha256`, `objects`, `object_inventory_sha256`, `shallow_cuts`,
+and `sources`. Unknown fields at every level are rejected. Each object contains
+`oid`, `kind`, and `size`; each source contains `commit_oid` and
+`available_at_ms`; each shallow cut contains `child` and `parent`. The commit
+digest hashes sorted `OID\n` lines; the object digest hashes sorted
+`OID TYPE SIZE\n` lines using SHA-256 and UTF-8. OIDs use full lowercase hex.
+
+The importer checks repo identity, SHA-1/SHA-256 format, current HEAD, canonical
+object hashes, complete finite ancestor membership and tree/blob closure.
+Replacement refs are refused. Declared shallow parents must be absent locally;
+unknown missing parents and unreachable/future objects in the inventory fail.
+Reads use existing local objects only, without alternates, cloud fallback or
+network fetch. Limits are 2 MiB per manifest, 5,000 commits, 20,000 objects,
+64 MiB of object bodies, 16 MiB per object (1 MiB per commit), and 128 sources.
+
+`strict_time` requires a cutoff and rejects a base or ancestor newer than it.
+`base_snapshot` explicitly permits a retrospective base snapshot; it does not
+certify historical task eligibility. A source with an availability timestamp
+after a supplied cutoff is always rejected. Publication/merge availability
+requires independently audited evidence; Git timestamps do not establish it.
+Retain that evidence and the exact manifest with the import receipt.
+
+An existing visible change mapping is reused; a legacy commit receives the
+existing object-format-separated synthetic Change ID. No patch-similarity
+identity or external sidecar identity is inferred. All new facts and projection
+invalidation publish in one transaction through the change revision writer.
+Failure preserves prior facts and projection rows; a failed operation audit
+record may remain. Repeating the same manifest reuses identities/revisions and
+does not invalidate an unchanged projection. Facts already outside the new
+base view are refused: use a fresh base-specific repository. With a cutoff,
+`sources` must list every already-stored revision admitted to that view; omitted
+facts are refused so a narrower cutoff cannot inherit a previous loose view.
+Use separate repositories for each base/cutoff/policy.
+
+The current operation records the manifest SHA-256 and the import time. An
+import operation succeeding does not establish a historical repair/test
+outcome: imported Episodes have `outcome: unknown`. Import never manufactures
+historical agent sessions or historical successful operations. A successful
+new batch invalidates an existing Memory generation; run `memory rebuild`
+before reading it. Current Memory path recall, large-window selection,
+revocation counters and consumer limitations remain separate.
+
+`--json` returns the manifest digest, base, imported/reused counts, the finite
+history flag, and explicit commit-to-change mappings. Rejection or transaction
+failure exits 128 with `LBR-IO-002`. Terminal control sequences in rejected
+manifest field names are removed from the diagnostic.

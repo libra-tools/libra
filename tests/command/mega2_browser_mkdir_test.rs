@@ -350,7 +350,7 @@ fn libra(dir: &Path, args: &[&str]) -> std::process::Output {
 }
 
 #[test]
-fn token_flags_are_refused_for_reads_and_never_echoed() {
+fn read_token_flags_are_accepted_and_never_echoed() {
     let workdir = tempfile::tempdir().expect("tempdir");
 
     let json = libra(
@@ -365,9 +365,10 @@ fn token_flags_are_refused_for_reads_and_never_echoed() {
             "secret",
         ],
     );
-    assert!(!json.status.success(), "token + --json must be refused");
+    // Issue #18: reads accept a token; here the request just fails to connect.
+    assert!(!json.status.success(), "unreachable server must fail");
     let err = String::from_utf8_lossy(&json.stderr).to_string();
-    assert!(err.contains("no credentials"), "unexpected stderr: {err}");
+    assert!(!err.contains("no credentials"), "unexpected stderr: {err}");
     assert!(!err.contains("secret"), "token leaked: {err}");
 
     // In human mode the token flag is accepted; the failure is the TTY gate.

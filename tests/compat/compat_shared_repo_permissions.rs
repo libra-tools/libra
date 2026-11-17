@@ -26,42 +26,35 @@ fn run(args: &[&str], dir: &Path) -> std::process::Output {
 #[cfg(unix)]
 #[test]
 fn shared_repo_permissions_sweep_guard() {
-    use std::os::unix::fs::PermissionsExt;
-
     let temp = tempdir().expect("tempdir");
     let repo = temp.path().join("repo");
     fs::create_dir_all(&repo).expect("mkdir repo");
-
-    let out = run(&["init", "--shared=group"], &repo);
-    assert!(out.status.success(), "init --shared=group");
-    assert!(
-        run(&["config", "user.name", "Test User"], &repo)
-            .status
-            .success()
-    );
-    assert!(
-        run(&["config", "user.email", "test@example.com"], &repo)
-            .status
-            .success()
-    );
-
-    // Sequence of operations
+    let step = |args: &[&str]| {
+        let out = run(args, &repo);
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_shared_permissions(&repo, &args.join(" "));
+    };
+    step(&["init", "--shared=group"]);
+    step(&["config", "user.name", "Test User"]);
+    step(&["config", "user.email", "test@example.com"]);
     fs::write(repo.join("file1.txt"), "first file\n").expect("write file1");
-    assert!(run(&["add", "file1.txt"], &repo).status.success());
-    assert!(run(&["commit", "-m", "commit 1"], &repo).status.success());
-
-    assert!(run(&["status"], &repo).status.success());
-
+    step(&["add", "file1.txt"]);
+    step(&["commit", "-m", "commit 1"]);
+    step(&["status"]);
     fs::write(repo.join("file1.txt"), "modified file\n").expect("modify file1");
-    assert!(
-        run(&["stash", "push", "-m", "wip stash"], &repo)
-            .status
-            .success()
-    );
-    assert!(run(&["stash", "pop"], &repo).status.success());
+    step(&["stash", "push", "-m", "wip stash"]);
+    step(&["stash", "pop"]);
+    step(&["repack", "-a"]);
+    step(&["maintenance", "run"]);
+}
 
-    assert!(run(&["repack", "-a"], &repo).status.success());
-    assert!(run(&["maintenance", "run"], &repo).status.success());
+#[cfg(unix)]
+fn assert_shared_permissions(repo: &Path, phase: &str) {
+    use std::os::unix::fs::PermissionsExt;
 
     let dot_libra = repo.join(".libra");
     assert!(dot_libra.is_dir());
@@ -80,7 +73,7 @@ fn shared_repo_permissions_sweep_guard() {
         assert_eq!(
             mode & 0o002,
             0,
-            "path {} must not be world-writable: mode {mode:o}",
+            "after {phase}: path {} must not be world-writable: mode {mode:o}",
             path.display()
         );
 
@@ -89,14 +82,14 @@ fn shared_repo_permissions_sweep_guard() {
             assert_ne!(
                 mode & 0o010,
                 0,
-                "directory {} must be group-traversable: mode {mode:o}",
+                "after {phase}: directory {} must be group-traversable: mode {mode:o}",
                 path.display()
             );
             // Invariant 3: Directories in a group-shared repo carry setgid
             assert_ne!(
                 mode & 0o2000,
                 0,
-                "directory {} must carry setgid bit: mode {mode:o}",
+                "after {phase}: directory {} must carry setgid bit: mode {mode:o}",
                 path.display()
             );
         } else if libra::utils::shared_perm::is_owner_only_path(path) {
@@ -104,7 +97,7 @@ fn shared_repo_permissions_sweep_guard() {
             assert_eq!(
                 mode & 0o077,
                 0,
-                "owner-only file {} must have zero group/other permissions: mode {mode:o}",
+                "after {phase}: owner-only file {} must have zero group/other permissions: mode {mode:o}",
                 path.display()
             );
         } else {
@@ -112,7 +105,7 @@ fn shared_repo_permissions_sweep_guard() {
             assert_ne!(
                 mode & 0o040,
                 0,
-                "file {} must be group-readable: mode {mode:o}",
+                "after {phase}: file {} must be group-readable: mode {mode:o}",
                 path.display()
             );
         }

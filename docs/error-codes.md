@@ -11,6 +11,8 @@ Libra now exposes failures through a stable three-layer contract:
 
 This contract is implemented in [`src/utils/error.rs`](../src/utils/error.rs).
 
+A rejected or failed `revision import --manifest` uses `LBR-IO-002` (exit 128). Verify the frozen manifest, repository identity, local object closure and base; retry in a fresh base-specific repository. A failure preserves committed change facts and Memory projection rows.
+
 ## Output Contract
 
 On failure, Libra always writes a human-readable error block to `stderr`.

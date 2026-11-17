@@ -2381,3 +2381,238 @@ fn unsupported_git_options_are_classified() {
         );
     }
 }
+
+// Each refusal gate is independently selectable; the plan also checks the
+// complete selector set so accidentally omitted assertions cannot pass a card.
+#[derive(Clone, Copy)]
+enum RefusalGate {
+    Message,
+    Code,
+    Exit,
+    Stdout,
+    Files,
+    Json,
+    Machine,
+}
+
+fn format_patch_snapshot(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+    use sha2::{Digest, Sha256};
+
+    fn visit(
+        root: &Path,
+        path: &Path,
+        snapshot: &mut std::collections::BTreeMap<PathBuf, Vec<u8>>,
+    ) {
+        for entry in fs::read_dir(path).expect("read refusal snapshot directory") {
+            let entry = entry.expect("read refusal snapshot entry");
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path).expect("read snapshot metadata");
+            let relative = path
+                .strip_prefix(root)
+                .expect("snapshot is within root")
+                .to_path_buf();
+            let value = if metadata.is_symlink() {
+                fs::read_link(&path)
+                    .expect("read snapshot symlink")
+                    .as_os_str()
+                    .as_encoded_bytes()
+                    .to_vec()
+            } else if metadata.is_dir() {
+                visit(root, &path, snapshot);
+                b"directory".to_vec()
+            } else {
+                Sha256::digest(fs::read(&path).expect("read snapshot file")).to_vec()
+            };
+            snapshot.insert(relative, value);
+        }
+    }
+
+    let mut snapshot = std::collections::BTreeMap::new();
+    visit(root, root, &mut snapshot);
+    snapshot
+}
+
+fn assert_format_patch_refusal(argv: &[&str], message: &str, gate: RefusalGate) {
+    let repo = repo_with_patch_subjects(&["3", "4", "rename"]);
+    let before = matches!(gate, RefusalGate::Files).then(|| format_patch_snapshot(repo.path()));
+    let mut args = argv.to_vec();
+    match gate {
+        RefusalGate::Json => args.push("--json"),
+        RefusalGate::Machine => args.push("--machine"),
+        _ => {}
+    }
+    let output = run_libra_command(&args, repo.path());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    match gate {
+        RefusalGate::Message => assert_eq!(
+            stderr.lines().next(),
+            Some(format!("fatal: {message}").as_str())
+        ),
+        RefusalGate::Code => assert_eq!(stderr.lines().nth(1), Some("Error-Code: LBR-CLI-002")),
+        RefusalGate::Exit => assert_eq!(output.status.code(), Some(129), "{stderr}"),
+        RefusalGate::Stdout => assert!(
+            output.stdout.is_empty(),
+            "unexpected stdout: {:?}",
+            output.stdout
+        ),
+        RefusalGate::Files => {
+            let before = before.expect("captured snapshot");
+            let after = format_patch_snapshot(repo.path());
+            let changed: std::collections::BTreeSet<_> = before
+                .keys()
+                .chain(after.keys())
+                .filter(|path| before.get(*path) != after.get(*path))
+                .collect();
+            assert!(changed.is_empty(), "refusal changed paths: {changed:?}");
+        }
+        RefusalGate::Json | RefusalGate::Machine => {
+            if matches!(gate, RefusalGate::Machine) {
+                assert_eq!(
+                    stderr.lines().count(),
+                    1,
+                    "machine error must be one JSON line"
+                );
+            }
+            let actual: serde_json::Value =
+                serde_json::from_slice(&output.stderr).expect("structured error");
+            assert_eq!(
+                actual,
+                serde_json::json!({
+                    "ok": false, "error_code": "LBR-CLI-002", "category": "cli",
+                    "exit_code": 129, "severity": "fatal", "message": message,
+                })
+            );
+        }
+    }
+}
+
+macro_rules! refusal_gates {
+    ($args:expr, $message:expr; $($name:ident => $gate:ident),+ $(,)?) => {
+        $(
+            #[test]
+            #[allow(non_snake_case)]
+            fn $name() {
+                assert_format_patch_refusal($args, $message, RefusalGate::$gate);
+            }
+        )+
+    };
+}
+
+refusal_gates!(
+    &["format-patch", "--rfc", "-k", "-1", "--stdout"],
+    "options '--subject-prefix/--rfc' and '-k' cannot be used together";
+    fp03_rfc_k__msg => Message,
+    fp03_rfc_k__code => Code,
+    fp03_rfc_k__exit => Exit,
+    fp03_rfc_k__stdout => Stdout,
+    fp03_rfc_k__fs => Files,
+    fp03_rfc_k__json => Json,
+    fp03_rfc_k__machine => Machine,
+);
+
+refusal_gates!(
+    &["format-patch", "-k", "--rfc=WIP", "-1", "--stdout"],
+    "options '--subject-prefix/--rfc' and '-k' cannot be used together";
+    fp03_k_rfc_wip__msg => Message,
+    fp03_k_rfc_wip__code => Code,
+    fp03_k_rfc_wip__exit => Exit,
+    fp03_k_rfc_wip__stdout => Stdout,
+    fp03_k_rfc_wip__fs => Files,
+    fp03_k_rfc_wip__json => Json,
+    fp03_k_rfc_wip__machine => Machine,
+);
+
+refusal_gates!(
+    &["format-patch", "--rfc=-(WIP)", "-k", "-1", "--stdout"],
+    "options '--subject-prefix/--rfc' and '-k' cannot be used together";
+    fp03_dash_rfc_k__msg => Message,
+    fp03_dash_rfc_k__code => Code,
+    fp03_dash_rfc_k__exit => Exit,
+    fp03_dash_rfc_k__stdout => Stdout,
+    fp03_dash_rfc_k__fs => Files,
+    fp03_dash_rfc_k__json => Json,
+    fp03_dash_rfc_k__machine => Machine,
+);
+
+refusal_gates!(
+    &["format-patch", "--subject-prefix=X", "-k", "-1", "--stdout"],
+    "options '--subject-prefix/--rfc' and '-k' cannot be used together";
+    fp03_prefix_k__msg => Message,
+    fp03_prefix_k__code => Code,
+    fp03_prefix_k__exit => Exit,
+    fp03_prefix_k__stdout => Stdout,
+    fp03_prefix_k__fs => Files,
+    fp03_prefix_k__json => Json,
+    fp03_prefix_k__machine => Machine,
+);
+
+refusal_gates!(
+    &["format-patch", "--subject-prefix=", "-k", "-1", "--stdout"],
+    "options '--subject-prefix/--rfc' and '-k' cannot be used together";
+    fp03_empty_prefix_k__msg => Message,
+    fp03_empty_prefix_k__code => Code,
+    fp03_empty_prefix_k__exit => Exit,
+    fp03_empty_prefix_k__stdout => Stdout,
+    fp03_empty_prefix_k__fs => Files,
+    fp03_empty_prefix_k__json => Json,
+    fp03_empty_prefix_k__machine => Machine,
+);
+
+refusal_gates!(
+    &["format-patch", "-n", "-k", "-1", "--stdout"],
+    "options '-n' and '-k' cannot be used together";
+    fp03_numbered_k__msg => Message,
+    fp03_numbered_k__code => Code,
+    fp03_numbered_k__exit => Exit,
+    fp03_numbered_k__stdout => Stdout,
+    fp03_numbered_k__fs => Files,
+    fp03_numbered_k__json => Json,
+    fp03_numbered_k__machine => Machine,
+);
+
+#[test]
+fn fp03_config_prefix_with_k() {
+    let repo = repo_with_patch_subjects(&["3", "4", "rename"]);
+    let config = run_libra_command(&["config", "set", "format.subjectPrefix", "X"], repo.path());
+    assert_cli_success(&config, "configure subject prefix");
+    let output = run_libra_command(&["format-patch", "-k", "-1", "--stdout"], repo.path());
+    assert_cli_success(&output, "compatible keep-subject options");
+    let body = String::from_utf8_lossy(&output.stdout);
+    let subjects: Vec<_> = body
+        .lines()
+        .filter(|line| line.starts_with("Subject:"))
+        .collect();
+    assert_eq!(subjects, ["Subject: rename"]);
+}
+
+#[test]
+fn fp03_empty_rfc_with_k() {
+    let repo = repo_with_patch_subjects(&["3", "4", "rename"]);
+    let output = run_libra_command(
+        &["format-patch", "--rfc=", "-k", "-1", "--stdout"],
+        repo.path(),
+    );
+    assert_cli_success(&output, "compatible keep-subject options");
+    let body = String::from_utf8_lossy(&output.stdout);
+    let subjects: Vec<_> = body
+        .lines()
+        .filter(|line| line.starts_with("Subject:"))
+        .collect();
+    assert_eq!(subjects, ["Subject: rename"]);
+}
+
+#[test]
+fn fp03_cancelled_rfc_with_k() {
+    let repo = repo_with_patch_subjects(&["3", "4", "rename"]);
+    let output = run_libra_command(
+        &["format-patch", "--rfc", "--no-rfc", "-k", "-1", "--stdout"],
+        repo.path(),
+    );
+    assert_cli_success(&output, "compatible keep-subject options");
+    let body = String::from_utf8_lossy(&output.stdout);
+    let subjects: Vec<_> = body
+        .lines()
+        .filter(|line| line.starts_with("Subject:"))
+        .collect();
+    assert_eq!(subjects, ["Subject: rename"]);
+}

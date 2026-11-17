@@ -252,6 +252,8 @@ Rebase 输出省略 `merge` 并包含 `rebase`：
 
 ## 错误处理
 
+显式配置 `protocol.version=0` 请求旧版协议、但服务端返回 v2 广告时，`pull` 与 `fetch`、`clone`、`ls-remote` 一样返回 `LBR-NET-002` 和协议兼容提示，不发送后续 upload-pack 请求。
+
 每个 `PullError` 变体都会映射到显式 `StableErrorCode`。Fetch、merge 和 rebase 子错误会带着 `phase` 详情转发，便于诊断。
 
 | 场景 | 错误码 | 退出码 | 提示 |

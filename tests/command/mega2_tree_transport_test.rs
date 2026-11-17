@@ -1,7 +1,8 @@
 //! plan-20260912 MB-01: mega2 `/api/v1/tree` transport integration.
 //!
-//! End-to-end (mock server) checks: query encoding, no Authorization header,
-//! valid listing, HTTP failure mapping, and zero local filesystem writes.
+//! End-to-end (mock server) checks: query encoding, anonymous vs. optional-token
+//! Authorization header, valid listing, HTTP failure mapping, and zero local
+//! filesystem writes.
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -19,7 +20,10 @@ use axum::{
     routing::get,
 };
 use libra::{
-    internal::protocol::mega2_tree::{ContentType, Mega2TreeClient},
+    internal::protocol::{
+        mega2_auth::Mega2Token,
+        mega2_tree::{ContentType, Mega2TreeClient},
+    },
     utils::test::ChangeDirGuard,
 };
 use serde::Deserialize;
@@ -37,7 +41,7 @@ struct TreeQuery {
 #[derive(Default)]
 struct MockState {
     queries: Vec<(String, String)>,
-    saw_authorization: bool,
+    authorization: Option<String>,
 }
 
 /// Spawns an axum mock of the mega2 tree route; returns the bound address,
@@ -61,9 +65,10 @@ impl MockMega2Tree {
                         {
                             let mut s = s.lock().expect("mock state poisoned");
                             s.queries.push((q.path.clone(), q.refs.clone()));
-                            if headers.contains_key("authorization") {
-                                s.saw_authorization = true;
-                            }
+                            s.authorization = headers
+                                .get("authorization")
+                                .and_then(|value| value.to_str().ok())
+                                .map(str::to_string);
                         }
                         let body = json!({
                             "req_result": status == 200,
@@ -123,7 +128,7 @@ async fn transport_encodes_query_sends_no_auth_and_returns_sorted_listing() {
     assert_eq!(state.queries.len(), 1, "exactly one request");
     assert_eq!(state.queries[0].0, "/src sub", "path round-trips");
     assert_eq!(state.queries[0].1, "ref with space", "refs round-trips");
-    assert!(!state.saw_authorization, "listing must be anonymous");
+    assert_eq!(state.authorization, None, "listing must be anonymous");
     drop(state);
 
     let names: Vec<(&str, ContentType)> = listing
@@ -138,6 +143,56 @@ async fn transport_encodes_query_sends_no_auth_and_returns_sorted_listing() {
             ("alpha-file", ContentType::File),
             ("zeta-file", ContentType::File),
         ]
+    );
+}
+
+/// Issue #18: a token makes reads carry exactly one Bearer header, and only
+/// then is plain `http` on a non-loopback host admitted by validation.
+#[tokio::test]
+async fn transport_attaches_the_optional_bearer_token() {
+    let mock = MockMega2Tree::start(
+        200,
+        json!([{"name": "file", "path": "/", "content_type": "file"}]),
+    )
+    .await;
+    let token = Mega2Token::new("read-token").expect("token");
+    let client =
+        Mega2TreeClient::new_with_token(&mock.url(), Some(token)).expect("client with token");
+    let listing = client.fetch_listing("/", None).await.expect("listing");
+    assert_eq!(listing.entries.len(), 1);
+
+    let state = mock.state.lock().expect("mock state poisoned");
+    assert_eq!(state.queries.len(), 1, "exactly one request");
+    assert_eq!(
+        state.authorization.as_deref(),
+        Some("Bearer read-token"),
+        "read must carry the token as one Bearer header"
+    );
+}
+
+/// Issue #18: without a token, a plain-http non-loopback base URL is refused
+/// before any request is sent (the mock would record one if it were reached).
+#[tokio::test]
+async fn transport_refuses_plain_http_non_loopback_without_a_token() {
+    let mock = MockMega2Tree::start(200, json!([])).await;
+    let non_loopback = mock.url().replace("127.0.0.1", "192.0.2.1");
+    let err = Mega2TreeClient::new(&non_loopback).expect_err("must refuse before the request");
+    assert_eq!(
+        err.stable_code(),
+        libra::utils::error::StableErrorCode::CliInvalidTarget
+    );
+    assert!(
+        err.message().contains("requires a token"),
+        "missing-token error must name the token: {}",
+        err.message()
+    );
+    assert!(
+        mock.state
+            .lock()
+            .expect("mock state poisoned")
+            .queries
+            .is_empty(),
+        "no request may be sent when the address is refused"
     );
 }
 

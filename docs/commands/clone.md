@@ -612,6 +612,8 @@ not, because its operation-log model fetches all refs by design.
 
 ## Error Handling
 
+HTTP(S) discovery runs before the destination repository exists. When no local repository is available, it uses the default protocol v2 negotiation and accepts legacy server advertisements through fallback.
+
 Every `CloneError` variant maps to an explicit `StableErrorCode` -- no message substring inference.
 
 | Scenario | Error Code | Exit | Hint |
@@ -626,7 +628,7 @@ Every `CloneError` variant maps to an explicit `StableErrorCode` -- no message s
 | SSH public-key rejection during discovery | `LBR-AUTH-002` | 128 | Check the selected key, SSH agent and repository access; see the [SSH setup guide](https://libra.tools/en/docs/getting-started/ssh) |
 | Network unreachable | `LBR-NET-001` | 128 | "check the remote host, DNS, VPN/proxy, and network connectivity" |
 | pkt-line discovery / transfer framing error | `LBR-NET-002` | 128 | "check that the remote serves Git data and that a proxy has not altered the response" |
-| Remote only advertises Git wire protocol v2 | `LBR-NET-002` | 128 | "use a remote whose server also serves protocol v0/v1 advertisements, or use Git for this remote" |
+| Server replies with protocol v2 after legacy discovery was selected | `LBR-NET-002` | 128 | "use a remote whose server also serves protocol v0/v1 advertisements, or use Git for this remote" |
 | Other discovery protocol error | `LBR-NET-002` | 128 | "the remote did not complete discovery successfully; retry and inspect server/protocol settings" |
 | Remote branch not found | `LBR-REPO-003` | 128 | "use `-b <branch>` to specify an existing branch" |
 | Object format mismatch | `LBR-REPO-003` | 128 | "the remote and local repository use different object formats" |

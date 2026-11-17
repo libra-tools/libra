@@ -13,6 +13,8 @@
 
 ## 设计方案
 
+- fetch discovery 的协议不匹配诊断复用 `is_protocol_v2_unsupported` 与统一提示：显式 legacy 请求遭 v2 响应时映射 `NetworkProtocol` / `LBR-NET-002`，不落入连通性错误分支。四命令边界回归在 `ls_remote::pkt_line_boundary_tests`。
+
 - 入口与分发：已公开接入 `src/cli.rs::Commands`；已由 `src/command/mod.rs` 导出。CLI 层在 `src/cli.rs` 把解析后的参数交给命令模块，命令模块负责把领域错误转换为 `CliError` / `CliResult`。
 - 源码分层：主要实现文件为 `src/command/pull.rs`。参数/子命令类型包括：`PullArgs`；输出、错误或状态类型包括：`PullRefUpdate`、`PullFetchResult`、`PullMergeResult`、`PullRebaseResult`、`PullOutput`、`PullError`；主要执行函数包括：`execute`、`execute_safe`。
 - 执行路径：`execute_safe` 负责 CLI 安全包装、错误映射和输出配置；引用路径会读取或更新 SQLite refs、HEAD 与 reflog；网络路径会解析 remote 配置、协商协议并处理 pack/idx 数据。

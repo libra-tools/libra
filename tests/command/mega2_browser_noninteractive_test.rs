@@ -421,20 +421,23 @@ fn r5a_output(case: &OpCase, mock: &MockMega2) -> Output {
     )
 }
 
-/// R5a ①: `--json` with `--token` fails with `LBR-CLI-002`.
+/// R5a ① (issue #18): a read operation accepts `--token` and succeeds.
 fn rule_r5a_code(case: &OpCase) {
     let mock = MockMega2::start(case.ok);
     let output = r5a_output(case, &mock);
-    assert!(!output.status.success());
-    assert_eq!(error_envelope(&output)["error_code"], "LBR-CLI-002");
+    assert!(output.status.success(), "stderr: {}", text(&output.stderr));
 }
 
-/// R5a ②: the refusal sends no request.
+/// R5a ② (issue #18): the accepted read token becomes one Bearer header.
 fn rule_r5a_no_request(case: &OpCase) {
     let mock = MockMega2::start(case.ok);
-    let output = r5a_output(case, &mock);
-    assert!(!output.status.success());
-    assert!(mock.records().is_empty(), "records: {:?}", mock.records());
+    let _output = r5a_output(case, &mock);
+    let authorizations: Vec<Option<String>> = mock
+        .records()
+        .into_iter()
+        .map(|record| record.authorization)
+        .collect();
+    assert_eq!(authorizations, vec![Some("Bearer secret".to_string())]);
 }
 
 fn r5b_output(case: &OpCase, mock: &MockMega2) -> Output {
@@ -449,23 +452,26 @@ fn r5b_output(case: &OpCase, mock: &MockMega2) -> Output {
     )
 }
 
-/// R5b ①: human mode with `--token-file` fails with `LBR-CLI-002`.
+/// R5b ① (issue #18): human mode accepts `--token-file` for a read and succeeds.
 fn rule_r5b_code(case: &OpCase) {
     let mock = MockMega2::start(case.ok);
     let output = r5b_output(case, &mock);
-    assert!(!output.status.success());
-    assert_eq!(error_envelope(&output)["error_code"], "LBR-CLI-002");
+    assert!(output.status.success(), "stderr: {}", text(&output.stderr));
 }
 
-/// R5b ②: the refusal sends no request.
+/// R5b ② (issue #18): the file token becomes one Bearer header on the read.
 fn rule_r5b_no_request(case: &OpCase) {
     let mock = MockMega2::start(case.ok);
-    let output = r5b_output(case, &mock);
-    assert!(!output.status.success());
-    assert!(mock.records().is_empty(), "records: {:?}", mock.records());
+    let _output = r5b_output(case, &mock);
+    let authorizations: Vec<Option<String>> = mock
+        .records()
+        .into_iter()
+        .map(|record| record.authorization)
+        .collect();
+    assert_eq!(authorizations, vec![Some("Bearer filetok".to_string())]);
 }
 
-/// R6: a read operation sends no Authorization even with `LIBRA_MEGA2_TOKEN` set.
+/// R6 (issue #18): a read operation sends the `LIBRA_MEGA2_TOKEN` Bearer header.
 fn rule_r6(case: &OpCase) {
     let mock = MockMega2::start(case.ok);
     let dir = tempfile::tempdir().expect("tempdir");
@@ -480,7 +486,7 @@ fn rule_r6(case: &OpCase) {
         .into_iter()
         .map(|record| record.authorization)
         .collect();
-    assert_eq!(authorizations, vec![None]);
+    assert_eq!(authorizations, vec![Some("Bearer envtok".to_string())]);
 }
 
 fn r7_output(case: &OpCase, mock: &MockMega2) -> Output {
@@ -1126,9 +1132,9 @@ fn create_dir_token_human_mode_401_never_echoes() {
     assert!(!combined.contains("filetok"), "token echoed: {combined}");
 }
 
-/// AC-1: a read operation refuses token flags with the credentials message.
+/// Issue #18: `--list --token` succeeds and the token never echoes.
 #[test]
-fn list_token_refusal_message() {
+fn list_token_is_accepted_and_sent_as_bearer() {
     let mock = MockMega2::start(list_ok);
     let dir = tempfile::tempdir().expect("tempdir");
     let output = run(
@@ -1146,11 +1152,16 @@ fn list_token_refusal_message() {
         ],
         &[],
     );
-    assert!(!output.status.success());
+    assert!(output.status.success(), "stderr: {}", text(&output.stderr));
+    let records = mock.records();
+    assert_eq!(records.len(), 1, "one request");
     assert_eq!(
-        error_envelope(&output)["message"],
-        "mega2 browser: read operations take no credentials; --token/--token-file only apply to write operations"
+        records[0].authorization.as_deref(),
+        Some("Bearer secret"),
+        "read must carry the token"
     );
+    let combined = format!("{}{}", text(&output.stdout), text(&output.stderr));
+    assert!(!combined.contains("secret"), "token echoed: {combined}");
 }
 
 /// A missing `--token-file` fails before any request and never falls back to

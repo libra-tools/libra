@@ -739,7 +739,7 @@ impl ChangeRevisionBuilder {
         Ok(revision)
     }
 
-    async fn build_on(
+    pub(crate) async fn build_on(
         &self,
         database: &DatabaseTransaction,
     ) -> Result<ChangeRevision, ChangeRevisionBuildError> {

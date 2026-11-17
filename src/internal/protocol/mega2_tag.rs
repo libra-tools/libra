@@ -4,12 +4,12 @@
 //! The pinned contract is the storage-only `tag_router` mounted at
 //! `api_router.rs:78` (`a1293686`):
 //!
-//! - `GET /api/v1/tags/list` — anonymous, with the **required** query keys
+//! - `GET /api/v1/tags/list` — optional token, with the **required** query keys
 //!   `page`/`per_page`/`path`; the root MVP always sends `path="/"`;
 //! - `POST /api/v1/tags` — trunk write, token via [`Mega2Token`], body
 //!   `CreateTagRequest` (no `tagger` key; `message` present makes an annotated
 //!   tag), any 2xx + `req_result=true` is success;
-//! - `GET /api/v1/tags/{name}` — anonymous, optional `path` selector
+//! - `GET /api/v1/tags/{name}` — optional token, optional `path` selector
 //!   (root MVP sends `/`), used for conflict diagnosis;
 //! - `DELETE /api/v1/tags/{name}` — trunk write, token via [`Mega2Token`],
 //!   authorization path = the `path` selector (root MVP `/`).
@@ -35,7 +35,7 @@ use crate::{
 
 /// Tag collection route (`POST` create).
 pub const TAGS_ROUTE: &str = "/api/v1/tags";
-/// Tag list route (anonymous `GET`, three required query keys).
+/// Tag list route (`GET`, three required query keys).
 pub const TAGS_LIST_ROUTE: &str = "/api/v1/tags/list";
 /// The pinned DEP-MB-05 evidence this module was written against.
 pub const DEP_MB_05_REFERENCE: &str =
@@ -294,7 +294,7 @@ fn parse_common_envelope<T: DeserializeOwned>(
     })
 }
 
-/// Tag client: anonymous list/get, token-bearing create/delete.
+/// Tag client: list/get/create/delete, each carrying the token when one is set.
 #[derive(Debug)]
 pub struct Mega2TagClient {
     base: Url,
@@ -329,7 +329,7 @@ impl Mega2TagClient {
             ))
             .with_stable_code(StableErrorCode::Unsupported));
         }
-        let base = validate_server_url(server_url)?;
+        let base = validate_server_url(server_url, token.is_some())?;
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .no_proxy()
@@ -353,7 +353,7 @@ impl Mega2TagClient {
         self.pin
     }
 
-    /// Whether this client attaches `Authorization` to write requests.
+    /// Whether this client attaches `Authorization` to its requests.
     pub fn has_token(&self) -> bool {
         self.token.is_some()
     }
@@ -382,7 +382,8 @@ impl Mega2TagClient {
         parse_common_envelope(status.as_u16(), &raw, operation)
     }
 
-    /// One anonymous `GET /api/v1/tags/list` with all three required keys.
+    /// One `GET /api/v1/tags/list` with all three required keys; carries the
+    /// optional token as one `Authorization: Bearer` header.
     pub async fn list_tags(&self, page: u64, per_page: u64, path: &str) -> CliResult<TagPage> {
         mega2_diag::run(
             mega2_diag::LIST_TAGS,
@@ -403,8 +404,11 @@ impl Mega2TagClient {
             .append_pair("page", &page.to_string())
             .append_pair("per_page", &per_page.to_string())
             .append_pair("path", &path);
-        // Anonymous: list never carries the write token.
-        let response = mega2_diag::send(self.http.get(url), transport_error).await?;
+        let mut request = self.http.get(url);
+        if let Some(token) = &self.token {
+            request = request.header(AUTHORIZATION, format!("Bearer {}", token.expose()));
+        }
+        let response = mega2_diag::send(request, transport_error).await?;
         let page: WirePage<TagInfo> = self.finish(response, "list").await?;
         Ok(TagPage {
             total: page.total,
@@ -432,7 +436,8 @@ impl Mega2TagClient {
         self.finish(response, "create").await
     }
 
-    /// One anonymous `GET /api/v1/tags/{name}` (conflict diagnosis).
+    /// One `GET /api/v1/tags/{name}` (conflict diagnosis); carries the optional
+    /// token when one is set.
     pub async fn get_tag(&self, name: &str, path: &str) -> CliResult<TagInfo> {
         mega2_diag::run(mega2_diag::GET_TAG, self.get_tag_scoped(name, path)).await
     }
@@ -443,7 +448,11 @@ impl Mega2TagClient {
         let path = normalize_path(path)?;
         let mut url = self.tag_url(name)?;
         url.query_pairs_mut().append_pair("path", &path);
-        let response = mega2_diag::send(self.http.get(url), transport_error).await?;
+        let mut request = self.http.get(url);
+        if let Some(token) = &self.token {
+            request = request.header(AUTHORIZATION, format!("Bearer {}", token.expose()));
+        }
+        let response = mega2_diag::send(request, transport_error).await?;
         self.finish(response, "get").await
     }
 

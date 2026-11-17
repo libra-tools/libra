@@ -1058,10 +1058,19 @@ mod pkt_line_boundary_tests {
                 bytes.to_vec(),
             )
         } else if method == "POST" && path == "/repo/git-upload-pack" {
-            (
-                "application/x-git-upload-pack-result",
-                b"0008NAK\n0001REMOTE_BOUNDARY_SECRET_7c41".to_vec(),
-            )
+            let response = if matches!(state.mode, ResponseMode::ProtocolV2Advertisement) {
+                let mut bytes = bytes::BytesMut::new();
+                add_pkt_line_string(
+                    &mut bytes,
+                    format!("{OID} HEAD symref-target:refs/heads/main\n"),
+                );
+                add_pkt_line_string(&mut bytes, format!("{OID} refs/heads/main\n"));
+                bytes.extend_from_slice(b"0000");
+                bytes.to_vec()
+            } else {
+                b"0008NAK\n0001REMOTE_BOUNDARY_SECRET_7c41".to_vec()
+            };
+            ("application/x-git-upload-pack-result", response)
         } else {
             return Response::builder()
                 .status(StatusCode::NOT_FOUND)
@@ -1256,17 +1265,20 @@ mod pkt_line_boundary_tests {
         server.stop().await;
     }
 
-    /// A v2-only remote must be reported as such by every discovery command:
-    /// the `version 2` line is not a reference, so the old
-    /// `Invalid object id 'version'` diagnosis must never come back.
+    /// A legacy-forced client must reject a v2-only advertisement before
+    /// opening a v2 session. The default is now v2, so this regression pins
+    /// `protocol.version=0`; the `version 2` line must never be parsed as a
+    /// reference or reported as a connectivity failure.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial(cwd, env)]
-    async fn pkt_line_protocol_v2_advertisement_reports_unsupported_remote() {
+    async fn pkt_line_forced_legacy_rejects_v2_only_advertisement() {
+        let _config = crate::utils::test::ConfigDbFixture::new().unwrap();
         let mut server = TestServer::start(ResponseMode::ProtocolV2Advertisement).await;
         for command in ["fetch", "clone", "ls-remote", "pull"] {
             let repo = tempdir().unwrap();
             setup_with_new_libra_in(repo.path()).await;
             let _cwd = ChangeDirGuard::new(repo.path());
+            ConfigKv::set("protocol.version", "0", false).await.unwrap();
             if matches!(command, "fetch" | "pull") {
                 ConfigKv::set("remote.origin.url", &server.url, false)
                     .await
@@ -1348,6 +1360,48 @@ mod pkt_line_boundary_tests {
                 ("GET", "/repo/info/refs?service=git-upload-pack")
             );
         }
+        server.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial(cwd, env)]
+    async fn pkt_line_protocol_v2_advertisement_negotiates_ls_refs() {
+        let _config = crate::utils::test::ConfigDbFixture::new().unwrap();
+        let repo = tempdir().unwrap();
+        setup_with_new_libra_in(repo.path()).await;
+        let _cwd = ChangeDirGuard::new(repo.path());
+        assert!(ConfigKv::get("protocol.version").await.unwrap().is_none());
+        let mut server = TestServer::start(ResponseMode::ProtocolV2Advertisement).await;
+        let result = tokio::time::timeout(
+            Duration::from_secs(45),
+            super::run_ls_remote(
+                LsRemoteArgs::try_parse_from(["ls-remote", server.url.as_str()]).unwrap(),
+                &OutputConfig::default(),
+            ),
+        )
+        .await
+        .expect("v2 discovery must terminate")
+        .expect("default negotiation accepts protocol v2");
+        assert_eq!(
+            result
+                .entries
+                .iter()
+                .map(|entry| entry.refname.as_str())
+                .collect::<Vec<_>>(),
+            ["HEAD", "refs/heads/main"]
+        );
+        assert!(result.entries.iter().all(|entry| entry.hash == OID));
+        let requests = server.requests();
+        assert_eq!(requests.len(), 2, "{requests:?}");
+        assert_eq!(
+            (&requests[0].0[..], &requests[0].1[..]),
+            ("GET", "/repo/info/refs?service=git-upload-pack")
+        );
+        assert_eq!(
+            (&requests[1].0[..], &requests[1].1[..]),
+            ("POST", "/repo/git-upload-pack")
+        );
+        assert!(String::from_utf8_lossy(&requests[1].2).contains("command=ls-refs"));
         server.stop().await;
     }
 
