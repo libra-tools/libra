@@ -43,6 +43,7 @@ flowchart TD
 - 2026-07-09（plan-20260708 P0-06）：stdout 下游提前关闭时经全局入口与 `Pager` 输出层静默正常终止，不打印 panic/backtrace/`Broken pipe` 诊断。回归覆盖：`compat_broken_pipe_output`。
 - 2026-07-09（plan-20260708 P1-04）：`show --pretty/--format` 复用扩展后的 `CommitFormatter`，获得 `%b`/`%B`/`%n`/ASCII/control `%xNN`/`%%`/`%aI`/`%cI`/`%at`/`%ct`/`%D`/`%m`/color placeholders；`show -s --format=<tmpl>` 与 Git 逐字节对齐的用例纳入 `compat_pretty_format_placeholders`，`%C...` 颜色占位符按全局 `--color` 策略输出。
 - 2026-07-11（plan-20260708 P1-05d）：`show` 与 Git 一样继承 `format.pretty` 和 `log.date`；新增显式 `--date` 覆盖配置。两键复用 `src/command/log/config.rs` 的严格 local→global→system 读取器，配置错误在 pager/对象输出前 fail-closed，JSON schema 与值保持配置免疫。默认 commit/tag 日期改走共享 `format_timestamp_with`，不再由 show 私有 RFC2822 分支绕开日期模式。
+- FX-479-05（issue #479 / #1055，TC3285）：`render_show_human`、`run_show`（JSON）与 `validate_show_quiet` 共用 selector-aware 的 revision/path 分隔规则，修复 `split_once(':')` 把 `<rev>^{/<regex>}` 内的冒号提前当作路径分隔符的问题。`libra show --no-patch 'HEAD^{/testing:}'` 展示匹配提交，`libra show 'HEAD^{/testing:}:hello'` 展示该提交中的 `hello`；全局 `--json` 使用解析后对象的既有 schema，`--quiet` 继续只验证而不输出人类可读内容。与 `rev-parse`、`cat-file` 共享基础消息搜索语义；此项只修复冒号分隔及组合 `:path`，不声明其它正则语法兼容性修复。
 - 历史结论：当前文档应以这些提交之后的代码、测试和兼容矩阵为准；更早的迁移式文档只保留为背景，不再作为事实来源。
 
 ## 当前状态

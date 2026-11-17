@@ -24,6 +24,8 @@ Index path spec 解析当前 worktree 的 index：`:<path>` 读取 stage-0 条�
 
 提交消息搜索 spec 按提交消息正文（头区空行之后的全部内容）查找提交：`:/<regex>` 以 HEAD 加上所有本地分支、远程跟踪分支与 tag 为起点，`<rev>^{/<regex>}` 以 `<rev>` 为起点，均按提交时间从新到旧遍历祖先并返回第一个匹配。前缀 `!-` 取反匹配，`!!` 保留字面 `!`，其它 `!` 开头为错误；无效正则、正则超限或无匹配均为 `LBR-CLI-003`（退出 129）。正则使用 Rust `regex` crate（线性时间引擎，不支持反向引用与 lookaround），部分仅 POSIX ERE 可编译的模式无法使用；匹配区分大小写，遍历期间只读提交对象。
 
+`<rev>^{/<regex>}` 内的冒号属于正则模式：`HEAD^{/testing:}` 查找从 HEAD 可达且提交消息匹配 `testing:` 的提交。其后可追加 `:path`，因此 `HEAD^{/testing:}:hello` 解析为该提交树中仓库相对路径 `hello` 对应的对象。`rev-parse`、`cat-file` 和 `show` 共用此语法；在 shell 中应对完整 spec 加引号。冒号处理修复不改变上述正则语法及其限制。
+
 `AUTO_MERGE` 是本命令唯一接受的伪引用：非 squash 合并因冲突暂停时，它解析为包含冲突标记的自动结果 tree。`merge --continue`、`--abort` 或 `--quit` 后会消失；干净合并和 squash 合并时不可用。六个历史伪引用（`ORIG_HEAD`、`MERGE_HEAD`、`CHERRY_PICK_HEAD`、`REVERT_HEAD`、`REBASE_HEAD`、`FETCH_HEAD`）仍会作为 revision 被拒绝。
 
 ## 选项
@@ -58,6 +60,9 @@ libra rev-parse :src/main.rs
 libra rev-parse :2:src/main.rs
 libra rev-parse ':/fix: crash'
 libra rev-parse 'HEAD^{/fix}'
+libra rev-parse 'HEAD^{/testing:}'
+libra rev-parse 'HEAD^{/testing:}:hello'
+libra cat-file -p 'HEAD^{/testing:}:hello'
 libra rev-parse 'main@{1}'
 libra rev-parse --short HEAD
 libra rev-parse --abbrev-ref HEAD

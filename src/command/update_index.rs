@@ -228,7 +228,9 @@ pub async fn execute_safe(args: UpdateIndexArgs, output: &OutputConfig) -> CliRe
     // Option handling is order-sensitive (git's parse_options_step interleaves
     // flags and paths), so the ordered operation list is the single source of
     // truth; the clap fields only validated the surface.
-    for op in ordered_operations(&usage)? {
+    let ordered = ordered_operations(&usage)?;
+    let suppress_refresh_output = ordered.suppress_refresh_output(output);
+    for op in ordered.ops {
         match op {
             Op::Cacheinfo(spec) => {
                 let entry = parse_cacheinfo(&spec).map_err(usage)?;
@@ -255,7 +257,7 @@ pub async fn execute_safe(args: UpdateIndexArgs, output: &OutputConfig) -> CliRe
                 let candidates = all_refresh_candidates(&index);
                 let report =
                     refresh::refresh_candidates(&mut index, &candidates, &workdir, &options);
-                render_refresh_report(&report, output);
+                render_refresh_report(&report, output, suppress_refresh_output);
                 refresh_errors |= report.has_errors;
             }
             Op::IndexInfo { nul } => {
@@ -334,6 +336,22 @@ enum Op {
     Stdin { nul: bool },
 }
 
+#[derive(Debug, Default)]
+struct OrderedOperations {
+    ops: Vec<Op>,
+    global_quiet: bool,
+    command_quiet: bool,
+}
+
+impl OrderedOperations {
+    fn suppress_refresh_output(&self, output: &OutputConfig) -> bool {
+        // Clap's inherited quiet flag combines both spellings and positions.
+        // Only command-position -q belongs to the ordered refresh semantics.
+        // Preserve quiet supplied by direct callers when argv has no such flag.
+        self.global_quiet || (output.quiet && !self.command_quiet)
+    }
+}
+
 /// Reconstruct the ordered update-index operations from the raw argv.
 ///
 /// Clap parses every flag up front, but git's `update-index` is
@@ -341,55 +359,78 @@ enum Op {
 /// `--refresh`, `--chmod` applies to the positional paths after it, and
 /// `--stdin`/`--index-info` must be the last argument. The walker therefore
 /// reads `std::env::args()` (the flags were already validated by clap) and
-/// captures the per-position state. Global CLI flags (validated by the root
-/// parser) are skipped.
-fn ordered_operations(usage: &dyn Fn(String) -> CliError) -> CliResult<Vec<Op>> {
-    // The tokens after the `update-index` subcommand token in the raw argv.
-    let tokens: Vec<String> = std::env::args()
-        .skip(1)
-        .collect::<Vec<_>>()
-        .iter()
-        .position(|arg| arg == "update-index")
-        .map(|position| std::env::args().skip(position + 2).collect::<Vec<String>>())
-        .unwrap_or_default();
+/// captures the per-position state. The same walk tracks explicit global
+/// quiet, skipping option values and stopping option interpretation at `--`.
+fn ordered_operations(usage: &dyn Fn(String) -> CliError) -> CliResult<OrderedOperations> {
+    ordered_operations_from_tokens(&std::env::args().skip(1).collect::<Vec<_>>(), usage)
+}
 
+fn ordered_operations_from_tokens(
+    tokens: &[String],
+    usage: &dyn Fn(String) -> CliError,
+) -> CliResult<OrderedOperations> {
+    let mut ordered = OrderedOperations::default();
+    let mut in_command = false;
     let mut ops = Vec::new();
     let mut ctx = PathContext::default();
     let mut switches = RefreshSwitches::default();
     let mut nul = false;
     let mut index = 0usize;
 
-    // Tolerate the (unusual) direct-call path where the env argv does not
-    // contain the subcommand token: fall back to a clap-field ordering.
-    if tokens.is_empty() {
-        return fallback_operations(usage);
-    }
-
     while index < tokens.len() {
         let token = &tokens[index];
         match token.as_str() {
+            "update-index" if !in_command => in_command = true,
+            "--quiet" | "--machine" => ordered.global_quiet = true,
+            "-q" if in_command => {
+                switches.quiet = true;
+                ordered.command_quiet = true;
+            }
+            "-q" => ordered.global_quiet = true,
             // Root-level global flags (already parsed by the root clap).
-            "--machine"
+            "--json"
+            | "--color"
             | "--no-pager"
             | "--no-color"
-            | "-q"
-            | "--quiet"
             | "--exit-code-on-warning"
             | "--sync-data"
             | "--offline"
             | "-J"
             | "--literal-pathspecs"
-            | "--no-literal-pathspecs" => {
-                if token == "-q" || token == "--quiet" {
-                    switches.quiet = true;
+            | "--no-literal-pathspecs" => {}
+            // Clap accepts short flag clusters too; -J's optional value must
+            // use '=', so it never consumes the next token.
+            _ if token.starts_with('-')
+                && !token.starts_with("--")
+                && token.len() > 2
+                && token[1..].split('=').next().is_some_and(|flags| {
+                    !flags.is_empty()
+                        && (!token.contains('=') || flags.ends_with('J'))
+                        && flags
+                            .chars()
+                            .all(|flag| matches!(flag, 'q' | 'J') || (in_command && flag == 'z'))
+                }) =>
+            {
+                for flag in token[1..].chars().take_while(|flag| *flag != '=') {
+                    match flag {
+                        'q' if in_command => {
+                            switches.quiet = true;
+                            ordered.command_quiet = true;
+                        }
+                        'q' => ordered.global_quiet = true,
+                        'z' => nul = true,
+                        _ => {}
+                    }
                 }
             }
             // Global flags with an inline or separate value.
-            _ if token.starts_with("--json=")
+            _ if token.starts_with("-J=")
+                || token.starts_with("--json=")
                 || token.starts_with("--color=")
                 || token.starts_with("--progress=")
                 || token.starts_with("--max-connections=") => {}
-            "--color" | "--progress" | "--max-connections" => index += 1,
+            "--progress" | "--max-connections" => index += 1,
+            _ if !in_command => {}
             "--" => {
                 for path in &tokens[index + 1..] {
                     ops.push(Op::Path {
@@ -440,11 +481,11 @@ fn ordered_operations(usage: &dyn Fn(String) -> CliError) -> CliResult<Vec<Op>> 
             "--unmerged" => switches.allow_unmerged = true,
             "-z" | "--null" => nul = true,
             "--index-info" => {
-                must_be_last(&tokens, index, "--index-info", usage)?;
+                must_be_last(tokens, index, "--index-info", usage)?;
                 ops.push(Op::IndexInfo { nul });
             }
             "--stdin" => {
-                must_be_last(&tokens, index, "--stdin", usage)?;
+                must_be_last(tokens, index, "--stdin", usage)?;
                 ops.push(Op::Stdin { nul });
             }
             _ => ops.push(Op::Path {
@@ -454,14 +495,8 @@ fn ordered_operations(usage: &dyn Fn(String) -> CliError) -> CliResult<Vec<Op>> 
         }
         index += 1;
     }
-    Ok(ops)
-}
-
-/// The direct-call fallback (env argv lacks the subcommand token): cacheinfo
-/// specs, then the refresh (when requested), then the positional paths, all
-/// under the final flag state.
-fn fallback_operations(_usage: &dyn Fn(String) -> CliError) -> CliResult<Vec<Op>> {
-    Ok(Vec::new())
+    ordered.ops = ops;
+    Ok(ordered)
 }
 
 /// git 2.56: `option '<flag>' must be the last argument` → usage error 129.
@@ -604,12 +639,11 @@ fn process_one_path(
     // git runs `chmod_path` right after every successful `update_one`.
     if let Some(target_mode) = ctx.chmod {
         match refresh::chmod_entry(index, path_str, target_mode) {
-            Ok(true) => {
-                updated += 1;
+            Ok(changed) => {
+                updated += usize::from(changed);
                 let flip = if target_mode & 0o111 != 0 { '+' } else { '-' };
                 verbose_line(output, ctx, &format!("chmod {flip}x '{path_str}'"));
             }
-            Ok(false) => {}
             Err(reason) => {
                 let flip = if target_mode & 0o111 != 0 { '+' } else { '-' };
                 return Err(CliError::fatal(format!(
@@ -818,8 +852,12 @@ fn all_refresh_candidates(index: &Index) -> Vec<PathBuf> {
 /// Render the git-matching refresh lines in index order: `<path>: needs
 /// update` and `<path>: needs merge` (missing files render as needs-update,
 /// exactly like git's `deleted_fmt`).
-fn render_refresh_report(report: &refresh::RefreshReport, output: &OutputConfig) {
-    if output.is_json() || output.quiet {
+fn render_refresh_report(
+    report: &refresh::RefreshReport,
+    output: &OutputConfig,
+    suppress_refresh_output: bool,
+) {
+    if output.is_json() || suppress_refresh_output {
         return;
     }
     let mut stdout = io::stdout().lock();
@@ -1140,6 +1178,104 @@ mod tests {
     use clap::Parser;
 
     use super::{IndexInfoLine, UpdateIndexArgs, parse_index_info_line};
+
+    #[test]
+    fn refresh_quiet_provenance_respects_values_and_path_boundary() {
+        use super::{Op, ordered_operations_from_tokens};
+        use crate::utils::{error::CliError, output::OutputConfig};
+
+        let cases: &[(&[&str], bool, &[bool])] = &[
+            (
+                &["update-index", "--refresh", "-q", "--really-refresh"],
+                false,
+                &[false, true],
+            ),
+            (
+                &["--quiet", "update-index", "-q", "--refresh"],
+                true,
+                &[true],
+            ),
+            (&["-q", "update-index", "--refresh"], true, &[false]),
+            (&["update-index", "--quiet", "--refresh"], true, &[false]),
+            (
+                &["update-index", "-q", "--refresh", "--quiet"],
+                true,
+                &[true],
+            ),
+            (
+                &["update-index", "-q", "--refresh", "--", "--quiet"],
+                false,
+                &[true],
+            ),
+            (&["update-index", "--refresh", "--", "-q"], true, &[false]),
+            (
+                &[
+                    "update-index",
+                    "--index-file",
+                    "update-index",
+                    "-q",
+                    "--refresh",
+                ],
+                false,
+                &[true],
+            ),
+            (
+                &["update-index", "--index-file=--quiet", "-q", "--refresh"],
+                false,
+                &[true],
+            ),
+            (
+                &[
+                    "--progress",
+                    "none",
+                    "--max-connections",
+                    "1",
+                    "update-index",
+                    "-q",
+                    "--refresh",
+                ],
+                false,
+                &[true],
+            ),
+            (
+                &["update-index", "--color", "--json", "-q", "--refresh"],
+                false,
+                &[true],
+            ),
+            (&["-qJ", "update-index", "-q", "--refresh"], true, &[true]),
+            (&["update-index", "-zq", "--refresh"], false, &[true]),
+            (&[], true, &[]),
+        ];
+        let output = OutputConfig {
+            quiet: true,
+            ..OutputConfig::default()
+        };
+        for (argv, suppressed, switches) in cases {
+            let tokens: Vec<String> = argv.iter().map(|arg| (*arg).to_owned()).collect();
+            let ordered = ordered_operations_from_tokens(&tokens, &CliError::command_usage)
+                .expect("ordered arguments");
+            assert_eq!(
+                ordered.suppress_refresh_output(&output),
+                *suppressed,
+                "{argv:?}"
+            );
+            let actual: Vec<bool> = ordered
+                .ops
+                .iter()
+                .filter_map(|op| match op {
+                    Op::Refresh { switches } => Some(switches.quiet),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(actual, *switches, "{argv:?}");
+            if argv.contains(&"--") {
+                assert!(
+                    matches!(ordered.ops.last(), Some(Op::Path { .. })),
+                    "{argv:?}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn force_remove_flag_parses_and_defaults_off() {

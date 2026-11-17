@@ -45,11 +45,11 @@ payload。
 | `--no-skip-worktree` | 清除 skip-worktree 位；无扩展标志时 index 回到 v2。 | `libra update-index --no-skip-worktree s.txt` |
 | `--add --remove` | 同时给出两项许可：存在的暂存、消失的移除。 | `libra update-index --add --remove a.txt gone.txt` |
 | `--cacheinfo <mode>,<object>,<path>` | 按对象 id 注册条目（可重复）。 | `libra update-index --cacheinfo 100644,<oid>,dir/f.txt` |
-| `--refresh` | 对照工作树重新 stat index：仅 stat 漂移的条目静默刷新；内容已修改或文件缺失的条目输出 `<path>: needs update` 并退出 1；未合并条目输出 `<path>: needs merge`。`-q`（抑制输出与退出码）、`--ignore-missing`、`--unmerged` 必须位于 `--refresh` 之前。 | `libra update-index --refresh` |
+| `--refresh` | 对照工作树重新 stat index：仅 stat 漂移的条目静默刷新；内容已修改或文件缺失的条目输出 `<path>: needs update` 并退出 1；未合并条目输出 `<path>: needs merge`。命令后的短旗标 `-q` 只抑制 needs update 的输出与对应退出码，不抑制 needs merge 的输出或退出码 1；`-q`、`--ignore-missing`、`--unmerged` 必须位于 `--refresh` 之前才影响该次刷新。Libra 全局 `--quiet`（或 `update-index` 之前的 `-q`）抑制全部 stdout，但不改变 refresh 退出码；其输出抑制优先于命令后的 `-q`。 | `libra update-index --refresh` |
 | `--really-refresh` | 与 `--refresh` 相同（Libra 无 assume-unchanged 位）。 | `libra update-index --really-refresh` |
 | `--chmod=(+\|-)-x` | 对随后（直至被覆盖）的位置路径与 `--stdin` 路径翻转可执行位；不触碰工作树文件。 | `libra update-index --chmod=+x a.sh` |
 | `--info-only` | 记录对象 id，但暂存路径不写入 blob。 | `libra update-index --add --info-only new.txt` |
-| `--verbose` | 在 stdout 逐条报告动作：`add '<path>'`、`remove '<path>'`、`chmod +x '<path>'` / `chmod -x '<path>'`。 | `libra update-index --add --verbose a.txt` |
+| `--verbose` | 在 stdout 逐条报告动作：`add '<path>'`、`remove '<path>'`、`chmod +x '<path>'` / `chmod -x '<path>'`。成功的 chmod 请求即使条目原本已有该 mode 也会输出记录。 | `libra update-index --add --verbose a.txt` |
 | `--index-info` | 从 stdin 读取 index 记录（`-z` 为 NUL 分隔），必须是最后一个参数。接受 `<mode> SP <oid> TAB <path>`、`<mode> SP <type> SP <oid> TAB <path>` 或 `<mode> SP <oid> SP <stage> TAB <path>`；`mode 0` 删除全部 stage。非法行退出 128 且 index 不变。 | `printf '100644 <oid> 3\tfoo\n' \| libra update-index --index-info` |
 | `--stdin` | 从 stdin 逐行读取路径（`-z` 为 NUL 分隔），必须是最后一个参数，按当前位置路径的相同规则处理。 | `printf 'a.txt\n' \| libra update-index --add --stdin` |
 | `-z` / `--null` | 配合 `--index-info`/`--stdin` 使用 NUL 分隔记录。 | `libra update-index -z --add --stdin` |
@@ -89,7 +89,7 @@ libra update-index --remove src/old.rs
 
 # 对照工作树刷新 index 的 stat 缓存
 libra update-index --refresh
-libra update-index -q --refresh        # 永不退出 1
+libra update-index -q --refresh        # 抑制 needs update，不抑制 needs merge
 
 # 从 stdin 直接写入未合并 stage 条目
 printf '100644 %s 3\tfoo\n' "$OID" | libra update-index --index-info

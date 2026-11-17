@@ -34,6 +34,16 @@
 
 ### Fixed
 
+- `update-index -q --refresh` retains `<path>: needs merge` and exit 1 for
+  unmerged entries. Command-position `-q` still suppresses needs-update output
+  and its exit status in argument order; global `--quiet` and JSON/machine
+  output remain silent for human refresh lines (#479, TC-3689).
+- `rev-parse`, `cat-file`, and `show` preserve colons inside the existing
+  `<rev>^{/<regex>}` commit-message selector instead of prematurely splitting
+  them as `REV:path`. `HEAD^{/testing:}` selects the matching commit, and
+  `HEAD^{/testing:}:hello` resolves `hello` in that commit's tree. The fix covers
+  `show` human output, JSON, and quiet validation; it does not change the regex
+  syntax or its existing limitations (issue #1055, TC3285; #479 FX-479-05).
 - `diff-index` / `diff-files` no longer mislabel a stat-invalid entry as added or
   deleted. After `read-tree` (or any operation that invalidates the index `stat`
   cache), an empty tracked file was reported as `A` and a worktree file truncated

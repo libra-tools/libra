@@ -90,11 +90,11 @@ agent cleanup fail closed while repair remains pending. With
 | `--no-skip-worktree` | Clear the skip-worktree bit again; the index returns to v2 when no extended flags remain. | `libra update-index --no-skip-worktree s.txt` |
 | `--add --remove` | Both permissions at once: stage what exists, drop what is gone. | `libra update-index --add --remove a.txt gone.txt` |
 | `--cacheinfo <mode>,<object>,<path>` | Register an entry from an object id (repeatable). | `libra update-index --cacheinfo 100644,<oid>,dir/f.txt` |
-| `--refresh` | Re-stat the index against the working tree: stat-only drift is refreshed silently; a modified or missing file prints `<path>: needs update` and exits 1. Unmerged entries print `<path>: needs merge`. Options `-q` (suppress output and the exit code), `--ignore-missing`, and `--unmerged` must precede `--refresh`. | `libra update-index --refresh` |
+| `--refresh` | Re-stat the index against the working tree: stat-only drift is refreshed silently; a modified or missing file prints `<path>: needs update` and exits 1. Unmerged entries print `<path>: needs merge`. Command-position `-q` suppresses needs-update output and that exit status, but not needs-merge output or its exit 1; `-q`, `--ignore-missing`, and `--unmerged` must precede `--refresh` to affect it. Libra's global `--quiet` (or `-q` before `update-index`) suppresses all stdout without changing refresh exit status; it takes precedence over command-position `-q` for output. | `libra update-index --refresh` |
 | `--really-refresh` | Same as `--refresh` (Libra has no assume-unchanged bit). Both clear a leftover assume-unchanged (`CE_VALID`) bit; see [Legacy assume-unchanged bits](#legacy-assume-unchanged-bits). | `libra update-index --really-refresh` |
 | `--chmod=(+\|-)-x` | Flip the executable bit on the positional (and `--stdin`) paths that follow it until overridden. The working-tree file is untouched. | `libra update-index --chmod=+x a.sh` |
 | `--info-only` | Record object ids without storing the blobs through the staging path. | `libra update-index --add --info-only new.txt` |
-| `--verbose` | Report each action on stdout: `add '<path>'`, `remove '<path>'`, `chmod +x '<path>'` / `chmod -x '<path>'`. | `libra update-index --add --verbose a.txt` |
+| `--verbose` | Report each action on stdout: `add '<path>'`, `remove '<path>'`, `chmod +x '<path>'` / `chmod -x '<path>'`. A successful chmod request is reported even when the entry already has that mode. | `libra update-index --add --verbose a.txt` |
 | `--index-info` | Read index records from stdin (NUL with `-z`), must be the last argument. Accepts `<mode> SP <oid> TAB <path>`, `<mode> SP <type> SP <oid> TAB <path>`, or `<mode> SP <oid> SP <stage> TAB <path>`; `mode 0` removes every stage. A malformed line exits 128 with the index unchanged. | `printf '100644 <oid> 3\tfoo\n' \| libra update-index --index-info` |
 | `--stdin` | Read one path per record from stdin (NUL with `-z`), must be the last argument, processed like positional paths under the current flags. | `printf 'a.txt\n' \| libra update-index --add --stdin` |
 | `-z` / `--null` | With `--index-info`/`--stdin`, records are NUL-terminated. | `libra update-index -z --add --stdin` |
@@ -133,7 +133,7 @@ libra update-index --no-skip-worktree s.txt
 
 # Refresh the index stat cache against the working tree
 libra update-index --refresh
-libra update-index -q --refresh        # never exits 1
+libra update-index -q --refresh        # suppresses needs-update, not needs-merge
 
 # Write unmerged stage entries straight from stdin
 printf '100644 %s 3\tfoo\n' "$OID" | libra update-index --index-info

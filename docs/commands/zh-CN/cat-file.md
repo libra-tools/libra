@@ -16,7 +16,7 @@ Libra 用 `--ai*` 标志扩展了经典命令，用于检查存储在 `libra/int
 
 必须且只能指定一个模式标志。Git 模式（`-t`、`-s`、`-p`、`-e`）需要位置 `OBJECT` 参数。AI 模式（`--ai`、`--ai-type`、`--ai-list`、`--ai-list-types`）忽略 `OBJECT`，并在 AI history 分支上操作。
 
-Git 对象模式与 batch 输入复用 `rev-parse` 的严格 resolver：支持 ref/唯一 OID 前缀、`@`、parent 导航、typed/递归 peel、数字 reflog selector 与 `REV:path`。resolver 必须消费完整输入，因此 `HEAD^{tree}junk` 这类非法后缀会被拒绝，不会只解析一部分。
+Git 对象模式与 batch 输入复用 `rev-parse` 的严格 resolver：支持 ref/唯一 OID 前缀、`@`、parent 导航、typed/递归 peel、数字 reflog selector、`REV:path` 与提交消息搜索。`<rev>^{/<regex>}` 内的冒号属于正则，因此 `HEAD^{/testing:}` 选择匹配的提交；闭合 `}` 之后的冒号才是路径分隔符，`libra cat-file -p 'HEAD^{/testing:}:hello'` 打印该提交中 `hello` 的 blob。resolver 必须消费完整输入，因此 `HEAD^{tree}junk` 这类非法后缀会被拒绝，不会只解析一部分。
 
 Batch 模式仅把不可解析或不存在的名称输出为 `<input> missing`。ref 数据库读取失败或对象损坏/不可读会让命令以结构化错误失败，避免把存储损坏静默伪装成缺失对象。
 
@@ -41,7 +41,7 @@ Batch 模式逐行读取 stdin，并在读取下一行之前先输出当前行�
 | `--ai-type <ID>` | | 打印给定 ID 的 AI 对象类型。 |
 | `--ai-list <TYPE>` | | 列出给定类型的所有 AI 对象（例如 `intent`、`patchset`、`event`）。 |
 | `--ai-list-types` | | 列出 history 分支中存在的所有 AI 对象类型。 |
-| `<OBJECT>` | | Git 对象 spec：哈希/ref、typed peel、数字 reflog selector 或 `REV:path`。`-t`/`-s`/`-p`/`-e` 必需；`--ai*` 模式忽略；batch 模式改从 stdin 读取对象 spec。 |
+| `<OBJECT>` | | Git 对象 spec：哈希/ref、typed peel、数字 reflog selector、`REV:path` 或 `<rev>^{/<regex>}`（模式内的冒号保留，其后可接 `:path`）。`-t`/`-s`/`-p`/`-e` 必需；`--ai*` 模式忽略；batch 模式改从 stdin 读取对象 spec。 |
 
 ### 示例
 
@@ -55,9 +55,11 @@ libra cat-file -s 40d352ee7190f92dcf7883b8a81f2c730fd8a860
 # 美化打印 HEAD 提交
 libra cat-file -p HEAD
 
-# 检查 peeled tree 或按路径选中的 blob
+# 检查 peeled tree、路径，或按含冒号的消息模式找到的提交
 libra cat-file -t 'HEAD^{tree}'
 libra cat-file -p 'HEAD:src/main.rs'
+libra cat-file -p 'HEAD^{/testing:}'
+libra cat-file -p 'HEAD^{/testing:}:hello'
 
 # 检查存在性（退出码 0 = 存在）
 libra cat-file -e abc1234

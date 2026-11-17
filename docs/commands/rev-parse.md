@@ -44,6 +44,13 @@ Rust `regex` crate — a linear-time engine without backreferences or
 lookaround — so some POSIX-ERE-only patterns do not compile; matching is
 case-sensitive and only commit objects are read during the walk.
 
+A colon inside `<rev>^{/<regex>}` belongs to the pattern: `HEAD^{/testing:}`
+finds a reachable commit whose message matches `testing:`. A following `:path`
+looks up a path in that commit's tree, so `HEAD^{/testing:}:hello` resolves the
+object at repository-relative path `hello`. `rev-parse`, `cat-file`, and `show`
+share this syntax. Quote the complete spec in the shell. The colon handling
+does not change the regex syntax or limitations described above.
+
 `AUTO_MERGE` is the sole pseudo-ref accepted by this command: during a
 non-squash merge paused on conflicts, it resolves to the automatic result
 tree, including conflict markers. It disappears after `merge --continue`,
@@ -83,6 +90,9 @@ libra rev-parse :src/main.rs
 libra rev-parse :2:src/main.rs
 libra rev-parse ':/fix: crash'
 libra rev-parse 'HEAD^{/fix}'
+libra rev-parse 'HEAD^{/testing:}'
+libra rev-parse 'HEAD^{/testing:}:hello'
+libra cat-file -p 'HEAD^{/testing:}:hello'
 libra rev-parse 'main@{1}'
 libra rev-parse --short HEAD
 libra rev-parse --abbrev-ref HEAD

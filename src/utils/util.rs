@@ -3055,6 +3055,30 @@ async fn resolve_message_search_typed(
     Err(invalid_reference(display_name))
 }
 
+/// Split a revision/path specification at the first colon outside selectors.
+/// Leading-colon index paths and message-search atoms are handled separately.
+/// Selector boundaries match the strict resolver: the first `}` closes `^{...}`
+/// or `@{...}`, and an unclosed selector is left intact for it to reject.
+pub(crate) fn split_revision_path(spec: &str) -> Option<(&str, &str)> {
+    if spec.starts_with(':') {
+        return None;
+    }
+
+    let bytes = spec.as_bytes();
+    let mut offset = 0;
+    while offset < bytes.len() {
+        match bytes[offset] {
+            b'^' | b'@' if bytes.get(offset + 1) == Some(&b'{') => {
+                offset += 2;
+                offset += bytes[offset..].iter().position(|byte| *byte == b'}')? + 1;
+            }
+            b':' => return Some((&spec[..offset], &spec[offset + 1..])),
+            _ => offset += 1,
+        }
+    }
+    None
+}
+
 /// Resolve one strict Git object specification to its concrete object id.
 ///
 /// Supported forms include refs, unique object-id prefixes, `@`, numeric reflog
@@ -3072,7 +3096,7 @@ pub async fn resolve_object_spec_typed(name: &str) -> Result<ObjectHash, CommitB
     if name.starts_with(":/") {
         return resolve_revision_expression_typed(name).await;
     }
-    if let Some((revision, tree_path)) = name.split_once(':') {
+    if let Some((revision, tree_path)) = split_revision_path(name) {
         if revision.is_empty() {
             return Err(invalid_reference(name));
         }
@@ -4233,6 +4257,61 @@ mod test {
         internal::{db::get_db_conn_instance, head::Head, model::reference, tag as internal_tag},
         utils::test,
     };
+
+    #[test]
+    fn split_revision_path_respects_selector_boundaries() {
+        for (spec, expected) in [
+            ("HEAD:hello", Some(("HEAD", "hello"))),
+            ("HEAD:", Some(("HEAD", ""))),
+            ("HEAD:colon:file", Some(("HEAD", "colon:file"))),
+            ("HEAD^{/testing:}", None),
+            (
+                "HEAD^{/testing:}:hello",
+                Some(("HEAD^{/testing:}", "hello")),
+            ),
+            (
+                "HEAD^{/testing[:]}:hello",
+                Some(("HEAD^{/testing[:]}", "hello")),
+            ),
+            ("HEAD@{12:34}:hello", Some(("HEAD@{12:34}", "hello"))),
+            ("HEAD@{12:34}", None),
+            (
+                "分支^{/测试:}:目录:文件",
+                Some(("分支^{/测试:}", "目录:文件")),
+            ),
+            (
+                "HEAD@{0}^{/testing:}^{tree}:colon:file",
+                Some(("HEAD@{0}^{/testing:}^{tree}", "colon:file")),
+            ),
+            (
+                "refs/heads/{topic}:hello",
+                Some(("refs/heads/{topic}", "hello")),
+            ),
+            (
+                "refs/heads/{topic:hello",
+                Some(("refs/heads/{topic", "hello")),
+            ),
+            // Selectors close at the first brace, without nesting or escaping.
+            ("HEAD^{/{nested}:hello", Some(("HEAD^{/{nested}", "hello"))),
+            ("HEAD^{/testing:hello", None),
+            ("HEAD@{12:34:hello", None),
+            ("HEAD^{/testing:}@{0:hello", None),
+            ("HEAD^{", None),
+            ("HEAD@{", None),
+            ("HEAD", None),
+            ("", None),
+            (":/testing:hello", None),
+            (":/testing:}:hello", None),
+            (":hello", None),
+            (":0:hello", None),
+            (":1:colon:file", None),
+            (":2:hello", None),
+            (":3:hello", None),
+            (":", None),
+        ] {
+            assert_eq!(split_revision_path(spec), expected, "spec: {spec}");
+        }
+    }
 
     /// `..` after a symlink must be resolved by the kernel, for an existing
     /// path AND for a leaf that does not exist yet: with `a/link -> b/sub`,

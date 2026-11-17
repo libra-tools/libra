@@ -12,6 +12,8 @@ libra show [OPTIONS] [OBJECT] [-- <PATHS>...]
 
 `libra show` 解析单个对象引用并渲染其内容。默认目标是 `HEAD`。它理解 commit-ish 引用（`HEAD~2`、分支名、标签名）、原始 SHA-1 哈希，以及用于从给定修订的树中提取特定 blob 的 `REV:path` 语法。
 
+提交消息 selector 使用 [`rev-parse`](rev-parse.md) 中的共享语法：`<rev>^{/<regex>}` 从 `<rev>` 开始按提交时间从新到旧搜索祖先。selector 内的冒号属于正则模式，因此 `HEAD^{/testing:}` 选择提交消息匹配 `testing:` 的提交。追加 `:hello` 即可读取该提交中的仓库相对路径 `hello`：`HEAD^{/testing:}:hello`。人类输出、JSON 和 quiet 验证均支持这两种形式，`rev-parse` 与 `cat-file` 也接受同样的 spec。JSON 沿用解析后对象的既有 schema；`--quiet` 验证对象但不输出人类可读内容。既有 Rust `regex` 语法及其限制仍然适用。
+
 对于提交，输出包含头部（作者、提交者、日期、消息），随后是 unified diff（“patch”）。`--no-patch`、`--stat` 和 `--name-only` 等标志控制显示多少 diff 上下文。对于附注标签，会先打印 tagger 元数据和消息，然后打印目标对象。树会列出其条目，blob 会打印文本内容（或二进制摘要）。
 
 当 stdout 被管道连接且下游命令提前退出时，`libra show` 会静默正常结束，不打印 panic/backtrace 或 `Broken pipe` 诊断。
@@ -69,6 +71,14 @@ libra show --no-patch v1.0.0
 
 # 显示某个修订中的特定文件
 libra show HEAD:src/main.rs
+
+# 使用含冒号的消息模式查找提交
+libra show --no-patch 'HEAD^{/testing:}'
+
+# 读取该提交中的文件，或仅验证而不输出人类可读内容
+libra show 'HEAD^{/testing:}:hello'
+libra --json show 'HEAD^{/testing:}:hello'
+libra --quiet show 'HEAD^{/testing:}:hello'
 
 # 提交的一行摘要
 libra show --oneline abc1234

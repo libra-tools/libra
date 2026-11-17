@@ -996,6 +996,187 @@ fn update_index_refresh_unmerged_needs_merge() {
         String::from_utf8_lossy(&allowed.stderr)
     );
     assert!(allowed.stdout.is_empty(), "nothing to report");
+
+    // Git keeps the merge report and exit 1 under `-q`; only the needs-update
+    // report is suppressed. `--unmerged` is the option that skips the entry.
+    let quiet = run_libra_command(&["update-index", "-q", "--refresh"], repo.path());
+    assert_eq!(
+        quiet.status.code(),
+        Some(1),
+        "-q must not suppress an unmerged entry: {}",
+        String::from_utf8_lossy(&quiet.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&quiet.stdout),
+        "conflict.txt: needs merge\n"
+    );
+}
+
+/// Command-position -q is ordered; explicit global quiet only controls output.
+/// Different-size content avoids relying on filesystem timestamp granularity.
+#[test]
+fn update_index_refresh_quiet_scope_matrix() {
+    for fixture in ["modified", "missing", "unmerged", "mixed"] {
+        let repo = init_repo();
+        fs::write(repo.path().join("a-modified.txt"), "base\n").expect("write modified");
+        fs::write(repo.path().join("b-missing.txt"), "base\n").expect("write missing");
+        fs::write(repo.path().join("c-conflict.txt"), "base\n").expect("write conflict");
+        fs::write(repo.path().join("-q"), "literal short flag\n").expect("write -q");
+        fs::write(repo.path().join("--quiet"), "literal long flag\n").expect("write --quiet");
+        let staged = run_libra_command(
+            &[
+                "update-index",
+                "--add",
+                "a-modified.txt",
+                "b-missing.txt",
+                "c-conflict.txt",
+                "--",
+                "-q",
+                "--quiet",
+            ],
+            repo.path(),
+        );
+        assert!(staged.status.success(), "{staged:?}");
+        let has_merge = matches!(fixture, "unmerged" | "mixed");
+        if has_merge {
+            let oid = blob_id_of_file(repo.path(), "c-conflict.txt");
+            let input = format!("100644 {oid} 2\tc-conflict.txt\n100644 {oid} 3\tc-conflict.txt\n");
+            let staged = run_libra_command_with_stdin(
+                &["update-index", "--index-info"],
+                repo.path(),
+                &input,
+            );
+            assert!(staged.status.success(), "{staged:?}");
+        }
+        let mut all_lines = String::new();
+        if matches!(fixture, "modified" | "mixed") {
+            fs::write(
+                repo.path().join("a-modified.txt"),
+                "longer changed content\n",
+            )
+            .expect("modify");
+            all_lines.push_str("a-modified.txt: needs update\n");
+        }
+        if matches!(fixture, "missing" | "mixed") {
+            fs::remove_file(repo.path().join("b-missing.txt")).expect("remove");
+            all_lines.push_str("b-missing.txt: needs update\n");
+        }
+        let merge_line = if has_merge {
+            "c-conflict.txt: needs merge\n"
+        } else {
+            ""
+        };
+        all_lines.push_str(merge_line);
+        for refresh in ["--refresh", "--really-refresh"] {
+            let cases: Vec<(Vec<&str>, i32, &str)> = vec![
+                (vec!["update-index", refresh], 1, &all_lines),
+                (
+                    vec!["update-index", "-q", refresh],
+                    i32::from(has_merge),
+                    merge_line,
+                ),
+                (vec!["update-index", refresh, "-q"], 1, &all_lines),
+                (vec!["update-index", refresh, "--", "-q"], 1, &all_lines),
+                (
+                    vec!["update-index", "-q", refresh, "--", "--quiet"],
+                    i32::from(has_merge),
+                    merge_line,
+                ),
+                (vec!["--quiet", "update-index", refresh], 1, ""),
+                (vec!["-q", "update-index", refresh], 1, ""),
+                (vec!["update-index", "--quiet", refresh], 1, ""),
+                (vec!["update-index", refresh, "--quiet"], 1, ""),
+                (
+                    vec!["--quiet", "update-index", "-q", refresh],
+                    i32::from(has_merge),
+                    "",
+                ),
+                // Distinct parser levels permit global quiet plus local -q.
+                // Two spellings at the same level remain a Clap conflict.
+                (
+                    vec!["-q", "update-index", "-q", refresh],
+                    i32::from(has_merge),
+                    "",
+                ),
+                (vec!["update-index", "-q", "--unmerged", refresh], 0, ""),
+                // Optional global values require '='; bare --color must not
+                // consume the next operation, and a required value is skipped.
+                (
+                    vec![
+                        "--progress",
+                        "none",
+                        "update-index",
+                        "--color",
+                        "-q",
+                        refresh,
+                    ],
+                    i32::from(has_merge),
+                    merge_line,
+                ),
+            ];
+            for (argv, code, stdout) in cases {
+                let output = run_libra_command(&argv, repo.path());
+                assert_eq!(
+                    output.status.code(),
+                    Some(code),
+                    "{fixture} {argv:?}: {output:?}"
+                );
+                assert_eq!(output.stdout, stdout.as_bytes(), "{fixture} {argv:?}");
+                assert!(output.stderr.is_empty(), "{fixture} {argv:?}: {output:?}");
+            }
+            // Both refresh operations retain their own flag snapshot. The
+            // first pass still fails even though the second sees -q.
+            let argv = [
+                "update-index",
+                refresh,
+                "-q",
+                if refresh == "--refresh" {
+                    "--really-refresh"
+                } else {
+                    "--refresh"
+                },
+            ];
+            let output = run_libra_command(&argv, repo.path());
+            assert_eq!(
+                output.status.code(),
+                Some(1),
+                "{fixture} {argv:?}: {output:?}"
+            );
+            assert_eq!(output.stdout, format!("{all_lines}{merge_line}").as_bytes());
+            assert!(output.stderr.is_empty(), "{fixture} {argv:?}: {output:?}");
+
+            for format in ["--json", "--json=compact", "--machine"] {
+                for local_quiet_first in [false, true] {
+                    let argv = if local_quiet_first {
+                        vec!["update-index", format, "-q", refresh]
+                    } else {
+                        vec![format, "update-index", refresh, "-q"]
+                    };
+                    let output = run_libra_command(&argv, repo.path());
+                    let code = i32::from(has_merge || !local_quiet_first);
+                    assert_eq!(
+                        output.status.code(),
+                        Some(code),
+                        "{fixture} {argv:?}: {output:?}"
+                    );
+                    assert!(output.stderr.is_empty(), "{fixture} {argv:?}: {output:?}");
+                    if code == 1 {
+                        // Refresh failures use silent_exit(1), including JSON.
+                        assert!(output.stdout.is_empty(), "{fixture} {argv:?}: {output:?}");
+                    } else {
+                        let expected = serde_json::json!({
+                            "command": "update-index",
+                            "data": {"updated": 0, "removed": 0},
+                            "ok": true,
+                        });
+                        let actual = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+                            .expect("stdout contains exactly one JSON envelope");
+                        assert_eq!(actual, expected, "{fixture} {argv:?}");
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// UI-02 F6: `--really-refresh` behaves exactly like `--refresh` (Libra has
@@ -1142,6 +1323,58 @@ fn update_index_chmod_matrix_positional() {
         "100755",
         "flag persists"
     );
+}
+
+/// UI-03 C2/C5: successful chmod reports even when the requested mode already
+/// matches. Only an actual mode change adds another update to the JSON count.
+#[test]
+fn update_index_verbose_chmod_reports_unchanged_mode() {
+    let repo = init_repo();
+    fs::write(repo.path().join("A"), "a\n").expect("write A");
+    fs::write(repo.path().join("B"), "b\n").expect("write B");
+    let staged = run_libra_command(&["update-index", "--add", "A", "B"], repo.path());
+    assert!(staged.status.success(), "{staged:?}");
+    let output = run_libra_command(
+        &[
+            "update-index",
+            "--verbose",
+            "--chmod=+x",
+            "A",
+            "--chmod=-x",
+            "B",
+        ],
+        repo.path(),
+    );
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(
+        output.stdout,
+        b"add 'A'\nchmod +x 'A'\nadd 'B'\nchmod -x 'B'\n"
+    );
+    assert!(output.stderr.is_empty(), "{output:?}");
+    assert_eq!(index_mode_of(repo.path(), "A"), "100755");
+    assert_eq!(index_mode_of(repo.path(), "B"), "100644");
+
+    let output = run_libra_command(
+        &["update-index", "--verbose", "--chmod=-x", "B"],
+        repo.path(),
+    );
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(output.stdout, b"add 'B'\nchmod -x 'B'\n");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    assert_eq!(index_mode_of(repo.path(), "B"), "100644");
+
+    let output = run_libra_command(
+        &["--json", "update-index", "--verbose", "--chmod=-x", "B"],
+        repo.path(),
+    );
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let json = parse_json_stdout(&output);
+    assert_eq!(
+        json["data"]["updated"], 1,
+        "only the positional restage counts"
+    );
+    assert_eq!(json["data"]["removed"], 0);
 }
 
 /// UI-03 C3: chmod on a non-regular file fails with 128.

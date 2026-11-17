@@ -382,7 +382,7 @@ fn color_enabled_for_output(output: &OutputConfig) -> bool {
 
 async fn show_target_uses_commit_display(args: &ShowArgs) -> CliResult<bool> {
     let object_ref = args.object.as_deref().unwrap_or("HEAD");
-    if object_ref.contains(':') {
+    if is_index_path_spec(object_ref) || util::split_revision_path(object_ref).is_some() {
         return Ok(false);
     }
 
@@ -429,10 +429,7 @@ async fn render_show_human(args: &ShowArgs, color_enabled: bool) -> CliResult<St
 
     // Handle `<revision>:<path>` lookups before generic revision resolution.
     // (Skip `:...` specs — index paths and `:/<regex>` have no revision part.)
-    if let Some((rev, path)) = object_ref
-        .split_once(':')
-        .filter(|(rev, _)| !rev.is_empty())
-    {
+    if let Some((rev, path)) = util::split_revision_path(object_ref) {
         return show_commit_file(rev, path).await;
     }
 
@@ -490,10 +487,7 @@ async fn validate_show_quiet(args: &ShowArgs) -> CliResult<()> {
         return validate_object_by_hash(&hash, args).await;
     }
 
-    if let Some((rev, path)) = object_ref
-        .split_once(':')
-        .filter(|(rev, _)| !rev.is_empty())
-    {
+    if let Some((rev, path)) = util::split_revision_path(object_ref) {
         return validate_commit_file(rev, path).await;
     }
 
@@ -991,77 +985,60 @@ fn validate_blob(hash: &ObjectHash) -> CliResult<()> {
     Ok(())
 }
 
-/// Shows a file from a specific revision.
-async fn show_commit_file(rev: &str, file_path: &str) -> CliResult<String> {
-    // Resolve the revision before looking up the path.
+#[derive(Clone, Copy)]
+enum CommitFileTarget {
+    Blob(ObjectHash),
+    Tree(ObjectHash),
+}
+
+/// Resolve `<rev>:<path>` once for human, quiet, and structured output. A tree
+/// suffix addresses the subtree itself, not a flattened list of descendant
+/// blobs; the empty suffix addresses the commit's root tree.
+async fn resolve_commit_file(rev: &str, file_path: &str) -> CliResult<CommitFileTarget> {
     let commit_hash = util::get_commit_base(rev)
         .await
         .map_err(|_| show_bad_revision_error(rev))?;
-
     let commit =
         load_object::<Commit>(&commit_hash).map_err(|e| show_object_load_error(commit_hash, e))?;
 
-    // ADR-LG-05 item 3: `<rev>:<dir>` renders the subtree exactly like
-    // `<rev>^{tree}` does, so walk each path component and keep the object
-    // mode instead of only consulting the flattened blob list.
     let normalized = file_path.trim_end_matches('/');
-    let mut tree_hash = commit.tree_id;
-    let mut tree =
-        load_object::<Tree>(&tree_hash).map_err(|e| show_object_load_error(tree_hash, e))?;
-    let mut found_tree = normalized.is_empty();
-    if !normalized.is_empty() {
-        let components: Vec<&str> = normalized.split('/').filter(|c| !c.is_empty()).collect();
-        for (index, component) in components.iter().enumerate() {
-            let Some(item) = tree.tree_items.iter().find(|item| item.name == *component) else {
-                return Err(show_path_not_found_error(file_path, rev));
-            };
-            let last = index + 1 == components.len();
-            match item.mode {
-                TreeItemMode::Tree => {
-                    tree_hash = item.id;
-                    tree = load_object::<Tree>(&tree_hash)
-                        .map_err(|e| show_object_load_error(tree_hash, e))?;
-                    if last {
-                        found_tree = true;
-                    }
-                }
-                _ if last => return show_blob(&item.id).await,
-                _ => return Err(show_path_not_found_error(file_path, rev)),
-            }
-        }
-    }
-    if found_tree {
-        return show_tree(&tree_hash, &format!("{rev}:{file_path}")).await;
+    if normalized.is_empty() {
+        return Ok(CommitFileTarget::Tree(commit.tree_id));
     }
 
-    // `get_plain_items` also covers the empty path (the commit's root tree).
-    let items = tree.get_plain_items()?;
-    let target_path = PathBuf::from(file_path);
-    if let Some((_, blob_hash)) = items.iter().find(|(path, _)| path == &target_path) {
-        show_blob(blob_hash).await
-    } else {
-        Err(show_path_not_found_error(file_path, rev))
+    let mut tree = load_object::<Tree>(&commit.tree_id)
+        .map_err(|e| show_object_load_error(commit.tree_id, e))?;
+    let components: Vec<&str> = normalized.split('/').filter(|c| !c.is_empty()).collect();
+    for (index, component) in components.iter().enumerate() {
+        let Some(item) = tree.tree_items.iter().find(|item| item.name == *component) else {
+            return Err(show_path_not_found_error(file_path, rev));
+        };
+        let last = index + 1 == components.len();
+        match item.mode {
+            TreeItemMode::Tree if !last => {
+                tree = load_object::<Tree>(&item.id)
+                    .map_err(|e| show_object_load_error(item.id, e))?;
+            }
+            TreeItemMode::Tree => return Ok(CommitFileTarget::Tree(item.id)),
+            _ if last => return Ok(CommitFileTarget::Blob(item.id)),
+            _ => return Err(show_path_not_found_error(file_path, rev)),
+        }
+    }
+    Err(show_path_not_found_error(file_path, rev))
+}
+
+/// Shows a file or tree from a specific revision.
+async fn show_commit_file(rev: &str, file_path: &str) -> CliResult<String> {
+    match resolve_commit_file(rev, file_path).await? {
+        CommitFileTarget::Blob(hash) => show_blob(&hash).await,
+        CommitFileTarget::Tree(hash) => show_tree(&hash, &format!("{rev}:{file_path}")).await,
     }
 }
 
 async fn validate_commit_file(rev: &str, file_path: &str) -> CliResult<()> {
-    let commit_hash = util::get_commit_base(rev)
-        .await
-        .map_err(|_| show_bad_revision_error(rev))?;
-
-    let commit =
-        load_object::<Commit>(&commit_hash).map_err(|e| show_object_load_error(commit_hash, e))?;
-
-    let tree = load_object::<Tree>(&commit.tree_id)
-        .map_err(|e| show_object_load_error(commit.tree_id, e))?;
-
-    let items = tree.get_plain_items()?;
-    let target_path = PathBuf::from(file_path);
-
-    if let Some((_, blob_hash)) = items.iter().find(|(path, _)| path == &target_path) {
-        validate_blob(blob_hash)
-    } else {
-        Err(show_path_not_found_error(file_path, rev))
+    match resolve_commit_file(rev, file_path).await? {
+        CommitFileTarget::Blob(hash) => validate_blob(&hash),
+        CommitFileTarget::Tree(hash) => validate_tree(&hash),
     }
 }
 
@@ -1263,10 +1240,7 @@ async fn run_show(args: &ShowArgs) -> CliResult<ShowOutput> {
         return collect_object_output(&hash, &paths, path_specs.as_ref(), args).await;
     }
 
-    if let Some((rev, path)) = object_ref
-        .split_once(':')
-        .filter(|(rev, _)| !rev.is_empty())
-    {
+    if let Some((rev, path)) = util::split_revision_path(object_ref) {
         return collect_commit_file_output(rev, path).await;
     }
 
@@ -1456,20 +1430,9 @@ async fn collect_blob_output(hash: &ObjectHash) -> CliResult<ShowOutput> {
 }
 
 async fn collect_commit_file_output(rev: &str, file_path: &str) -> CliResult<ShowOutput> {
-    let commit_hash = util::get_commit_base(rev)
-        .await
-        .map_err(|_| show_bad_revision_error(rev))?;
-    let commit =
-        load_object::<Commit>(&commit_hash).map_err(|e| show_object_load_error(commit_hash, e))?;
-    let tree = load_object::<Tree>(&commit.tree_id)
-        .map_err(|e| show_object_load_error(commit.tree_id, e))?;
-    let items = tree.get_plain_items()?;
-    let target_path = PathBuf::from(file_path);
-
-    if let Some((_, blob_hash)) = items.iter().find(|(path, _)| path == &target_path) {
-        collect_blob_output(blob_hash).await
-    } else {
-        Err(show_path_not_found_error(file_path, rev))
+    match resolve_commit_file(rev, file_path).await? {
+        CommitFileTarget::Blob(hash) => collect_blob_output(&hash).await,
+        CommitFileTarget::Tree(hash) => collect_tree_output(&hash).await,
     }
 }
 

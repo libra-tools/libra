@@ -1652,6 +1652,274 @@ fn test_cat_file_and_show_accept_index_path() {
     );
 }
 
+#[test]
+fn test_message_search_colons_and_path_suffix_across_consumers() {
+    let repo = tempdir().expect("tempdir");
+    let p = repo.path();
+    init_repo_via_cli(p);
+    configure_identity_via_cli(p);
+
+    let message = "!testing: one\n\n测试: body";
+    fs::write(p.join("hello"), "original\n").expect("write original blob");
+    assert_cli_success(&run_libra_command(&["add", "hello"], p), "add hello");
+    #[cfg(unix)]
+    {
+        fs::write(p.join("colon:file"), "colon path\n").expect("write colon path");
+        assert_cli_success(
+            &run_libra_command(&["add", "colon:file"], p),
+            "add colon path",
+        );
+    }
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", message, "--no-verify"], p),
+        "commit searchable ancestor",
+    );
+    let oid_of = |spec: &str| {
+        let output = run_libra_command(&["rev-parse", spec], p);
+        assert_cli_success(&output, &format!("rev-parse {spec}"));
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    };
+    let original_commit = oid_of("HEAD");
+    let original_blob = oid_of("HEAD:hello");
+
+    fs::write(p.join("hello"), "later\n").expect("replace original blob");
+    assert_cli_success(&run_libra_command(&["add", "hello"], p), "add later hello");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "later", "--no-verify"], p),
+        "commit later change",
+    );
+    assert_ne!(oid_of("HEAD"), original_commit);
+    assert_ne!(oid_of("HEAD:hello"), original_blob);
+
+    for pattern in [
+        "testing",
+        "testing:",
+        "testing[:]",
+        "!!testing:",
+        "!-later",
+        "测试:",
+    ] {
+        let revision = format!("HEAD^{{/{pattern}}}");
+        // Both search forms must select the ancestor, including colons in its body.
+        for spec in [revision.clone(), format!(":/{pattern}")] {
+            assert_eq!(oid_of(&spec), original_commit, "revision: {spec}");
+            let cat = run_libra_command(&["cat-file", "-p", &spec], p);
+            assert_cli_success(&cat, &format!("cat-file -p {spec}"));
+            assert!(String::from_utf8_lossy(&cat.stdout).contains(message));
+
+            let show = run_libra_command(&["show", "--no-patch", &spec], p);
+            assert_cli_success(&show, &format!("show {spec}"));
+            let text = String::from_utf8_lossy(&show.stdout);
+            assert!(text.contains(&original_commit), "{spec}: {text}");
+            assert!(text.contains("!testing: one"), "{spec}: {text}");
+            assert!(text.contains("测试: body"), "{spec}: {text}");
+
+            let show_json = run_libra_command(&["--json", "show", &spec], p);
+            assert_cli_success(&show_json, &format!("show --json {spec}"));
+            let json = parse_json_stdout(&show_json);
+            assert_eq!(json["data"]["type"], "commit");
+            assert_eq!(json["data"]["hash"], original_commit);
+            assert_eq!(json["data"]["subject"], "!testing: one");
+
+            let quiet = run_libra_command(&["--quiet", "show", &spec], p);
+            assert_cli_success(&quiet, &format!("show --quiet {spec}"));
+            assert!(quiet.stdout.is_empty());
+        }
+
+        let path_spec = format!("{revision}:hello");
+        assert_eq!(oid_of(&path_spec), original_blob, "path: {path_spec}");
+        for args in [vec!["cat-file", "-p", &path_spec], vec!["show", &path_spec]] {
+            let output = run_libra_command(&args, p);
+            assert_cli_success(&output, &args.join(" "));
+            assert_eq!(output.stdout, b"original\n", "{args:?}");
+        }
+        let show_json = run_libra_command(&["--json", "show", &path_spec], p);
+        assert_cli_success(&show_json, &format!("show --json {path_spec}"));
+        let json = parse_json_stdout(&show_json);
+        assert_eq!(json["data"]["type"], "blob");
+        assert_eq!(json["data"]["hash"], original_blob);
+        assert_eq!(json["data"]["content"], "original\n");
+        let quiet = run_libra_command(&["--quiet", "show", &path_spec], p);
+        assert_cli_success(&quiet, &format!("show --quiet {path_spec}"));
+        assert!(quiet.stdout.is_empty());
+    }
+
+    #[cfg(unix)]
+    {
+        let spec = "HEAD^{/testing:}:colon:file";
+        assert_eq!(
+            oid_of(spec),
+            oid_of(&format!("{original_commit}:colon:file"))
+        );
+        for args in [vec!["cat-file", "-p", spec], vec!["show", spec]] {
+            let output = run_libra_command(&args, p);
+            assert_cli_success(&output, &args.join(" "));
+            assert_eq!(output.stdout, b"colon path\n", "{args:?}");
+        }
+        let output = run_libra_command(&["--json", "show", spec], p);
+        assert_cli_success(&output, "show JSON colon path");
+        assert_eq!(
+            parse_json_stdout(&output)["data"]["content"],
+            "colon path\n"
+        );
+        let output = run_libra_command(&["--quiet", "show", spec], p);
+        assert_cli_success(&output, "show quiet colon path");
+        assert!(output.stdout.is_empty());
+    }
+
+    for spec in [
+        "HEAD^{/missing:}",
+        "HEAD^{/[:}",
+        "HEAD^{/testing:",
+        "HEAD^{/!}",
+        "HEAD^{/!testing:}",
+        ":/missing:",
+        ":/[:",
+        ":/!",
+    ] {
+        // Invalid selectors must also fail when a path suffix is supplied.
+        for input in [spec.to_string(), format!("{spec}:hello")] {
+            for args in [
+                vec!["rev-parse", &input],
+                vec!["cat-file", "-p", &input],
+                vec!["show", &input],
+                vec!["--json", "show", &input],
+                vec!["--quiet", "show", &input],
+            ] {
+                let output = run_libra_command(&args, p);
+                assert!(!output.status.success(), "{args:?} unexpectedly succeeded");
+                assert!(output.stdout.is_empty(), "{args:?}: {output:?}");
+            }
+        }
+    }
+
+    // Colons inside message searches must not bypass commit-display defaults.
+    assert_cli_success(
+        &run_libra_command(&["config", "format.pretty", "format:configured %s"], p),
+        "configure commit display",
+    );
+    for spec in ["HEAD^{/testing:}", ":/testing:"] {
+        let output = run_libra_command(&["show", "--no-patch", spec], p);
+        assert_cli_success(&output, &format!("show configured {spec}"));
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "configured !testing: one"
+        );
+    }
+}
+
+#[test]
+fn test_show_message_search_directory_and_root_path_across_outputs() {
+    let repo = tempdir().expect("tempdir");
+    let p = repo.path();
+    init_repo_via_cli(p);
+    configure_identity_via_cli(p);
+    fs::create_dir_all(p.join("dir/sub")).expect("create nested directories");
+    fs::write(p.join("dir/file.txt"), "nested\n").expect("write nested file");
+    fs::write(p.join("dir/sub/deep.txt"), "deep\n").expect("write deep file");
+    fs::write(p.join("root.txt"), "root\n").expect("write root file");
+    assert_cli_success(&run_libra_command(&["add", "."], p), "add tree fixtures");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "tree fixtures", "--no-verify"], p),
+        "commit tree fixtures",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &["config", "format.pretty", "format:commit-display-only %s"],
+            p,
+        ),
+        "configure pretty format",
+    );
+    let oid_of = |spec: &str| {
+        let output = run_libra_command(&["rev-parse", spec], p);
+        assert_cli_success(&output, &format!("rev-parse {spec}"));
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    };
+
+    for (suffix, expected_human, expected_names) in [
+        (
+            "dir",
+            "tree HEAD^{/tree fixtures}:dir\n\nfile.txt\nsub/\n",
+            vec!["file.txt", "sub"],
+        ),
+        (
+            "",
+            "tree HEAD^{/tree fixtures}:\n\ndir/\nroot.txt\n",
+            vec!["dir", "root.txt"],
+        ),
+    ] {
+        let spec = format!("HEAD^{{/tree fixtures}}:{suffix}");
+        let human = run_libra_command(&["show", &spec], p);
+        assert_cli_success(&human, &format!("show {spec}"));
+        assert_eq!(
+            String::from_utf8_lossy(&human.stdout),
+            expected_human,
+            "tree paths must ignore commit pretty formats"
+        );
+        assert!(human.stderr.is_empty(), "{human:?}");
+
+        let json = run_libra_command(&["--json", "show", &spec], p);
+        assert_cli_success(&json, &format!("show --json {spec}"));
+        let data = parse_json_stdout(&json);
+        assert_eq!(data["data"]["type"], "tree", "{data}");
+        let tree_spec = format!("HEAD:{suffix}");
+        let entries = data["data"]["entries"].as_array().expect("tree entries");
+        let actual: Vec<&str> = entries
+            .iter()
+            .map(|entry| entry["name"].as_str().expect("entry name"))
+            .collect();
+        assert_eq!(actual, expected_names, "{data}");
+        for entry in entries {
+            let name = entry["name"].as_str().expect("entry name");
+            let separator = if suffix.is_empty() { "" } else { "/" };
+            let child_spec = format!("{tree_spec}{separator}{name}");
+            assert_eq!(entry["hash"], oid_of(&child_spec), "{data}");
+            assert!(entry["mode"].is_string() && entry["object_type"].is_string());
+        }
+        assert_eq!(oid_of(&tree_spec).len(), 40);
+        assert!(json.stderr.is_empty(), "{json:?}");
+
+        let quiet = run_libra_command(&["--quiet", "show", &spec], p);
+        assert_cli_success(&quiet, &format!("show --quiet {spec}"));
+        assert!(quiet.stdout.is_empty(), "{quiet:?}");
+        assert!(quiet.stderr.is_empty(), "{quiet:?}");
+    }
+
+    // The shared resolver keeps the existing blob behavior for a nested file.
+    let spec = "HEAD^{/tree fixtures}:dir/file.txt";
+    let human = run_libra_command(&["show", spec], p);
+    assert_cli_success(&human, "show selector nested blob");
+    assert_eq!(human.stdout, b"nested\n");
+    let json = run_libra_command(&["--json", "show", spec], p);
+    assert_cli_success(&json, "show JSON selector nested blob");
+    assert_eq!(parse_json_stdout(&json)["data"]["content"], "nested\n");
+    let quiet = run_libra_command(&["--quiet", "show", spec], p);
+    assert_cli_success(&quiet, "show quiet selector nested blob");
+    assert!(quiet.stdout.is_empty() && quiet.stderr.is_empty());
+
+    for missing in ["missing-dir", "dir/missing.txt", "dir/file.txt/child"] {
+        let spec = format!("HEAD^{{/tree fixtures}}:{missing}");
+        for args in [
+            vec!["show", &spec],
+            vec!["--json", "show", &spec],
+            vec!["--quiet", "show", &spec],
+        ] {
+            let output = run_libra_command(&args, p);
+            assert_eq!(output.status.code(), Some(129), "{args:?}: {output:?}");
+            assert!(output.stdout.is_empty(), "{args:?}: {output:?}");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains(&format!("path '{missing}' does not exist")),
+                "{args:?}: {stderr}"
+            );
+            assert!(
+                !stderr.to_lowercase().contains("panicked"),
+                "{args:?}: {stderr}"
+            );
+        }
+    }
+}
+
 // ── RV-02: `:/<regex>` and `<rev>^{/<regex>}` message search (M-MSG M1–M9) ──
 
 #[test]

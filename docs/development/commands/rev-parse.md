@@ -43,6 +43,7 @@ flowchart TD
 - 2026-07-09 P0-03：新增 `--is-shallow-repository`，只读 `.libra/shallow` 并在存在非空 shallow boundary 时打印 `true`，否则 `false`；测试 `compat_clone_shallow_integrity::rev_parse_reports_shallow_repository_boolean`。
 - 2026-07-14 P1-09：新增共享严格 revision/object resolver，覆盖 `@`、数字 reflog selector、typed/recursive peel、完整 tag ref、`REV:path` 与 SHA-256；`cat-file`/`read-tree`/`commit-tree` 和 commit-ish 消费者共用同一错误分类，回归目标为 `compat_rev_parse_peel_selectors`。
 - 2026-10-20 RV-01/RV-02（issue #479）：共享解析器新增 index path spec（`:<path>`/`:<n>:<path>`，stage 0–3，`./`/`../` 相对 cwd，越出工作树拒绝；缺失路径或 stage-0 缺失 → `LBR-CLI-003`/129）与提交消息搜索（`:/<regex>`/`<rev>^{/<regex>}`，全部本地 ref + HEAD 为起点、按提交时间最新优先、`!-`/`!!`/裸 `!` 前缀语义、`regex` crate 线性时间 + 10 MiB 编译上限，只读提交对象）；矩阵回归为 `rev_parse_test::test_rev_parse_index_path_matrix`（M-IDX I1–I8）、`test_rev_parse_message_search_matrix`（M-MSG M1–M9）、`test_cat_file_and_show_accept_index_path`，退出码契约行追加进 `plumbing_exit_contract_test`（I7、I8、M5–M7）。
+- FX-479-05（issue #479 / #1055，TC3285）：修复既有 `<rev>^{/<regex>}` selector 被 `split_once(':')` 提前截断的问题。共享对象 spec 解析只把 selector 外的冒号识别为 tree path 分隔符；`HEAD^{/testing:}` 保留模式中的冒号，`HEAD^{/testing:}:hello` 先搜索提交，再读取其树中的 `hello`。该语义由 `rev-parse`、`cat-file` 和 `show` 共用，`show` 的人类、JSON、quiet 路径必须一致。基础消息搜索已由 RV-02 实现；本修复不扩展正则语法，也不改变既有匹配顺序、前缀或错误码契约。
 - 历史结论：当前文档应以这些提交之后的代码、测试和兼容矩阵为准；更早的迁移式文档只保留为背景，不再作为事实来源。
 
 ## 当前状态

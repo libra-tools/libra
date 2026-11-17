@@ -15,6 +15,16 @@ default target is `HEAD`. It understands commit-ish references (`HEAD~2`,
 branch names, tag names), raw SHA-1 hashes, and the `REV:path` syntax for
 extracting a specific blob from a tree at a given revision.
 
+Commit-message selectors use the shared syntax documented in
+[`rev-parse`](rev-parse.md): `<rev>^{/<regex>}` searches from `<rev>` through its
+ancestors, newest-first by committer timestamp. A colon inside the selector is
+part of the pattern, so `HEAD^{/testing:}` selects a commit whose message matches
+`testing:`. Append `:hello` to read the repository-relative path `hello` from
+that commit: `HEAD^{/testing:}:hello`. These forms work in human output, JSON,
+and quiet validation, and also in `rev-parse` and `cat-file`. JSON uses the
+resolved object's existing schema; `--quiet` validates without human output.
+The existing Rust `regex` syntax and limitations still apply.
+
 For commits the output includes the header (author, committer, date, message)
 followed by a unified diff (the "patch"). Flags such as `--no-patch`, `--stat`,
 and `--name-only` control how much diff context is shown. For annotated tags the
@@ -80,6 +90,14 @@ libra show --no-patch v1.0.0
 
 # Show a specific file from a revision
 libra show HEAD:src/main.rs
+
+# Find a commit by a message pattern containing a colon
+libra show --no-patch 'HEAD^{/testing:}'
+
+# Read a file from that commit, or validate it without human output
+libra show 'HEAD^{/testing:}:hello'
+libra --json show 'HEAD^{/testing:}:hello'
+libra --quiet show 'HEAD^{/testing:}:hello'
 
 # Peel a revision to its tree (same expressions as rev-parse)
 libra show HEAD^{tree}
