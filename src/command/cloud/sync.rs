@@ -24,7 +24,8 @@ async fn unsupported_capture_kinds() -> CloudResult<Vec<String>> {
 async fn local_capture_kinds() -> CloudResult<Vec<String>> {
     use sea_orm::Statement;
 
-    let db_conn = db::get_db_conn_instance().await;
+    let repository = db::get_db_conn_instance().await;
+    let db_conn = super::agent_capture::local_capture_catalog(&repository).await?;
     let backend = db_conn.get_database_backend();
     let present = db_conn
         .query_one_raw(Statement::from_string(
@@ -544,7 +545,12 @@ pub(super) async fn mirror_agent_capture(
     repo_id: &str,
     progress: &dyn CloudSyncProgress,
 ) -> AgentCaptureSyncOutcome {
-    let frozen = super::agent_capture::freeze_agent_capture(db_conn, None).await;
+    let frozen = match super::agent_capture::local_capture_catalog(db_conn).await {
+        Ok(catalog) => super::agent_capture::freeze_agent_capture(&catalog, None).await,
+        Err(error) => super::agent_capture::FrozenAgentCapture::Unreadable {
+            reason: error.to_string(),
+        },
+    };
     mirror_frozen_agent_capture(db_conn, d1_client, r2_storage, repo_id, progress, &frozen).await
 }
 

@@ -948,10 +948,31 @@ impl SnapshotSpool {
                 "prepare the repository database for the snapshot: {error}; nothing was written to D1 or R2"
             )));
         }
+        // The capture catalog is a separate file once it moved out of
+        // `libra.db`; its reads get their own change detection below.
+        let catalog_conn = match super::agent_capture::local_capture_catalog(&conn).await {
+            Ok(catalog_conn) => catalog_conn,
+            Err(error) => {
+                let _ = conn.close().await;
+                return Err(error);
+            }
+        };
+        let split_catalog = match crate::internal::db::connection_has_table(&conn, "agent_session")
+            .await
+        {
+            Ok(combined) => !combined,
+            Err(error) => {
+                let _ = conn.close().await;
+                return Err(CloudError::Generic(format!(
+                    "inspect the repository database for the snapshot: {error}; nothing was written to D1 or R2"
+                )));
+            }
+        };
+        let catalog = split_catalog.then_some(&catalog_conn);
         let mut outcome = Err(CloudError::Generic(String::new()));
         for attempt in 1..=MAX_FREEZE_ATTEMPTS {
             match self
-                .freeze_once(&conn, repo_id, force, tuning, attempt)
+                .freeze_once(&conn, catalog, repo_id, force, tuning, attempt)
                 .await
             {
                 Ok(true) => {
@@ -978,6 +999,7 @@ impl SnapshotSpool {
     async fn freeze_once(
         &mut self,
         conn: &sea_orm::DatabaseConnection,
+        catalog_conn: Option<&sea_orm::DatabaseConnection>,
         repo_id: &str,
         force: bool,
         tuning: &SnapshotTuning,
@@ -1041,6 +1063,20 @@ impl SnapshotSpool {
             return Ok(false);
         }
         let start = data_version(conn).await.map_err(read_failure)?;
+        // A split catalog proves its own connection and change counter the
+        // same way; a commit to either file retries the attempt.
+        let catalog_start = match catalog_conn {
+            Some(catalog_conn) => {
+                if let Err(error) = mark_freeze_connection(catalog_conn, attempt).await {
+                    replaced_connection(catalog_conn, attempt, error)
+                        .await
+                        .map_err(read_failure)?;
+                    return Ok(false);
+                }
+                Some(data_version(catalog_conn).await.map_err(read_failure)?)
+            }
+            None => None,
+        };
         let boundary = conn
             .query_one_raw(sea_orm::Statement::from_sql_and_values(
                 conn.get_database_backend(),
@@ -1258,7 +1294,11 @@ impl SnapshotSpool {
             });
         #[cfg(not(test))]
         let catalog_hook: Option<super::agent_capture::CatalogPageHook> = None;
-        let catalog = super::agent_capture::freeze_agent_capture(conn, catalog_hook.as_ref()).await;
+        let catalog = super::agent_capture::freeze_agent_capture(
+            catalog_conn.unwrap_or(conn),
+            catalog_hook.as_ref(),
+        )
+        .await;
         let catalog_path = self.dir.join(CATALOG_FILE);
         let catalog_file = recreate_private_file(&catalog_path)
             .map_err(|error| spool_failure("create", &catalog_path, error))?;
@@ -1293,6 +1333,14 @@ impl SnapshotSpool {
             || !same_freeze_connection(conn, attempt)
                 .await
                 .map_err(read_failure)?
+        {
+            return Ok(false);
+        }
+        if let (Some(catalog_conn), Some(catalog_start)) = (catalog_conn, catalog_start)
+            && (data_version(catalog_conn).await.map_err(read_failure)? != catalog_start
+                || !same_freeze_connection(catalog_conn, attempt)
+                    .await
+                    .map_err(read_failure)?)
         {
             return Ok(false);
         }

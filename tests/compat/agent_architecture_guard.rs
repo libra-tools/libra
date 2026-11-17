@@ -337,6 +337,10 @@ fn private_capture_identity_has_no_source_opener() {
     // Pin both production regions, including the new proof helpers; the
     // cfg(test) canary remains excluded. Any further production edit must
     // receive task scope review and Claude review before these pins change.
+    // plan-20261116 FIX-CQ-02 (reviewed under that plan) re-pins the
+    // serializer region: catalog reads go through `local_capture_catalog`
+    // (`capture.db` after the split) and the traces head through the paired
+    // `libra.db`; row shapes and the serialized bytes are unchanged.
     let (_, cloud) = parse_rust_source("src/command/cloud/agent_capture.rs");
     assert!(matches!(&cloud.items[0], syn::Item::Use(item)
         if matches!(&item.tree, syn::UseTree::Path(path) if path.ident == "super")));
@@ -368,7 +372,7 @@ fn private_capture_identity_has_no_source_opener() {
     let remainder = format!("const AGENT_CAPTURE_LOCAL_PAGE_SIZE{remainder}");
     assert_eq!(
         hex::encode(Sha256::digest(remainder.as_bytes())),
-        "dda3672cdae42eca2911c55856a4a3a5aea40b68640f7dc1b924387f637dfcfe",
+        "fcb3e5bda4018ebf3ca7e1341b1a7754da4c2c88ca44d1048bff49b4abdf75d6",
         "RG-05 cloud serializer edit requires scope and Claude review"
     );
 }

@@ -623,8 +623,11 @@ pub(crate) async fn restore_agent_capture_from_d1_inner(
     // would otherwise bypass the warning and either fail loudly later or
     // silently succeed with no checkpoint rows. Warn and bail in that
     // case so the user gets a single actionable hint.
-    let backend = db_conn.get_database_backend();
-    let session_present = db_conn
+    // The catalog lives in `capture.db` (or in a combined database that has
+    // not been split yet); refs and object rows stay in `libra.db`.
+    let catalog = super::agent_capture::local_capture_catalog(db_conn).await?;
+    let backend = catalog.get_database_backend();
+    let session_present = catalog
         .query_one_raw(Statement::from_sql_and_values(
             backend,
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'agent_session' LIMIT 1",
@@ -633,7 +636,7 @@ pub(crate) async fn restore_agent_capture_from_d1_inner(
         .await
         .map_err(|e| local_agent_capture_restore_failure("probe local capture schema", e))?
         .is_some();
-    let checkpoint_present = db_conn
+    let checkpoint_present = catalog
         .query_one_raw(Statement::from_sql_and_values(
             backend,
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'agent_checkpoint' LIMIT 1",
@@ -685,7 +688,7 @@ pub(crate) async fn restore_agent_capture_from_d1_inner(
         .await
         .map_err(|error| cloud_d1_failure("probe subagent-content schema", &error))?;
 
-    let local_cloud_base = load_local_agent_capture_cloud_base(db_conn, repo_id).await?;
+    let local_cloud_base = load_local_agent_capture_cloud_base(&catalog, repo_id).await?;
     let mut coherent = None;
     for _ in 0..3 {
         let before = d1_client
@@ -886,8 +889,8 @@ pub(crate) async fn restore_agent_capture_from_d1_inner(
     .await?;
     // PD-03: propagate the remote session tombstones to THIS machine, so
     // a later local import cannot resurrect a session erased elsewhere.
-    persist_local_import_tombstones(db_conn, &rows.import_tombstones).await?;
-    store_local_agent_capture_cloud_base(db_conn, repo_id, remote_generation).await?;
+    persist_local_import_tombstones(&catalog, &rows.import_tombstones).await?;
+    store_local_agent_capture_cloud_base(&catalog, repo_id, remote_generation).await?;
     Ok(AgentCaptureRestoreOutcome::GenerationInstalled)
 }
 
@@ -948,12 +951,39 @@ pub(crate) async fn restore_agent_capture_from_rows_with_subagents(
         "restored remote",
     )?;
     // Reads the existing refs/rows before rewriting them (`restore fenced
-    // traces ref` below), so the write lock is taken up front.
-    let txn = crate::internal::db::begin_write_transaction(db_conn)
+    // traces ref` below), so the write lock is taken up front. After the
+    // catalog moved to `capture.db`, the traces ref stays in `libra.db`: the
+    // repository writer is taken first and the catalog writer second (the
+    // order every split writer uses), the ref commits first and the catalog
+    // last. A catalog COMMIT failure after the ref commit leaves a
+    // ref-reachable checkpoint without its row, which `libra agent doctor
+    // --repair` rebuilds. The two files are never attached.
+    let catalog = super::agent_capture::local_capture_catalog(db_conn).await?;
+    let split_catalog = !crate::internal::db::connection_has_table(db_conn, "agent_session")
         .await
         .map_err(|error| {
-            local_agent_capture_restore_failure("begin atomic agent capture restore", error)
+            local_agent_capture_restore_failure("probe local capture schema", error)
         })?;
+    let repository_txn = if split_catalog {
+        Some(
+            crate::internal::db::begin_write_transaction(db_conn)
+                .await
+                .map_err(|error| {
+                    local_agent_capture_restore_failure("begin traces ref restore", error)
+                })?,
+        )
+    } else {
+        None
+    };
+    let txn = if split_catalog {
+        crate::internal::db::begin_catalog_or_repository_write(&catalog).await
+    } else {
+        crate::internal::db::begin_write_transaction(db_conn).await
+    }
+    .map_err(|error| {
+        local_agent_capture_restore_failure("begin atomic agent capture restore", error)
+    })?;
+    let ref_txn = repository_txn.as_ref().unwrap_or(&txn);
     let backend = txn.get_database_backend();
 
     // An ordinary retention prune is a durable local deletion intent. The
@@ -1006,7 +1036,7 @@ pub(crate) async fn restore_agent_capture_from_rows_with_subagents(
         }
     }
 
-    let existing_traces_ref = txn
+    let existing_traces_ref = ref_txn
         .query_one_raw(Statement::from_sql_and_values(
             backend,
             "SELECT id, `commit` FROM reference
@@ -1049,25 +1079,31 @@ pub(crate) async fn restore_agent_capture_from_rows_with_subagents(
         let ref_id: i64 = row
             .try_get_by("id")
             .map_err(|error| local_agent_capture_restore_failure("decode traces ref id", error))?;
-        txn.execute_raw(Statement::from_sql_and_values(
-            backend,
-            "UPDATE reference SET `commit` = ? WHERE id = ?",
-            [traces_head.map(str::to_string).into(), ref_id.into()],
-        ))
-        .await
-        .map_err(|error| local_agent_capture_restore_failure("restore fenced traces ref", error))?;
+        ref_txn
+            .execute_raw(Statement::from_sql_and_values(
+                backend,
+                "UPDATE reference SET `commit` = ? WHERE id = ?",
+                [traces_head.map(str::to_string).into(), ref_id.into()],
+            ))
+            .await
+            .map_err(|error| {
+                local_agent_capture_restore_failure("restore fenced traces ref", error)
+            })?;
     } else {
-        txn.execute_raw(Statement::from_sql_and_values(
-            backend,
-            "INSERT INTO reference (name, kind, `commit`, remote, worktree_id)
+        ref_txn
+            .execute_raw(Statement::from_sql_and_values(
+                backend,
+                "INSERT INTO reference (name, kind, `commit`, remote, worktree_id)
              VALUES (?, 'Branch', ?, NULL, NULL)",
-            [
-                crate::internal::branch::TRACES_BRANCH.into(),
-                traces_head.map(str::to_string).into(),
-            ],
-        ))
-        .await
-        .map_err(|error| local_agent_capture_restore_failure("create fenced traces ref", error))?;
+                [
+                    crate::internal::branch::TRACES_BRANCH.into(),
+                    traces_head.map(str::to_string).into(),
+                ],
+            ))
+            .await
+            .map_err(|error| {
+                local_agent_capture_restore_failure("create fenced traces ref", error)
+            })?;
     }
 
     // PD-03 tombstone-first, LOCAL side. The remote catalog is filtered by
@@ -1751,6 +1787,11 @@ pub(crate) async fn restore_agent_capture_from_rows_with_subagents(
         }
     }
 
+    if let Some(repository_txn) = repository_txn {
+        repository_txn.commit().await.map_err(|error| {
+            local_agent_capture_restore_failure("commit restored traces ref", error)
+        })?;
+    }
     txn.commit().await.map_err(|error| {
         local_agent_capture_restore_failure("commit atomic agent capture restore", error)
     })?;

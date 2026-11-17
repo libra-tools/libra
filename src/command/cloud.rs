@@ -1236,6 +1236,9 @@ async fn preflight_agent_capture_prune_fences(
 ) -> CloudResult<()> {
     use sea_orm::Statement;
 
+    // Prune tombstones are catalog rows: `capture.db` after the split.
+    let catalog = agent_capture::local_capture_catalog(db_conn).await?;
+    let db_conn = &catalog;
     let backend = db_conn.get_database_backend();
     let tombstone_table_present = db_conn
         .query_one_raw(Statement::from_string(
@@ -2847,6 +2850,62 @@ mod tests {
             1,
             "mirrored legacy subagent evidence remains restorable"
         );
+    }
+
+    /// plan-20261116 FIX-CQ-02: restoring into a split repository writes the
+    /// catalog rows into `capture.db` and the traces ref into `libra.db`;
+    /// `libra.db` gains no `agent_*` table.
+    #[tokio::test]
+    #[serial_test::serial(cwd, env)]
+    async fn cloud_restore_writes_a_split_catalog_into_the_capture_database() {
+        use sea_orm::Statement;
+
+        let _env = crate::utils::test::ConfigDbFixture::new().unwrap();
+        let repo = tempdir().unwrap();
+        crate::utils::test::setup_with_new_libra_in(repo.path()).await;
+        let _cwd = crate::utils::test::ChangeDirGuard::new(repo.path());
+        let storage = repo.path().join(".libra");
+        let capture = crate::internal::ai::capture::store::open(
+            &storage,
+            crate::internal::ai::capture::store::COMMAND_BUSY_TIMEOUT,
+        )
+        .await
+        .unwrap();
+        let repository = crate::internal::db::get_db_conn_instance().await;
+        let remote = fixture_session_row("split-restore-session", "split-restore-provider");
+        restore_agent_capture_from_rows(&repository, std::slice::from_ref(&remote), &[], false)
+            .await
+            .expect("restore into a split repository");
+        let restored = capture
+            .query_one_raw(Statement::from_string(
+                capture.get_database_backend(),
+                "SELECT COUNT(*) AS n FROM agent_session WHERE session_id = 'split-restore-session'"
+                    .to_string(),
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get_by::<i64, _>("n")
+            .unwrap();
+        assert_eq!(restored, 1, "the restored session must be in capture.db");
+        assert!(
+            !crate::internal::db::connection_has_table(&repository, "agent_session")
+                .await
+                .unwrap(),
+            "restore must not recreate catalog tables in libra.db"
+        );
+        let traces_refs = repository
+            .query_one_raw(Statement::from_sql_and_values(
+                repository.get_database_backend(),
+                "SELECT COUNT(*) AS n FROM reference WHERE name = ? AND kind = 'Branch' AND remote IS NULL",
+                [crate::internal::branch::TRACES_BRANCH.into()],
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get_by::<i64, _>("n")
+            .unwrap();
+        assert_eq!(traces_refs, 1, "the fenced traces ref stays in libra.db");
     }
 
     #[tokio::test]

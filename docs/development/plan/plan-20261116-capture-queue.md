@@ -2,7 +2,7 @@
 
 **模板版本:** `v2.16`。本计划不在 v2.16 具名 `code-only` 范围内，按普通发布合同执行：会推送的独立卡与家族发布点各自 `patch + 1` 并走 ER-08。
 
-**状态:** 实施中。CQ-01、CQ-02、CQ-03、CQ-07、CQ-04、CQ-05 为 `Lifecycle=done`、`Acceptance=complete`。CQ-06 为 `pending` / 空。FIX-CQ-01（CQ-02/CQ-03/CQ-07 拆库回归）随 CQ-05 关闭。FIX-CQ-02（cloud sync/restore 未读 `capture.db`）未开始，须在 CQ-06 之前独立完成。用户要求每张卡在 `main` 上提交并推送，因此这次执行不遵守 REL-CQ-01 的“子卡不推送”。用户另要求捕获相关的新测试不进入 GitHub Actions，以本地运行为准：这些测试由 `LIBRA_RUN_CAPTURE_TESTS=1` 门控，CI 中打印 `skipped`。
+**状态:** 实施中。CQ-01、CQ-02、CQ-03、CQ-07、CQ-04、CQ-05 为 `Lifecycle=done`、`Acceptance=complete`。CQ-06 为 `pending` / 空。FIX-CQ-01（CQ-02/CQ-03/CQ-07 拆库回归）随 CQ-05 关闭。FIX-CQ-02（cloud sync/restore 未读 `capture.db`）已修复，作为 CQ-06 之前的独立提交交付。用户要求每张卡在 `main` 上提交并推送，因此这次执行不遵守 REL-CQ-01 的“子卡不推送”。用户另要求捕获相关的新测试不进入 GitHub Actions，以本地运行为准：这些测试由 `LIBRA_RUN_CAPTURE_TESTS=1` 门控，CI 中打印 `skipped`。
 
 ## 文档职责
 
@@ -106,6 +106,7 @@
 | 2026-11-16 13:14:31 UTC | Codex R5 FAIL | 容量检查、发布和过期 `tmp/` 删除都放进 `capacity.lock`；`tmp/` 最多 64 个，不依赖消费者启动 | 无拆卡 | ADR-CQ-02、CQ-05 AC/验证/预算、故障矩阵 |
 | 2026-11-16 13:17:14 UTC | Codex R6 FAIL | `tmp/` 改为在 `capacity.lock` 内 `O_EXCL` 创建，锁外才写内容，避免并发创建越过 64 | 无拆卡 | ADR-CQ-02、CQ-05 AC/预算、故障矩阵、容量表 |
 | 2026-11-17 16:55:05 UTC | CQ-05 实施 | 消费者重放使用自己的捕获期限（提供方自管导出窗口的沿用其预算，其余 30 秒），数据库等待用满该期限；消费者只继承白名单环境变量（含提供方目录、沙箱、对象存储），丢弃 API key；`__capture-spool-drain` 在有信封进入 `quarantine/` 时非零退出；入队前只用文件元数据检查 `libra.db` 是否存在（`LBR-REPO-002`/`LBR-IO-001`），schema 过新由消费者报告。新增调试构建测试缝 `LIBRA_TEST=1` + `LIBRA_TEST_CAPTURE_SPOOL_NO_CONSUMER=1`。捕获新测试以 `LIBRA_RUN_CAPTURE_TESTS=1` 门控，不进入 GitHub Actions | 无拆卡；新增 FIX-CQ-01 | CQ-05 写集、ADR-CQ-03、修复登记、实施证据汇总 |
+| 2026-11-17 20:52:53 UTC | FIX-CQ-02 | `cloud sync`/`cloud restore` 改从 `capture.db` 读写目录，`libra.db` 只留 ref 与对象索引；冻结对两个库各做变更检测 | 无拆卡 | 修复登记、实施证据汇总 |
 
 ## 已决议设计决策
 
@@ -850,6 +851,8 @@ Result 只允许 `PASS` 或 `FAIL`。R7 是计划文本的当前结论。R9 是 
 | R11 | R10 修复与新增 FIX | FAIL | P0=0。R10 四项确认关闭；FIX-CQ-02 作为 CQ-06 之前的独立项被接受。新 P1 五项：补偿 CAS 在另一追加者已前进时仍会留下未入目录的祖先；`capacity.lock` 等待不受 hook 期限约束且超时被报成队列满；`begin_write_transaction` 仅凭表结构认定捕获库；非 Unix 平台改名后不刷目录却写“持久入队”；T-1 全量未跑就标完成 | 无 P2 | Codex exec，只读，2026-11-17。前滚：追加在持有 `libra.db` 写锁时提交目录，再提交 ref（取代补偿 CAS）；`publish` 接收 hook 期限，锁等待取期限与 30 秒的较小者，超时报新稳定码 `LBR-AGENT-049`（`capture_spool_lock_wait_ends_at_the_hook_deadline`）；捕获库角色改由文件路径 `<storage>/private/capture.db` 判定，表结构仍须吻合；文档把耐久承诺收窄为 Unix，并写明 Windows 的改名不刷盘；T-1 全量 nextest 已运行，结果见实施证据 |
 | R12 | R11 修复 | FAIL | P0=0。R11 五项中锁序、连接解析、`LBR-AGENT-049`、守卫与 oracle 修订被确认。新 P1 四项：重试命中已存在文件时不刷 `ready/` 目录就报成功；第二次取锁超时遗留 tmp 文件；目录写锁的获取不受捕获期限约束；ref 提交失败后留下的“目录有行、ref 无”状态 doctor 不报告 | P2 一项：注释仍写补偿 CAS | Codex exec，只读，2026-11-17。前滚：`AlreadyQueued` 两处都先刷 `ready/`；tmp 创建之后的任何失败都删掉本发布者的 tmp（`capture_spool_second_lock_timeout_removes_its_tmp_file`）；目录事务的取锁用捕获期限 `timeout_at`；提交顺序改为先 ref 后目录，残留窗口落在 doctor 已能自动修复的 `missing_catalog_row`；注释已更正 |
 | R13 | R12 修复 | PASS | P0=0，P1=0。R12 四项确认关闭；已核对 doctor class 2（`missing_catalog_row`）能识别并用 `--repair` 重建 ref 可达而目录缺行的检查点，cleanup-pending marker 不会挡住该修复 | P2 一项：验证清单勾选了带 `^` 锚点的原命令，实际证据来自不带锚点的命令。已改为不勾原命令，另列实际执行的命令 | Codex exec，只读，2026-11-17 |
+| F1 | FIX-CQ-02 | FAIL | P0=0。代码路由被确认（目录走目录连接，ref 与对象索引留在 `libra.db`，冻结对两个库都做检测，restore 先仓库后目录取锁）。P1：守卫修正后未重跑双环境全量 | P2：状态行写成“已独立提交” | Codex exec，只读，2026-11-17。已重跑全量并改写状态行 |
+| F2 | FIX-CQ-02 复核 | PASS | P0=0，P1=0。全量 11841 项全部通过（1 项无关 flaky 重试通过），状态行不再声称已提交 | 无 P2 | Codex exec，只读，2026-11-17 |
 
 ## 修复登记
 
@@ -857,7 +860,7 @@ Result 只允许 `PASS` 或 `FAIL`。R7 是计划文本的当前结论。R9 是 
 |---|---|---|---|---|
 | FIX-CQ-01 | CQ-02、CQ-03、CQ-07 拆库后的回归。`2c4bab3` 上 CI `compat-offline-core` 166 项失败，主要是 `no such table`：`agent_*` 在 `capture.db`，`reference`/`metadata_kv`/`config_kv`/`workspace_record` 在 `libra.db` | 随 CQ-05 前滚：marker 事务改用独立仓库连接；导出任务与覆盖门在 `capture.db` 上取写锁；`metadata_kv`、仓库身份、工作区租约、HEAD/traces 引用、提交锚定从捕获连接改走配对的 `libra.db`（由连接自身文件路径推得，不回退当前目录；配对结果仍缺 `config_kv` 时视为同一个库，不再无限递归）；`agent clean` 修剪与会话擦除拆成仓库事务加目录事务；GC 从 `capture.db` 读取目录对象根；目录 SQL 里的 `workspace_record` 租约子查询在 `capture.db` 上改为调用方先行校验。Codex R10–R12 后补：拆库后的检查点追加先在 `libra.db` 写事务里做 ref CAS 与对象索引；在仍持有该写锁时打开 `capture.db` 目录事务（取锁受捕获期限约束），写入并授权目录，再对仓库事务做最终授权（期限与工作区租约），然后提交 ref，最后提交目录。所有拆库写者都先取仓库锁再取目录锁，并发追加因此串行；提交之前的任何失败都回滚两边，ref 不动，失败的追加照常交给 cleanup-pending marker。剩下的窗口只有两次提交之间的 I/O 错误或崩溃：ref 已含该检查点而目录行缺失，这正是 doctor 既有的 `missing_catalog_row`（ref 可达、目录无行），`libra agent doctor --repair` 会从 ref 重建该行；只读的 `metadata_kv` 检查改用配对库的 deferred 事务，不再在 marker 注册已持有 `libra.db` 写锁时再抢写锁（这是 doctor 手动重放 2 秒期限耗尽的原因）；doctor 的 Claude/Codex 遗留修订修复写 `capture.db`；不变检查点验证从配对库读 traces ref；Hermes 实时导出的租约在 `capture.db`，信任行从配对库复核；hook 未带期限时重放也不带期限（带期限会省略子代理来源）；测试夹具在装故障触发器前先让 `capture.db` 生成 | 关闭 | 本地 17 个捕获相关 target 中原 13 项余项全部通过；唯一剩下的 `hermes_observe_checkpoint_exports_nonempty_reasoning` 失败在 `cloud sync` 断言，归 FIX-CQ-02 |
 
-| FIX-CQ-02 | CQ-03 拆库后的回归：`libra cloud sync` / `cloud restore` 仍只用 `libra.db`，而 detach 后该库没有 `agent_*` 表。sync 把仓库当作没有捕获目录：既不镜像 agent capture，也不执行本地 `agent_kind` 允许名单拒绝（`hermes_observe_checkpoint_exports_nonempty_reasoning` 的 `cloud sync` 断言因此失败，先报缺云配置）；restore 的目录写入与修剪栅栏同样落在错误的库 | 同步与恢复对目录表改走 `capture.db`，对象索引、引用与 `metadata_kv` 留在 `libra.db`；两个库不 ATTACH | 未开始 | 作为独立提交在 CQ-06 之前完成并经 Codex PASS；该 Hermes 用例与云相关单测通过 |
+| FIX-CQ-02 | CQ-03 拆库后的回归：`libra cloud sync` / `cloud restore` 仍只用 `libra.db`，而 detach 后该库没有 `agent_*` 表。sync 把仓库当作没有捕获目录：既不镜像 agent capture，也不执行本地 `agent_kind` 允许名单拒绝（`hermes_observe_checkpoint_exports_nonempty_reasoning` 的 `cloud sync` 断言因此失败，先报缺云配置）；restore 的目录写入与修剪栅栏同样落在错误的库 | 2026-11-17 20:52:53 UTC 前滚：新增 `cloud::agent_capture::local_capture_catalog`——仍含 `agent_session` 的库（合并库、测试夹具、本版本尚未打开过的仓库）就是它自己的目录，否则经 `capture::store::open` 打开 `capture.db`（缺失时创建，并搬走拆库前的目录）。sync 的本地 `agent_kind` 检查、快照冻结、durability 复查、`agent_capture_cloud_base` 读写、Claude 遗留修订、restore 的 schema 探测、修剪栅栏、导入墓碑与目录写入都改走该连接；traces head 经 `reference_peer` 从 `libra.db` 读取，`object_index` 留在 `libra.db`。快照冻结对 `capture.db` 连接同样做 TEMP 标记与 `data_version` 校验，任一库在冻结期间有提交就重试。restore 先取 `libra.db` 写锁再取 `capture.db` 写锁，先提交 ref 再提交目录（与追加者同序；目录 COMMIT 失败的残留是 doctor 可修复的 `missing_catalog_row`） | 关闭 | `split_catalog_is_frozen_from_the_capture_database` 与 `cloud_restore_writes_a_split_catalog_into_the_capture_database` 覆盖拆库仓库；含 `cloud` 的用例、`agent_cloud_tombstone_test`、`cloud_storage_backup_test` 与该 Hermes 用例共 209 项全部通过 |
 
 已知边角：`agent session list` 与消费者首次创建 `capture.db` 同时发生时，读者可能得到 `LBR-IO-001`。本轮未复现；重启条件是再次复现，承接在 FIX-CQ-02 之后的收口全量。
 
@@ -934,6 +937,10 @@ Clippy `--all-targets --all-features -D warnings` 先指出 CQ-01 留下的两�
 开发中发现一个只影响测试的泄漏：仓库连接配对曾回退到当前目录，进程内单测从仓库根运行时把一行测试会话（`claude__S-bare`）写进了本开发仓库的 `.libra/private/capture.db`。已去掉该回退（未识别的库文件现在报错），并删掉这一行；备份留在本机草稿目录，没有其它行受影响。
 
 版本面从 `0.30.208` 改为 `0.30.209`：`Cargo.toml`、`install.sh` 的 `DEFAULT_VERSION`、`install.ps1` 的 `$DefaultVersion`；`Cargo.lock` 由 `cargo update -p libra --offline` 刷新。
+
+### FIX-CQ-02（2026-11-17 20:52:53 UTC）
+
+改动只在 `src/command/cloud.rs`、`src/command/cloud/{agent_capture,sync,snapshot,restore}.rs` 与 `tests/compat/agent_architecture_guard.rs`（RG-05 摘要）。用户可见行为不变（`cloud` 文档不提库文件名，未改）；没有新稳定码、新 `--test` target 或版本变化。本地验证：`cargo nextest run -E 'test(/cloud/) | test(=hermes_observe_checkpoint_exports_nonempty_reasoning) | binary(agent_cloud_tombstone_test) | binary(cloud_storage_backup_test)'` 209 项全部通过，其中两项新单测覆盖拆库仓库的冻结与恢复。全量 `source .env.test && source .env.live-test && cargo nextest run --all --no-fail-fast --retries 2`：11841 项，11840 通过，唯一失败是 `compat_agent_architecture_guard::private_capture_identity_has_no_source_opener` 对 `cloud/agent_capture.rs` 序列化区的 RG-05 摘要固定——本修复改了该区，已在守卫中注明 FIX-CQ-02 范围并更新摘要，该 target 重跑 65/65 通过。CQ-05 起一直失败的 `hermes_observe_checkpoint_exports_nonempty_reasoning` 在此全量中通过。守卫修正后按 Codex 要求重跑同一双环境全量：11841 项全部通过，51 跳过；其中 `command_test::command::init_from_git_test::init_from_git_rejects_blake3_object_format` 首次失败、重试通过（nextest 记为 flaky），与本修复无关。
 
 ## 完成判据
 

@@ -339,6 +339,47 @@ mod tests {
         conn.close().await.unwrap();
     }
 
+    /// plan-20261116 FIX-CQ-02: once the catalog moved to `capture.db`,
+    /// `libra.db` has no `agent_*` tables. Cloud sync still freezes the
+    /// catalog, reading it from `capture.db`, and reads the traces head from
+    /// `libra.db`.
+    #[tokio::test]
+    #[serial_test::serial(cwd, env)]
+    async fn split_catalog_is_frozen_from_the_capture_database() {
+        let _env = crate::utils::test::ConfigDbFixture::new().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        crate::utils::test::setup_with_new_libra_in(repo.path()).await;
+        let _cwd = crate::utils::test::ChangeDirGuard::new(repo.path());
+        let storage = repo.path().join(".libra");
+        let capture = crate::internal::ai::capture::store::open(
+            &storage,
+            crate::internal::ai::capture::store::COMMAND_BUSY_TIMEOUT,
+        )
+        .await
+        .unwrap();
+        capture
+            .execute_unprepared(
+                "INSERT INTO agent_session (session_id, agent_kind, provider_session_id, state, working_dir, started_at, last_event_at, metadata_json, redaction_report) VALUES ('split-session', 'claude_code', 'split-provider', 'stopped', '/tmp/split-fixture', 1, 2, '{}', '{}')",
+            )
+            .await
+            .unwrap();
+        let repository = crate::internal::db::get_db_conn_instance().await;
+        assert!(
+            !crate::internal::db::connection_has_table(&repository, "agent_session")
+                .await
+                .unwrap(),
+            "the fixture must be a split repository"
+        );
+        let catalog = local_capture_catalog(&repository).await.unwrap();
+        match freeze_agent_capture(&catalog, None).await {
+            FrozenAgentCapture::Catalog(frozen) => {
+                assert_eq!(frozen.sessions.len(), 1);
+                assert_eq!(frozen.sessions[0].session_id, "split-session");
+            }
+            _ => panic!("the split catalog must be frozen from capture.db"),
+        }
+    }
+
     #[tokio::test]
     #[serial_test::serial(cwd, env)]
     async fn remote_missing_artifact_fails_sync() {
@@ -562,6 +603,35 @@ pub(super) const AGENT_CAPTURE_CLOUD_DEADLINE: std::time::Duration =
 /// can include SQL fragments or decoded values in their Display output, and
 /// a restored catalog may contain remote-controlled capture identifiers.
 /// Keep that material out of CloudError and tracing alike.
+/// The capture catalog paired with a repository connection.
+///
+/// After the catalog moved to `.libra/private/capture.db`, `libra.db` no
+/// longer holds the `agent_*` tables. A connection that still holds
+/// `agent_session` (a combined database, such as a test fixture or a
+/// repository this release has not opened yet) is its own catalog. Otherwise
+/// the repository's `capture.db` is opened through the capture store, which
+/// creates it (and moves a pre-split catalog) when it is missing. The two
+/// files are never attached.
+pub(super) async fn local_capture_catalog(
+    conn: &sea_orm::DatabaseConnection,
+) -> CloudResult<sea_orm::DatabaseConnection> {
+    if crate::internal::db::connection_has_table(conn, "agent_session")
+        .await
+        .map_err(|error| local_agent_capture_failure("probe local capture catalog", error))?
+    {
+        return Ok(conn.clone());
+    }
+    let storage = crate::internal::db::connection_storage_root(conn)
+        .await
+        .map_err(|error| local_agent_capture_failure("locate local capture catalog", error))?;
+    crate::internal::ai::capture::store::open(
+        &storage,
+        crate::internal::ai::capture::store::COMMAND_BUSY_TIMEOUT,
+    )
+    .await
+    .map_err(|error| local_agent_capture_failure("open local capture catalog", error))
+}
+
 pub(super) fn local_agent_capture_failure(
     operation: &'static str,
     _error: impl std::fmt::Display,
@@ -685,7 +755,10 @@ pub(super) struct AgentCaptureSnapshot {
 pub(super) async fn validated_claude_legacy_reasoning_mirror_refs(
     db_conn: &sea_orm::DatabaseConnection,
 ) -> Result<Vec<ClaudeLegacyReasoningMirrorRef>, String> {
-    let rows = load_claude_legacy_revision_rows(db_conn)
+    let catalog_conn = local_capture_catalog(db_conn)
+        .await
+        .map_err(cloud_error_text)?;
+    let rows = load_claude_legacy_revision_rows(&catalog_conn)
         .await
         .map_err(cloud_error_text)?;
     validate_claude_legacy_revision_mirror(&rows).map_err(cloud_error_text)
@@ -1585,19 +1658,26 @@ pub(super) async fn read_agent_capture_catalog<C: ConnectionTrait>(
     } else {
         Vec::new()
     };
-    let traces_head = txn
-        .query_one_raw(Statement::from_sql_and_values(
-            backend,
-            "SELECT `commit` FROM reference
-             WHERE name = ? AND kind = 'Branch' AND remote IS NULL LIMIT 1",
-            [crate::internal::branch::TRACES_BRANCH.into()],
-        ))
+    // The traces ref is in `libra.db`; a `capture.db` catalog reads it from
+    // its paired repository database.
+    let head_statement = Statement::from_sql_and_values(
+        backend,
+        "SELECT `commit` FROM reference
+         WHERE name = ? AND kind = 'Branch' AND remote IS NULL LIMIT 1",
+        [crate::internal::branch::TRACES_BRANCH.into()],
+    );
+    let traces_head = match crate::internal::db::reference_peer(txn)
         .await
-        .map_err(|error| local_agent_capture_failure("read local traces snapshot head", error))?
-        .map(|row| row.try_get_by::<Option<String>, _>("commit"))
-        .transpose()
-        .map_err(|error| local_agent_capture_failure("decode local traces snapshot head", error))?
-        .flatten();
+        .map_err(|error| local_agent_capture_failure("open local traces snapshot head", error))?
+    {
+        Some(repository) => repository.query_one_raw(head_statement).await,
+        None => txn.query_one_raw(head_statement).await,
+    }
+    .map_err(|error| local_agent_capture_failure("read local traces snapshot head", error))?
+    .map(|row| row.try_get_by::<Option<String>, _>("commit"))
+    .transpose()
+    .map_err(|error| local_agent_capture_failure("decode local traces snapshot head", error))?
+    .flatten();
 
     let import_tombstone_present = txn
         .query_one_raw(Statement::from_string(
@@ -1786,7 +1866,8 @@ async fn load_agent_capture_catalog_snapshot(
     _repo_id: &str,
     subagent_content_present: bool,
 ) -> CloudResult<AgentCaptureSnapshot> {
-    let catalog = read_agent_capture_catalog(db_conn, subagent_content_present, None).await?;
+    let catalog_conn = local_capture_catalog(db_conn).await?;
+    let catalog = read_agent_capture_catalog(&catalog_conn, subagent_content_present, None).await?;
     agent_capture_snapshot_from_catalog(&catalog)
 }
 
@@ -1813,7 +1894,8 @@ pub(super) async fn load_agent_capture_snapshot(
     repo_id: &str,
     subagent_content_present: bool,
 ) -> CloudResult<AgentCaptureSnapshot> {
-    let catalog = read_agent_capture_catalog(db_conn, subagent_content_present, None).await?;
+    let catalog_conn = local_capture_catalog(db_conn).await?;
+    let catalog = read_agent_capture_catalog(&catalog_conn, subagent_content_present, None).await?;
     let snapshot = verify_frozen_agent_capture(&catalog, db_conn, repo_id).await?;
     recheck_frozen_agent_capture(&catalog, db_conn, repo_id, None).await?;
     Ok(snapshot)
@@ -1951,12 +2033,14 @@ pub(super) async fn recheck_frozen_agent_capture(
     };
     // The schema probe and the re-read share one window; a schema that no
     // longer matches the frozen one is a change.
-    let current = super::snapshot::read_in_one_window(db_conn, || async move {
-        let (session_present, subagent_present) = probe_agent_capture_schema(db_conn).await?;
+    let catalog_conn = local_capture_catalog(db_conn).await?;
+    let catalog_conn = &catalog_conn;
+    let current = super::snapshot::read_in_one_window(catalog_conn, || async move {
+        let (session_present, subagent_present) = probe_agent_capture_schema(catalog_conn).await?;
         if !session_present || subagent_present != catalog.subagent_content_present {
             return Ok(None);
         }
-        read_agent_capture_catalog(db_conn, subagent_present, after_page)
+        read_agent_capture_catalog(catalog_conn, subagent_present, after_page)
             .await
             .map(Some)
     })
@@ -3009,7 +3093,8 @@ pub(super) async fn sync_agent_capture_tables(
     repo_id: &str,
     progress: &dyn CloudSyncProgress,
 ) -> CloudResult<AgentCaptureSyncOutcome> {
-    let frozen = freeze_agent_capture(db_conn, None).await;
+    let catalog_conn = local_capture_catalog(db_conn).await?;
+    let frozen = freeze_agent_capture(&catalog_conn, None).await;
     sync_frozen_agent_capture_tables(db_conn, d1_client, r2_storage, repo_id, progress, &frozen)
         .await
 }
@@ -3100,7 +3185,8 @@ async fn sync_agent_capture_tables_inner(
         .get_agent_capture_generation(repo_id)
         .await
         .map_err(|error| cloud_d1_failure("read agent-capture generation before sync", &error))?;
-    let local_cloud_base = load_local_agent_capture_cloud_base(db_conn, repo_id).await?;
+    let catalog_conn = local_capture_catalog(db_conn).await?;
+    let local_cloud_base = load_local_agent_capture_cloud_base(&catalog_conn, repo_id).await?;
     let remote_catalog = d1_client
         .list_agent_capture_restore_catalog_rows(
             repo_id,
@@ -3533,7 +3619,8 @@ async fn sync_agent_capture_tables_inner(
         .complete_agent_capture_generation(repo_id, &publish_token, object_index_generation)
         .await
         .map_err(|error| cloud_d1_failure("complete agent-capture generation", &error))?;
-    store_local_agent_capture_cloud_base(db_conn, repo_id, completed_generation.generation).await?;
+    store_local_agent_capture_cloud_base(&catalog_conn, repo_id, completed_generation.generation)
+        .await?;
     if withheld_legacy_rows > 0 {
         progress.on_agent_capture_warning(AGENT_CAPTURE_LEGACY_LOCAL_ONLY_MESSAGE);
     }
