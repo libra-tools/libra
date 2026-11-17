@@ -368,15 +368,13 @@ impl CaptureQueueDirCount {
             }
         };
         let mut count = Self::default();
-        let mut visited = 0_u64;
-        for entry in entries {
+        for (visited, entry) in entries.enumerate() {
             // The budget is entries visited, not regular files found, so a
             // directory full of other entries is still bounded.
-            if visited >= CAPTURE_QUEUE_COUNT_LIMIT {
+            if visited as u64 >= CAPTURE_QUEUE_COUNT_LIMIT {
                 count.at_least = true;
                 break;
             }
-            visited += 1;
             let Ok(entry) = entry else {
                 count.unavailable = true;
                 continue;
