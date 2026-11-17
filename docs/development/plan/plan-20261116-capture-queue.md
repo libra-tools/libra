@@ -2,7 +2,7 @@
 
 **模板版本:** `v2.16`。本计划不在 v2.16 具名 `code-only` 范围内，按普通发布合同执行：会推送的独立卡与家族发布点各自 `patch + 1` 并走 ER-08。
 
-**状态:** 实施中（收口全量待跑）。CQ-01、CQ-02、CQ-03、CQ-07、CQ-04、CQ-05、CQ-06 均为 `Lifecycle=done`、`Acceptance=complete`。FIX-CQ-01（CQ-02/CQ-03/CQ-07 拆库回归）随 CQ-05 关闭。FIX-CQ-02（cloud sync/restore 未读 `capture.db`）已修复，作为 CQ-06 之前的独立提交交付。用户要求每张卡在 `main` 上提交并推送，因此这次执行不遵守 REL-CQ-01 的“子卡不推送”。用户另要求捕获相关的新测试不进入 GitHub Actions，以本地运行为准：这些测试由 `LIBRA_RUN_CAPTURE_TESTS=1` 门控，CI 中打印 `skipped`。
+**状态:** 实施完成，收口全量通过；发布与网站同步待操作者执行（见「完成判据」）。CQ-01、CQ-02、CQ-03、CQ-07、CQ-04、CQ-05、CQ-06 均为 `Lifecycle=done`、`Acceptance=complete`。FIX-CQ-01（CQ-02/CQ-03/CQ-07 拆库回归）随 CQ-05 关闭。FIX-CQ-02（cloud sync/restore 未读 `capture.db`）已修复，作为 CQ-06 之前的独立提交交付。用户要求每张卡在 `main` 上提交并推送，因此这次执行不遵守 REL-CQ-01 的“子卡不推送”。用户另要求捕获相关的新测试不进入 GitHub Actions，以本地运行为准：这些测试由 `LIBRA_RUN_CAPTURE_TESTS=1` 门控，CI 中打印 `skipped`。
 
 ## 文档职责
 
@@ -950,17 +950,21 @@ Clippy `--all-targets --all-features -D warnings` 先指出 CQ-01 留下的两�
 
 本机验证：`source .env.test && cargo nextest run --test agent_doctor_repair_test capture_spool_doctor_` 3 项全部通过（计数与 JSON 无路径/内容、不等待也不动消费者锁、schema 过新与损坏文案）；`cargo nextest run --lib capture_spool_doctor_` 1 项通过（扫描按目录项计数的上限）；同时跑 `agent_doctor_repair_test` 全部、`compat_version_surface_sync`、`compat_error_codes_doc_sync` 共 50 项全部通过。新测试以 `LIBRA_RUN_CAPTURE_TESTS=1` 门控，不进 GitHub Actions。`cargo +nightly fmt --all --check` exit 0；`cargo clippy --all-targets --all-features -- -D warnings` exit 0；rustdoc 断链检查 exit 0。卡片 Full-suite trigger 为 `none`；计划收口全量随后运行。版本面 `0.30.209` → `0.30.210`（`Cargo.toml`、`install.sh`、`install.ps1`，`Cargo.lock` 经 `cargo update -p libra --offline`）。
 
+### 计划收口（2026-11-17 22:21:33 UTC）
+
+收口门在 `main` 最终代码（含 CQ-06 与其 clippy 前滚修复 `e247fab`）上运行：`cargo +nightly fmt --all --check` exit 0；`cargo clippy --all-targets --all-features -- -D warnings` exit 0；`source .env.test && source .env.live-test && cargo nextest run --all --no-fail-fast --retries 2` 11845 项全部通过，51 跳过，无 flaky。CQ-06 的提交 `b44367a` 曾带着一条 clippy `explicit_counter_loop` 推送（命令链未在 clippy 失败时停止），已由 `e247fab` 前滚修复并在本次收口复验。远端 `main` 的 CI 被其后提交的运行取代（Cancel superseded），以包含本计划全部提交的最新运行为准。
+
 ## 完成判据
 
 - [ ] 所有任务卡满足 `G-*`，粒度审计表与卡片一致。
-- [ ] CQ-01、CQ-02、CQ-03、CQ-07、CQ-04、CQ-05、CQ-06 均为 `Lifecycle=done` 且 `Acceptance=complete`。
-- [ ] 每张卡的 Verification 已运行并记在「实施证据汇总」。
-- [ ] 计划收口跑过 fmt、严格 clippy，以及 `source .env.test && source .env.live-test && cargo nextest run --all --no-fail-fast --retries 2`，并修复本次全量暴露的本计划缺陷。
-- [ ] 与本计划无关的既有失败有基线复现证据和 `FIX-*` 或 `DEFER-*`。
-- [ ] 命令文档、网站文档、兼容矩阵和错误码按各卡写集完成。
-- [ ] 每张卡的 `Rollback mode` 已验证，或记录了不可验证的原因。
-- [ ] Codex review 最终为 `PASS`，P0/P1 已关闭。
-- [ ] CQ-04、CQ-05、CQ-06 各自完成 patch、版本面、`gh` 发布与适用 D 组证据。
-- [ ] 修订历史覆盖成稿后的规范性变更。
-- [ ] 未新建证据文件或证据目录。
+- [x] CQ-01、CQ-02、CQ-03、CQ-07、CQ-04、CQ-05、CQ-06 均为 `Lifecycle=done` 且 `Acceptance=complete`。
+- [x] 每张卡的 Verification 已运行并记在「实施证据汇总」。
+- [x] 计划收口跑过 fmt、严格 clippy，以及 `source .env.test && source .env.live-test && cargo nextest run --all --no-fail-fast --retries 2`，并修复本次全量暴露的本计划缺陷。（11845/11845，见「计划收口」）
+- [x] 与本计划无关的既有失败有基线复现证据和 `FIX-*` 或 `DEFER-*`。（收口全量无失败；拆库引入的回归登记为 FIX-CQ-01/02 并已关闭）
+- [ ] 命令文档、网站文档、兼容矩阵和错误码按各卡写集完成。（仓库内文档、兼容矩阵与错误码已完成；`../libra-backend` 网站页已在 `cf` 本地修改，提交与推送待操作者执行）
+- [ ] 每张卡的 `Rollback mode` 已验证，或记录了不可验证的原因。（CQ-05 为 forward-only，无回滚可验；CQ-06 的 `revert` 只撤 doctor 诊断字段，未单独演练）
+- [x] Codex review 最终为 `PASS`，P0/P1 已关闭。（CQ-05 R13、FIX-CQ-02 F2、CQ-06 C1）
+- [ ] CQ-04、CQ-05、CQ-06 各自完成 patch、版本面、`gh` 发布与适用 D 组证据。（patch 与版本面完成：0.30.208/209/210；`v0.30.208` 已发布；`v0.30.209`、`v0.30.210` 的 `gh` 发布待操作者确认）
+- [x] 修订历史覆盖成稿后的规范性变更。
+- [x] 未新建证据文件或证据目录。
 - [ ] `plan-long.md` 日期索引已有本计划一行。
