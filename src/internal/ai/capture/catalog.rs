@@ -3002,6 +3002,26 @@ pub(crate) async fn resolve_pending_session_context(
     session_id: &str,
 ) -> Result<PendingSessionContext, CaptureCatalogError> {
     validate_catalog_text(session_id, MAX_SESSION_ID_BYTES)?;
+    // The session row is a catalog row. A repository transaction (on a
+    // split repository) reads it from the paired capture catalog.
+    if !crate::internal::db::connection_has_table(txn, "agent_session")
+        .await
+        .map_err(|_| CaptureCatalogError::Database)?
+    {
+        let storage = crate::internal::db::connection_storage_root(txn)
+            .await
+            .map_err(|_| CaptureCatalogError::Database)?;
+        let catalog = super::store::open_readonly(&storage, super::store::COMMAND_BUSY_TIMEOUT)
+            .await
+            .map_err(|_| CaptureCatalogError::Database)?;
+        let read = catalog
+            .begin()
+            .await
+            .map_err(|_| CaptureCatalogError::Database)?;
+        let result = Box::pin(resolve_pending_session_context(&read, scope, session_id)).await;
+        let _ = read.rollback().await;
+        return result;
+    }
     let repo = crate::internal::workspace::RepoIdentity::resolve(txn)
         .await
         .map_err(|_| CaptureCatalogError::Database)?;
@@ -7233,7 +7253,7 @@ async fn verify_artifact_registration_authority(
         } else {
             // Quarantine rows stay in the repository database. A capture
             // transaction cannot see them, and the two files are not attached.
-            let repo = crate::internal::db::open_cached_repository(&crate::utils::path::database())
+            let repo = crate::internal::db::open_paired_repository(txn)
                 .await
                 .map_err(|_| CaptureCatalogError::Database)?;
             repo.query_one_raw(Statement::from_sql_and_values(
@@ -7276,10 +7296,23 @@ async fn verify_artifact_registration_authority(
     {
         return Err(CaptureCatalogError::InvalidRequest);
     }
-    let marker = txn.query_one_raw(Statement::from_sql_and_values(txn.get_database_backend(),
+    // Writer markers are `metadata_kv` rows in `libra.db`.
+    let marker_statement = Statement::from_sql_and_values(
+        txn.get_database_backend(),
         "SELECT 1 FROM metadata_kv WHERE scope='agent_traces_inflight' AND target=? AND key=? LIMIT 1",
-        [fence.session.session_id.clone().into(), checkpoint_id.into()],
-    )).await.map_err(|_| CaptureCatalogError::Database)?;
+        [
+            fence.session.session_id.clone().into(),
+            checkpoint_id.into(),
+        ],
+    );
+    let marker = match crate::internal::metadata::repository_metadata_peer(txn)
+        .await
+        .map_err(|_| CaptureCatalogError::Database)?
+    {
+        Some(repository) => repository.query_one_raw(marker_statement).await,
+        None => txn.query_one_raw(marker_statement).await,
+    }
+    .map_err(|_| CaptureCatalogError::Database)?;
     if marker.is_some() {
         return Err(CaptureCatalogError::InvalidRequest);
     }

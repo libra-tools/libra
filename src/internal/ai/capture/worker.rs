@@ -104,6 +104,13 @@ pub(crate) async fn hold_for_test() {
 /// Acquire the per-repository worker lock. `None` means another worker owns
 /// it. The descriptor is the lock guard; OS process teardown releases it.
 pub(crate) fn try_lock(storage: &Path) -> io::Result<Option<File>> {
+    try_lock_named(storage, LOCK_NAME)
+}
+
+/// Acquire a repository-private advisory lock with the recovery worker's
+/// ownership checks and a caller-chosen file name. The capture spool consumer
+/// uses a different name so it cannot steal this worker's lock.
+pub(crate) fn try_lock_named(storage: &Path, lock_name: &str) -> io::Result<Option<File>> {
     #[cfg(windows)]
     {
         use std::ffi::OsStr;
@@ -111,7 +118,7 @@ pub(crate) fn try_lock(storage: &Path) -> io::Result<Option<File>> {
         use crate::utils::windows_fs;
         let storage = windows_fs::open_tree(storage)?;
         let private = windows_fs::create_directory_at(&storage, OsStr::new("private"), true)?;
-        let name = OsStr::new(LOCK_NAME);
+        let name = OsStr::new(lock_name);
         let file = windows_fs::open_private_lock_at(&private, name)?;
         windows_fs::validate_private(&file)?;
         if windows_fs::information(&file)?.nNumberOfLinks != 1 {
@@ -148,7 +155,7 @@ pub(crate) fn try_lock(storage: &Path) -> io::Result<Option<File>> {
             }
         }
 
-        let path = private.join(LOCK_NAME);
+        let path = private.join(lock_name);
         if let Ok(metadata) = fs::symlink_metadata(&path)
             && (metadata.file_type().is_symlink() || !metadata.file_type().is_file())
         {

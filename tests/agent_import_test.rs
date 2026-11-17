@@ -66,8 +66,63 @@ impl ImportRepo {
             .current_dir(&self.repo)
             .env("HOME", &self.home)
             .env("LIBRA_TEST_HOME", &self.home)
+            // Hooks queue without their detached consumer (debug-build
+            // seam); `finish_hook` runs the consumer the test observes.
+            .env("LIBRA_TEST", "1")
+            .env("LIBRA_TEST_CAPTURE_SPOOL_NO_CONSUMER", "1")
             .env_remove("CODEX_HOME");
         command
+    }
+
+    /// A realtime hook only queues its event. Run one consumer and report
+    /// the hook's failure or else the consumer's status with both outputs;
+    /// a delivery the consumer could not store is dropped, as a failed hook
+    /// delivery was before the queue.
+    fn finish_hook(&self, queued: Output) -> Output {
+        if !queued.status.success() {
+            return queued;
+        }
+        let consumer = self.run(&["__capture-spool-drain"]);
+        if !consumer.status.success()
+            && let Ok(entries) =
+                std::fs::read_dir(self.repo.join(".libra/private/capture-spool/ready"))
+        {
+            for entry in entries {
+                std::fs::remove_file(entry.expect("ready entry").path())
+                    .expect("drop an abandoned delivery");
+            }
+        }
+        let mut stdout = queued.stdout;
+        stdout.extend(consumer.stdout);
+        let mut stderr = queued.stderr;
+        stderr.extend(consumer.stderr);
+        Output {
+            status: consumer.status,
+            stdout,
+            stderr,
+        }
+    }
+
+    /// The database a raw statement belongs to: catalog (`agent_*`) tables
+    /// are in `capture.db` once the capture store opens, the rest in
+    /// `libra.db`.
+    /// Catalog tables live in `capture.db` once the capture store opens.
+    fn catalog_path(&self) -> std::path::PathBuf {
+        let capture = self.repo.join(".libra/private/capture.db");
+        if capture.is_file() {
+            capture
+        } else {
+            self.repo.join(".libra/libra.db")
+        }
+    }
+
+    fn path_for_sql(&self, sql: &str) -> std::path::PathBuf {
+        let capture = self.repo.join(".libra/private/capture.db");
+        if sql.contains("agent_") && !sql.contains("metadata_kv") && capture.is_file() {
+            capture
+        } else {
+            self.repo.join(".libra/libra.db")
+        }
     }
 
     fn run(&self, args: &[&str]) -> Output {
@@ -105,7 +160,7 @@ impl ImportRepo {
             .expect("hook stdin is piped")
             .write_all(envelope.as_bytes())
             .expect("write hook envelope");
-        child.wait_with_output().expect("wait for hook writer")
+        self.finish_hook(child.wait_with_output().expect("wait for hook writer"))
     }
 
     fn transcript_path(&self, session_id: &str) -> PathBuf {
@@ -191,10 +246,7 @@ impl ImportRepo {
     }
 
     async fn scalar(&self, sql: &str) -> i64 {
-        let url = format!(
-            "sqlite://{}?mode=ro",
-            self.repo.join(".libra/libra.db").display()
-        );
+        let url = format!("sqlite://{}?mode=ro", self.path_for_sql(sql).display());
         let conn = Database::connect(url).await.expect("open repo db");
         conn.query_one_raw(Statement::from_string(
             conn.get_database_backend(),
@@ -208,10 +260,7 @@ impl ImportRepo {
     }
 
     async fn text_rows(&self, sql: &str, column: &str) -> Vec<String> {
-        let url = format!(
-            "sqlite://{}?mode=ro",
-            self.repo.join(".libra/libra.db").display()
-        );
+        let url = format!("sqlite://{}?mode=ro", self.path_for_sql(sql).display());
         let conn = Database::connect(url).await.expect("open repo db");
         conn.query_all_raw(Statement::from_string(
             conn.get_database_backend(),
@@ -486,7 +535,7 @@ async fn reasoning_private_helper_old_control_preserves_pending_artifact_evidenc
             .expect("hook stdin")
             .write_all(envelope.as_bytes())
             .expect("write hook envelope");
-        child.wait_with_output().expect("wait for real hook")
+        fixture.finish_hook(child.wait_with_output().expect("wait for real hook"))
     };
     let start = run_hook("SessionStart", "session-start", false);
     assert!(
@@ -996,7 +1045,7 @@ async fn import_uses_capture_foundation_services() {
 
     let db = Database::connect(format!(
         "sqlite://{}?mode=ro",
-        fixture.repo.join(".libra/libra.db").display()
+        fixture.catalog_path().display()
     ))
     .await
     .expect("open capture-foundation db");
@@ -1197,12 +1246,9 @@ async fn live_and_import_snapshot_hashes_match() {
 
     // Phase 2: remove the live evidence (checkpoint, catalog, coverage) and
     // import the same bytes again so the import writes its own tree.
-    let conn = Database::connect(format!(
-        "sqlite://{}",
-        fixture.repo.join(".libra/libra.db").display()
-    ))
-    .await
-    .expect("open writable repo db");
+    let conn = Database::connect(format!("sqlite://{}", fixture.catalog_path().display()))
+        .await
+        .expect("open writable repo db");
     let libra_dir = fixture.repo.join(".libra");
     let history = HistoryManager::new_with_ref(
         Arc::new(ClientStorage::try_init(libra_dir.join("objects")).expect("storage")),
@@ -1619,7 +1665,7 @@ async fn agent_import_same_digest_terminal_upgrade_writes_complete_schema_valid_
 
     let db = Database::connect(format!(
         "sqlite://{}?mode=ro",
-        fixture.repo.join(".libra/libra.db").display()
+        fixture.catalog_path().display()
     ))
     .await
     .expect("open result db");
@@ -1821,7 +1867,7 @@ async fn agent_import_preserves_three_turn_checkpoint_and_lifecycle_chronology()
 
     let db = Database::connect(format!(
         "sqlite://{}?mode=ro",
-        fixture.repo.join(".libra/libra.db").display()
+        fixture.catalog_path().display()
     ))
     .await
     .expect("open chronology db");
@@ -1948,7 +1994,7 @@ async fn agent_import_normalizes_same_second_turns_in_public_checkpoint_order() 
 
     let db = Database::connect(format!(
         "sqlite://{}?mode=ro",
-        fixture.repo.join(".libra/libra.db").display()
+        fixture.catalog_path().display()
     ))
     .await
     .expect("open same-second chronology db");
@@ -2406,7 +2452,7 @@ async fn agent_import_codex_malformed_arguments_upgrade_without_conflict() {
     );
     let db = Database::connect(format!(
         "sqlite://{}?mode=ro",
-        fixture.repo.join(".libra/libra.db").display()
+        fixture.catalog_path().display()
     ))
     .await
     .expect("open result db");
@@ -2442,10 +2488,7 @@ async fn agent_import_reuses_same_repository_live_session_from_subdirectory() {
     let subdir = subdir.canonicalize().expect("canonical subdir");
     let transcript = fixture.write_discoverable_transcript_for_cwd("subdir123", &subdir);
     let repo_id = fixture.repo_id().await;
-    let db_url = format!(
-        "sqlite://{}",
-        fixture.repo.join(".libra/libra.db").display()
-    );
+    let db_url = format!("sqlite://{}", fixture.catalog_path().display());
     let conn = Database::connect(db_url).await.expect("open repo db");
     conn.execute_raw(Statement::from_sql_and_values(
         conn.get_database_backend(),
@@ -2672,10 +2715,7 @@ async fn agent_import_preserves_newer_stopped_live_session_lifecycle() {
     let newer_event_at = 9_999_999_999_000_i64;
     let newer_stopped_at = 9_999_999_999_500_i64;
     let repo_id = fixture.repo_id().await;
-    let db_url = format!(
-        "sqlite://{}",
-        fixture.repo.join(".libra/libra.db").display()
-    );
+    let db_url = format!("sqlite://{}", fixture.catalog_path().display());
     let conn = Database::connect(db_url).await.expect("open repo db");
     conn.execute_raw(Statement::from_sql_and_values(
         conn.get_database_backend(),
@@ -2724,7 +2764,7 @@ async fn agent_import_preserves_newer_stopped_live_session_lifecycle() {
 
     let conn = Database::connect(format!(
         "sqlite://{}?mode=ro",
-        fixture.repo.join(".libra/libra.db").display()
+        fixture.catalog_path().display()
     ))
     .await
     .expect("open result db");
@@ -2831,10 +2871,7 @@ async fn agent_import_tombstone_blocks_resurrection_until_audited_restore() {
         )
         .await;
 
-    let db_url = format!(
-        "sqlite://{}",
-        fixture.repo.join(".libra/libra.db").display()
-    );
+    let db_url = format!("sqlite://{}", fixture.catalog_path().display());
     let conn = Database::connect(db_url)
         .await
         .expect("open writable repo db");
@@ -2974,10 +3011,7 @@ async fn agent_import_tombstone_blocks_resurrection_until_audited_restore() {
 #[tokio::test]
 async fn agent_import_tombstone_update_clears_legacy_source_fingerprint() {
     let fixture = ImportRepo::init();
-    let db_url = format!(
-        "sqlite://{}",
-        fixture.repo.join(".libra/libra.db").display()
-    );
+    let db_url = format!("sqlite://{}", fixture.catalog_path().display());
     let conn = Database::connect(db_url).await.expect("open repo db");
     let legacy_source_fingerprint = "b".repeat(64);
     conn.execute_raw(Statement::from_sql_and_values(
@@ -3054,10 +3088,7 @@ async fn agent_import_tombstone_update_clears_legacy_source_fingerprint() {
 #[tokio::test]
 async fn agent_import_restore_refuses_while_erasure_is_unfinished() {
     let fixture = ImportRepo::init();
-    let db_url = format!(
-        "sqlite://{}",
-        fixture.repo.join(".libra/libra.db").display()
-    );
+    let db_url = format!("sqlite://{}", fixture.catalog_path().display());
     let conn = Database::connect(db_url).await.expect("open repo db");
     conn.execute_raw(Statement::from_string(
         conn.get_database_backend(),
@@ -4234,23 +4265,26 @@ async fn agent_import_marks_malformed_subagent_content_partial() {
             .await,
         1
     );
-    assert_eq!(
-        fixture
-            .scalar(
-                "SELECT COUNT(*) AS n FROM agent_checkpoint cp
-                 WHERE cp.scope = 'subagent'
-                   AND (
-                     NOT EXISTS (SELECT 1 FROM object_index oi WHERE oi.o_id = cp.traces_commit)
-                     OR NOT EXISTS (SELECT 1 FROM object_index oi WHERE oi.o_id = cp.tree_oid)
-                     OR NOT EXISTS (
-                         SELECT 1 FROM object_index oi WHERE oi.o_id = cp.metadata_blob_oid
-                     )
-                   )",
-            )
-            .await,
-        0,
-        "partial import must drain every durable checkpoint object-index write before error exit"
-    );
+    // Checkpoints are in capture.db and object_index rows in libra.db, so the
+    // check reads each side separately.
+    let subagent_oids = fixture
+        .text_rows(
+            "SELECT traces_commit || ' ' || tree_oid || ' ' || metadata_blob_oid AS oids
+             FROM agent_checkpoint WHERE scope = 'subagent'",
+            "oids",
+        )
+        .await;
+    for oid in subagent_oids.iter().flat_map(|row| row.split(' ')) {
+        assert_eq!(
+            fixture
+                .scalar(&format!(
+                    "SELECT COUNT(*) AS n FROM object_index WHERE o_id = '{oid}'"
+                ))
+                .await,
+            1,
+            "partial import must drain every durable checkpoint object-index write before error exit"
+        );
+    }
 }
 
 #[tokio::test]
@@ -4343,22 +4377,28 @@ async fn agent_import_marker_failure_is_fail_closed_and_preserves_existing_sessi
         "marker failure must happen before object construction"
     );
 
-    conn.execute_raw(Statement::from_sql_and_values(
-        conn.get_database_backend(),
-        "INSERT INTO agent_session (
+    // The first import opened the capture store: catalog rows now live in
+    // capture.db, while the marker trigger stays on libra.db's metadata_kv.
+    let catalog = Database::connect(format!("sqlite://{}", fixture.catalog_path().display()))
+        .await
+        .expect("open writable capture db");
+    catalog
+        .execute_raw(Statement::from_sql_and_values(
+            catalog.get_database_backend(),
+            "INSERT INTO agent_session (
             session_id, agent_kind, provider_session_id, state, working_dir,
             metadata_json, redaction_report, started_at, last_event_at,
             stopped_at, schema_version
          ) VALUES (?, 'claude_code', ?, 'active', ?, ?, '{}', 11, 22, NULL, 1)",
-        [
-            "claude__markerfail-existing".into(),
-            "markerfail-existing".into(),
-            fixture.repo.to_string_lossy().into_owned().into(),
-            serde_json::json!({"sentinel":"keep"}).to_string().into(),
-        ],
-    ))
-    .await
-    .expect("seed existing live session");
+            [
+                "claude__markerfail-existing".into(),
+                "markerfail-existing".into(),
+                fixture.repo.to_string_lossy().into_owned().into(),
+                serde_json::json!({"sentinel":"keep"}).to_string().into(),
+            ],
+        ))
+        .await
+        .expect("seed existing live session");
     let existing = fixture.write_transcript("markerfail-existing", &fixture.repo, true);
     let existing_output = fixture.run(&[
         "agent",
@@ -4371,9 +4411,9 @@ async fn agent_import_marker_failure_is_fail_closed_and_preserves_existing_sessi
         "--json",
     ]);
     assert!(!existing_output.status.success(), "marker failure passed");
-    let row = conn
+    let row = catalog
         .query_one_raw(Statement::from_string(
-            conn.get_database_backend(),
+            catalog.get_database_backend(),
             "SELECT state, working_dir, metadata_json, last_event_at, stopped_at
              FROM agent_session WHERE session_id = 'claude__markerfail-existing'"
                 .to_string(),
@@ -5413,7 +5453,7 @@ fn scalar(fixture: &ImportRepo, sql: &str) -> i64 {
 }
 
 fn scalar_text(fixture: &ImportRepo, sql: &str) -> String {
-    let db = fixture.repo.join(".libra/libra.db");
+    let db = fixture.path_for_sql(sql);
     let mut command = std::process::Command::new("python3");
     let output = command
         .arg("-c")
@@ -8551,10 +8591,11 @@ async fn pi_explicit_import_commits_the_session_first_and_retries_once() {
         PI10_SESSION_ID,
         &pi10_session(PI10_SESSION_ID, &fixture.repo),
     );
-    let db_url = format!(
-        "sqlite://{}",
-        fixture.repo.join(".libra/libra.db").display()
-    );
+    // Listing opens the capture store, which creates `capture.db`; the fault
+    // triggers below must be installed there, not on the pre-split copy.
+    let listed = fixture.run(&["agent", "checkpoint", "list", "--json"]);
+    assert!(listed.status.success(), "{}", describe(&listed));
+    let db_url = format!("sqlite://{}", fixture.catalog_path().display());
     let conn = Database::connect(db_url)
         .await
         .expect("open writable repo db");
@@ -8910,15 +8951,6 @@ async fn pi_explicit_import_recovers_after_the_process_is_killed() {
         parent = Some(answer);
     }
     let path = pi10_write(&fixture, PI10_SESSION_ID, &file.bytes());
-    let database = fixture.repo.join(".libra/libra.db");
-    let mut lock = SqliteConnection::connect_with(
-        &SqliteConnectOptions::new()
-            .filename(&database)
-            // The import may hold the writer lock for a while under load.
-            .busy_timeout(Duration::from_secs(60)),
-    )
-    .await
-    .expect("open the repository database");
     let path_text = path_arg(&path);
     let mut child = fixture
         .command()
@@ -8937,12 +8969,39 @@ async fn pi_explicit_import_recovers_after_the_process_is_killed() {
         .stderr(Stdio::null())
         .spawn()
         .expect("start the import");
+    // The catalog the import writes is `capture.db`, which the import itself
+    // creates on its first open.
+    let database = fixture.repo.join(".libra/private/capture.db");
     let started = Instant::now();
+    while !database.is_file() {
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "the import opened no capture catalog"
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    let mut lock = SqliteConnection::connect_with(
+        &SqliteConnectOptions::new()
+            .filename(&database)
+            // The import may hold the writer lock for a while under load.
+            .busy_timeout(Duration::from_secs(60)),
+    )
+    .await
+    .expect("open the capture database");
     loop {
-        let committed: i64 = sea_orm::sqlx::query_scalar("SELECT COUNT(*) FROM agent_checkpoint")
-            .fetch_one(&mut lock)
-            .await
-            .expect("count checkpoints");
+        let committed: i64 =
+            match sea_orm::sqlx::query_scalar("SELECT COUNT(*) FROM agent_checkpoint")
+                .fetch_one(&mut lock)
+                .await
+            {
+                Ok(committed) => committed,
+                // The catalog tables appear with the capture database's schema.
+                Err(_) if started.elapsed() < Duration::from_secs(60) => {
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                    continue;
+                }
+                Err(error) => panic!("count checkpoints: {error}"),
+            };
         if committed >= 1 {
             break;
         }
@@ -8975,25 +9034,38 @@ async fn pi_explicit_import_recovers_after_the_process_is_killed() {
         .execute(&mut lock)
         .await
         .expect("lapse the identity lease");
+    sea_orm::sqlx::query("COMMIT")
+        .execute(&mut lock)
+        .await
+        .expect("release the writer lock");
+    lock.close().await.expect("close the capture database");
+    // The barrier lease and the in-flight marker are `metadata_kv` rows in
+    // the repository database.
+    let mut repository = SqliteConnection::connect_with(
+        &SqliteConnectOptions::new()
+            .filename(fixture.repo.join(".libra/libra.db"))
+            .busy_timeout(Duration::from_secs(60)),
+    )
+    .await
+    .expect("open the repository database");
     sea_orm::sqlx::query(
         "UPDATE metadata_kv SET value = json_set(value, '$.lease_expires_at', 0)
          WHERE scope = 'agent_import_index_repair'",
     )
-    .execute(&mut lock)
+    .execute(&mut repository)
     .await
     .expect("lapse the index barrier lease");
     sea_orm::sqlx::query(
         "UPDATE metadata_kv SET value = json_set(value, '$.started_at_ms', 0)
          WHERE scope = 'agent_traces_inflight'",
     )
-    .execute(&mut lock)
+    .execute(&mut repository)
     .await
     .expect("lapse the in-flight marker");
-    sea_orm::sqlx::query("COMMIT")
-        .execute(&mut lock)
+    repository
+        .close()
         .await
-        .expect("release the writer lock");
-    lock.close().await.expect("close the repository database");
+        .expect("close the repository database");
 
     let retried = pi10_import(&fixture, &path, &["--yes", "--json"]);
     assert!(retried.status.success(), "{}", describe(&retried));

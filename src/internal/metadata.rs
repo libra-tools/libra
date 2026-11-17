@@ -932,6 +932,38 @@ fn truthy_fail_closed(value: &str) -> bool {
 }
 
 /// The single owner API for the `metadata_kv` table.
+/// `metadata_kv` stays in `libra.db`. Capture code paths may hold a
+/// connection to `.libra/private/capture.db`, which has the catalog but no
+/// `metadata_kv`. For such a connection this returns a fresh connection to
+/// the paired repository database (same storage); otherwise `None`. A
+/// fresh connection (not the cached one-connection pool) is used because a
+/// caller may already hold a write transaction on the cached handle. Writes
+/// through the peer commit separately: the two files are never attached.
+pub(crate) async fn repository_metadata_peer<C: ConnectionTrait>(
+    db: &C,
+) -> Result<Option<sea_orm::DatabaseConnection>> {
+    // Only the capture catalog qualifies: catalog tables and neither
+    // `metadata_kv` nor `config_kv`. A damaged repository database that
+    // lacks `metadata_kv` keeps failing on its own instead of pairing with
+    // itself.
+    if crate::internal::db::connection_has_table(db, "metadata_kv")
+        .await
+        .context("failed to inspect the metadata database")?
+        || crate::internal::db::connection_has_table(db, "config_kv")
+            .await
+            .context("failed to inspect the metadata database")?
+        || !crate::internal::db::connection_has_table(db, "agent_session")
+            .await
+            .context("failed to inspect the metadata database")?
+    {
+        return Ok(None);
+    }
+    let peer = crate::internal::db::open_paired_repository(db)
+        .await
+        .context("failed to open the repository database for capture metadata")?;
+    Ok(Some(peer))
+}
+
 pub struct MetadataKv;
 
 impl MetadataKv {
@@ -946,6 +978,12 @@ impl MetadataKv {
         limit: u64,
         value_cap: usize,
     ) -> Result<Vec<MetadataEntry>> {
+        if let Some(peer) = repository_metadata_peer(db).await? {
+            return Box::pin(Self::list_bounded_with_conn(
+                &peer, scopes, target, key_range, limit, value_cap,
+            ))
+            .await;
+        }
         anyhow::ensure!(
             !scopes.is_empty()
                 && scopes.len() <= 3
@@ -1010,6 +1048,9 @@ impl MetadataKv {
         target: &str,
         key: &str,
     ) -> Result<Option<MetadataEntry>> {
+        if let Some(peer) = repository_metadata_peer(db).await? {
+            return Box::pin(Self::get_with_conn(&peer, scope, target, key)).await;
+        }
         let row = metadata_kv::Entity::find()
             .filter(metadata_kv::Column::Scope.eq(scope.as_str()))
             .filter(metadata_kv::Column::Target.eq(target))
@@ -1041,6 +1082,12 @@ impl MetadataKv {
         value: &str,
         value_type: MetadataValueType,
     ) -> Result<Option<String>> {
+        if let Some(peer) = repository_metadata_peer(db).await? {
+            return Box::pin(Self::set_with_conn(
+                &peer, scope, target, key, value, value_type,
+            ))
+            .await;
+        }
         let previous = Self::get_with_conn(db, scope, target, key)
             .await?
             .map(|entry| entry.value);
@@ -1093,6 +1140,9 @@ impl MetadataKv {
         target: &str,
         key: &str,
     ) -> Result<bool> {
+        if let Some(peer) = repository_metadata_peer(db).await? {
+            return Box::pin(Self::unset_with_conn(&peer, scope, target, key)).await;
+        }
         let result = metadata_kv::Entity::delete_many()
             .filter(metadata_kv::Column::Scope.eq(scope.as_str()))
             .filter(metadata_kv::Column::Target.eq(target))
@@ -1117,6 +1167,9 @@ impl MetadataKv {
         target: &str,
         key_prefix: Option<&str>,
     ) -> Result<Vec<MetadataEntry>> {
+        if let Some(peer) = repository_metadata_peer(db).await? {
+            return Box::pin(Self::list_with_conn(&peer, scope, target, key_prefix)).await;
+        }
         let mut query = metadata_kv::Entity::find()
             .filter(metadata_kv::Column::Scope.eq(scope.as_str()))
             .filter(metadata_kv::Column::Target.eq(target));
@@ -1150,6 +1203,9 @@ impl MetadataKv {
         db: &C,
         scope: MetadataScope,
     ) -> Result<Vec<MetadataEntry>> {
+        if let Some(peer) = repository_metadata_peer(db).await? {
+            return Box::pin(Self::list_scope_with_conn(&peer, scope)).await;
+        }
         let rows = metadata_kv::Entity::find()
             .filter(metadata_kv::Column::Scope.eq(scope.as_str()))
             .order_by_asc(metadata_kv::Column::Target)
@@ -1167,6 +1223,9 @@ impl MetadataKv {
         scope: MetadataScope,
         target: &str,
     ) -> Result<u64> {
+        if let Some(peer) = repository_metadata_peer(db).await? {
+            return Box::pin(Self::delete_all_for_target_with_conn(&peer, scope, target)).await;
+        }
         let result = metadata_kv::Entity::delete_many()
             .filter(metadata_kv::Column::Scope.eq(scope.as_str()))
             .filter(metadata_kv::Column::Target.eq(target))
@@ -1186,6 +1245,12 @@ impl MetadataKv {
         old_target: &str,
         new_target: &str,
     ) -> Result<()> {
+        if let Some(peer) = repository_metadata_peer(db).await? {
+            return Box::pin(Self::rename_target_with_conn(
+                &peer, scope, old_target, new_target,
+            ))
+            .await;
+        }
         Self::delete_all_for_target_with_conn(db, scope, new_target).await?;
         metadata_kv::Entity::update_many()
             .col_expr(
@@ -1208,6 +1273,15 @@ impl MetadataKv {
         from_target: &str,
         to_target: &str,
     ) -> Result<()> {
+        if let Some(peer) = repository_metadata_peer(db).await? {
+            return Box::pin(Self::copy_target_with_conn(
+                &peer,
+                scope,
+                from_target,
+                to_target,
+            ))
+            .await;
+        }
         // Self-copy (`branch -C x x`) must be a no-op: clearing the
         // destination first would delete the source rows and then copy
         // nothing, silently losing the metadata.

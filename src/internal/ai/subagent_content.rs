@@ -4474,13 +4474,20 @@ async fn reserve_source_prepared(
         }
         let current_head =
             match await_subagent_precommit_read_until(Some(probe_deadline.monotonic()), async {
-                txn.query_one_raw(Statement::from_sql_and_values(
+                // The traces ref is in `libra.db`, not in the capture catalog.
+                let peer = crate::internal::db::reference_peer(&txn)
+                    .await
+                    .context("open the repository database for the subagent head recheck")?;
+                let statement = Statement::from_sql_and_values(
                     txn.get_database_backend(),
                     "SELECT `commit` FROM reference
                      WHERE name = ? AND kind = 'Branch' AND remote IS NULL LIMIT 1",
                     [crate::internal::branch::TRACES_BRANCH.into()],
-                ))
-                .await
+                );
+                match &peer {
+                    Some(repository) => repository.query_one_raw(statement).await,
+                    None => txn.query_one_raw(statement).await,
+                }
                 .context("recheck traces head for unchanged subagent content")
             })
             .await
@@ -5200,7 +5207,12 @@ async fn current_parent_commit(
     deadline: Option<Instant>,
 ) -> Result<Option<String>> {
     await_subagent_precommit_read_until(deadline, async {
-        match crate::internal::head::Head::current_commit_result_with_conn(conn).await {
+        // HEAD lives in `libra.db`; this catalog connection may be
+        // `capture.db`, which has no `reference` table.
+        let repository = crate::internal::db::repository_peer(conn)
+            .await
+            .context("open the repository database to resolve HEAD for subagent content")?;
+        match crate::internal::head::Head::current_commit_result_with_conn(&repository).await {
             Ok(commit) => Ok(commit.map(|hash| hash.to_string())),
             Err(crate::internal::branch::BranchStoreError::Corrupt { detail, .. })
                 if detail.contains("HEAD reference is missing") =>
@@ -6973,13 +6985,20 @@ async fn traces_head<C: ConnectionTrait>(
     deadline: Option<Instant>,
 ) -> Result<Option<String>> {
     await_subagent_precommit_read_until(deadline, async {
-        conn.query_one_raw(Statement::from_sql_and_values(
+        // The traces ref is in `libra.db`, not in the capture catalog.
+        let peer = crate::internal::db::reference_peer(conn)
+            .await
+            .context("open the repository database for the subagent durability proof")?;
+        let statement = Statement::from_sql_and_values(
             conn.get_database_backend(),
             "SELECT `commit` FROM reference
              WHERE name = ? AND kind = 'Branch' AND remote IS NULL LIMIT 1",
             [crate::internal::branch::TRACES_BRANCH.into()],
-        ))
-        .await
+        );
+        match &peer {
+            Some(repository) => repository.query_one_raw(statement).await,
+            None => conn.query_one_raw(statement).await,
+        }
         .context("read refs/libra/traces for subagent durability proof")
     })
     .await?

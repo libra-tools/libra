@@ -396,6 +396,9 @@ pub struct CaptureIngressCommand {
     /// Opaque identities linking a tool event to its call and parent call
     /// (PI-37); `None` when the provider names no link.
     tool_link: Option<CaptureToolLink>,
+    /// Redaction already applied before a spool replay was written. `None`
+    /// for a frame lowered in this process, which the runtime redacts.
+    replay_redaction: Option<crate::internal::ai::observed_agents::RedactionReport>,
 }
 
 /// Ingress either yields a canonical command or an explicit safe no-op for a
@@ -656,6 +659,42 @@ impl CaptureIngressCommand {
     /// must resolve their own request scope rather than reuse hook state.
     pub(crate) fn runtime_scope(&self) -> &CaptureRuntimeScope {
         &self.context.runtime_scope
+    }
+
+    /// Rebuild a command from parts that ingress already validated and the
+    /// hook already redacted. The hook's deadline belonged to the hook
+    /// process; the consumer supplies its own replay deadline.
+    pub(crate) fn from_replay_parts(
+        parts: CaptureIngressParts,
+        display_batch_limit: Option<u32>,
+        tool_link: Option<CaptureToolLink>,
+        redaction: crate::internal::ai::observed_agents::RedactionReport,
+        deadline: Option<CaptureDeadline>,
+    ) -> Self {
+        Self {
+            child_source_hints: parts.child_source_hints,
+            frame_bytes: parts.frame_bytes,
+            hook_command: parts.hook_command,
+            provider_kind: parts.provider_kind,
+            provider_source: parts.provider_source,
+            event_id: parts.event_id,
+            identity_scheme: parts.identity_scheme,
+            deadline,
+            dedup_key: parts.dedup_key,
+            context: parts.context,
+            event: parts.event,
+            display_batch_limit,
+            tool_link,
+            replay_redaction: Some(redaction),
+        }
+    }
+
+    /// The report of the redaction a spool producer already applied, if this
+    /// command was rebuilt from the capture queue.
+    pub(crate) fn replay_redaction(
+        &self,
+    ) -> Option<&crate::internal::ai::observed_agents::RedactionReport> {
+        self.replay_redaction.as_ref()
     }
 
     /// Consume the command at the trusted runtime boundary.
@@ -1014,6 +1053,7 @@ fn finish_capture_ingress(
             event,
             display_batch_limit,
             tool_link,
+            replay_redaction: None,
         },
     )))
 }

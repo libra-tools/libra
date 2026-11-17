@@ -61,6 +61,21 @@ async fn connect_repo_db(repo: &Path) -> DatabaseConnection {
         .expect("connect repository database")
 }
 
+/// Catalog tables live in `.libra/private/capture.db` once the capture store
+/// has opened (it copies rows seeded into `libra.db` before that).
+async fn connect_catalog_db(repo: &Path) -> DatabaseConnection {
+    let capture = repo.join(".libra").join("private").join("capture.db");
+    if !capture.is_file() {
+        return connect_repo_db(repo).await;
+    }
+    let mut opts = ConnectOptions::new(format!("sqlite://{}", capture.display()));
+    opts.sqlx_logging(false)
+        .connect_timeout(Duration::from_secs(5));
+    Database::connect(opts)
+        .await
+        .expect("connect capture database")
+}
+
 async fn seed_session(
     conn: &DatabaseConnection,
     session_id: &str,
@@ -222,7 +237,40 @@ async fn seed_checkpoint_commit(
     );
 }
 
+/// Storage root (`.libra`) of the database behind `conn`.
+async fn storage_of(conn: &DatabaseConnection) -> std::path::PathBuf {
+    let row = conn
+        .query_one_raw(Statement::from_string(
+            conn.get_database_backend(),
+            "SELECT file FROM pragma_database_list WHERE name = 'main'".to_string(),
+        ))
+        .await
+        .expect("query database file")
+        .expect("database file row");
+    let file: String = row.try_get_by("file").expect("decode database file");
+    let file = std::path::PathBuf::from(file);
+    let parent = file.parent().expect("database parent").to_path_buf();
+    if parent.file_name().and_then(|name| name.to_str()) == Some("private") {
+        parent.parent().expect("storage root").to_path_buf()
+    } else {
+        parent
+    }
+}
+
+/// The capture catalog paired with `conn` (or `libra.db` before it exists).
+async fn catalog_of(conn: &DatabaseConnection) -> DatabaseConnection {
+    let storage = storage_of(conn).await;
+    connect_catalog_db(storage.parent().expect("repository root")).await
+}
+
+/// The repository database paired with `conn`.
+async fn repository_of(conn: &DatabaseConnection) -> DatabaseConnection {
+    let storage = storage_of(conn).await;
+    connect_repo_db(storage.parent().expect("repository root")).await
+}
+
 async fn checkpoint_exists(conn: &DatabaseConnection, checkpoint_id: &str) -> bool {
+    let conn = &catalog_of(conn).await;
     let row = conn
         .query_one_raw(Statement::from_sql_and_values(
             conn.get_database_backend(),
@@ -237,6 +285,12 @@ async fn checkpoint_exists(conn: &DatabaseConnection, checkpoint_id: &str) -> bo
 }
 
 async fn scalar_count(conn: &DatabaseConnection, sql: &str) -> i64 {
+    let paired = if sql.contains("agent_") {
+        catalog_of(conn).await
+    } else {
+        repository_of(conn).await
+    };
+    let conn = &paired;
     conn.query_one_raw(Statement::from_string(
         conn.get_database_backend(),
         sql.to_string(),
@@ -252,6 +306,7 @@ async fn checkpoint_traces_commit(
     conn: &DatabaseConnection,
     checkpoint_id: &str,
 ) -> Option<String> {
+    let conn = &catalog_of(conn).await;
     conn.query_one_raw(Statement::from_sql_and_values(
         conn.get_database_backend(),
         "SELECT traces_commit FROM agent_checkpoint WHERE checkpoint_id = ? LIMIT 1",
@@ -266,6 +321,7 @@ async fn checkpoint_traces_commit(
 }
 
 async fn agent_traces_head(conn: &DatabaseConnection) -> Option<String> {
+    let conn = &repository_of(conn).await;
     conn.query_one_raw(Statement::from_sql_and_values(
         conn.get_database_backend(),
         "SELECT `commit` FROM reference WHERE name = ? AND kind = 'Branch' LIMIT 1",
@@ -341,7 +397,7 @@ async fn agent_clean_all_does_not_drop_active_session_checkpoints() {
 async fn agent_clean_claims_gc_reconciles_companion_import_state() {
     let repo = tempfile::tempdir().expect("repo tempdir");
     init_repo_via_cli(repo.path());
-    let conn = connect_repo_db(repo.path()).await;
+    let conn = connect_catalog_db(repo.path()).await;
     let old = chrono::Utc::now().timestamp() - 3 * 86_400;
     seed_session(&conn, "gc-coverage", "stopped", old, old, old).await;
     let traces_commit = seed_checkpoint_commit(
@@ -428,7 +484,7 @@ async fn agent_clean_claims_gc_reconciles_companion_import_state() {
         1,
         "dry-run must preview the identity made ownerless by its selected final checkpoint"
     );
-    let conn = connect_repo_db(repo.path()).await;
+    let conn = connect_catalog_db(repo.path()).await;
     assert_eq!(
         scalar_count(&conn, "SELECT COUNT(*) AS n FROM agent_coverage_claim").await,
         1
@@ -454,7 +510,7 @@ async fn agent_clean_claims_gc_reconciles_companion_import_state() {
         repo.path(),
     );
     assert_cli_success(&clean, "agent clean claims gc");
-    let conn = connect_repo_db(repo.path()).await;
+    let conn = connect_catalog_db(repo.path()).await;
     assert_eq!(
         scalar_count(&conn, "SELECT COUNT(*) AS n FROM agent_coverage_claim").await,
         0
@@ -483,7 +539,7 @@ async fn agent_clean_claims_gc_reconciles_companion_import_state() {
 async fn checkpoint_prune_rewinds_conflicted_claim_and_removes_stale_challenger() {
     let repo = tempfile::tempdir().expect("repo tempdir");
     init_repo_via_cli(repo.path());
-    let conn = connect_repo_db(repo.path()).await;
+    let conn = connect_catalog_db(repo.path()).await;
     seed_session(&conn, "gc-conflict-rewind", "stopped", 1, 2, 3).await;
     let first_commit = seed_checkpoint_commit(
         &conn,
@@ -641,7 +697,7 @@ async fn checkpoint_prune_rewinds_conflicted_claim_and_removes_stale_challenger(
 async fn agent_clean_gc_deletes_zero_checkpoint_import_identity() {
     let repo = tempfile::tempdir().expect("repo tempdir");
     init_repo_via_cli(repo.path());
-    let conn = connect_repo_db(repo.path()).await;
+    let conn = connect_catalog_db(repo.path()).await;
     let now = chrono::Utc::now().timestamp_millis();
     conn.execute_raw(Statement::from_sql_and_values(
         conn.get_database_backend(),
@@ -660,7 +716,7 @@ async fn agent_clean_gc_deletes_zero_checkpoint_import_identity() {
     assert_cli_success(&output, "agent clean zero-checkpoint identity gc");
     let json = parse_json_stdout(&output);
     assert_eq!(json["data"]["import_identities_pruned"], 1);
-    let conn = connect_repo_db(repo.path()).await;
+    let conn = connect_catalog_db(repo.path()).await;
     assert_eq!(
         scalar_count(&conn, "SELECT COUNT(*) AS n FROM agent_import_identity").await,
         0
@@ -767,7 +823,7 @@ async fn agent_clean_refuses_while_traces_write_marker_is_live() {
     let output = run_libra_command(&["--quiet", "agent", "clean", "--all"], repo.path());
     assert_cli_success(&output, "clean succeeds once the marker expired");
 
-    let conn = connect_repo_db(repo.path()).await;
+    let conn = connect_catalog_db(repo.path()).await;
     assert!(
         !checkpoint_exists(&conn, "cc000000-0000-4000-8000-000000000001").await,
         "the temporary checkpoint should be pruned once no live marker remains"
@@ -783,7 +839,7 @@ async fn agent_clean_refuses_when_traces_ref_reaches_uncataloged_commits() {
     let repo = tempfile::tempdir().expect("repo tempdir");
     init_repo_via_cli(repo.path());
 
-    let conn = connect_repo_db(repo.path()).await;
+    let conn = connect_catalog_db(repo.path()).await;
     seed_session(&conn, "stopped-session", "stopped", 10, 20, 30).await;
     seed_checkpoint_commit(
         &conn,
@@ -830,7 +886,7 @@ async fn agent_clean_refuses_when_traces_ref_reaches_uncataloged_commits() {
         "refusal must point at doctor --repair, stderr: {stderr}"
     );
 
-    let conn = connect_repo_db(repo.path()).await;
+    let conn = connect_catalog_db(repo.path()).await;
     assert!(
         checkpoint_exists(&conn, "dd000000-0000-4000-8000-000000000001").await,
         "a refused prune must not delete the targeted temporary checkpoint"
@@ -1062,7 +1118,7 @@ async fn agent_clean_rewrites_agent_traces_when_temporary_commit_is_ancestor() {
     let output = run_libra_command(&["--quiet", "agent", "clean", "--all"], repo.path());
     assert_cli_success(&output, "libra agent clean --all");
 
-    let conn = connect_repo_db(repo.path()).await;
+    let conn = connect_catalog_db(repo.path()).await;
     assert!(
         !checkpoint_exists(&conn, "aa000000-0000-4000-8000-000000000001").await,
         "temporary checkpoint row should be deleted"
@@ -1103,7 +1159,7 @@ async fn checkpoint_prune_preserves_leased_import_identity_before_claim_registra
     let repo = tempfile::tempdir().expect("repo tempdir");
     init_repo_via_cli(repo.path());
 
-    let conn = connect_repo_db(repo.path()).await;
+    let conn = connect_catalog_db(repo.path()).await;
     seed_session(&conn, "prune-race", "stopped", 10, 20, 30).await;
     let checkpoint_id = "cc000000-0000-4000-8000-000000000003";
     seed_checkpoint_commit(
@@ -1171,7 +1227,7 @@ async fn agent_clean_gc_drops_expired_all_scopes_and_keeps_audit_log() {
     let ancient = now - 200 * 86_400; // 200 days ago — past the 90-day window
     let recent = now - 3 * 86_400; // 3 days ago — inside the window
 
-    let conn = connect_repo_db(repo.path()).await;
+    let conn = connect_catalog_db(repo.path()).await;
     seed_session(&conn, "stopped-session", "stopped", 10, 20, 30).await;
     // Expired: both a temporary AND a committed checkpoint must be swept.
     seed_checkpoint(
@@ -1221,7 +1277,7 @@ async fn agent_clean_gc_drops_expired_all_scopes_and_keeps_audit_log() {
     let output = run_libra_command(&["--quiet", "agent", "clean", "--gc"], repo.path());
     assert_cli_success(&output, "libra agent clean --gc");
 
-    let conn = connect_repo_db(repo.path()).await;
+    let conn = connect_catalog_db(repo.path()).await;
     assert!(
         !checkpoint_exists(&conn, "cp-old-temp").await,
         "GC drops expired temporary checkpoints"

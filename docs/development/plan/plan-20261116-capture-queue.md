@@ -2,7 +2,7 @@
 
 **模板版本:** `v2.16`。本计划不在 v2.16 具名 `code-only` 范围内，按普通发布合同执行：会推送的独立卡与家族发布点各自 `patch + 1` 并走 ER-08。
 
-**状态:** 实施中。CQ-01、CQ-02 为 `Lifecycle=done`、`Acceptance=complete`。其余任务卡仍为 `pending` / 空。用户要求每张卡在 `main` 上提交并推送，因此这次执行不遵守 REL-CQ-01 的“子卡不推送”。
+**状态:** 实施中。CQ-01、CQ-02、CQ-03、CQ-07、CQ-04、CQ-05 为 `Lifecycle=done`、`Acceptance=complete`。CQ-06 为 `pending` / 空。FIX-CQ-01（CQ-02/CQ-03/CQ-07 拆库回归）随 CQ-05 关闭。FIX-CQ-02（cloud sync/restore 未读 `capture.db`）未开始，须在 CQ-06 之前独立完成。用户要求每张卡在 `main` 上提交并推送，因此这次执行不遵守 REL-CQ-01 的“子卡不推送”。用户另要求捕获相关的新测试不进入 GitHub Actions，以本地运行为准：这些测试由 `LIBRA_RUN_CAPTURE_TESTS=1` 门控，CI 中打印 `skipped`。
 
 ## 文档职责
 
@@ -105,6 +105,7 @@
 | 2026-11-16 13:10:31 UTC | Codex R4 FAIL | 默认覆盖表的 CQ-05 改为 forward-only。`ready/` 与 `quarantine/` 共用 1024 文件或 256 MiB；`tmp/` 超过 24 小时由消费者删除 | 无拆卡 | 默认覆盖、CQ-05 AC/预算、故障矩阵、容量表 |
 | 2026-11-16 13:14:31 UTC | Codex R5 FAIL | 容量检查、发布和过期 `tmp/` 删除都放进 `capacity.lock`；`tmp/` 最多 64 个，不依赖消费者启动 | 无拆卡 | ADR-CQ-02、CQ-05 AC/验证/预算、故障矩阵 |
 | 2026-11-16 13:17:14 UTC | Codex R6 FAIL | `tmp/` 改为在 `capacity.lock` 内 `O_EXCL` 创建，锁外才写内容，避免并发创建越过 64 | 无拆卡 | ADR-CQ-02、CQ-05 AC/预算、故障矩阵、容量表 |
+| 2026-11-17 16:55:05 UTC | CQ-05 实施 | 消费者重放使用自己的捕获期限（提供方自管导出窗口的沿用其预算，其余 30 秒），数据库等待用满该期限；消费者只继承白名单环境变量（含提供方目录、沙箱、对象存储），丢弃 API key；`__capture-spool-drain` 在有信封进入 `quarantine/` 时非零退出；入队前只用文件元数据检查 `libra.db` 是否存在（`LBR-REPO-002`/`LBR-IO-001`），schema 过新由消费者报告。新增调试构建测试缝 `LIBRA_TEST=1` + `LIBRA_TEST_CAPTURE_SPOOL_NO_CONSUMER=1`。捕获新测试以 `LIBRA_RUN_CAPTURE_TESTS=1` 门控，不进入 GitHub Actions | 无拆卡；新增 FIX-CQ-01 | CQ-05 写集、ADR-CQ-03、修复登记、实施证据汇总 |
 
 ## 已决议设计决策
 
@@ -616,7 +617,7 @@ D 组三条不计入 VER。它们是 ER-04 的远端门。
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `complete`
 
 **Description:** AgentTraces 实时路径不再打开数据库。它把已脱敏信封原子写入 spool，并尝试拉起一个消费者。消费者把 `ready/` 写入 `capture.db`。这是本计划对 200ms 锁失败的修复。
 
@@ -638,23 +639,24 @@ D 组三条不计入 VER。它们是 ER-04 的远端门。
 
 **Acceptance criteria:**
 
-- [ ] hook 退出 0 当且仅当 `ready/` 里已经有该去重键的完整文件。
-- [ ] 消费者启动失败或之后入库失败不改变这个退出 0。
-- [ ] `rename` 之前崩溃不会留下 `ready/` 文件。
-- [ ] 同一个 `ready/` 文件重放两次只产生一行目录。
-- [ ] 排序前缀 `0-` 的文件先于 `1-` 的文件被消费。
-- [ ] `tmp/` 的 `O_EXCL` 创建、过期删除、`ready/` 发布都在 `capacity.lock` 内完成。创建时 `tmp/` 不超过 64 个；发布时 `ready/` 与 `quarantine/` 合计不超过 1024 个文件或 256 MiB。越限返回队列已满错误码，文案不包含 `newer Libra`。并发创建和并发发布都不能越过各自的上限。
-- [ ] 第二个消费者抢不到锁时不会读取 `ready/`。
-- [ ] 1 KiB 信封的入队路径不调用目录检查点。
+- [x] hook 退出 0 当且仅当 `ready/` 里已经有该去重键的完整文件。例外：Claude `observe` 对它不记录的事件（缺 session、超长、格式不对）保持静默退出 0，这类事件在入队前就被拒绝，不产生文件；已通过校验但写不进队列的事件（队列满、文件系统错误）照常失败（`capture_spool_hook_observe_queue_full_fails_with_stable_code`）。
+- [x] 消费者启动失败或之后入库失败不改变这个退出 0。
+- [x] `rename` 之前崩溃不会留下 `ready/` 文件。
+- [x] 同一个 `ready/` 文件重放两次只产生一行目录。
+- [x] 排序前缀 `0-` 的文件先于 `1-` 的文件被消费。
+- [x] `tmp/` 的 `O_EXCL` 创建、过期删除、`ready/` 发布都在 `capacity.lock` 内完成。创建时 `tmp/` 不超过 64 个；发布时 `ready/` 与 `quarantine/` 合计不超过 1024 个文件或 256 MiB。越限返回队列已满错误码，文案不包含 `newer Libra`。并发创建和并发发布都不能越过各自的上限。
+- [x] 第二个消费者抢不到锁时不会读取 `ready/`。
+- [x] 1 KiB 信封的入队路径不调用目录检查点。
 
 六个 provider 共用这一条 AgentTraces 分支，由下面的表驱动测试一次覆盖，不拆成六条 AC。schema 过新、捕获库忙和文件损坏只由消费者或 doctor 报告，不由已经入队的 hook 返回。
 
 **Verification:**
 
-- [ ] `source .env.test && cargo nextest run -E 'test(/^capture_spool_/)'`（new：原子发布、崩溃窗口、去重、终态顺序、`capacity.lock` 下的并发名额、`tmp/` 24 小时清理、消费者单锁）
-- [ ] `source .env.test && cargo nextest run --test agent_lifecycle_event_test capture_spool_hook_`（new：六个入口不开库、错误文案）
-- [ ] `source .env.test && cargo nextest run --test agent_opencode_bridge_test capture_spool_`（new：OpenCode 转发进程在入队后返回）
-- [ ] `if rg -n 'establish_connection|get_db_conn' src/internal/ai/capture/live_pipeline.rs; then echo 'FAIL: live ingest still opens a database'; exit 1; else rc=$?; if [ "$rc" -ne 1 ]; then echo "ERROR: rg failed with exit $rc"; exit "$rc"; fi; echo 'OK: zero hits'; fi`
+- [ ] `source .env.test && cargo nextest run -E 'test(/^capture_spool_/)'` — 原命令的 `^` 锚点匹配不到带模块前缀的单测，不作为本卡证据。
+- [x] `source .env.test && cargo nextest run -E 'test(/capture_spool_/)'` — 实际执行的命令：35 项，35 通过（含 `spool.rs`/`drain.rs` 单测与 7 项既有 `command::cloud` 用例）。（new：原子发布、崩溃窗口、去重、终态顺序、`capacity.lock` 下的并发名额、`tmp/` 24 小时清理、消费者单锁）
+- [x] `source .env.test && cargo nextest run --test agent_lifecycle_event_test capture_spool_hook_`（new：六个入口不开库、错误文案）
+- [x] `source .env.test && cargo nextest run --features test-live-agent --run-ignored all --test agent_opencode_bridge_test capture_spool_`（该 target 需要 `test-live-agent` 特性；按 `compat_agent_architecture_guard` 的要求，该 target 的用例都是 `#[ignore]` 的操作者本地门，须显式选中 ignored，选中后不再跳过）（new：OpenCode 转发进程在入队后返回）
+- [x] `if rg -n 'establish_connection|get_db_conn' src/internal/ai/capture/live_pipeline.rs; then echo 'FAIL: live ingest still opens a database'; exit 1; else rc=$?; if [ "$rc" -ne 1 ]; then echo "ERROR: rg failed with exit $rc"; exit "$rc"; fi; echo 'OK: zero hits'; fi`
 
 **远端 D 组（不计入 AC/VER）:** 与 CQ-04 相同的三个 workflow 判据，但 head 和 tag 换成 CQ-05 自己的 PR 与版本。
 
@@ -831,7 +833,7 @@ D 组三条不计入 VER。它们是 ER-04 的远端门。
 
 ## Codex review log
 
-Result 只允许 `PASS` 或 `FAIL`。R7 是计划文本的当前结论。R9 是 CQ-04 实现的当前结论。
+Result 只允许 `PASS` 或 `FAIL`。R7 是计划文本的当前结论。R9 是 CQ-04 实现的当前结论。R10–R13 为 CQ-05，R13 是其当前结论。
 
 | Round | Scope | Result | P0/P1 | P2 处置 | Evidence |
 |---|---|---|---|---|---|
@@ -844,6 +846,20 @@ Result 只允许 `PASS` 或 `FAIL`。R7 是计划文本的当前结论。R9 是 
 | R7 | 锁内创建 tmp | PASS | P0=0，P1=0。R6 的并发创建窗口已关闭 | 无 P2 | Codex exec，只读 sandbox，2026-11-16 |
 | R8 | CQ-04 实现 | FAIL | P0=0，P1=1：两条 nextest 被勾成通过，与证据不符 | 无 P2 | Codex exec，只读，2026-11-17 |
 | R9 | CQ-04 清单修正 | PASS | P0=0，P1=0。nextest 保持未勾选；通过的是 cargo test | 无 P2 | Codex exec，只读，2026-11-17 |
+| R10 | CQ-05 实现与 FIX-CQ-01 | FAIL | P0=0。P1 四项：Claude `observe` 吞掉入队失败；拆库后 ref CAS 与目录写不再原子（FIX 余项不能随卡关闭）；重放打开 `capture.db` 时等待可超过期限；状态表写了尚未发生的提交推送 | P2 一项：已存在的队列目录不检查权限 | Codex exec，只读，2026-11-17。四项已前滚：observe 对入队失败（`CaptureEnqueueFailed`）报错；目录写失败时以补偿 CAS 把 ref 撤回原值；打开 `capture.db` 前按剩余期限重算等待；状态表删去推送字样。P2 已改：本用户拥有且对组或他人开放的目录收紧为 0700，他人拥有则拒绝 |
+| R11 | R10 修复与新增 FIX | FAIL | P0=0。R10 四项确认关闭；FIX-CQ-02 作为 CQ-06 之前的独立项被接受。新 P1 五项：补偿 CAS 在另一追加者已前进时仍会留下未入目录的祖先；`capacity.lock` 等待不受 hook 期限约束且超时被报成队列满；`begin_write_transaction` 仅凭表结构认定捕获库；非 Unix 平台改名后不刷目录却写“持久入队”；T-1 全量未跑就标完成 | 无 P2 | Codex exec，只读，2026-11-17。前滚：追加在持有 `libra.db` 写锁时提交目录，再提交 ref（取代补偿 CAS）；`publish` 接收 hook 期限，锁等待取期限与 30 秒的较小者，超时报新稳定码 `LBR-AGENT-049`（`capture_spool_lock_wait_ends_at_the_hook_deadline`）；捕获库角色改由文件路径 `<storage>/private/capture.db` 判定，表结构仍须吻合；文档把耐久承诺收窄为 Unix，并写明 Windows 的改名不刷盘；T-1 全量 nextest 已运行，结果见实施证据 |
+| R12 | R11 修复 | FAIL | P0=0。R11 五项中锁序、连接解析、`LBR-AGENT-049`、守卫与 oracle 修订被确认。新 P1 四项：重试命中已存在文件时不刷 `ready/` 目录就报成功；第二次取锁超时遗留 tmp 文件；目录写锁的获取不受捕获期限约束；ref 提交失败后留下的“目录有行、ref 无”状态 doctor 不报告 | P2 一项：注释仍写补偿 CAS | Codex exec，只读，2026-11-17。前滚：`AlreadyQueued` 两处都先刷 `ready/`；tmp 创建之后的任何失败都删掉本发布者的 tmp（`capture_spool_second_lock_timeout_removes_its_tmp_file`）；目录事务的取锁用捕获期限 `timeout_at`；提交顺序改为先 ref 后目录，残留窗口落在 doctor 已能自动修复的 `missing_catalog_row`；注释已更正 |
+| R13 | R12 修复 | PASS | P0=0，P1=0。R12 四项确认关闭；已核对 doctor class 2（`missing_catalog_row`）能识别并用 `--repair` 重建 ref 可达而目录缺行的检查点，cleanup-pending marker 不会挡住该修复 | P2 一项：验证清单勾选了带 `^` 锚点的原命令，实际证据来自不带锚点的命令。已改为不勾原命令，另列实际执行的命令 | Codex exec，只读，2026-11-17 |
+
+## 修复登记
+
+| ID | 来源 | 内容 | 状态 | 关闭条件 |
+|---|---|---|---|---|
+| FIX-CQ-01 | CQ-02、CQ-03、CQ-07 拆库后的回归。`2c4bab3` 上 CI `compat-offline-core` 166 项失败，主要是 `no such table`：`agent_*` 在 `capture.db`，`reference`/`metadata_kv`/`config_kv`/`workspace_record` 在 `libra.db` | 随 CQ-05 前滚：marker 事务改用独立仓库连接；导出任务与覆盖门在 `capture.db` 上取写锁；`metadata_kv`、仓库身份、工作区租约、HEAD/traces 引用、提交锚定从捕获连接改走配对的 `libra.db`（由连接自身文件路径推得，不回退当前目录；配对结果仍缺 `config_kv` 时视为同一个库，不再无限递归）；`agent clean` 修剪与会话擦除拆成仓库事务加目录事务；GC 从 `capture.db` 读取目录对象根；目录 SQL 里的 `workspace_record` 租约子查询在 `capture.db` 上改为调用方先行校验。Codex R10–R12 后补：拆库后的检查点追加先在 `libra.db` 写事务里做 ref CAS 与对象索引；在仍持有该写锁时打开 `capture.db` 目录事务（取锁受捕获期限约束），写入并授权目录，再对仓库事务做最终授权（期限与工作区租约），然后提交 ref，最后提交目录。所有拆库写者都先取仓库锁再取目录锁，并发追加因此串行；提交之前的任何失败都回滚两边，ref 不动，失败的追加照常交给 cleanup-pending marker。剩下的窗口只有两次提交之间的 I/O 错误或崩溃：ref 已含该检查点而目录行缺失，这正是 doctor 既有的 `missing_catalog_row`（ref 可达、目录无行），`libra agent doctor --repair` 会从 ref 重建该行；只读的 `metadata_kv` 检查改用配对库的 deferred 事务，不再在 marker 注册已持有 `libra.db` 写锁时再抢写锁（这是 doctor 手动重放 2 秒期限耗尽的原因）；doctor 的 Claude/Codex 遗留修订修复写 `capture.db`；不变检查点验证从配对库读 traces ref；Hermes 实时导出的租约在 `capture.db`，信任行从配对库复核；hook 未带期限时重放也不带期限（带期限会省略子代理来源）；测试夹具在装故障触发器前先让 `capture.db` 生成 | 关闭 | 本地 17 个捕获相关 target 中原 13 项余项全部通过；唯一剩下的 `hermes_observe_checkpoint_exports_nonempty_reasoning` 失败在 `cloud sync` 断言，归 FIX-CQ-02 |
+
+| FIX-CQ-02 | CQ-03 拆库后的回归：`libra cloud sync` / `cloud restore` 仍只用 `libra.db`，而 detach 后该库没有 `agent_*` 表。sync 把仓库当作没有捕获目录：既不镜像 agent capture，也不执行本地 `agent_kind` 允许名单拒绝（`hermes_observe_checkpoint_exports_nonempty_reasoning` 的 `cloud sync` 断言因此失败，先报缺云配置）；restore 的目录写入与修剪栅栏同样落在错误的库 | 同步与恢复对目录表改走 `capture.db`，对象索引、引用与 `metadata_kv` 留在 `libra.db`；两个库不 ATTACH | 未开始 | 作为独立提交在 CQ-06 之前完成并经 Codex PASS；该 Hermes 用例与云相关单测通过 |
+
+已知边角：`agent session list` 与消费者首次创建 `capture.db` 同时发生时，读者可能得到 `LBR-IO-001`。本轮未复现；重启条件是再次复现，承接在 FIX-CQ-02 之后的收口全量。
 
 ## 非目标与延后项
 
@@ -906,6 +922,18 @@ Clippy `--all-targets --all-features -D warnings` 先指出 CQ-01 留下的两�
 卡片上的 `cargo nextest` 在链接全部测试产物时负载超过 400，已停止，不把未跑完的 nextest 算通过。验证清单里的两条 nextest 保持未勾选。同一批谓词改由 `cargo test` 执行，并单独勾选。`cargo test --test db_migration_test --jobs 6 capture_ -- --test-threads=1`：8 通过，0 失败。`cargo test --lib --jobs 6 capture_store_ -- --test-threads=1`：3 通过，0 失败。`cargo test --test compat_version_surface_sync --jobs 6 -- --test-threads=1`：2 通过，0 失败。`rg` 对三份文档打印 `OK: docs mention capture.db`。`cargo +nightly fmt --all --check` exit 0。`cargo clippy --all-targets --all-features --jobs 2 -- -D warnings` exit 0。T-2 全量 nextest 留到计划收口，本机没有跑完。
 
 网站 `../libra-backend` 分支 `cf` 的 agent 页写入同一目录位置。推送发生在本仓提交之后。`gh release create v0.30.208` 也在本提交推送到 `main` 之后执行。远端 D 组不计入本卡 AC/VER。这次按用户要求在 `main` 发布，而不是把家族子卡留在未推送分支上。Codex R8 `VERDICT: FAIL`（P0=0，P1=1）：两条 nextest 被勾成通过。改为未勾选后，R9 `VERDICT: PASS`（P0=0，P1=0）。
+
+### CQ-05（2026-11-17 16:55:05 UTC）
+
+实时 AgentTraces 路径（`ingest_agent_traces`）不再打开数据库：先对事件脱敏，把带版本号的信封写入 `.libra/private/capture-spool/ready/`，再尝试拉起一个分离的消费者（`libra __capture-spool-drain`）。消费者持有 `capture-spool-consumer.lock`，抢不到锁立即退出；按文件名顺序重放，目录事务提交后才删文件；库忙、schema 过新、仓库库打不开、文件系统错误时文件留在 `ready/`，其余不能入库的信封移入 `quarantine/`，命令此时非零退出（`LBR-INTERNAL-001`，固定文案）。释放锁后若 `ready/` 仍有文件则再抢一次，避免锁竞争时丢下刚入队的文件。重放使用自己的捕获期限（提供方自管导出窗口的沿用其预算，其余 30 秒）。消费者只继承白名单环境变量，提供方 API key 不传入。入队前只用文件元数据检查 `libra.db` 是否存在，缺失返回 `LBR-REPO-002`，非普通文件返回 `LBR-IO-001`。新增稳定码 `LBR-AGENT-046`（队列已满）、`LBR-AGENT-047`（捕获库忙）、`LBR-AGENT-048`（捕获库 schema 过新）、`LBR-AGENT-049`（队列锁在 hook 的整个等待窗口内被占用；等待取 hook 剩余期限与 30 秒的较小者），已写入 `docs/error-codes.md`。耐久性：信封文件在改名前刷盘，Unix 上再刷 `ready/` 目录；Windows 上改名不刷盘，文档已如实写明。`docs/commands/agent.md`、`docs/commands/zh-CN/agent.md`、`COMPATIBILITY.md` 写明「hook 成功即已入队」。`docs/development/commands/agent.md` 没有 hook 入库段落，未改。
+
+本机验证（`CARGO_PROFILE_DEV_DEBUG=0`，`LIBRA_RUN_CAPTURE_TESTS=1`）：卡片原命令 `cargo nextest run -E 'test(/^capture_spool_/)'` 只匹配集成测试——nextest 的单测名带模块前缀，`^` 锚点匹配不到 `spool.rs`/`drain.rs` 里的单测；不加锚点的 `-E 'test(/capture_spool_/)'` 跑 35 项，35 通过，其中 7 项是既有的 `command::cloud::tests::capture_spool_owner_*`，与本卡无关。`cargo nextest run --test agent_lifecycle_event_test capture_spool_hook_` 包含在上述结果中。`agent_opencode_bridge_test` 的 `capture_spool_opencode_forwarder_returns_after_queueing` 与该 target 其它用例一样是 `#[ignore]` 的操作者本地门，已登记进架构守卫的手动清单：`cargo nextest run --features test-live-agent --run-ignored all --test agent_opencode_bridge_test capture_spool_` 1 通过。其余新测试不设 `LIBRA_RUN_CAPTURE_TESTS` 时打印 `skipped` 后返回；CI 既不设该变量，也不构建 `test-live-agent` target，更不选 ignored 用例，所以都不在 CI 中运行（`command::cloud` 的 7 项不受此门控，原本就在 CI 中）。`rg` 对 `live_pipeline.rs` 打印 `OK: zero hits`。`cargo +nightly fmt --all --check` exit 0；`cargo clippy --all-targets --all-features -- -D warnings` exit 0；`RUSTDOCFLAGS="-D rustdoc::broken_intra_doc_links" cargo doc --no-deps --all-features` exit 0。17 个捕获相关 target（lib、`command_test` 与 15 个 agent/compat target）最近一次本地 nextest：10630 项，10629 通过，1 失败：`hermes_observe_checkpoint_exports_nonempty_reasoning` 的 `cloud sync` 断言，归 FIX-CQ-02。修复前同一组为 161 项失败。`managed_hook_accepts_regular_file_stdin` 曾因测试起 hook 后立即读目录而失败，测试已改为先等队列入库。T-1 全量（卡片触发 `src/cli.rs` 隐藏入口、稳定错误码与 `docs/error-codes.md`）：`source .env.test && source .env.live-test && cargo nextest run --all --no-fail-fast --retries 2` 在最终代码上跑完：11839 项，11838 通过，1 失败，51 跳过；唯一失败仍是归 FIX-CQ-02 的 `hermes_observe_checkpoint_exports_nonempty_reasoning`（`cloud sync` 断言），三次重试均失败，不是偶发。同一轮全量暴露的 7 项 `compat_agent_architecture_guard` 失败已在本卡内修正，见 ADR-ACF-10 2026-11-17 修订。
+
+写集外的扩大：`src/cli.rs`（隐藏入口与错误映射）、`src/command/hooks.rs`（入队失败的 observe 映射；`spool_replay_provider` 把 hook 名映射到 provider 并注入消费者，capture 模块因此不 import hook 入口层、也不出现 provider 字面量）、`tests/compat/agent_architecture_guard.rs` 与 `docs/development/tracing/agent.md`（ADR-ACF-10 2026-11-17 修订：四项冻结 oracle 的摘要随 `HookRepo` 夹具更新，holder 链与 `LiveCaptureBinding::resolve` 调用点各加消费者侧一处，OpenCode 新用例进手动清单）、`ingress.rs`（重放构造与已脱敏报告）、`observed_agents/live_capture.rs`（重放子源提示）、`observed_agents/hermes_export.rs`（导出租约在 `capture.db`）、`.env.test.example`、`CLAUDE.md`（测试环境变量），以及 FIX-CQ-01 涉及的 `db.rs`、`metadata.rs`、`workspace.rs`、`capture_scope.rs`、`traces.rs`、`history.rs`、`catalog.rs`、`pending.rs`、`pending_identity.rs`、`coverage_gate.rs`、`export_job.rs`、`agent_import.rs`、`subagent_content.rs`、`command/agent/import.rs`、`command/maintenance.rs`、`config_ownership.rs`、`mutable_state_ownership.rs` 和对应测试。没有新 `--test` target，`tests/INDEX.md` 与 `Cargo.toml` `[[test]]` 为 `N/A`。
+
+开发中发现一个只影响测试的泄漏：仓库连接配对曾回退到当前目录，进程内单测从仓库根运行时把一行测试会话（`claude__S-bare`）写进了本开发仓库的 `.libra/private/capture.db`。已去掉该回退（未识别的库文件现在报错），并删掉这一行；备份留在本机草稿目录，没有其它行受影响。
+
+版本面从 `0.30.208` 改为 `0.30.209`：`Cargo.toml`、`install.sh` 的 `DEFAULT_VERSION`、`install.ps1` 的 `$DefaultVersion`；`Cargo.lock` 由 `cargo update -p libra --offline` 刷新。
 
 ## 完成判据
 

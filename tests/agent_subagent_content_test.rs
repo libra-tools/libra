@@ -45,7 +45,54 @@ impl Fixture {
         self.run_with_env(args, stdin, &[])
     }
 
+    /// A realtime hook only queues its event: run it without its detached
+    /// consumer (debug-build seam), then one consumer with the same
+    /// environment, and report the hook's failure or else the consumer's
+    /// status with both outputs. A delivery the consumer could not store is
+    /// dropped, as a failed hook delivery was before the queue.
     fn run_with_env(&self, args: &[&str], stdin: Option<&str>, env: &[(&str, &str)]) -> Output {
+        if !args.iter().take(3).any(|arg| *arg == "hooks") {
+            return self.run_raw(args, stdin, env);
+        }
+        let mut hook_env = env.to_vec();
+        hook_env.push(("LIBRA_TEST", "1"));
+        hook_env.push(("LIBRA_TEST_CAPTURE_SPOOL_NO_CONSUMER", "1"));
+        let queued = self.run_raw(args, stdin, &hook_env);
+        if !queued.status.success() {
+            return queued;
+        }
+        let consumer = self.run_raw(&["__capture-spool-drain"], None, env);
+        if !consumer.status.success()
+            && let Ok(entries) =
+                std::fs::read_dir(self.repo.join(".libra/private/capture-spool/ready"))
+        {
+            for entry in entries {
+                std::fs::remove_file(entry.expect("ready entry").path())
+                    .expect("drop an abandoned delivery");
+            }
+        }
+        let mut stdout = queued.stdout;
+        stdout.extend(consumer.stdout);
+        let mut stderr = queued.stderr;
+        stderr.extend(consumer.stderr);
+        Output {
+            status: consumer.status,
+            stdout,
+            stderr,
+        }
+    }
+
+    /// Catalog tables live in `capture.db` once the capture store opens.
+    fn catalog_path(&self) -> PathBuf {
+        let capture = self.repo.join(".libra/private/capture.db");
+        if capture.is_file() {
+            capture
+        } else {
+            self.repo.join(".libra/libra.db")
+        }
+    }
+
+    fn run_raw(&self, args: &[&str], stdin: Option<&str>, env: &[(&str, &str)]) -> Output {
         let mut command = Command::new(env!("CARGO_BIN_EXE_libra"));
         command
             .args(args)
@@ -152,7 +199,10 @@ impl Fixture {
     /// a provider-controlled hook environment cannot influence production
     /// capture behavior.
     async fn reject_committed_checkpoint_writes(&self) {
-        let database_path = self.repo.join(".libra/libra.db");
+        // Listing opens the capture store, which creates `capture.db`; the
+        // trigger must be installed there, not on the pre-split copy.
+        let _ = self.checkpoints();
+        let database_path = self.catalog_path();
         let conn = Database::connect(format!("sqlite://{}", database_path.display()))
             .await
             .expect("connect repository database");
@@ -218,7 +268,7 @@ async fn claude_hook_captures_partial_subagent_content_once_as_unresolved() {
         describe(&doctor)
     );
 
-    let database_path = fixture.repo.join(".libra/libra.db");
+    let database_path = fixture.catalog_path();
     let conn = Database::connect(format!("sqlite://{}", database_path.display()))
         .await
         .expect("connect repository database");
@@ -346,10 +396,9 @@ async fn claude_hook_captures_partial_subagent_content_once_as_unresolved() {
     );
     let stderr = String::from_utf8_lossy(&replay.stderr);
     assert!(
-        stderr.contains(
-            "capture could not be completed; retry the hook or inspect the local repository"
-        ),
-        "replay error must retain the fixed sanitized diagnostic: {}",
+        stderr
+            .contains("could not be stored and were moved to quarantine; run `libra agent doctor`"),
+        "the queued replay must be quarantined with the fixed sanitized diagnostic: {}",
         describe(&replay)
     );
     assert!(
@@ -461,7 +510,7 @@ async fn parent_metadata_uses_redacted_child_snapshot_for_attribution() {
     // The parent aggregate is a durable invariant, not a public `show`
     // schema. Read the object directly so this test does not restore the
     // withheld metadata body to the CLI contract.
-    let database_path = fixture.repo.join(".libra/libra.db");
+    let database_path = fixture.catalog_path();
     let conn = Database::connect(format!("sqlite://{}?mode=ro", database_path.display()))
         .await
         .expect("connect repository database for metadata assertion");
@@ -515,7 +564,7 @@ async fn unchanged_replay_rejects_an_uncataloged_traces_ancestor() {
     let first = fixture.stop(session_id, &transcript);
     assert!(first.status.success(), "first stop: {}", describe(&first));
 
-    let database_path = fixture.repo.join(".libra/libra.db");
+    let database_path = fixture.catalog_path();
     let conn = Database::connect(format!("sqlite://{}", database_path.display()))
         .await
         .expect("connect repository database");
@@ -537,10 +586,9 @@ async fn unchanged_replay_rejects_an_uncataloged_traces_ancestor() {
     );
     let stderr = String::from_utf8_lossy(&replay.stderr);
     assert!(
-        stderr.contains(
-            "capture could not be completed; retry the hook or inspect the local repository"
-        ),
-        "uncataloged history error must retain the fixed sanitized diagnostic: {}",
+        stderr
+            .contains("could not be stored and were moved to quarantine; run `libra agent doctor`"),
+        "uncataloged history must quarantine the queued replay with the fixed sanitized diagnostic: {}",
         describe(&replay)
     );
     assert!(

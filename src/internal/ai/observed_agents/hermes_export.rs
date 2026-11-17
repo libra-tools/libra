@@ -234,9 +234,14 @@ async fn export_under_lease(
     if output.exists() {
         return Err(HermesLiveError::Unavailable);
     }
-    // The lease and the trust row live on `conn`. The process repository can
-    // be a different checkout, so revocation must use this same connection.
-    trust::revalidate_trust_with_conn(conn, HERMES_EXPORTER_SLUG, &trust.record)
+    // The lease is on `conn`; the trust row is in that same repository's
+    // `libra.db` (`conn` itself when it is a combined database). The process
+    // repository can be a different checkout, so revocation is read from the
+    // database paired with `conn`, never from the current directory.
+    let repository = crate::internal::db::repository_peer(conn)
+        .await
+        .map_err(|_| HermesLiveError::Unavailable)?;
+    trust::revalidate_trust_with_conn(&repository, HERMES_EXPORTER_SLUG, &trust.record)
         .await
         .map_err(|_| HermesLiveError::Unavailable)?;
     let mut child = Command::new(&trust.record.path);
@@ -491,6 +496,19 @@ pub async fn export_for_live_capture(
         .map_err(|_| HermesLiveError::Unavailable)?;
     let Some(trust) = trust else {
         return Err(HermesLiveError::Unavailable);
+    };
+    // The export-job lease is a catalog row: after the split it is in
+    // `capture.db`. A repository without one keeps the combined database.
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let conn = if crate::internal::ai::capture::store::capture_database_path(&storage).is_file() {
+        crate::internal::ai::capture::store::open_existing_writer(
+            &storage,
+            remaining.min(crate::internal::ai::capture::store::COMMAND_BUSY_TIMEOUT),
+        )
+        .await
+        .map_err(|_| HermesLiveError::Unavailable)?
+    } else {
+        conn
     };
     let request = HermesLiveRequest {
         session_id: session_id.to_string(),

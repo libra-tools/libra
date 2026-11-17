@@ -3204,7 +3204,9 @@ async fn acquire_identity(
         let updated = txn
             .execute_raw(Statement::from_sql_and_values(
                 txn.get_database_backend(),
-                "UPDATE agent_import_identity
+                &crate::internal::db::catalog_lease_sql(
+                    &txn,
+                    "UPDATE agent_import_identity
                  SET state = 'leased', owner = ?, lease_expires_at = ?,
                      fence_token = ?, observed_digest = ?, last_error_code = NULL,
                      attempt_id = NULL, attempt_checkpoint_id = NULL,
@@ -3221,6 +3223,8 @@ async fn acquire_identity(
                          AND lease_owner IS NOT NULL
                          AND lease_expires_at > (unixepoch('now') * 1000)
                    ))",
+                )
+                .await?,
                 [
                     owner.into(),
                     lease_expires_at.into(),
@@ -3369,7 +3373,9 @@ async fn bind_import_attempt(
     let identity = txn
         .execute_raw(Statement::from_sql_and_values(
             txn.get_database_backend(),
-            "UPDATE agent_import_identity
+            &crate::internal::db::catalog_lease_sql(
+                &txn,
+                "UPDATE agent_import_identity
              SET state = 'writing', attempt_id = ?, attempt_checkpoint_id = ?,
                  lease_expires_at = ?, updated_at = ?
              WHERE identity_id = ? AND owner = ? AND fence_token = ?
@@ -3385,6 +3391,8 @@ async fn bind_import_attempt(
                      AND lease_expires_at > (unixepoch('now') * 1000)
                ))
                AND state IN ('leased','writing')",
+            )
+            .await?,
             [
                 checkpoint_id.into(),
                 checkpoint_id.into(),
@@ -3585,7 +3593,9 @@ async fn finalize_noop_identity(
     let result = txn
         .execute_raw(Statement::from_sql_and_values(
             txn.get_database_backend(),
-            "UPDATE agent_import_identity
+            &crate::internal::db::catalog_lease_sql(
+                &txn,
+                "UPDATE agent_import_identity
              SET state = ?, committed_digest = COALESCE(?, committed_digest),
                  next_ordinal = CASE WHEN ? THEN ? ELSE next_ordinal END,
                  owner = NULL, lease_expires_at = NULL,
@@ -3602,6 +3612,8 @@ async fn finalize_noop_identity(
                      AND lease_owner IS NOT NULL
                      AND lease_expires_at > (unixepoch('now') * 1000)
                ))",
+            )
+            .await?,
             [
                 state.into(),
                 committed_digest,
@@ -3691,7 +3703,9 @@ async fn abandon_import_attempt(
     let released_identity = txn
         .execute_raw(Statement::from_sql_and_values(
             txn.get_database_backend(),
-            "UPDATE agent_import_identity
+            &crate::internal::db::catalog_lease_sql(
+                &txn,
+                "UPDATE agent_import_identity
          SET state = ?, owner = NULL, lease_expires_at = NULL,
              attempt_id = NULL, attempt_checkpoint_id = NULL,
              fence_token = COALESCE(fence_token, 0) + 1,
@@ -3708,6 +3722,8 @@ async fn abandon_import_attempt(
                  AND lease_owner IS NOT NULL
                  AND lease_expires_at > (unixepoch('now') * 1000)
            ))",
+            )
+            .await?,
             [
                 abandonment.identity_state.into(),
                 abandonment.last_error_code.into(),
@@ -3959,7 +3975,12 @@ async fn current_parent_commit(
     deadline: Instant,
 ) -> Result<Option<String>> {
     await_import_precommit_read_until(deadline, async {
-        match crate::internal::head::Head::current_commit_result_with_conn(conn).await {
+        // HEAD lives in `libra.db`; the import catalog connection may be
+        // `capture.db`, which has no `reference` table.
+        let repository = crate::internal::db::repository_peer(conn)
+            .await
+            .context("open the repository database to resolve HEAD for import")?;
+        match crate::internal::head::Head::current_commit_result_with_conn(&repository).await {
             Ok(commit) => Ok(commit.map(|hash| hash.to_string())),
             Err(crate::internal::branch::BranchStoreError::Corrupt { detail, .. })
                 if detail.contains("HEAD reference is missing") =>

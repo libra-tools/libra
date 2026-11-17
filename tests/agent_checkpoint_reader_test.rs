@@ -77,7 +77,35 @@ impl ReaderRepo {
 
     /// Run the built `libra` binary inside the repo with a clean
     /// environment plus explicitly requested fixture variables.
+    ///
+    /// A realtime hook only queues its event: it runs without its detached
+    /// consumer (debug-build seam), then one consumer runs with the same
+    /// variables. The result is the hook's failure or else the consumer's
+    /// status, with both outputs.
     fn run(&self, args: &[&str], stdin: Option<&str>, extra_envs: &[(&str, &str)]) -> Output {
+        if !args.iter().take(3).any(|arg| *arg == "hooks") {
+            return self.run_raw(args, stdin, extra_envs);
+        }
+        let mut hook_envs = extra_envs.to_vec();
+        hook_envs.push(("LIBRA_TEST", "1"));
+        hook_envs.push(("LIBRA_TEST_CAPTURE_SPOOL_NO_CONSUMER", "1"));
+        let queued = self.run_raw(args, stdin, &hook_envs);
+        if !queued.status.success() {
+            return queued;
+        }
+        let consumer = self.run_raw(&["__capture-spool-drain"], None, extra_envs);
+        let mut stdout = queued.stdout;
+        stdout.extend(consumer.stdout);
+        let mut stderr = queued.stderr;
+        stderr.extend(consumer.stderr);
+        Output {
+            status: consumer.status,
+            stdout,
+            stderr,
+        }
+    }
+
+    fn run_raw(&self, args: &[&str], stdin: Option<&str>, extra_envs: &[(&str, &str)]) -> Output {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_libra"));
         cmd.args(args)
             .current_dir(&self.repo)
@@ -119,7 +147,14 @@ impl ReaderRepo {
     /// Direct connection to the repository's SQLite catalog (the same
     /// `.libra/libra.db` the CLI reads), for row seeding and EXPLAIN.
     async fn db(&self) -> DatabaseConnection {
-        let url = format!("sqlite://{}", self.libra_dir().join("libra.db").display());
+        // Catalog rows live in `capture.db` once the capture store opens.
+        let capture = self.libra_dir().join("private").join("capture.db");
+        let database = if capture.is_file() {
+            capture
+        } else {
+            self.libra_dir().join("libra.db")
+        };
+        let url = format!("sqlite://{}", database.display());
         let mut opts = ConnectOptions::new(url);
         opts.sqlx_logging(false);
         Database::connect(opts).await.expect("open repo db")

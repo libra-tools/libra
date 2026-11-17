@@ -162,6 +162,10 @@ structured report is always present.
 | `frame` | `LBR-AGENT-038` | `internal` | Bridge mutation fence drifted — HEAD moved, or the index/worktree is dirty where the operation requires a clean one; refused **before** any write | `commit.create` with a stale `expected_head`, or `checkpoint.restore` against a dirty working tree |
 | `128` | `LBR-AGENT-039` | `internal` | Reserved historical outcome: a removed controlled-fix path was denied at a Code-runtime tool or sandbox approval gate; no patch was applied | former `review --fix` / `investigate fix` denial |
 | `128` | `LBR-AGENT-040` | `internal` | Reserved historical outcome: a removed controlled-fix path stopped without a clean patch or deterministic repair result | former invalid terminal response, later denial after a patch, or controlled-execution timeout |
+| `128` | `LBR-AGENT-046` | `internal` | Realtime capture queue is full: `ready/` plus `quarantine/` already hold 1024 files or 256 MiB, or `tmp/` already holds 64 in-flight files. The hook wrote no `ready/` file | many parallel agent hooks while the capture consumer is stopped; retry after `libra __capture-spool-drain` stores the queue |
+| `128` | `LBR-AGENT-047` | `internal` | `.libra/private/capture.db` stayed busy past the consumer's 30-second wait. Queued events stay in `ready/` for the next consumer | `libra __capture-spool-drain` while another process holds a long capture write transaction |
+| `128` | `LBR-AGENT-048` | `internal` | `.libra/private/capture.db` was written by a newer Libra. Only the capture database is refused; queued events stay in `ready/` | `libra __capture-spool-drain` run by an older binary after a newer one migrated `capture.db` |
+| `128` | `LBR-AGENT-049` | `internal` | Another process held the realtime capture queue lock (`capture-spool/capacity.lock`) for the hook's whole wait window (its remaining capture budget, at most 30 seconds). The hook wrote no `ready/` file | many hooks publishing at once on a slow filesystem; retry the hook |
 | `128` | `LBR-MEMORY-001` | `repo` | Memory projection is stale and refuses to answer (ADR-DM-10 fail-closed) | `libra memory status`/`list`/`show` after a commit/change advanced beyond the last rebuild; pass `--allow-stale` to read anyway |
 | `128` | `LBR-MEMORY-002` | `repo` | Requested memory episode id is absent from the current window projection | `libra memory show <id>` with an unknown episode id |
 | `9` | `LBR-WARN-001` | `warning` | Command completed with warnings | `--exit-code-on-warning` |
@@ -306,6 +310,10 @@ evidence on uncertainty. See [repair recovery](commands/config.md#confirmed-lega
 | `LBR-AGENT-038` | Bridge mutation fence drifted (HEAD moved or the index/worktree is dirty); refused before any write |
 | `LBR-AGENT-039` | Reserved historical controlled-fix approval denial; the removed `review --fix` / `investigate fix` paths no longer emit it |
 | `LBR-AGENT-040` | Reserved historical controlled-fix failure without a clean patch or deterministic repair result; the removed paths no longer emit it |
+| `LBR-AGENT-046` | Realtime capture queue is full; the hook did not queue its event |
+| `LBR-AGENT-047` | Capture database busy; queued events stay durable and are retried |
+| `LBR-AGENT-048` | Capture database schema is newer than this binary; only `capture.db` is refused |
+| `LBR-AGENT-049` | Realtime capture queue lock stayed busy for the hook's wait window; the hook did not queue its event |
 
 ### Unsupported
 

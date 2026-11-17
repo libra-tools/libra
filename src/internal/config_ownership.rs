@@ -331,6 +331,22 @@ pub const CODE_AGENT_TABLE_OWNERSHIP: &[(&str, ConfigOwner)] = &[
 /// missing here.
 pub const CODE_AGENT_PROCESS_CACHES: &[ProcessCacheSurface] = &[
     ProcessCacheSurface {
+        source_path: "src/internal/ai/capture/drain.rs",
+        static_name: "SPOOL_READS",
+        discipline: "test-only record of (storage, ready file) consumer reads keyed by spool root; \
+                     compiled only under cfg(test) and holds no repository state",
+    },
+    ProcessCacheSurface {
+        source_path: "src/internal/ai/capture/spool.rs",
+        static_name: "FAIL_BEFORE_RENAME",
+        discipline: "test-only fault list keyed by spool root; compiled only under cfg(test)",
+    },
+    ProcessCacheSurface {
+        source_path: "src/internal/ai/capture/spool.rs",
+        static_name: "PAUSE_AFTER_TMP",
+        discipline: "test-only fault list keyed by spool root; compiled only under cfg(test)",
+    },
+    ProcessCacheSurface {
         source_path: "src/internal/ai/capture/ingress.rs",
         static_name: "COUNTS",
         discipline: "process-local MessageDisplay admission counters keyed by provider session id; \

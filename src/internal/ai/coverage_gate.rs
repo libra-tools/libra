@@ -713,6 +713,11 @@ async fn read_reasoning_map(
     session_id: &str,
     reader: Option<&ReasoningIdentityReadContext>,
 ) -> Result<StoredReasoningMap> {
+    // The map is a repository `metadata_kv` row; a capture-only connection
+    // reads it from `libra.db`.
+    if let Some(peer) = crate::internal::metadata::repository_metadata_peer(conn).await? {
+        return Box::pin(read_reasoning_map(&peer, scope, session_id, reader)).await;
+    }
     let rows = conn
         .query_all_raw(Statement::from_sql_and_values(
             conn.get_database_backend(),

@@ -746,8 +746,12 @@ fn run_hook(
         "prompt": "hook dispatch boundary fixture",
     })
     .to_string();
+    // The hook only queues its event (its detached consumer is disabled by
+    // the debug-build seam); one consumer then stores it, and the result is
+    // the hook's failure or else the consumer's status with both outputs.
     let mut child = fixture
         .command(&repo, args)
+        .env("LIBRA_TEST_CAPTURE_SPOOL_NO_CONSUMER", "1")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -759,7 +763,23 @@ fn run_hook(
         .expect("hook stdin is piped")
         .write_all(envelope.as_bytes())
         .expect("write hook envelope");
-    child.wait_with_output().expect("wait for libra hook entry")
+    let queued = child.wait_with_output().expect("wait for libra hook entry");
+    if !queued.status.success() {
+        return queued;
+    }
+    let consumer = fixture
+        .command(&repo, &["__capture-spool-drain"])
+        .output()
+        .expect("run capture spool drain");
+    let mut stdout = queued.stdout;
+    stdout.extend(consumer.stdout);
+    let mut stderr = queued.stderr;
+    stderr.extend(consumer.stderr);
+    Output {
+        status: consumer.status,
+        stdout,
+        stderr,
+    }
 }
 
 /// Every hook spelling exercised by the dispatch-boundary tests: the

@@ -251,6 +251,31 @@ Binaries older than this release cannot read that catalog. They still open
 the repository database, which no longer holds the capture tables. Use this
 release, or a newer one, to read captured sessions and checkpoints.
 
+Realtime hooks (Claude Code, Codex, Grok, OpenCode, Hermes and Pi) do not
+open either database. A hook redacts its event, writes one versioned envelope
+under `.libra/private/capture-spool/ready/`, and exits. Exit `0` means the
+envelope is queued (or the same event was already queued). The envelope file
+is flushed before it is renamed into `ready/`; on Unix the `ready/` directory
+is flushed as well, so the queued event survives a crash or power loss. On
+Windows the rename itself is not flushed, so a power loss right after exit `0`
+can drop the newest envelope. Exit `0` does not
+mean the event is already visible to `libra agent session list` or other
+queries, which read only `capture.db`. After queueing, the hook starts one
+detached consumer. Only one consumer runs per repository; it stores
+`ready/` in filename order (terminal `SessionEnd` envelopes first) and deletes
+a file only after its catalog transaction commits. A consumer that cannot
+start, a busy capture database, or a later storage failure does not change
+the hook's exit code: busy or too-new database errors leave the file in
+`ready/` for the next consumer, and an envelope that cannot be stored moves to
+`quarantine/`. A hook fails only when nothing was queued, for example when the
+queue is full (`LBR-AGENT-046`: `ready/` plus `quarantine/` hold 1024 files or
+256 MiB, or 64 envelopes are being written) or other hooks held the queue lock
+for the hook's whole capture budget, at most 30 seconds (`LBR-AGENT-049`). To store queued events by hand,
+for example after upgrading, run `libra __capture-spool-drain` from the
+repository root; it prints nothing on success, never prints envelope contents,
+and exits non-zero when it moved an event to `quarantine/`.
+`libra agent import` still writes `capture.db` directly and does not queue.
+
 `libra agent workspace list|show` is the read-only machine interface over
 the workspace registry (`workspace_record`): every linked worktree, task
 worktree, or remote workspace an agent runtime has associated, with its

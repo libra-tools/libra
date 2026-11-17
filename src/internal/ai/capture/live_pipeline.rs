@@ -35,7 +35,10 @@ use crate::{
                     CaptureCoordinatorReserveOutcome, NoCheckpointStore,
                 },
                 finalizer::{CaptureFinalizeMode, CaptureFinalizePolicy},
-                ingress::{CaptureDeadline, CaptureIngressCommand, CaptureIngressOutcome},
+                ingress::{
+                    CaptureDeadline, CaptureEventContext, CaptureIngressCommand,
+                    CaptureIngressOutcome, CaptureIngressParts, CaptureToolLink,
+                },
                 live::{
                     ExportJobLeaseStore, HOOK_DATABASE_BUSY_TIMEOUT_CAP,
                     HOOK_TERMINAL_SETTLEMENT_GRACE, HookExecutionDeadline, LiveExportLeasePort,
@@ -55,18 +58,22 @@ use crate::{
                     finalizer_now_millis, settle_preapplied_without_checkpoint,
                     write_committed_checkpoint, write_subagent_checkpoint,
                 },
+                runtime_scope::CaptureRuntimeScope,
                 scope_binding::{ActiveRepositoryFailureClass, active_repository_failure},
                 state::{CapturePhase, CheckpointWrite, LifecycleReducerInput, reduce_lifecycle},
                 store as capture_store,
             },
             capture_scope::{CaptureCommitDeadline, CaptureScope},
             hooks::{
-                lifecycle::{LifecycleEventKind, SessionHookEnvelope},
+                lifecycle::{
+                    LifecycleEvent, LifecycleEventKind, LifecycleIdentityScheme,
+                    SessionHookEnvelope,
+                },
                 provider::{HookProvider, ProviderHookCommand},
             },
             observed_agents::live_capture::{
-                LiveCaptureBinding, LiveCaptureContext, SubagentDiscoveryAvailability,
-                SubagentEventPolicy, UntrustedChildSourceHints,
+                LiveCaptureBinding, LiveCaptureContext, ReplayHintKind,
+                SubagentDiscoveryAvailability, SubagentEventPolicy, UntrustedChildSourceHints,
             },
             subagent_content::SubagentDiscovery,
         },
@@ -265,18 +272,124 @@ pub(super) mod test_support {
 
 /// External-Agent capture ingest (`refs/libra/traces`).
 ///
-/// Consumes a command already validated and lowered by ingress, redacts
-/// free-form fields, and upserts into `agent_session`. On `TurnEnd`,
-/// `SessionEnd`, and subagent boundaries it also writes E4-libra checkpoint
-/// commits on `refs/libra/traces`.
-///
-/// Boundary conditions:
-/// - Idempotent on repeated `SessionStart` for the same provider session
-///   (UPSERT keyed by `(agent_kind, provider_session_id)`).
-/// - Best-effort on `agent_session` table absence: if the migration hasn't
-///   run, returns a clear error so misconfigured installs surface a
-///   diagnostic rather than panic.
+/// The realtime hook redacts the validated command and publishes one spool
+/// file. It does not open a database. A later consumer commits the catalog.
 pub(crate) async fn ingest_agent_traces(
+    ingress_command: Box<CaptureIngressCommand>,
+    binding: LiveCaptureBinding,
+    ingest_span: &tracing::Span,
+) -> Result<()> {
+    let _ = ingest_span;
+    let queued = enqueue_validated_capture(ingress_command, binding)?;
+    if super::spool::try_spawn_consumer(&queued.worktree).is_err() {
+        tracing::warn!(
+            target: "agent.capture.spool",
+            reason = "consumer_spawn_failed",
+            "queued capture event is durable; the consumer will retry"
+        );
+    }
+    Ok(())
+}
+
+struct QueuedCapture {
+    worktree: std::path::PathBuf,
+}
+
+fn enqueue_validated_capture(
+    ingress_command: Box<CaptureIngressCommand>,
+    binding: LiveCaptureBinding,
+) -> Result<QueuedCapture> {
+    let storage = ingress_command.runtime_scope().storage_path.clone();
+    let worktree = ingress_command.runtime_scope().worktree_root.clone();
+    let hook_deadline = ingress_command.deadline();
+    // Pre-enqueue validation keeps the repository presence contract without
+    // opening SQLite: a missing database is `LBR-REPO-002`, a database path
+    // that is not a regular file is `LBR-IO-001`. Schema compatibility needs
+    // the database itself, so the consumer reports it.
+    match std::fs::metadata(storage.join(util::DATABASE)) {
+        Ok(metadata) if metadata.is_file() => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(active_repository_failure(
+                ActiveRepositoryFailureClass::DatabaseMissing,
+            ));
+        }
+        _ => {
+            return Err(active_repository_failure(
+                ActiveRepositoryFailureClass::DatabaseUnavailable,
+            ));
+        }
+    }
+    let terminal = ingress_command.event_kind() == LifecycleEventKind::SessionEnd;
+    let display_batch_limit = ingress_command
+        .display_batch_budget()
+        .map(|(_, limit)| limit);
+    let tool_link = ingress_command.tool_link().cloned();
+    let mut parts = (*ingress_command).into_parts();
+    let redaction = redact_lifecycle_event(&mut parts.event);
+    let dedup_key = parts
+        .dedup_key
+        .clone()
+        .unwrap_or_else(|| parts.event_id.to_string());
+    let body = encode_spool_envelope(
+        &parts,
+        binding,
+        display_batch_limit,
+        tool_link.as_ref(),
+        &redaction,
+    )?;
+    super::spool::publish(
+        &storage,
+        terminal,
+        &dedup_key,
+        &body,
+        hook_deadline.map(|deadline| deadline.monotonic()),
+    )
+    .context(super::spool::CaptureEnqueueFailed)?;
+    Ok(QueuedCapture { worktree })
+}
+
+/// Store one queued envelope. The hook deadline is not reused: the file is
+/// already the redacted event, and this function performs the catalog write.
+pub(crate) async fn persist_spool_envelope(
+    bytes: &[u8],
+    expected_storage: &std::path::Path,
+    resolve: SpoolReplayResolver,
+) -> Result<()> {
+    let decoded = decode_spool_envelope(bytes, resolve)?;
+    if !same_storage(
+        &decoded.command.runtime_scope().storage_path,
+        expected_storage,
+    ) {
+        bail!("capture queue entry belongs to another repository");
+    }
+    let command = decoded.command;
+    let binding = decoded.binding;
+    let span = tracing::info_span!(
+        "agent.hook.ingest",
+        provider = binding.hook_name(),
+        verb = %command.hook_command(),
+        event_kind = tracing::field::Empty,
+        event_id = tracing::field::Empty,
+        provider_source = tracing::field::Empty,
+        frame_bytes = tracing::field::Empty,
+        validated = true,
+        partial = tracing::field::Empty,
+    );
+    persist_agent_traces_command(command, binding, &span).await
+}
+
+/// A queue entry names the storage it was enqueued for. The consumer only
+/// replays entries for the repository whose spool it is draining.
+fn same_storage(recorded: &std::path::Path, expected: &std::path::Path) -> bool {
+    match (recorded.canonicalize(), expected.canonicalize()) {
+        (Ok(recorded), Ok(expected)) => recorded == expected,
+        _ => recorded == expected,
+    }
+}
+
+/// Catalog write used only by the spool consumer. Realtime hooks use
+/// [`ingest_agent_traces`], which queues instead.
+async fn persist_agent_traces_command(
     ingress_command: Box<CaptureIngressCommand>,
     binding: LiveCaptureBinding,
     ingest_span: &tracing::Span,
@@ -314,7 +427,12 @@ pub(crate) async fn ingest_agent_traces(
         // An expired terminal gets one non-blocking attempt to create its
         // content-free receipt. It must not wait for a 30-second connection
         // default after the host has already reached its outer deadline.
-        let busy_timeout = if remaining.is_zero() {
+        // A replayed queue entry is the single consumer, not a hook racing
+        // its host's timeout: it may wait out the whole replay window.
+        let replay = ingress_command.replay_redaction().is_some();
+        let busy_timeout = if replay && !remaining.is_zero() {
+            remaining
+        } else if remaining.is_zero() {
             // The deadline is capture's primary work window, not the host's
             // whole timeout. Give an expired terminal one short cold-start
             // connection/receipt attempt from its explicitly reserved
@@ -348,13 +466,21 @@ pub(crate) async fn ingest_agent_traces(
             })?;
         (conn, busy_timeout)
     } else {
-        let conn = db::open_cached_repository(&database_path)
-            .await
-            .map_err(|err| {
-                active_repository_failure(ActiveRepositoryFailureClass::for_database_open(
-                    err.kind(),
-                ))
-            })?;
+        // The spool consumer has no hook deadline. It opens its own
+        // connection exactly like the hook branch, with the consumer's
+        // 30-second wait, rather than the process-wide cached handle that
+        // later repository peers in this process would re-validate.
+        let database_path = database_path.to_str().ok_or_else(|| {
+            active_repository_failure(ActiveRepositoryFailureClass::DatabaseUnavailable)
+        })?;
+        let conn =
+            db::open_repository_with_busy_timeout(database_path, db::DEFAULT_CONNECTION_TIMEOUT)
+                .await
+                .map_err(|err| {
+                    active_repository_failure(ActiveRepositoryFailureClass::for_database_open(
+                        err.kind(),
+                    ))
+                })?;
         (conn, db::DEFAULT_CONNECTION_TIMEOUT)
     };
     await_agent_traces_pure_read_until(
@@ -416,11 +542,27 @@ pub(crate) async fn ingest_agent_traces(
     // Catalog writes, including the export-job lease, go to capture.db.
     // libra.db keeps hash kind, scope, the display budget, and the recovery
     // hint. The two files are never attached.
+    // Repository setup above spent part of the window: recompute the wait
+    // so the catalog open cannot extend past the deadline. An expired
+    // deadline gets the same single short attempt as the repository open.
+    let capture_busy_timeout = match ingress_command.deadline() {
+        Some(deadline) => {
+            let remaining = deadline
+                .monotonic()
+                .saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                HOOK_TERMINAL_SETTLEMENT_GRACE
+                    .min(HOOK_DATABASE_BUSY_TIMEOUT_CAP)
+                    .min(capture_busy_timeout)
+            } else {
+                remaining.min(capture_busy_timeout)
+            }
+        }
+        None => capture_busy_timeout,
+    };
     let capture_conn = capture_store::open(&storage_path, capture_busy_timeout)
         .await
-        .map_err(|err| {
-            active_repository_failure(ActiveRepositoryFailureClass::for_database_open(err.kind()))
-        })?;
+        .map_err(|err| super::drain::classify_capture_open(&err))?;
     ingest_agent_traces_payload_with_scope(
         ingress_command,
         binding,
@@ -470,14 +612,33 @@ pub(crate) async fn ingest_agent_traces_ingress_outcome_for_test(
                 return Ok(());
             }
             let scope = CaptureScope::main_for_connection(conn).await?;
+            // A repository connection whose catalog already moved to
+            // `capture.db` writes the catalog there, as production does.
+            let detached = crate::internal::db::connection_has_table(conn, "config_kv").await?
+                && !crate::internal::db::connection_has_table(conn, "agent_session").await?;
+            let storage = crate::internal::db::connection_storage_root(conn)
+                .await
+                .ok();
+            let capture_conn = if let Some(storage) = storage.filter(|storage| {
+                detached && capture_store::capture_database_path(storage).is_file()
+            }) {
+                Some(
+                    capture_store::open_existing_writer(&storage, db::DEFAULT_CONNECTION_TIMEOUT)
+                        .await
+                        .context("open the capture catalog for an in-process ingest")?,
+                )
+            } else {
+                None
+            };
+            let catalog = capture_conn.as_ref().unwrap_or(conn);
             ingest_agent_traces_payload_with_scope(
                 ingress_command,
                 binding,
-                conn,
+                catalog,
                 repo_path,
                 &scope,
                 &ingest_span,
-                &ExportJobLeaseStore::new(conn),
+                &ExportJobLeaseStore::new(catalog),
             )
             .await
         }
@@ -700,10 +861,9 @@ async fn ingest_agent_traces_payload_with_scope(
     ingest_span: &tracing::Span,
     export_lease: &impl LiveExportLeasePort,
 ) -> Result<()> {
-    use crate::internal::ai::observed_agents::{RedactionMatch, Redactor};
-
     // Read the opaque tool link before the command is consumed; it carries
     // only keyed commitments, never provider IDs.
+    let replay_redaction = ingress_command.replay_redaction().cloned();
     let tool_link = ingress_command
         .tool_link()
         .map(|link| {
@@ -788,63 +948,20 @@ async fn ingest_agent_traces_payload_with_scope(
     test_support::delay_after_ingress_before_redaction();
 
     // Redact every permitted free-form text field before it gets anywhere
-    // near durable storage (AG-19 redaction-before-persist: prompt, tool
-    // input/response, and assistant message). Provider-reported model,
-    // source, tool-name, and session-reference fields are not needed for a
-    // generic capture checkpoint and cannot be safely classified by a
-    // pattern redactor, so drop them instead of preserving arbitrary text.
-    // We aggregate the
-    // per-field reports into a single JSON document that lands in
-    // `agent_session.redaction_report` so the persisted row is observably
-    // scrubbed (Codex round-3 review: "assert observable redaction
-    // outcome").
+    // near durable storage. A spool replay already redacted the event and
+    // supplies that report so the catalog row keeps the original matches.
     let redaction_span = tracing::info_span!(
         "agent.redaction.apply",
         rules_hit = tracing::field::Empty,
         size_cap_triggered = false,
         fail_closed = false,
     );
-    let (all_matches, bytes_scanned, bytes_redacted, dropped_matches) =
-        redaction_span.in_scope(|| {
-            let redactor = Redactor::new_default();
-            let mut all_matches: Vec<RedactionMatch> = Vec::new();
-            let mut bytes_scanned: usize = 0;
-            let mut bytes_redacted: usize = 0;
-            let mut dropped_matches: usize = 0;
-            let mut redact_string = |value: &mut Option<String>| {
-                if let Some(text) = value.take() {
-                    let (redacted, report) = redactor.redact(text.as_bytes());
-                    *value = Some(String::from_utf8_lossy(redacted.bytes()).into_owned());
-                    bytes_scanned += report.bytes_scanned;
-                    bytes_redacted += report.bytes_redacted;
-                    append_redaction_report_bounded(&mut all_matches, &mut dropped_matches, report);
-                }
-            };
-            redact_string(&mut event.prompt);
-            redact_string(&mut event.assistant_message);
-            event.model = None;
-            event.source = None;
-            event.tool_name = None;
-            event.session_ref = None;
-            let mut redact_value = |value: &mut Option<serde_json::Value>| {
-                if let Some(inner) = value.take() {
-                    let Ok(serialized) = serde_json::to_vec(&inner) else {
-                        // A value which cannot round-trip through the redactor is
-                        // unsafe to preserve. Drop it rather than silently retain
-                        // unredacted provider bytes.
-                        return;
-                    };
-                    let (redacted, report) = redactor.redact(&serialized);
-                    *value = serde_json::from_slice(redacted.bytes()).ok();
-                    bytes_scanned += report.bytes_scanned;
-                    bytes_redacted += report.bytes_redacted;
-                    append_redaction_report_bounded(&mut all_matches, &mut dropped_matches, report);
-                }
-            };
-            redact_value(&mut event.tool_input);
-            redact_value(&mut event.tool_response);
-            (all_matches, bytes_scanned, bytes_redacted, dropped_matches)
-        });
+    let runtime_report = replay_redaction
+        .unwrap_or_else(|| redaction_span.in_scope(|| redact_lifecycle_event(&mut event)));
+    let all_matches = runtime_report.matches.clone();
+    let bytes_scanned = runtime_report.bytes_scanned;
+    let bytes_redacted = runtime_report.bytes_redacted;
+    let dropped_matches = runtime_report.dropped_matches;
     redaction_span.record(
         "rules_hit",
         all_matches.len().saturating_add(dropped_matches) as u64,
@@ -1802,6 +1919,385 @@ async fn discover_subagents(
             ..SubagentDiscovery::default()
         },
     }
+}
+
+fn redact_lifecycle_event(
+    event: &mut LifecycleEvent,
+) -> crate::internal::ai::observed_agents::RedactionReport {
+    use crate::internal::ai::observed_agents::{RedactionMatch, Redactor};
+
+    let redactor = Redactor::new_default();
+    let mut all_matches: Vec<RedactionMatch> = Vec::new();
+    let mut bytes_scanned: usize = 0;
+    let mut bytes_redacted: usize = 0;
+    let mut dropped_matches: usize = 0;
+    let mut redact_string = |value: &mut Option<String>| {
+        if let Some(text) = value.take() {
+            let (redacted, report) = redactor.redact(text.as_bytes());
+            *value = Some(String::from_utf8_lossy(redacted.bytes()).into_owned());
+            bytes_scanned += report.bytes_scanned;
+            bytes_redacted += report.bytes_redacted;
+            append_redaction_report_bounded(&mut all_matches, &mut dropped_matches, report);
+        }
+    };
+    redact_string(&mut event.prompt);
+    redact_string(&mut event.assistant_message);
+    event.model = None;
+    event.source = None;
+    event.tool_name = None;
+    event.session_ref = None;
+    let mut redact_value = |value: &mut Option<serde_json::Value>| {
+        if let Some(inner) = value.take() {
+            let Ok(serialized) = serde_json::to_vec(&inner) else {
+                return;
+            };
+            let (redacted, report) = redactor.redact(&serialized);
+            *value = serde_json::from_slice(redacted.bytes()).ok();
+            bytes_scanned += report.bytes_scanned;
+            bytes_redacted += report.bytes_redacted;
+            append_redaction_report_bounded(&mut all_matches, &mut dropped_matches, report);
+        }
+    };
+    redact_value(&mut event.tool_input);
+    redact_value(&mut event.tool_response);
+    crate::internal::ai::observed_agents::RedactionReport {
+        matches: all_matches,
+        dropped_matches,
+        bytes_scanned,
+        bytes_redacted,
+    }
+}
+
+/// ADR-CQ-03: the consumer waits up to 30 seconds for the databases and uses
+/// the same window as the capture budget of one replayed event.
+const SPOOL_REPLAY_CAPTURE_BUDGET: Duration = Duration::from_secs(30);
+
+struct DecodedSpool {
+    command: Box<CaptureIngressCommand>,
+    binding: LiveCaptureBinding,
+}
+
+fn encode_spool_envelope(
+    parts: &CaptureIngressParts,
+    binding: LiveCaptureBinding,
+    display_batch_limit: Option<u32>,
+    tool_link: Option<&CaptureToolLink>,
+    redaction: &crate::internal::ai::observed_agents::RedactionReport,
+) -> Result<Vec<u8>> {
+    let hints = match &parts.child_source_hints {
+        UntrustedChildSourceHints::Absent => json!({"kind": "absent"}),
+        UntrustedChildSourceHints::Unavailable => json!({"kind": "unavailable"}),
+        UntrustedChildSourceHints::Candidate(_) => {
+            let view = parts
+                .child_source_hints
+                .candidate()
+                .context("capture queue lost a child source hint")?;
+            json!({
+                "kind": "candidate",
+                "role": match view.role {
+                    crate::internal::ai::observed_agents::live_capture::ChildSourceHintRole::CurrentThread => "current",
+                    crate::internal::ai::observed_agents::live_capture::ChildSourceHintRole::ChildBoundary => "boundary",
+                },
+                "current_or_parent_path": view.current_or_parent_path.map(|path| path.display().to_string()),
+                "child_path": view.child_path.map(|path| path.display().to_string()),
+                "child_id": view.child_id,
+                "turn_id": view.turn_id,
+            })
+        }
+    };
+    let body = json!({
+        "version": 1,
+        "agent_kind": binding.agent_kind_db(),
+        "hook_name": binding.hook_name(),
+        "hook_command": parts.hook_command.to_string(),
+        "provider_kind": parts.provider_kind,
+        "provider_source": parts.provider_source,
+        "frame_bytes": parts.frame_bytes,
+        "event_id": parts.event_id.to_string(),
+        "identity_scheme": parts.identity_scheme.as_wire(),
+        "dedup_key": parts.dedup_key,
+        "hook_deadline": parts.deadline.is_some(),
+        "display_batch_limit": display_batch_limit,
+        "tool_link": tool_link.map(|link| json!({"tool": link.tool, "parent": link.parent})),
+        "child_hints": hints,
+        "context": {
+            "provider_session_id": parts.context.provider_session_id,
+            "working_dir": parts.context.working_dir,
+            "storage_path": parts.context.runtime_scope.storage_path.display().to_string(),
+            "worktree_root": parts.context.runtime_scope.worktree_root.display().to_string(),
+        },
+        "event": {
+            "kind": parts.event.kind.to_string(),
+            "session_id": parts.event.session_id,
+            "session_ref": parts.event.session_ref,
+            "prompt": parts.event.prompt,
+            "model": parts.event.model,
+            "source": parts.event.source,
+            "tool_name": parts.event.tool_name,
+            "tool_input": parts.event.tool_input,
+            "tool_response": parts.event.tool_response,
+            "assistant_message": parts.event.assistant_message,
+            "timestamp": parts.event.timestamp.to_rfc3339(),
+        },
+        "redaction": redaction,
+    });
+    serde_json::to_vec(&body).context("encode capture queue envelope")
+}
+
+/// What the hook entry layer resolves for one queued envelope: the binding
+/// the hook itself used, plus the provider's names. The capture runtime stays
+/// provider neutral; it only checks the envelope against these values.
+#[derive(Clone, Copy)]
+pub(crate) struct SpoolReplayProvider {
+    pub(crate) binding: LiveCaptureBinding,
+    pub(crate) provider_kind: &'static str,
+    pub(crate) provider_source: &'static str,
+}
+
+/// Hook name to replay provider, supplied by the hook entry layer
+/// (`crate::command::hooks::spool_replay_provider`). `None` for a hook this
+/// binary does not record.
+pub(crate) type SpoolReplayResolver = fn(&str) -> Option<SpoolReplayProvider>;
+
+fn decode_spool_envelope(bytes: &[u8], resolve: SpoolReplayResolver) -> Result<DecodedSpool> {
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).context("capture queue entry is not a valid envelope")?;
+    if value.get("version").and_then(|version| version.as_u64()) != Some(1) {
+        bail!("capture queue entry has an unsupported envelope version");
+    }
+    // Replay uses the binding exactly as the hook did. A file whose provider,
+    // source or agent kind does not match that binding is not one this
+    // binary wrote, so it is rejected rather than replayed.
+    let replay = resolve(required_str(&value, "hook_name")?)
+        .context("capture queue entry names an unknown hook")?;
+    if required_str(&value, "provider_kind")? != replay.provider_kind {
+        bail!("capture queue entry names a provider that does not match its hook");
+    }
+    if required_str(&value, "provider_source")? != replay.provider_source {
+        bail!("capture queue entry names a provider source that does not match its hook");
+    }
+    let binding = replay.binding;
+    if required_str(&value, "agent_kind")? != binding.agent_kind_db() {
+        bail!("capture queue entry names a hook that does not match its agent");
+    }
+    let provider_kind = replay.provider_kind;
+    let provider_source = replay.provider_source;
+    let event = decode_event(
+        value
+            .get("event")
+            .context("capture queue entry has no event")?,
+    )?;
+    let context_value = value
+        .get("context")
+        .context("capture queue entry has no scope")?;
+    let context = CaptureEventContext {
+        provider_session_id: required_str(context_value, "provider_session_id")?.to_string(),
+        working_dir: required_str(context_value, "working_dir")?.to_string(),
+        runtime_scope: CaptureRuntimeScope::new(
+            std::path::PathBuf::from(required_str(context_value, "storage_path")?),
+            std::path::PathBuf::from(required_str(context_value, "worktree_root")?),
+        ),
+    };
+    let tool_link = value.get("tool_link").and_then(|link| {
+        if link.is_null() {
+            return None;
+        }
+        Some(CaptureToolLink {
+            tool: link.get("tool")?.as_str()?.to_string(),
+            parent: link
+                .get("parent")
+                .and_then(|parent| parent.as_str().map(str::to_string)),
+        })
+    });
+    let redaction: crate::internal::ai::observed_agents::RedactionReport =
+        serde_json::from_value(value.get("redaction").cloned().unwrap_or(json!({})))
+            .context("capture queue entry has no redaction report")?;
+    let parts = CaptureIngressParts {
+        child_source_hints: decode_hints(value.get("child_hints"))?,
+        frame_bytes: value
+            .get("frame_bytes")
+            .and_then(|bytes| bytes.as_u64())
+            .and_then(|bytes| usize::try_from(bytes).ok())
+            .unwrap_or(0),
+        hook_command: parse_hook_command(required_str(&value, "hook_command")?)?,
+        provider_kind,
+        provider_source,
+        event_id: uuid::Uuid::parse_str(required_str(&value, "event_id")?)
+            .context("capture queue entry has a bad event id")?,
+        identity_scheme: parse_identity_scheme(required_str(&value, "identity_scheme")?)?,
+        deadline: None,
+        dedup_key: value
+            .get("dedup_key")
+            .and_then(|key| key.as_str().map(str::to_string)),
+        context,
+        event,
+    };
+    let display_batch_limit = value
+        .get("display_batch_limit")
+        .and_then(|limit| limit.as_u64())
+        .and_then(|limit| u32::try_from(limit).ok());
+    // A hook that ran with a capture budget is replayed inside the
+    // consumer's own capture window: a provider that owns its export window
+    // keeps that budget, every other replay gets the consumer budget. A hook
+    // run without a budget is replayed without one, as it would have run
+    // in-process; its database waits use the 30-second connection timeout.
+    let hook_deadline = value
+        .get("hook_deadline")
+        .and_then(|flag| flag.as_bool())
+        .unwrap_or(true);
+    let deadline = if hook_deadline {
+        let budget = binding
+            .missing_host_capture_budget()
+            .unwrap_or(SPOOL_REPLAY_CAPTURE_BUDGET);
+        Some(
+            CaptureDeadline::from_budget_millis(
+                u64::try_from(budget.as_millis())
+                    .context("capture queue replay budget is out of range")?,
+            )
+            .context("establish the capture queue replay deadline")?,
+        )
+    } else {
+        None
+    };
+    Ok(DecodedSpool {
+        command: Box::new(CaptureIngressCommand::from_replay_parts(
+            parts,
+            display_batch_limit,
+            tool_link,
+            redaction,
+            deadline,
+        )),
+        binding,
+    })
+}
+
+fn required_str<'a>(value: &'a serde_json::Value, key: &str) -> Result<&'a str> {
+    value
+        .get(key)
+        .and_then(|item| item.as_str())
+        .context("capture queue entry is missing a required field")
+}
+
+fn decode_event(value: &serde_json::Value) -> Result<LifecycleEvent> {
+    let timestamp = chrono::DateTime::parse_from_rfc3339(required_str(value, "timestamp")?)
+        .context("capture queue entry has a bad timestamp")?
+        .with_timezone(&chrono::Utc);
+    Ok(LifecycleEvent {
+        kind: parse_event_kind(required_str(value, "kind")?)?,
+        session_id: required_str(value, "session_id")?.to_string(),
+        session_ref: value
+            .get("session_ref")
+            .and_then(|item| item.as_str().map(str::to_string)),
+        prompt: value
+            .get("prompt")
+            .and_then(|item| item.as_str().map(str::to_string)),
+        model: value.get("model").cloned().filter(|item| !item.is_null()),
+        source: value.get("source").cloned().filter(|item| !item.is_null()),
+        tool_name: value
+            .get("tool_name")
+            .and_then(|item| item.as_str().map(str::to_string)),
+        tool_input: value
+            .get("tool_input")
+            .cloned()
+            .filter(|item| !item.is_null()),
+        tool_response: value
+            .get("tool_response")
+            .cloned()
+            .filter(|item| !item.is_null()),
+        assistant_message: value
+            .get("assistant_message")
+            .and_then(|item| item.as_str().map(str::to_string)),
+        timestamp,
+    })
+}
+
+fn decode_hints(value: Option<&serde_json::Value>) -> Result<UntrustedChildSourceHints> {
+    let Some(value) = value else {
+        return Ok(UntrustedChildSourceHints::Absent);
+    };
+    let kind = match value.get("kind").and_then(|kind| kind.as_str()) {
+        Some("absent") => ReplayHintKind::Absent,
+        Some("unavailable") => ReplayHintKind::Unavailable,
+        Some("candidate") => ReplayHintKind::Candidate,
+        _ => bail!("capture queue entry has a bad child hint"),
+    };
+    let role = match value.get("role").and_then(|role| role.as_str()) {
+        Some("current") => Some(
+            crate::internal::ai::observed_agents::live_capture::ChildSourceHintRole::CurrentThread,
+        ),
+        Some("boundary") => Some(
+            crate::internal::ai::observed_agents::live_capture::ChildSourceHintRole::ChildBoundary,
+        ),
+        _ => None,
+    };
+    let path = |key: &str| {
+        value
+            .get(key)
+            .and_then(|item| item.as_str())
+            .map(std::path::PathBuf::from)
+    };
+    let text = |key: &str| {
+        value
+            .get(key)
+            .and_then(|item| item.as_str())
+            .map(str::to_string)
+    };
+    Ok(UntrustedChildSourceHints::from_replay(
+        kind,
+        role,
+        path("current_or_parent_path"),
+        path("child_path"),
+        text("child_id"),
+        text("turn_id"),
+    ))
+}
+
+/// The realtime providers that queue. Gemini stays refused and never queues.
+fn parse_hook_command(name: &str) -> Result<ProviderHookCommand> {
+    Ok(match name {
+        "session-start" => ProviderHookCommand::SessionStart,
+        "prompt" => ProviderHookCommand::Prompt,
+        "tool-use" => ProviderHookCommand::ToolUse,
+        "permission-request" => ProviderHookCommand::PermissionRequest,
+        "model-update" => ProviderHookCommand::ModelUpdate,
+        "compaction" => ProviderHookCommand::Compaction,
+        "stop" => ProviderHookCommand::Stop,
+        "session-end" => ProviderHookCommand::SessionEnd,
+        "subagent-start" => ProviderHookCommand::SubagentStart,
+        "subagent-end" => ProviderHookCommand::SubagentEnd,
+        "observe" => ProviderHookCommand::Observe,
+        _ => bail!("capture queue entry names an unknown hook command"),
+    })
+}
+
+fn parse_event_kind(name: &str) -> Result<LifecycleEventKind> {
+    Ok(match name {
+        "session_start" => LifecycleEventKind::SessionStart,
+        "turn_start" => LifecycleEventKind::TurnStart,
+        "tool_use" => LifecycleEventKind::ToolUse,
+        "model_update" => LifecycleEventKind::ModelUpdate,
+        "compaction" => LifecycleEventKind::Compaction,
+        "compaction_completed" => LifecycleEventKind::CompactionCompleted,
+        "permission_request" => LifecycleEventKind::PermissionRequest,
+        "source_enabled" => LifecycleEventKind::SourceEnabled,
+        "source_disabled" => LifecycleEventKind::SourceDisabled,
+        "turn_end" => LifecycleEventKind::TurnEnd,
+        "session_end" => LifecycleEventKind::SessionEnd,
+        "subagent_start" => LifecycleEventKind::SubagentStart,
+        "subagent_end" => LifecycleEventKind::SubagentEnd,
+        "turn_interrupted" => LifecycleEventKind::TurnInterrupted,
+        _ => bail!("capture queue entry names an unknown event"),
+    })
+}
+
+fn parse_identity_scheme(name: &str) -> Result<LifecycleIdentityScheme> {
+    Ok(match name {
+        "native_replay_hmac_v2" => LifecycleIdentityScheme::NativeReplayHmacV2,
+        "fallback_action_hmac_v1" => LifecycleIdentityScheme::FallbackActionHmacV1,
+        "generic_lifecycle_uuid_v5" => LifecycleIdentityScheme::GenericLifecycleUuidV5,
+        "import_uuid_v5" => LifecycleIdentityScheme::ImportUuidV5,
+        _ => bail!("capture queue entry names an unknown identity scheme"),
+    })
 }
 
 // Test-only crash knob / harness boundary: raw frames and fault injection

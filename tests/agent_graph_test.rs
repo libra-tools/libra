@@ -54,11 +54,16 @@ impl GraphRepo {
         self.command().args(args).output().expect("run libra")
     }
 
+    /// Catalog rows live in `capture.db` once the capture store has opened
+    /// (it copies fixture rows written to `libra.db` before that).
     async fn connection(&self) -> DatabaseConnection {
-        let url = format!(
-            "sqlite://{}?mode=rwc",
-            self.repo.join(".libra/libra.db").display()
-        );
+        let capture = self.repo.join(".libra/private/capture.db");
+        let database = if capture.is_file() {
+            capture
+        } else {
+            self.repo.join(".libra/libra.db")
+        };
+        let url = format!("sqlite://{}?mode=rwc", database.display());
         Database::connect(url).await.expect("open graph fixture db")
     }
 

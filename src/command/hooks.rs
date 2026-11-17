@@ -198,7 +198,21 @@ pub async fn execute_safe(
             )
             .await;
             if cmd == ProviderHookCommand::Observe {
-                if captured.is_err() {
+                // Observe tolerates events it does not record (malformed or
+                // partial envelopes stay silent), but an event that passed
+                // validation and could not be written to the queue fails:
+                // exit 0 promises the event is queued.
+                if let Err(err) = captured {
+                    if err
+                        .downcast_ref::<crate::internal::ai::capture::spool::CaptureEnqueueFailed>()
+                        .is_some()
+                    {
+                        return Err(map_capture_ingest_error(
+                            err,
+                            "hook ingestion failed",
+                            CaptureErrorSurface::FailClosed,
+                        ));
+                    }
                     tracing::warn!(
                         target: "agent.hook.ingest",
                         reason = "claude_observe_partial",
@@ -343,7 +357,10 @@ async fn probe_active_repository_database(
 /// unresolvable storage is `LBR-REPO-003`, a missing database or unsupported
 /// object format `LBR-REPO-002`, and an unopenable database or unreadable
 /// object format `LBR-IO-001`.
-fn active_repository_failure_error(class: ActiveRepositoryFailureClass, context: &str) -> CliError {
+pub(crate) fn active_repository_failure_error(
+    class: ActiveRepositoryFailureClass,
+    context: &str,
+) -> CliError {
     match class {
         ActiveRepositoryFailureClass::StorageUnresolved => CliError::fatal(format!(
             "{context}: could not resolve the active repository storage (detached, migrating \
@@ -549,6 +566,38 @@ pub(crate) enum CaptureErrorSurface {
 /// `LBR-IO-001` error with a fixed, path-free remedy. Precedence is:
 /// envelope-invalid and no-repository, unsupported platform, the restored
 /// repository classes, then the generic message.
+/// Hook name to the binding the capture queue consumer replays with.
+///
+/// The realtime hook entry resolves its provider from the CLI subcommand;
+/// the consumer gets the same provider singleton from the hook name written
+/// in the envelope. This mapping lives here, in the entry layer, so the
+/// capture runtime never names a provider.
+pub(crate) fn spool_replay_provider(
+    hook_name: &str,
+) -> Option<crate::internal::ai::capture::live_pipeline::SpoolReplayProvider> {
+    use crate::internal::ai::hooks::providers;
+    let provider: &'static dyn crate::internal::ai::hooks::provider::HookProvider = match hook_name
+    {
+        "claude" => providers::claude_provider(),
+        "codex" => providers::codex_provider(),
+        "grok" => providers::grok_provider(),
+        "opencode" => providers::opencode_provider(),
+        "hermes" => providers::hermes::hermes_provider(),
+        "pi" => providers::pi::pi_provider(),
+        _ => return None,
+    };
+    Some(
+        crate::internal::ai::capture::live_pipeline::SpoolReplayProvider {
+            binding:
+                crate::internal::ai::observed_agents::live_capture::LiveCaptureBinding::resolve(
+                    provider,
+                ),
+            provider_kind: provider.provider_name(),
+            provider_source: provider.source_name(),
+        },
+    )
+}
+
 pub(crate) fn map_capture_ingest_error(
     err: anyhow::Error,
     context: &str,
@@ -571,6 +620,38 @@ pub(crate) fn map_capture_ingest_error(
     if envelope_invalid {
         CliError::fatal(format!("{context}: {err}"))
             .with_stable_code(StableErrorCode::AgentHookEnvelopeInvalid)
+    } else if err
+        .chain()
+        .any(|cause| cause.is::<crate::internal::ai::capture::spool::CaptureQueueFull>())
+    {
+        CliError::fatal(format!(
+            "{context}: the capture queue is full; retry after queued events are stored"
+        ))
+        .with_stable_code(StableErrorCode::CaptureQueueFull)
+    } else if err
+        .chain()
+        .any(|cause| cause.is::<crate::internal::ai::capture::spool::CaptureQueueBusy>())
+    {
+        CliError::fatal(format!(
+            "{context}: the capture queue is busy; retry after the current writers finish"
+        ))
+        .with_stable_code(StableErrorCode::CaptureQueueBusy)
+    } else if err
+        .chain()
+        .any(|cause| cause.is::<crate::internal::ai::capture::drain::CaptureDatabaseBusy>())
+    {
+        CliError::fatal(format!(
+            "{context}: the capture database is busy; queued events stay durable and will be retried"
+        ))
+        .with_stable_code(StableErrorCode::CaptureDatabaseBusy)
+    } else if err
+        .chain()
+        .any(|cause| cause.is::<crate::internal::ai::capture::drain::CaptureSchemaTooNew>())
+    {
+        CliError::fatal(format!(
+            "{context}: the capture database schema is too new for this binary; install the current Libra release and run libra __capture-spool-drain"
+        ))
+        .with_stable_code(StableErrorCode::CaptureSchemaTooNew)
     } else {
         CliError::fatal(format!(
             "{context}: capture could not be completed; retry the hook or inspect the local repository"

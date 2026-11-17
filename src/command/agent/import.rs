@@ -3068,7 +3068,9 @@ async fn set_import_index_barrier_pending(
         }
         txn.execute_raw(Statement::from_sql_and_values(
             txn.get_database_backend(),
-            "UPDATE agent_import_identity
+            &crate::internal::db::catalog_lease_sql(
+                &txn,
+                "UPDATE agent_import_identity
              SET state = 'partial', last_error_code = 'LBR-AGENT-018', updated_at = ?
              WHERE identity_id = ? AND fence_token = ? AND state = 'committed'
                AND scope_state = 'scoped' AND repo_id = ? AND worktree_id = ?
@@ -3082,6 +3084,8 @@ async fn set_import_index_barrier_pending(
                      AND lease_owner IS NOT NULL
                      AND lease_expires_at > (unixepoch('now') * 1000)
                ))",
+            )
+            .await?,
             [
                 Utc::now().timestamp_millis().into(),
                 identity.identity_id.clone().into(),

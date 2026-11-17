@@ -129,6 +129,37 @@ pub struct CaptureScope {
     pub workspace_fence: Option<i64>,
 }
 
+/// Repository identity, workspace records and the lease fence live in
+/// `libra.db`. A connection to the capture catalog (`capture.db`: catalog
+/// tables, no `config_kv`) is answered from its paired repository database;
+/// any other connection is used as given.
+async fn scope_repository_peer<C: ConnectionTrait>(
+    conn: &C,
+) -> Result<Option<sea_orm::DatabaseConnection>> {
+    if crate::internal::db::connection_has_table(conn, "config_kv")
+        .await
+        .context("inspect capture scope database")?
+        || !crate::internal::db::connection_has_table(conn, "agent_session")
+            .await
+            .context("inspect capture scope database")?
+    {
+        return Ok(None);
+    }
+    let peer = crate::internal::db::open_paired_repository(conn)
+        .await
+        .context("open the repository database for the capture scope")?;
+    // A combined database that lost `config_kv` pairs with itself. It has no
+    // separate repository database: query it directly, so the missing table
+    // surfaces as its typed database error instead of an endless pairing.
+    if !crate::internal::db::connection_has_table(&peer, "config_kv")
+        .await
+        .context("inspect capture scope database")?
+    {
+        return Ok(None);
+    }
+    Ok(Some(peer))
+}
+
 impl CaptureScope {
     /// Only the sealed-payload writer calls this signing façade. Key creation
     /// belongs to verified ingress/source acquisition, never artifact replay.
@@ -194,16 +225,29 @@ impl CaptureScope {
                 Ok(())
             };
             check_deadline()?;
-            let resolved_scope = Self::resolve(conn, authorized_root)
+            // Repository identity and the workspace lease live in
+            // `libra.db`. A capture-only connection (`capture.db`) cannot
+            // answer them, so the check runs on a fresh repository
+            // connection for the same storage instead of the cached handle,
+            // which a caller may already hold in a write transaction.
+            let on_repository = crate::internal::db::connection_has_table(conn, "config_kv")
                 .await
-                .context("resolve capture commitment scope")?;
-            check_deadline()?;
-            if &resolved_scope != self {
-                bail!("capture commitment root does not belong to the authorized scope");
+                .context("inspect capture commitment database")?;
+            if on_repository {
+                self.assert_scope_and_lease(conn, authorized_root).await?;
+            } else {
+                let database = storage_path.join(util::DATABASE);
+                let database = database
+                    .to_str()
+                    .context("the repository database path is not valid UTF-8")?;
+                let busy = deadline.saturating_duration_since(Instant::now());
+                let repository =
+                    crate::internal::db::open_repository_with_busy_timeout(database, busy)
+                        .await
+                        .context("open the repository database for the capture commitment")?;
+                self.assert_scope_and_lease(&repository, authorized_root)
+                    .await?;
             }
-            self.assert_workspace_fence_live(conn)
-                .await
-                .context("verify capture commitment workspace lease")?;
             check_deadline()?;
             let authorized_storage =
                 util::try_get_storage_path(Some(authorized_root.to_path_buf()))
@@ -225,12 +269,33 @@ impl CaptureScope {
         .map_err(|_| anyhow::anyhow!(CaptureFinalCommitAuthorizationError::DeadlineElapsed))?
     }
 
+    /// The repository-side half of [`Self::assert_capture_key_storage_binding_until`]:
+    /// the authorized root must resolve to this scope and its lease must be live.
+    async fn assert_scope_and_lease<C: ConnectionTrait>(
+        &self,
+        repository: &C,
+        authorized_root: &Path,
+    ) -> Result<()> {
+        let resolved_scope = Self::resolve(repository, authorized_root)
+            .await
+            .context("resolve capture commitment scope")?;
+        if &resolved_scope != self {
+            bail!("capture commitment root does not belong to the authorized scope");
+        }
+        self.assert_workspace_fence_live(repository)
+            .await
+            .context("verify capture commitment workspace lease")
+    }
+
     /// Resolve the scope from one already-selected repository root.
     ///
     /// The workspace lookup is read-only.  A normal main/human worktree need
     /// not have a WorkspaceRecord, but if one does exist its current fence is
     /// carried into later conditional writes.
     pub async fn resolve<C: ConnectionTrait>(conn: &C, repo_root: &Path) -> Result<Self> {
+        if let Some(repository) = scope_repository_peer(conn).await? {
+            return Box::pin(Self::resolve(&repository, repo_root)).await;
+        }
         let identity = RepoIdentity::resolve(conn).await.map_err(|error| {
             anyhow::Error::new(error).context("cannot resolve capture repository identity")
         })?;
@@ -274,6 +339,9 @@ impl CaptureScope {
     /// that only supplied a database connection are deliberately treated as
     /// main scope rather than trusting an envelope-provided cwd.
     pub async fn main_for_connection<C: ConnectionTrait>(conn: &C) -> Result<Self> {
+        if let Some(repository) = scope_repository_peer(conn).await? {
+            return Box::pin(Self::main_for_connection(&repository)).await;
+        }
         let identity = RepoIdentity::resolve(conn).await.map_err(|error| {
             anyhow::Error::new(error).context("cannot resolve capture repository identity")
         })?;
@@ -362,6 +430,9 @@ impl CaptureScope {
         let Some(workspace_id) = self.workspace_id.as_deref() else {
             return Ok(());
         };
+        if let Some(repository) = scope_repository_peer(conn).await? {
+            return Box::pin(self.assert_workspace_fence_live(&repository)).await;
+        }
         let live = conn
             .query_one_raw(Statement::from_sql_and_values(
                 conn.get_database_backend(),

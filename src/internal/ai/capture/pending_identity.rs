@@ -238,6 +238,19 @@ impl PreparedPendingAlias {
         txn: &DatabaseTransaction,
         checkpoint_id: &str,
     ) -> Result<()> {
+        // The alias and artifact headers are `metadata_kv` rows in
+        // `libra.db`; a capture-catalog transaction publishes them in a
+        // repository transaction.
+        if let Some(peer) = crate::internal::metadata::repository_metadata_peer(txn).await? {
+            let peer_txn = crate::internal::db::begin_write_transaction(&peer).await?;
+            let result = Box::pin(self.publish_for_artifact(&peer_txn, checkpoint_id)).await;
+            if result.is_ok() {
+                peer_txn.commit().await?;
+            } else {
+                let _ = peer_txn.rollback().await;
+            }
+            return result;
+        }
         ensure!(
             Uuid::parse_str(checkpoint_id).is_ok_and(|id| id.to_string() == checkpoint_id),
             REMEDY
@@ -489,6 +502,11 @@ impl PendingSessionAlias {
 }
 
 pub(crate) async fn assert_private_repo<C: ConnectionTrait>(conn: &C, repo_id: &str) -> Result<()> {
+    // `metadata_kv` stays in `libra.db`; a capture-only connection reads
+    // its paired repository database.
+    if let Some(peer) = crate::internal::metadata::repository_metadata_peer(conn).await? {
+        return Box::pin(assert_private_repo(&peer, repo_id)).await;
+    }
     let canonical = RepoIdentity::resolve(conn)
         .await
         .map_err(|error| preserve_transient_association_error(error.into()))?;
@@ -511,6 +529,11 @@ pub(crate) async fn assert_private_repo<C: ConnectionTrait>(conn: &C, repo_id: &
 /// GC checks only targets, never association bodies or integrity keys. Old
 /// databases with no private rows need no capture identity initialization.
 pub(crate) async fn assert_private_targets_for_gc<C: ConnectionTrait>(conn: &C) -> Result<()> {
+    // `metadata_kv` stays in `libra.db`; a capture-only connection reads
+    // its paired repository database.
+    if let Some(peer) = crate::internal::metadata::repository_metadata_peer(conn).await? {
+        return Box::pin(assert_private_targets_for_gc(&peer)).await;
+    }
     let row = conn
         .query_one_raw(Statement::from_sql_and_values(
             conn.get_database_backend(),
@@ -537,6 +560,11 @@ pub(crate) async fn lookup<C: ConnectionTrait>(
     repo_id: &str,
     alias: &str,
 ) -> Result<Option<PendingSessionAlias>> {
+    // `metadata_kv` stays in `libra.db`; a capture-only connection reads
+    // its paired repository database.
+    if let Some(peer) = crate::internal::metadata::repository_metadata_peer(conn).await? {
+        return Box::pin(lookup(&peer, repo_id, alias)).await;
+    }
     ensure!(canonical_alias(alias), REMEDY);
     assert_private_repo(conn, repo_id)
         .await
@@ -577,6 +605,14 @@ pub(crate) async fn lookup_for_worker<C: ConnectionTrait>(
     repo_id: &str,
     alias: &str,
 ) -> std::result::Result<Option<PendingSessionAlias>, WorkerIdentityError> {
+    // `metadata_kv` stays in `libra.db`; a capture-only connection reads
+    // its paired repository database.
+    if let Some(peer) = crate::internal::metadata::repository_metadata_peer(conn)
+        .await
+        .map_err(|_| WorkerIdentityError::Retryable)?
+    {
+        return Box::pin(lookup_for_worker(&peer, repo_id, alias)).await;
+    }
     if !canonical_alias(alias) {
         return Err(WorkerIdentityError::Invalid);
     }
@@ -642,9 +678,29 @@ pub(crate) async fn retained_alias(
     txn: &DatabaseTransaction,
     context: &PendingSessionContext,
 ) -> Result<Option<PendingSessionAlias>> {
-    txn.execute_unprepared("UPDATE metadata_kv SET updated_at = updated_at WHERE 0")
-        .await
-        .map_err(|error| preserve_transient_association_error(error.into()))?;
+    // `metadata_kv` stays in `libra.db`. A capture-catalog transaction reads
+    // it in a deferred transaction on its paired repository database, never
+    // taking that file's writer lock (a caller may hold it on another
+    // connection of this process).
+    if let Some(peer) = crate::internal::metadata::repository_metadata_peer(txn).await? {
+        let peer_txn = sea_orm::TransactionTrait::begin(&peer).await?;
+        let result = retained_alias_in(&peer_txn, context, false).await;
+        let _ = peer_txn.rollback().await;
+        return result;
+    }
+    retained_alias_in(txn, context, true).await
+}
+
+async fn retained_alias_in(
+    txn: &DatabaseTransaction,
+    context: &PendingSessionContext,
+    lock_writer: bool,
+) -> Result<Option<PendingSessionAlias>> {
+    if lock_writer {
+        txn.execute_unprepared("UPDATE metadata_kv SET updated_at = updated_at WHERE 0")
+            .await
+            .map_err(|error| preserve_transient_association_error(error.into()))?;
+    }
     assert_private_repo(txn, &context.scope().repo_id)
         .await
         .map_err(preserve_transient_association_error)?;
@@ -714,6 +770,24 @@ pub(crate) async fn aliases_for_erasure(
     session_id: &str,
     incarnation: Option<&str>,
 ) -> Result<ErasureAliases> {
+    // `metadata_kv` stays in `libra.db`; a capture-catalog transaction
+    // runs this in a transaction on its paired repository database.
+    if let Some(peer) = crate::internal::metadata::repository_metadata_peer(txn).await? {
+        let peer_txn = crate::internal::db::begin_write_transaction(&peer).await?;
+        let result = Box::pin(aliases_for_erasure(
+            &peer_txn,
+            scope,
+            session_id,
+            incarnation,
+        ))
+        .await;
+        if result.is_ok() {
+            peer_txn.commit().await?;
+        } else {
+            let _ = peer_txn.rollback().await;
+        }
+        return result;
+    }
     txn.execute_unprepared("UPDATE metadata_kv SET updated_at = updated_at WHERE 0")
         .await
         .map_err(|_| anyhow::anyhow!(REMEDY))?;
@@ -776,6 +850,18 @@ pub(crate) async fn erase_attributed_aliases(
     txn: &DatabaseTransaction,
     owned: &ErasureAliases,
 ) -> Result<()> {
+    // `metadata_kv` stays in `libra.db`; a capture-catalog transaction
+    // runs this in a transaction on its paired repository database.
+    if let Some(peer) = crate::internal::metadata::repository_metadata_peer(txn).await? {
+        let peer_txn = crate::internal::db::begin_write_transaction(&peer).await?;
+        let result = Box::pin(erase_attributed_aliases(&peer_txn, owned)).await;
+        if result.is_ok() {
+            peer_txn.commit().await?;
+        } else {
+            let _ = peer_txn.rollback().await;
+        }
+        return result;
+    }
     txn.execute_unprepared("UPDATE metadata_kv SET updated_at = updated_at WHERE 0")
         .await
         .map_err(|_| anyhow::anyhow!(REMEDY))?;
@@ -855,6 +941,18 @@ pub(crate) async fn remove_alias_if_unreferenced(
     repo_id: &str,
     alias: &str,
 ) -> Result<bool> {
+    // `metadata_kv` stays in `libra.db`; a capture-catalog transaction
+    // runs this in a transaction on its paired repository database.
+    if let Some(peer) = crate::internal::metadata::repository_metadata_peer(txn).await? {
+        let peer_txn = crate::internal::db::begin_write_transaction(&peer).await?;
+        let result = Box::pin(remove_alias_if_unreferenced(&peer_txn, repo_id, alias)).await;
+        if result.is_ok() {
+            peer_txn.commit().await?;
+        } else {
+            let _ = peer_txn.rollback().await;
+        }
+        return result;
+    }
     ensure!(canonical_alias(alias), REMEDY);
     txn.execute_unprepared("UPDATE metadata_kv SET updated_at = updated_at WHERE 0")
         .await

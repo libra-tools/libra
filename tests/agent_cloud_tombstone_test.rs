@@ -366,6 +366,18 @@ async fn connect_repo_db(repo: &Path) -> DatabaseConnection {
     Database::connect(opts).await.expect("connect repo db")
 }
 
+/// The capture catalog once the capture store has opened, else `libra.db`.
+async fn connect_catalog_db(repo: &Path) -> DatabaseConnection {
+    let capture = repo.join(".libra").join("private").join("capture.db");
+    if !capture.is_file() {
+        return connect_repo_db(repo).await;
+    }
+    let mut opts = ConnectOptions::new(format!("sqlite://{}", capture.display()));
+    opts.sqlx_logging(false)
+        .connect_timeout(Duration::from_secs(5));
+    Database::connect(opts).await.expect("connect capture db")
+}
+
 /// Pin the local repo id so the local repo and the D1 mirror row share it — a
 /// future erase keyed by `repo_id` would then target this exact D1 row.
 async fn set_repo_id(conn: &DatabaseConnection, repo_id: &str) {
@@ -940,6 +952,9 @@ async fn claude_legacy_revision_repair_is_idempotent_and_erases_with_the_old_che
         !repair_text.contains(canary) && !repair_text.contains(signature),
         "doctor repair expanded the thinking body: {repair_text}"
     );
+    // The repair opened the capture store, which moved the seeded catalog
+    // into `capture.db`.
+    let conn = connect_catalog_db(repo.path()).await;
     assert_eq!(
         count(
             &conn,

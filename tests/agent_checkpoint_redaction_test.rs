@@ -84,6 +84,104 @@ impl HookRepo {
         log_filter: Option<&str>,
         xdg_data_home: Option<&std::path::Path>,
     ) -> Output {
+        let mut out = self.run_no_drain(args, stdin, log_filter, xdg_data_home);
+        if args.iter().take(3).any(|arg| *arg == "hooks") && out.status.success() {
+            // The hook only queues; the consumer runs with the same logging
+            // so log assertions see both processes.
+            out.stderr
+                .extend(self.drain_spool(log_filter, xdg_data_home));
+        }
+        out
+    }
+
+    /// Store the capture queue the way an operator would, retrying while the
+    /// detached consumer the hook started still holds the consumer lock.
+    fn drain_spool(
+        &self,
+        log_filter: Option<&str>,
+        xdg_data_home: Option<&std::path::Path>,
+    ) -> Vec<u8> {
+        let ready = self.repo.join(".libra/private/capture-spool/ready");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+        let mut stderr = Vec::new();
+        loop {
+            let pending = std::fs::read_dir(&ready)
+                .map(|entries| entries.count())
+                .unwrap_or(0);
+            if pending == 0 {
+                return stderr;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "capture spool still holds {pending} ready file(s) after 90s"
+            );
+            let drained =
+                self.run_no_drain(&["__capture-spool-drain"], None, log_filter, xdg_data_home);
+            stderr.extend(drained.stderr);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// Queue a hook without starting a consumer (debug-build seam), run one
+    /// consumer, then drop anything still queued: the delivery is abandoned
+    /// as a failed hook delivery was before the queue. Returns the consumer's
+    /// status with the output of both processes.
+    fn run_with_one_consumer(&self, args: &[&str], stdin: Option<&str>) -> Output {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_libra"));
+        cmd.args(args)
+            .current_dir(&self.repo)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &self.home)
+            .env("LIBRA_TEST_HOME", &self.home)
+            .env("LIBRA_TEST", "1")
+            .env("LIBRA_TEST_CAPTURE_SPOOL_NO_CONSUMER", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = cmd.spawn().expect("spawn libra hook");
+        {
+            let mut input = child.stdin.take().expect("stdin piped");
+            if let Some(payload) = stdin {
+                input
+                    .write_all(payload.as_bytes())
+                    .expect("write hook envelope");
+            }
+        }
+        let queued = child.wait_with_output().expect("wait for libra hook");
+        assert!(queued.status.success(), "queue: {}", describe(&queued));
+        let mut consumer = self.run_no_drain(&["__capture-spool-drain"], None, None, None);
+        let ready = self.repo.join(".libra/private/capture-spool/ready");
+        if let Ok(entries) = std::fs::read_dir(&ready) {
+            for entry in entries {
+                std::fs::remove_file(entry.expect("ready entry").path())
+                    .expect("drop the abandoned delivery");
+            }
+        }
+        let mut stdout = queued.stdout;
+        stdout.extend(consumer.stdout);
+        let mut stderr = queued.stderr;
+        stderr.extend(std::mem::take(&mut consumer.stderr));
+        Output {
+            status: consumer.status,
+            stdout,
+            stderr,
+        }
+    }
+
+    fn quarantined(&self) -> usize {
+        std::fs::read_dir(self.repo.join(".libra/private/capture-spool/quarantine"))
+            .map(|entries| entries.count())
+            .unwrap_or(0)
+    }
+
+    fn run_no_drain(
+        &self,
+        args: &[&str],
+        stdin: Option<&str>,
+        log_filter: Option<&str>,
+        xdg_data_home: Option<&std::path::Path>,
+    ) -> Output {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_libra"));
         cmd.args(args)
             .current_dir(&self.repo)
@@ -159,6 +257,16 @@ impl HookRepo {
         self.repo.join(".libra").join("libra.db")
     }
 
+    /// Catalog tables live in `capture.db` once the capture store opens.
+    fn catalog_path(&self) -> PathBuf {
+        let capture = self.repo.join(".libra").join("private").join("capture.db");
+        if capture.is_file() {
+            capture
+        } else {
+            self.db_path()
+        }
+    }
+
     fn checkpoint_id_for_session(&self, session_id: &str) -> String {
         let list = self.run(&["agent", "checkpoint", "list", "--json"], None);
         assert!(
@@ -196,7 +304,7 @@ impl HookRepo {
     /// withholds this untrusted internal document, so these assertions must
     /// not accidentally turn its former CLI representation into a contract.
     async fn checkpoint_metadata(&self, checkpoint_id: &str) -> Value {
-        let url = format!("sqlite://{}?mode=ro", self.db_path().display());
+        let url = format!("sqlite://{}?mode=ro", self.catalog_path().display());
         let mut opts = ConnectOptions::new(url);
         opts.sqlx_logging(false);
         let conn = Database::connect(opts)
@@ -273,7 +381,7 @@ fn describe(out: &Output) -> String {
 /// no text column carries the raw token, and `redaction_report.matches`
 /// names the `aws-access-key-id` rule.
 async fn assert_persisted_row_redacted(repo: &HookRepo, session_id: &str, token: &str) {
-    let url = format!("sqlite://{}", repo.db_path().display());
+    let url = format!("sqlite://{}", repo.catalog_path().display());
     let mut opts = ConnectOptions::new(url);
     opts.sqlx_logging(false);
     let conn = Database::connect(opts).await.expect("open repo libra.db");
@@ -339,6 +447,8 @@ async fn assert_persisted_row_redacted(repo: &HookRepo, session_id: &str, token:
         repo.db_path(),
         repo.db_path().with_extension("db-wal"),
         PathBuf::from(format!("{}-wal", repo.db_path().display())),
+        repo.catalog_path(),
+        PathBuf::from(format!("{}-journal", repo.catalog_path().display())),
     ] {
         if let Ok(bytes) = std::fs::read(&path) {
             assert!(
@@ -357,7 +467,10 @@ async fn assert_persisted_row_redacted(repo: &HookRepo, session_id: &str, token:
 /// recovery ledger, so this test-only observer validates the durable
 /// idempotency boundary directly without widening the CLI contract.
 async fn durable_session_receipts(repo: &HookRepo, session_id: &str) -> (i64, Value) {
-    let mut options = ConnectOptions::new(format!("sqlite://{}?mode=ro", repo.db_path().display()));
+    let mut options = ConnectOptions::new(format!(
+        "sqlite://{}?mode=ro",
+        repo.catalog_path().display()
+    ));
     options.sqlx_logging(false);
     let conn = Database::connect(options)
         .await
@@ -918,7 +1031,17 @@ async fn snapshot_partial_reason_matrix() {
 #[tokio::test]
 async fn catalog_failure_leaves_no_false_checkpoint_row() {
     let repo = HookRepo::init();
-    let mut options = ConnectOptions::new(format!("sqlite://{}?mode=rw", repo.db_path().display()));
+    // The catalog is created in capture.db by the first stored event; the
+    // trigger must sit on that database's `agent_session`.
+    let warm = repo.hook(
+        "session-start",
+        &repo.envelope("SessionStart", "sess-catalog-warm", json!({})),
+    );
+    assert!(warm.status.success(), "{}", describe(&warm));
+    let mut options = ConnectOptions::new(format!(
+        "sqlite://{}?mode=rw",
+        repo.catalog_path().display()
+    ));
     options.sqlx_logging(false);
     let conn = Database::connect(options)
         .await
@@ -939,15 +1062,21 @@ async fn catalog_failure_leaves_no_false_checkpoint_row() {
             json!({ "event_id": "catalog-prewrite-failure-v1" }),
         ),
     );
-    assert!(
-        !failed.status.success(),
-        "catalog failure must not be acknowledged as a checkpoint success: {}",
-        describe(&failed)
+    // The hook only queues. The consumer's catalog write fails on the
+    // trigger, so the envelope is quarantined instead of acknowledged.
+    assert!(failed.status.success(), "{}", describe(&failed));
+    assert_eq!(
+        repo.quarantined(),
+        1,
+        "catalog failure must not be acknowledged as a checkpoint success"
     );
 
-    let conn = Database::connect(format!("sqlite://{}?mode=ro", repo.db_path().display()))
-        .await
-        .expect("reopen fault fixture database");
+    let conn = Database::connect(format!(
+        "sqlite://{}?mode=ro",
+        repo.catalog_path().display()
+    ))
+    .await
+    .expect("reopen fault fixture database");
     let row = conn
         .query_one_raw(Statement::from_string(
             conn.get_database_backend(),
@@ -1129,7 +1258,7 @@ async fn checkpoint_tree_blobs(repo: &HookRepo, checkpoint_id: &str) -> Vec<(Str
         entries
     }
 
-    let url = format!("sqlite://{}?mode=ro", repo.db_path().display());
+    let url = format!("sqlite://{}?mode=ro", repo.catalog_path().display());
     let mut opts = ConnectOptions::new(url);
     opts.sqlx_logging(false);
     let conn = Database::connect(opts)
@@ -1175,7 +1304,7 @@ async fn checkpoint_tree_blobs(repo: &HookRepo, checkpoint_id: &str) -> Vec<(Str
 
 #[cfg(feature = "test-live-agent")]
 async fn session_checkpoint_ids(repo: &HookRepo, session_id: &str) -> Vec<String> {
-    let url = format!("sqlite://{}?mode=ro", repo.db_path().display());
+    let url = format!("sqlite://{}?mode=ro", repo.catalog_path().display());
     let mut opts = ConnectOptions::new(url);
     opts.sqlx_logging(false);
     let conn = Database::connect(opts)
@@ -1775,7 +1904,10 @@ async fn capture_foundation_codex_reasoning_boundaries_live_and_import() {
             assert!(export.contains("planning the deploy"));
         }
     }
-    let mut options = ConnectOptions::new(format!("sqlite://{}?mode=ro", repo.db_path().display()));
+    let mut options = ConnectOptions::new(format!(
+        "sqlite://{}?mode=ro",
+        repo.catalog_path().display()
+    ));
     options.sqlx_logging(false);
     let conn = Database::connect(options)
         .await
@@ -1809,6 +1941,7 @@ async fn capture_foundation_codex_reasoning_boundaries_live_and_import() {
     for path in [
         repo.db_path(),
         PathBuf::from(format!("{}-wal", repo.db_path().display())),
+        repo.catalog_path(),
     ] {
         if let Ok(bytes) = std::fs::read(&path) {
             assert_free("repository catalog file", &bytes);
@@ -2171,7 +2304,7 @@ async fn pending_snapshot_contains_only_redacted_content() {
         }),
     );
     let blocker = block_checkpoint_object_directory(&repo);
-    let failed = repo.run(
+    let failed = repo.run_with_one_consumer(
         &[
             "agent",
             "hooks",

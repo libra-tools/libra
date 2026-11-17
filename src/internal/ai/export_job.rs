@@ -83,7 +83,7 @@ async fn begin_observed_idle_transaction_until(
     deadline: Option<CaptureCommitDeadline>,
 ) -> Result<DatabaseTransaction> {
     run_observed_idle_preflight_until(deadline, "begin export generation transaction", async {
-        crate::internal::db::begin_write_transaction(conn)
+        crate::internal::db::begin_catalog_or_repository_write(conn)
             .await
             .context("begin export generation transaction")
     })
@@ -111,7 +111,7 @@ async fn begin_export_job_mutation_transaction_until(
     ensure_export_job_mutation_before_deadline(deadline)?;
     let txn = tokio::time::timeout_at(
         tokio::time::Instant::from_std(deadline.monotonic()),
-        crate::internal::db::begin_write_transaction(conn),
+        crate::internal::db::begin_catalog_or_repository_write(conn),
     )
     .await
     .map_err(|_| anyhow!("OpenCode export job mutation exceeded its managed execution deadline"))?
@@ -380,7 +380,9 @@ pub async fn observe_idle_until(
     }
     txn.execute_raw(Statement::from_sql_and_values(
         txn.get_database_backend(),
-        "INSERT INTO agent_export_job (
+        &crate::internal::db::catalog_lease_sql(
+            &txn,
+            "INSERT INTO agent_export_job (
             job_id, agent_kind, provider_session_id, observed_generation,
             processed_generation, state, created_at, updated_at, ttl_expires_at,
             repo_id, worktree_id, workspace_id, workspace_fence, scope_state
@@ -393,6 +395,8 @@ pub async fn observe_idle_until(
                AND lease_expires_at > (unixepoch('now') * 1000)
          ))
          ON CONFLICT(agent_kind, provider_session_id) DO NOTHING",
+        )
+        .await?,
         [
             uuid::Uuid::new_v4().to_string().into(),
             agent_kind.into(),
@@ -421,7 +425,9 @@ pub async fn observe_idle_until(
     let bumped = txn
         .execute_raw(Statement::from_sql_and_values(
             txn.get_database_backend(),
-            "UPDATE agent_export_job
+            &crate::internal::db::catalog_lease_sql(
+                &txn,
+                "UPDATE agent_export_job
          SET observed_generation = observed_generation + 1, updated_at = ?,
              ttl_expires_at = ?
          WHERE agent_kind = ? AND provider_session_id = ?
@@ -434,6 +440,8 @@ pub async fn observe_idle_until(
                  AND lease_owner IS NOT NULL
                  AND lease_expires_at > (unixepoch('now') * 1000)
            ))",
+            )
+            .await?,
             [
                 now_ms.into(),
                 now_or(now_ms, EXPORT_JOB_TTL_MS).into(),
@@ -469,7 +477,9 @@ pub async fn observe_idle_until(
     let acquired = txn
         .execute_raw(Statement::from_sql_and_values(
             txn.get_database_backend(),
-            "UPDATE agent_export_job
+            &crate::internal::db::catalog_lease_sql(
+                &txn,
+                "UPDATE agent_export_job
              SET owner = ?, lease_expires_at = ?,
                  fence_token = COALESCE(fence_token, 0) + 1,
                  state = 'inflight', updated_at = ?
@@ -485,6 +495,8 @@ pub async fn observe_idle_until(
                ))
                AND (owner IS NULL OR lease_expires_at IS NULL OR lease_expires_at <= ?)
                AND processed_generation < observed_generation",
+            )
+            .await?,
             [
                 owner.into(),
                 now_or(now_ms, EXPORT_LEASE_MS).into(),
@@ -574,7 +586,9 @@ async fn advance_processed_inner<C: ConnectionTrait>(
     let advanced = conn
         .execute_raw(Statement::from_sql_and_values(
             conn.get_database_backend(),
-            "UPDATE agent_export_job
+            &crate::internal::db::catalog_lease_sql(
+                conn,
+                "UPDATE agent_export_job
              SET processed_generation = ?, updated_at = ?
          WHERE agent_kind = ? AND provider_session_id = ?
                AND scope_state = 'scoped' AND repo_id = ? AND worktree_id = ?
@@ -595,6 +609,8 @@ async fn advance_processed_inner<C: ConnectionTrait>(
                  WHERE t.agent_kind = agent_export_job.agent_kind
                    AND t.provider_session_id = agent_export_job.provider_session_id
                )",
+            )
+            .await?,
             [
                 target.into(),
                 now_ms.into(),
@@ -772,7 +788,9 @@ async fn release_inner<C: ConnectionTrait>(
     let released = conn
         .execute_raw(Statement::from_sql_and_values(
             conn.get_database_backend(),
-            "UPDATE agent_export_job
+            &crate::internal::db::catalog_lease_sql(
+                conn,
+                "UPDATE agent_export_job
          SET owner = NULL, lease_expires_at = NULL, state = ?,
              last_error_code = ?, updated_at = ?
          WHERE agent_kind = ? AND provider_session_id = ?
@@ -793,6 +811,8 @@ async fn release_inner<C: ConnectionTrait>(
              WHERE t.agent_kind = agent_export_job.agent_kind
                AND t.provider_session_id = agent_export_job.provider_session_id
            )",
+            )
+            .await?,
             [
                 state.into(),
                 last_error_code.into(),

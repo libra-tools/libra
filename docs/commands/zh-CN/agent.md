@@ -215,6 +215,23 @@ libra agent mcp --stdio
 比本发布更旧的二进制读不到这份目录。它们仍会打开仓库库，而捕获表已经不在那里。
 请继续使用本版本或更新的版本来读取已捕获的 session 与 checkpoint。
 
+实时 hook（Claude Code、Codex、Grok、OpenCode、Hermes、Pi）不打开任何数据库。
+hook 先脱敏事件，再把一个带版本号的信封写入 `.libra/private/capture-spool/ready/`，
+然后退出。退出码 `0` 表示信封已入队（或同一事件早已入队）。信封文件在改名进
+`ready/` 之前已刷盘；Unix 上还会刷 `ready/` 目录，崩溃或断电后入队的事件仍在。
+Windows 上改名本身不刷盘，退出 `0` 之后立即断电可能丢掉最新的那个信封。退出码 `0` 不表示
+`libra agent session list` 等查询已经能看到它；查询只读 `capture.db`。入队后
+hook 拉起一个分离的消费者。每个仓库同时只有一个消费者，它按文件名顺序
+（终态 `SessionEnd` 信封在前）写入，目录事务提交后才删除对应文件。消费者
+启动失败、捕获库忙或之后的入库失败都不改变 hook 的退出码：库忙或库 schema
+过新时文件留在 `ready/` 等下一个消费者；无法入库的信封移到 `quarantine/`。
+只有没能入队时 hook 才失败，例如队列已满（`LBR-AGENT-046`：`ready/` 与
+`quarantine/` 合计已有 1024 个文件或 256 MiB，或已有 64 个信封正在写入），或其它
+hook 在本 hook 的整个捕获预算内（最多 30 秒）一直占着队列锁（`LBR-AGENT-049`）。
+需要手动入库时（例如升级之后），在仓库根执行 `libra __capture-spool-drain`；
+成功时它不打印任何内容，也从不输出信封正文；有信封被移入 `quarantine/` 时以非零退出。`libra agent import` 仍直接写
+`capture.db`，不经过队列。
+
 `libra agent workspace list|show` 是 workspace 注册表（`workspace_record`）的
 只读机器接口：agent runtime 关联过的每个 linked worktree、task worktree 或
 remote workspace，含生命周期状态（`provisioning`/`active`/`releasing`/

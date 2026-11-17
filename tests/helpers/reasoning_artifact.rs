@@ -44,7 +44,7 @@ pub async fn seed_with_bad_digest(repo: &Path) -> (String, String, ObjectHash) {
 }
 
 pub async fn erase(repo: &Path) {
-    let conn = connect_repo_db(repo).await;
+    let conn = connect_catalog_db(repo).await;
     let storage = repo.join(".libra");
     let manager = HistoryManager::new_with_ref(
         Arc::new(ClientStorage::init_local_existing(storage.join("objects"))),
@@ -120,7 +120,7 @@ async fn attach(
     digest_override: Option<&str>,
 ) -> (String, String, ObjectHash) {
     let storage = repo.join(".libra");
-    let conn = connect_repo_db(repo).await;
+    let conn = connect_catalog_db(repo).await;
     let row = conn
         .query_one_raw(Statement::from_sql_and_values(
             conn.get_database_backend(),
@@ -302,6 +302,21 @@ async fn connect_repo_db(repo: &Path) -> DatabaseConnection {
     Database::connect(opts).await.expect("connect repo db")
 }
 
+/// Catalog tables live in `.libra/private/capture.db` once the capture store
+/// has opened (it copies rows seeded into `libra.db` before that).
+async fn connect_catalog_db(repo: &Path) -> DatabaseConnection {
+    let capture = repo.join(".libra").join("private").join("capture.db");
+    if !capture.is_file() {
+        return connect_repo_db(repo).await;
+    }
+    let mut opts = ConnectOptions::new(format!("sqlite://{}", capture.display()));
+    opts.sqlx_logging(false)
+        .connect_timeout(Duration::from_secs(5));
+    Database::connect(opts)
+        .await
+        .expect("connect capture database")
+}
+
 fn load_fixture_tree(storage: &Path, oid: ObjectHash) -> Vec<TreeItem> {
     Tree::from_bytes(
         &read_git_object(storage, &oid).expect("read fixture tree"),
@@ -323,7 +338,7 @@ fn write_fixture_tree(storage: &Path, mut items: Vec<TreeItem>) -> ObjectHash {
 }
 
 async fn seed_checkpoint(repo: &Path) -> String {
-    let conn = connect_repo_db(repo).await;
+    let conn = connect_catalog_db(repo).await;
     conn.execute_raw(Statement::from_sql_and_values(
         conn.get_database_backend(),
         "INSERT INTO agent_session (

@@ -177,6 +177,17 @@ impl BridgeRepo {
     }
 
     fn run_with_log(&self, args: &[&str], stdin: Option<&str>, log_filter: Option<&str>) -> Output {
+        let mut out = self.run_no_drain(args, stdin, log_filter);
+        if args.iter().take(3).any(|arg| *arg == "hooks") && out.status.success() {
+            // The hook only queues; the consumer runs the export and writes
+            // the catalog. Store the queue here and keep the consumer's log
+            // lines with the hook's so log assertions see both processes.
+            out.stderr.extend(self.drain_spool(log_filter));
+        }
+        out
+    }
+
+    fn run_no_drain(&self, args: &[&str], stdin: Option<&str>, log_filter: Option<&str>) -> Output {
         let mut cmd = self.command();
         if let Some(log_filter) = log_filter {
             cmd.env("LIBRA_LOG", log_filter);
@@ -197,6 +208,37 @@ impl BridgeRepo {
         }
         drop(child.stdin.take());
         child.wait_with_output().expect("wait libra")
+    }
+
+    /// Run `libra __capture-spool-drain` until `ready/` is empty and return
+    /// the consumers' stderr.
+    fn drain_spool(&self, log_filter: Option<&str>) -> Vec<u8> {
+        let ready = self.repo.join(".libra/private/capture-spool/ready");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+        let mut stderr = Vec::new();
+        loop {
+            let pending = std::fs::read_dir(&ready)
+                .map(|entries| entries.count())
+                .unwrap_or(0);
+            if pending == 0 {
+                return stderr;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "capture spool still holds {pending} ready file(s) after 90s"
+            );
+            let mut cmd = self.command();
+            if let Some(log_filter) = log_filter {
+                cmd.env("LIBRA_LOG", log_filter);
+            }
+            let drained = cmd
+                .arg("__capture-spool-drain")
+                .stdin(Stdio::null())
+                .output()
+                .expect("run capture spool drain");
+            stderr.extend(drained.stderr);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
 
     fn stop(&self, session_id: &str) -> Output {
@@ -244,10 +286,13 @@ impl BridgeRepo {
     }
 
     async fn query_rows(&self, sql: &str) -> Vec<sea_orm::QueryResult> {
-        let url = format!(
-            "sqlite://{}?mode=ro",
-            self.repo.join(".libra").join("libra.db").display()
-        );
+        // Capture tables live in capture.db; repository tables in libra.db.
+        let database = if sql.contains("agent_") {
+            self.repo.join(".libra").join("private").join("capture.db")
+        } else {
+            self.repo.join(".libra").join("libra.db")
+        };
+        let url = format!("sqlite://{}?mode=ro", database.display());
         let conn: DatabaseConnection = Database::connect(url).await.expect("open db");
         conn.query_all_raw(Statement::from_string(
             conn.get_database_backend(),
@@ -690,8 +735,45 @@ async fn opencode_registered_failure_releases_dirty_job_claim_and_marker() {
         return;
     };
     repo.block_object_directory();
-    let failed = repo.stop("ses_registered_failure");
+    // The hook only queues, so it succeeds. The consumer hits the blocked
+    // object store, keeps the envelope in ready/ (a filesystem failure is
+    // retryable) and reports the failure.
+    let envelope = json!({
+        "hook_event_name": "session.idle",
+        "session_id": "ses_registered_failure",
+        "cwd": repo.repo.to_string_lossy(),
+    })
+    .to_string();
+    let queued = {
+        let mut cmd = repo.command();
+        cmd.env("LIBRA_TEST", "1")
+            .env("LIBRA_TEST_CAPTURE_SPOOL_NO_CONSUMER", "1")
+            .args(["agent", "hooks", "opencode", "stop"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = cmd.spawn().expect("spawn libra");
+        {
+            use std::io::Write;
+            child
+                .stdin
+                .take()
+                .expect("stdin")
+                .write_all(envelope.as_bytes())
+                .expect("write envelope");
+        }
+        child.wait_with_output().expect("wait libra")
+    };
+    assert!(queued.status.success(), "{}", describe(&queued));
+    let failed = repo.run_no_drain(&["__capture-spool-drain"], None, Some("debug"));
     assert!(!failed.status.success(), "{}", describe(&failed));
+    assert_eq!(
+        std::fs::read_dir(repo.repo.join(".libra/private/capture-spool/ready"))
+            .map(|entries| entries.count())
+            .unwrap_or(0),
+        1,
+        "a retryable consumer failure keeps the envelope queued"
+    );
     assert!(repo.checkpoints().is_empty());
     let claims = repo
         .query_rows("SELECT state, owner FROM agent_coverage_claim WHERE source_channel = 'export'")
@@ -1830,4 +1912,71 @@ async fn cov2_macos_fake_exporter_candidate_import_partial_no_plaintext() {
             }
         }
     }
+}
+
+/// plan-20261116 CQ-05 (local capture test): the OpenCode forwarder hook
+/// returns as soon as its event is queued. It runs no exporter and opens no
+/// database, so it does not wait for the export window. Like every case in
+/// this `test-live-agent` target it is an ignored, operator-local gate: run it
+/// with an explicit ignored-test selection; it never skips once selected.
+#[test]
+#[ignore = "OpenCode Session capture is an operator-local manual gate"]
+fn capture_spool_opencode_forwarder_returns_after_queueing() {
+    let tmp = TempDir::new().expect("tempdir");
+    let repo = tmp.path().join("repo");
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&repo).expect("repo dir");
+    std::fs::create_dir_all(&home).expect("home dir");
+    let repo = repo.canonicalize().expect("canonical repo");
+    let command = |args: &[&str]| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_libra"));
+        cmd.args(args)
+            .current_dir(&repo)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &home)
+            .env("LIBRA_TEST_HOME", &home)
+            .env("LIBRA_TEST", "1")
+            .env("LIBRA_TEST_CAPTURE_SPOOL_NO_CONSUMER", "1");
+        cmd
+    };
+    let init = command(&["init"]).output().expect("libra init");
+    assert!(init.status.success(), "{}", describe(&init));
+    let envelope = json!({
+        "hook_event_name": "session.idle",
+        "session_id": "ses_spool_forwarder",
+        "cwd": repo.to_string_lossy(),
+    })
+    .to_string();
+    let started = std::time::Instant::now();
+    let mut child = command(&["agent", "hooks", "opencode", "stop"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn OpenCode hook");
+    {
+        use std::io::Write;
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(envelope.as_bytes())
+            .expect("write envelope");
+    }
+    let out = child.wait_with_output().expect("wait OpenCode hook");
+    let elapsed = started.elapsed();
+    assert!(out.status.success(), "{}", describe(&out));
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "the forwarder must return after queueing, not after an export: {elapsed:?}"
+    );
+    let ready = std::fs::read_dir(repo.join(".libra/private/capture-spool/ready"))
+        .map(|entries| entries.count())
+        .unwrap_or(0);
+    assert_eq!(ready, 1, "the OpenCode event must be queued");
+    assert!(
+        !repo.join(".libra/private/capture.db").exists(),
+        "queueing must not open the capture catalog or start an export"
+    );
 }

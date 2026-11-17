@@ -119,6 +119,12 @@ pub const MUTABLE_STATE_OWNERSHIP: &[MutableStateSurface] = &[
                      observed in (W4 adds the workspace scope key)",
     },
     MutableStateSurface {
+        table: "capture_catalog_copy_receipt",
+        owner: StateOwner::Repository,
+        rationale: "capture.db's one-row record that the catalog copy from libra.db finished; \
+                     one per repository capture database",
+    },
+    MutableStateSurface {
         table: "agent_session_commit",
         owner: StateOwner::Repository,
         rationale: "commit links are repository-local and inherit scope from their session FK",

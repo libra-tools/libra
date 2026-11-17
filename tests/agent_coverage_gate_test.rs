@@ -84,9 +84,58 @@ impl HookRepo {
         cmd
     }
 
+    /// A realtime hook only queues its event: run it without its detached
+    /// consumer (debug-build seam), then one consumer, and report the hook's
+    /// failure or else the consumer's status with both outputs. A delivery
+    /// the consumer could not store is dropped, as a failed hook was before.
     fn run(&self, args: &[&str], stdin: Option<&str>) -> Output {
+        if !args.iter().take(3).any(|arg| *arg == "hooks") {
+            return self.run_raw(args, stdin, &[]);
+        }
+        let queued = self.run_raw(
+            args,
+            stdin,
+            &[
+                ("LIBRA_TEST", "1"),
+                ("LIBRA_TEST_CAPTURE_SPOOL_NO_CONSUMER", "1"),
+            ],
+        );
+        if !queued.status.success() {
+            return queued;
+        }
+        let consumer = self.drain_once();
+        let mut stdout = queued.stdout;
+        stdout.extend(consumer.stdout);
+        let mut stderr = queued.stderr;
+        stderr.extend(consumer.stderr);
+        Output {
+            status: consumer.status,
+            stdout,
+            stderr,
+        }
+    }
+
+    /// One consumer run; anything it could not store is dropped.
+    fn drain_once(&self) -> Output {
+        let consumer = self.run_raw(&["__capture-spool-drain"], None, &[]);
+        if !consumer.status.success()
+            && let Ok(entries) =
+                std::fs::read_dir(self.repo.join(".libra/private/capture-spool/ready"))
+        {
+            for entry in entries {
+                std::fs::remove_file(entry.expect("ready entry").path())
+                    .expect("drop an abandoned delivery");
+            }
+        }
+        consumer
+    }
+
+    fn run_raw(&self, args: &[&str], stdin: Option<&str>, envs: &[(&str, &str)]) -> Output {
         let mut cmd = self.command();
         cmd.args(args);
+        for (key, value) in envs {
+            cmd.env(key, value);
+        }
         if let Some(input) = stdin {
             cmd.stdin(Stdio::piped());
             cmd.stdout(Stdio::piped());
@@ -111,7 +160,9 @@ impl HookRepo {
 
     fn spawn_hook(&self) -> std::process::Child {
         let mut cmd = self.command();
-        cmd.args(["agent", "hooks", "claude-code", "stop"])
+        cmd.env("LIBRA_TEST", "1")
+            .env("LIBRA_TEST_CAPTURE_SPOOL_NO_CONSUMER", "1")
+            .args(["agent", "hooks", "claude-code", "stop"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -167,16 +218,35 @@ impl HookRepo {
         std::fs::write(&objects, "not a directory").expect("block objects directory");
     }
 
+    /// Catalog tables live in `capture.db` once the capture store opens.
+    fn catalog_path(&self) -> std::path::PathBuf {
+        let capture = self.repo.join(".libra").join("private").join("capture.db");
+        if capture.is_file() {
+            capture
+        } else {
+            self.repo.join(".libra").join("libra.db")
+        }
+    }
+
     async fn db(&self) -> DatabaseConnection {
-        let url = format!(
-            "sqlite://{}?mode=ro",
-            self.repo.join(".libra").join("libra.db").display()
-        );
-        Database::connect(url).await.expect("open libra.db")
+        let url = format!("sqlite://{}?mode=ro", self.catalog_path().display());
+        Database::connect(url).await.expect("open capture catalog")
     }
 
     async fn query_rows(&self, sql: &str) -> Vec<sea_orm::QueryResult> {
-        let conn = self.db().await;
+        // Repository tables stay in libra.db; catalog tables are in capture.db.
+        let conn = if sql.contains("metadata_kv")
+            || sql.contains("object_index")
+            || sql.contains("FROM reference")
+        {
+            let url = format!(
+                "sqlite://{}?mode=ro",
+                self.repo.join(".libra").join("libra.db").display()
+            );
+            Database::connect(url).await.expect("open libra.db")
+        } else {
+            self.db().await
+        };
         conn.query_all_raw(Statement::from_string(
             conn.get_database_backend(),
             sql.to_string(),
@@ -593,6 +663,9 @@ async fn coverage_gate_concurrent_writers_single_append() {
         }
     }
     assert!(successes >= 1, "one concurrent writer must commit");
+    // Both hooks queued the same event; one consumer stores it.
+    let stored = repo.drain_once();
+    assert!(stored.status.success(), "{}", describe(&stored));
 
     assert_eq!(
         repo.checkpoints().len(),
@@ -622,10 +695,7 @@ async fn coverage_gate_inflight_only_fails_visibly() {
         describe(&start)
     );
 
-    let url = format!(
-        "sqlite://{}?mode=rw",
-        repo.repo.join(".libra").join("libra.db").display()
-    );
+    let url = format!("sqlite://{}?mode=rw", repo.catalog_path().display());
     let conn = Database::connect(url).await.expect("open rw");
     let inserted = conn
         .execute_raw(Statement::from_sql_and_values(
@@ -649,10 +719,12 @@ async fn coverage_gate_inflight_only_fails_visibly() {
         "an uncovered in-flight turn must not report success: {}",
         describe(&blocked)
     );
+    // The hook only queued the event; the consumer reports the failure with
+    // its fixed, content-free direction and keeps the event in quarantine.
     let stderr = String::from_utf8_lossy(&blocked.stderr);
     assert!(
         stderr.contains(
-            "capture could not be completed; retry the hook or inspect the local repository"
+            "queued capture event(s) could not be stored and were moved to quarantine; run `libra agent doctor`"
         ),
         "failure must give the caller the sanitized retry direction: {}",
         describe(&blocked)
@@ -686,10 +758,7 @@ async fn live_writer_preempts_reserved_import_and_fences_stale_owner() {
         describe(&start)
     );
 
-    let url = format!(
-        "sqlite://{}?mode=rw",
-        repo.repo.join(".libra").join("libra.db").display()
-    );
+    let url = format!("sqlite://{}?mode=rw", repo.catalog_path().display());
     let conn = Database::connect(url).await.expect("open rw");
     let inserted = conn
         .execute_raw(Statement::from_sql_and_values(
@@ -748,10 +817,7 @@ async fn coverage_gate_db_error_does_not_append() {
     // unavailability). The next gated write must fail CLOSED — error out,
     // no ungated append.
     {
-        let url = format!(
-            "sqlite://{}?mode=rw",
-            repo.repo.join(".libra").join("libra.db").display()
-        );
+        let url = format!("sqlite://{}?mode=rw", repo.catalog_path().display());
         let conn = Database::connect(url).await.expect("open rw");
         conn.execute_raw(Statement::from_string(
             conn.get_database_backend(),

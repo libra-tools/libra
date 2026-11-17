@@ -451,10 +451,58 @@ pub async fn begin_write_transaction<
     // failure beats intermittent "database is locked" on every read-then-write
     // command.
     if let Err(err) = txn.execute_unprepared(ACQUIRE_WRITE_LOCK_SQL).await {
+        // `.libra/private/capture.db` never has `config_kv`. A connection that
+        // holds the capture catalog takes that database's writer lock with
+        // the same no-op update `begin_catalog_or_repository_write` uses. A
+        // repository database without `config_kv` has no catalog tables any
+        // more, so it still fails here as corrupt.
+        if is_capture_catalog(&txn).await
+            && txn.execute_unprepared(CAPTURE_WRITE_LOCK_SQL).await.is_ok()
+        {
+            return Ok(txn);
+        }
         let _ = txn.rollback().await;
         return Err(err);
     }
     Ok(txn)
+}
+
+/// Writer lock of the capture catalog database, which has no `config_kv`.
+const CAPTURE_WRITE_LOCK_SQL: &str = "UPDATE `schema_versions` SET `version` = `version` WHERE 0";
+
+/// Whether this connection is the capture catalog. The role comes from the
+/// database file itself (`<storage>/private/capture.db`); the table shape
+/// (`agent_session`, no `config_kv`) must agree. A repository database that
+/// lost `config_kv` keeps its repository role and fails closed.
+async fn is_capture_catalog(conn: &impl ConnectionTrait) -> bool {
+    matches!(
+        connection_main_file(conn).await,
+        Ok(file) if is_capture_database_file(&file)
+    ) && matches!(connection_has_table(conn, "agent_session").await, Ok(true))
+        && matches!(connection_has_table(conn, "config_kv").await, Ok(false))
+}
+
+/// `true` for `<storage>/private/capture.db`.
+fn is_capture_database_file(file: &Path) -> bool {
+    file.file_name().and_then(|name| name.to_str()) == Some("capture.db")
+        && file
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            == Some("private")
+}
+
+/// The main database file of `conn` (empty for an in-memory database).
+async fn connection_main_file(conn: &impl ConnectionTrait) -> io::Result<PathBuf> {
+    let row = conn
+        .query_one_raw(Statement::from_string(
+            conn.get_database_backend(),
+            "SELECT file FROM pragma_database_list WHERE name = 'main'".to_string(),
+        ))
+        .await
+        .map_err(|err| io::Error::other(err.to_string()))?;
+    let file: Option<String> = row.and_then(|row| row.try_get_by("file").ok());
+    Ok(file.map(PathBuf::from).unwrap_or_default())
 }
 
 /// The sole writer of the configuration-owned legacy reader barrier. The
@@ -608,6 +656,110 @@ pub async fn connection_has_table(conn: &impl ConnectionTrait, table: &str) -> R
     Ok(row.is_some())
 }
 
+/// Storage root (`.libra`) of the database behind `conn`, taken from the
+/// connection's own file rather than the process working directory:
+/// `<storage>/private/capture.db` and `<storage>/libra.db` both name it. Any
+/// other file (an in-memory or differently named database) is an error, never
+/// the current directory's repository.
+pub async fn connection_storage_root(conn: &impl ConnectionTrait) -> io::Result<PathBuf> {
+    let file = connection_main_file(conn).await?;
+    let name = file.file_name().and_then(|name| name.to_str());
+    let storage = if is_capture_database_file(&file) {
+        file.parent().and_then(Path::parent).map(Path::to_path_buf)
+    } else if name == Some(crate::utils::util::DATABASE) {
+        file.parent().map(Path::to_path_buf)
+    } else {
+        None
+    };
+    storage.ok_or_else(|| {
+        io::Error::other("the database is neither a repository nor a capture database file")
+    })
+}
+
+/// A fresh connection to the repository database paired with `conn` (see
+/// [`connection_storage_root`]). It is not the cached one-connection pool:
+/// a caller may already hold a write transaction on that handle, and a
+/// nested use of the same pool would wait for itself. The process that holds
+/// `conn` has already opened (and migrated) this repository database, so the
+/// peer skips schema management and only opens the file.
+pub async fn open_paired_repository(conn: &impl ConnectionTrait) -> io::Result<DatabaseConnection> {
+    let database = connection_storage_root(conn)
+        .await?
+        .join(crate::utils::util::DATABASE);
+    let database = database
+        .to_str()
+        .ok_or_else(|| io::Error::other("the repository database path is not valid UTF-8"))?;
+    open_connection_without_schema_management(database, DEFAULT_CONNECTION_TIMEOUT).await
+}
+
+/// Catalog statements guard workspace leases with a correlated
+/// `EXISTS (SELECT 1 FROM workspace_record …)` clause. `workspace_record`
+/// lives in `libra.db`, so on the capture catalog (`capture.db`) SQLite
+/// cannot even prepare that clause. There each such subquery becomes an
+/// always-true expression that still consumes its bind parameters; the lease
+/// itself is verified by the caller's `CaptureScope::assert_workspace_fence_live`,
+/// which reads the paired repository database. The two files are never
+/// attached, so that check is not in the same transaction as the write.
+pub async fn catalog_lease_sql(conn: &impl ConnectionTrait, sql: &str) -> Result<String, DbErr> {
+    if connection_has_table(conn, "workspace_record").await? {
+        return Ok(sql.to_string());
+    }
+    Ok(strip_workspace_lease_subqueries(sql))
+}
+
+/// See [`catalog_lease_sql`].
+pub fn strip_workspace_lease_subqueries(sql: &str) -> String {
+    let mut out = sql.to_string();
+    while let Some(from) = out.find("FROM workspace_record") {
+        let Some(exists) = out[..from].rfind("EXISTS (") else {
+            break;
+        };
+        let open = exists + "EXISTS ".len();
+        let mut depth = 0_usize;
+        let mut close = None;
+        for (offset, ch) in out[open..].char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        close = Some(open + offset + 1);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(close) = close else {
+            break;
+        };
+        let parameters = out[exists..close].matches('?').count();
+        let replacement = if parameters == 0 {
+            "(1 = 1)".to_string()
+        } else {
+            format!(
+                "(1 = 1 OR ({}))",
+                vec!["? IS NULL"; parameters].join(" AND ")
+            )
+        };
+        out.replace_range(exists..close, &replacement);
+    }
+    out
+}
+
+/// Refs live in `libra.db`. For a connection without the `reference` table
+/// (the capture catalog) this returns its paired repository database;
+/// otherwise `None`.
+pub async fn reference_peer(conn: &impl ConnectionTrait) -> io::Result<Option<DatabaseConnection>> {
+    if connection_has_table(conn, "reference")
+        .await
+        .map_err(|err| io::Error::other(err.to_string()))?
+    {
+        return Ok(None);
+    }
+    open_paired_repository(conn).await.map(Some)
+}
+
 /// Repository connection paired with `conn`.
 ///
 /// A combined database (the repository file, or an injected test database that
@@ -621,7 +773,7 @@ pub async fn repository_peer(conn: &DatabaseConnection) -> io::Result<DatabaseCo
     {
         Ok(conn.clone())
     } else {
-        open_cached_repository(&path::database()).await
+        open_paired_repository(conn).await
     }
 }
 
@@ -639,7 +791,7 @@ pub async fn begin_catalog_or_repository_write(
     }
     let txn = conn.begin().await?;
     if txn
-        .execute_unprepared("UPDATE `schema_versions` SET `version` = `version` WHERE 0")
+        .execute_unprepared(CAPTURE_WRITE_LOCK_SQL)
         .await
         .is_err()
     {

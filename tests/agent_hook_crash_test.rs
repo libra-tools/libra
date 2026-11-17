@@ -70,7 +70,51 @@ impl HookRepo {
     }
 
     /// Run to completion, optionally piping `stdin` (closed after writing).
+    ///
+    /// A realtime hook only queues its event. For a hook this runs the
+    /// queueing process without its detached consumer (debug-build seam) and
+    /// then one consumer with the same environment, so fault injection
+    /// reaches the process that writes the catalog. The result is the hook's
+    /// failure if it failed, otherwise the consumer's status; output carries
+    /// both processes. A delivery the consumer could not store is dropped,
+    /// as a failed hook delivery was before the queue.
     fn run(&self, args: &[&str], stdin: Option<&str>, envs: &[(&str, &str)]) -> Output {
+        if !args.iter().take(3).any(|arg| *arg == "hooks") {
+            return self.run_raw(args, stdin, envs);
+        }
+        let mut hook_envs = envs.to_vec();
+        hook_envs.push(("LIBRA_TEST", "1"));
+        hook_envs.push(("LIBRA_TEST_CAPTURE_SPOOL_NO_CONSUMER", "1"));
+        let queued = self.run_raw(args, stdin, &hook_envs);
+        if !queued.status.success() {
+            return queued;
+        }
+        let consumer = self.run_raw(&["__capture-spool-drain"], None, envs);
+        if !consumer.status.success() {
+            self.drop_queue();
+        }
+        let mut stdout = queued.stdout;
+        stdout.extend(consumer.stdout);
+        let mut stderr = queued.stderr;
+        stderr.extend(consumer.stderr);
+        Output {
+            status: consumer.status,
+            stdout,
+            stderr,
+        }
+    }
+
+    fn drop_queue(&self) {
+        if let Ok(entries) = std::fs::read_dir(self.repo.join(".libra/private/capture-spool/ready"))
+        {
+            for entry in entries {
+                std::fs::remove_file(entry.expect("ready entry").path())
+                    .expect("drop an abandoned delivery");
+            }
+        }
+    }
+
+    fn run_raw(&self, args: &[&str], stdin: Option<&str>, envs: &[(&str, &str)]) -> Output {
         let mut cmd = self.command(args, envs);
         cmd.stdin(if stdin.is_some() {
             Stdio::piped()
@@ -142,6 +186,26 @@ impl HookRepo {
         self.repo.join(".libra").join("libra.db")
     }
 
+    /// Catalog tables live in `capture.db` once the capture store opens.
+    fn catalog_path(&self) -> PathBuf {
+        let capture = self.repo.join(".libra").join("private").join("capture.db");
+        if capture.is_file() {
+            capture
+        } else {
+            self.db_path()
+        }
+    }
+
+    /// The database a raw statement belongs to: catalog (`agent_*`) tables
+    /// are in `capture.db`, everything else in `libra.db`.
+    fn path_for_sql(&self, sql: &str) -> PathBuf {
+        if sql.contains("agent_") && !sql.contains("metadata_kv") {
+            self.catalog_path()
+        } else {
+            self.db_path()
+        }
+    }
+
     /// Put a coverage-v1-parseable Claude source at the provider-derived
     /// location.  The hook ignores a caller-supplied source pointer, so this
     /// is the only path that can exercise the real authorized snapshot and
@@ -163,7 +227,8 @@ impl HookRepo {
     }
 
     async fn query_rows(&self, sql: &str) -> Vec<sea_orm::QueryResult> {
-        let conn = self.db().await;
+        let url = format!("sqlite://{}?mode=ro", self.path_for_sql(sql).display());
+        let conn = Database::connect(url).await.expect("open libra catalog");
         conn.query_all_raw(Statement::from_string(
             conn.get_database_backend(),
             sql.to_string(),
@@ -230,7 +295,8 @@ impl HookRepo {
     /// Durable lifecycle evidence a native redelivery must never revise:
     /// (state, stopped_at, sync_revision, metadata_json).
     async fn session_ledger(&self, provider_session: &str) -> (String, Option<i64>, i64, String) {
-        let conn = self.db().await;
+        let url = format!("sqlite://{}?mode=ro", self.catalog_path().display());
+        let conn = Database::connect(url).await.expect("open capture catalog");
         let row = conn
             .query_one_raw(Statement::from_sql_and_values(
                 conn.get_database_backend(),
@@ -321,7 +387,7 @@ impl HookRepo {
             .and_then(Value::as_object_mut)
             .expect("blocked terminal persisted one pending finalizer");
         finalizer.insert(field.to_string(), value);
-        let conn = Database::connect(format!("sqlite://{}", self.db_path().display()))
+        let conn = Database::connect(format!("sqlite://{}", self.catalog_path().display()))
             .await
             .expect("open writable catalog for finalizer aging");
         conn.execute_raw(Statement::from_sql_and_values(
@@ -339,7 +405,23 @@ impl HookRepo {
     }
 
     async fn execute_sql(&self, sql: &str) {
-        let conn = Database::connect(format!("sqlite://{}", self.db_path().display()))
+        // A trigger is dropped from whichever database holds it.
+        if sql.trim_start().starts_with("DROP TRIGGER") && self.catalog_path() != self.db_path() {
+            let conn = Database::connect(format!("sqlite://{}", self.catalog_path().display()))
+                .await
+                .expect("open writable catalog for fault injection");
+            if conn
+                .execute_raw(Statement::from_string(
+                    conn.get_database_backend(),
+                    sql.to_string(),
+                ))
+                .await
+                .is_ok()
+            {
+                return;
+            }
+        }
+        let conn = Database::connect(format!("sqlite://{}", self.path_for_sql(sql).display()))
             .await
             .expect("open writable catalog for fault injection");
         conn.execute_raw(Statement::from_string(
@@ -351,7 +433,7 @@ impl HookRepo {
     }
 
     async fn seed_unrelated_sessions_before(&self, anchor_session: &str, count: usize) {
-        let conn = Database::connect(format!("sqlite://{}", self.db_path().display()))
+        let conn = Database::connect(format!("sqlite://{}", self.catalog_path().display()))
             .await
             .expect("open writable catalog for bounded worker regression");
         let anchor = conn
@@ -499,7 +581,12 @@ impl HookRepo {
         provider_prefix: &str,
         checkpoint_id: &str,
     ) -> (String, Option<String>, Vec<String>) {
-        let conn = self.db().await;
+        let conn = Database::connect(format!(
+            "sqlite://{}?mode=ro",
+            self.catalog_path().display()
+        ))
+        .await
+        .expect("open capture catalog");
         let backend = conn.get_database_backend();
         let session = conn
             .query_one_raw(Statement::from_sql_and_values(
@@ -779,6 +866,22 @@ fn managed_hook_accepts_regular_file_stdin() {
         "regular-file managed hook must succeed: {}",
         describe(&output)
     );
+    // The hook only queued its event; wait for the queue to be stored before
+    // reading the catalog.
+    let ready = repo.repo.join(".libra/private/capture-spool/ready");
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while std::fs::read_dir(&ready)
+        .map(|entries| entries.count())
+        .unwrap_or(0)
+        > 0
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the queued regular-file event was not stored"
+        );
+        let _ = repo.run_raw(&["__capture-spool-drain"], None, &[]);
+        std::thread::sleep(Duration::from_millis(20));
+    }
     assert!(
         repo.sessions()
             .iter()
@@ -849,9 +952,11 @@ fn codex_stop_exposes_and_retries_checkpoint_publication_failure() {
     );
     restore_checkpoint_object_directory(&repo, blocker);
 
+    // The Codex hook itself only queues and exits 0; the publication
+    // failure belongs to the consumer, which reports it.
     assert!(
-        stop.status.success(),
-        "Codex Stop must acknowledge capture failure: {}",
+        !stop.status.success(),
+        "the consumer must report the failed checkpoint publication: {}",
         describe(&stop)
     );
     let stderr = String::from_utf8_lossy(&stop.stderr);
@@ -3235,20 +3340,20 @@ async fn covered_turn_end_replay_keeps_cleanup_owned_marker_until_repair() {
     assert_eq!(repo.inflight_marker_count().await, 0);
 }
 
-/// ACF-06 AC7: routing capture through the coordinator keeps the public hook
-/// commands' exit/output contract byte-for-byte. Success and Codex's
-/// advisory nonterminal failure print nothing on either stream and exit 0;
-/// a terminal failure exits 128 with one fixed, content-free fatal line, its
-/// stable error code, and the structured envelope (stderr is not a TTY).
+/// ACF-06 AC7 under the capture queue (plan-20261116 CQ-05): the public
+/// hook commands only queue, so success and every capture failure alike exit
+/// 0 and print nothing on either stream. The consumer that stores the queue
+/// reports the failures with one fixed, content-free fatal line, its stable
+/// error code, and the structured envelope (stderr is not a TTY).
 #[test]
 fn hook_command_exit_and_output_contract_is_byte_stable() {
-    const TERMINAL_FAILURE_STDERR: &str = concat!(
-        "fatal: hook ingestion failed: capture could not be completed; ",
-        "retry the hook or inspect the local repository\n",
+    const CONSUMER_FAILURE_STDERR: &str = concat!(
+        "fatal: capture spool drain: 2 queued capture event(s) could not be stored and were ",
+        "moved to quarantine; run `libra agent doctor`\n",
         "Error-Code: LBR-INTERNAL-001\n",
         r#"{"ok":false,"error_code":"LBR-INTERNAL-001","category":"internal","exit_code":128,"#,
-        r#""severity":"fatal","message":"hook ingestion failed: capture could not be completed; "#,
-        r#"retry the hook or inspect the local repository"}"#,
+        r#""severity":"fatal","message":"capture spool drain: 2 queued capture event(s) could "#,
+        r#"not be stored and were moved to quarantine; run `libra agent doctor`"}"#,
         "\n",
     );
     let repo = HookRepo::init();
@@ -3273,38 +3378,48 @@ fn hook_command_exit_and_output_contract_is_byte_stable() {
     }
 
     let marker = "LIBRA_TEST_HOOK_CONTRACT_MARKER_7c1e";
-    let blocker = block_checkpoint_object_directory(&repo);
-    let advisory = repo.run(
+    let queue_only = [
+        ("LIBRA_TEST", "1"),
+        ("LIBRA_TEST_CAPTURE_SPOOL_NO_CONSUMER", "1"),
+    ];
+    let advisory = repo.run_raw(
         &["hooks", "codex", "stop"],
         Some(&repo.envelope(
             "Stop",
             codex,
             json!({ "event_id": "hook-contract-stop-v1", "last_assistant_message": marker }),
         )),
-        &[],
+        &queue_only,
     );
-    let terminal = repo.run(
+    let terminal = repo.run_raw(
         &["hooks", "claude", "session-end"],
         Some(&repo.envelope(
             "SessionEnd",
             claude,
             json!({ "event_id": "hook-contract-end-v1", "prompt": marker }),
         )),
-        &[],
+        &queue_only,
     );
+    for (label, queued) in [
+        ("Codex nonterminal", &advisory),
+        ("Claude terminal", &terminal),
+    ] {
+        assert_eq!(
+            (
+                queued.status.code(),
+                queued.stdout.as_slice(),
+                queued.stderr.as_slice()
+            ),
+            (Some(0), &b""[..], &b""[..]),
+            "{label} hook contract: {}",
+            describe(queued)
+        );
+    }
+    let blocker = block_checkpoint_object_directory(&repo);
+    let consumer = repo.run_raw(&["__capture-spool-drain"], None, &[]);
     restore_checkpoint_object_directory(&repo, blocker);
 
-    assert_eq!(
-        (
-            advisory.status.code(),
-            advisory.stdout.as_slice(),
-            advisory.stderr.as_slice()
-        ),
-        (Some(0), &b""[..], &b""[..]),
-        "Codex advisory nonterminal contract: {}",
-        describe(&advisory)
-    );
-    // The acknowledgement above must stand for a real capture failure.
+    // The queued acknowledgement above must stand for a real capture failure.
     let failed = repo.session_show(&format!("codex__{codex}"));
     assert_eq!(failed["capture_status"], json!("retryable"), "{failed}");
     assert_eq!(
@@ -3314,21 +3429,21 @@ fn hook_command_exit_and_output_contract_is_byte_stable() {
     );
 
     assert_eq!(
-        terminal.status.code(),
+        consumer.status.code(),
         Some(128),
-        "terminal failure exit code: {}",
-        describe(&terminal)
+        "consumer failure exit code: {}",
+        describe(&consumer)
     );
     assert!(
-        terminal.stdout.is_empty(),
-        "terminal failure must keep stdout empty: {}",
-        describe(&terminal)
+        consumer.stdout.is_empty(),
+        "consumer failure must keep stdout empty: {}",
+        describe(&consumer)
     );
     assert_eq!(
-        String::from_utf8(terminal.stderr.clone()).expect("hook stderr is utf-8"),
-        TERMINAL_FAILURE_STDERR,
-        "terminal failure stderr bytes: {}",
-        describe(&terminal)
+        String::from_utf8(consumer.stderr.clone()).expect("consumer stderr is utf-8"),
+        CONSUMER_FAILURE_STDERR,
+        "consumer failure stderr bytes: {}",
+        describe(&consumer)
     );
     assert_ne!(
         repo.session_show(&format!("claude__{claude}"))["state"],
@@ -3636,7 +3751,8 @@ fn hermes_observe_checkpoint_exports_nonempty_reasoning() {
     assert!(
         export_text.contains("\"reasoning\":\"kept-thinking\"")
             && export_text.contains("\"reasoning_content\":\"kept-thinking\""),
-        "ordinary export dropped thinking: {export_text}"
+        "ordinary export dropped thinking: {}; checkpoints: {checkpoints:?}",
+        describe(&exported)
     );
     assert!(
         !export_text.contains("[REDACTED]"),

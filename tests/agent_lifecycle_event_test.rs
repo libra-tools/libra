@@ -69,6 +69,21 @@ async fn ingest_agent_traces_payload(
     ingest_agent_traces_ingress_outcome_for_test(outcome, command, provider, conn, repo_path).await
 }
 
+/// New capture-queue tests run locally only. GitHub Actions never sets
+/// `LIBRA_RUN_CAPTURE_TESTS=1`, so they print `skipped` there.
+fn capture_tests_enabled(name: &str) -> bool {
+    if std::env::var_os("LIBRA_RUN_CAPTURE_TESTS").is_some_and(|value| value == "1") {
+        return true;
+    }
+    eprintln!("skipped ({name}: set LIBRA_RUN_CAPTURE_TESTS=1 to run local capture tests)");
+    false
+}
+
+/// `hooks ...` or `agent hooks ...`, possibly after global flags.
+fn is_hook_command(args: &[&str]) -> bool {
+    args.iter().take(3).any(|arg| *arg == "hooks")
+}
+
 /// One isolated libra repository plus a fake `$HOME` for provider
 /// transcript roots (`~/.claude`). Every test builds its own so no state
 /// is shared between tests.
@@ -147,8 +162,115 @@ impl HookRepo {
         cmd
     }
 
+    /// A realtime hook only queues its event. For a hook this runs the
+    /// queueing process without its detached consumer (debug-build seam) and
+    /// then one consumer, and returns the hook's failure or else the
+    /// consumer's status with both outputs. A delivery the consumer could not
+    /// store is dropped, as a failed hook delivery was before the queue.
     fn run_bytes_in(&self, workdir: &Path, args: &[&str], stdin: Option<&[u8]>) -> Output {
+        if !is_hook_command(args) {
+            return self.run_bytes_in_no_drain(workdir, args, stdin);
+        }
+        let queued = self.run_bytes_in_env(
+            workdir,
+            args,
+            stdin,
+            &[
+                ("LIBRA_TEST", "1"),
+                ("LIBRA_TEST_CAPTURE_SPOOL_NO_CONSUMER", "1"),
+            ],
+        );
+        if !queued.status.success() {
+            return queued;
+        }
+        let consumer = self.run_bytes_in_no_drain(&self.repo, &["__capture-spool-drain"], None);
+        if !consumer.status.success() {
+            for name in self.ready_files() {
+                std::fs::remove_file(
+                    self.repo
+                        .join(".libra/private/capture-spool/ready")
+                        .join(name),
+                )
+                .expect("drop an abandoned delivery");
+            }
+        }
+        let mut stdout = queued.stdout;
+        stdout.extend(consumer.stdout);
+        let mut stderr = queued.stderr;
+        stderr.extend(consumer.stderr);
+        Output {
+            status: consumer.status,
+            stdout,
+            stderr,
+        }
+    }
+
+    /// A realtime hook only queues its event. Most contract tests observe the
+    /// catalog afterwards, so they store the queue the same way an operator
+    /// would: `libra __capture-spool-drain`, repeated while the detached
+    /// consumer the hook started still holds the consumer lock.
+    fn drain_spool(&self) {
+        let ready = self.repo.join(".libra/private/capture-spool/ready");
+        let deadline = Instant::now() + Duration::from_secs(90);
+        loop {
+            let pending = std::fs::read_dir(&ready)
+                .map(|entries| entries.count())
+                .unwrap_or(0);
+            if pending == 0 {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "capture spool still holds {pending} ready file(s) after 90s"
+            );
+            let _ = self
+                .command_in(&self.repo)
+                .arg("__capture-spool-drain")
+                .stdin(Stdio::null())
+                .output()
+                .expect("run capture spool drain");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Run without storing the queue afterwards and without the detached
+    /// consumer a hook normally starts (debug-build seam), so the test alone
+    /// decides when `ready/` is read.
+    fn run_no_drain(&self, args: &[&str], stdin: Option<&str>) -> Output {
+        let mut cmd = self.command_in(&self.repo);
+        cmd.env("LIBRA_TEST", "1")
+            .env("LIBRA_TEST_CAPTURE_SPOOL_NO_CONSUMER", "1")
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = cmd.spawn().expect("spawn libra binary");
+        {
+            let mut input = child.stdin.take().expect("stdin piped");
+            if let Some(payload) = stdin {
+                input
+                    .write_all(payload.as_bytes())
+                    .expect("write hook envelope to stdin");
+            }
+        }
+        child.wait_with_output().expect("wait for libra binary")
+    }
+
+    fn run_bytes_in_no_drain(&self, workdir: &Path, args: &[&str], stdin: Option<&[u8]>) -> Output {
+        self.run_bytes_in_env(workdir, args, stdin, &[])
+    }
+
+    fn run_bytes_in_env(
+        &self,
+        workdir: &Path,
+        args: &[&str],
+        stdin: Option<&[u8]>,
+        envs: &[(&str, &str)],
+    ) -> Output {
         let mut cmd = self.command_in(workdir);
+        for (key, value) in envs {
+            cmd.env(key, value);
+        }
         cmd.args(args)
             .stdin(if stdin.is_some() {
                 Stdio::piped()
@@ -177,7 +299,13 @@ impl HookRepo {
             ))
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        cmd.output().expect("run libra with regular-file stdin")
+        cmd.env("LIBRA_TEST", "1")
+            .env("LIBRA_TEST_CAPTURE_SPOOL_NO_CONSUMER", "1");
+        let out = cmd.output().expect("run libra with regular-file stdin");
+        if is_hook_command(args) && out.status.success() {
+            self.drain_spool();
+        }
+        out
     }
 
     /// `libra agent hooks <agent> <verb>` with `envelope` piped via stdin.
@@ -248,8 +376,50 @@ impl HookRepo {
             .expect("open repository database")
     }
 
+    /// Names of envelopes waiting in the capture queue.
+    fn ready_files(&self) -> Vec<String> {
+        let mut names: Vec<String> =
+            std::fs::read_dir(self.repo.join(".libra/private/capture-spool/ready"))
+                .map(|entries| {
+                    entries
+                        .map(|entry| {
+                            entry
+                                .expect("ready entry")
+                                .file_name()
+                                .to_string_lossy()
+                                .into_owned()
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    fn quarantined_files(&self) -> usize {
+        std::fs::read_dir(self.repo.join(".libra/private/capture-spool/quarantine"))
+            .map(|entries| entries.count())
+            .unwrap_or(0)
+    }
+
+    /// The capture catalog (`agent_*` tables) lives in its own database.
+    async fn capture_db(&self) -> DatabaseConnection {
+        let mut options = ConnectOptions::new(format!(
+            "sqlite://{}",
+            self.repo
+                .join(".libra")
+                .join("private")
+                .join("capture.db")
+                .display()
+        ));
+        options.sqlx_logging(false);
+        Database::connect(options)
+            .await
+            .expect("open capture database")
+    }
+
     async fn durable_session(&self, session_id: &str) -> DurableSessionState {
-        let conn = self.db().await;
+        let conn = self.capture_db().await;
         let row = conn
             .query_one_raw(Statement::from_sql_and_values(
                 conn.get_database_backend(),
@@ -1436,13 +1606,18 @@ fn valid_ingress_with_unavailable_database_fails_without_panic() {
     );
 }
 
-/// A trusted Codex SessionEnd must not turn a SQLite writer collision into a
-/// successful callback or a false terminal state. The handler gets only its
-/// bounded managed slice while the writer holds the catalog lock; once that
-/// lock is released, redelivering the same native event must recover exactly
-/// one terminal checkpoint.
+/// A Codex terminal delivered while another writer holds `capture.db` is
+/// queued: the hook exits 0 quickly instead of failing on the catalog lock.
+/// The session stays active while the lock is held. Once it is released the
+/// consumer stores the terminal, and a redelivery of the same native event
+/// adds no second checkpoint.
 #[tokio::test]
-async fn codex_terminal_database_lock_is_bounded_nonzero_and_replays_once() {
+async fn capture_spool_hook_terminal_under_capture_lock_queues_and_replays_once() {
+    if !capture_tests_enabled(
+        "capture_spool_hook_terminal_under_capture_lock_queues_and_replays_once",
+    ) {
+        return;
+    }
     let repo = HookRepo::init();
     let session = "sess-codex-terminal-database-lock";
     let native_event_id = "codex-terminal-database-lock-v1";
@@ -1469,26 +1644,38 @@ async fn codex_terminal_database_lock_is_bounded_nonzero_and_replays_once() {
         None,
         json!({ "event_id": native_event_id }),
     );
-    let conn = repo.db().await;
-    let transaction = libra::internal::db::begin_write_transaction(&conn)
+    let mut options = ConnectOptions::new(format!(
+        "sqlite://{}?mode=rw",
+        repo.repo.join(".libra/private/capture.db").display()
+    ));
+    options
+        .max_connections(1)
+        .min_connections(1)
+        .sqlx_logging(false);
+    let transaction = Database::connect(options)
+        .await
+        .expect("open capture database to lock");
+    transaction
+        .execute_unprepared("BEGIN IMMEDIATE")
         .await
         .expect("hold a writer lock across the terminal hook");
 
     let started = Instant::now();
-    let locked = repo.run(
+    let locked = repo.run_no_drain(
         &["hooks", "codex", "session-end", "--capture-budget-ms", "20"],
         Some(&terminal),
     );
     assert!(
         started.elapsed() < Duration::from_secs(2),
-        "managed terminal hook must not inherit SQLite's ordinary 30-second wait: {}",
+        "a queued terminal must not wait for the catalog lock: {}",
         describe(&locked)
     );
     assert!(
-        !locked.status.success(),
-        "a trusted terminal without a durable receipt must fail closed: {}",
+        locked.status.success(),
+        "a terminal that reached ready/ must exit 0 even while capture.db is locked: {}",
         describe(&locked)
     );
+    assert_eq!(repo.ready_files().len(), 1, "the terminal must be queued");
 
     let row = transaction
         .query_one_raw(Statement::from_sql_and_values(
@@ -1503,18 +1690,21 @@ async fn codex_terminal_database_lock_is_bounded_nonzero_and_replays_once() {
         row.try_get_by::<String, _>("state")
             .expect("decode locked terminal state"),
         "active",
-        "a lock-rejected terminal must not publish stopped state"
-    );
-    assert_eq!(
-        row.try_get_by::<Option<i64>, _>("stopped_at")
-            .expect("decode locked terminal stopped_at"),
-        None,
-        "a lock-rejected terminal must not publish a stop timestamp"
+        "a queued terminal is not stored while the catalog lock is held"
     );
     transaction
-        .rollback()
+        .execute_unprepared("ROLLBACK")
         .await
-        .expect("release writer lock before native replay");
+        .expect("release writer lock before the consumer runs");
+    drop(transaction);
+
+    repo.drain_spool();
+    let durable = repo.durable_session(&format!("codex__{session}")).await;
+    assert_eq!(durable.state, "stopped");
+    assert!(
+        durable.stopped_at.is_some(),
+        "the stored terminal must have one durable stop timestamp"
+    );
 
     let replay = repo.run(
         &[
@@ -1528,17 +1718,10 @@ async fn codex_terminal_database_lock_is_bounded_nonzero_and_replays_once() {
     );
     assert!(
         replay.status.success(),
-        "the same native terminal delivery must recover after lock release: {}",
+        "redelivering the same native terminal must succeed: {}",
         describe(&replay)
     );
-
-    let durable = repo.durable_session(&format!("codex__{session}")).await;
-    assert_eq!(durable.state, "stopped");
-    assert!(
-        durable.stopped_at.is_some(),
-        "the recovered terminal must have one durable stop timestamp"
-    );
-    let conn = repo.db().await;
+    let conn = repo.capture_db().await;
     let checkpoint_count = conn
         .query_one_raw(Statement::from_sql_and_values(
             conn.get_database_backend(),
@@ -1552,7 +1735,7 @@ async fn codex_terminal_database_lock_is_bounded_nonzero_and_replays_once() {
         .expect("decode checkpoint count");
     assert_eq!(
         checkpoint_count, 1,
-        "native terminal replay must recover exactly one checkpoint"
+        "a replayed terminal must not add a second checkpoint"
     );
 }
 
@@ -2363,7 +2546,7 @@ async fn hooks_apply_pending_repository_migrations_before_capture() {
                 "{args:?}: the migrated schema must stay within the current schema, found {alien}"
             ));
         }
-        if !gemini && agent_session_rows(&conn).await == 0 {
+        if !gemini && agent_session_rows(&repo.capture_db().await).await == 0 {
             problems.push(format!(
                 "{args:?}: capture must complete on the migrated schema"
             ));
@@ -2421,6 +2604,64 @@ fn future_schema_forbidden(repo: &HookRepo, future: i64) -> Vec<String> {
     forbidden
 }
 
+/// Run hook entries against a newer-Libra repository schema. Hooks no longer
+/// open the repository database: each one queues its event and exits 0
+/// without rendering a path, version or the raw frame. The consumer then
+/// refuses the database with the path-free `LBR-IO-001` newer-binary remedy
+/// and keeps every queued event.
+fn assert_future_schema_queued_then_drain_refused(
+    repo: &HookRepo,
+    future: i64,
+    surfaces: &[(&[&str], Option<&str>)],
+) {
+    let forbidden = future_schema_forbidden(repo, future);
+    for (args, hook_event_name) in surfaces {
+        let payload = hook_event_name.map(|name| {
+            repo.envelope(
+                name,
+                "sess-future-schema-fail-closed",
+                None,
+                json!({ "prompt": FUTURE_SCHEMA_MARKER }),
+            )
+        });
+        let out = repo.run_no_drain(args, payload.as_deref());
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{args:?}: a hook queues even when the repository schema is newer: {}",
+            describe(&out)
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        for needle in &forbidden {
+            assert!(
+                !stderr.contains(needle.as_str()) && !stdout.contains(needle.as_str()),
+                "{args:?}: the queued hook must not render {needle:?}: {}",
+                describe(&out)
+            );
+        }
+    }
+    let queued = repo.ready_files();
+    assert!(!queued.is_empty(), "the hooks must leave queued events");
+    let drained = repo.run_no_drain(&["__capture-spool-drain"], None);
+    let forbidden: Vec<&str> = forbidden.iter().map(String::as_str).collect();
+    assert_restored_repository_error(
+        "__capture-spool-drain",
+        &drained,
+        "LBR-IO-001",
+        &[
+            "capture spool drain failed: could not open the repository database",
+            FUTURE_SCHEMA_REMEDY,
+        ],
+        &forbidden,
+    );
+    assert_eq!(
+        repo.ready_files(),
+        queued,
+        "a refused repository schema must keep every queued event"
+    );
+}
+
 /// Run fail-closed hook entries against a newer-Libra schema and require the
 /// restored path-free `LBR-IO-001` newer-binary contract from each.
 fn assert_future_schema_refused(
@@ -2467,97 +2708,61 @@ async fn assert_future_schema_untouched(repo: &HookRepo, receipts: &[String], sc
         schema,
         "a refused newer-Libra schema must not be migrated or rebuilt"
     );
-    assert_eq!(
-        agent_session_rows(&conn).await,
-        0,
-        "no hook may capture under a schema written by a newer Libra"
-    );
     conn.close().await.expect("close future-schema repository");
+    let capture = repo.repo.join(".libra/private/capture.db");
+    if capture.exists() {
+        assert_eq!(
+            agent_session_rows(&repo.capture_db().await).await,
+            0,
+            "no hook may capture under a schema written by a newer Libra"
+        );
+    }
 }
 
-/// R89: a repository database whose schema was written by a newer Libra is
-/// refused by the installed Claude surface and the hidden `libra agent
-/// hooks` alias before any capture write — on the managed
-/// (`--capture-budget-ms`) path as well as the unmanaged one — with the
-/// path-free `LBR-IO-001` newer-binary remedy the retired preflight gave,
-/// never the generic capture failure, a path, a version number or raw stdin.
+/// R89 under the capture queue: a repository database whose schema was
+/// written by a newer Libra no longer fails the installed Claude surface or
+/// the hidden `libra agent hooks` aliases, because they queue without opening
+/// it (managed and unmanaged paths alike). The consumer refuses the database
+/// with the path-free `LBR-IO-001` newer-binary remedy and keeps the queue;
+/// the schema and catalog stay untouched.
 #[tokio::test]
-async fn fail_closed_hooks_refuse_a_newer_libra_repository_schema() {
+async fn capture_spool_hook_newer_repository_schema_is_refused_by_the_consumer() {
+    if !capture_tests_enabled(
+        "capture_spool_hook_newer_repository_schema_is_refused_by_the_consumer",
+    ) {
+        return;
+    }
     let (repo, future, receipts, schema) = future_schema_hook_repo().await;
-    let mut surfaces: Vec<(&[&str], &str, Option<&str>)> = vec![(
-        &[
-            "agent",
-            "hooks",
-            "--capture-budget-ms",
-            "9000",
-            "claude-code",
-            "stop",
-        ],
-        "agent hook ingestion failed",
-        Some("Stop"),
-    )];
+    let mut surfaces: Vec<(&[&str], Option<&str>)> = vec![
+        (
+            &[
+                "agent",
+                "hooks",
+                "--capture-budget-ms",
+                "9000",
+                "claude-code",
+                "stop",
+            ],
+            Some("Stop"),
+        ),
+        (
+            &[
+                "hooks",
+                "codex",
+                "session-end",
+                "--capture-budget-ms",
+                "2000",
+            ],
+            Some("SessionEnd"),
+        ),
+        (&["hooks", "codex", "session-end"], Some("SessionEnd")),
+    ];
     surfaces.extend(
         FAIL_CLOSED_DAMAGED_REPOSITORY_SURFACES
             .iter()
-            .map(|(args, context)| (*args, *context, Some("Stop"))),
+            .map(|(args, _)| (*args, Some("Stop"))),
     );
-    assert_future_schema_refused(&repo, future, &surfaces);
-    assert_future_schema_untouched(&repo, &receipts, &schema).await;
-}
-
-/// R89: the installed Codex surface keeps its exit policy against a
-/// newer-Libra schema: a trusted managed `SessionEnd` fails with the same
-/// path-free `LBR-IO-001` code and remedy, and a nonterminal callback stays
-/// advisory (exit `0`) without capturing or leaking anything.
-#[tokio::test]
-async fn codex_hooks_refuse_a_newer_libra_repository_schema() {
-    let (repo, future, receipts, schema) = future_schema_hook_repo().await;
-    assert_future_schema_refused(
-        &repo,
-        future,
-        &[
-            (
-                &[
-                    "hooks",
-                    "codex",
-                    "session-end",
-                    "--capture-budget-ms",
-                    "2000",
-                ],
-                "Codex hook ingestion failed",
-                Some("SessionEnd"),
-            ),
-            (
-                &["hooks", "codex", "session-end"],
-                "Codex hook ingestion failed",
-                Some("SessionEnd"),
-            ),
-        ],
-    );
-    let nonterminal = repo.run(
-        &["hooks", "codex", "stop", "--capture-budget-ms", "29000"],
-        Some(&repo.envelope(
-            "Stop",
-            "sess-future-schema-codex-nonterminal",
-            None,
-            json!({ "prompt": FUTURE_SCHEMA_MARKER }),
-        )),
-    );
-    assert_eq!(
-        nonterminal.status.code(),
-        Some(0),
-        "installed Codex nonterminal callbacks stay advisory: {}",
-        describe(&nonterminal)
-    );
-    let stderr = String::from_utf8_lossy(&nonterminal.stderr);
-    let stdout = String::from_utf8_lossy(&nonterminal.stdout);
-    for needle in future_schema_forbidden(&repo, future) {
-        assert!(
-            !stderr.contains(&needle) && !stdout.contains(&needle),
-            "the advisory Codex callback must not render {needle:?}: {}",
-            describe(&nonterminal)
-        );
-    }
+    assert_future_schema_queued_then_drain_refused(&repo, future, &surfaces);
     assert_future_schema_untouched(&repo, &receipts, &schema).await;
 }
 
@@ -2872,6 +3077,7 @@ fn simultaneous_stop_race_yields_single_owner_checkpoints() {
             .wait_with_output()
             .expect("wait for claude stop");
         let codex_out = codex_child.wait_with_output().expect("wait for codex stop");
+        repo.drain_spool();
         assert!(
             claude_out.status.success(),
             "attempt {attempt}: racing claude stop must exit 0 (skip, never error): {}",
@@ -2957,6 +3163,7 @@ async fn simultaneous_nonexempt_state_only_events_fence_loser_before_any_mutatio
             let codex_out = codex_child
                 .wait_with_output()
                 .expect("wait for Codex first state-only event");
+            repo.drain_spool();
             assert!(
                 claude_out.status.success(),
                 "{label} attempt {attempt}: Claude handler must safely apply/skip: {}",
@@ -2968,7 +3175,7 @@ async fn simultaneous_nonexempt_state_only_events_fence_loser_before_any_mutatio
                 describe(&codex_out)
             );
 
-            let conn = repo.db().await;
+            let conn = repo.capture_db().await;
             let rows = conn
                 .query_all_raw(Statement::from_sql_and_values(
                     conn.get_database_backend(),
@@ -3059,6 +3266,7 @@ async fn simultaneous_session_end_race_fences_loser_before_receipt_write() {
         let codex_out = codex_child
             .wait_with_output()
             .expect("wait for Codex SessionEnd");
+        repo.drain_spool();
         assert!(
             claude_out.status.success(),
             "attempt {attempt}: fenced Claude SessionEnd acknowledges safely: {}",
@@ -3070,7 +3278,7 @@ async fn simultaneous_session_end_race_fences_loser_before_receipt_write() {
             describe(&codex_out)
         );
 
-        let conn = repo.db().await;
+        let conn = repo.capture_db().await;
         let rows = conn
             .query_all_raw(Statement::from_sql_and_values(
                 conn.get_database_backend(),
@@ -3142,7 +3350,7 @@ async fn simultaneous_session_end_race_fences_loser_before_receipt_write() {
                 "attempt {attempt}/{replay_attempt}: fenced loser replay must acknowledge: {}",
                 describe(&loser_replay)
             );
-            let conn = repo.db().await;
+            let conn = repo.capture_db().await;
             let after_rows = conn
                 .query_all_raw(Statement::from_sql_and_values(
                     conn.get_database_backend(),
@@ -3254,6 +3462,7 @@ async fn simultaneous_same_provider_session_end_uses_one_terminal_attempt() {
         })
         .collect::<Vec<_>>();
     let output_summary = outputs.iter().map(describe).collect::<Vec<_>>().join(" | ");
+    repo.drain_spool();
 
     // Once both concurrent handlers have returned, their shared native
     // receipt must already be terminal. A live-marker contender may report a
@@ -3272,23 +3481,30 @@ async fn simultaneous_same_provider_session_end_uses_one_terminal_attempt() {
         1,
         "all same-native contenders must append exactly one checkpoint before replay"
     );
-    let conn = repo.db().await;
-    let trace_row = conn
+    // The checkpoint row is in capture.db and the traces ref in libra.db.
+    let capture = repo.capture_db().await;
+    let checkpoint_commit: String = capture
         .query_one_raw(Statement::from_sql_and_values(
-            conn.get_database_backend(),
-            "SELECT c.traces_commit, r.\"commit\" AS ref_commit
-             FROM agent_checkpoint c
-             JOIN reference r ON r.name = 'traces'
-             WHERE c.session_id = ? LIMIT 1",
+            capture.get_database_backend(),
+            "SELECT traces_commit FROM agent_checkpoint WHERE session_id = ? LIMIT 1",
             [format!("claude__{session}").into()],
         ))
         .await
-        .expect("read terminal checkpoint and traces ref")
-        .expect("one terminal traces commit");
-    let checkpoint_commit: String = trace_row
+        .expect("read terminal checkpoint")
+        .expect("one terminal traces commit")
         .try_get_by("traces_commit")
         .expect("decode terminal checkpoint traces commit");
-    let traces_head_before_replay: String = trace_row
+    drop(capture);
+    let conn = repo.db().await;
+    let traces_head_before_replay: String = conn
+        .query_one_raw(Statement::from_string(
+            conn.get_database_backend(),
+            "SELECT \"commit\" AS ref_commit FROM reference WHERE name = 'traces' LIMIT 1"
+                .to_string(),
+        ))
+        .await
+        .expect("read traces ref")
+        .expect("traces ref row")
         .try_get_by("ref_commit")
         .expect("decode traces ref head");
     assert_eq!(
@@ -3781,29 +3997,42 @@ async fn failed_nonterminal_checkpoint_does_not_create_pending_artifact() {
     assert!(!backup.exists(), "isolated test backup must not exist");
     std::fs::rename(&objects, &backup).expect("move object directory aside");
     std::fs::write(&objects, b"not a directory").expect("block object directory creation");
-    let stopped = repo.hook(
-        "claude-code",
-        "stop",
-        &repo.envelope(
+    // The hook only queues. The consumer reaches the nonterminal checkpoint
+    // path, fails on the object store and keeps the event queued.
+    let stopped = repo.run_no_drain(
+        &["agent", "hooks", "claude-code", "stop"],
+        Some(&repo.envelope(
             "Stop",
             session,
             Some(&transcript),
             json!({ "event_id": "failed-nonterminal-stop-v1" }),
-        ),
+        )),
     );
+    assert!(
+        stopped.status.success(),
+        "queue Stop: {}",
+        describe(&stopped)
+    );
+    let drained = repo.run_no_drain(&["__capture-spool-drain"], None);
     std::fs::remove_file(&objects).expect("remove object-directory blocker");
     std::fs::rename(&backup, &objects).expect("restore object directory");
     assert_eq!(repo.pending_artifact_count().await, 0);
     assert!(
-        !stopped.status.success(),
+        !drained.status.success(),
         "the object-store failure must reach the nonterminal checkpoint path: {}",
-        describe(&stopped)
+        describe(&drained)
     );
     assert!(
-        String::from_utf8_lossy(&stopped.stderr)
-            .contains("agent hook ingestion failed: capture could not be completed"),
-        "the failure must retain the expected hook-ingest classification: {}",
-        describe(&stopped)
+        String::from_utf8_lossy(&drained.stderr)
+            .contains("capture spool drain: 1 queued capture event(s) could not be stored"),
+        "the consumer failure must keep its fixed classification: {}",
+        describe(&drained)
+    );
+    assert!(repo.ready_files().is_empty());
+    assert_eq!(
+        repo.quarantined_files(),
+        1,
+        "the event that could not be stored is kept in quarantine, not lost"
     );
 }
 
@@ -4239,19 +4468,38 @@ async fn stale_finalizer_cannot_overwrite_takeover() {
     assert!(!backup.exists(), "isolated test backup must not exist");
     std::fs::rename(&objects, &backup).expect("move object directory aside");
     std::fs::write(&objects, b"not a directory").expect("block object directory creation");
-    let blocked = repo.hook("claude-code", "session-end", &stale_terminal);
+    let queued = repo.run_no_drain(
+        &["agent", "hooks", "claude-code", "session-end"],
+        Some(&stale_terminal),
+    );
+    assert!(
+        queued.status.success(),
+        "queue terminal: {}",
+        describe(&queued)
+    );
+    let blocked = repo.run_no_drain(&["__capture-spool-drain"], None);
     std::fs::remove_file(&objects).expect("remove object-directory blocker");
     std::fs::rename(&backup, &objects).expect("restore object directory");
     assert!(
         !blocked.status.success(),
-        "a terminal whose checkpoint cannot publish must not be acknowledged: {}",
+        "a terminal whose checkpoint cannot publish must not be stored: {}",
         describe(&blocked)
     );
     assert!(
-        !describe(&blocked).contains(sentinel),
+        !describe(&blocked).contains(sentinel) && !describe(&queued).contains(sentinel),
         "the failed terminal must not echo transcript content: {}",
         describe(&blocked)
     );
+    // This scenario is the stale delivery that never completes: drop the
+    // queued copy so only the explicit redeliveries below replay it.
+    for name in repo.ready_files() {
+        std::fs::remove_file(
+            repo.repo
+                .join(".libra/private/capture-spool/ready")
+                .join(name),
+        )
+        .expect("drop the abandoned stale terminal");
+    }
     let pending = repo.durable_session(&session_id).await;
     assert_eq!(pending.state, "active", "pending terminal must stay active");
     assert_eq!(pending.stopped_at, None);
@@ -4317,29 +4565,29 @@ async fn stale_finalizer_cannot_overwrite_takeover() {
     // The stale redelivery is acknowledged only as a fenced skip. Capture
     // the content-free ingest diagnostic to prove the catalog rejected it on
     // the revision fence rather than by any later, accidental failure.
+    // The consumer applies the redelivery, so it writes the diagnostic.
     let fence_log = repo.repo.join("stale-finalizer-fence.log");
-    let mut fenced = repo.command_in(&repo.repo);
-    fenced
-        .args(["agent", "hooks", "claude-code", "session-end"])
-        .env("LIBRA_LOG", "agent.hook.ingest=warn")
-        .env("LIBRA_LOG_FILE", &fence_log)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut fenced = fenced.spawn().expect("spawn stale terminal redelivery");
-    fenced
-        .stdin
-        .take()
-        .expect("stale terminal stdin piped")
-        .write_all(stale_terminal.as_bytes())
-        .expect("write stale terminal envelope");
-    let fenced = fenced
-        .wait_with_output()
-        .expect("wait for stale terminal redelivery");
+    let fenced = repo.run_no_drain(
+        &["agent", "hooks", "claude-code", "session-end"],
+        Some(&stale_terminal),
+    );
     assert!(
         fenced.status.success(),
-        "a fenced stale terminal is acknowledged without side effects: {}",
+        "a stale terminal redelivery is queued: {}",
         describe(&fenced)
+    );
+    let consumer = repo
+        .command_in(&repo.repo)
+        .arg("__capture-spool-drain")
+        .env("LIBRA_LOG", "agent.hook.ingest=warn")
+        .env("LIBRA_LOG_FILE", &fence_log)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run capture spool drain");
+    assert!(
+        consumer.status.success() && repo.ready_files().is_empty(),
+        "a fenced stale terminal is acknowledged without side effects: {}",
+        describe(&consumer)
     );
     let fence_diagnostic = std::fs::read_to_string(&fence_log).expect("read fence diagnostic");
     assert!(
@@ -4642,7 +4890,15 @@ fn hook_contract_bytes(repo: &HookRepo, bytes: &[u8]) -> String {
 /// identity, lifecycle columns, checkpoint scopes and capture receipts, plus
 /// the repository's pending-artifact count.
 async fn hook_contract_projection(repo: &HookRepo) -> String {
-    let conn = repo.db().await;
+    // `capture.db` appears on the first stored event; before that the
+    // catalog is empty.
+    if !repo.repo.join(".libra/private/capture.db").exists() {
+        return format!(
+            "sessions=[] artifacts={}",
+            repo.pending_artifact_count().await
+        );
+    }
+    let conn = repo.capture_db().await;
     let backend = conn.get_database_backend();
     let rows = conn
         .query_all_raw(Statement::from_string(
@@ -5624,6 +5880,8 @@ fn claude_observe_parse_and_database_failures_keep_existing_data() {
         cmd.args(["agent", "hooks", "claude-code", "observe"])
             .env("LIBRA_LOG", "debug")
             .env("LIBRA_LOG_FILE", &log_file)
+            .env("LIBRA_TEST", "1")
+            .env("LIBRA_TEST_CAPTURE_SPOOL_NO_CONSUMER", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -5635,6 +5893,16 @@ fn claude_observe_parse_and_database_failures_keep_existing_data() {
             .write_all(stdin)
             .expect("write observe frame");
         child.wait_with_output().expect("wait for libra observe")
+    };
+    // The hook only queues; the consumer runs with the same log sink.
+    let drain = || {
+        repo.command_in(&repo.repo)
+            .arg("__capture-spool-drain")
+            .env("LIBRA_LOG", "debug")
+            .env("LIBRA_LOG_FILE", &log_file)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run capture spool drain")
     };
     let assert_silent = |out: &Output, case: &str| {
         let (stdout, stderr) = claude_observe_text(out);
@@ -5660,6 +5928,7 @@ fn claude_observe_parse_and_database_failures_keep_existing_data() {
         .as_bytes(),
     );
     assert_silent(&started, "baseline");
+    assert!(drain().status.success(), "baseline drain");
     assert!(session_listed(), "baseline observe records the session");
 
     let malformed = format!(
@@ -5672,16 +5941,10 @@ fn claude_observe_parse_and_database_failures_keep_existing_data() {
         "a parse failure must not delete the session"
     );
 
-    let partials = || {
-        std::fs::read_to_string(&log_file)
-            .unwrap_or_default()
-            .matches("claude_observe_partial")
-            .count()
-    };
-    let before_refusal = partials();
-    let database = repo.repo.join(".libra").join("libra.db");
+    // The catalog lives in capture.db, so that is the file whose write fails.
+    let database = repo.repo.join(".libra/private/capture.db");
     let original = std::fs::metadata(&database)
-        .expect("stat repository database")
+        .expect("stat capture database")
         .permissions();
     let mut read_only = original.clone();
     read_only.set_mode(0o444);
@@ -5695,16 +5958,28 @@ fn claude_observe_parse_and_database_failures_keep_existing_data() {
         )
         .as_bytes(),
     );
+    // A read-only repository database is the consumer's failure, not the
+    // hook's: the event stays queued and nothing is deleted.
+    let blocked = drain();
     std::fs::set_permissions(&database, original).expect("restore database permissions");
     assert_silent(&refused, "read-only database");
     assert!(
+        !blocked.status.success(),
+        "the consumer cannot store into a read-only database: {}",
+        describe(&blocked)
+    );
+    assert!(
+        !describe(&blocked).contains(canary),
+        "the consumer failure must not echo the payload"
+    );
+    assert_eq!(
+        repo.ready_files().len() + repo.quarantined_files(),
+        1,
+        "the event is kept in ready/ or quarantine/, never lost"
+    );
+    assert!(
         session_listed(),
         "a database write failure must not delete the session"
-    );
-
-    assert!(
-        partials() > before_refusal,
-        "the read-only database must take the controllable failure path"
     );
     let log = std::fs::read_to_string(&log_file).unwrap_or_default();
     assert!(
@@ -5787,7 +6062,7 @@ async fn claude_observe_message_display_limit_holds_across_processes() {
     );
 
     let storage = repo.repo.join(".libra");
-    let conn = repo.db().await;
+    let conn = repo.capture_db().await;
     libra::internal::ai::history::HistoryManager::new_with_ref(
         std::sync::Arc::new(
             libra::utils::client_storage::ClientStorage::init_local_existing(
@@ -9542,7 +9817,7 @@ async fn pi_tool_correlation_reads_sessions_with_and_without_links() {
 
 /// Replace one session's `metadata_json` member (test-only fault injection).
 async fn pi_set_metadata_member(repo: &HookRepo, session_id: &str, key: &str, value: Value) {
-    let conn = repo.db().await;
+    let conn = repo.capture_db().await;
     let mut metadata = repo.durable_session(session_id).await.metadata;
     metadata[key] = value;
     conn.execute_raw(Statement::from_sql_and_values(
@@ -9758,13 +10033,15 @@ async fn pi_tool_correlation_survives_a_doctor_repair() {
         "first_attempt_millis".to_string(),
         json!(Utc::now().timestamp_millis() - 1_800_001),
     );
-    conn.execute_raw(Statement::from_sql_and_values(
-        conn.get_database_backend(),
-        "UPDATE agent_session SET metadata_json = ? WHERE session_id = ?",
-        [metadata.to_string().into(), session_id.clone().into()],
-    ))
-    .await
-    .expect("age the finalizer");
+    let capture = repo.capture_db().await;
+    capture
+        .execute_raw(Statement::from_sql_and_values(
+            capture.get_database_backend(),
+            "UPDATE agent_session SET metadata_json = ? WHERE session_id = ?",
+            [metadata.to_string().into(), session_id.clone().into()],
+        ))
+        .await
+        .expect("age the finalizer");
     let before = repo.durable_session(&session_id).await;
     assert_ne!(before.state, "quarantined");
     let before_links = serde_json::to_string(&before.metadata["capture_tool_links_v1"]).unwrap();
@@ -9791,4 +10068,378 @@ async fn pi_tool_correlation_survives_a_doctor_repair() {
         before_links,
         "the links survive the repair byte for byte"
     );
+}
+
+// ---------------------------------------------------------------------------
+// plan-20261116 CQ-05: realtime hooks queue instead of opening a database.
+// Every case below is a local capture test (`LIBRA_RUN_CAPTURE_TESTS=1`).
+// ---------------------------------------------------------------------------
+
+/// Hold the spool consumer lock so a test can inspect `ready/` before any
+/// consumer reads it. The file must be private, as the consumer requires.
+fn hold_spool_consumer_lock(repo: &HookRepo) -> std::fs::File {
+    use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+    let private = repo.repo.join(".libra/private");
+    if !private.exists() {
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&private)
+            .expect("create private directory");
+    }
+    let path = private.join("capture-spool-consumer.lock");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&path)
+        .expect("open consumer lock");
+    file.try_lock().expect("take consumer lock");
+    file
+}
+
+/// One-connection pool holding `BEGIN EXCLUSIVE`: in DELETE journal mode
+/// this refuses readers as well as writers, so any database open by the
+/// hook would fail or stall.
+async fn hold_exclusive_database(path: &Path) -> DatabaseConnection {
+    let mut options = ConnectOptions::new(format!("sqlite://{}?mode=rw", path.display()));
+    options
+        .max_connections(1)
+        .min_connections(1)
+        .sqlx_logging(false);
+    let conn = Database::connect(options)
+        .await
+        .expect("open database to lock");
+    conn.execute_unprepared("BEGIN EXCLUSIVE")
+        .await
+        .expect("take exclusive database lock");
+    conn
+}
+
+/// The six realtime providers, each with one valid frame for its hook verb.
+fn capture_spool_provider_cases(repo: &HookRepo) -> Vec<(&'static str, Vec<&'static str>, String)> {
+    vec![
+        (
+            "claude",
+            vec!["hooks", "claude", "stop"],
+            repo.envelope("Stop", "sess-spool-claude", None, json!({})),
+        ),
+        (
+            "codex",
+            vec!["hooks", "codex", "stop"],
+            repo.envelope(
+                "Stop",
+                "sess-spool-codex",
+                None,
+                json!({"turn_id": "turn-spool-codex"}),
+            ),
+        ),
+        (
+            "grok",
+            vec!["agent", "hooks", "grok", "stop"],
+            repo.envelope(
+                "Stop",
+                "sess-spool-grok",
+                None,
+                json!({"event_id": "grok-spool-stop"}),
+            ),
+        ),
+        (
+            "opencode",
+            vec!["agent", "hooks", "opencode", "session-start"],
+            repo.envelope(
+                "session.created",
+                "sess-spool-opencode",
+                None,
+                json!({"event_id": "opencode-spool-start"}),
+            ),
+        ),
+        (
+            "hermes",
+            vec!["agent", "hooks", "hermes", "observe"],
+            hermes_observe_frame(repo, "on_session_end", Some("completed")),
+        ),
+        (
+            "pi",
+            vec!["agent", "hooks", "pi", "observe"],
+            pi_frame(repo, "session_start").to_string(),
+        ),
+    ]
+}
+
+/// All six realtime entries publish one ready envelope while `libra.db` is
+/// exclusively locked, `capture.db` does not exist and no consumer may run;
+/// the consumer later stores each one.
+#[tokio::test]
+async fn capture_spool_hook_six_entries_queue_without_opening_a_database() {
+    if !capture_tests_enabled("capture_spool_hook_six_entries_queue_without_opening_a_database") {
+        return;
+    }
+    let probe = HookRepo::init();
+    let providers: Vec<&str> = capture_spool_provider_cases(&probe)
+        .into_iter()
+        .map(|(name, _, _)| name)
+        .collect();
+    drop(probe);
+    for provider in providers {
+        let repo = HookRepo::init();
+        let (_, args, payload) = capture_spool_provider_cases(&repo)
+            .into_iter()
+            .find(|(name, _, _)| *name == provider)
+            .expect("provider case");
+        let consumer = hold_spool_consumer_lock(&repo);
+        // `init` does not create capture.db; the first catalog open does. A
+        // hook that never opens it leaves it absent, and libra.db is held
+        // exclusively so even a read of it would stall or fail.
+        let capture_path = repo.repo.join(".libra/private/capture.db");
+        assert!(!capture_path.exists(), "{provider}: fixture precondition");
+        let repo_db = hold_exclusive_database(&repo.repo.join(".libra/libra.db")).await;
+        let started = Instant::now();
+        let out = repo.run_no_drain(&args, Some(&payload));
+        let elapsed = started.elapsed();
+        assert!(
+            out.status.success(),
+            "{provider}: a hook must queue while both databases are locked: {}",
+            describe(&out)
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "{provider}: queueing must not wait for SQLite ({elapsed:?})"
+        );
+        let ready = repo.ready_files();
+        assert_eq!(ready.len(), 1, "{provider}: {ready:?}");
+        assert!(
+            ready[0].starts_with("0-") || ready[0].starts_with("1-"),
+            "{provider}: {ready:?}"
+        );
+        assert!(
+            !capture_path.exists(),
+            "{provider}: queueing must not open or create capture.db"
+        );
+        repo_db
+            .execute_unprepared("ROLLBACK")
+            .await
+            .expect("release exclusive lock");
+        drop(repo_db);
+        drop(consumer);
+        repo.drain_spool();
+        assert!(
+            !repo.sessions().is_empty(),
+            "{provider}: the consumer must store the queued event"
+        );
+        let quarantine = repo.repo.join(".libra/private/capture-spool/quarantine");
+        assert_eq!(
+            std::fs::read_dir(&quarantine)
+                .map(|entries| entries.count())
+                .unwrap_or(0),
+            0,
+            "{provider}: a valid envelope must not be quarantined"
+        );
+    }
+}
+
+/// The queued file holds the redacted event, never the raw secret.
+#[test]
+fn capture_spool_hook_ready_file_is_redacted() {
+    if !capture_tests_enabled("capture_spool_hook_ready_file_is_redacted") {
+        return;
+    }
+    let repo = HookRepo::init();
+    let _consumer = hold_spool_consumer_lock(&repo);
+    let secret = "AKIAIOSFODNN7EXAMPLE";
+    let payload = repo.envelope(
+        "UserPromptSubmit",
+        "sess-spool-redaction",
+        None,
+        json!({"prompt": format!("deploy with {secret} now")}),
+    );
+    let out = repo.run_no_drain(&["hooks", "claude", "prompt"], Some(&payload));
+    assert!(out.status.success(), "{}", describe(&out));
+    let ready = repo.ready_files();
+    assert_eq!(ready.len(), 1, "{ready:?}");
+    let body = std::fs::read(
+        repo.repo
+            .join(".libra/private/capture-spool/ready")
+            .join(&ready[0]),
+    )
+    .expect("read ready envelope");
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        !text.contains(secret),
+        "ready/ must hold redacted bytes only"
+    );
+    assert!(text.contains("deploy with"), "the redacted prompt is kept");
+}
+
+/// A full queue is the one hook failure: a stable code, no `newer Libra`
+/// text, and no path, session id or payload in the message.
+#[test]
+fn capture_spool_hook_queue_full_fails_with_stable_code() {
+    if !capture_tests_enabled("capture_spool_hook_queue_full_fails_with_stable_code") {
+        return;
+    }
+    let repo = HookRepo::init();
+    let quarantine = repo.repo.join(".libra/private/capture-spool/quarantine");
+    std::fs::create_dir_all(repo.repo.join(".libra/private/capture-spool/ready"))
+        .expect("ready dir");
+    std::fs::create_dir_all(repo.repo.join(".libra/private/capture-spool/tmp")).expect("tmp dir");
+    std::fs::create_dir_all(&quarantine).expect("quarantine dir");
+    for index in 0..1024 {
+        std::fs::write(quarantine.join(format!("1-seed-{index:04}~seed")), b"q")
+            .expect("seed quarantine");
+    }
+    let session = "sess-spool-queue-full";
+    let payload = repo.envelope("Stop", session, None, json!({}));
+    let out = repo.run_no_drain(&["hooks", "claude", "stop"], Some(&payload));
+    assert!(!out.status.success(), "a full queue must fail the hook");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("LBR-AGENT-046"), "{stderr}");
+    assert!(stderr.contains("capture queue is full"), "{stderr}");
+    assert!(!stderr.contains("newer Libra"), "{stderr}");
+    assert!(!stderr.contains(session), "{stderr}");
+    assert!(
+        !stderr.contains(&repo.repo.display().to_string()),
+        "{stderr}"
+    );
+    assert!(repo.ready_files().is_empty());
+}
+
+/// Claude `observe` keeps rejected events silent, but an accepted event that
+/// cannot be queued still fails: exit 0 promises a ready file.
+#[test]
+fn capture_spool_hook_observe_queue_full_fails_with_stable_code() {
+    if !capture_tests_enabled("capture_spool_hook_observe_queue_full_fails_with_stable_code") {
+        return;
+    }
+    let repo = HookRepo::init();
+    let quarantine = repo.repo.join(".libra/private/capture-spool/quarantine");
+    std::fs::create_dir_all(repo.repo.join(".libra/private/capture-spool/ready"))
+        .expect("ready dir");
+    std::fs::create_dir_all(repo.repo.join(".libra/private/capture-spool/tmp")).expect("tmp dir");
+    std::fs::create_dir_all(&quarantine).expect("quarantine dir");
+    for index in 0..1024 {
+        std::fs::write(quarantine.join(format!("1-seed-{index:04}~seed")), b"q")
+            .expect("seed quarantine");
+    }
+    let session = "sess-spool-observe-queue-full";
+    let payload = repo.envelope(
+        "SessionStart",
+        session,
+        None,
+        json!({ "source": "startup" }),
+    );
+    let out = repo.run_no_drain(&["hooks", "claude", "observe"], Some(&payload));
+    assert!(
+        !out.status.success(),
+        "observe must fail when its accepted event cannot be queued: {}",
+        describe(&out)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("LBR-AGENT-046"), "{stderr}");
+    assert!(!stderr.contains(session), "{stderr}");
+    assert!(repo.ready_files().is_empty());
+}
+
+/// `libra __capture-spool-drain` is the manual recovery entry: it stores the
+/// queue, prints nothing, and accepts no arguments.
+#[test]
+fn capture_spool_drain_cli_stores_queue_silently() {
+    if !capture_tests_enabled("capture_spool_drain_cli_stores_queue_silently") {
+        return;
+    }
+    let repo = HookRepo::init();
+    let consumer = hold_spool_consumer_lock(&repo);
+    let payload = repo.envelope("Stop", "sess-spool-drain-cli", None, json!({}));
+    let out = repo.run_no_drain(&["hooks", "claude", "stop"], Some(&payload));
+    assert!(out.status.success(), "{}", describe(&out));
+    assert_eq!(repo.ready_files().len(), 1);
+
+    // While another consumer holds the lock the entry returns at once and
+    // leaves the queue alone.
+    let busy = repo.run_no_drain(&["__capture-spool-drain"], None);
+    assert!(busy.status.success(), "{}", describe(&busy));
+    assert_eq!(repo.ready_files().len(), 1);
+    drop(consumer);
+
+    let drained = repo.run_no_drain(&["__capture-spool-drain"], None);
+    assert!(drained.status.success(), "{}", describe(&drained));
+    assert!(drained.stdout.is_empty(), "{}", describe(&drained));
+    assert!(drained.stderr.is_empty(), "{}", describe(&drained));
+    assert!(repo.ready_files().is_empty());
+    let sessions = repo.sessions();
+    assert_eq!(sessions.len(), 1, "{sessions:?}");
+
+    let extra = repo.run_no_drain(&["__capture-spool-drain", "extra"], None);
+    assert!(!extra.status.success(), "{}", describe(&extra));
+}
+
+/// The terminal sorts first, so the consumer may store a session's events
+/// out of order: a tool event and a terminal for a session whose start was
+/// never stored still land in the catalog without quarantine.
+#[tokio::test]
+async fn capture_spool_hook_tool_event_before_session_row_is_stored() {
+    if !capture_tests_enabled("capture_spool_hook_tool_event_before_session_row_is_stored") {
+        return;
+    }
+    let repo = HookRepo::init();
+    let consumer = hold_spool_consumer_lock(&repo);
+    let session = "sess-spool-out-of-order";
+    let tool = repo.envelope(
+        "PostToolUse",
+        session,
+        None,
+        json!({"tool_name": "Bash", "tool_use_id": "toolu-spool-1", "tool_input": {"command": "ls"}}),
+    );
+    let out = repo.run_no_drain(&["hooks", "claude", "tool-use"], Some(&tool));
+    assert!(out.status.success(), "{}", describe(&out));
+    let end = repo.envelope("SessionEnd", session, None, json!({"reason": "exit"}));
+    let out = repo.run_no_drain(&["hooks", "claude", "session-end"], Some(&end));
+    assert!(out.status.success(), "{}", describe(&out));
+    let ready = repo.ready_files();
+    assert_eq!(ready.len(), 2, "{ready:?}");
+    assert!(ready[0].starts_with("0-"), "terminal first: {ready:?}");
+    assert!(ready[1].starts_with("1-"), "{ready:?}");
+    drop(consumer);
+    repo.drain_spool();
+    let quarantine = repo.repo.join(".libra/private/capture-spool/quarantine");
+    assert_eq!(
+        std::fs::read_dir(&quarantine)
+            .map(|entries| entries.count())
+            .unwrap_or(0),
+        0,
+        "out-of-order replay must not quarantine either event"
+    );
+    let durable = repo.durable_session(&format!("claude__{session}")).await;
+    assert!(
+        durable.sync_revision >= 2,
+        "both events must be stored: {durable:?}"
+    );
+}
+
+/// Without the test seam the hook starts one detached consumer, which
+/// stores the queue on its own.
+#[test]
+fn capture_spool_hook_detached_consumer_stores_the_queue() {
+    if !capture_tests_enabled("capture_spool_hook_detached_consumer_stores_the_queue") {
+        return;
+    }
+    let repo = HookRepo::init();
+    let payload = repo.envelope("Stop", "sess-spool-detached", None, json!({}));
+    let out = repo.run_bytes_in_no_drain(
+        &repo.repo,
+        &["hooks", "claude", "stop"],
+        Some(payload.as_bytes()),
+    );
+    assert!(out.status.success(), "{}", describe(&out));
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !repo.ready_files().is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "the detached consumer did not store the queue"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let sessions = repo.sessions();
+    assert_eq!(sessions.len(), 1, "{sessions:?}");
 }

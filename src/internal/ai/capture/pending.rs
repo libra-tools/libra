@@ -737,6 +737,36 @@ impl SealedVersionedPendingArtifact {
     /// Native outer-v2 persistence uses one caller-owned writer transaction.
     /// The caller must roll the whole transaction back on every error.
     pub(crate) async fn persist(&self, txn: &DatabaseTransaction, deadline: Instant) -> Result<()> {
+        // Artifact rows, the alias and the writer lock are `metadata_kv` rows
+        // in `libra.db`; coverage claims are catalog rows. On a split
+        // repository the metadata half runs in its own repository
+        // transaction, committed when the artifact is fully written; the two
+        // files are never attached.
+        let Some(repository) = crate::internal::metadata::repository_metadata_peer(txn).await?
+        else {
+            return self.persist_split(txn, txn, deadline).await;
+        };
+        let meta = crate::internal::db::begin_write_transaction(&repository)
+            .await
+            .context("cannot lock capture recovery storage; run `libra agent doctor`")?;
+        match self.persist_split(txn, &meta, deadline).await {
+            Ok(()) => meta
+                .commit()
+                .await
+                .context("cannot commit capture recovery storage; run `libra agent doctor`"),
+            Err(error) => {
+                let _ = meta.rollback().await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn persist_split(
+        &self,
+        catalog: &DatabaseTransaction,
+        meta: &DatabaseTransaction,
+        deadline: Instant,
+    ) -> Result<()> {
         check_deadline(deadline)?;
         let binding = self.binding();
         binding.validate()?;
@@ -817,24 +847,24 @@ impl SealedVersionedPendingArtifact {
         check_deadline(deadline)?;
         // All retained leases, chunks, header and alias use this one caller
         // transaction. Any Err requires a full caller rollback.
-        txn.execute_unprepared("UPDATE metadata_kv SET updated_at = updated_at WHERE 0")
+        meta.execute_unprepared("UPDATE metadata_kv SET updated_at = updated_at WHERE 0")
             .await
             .context("cannot lock capture recovery storage; run `libra agent doctor`")?;
-        pending_identity::assert_private_repo(txn, &binding.scope.repo_id).await?;
+        pending_identity::assert_private_repo(meta, &binding.scope.repo_id).await?;
         crate::internal::ai::coverage_gate::verify_versioned_reserved_live_claims_with_conn(
-            txn,
+            catalog,
             &binding.scope,
             &plan,
         )
         .await?;
         crate::internal::ai::coverage_gate::retain_versioned_reserved_live_claims_for_artifact_with_conn(
-            txn,
+            catalog,
             &binding.scope,
             &plan,
         )
         .await?;
         let headers =
-            headers_for_repo(txn, &binding.scope.repo_id, MAX_ARTIFACTS as u64 + 1).await?;
+            headers_for_repo(meta, &binding.scope.repo_id, MAX_ARTIFACTS as u64 + 1).await?;
         ensure!(
             headers.len() <= MAX_ARTIFACTS,
             "capture recovery capacity is invalid; run `libra agent doctor`"
@@ -860,13 +890,13 @@ impl SealedVersionedPendingArtifact {
             );
             // An idempotent delivery never replaces quarantine/manual state
             // or rewrites payload rows. Corrupt chunks remain repair-required.
-            let retained = load_chunks(txn, &existing).await?;
+            let retained = load_chunks(meta, &existing).await?;
             ensure!(
                 retained == self.bytes,
                 "capture recovery chunks conflict with retained evidence; run `libra agent doctor`"
             );
             self.identity
-                .publish_for_artifact(txn, &binding.checkpoint_id)
+                .publish_for_artifact(meta, &binding.checkpoint_id)
                 .await?;
             check_deadline(deadline)?;
             return Ok(());
@@ -878,7 +908,7 @@ impl SealedVersionedPendingArtifact {
         let range = chunk_range(&binding.checkpoint_id);
         ensure!(
             MetadataKv::list_bounded_with_conn(
-                txn,
+                meta,
                 &[MetadataScope::AgentCapturePendingChunk],
                 Some(&binding.scope.repo_id),
                 Some((&range.0, &range.1)),
@@ -892,7 +922,7 @@ impl SealedVersionedPendingArtifact {
         for (index, chunk) in self.bytes.chunks(CHUNK_BYTES).enumerate() {
             check_deadline(deadline)?;
             MetadataKv::set_with_conn(
-                txn,
+                meta,
                 MetadataScope::AgentCapturePendingChunk,
                 &binding.scope.repo_id,
                 &chunk_key(&binding.checkpoint_id, index),
@@ -902,7 +932,7 @@ impl SealedVersionedPendingArtifact {
             .await?;
         }
         MetadataKv::set_with_conn(
-            txn,
+            meta,
             MetadataScope::AgentCapturePending,
             &binding.scope.repo_id,
             &binding.checkpoint_id,
@@ -911,7 +941,7 @@ impl SealedVersionedPendingArtifact {
         )
         .await?;
         self.identity
-            .publish_for_artifact(txn, &binding.checkpoint_id)
+            .publish_for_artifact(meta, &binding.checkpoint_id)
             .await?;
         check_deadline(deadline)?;
         Ok(())
@@ -1010,16 +1040,46 @@ impl SealedPendingArtifact {
     /// Caller must have verified catalog and coverage fences in this same
     /// SQLite writer transaction. No pool wrapper can split that atomicity.
     pub(crate) async fn persist(&self, txn: &DatabaseTransaction, deadline: Instant) -> Result<()> {
+        // Artifact rows, the alias and the writer lock are `metadata_kv` rows
+        // in `libra.db`; coverage claims are catalog rows. On a split
+        // repository the metadata half runs in its own repository
+        // transaction, committed when the artifact is fully written; the two
+        // files are never attached.
+        let Some(repository) = crate::internal::metadata::repository_metadata_peer(txn).await?
+        else {
+            return self.persist_split(txn, txn, deadline).await;
+        };
+        let meta = crate::internal::db::begin_write_transaction(&repository)
+            .await
+            .context("cannot lock capture recovery storage; run `libra agent doctor`")?;
+        match self.persist_split(txn, &meta, deadline).await {
+            Ok(()) => meta
+                .commit()
+                .await
+                .context("cannot commit capture recovery storage; run `libra agent doctor`"),
+            Err(error) => {
+                let _ = meta.rollback().await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn persist_split(
+        &self,
+        catalog: &DatabaseTransaction,
+        meta: &DatabaseTransaction,
+        deadline: Instant,
+    ) -> Result<()> {
         check_deadline(deadline)?;
         let binding = self.binding();
         // Acquire the writer lock before capacity/discovery reads. All
         // artifact rows and the authenticated alias commit together.
-        txn.execute_unprepared("UPDATE metadata_kv SET updated_at = updated_at WHERE 0")
+        meta.execute_unprepared("UPDATE metadata_kv SET updated_at = updated_at WHERE 0")
             .await
             .context("cannot lock capture recovery storage; run `libra agent doctor`")?;
-        pending_identity::assert_private_repo(txn, &binding.scope.repo_id).await?;
+        pending_identity::assert_private_repo(meta, &binding.scope.repo_id).await?;
         crate::internal::ai::coverage_gate::verify_reserved_live_claims_with_conn(
-            txn,
+            catalog,
             &binding.scope,
             self.identity.context().session_id(),
             &self.coverage_owner,
@@ -1031,14 +1091,14 @@ impl SealedPendingArtifact {
         // resumed writer, or import fence them out. Any later failure in
         // this transaction rolls the retention back with the artifact rows.
         crate::internal::ai::coverage_gate::retain_reserved_live_claims_for_artifact_with_conn(
-            txn,
+            catalog,
             self.identity.context().session_id(),
             &self.coverage_owner,
             &self.coverage_claims,
         )
         .await?;
         let headers =
-            headers_for_repo(txn, &binding.scope.repo_id, MAX_ARTIFACTS as u64 + 1).await?;
+            headers_for_repo(meta, &binding.scope.repo_id, MAX_ARTIFACTS as u64 + 1).await?;
         ensure!(
             headers.len() <= MAX_ARTIFACTS,
             "capture recovery capacity is invalid; run `libra agent doctor`"
@@ -1064,13 +1124,13 @@ impl SealedPendingArtifact {
             );
             // An idempotent delivery never replaces quarantine/manual state
             // or rewrites payload rows. Corrupt chunks remain repair-required.
-            let retained = load_chunks(txn, &existing).await?;
+            let retained = load_chunks(meta, &existing).await?;
             ensure!(
                 retained == self.bytes,
                 "capture recovery chunks conflict with retained evidence; run `libra agent doctor`"
             );
             self.identity
-                .publish_for_artifact(txn, &binding.checkpoint_id)
+                .publish_for_artifact(meta, &binding.checkpoint_id)
                 .await?;
             check_deadline(deadline)?;
             return Ok(());
@@ -1082,7 +1142,7 @@ impl SealedPendingArtifact {
         let range = chunk_range(&binding.checkpoint_id);
         ensure!(
             MetadataKv::list_bounded_with_conn(
-                txn,
+                meta,
                 &[MetadataScope::AgentCapturePendingChunk],
                 Some(&binding.scope.repo_id),
                 Some((&range.0, &range.1)),
@@ -1096,7 +1156,7 @@ impl SealedPendingArtifact {
         for (index, chunk) in self.bytes.chunks(CHUNK_BYTES).enumerate() {
             check_deadline(deadline)?;
             MetadataKv::set_with_conn(
-                txn,
+                meta,
                 MetadataScope::AgentCapturePendingChunk,
                 &binding.scope.repo_id,
                 &chunk_key(&binding.checkpoint_id, index),
@@ -1106,7 +1166,7 @@ impl SealedPendingArtifact {
             .await?;
         }
         MetadataKv::set_with_conn(
-            txn,
+            meta,
             MetadataScope::AgentCapturePending,
             &binding.scope.repo_id,
             &binding.checkpoint_id,
@@ -1115,7 +1175,7 @@ impl SealedPendingArtifact {
         )
         .await?;
         self.identity
-            .publish_for_artifact(txn, &binding.checkpoint_id)
+            .publish_for_artifact(meta, &binding.checkpoint_id)
             .await?;
         check_deadline(deadline)?;
         Ok(())
@@ -1526,6 +1586,11 @@ pub(crate) async fn headers_for_repo<C: ConnectionTrait>(
     repo_id: &str,
     limit: u64,
 ) -> Result<Vec<crate::internal::metadata::MetadataEntry>> {
+    // `metadata_kv` stays in `libra.db`; a capture-only connection reads
+    // its paired repository database.
+    if let Some(peer) = crate::internal::metadata::repository_metadata_peer(conn).await? {
+        return Box::pin(headers_for_repo(&peer, repo_id, limit)).await;
+    }
     MetadataKv::list_bounded_with_conn(
         conn,
         &HEADER_SCOPES,
@@ -1589,6 +1654,11 @@ pub(crate) async fn has_pending_hint<C: ConnectionTrait>(
     conn: &C,
     scope: &CaptureScope,
 ) -> Result<bool> {
+    // `metadata_kv` stays in `libra.db`; a capture-only connection reads
+    // its paired repository database.
+    if let Some(peer) = crate::internal::metadata::repository_metadata_peer(conn).await? {
+        return Box::pin(has_pending_hint(&peer, scope)).await;
+    }
     validate_queue_repo(conn, &scope.repo_id).await?;
     Ok(conn
         .query_one_raw(Statement::from_sql_and_values(
@@ -1657,6 +1727,24 @@ async fn pending_candidates_inner(
     scope: Option<&CaptureScope>,
     selection_limit: usize,
 ) -> Result<PendingCandidateBatch> {
+    // `metadata_kv` stays in `libra.db`; a capture-catalog transaction
+    // runs this in a transaction on its paired repository database.
+    if let Some(peer) = crate::internal::metadata::repository_metadata_peer(txn).await? {
+        let peer_txn = crate::internal::db::begin_write_transaction(&peer).await?;
+        let result = Box::pin(pending_candidates_inner(
+            &peer_txn,
+            repo_id,
+            scope,
+            selection_limit,
+        ))
+        .await;
+        if result.is_ok() {
+            peer_txn.commit().await?;
+        } else {
+            let _ = peer_txn.rollback().await;
+        }
+        return result;
+    }
     ensure!(
         (1..=MAX_ARTIFACTS).contains(&selection_limit),
         "capture recovery selection limit is invalid; rerun libra agent doctor"
@@ -1804,9 +1892,30 @@ pub(crate) async fn current_header_namespace(
     txn: &DatabaseTransaction,
     expected: &PendingHeader,
 ) -> Result<MetadataScope> {
-    txn.execute_unprepared("UPDATE metadata_kv SET updated_at = updated_at WHERE 0")
-        .await
-        .context("cannot lock capture recovery header; run `libra agent doctor`")?;
+    // `metadata_kv` stays in `libra.db`. A capture-catalog transaction reads
+    // it in a deferred transaction on its paired repository database. This
+    // is a read: it must not take that file's writer lock, which a caller
+    // such as marker registration may already hold on another connection
+    // of this process.
+    if let Some(peer) = crate::internal::metadata::repository_metadata_peer(txn).await? {
+        let peer_txn = sea_orm::TransactionTrait::begin(&peer).await?;
+        let result = current_header_namespace_in(&peer_txn, expected, false).await;
+        let _ = peer_txn.rollback().await;
+        return result;
+    }
+    current_header_namespace_in(txn, expected, true).await
+}
+
+async fn current_header_namespace_in(
+    txn: &DatabaseTransaction,
+    expected: &PendingHeader,
+    lock_writer: bool,
+) -> Result<MetadataScope> {
+    if lock_writer {
+        txn.execute_unprepared("UPDATE metadata_kv SET updated_at = updated_at WHERE 0")
+            .await
+            .context("cannot lock capture recovery header; run `libra agent doctor`")?;
+    }
     validate_queue_repo(txn, &expected.binding.scope.repo_id).await?;
     let encoded = serde_json::to_string(expected)?;
     PendingHeader::decode(&encoded)?;
@@ -1854,6 +1963,11 @@ pub(crate) async fn header_for_checkpoint<C: ConnectionTrait>(
     repo_id: &str,
     checkpoint_id: &str,
 ) -> Result<Option<(PendingHeader, MetadataScope)>> {
+    // `metadata_kv` stays in `libra.db`; a capture-only connection reads
+    // its paired repository database.
+    if let Some(peer) = crate::internal::metadata::repository_metadata_peer(conn).await? {
+        return Box::pin(header_for_checkpoint(&peer, repo_id, checkpoint_id)).await;
+    }
     validate_queue_repo(conn, repo_id).await?;
     let rows = conn
         .query_all_raw(Statement::from_sql_and_values(
@@ -1913,6 +2027,18 @@ pub(crate) async fn quarantine_header(
     txn: &DatabaseTransaction,
     expected: &PendingHeader,
 ) -> Result<()> {
+    // `metadata_kv` stays in `libra.db`; a capture-catalog transaction
+    // runs this in a transaction on its paired repository database.
+    if let Some(peer) = crate::internal::metadata::repository_metadata_peer(txn).await? {
+        let peer_txn = crate::internal::db::begin_write_transaction(&peer).await?;
+        let result = Box::pin(quarantine_header(&peer_txn, expected)).await;
+        if result.is_ok() {
+            peer_txn.commit().await?;
+        } else {
+            let _ = peer_txn.rollback().await;
+        }
+        return result;
+    }
     let scope = current_header_namespace(txn, expected).await?;
     if scope == MetadataScope::AgentCaptureQuarantine {
         return Ok(());
@@ -1944,6 +2070,18 @@ pub(crate) async fn claim_manual_attempt(
     txn: &DatabaseTransaction,
     expected: &PendingHeader,
 ) -> Result<PendingHeader> {
+    // Artifact headers are `metadata_kv` rows in `libra.db`; a
+    // capture-catalog transaction claims them in a repository transaction.
+    if let Some(peer) = crate::internal::metadata::repository_metadata_peer(txn).await? {
+        let peer_txn = crate::internal::db::begin_write_transaction(&peer).await?;
+        let result = Box::pin(claim_manual_attempt(&peer_txn, expected)).await;
+        if result.is_ok() {
+            peer_txn.commit().await?;
+        } else {
+            let _ = peer_txn.rollback().await;
+        }
+        return result;
+    }
     ensure!(
         !expected.manual_attempted,
         "capture recovery manual attempt was already used; provide a newly authorized event or explicitly erase the session"
@@ -2054,7 +2192,7 @@ async fn metadata_presence<C: ConnectionTrait>(
             }
             // Recovery headers stay in the repository database. A capture
             // transaction cannot see them, and the two files are not attached.
-            let repo = crate::internal::db::open_cached_repository(&crate::utils::path::database())
+            let repo = crate::internal::db::open_paired_repository(conn)
                 .await
                 .context(context)?;
             Ok(repo
@@ -2138,7 +2276,7 @@ pub(crate) async fn retains_unpublished_artifact_for_checkpoint<C: ConnectionTra
         .context(context)?
         .is_some()
     } else {
-        let repo = crate::internal::db::open_cached_repository(&crate::utils::path::database())
+        let repo = crate::internal::db::open_paired_repository(conn)
             .await
             .context(context)?;
         repo.query_one_raw(Statement::from_sql_and_values(
@@ -2164,9 +2302,8 @@ pub(crate) async fn retains_unpublished_artifact_for_checkpoint<C: ConnectionTra
         .context(context)?
         .is_some()
     } else {
-        let storage_root = crate::utils::path::database()
-            .parent()
-            .map(std::path::Path::to_path_buf)
+        let storage_root = crate::internal::db::connection_storage_root(conn)
+            .await
             .context(context)?;
         match super::store::open_readonly(&storage_root, super::store::COMMAND_BUSY_TIMEOUT).await {
             Ok(capture) => capture
@@ -2254,7 +2391,7 @@ pub(crate) async fn quarantine_checkpoint_if_present(
         // Recovery headers stay in the repository database. Do not query
         // `metadata_kv` on this catalog transaction: a missing table aborts it.
         // The repository write commits on its own; the two files are not attached.
-        let repo = crate::internal::db::open_cached_repository(&crate::utils::path::database())
+        let repo = crate::internal::db::open_paired_repository(txn)
             .await
             .context("cannot lock capture recovery quarantine; run `libra agent doctor`")?;
         let repo_txn = crate::internal::db::begin_write_transaction(&repo)
@@ -2311,6 +2448,24 @@ pub(crate) async fn remove_artifact(
     checkpoint: &str,
     owned_aliases: &[String],
 ) -> Result<bool> {
+    // `metadata_kv` stays in `libra.db`; a capture-catalog transaction
+    // runs this in a transaction on its paired repository database.
+    if let Some(peer) = crate::internal::metadata::repository_metadata_peer(txn).await? {
+        let peer_txn = crate::internal::db::begin_write_transaction(&peer).await?;
+        let result = Box::pin(remove_artifact(
+            &peer_txn,
+            repo_id,
+            checkpoint,
+            owned_aliases,
+        ))
+        .await;
+        if result.is_ok() {
+            peer_txn.commit().await?;
+        } else {
+            let _ = peer_txn.rollback().await;
+        }
+        return result;
+    }
     ensure!(
         uuid::Uuid::parse_str(checkpoint).is_ok_and(|id| id.to_string() == checkpoint),
         "invalid capture artifact cleanup identity; run `libra agent doctor`"
@@ -2422,12 +2577,28 @@ pub(crate) async fn erase_session_artifacts(
     let legacy = pending_identity::aliases_for_erasure(txn, &scope, session_id, None).await?;
     let known_association = !legacy.aliases().is_empty() || legacy.has_other_incarnation();
     let ownership_remedy = "capture erasure cannot establish the session incarnation; restore consistent session/alias catalog metadata before retrying";
-    let row = txn.query_one_raw(Statement::from_sql_and_values(
+    let session_statement = Statement::from_sql_and_values(
         txn.get_database_backend(),
         "SELECT CASE WHEN length(CAST(metadata_json AS BLOB)) <= 1048576 THEN metadata_json ELSE NULL END AS bounded_value
          FROM agent_session WHERE session_id = ? LIMIT 1",
         [session_id.into()],
-    )).await.context("cannot read erased session incarnation; run `libra agent doctor`")?;
+    );
+    // The session row is in the capture catalog when the databases are split.
+    let row = if crate::internal::db::connection_has_table(txn, "agent_session")
+        .await
+        .context("cannot inspect erased session incarnation; run `libra agent doctor`")?
+    {
+        txn.query_one_raw(session_statement).await
+    } else {
+        let storage = crate::internal::db::connection_storage_root(txn)
+            .await
+            .context("cannot locate the capture catalog for erasure; run `libra agent doctor`")?;
+        let catalog = super::store::open_readonly(&storage, super::store::COMMAND_BUSY_TIMEOUT)
+            .await
+            .context("cannot open the capture catalog for erasure; run `libra agent doctor`")?;
+        catalog.query_one_raw(session_statement).await
+    }
+    .context("cannot read erased session incarnation; run `libra agent doctor`")?;
     let Some(row) = row else {
         ensure!(!known_association, ownership_remedy);
         return Ok(legacy.has_unassigned());
@@ -2499,6 +2670,15 @@ pub(crate) async fn erase_session_artifacts(
 
 /// One indexed existence probe; the association body is never hydrated.
 async fn alias_registered(txn: &DatabaseTransaction, repo_id: &str, alias: &str) -> Result<bool> {
+    // `metadata_kv` stays in `libra.db`; a capture-catalog transaction
+    // runs this in a transaction on its paired repository database.
+    // A read: a deferred transaction, never the paired file's writer lock.
+    if let Some(peer) = crate::internal::metadata::repository_metadata_peer(txn).await? {
+        let peer_txn = sea_orm::TransactionTrait::begin(&peer).await?;
+        let result = Box::pin(alias_registered(&peer_txn, repo_id, alias)).await;
+        let _ = peer_txn.rollback().await;
+        return result;
+    }
     Ok(txn
         .query_one_raw(Statement::from_sql_and_values(
             txn.get_database_backend(),

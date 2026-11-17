@@ -3554,6 +3554,51 @@ async fn collect_registered_store_roots<C: sea_orm::ConnectionTrait>(
         }
     }
 
+    // The capture catalog (`agent_checkpoint`, `agent_coverage_claim`,
+    // `agent_session`) lives in `.libra/private/capture.db`, not in the
+    // repository database: its object ids are roots too. A repository
+    // connection reads them from the paired capture database; failing to open
+    // an existing one fails closed rather than pruning against a partial set.
+    if crate::internal::db::connection_has_table(db, "config_kv")
+        .await
+        .unwrap_or(false)
+    {
+        // A database that is not a repository's `libra.db` (an in-memory or
+        // fixture file) has no paired capture catalog.
+        let storage_root = crate::internal::db::connection_storage_root(db).await.ok();
+        if let Some(storage_root) = storage_root.filter(|storage_root| {
+            crate::internal::ai::capture::store::capture_database_path(storage_root).is_file()
+        }) {
+            let capture = crate::internal::ai::capture::store::open_readonly(
+                &storage_root,
+                crate::internal::ai::capture::store::COMMAND_BUSY_TIMEOUT,
+            )
+            .await
+            .map_err(|err| {
+                CliError::fatal(format!(
+                    "failed to open the capture catalog for GC roots: {err}"
+                ))
+                .with_stable_code(StableErrorCode::IoReadFailed)
+            })?;
+            Box::pin(collect_registered_store_roots(
+                &capture, storage, boundaries, reachable,
+            ))
+            .await?;
+        }
+    }
+
+    // The capture catalog has no `metadata_kv`: its repository's markers and
+    // metadata are read on the repository connection.
+    if crate::internal::db::connection_has_table(db, "agent_session")
+        .await
+        .unwrap_or(false)
+        && !crate::internal::db::connection_has_table(db, "config_kv")
+            .await
+            .unwrap_or(true)
+    {
+        return Ok(());
+    }
+
     // `metadata_kv` splits by ownership. Rows in the Libra-OWNED
     // `agent_traces_inflight` scope go through the dedicated prune-side
     // contract below (`list_live_traces_inflight_markers`): malformed rows
@@ -5451,6 +5496,10 @@ mod tests {
             (
                 "private",
                 "repository-private capture key material and worker advisory locks; no object ids",
+            ),
+            (
+                "capture.db",
+                "the capture catalog SQLite database under private/; its object ids live in its tables and collect_registered_store_roots reads them as roots",
             ),
             (
                 "refs",

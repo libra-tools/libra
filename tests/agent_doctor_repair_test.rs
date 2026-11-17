@@ -980,6 +980,41 @@ impl DoctorRepo {
     /// Run the built `libra` binary inside the repo with a clean
     /// environment (plus optional extra env vars, e.g. LIBRA_LOG*).
     fn run_env(&self, args: &[&str], stdin: Option<&str>, envs: &[(&str, &str)]) -> Output {
+        let out = self.run_env_no_drain(args, stdin, envs);
+        if args.iter().take(3).any(|arg| *arg == "hooks") && out.status.success() {
+            self.drain_spool(envs);
+        }
+        out
+    }
+
+    /// A realtime hook only queues its event; store the queue the way an
+    /// operator would (`libra __capture-spool-drain`), retrying while the
+    /// detached consumer the hook started still holds the consumer lock.
+    fn drain_spool(&self, envs: &[(&str, &str)]) {
+        let ready = self.repo.join(".libra/private/capture-spool/ready");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+        loop {
+            let pending = std::fs::read_dir(&ready)
+                .map(|entries| entries.count())
+                .unwrap_or(0);
+            if pending == 0 {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "capture spool still holds {pending} ready file(s) after 90s"
+            );
+            let _ = self.run_env_no_drain(&["__capture-spool-drain"], None, envs);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    fn run_env_no_drain(
+        &self,
+        args: &[&str],
+        stdin: Option<&str>,
+        envs: &[(&str, &str)],
+    ) -> Output {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_libra"));
         cmd.args(args)
             .current_dir(&self.repo)

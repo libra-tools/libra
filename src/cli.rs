@@ -3362,6 +3362,56 @@ pub async fn parse_async(args: Option<&[&str]>) -> CliResult<()> {
         }
         return command::agent::run_capture_recovery_worker().await;
     }
+    if argv.get(1).and_then(|arg| arg.to_str())
+        == Some(crate::internal::ai::capture::spool::DRAIN_ARG)
+    {
+        if argv.len() != 2 {
+            return Err(CliError::fatal(
+                "capture spool drain does not accept arguments".to_string(),
+            ));
+        }
+        return crate::internal::ai::capture::drain::run_from_repository(
+            crate::command::hooks::spool_replay_provider,
+        )
+            .await
+            .map_err(|error| {
+                if error
+                    .chain()
+                    .any(|cause| cause.is::<crate::internal::ai::capture::drain::CaptureDatabaseBusy>())
+                {
+                    CliError::fatal(
+                        crate::internal::ai::capture::drain::CaptureDatabaseBusy.to_string(),
+                    )
+                    .with_stable_code(crate::utils::error::StableErrorCode::CaptureDatabaseBusy)
+                } else if error.chain().any(|cause| {
+                    cause.is::<crate::internal::ai::capture::drain::CaptureSchemaTooNew>()
+                }) {
+                    CliError::fatal(
+                        crate::internal::ai::capture::drain::CaptureSchemaTooNew.to_string(),
+                    )
+                    .with_stable_code(crate::utils::error::StableErrorCode::CaptureSchemaTooNew)
+                } else if let Some(class) =
+                    crate::internal::ai::capture::scope_binding::active_repository_failure_class(
+                        &error,
+                    )
+                {
+                    // The repository database is refused exactly as the hooks
+                    // refused it before they queued: path-free, stable code.
+                    crate::command::hooks::active_repository_failure_error(
+                        class,
+                        "capture spool drain failed",
+                    )
+                } else if let Some(quarantined) = error
+                    .downcast_ref::<crate::internal::ai::capture::drain::CaptureEventsQuarantined>()
+                {
+                    CliError::fatal(format!("capture spool drain: {quarantined}"))
+                } else {
+                    CliError::fatal(
+                        "capture spool drain could not store queued events; queued events stay in place, run `libra agent doctor`".to_string(),
+                    )
+                }
+            });
+    }
     // MCP read worker (MC-29): before clap, schema migration, object-index
     // repair, and the auto-upgrade check. It only reads one server-built
     // request and writes one result.

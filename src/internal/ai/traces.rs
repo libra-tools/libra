@@ -1500,7 +1500,7 @@ pub(crate) async fn terminal_attempt_marker_status<C: ConnectionTrait>(
     if !on_connection {
         // Inflight markers stay in the repository database. Do not query
         // `metadata_kv` on a capture transaction: a missing table aborts it.
-        let repo = crate::internal::db::open_cached_repository(&crate::utils::path::database())
+        let repo = crate::internal::db::open_paired_repository(conn)
             .await
             .context("read terminal traces marker state")?;
         return terminal_attempt_marker_status_on(
@@ -1773,7 +1773,13 @@ async fn register_split_capture_marker(
 ) -> Result<TracesWriteAttemptPreparation> {
     ensure_before_traces_marker_deadline(deadline)?;
     validate_traces_coverage_fences(coverage_fences)?;
-    let repo = crate::internal::db::repository_peer(conn)
+    // The marker transaction gets its own repository connection. The cached
+    // repository handle is a one-connection pool, and checks below (for
+    // example the quarantine lookup in terminal-attempt verification) read
+    // `metadata_kv` through that handle while this transaction is open; on
+    // the same pool they would wait for their own writer until the pool's
+    // acquire timeout. SQLite lets those reads proceed beside this writer.
+    let repo = crate::internal::db::open_paired_repository(conn)
         .await
         .context("open the repository database for the checkpoint marker")?;
     let txn = begin_traces_marker_write_transaction_until(
@@ -2427,6 +2433,16 @@ pub async fn update_traces_inflight_marker_if_generation<C: ConnectionTrait>(
     marker: &TracesInflightMarker,
     expected_generation: &str,
 ) -> Result<bool> {
+    // Writer markers are `metadata_kv` rows in `libra.db`; a capture-only
+    // connection reaches its paired repository database.
+    if let Some(peer) = crate::internal::metadata::repository_metadata_peer(conn).await? {
+        return Box::pin(update_traces_inflight_marker_if_generation(
+            &peer,
+            marker,
+            expected_generation,
+        ))
+        .await;
+    }
     validate_traces_inflight_marker(marker, &marker.session_id, &marker.attempt_id)?;
     if marker.generation.as_deref() != Some(expected_generation) {
         bail!("refusing to update a traces marker with a mismatched writer generation");
@@ -2553,6 +2569,14 @@ pub async fn clear_traces_inflight_marker_if_generation<C: ConnectionTrait>(
     attempt_id: &str,
     generation: &str,
 ) -> Result<bool> {
+    // Writer markers are `metadata_kv` rows in `libra.db`; a capture-only
+    // connection reaches its paired repository database.
+    if let Some(peer) = crate::internal::metadata::repository_metadata_peer(conn).await? {
+        return Box::pin(clear_traces_inflight_marker_if_generation(
+            &peer, session_id, attempt_id, generation,
+        ))
+        .await;
+    }
     let result = conn
         .execute_raw(Statement::from_sql_and_values(
             conn.get_database_backend(),
@@ -2652,6 +2676,14 @@ pub async fn clear_non_cleanup_traces_inflight_marker<C: ConnectionTrait>(
     attempt_id: &str,
     generation: &str,
 ) -> Result<bool> {
+    // Writer markers are `metadata_kv` rows in `libra.db`; a capture-only
+    // connection reaches its paired repository database.
+    if let Some(peer) = crate::internal::metadata::repository_metadata_peer(conn).await? {
+        return Box::pin(clear_non_cleanup_traces_inflight_marker(
+            &peer, session_id, attempt_id, generation,
+        ))
+        .await;
+    }
     let result = conn
         .execute_raw(Statement::from_sql_and_values(
             conn.get_database_backend(),
@@ -2735,6 +2767,21 @@ async fn clear_non_cleanup_traces_inflight_marker_with_capture_scope_prepare(
     generation: &str,
     deadline: Option<CaptureCommitDeadline>,
 ) -> Result<(DatabaseTransaction, bool)> {
+    // Writer markers are `metadata_kv` rows in `libra.db`; a capture-only
+    // connection reaches its paired repository database.
+    if let Some(peer) = crate::internal::metadata::repository_metadata_peer(conn).await? {
+        return Box::pin(
+            clear_non_cleanup_traces_inflight_marker_with_capture_scope_prepare(
+                &peer,
+                capture_scope,
+                session_id,
+                attempt_id,
+                generation,
+                deadline,
+            ),
+        )
+        .await;
+    }
     ensure_before_traces_marker_deadline(deadline)?;
     let txn = begin_traces_marker_write_transaction_until(
         conn,

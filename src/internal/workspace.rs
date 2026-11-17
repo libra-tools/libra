@@ -536,6 +536,40 @@ type WorkspaceResult<T> = Result<T, WorkspaceError>;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepoIdentity(String);
 
+/// The repository database paired with a capture-catalog connection, or
+/// `None` for any other connection.
+async fn capture_catalog_repository<C: ConnectionTrait>(
+    conn: &C,
+) -> WorkspaceResult<Option<sea_orm::DatabaseConnection>> {
+    let read_failed = |error: sea_orm::DbErr| {
+        WorkspaceError::ReadFailed(format!("cannot inspect the repository database: {error}"))
+    };
+    if crate::internal::db::connection_has_table(conn, "config_kv")
+        .await
+        .map_err(read_failed)?
+        || !crate::internal::db::connection_has_table(conn, "agent_session")
+            .await
+            .map_err(read_failed)?
+    {
+        return Ok(None);
+    }
+    let peer = crate::internal::db::open_paired_repository(conn)
+        .await
+        .map_err(|error| {
+            WorkspaceError::ReadFailed(format!("cannot open the repository database: {error}"))
+        })?;
+    // A combined database that lost `config_kv` pairs with itself. It has no
+    // separate repository database: read it directly so the missing table
+    // surfaces as a read failure instead of an endless pairing.
+    if !crate::internal::db::connection_has_table(&peer, "config_kv")
+        .await
+        .map_err(read_failed)?
+    {
+        return Ok(None);
+    }
+    Ok(Some(peer))
+}
+
 impl RepoIdentity {
     /// Read and validate `libra.repoid` from a repository database.
     ///
@@ -546,6 +580,12 @@ impl RepoIdentity {
     /// identity in two — the SQL guard compares the stored bytes, and SQLite's
     /// `TRIM` and Rust's `str::trim` do not agree on what whitespace is.
     pub async fn resolve<C: ConnectionTrait>(conn: &C) -> WorkspaceResult<Self> {
+        // The identity is in `libra.db`'s `config_kv`. The capture catalog
+        // (`capture.db`: catalog tables, no `config_kv`) reads it from its
+        // paired repository database.
+        if let Some(repository) = capture_catalog_repository(conn).await? {
+            return Box::pin(Self::resolve(&repository)).await;
+        }
         let entry = ConfigKv::get_with_conn(conn, "libra.repoid")
             .await
             .map_err(|error| {

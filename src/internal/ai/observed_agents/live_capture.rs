@@ -96,6 +96,14 @@ pub(crate) enum UntrustedChildSourceHints {
     Candidate(ChildSourceHint),
 }
 
+/// Which hint shape a spool replay is allowed to restore.
+#[derive(Clone, Copy)]
+pub(crate) enum ReplayHintKind {
+    Absent,
+    Unavailable,
+    Candidate,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ChildSourceHintRole {
     CurrentThread,
@@ -119,6 +127,39 @@ pub(crate) struct ChildSourceHintView<'a> {
 }
 
 impl UntrustedChildSourceHints {
+    /// Rebuild a hint that was already accepted at ingress. A candidate that
+    /// no longer meets the bound becomes `Unavailable` rather than a path.
+    pub(crate) fn from_replay(
+        kind: ReplayHintKind,
+        role: Option<ChildSourceHintRole>,
+        current_or_parent_path: Option<std::path::PathBuf>,
+        child_path: Option<std::path::PathBuf>,
+        child_id: Option<String>,
+        turn_id: Option<String>,
+    ) -> Self {
+        match kind {
+            ReplayHintKind::Absent => Self::Absent,
+            ReplayHintKind::Unavailable => Self::Unavailable,
+            ReplayHintKind::Candidate => {
+                let Some(role) = role else {
+                    return Self::Unavailable;
+                };
+                let hints = Self::Candidate(ChildSourceHint {
+                    role,
+                    current_or_parent_path,
+                    child_path,
+                    child_id,
+                    turn_id,
+                });
+                if hints.bounded() {
+                    hints
+                } else {
+                    Self::Unavailable
+                }
+            }
+        }
+    }
+
     pub(crate) fn candidate(&self) -> Option<ChildSourceHintView<'_>> {
         match self {
             Self::Candidate(hint) => Some(ChildSourceHintView {

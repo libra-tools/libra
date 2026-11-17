@@ -344,6 +344,16 @@ pub enum StableErrorCode {
     /// `libra memory show <id>` was given an `episode_id` that is absent from
     /// the current window projection (GC-DM-01; identity is ADR-DM-01).
     MemoryEpisodeNotFound,
+    /// The realtime capture queue cannot accept another durable envelope.
+    /// `041`..`045` stay reserved for the capture-push plan.
+    CaptureQueueFull,
+    /// `capture.db` was busy, so a queued event was left durable for retry.
+    CaptureDatabaseBusy,
+    /// `capture.db` was written by a newer binary than this one can read.
+    CaptureSchemaTooNew,
+    /// Another process held the capture queue lock for the hook's whole
+    /// wait window; the hook queued nothing.
+    CaptureQueueBusy,
 }
 
 impl Serialize for StableErrorCode {
@@ -416,6 +426,10 @@ impl StableErrorCode {
             Self::UpgradeSettingsInvalid => "LBR-UPGRADE-001",
             Self::MemoryProjectionStale => "LBR-MEMORY-001",
             Self::MemoryEpisodeNotFound => "LBR-MEMORY-002",
+            Self::CaptureQueueFull => "LBR-AGENT-046",
+            Self::CaptureDatabaseBusy => "LBR-AGENT-047",
+            Self::CaptureSchemaTooNew => "LBR-AGENT-048",
+            Self::CaptureQueueBusy => "LBR-AGENT-049",
         }
     }
 
@@ -485,7 +499,11 @@ impl StableErrorCode {
             | Self::AgentWorkspaceLeaseHeld
             | Self::AgentWorkspaceLeaseLost
             | Self::AgentFixExecutionDenied
-            | Self::AgentFixExecutionFailed => CliErrorCategory::Internal,
+            | Self::AgentFixExecutionFailed
+            | Self::CaptureQueueFull
+            | Self::CaptureDatabaseBusy
+            | Self::CaptureSchemaTooNew
+            | Self::CaptureQueueBusy => CliErrorCategory::Internal,
         }
     }
 
@@ -659,6 +677,18 @@ impl StableErrorCode {
             }
             Self::AgentFixExecutionFailed => {
                 "review --fix stopped without a clean patch or deterministic repair outcome; inspect the active Code session and worktree before retrying."
+            }
+            Self::CaptureQueueFull => {
+                "The capture queue is full; retry after queued events are stored."
+            }
+            Self::CaptureDatabaseBusy => {
+                "The capture database is busy; queued events stay durable and will be retried."
+            }
+            Self::CaptureSchemaTooNew => {
+                "The capture database schema is too new for this binary; install the current Libra release and run libra __capture-spool-drain."
+            }
+            Self::CaptureQueueBusy => {
+                "The capture queue is busy; retry the hook after the current writers finish."
             }
             Self::WorktreeCursorInvalid => {
                 "The pagination cursor is malformed or expired; drop it and re-read the first page."
@@ -2292,6 +2322,10 @@ mod tests {
             (StableErrorCode::WorktreeScopeCorrupt, "LBR-WORKTREE-002"),
             (StableErrorCode::MemoryProjectionStale, "LBR-MEMORY-001"),
             (StableErrorCode::MemoryEpisodeNotFound, "LBR-MEMORY-002"),
+            (StableErrorCode::CaptureQueueFull, "LBR-AGENT-046"),
+            (StableErrorCode::CaptureDatabaseBusy, "LBR-AGENT-047"),
+            (StableErrorCode::CaptureSchemaTooNew, "LBR-AGENT-048"),
+            (StableErrorCode::CaptureQueueBusy, "LBR-AGENT-049"),
         ] {
             assert_eq!(variant.as_str(), code);
         }

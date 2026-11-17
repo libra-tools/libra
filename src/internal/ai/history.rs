@@ -367,32 +367,129 @@ fn ensure_before_rejected_cleanup_registration_deadline(deadline: Instant) -> Re
 /// COMMIT before the future is cancelled, making a dropped transaction unable
 /// to roll it back. The authorization statement is therefore the deadline
 /// decision point; after it succeeds we must await the acknowledgement.
+/// Commit a checkpoint whose catalog is in `capture.db`.
+///
+/// `repository` holds the `libra.db` writer lock with the ref CAS and the
+/// object-index rows applied. Every split writer takes the repository lock
+/// before the catalog lock, so concurrent appenders serialize here. The
+/// catalog transaction is opened (bounded by the capture deadline), written
+/// and authorized while both locks are held; any failure up to that point
+/// rolls both back, so the ref does not move. Then the ref commits, and the
+/// catalog commits last. If that final catalog COMMIT fails (an I/O error or
+/// a crash between the two commits), the ref already holds the checkpoint
+/// and its catalog row is missing: `libra agent doctor --repair` rebuilds a
+/// ref-reachable checkpoint's missing catalog row (`missing_catalog_row`).
+async fn commit_split_checkpoint(
+    repository: DatabaseTransaction,
+    capture: &DatabaseConnection,
+    catalog_extra: &dyn TracesTxnExtra,
+    capture_scope: Option<&CaptureScope>,
+    ctx: &TracesCommitCtx,
+    deadline: Option<CaptureCommitDeadline>,
+) -> Result<RefUpdateOutcome> {
+    let catalog =
+        match prepare_split_catalog(capture, catalog_extra, capture_scope, ctx, deadline).await {
+            Ok(catalog) => catalog,
+            Err(error) => {
+                repository.rollback().await.ok();
+                return Err(error.context(CheckpointCompanionTransactionFailed));
+            }
+        };
+    if let Err(error) = authorize_checkpoint_txn_before_commit(
+        &repository,
+        capture_scope,
+        deadline,
+        "Failed to commit transaction",
+    )
+    .await
+    {
+        catalog.rollback().await.ok();
+        repository.rollback().await.ok();
+        return Err(error);
+    }
+    if let Err(error) = repository.commit().await {
+        catalog.rollback().await.ok();
+        return Err(error).context("Failed to commit transaction");
+    }
+    catalog.commit().await.context(
+        "the traces ref committed but its checkpoint catalog row did not; run `libra agent doctor --repair`",
+    )?;
+    Ok(RefUpdateOutcome::Updated)
+}
+
+/// Open, write and authorize the checkpoint catalog transaction in
+/// `capture.db` without committing it. Writer acquisition is bounded by the
+/// capture deadline.
+async fn prepare_split_catalog(
+    capture: &DatabaseConnection,
+    extra: &dyn TracesTxnExtra,
+    capture_scope: Option<&CaptureScope>,
+    ctx: &TracesCommitCtx,
+    deadline: Option<CaptureCommitDeadline>,
+) -> Result<DatabaseTransaction> {
+    ensure_checkpoint_append_before_deadline(deadline)?;
+    let begin = crate::internal::db::begin_catalog_or_repository_write(capture);
+    let txn = match deadline {
+        Some(deadline) => {
+            tokio::time::timeout_at(tokio::time::Instant::from_std(deadline.monotonic()), begin)
+                .await
+                .map_err(|_| {
+                    anyhow!("checkpoint append exceeded the historical import execution deadline")
+                })?
+        }
+        None => begin.await,
+    }
+    .context("begin the capture catalog transaction for the traces ref update")?;
+    if let Err(error) = extra.apply(&txn, ctx).await {
+        let _ = txn.rollback().await;
+        return Err(error.context("write the checkpoint catalog in the capture database"));
+    }
+    if let Some(scope) = capture_scope.filter(|scope| scope.workspace_id.is_none())
+        && let Err(error) = scope.authorize_final_commit_until(&txn, deadline).await
+    {
+        let _ = txn.rollback().await;
+        return Err(anyhow!(error)
+            .context("authorize the checkpoint catalog commit in the capture database"));
+    }
+    Ok(txn)
+}
+
 async fn commit_checkpoint_txn_after_final_authorization(
     txn: DatabaseTransaction,
     capture_scope: Option<&CaptureScope>,
     deadline: Option<CaptureCommitDeadline>,
     operation: &'static str,
 ) -> Result<()> {
-    if let Err(error) = ensure_checkpoint_append_before_deadline(deadline) {
+    if let Err(error) =
+        authorize_checkpoint_txn_before_commit(&txn, capture_scope, deadline, operation).await
+    {
         txn.rollback().await.ok();
-        return Err(error).context(operation);
+        return Err(error);
     }
+    txn.commit().await.context(operation)
+}
 
-    let authorization = match authorize_final_capture_commit(capture_scope, &txn, deadline).await {
+/// The last SQL before a checkpoint COMMIT: the deadline and, where present,
+/// the workspace lease fence. The caller rolls back on error.
+async fn authorize_checkpoint_txn_before_commit(
+    txn: &DatabaseTransaction,
+    capture_scope: Option<&CaptureScope>,
+    deadline: Option<CaptureCommitDeadline>,
+    operation: &'static str,
+) -> Result<()> {
+    ensure_checkpoint_append_before_deadline(deadline).context(operation)?;
+    match authorize_final_capture_commit(capture_scope, txn, deadline).await {
         Ok(()) => Ok(()),
         Err(CaptureFinalCommitAuthorizationError::DeadlineElapsed) => Err(anyhow!(
             "checkpoint append exceeded the historical import execution deadline"
-        )),
-        Err(error) => Err(anyhow::Error::new(error).context(
-            "verify capture workspace lease before final checkpoint transaction authorization",
-        )),
-    };
-    if let Err(error) = authorization {
-        txn.rollback().await.ok();
-        return Err(error).context(operation);
+        )
+        .context(operation)),
+        Err(error) => Err(anyhow::Error::new(error)
+            .context(
+                "verify capture workspace lease before final checkpoint transaction authorization",
+            )
+            .context(operation)),
     }
-
-    txn.commit().await.context(operation)
 }
 const CHECKPOINT_OBJECT_READ_MAX_INFLATED_BYTES: u64 = 16 * 1024 * 1024;
 
@@ -687,9 +784,9 @@ impl TracesTxnExtra for CheckpointCommitTxnExtra<'_> {
     async fn apply(&self, txn: &DatabaseTransaction, ctx: &TracesCommitCtx) -> Result<()> {
         // A combined database still commits the catalog in this ref
         // transaction. After detach, `agent_checkpoint` lives only in
-        // `capture.db`. That write happens after this ref commit; the two
-        // files are never attached, so a later catalog failure cannot roll
-        // the ref back.
+        // `capture.db`; the two files are never attached.
+        // `commit_split_checkpoint` writes that catalog while this ref
+        // transaction is still open and rolls the ref back if it fails.
         let catalog_on_ref_transaction =
             crate::internal::db::connection_has_table(txn, "agent_checkpoint")
                 .await
@@ -1840,6 +1937,54 @@ impl HistoryManager {
         self.db_conn.as_ref().clone()
     }
 
+    /// Repository connection (`libra.db`) for refs, object index rows and
+    /// writer markers. A manager built over the capture catalog
+    /// (`capture.db`, no `config_kv`) reaches its paired repository database.
+    async fn repository_conn(&self) -> Result<DatabaseConnection> {
+        if crate::internal::db::connection_has_table(self.db_conn.as_ref(), "config_kv")
+            .await
+            .context("inspect the history database")?
+        {
+            return Ok(self.db_conn.as_ref().clone());
+        }
+        crate::internal::db::open_paired_repository(self.db_conn.as_ref())
+            .await
+            .context("open the repository database for traces history")
+    }
+
+    /// The capture catalog when it is a different database from the
+    /// repository one. `None` means `db_conn` is a combined database that
+    /// holds both (a test fixture, or a repository not yet split).
+    async fn split_catalog_conn(&self) -> Result<Option<DatabaseConnection>> {
+        let has_catalog =
+            crate::internal::db::connection_has_table(self.db_conn.as_ref(), "agent_checkpoint")
+                .await
+                .context("inspect the history database")?;
+        let has_repository =
+            crate::internal::db::connection_has_table(self.db_conn.as_ref(), "config_kv")
+                .await
+                .context("inspect the history database")?;
+        match (has_catalog, has_repository) {
+            (true, true) => Ok(None),
+            (true, false) => Ok(Some(self.db_conn.as_ref().clone())),
+            (false, _) => crate::internal::ai::capture::store::open_existing_writer(
+                &self.repo_path,
+                crate::internal::ai::capture::store::COMMAND_BUSY_TIMEOUT,
+            )
+            .await
+            .map(Some)
+            .context("open the capture database for traces history"),
+        }
+    }
+
+    /// Connection holding the capture catalog tables.
+    async fn catalog_conn(&self) -> Result<DatabaseConnection> {
+        Ok(self
+            .split_catalog_conn()
+            .await?
+            .unwrap_or_else(|| self.db_conn.as_ref().clone()))
+    }
+
     /// Initialise the AI orphan branch with an empty tree commit.
     ///
     /// This should be called once during `libra init` so that the AI ref
@@ -2129,10 +2274,13 @@ impl HistoryManager {
         let mut attempt = 0;
         let ref_model = loop {
             let query = async {
+                // Resolving the repository connection reads the database too,
+                // so it stays inside the deadline-bounded query.
+                let repository = self.repository_conn().await?;
                 reference::Entity::find()
                     .filter(reference::Column::Name.eq(&self.ref_name))
                     .filter(reference::Column::Kind.eq(ConfigKind::Branch))
-                    .one(&*self.db_conn)
+                    .one(&repository)
                     .await
                     .context("Failed to query history head")
             };
@@ -2919,9 +3067,10 @@ impl HistoryManager {
     }
 
     async fn update_ref(&self, ref_name: &str, hash: ObjectHash) -> Result<()> {
+        let repository = self.repository_conn().await?;
         for attempt in 0..=SQLITE_BUSY_MAX_RETRIES {
             let txn: DatabaseTransaction =
-                match crate::internal::db::begin_write_transaction(self.db_conn.as_ref()).await {
+                match crate::internal::db::begin_write_transaction(&repository).await {
                     Ok(txn) => txn,
                     Err(err) if is_sqlite_busy(&err) && attempt < SQLITE_BUSY_MAX_RETRIES => {
                         sleep(Duration::from_millis(
@@ -3002,60 +3151,6 @@ impl HistoryManager {
         unreachable!("sqlite busy retry loop must return on success or terminal error")
     }
 
-    /// Write the checkpoint catalog after the traces ref has committed.
-    ///
-    /// A database that still contains `agent_checkpoint` already wrote the
-    /// catalog inside the ref transaction. After detach, that table is only
-    /// in `capture.db`. The ref stays committed if this later write fails;
-    /// the two files are never attached.
-    async fn commit_capture_catalog_after_ref(
-        &self,
-        extra: Option<&dyn TracesTxnExtra>,
-        capture_scope: Option<&CaptureScope>,
-        ctx: &TracesCommitCtx,
-        deadline: Option<CaptureCommitDeadline>,
-    ) -> Result<()> {
-        // Unscoped extras already ran inside the ref transaction. Only the
-        // scoped companion defers its catalog write when the table is absent.
-        if capture_scope.is_none() {
-            return Ok(());
-        }
-        if crate::internal::db::connection_has_table(self.db_conn.as_ref(), "agent_checkpoint")
-            .await
-            .context("inspect checkpoint catalog tables")?
-        {
-            return Ok(());
-        }
-        let Some(extra) = extra else {
-            return Ok(());
-        };
-        let capture = crate::internal::ai::capture::store::open_existing_writer(
-            &self.repo_path,
-            crate::internal::ai::capture::store::COMMAND_BUSY_TIMEOUT,
-        )
-        .await
-        .context("open the capture database for the checkpoint catalog")?;
-        let txn = crate::internal::db::begin_catalog_or_repository_write(&capture)
-            .await
-            .context("begin the capture catalog transaction after the traces ref update")?;
-        if let Err(error) = extra.apply(&txn, ctx).await {
-            let _ = txn.rollback().await;
-            return Err(error.context(
-                "write the checkpoint catalog in the capture database after the traces ref update",
-            ));
-        }
-        if let Some(scope) = capture_scope.filter(|scope| scope.workspace_id.is_none())
-            && let Err(error) = scope.authorize_final_commit_until(&txn, deadline).await
-        {
-            let _ = txn.rollback().await;
-            return Err(anyhow!(error)
-                .context("authorize the checkpoint catalog commit in the capture database"));
-        }
-        txn.commit()
-            .await
-            .context("commit the checkpoint catalog in the capture database")
-    }
-
     async fn update_ref_if_matches(
         &self,
         ref_name: &str,
@@ -3066,6 +3161,7 @@ impl HistoryManager {
             ref_name,
             expected_head,
             new_hash,
+            None,
             None,
             None,
             None,
@@ -3091,14 +3187,37 @@ impl HistoryManager {
         deadline: Option<CaptureCommitDeadline>,
         marker_fence: Option<&TracesWriterFence>,
         capture_scope: Option<&CaptureScope>,
+        catalog_extra: Option<&dyn TracesTxnExtra>,
     ) -> Result<RefUpdateOutcome> {
         let expected_commit = expected_head.map(|hash| hash.to_string());
         let new_commit = new_hash.to_string();
+        // Refs, writer markers and object index rows are in `libra.db`.
+        // Resolving that connection reads the database too, so it is bounded
+        // by the same deadline as the writer acquisition below.
+        let repository = await_checkpoint_precommit_read_until(
+            deadline,
+            "open the repository database for the checkpoint ref update",
+            self.repository_conn(),
+        )
+        .await?;
+        // Resolved before the writer transaction: a combined database is a
+        // one-connection pool that the transaction below occupies.
+        let split_catalog = match (catalog_extra, capture_scope) {
+            (Some(_), Some(_)) => {
+                await_checkpoint_precommit_read_until(
+                    deadline,
+                    "open the capture database for the checkpoint ref update",
+                    self.split_catalog_conn(),
+                )
+                .await?
+            }
+            _ => None,
+        };
 
         for attempt in 0..=SQLITE_BUSY_MAX_RETRIES {
             ensure_checkpoint_append_before_deadline(deadline)?;
             let txn: DatabaseTransaction = match begin_checkpoint_write_transaction_until(
-                self.db_conn.as_ref(),
+                &repository,
                 deadline,
                 "begin checkpoint ref update transaction",
             )
@@ -3280,6 +3399,24 @@ impl HistoryManager {
             {
                 let _ = txn.rollback().await;
                 return Err(err.context(CheckpointCompanionTransactionFailed));
+            }
+
+            // After detach the checkpoint catalog is in `capture.db` and cannot
+            // join this transaction. It is written while this `libra.db` writer
+            // lock is still held, so no other appender can move the ref in
+            // between, and a catalog failure rolls the ref CAS back.
+            if let (Some(catalog_extra), Some(capture), Some((_, ctx))) =
+                (catalog_extra, split_catalog.as_ref(), extra)
+            {
+                return commit_split_checkpoint(
+                    txn,
+                    capture,
+                    catalog_extra,
+                    capture_scope,
+                    ctx,
+                    deadline,
+                )
+                .await;
             }
 
             // This is the last SQL before COMMIT. It atomically tests the
@@ -3961,17 +4098,11 @@ impl HistoryManager {
                     params.deadline,
                     Some(writer_fence),
                     params.capture_scope,
+                    params.txn_extra,
                 )
                 .await?
             {
                 RefUpdateOutcome::Updated => {
-                    self.commit_capture_catalog_after_ref(
-                        params.txn_extra,
-                        params.capture_scope,
-                        &commit_ctx,
-                        params.deadline,
-                    )
-                    .await?;
                     return Ok(CheckpointCommit {
                         commit_hash,
                         tree_oid: new_root,
@@ -5077,9 +5208,10 @@ impl HistoryManager {
     ) -> Result<ClaudeLegacyRevisionRepair> {
         let identity = claude_legacy_revision_identity(checkpoint_id, ordinary_bytes)
             .context("this checkpoint has no ordinary Claude thinking data to repair")?;
-        let backend = self.db_conn.get_database_backend();
-        let txn = self
-            .db_conn
+        // Revisions, claims, checkpoints and tombstones are catalog tables.
+        let catalog = self.catalog_conn().await?;
+        let backend = catalog.get_database_backend();
+        let txn = catalog
             .begin()
             .await
             .context("begin Claude legacy reasoning revision repair")?;
@@ -5268,9 +5400,10 @@ impl HistoryManager {
         checkpoint_id: &str,
         ordinary_bytes: &[u8],
     ) -> Result<ClaudeLegacyRevisionRepair> {
-        let backend = self.db_conn.get_database_backend();
-        let txn = self
-            .db_conn
+        // Revisions, claims, checkpoints and tombstones are catalog tables.
+        let catalog = self.catalog_conn().await?;
+        let backend = catalog.get_database_backend();
+        let txn = catalog
             .begin()
             .await
             .context("begin Codex legacy reasoning revision repair")?;
@@ -5495,6 +5628,12 @@ impl HistoryManager {
     pub async fn erase_session_local(&self, session_id: &str) -> Result<SessionEraseOutcome> {
         use sea_orm::{Statement, Value};
         let backend = self.db_conn.get_database_backend();
+        // Catalog rows live in `capture.db`; markers, recovery artifacts and
+        // other `metadata_kv` rows in `libra.db`. A combined database is
+        // both. The two files are never attached.
+        let catalog = self.catalog_conn().await?;
+        let repository = self.repository_conn().await?;
+        let split = self.split_catalog_conn().await?.is_some();
 
         // ADR-DR-19 (M4): establish the anti-resurrection barrier BEFORE
         // pruning/deleting anything. The same transaction fences every
@@ -5502,8 +5641,7 @@ impl HistoryManager {
         // later ref prune is interrupted, the session remains tombstoned and
         // a retry can safely finish deletion; no in-flight writer can revive
         // it in the meantime.
-        let identity = self
-            .db_conn
+        let identity = catalog
             .query_one_raw(Statement::from_sql_and_values(
                 backend,
                 "SELECT agent_kind, provider_session_id
@@ -5515,8 +5653,7 @@ impl HistoryManager {
         let provider_identity = if let Some(row) = identity {
             let agent_kind: String = row.try_get_by("agent_kind")?;
             let provider_session_id: String = row.try_get_by("provider_session_id")?;
-            let txn = self
-                .db_conn
+            let txn = catalog
                 .begin()
                 .await
                 .context("begin agent erasure tombstone transaction")?;
@@ -5637,7 +5774,7 @@ impl HistoryManager {
         // cleanup with pre-ref append and repair under the same SQLite writer
         // lock. If cleanup fails, return an explicit partial erasure; retrying
         // this command can remove the residual local identity evidence.
-        let journal_txn = crate::internal::db::begin_write_transaction(self.db_conn.as_ref())
+        let journal_txn = crate::internal::db::begin_write_transaction(&repository)
             .await
             .context("agent session erasure is partial: lock the commit journal for cleanup; retry 'libra agent erase'")?;
         // A retry may find no catalog row (and therefore no new tombstone),
@@ -5657,12 +5794,10 @@ impl HistoryManager {
         // transaction above; once the tombstone wins, no new marker for this
         // provider identity can be created. Refuse this attempt until the
         // already-marked writer finishes or its rejected objects are cleaned.
-        let live_markers = list_live_traces_inflight_markers(
-            self.db_conn.as_ref(),
-            chrono::Utc::now().timestamp_millis(),
-        )
-        .await
-        .context("verify in-flight writers before agent session erasure")?;
+        let live_markers =
+            list_live_traces_inflight_markers(&repository, chrono::Utc::now().timestamp_millis())
+                .await
+                .context("verify in-flight writers before agent session erasure")?;
         if let Some(marker) = live_markers
             .into_iter()
             .find(|marker| marker.session_id == session_id)
@@ -5676,8 +5811,7 @@ impl HistoryManager {
         }
 
         // Enumerate the session's checkpoints from the catalog.
-        let rows = self
-            .db_conn
+        let rows = catalog
             .query_all_raw(Statement::from_sql_and_values(
                 backend,
                 "SELECT checkpoint_id FROM agent_checkpoint WHERE session_id = ?",
@@ -5703,20 +5837,29 @@ impl HistoryManager {
         // Delete the session row (cascades claims/revisions/checkpoints) and
         // application-owned import/export job rows together. The tombstone is
         // deliberately retained outside ordinary retention.
-        let txn = self
-            .db_conn
+        let txn = catalog
             .begin()
             .await
             .context("begin agent session catalog erasure")?;
+        let meta_txn = if split {
+            Some(
+                crate::internal::db::begin_write_transaction(&repository)
+                    .await
+                    .context("begin repository metadata erasure")?,
+            )
+        } else {
+            None
+        };
+        let meta = meta_txn.as_ref().unwrap_or(&txn);
         let capture_capacity_lost =
-            crate::internal::ai::capture::pending::erase_session_artifacts(&txn, session_id)
+            crate::internal::ai::capture::pending::erase_session_artifacts(meta, session_id)
                 .await
                 .context("remove private capture recovery artifacts during session erasure")?;
         if provider_identity.is_some() {
             // The existing local session is the deletion authority. Neither
             // map decoding nor a private key is needed; unknown owners stay
             // untouched. This deletion rolls back with the catalog deletion.
-            txn.execute_raw(Statement::from_sql_and_values(
+            meta.execute_raw(Statement::from_sql_and_values(
                 backend,
                 "DELETE FROM metadata_kv WHERE scope = ? AND target = ?",
                 [
@@ -5737,7 +5880,7 @@ impl HistoryManager {
             ))
             .await
             .context("delete agent_session row for erasure")?;
-        txn.execute_raw(Statement::from_sql_and_values(
+        meta.execute_raw(Statement::from_sql_and_values(
             backend,
             "DELETE FROM metadata_kv WHERE scope = ? AND target = ?",
             [
@@ -5749,7 +5892,7 @@ impl HistoryManager {
         ))
         .await
         .context("delete import object-index repair marker for erased session")?;
-        txn.execute_raw(Statement::from_sql_and_values(
+        meta.execute_raw(Statement::from_sql_and_values(
             backend,
             "DELETE FROM metadata_kv WHERE scope = ? AND target = ?",
             [
@@ -5785,6 +5928,12 @@ impl HistoryManager {
         txn.commit()
             .await
             .context("commit agent session catalog erasure")?;
+        if let Some(meta_txn) = meta_txn {
+            meta_txn
+                .commit()
+                .await
+                .context("commit repository metadata erasure after the catalog")?;
+        }
         if capture_capacity_lost {
             tracing::warn!(
                 "unattributable private capture recovery evidence was retained and still consumes capacity; run `libra agent doctor` and inspect repository backups"
@@ -5823,7 +5972,8 @@ impl HistoryManager {
         let now_ms = chrono::Utc::now().timestamp_millis();
         // A marker-listing failure cannot prove the absence of a live
         // writer — propagate it, which aborts (fails closed) the prune.
-        let live_markers = list_live_traces_inflight_markers(self.db_conn.as_ref(), now_ms)
+        let repository = self.repository_conn().await?;
+        let live_markers = list_live_traces_inflight_markers(&repository, now_ms)
             .await
             .context("failed to verify traces in-flight markers (prune fails closed)")?;
         if let Some(marker) = live_markers.first() {
@@ -5840,10 +5990,10 @@ impl HistoryManager {
         // whole-chain prune in that interval could delete the claim's current
         // leaf and invalidate the writer's source revision base, so fail
         // closed on every unexpired reservation just as we do for markers.
-        let reserved = self
-            .db_conn
+        let catalog = self.catalog_conn().await?;
+        let reserved = catalog
             .query_one_raw(Statement::from_sql_and_values(
-                self.db_conn.get_database_backend(),
+                catalog.get_database_backend(),
                 "SELECT parent_session_id, attempt_checkpoint_id, lease_expires_at
                  FROM agent_subagent_content_claim
                  WHERE state = 'reserved' AND lease_expires_at > ?
@@ -5910,9 +6060,9 @@ impl HistoryManager {
     }
 
     async fn load_checkpoint_history_rows(&self) -> Result<Vec<CheckpointHistoryRow>> {
-        let backend = self.db_conn.get_database_backend();
-        let rows = self
-            .db_conn
+        let catalog = self.catalog_conn().await?;
+        let backend = catalog.get_database_backend();
+        let rows = catalog
             .query_all_raw(Statement::from_string(
                 backend,
                 "SELECT cp.checkpoint_id, cp.session_id, cp.scope, cp.parent_commit, \
@@ -6102,9 +6252,15 @@ impl HistoryManager {
                 "refusing checkpoint prune because concurrent object-index repair work could recreate a deleted catalog row; retry after the repair marker drains"
             })?;
 
+        // Refs and object index rows live in `libra.db`; the catalog rows the
+        // prune rewrites live in `capture.db` when the two are split. The two
+        // files are never attached: the repository transaction commits first
+        // and the catalog transaction follows, as for checkpoint appends.
+        let repository = self.repository_conn().await?;
+        let split_catalog = self.split_catalog_conn().await?;
         'retry_sqlite: for attempt in 0..=SQLITE_BUSY_MAX_RETRIES {
             let txn: DatabaseTransaction =
-                match crate::internal::db::begin_write_transaction(self.db_conn.as_ref()).await {
+                match crate::internal::db::begin_write_transaction(&repository).await {
                     Ok(txn) => txn,
                     Err(err) if is_sqlite_busy(&err) && attempt < SQLITE_BUSY_MAX_RETRIES => {
                         sleep(Duration::from_millis(
@@ -6174,9 +6330,31 @@ impl HistoryManager {
                 return Err(err).context("Failed to update checkpoint prune ref");
             }
 
+            let catalog_txn = match &split_catalog {
+                Some(catalog) => {
+                    match crate::internal::db::begin_catalog_or_repository_write(catalog).await {
+                        Ok(catalog_txn) => Some(catalog_txn),
+                        Err(err) if is_sqlite_busy(&err) && attempt < SQLITE_BUSY_MAX_RETRIES => {
+                            let _ = txn.rollback().await;
+                            sleep(Duration::from_millis(
+                                SQLITE_BUSY_RETRY_BASE_MS * (attempt as u64 + 1),
+                            ))
+                            .await;
+                            continue 'retry_sqlite;
+                        }
+                        Err(err) => {
+                            let _ = txn.rollback().await;
+                            return Err(err)
+                                .context("Failed to begin checkpoint prune catalog transaction");
+                        }
+                    }
+                }
+                None => None,
+            };
+            let cat: &DatabaseTransaction = catalog_txn.as_ref().unwrap_or(&txn);
             let backend = txn.get_database_backend();
             for item in rewritten {
-                if let Err(err) = txn
+                if let Err(err) = cat
                     .execute_raw(Statement::from_sql_and_values(
                         backend,
                         "UPDATE agent_checkpoint SET traces_commit = ?, tree_oid = ?, \
@@ -6205,7 +6383,7 @@ impl HistoryManager {
             let mut removed = 0;
             for id in remove_ids {
                 if record_cloud_tombstones {
-                    txn.execute_raw(Statement::from_sql_and_values(
+                    cat.execute_raw(Statement::from_sql_and_values(
                         backend,
                         "INSERT INTO agent_checkpoint_prune_tombstone (
                             checkpoint_id, session_id, pruned_at
@@ -6232,7 +6410,7 @@ impl HistoryManager {
                 // cascades its revision/link.  Keep an empty claim as the
                 // durable revision high-water mark so a later capture cannot
                 // reuse an audited revision number for different content.
-                txn.execute_raw(Statement::from_sql_and_values(
+                cat.execute_raw(Statement::from_sql_and_values(
                     backend,
                     "DELETE FROM agent_subagent_content_revision
                      WHERE checkpoint_id = ?",
@@ -6240,7 +6418,7 @@ impl HistoryManager {
                 ))
                 .await
                 .context("delete subagent content revision for pruned checkpoint")?;
-                txn.execute_raw(Statement::from_sql_and_values(
+                cat.execute_raw(Statement::from_sql_and_values(
                     backend,
                     "UPDATE agent_subagent_content_claim
                      SET sync_revision = sync_revision + 1,
@@ -6283,7 +6461,7 @@ impl HistoryManager {
                 // attempt cursors are part of the same catalog fact as the
                 // checkpoint. Reconcile them before deleting the row so no
                 // committed claim can point at a pruned checkpoint.
-                txn.execute_raw(Statement::from_sql_and_values(
+                cat.execute_raw(Statement::from_sql_and_values(
                     backend,
                     "DELETE FROM agent_coverage_conflict
                      WHERE incumbent_checkpoint_id = ?
@@ -6298,14 +6476,14 @@ impl HistoryManager {
                 ))
                 .await
                 .context("delete conflict evidence whose incumbent checkpoint is pruned")?;
-                txn.execute_raw(Statement::from_sql_and_values(
+                cat.execute_raw(Statement::from_sql_and_values(
                     backend,
                     "DELETE FROM agent_coverage_revision WHERE checkpoint_id = ?",
                     [Value::from(id.clone())],
                 ))
                 .await
                 .context("delete coverage revisions for pruned checkpoint")?;
-                txn.execute_raw(Statement::from_sql_and_values(
+                cat.execute_raw(Statement::from_sql_and_values(
                     backend,
                     "DELETE FROM agent_coverage_claim
                      WHERE checkpoint_id = ?
@@ -6319,7 +6497,7 @@ impl HistoryManager {
                 ))
                 .await
                 .context("delete coverage claims emptied by checkpoint prune")?;
-                txn.execute_raw(Statement::from_sql_and_values(
+                cat.execute_raw(Statement::from_sql_and_values(
                     backend,
                     "UPDATE agent_coverage_claim
                      SET revision = (
@@ -6376,7 +6554,7 @@ impl HistoryManager {
                 ))
                 .await
                 .context("repoint coverage claim after checkpoint prune")?;
-                txn.execute_raw(Statement::from_sql_and_values(
+                cat.execute_raw(Statement::from_sql_and_values(
                     backend,
                     "UPDATE agent_import_identity SET attempt_checkpoint_id = NULL
                      WHERE attempt_checkpoint_id = ?",
@@ -6384,7 +6562,7 @@ impl HistoryManager {
                 ))
                 .await
                 .context("clear pruned import attempt checkpoint pointer")?;
-                match txn
+                match cat
                     .execute_raw(Statement::from_sql_and_values(
                         backend,
                         "DELETE FROM agent_checkpoint WHERE checkpoint_id = ?",
@@ -6405,7 +6583,7 @@ impl HistoryManager {
                 }
             }
 
-            let deleted_import_identities = txn
+            let deleted_import_identities = cat
                 .execute_raw(Statement::from_sql_and_values(
                     backend,
                     "DELETE FROM agent_import_identity
@@ -6488,6 +6666,11 @@ impl HistoryManager {
 
             match txn.commit().await {
                 Ok(()) => {
+                    if let Some(catalog_txn) = catalog_txn {
+                        catalog_txn.commit().await.context(
+                            "commit the checkpoint prune catalog after the traces ref update",
+                        )?;
+                    }
                     return Ok((
                         RefUpdateOutcome::Updated,
                         removed,
@@ -7060,15 +7243,22 @@ async fn checkpoint_snapshot_durable_oids_with_catalog<C: ConnectionTrait>(
     cataloged_commits: Vec<String>,
     deadline: Option<Instant>,
 ) -> Result<HashSet<String>> {
-    let head_row = conn
-        .query_one_raw(Statement::from_sql_and_values(
-            conn.get_database_backend(),
-            "SELECT `commit` FROM reference
-             WHERE name = ? AND kind = 'Branch' AND remote IS NULL LIMIT 1",
-            [crate::internal::branch::TRACES_BRANCH.into()],
-        ))
+    // The traces ref is in `libra.db`; a capture catalog connection reads it
+    // through its paired repository database.
+    let statement = Statement::from_sql_and_values(
+        conn.get_database_backend(),
+        "SELECT `commit` FROM reference
+         WHERE name = ? AND kind = 'Branch' AND remote IS NULL LIMIT 1",
+        [crate::internal::branch::TRACES_BRANCH.into()],
+    );
+    let head_row = match crate::internal::db::reference_peer(conn)
         .await
-        .context("resolve traces ref while verifying unchanged checkpoint")?;
+        .context("open the repository database while verifying unchanged checkpoint")?
+    {
+        Some(peer) => peer.query_one_raw(statement).await,
+        None => conn.query_one_raw(statement).await,
+    }
+    .context("resolve traces ref while verifying unchanged checkpoint")?;
     let head = head_row
         .map(|row| {
             row.try_get_by::<Option<String>, _>("commit")
@@ -11240,6 +11430,7 @@ mod tests {
                 Some(deadline),
                 Some(&fence),
                 Some(&scope),
+                None,
             )
             .await
             .expect_err("expired SQLite final authorization must roll back the final transaction");
@@ -11845,6 +12036,7 @@ mod tests {
                 None,
                 None,
                 Some(&stale_fence),
+                None,
                 None,
             )
             .await
@@ -12612,6 +12804,7 @@ mod tests {
                 oid,
                 None,
                 Some(deadline_for_contention_test()),
+                None,
                 None,
                 None,
             ),

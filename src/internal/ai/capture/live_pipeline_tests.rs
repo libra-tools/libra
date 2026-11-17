@@ -6713,7 +6713,27 @@ async fn capture_store_writer_hook_catalog_lands_in_capture_database() {
     let ingest_span = new_ingest_span(command.hook_command(), claude_provider());
     ingest_agent_traces(command, binding, &ingest_span)
         .await
-        .expect("hook ingest writes the catalog through the capture store");
+        .expect("hook ingest queues the event");
+    // The hook only queues. The single consumer writes the catalog.
+    assert_eq!(
+        crate::internal::ai::capture::spool::ready_names(&storage)
+            .expect("list queued events")
+            .len(),
+        1,
+        "the realtime hook must leave exactly one ready envelope"
+    );
+    crate::internal::ai::capture::drain::drain_storage(
+        &storage,
+        crate::command::hooks::spool_replay_provider,
+    )
+    .await
+    .expect("the consumer replays the queued event into capture.db");
+    assert!(
+        crate::internal::ai::capture::spool::ready_names(&storage)
+            .expect("list queued events after drain")
+            .is_empty(),
+        "a committed event must leave ready/"
+    );
 
     let schema_after = repo_conn
         .query_one_raw(Statement::from_string(

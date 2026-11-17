@@ -197,10 +197,25 @@ async fn connect_repo_db(repo: &Path) -> DatabaseConnection {
     Database::connect(opts).await.expect("connect repo db")
 }
 
+/// Catalog tables live in `.libra/private/capture.db` once the capture store
+/// has opened (it copies rows seeded into `libra.db` before that).
+async fn connect_catalog_db(repo: &Path) -> DatabaseConnection {
+    let capture = repo.join(".libra").join("private").join("capture.db");
+    if !capture.is_file() {
+        return connect_repo_db(repo).await;
+    }
+    let mut opts = ConnectOptions::new(format!("sqlite://{}", capture.display()));
+    opts.sqlx_logging(false)
+        .connect_timeout(Duration::from_secs(5));
+    Database::connect(opts)
+        .await
+        .expect("connect capture database")
+}
+
 /// Seed a stopped session plus a real E4-libra checkpoint whose transcript
 /// embeds `SECRET`, and return the checkpoint id.
 async fn seed_checkpoint_with_secret(repo: &Path) -> String {
-    let conn = connect_repo_db(repo).await;
+    let conn = connect_catalog_db(repo).await;
     conn.execute_raw(Statement::from_sql_and_values(
         conn.get_database_backend(),
         "INSERT INTO agent_session (
@@ -279,7 +294,7 @@ async fn seed_checkpoint_with_secret(repo: &Path) -> String {
 }
 
 async fn seed_og13_legacy_checkpoint(repo: &Path, transcript: &[u8]) -> String {
-    let conn = connect_repo_db(repo).await;
+    let conn = connect_catalog_db(repo).await;
     conn.execute_raw(Statement::from_sql_and_values(
         conn.get_database_backend(),
         "INSERT INTO agent_session (
@@ -398,7 +413,7 @@ async fn opencode_legacy_raw_read_preserves_original_bytes() {
     );
     assert_eq!(raw.stdout, OG13_LEGACY_BYTES);
     assert_eq!(audit_rows(repo.path()).await, vec![(id.clone(), 1)]);
-    let conn = connect_repo_db(repo.path()).await;
+    let conn = connect_catalog_db(repo.path()).await;
     conn.execute_raw(Statement::from_string(
         conn.get_database_backend(),
         "UPDATE agent_session SET agent_kind = 'claude_code' WHERE session_id = 'sess-x'",
@@ -505,7 +520,7 @@ async fn opencode_legacy_invalid_ordinary_export_is_refused_raw_is_audited() {
 }
 
 async fn audit_rows(repo: &Path) -> Vec<(String, i64)> {
-    let conn = connect_repo_db(repo).await;
+    let conn = connect_catalog_db(repo).await;
     let rows = conn
         .query_all_raw(Statement::from_string(
             conn.get_database_backend(),
@@ -685,7 +700,7 @@ fn artifact_object_path(repo: &Path, oid: &str) -> std::path::PathBuf {
 }
 
 async fn seed_temporary_gc_checkpoint(repo: &Path) -> (String, ObjectHash) {
-    let conn = connect_repo_db(repo).await;
+    let conn = connect_catalog_db(repo).await;
     let storage = repo.join(".libra");
     let history = HistoryManager::new_with_ref(
         Arc::new(ClientStorage::try_init(storage.join("objects")).expect("storage")),
@@ -830,18 +845,20 @@ async fn agent_clean_gc_keeps_reachable_reasoning_artifact() {
     // RG-06 precedes RG-03's authorized export option. Read the actual
     // surviving checkpoint manifest so this GC gate verifies its own
     // reachability contract without requiring a later card's reader API.
-    let conn = connect_repo_db(repo.path()).await;
+    let catalog = connect_catalog_db(repo.path()).await;
     assert!(
-        conn.query_one_raw(Statement::from_sql_and_values(
-            conn.get_database_backend(),
-            "SELECT checkpoint_id FROM agent_checkpoint WHERE checkpoint_id = ?",
-            [temporary_id.into()],
-        ))
-        .await
-        .expect("temporary checkpoint removal")
-        .is_none(),
+        catalog
+            .query_one_raw(Statement::from_sql_and_values(
+                catalog.get_database_backend(),
+                "SELECT checkpoint_id FROM agent_checkpoint WHERE checkpoint_id = ?",
+                [temporary_id.into()],
+            ))
+            .await
+            .expect("temporary checkpoint removal")
+            .is_none(),
         "clean must actually prune the temporary checkpoint"
     );
+    let conn = connect_repo_db(repo.path()).await;
     let ref_row = conn
         .query_one_raw(Statement::from_sql_and_values(
             conn.get_database_backend(),
@@ -858,9 +875,9 @@ async fn agent_clean_gc_keeps_reachable_reasoning_artifact() {
         previous_head.to_string(),
         "clean must actually rewrite traces before post-retention object GC"
     );
-    let row = conn
+    let row = catalog
         .query_one_raw(Statement::from_sql_and_values(
-            conn.get_database_backend(),
+            catalog.get_database_backend(),
             "SELECT tree_oid FROM agent_checkpoint WHERE checkpoint_id = ?",
             [id.clone().into()],
         ))
@@ -909,7 +926,7 @@ async fn agent_clean_gc_keeps_reachable_reasoning_artifact() {
 async fn seed_reasoning_artifact(repo: &Path) -> (String, String, ObjectHash) {
     let id = seed_checkpoint_with_secret(repo).await;
     let storage = repo.join(".libra");
-    let conn = connect_repo_db(repo).await;
+    let conn = connect_catalog_db(repo).await;
     let row = conn
         .query_one_raw(Statement::from_sql_and_values(
             conn.get_database_backend(),
@@ -1028,7 +1045,7 @@ fn assert_no_artifact_canary(output: &std::process::Output) {
 }
 
 async fn artifact_audit_details(repo: &Path) -> Vec<(String, i64, String, Option<String>)> {
-    let conn = connect_repo_db(repo).await;
+    let conn = connect_catalog_db(repo).await;
     let rows = conn
         .query_all_raw(Statement::from_string(
             conn.get_database_backend(),
@@ -1218,7 +1235,11 @@ async fn reasoning_export_audit_failure_prevents_body_read_and_output() {
     let repo = tempfile::tempdir().unwrap();
     init_repo_via_cli(repo.path());
     let (id, sha, artifact) = seed_reasoning_artifact(repo.path()).await;
-    let conn = connect_repo_db(repo.path()).await;
+    // Materialize capture.db (it copies the seeded rows) so the trigger lands
+    // on the catalog the export will write; a copy does not carry triggers.
+    let status = run_libra_command(&["agent", "status"], repo.path());
+    assert!(status.status.success(), "agent status: {status:?}");
+    let conn = connect_catalog_db(repo.path()).await;
     conn.execute_raw(Statement::from_string(conn.get_database_backend(),"CREATE TRIGGER fail_rg03_audit BEFORE INSERT ON agent_audit_log BEGIN SELECT RAISE(ABORT, 'synthetic audit failure'); END".to_owned())).await.unwrap();
     conn.close().await.unwrap();
     let oid = artifact.to_string();
@@ -1369,7 +1390,7 @@ async fn reasoning_export_integrity_failure_never_publishes_a_file() {
             }
             "foreign_checkpoint" => {
                 checkpoint_id = "ccddeeff00112233445566778899aabbcc".into();
-                let conn = connect_repo_db(repo.path()).await;
+                let conn = connect_catalog_db(repo.path()).await;
                 conn.execute_raw(Statement::from_sql_and_values(conn.get_database_backend(),
                     "INSERT INTO agent_checkpoint (checkpoint_id,session_id,scope,parent_commit,tree_oid,metadata_blob_oid,traces_commit,created_at) SELECT ?,session_id,scope,parent_commit,tree_oid,metadata_blob_oid,traces_commit,created_at FROM agent_checkpoint WHERE checkpoint_id = ?",
                     [checkpoint_id.clone().into(), id.into()])).await.unwrap();

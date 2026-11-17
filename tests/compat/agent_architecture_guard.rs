@@ -2567,13 +2567,18 @@ fn live_capture_port_and_store_boundaries() {
         ["src/internal/ai/observed_agents/mod.rs::live_capture_for"],
         "observed_agents::live_capture_for must be the only lookup that returns a LiveCaptureProvider"
     );
+    // plan-20261116 CQ-05: the capture queue consumer is the second half of
+    // the hook entry. It resolves the same provider singleton from the hook
+    // name in a queued envelope, in the entry layer, and injects the binding
+    // into the provider-neutral capture runtime.
     assert_eq!(
         resolve_calls,
         [
+            "src/command/hooks.rs::spool_replay_provider",
             "src/internal/ai/capture/test_support.rs::ingest_agent_traces_ingress_outcome_for_test",
             "src/internal/ai/hooks/runtime.rs::process_hook_event_with_target",
         ],
-        "LiveCaptureBinding::resolve is the hook entry's single provider lookup (plus the in-process harness)"
+        "LiveCaptureBinding::resolve is the hook entry's provider lookup (realtime hook, queue replay, and the in-process harness)"
     );
     let production_identities: BTreeSet<(String, String)> = identity_impls
         .iter()
@@ -6896,11 +6901,14 @@ fn capture_export_runner_token_settles_at_two_sites() {
             "process_hook_event_with_target",
             "await_hook_capture_with_deadline",
         ),
+        // plan-20261116 CQ-05: the realtime hook only queues the event; the
+        // single queue consumer reaches the payload writer through
+        // `persist_spool_envelope` → `persist_agent_traces_command`.
         (
             &live_pipeline_source,
             &live_pipeline_file,
             LIVE_PIPELINE,
-            "ingest_agent_traces",
+            "persist_agent_traces_command",
             "ingest_agent_traces_payload_with_scope",
         ),
         (
@@ -9275,7 +9283,11 @@ fn capture_runtime_extraction_oracles_are_frozen() {
     // docs/development/tracing/agent.md. The 2026-10-22 ADR-ACF-10
     // amendment removes the redundant CX-15 overlay/helper. Both public
     // tests now compare against the same base matrix, and these two digests
-    // match the current upstream oracle revision.
+    // match the current upstream oracle revision. The 2026-11-17 amendment
+    // (plan-20261116 CQ-05) changes only the shared `HookRepo` harness: a
+    // realtime hook now queues its event, and `HookRepo::run` stores the
+    // queue with one `libra __capture-spool-drain` before returning. The
+    // oracle bodies and their expected bytes are unchanged.
     const FROZEN_ORACLES: [(&str, &str, &[&str], &str); 3] = [
         (
             "tests/agent_lifecycle_event_test.rs",
@@ -9295,7 +9307,7 @@ fn capture_runtime_extraction_oracles_are_frozen() {
                 "fn hook_contract_projection",
                 "struct HookRepo",
             ],
-            "78656cf7640f911ac2c1e37a7edfedd049c3ea7a1e331044d89b9c0cdc8faeea",
+            "d1ccda7ab2c0674770423443123ad5d2540d00eb9825bc9c64a4a1316890bdff",
         ),
         (
             "tests/agent_hook_crash_test.rs",
@@ -9324,7 +9336,7 @@ fn capture_runtime_extraction_oracles_are_frozen() {
                 "struct ReplayCase",
                 "struct ReplayDurableOracle",
             ],
-            "42718713cfa9baf3fbf5949f3e5fd1830e439aee84fc3292d1cda04215c91bc3",
+            "53122bb32bc2436c841586e36680b0a03953c47c9a7e5f97ad29497b5d6661fb",
         ),
         (
             "src/internal/ai/capture/live_oracle_tests.rs",
@@ -9363,7 +9375,7 @@ fn capture_runtime_extraction_oracles_are_frozen() {
                 "fn hook_contract_projection",
                 "struct HookRepo",
             ],
-            "732953abeb31caa0b839376e37cdb405fd35287ee5e44259a95d5e16331de665",
+            "289b4bf1963bd564804e79361fafcd77bb7ff5cb9e7a04869a97f30bb3402a0d",
         ),
         (
             "tests/agent_hook_crash_test.rs",
@@ -9392,7 +9404,7 @@ fn capture_runtime_extraction_oracles_are_frozen() {
                 "struct ReplayCase",
                 "struct ReplayDurableOracle",
             ],
-            "bdf7b32879957d3d13fc495bec45dbebfcd0768cc9436e8a2325851c3614a5c2",
+            "572f573006ef9c9d7b9833ed8143c80d1f56b8feb25b808efb74efa7e4052aae",
         ),
         (
             "src/internal/ai/capture/live_oracle_tests.rs",
@@ -11962,6 +11974,8 @@ const COV2_MANUAL_SESSION_CASES: &[(&str, &[&str])] = &[
             "cov2_macos_failed_export_session_zero_write",
             "cov2_macos_fake_exporter_candidate_live_partial_no_plaintext",
             "cov2_macos_fake_exporter_candidate_import_partial_no_plaintext",
+            // plan-20261116 CQ-05: local-only capture queue case.
+            "capture_spool_opencode_forwarder_returns_after_queueing",
         ],
     ),
     (
@@ -12286,7 +12300,7 @@ fn cov2_opencode_session_e2e_is_manual_only() {
             .iter()
             .map(|(_, names)| names.len())
             .sum::<usize>(),
-        22 + 5
+        22 + 5 + 1
     );
     for (path, names) in COV2_MANUAL_SESSION_CASES {
         let (_, file) = parse_rust_source(path);

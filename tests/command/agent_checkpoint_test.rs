@@ -20,6 +20,21 @@ async fn connect_repo_db(repo: &Path) -> DatabaseConnection {
         .expect("connect repository database")
 }
 
+/// Catalog tables live in `.libra/private/capture.db` once the capture store
+/// has opened (it copies rows seeded into `libra.db` before that).
+async fn connect_catalog_db(repo: &Path) -> DatabaseConnection {
+    let capture = repo.join(".libra").join("private").join("capture.db");
+    if !capture.is_file() {
+        return connect_repo_db(repo).await;
+    }
+    let mut opts = ConnectOptions::new(format!("sqlite://{}", capture.display()));
+    opts.sqlx_logging(false)
+        .connect_timeout(Duration::from_secs(5));
+    Database::connect(opts)
+        .await
+        .expect("connect capture database")
+}
+
 async fn seed_checkpoint_for_parent(conn: &DatabaseConnection, checkpoint_id: &str, parent: &str) {
     conn.execute_raw(Statement::from_sql_and_values(
         conn.get_database_backend(),
@@ -73,7 +88,7 @@ async fn agent_checkpoint_rewind_dry_run_and_apply_restore_worktree_only() {
         .to_string();
     assert_ne!(base, head_before_rewind);
 
-    let conn = connect_repo_db(repo.path()).await;
+    let conn = connect_catalog_db(repo.path()).await;
     seed_checkpoint_for_parent(&conn, "cp-rewind", &base).await;
 
     let output = run_libra_command(
@@ -143,7 +158,7 @@ async fn agent_checkpoint_rewind_dry_run_and_apply_restore_worktree_only() {
 async fn agent_session_show_extract_transcript_rejects_corrupt_identity_without_output() {
     let repo = create_committed_repo_via_cli();
     let _guard = ChangeDirGuard::new(repo.path());
-    let conn = connect_repo_db(repo.path()).await;
+    let conn = connect_catalog_db(repo.path()).await;
     conn.execute_raw(Statement::from_sql_and_values(
         conn.get_database_backend(),
         "INSERT INTO agent_session (
@@ -198,7 +213,7 @@ async fn agent_session_show_extract_transcript_rejects_corrupt_identity_without_
 async fn agent_checkpoint_subagent_scope_listed_and_linked() {
     let repo = create_committed_repo_via_cli();
     let _guard = ChangeDirGuard::new(repo.path());
-    let conn = connect_repo_db(repo.path()).await;
+    let conn = connect_catalog_db(repo.path()).await;
 
     // A committed parent + a subagent child linked back to it.
     seed_checkpoint_for_parent(&conn, "cp-committed", "deadbeef").await;
@@ -234,7 +249,9 @@ async fn agent_checkpoint_subagent_scope_listed_and_linked() {
     assert_eq!(scope_of("cp-committed"), "committed", "rows: {rows:?}");
     assert_eq!(scope_of("cp-subagent"), "subagent", "rows: {rows:?}");
 
-    // Parent linkage persisted on the subagent row.
+    // Parent linkage persisted on the subagent row (in the capture catalog
+    // once the command above opened it).
+    let conn = connect_catalog_db(repo.path()).await;
     let link = conn
         .query_one_raw(Statement::from_sql_and_values(
             conn.get_database_backend(),
