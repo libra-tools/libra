@@ -207,6 +207,14 @@ libra agent mcp --stdio
 
 `libra agent` 管理 Libra 的外部代理捕获表面。它安装和移除提供商 hook，报告已捕获的 session/checkpoint 状态，暴露只读诊断，并可将 `refs/libra/traces` 推送到远程。
 
+捕获目录（session、checkpoint 以及其余捕获表）只放在 `.libra/private/capture.db`。
+在 Unix 上，Libra 创建父目录 `.libra/private`，模式为 `0700`，数据库文件模式为
+`0600`。`libra status` 这类仓库命令仍使用 `.libra/libra.db`，不会打开捕获文件。
+两个数据库不会互相 ATTACH。
+
+比本发布更旧的二进制读不到这份目录。它们仍会打开仓库库，而捕获表已经不在那里。
+请继续使用本版本或更新的版本来读取已捕获的 session 与 checkpoint。
+
 `libra agent workspace list|show` 是 workspace 注册表（`workspace_record`）的
 只读机器接口：agent runtime 关联过的每个 linked worktree、task worktree 或
 remote workspace，含生命周期状态（`provisioning`/`active`/`releasing`/

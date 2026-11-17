@@ -241,6 +241,16 @@ libra agent mcp --stdio
 removes provider hooks, reports captured session/checkpoint state, exposes
 read-only diagnostics, and can push `refs/libra/traces` to a remote.
 
+The capture catalog (sessions, checkpoints, and the other capture tables)
+lives only in `.libra/private/capture.db`. On Unix, Libra creates the parent
+directory `.libra/private` with mode `0700` and the database file with mode
+`0600`. Repository commands such as `libra status` keep using `.libra/libra.db`
+and do not open the capture file. The two databases are never attached.
+
+Binaries older than this release cannot read that catalog. They still open
+the repository database, which no longer holds the capture tables. Use this
+release, or a newer one, to read captured sessions and checkpoints.
+
 `libra agent workspace list|show` is the read-only machine interface over
 the workspace registry (`workspace_record`): every linked worktree, task
 worktree, or remote workspace an agent runtime has associated, with its

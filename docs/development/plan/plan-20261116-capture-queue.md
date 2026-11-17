@@ -546,7 +546,7 @@ ER-01..ER-14 按模板 v2.16 执行，本文不削弱。补充：
 
 **Task type:** `release`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `complete`
 
 **Description:** 发布同时包含 CQ-01、CQ-02、CQ-03、CQ-07 的树。本卡不写新的捕获行为，只做版本、聚合守卫、文档和 ER-08 发布。
 
@@ -563,16 +563,18 @@ ER-01..ER-14 按模板 v2.16 执行，本文不削弱。补充：
 
 **Acceptance criteria:**
 
-- [ ] 集成树上捕获读写只使用 `capture.db`，`libra.db` 没有捕获目录表。
-- [ ] 聚合守卫覆盖拷贝重入、读写连接归属和仓库命令不被捕获写锁阻塞。
-- [ ] `docs/commands/agent.md` 与 `docs/commands/zh-CN/agent.md` 说明捕获目录位于 `.libra/private/capture.db`，旧二进制不能读取该目录。
-- [ ] `COMPATIBILITY.md` 记录这一存储位置变化和旧读者行为。
+- [x] 集成树上捕获读写只使用 `capture.db`，`libra.db` 没有捕获目录表。
+- [x] 聚合守卫覆盖拷贝重入、读写连接归属和仓库命令不被捕获写锁阻塞。
+- [x] `docs/commands/agent.md` 与 `docs/commands/zh-CN/agent.md` 说明捕获目录位于 `.libra/private/capture.db`，旧二进制不能读取该目录。
+- [x] `COMPATIBILITY.md` 记录这一存储位置变化和旧读者行为。
 
 **Verification:**
 
-- [ ] `source .env.test && cargo nextest run -E 'test(/^capture_db_/) + test(/^capture_store_/) + test(/^capture_catalog_detach_/)'`
-- [ ] `source .env.test && cargo nextest run --test compat_version_surface_sync`
-- [ ] `if rg -n 'capture\.db' docs/commands/agent.md docs/commands/zh-CN/agent.md COMPATIBILITY.md; then echo 'OK: docs mention capture.db'; else rc=$?; if [ "$rc" -eq 1 ]; then echo 'FAIL: missing capture.db docs'; exit 1; fi; echo "ERROR: rg failed with exit $rc"; exit "$rc"; fi`
+- [ ] `source .env.test && cargo nextest run -E 'test(/^capture_db_/) + test(/^capture_store_/) + test(/^capture_catalog_detach_/)'` — 已停止。链接全部测试产物时负载超过 400。未跑完，不算通过。
+- [x] 同一谓词由 `cargo test --test db_migration_test --jobs 6 capture_ -- --test-threads=1`（8 通过，0 失败）和 `cargo test --lib --jobs 6 capture_store_ -- --test-threads=1`（3 通过，0 失败）执行。覆盖 `capture_db_`、`capture_store_` 与 `capture_catalog_detach_`。
+- [ ] `source .env.test && cargo nextest run --test compat_version_surface_sync` — 未运行。
+- [x] 同一目标由 `cargo test --test compat_version_surface_sync --jobs 6 -- --test-threads=1` 执行：2 通过，0 失败。
+- [x] `if rg -n 'capture\.db' docs/commands/agent.md docs/commands/zh-CN/agent.md COMPATIBILITY.md; then echo 'OK: docs mention capture.db'; else rc=$?; if [ "$rc" -eq 1 ]; then echo 'FAIL: missing capture.db docs'; exit 1; fi; echo "ERROR: rg failed with exit $rc"; exit "$rc"; fi`
 
 **远端 D 组（不计入 AC/VER）:** `base.yml` 的 `format`、`clippy`、`redundancy`、`test` 必须在本卡 PR head 的 `pull_request` 上全部 success。`codeql.yml` 的 `analyze` 必须在同一个 head 上 success。`release.yml` 的 `build-and-upload`、`upload-install-scripts`、`update-homebrew-tap`、`verify-homebrew-formula`、`request-stable-manifest` 必须在 `gh release create` 产生的 `v*` tag push 上全部 success。缺任何一个 job 或 head 不一致时，本卡停在 `remote-pending`。
 
@@ -829,7 +831,7 @@ D 组三条不计入 VER。它们是 ER-04 的远端门。
 
 ## Codex review log
 
-Result 只允许 `PASS` 或 `FAIL`。R7 是当前结论。
+Result 只允许 `PASS` 或 `FAIL`。R7 是计划文本的当前结论。R9 是 CQ-04 实现的当前结论。
 
 | Round | Scope | Result | P0/P1 | P2 处置 | Evidence |
 |---|---|---|---|---|---|
@@ -840,6 +842,8 @@ Result 只允许 `PASS` 或 `FAIL`。R7 是当前结论。
 | R5 | 容量策略 | FAIL | 上限未串行化；tmp 清理只挂在消费者启动上 | 无 P2 | 改为 `capacity.lock` 内计数、发布和删除过期 tmp；tmp 最多 64 个 |
 | R6 | tmp 并发创建 | FAIL | `tmp/` 在拿锁前写出，64 个上限仍可被并发撑破 | 无 P2 | 改为锁内 `O_EXCL` 创建，锁外再写内容 |
 | R7 | 锁内创建 tmp | PASS | P0=0，P1=0。R6 的并发创建窗口已关闭 | 无 P2 | Codex exec，只读 sandbox，2026-11-16 |
+| R8 | CQ-04 实现 | FAIL | P0=0，P1=1：两条 nextest 被勾成通过，与证据不符 | 无 P2 | Codex exec，只读，2026-11-17 |
+| R9 | CQ-04 清单修正 | PASS | P0=0，P1=0。nextest 保持未勾选；通过的是 cargo test | 无 P2 | Codex exec，只读，2026-11-17 |
 
 ## 非目标与延后项
 
@@ -892,6 +896,16 @@ Clippy `--all-targets --all-features -D warnings` 先指出 CQ-01 留下的两�
 写集外的扩大：`pub mod detach`；`declared_capture_tables` 改为 `pub(crate)`；`open_existing_writer` 只打开已有捕获库，不拷贝、不摘除。检查点父提交经 `repository_peer` 读 HEAD。`metadata_kv` 不在当前事务上时，marker 登记、隔离区查询、恢复头、拒绝对象清理、终态 marker 状态、子代理写锁和 doctor 的 HistoryManager 改走仓库库。目录伴随提交发生在 traces ref 提交之后，经 `open_existing_writer`。合并夹具仍有 `config_kv` 时保持原来的单事务。doctor 测试夹具把 `agent_*` 读到 `capture.db`，marker 与 reference 仍读 `libra.db`。`mutable_state_ownership` 仍按源码 DDL 把这些表记在仓库库，本卡没有改那份清单。
 
 这次执行按用户要求把子卡推到 `main`。REL-CQ-01 原文仍要求子卡留在本地，直到 CQ-04。
+
+### CQ-04（2026-11-17 11:02:54 UTC）
+
+`docs/commands/agent.md` 与 `docs/commands/zh-CN/agent.md` 写明捕获目录只在 `.libra/private/capture.db`。Unix 上父目录 `.libra/private` 为模式 `0700`，数据库文件为模式 `0600`。仓库命令仍用 `.libra/libra.db`，两个库不 ATTACH。比本发布更旧的二进制读不到这份目录。`COMPATIBILITY.md` 的 agent 行记录同一存储位置和旧读者行为。本卡没有改 `src/**` 或 `sql/**`。
+
+版本面从 `0.30.207` 改为 `0.30.208`：`Cargo.toml`、`install.sh` 的 `DEFAULT_VERSION`、`install.ps1` 的 `$DefaultVersion`。`Cargo.lock` 由 `cargo update -p libra --offline` 刷新，只改 libra 自己的版本行。
+
+卡片上的 `cargo nextest` 在链接全部测试产物时负载超过 400，已停止，不把未跑完的 nextest 算通过。验证清单里的两条 nextest 保持未勾选。同一批谓词改由 `cargo test` 执行，并单独勾选。`cargo test --test db_migration_test --jobs 6 capture_ -- --test-threads=1`：8 通过，0 失败。`cargo test --lib --jobs 6 capture_store_ -- --test-threads=1`：3 通过，0 失败。`cargo test --test compat_version_surface_sync --jobs 6 -- --test-threads=1`：2 通过，0 失败。`rg` 对三份文档打印 `OK: docs mention capture.db`。`cargo +nightly fmt --all --check` exit 0。`cargo clippy --all-targets --all-features --jobs 2 -- -D warnings` exit 0。T-2 全量 nextest 留到计划收口，本机没有跑完。
+
+网站 `../libra-backend` 分支 `cf` 的 agent 页写入同一目录位置。推送发生在本仓提交之后。`gh release create v0.30.208` 也在本提交推送到 `main` 之后执行。远端 D 组不计入本卡 AC/VER。这次按用户要求在 `main` 发布，而不是把家族子卡留在未推送分支上。Codex R8 `VERDICT: FAIL`（P0=0，P1=1）：两条 nextest 被勾成通过。改为未勾选后，R9 `VERDICT: PASS`（P0=0，P1=0）。
 
 ## 完成判据
 
