@@ -2670,7 +2670,19 @@ async fn quarantine_stale_pending_artifact(
     scope: &CaptureScope,
     checkpoint_id: &str,
 ) -> Result<()> {
-    let txn = conn
+    // Pending headers and the workspace lease live in the repository database.
+    // A capture-only connection has neither table. The two files are not attached.
+    let repo = if crate::internal::db::connection_has_table(conn, "metadata_kv")
+        .await
+        .context("lock stale capture artifact quarantine")?
+    {
+        conn.clone()
+    } else {
+        crate::internal::db::repository_peer(conn)
+            .await
+            .context("lock stale capture artifact quarantine")?
+    };
+    let txn = repo
         .begin()
         .await
         .context("start stale capture artifact quarantine")?;
@@ -2782,7 +2794,7 @@ async fn scan_checkpoint_store(
             repo_path.join("objects"),
         )),
         repo_path.clone(),
-        Arc::new(conn.clone()),
+        Arc::new(index_conn.clone()),
     );
     let mut findings: Vec<CheckpointFinding> = Vec::new();
     let mut plans: Vec<RepairPlan> = Vec::new();
@@ -3000,7 +3012,7 @@ async fn scan_checkpoint_store(
     // untrusted JSON.
     let now_ms = Utc::now().timestamp_millis();
     let marker_entries = match crate::internal::metadata::MetadataKv::list_scope_with_conn(
-        conn,
+        &index_conn,
         crate::internal::metadata::MetadataScope::AgentTracesInflight,
     )
     .await

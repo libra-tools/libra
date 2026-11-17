@@ -1494,6 +1494,32 @@ pub(crate) async fn terminal_attempt_marker_status<C: ConnectionTrait>(
     checkpoint_id: &str,
     marker_generation: &str,
 ) -> Result<TerminalAttemptMarkerStatus> {
+    let on_connection = crate::internal::db::connection_has_table(conn, "metadata_kv")
+        .await
+        .context("read terminal traces marker state")?;
+    if !on_connection {
+        // Inflight markers stay in the repository database. Do not query
+        // `metadata_kv` on a capture transaction: a missing table aborts it.
+        let repo = crate::internal::db::open_cached_repository(&crate::utils::path::database())
+            .await
+            .context("read terminal traces marker state")?;
+        return terminal_attempt_marker_status_on(
+            &repo,
+            session_id,
+            checkpoint_id,
+            marker_generation,
+        )
+        .await;
+    }
+    terminal_attempt_marker_status_on(conn, session_id, checkpoint_id, marker_generation).await
+}
+
+async fn terminal_attempt_marker_status_on<C: ConnectionTrait>(
+    conn: &C,
+    session_id: &str,
+    checkpoint_id: &str,
+    marker_generation: &str,
+) -> Result<TerminalAttemptMarkerStatus> {
     let entry = crate::internal::metadata::MetadataKv::get_with_conn(
         conn,
         crate::internal::metadata::MetadataScope::AgentTracesInflight,
@@ -1729,6 +1755,329 @@ pub(crate) async fn register_traces_write_attempt_with_capture_scope_until(
     }
 }
 
+/// Marker registration when the catalog connection is `capture.db`.
+///
+/// The marker row stays in the repository `metadata_kv`. Catalog checks
+/// stay on `capture.db`. Those two writes are not one transaction: the
+/// databases are never attached.
+async fn register_split_capture_marker(
+    conn: &DatabaseConnection,
+    capture_scope: Option<&crate::internal::ai::capture_scope::CaptureScope>,
+    marker: &TracesInflightMarker,
+    coverage_fences: &[TracesCoverageFence<'_>],
+    expected_checkpoint_scope: Option<CheckpointScope>,
+    terminal_attempt_fence: Option<
+        &crate::internal::ai::capture::catalog::CaptureCatalogTerminalAttemptFence,
+    >,
+    deadline: Option<CaptureCommitDeadline>,
+) -> Result<TracesWriteAttemptPreparation> {
+    ensure_before_traces_marker_deadline(deadline)?;
+    validate_traces_coverage_fences(coverage_fences)?;
+    let repo = crate::internal::db::repository_peer(conn)
+        .await
+        .context("open the repository database for the checkpoint marker")?;
+    let txn = begin_traces_marker_write_transaction_until(
+        &repo,
+        deadline,
+        "begin traces writer-attempt registration",
+    )
+    .await?;
+    let catalog_txn = crate::internal::db::begin_catalog_or_repository_write(conn)
+        .await
+        .context("begin capture catalog check for checkpoint marker")?;
+    if let Some(scope) = capture_scope
+        && let Err(error) = await_traces_marker_precommit_read_until(
+            deadline,
+            "verify capture workspace lease before marker registration",
+            scope.assert_workspace_fence_live(&txn),
+        )
+        .await
+    {
+        txn.rollback().await.ok();
+        return Err(error);
+    }
+    // A terminal writer is elected by a prior catalog transaction because
+    // snapshot preparation may be expensive. Revalidate that opaque election
+    // under this *same* writer lock before publishing its marker: a changed
+    // source may have safely quarantined an unregistered attempt while this
+    // process was paused, and that stale writer must never append afterward.
+    if let Some(fence) = terminal_attempt_fence {
+        let marker_generation = marker.generation.as_deref().ok_or_else(|| {
+            anyhow!(
+                "terminal checkpoint writer marker has no generation before registration; inspect it with `libra agent doctor` before retrying"
+            )
+        })?;
+        let registration = match await_traces_marker_precommit_read_until(
+            deadline,
+            "verify catalog terminal attempt before marker registration",
+            async {
+                crate::internal::ai::capture::catalog::verify_terminal_attempt_registration(
+                    &catalog_txn,
+                    fence,
+                    &marker.attempt_id,
+                    marker_generation,
+                )
+                .await
+                .context("verify terminal attempt registration")
+            },
+        )
+        .await
+        {
+            Ok(registration) => registration,
+            Err(error) => {
+                txn.rollback().await.ok();
+                return Err(error);
+            }
+        };
+        match registration {
+            crate::internal::ai::capture::catalog::CaptureCatalogTerminalAttemptRegistration::Authorized => {}
+            crate::internal::ai::capture::catalog::CaptureCatalogTerminalAttemptRegistration::TerminalReceiptAlreadyComplete => {
+                let claim_set = await_traces_marker_precommit_read_until(
+                    deadline,
+                    "verify completed terminal coverage before acknowledgement",
+                    verify_completed_terminal_claim_set_with_conn(
+                        &catalog_txn,
+                        marker,
+                        expected_checkpoint_scope,
+                        coverage_fences,
+                    ),
+                )
+                .await;
+                txn.rollback().await.ok();
+                claim_set?;
+                return Ok(TracesWriteAttemptPreparation::Complete(
+                    TracesWriteAttemptRegistration::TerminalReceiptAlreadyComplete,
+                ));
+            }
+        }
+    }
+    let writable = match await_traces_marker_precommit_read_until(
+        deadline,
+        "verify traces writer session/tombstone barrier",
+        async {
+            catalog_txn
+                .query_one_raw(Statement::from_sql_and_values(
+                    catalog_txn.get_database_backend(),
+                    "SELECT 1 AS writable
+                 FROM agent_session s
+                 WHERE s.session_id = ?
+                   AND NOT EXISTS (
+                     SELECT 1 FROM agent_import_tombstone t
+                     WHERE t.agent_kind = s.agent_kind
+                       AND t.provider_session_id = s.provider_session_id
+                   )",
+                    [marker.session_id.clone().into()],
+                ))
+                .await
+                .context("query traces writer session/tombstone barrier")
+        },
+    )
+    .await
+    {
+        Ok(writable) => writable,
+        Err(error) => {
+            txn.rollback().await.ok();
+            return Err(error);
+        }
+    };
+    if writable.is_none() {
+        txn.rollback().await.ok();
+        bail!("agent session was erased or is unavailable for checkpoint writing");
+    }
+
+    // The optimistic replay probe happens before this call. Re-check the
+    // durable checkpoint under this same writer lock as marker registration:
+    // another delivery may have committed the ref/catalog and retired its
+    // marker while this delivery was between that probe and this transaction.
+    // A checkpoint id is globally unique, so a mismatched session/scope is a
+    // hard identity conflict rather than permission to append another ref.
+    if let Some(expected_scope) = expected_checkpoint_scope {
+        let committed = match await_traces_marker_precommit_read_until(
+            deadline,
+            "verify durable checkpoint before marker registration",
+            async {
+                catalog_txn
+                    .query_one_raw(Statement::from_sql_and_values(
+                        catalog_txn.get_database_backend(),
+                        "SELECT session_id, scope FROM agent_checkpoint
+                     WHERE checkpoint_id = ? LIMIT 1",
+                        [marker.attempt_id.clone().into()],
+                    ))
+                    .await
+                    .context("query durable checkpoint before marker registration")
+            },
+        )
+        .await
+        {
+            Ok(committed) => committed,
+            Err(error) => {
+                txn.rollback().await.ok();
+                return Err(error);
+            }
+        };
+        if let Some(committed) = committed {
+            let session_id: String = committed
+                .try_get_by("session_id")
+                .context("decode durable checkpoint session before marker registration")?;
+            let scope: String = committed
+                .try_get_by("scope")
+                .context("decode durable checkpoint scope before marker registration")?;
+            if session_id == marker.session_id && scope == expected_scope.as_str() {
+                let claims = await_traces_marker_precommit_read_until(
+                    deadline,
+                    "verify committed coverage before marker registration",
+                    verify_checkpoint_claim_set_with_conn(
+                        &catalog_txn,
+                        &marker.session_id,
+                        &marker.attempt_id,
+                        coverage_fences,
+                    ),
+                )
+                .await;
+                if let Err(error) = claims {
+                    txn.rollback().await.ok();
+                    return Err(error);
+                }
+            }
+            txn.rollback().await.ok();
+            if session_id == marker.session_id && scope == expected_scope.as_str() {
+                return Ok(TracesWriteAttemptPreparation::Complete(
+                    TracesWriteAttemptRegistration::AlreadyCommitted,
+                ));
+            }
+            bail!("checkpoint identity is already durably committed for another session or scope");
+        }
+    }
+    for fence in coverage_fences {
+        let owned = match await_traces_marker_precommit_read_until(
+            deadline,
+            "verify traces writer coverage fence",
+            async {
+                catalog_txn
+                    .query_one_raw(Statement::from_sql_and_values(
+                        catalog_txn.get_database_backend(),
+                        "SELECT 1 AS owned FROM agent_coverage_claim
+                     WHERE session_id = ? AND logical_turn_key = ?
+                       AND coverage_schema_version = ? AND state = ?
+                       AND owner = ? AND fence_token = ?
+                       AND coverage_digest = ? AND completeness = ? AND revision = ?",
+                        [
+                            marker.session_id.clone().into(),
+                            fence.logical_turn_key.into(),
+                            fence.coverage_schema_version.as_i64().into(),
+                            fence.reservation_state.into(),
+                            fence.owner.into(),
+                            fence.fence_token.into(),
+                            fence.coverage_digest.into(),
+                            fence.completeness.as_db_str().into(),
+                            fence.previous_revision()?.into(),
+                        ],
+                    ))
+                    .await
+                    .context("query traces writer coverage fence")
+            },
+        )
+        .await
+        {
+            Ok(owned) => owned,
+            Err(error) => {
+                txn.rollback().await.ok();
+                return Err(error);
+            }
+        };
+        if owned.is_none() {
+            txn.rollback().await.ok();
+            bail!("checkpoint coverage fence is no longer owned; checkpoint write aborted");
+        }
+    }
+
+    // A checkpoint id is replay-stable, so concurrent deliveries can arrive
+    // with the same persisted terminal generation. Do not turn that into an
+    // upsert race: an existing live marker owns the one active append, and a
+    // different generation is an explicit fence loss. Only an expired empty
+    // marker may be re-registered for a crash retry of the *same* generation.
+    let existing_marker = match await_traces_marker_precommit_read_until(
+        deadline,
+        "load existing traces writer marker before registration",
+        crate::internal::metadata::MetadataKv::get_with_conn(
+            &txn,
+            crate::internal::metadata::MetadataScope::AgentTracesInflight,
+            &marker.session_id,
+            &marker.attempt_id,
+        ),
+    )
+    .await
+    {
+        Ok(existing_marker) => existing_marker,
+        Err(error) => {
+            txn.rollback().await.ok();
+            return Err(error);
+        }
+    };
+    if let Some(entry) = existing_marker {
+        let existing =
+            decode_and_validate_traces_inflight_marker(&entry.value, &entry.target, &entry.key)?;
+        let requested_generation = marker.generation.as_deref().ok_or_else(|| {
+            anyhow!(
+                "checkpoint writer marker has no generation before registration; inspect it with `libra agent doctor` before retrying"
+            )
+        })?;
+        if existing.generation.as_deref() != Some(requested_generation) {
+            txn.rollback().await.ok();
+            bail!(
+                "checkpoint writer marker generation was fenced or replaced; retry the operation"
+            );
+        }
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        // Match the listing/maintenance consumers: a marker whose clock is
+        // implausibly ahead is corrupt, not a healthy long-lived writer.
+        // Returning an in-flight outcome here would hide the repair-needed
+        // state until the persisted future deadline elapsed.
+        if !existing.time_fields_trustworthy(now_ms) {
+            txn.rollback().await.ok();
+            bail!(
+                "checkpoint writer marker carries an implausible timestamp; inspect it with \
+                 `libra agent doctor` before retrying",
+            );
+        }
+        if existing.cleanup_pending {
+            txn.rollback().await.ok();
+            bail!("checkpoint writer marker requires durable cleanup before retrying");
+        }
+        if existing.is_live(now_ms) {
+            txn.rollback().await.ok();
+            return Ok(TracesWriteAttemptPreparation::Complete(
+                TracesWriteAttemptRegistration::AlreadyInFlightSameGeneration,
+            ));
+        }
+        // A live writer persists every newly created object into its marker
+        // before it can publish the ref/catalog transaction. That ownership
+        // evidence does not turn a healthy writer into a cleanup job: a
+        // duplicate must observe it as in-flight, not consume a terminal
+        // finalizer retry budget while the elected writer is appending.
+        if !existing.created_oids.is_empty() {
+            txn.rollback().await.ok();
+            bail!("checkpoint writer marker requires durable cleanup before retrying");
+        }
+    }
+    if let Err(error) = ensure_before_traces_marker_dml(deadline) {
+        txn.rollback().await.ok();
+        return Err(error).context("verify marker deadline before marker persistence");
+    }
+    catalog_txn
+        .rollback()
+        .await
+        .context("close capture catalog check for checkpoint marker")?;
+    if let Err(error) = write_traces_inflight_marker(&txn, marker)
+        .await
+        .context("register traces writer marker")
+    {
+        txn.rollback().await.ok();
+        return Err(error);
+    }
+    Ok(TracesWriteAttemptPreparation::Commit(txn))
+}
+
 async fn register_traces_write_attempt_with_capture_scope_prepare(
     conn: &DatabaseConnection,
     capture_scope: Option<&crate::internal::ai::capture_scope::CaptureScope>,
@@ -1740,6 +2089,21 @@ async fn register_traces_write_attempt_with_capture_scope_prepare(
     >,
     deadline: Option<CaptureCommitDeadline>,
 ) -> Result<TracesWriteAttemptPreparation> {
+    if !crate::internal::db::connection_has_table(conn, "metadata_kv")
+        .await
+        .context("inspect checkpoint marker database")?
+    {
+        return register_split_capture_marker(
+            conn,
+            capture_scope,
+            marker,
+            coverage_fences,
+            expected_checkpoint_scope,
+            terminal_attempt_fence,
+            deadline,
+        )
+        .await;
+    }
     ensure_before_traces_marker_deadline(deadline)?;
     validate_traces_coverage_fences(coverage_fences)?;
     let txn = begin_traces_marker_write_transaction_until(

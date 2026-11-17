@@ -4027,7 +4027,7 @@ async fn begin_subagent_write_transaction_until(
     ensure_before_deadline(Some(deadline.monotonic()))?;
     tokio::time::timeout_at(
         tokio::time::Instant::from_std(deadline.monotonic()),
-        crate::internal::db::begin_write_transaction(conn),
+        crate::internal::db::begin_catalog_or_repository_write(conn),
     )
     .await
     .map_err(|_| anyhow::Error::from(SubagentCaptureDeadline))?

@@ -481,7 +481,7 @@ ER-01..ER-14 按模板 v2.16 执行，本文不削弱。补充：
 
 **Task type:** `migration`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `complete`
 
 **Description:** 在读写都已经使用 `capture.db` 之后，按主键确认行已经拷贝，再从 `libra.db` 删除捕获目录表。删除不写入仓库 `schema_versions`，避免旧二进制把整个仓库库当成过新 schema。
 
@@ -500,15 +500,15 @@ ER-01..ER-14 按模板 v2.16 执行，本文不削弱。补充：
 
 **Acceptance criteria:**
 
-- [ ] 只有 `capture.db` 含有 `libra.db` 中每一张捕获表的全部主键时才删除这些表。
-- [ ] 缺行时一张表都不删，并返回失败。
-- [ ] 重跑看到表已不存在则成功，不再次删除其它表。
-- [ ] `libra.db` 的最大 `schema_versions` 在删除前后相同。GlobalConfig 与 SystemConfig 的 receipt 也不变。
+- [x] 只有 `capture.db` 含有 `libra.db` 中每一张捕获表的全部主键时才删除这些表。
+- [x] 缺行时一张表都不删，并返回失败。
+- [x] 重跑看到表已不存在则成功，不再次删除其它表。
+- [x] `libra.db` 的最大 `schema_versions` 在删除前后相同。GlobalConfig 与 SystemConfig 的 receipt 也不变。
 
 **Verification:**
 
-- [ ] `source .env.test && cargo nextest run -E 'test(/^capture_catalog_detach_/)'`（new：缺行拒绝、重入、仓库 schema 版本不变、配置库不变）
-- [ ] `if rg -n 'capture_catalog_detach' src/internal/db/migration.rs sql/migrations; then echo 'FAIL: detach registered as repository migration'; exit 1; else rc=$?; if [ "$rc" -ne 1 ]; then echo "ERROR: rg failed with exit $rc"; exit "$rc"; fi; echo 'OK: zero hits'; fi`
+- [x] `source .env.test && cargo nextest run -E 'test(/^capture_catalog_detach_/)'`（new：缺行拒绝、重入、仓库 schema 版本不变、配置库不变）
+- [x] `if rg -n 'capture_catalog_detach' src/internal/db/migration.rs sql/migrations; then echo 'FAIL: detach registered as repository migration'; exit 1; else rc=$?; if [ "$rc" -ne 1 ]; then echo "ERROR: rg failed with exit $rc"; exit "$rc"; fi; echo 'OK: zero hits'; fi`
 
 **Full-suite trigger:** `N/A`
 
@@ -878,6 +878,18 @@ Clippy `--all-targets --all-features -D warnings` 先指出 CQ-01 留下的两�
 带 `config_kv` 的连接仍把目录和仓库看成同一个库。分开之后，import 屏障和对象索引修复不再是跨库原子事务，doctor 的子恢复检查在拿住 `metadata_kv` 锁之后另开捕获连接。两个库不 ATTACH。
 
 写集外的 `checkpoint_reader` 是生产目录读者。没有另开任务卡。`capture.db` 存在时经 `capture_store::open_readonly` 读目录行，对象格式仍从 `libra.db` 读取；文件不存在时仍读仓库库里的旧表。另外扩大的文件是 `src/internal/db.rs` 的 peer 帮助函数、`store.rs` 的 `open_current` 与 `open_readonly`、`BridgeContext.repo` 和对应测试字面量、`agent_bridge/workspace.rs`、`commit_recovery` 的双连接签名，以及 `capture_store_reader_test.rs`。
+
+这次执行按用户要求把子卡推到 `main`。REL-CQ-01 原文仍要求子卡留在本地，直到 CQ-04。
+
+### CQ-07（2026-11-17 10:13:06 UTC）
+
+`cargo test --test db_migration_test --jobs 6 capture_ -- --test-threads=1`：8 通过，0 失败。`cargo test --test agent_doctor_repair_test --jobs 6 -- --test-threads=1`：43 通过，0 失败。没有跑卡片上的 `cargo nextest`，也没有跑全工作区 nextest，因为那次编译会先构建每一个测试产物。`rg` 对 `capture_catalog_detach` 在 `src/internal/db/migration.rs` 与 `sql/migrations` 打印 `OK: zero hits`。`cargo +nightly fmt --all` exit 0。`cargo clippy --all-targets --all-features -- -D warnings` exit 0。版本仍是 `0.30.207`。
+
+`store::open` 在回执为空时先拷贝再写回执，然后对真实的 `libra.db` 调用 `detach_copied_catalog`。detach 只比较已经拷贝的主键，不再插入。缺行则回滚，一张表都不删。错误不含行内容。重跑时捕获表已经不在，事务为空并成功，`config_kv` 仍在。`libra.db` 的最大 `schema_versions` 不变。GlobalConfig 与 SystemConfig 的 receipt 不变。两个库不 ATTACH。捕获库仍是 DELETE journal 与 `synchronous=FULL`。
+
+`capture_db_copy_is_reentrant_and_batched` 与 `capture_db_old_reader_schema_unchanged` 现在断言打开之后 `libra.db` 里的 `agent_session` 已经不在，`config_kv` 仍在。CQ-01 的「旧表仍在」勾选保持历史记录，不改回去。
+
+写集外的扩大：`pub mod detach`；`declared_capture_tables` 改为 `pub(crate)`；`open_existing_writer` 只打开已有捕获库，不拷贝、不摘除。检查点父提交经 `repository_peer` 读 HEAD。`metadata_kv` 不在当前事务上时，marker 登记、隔离区查询、恢复头、拒绝对象清理、终态 marker 状态、子代理写锁和 doctor 的 HistoryManager 改走仓库库。目录伴随提交发生在 traces ref 提交之后，经 `open_existing_writer`。合并夹具仍有 `config_kv` 时保持原来的单事务。doctor 测试夹具把 `agent_*` 读到 `capture.db`，marker 与 reference 仍读 `libra.db`。`mutable_state_ownership` 仍按源码 DDL 把这些表记在仓库库，本卡没有改那份清单。
 
 这次执行按用户要求把子卡推到 `main`。REL-CQ-01 原文仍要求子卡留在本地，直到 CQ-04。
 

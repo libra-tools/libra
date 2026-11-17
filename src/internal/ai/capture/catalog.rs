@@ -7215,10 +7215,35 @@ async fn verify_artifact_registration_authority(
     consume_manual_registration: bool,
 ) -> Result<(), CaptureCatalogError> {
     let Some(manual) = &fence.manual_artifact else {
-        let quarantined = txn.query_one_raw(Statement::from_sql_and_values(txn.get_database_backend(),
-            "SELECT 1 FROM metadata_kv WHERE scope='agent_capture_quarantine' AND target=? AND key=? LIMIT 1",
-            [fence.scope.repo_id.clone().into(), checkpoint_id.into()],
-        )).await.map_err(|_| CaptureCatalogError::Database)?;
+        let quarantine_sql = "SELECT 1 FROM metadata_kv WHERE scope='agent_capture_quarantine' AND target=? AND key=? LIMIT 1";
+        let quarantine_values = [fence.scope.repo_id.clone().into(), checkpoint_id.into()];
+        // Check the table first. A missing `metadata_kv` query aborts the
+        // catalog transaction, so the fallback cannot run after that error.
+        let on_catalog = crate::internal::db::connection_has_table(txn, "metadata_kv")
+            .await
+            .map_err(|_| CaptureCatalogError::Database)?;
+        let quarantined = if on_catalog {
+            txn.query_one_raw(Statement::from_sql_and_values(
+                txn.get_database_backend(),
+                quarantine_sql,
+                quarantine_values,
+            ))
+            .await
+            .map_err(|_| CaptureCatalogError::Database)?
+        } else {
+            // Quarantine rows stay in the repository database. A capture
+            // transaction cannot see them, and the two files are not attached.
+            let repo = crate::internal::db::open_cached_repository(&crate::utils::path::database())
+                .await
+                .map_err(|_| CaptureCatalogError::Database)?;
+            repo.query_one_raw(Statement::from_sql_and_values(
+                repo.get_database_backend(),
+                quarantine_sql,
+                quarantine_values,
+            ))
+            .await
+            .map_err(|_| CaptureCatalogError::Database)?
+        };
         return if quarantined.is_none() {
             Ok(())
         } else {

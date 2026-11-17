@@ -4448,6 +4448,24 @@ impl<'a> TracesCheckpointStore<'a> {
         .await
     }
 
+    /// Repository connection for refs, object index, and writer markers.
+    ///
+    /// Catalog writes use `self.conn`. A combined database that still has
+    /// `metadata_kv` is its own repository peer.
+    async fn repository_connection(
+        &self,
+        stage: CheckpointStoreStage,
+    ) -> Result<DatabaseConnection, CheckpointStoreError> {
+        let failure = CheckpointStoreError::StoreFailure { stage };
+        match crate::internal::db::connection_has_table(self.conn, "metadata_kv").await {
+            Ok(true) => Ok(self.conn.clone()),
+            Ok(false) => crate::internal::db::repository_peer(self.conn)
+                .await
+                .map_err(|_| failure),
+            Err(_) => Err(failure),
+        }
+    }
+
     async fn retire_ordinary_marker(
         &self,
         deadline: Option<CaptureCommitDeadline>,
@@ -4455,6 +4473,9 @@ impl<'a> TracesCheckpointStore<'a> {
         if deadline.is_some_and(|deadline| Instant::now() >= deadline.monotonic()) {
             return Err(CheckpointStoreError::DeadlineExceeded);
         }
+        let marker_conn = self
+            .repository_connection(CheckpointStoreStage::Cleanup)
+            .await?;
         #[cfg(test)]
         if test_support::take_fault(test_support::CheckpointFaultPoint::MarkerCleanup) {
             return Err(CheckpointStoreError::StoreFailure {
@@ -4464,7 +4485,7 @@ impl<'a> TracesCheckpointStore<'a> {
         let cleared = match deadline {
             Some(deadline) => {
                 traces::clear_non_cleanup_traces_inflight_marker_with_capture_scope_until(
-                    self.conn,
+                    &marker_conn,
                     self.capture_scope.as_ref(),
                     &self.marker.session_id,
                     &self.marker.attempt_id,
@@ -4475,7 +4496,7 @@ impl<'a> TracesCheckpointStore<'a> {
             }
             None => {
                 traces::clear_non_cleanup_traces_inflight_marker_with_capture_scope(
-                    self.conn,
+                    &marker_conn,
                     self.capture_scope.as_ref(),
                     &self.marker.session_id,
                     &self.marker.attempt_id,
@@ -4541,9 +4562,12 @@ impl<'a> TracesCheckpointStore<'a> {
             .map_err(|_| CheckpointStoreError::StoreFailure {
             stage: CheckpointStoreStage::Marker,
         })?;
+        let marker_conn = self
+            .repository_connection(CheckpointStoreStage::Marker)
+            .await?;
         let txn = tokio::time::timeout_at(
             tokio::time::Instant::from_std(recovery_deadline.monotonic()),
-            crate::internal::db::begin_write_transaction(self.conn),
+            crate::internal::db::begin_write_transaction(&marker_conn),
         )
         .await
         .map_err(|_| CheckpointStoreError::StoreFailure {
@@ -4981,10 +5005,15 @@ impl CheckpointStore for TracesCheckpointStore<'_> {
                 crate::utils::client_storage::ClientStorage::init_local_existing(objects_dir),
             ),
         };
+        // Objects, the traces ref, and writer markers stay in `libra.db`.
+        // A combined test database still has `metadata_kv` on `self.conn`.
+        let history_conn = self
+            .repository_connection(CheckpointStoreStage::ObjectWrite)
+            .await?;
         let manager = crate::internal::ai::history::HistoryManager::for_traces(
             storage,
             self.repo_path.clone(),
-            std::sync::Arc::new(self.conn.clone()),
+            std::sync::Arc::new(history_conn),
         );
         #[cfg(test)]
         let manager = test_support::with_history_fault(manager);

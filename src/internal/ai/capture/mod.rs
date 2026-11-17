@@ -12,6 +12,7 @@
 pub(crate) mod catalog;
 pub(crate) mod checkpoint;
 pub(crate) mod coordinator;
+pub mod detach;
 pub(crate) mod diagnostics;
 pub(crate) mod extraction;
 pub use extraction::deadline_provider_extraction_summary;

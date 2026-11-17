@@ -72,12 +72,15 @@ pub async fn open(storage_root: &Path, busy_timeout: Duration) -> io::Result<Dat
     reject_symlink(&db_path)?;
     let conn = connect_capture(&db_path, busy_timeout).await?;
     ensure_capture_schema(&conn).await?;
+    let repository = storage_root.join(util::DATABASE);
     if !copy_receipt_present(&conn).await? {
-        let repository = storage_root.join(util::DATABASE);
         if repository.is_file() && !repository_is_symlink(&repository)? {
             copy_catalog_from_repository(&conn, &repository).await?;
         }
         write_copy_receipt(&conn).await?;
+    }
+    if repository.is_file() && !repository_is_symlink(&repository)? {
+        super::detach::detach_copied_catalog(&conn, &repository).await?;
     }
     Ok(conn)
 }
@@ -100,6 +103,28 @@ pub async fn open_readonly(
     }
     reject_symlink(&db_path)?;
     connect_capture_file(&db_path, busy_timeout, true).await
+}
+
+/// Open an existing capture database for a catalog write.
+///
+/// Does not copy rows and does not detach. Detach takes an immediate lock on
+/// `libra.db`, and the caller may already hold the traces-ref transaction on
+/// that file. The two databases are never attached.
+pub async fn open_existing_writer(
+    storage_root: &Path,
+    busy_timeout: Duration,
+) -> io::Result<DatabaseConnection> {
+    let db_path = capture_database_path(storage_root);
+    if !db_path.is_file() {
+        return Err(io::Error::new(
+            ErrorKind::NotFound,
+            "capture database is not present",
+        ));
+    }
+    reject_symlink(&db_path)?;
+    let conn = connect_capture(&db_path, busy_timeout).await?;
+    ensure_capture_schema(&conn).await?;
+    Ok(conn)
 }
 
 /// Copy capture-catalog rows from a repository database into an open capture
@@ -157,7 +182,7 @@ pub async fn copy_catalog_from_repository(
     Ok(())
 }
 
-fn declared_capture_tables() -> Vec<String> {
+pub(crate) fn declared_capture_tables() -> Vec<String> {
     let mut tables = Vec::new();
     for line in schema::CAPTURE_DATABASE_SQL.lines() {
         let trimmed = line.trim();

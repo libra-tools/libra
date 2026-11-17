@@ -685,7 +685,16 @@ struct CheckpointCommitTxnExtra<'a> {
 #[async_trait::async_trait]
 impl TracesTxnExtra for CheckpointCommitTxnExtra<'_> {
     async fn apply(&self, txn: &DatabaseTransaction, ctx: &TracesCommitCtx) -> Result<()> {
-        if let Some(extra) = self.extra {
+        // A combined database still commits the catalog in this ref
+        // transaction. After detach, `agent_checkpoint` lives only in
+        // `capture.db`. That write happens after this ref commit; the two
+        // files are never attached, so a later catalog failure cannot roll
+        // the ref back.
+        let catalog_on_ref_transaction =
+            crate::internal::db::connection_has_table(txn, "agent_checkpoint")
+                .await
+                .context("inspect checkpoint catalog tables")?;
+        if catalog_on_ref_transaction && let Some(extra) = self.extra {
             extra.apply(txn, ctx).await?;
         }
         // `update_ref_if_matches_with_extra` checks scope before it begins
@@ -2993,6 +3002,60 @@ impl HistoryManager {
         unreachable!("sqlite busy retry loop must return on success or terminal error")
     }
 
+    /// Write the checkpoint catalog after the traces ref has committed.
+    ///
+    /// A database that still contains `agent_checkpoint` already wrote the
+    /// catalog inside the ref transaction. After detach, that table is only
+    /// in `capture.db`. The ref stays committed if this later write fails;
+    /// the two files are never attached.
+    async fn commit_capture_catalog_after_ref(
+        &self,
+        extra: Option<&dyn TracesTxnExtra>,
+        capture_scope: Option<&CaptureScope>,
+        ctx: &TracesCommitCtx,
+        deadline: Option<CaptureCommitDeadline>,
+    ) -> Result<()> {
+        // Unscoped extras already ran inside the ref transaction. Only the
+        // scoped companion defers its catalog write when the table is absent.
+        if capture_scope.is_none() {
+            return Ok(());
+        }
+        if crate::internal::db::connection_has_table(self.db_conn.as_ref(), "agent_checkpoint")
+            .await
+            .context("inspect checkpoint catalog tables")?
+        {
+            return Ok(());
+        }
+        let Some(extra) = extra else {
+            return Ok(());
+        };
+        let capture = crate::internal::ai::capture::store::open_existing_writer(
+            &self.repo_path,
+            crate::internal::ai::capture::store::COMMAND_BUSY_TIMEOUT,
+        )
+        .await
+        .context("open the capture database for the checkpoint catalog")?;
+        let txn = crate::internal::db::begin_catalog_or_repository_write(&capture)
+            .await
+            .context("begin the capture catalog transaction after the traces ref update")?;
+        if let Err(error) = extra.apply(&txn, ctx).await {
+            let _ = txn.rollback().await;
+            return Err(error.context(
+                "write the checkpoint catalog in the capture database after the traces ref update",
+            ));
+        }
+        if let Some(scope) = capture_scope.filter(|scope| scope.workspace_id.is_none())
+            && let Err(error) = scope.authorize_final_commit_until(&txn, deadline).await
+        {
+            let _ = txn.rollback().await;
+            return Err(anyhow!(error)
+                .context("authorize the checkpoint catalog commit in the capture database"));
+        }
+        txn.commit()
+            .await
+            .context("commit the checkpoint catalog in the capture database")
+    }
+
     async fn update_ref_if_matches(
         &self,
         ref_name: &str,
@@ -3902,6 +3965,13 @@ impl HistoryManager {
                 .await?
             {
                 RefUpdateOutcome::Updated => {
+                    self.commit_capture_catalog_after_ref(
+                        params.txn_extra,
+                        params.capture_scope,
+                        &commit_ctx,
+                        params.deadline,
+                    )
+                    .await?;
                     return Ok(CheckpointCommit {
                         commit_hash,
                         tree_oid: new_root,
@@ -3929,6 +3999,54 @@ impl HistoryManager {
         ))
     }
 
+    /// Whether `agent_checkpoint` already records this attempt.
+    ///
+    /// A combined database answers from `conn`. After detach the catalog is
+    /// only in `capture.db`, which is never attached to the repository.
+    async fn checkpoint_is_cataloged<C: ConnectionTrait>(
+        &self,
+        conn: &C,
+        checkpoint_id: &str,
+    ) -> Result<bool> {
+        let sql = "SELECT 1 FROM agent_checkpoint WHERE checkpoint_id = ?";
+        let values = vec![checkpoint_id.to_string().into()];
+        if crate::internal::db::connection_has_table(conn, "agent_checkpoint")
+            .await
+            .context("inspect checkpoint catalog for rejected object cleanup")?
+        {
+            return Ok(conn
+                .query_one_raw(Statement::from_sql_and_values(
+                    conn.get_database_backend(),
+                    sql,
+                    values,
+                ))
+                .await
+                .context("verify rejected checkpoint cleanup candidate")?
+                .is_some());
+        }
+        let capture = match crate::internal::ai::capture::store::open_readonly(
+            &self.repo_path,
+            crate::internal::ai::capture::store::COMMAND_BUSY_TIMEOUT,
+        )
+        .await
+        {
+            Ok(capture) => capture,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => {
+                return Err(error).context("open the capture database for rejected object cleanup");
+            }
+        };
+        Ok(capture
+            .query_one_raw(Statement::from_sql_and_values(
+                capture.get_database_backend(),
+                sql,
+                values,
+            ))
+            .await
+            .context("verify rejected checkpoint cleanup candidate in the capture database")?
+            .is_some())
+    }
+
     async fn rejected_cleanup_db_snapshot<C: ConnectionTrait>(
         &self,
         conn: &C,
@@ -3945,15 +4063,11 @@ impl HistoryManager {
                 || !marker.is_live(now_ms)
                 || !marker.time_fields_trustworthy(now_ms)
         }) {
-            let cataloged = conn
-                .query_one_raw(Statement::from_sql_and_values(
-                    conn.get_database_backend(),
-                    "SELECT 1 FROM agent_checkpoint WHERE checkpoint_id = ?",
-                    [marker.attempt_id.clone().into()],
-                ))
+            let cataloged = self
+                .checkpoint_is_cataloged(conn, &marker.attempt_id)
                 .await
                 .context("verify rejected checkpoint cleanup candidate")?;
-            if cataloged.is_none() {
+            if !cataloged {
                 candidates.extend(marker.created_oids.iter().cloned());
             }
         }

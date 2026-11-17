@@ -2033,6 +2033,39 @@ pub(crate) async fn gc_parent_roots<C: ConnectionTrait>(conn: &C) -> Result<Vec<
     Ok(roots)
 }
 
+async fn metadata_presence<C: ConnectionTrait>(
+    conn: &C,
+    sql: &str,
+    values: Vec<sea_orm::Value>,
+    context: &'static str,
+) -> Result<bool> {
+    let statement = |backend, values| Statement::from_sql_and_values(backend, sql, values);
+    match conn
+        .query_one_raw(statement(conn.get_database_backend(), values.clone()))
+        .await
+    {
+        Ok(row) => Ok(row.is_some()),
+        Err(error) => {
+            let on_connection = crate::internal::db::connection_has_table(conn, "metadata_kv")
+                .await
+                .context(context)?;
+            if on_connection {
+                return Err(error).context(context);
+            }
+            // Recovery headers stay in the repository database. A capture
+            // transaction cannot see them, and the two files are not attached.
+            let repo = crate::internal::db::open_cached_repository(&crate::utils::path::database())
+                .await
+                .context(context)?;
+            Ok(repo
+                .query_one_raw(statement(repo.get_database_backend(), values))
+                .await
+                .context(context)?
+                .is_some())
+        }
+    }
+}
+
 pub(crate) async fn has_header_for_checkpoint<C: ConnectionTrait>(
     conn: &C,
     repo_id: &str,
@@ -2042,11 +2075,14 @@ pub(crate) async fn has_header_for_checkpoint<C: ConnectionTrait>(
         uuid::Uuid::parse_str(checkpoint).is_ok_and(|id| id.to_string() == checkpoint),
         "invalid capture artifact cleanup identity; run `libra agent doctor`"
     );
-    Ok(conn.query_one_raw(Statement::from_sql_and_values(
-        conn.get_database_backend(),
+    metadata_presence(
+        conn,
         "SELECT 1 FROM metadata_kv WHERE scope IN ('agent_capture_pending', 'agent_capture_quarantine')
-          AND target = ? AND key = ? LIMIT 1", [repo_id.into(), checkpoint.into()],
-    )).await.context("cannot inspect capture recovery header; run `libra agent doctor`")?.is_some())
+          AND target = ? AND key = ? LIMIT 1",
+        vec![repo_id.into(), checkpoint.into()],
+        "cannot inspect capture recovery header; run `libra agent doctor`",
+    )
+    .await
 }
 
 /// Native-redelivery ownership probe: an authenticated artifact (pending or
@@ -2063,20 +2099,90 @@ pub(crate) async fn retains_unpublished_artifact_for_checkpoint<C: ConnectionTra
         uuid::Uuid::parse_str(checkpoint).is_ok_and(|id| id.to_string() == checkpoint),
         "invalid capture artifact identity; run `libra agent doctor`"
     );
-    Ok(conn
-        .query_one_raw(Statement::from_sql_and_values(
+    let context = "cannot inspect retained capture recovery evidence; run `libra agent doctor`";
+    let has_headers = crate::internal::db::connection_has_table(conn, "metadata_kv")
+        .await
+        .context(context)?;
+    let has_checkpoints = crate::internal::db::connection_has_table(conn, "agent_checkpoint")
+        .await
+        .context(context)?;
+    if has_headers && has_checkpoints {
+        return Ok(conn
+            .query_one_raw(Statement::from_sql_and_values(
+                conn.get_database_backend(),
+                "SELECT 1 FROM metadata_kv AS p
+                  WHERE p.scope IN ('agent_capture_pending', 'agent_capture_quarantine')
+                    AND p.target = ? AND p.key = ?
+                    AND NOT EXISTS (SELECT 1 FROM agent_checkpoint AS c
+                      WHERE c.checkpoint_id = p.key)
+                  LIMIT 1",
+                [repo_id.into(), checkpoint.into()],
+            ))
+            .await
+            .context(context)?
+            .is_some());
+    }
+    // The header and the published checkpoint row live in different files.
+    // Query each one where it exists. The two files are not attached.
+    let header_sql = "SELECT 1 FROM metadata_kv
+          WHERE scope IN ('agent_capture_pending', 'agent_capture_quarantine')
+            AND target = ? AND key = ? LIMIT 1";
+    let header_values = vec![repo_id.into(), checkpoint.into()];
+    let header_present = if has_headers {
+        conn.query_one_raw(Statement::from_sql_and_values(
             conn.get_database_backend(),
-            "SELECT 1 FROM metadata_kv AS p
-              WHERE p.scope IN ('agent_capture_pending', 'agent_capture_quarantine')
-                AND p.target = ? AND p.key = ?
-                AND NOT EXISTS (SELECT 1 FROM agent_checkpoint AS c
-                  WHERE c.checkpoint_id = p.key)
-              LIMIT 1",
-            [repo_id.into(), checkpoint.into()],
+            header_sql,
+            header_values,
         ))
         .await
-        .context("cannot inspect retained capture recovery evidence; run `libra agent doctor`")?
-        .is_some())
+        .context(context)?
+        .is_some()
+    } else {
+        let repo = crate::internal::db::open_cached_repository(&crate::utils::path::database())
+            .await
+            .context(context)?;
+        repo.query_one_raw(Statement::from_sql_and_values(
+            repo.get_database_backend(),
+            header_sql,
+            header_values,
+        ))
+        .await
+        .context(context)?
+        .is_some()
+    };
+    if !header_present {
+        return Ok(false);
+    }
+    let published_sql = "SELECT 1 FROM agent_checkpoint WHERE checkpoint_id = ? LIMIT 1";
+    let published = if has_checkpoints {
+        conn.query_one_raw(Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            published_sql,
+            [checkpoint.into()],
+        ))
+        .await
+        .context(context)?
+        .is_some()
+    } else {
+        let storage_root = crate::utils::path::database()
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .context(context)?;
+        match super::store::open_readonly(&storage_root, super::store::COMMAND_BUSY_TIMEOUT).await {
+            Ok(capture) => capture
+                .query_one_raw(Statement::from_sql_and_values(
+                    capture.get_database_backend(),
+                    published_sql,
+                    [checkpoint.into()],
+                ))
+                .await
+                .context(context)?
+                .is_some(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error).context(context),
+        }
+    };
+    Ok(!published)
 }
 
 pub(crate) async fn has_pending_header_for_checkpoint<C: ConnectionTrait>(
@@ -2088,26 +2194,24 @@ pub(crate) async fn has_pending_header_for_checkpoint<C: ConnectionTrait>(
         uuid::Uuid::parse_str(checkpoint).is_ok_and(|id| id.to_string() == checkpoint),
         "invalid capture artifact cleanup identity; run `libra agent doctor`"
     );
-    Ok(conn
-        .query_one_raw(Statement::from_sql_and_values(
-            conn.get_database_backend(),
-            "SELECT 1 FROM metadata_kv WHERE scope = 'agent_capture_pending'
-              AND target = ? AND key = ?
-              AND CASE WHEN value_type = 'text' AND typeof(value) = 'text'
-                    AND length(CAST(value AS BLOB)) <= 8192
-                    THEN CASE WHEN json_valid(value)
-                               AND json_type(value, '$.manual_attempted') = 'true'
-                              THEN 0 ELSE 1 END
-                    ELSE 1 END = 1
-              AND NOT EXISTS (SELECT 1 FROM metadata_kv AS q
-                WHERE q.scope = 'agent_capture_quarantine'
-                  AND q.target = metadata_kv.target AND q.key = metadata_kv.key)
-              LIMIT 1",
-            [repo_id.into(), checkpoint.into()],
-        ))
-        .await
-        .context("cannot inspect pending capture recovery header; run `libra agent doctor`")?
-        .is_some())
+    metadata_presence(
+        conn,
+        "SELECT 1 FROM metadata_kv WHERE scope = 'agent_capture_pending'
+          AND target = ? AND key = ?
+          AND CASE WHEN value_type = 'text' AND typeof(value) = 'text'
+                AND length(CAST(value AS BLOB)) <= 8192
+                THEN CASE WHEN json_valid(value)
+                           AND json_type(value, '$.manual_attempted') = 'true'
+                          THEN 0 ELSE 1 END
+                ELSE 1 END = 1
+          AND NOT EXISTS (SELECT 1 FROM metadata_kv AS q
+            WHERE q.scope = 'agent_capture_quarantine'
+              AND q.target = metadata_kv.target AND q.key = metadata_kv.key)
+          LIMIT 1",
+        vec![repo_id.into(), checkpoint.into()],
+        "cannot inspect pending capture recovery header; run `libra agent doctor`",
+    )
+    .await
 }
 
 pub(crate) async fn has_manual_attempted_header_for_checkpoint<C: ConnectionTrait>(
@@ -2119,22 +2223,20 @@ pub(crate) async fn has_manual_attempted_header_for_checkpoint<C: ConnectionTrai
         uuid::Uuid::parse_str(checkpoint).is_ok_and(|id| id.to_string() == checkpoint),
         "invalid capture artifact cleanup identity; run `libra agent doctor`"
     );
-    Ok(conn
-        .query_one_raw(Statement::from_sql_and_values(
-            conn.get_database_backend(),
-            "SELECT 1 FROM metadata_kv WHERE scope IN ('agent_capture_pending', 'agent_capture_quarantine')
-              AND target = ? AND key = ?
-              AND CASE WHEN value_type = 'text' AND typeof(value) = 'text'
-                    AND length(CAST(value AS BLOB)) <= 8192
-                    THEN CASE WHEN json_valid(value)
-                               AND json_type(value, '$.manual_attempted') = 'true'
-                              THEN 1 ELSE 0 END
-                    ELSE 0 END = 1 LIMIT 1",
-            [repo_id.into(), checkpoint.into()],
-        ))
-        .await
-        .context("cannot inspect capture recovery attempt state; run `libra agent doctor`")?
-        .is_some())
+    metadata_presence(
+        conn,
+        "SELECT 1 FROM metadata_kv WHERE scope IN ('agent_capture_pending', 'agent_capture_quarantine')
+          AND target = ? AND key = ?
+          AND CASE WHEN value_type = 'text' AND typeof(value) = 'text'
+                AND length(CAST(value AS BLOB)) <= 8192
+                THEN CASE WHEN json_valid(value)
+                           AND json_type(value, '$.manual_attempted') = 'true'
+                          THEN 1 ELSE 0 END
+                ELSE 0 END = 1 LIMIT 1",
+        vec![repo_id.into(), checkpoint.into()],
+        "cannot inspect capture recovery attempt state; run `libra agent doctor`",
+    )
+    .await
 }
 
 /// Artifact-only policy routing for a catalog-fenced receipt. Even malformed
@@ -2145,6 +2247,36 @@ pub(crate) async fn quarantine_checkpoint_if_present(
     repo_id: &str,
     checkpoint: &str,
 ) -> Result<bool> {
+    let headers_here = crate::internal::db::connection_has_table(txn, "metadata_kv")
+        .await
+        .context("cannot lock capture recovery quarantine; run `libra agent doctor`")?;
+    if !headers_here {
+        // Recovery headers stay in the repository database. Do not query
+        // `metadata_kv` on this catalog transaction: a missing table aborts it.
+        // The repository write commits on its own; the two files are not attached.
+        let repo = crate::internal::db::open_cached_repository(&crate::utils::path::database())
+            .await
+            .context("cannot lock capture recovery quarantine; run `libra agent doctor`")?;
+        let repo_txn = crate::internal::db::begin_write_transaction(&repo)
+            .await
+            .context("cannot lock capture recovery quarantine; run `libra agent doctor`")?;
+        let moved = Box::pin(quarantine_checkpoint_if_present(
+            &repo_txn, repo_id, checkpoint,
+        ))
+        .await;
+        return match moved {
+            Ok(true) => {
+                repo_txn.commit().await.context(
+                    "cannot retain exhausted capture artifact; run `libra agent doctor`",
+                )?;
+                Ok(true)
+            }
+            other => {
+                let _ = repo_txn.rollback().await;
+                other
+            }
+        };
+    }
     txn.execute_unprepared("UPDATE metadata_kv SET updated_at = updated_at WHERE 0")
         .await
         .context("cannot lock capture recovery quarantine; run `libra agent doctor`")?;

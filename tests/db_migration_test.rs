@@ -7807,16 +7807,15 @@ async fn capture_db_copy_is_reentrant_and_batched() {
         capture_count(&capture, "agent_session").await,
         (CAPTURE_COPY_BATCH + 1) as i64
     );
-    assert_eq!(
-        capture_count(
-            &db::establish_connection(repository.to_str().unwrap())
-                .await
-                .unwrap(),
-            "agent_session"
-        )
-        .await,
-        (CAPTURE_COPY_BATCH + 1) as i64
+    let source = db::establish_connection(repository.to_str().unwrap())
+        .await
+        .unwrap();
+    assert!(
+        !capture_has_table(&source, "agent_session").await,
+        "a complete copy removes the repository capture table"
     );
+    assert!(capture_has_table(&source, "config_kv").await);
+    source.close().await.unwrap();
     let reopened = store::open(&storage, Duration::from_secs(30))
         .await
         .unwrap();
@@ -7919,7 +7918,8 @@ async fn capture_db_old_reader_schema_unchanged() {
         .await
         .unwrap();
     assert_eq!(capture_schema_max(&repository).await, repository_before);
-    assert!(capture_has_table(&repository, "agent_session").await);
+    assert!(!capture_has_table(&repository, "agent_session").await);
+    assert!(capture_has_table(&repository, "config_kv").await);
     repository.close().await.unwrap();
     let global_conn =
         db::establish_connection_for_role(global.to_str().unwrap(), DatabaseRole::GlobalConfig)
@@ -7944,6 +7944,141 @@ async fn capture_db_old_reader_schema_unchanged() {
     assert_eq!(std::fs::read(&global).unwrap(), global_bytes);
     assert_eq!(std::fs::read(&system).unwrap(), system_bytes);
     assert_eq!(std::fs::read(&derived).unwrap(), b"derived-unchanged");
+}
+
+#[tokio::test]
+async fn capture_catalog_detach_drops_copied_tables_and_keeps_repository_receipts() {
+    let dir = tempfile::tempdir().unwrap();
+    let global = dir.path().join("global.db");
+    let system = dir.path().join("system.db");
+    let global_conn =
+        db::create_database_for_role(global.to_str().unwrap(), DatabaseRole::GlobalConfig)
+            .await
+            .unwrap();
+    let system_conn =
+        db::create_database_for_role(system.to_str().unwrap(), DatabaseRole::SystemConfig)
+            .await
+            .unwrap();
+    let global_before =
+        db::schema::current_schema_version_for_role(&global_conn, DatabaseRole::GlobalConfig)
+            .await
+            .unwrap();
+    let system_before =
+        db::schema::current_schema_version_for_role(&system_conn, DatabaseRole::SystemConfig)
+            .await
+            .unwrap();
+    global_conn.close().await.unwrap();
+    system_conn.close().await.unwrap();
+    let storage = capture_repository(dir.path()).await;
+    let repository = storage.join("libra.db");
+    insert_capture_sessions(&repository, CAPTURE_COPY_BATCH + 1, "{}").await;
+    let source = db::establish_connection(repository.to_str().unwrap())
+        .await
+        .unwrap();
+    source
+        .execute_raw(Statement::from_string(
+            source.get_database_backend(),
+            "CREATE TABLE widgets (id INTEGER PRIMARY KEY, name TEXT NOT NULL)".to_owned(),
+        ))
+        .await
+        .unwrap();
+    let schema_before = capture_schema_max(&source).await;
+    source.close().await.unwrap();
+    let capture = store::open(&storage, Duration::from_secs(30))
+        .await
+        .unwrap();
+    assert_eq!(
+        capture_count(&capture, "agent_session").await,
+        (CAPTURE_COPY_BATCH + 1) as i64
+    );
+    let source = db::establish_connection(repository.to_str().unwrap())
+        .await
+        .unwrap();
+    assert!(!capture_has_table(&source, "agent_session").await);
+    assert!(capture_has_table(&source, "config_kv").await);
+    assert!(capture_has_table(&source, "widgets").await);
+    assert_eq!(capture_schema_max(&source).await, schema_before);
+    source.close().await.unwrap();
+    store::open(&storage, Duration::from_secs(30))
+        .await
+        .expect("detach is successful when the capture tables are already gone");
+    let source = db::establish_connection(repository.to_str().unwrap())
+        .await
+        .unwrap();
+    assert!(capture_has_table(&source, "widgets").await);
+    assert!(capture_has_table(&source, "config_kv").await);
+    assert!(!capture_has_table(&source, "agent_checkpoint").await);
+    assert_eq!(capture_schema_max(&source).await, schema_before);
+    source.close().await.unwrap();
+    let global_conn =
+        db::establish_connection_for_role(global.to_str().unwrap(), DatabaseRole::GlobalConfig)
+            .await
+            .unwrap();
+    let system_conn =
+        db::establish_connection_for_role(system.to_str().unwrap(), DatabaseRole::SystemConfig)
+            .await
+            .unwrap();
+    assert_eq!(
+        db::schema::current_schema_version_for_role(&global_conn, DatabaseRole::GlobalConfig)
+            .await
+            .unwrap(),
+        global_before
+    );
+    assert_eq!(
+        db::schema::current_schema_version_for_role(&system_conn, DatabaseRole::SystemConfig)
+            .await
+            .unwrap(),
+        system_before
+    );
+}
+
+#[tokio::test]
+async fn capture_catalog_detach_missing_key_deletes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = capture_repository(dir.path()).await;
+    let repository = storage.join("libra.db");
+    insert_capture_sessions(&repository, 1, "{}").await;
+    let capture = store::open(&storage, Duration::from_secs(30))
+        .await
+        .unwrap();
+    let source = db::establish_connection(repository.to_str().unwrap())
+        .await
+        .unwrap();
+    let table_sql: String = capture
+        .query_one_raw(Statement::from_string(
+            capture.get_database_backend(),
+            "SELECT sql FROM sqlite_master WHERE name = 'agent_session'".to_owned(),
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get_by_index(0)
+        .unwrap();
+    source.execute_unprepared(&table_sql).await.unwrap();
+    source
+        .execute_raw(Statement::from_string(
+            source.get_database_backend(),
+            "INSERT INTO agent_session (
+                session_id, agent_kind, provider_session_id, state, working_dir,
+                metadata_json, started_at, last_event_at
+             ) VALUES ('session-extra', 'claude_code', 'provider-extra', 'active', '/work', '{}', 1, 1)"
+                .to_owned(),
+        ))
+        .await
+        .unwrap();
+    let error = libra::internal::ai::capture::detach::detach_copied_catalog(&capture, &repository)
+        .await
+        .expect_err("a key that did not copy must refuse the drop");
+    let message = error.to_string();
+    assert!(message.contains("missing"), "{message}");
+    assert!(!message.contains("session-extra"), "{message}");
+    assert!(capture_has_table(&source, "agent_session").await);
+    assert!(capture_has_table(&source, "config_kv").await);
+    assert_eq!(
+        capture_count(&source, "agent_session").await,
+        1,
+        "the repository row stays when detach refuses"
+    );
 }
 
 #[tokio::test]

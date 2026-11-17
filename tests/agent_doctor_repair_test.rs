@@ -1085,19 +1085,35 @@ impl DoctorRepo {
     /// Fresh sea-orm connection to the repo database. Callers drop it
     /// before the next CLI invocation (sequential access only).
     async fn db(&self) -> DatabaseConnection {
-        let db_url = format!(
-            "sqlite://{}",
-            self.repo.join(".libra").join("libra.db").display()
-        );
+        Self::connect_sqlite(&self.repo.join(".libra").join("libra.db")).await
+    }
+
+    /// Catalog rows live in `capture.db` after the capture store opens.
+    /// Before that file exists they are still in `libra.db`.
+    async fn catalog_db(&self) -> DatabaseConnection {
+        let capture = self.repo.join(".libra").join("private").join("capture.db");
+        if capture.is_file() {
+            Self::connect_sqlite(&capture).await
+        } else {
+            self.db().await
+        }
+    }
+
+    async fn connect_sqlite(path: &Path) -> DatabaseConnection {
+        let db_url = format!("sqlite://{}", path.display());
         let mut opts = sea_orm::ConnectOptions::new(db_url);
         opts.sqlx_logging(false);
         sea_orm::Database::connect(opts)
             .await
-            .expect("open repo db")
+            .expect("open sqlite database")
     }
 
     async fn exec_sql(&self, sql: &str, values: Vec<sea_orm::Value>) {
-        let conn = self.db().await;
+        let conn = if sql.contains("agent_") {
+            self.catalog_db().await
+        } else {
+            self.db().await
+        };
         let backend = conn.get_database_backend();
         conn.execute_raw(Statement::from_sql_and_values(backend, sql, values))
             .await
@@ -1106,7 +1122,7 @@ impl DoctorRepo {
 
     /// All `agent_checkpoint` rows, oldest first.
     async fn checkpoint_rows(&self) -> Vec<RowSnapshot> {
-        let conn = self.db().await;
+        let conn = self.catalog_db().await;
         let backend = conn.get_database_backend();
         let rows = conn
             .query_all_raw(Statement::from_sql_and_values(
@@ -1268,7 +1284,7 @@ async fn bind_expired_terminal_marker(
     receipt_key: &str,
     source_digest: &str,
 ) -> (String, String, String, String) {
-    let conn = repo.db().await;
+    let conn = repo.catalog_db().await;
     let row = conn
         .query_one_raw(Statement::from_sql_and_values(
             conn.get_database_backend(),
@@ -1340,7 +1356,10 @@ async fn bind_expired_terminal_marker(
     let mut marker = TracesInflightMarker::new(&session_id, &checkpoint_id, 0);
     marker.generation = Some(generation.clone());
     marker.ttl_ms = 0;
-    write_traces_inflight_marker(&conn, &marker)
+    // Inflight markers stay in the repository database. The catalog connection
+    // has no metadata_kv after the capture tables move to capture.db.
+    let marker_conn = repo.db().await;
+    write_traces_inflight_marker(&marker_conn, &marker)
         .await
         .expect("persist expired terminal marker");
     (session_id, checkpoint_id, generation, source_digest)
@@ -1444,7 +1463,7 @@ async fn align_pending_session_with_cli_scope(
         "create real CLI scope probe: {}",
         describe(&output)
     );
-    let conn = repo.db().await;
+    let conn = repo.catalog_db().await;
     let scope = conn
         .query_one_raw(Statement::from_sql_and_values(
             conn.get_database_backend(),
@@ -1794,28 +1813,49 @@ async fn doctor_repair_never_rebinds_an_expired_terminal_marker_to_changed_sourc
         describe(&output)
     );
 
-    let conn = repo.db().await;
+    let conn = repo.catalog_db().await;
     let row = conn
         .query_one_raw(Statement::from_sql_and_values(
             conn.get_database_backend(),
-            "SELECT state, stopped_at, metadata_json,
+            "SELECT state, stopped_at, metadata_json, session_id,
                     (SELECT COUNT(*) FROM agent_checkpoint
-                     WHERE session_id = agent_session.session_id) AS checkpoints,
-                    (SELECT COUNT(*) FROM metadata_kv
-                     WHERE scope = 'agent_traces_inflight'
-                       AND target = agent_session.session_id) AS markers,
-                    (SELECT COUNT(*) FROM reference
-                     WHERE name = ? AND kind = 'Branch' AND remote IS NULL
-                       AND \"commit\" IS NOT NULL) AS trace_heads
+                     WHERE session_id = agent_session.session_id) AS checkpoints
              FROM agent_session WHERE provider_session_id = ?",
-            [
-                libra::internal::branch::TRACES_BRANCH.into(),
-                session.into(),
-            ],
+            [session.into()],
         ))
         .await
         .expect("read source-conflict terminal result")
         .expect("terminal session remains durable");
+    let conflict_session_id: String = row
+        .try_get_by("session_id")
+        .expect("decode source-conflict session id");
+    let repo_conn = repo.db().await;
+    let marker_count: i64 = repo_conn
+        .query_one_raw(Statement::from_sql_and_values(
+            repo_conn.get_database_backend(),
+            "SELECT COUNT(*) AS count FROM metadata_kv
+             WHERE scope = 'agent_traces_inflight' AND target = ?",
+            [conflict_session_id.into()],
+        ))
+        .await
+        .expect("read source-conflict markers")
+        .expect("marker count row")
+        .try_get_by("count")
+        .expect("decode source-conflict marker count");
+    let trace_heads: i64 = repo_conn
+        .query_one_raw(Statement::from_sql_and_values(
+            repo_conn.get_database_backend(),
+            "SELECT COUNT(*) AS count FROM reference
+             WHERE name = ? AND kind = 'Branch' AND remote IS NULL
+               AND \"commit\" IS NOT NULL",
+            [libra::internal::branch::TRACES_BRANCH.into()],
+        ))
+        .await
+        .expect("read source-conflict trace head")
+        .expect("trace head row")
+        .try_get_by("count")
+        .expect("decode source-conflict trace-head count");
+    drop(repo_conn);
     let metadata: Value = serde_json::from_str(
         &row.try_get_by::<String, _>("metadata_json")
             .expect("decode source-conflict metadata"),
@@ -1841,15 +1881,11 @@ async fn doctor_repair_never_rebinds_an_expired_terminal_marker_to_changed_sourc
         "repair must not publish a checkpoint with a mixed source fence"
     );
     assert_eq!(
-        row.try_get_by::<i64, _>("markers")
-            .expect("decode source-conflict marker count"),
-        0,
+        marker_count, 0,
         "changed-source replay must not recreate/rebind the retired marker"
     );
     assert_eq!(
-        row.try_get_by::<i64, _>("trace_heads")
-            .expect("decode source-conflict trace-head count"),
-        0,
+        trace_heads, 0,
         "changed-source replay must not advance refs/libra/traces"
     );
     let finalizer = &metadata["capture_catalog_receipts_v1"]["entries"]
@@ -2813,7 +2849,7 @@ async fn class1_stale_row_repaired_from_ref() {
         repaired, original,
         "repair must restore tree_oid/metadata_blob_oid/traces_commit from the ref"
     );
-    let conn = repo.db().await;
+    let conn = repo.catalog_db().await;
     let generation = conn
         .query_one_raw(Statement::from_sql_and_values(
             conn.get_database_backend(),
@@ -3782,7 +3818,7 @@ async fn class3_drifted_object_index_row_updated_in_place() {
 // ---------------------------------------------------------------------------
 
 async fn subagent_parent_link(repo: &DoctorRepo, checkpoint_id: &str) -> Option<String> {
-    let conn = repo.db().await;
+    let conn = repo.catalog_db().await;
     let backend = conn.get_database_backend();
     let row = conn
         .query_one_raw(Statement::from_sql_and_values(

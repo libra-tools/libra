@@ -2198,6 +2198,29 @@ async fn uncommitted(
     CheckpointStageExit::Uncommitted(result())
 }
 
+/// User-branch HEAD lives in the repository database. Catalog writes use
+/// `capture.db`, which has no `reference` table. A combined connection that
+/// still has `config_kv` remains its own peer.
+async fn checkpoint_parent_commit(
+    conn: &sea_orm::DatabaseConnection,
+    label: &str,
+) -> Result<Option<String>> {
+    let repo = crate::internal::db::repository_peer(conn)
+        .await
+        .with_context(|| format!("failed to open the repository database while writing {label}"))?;
+    match crate::internal::head::Head::current_commit_result_with_conn(&repo).await {
+        Ok(commit) => Ok(commit.map(|hash| hash.to_string())),
+        Err(crate::internal::branch::BranchStoreError::Corrupt { detail, .. })
+            if detail.contains("HEAD reference is missing") =>
+        {
+            Ok(None)
+        }
+        Err(err) => Err(anyhow!(
+            "failed to resolve HEAD while writing {label}: {err}"
+        )),
+    }
+}
+
 /// Class (a) for an elapsed capture deadline: release this invocation's
 /// claims, then hand the reservation to the pending-receipt continuation.
 async fn uncommitted_settle(
@@ -2562,23 +2585,13 @@ pub(super) async fn run_checkpoint_stage<P: LiveExportLeasePort>(
         //   running `initialize_refs`. Functionally equivalent to "unborn" for
         //   the traces writer, so we coerce to `None` rather than
         //   failing the whole ingest.
-        let parent_commit: Option<String> =
-            match crate::internal::head::Head::current_commit_result_with_conn(conn).await {
-                Ok(commit) => commit.map(|h| h.to_string()),
-                Err(crate::internal::branch::BranchStoreError::Corrupt { detail, .. })
-                    if detail.contains("HEAD reference is missing") =>
-                {
-                    None
-                }
-                Err(err) => {
-                    return uncommitted(conn, &cleanup, capture_deadline, None, || {
-                        Err(anyhow!(
-                            "failed to resolve HEAD while writing checkpoint: {err}"
-                        ))
-                    })
-                    .await;
-                }
-            };
+        let parent_commit: Option<String> = match checkpoint_parent_commit(conn, "checkpoint").await
+        {
+            Ok(commit) => commit,
+            Err(err) => {
+                return uncommitted(conn, &cleanup, capture_deadline, None, || Err(err)).await;
+            }
+        };
 
         // DR-05c-0: reserved claims + the catalog row commit INSIDE the
         // ref-CAS transaction (ADR-DR-10) — ref, catalog, revisions and claim
@@ -3535,20 +3548,7 @@ pub(super) async fn write_subagent_checkpoint(
     let (redaction_report_redacted, _) = Redactor::new_default().redact(&redaction_report_bytes);
 
     // Parent user-branch HEAD (same semantics/tolerance as committed path).
-    let parent_commit: Option<String> =
-        match crate::internal::head::Head::current_commit_result_with_conn(conn).await {
-            Ok(commit) => commit.map(|h| h.to_string()),
-            Err(crate::internal::branch::BranchStoreError::Corrupt { detail, .. })
-                if detail.contains("HEAD reference is missing") =>
-            {
-                None
-            }
-            Err(err) => {
-                return Err(anyhow!(
-                    "failed to resolve HEAD while writing subagent checkpoint: {err}"
-                ));
-            }
-        };
+    let parent_commit = checkpoint_parent_commit(conn, "subagent checkpoint").await?;
 
     let commit_plan = SubagentCheckpointCommitPlan::new(
         checkpoint_id.clone(),
