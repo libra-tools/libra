@@ -339,9 +339,11 @@ struct CaptureQueueReport {
     quarantine: CaptureQueueDirCount,
 }
 
-/// Files and bytes in one queue directory. The scan visits at most
-/// [`CAPTURE_QUEUE_COUNT_LIMIT`] directory entries of any kind; when more
-/// remain, `at_least` marks `files` and `bytes` as lower bounds.
+/// Files and bytes in one queue directory. The scan stats at most
+/// [`CAPTURE_QUEUE_COUNT_LIMIT`] directory entries of any kind; it may pull
+/// one more result from the directory iterator (an entry or a read error,
+/// never statted) to detect that more remain, and then `at_least` marks
+/// `files` and `bytes` as lower bounds.
 /// `unavailable` means the directory or one of its entries could not be read.
 #[derive(Debug, Default, Serialize)]
 struct CaptureQueueDirCount {
@@ -369,8 +371,9 @@ impl CaptureQueueDirCount {
         };
         let mut count = Self::default();
         for (visited, entry) in entries.enumerate() {
-            // The budget is entries visited, not regular files found, so a
-            // directory full of other entries is still bounded.
+            // The budget is entries statted, not regular files found, so a
+            // directory full of other entries is still bounded. The iterator
+            // result that trips the limit is never statted.
             if visited as u64 >= CAPTURE_QUEUE_COUNT_LIMIT {
                 count.at_least = true;
                 break;

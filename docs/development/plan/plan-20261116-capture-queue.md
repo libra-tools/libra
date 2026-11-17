@@ -855,6 +855,9 @@ Result 只允许 `PASS` 或 `FAIL`。R7 是计划文本的当前结论。R9 是 
 | F1 | FIX-CQ-02 | FAIL | P0=0。代码路由被确认（目录走目录连接，ref 与对象索引留在 `libra.db`，冻结对两个库都做检测，restore 先仓库后目录取锁）。P1：守卫修正后未重跑双环境全量 | P2：状态行写成“已独立提交” | Codex exec，只读，2026-11-17。已重跑全量并改写状态行 |
 | F2 | FIX-CQ-02 复核 | PASS | P0=0，P1=0。全量 11841 项全部通过（1 项无关 flaky 重试通过），状态行不再声称已提交 | 无 P2 | Codex exec，只读，2026-11-17 |
 | C1 | CQ-06 实现 | PASS | P0=0，P1=0。四项 AC、只 stat 的预算、无路径/内容、文档与 0.30.210 版本面均确认 | P2 一项：1024 上限按普通文件数计，非文件目录项不受限。已改为按访问的目录项计数，并加单测 `capture_spool_doctor_scan_is_bounded_by_entries_visited` | Codex exec，只读，2026-11-17 |
+| C2 | C1 之后的提交（`b44367a` 中的有界扫描修复、`e247fab` clippy 前滚、`23b7e0b` 收口文档） | PASS | P0=0，P1=0。按目录项计数的上限、1024 边界、`at_least`/`unavailable` 语义与 `enumerate()` 改写都确认；收口记录与证据一致 | P2 两项：注释与证据写“访问至多 1024 项”，实际会多取一个不 stat 的迭代结果；`plan-long.md` 判据未勾选也未说明。已改注释与证据措辞，并勾选该判据 | Codex exec，只读，2026-11-17。这三处提交在推送前未经复审，违反逐卡“PASS 后再提交推送”的要求，此轮为补审 |
+| C3 | C2 的 P2 修正 | FAIL | P0=0。P1：C2 行日期与复审日期不符；“只读出名字”比代码窄（迭代器在该位置也可能返回读取错误） | 无 | Codex exec，只读，2026-11-17。日期核对：本日志统一用 UTC，复审时为 2026-11-17 22:56 UTC（本机时区 UTC+8 已是 11-18），C2 日期保持不变；措辞已改为“再取一个迭代结果（目录项或读取错误）” |
+| C4 | C3 修正 | PASS | P0=0，P1=0。注释与证据措辞与代码一致（Rust 侧只改注释）；C2/C3 日期按 UTC 一致 | 无 | Codex exec，只读，2026-11-17 |
 
 ## 修复登记
 
@@ -946,7 +949,7 @@ Clippy `--all-targets --all-features -D warnings` 先指出 CQ-01 留下的两�
 
 ### CQ-06（2026-11-17 21:50:12 UTC）
 
-`libra agent doctor` 经 `capture::store::open` 打开 `capture.db`；打不开时按 `drain::classify_capture_open` 分类：schema 由更新版本写入报 `LBR-AGENT-048`，库忙报 `LBR-AGENT-047`，文件损坏或不可读报 `LBR-IO-001`，三种文案都点名 `.libra/private/capture.db`，不提仓库库。报告新增 `capture_queue.ready` / `capture_queue.quarantine`（`files`、`bytes`、`at_least`、`unavailable`）与人读行 `Capture queue`；只对目录项 `stat`（`DirEntry::metadata`，不跟随 symlink），每个目录最多访问 1024 个目录项（任何类型都计入，只统计普通文件）即停并置 `at_least`，不读文件内容，不取消费者锁。`docs/commands/agent.md`、zh-CN 页与 `docs/error-codes.md`（047/048 增加 doctor 触发情形）已更新；`COMPATIBILITY.md` 为 `N/A`（只加诊断字段，兼容矩阵未承诺 doctor 字段集合）。网站 `../libra-backend` 的 agent 页已在本地 `cf` 工作区修改；该仓库的提交与推送被本次会话的自动权限拒绝，留给操作者。
+`libra agent doctor` 经 `capture::store::open` 打开 `capture.db`；打不开时按 `drain::classify_capture_open` 分类：schema 由更新版本写入报 `LBR-AGENT-048`，库忙报 `LBR-AGENT-047`，文件损坏或不可读报 `LBR-IO-001`，三种文案都点名 `.libra/private/capture.db`，不提仓库库。报告新增 `capture_queue.ready` / `capture_queue.quarantine`（`files`、`bytes`、`at_least`、`unavailable`）与人读行 `Capture queue`；只对目录项 `stat`（`DirEntry::metadata`，不跟随 symlink），每个目录最多 stat 1024 个目录项（任何类型都计入，只统计普通文件），之后最多再从目录迭代器取一个结果（目录项或读取错误，不 stat），用来判断还有剩余并置 `at_least`，不读文件内容，不取消费者锁。`docs/commands/agent.md`、zh-CN 页与 `docs/error-codes.md`（047/048 增加 doctor 触发情形）已更新；`COMPATIBILITY.md` 为 `N/A`（只加诊断字段，兼容矩阵未承诺 doctor 字段集合）。网站 `../libra-backend` 的 agent 页已在本地 `cf` 工作区修改；该仓库的提交与推送被本次会话的自动权限拒绝，留给操作者。
 
 本机验证：`source .env.test && cargo nextest run --test agent_doctor_repair_test capture_spool_doctor_` 3 项全部通过（计数与 JSON 无路径/内容、不等待也不动消费者锁、schema 过新与损坏文案）；`cargo nextest run --lib capture_spool_doctor_` 1 项通过（扫描按目录项计数的上限）；同时跑 `agent_doctor_repair_test` 全部、`compat_version_surface_sync`、`compat_error_codes_doc_sync` 共 50 项全部通过。新测试以 `LIBRA_RUN_CAPTURE_TESTS=1` 门控，不进 GitHub Actions。`cargo +nightly fmt --all --check` exit 0；`cargo clippy --all-targets --all-features -- -D warnings` exit 0；rustdoc 断链检查 exit 0。卡片 Full-suite trigger 为 `none`；计划收口全量随后运行。版本面 `0.30.209` → `0.30.210`（`Cargo.toml`、`install.sh`、`install.ps1`，`Cargo.lock` 经 `cargo update -p libra --offline`）。
 
@@ -967,4 +970,4 @@ Clippy `--all-targets --all-features -D warnings` 先指出 CQ-01 留下的两�
 - [ ] CQ-04、CQ-05、CQ-06 各自完成 patch、版本面、`gh` 发布与适用 D 组证据。（patch 与版本面完成：0.30.208/209/210；`v0.30.208` 已发布；`v0.30.209`、`v0.30.210` 的 `gh` 发布待操作者确认）
 - [x] 修订历史覆盖成稿后的规范性变更。
 - [x] 未新建证据文件或证据目录。
-- [ ] `plan-long.md` 日期索引已有本计划一行。
+- [x] `plan-long.md` 日期索引已有本计划一行。（收口提交 `23b7e0b` 已把该行更新为实施完成）
