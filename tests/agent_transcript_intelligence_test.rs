@@ -1637,7 +1637,9 @@ fn pi_coverage_normalizer_records_readable_thinking_as_pi_reasoning() {
     );
 }
 
-/// PI-34 AC3: Pi stays unsupported.
+/// PI-34 AC3: Pi is supported for local capture, not launchable; its generic
+/// transcript reader stays closed because capture and import use dedicated
+/// bounded session-source paths.
 #[test]
 fn pi_coverage_normalizer_reports_the_supported_row() {
     use libra::internal::ai::observed_agents::{registration_for, supported_slugs};

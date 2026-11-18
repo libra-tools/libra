@@ -73,8 +73,9 @@ pub enum AgentHooksSubcommand {
         #[command(subcommand)]
         command: HookCommandKind,
     },
-    /// `libra agent hooks pi observe` (PI-04). Pi stays unsupported and its
-    /// extension is not installed by `libra agent enable`.
+    /// `libra agent hooks pi observe` (PI-04). Pi is supported and
+    /// hook-installable; `libra agent enable --agent pi` installs the
+    /// extension.
     #[command(about = "Pi observe-only hook entry")]
     Pi {
         #[command(subcommand)]

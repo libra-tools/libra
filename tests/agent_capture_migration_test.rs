@@ -1589,7 +1589,7 @@ async fn pi_role_stub_refuses_every_read_and_install() {
             working_dir: std::path::PathBuf::from("/work"),
             transcript_path: None,
         })
-        .expect_err("pi capture stays disabled");
+        .expect_err("pi's generic transcript reader stays closed");
     assert!(read.to_string().contains("not available"), "{read}");
     let summary = deadline_provider_extraction_summary(AgentKind::Pi, b"pi-thought-canary");
     assert!(summary.partial);

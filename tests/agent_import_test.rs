@@ -8415,7 +8415,8 @@ fn pi_explicit_import_refused_consent_reads_no_source() {
 /// one partial checkpoint through the shared coordinator and claim store
 /// (one identity, one coverage claim); its snapshot is the Pi frame's
 /// unproven partial one. A second import of the same logical turn writes
-/// nothing. Output never echoes session content, and Pi stays unsupported.
+/// nothing. Output never echoes session content. Pi is supported for local
+/// capture; this test covers the explicit import path.
 #[test]
 fn pi_explicit_import_stores_one_partial_checkpoint_and_replays_as_noop() {
     use libra::internal::ai::observed_agents::registration_for;

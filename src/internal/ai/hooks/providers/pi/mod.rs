@@ -7,7 +7,8 @@
 //! The extension bounds its child processes (PI-13) and the receiver keys
 //! every recorded event by a stable native field (PI-12, see [`parser`]).
 //! Installing the asset through `libra agent enable` and the run terminal
-//! belong to PI-14 and PI-19. Pi stays unsupported and not hook-installable.
+//! belong to PI-14 and PI-19. Pi is supported and hook-installable since
+//! PI-06 (`support_wave=pi`).
 
 pub mod parser;
 pub mod settings;

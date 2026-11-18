@@ -307,7 +307,8 @@ static REGISTRY: [AgentRegistration; 10] = [
         db_value: "pi",
         // PI-06: local capture is supported and hook-installable through
         // the Libra-owned project extension. Pi is not a launcher; the
-        // generic transcript reader stays closed (import is explicit).
+        // the generic transcript reader stays closed; live capture and explicit
+        // import read session bytes through their dedicated bounded paths.
         supported: true,
         support_wave: Some(PI_WAVE),
         registered: true,

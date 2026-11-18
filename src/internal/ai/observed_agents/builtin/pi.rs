@@ -12,9 +12,15 @@
 //! PI-34 turns the branch into coverage turns, and PI-32 bounds a worker
 //! frame of those turns with the branch's thinking blocks under a byte
 //! budget and a deadline; PI-33 runs that frame on a `pi` capture snapshot
-//! (`capture/snapshot.rs`) over bytes already read. Pi stays unsupported:
-//! nothing here imports a session, installs hooks, or reads a transcript for
-//! capture.
+//! (`capture/snapshot.rs`) over bytes already read. PI-06 promotes Pi to a
+//! supported, hook-installable local-capture agent (`support_wave=pi`).
+//!
+//! Pi session bytes reach Libra through two bounded readers, not through
+//! this adapter's generic `read_transcript`: PI-35 selects and reads one
+//! session file for the live capture path (PI-36), and PI-10 reads one
+//! explicitly named file for `libra agent import --agent pi --path <file>`.
+//! The generic reader stays closed for Pi, so the registry row keeps
+//! `transcript_readable=false`.
 //!
 //! Pi writes sessions under `<agent-dir>/sessions/--<encoded-cwd>--/` by
 //! default (`session-manager.ts:585-601`, `<agent-dir>` defaulting to
@@ -44,9 +50,13 @@ macro_rules! poll {
     };
 }
 
-/// PI-01 identity stub. The db tag is accepted, but the registry row stays
-/// unsupported: discovery is internal (PI-02), and capture, hook install, and
-/// launch are closed until later cards.
+/// The Pi adapter identity. Pi is supported for local capture since PI-06
+/// (`supported=true`, `hook_installable=true`, `support_wave="pi"`), and its
+/// hook provider lives in `hooks/providers/pi`. The generic
+/// [`ObservedAgent::read_transcript`] reader stays closed for Pi: session
+/// bytes are read by the bounded live-capture source (PI-35/PI-36) and by
+/// the explicit import (PI-10), so the registry row keeps
+/// `transcript_readable=false`.
 pub struct PiObservedAgent;
 
 impl ObservedAgent for PiObservedAgent {
@@ -64,7 +74,7 @@ impl ObservedAgent for PiObservedAgent {
 
     fn read_transcript(&self, _session: &AgentSessionCtx) -> Result<Option<Vec<u8>>> {
         Err(anyhow::anyhow!(
-            "pi capture is not available; the identity is registered but discovery, capture, hook install, and launch stay disabled"
+            "pi's generic transcript reader is not available; Pi sessions are read through the hook-based capture (one bounded session source) or an explicit `libra agent import --agent pi --path <file>`, so this adapter reads no transcript"
         ))
     }
 

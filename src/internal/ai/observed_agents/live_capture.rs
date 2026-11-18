@@ -806,10 +806,11 @@ pub(super) struct GrokLiveCapture;
 
 impl LiveCaptureProvider for GrokLiveCapture {}
 
-/// PI-36: Pi is not hook-installable yet, but its observe path already needs
-/// a bounded session source for automatic checkpoints before PI-06 promotes
-/// it. The exporter returns the selected session bytes as an authorized
-/// in-memory source, so the snapshot runs the PI-33 worker frame.
+/// PI-36: Pi is supported and hook-installable since PI-06
+/// (`support_wave=pi`), and its observe path reads one bounded session
+/// source (PI-35) for the automatic checkpoint. The exporter returns the
+/// selected session bytes as an authorized in-memory source, so the snapshot
+/// runs the PI-33 worker frame.
 pub(super) struct PiLiveCapture;
 
 impl LiveCaptureProvider for PiLiveCapture {
