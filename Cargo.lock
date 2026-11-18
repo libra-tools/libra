@@ -6501,6 +6501,7 @@ dependencies = [
  "rsa 0.9.10",
  "sea-orm",
  "seccompiler",
+ "semver",
  "serde",
  "serde_json",
  "serial_test",

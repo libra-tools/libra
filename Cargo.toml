@@ -67,6 +67,7 @@ sea-orm = { version = "2.0.0", features = [
     "runtime-tokio-rustls",
     "macros",
 ]}
+semver = "1.0.27"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.149", features = ["raw_value"] }
 sha1 = "0.11.0"

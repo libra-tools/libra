@@ -593,23 +593,23 @@ fn install_or_uninstall(
         }
     }
     if install && resolved.contains(&AgentKind::Hermes) {
-        match crate::internal::ai::hooks::providers::hermes::settings::hermes_enable_gate(
-            agents.is_empty(),
-            crate::internal::ai::hooks::providers::hermes::settings::hermes_runtime_is_supported(),
-        ) {
-            crate::internal::ai::hooks::providers::hermes::settings::HermesEnableGate::Install => {}
-            crate::internal::ai::hooks::providers::hermes::settings::HermesEnableGate::SkipBare => {
+        use crate::internal::ai::hooks::providers::hermes::settings::{
+            HermesEnableGate, MIN_HERMES_VERSION, hermes_enable_gate, hermes_runtime_is_supported,
+        };
+        match hermes_enable_gate(agents.is_empty(), hermes_runtime_is_supported()) {
+            HermesEnableGate::Install => {}
+            HermesEnableGate::SkipBare => {
                 resolved.retain(|kind| *kind != AgentKind::Hermes);
                 if !output.quiet {
                     eprintln!(
-                        "libra agent enable: skipping 'hermes' (Hermes v0.22.5 bf0203a was not found on PATH; no Hermes files were changed)"
+                        "libra agent enable: skipping 'hermes' (requires Hermes v{MIN_HERMES_VERSION} or later on PATH; no Hermes files were changed)"
                     );
                 }
             }
-            crate::internal::ai::hooks::providers::hermes::settings::HermesEnableGate::RefuseExplicit => {
-                return Err(CliError::fatal(
-                    "agent 'hermes' needs Hermes v0.22.5 (bf0203a) on PATH before capture can be enabled; no files were changed",
-                ));
+            HermesEnableGate::RefuseExplicit => {
+                return Err(CliError::fatal(format!(
+                    "agent 'hermes' needs Hermes v{MIN_HERMES_VERSION} or later on PATH before capture can be enabled; no files were changed"
+                )));
             }
         }
     }

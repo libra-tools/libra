@@ -633,7 +633,49 @@ fn hermes_missing_runtime_skips_bare_enable_and_refuses_explicit() {
     assert!(hermes_version_text_is_supported(
         "Hermes Agent v0.22.5 (2026.9.24) stable local bf0203a794a0"
     ));
-    assert!(!hermes_version_text_is_supported(
-        "Hermes Agent v0.22.6 bf0203a"
+    assert!(hermes_version_text_is_supported(
+        "Hermes Agent v0.22.6 stable local deadbeef"
     ));
+}
+
+#[cfg(unix)]
+#[test]
+fn hermes_add_checks_the_version_before_installing() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    init_repo_via_cli(&repo);
+    let profile = tempdir().unwrap();
+    let fake = temp.path().join("hermes");
+    std::fs::write(
+        &fake,
+        "#!/bin/sh\n[ \"$1\" = --version ] || exit 2\nprintf 'Hermes Agent v%s\\n' \"$TEST_HERMES_VERSION\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let add = |version| {
+        run_libra_command_with_env(
+            &["agent", "add", "hermes"],
+            &repo,
+            &[
+                ("PATH", temp.path().to_str().unwrap()),
+                ("HERMES_HOME", profile.path().to_str().unwrap()),
+                ("TEST_HERMES_VERSION", version),
+            ],
+        )
+    };
+    let refused = add("0.22.4");
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("v0.22.5 or later"));
+    assert!(profile.path().read_dir().unwrap().next().is_none());
+
+    let enabled = add("0.23.2");
+    assert!(enabled.status.success(), "{:?}", enabled.stderr);
+    assert!(
+        profile
+            .path()
+            .join("plugins/libra-hermes-capture/plugin.yaml")
+            .is_file()
+    );
 }

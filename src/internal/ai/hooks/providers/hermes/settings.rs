@@ -12,11 +12,13 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use semver::Version;
 use sha2::{Digest, Sha256};
 
 use super::super::super::provider::ProviderInstallOptions;
 
 pub const LIBRA_CAPTURE_MARKER: &str = "libra capture";
+pub const MIN_HERMES_VERSION: Version = Version::new(0, 22, 5);
 const PLUGIN_ID: &str = "libra-hermes-capture";
 const HASH_NAME: &str = "libra-capture.sha256";
 const CONFIG_HASH_NAME: &str = "libra-capture-config.sha256";
@@ -43,25 +45,14 @@ pub fn hermes_enable_gate(bare: bool, runtime_ready: bool) -> HermesEnableGate {
 }
 
 pub fn hermes_version_text_is_supported(text: &str) -> bool {
-    let tokens = text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '.'));
-    let mut version = false;
-    let mut commit = false;
-    for token in tokens {
-        if token == "v0.22.5" {
-            version = true;
-        }
-        if token == "bf0203a"
-            || (token.starts_with("bf0203a")
-                && token.len() > 7
-                && token[7..].bytes().all(|byte| byte.is_ascii_hexdigit()))
-        {
-            commit = true;
-        }
-    }
-    version && commit
+    text.lines()
+        .find_map(|line| line.trim().strip_prefix("Hermes Agent v"))
+        .and_then(|banner| banner.split_whitespace().next())
+        .and_then(|token| Version::parse(token).ok())
+        .is_some_and(|version| version.cmp_precedence(&MIN_HERMES_VERSION).is_ge())
 }
 
-/// The frozen Hermes release is on `PATH`. `--version` is answered before
+/// Check the minimum Hermes version on `PATH`. `--version` is answered before
 /// Hermes reads config, so this does not open a profile database. The
 /// probe clears `HERMES_HOME` because a new profile has no dependency
 /// environment and would make the version command fail closed.
@@ -78,7 +69,7 @@ pub fn hermes_runtime_is_supported() -> bool {
     }
     let text = String::from_utf8_lossy(&output.stdout);
     let err = String::from_utf8_lossy(&output.stderr);
-    hermes_version_text_is_supported(&format!("{text}{err}"))
+    hermes_version_text_is_supported(&format!("{text}\n{err}"))
 }
 
 pub fn install_hermes_hooks(options: &ProviderInstallOptions) -> Result<()> {
@@ -575,19 +566,26 @@ mod tests {
     }
 
     #[test]
-    fn hermes_version_text_requires_the_frozen_release() {
-        assert!(hermes_version_text_is_supported(
-            "Hermes Agent v0.22.5 stable local bf0203a794a0"
-        ));
-        assert!(!hermes_version_text_is_supported(
-            "Hermes Agent v0.22.50 stable local bf0203a794a0"
-        ));
-        assert!(!hermes_version_text_is_supported(
-            "Hermes Agent v0.22.4 bf0203a"
-        ));
-        assert!(!hermes_version_text_is_supported(
-            "Hermes Agent v0.22.5 deadbeef"
-        ));
+    fn hermes_version_text_checks_the_minimum_release() {
+        for banner in [
+            "Hermes Agent v0.22.5",
+            "Hermes Agent v0.22.5+local.1",
+            "Hermes Agent v0.22.50",
+            "Hermes Agent v0.23.2 (2026.9.24) · stable · local ae2a81ccc00e",
+            "Hermes Agent v1.0.0-rc.1",
+        ] {
+            assert!(hermes_version_text_is_supported(banner), "{banner}");
+        }
+        for banner in [
+            "Hermes Agent v0.22.4 (2026.9.24) bf0203a",
+            "Hermes Agent v0.22.5-rc.1",
+            "Hermes Agent v0.22",
+            "Hermes Agent v0.22.5.invalid",
+            "Hermes Agent unknown\nPython: v3.14.9",
+            "Other Agent v1.0.0",
+        ] {
+            assert!(!hermes_version_text_is_supported(banner), "{banner}");
+        }
     }
 
     #[test]

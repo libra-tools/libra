@@ -1,5 +1,7 @@
 # Hermes Agent 本地会话采集计划（2026-10-18）
 
+> **HM-06 之后的版本准入变更（待发布）。** HM-00 冻结了审计样本，HM-06 首次在 Hermes v0.22.5（`bf0203a`）上完成隔离端到端采集。下文的提交、哈希、实测结果与发布记录保留其历史含义。Libra 0.30.208 启用采集时仍检查该版本与提交。新规则仅按 SemVer 优先级判断 Hermes 是否达到最低版本 `0.22.5`，忽略构建元数据，无需匹配提交。`0.22.5-rc.1` 低于下限，`0.23.2` 高于下限。达到下限仅通过版本检查，真实模型验证的范围仍以各次实测记录为准。
+
 > **本机版本冻结：2026-10-29 16:42:17 UTC。** 本机 Hermes Agent v0.22.5（CLI 原文 `Hermes Agent v0.22.5 (2026.9.24) · stable · local bf0203a794a0`，并打印 `Up to date`）。安装目录 `/Users/eli/.hermes/hermes-agent`，方法 git，detached HEAD，完整提交 `bf0203a794a07aac3ff764972ab9087baa4e4f4e`。本地 tag `v0.22.5` 与 `rc.3-v0.22.5` 指向该提交。GitHub latest release 同为 `v0.22.5`，发布时间 2026-10-23T05:28:45Z，发布说明引用提交前缀 `bf0203a794a`。二进制 `/Users/eli/.local/bin/hermes`（同目录另有 `hermes-agent`）。Python 3.14.9。旧 pin `ccc6956` 只保留为 2026-10-18 历史，不再作为当前 source。本轮未读 `~/.hermes/state.db`、会话目录、`config.yaml` 或 `.env`，未启动模型。冻结当时 10 张卡仍 `pending`。HM-00 的审计收口在后文，不把真实数据算成已取得。Thinking 主源、哈希与 GO/HOLD 见「HM-00 版本冻结」。
 
 > **数据获取优先修订：2026-10-18 16:23:55 UTC（用户本次明确授权）。** 采用 [DATA-CAP-20261019](plan-20260904.md#thinking-data-baseline-20261019)：按 OpenCode 实测保留 thinking 正文及其未证明附带数据，不再以 native 来源认证或隐私剥离阻止普通 checkpoint 保存。下方旧日期 PASS/FAIL、版本与 source pin 仅作原时点证据；本次未运行这四种 provider 的模型，不增加已完成卡数。
