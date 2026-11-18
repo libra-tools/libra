@@ -1,3 +1,6 @@
+// The in-process capture harness awaits a deeply nested future; its layout
+// query needs more than the default depth (as `src/lib.rs` does).
+#![recursion_limit = "256"]
 //! AG-19 central hook dispatcher contract (plan.md Task A4).
 //!
 //! Drives the built `libra` binary end-to-end: `libra init` in a tempdir,

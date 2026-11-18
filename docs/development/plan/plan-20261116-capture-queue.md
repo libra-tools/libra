@@ -957,6 +957,10 @@ Clippy `--all-targets --all-features -D warnings` 先指出 CQ-01 留下的两�
 
 收口门在 `main` 最终代码（含 CQ-06 与其 clippy 前滚修复 `e247fab`）上运行：`cargo +nightly fmt --all --check` exit 0；`cargo clippy --all-targets --all-features -- -D warnings` exit 0；`source .env.test && source .env.live-test && cargo nextest run --all --no-fail-fast --retries 2` 11845 项全部通过，51 跳过，无 flaky。CQ-06 的提交 `b44367a` 曾带着一条 clippy `explicit_counter_loop` 推送（命令链未在 clippy 失败时停止），已由 `e247fab` 前滚修复并在本次收口复验。远端 `main` 的 CI 被其后提交的运行取代（Cancel superseded），以包含本计划全部提交的最新运行为准。
 
+### 远端 CI 前滚（2026-11-17）
+
+`main` 上的 `Check, Build and Test` 在自托管 runner（`RUSTUP_TOOLCHAIN=stable`）编译 `agent_checkpoint_export_test`、`agent_checkpoint_span_test`、`agent_doctor_repair_test`、`agent_import_test`、`agent_lifecycle_event_test` 时报 `queries overflow the depth limit`（查询深度 +130，超过测试 crate 默认的 128；CI 指出的位置是 `agent_doctor_repair_test` 的 `ingest_agent_traces_payload` 与 `agent_import_test` 中 `cov2_mixed_v1_v2_direct_import_idempotent` 的 async 块）；`compat-clippy` 同因失败。本地同版本 `rustc 1.100.0` 在增量与非增量模式下都编译通过，未能复现。其中四个 crate 等待进程内捕获 harness（`ingest_agent_traces_ingress_outcome_for_test`），`agent_import_test` 直接等待历史导入管线 `agent_import::import_prepared_with_coverage_versions`；两者都是 CQ-05/FIX 加深的 future。前滚：上述五个 target 与同样调用该 harness 的 `agent_hook_span_test` 加 `#![recursion_limit = "256"]`（与 `src/lib.rs` 及其它测试 crate 一致）。本地：fmt、严格 clippy 通过，六个 target 295 项通过。远端结果以修复提交的 CI 为准。
+
 ## 完成判据
 
 - [ ] 所有任务卡满足 `G-*`，粒度审计表与卡片一致。

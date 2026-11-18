@@ -1,3 +1,6 @@
+// The in-process capture harness awaits a deeply nested future; its layout
+// query needs more than the default depth (as `src/lib.rs` does).
+#![recursion_limit = "256"]
 //! AG-20 E4-libra checkpoint export writer tests (plan.md Task A5).
 //!
 //! Drives the hook-ingest writer in-process through capture ingress's typed

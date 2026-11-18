@@ -1,3 +1,6 @@
+// The in-process capture harness awaits a deeply nested future; its layout
+// query needs more than the default depth (as `src/lib.rs` does).
+#![recursion_limit = "256"]
 //! Fake-sink span assertions for the AG-20 checkpoint-writer span
 //! (`agent.checkpoint.write`, plan.md Task A5 / agent.md §6).
 //!

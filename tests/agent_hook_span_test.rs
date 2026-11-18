@@ -1,3 +1,6 @@
+// The in-process capture harness awaits a deeply nested future; its layout
+// query needs more than the default depth (as `src/lib.rs` does).
+#![recursion_limit = "256"]
 //! Fake-sink span assertions for the AG-19 hook-ingest spans
 //! (`agent.hook.ingest` / `agent.redaction.apply`, plan.md Task A4).
 //!

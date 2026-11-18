@@ -1,3 +1,8 @@
+// Tests here await the historical-import pipeline directly
+// (`agent_import::import_prepared_with_coverage_versions`), a deeply nested
+// future whose layout query needs more than the default depth (as
+// `src/lib.rs` does).
+#![recursion_limit = "256"]
 //! plan-20260713 M4 historical transcript import contract.
 
 use std::{
