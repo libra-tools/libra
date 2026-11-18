@@ -304,12 +304,17 @@ schema-v1 record. Lease mutation is never exposed here — it stays inside
 the agent runtime's internal services.
 
 The supported roster is `claude-code`, `codex` and `opencode` (first batch),
-and all three are hook-installable: `claude-code` writes `.claude/settings.json`,
-`codex` writes user-level `$CODEX_HOME/hooks.json` plus Libra-managed trust
-entries in `$CODEX_HOME/config.toml` (untrusted Codex hooks are skipped
-silently, so trust entries are part of the install), and `opencode` writes the
-Libra-managed plugin `.opencode/plugin/libra-hooks.js` (note: `opencode --pure`
-disables all external plugins, including capture).
+plus `grok`, `hermes` and `pi`; all six are hook-installable. `claude-code`
+writes `.claude/settings.json`, `codex` writes user-level
+`$CODEX_HOME/hooks.json` plus Libra-managed trust entries in
+`$CODEX_HOME/config.toml` (untrusted Codex hooks are skipped silently, so
+trust entries are part of the install), `opencode` writes the Libra-managed
+plugin `.opencode/plugin/libra-hooks.js` (note: `opencode --pure` disables all
+external plugins, including capture), `grok` writes the Libra-owned
+`$GROK_HOME/hooks/libra-grok-capture.json` (default `~/.grok/hooks`), `hermes`
+rewrites only its marker-and-hash owned
+`HERMES_HOME/plugins/libra-hermes-capture` plugin, and `pi` creates the owned
+project extension `.pi/extensions/libra-hooks.ts`.
 `gemini` was demoted out of the supported roster and is uninstall-only:
 `libra agent remove gemini` removes previously installed Libra-managed hooks
 (idempotent), captured sessions stay readable, and `add`/`enable` for it — or
@@ -669,7 +674,9 @@ whether a session's content can be captured. `pi` keeps
 `transcript_readable=false` because that generic reader stays closed, while
 Pi sessions are still read: the hook path reads one bounded session file per
 settle, and `libra agent import --agent pi --path <file>` reads one
-explicitly named file.
+explicitly named file. The human `agent list` table renders this same flag in
+its `TRANSCRIPT` column: `readable` when the reader is available, `-`
+otherwise.
 Claude Code advertises `capabilities.transcript_preparer=true`: after Libra
 securely opens and pins an authorized transcript descriptor, it may briefly
 wait for a trailing JSONL record to finish flushing through that same

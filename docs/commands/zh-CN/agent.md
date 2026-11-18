@@ -510,7 +510,7 @@ libra --json agent rpc list
 
 `agent list --json` 携带稳定的 `schema_version`，并为每个受支持代理输出一行——首批 roster `claude-code`、`codex`、`opencode`，以及 `grok`、`hermes` 与 `pi`。非首批代理（`gemini`、`cursor`、`copilot`、`factory-ai`）仍保留在注册表中以保证历史会话可读，但不会出现在该列表里。每行携带 `slug`、`agent_kind`、`stability`、`supported`、`support_wave`、`registered`、`transcript_readable`、`hook_installable`、`installed`、`launchable_review`、`launchable_investigate`、`external_binary`、`config_paths`、`protected_dirs`、`capabilities`。行结构是面向自动化的冻结契约。
 
-`transcript_readable` 表示 provider 自身的通用 transcript reader（`ObservedAgent::read_transcript`）是否可用，并不表示会话内容能否被采集。`pi` 的该值仍为 `false`，因为通用 reader 保持关闭；但 Pi 会话仍会被读取：hook 路径每次 settle 读取一个有界的会话文件，`libra agent import --agent pi --path <file>` 读取一个显式指定的文件。
+`transcript_readable` 表示 provider 自身的通用 transcript reader（`ObservedAgent::read_transcript`）是否可用，并不表示会话内容能否被采集。`pi` 的该值仍为 `false`，因为通用 reader 保持关闭；但 Pi 会话仍会被读取：hook 路径每次 settle 读取一个有界的会话文件，`libra agent import --agent pi --path <file>` 读取一个显式指定的文件。人类可读的 `agent list` 表格用 `TRANSCRIPT` 列呈现同一标志：可用时显示 `readable`，否则显示 `-`。
 
 Claude Code 会声明 `capabilities.transcript_preparer=true`：Libra 先安全打开并 pin 已授权 descriptor，再只通过同一 descriptor 短暂等待末尾 JSONL 记录完成 flush；等待与 tail probe 均有界，preparer 不会按路径重新打开文件。
 
