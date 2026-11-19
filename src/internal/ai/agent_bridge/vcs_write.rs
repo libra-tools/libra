@@ -66,27 +66,39 @@ pub async fn unstage_paths(paths: &[String]) -> (Vec<String>, Vec<serde_json::Va
     apply_each(paths, false).await
 }
 
-pub async fn commit_index(message: &str) -> Result<serde_json::Value, BridgeError> {
+pub async fn commit_index(
+    message: &str,
+    requested: &[String],
+) -> Result<serde_json::Value, BridgeError> {
     let staged = crate::command::status::changes_to_be_committed_safe()
         .await
         .map_err(|error| BridgeError::internal(format!("vcs.commit: read index: {error}")))?;
     let relative = staged.to_relative();
-    let mut paths = Vec::new();
+    let mut staged_paths = std::collections::BTreeSet::new();
     for path in relative
         .new
         .iter()
         .chain(relative.modified.iter())
         .chain(relative.deleted.iter())
     {
-        paths.push(path.display().to_string());
+        staged_paths.insert(path.display().to_string().replace('\\', "/"));
     }
     for (_old, new) in &relative.renamed {
-        paths.push(new.display().to_string());
+        staged_paths.insert(new.display().to_string().replace('\\', "/"));
+    }
+    let requested_paths: std::collections::BTreeSet<String> = requested
+        .iter()
+        .map(|path| path.replace('\\', "/"))
+        .collect();
+    if staged_paths != requested_paths {
+        return Err(BridgeError::invalid_params(format!(
+            "vcs.commit paths {requested_paths:?} do not match the staged set {staged_paths:?}; refusing before creating a commit"
+        )));
     }
     let created = vcs::commit_create(message, false, false).await?;
     Ok(serde_json::json!({
         "commitOid": created["commit"],
-        "paths": paths,
+        "paths": staged_paths.into_iter().collect::<Vec<_>>(),
     }))
 }
 

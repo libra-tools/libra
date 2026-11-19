@@ -490,7 +490,7 @@ async fn vcs_write(
     )?;
     if method == "vcs.commit" {
         let message = vcs::parse_commit_message(&request.params)?;
-        let created = super::vcs_write::commit_index(&message).await?;
+        let created = super::vcs_write::commit_index(&message, &paths).await?;
         let commit_oid = created["commitOid"]
             .as_str()
             .ok_or_else(|| BridgeError::internal("vcs.commit produced no commit id"))?

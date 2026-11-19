@@ -134,6 +134,11 @@ fn validate_path_selector(raw: &str) -> Result<String, BridgeError> {
             "path selector '{raw}' must be repository-relative, not absolute"
         )));
     }
+    if raw.contains(['*', '?', '[', ']']) {
+        return Err(BridgeError::invalid_params(format!(
+            "path selector '{raw}' contains pathspec glob syntax; the bridge accepts literal paths only"
+        )));
+    }
     if raw
         .split(['/', '\\'])
         .any(|component| component == ".." || component == "~")
@@ -983,6 +988,9 @@ mod tests {
             ":/",
             "C:\\Windows",
             "~",
+            "*.rs",
+            "src/?.txt",
+            "src/[ab].rs",
         ] {
             assert!(
                 validate_path_selector(bad).is_err(),

@@ -727,6 +727,36 @@ async fn vcs_stage_replays_and_refuses_a_stale_fence() {
     assert_eq!(replay.result.expect("result")["outcome"], "replayed");
 }
 
+/// (new) LVC-06: commit refuses when the index contains paths outside the request.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_commit_refuses_unselected_staged_paths() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    let before = Head::current_commit().await.expect("head");
+    write_file(dir.path(), "chosen.txt", "chosen\n");
+    write_file(dir.path(), "other.txt", "other\n");
+    stage(&["chosen.txt", "other.txt"]).await;
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.commit","params":{{"operation_id":"op-scope","session_id":"s1","message":"feat: one file","paths":["chosen.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let err = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect_err("scope mismatch");
+    assert!(
+        err.message.contains("do not match the staged set"),
+        "{}",
+        err.message
+    );
+    assert_eq!(Head::current_commit().await.expect("unchanged"), before);
+}
+
 async fn vcs_data(ctx: &BridgeContext, line: &str) -> Value {
     let response = read_dispatch(ctx, &request(line))
         .await
