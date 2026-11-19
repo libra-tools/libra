@@ -9,6 +9,80 @@ use std::io::Cursor;
 
 use libra::internal::ai::agent_bridge::transport::{HandshakeHandler, run};
 
+/// The transport must reject disabled VCS calls before a handler can have side effects.
+#[tokio::test]
+async fn disabled_vcs_methods_never_reach_the_handler() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use async_trait::async_trait;
+    use libra::internal::ai::agent_bridge::{
+        protocol::{BridgeError, BridgeRequest, BridgeResponse},
+        transport::BridgeHandler,
+    };
+
+    struct SideEffectHandler(AtomicUsize);
+    #[async_trait(?Send)]
+    impl BridgeHandler for SideEffectHandler {
+        async fn handle(
+            &self,
+            request: &BridgeRequest,
+        ) -> Result<Option<BridgeResponse>, BridgeError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(BridgeResponse {
+                jsonrpc: "2.0",
+                result: Some(serde_json::json!({"handled": true})),
+                error: None,
+                id: request.id.clone().unwrap_or(serde_json::Value::Null),
+            }))
+        }
+    }
+    let names = [
+        "vcs.identity",
+        "vcs.status",
+        "vcs.diff",
+        "vcs.log",
+        "vcs.show",
+        "vcs.stage",
+        "vcs.unstage",
+        "vcs.commit",
+    ];
+    let mut input = String::new();
+    for (id, method) in names.iter().enumerate() {
+        input.push_str(&format!(
+            "{}\n",
+            serde_json::json!({"jsonrpc":"2.0", "method":method, "id":id})
+        ));
+    }
+    input.push_str("{\"jsonrpc\":\"2.0\",\"method\":\"status.get\",\"id\":99}\n");
+    let handler = SideEffectHandler(AtomicUsize::new(0));
+    let mut output = Vec::new();
+    run(
+        Cursor::new(input),
+        &mut output,
+        &handler,
+        std::time::Duration::from_secs(30),
+    )
+    .await
+    .expect("transport");
+    let text = String::from_utf8(output).expect("utf8");
+    let responses: Vec<serde_json::Value> = text
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("frame"))
+        .collect();
+    assert_eq!(responses.len(), names.len() + 1);
+    for (id, response) in responses[..names.len()].iter().enumerate() {
+        assert_eq!(response["id"], id);
+        assert_eq!(response["error"]["code"], -32601);
+        assert!(response.get("result").is_none());
+    }
+    assert_eq!(responses[names.len()]["result"]["handled"], true);
+    assert_eq!(
+        handler.0.load(Ordering::SeqCst),
+        1,
+        "only the existing method reached the handler"
+    );
+}
+
 /// Every stdout line must be a valid NDJSON frame; diagnostics never reach
 /// stdout.
 #[tokio::test]

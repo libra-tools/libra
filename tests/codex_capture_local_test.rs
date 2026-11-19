@@ -2,6 +2,8 @@
 //! Run with --features test-live-agent --test codex_capture_local_test
 //! -- --ignored --test-threads=1. Synthetic fixtures do not prove model capture.
 
+#![recursion_limit = "256"]
+
 #[cfg(unix)]
 #[tokio::test]
 #[ignore = "operator-local Codex acceptance; never run in CI"]

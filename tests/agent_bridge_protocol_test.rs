@@ -12,15 +12,46 @@ use libra::internal::ai::agent_bridge::protocol::{
 };
 
 #[test]
-fn protocol_v1_allowlist_is_exactly_28_methods() {
+fn protocol_v1_allowlist_is_exactly_20_methods() {
     assert_eq!(
         libra::internal::ai::agent_bridge::protocol::METHOD_ALLOWLIST.len(),
-        28
+        20
     );
     assert_eq!(
         libra::internal::ai::agent_bridge::protocol::ProtocolVersion::current().minor,
         2
     );
+}
+
+#[test]
+fn unsafe_experimental_vcs_methods_are_neither_advertised_nor_accepted() {
+    use libra::internal::ai::agent_bridge::protocol::{dispatch_handshake, validate_method};
+    let request = parse_request_line(r#"{"jsonrpc":"2.0","method":"initialize","params":{"protocol":{"major":1,"minor":2}},"id":1}"#).expect("request");
+    let result = dispatch_handshake(&request)
+        .expect("handshake")
+        .expect("response")
+        .result
+        .expect("result");
+    let advertised = result["methods"].as_array().expect("methods");
+    for method in [
+        "vcs.identity",
+        "vcs.status",
+        "vcs.diff",
+        "vcs.log",
+        "vcs.show",
+        "vcs.stage",
+        "vcs.unstage",
+        "vcs.commit",
+    ] {
+        assert!(
+            !advertised
+                .iter()
+                .any(|entry| entry.as_str() == Some(method)),
+            "advertised {method}"
+        );
+        assert!(validate_method(method).is_err(), "accepted {method}");
+    }
+    assert!(validate_method("status.get").is_ok());
 }
 
 #[test]

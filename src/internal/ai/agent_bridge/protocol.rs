@@ -51,7 +51,7 @@ pub const MAX_PAGE: usize = 100;
 pub const MAX_SESSION_PAGE: usize = 500;
 
 // ---------------------------------------------------------------------------
-// The v1 method allowlist. Minor 1 adds five read-only `vcs.*` methods.
+// The v1 method allowlist. Experimental `vcs.*` methods remain disabled until reviewed.
 // Implementations must dispatch on these literal names; the model-visible
 // tool aliases (`libra_context`, …) are a TypeScript facade and are NOT
 // bridge methods. Unknown methods are still rejected fail-closed.
@@ -81,14 +81,6 @@ pub const METHOD_ALLOWLIST: &[&str] = &[
     "workspace.claim",
     "workspace.renew",
     "workspace.release",
-    "vcs.identity",
-    "vcs.status",
-    "vcs.diff",
-    "vcs.log",
-    "vcs.show",
-    "vcs.stage",
-    "vcs.unstage",
-    "vcs.commit",
 ];
 
 /// The allowlist as an efficient set for O(1) membership checks.
@@ -538,21 +530,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn allowlist_has_exactly_28_methods() {
-        assert_eq!(METHOD_ALLOWLIST.len(), 28);
+    fn allowlist_has_exactly_20_methods() {
+        assert_eq!(METHOD_ALLOWLIST.len(), 20);
         assert_eq!(PROTOCOL_MINOR, 2);
-        for method in [
-            "vcs.identity",
-            "vcs.status",
-            "vcs.diff",
-            "vcs.log",
-            "vcs.show",
-            "vcs.stage",
-            "vcs.unstage",
-            "vcs.commit",
-        ] {
-            assert!(MethodAllowlist::contains(method), "missing {method}");
-        }
         // The four handshake/session/ingress methods, projection, reads,
         // mutation and workspace groups must all be present.
         for m in [
