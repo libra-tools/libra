@@ -905,7 +905,7 @@ pub mod supervisor {
 /// A quiet, machine-mode output config for in-process service calls: nothing
 /// is written to stdout and hook I/O is piped rather than inherited
 /// (GC-LB-04).
-fn service_output() -> crate::utils::output::OutputConfig {
+pub(crate) fn service_output() -> crate::utils::output::OutputConfig {
     use crate::utils::output::{
         ColorChoice, JsonFormat, OutputConfig, ProgressMode, ProgressPreference,
     };

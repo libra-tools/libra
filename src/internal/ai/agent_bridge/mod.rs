@@ -26,6 +26,7 @@ pub mod storage;
 pub mod transport;
 pub mod vcs;
 pub mod vcs_read;
+pub mod vcs_write;
 pub mod workspace;
 
 pub use protocol::{

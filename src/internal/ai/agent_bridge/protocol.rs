@@ -22,7 +22,7 @@ pub const SOURCE_DEEPSEEK_HARNESS: &str = "deepseek-harness";
 /// processed (GC-LB-05). `minor` allows additive, backward-compatible fields
 /// on the same major.
 pub const PROTOCOL_MAJOR: u32 = 1;
-pub const PROTOCOL_MINOR: u32 = 1;
+pub const PROTOCOL_MINOR: u32 = 2;
 
 /// JSON-RPC 2.0 framing (ADR-LB-01): newline-delimited JSON on stdout;
 /// diagnostics only on stderr (GC-LB-04).
@@ -86,6 +86,9 @@ pub const METHOD_ALLOWLIST: &[&str] = &[
     "vcs.diff",
     "vcs.log",
     "vcs.show",
+    "vcs.stage",
+    "vcs.unstage",
+    "vcs.commit",
 ];
 
 /// The allowlist as an efficient set for O(1) membership checks.
@@ -535,15 +538,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn allowlist_has_exactly_25_methods() {
-        assert_eq!(METHOD_ALLOWLIST.len(), 25);
-        assert_eq!(PROTOCOL_MINOR, 1);
+    fn allowlist_has_exactly_28_methods() {
+        assert_eq!(METHOD_ALLOWLIST.len(), 28);
+        assert_eq!(PROTOCOL_MINOR, 2);
         for method in [
             "vcs.identity",
             "vcs.status",
             "vcs.diff",
             "vcs.log",
             "vcs.show",
+            "vcs.stage",
+            "vcs.unstage",
+            "vcs.commit",
         ] {
             assert!(MethodAllowlist::contains(method), "missing {method}");
         }

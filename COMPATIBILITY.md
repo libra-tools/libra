@@ -2008,4 +2008,4 @@ Codex acceptance cases remain local-only (`test-live-agent` plus `ignored`).
 
 ## DeepSeek Harness bridge read methods (LVC-02)
 
-Protocol major stays 1. Minor 1 adds `vcs.identity`, `vcs.status`, `vcs.diff`, `vcs.log`, and `vcs.show`. Older peers that do not advertise those names fail closed on them; `status.get` is still bridge session/event/checkpoint telemetry and is not worktree status. `vcs.identity.workdir` is a host binding path, not a model-facing field.
+Protocol major stays 1. Minor 1 adds `vcs.identity`, `vcs.status`, `vcs.diff`, `vcs.log`, and `vcs.show`. Minor 2 adds fenced `vcs.stage`, `vcs.unstage`, and `vcs.commit` without changing `commit.create`. Older peers that do not advertise those names fail closed on them; `status.get` is still bridge session/event/checkpoint telemetry and is not worktree status. `vcs.identity.workdir` is a host binding path, not a model-facing field.

@@ -51,7 +51,13 @@ pub async fn dispatch(
 fn is_mutation(method: &str) -> bool {
     matches!(
         method,
-        "checkpoint.create" | "checkpoint.restore" | "commit.create" | "review.run"
+        "checkpoint.create"
+            | "checkpoint.restore"
+            | "commit.create"
+            | "review.run"
+            | "vcs.stage"
+            | "vcs.unstage"
+            | "vcs.commit"
     )
 }
 
@@ -196,6 +202,9 @@ async fn dispatch_mutation(
             checkpoint_restore(ctx, &session, &session_id, &operation_id, request).await
         }
         "review.run" => review_run(ctx, &session, &session_id, &operation_id, request).await,
+        "vcs.stage" | "vcs.unstage" | "vcs.commit" => {
+            vcs_write(ctx, &session, &session_id, &operation_id, method, request).await
+        }
         // INVARIANT: `is_mutation` (above) mirrors exactly the match arms in
         // `dispatch_mutation`, so every allowlisted mutation method that
         // reaches this dispatcher is one of the handled arms. This arm is
@@ -230,7 +239,12 @@ async fn dispatch_mutation(
 fn replays_recorded_result(method: &str) -> bool {
     matches!(
         method,
-        "commit.create" | "review.run" | "checkpoint.restore"
+        "commit.create"
+            | "review.run"
+            | "checkpoint.restore"
+            | "vcs.stage"
+            | "vcs.unstage"
+            | "vcs.commit"
     )
 }
 
@@ -242,6 +256,9 @@ fn result_identity(method: &str, result: &Value) -> Option<String> {
         "commit.create" => "commit",
         "checkpoint.restore" => "target_commit",
         "review.run" => "run_id",
+        "vcs.stage" | "vcs.unstage" | "vcs.commit" => {
+            return serde_json::to_string(result).ok();
+        }
         _ => return None,
     };
     result.get(key).and_then(Value::as_str).map(str::to_string)
@@ -265,6 +282,16 @@ fn replayed_result(
             "head_moved": false,
             "replayed": true,
         })),
+        "vcs.stage" | "vcs.unstage" | "vcs.commit" => {
+            let mut value: Value = serde_json::from_str(result_digest).map_err(|error| {
+                BridgeError::internal(format!("vcs replay payload is not JSON: {error}"))
+            })?;
+            if let Some(object) = value.as_object_mut() {
+                object.insert("replayed".to_string(), json!(true));
+                object.insert("outcome".to_string(), json!("replayed"));
+            }
+            Ok(value)
+        }
         "review.run" => {
             let mut state = vcs::review_state(result_digest)?;
             if let Some(object) = state.as_object_mut() {
@@ -422,6 +449,94 @@ async fn review_run(
         object.insert("session_id".to_string(), json!(session_id));
     }
     Ok(state)
+}
+
+async fn vcs_write(
+    ctx: &BridgeContext,
+    session: &storage::BridgeSessionRow,
+    session_id: &str,
+    operation_id: &str,
+    method: &str,
+    request: &BridgeRequest,
+) -> Result<Value, BridgeError> {
+    let path_values = request
+        .params
+        .as_ref()
+        .and_then(|value| value.get("paths"))
+        .cloned()
+        .unwrap_or(json!([]));
+    let paths = vcs::parse_diff_params(&Some(json!({
+        "mode": "worktree",
+        "paths": path_values,
+    })))?
+    .1;
+    if paths.is_empty() {
+        return Err(BridgeError::invalid_params(
+            "vcs.stage, vcs.unstage, and vcs.commit require at least one repository-relative path",
+        ));
+    }
+    let expected_head = param_str(&request.params, "expectedHead")
+        .ok_or_else(|| BridgeError::invalid_params("vcs write methods require expectedHead"))?;
+    let expected_index = param_str(&request.params, "expectedIndex")
+        .ok_or_else(|| BridgeError::invalid_params("vcs write methods require expectedIndex"))?;
+    let expected_worktree = param_str(&request.params, "expectedWorktree")
+        .ok_or_else(|| BridgeError::invalid_params("vcs write methods require expectedWorktree"))?;
+    let actual = super::vcs_write::current_write_fence().await?;
+    super::vcs_write::require_matching_fence(
+        &actual,
+        &expected_head,
+        &expected_index,
+        &expected_worktree,
+    )?;
+    if method == "vcs.commit" {
+        let message = vcs::parse_commit_message(&request.params)?;
+        let created = super::vcs_write::commit_index(&message).await?;
+        let commit_oid = created["commitOid"]
+            .as_str()
+            .ok_or_else(|| BridgeError::internal("vcs.commit produced no commit id"))?
+            .to_string();
+        if param_bool(&request.params, "linkSession") {
+            record_association_links(
+                ctx,
+                session,
+                session_id,
+                operation_id,
+                "commit",
+                &commit_oid,
+                &evidence_ids(request),
+            )
+            .await?;
+        }
+        return Ok(json!({
+            "operationId": operation_id,
+            "outcome": "applied",
+            "commitOid": commit_oid,
+            "paths": created["paths"],
+            "failures": [],
+        }));
+    }
+    let (applied, failures) = if method == "vcs.stage" {
+        super::vcs_write::stage_paths(&paths).await
+    } else {
+        super::vcs_write::unstage_paths(&paths).await
+    };
+    if applied.is_empty() {
+        return Err(BridgeError::internal(format!(
+            "vcs write applied no paths: {failures:?}"
+        )));
+    }
+    let outcome = if failures.is_empty() {
+        "applied"
+    } else {
+        "partial"
+    };
+    Ok(json!({
+        "operationId": operation_id,
+        "outcome": outcome,
+        "commitOid": Value::Null,
+        "paths": applied,
+        "failures": failures,
+    }))
 }
 
 /// Record the durable association graph for one mutation result.

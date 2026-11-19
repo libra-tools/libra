@@ -680,6 +680,53 @@ async fn vcs_read_methods_report_identity_status_diff_and_log() {
     );
 }
 
+/// (new) LVC-06: stage is fenced, replay does not stage twice, and a stale
+/// fence does not touch the index.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_stage_replays_and_refuses_a_stale_fence() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), "queued.txt", "queued\n");
+
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let index_before = fs::read(dir.path().join(".libra").join("index")).expect("index");
+    let stale = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-stale","session_id":"s1","paths":["queued.txt"],"expectedHead":"deadbeef","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.index_generation, fence.worktree_generation
+    );
+    let err = mutation_dispatch(&ctx, &request(&stale))
+        .await
+        .expect_err("stale fence");
+    assert!(err.message.contains("stale_state"), "{}", err.message);
+    assert_eq!(
+        fs::read(dir.path().join(".libra").join("index")).expect("index"),
+        index_before
+    );
+
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-stage","session_id":"s1","paths":["queued.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":2}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let response = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect("stage")
+        .expect("response");
+    let result = response.result.expect("result");
+    assert_eq!(result["outcome"], "applied");
+    assert_eq!(result["paths"][0], "queued.txt");
+
+    let replay = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect("replay")
+        .expect("response");
+    assert_eq!(replay.result.expect("result")["outcome"], "replayed");
+}
+
 async fn vcs_data(ctx: &BridgeContext, line: &str) -> Value {
     let response = read_dispatch(ctx, &request(line))
         .await

@@ -12,14 +12,14 @@ use libra::internal::ai::agent_bridge::protocol::{
 };
 
 #[test]
-fn protocol_v1_allowlist_is_exactly_25_methods() {
+fn protocol_v1_allowlist_is_exactly_28_methods() {
     assert_eq!(
         libra::internal::ai::agent_bridge::protocol::METHOD_ALLOWLIST.len(),
-        25
+        28
     );
     assert_eq!(
         libra::internal::ai::agent_bridge::protocol::ProtocolVersion::current().minor,
-        1
+        2
     );
 }
 
