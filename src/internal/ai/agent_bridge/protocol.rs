@@ -81,7 +81,6 @@ pub const METHOD_ALLOWLIST: &[&str] = &[
     "workspace.claim",
     "workspace.renew",
     "workspace.release",
-    "vcs.fence",
 ];
 
 /// The allowlist as an efficient set for O(1) membership checks.
@@ -571,9 +570,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn allowlist_has_exactly_21_methods() {
-        assert_eq!(METHOD_ALLOWLIST.len(), 21);
-        assert!(MethodAllowlist::contains("vcs.fence"));
+    fn allowlist_has_exactly_20_methods() {
+        assert_eq!(METHOD_ALLOWLIST.len(), 20);
         assert_eq!(PROTOCOL_MINOR, 2);
         // The four handshake/session/ingress methods, projection, reads,
         // mutation and workspace groups must all be present.

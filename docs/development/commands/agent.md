@@ -317,7 +317,7 @@ Each MCP request emits one `agent.mcp.request` span (MC-22). `method` is the ori
 - **Protocol authority:** the frame/method/limit/error contract lives only in
   `src/internal/ai/agent_bridge/{protocol,transport}.rs` (GC-LB-02). The
   TypeScript plugin consumes the fixture generated from it; it must not define
-  a second schema. Protocol v1: minor 0 gets the original 20 methods; minor 1+ also gets read-only `vcs.fence`. Experimental write methods stay disabled, 256 KiB frame cap, 64
+  a second schema. Protocol v1: peers get the original 20 methods. Experimental `vcs.*` methods stay disabled pending safety fixes, 256 KiB frame cap, 64
   in-flight requests, 64-event/256 KiB batch, 30 s default deadline.
 - **Scope:** repository/worktree/workspace/actor scope is derived from the
   trusted context at handshake (GC-LB-06/07); self-reported identity is never

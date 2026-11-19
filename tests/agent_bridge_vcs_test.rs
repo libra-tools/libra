@@ -729,10 +729,10 @@ async fn vcs_stage_replays_and_refuses_a_stale_fence() {
     assert_eq!(replay.result.expect("result")["outcome"], "replayed");
 }
 
-/// (new) A negotiated connection can read the write fence through NDJSON.
+/// A negotiated connection must not expose the unsafe fence through NDJSON.
 #[tokio::test]
 #[serial(cwd, env, hash_kind)]
-async fn vcs_fence_is_readable_after_minor_one_handshake() {
+async fn vcs_fence_is_disabled_after_minor_one_handshake() {
     use std::io::Cursor;
 
     use libra::{
@@ -742,9 +742,6 @@ async fn vcs_fence_is_readable_after_minor_one_handshake() {
     let dir = tempfile::tempdir().expect("tempdir");
     let _guard = repo_with_initial_commit(dir.path()).await;
     let ctx = bridge_ctx().await;
-    let expected = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
-        .await
-        .expect("fence");
     let input = concat!(
         r#"{"jsonrpc":"2.0","method":"initialize","params":{"protocol":{"major":1,"minor":1}},"id":1}"#,
         "\n",
@@ -767,16 +764,14 @@ async fn vcs_fence_is_readable_after_minor_one_handshake() {
         .map(|line| serde_json::from_str(line).expect("frame"))
         .collect();
     assert!(
-        responses[0]["result"]["methods"]
+        !responses[0]["result"]["methods"]
             .as_array()
             .expect("methods")
             .iter()
             .any(|method| method == "vcs.fence")
     );
-    let data = &responses[1]["result"]["data"];
-    assert_eq!(data["head"], expected.head);
-    assert_eq!(data["indexGeneration"], expected.index_generation);
-    assert_eq!(data["worktreeGeneration"], expected.worktree_generation);
+    assert_eq!(responses[1]["error"]["code"], -32601);
+    assert!(responses[1].get("result").is_none());
 }
 
 /// (new) A recorded commit is replayed even if a later bookkeeping step failed.

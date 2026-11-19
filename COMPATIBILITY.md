@@ -2008,4 +2008,4 @@ Codex acceptance cases remain local-only (`test-live-agent` plus `ignored`).
 
 ## DeepSeek Harness bridge read methods (LVC-02)
 
-Protocol major stays 1. A minor-0 peer is not offered `vcs.fence`. Minor 1 or newer can read `vcs.fence` (`head`, `indexGeneration`, `worktreeGeneration`). Experimental VCS mutations are not advertised or accepted pending safety corrections. `status.get` remains bridge session/event/checkpoint telemetry, not worktree status; `commit.create` retains its existing contract.
+Protocol major stays 1. Experimental `vcs.*` methods, including `vcs.fence`, are not advertised or accepted pending safety corrections. `status.get` remains bridge session/event/checkpoint telemetry, not worktree status; `commit.create` retains its existing contract.
