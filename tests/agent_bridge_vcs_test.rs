@@ -729,6 +729,44 @@ async fn vcs_stage_replays_and_refuses_a_stale_fence() {
     assert_eq!(replay.result.expect("result")["outcome"], "replayed");
 }
 
+/// (new) A recorded commit is replayed even if a later bookkeeping step failed.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_commit_replay_keeps_a_published_result_after_failure() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), "only.txt", "only\n");
+    stage(&["only.txt"]).await;
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.commit","params":{{"operation_id":"op-once","session_id":"s1","message":"feat: only","paths":["only.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let first = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect("commit")
+        .expect("response")
+        .result
+        .expect("result");
+    let oid = first["commitOid"].as_str().expect("oid").to_string();
+    libra::internal::ai::agent_bridge::storage::fail_operation_keep_result(&ctx.conn, "op-once", 1)
+        .await
+        .expect("mark failed");
+    let replay = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect("replay")
+        .expect("response")
+        .result
+        .expect("result");
+    assert_eq!(replay["outcome"], "replayed");
+    assert_eq!(replay["commitOid"], oid);
+    assert_eq!(Head::current_commit().await.expect("head").to_string(), oid);
+}
+
 /// (new) Editing an already-unstaged file changes the fence, not only its path list.
 #[tokio::test]
 #[serial(cwd, env, hash_kind)]

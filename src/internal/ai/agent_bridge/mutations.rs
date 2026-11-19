@@ -171,7 +171,7 @@ async fn dispatch_mutation(
             .await
             .map_err(|e| BridgeError::internal(format!("read bridge operation: {e}")))?;
         match recorded {
-            Some((status, Some(result_digest))) if status == "applied" => {
+            Some((_, Some(result_digest))) => {
                 return Ok(ok_result(
                     replayed_result(method, &result_digest, &session_id)?,
                     id,
@@ -214,7 +214,7 @@ async fn dispatch_mutation(
     let result = match outcome {
         Ok(value) => value,
         Err(e) => {
-            storage::finish_operation(&ctx.conn, &operation_id, "failed", None, now_ms())
+            storage::fail_operation_keep_result(&ctx.conn, &operation_id, now_ms())
                 .await
                 .map_err(|err| BridgeError::internal(format!("finish bridge operation: {err}")))?;
             return Err(e);
@@ -494,6 +494,29 @@ async fn vcs_write(
                 .as_str()
                 .ok_or_else(|| BridgeError::internal("vcs.commit produced no commit id"))?
                 .to_string();
+            let published = json!({
+                "operationId": operation_id,
+                "outcome": "applied",
+                "commitOid": commit_oid,
+                "paths": created["paths"],
+                "failures": [],
+            });
+            let published_json = serde_json::to_string(&published).map_err(|error| {
+                BridgeError::internal(format!("vcs.commit could not record its result: {error}"))
+            })?;
+            storage::finish_operation(
+                &ctx.conn,
+                operation_id,
+                "applied",
+                Some(&published_json),
+                now_ms(),
+            )
+            .await
+            .map_err(|error| {
+                BridgeError::internal(format!(
+                    "vcs.commit published {commit_oid} but could not record it: {error}"
+                ))
+            })?;
             if param_bool(&request.params, "linkSession") {
                 record_association_links(
                     ctx,
@@ -506,13 +529,7 @@ async fn vcs_write(
                 )
                 .await?;
             }
-            return Ok(json!({
-                "operationId": operation_id,
-                "outcome": "applied",
-                "commitOid": commit_oid,
-                "paths": created["paths"],
-                "failures": [],
-            }));
+            return Ok(published);
         }
         let (applied, failures) = if method == "vcs.stage" {
             super::vcs_write::stage_paths(&paths).await

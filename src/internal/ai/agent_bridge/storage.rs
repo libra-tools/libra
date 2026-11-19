@@ -471,6 +471,22 @@ pub async fn finish_operation<C: ConnectionTrait>(
     Ok(())
 }
 
+/// Mark an operation failed without erasing a result that was already published.
+pub async fn fail_operation_keep_result<C: ConnectionTrait>(
+    conn: &C,
+    operation_id: &str,
+    now_ms: i64,
+) -> Result<(), DbErr> {
+    let stmt = Statement::from_sql_and_values(
+        DatabaseBackend::Sqlite,
+        "UPDATE agent_bridge_operation SET status = 'failed', completed_at = ? \
+         WHERE operation_id = ?",
+        [now_ms.into(), operation_id.into()],
+    );
+    conn.execute_raw(stmt).await?;
+    Ok(())
+}
+
 /// Read an operation's current status (for audit/observability and tests).
 pub async fn get_operation_status<C: ConnectionTrait>(
     conn: &C,
