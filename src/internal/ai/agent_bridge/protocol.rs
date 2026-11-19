@@ -466,6 +466,29 @@ pub fn validate_method(method: &str) -> Result<(), BridgeError> {
     }
 }
 
+/// Minor required before a connection may attempt a method. Experimental VCS
+/// methods stay above the negotiated baseline even while they are disabled.
+pub fn minimum_minor(method: &str) -> u32 {
+    match method {
+        "vcs.identity" | "vcs.status" | "vcs.diff" | "vcs.log" | "vcs.show" => 1,
+        "vcs.stage" | "vcs.unstage" | "vcs.commit" => 2,
+        _ => 0,
+    }
+}
+
+/// Admit a method for one connection. A peer that did not negotiate the
+/// required minor is rejected before the allowlist, so an old peer cannot
+/// invoke a newer method by guessing its name.
+pub fn admit_for_minor(peer_minor: u32, method: &str) -> Result<(), BridgeError> {
+    let required = minimum_minor(method);
+    if required > peer_minor {
+        return Err(BridgeError::invalid_params(format!(
+            "method '{method}' requires negotiated protocol minor {required}; this connection negotiated {peer_minor}"
+        )));
+    }
+    validate_method(method)
+}
+
 /// Enforce the v1 frame byte cap on an inbound line.
 pub fn check_frame_size(line: &str) -> Result<(), BridgeError> {
     if line.len() > MAX_FRAME_BYTES {

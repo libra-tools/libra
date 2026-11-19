@@ -65,6 +65,7 @@ pub async fn run<R: BufRead, W: Write>(
     let mut in_flight = 0usize;
     let mut frames = 0u64;
     let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut negotiated_minor: Option<u32> = None;
 
     loop {
         // Read one bounded NDJSON frame. `read_bounded_line` stops buffering
@@ -127,8 +128,9 @@ pub async fn run<R: BufRead, W: Write>(
             continue;
         }
 
-        // Validate the method against the allowlist before dispatching.
-        if let Err(err) = super::protocol::validate_method(&request.method) {
+        // Validate the negotiated minor and the allowlist before dispatching.
+        let peer_minor = negotiated_minor.unwrap_or(0);
+        if let Err(err) = super::protocol::admit_for_minor(peer_minor, &request.method) {
             if !is_notification {
                 write_response(&mut writer, err.into_object(id))?;
             }
@@ -147,6 +149,7 @@ pub async fn run<R: BufRead, W: Write>(
             }
             continue;
         }
+        let initializing = request.method == "initialize";
         in_flight += 1;
 
         // Dispatch with a hard request deadline (GC-LB-11). A handler that
@@ -193,6 +196,9 @@ pub async fn run<R: BufRead, W: Write>(
             Ok(Ok(Err(err))) => err.into_object(id),
         };
         in_flight -= 1;
+        if initializing && response.result.is_some() {
+            negotiated_minor = Some(requested_minor(&request));
+        }
 
         // Notifications get no reply (JSON-RPC 2.0).
         if !is_notification {
@@ -221,6 +227,17 @@ enum ReadOutcome {
 /// (not buffered) so the stream stays in sync, and the returned flag tells the
 /// caller the line was oversized. `R: BufRead` keeps this efficient:
 /// `bytes()` reads from the already-buffered data.
+fn requested_minor(request: &BridgeRequest) -> u32 {
+    request
+        .params
+        .as_ref()
+        .and_then(|params| params.get("protocol"))
+        .and_then(|protocol| protocol.get("minor"))
+        .and_then(Value::as_u64)
+        .and_then(|minor| u32::try_from(minor).ok())
+        .unwrap_or(0)
+}
+
 fn read_bounded_line<R: BufRead>(reader: &mut R) -> io::Result<ReadOutcome> {
     use std::io::Read;
     let mut line: Vec<u8> = Vec::new();

@@ -9,7 +9,44 @@ use std::io::Cursor;
 
 use libra::internal::ai::agent_bridge::transport::{HandshakeHandler, run};
 
-/// The transport must reject disabled VCS calls before a handler can have side effects.
+/// A minor-0 handshake cannot unlock experimental VCS methods, and it still
+/// serves the original allowlist.
+#[tokio::test]
+async fn minor_zero_handshake_rejects_unnegotiated_vcs_methods() {
+    let input = concat!(
+        r#"{"jsonrpc":"2.0","method":"initialize","params":{"protocol":{"major":1,"minor":0}},"id":1}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","method":"vcs.commit","id":2}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","method":"status.get","id":3}"#,
+        "\n",
+    );
+    let mut output = Vec::new();
+    run(
+        Cursor::new(input),
+        &mut output,
+        &HandshakeHandler,
+        std::time::Duration::from_secs(30),
+    )
+    .await
+    .expect("transport");
+    let responses: Vec<serde_json::Value> = String::from_utf8(output)
+        .expect("utf8")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("frame"))
+        .collect();
+    assert!(responses[0].get("result").is_some());
+    assert!(
+        responses[1]["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("requires negotiated protocol minor")
+    );
+    assert_eq!(
+        responses[2]["error"]["data"]["stable_code"], "LBR-AGENT-030",
+        "status.get remains accepted and reaches the handshake handler"
+    );
+}
 #[tokio::test]
 async fn disabled_vcs_methods_never_reach_the_handler() {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -72,7 +109,13 @@ async fn disabled_vcs_methods_never_reach_the_handler() {
     assert_eq!(responses.len(), names.len() + 1);
     for (id, response) in responses[..names.len()].iter().enumerate() {
         assert_eq!(response["id"], id);
-        assert_eq!(response["error"]["code"], -32601);
+        assert_eq!(response["error"]["code"], -32602);
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("requires negotiated protocol minor")
+        );
         assert!(response.get("result").is_none());
     }
     assert_eq!(responses[names.len()]["result"]["handled"], true);
