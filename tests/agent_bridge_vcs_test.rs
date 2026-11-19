@@ -670,6 +670,8 @@ async fn vcs_read_methods_report_identity_status_diff_and_log() {
     )
     .await;
     assert_eq!(show["summary"], "initial commit");
+    assert_eq!(show["files"][0]["path"], "tracked.txt");
+    assert!(show["cursor"]["next"].is_null());
 
     let legacy = vcs_data(&ctx, r#"{"jsonrpc":"2.0","method":"status.get","id":6}"#).await;
     assert!(legacy.get("entries").is_none());

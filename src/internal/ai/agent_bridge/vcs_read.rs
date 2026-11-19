@@ -14,7 +14,13 @@ use std::{
 
 use git_internal::{
     hash::ObjectHash,
-    internal::{index::Index, object::commit::Commit},
+    internal::{
+        index::Index,
+        object::{
+            commit::Commit,
+            tree::{Tree, TreeItemMode},
+        },
+    },
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -196,7 +202,7 @@ pub async fn show(params: &Option<Value>) -> Result<Value, BridgeError> {
     let commit = load_object::<Commit>(&oid)
         .map_err(|_| BridgeError::invalid_params(format!("vcs.show: '{oid}' is not a commit")))?;
     let parent = commit.parent_commit_ids.first().copied();
-    let files = if let Some(parent_oid) = parent {
+    let mut files = if let Some(parent_oid) = parent {
         let mut args = DiffArgs::for_service(false, Some(parent_oid.to_string()), Vec::new());
         args.new = Some(oid.to_string());
         match run_diff_for_service(args).await {
@@ -218,14 +224,64 @@ pub async fn show(params: &Option<Value>) -> Result<Value, BridgeError> {
             }
         }
     } else {
-        Vec::new()
+        let mut files = Vec::new();
+        root_commit_files(commit.tree_id, "", &mut files)?;
+        files
     };
+    if files.len() > 10_000 {
+        return Err(BridgeError::invalid_params(
+            "vcs.show refuses a commit with more than 10000 files",
+        ));
+    }
+    let offset = cursor_offset(params)?;
+    let limit = page_limit(params);
+    let next = if files.len() > offset.saturating_add(limit) {
+        Some((offset + limit).to_string())
+    } else {
+        None
+    };
+    files = files.into_iter().skip(offset).take(limit).collect();
     Ok(json!({
         "oid": oid.to_string(),
         "summary": summary_line(&commit.message),
         "parents": commit.parent_commit_ids.iter().map(ToString::to_string).collect::<Vec<_>>(),
         "files": files,
+        "cursor": { "next": next },
     }))
+}
+
+fn root_commit_files(
+    tree_id: ObjectHash,
+    prefix: &str,
+    files: &mut Vec<Value>,
+) -> Result<(), BridgeError> {
+    let tree = load_object::<Tree>(&tree_id).map_err(|error| {
+        BridgeError::internal(format!("vcs.show could not read tree '{tree_id}': {error}"))
+    })?;
+    let mut items = tree.tree_items;
+    items.sort_by(|left, right| left.name.cmp(&right.name));
+    for item in items {
+        let path = if prefix.is_empty() {
+            item.name.clone()
+        } else {
+            format!("{prefix}/{}", item.name)
+        };
+        if item.mode == TreeItemMode::Tree {
+            root_commit_files(item.id, &path, files)?;
+        } else {
+            files.push(json!({
+                "path": path,
+                "state": "staged",
+                "oldPath": Value::Null,
+            }));
+        }
+        if files.len() > 10_000 {
+            return Err(BridgeError::invalid_params(
+                "vcs.show refuses a commit with more than 10000 files",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn discovered_workdir() -> Result<PathBuf, BridgeError> {
