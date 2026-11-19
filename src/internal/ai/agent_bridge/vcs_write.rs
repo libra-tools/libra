@@ -4,16 +4,23 @@
 //! paths, an `operation_id`, and the HEAD/index/worktree fence the caller
 //! observed. A stale fence returns before any index or commit write.
 
-use sha2::{Digest, Sha256};
+use std::{collections::BTreeSet, path::Path};
 
-use super::{protocol::BridgeError, vcs, vcs_read};
+use sha2::{Digest, Sha256};
+use tokio::sync::Mutex;
+
+use super::{protocol::BridgeError, vcs};
 use crate::{
     command::{
         add::{AddArgs, execute_safe as add_execute},
         restore::{RestoreArgs, execute_safe as restore_execute},
+        status::{changes_to_be_committed_safe, changes_to_be_staged},
     },
-    utils::path,
+    utils::{path, util},
 };
+
+const MAX_FENCE_PATHS: usize = 256;
+static WRITE_GATE: Mutex<()> = Mutex::const_new(());
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WriteFence {
@@ -32,12 +39,32 @@ pub async fn current_write_fence() -> Result<WriteFence, BridgeError> {
         BridgeError::scope_mismatch("not_a_repository: vcs write methods need a Libra index")
     })?;
     let index_bytes = std::fs::read(&index_path).unwrap_or_default();
-    let status = vcs_read::status(&None).await?;
+    let workdir = util::try_working_dir().map_err(|_| {
+        BridgeError::scope_mismatch("not_a_repository: vcs write methods need a Libra worktree")
+    })?;
     Ok(WriteFence {
         head,
         index_generation: sha256_hex(&index_bytes),
-        worktree_generation: sha256_hex(status["entries"].to_string().as_bytes()),
+        worktree_generation: worktree_generation(&workdir).await?,
     })
+}
+
+/// Re-read the fence and run `write` while this process holds the write gate.
+/// Another process can still change the repository; that residual race is not
+/// closed by this gate.
+pub async fn run_fenced<T>(
+    expected: &WriteFence,
+    write: impl std::future::Future<Output = Result<T, BridgeError>>,
+) -> Result<T, BridgeError> {
+    let _gate = WRITE_GATE.lock().await;
+    let actual = current_write_fence().await?;
+    require_matching_fence(
+        &actual,
+        &expected.head,
+        &expected.index_generation,
+        &expected.worktree_generation,
+    )?;
+    write.await
 }
 
 pub fn require_matching_fence(
@@ -143,6 +170,57 @@ fn quiet_output() -> crate::utils::output::OutputConfig {
     let mut output = vcs::service_output();
     output.json_format = None;
     output
+}
+
+async fn worktree_generation(workdir: &Path) -> Result<String, BridgeError> {
+    let staged = changes_to_be_committed_safe()
+        .await
+        .map_err(|error| BridgeError::internal(format!("vcs fence: read index: {error}")))?;
+    let unstaged = changes_to_be_staged()
+        .map_err(|error| BridgeError::internal(format!("vcs fence: read worktree: {error}")))?;
+    let mut rows = BTreeSet::new();
+    collect_rows(workdir, &staged.to_relative(), "staged", &mut rows);
+    collect_rows(workdir, &unstaged.to_relative(), "unstaged", &mut rows);
+    if rows.len() > MAX_FENCE_PATHS {
+        return Err(BridgeError::invalid_params(format!(
+            "vcs fence refuses more than {MAX_FENCE_PATHS} changed paths"
+        )));
+    }
+    Ok(sha256_hex(
+        rows.into_iter().collect::<Vec<_>>().join("\n").as_bytes(),
+    ))
+}
+
+fn collect_rows(
+    workdir: &Path,
+    changes: &crate::command::status::Changes,
+    state: &str,
+    rows: &mut BTreeSet<String>,
+) {
+    for path in changes
+        .new
+        .iter()
+        .chain(changes.modified.iter())
+        .chain(changes.deleted.iter())
+    {
+        let rel = path.display().to_string().replace('\\', "/");
+        rows.insert(format!("{state}\t{rel}\t{}", content_digest(workdir, &rel)));
+    }
+    for (old, new) in &changes.renamed {
+        let rel = new.display().to_string().replace('\\', "/");
+        let from = old.display().to_string().replace('\\', "/");
+        rows.insert(format!(
+            "rename\t{from}\t{rel}\t{}",
+            content_digest(workdir, &rel)
+        ));
+    }
+}
+
+fn content_digest(workdir: &Path, relative: &str) -> String {
+    match std::fs::read(workdir.join(relative)) {
+        Ok(bytes) => sha256_hex(&bytes),
+        Err(_) => "missing".to_string(),
+    }
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {

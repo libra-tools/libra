@@ -481,62 +481,63 @@ async fn vcs_write(
         .ok_or_else(|| BridgeError::invalid_params("vcs write methods require expectedIndex"))?;
     let expected_worktree = param_str(&request.params, "expectedWorktree")
         .ok_or_else(|| BridgeError::invalid_params("vcs write methods require expectedWorktree"))?;
-    let actual = super::vcs_write::current_write_fence().await?;
-    super::vcs_write::require_matching_fence(
-        &actual,
-        &expected_head,
-        &expected_index,
-        &expected_worktree,
-    )?;
-    if method == "vcs.commit" {
-        let message = vcs::parse_commit_message(&request.params)?;
-        let created = super::vcs_write::commit_index(&message, &paths).await?;
-        let commit_oid = created["commitOid"]
-            .as_str()
-            .ok_or_else(|| BridgeError::internal("vcs.commit produced no commit id"))?
-            .to_string();
-        if param_bool(&request.params, "linkSession") {
-            record_association_links(
-                ctx,
-                session,
-                session_id,
-                operation_id,
-                "commit",
-                &commit_oid,
-                &evidence_ids(request),
-            )
-            .await?;
+    let expected = super::vcs_write::WriteFence {
+        head: expected_head,
+        index_generation: expected_index,
+        worktree_generation: expected_worktree,
+    };
+    return super::vcs_write::run_fenced(&expected, async move {
+        if method == "vcs.commit" {
+            let message = vcs::parse_commit_message(&request.params)?;
+            let created = super::vcs_write::commit_index(&message, &paths).await?;
+            let commit_oid = created["commitOid"]
+                .as_str()
+                .ok_or_else(|| BridgeError::internal("vcs.commit produced no commit id"))?
+                .to_string();
+            if param_bool(&request.params, "linkSession") {
+                record_association_links(
+                    ctx,
+                    session,
+                    session_id,
+                    operation_id,
+                    "commit",
+                    &commit_oid,
+                    &evidence_ids(request),
+                )
+                .await?;
+            }
+            return Ok(json!({
+                "operationId": operation_id,
+                "outcome": "applied",
+                "commitOid": commit_oid,
+                "paths": created["paths"],
+                "failures": [],
+            }));
         }
-        return Ok(json!({
+        let (applied, failures) = if method == "vcs.stage" {
+            super::vcs_write::stage_paths(&paths).await
+        } else {
+            super::vcs_write::unstage_paths(&paths).await
+        };
+        if applied.is_empty() {
+            return Err(BridgeError::internal(format!(
+                "vcs write applied no paths: {failures:?}"
+            )));
+        }
+        let outcome = if failures.is_empty() {
+            "applied"
+        } else {
+            "partial"
+        };
+        Ok(json!({
             "operationId": operation_id,
-            "outcome": "applied",
-            "commitOid": commit_oid,
-            "paths": created["paths"],
-            "failures": [],
-        }));
-    }
-    let (applied, failures) = if method == "vcs.stage" {
-        super::vcs_write::stage_paths(&paths).await
-    } else {
-        super::vcs_write::unstage_paths(&paths).await
-    };
-    if applied.is_empty() {
-        return Err(BridgeError::internal(format!(
-            "vcs write applied no paths: {failures:?}"
-        )));
-    }
-    let outcome = if failures.is_empty() {
-        "applied"
-    } else {
-        "partial"
-    };
-    Ok(json!({
-        "operationId": operation_id,
-        "outcome": outcome,
-        "commitOid": Value::Null,
-        "paths": applied,
-        "failures": failures,
-    }))
+            "outcome": outcome,
+            "commitOid": Value::Null,
+            "paths": applied,
+            "failures": failures,
+        }))
+    })
+    .await;
 }
 
 /// Record the durable association graph for one mutation result.

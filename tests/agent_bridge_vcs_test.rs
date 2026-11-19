@@ -727,6 +727,23 @@ async fn vcs_stage_replays_and_refuses_a_stale_fence() {
     assert_eq!(replay.result.expect("result")["outcome"], "replayed");
 }
 
+/// (new) Editing an already-unstaged file changes the fence, not only its path list.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_fence_changes_when_file_content_changes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    write_file(dir.path(), "tracked.txt", "one\nchanged\n");
+    let first = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("first fence");
+    write_file(dir.path(), "tracked.txt", "one\nchanged again\n");
+    let second = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("second fence");
+    assert_ne!(first.worktree_generation, second.worktree_generation);
+}
+
 /// (new) LVC-06: commit refuses when the index contains paths outside the request.
 #[tokio::test]
 #[serial(cwd, env, hash_kind)]
