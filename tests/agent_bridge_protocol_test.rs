@@ -12,11 +12,12 @@ use libra::internal::ai::agent_bridge::protocol::{
 };
 
 #[test]
-fn protocol_v1_allowlist_is_exactly_20_methods() {
+fn protocol_v1_allowlist_is_exactly_21_methods() {
     assert_eq!(
         libra::internal::ai::agent_bridge::protocol::METHOD_ALLOWLIST.len(),
-        20
+        21
     );
+    assert!(libra::internal::ai::agent_bridge::protocol::MethodAllowlist::contains("vcs.fence"));
     assert_eq!(
         libra::internal::ai::agent_bridge::protocol::ProtocolVersion::current().minor,
         2

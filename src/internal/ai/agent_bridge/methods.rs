@@ -91,6 +91,21 @@ pub async fn dispatch(
             resp.id = id;
             Ok(Some(resp))
         }
+        "vcs.fence" => {
+            let fence = super::vcs_write::current_write_fence().await?;
+            Ok(Some(
+                vcs_response(
+                    ctx,
+                    id,
+                    json!({
+                        "head": fence.head,
+                        "indexGeneration": fence.index_generation,
+                        "worktreeGeneration": fence.worktree_generation,
+                    }),
+                )
+                .await,
+            ))
+        }
         "vcs.identity" => Ok(Some(
             vcs_response(ctx, id, super::vcs_read::identity().await?).await,
         )),

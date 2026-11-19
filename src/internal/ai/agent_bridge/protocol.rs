@@ -81,6 +81,7 @@ pub const METHOD_ALLOWLIST: &[&str] = &[
     "workspace.claim",
     "workspace.renew",
     "workspace.release",
+    "vcs.fence",
 ];
 
 /// The allowlist as an efficient set for O(1) membership checks.
@@ -470,7 +471,7 @@ pub fn validate_method(method: &str) -> Result<(), BridgeError> {
 /// methods stay above the negotiated baseline even while they are disabled.
 pub fn minimum_minor(method: &str) -> u32 {
     match method {
-        "vcs.identity" | "vcs.status" | "vcs.diff" | "vcs.log" | "vcs.show" => 1,
+        "vcs.fence" | "vcs.identity" | "vcs.status" | "vcs.diff" | "vcs.log" | "vcs.show" => 1,
         "vcs.stage" | "vcs.unstage" | "vcs.commit" => 2,
         _ => 0,
     }
@@ -479,6 +480,15 @@ pub fn minimum_minor(method: &str) -> u32 {
 /// Admit a method for one connection. A peer that did not negotiate the
 /// required minor is rejected before the allowlist, so an old peer cannot
 /// invoke a newer method by guessing its name.
+fn requested_minor(params: Option<&Value>) -> u32 {
+    params
+        .and_then(|params| params.get("protocol"))
+        .and_then(|protocol| protocol.get("minor"))
+        .and_then(Value::as_u64)
+        .and_then(|minor| u32::try_from(minor).ok())
+        .unwrap_or(0)
+}
+
 pub fn admit_for_minor(peer_minor: u32, method: &str) -> Result<(), BridgeError> {
     let required = minimum_minor(method);
     if required > peer_minor {
@@ -524,10 +534,18 @@ pub fn dispatch_handshake(request: &BridgeRequest) -> Result<Option<BridgeRespon
             // (GC-LB-06/07): the handshake itself only negotiates protocol and
             // capabilities, and never trusts a self-reported repository id.
 
+            let minor = requested_minor(params).min(PROTOCOL_MINOR);
             let capability = BridgeCapability {
-                protocol: ProtocolVersion::current(),
+                protocol: ProtocolVersion {
+                    major: PROTOCOL_MAJOR,
+                    minor,
+                },
                 limits: BridgeLimits::v1(),
-                methods: METHOD_ALLOWLIST.to_vec(),
+                methods: METHOD_ALLOWLIST
+                    .iter()
+                    .copied()
+                    .filter(|method| minimum_minor(method) <= minor)
+                    .collect(),
                 source: SOURCE_DEEPSEEK_HARNESS,
             };
             let result = serde_json::to_value(capability).map_err(|e| {
@@ -553,8 +571,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn allowlist_has_exactly_20_methods() {
-        assert_eq!(METHOD_ALLOWLIST.len(), 20);
+    fn allowlist_has_exactly_21_methods() {
+        assert_eq!(METHOD_ALLOWLIST.len(), 21);
+        assert!(MethodAllowlist::contains("vcs.fence"));
         assert_eq!(PROTOCOL_MINOR, 2);
         // The four handshake/session/ingress methods, projection, reads,
         // mutation and workspace groups must all be present.

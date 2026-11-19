@@ -37,6 +37,13 @@ async fn minor_zero_handshake_rejects_unnegotiated_vcs_methods() {
         .collect();
     assert!(responses[0].get("result").is_some());
     assert!(
+        !responses[0]["result"]["methods"]
+            .as_array()
+            .expect("methods")
+            .iter()
+            .any(|method| method == "vcs.fence")
+    );
+    assert!(
         responses[1]["error"]["message"]
             .as_str()
             .unwrap_or_default()
