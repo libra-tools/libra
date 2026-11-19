@@ -147,7 +147,7 @@ structured report is always present.
 | `128` | `LBR-AGENT-023` | `internal` | Workspace lease owner/fence is stale — the lease was reclaimed with a higher fence or already settled | renewing or releasing after the expired lease was reclaimed with a higher fence by its workspace owner |
 | `frame` | `LBR-AGENT-024` | `internal` | Bridge protocol frame failed JSON parsing (JSON-RPC `-32700`) | a peer writes a non-JSON NDJSON line to `libra agent bridge --stdio` |
 | `frame` | `LBR-AGENT-025` | `internal` | Bridge request is not a valid JSON-RPC 2.0 object (JSON-RPC `-32600`) | a peer sends a frame missing `jsonrpc`/`method`, or with an unsupported `jsonrpc` version |
-| `frame` | `LBR-AGENT-026` | `internal` | Bridge method is not in the v1 20-method allowlist (JSON-RPC `-32601`) | invoking `create_intent` or another low-level method over the bridge |
+| `frame` | `LBR-AGENT-026` | `internal` | Bridge method is not in this build's method allowlist (JSON-RPC `-32601`) | invoking `create_intent` or another low-level method over the bridge |
 | `frame` | `LBR-AGENT-027` | `internal` | Bridge method params failed schema/limit validation (JSON-RPC `-32602`) | `event.append` with a batch over 64 events or 256 KiB |
 | `frame` | `LBR-AGENT-028` | `internal` | Bridge request exceeded the v1 frame byte cap (256 KiB) and was refused; an MCP tool result over 256 KiB uses this code; an MCP read worker memory limit uses `worker_memory_limit` | a peer writes an NDJSON line larger than 256 KiB, an MCP tool result exceeds 256 KiB, or read worker memory is exhausted |
 | `frame` | `LBR-AGENT-029` | `internal` | Bridge connection already has the maximum in-flight requests (64) | a peer floods requests without waiting for responses |
@@ -295,7 +295,7 @@ evidence on uncertainty. See [repair recovery](commands/config.md#confirmed-lega
 | `LBR-AGENT-023` | The presented workspace lease owner/fence is stale; the lease was reclaimed or already released |
 | `LBR-AGENT-024` | Bridge protocol frame failed JSON parsing |
 | `LBR-AGENT-025` | Bridge request is not a valid JSON-RPC 2.0 object |
-| `LBR-AGENT-026` | Bridge method is not in the v1 20-method allowlist |
+| `LBR-AGENT-026` | Bridge method is not in this build's method allowlist |
 | `LBR-AGENT-027` | Bridge method params failed schema/limit validation |
 | `LBR-AGENT-028` | Bridge request exceeded the v1 frame byte cap (256 KiB) and was refused; an MCP tool result over 256 KiB uses this code; an MCP read worker memory limit uses `worker_memory_limit` |
 | `LBR-AGENT-029` | Bridge connection already has the maximum in-flight requests (64) |

@@ -606,3 +606,85 @@ fn commit_create_waits_for_a_deletion_phase_before_publishing() {
         "commit.create must wait for the deletion phase, not publish underneath it"
     );
 }
+
+/// (new) LVC-02: `vcs.*` reads the real repository and leaves `status.get` as
+/// bridge telemetry.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_read_methods_report_identity_status_diff_and_log() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+
+    write_file(dir.path(), "tracked.txt", "one\ntwo\n");
+    write_file(dir.path(), "extra.txt", "extra\n");
+    stage(&["extra.txt"]).await;
+
+    let identity = vcs_data(&ctx, r#"{"jsonrpc":"2.0","method":"vcs.identity","id":1}"#).await;
+    assert!(identity["worktree_root_hash"].as_str().unwrap().len() == 64);
+    assert!(identity["head_oid"].as_str().is_some());
+    assert_eq!(identity["unborn"], false);
+    assert!(
+        identity["workdir"]
+            .as_str()
+            .unwrap()
+            .contains(dir.path().file_name().unwrap().to_str().unwrap())
+            || identity["workdir"].as_str().is_some()
+    );
+
+    let status = vcs_data(&ctx, r#"{"jsonrpc":"2.0","method":"vcs.status","id":2}"#).await;
+    let entries = status["entries"].as_array().expect("entries");
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry["path"] == "tracked.txt" && entry["state"] == "unstaged"),
+        "unstaged edit must be distinct: {entries:?}"
+    );
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry["path"] == "extra.txt" && entry["state"] == "staged"),
+        "staged file must be distinct: {entries:?}"
+    );
+
+    let diff = vcs_data(
+        &ctx,
+        r#"{"jsonrpc":"2.0","method":"vcs.diff","params":{"sides":"worktree-vs-index","paths":["tracked.txt"]},"id":3}"#,
+    )
+    .await;
+    assert_eq!(diff["sides"], "worktree-vs-index");
+    let patch = diff["files"][0]["patch"].as_str().expect("patch");
+    assert!(patch.contains("+two"), "real patch, got {patch}");
+
+    let log = vcs_data(
+        &ctx,
+        r#"{"jsonrpc":"2.0","method":"vcs.log","params":{"limit":1},"id":4}"#,
+    )
+    .await;
+    let oid = log["commits"][0]["oid"].as_str().expect("oid").to_string();
+    assert_eq!(log["commits"][0]["summary"], "initial commit");
+
+    let show = vcs_data(
+        &ctx,
+        &format!(r#"{{"jsonrpc":"2.0","method":"vcs.show","params":{{"oid":"{oid}"}},"id":5}}"#),
+    )
+    .await;
+    assert_eq!(show["summary"], "initial commit");
+
+    let legacy = vcs_data(&ctx, r#"{"jsonrpc":"2.0","method":"status.get","id":6}"#).await;
+    assert!(legacy.get("entries").is_none());
+    assert!(
+        legacy.get("bridge_sessions").is_some()
+            || legacy.get("bridge_events").is_some()
+            || legacy.as_object().is_some()
+    );
+}
+
+async fn vcs_data(ctx: &BridgeContext, line: &str) -> Value {
+    let response = read_dispatch(ctx, &request(line))
+        .await
+        .expect("dispatch")
+        .expect("response");
+    let result = response.result.expect("result envelope");
+    envelope_data(&result).clone()
+}

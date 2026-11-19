@@ -334,7 +334,7 @@ profile，而不是假设 Harness 已经内置 Libra 专用 profile。
 ### MVP（对应 LB-01…LB-06 + TS-01…TS-06 的最小可写且可治理切片）
 
 1. 独立的 `libra agent bridge --stdio` 入口；若新增顶层 Libra 命令或 `agent` 子命令，必须同时更新 `COMPATIBILITY.md`、对应 `docs/commands/<cmd>.md`（含 `Examples`）、CLI `*_EXAMPLES`/root command groups，以及相关 compat guards；新增稳定错误码还要同步 `docs/error-codes.md`。
-2. Rust authoritative schema/fixture：含完整 20-method allowlist、frame/batch limits、`last_acked_seq`、稳定错误码（TypeScript 只接收，不发明）。
+2. Rust authoritative schema/fixture：含完整 method allowlist（minor 1 在原 20 个方法上增加只读 `vcs.identity`、`vcs.status`、`vcs.diff`、`vcs.log`、`vcs.show`；`status.get` 仍是 bridge telemetry，不是工作区 status）、frame/batch limits、`last_acked_seq`、稳定错误码（TypeScript 只接收，不发明）。
 3. `context.get` / `status.get` / `diff.get` / `history.search` / `checkpoint.*` 只读方法与模型可见 facade。
 4. `session.open` / `event.append` / `session.flush` / `session.close` 的批量投影、outbox、幂等和断点续传。
 5. `commit.create` 与 Harness session/checkpoint/evidence 关联；双层 approval；危险操作默认关闭。

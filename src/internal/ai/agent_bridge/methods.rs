@@ -25,6 +25,12 @@ use super::{
 /// The v1 result envelope schema version (fixed, additive).
 pub const READ_SCHEMA_VERSION: i64 = 1;
 
+async fn vcs_response(ctx: &BridgeContext, id: Value, data: Value) -> BridgeResponse {
+    let mut response = ok_envelope(ctx, data, "", json!([]));
+    response.id = id;
+    response
+}
+
 fn ok_envelope(
     ctx: &BridgeContext,
     data: Value,
@@ -85,6 +91,21 @@ pub async fn dispatch(
             resp.id = id;
             Ok(Some(resp))
         }
+        "vcs.identity" => Ok(Some(
+            vcs_response(ctx, id, super::vcs_read::identity().await?).await,
+        )),
+        "vcs.status" => Ok(Some(
+            vcs_response(ctx, id, super::vcs_read::status(&request.params).await?).await,
+        )),
+        "vcs.diff" => Ok(Some(
+            vcs_response(ctx, id, super::vcs_read::diff(&request.params).await?).await,
+        )),
+        "vcs.log" => Ok(Some(
+            vcs_response(ctx, id, super::vcs_read::log(&request.params).await?).await,
+        )),
+        "vcs.show" => Ok(Some(
+            vcs_response(ctx, id, super::vcs_read::show(&request.params).await?).await,
+        )),
         _ => Ok(None),
     }
 }

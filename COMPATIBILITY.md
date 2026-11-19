@@ -2005,3 +2005,7 @@ Codex acceptance cases remain local-only (`test-live-agent` plus `ignored`).
 ## Human host redaction (SC-07)
 
 `auth status` human output redacts a username after the URL helper. A username whose longest prefix is `github_pat_`, `ghp_`, or `sk-` is shown as `[REDACTED]`. `login` human output redacts the server `exchanged.host`, and `whoami` human output redacts `body.host`. An origin with no userinfo stays byte-for-byte the same, with no added trailing slash. `--json` for auth, login, and whoami is unchanged. 人读 host 脱敏 applies only to those human lines.
+
+## DeepSeek Harness bridge read methods (LVC-02)
+
+Protocol major stays 1. Minor 1 adds `vcs.identity`, `vcs.status`, `vcs.diff`, `vcs.log`, and `vcs.show`. Older peers that do not advertise those names fail closed on them; `status.get` is still bridge session/event/checkpoint telemetry and is not worktree status. `vcs.identity.workdir` is a host binding path, not a model-facing field.
