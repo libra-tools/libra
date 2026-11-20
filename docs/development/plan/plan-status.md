@@ -1281,7 +1281,7 @@ FIX08采纳候选待双审；Mega109/活动108、Libra26/活动25、联合135/�
 
 | 计划 | 类别 | 状态 | 一句话进度（卡片状态） |
 |---|---|---|---|
-| [`plan-20261120-ui-real-data.md`](plan-20261120-ui-real-data.md) | D（`libra ui` 桌面窗口真实数据接入） | 未启动 | 7 张活动卡 `UID-01`..`UID-07` 全部 `pending` / 验收空；计划文本 R1–R4 四轮双评均 FAIL 已修订至第五版，R5 待审；串行链 `UID-01 → UID-02 → UID-03 → UID-04 → UID-05 → UID-06 → UID-07`；链首 `UID-01` 只读数据接缝；`UID-02`..`UID-05` 命中 `T-1`（共享读 API 提升）；无 `EX-*`、无 `REL-*`、全串行发布；内嵌演示数据随对应卡删除 |
+| [`plan-20261120-ui-real-data.md`](plan-20261120-ui-real-data.md) | D（`libra ui` 桌面窗口真实数据接入） | 未启动 | 7 张活动卡 `UID-01`..`UID-07` 全部 `pending` / 验收空；计划文本 R1–R7 双评 FAIL、R8 Codex FAIL 后逐轮修订，R9/R10/R11 双评 PASS，R12 最终字节确认待；串行链 `UID-01 → UID-02 → UID-03 → UID-04 → UID-05 → UID-06 → UID-07`；链首 `UID-01` 只读数据接缝；`UID-02`..`UID-05` 命中 `T-1`（共享读 API 提升）；无 `EX-*`、无 `REL-*`、全串行发布；内嵌演示数据随对应卡删除 |
 | [`plan-20261117-branch.md`](plan-20261117-branch.md) | Git 兼容（`branch`） | 已排期 | 35 张活动卡：`BR-01` 已 `done`/`complete`（`0.30.212`；Codex R4 PASS），其余 `pending`；计划文本 Claude R8 + Codex R8 双审 PASS（受审 SHA-256 前 12 位 `ea135d1e7ecd`）。链首 `BR-01` 已完成；`BR-17`/`BR-21`/`BR-09` 的完整上游脚本 setup 分别受 `#686`/`#556`/`#675` 等外部 Issue 影响，`issues/541` 只影响上游脚本 setup，不阻塞 `BR-03` 本地聚焦验收；`#676` 为完整 `t3204` 前置。 |
 | [`plan-20261117-checkout-switch-restore.md`](plan-20261117-checkout-switch-restore.md) | Git 兼容（`checkout`/`switch`/`restore`） | 已排期 | 38 张活动任务卡全部 `pending`；Claude R11 + Codex R11 双审 PASS（`fd3f96ccd547`）。链首 `CSR-01` 可开工；`CSR-21` 等受 `merge-pull` 的 `MP-17..MP-25` 写集顺序门控，`restore` 卡与 `worktree` 计划共享写集。 |
 | [`plan-20261117-clone.md`](plan-20261117-clone.md) | Git 兼容（`clone`） | 执行中 | 27 张活动任务卡：`CL-01`、`CL-02`、`CL-03`、`CL-04`、`CL-23`、`CL-28`、`CL-25` 已 `done`（`CL-25` 为 `remote-pending`，版本 `0.30.219`），其余 `pending`；Claude R73 + Codex R73 双审 PASS（`189cec976839`）。链首 `CL-01` 已完成，下一张 `CL-05`；`CL-14` 等 `PM-06` |
@@ -1480,7 +1480,7 @@ FIX08采纳候选待双审；Mega109/活动108、Libra26/活动25、联合135/�
 
 **20261117 批次：** 15 份 `plan-20261117-*.md` 均为“已排期；除 `WC-11a`/`WC-11b`/`WC-11R` 为 `blocked` 外，活动卡均 pending”，逐计划状态见 `## 一、计划一览` 的 `### 20261117 批次`；可立即开工的入口卡见 `## 四·零`。本节下方列表为旧快照，未逐项重排。
 
-**2026-11-20 `libra ui` 真实数据接入：** [`plan-20261120-ui-real-data.md`](plan-20261120-ui-real-data.md) 为新建设计计划，`UID-01`..`UID-07` 全部 `pending` / 验收空；本轮只写计划，不表示任何窗口数据已接入。R4 双评 FAIL 已再修订至第五版（dirty 改 stat-only 不哈希、关闭改 controller 记录 + `gui::run` 持有 handle、op 改 id 快照、权限改读打开探测、run 改解析上限 500 + 每 kind 100 + truncated、History 改 commit-keyed 批量归属、catalog 迁移序列固定、AC 去 panic 捆绑 + 逐卡映射、每卡登记 DEP-03/04、DEP-UID-05 改行为门、锚点/landing 计数修正），R5 复审待。开工门为 R5 review `PASS` 与维护者授权，`UID-01` 是唯一链首；七卡实现写集相交于 `src/gui/desktop.rs`、`src/gui/data/mod.rs`、`docs/commands/ui.md` 与 `COMPATIBILITY.md`，按 ER-12 全串行发布。
+**2026-11-20 `libra ui` 真实数据接入：** [`plan-20261120-ui-real-data.md`](plan-20261120-ui-real-data.md) 为新建设计计划，`UID-01`..`UID-07` 全部 `pending` / 验收空；本轮只写计划，不表示任何窗口数据已接入。计划文本经 R1–R7 双评 FAIL、R8 Codex FAIL 逐轮修订；R9/R10/R11/R12 均 PASS（Codex 与 Claude 各自对当轮字节审查），现为最终版。开工门为 R12 终确认 `PASS` 与维护者授权；`UID-01` 是唯一链首，七卡实现写集相交于 `src/gui/desktop.rs`、`src/gui/data/mod.rs`、`docs/commands/ui.md`、`COMPATIBILITY.md` 与 `plan-status.md`，按 ER-12 全串行发布。
 
 [Memory benchmark 平台接入计划](plan-20261103.md)为新增设计项，BM-00..07 全部 pending；本轮只写计划，不表示已部署平台、接入模型或完成质量评测。
 
@@ -1894,6 +1894,7 @@ SBX-01..05 `done/locally-accepted`；**发布步按 DEFER-SBX-06 正式延后**�
 - DEFER-UID-06：diff/hunk 内容视图；重启条件为需要 hunk 级审阅。
 - DEFER-UID-07：run 全文（findings/diff 内容）；重启条件为需要审阅 run 细节。
 - DEFER-UID-08：Linux/Windows 桌面人工验收；重启条件为有对应桌面会话或图形 CI。
+- DEFER-UID-09：stat-only dirty 摘要（staged/unstaged/untracked + `unverified`）；现有 status 采集器会做内容哈希并写 conversion 证书，需要独立 stat-only 共享 reader（`T-1`）；重启条件为维护者批准该共享 reader。
 
 ### #1059 的格式與平台邊界（2026-11-10 15:49:01 UTC）
 
@@ -1977,9 +1978,9 @@ DEFER-AD-01..16：Git advice、ignored 相对路径、`add -u --ignore-missing` 
 |---|---|---|---|
 | DEP-UID-01 | 跨计划前置（`plan-20261120-ui-real-data.md` ← capture-queue） | `UID-02`/`UID-03`/`UID-07` 消费 `.libra/private/capture.db` 的 `agent_session`/`agent_checkpoint`/`agent_session_commit` 与只读打开 API；CQ-04 已 `done`/`complete`；布局变化时这些卡置 `blocked` 并登记 `FIX-*`；等待上限 1 个发布切片 | 2026-11-20 20:05:00 UTC 复核；产物已在 main（`src/internal/ai/capture/store.rs:93`） |
 | DEP-UID-02 | 跨计划前置（`plan-20261120-ui-real-data.md` ← `plan-20260926.md` DM-11 读面） | `UID-05`/`UID-07` 只消费 `memory` 读面（伴生有界 API 由 `UID-05` 新增，保留 `list_episodes` 原签名）；只要求 API 在 main 可用（DM-11 卡面 `locally-accepted`，不要求其 `done`）；API 变更时这些卡置 `blocked`；等待上限 1 个发布切片 | 2026-11-20 20:05:00 UTC 复核；API 已合入 main（`src/internal/ai/memory/reader.rs:198`） |
-| DEP-UID-03 | 跨计划文件级写集窗口（`plan-20261120-ui-real-data.md` ↔ `plan-20261117-*.md`） | 本计划每卡写 `COMPATIBILITY.md`、`docs/commands/ui.md`、`docs/development/commands/README.md`、`plan-status.md`；开工前扫描 15 份 20261117 计划的 `in-progress` 卡，确认无卡写同一文件（不论行）；窗口上限 1 个发布切片，超时置 `blocked` | 2026-11-20 20:05:00 UTC 复核；本计划尚未开工，未取得窗口 |
+| DEP-UID-03 | 跨计划文件级写集窗口（`plan-20261120-ui-real-data.md` ↔ `plan-20261117-*.md`） | 本计划每卡写 `COMPATIBILITY.md`、`docs/commands/ui.md`、`docs/development/commands/README.md`、`plan-status.md`（整文件）；开工前扫描 15 份 20261117 计划的 `in-progress` 卡，确认无卡写同一文件（不论行）；窗口上限 1 个发布切片，超时置 `blocked` | 2026-11-20 20:05:00 UTC 复核；本计划尚未开工，未取得窗口 |
 | DEP-UID-04 | 外部仓库交付（`../libra-backend` `cf`） | 每卡同步 `commands/ui.en.md`；文档未交付 → `blocked`；已提交推送仅部署待确认 → `remote-pending`；后端要求 sync check、typecheck/build 与 Claude Code PASS；等待上限 1 个发布切片 | 2026-11-20 20:05:00 UTC 复核；后端为 Libra 仓库、`cf` 分支，尚未写入本计划内容 |
-| DEP-UID-05 | 基线前置（`libra ui` 全局 flag 修复） | `UID-01` 要求 main 上 `ui_window_launch` 使用 clap 解析（`Cli::try_parse_from`）且 `ui_test` 通过；未合入则 `UID-01` 置 `blocked`，不得在本计划内夹带该修复；等待上限 1 个发布切片 | 2026-11-20 20:05:00 UTC 复核；修复提交待合入 main（`src/cli.rs:1401`） |
+| DEP-UID-05 | 基线前置（`libra ui` 全局 flag 行为修复） | `UID-01` 按**行为**判定：main 上 `libra ui --json` 与 `libra ui --no-pager` 打开窗口（不返回 `LBR-UNSUPPORTED-001`），且 `ui_test` 通过；不绑定具体实现；未合入则 `UID-01` 置 `blocked`，不得在本计划内夹带该修复；等待上限 1 个发布切片 | 2026-11-20 22:10:00 UTC 复核；修复已在本计划基线提交（`src/cli.rs:1401`） |
 | DEP-I978-CHAIN | 跨计划前置与写集顺序 | `issues/817.md#I817-01`、`issues/974.md#I974-01`、`issues/975.md#I975-01` → `issues/978.md#I978-01` → `issues/984.md#I984-01`；#978 同时消费 merge 参数读值和共享消息/merge 写集，#984 消费 #978 的 mergeOptions 配置 | #817 实现仍 pending；#974/#975/#978/#984 均未完成实现；#978 与 #984 按卡内 start gate 保持 blocked/pending，未满足前不得开工 |
 | DEP-I1059-WRITERS | archive 寫集與版本窗口互斥 | [1059](issues/1059.md) I1059-01 與 [545](issues/545.md) AR 系列及其它 archive 源碼/測試/文檔、`COMPATIBILITY.md`、版本面活動寫者按實際文件串行；#545 後續重寫 tar writer 必須保留長 path/prefix/target 的四個功能回歸、writer 錯誤守衛及語義，不得回退到直接固定 header 寫入 | 2026-11-10 15:49:01 UTC 登記；#545 當前 pending，開工仍須掃描全部活動計劃，未證明可啟動 |
 | DEP-I1059-SITE | 網站交付前置 | [1059](issues/1059.md) 需在 `/mnt/data/libra-backend` 核實唯一 VCS、乾淨 `cf` 與遠端一致後，同卡同步 archive 頁、同步檢查、前端 typecheck/build、精簽提交、`cf` 推送、Cloudflare 部署及頁面內容 | `fdd95f00c86041f1bebd9a200f285c3ba9b39698` 已簽推 `cf`，EN/zh-CN archive 與 troubleshooting 公開頁面已核實，網站依賴已關閉 |
