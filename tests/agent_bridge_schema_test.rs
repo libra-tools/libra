@@ -218,7 +218,11 @@ async fn operation_is_idempotent_and_digest_conflict_detected() {
     .await
     .expect("replay");
     assert!(!created2);
-    assert_eq!(existing2.as_deref(), Some("digest-A"));
+    let stored = existing2.expect("the stored operation identity");
+    assert_eq!(stored.params_digest, "digest-A");
+    assert_eq!(stored.method, "commit.create");
+    assert_eq!(stored.bridge_session_id, "s1");
+    assert_eq!(stored.repository_id, "repo1");
 
     // Same operation_id + different digest -> returns the stored (original)
     // digest so the caller can detect the conflict and fail closed.
@@ -235,7 +239,9 @@ async fn operation_is_idempotent_and_digest_conflict_detected() {
     .await
     .expect("conflict probe");
     assert!(!created3);
-    assert_eq!(existing3.as_deref(), Some("digest-A"));
+    let stored = existing3.expect("the stored operation identity");
+    assert_eq!(stored.params_digest, "digest-A");
+    assert_eq!(stored.method, "commit.create");
     // Original params_digest is unchanged.
     assert!(!created3);
 }

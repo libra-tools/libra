@@ -65,7 +65,7 @@ async fn require_session_in_repo(ctx: &BridgeContext, session_id: &str) -> Resul
 }
 
 fn db_error(context: &'static str) -> impl Fn(DbErr) -> BridgeError {
-    move |err| BridgeError::internal(format!("{context}: {err}"))
+    move |err| super::vcs::internal_hiding_host_paths(context, err)
 }
 
 /// Dispatch the session/event ingress methods. Returns `None` for a
@@ -287,8 +287,12 @@ fn parse_event_batch(request: &BridgeRequest) -> Result<Vec<EventItem>, BridgeEr
 
     let mut out = Vec::with_capacity(events.len());
     for ev in events {
-        let item: EventItem = serde_json::from_value(ev.clone())
-            .map_err(|e| BridgeError::invalid_params(format!("invalid event object: {e}")))?;
+        let item: EventItem = serde_json::from_value(ev.clone()).map_err(|error| {
+            BridgeError::invalid_params(format!(
+                "invalid event object: {}",
+                super::vcs::withheld_detail(&error)
+            ))
+        })?;
         // Enforce the per-event payload cap BEFORE redaction.
         if item.payload.len() > super::protocol::MAX_EVENT_BYTES {
             return Err(super::redaction::redaction_failed(format!(

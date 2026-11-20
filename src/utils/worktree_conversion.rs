@@ -151,6 +151,45 @@ fn clean_bytes(mut bytes: Vec<u8>, policy: ResolvedPolicy) -> Vec<u8> {
     bytes
 }
 
+/// Convert an already captured regular-file snapshot using current attributes.
+/// LFS requires a separate object-store publication step and is deliberately
+/// refused here until the bridge can carry out that complete workflow.
+pub(crate) fn clean_captured_bytes(
+    workdir: &Path,
+    relative: &Path,
+    bytes: Vec<u8>,
+    index_has_text_crlf: impl FnOnce() -> io::Result<bool>,
+) -> io::Result<Vec<u8>> {
+    let root = beneath::open_root(workdir)?;
+    let attributes = attributes::try_all_attribute_states_beneath(workdir, &root, relative)?;
+    // A filter must transform the payload or store it beside the pointer.
+    // Neither step exists here, so any active filter is refused before a blob
+    // or index write. `-filter` (Unset) means no filter and is allowed.
+    match attributes.get("filter") {
+        Some(AttributeState::Value(value)) if value == "lfs" => {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "LFS snapshot staging is not supported",
+            ));
+        }
+        Some(AttributeState::Value(_) | AttributeState::Set) => {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "content filter staging is not supported",
+            ));
+        }
+        _ => {}
+    }
+    let policy = explicit_policy(&attributes);
+    let stats = if policy == CleanPolicy::Auto {
+        TextStats::from_bytes(&bytes)
+    } else {
+        TextStats::default()
+    };
+    let resolved = resolve_policy(policy, &stats, CleanMode::Normal, index_has_text_crlf)?;
+    Ok(clean_bytes(bytes, resolved))
+}
+
 /// Read the representation to stage, retaining LFS and symlink semantics.
 /// Regular content is read from one no-follow descriptor; the initial length
 /// bounds the read, and a changed file is rejected before an index can be saved.

@@ -20,7 +20,7 @@ DeepSeek Harness 的公开定位是“一切皆插件”：模型、工具、技
 | --- | --- | --- |
 | DeepSeek Harness pin | `dsh-v0.1.0-rc.7` / `99f6f02fecdb7dff40c3fbc9470f5907c29f74ca` | 上游 tag `dsh-v0.1.0-rc.7`；架构文档确认 `web`/`headless` profile、`--dump-config`、`agent.inject()`、`sessionPersistence`、`ctx.codeRuntime` |
 | Harness 生命周期事件 | `session/created`、`session/event`、`session/flush`、`session/disposed`、`agent/created`、`agent/disposed`、`subagent/start`、`subagent/end`、`agent/turn-stopping` 均存在；`tool/result` 是 session event 变体，不是独立 Cordis dispatch 事件 | pin 的 `docs/event-producer-consumer.md` / `docs/architecture.md` |
-| Libra bridge 入口 | **已实现（LB-01..LB-06 全量 20 method）**；`libra agent bridge --stdio` 提供协议 v1 + NDJSON transport、`initialize` 握手、session/event durable ingress、只读方法（`context.get/status.get/history.search/checkpoint.list/checkpoint.show/diff.get`）、mutation admission/authorization/approval 管线（`operation_id` 幂等 + digest conflict、actor binding、危险动作默认 deny），以及 workspace lease（`workspace.claim/renew/release` 通过既有 `WorkspaceStore` 的 owner+fence 语义，actor 由 session lineage 派生）。`diff.get`、`commit.create`、`checkpoint.restore`、`review.run` 已通过 typed `agent_bridge/vcs.rs` adapter 接入真实 VCS/review service：`diff.get` 只接受封闭 `mode`（worktree/staged/checkpoint）+ 经校验的仓库相对 `paths`，并强制 `--no-ext-diff`/`--no-textconv`；`commit.create` 只提交当前 index 并把关联图写入 `agent_bridge_link`（不拼进 commit message）；`checkpoint.restore` 要求显式 `expected_head` + 干净 index/worktree，且绝不移动 HEAD；`review.run` 同步完成校验/admission 后由受监督的后台任务执行，bridge 退出时统一 cancel + bounded drain。HEAD 漂移或脏 worktree 以 `LBR-AGENT-038` 在写入前 fail-closed | `src/command/agent/bridge.rs`；`src/internal/ai/agent_bridge/{protocol,transport,storage,ingress,redaction,methods,mutations,authorization,provenance,workspace,vcs}.rs` |
+| Libra bridge 入口 | **已实现（LB-01..LB-06 全量 20 method + LVC-02 的 5 个 typed read）**；`libra agent bridge --stdio` 提供协议 v1 + NDJSON transport、`initialize` 握手、session/event durable ingress、只读方法（`context.get/status.get/history.search/checkpoint.list/checkpoint.show/diff.get`）、mutation admission/authorization/approval 管线（`operation_id` 幂等 + digest conflict、actor binding、危险动作默认 deny），以及 workspace lease（`workspace.claim/renew/release` 通过既有 `WorkspaceStore` 的 owner+fence 语义，actor 由 session lineage 派生）。`diff.get`、`commit.create`、`checkpoint.restore`、`review.run` 已通过 typed `agent_bridge/vcs.rs` adapter 接入真实 VCS/review service：`diff.get` 只接受封闭 `mode`（worktree/staged/checkpoint）+ 经校验的仓库相对 `paths`，并强制 `--no-ext-diff`/`--no-textconv`；`commit.create` 只提交当前 index 并把关联图写入 `agent_bridge_link`（不拼进 commit message）；`checkpoint.restore` 要求显式 `expected_head` + 干净 index/worktree，且绝不移动 HEAD；`review.run` 同步完成校验/admission 后由受监督的后台任务执行，bridge 退出时统一 cancel + bounded drain。HEAD 漂移或脏 worktree 以 `LBR-AGENT-038` 在写入前 fail-closed | `src/command/agent/bridge.rs`；`src/internal/ai/agent_bridge/{protocol,transport,storage,ingress,redaction,methods,mutations,authorization,provenance,workspace,vcs}.rs` |
 | Libra Code 控制面 | `libra code --control stdio` 已是 JSON-RPC NDJSON **client**，控制已有 Code session，不是 Harness ingress | `docs/commands/code.md`（约 `96-115`） |
 | Libra worktree | linked worktree 共享 common storage（db/objects）与分支 ref 目录；**HEAD/index 已按 `worktree_id` 作用域隔离**；真正的分支隔离仍需独立 clone 或显式 branch scope | `src/internal/worktree_scope.rs`；`docs/development/libra-worktree-architecture.md` |
 | Actor 兼容风险 | 低层 AI/MCP adapter 仍接受调用方自报 `actor_kind`/`actor_id`；bridge 不得沿用该模型 | `src/internal/ai/mcp/resource.rs` |
@@ -142,7 +142,7 @@ Harness 插件可以将模型可见工具映射为 bridge 方法，但模型不�
 - `libra_review`：针对指定 checkpoint 执行只读 review。
 - `libra_restore_checkpoint`：恢复前必须经过人工确认。
 
-对应 bridge 方法按以下命名分组。**模型可见工具**只映射高层子集；**完整 v1 allowlist**（20 个 method，与两份 `plan-20260818.md` 及 Rust protocol fixture 权威一致）如下：
+对应 bridge 方法按以下命名分组。**模型可见工具**只映射高层子集；**当前完整 v1 allowlist**（25 个 method，与 Rust protocol fixture 权威一致）如下：
 
 ```text
 # handshake / session ingress
@@ -161,7 +161,12 @@ commit.create / review.run
 
 # workspace lease
 workspace.claim / workspace.renew / workspace.release
+
+# typed repository reads (protocol minor 1)
+vcs.identity / vcs.status / vcs.diff / vcs.log / vcs.show
 ```
+
+LVC-02 已启用 `vcs.identity`、`vcs.status`、`vcs.diff`、`vcs.log`、`vcs.show` 五个 minor 1 reads：它们在 allowlist 中，只对协商到 minor 1 及以上的 peer 广告；未协商到该 minor 的旧 1.x peer 看不到这些方法，调用时在 dispatch 前 fail closed，既有行为不变。LVC-06 正在准备的 `vcs.stage`、`vcs.unstage`、`vcs.commit` 是 proposed minor 2 writes，当前仍不在 allowlist，未完成安全 review 前不应广告或调用。`vcs.fence` 不在 allowlist：写方法自带 `expectedHead` / `expectedIndex` / `expectedWorktree` fence。`status.get` 仍是 bridge telemetry（session/event/checkpoint 计数），不是 worktree status。
 
 模型可见 facade 名称（`libra_context`、`libra_status`、…）只是上述 method 的工具层别名；实现与测试必须以 allowlist 字面名为准，不得另发明 method。
 
@@ -334,7 +339,7 @@ profile，而不是假设 Harness 已经内置 Libra 专用 profile。
 ### MVP（对应 LB-01…LB-06 + TS-01…TS-06 的最小可写且可治理切片）
 
 1. 独立的 `libra agent bridge --stdio` 入口；若新增顶层 Libra 命令或 `agent` 子命令，必须同时更新 `COMPATIBILITY.md`、对应 `docs/commands/<cmd>.md`（含 `Examples`）、CLI `*_EXAMPLES`/root command groups，以及相关 compat guards；新增稳定错误码还要同步 `docs/error-codes.md`。
-2. Rust authoritative schema/fixture：含完整 method allowlist（实验性 `vcs.*` 读写方法已从 allowlist 移除，等待安全修复和复审。`status.get` 仍是 bridge telemetry，`commit.create` 语义不变）、frame/batch limits、`last_acked_seq`、稳定错误码（TypeScript 只接收，不发明）。
+2. Rust authoritative schema/fixture：当前含 25 个 method 的 allowlist；typed `vcs.*` reads 已作为 minor 1 negotiated surface 加入并只对协商到 minor 1 及以上的 peer 广告；typed `vcs.*` writes 仍在实施，安全 review 通过并完成 LVC-06 后才会加入 minor 2 negotiated surface。`vcs.fence` 不加入 allowlist，写方法自带 fence。`status.get` 仍是 bridge telemetry，`commit.create` 语义不变；frame/batch limits、`last_acked_seq` 与稳定错误码仍以 Rust 为权威（TypeScript 只接收，不发明）。
 3. `context.get` / `status.get` / `diff.get` / `history.search` / `checkpoint.*` 只读方法与模型可见 facade。
 4. `session.open` / `event.append` / `session.flush` / `session.close` 的批量投影、outbox、幂等和断点续传。
 5. `commit.create` 与 Harness session/checkpoint/evidence 关联；双层 approval；危险操作默认关闭。

@@ -104,6 +104,21 @@ async fn stage(paths: &[&str]) {
 
 /// Commit through the ordinary CLI path (test fixture setup, not the code
 /// under test).
+async fn delete_publication(operation_id: &str) {
+    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+
+    let db = libra::internal::worktree_scope::request_db()
+        .await
+        .expect("repository database");
+    db.execute_raw(Statement::from_sql_and_values(
+        DatabaseBackend::Sqlite,
+        "DELETE FROM agent_bridge_publication WHERE operation_id = ?",
+        [operation_id.into()],
+    ))
+    .await
+    .expect("delete publication");
+}
+
 async fn cli_commit(message: &str) {
     commit::execute_safe(
         CommitArgs {
@@ -259,6 +274,309 @@ async fn diff_get_rejects_untyped_selectors() {
 // LB-05 commit.create
 // ---------------------------------------------------------------------------
 
+/// Publication checks the admitted HEAD inside the ref transaction.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn bridge_publication_refuses_a_head_changed_after_admission() {
+    use libra::internal::ai::agent_bridge::{publication, vcs};
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let admitted = Head::current_commit()
+        .await
+        .expect("initial head")
+        .to_string();
+    write_file(dir.path(), "advance.txt", "advance\n");
+    stage(&["advance.txt"]).await;
+    cli_commit("advance before publication").await;
+    let actual = Head::current_commit()
+        .await
+        .expect("advanced head")
+        .to_string();
+    assert_ne!(actual, admitted);
+    publication::ensure_table()
+        .await
+        .expect("publication table");
+    let error = publication::with_operation("op-transaction-fence", &admitted, async {
+        vcs::commit_create_unguarded("must not publish", false, true).await
+    })
+    .await
+    .expect_err("moved HEAD must refuse publication");
+    assert_eq!(error.stable_code, "LBR-AGENT-038", "{}", error.message);
+    assert!(error.message.contains("stale_state"), "{}", error.message);
+    assert_eq!(
+        Head::current_commit().await.expect("head").to_string(),
+        actual
+    );
+    assert!(
+        publication::published_commit("op-transaction-fence")
+            .await
+            .expect("lookup")
+            .is_none()
+    );
+}
+
+/// A child holding a SQLite write transaction advances HEAD while publication waits.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn bridge_publication_refuses_overlapping_external_ref_transaction() {
+    use std::{
+        io::{BufRead, BufReader, Write as _},
+        process::{Command, Stdio},
+    };
+
+    use libra::internal::{
+        ai::agent_bridge::{publication, vcs},
+        branch::Branch,
+    };
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let admitted = Head::current_commit()
+        .await
+        .expect("initial head")
+        .to_string();
+    write_file(dir.path(), "advance.txt", "advance\n");
+    stage(&["advance.txt"]).await;
+    cli_commit("external target").await;
+    let target = Head::current_commit().await.expect("target").to_string();
+    let branch = match Head::current().await {
+        Head::Branch(name) => name,
+        Head::Detached(_) => panic!("expected branch"),
+    };
+    Branch::update_branch(&branch, &admitted, None)
+        .await
+        .expect("restore test branch");
+    publication::ensure_table()
+        .await
+        .expect("publication table");
+    let script = "import sqlite3,sys\nc=sqlite3.connect(sys.argv[1],timeout=30)\nc.execute('BEGIN IMMEDIATE')\nr=c.execute(\"UPDATE `reference` SET `commit`=? WHERE name=? AND kind='Branch' AND remote IS NULL\",(sys.argv[2],sys.argv[3]))\nassert r.rowcount==1\nprint('locked',flush=True)\nsys.stdin.readline()\nc.commit()\n";
+    let mut child = Command::new("python3")
+        .args(["-c", script])
+        .arg(dir.path().join(".libra/libra.db"))
+        .arg(&target)
+        .arg(&branch)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn transaction holder");
+    let mut line = String::new();
+    BufReader::new(child.stdout.take().expect("stdout"))
+        .read_line(&mut line)
+        .expect("read lock confirmation");
+    assert_eq!(line.trim(), "locked");
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let mut pending = tokio::task::spawn_local(async move {
+                publication::with_operation("op-overlap", &admitted, async {
+                    vcs::commit_create_unguarded("must not publish", false, true).await
+                })
+                .await
+            });
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(200), &mut pending)
+                    .await
+                    .is_err(),
+                "bridge must not finish while the writer holds its transaction"
+            );
+            child
+                .stdin
+                .take()
+                .expect("stdin")
+                .write_all(b"commit\n")
+                .expect("release child");
+            let result = tokio::time::timeout(std::time::Duration::from_secs(30), pending)
+                .await
+                .expect("bridge completes")
+                .expect("join");
+            let error = result.expect_err("HEAD moved by overlapping writer");
+            assert_eq!(error.stable_code, "LBR-AGENT-038", "{}", error.message);
+        })
+        .await;
+    let output = child.wait_with_output().expect("child exit");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        Head::current_commit().await.expect("head").to_string(),
+        target
+    );
+    assert!(
+        publication::published_commit("op-overlap")
+            .await
+            .expect("lookup")
+            .is_none()
+    );
+}
+
+/// A different Libra process can advance HEAD after this request observes it.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn bridge_publication_refuses_head_advanced_by_another_process() {
+    use libra::internal::ai::agent_bridge::{publication, vcs};
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let admitted = Head::current_commit()
+        .await
+        .expect("initial head")
+        .to_string();
+    write_file(dir.path(), "external.txt", "external\n");
+    stage(&["external.txt"]).await;
+    let child = std::process::Command::new(env!("CARGO_BIN_EXE_libra"))
+        .current_dir(dir.path())
+        .args(["commit", "--no-verify", "-m", "external commit"])
+        .output()
+        .expect("run separate Libra process");
+    assert!(
+        child.status.success(),
+        "child commit failed: {}",
+        String::from_utf8_lossy(&child.stderr)
+    );
+    let actual = Head::current_commit()
+        .await
+        .expect("advanced head")
+        .to_string();
+    assert_ne!(actual, admitted);
+    publication::ensure_table()
+        .await
+        .expect("publication table");
+    let error = publication::with_operation("op-external-fence", &admitted, async {
+        vcs::commit_create_unguarded("must not publish", false, true).await
+    })
+    .await
+    .expect_err("external HEAD advance must refuse publication");
+    assert_eq!(error.stable_code, "LBR-AGENT-038", "{}", error.message);
+    assert_eq!(
+        Head::current_commit().await.expect("head").to_string(),
+        actual
+    );
+    assert!(
+        publication::published_commit("op-external-fence")
+            .await
+            .expect("lookup")
+            .is_none()
+    );
+}
+
+/// A broken HEAD store cannot be mistaken for an unborn branch on mutation.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn commit_create_refuses_an_unreadable_head() {
+    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    let db = libra::internal::worktree_scope::request_db()
+        .await
+        .expect("repository database");
+    db.execute_raw(Statement::from_string(
+        DatabaseBackend::Sqlite,
+        "DROP TABLE \"reference\"".to_string(),
+    ))
+    .await
+    .expect("remove reference table in disposable repository");
+    let frame = r#"{"jsonrpc":"2.0","method":"commit.create","params":{"operation_id":"op-broken-head","session_id":"s1","message":"must not commit","allow_empty":true,"expected_head":"","approval":{"decision":"approved","approver":"reviewer-1"}},"id":1}"#;
+    let error = mutation_dispatch(&ctx, &request(frame))
+        .await
+        .expect_err("unreadable HEAD must not be accepted as unborn");
+    assert!(error.message.contains("HEAD fence"), "{}", error.message);
+    let published =
+        libra::internal::ai::agent_bridge::publication::published_commit("op-broken-head")
+            .await
+            .expect("publication lookup");
+    assert!(published.is_none(), "no commit should have been published");
+}
+
+/// A publication table created before the phase column still accepts a commit.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn commit_create_upgrades_a_publication_table_without_phase() {
+    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    let db = libra::internal::worktree_scope::request_db()
+        .await
+        .expect("repository database");
+    db.execute_raw(Statement::from_string(
+        DatabaseBackend::Sqlite,
+        "CREATE TABLE agent_bridge_publication (operation_id TEXT PRIMARY KEY, commit_oid TEXT NOT NULL)"
+            .to_string(),
+    ))
+    .await
+    .expect("old publication table");
+    let frame = r#"{"jsonrpc":"2.0","method":"commit.create","params":{"operation_id":"op-upgrade","session_id":"s1","message":"feat: upgrade","allow_empty":true,"approval":{"decision":"approved","approver":"reviewer-1"}},"id":1}"#;
+    let result = mutation_dispatch(&ctx, &request(frame))
+        .await
+        .expect("commit")
+        .expect("response")
+        .result
+        .expect("result");
+    let oid = result["commit"].as_str().expect("oid");
+    let row = db
+        .query_one_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "SELECT phase FROM agent_bridge_publication WHERE operation_id = ?",
+            ["op-upgrade".into()],
+        ))
+        .await
+        .expect("phase query")
+        .expect("phase row");
+    let phase: String = row.try_get_by_index(0).expect("phase");
+    assert_eq!(phase, "published");
+    assert_eq!(Head::current_commit().await.expect("HEAD").to_string(), oid);
+}
+
+/// `vcs.commit` rechecks its worktree fence after a pre-commit hook edits a file.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+#[cfg(unix)]
+async fn vcs_commit_rechecks_worktree_after_pre_commit_hook() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    let before = Head::current_commit().await.expect("initial HEAD");
+    write_file(dir.path(), "commit.txt", "staged for bridge\n");
+    stage(&["commit.txt"]).await;
+    write_file(dir.path(), "hook.txt", "before hook\n");
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+
+    let hooks = dir.path().join(".libra/hooks");
+    fs::create_dir_all(&hooks).expect("hooks directory");
+    let hook = hooks.join("pre-commit");
+    fs::write(
+        &hook,
+        "#!/bin/sh\nprintf 'completed' > \"$LIBRA_WORK_TREE/hook-result\"\nprintf 'changed by hook\\n' > \"$LIBRA_WORK_TREE/hook.txt\"\n",
+    )
+    .expect("pre-commit hook");
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).expect("make hook executable");
+
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.commit","params":{{"operation_id":"op-hook-lock","session_id":"s1","message":"feat: hook lock","paths":["commit.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let response = mutation_dispatch(&ctx, &request(&frame)).await;
+    let hook_result = fs::read_to_string(dir.path().join("hook-result"))
+        .expect("the pre-commit hook must finish");
+    assert_eq!(hook_result, "completed");
+    let error = response.expect_err("the hook's worktree change must make the commit stale");
+    assert_eq!(error.stable_code, "LBR-AGENT-038", "{}", error.message);
+    assert_eq!(Head::current_commit().await.expect("HEAD"), before);
+    assert_eq!(
+        fs::read_to_string(dir.path().join("hook.txt")).expect("hook edit"),
+        "changed by hook\n"
+    );
+}
+
 /// `commit.create` creates a real commit from the index, moves HEAD, and a
 /// replay of the same `operation_id` reports the ORIGINAL commit instead of
 /// creating a second one.
@@ -316,6 +634,768 @@ async fn commit_create_commits_the_index_and_replays_idempotently() {
         commit,
         "a replayed commit.create must not create a second commit"
     );
+}
+
+/// An intent without a publication record cannot identify a completed commit.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn commit_create_refuses_an_intent_without_a_publication_record() {
+    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    let before = Head::current_commit().await.expect("initial HEAD");
+    let frame = r#"{"jsonrpc":"2.0","method":"commit.create","params":{"operation_id":"op-recover","session_id":"s1","message":"feat: recover","allow_empty":true,"approval":{"decision":"approved","approver":"reviewer-1"}},"id":1}"#;
+    let first = mutation_dispatch(&ctx, &request(frame))
+        .await
+        .expect("commit")
+        .expect("response")
+        .result
+        .expect("result");
+    let oid = first["commit"].as_str().expect("oid").to_string();
+    let intent =
+        format!(r#"{{"commitIntent":true,"expectedHead":"{before}","message":"feat: recover"}}"#);
+    ctx.conn
+        .execute_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "UPDATE agent_bridge_operation SET status = 'failed', result_digest = ? WHERE operation_id = 'op-recover'",
+            [intent.into()],
+        ))
+        .await
+        .expect("replace result with intent");
+    delete_publication("op-recover").await;
+    let replay = mutation_dispatch(&ctx, &request(frame))
+        .await
+        .expect("replay")
+        .expect("response")
+        .result
+        .expect("result");
+    assert_eq!(
+        replay["outcome"], "indeterminate",
+        "an intent without a publication record has an uncertain outcome: {replay}"
+    );
+    assert_ne!(
+        replay["commit"].as_str(),
+        Some(oid.as_str()),
+        "an intent alone must not adopt a commit"
+    );
+    assert_eq!(Head::current_commit().await.expect("HEAD").to_string(), oid);
+}
+
+/// A later commit with the same message is not this operation's result.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn commit_create_replay_uses_the_publication_not_a_lookalike() {
+    use git_internal::internal::object::commit::Commit;
+    use libra::utils::object_ext::CommitExt;
+    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    let frame = r#"{"jsonrpc":"2.0","method":"commit.create","params":{"operation_id":"op-bound","session_id":"s1","message":"feat: same","allow_empty":true,"approval":{"decision":"approved","approver":"reviewer-1"}},"id":1}"#;
+    let first = mutation_dispatch(&ctx, &request(frame))
+        .await
+        .expect("commit")
+        .expect("response")
+        .result
+        .expect("result");
+    let oid = first["commit"].as_str().expect("oid").to_string();
+    let stored = Commit::load(&libra::internal::object_format::parse_repo_oid(&oid).expect("oid"))
+        .expect("commit object");
+    assert_eq!(stored.message.trim(), "feat: same");
+    assert!(
+        !stored.message.contains("op-bound"),
+        "operation id must not enter the commit message: {}",
+        stored.message
+    );
+    let before = Head::current_commit().await.expect("parent").to_string();
+    // The successful call already replaced the intent with the commit id.
+    // Put the intent back in the capture catalog only; the repository binding stays.
+    let intent =
+        format!(r#"{{"commitIntent":true,"expectedHead":"{before}","message":"feat: same"}}"#);
+    ctx.conn
+        .execute_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "UPDATE agent_bridge_operation SET status = 'failed', result_digest = ? WHERE operation_id = 'op-bound'",
+            [intent.into()],
+        ))
+        .await
+        .expect("restore intent");
+    commit::execute_safe(
+        CommitArgs {
+            message: Some("feat: same".to_string()),
+            allow_empty: true,
+            disable_pre: true,
+            no_verify: true,
+            ..CommitArgs::default()
+        },
+        &OutputConfig::default(),
+    )
+    .await
+    .expect("lookalike");
+    let lookalike = Head::current_commit().await.expect("lookalike").to_string();
+    assert_ne!(lookalike, oid);
+    let replay = mutation_dispatch(&ctx, &request(frame))
+        .await
+        .expect("replay")
+        .expect("response")
+        .result
+        .expect("result");
+    assert_eq!(replay["commit"], oid);
+    assert_eq!(replay["replayed"], true);
+    assert_eq!(
+        Head::current_commit().await.expect("HEAD").to_string(),
+        lookalike,
+        "recovery must not publish another commit"
+    );
+}
+
+/// A retry resumes a prepared commit after acquiring the stopped owner's lock.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn commit_create_recovers_a_prepared_object_after_owner_stops() {
+    use git_internal::internal::object::commit::Commit;
+    use libra::{internal::branch::Branch, utils::object_ext::CommitExt};
+    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    let frame = r#"{"jsonrpc":"2.0","method":"commit.create","params":{"operation_id":"op-prepared","session_id":"s1","message":"feat: prepared","allow_empty":true,"approval":{"decision":"approved","approver":"reviewer-1"}},"id":1}"#;
+    let first = mutation_dispatch(&ctx, &request(frame))
+        .await
+        .expect("commit")
+        .expect("response")
+        .result
+        .expect("result");
+    let oid = first["commit"].as_str().expect("oid").to_string();
+    let stored = Commit::load(&libra::internal::object_format::parse_repo_oid(&oid).expect("oid"))
+        .expect("commit");
+    let parent = stored
+        .parent_commit_ids
+        .first()
+        .expect("parent")
+        .to_string();
+    let branch = match Head::current().await {
+        Head::Branch(name) => name,
+        Head::Detached(_) => panic!("expected a branch"),
+    };
+    Branch::update_branch(&branch, &parent, None)
+        .await
+        .expect("rewind branch");
+    let db = libra::internal::worktree_scope::request_db()
+        .await
+        .expect("repository database");
+    db.execute_raw(Statement::from_string(
+        DatabaseBackend::Sqlite,
+        "UPDATE agent_bridge_publication SET phase = 'prepared' WHERE operation_id = 'op-prepared'"
+            .to_string(),
+    ))
+    .await
+    .expect("mark prepared");
+    let intent =
+        format!(r#"{{"commitIntent":true,"expectedHead":"{parent}","message":"feat: prepared"}}"#);
+    ctx.conn
+        .execute_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "UPDATE agent_bridge_operation SET status = 'pending', result_digest = ? WHERE operation_id = 'op-prepared'",
+            [intent.clone().into()],
+        ))
+        .await
+        .expect("restore intent");
+    let recovered = mutation_dispatch(&ctx, &request(frame))
+        .await
+        .expect("recover stopped publisher")
+        .expect("response")
+        .result
+        .expect("replayed result");
+    assert_eq!(recovered["commit"], oid);
+    assert_eq!(recovered["replayed"], true);
+    assert_eq!(Head::current_commit().await.expect("HEAD").to_string(), oid);
+
+    // A later recovery attempt blocked by sequence state is terminal. Removing
+    // the marker later must not let the same operation publish retroactively.
+    Branch::update_branch(&branch, &parent, None)
+        .await
+        .expect("rewind for the blocked recovery case");
+    db.execute_raw(Statement::from_string(
+        DatabaseBackend::Sqlite,
+        "UPDATE agent_bridge_publication SET phase = 'prepared' WHERE operation_id = 'op-prepared'"
+            .to_string(),
+    ))
+    .await
+    .expect("restore prepared publication");
+    ctx.conn
+        .execute_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "UPDATE agent_bridge_operation SET status = 'pending', result_digest = ? WHERE operation_id = 'op-prepared'",
+            [intent.into()],
+        ))
+        .await
+        .expect("restore pending intent");
+    write_file(dir.path(), ".libra/merge-state.json", "{}\n");
+    let blocked = mutation_dispatch(&ctx, &request(frame))
+        .await
+        .expect("terminal recovery response")
+        .expect("response")
+        .result
+        .expect("terminal result");
+    assert_eq!(blocked["outcome"], "indeterminate", "{blocked}");
+    fs::remove_file(dir.path().join(".libra/merge-state.json")).expect("remove merge marker");
+    let replay = mutation_dispatch(&ctx, &request(frame))
+        .await
+        .expect("replay after terminal recovery")
+        .expect("response")
+        .result
+        .expect("terminal result");
+    assert_eq!(replay["outcome"], "indeterminate", "{replay}");
+    assert_eq!(replay["replayed"], true);
+    assert_eq!(
+        Head::current_commit().await.expect("HEAD").to_string(),
+        parent,
+        "a terminal operation must not publish later"
+    );
+}
+
+/// Replay must reject a corrupted recorded commit identifier.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn commit_create_replay_rejects_corrupt_recorded_oid() {
+    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    let frame = r#"{"jsonrpc":"2.0","method":"commit.create","params":{"operation_id":"op-corrupt","session_id":"s1","message":"feat: corrupt","allow_empty":true,"approval":{"decision":"approved","approver":"reviewer-1"}},"id":1}"#;
+    mutation_dispatch(&ctx, &request(frame))
+        .await
+        .expect("commit");
+    let before = Head::current_commit().await.expect("head");
+    ctx.conn
+        .execute_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "UPDATE agent_bridge_operation SET result_digest = ? WHERE operation_id = 'op-corrupt'",
+            ["not-an-object-id".into()],
+        ))
+        .await
+        .expect("corrupt result");
+    let error = mutation_dispatch(&ctx, &request(frame))
+        .await
+        .expect_err("corrupt result must fail");
+    assert!(
+        error.message.contains("recorded commit"),
+        "{}",
+        error.message
+    );
+    assert_eq!(Head::current_commit().await.expect("head"), before);
+}
+
+/// An association failure after publication keeps the commit id for replay.
+#[tokio::test]
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+#[serial(cwd, env, hash_kind)]
+async fn commit_create_keeps_the_commit_id_when_association_fails() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    let frame = r#"{"jsonrpc":"2.0","method":"commit.create","params":{"operation_id":"op-assoc","session_id":"s1","message":"feat: assoc","allow_empty":true,"approval":{"decision":"approved","approver":"reviewer-1"}},"id":1}"#;
+    libra::internal::ai::agent_bridge::mutations::fail_next_association_for_test();
+    let error = mutation_dispatch(&ctx, &request(frame))
+        .await
+        .expect_err("association failure");
+    assert!(error.message.contains("association"), "{}", error.message);
+    assert!(
+        error.message.contains("durable outcome"),
+        "the bookkeeping error must name the durable outcome it hides: {}",
+        error.message
+    );
+    let published = Head::current_commit()
+        .await
+        .expect("published HEAD")
+        .to_string();
+    let recorded =
+        libra::internal::ai::agent_bridge::storage::get_operation_result(&ctx.conn, "op-assoc")
+            .await
+            .expect("operation")
+            .expect("row");
+    assert_eq!(recorded.result_digest.as_deref(), Some(published.as_str()));
+    let replay = mutation_dispatch(&ctx, &request(frame))
+        .await
+        .expect("replay")
+        .expect("response")
+        .result
+        .expect("result");
+    assert_eq!(replay["commit"], published);
+    assert_eq!(replay["replayed"], true);
+    assert_eq!(
+        Head::current_commit().await.expect("HEAD").to_string(),
+        published
+    );
+}
+
+/// Recovery must not adopt a commit whose tree differs from the recorded intent.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn commit_create_recovery_rejects_a_different_tree() {
+    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    let before = Head::current_commit().await.expect("initial HEAD");
+    let frame = r#"{"jsonrpc":"2.0","method":"commit.create","params":{"operation_id":"op-tree","session_id":"s1","message":"feat: tree","allow_empty":true,"approval":{"decision":"approved","approver":"reviewer-1"}},"id":1}"#;
+    let first = mutation_dispatch(&ctx, &request(frame))
+        .await
+        .expect("commit")
+        .expect("response")
+        .result
+        .expect("result");
+    let oid = first["commit"].as_str().expect("oid").to_string();
+    let intent = format!(
+        r#"{{"commitIntent":true,"expectedHead":"{before}","message":"feat: tree","tree":"not-the-commit-tree"}}"#
+    );
+    ctx.conn
+        .execute_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "UPDATE agent_bridge_operation SET status = 'failed', result_digest = ? WHERE operation_id = 'op-tree'",
+            [intent.into()],
+        ))
+        .await
+        .expect("store mismatched intent");
+    delete_publication("op-tree").await;
+    let replay = mutation_dispatch(&ctx, &request(frame))
+        .await
+        .expect("replay")
+        .expect("response")
+        .result
+        .expect("result");
+    assert_eq!(
+        replay["outcome"], "indeterminate",
+        "a commit whose publication record is gone has an uncertain outcome: {replay}"
+    );
+    assert_ne!(
+        replay["commit"].as_str(),
+        Some(oid.as_str()),
+        "the mismatched commit must not be adopted"
+    );
+    assert_eq!(Head::current_commit().await.expect("HEAD").to_string(), oid);
+}
+
+/// Recovery must not adopt a commit that was created before the operation existed.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn commit_create_recovery_rejects_a_commit_that_predates_the_operation() {
+    use git_internal::internal::object::commit::Commit;
+    use libra::utils::object_ext::CommitExt;
+    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    let before = Head::current_commit().await.expect("initial HEAD");
+    let frame = r#"{"jsonrpc":"2.0","method":"commit.create","params":{"operation_id":"op-old","session_id":"s1","message":"feat: predates","allow_empty":true,"approval":{"decision":"approved","approver":"reviewer-1"}},"id":1}"#;
+    let first = mutation_dispatch(&ctx, &request(frame))
+        .await
+        .expect("commit")
+        .expect("response")
+        .result
+        .expect("result");
+    let oid = first["commit"].as_str().expect("oid").to_string();
+    let stored = Commit::load(&libra::internal::object_format::parse_repo_oid(&oid).expect("oid"))
+        .expect("commit");
+    let intent = format!(
+        r#"{{"commitIntent":true,"expectedHead":"{before}","message":"feat: predates","tree":"{}"}}"#,
+        stored.tree_id
+    );
+    ctx.conn
+        .execute_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "UPDATE agent_bridge_operation SET status = 'failed', result_digest = ?, created_at = 9000000000000 WHERE operation_id = 'op-old'",
+            [intent.into()],
+        ))
+        .await
+        .expect("backdate operation");
+    delete_publication("op-old").await;
+    let replay = mutation_dispatch(&ctx, &request(frame))
+        .await
+        .expect("replay")
+        .expect("response")
+        .result
+        .expect("result");
+    assert_eq!(
+        replay["outcome"], "indeterminate",
+        "a commit whose publication record is gone has an uncertain outcome: {replay}"
+    );
+    assert_ne!(
+        replay["commit"].as_str(),
+        Some(oid.as_str()),
+        "a commit that predates the operation must not be adopted"
+    );
+    assert_eq!(Head::current_commit().await.expect("HEAD").to_string(), oid);
+}
+
+/// A replay does not terminalize a commit while another process owns the bridge claim.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+#[cfg(unix)]
+async fn commit_replay_refuses_reconciliation_during_a_cross_process_claim() {
+    use std::io::{BufRead, BufReader};
+
+    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    let (expected_head, expected_index) =
+        libra::internal::ai::agent_bridge::vcs_write::current_commit_fence()
+            .await
+            .expect("commit fence");
+    let frame = r#"{"jsonrpc":"2.0","method":"commit.create","params":{"operation_id":"op-cross-process-claim","session_id":"s1","message":"feat: cross-process claim","allow_empty":true,"approval":{"decision":"approved","approver":"reviewer-1"}},"id":1}"#;
+    mutation_dispatch(&ctx, &request(frame))
+        .await
+        .expect("commit")
+        .expect("response");
+    let head_after_commit = Head::current_commit().await.expect("HEAD").to_string();
+
+    // Simulate the executor having recorded its intent before a process stop.
+    let intent = serde_json::json!({
+        "commitIntent": true,
+        "expectedHead": expected_head,
+        "expectedIndex": expected_index,
+        "message": "feat: cross-process claim",
+    })
+    .to_string();
+    ctx.conn
+        .execute_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "UPDATE agent_bridge_operation SET status = 'pending', result_digest = ? \
+             WHERE operation_id = 'op-cross-process-claim'",
+            [intent.clone().into()],
+        ))
+        .await
+        .expect("record the prepared intent");
+    delete_publication("op-cross-process-claim").await;
+
+    // A different process holds the bridge write claim, representing a live
+    // executor. A replay must report retryable busy and leave the row alone.
+    let script = "import fcntl, sys\nf = open(sys.argv[1], 'a+')\nfcntl.flock(f, fcntl.LOCK_EX)\nprint('locked', flush=True)\nsys.stdin.read()\n";
+    let lock_path = dir.path().join(".libra/agent-bridge-writes.lock");
+    let mut owner = ChildGuard(
+        std::process::Command::new("python3")
+            .args(["-c", script])
+            .arg(lock_path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn claim owner"),
+    );
+    let mut ready = String::new();
+    BufReader::new(owner.0.stdout.take().expect("claim stdout"))
+        .read_line(&mut ready)
+        .expect("claim ready");
+    assert_eq!(ready.trim(), "locked");
+
+    let error = mutation_dispatch(&ctx, &request(frame))
+        .await
+        .expect_err("replay must not reconcile while a claim is held");
+    assert_eq!(error.stable_code, "LBR-AGENT-035", "{}", error.message);
+    assert!(error.retryable, "{}", error.message);
+    let operation = libra::internal::ai::agent_bridge::storage::get_operation_result(
+        &ctx.conn,
+        "op-cross-process-claim",
+    )
+    .await
+    .expect("read operation")
+    .expect("operation row");
+    assert_eq!(operation.status, "pending");
+    assert_eq!(operation.result_digest.as_deref(), Some(intent.as_str()));
+
+    drop(owner.0.stdin.take().expect("claim stdin"));
+    owner.0.wait().expect("claim process exits");
+
+    let replay = mutation_dispatch(&ctx, &request(frame))
+        .await
+        .expect("replay after owner exits")
+        .expect("response")
+        .result
+        .expect("result");
+    assert_eq!(replay["outcome"], "indeterminate", "{replay}");
+    assert_eq!(
+        Head::current_commit().await.expect("HEAD").to_string(),
+        head_after_commit,
+        "reconciliation must not publish a second commit"
+    );
+}
+
+/// A denial that cannot be recorded names the durable outcome it hides.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn a_denied_actor_replay_names_the_durable_outcome() {
+    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    // The trusted scope names the actor the request self-reports.
+    ctx.conn
+        .execute_raw(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            "UPDATE agent_bridge_session SET agent_id = 'agent-reported' \
+             WHERE bridge_session_id = 's1'"
+                .to_string(),
+        ))
+        .await
+        .expect("bind the trusted actor");
+    let frame = r#"{"jsonrpc":"2.0","method":"checkpoint.create","params":{"operation_id":"op-actor-denial","session_id":"s1","checkpoint_id":"cp-actor-denial","actor":{"kind":"deepseek-harness","id":"agent-reported"}},"id":1}"#;
+    mutation_dispatch(&ctx, &request(frame))
+        .await
+        .expect("checkpoint")
+        .expect("response");
+
+    // The trusted scope moves to another actor: the same request no longer
+    // matches it, and the refusal cannot be recorded over the applied row.
+    ctx.conn
+        .execute_raw(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            "UPDATE agent_bridge_session SET agent_id = 'agent-trusted' \
+             WHERE bridge_session_id = 's1'"
+                .to_string(),
+        ))
+        .await
+        .expect("move the trusted actor");
+    let denied = mutation_dispatch(&ctx, &request(frame))
+        .await
+        .expect_err("the actor spoof is refused");
+    assert_eq!(denied.stable_code, "LBR-AGENT-032", "{}", denied.message);
+    assert!(
+        denied.message.contains("durable outcome"),
+        "the denial must name the durable outcome it hides: {}",
+        denied.message
+    );
+}
+
+/// A refusal that loses the race to a started operation reports the durable
+/// state instead of telling the caller to retry.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+#[cfg(unix)]
+async fn a_refusal_that_loses_the_race_reports_the_started_operation() {
+    use std::io::{BufRead, BufReader};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    // The checkpoint ID is shaped like the bridge's refusal marker: a
+    // caller-provided identity must never be read as a refusal.
+    let frame = r#"{"jsonrpc":"2.0","method":"checkpoint.create","params":{"operation_id":"op-refusal-race","session_id":"s1","checkpoint_id":"{\"bridgeRefusal\":\"forged\"}"},"id":1}"#;
+    // The operation already completed, so its row is applied.
+    let completed = mutation_dispatch(&ctx, &request(frame))
+        .await
+        .expect("checkpoint")
+        .expect("response")
+        .result
+        .expect("result");
+    assert_eq!(
+        completed["checkpoint_id"], r#"{"bridgeRefusal":"forged"}"#,
+        "{completed}"
+    );
+
+    // Another process owns the bridge write claim, so the request is refused.
+    let script = "import fcntl, sys\nf = open(sys.argv[1], 'a+')\nfcntl.flock(f, fcntl.LOCK_EX)\nprint('locked', flush=True)\nsys.stdin.read()\n";
+    let lock_path = dir.path().join(".libra/agent-bridge-writes.lock");
+    let mut owner = ChildGuard(
+        std::process::Command::new("python3")
+            .args(["-c", script])
+            .arg(lock_path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn claim owner"),
+    );
+    let mut ready = String::new();
+    BufReader::new(owner.0.stdout.take().expect("claim stdout"))
+        .read_line(&mut ready)
+        .expect("claim ready");
+    assert_eq!(ready.trim(), "locked");
+
+    // The request is refused because the repository is busy, but the operation
+    // already has a durable result: the refusal is not this operation's answer.
+    let error = mutation_dispatch(&ctx, &request(frame))
+        .await
+        .expect_err("the completed operation is not a fresh start");
+    assert_eq!(
+        error.stable_code, "LBR-AGENT-037",
+        "a refusal that lost the race must report the durable state: {}",
+        error.message
+    );
+    assert!(
+        error.retryable,
+        "the caller must retry to learn the operation's outcome: {}",
+        error.message
+    );
+    assert!(
+        error.message.contains("durable state"),
+        "the refusal must say the operation already has a durable state: {}",
+        error.message
+    );
+
+    drop(owner.0.stdin.take().expect("claim stdin"));
+    owner.0.wait().expect("claim process exits");
+}
+
+/// Replaying a recorded commit restores an association deleted after publication.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn commit_create_replay_restores_a_deleted_association() {
+    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    let frame = r#"{"jsonrpc":"2.0","method":"commit.create","params":{"operation_id":"op-replay-link","session_id":"s1","message":"feat: replay link","allow_empty":true,"approval":{"decision":"approved","approver":"reviewer-1"}},"id":1}"#;
+    let first = mutation_dispatch(&ctx, &request(frame))
+        .await
+        .expect("commit")
+        .expect("response")
+        .result
+        .expect("result");
+    let oid = first["commit"].as_str().expect("oid").to_string();
+    ctx.conn
+        .execute_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "DELETE FROM agent_bridge_link WHERE source_id = ?",
+            [oid.clone().into()],
+        ))
+        .await
+        .expect("remove links");
+    let replay = mutation_dispatch(&ctx, &request(frame))
+        .await
+        .expect("replay")
+        .expect("response")
+        .result
+        .expect("result");
+    assert_eq!(replay["commit"], oid);
+    assert_eq!(replay["replayed"], true);
+    assert_eq!(Head::current_commit().await.expect("HEAD").to_string(), oid);
+    let links = ctx
+        .conn
+        .query_all_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "SELECT target_id FROM agent_bridge_link WHERE source_type = 'commit' AND source_id = ? AND target_id = 'op-replay-link'",
+            [oid.into()],
+        ))
+        .await
+        .expect("query links");
+    assert_eq!(links.len(), 1, "replay must restore the operation link");
+}
+
+/// Recovering a published commit must also restore its association link.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn commit_create_recovery_restores_the_missing_association() {
+    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    let before = Head::current_commit().await.expect("initial HEAD");
+    let frame = r#"{"jsonrpc":"2.0","method":"commit.create","params":{"operation_id":"op-relink","session_id":"s1","message":"feat: relink","allow_empty":true,"approval":{"decision":"approved","approver":"reviewer-1"}},"id":1}"#;
+    let first = mutation_dispatch(&ctx, &request(frame))
+        .await
+        .expect("commit")
+        .expect("response")
+        .result
+        .expect("result");
+    let oid = first["commit"].as_str().expect("oid").to_string();
+    let intent =
+        format!(r#"{{"commitIntent":true,"expectedHead":"{before}","message":"feat: relink"}}"#);
+    ctx.conn
+        .execute_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "DELETE FROM agent_bridge_link WHERE source_id = ?",
+            [oid.clone().into()],
+        ))
+        .await
+        .expect("remove links");
+    ctx.conn
+        .execute_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "UPDATE agent_bridge_operation SET status = 'failed', result_digest = ? WHERE operation_id = 'op-relink'",
+            [intent.into()],
+        ))
+        .await
+        .expect("restore intent");
+    let replay = mutation_dispatch(&ctx, &request(frame))
+        .await
+        .expect("replay")
+        .expect("response")
+        .result
+        .expect("result");
+    assert_eq!(replay["commit"], oid);
+    assert_eq!(Head::current_commit().await.expect("HEAD").to_string(), oid);
+    let links = ctx
+        .conn
+        .query_all_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "SELECT target_id FROM agent_bridge_link WHERE source_type = 'commit' AND source_id = ? AND target_id = 'op-relink'",
+            [oid.into()],
+        ))
+        .await
+        .expect("query links");
+    assert_eq!(links.len(), 1, "recovery must restore the operation link");
+}
+
+/// HEAD drift while waiting for the in-process gate must be checked after acquisition.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn commit_create_rechecks_head_after_waiting_for_gate() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), "next.txt", "next\n");
+    stage(&["next.txt"]).await;
+    let before = Head::current_commit().await.expect("head");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"commit.create","params":{{"operation_id":"op-wait-head","session_id":"s1","message":"feat: bridge","allow_empty":true,"expected_head":"{before}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#
+    );
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let hold = libra::internal::ai::agent_bridge::vcs_write::acquire_publish_gate().await;
+            let cloned = ctx.clone();
+            let mut pending = tokio::task::spawn_local(async move {
+                mutation_dispatch(&cloned, &request(&frame)).await
+            });
+            tokio::select! {
+                _ = &mut pending => panic!("request must wait for gate"),
+                _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
+            }
+            cli_commit("advance head").await;
+            let advanced = Head::current_commit().await.expect("advanced");
+            assert_ne!(advanced, before);
+            drop(hold);
+            let error = tokio::time::timeout(std::time::Duration::from_secs(10), pending)
+                .await
+                .expect("request completed")
+                .expect("join")
+                .expect_err("stale head");
+            assert_eq!(error.stable_code, "LBR-AGENT-038", "{}", error.message);
+            assert_eq!(Head::current_commit().await.expect("head"), advanced);
+        })
+        .await;
 }
 
 /// A stated-but-stale `expected_head` refuses the commit before it is created
@@ -418,6 +1498,72 @@ async fn checkpoint_restore_honours_the_fence_and_restores_the_worktree() {
     );
 }
 
+/// A competing Libra writer prevents checkpoint.restore from touching the worktree.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+#[cfg(unix)]
+async fn checkpoint_restore_refuses_a_cross_process_publisher() {
+    use std::io::{BufRead, BufReader};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    let base = Head::current_commit()
+        .await
+        .expect("base commit")
+        .to_string();
+    insert_checkpoint(&ctx.conn, "cp-base", "s1", None, Some(&base), 1)
+        .await
+        .expect("checkpoint");
+    write_file(dir.path(), "tracked.txt", "one\ntwo\n");
+    stage(&["tracked.txt"]).await;
+    cli_commit("second commit").await;
+    let head = Head::current_commit().await.expect("head").to_string();
+
+    let script = format!(
+        "import fcntl, sys, time\n\
+         f = open({path:?}, 'a+')\n\
+         fcntl.flock(f, fcntl.LOCK_SH)\n\
+         sys.stdout.write('locked\\n')\n\
+         sys.stdout.flush()\n\
+         time.sleep(600)\n",
+        path = dir
+            .path()
+            .join(".libra/maintenance.lock")
+            .to_string_lossy()
+            .to_string()
+    );
+    let mut publisher = ChildGuard(
+        std::process::Command::new("python3")
+            .args(["-c", &script])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("publisher"),
+    );
+    let mut ready = String::new();
+    BufReader::new(publisher.0.stdout.take().expect("publisher stdout"))
+        .read_line(&mut ready)
+        .expect("publisher ready");
+    assert_eq!(ready.trim(), "locked");
+
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"checkpoint.restore","params":{{"operation_id":"op-lock-restore","session_id":"s1","checkpoint_id":"cp-base","expected_head":"{head}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#
+    );
+    let error = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect_err("restore must refuse a concurrent writer");
+    assert_eq!(error.stable_code, "LBR-AGENT-038", "{}", error.message);
+    assert_eq!(
+        fs::read_to_string(dir.path().join("tracked.txt")).unwrap(),
+        "one\ntwo\n"
+    );
+    assert_eq!(
+        Head::current_commit().await.expect("head").to_string(),
+        head
+    );
+}
+
 /// A bridge checkpoint that pins no commit cannot be a restore or diff target:
 /// it fails closed rather than restoring "nothing".
 #[tokio::test]
@@ -497,27 +1643,119 @@ impl Drop for ChildGuard {
     }
 }
 
-/// `commit.create` publishes under the shared maintenance hold (§C.4.3).
+/// A publisher in another process prevents a fenced bridge write from running.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+#[cfg(unix)]
+async fn fenced_write_refuses_a_cross_process_publisher() {
+    use std::{
+        io::{BufRead, BufReader},
+        sync::atomic::{AtomicBool, Ordering},
+    };
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let index_path = dir.path().join(".libra/index");
+    let before = fs::read(&index_path).expect("index");
+    let script = "import fcntl, sys\nf = open(sys.argv[1], 'a+')\nfcntl.flock(f, fcntl.LOCK_SH)\nprint('locked', flush=True)\nsys.stdin.read()\n";
+    let mut child = ChildGuard(
+        std::process::Command::new("python3")
+            .args(["-c", script])
+            .arg(dir.path().join(".libra/maintenance.lock"))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("publisher"),
+    );
+    let mut ready = String::new();
+    BufReader::new(child.0.stdout.take().expect("stdout"))
+        .read_line(&mut ready)
+        .expect("ready");
+    assert_eq!(ready.trim(), "locked");
+    let called = AtomicBool::new(false);
+    let result = libra::internal::ai::agent_bridge::vcs_write::run_fenced(&fence, true, async {
+        called.store(true, Ordering::SeqCst);
+        Ok::<_, libra::internal::ai::agent_bridge::protocol::BridgeError>(())
+    })
+    .await;
+    let error = result.expect_err("cross-process publisher must block the fenced write");
+    assert_eq!(error.stable_code, "LBR-AGENT-038");
+    assert!(!called.load(Ordering::SeqCst));
+    assert_eq!(fs::read(index_path).expect("index"), before);
+}
+
+/// The index publication lock is shared with ordinary Libra index writers.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+#[cfg(unix)]
+async fn a_bridge_publication_blocks_another_libra_index_writer() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    write_file(dir.path(), "written-by-add.txt", "content\n");
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let mut child = ChildGuard(
+        std::process::Command::new(env!("CARGO_BIN_EXE_libra"))
+            .args(["add", "written-by-add.txt"])
+            .current_dir(dir.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn libra add"),
+    );
+
+    let finished = AtomicBool::new(false);
+    let result = libra::internal::ai::agent_bridge::vcs_write::run_fenced(&fence, true, async {
+        // While the bridge holds the publication lock, an ordinary Libra
+        // index writer must not be able to complete its own index write.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert!(
+            child.0.try_wait().expect("poll").is_none(),
+            "an ordinary index writer completed while the bridge held the publication lock"
+        );
+        Ok::<_, libra::internal::ai::agent_bridge::protocol::BridgeError>(())
+    })
+    .await;
+    assert!(result.is_ok());
+    finished.store(true, Ordering::SeqCst);
+    assert!(finished.load(Ordering::SeqCst));
+
+    // The writer completes once the publication lock is released.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        if child.0.try_wait().expect("poll").is_some() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the ordinary index writer never completed after the lock was released"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    let index =
+        git_internal::internal::index::Index::load(dir.path().join(".libra/index")).expect("index");
+    assert!(
+        index.get("written-by-add.txt", 0).is_some(),
+        "the ordinary writer's staged file must survive the bridge publication"
+    );
+}
+
+/// `commit.create` refuses a competing cross-process publisher before mutation.
 ///
-/// The bridge is the one writer that reaches the repository IN-PROCESS while
-/// living outside the CLI's command-level hold:
-/// `command_holds_shared_maintenance_lock` (`src/cli.rs`) excludes the whole
-/// `agent` surface because an agent's VCS mutations are supposed to spawn
-/// `libra` as a subprocess, and the child takes the hold. LB-05 made
-/// `commit.create` call `run_commit` directly, so without an explicit hold a
-/// concurrent `gc` / `prune` / `repack -d` could unlink payloads between
-/// writing an object and publishing the reference that pins it.
-///
-/// A deletion phase in ANOTHER process holds the lock exclusively (same
-/// process would join its own hold instead of blocking). The
-/// `publication-barrier` sentinel is written from inside the acquisition only
-/// when a shared take would block, so its existence proves the bridge waited
-/// rather than merely being slow — there is no sleep here to be wrong about.
+/// The bridge is a long-lived `agent` process, which does not hold the CLI's
+/// command-level maintenance lock. Each in-process mutation must therefore
+/// acquire the repository lock for its complete check-and-publish interval.
 #[test]
 #[serial(cwd, env, hash_kind)]
 #[cfg(unix)]
-fn commit_create_waits_for_a_deletion_phase_before_publishing() {
-    use std::io::{BufRead, BufReader, Write as _};
+fn commit_create_refuses_another_cross_process_publisher() {
+    use std::io::{BufRead, BufReader, Read as _, Write as _};
 
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path().to_path_buf();
@@ -532,28 +1770,28 @@ fn commit_create_waits_for_a_deletion_phase_before_publishing() {
         stage(&["staged.txt"]).await;
     });
 
-    // A deletion phase, in another process, holding the lock exclusively.
+    // A normal Libra publisher in another process holds the shared lock.
     let lock_path = root.join(".libra").join("maintenance.lock");
     let script = format!(
         "import fcntl, sys, time\n\
          f = open({path:?}, 'a+')\n\
-         fcntl.flock(f, fcntl.LOCK_EX)\n\
+         fcntl.flock(f, fcntl.LOCK_SH)\n\
          sys.stdout.write('locked\\n')\n\
          sys.stdout.flush()\n\
          time.sleep(600)\n",
         path = lock_path.to_string_lossy().to_string()
     );
-    let mut deleter = ChildGuard(
+    let mut publisher = ChildGuard(
         std::process::Command::new("python3")
             .args(["-c", &script])
             .stdout(std::process::Stdio::piped())
             .spawn()
-            .expect("spawn the deleter holding the lock"),
+            .expect("spawn the publisher holding the lock"),
     );
     let mut ready = String::new();
-    BufReader::new(deleter.0.stdout.take().expect("stdout"))
+    BufReader::new(publisher.0.stdout.take().expect("stdout"))
         .read_line(&mut ready)
-        .expect("deleter ready");
+        .expect("publisher ready");
     assert_eq!(ready.trim(), "locked");
 
     // Drive a real bridge session up to `commit.create`.
@@ -571,7 +1809,7 @@ fn commit_create_waits_for_a_deletion_phase_before_publishing() {
             .current_dir(&root)
             .env("LIBRA_TEST", "1")
             .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
             .spawn()
             .expect("spawn the bridge"),
@@ -584,26 +1822,35 @@ fn commit_create_waits_for_a_deletion_phase_before_publishing() {
         .write_all(frames.as_bytes())
         .expect("feed bridge frames");
 
-    let barrier = root.join(".libra").join("publication-barrier");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-    while !barrier.exists() {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        if bridge.0.try_wait().expect("poll").is_some() {
+            break;
+        }
         assert!(
             std::time::Instant::now() < deadline,
-            "commit.create never reached the publication barrier — it published \
-             without taking the shared maintenance hold"
+            "commit.create remained blocked instead of refusing the competing publisher"
         );
-        assert!(
-            bridge.0.try_wait().expect("poll").is_none(),
-            "the bridge exited before reaching the publication barrier"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::thread::sleep(std::time::Duration::from_millis(25));
     }
-
-    // The sentinel is written only after the bridge observed that a shared
-    // acquisition would block, so reaching here already proves the wait.
-    assert!(
-        bridge.0.try_wait().expect("poll").is_none(),
-        "commit.create must wait for the deletion phase, not publish underneath it"
+    let mut stdout = String::new();
+    bridge
+        .0
+        .stdout
+        .take()
+        .expect("bridge stdout")
+        .read_to_string(&mut stdout)
+        .expect("read bridge response");
+    let response: serde_json::Value = serde_json::from_str(
+        stdout
+            .lines()
+            .last()
+            .expect("bridge returned a commit.create response"),
+    )
+    .expect("decode bridge response");
+    assert_eq!(
+        response["error"]["data"]["stable_code"], "LBR-AGENT-038",
+        "{response}"
     );
 }
 
@@ -625,11 +1872,13 @@ async fn vcs_read_methods_report_identity_status_diff_and_log() {
     assert!(identity["head_oid"].as_str().is_some());
     assert_eq!(identity["unborn"], false);
     assert!(
-        identity["workdir"]
-            .as_str()
-            .unwrap()
-            .contains(dir.path().file_name().unwrap().to_str().unwrap())
-            || identity["workdir"].as_str().is_some()
+        identity.get("workdir").is_none(),
+        "vcs.identity must not return an absolute worktree path: {identity}"
+    );
+    let rendered = identity.to_string();
+    assert!(
+        !rendered.contains(&dir.path().to_string_lossy().to_string()),
+        "vcs.identity must not leak the host path: {rendered}"
     );
 
     let status = vcs_data(&ctx, r#"{"jsonrpc":"2.0","method":"vcs.status","id":2}"#).await;
@@ -680,6 +1929,24 @@ async fn vcs_read_methods_report_identity_status_diff_and_log() {
             || legacy.get("bridge_events").is_some()
             || legacy.as_object().is_some()
     );
+}
+
+/// A corrupt index is an error, never an empty or conflict-free status.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_status_refuses_a_corrupt_index() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    fs::write(dir.path().join(".libra/index"), b"corrupt index").expect("corrupt index");
+    let error = read_dispatch(
+        &ctx,
+        &request(r#"{"jsonrpc":"2.0","method":"vcs.status","id":1}"#),
+    )
+    .await
+    .expect_err("unreadable index must not look clean");
+    assert!(error.message.contains("read index"), "{}", error.message);
+    assert!(!error.message.contains(&dir.path().display().to_string()));
 }
 
 /// (new) LVC-06: stage is fenced, replay does not stage twice, and a stale
@@ -774,6 +2041,214 @@ async fn vcs_fence_is_disabled_after_minor_one_handshake() {
     assert!(responses[1].get("result").is_none());
 }
 
+/// A `vcs.commit` retry resumes its prepared object after its owner stops.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_commit_recovers_a_prepared_object_after_owner_stops() {
+    use git_internal::internal::object::commit::Commit;
+    use libra::{internal::branch::Branch, utils::object_ext::CommitExt};
+    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    let before = Head::current_commit().await.expect("before");
+    write_file(dir.path(), "recover.txt", "recover\n");
+    stage(&["recover.txt"]).await;
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.commit","params":{{"operation_id":"op-vcs-intent","session_id":"s1","message":"feat: recover vcs","paths":["recover.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let first = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect("commit")
+        .expect("response")
+        .result
+        .expect("result");
+    let oid = first["commitOid"].as_str().expect("oid").to_string();
+    let stored = Commit::load(&libra::internal::object_format::parse_repo_oid(&oid).expect("oid"))
+        .expect("commit object");
+    let branch = match Head::current().await {
+        Head::Branch(name) => name,
+        Head::Detached(_) => panic!("expected a branch"),
+    };
+    Branch::update_branch(&branch, &before.to_string(), None)
+        .await
+        .expect("restore expected HEAD");
+    let db = libra::internal::worktree_scope::request_db()
+        .await
+        .expect("repository database");
+    db.execute_raw(Statement::from_sql_and_values(
+        DatabaseBackend::Sqlite,
+        "UPDATE agent_bridge_publication SET phase = 'prepared' WHERE operation_id = ?",
+        ["op-vcs-intent".into()],
+    ))
+    .await
+    .expect("restore prepared phase");
+    let intent = format!(
+        r#"{{"commitIntent":true,"expectedHead":"{before}","expectedIndex":"{}","expectedWorktree":"{}","message":"feat: recover vcs","tree":"{}","paths":["recover.txt"]}}"#,
+        fence.index_generation, fence.worktree_generation, stored.tree_id
+    );
+    ctx.conn
+        .execute_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "UPDATE agent_bridge_operation SET status = 'pending', result_digest = ? WHERE operation_id = 'op-vcs-intent'",
+            [intent.clone().into()],
+        ))
+        .await
+        .expect("store commit intent");
+    let index_path = dir.path().join(".libra/index");
+    let index_before = fs::read(&index_path).expect("index");
+    let recovered = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect("prepared recovery")
+        .expect("response")
+        .result
+        .expect("result");
+    assert_eq!(recovered["commitOid"], oid);
+    assert_eq!(recovered["outcome"], "replayed");
+    assert_eq!(Head::current_commit().await.expect("HEAD").to_string(), oid);
+
+    // A later recovery attempt whose worktree fence has drifted is terminal.
+    // Restoring the old bytes must not publish the prepared commit later.
+    Branch::update_branch(&branch, &before.to_string(), None)
+        .await
+        .expect("rewind for the stale recovery case");
+    db.execute_raw(Statement::from_sql_and_values(
+        DatabaseBackend::Sqlite,
+        "UPDATE agent_bridge_publication SET phase = 'prepared' WHERE operation_id = ?",
+        ["op-vcs-intent".into()],
+    ))
+    .await
+    .expect("restore prepared phase");
+    ctx.conn
+        .execute_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "UPDATE agent_bridge_operation SET status = 'pending', result_digest = ? WHERE operation_id = 'op-vcs-intent'",
+            [intent.into()],
+        ))
+        .await
+        .expect("restore intent");
+    write_file(dir.path(), "recover.txt", "changed after the fence\n");
+    let stale = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect("recovery response")
+        .expect("response")
+        .result
+        .expect("terminal result");
+    assert_eq!(stale["outcome"], "indeterminate", "{stale}");
+    assert_eq!(Head::current_commit().await.expect("HEAD"), before);
+    assert_eq!(fs::read(&index_path).expect("index"), index_before);
+    write_file(dir.path(), "recover.txt", "recover\n");
+    let replay = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect("replay")
+        .expect("response")
+        .result
+        .expect("terminal result");
+    assert_eq!(replay["outcome"], "indeterminate", "{replay}");
+    assert_eq!(replay["replayed"], true);
+    assert_eq!(Head::current_commit().await.expect("HEAD"), before);
+    assert_eq!(fs::read(&index_path).expect("index"), index_before);
+}
+
+/// A corrupt vcs.commit result never replays as a successful commit.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_commit_replay_rejects_corrupt_commit_oid() {
+    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), "new.txt", "new\n");
+    stage(&["new.txt"]).await;
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.commit","params":{{"operation_id":"op-bad-vcs","session_id":"s1","message":"feat: new","paths":["new.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect("commit");
+    let head = Head::current_commit().await.expect("head");
+    ctx.conn
+        .execute_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "UPDATE agent_bridge_operation SET result_digest = ? WHERE operation_id = 'op-bad-vcs'",
+            [r#"{"commitOid":"bogus","outcome":"applied"}"#.into()],
+        ))
+        .await
+        .expect("corrupt result");
+    let error = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect_err("corrupt oid");
+    assert!(
+        error.message.contains("recorded commit"),
+        "{}",
+        error.message
+    );
+    assert_eq!(Head::current_commit().await.expect("head"), head);
+}
+
+/// `vcs.commit` replay restores the session link after an association failure.
+#[tokio::test]
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_commit_replay_restores_link_after_association_failure() {
+    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), "linked.txt", "linked\n");
+    stage(&["linked.txt"]).await;
+    let before = Head::current_commit().await.expect("before");
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.commit","params":{{"operation_id":"op-vcs-link","session_id":"s1","message":"feat: linked","paths":["linked.txt"],"linkSession":true,"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    libra::internal::ai::agent_bridge::mutations::fail_next_association_for_test();
+    let error = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect_err("association failure");
+    assert!(error.message.contains("association"), "{}", error.message);
+    let published = Head::current_commit().await.expect("published").to_string();
+    assert_ne!(published, before.to_string());
+    let replay = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect("replay")
+        .expect("response")
+        .result
+        .expect("result");
+    assert_eq!(replay["commitOid"], published);
+    assert_eq!(replay["outcome"], "replayed");
+    assert_eq!(
+        Head::current_commit().await.expect("HEAD").to_string(),
+        published
+    );
+    let links = ctx
+        .conn
+        .query_all_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "SELECT target_id FROM agent_bridge_link WHERE source_type = 'commit' AND source_id = ? AND target_id = 'op-vcs-link'",
+            [published.into()],
+        ))
+        .await
+        .expect("links");
+    assert_eq!(links.len(), 1, "replay must restore the vcs commit link");
+}
+
 /// (new) A recorded commit is replayed even if a later bookkeeping step failed.
 #[tokio::test]
 #[serial(cwd, env, hash_kind)]
@@ -812,6 +2287,3253 @@ async fn vcs_commit_replay_keeps_a_published_result_after_failure() {
     assert_eq!(Head::current_commit().await.expect("head").to_string(), oid);
 }
 
+/// A mode-only change between the two reads is not staged.
+#[tokio::test]
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_stage_rejects_a_mode_change_between_reads() {
+    struct ClearHook;
+    impl Drop for ClearHook {
+        fn drop(&mut self) {
+            libra::internal::ai::agent_bridge::vcs_write::set_mode_chmod_between_reads_for_test(
+                None,
+            );
+        }
+    }
+    let _clear = ClearHook;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), "tool.sh", "#!/bin/sh\n");
+    std::fs::set_permissions(
+        dir.path().join("tool.sh"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .expect("chmod");
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let index_before = fs::read(dir.path().join(".libra").join("index")).expect("index");
+    libra::internal::ai::agent_bridge::vcs_write::set_mode_chmod_between_reads_for_test(Some(
+        dir.path().join("tool.sh"),
+    ));
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-mode-between","session_id":"s1","paths":["tool.sh"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let error = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect_err("mode changed between reads");
+    assert!(error.message.contains("stale_state"), "{}", error.message);
+    assert_eq!(
+        fs::read(dir.path().join(".libra").join("index")).expect("index"),
+        index_before
+    );
+}
+
+/// Replacing the file after its bytes are reread does not change the staged mode.
+#[tokio::test]
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_stage_keeps_mode_from_the_read_descriptor() {
+    struct ClearHook;
+    impl Drop for ClearHook {
+        fn drop(&mut self) {
+            libra::internal::ai::agent_bridge::vcs_write::set_mode_stat_rewrite_for_test(None);
+        }
+    }
+    let _clear = ClearHook;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), "tool.sh", "#!/bin/sh\n");
+    std::fs::set_permissions(
+        dir.path().join("tool.sh"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .expect("chmod");
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    libra::internal::ai::agent_bridge::vcs_write::set_mode_stat_rewrite_for_test(Some(
+        dir.path().join("tool.sh"),
+    ));
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-mode-fd","session_id":"s1","paths":["tool.sh"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect("stage")
+        .expect("response")
+        .result
+        .expect("result");
+    let index =
+        git_internal::internal::index::Index::load(dir.path().join(".libra/index")).expect("index");
+    let entry = index.get("tool.sh", 0).expect("entry");
+    assert_eq!(entry.mode, 0o100755);
+    let approved = git_internal::hash::ObjectHash::from_type_and_data(
+        git_internal::internal::object::types::ObjectType::Blob,
+        b"#!/bin/sh\n",
+    );
+    assert_eq!(entry.hash, approved);
+}
+
+/// A mode change during publish does not replace the snapshotted executable bit.
+#[tokio::test]
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_stage_keeps_the_snapshotted_executable_bit() {
+    struct ClearHook;
+    impl Drop for ClearHook {
+        fn drop(&mut self) {
+            libra::internal::ai::agent_bridge::vcs_write::set_publish_rewrite_for_test(None);
+        }
+    }
+    let _clear = ClearHook;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), "tool.sh", "#!/bin/sh\n");
+    std::fs::set_permissions(
+        dir.path().join("tool.sh"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .expect("chmod");
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    libra::internal::ai::agent_bridge::vcs_write::set_publish_rewrite_for_test(Some(
+        dir.path().join("tool.sh"),
+    ));
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-exec-race","session_id":"s1","paths":["tool.sh"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect("stage")
+        .expect("response")
+        .result
+        .expect("result");
+    let index =
+        git_internal::internal::index::Index::load(dir.path().join(".libra/index")).expect("index");
+    let entry = index.get("tool.sh", 0).expect("entry");
+    assert_eq!(entry.mode, 0o100755);
+    let approved = git_internal::hash::ObjectHash::from_type_and_data(
+        git_internal::internal::object::types::ObjectType::Blob,
+        b"#!/bin/sh\n",
+    );
+    assert_eq!(entry.hash, approved);
+}
+
+/// Staging an executable regular file keeps mode 100755.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_stage_preserves_the_executable_bit() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), "tool.sh", "#!/bin/sh\n");
+    std::fs::set_permissions(
+        dir.path().join("tool.sh"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .expect("chmod");
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-exec","session_id":"s1","paths":["tool.sh"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect("stage")
+        .expect("response")
+        .result
+        .expect("result");
+    let index =
+        git_internal::internal::index::Index::load(dir.path().join(".libra/index")).expect("index");
+    assert_eq!(index.get("tool.sh", 0).expect("entry").mode, 0o100755);
+}
+
+/// Unstaging a modification restores the index to HEAD and leaves the worktree file.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_unstage_restores_index_without_touching_the_worktree() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), "tracked.txt", "one\nchanged\n");
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let stage = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-stage-edit","session_id":"s1","paths":["tracked.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    mutation_dispatch(&ctx, &request(&stage))
+        .await
+        .expect("stage")
+        .expect("response");
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("after stage");
+    let unstage = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.unstage","params":{{"operation_id":"op-unstage-edit","session_id":"s1","paths":["tracked.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":2}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let result = mutation_dispatch(&ctx, &request(&unstage))
+        .await
+        .expect("unstage")
+        .expect("response")
+        .result
+        .expect("result");
+    assert_eq!(result["outcome"], "applied");
+    let head_blob = git_internal::hash::ObjectHash::from_type_and_data(
+        git_internal::internal::object::types::ObjectType::Blob,
+        b"one\n",
+    );
+    let index =
+        git_internal::internal::index::Index::load(dir.path().join(".libra/index")).expect("index");
+    assert_eq!(
+        index.get("tracked.txt", 0).expect("tracked").hash,
+        head_blob
+    );
+    assert_eq!(
+        fs::read(dir.path().join("tracked.txt")).expect("worktree"),
+        b"one\nchanged\n"
+    );
+}
+
+/// One unstage request restores two index entries and preserves both files.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_unstage_restores_multiple_paths_without_touching_worktree() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), "new-one.txt", "first\n");
+    write_file(dir.path(), "new-two.txt", "second\n");
+    stage(&["new-one.txt", "new-two.txt"]).await;
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.unstage","params":{{"operation_id":"op-unstage-pair","session_id":"s1","paths":["new-one.txt","new-two.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let result = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect("unstage")
+        .expect("response")
+        .result
+        .expect("result");
+    assert_eq!(result["outcome"], "applied");
+    assert_eq!(
+        result["paths"],
+        serde_json::json!(["new-one.txt", "new-two.txt"])
+    );
+    let index =
+        git_internal::internal::index::Index::load(dir.path().join(".libra/index")).expect("index");
+    assert!(index.get("new-one.txt", 0).is_none());
+    assert!(index.get("new-two.txt", 0).is_none());
+    assert_eq!(
+        fs::read(dir.path().join("new-one.txt")).unwrap(),
+        b"first\n"
+    );
+    assert_eq!(
+        fs::read(dir.path().join("new-two.txt")).unwrap(),
+        b"second\n"
+    );
+}
+
+/// Unstaging a missing path is invalid input and does not unstage earlier paths.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_unstage_rejects_a_missing_path_without_partial_updates() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), "good.txt", "good\n");
+    write_file(dir.path(), "other.txt", "other\n");
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let stage = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-stage-both","session_id":"s1","paths":["good.txt","other.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    mutation_dispatch(&ctx, &request(&stage))
+        .await
+        .expect("stage")
+        .expect("response");
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("after stage");
+    let index_before = fs::read(dir.path().join(".libra").join("index")).expect("index");
+    let unstage = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.unstage","params":{{"operation_id":"op-unstage-mixed","session_id":"s1","paths":["good.txt","missing.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":2}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let error = mutation_dispatch(&ctx, &request(&unstage))
+        .await
+        .expect_err("missing path");
+    assert_eq!(error.stable_code, "LBR-AGENT-027", "{}", error.message);
+    assert!(error.message.contains("did not match"), "{}", error.message);
+    assert_eq!(
+        fs::read(dir.path().join(".libra").join("index")).expect("index"),
+        index_before
+    );
+}
+
+/// Unstaging a newly staged file removes that index entry.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_unstage_removes_a_newly_staged_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), "extra.txt", "extra\n");
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let stage = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-add-extra","session_id":"s1","paths":["extra.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    mutation_dispatch(&ctx, &request(&stage))
+        .await
+        .expect("stage")
+        .expect("response");
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("after stage");
+    let unstage = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.unstage","params":{{"operation_id":"op-unstage-extra","session_id":"s1","paths":["extra.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":2}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let result = mutation_dispatch(&ctx, &request(&unstage))
+        .await
+        .expect("unstage")
+        .expect("response")
+        .result
+        .expect("result");
+    assert_eq!(result["outcome"], "applied");
+    let index =
+        git_internal::internal::index::Index::load(dir.path().join(".libra/index")).expect("index");
+    assert!(
+        index.get("extra.txt", 0).is_none(),
+        "new file must leave the index"
+    );
+}
+
+/// A path through a symlink directory must not read a file outside the repository.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_stage_rejects_a_path_through_a_symlink_directory() {
+    use std::os::unix::fs::symlink;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let outside = tempfile::tempdir().expect("outside");
+    write_file(outside.path(), "secret.txt", "SECRET\n");
+    symlink(outside.path(), dir.path().join("escape")).expect("symlink dir");
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let index_before = fs::read(dir.path().join(".libra").join("index")).expect("index");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-escape","session_id":"s1","paths":["escape/secret.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let error = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect_err("symlink directory");
+    assert_eq!(error.stable_code, "LBR-AGENT-027", "{}", error.message);
+    assert!(error.message.contains("symlink"), "{}", error.message);
+    assert!(
+        !error
+            .message
+            .contains(&dir.path().to_string_lossy().to_string()),
+        "the error must not carry the host path: {}",
+        error.message
+    );
+    assert!(
+        !error
+            .message
+            .contains(&outside.path().to_string_lossy().to_string()),
+        "the error must not carry an outside path: {}",
+        error.message
+    );
+    assert_eq!(
+        fs::read(dir.path().join(".libra").join("index")).expect("index"),
+        index_before
+    );
+    let secret = git_internal::hash::ObjectHash::from_type_and_data(
+        git_internal::internal::object::types::ObjectType::Blob,
+        b"SECRET\n",
+    );
+    let hex = secret.to_string();
+    let loose = dir
+        .path()
+        .join(".libra/objects")
+        .join(&hex[..2])
+        .join(&hex[2..]);
+    assert!(
+        !loose.exists(),
+        "outside file stored at {}",
+        loose.display()
+    );
+}
+
+/// A failure after preparing the first blob leaves the live index unchanged.
+/// The first blob remains in the object store: this test does not claim that
+/// multi-path stage is atomic with respect to object publication.
+#[tokio::test]
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_stage_restores_index_after_a_real_mid_publish_failure() {
+    struct ClearHook;
+    impl Drop for ClearHook {
+        fn drop(&mut self) {
+            libra::internal::ai::agent_bridge::vcs_write::fail_second_publish_for_test(false);
+        }
+    }
+    let _clear = ClearHook;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), "good.txt", "good\n");
+    write_file(dir.path(), "other.txt", "other\n");
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let index_before = fs::read(dir.path().join(".libra").join("index")).expect("index");
+    libra::internal::ai::agent_bridge::vcs_write::fail_second_publish_for_test(true);
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-second-publish","session_id":"s1","paths":["good.txt","other.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let error = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect_err("second publish");
+    assert_eq!(error.stable_code, "LBR-AGENT-027", "{}", error.message);
+    assert_eq!(
+        fs::read(dir.path().join(".libra").join("index")).expect("index"),
+        index_before
+    );
+    let good = git_internal::hash::ObjectHash::from_type_and_data(
+        git_internal::internal::object::types::ObjectType::Blob,
+        b"good\n",
+    );
+    let hex = good.to_string();
+    let loose = dir
+        .path()
+        .join(".libra/objects")
+        .join(&hex[..2])
+        .join(&hex[2..]);
+    assert!(
+        loose.exists(),
+        "the injected failure must happen after the first blob was published: {}",
+        loose.display()
+    );
+}
+
+/// Invalidating another path as the first publish begins must not store that first blob.
+#[tokio::test]
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_stage_snapshots_the_batch_before_the_first_blob() {
+    struct ClearHook;
+    impl Drop for ClearHook {
+        fn drop(&mut self) {
+            libra::internal::ai::agent_bridge::vcs_write::set_break_on_first_publish_for_test(None);
+        }
+    }
+    let _clear = ClearHook;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), "good.txt", "good\n");
+    write_file(dir.path(), "later.txt", "later\n");
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let index_before = fs::read(dir.path().join(".libra").join("index")).expect("index");
+    libra::internal::ai::agent_bridge::vcs_write::set_break_on_first_publish_for_test(Some(
+        dir.path().join("later.txt"),
+    ));
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-first-blob","session_id":"s1","paths":["good.txt","later.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let error = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect_err("later path invalidated as publish begins");
+    assert_eq!(error.stable_code, "LBR-AGENT-027", "{}", error.message);
+    assert_eq!(
+        fs::read(dir.path().join(".libra").join("index")).expect("index"),
+        index_before
+    );
+    let good = git_internal::hash::ObjectHash::from_type_and_data(
+        git_internal::internal::object::types::ObjectType::Blob,
+        b"good\n",
+    );
+    let hex = good.to_string();
+    let loose = dir
+        .path()
+        .join(".libra/objects")
+        .join(&hex[..2])
+        .join(&hex[2..]);
+    assert!(
+        !loose.exists(),
+        "first blob stored after another path became invalid: {}",
+        loose.display()
+    );
+}
+
+/// A path invalidated at the start of publishing must not leave an earlier blob stored.
+#[tokio::test]
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_stage_rechecks_every_path_before_publishing() {
+    struct ClearHook;
+    impl Drop for ClearHook {
+        fn drop(&mut self) {
+            libra::internal::ai::agent_bridge::vcs_write::set_break_at_publish_for_test(None);
+        }
+    }
+    let _clear = ClearHook;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), "good.txt", "good\n");
+    write_file(dir.path(), "later.txt", "later\n");
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let index_before = fs::read(dir.path().join(".libra").join("index")).expect("index");
+    libra::internal::ai::agent_bridge::vcs_write::set_break_at_publish_for_test(Some(
+        dir.path().join("later.txt"),
+    ));
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-recheck-batch","session_id":"s1","paths":["good.txt","later.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let error = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect_err("path changed before publish");
+    assert_eq!(error.stable_code, "LBR-AGENT-027", "{}", error.message);
+    assert_eq!(
+        fs::read(dir.path().join(".libra").join("index")).expect("index"),
+        index_before
+    );
+    let good = git_internal::hash::ObjectHash::from_type_and_data(
+        git_internal::internal::object::types::ObjectType::Blob,
+        b"good\n",
+    );
+    let hex = good.to_string();
+    let loose = dir
+        .path()
+        .join(".libra/objects")
+        .join(&hex[..2])
+        .join(&hex[2..]);
+    assert!(
+        !loose.exists(),
+        "publish started before the batch was rechecked: {}",
+        loose.display()
+    );
+}
+
+/// A path that becomes invalid after the first path is staged must not leave that blob stored.
+#[tokio::test]
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_stage_does_not_store_a_blob_when_a_later_path_becomes_invalid() {
+    struct ClearHook;
+    impl Drop for ClearHook {
+        fn drop(&mut self) {
+            libra::internal::ai::agent_bridge::vcs_write::set_break_second_stage_for_test(None);
+        }
+    }
+    let _clear = ClearHook;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), "good.txt", "good\n");
+    write_file(dir.path(), "later.txt", "later\n");
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let index_before = fs::read(dir.path().join(".libra").join("index")).expect("index");
+    libra::internal::ai::agent_bridge::vcs_write::set_break_second_stage_for_test(Some(
+        dir.path().join("later.txt"),
+    ));
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-later","session_id":"s1","paths":["good.txt","later.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let error = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect_err("later path became a directory");
+    assert_eq!(error.stable_code, "LBR-AGENT-027", "{}", error.message);
+    assert_eq!(
+        fs::read(dir.path().join(".libra").join("index")).expect("index"),
+        index_before
+    );
+    let good = git_internal::hash::ObjectHash::from_type_and_data(
+        git_internal::internal::object::types::ObjectType::Blob,
+        b"good\n",
+    );
+    let hex = good.to_string();
+    let loose = dir
+        .path()
+        .join(".libra/objects")
+        .join(&hex[..2])
+        .join(&hex[2..]);
+    assert!(
+        !loose.exists(),
+        "first path was stored before the later path failed: {}",
+        loose.display()
+    );
+}
+
+/// One invalid path rolls back paths staged earlier in the same request.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_stage_rolls_back_when_a_later_path_is_invalid() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), "good.txt", "good\n");
+    std::fs::create_dir(dir.path().join("nested")).expect("dir");
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let index_before = fs::read(dir.path().join(".libra").join("index")).expect("index");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-partial","session_id":"s1","paths":["good.txt","nested"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let error = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect_err("mixed request");
+    assert_eq!(error.stable_code, "LBR-AGENT-027", "{}", error.message);
+    assert_eq!(
+        fs::read(dir.path().join(".libra").join("index")).expect("index"),
+        index_before,
+        "earlier path must not remain staged"
+    );
+    let good = git_internal::hash::ObjectHash::from_type_and_data(
+        git_internal::internal::object::types::ObjectType::Blob,
+        b"good\n",
+    );
+    let hex = good.to_string();
+    let loose = dir
+        .path()
+        .join(".libra/objects")
+        .join(&hex[..2])
+        .join(&hex[2..]);
+    assert!(
+        !loose.exists(),
+        "rejected request stored good.txt at {}",
+        loose.display()
+    );
+}
+
+/// Deleting a directory's only file does not leave an empty directory in the commit.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_commit_omits_an_empty_directory_after_its_last_file_is_deleted() {
+    use libra::utils::object_ext::{CommitExt, TreeExt};
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    std::fs::create_dir(dir.path().join("sub")).expect("sub");
+    write_file(dir.path(), "sub/nested.txt", "nested\n");
+    stage(&["sub/nested.txt"]).await;
+    cli_commit("add nested").await;
+    std::fs::remove_file(dir.path().join("sub/nested.txt")).expect("delete");
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let stage_frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-stage-empty-dir","session_id":"s1","paths":["sub/nested.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    mutation_dispatch(&ctx, &request(&stage_frame))
+        .await
+        .expect("stage deletion")
+        .expect("response");
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("after stage");
+    let commit_frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.commit","params":{{"operation_id":"op-commit-empty-dir","session_id":"s1","message":"chore: remove nested","paths":["sub/nested.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":2}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let result = mutation_dispatch(&ctx, &request(&commit_frame))
+        .await
+        .expect("commit")
+        .expect("response")
+        .result
+        .expect("result");
+    let oid = result["commitOid"].as_str().expect("oid");
+    let stored = git_internal::internal::object::commit::Commit::load(
+        &libra::internal::object_format::parse_repo_oid(oid).expect("oid"),
+    )
+    .expect("commit");
+    let tree = git_internal::internal::object::tree::Tree::load(&stored.tree_id).expect("tree");
+    assert!(
+        tree.tree_items
+            .iter()
+            .all(|item| !item.name.eq_ignore_ascii_case("sub")),
+        "empty directory remained in the commit: {:?}",
+        tree.tree_items
+            .iter()
+            .map(|item| &item.name)
+            .collect::<Vec<_>>()
+    );
+}
+
+/// A case-only directory rename keeps one index path and one tree path.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_commit_accepts_a_case_only_directory_rename() {
+    use libra::utils::object_ext::{CommitExt, TreeExt};
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    std::fs::create_dir(dir.path().join("sub")).expect("sub");
+    write_file(dir.path(), "sub/nested.txt", "nested\n");
+    stage(&["sub/nested.txt"]).await;
+    cli_commit("add nested").await;
+    std::fs::rename(dir.path().join("sub"), dir.path().join("Sub")).expect("rename dir");
+    if !dir.path().join("sub").exists() {
+        return;
+    }
+    write_file(dir.path(), "Sub/nested.txt", "nested\nrenamed\n");
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let stage_frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-stage-dir-case","session_id":"s1","paths":["sub/nested.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    mutation_dispatch(&ctx, &request(&stage_frame))
+        .await
+        .expect("stage")
+        .expect("response");
+    let index =
+        git_internal::internal::index::Index::load(dir.path().join(".libra/index")).expect("index");
+    let names: Vec<String> = index
+        .tracked_files()
+        .into_iter()
+        .map(|path| path.display().to_string().replace('\\', "/"))
+        .filter(|name| name.eq_ignore_ascii_case("sub/nested.txt"))
+        .collect();
+    assert_eq!(names, vec!["Sub/nested.txt".to_string()], "{names:?}");
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("after stage");
+    let commit_frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.commit","params":{{"operation_id":"op-commit-dir-case","session_id":"s1","message":"chore: rename directory case","paths":["SUB/NESTED.TXT"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":2}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let result = mutation_dispatch(&ctx, &request(&commit_frame))
+        .await
+        .expect("commit")
+        .expect("response")
+        .result
+        .expect("result");
+    let oid = result["commitOid"].as_str().expect("oid");
+    let stored = git_internal::internal::object::commit::Commit::load(
+        &libra::internal::object_format::parse_repo_oid(oid).expect("oid"),
+    )
+    .expect("commit");
+    let tree = git_internal::internal::object::tree::Tree::load(&stored.tree_id).expect("tree");
+    let sub = tree
+        .tree_items
+        .iter()
+        .find(|item| item.name.eq_ignore_ascii_case("sub"))
+        .expect("subdirectory");
+    assert_eq!(sub.name, "Sub");
+    let nested = git_internal::internal::object::tree::Tree::load(&sub.id).expect("nested tree");
+    let nested_names: Vec<_> = nested
+        .tree_items
+        .iter()
+        .map(|item| item.name.as_str())
+        .filter(|name| name.eq_ignore_ascii_case("nested.txt"))
+        .collect();
+    assert_eq!(nested_names, ["nested.txt"], "{nested_names:?}");
+}
+
+/// Unstaging a case-only rename restores the HEAD spelling in the index.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_unstage_restores_the_head_spelling_after_a_case_rename() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    std::fs::rename(
+        dir.path().join("tracked.txt"),
+        dir.path().join("Tracked.txt"),
+    )
+    .expect("rename");
+    if !dir.path().join("tracked.txt").exists() {
+        return;
+    }
+    write_file(dir.path(), "Tracked.txt", "one\nrenamed\n");
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let stage = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-stage-unstage-case","session_id":"s1","paths":["Tracked.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    mutation_dispatch(&ctx, &request(&stage))
+        .await
+        .expect("stage")
+        .expect("response");
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("after stage");
+    let unstage = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.unstage","params":{{"operation_id":"op-unstage-case","session_id":"s1","paths":["TRACKED.TXT"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":2}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let result = mutation_dispatch(&ctx, &request(&unstage))
+        .await
+        .expect("unstage")
+        .expect("response")
+        .result
+        .expect("result");
+    assert_eq!(result["outcome"], "applied");
+    let index =
+        git_internal::internal::index::Index::load(dir.path().join(".libra/index")).expect("index");
+    let names: Vec<String> = index
+        .tracked_files()
+        .into_iter()
+        .map(|path| path.display().to_string())
+        .filter(|name| name.eq_ignore_ascii_case("tracked.txt"))
+        .collect();
+    assert_eq!(names, vec!["tracked.txt".to_string()], "{names:?}");
+    assert_eq!(
+        fs::read(dir.path().join("Tracked.txt")).expect("worktree"),
+        b"one\nrenamed\n"
+    );
+}
+
+/// Committing a case-only rename uses the single index name, not both spellings.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_commit_accepts_a_case_only_rename() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    std::fs::rename(
+        dir.path().join("tracked.txt"),
+        dir.path().join("Tracked.txt"),
+    )
+    .expect("rename");
+    if !dir.path().join("tracked.txt").exists() {
+        return;
+    }
+    write_file(dir.path(), "Tracked.txt", "one\nrenamed\n");
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let stage = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-stage-case-commit","session_id":"s1","paths":["tracked.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    mutation_dispatch(&ctx, &request(&stage))
+        .await
+        .expect("stage")
+        .expect("response");
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("after stage");
+    let commit = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.commit","params":{{"operation_id":"op-commit-case","session_id":"s1","message":"chore: rename case","paths":["TRACKED.TXT"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":2}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let result = mutation_dispatch(&ctx, &request(&commit))
+        .await
+        .expect("commit case rename")
+        .expect("response")
+        .result
+        .expect("result");
+    let oid = result["commitOid"].as_str().expect("oid").to_string();
+    assert!(!oid.is_empty());
+    use libra::utils::object_ext::{CommitExt, TreeExt};
+    let stored = git_internal::internal::object::commit::Commit::load(
+        &libra::internal::object_format::parse_repo_oid(&oid).expect("oid"),
+    )
+    .expect("commit");
+    let tree = git_internal::internal::object::tree::Tree::load(&stored.tree_id).expect("tree");
+    let names: Vec<_> = tree
+        .tree_items
+        .iter()
+        .map(|item| item.name.as_str())
+        .filter(|name| name.eq_ignore_ascii_case("tracked.txt"))
+        .collect();
+    assert_eq!(names, ["Tracked.txt"], "{names:?}");
+    let renamed = git_internal::hash::ObjectHash::from_type_and_data(
+        git_internal::internal::object::types::ObjectType::Blob,
+        b"one\nrenamed\n",
+    );
+    let item = tree
+        .tree_items
+        .iter()
+        .find(|item| item.name == "Tracked.txt")
+        .expect("tree item");
+    assert_eq!(item.id, renamed);
+}
+
+/// A Unicode spelling that names an existing directory entry reuses that entry's name.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_stage_uses_the_directory_spelling_for_unicode_names() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let requested = "caf\u{e9}.txt";
+    write_file(dir.path(), requested, "cafe\n");
+    let listed: Vec<String> = std::fs::read_dir(dir.path())
+        .expect("list")
+        .flatten()
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| name.starts_with("caf"))
+        .collect();
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-unicode","session_id":"s1","paths":["{requested}"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect("stage")
+        .expect("response")
+        .result
+        .expect("result");
+    let index =
+        git_internal::internal::index::Index::load(dir.path().join(".libra/index")).expect("index");
+    let staged: Vec<String> = index
+        .tracked_files()
+        .into_iter()
+        .map(|path| path.display().to_string())
+        .filter(|name| name.starts_with("caf"))
+        .collect();
+    assert_eq!(staged, listed, "index spelling diverged from the directory");
+}
+
+/// A case-only rename replaces the old index name instead of keeping both.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_stage_replaces_a_case_only_rename() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let renamed = dir.path().join("Tracked.txt");
+    std::fs::rename(dir.path().join("tracked.txt"), &renamed).expect("rename");
+    if !dir.path().join("tracked.txt").exists() {
+        return;
+    }
+    write_file(dir.path(), "Tracked.txt", "one\nrenamed\n");
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-case-rename","session_id":"s1","paths":["Tracked.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect("stage")
+        .expect("response")
+        .result
+        .expect("result");
+    let index =
+        git_internal::internal::index::Index::load(dir.path().join(".libra/index")).expect("index");
+    let names: Vec<String> = index
+        .tracked_files()
+        .into_iter()
+        .map(|path| path.display().to_string())
+        .filter(|name| name.eq_ignore_ascii_case("tracked.txt"))
+        .collect();
+    assert_eq!(names, vec!["Tracked.txt".to_string()], "{names:?}");
+    let changed = git_internal::hash::ObjectHash::from_type_and_data(
+        git_internal::internal::object::types::ObjectType::Blob,
+        b"one\nrenamed\n",
+    );
+    assert_eq!(index.get("Tracked.txt", 0).expect("entry").hash, changed);
+}
+
+/// A case-only path spelling does not create a second index entry.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_stage_does_not_duplicate_a_case_variant() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), "tracked.txt", "one\nchanged\n");
+    let case_insensitive = dir.path().join("TRACKED.TXT").exists();
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-case","session_id":"s1","paths":["TRACKED.TXT"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let dispatched = mutation_dispatch(&ctx, &request(&frame)).await;
+    let index =
+        git_internal::internal::index::Index::load(dir.path().join(".libra/index")).expect("index");
+    assert!(
+        index.get("TRACKED.TXT", 0).is_none(),
+        "case variant was stored as its own entry"
+    );
+    if case_insensitive {
+        let result = dispatched
+            .expect("stage case variant")
+            .expect("response")
+            .result
+            .expect("result");
+        assert_eq!(result["outcome"], "applied");
+        let changed = git_internal::hash::ObjectHash::from_type_and_data(
+            git_internal::internal::object::types::ObjectType::Blob,
+            b"one\nchanged\n",
+        );
+        assert_eq!(
+            index.get("tracked.txt", 0).expect("canonical").hash,
+            changed
+        );
+    } else {
+        assert!(
+            dispatched.is_err(),
+            "case-sensitive volume must reject the variant"
+        );
+    }
+}
+
+/// A dotted path updates the canonical index entry instead of adding a second name.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_stage_normalizes_dot_segments() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), "tracked.txt", "one\nchanged\n");
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-dot","session_id":"s1","paths":["./tracked.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let result = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect("stage dotted path")
+        .expect("response")
+        .result
+        .expect("result");
+    assert_eq!(result["outcome"], "applied");
+    let index =
+        git_internal::internal::index::Index::load(dir.path().join(".libra/index")).expect("index");
+    assert!(
+        index.get("./tracked.txt", 0).is_none(),
+        "dotted name was stored"
+    );
+    let entry = index.get("tracked.txt", 0).expect("canonical entry");
+    let changed = git_internal::hash::ObjectHash::from_type_and_data(
+        git_internal::internal::object::types::ObjectType::Blob,
+        b"one\nchanged\n",
+    );
+    assert_eq!(entry.hash, changed);
+}
+
+/// A path beneath a regular file is invalid input and does not change the index.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_stage_rejects_a_path_below_a_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let index_before = fs::read(dir.path().join(".libra").join("index")).expect("index");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-below-file","session_id":"s1","paths":["tracked.txt/extra"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let error = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect_err("path below a file");
+    assert_eq!(error.stable_code, "LBR-AGENT-027", "{}", error.message);
+    assert!(error.message.contains("non-directory"), "{}", error.message);
+    assert_eq!(
+        fs::read(dir.path().join(".libra").join("index")).expect("index"),
+        index_before
+    );
+}
+
+/// Bridge staging uses the same text conversion as ordinary Libra add.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_stage_uses_libra_text_conversion() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), ".gitattributes", "*.txt text eol=lf\n");
+    fs::write(dir.path().join("ordinary.txt"), b"one\r\ntwo\r\n").unwrap();
+    fs::write(dir.path().join("bridge.txt"), b"one\r\ntwo\r\n").unwrap();
+    stage(&["ordinary.txt"]).await;
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-clean","session_id":"s1","paths":["bridge.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect("stage");
+    let index =
+        git_internal::internal::index::Index::load(dir.path().join(".libra/index")).expect("index");
+    let ordinary = index.get("ordinary.txt", 0).expect("ordinary entry").hash;
+    let bridge = index.get("bridge.txt", 0).expect("bridge entry").hash;
+    let expected = git_internal::hash::ObjectHash::from_type_and_data(
+        git_internal::internal::object::types::ObjectType::Blob,
+        b"one\ntwo\n",
+    );
+    assert_eq!(ordinary, expected);
+    assert_eq!(bridge, ordinary);
+    assert_eq!(
+        fs::read(dir.path().join("bridge.txt")).unwrap(),
+        b"one\r\ntwo\r\n"
+    );
+}
+
+/// An LFS path is refused until its payload can be durably stored too.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_stage_rejects_lfs_without_publishing_content_or_pointer() {
+    use sha2::{Digest, Sha256};
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), ".gitattributes", "*.dat filter=lfs\n");
+    let content = b"unique LFS payload for bridge refusal\n";
+    fs::write(dir.path().join("payload.dat"), content).expect("payload");
+    let before = fs::read(dir.path().join(".libra/index")).expect("index");
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-lfs-refusal","session_id":"s1","paths":["payload.dat"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let error = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect_err("LFS must be refused");
+    assert_eq!(error.stable_code, "LBR-AGENT-027");
+    assert_eq!(
+        error.message,
+        "vcs.stage: LFS snapshot staging is not supported; no index or object write was performed"
+    );
+    assert!(
+        !error.message.contains(dir.path().to_str().unwrap_or("")),
+        "{}",
+        error.message
+    );
+    assert_eq!(fs::read(dir.path().join(".libra/index")).unwrap(), before);
+    let oid = format!("{:x}", Sha256::digest(content));
+    let pointer = libra::utils::lfs::format_pointer_string(&oid, content.len() as u64);
+    for bytes in [content.as_slice(), pointer.as_bytes()] {
+        let hash = git_internal::hash::ObjectHash::from_type_and_data(
+            git_internal::internal::object::types::ObjectType::Blob,
+            bytes,
+        )
+        .to_string();
+        assert!(
+            !dir.path()
+                .join(".libra/objects")
+                .join(&hash[..2])
+                .join(&hash[2..])
+                .exists()
+        );
+    }
+    assert!(
+        !dir.path()
+            .join(".libra/lfs/objects")
+            .join(&oid[..2])
+            .join(&oid[2..4])
+            .join(&oid)
+            .exists()
+    );
+    assert_eq!(fs::read(dir.path().join("payload.dat")).unwrap(), content);
+}
+
+/// A refused path in a multi-path request leaves no other path's blob behind.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_stage_refuses_a_filtered_path_without_publishing_any_blob() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), ".gitattributes", "*.dat filter=lfs\n");
+    let plain = b"plain payload that must not be stored\n";
+    let filtered = b"filtered payload that must not be stored\n";
+    fs::write(dir.path().join("plain.txt"), plain).expect("plain");
+    fs::write(dir.path().join("payload.dat"), filtered).expect("filtered");
+    let before = fs::read(dir.path().join(".libra/index")).expect("index");
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-multi-filter","session_id":"s1","paths":["plain.txt","payload.dat"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let error = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect_err("the filtered path must refuse the whole request");
+    assert_eq!(error.stable_code, "LBR-AGENT-027", "{}", error.message);
+    assert_eq!(fs::read(dir.path().join(".libra/index")).unwrap(), before);
+    for bytes in [plain.as_slice(), filtered.as_slice()] {
+        let hash = git_internal::hash::ObjectHash::from_type_and_data(
+            git_internal::internal::object::types::ObjectType::Blob,
+            bytes,
+        )
+        .to_string();
+        assert!(
+            !dir.path()
+                .join(".libra/objects")
+                .join(&hash[..2])
+                .join(&hash[2..])
+                .exists(),
+            "a refused request must not store any blob"
+        );
+    }
+}
+
+/// Other content filters are refused instead of staging unfiltered bytes.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_stage_rejects_other_content_filters_without_publishing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), ".gitattributes", "*.secret filter=rot13\n");
+    let content = b"filtered payload\n";
+    fs::write(dir.path().join("note.secret"), content).expect("payload");
+    let before = fs::read(dir.path().join(".libra/index")).expect("index");
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-filter","session_id":"s1","paths":["note.secret"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let error = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect_err("filter must be refused");
+    assert_eq!(error.stable_code, "LBR-AGENT-027");
+    assert_eq!(
+        error.message,
+        "vcs.stage: content filter staging is not supported; no index or object write was performed"
+    );
+    assert_eq!(fs::read(dir.path().join(".libra/index")).unwrap(), before);
+    let hash = git_internal::hash::ObjectHash::from_type_and_data(
+        git_internal::internal::object::types::ObjectType::Blob,
+        content,
+    )
+    .to_string();
+    assert!(
+        !dir.path()
+            .join(".libra/objects")
+            .join(&hash[..2])
+            .join(&hash[2..])
+            .exists()
+    );
+}
+
+/// Repository metadata is never staged, matching ordinary `libra add`.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_stage_rejects_repository_metadata() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), ".libra/notes.txt", "internal bookkeeping\n");
+    let before = fs::read(dir.path().join(".libra/index")).expect("index");
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-metadata","session_id":"s1","paths":[".libra/notes.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let error = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect_err("repository metadata must be refused");
+    assert_eq!(error.stable_code, "LBR-AGENT-027", "{}", error.message);
+    assert!(
+        error.message.contains("repository metadata"),
+        "{}",
+        error.message
+    );
+    assert_eq!(fs::read(dir.path().join(".libra/index")).unwrap(), before);
+}
+
+/// A stage whose index was replaced but whose result was never recorded is
+/// reconciled on replay instead of reporting "still in flight" forever.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_stage_replay_recovers_a_publication_that_was_not_recorded() {
+    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), "staged.txt", "content\n");
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-crash-stage","session_id":"s1","paths":["staged.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let first = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect("stage")
+        .expect("response")
+        .result
+        .expect("result");
+    assert_eq!(first["outcome"], "applied");
+    let index_digest = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence")
+        .index_generation;
+
+    // Simulate a crash between the index replacement and the result record:
+    // the operation is pending again and only its intent survives.
+    let intent = format!(
+        r#"{{"vcsWriteIntent":true,"method":"vcs.stage","expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","paths":["staged.txt"],"indexAfter":"{}"}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation, index_digest
+    );
+    ctx.conn
+        .execute_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "UPDATE agent_bridge_operation SET status = 'pending', result_digest = ? WHERE operation_id = ?",
+            [intent.into(), "op-crash-stage".into()],
+        ))
+        .await
+        .expect("restore the pending intent");
+
+    let replay = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect("replay")
+        .expect("response")
+        .result
+        .expect("result");
+    assert_eq!(replay["outcome"], "replayed");
+    assert_eq!(replay["paths"][0], "staged.txt");
+}
+
+/// A replay that finalizes an operation stops the original from writing.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_stage_replay_finalization_stops_the_original_execution() {
+    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), "staged.txt", "content\n");
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-claimed","session_id":"s1","paths":["staged.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    // The executor recorded its operation row but has not started its work.
+    mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect("stage")
+        .expect("response");
+    let db = libra::internal::worktree_scope::request_db()
+        .await
+        .expect("repository database");
+    db.execute_raw(Statement::from_string(
+        DatabaseBackend::Sqlite,
+        "DELETE FROM agent_bridge_index_publication WHERE operation_id = 'op-claimed'".to_string(),
+    ))
+    .await
+    .expect("drop the publication record");
+    ctx.conn
+        .execute_raw(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            "UPDATE agent_bridge_operation SET status = 'pending', result_digest = NULL \
+             WHERE operation_id = 'op-claimed'"
+                .to_string(),
+        ))
+        .await
+        .expect("restore the pending operation");
+
+    // A replay finalizes it.
+    let index_before = fs::read(dir.path().join(".libra/index")).expect("index");
+    let replay = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect("replay")
+        .expect("response")
+        .result
+        .expect("result");
+    assert_eq!(
+        replay["outcome"], "indeterminate",
+        "an operation that never started has an uncertain outcome: {replay}"
+    );
+
+    // The finalized operation never runs again and never writes.
+    let again = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect("replay")
+        .expect("response")
+        .result
+        .expect("result");
+    assert_eq!(again["outcome"], "indeterminate", "{again}");
+    assert_eq!(
+        fs::read(dir.path().join(".libra/index")).expect("index"),
+        index_before,
+        "a finalized operation must not write the index"
+    );
+}
+
+/// A concurrent replay finalizes a paused execution, which must then refuse.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+async fn vcs_stage_concurrent_replay_stops_a_paused_execution() {
+    use libra::internal::ai::agent_bridge::mutations::{
+        pause_gate_channel, set_pause_before_claim_for_test,
+    };
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), "staged.txt", "content\n");
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-paused","session_id":"s1","paths":["staged.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let (pause, reached_rx, resume_tx) = pause_gate_channel();
+    set_pause_before_claim_for_test(Some(pause));
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            // The execution starts and pauses before it takes the publication
+            // lock.
+            let executor = tokio::task::spawn_local({
+                let ctx = ctx.clone();
+                let frame = frame.to_string();
+                async move { mutation_dispatch(&ctx, &request(&frame)).await }
+            });
+            reached_rx
+                .await
+                .expect("the execution must reach the pause");
+
+            // A concurrent replay finalizes the operation while the executor
+            // waits.
+            let replay = mutation_dispatch(&ctx, &request(&frame))
+                .await
+                .expect("replay")
+                .expect("response")
+                .result
+                .expect("result");
+            assert_eq!(
+                replay["outcome"], "indeterminate",
+                "the paused execution has no outcome yet: {replay}"
+            );
+
+            // The executor resumes and must refuse to write behind that answer.
+            resume_tx.send(()).expect("resume the execution");
+            let error = executor
+                .await
+                .expect("the execution task must finish")
+                .expect_err("a finalized operation must not write");
+            assert_eq!(error.stable_code, "LBR-AGENT-038", "{}", error.message);
+        })
+        .await;
+
+    let index =
+        git_internal::internal::index::Index::load(dir.path().join(".libra/index")).expect("index");
+    assert!(
+        index.get("staged.txt", 0).is_none(),
+        "the finalized execution must not have staged anything"
+    );
+}
+
+/// A replay cannot finalize a paused allowlisted `commit.create` executor.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+async fn commit_create_concurrent_replay_stops_a_paused_execution() {
+    use libra::internal::ai::agent_bridge::mutations::{
+        pause_gate_channel, set_pause_before_claim_for_test,
+    };
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), "commit-paused.txt", "content\n");
+    stage(&["commit-paused.txt"]).await;
+    let head_before = Head::current_commit().await.expect("HEAD");
+    let frame = r#"{"jsonrpc":"2.0","method":"commit.create","params":{"operation_id":"op-paused-create","session_id":"s1","message":"feat: paused commit","approval":{"decision":"approved","approver":"reviewer-1"}},"id":1}"#;
+    let (pause, reached_rx, resume_tx) = pause_gate_channel();
+    set_pause_before_claim_for_test(Some(pause));
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let executor = tokio::task::spawn_local({
+                let ctx = ctx.clone();
+                async move { mutation_dispatch(&ctx, &request(frame)).await }
+            });
+            reached_rx.await.expect("commit executor reaches the pause");
+            let replay = mutation_dispatch(&ctx, &request(frame))
+                .await
+                .expect("replay")
+                .expect("response")
+                .result
+                .expect("result");
+            assert_eq!(replay["outcome"], "indeterminate", "{replay}");
+
+            resume_tx.send(()).expect("resume the executor");
+            let error = executor
+                .await
+                .expect("executor task")
+                .expect_err("terminalized commit must refuse");
+            assert_eq!(error.stable_code, "LBR-AGENT-038", "{}", error.message);
+        })
+        .await;
+
+    assert_eq!(
+        Head::current_commit().await.expect("HEAD"),
+        head_before,
+        "the paused executor must not move HEAD after its terminal result"
+    );
+}
+
+/// A replay cannot finalize a paused `vcs.commit` executor.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+async fn vcs_commit_concurrent_replay_stops_a_paused_execution() {
+    use libra::internal::ai::agent_bridge::mutations::{
+        pause_gate_channel, set_pause_before_claim_for_test,
+    };
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), "commit-paused.txt", "content\n");
+    stage(&["commit-paused.txt"]).await;
+    let head_before = Head::current_commit().await.expect("HEAD");
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("write fence");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.commit","params":{{"operation_id":"op-paused-vcs-commit","session_id":"s1","message":"feat: paused vcs commit","paths":["commit-paused.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let (pause, reached_rx, resume_tx) = pause_gate_channel();
+    set_pause_before_claim_for_test(Some(pause));
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let executor = tokio::task::spawn_local({
+                let ctx = ctx.clone();
+                let frame = frame.to_string();
+                async move { mutation_dispatch(&ctx, &request(&frame)).await }
+            });
+            reached_rx
+                .await
+                .expect("vcs.commit executor reaches the pause");
+            let replay = mutation_dispatch(&ctx, &request(&frame))
+                .await
+                .expect("replay")
+                .expect("response")
+                .result
+                .expect("result");
+            assert_eq!(replay["outcome"], "indeterminate", "{replay}");
+
+            resume_tx.send(()).expect("resume the executor");
+            let error = executor
+                .await
+                .expect("executor task")
+                .expect_err("terminalized commit must refuse");
+            assert_eq!(error.stable_code, "LBR-AGENT-038", "{}", error.message);
+        })
+        .await;
+
+    assert_eq!(
+        Head::current_commit().await.expect("HEAD"),
+        head_before,
+        "the paused executor must not move HEAD after its terminal result"
+    );
+}
+
+/// A replay that read a stale pending row must not terminalize a commit that
+/// was published while it waited.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+async fn commit_replay_routes_a_newly_recorded_intent_to_publication() {
+    use libra::internal::ai::agent_bridge::mutations::{
+        pause_gate_channel, set_pause_before_reconciliation_for_test,
+    };
+    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    let frame = r#"{"jsonrpc":"2.0","method":"commit.create","params":{"operation_id":"op-stale-read","session_id":"s1","message":"feat: stale read","allow_empty":true,"approval":{"decision":"approved","approver":"reviewer-1"}},"id":1}"#;
+    let first = mutation_dispatch(&ctx, &request(frame))
+        .await
+        .expect("commit")
+        .expect("response")
+        .result
+        .expect("result");
+    let oid = first["commit"].as_str().expect("oid").to_string();
+
+    // The replay will read the operation as pending without a result. The
+    // publication record still names the commit this operation published.
+    ctx.conn
+        .execute_raw(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            "UPDATE agent_bridge_operation SET status = 'pending', result_digest = NULL \
+             WHERE operation_id = 'op-stale-read'"
+                .to_string(),
+        ))
+        .await
+        .expect("restore the pending operation");
+    let intent = serde_json::json!({
+        "commitIntent": true,
+        "expectedHead": Head::current_commit().await.expect("HEAD").to_string(),
+        "message": "feat: stale read",
+    })
+    .to_string();
+
+    let (pause, reached_rx, resume_tx) = pause_gate_channel();
+    set_pause_before_reconciliation_for_test(Some(pause));
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let replay = tokio::task::spawn_local({
+                let ctx = ctx.clone();
+                async move { mutation_dispatch(&ctx, &request(frame)).await }
+            });
+            match tokio::time::timeout(std::time::Duration::from_secs(20), reached_rx).await {
+                Ok(reached) => {
+                    reached.expect("the replay must reach the reconciliation pause");
+                }
+                Err(_) => panic!("the replay never reached the reconciliation pause"),
+            }
+            // While the replay waits, the operation records the intent it was
+            // about to publish, exactly as a live executor would.
+            ctx.conn
+                .execute_raw(Statement::from_sql_and_values(
+                    DatabaseBackend::Sqlite,
+                    "UPDATE agent_bridge_operation SET result_digest = ? \
+                     WHERE operation_id = 'op-stale-read'",
+                    [intent.clone().into()],
+                ))
+                .await
+                .expect("record the intent");
+
+            resume_tx.send(()).expect("resume the replay");
+            let result = replay
+                .await
+                .expect("replay task")
+                .expect("replay response")
+                .expect("replay result")
+                .result
+                .expect("replay payload");
+            assert_eq!(
+                result["commit"], oid,
+                "a published commit must not be reported as indeterminate: {result}"
+            );
+        })
+        .await;
+
+    assert_eq!(
+        Head::current_commit().await.expect("HEAD").to_string(),
+        oid,
+        "the replay must not move HEAD"
+    );
+}
+
+/// An operation id is bound to the method it was first used with.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn an_operation_id_cannot_be_reused_for_another_method() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), "shared.txt", "content\n");
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let stage = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-shared","session_id":"s1","paths":["shared.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let staged = mutation_dispatch(&ctx, &request(&stage))
+        .await
+        .expect("stage")
+        .expect("response")
+        .result
+        .expect("result");
+    assert_eq!(staged["outcome"], "applied");
+
+    // The same id with the same parameters but a different method must not
+    // replay the stage result.
+    let unstage = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.unstage","params":{{"operation_id":"op-shared","session_id":"s1","paths":["shared.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":2}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let error = mutation_dispatch(&ctx, &request(&unstage))
+        .await
+        .expect_err("an operation id is bound to its method");
+    assert_eq!(error.stable_code, "LBR-AGENT-033", "{}", error.message);
+    let index =
+        git_internal::internal::index::Index::load(dir.path().join(".libra/index")).expect("index");
+    assert!(
+        index.get("shared.txt", 0).is_some(),
+        "the rejected unstage must not change the index"
+    );
+}
+
+/// A malformed approval leaves no pending operation behind.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn a_malformed_approval_does_not_leave_a_pending_operation() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), "approval.txt", "content\n");
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let malformed = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-approval","session_id":"s1","paths":["approval.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"maybe","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let error = mutation_dispatch(&ctx, &request(&malformed))
+        .await
+        .expect_err("a malformed approval is refused");
+    assert_eq!(error.stable_code, "LBR-AGENT-027", "{}", error.message);
+
+    // Every malformed PRESENT approval is refused the same way, and none of
+    // them records an operation row.
+    for approval in [
+        r#"{"decision":"maybe","approver":"reviewer-1"}"#,
+        r#"{}"#,
+        r#"{"decision":7}"#,
+        r#"{"approver":"reviewer-1"}"#,
+        r#""approved""#,
+        r#"{"decision":"approved","approver":7}"#,
+        r#"{"decision":"denied","approver":[]}"#,
+        r#"{"decision":"approved","approver":null}"#,
+    ] {
+        let frame = format!(
+            r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-approval","session_id":"s1","paths":["approval.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{approval}}},"id":3}}"#,
+            fence.head, fence.index_generation, fence.worktree_generation
+        );
+        let error = mutation_dispatch(&ctx, &request(&frame))
+            .await
+            .expect_err("a malformed approval is refused");
+        assert_eq!(
+            error.stable_code, "LBR-AGENT-027",
+            "approval {approval}: {}",
+            error.message
+        );
+        assert!(
+            libra::internal::ai::agent_bridge::storage::get_operation_result(
+                &ctx.conn,
+                "op-approval"
+            )
+            .await
+            .expect("read the operation")
+            .is_none(),
+            "approval {approval} must not create an operation row"
+        );
+    }
+
+    // No operation row may be left pending for that id.
+    let recorded =
+        libra::internal::ai::agent_bridge::storage::get_operation_result(&ctx.conn, "op-approval")
+            .await
+            .expect("read the operation");
+    assert!(
+        recorded.is_none(),
+        "a malformed approval must not create an operation row: {recorded:?}"
+    );
+
+    // A corrected request with the same id is accepted.
+    let corrected = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-approval","session_id":"s1","paths":["approval.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":2}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let staged = mutation_dispatch(&ctx, &request(&corrected))
+        .await
+        .expect("corrected stage")
+        .expect("response")
+        .result
+        .expect("result");
+    assert_eq!(staged["outcome"], "applied");
+}
+
+/// A pending replay that finds a started operation while it waits reconciles
+/// it instead of refusing itself.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+async fn a_pending_replay_reconciles_a_started_operation_it_finds() {
+    use libra::internal::ai::agent_bridge::mutations::{
+        pause_gate_channel, set_pause_before_reconciliation_for_test,
+    };
+    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    let frame = r#"{"jsonrpc":"2.0","method":"review.run","params":{"operation_id":"op-reread","session_id":"s1","agents":["not-a-reviewer"],"approval":{"decision":"approved","approver":"reviewer-1"}},"id":1}"#;
+    mutation_dispatch(&ctx, &request(frame))
+        .await
+        .expect_err("an unlaunchable reviewer is refused");
+    // The replay reads an empty pending row.
+    ctx.conn
+        .execute_raw(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            "UPDATE agent_bridge_operation SET status = 'pending', result_digest = NULL \
+             WHERE operation_id = 'op-reread'"
+                .to_string(),
+        ))
+        .await
+        .expect("restore the pending operation");
+
+    let (pause, reached_rx, resume_tx) = pause_gate_channel();
+    set_pause_before_reconciliation_for_test(Some(pause));
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let replay = tokio::task::spawn_local({
+                let ctx = ctx.clone();
+                async move { mutation_dispatch(&ctx, &request(frame)).await }
+            });
+            reached_rx
+                .await
+                .expect("the replay must reach the pause before it claims");
+
+            // The executor records the started operation while the replay waits.
+            ctx.conn
+                .execute_raw(Statement::from_sql_and_values(
+                    DatabaseBackend::Sqlite,
+                    "UPDATE agent_bridge_operation SET result_digest = ? \
+                     WHERE operation_id = 'op-reread'",
+                    [r#"{"vcsWriteStarted":true,"method":"review.run","runId":"run-77"}"#.into()],
+                ))
+                .await
+                .expect("record the started operation");
+
+            resume_tx.send(()).expect("resume the replay");
+            let result = replay
+                .await
+                .expect("replay task")
+                .expect("replay response")
+                .expect("replay result")
+                .result
+                .expect("replay payload");
+            assert_eq!(
+                result["runId"], "run-77",
+                "the replay must reconcile the started operation it found: {result}"
+            );
+        })
+        .await;
+}
+
+/// A pending replay that finds the operation completed reports its result.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+async fn a_pending_replay_reports_a_completed_operation() {
+    use libra::internal::ai::agent_bridge::mutations::{
+        pause_gate_channel, set_pause_before_reconciliation_for_test,
+    };
+    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    let frame = r#"{"jsonrpc":"2.0","method":"review.run","params":{"operation_id":"op-completed-race","session_id":"s1","agents":["not-a-reviewer"],"approval":{"decision":"approved","approver":"reviewer-1"}},"id":1}"#;
+    mutation_dispatch(&ctx, &request(frame))
+        .await
+        .expect_err("an unlaunchable reviewer is refused");
+    ctx.conn
+        .execute_raw(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            "UPDATE agent_bridge_operation SET status = 'pending', result_digest = NULL \
+             WHERE operation_id = 'op-completed-race'"
+                .to_string(),
+        ))
+        .await
+        .expect("restore the pending operation");
+
+    let (pause, reached_rx, resume_tx) = pause_gate_channel();
+    set_pause_before_reconciliation_for_test(Some(pause));
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let replay = tokio::task::spawn_local({
+                let ctx = ctx.clone();
+                async move { mutation_dispatch(&ctx, &request(frame)).await }
+            });
+            reached_rx
+                .await
+                .expect("the replay must reach the pause before it claims");
+
+            // The executor completes while the replay waits: the row now holds
+            // the run id the operation produced.
+            ctx.conn
+                .execute_raw(Statement::from_sql_and_values(
+                    DatabaseBackend::Sqlite,
+                    "UPDATE agent_bridge_operation SET status = 'applied', result_digest = ? \
+                     WHERE operation_id = 'op-completed-race'",
+                    ["run-42".into()],
+                ))
+                .await
+                .expect("record the completed operation");
+
+            resume_tx.send(()).expect("resume the replay");
+            let result = replay
+                .await
+                .expect("replay task")
+                .expect("replay response")
+                .expect("replay result")
+                .result
+                .expect("replay payload");
+            assert_eq!(
+                result["run_id"], "run-42",
+                "the completed operation must report its recorded result: {result}"
+            );
+            assert_eq!(
+                result["state"], "unknown",
+                "the run's own state is reported, not a terminal outcome: {result}"
+            );
+        })
+        .await;
+}
+
+/// A replay that observed a started marker reports the completed operation.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+async fn a_started_replay_reports_the_completed_operation() {
+    use libra::internal::ai::agent_bridge::mutations::{
+        pause_gate_channel, set_pause_before_reconciliation_for_test,
+    };
+    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    let frame = r#"{"jsonrpc":"2.0","method":"review.run","params":{"operation_id":"op-started-race","session_id":"s1","agents":["not-a-reviewer"],"approval":{"decision":"approved","approver":"reviewer-1"}},"id":1}"#;
+    mutation_dispatch(&ctx, &request(frame))
+        .await
+        .expect_err("an unlaunchable reviewer is refused");
+    // The replay observes the operation as started.
+    ctx.conn
+        .execute_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "UPDATE agent_bridge_operation SET status = 'pending', result_digest = ? \
+             WHERE operation_id = 'op-started-race'",
+            [r#"{"vcsWriteStarted":true,"method":"review.run","runId":"run-42"}"#.into()],
+        ))
+        .await
+        .expect("record the started operation");
+
+    let (pause, reached_rx, resume_tx) = pause_gate_channel();
+    set_pause_before_reconciliation_for_test(Some(pause));
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let replay = tokio::task::spawn_local({
+                let ctx = ctx.clone();
+                async move { mutation_dispatch(&ctx, &request(frame)).await }
+            });
+            reached_rx
+                .await
+                .expect("the replay must reach the pause before it claims");
+
+            // The executor completes before the reconciliation claims: the row
+            // now holds the run id the operation produced.
+            ctx.conn
+                .execute_raw(Statement::from_sql_and_values(
+                    DatabaseBackend::Sqlite,
+                    "UPDATE agent_bridge_operation SET status = 'applied', result_digest = ? \
+                     WHERE operation_id = 'op-started-race'",
+                    ["run-42".into()],
+                ))
+                .await
+                .expect("record the completed operation");
+
+            resume_tx.send(()).expect("resume the replay");
+            let result = replay
+                .await
+                .expect("replay task")
+                .expect("replay response")
+                .expect("replay result")
+                .result
+                .expect("replay payload");
+            assert_eq!(
+                result["run_id"], "run-42",
+                "the completed operation must report its recorded result: {result}"
+            );
+            assert_eq!(
+                result["state"], "unknown",
+                "the run's own state is reported, not a terminal outcome: {result}"
+            );
+            assert!(
+                result.get("vcsWriteOutcome").is_none(),
+                "an applied result must not be projected as a terminal outcome: {result}"
+            );
+        })
+        .await;
+}
+
+/// A pending replay keeps a started review's recorded identity.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn a_pending_replay_keeps_a_started_review_identity() {
+    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    let frame = r#"{"jsonrpc":"2.0","method":"review.run","params":{"operation_id":"op-review-identity","session_id":"s1","agents":["not-a-reviewer"],"approval":{"decision":"approved","approver":"reviewer-1"}},"id":1}"#;
+    mutation_dispatch(&ctx, &request(frame))
+        .await
+        .expect_err("an unlaunchable reviewer is refused");
+
+    // The review started and recorded its identity, then the process stopped
+    // before the result was persisted.
+    ctx.conn
+        .execute_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "UPDATE agent_bridge_operation SET status = 'pending', result_digest = ? \
+             WHERE operation_id = 'op-review-identity'",
+            [r#"{"vcsWriteStarted":true,"method":"review.run","runId":"run-42"}"#.into()],
+        ))
+        .await
+        .expect("record the started review");
+
+    let replay = mutation_dispatch(&ctx, &request(frame))
+        .await
+        .expect("replay")
+        .expect("response")
+        .result
+        .expect("result");
+    assert_eq!(
+        replay["runId"], "run-42",
+        "the recorded review identity must survive the replay: {replay}"
+    );
+    assert_eq!(
+        replay["outcome"], "indeterminate",
+        "the recovered review is terminal: {replay}"
+    );
+    assert_eq!(
+        replay["run"]["state"], "unknown",
+        "the replay projects the run's current state: {replay}"
+    );
+    assert!(
+        replay["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("indeterminate")),
+        "the outcome says the launch is indeterminate: {replay}"
+    );
+}
+
+/// A review state that cannot be read is a retryable read error.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+async fn a_review_state_read_failure_is_retryable() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    libra::internal::ai::agent_bridge::vcs::fail_review_state_read_for_test();
+    let error = libra::internal::ai::agent_bridge::vcs::review_state("op-read-failure")
+        .expect_err("the read failure is reported");
+    assert_eq!(error.stable_code, "LBR-AGENT-037", "{}", error.message);
+    assert!(
+        error.retryable,
+        "a transient read failure must tell the peer to retry: {}",
+        error.message
+    );
+}
+
+/// A review whose state was never written reports an unknown liveness.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn a_review_without_a_state_reports_an_unknown_liveness() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let state = libra::internal::ai::agent_bridge::vcs::review_state("op-never-started")
+        .expect("the missing state is answered");
+    assert_eq!(state["state"], "unknown", "{state}");
+    assert!(
+        state["running"].is_null(),
+        "an unverified liveness is not 'stopped': {state}"
+    );
+    assert_eq!(state["supervised"], false, "{state}");
+    assert_eq!(state["liveness"], "unknown", "{state}");
+}
+
+/// A failed started-record releases the review admission slot.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+async fn a_failed_started_record_releases_the_review_slot() {
+    use libra::internal::ai::{
+        observed_agents::launchable_review_slugs,
+        run_admission::{self, AdmissionOutcome},
+    };
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    ConfigKv::set("agent.max_concurrent_runs", "1", false)
+        .await
+        .expect("set the review budget");
+    let reviewer = launchable_review_slugs()
+        .first()
+        .copied()
+        .expect("a launchable reviewer");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"review.run","params":{{"operation_id":"op-slot","session_id":"s1","agents":["{reviewer}"],"approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#
+    );
+    libra::internal::ai::agent_bridge::mutations::fail_next_started_record_for_test();
+    let error = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect_err("the injected failure is reported");
+    assert!(error.message.contains("injected"), "{}", error.message);
+
+    // The slot the prepared run took must be released, so the budget is free.
+    let runs_root = dir.path().join(".libra/sessions/agent-runs");
+    match run_admission::try_admit(&runs_root, 1, run_admission::RUN_QUEUE_CAP)
+        .expect("take a slot")
+    {
+        AdmissionOutcome::Admitted(_) => {}
+        _ => panic!("the admission slot must have been released"),
+    }
+}
+
+/// A stale refusal cannot make a commit run twice.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+async fn a_stale_refusal_never_commits_twice() {
+    use libra::internal::ai::agent_bridge::mutations::{
+        pause_gate_channel, set_pause_before_claim_for_test,
+    };
+    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), "commit-twice.txt", "content\n");
+    stage(&["commit-twice.txt"]).await;
+    let frame = r#"{"jsonrpc":"2.0","method":"commit.create","params":{"operation_id":"op-commit-twice","session_id":"s1","message":"feat: twice","allow_empty":true,"approval":{"decision":"approved","approver":"reviewer-1"}},"id":1}"#;
+    // The operation is left in the state a pre-execution refusal produces.
+    let create = r#"{"jsonrpc":"2.0","method":"commit.create","params":{"operation_id":"op-commit-twice","session_id":"s1","message":"feat: twice","allow_empty":true,"approval":{"decision":"approved","approver":"reviewer-1"}},"id":1}"#;
+    mutation_dispatch(&ctx, &request(create))
+        .await
+        .expect("commit")
+        .expect("response");
+    ctx.conn
+        .execute_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "UPDATE agent_bridge_operation SET status = 'failed', result_digest = ? \
+             WHERE operation_id = 'op-commit-twice'",
+            [r#"{"bridgeRefusal":"the repository was busy when this request arrived"}"#.into()],
+        ))
+        .await
+        .expect("record the refusal");
+
+    let (pause, reached_rx, resume_tx) = pause_gate_channel();
+    set_pause_before_claim_for_test(Some(pause));
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let retry = tokio::task::spawn_local({
+                let ctx = ctx.clone();
+                let frame = frame.to_string();
+                async move { mutation_dispatch(&ctx, &request(&frame)).await }
+            });
+            reached_rx
+                .await
+                .expect("the retry must reach the pause before it claims");
+
+            // Another attempt records the commit intent and publishes it.
+            ctx.conn
+                .execute_raw(Statement::from_sql_and_values(
+                    DatabaseBackend::Sqlite,
+                    "UPDATE agent_bridge_operation SET status = 'pending', result_digest = ? \
+                     WHERE operation_id = 'op-commit-twice'",
+                    [
+                        r#"{"commitIntent":true,"expectedHead":"head","message":"feat: twice"}"#
+                            .into(),
+                    ],
+                ))
+                .await
+                .expect("record the commit intent");
+
+            resume_tx.send(()).expect("resume the retry");
+            let error = retry
+                .await
+                .expect("retry task")
+                .expect_err("a started commit must not run again");
+            assert_eq!(error.stable_code, "LBR-AGENT-038", "{}", error.message);
+        })
+        .await;
+
+    assert_eq!(
+        Head::current_commit().await.expect("HEAD"),
+        Head::current_commit().await.expect("HEAD"),
+        "the retry must not move HEAD"
+    );
+}
+
+/// A full review budget refuses the request but keeps the id retryable.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn a_full_review_budget_keeps_the_operation_id_retryable() {
+    use libra::internal::ai::{
+        observed_agents::launchable_review_slugs,
+        run_admission::{self, AdmissionOutcome},
+    };
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    ConfigKv::set("agent.max_concurrent_runs", "1", false)
+        .await
+        .expect("set the review budget");
+
+    // Fill the budget with a slot this test owns.
+    let runs_root = dir.path().join(".libra/sessions/agent-runs");
+    let slot = match run_admission::try_admit(&runs_root, 1, run_admission::RUN_QUEUE_CAP)
+        .expect("take a slot")
+    {
+        AdmissionOutcome::Admitted(slot) => slot,
+        _ => panic!("the budget must be free at the start"),
+    };
+    let reviewer = launchable_review_slugs()
+        .first()
+        .copied()
+        .expect("a launchable reviewer");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"review.run","params":{{"operation_id":"op-budget","session_id":"s1","agents":["{reviewer}"],"approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#
+    );
+    let error = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect_err("a full budget refuses the review");
+    assert_eq!(error.stable_code, "LBR-AGENT-035", "{}", error.message);
+    assert!(error.retryable, "{}", error.message);
+
+    // The refusal is not a terminal answer: the operation may run again.
+    drop(slot);
+    let response = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect("the retry is admitted once the budget has room")
+        .expect("response");
+    let result = response.result.expect("result");
+    assert!(
+        result["run_id"].as_str().is_some(),
+        "the retry must start the review: {result}"
+    );
+
+    // The launched run is stopped, so it cannot leak into another test.
+    libra::internal::ai::agent_bridge::vcs::supervisor::shutdown().await;
+}
+
+/// A retry that read a stale refusal never executes an operation another
+/// request has since started.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+async fn a_stale_refusal_retry_never_repeats_a_started_operation() {
+    use libra::internal::ai::agent_bridge::mutations::{
+        pause_gate_channel, set_pause_before_claim_for_test,
+    };
+    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    let base = Head::current_commit()
+        .await
+        .expect("base commit")
+        .to_string();
+    insert_checkpoint(&ctx.conn, "cp-stale", "s1", None, Some(&base), 1)
+        .await
+        .expect("record bridge checkpoint");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"checkpoint.restore","params":{{"operation_id":"op-stale-refusal","session_id":"s1","checkpoint_id":"cp-stale","expected_head":"{base}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#
+    );
+    mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect("restore")
+        .expect("response");
+
+    // The operation is left in the state a pre-execution refusal produces.
+    ctx.conn
+        .execute_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "UPDATE agent_bridge_operation SET status = 'failed', result_digest = ? \
+             WHERE operation_id = 'op-stale-refusal'",
+            [r#"{"bridgeRefusal":"the repository was busy when this request arrived"}"#.into()],
+        ))
+        .await
+        .expect("record the refusal");
+
+    let (pause, reached_rx, resume_tx) = pause_gate_channel();
+    set_pause_before_claim_for_test(Some(pause));
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let retry = tokio::task::spawn_local({
+                let ctx = ctx.clone();
+                let frame = frame.to_string();
+                async move { mutation_dispatch(&ctx, &request(&frame)).await }
+            });
+            reached_rx
+                .await
+                .expect("the retry must reach the pause before it claims");
+
+            // Another request starts the operation and stops before it
+            // records a result.
+            ctx.conn
+                .execute_raw(Statement::from_sql_and_values(
+                    DatabaseBackend::Sqlite,
+                    "UPDATE agent_bridge_operation SET status = 'pending', result_digest = ? \
+                     WHERE operation_id = 'op-stale-refusal'",
+                    [r#"{"vcsWriteStarted":true,"method":"checkpoint.restore"}"#.into()],
+                ))
+                .await
+                .expect("record the started operation");
+
+            resume_tx.send(()).expect("resume the retry");
+            let error = retry
+                .await
+                .expect("retry task")
+                .expect_err("a started operation must not be repeated");
+            assert_eq!(error.stable_code, "LBR-AGENT-038", "{}", error.message);
+        })
+        .await;
+
+    assert_eq!(
+        Head::current_commit().await.expect("HEAD").to_string(),
+        base,
+        "the retry must not restore again"
+    );
+}
+
+/// A started operation that never recorded a result is never repeated.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn a_started_operation_is_never_repeated() {
+    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    let base = Head::current_commit()
+        .await
+        .expect("base commit")
+        .to_string();
+    insert_checkpoint(&ctx.conn, "cp-started", "s1", None, Some(&base), 1)
+        .await
+        .expect("record bridge checkpoint");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"checkpoint.restore","params":{{"operation_id":"op-started","session_id":"s1","checkpoint_id":"cp-started","expected_head":"{base}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#
+    );
+    mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect("restore")
+        .expect("response");
+
+    // Simulate the process stopping after the restore marked the operation as
+    // started but before it recorded the restored commit.
+    ctx.conn
+        .execute_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "UPDATE agent_bridge_operation SET status = 'pending', result_digest = ?              WHERE operation_id = 'op-started'",
+            [r#"{"vcsWriteStarted":true,"method":"checkpoint.restore"}"#.into()],
+        ))
+        .await
+        .expect("restore the started operation");
+
+    let replay = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect("replay")
+        .expect("response")
+        .result
+        .expect("result");
+    assert_eq!(
+        replay["outcome"], "indeterminate",
+        "a started operation must not be repeated: {replay}"
+    );
+    assert_eq!(
+        Head::current_commit().await.expect("HEAD").to_string(),
+        base,
+        "the replay must not move HEAD"
+    );
+}
+
+/// An interrupted mutation reaches a durable terminal answer.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn an_interrupted_mutation_reaches_a_terminal_outcome() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+
+    // A restore that recorded its operation row and then stopped.
+    let base = Head::current_commit()
+        .await
+        .expect("base commit")
+        .to_string();
+    insert_checkpoint(&ctx.conn, "cp-interrupted", "s1", None, Some(&base), 1)
+        .await
+        .expect("record bridge checkpoint");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"checkpoint.restore","params":{{"operation_id":"op-interrupted","session_id":"s1","checkpoint_id":"cp-interrupted","expected_head":"{base}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#
+    );
+    mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect("restore")
+        .expect("response");
+    // Simulate the process stopping after the operation row was written.
+    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+    ctx.conn
+        .execute_raw(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            "UPDATE agent_bridge_operation SET status = 'pending', result_digest = NULL \
+             WHERE operation_id = 'op-interrupted'"
+                .to_string(),
+        ))
+        .await
+        .expect("restore the pending operation");
+    assert_eq!(
+        libra::internal::ai::agent_bridge::storage::get_operation_status(
+            &ctx.conn,
+            "op-interrupted"
+        )
+        .await
+        .expect("read the status")
+        .as_deref(),
+        Some("pending")
+    );
+
+    // The replay must not report "still in flight" forever.
+    let replay = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect("replay")
+        .expect("response")
+        .result
+        .expect("result");
+    assert_eq!(
+        replay["outcome"], "indeterminate",
+        "an interrupted mutation must reach a terminal outcome: {replay}"
+    );
+    assert_eq!(
+        libra::internal::ai::agent_bridge::storage::get_operation_status(
+            &ctx.conn,
+            "op-interrupted"
+        )
+        .await
+        .expect("read the status")
+        .as_deref(),
+        Some("failed"),
+        "the interrupted operation must not stay pending"
+    );
+}
+
+/// A busy repository claim refuses the operation but keeps the id retryable.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+#[cfg(unix)]
+async fn a_busy_claim_refuses_the_operation_and_keeps_the_id_retryable() {
+    use std::io::{BufRead, BufReader};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), "busy.txt", "content\n");
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-busy","session_id":"s1","paths":["busy.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+
+    // Another process holds the repository claim.
+    let script = "import fcntl, sys\nf = open(sys.argv[1], 'a+')\nfcntl.flock(f, fcntl.LOCK_EX)\nprint('locked', flush=True)\nsys.stdin.read()\n";
+    let lock_path = dir.path().join(".libra/agent-bridge-writes.lock");
+    let mut owner = ChildGuard(
+        std::process::Command::new("python3")
+            .args(["-c", script])
+            .arg(lock_path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn claim owner"),
+    );
+    let mut ready = String::new();
+    BufReader::new(owner.0.stdout.take().expect("claim stdout"))
+        .read_line(&mut ready)
+        .expect("claim ready");
+    assert_eq!(ready.trim(), "locked");
+
+    let error = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect_err("a busy claim refuses the operation");
+    assert_eq!(error.stable_code, "LBR-AGENT-035", "{}", error.message);
+    assert!(error.retryable, "{}", error.message);
+
+    drop(owner.0.stdin.take().expect("claim stdin"));
+    owner.0.wait().expect("claim process exits");
+
+    // The same operation id must really retry, not report an outcome.
+    let staged = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect("retry after the claim is free")
+        .expect("response")
+        .result
+        .expect("result");
+    assert_eq!(staged["outcome"], "applied", "{staged}");
+    let index =
+        git_internal::internal::index::Index::load(dir.path().join(".libra/index")).expect("index");
+    assert!(
+        index.get("busy.txt", 0).is_some(),
+        "the retry must stage the file"
+    );
+}
+
+/// A crashed `vcs.commit` reaches a terminal outcome instead of staying pending.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_commit_replay_finalizes_an_operation_that_never_started() {
+    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), "committed.txt", "content\n");
+    stage(&["committed.txt"]).await;
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.commit","params":{{"operation_id":"op-crashed-commit","session_id":"s1","message":"feat: crashed","paths":["committed.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect("commit")
+        .expect("response");
+    let head_after_commit = Head::current_commit().await.expect("HEAD").to_string();
+
+    // Simulate a crash right after the operation row was created: the intent
+    // and the publication record are both gone.
+    let db = libra::internal::worktree_scope::request_db()
+        .await
+        .expect("repository database");
+    db.execute_raw(Statement::from_string(
+        DatabaseBackend::Sqlite,
+        "DELETE FROM agent_bridge_publication WHERE operation_id = 'op-crashed-commit'".to_string(),
+    ))
+    .await
+    .expect("drop the publication record");
+    ctx.conn
+        .execute_raw(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            "UPDATE agent_bridge_operation SET status = 'pending', result_digest = NULL \
+             WHERE operation_id = 'op-crashed-commit'"
+                .to_string(),
+        ))
+        .await
+        .expect("restore the pending operation");
+
+    let replay = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect("replay")
+        .expect("response")
+        .result
+        .expect("result");
+    assert_eq!(
+        replay["outcome"], "indeterminate",
+        "an operation that never started has an uncertain outcome: {replay}"
+    );
+
+    // The answer is durable: a later replay reports it and never commits.
+    let again = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect("replay")
+        .expect("response")
+        .result
+        .expect("result");
+    assert_eq!(again["outcome"], "indeterminate", "{again}");
+    assert_eq!(
+        Head::current_commit().await.expect("HEAD").to_string(),
+        head_after_commit,
+        "a finalized commit operation must not commit"
+    );
+}
+
+/// A pending stage whose recorded effect is not the live index is terminal.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_stage_replay_refuses_an_intent_that_never_landed() {
+    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), "staged.txt", "content\n");
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-lost-stage","session_id":"s1","paths":["staged.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect("stage")
+        .expect("response");
+
+    // Simulate a crash between the prepared publication and the completed
+    // one: the repository still records only the preparation, and the
+    // operation row never got its result.
+    let db = libra::internal::worktree_scope::request_db()
+        .await
+        .expect("repository database");
+    db.execute_raw(Statement::from_sql_and_values(
+        DatabaseBackend::Sqlite,
+        "UPDATE agent_bridge_index_publication SET phase = 'prepared' WHERE operation_id = ?",
+        ["op-lost-stage".into()],
+    ))
+    .await
+    .expect("restore the prepared phase");
+    let intent = format!(
+        r#"{{"vcsWriteIntent":true,"method":"vcs.stage","expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","paths":["staged.txt"],"indexAfter":"{}"}}"#,
+        fence.head,
+        fence.index_generation,
+        fence.worktree_generation,
+        libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+            .await
+            .expect("fence")
+            .index_generation
+    );
+    ctx.conn
+        .execute_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "UPDATE agent_bridge_operation SET status = 'pending', result_digest = ? WHERE operation_id = ?",
+            [intent.into(), "op-lost-stage".into()],
+        ))
+        .await
+        .expect("restore the pending intent");
+
+    let replay = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect("replay")
+        .expect("response")
+        .result
+        .expect("result");
+    assert_eq!(
+        replay["outcome"], "indeterminate",
+        "an unproven publication must be reported as indeterminate: {replay}"
+    );
+
+    // The terminal outcome is durable: a later replay reports it again and
+    // never runs the operation a second time.
+    let again = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect("replay")
+        .expect("response")
+        .result
+        .expect("result");
+    assert_eq!(again["outcome"], "indeterminate", "{again}");
+}
+
+/// Explicit staging still respects ignore rules for untracked paths.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_stage_rejects_ignored_untracked_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), ".libraignore", "private.txt\n");
+    write_file(dir.path(), "private.txt", "ignored secret\n");
+    let before = fs::read(dir.path().join(".libra/index")).expect("index");
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-ignored","session_id":"s1","paths":["private.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let error = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect_err("ignored path");
+    assert_eq!(error.stable_code, "LBR-AGENT-027");
+    assert!(error.message.contains("ignored"), "{}", error.message);
+    assert_eq!(fs::read(dir.path().join(".libra/index")).unwrap(), before);
+    let blob = git_internal::hash::ObjectHash::from_type_and_data(
+        git_internal::internal::object::types::ObjectType::Blob,
+        b"ignored secret\n",
+    );
+    let hex = blob.to_string();
+    assert!(
+        !dir.path()
+            .join(".libra/objects")
+            .join(&hex[..2])
+            .join(&hex[2..])
+            .exists()
+    );
+}
+
+/// A directory path is rejected as invalid input and does not change the index.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_stage_rejects_a_directory() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    std::fs::create_dir(dir.path().join("nested")).expect("dir");
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let index_before = fs::read(dir.path().join(".libra").join("index")).expect("index");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-dir","session_id":"s1","paths":["nested"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let error = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect_err("directory");
+    assert_eq!(error.stable_code, "LBR-AGENT-027", "{}", error.message);
+    assert!(
+        error.message.contains("not a regular file"),
+        "{}",
+        error.message
+    );
+    assert_eq!(
+        fs::read(dir.path().join(".libra").join("index")).expect("index"),
+        index_before
+    );
+}
+
+/// Replacing a symlink during publish does not replace its snapshotted link text.
+#[tokio::test]
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_stage_keeps_snapshotted_symlink_text_during_publish() {
+    use std::os::unix::fs::symlink;
+    struct ClearHook;
+    impl Drop for ClearHook {
+        fn drop(&mut self) {
+            libra::internal::ai::agent_bridge::vcs_write::set_publish_rewrite_for_test(None);
+        }
+    }
+    let _clear = ClearHook;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), "secret.txt", "SECRET\n");
+    symlink("secret.txt", dir.path().join("link")).expect("symlink");
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    libra::internal::ai::agent_bridge::vcs_write::set_publish_rewrite_for_test(Some(
+        dir.path().join("link"),
+    ));
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-link-publish","session_id":"s1","paths":["link"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let result = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect("stage snapshotted symlink")
+        .expect("response")
+        .result
+        .expect("result");
+    assert_eq!(result["outcome"], "applied");
+    let index =
+        git_internal::internal::index::Index::load(dir.path().join(".libra/index")).expect("index");
+    let entry = index.get("link", 0).expect("entry");
+    assert_eq!(entry.mode, 0o120000);
+    let link_blob = git_internal::hash::ObjectHash::from_type_and_data(
+        git_internal::internal::object::types::ObjectType::Blob,
+        b"secret.txt",
+    );
+    assert_eq!(entry.hash, link_blob);
+}
+
+/// Staging a symlink records the link text, not the target file's bytes.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_stage_records_symlink_text_without_following_it() {
+    use std::os::unix::fs::symlink;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), "secret.txt", "SECRET\n");
+    symlink("secret.txt", dir.path().join("link")).expect("symlink");
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-link","session_id":"s1","paths":["link"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let result = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect("stage symlink")
+        .expect("response")
+        .result
+        .expect("result");
+    assert_eq!(result["outcome"], "applied");
+    let index =
+        git_internal::internal::index::Index::load(dir.path().join(".libra/index")).expect("index");
+    let entry = index.get("link", 0).expect("symlink entry");
+    assert_eq!(entry.mode, 0o120000);
+    let link_blob = git_internal::hash::ObjectHash::from_type_and_data(
+        git_internal::internal::object::types::ObjectType::Blob,
+        b"secret.txt",
+    );
+    assert_eq!(entry.hash, link_blob);
+    let secret_blob = git_internal::hash::ObjectHash::from_type_and_data(
+        git_internal::internal::object::types::ObjectType::Blob,
+        b"SECRET\n",
+    );
+    let hex = secret_blob.to_string();
+    let secret_loose = dir
+        .path()
+        .join(".libra/objects")
+        .join(&hex[..2])
+        .join(&hex[2..]);
+    assert!(
+        !secret_loose.exists(),
+        "followed target stored at {}",
+        secret_loose.display()
+    );
+}
+
+/// A staged deletion can be committed without the file remaining in HEAD.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_commit_records_a_staged_deletion() {
+    use libra::utils::object_ext::{CommitExt, TreeExt};
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    let before = Head::current_commit().await.expect("before");
+    std::fs::remove_file(dir.path().join("tracked.txt")).expect("delete");
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let stage = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-stage-del","session_id":"s1","paths":["tracked.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    mutation_dispatch(&ctx, &request(&stage))
+        .await
+        .expect("stage deletion")
+        .expect("response");
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("after stage");
+    let commit = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.commit","params":{{"operation_id":"op-commit-del","session_id":"s1","message":"chore: remove tracked","paths":["tracked.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":2}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let result = mutation_dispatch(&ctx, &request(&commit))
+        .await
+        .expect("commit deletion")
+        .expect("response")
+        .result
+        .expect("result");
+    let oid = result["commitOid"].as_str().expect("oid").to_string();
+    assert_ne!(oid, before.to_string());
+    let stored = git_internal::internal::object::commit::Commit::load(
+        &libra::internal::object_format::parse_repo_oid(&oid).expect("parse"),
+    )
+    .expect("commit");
+    let tree = git_internal::internal::object::tree::Tree::load(&stored.tree_id).expect("tree");
+    assert!(
+        tree.tree_items
+            .iter()
+            .all(|item| item.name != "tracked.txt"),
+        "deleted file remains in the commit tree"
+    );
+}
+
+/// Deleting a file during publish still stages the bytes already snapshotted.
+#[tokio::test]
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_stage_publishes_a_snapshot_after_the_file_disappears() {
+    struct ClearHook;
+    impl Drop for ClearHook {
+        fn drop(&mut self) {
+            libra::internal::ai::agent_bridge::vcs_write::set_publish_remove_for_test(None);
+        }
+    }
+    let _clear = ClearHook;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), "good.txt", "good\n");
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    libra::internal::ai::agent_bridge::vcs_write::set_publish_remove_for_test(Some(
+        dir.path().join("good.txt"),
+    ));
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-vanish","session_id":"s1","paths":["good.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let result = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect("stage vanished file")
+        .expect("response")
+        .result
+        .expect("result");
+    assert_eq!(result["outcome"], "applied");
+    let index =
+        git_internal::internal::index::Index::load(dir.path().join(".libra/index")).expect("index");
+    let entry = index.get("good.txt", 0).expect("entry");
+    let approved = git_internal::hash::ObjectHash::from_type_and_data(
+        git_internal::internal::object::types::ObjectType::Blob,
+        b"good\n",
+    );
+    assert_eq!(entry.hash, approved);
+    assert!(!dir.path().join("good.txt").exists());
+}
+
+/// A file recreated during publish does not undo a snapshotted deletion.
+#[tokio::test]
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_stage_keeps_a_snapshotted_deletion_if_the_file_returns() {
+    struct ClearHook;
+    impl Drop for ClearHook {
+        fn drop(&mut self) {
+            libra::internal::ai::agent_bridge::vcs_write::set_publish_rewrite_for_test(None);
+        }
+    }
+    let _clear = ClearHook;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    std::fs::remove_file(dir.path().join("tracked.txt")).expect("delete");
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    libra::internal::ai::agent_bridge::vcs_write::set_publish_rewrite_for_test(Some(
+        dir.path().join("tracked.txt"),
+    ));
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-delete-publish","session_id":"s1","paths":["tracked.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let result = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect("stage snapshotted deletion")
+        .expect("response")
+        .result
+        .expect("result");
+    assert_eq!(result["outcome"], "applied");
+    let index =
+        git_internal::internal::index::Index::load(dir.path().join(".libra/index")).expect("index");
+    assert!(
+        index.get("tracked.txt", 0).is_none(),
+        "snapshotted deletion must leave the index"
+    );
+    assert_eq!(
+        fs::read(dir.path().join("tracked.txt")).expect("recreated worktree file"),
+        b"changed while publishing\n"
+    );
+}
+
+/// Staging a deleted tracked file removes it from the index.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_stage_records_deletion_of_a_tracked_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    std::fs::remove_file(dir.path().join("tracked.txt")).expect("delete");
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-delete","session_id":"s1","paths":["tracked.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let result = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect("stage deletion")
+        .expect("response")
+        .result
+        .expect("result");
+    assert_eq!(result["outcome"], "applied");
+    let index =
+        git_internal::internal::index::Index::load(dir.path().join(".libra/index")).expect("index");
+    assert!(
+        index.get("tracked.txt", 0).is_none(),
+        "deleted file must leave the index"
+    );
+}
+
+/// Bytes staged by `add` must match the bytes observed immediately before it.
+#[tokio::test]
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_stage_rejects_content_changed_during_add() {
+    struct ClearHook;
+    impl Drop for ClearHook {
+        fn drop(&mut self) {
+            libra::internal::ai::agent_bridge::vcs_write::set_stage_rewrite_for_test(None);
+        }
+    }
+    let _clear = ClearHook;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), "queued.txt", "queued\n");
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let index_before = fs::read(dir.path().join(".libra").join("index")).expect("index");
+    libra::internal::ai::agent_bridge::vcs_write::set_stage_rewrite_for_test(Some(
+        dir.path().join("queued.txt"),
+    ));
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-during-add","session_id":"s1","paths":["queued.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let error = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect_err("content changed during add");
+    assert!(error.message.contains("stale_state"), "{}", error.message);
+    assert_eq!(
+        fs::read(dir.path().join(".libra").join("index")).expect("index"),
+        index_before
+    );
+    let unapproved = git_internal::hash::ObjectHash::from_type_and_data(
+        git_internal::internal::object::types::ObjectType::Blob,
+        b"changed while staging\n",
+    );
+    let hex = unapproved.to_string();
+    let loose = dir
+        .path()
+        .join(".libra/objects")
+        .join(&hex[..2])
+        .join(&hex[2..]);
+    assert!(
+        !loose.exists(),
+        "unapproved content must not be stored at {}",
+        loose.display()
+    );
+}
+
+/// A file edited while the approved bytes are stored does not replace those bytes.
+#[tokio::test]
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_stage_keeps_the_snapshot_if_the_file_changes_during_publish() {
+    struct ClearHook;
+    impl Drop for ClearHook {
+        fn drop(&mut self) {
+            libra::internal::ai::agent_bridge::vcs_write::set_publish_rewrite_for_test(None);
+        }
+    }
+    let _clear = ClearHook;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), "queued.txt", "queued\n");
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    libra::internal::ai::agent_bridge::vcs_write::set_publish_rewrite_for_test(Some(
+        dir.path().join("queued.txt"),
+    ));
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-publish","session_id":"s1","paths":["queued.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let result = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect("stage snapshot")
+        .expect("response")
+        .result
+        .expect("result");
+    assert_eq!(result["outcome"], "applied");
+    let approved = git_internal::hash::ObjectHash::from_type_and_data(
+        git_internal::internal::object::types::ObjectType::Blob,
+        b"queued\n",
+    );
+    let index =
+        git_internal::internal::index::Index::load(dir.path().join(".libra/index")).expect("index");
+    assert_eq!(index.get("queued.txt", 0).expect("entry").hash, approved);
+    let unapproved = git_internal::hash::ObjectHash::from_type_and_data(
+        git_internal::internal::object::types::ObjectType::Blob,
+        b"changed while publishing\n",
+    );
+    let hex = unapproved.to_string();
+    let loose = dir
+        .path()
+        .join(".libra/objects")
+        .join(&hex[..2])
+        .join(&hex[2..]);
+    assert!(
+        !loose.exists(),
+        "unapproved content stored at {}",
+        loose.display()
+    );
+}
+
+/// A file edited after the fence check and before staging is not staged.
+#[tokio::test]
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_stage_rechecks_the_fence_immediately_before_writing() {
+    struct ClearHook;
+    impl Drop for ClearHook {
+        fn drop(&mut self) {
+            libra::internal::ai::agent_bridge::vcs_write::set_fence_recheck_rewrite_for_test(None);
+        }
+    }
+    let _clear = ClearHook;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), "queued.txt", "queued\n");
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let index_before = fs::read(dir.path().join(".libra").join("index")).expect("index");
+    libra::internal::ai::agent_bridge::vcs_write::set_fence_recheck_rewrite_for_test(Some(
+        dir.path().join("queued.txt"),
+    ));
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-recheck","session_id":"s1","paths":["queued.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let error = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect_err("edit between checks");
+    assert!(error.message.contains("stale_state"), "{}", error.message);
+    assert_eq!(
+        fs::read(dir.path().join(".libra").join("index")).expect("index"),
+        index_before
+    );
+}
+
 /// (new) Editing an already-unstaged file changes the fence, not only its path list.
 #[tokio::test]
 #[serial(cwd, env, hash_kind)]
@@ -827,6 +5549,87 @@ async fn vcs_fence_changes_when_file_content_changes() {
         .await
         .expect("second fence");
     assert_ne!(first.worktree_generation, second.worktree_generation);
+}
+
+/// `commit.create` must not publish while another bridge task holds the gate.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn in_process_commit_waits_while_publish_gate_is_held() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let hold = libra::internal::ai::agent_bridge::vcs_write::acquire_publish_gate().await;
+            let mut pending = tokio::task::spawn_local(async {
+                libra::internal::ai::agent_bridge::vcs::commit_create("gate", false, true).await
+            });
+            tokio::select! {
+                _ = &mut pending => panic!("commit.create ran while the publish gate was held"),
+                _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
+            }
+            drop(hold);
+            let result = tokio::time::timeout(std::time::Duration::from_secs(5), pending)
+                .await
+                .expect("commit should proceed after the gate is released")
+                .expect("join");
+            assert!(result.is_ok(), "{result:?}");
+        })
+        .await;
+}
+
+/// Content outside the repository, reached only through a symlink directory, must not affect the fence.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_fence_ignores_files_reached_through_a_symlink_directory() {
+    use std::os::unix::fs::symlink;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let outside = tempfile::tempdir().expect("outside");
+    write_file(outside.path(), "secret.txt", "SECRET\n");
+    symlink(outside.path(), dir.path().join("escape")).expect("symlink dir");
+    let first = libra::internal::ai::agent_bridge::vcs_write::current_write_fence().await;
+    write_file(outside.path(), "secret.txt", "OTHER\n");
+    let second = libra::internal::ai::agent_bridge::vcs_write::current_write_fence().await;
+    let before = first.expect("fence should ignore a symlink directory");
+    let after = second.expect("fence should stay available");
+    assert_eq!(
+        before, after,
+        "outside content reached through a symlink directory changed the fence"
+    );
+}
+
+/// Deleting a tracked file is an ordinary worktree observation, not an error.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_fence_changes_when_tracked_file_is_deleted() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let before = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("before deletion");
+    std::fs::remove_file(dir.path().join("tracked.txt")).expect("delete");
+    let after = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("deleted file must remain observable");
+    assert_ne!(before.worktree_generation, after.worktree_generation);
+}
+
+/// Fence hashing must use paths relative to the repository, even from a subdirectory.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_fence_uses_repository_relative_paths_from_subdirectory() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    std::fs::create_dir(dir.path().join("nested")).expect("nested");
+    write_file(dir.path(), "tracked.txt", "one\nchanged\n");
+    let from_root = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("root fence");
+    let _nested = ChangeDirGuard::new(dir.path().join("nested"));
+    let from_nested = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("nested fence");
+    assert_eq!(from_root, from_nested);
 }
 
 /// (new) LVC-06: commit refuses when the index contains paths outside the request.
@@ -857,6 +5660,205 @@ async fn vcs_commit_refuses_unselected_staged_paths() {
         err.message
     );
     assert_eq!(Head::current_commit().await.expect("unchanged"), before);
+}
+
+/// A restore fence check must not echo the host path when a tracked directory
+/// was replaced by a symlink.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn restore_fence_hides_the_host_path_behind_a_symlink_directory() {
+    use std::os::unix::fs::symlink;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    std::fs::create_dir(dir.path().join("sub")).expect("sub");
+    write_file(dir.path(), "sub/nested.txt", "inside\n");
+    stage(&["sub/nested.txt"]).await;
+    cli_commit("add nested").await;
+    let head = Head::current_commit().await.expect("head").to_string();
+    insert_checkpoint(&ctx.conn, "cp-symlink", "s1", None, Some(&head), 1)
+        .await
+        .expect("checkpoint");
+    std::fs::remove_dir_all(dir.path().join("sub")).expect("remove tracked dir");
+    let outside = tempfile::tempdir().expect("outside");
+    write_file(outside.path(), "nested.txt", "SECRET-DIFF\n");
+    symlink(outside.path(), dir.path().join("sub")).expect("replace with symlink");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"checkpoint.restore","params":{{"operation_id":"op-symlink-fence","session_id":"s1","checkpoint_id":"cp-symlink","expected_head":"{head}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#
+    );
+    let error = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect_err("symlink fence");
+    assert!(
+        error.message.contains("symlink") || error.message.contains("directory"),
+        "{}",
+        error.message
+    );
+    assert!(
+        !error.message.contains("SECRET-DIFF")
+            && !error
+                .message
+                .contains(dir.path().to_str().unwrap_or("repo-path"))
+            && !error
+                .message
+                .contains(outside.path().to_str().unwrap_or("outside-path")),
+        "restore fence leaked host data: {}",
+        error.message
+    );
+    assert_eq!(
+        Head::current_commit().await.expect("HEAD").to_string(),
+        head
+    );
+}
+
+/// Enabled `diff.get` must not return bytes read through a symlink that
+/// replaced a tracked directory.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn diff_get_rejects_a_tracked_path_replaced_by_a_symlink_directory() {
+    use std::os::unix::fs::symlink;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    std::fs::create_dir(dir.path().join("sub")).expect("sub");
+    write_file(dir.path(), "sub/nested.txt", "inside\n");
+    stage(&["sub/nested.txt"]).await;
+    cli_commit("add nested").await;
+    std::fs::remove_dir_all(dir.path().join("sub")).expect("remove tracked dir");
+    let outside = tempfile::tempdir().expect("outside");
+    write_file(outside.path(), "nested.txt", "SECRET-DIFF\n");
+    symlink(outside.path(), dir.path().join("sub")).expect("replace with symlink");
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    let error = read_dispatch(
+        &ctx,
+        &request(r#"{"jsonrpc":"2.0","method":"diff.get","params":{"mode":"worktree"},"id":1}"#),
+    )
+    .await
+    .expect_err("symlink ancestor in diff.get");
+    assert!(error.message.contains("symlink"), "{}", error.message);
+    assert_eq!(error.stable_code, "LBR-AGENT-027", "{}", error.message);
+    assert!(
+        !error.message.contains("SECRET-DIFF"),
+        "diff.get leaked outside bytes: {}",
+        error.message
+    );
+    assert!(
+        !error
+            .message
+            .contains(dir.path().to_str().unwrap_or("repo-path"))
+            && !error
+                .message
+                .contains(outside.path().to_str().unwrap_or("outside-path")),
+        "diff.get leaked a host path: {}",
+        error.message
+    );
+}
+
+/// An unfiltered diff must not return bytes read through a symlink that
+/// replaced a tracked directory.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_diff_omits_tracked_paths_replaced_by_a_symlink_directory() {
+    use std::os::unix::fs::symlink;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    std::fs::create_dir(dir.path().join("sub")).expect("sub");
+    write_file(dir.path(), "sub/nested.txt", "inside\n");
+    stage(&["sub/nested.txt"]).await;
+    cli_commit("add nested").await;
+    std::fs::remove_dir_all(dir.path().join("sub")).expect("remove tracked dir");
+    let outside = tempfile::tempdir().expect("outside");
+    write_file(outside.path(), "nested.txt", "SECRET-DIFF\n");
+    symlink(outside.path(), dir.path().join("sub")).expect("replace with symlink");
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    let error = read_dispatch(
+        &ctx,
+        &request(
+            r#"{"jsonrpc":"2.0","method":"vcs.diff","params":{"sides":"worktree-vs-index"},"id":1}"#,
+        ),
+    )
+    .await
+    .expect_err("symlink ancestor in an unfiltered diff");
+    assert!(error.message.contains("symlink"), "{}", error.message);
+    assert!(
+        !error.message.contains("SECRET-DIFF")
+            && !error
+                .message
+                .contains(dir.path().to_str().unwrap_or("repo-path"))
+            && !error
+                .message
+                .contains(outside.path().to_str().unwrap_or("outside-path")),
+        "unfiltered diff leaked host data: {}",
+        error.message
+    );
+}
+
+/// A tracked file replaced by a symlink must not leak the outside file's bytes.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+#[cfg(unix)]
+async fn vcs_diff_does_not_read_through_a_leaf_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    write_file(dir.path(), "tracked.txt", "inside\n");
+    stage(&["tracked.txt"]).await;
+    cli_commit("add tracked").await;
+    let outside = tempfile::tempdir().expect("outside");
+    write_file(outside.path(), "secret.txt", "SECRET-LEAF\n");
+    fs::remove_file(dir.path().join("tracked.txt")).expect("remove tracked file");
+    symlink(
+        outside.path().join("secret.txt"),
+        dir.path().join("tracked.txt"),
+    )
+    .expect("replace with a symlink");
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    let response = read_dispatch(
+        &ctx,
+        &request(
+            r#"{"jsonrpc":"2.0","method":"vcs.diff","params":{"sides":"worktree-vs-index","paths":["tracked.txt"]},"id":1}"#,
+        ),
+    )
+    .await
+    .expect("vcs.diff")
+    .expect("response");
+    let rendered = serde_json::to_string(&response).expect("render");
+    assert!(
+        !rendered.contains("SECRET-LEAF"),
+        "the diff must not carry bytes read through a symlink: {rendered}"
+    );
+}
+
+/// `vcs.diff` must not follow a symlink directory to a file outside the repository.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_diff_rejects_a_path_through_a_symlink_directory() {
+    use std::os::unix::fs::symlink;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let outside = tempfile::tempdir().expect("outside");
+    write_file(outside.path(), "secret.txt", "SECRET-DIFF\n");
+    symlink(outside.path(), dir.path().join("escape")).expect("symlink dir");
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    let error = read_dispatch(
+        &ctx,
+        &request(
+            r#"{"jsonrpc":"2.0","method":"vcs.diff","params":{"sides":"worktree-vs-index","paths":["escape/secret.txt"]},"id":1}"#,
+        ),
+    )
+    .await
+    .expect_err("symlink diff");
+    assert!(error.message.contains("symlink"), "{}", error.message);
+    assert!(
+        !error.message.contains("SECRET-DIFF"),
+        "diff leaked outside bytes: {}",
+        error.message
+    );
 }
 
 async fn vcs_data(ctx: &BridgeContext, line: &str) -> Value {

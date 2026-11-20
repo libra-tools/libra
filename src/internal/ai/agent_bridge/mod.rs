@@ -21,6 +21,7 @@ pub mod methods;
 pub mod mutations;
 pub mod protocol;
 pub mod provenance;
+pub mod publication;
 pub mod redaction;
 pub mod storage;
 pub mod transport;

@@ -52,26 +52,30 @@ fn map_workspace_error(err: WorkspaceError, action: &str) -> BridgeError {
         // Another live record holds the identity/path: a lease-held refusal.
         // Use the dedicated LBR-AGENT-022 code so a client can tell \"lease
         // held, backoff and retry\" from an unrelated denial.
-        WorkspaceError::LeaseHeld(detail) => BridgeError::workspace_lease_held(format!(
-            "{action} refused: {detail} (another agent or runtime already holds the workspace)"
+        WorkspaceError::LeaseHeld(_) => BridgeError::workspace_lease_held(format!(
+            "{action} refused: another agent or runtime holds this workspace lease; retry after it is released or expires"
         )),
         // Owner/fence mismatch: the lease was reclaimed or already settled.
         // Use the dedicated LBR-AGENT-023 code so a client can tell \"lease
         // lost\" from a generic scope mismatch.
-        WorkspaceError::LeaseLost {
-            workspace_id,
-            owner,
-            fence,
-        } => BridgeError::workspace_lease_lost(format!(
-            "{action} refused: workspace lease for '{workspace_id}' is no longer held by '{owner}' at fence {fence} — it was reclaimed or already released"
+        WorkspaceError::LeaseLost { .. } => BridgeError::workspace_lease_lost(format!(
+            "{action} refused: this workspace lease is no longer held by the current owner; claim it again before retrying"
         )),
-        WorkspaceError::NotFound(id) => BridgeError::scope_mismatch(format!(
-            "{action} refused: workspace '{id}' does not exist in this repository"
+        WorkspaceError::NotFound(_) => BridgeError::scope_mismatch(format!(
+            "{action} refused: the workspace does not exist in this repository; refresh the workspace list"
         )),
-        WorkspaceError::Invalid(msg) => BridgeError::invalid_params(format!("{action}: {msg}")),
-        WorkspaceError::Corrupt(msg) => BridgeError::internal(format!("{action}: {msg}")),
-        WorkspaceError::ReadFailed(msg) => BridgeError::internal(format!("{action}: {msg}")),
-        WorkspaceError::WriteFailed(msg) => BridgeError::internal(format!("{action}: {msg}")),
+        WorkspaceError::Invalid(_) => BridgeError::invalid_params(format!(
+            "{action} request is invalid; check the workspace ID, path, lease duration and owner fields"
+        )),
+        WorkspaceError::Corrupt(_) => BridgeError::internal(format!(
+            "{action} could not read a valid workspace lease record; inspect the repository's Libra workspace state"
+        )),
+        WorkspaceError::ReadFailed(_) => BridgeError::internal(format!(
+            "{action} could not read workspace lease state; retry, then inspect the repository's Libra workspace state"
+        )),
+        WorkspaceError::WriteFailed(_) => BridgeError::internal(format!(
+            "{action} could not update workspace lease state; retry, then inspect the repository's Libra workspace state"
+        )),
     }
 }
 
@@ -111,9 +115,9 @@ fn claim_path(params: &Option<Value>) -> Result<PathBuf, BridgeError> {
     let path_str = require_param_str(params, "path")?;
     let path = PathBuf::from(&path_str);
     if !path.is_absolute() {
-        return Err(BridgeError::invalid_params(format!(
-            "workspace.claim path must be absolute; got '{path_str}'"
-        )));
+        return Err(BridgeError::invalid_params(
+            "workspace.claim path must be absolute",
+        ));
     }
     Ok(path)
 }
@@ -279,4 +283,66 @@ pub async fn trusted_repo_identity(ctx: &BridgeContext) -> Result<RepoIdentity, 
         )));
     }
     Ok(identity)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workspace_errors_withhold_embedded_details_and_preserve_codes() {
+        let secret_path = "/Users/alice/private/workspace.db";
+        let lease_held = crate::internal::workspace::LeaseHeldDetail {
+            identity: secret_path.to_string(),
+            workspace_id: Some(secret_path.to_string()),
+            holder: Some(secret_path.to_string()),
+            state: None,
+            expires_at: None,
+            path_conflict: true,
+        };
+        let errors = [
+            (
+                WorkspaceError::LeaseHeld(Box::new(lease_held)),
+                "LBR-AGENT-022",
+            ),
+            (
+                WorkspaceError::LeaseLost {
+                    workspace_id: secret_path.to_string(),
+                    owner: secret_path.to_string(),
+                    fence: 42,
+                },
+                "LBR-AGENT-023",
+            ),
+            (
+                WorkspaceError::NotFound(secret_path.to_string()),
+                "LBR-AGENT-032",
+            ),
+            (
+                WorkspaceError::Invalid(secret_path.to_string()),
+                "LBR-AGENT-027",
+            ),
+            (
+                WorkspaceError::Corrupt(secret_path.to_string()),
+                "LBR-AGENT-037",
+            ),
+            (
+                WorkspaceError::ReadFailed(secret_path.to_string()),
+                "LBR-AGENT-037",
+            ),
+            (
+                WorkspaceError::WriteFailed(secret_path.to_string()),
+                "LBR-AGENT-037",
+            ),
+        ];
+
+        for (error, expected_code) in errors {
+            let mapped = map_workspace_error(error, "workspace.claim");
+            assert_eq!(mapped.stable_code, expected_code);
+            assert!(
+                !mapped.message.contains(secret_path),
+                "workspace error exposed a path: {}",
+                mapped.message
+            );
+        }
+    }
 }

@@ -368,7 +368,7 @@ async fn agent_checkpoint_parent_commit(
 }
 
 fn db_error(context: &'static str) -> impl Fn(sea_orm::DbErr) -> BridgeError {
-    move |err| BridgeError::internal(format!("{context}: {err}"))
+    move |err| super::vcs::internal_hiding_host_paths(context, err)
 }
 
 // ---------------------------------------------------------------------------

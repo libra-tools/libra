@@ -287,6 +287,16 @@ pub const MUTABLE_STATE_OWNERSHIP: &[MutableStateSurface] = &[
         rationale: "bridge association links are repository-owned and keyed by bridge_session_id (LB-02)",
     },
     MutableStateSurface {
+        table: "agent_bridge_publication",
+        owner: StateOwner::Repository,
+        rationale: "bridge operation-to-commit bindings are written in the same repository transaction as the ref update and are not capture-catalog rows",
+    },
+    MutableStateSurface {
+        table: "agent_bridge_index_publication",
+        owner: StateOwner::Repository,
+        rationale: "bridge operation-to-index bindings record what a stage or unstage published; they are repository state, not capture-catalog rows",
+    },
+    MutableStateSurface {
         table: "agent_usage_stats",
         owner: StateOwner::Repository,
         rationale: "agent capture/export/coverage state (repository-owned; W4 adds workspace keys)",

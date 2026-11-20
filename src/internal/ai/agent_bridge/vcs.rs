@@ -14,8 +14,13 @@
 //! - nothing here writes to stdout: the callers own the response frame
 //!   (GC-LB-04);
 //! - dangerous mutations pre-check a HEAD/index/worktree fence and fail closed
-//!   **before** any write, so a refused operation is never partially applied
-//!   (LB-05 AC5).
+//!   **before** the index, object or ref write they would perform, so a
+//!   refused operation never published an index or a commit (LB-05 AC5). A
+//!   preparation step may still have stored content objects before a late
+//!   fence refusal, and a write that fails *during* its own execution can
+//!   leave partial effects: that call returns an error, and a later replay of
+//!   the same operation reports an indeterminate outcome rather than claiming
+//!   a success or repeating the effect.
 //!
 //! Long-running work is bounded by the v1 request deadline. `review.run`
 //! therefore *admits and starts* a run synchronously and returns its
@@ -147,7 +152,17 @@ fn validate_path_selector(raw: &str) -> Result<String, BridgeError> {
             "path selector '{raw}' escapes the repository root"
         )));
     }
-    Ok(raw.to_string())
+    let normalized = raw
+        .split(['/', '\\'])
+        .filter(|component| !component.is_empty() && *component != ".")
+        .collect::<Vec<_>>()
+        .join("/");
+    if normalized.is_empty() {
+        return Err(BridgeError::invalid_params(
+            "path selector must name a file inside the repository",
+        ));
+    }
+    Ok(normalized)
 }
 
 /// Validate the optional `paths` array of a request.
@@ -170,9 +185,64 @@ fn validate_paths(params: &Option<Value>) -> Result<Vec<String>, BridgeError> {
         let raw = entry.as_str().ok_or_else(|| {
             BridgeError::invalid_params("every entry of 'paths' must be a string")
         })?;
+        // Enabled `diff.get` keeps the caller's spelling. Resolving it through
+        // `read_dir` follows symlink ancestors and can adopt names from outside
+        // the worktree; case folding is not part of the released selector.
         paths.push(validate_path_selector(raw)?);
     }
     Ok(paths)
+}
+
+/// Confirm `path` does not descend through a symlink, without rewriting it.
+///
+/// The returned spelling is always the caller's. The walk uses no-follow
+/// `lstat` beneath the worktree root, never `read_dir`, so a symlink ancestor
+/// cannot reveal or adopt directory entries from outside the repository.
+/// A missing component stops the walk and the remainder is kept verbatim.
+/// Distinct case spellings are never merged or replaced.
+pub(crate) fn canonicalize_existing_spelling(path: &str) -> Result<String, BridgeError> {
+    let Ok(workdir) = util::try_working_dir() else {
+        return Ok(path.to_string());
+    };
+    let root = crate::utils::beneath::open_root(&workdir).map_err(|error| {
+        BridgeError::internal(format!(
+            "path selector '{path}' could not pin the worktree ({})",
+            withheld_detail(&error)
+        ))
+    })?;
+    let components: Vec<&str> = path
+        .split('/')
+        .filter(|component| !component.is_empty() && *component != ".")
+        .collect();
+    let mut prefix = String::new();
+    for (index, component) in components.iter().enumerate() {
+        if !prefix.is_empty() {
+            prefix.push('/');
+        }
+        prefix.push_str(component);
+        let last = index + 1 == components.len();
+        match crate::utils::beneath::lstat_beneath(&root, std::path::Path::new(&prefix)) {
+            Ok(stat) if stat.is_symlink && !last => {
+                return Err(BridgeError::invalid_params(format!(
+                    "path selector '{path}' descends through symlink '{prefix}'; refusing to follow it"
+                )));
+            }
+            Ok(stat) if !stat.is_dir && !last => {
+                return Err(BridgeError::invalid_params(format!(
+                    "path selector '{path}' descends through non-directory '{prefix}'"
+                )));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => {
+                return Err(BridgeError::internal(format!(
+                    "path selector '{path}' could not be inspected ({})",
+                    withheld_detail(&error)
+                )));
+            }
+        }
+    }
+    Ok(path.to_string())
 }
 
 /// Parse a commit id that came out of the bridge's own durable tables.
@@ -232,6 +302,9 @@ pub async fn diff_data(
     } else {
         None
     };
+    for path in &paths {
+        canonicalize_existing_spelling(path)?;
+    }
     let args = DiffArgs::for_service(mode == DiffMode::Staged, old_side, paths);
 
     let output = run_diff_for_service(args).await.map_err(map_diff_error)?;
@@ -241,6 +314,11 @@ pub async fn diff_data(
     let mut budget = MAX_DIFF_PATCH_BYTES;
     let mut files: Vec<Value> = Vec::with_capacity(total_files.min(limit));
     for file in output.files.iter().take(limit) {
+        // Drop the page rather than return a patch read through a symlink ancestor.
+        canonicalize_existing_spelling(&file.path)?;
+        if let Some(old) = &file.rename_from {
+            canonicalize_existing_spelling(old)?;
+        }
         let patch = file.raw_patch();
         // Spend the shared patch budget in file order; once it is exhausted the
         // remaining files still report their stats, with `patch_omitted` set.
@@ -294,14 +372,61 @@ pub async fn diff_data(
 /// "not in a repository" is a **scope** condition, not an internal failure: the
 /// bridge was asked to diff where it has no working repository bound, and the
 /// caller can act on that. Everything else is a genuine service failure.
-fn map_diff_error(error: DiffError) -> BridgeError {
+pub(crate) enum SanitizedDiffFailure {
+    NotInRepo,
+    SymlinkParent,
+    Other(String),
+}
+
+/// Classify a diff failure without copying host paths into the bridge error.
+pub(crate) fn sanitize_diff_failure(error: &DiffError) -> SanitizedDiffFailure {
     match error {
-        DiffError::NotInRepo => BridgeError::scope_mismatch(
+        DiffError::NotInRepo => SanitizedDiffFailure::NotInRepo,
+        other => {
+            let text = other.to_string();
+            if text.contains("symbolic link") || text.contains("Not a directory") {
+                SanitizedDiffFailure::SymlinkParent
+            } else {
+                SanitizedDiffFailure::Other("diff service failed; details withheld".to_string())
+            }
+        }
+    }
+}
+
+fn map_diff_error(error: DiffError) -> BridgeError {
+    match sanitize_diff_failure(&error) {
+        SanitizedDiffFailure::NotInRepo => BridgeError::scope_mismatch(
             "diff.get has no working repository in scope; start `libra agent bridge --stdio` \
              from inside the repository you want to diff",
         ),
-        other => BridgeError::internal(format!("diff.get: {other}")),
+        SanitizedDiffFailure::SymlinkParent => BridgeError::invalid_params(
+            "diff.get refuses a path whose parent is a symlink or not a directory",
+        ),
+        SanitizedDiffFailure::Other(text) => BridgeError::internal(format!("diff.get: {text}")),
     }
+}
+
+/// Withhold untrusted error details, which can contain host paths in many
+/// platform-specific forms. Callers supply a fixed, safe context.
+pub(crate) fn internal_hiding_host_paths(
+    context: &str,
+    _detail: impl std::fmt::Display,
+) -> BridgeError {
+    BridgeError::internal(format!("{context}: details withheld"))
+}
+
+/// The same withholding for a stale-fence answer, so the caller keeps the
+/// `stale_state` contract while the underlying detail stays private.
+pub(crate) fn stale_fence_hiding_host_paths(
+    context: &str,
+    _detail: impl std::fmt::Display,
+) -> BridgeError {
+    BridgeError::stale_fence(format!("{context}: details withheld"))
+}
+
+/// A fixed placeholder for an underlying error detail that must not be shown.
+pub(crate) fn withheld_detail(_detail: impl std::fmt::Display) -> &'static str {
+    "details withheld"
 }
 
 /// Parse the typed `diff.get` params (mode + paths + limit).
@@ -327,10 +452,11 @@ pub struct Fence {
 }
 
 /// Read the current fence.
-pub async fn read_fence() -> Fence {
-    Fence {
-        head: Head::current_commit().await,
-    }
+pub async fn read_fence() -> Result<Fence, BridgeError> {
+    let head = Head::current_commit_result()
+        .await
+        .map_err(|error| internal_hiding_host_paths("cannot read HEAD fence", error))?;
+    Ok(Fence { head })
 }
 
 /// Verify that HEAD still is what the caller pre-checked.
@@ -367,11 +493,16 @@ pub fn check_head_fence(fence: &Fence, expected: &str) -> Result<(), BridgeError
 pub async fn check_clean_worktree_fence() -> Result<(), BridgeError> {
     for (staged, what) in [(false, "working tree"), (true, "index")] {
         let args = DiffArgs::for_service(staged, None, Vec::new());
-        let output = run_diff_for_service(args).await.map_err(|e| match e {
-            DiffError::NotInRepo => BridgeError::scope_mismatch(
+        let output = run_diff_for_service(args).await.map_err(|error| match sanitize_diff_failure(&error) {
+            SanitizedDiffFailure::NotInRepo => BridgeError::scope_mismatch(
                 "cannot verify the worktree fence: no working repository is in scope",
             ),
-            other => BridgeError::internal(format!("cannot verify the {what} fence: {other}")),
+            SanitizedDiffFailure::SymlinkParent => BridgeError::invalid_params(
+                "cannot verify the worktree fence: a path parent is a symlink or not a directory",
+            ),
+            SanitizedDiffFailure::Other(text) => {
+                BridgeError::internal(format!("cannot verify the {what} fence: {text}"))
+            }
         })?;
         if output.files_changed > 0 {
             return Err(BridgeError::stale_fence(format!(
@@ -411,7 +542,25 @@ pub async fn commit_create(
     signoff: bool,
     allow_empty: bool,
 ) -> Result<Value, BridgeError> {
-    use crate::command::commit::{CommitArgs, run_commit};
+    let _gate = super::vcs_write::acquire_publish_gate().await;
+    // `commit.create` commits the index, so the admitted fence is HEAD plus the
+    // index bytes. The worktree is not part of what this operation publishes.
+    let (head, index_generation) = super::vcs_write::current_commit_fence().await?;
+    super::publication::with_commit_fence(
+        &head,
+        Some(&index_generation),
+        None,
+        commit_create_unguarded(message, signoff, allow_empty),
+    )
+    .await
+}
+
+pub async fn commit_create_unguarded(
+    message: &str,
+    signoff: bool,
+    allow_empty: bool,
+) -> Result<Value, BridgeError> {
+    use crate::command::commit::{CommitArgs, CommitError, run_commit};
 
     let args = CommitArgs {
         message: Some(message.to_string()),
@@ -420,35 +569,18 @@ pub async fn commit_create(
         ..CommitArgs::default()
     };
 
-    // Publish under the shared maintenance hold (§C.4.3 writer-vs-deleter).
-    //
-    // `libra commit` takes this hold at CLI dispatch, but
-    // `command_holds_shared_maintenance_lock` (`src/cli.rs`) excludes the whole
-    // `agent` surface, and states why: an agent's VCS mutations reach the
-    // repository by spawning `libra` as a SUBPROCESS, so the child takes the
-    // hold. That stopped being true here when LB-05 wired `commit.create` to
-    // `run_commit` IN-PROCESS — this call writes blobs, trees, a commit and a
-    // ref inside the long-lived bridge process, which holds nothing. Without
-    // the hold, a concurrent `gc` / `prune` / `repack -d` deletion phase can
-    // unlink payloads in the window between writing an object and publishing
-    // the reference that pins it.
-    //
-    // Taking it here rather than at bridge startup keeps §C.10's rule that no
-    // ordinary command holds a maintenance lock for its lifetime: a bridge
-    // session runs for hours, and a session-long hold would starve every
-    // deletion phase. The guard drops when this commit returns, before the
-    // next NDJSON frame is read.
-    let storage = crate::utils::util::try_get_storage_path(None).map_err(|e| {
-        BridgeError::internal(format!("commit.create: resolve repository storage: {e}"))
-    })?;
-    let _publish_lock = crate::internal::maintenance_lock::MaintenanceLock::shared(&storage)
-        .map_err(|e| {
-            BridgeError::internal(format!("commit.create: take repository publish lock: {e}"))
-        })?;
+    // Bridge callers provide a task-scoped fence. `run_commit` runs configured
+    // hooks first, then takes the exclusive repository lock and rechecks that
+    // fence before writing trees, objects, or refs.
 
     let output = run_commit(args, &service_output())
         .await
-        .map_err(|e| BridgeError::internal(format!("commit.create: {e}")))?;
+        .map_err(|error| match error {
+            CommitError::BridgeFenceChanged => BridgeError::stale_fence(
+                "stale_state: repository state changed before commit publication; refresh and retry",
+            ),
+            other => internal_hiding_host_paths("commit.create", other),
+        })?;
     Ok(json!({
         "commit": output.commit,
         "short_id": output.short_id,
@@ -508,10 +640,11 @@ pub async fn checkpoint_restore(target: &ObjectHash) -> Result<Value, BridgeErro
         restore::{RestoreArgs, execute_checked_typed},
     };
 
-    let plan = build_rewind_plan(target).map_err(|e| {
-        BridgeError::internal(format!(
-            "checkpoint.restore cannot enumerate the target commit {target}: {e}"
-        ))
+    let plan = build_rewind_plan(target).map_err(|error| {
+        internal_hiding_host_paths(
+            &format!("checkpoint.restore cannot enumerate the target commit {target}"),
+            error,
+        )
     })?;
     let restore_args = RestoreArgs {
         pathspec: vec![".".to_string()],
@@ -521,7 +654,7 @@ pub async fn checkpoint_restore(target: &ObjectHash) -> Result<Value, BridgeErro
     };
     execute_checked_typed(restore_args)
         .await
-        .map_err(|e| BridgeError::internal(format!("checkpoint.restore failed: {e}")))?;
+        .map_err(|error| internal_hiding_host_paths("checkpoint.restore failed", error))?;
     Ok(json!({
         "target_commit": target.to_string(),
         "restored_paths": plan.restore.len(),
@@ -586,12 +719,24 @@ pub fn parse_review_params(params: &Option<Value>) -> Result<ReviewRequest, Brid
 
 /// Open the review run store rooted at this repository's `.libra/sessions`.
 fn open_review_store() -> Result<ReviewRunStore, BridgeError> {
-    let storage = util::try_get_storage_path(None).map_err(|e| {
-        BridgeError::internal(format!(
-            "review.run cannot resolve this repository's storage path: {e}"
-        ))
+    let storage = util::try_get_storage_path(None).map_err(|error| {
+        internal_hiding_host_paths(
+            "review.run cannot resolve this repository's storage path",
+            error,
+        )
     })?;
     Ok(ReviewRunStore::new(storage.join("sessions")))
+}
+
+/// Test seam: the next review-state read fails.
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+static FAIL_REVIEW_STATE_READ: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Test seam: the next review-state read fails once.
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+pub fn fail_review_state_read_for_test() {
+    FAIL_REVIEW_STATE_READ.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
 /// Report a review run's current state from the store.
@@ -599,39 +744,76 @@ fn open_review_store() -> Result<ReviewRunStore, BridgeError> {
 /// This is the reply to a replayed `operation_id`: the recorded run is the
 /// single source of truth.
 ///
-/// A run whose `state.json` does not exist yet is NOT an error while this
-/// process is still supervising it — `run_review` creates the run directory on
-/// its own task, so a poll issued immediately after `review.run` returned can
-/// land inside that window. Once the run is no longer supervised here, a
-/// missing state means the run directory is gone (`libra review clean`) and is
-/// reported as an error rather than as a silent "not running".
+/// A run whose `state.json` does not exist yet is not an error: `run_review`
+/// creates the run directory on its own task, so a poll issued immediately
+/// after `review.run` returned can land inside that window, and a run owned by
+/// another bridge process is equally invisible from here. The answer is
+/// therefore "unknown" — the run may still be starting — never a silent "not
+/// running" and never an error that hides the recorded identity.
+///
+/// A read failure is a transient condition, not a verdict: it is reported as
+/// a retryable error so the caller can poll again.
 pub fn review_state(run_id: &str) -> Result<Value, BridgeError> {
     let store = open_review_store()?;
-    let state = store
-        .load_state(run_id)
-        .map_err(|e| BridgeError::internal(format!("review.run: cannot read run state: {e}")))?;
+    #[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+    if FAIL_REVIEW_STATE_READ.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        return Err(
+            BridgeError::internal("review.run: cannot read run state: details withheld")
+                .retryable(),
+        );
+    }
+    let state = store.load_state(run_id).map_err(|error| {
+        BridgeError::internal(format!(
+            "review.run: cannot read run state: {}",
+            withheld_detail(&error)
+        ))
+        .retryable()
+    })?;
     let Some(state) = state else {
         if supervisor::is_live(run_id) {
             return Ok(json!({
                 "run_id": run_id,
                 "state": "starting",
                 "terminal_state": Value::Null,
-                "running": true}));
+                "running": true,
+                "supervised": true,
+                "liveness": "live"}));
         }
-        return Err(BridgeError::internal(format!(
-            "review run '{run_id}' was recorded for this operation but its state is missing; \
-             it may have been removed with `libra review clean` — check `libra review list`"
-        )));
+        return Ok(json!({
+            "run_id": run_id,
+            "state": "unknown",
+            "terminal_state": Value::Null,
+            "running": Value::Null,
+            "supervised": false,
+            "liveness": "unknown"}));
     };
     let terminal = state.terminal_state.map(|t| t.as_str());
+    // The run's own record is the durable fact. Whether THIS process
+    // supervises the run is a per-process fact and is reported as such, so a
+    // run owned by another bridge process is never called stopped here.
+    let supervised = supervisor::is_live(run_id);
+    // Without a terminal state the run has not finished, but its liveness is
+    // only PROVEN while this process supervises it: another process may own a
+    // live run, and a crashed owner leaves a state that never finalizes. The
+    // answer is therefore "unknown" unless the liveness is established here.
+    let liveness = if supervised { "live" } else { "unknown" };
+    let running = if supervised && !state.is_terminal() {
+        json!(true)
+    } else if state.is_terminal() {
+        json!(false)
+    } else {
+        Value::Null
+    };
     Ok(json!({
         "run_id": state.run_id,
-        "state": terminal.unwrap_or("running"),
+        "state": terminal.unwrap_or(if supervised { "running" } else { "unknown" }),
+        "supervised": supervised,
+        "liveness": liveness,
         "target_scope": state.target_scope,
         "starting_sha": state.starting_sha,
         "agents": state.agents.iter().map(|a| a.slug.clone()).collect::<Vec<_>>(),
         "terminal_state": terminal,
-        "running": !state.is_terminal(),
+        "running": running,
         "cancel_requested": state.cancel_requested,
         "created_at": state.created_at,
         "updated_at": state.updated_at}))
@@ -653,7 +835,31 @@ pub fn review_state(run_id: &str) -> Result<Value, BridgeError> {
 /// # Returns
 ///
 /// `(run_id, state)` — the allocated run id and its state snapshot.
-pub async fn review_start(request: &ReviewRequest) -> Result<(String, Value), BridgeError> {
+/// A review run that was validated and admitted but not launched yet.
+///
+/// Preparing a run proves that the request is well formed and that the
+/// concurrency budget has room. Launching it is the point of no return: after
+/// that, a review is running and its identity must be recorded.
+pub struct PreparedReviewRun {
+    run_id: String,
+    store: ReviewRunStore,
+    run_request: ReviewRunRequest,
+    scope_label: String,
+    starting_sha_label: String,
+    agents: Vec<String>,
+    /// The admission slot, held for the run's lifetime.
+    slot: crate::internal::ai::run_admission::RunSlot,
+}
+
+impl PreparedReviewRun {
+    /// The identity the run will report once it is launched.
+    pub fn run_id(&self) -> &str {
+        &self.run_id
+    }
+}
+
+/// Validate and admit a review run without starting it.
+pub async fn review_prepare(request: &ReviewRequest) -> Result<PreparedReviewRun, BridgeError> {
     use crate::internal::ai::agent_run::AgentRunId;
 
     // Checkpoint scope is resolved BEFORE any run side effect: an unknown or
@@ -662,17 +868,17 @@ pub async fn review_start(request: &ReviewRequest) -> Result<(String, Value), Br
         Some(id) => Some(
             crate::command::agent::checkpoint::resolve_checkpoint_input_spec(id)
                 .await
-                .map_err(|e| {
+                .map_err(|error| {
                     BridgeError::invalid_params(format!(
-                        "review.run checkpoint '{id}' is not usable: {e}"
+                        "review.run checkpoint '{id}' is not usable: {}",
+                        withheld_detail(&error)
                     ))
                 })?,
         ),
         None => None,
     };
-    let repo_root: PathBuf = util::try_working_dir().map_err(|e| {
-        BridgeError::internal(format!("review.run is not inside a repository: {e}"))
-    })?;
+    let repo_root: PathBuf = util::try_working_dir()
+        .map_err(|e| internal_hiding_host_paths("review.run is not inside a repository", e))?;
     let starting_sha = Head::current_commit()
         .await
         .map(|oid| oid.to_string())
@@ -712,15 +918,20 @@ pub async fn review_start(request: &ReviewRequest) -> Result<(String, Value), Br
     // Run admission: the shared agent-run concurrency budget applies to bridge
     // runs exactly as it does to `libra review`. A full queue fails closed
     // rather than queueing past the request deadline.
-    let max_runs = run_admission::max_concurrent_runs().await.map_err(|e| {
-        BridgeError::internal(format!(
-            "review.run cannot resolve {}: {e}",
-            run_admission::MAX_CONCURRENT_RUNS_KEY
-        ))
-    })?;
+    let max_runs = run_admission::max_concurrent_runs()
+        .await
+        .map_err(|error| {
+            internal_hiding_host_paths(
+                &format!(
+                    "review.run cannot resolve {}",
+                    run_admission::MAX_CONCURRENT_RUNS_KEY
+                ),
+                error,
+            )
+        })?;
     let slot =
         match run_admission::try_admit(&store.runs_root(), max_runs, run_admission::RUN_QUEUE_CAP)
-            .map_err(|e| BridgeError::internal(format!("review.run admission failed: {e}")))?
+            .map_err(|error| internal_hiding_host_paths("review.run admission failed", error))?
         {
             run_admission::AdmissionOutcome::Admitted(slot) => slot,
             run_admission::AdmissionOutcome::Queued(_)
@@ -733,6 +944,28 @@ pub async fn review_start(request: &ReviewRequest) -> Result<(String, Value), Br
             }
         };
 
+    Ok(PreparedReviewRun {
+        run_id: run_id_str,
+        store,
+        run_request,
+        scope_label,
+        starting_sha_label,
+        agents: request.agents.clone(),
+        slot,
+    })
+}
+
+/// Start a prepared review run and report its identity.
+pub async fn review_launch(prepared: PreparedReviewRun) -> Result<(String, Value), BridgeError> {
+    let PreparedReviewRun {
+        run_id: run_id_str,
+        store,
+        run_request,
+        scope_label,
+        starting_sha_label,
+        agents,
+        slot,
+    } = prepared;
     let cancel = ReviewCancelHandle::new();
     supervisor::register(&run_id_str, cancel.clone());
     let supervised_id = run_id_str.clone();
@@ -764,16 +997,22 @@ pub async fn review_start(request: &ReviewRequest) -> Result<(String, Value), Br
     // the store: `run_review` creates the run directory on its own task, so a
     // store read here would race that creation. Subsequent polls (replaying the
     // same `operation_id`) go through `review_state` and see the real record.
+    // The reply reports the supervision that exists NOW: the task may already
+    // have finished or failed, so the launch is acknowledged as unverified
+    // unless this process still supervises the run.
+    let supervised = supervisor::is_live(&run_id_str);
     Ok((
         run_id_str.clone(),
         json!({
             "run_id": run_id_str,
-            "state": "starting",
+            "state": if supervised { "starting" } else { "unknown" },
             "target_scope": scope_label,
             "starting_sha": starting_sha_label,
-            "agents": request.agents,
+            "agents": agents,
             "terminal_state": Value::Null,
-            "running": true}),
+            "running": if supervised { json!(true) } else { Value::Null },
+            "supervised": supervised,
+            "liveness": if supervised { "live" } else { "unknown" }}),
     ))
 }
 
@@ -1019,10 +1258,127 @@ mod tests {
     }
 
     #[test]
+    fn diff_errors_do_not_keep_absolute_paths() {
+        for detail in [
+            "failed at '/private/My Repo/secret.txt'",
+            r"failed at C:\Users\Alice\secret.txt",
+            r"failed at \\server\share\secret.txt",
+        ] {
+            let error = internal_hiding_host_paths("commit.create", detail);
+            assert_eq!(error.message, "commit.create: details withheld");
+        }
+        let error = DiffError::FileRead {
+            path: r"C:\Users\Alice\secret.txt".to_string(),
+            detail: "read failed".to_string(),
+        };
+        let sanitized = map_diff_error(error);
+        assert_eq!(
+            sanitized.message,
+            "diff.get: diff service failed; details withheld"
+        );
+    }
+
+    #[test]
     fn head_fence_detects_drift() {
         let fence = Fence { head: None };
         assert!(check_head_fence(&fence, "").is_ok());
         let err = check_head_fence(&fence, "deadbeef").expect_err("drift");
         assert_eq!(err.stable_code, "LBR-AGENT-038");
+    }
+
+    #[cfg(unix)]
+    fn scratch_repo() -> tempfile::TempDir {
+        let repo = tempfile::tempdir().expect("temp repo");
+        std::fs::create_dir(repo.path().join(".libra")).expect("metadata dir");
+        std::fs::write(repo.path().join(".libra/libra.db"), b"").expect("metadata db");
+        repo
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial(cwd)]
+    fn spelling_refuses_symlink_ancestor_without_listing_outside() {
+        let repo = scratch_repo();
+        let outside = tempfile::tempdir().expect("outside dir");
+        let canary = "traversal-canary-9f3a";
+        std::fs::write(outside.path().join("OnlyOutsideSpelling.txt"), b"secret")
+            .expect("outside file");
+        std::fs::write(outside.path().join(canary), b"canary").expect("canary");
+        std::os::unix::fs::symlink(outside.path(), repo.path().join("escape")).expect("symlink");
+        let _cwd = crate::utils::test::ChangeDirGuard::new(repo.path());
+
+        let requested = "escape/onlyoutsidespelling.txt";
+        let error = canonicalize_existing_spelling(requested).expect_err("symlink ancestor");
+        assert!(
+            error.message.contains("symlink"),
+            "refusal must name the symlink policy, got {}",
+            error.message
+        );
+        assert!(
+            !error.message.contains(canary) && !error.message.contains("OnlyOutsideSpelling"),
+            "refusal must not reveal outside directory entries, got {}",
+            error.message
+        );
+
+        let params = Some(json!({ "paths": [requested] }));
+        let (_mode, paths) = parse_diff_params(&params).expect("lexical selector");
+        assert_eq!(paths, vec![requested.to_string()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial(cwd)]
+    fn spelling_preserves_distinct_case_and_symlink_leaf() {
+        let repo = scratch_repo();
+        let outside = tempfile::tempdir().expect("outside target");
+        let canary = "leaf-canary-9f3a";
+        std::fs::write(outside.path().join(canary), b"secret").expect("leaf target");
+        std::os::unix::fs::symlink(outside.path().join(canary), repo.path().join("leaf"))
+            .expect("leaf symlink");
+        std::fs::create_dir(repo.path().join("kept")).expect("dir");
+        std::fs::write(repo.path().join("kept/inside.txt"), b"inside").expect("file");
+        let insensitive = crate::utils::path_case::probe_dir_ignore_case(repo.path());
+        if !insensitive {
+            std::fs::write(repo.path().join("CaseName"), b"upper").expect("case a");
+            std::fs::write(repo.path().join("casename"), b"lower").expect("case b");
+        } else {
+            std::fs::write(repo.path().join("CaseName"), b"one").expect("case file");
+        }
+        let _cwd = crate::utils::test::ChangeDirGuard::new(repo.path());
+
+        assert_eq!(
+            canonicalize_existing_spelling("kept/inside.txt").expect("real file"),
+            "kept/inside.txt"
+        );
+        assert_eq!(
+            canonicalize_existing_spelling("leaf").expect("symlink leaf"),
+            "leaf"
+        );
+        let missing = canonicalize_existing_spelling("kept/new-file.txt").expect("missing");
+        assert_eq!(missing, "kept/new-file.txt");
+        assert!(!missing.contains(canary));
+
+        if insensitive {
+            assert_eq!(
+                canonicalize_existing_spelling("casename").expect("folded lookup"),
+                "casename"
+            );
+        } else {
+            assert_eq!(
+                canonicalize_existing_spelling("CaseName").expect("exact upper"),
+                "CaseName"
+            );
+            assert_eq!(
+                canonicalize_existing_spelling("casename").expect("exact lower"),
+                "casename"
+            );
+            assert_eq!(
+                canonicalize_existing_spelling("CASENAME").expect("absent case"),
+                "CASENAME"
+            );
+        }
+        let through_file =
+            canonicalize_existing_spelling("kept/inside.txt/child").expect_err("non-directory");
+        assert!(through_file.message.contains("non-directory"));
     }
 }

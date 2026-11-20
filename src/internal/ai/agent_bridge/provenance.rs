@@ -123,7 +123,12 @@ pub async fn record_links(
             now_ms,
         )
         .await
-        .map_err(|e| BridgeError::internal(format!("record provenance link: {e}")))?;
+        .map_err(|error| {
+            crate::internal::ai::agent_bridge::vcs::internal_hiding_host_paths(
+                "record provenance link",
+                error,
+            )
+        })?;
         match outcome {
             storage::LinkOutcome::Inserted | storage::LinkOutcome::Existing => {}
             storage::LinkOutcome::Conflict { stored_target_id } => {
@@ -163,7 +168,12 @@ pub async fn trusted_session_scope(
     let session_id = require_param_str(&request.params, "session_id")?;
     let row = storage::get_session(&ctx.conn, &session_id)
         .await
-        .map_err(|e| BridgeError::internal(format!("load bridge session: {e}")))?
+        .map_err(|error| {
+            crate::internal::ai::agent_bridge::vcs::internal_hiding_host_paths(
+                "load bridge session",
+                error,
+            )
+        })?
         .ok_or_else(|| {
             BridgeError::scope_mismatch(format!(
                 "bridge session '{session_id}' is not open in this repository; open it first"

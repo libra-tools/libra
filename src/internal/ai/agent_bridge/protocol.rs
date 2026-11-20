@@ -81,6 +81,12 @@ pub const METHOD_ALLOWLIST: &[&str] = &[
     "workspace.claim",
     "workspace.renew",
     "workspace.release",
+    // Typed repository reads (LVC-02): protocol minor 1.
+    "vcs.identity",
+    "vcs.status",
+    "vcs.diff",
+    "vcs.log",
+    "vcs.show",
 ];
 
 /// The allowlist as an efficient set for O(1) membership checks.
@@ -230,7 +236,9 @@ pub mod code {
     /// A request did not complete within its deadline.
     pub const TIMEOUT: i64 = 1010;
     /// A mutation's pre-checked fence (HEAD / index / worktree) drifted, so the
-    /// operation was refused before any write.
+    /// operation was refused before the index, commit or ref publication it
+    /// would have performed. A preparation step may already have stored
+    /// content objects.
     pub const STALE_FENCE: i64 = 1011;
 }
 
@@ -384,8 +392,10 @@ impl BridgeError {
 
     /// A mutation's pre-checked fence drifted between admission and execution:
     /// HEAD moved, or the index/worktree is dirty when the operation requires a
-    /// clean one (LB-05). Fail-closed **before** any write, so nothing is
-    /// partially applied. Not retryable as-is: the caller must re-read the
+    /// clean one (LB-05). Fail-closed **before** the index, commit or ref
+    /// publication the operation would perform, so a refused operation never
+    /// published one. A preparation step may still have stored content objects
+    /// before a late refusal. Not retryable as-is: the caller must re-read the
     /// current state and re-issue with a fresh fence.
     pub fn stale_fence(message: impl Into<String>) -> Self {
         Self::new(code::STALE_FENCE, "LBR-AGENT-038", message).resource("worktree")
@@ -547,8 +557,8 @@ pub fn dispatch_handshake(request: &BridgeRequest) -> Result<Option<BridgeRespon
                     .collect(),
                 source: SOURCE_DEEPSEEK_HARNESS,
             };
-            let result = serde_json::to_value(capability).map_err(|e| {
-                BridgeError::internal(format!("failed to serialize capability: {e}"))
+            let result = serde_json::to_value(capability).map_err(|_error| {
+                BridgeError::internal("failed to serialize capability: details withheld")
             })?;
             let id = request.id.clone().unwrap_or(Value::Null);
             Ok(Some(BridgeResponse {
@@ -570,8 +580,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn allowlist_has_exactly_20_methods() {
-        assert_eq!(METHOD_ALLOWLIST.len(), 20);
+    fn allowlist_has_exactly_25_methods() {
+        assert_eq!(METHOD_ALLOWLIST.len(), 25);
         assert_eq!(PROTOCOL_MINOR, 2);
         // The four handshake/session/ingress methods, projection, reads,
         // mutation and workspace groups must all be present.
@@ -596,6 +606,11 @@ mod tests {
             "workspace.claim",
             "workspace.renew",
             "workspace.release",
+            "vcs.identity",
+            "vcs.status",
+            "vcs.diff",
+            "vcs.log",
+            "vcs.show",
         ] {
             assert!(
                 MethodAllowlist::contains(m),

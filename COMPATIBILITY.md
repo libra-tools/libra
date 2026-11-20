@@ -2008,4 +2008,20 @@ Codex acceptance cases remain local-only (`test-live-agent` plus `ignored`).
 
 ## DeepSeek Harness bridge read methods (LVC-02)
 
-Protocol major stays 1. Experimental `vcs.*` methods, including `vcs.fence`, are not advertised or accepted pending safety corrections. `status.get` remains bridge session/event/checkpoint telemetry, not worktree status; `commit.create` retains its existing contract.
+Protocol major stays 1. The five typed repository reads are additive protocol minor 1 methods: `vcs.identity`, `vcs.status`, `vcs.diff`, `vcs.log` and `vcs.show` are in the current 25-method allowlist and are advertised to a peer that negotiated minor 1 or higher. A peer that negotiated an older minor does not see them and cannot invoke them; `vcs.fence` remains disabled, and the typed write methods stay disabled until LVC-06.
+
+The read contract is bounded and repository-scoped: `vcs.identity` returns stable repository identity and HEAD fields without an absolute path; `vcs.status` returns paginated staged, unstaged, untracked, conflict and rename states; `vcs.diff` uses validated relative paths and reports truncation; `vcs.log` and `vcs.show` return paginated history and commit detail. Values come from Libra core services, never direct SQL, shell text parsing or an external `git` process. Errors that could carry host paths withhold their underlying detail.
+
+`status.get` remains bridge session/event/checkpoint telemetry, not worktree status; `commit.create` retains its existing contract.
+
+## DeepSeek Harness bridge write methods (LVC-06)
+
+The typed repository writes are being prepared as protocol minor 2 methods, but remain disabled and absent from the current allowlist until implementation review and LVC-06 completion. They are not advertised or accepted in this source build.
+
+The intended write contract, once LVC-06 is reviewed and enabled, is:
+
+- Each write names literal repository-relative paths, an `operation_id`, and the HEAD/index/worktree fence the caller observed. A stale fence returns `LBR-AGENT-038` before the index, commit or ref publication the operation would perform; a preparation step may still have stored content objects before that refusal.
+- A single cross-process bridge write claim protects execution and reconciliation, including commit hooks; the separate maintenance lock protects publication and is shared with supported Libra index writers for their whole command. A writer that ignores Libra's lock is outside the protocol; the bridge compares the index before replacing it and verifies the published bytes afterwards, without claiming a conditional filesystem replace.
+- Staging publishes the content captured at admission, like ordinary `libra add`. A later edit is detected by the next fence read, not by the stage itself.
+- An unsupported content filter (Git LFS or any other `filter=`) is refused before any blob is stored, with a fixed path-free error.
+- Each write records what it published in the repository database (`agent_bridge_index_publication`, `agent_bridge_publication`), so a replay reports the recorded outcome instead of guessing. An outcome that cannot be established is reported as explicitly indeterminate and is never run again.

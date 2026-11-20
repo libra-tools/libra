@@ -21,7 +21,7 @@ use std::{
 
 mod entry_identity;
 pub(crate) use entry_identity::{
-    EntryIdentity, EntryIdentityKey, EntryKind, entry_identity_beneath,
+    EntryIdentity, EntryIdentityKey, EntryKind, entry_identity_beneath, identity_for_file,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -254,6 +254,15 @@ pub fn open_beneath(root: &fs::File, rel: &Path) -> io::Result<fs::File> {
     open_beneath_platform(root, rel)
 }
 
+/// Whether `left` and `right` are the same directory entry, without following
+/// a symlink at either path. Ancestor symlinks are not followed: the walk uses
+/// the no-follow beneath open.
+pub fn same_nofollow_entry(root: &fs::File, left: &Path, right: &Path) -> io::Result<bool> {
+    let left = nofollow_identity(root, left)?;
+    let right = nofollow_identity(root, right)?;
+    Ok(left == right)
+}
+
 /// `lstat` of `rel` beneath `root` (final component may be a symlink leaf).
 pub fn lstat_beneath(root: &fs::File, rel: &Path) -> io::Result<RawLstat> {
     if rel.is_absolute() {
@@ -273,6 +282,19 @@ pub fn lstat_beneath(root: &fs::File, rel: &Path) -> io::Result<RawLstat> {
 /// symlink. The returned descriptor, rather than the pathname, is the source
 /// for all subsequent reads so a rename/replacement cannot redirect them.
 pub fn open_file_beneath(root: &fs::File, rel: &Path) -> io::Result<fs::File> {
+    open_file_beneath_with_nonblocking(root, rel, false)
+}
+
+/// Open a regular file without blocking on a special-file replacement.
+pub(crate) fn open_file_beneath_nonblocking(root: &fs::File, rel: &Path) -> io::Result<fs::File> {
+    open_file_beneath_with_nonblocking(root, rel, true)
+}
+
+fn open_file_beneath_with_nonblocking(
+    root: &fs::File,
+    rel: &Path,
+    nonblocking: bool,
+) -> io::Result<fs::File> {
     if rel.is_absolute() || is_root_rel(rel) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -291,7 +313,7 @@ pub fn open_file_beneath(root: &fs::File, rel: &Path) -> io::Result<fs::File> {
         Some(parent) => open_beneath(root, parent)?,
         None => dup_file(root)?,
     };
-    open_file_in_dir(&directory, name, root)
+    open_file_in_dir(&directory, name, root, nonblocking)
 }
 
 /// Read a regular file beneath an already-pinned root. This is used for
@@ -356,6 +378,7 @@ fn open_file_in_dir(
     directory: &fs::File,
     name: &std::ffi::OsStr,
     root: &fs::File,
+    nonblocking: bool,
 ) -> io::Result<fs::File> {
     #[cfg(unix)]
     {
@@ -367,7 +390,10 @@ fn open_file_in_dir(
             libc::openat(
                 directory.as_raw_fd(),
                 c_name.as_ptr(),
-                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                libc::O_RDONLY
+                    | libc::O_NOFOLLOW
+                    | libc::O_CLOEXEC
+                    | if nonblocking { libc::O_NONBLOCK } else { 0 },
             )
         };
         if fd < 0 {
@@ -388,6 +414,7 @@ fn open_file_in_dir(
 
         use windows_sys::Win32::Foundation::HANDLE;
 
+        let _ = nonblocking;
         let root_path = final_path_name(root.as_raw_handle() as HANDLE)?;
         let directory_path = final_path_name(directory.as_raw_handle() as HANDLE)?;
         let file = open_windows_nofollow(&directory_path.join(name), false, false, true)?;
@@ -402,7 +429,7 @@ fn open_file_in_dir(
     }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = (directory, name, root);
+        let _ = (directory, name, root, nonblocking);
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "beneath file open unsupported on this platform",
@@ -1665,6 +1692,38 @@ fn path_starts_with_windows(candidate: &Path, root: &Path) -> bool {
     }
     candidate.as_bytes().get(root.len()) == Some(&b'\\')
         || candidate.as_bytes().get(root.len()) == Some(&b'/')
+}
+
+fn nofollow_identity(root: &fs::File, rel: &Path) -> io::Result<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        let stat = stat_nofollow(root, rel)?;
+        Ok((stat.st_dev as u64, stat.st_ino as u64))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (root, rel);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "nofollow identity is unavailable on this platform",
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn stat_nofollow(root: &fs::File, rel: &Path) -> io::Result<libc::stat> {
+    let parent = rel.parent().filter(|parent| !is_root_rel(parent));
+    let name = rel.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "beneath lstat missing file name",
+        )
+    })?;
+    let dir = match parent {
+        Some(parent) => open_beneath_platform(root, parent)?,
+        None => dup_file(root)?,
+    };
+    fstatat_value(&dir, name)
 }
 
 #[cfg(unix)]

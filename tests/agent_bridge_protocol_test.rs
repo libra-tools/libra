@@ -12,10 +12,10 @@ use libra::internal::ai::agent_bridge::protocol::{
 };
 
 #[test]
-fn protocol_v1_allowlist_is_exactly_20_methods() {
+fn protocol_v1_allowlist_is_exactly_25_methods() {
     assert_eq!(
         libra::internal::ai::agent_bridge::protocol::METHOD_ALLOWLIST.len(),
-        20
+        25
     );
     assert_eq!(
         libra::internal::ai::agent_bridge::protocol::ProtocolVersion::current().minor,
@@ -23,9 +23,24 @@ fn protocol_v1_allowlist_is_exactly_20_methods() {
     );
 }
 
+/// The typed repository reads are negotiated: a peer that negotiated minor 1
+/// or higher sees them, an older peer does not, and the write methods stay
+/// disabled until LVC-06.
 #[test]
-fn unsafe_experimental_vcs_methods_are_neither_advertised_nor_accepted() {
-    use libra::internal::ai::agent_bridge::protocol::{dispatch_handshake, validate_method};
+fn typed_vcs_reads_are_negotiated_and_writes_stay_disabled() {
+    use libra::internal::ai::agent_bridge::protocol::{
+        admit_for_minor, dispatch_handshake, validate_method,
+    };
+
+    let reads = [
+        "vcs.identity",
+        "vcs.status",
+        "vcs.diff",
+        "vcs.log",
+        "vcs.show",
+    ];
+    let writes = ["vcs.stage", "vcs.unstage", "vcs.commit"];
+
     let request = parse_request_line(r#"{"jsonrpc":"2.0","method":"initialize","params":{"protocol":{"major":1,"minor":2}},"id":1}"#).expect("request");
     let result = dispatch_handshake(&request)
         .expect("handshake")
@@ -33,17 +48,16 @@ fn unsafe_experimental_vcs_methods_are_neither_advertised_nor_accepted() {
         .result
         .expect("result");
     let advertised = result["methods"].as_array().expect("methods");
-    for method in [
-        "vcs.fence",
-        "vcs.identity",
-        "vcs.status",
-        "vcs.diff",
-        "vcs.log",
-        "vcs.show",
-        "vcs.stage",
-        "vcs.unstage",
-        "vcs.commit",
-    ] {
+    for method in reads {
+        assert!(
+            advertised
+                .iter()
+                .any(|entry| entry.as_str() == Some(method)),
+            "not advertised {method}"
+        );
+        assert!(validate_method(method).is_ok(), "not accepted {method}");
+    }
+    for method in writes {
         assert!(
             !advertised
                 .iter()
@@ -51,6 +65,35 @@ fn unsafe_experimental_vcs_methods_are_neither_advertised_nor_accepted() {
             "advertised {method}"
         );
         assert!(validate_method(method).is_err(), "accepted {method}");
+    }
+    assert!(
+        !advertised
+            .iter()
+            .any(|entry| entry.as_str() == Some("vcs.fence")),
+        "advertised vcs.fence"
+    );
+    assert!(validate_method("vcs.fence").is_err());
+
+    // A peer that negotiated minor 0 does not see the typed reads and cannot
+    // invoke them.
+    let old = parse_request_line(r#"{"jsonrpc":"2.0","method":"initialize","params":{"protocol":{"major":1,"minor":0}},"id":1}"#).expect("request");
+    let old_result = dispatch_handshake(&old)
+        .expect("handshake")
+        .expect("response")
+        .result
+        .expect("result");
+    let old_advertised = old_result["methods"].as_array().expect("methods");
+    for method in reads {
+        assert!(
+            !old_advertised
+                .iter()
+                .any(|entry| entry.as_str() == Some(method)),
+            "advertised {method} to a minor 0 peer"
+        );
+        assert!(
+            admit_for_minor(0, method).is_err(),
+            "admitted {method} for a minor 0 peer"
+        );
     }
     assert!(validate_method("status.get").is_ok());
 }

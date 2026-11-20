@@ -63,16 +63,35 @@ impl Approval {
                 "approval must be an object { decision, approver? }",
             )));
         }
-        let decision = approval.get("decision")?.as_str()?.to_string();
+        // A present approval must be complete: a missing or non-string
+        // decision is a malformed request, not an absent approval. Reporting
+        // it as absent would let the request be recorded and denied, so the
+        // corrected retry would collide with the recorded payload.
+        let Some(decision) = approval.get("decision").and_then(serde_json::Value::as_str) else {
+            return Some(Err(BridgeError::invalid_params(
+                "approval.decision must be the string 'approved' or 'denied'",
+            )));
+        };
+        let decision = decision.to_string();
         if decision != "approved" && decision != "denied" {
             return Some(Err(BridgeError::invalid_params(format!(
                 "approval.decision must be 'approved' or 'denied', got '{decision}'"
             ))));
         }
-        let approver = approval
-            .get("approver")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string);
+        // A present approver must be a string: a malformed approver is a
+        // malformed request, not an absent one, and its audit identity must
+        // not be silently dropped.
+        let approver = match approval.get("approver") {
+            None => None,
+            Some(value) => match value.as_str() {
+                Some(approver) => Some(approver.to_string()),
+                None => {
+                    return Some(Err(BridgeError::invalid_params(
+                        "approval.approver must be a string when present",
+                    )));
+                }
+            },
+        };
         Some(Ok(Approval { decision, approver }))
     }
 }

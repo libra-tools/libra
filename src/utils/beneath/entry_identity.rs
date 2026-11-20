@@ -64,7 +64,7 @@ fn entry_kind(stat: &RawLstat) -> EntryKind {
 }
 
 #[cfg(unix)]
-fn identity_for_file(file: &fs::File) -> io::Result<EntryIdentity> {
+pub(crate) fn identity_for_file(file: &fs::File) -> io::Result<EntryIdentity> {
     use std::os::unix::fs::MetadataExt;
 
     let metadata = file.metadata()?;
@@ -121,7 +121,7 @@ fn identity_in_directory(
 }
 
 #[cfg(windows)]
-fn identity_for_file(file: &fs::File) -> io::Result<EntryIdentity> {
+pub(crate) fn identity_for_file(file: &fs::File) -> io::Result<EntryIdentity> {
     use std::os::windows::io::AsRawHandle;
 
     use windows_sys::Win32::{

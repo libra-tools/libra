@@ -370,6 +370,9 @@ pub enum CommitError {
     #[error("failed to load parent commit '{commit_id}': {detail}")]
     ParentCommitLoad { commit_id: String, detail: String },
 
+    #[error("repository state changed before bridge publication")]
+    BridgeFenceChanged,
+
     #[error("failed to update HEAD: {0}")]
     HeadUpdate(String),
 
@@ -547,6 +550,8 @@ impl From<CommitError> for CliError {
             // the user has a next step; everything else here is a write
             // fault. The predicate belongs to the storage layer, so this
             // boundary asks it rather than matching on the message itself.
+            CommitError::BridgeFenceChanged => CliError::failure(error.to_string())
+                .with_stable_code(StableErrorCode::RepoStateInvalid),
             CommitError::HeadUpdate(..) => {
                 crate::internal::branch::checked_out_elsewhere_cli_error(&error).unwrap_or_else(
                     || {
@@ -1343,9 +1348,6 @@ async fn run_commit_with_index(
     let (agent_trailer_enabled, agent_config_warning) = agent_commit_trailer_enabled().await?;
     let agent_trailer_enabled = agent_trailer_enabled && !dry_run;
 
-    // Create tree
-    let tree = create_tree_with_persistence(&index, &storage, "".into(), !dry_run).await?;
-
     // Create author and committer signatures
     let reuse_author = load_reused_commit_author(&args).await?;
     let (mut author, committer, committer_identity) =
@@ -1447,16 +1449,6 @@ async fn run_commit_with_index(
         {
             commit_message = append_agent_session_trailers(&commit_message, &snapshot.session_ids);
         }
-        let mut committer = committer;
-        refresh_noop_amend_committer_timestamp(
-            &parent_commit,
-            &author,
-            &mut committer,
-            &tree.id,
-            &grandpa_commit_id,
-            &commit_message,
-        );
-
         // Conventional commit validation
         if is_conventional
             && !skip_conventional_check
@@ -1466,6 +1458,22 @@ async fn run_commit_with_index(
                 "commit message does not follow conventional commits".to_string(),
             ));
         }
+
+        let bridge_publish_lock = if dry_run {
+            None
+        } else {
+            acquire_bridge_commit_publish_lock().await?
+        };
+        let tree = create_tree_with_persistence(&index, &storage, "".into(), !dry_run).await?;
+        let mut committer = committer;
+        refresh_noop_amend_committer_timestamp(
+            &parent_commit,
+            &author,
+            &mut committer,
+            &tree.id,
+            &grandpa_commit_id,
+            &commit_message,
+        );
 
         if dry_run {
             let commit = Commit::new(
@@ -1543,6 +1551,7 @@ async fn run_commit_with_index(
             journal_snapshot,
         )
         .await?;
+        drop(bridge_publish_lock);
         sequence_warnings.extend(agent_config_warning);
         if let Some(snapshot) = &agent_snapshot
             && let Err(error) =
@@ -1646,6 +1655,13 @@ async fn run_commit_with_index(
         ));
     }
 
+    let bridge_publish_lock = if dry_run {
+        None
+    } else {
+        acquire_bridge_commit_publish_lock().await?
+    };
+    let tree = create_tree_with_persistence(&index, &storage, "".into(), !dry_run).await?;
+
     if dry_run {
         let commit = Commit::new(
             author,
@@ -1728,6 +1744,7 @@ async fn run_commit_with_index(
         journal_snapshot,
     )
     .await?;
+    drop(bridge_publish_lock);
     sequence_warnings.extend(agent_config_warning);
     if let Some(snapshot) = &agent_snapshot
         && let Err(error) = crate::internal::ai::history::link_authorized_agent_sessions_to_commit(
@@ -2809,6 +2826,20 @@ async fn snapshot_stopped_sequences() -> StoppedSequences {
     }
 }
 
+/// Acquire the bridge publication lock after all commit hooks have completed,
+/// and recheck the admitted repository fence before writing tree/object/ref state.
+async fn acquire_bridge_commit_publish_lock()
+-> Result<Option<crate::internal::maintenance_lock::MaintenanceLock>, CommitError> {
+    match crate::internal::ai::agent_bridge::vcs_write::acquire_commit_publish_lock().await {
+        Ok(lock) => Ok(lock),
+        Err(error) if error.stable_code == "LBR-AGENT-038" => Err(CommitError::BridgeFenceChanged),
+        Err(error) => Err(CommitError::HeadUpdate(format!(
+            "cannot acquire bridge commit publication lock: {}",
+            error.message
+        ))),
+    }
+}
+
 /// Persist the commit object, move HEAD, then conclude a stopped cherry-pick
 /// or revert. The snapshot is taken before those writes.
 async fn persist_commit_and_conclude_stopped(
@@ -2821,6 +2852,9 @@ async fn persist_commit_and_conclude_stopped(
     let stopped = snapshot_stopped_sequences().await;
     let stopped_merge = crate::command::merge::snapshot_stopped_merge();
     save_commit_object(storage, commit)?;
+    crate::internal::ai::agent_bridge::publication::prepare_current(&commit.id.to_string())
+        .await
+        .map_err(CommitError::HeadUpdate)?;
     update_head_and_reflog(
         &commit.id.to_string(),
         commit_message,
@@ -4023,6 +4057,77 @@ async fn mark_agent_journal_linked(
     Ok(())
 }
 
+/// Refuse prepared-commit recovery when completing the ref update could also
+/// require clearing sequence state whose original snapshot was not persisted.
+pub(crate) async fn ensure_bridge_prepared_recovery_has_no_sequences() -> Result<(), String> {
+    let stopped = snapshot_stopped_sequences().await;
+    if stopped
+        .cherry_pick
+        .map_err(|error| format!("cannot inspect cherry-pick state: {error}"))?
+        .is_some()
+    {
+        return Err("a cherry-pick sequence is active".to_string());
+    }
+    if stopped
+        .revert
+        .map_err(|error| format!("cannot inspect revert state: {error}"))?
+        .is_some()
+    {
+        return Err("a revert sequence is active".to_string());
+    }
+    if crate::command::merge::snapshot_stopped_merge()
+        .map_err(|error| format!("cannot inspect merge state: {error}"))?
+        .is_some()
+    {
+        return Err("a merge sequence is active".to_string());
+    }
+    if crate::command::merge::load_squash_message()
+        .map_err(|error| format!("cannot inspect squash state: {error}"))?
+        .is_some()
+    {
+        return Err("a squash sequence is active".to_string());
+    }
+    Ok(())
+}
+
+/// Publish a bridge commit object left in the durable `prepared` phase after
+/// its original publisher stopped. The bridge caller must first acquire the
+/// repository's exclusive publication lock; the ref transaction then verifies
+/// both the prepared operation binding and its admitted HEAD before publishing.
+pub(crate) async fn resume_prepared_bridge_commit(
+    commit_id: &str,
+    commit_message: &str,
+) -> Result<(), CommitError> {
+    use crate::utils::object_ext::CommitExt;
+
+    let oid = crate::internal::object_format::parse_repo_oid(commit_id)
+        .map_err(|error| CommitError::HeadUpdate(format!("invalid prepared commit id: {error}")))?;
+    let commit = Commit::load(&oid).map_err(|error| {
+        CommitError::HeadUpdate(format!("prepared commit is unreadable: {error}"))
+    })?;
+    if commit.id != oid {
+        return Err(CommitError::HeadUpdate(
+            "prepared commit object id does not match its publication record".to_string(),
+        ));
+    }
+    let parent = commit
+        .parent_commit_ids
+        .first()
+        .map(ToString::to_string)
+        .unwrap_or_default();
+    let current = Head::current_commit_result()
+        .await
+        .map_err(|error| {
+            CommitError::HeadUpdate(format!("cannot read HEAD for recovery: {error}"))
+        })?
+        .map(|head| head.to_string())
+        .unwrap_or_default();
+    if parent != current {
+        return Err(CommitError::BridgeFenceChanged);
+    }
+    update_head_and_reflog(commit_id, commit_message, None).await
+}
+
 async fn update_head_and_reflog(
     commit_id: &str,
     commit_message: &str,
@@ -4050,15 +4155,69 @@ async fn update_head_and_reflog(
                             "agent commit journal could not be durably written before ref update: {error:#}"
                         )))?;
                 }
+                crate::internal::ai::agent_bridge::publication::check_expected_head_in_txn(txn).await?;
+                if let Some(prepared) =
+                    crate::internal::ai::agent_bridge::publication::prepared_oid_in_txn(txn).await?
+                    && prepared != commit_id
+                {
+                    return Err(sea_orm::DbErr::Custom(format!(
+                        "bridge operation prepared commit {prepared}, not {commit_id}; the ref was not moved"
+                    )));
+                }
+                if let Some(prepared) =
+                    crate::internal::ai::agent_bridge::publication::prepared_oid_in_txn(txn).await?
+                {
+                    use crate::utils::object_ext::CommitExt;
+                    let loaded = git_internal::internal::object::commit::Commit::load(
+                        &crate::internal::object_format::parse_repo_oid(&prepared).map_err(|error| {
+                            sea_orm::DbErr::Custom(format!(
+                                "prepared commit id is invalid: {error}"
+                            ))
+                        })?,
+                    )
+                    .map_err(|error| {
+                        sea_orm::DbErr::Custom(format!("prepared commit could not be read: {error}"))
+                    })?;
+                    let parent = loaded
+                        .parent_commit_ids
+                        .first()
+                        .map(|oid| oid.to_string())
+                        .unwrap_or_default();
+                    let head = crate::internal::head::Head::current_commit_result_with_conn(txn)
+                        .await
+                        .map_err(|error| {
+                            sea_orm::DbErr::Custom(format!(
+                                "prepared commit could not read HEAD: {error}"
+                            ))
+                        })?
+                        .map(|oid| oid.to_string())
+                        .unwrap_or_default();
+                    if parent != head {
+                        return Err(sea_orm::DbErr::Custom(
+                            "prepared commit parent is not current HEAD; the ref was not moved"
+                                .to_string(),
+                        ));
+                    }
+                }
                 update_head(txn, &commit_id)
                     .await
-                    .map_err(|e| sea_orm::DbErr::Custom(e.to_string()))
+                    .map_err(|e| sea_orm::DbErr::Custom(e.to_string()))?;
+                // Bridge publications bind the operation id in this same
+                // transaction. Ordinary commits have no scope and do nothing.
+                crate::internal::ai::agent_bridge::publication::bind_in_txn(txn, &commit_id).await
             })
         },
         true,
     )
     .await
-    .map_err(|e| CommitError::HeadUpdate(format!("failed to update reflog: {}", e)))
+    .map_err(|error| match error {
+        crate::internal::reflog::ReflogError::DatabaseError(sea_orm::DbErr::Custom(ref message))
+            if message == crate::internal::ai::agent_bridge::publication::STALE_HEAD_MARKER =>
+        {
+            CommitError::BridgeFenceChanged
+        }
+        other => CommitError::HeadUpdate(format!("failed to update reflog: {other}")),
+    })
 }
 
 async fn new_reflog_context(commit_id: &str, message: &str) -> ReflogContext {

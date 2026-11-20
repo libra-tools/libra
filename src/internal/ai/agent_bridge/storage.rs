@@ -396,10 +396,35 @@ pub async fn contiguous_acked_seq<C: ConnectionTrait>(
 // Operation registry (idempotent by operation_id + digest conflict)
 // ---------------------------------------------------------------------------
 
+/// The current durable result of an operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperationResult {
+    /// The method the operation was first recorded with.
+    pub method: String,
+    /// Current operation row status.
+    pub status: String,
+    /// Result payload or raw replay identity.
+    pub result_digest: Option<String>,
+    /// Whether the result is an immutable terminal outcome.
+    pub terminal_outcome: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExistingOperation {
+    /// The method the first request used.
+    pub method: String,
+    /// The digest of the first request's parameters.
+    pub params_digest: String,
+    /// The session the first request came from.
+    pub bridge_session_id: String,
+    /// The repository the first request was bound to.
+    pub repository_id: String,
+}
+
 /// Record a bridge operation. Returns `Ok((true, None))` on insert, or
-/// `Ok((false, Some(existing_digest)))` when the same `operation_id` was
-/// already recorded (the caller compares digests to decide replay vs
-/// conflict).
+/// `Ok((false, Some(existing)))` when the same `operation_id` was already
+/// recorded (the caller compares the method, scope and digest to decide
+/// replay vs conflict).
 // Explicit scope parameters as in `open_session` (GC-LB-06).
 #[allow(clippy::too_many_arguments)]
 pub async fn upsert_operation<C: ConnectionTrait>(
@@ -411,7 +436,7 @@ pub async fn upsert_operation<C: ConnectionTrait>(
     repository_id: &str,
     workspace_id: Option<&str>,
     now_ms: i64,
-) -> Result<(bool, Option<String>), DbErr> {
+) -> Result<(bool, Option<ExistingOperation>), DbErr> {
     let insert = Statement::from_sql_and_values(
         DatabaseBackend::Sqlite,
         "INSERT INTO agent_bridge_operation \
@@ -435,29 +460,38 @@ pub async fn upsert_operation<C: ConnectionTrait>(
     }
     let stmt = Statement::from_sql_and_values(
         DatabaseBackend::Sqlite,
-        "SELECT params_digest FROM agent_bridge_operation WHERE operation_id = ?",
+        "SELECT method, params_digest, bridge_session_id, repository_id \
+         FROM agent_bridge_operation WHERE operation_id = ?",
         [operation_id.into()],
     );
     let rows = conn.query_all_raw(stmt).await?;
-    let existing = rows
-        .into_iter()
-        .next()
-        .and_then(|r| r.try_get::<String>("", "params_digest").ok());
+    let existing = rows.into_iter().next().and_then(|row| {
+        Some(ExistingOperation {
+            method: row.try_get::<String>("", "method").ok()?,
+            params_digest: row.try_get::<String>("", "params_digest").ok()?,
+            bridge_session_id: row.try_get::<String>("", "bridge_session_id").ok()?,
+            repository_id: row.try_get::<String>("", "repository_id").ok()?,
+        })
+    });
     Ok((false, existing))
 }
 
-/// Mark an operation applied (with its result digest) or failed.
-pub async fn finish_operation<C: ConnectionTrait>(
+/// Mark an operation that never started, without touching a row that already
+/// carries an intent or a result.
+///
+/// The statement is conditional, so a refusal recorded by one request cannot
+/// erase the intent or the success another request recorded meanwhile.
+pub async fn finish_operation_if_not_started<C: ConnectionTrait>(
     conn: &C,
     operation_id: &str,
     status: &str,
     result_digest: Option<&str>,
     now_ms: i64,
-) -> Result<(), DbErr> {
+) -> Result<bool, DbErr> {
     let stmt = Statement::from_sql_and_values(
         DatabaseBackend::Sqlite,
         "UPDATE agent_bridge_operation SET status = ?, result_digest = ?, completed_at = ? \
-         WHERE operation_id = ?",
+         WHERE operation_id = ? AND status = 'pending' AND result_digest IS NULL",
         [
             status.into(),
             result_digest
@@ -467,27 +501,94 @@ pub async fn finish_operation<C: ConnectionTrait>(
             operation_id.into(),
         ],
     );
-    conn.execute_raw(stmt).await?;
-    Ok(())
+    let result = conn.execute_raw(stmt).await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// Mark an operation applied unless a terminal outcome was already recorded.
+///
+/// Terminal records are typed JSON outcomes produced only by the listed
+/// non-idempotent VCS methods. `checkpoint.create` stores a caller-provided raw
+/// checkpoint ID, so it is deliberately excluded from marker recognition.
+pub async fn finish_operation_unless_terminal<C: ConnectionTrait>(
+    conn: &C,
+    operation_id: &str,
+    status: &str,
+    result_digest: Option<&str>,
+    now_ms: i64,
+) -> Result<bool, DbErr> {
+    let stmt = Statement::from_sql_and_values(
+        DatabaseBackend::Sqlite,
+        "UPDATE agent_bridge_operation SET status = ?, result_digest = ?, completed_at = ? \
+         WHERE operation_id = ? AND NOT (
+             method IN ('commit.create', 'checkpoint.restore', 'review.run', \
+                        'vcs.stage', 'vcs.unstage', 'vcs.commit') \
+             AND CASE WHEN json_valid(result_digest) THEN \
+                 json_type(result_digest, '$.vcsWriteOutcome') IS NOT NULL \
+                 ELSE 0 END)",
+        [
+            status.into(),
+            result_digest
+                .map(Value::from)
+                .unwrap_or(Value::String(None)),
+            now_ms.into(),
+            operation_id.into(),
+        ],
+    );
+    let result = conn.execute_raw(stmt).await?;
+    Ok(result.rows_affected() > 0)
 }
 
 /// Mark an operation failed without erasing a result that was already published.
+///
+/// Two states are final and are never downgraded: an applied operation (a
+/// later failure in optional bookkeeping, such as an association link, must
+/// not hide the published result) and a recorded terminal outcome (the
+/// operation already has its final answer).
 pub async fn fail_operation_keep_result<C: ConnectionTrait>(
     conn: &C,
     operation_id: &str,
     now_ms: i64,
-) -> Result<(), DbErr> {
+) -> Result<bool, DbErr> {
     let stmt = Statement::from_sql_and_values(
         DatabaseBackend::Sqlite,
         "UPDATE agent_bridge_operation SET status = 'failed', completed_at = ? \
-         WHERE operation_id = ?",
+         WHERE operation_id = ? AND status <> 'applied' AND NOT (
+             method IN ('commit.create', 'checkpoint.restore', 'review.run', \
+                        'vcs.stage', 'vcs.unstage', 'vcs.commit') \
+             AND CASE WHEN json_valid(result_digest) THEN \
+                 json_type(result_digest, '$.vcsWriteOutcome') IS NOT NULL \
+                 ELSE 0 END)",
         [now_ms.into(), operation_id.into()],
     );
-    conn.execute_raw(stmt).await?;
-    Ok(())
+    let result = conn.execute_raw(stmt).await?;
+    Ok(result.rows_affected() > 0)
 }
 
-/// Read an operation's current status (for audit/observability and tests).
+/// Record an immutable terminal outcome, but only if the operation has not
+/// already reached one.
+pub async fn finish_operation_terminal<C: ConnectionTrait>(
+    conn: &C,
+    operation_id: &str,
+    result_digest: &str,
+    now_ms: i64,
+) -> Result<bool, DbErr> {
+    let stmt = Statement::from_sql_and_values(
+        DatabaseBackend::Sqlite,
+        "UPDATE agent_bridge_operation \
+         SET status = 'failed', result_digest = ?, completed_at = ? \
+         WHERE operation_id = ? AND NOT (
+             method IN ('commit.create', 'checkpoint.restore', 'review.run', \
+                        'vcs.stage', 'vcs.unstage', 'vcs.commit') \
+             AND CASE WHEN json_valid(result_digest) THEN \
+                 json_type(result_digest, '$.vcsWriteOutcome') IS NOT NULL \
+                 ELSE 0 END)",
+        [result_digest.into(), now_ms.into(), operation_id.into()],
+    );
+    let result = conn.execute_raw(stmt).await?;
+    Ok(result.rows_affected() > 0)
+}
+
 pub async fn get_operation_status<C: ConnectionTrait>(
     conn: &C,
     operation_id: &str,
@@ -504,29 +605,71 @@ pub async fn get_operation_status<C: ConnectionTrait>(
         .and_then(|r| r.try_get::<String>("", "status").ok()))
 }
 
-/// Read an operation's `(status, result_digest)` pair.
-///
-/// A replayed non-idempotent mutation (`review.run`) uses this to return the
-/// ORIGINAL result instead of executing a second time — the failure-recovery
-/// contract for "mutation applied but the response was lost" (plan-20260818
-/// 故障恢复矩阵: "以 operation id 查询并返回原结果").
-pub async fn get_operation_result<C: ConnectionTrait>(
+/// Read when the operation row was first recorded, in Unix milliseconds.
+pub async fn get_operation_created_at<C: ConnectionTrait>(
     conn: &C,
     operation_id: &str,
-) -> Result<Option<(String, Option<String>)>, DbErr> {
+) -> Result<Option<i64>, DbErr> {
     let stmt = Statement::from_sql_and_values(
         DatabaseBackend::Sqlite,
-        "SELECT status, result_digest FROM agent_bridge_operation WHERE operation_id = ?",
+        "SELECT created_at FROM agent_bridge_operation WHERE operation_id = ?",
         [operation_id.into()],
     );
     let rows = conn.query_all_raw(stmt).await?;
-    Ok(rows.into_iter().next().map(|r| {
-        (
-            r.try_get::<String>("", "status").unwrap_or_default(),
-            r.try_get::<Option<String>>("", "result_digest")
-                .ok()
-                .flatten(),
+    Ok(rows
+        .into_iter()
+        .next()
+        .and_then(|row| row.try_get::<i64>("", "created_at").ok()))
+}
+
+fn has_terminal_outcome(method: &str, status: &str, result_digest: Option<&str>) -> bool {
+    if status != "failed"
+        || !matches!(
+            method,
+            "commit.create"
+                | "checkpoint.restore"
+                | "review.run"
+                | "vcs.stage"
+                | "vcs.unstage"
+                | "vcs.commit"
         )
+    {
+        return false;
+    }
+    result_digest
+        .and_then(|digest| serde_json::from_str::<serde_json::Value>(digest).ok())
+        .and_then(|value| value.get("vcsWriteOutcome").cloned())
+        .is_some()
+}
+
+/// Read an operation's status and replay payload. The terminal flag is
+/// derived from the typed result AND method, because `result_digest` also stores
+/// raw caller-controlled checkpoint IDs.
+pub async fn get_operation_result<C: ConnectionTrait>(
+    conn: &C,
+    operation_id: &str,
+) -> Result<Option<OperationResult>, DbErr> {
+    let stmt = Statement::from_sql_and_values(
+        DatabaseBackend::Sqlite,
+        "SELECT status, result_digest, method \
+         FROM agent_bridge_operation WHERE operation_id = ?",
+        [operation_id.into()],
+    );
+    let rows = conn.query_all_raw(stmt).await?;
+    Ok(rows.into_iter().next().map(|row| {
+        let status = row.try_get::<String>("", "status").unwrap_or_default();
+        let result_digest = row
+            .try_get::<Option<String>>("", "result_digest")
+            .ok()
+            .flatten();
+        let method = row.try_get::<String>("", "method").unwrap_or_default();
+        let terminal_outcome = has_terminal_outcome(&method, &status, result_digest.as_deref());
+        OperationResult {
+            method,
+            status,
+            result_digest,
+            terminal_outcome,
+        }
     }))
 }
 
@@ -680,4 +823,153 @@ pub async fn insert_checkpoint<C: ConnectionTrait>(
     );
     let affected = conn.execute_raw(insert).await?;
     Ok(affected.rows_affected() > 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use sea_orm::Database;
+
+    use super::*;
+
+    /// A path that looks like the terminal marker is not a terminal outcome.
+    #[tokio::test]
+    async fn a_path_named_like_the_terminal_marker_is_not_one() {
+        let conn = Database::connect("sqlite::memory:").await.expect("connect");
+        crate::internal::db::migration::run_builtin_migrations(&conn)
+            .await
+            .expect("migrations");
+        open_session(&conn, "s1", "repo-1", None, None, None, None, 1)
+            .await
+            .expect("open the session");
+        conn.execute_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "INSERT INTO agent_bridge_operation \
+             (operation_id, bridge_session_id, method, params_digest, repository_id, status, \
+              result_digest, created_at) \
+             VALUES ('op-path', 's1', 'vcs.stage', 'digest', 'repo-1', 'pending', ?, 1)",
+            [r#"{"vcsWriteIntent":true,"paths":["vcsWriteOutcome"]}"#.into()],
+        ))
+        .await
+        .expect("insert the operation");
+
+        // The intent names a path that looks like the terminal marker; the
+        // completion write must still be accepted.
+        let applied = finish_operation_unless_terminal(
+            &conn,
+            "op-path",
+            "applied",
+            Some(r#"{"outcome":"applied"}"#),
+            2,
+        )
+        .await
+        .expect("apply the operation");
+        assert!(
+            applied,
+            "a path named like the terminal marker must not block the completion write"
+        );
+    }
+
+    /// A caller-provided checkpoint ID that looks like terminal JSON stays a
+    /// raw identity and cannot block a later completion update.
+    #[tokio::test]
+    async fn a_json_shaped_checkpoint_id_is_not_a_terminal_outcome() {
+        let conn = Database::connect("sqlite::memory:").await.expect("connect");
+        crate::internal::db::migration::run_builtin_migrations(&conn)
+            .await
+            .expect("migrations");
+        open_session(&conn, "s1", "repo-1", None, None, None, None, 1)
+            .await
+            .expect("open the session");
+        let forged_id = r#"{"vcsWriteOutcome":"forged","outcome":"applied"}"#;
+        conn.execute_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "INSERT INTO agent_bridge_operation \
+             (operation_id, bridge_session_id, method, params_digest, repository_id, status, \
+              result_digest, created_at) \
+             VALUES ('op-json-id', 's1', 'checkpoint.create', 'digest', 'repo-1', 'pending', ?, 1)",
+            [forged_id.into()],
+        ))
+        .await
+        .expect("insert the raw identity");
+        let applied =
+            finish_operation_unless_terminal(&conn, "op-json-id", "applied", Some(forged_id), 2)
+                .await
+                .expect("complete the operation");
+        assert!(applied, "raw checkpoint identity is not terminal");
+        let outcome = get_operation_result(&conn, "op-json-id")
+            .await
+            .expect("read operation")
+            .expect("operation exists");
+        assert!(!outcome.terminal_outcome);
+        assert_eq!(outcome.result_digest.as_deref(), Some(forged_id));
+    }
+
+    /// The operation-row transitions preserve a recorded terminal outcome.
+    #[tokio::test]
+    async fn a_terminal_outcome_survives_later_failure_writes() {
+        let conn = Database::connect("sqlite::memory:").await.expect("connect");
+        crate::internal::db::migration::run_builtin_migrations(&conn)
+            .await
+            .expect("migrations");
+        open_session(&conn, "s1", "repo-1", None, None, None, None, 1)
+            .await
+            .expect("open the session");
+        conn.execute_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "INSERT INTO agent_bridge_operation \
+             (operation_id, bridge_session_id, method, params_digest, repository_id, status, \
+              created_at) \
+             VALUES ('op-terminal', 's1', 'vcs.stage', 'digest', 'repo-1', 'pending', 1)",
+            [],
+        ))
+        .await
+        .expect("insert the operation");
+        let terminal = r#"{"vcsWriteOutcome":"indeterminate","operationId":"op-terminal"}"#;
+        assert!(
+            finish_operation_terminal(&conn, "op-terminal", terminal, 1)
+                .await
+                .expect("record the terminal outcome"),
+            "the first terminal write wins"
+        );
+
+        // A later failure write must not erase it.
+        fail_operation_keep_result(&conn, "op-terminal", 2)
+            .await
+            .expect("fail the operation");
+        let row = conn
+            .query_one_raw(Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                "SELECT result_digest FROM agent_bridge_operation WHERE operation_id = ?",
+                ["op-terminal".into()],
+            ))
+            .await
+            .expect("read the operation")
+            .expect("the operation row");
+        let digest: Option<String> = row.try_get_by_index(0).expect("digest");
+        assert_eq!(
+            digest.as_deref(),
+            Some(terminal),
+            "a recorded terminal outcome must survive a later failure write"
+        );
+
+        // A later success write must not erase it either.
+        finish_operation_unless_terminal(&conn, "op-terminal", "applied", Some("result"), 3)
+            .await
+            .expect("apply the operation");
+        let row = conn
+            .query_one_raw(Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                "SELECT result_digest FROM agent_bridge_operation WHERE operation_id = ?",
+                ["op-terminal".into()],
+            ))
+            .await
+            .expect("read the operation")
+            .expect("the operation row");
+        let digest: Option<String> = row.try_get_by_index(0).expect("digest");
+        assert_eq!(
+            digest.as_deref(),
+            Some(terminal),
+            "a recorded terminal outcome must survive a later success write"
+        );
+    }
 }
