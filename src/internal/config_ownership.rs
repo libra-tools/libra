@@ -388,6 +388,13 @@ pub const CODE_AGENT_PROCESS_CACHES: &[ProcessCacheSurface] = &[
                      process's own runs, and is emptied by the shutdown drain",
     },
     ProcessCacheSurface {
+        source_path: "src/internal/ai/agent_bridge/vcs_write.rs",
+        static_name: "WRITE_GATE",
+        discipline: "process-local async mutex serializing this process's fenced VCS \
+                     writes so a fence check and its index/commit write cannot interleave \
+                     with another bridge write; holds no repository state",
+    },
+    ProcessCacheSurface {
         source_path: "src/main.rs",
         static_name: "CONTROLS",
         discipline: "test-only private-helper fault controls; process-local and restored by \
