@@ -236,7 +236,12 @@ libra clone --depth 1 git@github.com:user/repo.git
 libra clone --depth 50 git@github.com:user/repo.git
 ```
 
-### `--reject-shallow`
+### `--reject-shallow` / `--no-reject-shallow`
+
+`--reject-shallow` and `--no-reject-shallow` are a toggle pair: the last one
+wins, so `--reject-shallow --no-reject-shallow` clones a shallow source normally
+and `--no-reject-shallow --reject-shallow` rejects it. `--no-reject-shallow`
+alone is the default (a no-op).
 
 A shallow local Git source is rejected before creating the destination, even
 when `--depth` is also given (exit 128, matching `git clone --reject-shallow`).

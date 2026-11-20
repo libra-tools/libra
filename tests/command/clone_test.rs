@@ -219,6 +219,7 @@ async fn test_clone_branch() {
         local: false,
         no_local: false,
         reject_shallow: false,
+        no_reject_shallow: false,
         reference: vec![],
         reference_if_able: vec![],
         shared: false,
@@ -270,6 +271,7 @@ async fn test_clone_bare_repository() {
         local: false,
         no_local: false,
         reject_shallow: false,
+        no_reject_shallow: false,
         reference: vec![],
         reference_if_able: vec![],
         shared: false,
@@ -336,6 +338,7 @@ async fn test_clone_branch_single_branch() {
         local: false,
         no_local: false,
         reject_shallow: false,
+        no_reject_shallow: false,
         reference: vec![],
         reference_if_able: vec![],
         shared: false,
@@ -386,6 +389,7 @@ async fn test_clone_default_branch() {
         local: false,
         no_local: false,
         reject_shallow: false,
+        no_reject_shallow: false,
         reference: vec![],
         reference_if_able: vec![],
         shared: false,
@@ -436,6 +440,7 @@ async fn test_clone_default_branch_single_branch() {
         local: false,
         no_local: false,
         reject_shallow: false,
+        no_reject_shallow: false,
         reference: vec![],
         reference_if_able: vec![],
         shared: false,
@@ -488,6 +493,7 @@ async fn test_clone_to_existing_empty_dir() {
         local: false,
         no_local: false,
         reject_shallow: false,
+        no_reject_shallow: false,
         reference: vec![],
         reference_if_able: vec![],
         shared: false,
@@ -543,6 +549,7 @@ async fn test_clone_to_existing_dir() {
         local: false,
         no_local: false,
         reject_shallow: false,
+        no_reject_shallow: false,
         reference: vec![],
         reference_if_able: vec![],
         shared: false,
@@ -594,6 +601,7 @@ async fn test_clone_to_dir_with_existing_file_name() {
         local: false,
         no_local: false,
         reject_shallow: false,
+        no_reject_shallow: false,
         reference: vec![],
         reference_if_able: vec![],
         shared: false,
@@ -644,6 +652,7 @@ async fn test_clone_with_depth() {
         local: false,
         no_local: false,
         reject_shallow: false,
+        no_reject_shallow: false,
         reference: vec![],
         reference_if_able: vec![],
         shared: false,
@@ -696,6 +705,7 @@ async fn test_clone_with_depth_and_branch() {
         local: false,
         no_local: false,
         reject_shallow: false,
+        no_reject_shallow: false,
         reference: vec![],
         reference_if_able: vec![],
         shared: false,
@@ -2492,6 +2502,71 @@ fn test_clone_from_shallow_git_source_matrix() {
     assert_eq!(read_shallow_oids(&r4), vec![c3.clone()], "R4 boundary");
     assert_cli_success(&run_libra_command(&["log", "--oneline"], &r4), "R4 log");
     assert_cli_success(&run_libra_command(&["fsck"], &r4), "R4 fsck");
+}
+
+#[test]
+fn test_clone_no_reject_shallow_overrides_reject_shallow() {
+    use super::{assert_cli_success, create_linear_git_repo, git_success, run_libra_command};
+
+    let (linear, _oids) = create_linear_git_repo(2);
+    let root = tempdir().expect("no-reject-shallow destination root");
+    let shallow = root.path().join("shallow");
+    git_success(
+        root.path(),
+        &[
+            "clone",
+            "--depth",
+            "1",
+            "--single-branch",
+            "--no-tags",
+            &format!("file://{}", linear.path().display()),
+            shallow.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        shallow.join(".git").join("shallow").is_file(),
+        "git must produce a shallow source"
+    );
+
+    // AC1: the later `--no-reject-shallow` wins, so the shallow source clones.
+    let d1 = root.path().join("d1");
+    let out = run_libra_command(
+        &[
+            "clone",
+            "--reject-shallow",
+            "--no-reject-shallow",
+            shallow.to_str().unwrap(),
+            d1.to_str().unwrap(),
+        ],
+        root.path(),
+    );
+    assert_cli_success(&out, "clone --reject-shallow --no-reject-shallow");
+
+    // AC2: the later `--reject-shallow` wins and the shallow source is refused.
+    let d2 = root.path().join("d2");
+    let out = run_libra_command(
+        &[
+            "clone",
+            "--no-reject-shallow",
+            "--reject-shallow",
+            shallow.to_str().unwrap(),
+            d2.to_str().unwrap(),
+        ],
+        root.path(),
+    );
+    assert!(
+        !out.status.success(),
+        "the later --reject-shallow must be honoured"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("LBR-REPO-003"),
+        "expected the LBR-REPO-003 stable code: {stderr}"
+    );
+    assert!(
+        !d2.join(".libra").exists(),
+        "a refused clone must not leave a destination"
+    );
 }
 
 #[test]

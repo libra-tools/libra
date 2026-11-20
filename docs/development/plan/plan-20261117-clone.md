@@ -481,7 +481,7 @@ PY
 ### Task CL-03: 支持 `libra clone --no-reject-shallow` 否定标志（#738）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `complete`（2026-11-20：`CloneArgs` 新增 `--no-reject-shallow`，与 `--reject-shallow` 互为 `overrides_with`（后出现者生效，单独 `--no-reject-shallow` 为默认 no-op）；`command::clone_test::test_clone_no_reject_shallow_overrides_reject_shallow` 覆盖 AC1–AC2（有效 Git 浅源：`--reject-shallow --no-reject-shallow` 退出 0；反向顺序以 `LBR-REPO-003` 拒绝且目标不留 `.libra`），nextest 1 run / 1 passed / 0 failed；共享回归 `test_clone_from_shallow_git_source_matrix` 1 passed；`compat_version_surface_sync` 2 passed；`cargo +nightly fmt --all --check` 与 `cargo clippy --all-targets --all-features -- -D warnings` 均 exit 0；`sh tests/NEXTEST_GROUPS.sh` 后 `.config/nextest.toml` 无变化；版本面 patch 0.30.214 → 0.30.215。按用户 2026-11-20 指令在 `main` 直接提交推送、不等 CI。）
 **Description:** 为 `CloneArgs` 新增 `--no-reject-shallow` 与 `--reject-shallow` 互相 `overrides_with`（last-one-wins）。
 **Out of scope:** `--reject-shallow` 自身检测逻辑（由既有实现承接）。
 **Current evidence:**
@@ -491,8 +491,8 @@ PY
 | `#738` `CloneArgs::reject_shallow` 缺少对应的 `--no-reject-shallow` | `src/command/clone.rs:144-145` |
 
 **Acceptance criteria:**（每条单谓词，按「验证执行协议」第 6 项计数）
-- [ ] **AC1** `libra clone --reject-shallow --no-reject-shallow <浅源> d1` 退出 0（后出现的 `--no-reject-shallow` 生效；`<浅源>` 为有效 Git 浅仓库（以本机 `git` 对含两个提交的 Git 仓库执行 `git clone --depth 1 file://<源> <浅源>` 生成，不写坏 `.git/shallow`；与既有 `test_clone_reject_shallow_local_git_source` 的损坏夹具不同））。
-- [ ] **AC2** `libra clone --no-reject-shallow --reject-shallow <浅源> d2` 以 `LBR-REPO-003` 拒绝（后出现的 `--reject-shallow` 生效）。
+- [x] **AC1** `libra clone --reject-shallow --no-reject-shallow <浅源> d1` 退出 0（后出现的 `--no-reject-shallow` 生效；`<浅源>` 为有效 Git 浅仓库（以本机 `git` 对含两个提交的 Git 仓库执行 `git clone --depth 1 file://<源> <浅源>` 生成，不写坏 `.git/shallow`；与既有 `test_clone_reject_shallow_local_git_source` 的损坏夹具不同））。
+- [x] **AC2** `libra clone --no-reject-shallow --reject-shallow <浅源> d2` 以 `LBR-REPO-003` 拒绝（后出现的 `--reject-shallow` 生效）。
 - [ ] ER-06/ER-06a 同卡强制门：`Docs and compatibility impact` 所列文件均按「文档与网站验收命令」逐文件验收（不计入 G-03）。
 
 **AC → 断言映射:**（「验证执行协议」第 4、6 项：映射与 AC 表述同一谓词；成功类 `exit 0` 为读取输出的前提；失败类按第 6 项断言非零状态与稳定码）
@@ -501,8 +501,8 @@ PY
 - 文档 AC（ER-06/ER-06a 同卡强制门，不计入 G-03）→ 「文档与网站验收命令」第 1–8 步；文档关键字：`--no-reject-shallow`。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest run --test command_test -E 'test(=command::clone_test::test_clone_no_reject_shallow_overrides_reject_shallow)'` `(new)` — 卡特有用例（「验证执行协议」第 1–4 项），覆盖 AC1–AC2。
-- [ ] `source .env.test && cargo nextest run --test command_test -E 'test(=command::clone_test::test_clone_from_shallow_git_source_matrix)'` — 共享回归组（「验证执行协议」第 5 项，预期 N=1）：既有本地浅源矩阵回归（`tests/command/clone_test.rs:2106`：对有效 Git 浅源执行 `--reject-shallow` 以退出 128 与 `source repository is shallow, reject to clone.` 拒绝且目标下不留 `.libra`，完整源放行；新增用例的目标目录整体不存在由「验证执行协议」第 4 项克隆拒绝不变量另行检查）。
+- [x] `source .env.test && cargo nextest run --test command_test -E 'test(=command::clone_test::test_clone_no_reject_shallow_overrides_reject_shallow)'` `(new)` — 卡特有用例（「验证执行协议」第 1–4 项），覆盖 AC1–AC2。
+- [x] `source .env.test && cargo nextest run --test command_test -E 'test(=command::clone_test::test_clone_from_shallow_git_source_matrix)'` — 共享回归组（「验证执行协议」第 5 项，预期 N=1）：既有本地浅源矩阵回归（`tests/command/clone_test.rs:2106`：对有效 Git 浅源执行 `--reject-shallow` 以退出 128 与 `source repository is shallow, reject to clone.` 拒绝且目标下不留 `.libra`，完整源放行；新增用例的目标目录整体不存在由「验证执行协议」第 4 项克隆拒绝不变量另行检查）。
 
 **Full-suite trigger:** `none`
 **Dependencies:** `CL-02`

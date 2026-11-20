@@ -143,8 +143,14 @@ pub struct CloneArgs {
     /// fetch unless `--depth` is supplied, which skips that post-fetch check.
     /// Local Libra sources do not advertise shallow boundaries (D20), so
     /// `--depth` fails closed before this check.
-    #[clap(long = "reject-shallow")]
+    #[clap(long = "reject-shallow", overrides_with = "no_reject_shallow")]
     pub reject_shallow: bool,
+
+    /// Do not fail when the source repository is shallow (the default).
+    /// Countermands an earlier `--reject-shallow`; the last of the two wins,
+    /// matching `git clone --no-reject-shallow`.
+    #[clap(long = "no-reject-shallow", overrides_with = "reject_shallow")]
+    pub no_reject_shallow: bool,
 
     /// Borrow objects from an existing local repository to reduce transfer
     /// (Git's `--reference <repo>`, which sets up `objects/info/alternates`).

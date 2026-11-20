@@ -126,7 +126,9 @@ libra clone --depth 1 git@github.com:user/repo.git
 libra clone --depth 50 git@github.com:user/repo.git
 ```
 
-### `--reject-shallow`
+### `--reject-shallow` / `--no-reject-shallow`
+
+`--reject-shallow` 与 `--no-reject-shallow` 互为开关对，后出现者生效：`--reject-shallow --no-reject-shallow` 正常克隆浅源，`--no-reject-shallow --reject-shallow` 则拒绝。单独使用 `--no-reject-shallow` 即默认行为（no-op）。
 
 本地 Git 浅源在创建目标目录前即被拒绝，即使同时指定 `--depth` 也一样（exit 128，对齐 `git clone --reject-shallow`）。不带该标志克隆浅源时，会把源的 `.git/shallow` 边界并入 `.libra/shallow`，使 `log` / `fsck` 可遍历。本地 Libra 源带 `--depth` 仍在对象传输前以 `LBR-REPO-002` fail-closed。
 
