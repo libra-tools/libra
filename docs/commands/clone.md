@@ -201,7 +201,7 @@ and Git's warning text is printed (`warning: --depth is ignored in local clones;
 use file:// instead.` and the matching `--shallow-*` / `--filter` lines).
 An already shallow Git source uses transport so its boundaries are preserved.
 `--no-local` (or a `file://` URL) uses the transport and honors `--depth`.
-Libra still never hardlinks — it always copies objects. The two flags override
+A local Libra source now hard-links its object store when source and destination share a filesystem (copy fallback after the first hard-link failure; explicit `--local` fails closed with `LBR-IO-002`), while `--no-local` keeps the copied transport path. The two flags override
 each other; the last one given wins. A local Libra source is unchanged: `--depth`
 fails closed with `LBR-REPO-002` on both a plain path and `file://`.
 

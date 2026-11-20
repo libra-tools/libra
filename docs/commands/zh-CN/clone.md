@@ -113,6 +113,10 @@ libra clone -l /path/to/source /path/to/dest
 
 大型仓库的**本地路径克隆**（数千提交 / 数十万可达对象）经由与 `repack`/`pack-objects`/`maintenance` 相同的共享 pack 编码器完成，不再停住于 “Fetching objects”（ADR-CLH-01 / issues/496）。
 
+### 本地硬链接
+
+本地 Libra 源在源与目标同一文件系统时会把对象存储硬链接到克隆（`--local` 与默认本地路径；首次硬链接失败后回退复制，显式 `--local` 失败即以 `LBR-IO-002` 拒绝）；`--no-local` 保持复制的传输路径。`objects/info/alternates` 的相对条目会按 Git `copy_alternates` 改写为绝对路径。
+
 ### `--depth <N>`
 
 创建浅克隆，将历史截断到指定提交数。`N` 必须是正整数。除非给出 `--no-single-branch`，否则隐含 `--single-branch`（对齐 `git clone`）。

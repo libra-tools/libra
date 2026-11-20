@@ -3460,6 +3460,99 @@ fn test_clone_local_hardlinks_and_no_local() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn test_clone_local_rewrites_relative_alternates() {
+    use crate::command::{assert_cli_success, create_committed_repo_via_cli, run_libra_command};
+
+    let src = create_committed_repo_via_cli();
+    let root = tempdir().unwrap();
+
+    // R owns the objects.
+    let r = root.path().join("R");
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "clone",
+                src.path().to_str().expect("src"),
+                r.to_str().expect("R"),
+            ],
+            root.path(),
+        ),
+        "clone R",
+    );
+
+    // SA borrows R through a RELATIVE alternates entry and owns no objects.
+    let sa = root.path().join("SA");
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "clone",
+                src.path().to_str().expect("src"),
+                sa.to_str().expect("SA"),
+            ],
+            root.path(),
+        ),
+        "clone SA",
+    );
+    for entry in std::fs::read_dir(sa.join(".libra/objects")).expect("read SA objects") {
+        let entry = entry.expect("SA object entry");
+        if entry.file_name() == "info" {
+            continue;
+        }
+        let path = entry.path();
+        if path.is_dir() {
+            std::fs::remove_dir_all(&path).expect("clear SA objects");
+        } else {
+            std::fs::remove_file(&path).expect("clear SA objects");
+        }
+    }
+    std::fs::write(
+        sa.join(".libra/objects/info/alternates"),
+        "../../../R/.libra/objects\n",
+    )
+    .expect("write the relative alternates");
+    assert_cli_success(
+        &run_libra_command(&["cat-file", "-p", "HEAD:tracked.txt"], &sa),
+        "the relative alternates resolve inside SA",
+    );
+
+    // Cloning SA must rewrite the entry to an absolute path.
+    let d8 = root.path().join("d8");
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "clone",
+                sa.to_str().expect("SA"),
+                d8.to_str().expect("dest"),
+            ],
+            root.path(),
+        ),
+        "AC2: clone a source with relative alternates",
+    );
+    let alternates = std::fs::read_to_string(d8.join(".libra/objects/info/alternates"))
+        .expect("read the destination alternates");
+    let lines: Vec<&str> = alternates
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+    assert!(
+        !lines.is_empty(),
+        "the destination must keep the borrowed store"
+    );
+    for line in lines {
+        assert!(
+            std::path::Path::new(line.trim()).is_absolute(),
+            "AC2: alternates entries must be absolute: {line}"
+        );
+    }
+    let cat = run_libra_command(&["cat-file", "-p", "HEAD:tracked.txt"], &d8);
+    assert_cli_success(
+        &cat,
+        "AC2: the borrowed blob is readable through the rewrite",
+    );
+}
+
 #[test]
 fn test_clone_reject_shallow_local_git_source() {
     use super::{create_linear_git_repo, git_success, run_libra_command};
