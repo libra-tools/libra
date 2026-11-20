@@ -411,7 +411,7 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 
 ### Task MP-01: 修复 `merge --ff` / `--no-ff` / `--ff-only` last-one-wins 覆盖规则（#996）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `complete`（2026-11-20：`0.30.216`；卡特有用例 1/1、解析器单测 1/1、共享回归 13/13、版本守卫 2/2；Codex R3 `VERDICT: PASS`；EN/zh/开发/COMPATIBILITY 与网站 `merge.en.md` 同卡同步；按用户 2026-11-20 指令未跑全量、未等待远端 CI）
 
 **Description:** 将 `MergeArgs` 的 `--ff`、`--no-ff`、`--ff-only` 由互相 `conflicts_with_all` 改为 last-one-wins（命令行最后一个 FF 标志生效，并覆盖 `merge.ff` 配置），与 Git 的 `OPT_SET_INT` 语义一致。（按 G-09 自本卡拆出 `MP-26`、`MP-27`、`MP-28`。）
 
@@ -426,14 +426,14 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 
 **Acceptance criteria:**
 
-- [ ] AC1：在 F-FF 上 `libra merge --ff-only --no-ff topic -m m` 创建合并提交（最后的 `--no-ff` 生效）。
-- [ ] AC2：在 F-FF 上 `libra merge --no-ff --ff topic` 快进（最后的 `--ff` 生效）。
-- [ ] AC3：在 F-DIV 上 `libra merge --no-ff --ff-only topic` 按最后的 `--ff-only` 拒绝非快进合并。
-- [ ] AC4：`merge.ff=only` 时，在 F-DIV 上 `libra merge --ff-only --ff topic -m m` 创建合并提交（最后的 `--ff` 同时覆盖前一标志与配置）。
-- [ ] AC5：在 F-FF 上 `libra merge --no-ff --ff-only topic` 快进（最后的 `--ff-only` 生效；`#996` AC2 前半与 `t7600#44`）。
-- [ ] AC6：在 F-FF 上 `libra merge --ff --no-ff topic -m m` 创建合并提交（最后的 `--no-ff` 生效）。
-- [ ] AC7：`merge.ff=only` 时，在 F-FF 上单个 `libra merge --no-ff topic -m m` 创建合并提交（命令行覆盖配置；`#996` AC3 前半）。
-- [ ] ER-06/ER-06a 同卡强制门（不计入 G-03）：按 `Docs and compatibility impact` 逐文件交付，按「文档与网站验收命令」第 1–8 步验收。
+- [x] AC1：在 F-FF 上 `libra merge --ff-only --no-ff topic -m m` 创建合并提交（最后的 `--no-ff` 生效）。
+- [x] AC2：在 F-FF 上 `libra merge --no-ff --ff topic` 快进（最后的 `--ff` 生效）。
+- [x] AC3：在 F-DIV 上 `libra merge --no-ff --ff-only topic` 按最后的 `--ff-only` 拒绝非快进合并。
+- [x] AC4：`merge.ff=only` 时，在 F-DIV 上 `libra merge --ff-only --ff topic -m m` 创建合并提交（最后的 `--ff` 同时覆盖前一标志与配置）。
+- [x] AC5：在 F-FF 上 `libra merge --no-ff --ff-only topic` 快进（最后的 `--ff-only` 生效；`#996` AC2 前半与 `t7600#44`）。
+- [x] AC6：在 F-FF 上 `libra merge --ff --no-ff topic -m m` 创建合并提交（最后的 `--no-ff` 生效）。
+- [x] AC7：`merge.ff=only` 时，在 F-FF 上单个 `libra merge --no-ff topic -m m` 创建合并提交（命令行覆盖配置；`#996` AC3 前半）。
+- [x] ER-06/ER-06a 同卡强制门（不计入 G-03）：按 `Docs and compatibility impact` 逐文件交付，按「文档与网站验收命令」第 1–8 步验收。
 
 **AC → 断言映射:**（`(new)` `command::merge_test::ff_flags_last_one_wins` 承载 AC1–AC7；夹具 F-FF（`init_repo_via_cli` 建库后执行 `libra config user.name 'A U Thor'` 与 `libra config user.email author@example.com` 设定身份——不使用会设为 `Test User <test@example.com>` 的 `configure_identity_via_cli`，`tests/command/mod.rs:686-693`——全部提交带 `--no-gpg-sign`；再 `libra config vault.signing false`，使合并提交也不签名（`libra init` 默认启用 vault 签名，密钥在按调用 cwd 建立的测试 HOME 中，`tests/command/mod.rs:353-381`；以子目录为 cwd 时签名以 `LBR-AUTH-001` 失败，Libra 0.30.207 预探））：`main` 上提交 `B`（`f`=`base\n`）；自 `B` 建分支 `topic` 并提交 `T`（新增 `g`=`t1\n`），`main` 仍指向 `B`（可 fast-forward）；夹具 F-DIV（`init_repo_via_cli` 建库后执行 `libra config user.name 'A U Thor'` 与 `libra config user.email author@example.com` 设定身份——不使用会设为 `Test User <test@example.com>` 的 `configure_identity_via_cli`，`tests/command/mod.rs:686-693`——全部提交带 `--no-gpg-sign`；再 `libra config vault.signing false`，使合并提交也不签名（`libra init` 默认启用 vault 签名，密钥在按调用 cwd 建立的测试 HOME 中，`tests/command/mod.rs:353-381`；以子目录为 cwd 时签名以 `LBR-AUTH-001` 失败，Libra 0.30.207 预探））：`main` 上提交 `B`（`f`=`base\n`）；自 `B` 建分支 `topic` 并提交 `T`（新增 `g`=`t1\n`）；`main` 自 `B` 再提交 `M`（新增 `h`=`m1\n`），与 `topic` 分叉且无冲突；「仓库快照 Σ」「HEAD 的父提交」「夹具提交名」（以字母命名的提交以同名轻量标签标记）「映射的执行仓库」按「验证执行协议」第 8 条定义；标注「Git 2.54.0 预探」或「Git 同夹具期望」的值按第 4 条在开工时以 `git@6de20f6092` 复核后硬编码）
 
@@ -448,8 +448,8 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 
 **Verification:**
 
-- [ ] 卡特有用例（AC1–AC7）：`source .env.test && cargo nextest run --test command_test -E 'test(=command::merge_test::ff_flags_last_one_wins)'`（`(new)`，在 `tests/command/merge_test.rs` 新增；按「验证执行协议」第 1–4 条：`source .env.test && cargo nextest list --test command_test -E 'test(=command::merge_test::ff_flags_last_one_wins)'` 须恰好列出该 1 条）
-- [ ] 共享回归组（不计入 G-03 VER）：`source .env.test && cargo nextest run --test compat_config_history_defaults`（整 target，`merge.ff` 等历史默认配置；按「验证执行协议」第 2、3、5 条，先 `source .env.test && cargo nextest list --test compat_config_history_defaults` 记录 `N` ≥ 1）
+- [x] 卡特有用例（AC1–AC7）：`source .env.test && cargo nextest run --test command_test -E 'test(=command::merge_test::ff_flags_last_one_wins)'`（`nextest list` 恰好 1 条；运行 1/1 PASS，2026-11-20 `/tmp/opencode/mp-01-tests-r3.log`）（`(new)`，在 `tests/command/merge_test.rs` 新增；按「验证执行协议」第 1–4 条：`source .env.test && cargo nextest list --test command_test -E 'test(=command::merge_test::ff_flags_last_one_wins)'` 须恰好列出该 1 条）
+- [x] 共享回归组（不计入 G-03 VER）：`source .env.test && cargo nextest run --test compat_config_history_defaults`（整 target，`merge.ff` 等历史默认配置；按「验证执行协议」第 2、3、5 条，先 `source .env.test && cargo nextest list --test compat_config_history_defaults` 记录 `N` = 13；运行 13/13 PASS）
 
 **Full-suite trigger:** `T-1: 版本面集合同步修改 install.sh / install.ps1（ER-08 / ER-13 T-1）` | **Dependencies:** `DEP-MP-01`, `DEP-MP-10`
 
@@ -3609,7 +3609,11 @@ awk -F'|' -v c=" <cmd> " '$2==c && $3 ~ /^ (supported|partial|unsupported|intent
 
 ## 实施证据汇总
 
-> 按 v2.12 规定，执行与收口证据统一汇总于本节或对应卡的 `Verification` 记录，不新建证据文件。尚无执行记录。
+> 按 v2.12 规定，执行与收口证据统一汇总于本节或对应卡的 `Verification` 记录，不新建证据文件。
+
+| 卡 | 日期 | 版本 | 代码评审 | 定向验证 | 备注 |
+|---|---|---|---|---|---|
+| `MP-01` | 2026-11-20 | `0.30.216` | Codex R3 `VERDICT: PASS`（`/tmp/opencode/codex-mp01-r3.log`） | 卡特有用例 1/1、解析器单测 1/1、共享回归 13/13、版本守卫 2/2 | 网站同步与部署按用户 local C/D 指令执行；未跑全量 |
 
 ## 非目标与延后项
 

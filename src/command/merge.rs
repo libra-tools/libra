@@ -310,15 +310,15 @@ pub struct MergeArgs {
 
     /// Refuse to merge unless the current branch can fast-forward to the
     /// target. A multi-branch octopus merge never fast-forwards.
-    #[arg(long = "ff-only", conflicts_with_all = ["ff", "no_ff", "continue_merge", "abort"])]
+    #[arg(long = "ff-only", overrides_with_all = ["ff_only", "ff", "no_ff"], conflicts_with_all = ["continue_merge", "abort", "restart"])]
     pub ff_only: bool,
 
     /// Allow fast-forwarding when possible, overriding `merge.ff`.
-    #[arg(long, conflicts_with_all = ["ff_only", "no_ff", "continue_merge", "abort"])]
+    #[arg(long, overrides_with_all = ["ff", "ff_only", "no_ff"], conflicts_with_all = ["continue_merge", "abort", "restart"])]
     pub ff: bool,
 
     /// Always create a merge commit, even when a fast-forward would be possible.
-    #[arg(long = "no-ff", conflicts_with_all = ["ff", "ff_only", "continue_merge", "abort"])]
+    #[arg(long = "no-ff", overrides_with_all = ["no_ff", "ff", "ff_only"], conflicts_with_all = ["continue_merge", "abort", "restart"])]
     pub no_ff: bool,
 
     /// Select one or more merge strategies in fallback order. `recursive` is
@@ -2795,11 +2795,12 @@ async fn run_merge_for_pull_inner(
         });
     }
 
-    // `--no-ff` cannot be combined with `--ff-only` (clap rejects the pair on
-    // the pull surface). `ff_only` (flag or `merge.ff=only`) must reject only
-    // a genuinely diverged history: a fast-forwardable `--squash`/`--no-commit`
-    // merely skipped the fast-forward branch above and is allowed (Git accepts
-    // `merge.ff=only` + `--squash` when the target is fast-forwardable).
+    // The pull surface rejects `--no-ff` with `--ff-only` at the clap layer;
+    // the merge surface resolves the last FF flag before reaching this point.
+    // `ff_only` (flag or `merge.ff=only`) must reject only a genuinely diverged
+    // history: a fast-forwardable `--squash`/`--no-commit` merely skipped the
+    // fast-forward branch above and is allowed (Git accepts `merge.ff=only` +
+    // `--squash` when the target is fast-forwardable).
     if options.ff_only && !merge_head_is_sole_base(&bases, &current_commit) {
         return Err(PullMergeError::NonFastForward {
             current: current_commit.id.to_string(),
@@ -10657,10 +10658,60 @@ mod tests {
     }
 
     #[test]
-    fn merge_args_ff_only_conflicts_with_no_ff() {
-        let err = MergeArgs::try_parse_from(["merge", "--ff-only", "--no-ff", "feature"])
-            .expect_err("--ff-only and --no-ff are mutually exclusive");
-        assert!(err.to_string().contains("cannot be used with"));
+    fn merge_args_ff_flags_are_last_one_wins() {
+        for (argv, ff_only, ff, no_ff) in [
+            (
+                ["merge", "--ff-only", "--no-ff", "feature"],
+                false,
+                false,
+                true,
+            ),
+            (
+                ["merge", "--ff-only", "--ff", "feature"],
+                false,
+                true,
+                false,
+            ),
+            (
+                ["merge", "--no-ff", "--ff-only", "feature"],
+                true,
+                false,
+                false,
+            ),
+            (["merge", "--no-ff", "--ff", "feature"], false, true, false),
+            (
+                ["merge", "--ff", "--ff-only", "feature"],
+                true,
+                false,
+                false,
+            ),
+            (["merge", "--ff", "--no-ff", "feature"], false, false, true),
+        ] {
+            let args = MergeArgs::try_parse_from(argv).expect("last FF flag wins");
+            assert_eq!(
+                (args.ff_only, args.ff, args.no_ff),
+                (ff_only, ff, no_ff),
+                "{argv:?}"
+            );
+        }
+
+        for flag in ["--ff", "--ff-only", "--no-ff"] {
+            let args = MergeArgs::try_parse_from(["merge", flag, flag, "feature"])
+                .expect("a repeated FF flag is accepted");
+            assert_eq!(
+                (args.ff_only, args.ff, args.no_ff),
+                (flag == "--ff-only", flag == "--ff", flag == "--no-ff"),
+                "{flag}"
+            );
+        }
+
+        for flag in ["--ff", "--ff-only", "--no-ff"] {
+            for control in ["--continue", "--abort", "--restart"] {
+                let err = MergeArgs::try_parse_from(["merge", flag, control])
+                    .expect_err("control actions reject FF flags");
+                assert!(err.to_string().contains("cannot be used with"), "{err}");
+            }
+        }
     }
 
     #[test]

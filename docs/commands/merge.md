@@ -5,7 +5,7 @@ Merge one or more targets into the current branch.
 ## Synopsis
 
 ```text
-libra merge [--ff | --ff-only | --no-ff] [-s <strategy>...] [-X <option>...] [--allow-unrelated-histories] [--log[=<n>] | --no-log] [--squash | --no-commit] [-m <msg> | -F <file>] [--into-name <name>] [-e | --edit | --no-edit] [--cleanup=<mode>] [--no-verify] [-v | --verbose] [--stat | -n | --no-stat] [--verify-signatures | --no-verify-signatures] [--rerere-autoupdate | --no-rerere-autoupdate] [-S | --gpg-sign | --no-gpg-sign] [--signoff] [--dry-run] [--autostash | --no-autostash] <branch>...
+libra merge [--ff] [--ff-only] [--no-ff] [-s <strategy>...] [-X <option>...] [--allow-unrelated-histories] [--log[=<n>] | --no-log] [--squash | --no-commit] [-m <msg> | -F <file>] [--into-name <name>] [-e | --edit | --no-edit] [--cleanup=<mode>] [--no-verify] [-v | --verbose] [--stat | -n | --no-stat] [--verify-signatures | --no-verify-signatures] [--rerere-autoupdate | --no-rerere-autoupdate] [-S | --gpg-sign | --no-gpg-sign] [--signoff] [--dry-run] [--autostash | --no-autostash] <branch>...
 libra merge --continue [-m <msg> | -F <file>] [-e | --edit | --no-edit] [--cleanup=<mode>] [--no-verify] [-S | --gpg-sign | --no-gpg-sign] [--signoff]
 libra merge --abort
 libra merge --quit
@@ -325,7 +325,7 @@ mode; a suggested-location or split preview uses conflict kind
 
 When the corresponding CLI flag is absent, Libra reads these Git-compatible defaults through the local → global → system cascade:
 
-- `merge.ff=true|false|only` allows fast-forwarding, forces a merge commit, or rejects a non-fast-forward merge. `--ff`, `--no-ff`, and `--ff-only` override it. `only` (like `--ff-only`) rejects only a genuinely diverged single-head history; a non-up-to-date octopus never fast-forwards.
+- `merge.ff=true|false|only` allows fast-forwarding, forces a merge commit, or rejects a non-fast-forward merge. `--ff`, `--no-ff`, and `--ff-only` override it and are last-one-wins among themselves (the last FF flag on the command line decides). `only` (like `--ff-only`) rejects only a genuinely diverged single-head history; a non-up-to-date octopus never fast-forwards.
 - `merge.log=true|false|<n>` appends up to 20 (for `true`) or `<n>` target-side commit subjects to the generated merge message. `--log[=<n>]` and `--no-log` override config and are last-one-wins; bare `--log` means 20. An explicit `-m` suppresses config-only `merge.log`, while an explicit `--log` still appends the shortlog to the custom message. For a non-squash merge, the resolved message is recorded in merge state, so a merge finished later with `merge --continue` commits with the same message and shortlog. Squash records no merge state; its ordinary `libra commit` supplies the commit message.
 - `merge.verifySignatures=true|false` controls tip-signature verification; `--verify-signatures` and `--no-verify-signatures` override it. Verification runs on every resolved target before any mutation — including autostash creation — so a rejected merge writes nothing (no stash entry, no objects).
   `--verify-signatures` accepts any certificate in the repository allowlist (the active key, the generated fallback, and archived `vault.gpg.history.<FPR>.pubkey` entries), so a tip signed before a key rotation stays verifiable, while a tip signed by a key this repository never imported is refused. Revocation and expiry are evaluated at the **signature's own creation time**: a tip signed while the key was still valid keeps verifying, while a signature made after the key was revoked or had expired is refused.
@@ -395,6 +395,8 @@ Worktree materialization is mode-aware (plan issues/470 FM-02): files are create
 | `--json` | Emit a structured success envelope. `selected_strategy` names the concrete backend when one ran; the existing `strategy` field remains the outcome category. |
 | `--machine` | Emit the same structured envelope as one compact JSON line. |
 | `--quiet` | Suppress human success output. |
+
+`--ff`, `--no-ff`, and `--ff-only` form a last-one-wins group (Git's `OPT_SET_INT` semantics): the last flag on the command line decides, and any of them overrides `merge.ff`. For example, `libra merge --ff-only --no-ff topic` creates a merge commit even when a fast-forward is possible.
 
 ## Repository hooks
 

@@ -14648,3 +14648,175 @@ fn eol_merge_fast_forward_accepts_clean_representation_and_rejects_edits(auto: b
         }
     }
 }
+
+/// MP-01 (#996): `--ff`, `--no-ff` and `--ff-only` are last-one-wins and a
+/// command-line FF flag overrides `merge.ff`.
+#[test]
+fn ff_flags_last_one_wins() {
+    struct Fixture {
+        repo: tempfile::TempDir,
+        /// First parent of the merge result: `B` on F-FF, `M` on F-DIV.
+        ours: String,
+        topic: String,
+    }
+
+    fn head(repo: &Path) -> String {
+        let out = run_libra_command(&["rev-parse", "HEAD"], repo);
+        assert_cli_success(&out, "rev-parse HEAD");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn current_branch(repo: &Path) -> String {
+        let out = run_libra_command(&["branch", "--show-current"], repo);
+        assert_cli_success(&out, "branch --show-current");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn setup() -> Fixture {
+        let repo = tempfile::tempdir().expect("create repo root");
+        let p = repo.path();
+        init_repo_via_cli(p);
+        assert_cli_success(
+            &run_libra_command(&["config", "user.name", "A U Thor"], p),
+            "config user.name",
+        );
+        assert_cli_success(
+            &run_libra_command(&["config", "user.email", "author@example.com"], p),
+            "config user.email",
+        );
+        assert_cli_success(
+            &run_libra_command(&["config", "vault.signing", "false"], p),
+            "disable vault signing",
+        );
+        fs::write(p.join("f"), "base\n").unwrap();
+        assert_cli_success(&run_libra_command(&["add", "f"], p), "add f");
+        assert_cli_success(
+            &run_libra_command(&["commit", "--no-gpg-sign", "-m", "B"], p),
+            "commit B",
+        );
+        let base = head(p);
+        assert_cli_success(&run_libra_command(&["tag", "B"], p), "tag B");
+        let main = current_branch(p);
+        assert_cli_success(&run_libra_command(&["branch", "topic"], p), "branch topic");
+        assert_cli_success(&run_libra_command(&["switch", "topic"], p), "switch topic");
+        fs::write(p.join("g"), "t1\n").unwrap();
+        assert_cli_success(&run_libra_command(&["add", "g"], p), "add g");
+        assert_cli_success(
+            &run_libra_command(&["commit", "--no-gpg-sign", "-m", "T"], p),
+            "commit T",
+        );
+        let topic = head(p);
+        assert_cli_success(&run_libra_command(&["tag", "T"], p), "tag T");
+        assert_cli_success(&run_libra_command(&["switch", &main], p), "switch main");
+        Fixture {
+            repo,
+            ours: base,
+            topic,
+        }
+    }
+
+    fn diverge(fixture: Fixture) -> Fixture {
+        let p = fixture.repo.path();
+        fs::write(p.join("h"), "m1\n").unwrap();
+        assert_cli_success(&run_libra_command(&["add", "h"], p), "add h");
+        assert_cli_success(
+            &run_libra_command(&["commit", "--no-gpg-sign", "-m", "M"], p),
+            "commit M",
+        );
+        assert_cli_success(&run_libra_command(&["tag", "M"], p), "tag M");
+        let m = head(p);
+        let mut fixture = fixture;
+        fixture.ours = m;
+        fixture
+    }
+
+    fn assert_merge_commit(fixture: &Fixture, context: &str) {
+        let p = fixture.repo.path();
+        let out = run_libra_command(&["log", "-1", "--format=%P"], p);
+        assert_cli_success(&out, context);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let parents: Vec<&str> = stdout.split_whitespace().collect();
+        assert_eq!(
+            parents,
+            vec![fixture.ours.as_str(), fixture.topic.as_str()],
+            "{context}: parents"
+        );
+    }
+
+    fn assert_fast_forward(fixture: &Fixture, context: &str) {
+        assert_eq!(head(fixture.repo.path()), fixture.topic, "{context}: HEAD");
+    }
+
+    // AC1: last --no-ff creates a merge commit.
+    let fixture = setup();
+    let p = fixture.repo.path();
+    assert_cli_success(
+        &run_libra_command(&["merge", "--ff-only", "--no-ff", "topic", "-m", "m"], p),
+        "AC1 merge",
+    );
+    assert_merge_commit(&fixture, "AC1");
+
+    // AC2: last --ff fast-forwards.
+    let fixture = setup();
+    let p = fixture.repo.path();
+    assert_cli_success(
+        &run_libra_command(&["merge", "--no-ff", "--ff", "topic"], p),
+        "AC2 merge",
+    );
+    assert_fast_forward(&fixture, "AC2");
+
+    // AC3: last --ff-only rejects a divergent merge.
+    let fixture = diverge(setup());
+    let p = fixture.repo.path();
+    let out = run_libra_command(&["merge", "--no-ff", "--ff-only", "topic"], p);
+    assert_eq!(out.status.code(), Some(128), "AC3 merge must fail");
+    let (stderr, report) = parse_cli_error_stderr(&out.stderr);
+    assert_eq!(
+        report.error_code, "LBR-CONFLICT-002",
+        "AC3 stderr: {stderr}"
+    );
+
+    // AC4: last --ff overrides the earlier flag and merge.ff=only.
+    let fixture = diverge(setup());
+    let p = fixture.repo.path();
+    assert_cli_success(
+        &run_libra_command(&["config", "merge.ff", "only"], p),
+        "config merge.ff only",
+    );
+    assert_cli_success(
+        &run_libra_command(&["merge", "--ff-only", "--ff", "topic", "-m", "m"], p),
+        "AC4 merge",
+    );
+    assert_merge_commit(&fixture, "AC4");
+
+    // AC5: last --ff-only fast-forwards.
+    let fixture = setup();
+    let p = fixture.repo.path();
+    assert_cli_success(
+        &run_libra_command(&["merge", "--no-ff", "--ff-only", "topic"], p),
+        "AC5 merge",
+    );
+    assert_fast_forward(&fixture, "AC5");
+
+    // AC6: last --no-ff creates a merge commit.
+    let fixture = setup();
+    let p = fixture.repo.path();
+    assert_cli_success(
+        &run_libra_command(&["merge", "--ff", "--no-ff", "topic", "-m", "m"], p),
+        "AC6 merge",
+    );
+    assert_merge_commit(&fixture, "AC6");
+
+    // AC7: a single --no-ff overrides merge.ff=only.
+    let fixture = setup();
+    let p = fixture.repo.path();
+    assert_cli_success(
+        &run_libra_command(&["config", "merge.ff", "only"], p),
+        "config merge.ff only",
+    );
+    assert_cli_success(
+        &run_libra_command(&["merge", "--no-ff", "topic", "-m", "m"], p),
+        "AC7 merge",
+    );
+    assert_merge_commit(&fixture, "AC7");
+}
