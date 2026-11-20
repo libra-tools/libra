@@ -3620,3 +3620,85 @@ fn storage_config_unresolved_fetch_stays_local_fetch() {
     );
     assert!(output.status.success(), "{text}");
 }
+
+#[test]
+fn fetch_without_repository_uses_git_default_remote() {
+    use crate::command::{run_libra_command, run_libra_command_with_env};
+
+    // Source repository with one commit on `main`.
+    let root = tempdir().unwrap();
+    let src = root.path().join("s");
+    assert!(
+        run_libra_command(&["init", src.to_str().unwrap()], root.path())
+            .status
+            .success()
+    );
+    std::fs::write(src.join("a.txt"), "a\n").unwrap();
+    assert!(run_libra_command(&["add", "a.txt"], &src).status.success());
+    let identity: &[(&str, &str)] = &[
+        ("LIBRA_COMMITTER_NAME", "t"),
+        ("LIBRA_COMMITTER_EMAIL", "t@t"),
+        ("GIT_AUTHOR_NAME", "t"),
+        ("GIT_AUTHOR_EMAIL", "t@t"),
+    ];
+    assert!(
+        run_libra_command_with_env(&["commit", "--no-gpg-sign", "-m", "s1"], &src, identity)
+            .status
+            .success()
+    );
+    let s1 = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], &src).stdout)
+        .trim()
+        .to_string();
+
+    let clone_with_remote = |dir: &str, remotes: &[(&str, &str)]| {
+        let dst = root.path().join(dir);
+        assert!(
+            run_libra_command(&["init", dst.to_str().unwrap()], root.path())
+                .status
+                .success()
+        );
+        for (name, url) in remotes {
+            assert!(
+                run_libra_command(&["remote", "add", name, url], &dst)
+                    .status
+                    .success(),
+                "remote add {name}"
+            );
+        }
+        dst
+    };
+    let src_url = src.to_str().unwrap().to_string();
+
+    // AC2: no upstream, only `origin` -> origin is used.
+    let c = clone_with_remote("c", &[("origin", &src_url)]);
+    assert!(
+        run_libra_command(&["fetch"], &c).status.success(),
+        "AC2 fetch"
+    );
+    let tip = run_libra_command(&["rev-parse", "refs/remotes/origin/main"], &c);
+    assert!(tip.status.success(), "AC2 tracking ref");
+    assert_eq!(String::from_utf8_lossy(&tip.stdout).trim(), s1);
+
+    // AC4: no upstream, the only remote is `up` -> up is used.
+    let n1 = clone_with_remote("n1", &[("up", &src_url)]);
+    assert!(
+        run_libra_command(&["fetch"], &n1).status.success(),
+        "AC4 fetch"
+    );
+    let tip = run_libra_command(&["rev-parse", "refs/remotes/up/main"], &n1);
+    assert!(tip.status.success(), "AC4 tracking ref");
+    assert_eq!(String::from_utf8_lossy(&tip.stdout).trim(), s1);
+
+    // AC7: two remotes, neither named origin -> no default remote.
+    let n2 = clone_with_remote("n2", &[("up", &src_url), ("other", &src_url)]);
+    let out = run_libra_command(&["fetch"], &n2);
+    assert!(
+        !out.status.success(),
+        "AC7 must fail without a default remote"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("LBR-REPO-003"),
+        "AC7: expected LBR-REPO-003: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

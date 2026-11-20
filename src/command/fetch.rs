@@ -1561,23 +1561,24 @@ async fn run_fetch(args: FetchArgs, output: &OutputConfig) -> CliResult<FetchOut
 
     let remote = match repository {
         Some(remote) => remote,
+        // Git's `remotes_remote_for_branch`: a configured upstream wins; a
+        // branch without one (or a detached HEAD, or a bare/mirror HEAD with no
+        // upstream) falls back to the only configured remote, then `origin`.
         None => match ConfigKv::get_current_remote().await {
             // A local upstream (`branch.<b>.remote=.`) is treated as the
             // current repository as an anonymous fetch source (issues/480
             // HP-16), replacing the earlier fail-closed refusal.
             Ok(Some(remote)) => remote,
-            Ok(None) => {
-                return Err(
-                    CliError::fatal("no configured remote for the current branch")
-                        .with_stable_code(StableErrorCode::RepoStateInvalid)
-                        .with_hint("use 'libra remote add <name> <url>' to configure a remote"),
-                );
-            }
-            Err(_) => {
-                return Err(CliError::fatal("HEAD is detached")
-                    .with_stable_code(StableErrorCode::RepoStateInvalid)
-                    .with_hint("switch to a branch before fetching its upstream"));
-            }
+            Ok(None) | Err(_) => match default_fetch_remote().await {
+                Some(remote) => remote,
+                None => {
+                    return Err(
+                        CliError::fatal("no configured remote for the current branch")
+                            .with_stable_code(StableErrorCode::RepoStateInvalid)
+                            .with_hint("use 'libra remote add <name> <url>' to configure a remote"),
+                    );
+                }
+            },
         },
     };
 
@@ -4563,6 +4564,21 @@ fn write_fetch_head(result: &FetchOutput, append: bool) -> Result<(), FetchError
 /// tip; otherwise falls back to `main`, then `master`, then the first branch.
 /// Shared by `fetch` (to cache the remote HEAD) and `remote show` /
 /// `remote set-head --auto`.
+/// The remote a branch without an upstream falls back to (Git's
+/// `remotes_remote_for_branch`): the only configured remote, or `origin` when
+/// several remotes exist. Two or more remotes without `origin` have no default.
+async fn default_fetch_remote() -> Option<String> {
+    let remotes = ConfigKv::all_remote_configs().await.ok()?;
+    match remotes.as_slice() {
+        [] => None,
+        [only] => Some(only.name.clone()),
+        many => many
+            .iter()
+            .find(|remote| remote.name == "origin")
+            .map(|remote| remote.name.clone()),
+    }
+}
+
 pub(crate) fn resolve_remote_default_branch(
     capabilities: &[String],
     ref_heads: &[DiscRef],

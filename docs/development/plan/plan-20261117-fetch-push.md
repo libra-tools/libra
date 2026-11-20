@@ -927,7 +927,7 @@ PY
 
 ### Task FP-07: 无参 `libra fetch` 在无上游时按 Git 选择默认 remote（镜像克隆、无上游分支与分离 HEAD）（#749）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `in-progress` / `locally-accepted`（2026-11-20：`fetch` 无参远端选择已实现 Git `remotes_remote_for_branch` 回退——`branch.<name>.remote` 优先，否则唯一 remote，否则 `origin`；两个及以上 remote 且无 `origin` 时保持 `LBR-REPO-003`。新增 `default_fetch_remote()`；`command::fetch_test::fetch_without_repository_uses_git_default_remote` 目前覆盖 AC2（仅 origin）、AC4（唯一 `up`）、AC7（双非 origin 拒绝）；`fetch_test` 全模块 63 passed / 0 failed。**AC1（裸/镜像全引用）、AC3（分离 HEAD）、AC5/AC6（`branch.main.remote=up` 与上游不变性）、AC8（失败时源仓库逐字不变）尚未落地**，故本卡保持 `in-progress`/`locally-accepted`。）
 
 **Description:** 无 `<repository>` 且非 `--all` 时，按 Git `remotes_remote_for_branch`：当前分支配置了 `branch.<name>.remote` 则用之；否则（当前分支无上游、HEAD 分离，或裸/镜像仓库 HEAD 指向无上游的分支）若恰好配置了一个 remote 则用该 remote，否则用 `origin`；所选 remote 未配置时保持 `no configured remote for the current branch`（`LBR-REPO-003`）。读取当前分支与配置的存储错误按既有 `IoReadFailed` 路径失败，不得当作无上游而回落。镜像克隆的 `+refs/*:refs/*` 映射与既有 prune 语义不变。
 
