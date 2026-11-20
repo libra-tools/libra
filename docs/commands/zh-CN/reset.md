@@ -254,3 +254,6 @@ revert 当前把文本冲突保存为 stage-0 blob。整树 reset 收尾前也�
 
 清除进行中的 merge，并把其 autostash 移入 stash 列表
 仍不支持的交互入口返回 `LBR-UNSUPPORTED-001`
+
+
+> `clone --separate-git-dir` 指针布局：当 `<worktree>/.libra` 是 `gitdir:` 指针文件时，本命令在任何索引、`HEAD` 或 ref 写入之前以 `LBR-UNSUPPORTED-001` 拒绝。该布局下只放行 `status`、`log`、`cat-file`、无参数 `branch` 列表、`alternates list`、`clone`、`upgrade`、`ui`、`login`、`whoami`、`logout` 与 `completions`。

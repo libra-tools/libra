@@ -84,3 +84,6 @@ revert 当前把文本冲突保存为 stage-0 blob。整树 reset 收尾前也�
 
 reset concludes merge state through the merge module
 reset -p 的 Unstage 与 Apply 两种模式
+
+
+**`clone --separate-git-dir` 指针布局（2026-11-20，CL-28）：** `.libra` 为 `gitdir:` 指针文件时，`src/cli.rs::command_preflight` 在分发前以 `LBR-UNSUPPORTED-001` 默认拒绝本命令，因此不会写错目录；放行名单与逐变体判定见 `docs/development/commands/_compatibility.md` 的「指针布局：命令放行清单」。

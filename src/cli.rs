@@ -1845,7 +1845,79 @@ fn repair_invocation_refused_without_confirmation(
     !(*confirm || *migrate_layout && *dry_run)
 }
 
+/// Locate a `gitdir:` pointer layout rooted at (or above) the current
+/// directory: `libra clone --separate-git-dir` leaves `<worktree>/.libra` as a
+/// pointer file instead of a storage directory.
+fn pointer_layout_storage() -> Option<std::path::PathBuf> {
+    let mut dir = std::env::current_dir().ok()?;
+    loop {
+        if let Some(target) = crate::utils::util::resolve_dot_libra_pointer(&dir) {
+            return Some(target);
+        }
+        // A real `.libra` directory ends the climb: this is the normal layout.
+        if dir.join(crate::utils::util::ROOT_DIR).exists() {
+            return None;
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
+/// Whether `command` may run when the repository metadata lives behind a
+/// `gitdir:` pointer file. Only commands whose storage adaptation exists
+/// today are allowed; everything else would write into the wrong directory, so
+/// it is refused until its own pointer-layout card lands.
+fn pointer_layout_permits(command: &Commands) -> bool {
+    match command {
+        Commands::Clone(_)
+        | Commands::Status(_)
+        | Commands::Log(_)
+        | Commands::CatFile(_)
+        | Commands::Upgrade(_)
+        | Commands::Ui(_)
+        | Commands::Login(_)
+        | Commands::Whoami(_)
+        | Commands::Logout(_)
+        | Commands::Completions(_) => true,
+        Commands::Alternates(args) => {
+            matches!(args.command, command::alternates::AlternatesCommand::List)
+        }
+        // Only the bare listing form; every ref-writing form is refused.
+        Commands::Branch(args) => {
+            args.subcommand.is_none()
+                && args.new_branch.is_none()
+                && args.commit_hash.is_none()
+                && !args.force
+                && !args.create_reflog
+                && args.delete.is_none()
+                && args.delete_safe.is_none()
+                && args.set_upstream_to.is_none()
+                && !args.no_track
+                && args.unset_upstream.is_none()
+                && args.edit_description.is_none()
+                && args.rename.is_empty()
+                && args.copy.is_empty()
+                && args.copy_force.is_empty()
+        }
+        _ => false,
+    }
+}
+
 fn command_preflight(command: &Commands, structured_output: bool) -> CliResult<CommandPreflight> {
+    if pointer_layout_storage().is_some() && !pointer_layout_permits(command) {
+        return Err(CliError::command_usage(
+            "this command is not available when the repository metadata lives in a \
+             `--separate-git-dir` directory (`.libra` is a `gitdir:` pointer file)",
+        )
+        .with_stable_code(crate::utils::error::StableErrorCode::Unsupported)
+        .with_hint(
+            "only `status`, `log`, `cat-file`, the no-argument `branch` listing, `alternates list`, \
+             `clone`, `upgrade`, `ui`, `login`, `whoami`, `logout` and `completions` are available \
+             in this layout today",
+        ));
+    }
+
     match command {
         // Hook frames are untrusted input. All installed `libra hooks` and
         // legacy hidden `libra agent hooks` entries resolve storage lazily,
@@ -5083,6 +5155,136 @@ mod tests {
                 "fixture.pack"
             ]
         );
+    }
+
+    /// Collect one parseable sample per top-level subcommand. Required
+    /// arguments are synthesized from clap metadata so the table keeps covering
+    /// every `Commands` variant as the CLI grows (CL-28 AC5/AC6).
+    fn pointer_layout_samples() -> Vec<(String, Vec<String>, Option<String>)> {
+        fn required_argv(cmd: &clap::Command, argv: &mut Vec<String>) {
+            for arg in cmd.get_arguments() {
+                if !arg.is_required_set() {
+                    continue;
+                }
+                if let Some(long) = arg.get_long() {
+                    argv.push(format!("--{long}"));
+                    if arg.get_action().takes_values() {
+                        argv.push("x".to_string());
+                    }
+                } else if let Some(short) = arg.get_short() {
+                    argv.push(format!("-{short}"));
+                    if arg.get_action().takes_values() {
+                        argv.push("x".to_string());
+                    }
+                } else {
+                    argv.push("x".to_string());
+                }
+            }
+        }
+
+        let root = <Cli as clap::CommandFactory>::command();
+        let mut samples = Vec::new();
+        for sub in root
+            .get_subcommands()
+            .filter(|cmd| cmd.get_name() != "help")
+        {
+            let name = sub.get_name().to_string();
+            let mut argv = vec![name.clone()];
+            // Commands with subcommands get their first verb (except `branch`,
+            // whose bare listing is the allowlisted form).
+            let mut chosen_sub = None;
+            if name != "branch"
+                && let Some(child) = sub.get_subcommands().next()
+            {
+                argv.push(child.get_name().to_string());
+                required_argv(child, &mut argv);
+                chosen_sub = Some(child.get_name().to_string());
+            } else {
+                required_argv(sub, &mut argv);
+            }
+            samples.push((name, argv, chosen_sub));
+        }
+        samples
+    }
+
+    #[test]
+    fn pointer_layout_allowlist_matches_commands() {
+        use std::collections::BTreeSet;
+
+        let samples = pointer_layout_samples();
+
+        // AC6: the sample table covers every top-level `Commands` variant.
+        let all: BTreeSet<String> = <Cli as clap::CommandFactory>::command()
+            .get_subcommands()
+            .filter(|cmd| cmd.get_name() != "help")
+            .map(|cmd| cmd.get_name().to_string())
+            .collect();
+        let covered: BTreeSet<String> = samples.iter().map(|(name, _, _)| name.clone()).collect();
+        assert_eq!(all, covered);
+
+        let mut unparseable: Vec<String> = Vec::new();
+        // AC5: every sample's verdict matches the allowlist. Samples whose
+        // required positionals clap does not expose through `is_required_set`
+        // get dummy positionals appended until they parse.
+        for (name, argv, chosen_sub) in &samples {
+            let mut argv = argv.clone();
+            let mut parsed = Cli::try_parse_from(
+                std::iter::once("libra").chain(argv.iter().map(String::as_str)),
+            );
+            while parsed.is_err() && argv.len() < 8 {
+                argv.push("x".to_string());
+                parsed = Cli::try_parse_from(
+                    std::iter::once("libra").chain(argv.iter().map(String::as_str)),
+                );
+            }
+            let parsed = match parsed {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    unparseable.push(format!("{name}: {error}"));
+                    continue;
+                }
+            };
+            let expected = match name.as_str() {
+                "clone" | "status" | "log" | "cat-file" | "upgrade" | "ui" | "login" | "whoami"
+                | "logout" | "completions" | "branch" => true,
+                "alternates" => chosen_sub.as_deref() == Some("list"),
+                _ => false,
+            };
+            assert_eq!(
+                pointer_layout_permits(&parsed.command),
+                expected,
+                "sample `{}` verdict",
+                argv.join(" ")
+            );
+        }
+
+        assert!(
+            unparseable.is_empty(),
+            "unparseable pointer-layout samples:\n{}",
+            unparseable.join("\n")
+        );
+
+        // AC5 (explicit forms): `branch` only as the bare listing, `alternates`
+        // only as `list`.
+        for (argv, expected) in [
+            (vec!["branch"], true),
+            (vec!["branch", "newbranch"], false),
+            (vec!["branch", "-D", "x"], false),
+            (vec!["branch", "-m", "a", "b"], false),
+            (vec!["alternates", "list"], true),
+            (vec!["alternates", "add", "p"], false),
+            (vec!["alternates", "remove", "p"], false),
+            (vec!["alternates", "prune"], false),
+        ] {
+            let parsed = Cli::try_parse_from(std::iter::once("libra").chain(argv.iter().copied()))
+                .unwrap_or_else(|error| panic!("`{}` must parse: {error}", argv.join(" ")));
+            assert_eq!(
+                pointer_layout_permits(&parsed.command),
+                expected,
+                "`{}` verdict",
+                argv.join(" ")
+            );
+        }
     }
 
     #[test]

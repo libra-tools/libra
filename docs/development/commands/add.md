@@ -115,3 +115,6 @@ flowchart TD
 候选分类也使用 clean 表示。只修改属性、目标文件 stat 不变时，已跟踪文件仍可能需要重新暂存；单纯 CRLF/LF 表示差异不会报告为内容修改。`--renormalize` 仍强制重新处理已跟踪文件。比较过程不改写工作区文件。
 
 调用现有共享状态入口并消费 `worktree_conversion` 的显式策略；保留原始快照/物化 API，未将其它命令的 raw blob 读取批量改成 clean。属性版本变化及读取失败不得复用旧的 clean 结论。回归位于既有 `command_test` 对应模块的 `i1062_` 用例（am 为 `worktree_isolation_test`）。
+
+
+**`clone --separate-git-dir` 指针布局（2026-11-20，CL-28）：** `.libra` 为 `gitdir:` 指针文件时，`src/cli.rs::command_preflight` 在分发前以 `LBR-UNSUPPORTED-001` 默认拒绝本命令，因此不会写错目录；放行名单与逐变体判定见 `docs/development/commands/_compatibility.md` 的「指针布局：命令放行清单」。

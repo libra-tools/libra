@@ -453,3 +453,6 @@ Merge aborted.
 - reset 会清除进行中的 merge，并把其 autostash 移入 stash 列表
 - 普通 commit 会结束进行中的 merge
 - 冲突标记按命令行原文标注合并目标
+
+
+> `clone --separate-git-dir` 指针布局：当 `<worktree>/.libra` 是 `gitdir:` 指针文件时，本命令在任何索引、`HEAD` 或 ref 写入之前以 `LBR-UNSUPPORTED-001` 拒绝。该布局下只放行 `status`、`log`、`cat-file`、无参数 `branch` 列表、`alternates list`、`clone`、`upgrade`、`ui`、`login`、`whoami`、`logout` 与 `completions`。

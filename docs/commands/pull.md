@@ -542,3 +542,10 @@ existing command hints and structured error fields retain their behavior.
 ## Issue #477 notes
 
 refuses a local upstream (`branch.<name>.remote=.`)
+
+
+> `clone --separate-git-dir` pointer layout: when `<worktree>/.libra` is a `gitdir:`
+> pointer file, this command is refused with `LBR-UNSUPPORTED-001` before any index,
+> `HEAD` or ref write. Only `status`, `log`, `cat-file`, the no-argument `branch`
+> listing, `alternates list`, `clone`, `upgrade`, `ui`, `login`, `whoami`, `logout` and
+> `completions` run in that layout.

@@ -2842,6 +2842,113 @@ fn test_clone_separate_git_dir_pointer_commands() {
 }
 
 #[test]
+fn test_clone_separate_git_dir_default_deny() {
+    use sha2::{Digest, Sha256};
+
+    use crate::command::{assert_cli_success, create_committed_repo_via_cli, run_libra_command};
+
+    let src = create_committed_repo_via_cli();
+    let root = tempdir().unwrap();
+    let git_dir = root.path().join("meta");
+    let work = root.path().join("w1");
+    let out = run_libra_command(
+        &[
+            "clone",
+            "--separate-git-dir",
+            git_dir.to_str().expect("git dir path"),
+            &format!("file://{}", src.path().display()),
+            work.to_str().expect("workdir path"),
+        ],
+        root.path(),
+    );
+    assert_cli_success(&out, "clone --separate-git-dir");
+
+    // Snapshot of the repository state the refused commands must not change:
+    // the index bytes, every reference (read from the metadata directory, where
+    // discovery treats `<G>` as the storage root) and the worktree files.
+    let snapshot = |work: &std::path::Path, git_dir: &std::path::Path| {
+        let index = std::fs::read(git_dir.join("index")).unwrap_or_default();
+        let refs = run_libra_command(&["show-ref"], git_dir);
+        assert_cli_success(&refs, "snapshot show-ref in the metadata directory");
+        let mut files: Vec<(String, String)> = Vec::new();
+        for entry in std::fs::read_dir(work).expect("read worktree") {
+            let entry = entry.expect("worktree entry");
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name == ".libra" || name == ".libra-test-home" {
+                continue;
+            }
+            let path = entry.path();
+            if path.is_file() {
+                let bytes = std::fs::read(&path).expect("read worktree file");
+                files.push((name, format!("{:x}", Sha256::digest(&bytes))));
+            }
+        }
+        files.sort();
+        (
+            format!("{:x}", Sha256::digest(&index)),
+            String::from_utf8_lossy(&refs.stdout).into_owned(),
+            files,
+        )
+    };
+
+    let before = snapshot(&work, &git_dir);
+
+    // AC1: `restore .` is refused (it reads and rewrites the index).
+    std::fs::write(work.join("tracked.txt"), "dirty\n").expect("modify the tracked file");
+    let out = run_libra_command(&["restore", "."], &work);
+    assert!(!out.status.success(), "AC1: restore must be refused");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("LBR-UNSUPPORTED-001"),
+        "AC1: expected the LBR-UNSUPPORTED-001 stable code: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    std::fs::write(work.join("tracked.txt"), "tracked\n").expect("restore the tracked file");
+
+    // AC2: `commit` is refused.
+    let out = run_libra_command(&["commit", "--allow-empty", "-m", "x"], &work);
+    assert!(!out.status.success(), "AC2: commit must be refused");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("LBR-UNSUPPORTED-001"),
+        "AC2: expected the LBR-UNSUPPORTED-001 stable code"
+    );
+
+    // AC3: creating a branch is refused.
+    let out = run_libra_command(&["branch", "newbranch"], &work);
+    assert!(
+        !out.status.success(),
+        "AC3: branch creation must be refused"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("LBR-UNSUPPORTED-001"),
+        "AC3: expected the LBR-UNSUPPORTED-001 stable code"
+    );
+
+    // AC4: `checkout` is refused.
+    let out = run_libra_command(&["checkout", "other"], &work);
+    assert!(!out.status.success(), "AC4: checkout must be refused");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("LBR-UNSUPPORTED-001"),
+        "AC4: expected the LBR-UNSUPPORTED-001 stable code"
+    );
+
+    let after = snapshot(&work, &git_dir);
+    assert_eq!(
+        before, after,
+        "a refused command must not change the index, the refs or the worktree"
+    );
+
+    // The allowed read-only commands still work in the same layout.
+    assert_cli_success(
+        &run_libra_command(&["status"], &work),
+        "status stays allowed",
+    );
+    assert_cli_success(
+        &run_libra_command(&["branch"], &work),
+        "the bare branch listing stays allowed",
+    );
+}
+
+#[test]
 fn test_clone_reject_shallow_local_git_source() {
     use super::{create_linear_git_repo, git_success, run_libra_command};
 

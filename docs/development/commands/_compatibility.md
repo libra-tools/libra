@@ -296,3 +296,122 @@ D-empty-message 已由 HF-06 实现
 - 迁移：使用 Git `--separate-git-dir` 的仓库可直接转换——`libra init --from-git-repository <worktree>`（或 `<worktree>/.git` 指针文件路径）已支持 `gitdir:` 指针解析。
 - 测试证据：`cargo test --test command_test init_separate_libra_dir_test`、`cargo test --test command_test init_from_git_test::test_init_from_git_gitdir_file_matrix`。
 - 重启条件：产品决定支持分离布局或另一种引用后端时一并重启。
+
+### `clone --separate-git-dir` 指针布局：命令放行清单（CL-28，2026-11-20）
+
+当 `<worktree>/.libra` 是指向 `<G>` 的 `gitdir:` 指针文件时，`src/cli.rs::command_preflight` 在分发前拒绝未适配的命令（`LBR-UNSUPPORTED-001`，且不改索引、`HEAD` 或 ref）。放行名单与逐变体判定如下（与 `tests` 的 `cli::tests::pointer_layout_allowlist_matches_commands` 一一对应；新增变体而未进本表时该单元测试失败）：
+
+| 子命令 | 指针布局下的判定 |
+|---|---|
+| `init` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `clone` | 放行 |
+| `config` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `status` | 放行 |
+| `add` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `rm` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `mv` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `restore` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `clean` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `stash` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `lfs` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `ls-files` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `worktree` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `log` | 放行 |
+| `logfile` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `upgrade` | 放行 |
+| `ui` | 放行 |
+| `cache` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `layer` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `file` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `alternates` | 仅 `list` 放行；`add`/`remove`/`prune` 拒绝 |
+| `deps` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `hydrate` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `media` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `sparse-view` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `metadata` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `memory` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `dirty` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `auth` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `login` | 放行 |
+| `whoami` | 放行 |
+| `logout` | 放行 |
+| `revision` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `service` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `shortlog` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `show` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `show-ref` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `format-patch` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `am` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `mailinfo` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `for-each-ref` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `ls-remote` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `ls-tree` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `symbolic-ref` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `rev-parse` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `rev-list` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `diff` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `grep` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `blame` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `describe` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `notes` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `cat-file` | 放行 |
+| `check-ignore` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `check-attr` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `check-mailmap` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `fast-export` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `bundle` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `fast-import` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `completions` | 放行 |
+| `archive` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `hash-object` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `write-tree` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `commit-tree` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `read-tree` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `update-index` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `update-ref` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `verify-pack` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `count-objects` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `commit` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `branch` | 仅无参数列表放行；`newbranch`/`-D`/`-m`/`--set-upstream-to` 等改 ref 形式拒绝 |
+| `switch` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `checkout` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `tag` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `merge` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `mergetool` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `merge-file` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `merge-base` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `apply` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `diff-tree` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `diff-index` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `diff-files` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `credential` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `rerere` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `rebase` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `reset` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `cherry-pick` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `push` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `fetch` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `pull` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `fsck` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `gc` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `maintenance` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `repack` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `revert` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `replace` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `reflog` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `op` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `bisect` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `remote` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `open` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `cloud` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `mega2` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `automation` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `sandbox` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `agent` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `review` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `investigate` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `index-pack` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `pack-objects` | 拒绝（`LBR-UNSUPPORTED-001`） |
+| `hooks` | 拒绝（`LBR-UNSUPPORTED-001`） |
+
+放行的只读命令允许 JSON/机器输出；`branch` 仅无参数列表、`alternates` 仅 `list` 放行。被拒绝命令的写入能力等待 `DEFER-CL-02` 的真实指针布局适配，不做静默降级。

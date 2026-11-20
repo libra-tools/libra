@@ -279,3 +279,10 @@ This warning delivery also applies to internal resets used by cherry-pick and am
 
 clears an in-progress merge and moves its autostash into the stash list
 remaining unsupported interactive options fail with `LBR-UNSUPPORTED-001`
+
+
+> `clone --separate-git-dir` pointer layout: when `<worktree>/.libra` is a `gitdir:`
+> pointer file, this command is refused with `LBR-UNSUPPORTED-001` before any index,
+> `HEAD` or ref write. Only `status`, `log`, `cat-file`, the no-argument `branch`
+> listing, `alternates list`, `clone`, `upgrade`, `ui`, `login`, `whoami`, `logout` and
+> `completions` run in that layout.
