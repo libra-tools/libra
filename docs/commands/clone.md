@@ -365,6 +365,18 @@ metadata but no checked-out files.
 libra clone -n git@github.com:user/repo.git
 ```
 
+### `--revision <REV>`
+
+Clone only the given revision (for example `refs/heads/main` or `refs/tags/v1`)
+and check it out as a detached HEAD, matching `git clone --revision`. No local
+branches, tags or remote-tracking refs are created and `remote.<name>.fetch` is
+not written, so the clone carries only the objects reachable from that revision.
+Conflicts with `--branch` and `--mirror` (`LBR-CLI-002`).
+
+```bash
+libra clone --revision=refs/tags/v1 git@github.com:user/repo.git
+```
+
 ### `--separate-git-dir <DIR>`
 
 Store the repository metadata in `<DIR>` instead of `<workdir>/.libra`, and leave

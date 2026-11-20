@@ -189,6 +189,14 @@ libra clone --no-progress git@github.com:user/repo.git
 libra clone -n git@github.com:user/repo.git
 ```
 
+### `--revision <REV>`
+
+只克隆指定修订（例如 `refs/heads/main` 或 `refs/tags/v1`），并检出为游离 HEAD，对齐 `git clone --revision`。不会创建本地分支、标签或远端跟踪引用，也不写入 `remote.<name>.fetch`，因此克隆只包含该修订可达的对象。与 `--branch`、`--mirror` 互斥（`LBR-CLI-002`）。
+
+```bash
+libra clone --revision=refs/tags/v1 git@github.com:user/repo.git
+```
+
 ### `--separate-git-dir <DIR>`
 
 把仓库元数据放在 `<DIR>` 而不是 `<workdir>/.libra`，并在 `<workdir>/.libra` 留下 `gitdir: <DIR>` 指针文件，对齐 `git clone --separate-git-dir`。克隆过程（含初始检出）始终以工作区内的元数据运行，只在检出于完成后才迁移到 `<DIR>`，因此失败不会留下半迁移的仓库。`<DIR>` 必须不存在或为空目录。不能与 `--bare`/`--mirror` 组合（`options '--bare' and '--separate-git-dir' cannot be used together`，`LBR-CLI-002`）。只读仓库的命令——`status`、`log`、`cat-file` 与无参数 `branch`——会解析该指针布局并在 `<DIR>` 上工作；会写 ref 的子命令在后续卡片落地前默认拒绝。
