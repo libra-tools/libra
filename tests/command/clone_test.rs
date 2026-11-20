@@ -1002,6 +1002,70 @@ fn clone_no_single_branch_countermands_single_branch() {
 }
 
 #[test]
+fn test_clone_short_n_skips_checkout() {
+    use crate::command::{assert_cli_success, create_committed_repo_via_cli, run_libra_command};
+
+    let src = create_committed_repo_via_cli();
+    let src_head = run_libra_command(&["rev-parse", "HEAD"], src.path());
+    assert_cli_success(&src_head, "source rev-parse HEAD");
+    let expected = String::from_utf8_lossy(&src_head.stdout).trim().to_string();
+
+    let work = tempdir().unwrap();
+    let dst = work.path().join("short-n-dst");
+    let url = format!("file://{}", src.path().display());
+    let out = run_libra_command(
+        &["clone", "-n", url.as_str(), dst.to_str().expect("dst path")],
+        work.path(),
+    );
+    assert_cli_success(&out, "clone -n");
+
+    // AC2: nothing but repository metadata was materialized. Checked before any
+    // later command runs inside the destination, because the shared test
+    // harness creates its fake `HOME` as `.libra-test-home` in the child cwd.
+    let mut entries: Vec<String> = std::fs::read_dir(&dst)
+        .expect("read clone destination")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    entries.sort();
+    assert_eq!(
+        entries,
+        vec![".libra".to_string()],
+        "clone -n must leave only `.libra` in the destination"
+    );
+
+    // AC1: the short flag still records the source HEAD.
+    let cloned = run_libra_command(&["rev-parse", "HEAD"], &dst);
+    assert_cli_success(&cloned, "cloned rev-parse HEAD");
+    assert_eq!(
+        String::from_utf8_lossy(&cloned.stdout).trim(),
+        expected,
+        "clone -n must set HEAD to the source commit"
+    );
+
+    // AC3: exactly one merged output line mentions `Clon`.
+    let merged = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let clon_lines = merged.lines().filter(|line| line.contains("Clon")).count();
+    assert_eq!(
+        clon_lines, 1,
+        "clone -n should print exactly one line mentioning Clon: {merged}"
+    );
+
+    // AC4: the help text advertises the short flag.
+    let help = run_libra_command(&["clone", "--help"], work.path());
+    assert_cli_success(&help, "clone --help");
+    let help_stdout = String::from_utf8_lossy(&help.stdout);
+    assert!(
+        help_stdout.contains("-n, --no-checkout"),
+        "clone help must document `-n, --no-checkout`: {help_stdout}"
+    );
+}
+
+#[test]
 fn no_checkout_skips_working_tree() {
     use crate::command::{assert_cli_success, create_committed_repo_via_cli, run_libra_command};
 

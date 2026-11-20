@@ -179,12 +179,12 @@ libra clone --progress https://github.com/user/repo.git
 libra clone --no-progress git@github.com:user/repo.git
 ```
 
-### `--no-checkout`
+### `-n`, `--no-checkout`
 
-克隆后不把 HEAD 检出到工作区，对齐 `git clone --no-checkout`。objects、refs 与 HEAD 仍会设置，只跳过工作区检出，因此目标目录只有仓库元数据而没有检出的文件。
+克隆后不把 HEAD 检出到工作区，对齐 `git clone -n` / `git clone --no-checkout`。objects、refs 与 HEAD 仍会设置，只跳过工作区检出，因此目标目录只有仓库元数据而没有检出的文件。
 
 ```bash
-libra clone --no-checkout git@github.com:user/repo.git
+libra clone -n git@github.com:user/repo.git
 ```
 
 ### `-o`, `--origin <NAME>`

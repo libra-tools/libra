@@ -115,7 +115,7 @@ pub struct CloneArgs {
 
     /// Do not check out HEAD into the working tree after cloning (objects, refs
     /// and HEAD are still set up), matching `git clone --no-checkout`.
-    #[clap(long = "no-checkout")]
+    #[clap(short = 'n', long = "no-checkout")]
     pub no_checkout: bool,
 
     /// Use NAME for the remote (and its `refs/remotes/<NAME>/*` tracking refs)

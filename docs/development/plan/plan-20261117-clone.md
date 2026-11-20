@@ -435,7 +435,7 @@ PY
 ### Task CL-02: 支持 `libra clone -n` 短标志（`--no-checkout`）（#739）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `complete`（2026-11-20：`CloneArgs::no_checkout` 增补 `short = 'n'`，`libra clone -n` 跳过工作区检出；`command::clone_test::test_clone_short_n_skips_checkout` 覆盖 AC1–AC4，nextest 1 run / 1 passed / 0 failed；共享回归 `test_clone_json_reports_fetch_transfer_counts` 1 passed；`compat_version_surface_sync` 2 passed；`cargo +nightly fmt --all --check` exit 0；`sh tests/NEXTEST_GROUPS.sh` 后 `.config/nextest.toml` 无变化（新用例未进 serial registry）；版本面 patch 0.30.212 → 0.30.213。按用户 2026-11-20 指令在 `main` 直接提交推送、不等 CI。）
 **Description:** 为 `CloneArgs::no_checkout` 添加 `short = 'n'`，支持 `libra clone -n <url>` 跳过工作区检出，且 stdout 与 stderr 合并输出中匹配 `Clon` 的行恰为 1 行（`#739` 验收第 3 条，对应 Git `t/t5601-clone.sh#4`）。
 **Out of scope:** `--no-checkout` 内部检出跳过逻辑（由既有实现承接）。
 **Current evidence:**
@@ -445,10 +445,10 @@ PY
 | `#739` `CloneArgs::no_checkout` 仅有 `long = "no-checkout"`，缺少 `short = 'n'` | `src/command/clone.rs:116-117` |
 
 **Acceptance criteria:**（每条单谓词，按「验证执行协议」第 6 项计数）
-- [ ] **AC1** `libra clone -n file://<S> dst` 退出 0，且 `dst` 中 `libra rev-parse HEAD` 等于 S 的 `HEAD` 提交 OID。
-- [ ] **AC2** 同一次克隆后，`dst` 工作区除 `.libra/` 外不含任何文件或目录（未检出）。
-- [ ] **AC3** 同一命令 stdout 与 stderr 合并后，匹配 `Clon` 的行恰为 1 行（`#739` 验收第 3 条，对应 Git `t/t5601-clone.sh#4`）。
-- [ ] **AC4** `libra clone --help` 的 stdout 含 `-n, --no-checkout`。
+- [x] **AC1** `libra clone -n file://<S> dst` 退出 0，且 `dst` 中 `libra rev-parse HEAD` 等于 S 的 `HEAD` 提交 OID。
+- [x] **AC2** 同一次克隆后，`dst` 工作区除 `.libra/` 外不含任何文件或目录（未检出）。
+- [x] **AC3** 同一命令 stdout 与 stderr 合并后，匹配 `Clon` 的行恰为 1 行（`#739` 验收第 3 条，对应 Git `t/t5601-clone.sh#4`）。
+- [x] **AC4** `libra clone --help` 的 stdout 含 `-n, --no-checkout`。
 - [ ] ER-06/ER-06a 同卡强制门：`Docs and compatibility impact` 所列文件均按「文档与网站验收命令」逐文件验收（不计入 G-03）。
 
 **AC → 断言映射:**（「验证执行协议」第 4、6 项：映射与 AC 表述同一谓词；成功类 `exit 0` 为读取输出的前提；失败类按第 6 项断言非零状态与稳定码）
@@ -459,8 +459,8 @@ PY
 - 文档 AC（ER-06/ER-06a 同卡强制门，不计入 G-03）→ 「文档与网站验收命令」第 1–8 步；文档关键字：`-n, --no-checkout`。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest run --test command_test -E 'test(=command::clone_test::test_clone_short_n_skips_checkout)'` `(new)` — 卡特有用例（「验证执行协议」第 1–4 项），覆盖 AC1–AC4。
-- [ ] `source .env.test && cargo nextest run --test command_test -E 'test(=command::clone_test::test_clone_json_reports_fetch_transfer_counts)'` — 共享回归组（「验证执行协议」第 5 项，预期 N=1）：既有本地 `clone --json` 回归（`tests/command/clone_test.rs:1458`，把 stdout 解析为 JSON）——新增的 `Cloning into` 行不得进入 `--json` 的 stdout。
+- [x] `source .env.test && cargo nextest run --test command_test -E 'test(=command::clone_test::test_clone_short_n_skips_checkout)'` `(new)` — 卡特有用例（「验证执行协议」第 1–4 项），覆盖 AC1–AC4。
+- [x] `source .env.test && cargo nextest run --test command_test -E 'test(=command::clone_test::test_clone_json_reports_fetch_transfer_counts)'` — 共享回归组（「验证执行协议」第 5 项，预期 N=1）：既有本地 `clone --json` 回归（`tests/command/clone_test.rs:1458`，把 stdout 解析为 JSON）——`Cloned into` 行不得进入 `--json` 的 stdout。
 
 **Full-suite trigger:** `none`
 **Dependencies:** `CL-01`

@@ -349,15 +349,15 @@ clone, matching `git clone --no-progress`. Other output is unaffected.
 libra clone --no-progress git@github.com:user/repo.git
 ```
 
-### `--no-checkout`
+### `-n`, `--no-checkout`
 
 Do not check out HEAD into the working tree after cloning, matching `git clone
---no-checkout`. Objects, refs and HEAD are still set up — only the working-tree
-checkout is skipped, so the destination contains the repository metadata but no
-checked-out files.
+-n` / `git clone --no-checkout`. Objects, refs and HEAD are still set up — only
+the working-tree checkout is skipped, so the destination contains the repository
+metadata but no checked-out files.
 
 ```bash
-libra clone --no-checkout git@github.com:user/repo.git
+libra clone -n git@github.com:user/repo.git
 ```
 
 ### `-o`, `--origin <NAME>`
