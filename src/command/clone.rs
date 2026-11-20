@@ -1946,7 +1946,7 @@ async fn clone_into_destination(
     // move it to the requested directory now that the checkout is complete and
     // leave the `gitdir:` pointer file in its place.
     if let Some(git_dir) = &separate_git_dir
-        && let Err(message) = relocate_libra_dir(&local_path, git_dir)
+        && let Err(message) = relocate_libra_dir(local_path, git_dir)
     {
         return Err(CloneError::SeparateGitDirFailed { message });
     }

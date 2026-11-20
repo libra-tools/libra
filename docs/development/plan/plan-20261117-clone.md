@@ -523,7 +523,7 @@ PY
 ### Task CL-04: 支持 `libra clone --separate-git-dir` 并输出与 `--bare` 互斥信息（#740）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `complete`（2026-11-20：`CloneArgs` 新增 `--separate-git-dir <DIR>`；克隆（含初始检出）先在 `<workdir>/.libra` 内完成，检出后把元数据迁移到 `<DIR>` 并在工作区留下 `gitdir: <DIR>` 指针文件（`relocate_libra_dir`，rename 失败时回退为递归复制，指针写入失败则回滚）；`--bare`/`--mirror` 组合在创建任何目录前以 `LBR-CLI-002` + Git 原文 `options '--bare' and '--separate-git-dir' cannot be used together` 拒绝；`command::clone_test::test_clone_separate_git_dir_and_bare_mutex` 覆盖 AC1–AC8，nextest 1 run / 1 passed / 0 failed；共享回归 `test_clone_bare_and_mirror_default_names_and_layout` 1 passed；`cargo +nightly fmt --all --check` 与 `cargo clippy --all-targets --all-features -- -D warnings` 均 exit 0；`sh tests/NEXTEST_GROUPS.sh` 后 `.config/nextest.toml` 无变化。本卡为 `REL-CL-01` 家族子卡（无版本 bump，C/D 由 `CL-25` 承接）；按用户 2026-11-20 指令在 `main` 直接提交推送。）
 **Description:** 按 ADR-CL-05 为 `CloneArgs` 新增 `--separate-git-dir <dir>`，将仓库元数据目录初始化至 `<dir>` 并在 `<workdir>/.libra` 写入 `gitdir: <dir>` 指针文件（复用 `src/utils/convert.rs:242-252` 与 `src/utils/util.rs:265`），（`clone` 自身的初始检出须在写入指针文件之前完成或显式使用 `<dir>` 作为仓库路径，不依赖 `CL-23` 的指针发现），同时在 `--bare`/`--mirror` 与 `--separate-git-dir` 组合时输出 Git 兼容的互斥错误提示并清理失败新建目录。（按 G-09 拆出 `CL-23` 承接指针发现；`CL-28`（写命令 fail-closed）再自 `CL-23` 拆出。）
 **Out of scope:** 指针发现与四个基本命令（`CL-23`）；写命令 fail-closed（`CL-28`）；`libra init --separate-git-dir`（保留 D25）。
 **Current evidence:**
@@ -533,14 +533,14 @@ PY
 | `#740` `CloneArgs` 缺少 `--separate-git-dir` 及 `--bare` 互斥错误信息 | `src/command/clone.rs:89-91,1592`；`src/utils/convert.rs:242-252` |
 
 **Acceptance criteria:**（每条单谓词，按「验证执行协议」第 6 项计数）
-- [ ] **AC1** `libra clone --separate-git-dir <G> file://<S> <W>` 退出 0，且 `<G>/libra.db` 存在。
-- [ ] **AC2** AC1 之后读取 `<W>/.libra` 的文件内容，去掉 `gitdir:` 前缀并去除首尾空白后，规范化路径等于 `<G>` 的规范化路径。
-- [ ] **AC3** AC1 之后 `<W>` 工作区（不含 `.libra`）的「相对路径 → SHA-256」清单等于 S 的 `HEAD` 树全部文件的清单（初始检出完成）。
-- [ ] **AC4** `libra clone --bare --separate-git-dir <G2> file://<S> <W2>` 以 `LBR-CLI-002` 拒绝。
-- [ ] **AC5** AC4 的 stderr 含 Git 原文 `options '--bare' and '--separate-git-dir' cannot be used together`（`builtin/clone.c:1068-1070`）。
-- [ ] **AC6** `libra clone --mirror --separate-git-dir <G3> file://<S> <W3>` 以 `LBR-CLI-002` 拒绝（Git 中 `--mirror` 隐含 `--bare`，`builtin/clone.c:1063-1070`）。
-- [ ] **AC7** AC6 的 stderr 含同一 Git 原文 `options '--bare' and '--separate-git-dir' cannot be used together`。
-- [ ] **AC8** `libra clone --separate-git-dir <G4> <不存在的本地路径> <W4>` 以 `LBR-REPO-001` 拒绝（目标与 `<G4>` 的清理由「验证执行协议」第 4 项克隆拒绝不变量检查）。
+- [x] **AC1** `libra clone --separate-git-dir <G> file://<S> <W>` 退出 0，且 `<G>/libra.db` 存在。
+- [x] **AC2** AC1 之后读取 `<W>/.libra` 的文件内容，去掉 `gitdir:` 前缀并去除首尾空白后，规范化路径等于 `<G>` 的规范化路径。
+- [x] **AC3** AC1 之后 `<W>` 工作区（不含 `.libra`）的「相对路径 → SHA-256」清单等于 S 的 `HEAD` 树全部文件的清单（初始检出完成）。
+- [x] **AC4** `libra clone --bare --separate-git-dir <G2> file://<S> <W2>` 以 `LBR-CLI-002` 拒绝。
+- [x] **AC5** AC4 的 stderr 含 Git 原文 `options '--bare' and '--separate-git-dir' cannot be used together`（`builtin/clone.c:1068-1070`）。
+- [x] **AC6** `libra clone --mirror --separate-git-dir <G3> file://<S> <W3>` 以 `LBR-CLI-002` 拒绝（Git 中 `--mirror` 隐含 `--bare`，`builtin/clone.c:1063-1070`）。
+- [x] **AC7** AC6 的 stderr 含同一 Git 原文 `options '--bare' and '--separate-git-dir' cannot be used together`。
+- [x] **AC8** `libra clone --separate-git-dir <G4> <不存在的本地路径> <W4>` 以 `LBR-REPO-001` 拒绝（目标与 `<G4>` 的清理由「验证执行协议」第 4 项克隆拒绝不变量检查）。
 - [ ] ER-06/ER-06a 同卡强制门：`Docs and compatibility impact` 所列文件均按「文档与网站验收命令」逐文件验收（不计入 G-03）。
 
 **AC → 断言映射:**（「验证执行协议」第 4、6 项：映射与 AC 表述同一谓词；成功类 `exit 0` 为读取输出的前提；失败类按第 6 项断言非零状态与稳定码）
@@ -555,8 +555,8 @@ PY
 - 文档 AC（ER-06/ER-06a 同卡强制门，不计入 G-03）→ 「文档与网站验收命令」第 1–6 步（家族子卡：第 6 步只做精确本地 `cf` 提交、不推送；推送与第 7 步部署核验由 `CL-25` 承接）；文档关键字：`--separate-git-dir`。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest run --test command_test -E 'test(=command::clone_test::test_clone_separate_git_dir_and_bare_mutex)'` `(new)` — 卡特有用例（「验证执行协议」第 1–4 项），覆盖 AC1–AC8。
-- [ ] `source .env.test && cargo nextest run --test command_test -E 'test(=command::clone_test::test_clone_bare_and_mirror_default_names_and_layout)'` — 共享回归组（「验证执行协议」第 5 项，预期 N=1）：既有本地 `--bare`/`--mirror` 默认目录名与裸布局回归（`tests/command/clone_test.rs:2486`）。
+- [x] `source .env.test && cargo nextest run --test command_test -E 'test(=command::clone_test::test_clone_separate_git_dir_and_bare_mutex)'` `(new)` — 卡特有用例（「验证执行协议」第 1–4 项），覆盖 AC1–AC8。
+- [x] `source .env.test && cargo nextest run --test command_test -E 'test(=command::clone_test::test_clone_bare_and_mirror_default_names_and_layout)'` — 共享回归组（「验证执行协议」第 5 项，预期 N=1）：既有本地 `--bare`/`--mirror` 默认目录名与裸布局回归（`tests/command/clone_test.rs:2486`）。
 
 **Full-suite trigger:** `N/A（REL-CL-01 家族子卡，合并后由 CL-25 统一执行 T-2 全量门）`
 **Dependencies:** `CL-03`
