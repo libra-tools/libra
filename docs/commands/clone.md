@@ -365,6 +365,21 @@ metadata but no checked-out files.
 libra clone -n git@github.com:user/repo.git
 ```
 
+### `--separate-git-dir <DIR>`
+
+Store the repository metadata in `<DIR>` instead of `<workdir>/.libra`, and leave
+a `gitdir: <DIR>` pointer file at `<workdir>/.libra`, matching `git clone
+--separate-git-dir`. The clone itself — including the initial checkout — runs
+with the metadata inside the worktree; it is moved to `<DIR>` only after the
+checkout completes, so a failed clone never leaves a half-relocated repository.
+`<DIR>` must not exist or must be an empty directory. Cannot be combined with
+`--bare` or `--mirror` (`options '--bare' and '--separate-git-dir' cannot be
+used together`, `LBR-CLI-002`).
+
+```bash
+libra clone --separate-git-dir ~/.libra-meta/repo git@github.com:user/repo.git
+```
+
 ### `-o`, `--origin <NAME>`
 
 Use `<NAME>` for the remote (and its `refs/remotes/<NAME>/*` tracking refs)

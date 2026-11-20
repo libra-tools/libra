@@ -92,6 +92,13 @@ pub struct CloneArgs {
     #[clap(long)]
     pub bare: bool,
 
+    /// Store the repository metadata in `<DIR>` instead of `<workdir>/.libra`,
+    /// leaving a `gitdir:` pointer file at `<workdir>/.libra` (matching
+    /// `git clone --separate-git-dir`). Cannot be combined with `--bare` or
+    /// `--mirror`.
+    #[clap(long = "separate-git-dir", value_name = "DIR")]
+    pub separate_git_dir: Option<String>,
+
     /// Create a shallow clone with history truncated to N commits (must be > 0).
     /// Implies `--single-branch` unless `--no-single-branch` is given.
     #[clap(long, value_name = "N", value_parser = validate_depth)]
@@ -592,6 +599,10 @@ pub enum CloneError {
     SetupFailed { message: String },
     #[error("this clone source is no longer supported")]
     RemovedPublishRestoreSource,
+    #[error("options '--bare' and '--separate-git-dir' cannot be used together")]
+    SeparateGitDirWithBare,
+    #[error("failed to move repository metadata for --separate-git-dir: {message}")]
+    SeparateGitDirFailed { message: String },
     #[error(
         "refusing to clone a Mega2 traces locator with libra clone; traces history is not part of the code view"
     )]
@@ -676,6 +687,13 @@ impl From<CloneError> for CliError {
                 .with_hint(
                     "the Cloudflare publish site host was removed; clone a git remote or use `libra cloud` for repository backup.",
                 ),
+            CloneError::SeparateGitDirWithBare => CliError::command_usage(error.to_string())
+                .with_stable_code(StableErrorCode::CliInvalidArguments)
+                .with_hint("drop either `--bare`/`--mirror` or `--separate-git-dir`"),
+            CloneError::SeparateGitDirFailed { ref message } => CliError::fatal(format!(
+                "failed to move repository metadata for --separate-git-dir: {message}"
+            ))
+            .with_stable_code(StableErrorCode::IoReadFailed),
             CloneError::TracesLocatorRefused => CliError::fatal(error.to_string())
                 .with_stable_code(StableErrorCode::CliInvalidArguments)
                 .with_hint(
@@ -1007,6 +1025,100 @@ fn contains_initialized_repo(metadata_root: &Path) -> bool {
         .any(|marker| metadata_root.join(marker).exists())
 }
 
+/// Move a freshly cloned `.libra` storage directory to `git_dir` and leave a
+/// `gitdir:` pointer file in its place (`git clone --separate-git-dir`).
+///
+/// The clone itself always keeps the metadata inside the worktree, so the
+/// initial checkout never depends on pointer discovery. `git_dir` must be
+/// absent or an empty directory; on failure the metadata is put back so the
+/// destination is never left half-relocated.
+fn relocate_libra_dir(worktree: &Path, git_dir: &Path) -> Result<(), String> {
+    let storage = worktree.join(util::ROOT_DIR);
+    if !storage.is_dir() {
+        return Err(format!(
+            "expected repository metadata at '{}' after cloning",
+            storage.display()
+        ));
+    }
+    if git_dir.exists() {
+        if !git_dir.is_dir() || !util::is_empty_dir(git_dir) {
+            return Err(format!(
+                "separate git dir '{}' already exists and is not an empty directory",
+                git_dir.display()
+            ));
+        }
+        fs::remove_dir(git_dir).map_err(|error| {
+            format!(
+                "could not use '{}' as the separate git dir: {error}",
+                git_dir.display()
+            )
+        })?;
+    }
+    if let Some(parent) = git_dir.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("could not create '{}': {error}", parent.display()))?;
+    }
+
+    match fs::rename(&storage, git_dir) {
+        Ok(()) => {}
+        Err(rename_error) => {
+            copy_dir_recursive(&storage, git_dir).map_err(|copy_error| {
+                format!(
+                    "could not move '{}' to '{}': rename failed ({rename_error}); copy failed ({copy_error})",
+                    storage.display(),
+                    git_dir.display()
+                )
+            })?;
+            fs::remove_dir_all(&storage).map_err(|error| {
+                format!(
+                    "copied metadata to '{}' but could not remove '{}': {error}",
+                    git_dir.display(),
+                    storage.display()
+                )
+            })?;
+        }
+    }
+
+    let pointer = format!("gitdir: {}\n", git_dir.display());
+    if let Err(error) = fs::write(&storage, pointer) {
+        // Put the metadata back so a failed clone is not left half-relocated.
+        let _ = fs::rename(git_dir, &storage);
+        return Err(format!(
+            "could not write the '{}' pointer file: {error}",
+            storage.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Recursive directory copy used when the metadata cannot be renamed across
+/// filesystems (symlinks, including `objects/info/alternates`, are recreated).
+fn copy_dir_recursive(from: &Path, to: &Path) -> io::Result<()> {
+    fs::create_dir_all(to)?;
+    for entry in fs::read_dir(from)? {
+        let entry = entry?;
+        let target = to.join(entry.file_name());
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            copy_dir_recursive(&entry.path(), &target)?;
+        } else if file_type.is_symlink() {
+            let link = fs::read_link(entry.path())?;
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&link, &target)?;
+            #[cfg(not(unix))]
+            {
+                let _ = link;
+                fs::copy(entry.path(), &target)?;
+            }
+        } else {
+            fs::copy(entry.path(), &target)?;
+        }
+    }
+    Ok(())
+}
+
 /// Custom validation function, ensuring depth >= 1
 fn validate_depth(s: &str) -> Result<usize, String> {
     s.parse::<usize>()
@@ -1277,6 +1389,13 @@ async fn execute_clone_inner(
 ) -> Result<CloneOutput, (CloneError, Option<String>)> {
     if is_removed_publish_restore_source(&args.remote_repo) {
         return Err((CloneError::RemovedPublishRestoreSource, None));
+    }
+
+    // `--separate-git-dir` relocates the metadata after the initial checkout and
+    // leaves a `gitdir:` pointer behind, so a bare or mirror clone (which has no
+    // working tree) is refused up front, before anything is created.
+    if args.separate_git_dir.is_some() && (args.bare || args.mirror) {
+        return Err((CloneError::SeparateGitDirWithBare, None));
     }
 
     let mut remote_repo = args.remote_repo.clone();
@@ -1559,6 +1678,17 @@ async fn clone_into_destination(
     original_dir: &Path,
     output: &OutputConfig,
 ) -> Result<CloneOutput, CloneError> {
+    // `--separate-git-dir` is resolved against the caller's directory; the
+    // metadata move itself happens after the initial checkout below.
+    let separate_git_dir = args.separate_git_dir.as_deref().map(|dir| {
+        let path = PathBuf::from(dir);
+        if path.is_absolute() {
+            path
+        } else {
+            original_dir.join(path)
+        }
+    });
+
     // lore.md 2.11: resolve the effective `--shared` decision BEFORE cwd
     // changes into the new (empty) clone — a per-repo `clone.shared` in the
     // directory being cloned FROM should count, and the fresh clone has no
@@ -1811,6 +1941,15 @@ async fn clone_into_destination(
         path: original_dir.to_path_buf(),
         source,
     })?;
+
+    // `--separate-git-dir`: the clone ran with the metadata inside the worktree;
+    // move it to the requested directory now that the checkout is complete and
+    // leave the `gitdir:` pointer file in its place.
+    if let Some(git_dir) = &separate_git_dir
+        && let Err(message) = relocate_libra_dir(&local_path, git_dir)
+    {
+        return Err(CloneError::SeparateGitDirFailed { message });
+    }
 
     // Build CloneOutput.
     if setup_result.branch_name.is_none() {

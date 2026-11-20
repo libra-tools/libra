@@ -189,6 +189,14 @@ libra clone --no-progress git@github.com:user/repo.git
 libra clone -n git@github.com:user/repo.git
 ```
 
+### `--separate-git-dir <DIR>`
+
+把仓库元数据放在 `<DIR>` 而不是 `<workdir>/.libra`，并在 `<workdir>/.libra` 留下 `gitdir: <DIR>` 指针文件，对齐 `git clone --separate-git-dir`。克隆过程（含初始检出）始终以工作区内的元数据运行，只在检出于完成后才迁移到 `<DIR>`，因此失败不会留下半迁移的仓库。`<DIR>` 必须不存在或为空目录。不能与 `--bare`/`--mirror` 组合（`options '--bare' and '--separate-git-dir' cannot be used together`，`LBR-CLI-002`）。
+
+```bash
+libra clone --separate-git-dir ~/.libra-meta/repo git@github.com:user/repo.git
+```
+
 ### `-o`, `--origin <NAME>`
 
 用 `<NAME>` 命名远端（及其 `refs/remotes/<NAME>/*` 跟踪引用），取代默认的 `origin`，对齐 `git clone -o`。分支跟踪配置（`branch.<branch>.remote`）与 `remote.<NAME>.url` 都使用所选名称。该选项适用于标准克隆。

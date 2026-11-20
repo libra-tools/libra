@@ -220,6 +220,7 @@ async fn test_clone_branch() {
         no_local: false,
         reject_shallow: false,
         no_reject_shallow: false,
+        separate_git_dir: None,
         reference: vec![],
         reference_if_able: vec![],
         shared: false,
@@ -272,6 +273,7 @@ async fn test_clone_bare_repository() {
         no_local: false,
         reject_shallow: false,
         no_reject_shallow: false,
+        separate_git_dir: None,
         reference: vec![],
         reference_if_able: vec![],
         shared: false,
@@ -339,6 +341,7 @@ async fn test_clone_branch_single_branch() {
         no_local: false,
         reject_shallow: false,
         no_reject_shallow: false,
+        separate_git_dir: None,
         reference: vec![],
         reference_if_able: vec![],
         shared: false,
@@ -390,6 +393,7 @@ async fn test_clone_default_branch() {
         no_local: false,
         reject_shallow: false,
         no_reject_shallow: false,
+        separate_git_dir: None,
         reference: vec![],
         reference_if_able: vec![],
         shared: false,
@@ -441,6 +445,7 @@ async fn test_clone_default_branch_single_branch() {
         no_local: false,
         reject_shallow: false,
         no_reject_shallow: false,
+        separate_git_dir: None,
         reference: vec![],
         reference_if_able: vec![],
         shared: false,
@@ -494,6 +499,7 @@ async fn test_clone_to_existing_empty_dir() {
         no_local: false,
         reject_shallow: false,
         no_reject_shallow: false,
+        separate_git_dir: None,
         reference: vec![],
         reference_if_able: vec![],
         shared: false,
@@ -550,6 +556,7 @@ async fn test_clone_to_existing_dir() {
         no_local: false,
         reject_shallow: false,
         no_reject_shallow: false,
+        separate_git_dir: None,
         reference: vec![],
         reference_if_able: vec![],
         shared: false,
@@ -602,6 +609,7 @@ async fn test_clone_to_dir_with_existing_file_name() {
         no_local: false,
         reject_shallow: false,
         no_reject_shallow: false,
+        separate_git_dir: None,
         reference: vec![],
         reference_if_able: vec![],
         shared: false,
@@ -653,6 +661,7 @@ async fn test_clone_with_depth() {
         no_local: false,
         reject_shallow: false,
         no_reject_shallow: false,
+        separate_git_dir: None,
         reference: vec![],
         reference_if_able: vec![],
         shared: false,
@@ -706,6 +715,7 @@ async fn test_clone_with_depth_and_branch() {
         no_local: false,
         reject_shallow: false,
         no_reject_shallow: false,
+        separate_git_dir: None,
         reference: vec![],
         reference_if_able: vec![],
         shared: false,
@@ -2566,6 +2576,186 @@ fn test_clone_no_reject_shallow_overrides_reject_shallow() {
     assert!(
         !d2.join(".libra").exists(),
         "a refused clone must not leave a destination"
+    );
+}
+
+#[test]
+fn test_clone_separate_git_dir_and_bare_mutex() {
+    use sha2::{Digest, Sha256};
+
+    use crate::command::{assert_cli_success, create_committed_repo_via_cli, run_libra_command};
+
+    fn blob_hashes(dir: &std::path::Path, paths: &[String]) -> Vec<(String, String)> {
+        paths
+            .iter()
+            .map(|path| {
+                let out = run_libra_command(&["cat-file", "-p", &format!("HEAD:{path}")], dir);
+                assert_cli_success(&out, "cat-file HEAD path");
+                (path.clone(), format!("{:x}", Sha256::digest(&out.stdout)))
+            })
+            .collect()
+    }
+
+    fn worktree_hashes(root: &std::path::Path) -> Vec<(String, String)> {
+        fn walk(base: &std::path::Path, dir: &std::path::Path, out: &mut Vec<(String, String)>) {
+            for entry in std::fs::read_dir(dir).expect("read worktree dir") {
+                let entry = entry.expect("worktree entry");
+                let name = entry.file_name();
+                if dir == base && name == ".libra" {
+                    continue;
+                }
+                let path = entry.path();
+                let file_type = entry.file_type().expect("worktree entry type");
+                if file_type.is_dir() {
+                    walk(base, &path, out);
+                } else {
+                    let relative = path
+                        .strip_prefix(base)
+                        .expect("relative worktree path")
+                        .to_string_lossy()
+                        .into_owned();
+                    let bytes = std::fs::read(&path).expect("read worktree file");
+                    out.push((relative, format!("{:x}", Sha256::digest(&bytes))));
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(root, root, &mut files);
+        files.sort();
+        files
+    }
+
+    let src = create_committed_repo_via_cli();
+    let root = tempdir().unwrap();
+    let url = format!("file://{}", src.path().display());
+
+    // AC1/AC2/AC3: metadata in <G>, pointer at <W>/.libra, worktree checked out.
+    let git_dir = root.path().join("meta");
+    let work = root.path().join("w1");
+    let out = run_libra_command(
+        &[
+            "clone",
+            "--separate-git-dir",
+            git_dir.to_str().expect("git dir path"),
+            url.as_str(),
+            work.to_str().expect("workdir path"),
+        ],
+        root.path(),
+    );
+    assert_cli_success(&out, "clone --separate-git-dir");
+    assert!(
+        git_dir.join("libra.db").is_file(),
+        "AC1: the metadata database lives in <G>"
+    );
+    let pointer = std::fs::read_to_string(work.join(".libra")).expect("read the pointer file");
+    let target = pointer
+        .trim()
+        .strip_prefix("gitdir:")
+        .expect("pointer must start with `gitdir:`")
+        .trim();
+    assert_eq!(
+        std::fs::canonicalize(target).expect("canonicalize pointer target"),
+        std::fs::canonicalize(&git_dir).expect("canonicalize <G>"),
+        "AC2: the pointer names <G>"
+    );
+    let names_out = run_libra_command(&["ls-tree", "-r", "--name-only", "HEAD"], src.path());
+    assert_cli_success(&names_out, "source ls-tree");
+    let names: Vec<String> = String::from_utf8_lossy(&names_out.stdout)
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    let mut expected = blob_hashes(src.path(), &names);
+    expected.sort();
+    assert_eq!(
+        worktree_hashes(&work),
+        expected,
+        "AC3: the initial checkout matches the source HEAD tree"
+    );
+
+    // AC4/AC5: `--bare` conflicts with `--separate-git-dir`.
+    let bare_git = root.path().join("g2");
+    let bare_work = root.path().join("w2");
+    let out = run_libra_command(
+        &[
+            "clone",
+            "--bare",
+            "--separate-git-dir",
+            bare_git.to_str().expect("git dir path"),
+            url.as_str(),
+            bare_work.to_str().expect("workdir path"),
+        ],
+        root.path(),
+    );
+    assert!(
+        !out.status.success(),
+        "--bare with --separate-git-dir must fail"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("LBR-CLI-002"),
+        "AC4: expected the LBR-CLI-002 stable code: {stderr}"
+    );
+    assert!(
+        stderr.contains("options '--bare' and '--separate-git-dir' cannot be used together"),
+        "AC5: expected Git's message: {stderr}"
+    );
+    assert!(
+        !bare_git.exists() && !bare_work.exists(),
+        "a refused clone must not create either directory"
+    );
+
+    // AC6/AC7: `--mirror` implies bare, so the same mutex applies.
+    let mirror_git = root.path().join("g3");
+    let mirror_work = root.path().join("w3");
+    let out = run_libra_command(
+        &[
+            "clone",
+            "--mirror",
+            "--separate-git-dir",
+            mirror_git.to_str().expect("git dir path"),
+            url.as_str(),
+            mirror_work.to_str().expect("workdir path"),
+        ],
+        root.path(),
+    );
+    assert!(
+        !out.status.success(),
+        "--mirror with --separate-git-dir must fail"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("LBR-CLI-002"),
+        "AC6: expected the LBR-CLI-002 stable code: {stderr}"
+    );
+    assert!(
+        stderr.contains("options '--bare' and '--separate-git-dir' cannot be used together"),
+        "AC7: expected Git's message: {stderr}"
+    );
+
+    // AC8: a missing source is rejected before anything is created.
+    let missing_git = root.path().join("g4");
+    let missing_work = root.path().join("w4");
+    let out = run_libra_command(
+        &[
+            "clone",
+            "--separate-git-dir",
+            missing_git.to_str().expect("git dir path"),
+            root.path()
+                .join("does-not-exist")
+                .to_str()
+                .expect("source path"),
+            missing_work.to_str().expect("workdir path"),
+        ],
+        root.path(),
+    );
+    assert!(!out.status.success(), "a missing source must fail");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("LBR-REPO-001"),
+        "AC8: expected the LBR-REPO-001 stable code"
+    );
+    assert!(
+        !missing_git.exists() && !missing_work.exists(),
+        "a refused clone must not create either directory"
     );
 }
 
