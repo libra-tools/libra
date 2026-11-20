@@ -5198,9 +5198,20 @@ mod tests {
             {
                 argv.push(child.get_name().to_string());
                 required_argv(child, &mut argv);
+                if let Some(grand) = child.get_subcommands().next() {
+                    argv.push(grand.get_name().to_string());
+                    required_argv(grand, &mut argv);
+                }
                 chosen_sub = Some(child.get_name().to_string());
             } else {
                 required_argv(sub, &mut argv);
+            }
+            // Commands whose required shape is an argument group or a fixed
+            // value namespace rather than a plain required argument.
+            match name.as_str() {
+                "metadata" => argv.extend(["--repo".to_string(), "x".to_string()]),
+                "completions" => argv.push("bash".to_string()),
+                _ => {}
             }
             samples.push((name, argv, chosen_sub));
         }
