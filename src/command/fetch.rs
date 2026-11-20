@@ -166,18 +166,34 @@ impl RemoteClient {
 fn local_or_bundle_client(path: PathBuf, spec: &str) -> Result<RemoteClient, String> {
     match LocalClient::from_path(&path) {
         Ok(client) => Ok(RemoteClient::Local(client)),
-        Err(error) => match BundleClient::open_resolved(&path) {
-            Ok(client) => Ok(RemoteClient::Bundle(client)),
-            Err(bundle_error) => {
-                if looks_like_missing_bundle(&path, spec) {
-                    Err(format!("bundle file does not exist: {spec}"))
-                } else if path.is_file() {
-                    Err(format!("invalid local repository '{spec}': {bundle_error}"))
-                } else {
-                    Err(format!("invalid local repository '{spec}': {error}"))
+        Err(error) => {
+            // Git falls back to `<path>.git` when the requested path itself is
+            // not a repository (`git clone foo` finds the bare `foo.git`). Clone
+            // normalizes remote specs with a trailing separator, so trim it
+            // before appending the suffix.
+            let trimmed = path.to_string_lossy();
+            let trimmed = trimmed.trim_end_matches(['/', '\\']);
+            let mut suffixed = std::ffi::OsString::from(trimmed);
+            suffixed.push(".git");
+            let suffixed = PathBuf::from(suffixed);
+            if suffixed != path
+                && let Ok(client) = LocalClient::from_path(&suffixed)
+            {
+                return Ok(RemoteClient::Local(client));
+            }
+            match BundleClient::open_resolved(&path) {
+                Ok(client) => Ok(RemoteClient::Bundle(client)),
+                Err(bundle_error) => {
+                    if looks_like_missing_bundle(&path, spec) {
+                        Err(format!("bundle file does not exist: {spec}"))
+                    } else if path.is_file() {
+                        Err(format!("invalid local repository '{spec}': {bundle_error}"))
+                    } else {
+                        Err(format!("invalid local repository '{spec}': {error}"))
+                    }
                 }
             }
-        },
+        }
     }
 }
 

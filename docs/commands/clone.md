@@ -83,6 +83,12 @@ Checked-out entries carry the tree mode's permission bits (`100755` executable, 
 
 ## Options
 
+### `<path>.git` fallback
+
+When the requested local path is not itself a repository, a plain path and a
+`file://` URL both fall back to `<path>.git` (Git's `clone foo` finding the bare
+`foo.git`). `file://` keeps transport semantics and never hard-links objects.
+
 ### `<REMOTE_REPO>` (required)
 
 The remote repository URL to clone from. Supports Git (`git://host/user/repo.git`),

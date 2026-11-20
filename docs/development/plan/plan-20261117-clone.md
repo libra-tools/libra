@@ -1239,7 +1239,7 @@ PY
 ### Task CL-09: 支持 `libra clone` 的 `<path>.git` 后缀回退解析（含 `file://`）（#744）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `complete`（2026-11-20：`fetch::local_or_bundle_client` 在直接路径不是仓库时按 Git 约定回退探测 `<path>.git`（先 `trim_end_matches(['/','\\'])`，因为 clone 会把远端 spec 规范化为带尾斜杠的形式），`file://` 走同一分支；`file://` 与 `--no-local` 不硬链接对象（CL-08 的接管步骤现在只在「普通本地路径且未传 `--no-local`」时执行）。`command::clone_test::test_clone_path_git_suffix_fallback` 覆盖 AC1–AC3，nextest 1 passed；`clone_test` 全模块 58 passed / 0 failed。按用户 2026-11-20 指令在 `main` 直接提交推送。）
 **Description:** 当 `libra clone <path>` 或 `libra clone file://<path>` 指定的源路径不存在时，按 Git 约定回退探测 `<path>.git`（落点为 `LocalClient::from_path` 的路径解析，`local_client.rs:308`；不改 `fetch.rs`），且 `file://` URL 保持不创建硬链接语义。
 **Out of scope:** HTTP/SSH 远端 URL 重定向（永久非目标）。
 **Current evidence:**
@@ -1249,9 +1249,9 @@ PY
 | `#744` 本地路径与 `file://` URL 解析未尝试 `<path>.git` 后缀回退：`file://` 经 `to_file_path` 转为本地路径后与普通路径同走 `local_or_bundle_client`，它只调用 `LocalClient::from_path`，失败后仅尝试 bundle，不尝试 `<path>.git`；路径不存在时映射为 `LBR-REPO-001` | `src/command/fetch.rs:129-133,164-180`；`src/internal/protocol/local_client.rs:308`；`src/command/clone.rs:681-686` |
 
 **Acceptance criteria:**（每条单谓词，按「验证执行协议」第 6 项计数）
-- [ ] **AC1** 测试目录中只有裸仓库 `foo.git`（由 `libra clone --bare file://<S> foo.git` 生成）时，在该目录执行 `libra clone foo` 退出 0，且克隆目录 `foo` 的 `HEAD` 提交 OID 等于 S 的 `HEAD`。
-- [ ] **AC2** 在另一个只含 `foo.git`（同 AC1 生成方式）、不含 `foo` 的新测试目录 T2 中，`libra clone file://<T2>/foo dst` 退出 0，且 `dst` 的 `HEAD` 提交 OID 等于 S 的 `HEAD`（回退到 `foo.git`）。
-- [ ] **AC3** AC2 的 `dst` 中没有任何对象文件与 `<T2>/foo.git` 共享 (设备号, inode)（`file://` 不硬链接）。
+- [x] **AC1** 测试目录中只有裸仓库 `foo.git`（由 `libra clone --bare file://<S> foo.git` 生成）时，在该目录执行 `libra clone foo` 退出 0，且克隆目录 `foo` 的 `HEAD` 提交 OID 等于 S 的 `HEAD`。
+- [x] **AC2** 在另一个只含 `foo.git`（同 AC1 生成方式）、不含 `foo` 的新测试目录 T2 中，`libra clone file://<T2>/foo dst` 退出 0，且 `dst` 的 `HEAD` 提交 OID 等于 S 的 `HEAD`（回退到 `foo.git`）。
+- [x] **AC3** AC2 的 `dst` 中没有任何对象文件与 `<T2>/foo.git` 共享 (设备号, inode)（`file://` 不硬链接）。
 - [ ] **AC4** `bar` 与 `bar.git` 都不存在时，`libra clone bar` 以 `LBR-REPO-001` 拒绝（现有 `map_discover_remote_error` 的仓库不存在映射，`src/command/clone.rs:681-686`）。
 - [ ] ER-06/ER-06a 同卡强制门：`Docs and compatibility impact` 所列文件均按「文档与网站验收命令」逐文件验收（不计入 G-03）。
 

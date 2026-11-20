@@ -2248,11 +2248,13 @@ async fn clone_into_destination(
             .collect();
     }
 
-    // A local Libra source hands its object store to the clone (`--local`, and
-    // the default for a plain local path); `--no-local` keeps the fetched copy.
-    // This runs before any `--separate-git-dir` relocation, so the destination
-    // objects still live in the worktree.
+    // A plain local path (and an explicit `--local`) hands the local Libra
+    // source's object store to the clone; `file://` and `--no-local` keep the
+    // transport semantics and never hard-link. This runs before any
+    // `--separate-git-dir` relocation, so the destination objects still live in
+    // the worktree.
     if !args.no_local
+        && remote_spec_is_plain_local_path(&args.remote_repo)
         && let fetch::RemoteClient::Local(client) = remote_client
         && client.is_libra_source()
     {

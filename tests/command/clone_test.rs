@@ -3657,6 +3657,89 @@ fn test_clone_no_hardlinks_copies_objects() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn test_clone_path_git_suffix_fallback() {
+    use std::os::unix::fs::MetadataExt;
+
+    use crate::command::{assert_cli_success, create_committed_repo_via_cli, run_libra_command};
+
+    let src = create_committed_repo_via_cli();
+    let src_head = run_libra_command(&["rev-parse", "HEAD"], src.path());
+    assert_cli_success(&src_head, "source rev-parse HEAD");
+    let expected = String::from_utf8_lossy(&src_head.stdout).trim().to_string();
+    let bare_url = format!("file://{}", src.path().display());
+
+    // AC1: `clone foo` finds the bare `foo.git` next to it.
+    let t1 = tempdir().unwrap();
+    assert_cli_success(
+        &run_libra_command(
+            &["clone", "--bare", bare_url.as_str(), "foo.git"],
+            t1.path(),
+        ),
+        "create foo.git",
+    );
+    assert_cli_success(
+        &run_libra_command(&["clone", "foo"], t1.path()),
+        "AC1: clone foo resolves foo.git",
+    );
+    let head = run_libra_command(&["rev-parse", "HEAD"], &t1.path().join("foo"));
+    assert_cli_success(&head, "AC1: cloned HEAD");
+    assert_eq!(String::from_utf8_lossy(&head.stdout).trim(), expected);
+
+    // AC2/AC3: a `file://` URL falls back too, and never hard-links.
+    let t2 = tempdir().unwrap();
+    assert_cli_success(
+        &run_libra_command(
+            &["clone", "--bare", bare_url.as_str(), "foo.git"],
+            t2.path(),
+        ),
+        "create the second foo.git",
+    );
+    let dst = t2.path().join("dst");
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "clone",
+                &format!("file://{}/foo", t2.path().display()),
+                dst.to_str().expect("dst"),
+            ],
+            t2.path(),
+        ),
+        "AC2: file:// falls back to foo.git",
+    );
+    let head = run_libra_command(&["rev-parse", "HEAD"], &dst);
+    assert_cli_success(&head, "AC2: cloned HEAD");
+    assert_eq!(String::from_utf8_lossy(&head.stdout).trim(), expected);
+
+    fn walk(dir: &std::path::Path, out: &mut Vec<(u64, u64)>) {
+        for entry in std::fs::read_dir(dir).expect("read dir") {
+            let entry = entry.expect("entry");
+            let path = entry.path();
+            let file_type = entry.file_type().expect("type");
+            if file_type.is_dir() {
+                walk(&path, out);
+            } else {
+                let meta = std::fs::metadata(&path).expect("meta");
+                out.push((meta.dev(), meta.ino()));
+            }
+        }
+    }
+    let mut source_inodes = Vec::new();
+    walk(
+        &t2.path().join("foo.git").join("objects"),
+        &mut source_inodes,
+    );
+    let mut dest_inodes = Vec::new();
+    walk(&dst.join(".libra/objects"), &mut dest_inodes);
+    for inode in dest_inodes {
+        assert!(
+            !source_inodes.contains(&inode),
+            "AC3: file:// must not hard-link objects"
+        );
+    }
+}
+
 #[test]
 fn test_clone_reject_shallow_local_git_source() {
     use super::{create_linear_git_repo, git_success, run_libra_command};
