@@ -9,7 +9,7 @@
 use std::{
     fs,
     path::Path,
-    process::Command,
+    process::{Command, Stdio},
     sync::OnceLock,
     time::{Duration, Instant},
 };
@@ -772,6 +772,207 @@ fn clone_no_progress_flag_is_accepted() {
     assert!(
         !stderr.contains("unexpected argument"),
         "--no-progress is accepted by the parser: {stderr}"
+    );
+}
+
+fn run_libra_with_stderr_file(
+    args: &[&str],
+    cwd: &Path,
+    stderr_path: &Path,
+) -> std::process::Output {
+    let home = cwd.join(".libra-test-home");
+    let config_home = home.join(".config");
+    let global_db = home.join(".libra").join("config.db");
+    let system_db = home.join(".libra").join("system-config.db");
+    fs::create_dir_all(&config_home).expect("create isolated config directory");
+    let stderr = fs::File::create(stderr_path).expect("create stderr capture file");
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_libra"));
+    command
+        .args(args)
+        .current_dir(cwd)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("LIBRA_CONFIG_GLOBAL_DB", &global_db)
+        .env("LIBRA_CONFIG_SYSTEM_DB", &system_db)
+        .env("LANG", "C")
+        .env("LC_ALL", "C")
+        .env(libra::utils::pager::LIBRA_TEST_ENV, "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::from(stderr));
+    if let Some(llvm_profile_file) = std::env::var_os("LLVM_PROFILE_FILE") {
+        command.env("LLVM_PROFILE_FILE", llvm_profile_file);
+    }
+    command
+        .output()
+        .expect("failed to execute libra binary with stderr file")
+}
+
+#[test]
+fn test_clone_boolean_progress_does_not_consume_url() {
+    use super::{assert_cli_success, run_libra_command};
+
+    let parent = tempdir().unwrap();
+    let src = committed_named_repo(parent.path(), "progress-src");
+    let src_head = run_libra_command(&["rev-parse", "HEAD"], &src);
+    assert_cli_success(&src_head, "source rev-parse HEAD");
+    let expected = String::from_utf8_lossy(&src_head.stdout).trim().to_string();
+    let url = format!("file://{}", src.display());
+
+    // (case name, extra clone flags, whether a `%` line is expected)
+    let cases: &[(&str, &[&str], bool)] = &[
+        ("progress", &["--progress"], true),
+        ("no-progress", &["--no-progress"], false),
+        ("progress-none", &["--progress=none"], false),
+        ("progress-text", &["--progress=text"], true),
+        (
+            "progress-text-no-progress",
+            &["--progress=text", "--no-progress"],
+            false,
+        ),
+        ("progress-auto", &["--progress=auto"], false),
+        ("quiet", &["--quiet", "--progress"], false),
+        ("json", &["--json", "--progress"], false),
+        ("machine", &["--machine", "--progress"], false),
+        // Existing mode-value spelling must remain accepted for compatibility.
+        ("progress-legacy-text", &["--progress", "text"], true),
+    ];
+
+    for &(name, extra, expect_percent) in cases {
+        let destination = parent.path().join(format!("{name}-dest"));
+        let stderr_path = parent.path().join(format!("{name}.stderr"));
+        let mut args = vec!["clone"];
+        args.extend_from_slice(extra);
+        args.push(url.as_str());
+        args.push(destination.to_str().expect("dest path"));
+        let out = run_libra_with_stderr_file(&args, parent.path(), &stderr_path);
+        assert_cli_success(&out, name);
+        let stderr = fs::read_to_string(&stderr_path).expect("read captured stderr");
+        assert_eq!(
+            stderr.contains('%'),
+            expect_percent,
+            "{name}: unexpected progress output on redirected stderr: {stderr}"
+        );
+    }
+
+    let global_progress_dest = parent.path().join("progress-global-dest");
+    let global_progress_stderr = parent.path().join("progress-global.stderr");
+    let global_progress = run_libra_with_stderr_file(
+        &[
+            "--color=never",
+            "--progress",
+            "clone",
+            url.as_str(),
+            global_progress_dest.to_str().expect("global dest path"),
+        ],
+        parent.path(),
+        &global_progress_stderr,
+    );
+    assert_cli_success(&global_progress, "global flags before --progress clone");
+    let global_stderr =
+        fs::read_to_string(&global_progress_stderr).expect("read global progress stderr");
+    assert!(
+        global_stderr.contains('%'),
+        "a global flag before --progress clone must still preserve boolean progress: {global_stderr}"
+    );
+
+    let json_progress_dest = parent.path().join("progress-json-dest");
+    let json_progress_stderr = parent.path().join("progress-json.stderr");
+    let json_progress = run_libra_with_stderr_file(
+        &[
+            "clone",
+            "--progress=json",
+            url.as_str(),
+            json_progress_dest.to_str().expect("json dest path"),
+        ],
+        parent.path(),
+        &json_progress_stderr,
+    );
+    assert_cli_success(&json_progress, "clone --progress=json");
+    let json_stderr = fs::read_to_string(&json_progress_stderr).expect("read json progress stderr");
+    let json_lines: Vec<&str> = json_stderr
+        .lines()
+        .filter(|line| line.trim_start().starts_with('{'))
+        .collect();
+    assert!(
+        !json_lines.is_empty(),
+        "--progress=json must emit NDJSON progress events: {json_stderr}"
+    );
+    for line in &json_lines {
+        serde_json::from_str::<serde_json::Value>(line)
+            .unwrap_or_else(|error| panic!("invalid NDJSON progress line {line:?}: {error}"));
+    }
+    assert!(
+        json_stderr.contains("\"event\":\"progress\""),
+        "--progress=json must emit a progress event: {json_stderr}"
+    );
+    assert!(
+        json_stderr.contains("\"event\":\"progress_done\""),
+        "--progress=json must emit a completion event: {json_stderr}"
+    );
+
+    let json_no_progress_dest = parent.path().join("progress-json-none-dest");
+    let json_no_progress_stderr = parent.path().join("progress-json-none.stderr");
+    let json_no_progress = run_libra_with_stderr_file(
+        &[
+            "clone",
+            "--progress=json",
+            "--no-progress",
+            url.as_str(),
+            json_no_progress_dest.to_str().expect("json none dest path"),
+        ],
+        parent.path(),
+        &json_no_progress_stderr,
+    );
+    assert_cli_success(&json_no_progress, "clone --progress=json --no-progress");
+    let json_none =
+        fs::read_to_string(&json_no_progress_stderr).expect("read suppressed json progress stderr");
+    for line in json_none
+        .lines()
+        .filter(|line| line.trim_start().starts_with('{'))
+    {
+        let event: serde_json::Value = serde_json::from_str(line)
+            .unwrap_or_else(|error| panic!("invalid NDJSON {line:?}: {error}"));
+        let name = event.get("event").and_then(|value| value.as_str());
+        assert!(
+            !matches!(name, Some("progress" | "progress_done")),
+            "--no-progress must suppress all NDJSON progress events: {line}"
+        );
+    }
+
+    let cloned_head =
+        run_libra_command(&["rev-parse", "HEAD"], &parent.path().join("progress-dest"));
+    assert_cli_success(&cloned_head, "cloned rev-parse HEAD");
+    assert_eq!(
+        String::from_utf8_lossy(&cloned_head.stdout).trim(),
+        expected,
+        "clone --progress must not consume the URL as the mode value"
+    );
+}
+
+#[test]
+fn test_clone_help_documents_boolean_progress() {
+    use super::run_libra_command;
+
+    let temp = tempdir().unwrap();
+    let output = run_libra_command(&["clone", "--help"], temp.path());
+    assert!(
+        output.status.success(),
+        "clone --help should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let help = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        help.contains("--progress=<MODE>"),
+        "clone help must document the explicit mode spelling: {help}"
+    );
+    assert!(
+        help.contains("libra clone --progress"),
+        "clone help must include the boolean --progress example: {help}"
     );
 }
 

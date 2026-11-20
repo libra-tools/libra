@@ -291,7 +291,11 @@ pub(crate) struct Cli {
 
     /// Control progress output for long-running operations.
     /// `json` emits NDJSON progress events; `text` shows a human-friendly bar;
-    /// `none` suppresses progress entirely.
+    /// `none` suppresses progress entirely. For `clone`, a bare `--progress` is
+    /// a boolean flag that does not consume the URL; use `--progress=<MODE>` for
+    /// an explicit mode. The legacy tokens `json`, `text`, `none`, and `auto`
+    /// immediately after a bare clone `--progress` are still consumed as modes;
+    /// separate a source with one of those exact names using `--`.
     #[arg(
         long,
         global = true,
@@ -1160,6 +1164,70 @@ fn rewrite_index_pack_progress_args(args: Vec<std::ffi::OsString>) -> Vec<std::f
     out
 }
 
+/// Rewrite a bare `clone --progress` into `--progress=text` before clap sees it.
+///
+/// Git's `clone --progress` is a boolean flag, but Libra's global `--progress`
+/// option takes a mode value; without this rewrite clap consumes the clone URL
+/// as the mode. A bare `--progress` followed by an explicit mode token keeps
+/// the legacy `--progress <mode>` spelling; any other following token is a
+/// positional, so the bare flag becomes `--progress=text` without consuming it.
+/// `--no-progress` is deliberately left for clone's own handler.
+fn rewrite_clone_progress_args(args: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
+    let Some((clone_index, from_double_dash)) = find_subcommand_index(&args) else {
+        return args;
+    };
+    if from_double_dash || !matches!(args.get(clone_index), Some(name) if name == "clone") {
+        return args;
+    }
+
+    let mut out: Vec<std::ffi::OsString> = args.iter().take(clone_index + 1).cloned().collect();
+    // A bare global `--progress` in the prefix is boolean for clone, even when
+    // another global flag sits between it and the subcommand. An explicit
+    // `--progress <mode>` prefix is left untouched.
+    for index in 1..clone_index {
+        if out[index] != "--progress" {
+            continue;
+        }
+        let next_is_mode = out
+            .get(index + 1)
+            .and_then(|next| next.to_str())
+            .is_some_and(|next| matches!(next, "json" | "text" | "none" | "auto"));
+        if !next_is_mode {
+            out[index] = std::ffi::OsString::from("--progress=text");
+        }
+    }
+
+    let mut after_double_dash = false;
+    let mut rest = args.into_iter().skip(clone_index + 1).peekable();
+    while let Some(arg) = rest.next() {
+        if after_double_dash {
+            out.push(arg);
+            continue;
+        }
+        if arg == "--" {
+            after_double_dash = true;
+            out.push(arg);
+            continue;
+        }
+        if arg == "--progress" {
+            let explicit_mode = rest
+                .peek()
+                .and_then(|next| next.to_str())
+                .map(str::to_owned)
+                .filter(|next| matches!(next.as_str(), "json" | "text" | "none" | "auto"));
+            if let Some(mode) = explicit_mode {
+                out.push(std::ffi::OsString::from(format!("--progress={mode}")));
+                rest.next();
+            } else {
+                out.push(std::ffi::OsString::from("--progress=text"));
+            }
+        } else {
+            out.push(arg);
+        }
+    }
+    out
+}
+
 fn rewrite_reset_pathspec_separator_args(args: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
     let subcommand = find_subcommand_index(&args);
     let Some((reset_index, from_double_dash)) = subcommand else {
@@ -1363,7 +1431,32 @@ fn find_subcommand_index(args: &[std::ffi::OsString]) -> Option<(usize, bool)> {
             i += 1;
             continue;
         }
-        if matches!(arg, "--progress" | "--max-connections") {
+        if arg == "--progress" {
+            // A bare global `--progress` immediately before `clone` is a
+            // boolean flag; the next token is the subcommand, not a mode value.
+            // When another flag follows, skip only `--progress` so that the
+            // next iteration can consume that flag and its own value.
+            let next = args.get(i + 1).and_then(|next| next.to_str());
+            match next {
+                Some("clone") => {
+                    i += 1;
+                    continue;
+                }
+                Some("json" | "text" | "none" | "auto") => {
+                    i = (i + 2).min(args.len());
+                    continue;
+                }
+                Some(next) if next.starts_with('-') => {
+                    i += 1;
+                    continue;
+                }
+                _ => {
+                    i = (i + 2).min(args.len());
+                    continue;
+                }
+            }
+        }
+        if arg == "--max-connections" {
             i = (i + 2).min(args.len());
             continue;
         }
@@ -3496,6 +3589,7 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
     // form `log -<n>` uses); it rewrites to the hidden `--last-n <n>`.
     let argv = rewrite_short_number_args_to(argv, "format-patch", "--last-n");
     let argv = rewrite_index_pack_progress_args(argv);
+    let argv = rewrite_clone_progress_args(argv);
     let argv = rewrite_reset_pathspec_separator_args(argv);
     let argv = rewrite_show_pathspec_separator_args(argv);
     // §B.4.3 (R0-4): rewrite the status/st argument slice so Git's raw
@@ -4987,6 +5081,209 @@ mod tests {
                 "index-pack",
                 "--progress=none",
                 "fixture.pack"
+            ]
+        );
+    }
+
+    #[test]
+    fn clone_progress_rewrite_keeps_url_positional() {
+        let rewritten = rewrite_clone_progress_args(vec![
+            "libra".into(),
+            "clone".into(),
+            "--progress".into(),
+            "file:///tmp/src".into(),
+            "dest".into(),
+        ]);
+
+        assert_eq!(
+            rewritten,
+            vec![
+                "libra",
+                "clone",
+                "--progress=text",
+                "file:///tmp/src",
+                "dest"
+            ]
+        );
+    }
+
+    #[test]
+    fn clone_progress_rewrite_preserves_explicit_modes() {
+        let explicit_mode = rewrite_clone_progress_args(vec![
+            "libra".into(),
+            "clone".into(),
+            "--progress=json".into(),
+            "file:///tmp/src".into(),
+        ]);
+        assert_eq!(
+            explicit_mode,
+            vec!["libra", "clone", "--progress=json", "file:///tmp/src"]
+        );
+
+        let no_progress = rewrite_clone_progress_args(vec![
+            "libra".into(),
+            "clone".into(),
+            "--no-progress".into(),
+            "file:///tmp/src".into(),
+        ]);
+        assert_eq!(
+            no_progress,
+            vec!["libra", "clone", "--no-progress", "file:///tmp/src"]
+        );
+
+        // A bare `--progress` after another subcommand stays untouched.
+        let other_subcommand =
+            rewrite_clone_progress_args(vec!["libra".into(), "fetch".into(), "--progress".into()]);
+        assert_eq!(other_subcommand, vec!["libra", "fetch", "--progress"]);
+    }
+
+    #[test]
+    fn clone_progress_rewrite_reserves_legacy_mode_names() {
+        // A source named `text` must be separated with `--`; otherwise the
+        // legacy `--progress text` spelling consumes it as the mode.
+        let rewritten = rewrite_clone_progress_args(vec![
+            "libra".into(),
+            "clone".into(),
+            "--progress".into(),
+            "--".into(),
+            "text".into(),
+            "dest".into(),
+        ]);
+        assert_eq!(
+            rewritten,
+            vec!["libra", "clone", "--progress=text", "--", "text", "dest"]
+        );
+    }
+
+    #[test]
+    fn clone_progress_rewrite_stops_at_double_dash() {
+        let rewritten = rewrite_clone_progress_args(vec![
+            "libra".into(),
+            "clone".into(),
+            "--".into(),
+            "--progress".into(),
+            "dest".into(),
+        ]);
+        assert_eq!(
+            rewritten,
+            vec!["libra", "clone", "--", "--progress", "dest"]
+        );
+    }
+
+    #[test]
+    fn clone_progress_rewrite_does_not_touch_other_subcommands() {
+        let rewritten = rewrite_clone_progress_args(vec![
+            "libra".into(),
+            "fetch".into(),
+            "--progress".into(),
+            "clone".into(),
+        ]);
+        assert_eq!(rewritten, vec!["libra", "fetch", "--progress", "clone"]);
+    }
+
+    #[test]
+    fn clone_progress_rewrite_does_not_touch_tokens_after_double_dash() {
+        let rewritten = rewrite_clone_progress_args(vec![
+            "libra".into(),
+            "clone".into(),
+            "--".into(),
+            "--progress".into(),
+            "clone".into(),
+        ]);
+        assert_eq!(
+            rewritten,
+            vec!["libra", "clone", "--", "--progress", "clone"]
+        );
+    }
+
+    #[test]
+    fn clone_progress_rewrite_handles_value_flag_between_progress_and_clone() {
+        let rewritten = rewrite_clone_progress_args(vec![
+            "libra".into(),
+            "--progress".into(),
+            "--max-connections".into(),
+            "2".into(),
+            "clone".into(),
+            "file:///tmp/src".into(),
+            "dest".into(),
+        ]);
+        assert_eq!(
+            rewritten,
+            vec![
+                "libra",
+                "--progress=text",
+                "--max-connections",
+                "2",
+                "clone",
+                "file:///tmp/src",
+                "dest"
+            ]
+        );
+    }
+
+    #[test]
+    fn clone_progress_rewrite_handles_global_flag_between_progress_and_clone() {
+        let rewritten = rewrite_clone_progress_args(vec![
+            "libra".into(),
+            "--progress".into(),
+            "--quiet".into(),
+            "clone".into(),
+            "file:///tmp/src".into(),
+            "dest".into(),
+        ]);
+        assert_eq!(
+            rewritten,
+            vec![
+                "libra",
+                "--progress=text",
+                "--quiet",
+                "clone",
+                "file:///tmp/src",
+                "dest"
+            ]
+        );
+    }
+
+    #[test]
+    fn clone_progress_rewrite_handles_global_flags_before_progress() {
+        let rewritten = rewrite_clone_progress_args(vec![
+            "libra".into(),
+            "--quiet".into(),
+            "--progress".into(),
+            "clone".into(),
+            "file:///tmp/src".into(),
+            "dest".into(),
+        ]);
+        assert_eq!(
+            rewritten,
+            vec![
+                "libra",
+                "--quiet",
+                "--progress=text",
+                "clone",
+                "file:///tmp/src",
+                "dest"
+            ]
+        );
+    }
+
+    #[test]
+    fn clone_progress_rewrite_handles_global_prefix() {
+        let rewritten = rewrite_clone_progress_args(vec![
+            "libra".into(),
+            "--progress".into(),
+            "clone".into(),
+            "file:///tmp/src".into(),
+            "dest".into(),
+        ]);
+        assert_eq!(
+            rewritten,
+            vec![
+                "libra",
+                "--progress=text",
+                "clone",
+                "file:///tmp/src",
+                "dest"
             ]
         );
     }

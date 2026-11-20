@@ -324,6 +324,22 @@ override an earlier `--no-tags` (last flag wins).
 libra clone --no-tags git@github.com:user/repo.git
 ```
 
+### `--progress`
+
+Emit a completion progress line (`Receiving objects: 100%`) on `stderr` when
+`stderr` is redirected to a file or pipe (non-TTY). On a TTY the interactive
+spinner is used instead. `--progress` is a boolean flag: the repository URL
+remains the positional source and is not consumed as the flag's value. Use
+`--progress=<MODE>` for an explicit global mode, and `--progress=none` (or
+`--no-progress`) to suppress the completion line. The four legacy mode tokens `json`, `text`, `none`, and `auto`
+immediately after a bare `--progress` are still consumed as modes; separate a
+source with one of those exact names using `--` (for example
+`libra clone --progress -- text dest`).
+
+```bash
+libra clone --progress https://github.com/user/repo.git
+```
+
 ### `--no-progress`
 
 Suppress the fetch progress meter (the "Receiving objects" spinner) during the
@@ -600,7 +616,7 @@ not, because its operation-log model fetches all refs by design.
 | Separate git dir | `--separate-git-dir=<dir>` | N/A | N/A (removed) |
 | Template directory | `--template=<dir>` | N/A | N/A (handled by init internally) |
 | Quiet mode | `-q` / `--quiet` | `--quiet` | `--quiet` (global flag) |
-| Verbose / progress | `--progress` / `--verbose` | N/A | Phased stderr progress (default) |
+| Verbose / progress | `--progress` / `--verbose` | N/A | `--progress` is a boolean clone flag; bare `--progress` emits a completion line on redirected stderr; `--progress=<mode>` selects an explicit global mode; `--verbose` N/A |
 | No checkout | `-n` / `--no-checkout` | N/A | `--no-checkout` |
 | Sparse checkout | `--sparse` | N/A | N/A |
 | Filter (partial clone) | `--filter=<spec>` | N/A | accepted no-op for Git remotes (ignored + warning; no new cutoff except `--depth`; source shallow boundaries preserved) |

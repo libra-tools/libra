@@ -163,6 +163,14 @@ libra clone --reference /path/to/local/mirror git@github.com:user/repo.git
 libra clone --dissociate git@github.com:user/repo.git
 ```
 
+### `--progress`
+
+当 `stderr` 被重定向到文件或管道（非 TTY）时，在 `stderr` 输出完成进度行（`Receiving objects: 100%`）；TTY 下使用交互式 spinner。`--progress` 是布尔开关：仓库 URL 仍是位置参数，不会被当作该开关的取值消费。显式模式用 `--progress=<MODE>`，抑制完成行用 `--progress=none`（或 `--no-progress`）。`json`、`text`、`none`、`auto` 四个旧模式 token 紧跟在裸 `--progress` 后仍会被当作模式；源目录若正好叫这些名字，用 `--` 分隔（例如 `libra clone --progress -- text dest`）。
+
+```bash
+libra clone --progress https://github.com/user/repo.git
+```
+
 ### `--no-progress`
 
 在克隆期间抑制 fetch 进度条（“Receiving objects” spinner），对齐 `git clone --no-progress`。其它输出不受影响。
@@ -367,7 +375,7 @@ Libra 使用 `.libraignore` 作为忽略策略。非裸克隆期间，每个检�
 | 独立 git dir | `--separate-git-dir=<dir>` | N/A | N/A（已移除） |
 | 模板目录 | `--template=<dir>` | N/A | N/A（由 init 内部处理） |
 | Quiet 模式 | `-q` / `--quiet` | `--quiet` | `--quiet`（全局标志） |
-| Verbose / 进度 | `--progress` / `--verbose` | N/A | 分阶段 stderr 进度（默认） |
+| Verbose / 进度 | `--progress` / `--verbose` | N/A | `--progress` 是 clone 的布尔开关；裸 `--progress` 在重定向 stderr 时输出完成行；`--progress=<mode>` 选择显式全局模式；`--verbose` N/A |
 | 不检出 | `-n` / `--no-checkout` | N/A | `--no-checkout` |
 | 稀疏检出 | `--sparse` | N/A | N/A |
 | Filter（部分克隆） | `--filter=<spec>` | N/A | Git 远程按 no-op 接受（忽略+告警；仅 `--depth` 可新增深度限制；保留源浅边界） |

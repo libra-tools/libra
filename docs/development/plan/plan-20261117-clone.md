@@ -389,7 +389,7 @@ PY
 ### Task CL-01: 修复 `libra clone --progress` 布尔解析（含重定向 stderr 输出 `%`）（#737）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `complete`（2026-11-20：`0.30.211`；targeted `command::clone_test::test_clone_boolean_progress_does_not_consume_url` + `test_clone_help_documents_boolean_progress` 2/2，lib `clone_progress_rewrite*` + `index_pack_progress_rewrite*` 11/11；Codex R6 `VERDICT: PASS`；主仓与网站文档已同步；远端 CI 未等待，按用户 2026-11-20 指令 local C/D）
 **Description:** 按 ADR-CL-01 修复 `libra clone --progress <url>` 将 `<url>` 当成 `--progress` 参数值消费的问题，同时兼容 `clone.rs:111-112` 既有的 `--no-progress` 处理器（不将其提前改写为全局 `--progress=none` 以免绕过原有处理），并确保 `--progress` 在 stderr 重定向至非 TTY 时仍输出 `%` 进度。
 **Out of scope:** 非 `clone` 子命令的全局 `--progress=<mode>` 语义（永久非目标）。
 **Current evidence:**
@@ -399,11 +399,11 @@ PY
 | `#737` 全局 `--progress` 消费后续位置参数 `<url>`；仅 `index-pack` 有 `rewrite_index_pack_progress_args` | `src/cli.rs:292-302,1121,1318,1366` |
 
 **Acceptance criteria:**（每条单谓词，按「验证执行协议」第 6 项计数）
-- [ ] **AC1** `libra clone --progress file://<S> d` 退出 0，且 `d` 中 `HEAD` 解析出的提交 OID 等于 S 的 `HEAD`（`<url>` 未被 `--progress` 当作取值吞掉）。
-- [ ] **AC2** AC1 的命令在 stderr 重定向到文件时，该文件至少有一行含 `%` 的进度行。
-- [ ] **AC3** `libra clone --no-progress file://<S> d2`（stderr 重定向到文件）退出 0，且其 stderr 不含 `%`（克隆成功是读取 stderr 的前提）。
-- [ ] **AC4** `libra clone --progress=none file://<S> d3`（显式取值形式，stderr 重定向到文件）退出 0，且其 stderr 不含 `%`。
-- [ ] ER-06/ER-06a 同卡强制门：`Docs and compatibility impact` 所列文件均按「文档与网站验收命令」逐文件验收（不计入 G-03）。
+- [x] **AC1** `libra clone --progress file://<S> d` 退出 0，且 `d` 中 `HEAD` 解析出的提交 OID 等于 S 的 `HEAD`（`<url>` 未被 `--progress` 当作取值吞掉）。
+- [x] **AC2** AC1 的命令在 stderr 重定向到文件时，该文件至少有一行含 `%` 的进度行。
+- [x] **AC3** `libra clone --no-progress file://<S> d2`（stderr 重定向到文件）退出 0，且其 stderr 不含 `%`（克隆成功是读取 stderr 的前提）。
+- [x] **AC4** `libra clone --progress=none file://<S> d3`（显式取值形式，stderr 重定向到文件）退出 0，且其 stderr 不含 `%`。
+- [x] ER-06/ER-06a 同卡强制门：`Docs and compatibility impact` 所列文件均按「文档与网站验收命令」逐文件验收（不计入 G-03）。
 
 **AC → 断言映射:**（「验证执行协议」第 4、6 项：映射与 AC 表述同一谓词；成功类 `exit 0` 为读取输出的前提；失败类按第 6 项断言非零状态与稳定码）
 - AC1 → `command::clone_test::test_clone_boolean_progress_does_not_consume_url`：`exit 0` 后在 `d` 执行 `libra rev-parse HEAD`，stdout 去掉换行后等于在 S 执行同一命令的结果。
@@ -413,8 +413,8 @@ PY
 - 文档 AC（ER-06/ER-06a 同卡强制门，不计入 G-03）→ 「文档与网站验收命令」第 1–8 步；文档关键字：`--progress`。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest run --test command_test -E 'test(=command::clone_test::test_clone_boolean_progress_does_not_consume_url)'` `(new)` — 卡特有用例（「验证执行协议」第 1–4 项），覆盖 AC1–AC4。
-- [ ] `source .env.test && cargo nextest run --lib -E 'test(/^cli::tests::index_pack_progress_rewrite/)'` — 共享回归组（「验证执行协议」第 5 项）：既有 `index-pack` 布尔 `--progress` 重写回归（`src/cli.rs:4956`）。
+- [x] `source .env.test && cargo nextest run --test command_test -E 'test(=command::clone_test::test_clone_boolean_progress_does_not_consume_url)'` `(new)` — 卡特有用例（「验证执行协议」第 1–4 项），覆盖 AC1–AC4。
+- [x] `source .env.test && cargo nextest run --lib -E 'test(/^cli::tests::index_pack_progress_rewrite/)'` — 共享回归组（「验证执行协议」第 5 项）：既有 `index-pack` 布尔 `--progress` 重写回归（`src/cli.rs:4956`）。
 
 **Full-suite trigger:** `T-1: 修改 src/cli.rs 全局参数预处理`
 **Dependencies:** `无`

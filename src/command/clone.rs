@@ -6,7 +6,8 @@
 //! machine output according to the global [`OutputConfig`].
 
 use std::{
-    env, fs, io,
+    env, fs,
+    io::{self, IsTerminal},
     path::{Path, PathBuf},
 };
 
@@ -35,7 +36,7 @@ use crate::{
     utils::{
         error::{CliError, CliResult, StableErrorCode},
         ignore as ignore_utils,
-        output::{OutputConfig, emit_json_data},
+        output::{OutputConfig, ProgressMode, emit_json_data},
         path, util,
     },
 };
@@ -58,6 +59,7 @@ const ISSUE_URL: &str = "https://github.com/libra-tools/libra/issues";
     libra clone -b develop git@github.com:user/repo.git   Clone specific branch\n    \
     libra clone --single-branch -b main <url>             Clone only one branch\n    \
     libra clone --no-checkout <url>                       Set up the repo without checking out files\n    \
+    libra clone --progress <url>                          Emit a completion progress line on redirected stderr\n    \
     libra clone -o upstream <url>                         Name the remote 'upstream' instead of 'origin'\n    \
     libra clone --depth 1 <url>                           Shallow clone (latest commit only)\n    \
     libra clone --deps-of scene.usd <local-libra>         Scope the view to a file's dependency closure (lore.md 3.2)")]
@@ -1677,6 +1679,19 @@ async fn clone_into_destination(
     // Clone owns this fresh repository exclusively; the fetch's ref updates
     // landed inside — release the pack's `.keep` pin now.
     fetch_result.release_pack_pin();
+
+    // Explicit `--progress` must remain observable when stderr is redirected;
+    // the indicatif spinner is TTY-only, so emit the completion line directly.
+    // On a TTY the spinner already rendered it, and `--no-progress` /
+    // `--progress=none` must stay byte-clean of `%`.
+    if !args.no_progress
+        && !output.quiet
+        && !output.is_json()
+        && matches!(output.progress, ProgressMode::Text)
+        && !io::stderr().is_terminal()
+    {
+        eprintln!("Receiving objects: 100%");
+    }
 
     // --- Step 6–7: Configure repository + checkout ---
     if !output.quiet && !output.is_json() {
