@@ -189,6 +189,14 @@ libra clone --no-progress git@github.com:user/repo.git
 libra clone -n git@github.com:user/repo.git
 ```
 
+### `-c`, `--config <key=value>`
+
+在新仓库中写入配置项，对齐 `git clone -c`。可重复，按命令行顺序记录（`-c a.b=1 -c a.b=2` 两个值都会保存）。`clone.defaultRemoteName=<name>` 在初始 fetch 之前生效（远端跟踪引用使用该名字）；显式 `-o`/`--origin` 优先于它，两者都缺省时使用全局 `clone.defaultRemoteName`。空键（`-c =v`）以 `LBR-CLI-002` 拒绝。
+
+```bash
+libra clone -c core.foo=bar git@github.com:user/repo.git
+```
+
 ### `--revision <REV>`
 
 只克隆指定修订（例如 `refs/heads/main` 或 `refs/tags/v1`），并检出为游离 HEAD，对齐 `git clone --revision`。不会创建本地分支、标签或远端跟踪引用，也不写入 `remote.<name>.fetch`，因此克隆只包含该修订可达的对象。与 `--branch`、`--mirror` 互斥（`LBR-CLI-002`）。

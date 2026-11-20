@@ -781,7 +781,7 @@ PY
 ### Task CL-06: 支持 `libra clone -c <key=value>` 配置覆盖与 `clone.defaultRemoteName`（#752）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `complete`（2026-11-20：`CloneArgs` 新增可重复 `-c`/`--config <key=value>`；init 后按命令行顺序写入新仓库配置（多值追加，`config get --all` 得 `1\n2\n`）；`clone.defaultRemoteName` 在初始 fetch 前解析：显式 `--origin` > `-c clone.defaultRemoteName` > 全局 `clone.defaultRemoteName` > `origin`；空键以 `LBR-CLI-002` 拒绝（`CloneError::InvalidConfigEntry`）。`command::clone_test::test_clone_config_overrides` 覆盖 AC1–AC6，nextest 1 passed / 0 failed；`cargo +nightly fmt --all --check` exit 0。按用户 2026-11-20 指令在 `main` 直接提交推送。）
 **Description:** 为 `CloneArgs` 新增可重复 `-c` / `--config <key=value>`，在初始化目标仓库后写入新仓库配置；其中 `clone.defaultRemoteName` 在初始 fetch 前生效（以 AC3–AC5 的远端跟踪引用观测），其它配置项对本次初始 fetch/checkout 的即时影响不在本卡验收（`DEFER-CL-07`），同时支持 `clone.defaultRemoteName` 并确保显式 `--origin` 优先于 `-c clone.defaultRemoteName`。
 **Out of scope:** 非 `clone` 子命令的全局配置覆盖。
 **Current evidence:**
@@ -791,12 +791,12 @@ PY
 | `#752` `CloneArgs` 缺少 `-c`/`--config` 参数且未读取 `clone.defaultRemoteName` | `src/command/clone.rs:64-236` |
 
 **Acceptance criteria:**（每条单谓词，按「验证执行协议」第 6 项计数）
-- [ ] **AC1** 短、长两种形式（表驱动，按「验证执行协议」第 6 项计为 1 条：结局相同）：`libra clone -c core.foo=bar file://<S> d` 与 `libra clone --config core.foo=bar file://<S> d1` 退出 0 后，`d`、`d1` 中 `libra config get core.foo` 的 stdout 均为 `bar` 加换行。
-- [ ] **AC2** `libra clone -c a.b=1 -c a.b=2 file://<S> d2` 后，`d2` 中 `libra config get --all a.b` 的 stdout 为 `1\n2\n`（多值按出现顺序全部写入）。
-- [ ] **AC3** `libra clone -c clone.defaultRemoteName=upstream file://<S> d3` 后，`d3` 的 `reference` 表中 `kind='Branch' AND remote IS NOT NULL` 各行的 `remote` 去重集合恰为 {`upstream`}（配置在初始 fetch 前生效，未同时建立 `origin` 远端跟踪分支）。
-- [ ] **AC4** `libra clone -c clone.defaultRemoteName=inline --origin from_option file://<S> d4` 后，`d4` 的 `reference` 表中 `kind='Branch' AND remote IS NOT NULL` 各行的 `remote` 去重集合恰为 {`from_option`}（显式 `--origin` 优先，`inline` 未参与；`#752`，对应 Git `t/t5606-clone-options.sh#16`）。
-- [ ] **AC5** 以逐子进程环境变量 `LIBRA_CONFIG_GLOBAL_DB=<测试临时目录>/global.db` 隔离全局配置，执行 `libra config set --global clone.defaultRemoteName from_config` 后，不带 `-c` 的 `libra clone file://<S> d6` 中，`d6` 的 `reference` 表中 `kind='Branch' AND remote IS NOT NULL` 各行的 `remote` 去重集合恰为 {`from_config`}（对应 Git `t/t5606-clone-options.sh` 的 `test_config_global clone.defaultRemoteName` 用例）。
-- [ ] **AC6** `libra clone -c =v file://<S> d5`（空键名）以 `LBR-CLI-002` 拒绝。
+- [x] **AC1** 短、长两种形式（表驱动，按「验证执行协议」第 6 项计为 1 条：结局相同）：`libra clone -c core.foo=bar file://<S> d` 与 `libra clone --config core.foo=bar file://<S> d1` 退出 0 后，`d`、`d1` 中 `libra config get core.foo` 的 stdout 均为 `bar` 加换行。
+- [x] **AC2** `libra clone -c a.b=1 -c a.b=2 file://<S> d2` 后，`d2` 中 `libra config get --all a.b` 的 stdout 为 `1\n2\n`（多值按出现顺序全部写入）。
+- [x] **AC3** `libra clone -c clone.defaultRemoteName=upstream file://<S> d3` 后，`d3` 的 `reference` 表中 `kind='Branch' AND remote IS NOT NULL` 各行的 `remote` 去重集合恰为 {`upstream`}（配置在初始 fetch 前生效，未同时建立 `origin` 远端跟踪分支）。
+- [x] **AC4** `libra clone -c clone.defaultRemoteName=inline --origin from_option file://<S> d4` 后，`d4` 的 `reference` 表中 `kind='Branch' AND remote IS NOT NULL` 各行的 `remote` 去重集合恰为 {`from_option`}（显式 `--origin` 优先，`inline` 未参与；`#752`，对应 Git `t/t5606-clone-options.sh#16`）。
+- [x] **AC5** 以逐子进程环境变量 `LIBRA_CONFIG_GLOBAL_DB=<测试临时目录>/global.db` 隔离全局配置，执行 `libra config set --global clone.defaultRemoteName from_config` 后，不带 `-c` 的 `libra clone file://<S> d6` 中，`d6` 的 `reference` 表中 `kind='Branch' AND remote IS NOT NULL` 各行的 `remote` 去重集合恰为 {`from_config`}（对应 Git `t/t5606-clone-options.sh` 的 `test_config_global clone.defaultRemoteName` 用例）。
+- [x] **AC6** `libra clone -c =v file://<S> d5`（空键名）以 `LBR-CLI-002` 拒绝。
 - [ ] ER-06/ER-06a 同卡强制门：`Docs and compatibility impact` 所列文件均按「文档与网站验收命令」逐文件验收（不计入 G-03）。
 
 **AC → 断言映射:**（「验证执行协议」第 4、6 项：映射与 AC 表述同一谓词；成功类 `exit 0` 为读取输出的前提；失败类按第 6 项断言非零状态与稳定码）

@@ -222,6 +222,7 @@ async fn test_clone_branch() {
         no_reject_shallow: false,
         separate_git_dir: None,
         revision: None,
+        config: Vec::new(),
         reference: vec![],
         reference_if_able: vec![],
         shared: false,
@@ -276,6 +277,7 @@ async fn test_clone_bare_repository() {
         no_reject_shallow: false,
         separate_git_dir: None,
         revision: None,
+        config: Vec::new(),
         reference: vec![],
         reference_if_able: vec![],
         shared: false,
@@ -345,6 +347,7 @@ async fn test_clone_branch_single_branch() {
         no_reject_shallow: false,
         separate_git_dir: None,
         revision: None,
+        config: Vec::new(),
         reference: vec![],
         reference_if_able: vec![],
         shared: false,
@@ -398,6 +401,7 @@ async fn test_clone_default_branch() {
         no_reject_shallow: false,
         separate_git_dir: None,
         revision: None,
+        config: Vec::new(),
         reference: vec![],
         reference_if_able: vec![],
         shared: false,
@@ -451,6 +455,7 @@ async fn test_clone_default_branch_single_branch() {
         no_reject_shallow: false,
         separate_git_dir: None,
         revision: None,
+        config: Vec::new(),
         reference: vec![],
         reference_if_able: vec![],
         shared: false,
@@ -506,6 +511,7 @@ async fn test_clone_to_existing_empty_dir() {
         no_reject_shallow: false,
         separate_git_dir: None,
         revision: None,
+        config: Vec::new(),
         reference: vec![],
         reference_if_able: vec![],
         shared: false,
@@ -564,6 +570,7 @@ async fn test_clone_to_existing_dir() {
         no_reject_shallow: false,
         separate_git_dir: None,
         revision: None,
+        config: Vec::new(),
         reference: vec![],
         reference_if_able: vec![],
         shared: false,
@@ -618,6 +625,7 @@ async fn test_clone_to_dir_with_existing_file_name() {
         no_reject_shallow: false,
         separate_git_dir: None,
         revision: None,
+        config: Vec::new(),
         reference: vec![],
         reference_if_able: vec![],
         shared: false,
@@ -671,6 +679,7 @@ async fn test_clone_with_depth() {
         no_reject_shallow: false,
         separate_git_dir: None,
         revision: None,
+        config: Vec::new(),
         reference: vec![],
         reference_if_able: vec![],
         shared: false,
@@ -726,6 +735,7 @@ async fn test_clone_with_depth_and_branch() {
         no_reject_shallow: false,
         separate_git_dir: None,
         revision: None,
+        config: Vec::new(),
         reference: vec![],
         reference_if_able: vec![],
         shared: false,
@@ -3149,6 +3159,159 @@ fn test_clone_revision_conflicts() {
             String::from_utf8_lossy(&out.stderr)
         );
     }
+}
+
+#[test]
+fn test_clone_config_overrides() {
+    use crate::command::{
+        assert_cli_success, create_committed_repo_via_cli, run_libra_command,
+        run_libra_command_with_env,
+    };
+
+    fn remotes(dir: &std::path::Path) -> Vec<String> {
+        let out = run_libra_command(
+            &["for-each-ref", "--format=%(refname)", "refs/remotes"],
+            dir,
+        );
+        assert_cli_success(&out, "for-each-ref refs/remotes");
+        let mut set: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("refs/remotes/"))
+            .filter_map(|rest| rest.split('/').next())
+            .map(str::to_string)
+            .collect();
+        set.sort();
+        set.dedup();
+        set
+    }
+
+    let src = create_committed_repo_via_cli();
+    let url = format!("file://{}", src.path().display());
+    let root = tempdir().unwrap();
+
+    // AC1: short and long forms both write the new repository's config.
+    for (flag, dir) in [("-c", "d"), ("--config", "d1")] {
+        let dest = root.path().join(dir);
+        let out = run_libra_command(
+            &[
+                "clone",
+                flag,
+                "core.foo=bar",
+                url.as_str(),
+                dest.to_str().expect("dest"),
+            ],
+            root.path(),
+        );
+        assert_cli_success(&out, "AC1: clone with a config override");
+        let got = run_libra_command(&["config", "get", "core.foo"], &dest);
+        assert_cli_success(&got, "AC1: config get core.foo");
+        assert_eq!(String::from_utf8_lossy(&got.stdout), "bar\n");
+    }
+
+    // AC2: repeated entries are stored in order.
+    let d2 = root.path().join("d2");
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "clone",
+                "-c",
+                "a.b=1",
+                "-c",
+                "a.b=2",
+                url.as_str(),
+                d2.to_str().expect("dest"),
+            ],
+            root.path(),
+        ),
+        "AC2: two entries",
+    );
+    let all = run_libra_command(&["config", "get", "--all", "a.b"], &d2);
+    assert_cli_success(&all, "AC2: config get --all");
+    assert_eq!(String::from_utf8_lossy(&all.stdout), "1\n2\n");
+
+    // AC3: clone.defaultRemoteName applies before the initial fetch.
+    let d3 = root.path().join("d3");
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "clone",
+                "-c",
+                "clone.defaultRemoteName=upstream",
+                url.as_str(),
+                d3.to_str().expect("dest"),
+            ],
+            root.path(),
+        ),
+        "AC3: defaultRemoteName",
+    );
+    assert_eq!(remotes(&d3), vec!["upstream".to_string()]);
+
+    // AC4: an explicit `--origin` wins over the config value.
+    let d4 = root.path().join("d4");
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "clone",
+                "-c",
+                "clone.defaultRemoteName=inline",
+                "--origin",
+                "from_option",
+                url.as_str(),
+                d4.to_str().expect("dest"),
+            ],
+            root.path(),
+        ),
+        "AC4: --origin wins",
+    );
+    assert_eq!(remotes(&d4), vec!["from_option".to_string()]);
+
+    // AC5: the global config provides the default remote name.
+    let global = root.path().join("global.db");
+    let env: &[(&str, &str)] = &[(
+        "LIBRA_CONFIG_GLOBAL_DB",
+        global.to_str().expect("global db"),
+    )];
+    assert_cli_success(
+        &run_libra_command_with_env(
+            &[
+                "config",
+                "set",
+                "--global",
+                "clone.defaultRemoteName",
+                "from_config",
+            ],
+            root.path(),
+            env,
+        ),
+        "AC5: config set --global",
+    );
+    let d6 = root.path().join("d6");
+    let out = run_libra_command_with_env(
+        &["clone", url.as_str(), d6.to_str().expect("dest")],
+        root.path(),
+        env,
+    );
+    assert_cli_success(&out, "AC5: clone with the global default");
+    assert_eq!(remotes(&d6), vec!["from_config".to_string()]);
+
+    // AC6: an empty key is refused.
+    let d5 = root.path().join("d5");
+    let out = run_libra_command(
+        &[
+            "clone",
+            "-c",
+            "=v",
+            url.as_str(),
+            d5.to_str().expect("dest"),
+        ],
+        root.path(),
+    );
+    assert!(!out.status.success(), "AC6: an empty key must be refused");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("LBR-CLI-002"),
+        "AC6: expected LBR-CLI-002: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]

@@ -141,6 +141,12 @@ pub struct CloneArgs {
     #[clap(short = 'o', long = "origin", value_name = "NAME")]
     pub origin: Option<String>,
 
+    /// Set a configuration value in the new repository (repeatable), matching
+    /// `git clone -c <key>=<value>`. An empty key is refused with
+    /// `LBR-CLI-002`.
+    #[clap(short = 'c', long = "config", value_name = "KEY=VALUE")]
+    pub config: Vec<String>,
+
     /// Request local-clone semantics for a filesystem source (Git's `-l`/`--local`).
     /// Libra still copies objects (it never hardlinks). A complete plain local
     /// Git source ignores `--depth` / `--shallow-*` / `--filter` with Git's
@@ -471,6 +477,27 @@ impl CloneArgs {
     }
 }
 
+/// Parse `-c <key>=<value>` entries, refusing a missing `=` or an empty key.
+fn parse_clone_config(entries: &[String]) -> Result<Vec<(String, String)>, CloneError> {
+    entries
+        .iter()
+        .map(|entry| {
+            let (key, value) =
+                entry
+                    .split_once('=')
+                    .ok_or_else(|| CloneError::InvalidConfigEntry {
+                        entry: entry.clone(),
+                    })?;
+            if key.trim().is_empty() {
+                return Err(CloneError::InvalidConfigEntry {
+                    entry: entry.clone(),
+                });
+            }
+            Ok((key.to_string(), value.to_string()))
+        })
+        .collect()
+}
+
 fn clone_fetch_branch(
     args: &CloneArgs,
     discovery: &DiscoveryResult,
@@ -629,6 +656,8 @@ pub enum CloneError {
     SeparateGitDirFailed { message: String },
     #[error("remote revision '{revision}' was not advertised by the source repository")]
     RevisionNotFound { revision: String },
+    #[error("invalid configuration entry '{entry}': expected <key>=<value>")]
+    InvalidConfigEntry { entry: String },
     #[error(
         "refusing to clone a Mega2 traces locator with libra clone; traces history is not part of the code view"
     )]
@@ -713,6 +742,11 @@ impl From<CloneError> for CliError {
                 .with_hint(
                     "the Cloudflare publish site host was removed; clone a git remote or use `libra cloud` for repository backup.",
                 ),
+            CloneError::InvalidConfigEntry { ref entry } => CliError::command_usage(format!(
+                "invalid configuration entry '{entry}': expected <key>=<value>"
+            ))
+            .with_stable_code(crate::utils::error::StableErrorCode::CliInvalidArguments)
+            .with_hint("pass `-c <key>=<value>`; the key must not be empty"),
             CloneError::RevisionNotFound { ref revision } => CliError::command_usage(format!(
                 "remote revision '{revision}' was not advertised by the source repository"
             ))
@@ -1767,6 +1801,12 @@ async fn clone_into_destination(
     .await
     .map_err(|source| CloneError::InitializeRepository { source })?;
 
+    // `-c <key>=<value>`: record every entry in the new repository's config in
+    // command-line order (Git writes the same values into the clone).
+    for (key, value) in &parse_clone_config(&args.config)? {
+        let _ = ConfigKv::add(key, value, false).await;
+    }
+
     // --- Step 5: Fetch objects ---
     if !output.quiet && !output.is_json() {
         eprintln!("Fetching objects ...");
@@ -1780,7 +1820,27 @@ async fn clone_into_destination(
     // `-o`/`--origin` names the remote (and its tracking refs); defaults to
     // `origin`. `setup_repository` threads `remote_config.name` through the
     // `refs/remotes/<name>/*` refs, `branch.<b>.remote`, and `remote.<name>.url`.
-    let remote_name = args.origin.clone().unwrap_or_else(|| "origin".to_string());
+    let config_overrides = parse_clone_config(&args.config)?;
+    // `--origin` wins over `-c clone.defaultRemoteName`, which wins over the
+    // global default and finally `origin` (Git's `clone.defaultRemoteName`).
+    let remote_name = if let Some(origin) = args.origin.clone() {
+        origin
+    } else if let Some(name) = config_overrides
+        .iter()
+        .find_map(|(key, value)| (key == "clone.defaultRemoteName").then(|| value.clone()))
+    {
+        name
+    } else {
+        crate::internal::config::read_cascaded_config_value(
+            clone_config_local_target(),
+            "clone.defaultRemoteName",
+        )
+        .await
+        .ok()
+        .flatten()
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| "origin".to_string())
+    };
     let remote_config = RemoteConfig {
         name: remote_name.clone(),
         url: remote_url.to_string(),

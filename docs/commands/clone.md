@@ -365,6 +365,20 @@ metadata but no checked-out files.
 libra clone -n git@github.com:user/repo.git
 ```
 
+### `-c`, `--config <key=value>`
+
+Set a configuration value in the new repository, matching `git clone -c`. The
+option is repeatable and values are recorded in command-line order, so
+`-c a.b=1 -c a.b=2` stores both. `clone.defaultRemoteName=<name>` takes effect
+before the initial fetch (the tracking refs use that remote name); an explicit
+`-o`/`--origin` wins over it, and a global `clone.defaultRemoteName` applies
+when neither flag is given. An empty key (`-c =v`) is refused with
+`LBR-CLI-002`.
+
+```bash
+libra clone -c core.foo=bar git@github.com:user/repo.git
+```
+
 ### `--revision <REV>`
 
 Clone only the given revision (for example `refs/heads/main` or `refs/tags/v1`)
