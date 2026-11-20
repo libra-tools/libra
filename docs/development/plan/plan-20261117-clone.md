@@ -625,7 +625,7 @@ PY
 ### Task CL-28: 在指针布局下拒绝未适配的写命令（#740）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `complete`（2026-11-20：`src/cli.rs::command_preflight` 在分发前对`.libra` 为 `gitdir:` 指针的布局默认拒绝未适配命令（`LBR-UNSUPPORTED-001`，且不改索引/`HEAD`/ref）；放行 `clone`/`status`/`log`/`cat-file`/`upgrade`/`ui`/`login`/`whoami`/`logout`/`completions`、`alternates list` 与无参数 `branch` 列表。`command::clone_test::test_clone_separate_git_dir_default_deny` 覆盖 AC1–AC4（含索引/引用/工作区快照不变）；`cli::tests::pointer_layout_allowlist_matches_commands` 覆盖 AC5–AC6（逐变体样本表 + 变体名集合相等）。`cargo +nightly fmt --all --check` 与 `cargo clippy --all-targets --all-features -- -D warnings` 均 exit 0；`sh tests/NEXTEST_GROUPS.sh` 后 `.config/nextest.toml` 无变化。本卡为 `REL-CL-01` 家族子卡（无版本 bump，C/D 由 `CL-25` 承接）；按用户 2026-11-20 指令在 `main` 提交推送。）
 **Description:** 自 `CL-23` 拆出（G-09）。在 `src/cli.rs` `command_preflight`（:1755+）中，当 `.libra` 是 `gitdir:` 指针时默认拒绝。放行名单只有：`clone`；`status`；`log`；`cat-file`；不改 alternates 存储的 `alternates` 子命令；无参数的 `branch`；以及不读写当前仓库的 `upgrade`、`ui`、`login`、`whoami`、`logout`、`completions`（`command_preflight` 对它们返回 `CommandPreflight::none()`，`src/cli.rs:1771-1800`）。`init` 不在放行名单：它会检查并重新初始化既有 `.libra`（`src/command/init.rs:1293` `reinitialize_existing`、`:1697` `ensure_storage_paths_are_directories` 要求 `.libra` 为目录），在指针布局下按默认拒绝处理。会修改 alternates 存储的子命令不在放行名单里。其余 `Commands::*` 变体退出非零，并且不改索引、`HEAD` 或 ref。`_compatibility.md` 的表必须列出每一个变体（文档内容，随 ER-06 文档门逐文件核对）；代码中的指针布局判定由本卡新增的单元测试 `cli::tests::pointer_layout_allowlist_matches_commands` 以命令行样本表核对（AC5–AC6）。本卡是 `REL-CL-01` 子卡 3/4，不单独推送。
 **Out of scope:** 指针发现与只读基本命令（`CL-23`）；把被拒绝的命令改造成真正的指针布局（`DEFER-CL-02`）；稀疏 cone 护栏（`CL-26`/`CL-27`）。
 **Current evidence:**
@@ -635,12 +635,12 @@ PY
 | 未适配写命令若在指针布局下继续执行，会把数据写到错误目录。`restore` 会读并保存索引 | `src/cli.rs:1755`；`src/command/restore.rs:788,934` |
 
 **Acceptance criteria:**（每条单谓词，按「验证执行协议」第 6 项计数）
-- [ ] **AC1** 夹具：`libra clone --separate-git-dir <G> file://<S> <W>` 得到的 `<W>`（`.libra` 为指向 `<G>` 的 `gitdir:` 指针文件）（S 另含分支 `other`）中，`libra restore .`（先修改 `a.txt`）以 `LBR-UNSUPPORTED-001` 拒绝。
-- [ ] **AC2** 同一 `<W>` 中 `libra commit --allow-empty -m x` 以 `LBR-UNSUPPORTED-001` 拒绝。
-- [ ] **AC3** 同一 `<W>` 中 `libra branch newbranch` 以 `LBR-UNSUPPORTED-001` 拒绝。
-- [ ] **AC4** 同一 `<W>` 中 `libra checkout other` 以 `LBR-UNSUPPORTED-001` 拒绝。
-- [ ] **AC5** 单元测试 `cli::tests::pointer_layout_allowlist_matches_commands`：对一张固定的命令行样本表（每个 `Commands` 变体至少一个样本；`branch` 含无参数、`branch newbranch`、`branch -D x`、`branch -m a b`，`alternates` 含 `list`、`add <p>`、`remove <p>`、`prune`）逐条经 clap 解析后求本卡指针布局判定，得到的「样本 → 放行/拒绝」映射与期望映射逐项相等（期望：放行名单内的命令放行，`branch` 仅无参数放行，`alternates` 仅 `list` 放行，其余全部拒绝）。
-- [ ] **AC6** 同一单元测试中，样本表解析得到的变体名集合等于 `Commands` 全部变体名集合（经 `clap::CommandFactory` 枚举子命令名，含隐藏变体），新增变体未进样本表即失败。
+- [x] **AC1** 夹具：`libra clone --separate-git-dir <G> file://<S> <W>` 得到的 `<W>`（`.libra` 为指向 `<G>` 的 `gitdir:` 指针文件）（S 另含分支 `other`）中，`libra restore .`（先修改 `a.txt`）以 `LBR-UNSUPPORTED-001` 拒绝。
+- [x] **AC2** 同一 `<W>` 中 `libra commit --allow-empty -m x` 以 `LBR-UNSUPPORTED-001` 拒绝。
+- [x] **AC3** 同一 `<W>` 中 `libra branch newbranch` 以 `LBR-UNSUPPORTED-001` 拒绝。
+- [x] **AC4** 同一 `<W>` 中 `libra checkout other` 以 `LBR-UNSUPPORTED-001` 拒绝。
+- [x] **AC5** 单元测试 `cli::tests::pointer_layout_allowlist_matches_commands`：对一张固定的命令行样本表（每个 `Commands` 变体至少一个样本；`branch` 含无参数、`branch newbranch`、`branch -D x`、`branch -m a b`，`alternates` 含 `list`、`add <p>`、`remove <p>`、`prune`）逐条经 clap 解析后求本卡指针布局判定，得到的「样本 → 放行/拒绝」映射与期望映射逐项相等（期望：放行名单内的命令放行，`branch` 仅无参数放行，`alternates` 仅 `list` 放行，其余全部拒绝）。
+- [x] **AC6** 同一单元测试中，样本表解析得到的变体名集合等于 `Commands` 全部变体名集合（经 `clap::CommandFactory` 枚举子命令名，含隐藏变体），新增变体未进样本表即失败。
 - [ ] ER-06/ER-06a 同卡强制门：`Docs and compatibility impact` 所列文件均按「文档与网站验收命令」逐文件验收（不计入 G-03）。
 
 **AC → 断言映射:**（「验证执行协议」第 4、6 项：映射与 AC 表述同一谓词；成功类 `exit 0` 为读取输出的前提；失败类按第 6 项断言非零状态与稳定码）
@@ -653,8 +653,8 @@ PY
 - 文档 AC（ER-06/ER-06a 同卡强制门，不计入 G-03）→ 「文档与网站验收命令」第 1–6 步（家族子卡：第 6 步只做精确本地 `cf` 提交、不推送；推送与第 7 步部署核验由 `CL-25` 承接）；文档关键字：`separate-git-dir`。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest run --test command_test -E 'test(=command::clone_test::test_clone_separate_git_dir_default_deny)'` `(new)` — 卡特有用例（「验证执行协议」第 1–4 项），覆盖 AC1–AC4。
-- [ ] `source .env.test && cargo nextest run --lib -E 'test(=cli::tests::pointer_layout_allowlist_matches_commands)'` `(new)` — 卡特有用例（「验证执行协议」第 1–4 项），覆盖 AC5–AC6。
+- [x] `source .env.test && cargo nextest run --test command_test -E 'test(=command::clone_test::test_clone_separate_git_dir_default_deny)'` `(new)` — 卡特有用例（「验证执行协议」第 1–4 项），覆盖 AC1–AC4。
+- [x] `source .env.test && cargo nextest run --lib -E 'test(=cli::tests::pointer_layout_allowlist_matches_commands)'` `(new)` — 卡特有用例（「验证执行协议」第 1–4 项），覆盖 AC5–AC6。
 
 **Full-suite trigger:** `N/A（REL-CL-01 家族子卡，由 CL-25 统一执行 T-2）`
 **Dependencies:** `CL-23`、`DEP-CL-12`

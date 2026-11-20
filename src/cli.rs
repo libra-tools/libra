@@ -5213,8 +5213,19 @@ mod tests {
             // Commands whose required shape is an argument group or a fixed
             // value namespace rather than a plain required argument.
             match name.as_str() {
-                "metadata" => argv.extend(["--repo".to_string(), "x".to_string()]),
-                "completions" => argv.push("bash".to_string()),
+                "metadata" => {
+                    argv.clear();
+                    argv.extend([
+                        "metadata".to_string(),
+                        "get".to_string(),
+                        "--repo".to_string(),
+                        "x".to_string(),
+                    ]);
+                }
+                "completions" => {
+                    argv.clear();
+                    argv.extend(["completions".to_string(), "bash".to_string()]);
+                }
                 _ => {}
             }
             samples.push((name, argv, chosen_sub));
