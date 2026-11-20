@@ -1,4 +1,4 @@
-> **2026-11-20 20261117 批次登记：** 15 份 `plan-20261117-*.md` 已全部纳入本文件。计划文本均取得 Claude（Subagent）与 Codex 对同一受审字节的双 `VERDICT: PASS`；合计 **586 张活动卡：`CL-01`、`BR-01`、`CL-02`、`DESC-01`、`MP-01` 已 `done`/`complete`（`0.30.211`–`0.30.216`），`WC-11a`、`WC-11b`、`WC-11R` 为 `blocked`，其余 `pending`**；尚无释放/发布结果。执行按卡级 DAG，不以整计划为调度单位；关键汇聚点为 [`plan-20261117-commit-signing.md`](plan-20261117-commit-signing.md) 的 `REL-CS-00`。详见 `## 一、计划一览` 下的 `### 20261117 批次` 与 `## 四·零`。
+> **2026-11-20 20261117 批次登记：** 15 份 `plan-20261117-*.md` 已全部纳入本文件。计划文本均取得 Claude（Subagent）与 Codex 对同一受审字节的双 `VERDICT: PASS`；合计 **586 张活动卡：`CL-01`、`BR-01`、`CL-02`、`DESC-01`、`MP-01`、`DIFF-01` 已 `done`/`complete`（`0.30.211`–`0.30.217`），`WC-11a`、`WC-11b`、`WC-11R` 为 `blocked`，其余 `pending`**；尚无释放/发布结果。执行按卡级 DAG，不以整计划为调度单位；关键汇聚点为 [`plan-20261117-commit-signing.md`](plan-20261117-commit-signing.md) 的 `REL-CS-00`。详见 `## 一、计划一览` 下的 `### 20261117 批次` 与 `## 四·零`。
 
 > **2026-11-20 用户授权（零依赖入口卡）：** 用户明确授权上述 11 张技术零依赖卡开工（`BR-01`、`CSR-01`、`CL-01`、`CS-01`、`DESC-01`、`DIFF-01`、`FP-01`、`LS-01`、`MP-01`、`WC-04`、`A631-01`）。该授权只解除“未授权”状态，不替代各卡的写集窗口、网站/测试仓预检、EX 门、ER-05 代码评审或 C/D 门。
 
@@ -1286,7 +1286,7 @@ FIX08采纳候选待双审；Mega109/活动108、Libra26/活动25、联合135/�
 | [`plan-20261117-clone.md`](plan-20261117-clone.md) | Git 兼容（`clone`） | 已排期 | 27 张活动任务卡：`CL-01`、`CL-02` 已 `done`/`complete`（`0.30.211`、`0.30.213`），其余 `pending`；Claude R73 + Codex R73 双审 PASS（`189cec976839`）。链首 `CL-01` 已完成；`CL-14` 等 `PM-06`，`CL-05/10/13/19/20/21/24/29` 等 `fetch-push` 的 `FP-07`/`FP-15` 单向合入。 |
 | [`plan-20261117-commit-signing.md`](plan-20261117-commit-signing.md) | Git 兼容（commit 与签名） | 已排期 | 83 张活动任务卡全部 `pending`；Claude R58 + Codex R58 双审 PASS（`fdc9dc310d3e`）。`CS-01`/`CS-01a` 可开工；`REL-CS-00` 是本批关键汇聚点，`CS-02`/`CS-02a` 受 `PM-02` 与 clone 前段门控，`CS-08` 起受 `CSR-01/02/27` 的 `src/cli.rs` 窗口门控。 |
 | [`plan-20261117-describe.md`](plan-20261117-describe.md) | Git 兼容（`describe`/`rev-parse` 后缀） | 已排期 | 27 张活动卡：`DESC-01` 已 `done`/`complete`（`0.30.214`；Codex R3 PASS），其余 `pending`；Claude R65 + Codex R65 双审 PASS（`10e7257d1dda`）。链首 `DESC-01` 已完成；完整上游 `t6120` 门受 `issues/541` 的 `update-ref refs/tags/*` 影响，`rev-parse` 后缀卡须与共享 `src/utils/util.rs` 写锁协调，网站交付共用 `COMPATIBILITY.md` 串行窗口。 |
-| [`plan-20261117-diff.md`](plan-20261117-diff.md) | Git 兼容（`diff`/`diff-tree`/`diff-files`） | 已排期 | 53 张活动卡全部 `pending`；Claude R92 + Codex R92 双审 PASS（`eaf1559b5f46`）。链首 `DIFF-01` 可开工；`DIFF-45` 是 commit-signing `CS-15` 的前置，`DIFF-50` 承接 worktree `DEFER-WC-05`。 |
+| [`plan-20261117-diff.md`](plan-20261117-diff.md) | Git 兼容（`diff`/`diff-tree`/`diff-files`） | 已排期 | 53 张活动卡：`DIFF-01` 已 `done`/`complete`（`0.30.217`；Codex R7 代码 PASS），其余 52 张 `pending`；Claude R92 + Codex R92 双审 PASS（`eaf1559b5f46`）。链首 `DIFF-01` 已完成；`DIFF-45` 是 commit-signing `CS-15` 的前置，`DIFF-50` 承接 worktree `DEFER-WC-05`。 |
 | [`plan-20261117-fetch-push.md`](plan-20261117-fetch-push.md) | Git 兼容（`fetch`/`push`） | 已排期 | 23 张活动卡全部 `pending`；Claude R19 + Codex R19 双审 PASS（`bda4c9f4798d`）。链首 `FP-01` 可开工；`FP-07`/`FP-15` 为 clone 多卡前置，`FP-10/19/11` 受共享 `fetch.rs` 窗口串行。 |
 | [`plan-20261117-format-patch.md`](plan-20261117-format-patch.md) | Git 兼容（`format-patch`） | 已排期（开工门未满足） | 64 张活动卡全部 `pending`；Claude R41 + Codex R41 双审 PASS（`7249da6bea02`）。`DEP-FPG-01` 要求 `issues/529` 全部实现卡及 `CLOSE-529` 完成并释放 `format_patch.rs`；当前 529 仍 `FP-03 remote-pending`、多卡 pending，故链首 `FPG-01` 暂不可开工。 |
 | [`plan-20261117-global-init-infra.md`](plan-20261117-global-init-infra.md) | 全局 CLI、`init` 与基础设施 | 已排期（开工门未满足） | 24 张活动卡全部 `pending`；Claude R26 + Codex R26 双审 PASS（`973afedc5a69`）。`DEP-GII-01` 要求 `issues/529#FP-13` 释放 `src/cli.rs`；当前 `FP-13` 仍 pending，故 `GII-01` 保持 pending，其余卡同链串行。 |
@@ -1350,7 +1350,7 @@ FIX08采纳候选待双审；Mega109/活动108、Libra26/活动25、联合135/�
 
 ### 20261117 批次（15 份计划）
 
-**登记时间：** 2026-11-20。**共同状态：** 15 份计划文本均取得 Claude（Subagent）与 Codex 对同一受审字节的双 `VERDICT: PASS`；合计 586 张活动卡：`CL-01`、`BR-01`、`CL-02`、`DESC-01`、`MP-01` 已 `done`/`complete`（`0.30.211`–`0.30.216`），`WC-11a`、`WC-11b`、`WC-11R` 为 `blocked`，其余 `pending`；尚无释放/发布结果。各计划仍按自身依赖表与 `Release boundary` 执行，本表只登记计划状态，不替代逐卡 ER-04/ER-05/ER-13 门。15 份计划均把 `plan-status.md` 登记为协调者共享写集；后续每张卡的 `in-progress`、C/D 或 `blocked` 推进必须在同一变更更新本文件对应行。
+**登记时间：** 2026-11-20。**共同状态：** 15 份计划文本均取得 Claude（Subagent）与 Codex 对同一受审字节的双 `VERDICT: PASS`；合计 586 张活动卡：`CL-01`、`BR-01`、`CL-02`、`DESC-01`、`MP-01`、`DIFF-01` 已 `done`/`complete`（`0.30.211`–`0.30.217`），`WC-11a`、`WC-11b`、`WC-11R` 为 `blocked`，其余 `pending`；尚无释放/发布结果。各计划仍按自身依赖表与 `Release boundary` 执行，本表只登记计划状态，不替代逐卡 ER-04/ER-05/ER-13 门。15 份计划均把 `plan-status.md` 登记为协调者共享写集；后续每张卡的 `in-progress`、C/D 或 `blocked` 推进必须在同一变更更新本文件对应行。
 
 **执行顺序：** 本批没有单一整计划串行链，必须按卡级 DAG 调度。关键汇聚点是 [`plan-20261117-commit-signing.md`](plan-20261117-commit-signing.md) 的 `REL-CS-00`：同批计划的前段卡需先释放 `src/cli.rs`、配置与迁移写集；`REL-CS-00` 的直接前置按其依赖表为 `PM-02`、clone 前段与 `CSR-01/02/27`。`REL-CS-00` 发布后，`merge-pull` 中段与 `sequencer-am` 才解锁。`format-patch` 整体等 `issues/529#CLOSE-529`；`grep` 等 `issues/535` supersede 与 `issues/488` 收口；`worktree` 的 reset 家族（`WC-11s -> WC-11 -> WC-11a -> WC-11b -> WC-11R`）排在自身链尾，并因 `DEP-WC-07` 等待 23 张跨计划 `src/cli.rs` 写者而接近全批末尾。
 
@@ -1713,7 +1713,7 @@ SBX-01..05 `done/locally-accepted`；**发布步按 DEFER-SBX-06 正式延后**�
 
 ## 四、当前执行指针（next action）
 
-- **2026-11-20 20261117 批次：** 15 份计划已登记，586 张活动卡中 `CL-01`、`BR-01`、`CL-02`、`DESC-01`、`MP-01` 已 `done`/`complete`，除 `WC-11a`/`WC-11b`/`WC-11R` 为 `blocked` 外其余 `pending`。首批可按卡级 DAG 开工：`CSR-01`、`CS-01`、`DIFF-01`、`FP-01`、`LS-01`、`WC-04`（均须先取得各自写集——`COMPATIBILITY.md`、`src/cli.rs` 或网站——的串行窗口）。`GR-00` 需先完成 `issues/535` supersede 与 `issues/488` 收口；`GII-01` 等 `issues/529#FP-13`；`PM-01` 等 `issues/1048#I1048-05`；`FPG-01` 等 `issues/529#CLOSE-529`；`SA-01` 等 `REL-CS-00` 与 `issues/1041#I1041-06/07`。`REL-CS-00` 是本批关键汇聚点；`WC-11s -> WC-11 -> WC-11a -> WC-11b -> WC-11R` 排在 worktree 链尾，并因等待跨计划 `src/cli.rs` 写者而接近全批末尾。
+- **2026-11-20 20261117 批次：** 15 份计划已登记，586 张活动卡中 `CL-01`、`BR-01`、`CL-02`、`DESC-01`、`MP-01`、`DIFF-01` 已 `done`/`complete`，除 `WC-11a`/`WC-11b`/`WC-11R` 为 `blocked` 外其余 `pending`。首批可按卡级 DAG 开工：`CSR-01`、`CS-01`、`FP-01`、`LS-01`、`WC-04`（均须先取得各自写集——`COMPATIBILITY.md`、`src/cli.rs` 或网站——的串行窗口）。`GR-00` 需先完成 `issues/535` supersede 与 `issues/488` 收口；`GII-01` 等 `issues/529#FP-13`；`PM-01` 等 `issues/1048#I1048-05`；`FPG-01` 等 `issues/529#CLOSE-529`；`SA-01` 等 `REL-CS-00` 与 `issues/1041#I1041-06/07`。`REL-CS-00` 是本批关键汇聚点；`WC-11s -> WC-11 -> WC-11a -> WC-11b -> WC-11R` 排在 worktree 链尾，并因等待跨计划 `src/cli.rs` 写者而接近全批末尾。
 
 - **本对话当前指针（USER-OG-FINAL-C-20261017）：** 下一张OG-08最终方案C文档审计→OG-06 legacy doctor→FAST-OG-04唯一patch/full/C-D；OG-25/26已source-qualified待该发布收口。BOOT与OG-24/27/28/29/05撤出本轮、native-only DEP不再是前驱；初始环境DEFER按范围决定关闭（未修复/非PASS）。68库存=61完成+5待交付+2原延期，正式61/68=89.71%；可执行macOS61/66=92.42%，COV26/26不变。旧OG00/02及SRC029指针仅历史。
 
@@ -1738,7 +1738,7 @@ SBX-01..05 `done/locally-accepted`；**发布步按 DEFER-SBX-06 正式延后**�
 | [`plan-20261117-clone`](plan-20261117-clone.md) | CL-01 | 修复 `clone --progress` 布尔解析与 stderr `%`（#737） | 无 | Claude R73 + Codex R73 PASS；Codex R6 代码 PASS | `DEP-CL-06` 后续 `src/cli.rs` 串行 | `done` / `complete`（`0.30.211`） |
 | [`plan-20261117-commit-signing`](plan-20261117-commit-signing.md) | CS-01 | `-S[<keyid>]` 贴合解析与分离参数守卫（#787/#1006） | 无 | Claude R58 + Codex R58 PASS | `DEP-CS-07` 同批写集串行窗口 | ✅ 已获 2026-11-20 用户授权；仍需取得写集窗口（`DEP-CS-07` 同批写集串行窗口） |
 | [`plan-20261117-describe`](plan-20261117-describe.md) | DESC-01 | `describe --contains` 精确匹配附注 tag 补 `^0`（#795） | 无 | Claude R65 + Codex R65 PASS；Codex R3 代码 PASS | `DEP-DESC-UTIL` 共享 `util.rs`/`rev-parse` 文档窗口 | `done` / `complete`（`0.30.214`） |
-| [`plan-20261117-diff`](plan-20261117-diff.md) | DIFF-01 | `diff-tree --format` 与 subject 输出（#775） | 无 | Claude R92 + Codex R92 PASS | `DEP-DIFF-DOCS` 网站串行窗口 | ✅ 已获 2026-11-20 用户授权；仍需取得写集窗口（`DEP-DIFF-DOCS` 网站串行窗口） |
+| [`plan-20261117-diff`](plan-20261117-diff.md) | DIFF-01 | `diff-tree --format` 与 subject 输出（#775） | 无 | Claude R92 + Codex R92 PASS；Codex R7 代码 PASS | `DEP-DIFF-DOCS` 网站串行窗口 | `done` / `complete`（`0.30.217`） |
 | [`plan-20261117-fetch-push`](plan-20261117-fetch-push.md) | FP-01 | 裸本地仓库目录名不再当 remote 名（#719） | 无 | Claude R19 + Codex R19 PASS | `DEP-FP-01` 全写集互斥锁 | ✅ 已获 2026-11-20 用户授权；仍需取得写集窗口（`DEP-FP-01` 全写集互斥锁） |
 | [`plan-20261117-grep`](plan-20261117-grep.md) | GR-00 | `grep` 位置 `<rev>` 消歧与 `<rev>:` 前缀（#925/#922/#932 前置） | 无 | Claude R122 + Codex R122 PASS | `DEP-GR-05`：`issues/535` supersede + `issues/488` 收口 | ⚠️ 协调门未完成 |
 | [`plan-20261117-log-show`](plan-20261117-log-show.md) | LS-01 | `log --decorate` 嵌套 annotated-tag 与 `%D/%d`（#949） | 无 | Claude R41 + Codex R41 PASS | `DEP-LS-01` 跨计划写锁 | ✅ 已获 2026-11-20 用户授权；仍需取得写集窗口（`DEP-LS-01` 跨计划写锁） |
@@ -1869,7 +1869,7 @@ SBX-01..05 `done/locally-accepted`；**发布步按 DEFER-SBX-06 正式延后**�
 
 > 说明：✅ = 无任何门控，可立即开工；⚠️ = 内部无前置但仍有外部/跨计划 `DEP-*` 或发布队列约束；❌ = 计划级 review 门未过（多数 issue 计划尚未 Codex review），按模板 ER-05 / GC-01 **禁止**标 `in-progress`。
 >
-> **一致结论（2026-11-20）：** 当前严格满足“无前驱卡 + 计划评审 PASS”的未完成入口卡是 20261117 批次的 `CSR-01`、`CS-01`、`DIFF-01`、`FP-01`、`LS-01`、`WC-04`（`CL-01`、`BR-01`、`CL-02`、`DESC-01`、`MP-01` 已完成）；它们仍须取得各自写集/网站窗口。`A631-01` 为技术零依赖（`Dependencies: 无`），但计划标注“仅规划、未授权执行”。`CAP-01` 仍需先重核 `DEP-CAP-01`，`LG-22` 仍需等 `issues/483#CO-04`，`FIX-FP-DTR` 仍需等 `FP-13`，`GII-01`/`PM-01`/`FPG-01`/`SA-01` 亦仍被外部前置门控。`plan-20260822` 的 OL-15 为 `done/remote-pending`，等待 compat-offline-core 远端门禁。2026-11-20 用户已明确授权上述 11 张技术零依赖入口卡（`BR-01`、`CSR-01`、`CL-01`、`CS-01`、`DESC-01`、`DIFF-01`、`FP-01`、`LS-01`、`MP-01`、`WC-04`、`A631-01`）开工；该授权只解除“未授权”状态，不替代各卡的写集窗口、网站/测试仓预检、EX 门、ER-05 代码评审或 C/D 门。
+> **一致结论（2026-11-20）：** 当前严格满足“无前驱卡 + 计划评审 PASS”的未完成入口卡是 20261117 批次的 `CSR-01`、`CS-01`、`FP-01`、`LS-01`、`WC-04`（`CL-01`、`BR-01`、`CL-02`、`DESC-01`、`MP-01`、`DIFF-01` 已完成）；它们仍须取得各自写集/网站窗口。`A631-01` 为技术零依赖（`Dependencies: 无`），但计划标注“仅规划、未授权执行”。`CAP-01` 仍需先重核 `DEP-CAP-01`，`LG-22` 仍需等 `issues/483#CO-04`，`FIX-FP-DTR` 仍需等 `FP-13`，`GII-01`/`PM-01`/`FPG-01`/`SA-01` 亦仍被外部前置门控。`plan-20260822` 的 OL-15 为 `done/remote-pending`，等待 compat-offline-core 远端门禁。2026-11-20 用户已明确授权上述 11 张技术零依赖入口卡（`BR-01`、`CSR-01`、`CL-01`、`CS-01`、`DESC-01`、`DIFF-01`、`FP-01`、`LS-01`、`MP-01`、`WC-04`、`A631-01`）开工；该授权只解除“未授权”状态，不替代各卡的写集窗口、网站/测试仓预检、EX 门、ER-05 代码评审或 C/D 门。
 
 ---
 

@@ -7,9 +7,12 @@
 //! the porcelain engine, while plumbing exit codes and rename defaults differ.
 
 use clap::Parser;
+use git_internal::internal::object::commit::Commit;
 
 use crate::{
     command::diff::DiffArgs,
+    common_utils::parse_commit_msg,
+    internal::log::formatter::{CommitFormatter, FormatContext, FormatType},
     utils::{
         error::{CliError, CliResult, StableErrorCode},
         output::OutputConfig,
@@ -77,6 +80,11 @@ pub struct DiffTreeArgs {
     /// `--no-commit-id`: suppress the commit id line in the single-commit form.
     #[clap(long = "no-commit-id")]
     pub no_commit_id: bool,
+    /// Render a commit header with `--format=<fmt>` (or its `--pretty` alias).
+    /// Bare templates containing `%` and explicit `format:` templates are
+    /// supported; the only accepted preset is `oneline`.
+    #[clap(long = "format", visible_alias = "pretty", value_name = "FORMAT")]
+    pub format: Option<String>,
     /// The "old" tree-ish, or the commit to diff against its first parent.
     #[clap(value_name = "TREE-A")]
     pub tree_a: String,
@@ -243,6 +251,101 @@ pub(crate) fn push_paths(argv: &mut Vec<String>, paths: &[String]) {
     }
 }
 
+#[derive(Debug, Clone)]
+enum DiffTreeHeaderFormat {
+    /// `<full-commit-id> <subject>`.
+    Oneline,
+    /// A custom pretty template; `blank_line` separates the header from the
+    /// raw/patch body (bare `%` templates) and is false for `format:`.
+    Custom { template: String, blank_line: bool },
+}
+
+fn parse_diff_tree_header_format(value: &str) -> CliResult<DiffTreeHeaderFormat> {
+    if value == "oneline" {
+        return Ok(DiffTreeHeaderFormat::Oneline);
+    }
+    if let Some(template) = value.strip_prefix("format:") {
+        return Ok(DiffTreeHeaderFormat::Custom {
+            template: template.to_string(),
+            blank_line: false,
+        });
+    }
+    if value.contains('%') {
+        return Ok(DiffTreeHeaderFormat::Custom {
+            template: value.to_string(),
+            blank_line: true,
+        });
+    }
+    Err(
+        CliError::command_usage(format!("invalid --pretty format: {value}"))
+            .with_stable_code(StableErrorCode::CliInvalidArguments),
+    )
+}
+
+/// Git's subject is the first paragraph with its physical lines joined by
+/// single spaces; `parse_commit_msg` only splits off the first line.
+fn git_subject(message: &str) -> String {
+    let mut lines = message
+        .lines()
+        .skip_while(|line| line.trim().is_empty())
+        .take_while(|line| !line.trim().is_empty())
+        .map(str::trim);
+    let mut subject = String::new();
+    for line in lines.by_ref() {
+        if !subject.is_empty() {
+            subject.push(' ');
+        }
+        subject.push_str(line);
+    }
+    subject
+}
+
+fn commit_subject(message: &str) -> String {
+    let (message, _) = parse_commit_msg(message);
+    git_subject(message)
+}
+
+fn render_diff_tree_header(format: &DiffTreeHeaderFormat, commit: &Commit) -> String {
+    match format {
+        DiffTreeHeaderFormat::Oneline => {
+            format!("{} {}\n", commit.id, commit_subject(&commit.message))
+        }
+        DiffTreeHeaderFormat::Custom { template, .. } => {
+            // Card scope is `%s` (and `prefix %s`); handling only those
+            // placeholders directly keeps body/signature placeholders raw for
+            // the shared formatter branch below.
+            if !template.replace("%s", "").contains('%') {
+                return format!(
+                    "{}\n",
+                    template.replace("%s", &commit_subject(&commit.message))
+                );
+            }
+            let formatter = CommitFormatter::new(FormatType::Custom(template.clone()));
+            let context = FormatContext {
+                graph_prefix: "",
+                decoration: "",
+                abbrev_len: 7,
+                extra_hashes: "",
+                notes: "",
+            };
+            let (message, _) = parse_commit_msg(&commit.message);
+            let mut raw = commit.clone();
+            raw.message = message.to_string();
+            format!("{}\n", formatter.format(&raw, &context))
+        }
+    }
+}
+
+fn diff_tree_header_blank_line(format: &DiffTreeHeaderFormat) -> bool {
+    matches!(
+        format,
+        DiffTreeHeaderFormat::Custom {
+            blank_line: true,
+            ..
+        }
+    )
+}
+
 pub async fn execute_tree(args: DiffTreeArgs) {
     if let Err(err) = execute_tree_safe(args, &OutputConfig::default()).await {
         err.print_stderr();
@@ -251,11 +354,15 @@ pub async fn execute_tree(args: DiffTreeArgs) {
 }
 
 pub async fn execute_tree_safe(args: DiffTreeArgs, output: &OutputConfig) -> CliResult<()> {
+    let header_format = match args.format.as_deref() {
+        Some(value) => Some(parse_diff_tree_header_format(value)?),
+        None => None,
+    };
     let recursive = args.recurse || args.tree_entries || args.patch;
     if args.patch || args.name_only || args.name_status {
-        return execute_tree_delegated(args, recursive, output).await;
+        return execute_tree_delegated(args, recursive, output, header_format.as_ref()).await;
     }
-    execute_tree_raw(args, recursive, output).await
+    execute_tree_raw(args, recursive, output, header_format.as_ref()).await
 }
 
 /// Delegating tail for patch/name output: the shared diff engine renders the
@@ -264,37 +371,48 @@ async fn execute_tree_delegated(
     args: DiffTreeArgs,
     recursive: bool,
     output: &OutputConfig,
+    header_format: Option<&DiffTreeHeaderFormat>,
 ) -> CliResult<()> {
     let mut argv = vec!["diff".to_string()];
-    let mut commit_id = None;
-    match &args.tree_b {
+    let header = match &args.tree_b {
         Some(tree_b) => {
             argv.push("--old".to_string());
             argv.push(args.tree_a.clone());
             argv.push("--new".to_string());
             argv.push(tree_b.clone());
+            None
         }
         None => {
             let commit = resolve_commit(&args.tree_a).await?;
-            commit_id = Some(commit.id);
+            let header = if !args.no_commit_id && (!args.quiet || header_format.is_some()) {
+                Some(match header_format {
+                    Some(format) => render_diff_tree_header(format, &commit),
+                    None => format!("{}\n", commit.id),
+                })
+            } else {
+                None
+            };
             match commit.parent_commit_ids.first() {
                 Some(parent) => {
                     argv.push("--old".to_string());
                     argv.push(parent.to_string());
                     argv.push("--new".to_string());
                     argv.push(commit.id.to_string());
+                    header
                 }
                 None => {
                     // A root commit has no parent; without `--root` Git shows
-                    // only the commit id line, and `-p` prints nothing.
-                    if !args.quiet && !args.no_commit_id && !args.no_patch {
-                        println!("{}", commit.id);
+                    // only the header, and `-p` prints nothing.
+                    if !args.no_patch
+                        && let Some(header) = header
+                    {
+                        print!("{header}");
                     }
                     return Ok(());
                 }
             }
         }
-    }
+    };
     let _ = recursive;
     push_output_mode(
         &mut argv,
@@ -305,11 +423,11 @@ async fn execute_tree_delegated(
         args.name_status,
     );
     push_paths(&mut argv, &args.paths);
-    if let Some(id) = commit_id
-        && !args.quiet
-        && !args.no_commit_id
-    {
-        println!("{id}");
+    if let Some(header) = header {
+        print!("{header}");
+        if header_format.is_some_and(diff_tree_header_blank_line) && !args.no_patch && !args.quiet {
+            println!();
+        }
     }
     run_via_diff(
         argv,
@@ -419,6 +537,7 @@ async fn execute_tree_raw(
     args: DiffTreeArgs,
     recursive: bool,
     _output: &OutputConfig,
+    header_format: Option<&DiffTreeHeaderFormat>,
 ) -> CliResult<()> {
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -435,15 +554,23 @@ async fn execute_tree_raw(
             .map_err(|error| CliError::command_usage(format!("invalid pathspec: {error}")))?
     };
 
-    let (old_tree, new_tree, commit_id, root_commit) = match &args.tree_b {
+    let (old_tree, new_tree, root_commit, header) = match &args.tree_b {
         Some(tree_b) => (
             Some(resolve_tree_id(&args.tree_a).await?),
             Some(resolve_tree_id(tree_b).await?),
-            None,
             false,
+            None,
         ),
         None => {
             let commit = resolve_commit(&args.tree_a).await?;
+            let header = if !args.no_commit_id && (!args.quiet || header_format.is_some()) {
+                Some(match header_format {
+                    Some(format) => render_diff_tree_header(format, &commit),
+                    None => format!("{}\n", commit.id),
+                })
+            } else {
+                None
+            };
             let parent_tree = match commit.parent_commit_ids.first() {
                 Some(parent) => {
                     let parent = crate::command::load_object::<
@@ -459,25 +586,19 @@ async fn execute_tree_raw(
             (
                 parent_tree,
                 Some(commit.tree_id),
-                Some(commit.id),
                 parent_tree.is_none(),
+                header,
             )
         }
     };
 
-    let mut lines = String::new();
-    if let Some(id) = commit_id
-        && !args.quiet
-        && !args.no_commit_id
-    {
-        lines.push_str(&format!("{id}\n"));
-    }
-
-    // A root commit without `--root` shows no raw records (Git prints only the
-    // id line); with `--root` it diffs against the empty tree.
+    // A root commit without `--root` shows no raw records; with `--root` it
+    // diffs against the empty tree.
     let show_diff = !args.no_patch && (!root_commit || args.root);
+    let has_diff = !root_commit || args.root;
+    let mut body = String::new();
     let mut differences = false;
-    if show_diff {
+    if has_diff {
         let mut old_entries: BTreeMap<String, (u32, git_internal::hash::ObjectHash)> =
             BTreeMap::new();
         let mut new_entries: BTreeMap<String, (u32, git_internal::hash::ObjectHash)> =
@@ -501,18 +622,32 @@ async fn execute_tree_raw(
                 new_entries.get(name).copied(),
             ) {
                 differences = true;
-                lines.push_str(&record);
+                if show_diff {
+                    body.push_str(&record);
+                }
             }
         }
     }
 
+    // Git omits the commit header when the filtered diff has no records, but
+    // a root commit without `--root` keeps its legacy id header.
+    let show_header = header.is_some() && (differences || (root_commit && !args.root));
     if args.quiet {
+        if show_header && let Some(header) = &header {
+            print!("{header}");
+        }
         if differences {
             return Err(CliError::silent_exit(1));
         }
         return Ok(());
     }
-    print!("{lines}");
+    if show_header && let Some(header) = header {
+        print!("{header}");
+        if show_diff && header_format.is_some_and(diff_tree_header_blank_line) {
+            println!();
+        }
+    }
+    print!("{body}");
     if args.exit_code && differences {
         return Err(CliError::silent_exit(1));
     }
@@ -582,4 +717,16 @@ pub async fn execute_files_safe(args: DiffFilesArgs, output: &OutputConfig) -> C
     }
     push_paths(&mut argv, &args.paths);
     run_via_diff(argv, output, args.exit_code || args.quiet, true, args.quiet).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn commit_subject_strips_gpgsig_and_joins_the_paragraph() {
+        let signature = "-----BEGIN PGP SIGNATURE-----\nabcDEF123\n-----END PGP SIGNATURE-----";
+        let message = format!("gpgsig {signature}\n\nfirst\nsecond\n\nbody");
+        assert_eq!(commit_subject(&message), "first second");
+    }
 }

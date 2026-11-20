@@ -8,7 +8,10 @@ use std::{fs, process::Output};
 use serial_test::serial;
 use tempfile::TempDir;
 
-use super::{assert_cli_success, create_committed_repo_via_cli, run_libra_command};
+use super::{
+    assert_cli_success, configure_identity_via_cli, create_committed_repo_via_cli,
+    init_repo_via_cli, run_libra_command,
+};
 
 fn out_str(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).to_string()
@@ -1295,4 +1298,249 @@ fn test_diff_index_cached() {
     assert_cli_success(&staged, "diff-index --cached staged");
     let text = out_str(&staged);
     assert!(text.trim_end().ends_with("M\ttracked.txt"), "{text}");
+}
+
+/// DIFF-01 fixture F01: C1 (`a.txt=1`, subject `base`) and C2=HEAD
+/// (`a.txt=2`, added `b.txt=x`, subject `unamended`).
+fn diff_tree_format_fixture() -> (TempDir, String) {
+    let repo = tempfile::tempdir().expect("create repository root");
+    let p = repo.path();
+    init_repo_via_cli(p);
+    configure_identity_via_cli(p);
+    assert_cli_success(
+        &run_libra_command(&["config", "vault.signing", "false"], p),
+        "disable vault signing",
+    );
+    fs::write(p.join("a.txt"), "1\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "a.txt"], p), "add a.txt");
+    assert_cli_success(
+        &run_libra_command(&["commit", "--no-gpg-sign", "-m", "base"], p),
+        "commit base",
+    );
+    fs::write(p.join("a.txt"), "2\n").unwrap();
+    fs::write(p.join("b.txt"), "x\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "."], p), "add second change");
+    assert_cli_success(
+        &run_libra_command(&["commit", "--no-gpg-sign", "-m", "unamended"], p),
+        "commit unamended",
+    );
+    let head = rev_parse(&repo, "HEAD");
+    (repo, head)
+}
+
+/// The two raw records Git prints for F01, independent of `--format`.
+fn diff_tree_format_raw_records() -> &'static str {
+    ":100644 100644 d00491fd7e5bb6fa28c517a0bb32b8b506539d4d 0cfbf08886fca9a91cb753ec8734c84fcbe52c9f M\ta.txt\n\
+     :000000 100644 0000000000000000000000000000000000000000 587be6b4c3f93f93c489c0111bba5596147a26cb A\tb.txt\n"
+}
+
+#[test]
+fn diff_tree_format_subject() {
+    let (repo, _head) = diff_tree_format_fixture();
+    let p = repo.path();
+
+    // AC1: `-s` renders only the subject, with no trailing blank line.
+    let short = run_libra_command(&["diff-tree", "-s", "--format=%s", "HEAD"], p);
+    assert_cli_success(&short, "diff-tree -s --format=%s");
+    assert_eq!(out_str(&short), "unamended\n");
+    assert!(short.stderr.is_empty(), "{:?}", short.stderr);
+
+    // AC2: a bare `%` template is followed by a blank line and the raw records.
+    let full = run_libra_command(&["diff-tree", "--format=%s", "HEAD"], p);
+    assert_cli_success(&full, "diff-tree --format=%s");
+    assert_eq!(
+        out_str(&full),
+        format!("unamended\n\n{}", diff_tree_format_raw_records())
+    );
+    assert!(full.stderr.is_empty(), "{:?}", full.stderr);
+}
+
+#[test]
+fn diff_tree_format_presets_and_no_commit_id() {
+    let (repo, head) = diff_tree_format_fixture();
+    let p = repo.path();
+
+    // AC3: `oneline` uses the full commit id, then the raw records directly.
+    let oneline = run_libra_command(&["diff-tree", "--format=oneline", "HEAD"], p);
+    assert_cli_success(&oneline, "diff-tree --format=oneline");
+    assert_eq!(
+        out_str(&oneline),
+        format!("{head} unamended\n{}", diff_tree_format_raw_records())
+    );
+    assert!(oneline.stderr.is_empty(), "{:?}", oneline.stderr);
+
+    // AC8: `--pretty` is an alias for `--format`.
+    let pretty = run_libra_command(&["diff-tree", "--pretty=oneline", "HEAD"], p);
+    assert_cli_success(&pretty, "diff-tree --pretty=oneline");
+    assert_eq!(out_str(&pretty), out_str(&oneline));
+
+    // AC4: `--no-commit-id` suppresses the header, leaving raw records only.
+    let no_commit_id =
+        run_libra_command(&["diff-tree", "--no-commit-id", "--format=%s", "HEAD"], p);
+    assert_cli_success(&no_commit_id, "diff-tree --no-commit-id --format=%s");
+    assert_eq!(out_str(&no_commit_id), diff_tree_format_raw_records());
+    assert!(no_commit_id.stderr.is_empty(), "{:?}", no_commit_id.stderr);
+}
+
+#[test]
+fn diff_tree_unknown_preset_and_custom_format() {
+    let (repo, _head) = diff_tree_format_fixture();
+    let p = repo.path();
+
+    // AC5: a bare template containing `%` is rendered, not rejected as a preset.
+    let custom = run_libra_command(&["diff-tree", "--format=prefix %s", "HEAD"], p);
+    assert_cli_success(&custom, "diff-tree --format=prefix %s");
+    assert_eq!(
+        out_str(&custom),
+        format!("prefix unamended\n\n{}", diff_tree_format_raw_records())
+    );
+    assert!(custom.stderr.is_empty(), "{:?}", custom.stderr);
+
+    // AC6: `format:` is a literal template and does not add the extra blank line.
+    let literal = run_libra_command(&["diff-tree", "--format=format:unknown", "HEAD"], p);
+    assert_cli_success(&literal, "diff-tree --format=format:unknown");
+    assert_eq!(
+        out_str(&literal),
+        format!("unknown\n{}", diff_tree_format_raw_records())
+    );
+    assert!(literal.stderr.is_empty(), "{:?}", literal.stderr);
+
+    // AC7: an unknown bare preset is a stable CLI argument error.
+    let unknown = run_libra_command(&["diff-tree", "--format=unknown", "HEAD"], p);
+    assert_eq!(unknown.status.code(), Some(129), "{unknown:?}");
+    assert!(out_str(&unknown).is_empty(), "{}", out_str(&unknown));
+    assert!(
+        String::from_utf8_lossy(&unknown.stderr).contains("LBR-CLI-002"),
+        "{}",
+        String::from_utf8_lossy(&unknown.stderr)
+    );
+}
+
+#[test]
+fn diff_tree_format_multiline_subject() {
+    let (repo, _head) = diff_tree_format_fixture();
+    let p = repo.path();
+    fs::write(p.join("a.txt"), "3\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "a.txt"], p), "add third");
+    assert_cli_success(
+        &run_libra_command(
+            &["commit", "--no-gpg-sign", "-m", "first\nsecond\n\nbody"],
+            p,
+        ),
+        "commit multiline subject",
+    );
+    let head = rev_parse(&repo, "HEAD");
+    let raw = ":100644 100644 0cfbf08886fca9a91cb753ec8734c84fcbe52c9f \
+               00750edc07d6415dcc07ae0351e9397b0222b7ba M\ta.txt\n";
+
+    // AC2 with a multi-line first paragraph: Git joins the subject lines.
+    let subject = run_libra_command(&["diff-tree", "--format=%s", "HEAD"], p);
+    assert_cli_success(&subject, "multiline --format=%s");
+    assert_eq!(out_str(&subject), format!("first second\n\n{raw}"));
+
+    // AC3 with the same message: `oneline` uses the joined subject too.
+    let oneline = run_libra_command(&["diff-tree", "--format=oneline", "HEAD"], p);
+    assert_cli_success(&oneline, "multiline --format=oneline");
+    assert_eq!(out_str(&oneline), format!("{head} first second\n{raw}"));
+}
+
+#[test]
+fn diff_tree_format_delegated_and_quiet_interactions() {
+    let (repo, _head) = diff_tree_format_fixture();
+    let p = repo.path();
+
+    // `-p` keeps the formatted header and inserts the custom-template blank line.
+    let patch = run_libra_command(&["diff-tree", "-p", "--format=%s", "HEAD"], p);
+    assert_cli_success(&patch, "diff-tree -p --format=%s");
+    let patch_text = out_str(&patch);
+    assert!(
+        patch_text.starts_with("unamended\n\ndiff --git a/a.txt b/a.txt\n"),
+        "{patch_text}"
+    );
+    assert!(patch_text.contains("+++ b/a.txt"), "{patch_text}");
+    assert!(patch.stderr.is_empty(), "{:?}", patch.stderr);
+
+    // `--name-only` keeps the same header/body separator.
+    let names = run_libra_command(&["diff-tree", "--name-only", "--format=%s", "HEAD"], p);
+    assert_cli_success(&names, "diff-tree --name-only --format=%s");
+    assert_eq!(out_str(&names), "unamended\n\na.txt\nb.txt\n");
+    assert!(names.stderr.is_empty(), "{:?}", names.stderr);
+
+    // Git prints the explicit format header even under `--quiet`, then exits 1.
+    let quiet = run_libra_command(&["diff-tree", "--quiet", "--format=%s", "HEAD"], p);
+    assert_eq!(quiet.status.code(), Some(1), "{quiet:?}");
+    assert_eq!(out_str(&quiet), "unamended\n");
+
+    for mode in ["-p", "--name-only", "--name-status"] {
+        let quiet_body =
+            run_libra_command(&["diff-tree", mode, "--quiet", "--format=%s", "HEAD"], p);
+        assert_eq!(quiet_body.status.code(), Some(1), "{quiet_body:?}");
+        assert_eq!(out_str(&quiet_body), "unamended\n", "{mode}");
+    }
+
+    // The two-tree form has no commit header to format: raw records only.
+    let parent = rev_parse(&repo, "HEAD^");
+    let two_tree = run_libra_command(&["diff-tree", "--format=%s", &parent, "HEAD"], p);
+    assert_cli_success(&two_tree, "two-tree --format=%s");
+    assert_eq!(out_str(&two_tree), diff_tree_format_raw_records());
+
+    // The raw form suppresses the formatted header when the filtered diff is
+    // empty, matching Git.
+    let no_match = run_libra_command(
+        &["diff-tree", "--format=%s", "HEAD", "--", "does-not-exist"],
+        p,
+    );
+    assert_cli_success(&no_match, "raw no-match --format=%s");
+    assert!(out_str(&no_match).is_empty(), "{}", out_str(&no_match));
+
+    let no_match_no_patch = run_libra_command(
+        &[
+            "diff-tree",
+            "-s",
+            "--format=%s",
+            "HEAD",
+            "--",
+            "does-not-exist",
+        ],
+        p,
+    );
+    assert_cli_success(&no_match_no_patch, "raw -s no-match --format=%s");
+    assert!(
+        out_str(&no_match_no_patch).is_empty(),
+        "{}",
+        out_str(&no_match_no_patch)
+    );
+
+    // The raw root form renders the header and the creation record.
+    let root = run_libra_command(&["diff-tree", "--root", "--format=%s", &parent], p);
+    assert_cli_success(&root, "root --root --format=%s");
+    assert_eq!(
+        out_str(&root),
+        "base\n\n:000000 100644 0000000000000000000000000000000000000000 d00491fd7e5bb6fa28c517a0bb32b8b506539d4d A\ta.txt\n"
+    );
+
+    // A root commit without `--root` keeps its legacy header, with no blank
+    // line and no records.
+    let root_header = run_libra_command(&["diff-tree", "--format=%s", &parent], p);
+    assert_cli_success(&root_header, "root --format=%s");
+    assert_eq!(out_str(&root_header), "base\n");
+
+    let root_oneline = run_libra_command(&["diff-tree", "--format=oneline", &parent], p);
+    assert_cli_success(&root_oneline, "root --format=oneline");
+    assert_eq!(out_str(&root_oneline), format!("{parent} base\n"));
+
+    // Empty non-root commits suppress the formatted header, including `-s`.
+    assert_cli_success(
+        &run_libra_command(
+            &["commit", "--allow-empty", "--no-gpg-sign", "-m", "empty"],
+            p,
+        ),
+        "commit empty",
+    );
+    let empty = run_libra_command(&["diff-tree", "--format=%s", "HEAD"], p);
+    assert_cli_success(&empty, "empty --format=%s");
+    assert!(out_str(&empty).is_empty(), "{}", out_str(&empty));
+    let empty_s = run_libra_command(&["diff-tree", "-s", "--format=%s", "HEAD"], p);
+    assert_cli_success(&empty_s, "empty -s --format=%s");
+    assert!(out_str(&empty_s).is_empty(), "{}", out_str(&empty_s));
 }
