@@ -1017,6 +1017,7 @@ Result 只允许 `PASS` 或 `FAIL`。`FAIL` 必须列出 P0/P1 条目并在下�
 | R9 | 全文（第九版，SHA-256 `fabfd59a25dad60da08ae98d81c5b72ed6cc02741dd199c2431eee4a433ddd62`） | PASS | Codex：P0=0、P1=0（3×P2：dirty 残留、门禁引用 R8、VER 计数）；Claude：P0=0、P1=0（6×P2、5×P3：About 预算、AC 实现规则、延后页 demo 徽标、锚点、freshness 记录、措辞、修订历史顺序） | 清理见下一行修订 | Codex exec 与 Claude Code 只读全文审查（2026-11-21 02:0x UTC） |
 | R10 | 全文（第十版，SHA-256 `282aed1896f338f59d389d07a7b6974007ef882d9cc129c02dd9f51c20603b6c`） | PASS | Codex：P0=0、P1=0（1×P2：§二 摘要陈旧）；Claude：P0=0、P1=0（2×P2、7×P3：§二 摘要、徽标"新增"、`未检查` 占位、计数规则、traceability、R8 口径、映射顺序、临时仓库、availability timeout） | 清理见修订历史（02:50 行） | Codex exec 与 Claude Code 只读全文审查（2026-11-21 02:4x UTC） |
 | R11 | 全文（第十一版，SHA-256 `59aa83d914e7207fc35c7dfe159ba2edddee317992d02abc86f41760b03462c4`） | PASS | Codex：P0=0、P1=0（2×P2/P3：busy 契约、评审日志/状态行）；Claude：P0=0、P1=0（4×P2、1×P3：availability 预算措辞、A7 重复、§一/§二 漂移、映射顺序） | 清理见修订历史（R11 后一行） | Codex exec 与 Claude Code 只读全文审查（2026-11-21 03:0x UTC） |
+| R12 | 全文（最终字节，SHA-256 `d932f1b32419a108ed56088a0c8aaf57fc76e06473a99f2ff00b0d2d32607597`） | PASS | Codex：P0=0、P1=0（2×P2/P3：性能摘要口径、§二 摘要）；Claude：P0=0、P1=0（4×P2、1×P3，均在 R11 清理项内） | 清理：性能摘要区分无争用 ≤80ms 与持锁 ≤200ms；§二 摘要同步 R12 | Codex exec（受审 SHA `f7f31b2b897a2bc405679cac320b4b98999cef0cce3234396747eae5157734b6`）与 Claude Code（受审 SHA `0639dea4a50833e0c8e865fe6f1a7de7966744358e965ec29f8c4555276e2819`）只读全文审查（2026-11-21 03:3x UTC） |
 
 ## 非目标与延后项
 
