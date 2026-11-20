@@ -246,7 +246,7 @@
 | DEP-BR-05 | incoming | 外部前置 Issue | `libra#541`（`update-ref` 仅限 `refs/heads`） | CLI 维护者 | 通用 ref 更新支持非 `refs/heads` 引用 | Issue #680/#689 关联项 | 仅影响上游脚本 setup；不影响 `BR-03` 本地测试 |
 | DEP-BR-06 | incoming | 外部前置 Issue | `libra#675`（`branch -M` 强制重命名） | CLI 维护者 | `branch -M` 可用于上游测试 setup | Issue #688 关联项 | 仅影响完整上游脚本 setup；`-M` 相关判据已移入 `DEFER-BR-04`，`BR-09` 只交付 `-m` |
 | DEP-BR-07 | incoming | 外部前置 Issue | `libra#556`（symref/detached-from 底层前置） | CLI 维护者 | 上游完整 `t3203` symref 用例前置就绪 | Issue #701 关联项 | 仅影响完整上游脚本跑通；`BR-21` 自身聚焦测试不阻塞 |
-| DEP-BR-08 | incoming | 跨计划共享文档写集 | `COMPATIBILITY.md`、`docs/error-codes.md`（同批全部计划共享 `COMPATIBILITY.md`，按 global-init-infra `DEP-GII-03` 同口径；`docs/error-codes.md` 另与 `grep`/`checkout-switch-restore`/`diff` 等共享） | 仓库协调者 | 每张活动卡（`BR-01`..`BR-32`、`BR-34`、`BR-36`、`BR-40`；已撤回卡不写文件）开工编辑前取得协调者对上述文件的单写者串行窗口，本卡合入 `main` 后释放。`COMPATIBILITY.md` 仅原地改 `branch`/`for-each-ref`/`fetch`/`rev-parse` 专属行（不增删行），`docs/error-codes.md` 仅在 `BR-05`、`BR-08` 新增稳定码时追加行 | 协调者放行记录写入该卡 `Verification` 记录（合入后同步 `plan-status.md`） | 未获窗口前该卡保持 `pending`，不编辑相交文件（G-10）；超过 7 日未获窗口即报告协调者 |
+| DEP-BR-08 | incoming | 跨计划共享文档写集 | `COMPATIBILITY.md`、`docs/error-codes.md`（同批全部计划共享 `COMPATIBILITY.md`，按 global-init-infra `DEP-GII-03` 同口径；`docs/error-codes.md` 另与 `grep`/`checkout-switch-restore`/`diff` 等共享） | 仓库协调者 | 每张活动卡（`BR-01`..`BR-32`、`BR-34`、`BR-36`、`BR-40`；已撤回卡不写文件）开工编辑前取得协调者对上述文件的单写者串行窗口，本卡合入 `main` 后释放。`COMPATIBILITY.md` 仅原地改 `branch`/`for-each-ref`/`fetch`/`rev-parse` 专属行（不增删行），`docs/error-codes.md` 由 `BR-01` 追加 `LBR-CLI-002` 的 exit-128 override 说明，`BR-05`/`BR-08` 新增稳定码时追加行 | 协调者放行记录写入该卡 `Verification` 记录（合入后同步 `plan-status.md`） | 未获窗口前该卡保持 `pending`，不编辑相交文件（G-10）；超过 7 日未获窗口即报告协调者 |
 | DEP-BR-09 | incoming | 跨计划共享源码写集 | `src/utils/util.rs`、`tests/command/rev_parse_test.rs`、rev-parse 文档（与 `clone`/`describe`/`merge-pull`/`global-init-infra`/`plumbing-misc` 共享；describe `DEP-DESC-UTIL` 已登记本计划 `BR-06`、`BR-07`、`BR-25`..`BR-32`、`BR-40`） | 仓库协调者 | `BR-06`/`BR-32`/`BR-31`/`BR-07`/`BR-40`/`BR-25`/`BR-29`/`BR-27`/`BR-30`/`BR-26`/`BR-28` 开工编辑前按 `DEP-GII-03` 口径核对同批写集交集并取得单写者串行窗口，合入 `main` 后释放 | 核对结果与放行记录写入该卡 `Verification` 记录 | 未获窗口前阻塞编辑上述文件（G-10）；超过 7 日即报告协调者 |
 | DEP-BR-10 | incoming | 跨计划共享源码写集 | `src/command/fetch.rs`、`tests/command/fetch_test.rs` 与 fetch 文档（EN/zh-CN/开发/网站 `fetch.en.md`；与 `fetch-push`、`clone`、`global-init-infra` 共享，按 `DEP-GII-03` 口径） | 仓库协调者 | `BR-24` 开工编辑前核对同批写集交集并取得上述文件的单写者串行窗口，合入 `main` 后释放 | 核对结果与放行记录写入该卡 `Verification` 记录 | 未获窗口前阻塞编辑上述文件（G-10）；超过 7 日即报告协调者 |
 | DEP-BR-11 | incoming | 跨计划共享源码写集 | `src/command/branch.rs`（与 `checkout-switch-restore#CSR-10` 共享） | 仓库协调者 | 修改 `branch.rs` 的卡片取得协调者串行放行并与 `CSR-10` 错开窗口 | 协调者串行调度记录 | 禁止与 `CSR-10` 并发修改 `src/command/branch.rs`（G-10） |
@@ -372,7 +372,7 @@
 ### Task BR-01: 修复 `libra branch` 中 `--column` 与 `-v` 选项互斥校验（#678）
 
 **Task type:** implementation
-**Lifecycle / Acceptance:** pending / 空
+**Lifecycle / Acceptance:** `done` / `complete`（2026-11-20：`0.30.212`；targeted `command::branch_test::column_verbose_conflict` 1/1 PASS；Codex R4 `VERDICT: PASS`；`docs/error-codes.md`/EN/zh/开发/COMPATIBILITY/网站已同步；远端 CI 未等待，按用户 2026-11-20 指令 local C/D）
 **Description:** 解决 Issue #678：当解析后的列模式实际启用（`--column`/`--column=always`，或 `--column=auto` 且 stdout 为终端）并同时传入 `-v`/`--verbose` 时，拒绝该选项冲突（`--no-column`、`--column=never` 与非终端下的 `--column=auto` 不触发；终端下 `--column=auto -v` 的拒绝需 PTY 夹具，本卡不作验收，见 `DEFER-BR-08`）并输出 `options '--column' and '--verbose' cannot be used together`（exit 128，对齐 Git `die`）。
 **Out of scope:** `--format` 与 `--column` 的交互（已由既有逻辑覆盖）；`color.branch.*` 配置（由 `BR-03` 承接）。
 **Current evidence:**
@@ -381,29 +381,29 @@
 | `BranchArgs.column` 与 `verbose` 未在 clap 或 `execute_safe` 中做互斥校验 | `src/command/branch.rs:491-508,875-886` |
 | `render_branch_output` 仅以 `verbose == 0` 静默禁用列布局 | `src/command/branch.rs:2913-2916` |
 **Acceptance criteria:**
-- [ ] `libra branch --column -v` 的退出码为 128（`#678` 与 pinned Git 一致）。
-- [ ] `libra branch --column -v` 的 stderr 含 `options '--column' and '--verbose' cannot be used together`（执行条件：以非零状态退出）。
-- [ ] `libra branch --column=always -v` 的 stderr 含同一诊断（执行条件：以非零状态退出）。
-- [ ] `libra branch --column --no-column -v` 退出 0（后给出的 `--no-column` 生效）。
-- [ ] `libra branch --column=never -v` 退出 0。
-- [ ] `libra branch --column` 单独使用退出 0（`#678` Acceptance 2）。
-- [ ] stdout 为管道（子进程默认）时 `libra branch --column=auto -v` 退出 0（`auto` 在非终端时不启用列布局，因此不触发互斥；pinned Git `builtin/branch.c:1117-1122` 先 `finalize_colopts` 再判 `explicitly_enable_column`，实测同样退出 0）。
-- [ ] `libra branch -v` 单独使用退出 0（`#678` Acceptance 2）。
-- [ ] 同卡完成「Docs and compatibility impact」所列全部文档文件更新并逐文件验收通过（ER-06/ER-06a，不计入 G-03 卡特有 AC 分子）。
+- [x] `libra branch --column -v` 的退出码为 128（`#678` 与 pinned Git 一致）。
+- [x] `libra branch --column -v` 的 stderr 含 `options '--column' and '--verbose' cannot be used together`（执行条件：以非零状态退出）。
+- [x] `libra branch --column=always -v` 的 stderr 含同一诊断（执行条件：以非零状态退出）。
+- [x] `libra branch --column --no-column -v` 退出 0（后给出的 `--no-column` 生效）。
+- [x] `libra branch --column=never -v` 退出 0。
+- [x] `libra branch --column` 单独使用退出 0（`#678` Acceptance 2）。
+- [x] stdout 为管道（子进程默认）时 `libra branch --column=auto -v` 退出 0（`auto` 在非终端时不启用列布局，因此不触发互斥；pinned Git `builtin/branch.c:1117-1122` 先 `finalize_colopts` 再判 `explicitly_enable_column`，实测同样退出 0）。
+- [x] `libra branch -v` 单独使用退出 0（`#678` Acceptance 2）。
+- [x] 同卡完成「Docs and compatibility impact」所列全部文档文件更新并逐文件验收通过（ER-06/ER-06a，不计入 G-03 卡特有 AC 分子）。
 **AC → 断言映射:**（夹具 F0/FR/SNAP/FI/NOESC 见「验证执行协议」第 6 条；每条只写判定该 AC 所需的检查）
 - 夹具：F0；`main` 上一个提交，另建分支 `topic`。
 - AC1–AC8 → `command::branch_test::column_verbose_conflict`：逐条运行 AC 所列命令；AC1 判据 `status.code() == Some(128)`；AC2、AC3 判据 stderr 含该诊断原文（执行条件 exit ≠ 0）；AC4–AC8 判据 `status.code() == Some(0)`。
 - 文档 AC → 「文档与网站验收命令」第 1–7 步（不计入卡特有 AC 分子）
 **Verification:**
-- [ ] `source .env.test && cargo nextest run --test command_test -E 'test(=command::branch_test::column_verbose_conflict)'`（卡特有用例，new；覆盖 AC1–AC8）
-- [ ] `source .env.test && cargo nextest run --lib -E 'test(/^command::branch::tests::/)'`（共享回归组，不计入 G-03 VER）
+- [x] `source .env.test && cargo nextest run --test command_test -E 'test(=command::branch_test::column_verbose_conflict)'`（卡特有用例，new；覆盖 AC1–AC8）
+- [x] `source .env.test && cargo nextest run --lib -E 'test(/^command::branch::tests::/)'`（共享回归组，不计入 G-03 VER）
 **Full-suite trigger:** T-1: 本卡 `patch + 1` 同步 `install.sh` 与 `install.ps1`（ER-13；C 组第④步在 bump 后跑双环境完整 nextest）（执行阶段只跑本卡 focused 测试）
 **Dependencies:** DEP-BR-01, DEP-BR-08, DEP-BR-11, DEP-BR-14
 **Deliverables:** N/A
-**Implementation write set:** `src/command/branch.rs`, `tests/command/branch_test.rs`, `docs/commands/branch.md`, `docs/commands/zh-CN/branch.md`, `docs/development/commands/branch.md`, `/Volumes/Data/gitmono/libra-backend/apps/tanstack-app/content/docs/commands/branch.en.md`, `COMPATIBILITY.md`, `/Volumes/Data/gitmono/libra-backend/apps/tanstack-app/src/generated/docs-manifest.ts`, `/Volumes/Data/gitmono/libra-backend/apps/tanstack-app/src/generated/docs-search.ts`, `/Volumes/Data/gitmono/libra-backend/apps/tanstack-app/dist/`（网站第 4 步生成器/构建派生产物，不手改、不暂存、不提交）
+**Implementation write set:** `src/command/branch.rs`, `tests/command/branch_test.rs`, `docs/commands/branch.md`, `docs/commands/zh-CN/branch.md`, `docs/development/commands/branch.md`, `docs/error-codes.md`, `/Volumes/Data/gitmono/libra-backend/apps/tanstack-app/content/docs/commands/branch.en.md`, `COMPATIBILITY.md`, `/Volumes/Data/gitmono/libra-backend/apps/tanstack-app/src/generated/docs-manifest.ts`, `/Volumes/Data/gitmono/libra-backend/apps/tanstack-app/src/generated/docs-search.ts`, `/Volumes/Data/gitmono/libra-backend/apps/tanstack-app/dist/`（网站第 4 步生成器/构建派生产物，不手改、不暂存、不提交）
 **Release write set:** Inherited
 **Files likely touched:** `src/command/branch.rs`, `tests/command/branch_test.rs`, `docs/commands/branch.md`, `docs/commands/zh-CN/branch.md`, `docs/development/commands/branch.md`, `/Volumes/Data/gitmono/libra-backend/apps/tanstack-app/content/docs/commands/branch.en.md`, `COMPATIBILITY.md`
-**Docs and compatibility impact:** 更新 `docs/commands/branch.md`、`docs/commands/zh-CN/branch.md`、`docs/development/commands/branch.md`、`/Volumes/Data/gitmono/libra-backend/apps/tanstack-app/content/docs/commands/branch.en.md`（按 ER-06a 核对相邻仓库 `/Volumes/Data/gitmono/libra-backend` 的 VCS 与 `cf` 分支，无有效 `cf` 仓库则 STOP 报告）及 `COMPATIBILITY.md`。
+**Docs and compatibility impact:** 更新 `docs/commands/branch.md`、`docs/commands/zh-CN/branch.md`、`docs/development/commands/branch.md`、`docs/error-codes.md`、`/Volumes/Data/gitmono/libra-backend/apps/tanstack-app/content/docs/commands/branch.en.md`（按 ER-06a 核对相邻仓库 `/Volumes/Data/gitmono/libra-backend` 的 VCS 与 `cf` 分支，无有效 `cf` 仓库则 STOP 报告）及 `COMPATIBILITY.md`。
 **Rollback mode:** immutable-release
 **Estimated scope:** M（1 个落点，1 个生产文件）
 **Version increment:** patch

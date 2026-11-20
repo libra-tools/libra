@@ -44,6 +44,96 @@ fn test_branch_cli_invalid_start_point_returns_cli_exit_code() {
     assert!(stderr.contains("Error-Code: LBR-CLI-003"));
 }
 
+#[test]
+fn column_verbose_conflict() {
+    let repo = create_committed_repo_via_cli();
+    assert_cli_success(
+        &run_libra_command(&["branch", "topic"], repo.path()),
+        "branch topic fixture",
+    );
+
+    let conflict = run_libra_command(&["branch", "--column", "-v"], repo.path());
+    assert_eq!(
+        conflict.status.code(),
+        Some(128),
+        "stderr: {}",
+        String::from_utf8_lossy(&conflict.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&conflict.stderr);
+    assert!(
+        stderr.contains("options '--column' and '--verbose' cannot be used together"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        conflict.stdout.is_empty(),
+        "the conflict must be refused before any listing output: {}",
+        String::from_utf8_lossy(&conflict.stdout)
+    );
+
+    let create_conflict =
+        run_libra_command(&["branch", "--column", "-v", "must-not-exist"], repo.path());
+    assert_eq!(create_conflict.status.code(), Some(128));
+    assert!(
+        String::from_utf8_lossy(&create_conflict.stderr)
+            .contains("options '--column' and '--verbose' cannot be used together")
+    );
+    let created = run_libra_command(
+        &["rev-parse", "--verify", "refs/heads/must-not-exist"],
+        repo.path(),
+    );
+    assert!(
+        !created.status.success(),
+        "the conflict must be refused before branch creation: {}",
+        String::from_utf8_lossy(&created.stdout)
+    );
+
+    let delete_conflict =
+        run_libra_command(&["branch", "--column", "-v", "-d", "topic"], repo.path());
+    assert_eq!(delete_conflict.status.code(), Some(128));
+    assert!(
+        String::from_utf8_lossy(&delete_conflict.stderr)
+            .contains("options '--column' and '--verbose' cannot be used together")
+    );
+    let still_there =
+        run_libra_command(&["rev-parse", "--verify", "refs/heads/topic"], repo.path());
+    assert_cli_success(&still_there, "rev-parse --verify refs/heads/topic");
+
+    let always = run_libra_command(&["branch", "--column=always", "-v"], repo.path());
+    assert_eq!(
+        always.status.code(),
+        Some(128),
+        "stderr: {}",
+        String::from_utf8_lossy(&always.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&always.stderr)
+            .contains("options '--column' and '--verbose' cannot be used together"),
+        "stderr: {}",
+        String::from_utf8_lossy(&always.stderr)
+    );
+
+    assert_cli_success(
+        &run_libra_command(&["branch", "--column", "--no-column", "-v"], repo.path()),
+        "branch --column --no-column -v",
+    );
+    assert_cli_success(
+        &run_libra_command(&["branch", "--column=never", "-v"], repo.path()),
+        "branch --column=never -v",
+    );
+    assert_cli_success(
+        &run_libra_command(&["branch", "--column"], repo.path()),
+        "branch --column",
+    );
+    assert_cli_success(
+        &run_libra_command(&["branch", "--column=auto", "-v"], repo.path()),
+        "branch --column=auto -v",
+    );
+    assert_cli_success(
+        &run_libra_command(&["branch", "-v"], repo.path()),
+        "branch -v",
+    );
+}
+
 /// Scenario: `--json branch <name>` must emit `command="branch"`,
 /// `data.action="create"`, `data.name=<name>` and a non-empty
 /// `data.commit`. Schema pin for branch-create JSON output.

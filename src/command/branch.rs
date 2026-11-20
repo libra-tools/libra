@@ -873,7 +873,13 @@ pub async fn execute_safe(args: BranchArgs, output: &OutputConfig) -> CliResult<
     // Validate the `--column` mode up front so an invalid mode is rejected
     // regardless of output path; the enable decision is recomputed at render.
     if let Some(mode) = args.column.as_deref() {
-        super::tag::resolve_column_enabled(mode)?;
+        let column_enabled = super::tag::resolve_column_enabled(mode)?;
+        if column_enabled && args.verbose > 0 {
+            return Err(CliError::command_usage(
+                "options '--column' and '--verbose' cannot be used together",
+            )
+            .with_exit_code(128));
+        }
     }
     let result = run_branch(&args).await.map_err(CliError::from)?;
     render_branch_output(
@@ -2908,8 +2914,9 @@ async fn render_branch_output(
                 return Ok(());
             }
 
-            // `-v` (per-branch sha + subject) takes precedence over `--column`
-            // (which is a names-only dense layout).
+            // `execute_safe` already rejects an enabled `--column` combined with
+            // `-v`/`--verbose`; the `verbose == 0` guard here is defensive for
+            // callers that bypass that validation (e.g. internal renderers).
             let column_enabled = match column {
                 Some(mode) => super::tag::resolve_column_enabled(mode)? && verbose == 0,
                 None => false,

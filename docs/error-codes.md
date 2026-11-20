@@ -62,6 +62,7 @@ Set `LIBRA_FINE_EXIT_CODES=1` to re-enable the legacy fine-grained exit codes (2
 `CliError::with_exit_code` wins over both the Git-standard 128/129 mapping and `LIBRA_FINE_EXIT_CODES=1`. The stable `error_code` is unchanged.
 
 - `branch -d` / `--delete` refusals (not fully merged, missing branch, currently checked-out branch) exit **1**. Codes stay `LBR-REPO-003` or `LBR-CLI-003`.
+- `branch --column` combined with `-v`/`--verbose` when column mode is actually enabled exits **128** (Git `die` parity); the stable code remains `LBR-CLI-002`. `--no-column`, `--column=never`, and non-TTY `--column=auto` do not trigger the override.
 
 The MCP front end (`libra agent mcp`) reuses `LBR-AGENT-022..038` as tool errors (`result.isError` with `structuredContent.stable_code`). It does not allocate new stable codes. The trigger for each code under MCP is in the agent command docs.
 
@@ -95,7 +96,7 @@ structured report is always present.
 | Exit | Stable code | Category | Meaning | Typical examples |
 | --- | --- | --- | --- | --- |
 | `129` | `LBR-CLI-001` | `cli` | Unknown command | `libra wat` |
-| `129` | `LBR-CLI-002` | `cli` | Invalid or missing CLI arguments | missing required flag, conflicting flags, `init` targeting the per-user Libra home as repository storage; `update-ref` fatals exit `128` instead — see the note below the table |
+| `129` | `LBR-CLI-002` | `cli` | Invalid or missing CLI arguments | missing required flag, conflicting flags, `init` targeting the per-user Libra home as repository storage; `update-ref` fatals exit `128` instead, and `branch --column` + `-v` exits `128` — see the notes below the table |
 | `129` | `LBR-CLI-003` | `cli` | Invalid object, revision, pathspec, or move target | bad ref, invalid pathspec, outside-repo move target, `update-ref <newvalue>` naming an unresolvable revision or an object that is not a commit ; `update-ref` fatals exit `128` instead — see the note below the table |
 | `128` | `LBR-REPO-001` | `repo` | Not inside a Libra repository | running repo commands outside `.libra` |
 | `128` | `LBR-REPO-002` | `repo` | Repository metadata is corrupt or incompatible | missing DB, corrupted metadata, missing/corrupt nested HEAD tree in `status` (affected OID and `libra fsck`/object-restoration hint; no partial status) |
@@ -172,7 +173,8 @@ structured report is always present.
 
 > **update-ref exit-code exception** — `src/command/update_ref.rs:107-113` stamps **every**
 > `update-ref` fatal with exit code **128** (matching Git's `fatal:` convention), including
-> `LBR-CLI-002` and `LBR-CLI-003`, which the table above lists as `129` for every other command.
+> `LBR-CLI-002` and `LBR-CLI-003`, which the table above lists as `129` for every other command
+> except the documented `branch --column` + `-v` exit-128 override.
 > Reproduce in a repository with one commit: `libra update-ref refs/heads/x HEAD` prints
 > `Error-Code: LBR-CLI-002` and exits `128`; `libra update-ref refs/heads/x 1111111111111111111111111111111111111111`
 > prints `Error-Code: LBR-CLI-003` and exits `128`. Aligning the implementation with the table
