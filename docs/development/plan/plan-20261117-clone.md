@@ -675,7 +675,7 @@ PY
 ### Task CL-25: 发布 `REL-CL-01`（`clone --separate-git-dir` 指针布局家族发布点）（#740）
 
 **Task type:** `release`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `remote-pending`（2026-11-20：`REL-CL-01` 家族发布点。三张子卡 `CL-04`（`2335f3f`+`d9189cc`）、`CL-23`（`05698cd`）、`CL-28`（`5d3079f`）均已是本卡受测提交的祖先；版本面 patch 0.30.218 → 0.30.219（`Cargo.toml`/`install.sh`/`install.ps1` + `Cargo.lock`），`compat_version_surface_sync` 2 passed；家族聚合守卫 3 passed（`test_clone_separate_git_dir_and_bare_mutex`、`test_clone_separate_git_dir_pointer_commands`、`test_clone_separate_git_dir_default_deny`）；`cargo build --release --bin libra` exit 0。按用户 2026-11-20 指令：全量 `T-2` 未执行（3.5「不进行全量测试」），PR/`gh pr merge` 流程由「main 直接提交推送」替代（3.1），`gh release create` 与 tag 尚未执行（需用户批准后补）。`remote-pending` 指远端发布流水线与 Release 产物仍待用户批准。
 **Description:** 聚合 `REL-CL-01` 家族子卡 `CL-04`、`CL-23` 与 `CL-28`（不引入新生产代码变更），执行 `patch + 1`、`compat_version_surface_sync` 三处版本面同步、工具链刷新 `Cargo.lock`、全量 `T-2` 门禁、`cargo build --release` 与 `gh release create`；其中 `patch + 1` 版本面同步与 `compat_version_surface_sync` 属 ER-04 C 组强制门（模板 C 组 ①–②），`release.yml` 等远端结果属 ER-04 D 组门（见「执行检查必备需求」），均不计入本卡 G-03 计数。对外发布指针布局、四个只读基本命令，以及 `CL-28` 对未放行子命令的默认拒绝；发布后承载三张子卡本地 `cf` 网站提交的推送与部署核验（「文档与网站验收命令」第 6–7 步，收口 `DEP-CL-15` 窗口）。
 **Out of scope:** 任何新增功能代码实现；`libra init --separate-git-dir`（`DEFER-CL-02`）。
 **Current evidence:**
@@ -685,12 +685,12 @@ PY
 | `REL-CL-01` 需在 `CL-04`、`CL-23` 与 `CL-28` 均完成本地提交后统一版本化发布；三处版本面（2026-11-18 核对均为 `0.30.210`，开工按 ER-02 刷新） | `Cargo.toml:3`；`install.sh:21`（`DEFAULT_VERSION`）；`install.ps1:25`（`$DefaultVersion`） |
 
 **Acceptance criteria:**（每条单谓词，按「验证执行协议」第 6 项计数）
-- [ ] **AC1** `CL-04` 的本地签名提交是本卡受测提交 `<T>` 的祖先（`<T>` = `CL-28` 本地提交之后、ER-05 评审之前执行本卡 A/B 门时的本地 `HEAD`，尚未做 C 组版本 bump；其 `libra rev-parse HEAD` 与 `HEAD^{tree}` 记入执行记录）。
-- [ ] **AC2** `CL-23` 的本地签名提交是 `<T>` 的祖先。
-- [ ] **AC3** `CL-28` 的本地签名提交是 `<T>` 的祖先。
-- [ ] **AC4** 家族聚合守卫：三张子卡在 `command_test` 中的卡特有用例在 `<T>` 上全部通过。
-- [ ] **AC5** 家族聚合守卫：`CL-28` 的 `--lib` 卡特有用例在 `<T>` 上通过。
-- [ ] ER-04 C 组强制门（不计入 G-03；ER-05 评审 PASS 后严格按模板 C 组 ①–⑨ 的顺序执行，结果记入执行记录）：在 `<T>` 之上做 `patch + 1` 版本面同步与 `Cargo.lock` 工具链刷新（①–③）；在这一已 bump、尚未提交的工作树上先确认 `Cargo.toml` 的 `version` 行是合并基底 `X.Y.Z` 的 `X.Y.(Z+1)`、`source .env.test && cargo nextest run --test compat_version_surface_sync` 通过，再跑本卡 `Full-suite trigger` 的 `T-2` 收口门、`cargo build --release` 与安装（④–⑥）；之后才签名提交得到 `<F>`（⑦；提交后 `libra status --porcelain --untracked-files=no` 为空——已跟踪文件无未提交改动，因而 `<F>^{tree}` 即 ④–⑥ 的受测树；`libra merge-base --is-ancestor <T> <F>` 退出 0）；`<F>` 作为 PR head 推送，`gh pr merge --squash` 后 `libra fetch origin`，`libra rev-parse <MERGE_SHA>^{tree}` 等于 `libra rev-parse <F>^{tree}`（发布树即 `T-2` 受测树）。
+- [x] **AC1** `CL-04` 的本地签名提交是本卡受测提交 `<T>` 的祖先（`<T>` = `CL-28` 本地提交之后、ER-05 评审之前执行本卡 A/B 门时的本地 `HEAD`，尚未做 C 组版本 bump；其 `libra rev-parse HEAD` 与 `HEAD^{tree}` 记入执行记录）。
+- [x] **AC2** `CL-23` 的本地签名提交是 `<T>` 的祖先。
+- [x] **AC3** `CL-28` 的本地签名提交是 `<T>` 的祖先。
+- [x] **AC4** 家族聚合守卫：三张子卡在 `command_test` 中的卡特有用例在 `<T>` 上全部通过。
+- [x] **AC5** 家族聚合守卫：`CL-28` 的 `--lib` 卡特有用例在 `<T>` 上通过。
+- [ ] ER-04 C 组强制门（不计入 G-03；本卡按用户 2026-11-20 指令执行 ①–③ 与 `cargo build --release`：版本面 `0.30.219`、`compat_version_surface_sync` 2 passed、release 构建 exit 0；`T-2` 全量按 3.5 暂缓，`gh release create` 待用户批准）：在 `<T>` 之上做 `patch + 1` 版本面同步与 `Cargo.lock` 工具链刷新（①–③）；在这一已 bump、尚未提交的工作树上先确认 `Cargo.toml` 的 `version` 行是合并基底 `X.Y.Z` 的 `X.Y.(Z+1)`、`source .env.test && cargo nextest run --test compat_version_surface_sync` 通过，再跑本卡 `Full-suite trigger` 的 `T-2` 收口门、`cargo build --release` 与安装（④–⑥）；之后才签名提交得到 `<F>`（⑦；提交后 `libra status --porcelain --untracked-files=no` 为空——已跟踪文件无未提交改动，因而 `<F>^{tree}` 即 ④–⑥ 的受测树；`libra merge-base --is-ancestor <T> <F>` 退出 0）；`<F>` 作为 PR head 推送，`gh pr merge --squash` 后 `libra fetch origin`，`libra rev-parse <MERGE_SHA>^{tree}` 等于 `libra rev-parse <F>^{tree}`（发布树即 `T-2` 受测树）。
 - [ ] ER-06a 网站交付（不计入 G-03）：见下方「文档 AC」行。
 
 **AC → 断言映射:**（「验证执行协议」第 4、6 项：映射与 AC 表述同一谓词；成功类 `exit 0` 为读取输出的前提；失败类按第 6 项断言非零状态与稳定码）
