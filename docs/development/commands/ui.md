@@ -15,7 +15,7 @@ Cargo feature 控制。
 
 ## 设计方案
 
-- GPUI 的 `Application::run` 必须在进程主线程上调用。`src/main.rs` 在 helper 提前返回和 tracing 初始化之后、启动 `libra-cli` 线程之前，用 `cli::ui_window_launch` 识别裸 `libra ui`（子命令前可以有全局 flag，子命令后不能有参数）。
+- GPUI 的 `Application::run` 必须在进程主线程上调用。`src/main.rs` 在 helper 提前返回和 tracing 初始化之后、启动 `libra-cli` 线程之前，用 `cli::ui_window_launch` 识别 `libra ui`：该函数用 clap 解析整条 argv，因此子命令前后都可带全局 flag（`libra ui --json` 同样开窗）；`--help`、未知 flag 与多余参数仍走 clap 路径，保持原有用法输出与退出码。
 - 窗口实现在 `src/gui/mod.rs`，始终参与编译。入口是 `gui::run`。
 - clap 命令始终存在：`Commands::Ui` → `command::ui::execute`。调度器路径不打开窗口。库嵌入（`libra::exec`）走到这里时返回说明，避免在错误线程上启动 GPUI。
 - 预检是 `CommandPreflight::none()`，scope 是 `ReadOnly`。不参与自动升级检查。

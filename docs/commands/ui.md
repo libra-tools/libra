@@ -15,8 +15,9 @@ libra ui
 
 ## Description
 
-`libra ui` with no further arguments opens the Libra desktop on the process
-main thread. The interface uses [Ely GPUI Components](https://github.com/ELY-Open-Source/Ely-GPUI-Components),
+`libra ui` with no positional arguments opens the Libra desktop on the process
+main thread; global flags on either side of the subcommand do not affect the
+window. The interface uses [Ely GPUI Components](https://github.com/ELY-Open-Source/Ely-GPUI-Components),
 pinned to repository revision `dd727f4`, with `gpui-pre` 0.3.10. It opens on
 History, with a commit graph, author filters, and a creation-history inspector.
 The toolbar and **All tools** (`⌘K`) open the other desktop views:
@@ -46,7 +47,8 @@ fonts and assets load offline. macOS is the current validation target.
 The command does not read or write a repository.
 
 `libra ui --help` prints this command's usage and does not open a window.
-Any other argument is a usage error, also without opening a window.
+Any other argument except a global flag is a usage error, also without opening
+a window.
 
 Calling the command through the library dispatcher (`libra::exec`) does not
 open a window; it returns `LBR-UNSUPPORTED-001` because the UI toolkit must own
@@ -62,8 +64,9 @@ fontconfig and xkbcommon development headers (`libfontconfig1-dev`,
 
 ## Options
 
-`ui` takes no flags of its own. Global flags that appear before the
-subcommand (`libra --no-pager ui`) are ignored by the window.
+`ui` takes no flags of its own. Global flags are accepted on either side of
+the subcommand (`libra --no-pager ui`, `libra ui --json`) and are ignored by
+the window. Any other argument after `ui` is a usage error.
 
 ## Exit codes
 
@@ -71,7 +74,7 @@ subcommand (`libra --no-pager ui`) are ignored by the window.
 |------|---------|
 | `0` | The window was opened and then closed. |
 | `128` | The window failed to open, or Linux has no graphical display (`LBR-UNSUPPORTED-001`). |
-| `129` | Extra arguments. `libra ui --help` exits 0. |
+| `129` | Unknown flags or extra arguments. `libra ui --help` exits 0. |
 
 ## Examples
 

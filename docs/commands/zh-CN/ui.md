@@ -13,7 +13,8 @@ libra ui
 
 ## 说明
 
-不带其它参数的 `libra ui` 在进程主线程打开 Libra 桌面界面，默认显示 History。
+不带位置参数的 `libra ui` 在进程主线程打开 Libra 桌面界面，默认显示 History；
+子命令前后的全局标志都不影响窗口。
 使用 [Ely GPUI Components](https://github.com/ELY-Open-Source/Ely-GPUI-Components)
 仓库版本 `dd727f4` 和 `gpui-pre` 0.3.10，实现提交图、作者筛选和创作历史检查器。
 顶栏和 **All tools**（`⌘K`）可进入全部 26 个设计页面：
@@ -36,7 +37,8 @@ Logo 来自官网，字体和图片内置，离线可用。当前以 macOS 为�
 
 此命令不读取、不写入仓库。
 
-`libra ui --help` 只打印用法，不打开窗口。其它额外参数是用法错误，同样不打开窗口。
+`libra ui --help` 只打印用法，不打开窗口。除全局标志外的其它参数是用法错误，
+同样不打开窗口。
 
 通过库调度器（`libra::exec`）调用不会打开窗口，而是返回
 `LBR-UNSUPPORTED-001`，因为 UI 工具包必须占用进程主线程。界面必须从 `libra`
@@ -50,7 +52,8 @@ Linux 上如果 `DISPLAY` 与 `WAYLAND_DISPLAY` 都未设置，命令会在启�
 
 ## 选项
 
-`ui` 自己没有标志。子命令前的全局标志（`libra --no-pager ui`）会被窗口忽略。
+`ui` 自己没有标志。全局标志可以放在子命令之前或之后（`libra --no-pager ui`、
+`libra ui --json`），都会被窗口忽略。`ui` 之后的其它参数是用法错误。
 
 ## 退出码
 
@@ -58,7 +61,7 @@ Linux 上如果 `DISPLAY` 与 `WAYLAND_DISPLAY` 都未设置，命令会在启�
 |--------|------|
 | `0` | 窗口已打开并随后关闭。 |
 | `128` | 窗口打开失败，或 Linux 没有图形显示（`LBR-UNSUPPORTED-001`）。 |
-| `129` | 额外参数。`libra ui --help` 退出 0。 |
+| `129` | 未知标志或额外参数。`libra ui --help` 退出 0。 |
 
 ## Examples
 

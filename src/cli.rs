@@ -1387,18 +1387,22 @@ fn reset_flag_takes_separate_value(arg: &str) -> bool {
     )
 }
 
-/// A bare `libra ui` (global flags allowed before the subcommand, nothing after it).
+/// `libra ui` (global flags allowed before or after the subcommand).
 ///
-/// `libra ui --help` is left for clap. The process entry point uses this to
-/// open the window on the main thread instead of the CLI worker thread.
+/// The decision is delegated to clap instead of scanning trailing tokens by
+/// hand: every `global = true` flag is accepted on either side of the
+/// subcommand, so `libra ui --no-pager` / `libra ui --json` must reach the
+/// window rather than the dispatcher (which cannot own the main thread).
+/// Help/version requests and invalid arguments stay on the clap path so they
+/// keep their usage output and exit codes.
+///
+/// The process entry point uses this to open the window on the main thread
+/// instead of the CLI worker thread.
 pub fn ui_window_launch(args: &[std::ffi::OsString]) -> bool {
-    let Some((index, _)) = find_subcommand_index(args) else {
-        return false;
-    };
-    let Some(name) = args.get(index).and_then(|arg| arg.to_str()) else {
-        return false;
-    };
-    name == "ui" && args.len() == index + 1
+    match Cli::try_parse_from(args.to_vec()) {
+        Ok(cli) => matches!(cli.command, Commands::Ui(_)),
+        Err(_) => false,
+    }
 }
 
 /// Locate the first non-flag token in `args` and return its index plus whether it was
@@ -5526,15 +5530,15 @@ mod tests {
         assert!(preflight.set_hash_kind);
     }
 
-    /// Scenario: every visible command in [`Commands`] must appear in the
-    /// `Command Groups:` section of `ROOT_AFTER_HELP`. Hidden commands
-    /// (e.g. `index-pack`, `hooks`) are intentionally excluded. This
-    /// guards against new visible commands being added without an
-    /// accompanying group entry, which would make them invisible in
-    /// scenario-grouped `libra --help` output even though they remain
-    /// callable.
+    /// Scenario: the main-thread window launch must accept `ui` together with
+    /// any global flag, on either side of the subcommand. Global flags are
+    /// `global = true` in clap, so refusing `libra ui --no-pager` would send it
+    /// to the dispatcher, which cannot own the main thread and reports a
+    /// misleading `LBR-UNSUPPORTED-001` for a direct executable run. Help,
+    /// version, unknown flags and extra positional arguments stay on the clap
+    /// path so their usage output and exit codes are unchanged.
     #[test]
-    fn ui_window_launch_accepts_only_a_bare_ui_command() {
+    fn ui_window_launch_accepts_ui_with_global_flags() {
         let launch = |args: &[&str]| {
             let argv = args
                 .iter()
@@ -5545,13 +5549,28 @@ mod tests {
         assert!(launch(&["libra", "ui"]));
         assert!(launch(&["libra", "--no-pager", "ui"]));
         assert!(launch(&["libra", "--json", "ui"]));
+        assert!(launch(&["libra", "ui", "--no-pager"]));
+        assert!(launch(&["libra", "ui", "--json"]));
+        assert!(launch(&["libra", "ui", "--json=compact"]));
+        assert!(launch(&["libra", "ui", "--quiet"]));
+        assert!(launch(&["libra", "--json=compact", "ui", "--no-color"]));
+        assert!(launch(&["libra", "ui", "--max-connections", "4"]));
         assert!(!launch(&["libra", "ui", "--help"]));
+        assert!(!launch(&["libra", "ui", "-h"]));
         assert!(!launch(&["libra", "ui", "--bogus"]));
+        assert!(!launch(&["libra", "ui", "extra"]));
         assert!(!launch(&["libra", "status"]));
         assert!(!launch(&["libra", "--help"]));
         assert!(!launch(&["libra"]));
     }
 
+    /// Scenario: every visible command in [`Commands`] must appear in the
+    /// `Command Groups:` section of `ROOT_AFTER_HELP`. Hidden commands
+    /// (e.g. `index-pack`, `hooks`) are intentionally excluded. This
+    /// guards against new visible commands being added without an
+    /// accompanying group entry, which would make them invisible in
+    /// scenario-grouped `libra --help` output even though they remain
+    /// callable.
     #[test]
     fn root_after_help_lists_every_visible_command() {
         use clap::CommandFactory;

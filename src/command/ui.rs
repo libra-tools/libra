@@ -19,8 +19,8 @@ pub struct UiArgs {}
 
 /// Why `libra ui` did not open a window from the dispatcher.
 ///
-/// The process entry point handles a bare `libra ui` before this runs.
-/// Reaching here means the caller is not the process entry point (for
+/// The process entry point handles `libra ui` (with any global flag) before
+/// this runs. Reaching here means the caller is not the process entry point (for
 /// example `libra::exec`), which cannot hand the main thread to GPUI.
 pub fn unavailable_error() -> CliError {
     CliError::fatal(

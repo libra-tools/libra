@@ -639,8 +639,9 @@ fn main() {
     install_broken_pipe_panic_hook();
     init_tracing();
 
-    // GPUI must run on this thread. A bare `libra ui` never enters the CLI
-    // worker below; `--help` and any other arguments stay on the clap path.
+    // GPUI must run on this thread. `libra ui` (with any global flag on either
+    // side) never enters the CLI worker below; `--help`, unknown flags and
+    // extra arguments stay on the clap path.
     let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
     if cli::ui_window_launch(&argv) {
         let exit_code = run_desktop_ui();

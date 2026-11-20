@@ -34,6 +34,13 @@
 
 ### Fixed
 
+- `libra ui` now opens the desktop window when a global flag follows the
+  subcommand (`libra ui --json`, `libra ui --no-pager`). Before, only flags
+  placed before `ui` reached the main-thread window path, so a trailing global
+  flag fell through to the dispatcher and exited 128 with a misleading
+  `LBR-UNSUPPORTED-001` "library dispatcher" message for a direct executable
+  run. Help, version, unknown flags and extra arguments keep their clap usage
+  output and exit codes.
 - `diff-index` / `diff-files` no longer mislabel a stat-invalid entry as added or
   deleted. After `read-tree` (or any operation that invalidates the index `stat`
   cache), an empty tracked file was reported as `A` and a worktree file truncated
