@@ -302,7 +302,7 @@ libra log --format=oneline
 ### `--decorate[=<style>]`
 
 在提交旁打印 ref 名称（分支、标签）。样式：`short`（默认）、`full`、`no`。
-人类可读输出中的装饰按完整引用名的逆序列出，`HEAD` 位于最前。`HEAD` 只标在它指向的提交上，即使范围、`--reverse` 或 `--skip` 从别处开始。`--json` 的 `refs` 数组保持原有顺序。
+人类可读输出中的装饰按完整引用名的逆序列出，`HEAD` 位于最前。`HEAD` 只标在它指向的提交上，即使范围、`--reverse` 或 `--skip` 从别处开始。`--json` 的 `refs` 数组保持原有顺序。附注 tag 会沿整条 tag 链剥皮，因此 tag 的 tag 会与内层 tag 一起装饰目标提交；显式 `--format`/`--pretty` 含 `%D`/`%d` 时即使 stdout 不是终端也会请求装饰，且不受 `--decorate=no`/`--no-decorate` 影响（与 Git 一致）。
 
 ```bash
 libra log --decorate

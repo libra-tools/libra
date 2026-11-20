@@ -354,7 +354,7 @@ PY
 
 ### Task LS-01: 修复 `log --decorate` 嵌套 annotated-tag 链与 `%D`/`%d` 输出（#949）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `complete`（2026-11-20：`0.30.218`；卡特有用例 1/1、共享 `compat_pretty_format_placeholders` 全通过、版本守卫 2/2；Codex R9 `VERDICT: PASS`；EN/zh/开发/COMPATIBILITY 与网站 `log.en.md` 同卡同步；未跑全量、未等待远端 CI）
 
 **Description:** 将 `create_reference_commit_map` 对 annotated tag 的解引用由单层改为迭代（非递归）解引用整条 tag 链（直到非 tag 目标），使 `log --decorate`、`%D` 与 `%d` 对嵌套 tag 显示链上全部标签，而非丢弃。
 
@@ -368,11 +368,11 @@ PY
 
 **Acceptance criteria:**
 
-- [ ] **AC1** `libra log --decorate=short -1` 的 stdout 首行含装饰 `(HEAD -> main, tag: t2, tag: t1)`。
-- [ ] **AC2** `libra log -1 --format=%D` 的 stdout 逐字为 `HEAD -> main, tag: t2, tag: t1\n`。
-- [ ] **AC3** `libra log -1 --format=%d` 的 stdout 逐字为 ` (HEAD -> main, tag: t2, tag: t1)\n`。
-- [ ] **AC4** 200 层嵌套链的 `libra log -1 --format=%D` 输出去掉行尾换行后按 `, ` 切分得到的装饰项集合包含 `tag: d1` 至 `tag: d200` 全部 200 项（逐项完整匹配，GC-10：深链有界完成）。
-- [ ] ER-06/ER-06a 同卡强制门：`Docs and compatibility impact` 所列每个文件按「文档与网站验收命令」第 1–7 步逐文件交付并验收（不计入卡特有 AC 分子）。
+- [x] **AC1** `libra log --decorate=short -1` 的 stdout 首行含装饰 `(HEAD -> main, tag: t2, tag: t1)`。
+- [x] **AC2** `libra log -1 --format=%D` 的 stdout 逐字为 `HEAD -> main, tag: t2, tag: t1\n`。
+- [x] **AC3** `libra log -1 --format=%d` 的 stdout 逐字为 ` (HEAD -> main, tag: t2, tag: t1)\n`。
+- [x] **AC4** 200 层嵌套链的 `libra log -1 --format=%D` 输出去掉行尾换行后按 `, ` 切分得到的装饰项集合包含 `tag: d1` 至 `tag: d200` 全部 200 项（逐项完整匹配，GC-10：深链有界完成）。
+- [x] ER-06/ER-06a 同卡强制门：`Docs and compatibility impact` 所列每个文件按「文档与网站验收命令」第 1–7 步逐文件交付并验收（不计入卡特有 AC 分子）。
 
 **AC → 断言映射:**（夹具 F01：提交 C（分支 `main`）；annotated tag `t1`→C；annotated tag `t2`→tag 对象 `t1`；另建 200 层嵌套 annotated tag 链 `d1`→C、`d2`→`d1`…`d200`→`d199` 的独立夹具；每次调用另按「验证执行协议」第 4 项断言只读不变量；标注「Git 2.54.0 预探」或「Git 同夹具期望」的值按该项以 `git@6de20f6092` 取得并硬编码）
 
@@ -384,8 +384,8 @@ PY
 
 **Verification:**
 
-- [ ] `source .env.test && cargo nextest run --test command_test -E 'test(=command::log_test::decorate_nested_annotated_tags)'`（卡特有 `(new)`，`tests/command/log_test.rs` 内新增；覆盖 AC1–AC4；按「验证执行协议」第 1–4 项执行）
-- [ ] `source .env.test && cargo nextest run --test compat_pretty_format_placeholders`（共享回归组：整 target，`%D`/`%d` 占位符回归；按「验证执行协议」第 5 项先 `cargo nextest list --test compat_pretty_format_placeholders` 记录 N≥1，要求 exit 0、通过 = N、失败 = 0、跳过 = 0；不计为卡特有 AC 证据）
+- [x] `source .env.test && cargo nextest run --test command_test -E 'test(=command::log_test::decorate_nested_annotated_tags)'`（1/1 PASS）（卡特有 `(new)`，`tests/command/log_test.rs` 内新增；覆盖 AC1–AC4；按「验证执行协议」第 1–4 项执行）
+- [x] `source .env.test && cargo nextest run --test compat_pretty_format_placeholders`（共享回归组：整 target，`%D`/`%d` 占位符回归；按「验证执行协议」第 5 项先 `cargo nextest list --test compat_pretty_format_placeholders` 记录 N≥1，要求 exit 0、通过 = N、失败 = 0、跳过 = 0；不计为卡特有 AC 证据）
 
 **Full-suite trigger:** `T-1: 版本面集合同步修改 install.sh / install.ps1（ER-08 / ER-13 T-1）` | **Dependencies:** `DEP-LS-01`, `DEP-LS-03`
 
@@ -400,6 +400,9 @@ PY
 **Granularity:** `type=implementation; axis=嵌套annotated-tag装饰与%D/%d; recovery=immutable-release; complete=yes; self-contained=yes; AC=4/8; VER=4/8; landing=1; prod-files=1; scope=M; deps=DEP-LS-01,DEP-LS-03; writeset=序列化于DEP-LS-01; release=independent; split-from=N/A; exception=N/A`
 
 ---
+
+**Execution evidence (2026-11-20):** `decorate_nested_annotated_tags` covers t1→C, t2→t1 and the 200-deep d1..d200 chain, plus `%D`/`%d` forcing decoration under `--decorate=no`/`--no-decorate`; Codex R9 PASS; version guard 2/2 at `0.30.218`.
+
 
 ### Task LS-02: 修复 `log.decorate=true` 与 `--pretty=raw` 装饰规则（#950）
 

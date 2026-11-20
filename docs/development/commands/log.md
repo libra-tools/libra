@@ -47,6 +47,8 @@ flowchart TD
 
 ## 实现历史
 
+- 2026-11-20（LS-01 / #949）：`create_reference_commit_map` 对附注 tag 由单层解引用改为沿整条 tag 链迭代剥皮（`util::peel_to_non_tag_typed`），嵌套 tag 的每一层都装饰目标提交；显式 `--format`/`--pretty` 含 `%D`/`%d` 时在无终端也请求装饰（short，除非 `--decorate=full`/`log.decorate=full` 选择 full），且不受 `--decorate=no`/`--no-decorate` 影响（与 Git 一致）；配置 `format.pretty` 中的 `%D`/`%d` 请求不在本卡范围。回归：`command::log_test::decorate_nested_annotated_tags`（含 200 层链）。
+
 - 本节依据本地 main 分支提交历史重写，筛选与该命令实现、测试或文档路径直接相关的提交；以下是归纳后的实现脉络。
 - 2025-12-19 `d45bec8c`（`feat(log): add --abbrev-commit/--abbrev/--no-abbrev-commit for commit… (#93)`）：基础实现节点：add --abbrev-commit/--abbrev/--no-abbrev-commit for commit… (#93)；当前实现的主要轮廓可追溯到该提交。
 - 2026-06-06 `f95b80df`（`feat(log): colorize graph columns and align compatibility matrix`）：功能演进：colorize graph columns and align compatibility matrix；该节点扩展了当前命令可用的参数或行为。

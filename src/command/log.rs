@@ -1075,6 +1075,38 @@ async fn determine_decorate_option(args: &LogArgs) -> Result<DecorateOptions, St
     }
 }
 
+fn format_requests_decoration(args: &LogArgs) -> bool {
+    args.format
+        .as_deref()
+        .or(args.pretty.as_deref())
+        .is_some_and(has_decoration_placeholder)
+}
+
+/// Scan pretty-format escapes, ignoring `%%` literals and consuming `%xNN`
+/// style escapes so a literal `%%D` does not request decoration.
+fn has_decoration_placeholder(format: &str) -> bool {
+    let bytes = format.as_bytes();
+    let mut index = 0;
+    while index + 1 < bytes.len() {
+        if bytes[index] != b'%' {
+            index += 1;
+            continue;
+        }
+        match bytes[index + 1] {
+            b'%' => index += 2,
+            b'D' | b'd' => return true,
+            b'x' if index + 3 < bytes.len()
+                && bytes[index + 2].is_ascii_hexdigit()
+                && bytes[index + 3].is_ascii_hexdigit() =>
+            {
+                index += 4;
+            }
+            _ => index += 2,
+        }
+    }
+    false
+}
+
 /// Get all reachable commits from the given commit hash, up to a specified depth.
 /// **didn't consider the order of the commits**
 pub async fn get_reachable_commits(
@@ -1156,11 +1188,18 @@ fn parse_date_arg(value: &str) -> CliResult<i64> {
 }
 
 async fn resolve_decorate_option(args: &LogArgs) -> CliResult<DecorateOptions> {
-    determine_decorate_option(args).await.map_err(|value| {
+    let option = determine_decorate_option(args).await.map_err(|value| {
         CliError::command_usage(format!("invalid --decorate option: {value}"))
             .with_stable_code(StableErrorCode::CliInvalidArguments)
             .with_hint("valid options: no, short, full, auto")
-    })
+    })?;
+    // `%D`/`%d` request decorations even under `--decorate=no`/auto, but an
+    // explicit `full` style (flag or config) still selects full ref names.
+    if format_requests_decoration(args) && option == DecorateOptions::No {
+        Ok(DecorateOptions::Short)
+    } else {
+        Ok(option)
+    }
 }
 
 pub async fn execute(args: LogArgs) {
@@ -4223,10 +4262,39 @@ async fn create_reference_commit_map() -> HashMap<ObjectHash, Vec<Reference>> {
         tracing::warn!("failed to list tags for log decoration: {e}");
         Vec::new()
     });
+    // Follow the in-memory tag edges before peeling the terminal object. This
+    // keeps a chain with one tag per level linear in object reads instead of
+    // re-reading the remaining chain from every tag.
+    let tag_edges: HashMap<ObjectHash, ObjectHash> = all_tags
+        .iter()
+        .filter_map(|tag| match &tag.object {
+            TagObject::Tag(t) => Some((t.id, t.object_hash)),
+            _ => None,
+        })
+        .collect();
     for tag in all_tags {
         let commit_id = match tag.object {
             TagObject::Commit(c) => c.id,
-            TagObject::Tag(t) => t.object_hash,
+            TagObject::Tag(t) => {
+                let mut target = t.object_hash;
+                let mut seen = std::collections::HashSet::new();
+                while let Some(next) = tag_edges.get(&target) {
+                    if !seen.insert(target) {
+                        tracing::warn!(tag = %tag.name, "tag chain cycle while decorating log");
+                        target = next.to_owned();
+                        break;
+                    }
+                    target = next.to_owned();
+                }
+                match util::peel_to_non_tag_typed(target, &tag.name) {
+                    Ok((id, git_internal::internal::object::types::ObjectType::Commit)) => id,
+                    Ok(_) => continue,
+                    Err(error) => {
+                        tracing::warn!(tag = %tag.name, %error, "failed to peel tag chain for log decoration");
+                        continue;
+                    }
+                }
+            }
             _ => continue,
         };
         commit_to_refs
@@ -4585,6 +4653,16 @@ mod tests {
         );
         assert!(str_to_decorate_option("auto").is_ok());
         assert!(str_to_decorate_option("invalid").is_err());
+    }
+
+    #[test]
+    fn has_decoration_placeholder_ignores_escapes() {
+        for format in ["%D", "%d", "%ad %D", "%x41 %D", "%x%D"] {
+            assert!(has_decoration_placeholder(format), "{format}");
+        }
+        for format in ["%%D", "%%d", "%x41", "%xZZ", "plain"] {
+            assert!(!has_decoration_placeholder(format), "{format}");
+        }
     }
 
     #[test]

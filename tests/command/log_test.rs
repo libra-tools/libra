@@ -11,10 +11,16 @@ use git_internal::{
     internal::object::{blob::Blob, commit::Commit, tree::Tree},
 };
 use libra::{
-    internal::{db::get_db_conn_instance, model::reference},
+    internal::{
+        db::{get_db_conn_instance, get_db_conn_instance_for_path},
+        model::reference,
+    },
     utils::{object_ext::TreeExt, output::OutputConfig, pager::LIBRA_PAGER_ENV, util},
 };
-use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseBackend, EntityTrait, QueryFilter, Set,
+    Statement,
+};
 use serial_test::serial;
 
 use super::*;
@@ -1649,6 +1655,15 @@ fn test_log_invalid_decorate_uses_command_usage_error() {
     assert_eq!(report.severity, "error");
     assert_eq!(report.message, "invalid --decorate option: bogus");
     assert_eq!(report.hints, vec!["valid options: no, short, full, auto"]);
+
+    // `%D` forcing must not bypass option validation.
+    let output = run_log_with_snapshot(
+        repo.path(),
+        &["--json", "log", "--format=%D", "--decorate=bogus"],
+    );
+    assert_eq!(output.status.code(), Some(129));
+    let (_, report) = parse_cli_error_stderr(&output.stderr);
+    assert_eq!(report.message, "invalid --decorate option: bogus");
 }
 
 #[tokio::test]
@@ -6717,4 +6732,215 @@ fn test_log_perl_regexp_grep() {
         "{}",
         String::from_utf8_lossy(&unsupported.stderr)
     );
+}
+
+fn log_readonly_snapshot(repo: &std::path::Path) -> String {
+    use sha2::{Digest, Sha256};
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build snapshot runtime");
+    let database_path = repo.join(".libra").join(libra::utils::util::DATABASE);
+    let (references, notes) = runtime.block_on(async {
+        let db = get_db_conn_instance_for_path(&database_path)
+            .await
+            .expect("open repository database");
+        let references = db
+            .query_all_raw(Statement::from_string(
+                DatabaseBackend::Sqlite,
+                "SELECT * FROM reference ORDER BY id",
+            ))
+            .await
+            .expect("snapshot reference rows");
+        let notes = db
+            .query_all_raw(Statement::from_string(
+                DatabaseBackend::Sqlite,
+                "SELECT * FROM notes ORDER BY id",
+            ))
+            .await
+            .expect("snapshot notes rows");
+        let references = references
+            .iter()
+            .map(|row| {
+                format!(
+                    "{}|{:?}|{:?}|{:?}|{:?}|{:?}",
+                    row.try_get::<i64>("", "id").expect("reference id"),
+                    row.try_get::<Option<String>>("", "name")
+                        .expect("reference name"),
+                    row.try_get::<Option<String>>("", "kind")
+                        .expect("reference kind"),
+                    row.try_get::<Option<String>>("", "commit")
+                        .expect("reference commit"),
+                    row.try_get::<Option<String>>("", "remote")
+                        .expect("reference remote"),
+                    row.try_get::<Option<String>>("", "worktree_id")
+                        .expect("reference worktree_id"),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let notes = notes
+            .iter()
+            .map(|row| {
+                format!(
+                    "{}|{:?}|{:?}|{:?}",
+                    row.try_get::<i64>("", "id").expect("notes id"),
+                    row.try_get::<Option<String>>("", "notes_ref")
+                        .expect("notes ref"),
+                    row.try_get::<Option<String>>("", "object")
+                        .expect("notes object"),
+                    row.try_get::<Option<String>>("", "blob")
+                        .expect("notes blob"),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        (references, notes)
+    });
+    let mut snapshot = format!("reference:{references}\nnotes:{notes}\nrefs-files:\n");
+    let refs_root = repo.join(".libra").join("refs");
+    let mut refs = Vec::new();
+    if refs_root.is_dir() {
+        let mut stack = vec![refs_root];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read refs dir") {
+                let path = entry.expect("ref entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.is_file() {
+                    let bytes = std::fs::read(&path).expect("read ref file");
+                    let digest = Sha256::digest(&bytes);
+                    refs.push(format!(
+                        "{} {:x}",
+                        path.strip_prefix(repo).unwrap().display(),
+                        digest
+                    ));
+                }
+            }
+        }
+    }
+    refs.sort();
+    for line in refs {
+        snapshot.push_str(&line);
+        snapshot.push('\n');
+    }
+    snapshot
+}
+
+fn run_log_with_snapshot(repo: &std::path::Path, args: &[&str]) -> std::process::Output {
+    let before = log_readonly_snapshot(repo);
+    let output = run_libra_command(args, repo);
+    let after = log_readonly_snapshot(repo);
+    assert_eq!(before, after, "log changed refs/notes: {args:?}");
+    output
+}
+
+/// LS-01 (#949): a tag chain is peeled iteratively, so `log --decorate` and
+/// `%D`/`%d` name every tag in the chain, including a 200-deep chain.
+#[test]
+fn decorate_nested_annotated_tags() {
+    fn tag_object_id(repo: &std::path::Path, name: &str) -> String {
+        let out = run_libra_command(&["show-ref", "--tags"], repo);
+        assert_cli_success(&out, "show-ref --tags");
+        let needle = format!("refs/tags/{name}");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .find_map(|line| {
+                let mut parts = line.split_whitespace();
+                let oid = parts.next()?;
+                (parts.next() == Some(needle.as_str())).then(|| oid.to_string())
+            })
+            .unwrap_or_else(|| panic!("tag {name} missing from show-ref"))
+    }
+
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["config", "vault.signing", "false"], p),
+        "disable vault signing",
+    );
+    assert_cli_success(
+        &run_libra_command(&["tag", "-m", "t1", "t1", "HEAD"], p),
+        "tag t1",
+    );
+    let t1 = tag_object_id(p, "t1");
+    assert_cli_success(
+        &run_libra_command(&["tag", "-m", "t2", "t2", &t1], p),
+        "tag t2",
+    );
+    let t2 = tag_object_id(p, "t2");
+    assert_ne!(t1, t2, "t2 must point at the t1 tag object");
+    let t2_body = run_libra_command(&["cat-file", "-p", "refs/tags/t2"], p);
+    assert_cli_success(&t2_body, "cat-file t2");
+    let t2_body = String::from_utf8_lossy(&t2_body.stdout);
+    assert!(t2_body.contains(&format!("object {t1}\n")), "{t2_body}");
+    assert!(t2_body.contains("type tag\n"), "{t2_body}");
+
+    // AC1: short decoration names both tags.
+    let short = run_log_with_snapshot(p, &["log", "--decorate=short", "-1"]);
+    assert_cli_success(&short, "log --decorate=short -1");
+    let first = String::from_utf8_lossy(&short.stdout)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        first.contains("(HEAD -> main, tag: t2, tag: t1)"),
+        "{first}"
+    );
+
+    // AC2/AC3: `%D` and `%d` force decoration even when piped.
+    let upper = run_log_with_snapshot(p, &["log", "-1", "--format=%D"]);
+    assert_cli_success(&upper, "log --format=%D");
+    assert_eq!(
+        String::from_utf8_lossy(&upper.stdout),
+        "HEAD -> main, tag: t2, tag: t1\n"
+    );
+    let lower = run_log_with_snapshot(p, &["log", "-1", "--format=%d"]);
+    assert_cli_success(&lower, "log --format=%d");
+    assert_eq!(
+        String::from_utf8_lossy(&lower.stdout),
+        " (HEAD -> main, tag: t2, tag: t1)\n"
+    );
+
+    // AC4: a 200-layer annotated-tag chain is fully decorated.
+    let mut previous = t1;
+    for depth in 1..=200 {
+        let name = format!("d{depth}");
+        let target = if depth == 1 {
+            let out = run_libra_command(&["rev-parse", "HEAD"], p);
+            assert_cli_success(&out, "rev-parse HEAD");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        } else {
+            previous.clone()
+        };
+        assert_cli_success(
+            &run_libra_command(&["tag", "-m", &name, &name, &target], p),
+            &format!("tag {name}"),
+        );
+        previous = tag_object_id(p, &name);
+    }
+    let deep = run_log_with_snapshot(p, &["log", "-1", "--format=%D"]);
+    assert_cli_success(&deep, "log deep --format=%D");
+    let deep_stdout = String::from_utf8_lossy(&deep.stdout);
+    let decorations: Vec<&str> = deep_stdout.trim_end().split(", ").collect();
+    for depth in 1..=200 {
+        let expected = format!("tag: d{depth}");
+        assert!(
+            decorations.iter().any(|item| *item == expected),
+            "missing {expected} in {} decorations",
+            decorations.len()
+        );
+    }
+
+    // `%D` always renders decorations, independent of `--decorate=no` and
+    // `--no-decorate`, matching Git.
+    for flag in ["--decorate=no", "--no-decorate"] {
+        let forced = run_log_with_snapshot(p, &["log", "-1", "--format=%D", flag]);
+        assert_cli_success(&forced, flag);
+        let forced = String::from_utf8_lossy(&forced.stdout);
+        assert!(forced.contains("HEAD -> main"), "{forced}");
+        assert!(forced.contains("tag: t2"), "{forced}");
+        assert!(forced.contains("tag: t1"), "{forced}");
+    }
 }
