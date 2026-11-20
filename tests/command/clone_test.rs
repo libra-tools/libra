@@ -3025,10 +3025,7 @@ fn test_clone_revision_single_rev() {
     let head = run_libra_command(&["cat-file", "-p", "HEAD"], &bare);
     assert_cli_success(&head, "AC1: read the bare HEAD commit");
     let head_text = String::from_utf8_lossy(&head.stdout);
-    assert!(
-        head_text.contains(&format!("tree")),
-        "AC1: HEAD is a commit"
-    );
+    assert!(head_text.contains("tree"), "AC1: HEAD is a commit");
     // HEAD resolves to S2, not to the side branch tip.
     let resolved = run_libra_command(&["rev-parse", "HEAD"], &bare);
     assert_cli_success(&resolved, "AC1: rev-parse HEAD");
