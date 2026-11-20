@@ -677,3 +677,6 @@ Libra 将 `--graph` 实现为基于文本的 ASCII/Unicode 图渲染器，类似
 - 合格的 `log -n N` 是无限额 `log` 的前缀，缩写取自本次打印的提交（下限 7）。偏斜或同秒历史按发现顺序输出；比限额前沿更深的缺失祖先不再使该命令失败
 - jj 的 log 使用模板语言（`-T`）进行格式化；Libra 使用 Git 兼容的 `--pretty` 格式字符串
 - 在 JSON 模式中，`files` 包含结构化变更摘要；JSON 输出永远不包含 patch 文本
+
+
+> 支持 `--separate-git-dir` 指针布局：当 `<worktree>/.libra` 是指向 `<dir>` 的 `gitdir:` 指针文件（由 `libra clone --separate-git-dir` 创建）时，本命令会解析真实元数据目录并读取 `<dir>/libra.db` 与 `<dir>/objects`，而不是 `<worktree>/.libra`。

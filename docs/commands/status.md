@@ -822,3 +822,9 @@ object store.
 - jj's `jj status` always uses a short format and does not distinguish staged from unstaged changes (jj has no staging area)
 - Rename detection is supported via Git's `-M[<n>]` / `--find-renames[=<n>]` and the `--renames`/`--no-renames` toggles; all four spellings share the last-one-wins argv order
 - `--column` column-aligned display is supported; `--no-column` (equivalent to `--column=never`) countermands an earlier `--column` via clap's symmetric override (last one wins), and status is not columnar by default so `--no-column` alone is a no-op
+
+
+> `--separate-git-dir` pointer layouts are supported: when `<worktree>/.libra` is a
+> `gitdir: <dir>` pointer file (created by `libra clone --separate-git-dir`), this
+> command resolves the real metadata directory and reads `<dir>/libra.db` and
+> `<dir>/objects` instead of `<worktree>/.libra`.

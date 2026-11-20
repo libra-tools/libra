@@ -254,3 +254,6 @@ Git 的 batch 模式从 stdin 读取对象 ID（或命令）以批量检查。Li
 > 退出码说明：无法解析的对象名与无效参数组合退出 `129`（`LBR-CLI-003` / `LBR-CLI-002`），
 > 这是与 Git `128` 的有意差异（ADR-PL-02）。`-e` 存在性探测保持与 Git 完全一致：
 > 存在 `0`，格式正确但缺失 `1`（静默），非法名称 `129`。
+
+
+> 支持 `--separate-git-dir` 指针布局：当 `<worktree>/.libra` 是指向 `<dir>` 的 `gitdir:` 指针文件（由 `libra clone --separate-git-dir` 创建）时，本命令会解析真实元数据目录并读取 `<dir>/libra.db` 与 `<dir>/objects`，而不是 `<worktree>/.libra`。

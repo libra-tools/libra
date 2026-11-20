@@ -71,3 +71,9 @@ unregisters both sides.
 `git clone --reference`/`--shared` copy-avoidance (needs fetch have-negotiation
 against the alternate — the flags stay accepted no-ops for now); `--dissociate`
 (copy borrowed objects in + break the link); the 2.11 default shared-store.
+
+
+> `--separate-git-dir` pointer layouts are supported: when `<worktree>/.libra` is a
+> `gitdir: <dir>` pointer file (created by `libra clone --separate-git-dir`), this
+> command resolves the real metadata directory and reads `<dir>/libra.db` and
+> `<dir>/objects` instead of `<worktree>/.libra`.

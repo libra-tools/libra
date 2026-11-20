@@ -2760,6 +2760,88 @@ fn test_clone_separate_git_dir_and_bare_mutex() {
 }
 
 #[test]
+fn test_clone_separate_git_dir_pointer_commands() {
+    use crate::command::{assert_cli_success, create_committed_repo_via_cli, run_libra_command};
+
+    let src = create_committed_repo_via_cli();
+    let src_head = run_libra_command(&["rev-parse", "HEAD"], src.path());
+    assert_cli_success(&src_head, "source rev-parse HEAD");
+    let expected = String::from_utf8_lossy(&src_head.stdout).trim().to_string();
+
+    let root = tempdir().unwrap();
+    let git_dir = root.path().join("meta");
+    let work = root.path().join("w1");
+    let out = run_libra_command(
+        &[
+            "clone",
+            "--separate-git-dir",
+            git_dir.to_str().expect("git dir path"),
+            &format!("file://{}", src.path().display()),
+            work.to_str().expect("workdir path"),
+        ],
+        root.path(),
+    );
+    assert_cli_success(&out, "clone --separate-git-dir");
+
+    // AC1: repository discovery follows the `gitdir:` pointer.
+    let status = run_libra_command(&["status"], &work);
+    assert_cli_success(&status, "AC1: status in a pointer worktree");
+
+    // AC2: log walks the fetched history.
+    let log = run_libra_command(&["log", "-n", "1"], &work);
+    assert_cli_success(&log, "AC2: log -n 1 in a pointer worktree");
+    assert!(
+        String::from_utf8_lossy(&log.stdout).contains(&expected),
+        "AC2: log must name the source HEAD commit"
+    );
+
+    // AC3: object reads resolve through the relocated metadata.
+    let cat = run_libra_command(&["cat-file", "-t", "HEAD"], &work);
+    assert_cli_success(&cat, "AC3: cat-file -t HEAD");
+    assert_eq!(String::from_utf8_lossy(&cat.stdout), "commit\n");
+
+    // AC4: the no-argument branch listing shows the checked-out branch.
+    let branch = run_libra_command(&["branch"], &work);
+    assert_cli_success(&branch, "AC4: branch in a pointer worktree");
+    assert!(
+        String::from_utf8_lossy(&branch.stdout).contains("main"),
+        "AC4: branch must list main: {}",
+        String::from_utf8_lossy(&branch.stdout)
+    );
+
+    // AC5: `alternates add <W>` records `<G>/objects`, not `<W>/.libra/objects`.
+    let other = root.path().join("other");
+    assert_cli_success(
+        &run_libra_command(
+            &["init", other.to_str().expect("other repo path")],
+            root.path(),
+        ),
+        "init the alternates borrower",
+    );
+    let added = run_libra_command(
+        &["alternates", "add", work.to_str().expect("workdir path")],
+        &other,
+    );
+    assert_cli_success(&added, "AC5: alternates add");
+    let alternates = std::fs::read_to_string(other.join(".libra/objects/info/alternates"))
+        .expect("read the alternates file");
+    let recorded: Vec<&str> = alternates
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    assert_eq!(
+        recorded.len(),
+        1,
+        "exactly one alternate must be recorded: {alternates}"
+    );
+    assert_eq!(
+        std::fs::canonicalize(recorded[0]).expect("canonicalize the alternate"),
+        std::fs::canonicalize(git_dir.join("objects")).expect("canonicalize <G>/objects"),
+        "AC5: the alternate must point at <G>/objects"
+    );
+}
+
+#[test]
 fn test_clone_reject_shallow_local_git_source() {
     use super::{create_linear_git_repo, git_success, run_libra_command};
 

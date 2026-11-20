@@ -290,7 +290,7 @@ D-empty-message 已由 HF-06 实现
 
 ### D25: `init` 的 Git 布局与引用存储选项（issue #473）
 
-- 拒绝项（仅 `init`）：`--separate-git-dir`、Libra 旧版 `--separate-libra-dir`、`--ref-format=files|reftable`、`--recurse-submodules`。`clone --separate-git-dir <DIR>` 不受 D25 限制（ADR-CL-05）：克隆完成后把 `.libra` 元数据迁移到 `<DIR>` 并在工作区写 `gitdir:` 指针文件；与 `--bare`/`--mirror` 互斥（`options '--bare' and '--separate-git-dir' cannot be used together`，`LBR-CLI-002`）。指针布局下的发现与写命令护栏由 `CL-23`/`CL-28` 承接。
+- 拒绝项（仅 `init`）：`--separate-git-dir`、Libra 旧版 `--separate-libra-dir`、`--ref-format=files|reftable`、`--recurse-submodules`。`clone --separate-git-dir <DIR>` 不受 D25 限制（ADR-CL-05）：克隆完成后把 `.libra` 元数据迁移到 `<DIR>` 并在工作区写 `gitdir:` 指针文件；与 `--bare`/`--mirror` 互斥（`options '--bare' and '--separate-git-dir' cannot be used together`，`LBR-CLI-002`）。指针布局下的发现已由 `CL-23` 落地（`util::resolve_dot_libra_pointer`：仓库发现、`info/*` 候选与 `alternates` 的 objects 解析都跟随 `.libra` 的 `gitdir:` 指针，`status`/`log`/`cat-file`/无参 `branch` 可用）；写命令护栏由 `CL-28` 承接。
 - 行为：解析层返回 `LBR-CLI-002`（129）并给出可执行的迁移或替代 hint，零写入。
 - 原因：Libra 的仓库元数据在目标目录自身的 `.libra/libra.db`（SQLite），引用也存于 SQLite；`gitdir:` 指针布局需要仓库发现、worktree 共享与元数据分离的整体改造，`reftable` 则是另一种引用后端。`--ref-format` 在 Libra 只选择分支名校验规则（`strict`/`filesystem`）。
 - 迁移：使用 Git `--separate-git-dir` 的仓库可直接转换——`libra init --from-git-repository <worktree>`（或 `<worktree>/.git` 指针文件路径）已支持 `gitdir:` 指针解析。

@@ -314,3 +314,9 @@ hard error (`LBR-CLI-003`, exit 129) that emits no envelope.
 > exit `129` (`LBR-CLI-003` / `LBR-CLI-002`), intentionally different from
 > Git's `128` (ADR-PL-02). The `-e` existence probe keeps Git's exact contract:
 > present `0`, well-formed-but-absent `1` (silent), malformed name `129`.
+
+
+> `--separate-git-dir` pointer layouts are supported: when `<worktree>/.libra` is a
+> `gitdir: <dir>` pointer file (created by `libra clone --separate-git-dir`), this
+> command resolves the real metadata directory and reads `<dir>/libra.db` and
+> `<dir>/objects` instead of `<worktree>/.libra`.

@@ -275,6 +275,18 @@ fn read_gitdir_file(path: &Path, worktree: &Path) -> Option<PathBuf> {
     })
 }
 
+/// Resolve a `gitdir:` pointer stored in the worktree's `.libra` entry (the
+/// layout `libra clone --separate-git-dir <DIR>` creates). A `.libra`
+/// directory, or a missing/unreadable entry, yields `None`; a relative target
+/// resolves against the worktree.
+pub fn resolve_dot_libra_pointer(worktree: &Path) -> Option<PathBuf> {
+    let pointer = worktree.join(ROOT_DIR);
+    if fs::symlink_metadata(&pointer).ok()?.file_type().is_dir() {
+        return None;
+    }
+    read_gitdir_file(&pointer, worktree)
+}
+
 fn resolve_dot_git_dir(worktree: &Path) -> Option<PathBuf> {
     let dot_git = worktree.join(".git");
     let metadata = fs::metadata(&dot_git).ok()?;
@@ -316,6 +328,10 @@ pub fn worktree_info_file_paths(worktree: &Path, name: &str) -> Vec<PathBuf> {
     let libra_gitdir = worktree.join(ROOT_DIR);
     if libra_gitdir.is_dir() && is_valid_storage_dir(&libra_gitdir) {
         candidates.push(libra_gitdir.join("info").join(name));
+    } else if let Some(git_dir) = resolve_dot_libra_pointer(worktree)
+        && is_valid_storage_dir(&git_dir)
+    {
+        candidates.push(git_dir.join("info").join(name));
     }
     if let Some(git_dir) = resolve_dot_git_dir(worktree) {
         candidates.push(git_dir.join("info").join(name));
@@ -797,6 +813,17 @@ fn try_get_paths_full_with_storage_lookup(
         if standard_repo.is_dir() && is_valid_storage_dir(&standard_repo) {
             // unwrap_or is safe here: if canonicalize fails, we use the original path
             let gitdir = fs::canonicalize(&standard_repo).unwrap_or(standard_repo);
+            let common = worktree_common_storage(&gitdir)?;
+            let common = resolve_managed_workspace_common(&path, &gitdir, &common)?;
+            return Ok((common, path.clone(), gitdir));
+        }
+
+        // `clone --separate-git-dir`: `.libra` is a file holding a `gitdir:`
+        // pointer to the real metadata directory.
+        if let Some(pointer_gitdir) = resolve_dot_libra_pointer(&path)
+            && is_valid_storage_dir(&pointer_gitdir)
+        {
+            let gitdir = fs::canonicalize(&pointer_gitdir).unwrap_or(pointer_gitdir);
             let common = worktree_common_storage(&gitdir)?;
             let common = resolve_managed_workspace_common(&path, &gitdir, &common)?;
             return Ok((common, path.clone(), gitdir));

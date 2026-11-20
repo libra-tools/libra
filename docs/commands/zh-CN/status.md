@@ -517,3 +517,6 @@ Git 的 porcelain v1 不包含 upstream tracking 信息；porcelain v2 会添加
 - jj 的 `jj status` 始终使用短格式，并且不区分已暂存与未暂存更改（jj 没有暂存区）
 - 通过 Git 的 `-M[<n>]` / `--find-renames[=<n>]` 及 `--renames`/`--no-renames` 开关支持重命名检测；四种拼写共享同一 argv last-one-wins 顺序
 - 支持 `--column` 列对齐显示；`--no-column`（等价于 `--column=never`）经 clap `overrides_with` 撤销先前的 `--column`（最后出现者生效），status 默认非列式故单独使用为 no-op
+
+
+> 支持 `--separate-git-dir` 指针布局：当 `<worktree>/.libra` 是指向 `<dir>` 的 `gitdir:` 指针文件（由 `libra clone --separate-git-dir` 创建）时，本命令会解析真实元数据目录并读取 `<dir>/libra.db` 与 `<dir>/objects`，而不是 `<worktree>/.libra`。

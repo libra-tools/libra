@@ -329,3 +329,9 @@ invalid `-u` targets exit 129 (Git: 128)
 `--track <commit>` is refused with exit 129 (Git: 128)
 listed in refname order; the current branch is marked but not moved
 `branch -d` refusals exit with status 1
+
+
+> `--separate-git-dir` pointer layouts are supported: when `<worktree>/.libra` is a
+> `gitdir: <dir>` pointer file (created by `libra clone --separate-git-dir`), this
+> command resolves the real metadata directory and reads `<dir>/libra.db` and
+> `<dir>/objects` instead of `<worktree>/.libra`.

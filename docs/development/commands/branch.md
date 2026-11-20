@@ -105,3 +105,6 @@ flowchart TD
 创建时的 --track / --no-track 复用 upstream 解析
 分支列表按 refname 排序并按最长名对齐
 branch -d 三类拒绝以 exit 1 结束（稳定错误码不变）
+
+
+**`--separate-git-dir` 指针布局（2026-11-20，CL-23）：** `<worktree>/.libra` 为 `gitdir: <dir>` 指针文件时，`util::resolve_dot_libra_pointer` 解析真实元数据目录，仓库发现（`try_get_paths_full_with_storage_lookup`）、`info/*` 候选与 `alternates` 的 objects 解析都改读 `<dir>`。会写 ref 的子命令仍由 `CL-28` 默认拒绝。

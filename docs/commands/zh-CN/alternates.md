@@ -51,3 +51,6 @@ libra alternates prune                               # 退役这些登记（解�
 ## 延后项（非 v1）
 
 `git clone --reference`/`--shared` 的免复制能力（需要针对 alternate 做 fetch have-negotiation，目前这些标志仍是已接受的 no-op）；`--dissociate`（复制借用对象并断开链接）；2.11 默认共享对象库。
+
+
+> 支持 `--separate-git-dir` 指针布局：当 `<worktree>/.libra` 是指向 `<dir>` 的 `gitdir:` 指针文件（由 `libra clone --separate-git-dir` 创建）时，本命令会解析真实元数据目录并读取 `<dir>/libra.db` 与 `<dir>/objects`，而不是 `<worktree>/.libra`。

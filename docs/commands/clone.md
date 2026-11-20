@@ -374,7 +374,10 @@ with the metadata inside the worktree; it is moved to `<DIR>` only after the
 checkout completes, so a failed clone never leaves a half-relocated repository.
 `<DIR>` must not exist or must be an empty directory. Cannot be combined with
 `--bare` or `--mirror` (`options '--bare' and '--separate-git-dir' cannot be
-used together`, `LBR-CLI-002`).
+used together`, `LBR-CLI-002`). Commands that only read the repository —
+`status`, `log`, `cat-file` and the no-argument `branch` listing — resolve the
+pointer layout and operate on `<DIR>`; commands that write refs are refused
+until the follow-up cards land.
 
 ```bash
 libra clone --separate-git-dir ~/.libra-meta/repo git@github.com:user/repo.git

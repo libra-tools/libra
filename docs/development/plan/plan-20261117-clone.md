@@ -577,7 +577,7 @@ PY
 ### Task CL-23: 适配 `util.rs`/`alternates.rs` 指针布局并使四个基本命令可用（#740）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `complete`（2026-11-20：新增 `util::resolve_dot_libra_pointer`，仓库发现（`try_get_paths_full_with_storage_lookup`）、`info/*` 候选与 `alternates` 的 objects 解析都跟随 `.libra` 的 `gitdir:` 指针；`status`、`log -n 1`、`cat-file -t HEAD` 与无参 `branch` 在指针布局下可用，`libra alternates add <W>` 记录 `<G>/objects`；`command::clone_test::test_clone_separate_git_dir_pointer_commands` 覆盖 AC1–AC5，nextest 1 run / 1 passed / 0 failed；共享回归 `command::status_test::*` 80 passed / 0 failed；`cargo +nightly fmt --all --check` 与 `cargo clippy --all-targets --all-features -- -D warnings` 均 exit 0；`sh tests/NEXTEST_GROUPS.sh` 后 `.config/nextest.toml` 无变化。本卡为 `REL-CL-01` 家族子卡（无版本 bump，C/D 由 `CL-25` 承接；写 ref 的默认拒绝由 `CL-28` 承接，本卡未放行任何写命令）；按用户 2026-11-20 指令在 `main` 提交推送。）
 **Description:** 自 `CL-04` 拆出（G-09）。在 `src/utils/util.rs:278,314-324,791-803,1269,1464` 与 `src/command/alternates.rs:91` 解析 `.libra` `gitdir:` 指针，并使 `status`、`log`、`cat-file` 与无参数 `branch` 在该布局下退出 0，`libra alternates add <W>` 解析到 `<G>/objects`。会改 ref 的 `branch` 以及其余子命令由 `CL-28` 默认拒绝（按 G-09 自本卡拆出 `CL-28`）。
 **Out of scope:** 默认拒绝（`CL-28`）；会改 ref 的 `branch`（`CL-28`）；`libra init --separate-git-dir`（保留 D25）。
 **Current evidence:**
@@ -587,11 +587,11 @@ PY
 | `#740` 需要 `util.rs` 与 `alternates.rs:91` 消费 `gitdir:` 指针 | `src/utils/util.rs:278,314-324,791-803,1269,1464`；`src/command/alternates.rs:91` |
 
 **Acceptance criteria:**（每条单谓词，按「验证执行协议」第 6 项计数）
-- [ ] **AC1** 夹具：`libra clone --separate-git-dir <G> file://<S> <W>` 得到的 `<W>`（`.libra` 为指向 `<G>` 的 `gitdir:` 指针文件）中，`libra status` 退出 0。
-- [ ] **AC2** 同一 `<W>` 中 `libra log -n 1` 退出 0 且 stdout 含 S 的 `HEAD` 提交 OID。
-- [ ] **AC3** 同一 `<W>` 中 `libra cat-file -t HEAD` 的 stdout 为 `commit` 加换行。
-- [ ] **AC4** 同一 `<W>` 中无参数 `libra branch` 的 stdout 含当前分支名 `main`。
-- [ ] **AC5** 在另一普通仓库 R 中执行 `libra alternates add <W>` 后，R 的 `.libra/objects/info/alternates` 记录的路径规范化后等于 `<G>/objects`（`src/command/alternates.rs:91` 跟随指针，而不是返回不存在的 `<W>/.libra/objects`）。
+- [x] **AC1** 夹具：`libra clone --separate-git-dir <G> file://<S> <W>` 得到的 `<W>`（`.libra` 为指向 `<G>` 的 `gitdir:` 指针文件）中，`libra status` 退出 0。
+- [x] **AC2** 同一 `<W>` 中 `libra log -n 1` 退出 0 且 stdout 含 S 的 `HEAD` 提交 OID。
+- [x] **AC3** 同一 `<W>` 中 `libra cat-file -t HEAD` 的 stdout 为 `commit` 加换行。
+- [x] **AC4** 同一 `<W>` 中无参数 `libra branch` 的 stdout 含当前分支名 `main`。
+- [x] **AC5** 在另一普通仓库 R 中执行 `libra alternates add <W>` 后，R 的 `.libra/objects/info/alternates` 记录的路径规范化后等于 `<G>/objects`（`src/command/alternates.rs:91` 跟随指针，而不是返回不存在的 `<W>/.libra/objects`）。
 - [ ] ER-06/ER-06a 同卡强制门：`Docs and compatibility impact` 所列文件均按「文档与网站验收命令」逐文件验收（不计入 G-03）。
 
 **AC → 断言映射:**（「验证执行协议」第 4、6 项：映射与 AC 表述同一谓词；成功类 `exit 0` 为读取输出的前提；失败类按第 6 项断言非零状态与稳定码）
@@ -603,8 +603,8 @@ PY
 - 文档 AC（ER-06/ER-06a 同卡强制门，不计入 G-03）→ 「文档与网站验收命令」第 1–6 步（家族子卡：第 6 步只做精确本地 `cf` 提交、不推送；推送与第 7 步部署核验由 `CL-25` 承接）；文档关键字：`separate-git-dir`。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest run --test command_test -E 'test(=command::clone_test::test_clone_separate_git_dir_pointer_commands)'` `(new)` — 卡特有用例（「验证执行协议」第 1–4 项），覆盖 AC1–AC5。
-- [ ] `source .env.test && cargo nextest run --test command_test -E 'test(/^command::status_test::/)'` — 共享回归组（「验证执行协议」第 5 项）：`status_test` 全模块回归。
+- [x] `source .env.test && cargo nextest run --test command_test -E 'test(=command::clone_test::test_clone_separate_git_dir_pointer_commands)'` `(new)` — 卡特有用例（「验证执行协议」第 1–4 项），覆盖 AC1–AC5。
+- [x] `source .env.test && cargo nextest run --test command_test -E 'test(/^command::status_test::/)'` — 共享回归组（「验证执行协议」第 5 项）：`status_test` 全模块回归。
 
 **Full-suite trigger:** `N/A（REL-CL-01 家族子卡，由 CL-25 统一执行 T-2）`
 **Dependencies:** `CL-04`、`DEP-CL-10`

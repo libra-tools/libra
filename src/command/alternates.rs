@@ -87,8 +87,16 @@ fn looks_like_object_dir(p: &Path) -> bool {
 /// object dir (has `info`/`pack`).
 fn resolve_objects_dir(input: &str) -> CliResult<PathBuf> {
     let p = Path::new(input);
-    // Repo-root layouts win first.
-    for candidate in [p.join(".libra").join("objects"), p.join("objects")] {
+    // Repo-root layouts win first. A `.libra` `gitdir:` pointer (created by
+    // `clone --separate-git-dir`) resolves to the real metadata directory, so
+    // its `objects` comes first instead of the nonexistent `<W>/.libra/objects`.
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(git_dir) = crate::utils::util::resolve_dot_libra_pointer(p) {
+        candidates.push(git_dir.join("objects"));
+    }
+    candidates.push(p.join(".libra").join("objects"));
+    candidates.push(p.join("objects"));
+    for candidate in candidates {
         if looks_like_object_dir(&candidate) {
             return std::fs::canonicalize(&candidate).or(Ok(candidate));
         }

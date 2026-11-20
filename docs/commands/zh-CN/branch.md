@@ -274,3 +274,6 @@ Git 将分支引用存储为 `.git/refs/heads/` 下的单独文件。这在规�
 `--track <提交>` 以 129 拒绝（Git 为 128）
 按 refname 排序，当前分支只标记不置顶
 `branch -d` 的三类拒绝以退出码 1 结束
+
+
+> 支持 `--separate-git-dir` 指针布局：当 `<worktree>/.libra` 是指向 `<dir>` 的 `gitdir:` 指针文件（由 `libra clone --separate-git-dir` 创建）时，本命令会解析真实元数据目录并读取 `<dir>/libra.db` 与 `<dir>/objects`，而不是 `<worktree>/.libra`。

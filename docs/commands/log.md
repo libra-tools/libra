@@ -900,3 +900,9 @@ flag only affects the human rendering layer.
 - Eligible `log -n N` is a prefix of unlimited `log` and abbreviates hashes from the printed commits (minimum 7). Skewed or same-second histories follow discovery order, and a missing ancestor beyond the limited frontier no longer fails the command
 - jj's log uses a template language (`-T`) for formatting; Libra uses Git-compatible `--pretty` format strings
 - In JSON mode, `files` contains structured change summaries; patch text is never included in JSON output
+
+
+> `--separate-git-dir` pointer layouts are supported: when `<worktree>/.libra` is a
+> `gitdir: <dir>` pointer file (created by `libra clone --separate-git-dir`), this
+> command resolves the real metadata directory and reads `<dir>/libra.db` and
+> `<dir>/objects` instead of `<worktree>/.libra`.

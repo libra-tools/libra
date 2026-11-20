@@ -95,3 +95,6 @@ flowchart TD
 旧版符号链接工作树仍支持只读 `status`，并使用该工作树已解析的元数据目录中的 `info/attributes`。这不会解除旧版布局的写入限制；修改仓库前仍需迁移布局。属性文件自身的符号链接或不可读属性会报错，不会被当作未设置属性。
 
 `ConversionScan` 以已加载索引的完整条目摘要、根身份及全部候选属性来源版本约束 stat 快路。首次或失效时逐文件 clean 比较；完整且干净的扫描才能在当前索引目录写入一个固定 64 字节的可丢弃 `conversion-stat-v1` 记录。记录缺失、损坏、不可读或写失败只使优化失效；不更新索引、ODB、refs 或默认状态的 dirty-cache 数据表。属性读取与记录 I/O 仍经过原有有界 worker；clean hash 的长度计算和哈希最多两遍读取同一描述符。`--scan` 的 dirty-cache fingerprint 加入属性来源版本，`--check-dirty` 也保留类型与执行位差异。
+
+
+**`--separate-git-dir` 指针布局（2026-11-20，CL-23）：** `<worktree>/.libra` 为 `gitdir: <dir>` 指针文件时，`util::resolve_dot_libra_pointer` 解析真实元数据目录，仓库发现（`try_get_paths_full_with_storage_lookup`）、`info/*` 候选与 `alternates` 的 objects 解析都改读 `<dir>`。会写 ref 的子命令仍由 `CL-28` 默认拒绝。
