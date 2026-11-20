@@ -658,6 +658,8 @@ pub enum CloneError {
     RevisionNotFound { revision: String },
     #[error("invalid configuration entry '{entry}': expected <key>=<value>")]
     InvalidConfigEntry { entry: String },
+    #[error("local object transfer failed: {message}")]
+    HardlinkFailed { message: String },
     #[error(
         "refusing to clone a Mega2 traces locator with libra clone; traces history is not part of the code view"
     )]
@@ -742,6 +744,10 @@ impl From<CloneError> for CliError {
                 .with_hint(
                     "the Cloudflare publish site host was removed; clone a git remote or use `libra cloud` for repository backup.",
                 ),
+            CloneError::HardlinkFailed { ref message } => CliError::fatal(format!(
+                "local object transfer failed: {message}"
+            ))
+            .with_stable_code(crate::utils::error::StableErrorCode::IoWriteFailed),
             CloneError::InvalidConfigEntry { ref entry } => CliError::command_usage(format!(
                 "invalid configuration entry '{entry}': expected <key>=<value>"
             ))
@@ -1083,6 +1089,154 @@ fn map_local_branch_state_error(source: branch::BranchStoreError) -> CliError {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Whether the test-only hard-link fault seam is active (`LIBRA_TEST=1` plus
+/// `LIBRA_TEST_CLONE_HARDLINK_FAIL=first`).
+fn clone_hardlink_fault_injected() -> bool {
+    std::env::var_os("LIBRA_TEST").is_some()
+        && std::env::var("LIBRA_TEST_CLONE_HARDLINK_FAIL")
+            .map(|value| value == "first")
+            .unwrap_or(false)
+}
+
+/// Replace the clone's object store with the local Libra source's store.
+///
+/// Git's local clone copies (or hard-links) the source object store verbatim
+/// instead of re-packing it, so every source object file keeps its layout and,
+/// on the same filesystem, its inode. `explicit_local` mirrors Git: with
+/// `--local` a hard-link failure is fatal while the default local path falls
+/// back to copying after the first failure. Symlinks anywhere in the source
+/// object store are refused rather than followed.
+fn adopt_local_objects(
+    source_objects: &Path,
+    dest_objects: &Path,
+    explicit_local: bool,
+) -> Result<(), String> {
+    let mut files = Vec::new();
+    collect_object_files(source_objects, source_objects, &mut files)?;
+    if dest_objects.is_dir() {
+        for entry in fs::read_dir(dest_objects)
+            .map_err(|error| format!("could not read '{}': {error}", dest_objects.display()))?
+        {
+            let entry = entry
+                .map_err(|error| format!("could not read '{}': {error}", dest_objects.display()))?;
+            if entry.file_name() == "info" {
+                continue;
+            }
+            let path = entry.path();
+            if path.is_dir() {
+                fs::remove_dir_all(&path)
+                    .map_err(|error| format!("could not clear '{}': {error}", path.display()))?;
+            } else {
+                fs::remove_file(&path)
+                    .map_err(|error| format!("could not clear '{}': {error}", path.display()))?;
+            }
+        }
+    }
+    let mut pending_fault = clone_hardlink_fault_injected();
+    let mut fallback = false;
+    for relative in files {
+        let source_file = source_objects.join(&relative);
+        let dest_file = dest_objects.join(&relative);
+        if let Some(parent) = dest_file.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("could not create '{}': {error}", parent.display()))?;
+        }
+        if fallback {
+            fs::copy(&source_file, &dest_file)
+                .map_err(|error| format!("could not copy '{}': {error}", source_file.display()))?;
+            continue;
+        }
+        let link_result = if pending_fault {
+            pending_fault = false;
+            Err(io::Error::other("LIBRA_TEST_CLONE_HARDLINK_FAIL=first"))
+        } else {
+            fs::hard_link(&source_file, &dest_file)
+        };
+        match link_result {
+            Ok(()) => {}
+            Err(error) if explicit_local => {
+                return Err(format!(
+                    "could not hard-link '{}' to '{}': {error}",
+                    dest_file.display(),
+                    source_file.display()
+                ));
+            }
+            Err(_) => {
+                fallback = true;
+                fs::copy(&source_file, &dest_file).map_err(|error| {
+                    format!("could not copy '{}': {error}", source_file.display())
+                })?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn collect_object_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
+    let entries = fs::read_dir(dir)
+        .map_err(|error| format!("could not read '{}': {error}", dir.display()))?;
+    for entry in entries {
+        let entry =
+            entry.map_err(|error| format!("could not read '{}': {error}", dir.display()))?;
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("could not inspect '{}': {error}", path.display()))?;
+        if file_type.is_symlink() {
+            return Err(format!(
+                "refusing to follow a symlink in the source object store: {}",
+                path.display()
+            ));
+        }
+        if file_type.is_dir() {
+            collect_object_files(root, &path, out)?;
+            continue;
+        }
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|_| format!("unexpected object path '{}'", path.display()))?;
+        if relative == Path::new("info").join("alternates") {
+            continue;
+        }
+        out.push(relative.to_path_buf());
+    }
+    Ok(())
+}
+
+/// Rewrite relative `objects/info/alternates` entries to absolute paths, like
+/// Git's `copy_alternates` (the clone must not resolve them against itself).
+fn rewrite_alternates_absolute(source_objects: &Path, dest_objects: &Path) -> Result<(), String> {
+    let source = source_objects.join("info").join("alternates");
+    let dest = dest_objects.join("info").join("alternates");
+    let Ok(contents) = fs::read_to_string(&source) else {
+        return Ok(());
+    };
+    let mut rewritten = Vec::new();
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if Path::new(trimmed).is_absolute() {
+            rewritten.push(trimmed.to_string());
+            continue;
+        }
+        let resolved = source_objects.join(trimmed);
+        let absolute = fs::canonicalize(&resolved).unwrap_or(resolved);
+        rewritten.push(absolute.display().to_string());
+    }
+    let mut body = rewritten.join("\n");
+    if !body.is_empty() {
+        body.push('\n');
+    }
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("could not create '{}': {error}", parent.display()))?;
+    }
+    fs::write(&dest, body)
+        .map_err(|error| format!("could not rewrite '{}': {error}", dest.display()))
+}
 
 fn contains_initialized_repo(metadata_root: &Path) -> bool {
     REPO_MARKERS
@@ -2086,6 +2240,26 @@ async fn clone_into_destination(
             .iter()
             .map(|p| p.to_string_lossy().into_owned())
             .collect();
+    }
+
+    // A local Libra source hands its object store to the clone (`--local`, and
+    // the default for a plain local path); `--no-local` keeps the fetched copy.
+    // This runs before any `--separate-git-dir` relocation, so the destination
+    // objects still live in the worktree.
+    if !args.no_local
+        && let fetch::RemoteClient::Local(client) = remote_client
+        && client.is_libra_source()
+    {
+        let source_objects = client.repo_path().join("objects");
+        let dest_objects = if args.bare {
+            local_path.join("objects")
+        } else {
+            local_path.join(util::ROOT_DIR).join("objects")
+        };
+        adopt_local_objects(&source_objects, &dest_objects, args.local)
+            .map_err(|message| CloneError::HardlinkFailed { message })?;
+        rewrite_alternates_absolute(&source_objects, &dest_objects)
+            .map_err(|message| CloneError::HardlinkFailed { message })?;
     }
 
     // Restore original directory before returning.

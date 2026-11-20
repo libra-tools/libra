@@ -3314,6 +3314,152 @@ fn test_clone_config_overrides() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn test_clone_local_hardlinks_and_no_local() {
+    use std::os::unix::fs::MetadataExt;
+
+    use crate::command::{
+        assert_cli_success, create_committed_repo_via_cli, run_libra_command,
+        run_libra_command_with_env,
+    };
+
+    type ObjFile = (std::path::PathBuf, u64, u64, Vec<u8>);
+
+    fn walk(base: &std::path::Path, dir: &std::path::Path, out: &mut Vec<ObjFile>) {
+        for entry in std::fs::read_dir(dir).expect("read object dir") {
+            let entry = entry.expect("object entry");
+            let path = entry.path();
+            let file_type = entry.file_type().expect("object type");
+            if file_type.is_dir() {
+                walk(base, &path, out);
+                continue;
+            }
+            let relative = path.strip_prefix(base).expect("relative").to_path_buf();
+            if relative == std::path::Path::new("info/alternates") {
+                continue;
+            }
+            let meta = std::fs::metadata(&path).expect("metadata");
+            let bytes = std::fs::read(&path).expect("read object");
+            out.push((relative, meta.dev(), meta.ino(), bytes));
+        }
+    }
+
+    fn object_files(root: &std::path::Path) -> Vec<ObjFile> {
+        let mut files = Vec::new();
+        walk(root, root, &mut files);
+        files.sort();
+        files
+    }
+
+    let src = create_committed_repo_via_cli();
+    let src_objects = src.path().join(".libra/objects");
+    let source_files = object_files(&src_objects);
+    assert!(!source_files.is_empty(), "the fixture must have objects");
+    let url = format!("file://{}", src.path().display());
+    let root = tempdir().unwrap();
+
+    // AC1: `--local` and the default plain local path share inodes.
+    for (flags, dir) in [(vec!["--local"], "d"), (vec![], "d1")] {
+        let dest = root.path().join(dir);
+        let mut argv = vec!["clone"];
+        argv.extend(flags.iter().copied());
+        argv.push(src.path().to_str().expect("src"));
+        argv.push(dest.to_str().expect("dest"));
+        assert_cli_success(&run_libra_command(&argv, root.path()), "AC1: local clone");
+        for (relative, dev, ino, _bytes) in &source_files {
+            let target = dest.join(".libra/objects").join(relative);
+            let meta = std::fs::metadata(&target)
+                .unwrap_or_else(|error| panic!("AC1: {} missing: {error}", target.display()));
+            assert_eq!(
+                (meta.dev(), meta.ino()),
+                (*dev, *ino),
+                "AC1: {} must share the source inode",
+                relative.display()
+            );
+        }
+    }
+
+    // AC3: `--no-local` copies, never shares inodes.
+    let d2 = root.path().join("d2");
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "clone",
+                "--no-local",
+                url.as_str(),
+                d2.to_str().expect("dest"),
+            ],
+            root.path(),
+        ),
+        "AC3: --no-local clone",
+    );
+    assert_cli_success(
+        &run_libra_command(&["fsck"], &d2),
+        "AC3: destination is complete",
+    );
+    let source_inodes: std::collections::HashSet<(u64, u64)> = source_files
+        .iter()
+        .map(|(_, dev, ino, _)| (*dev, *ino))
+        .collect();
+    for (relative, dev, ino, _bytes) in object_files(&d2.join(".libra/objects")) {
+        assert!(
+            !source_inodes.contains(&(dev, ino)),
+            "AC3: {} must not share the source inode",
+            relative.display()
+        );
+    }
+
+    // AC4: the injected first hard-link failure falls back to copying.
+    let d3 = root.path().join("d3");
+    let env: &[(&str, &str)] = &[
+        ("LIBRA_TEST", "1"),
+        ("LIBRA_TEST_CLONE_HARDLINK_FAIL", "first"),
+    ];
+    assert_cli_success(
+        &run_libra_command_with_env(
+            &[
+                "clone",
+                src.path().to_str().expect("src"),
+                d3.to_str().expect("dest"),
+            ],
+            root.path(),
+            env,
+        ),
+        "AC4: fallback clone",
+    );
+    assert_cli_success(
+        &run_libra_command(&["fsck"], &d3),
+        "AC4: destination is complete",
+    );
+    for (relative, dev, ino, _bytes) in object_files(&d3.join(".libra/objects")) {
+        assert!(
+            !source_inodes.contains(&(dev, ino)),
+            "AC4: {} must be copied after the injected failure",
+            relative.display()
+        );
+    }
+
+    // AC5: an explicit `--local` fails hard when hard-linking fails.
+    let d4 = root.path().join("d4");
+    let out = run_libra_command_with_env(
+        &[
+            "clone",
+            "--local",
+            src.path().to_str().expect("src"),
+            d4.to_str().expect("dest"),
+        ],
+        root.path(),
+        env,
+    );
+    assert!(!out.status.success(), "AC5: explicit --local must fail");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("LBR-IO-002"),
+        "AC5: expected LBR-IO-002: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 #[test]
 fn test_clone_reject_shallow_local_git_source() {
     use super::{create_linear_git_repo, git_success, run_libra_command};
