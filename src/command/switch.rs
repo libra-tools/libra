@@ -1668,7 +1668,7 @@ pub(crate) async fn guard_target_tree_case(
     crate::utils::path_case::guard_tree_case_collisions(&paths).await
 }
 
-async fn restore_to_commit(
+pub(crate) async fn restore_to_commit(
     commit_id: ObjectHash,
     output: &OutputConfig,
 ) -> Result<(), SwitchError> {

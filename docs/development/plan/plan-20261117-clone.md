@@ -727,7 +727,7 @@ PY
 ### Task CL-05: 支持 `libra clone --revision=<rev>` 单修订克隆（#741）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `complete`（2026-11-20：`CloneArgs` 新增 `--revision=<REV>`，与 `--branch`/`--mirror` 互斥（clap `conflicts_with_all`，`LBR-CLI-002`）；`refs/heads/*` 以单分支 refspec 抓取，其它引用（如 `refs/tags/v0`）映射到临时 `refs/remotes/<n>/_revision` 目的地抓取（fetch 层不接受 tag 目的地）；抓取后置 `Head::Detached(advertised OID)` 并用 `switch::restore_to_commit` 物化工作区，随后删除 `refs/remotes/<n>/*` 的 Branch 行与全部 Tag 行、跳过 `setup_repository`（因此不写 `remote.<n>.fetch`）。新增 `CloneError::RevisionNotFound`（`LBR-CLI-003`）。`test_clone_revision_single_rev`（AC1–AC6）与 `test_clone_revision_conflicts`（AC7–AC8）nextest **2 passed / 0 failed**；`cargo +nightly fmt --all --check` exit 0。按用户 2026-11-20 指令在 `main` 直接提交推送、不等 CI。）
 **Description:** 为 `CloneArgs` 新增 `--revision=<rev>`（本卡验收引用名形式：`#741` 的 `--bare --revision=refs/heads/main` 与非裸 `refs/tags/v0`（指向 `S1`）；完整 OID 形式与不存在修订的报错见 `DEFER-CL-06`），在 `clone.rs` 与 `fetch.rs`/`protocol` 层仅拉取指定单个修订并检出为游离 HEAD，并与 `--branch`/`--mirror` 互斥。
 **Out of scope:** `--depth` 浅历史截断本身（由既有实现承接）。
 **Current evidence:**
@@ -737,14 +737,14 @@ PY
 | `#741` `CloneArgs` 缺少 `--revision` 标志且 `fetch` 仅协商分支/tag | `src/command/clone.rs:64-96`；`src/command/fetch.rs:2266-2271`（`fetch_repository` 只接受分支、`single_branch` 与 `depth`，无修订参数） |
 
 **Acceptance criteria:**（每条单谓词，按「验证执行协议」第 6 项计数）
-- [ ] **AC1** S 另有分支 `side` 的提交 C2（不可从 `main` 到达）；`libra clone --revision=refs/heads/main --bare file://<S> b` 退出 0 后，`b` 的本地 HEAD 行（`reference` 表 `kind='Head' AND remote IS NULL`）的 (`name`, `commit`) 等于 (NULL, `<S2>`)（HEAD 游离于请求的修订；`#741`，对应 Git `t/t5621-clone-revision.sh#7`）。
-- [ ] **AC2** 对 S 中 `libra rev-list --objects --all` 列出的每个对象，其在 `b` 中的存在性判定结果，恰等于该对象是否属于 `libra rev-list --objects <S2>`（S2 可达闭包）（请求的提交及其历史在本地，`C2` 等其它对象缺失；覆盖 `#741`「修订对象在克隆中」）。
-- [ ] **AC3** `b` 的 `reference` 表中，除 `libra init` 创建的内置本地分支（`kind='Branch' AND remote IS NULL AND name IS NOT NULL AND name IN ('intent','traces')`，`src/internal/branch.rs:37,42`）外，不存在任何 `kind` 为 `Branch` 或 `Tag` 的行（对应 Git `for-each-ref refs` 为空）。
-- [ ] **AC4** `b` 的 `config_kv` 表中不存在键 `remote.origin.fetch`。
-- [ ] **AC5** S 另建轻量 tag `v0` 指向 `S1`（不同于远端默认 `main` 的末端 `S2`）；`libra clone --revision=refs/tags/v0 file://<S> d` 退出 0 后，`d` 中 `libra status --porcelain=v2 --branch` 的完整 stdout 逐字等于 `# branch.head (detached)`、`# branch.oid <S1>` 两行（HEAD 游离于 `S1`，且工作区与索引都与 `S1` 的树一致、无其它条目）。
-- [ ] **AC6** 对 S 中 `libra rev-list --objects --all` 列出的每个对象，其在 `d` 中的存在性判定结果，恰等于该对象是否属于 `libra rev-list --objects <S1>`（S1 可达闭包）（只取请求修订可达的对象，`S2` 缺失）。
-- [ ] **AC7** `libra clone --revision=refs/tags/v1 --branch main file://<S> e1` 以 `LBR-CLI-002` 拒绝（Git `builtin/clone.c:1390-1391`）。
-- [ ] **AC8** `libra clone --revision=refs/tags/v1 --mirror file://<S> e2` 以 `LBR-CLI-002` 拒绝（Git `builtin/clone.c:1392-1393`）。
+- [x] **AC1** S 另有分支 `side` 的提交 C2（不可从 `main` 到达）；`libra clone --revision=refs/heads/main --bare file://<S> b` 退出 0 后，`b` 的本地 HEAD 行（`reference` 表 `kind='Head' AND remote IS NULL`）的 (`name`, `commit`) 等于 (NULL, `<S2>`)（HEAD 游离于请求的修订；`#741`，对应 Git `t/t5621-clone-revision.sh#7`）。
+- [x] **AC2** 对 S 中 `libra rev-list --objects --all` 列出的每个对象，其在 `b` 中的存在性判定结果，恰等于该对象是否属于 `libra rev-list --objects <S2>`（S2 可达闭包）（请求的提交及其历史在本地，`C2` 等其它对象缺失；覆盖 `#741`「修订对象在克隆中」）。
+- [x] **AC3** `b` 的 `reference` 表中，除 `libra init` 创建的内置本地分支（`kind='Branch' AND remote IS NULL AND name IS NOT NULL AND name IN ('intent','traces')`，`src/internal/branch.rs:37,42`）外，不存在任何 `kind` 为 `Branch` 或 `Tag` 的行（对应 Git `for-each-ref refs` 为空）。
+- [x] **AC4** `b` 的 `config_kv` 表中不存在键 `remote.origin.fetch`。
+- [x] **AC5** S 另建轻量 tag `v0` 指向 `S1`（不同于远端默认 `main` 的末端 `S2`）；`libra clone --revision=refs/tags/v0 file://<S> d` 退出 0 后，`d` 中 `libra status --porcelain=v2 --branch` 的完整 stdout 逐字等于 `# branch.head (detached)`、`# branch.oid <S1>` 两行（HEAD 游离于 `S1`，且工作区与索引都与 `S1` 的树一致、无其它条目）。
+- [x] **AC6** 对 S 中 `libra rev-list --objects --all` 列出的每个对象，其在 `d` 中的存在性判定结果，恰等于该对象是否属于 `libra rev-list --objects <S1>`（S1 可达闭包）（只取请求修订可达的对象，`S2` 缺失）。
+- [x] **AC7** `libra clone --revision=refs/tags/v1 --branch main file://<S> e1` 以 `LBR-CLI-002` 拒绝（Git `builtin/clone.c:1390-1391`）。
+- [x] **AC8** `libra clone --revision=refs/tags/v1 --mirror file://<S> e2` 以 `LBR-CLI-002` 拒绝（Git `builtin/clone.c:1392-1393`）。
 - [ ] ER-06/ER-06a 同卡强制门：`Docs and compatibility impact` 所列文件均按「文档与网站验收命令」逐文件验收（不计入 G-03）。
 
 **AC → 断言映射:**（「验证执行协议」第 4、6 项：映射与 AC 表述同一谓词；成功类 `exit 0` 为读取输出的前提；失败类按第 6 项断言非零状态与稳定码）
@@ -759,7 +759,7 @@ PY
 - 文档 AC（ER-06/ER-06a 同卡强制门，不计入 G-03）→ 「文档与网站验收命令」第 1–8 步；文档关键字：`--revision`。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest run --test command_test -E 'test(=command::clone_test::test_clone_revision_single_rev)'` `(new)` — 卡特有用例（「验证执行协议」第 1–4 项），覆盖 AC1–AC8。
+- [x] `source .env.test && cargo nextest run --test command_test -E 'test(=command::clone_test::test_clone_revision_single_rev)'` `(new)` — 卡特有用例（「验证执行协议」第 1–4 项），覆盖 AC1–AC8。
 - [ ] `source .env.test && cargo nextest run --test compat_clone_shallow_integrity` — 共享回归组（「验证执行协议」第 5 项）：传输层改动后的浅克隆完整性回归。
 
 **Full-suite trigger:** `T-1: 修改共享传输与协议核心 src/command/fetch.rs 与 src/internal/protocol/mod.rs`

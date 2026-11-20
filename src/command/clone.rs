@@ -75,6 +75,17 @@ pub struct CloneArgs {
     #[clap(short = 'b', long, required = false)]
     pub branch: Option<String>,
 
+    /// Clone only this revision (for example `refs/heads/main` or
+    /// `refs/tags/v1`), checking it out as a detached HEAD. No local branches,
+    /// tags or remote-tracking refs are created and `remote.<name>.fetch` is
+    /// not written. Conflicts with `--branch` and `--mirror`.
+    #[clap(
+        long = "revision",
+        value_name = "REV",
+        conflicts_with_all = ["branch", "mirror"]
+    )]
+    pub revision: Option<String>,
+
     /// Clone only one branch, HEAD or --branch. Also implied by `--depth`,
     /// `--shallow-since`, and `--shallow-exclude` unless `--no-single-branch`
     /// (or `--mirror`) is given, matching `git clone`.
@@ -465,6 +476,19 @@ fn clone_fetch_branch(
     discovery: &DiscoveryResult,
     single_branch: bool,
 ) -> Option<String> {
+    if let Some(revision) = args.revision.as_deref() {
+        // Fetch exactly the requested ref. A tag (or any non-head ref) needs an
+        // explicit destination; the revision clone deletes the persisted row
+        // again right after the checkout.
+        if revision.starts_with("refs/heads/") {
+            return Some(revision.to_string());
+        }
+        // Tag destinations are rejected by the fetch refspec validator, so map
+        // the tag onto a temporary remote-tracking destination; the revision
+        // clone deletes that ref right after the checkout.
+        let remote = args.origin.clone().unwrap_or_else(|| "origin".to_string());
+        return Some(format!("{revision}:refs/remotes/{remote}/_revision"));
+    }
     if let Some(branch) = args.branch.clone() {
         return Some(branch);
     }
@@ -603,6 +627,8 @@ pub enum CloneError {
     SeparateGitDirWithBare,
     #[error("failed to move repository metadata for --separate-git-dir: {message}")]
     SeparateGitDirFailed { message: String },
+    #[error("remote revision '{revision}' was not advertised by the source repository")]
+    RevisionNotFound { revision: String },
     #[error(
         "refusing to clone a Mega2 traces locator with libra clone; traces history is not part of the code view"
     )]
@@ -687,6 +713,11 @@ impl From<CloneError> for CliError {
                 .with_hint(
                     "the Cloudflare publish site host was removed; clone a git remote or use `libra cloud` for repository backup.",
                 ),
+            CloneError::RevisionNotFound { ref revision } => CliError::command_usage(format!(
+                "remote revision '{revision}' was not advertised by the source repository"
+            ))
+            .with_stable_code(crate::utils::error::StableErrorCode::CliInvalidTarget)
+            .with_hint("pass a ref the remote advertises (for example refs/heads/main or refs/tags/v1)"),
             CloneError::SeparateGitDirWithBare => CliError::command_usage(error.to_string())
                 .with_stable_code(StableErrorCode::CliInvalidArguments)
                 .with_hint("drop either `--bare`/`--mirror` or `--separate-git-dir`"),
@@ -1756,7 +1787,9 @@ async fn clone_into_destination(
     };
     // `git clone` fetches ALL tags by default; `--no-tags` skips them and records
     // `remote.<name>.tagOpt=--no-tags` so later fetches also skip tags.
-    let clone_tag_mode = if args.no_tags {
+    let clone_tag_mode = if args.revision.is_some() {
+        fetch::TagFetchMode::NoTags
+    } else if args.no_tags {
         let _ = ConfigKv::set(&format!("remote.{remote_name}.tagOpt"), "--no-tags", false).await;
         fetch::TagFetchMode::NoTags
     } else {
@@ -1768,7 +1801,7 @@ async fn clone_into_destination(
     // `--depth` / `--shallow-*` imply `--single-branch` unless
     // `--no-single-branch` (git `builtin/clone.c:1025-1028`). Resolve HEAD's
     // branch so a flag-less `--single-branch` still writes one refspec.
-    let single_branch = args.effective_single_branch();
+    let single_branch = args.effective_single_branch() || args.revision.is_some();
     let fetch_branch = clone_fetch_branch(args, discovery, single_branch);
     // A plain local Git path ignores `--depth` (git local-clone). `file://`
     // and `--no-local` keep the transport depth.
@@ -1815,6 +1848,65 @@ async fn clone_into_destination(
     // Clone owns this fresh repository exclusively; the fetch's ref updates
     // landed inside — release the pack's `.keep` pin now.
     fetch_result.release_pack_pin();
+
+    // `--revision`: check out exactly one advertised revision as a detached
+    // HEAD. No local branch, tag or remote-tracking ref is created, and
+    // `remote.<name>.fetch` is never written (Git's `clone --revision`).
+    if let Some(revision) = &args.revision {
+        let oid = discovery
+            .refs
+            .iter()
+            .find(|reference| reference._ref == *revision)
+            .and_then(|reference| {
+                crate::internal::object_format::parse_repo_oid(&reference._hash).ok()
+            })
+            .ok_or_else(|| CloneError::RevisionNotFound {
+                revision: revision.clone(),
+            })?;
+        Head::update(Head::Detached(oid), None).await;
+        if !args.bare && !args.no_checkout {
+            crate::command::switch::restore_to_commit(oid, output)
+                .await
+                .map_err(|error| CloneError::SetupFailed {
+                    message: format!("failed to check out revision '{revision}': {error}"),
+                })?;
+        }
+        let tracking = Branch::list_branches_result(Some(&remote_name))
+            .await
+            .map_err(|source| CloneError::LocalBranchState { source })?;
+        for branch in tracking {
+            Branch::delete_branch_result(&branch.name, Some(&remote_name))
+                .await
+                .map_err(|source| CloneError::LocalBranchState { source })?;
+        }
+        if let Ok(tags) = crate::internal::tag::list().await {
+            for tag in tags {
+                let _ = crate::internal::tag::delete(&tag.name).await;
+            }
+        }
+        env::set_current_dir(original_dir).map_err(|source| CloneError::RestoreDirectory {
+            path: original_dir.to_path_buf(),
+            source,
+        })?;
+        return Ok(CloneOutput {
+            path: local_path.to_string_lossy().into_owned(),
+            bare: args.bare,
+            remote_url: remote_url.to_string(),
+            remote_name: remote_name.clone(),
+            branch: None,
+            object_format,
+            repo_id: init_output.repo_id,
+            vault_signing: init_output.vault_signing,
+            ssh_key_detected: init_output.ssh_key_detected,
+            shallow: fetch_depth.is_some(),
+            warnings: init_output.warnings.clone(),
+            gitignore_converted: Vec::new(),
+            source_kind: None,
+            cloud_site: None,
+            objects_fetched: Some(fetch_result.objects_fetched),
+            bytes_received: Some(fetch_result.bytes_received),
+        });
+    }
 
     // Explicit `--progress` must remain observable when stderr is redirected;
     // the indicatif spinner is TTY-only, so emit the completion line directly.

@@ -221,6 +221,7 @@ async fn test_clone_branch() {
         reject_shallow: false,
         no_reject_shallow: false,
         separate_git_dir: None,
+        revision: None,
         reference: vec![],
         reference_if_able: vec![],
         shared: false,
@@ -274,6 +275,7 @@ async fn test_clone_bare_repository() {
         reject_shallow: false,
         no_reject_shallow: false,
         separate_git_dir: None,
+        revision: None,
         reference: vec![],
         reference_if_able: vec![],
         shared: false,
@@ -342,6 +344,7 @@ async fn test_clone_branch_single_branch() {
         reject_shallow: false,
         no_reject_shallow: false,
         separate_git_dir: None,
+        revision: None,
         reference: vec![],
         reference_if_able: vec![],
         shared: false,
@@ -394,6 +397,7 @@ async fn test_clone_default_branch() {
         reject_shallow: false,
         no_reject_shallow: false,
         separate_git_dir: None,
+        revision: None,
         reference: vec![],
         reference_if_able: vec![],
         shared: false,
@@ -446,6 +450,7 @@ async fn test_clone_default_branch_single_branch() {
         reject_shallow: false,
         no_reject_shallow: false,
         separate_git_dir: None,
+        revision: None,
         reference: vec![],
         reference_if_able: vec![],
         shared: false,
@@ -500,6 +505,7 @@ async fn test_clone_to_existing_empty_dir() {
         reject_shallow: false,
         no_reject_shallow: false,
         separate_git_dir: None,
+        revision: None,
         reference: vec![],
         reference_if_able: vec![],
         shared: false,
@@ -557,6 +563,7 @@ async fn test_clone_to_existing_dir() {
         reject_shallow: false,
         no_reject_shallow: false,
         separate_git_dir: None,
+        revision: None,
         reference: vec![],
         reference_if_able: vec![],
         shared: false,
@@ -610,6 +617,7 @@ async fn test_clone_to_dir_with_existing_file_name() {
         reject_shallow: false,
         no_reject_shallow: false,
         separate_git_dir: None,
+        revision: None,
         reference: vec![],
         reference_if_able: vec![],
         shared: false,
@@ -662,6 +670,7 @@ async fn test_clone_with_depth() {
         reject_shallow: false,
         no_reject_shallow: false,
         separate_git_dir: None,
+        revision: None,
         reference: vec![],
         reference_if_able: vec![],
         shared: false,
@@ -716,6 +725,7 @@ async fn test_clone_with_depth_and_branch() {
         reject_shallow: false,
         no_reject_shallow: false,
         separate_git_dir: None,
+        revision: None,
         reference: vec![],
         reference_if_able: vec![],
         shared: false,
@@ -2946,6 +2956,202 @@ fn test_clone_separate_git_dir_default_deny() {
         &run_libra_command(&["branch"], &work),
         "the bare branch listing stays allowed",
     );
+}
+
+#[test]
+fn test_clone_revision_single_rev() {
+    use crate::command::{assert_cli_success, run_libra_command, run_libra_command_with_env};
+
+    let root = tempdir().unwrap();
+    let src = root.path().join("src");
+    assert_cli_success(
+        &run_libra_command(&["init", src.to_str().unwrap()], root.path()),
+        "init source",
+    );
+    let identity: &[(&str, &str)] = &[
+        ("LIBRA_COMMITTER_NAME", "t"),
+        ("LIBRA_COMMITTER_EMAIL", "t@t"),
+        ("GIT_AUTHOR_NAME", "t"),
+        ("GIT_AUTHOR_EMAIL", "t@t"),
+    ];
+    let commit = |msg: &str| {
+        assert_cli_success(
+            &run_libra_command_with_env(&["commit", "--no-gpg-sign", "-m", msg], &src, identity),
+            "commit",
+        );
+    };
+    std::fs::write(src.join("a.txt"), "1\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "a.txt"], &src), "add s1");
+    commit("s1");
+    let s1 = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], &src).stdout)
+        .trim()
+        .to_string();
+    assert_cli_success(&run_libra_command(&["tag", "v0"], &src), "tag v0");
+    std::fs::write(src.join("a.txt"), "2\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "a.txt"], &src), "add s2");
+    commit("s2");
+    let s2 = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], &src).stdout)
+        .trim()
+        .to_string();
+    // C2 on `side` is reachable only from that branch.
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "side"], &src),
+        "switch side",
+    );
+    std::fs::write(src.join("b.txt"), "side\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "b.txt"], &src), "add c2");
+    commit("c2");
+    assert_cli_success(
+        &run_libra_command(&["switch", "main"], &src),
+        "back to main",
+    );
+    let url = format!("file://{}", src.display());
+
+    // AC1/AC2/AC3/AC4: a bare revision clone of refs/heads/main.
+    let bare = root.path().join("b");
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "clone",
+                "--revision=refs/heads/main",
+                "--bare",
+                url.as_str(),
+                bare.to_str().unwrap(),
+            ],
+            root.path(),
+        ),
+        "AC1: bare revision clone",
+    );
+    let head = run_libra_command(&["cat-file", "-p", "HEAD"], &bare);
+    assert_cli_success(&head, "AC1: read the bare HEAD commit");
+    let head_text = String::from_utf8_lossy(&head.stdout);
+    assert!(
+        head_text.contains(&format!("tree")),
+        "AC1: HEAD is a commit"
+    );
+    // HEAD resolves to S2, not to the side branch tip.
+    let resolved = run_libra_command(&["rev-parse", "HEAD"], &bare);
+    assert_cli_success(&resolved, "AC1: rev-parse HEAD");
+    assert_eq!(
+        String::from_utf8_lossy(&resolved.stdout).trim(),
+        s2,
+        "AC1: detached at S2"
+    );
+
+    // AC2: every object of the source is present iff reachable from S2.
+    let all = run_libra_command(&["rev-list", "--objects", "--all"], &src);
+    assert_cli_success(&all, "AC2: source object list");
+    let reachable = run_libra_command(&["rev-list", "--objects", &s2], &src);
+    assert_cli_success(&reachable, "AC2: S2 closure");
+    let reachable_set: std::collections::HashSet<String> =
+        String::from_utf8_lossy(&reachable.stdout)
+            .lines()
+            .filter_map(|line| line.split_whitespace().next().map(str::to_owned))
+            .collect();
+    for line in String::from_utf8_lossy(&all.stdout).lines() {
+        let Some(oid) = line.split_whitespace().next() else {
+            continue;
+        };
+        let exists = run_libra_command(&["cat-file", "-e", oid], &bare)
+            .status
+            .success();
+        assert_eq!(
+            exists,
+            reachable_set.contains(oid),
+            "AC2: object {oid} presence must match the requested closure"
+        );
+    }
+
+    // AC3: no branch or tag rows survive (only built-in local rows).
+    let branches = run_libra_command(&["branch", "--all"], &bare);
+    let branches_out = String::from_utf8_lossy(&branches.stdout);
+    assert!(
+        !branches_out.contains("main") && !branches_out.contains("side"),
+        "AC3: a revision clone keeps no branches: {branches_out}"
+    );
+
+    // AC4: no remote.origin.fetch configuration.
+    let config = run_libra_command(&["config", "list"], &bare);
+    let config_out = String::from_utf8_lossy(&config.stdout);
+    assert!(
+        !config_out.contains("remote.origin.fetch"),
+        "AC4: no remote fetch refspec: {config_out}"
+    );
+
+    // AC5/AC6: a tag revision checks out S1 as a detached worktree.
+    let work = root.path().join("d");
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "clone",
+                "--revision=refs/tags/v0",
+                url.as_str(),
+                work.to_str().unwrap(),
+            ],
+            root.path(),
+        ),
+        "AC5: tag revision clone",
+    );
+    let status = run_libra_command(&["status", "--porcelain=v2", "--branch"], &work);
+    assert_cli_success(&status, "AC5: status");
+    let first_two: Vec<String> = String::from_utf8_lossy(&status.stdout)
+        .lines()
+        .take(2)
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(
+        first_two,
+        vec![
+            "# branch.head (detached)".to_string(),
+            format!("# branch.oid {s1}")
+        ]
+    );
+
+    // AC6: only the S1 closure is present.
+    let reachable_s1 = run_libra_command(&["rev-list", "--objects", &s1], &src);
+    assert_cli_success(&reachable_s1, "AC6: S1 closure");
+    let s1_set: std::collections::HashSet<String> = String::from_utf8_lossy(&reachable_s1.stdout)
+        .lines()
+        .filter_map(|line| line.split_whitespace().next().map(str::to_owned))
+        .collect();
+    for line in String::from_utf8_lossy(&all.stdout).lines() {
+        let Some(oid) = line.split_whitespace().next() else {
+            continue;
+        };
+        let exists = run_libra_command(&["cat-file", "-e", oid], &work)
+            .status
+            .success();
+        assert_eq!(
+            exists,
+            s1_set.contains(oid),
+            "AC6: object {oid} presence must match the S1 closure"
+        );
+    }
+}
+
+#[test]
+fn test_clone_revision_conflicts() {
+    use crate::command::{create_committed_repo_via_cli, run_libra_command};
+
+    let src = create_committed_repo_via_cli();
+    let root = tempdir().unwrap();
+    let url = format!("file://{}", src.path().display());
+
+    for extra in [vec!["--branch", "main"], vec!["--mirror"]] {
+        let mut argv = vec!["clone", "--revision=refs/tags/v1"];
+        argv.extend(extra.iter().copied());
+        argv.push(url.as_str());
+        let dest = root.path().join("out");
+        argv.push(dest.to_str().unwrap());
+        let out = run_libra_command(&argv, root.path());
+        assert!(!out.status.success(), "--revision with {extra:?} must fail");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("LBR-CLI-002")
+                || String::from_utf8_lossy(&out.stderr).contains("LBR-CLI-003"),
+            "expected a CLI usage code: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }
 
 #[test]
