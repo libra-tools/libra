@@ -60,7 +60,7 @@ this command.
 | `--first-parent` | Follow only the first parent of merge commits when walking history. | Off |
 | `--match <pattern>` | Only consider tags whose name matches the glob (repeatable; OR semantics, wax globs ≤256 chars). | None |
 | `--exclude <pattern>` | Exclude tags whose name matches the glob (repeatable; takes precedence over `--match`). | None |
-| `--contains` | Inverse containment query (git name-rev): name the target by its nearest **descendant** tag, printing `<tag>`, `<tag>~<n>`, or `<tag>~<n>^<m>~<k>`. Implies lightweight tags; equal-weight ties resolve by tag name; fails when no tag descends from the target. | Off |
+| `--contains` | Inverse containment query (git name-rev): name the target by its nearest **descendant** tag, printing `<tag>` (lightweight) / `<tag>^0` (annotated direct hit), `<tag>~<n>`, or `<tag>~<n>^<m>~<k>`. Implies lightweight tags; equal-weight ties resolve by tag name; fails when no tag descends from the target. `--contains --exact-match` and `--contains --candidates 0` still print the bare tag without `^0` in this release. | Off |
 
 ### Examples
 
@@ -247,7 +247,7 @@ shared commit, then heads, then remotes. `--contains` is supported: it runs
 Git's reverse-walk containment algorithm (name-rev) — a Dijkstra-style walk
 backward from every tag commit where first-parent steps are cheap and
 other-parent steps are expensive, so the closest descendant tag's straightest
-path wins — and prints `<tag>`, `<tag>~<n>`, or `<tag>~<n>^<m>~<k>`. It
+path wins — and prints `<tag>^0` for an annotated direct hit, `<tag>` for a lightweight direct hit, `<tag>~<n>`, or `<tag>~<n>^<m>~<k>`. `--contains --exact-match`/`--contains --candidates 0` still print the bare tag without `^0` in this release. It
 implies lightweight-tag inclusion (like `git name-rev --tags`) and fails when
 no tag descends from the commit.
 

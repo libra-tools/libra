@@ -405,7 +405,7 @@
 
 ### Task DESC-01: 修复 `libra describe --contains` 在精确匹配附注 tag 时缺少 `^0` 后缀（#795）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空` | **Priority / Selection:** P1；Git 核心兼容缺陷 | **Issue:** [#795](https://github.com/libra-tools/libra/issues/795)
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `complete`（2026-11-20：`0.30.214`；targeted 3/3、共享 describe 组 34/34、版本守卫 2/2、`TC-1031 PASS`；Codex R3 `VERDICT: PASS`；EN/zh/开发/COMPATIBILITY/网站已同步；远端 CI 未等待，按用户 2026-11-20 指令 local C/D） | **Priority / Selection:** P1；Git 核心兼容缺陷 | **Issue:** [#795](https://github.com/libra-tools/libra/issues/795)
 
 **Description:** 修复 `run_describe_contains` 主循环：目标提交直接被**附注 tag**指向时输出 `<tag>^0`（轻量 tag 仍输出 `<tag>`，对齐 Git `name-rev --peel-tag`）。「直接指向」以种子状态判定：Dijkstra 权重 `weight == 0`（只有 tag 种子权重为 0；首父边 `+1`、非首父边 `+MERGE_COST`，`src/command/describe.rs:437, 456, 515-518`），**不得**用 `generation == 0`——非首父边把新状态置为 `("<display>^<n>", 0)`（`:518`），以它判定会把合并提交的第二父 `v2.0^2` 误判为精确匹配。`data.exact_match` 改为按同一种子条件计算（现为 `display == tag`，`:479-482`，追加 `^0` 后会误判为 `false`）；同步更新既有 `describe_test.rs:555` 的旧断言。`--exact-match`/`--candidates 0` 的提前返回分支（`:411-427`）本卡不改，按 G-09 拆出 `DESC-01a`：本卡期间该分支仍输出 `<tag>`，既有用例 `test_describe_contains_exact_match_requires_direct_tag`（`:687` 断言 `v1.0`）在共享回归组中保持通过，作为本卡的未改动边界。
 
@@ -422,15 +422,15 @@
 
 **Acceptance criteria:**
 
-- [ ] AC1：`HEAD` 被附注 tag 直接指向时，无参数 `libra describe --contains`（默认 `HEAD`，`#795` 上游用例）的 stdout 为 `<tag>^0`。
-- [ ] AC2：显式 `<commit>` 被附注 tag 直接指向时，`libra describe --contains <commit>` 的 stdout 为 `<tag>^0`。
-- [ ] AC3：目标被轻量 tag 直接指向时，`libra describe --contains <commit>` 的 stdout 为 `<tag>`（不加 `^0`）。
-- [ ] AC4：附注 tag 精确匹配时 `libra describe --contains --json` 的 `data.result` 为 `<tag>^0`。
-- [ ] AC5：同一命令的 `data.tag` 为 `<tag>`（不含 `^0`）。
-- [ ] AC6：同一命令的 `data.exact_match` 为 `true`。
-- [ ] AC7：附注 tag 指向合并提交时，`libra describe --contains <合并提交的第二父>` 的 stdout 为 `<tag>^2`（不加 `^0`）。
-- [ ] AC8：同一目标的 `libra describe --contains --json <合并提交的第二父>` 的 `data.exact_match` 为 `false`。
-- [ ] ER-06/ER-06a 同卡强制门（不计入 G-03）：逐文件更新 `docs/commands/describe.md`、`docs/commands/zh-CN/describe.md`、`docs/development/commands/describe.md`、`COMPATIBILITY.md:219` 与网站 `describe.en.md`（说明 `--exact-match`/`--candidates 0` 下的 `^0` 尚未支持），按「文档与网站验收命令」逐步验收。
+- [x] AC1：`HEAD` 被附注 tag 直接指向时，无参数 `libra describe --contains`（默认 `HEAD`，`#795` 上游用例）的 stdout 为 `<tag>^0`。
+- [x] AC2：显式 `<commit>` 被附注 tag 直接指向时，`libra describe --contains <commit>` 的 stdout 为 `<tag>^0`。
+- [x] AC3：目标被轻量 tag 直接指向时，`libra describe --contains <commit>` 的 stdout 为 `<tag>`（不加 `^0`）。
+- [x] AC4：附注 tag 精确匹配时 `libra describe --contains --json` 的 `data.result` 为 `<tag>^0`。
+- [x] AC5：同一命令的 `data.tag` 为 `<tag>`（不含 `^0`）。
+- [x] AC6：同一命令的 `data.exact_match` 为 `true`。
+- [x] AC7：附注 tag 指向合并提交时，`libra describe --contains <合并提交的第二父>` 的 stdout 为 `<tag>^2`（不加 `^0`）。
+- [x] AC8：同一目标的 `libra describe --contains --json <合并提交的第二父>` 的 `data.exact_match` 为 `false`。
+- [x] ER-06/ER-06a 同卡强制门（不计入 G-03）：逐文件更新 `docs/commands/describe.md`、`docs/commands/zh-CN/describe.md`、`docs/development/commands/describe.md`、`COMPATIBILITY.md:219` 与网站 `describe.en.md`（说明 `--exact-match`/`--candidates 0` 下的 `^0` 尚未支持），按「文档与网站验收命令」逐步验收。
 
 **AC → 断言映射:**（夹具 A：`create_committed_repo_via_cli()` 后新增提交 `C1` 并 `libra tag -m v1.0 v1.0`（附注，指向 `C1`），再新增提交 `C2` 并 `libra tag lw`（轻量，指向 `C2`），最后 `libra switch --detach <C1>` 使 `HEAD` = `C1`。夹具 B（独立仓库）：`create_committed_repo_via_cli()` 后以 `libra branch --show-current` 记录当前分支名 `<main>`，`libra branch side`；新增提交 `M1`；`libra switch side` 后新增提交 `S1`；`libra switch <main>`，`libra merge side`（前置断言：`libra rev-parse HEAD^2` 等于 `S1`，即生成了合并提交），再 `libra tag -m v2.0 v2.0`（附注，指向合并提交）。「新增提交 `X`」按「共享测试夹具」的约定；所有命令须退出 0（执行条件））
 
@@ -443,9 +443,9 @@
 
 **Verification:**
 
-- [ ] 卡特有用例（AC1–AC8）：`source .env.test && cargo nextest run --test command_test -E 'test(=command::describe_test::contains_exact_tag_appends_caret_zero) or test(=command::describe_test::contains_merge_parent_not_exact) or test(=command::describe_test::test_describe_contains_names_relative_to_descendant_tag)'`（前两条 `(new)`，第三条为本卡修改的既有用例；`cargo nextest list` 须恰好列出这 3 条）
-- [ ] 非 nextest 门（TC-1031 / `t6120#27`）：`export TC_RUN_ID="desc-01-$(date -u +%Y%m%dT%H%M%SZ)-$$" TC_TMP_ROOT=/Volumes/Data/tmp/libra-testcases && cargo build --bin libra && LIBRA_BIN="$PWD/target/debug/libra" bash ../libra-testcases/cases/tc1031-describe-contains/tc1031-describe-contains.sh`（判据与记录项按 `DEP-DESC-TC`）
-- [ ] 共享回归组（不计入 G-03 VER）：`source .env.test && cargo nextest run --test command_test -E 'test(/^command::describe_test::/) or test(/^command::describe_long_test::/)'`
+- [x] 卡特有用例（AC1–AC8）：`source .env.test && cargo nextest run --test command_test -E 'test(=command::describe_test::contains_exact_tag_appends_caret_zero) or test(=command::describe_test::contains_merge_parent_not_exact) or test(=command::describe_test::test_describe_contains_names_relative_to_descendant_tag)'`（前两条 `(new)`，第三条为本卡修改的既有用例；`cargo nextest list` 须恰好列出这 3 条）
+- [x] 非 nextest 门（TC-1031 / `t6120#27`）：`export TC_RUN_ID="desc-01-$(date -u +%Y%m%dT%H%M%SZ)-$$" TC_TMP_ROOT=/Volumes/Data/tmp/libra-testcases && cargo build --bin libra && LIBRA_BIN="$PWD/target/debug/libra" bash ../libra-testcases/cases/tc1031-describe-contains/tc1031-describe-contains.sh`（判据与记录项按 `DEP-DESC-TC`）
+- [x] 共享回归组（不计入 G-03 VER）：`source .env.test && cargo nextest run --test command_test -E 'test(/^command::describe_test::/) or test(/^command::describe_long_test::/)'`
 
 **Full-suite trigger:** `T-1：本卡 patch + 1 修改 install.sh / install.ps1 版本面（C 组第 ④ 步在 bump 后跑双环境完整 nextest）` | **Dependencies:** `DEP-DESC-DOCS, DEP-DESC-COMPAT, DEP-DESC-TC`
 

@@ -384,7 +384,8 @@ async fn run_describe(args: DescribeArgs) -> Result<DescribeOutput, DescribeErro
 /// tag that descends from it. A Dijkstra-style walk runs backward from every tag
 /// commit; first-parent steps cost 1 and other-parent steps cost `MERGE_COST`,
 /// so the straightest path from the closest descendant tag wins. The resulting
-/// name is `<tag>` (the tag itself), `<tag>~<n>` (n first-parent steps), or a
+/// name is `<tag>^0` for an annotated tag pointing directly at the target,
+/// `<tag>` for a lightweight direct tag, `<tag>~<n>` (n first-parent steps), or a
 /// `<tag>~<n>^<m>~<k>` chain when the path crosses a merge's non-first parent.
 ///
 /// When `exact_match` is set (`--exact-match` or `--candidates 0`), only a tag
@@ -440,7 +441,7 @@ async fn run_describe_contains(
     // propagation state (base name + first-parent generation) for that seq.
     let mut heap: BinaryHeap<Reverse<(u64, u64)>> = BinaryHeap::new();
     let mut nodes: Vec<ObjectHash> = Vec::new();
-    let mut states: Vec<(String, u32)> = Vec::new();
+    let mut states: Vec<(String, u32, bool)> = Vec::new();
     // A commit is finalized the first time it is popped (lowest weight).
     let mut finalized: HashSet<ObjectHash> = HashSet::new();
 
@@ -452,7 +453,7 @@ async fn run_describe_contains(
     for (commit, info) in seeds {
         let seq = nodes.len() as u64;
         nodes.push(*commit);
-        states.push((info.name.clone(), 0));
+        states.push((info.name.clone(), 0, info.is_annotated));
         heap.push(Reverse((0, seq)));
     }
 
@@ -461,8 +462,10 @@ async fn run_describe_contains(
         if !finalized.insert(commit) {
             continue; // already finalized with a weight <= this one
         }
-        let (base, generation) = states[seq as usize].clone();
-        let display = if generation == 0 {
+        let (base, generation, annotated_seed) = states[seq as usize].clone();
+        let display = if weight == 0 && annotated_seed {
+            format!("{base}^0")
+        } else if generation == 0 {
             base.clone()
         } else {
             format!("{base}~{generation}")
@@ -477,9 +480,9 @@ async fn run_describe_contains(
                 .unwrap_or(&display)
                 .to_string();
             // `exact_match_only` is handled up front, so here the name may be
-            // relative; `exact_match` is true only when the target carries the
-            // tag directly (display has no `~`/`^` suffix).
-            let exact_match = display == tag;
+            // relative; `exact_match` is true only for a direct tag seed
+            // (`weight == 0`), even when an annotated seed renders as `<tag>^0`.
+            let exact_match = weight == 0;
             let output = DescribeOutput {
                 input,
                 resolved_commit,
@@ -512,14 +515,20 @@ async fn run_describe_contains(
             if finalized.contains(parent) {
                 continue;
             }
-            let (new_weight, new_base, new_gen) = if i == 0 {
-                (weight + 1, base.clone(), generation + 1)
+            let (new_weight, new_base, new_gen, new_annotated) = if i == 0 {
+                (weight + 1, base.clone(), generation + 1, false)
             } else {
-                (weight + MERGE_COST, format!("{display}^{}", i + 1), 0)
+                let propagated = if weight == 0 { &base } else { &display };
+                (
+                    weight + MERGE_COST,
+                    format!("{propagated}^{}", i + 1),
+                    0,
+                    false,
+                )
             };
             let next = nodes.len() as u64;
             nodes.push(*parent);
-            states.push((new_base, new_gen));
+            states.push((new_base, new_gen, new_annotated));
             heap.push(Reverse((new_weight, next)));
         }
     }

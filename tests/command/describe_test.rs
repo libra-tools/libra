@@ -552,7 +552,7 @@ fn test_describe_contains_names_relative_to_descendant_tag() {
     // The tagged commit prints the tag itself; ancestors print <tag>~<n>.
     let r2 = run_libra_command(&["describe", "--contains", &c2], p);
     assert_cli_success(&r2, "describe --contains c2");
-    assert_eq!(String::from_utf8_lossy(&r2.stdout).trim(), "v1.0");
+    assert_eq!(String::from_utf8_lossy(&r2.stdout).trim(), "v1.0^0");
     let r1 = run_libra_command(&["describe", "--contains", &c1], p);
     assert_cli_success(&r1, "describe --contains c1");
     assert_eq!(String::from_utf8_lossy(&r1.stdout).trim(), "v1.0~1");
@@ -746,6 +746,127 @@ fn test_describe_contains_exact_match_requires_direct_tag() {
             "exact-match must NOT use the contains-specific error ({flag:?}), got: {err}"
         );
     }
+}
+
+#[test]
+fn contains_exact_tag_appends_caret_zero() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    let head = |p: &std::path::Path| -> String {
+        String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], p).stdout)
+            .trim()
+            .to_string()
+    };
+
+    std::fs::write(p.join("c1.txt"), "c1").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "c1.txt"], p), "add c1");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c1", "--no-verify"], p),
+        "commit c1",
+    );
+    let c1 = head(p);
+    assert_cli_success(
+        &run_libra_command(&["tag", "-m", "release", "v1.0"], p),
+        "annotated tag v1.0",
+    );
+
+    std::fs::write(p.join("c2.txt"), "c2").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "c2.txt"], p), "add c2");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c2", "--no-verify"], p),
+        "commit c2",
+    );
+    let c2 = head(p);
+    assert_cli_success(&run_libra_command(&["tag", "lw"], p), "lightweight tag lw");
+
+    assert_cli_success(
+        &run_libra_command(&["switch", "--detach", &c1], p),
+        "detach at c1",
+    );
+
+    let implicit = run_libra_command(&["describe", "--contains"], p);
+    assert_cli_success(&implicit, "describe --contains");
+    assert_eq!(String::from_utf8_lossy(&implicit.stdout).trim(), "v1.0^0");
+
+    let explicit = run_libra_command(&["describe", "--contains", &c1], p);
+    assert_cli_success(&explicit, "describe --contains c1");
+    assert_eq!(String::from_utf8_lossy(&explicit.stdout).trim(), "v1.0^0");
+
+    let lightweight = run_libra_command(&["describe", "--contains", &c2], p);
+    assert_cli_success(&lightweight, "describe --contains c2");
+    assert_eq!(String::from_utf8_lossy(&lightweight.stdout).trim(), "lw");
+
+    let json = run_libra_command(&["describe", "--contains", "--json", &c1], p);
+    assert_cli_success(&json, "describe --contains --json c1");
+    let json = parse_json_stdout(&json);
+    assert_eq!(json["data"]["result"], "v1.0^0");
+    assert_eq!(json["data"]["tag"], "v1.0");
+    assert_eq!(json["data"]["exact_match"], true);
+}
+
+#[test]
+fn contains_merge_parent_not_exact() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    let head = |p: &std::path::Path| -> String {
+        String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], p).stdout)
+            .trim()
+            .to_string()
+    };
+    let main_branch =
+        String::from_utf8_lossy(&run_libra_command(&["branch", "--show-current"], p).stdout)
+            .trim()
+            .to_string();
+
+    assert_cli_success(&run_libra_command(&["branch", "side"], p), "branch side");
+    std::fs::write(p.join("m1.txt"), "m1").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "m1.txt"], p), "add m1");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "m1", "--no-verify"], p),
+        "commit m1",
+    );
+
+    assert_cli_success(&run_libra_command(&["switch", "side"], p), "switch side");
+    std::fs::write(p.join("s0.txt"), "s0").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "s0.txt"], p), "add s0");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "s0", "--no-verify"], p),
+        "commit s0",
+    );
+    std::fs::write(p.join("s1.txt"), "s1").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "s1.txt"], p), "add s1");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "s1", "--no-verify"], p),
+        "commit s1",
+    );
+    let s1 = head(p);
+
+    assert_cli_success(
+        &run_libra_command(&["switch", &main_branch], p),
+        "switch main",
+    );
+    assert_cli_success(&run_libra_command(&["merge", "side"], p), "merge side");
+    assert_cli_success(
+        &run_libra_command(&["tag", "-m", "release", "v2.0"], p),
+        "annotated tag v2.0",
+    );
+    let second_parent = run_libra_command(&["rev-parse", "HEAD^2"], p);
+    assert_cli_success(&second_parent, "rev-parse HEAD^2");
+    assert_eq!(String::from_utf8_lossy(&second_parent.stdout).trim(), s1);
+
+    let output = run_libra_command(&["describe", "--contains", &s1], p);
+    assert_cli_success(&output, "describe --contains s1");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "v2.0^2");
+
+    let s1_parent = format!("{s1}~1");
+    let parent = run_libra_command(&["describe", "--contains", &s1_parent], p);
+    assert_cli_success(&parent, "describe --contains s1~1");
+    assert_eq!(String::from_utf8_lossy(&parent.stdout).trim(), "v2.0^2~1");
+
+    let json = run_libra_command(&["describe", "--contains", "--json", &s1], p);
+    assert_cli_success(&json, "describe --contains --json s1");
+    let json = parse_json_stdout(&json);
+    assert_eq!(json["data"]["exact_match"], false);
 }
 
 /// `describe --contains` over a merge: the first-parent ancestor is named
