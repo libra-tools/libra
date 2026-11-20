@@ -1281,7 +1281,7 @@ FIX08采纳候选待双审；Mega109/活动108、Libra26/活动25、联合135/�
 
 | 计划 | 类别 | 状态 | 一句话进度（卡片状态） |
 |---|---|---|---|
-| [`plan-20261120-ui-real-data.md`](plan-20261120-ui-real-data.md) | D（`libra ui` 桌面窗口真实数据接入） | 未启动 | 7 张活动卡 `UID-01`..`UID-07` 全部 `pending` / 验收空；计划文本 R1/R2/R3 三轮双评均 FAIL 已修订至第四版，R4 待审；串行链 `UID-01 → UID-02 → UID-03 → UID-04 → UID-05 → UID-06 → UID-07`；链首 `UID-01` 只读数据接缝；`UID-02`..`UID-05` 命中 `T-1`（共享读 API 提升）；无 `EX-*`、无 `REL-*`、全串行发布；内嵌演示数据随对应卡删除 |
+| [`plan-20261120-ui-real-data.md`](plan-20261120-ui-real-data.md) | D（`libra ui` 桌面窗口真实数据接入） | 未启动 | 7 张活动卡 `UID-01`..`UID-07` 全部 `pending` / 验收空；计划文本 R1–R4 四轮双评均 FAIL 已修订至第五版，R5 待审；串行链 `UID-01 → UID-02 → UID-03 → UID-04 → UID-05 → UID-06 → UID-07`；链首 `UID-01` 只读数据接缝；`UID-02`..`UID-05` 命中 `T-1`（共享读 API 提升）；无 `EX-*`、无 `REL-*`、全串行发布；内嵌演示数据随对应卡删除 |
 | [`plan-20261117-branch.md`](plan-20261117-branch.md) | Git 兼容（`branch`） | 已排期 | 35 张活动卡：`BR-01` 已 `done`/`complete`（`0.30.212`；Codex R4 PASS），其余 `pending`；计划文本 Claude R8 + Codex R8 双审 PASS（受审 SHA-256 前 12 位 `ea135d1e7ecd`）。链首 `BR-01` 已完成；`BR-17`/`BR-21`/`BR-09` 的完整上游脚本 setup 分别受 `#686`/`#556`/`#675` 等外部 Issue 影响，`issues/541` 只影响上游脚本 setup，不阻塞 `BR-03` 本地聚焦验收；`#676` 为完整 `t3204` 前置。 |
 | [`plan-20261117-checkout-switch-restore.md`](plan-20261117-checkout-switch-restore.md) | Git 兼容（`checkout`/`switch`/`restore`） | 已排期 | 38 张活动任务卡全部 `pending`；Claude R11 + Codex R11 双审 PASS（`fd3f96ccd547`）。链首 `CSR-01` 可开工；`CSR-21` 等受 `merge-pull` 的 `MP-17..MP-25` 写集顺序门控，`restore` 卡与 `worktree` 计划共享写集。 |
 | [`plan-20261117-clone.md`](plan-20261117-clone.md) | Git 兼容（`clone`） | 已排期 | 27 张活动任务卡：`CL-01`、`CL-02` 已 `done`/`complete`（`0.30.211`、`0.30.213`），其余 `pending`；Claude R73 + Codex R73 双审 PASS（`189cec976839`）。链首 `CL-01` 已完成；`CL-14` 等 `PM-06`，`CL-05/10/13/19/20/21/24/29` 等 `fetch-push` 的 `FP-07`/`FP-15` 单向合入。 |
@@ -1480,7 +1480,7 @@ FIX08采纳候选待双审；Mega109/活动108、Libra26/活动25、联合135/�
 
 **20261117 批次：** 15 份 `plan-20261117-*.md` 均为“已排期；除 `WC-11a`/`WC-11b`/`WC-11R` 为 `blocked` 外，活动卡均 pending”，逐计划状态见 `## 一、计划一览` 的 `### 20261117 批次`；可立即开工的入口卡见 `## 四·零`。本节下方列表为旧快照，未逐项重排。
 
-**2026-11-20 `libra ui` 真实数据接入：** [`plan-20261120-ui-real-data.md`](plan-20261120-ui-real-data.md) 为新建设计计划，`UID-01`..`UID-07` 全部 `pending` / 验收空；本轮只写计划，不表示任何窗口数据已接入。R3 双评 FAIL 已再修订至第四版（双连接注入并移除内部 open、补 `agent/mod.rs`、关闭 ADR/AC 对齐、freshness 保留全源成本、op revision token、run 打开句柄有界读 + truncated、按连接 schema 检查 + Capture 自身 `schema_versions`、权限前置探测、AC 具名 test fn、守卫正则、DEP 消费者/README 窗口/页面数），R4 复审待。开工门为 R4 review `PASS` 与维护者授权，`UID-01` 是唯一链首；七卡实现写集相交于 `src/gui/desktop.rs`、`src/gui/data/mod.rs`、`docs/commands/ui.md` 与 `COMPATIBILITY.md`，按 ER-12 全串行发布。
+**2026-11-20 `libra ui` 真实数据接入：** [`plan-20261120-ui-real-data.md`](plan-20261120-ui-real-data.md) 为新建设计计划，`UID-01`..`UID-07` 全部 `pending` / 验收空；本轮只写计划，不表示任何窗口数据已接入。R4 双评 FAIL 已再修订至第五版（dirty 改 stat-only 不哈希、关闭改 controller 记录 + `gui::run` 持有 handle、op 改 id 快照、权限改读打开探测、run 改解析上限 500 + 每 kind 100 + truncated、History 改 commit-keyed 批量归属、catalog 迁移序列固定、AC 去 panic 捆绑 + 逐卡映射、每卡登记 DEP-03/04、DEP-UID-05 改行为门、锚点/landing 计数修正），R5 复审待。开工门为 R5 review `PASS` 与维护者授权，`UID-01` 是唯一链首；七卡实现写集相交于 `src/gui/desktop.rs`、`src/gui/data/mod.rs`、`docs/commands/ui.md` 与 `COMPATIBILITY.md`，按 ER-12 全串行发布。
 
 [Memory benchmark 平台接入计划](plan-20261103.md)为新增设计项，BM-00..07 全部 pending；本轮只写计划，不表示已部署平台、接入模型或完成质量评测。
 

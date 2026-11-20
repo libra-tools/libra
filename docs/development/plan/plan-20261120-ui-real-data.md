@@ -2,7 +2,7 @@
 
 **模板版本:** `v2.16`（本计划未具名 `code-only`，按自身默认发布合同执行：每张实现卡 `patch + 1`、完整 C/D、ER-05 review 与 ER-13/ER-14 分层测试。）
 
-**状态:** 设计计划（草案，R1/R2/R3 三轮双评 FAIL 后修订至第四版，待 R4 复审）。七张活动卡 `UID-01`..`UID-07` 全部 `pending` / 验收空；本文件只规划任务，不宣称任何数据已接入窗口。
+**状态:** 设计计划（草案，R1–R4 四轮双评 FAIL 后修订至第五版，待 R5 复审）。七张活动卡 `UID-01`..`UID-07` 全部 `pending` / 验收空；本文件只规划任务，不宣称任何数据已接入窗口。
 
 **卡 ID 前缀说明:** 使用 `UID-`（UI Desktop）以区别于 `issues/479` 已占用的 `UI-01`..`UI-03`。
 
@@ -34,7 +34,7 @@
 ### 成功定义
 
 - 在仓库内启动 `libra ui` 时，六个数据表面与可用性状态面显示仓库真实数据；仓库外启动时窗口正常打开并显示明确空状态，不报错退出。
-- 所有仓库 I/O 在单一后台 worker 上执行，GPUI 主线程不阻塞；读取全程不写仓库（无 operation 行、无 schema 升级、无 writer boundary）。
+- 所有仓库 I/O 在单一后台 worker 上执行，GPUI 主线程不阻塞；读取全程不写仓库（无 operation 行、无 schema 升级、无 writer boundary、无 conversion 证书写入）。
 - 失败路径按 ADR-UID-06 的分类矩阵呈现（源级与条目级分开），不 panic、不静默降级成演示数据。
 - 每卡同步 EN+zh 命令文档、开发文档、`docs/development/commands/README.md`、兼容矩阵与网站页面；网站 `cf` typecheck/build、Claude Code PASS 与部署检查通过。
 - 计划完成判据全部满足（见「完成判据」）。
@@ -47,8 +47,8 @@
 |---|---|---|
 | 代码入口 | `libra ui` 由进程入口在主线程识别并调用 `gui::run` | `src/main.rs:539`、`src/main.rs:646`、`src/cli.rs:1401` |
 | 代码入口 | `gui::run` 定义（GPUI 主线程） | `src/gui/mod.rs:30` |
-| 代码入口 | 调度器路径的 `ui` 永远返回 `LBR-UNSUPPORTED-001` | `src/command/ui.rs:42`、`src/cli.rs:4012` |
-| 代码入口 | `ui` 的 preflight 为 `none()`、scope 为 `ReadOnly`、豁免自动升级检查 | `src/cli.rs:1884`、`src/cli.rs:2266`、`src/cli.rs:3918` |
+| 代码入口 | 调度器路径的 `ui` 永远返回 `LBR-UNSUPPORTED-001` | `src/command/ui.rs:42`、`src/cli.rs:4008` |
+| 代码入口 | `ui` 的 preflight 为 `none()`、scope 为 `ReadOnly`、豁免自动升级检查 | `src/cli.rs:1880`、`src/cli.rs:2262`、`src/cli.rs:3914` |
 | 数据/状态 | 窗口数据是内嵌演示目录，不读仓库 | `src/gui/model.rs:14`、`src/gui/view.rs:1` |
 | 数据/状态 | 演示目录另有 `search` 与 `capabilities` 两个消费者 | `src/gui/screens/search.rs:56`、`src/gui/screens/capabilities.rs:14` |
 | 数据/状态 | History 提交表是静态常量 `COMMITS` | `src/gui/screens/history.rs:20` |
@@ -57,28 +57,27 @@
 | 数据/状态 | 窗口状态只有 `Desktop` 的页面/选择/输入字段 | `src/gui/desktop.rs:145`、`src/gui/desktop.rs:55` |
 | 数据/状态 | `RequestScope` 解析与 scope pin API | `src/internal/worktree_scope.rs:80`、`src/internal/worktree_scope.rs:226` |
 | 数据/状态 | Agent session/checkpoint 目录已拆分到 `.libra/private/capture.db` | `src/command/maintenance.rs:3558`、`sql/migrations/2026111601_capture_database.sql:304` |
-| 数据/状态 | capture 库只读打开 API、库路径与错误消息 | `src/internal/ai/capture/store.rs:93`、`:41`、`:98`、`:807` |
+| 数据/状态 | capture 库只读打开 API（真正 read-only）、库路径与错误消息 | `src/internal/ai/capture/store.rs:93`、`:796`、`:41`、`:98`、`:808` |
 | 数据/状态 | capture 库会话/checkpoint/事件/归属表 | `sql/migrations/2026111601_capture_database.sql:304`、`:135`、`:57`、`:329` |
-| 数据/状态 | `session_page_sql` 是命令层 `pub(super)` helper（生产路径仅 session.rs；checkpoint 的复用只在测试里） | `src/command/agent/session.rs:390`、`src/command/agent/checkpoint.rs:1826`、`:3291` |
+| 数据/状态 | `session_page_sql` 是命令层 `pub(super)` helper | `src/command/agent/session.rs:390` |
 | 数据/状态 | `mod session` 在 agent 模块内是私有的 | `src/command/agent/mod.rs:48` |
-| 数据/状态 | 会话↔提交链接 helper 接收注入连接，但内部仍会 `open_cached_repository` | `src/command/agent/session.rs:763`、`:799` |
+| 数据/状态 | 会话↔提交链接 helper 接收注入连接，但内部仍会 `open_cached_repository`；方向是 session→commits | `src/command/agent/session.rs:763`、`:800` |
 | 数据/状态 | 文件会话存储 `SessionStore` 会在 `load()` 时迁移旧格式（有副作用） | `src/internal/ai/session/store.rs:29`、`:377` |
-| 数据/状态 | memory episode 读面：`list_episodes` 无 limit，子表按 repo 全量取，freshness 用全源指纹 | `src/internal/ai/memory/reader.rs:198`、`:315`、`:165` |
+| 数据/状态 | memory episode 读面：`list_episodes` 无 limit，子表按 repo 全量取，freshness 成本随链接 operation 数增长 | `src/internal/ai/memory/reader.rs:198`、`:315`、`:165`、`:384` |
 | 数据/状态 | memory 全源指纹由投影写入 | `src/internal/ai/memory/projection.rs:183` |
-| 数据/状态 | operation v2 存储 API；head 按 scope 记录 | `src/internal/operation/store.rs:330`、`:949` |
+| 数据/状态 | operation v2 存储 API；head 按 scope 记录；`end_ts` 可在 head 不变时改变 | `src/internal/operation/store.rs:330`、`:949`、`:757` |
 | 数据/状态 | operation 历史查询是命令层私有 helper：ranked CTE + COUNT + 外层 OFFSET，按可变 `end_ts` 排序 | `src/command/op.rs:642`、`:651`、`:662`、`:693` |
 | 数据/状态 | CLI 分页从第 1 页开始 | `src/command/op.rs:251` |
-| 数据/状态 | review/investigate run 落盘目录 `.libra/sessions/agent-runs/<run_id>/` | `src/internal/ai/review/mod.rs:6` |
-| 数据/状态 | run 列表 API 会跳过不可解析项；逐项读取用无上限 `fs::read` | `src/internal/ai/review/store.rs:882`、`:1226`、`src/internal/ai/investigate/store.rs:935` |
+| 数据/状态 | review/investigate run 共享 `.libra/sessions/agent-runs/<run_id>/`，按 `state.json` 的 `created_at`/`started_at` 排序并各自过滤 kind | `src/internal/ai/review/mod.rs:6`、`src/internal/ai/review/store.rs:878`、`src/internal/ai/investigate/store.rs:932` |
+| 数据/状态 | run 逐项读取用无上限 `fs::read` | `src/internal/ai/review/store.rs:1226` |
 | 数据/状态 | 屏幕静态 run 字面量 | `src/gui/screens/reviews.rs:31`、`src/gui/screens/investigate.rs:29` |
 | 数据库连接 | `get_db_conn_instance()` 失败即 panic | `src/internal/db.rs:608` |
-| 数据库连接 | 显式路径连接默认允许 schema 升级 | `src/internal/db.rs:624`、`:635` |
-| 数据库连接 | 无 schema 管理连接（可传 busy timeout；仍是读写打开） | `src/internal/db.rs:217`、`:274` |
-| 数据库连接 | `open_database_without_migrations`（跳过迁移；也是读写打开） | `src/internal/db.rs:874` |
-| 数据库连接 | 连接失败被包装为 `io::Error::other` | `src/internal/db.rs:274`、`src/internal/ai/capture/store.rs:807` |
-| 数据库连接 | 按连接检查 schema 的 API；按角色的 API 拒绝 Capture 角色 | `src/internal/db/schema.rs:381`、`:871`、`:877` |
-| 数据库连接 | CLI 对只读命令关闭升级的入口（窗口路径绕过） | `src/cli.rs:3777` |
+| 数据库连接 | 显式路径连接默认允许 schema 升级；连接失败被包装为 `io::Error::other` | `src/internal/db.rs:624`、`:635`、`:274` |
+| 数据库连接 | 无 schema 管理连接（可传 busy timeout；读写打开） | `src/internal/db.rs:217` |
+| 数据库连接 | 按连接检查 schema 的 API；按角色 API 拒绝 Capture 角色 | `src/internal/db/schema.rs:381`、`:871`、`:877` |
+| 数据库连接 | CLI 对只读命令关闭升级的入口（窗口路径绕过） | `src/cli.rs:3773` |
 | 仓库定位 | `storage_path()`/`working_dir()` 在仓库外 panic；`try_get_storage_path` 返回错误 | `src/utils/util.rs:1262`、`:1269`、`:1464` |
+| 工作树状态 | `changes_to_be_staged` 在 stat 证据不足时会做内容哈希并写 conversion 证书 | `src/command/status.rs:1146`、`:1570`、`:1586`、`src/utils/worktree_conversion.rs:444` |
 | 用户命令 | `libra ui` 不读取也不写入仓库 | `docs/commands/ui.md:47` |
 | 文档 | 开发文档把「接真实数据」列为未实现项 | `docs/development/commands/ui.md:37` |
 | 文档 | 开发文档索引仍写 "Needs no repository" | `docs/development/commands/README.md:85` |
@@ -109,7 +108,7 @@
 | [`plan-20260926.md`](plan-20260926.md) | 前置（incoming）：memory episode 只读投影 API | 只消费 `memory` 读面（`DEP-UID-02`） |
 | `plan-20261117-*.md`（15 份 Git 兼容计划） | 写集协调（incoming）：`COMPATIBILITY.md`、`docs/commands/`、`docs/development/commands/README.md`、网站 `commands/` 页面 | 按 ER-12 串行窗口写入（`DEP-UID-03`） |
 | `../libra-backend` | 网站文档交付（incoming） | 每卡同步 `commands/ui.en.md`、`cf` typecheck/build、Claude Code PASS 与部署检查（`DEP-UID-04`） |
-| 本次 `libra ui` 全局 flag 修复 | 基线前置（incoming） | 开工前确认 main 上的 `ui_window_launch` 使用 clap 解析（`DEP-UID-05`） |
+| `libra ui` 全局 flag 修复 | 基线前置（incoming） | 开工前确认该行为已合入 main（`DEP-UID-05`，按行为判定） |
 | `plan-status.md` | 协调者共享写集 | 每卡推进必须在同一变更更新对应行与 §五/§六 登记 |
 | `docs/development/commands/ui.md` | 命令开发事实源 | 更新其「当前状态 / 还未实现的功能」章节 |
 | [`docs/development/internal/stats.md`](../internal/stats.md) | 统计面事实源 | 只登记 UI 消费哪些统计字段，不改统计口径 |
@@ -120,14 +119,14 @@
 |---|---|---|
 | 合理性 | 值得做：窗口已是默认构建的一部分，但只显示演示数据 | 无 |
 | 可行性 | 可拆：接缝卡 + 六个表面卡，每卡单轴、M 规模 | 按表面拆成 7 卡 |
-| 任务卡粒度 | 三轮发现 AC 捆绑、计数口径、测试路径不可选 | AC 单一谓词 + 具名 test fn（`gui::data::tests::*`）；矩阵移入 ADR |
-| 依赖与顺序 | 发现写集相交未入图、DEP 粒度/消费者错误 | 补齐串行链与文件级写集窗口；修正消费者 |
+| 任务卡粒度 | 四轮发现 AC 捆绑、计数口径、测试路径与映射 | AC 单一谓词 + 具名 test fn + 逐卡 AC→test 映射；矩阵移入 ADR |
+| 依赖与顺序 | 发现写集相交未入图、DEP 粒度/消费者错误 | 补齐串行链与文件级写集窗口；修正消费者；每卡登记 DEP-03/04 |
 | 完整性 | 补齐共享读 API 提升写集（含 `agent/mod.rs`）、`T-1` 门、D 组 job 清单 | 见各卡与 ER-04 |
-| 安全性 | 只读面、fail-closed、redaction 复用、scope pin、错误保留与脱敏 | 见 GC-UID-02/04 与 ADR-UID-06 |
-| 功能正确性 | 源级/条目级状态分离；History 归属与父链真实化；分页 revision token | 见 ADR-UID-06 与各卡 AC |
+| 安全性 | 只读面、fail-closed、redaction、scope pin、错误分类与脱敏 | 见 GC-UID-02/04 与 ADR-UID-06 |
+| 功能正确性 | 源级/条目级状态分离；History 归属与父链；分页 id 快照；run 解析上限 | 见 ADR-UID-06 与各卡 AC |
 | 接口兼容 | 不新增 CLI flag、不改退出码；提升 API 保持 CLI 输出 | 见各卡 Verification |
-| 数据流与控制流 | worker deadline + 取消标志 + scope pin + 有界读取 | 见 ADR-UID-01 |
-| 性能与容量 | 按既有 API 真实成本写契约（不做虚假 O(200) 承诺；freshness 保留全源成本） | 见「性能与容量摘要」 |
+| 数据流与控制流 | worker deadline + 取消 + scope pin + 有界读取 + stalled 归属 | 见 ADR-UID-01 |
+| 性能与容量 | 按既有 API 真实成本写契约（dirty 不哈希、freshness 全源成本、run 解析上限） | 见「性能与容量摘要」 |
 | 可靠性与容错 | 损坏 run 逐项隔离；worker 停滞有预算与归属 | 见故障恢复矩阵 |
 | 可维护性 | 共享读 API 提升为单一事实源 | 见 GC-UID-03 |
 
@@ -137,44 +136,47 @@
 |---|---|---|---|---|
 | 2026-11-20 17:10:00 UTC | 自审（成稿） | 首版：6 卡、5 项 ADR、5 项依赖、串行发布 | N/A | 实施顺序、依赖登记表、粒度审计表 |
 | 2026-11-20 18:05:00 UTC | Codex R1 FAIL + Claude R1 FAIL | 拆 Operations/Memory；卡 ID 改 `UID-*`；AC 逐谓词；补串行依赖边；补共享读 API 提升与 `T-1`；D 组补 `release.yml`；rollback 改 `compensating`；DEP 补证据与失败路径；修正锚点与计数；补守卫命令；补 §五/§六/plan-long 登记 | `UI-01..UI-06` → `UID-01..UID-07` | 实施顺序、依赖登记表、粒度审计表、测试矩阵、追溯表、里程碑、风险表 |
-| 2026-11-20 19:10:00 UTC | Codex R2 FAIL + Claude R2 FAIL | 注入连接 + `open_connection_without_schema_management(busy_timeout)`；scope pin；memory 伴生有界 API（不改原签名）；op 真实成本 + head pin；run 目录/字节上限；源级/条目级状态分离；D 组枚举实际 job；守卫改具体模式；`op log`、相对路径、prod-file 计数、DEP 粒度与等待上限；补偿演练收口一次 | `UID-04`/`UID-05` 口径调整 | 各卡 AC/VER/写集、ADR、ER-04/ER-06a、依赖登记表、粒度审计表、性能摘要、故障矩阵 |
-| 2026-11-20 20:05:00 UTC | Codex R3 FAIL + Claude R3 FAIL | 归属双连接注入并移除内部 `open_cached_repository`；补 `agent/mod.rs` 写集与计数；关闭 ADR/AC 对齐（预算内结束或记录 stalled，窗口不阻塞）；memory freshness 保留全源成本、只做页内行/子表有界；op 分页改 revision token（全 scope head 集 + 行数 + max `end_ts`，同事务读取，页从 1 起）；run 改为打开句柄的有界读 + 全目录扫描后取最新 100（扫描上限 5000 + truncated 指示）；schema 检查用按连接 API，Capture 角色读自身 `schema_versions`；权限错误前置探测保留 `io::ErrorKind` 并脱敏；AC 重新拆分并给具名 test fn；守卫正则 `\b(rv|iv)-[0-9a-f]{6}\b`；修正 DEP 消费者、README 写集窗口、DEFER 页面数；补回「非目标与延后项」「完成判据」章节 | `UID-02`/`UID-03` 计数与写集调整 | 各卡 AC/VER/写集、ADR-UID-01/03/06、依赖登记表、粒度审计表、性能摘要、故障矩阵、§五/§六 |
+| 2026-11-20 19:10:00 UTC | Codex R2 FAIL + Claude R2 FAIL | 注入连接 + busy timeout、scope pin、memory 伴生 API、op 真实成本、run 目录/字节上限、源级/条目级状态分离、D 组枚举 job、守卫具体模式、`op log`、相对路径、计数、DEP 粒度、补偿演练收口一次 | `UID-04`/`UID-05` 口径调整 | 各卡 AC/VER/写集、ADR、ER-04/ER-06a、依赖登记表、粒度审计表、性能摘要、故障矩阵 |
+| 2026-11-20 20:05:00 UTC | Codex R3 FAIL + Claude R3 FAIL | 双连接注入并移除内部 open；补 `agent/mod.rs`；关闭 ADR/AC 对齐；freshness 保留全源成本；op head pin；run 打开句柄有界读；按连接 schema 检查 + Capture 自身 `schema_versions`；权限前置探测；AC 具名 test fn；守卫正则；DEP 消费者/README 窗口/页面数；补回「非目标与延后项」「完成判据」 | `UID-02`/`UID-03` 计数与写集调整 | 各卡 AC/VER/写集、ADR、依赖登记表、粒度审计表、性能摘要、故障矩阵、§五/§六 |
+| 2026-11-20 21:20:00 UTC | Codex R4 FAIL + Claude R4 FAIL | dirty 改为不哈希的 stat-only 摘要（避免 conversion 证书写入）；关闭归属改为 controller 记录 + `gui::run` 持有 handle；op 分页改 id 快照；权限分类改用读打开探测；run 改为解析上限 500 + 每 kind 最新 100 + truncated；History 归属改 commit-keyed 批量查询；`catalog()` 迁移序列改为 UID-03 保留、UID-07 删除（含 search 写集）；AC 去除 panic 捆绑并逐卡加 AC→test 映射；每卡登记 DEP-03/04；DEP-UID-05 改行为判定；修正锚点漂移与 landing 计数；ADR-UID-02 区分 capture 只读与 repo 读写 | `UID-02`/`UID-07` 写集与计数调整 | 各卡 AC/VER/写集、ADR-UID-01/02/03/06、依赖登记表、粒度审计表、性能摘要、故障矩阵 |
 
 ## 已决议设计决策
 
 ### ADR-UID-01: 窗口数据经单一后台 worker 读取，主线程只渲染快照
 
 - **Status:** Accepted
-- **Context:** GPUI 必须占用进程主线程（`src/gui/mod.rs:30`）；读取涉及 SQLite、对象库与文件系统；`storage_path()`/`working_dir()` 在仓库外 panic（`src/utils/util.rs:1269`、`:1464`）；既有读面多为 async API。
-- **Decision:** `src/gui/data/` 提供一个常驻 `std::thread` worker：线程内建立**一个长期存在的 current-thread Tokio runtime** 执行 async 读 API，并用 `WorktreeScope::pin_request_scope`（`src/internal/worktree_scope.rs:226`）固定仓库 scope。连接由调用方注入：仓库库用 `open_connection_without_schema_management(path, busy_timeout ≤2s)`（`src/internal/db.rs:217`），capture 库用 `open_readonly`（`src/internal/ai/capture/store.rs:93`）；worker 不调用 `get_db_conn_instance()`。每次请求带 deadline（busy timeout + 行/字节上限）；worker 在请求边界检查取消标志。窗口关闭时置取消标志，并在关闭预算 3s 内等待；若某次阻塞读仍超出 deadline，worker 记录 `worker stalled` 状态后结束，**surviving 线程由 worker handle 持有**（不 detach；进程退出时由 OS 回收），窗口在预算内返回、不阻塞主线程。
-- **Alternatives considered:** GPUI executor 上做 I/O（仍受主线程调度）；每次操作新建 runtime（启动成本与线程泄漏）。
-- **Consequences:** 引入 supersession、取消、scope pin 与 stalled 归属语义；禁止主线程直接调用 `storage_path()`/`get_db_conn_instance()`；数据层测试必须无显示器且能注入慢读。
+- **Context:** GPUI 必须占用进程主线程（`src/gui/mod.rs:30`）；读取涉及 SQLite、对象库与文件系统；`storage_path()`/`working_dir()` 在仓库外 panic（`src/utils/util.rs:1269`、`:1464`）；既有读面多为 async API；`std::thread` 的 `join` 无超时，阻塞读无法被中断。
+- **Decision:** `src/gui/data/` 提供一个常驻 `std::thread` worker：线程内建立**一个长期存在的 current-thread Tokio runtime** 执行 async 读 API，并用 `WorktreeScope::pin_request_scope`（`src/internal/worktree_scope.rs:226`）固定仓库 scope。连接由调用方注入：仓库库用 `open_connection_without_schema_management(path, busy_timeout ≤2s)`（`src/internal/db.rs:217`），capture 库用真正只读的 `open_readonly`（`src/internal/ai/capture/store.rs:93`、`:796`）；worker 不调用 `get_db_conn_instance()`。每次请求带 deadline（busy timeout + 行/字节上限）；worker 在请求边界检查取消标志。关闭窗口时只有两种可声明结果：
+  (a) **joined**：worker 在关闭预算（3s）内结束；
+  (b) **stalled**：worker 仍在不可中断的阻塞读中，**由控制侧**（窗口关闭路径）记录 `worker stalled` 状态，线程 handle 由 `gui::run` 的局部作用域持有直到进程退出（不 detach、不等待），窗口在预算内返回、主线程不阻塞。
+- **Alternatives considered:** GPUI executor 上做 I/O（仍受主线程调度）；每次操作新建 runtime；在阻塞读上等待 join（无超时）。
+- **Consequences:** 引入 supersession、取消、scope pin 与 stalled 归属语义；禁止主线程直接调用 `storage_path()`/`get_db_conn_instance()`；数据层测试必须无显示器且能注入不可合作的慢读。
 - **Revisit when:** GPUI 提供稳定的后台 executor，或需要流式刷新（`DEFER-UID-02`）。
 
 ### ADR-UID-02: 只读边界——无 schema 管理、无 writer boundary、无 operation 行
 
 - **Status:** Accepted
-- **Context:** 显式路径连接默认允许 schema 升级（`src/internal/db.rs:624`）；CLI 对只读命令用 `set_schema_upgrade_allowed(false)`（`src/cli.rs:3777`），而窗口路径绕过 CLI preflight。
-- **Decision:** 窗口读取使用跳过 schema 管理的连接（`open_connection_without_schema_management`，可传 busy timeout）与 capture 库 `open_readonly`；这些连接仍以读写方式打开，但调用面**从不写**（不获取 writer boundary/lease、不写 operation journal、不触发迁移），只读性由调用面与判据保证。schema 落后/超前按 ADR-UID-06 分类显示，不自动迁移。
-- **Alternatives considered:** 复用 CLI preflight 全流程（会把迁移与锁语义带进窗口）；允许自动升级（只读命令改变磁盘状态）。
-- **Consequences:** 每卡必须提供"读后仓库状态不变"判据；升级动作留给 CLI。
+- **Context:** 显式路径连接默认允许 schema 升级（`src/internal/db.rs:624`）；CLI 对只读命令用 `set_schema_upgrade_allowed(false)`（`src/cli.rs:3773`），窗口路径绕过 CLI preflight；`changes_to_be_staged` 在 stat 证据不足时会写 conversion 证书（`src/command/status.rs:1586`、`src/utils/worktree_conversion.rs:444`）。
+- **Decision:** 窗口读取使用跳过 schema 管理的仓库连接（`open_connection_without_schema_management`，读写打开但从不写）与 capture 库真正只读的 `open_readonly`（`read_only(true)`）；不获取 writer boundary/lease、不写 operation journal、不触发迁移、**不使用会写证书的 `changes_to_be_staged`**（dirty 摘要只做 stat 级判定，见 `UID-07`）。schema 落后/超前按 ADR-UID-06 分类显示。
+- **Alternatives considered:** 复用 CLI preflight 全流程（会把迁移与锁语义带进窗口）；允许自动升级。
+- **Consequences:** 每卡必须提供"读后仓库状态不变"判据（schema receipt、operation head、conversion 证书）。
 - **Revisit when:** 窗口需要写操作（`DEFER-UID-01`）。
 
 ### ADR-UID-03: 单一事实源——共享读 API 提升，GUI 只做投影
 
 - **Status:** Accepted
-- **Context:** 需要复用的读逻辑部分是命令层私有 helper：`session_page_sql`（`src/command/agent/session.rs:390`，`pub(super)`）、会话↔提交链接（`:763`，内部仍会自开连接）、operation 历史查询（`src/command/op.rs:662`）、memory 读面（`src/internal/ai/memory/reader.rs:198`）。GUI 若自行复制会漂移（GC-02）。
-- **Decision:** 只做**可见性提升 + 连接注入 + 父模块导出**，不改变 SQL/语义：`session_page_sql` 与取行函数提升并在 `src/command/agent/mod.rs` 导出；`read_session_commit_links` 改为**双连接注入**（repo + capture），移除内部 `open_cached_repository`；`query_operation_log_page` 提升为 `pub(crate)`；memory 新增**伴生**有界读 API（保留 `list_episodes` 原签名）。GUI 只把结果转换为行类型。唯一允许 GUI 直接反序列化的是 run 的公开 wire 类型（`ReviewRunState`/`ReviewManifest` 等）——这是复用 wire 类型而非复制业务逻辑，用于实现有界读。
-- **Alternatives considered:** GUI 解析命令 stdout（需要 OutputConfig、易漂移）；GUI 复制 SQL（违反 GC-02）。
+- **Context:** 需要复用的读逻辑部分是命令层私有 helper：`session_page_sql`（`src/command/agent/session.rs:390`，`pub(super)`）、会话↔提交链接（`:763`，内部仍自开连接，方向是 session→commits）、operation 历史查询（`src/command/op.rs:662`）、memory 读面（`src/internal/ai/memory/reader.rs:198`）。GUI 若自行复制会漂移（GC-02）。
+- **Decision:** 只做**可见性提升 + 连接注入 + 父模块导出 + 方向补齐**，不改变 SQL/语义：`session_page_sql` 与取行函数提升并在 `src/command/agent/mod.rs` 导出；`read_session_commit_links` 改为双连接注入并移除内部 `open_cached_repository`；新增 commit-keyed 批量归属查询（`agent_session_commit` 按 commit id 集合一次查询），供 History 使用，避免 per-commit N+1；`query_operation_log_page` 提升为 `pub(crate)`；memory 新增**伴生**有界读 API（保留 `list_episodes` 原签名）。GUI 只把结果转换为行类型。唯一允许 GUI 直接反序列化的是 run 的公开 wire 类型——复用 wire 类型而非复制业务逻辑，用于实现有界读。
+- **Alternatives considered:** GUI 解析命令 stdout（需要 OutputConfig、易漂移）；GUI 复制 SQL（违反 GC-02）；按 commit 逐个调用 session-keyed 查询（N+1）。
 - **Consequences:** 提升卡必须证明 CLI 行为未变（既有命令测试），并按 ER-13 `T-1` 跑全量。
 - **Revisit when:** 某表面需要 CLI 独有输出布局。
 
 ### ADR-UID-04: 隐私与路径卫生
 
 - **Status:** Accepted
-- **Context:** Agent 会话内容可能含 secret 与主机绝对路径；ER-11 要求 sanitized 证据，窗口同样是用户可见面。
+- **Context:** Agent 会话内容可能含 secret 与主机绝对路径；ER-11 要求 sanitized 证据。
 - **Decision:** 显示前复用既有 redaction（`utils::redact` / `observed_agents::redaction`）；所有路径在快照边界转换为仓库相对路径（`session_page_sql` 的绝对 `working_dir` 与 capture 打开错误消息里的绝对路径都必须转换/脱敏）；快照不含原始 tool payload 全文，单条截断 ≤4 KiB。
-- **Alternatives considered:** 原样展示（泄漏风险）；GUI 内另写 redaction（重复实现）。
+- **Alternatives considered:** 原样展示；GUI 内另写 redaction。
 - **Consequences:** 部分内容被掩码；截断上限写入性能预算。
 - **Revisit when:** 远端/云数据进入窗口（`DEFER-UID-04`）。
 
@@ -182,58 +184,58 @@
 
 - **Status:** Accepted
 - **Context:** `libra ui` 可在任意目录启动；改为"必须有仓库"会破坏现有退出码与用户预期；`storage_path()`/`working_dir()` 在仓库外 panic。
-- **Decision:** 仓库定位只用 `RequestScope::try_resolve`（`src/internal/worktree_scope.rs:80`）与 `try_get_storage_path`（`src/utils/util.rs:1262`），不使用会 panic 的包装函数；找到仓库则加载数据，找不到则以空上下文启动。
-- **Alternatives considered:** 无仓库即退出（破坏现有行为）；新增 `--repo` 参数（推迟到 `DEFER-UID-03`）。
+- **Decision:** 仓库定位只用 `RequestScope::try_resolve`（`src/internal/worktree_scope.rs:80`）与 `try_get_storage_path`（`src/utils/util.rs:1262`）；找到仓库则加载数据，找不到则以空上下文启动。
+- **Alternatives considered:** 无仓库即退出；新增 `--repo` 参数（推迟到 `DEFER-UID-03`）。
 - **Consequences:** 每个表面必须实现空状态；空状态不得伪装成演示数据。
 - **Revisit when:** 引入 `libra ui <path>` 或多仓标签页。
 
 ### ADR-UID-06: 源级与条目级状态分类
 
 - **Status:** Accepted
-- **Context:** R1/R2/R3 发现同一缺失数据源被同时定义为错误和空状态；源级损坏与条目级损坏恢复语义不同；现有 open API 会把连接失败包装为 `io::Error::other`，`capture::open_readonly` 用 `is_file()` 会把不可访问父目录当作 NotFound。
+- **Context:** 同一缺失数据源曾被同时定义为错误和空状态；源级损坏与条目级损坏恢复语义不同；现有 open API 会把连接失败包装为 `io::Error::other`，`capture::open_readonly` 用 `is_file()` 会把不可访问父目录当作 NotFound。
 - **Decision:** 分类函数只返回以下状态，GUI 按返回值渲染：
 
-  - **源级**：`absent`（未创建 → 空状态）、`unreadable`（保留 `io::ErrorKind`，含 PermissionDenied → 类型化错误）、`corrupt`（库结构损坏 → 类型化错误）、`schema-old`（库版本低于二进制 → "用 CLI 升级"）、`schema-new`（库版本高于二进制 → "二进制过旧"）、`stale`（投影过期 → 提示 `libra memory rebuild`）。
+  - **源级**：`absent`（未创建 → 空状态）、`unreadable`（读打开探测保留 `io::ErrorKind`，含 PermissionDenied → 类型化错误）、`corrupt`（读打开成功但连接/结构失败 → 类型化错误）、`schema-old`（库版本低于二进制 → "用 CLI 升级"）、`schema-new`（库版本高于二进制 → "二进制过旧"）、`stale`（投影过期 → 提示 `libra memory rebuild`）。
   - **条目级**：`ok`、`malformed`（内容不可解析 → 该行不可读）、`oversized`（超过字节上限 → 该行标记超大）、`incomplete`（产物缺件 → 该行提示不完整）。
 
-  源级判定必须做**前置探测**：先 `std::fs::metadata` 保留 `NotFound`/`PermissionDenied`/其它 io kind，再打开；capture 打开错误消息在渲染前脱敏（去掉绝对路径）。schema 判定用按连接 API `inspect_schema_for_connection(conn, role)`（`src/internal/db/schema.rs:381`）；Capture 角色不被按角色 API 接受（`:877`），因此 capture 库的 `schema-old`/`schema-new` 由注入的 capture 连接读取其 `schema_versions` 判定。页面级状态不得自定义：过期映射到 `stale`，产物缺件映射到 `incomplete`。
-- **Alternatives considered:** 各页自定义语义（验收冲突）；一律报错（空仓库体验差）。
+  源级判定顺序：先 `std::fs::metadata`（保留 NotFound/PermissionDenied），再做**读打开探测**（`std::fs::File::open`）保留其 io kind，最后才打开数据库；数据库打开失败若读打开已成功则归类 `corrupt`。capture 打开错误消息在渲染前脱敏。schema 判定用按连接 API `inspect_schema_for_connection(conn, role)`（`src/internal/db/schema.rs:381`）；Capture 角色不被按角色 API 接受（`:877`），因此 capture 库的 `schema-old`/`schema-new` 由注入的 capture 连接读取其 `schema_versions` 判定。页面级状态不得自定义：过期映射到 `stale`，产物缺件映射到 `incomplete`。
+- **Alternatives considered:** 各页自定义语义；一律报错。
 - **Consequences:** 每卡 AC 只断言"分类函数返回并可渲染"，矩阵细节在本 ADR 而非 AC 中计数。
-- **Revisit when:** 引入远端数据源（网络不可达成为第七类源级状态，见 `DEFER-UID-04`）。
+- **Revisit when:** 引入远端数据源（网络不可达成为第七类源级状态）。
 
 ## 全局工程约束
 
-- **GC-01 现状核实前置:** 每个任务开工前重新核对计划、相关开发文档、用户文档、当前代码和测试。
-- **GC-02 单一事实源:** 状态机、schema、输出结构、权限策略、配置解析和共享 helper 必须有单一事实源。
-- **GC-03 Git 互操作与 Libra 扩展边界:** Git 兼容表面必须说明与 Git 的一致点和有意差异；Libra-only 表面必须说明替代工作流、用户影响和机器接口。
-- **GC-04 输出与错误契约:** 用户可见错误使用稳定 `LBR-*` 码并同步 `docs/error-codes.md`。
-- **GC-05 文档同步:** 命令或公开行为变化必须同步 `docs/commands/<cmd>.md`、zh-CN、开发文档、`COMPATIBILITY.md` 和测试索引。
-- **GC-06 测试索引:** 新增或重命名 `--test` target 必须更新 `tests/INDEX.md`。
+- **GC-01 现状核实前置:** 开工前重新核对计划、文档、代码与测试。
+- **GC-02 单一事实源:** 禁止 CLI、Web、Agent adapter 或测试 fixture 各自复制逻辑。
+- **GC-03 Git 互操作与 Libra 扩展边界:** 说明与 Git 的一致点与有意差异。
+- **GC-04 输出与错误契约:** 稳定 `LBR-*` 码并同步 `docs/error-codes.md`。
+- **GC-05 文档同步:** EN+zh、开发文档、`COMPATIBILITY.md` 与测试索引同卡同步。
+- **GC-06 测试索引:** 新增/重命名 `--test` target 必须更新 `tests/INDEX.md`。
 - **GC-07 安全默认值:** 未满足前置时默认 fail-closed。
-- **GC-08 原子性与恢复:** 必须定义事务边界、幂等键、崩溃窗口和回滚/前滚策略。
-- **GC-09 并发与资源生命周期:** 锁、CAS、lease、队列、子进程、连接池、临时目录必须有释放/恢复语义。
-- **GC-10 性能预算:** 不得引入无界扫描、无界内存或 N+1 调用；写出数据规模与断言。
-- **GC-11 生产 panic 禁止:** 生产路径不得新增裸 `unwrap()`、`expect()`、`panic!()`。
-- **GC-12 精确暂存:** 提交前只 `libra add <相关路径>`，不得使用 `commit -a`。
-- **GC-13 数据库迁移作用域与全局配置隔离:** 读路径按数据库角色区分并显式登记 allowlist：`Repository` = `.libra/libra.db`（只读、不迁移）、`Capture` = `.libra/private/capture.db`（只读打开）、`GlobalConfig`/`SystemConfig` = 配置库（只经既有只读配置读取）。每连接声明角色与迁移策略；仓库库的 schema 判定不得施加到配置库；测试使用隔离的 `LIBRA_CONFIG_GLOBAL_DB`/`LIBRA_CONFIG_SYSTEM_DB`。
+- **GC-08 原子性与恢复:** 定义事务边界、幂等键、崩溃窗口与回滚/前滚。
+- **GC-09 并发与资源生命周期:** 锁、CAS、lease、队列、子进程、连接池、临时目录必须有释放语义。
+- **GC-10 性能预算:** 不得引入无界扫描、无界内存或 N+1；写出规模与断言。
+- **GC-11 生产 panic 禁止:** 不得新增裸 `unwrap()`、`expect()`、`panic!()`。
+- **GC-12 精确暂存:** 只 `libra add <相关路径>`，不得 `commit -a`。
+- **GC-13 数据库迁移作用域与全局配置隔离:** 读路径按角色区分并登记 allowlist：`Repository` = `.libra/libra.db`（跳过 schema 管理、从不写）、`Capture` = `.libra/private/capture.db`（只读打开）、`GlobalConfig`/`SystemConfig` = 配置库（只读配置读取）。每连接声明角色与迁移策略；测试使用隔离的 `LIBRA_CONFIG_GLOBAL_DB`/`LIBRA_CONFIG_SYSTEM_DB`。
 
 **计划专属约束:**
 
 - **GC-UID-01 主线程零 I/O:** 所有读取经 `src/gui/data/` 的 worker（ADR-UID-01）。
-- **GC-UID-02 只读不写:** 不写 operation 行、不获取 writer boundary、不推进 schema 版本（ADR-UID-02）。
+- **GC-UID-02 只读不写:** 不写 operation 行、不获取 writer boundary、不推进 schema、不写 conversion 证书（ADR-UID-02）。
 - **GC-UID-03 不复制业务逻辑:** 复用既有或本卡提升的共享实现；唯一例外是 run 的公开 wire 类型反序列化（ADR-UID-03）。
 - **GC-UID-04 路径与隐私卫生:** 快照不含宿主绝对路径；redaction 复用；payload 截断（ADR-UID-04）。
-- **GC-UID-05 无演示兜底:** 不得回退到内嵌演示数据；`sessions.json` 与 `COMMITS` 常量在对应卡完成后删除。**过渡期例外**：`UID-03` 完成后 `model::catalog()` 仅保留给 `search`/`capabilities`（`DEFER-UID-05` 页面），Sessions 不得再调用；`UID-07` 移除该过渡接口。
-- **GC-UID-06 无显示器可测:** 数据层测试放在 `src/gui/data/tests.rs`（生产文件不含测试代码），路径为 `gui::data::tests::*`；屏幕模块可保留内联测试，其 panic 守卫不适用。窗口人工验收需要 macOS 桌面会话。
+- **GC-UID-05 无演示兜底:** 不得回退到内嵌演示数据。**迁移序列固定**：`UID-03` 让 Sessions 不再使用 `catalog()`，但保留 `sessions.json`/`catalog()` 给 `search`/`capabilities`（`DEFER-UID-05` 页面）；`UID-07` 删除 `sessions.json` 与 `catalog()` 并同步改写这两个消费者（`search.rs`/`capabilities.rs` 进 `UID-07` 写集）。
+- **GC-UID-06 无显示器可测:** 数据层测试放在 `src/gui/data/tests.rs`（生产文件不含测试代码），路径为 `gui::data::tests::*`；屏幕模块保留内联测试，其 panic 守卫不适用。窗口人工验收需要 macOS 桌面会话。
 - **GC-UID-07 文档同卡交付:** EN+zh、开发文档、`docs/development/commands/README.md`、兼容矩阵与网站页面同卡交付（ER-06a）。
 - **GC-UID-08 状态矩阵统一:** 所有表面按 ADR-UID-06 返回状态。
 
 ## 执行检查必备需求（强制）
 
-1. **ER-01 开工前安全检查:** `libra status --short --branch`，确认分支与工作区状态；默认在 `main` 上按卡直推。
+1. **ER-01 开工前安全检查:** `libra status --short --branch`；默认在 `main` 上按卡直推。
 2. **ER-02 先核对后实现:** 刷新源码/文档锚点、测试 target 与外部参照。
 3. **ER-03 粒度门禁:** 按 `G-*` 复核本卡 `Granularity` 行；范围扩大先拆卡。
-4. **ER-04 每卡验收门:** A 组（本卡 `Verification` 的 nextest 命令）+ B 组（`Task type`）+ C 组（发布收口）+ D 组（远端后置）累加。C 组按 ①版本面 parity → ②`patch + 1` 与三处版本面同步 → ③`cargo build` 由工具链刷新 `Cargo.lock` → ④bump 后重跑 fmt + 严格 Clippy + 本卡 A 组（`Full-suite trigger` 命中时改跑双环境全量 nextest）→ ⑤`cargo build --release` → ⑥安装 → ⑦`libra add <相关路径>` + `libra commit -s` → ⑧推送 `main` → ⑨`gh release create v<version>`。D 组逐 job 登记并取证：`base.yml`（push `main`）的 `format`/`clippy`/`redundancy`/`test`；`codeql.yml`（push `main`）的 `analyze`；`release.yml`（push `v*` tag）的 `build-and-upload`（四平台 leg）/`upload-install-scripts`/`update-homebrew-tap`/`verify-homebrew-formula`/`request-stable-manifest`，head SHA 为本卡提交；产物判据为 `download.libra.tools` 对应版本 HTTP 200 + 版本号匹配。任一失败前滚修复，不回退已发布 artifact。
+4. **ER-04 每卡验收门:** A 组（本卡 `Verification` 的 nextest 命令）+ B 组（`Task type`）+ C 组（发布收口）+ D 组（远端后置）累加。C 组按 ①版本面 parity → ②`patch + 1` 与三处版本面同步 → ③`cargo build` 由工具链刷新 `Cargo.lock` → ④bump 后重跑 fmt + 严格 Clippy + 本卡 A 组（`Full-suite trigger` 命中时改跑双环境全量 nextest）→ ⑤`cargo build --release` → ⑥安装 → ⑦`libra add <相关路径>` + `libra commit -s` → ⑧推送 `main` → ⑨`gh release create v<version>`。D 组逐 job 登记并取证：`base.yml`（push `main`）的 `format`/`clippy`/`redundancy`/`test`；`codeql.yml`（push `main`）的 `analyze`；`release.yml`（push `v*` tag）的 `build-and-upload`（四平台 leg）/`upload-install-scripts`/`update-homebrew-tap`/`verify-homebrew-formula`/`request-stable-manifest`，head SHA 为本卡提交；产物判据为 `download.libra.tools` 对应版本 HTTP 200 + 版本号匹配。任一失败前滚修复。
 5. **ER-05 review 闭环:** 代码 review 者为 Codex（维护者可指定 Claude），P0/P1 关闭并以 `VERDICT: PASS` 收口；网站 `cf` 推送前另需后端 `AGENTS.md` 要求的 Claude Code PASS。
 6. **ER-06 文档与兼容同步:** 按 ER-06a 逐文件交付；网站写入前确认 `../libra-backend` 是 Libra 仓库且为 `cf`，跑 sync check、typecheck、build 与 Claude Code PASS；部署判据为公开页 URL HTTP 200 且新文案可见。
 7. **ER-07 Libra-native 工作流与提交签名:** 只用 `libra status`/`libra add`/`libra commit -s`/`libra push origin main`；提交后校验 `gpgsig` 与 `Signed-off-by` 同一提交。
@@ -261,10 +263,10 @@
 | ID | direction | 类型 | 对象 | Owner | 产物与可用性判据 | 证据 | 超时与失败策略 |
 |---|---|---|---|---|---|---|---|
 | DEP-UID-01 | incoming | 跨计划 | [`plan-20261116-capture-queue.md`](plan-20261116-capture-queue.md)（CQ-04） | capture-queue 计划 owner | `.libra/private/capture.db` 承载 `agent_session`/`agent_checkpoint`/`agent_session_commit`，且存在只读打开 API；CQ-04 `done`/`complete` | `src/internal/ai/capture/store.rs:93`、`sql/migrations/2026111601_capture_database.sql:135`、`:329`、`plan-status.md` 的 capture-queue 行（核对 2026-11-20） | 布局变化时 `UID-02`/`UID-03`/`UID-07` 置 `blocked` 并登记 `FIX-*`；等待上限 1 个发布切片 |
-| DEP-UID-02 | incoming | 跨计划 | [`plan-20260926.md`](plan-20260926.md)（DM-11 读面） | memory 计划 owner | `memory` 读面 API 在 main 可用（DM-11 已合入 main，卡面 `locally-accepted`）；本计划只要求 API 存在 | `src/internal/ai/memory/reader.rs:198`、`plan-status.md` 的 0926 行（核对 2026-11-20） | API 变更时 `UID-05`/`UID-07` 置 `blocked`；等待上限 1 个发布切片 |
-| DEP-UID-03 | incoming | 跨计划（文件级写集窗口） | `plan-20261117-*.md` 15 份计划中当前写 `COMPATIBILITY.md`、`docs/commands/` 或 `docs/development/commands/README.md` 的活动卡（例如 `plan-20261117-branch.md#BR-01`、`plan-20261117-global-init-infra.md#GII-01`、`plan-20261117-plumbing-misc.md#PM-01`） | 20261117 批次发布者 | 文件级窗口：开工前扫描这些计划的 `in-progress` 卡，确认无卡写 `COMPATIBILITY.md`、`docs/commands/ui.md` 或 `docs/development/commands/README.md`（整文件，不论行）；窗口上限 1 个发布切片 | `plan-status.md` 20261117 批次节（核对 2026-11-20） | 窗口不可得则排队；超过 1 个发布切片置 `blocked` 并报告维护者 |
+| DEP-UID-02 | incoming | 跨计划 | [`plan-20260926.md`](plan-20260926.md)（DM-11 读面） | memory 计划 owner | `memory` 读面 API 在 main 可用（DM-11 已合入 main，卡面 `locally-accepted`） | `src/internal/ai/memory/reader.rs:198`、`plan-status.md` 的 0926 行（核对 2026-11-20） | API 变更时 `UID-05`/`UID-07` 置 `blocked`；等待上限 1 个发布切片 |
+| DEP-UID-03 | incoming | 跨计划（文件级写集窗口） | `plan-20261117-*.md` 15 份计划中当前写 `COMPATIBILITY.md`、`docs/commands/` 或 `docs/development/commands/README.md` 的活动卡（例如 `plan-20261117-branch.md#BR-01`、`plan-20261117-global-init-infra.md#GII-01`、`plan-20261117-plumbing-misc.md#PM-01`） | 20261117 批次发布者 | 文件级窗口：开工前扫描这些计划的 `in-progress` 卡，确认无卡写 `COMPATIBILITY.md`、`docs/commands/ui.md` 或 `docs/development/commands/README.md`（整文件）；窗口上限 1 个发布切片 | `plan-status.md` 20261117 批次节（核对 2026-11-20） | 窗口不可得则排队；超过 1 个发布切片置 `blocked` |
 | DEP-UID-04 | incoming | 外部仓库 | `../libra-backend`（`cf`） | 网站维护者/本计划发布者 | `libra status --short --branch` 显示 `cf`；sync check、typecheck/build、Claude Code PASS 通过 | 后端 `AGENTS.md`「Libra command documentation delivery」（核对 2026-11-20） | 文档未交付 → `blocked`；已提交推送仅部署待确认 → `remote-pending`；等待上限 1 个发布切片 |
-| DEP-UID-05 | incoming | 基线前置 | 本次 `libra ui` 全局 flag 修复提交 | 本计划发布者 | main 上 `ui_window_launch` 使用 clap 解析（`Cli::try_parse_from`），且 `ui_test` 通过 | `src/cli.rs:1401`、`tests/command/ui_test.rs`（核对 2026-11-20） | 未合入则 `UID-01` 置 `blocked`；等待上限 1 个发布切片；不得在本计划内夹带该修复 |
+| DEP-UID-05 | incoming | 基线前置 | `libra ui` 全局 flag 行为修复 | 本计划发布者 | 行为判据：main 上 `libra ui --json` 与 `libra ui --no-pager` 打开窗口（不再返回 `LBR-UNSUPPORTED-001`），且 `ui_test` 通过；不绑定具体实现 | `tests/command/ui_test.rs`、`docs/commands/ui.md`（核对 2026-11-20） | 未合入则 `UID-01` 置 `blocked`；等待上限 1 个发布切片；不得在本计划内夹带该修复 |
 
 ### 发布分组与并发窗口
 
@@ -282,7 +284,7 @@
 
 **进入条件:** `libra status --short --branch` 干净；`DEP-UID-01`/`DEP-UID-02`/`DEP-UID-05` 满足；`UID-01` 粒度行通过 ER-03。
 
-**退出条件:** 锚点在开工日复核；维护者批准计划文本（R4 review `PASS`）并授权 `UID-01`。
+**退出条件:** 锚点在开工日复核；维护者批准计划文本（R5 review `PASS`）并授权 `UID-01`。
 
 ### Phase 1: 只读数据接缝
 
@@ -298,7 +300,7 @@
 
 **进入条件:** `UID-01` `done`/`complete`。
 
-**退出条件:** `UID-02`..`UID-07` 全部 `done`/`complete`；`sessions.json`、`COMMITS` 常量与静态 run 字面量已删除；`model::catalog()` 仅保留给 `DEFER-UID-05` 页面（Sessions 不再调用），并由 `UID-07` 移除或标注过渡。
+**退出条件:** `UID-02`..`UID-07` 全部 `done`/`complete`；`sessions.json`/`catalog()`、`COMMITS` 常量与静态 run 字面量已删除（`catalog()` 在 `UID-03` 保留给 `DEFER-UID-05` 页面，`UID-07` 删除并改写消费者）。
 
 ### Phase 3: 收口
 
@@ -327,7 +329,7 @@
 
 | 任务 | 偏离的字段 | 取值与理由 |
 |---|---|---|
-| 全部卡 | `Docs and compatibility impact` | 命令文档 EN+zh、开发文档、开发文档索引、`COMPATIBILITY.md` 与网站页面同卡同步（ER-06a） |
+| 全部卡 | `Docs and compatibility impact` | EN+zh、开发文档、开发文档索引、`COMPATIBILITY.md` 与网站页面同卡同步（ER-06a） |
 | `UID-03` | `Security and privacy` | Agent 内容经既有 redaction，快照不含原始 payload |
 | `UID-02`/`UID-03`/`UID-04`/`UID-05` | `Full-suite trigger` | 提升共享读 API（GC-02 单一事实源）命中 `T-1` |
 
@@ -337,18 +339,18 @@
 
 | 任务 | type | axis | recovery | complete | self-contained | AC | VER | landing / prod-files | scope | deps | writeset | release | split-from | exception |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| `UID-01` | implementation | 只读数据接缝、状态分类与 worker 生命周期 | 补偿：revert 提交 + 下一 patch 发布 + 网站重同步 | yes | yes | 8/8 | 6/8 | 2/7 | M | DEP-UID-05 | no-overlap（链首） | independent | N/A | N/A |
-| `UID-02` | implementation | History 提交历史、归属与拓扑真实化 | 补偿：revert 提交 + 下一 patch 发布 + 网站重同步 | yes | yes | 8/8 | 6/8 | 4/6 | M | UID-01, DEP-UID-01 | 序列化于 UID-01 | independent | N/A | N/A |
-| `UID-03` | implementation | Sessions Agent 会话真实投影与隐私边界 | 补偿：revert 提交 + 下一 patch 发布 + 网站重同步 | yes | yes | 8/8 | 6/8 | 4/8 | M | UID-02, DEP-UID-01 | 序列化于 UID-02 | independent | N/A | N/A |
-| `UID-04` | implementation | Operations 操作日志真实投影 | 补偿：revert 提交 + 下一 patch 发布 + 网站重同步 | yes | yes | 8/8 | 6/8 | 4/5 | M | UID-03 | 序列化于 UID-03 | independent | N/A | N/A |
-| `UID-05` | implementation | Memory episode 有界投影与 stale 语义 | 补偿：revert 提交 + 下一 patch 发布 + 网站重同步 | yes | yes | 8/8 | 6/8 | 4/5 | M | UID-04, DEP-UID-02 | 序列化于 UID-04 | independent | N/A | N/A |
-| `UID-06` | implementation | Review/Investigate run 记录投影与损坏隔离 | 补偿：revert 提交 + 下一 patch 发布 + 网站重同步 | yes | yes | 8/8 | 6/8 | 3/5 | M | UID-05 | 序列化于 UID-05 | independent | N/A | N/A |
-| `UID-07` | implementation | 仓库与数据面可用性状态呈现 | 补偿：revert 提交 + 下一 patch 发布 + 网站重同步 | yes | yes | 8/8 | 6/8 | 3/7 | M | UID-06, DEP-UID-01, DEP-UID-02 | 序列化于 UID-06 | independent | N/A | N/A |
+| `UID-01` | implementation | 只读数据接缝、状态分类与 worker 生命周期 | 补偿：revert 提交 + 下一 patch 发布 + 网站重同步 | yes | yes | 8/8 | 5/8 | 2/7 | M | DEP-UID-03, DEP-UID-04, DEP-UID-05 | no-overlap（链首） | independent | N/A | N/A |
+| `UID-02` | implementation | History 提交历史、归属与拓扑真实化 | 补偿：revert 提交 + 下一 patch 发布 + 网站重同步 | yes | yes | 8/8 | 6/8 | 4/6 | M | UID-01, DEP-UID-01, DEP-UID-03, DEP-UID-04 | 序列化于 UID-01 | independent | N/A | N/A |
+| `UID-03` | implementation | Sessions Agent 会话真实投影与隐私边界 | 补偿：revert 提交 + 下一 patch 发布 + 网站重同步 | yes | yes | 8/8 | 6/8 | 3/8 | M | UID-02, DEP-UID-01, DEP-UID-03, DEP-UID-04 | 序列化于 UID-02 | independent | N/A | N/A |
+| `UID-04` | implementation | Operations 操作日志真实投影 | 补偿：revert 提交 + 下一 patch 发布 + 网站重同步 | yes | yes | 8/8 | 6/8 | 4/5 | M | UID-03, DEP-UID-03, DEP-UID-04 | 序列化于 UID-03 | independent | N/A | N/A |
+| `UID-05` | implementation | Memory episode 有界投影与 stale 语义 | 补偿：revert 提交 + 下一 patch 发布 + 网站重同步 | yes | yes | 8/8 | 6/8 | 4/5 | M | UID-04, DEP-UID-02, DEP-UID-03, DEP-UID-04 | 序列化于 UID-04 | independent | N/A | N/A |
+| `UID-06` | implementation | Review/Investigate run 记录投影与损坏隔离 | 补偿：revert 提交 + 下一 patch 发布 + 网站重同步 | yes | yes | 8/8 | 6/8 | 3/5 | M | UID-05, DEP-UID-03, DEP-UID-04 | 序列化于 UID-05 | independent | N/A | N/A |
+| `UID-07` | implementation | 仓库与数据面可用性状态呈现 | 补偿：revert 提交 + 下一 patch 发布 + 网站重同步 | yes | yes | 8/8 | 6/8 | 3/8 | M | UID-06, DEP-UID-01, DEP-UID-02, DEP-UID-03, DEP-UID-04 | 序列化于 UID-06 | independent | N/A | N/A |
 
 #### Verification 判定口径
 
-- 每条 AC 是单一 pass/fail 谓词，且由**一个具名 test fn** 覆盖；矩阵与分类细节写在 ADR-UID-06 或 Description，不按矩阵行计数。
-- 数据层测试路径为 `gui::data::tests::<fn>`；`Verification` 必须写完整 test fn 名（不是模块前缀），确保 nextest 过滤器能选中。
+- 每条 AC 是单一 pass/fail 谓词，且由**一个具名 test fn** 覆盖；每卡正文给出 AC→test 映射表（不计入 AC/VER 条目数）。
+- 数据层测试路径为 `gui::data::tests::<fn>`；`Verification` 用 `-E 'test(uid0N_)'` 选中本卡全部数据层用例。
 - 零命中守卫统一模板（`<paths>`/`<pattern>` 由各卡给出）：
 
   ```bash
@@ -361,7 +363,7 @@
   fi
   ```
 
-- 数据层生产文件不含测试代码：测试放在 `src/gui/data/tests.rs`（`#[cfg(test)] mod tests;`），守卫以 `--glob '!tests.rs'` 排除；屏幕模块保留内联测试，panic 守卫只覆盖数据层。
+- 数据层生产文件不含测试代码：测试放在 `src/gui/data/tests.rs`，守卫以 `--glob '!tests.rs'` 排除；屏幕模块保留内联测试，panic 守卫只覆盖数据层。
 - 新增 test fn 标 `(new)`；不新增 `--test` target。
 - 全量 nextest 不替代本卡指定用例。
 
@@ -394,22 +396,23 @@
 - [ ] A3 全部仓库读取经单一 worker；主线程侧读取调用计数为 0。
 - [ ] A4 读取后 `libra.db` 的 schema receipt 逐字节不变。
 - [ ] A5 读取后 `libra.db` 的 operation head 逐字节不变。
-- [ ] A6 源级状态分类按 ADR-UID-06 返回（含前置探测保留 `io::ErrorKind`），窗口按返回值渲染。
-- [ ] A7 关闭窗口时 worker 在关闭预算内结束；停滞读超 deadline 时记录 `worker stalled` 并结束（surviving 线程由 handle 持有）。
+- [ ] A6 源级状态分类按 ADR-UID-06 返回（metadata → 读打开探测 → 数据库打开），窗口按返回值渲染。
+- [ ] A7 关闭窗口时 worker 在预算内 joined，或由控制侧记录 `worker stalled` 且 handle 由 `gui::run` 持有到进程退出。
 - [ ] A8 关闭窗口不阻塞主线程（预算内返回）。
+
+**AC→test 映射（非计数）:** A1→`uid01_context_snapshot_in_repository`；A2→`uid01_outside_repository_absent`；A3→`uid01_main_thread_read_count_zero`；A4→`uid01_schema_receipt_unchanged`；A5→`uid01_operation_head_unchanged`；A6→`uid01_source_state_classification`；A7→`uid01_shutdown_joined_or_stalled`；A8→`uid01_close_returns_within_budget`。
 
 **Verification:**
 
-- [ ] `source .env.test && cargo nextest run --lib gui::data::tests::uid01_context_snapshot_in_repository` (new)
-- [ ] `source .env.test && cargo nextest run --lib gui::data::tests::uid01_source_state_classification` (new)
-- [ ] `source .env.test && cargo nextest run --lib gui::data::tests::uid01_shutdown_and_stalled` (new)
-- [ ] `source .env.test && cargo nextest run --lib gui::data::tests::uid01_queue_cap_and_supersession` (new)
+- [ ] `source .env.test && cargo nextest run --lib -E 'test(uid01_)'` (new)
 - [ ] `source .env.test && cargo nextest run --test command_test -E 'test(command::ui_test)'`
 - [ ] 零命中守卫（模板三分支）：`rg -n '\.unwrap\(|\.expect\(|panic!\(' src/gui/data --glob '*.rs' --glob '!tests.rs'`
+- [ ] 手工（macOS 桌面会话）：仓库内/外分别运行 `./target/debug/libra ui`，记录上下文/空状态、关闭返回时间与 stalled 分支
+- [ ] 手工（macOS 桌面会话）：仓库内 `libra ui --json` 与 `libra ui --no-pager` 均开窗（`DEP-UID-05` 行为门）
 
 **Full-suite trigger:** `none`（不动 `src/cli.rs` 命令注册与全局 flag，不改共享读 API，不新增 `--test` target）
 
-**Dependencies:** `DEP-UID-05`
+**Dependencies:** `DEP-UID-03`、`DEP-UID-04`、`DEP-UID-05`
 
 **Deliverables:** N/A
 
@@ -427,7 +430,7 @@
 
 **Security and privacy:** 继承 GC-07/GC-11/GC-UID-04；worker 只读；上下文标签为仓库相对路径；capture 打开错误脱敏。
 
-**Performance budget:** 上下文快照 ≤50ms（仅存在性/scope 检查，不含 dirty 扫描）；请求队列上限 8；读取 deadline ≤2s（busy timeout 同值）；关闭预算 3s。
+**Performance budget:** 上下文快照 ≤50ms（仅存在性/scope 检查）；请求队列上限 8；读取 deadline ≤2s（busy timeout 同值）；关闭预算 3s。
 
 **Estimated scope:** M
 
@@ -437,7 +440,7 @@
 
 **C/D coverage from:** `self`
 
-**Granularity:** `type=implementation; axis=只读数据接缝与 worker 生命周期; recovery=compensating; complete=yes; self-contained=yes; AC=8/8; VER=6/8; landing=2; prod-files=7; scope=M; deps=DEP-UID-05; writeset=no-overlap; release=independent; split-from=N/A; exception=N/A`
+**Granularity:** `type=implementation; axis=只读数据接缝与 worker 生命周期; recovery=compensating; complete=yes; self-contained=yes; AC=8/8; VER=5/8; landing=2; prod-files=7; scope=M; deps=DEP-UID-03,DEP-UID-04,DEP-UID-05; writeset=no-overlap; release=independent; split-from=N/A; exception=N/A`
 
 ### Task UID-02: History 提交历史、归属与拓扑真实化
 
@@ -445,7 +448,7 @@
 
 **Lifecycle / Acceptance:** `pending` / 空
 
-**Description:** 用真实提交历史替换 `screens/history.rs` 的静态 `COMMITS` 表，按真实归属数据（`agent_session_commit`）与真实父链重建筛选与拓扑，并移除该页残留的演示文案。行为轴是**History 表面的数据、归属与拓扑**。
+**Description:** 用真实提交历史替换 `screens/history.rs` 的静态 `COMMITS` 表，按真实归属数据（`agent_session_commit` 的 commit-keyed 批量查询）与真实父链重建筛选与拓扑，并移除该页残留的演示文案。行为轴是**History 表面的数据、归属与拓扑**。
 
 **Out of scope:** diff/hunk 内容 → `DEFER-UID-06`；分支切换 UI → 沿用现有状态；提交图布局重构 → 保留绘制骨架。
 
@@ -457,7 +460,7 @@
 | 筛选按作者 `eli`、图形按 `Codex` 与行号 | `src/gui/screens/history.rs:183`、`:224`、`:483` |
 | 页面残留演示文案 | `src/gui/screens/history.rs:95`、`:107` |
 | 归属表 | `sql/migrations/2026111601_capture_database.sql:329` |
-| 归属 helper 接收注入连接但内部仍自开连接 | `src/command/agent/session.rs:763`、`:799` |
+| 现有链接 helper 是 session→commits 方向 | `src/command/agent/session.rs:763` |
 | `mod session` 私有 | `src/command/agent/mod.rs:48` |
 
 **Acceptance criteria:**
@@ -465,24 +468,26 @@
 - [ ] A1 History 显示真实提交（≤200，按提交时间倒序），不再读取 `COMMITS` 常量。
 - [ ] A2 提交行显示短 OID、作者、时间与主题（主题 ≤200 字符）。
 - [ ] A3 提交图按真实父链绘制，不用作者名或行号判断拓扑。
-- [ ] A4 Human / Agent-authored / Has checkpoint 三个筛选由真实归属与 checkpoint 数据决定。
+- [ ] A4 Human / Agent-authored / Has checkpoint 三个筛选由 commit-keyed 批量归属查询（一次查询 ≤200 commit）决定，不做 per-commit N+1。
 - [ ] A5 搜索与筛选作用于真实数据，无匹配显示空状态。
 - [ ] A6 空仓库显示 `absent` 状态（"尚无提交"）。
 - [ ] A7 读取只读：不写 operation 行、schema receipt 不变。
-- [ ] A8 页面演示文案 "acme-libra"/"Design preview" 移除，数据层生产文件无裸 panic。
+- [ ] A8 页面演示文案 "acme-libra"/"Design preview" 移除。
+
+**AC→test 映射（非计数）:** A1→`uid02_history_rows`；A2→`uid02_history_row_fields`；A3→`uid02_parent_chain_graph`；A4→`uid02_commit_keyed_attribution`；A5→`uid02_search_and_filter`；A6→`uid02_empty_repository`；A7→`uid02_read_only_receipt`；A8→`uid02_demo_copy_removed`。
 
 **Verification:**
 
-- [ ] `source .env.test && cargo nextest run --lib gui::data::tests::uid02_history_rows` (new)
-- [ ] `source .env.test && cargo nextest run --lib gui::data::tests::uid02_attribution_and_graph` (new)
+- [ ] `source .env.test && cargo nextest run --lib -E 'test(uid02_)'` (new)
 - [ ] `source .env.test && cargo nextest run --test agent_checkpoint_reader_test -E 'test(session_list_walks_keyset_pages)'`
 - [ ] `source .env.test && cargo nextest run --test command_test -E 'test(command::ui_test)'`
 - [ ] 零命中守卫（模板三分支）：`rg -n 'COMMITS' src/gui/screens/history.rs`
 - [ ] 零命中守卫（模板三分支）：`rg -n '\.unwrap\(|\.expect\(|panic!\(' src/gui/data --glob '*.rs' --glob '!tests.rs'`
+- [ ] 手工（macOS 桌面会话）：临时仓库造 3 条提交（1 条关联捕获会话），验证列表、三个筛选、搜索与空状态
 
-**Full-suite trigger:** `T-1: 会话↔提交归属读取提升为双连接注入的共享 API（GC-02 共享 helper）`
+**Full-suite trigger:** `T-1: 新增 commit-keyed 批量归属查询并提升 session→commits helper 为共享 API（GC-02 共享 helper）`
 
-**Dependencies:** `UID-01`；`DEP-UID-01`
+**Dependencies:** `UID-01`、`DEP-UID-01`、`DEP-UID-03`、`DEP-UID-04`
 
 **Deliverables:** N/A
 
@@ -500,7 +505,7 @@
 
 **Security and privacy:** 提交主题/作者按既有字段输出；不含绝对路径。
 
-**Performance budget:** 提交列表 ≤150ms（≤10k 提交仓库）；显示上限 200 行；批量读取元数据，禁止逐提交 N+1。
+**Performance budget:** 提交列表 ≤150ms（≤10k 提交仓库）；归属批量查询一次（≤200 commit）；显示上限 200 行；禁止逐提交 N+1。
 
 **Estimated scope:** M
 
@@ -510,7 +515,7 @@
 
 **C/D coverage from:** `self`
 
-**Granularity:** `type=implementation; axis=History 数据/归属/拓扑真实化; recovery=compensating; complete=yes; self-contained=yes; AC=8/8; VER=6/8; landing=4; prod-files=6; scope=M; deps=UID-01,DEP-UID-01; writeset=序列化于 UID-01; release=independent; split-from=N/A; exception=N/A`
+**Granularity:** `type=implementation; axis=History 数据/归属/拓扑真实化; recovery=compensating; complete=yes; self-contained=yes; AC=8/8; VER=6/8; landing=4; prod-files=6; scope=M; deps=UID-01,DEP-UID-01,DEP-UID-03,DEP-UID-04; writeset=序列化于 UID-01; release=independent; split-from=N/A; exception=N/A`
 
 ### Task UID-03: Sessions Agent 会话真实投影与隐私边界
 
@@ -518,16 +523,16 @@
 
 **Lifecycle / Acceptance:** `pending` / 空
 
-**Description:** 用 `.libra/private/capture.db` 中的真实 `agent_session`/`agent_checkpoint`/`agent_bridge_event` 行替换内嵌 `sessions.json` 演示目录，并提升会话分页 SQL 为可复用读 API（连接由调用方注入，父模块导出）。行为轴是**Sessions 表面的数据来源、隐私边界与过渡消费者兼容**。
+**Description:** 用 `.libra/private/capture.db` 中的真实 `agent_session`/`agent_checkpoint`/`agent_bridge_event` 行替换 Sessions 的内嵌演示目录数据，并提升会话分页 SQL 为可复用读 API（连接注入、父模块导出）。行为轴是**Sessions 表面的数据来源、隐私边界与过渡消费者兼容**。
 
-**Out of scope:** 实时捕获 → `DEFER-UID-02`；云端会话 → `DEFER-UID-04`；会话写入/编辑 → 本计划只读。
+**Out of scope:** 实时捕获 → `DEFER-UID-02`；云端会话 → `DEFER-UID-04`；会话写入/编辑 → 本计划只读；`search`/`capabilities` 的真实化 → `UID-07`（本卡保留其演示接口）。
 
 **Current evidence:**
 
 | 事实 | 证据 |
 |---|---|
 | 演示目录经 `include_str!` 内嵌，另有 search/capabilities 消费者 | `src/gui/model.rs:14`、`src/gui/screens/search.rs:56`、`src/gui/screens/capabilities.rs:14` |
-| capture 库路径、只读打开与错误消息 | `src/internal/ai/capture/store.rs:41`、`:93`、`:98`、`:807` |
+| capture 库路径、只读打开与错误消息 | `src/internal/ai/capture/store.rs:41`、`:93`、`:98`、`:808` |
 | capture 库会话/checkpoint/事件/归属表 | `sql/migrations/2026111601_capture_database.sql:304`、`:135`、`:57`、`:329` |
 | `session_page_sql` 是 `pub(super)` helper | `src/command/agent/session.rs:390` |
 | `mod session` 私有 | `src/command/agent/mod.rs:48` |
@@ -535,41 +540,43 @@
 
 **Acceptance criteria:**
 
-- [ ] A1 Sessions 显示 `capture.db` 真实会话（≤200，按 `started_at` 倒序），不再读取 `sessions.json`。
+- [ ] A1 Sessions 显示 `capture.db` 真实会话（≤200，按 `started_at` 倒序），不再使用演示目录数据。
 - [ ] A2 会话详情显示真实 agent、模型、起止时间、usage、checkpoint 数与 `agent_session_commit` 链接行；缺失字段显示"—"。
 - [ ] A3 会话内容经既有 redaction 后显示，单条 payload 截断 ≤4 KiB。
 - [ ] A4 搜索与"可读内容"过滤作用于真实数据，无结果显示空状态。
 - [ ] A5 `capture.db` 未创建显示 `absent` 状态；不可读/损坏按 ADR-UID-06 源级状态显示（错误消息脱敏）。
 - [ ] A6 读取只读：`libra.db` 与 `capture.db` 的 schema receipt 不变，且不写 operation 行。
-- [ ] A7 过渡接口明确：`model::catalog()` 仅保留给 `search`/`capabilities`（Sessions 不再调用），`UID-07` 移除或标注过渡。
-- [ ] A8 数据层生产文件无裸 `unwrap(`/`expect(`/`panic!(`，且 GUI 不构造 `SessionStore`。
+- [ ] A7 过渡边界明确：Sessions 不再调用 `catalog()`，`sessions.json`/`catalog()` 仍保留给 `search`/`capabilities`，由 `UID-07` 删除并改写这两个消费者。
+- [ ] A8 GUI 不构造 `SessionStore`（避免其 `load()` 迁移副作用）。
+
+**AC→test 映射（非计数）:** A1→`uid03_session_rows`；A2→`uid03_session_detail_fields`；A3→`uid03_redaction_and_payload_cap`；A4→`uid03_search_and_readable_filter`；A5→`uid03_source_states`；A6→`uid03_read_only_receipts`；A7→`uid03_catalog_transition_boundary`；A8→`uid03_no_session_store`。
 
 **Verification:**
 
-- [ ] `source .env.test && cargo nextest run --lib gui::data::tests::uid03_session_rows` (new)
-- [ ] `source .env.test && cargo nextest run --lib gui::data::tests::uid03_redaction_and_payload_cap` (new)
+- [ ] `source .env.test && cargo nextest run --lib -E 'test(uid03_)'` (new)
 - [ ] `source .env.test && cargo nextest run --test agent_checkpoint_reader_test -E 'test(session_list_walks_keyset_pages)'`
 - [ ] `source .env.test && cargo nextest run --test command_test -E 'test(command::ui_test)'`
-- [ ] 零命中守卫（模板三分支）：`rg -n 'sessions\.json' src/gui --glob '*.rs'`
+- [ ] 零命中守卫（模板三分支）：`rg -n 'catalog\(\)' src/gui/view.rs`
 - [ ] 零命中守卫（模板三分支）：`rg -n 'SessionStore' src/gui --glob '*.rs'`
+- [ ] 手工（macOS 桌面会话）：仓库内造 2 条捕获会话，验证列表、详情、搜索、redaction 与空状态
 
 **Full-suite trigger:** `T-1: 把 `session_page_sql` 与取行提升为命令层与 GUI 共用的单一事实源（GC-02 共享 helper）`
 
-**Dependencies:** `UID-02`；`DEP-UID-01`
+**Dependencies:** `UID-02`、`DEP-UID-01`、`DEP-UID-03`、`DEP-UID-04`
 
 **Deliverables:** N/A
 
-**Implementation write set:** `src/command/agent/session.rs`、`src/command/agent/mod.rs`、`src/gui/data/sessions.rs`、`src/gui/data/tests.rs`、`src/gui/data/mod.rs`、`src/gui/view.rs`、`src/gui/model.rs`、`src/gui/sessions.json`（删除）、`src/gui/desktop.rs`、`docs/commands/ui.md`、`docs/commands/zh-CN/ui.md`、`docs/development/commands/ui.md`、`docs/development/commands/README.md`、`COMPATIBILITY.md`、`../libra-backend/apps/tanstack-app/content/docs/commands/ui.en.md`
+**Implementation write set:** `src/command/agent/session.rs`、`src/command/agent/mod.rs`、`src/gui/data/sessions.rs`、`src/gui/data/tests.rs`、`src/gui/data/mod.rs`、`src/gui/view.rs`、`src/gui/model.rs`、`src/gui/desktop.rs`、`docs/commands/ui.md`、`docs/commands/zh-CN/ui.md`、`docs/development/commands/ui.md`、`docs/development/commands/README.md`、`COMPATIBILITY.md`、`../libra-backend/apps/tanstack-app/content/docs/commands/ui.en.md`
 
 **Release write set:** Inherited
 
 **Files likely touched:** 上述文件
 
-**Docs and compatibility impact:** 逐文件：`docs/commands/ui.md`（Sessions 真实捕获与 redaction 边界、过渡接口）、`docs/commands/zh-CN/ui.md`（同义）、`docs/development/commands/ui.md`、`docs/development/commands/README.md`、`COMPATIBILITY.md:179`、网站 `commands/ui.en.md`。`docs/error-codes.md` N/A。
+**Docs and compatibility impact:** 逐文件：`docs/commands/ui.md`（Sessions 真实捕获、redaction 边界、过渡接口）、`docs/commands/zh-CN/ui.md`（同义）、`docs/development/commands/ui.md`、`docs/development/commands/README.md`、`COMPATIBILITY.md:179`、网站 `commands/ui.en.md`。`docs/error-codes.md` N/A。
 
 **Rollback mode:** `compensating`
 
-**Migration and rollback:** N/A（只读）。补偿：revert 提交（恢复 `sessions.json`）→ 新 patch 发布 → 网站重同步。
+**Migration and rollback:** N/A（只读）。补偿：revert 提交 → 新 patch 发布 → 网站重同步。
 
 **Security and privacy:** Agent 内容经既有 redaction；快照不含原始 payload；绝对 `working_dir` 与打开错误路径转换为仓库相对路径；不读取未注册 agent 的私有目录。
 
@@ -583,7 +590,7 @@
 
 **C/D coverage from:** `self`
 
-**Granularity:** `type=implementation; axis=Sessions 真实会话投影与隐私边界; recovery=compensating; complete=yes; self-contained=yes; AC=8/8; VER=6/8; landing=4; prod-files=8; scope=M; deps=UID-02,DEP-UID-01; writeset=序列化于 UID-02; release=independent; split-from=N/A; exception=N/A`
+**Granularity:** `type=implementation; axis=Sessions 真实会话投影与隐私边界; recovery=compensating; complete=yes; self-contained=yes; AC=8/8; VER=6/8; landing=3; prod-files=8; scope=M; deps=UID-02,DEP-UID-01,DEP-UID-03,DEP-UID-04; writeset=序列化于 UID-02; release=independent; split-from=N/A; exception=N/A`
 
 ### Task UID-04: Operations 操作日志真实投影
 
@@ -591,7 +598,7 @@
 
 **Lifecycle / Acceptance:** `pending` / 空
 
-**Description:** 用 operation v2 journal 替换 Operations 页面静态卡片，并提升命令层私有的分页查询为可复用读 API（保持 CLI 输出不变、连接注入）。行为轴是**Operations 表面的分页数据投影**。
+**Description:** 用 operation v2 journal 替换 Operations 页面静态卡片，并提升命令层私有的分页查询为可复用读 API（保持 CLI 输出不变、连接注入）；分页以 **id 快照**为基准（不依赖可变的 `end_ts` 排序）。行为轴是**Operations 表面的分页数据投影**。
 
 **Out of scope:** 撤销/恢复执行 → `DEFER-UID-01`；统计聚合口径 → `docs/development/internal/stats.md`；memory 投影 → `UID-05`。
 
@@ -599,7 +606,7 @@
 
 | 事实 | 证据 |
 |---|---|
-| operation v2 存储 API；head 按 scope 记录 | `src/internal/operation/store.rs:330`、`:949` |
+| operation v2 存储 API；head 按 scope；`end_ts` 可在 head 不变时改变 | `src/internal/operation/store.rs:330`、`:949`、`:757` |
 | 历史查询是命令层私有 helper（ranked CTE + COUNT + OFFSET，按可变 `end_ts` 排序） | `src/command/op.rs:642`、`:651`、`:662`、`:693` |
 | CLI 分页从第 1 页开始 | `src/command/op.rs:251` |
 | 子命令是 `op log` | `src/command/op.rs:42` |
@@ -610,15 +617,16 @@
 - [ ] A2 每行显示 kind、时间、状态与摘要（摘要 ≤200 字符）。
 - [ ] A3 命令过滤与搜索作用于真实数据，无匹配显示空状态。
 - [ ] A4 空仓库显示 `absent` 状态；不可读/损坏按 ADR-UID-06 源级状态显示。
-- [ ] A5 分页用 revision token（全 scope head 集 + 行数 + max `end_ts`，与页面同事务读取）判定稳定性；token 变化时重置到第 1 页，避免 offset 重复/丢行。
+- [ ] A5 分页以一次读取的 **op id 快照**为基准（按 CLI 排序取 id，≤50k id 上限）；翻页只切片该快照，重读快照变化时重置到第 1 页。
 - [ ] A6 读取只读：不写 operation 行、schema receipt 不变。
 - [ ] A7 提升后 CLI `libra op log` 输出与既有测试逐字节一致。
-- [ ] A8 数据层生产文件无裸 `unwrap(`/`expect(`/`panic!(`。
+- [ ] A8 `end_ts` 在页间变化（terminalization）不会造成重复或丢行（由 A5 的快照语义覆盖）。
+
+**AC→test 映射（非计数）:** A1→`uid04_operation_rows`；A2→`uid04_row_fields`；A3→`uid04_filter_and_search`；A4→`uid04_source_states`；A5→`uid04_id_snapshot_paging`；A6→`uid04_read_only_receipt`；A7→`uid04_cli_output_unchanged`；A8→`uid04_terminalization_no_duplicate`。
 
 **Verification:**
 
-- [ ] `source .env.test && cargo nextest run --lib gui::data::tests::uid04_operation_rows` (new)
-- [ ] `source .env.test && cargo nextest run --lib gui::data::tests::uid04_pagination_revision_token` (new)
+- [ ] `source .env.test && cargo nextest run --lib -E 'test(uid04_)'` (new)
 - [ ] `source .env.test && cargo nextest run --test command_test -E 'test(command::op_test)'`
 - [ ] `source .env.test && cargo nextest run --test command_test -E 'test(command::ui_test)'`
 - [ ] 零命中守卫（模板三分支）：`rg -n '\.unwrap\(|\.expect\(|panic!\(' src/gui/data --glob '*.rs' --glob '!tests.rs'`
@@ -626,7 +634,7 @@
 
 **Full-suite trigger:** `T-1: 把 `query_operation_log_page` 提升为命令层与 GUI 共用的单一事实源（GC-02 共享 helper）`
 
-**Dependencies:** `UID-03`
+**Dependencies:** `UID-03`、`DEP-UID-03`、`DEP-UID-04`
 
 **Deliverables:** N/A
 
@@ -636,7 +644,7 @@
 
 **Files likely touched:** 上述文件
 
-**Docs and compatibility impact:** 逐文件：`docs/commands/ui.md`（Operations 数据来源与 revision token 语义）、`docs/commands/zh-CN/ui.md`（同义）、`docs/development/commands/ui.md`、`docs/development/commands/README.md`、`COMPATIBILITY.md:179`、网站 `commands/ui.en.md`。`docs/error-codes.md` N/A。
+**Docs and compatibility impact:** 逐文件：`docs/commands/ui.md`（Operations 数据来源与 id 快照语义）、`docs/commands/zh-CN/ui.md`（同义）、`docs/development/commands/ui.md`、`docs/development/commands/README.md`、`COMPATIBILITY.md:179`、网站 `commands/ui.en.md`。`docs/error-codes.md` N/A。
 
 **Rollback mode:** `compensating`
 
@@ -644,7 +652,7 @@
 
 **Security and privacy:** 摘要不含绝对路径、不含原始 payload。
 
-**Performance budget:** 单页 ≤150ms；显示上限 200 行/页；查询成本 = 既有 ranked CTE 对仓库 operation 历史的排序 + COUNT（与 CLI 相同，不是 O(200)），在 ≥10k operation 仓库上实测并记录；不引入新索引。
+**Performance budget:** 单页 ≤150ms；显示上限 200 行/页；id 快照读取成本 = 既有 ranked CTE 排序 + 一次 id 列表（≤50k id），在 ≥10k operation 仓库上实测并记录；不引入新索引。
 
 **Estimated scope:** M
 
@@ -654,7 +662,7 @@
 
 **C/D coverage from:** `self`
 
-**Granularity:** `type=implementation; axis=Operations 分页投影; recovery=compensating; complete=yes; self-contained=yes; AC=8/8; VER=6/8; landing=4; prod-files=5; scope=M; deps=UID-03; writeset=序列化于 UID-03; release=independent; split-from=N/A; exception=N/A`
+**Granularity:** `type=implementation; axis=Operations 分页投影; recovery=compensating; complete=yes; self-contained=yes; AC=8/8; VER=5/8; landing=4; prod-files=5; scope=M; deps=UID-03,DEP-UID-03,DEP-UID-04; writeset=序列化于 UID-03; release=independent; split-from=N/A; exception=N/A`
 
 ### Task UID-05: Memory episode 有界投影与 stale 语义
 
@@ -662,7 +670,7 @@
 
 **Lifecycle / Acceptance:** `pending` / 空
 
-**Description:** 用 memory episode 只读投影替换 Memory 页面静态卡片，并新增**伴生**有界读 API（保留 `list_episodes` 原签名，CLI 与投影调用方不变），把 episode 行与子表证据/路径限制在本页选中的 episode 集合。freshness 校验保留既有**全源指纹**语义（成本如实登记）。行为轴是**Memory 表面的有界投影与 stale 语义**。
+**Description:** 用 memory episode 只读投影替换 Memory 页面静态卡片，并新增**伴生**有界读 API（保留 `list_episodes` 原签名，CLI 与投影调用方不变），把 episode 行与子表证据/路径限制在本页选中的 episode 集合。freshness 校验保留既有**全源指纹**语义（成本如实登记，随链接 operation 数增长）。行为轴是**Memory 表面的有界投影与 stale 语义**。
 
 **Out of scope:** `libra memory rebuild` 执行 → 本计划只读；投影算法与 horizon 口径 → `plan-20260926`；统计聚合 → `docs/development/internal/stats.md`。
 
@@ -671,7 +679,7 @@
 | 事实 | 证据 |
 |---|---|
 | `list_episodes` 无 limit，子表按 repo 全量取 | `src/internal/ai/memory/reader.rs:198`、`:315` |
-| freshness 用全源 operation 指纹 | `src/internal/ai/memory/reader.rs:165`、`src/internal/ai/memory/projection.rs:183` |
+| freshness 用全源 operation 指纹，成本随链接 operation 数增长 | `src/internal/ai/memory/reader.rs:165`、`:384`、`src/internal/ai/memory/projection.rs:183` |
 | memory 过期 fail-closed 语义 | `src/command/memory.rs` 顶部注释（ADR-DM-10） |
 
 **Acceptance criteria:**
@@ -685,10 +693,11 @@
 - [ ] A7 既有 `list_episodes` 签名与调用方（`libra memory`、投影）行为不变。
 - [ ] A8 读取只读：不写 operation 行、不触发 rebuild、schema receipt 不变。
 
+**AC→test 映射（非计数）:** A1→`uid05_episode_rows`；A2→`uid05_row_fields`；A3→`uid05_stale_state`；A4→`uid05_search_and_filter`；A5→`uid05_source_states`；A6→`uid05_bounded_children`；A7→`uid05_existing_signature_unchanged`；A8→`uid05_read_only_receipt`。
+
 **Verification:**
 
-- [ ] `source .env.test && cargo nextest run --lib gui::data::tests::uid05_episode_rows` (new)
-- [ ] `source .env.test && cargo nextest run --lib gui::data::tests::uid05_bounded_children_and_stale` (new)
+- [ ] `source .env.test && cargo nextest run --lib -E 'test(uid05_)'` (new)
 - [ ] `source .env.test && cargo nextest run --test command_test -E 'test(command::memory_test)'`
 - [ ] `source .env.test && cargo nextest run --test command_test -E 'test(command::ui_test)'`
 - [ ] 零命中守卫（模板三分支）：`rg -n '\.unwrap\(|\.expect\(|panic!\(' src/gui/data --glob '*.rs' --glob '!tests.rs'`
@@ -696,7 +705,7 @@
 
 **Full-suite trigger:** `T-1: 在 `src/internal/ai/memory/` 新增共享有界读 API（GC-02 单一事实源）`
 
-**Dependencies:** `UID-04`；`DEP-UID-02`
+**Dependencies:** `UID-04`、`DEP-UID-02`、`DEP-UID-03`、`DEP-UID-04`
 
 **Deliverables:** N/A
 
@@ -714,7 +723,7 @@
 
 **Security and privacy:** episode 摘要不含绝对路径、不含原始 payload。
 
-**Performance budget:** 单页 ≤150ms（≤200 选中 episode；子表按选中集合过滤）；freshness 保留全源校验成本（在 ≥10k episode 仓库上实测并记录）；显示上限 200 行。
+**Performance budget:** 单页 ≤150ms（≤200 选中 episode；子表按选中集合过滤）；freshness 保留全源校验成本，随链接 operation 数增长（在 ≥10k episode/≥50k link 仓库上实测并记录，超预算时显示降级提示）；显示上限 200 行。
 
 **Estimated scope:** M
 
@@ -724,7 +733,7 @@
 
 **C/D coverage from:** `self`
 
-**Granularity:** `type=implementation; axis=Memory 有界投影与 stale 语义; recovery=compensating; complete=yes; self-contained=yes; AC=8/8; VER=6/8; landing=4; prod-files=5; scope=M; deps=UID-04,DEP-UID-02; writeset=序列化于 UID-04; release=independent; split-from=N/A; exception=N/A`
+**Granularity:** `type=implementation; axis=Memory 有界投影与 stale 语义; recovery=compensating; complete=yes; self-contained=yes; AC=8/8; VER=5/8; landing=4; prod-files=5; scope=M; deps=UID-04,DEP-UID-02,DEP-UID-03,DEP-UID-04; writeset=序列化于 UID-04; release=independent; split-from=N/A; exception=N/A`
 
 ### Task UID-06: Review/Investigate run 记录投影与损坏隔离
 
@@ -732,7 +741,7 @@
 
 **Lifecycle / Acceptance:** `pending` / 空
 
-**Description:** 用 `.libra/sessions/agent-runs/<run_id>/` 的真实 run 目录替换 Reviews/Investigate 页面静态卡片：全目录扫描后按时间取最新 100，逐项用**打开句柄的有界读**（≤64 KiB）解析公开 wire 类型，使损坏/超大/缺件行成为条目级状态而不是整页失败。行为轴是**运行记录面的逐项读取与损坏隔离**。
+**Description:** 用 `.libra/sessions/agent-runs/<run_id>/` 的真实 run 目录替换 Reviews/Investigate 页面静态卡片：全目录扫描（上限 5000 metadata）、逐项**打开句柄的有界读**（≤64 KiB）解析公开 wire 类型（解析上限 500 个 state），按 `state.json` 的 `created_at`/`started_at` 排序、按 kind 过滤并显示每页最新 100，使损坏/超大/缺件行成为条目级状态而不是整页失败。行为轴是**运行记录面的逐项读取与损坏隔离**。
 
 **Out of scope:** 触发新 run → `DEFER-UID-01`；run 全文 → `DEFER-UID-07`；run 清理 → 本计划只读。
 
@@ -740,26 +749,28 @@
 
 | 事实 | 证据 |
 |---|---|
-| run 目录与 wire 文件 | `src/internal/ai/review/mod.rs:6` |
-| 列表 API 跳过不可解析项；逐项读取用无上限 `fs::read` | `src/internal/ai/review/store.rs:882`、`:1226` |
+| run 目录与 wire 文件；两种 kind 共享目录 | `src/internal/ai/review/mod.rs:6` |
+| CLI 按 `state.json` 时间排序并按 kind 过滤 | `src/internal/ai/review/store.rs:878`、`src/internal/ai/investigate/store.rs:932` |
+| 逐项读取用无上限 `fs::read` | `src/internal/ai/review/store.rs:1226` |
 | 公开 wire 类型与逐项读取 API | `src/internal/ai/review/store.rs:513`、`src/internal/ai/investigate/store.rs:629` |
 | 屏幕静态 run 字面量 | `src/gui/screens/reviews.rs:31`、`src/gui/screens/investigate.rs:29` |
 
 **Acceptance criteria:**
 
-- [ ] A1 Reviews/Investigate 显示真实 run（最新 100，按时间倒序），不再显示静态 run 字面量。
+- [ ] A1 Reviews/Investigate 显示真实 run（每 kind 最新 100，按 `state.json` 时间倒序），不再显示静态 run 字面量。
 - [ ] A2 选中 run 时显示轮次、参与 agent 与结论摘要（摘要 ≤200 字符）。
 - [ ] A3 损坏 `state.json` 只影响该行（条目级 `malformed`），其余行仍可用。
 - [ ] A4 产物缺件（缺 `manifest.json`）显示条目级 `incomplete`。
 - [ ] A5 超过 64 KiB 的文件显示条目级 `oversized`（有界读在反序列化前拒绝超额字节）。
-- [ ] A6 目录扫描上限 5000；超过时列表标记 `truncated`；run 目录未创建显示 `absent`，不可读按 ADR-UID-06 源级状态显示。
-- [ ] A7 读取只读：不获取 run 锁写权限、不创建目录、不写 operation 行。
-- [ ] A8 数据层生产文件无裸 `unwrap(`/`expect(`/`panic!(`。
+- [ ] A6 扫描/解析上限（5000 metadata / 500 state）命中时列表标记 `truncated`，并说明结果只覆盖已检查子集。
+- [ ] A7 run 目录未创建显示 `absent`，不可读按 ADR-UID-06 源级状态显示。
+- [ ] A8 读取只读：不获取 run 锁写权限、不创建目录、不写 operation 行。
+
+**AC→test 映射（非计数）:** A1→`uid06_run_rows`；A2→`uid06_run_detail`；A3→`uid06_malformed_isolation`；A4→`uid06_incomplete_item`；A5→`uid06_oversized_item`；A6→`uid06_truncated_subset`；A7→`uid06_source_states`；A8→`uid06_read_only`。
 
 **Verification:**
 
-- [ ] `source .env.test && cargo nextest run --lib gui::data::tests::uid06_run_rows` (new)
-- [ ] `source .env.test && cargo nextest run --lib gui::data::tests::uid06_item_states_and_limits` (new)
+- [ ] `source .env.test && cargo nextest run --lib -E 'test(uid06_)'` (new)
 - [ ] `source .env.test && cargo nextest run --test command_test -E 'test(command::ui_test)'`
 - [ ] 零命中守卫（模板三分支）：`rg -n '\b(rv|iv)-[0-9a-f]{6}\b' src/gui/screens/reviews.rs src/gui/screens/investigate.rs`
 - [ ] 零命中守卫（模板三分支）：`rg -n '\.unwrap\(|\.expect\(|panic!\(' src/gui/data --glob '*.rs' --glob '!tests.rs'`
@@ -767,7 +778,7 @@
 
 **Full-suite trigger:** `none`（只消费既有 wire 类型与逐项读取，不改共享读 API）
 
-**Dependencies:** `UID-05`
+**Dependencies:** `UID-05`、`DEP-UID-03`、`DEP-UID-04`
 
 **Deliverables:** N/A
 
@@ -777,7 +788,7 @@
 
 **Files likely touched:** 上述文件
 
-**Docs and compatibility impact:** 逐文件：`docs/commands/ui.md`（run 记录来源、条目级状态、扫描/字节上限）、`docs/commands/zh-CN/ui.md`（同义）、`docs/development/commands/ui.md`、`docs/development/commands/README.md`、`COMPATIBILITY.md:179`、网站 `commands/ui.en.md`。`docs/error-codes.md` N/A。
+**Docs and compatibility impact:** 逐文件：`docs/commands/ui.md`（run 记录来源、条目级状态、扫描/解析/字节上限与 truncated）、`docs/commands/zh-CN/ui.md`（同义）、`docs/development/commands/ui.md`、`docs/development/commands/README.md`、`COMPATIBILITY.md:179`、网站 `commands/ui.en.md`。`docs/error-codes.md` N/A。
 
 **Rollback mode:** `compensating`
 
@@ -785,7 +796,7 @@
 
 **Security and privacy:** run 摘要经既有 redaction；不含绝对路径；不含未脱敏 transcript。
 
-**Performance budget:** 列表 ≤300ms（全目录扫描 ≤5000 条 metadata + 最新 100 × ≤64 KiB 有界读）；详情 ≤50ms（`state.json`/`manifest.json` 各自 ≤64 KiB）。
+**Performance budget:** 列表 ≤400ms（metadata 扫描 ≤5000 + state 解析 ≤500 × ≤64 KiB 有界读；显示 100 行）；详情 ≤50ms（`state.json`/`manifest.json` 各自 ≤64 KiB）。
 
 **Estimated scope:** M
 
@@ -795,7 +806,7 @@
 
 **C/D coverage from:** `self`
 
-**Granularity:** `type=implementation; axis=run 记录逐项投影与损坏隔离; recovery=compensating; complete=yes; self-contained=yes; AC=8/8; VER=6/8; landing=3; prod-files=5; scope=M; deps=UID-05; writeset=序列化于 UID-05; release=independent; split-from=N/A; exception=N/A`
+**Granularity:** `type=implementation; axis=run 记录逐项投影与损坏隔离; recovery=compensating; complete=yes; self-contained=yes; AC=8/8; VER=5/8; landing=3; prod-files=5; scope=M; deps=UID-05,DEP-UID-03,DEP-UID-04; writeset=序列化于 UID-05; release=independent; split-from=N/A; exception=N/A`
 
 ### Task UID-07: 仓库与数据面可用性状态呈现
 
@@ -803,7 +814,7 @@
 
 **Lifecycle / Acceptance:** `pending` / 空
 
-**Description:** 让 Splash、Welcome、About 与 Capability map 反映真实仓库与数据面可用性：显示仓库是否已打开、分支/HEAD/dirty 摘要、各数据源（capture、memory、operation、runs、history）的状态，替换固定文案与插图，并把窗口标签改为 "Read-only preview"。行为轴是**状态与可用性呈现**。
+**Description:** 让 Splash、Welcome、About 与 Capability map 反映真实仓库与数据面可用性：显示仓库是否已打开、分支/HEAD/**stat-only dirty 摘要**、各数据源（capture、memory、operation、runs、history）的状态；替换固定文案与插图，删除 `catalog()`/`sessions.json` 并改写 `search`/`capabilities` 消费者，把窗口标签改为 "Read-only preview"。行为轴是**状态与可用性呈现**。
 
 **Out of scope:** 导入/克隆/初始化执行 → `DEFER-UID-01`；多仓库列表 → `DEFER-UID-03`；远端/云可用性 → `DEFER-UID-04`；其余演示页 → `DEFER-UID-05`。
 
@@ -814,43 +825,45 @@
 | Splash 固定文案 | `src/gui/screens/splash.rs:67` |
 | Welcome 预览不打开/不创建仓库 | `src/gui/screens/welcome.rs:1` |
 | About 固定 "not connected" | `src/gui/screens/about.rs:69` |
-| Capability map 依赖演示目录 | `src/gui/screens/capabilities.rs:14` |
+| Capability map 与 search 依赖演示目录 | `src/gui/screens/capabilities.rs:14`、`src/gui/screens/search.rs:56` |
 | 窗口 "Design preview" 标签 | `src/gui/desktop.rs:332` |
-| dirty 摘要来源（工作树扫描） | `src/command/status.rs:1145` |
+| `changes_to_be_staged` 会哈希并写证书（不可用于本卡） | `src/command/status.rs:1146`、`:1570`、`:1586`、`src/utils/worktree_conversion.rs:444` |
 
 **Acceptance criteria:**
 
-- [ ] A1 Splash 显示真实仓库名（工作目录名）、分支、HEAD 短值、对象格式与 dirty 计数（staged+unstaged+untracked 合计）；仓库外显示 `absent`。
+- [ ] A1 Splash 显示真实仓库名（工作目录名）、分支、HEAD 短值、对象格式与 stat-only dirty 摘要（staged/unstaged/untracked 计数 + 需内容哈希的 `unverified` 计数，不做哈希、不写证书）；仓库外显示 `absent`。
 - [ ] A2 About 显示真实仓库状态与各数据源状态（可用/缺失/不可读/损坏/不兼容），不再显示固定 "not connected"。
 - [ ] A3 Capability map 按真实可用性标注五个数据面，缺失项显示 ADR-UID-06 中的状态。
 - [ ] A4 Welcome 在仓库内显示当前仓库摘要，仓库外保留导入/克隆/打开入口且不执行动作。
 - [ ] A5 窗口标签由 "Design preview" 改为 "Read-only preview"，并同步文档。
-- [ ] A6 状态读取只读：不写 operation 行、不推进 schema、不创建仓库。
-- [ ] A7 `catalog()` 演示依赖在本卡移除或标注过渡，删除后无死代码警告。
-- [ ] A8 数据层生产文件无裸 `unwrap(`/`expect(`/`panic!(`。
+- [ ] A6 状态读取只读：不写 operation 行、不推进 schema、不创建仓库、不写 conversion 证书。
+- [ ] A7 `catalog()` 与 `sessions.json` 删除，`search`/`capabilities` 改用真实或空状态数据。
+- [ ] A8 删除后无死代码警告。
+
+**AC→test 映射（非计数）:** A1→`uid07_context_and_dirty_summary`；A2→`uid07_about_availability`；A3→`uid07_capability_map_states`；A4→`uid07_welcome_in_and_out`；A5→`uid07_label_copy`；A6→`uid07_read_only_no_certificate`；A7→`uid07_catalog_removed`；A8→`uid07_no_dead_code`。
 
 **Verification:**
 
-- [ ] `source .env.test && cargo nextest run --lib gui::data::tests::uid07_context_and_availability` (new)
-- [ ] `source .env.test && cargo nextest run --lib gui::data::tests::uid07_dirty_count` (new)
+- [ ] `source .env.test && cargo nextest run --lib -E 'test(uid07_)'` (new)
 - [ ] `source .env.test && cargo nextest run --test command_test -E 'test(command::ui_test)'`
 - [ ] 零命中守卫（模板三分支）：`rg -n 'acme-libra|not connected|Design preview' src/gui/screens/splash.rs src/gui/screens/welcome.rs src/gui/screens/about.rs src/gui/screens/capabilities.rs src/gui/desktop.rs`
+- [ ] 零命中守卫（模板三分支）：`rg -n 'catalog\(\)' src/gui --glob '*.rs'`
 - [ ] 零命中守卫（模板三分支）：`rg -n '\.unwrap\(|\.expect\(|panic!\(' src/gui/data --glob '*.rs' --glob '!tests.rs'`
-- [ ] 手工（macOS 桌面会话）：仓库内/外分别打开 Splash、About、Capability、Welcome，记录状态差异、dirty 摘要与标签文案
+- [ ] 手工（macOS 桌面会话）：仓库内/外分别打开 Splash、About、Capability、Welcome，记录状态差异、dirty 摘要、标签文案与 search 页面
 
-**Full-suite trigger:** `none`（复用 `RequestScope`/`try_get_storage_path` 与既有状态读取，不改共享读 API）
+**Full-suite trigger:** `none`（复用 `RequestScope`/`try_get_storage_path` 与既有只读状态读取，不改共享读 API）
 
-**Dependencies:** `UID-06`；`DEP-UID-01`；`DEP-UID-02`
+**Dependencies:** `UID-06`、`DEP-UID-01`、`DEP-UID-02`、`DEP-UID-03`、`DEP-UID-04`
 
 **Deliverables:** N/A
 
-**Implementation write set:** `src/gui/data/context.rs`、`src/gui/data/tests.rs`、`src/gui/data/mod.rs`、`src/gui/screens/splash.rs`、`src/gui/screens/welcome.rs`、`src/gui/screens/about.rs`、`src/gui/screens/capabilities.rs`、`src/gui/desktop.rs`、`docs/commands/ui.md`、`docs/commands/zh-CN/ui.md`、`docs/development/commands/ui.md`、`docs/development/commands/README.md`、`COMPATIBILITY.md`、`../libra-backend/apps/tanstack-app/content/docs/commands/ui.en.md`
+**Implementation write set:** `src/gui/data/context.rs`、`src/gui/data/tests.rs`、`src/gui/data/mod.rs`、`src/gui/screens/splash.rs`、`src/gui/screens/welcome.rs`、`src/gui/screens/about.rs`、`src/gui/screens/capabilities.rs`、`src/gui/screens/search.rs`、`src/gui/desktop.rs`、`src/gui/model.rs`、`src/gui/sessions.json`（删除）、`docs/commands/ui.md`、`docs/commands/zh-CN/ui.md`、`docs/development/commands/ui.md`、`docs/development/commands/README.md`、`COMPATIBILITY.md`、`../libra-backend/apps/tanstack-app/content/docs/commands/ui.en.md`
 
 **Release write set:** Inherited
 
 **Files likely touched:** 上述文件
 
-**Docs and compatibility impact:** 逐文件：`docs/commands/ui.md`（状态页、可用性矩阵与标签文案）、`docs/commands/zh-CN/ui.md`（同义）、`docs/development/commands/ui.md`、`docs/development/commands/README.md`、`COMPATIBILITY.md:179`、网站 `commands/ui.en.md`。`docs/error-codes.md` N/A。
+**Docs and compatibility impact:** 逐文件：`docs/commands/ui.md`（状态页、可用性矩阵、dirty 摘要口径与标签文案）、`docs/commands/zh-CN/ui.md`（同义）、`docs/development/commands/ui.md`、`docs/development/commands/README.md`、`COMPATIBILITY.md:179`、网站 `commands/ui.en.md`。`docs/error-codes.md` N/A。
 
 **Rollback mode:** `compensating`
 
@@ -858,7 +871,7 @@
 
 **Security and privacy:** 只显示仓库相对路径与分支名；不显示宿主绝对路径。
 
-**Performance budget:** 可用性探测 ≤80ms（存在性/可打开检查）；dirty 摘要 ≤250ms（≤5k 文件 stat 扫描）。
+**Performance budget:** 可用性探测 ≤80ms（存在性/读打开探测）；dirty 摘要 ≤200ms（stat-only，≤5k 文件；不做内容哈希）。
 
 **Estimated scope:** M
 
@@ -868,39 +881,39 @@
 
 **C/D coverage from:** `self`
 
-**Granularity:** `type=implementation; axis=仓库与数据面可用性呈现; recovery=compensating; complete=yes; self-contained=yes; AC=8/8; VER=6/8; landing=3; prod-files=7; scope=M; deps=UID-06,DEP-UID-01,DEP-UID-02; writeset=序列化于 UID-06; release=independent; split-from=N/A; exception=N/A`
+**Granularity:** `type=implementation; axis=仓库与数据面可用性呈现; recovery=compensating; complete=yes; self-contained=yes; AC=8/8; VER=6/8; landing=3; prod-files=8; scope=M; deps=UID-06,DEP-UID-01,DEP-UID-02,DEP-UID-03,DEP-UID-04; writeset=序列化于 UID-06; release=independent; split-from=N/A; exception=N/A`
 
 ## 测试矩阵
 
 | 类别 | 必须覆盖 | Target / command |
 |---|---|---|
-| 单元 | 仓库上下文、worker supersession/队列/关闭/stalled、源级状态分类 | `source .env.test && cargo nextest run --lib gui::data::tests::uid01_` |
-| 单元 | 各表面行、归属、分页 revision token、redaction、条目级状态 | `source .env.test && cargo nextest run --lib gui::data::tests::uid0` |
+| 单元 | 仓库上下文、worker supersession/队列/关闭/stalled、源级状态分类 | `source .env.test && cargo nextest run --lib -E 'test(uid01_)'` |
+| 单元 | 各表面行、归属、id 快照分页、redaction、条目级状态、dirty 摘要 | `source .env.test && cargo nextest run --lib -E 'test(uid0)'` |
 | 集成 | `libra ui` CLI 表面不变 | `source .env.test && cargo nextest run --test command_test -E 'test(command::ui_test)'` |
 | 集成 | session 列表分页契约（提升后的共享 SQL） | `source .env.test && cargo nextest run --test agent_checkpoint_reader_test -E 'test(session_list_walks_keyset_pages)'` |
 | 集成 | 提升后的读 API 不改变既有命令输出 | `source .env.test && cargo nextest run --test command_test -E 'test(command::op_test) or test(command::memory_test)'` |
 | 兼容 | 文档与 `COMPATIBILITY.md` 同步守卫 | `python3 scripts/sync-libra-command-docs.py --libra-root ../libra --only ui`（后端仓库） |
 | 安全 | 无裸 panic（数据层）、无绝对路径、redaction、不构造 `SessionStore` | `rg` 零命中守卫（模板三分支，排除 `tests.rs`） |
-| 性能 | 上限截断与实测成本记录 | 数据层单测中的规模断言（≤200 行/≤300ms/≥10k 规模实测） |
+| 性能 | 上限截断与实测成本记录 | 数据层单测中的规模断言（≤200 行/≤400ms/≥10k 规模实测） |
 | live/gated | 窗口人工验收（需显示器） | 手工：`./target/debug/libra ui` |
 
 ## 追溯表
 
 | 任务 | 来源/证据 | Libra 落点 | 文档/兼容动作 | 指定测试 |
 |---|---|---|---|---|
-| `UID-01` | `src/gui/mod.rs:30`、`src/utils/util.rs:1269`、`src/internal/db.rs:217`、`src/internal/db/schema.rs:381` | `src/gui/data/{mod,repo,worker,snapshot,state}.rs`、`src/gui/mod.rs`、`src/gui/desktop.rs` | `docs/commands/ui.md` EN+zh、开发文档、开发文档索引、`COMPATIBILITY.md`、网站 | `uid01_context_snapshot_in_repository`、`uid01_source_state_classification`、`uid01_shutdown_and_stalled` (new) |
-| `UID-02` | `src/gui/screens/history.rs:20`、`:224`、`:95`、`sql/migrations/2026111601_capture_database.sql:329` | `src/command/agent/{session,mod}.rs`、`src/gui/data/history.rs`、`src/gui/screens/history.rs` | 同上 | `uid02_history_rows`、`uid02_attribution_and_graph` (new) |
-| `UID-03` | `src/gui/model.rs:14`、`src/command/agent/session.rs:390`、`src/internal/ai/capture/store.rs:93` | `src/command/agent/{session,mod}.rs`、`src/gui/data/sessions.rs`、`src/gui/view.rs`、`src/gui/model.rs` | 同上（含 redaction 与过渡接口） | `uid03_session_rows`、`uid03_redaction_and_payload_cap` (new) |
-| `UID-04` | `src/command/op.rs:662`、`src/internal/operation/store.rs:949` | `src/command/op.rs`、`src/gui/data/operations.rs`、`src/gui/screens/operations.rs` | 同上（revision token） | `uid04_operation_rows`、`uid04_pagination_revision_token` (new) |
-| `UID-05` | `src/internal/ai/memory/reader.rs:198`、`:315`、`:165` | `src/internal/ai/memory/reader.rs`、`src/gui/data/memory.rs`、`src/gui/screens/memory.rs` | 同上（stale 与 freshness 成本） | `uid05_episode_rows`、`uid05_bounded_children_and_stale` (new) |
-| `UID-06` | `src/internal/ai/review/mod.rs:6`、`src/internal/ai/review/store.rs:1226` | `src/gui/data/runs.rs`、`src/gui/screens/reviews.rs`、`src/gui/screens/investigate.rs` | 同上（条目级状态与上限） | `uid06_run_rows`、`uid06_item_states_and_limits` (new) |
-| `UID-07` | `src/gui/screens/splash.rs:67`、`src/gui/screens/about.rs:69`、`src/gui/desktop.rs:332` | `src/gui/data/context.rs`、四个屏幕、`src/gui/desktop.rs` | 同上（可用性状态与标签） | `uid07_context_and_availability`、`uid07_dirty_count` (new) |
+| `UID-01` | `src/gui/mod.rs:30`、`src/utils/util.rs:1269`、`src/internal/db.rs:217`、`src/internal/db/schema.rs:381` | `src/gui/data/{mod,repo,worker,snapshot,state}.rs`、`src/gui/mod.rs`、`src/gui/desktop.rs` | `docs/commands/ui.md` EN+zh、开发文档、开发文档索引、`COMPATIBILITY.md`、网站 | `uid01_` 系列 (new) |
+| `UID-02` | `src/gui/screens/history.rs:20`、`:224`、`:95`、`sql/migrations/2026111601_capture_database.sql:329` | `src/command/agent/{session,mod}.rs`、`src/gui/data/history.rs`、`src/gui/screens/history.rs` | 同上 | `uid02_` 系列 (new) |
+| `UID-03` | `src/gui/model.rs:14`、`src/command/agent/session.rs:390`、`src/internal/ai/capture/store.rs:93` | `src/command/agent/{session,mod}.rs`、`src/gui/data/sessions.rs`、`src/gui/view.rs`、`src/gui/model.rs` | 同上（含 redaction 与过渡边界） | `uid03_` 系列 (new) |
+| `UID-04` | `src/command/op.rs:662`、`src/internal/operation/store.rs:757` | `src/command/op.rs`、`src/gui/data/operations.rs`、`src/gui/screens/operations.rs` | 同上（id 快照语义） | `uid04_` 系列 (new) |
+| `UID-05` | `src/internal/ai/memory/reader.rs:198`、`:315`、`:165` | `src/internal/ai/memory/reader.rs`、`src/gui/data/memory.rs`、`src/gui/screens/memory.rs` | 同上（stale 与 freshness 成本） | `uid05_` 系列 (new) |
+| `UID-06` | `src/internal/ai/review/mod.rs:6`、`src/internal/ai/review/store.rs:1226` | `src/gui/data/runs.rs`、`src/gui/screens/reviews.rs`、`src/gui/screens/investigate.rs` | 同上（条目级状态与上限） | `uid06_` 系列 (new) |
+| `UID-07` | `src/gui/screens/splash.rs:67`、`src/gui/screens/about.rs:69`、`src/gui/desktop.rs:332`、`src/command/status.rs:1586` | `src/gui/data/context.rs`、五个屏幕、`src/gui/model.rs`、`src/gui/desktop.rs` | 同上（可用性状态、dirty 口径与标签） | `uid07_` 系列 (new) |
 
 ## 里程碑验收与回滚
 
 | 里程碑 | 完成条件 | 发布/证据 | 回滚或前滚 |
 |---|---|---|---|
-| M0 | 基线冻结、计划 R4 review PASS、维护者授权 | 计划文件签名提交、`plan-status.md` 行 | N/A |
+| M0 | 基线冻结、计划 R5 review PASS、维护者授权 | 计划文件签名提交、`plan-status.md` 行 | N/A |
 | M1 | `UID-01` `done`/`complete` | patch 发布、`release.yml` success、D 组绿 | 发布前：revert 提交；发布后：补偿发布 + 网站重同步 |
 | M2 | `UID-02`..`UID-07` 全部 `done`/`complete` | 六次独立发布与 D 组证据 | 同上逐卡补偿 |
 | M3 | 计划完成判据全部满足 | 全量收口门绿、计划状态同步；**收口时做一次补偿演练**（revert 一项已发布卡并重发/重同步） | 前滚修复 |
@@ -911,12 +924,12 @@
 |---|---|---|---|
 | worker 启动后窗口打开前失败 | 无 | 重开窗口或显示状态 | 主线程 panic |
 | 读取中途数据库被外部迁移 | 无（不写） | 显示 `schema-old`/`schema-new`，用户用 CLI 升级 | 自动迁移或静默降级 |
-| 窗口关闭时 worker 仍在读 | 已投递旧快照（丢弃） | 置取消标志；预算内等待；超 deadline 记录 `worker stalled`，surviving 线程由 handle 持有 | 无限等待、主线程阻塞或线程泄漏无主 |
+| 窗口关闭时 worker 仍在读 | 已投递旧快照（丢弃） | 预算内 joined，或控制侧记录 `worker stalled` 并由 `gui::run` 持有 handle | 无限等待、主线程阻塞或线程无主 |
 | `capture.db` 未创建 | 无 | 显示 `absent` | 回退演示数据 |
-| `capture.db` 不可读/权限拒绝 | 无 | 显示 `unreadable`（前置探测保留 io kind，消息脱敏） | 把不可读当空状态 |
+| `capture.db` 不可读/权限拒绝 | 无 | 显示 `unreadable`（读打开探测保留 io kind，消息脱敏） | 把不可读当空状态 |
 | 库结构损坏 | 无 | 显示 `corrupt` | 把损坏当空状态 |
-| run 目录损坏/超大 | 该行 `malformed`/`oversized` | 逐项隔离，其余可用 | 整页失败 |
-| 目录扫描超过 5000 | 列表标记 `truncated` | 显示最新 100 行 | 静默截断 |
+| run 目录损坏/超大/缺件 | 该行条目级状态 | 逐项隔离，其余可用 | 整页失败 |
+| 扫描/解析超过上限 | 列表标记 `truncated` | 显示已检查子集的最新行 | 静默截断 |
 | 快照序号乱序 | 无 | 丢弃过期响应并重发 | 用旧数据覆盖新数据 |
 | 已发布版本/网站回滚需求 | 已发布 artifact 保留 | revert 提交 + 新 patch 发布 + 网站重同步（补偿键=新版本号） | 删除已发布 artifact 或强推 |
 
@@ -924,13 +937,13 @@
 
 | 风险 | 影响 | 缓解 | 任务 |
 |---|---|---|---|
-| GPUI 主线程被 I/O 阻塞导致窗口冻结 | 高：用户以为程序卡死 | GC-UID-01 + worker 单测（含停滞模拟）+ 手工验收 | `UID-01` |
-| 只读面触发 schema 升级或 operation 行 | 高：污染仓库状态 | ADR-UID-02 + 无 schema 管理连接 + 读后状态不变判据 | `UID-01` |
+| GPUI 主线程被 I/O 阻塞导致窗口冻结 | 高：用户以为程序卡死 | GC-UID-01 + worker 单测（含不可合作慢读）+ 手工验收 | `UID-01` |
+| 只读面触发 schema 升级、operation 行或证书写入 | 高：污染仓库状态 | ADR-UID-02 + 无 schema 管理连接 + stat-only dirty + 读后状态不变判据 | `UID-01`/`UID-07` |
 | GUI 复制命令逻辑导致语义漂移 | 中：显示错误事实 | ADR-UID-03 + 提升共享读 API + CLI 输出回归 | `UID-02`..`UID-05` |
 | Agent 内容泄漏 secret 或绝对路径 | 高：隐私暴露 | ADR-UID-04 + redaction 复用 + 路径转换 + 脱敏 | `UID-03` |
-| 演示数据兜底掩盖读取失败 | 中：用户看到假数据 | GC-UID-05 + ADR-UID-06 + 过渡接口边界 | 全部 |
+| 演示数据兜底掩盖读取失败 | 中：用户看到假数据 | GC-UID-05 + ADR-UID-06 + 固定迁移序列 | 全部 |
 | 与 20261117 批次并发改共享文档 | 中：冲突/覆盖 | ER-12 文件级串行窗口 + 精确暂存 | 全部 |
-| 大仓库读取超预算 | 中：窗口迟滞 | 行/字节/目录上限 + 实测成本记录（不做虚假 O(200) 承诺） | `UID-02`..`UID-06` |
+| 大仓库读取超预算 | 中：窗口迟滞 | 行/字节/解析上限 + 实测成本记录（不做虚假 O(200) 承诺） | `UID-02`..`UID-06` |
 | `storage_path()`/`get_db_conn_instance()` panic 路径被误用 | 高：窗口崩溃 | 只用 `RequestScope::try_resolve`/`try_get_storage_path`/注入连接 | `UID-01` |
 | 提升共享读 API 破坏 CLI 输出 | 高：兼容回归 | 同卡 CLI 输出回归测试 + `T-1` 全量门 | `UID-02`..`UID-05` |
 
@@ -939,13 +952,13 @@
 | 操作 | 单次成本 | 累积成本 | 预算/上限 | 验证 |
 |---|---|---|---|---|
 | 仓库上下文快照 | O(1) 存在性/scope 检查 | 每窗口一次 | ≤50ms | `UID-01` 单测 |
-| 提交历史列表 | O(200 提交元数据 + 父链) | 每次页面重读 | ≤150ms、200 行 | `UID-02` 单测 |
+| 提交历史列表 + 归属 | O(200 提交元数据 + 父链) + 一次批量归属查询 | 每次页面重读 | ≤150ms、200 行 | `UID-02` 单测 |
 | 会话列表/详情 | O(200 会话)、O(100 事件) | 每次页面重读 | ≤200ms / ≤100ms | `UID-03` 单测 |
-| operation 单页 | ranked CTE 对仓库历史排序 + COUNT（既有成本，非 O(200)） | 每次翻页 | ≤150ms；≥10k operation 实测记录 | `UID-04` 单测 |
-| memory 单页 | O(200 选中 episode) + 选中集合子表 + 全源 freshness | 每次页面重读 | ≤150ms；≥10k episode 实测记录 | `UID-05` 单测 |
-| run 列表/详情 | 全目录扫描 ≤5000 metadata + 最新 100 × ≤64 KiB 有界读 | 每次页面重读 | ≤300ms / ≤50ms、100 行 | `UID-06` 单测 |
+| operation 单页 | id 快照（≤50k id）+ 既有 ranked CTE 成本 | 每次翻页 | ≤150ms；≥10k operation 实测记录 | `UID-04` 单测 |
+| memory 单页 | O(200 选中 episode) + 选中集合子表 + 全源 freshness（随链接 operation 数增长） | 每次页面重读 | ≤150ms；≥10k episode/≥50k link 实测记录 | `UID-05` 单测 |
+| run 列表/详情 | metadata ≤5000 + state 解析 ≤500 × ≤64 KiB | 每次页面重读 | ≤400ms / ≤50ms、100 行 | `UID-06` 单测 |
 | 可用性探测 | O(5 数据面) | 每窗口一次 | ≤80ms | `UID-07` 单测 |
-| dirty 摘要 | O(工作树 stat，≤5k 文件) | 每窗口一次 | ≤250ms | `UID-07` 单测 |
+| dirty 摘要（stat-only，不哈希） | O(工作树 stat，≤5k 文件) | 每窗口一次 | ≤200ms | `UID-07` 单测 |
 
 ## 兼容与文档收口
 
@@ -965,9 +978,10 @@ Result 只允许 `PASS` 或 `FAIL`。`FAIL` 必须列出 P0/P1 条目并在下�
 
 | Round | Scope | Result | P0/P1 | P2 处置 | Evidence |
 |---|---|---|---|---|---|
-| R1 | 全文（首版，SHA-256 `286ed2943ff417e25024b8d441fd714d27abe510d7cc2cb6ecb015fd4ad3197d`） | FAIL | Codex：P0=0；P1=7（迁移默认开启、`SessionStore` 副作用、无界读、History 演示语义、D 组缺 `release.yml`、focused nextest 未覆盖全部表面、网站不可写误记 `remote-pending`、worker 关闭无取消边界）。Claude：P0=0；P1=7（AC 捆绑、写集漏共享 API 提升且 `T-1` 误写 `none`、写集相交未入图、未登记 `ui` 修复依赖） | 修订：拆卡、AC 逐谓词、补 `T-1`、补依赖边、补 `release.yml`、补 `compensating`、补状态矩阵、补守卫命令、修正锚点与计数 | Codex exec 与 Claude Code 只读全文审查（2026-11-20 18:0x UTC） |
-| R2 | 全文（第二版，SHA-256 `eea3da953ed91a58986ffbb5317b94acc0c5f303431be4639ae599409c69bb6b`） | FAIL | Codex：P0=0；P1=7（归属 helper 迁移注入、关闭边界不可执行、memory 子查询无界、op CTE 成本非 O(200)、offset 翻页重复、run 目录/文档无上限、缺 session CLI focused 门）。Claude：P0=0；P1=6（AC 计数口径、写集漏调用方/`tests.rs`、守卫不可命中或不可通过、目录消费者三处矛盾、D 组未枚举 job、DEP 粒度/等待上限） | 修订：注入连接 + busy timeout、scope pin、memory 伴生 API、op 真实成本 + head pin、run 目录/字节上限、源级/条目级状态分离、D 组枚举 job、守卫具体模式、`op log`、相对路径、prod-file 计数、DEP 粒度、补偿演练收口一次 | Codex exec 与 Claude Code 只读全文审查（2026-11-20 19:0x UTC） |
-| R3 | 全文（第三版，SHA-256 `4ab80bbebf9d4c785022b3deb1595ee252b5adc642489175a1c00fde7385eb1a`） | FAIL | Codex：P0=0；P1=8（归属仍自开连接、关闭 ADR/AC 冲突、memory 页内 freshness 与全源指纹冲突、op head 不足以稳定 offset、run 字节上限仅预检、schema 检查绕过注入、权限错误被 `is_file()` 抹掉、AC→test 映射与 `gui::data::tests::*` 路径）。Claude：P0=0；P1=5（写集漏 `agent/mod.rs`、UID-01 计数、状态矩阵三缺口、`open_connection_without_schema_management` 也是读写打开的误述、op head scope/页码/事务、run 扫描与守卫正则、History 残留文案无归属、DEP 消费者与 README 窗口、演示目录过渡矛盾、缺「非目标与延后项」「完成判据」两节） | 修订：双连接注入并移除内部 open；补 `agent/mod.rs`；关闭 ADR/AC 对齐；freshness 保留全源成本；op revision token；run 打开句柄有界读 + 全目录扫描 + truncated；schema 用按连接 API + Capture 自身 `schema_versions`；权限前置探测；AC 拆分并给具名 test fn；守卫正则；DEP 消费者/README 窗口/页面数；补回两节 | Codex exec 与 Claude Code 只读全文审查（2026-11-20 20:0x UTC） |
+| R1 | 全文（首版，SHA-256 `286ed2943ff417e25024b8d441fd714d27abe510d7cc2cb6ecb015fd4ad3197d`） | FAIL | Codex：P0=0；P1=7（迁移默认开启、`SessionStore` 副作用、无界读、History 演示语义、D 组缺 `release.yml`、focused 未覆盖全部表面、网站不可写误记 `remote-pending`、关闭无取消边界）。Claude：P0=0；P1=7（AC 捆绑、写集漏共享 API 提升且 `T-1` 误写 `none`、写集相交未入图、未登记 `ui` 修复依赖） | 修订：拆卡、AC 逐谓词、补 `T-1`、补依赖边、补 `release.yml`、补 `compensating`、补状态矩阵、补守卫命令、修正锚点与计数 | Codex exec 与 Claude Code 只读全文审查（2026-11-20 18:0x UTC） |
+| R2 | 全文（第二版，SHA-256 `eea3da953ed91a58986ffbb5317b94acc0c5f303431be4639ae599409c69bb6b`） | FAIL | Codex：P0=0；P1=7（归属迁移注入、关闭边界、memory 子查询无界、op CTE 成本、offset 翻页重复、run 目录/文档上限、缺 session CLI focused 门）。Claude：P0=0；P1=6（AC 计数口径、写集漏调用方/`tests.rs`、守卫不可命中或不可通过、目录消费者矛盾、D 组未枚举 job、DEP 粒度/等待上限） | 修订：注入连接 + busy timeout、scope pin、memory 伴生 API、op 真实成本、run 上限、状态分离、D 组枚举 job、守卫模式、`op log`、相对路径、计数、DEP 粒度、补偿演练收口一次 | Codex exec 与 Claude Code 只读全文审查（2026-11-20 19:0x UTC） |
+| R3 | 全文（第三版，SHA-256 `4ab80bbebf9d4c785022b3deb1595ee252b5adc642489175a1c00fde7385eb1a`） | FAIL | Codex：P0=0；P1=8（归属自开连接、关闭 ADR/AC 冲突、memory 页内 freshness 冲突、op head 不足、run 字节预检、schema 绕过注入、权限错误被抹、AC→test 映射与测试路径）。Claude：P0=0；P1=5（写集漏 `agent/mod.rs`、UID-01 计数、状态矩阵缺口、读写打开误述、op head/页码/事务、run 扫描与守卫、History 残留文案、DEP 消费者与 README、演示目录过渡矛盾、缺两节） | 修订：双连接注入并移除内部 open；补 `agent/mod.rs`；关闭 ADR/AC 对齐；freshness 全源成本；op head pin；run 句柄有界读；按连接 schema + Capture 自身 `schema_versions`；权限前置探测；AC 具名 test fn；守卫正则；DEP 消费者/README/页面数；补回两节 | Codex exec 与 Claude Code 只读全文审查（2026-11-20 20:0x UTC） |
+| R4 | 全文（第四版，SHA-256 `0c5ced37d011937f82a74b81fa32088431a4af2459e2d7f1677b9e30d575541e`） | FAIL | Codex：P0=0；P1=8（dirty reader 写证书、关闭仍要求不可中断线程结束、revision token 漏排序变化、metadata 不保留读打开权限失败、最新 100 无法由扫描预算保证、catalog 删除条件冲突、AC 计数仍捆绑、AC→test 映射缺失）。Claude：P0=0；P1=5（UID-03 写集/landing、UID-02 归属方向、关闭机制归属、UID-06 排序与 kind、状态矩阵/锚点漂移） | 修订：dirty 改 stat-only（不哈希、不写证书）、关闭改 controller 记录 + `gui::run` 持有 handle、op 改 id 快照、权限改读打开探测、run 改解析上限 500 + 每 kind 100 + truncated、History 改 commit-keyed 批量归属、catalog 迁移序列固定（UID-03 保留/UID-07 删除并改写 search）、AC 去 panic 捆绑 + 逐卡映射、每卡登记 DEP-03/04、DEP-UID-05 改行为门、修正锚点/landing 计数、ADR-UID-02 区分 capture 只读与 repo 读写 | Codex exec 与 Claude Code 只读全文审查（2026-11-20 21:0x UTC） |
 
 ## 非目标与延后项
 
@@ -977,7 +991,7 @@ Result 只允许 `PASS` 或 `FAIL`。`FAIL` 必须列出 P0/P1 条目并在下�
 | DEFER-UID-02 | 实时流式刷新（watcher/增量推送） | 快照模式已足够；避免线程与背压复杂度 | 用户要求实时更新 | 未来刷新计划 |
 | DEFER-UID-03 | 多仓库标签页与 `libra ui <path>` | 需要路径参数与状态隔离 | 多仓需求确认 | 未来多仓计划 |
 | DEFER-UID-04 | 远端/云数据（Mega2 traces、Cloud 快照） | 需要网络、认证与缓存策略 | 本地只读面稳定 | 未来云端数据计划 |
-| DEFER-UID-05 | 其余 16 个演示页：refs、agents、automation、bisect、blame、conflict、deps、lanes、rebase、search、settings、views、merge review、cloud、mega2 browser、splash error | 本计划只接六个数据表面 + 一个状态面 | 演示目录消费者全部迁移后 | 未来逐面接入计划 |
+| DEFER-UID-05 | 其余 16 个演示页：refs、agents、automation、bisect、blame、conflict、deps、lanes、rebase、search、settings、views、merge review、cloud、mega2 browser、splash error | 本计划只接六个数据表面 + 一个状态面（`search`/`capabilities` 仅做演示目录移除后的空/真实状态切换） | 演示目录消费者全部迁移后 | 未来逐面接入计划 |
 | DEFER-UID-06 | diff/hunk 内容视图 | 只接提交元数据与拓扑 | 需要 hunk 级审阅 | 未来 diff 面计划 |
 | DEFER-UID-07 | run 全文（findings/diff 内容） | 只显示摘要 | 需要审阅 run 细节 | 未来 run 详情计划 |
 | DEFER-UID-08 | Linux/Windows 桌面人工验收 | 验收平台为 macOS | 有对应桌面会话或图形 CI | 未来跨平台验收 |
