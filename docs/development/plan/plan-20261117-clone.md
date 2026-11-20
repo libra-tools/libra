@@ -1138,6 +1138,62 @@ PY
 
 ---
 
+### Task CL-08: 实现 `libra clone -l` / `--local` 硬链接本地对象（#743）
+
+**Task type:** `implementation`
+**Lifecycle / Acceptance:** `in-progress` / `locally-accepted`（2026-11-20：本地 Libra 源的对象传输改为「整体接管对象存储」：`adopt_local_objects` 先清空 fetch 产生的目标对象布局，再按源目录逐文件 `hard_link`（同一文件系统 → 共享 inode），首次失败后回退复制（Git `builtin/clone.c:365-369`），显式 `--local` 失败即 `LBR-IO-002`；`info/alternates` 由 `rewrite_alternates_absolute` 把相对条目改写为绝对路径；源对象目录出现符号链接即 fail-closed；`--no-local` 跳过该步骤；`LIBRA_TEST=1` 下的 `LIBRA_TEST_CLONE_HARDLINK_FAIL=first` 为注入接缝。`command::clone_test::test_clone_local_hardlinks_and_no_local` 覆盖 AC1、AC3、AC4、AC5，nextest 1 passed；`clone_test` 全模块 **55 passed / 0 failed**。**AC2（相对 alternates 夹具的端到端用例）尚未落地**，代码路径已实现，故本卡保持 `in-progress`/`locally-accepted`。）
+**Description:** 当从本地 Libra 仓库（`.libra` 源）执行 `libra clone`（默认或 `-l`/`--local`，未传 `--no-local`）且源与目标在同一文件系统时，使用 `std::fs::hard_link` 链接松散/pack 对象文件（对象目录中的 `info/alternates` 不按普通文件复制或硬链接，而按 Git `copy_alternates` 把相对条目改写为绝对路径写入目标，AC2；按 Git `builtin/clone.c:350-372`：默认本地路径在某个对象硬链接失败时改为复制，并对其后对象不再尝试硬链接；显式 `-l`/`--local` 时硬链接失败即以 `LBR-IO-002` 拒绝；`clone.rs:125-128` 对完整本地 Git 源的 `--depth`/`--filter` 警告为既有行为，本卡不改；本地 Git 源（`.git` 目录）沿用既有复制路径，其硬链接登记 `DEFER-CL-09`）。对象目录树中遇到任何符号链接（目录根 `.libra/objects`、子目录或对象文件）时 fail-closed 拒绝（Git `builtin/clone.c:328-330`），禁止跟随链接读取仓库外内容；复制或硬链接之前先核对源仓库元数据目录（普通仓库为 `<S>/.libra`，裸仓库为 `<S>` 本身；对应 Git 在 `clone_local`→`copy_or_link_directory` 中传给 `die_upon_dubious_ownership` 的 `src_repo`，`builtin/clone.c:381-389,298`）的属主与当前用户一致，不一致即 fail-closed 拒绝，对象目录不能代替这一检查（Libra 无 `safe.directory` 例外配置，本卡不新增）；以本卡新增的测试接缝 `LIBRA_TEST_CLONE_FOREIGN_OWNER=1`（仅 `LIBRA_TEST=1` 时读取，只作用于对源仓库元数据目录的属主判定，对象目录等其它路径的判定不受影响，因而只检查对象目录的实现不会拒绝）验收（AC7）；硬链接之后按 Git `builtin/clone.c:343-361` 用 `lstat` 比对新链接与遍历时观察到的源文件元数据（mode、inode、设备号、大小、uid、gid），不一致即以 `LBR-REPO-003` 拒绝（防遍历与链接之间源文件被替换），以本卡新增的测试接缝 `LIBRA_TEST_CLONE_SWAP_BEFORE_LINK=first`（仅 `LIBRA_TEST=1` 时读取：在记录第一个对象文件的元数据之后、对其调用 `hard_link` 之前，把该源文件替换为内容不同的新普通文件）验收（AC8）；复制回退路径与 Git 相同不另做竞态检测（源仓库属主已由 AC7 限定为当前用户）；默认本地路径与显式 `--local` 共用同一遍历与检查（AC6 对三种位置 × 两种调用形式共 6 个样本逐一验收，任何位置在任一调用形式下漏检都会使 AC6 失败）。硬链接失败回退以本卡新增的测试接缝 `LIBRA_TEST_CLONE_HARDLINK_FAIL=first`（仅 `LIBRA_TEST=1` 时读取，使本次克隆的第一次 `hard_link` 调用失败）注入。（先于 `CL-07` 落地以使 `--no-hardlinks` 可实测验证。）
+**Out of scope:** `--no-hardlinks` 标志（`CL-07`）与 `--reference`（`CL-10`）。
+**Current evidence:**
+
+| 事实 | 证据 |
+|---|---|
+| `#743` `CloneArgs::local` 文档明言始终复制从不硬链接 | `src/command/clone.rs:124-130`；`src/internal/protocol/local_client.rs:586`（`fetch_objects` 以打包传输取对象） |
+
+**Acceptance criteria:**（每条单谓词，按「验证执行协议」第 6 项计数）
+- [ ] **AC1** 同文件系统夹具 S（至少一个松散对象与一个 pack 及其 `.idx`）：显式 `libra clone --local <S> d` 与默认本地路径 `libra clone <S> d1`（不带 `-l`）退出 0 后，S 对象目录清单中的每一个文件（逐一枚举，不抽样）在 `d`、`d1` 中的对应文件都与其设备号、inode 相同（表驱动，按「验证执行协议」第 6 项计为 1 条：结局相同）。
+- [ ] **AC2** 源 alternates 的改写（表驱动，结局相同）：夹具 SA——`<T>/R` 为 S 的完整克隆；`libra clone --shared <T>/R <T>/SA` 建立借用 R 的源后，删除 `<T>/SA/.libra/objects/pack/` 下的全部文件（现行 `--shared` 仍会取回 pack），再把 `<T>/SA/.libra/objects/info/alternates` 改写为指向同一目录的相对路径 `../../../R/.libra/objects`；建夹具时断言 SA 自身对象数为 0 且 SA 中 `libra cat-file -p HEAD:a.txt` 退出 0（相对 alternates 在源内生效，2026-11-18 以 libra 0.30.207 实测）——之下，默认本地路径 `libra clone <T>/SA <T>/deep/x/d8` 与显式 `libra clone --local <T>/SA <T>/deep/x/d8b` 均退出 0，且两库中 `libra cat-file -p HEAD:a.txt`（该 blob 只在 R 中）均退出 0 并输出 S 中同一内容（Git `copy_alternates` 不逐字节复制该文件，而把相对条目改写为绝对路径写入目标，`builtin/clone.c:184-224`，并在复制/硬链接遍历中跳过 `info/alternates`，`:337-339`；原样复制或硬链接相对路径会在更深的目标下解析到不存在的 `<T>/deep/R`，读取失败）。
+- [ ] **AC3** `libra clone --no-local <S> d2` 退出 0 后，`d2` 的 `.libra/objects/` 下没有任何文件与 S 中任一对象文件的 (设备号, inode) 相同（以 `d2` 的对象完整、可读为前提）。
+- [ ] **AC4** 默认本地路径加硬链接故障注入（`LIBRA_TEST=1` 下本卡新增的测试接缝 `LIBRA_TEST_CLONE_HARDLINK_FAIL=first` 使本次克隆的第一次 `hard_link` 调用返回错误）：`libra clone <S> d3` 退出 0，且 `d3` 对象目录的清单「相对路径 →（SHA-256，是否与 S 对应文件共享 (设备号, inode)）」逐项等于「S 对象目录的每个文件 →（其 SHA-256，否）」（对象完整复制、无遗漏，且 Git 在首次硬链接失败后对其余对象也改为复制，`builtin/clone.c:365-369`）。
+- [ ] **AC5** 显式 `--local` 加同一故障注入时，`libra clone --local <S> d4` 以 `LBR-IO-002` 拒绝（Git 显式 `--local` 硬链接失败即 `die`，`builtin/clone.c:365-366`）。
+- [ ] **AC6** 符号链接拒绝（表驱动，按「验证执行协议」第 6 项计为 1 条：6 个样本的用户可见结局相同）：三种夹具——S 的对象目录根 `.libra/objects` 是指向仓库外目录的符号链接、对象子目录 `.libra/objects/pack` 是指向仓库外目录的符号链接、某个松散对象文件是指向仓库外文件的符号链接——各自以默认本地路径 `libra clone <S> <新目标>` 与显式 `libra clone --local <S> <新目标>` 两种形式调用，共 6 次调用全部以 `LBR-REPO-003` 拒绝（Git 对遍历中遇到的任何符号链接都拒绝，`builtin/clone.c:328-330`；默认本地路径与显式 `--local` 都走 `clone_local`）。
+- [ ] **AC7** 源仓库属主边界（表驱动，按「验证执行协议」第 6 项计为 1 条：结局相同）：`LIBRA_TEST=1` 下本卡新增的测试接缝 `LIBRA_TEST_CLONE_FOREIGN_OWNER=1` 使对源仓库元数据目录的属主判定视为非当前用户所有（普通源 S 为 `<S>/.libra`；裸源 SB——由 `libra clone --bare file://<S> SB` 生成——为 `<SB>` 本身；对象目录的判定不受影响）时，样本表 {S + 默认本地路径、S + 显式 `--local`、SB + 默认本地路径、SB + 显式 `--local`} 中每个 `libra clone [--local] <源> <新目标>` 均以 `LBR-REPO-003` 拒绝，不复制也不硬链接任何对象（Git 在复制或硬链接前以 `die_upon_dubious_ownership` 拒绝属主不同的源仓库，`builtin/clone.c:286-298`：跨用户硬链接的文件可被源属主任意改写；只检查对象目录或只处理普通布局的实现在此样本表下不能通过）。
+- [ ] **AC8** 硬链接后核对（表驱动，结局相同）：`LIBRA_TEST=1` 下本卡新增的测试接缝 `LIBRA_TEST_CLONE_SWAP_BEFORE_LINK=first` 在第一个对象文件被记录元数据之后、`hard_link` 之前把该源文件替换为内容不同的新普通文件时，默认本地路径 `libra clone <S> <新目标>` 与显式 `libra clone --local <S> <新目标>` 均以 `LBR-REPO-003` 拒绝（Git `builtin/clone.c:353-361` 对 inode 等元数据不一致的新链接 `die`）。
+- [ ] ER-06/ER-06a 同卡强制门：`Docs and compatibility impact` 所列文件均按「文档与网站验收命令」逐文件验收（不计入 G-03）。
+
+**AC → 断言映射:**（「验证执行协议」第 4、6 项：映射与 AC 表述同一谓词；成功类 `exit 0` 为读取输出的前提；失败类按第 6 项断言非零状态与稳定码）
+- AC1 → `command::clone_test::test_clone_local_hardlinks_objects_on_same_fs`：两次克隆的 `exit 0` 为前提；递归枚举 S 的对象目录清单（「对象目录清单」按「验证执行协议」第 7 项，不含 `info/alternates`）（含至少一个松散对象、一个 `.pack`、一个 `.idx`，正控制），「(目标库, 相对路径) → 与 S 对应文件 `std::os::unix::fs::MetadataExt` 的 `(dev, ino)` 是否相等」映射与「每项 → 真」映射做一次 `assert_eq!`（目标库为 `d`、`d1`）。
+- AC2 → `command::clone_test::test_clone_local_hardlinks_objects_on_same_fs`：两次克隆的 `exit 0` 为前提；「目标 → (`cat-file -p HEAD:a.txt` 的退出码, stdout)」映射与「每个目标 → (0, S 中 `libra cat-file -p HEAD:a.txt` 的 stdout)」映射做一次 `assert_eq!`（夹具断言已保证 SA 自身不含该 blob，读取只能经改写后的 alternates 成功）。
+- AC3 → `command::clone_test::test_clone_local_hardlinks_objects_on_same_fs`：`exit 0` 为前提；正控制：`d2` 对象目录的文件集合非空，且 S 中 `libra rev-list --objects --all` 的每个对象在 `d2` 按「验证执行协议」第 7 项判定为存在；然后收集 S 对象文件的 `(dev, ino)` 集合，`d2` 对象目录全部文件的 `(dev, ino)` 与之交集为空。
+- AC4 → `command::clone_test::test_clone_local_hardlink_failure_falls_back_to_copy`：`exit 0` 为前提；分别为 S 与 `d3` 的对象目录清单（「对象目录清单」按「验证执行协议」第 7 项，不含 `info/alternates`）构造该映射（S 侧第二项恒为「否」），两份清单做一次 `assert_eq!`；夹具 S 含检出树以外的对象（`S1` 版本 `a.txt` 的 blob）。
+- AC5 → `command::clone_test::test_clone_local_hardlink_failure_falls_back_to_copy`：进程以非零状态结束且 stderr 含 `LBR-IO-002`（「以…拒绝」的定义，「验证执行协议」第 6 项）。
+- AC6 → `command::clone_test::test_clone_local_rejects_symlinked_object_paths`：对 (夹具位置, 调用形式) 共 6 个样本逐一以新目标目录调用，得到「样本 → (进程以非零状态结束, stderr 含 `LBR-REPO-003`)」映射，与「每个样本 → (真, 真)」映射做一次 `assert_eq!`（「以…拒绝」的定义，「验证执行协议」第 6 项）；每个样本另按「验证执行协议」第 4 项检查克隆拒绝不变量。
+- AC7 → `command::clone_test::test_clone_local_rejects_symlinked_object_paths`：对四个样本逐一以新目标目录调用，得到「样本 → (进程以非零状态结束, stderr 含 `LBR-REPO-003`)」映射，与「每个样本 → (真, 真)」映射做一次 `assert_eq!`（「以…拒绝」的定义，「验证执行协议」第 6 项）；每个样本另按「验证执行协议」第 4 项检查克隆拒绝不变量。
+- AC8 → `command::clone_test::test_clone_local_rejects_symlinked_object_paths`：对两种调用形式逐一以新目标目录调用（每次重建 S），得到「形式 → (进程以非零状态结束, stderr 含 `LBR-REPO-003`)」映射，与「每种形式 → (真, 真)」映射做一次 `assert_eq!`；每个样本另按「验证执行协议」第 4 项检查克隆拒绝不变量。
+- 文档 AC（ER-06/ER-06a 同卡强制门，不计入 G-03）→ 「文档与网站验收命令」第 1–8 步；文档关键字：`hardlink`。
+
+**Verification:**
+- [ ] `source .env.test && cargo nextest run --test command_test -E 'test(=command::clone_test::test_clone_local_hardlinks_objects_on_same_fs)'` `(new)` — 卡特有用例（「验证执行协议」第 1–4 项），覆盖 AC1–AC3。
+- [ ] `source .env.test && cargo nextest run --test command_test -E 'test(=command::clone_test::test_clone_local_hardlink_failure_falls_back_to_copy)'` `(new)` — 卡特有用例（「验证执行协议」第 1–4 项），覆盖 AC4–AC5。
+- [ ] `source .env.test && cargo nextest run --test command_test -E 'test(=command::clone_test::test_clone_local_rejects_symlinked_object_paths)'` `(new)` — 卡特有用例（「验证执行协议」第 1–4 项），覆盖 AC6–AC8。
+- [ ] `source .env.test && cargo nextest run --test command_test -E 'test(=command::clone_test::test_clone_local_flag_accepted_for_local_source)'` — 共享回归组（「验证执行协议」第 5 项，预期 N=1）：既有 `-l`/`--local` 接受回归（`tests/command/clone_test.rs:953`）。
+
+**Full-suite trigger:** `T-1: 修改共享局部传输模块 src/internal/protocol/local_client.rs`
+**Dependencies:** `CL-06`
+**Deliverables:** `N/A`
+**Implementation write set:** `src/command/clone.rs`, `src/internal/protocol/local_client.rs`, `tests/command/clone_test.rs`, `docs/commands/clone.md`, `docs/commands/zh-CN/clone.md`, `docs/development/commands/clone.md`, `COMPATIBILITY.md`, `/Volumes/Data/gitmono/libra-backend/apps/tanstack-app/content/docs/commands/clone.en.md`
+**Release write set:** `Inherited`
+**Files likely touched:** `src/command/clone.rs`, `src/internal/protocol/local_client.rs`, `tests/command/clone_test.rs`
+**Docs and compatibility impact:** 逐文件同步 `docs/commands/clone.md`、`docs/commands/zh-CN/clone.md`、`docs/development/commands/clone.md`、`COMPATIBILITY.md`、`/Volumes/Data/gitmono/libra-backend/apps/tanstack-app/content/docs/commands/clone.en.md`（网站文件写前按「文档与网站验收命令」第 2 步核验 `cf` 分支）；`clone.md` 的 EN/zh-CN/开发文档与网站页更新原「从不硬链接」说明。
+**Rollback mode:** `immutable-release`
+**Estimated scope:** `M`
+**Version increment:** `patch`
+**Release boundary:** `independent`
+**C/D coverage from:** `self`
+**Granularity:** `type=implementation; axis=clone -l/--local 硬链接本地对象; recovery=推送前 revert，发布后前滚新 patch+降级指引; complete=yes; self-contained=yes; AC=8/8; VER=8/8; landing=2; prod-files=2; scope=M; deps=CL-06; writeset=串行于 CL-06; release=independent; split-from=N/A; exception=N/A`
+
+---
+
 ### Task CL-07: 支持 `libra clone --no-hardlinks` 标志（#742）
 
 **Task type:** `implementation`

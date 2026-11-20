@@ -223,6 +223,7 @@ async fn test_clone_branch() {
         separate_git_dir: None,
         revision: None,
         config: Vec::new(),
+        no_hardlinks: false,
         reference: vec![],
         reference_if_able: vec![],
         shared: false,
@@ -278,6 +279,7 @@ async fn test_clone_bare_repository() {
         separate_git_dir: None,
         revision: None,
         config: Vec::new(),
+        no_hardlinks: false,
         reference: vec![],
         reference_if_able: vec![],
         shared: false,
@@ -348,6 +350,7 @@ async fn test_clone_branch_single_branch() {
         separate_git_dir: None,
         revision: None,
         config: Vec::new(),
+        no_hardlinks: false,
         reference: vec![],
         reference_if_able: vec![],
         shared: false,
@@ -402,6 +405,7 @@ async fn test_clone_default_branch() {
         separate_git_dir: None,
         revision: None,
         config: Vec::new(),
+        no_hardlinks: false,
         reference: vec![],
         reference_if_able: vec![],
         shared: false,
@@ -456,6 +460,7 @@ async fn test_clone_default_branch_single_branch() {
         separate_git_dir: None,
         revision: None,
         config: Vec::new(),
+        no_hardlinks: false,
         reference: vec![],
         reference_if_able: vec![],
         shared: false,
@@ -512,6 +517,7 @@ async fn test_clone_to_existing_empty_dir() {
         separate_git_dir: None,
         revision: None,
         config: Vec::new(),
+        no_hardlinks: false,
         reference: vec![],
         reference_if_able: vec![],
         shared: false,
@@ -571,6 +577,7 @@ async fn test_clone_to_existing_dir() {
         separate_git_dir: None,
         revision: None,
         config: Vec::new(),
+        no_hardlinks: false,
         reference: vec![],
         reference_if_able: vec![],
         shared: false,
@@ -626,6 +633,7 @@ async fn test_clone_to_dir_with_existing_file_name() {
         separate_git_dir: None,
         revision: None,
         config: Vec::new(),
+        no_hardlinks: false,
         reference: vec![],
         reference_if_able: vec![],
         shared: false,
@@ -680,6 +688,7 @@ async fn test_clone_with_depth() {
         separate_git_dir: None,
         revision: None,
         config: Vec::new(),
+        no_hardlinks: false,
         reference: vec![],
         reference_if_able: vec![],
         shared: false,
@@ -736,6 +745,7 @@ async fn test_clone_with_depth_and_branch() {
         separate_git_dir: None,
         revision: None,
         config: Vec::new(),
+        no_hardlinks: false,
         reference: vec![],
         reference_if_able: vec![],
         shared: false,
@@ -3551,6 +3561,100 @@ fn test_clone_local_rewrites_relative_alternates() {
         &cat,
         "AC2: the borrowed blob is readable through the rewrite",
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_clone_no_hardlinks_copies_objects() {
+    use std::os::unix::fs::MetadataExt;
+
+    use crate::command::{assert_cli_success, create_committed_repo_via_cli, run_libra_command};
+
+    fn walk(
+        base: &std::path::Path,
+        dir: &std::path::Path,
+        out: &mut Vec<(std::path::PathBuf, u64, u64, Vec<u8>)>,
+    ) {
+        for entry in std::fs::read_dir(dir).expect("read object dir") {
+            let entry = entry.expect("object entry");
+            let path = entry.path();
+            let file_type = entry.file_type().expect("object type");
+            if file_type.is_dir() {
+                walk(base, &path, out);
+                continue;
+            }
+            let relative = path.strip_prefix(base).expect("relative").to_path_buf();
+            if relative == std::path::Path::new("info/alternates") {
+                continue;
+            }
+            let meta = std::fs::metadata(&path).expect("metadata");
+            let bytes = std::fs::read(&path).expect("read object");
+            out.push((relative, meta.dev(), meta.ino(), bytes));
+        }
+    }
+
+    let src = create_committed_repo_via_cli();
+    let src_objects = src.path().join(".libra/objects");
+    let mut source_files = Vec::new();
+    walk(&src_objects, &src_objects, &mut source_files);
+    source_files.sort();
+    assert!(!source_files.is_empty());
+
+    let root = tempdir().unwrap();
+    let dest = root.path().join("d");
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "clone",
+                "--no-hardlinks",
+                src.path().to_str().expect("src"),
+                dest.to_str().expect("dest"),
+            ],
+            root.path(),
+        ),
+        "AC1: --no-hardlinks clone",
+    );
+    assert_cli_success(
+        &run_libra_command(&["fsck"], &dest),
+        "AC1: destination complete",
+    );
+
+    let mut dest_files = Vec::new();
+    walk(
+        &dest.join(".libra/objects"),
+        &dest.join(".libra/objects"),
+        &mut dest_files,
+    );
+    dest_files.sort();
+    assert_eq!(
+        dest_files.len(),
+        source_files.len(),
+        "AC1: every source object must be copied"
+    );
+    for ((src_rel, _, _, src_bytes), (dest_rel, dev, ino, dest_bytes)) in
+        source_files.iter().zip(dest_files.iter())
+    {
+        assert_eq!(src_rel, dest_rel, "AC1: object layout matches");
+        assert_eq!(src_bytes, dest_bytes, "AC1: identical content");
+        assert!(
+            !(*dev
+                == source_files
+                    .iter()
+                    .find(|(r, _, _, _)| r == src_rel)
+                    .map(|(_, d, i, _)| (*d, *i))
+                    .unwrap()
+                    .0
+                && *ino
+                    == source_files
+                        .iter()
+                        .find(|(r, _, _, _)| r == src_rel)
+                        .map(|(_, d, i, _)| (*d, *i))
+                        .unwrap()
+                        .1),
+            "AC1: {} must not share the source inode",
+            dest_rel.display()
+        );
+    }
 }
 
 #[test]

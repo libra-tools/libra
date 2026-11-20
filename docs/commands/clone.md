@@ -659,7 +659,7 @@ not, because its operation-log model fetches all refs by design.
 | Reference repository | `--reference <repo>` / `--reference-if-able <repo>` | N/A | accepted no-op (no fetch-side alternate negotiation); `--reference` warns, `--reference-if-able` silent |
 | Shared object store | `--shared` / `-s` | N/A | guarded alternate for local Libra source; v1 still copies objects; explicit use on other sources warns |
 | Dissociate from reference | `--dissociate` | N/A | disables shared alternate registration; fetched objects are already copied |
-| No hardlinks | `--no-hardlinks` | N/A | N/A |
+| No hardlinks | `--no-hardlinks` | N/A | Force copying local objects instead of hard-linking |
 | Recurse submodules | `--recurse-submodules` | N/A | N/A (no submodules) |
 | Shallow submodules | `--shallow-submodules` | N/A | N/A |
 | Separate git dir | `--separate-git-dir=<dir>` | N/A | N/A (removed) |

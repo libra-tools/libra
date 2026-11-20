@@ -161,6 +161,11 @@ pub struct CloneArgs {
     #[clap(long = "no-local", overrides_with = "local")]
     pub no_local: bool,
 
+    /// Force copying local objects instead of hard-linking them, matching
+    /// `git clone --no-hardlinks`.
+    #[clap(long = "no-hardlinks")]
+    pub no_hardlinks: bool,
+
     /// Fail if the source repository is shallow (matching
     /// `git clone --reject-shallow`). A local Git shallow source is inspected
     /// before the destination is created. A network source is checked after
@@ -1111,6 +1116,7 @@ fn adopt_local_objects(
     source_objects: &Path,
     dest_objects: &Path,
     explicit_local: bool,
+    hardlink: bool,
 ) -> Result<(), String> {
     let mut files = Vec::new();
     collect_object_files(source_objects, source_objects, &mut files)?;
@@ -1134,7 +1140,7 @@ fn adopt_local_objects(
         }
     }
     let mut pending_fault = clone_hardlink_fault_injected();
-    let mut fallback = false;
+    let mut fallback = !hardlink;
     for relative in files {
         let source_file = source_objects.join(&relative);
         let dest_file = dest_objects.join(&relative);
@@ -2256,8 +2262,13 @@ async fn clone_into_destination(
         } else {
             local_path.join(util::ROOT_DIR).join("objects")
         };
-        adopt_local_objects(&source_objects, &dest_objects, args.local)
-            .map_err(|message| CloneError::HardlinkFailed { message })?;
+        adopt_local_objects(
+            &source_objects,
+            &dest_objects,
+            args.local,
+            !args.no_hardlinks,
+        )
+        .map_err(|message| CloneError::HardlinkFailed { message })?;
         rewrite_alternates_absolute(&source_objects, &dest_objects)
             .map_err(|message| CloneError::HardlinkFailed { message })?;
     }
