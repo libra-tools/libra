@@ -64,6 +64,10 @@ libra rev-parse --show-ref-storage-format
 
 ## Options
 
+A Git describe name (`<ref>-<count>-g<hex>`) also resolves: after the tag,
+local-branch and remote-branch literal lookups miss, the trailing object id names
+the commit (`v1-2-gabc1234`). An existing ref with exactly that name still wins.
+
 | Flag | Description |
 |------|-------------|
 | `--verify` | Assert that `<SPEC>` resolves to exactly one object; print it, or exit 128 on failure (silent exit 1 under the global `--quiet` / `-q`). |

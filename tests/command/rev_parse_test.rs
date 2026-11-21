@@ -1746,3 +1746,58 @@ fn test_rev_parse_message_search_matrix() {
         String::from_utf8_lossy(&show.stdout)
     );
 }
+
+#[test]
+fn test_rev_parse_resolves_describe_suffix() {
+    use crate::command::{assert_cli_success, run_libra_command};
+
+    let repo = tempfile::tempdir().expect("repo");
+    let p = repo.path();
+    assert_cli_success(&run_libra_command(&["init"], p), "init");
+    run_libra_command(&["config", "set", "user.name", "t"], p);
+    run_libra_command(&["config", "set", "user.email", "t@t"], p);
+    std::fs::write(p.join("f.txt"), "one\n").expect("write f");
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], p), "stage");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c1", "--no-verify"], p),
+        "commit c1",
+    );
+    let c1 = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], p).stdout)
+        .trim()
+        .to_string();
+    let short = &c1[..8];
+    assert_cli_success(&run_libra_command(&["tag", "v1"], p), "tag v1");
+
+    // A second commit for the literal-precedence case.
+    std::fs::write(p.join("f.txt"), "two\n").expect("write f2");
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], p), "stage f2");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c2", "--no-verify"], p),
+        "commit c2",
+    );
+    let c2 = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], p).stdout)
+        .trim()
+        .to_string();
+
+    let resolve = |spec: &str| {
+        let out = run_libra_command(&["rev-parse", spec], p);
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+
+    // AC1: `<tag>-<count>-g<abbrev>` names the abbreviated commit.
+    assert_eq!(resolve(&format!("v1-1-g{short}")), c1, "AC1");
+
+    // AC2: the count may contain hex letters and the trailing id may be full.
+    assert_eq!(resolve(&format!("x-1a-g{c1}")), c1, "AC2");
+
+    // AC3: an existing ref with that exact name wins over the suffix parse.
+    assert_cli_success(
+        &run_libra_command(&["branch", &format!("v1-1-g{short}"), &c2], p),
+        "branch with a describe-shaped name",
+    );
+    assert_eq!(
+        resolve(&format!("v1-1-g{short}")),
+        c2,
+        "AC3: the literal branch wins"
+    );
+}

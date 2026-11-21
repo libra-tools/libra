@@ -2504,7 +2504,46 @@ async fn resolve_object_atom_typed(name: &str) -> Result<ResolvedAtom, CommitBas
         return Ok(branch);
     }
 
+    // Git's describe suffix (`<ref>-<count>-g<hex>`): the literal lookups above
+    // win, then the trailing object id names the commit (ADR-DESC-03).
+    if let Some((_base, _count, hash)) = split_describe_name(name) {
+        return resolve_hash_atom_typed(&hash).await;
+    }
+
     resolve_hash_atom_typed(name).await
+}
+
+/// Split a Git describe name `<ref>-<count>-g<hex>` into its parts.
+///
+/// `<count>` is one or more hex digits, `<ref>` must be a valid ref name and
+/// cannot be `@`. The rightmost valid split wins, mirroring Git's
+/// `get_describe_name`.
+fn split_describe_name(name: &str) -> Option<(String, String, String)> {
+    let bytes = name.as_bytes();
+    let mut search_end = bytes.len();
+    while let Some(offset) = name[..search_end].rfind("-g") {
+        let hash = &name[offset + 2..];
+        if !hash.is_empty() && hash.chars().all(|c| c.is_ascii_hexdigit()) {
+            let prefix = &name[..offset];
+            if let Some(dash) = prefix.rfind('-') {
+                let base = &prefix[..dash];
+                let count = &prefix[dash + 1..];
+                if !base.is_empty()
+                    && base != "@"
+                    && !count.is_empty()
+                    && count.chars().all(|c| c.is_ascii_hexdigit())
+                    && is_valid_refname(&format!("refs/{base}"))
+                {
+                    return Some((base.to_string(), count.to_string(), hash.to_string()));
+                }
+            }
+        }
+        search_end = offset;
+        if search_end == 0 {
+            break;
+        }
+    }
+    None
 }
 
 fn peel_tag_target_typed(
