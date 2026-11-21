@@ -412,10 +412,18 @@ async fn run_describe_contains(
     if exact_match_only {
         return match tag_map.get(&start_hash) {
             Some(info) => {
+                // An annotated tag that points directly at the target renders
+                // as `<tag>^0` (the tag object, not the commit), matching the
+                // main `--contains` loop; a lightweight tag stays `<tag>`.
+                let display = if info.is_annotated {
+                    format!("{}^0", info.name)
+                } else {
+                    info.name.clone()
+                };
                 let output = DescribeOutput {
                     input,
                     resolved_commit,
-                    result: info.name.clone(),
+                    result: display,
                     tag: Some(info.name.clone()),
                     distance: None,
                     abbreviated_commit: None,

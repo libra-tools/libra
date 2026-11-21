@@ -463,7 +463,7 @@
 
 ### Task DESC-01a: `--contains --exact-match`/`--candidates 0` 精确匹配附注 tag 时追加 `^0`（#795）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空` | **Priority / Selection:** P1；Git 核心兼容缺陷 | **Issue:** [#795](https://github.com/libra-tools/libra/issues/795)
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `complete`（2026-11-21：`run_describe_contains` 的 `exact_match_only` 分支按 `TagInfo::is_annotated` 渲染——附注 tag 直接命中输出 `<tag>^0`、轻量 tag 仍为 `<tag>`，与 `--contains` 主循环一致；`data.tag` 保持纯 tag 名、`data.exact_match` 为 `true`。既有断言 `describe_test.rs` 中 `--contains --exact-match`/`--candidates 0` 的期望改为 `v1.0^0`；新增 `test_describe_contains_exact_match_renders_tag_peel` 覆盖 AC1–AC6。文档同步：`docs/commands/describe.md`、`docs/commands/zh-CN/describe.md`（两处）、`docs/development/commands/describe.md`（两处）与 `COMPATIBILITY.md:219` 移除「仍输出裸标签」的说明；`describe_test` **32/32**；版本面 0.30.258 → 0.30.259。按用户 2026-11-20 指令在 `main` 直接提交推送。） | **Priority / Selection:** P1；Git 核心兼容缺陷 | **Issue:** [#795](https://github.com/libra-tools/libra/issues/795)
 
 **Description:** 自 `DESC-01` 拆出（G-09）。`run_describe_contains` 的 `exact_match_only` 提前返回分支（`--exact-match` 或 `--candidates 0`，`src/command/describe.rs:207, 411-427`）在目标被附注 tag 直接指向时输出 `<tag>^0`（轻量 tag 仍为 `<tag>`），与 `DESC-01` 的主循环一致；`data.tag` 保持纯 tag 名、`data.exact_match` 保持 `true`（`ADR-DESC-02`）；同步更新既有 `describe_test.rs:687` 的旧断言。
 

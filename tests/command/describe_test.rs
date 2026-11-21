@@ -675,6 +675,7 @@ fn test_describe_contains_exact_match_requires_direct_tag() {
     );
 
     // The tagged commit itself is an exact contains match under both spellings.
+    // `v1.0` is annotated, so an exact hit renders `<tag>^0` (DESC-01a).
     for flag in [
         ["--exact-match"].as_slice(),
         ["--candidates", "0"].as_slice(),
@@ -684,7 +685,7 @@ fn test_describe_contains_exact_match_requires_direct_tag() {
         argv.push(&c1);
         let r = run_libra_command(&argv, p);
         assert_cli_success(&r, "exact contains at tagged commit");
-        assert_eq!(String::from_utf8_lossy(&r.stdout).trim(), "v1.0");
+        assert_eq!(String::from_utf8_lossy(&r.stdout).trim(), "v1.0^0");
     }
 
     // An ancestor (named v1.0~1 without exact-match) is NOT an exact match —
@@ -968,4 +969,74 @@ fn eol_consumer_describe_dirty_uses_clean_representation(auto: bool) {
     std::fs::write(repo.join("probe.ps1"), b"real change\r\n").unwrap();
     let dirty = i1062_ok(&repo, &["describe", "--dirty"]);
     assert_eq!(String::from_utf8(dirty).unwrap().trim(), "eol-base-dirty");
+}
+
+#[test]
+fn test_describe_contains_exact_match_renders_tag_peel() {
+    // AC1/AC2/AC4/AC5/AC6: an annotated tag pointing straight at the target is
+    // reported as `<tag>^0`, while `data.tag` stays the bare tag name.
+    let repo = create_committed_repo_via_cli();
+    let head =
+        String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], repo.path()).stdout)
+            .trim()
+            .to_string();
+    assert_cli_success(
+        &run_libra_command(&["tag", "-m", "annotated", "v-ann"], repo.path()),
+        "annotated tag",
+    );
+
+    for flag in [
+        vec!["describe", "--contains", "--exact-match", head.as_str()],
+        vec!["describe", "--contains", "--candidates", "0", head.as_str()],
+    ] {
+        let out = run_libra_command(&flag, repo.path());
+        assert_cli_success(&out, "exact contains on an annotated tag");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "v-ann^0",
+            "AC1/AC2: the annotated tag is rendered peeled"
+        );
+    }
+
+    let json = run_libra_command(
+        &[
+            "describe",
+            "--contains",
+            "--exact-match",
+            "--json",
+            head.as_str(),
+        ],
+        repo.path(),
+    );
+    assert_cli_success(&json, "AC4: json exact match");
+    let parsed = parse_json_stdout(&json);
+    assert_eq!(parsed["data"]["result"], "v-ann^0", "AC4: result is peeled");
+    assert_eq!(parsed["data"]["tag"], "v-ann", "AC5: tag stays bare");
+    assert_eq!(parsed["data"]["exact_match"], true, "AC6: exact match flag");
+
+    // AC3: a lightweight tag stays bare.
+    let light = create_committed_repo_via_cli();
+    let light_head =
+        String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], light.path()).stdout)
+            .trim()
+            .to_string();
+    assert_cli_success(
+        &run_libra_command(&["tag", "v-light"], light.path()),
+        "lightweight tag",
+    );
+    let out = run_libra_command(
+        &[
+            "describe",
+            "--contains",
+            "--exact-match",
+            light_head.as_str(),
+        ],
+        light.path(),
+    );
+    assert_cli_success(&out, "AC3: exact contains on a lightweight tag");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "v-light",
+        "AC3: lightweight tags are not peeled"
+    );
 }

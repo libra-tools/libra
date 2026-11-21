@@ -44,7 +44,7 @@ libra describe [OPTIONS] [COMMIT]
 | `--first-parent` | 遍历历史时只跟随合并提交的第一个父。 | 关闭 |
 | `--match <pattern>` | 仅考虑名称匹配该 glob 的标签（可重复；OR 语义，wax glob ≤256 字符）。 | 无 |
 | `--exclude <pattern>` | 排除名称匹配该 glob 的标签（可重复；优先于 `--match`）。 | 无 |
-| `--contains` | 反向包含查询（git name-rev）：用最近的「后代」标签命名目标，输出 `<tag>`（轻量 tag）/`<tag>^0`（附注 tag 直接命中）、`<tag>~<n>` 或 `<tag>~<n>^<m>~<k>`。隐含含轻量标签；等权重并列按标签名字典序确定；无后代标签时报错。`--contains --exact-match` 与 `--contains --candidates 0` 在本版本仍输出不带 `^0` 的裸标签。 | 关闭 |
+| `--contains` | 反向包含查询（git name-rev）：用最近的「后代」标签命名目标，输出 `<tag>`（轻量 tag）/`<tag>^0`（附注 tag 直接命中）、`<tag>~<n>` 或 `<tag>~<n>^<m>~<k>`。隐含含轻量标签；等权重并列按标签名字典序确定；无后代标签时报错。`--contains --exact-match` 与 `--contains --candidates 0` 同样在直接命中附注 tag 时输出 `<tag>^0`（轻量 tag 仍为裸 `<tag>`）。 | 关闭 |
 
 ### 示例
 
@@ -198,7 +198,7 @@ libra describe --tags --abbrev 10
 
 ### 实现了 Git `describe` 的哪个子集？
 
-Libra 已公开 `--tags`、`--abbrev`、`--always`、`--exact-match`、`--long`、`--dirty[=<mark>]`、`--first-parent`、`--match`/`--exclude`（wax glob，≤256 字符，exclude 优先）以及 `--candidates <N>`（`N=0` 等价 `--exact-match`；`N≥1` 维持确定性最近-tag BFS，不强制 Git 的正数候选上界）。基于 BFS 的算法直接且可预测。`--all` 已支持：将本地分支（`heads/`）、远程跟踪分支（`remotes/`）与标签（`tags/`，含轻量标签）一并加入候选集合后复用同一 BFS，同一提交上标签优先、其次 heads、再次 remotes。`--contains` 已支持：运行 Git 的反向遍历包含算法（name-rev）——从每个 tag commit 反向做 Dijkstra，first-parent 步便宜、其它父步昂贵，故最近后代 tag 的最直路径胜出——直接命中附注 tag 输出 `<tag>^0`（轻量 tag 仍为 `<tag>`），其余输出 `<tag>~<n>` 或 `<tag>~<n>^<m>~<k>`；`--contains --exact-match`/`--contains --candidates 0` 在本版本仍输出裸标签。它隐含包含轻量 tag（如 `git name-rev --tags`），且当没有后代 tag 时报错。
+Libra 已公开 `--tags`、`--abbrev`、`--always`、`--exact-match`、`--long`、`--dirty[=<mark>]`、`--first-parent`、`--match`/`--exclude`（wax glob，≤256 字符，exclude 优先）以及 `--candidates <N>`（`N=0` 等价 `--exact-match`；`N≥1` 维持确定性最近-tag BFS，不强制 Git 的正数候选上界）。基于 BFS 的算法直接且可预测。`--all` 已支持：将本地分支（`heads/`）、远程跟踪分支（`remotes/`）与标签（`tags/`，含轻量标签）一并加入候选集合后复用同一 BFS，同一提交上标签优先、其次 heads、再次 remotes。`--contains` 已支持：运行 Git 的反向遍历包含算法（name-rev）——从每个 tag commit 反向做 Dijkstra，first-parent 步便宜、其它父步昂贵，故最近后代 tag 的最直路径胜出——直接命中附注 tag 输出 `<tag>^0`（轻量 tag 仍为 `<tag>`），其余输出 `<tag>~<n>` 或 `<tag>~<n>^<m>~<k>`；`--contains --exact-match`/`--contains --candidates 0` 同样在直接命中附注 tag 时输出 `<tag>^0`（轻量 tag 仍为裸 `<tag>`）。它隐含包含轻量 tag（如 `git name-rev --tags`），且当没有后代 tag 时报错。
 
 ### 为什么简化输出格式？
 
