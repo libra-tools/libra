@@ -1698,6 +1698,8 @@ PY
 **C/D coverage from:** `self`
 **Granularity:** `type=implementation; axis=promisor 缺失对象读取 lazy fetch; recovery=推送前 revert，发布后前滚新 patch+降级指引; complete=yes; self-contained=yes; AC=8/8; VER=4/8; landing=4; prod-files=5; scope=M; deps=CL-18,DEP-CL-04,DEP-CL-08; writeset=串行于 CL-18; release=independent; split-from=CL-13; exception=N/A`
 
+> **2026-11-20 前置缺口（实测）：** 本卡要求的「缺失对象按需拉取」需要**按 OID 向远端 want 单个对象**；`CL-05` 已实测当前客户端的 OID want 被拒（`fatal: couldn't find remote ref <oid>`），即 fetch/协议层没有对象级 want 支持。因此 `CL-19` 的真实实现面是：①传输层新增按 OID want（含 `upload-pack` 能力协商与本地客户端的对象定位）；②`src/command/mod.rs:249 load_object`（同步）用阻塞桥接到异步拉取；③`LIBRA_TEST_TRACE_LAZY_FETCH` 接缝与 `--offline` 拒绝；④8 条 AC 用例。这是一次跨协议层的较大改动，需独立实现窗口。
+
 ---
 
 ### Task CL-14: 支持 `clone --ref-storage-format` 与 `rev-parse --show-ref-storage-format`（#750）
