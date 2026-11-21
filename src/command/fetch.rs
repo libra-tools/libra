@@ -731,8 +731,12 @@ pub struct FetchArgs {
 
     /// Print a machine-readable, single-space-separated line per ref update:
     /// `<flag> <old-oid> <new-oid> <local-ref>`. Mutually exclusive with `--json`.
-    #[clap(long)]
+    #[clap(long, overrides_with = "no_porcelain")]
     pub porcelain: bool,
+
+    /// Undo an earlier `--porcelain`, restoring the human report (last one wins).
+    #[clap(long = "no-porcelain", overrides_with = "porcelain")]
+    pub no_porcelain: bool,
 
     /// Allow updates that are not fast-forward and overwrite (clobber) a local
     /// tag that points elsewhere. Without it, conflicting tags are kept.
@@ -1468,6 +1472,7 @@ async fn run_fetch(args: FetchArgs, output: &OutputConfig) -> CliResult<FetchOut
         append: _,
         verbose,
         porcelain: _,
+        no_porcelain: _,
         force,
         tags,
         no_tags,

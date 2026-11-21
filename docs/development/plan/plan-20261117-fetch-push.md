@@ -1423,7 +1423,7 @@ PY
 
 ### Task FP-14: 支持 `libra fetch --no-porcelain` 并与 `--porcelain` 按最后出现者生效（#879）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `complete`（2026-11-20：`FetchArgs` 新增 `--no-porcelain`，与 `--porcelain` 以 `overrides_with` 互为最后出现者生效；porcelain 生效时沿用 `format_fetch_porcelain`（stdout 每条一行、stderr 空），非 porcelain 时输出 FP-13 的人读报告；`--porcelain` 与 `--json` 互斥不变。新用例 `fetch_no_porcelain_overrides_porcelain` 覆盖 AC1–AC5（stdout 空 / stderr 两行报告 / stdout 恰一行 porcelain / stderr 空 / `--json`+`--porcelain` 为 `LBR-CLI-002`）；`fetch_test` 全模块 **67/67 通过**；版本面 patch 0.30.221 → 0.30.222。按用户 2026-11-20 指令在 `main` 直接提交推送。）
 
 **Description:** 新增 `--no-porcelain`，与 `--porcelain` 以 clap `overrides_with` 按最后出现者生效；生效为 porcelain 时沿用现有 `format_fetch_porcelain`（stdout 每条更新一行 `<flag> <old-oid> <new-oid> <local-ref>`，stderr 不输出人读报告）；生效为非 porcelain 时输出 `FP-13` 的人读报告。`--porcelain` 与 `--json` 的互斥保持不变。
 

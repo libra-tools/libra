@@ -2314,6 +2314,7 @@ fn local_fetch_args(repository: &str, prune: bool, dry_run: bool) -> fetch::Fetc
         append: false,
         verbose: false,
         porcelain: false,
+        no_porcelain: false,
         force: false,
         tags: false,
         no_tags: false,
@@ -3927,5 +3928,79 @@ fn fetch_human_report_on_stderr_with_fetch_head_plan() {
         rest.join("\n"),
         expected,
         "AC2: exact git display_ref_update layout"
+    );
+}
+
+#[test]
+fn fetch_no_porcelain_overrides_porcelain() {
+    use crate::command::{run_libra_command, run_libra_command_with_env};
+
+    let root = tempdir().unwrap();
+    let src = root.path().join("s");
+    assert!(
+        run_libra_command(&["init", src.to_str().unwrap()], root.path())
+            .status
+            .success()
+    );
+    let identity: &[(&str, &str)] = &[
+        ("LIBRA_COMMITTER_NAME", "t"),
+        ("LIBRA_COMMITTER_EMAIL", "t@t"),
+        ("GIT_AUTHOR_NAME", "t"),
+        ("GIT_AUTHOR_EMAIL", "t@t"),
+    ];
+    std::fs::write(src.join("a.txt"), "1\n").unwrap();
+    assert!(run_libra_command(&["add", "a.txt"], &src).status.success());
+    assert!(
+        run_libra_command_with_env(&["commit", "--no-gpg-sign", "-m", "c1"], &src, identity)
+            .status
+            .success()
+    );
+
+    let c = root.path().join("c");
+    assert!(
+        run_libra_command(&["init", c.to_str().unwrap()], root.path())
+            .status
+            .success()
+    );
+    assert!(
+        run_libra_command(&["remote", "add", "origin", src.to_str().unwrap()], &c)
+            .status
+            .success()
+    );
+
+    // AC1/AC2: `--porcelain --no-porcelain` keeps the human report on stderr.
+    let out = run_libra_command(&["fetch", "--porcelain", "--no-porcelain", "origin"], &c);
+    assert!(out.status.success(), "fetch");
+    assert!(out.stdout.is_empty(), "AC1: no porcelain output on stdout");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("From ") && stderr.contains("-> origin/main"),
+        "AC2: the human report is on stderr: {stderr}"
+    );
+
+    // AC3/AC4: `--no-porcelain --porcelain` prints porcelain on stdout only.
+    assert!(
+        run_libra_command(&["branch", "side"], &src)
+            .status
+            .success()
+    );
+    let out = run_libra_command(&["fetch", "--no-porcelain", "--porcelain", "origin"], &c);
+    assert!(out.status.success(), "fetch");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.trim().is_empty() && stdout.lines().count() == 1,
+        "AC3: exactly one porcelain record: {stdout}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).is_empty(),
+        "AC4: stderr is empty in porcelain mode"
+    );
+
+    // AC5: `--porcelain` with `--json` is still refused.
+    let out = run_libra_command(&["--json", "fetch", "--porcelain", "origin"], &c);
+    assert!(!out.status.success(), "AC5: --json + --porcelain must fail");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("LBR-CLI-002"),
+        "AC5: expected LBR-CLI-002"
     );
 }
