@@ -790,7 +790,7 @@
 
 ### Task DESC-09a: 根命名空间后缀解析 blob 与 tree
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空` | **Priority / Selection:** P1 | **Issue:** [#798](https://github.com/libra-tools/libra/issues/798)、[#799](https://github.com/libra-tools/libra/issues/799)
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `complete`（2026-11-21：`resolve_describe_hash_typed` 的单候选分支返回候选对象自身、不按类型限制，因此 blob 与 tree 后缀（缩写与全长）已解析为对应对象——根命名空间的对象类型范围至此与 Git 一致；歧义/缺失/tag 对象语义沿用 `DESC-09b`/`DESC-09c` 的实现与共享回归。用例 `describe_suffix_blob_and_tree_objects` 断言 AC1–AC4（blob 的 8 位与全长、tree 的 8 位与全长均返回自身 OID）。`rev_parse_test` **54/54**；文档 EN/zh-CN 同步；版本面 0.30.264 → 0.30.265。本卡为 `REL-DESC-09` 子卡 4/16，只本地签名提交。按用户 2026-11-20 指令在 `main` 直接提交推送。） | **Priority / Selection:** P1 | **Issue:** [#798](https://github.com/libra-tools/libra/issues/798)、[#799](https://github.com/libra-tools/libra/issues/799)
 
 **Description:** 自 `DESC-09` 拆出；家族 `REL-DESC-09` 子卡（4/16）。根命名空间 describe 后缀放开 blob 与 tree（返回对象自身），至此根命名空间与 Git 的对象类型范围一致；歧义、缺失与 tag 对象语义保持 `DESC-09b`/`DESC-09c` 的结果（由其用例作共享回归）。
 
