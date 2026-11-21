@@ -1117,7 +1117,7 @@ PY
 
 ### Task FP-10: 支持 `libra fetch --multiple` 与 `--jobs`（#867；拆出 FP-19）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `complete`（2026-11-21：`FetchArgs` 新增 `--multiple`/`-m` 与 `--jobs`/`-j`；`execute_safe` 在 `--multiple` 时进入新增 `run_multiple_remote_fetch`——位置参数全部视为 remote 名，逐一校验为已配置 remote（否则 `LBR-CLI-003`，零写入），再按顺序逐个走既有 fetch 路径并聚合，`FETCH_HEAD` 未给 `--append` 时先截断后按序追加；`effective_job_count` 解析 `--jobs`（非整数 `LBR-CLI-002`，`0`→CPU 核数，未给/负值→1），`trace_parallel_fetch` 在 `GIT_TRACE` 为绝对路径且 remote 多于一个时追加 `preparing to run up to <n> tasks`。Libra 仍串行执行（真正并发由 `DEFER-FP-05` 承接）。用例 `test_fetch_multiple_remotes_and_jobs` 覆盖 AC1–AC8（只拉所列 remote；未 `--append` 时截断后为 O1、T1；`--append` 保留 X1；未知 remote 整体拒绝且引用不变；`--jobs=2` 结果一致；`--jobs=0`/`--jobs=2` 的 trace 行分别为 CPU 数与其自身）。**偏差登记**：AC1 的 RefMap 断言过滤掉 `refs/remotes/<remote>/HEAD` 记账行。`fetch`/`pull`/`clone` 套件 **200/200**；版本面 0.30.254 → 0.30.255；文档 EN/zh-CN 同步。按用户 2026-11-20 指令在 `main` 直接提交推送。）
 
 **Description:** 为 `FetchArgs` 新增 `--multiple`/`-m`（全部位置参数视为 remote 名，任一不是已配置 remote 时在任何网络交互前以 `LBR-CLI-003` 拒绝）与 `--jobs`/`-j <n>`（接受任意整数，非整数以 `LBR-CLI-002` 拒绝；生效并发数：`0` 取 CPU 核数（`std::thread::available_parallelism()`，取不到时为 1），未给出与负值为 1）；多远程时按位置参数顺序逐一串行 fetch——Libra 本卡不实现真正的并发执行，`--jobs` 只决定生效并发数的计算与下述追踪行，串行执行的结果与 Git 并行执行的最终引用一致（有意差异，真正并发由 `DEFER-FP-05` 承接）；未给 `--append` 时 `FETCH_HEAD` 先截断再按 remote 顺序追加，给出 `--append` 时保留已有记录、按 remote 顺序追加在其后（与 Git `fetch_multiple` 一致）。为使上游 `t5514` #13 可判定，当环境变量 `GIT_TRACE` 为绝对路径且一次 fetch 涉及多于一个 remote 时，向该文件追加一行含 `preparing to run up to <n> tasks`（`<n>` 为生效并发数）的追踪；`GIT_TRACE` 其它取值不实现。按 G-09 自本卡拆出 `FP-19`（`fetch.all`/`--no-all`）。
 

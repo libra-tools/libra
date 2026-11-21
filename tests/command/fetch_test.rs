@@ -2316,6 +2316,8 @@ fn local_fetch_args(repository: &str, prune: bool, dry_run: bool) -> fetch::Fetc
     fetch::FetchArgs {
         repository: Some(repository.to_string()),
         refspecs: Vec::new(),
+        multiple: false,
+        jobs: None,
         all: false,
         depth: None,
         dry_run,
@@ -4896,5 +4898,177 @@ fn test_fetch_custom_namespace_destinations() {
     assert!(
         listed.contains(&format!("{s2} refs/remotes/extra_dir/repo_c/side")),
         "the unconfigured remote namespace is still listed: {listed}"
+    );
+}
+
+#[test]
+fn test_fetch_multiple_remotes_and_jobs() {
+    use crate::command::{assert_cli_success, run_libra_command, run_libra_command_with_env};
+
+    // Three independent sources plus a consumer that clones `origin`.
+    let work = tempfile::tempdir().expect("work dir");
+    let make_source = |name: &str| {
+        let dir = work.path().join(name);
+        std::fs::create_dir_all(&dir).expect("mkdir source");
+        assert_cli_success(&run_libra_command(&["init"], &dir), "init source");
+        run_libra_command(&["config", "set", "user.name", "t"], &dir);
+        run_libra_command(&["config", "set", "user.email", "t@t"], &dir);
+        std::fs::write(dir.join("f.txt"), format!("{name}\n")).expect("write f");
+        assert_cli_success(&run_libra_command(&["add", "f.txt"], &dir), "stage");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", name, "--no-verify"], &dir),
+            "commit",
+        );
+        String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], &dir).stdout)
+            .trim()
+            .to_string()
+    };
+    let o1 = make_source("one");
+    let t1 = make_source("two");
+    let x1 = make_source("origin");
+
+    let w = work.path().join("w");
+    assert_cli_success(
+        &run_libra_command(&["clone", "./origin", "w"], work.path()),
+        "clone w",
+    );
+    run_libra_command(&["config", "set", "user.name", "t"], &w);
+    run_libra_command(&["config", "set", "user.email", "t@t"], &w);
+    for remote in ["one", "two"] {
+        assert_cli_success(
+            &run_libra_command(&["remote", "add", remote, &format!("../{remote}")], &w),
+            "add remote",
+        );
+    }
+    let refs = |repo: &std::path::Path| {
+        run_libra_command(&["show-ref"], repo)
+            .stdout
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| String::from_utf8_lossy(line).to_string())
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+
+    // AC1/AC2: only the listed remotes are fetched, in order, and FETCH_HEAD is
+    // truncated first.
+    std::fs::write(
+        w.join(".libra/FETCH_HEAD"),
+        format!("{x1}\tnot-for-merge\tbranch 'old' of /tmp/old\n"),
+    )
+    .expect("seed FETCH_HEAD");
+    let before = refs(&w);
+    assert_cli_success(
+        &run_libra_command(&["fetch", "--multiple", "one", "two"], &w),
+        "AC1: fetch --multiple",
+    );
+    let after = refs(&w);
+    // The cached `refs/remotes/<remote>/HEAD` rows are fetch bookkeeping; the
+    // card's RefMap assertion covers the branch refs.
+    let added = after
+        .difference(&before)
+        .filter(|line| !line.ends_with("/HEAD"))
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        added,
+        [
+            format!("{o1} refs/remotes/one/main"),
+            format!("{t1} refs/remotes/two/main"),
+        ]
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>(),
+        "AC1: only the listed remotes moved"
+    );
+    assert!(
+        after.contains(&format!("{x1} refs/remotes/origin/main")),
+        "AC1: origin/main is untouched"
+    );
+    let head_oids = |repo: &std::path::Path| {
+        std::fs::read_to_string(repo.join(".libra/FETCH_HEAD"))
+            .unwrap_or_default()
+            .lines()
+            .map(|line| line.split('\t').next().unwrap_or_default().to_string())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        head_oids(&w),
+        vec![o1.clone(), t1.clone()],
+        "AC2: truncated then ordered"
+    );
+
+    // AC3: `--append` keeps the old record in front.
+    std::fs::write(
+        w.join(".libra/FETCH_HEAD"),
+        format!("{x1}\tnot-for-merge\tbranch 'old' of /tmp/old\n"),
+    )
+    .expect("seed FETCH_HEAD");
+    assert_cli_success(
+        &run_libra_command(&["fetch", "--append", "--multiple", "one", "two"], &w),
+        "AC3: fetch --append --multiple",
+    );
+    assert_eq!(
+        head_oids(&w),
+        vec![x1.clone(), o1.clone(), t1.clone()],
+        "AC3: kept then appended"
+    );
+
+    // AC4/AC5: an unknown remote refuses the whole command with no write.
+    let before = refs(&w);
+    let out = run_libra_command(&["fetch", "--multiple", "one", "nosuch"], &w);
+    assert!(
+        !out.status.success(),
+        "AC4: the unknown remote fails the fetch"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("LBR-CLI-003"),
+        "AC4: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(refs(&w), before, "AC5: nothing changed");
+
+    // AC6: `--jobs` does not change the outcome.
+    assert_cli_success(
+        &run_libra_command(&["fetch", "--jobs=2", "--multiple", "one", "two"], &w),
+        "AC6: fetch --jobs=2 --multiple",
+    );
+    for (name, oid) in [
+        ("refs/remotes/one/main", &o1),
+        ("refs/remotes/two/main", &t1),
+    ] {
+        let resolved = String::from_utf8_lossy(&run_libra_command(&["rev-parse", name], &w).stdout)
+            .trim()
+            .to_string();
+        assert_eq!(&resolved, oid, "AC6: {name}");
+    }
+
+    // AC7/AC8: `GIT_TRACE` records the effective concurrency.
+    let trace_zero = work.path().join("trace-zero.log");
+    let out = run_libra_command_with_env(
+        &["fetch", "--jobs=0", "--multiple", "one", "two"],
+        &w,
+        &[("GIT_TRACE", trace_zero.to_str().expect("trace path"))],
+    );
+    assert_cli_success(&out, "AC7: fetch --jobs=0");
+    let traced = std::fs::read_to_string(&trace_zero).expect("trace file");
+    let cpus = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1);
+    assert!(
+        traced.contains(&format!("preparing to run up to {cpus} tasks")),
+        "AC7: {traced}"
+    );
+
+    let trace_two = work.path().join("trace-two.log");
+    let out = run_libra_command_with_env(
+        &["fetch", "--jobs=2", "--multiple", "one", "two"],
+        &w,
+        &[("GIT_TRACE", trace_two.to_str().expect("trace path"))],
+    );
+    assert_cli_success(&out, "AC8: fetch --jobs=2");
+    assert!(
+        std::fs::read_to_string(&trace_two)
+            .expect("trace file")
+            .contains("preparing to run up to 2 tasks"),
+        "AC8"
     );
 }

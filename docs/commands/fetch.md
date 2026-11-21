@@ -176,6 +176,14 @@ libra config remote.origin.prune false  # but never for origin
 
 ## Options
 
+`--multiple`/`-m` treats every positional argument as a remote name: each listed
+remote is fetched in order (an unknown name refuses the whole command with
+`LBR-CLI-003` before any transfer). `FETCH_HEAD` is truncated first unless
+`--append` is given, then appended in remote order. `--jobs`/`-j <n>` is accepted
+for Git parity — Libra fetches the remotes serially, so the value only shapes the
+`preparing to run up to <n> tasks` line written to an absolute `GIT_TRACE` path
+(`0` resolves to the CPU count, absent/negative to 1).
+
 A refspec destination may live in any `refs/<namespace>/...` (for example
 `+refs/heads/*:refs/rd/*`), not just `refs/heads/` and `refs/remotes/<remote>/`.
 Such refs are listed by `show-ref` and resolve through `rev-parse`. A

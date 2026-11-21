@@ -711,6 +711,17 @@ pub struct FetchArgs {
     #[clap(long, short, conflicts_with("repository"))]
     pub all: bool,
 
+    /// Treat every positional argument as a remote name (Git's `--multiple`):
+    /// each listed remote is fetched in order.
+    #[clap(long, short = 'm')]
+    pub multiple: bool,
+
+    /// Accepted for Git parity: Libra fetches the listed remotes serially. `0`
+    /// resolves to the CPU count, an absent or negative value to 1; the value
+    /// only shapes the `GIT_TRACE` line.
+    #[clap(long, short = 'j', value_name = "N")]
+    pub jobs: Option<String>,
+
     /// Limit fetching to the specified number of commits from the tip of each remote branch
     #[clap(long, value_name = "N")]
     pub depth: Option<usize>,
@@ -1341,6 +1352,9 @@ pub async fn execute_safe(args: FetchArgs, output: &OutputConfig) -> CliResult<(
     let append = args.append;
     let no_write_fetch_head = args.no_write_fetch_head;
     let cli_refspec_present = !args.refspecs.is_empty();
+    if args.multiple {
+        return run_multiple_remote_fetch(args, output).await;
+    }
     if args.refspecs.len() > 1 {
         return run_multi_refspec_fetch(args, output).await;
     }
@@ -1364,6 +1378,113 @@ pub async fn execute_safe(args: FetchArgs, output: &OutputConfig) -> CliResult<(
             !no_write_fetch_head,
             cli_refspec_present,
         )
+    }
+}
+
+/// Effective concurrency for `--jobs` (Libra runs the fetches serially, so this
+/// only feeds the `GIT_TRACE` line).
+fn effective_job_count(jobs: Option<&str>) -> CliResult<usize> {
+    let Some(raw) = jobs else {
+        return Ok(1);
+    };
+    let parsed = raw.trim().parse::<i64>().map_err(|_| {
+        CliError::command_usage(format!("invalid --jobs value '{raw}'"))
+            .with_stable_code(crate::utils::error::StableErrorCode::CliInvalidArguments)
+    })?;
+    if parsed == 0 {
+        return Ok(std::thread::available_parallelism()
+            .map(|count| count.get())
+            .unwrap_or(1));
+    }
+    if parsed < 0 {
+        return Ok(1);
+    }
+    Ok(parsed as usize)
+}
+
+/// Append Git's `preparing to run up to <n> tasks` line when `GIT_TRACE` names
+/// an absolute file path and more than one remote is fetched.
+fn trace_parallel_fetch(tasks: usize) {
+    let Some(path) = std::env::var_os("GIT_TRACE").map(std::path::PathBuf::from) else {
+        return;
+    };
+    if !path.is_absolute() || tasks <= 1 {
+        return;
+    }
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        use std::io::Write as _;
+        let _ = writeln!(file, "preparing to run up to {tasks} tasks");
+    }
+}
+
+/// `fetch --multiple one two`: every positional argument is a remote name.
+async fn run_multiple_remote_fetch(args: FetchArgs, output: &OutputConfig) -> CliResult<()> {
+    let tasks = effective_job_count(args.jobs.as_deref())?;
+    let mut remotes = Vec::new();
+    if let Some(repository) = &args.repository {
+        remotes.push(repository.clone());
+    }
+    remotes.extend(args.refspecs.clone());
+    if remotes.is_empty() {
+        return Err(
+            CliError::command_usage("--multiple requires at least one remote name")
+                .with_stable_code(crate::utils::error::StableErrorCode::CliInvalidArguments),
+        );
+    }
+    // Every name must be a configured remote, checked before any transfer.
+    let configured = ConfigKv::all_remote_configs()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|remote| remote.name)
+        .collect::<std::collections::HashSet<_>>();
+    for remote in &remotes {
+        if !configured.contains(remote) {
+            return Err(
+                CliError::fatal(format!("no such remote or remote group '{remote}'"))
+                    .with_stable_code(crate::utils::error::StableErrorCode::CliInvalidTarget)
+                    .with_hint("use 'libra remote -v' to inspect configured remotes"),
+            );
+        }
+    }
+    trace_parallel_fetch(tasks);
+
+    let dry_run = args.dry_run;
+    let append = args.append;
+    let no_write_fetch_head = args.no_write_fetch_head;
+    let porcelain = args.porcelain;
+    let mut combined: Option<FetchOutput> = None;
+    for remote in &remotes {
+        let mut single = args.clone();
+        single.repository = Some(remote.clone());
+        single.refspecs = Vec::new();
+        single.multiple = false;
+        let partial = run_fetch(single, output).await?;
+        combined = Some(match combined {
+            None => partial,
+            Some(mut accumulated) => {
+                accumulated.remotes.extend(partial.remotes);
+                accumulated
+            }
+        });
+    }
+    let mut result = combined.ok_or_else(|| CliError::command_usage("no remote to fetch"))?;
+    result.refspec = None;
+
+    if !dry_run && !no_write_fetch_head {
+        write_fetch_head(&result, append).map_err(CliError::from)?;
+    }
+    for remote in &result.remotes {
+        remote.release_pack_pin();
+    }
+    if porcelain {
+        render_fetch_porcelain(&result, output)
+    } else {
+        render_fetch_output(&result, output, dry_run, !no_write_fetch_head, false)
     }
 }
 
@@ -1572,6 +1693,8 @@ async fn run_fetch(args: FetchArgs, output: &OutputConfig) -> CliResult<FetchOut
         prune,
         no_prune,
         notes,
+        multiple: _,
+        jobs: _,
     } = args;
     // The multi-refspec caller runs this once per refspec.
     let refspec = refspecs.first().cloned();
