@@ -31,6 +31,12 @@ LFS 跟踪文件会在 HTTP 推送期间透明上传，不需要单独执行 `lf
 
 ## 选项
 
+### `--prune` / 通配符 / 负向 refspec
+
+refspec 可含单个 `*` 通配符：`refs/heads/feature/*` 把每个匹配的本地分支推到同名远端引用，`refs/heads/ours/*:refs/heads/theirs/*` 把每个匹配映射到目标模式。负向 refspec（`^refs/heads/feature/wip`，精确或通配）在源侧与映射后的目标侧排除匹配项。
+
+`--prune` 会删除落在被推送目标模式内、但本地已无对应源的远端引用；被负向 refspec 匹配的引用与模式之外的一律不动。`--dry-run` 只报告删除而不改动远端。
+
 未配置为 remote、且指向一个 Libra 仓库的**裸目录名**会按匿名本地目标解析：先看当前目录，再看其父目录（同级仓库），裸仓库与带工作树的仓库都支持。同名已配置 remote 仍优先；既非配置 remote 也不是 Libra 仓库的名字以 `remote '<name>' not found`（`LBR-CLI-003`）拒绝。
 
 | 标志 / 参数 | 说明 | 示例 |

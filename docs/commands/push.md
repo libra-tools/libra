@@ -75,6 +75,19 @@ these modes warn and are not authorization for remote synchronization.
 
 ## Options
 
+### `--prune` / wildcard / negative refspecs
+
+A refspec may contain a single `*` wildcard: `refs/heads/feature/*` pushes every
+matching local branch to the same name, and
+`refs/heads/ours/*:refs/heads/theirs/*` maps each match onto the destination
+pattern. A negative refspec (`^refs/heads/feature/wip`, exact or wildcard) excludes
+matches on the source side and on the mapped destination side.
+
+`--prune` deletes remote refs that fall inside the pushed destination patterns but
+have no matching local source any more; refs matched by a negative refspec, and refs
+outside the pushed patterns, are left alone. `--dry-run` reports the deletions
+without touching the remote.
+
 A bare directory name is resolved as an anonymous local target when it is not a
 configured remote and it names a Libra repository: the current directory is checked
 first, then its parent (a sibling repository), bare or with a working tree. A

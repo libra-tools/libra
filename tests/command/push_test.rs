@@ -3109,3 +3109,198 @@ fn test_push_bare_directory_name_resolves_as_anonymous() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+#[test]
+fn test_push_prune_wildcards_and_negative_refspecs() {
+    use crate::command::{assert_cli_success, run_libra_command};
+
+    // A work repository with `prune/a|b|c` and `ours/a|b|c` all at T1, plus a
+    // fresh bare target.
+    let fixture = || {
+        let work = tempfile::tempdir().expect("work dir");
+        let w = work.path().join("w");
+        std::fs::create_dir_all(&w).expect("mkdir w");
+        assert_cli_success(&run_libra_command(&["init"], &w), "init w");
+        run_libra_command(&["config", "set", "user.name", "t"], &w);
+        run_libra_command(&["config", "set", "user.email", "t@t"], &w);
+        std::fs::write(w.join("f.txt"), "x\n").expect("write f");
+        assert_cli_success(&run_libra_command(&["add", "f.txt"], &w), "stage f");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "t1", "--no-verify"], &w),
+            "commit t1",
+        );
+        for branch in ["a", "b", "c"] {
+            run_libra_command(&["branch", &format!("prune/{branch}")], &w);
+            run_libra_command(&["branch", &format!("ours/{branch}")], &w);
+        }
+        let three = work.path().join("three");
+        assert_cli_success(
+            &run_libra_command(&["init", "--bare", "three"], work.path()),
+            "init three",
+        );
+        (work, w, three)
+    };
+    let refs = |repo: &std::path::Path| {
+        String::from_utf8_lossy(&run_libra_command(&["show-ref"], repo).stdout)
+            .lines()
+            .map(str::to_string)
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+
+    // AC1: a wildcard source spec pushes every matching local branch.
+    let (_work, w, three) = fixture();
+    assert_cli_success(
+        &run_libra_command(&["push", "../three", "refs/heads/prune/*"], &w),
+        "AC1: wildcard push",
+    );
+    let names = refs(&three)
+        .iter()
+        .map(|line| {
+            line.split_whitespace()
+                .nth(1)
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        names,
+        [
+            "refs/heads/prune/a",
+            "refs/heads/prune/b",
+            "refs/heads/prune/c"
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<std::collections::BTreeSet<_>>(),
+        "AC1: every matching branch landed"
+    );
+
+    // AC2: prune removes the vanished branch but a negative refspec protects
+    // `prune/b`.
+    let before = refs(&three);
+    run_libra_command(&["branch", "-D", "prune/a"], &w);
+    run_libra_command(&["branch", "-D", "prune/b"], &w);
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "push",
+                "--prune",
+                "../three",
+                "refs/heads/prune/*",
+                "^refs/heads/prune/b",
+            ],
+            &w,
+        ),
+        "AC2: prune with a negative refspec",
+    );
+    let mut expected = before.clone();
+    expected.retain(|line| !line.ends_with("refs/heads/prune/a"));
+    assert_eq!(refs(&three), expected, "AC2: only prune/a was removed");
+
+    // AC3: a wildcard mapping pushes `ours/*` to `theirs/*`.
+    let (_work3, w3, three3) = fixture();
+    assert_cli_success(
+        &run_libra_command(
+            &["push", "../three", "refs/heads/ours/*:refs/heads/theirs/*"],
+            &w3,
+        ),
+        "AC3: wildcard mapping",
+    );
+    let names = refs(&three3)
+        .iter()
+        .map(|line| {
+            line.split_whitespace()
+                .nth(1)
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        names,
+        [
+            "refs/heads/theirs/a",
+            "refs/heads/theirs/b",
+            "refs/heads/theirs/c"
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<std::collections::BTreeSet<_>>(),
+        "AC3: the mapped branches landed"
+    );
+
+    // AC4: a negative refspec on the mapped destination protects `theirs/b`.
+    let before = refs(&three3);
+    run_libra_command(&["branch", "-D", "ours/a"], &w3);
+    run_libra_command(&["branch", "-D", "ours/b"], &w3);
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "push",
+                "--prune",
+                "../three",
+                "refs/heads/ours/*:refs/heads/theirs/*",
+                "^refs/heads/theirs/b",
+            ],
+            &w3,
+        ),
+        "AC4: prune with a destination-side negative refspec",
+    );
+    let mut expected = before.clone();
+    expected.retain(|line| !line.ends_with("refs/heads/theirs/a"));
+    assert_eq!(refs(&three3), expected, "AC4: only theirs/a was removed");
+
+    // AC5: a fresh target, a negative refspec on the source side.
+    let (_work5, w5, three5) = fixture();
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "push",
+                "../three",
+                "refs/heads/prune/*",
+                "^refs/heads/prune/b",
+            ],
+            &w5,
+        ),
+        "AC5: source-side exclusion",
+    );
+    let names = refs(&three5)
+        .iter()
+        .map(|line| {
+            line.split_whitespace()
+                .nth(1)
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        names,
+        ["refs/heads/prune/a", "refs/heads/prune/c"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<std::collections::BTreeSet<_>>(),
+        "AC5: prune/b was excluded"
+    );
+
+    // AC6: `--dry-run --prune` reports the deletion but changes nothing.
+    let (_work6, w6, three6) = fixture();
+    assert_cli_success(
+        &run_libra_command(&["push", "../three", "refs/heads/prune/*"], &w6),
+        "AC6: seed the target",
+    );
+    let before = refs(&three6);
+    run_libra_command(&["branch", "-D", "prune/a"], &w6);
+    run_libra_command(&["branch", "-D", "prune/b"], &w6);
+    let out = run_libra_command(
+        &[
+            "push",
+            "--dry-run",
+            "--prune",
+            "../three",
+            "refs/heads/prune/*",
+            "^refs/heads/prune/b",
+        ],
+        &w6,
+    );
+    assert_cli_success(&out, "AC6: dry-run prune");
+    assert_eq!(refs(&three6), before, "AC6: nothing changed");
+}

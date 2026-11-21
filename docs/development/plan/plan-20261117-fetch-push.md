@@ -578,7 +578,7 @@ PY
 
 ### Task FP-04: 支持 `libra push --prune`、通配符源 refspec 与负向 refspec（#877）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `complete`（2026-11-21：`PushArgs` 新增 `--prune`；`parse_refspec` 增 `Wildcard { src, dst }` 与 `Exclude { pattern }`，`expand_wildcard_local_refs`/`wildcard_capture` 把通配符对本地分支与标签展开为逐 ref 更新（无冒号时目标同源，映射形式把捕获段替换进目标），`negative_refspec_matches`（精确或单通配）在源侧与映射后的目标侧排除；`--prune` 以被推送的目标模式为范围，删除无本地源的远端引用，负向匹配与模式外引用不动，`--dry-run` 只报告不写入。用例 `test_push_prune_wildcards_and_negative_refspecs` 覆盖 AC1–AC6（通配推送、`--prune` + `^refs/heads/prune/b` 只删 `prune/a`、映射通配、目标侧负向只删 `theirs/a`、源侧负向只推 `a`/`c`、dry-run 前后 `R` 逐字相等）；`push` 套件 **37/37**；版本面 0.30.242 → 0.30.243；文档 EN/zh-CN 同步。按用户 2026-11-20 指令在 `main` 直接提交推送。）
 
 **Description:** 为 `PushArgs` 新增 `--prune`，并把命令行 refspec 的匹配/规划统一到一个引擎：通配符源 refspec（`refs/heads/prune/*`，无目标时目标同源）与映射（`refs/heads/ours/*:refs/heads/theirs/*`）展开为逐 ref 更新；负向 refspec（`^<pattern>`）同时作用于源侧与映射后的目标侧；`--prune` 删除远端在本次 refspec 目标模式内、但本地已无对应源的引用，被负向 refspec 匹配的目标与目标模式之外的引用不删除。该引擎是 `FP-03` 配置 refspec 的唯一事实源（GC-02）。
 

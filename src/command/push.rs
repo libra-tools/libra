@@ -134,6 +134,11 @@ pub struct PushArgs {
     #[clap(long = "no-thin", conflicts_with = "thin")]
     pub no_thin: bool,
 
+    /// Delete remote refs that match the pushed refspecs but have no matching
+    /// local source any more (Git's `push --prune`).
+    #[clap(long)]
+    pub prune: bool,
+
     /// Request an atomic push: the remote applies all ref updates together or
     /// none at all. Errors if the remote does not advertise the `atomic`
     /// capability.
@@ -198,6 +203,7 @@ impl PushArgs {
             thin: false,
             no_thin: false,
             atomic: false,
+            prune: false,
             push_option: Vec::new(),
             follow_tags: false,
             signed: false,
@@ -722,6 +728,10 @@ enum ParsedRefspec {
     Update { src: String, dst: String },
     /// Delete a remote ref by sending a zero object id.
     Delete { dst: String },
+    /// A wildcard spec (`refs/heads/x/*` or `refs/heads/x/*:refs/heads/y/*`).
+    Wildcard { src: String, dst: String },
+    /// A negative refspec (`^<pattern>`) scoping the other refspecs.
+    Exclude { pattern: String },
 }
 
 /// Parse a refspec string into an update or deletion request.
@@ -732,9 +742,73 @@ enum ParsedRefspec {
 /// - `:<dst>` — delete remote `<dst>`
 ///
 /// Empty destinations (e.g. `src:`) are rejected.
+/// Match `name` against a single-`*` wildcard pattern, returning the captured
+/// middle segment.
+fn wildcard_capture(pattern: &str, name: &str) -> Option<String> {
+    let (prefix, suffix) = pattern.split_once('*')?;
+    let rest = name.strip_prefix(prefix)?;
+    let captured = rest.strip_suffix(suffix)?;
+    Some(captured.to_string())
+}
+
+/// Whether a negative refspec matches `name` (an exact name or a single-`*`
+/// pattern, like Git's `refspec_match`).
+fn negative_refspec_matches(pattern: &str, name: &str) -> bool {
+    if pattern.contains('*') {
+        wildcard_capture(pattern, name).is_some()
+    } else {
+        name == pattern || name == format!("refs/heads/{pattern}")
+    }
+}
+
+/// Every local branch and tag whose full name matches `pattern`, paired with its
+/// resolved tip so the planner can build an update per ref.
+async fn expand_wildcard_local_refs(
+    pattern: &str,
+) -> Result<Vec<(String, ResolvedLocalRef)>, PushError> {
+    let mut names: Vec<String> = Vec::new();
+    if let Some((prefix, _)) = pattern.split_once('*')
+        && (prefix.is_empty() || prefix.starts_with("refs/heads/"))
+    {
+        for branch in crate::internal::branch::Branch::list_branches_result(None)
+            .await
+            .unwrap_or_default()
+        {
+            names.push(format!("refs/heads/{}", branch.name));
+        }
+    }
+    if let Some((prefix, _)) = pattern.split_once('*')
+        && (prefix.is_empty() || prefix.starts_with("refs/tags/"))
+        && let Ok(tags) = crate::internal::tag::list().await
+    {
+        for tag in tags {
+            names.push(format!("refs/tags/{}", tag.name));
+        }
+    }
+    names.sort();
+    names.dedup();
+    let mut out = Vec::new();
+    for name in names {
+        if wildcard_capture(pattern, &name).is_none() {
+            continue;
+        }
+        let resolved = resolve_local_ref(&name).await?;
+        out.push((name, resolved));
+    }
+    Ok(out)
+}
+
 fn parse_refspec(refspec: &str) -> Result<ParsedRefspec, PushError> {
     if refspec.is_empty() {
         return Err(PushError::InvalidRefspec(refspec.to_string()));
+    }
+    if let Some(pattern) = refspec.strip_prefix('^') {
+        if pattern.is_empty() {
+            return Err(PushError::InvalidRefspec(refspec.to_string()));
+        }
+        return Ok(ParsedRefspec::Exclude {
+            pattern: pattern.to_string(),
+        });
     }
 
     // Only 0 or 1 colon is valid; reject multi-colon forms like "a:b:c"
@@ -750,12 +824,22 @@ fn parse_refspec(refspec: &str) -> Result<ParsedRefspec, PushError> {
             Ok(ParsedRefspec::Delete {
                 dst: dst.to_string(),
             })
+        } else if src.contains('*') || dst.contains('*') {
+            Ok(ParsedRefspec::Wildcard {
+                src: src.to_string(),
+                dst: dst.to_string(),
+            })
         } else {
             Ok(ParsedRefspec::Update {
                 src: src.to_string(),
                 dst: dst.to_string(),
             })
         }
+    } else if refspec.contains('*') {
+        Ok(ParsedRefspec::Wildcard {
+            src: refspec.to_string(),
+            dst: refspec.to_string(),
+        })
     } else {
         Ok(ParsedRefspec::Update {
             src: refspec.to_string(),
@@ -927,6 +1011,16 @@ async fn validate_local_refspecs(args: &PushArgs, current_branch: &str) -> Resul
                 // validated.
                 normalize_delete_ref(&dst)?;
             }
+            ParsedRefspec::Wildcard { src, dst } => {
+                // Validation only: the expansion needs the local ref list, which
+                // the planner loads once.
+                if src.matches('*').count() != dst.matches('*').count() {
+                    return Err(PushError::InvalidRefspec(refspec.clone()));
+                }
+            }
+            // A negative refspec only scopes the others; its pattern is
+            // validated by the planner.
+            ParsedRefspec::Exclude { .. } => {}
         }
     }
 
@@ -1054,8 +1148,56 @@ pub async fn run_push(args: PushArgs, output: &OutputConfig) -> Result<PushOutpu
             )?;
         }
 
+        // Negative refspecs scope every other one; collect them first.
+        let mut excludes: Vec<String> = Vec::new();
+        let mut destination_patterns: Vec<String> = Vec::new();
         for refspec in &args.refspecs {
             match parse_refspec(refspec)? {
+                ParsedRefspec::Exclude { pattern } => excludes.push(pattern),
+                ParsedRefspec::Update { dst, .. } => destination_patterns.push(dst),
+                ParsedRefspec::Wildcard { dst, .. } => destination_patterns.push(dst),
+                ParsedRefspec::Delete { .. } => {}
+            }
+        }
+
+        for refspec in &args.refspecs {
+            match parse_refspec(refspec)? {
+                ParsedRefspec::Exclude { .. } => {}
+                ParsedRefspec::Wildcard { src, dst } => {
+                    let local_refs = expand_wildcard_local_refs(&src).await?;
+                    for (name, local_ref) in local_refs {
+                        let Some(captured) = wildcard_capture(&src, &name) else {
+                            continue;
+                        };
+                        if excludes
+                            .iter()
+                            .any(|pattern| negative_refspec_matches(pattern, &name))
+                        {
+                            continue;
+                        }
+                        let mapped = if dst.contains('*') {
+                            dst.replacen('*', &captured, 1)
+                        } else {
+                            dst.clone()
+                        };
+                        if excludes
+                            .iter()
+                            .any(|pattern| negative_refspec_matches(pattern, &mapped))
+                        {
+                            continue;
+                        }
+                        let remote_ref = normalize_destination_ref(&mapped, local_ref.kind)?;
+                        add_update_ref_plan(
+                            local_ref,
+                            remote_ref,
+                            &remote_refs,
+                            effective_force,
+                            &mut warnings,
+                            &mut seen_remote_refs,
+                            &mut plans,
+                        )?;
+                    }
+                }
                 ParsedRefspec::Update { src, dst } => {
                     let local_ref = resolve_local_ref(&src).await?;
                     let remote_ref = normalize_destination_ref(&dst, local_ref.kind)?;
@@ -1079,6 +1221,44 @@ pub async fn run_push(args: PushArgs, output: &OutputConfig) -> Result<PushOutpu
                         &mut plans,
                     )?;
                 }
+            }
+        }
+
+        // `--prune`: delete remote refs inside the pushed destination patterns
+        // that no longer have a local source, minus the negative refspecs.
+        if args.prune {
+            let mut prune_targets: Vec<String> = remote_refs
+                .keys()
+                .filter(|name| {
+                    destination_patterns.iter().any(|pattern| {
+                        if pattern.contains('*') {
+                            wildcard_capture(pattern, name).is_some()
+                        } else {
+                            // A non-wildcard spec prunes only its own destination.
+                            name.as_str() == pattern.as_str()
+                        }
+                    })
+                })
+                .filter(|name| {
+                    !excludes
+                        .iter()
+                        .any(|pattern| negative_refspec_matches(pattern, name))
+                })
+                .cloned()
+                .collect();
+            prune_targets.sort();
+            for name in prune_targets {
+                if seen_remote_refs.contains(&name) {
+                    continue;
+                }
+                let display = name.clone();
+                add_delete_ref_plan_named(
+                    name,
+                    &display,
+                    &remote_refs,
+                    &mut seen_remote_refs,
+                    &mut plans,
+                )?;
             }
         }
 
@@ -5077,6 +5257,7 @@ mod test {
             thin: false,
             no_thin: false,
             atomic: false,
+            prune: false,
             push_option: Vec::new(),
             follow_tags: false,
             signed: false,
