@@ -697,8 +697,30 @@ path = "tests/commit_change_id_header_spike.rs"
 # 20-30x slower unoptimized). Workspace crates stay at opt-0 for incremental
 # builds; proc-macros/build scripts are unaffected (no build-override) and
 # debug_assertions are independent of opt-level, so behavior is unchanged.
+#
+# Hybrid debuginfo (`dev` & `test` aligned so `cargo build` and `cargo test`
+# reuse dependency artifacts): full DWARF on all dependencies inflates a single
+# heavy test binary to ~2.0 GiB (95% `.debug_*`) and pushes `rust-lld` to ~8.9 GiB
+# RSS. Keeping `debug = "line-tables-only"` for workspace/test crates while
+# setting `debug = 0` for external dependencies cuts linker RSS by ~80% (~1.8 GiB)
+# and test ELF size by ~90% (~195 MiB) while preserving `file:line` resolution
+# (verified via `addr2line`) for `libra` and test code. Override with
+# `CARGO_PROFILE_DEV_DEBUG=2` / `CARGO_PROFILE_TEST_DEBUG=2` for full workspace
+# DWARF (dependencies remain at `debug = 0` unless also overridden with
+# `--config 'profile.test.package."*".debug=2'`), or `CARGO_PROFILE_TEST_DEBUG=0`
+# for minimal test footprint.
+[profile.dev]
+debug = "line-tables-only"
+
 [profile.dev.package."*"]
 opt-level = 2
+debug = 0
+
+[profile.test]
+debug = "line-tables-only"
+
+[profile.test.package."*"]
+debug = 0
 # OL-02..04: v2 persistence foundation targets.
 [[test]]
 name = "operation_schema_v2"
