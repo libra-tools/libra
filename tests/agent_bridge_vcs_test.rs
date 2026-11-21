@@ -11,11 +11,9 @@
 //!
 //! Every test is `#[serial]`: `ChangeDirGuard` mutates the process cwd.
 
-use std::{
-    fs,
-    io::Write,
-    path::{Path, PathBuf},
-};
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+use std::path::PathBuf;
+use std::{fs, io::Write, path::Path};
 
 use libra::{
     command::{
