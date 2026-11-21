@@ -1707,6 +1707,18 @@ fn render_fetch_output(result: &FetchOutput, output: &OutputConfig) -> CliResult
         // Refs written only to `FETCH_HEAD` (no local destination) are reported
         // as ` * branch <src> -> FETCH_HEAD` (ADR-FP-05).
         for record in &remote.fetch_head_records {
+            let short = record
+                .source_ref
+                .rsplit('/')
+                .next()
+                .unwrap_or(record.source_ref.as_str());
+            let has_local_target = remote
+                .refs_updated
+                .iter()
+                .any(|update| update.remote_ref.ends_with(&format!("/{short}")));
+            if has_local_target {
+                continue;
+            }
             writeln!(
                 writer,
                 " * branch            {} -> FETCH_HEAD",
