@@ -2380,3 +2380,43 @@ fn describe_suffix_inside_the_refs_remotes_namespace() {
         "AC3: the literal remote-tracking branch wins"
     );
 }
+
+#[test]
+fn describe_suffix_tag_namespace_non_commit_objects() {
+    use crate::command::{assert_cli_success, run_libra_command};
+
+    let repo = tempfile::tempdir().expect("repo");
+    let p = repo.path();
+    assert_cli_success(&run_libra_command(&["init"], p), "init");
+    run_libra_command(&["config", "set", "user.name", "t"], p);
+    run_libra_command(&["config", "set", "user.email", "t@t"], p);
+    std::fs::write(p.join("f.txt"), "one\n").expect("write f");
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], p), "stage");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c1", "--no-verify"], p),
+        "commit c1",
+    );
+    let rev = |spec: &str| {
+        String::from_utf8_lossy(&run_libra_command(&["rev-parse", spec], p).stdout)
+            .trim()
+            .to_string()
+    };
+    let blob = rev("HEAD:f.txt");
+    let tree = rev("HEAD^{tree}");
+
+    let resolve = |spec: &str| {
+        let out = run_libra_command(&["rev-parse", spec], p);
+        assert_cli_success(&out, "describe suffix for a non-commit object");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+
+    // `tags/` accepts blob and tree suffixes (abbreviated and full).
+    assert_eq!(resolve(&format!("tags/x-1-g{}", &blob[..8])), blob);
+    assert_eq!(resolve(&format!("tags/x-1-g{blob}")), blob);
+    assert_eq!(resolve(&format!("tags/x-1-g{}", &tree[..8])), tree);
+    assert_eq!(resolve(&format!("tags/x-1-g{tree}")), tree);
+
+    // `refs/tags/` behaves the same way.
+    assert_eq!(resolve(&format!("refs/tags/x-1-g{}", &blob[..8])), blob);
+    assert_eq!(resolve(&format!("refs/tags/x-1-g{tree}")), tree);
+}
