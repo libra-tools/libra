@@ -1676,8 +1676,10 @@ fn render_fetch_output(result: &FetchOutput, output: &OutputConfig) -> CliResult
         return Ok(());
     }
 
-    let stdout = io::stdout();
-    let mut writer = stdout.lock();
+    // FP-13: the human-readable fetch report goes to stderr; stdout stays empty
+    // for `--porcelain`/`--json`/`--machine` only (ADR-FP-05).
+    let stderr = io::stderr();
+    let mut writer = stderr.lock();
 
     if result.remotes.is_empty() {
         writeln!(writer, "No remotes configured")
