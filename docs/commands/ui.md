@@ -42,10 +42,15 @@ This is an interface preview based on the supplied desktop design. The window
 reads the current working directory's repository **read-only**: the context bar shows
 the working-tree folder name, storage label, branch, HEAD and object format, and the read
 never creates operation rows, upgrades the schema or takes a writer boundary.
-The context bar, History's commit list and attribution filters, and the Sessions
-list are real. Sessions come from the read-only capture catalog (filtered to this
-worktree/workspace scope, newest first, capped at 200 rows); model and usage fields may be
-absent, summaries are redacted before rendering, and a repository without capture
+The context bar, History's commit list and attribution filters, the Sessions
+list, and the Operations list are real. Operations come from one bounded
+Operation v2 snapshot (newest first, 50k-row cap with a truncated marker);
+paging slices that snapshot, so pages never repeat or drop rows, and a new
+snapshot resets the list to page one. Summaries are redacted excerpts.
+Sessions come from the read-only capture catalog (filtered to this
+worktree/workspace scope, newest first, capped at 200 rows); model and usage
+fields may be absent, summaries are redacted before rendering, and a repository
+without capture
 shows an empty state. Inside History, the inspector's prompt, session, tool and
 checkpoint details are sample content; only the commit metadata and attribution
 counts are real. Navigation, selection, tabs and theme changes are local

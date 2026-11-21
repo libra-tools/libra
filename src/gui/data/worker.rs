@@ -44,11 +44,16 @@ pub struct ReadOutcome {
     pub sessions_error: Option<String>,
     /// The typed Sessions source state (absent, available, corrupt, …).
     pub sessions_state: SourceState,
+    /// Operation snapshot for the Operations surface.
+    pub operations: super::operations::OperationsRead,
+    /// Operations-specific failure while the context itself is available.
+    pub operations_error: Option<String>,
 }
 
 impl ReadOutcome {
     /// Build an outcome without history (tests and non-History readers).
     pub fn new(state: SourceState, context: Option<RepoContext>, message: Option<String>) -> Self {
+        let operations_state = state.clone();
         Self {
             state,
             context,
@@ -58,6 +63,12 @@ impl ReadOutcome {
             sessions: Vec::new(),
             sessions_error: None,
             sessions_state: SourceState::Stale,
+            operations: super::operations::OperationsRead {
+                state: operations_state,
+                rows: Vec::new(),
+                truncated: false,
+            },
+            operations_error: None,
         }
     }
 }
@@ -124,6 +135,20 @@ impl DataHandle {
                             };
                             let sessions = sessions_read.rows;
                             let sessions_state = sessions_read.state;
+                            // Operations are read independently too.
+                            let operations_outcome =
+                                super::operations::read_operations(&scope).await;
+                            let (operations, operations_error) = match operations_outcome {
+                                Ok(read) => (read, None),
+                                Err(error) => (
+                                    super::operations::OperationsRead {
+                                        state: error.state,
+                                        rows: Vec::new(),
+                                        truncated: false,
+                                    },
+                                    Some(error.message),
+                                ),
+                            };
                             let head_oid = context.head_oid.clone();
                             let history = match super::history::read_history(&scope, head_oid).await
                             {
@@ -141,6 +166,8 @@ impl DataHandle {
                                         sessions,
                                         sessions_error,
                                         sessions_state,
+                                        operations,
+                                        operations_error,
                                     });
                                 }
                             };
@@ -153,6 +180,8 @@ impl DataHandle {
                                 sessions,
                                 sessions_error,
                                 sessions_state,
+                                operations,
+                                operations_error,
                             })
                         }
                         Err(error) => Ok(ReadOutcome::new(error.state, None, Some(error.message))),
@@ -212,6 +241,12 @@ impl DataHandle {
                     sessions: Vec::new(),
                     sessions_error: None,
                     sessions_state: SourceState::Stale,
+                    operations: super::operations::OperationsRead {
+                        state: SourceState::Stale,
+                        rows: Vec::new(),
+                        truncated: false,
+                    },
+                    operations_error: None,
                 });
                 shared.done = true;
                 cv.notify_all();
@@ -266,12 +301,13 @@ impl DataHandle {
     pub fn take_snapshot(&self) -> Option<Snapshot> {
         let (lock, _) = &*self.inner;
         let mut shared = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let latest = shared.latest.clone()?;
-        if shared.delivered == Some(latest.seq) {
+        // Check the sequence BEFORE cloning the (potentially large) snapshot.
+        let seq = shared.latest.as_ref()?.seq;
+        if shared.delivered == Some(seq) {
             return None;
         }
-        shared.delivered = Some(latest.seq);
-        Some(latest)
+        shared.delivered = Some(seq);
+        shared.latest.clone()
     }
 
     /// Number of requests waiting in the bounded queue (test seam).
@@ -405,6 +441,8 @@ fn worker_loop(inner: Arc<(Mutex<Shared>, Condvar)>, reads: Arc<AtomicU64>, read
                     sessions: outcome.sessions,
                     sessions_error: outcome.sessions_error,
                     sessions_state: outcome.sessions_state,
+                    operations: outcome.operations,
+                    operations_error: outcome.operations_error,
                 },
                 Err(error) => Snapshot {
                     seq,
@@ -415,7 +453,13 @@ fn worker_loop(inner: Arc<(Mutex<Shared>, Condvar)>, reads: Arc<AtomicU64>, read
                     history_error: None,
                     sessions: Vec::new(),
                     sessions_error: None,
-                    sessions_state: error.state,
+                    sessions_state: error.state.clone(),
+                    operations: super::operations::OperationsRead {
+                        state: error.state,
+                        rows: Vec::new(),
+                        truncated: false,
+                    },
+                    operations_error: None,
                 },
             };
             let (lock, _) = &*inner;
@@ -453,6 +497,12 @@ fn finish_with_error(inner: &Arc<(Mutex<Shared>, Condvar)>, message: String) {
         sessions: Vec::new(),
         sessions_error: None,
         sessions_state: SourceState::Stale,
+        operations: super::operations::OperationsRead {
+            state: SourceState::Stale,
+            rows: Vec::new(),
+            truncated: false,
+        },
+        operations_error: None,
     });
     shared.done = true;
     cv.notify_all();

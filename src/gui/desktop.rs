@@ -150,6 +150,14 @@ pub struct Desktop {
     pub tab: usize,
     pub selected: usize,
     pub filter: usize,
+    /// Operations page index over the current id snapshot.
+    pub ops_page: usize,
+    /// Operations command filter.
+    pub ops_command: String,
+    /// Operations free-text search.
+    pub ops_query: String,
+    /// Dedicated Operations search input (never the command palette text).
+    pub ops_input: Entity<TextInput>,
     pub rebase_actions: [usize; 6],
     pub notice: Option<String>,
     pub sessions: Entity<SessionsWindow>,
@@ -164,6 +172,16 @@ pub struct Desktop {
     pub data: DataHandle,
     /// Latest snapshot delivered by the worker.
     pub snapshot: Option<Snapshot>,
+}
+
+/// A new snapshot always starts on the first page (A7).
+pub fn reset_page_for_new_snapshot() -> usize {
+    0
+}
+
+/// Page state after a replacement snapshot is delivered: always page one.
+pub fn delivered_page(_previous: usize) -> usize {
+    reset_page_for_new_snapshot()
 }
 
 impl Desktop {
@@ -199,6 +217,16 @@ impl Desktop {
             .new(|cx| TextInput::new(window, cx).placeholder("What should this lane accomplish?"));
         let review_comment =
             cx.new(|cx| TextInput::new(window, cx).placeholder("Leave a review comment…"));
+        let ops_input = cx.new(|cx| TextInput::new(window, cx).placeholder("Search operations"));
+        cx.subscribe(&ops_input, |s, input, event: &InputEvent, cx| {
+            if *event == InputEvent::Changed || *event == InputEvent::Focus {
+                s.ops_query = input.read(cx).text().to_string();
+                s.ops_page = 0;
+                s.selected = 0;
+                cx.notify();
+            }
+        })
+        .detach();
         let data = DataHandle::spawn();
         data.request();
         let polled = data.clone();
@@ -217,6 +245,8 @@ impl Desktop {
                     let sessions_state = snapshot.sessions_state.clone();
                     let delivered = this.update(cx, |desktop, cx| {
                         desktop.snapshot = Some(snapshot);
+                        desktop.ops_page = delivered_page(desktop.ops_page);
+                        desktop.selected = 0;
                         sessions_handle.update(cx, |window, cx| {
                             window.set_catalog(
                                 crate::gui::view::catalog_from_sessions(
@@ -255,6 +285,10 @@ impl Desktop {
             tab: 0,
             selected: 0,
             filter: 0,
+            ops_page: 0,
+            ops_command: String::new(),
+            ops_query: String::new(),
+            ops_input,
             rebase_actions: [0, 4, 3, 1, 0, 5],
             notice: None,
             sessions,

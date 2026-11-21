@@ -31,7 +31,7 @@ Cargo feature 控制。
 仓库上下文快照，源级状态按 ADR-UID-06 分类；主线程只渲染快照，不做 I/O。
 `src/gui/desktop.rs` 管理页面与本地预览状态，
 `src/gui/screens/` 放各设计页面，`widgets.rs` 提供原生 GPUI 布局和 Ely 控件。
-Sessions 由 `src/gui/data/sessions.rs` 从只读 capture 目录读取（按仓库 scope 过滤、倒序、200 行上限、默认脱敏），不再使用 `sessions.json`；能力地图仍来自演示目录。官网 Logo 内嵌在
+Sessions 由 `src/gui/data/sessions.rs` 从只读 capture 目录读取（按仓库 scope 过滤、倒序、200 行上限、默认脱敏），不再使用 `sessions.json`；Operations 由 `src/gui/data/operations.rs` 读取 Operation v2 id 快照（共享 `operation_snapshot_rows`、50k 上限与 truncated、按 200 行切片翻页）；能力地图仍来自演示目录。官网 Logo 内嵌在
 `src/gui/assets/libra-logo.svg`，通过组合 AssetSource 与 Ely 的字体、图标一起加载。
 
 2026-11-01 桌面设计来自 `libra-desktop-gui.zip`。`.dc.html` 是设计资料，

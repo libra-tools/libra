@@ -1,54 +1,80 @@
 //! Operation log, ref transitions and restore preview.
-use ely_gpui_component::theme::Palette;
+//!
+//! Rows come from the real Operation v2 id snapshot read by the window worker;
+//! paging slices that same snapshot so pages never repeat or lose a row.
+use ely_gpui_component::{
+    buttons::{Button, ButtonVariant},
+    forms::{Choice, ChoiceChips},
+    theme::Palette,
+};
 use gpui::{
-    AnyElement, Context, InteractiveElement, IntoElement, ParentElement,
-    StatefulInteractiveElement, Styled, div, px,
+    AnyElement, Context, InteractiveElement, IntoElement, ParentElement, SharedString,
+    StatefulInteractiveElement, Styled, div, prelude::FluentBuilder, px,
 };
 
 use super::super::{
+    data::{OperationsRead, SourceState, filtered_page},
     desktop::Desktop,
-    widgets::{action, banner, card, code, column, label, mono, muted, note, row, table, title},
+    widgets::{banner, card, column, mono, muted, note, row, title},
 };
+
 pub fn render(s: &Desktop, cx: &Context<Desktop>, p: &Palette) -> AnyElement {
-    let ops = [
-        (
-            "rebase -i main~4",
-            "23:02 today",
-            "019e3f00",
-            "main · 3 refs",
+    // Borrow the snapshot; never clone the (potentially 50k-row) projection.
+    let empty = OperationsRead {
+        state: SourceState::Stale,
+        rows: Vec::new(),
+        truncated: false,
+    };
+    let read = s
+        .snapshot
+        .as_ref()
+        .map(|snapshot| &snapshot.operations)
+        .unwrap_or(&empty);
+    // Filter the stable snapshot FIRST, then paginate the matching sequence so
+    // a match beyond the first page is reachable.
+    let (filtered, page_count) =
+        filtered_page(&read.rows, &s.ops_command, &s.ops_query, s.ops_page);
+
+    let state_note = match &read.state {
+        SourceState::Absent => "No operations recorded yet.".to_string(),
+        state if !state.is_available() => {
+            format!(
+                "Operation source is {}: {}",
+                state.label(),
+                state.hint().unwrap_or("retry shortly")
+            )
+        }
+        _ => format!(
+            "{} operation row(s){} · page {} of {}",
+            read.rows.len(),
+            if read.truncated {
+                " · truncated at 50k ids"
+            } else {
+                ""
+            },
+            s.ops_page + 1,
+            page_count
         ),
-        ("commit", "22:49 today", "019e3e91", "main · 1 ref"),
-        (
-            "switch feat/search",
-            "22:10 today",
-            "019e3d01",
-            "wt-review · HEAD",
-        ),
-        (
-            "merge agent/rate-limit",
-            "21:40 today",
-            "019e3c88",
-            "main · 2 refs",
-        ),
-        (
-            "reset --soft HEAD~1",
-            "yesterday",
-            "019e3a20",
-            "main · 2 refs",
-        ),
-    ];
-    let op = ops.get(s.selected).unwrap_or(&ops[0]);
+    };
+    let mut command_choices = vec![Choice::new("", "All commands")];
+    let mut seen = std::collections::HashSet::new();
+    for row in &read.rows {
+        if seen.insert(row.command_name.clone()) {
+            command_choices.push(Choice::new(
+                row.command_name.clone(),
+                row.command_name.clone(),
+            ));
+        }
+    }
+    let last_page = page_count.saturating_sub(1);
+    let selected = filtered
+        .get(s.selected)
+        .copied()
+        .or_else(|| filtered.first().copied());
     column()
         .size_full()
         .gap_0()
-        .child(
-            banner(
-                "2 concurrent operation heads. A linked worktree and this one both wrote while offline from each \
-                 other.",
-                p,
-            )
-            .child(action("reconcile", "Reconcile…", false, cx)),
-        )
+        .child(banner(&state_note, p))
         .child(
             row()
                 .items_stretch()
@@ -62,19 +88,68 @@ pub fn render(s: &Desktop, cx: &Context<Desktop>, p: &Palette) -> AnyElement {
                         .w(px(330.0))
                         .p_4()
                         .child(title("Operation log"))
-                        .child(label("COMMAND · ALL", p))
-                        .children(ops.iter().enumerate().map(|(i, o)| {
+                        .child(s.ops_input.clone())
+                        .child(
+                            ChoiceChips::new("op-command", command_choices)
+                                .selected(if s.ops_command.is_empty() {
+                                    Vec::new()
+                                } else {
+                                    vec![SharedString::from(s.ops_command.clone())]
+                                })
+                                .on_change(cx.listener(|s, values: &[SharedString], _, cx| {
+                                    s.ops_command = values
+                                        .first()
+                                        .map(|value| value.to_string())
+                                        .unwrap_or_default();
+                                    s.ops_page = 0;
+                                    s.selected = 0;
+                                    cx.notify();
+                                })),
+                        )
+                        .children(filtered.iter().enumerate().map(|(i, op)| {
                             card(p)
                                 .id(("op", i))
                                 .cursor_pointer()
-                                .bg(if s.selected == i { p.selection } else { p.surface })
+                                .bg(if s.selected == i {
+                                    p.selection
+                                } else {
+                                    p.surface
+                                })
                                 .on_click(cx.listener(move |s, _, _, cx| {
                                     s.selected = i;
                                     cx.notify();
                                 }))
-                                .child(row().child(mono(o.0)).child(div().flex_1()).child(muted(o.1, p)))
-                                .child(muted(format!("{} · {}", o.2, o.3), p))
-                        })),
+                                .child(
+                                    row()
+                                        .child(mono(&op.command_name))
+                                        .child(div().flex_1())
+                                        .child(muted(clock(op.end_ts), p)),
+                                )
+                                .child(muted(format!("{} · {}", op.status, short_id(&op.op_id)), p))
+                                .child(muted(truncate_summary(&op.description), p))
+                        }))
+                        .child(
+                            row()
+                                .gap_2()
+                                .child(
+                                    Button::new("op-prev", "Previous")
+                                        .variant(ButtonVariant::Ghost)
+                                        .on_click(cx.listener(|s, _, _, cx| {
+                                            s.ops_page = s.ops_page.saturating_sub(1);
+                                            s.selected = 0;
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(
+                                    Button::new("op-next", "Next")
+                                        .variant(ButtonVariant::Ghost)
+                                        .on_click(cx.listener(move |s, _, _, cx| {
+                                            s.ops_page = (s.ops_page + 1).min(last_page);
+                                            s.selected = 0;
+                                            cx.notify();
+                                        })),
+                                ),
+                        ),
                 )
                 .child(
                     column()
@@ -83,42 +158,48 @@ pub fn render(s: &Desktop, cx: &Context<Desktop>, p: &Palette) -> AnyElement {
                         .flex_1()
                         .p_6()
                         .bg(p.surface)
-                        .child(mono(format!("{}-8ee5-7e62-a54c-0ab1f1bba0f9", op.2)))
-                        .child(title(format!("libra {}", op.0)))
-                        .child(muted(format!("{} · worktree {} · by you", op.1, op.3), p))
-                        .child(table(
-                            &["Ref", "Before", "After"],
-                            &[
-                                vec!["HEAD", "2a9e1f3", "9f2c4e1"],
-                                vec!["refs/heads/main", "2a9e1f3", "9f2c4e1"],
-                                vec!["refs/heads/fix/limiter-config", "41be07a", "5c0d9e2"],
-                            ],
-                            p,
-                        ))
-                        .child(
-                            card(p)
-                                .child(title("Commits rewritten"))
-                                .child(mono("7d13b20 → a41c7e0"))
-                                .child("Scaffold search module and CLI flag")
-                                .child(mono("41be07a → 5c0d9e2"))
-                                .child("Tighten limiter config validation"),
-                        )
-                        .child(
-                            card(p)
-                                .child(title("Restore the view from before this operation"))
-                                .child(note(
-                                    "Moves HEAD and the 2 branch refs above back to their captured values. The \
-                                     restore is itself recorded, so it can be undone too.",
+                        .when_some(selected.cloned(), |body, op| {
+                            body.child(mono(op.op_id.clone()))
+                                .child(title(format!("libra {}", op.command_name)))
+                                .child(muted(
+                                    format!(
+                                        "{} · {} · by {} · view {}",
+                                        op.status,
+                                        clock(op.end_ts),
+                                        if op.actor.is_empty() {
+                                            "unknown"
+                                        } else {
+                                            &op.actor
+                                        },
+                                        short_id(&op.view_id)
+                                    ),
                                     p,
                                 ))
-                                .child(code(format!("libra op restore {}", op.2)))
                                 .child(
-                                    row()
-                                        .child(action("captured-view", "Show captured view", false, cx))
-                                        .child(action("restore", "Restore", true, cx)),
-                                ),
-                        ),
+                                    card(p)
+                                        .child(title("Summary"))
+                                        .child(note(op.description.clone(), p)),
+                                )
+                        })
+                        .when(selected.is_none(), |body| {
+                            body.child(muted("No operations match the current search.", p))
+                        }),
                 ),
         )
         .into_any_element()
+}
+
+fn clock(end_ts: Option<i64>) -> String {
+    end_ts
+        .and_then(|value| chrono::DateTime::<chrono::Utc>::from_timestamp(value, 0))
+        .map(|value| value.format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_else(|| "—".to_string())
+}
+
+fn truncate_summary(summary: &str) -> String {
+    summary.chars().take(80).collect()
+}
+
+fn short_id(value: &str) -> String {
+    value.chars().take(8).collect()
 }

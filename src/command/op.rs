@@ -219,16 +219,16 @@ pub struct OpLogEntry {
 }
 
 #[derive(Clone, Debug)]
-struct OperationHistoryEntry {
-    index: usize,
-    op_id: String,
-    command_name: String,
-    description: String,
-    actor: String,
-    status: String,
-    start_ts: i64,
-    end_ts: Option<i64>,
-    view_id: String,
+pub(crate) struct OperationHistoryEntry {
+    pub(crate) index: usize,
+    pub(crate) op_id: String,
+    pub(crate) command_name: String,
+    pub(crate) description: String,
+    pub(crate) actor: String,
+    pub(crate) status: String,
+    pub(crate) start_ts: i64,
+    pub(crate) end_ts: Option<i64>,
+    pub(crate) view_id: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -723,6 +723,39 @@ async fn query_operation_log_page<C: ConnectionTrait>(
         total: u64::try_from(total).unwrap_or(0),
     })
 }
+
+/// Read the whole Operation v2 history as one id snapshot for the window.
+/// Returns rows (bounded by [`OPERATION_SNAPSHOT_CAP`]) and whether the
+/// snapshot was truncated at the cap.
+pub(crate) async fn operation_snapshot_rows<C: ConnectionTrait>(
+    db: &C,
+    repo_id: &str,
+) -> CliResult<(Vec<OperationHistoryEntry>, bool)> {
+    let sql = format!(
+        "{OPERATION_HISTORY_CTE} SELECT {OPERATION_HISTORY_FIELDS} FROM ranked \
+         ORDER BY history_index LIMIT ?"
+    );
+    let rows = db
+        .query_all_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            sql,
+            [
+                repo_id.to_string().into(),
+                (OPERATION_SNAPSHOT_CAP as i64 + 1).into(),
+            ],
+        ))
+        .await
+        .map_err(|error| CliError::fatal(format!("failed to snapshot operations: {error}")))?;
+    let truncated = rows.len() > OPERATION_SNAPSHOT_CAP;
+    let mut entries = Vec::with_capacity(rows.len().min(OPERATION_SNAPSHOT_CAP));
+    for row in rows.iter().take(OPERATION_SNAPSHOT_CAP) {
+        entries.push(operation_history_entry_from_row(row)?);
+    }
+    Ok((entries, truncated))
+}
+
+/// The shared snapshot cap for the window's Operation projection.
+pub(crate) const OPERATION_SNAPSHOT_CAP: usize = 50_000;
 
 fn operation_history_entry_from_row(
     row: &sea_orm::QueryResult,

@@ -6,6 +6,7 @@
 //! read cannot migrate the repository (ADR-UID-01/02).
 
 mod history;
+mod operations;
 mod repo;
 mod sessions;
 mod snapshot;
@@ -13,6 +14,10 @@ mod state;
 mod worker;
 
 pub use history::{AttributionFilter, HistoryRow, age_label};
+pub use operations::{
+    OPERATIONS_PAGE_SIZE, OperationRow, OperationsRead, filtered_page, matches_filter, page_range,
+    page_slice,
+};
 pub use repo::READ_BUSY_TIMEOUT;
 pub use sessions::{SESSION_ROW_CAP, SessionRow, clock_from_epoch};
 pub use snapshot::{DataError, RepoContext, Snapshot};

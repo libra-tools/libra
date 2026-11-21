@@ -137,6 +137,7 @@
 
 | 时间 | 触发 | 变更内容 | 原卡 → 新卡 | 受影响的引用 |
 |---|---|---|---|---|
+| 2026-11-21 16:00:00 UTC | UID-04 执行期评审（Codex/Claude 十八轮） | 共享 `operation_snapshot_rows`（50k 上限/truncated）；生产 `filtered_page` 先过滤后分页；独立搜索/命令过滤与翻页夹紧；快照交付重置；绝对路径（引号/列表/URL/Windows）脱敏；schema 兼容与缺账本分类；只读逻辑指纹；真实 50k/10k fixture 与终止化用例 | `UID-04` AC/VER/写集与映射 | UID-04 AC/VER、写集、AC→test 映射 |
 | 2026-11-21 12:00:00 UTC | UID-03 执行期评审（Codex/Claude 二十一轮，末轮双 PASS） | 共享 `SESSION_PAGE_COLUMNS` 提升；`SessionSummaryRead::prepare_for` 支持 agent 感知与共享预算；catalog/单行失败分离（`CatalogBusy`/`DatabaseBusy` 保锁分类，`CatalogUnavailable` 页面级）；逐行摘要状态（malformed/unavailable）与可读性过滤；typed Sessions 源级状态（Stale/Absent/Busy/SchemaOld/SchemaNew）；链接与摘要上限；只读逻辑指纹；搜索/过滤/选择/状态消息回归用例 | `UID-03` AC/VER/写集与映射、EX-UID-03-01 登记 | UID-03 写集、AC→test 映射、ADR-UID-06（状态分类口径） |
 | 2026-11-21 08:00:00 UTC | UID-02 执行期评审（Claude/Codex） | History 提交按提交时间倒序并截断 200 行；归属查询按 CaptureScope（repo/worktree/workspace/fence）过滤、scope 由注入仓库连接解析、fence 仅 SELECT；归属失败降级为 Human 而不隐藏提交；补 tombstone/merge/过滤用例；Verification 改用既有 `session_list_walks_keyset_pages`；写集补 `snapshot.rs`/`worker.rs`/`widgets.rs` | `UID-02` AC/VER/写集 | UID-02 AC/VER/写集、ADR-UID-03 |
 | 2026-11-21 06:00:00 UTC | UID-01 执行期评审（Codex 四轮） | 补 anyhow 链式池超时回归用例；ADR-UID-01 说明 `with_request_scope` 为 task-local（spawn 任务不继承）；A5 与 ADR 记录退出路径的预算内等待例外；A2 映射补真实 worker 仓库外用例 | `UID-01` A5/映射 | ADR-UID-01、UID-01 AC/VER |
@@ -629,9 +630,9 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `remote-pending`
 
-**Description:** 用 operation v2 journal 替换 Operations 页面静态卡片，并提升命令层分页查询 + 新增共享 snapshot-id/fetch-by-id helper（CLI 输出不变）；分页以 **id 快照**为基准（不依赖可变的 `end_ts` 排序）。行为轴是**Operations 表面的分页数据投影**。
+**Description:** 用 operation v2 journal 替换 Operations 页面静态卡片，并新增命令层共享 `operation_snapshot_rows` 快照读取（CLI 输出不变）；分页以 **一次性快照**为基准（不依赖可变的 `end_ts` 排序）。行为轴是**Operations 表面的分页数据投影**。
 
 **Out of scope:** 撤销/恢复执行 → `DEFER-UID-01`；统计聚合口径 → `docs/development/internal/stats.md`；memory 投影 → `UID-05`。
 
@@ -655,7 +656,7 @@
 - [ ] A7 快照变化时列表重置到第 1 页。
 - [ ] A8 CLI `libra op log` 输出保持不变。
 
-**AC→test 映射（非计数）:** A1→`uid04_operation_rows`；A2→`uid04_row_fields`；A3→`uid04_filter_and_search`；A4→`uid04_source_states`；A5→`uid04_id_snapshot_paging`；A6→`uid04_snapshot_cap_truncated`；A7→`uid04_snapshot_reset_to_page_one`；A8→`command::op_test`（CLI 输出回归）。实现不变量→`uid04_terminalization_no_duplicate`、`uid04_read_only_receipt`（Verification）。
+**AC→test 映射（非计数）:** A1→`uid04_operation_rows`；A2→`uid04_operation_rows`（字段断言）+ 详情面板；A3→`uid04_filter_and_search`；A4→`uid04_source_states` + `uid04_schema_mismatch_is_typed` + `uid04_missing_schema_ledger_is_schema_old`；A5→`uid04_id_snapshot_paging`；A6→`uid04_snapshot_cap_truncated`；A7→`uid04_snapshot_reset_to_page_one`；A8→`command::op_test`（CLI 输出回归）。实现不变量→`uid04_terminalization_no_duplicate`、`uid04_read_only_receipt`（Verification）。
 
 **Verification:**
 
@@ -666,7 +667,7 @@
 - [ ] 手工（macOS 桌面会话）：临时仓库内执行一次写操作后打开窗口，核对行与过滤
 - [ ] 手工（macOS 桌面会话）：核对翻页与空状态
 
-**Full-suite trigger:** `T-1: 提升 `query_operation_log_page` 并新增共享 snapshot-id/fetch-by-id helper（GC-02 共享 helper）`
+**Full-suite trigger:** `T-1: 在命令层新增共享 operation snapshot 读取（`operation_snapshot_rows`，GC-02 共享 helper）`
 
 **Dependencies:** `UID-03`、`DEP-UID-03`、`DEP-UID-04`
 
@@ -686,7 +687,7 @@
 
 **Security and privacy:** 摘要不含绝对路径、不含原始 payload。
 
-**Performance budget:** 单页 ≤150ms；显示上限 200 行/页；id 快照读取成本 = 既有 ranked CTE 排序 + 一次 id 列表（≤50k id），在 ≥10k operation 仓库上实测并记录；不引入新索引。
+**Performance budget:** 单页 ≤150ms；显示上限 200 行/页；快照读取成本 = 既有 ranked CTE 排序 + 一次行快照（≤50k 行），10k operation fixture 实测记录于 `uid04_read_budget_10k`；不引入新索引。
 
 **Estimated scope:** M
 

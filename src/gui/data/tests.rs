@@ -2123,3 +2123,587 @@ async fn uid03_active_and_stopped_sessions_render_distinctly() {
         "a quarantined session with a cleared end is not 'Still running'"
     );
 }
+
+async fn insert_operation(dir: &tempfile::TempDir, op_id: &str, command: &str, end_ts: i64) {
+    let db_path = dir
+        .path()
+        .join(crate::utils::util::ROOT_DIR)
+        .join(crate::utils::util::DATABASE);
+    let conn = db::open_database_without_migrations(&db_path)
+        .await
+        .expect("open repository database");
+    let repo_id = crate::internal::config::ConfigKv::get_with_conn(&conn, "libra.repoid")
+        .await
+        .expect("repo id query")
+        .expect("repo id")
+        .value;
+    conn.execute_unprepared(&format!(
+        "INSERT INTO operation \
+         (op_id, repo_id, kind, status, command_name, description, actor, worktree_id, \
+          scope_kind, pre_view_oid, post_view_oid, start_ts, end_ts) \
+         VALUES ('{op_id}', '{repo_id}', 'commit', 'success', '{command}', 'summary {op_id}', \
+                 'tester', '', 'main', 'view-{op_id}', 'view-{op_id}', {start_ts}, {end_ts})",
+        start_ts = end_ts - 1
+    ))
+    .await
+    .expect("insert operation");
+    conn.close().await.ok();
+}
+
+async fn insert_operations_bulk(dir: &tempfile::TempDir, count: usize) {
+    let db_path = dir
+        .path()
+        .join(crate::utils::util::ROOT_DIR)
+        .join(crate::utils::util::DATABASE);
+    let conn = db::open_database_without_migrations(&db_path)
+        .await
+        .expect("open repository database");
+    let repo_id = crate::internal::config::ConfigKv::get_with_conn(&conn, "libra.repoid")
+        .await
+        .expect("repo id query")
+        .expect("repo id")
+        .value;
+    let mut batch = String::new();
+    for index in 0..count {
+        if index % 500 == 0 {
+            if !batch.is_empty() {
+                conn.execute_unprepared(&batch).await.expect("bulk insert");
+            }
+            batch.clear();
+            batch.push_str(
+                "INSERT INTO operation (op_id, repo_id, kind, status, command_name, description, \
+                 actor, worktree_id, scope_kind, pre_view_oid, post_view_oid, start_ts, end_ts) VALUES ",
+            );
+        } else {
+            batch.push(',');
+        }
+        let ts = 1_700_000_000_i64 + index as i64;
+        batch.push_str(&format!(
+            "('op-{index:06}', '{repo_id}', 'commit', 'success', 'commit', 'summary {index}', \
+             'tester', '', 'main', 'view-{index}', 'view-{index}', {ts}, {ts})"
+        ));
+    }
+    if !batch.is_empty() {
+        conn.execute_unprepared(&batch).await.expect("bulk insert");
+    }
+    conn.close().await.ok();
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn uid04_operation_rows() {
+    let repo_dir = tempdir().expect("temp repo");
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    insert_operation(&repo_dir, "op-1", "commit", 1_700_000_100).await;
+    insert_operation(&repo_dir, "op-2", "rebase", 1_700_000_200).await;
+    let read = super::operations::read_operations(&scope_for(&repo_dir))
+        .await
+        .expect("operations");
+    assert_eq!(read.state, SourceState::Available);
+    assert_eq!(read.rows[0].op_id, "op-2", "newest first");
+    assert!(!read.rows.is_empty(), "the real operation log has rows");
+    let row = &read.rows[0];
+    assert!(!row.op_id.is_empty());
+    assert!(!row.command_name.is_empty());
+    assert!(!row.status.is_empty());
+    assert!(row.description.chars().count() <= 200);
+    assert!(row.end_ts.is_some());
+    assert!(!read.truncated);
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn uid04_source_states() {
+    let repo_dir = tempdir().expect("temp repo");
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    let read = super::operations::read_operations(&scope_for(&repo_dir))
+        .await
+        .expect("operations");
+    assert_eq!(read.state, SourceState::Absent, "no rows means absent");
+    assert!(read.rows.is_empty());
+}
+
+#[test]
+fn uid04_id_snapshot_paging() {
+    let rows: Vec<super::operations::OperationRow> = (0..450)
+        .map(|index| super::operations::OperationRow {
+            op_id: format!("op-{index:04}"),
+            command_name: "commit".into(),
+            description: "fixture".into(),
+            actor: "tester".into(),
+            status: "succeeded".into(),
+            start_ts: 1_700_000_000,
+            end_ts: Some(1_700_000_000),
+            view_id: "view".into(),
+        })
+        .collect();
+    let first = super::operations::page_slice(&rows, 0);
+    let second = super::operations::page_slice(&rows, 1);
+    let third = super::operations::page_slice(&rows, 2);
+    assert_eq!(first.len(), 200);
+    assert_eq!(second.len(), 200);
+    assert_eq!(third.len(), 50);
+    assert_eq!(first[0].op_id, "op-0000");
+    assert_eq!(second[0].op_id, "op-0200");
+    assert_eq!(third[0].op_id, "op-0400");
+    assert_eq!(
+        super::operations::page_slice(&rows, 9).len(),
+        0,
+        "pages past the end are empty, never wrapped"
+    );
+}
+
+#[test]
+fn uid04_filter_and_search() {
+    let row = super::operations::OperationRow {
+        op_id: "op-1".into(),
+        command_name: "commit".into(),
+        description: "feat(ui): add sessions".into(),
+        actor: "tester".into(),
+        status: "succeeded".into(),
+        start_ts: 1,
+        end_ts: Some(1),
+        view_id: "view".into(),
+    };
+    assert!(super::operations::matches_filter(&row, "", "sessions"));
+    assert!(super::operations::matches_filter(&row, "commit", ""));
+    assert!(!super::operations::matches_filter(&row, "rebase", ""));
+    assert!(!super::operations::matches_filter(&row, "", "absent"));
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn uid04_read_only_receipt() {
+    let repo_dir = tempdir().expect("temp repo");
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    insert_operation(&repo_dir, "op-1", "commit", 1_700_000_100).await;
+    let db_path = repo_dir
+        .path()
+        .join(crate::utils::util::ROOT_DIR)
+        .join(crate::utils::util::DATABASE);
+    let before = receipt_fingerprint(&db_path).await;
+    let _read = super::operations::read_operations(&scope_for(&repo_dir))
+        .await
+        .expect("operations");
+    let after = receipt_fingerprint(&db_path).await;
+    assert_eq!(before, after, "operation reads write no rows");
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn uid04_schema_mismatch_is_typed() {
+    let repo_dir = tempdir().expect("temp repo");
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    insert_operation(&repo_dir, "op-1", "commit", 1_700_000_100).await;
+    let db_path = repo_dir
+        .path()
+        .join(crate::utils::util::ROOT_DIR)
+        .join(crate::utils::util::DATABASE);
+    let conn = db::open_database_without_migrations(&db_path)
+        .await
+        .expect("open repo db");
+    conn.execute_unprepared(
+        "DELETE FROM schema_versions;          INSERT INTO schema_versions (version, name, applied_at) VALUES (1, 'old', 'now')",
+    )
+    .await
+    .expect("downgrade schema");
+    conn.close().await.ok();
+    let error = super::operations::read_operations(&scope_for(&repo_dir))
+        .await
+        .expect_err("an old schema is not Available");
+    assert_eq!(error.state, SourceState::SchemaOld);
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn uid04_description_is_redacted() {
+    let repo_dir = tempdir().expect("temp repo");
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    insert_operation(&repo_dir, "op-1", "commit", 1_700_000_100).await;
+    let token = format!("ghp_{}", "b".repeat(36));
+    let db_path = repo_dir
+        .path()
+        .join(crate::utils::util::ROOT_DIR)
+        .join(crate::utils::util::DATABASE);
+    let conn = db::open_database_without_migrations(&db_path)
+        .await
+        .expect("open repo db");
+    conn.execute_unprepared(&format!(
+        "UPDATE operation SET description = 'pushed with {token} ok'"
+    ))
+    .await
+    .expect("set secret description");
+    conn.close().await.ok();
+    let read = super::operations::read_operations(&scope_for(&repo_dir))
+        .await
+        .expect("operations");
+    assert!(!read.rows[0].description.contains(&token));
+    assert!(read.rows[0].description.contains("pushed with"));
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn uid04_paths_are_sanitized() {
+    let repo_dir = tempdir().expect("temp repo");
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    insert_operation(&repo_dir, "op-1", "commit", 1_700_000_100).await;
+    insert_operation(&repo_dir, "op-2", "commit", 1_700_000_200).await;
+    insert_operation(&repo_dir, "op-3", "commit", 1_700_000_300).await;
+    insert_operation(&repo_dir, "op-4", "commit", 1_700_000_400).await;
+    let db_path = repo_dir
+        .path()
+        .join(crate::utils::util::ROOT_DIR)
+        .join(crate::utils::util::DATABASE);
+    let conn = db::open_database_without_migrations(&db_path)
+        .await
+        .expect("open repo db");
+    conn.execute_unprepared(
+        "UPDATE operation SET description = \
+         'edited path=\"/Users/alice/private/file.rs\" path=C:\\work\\repo\\x.rs done' \
+         WHERE op_id = 'op-1'",
+    )
+    .await
+    .expect("set paths 1");
+    conn.execute_unprepared(
+        "UPDATE operation SET description = \
+         'cd /Users/alice; a=b=/Users/alice/f=b.rs a=b=C:\\Users\\alice\\g=b.rs \
+          error:/Users/alice/h.rs [file](/Users/alice/i.rs) path=(/Users/alice/e.rs) a.rs->/Users/alice/q.rs \
+          file:///Users/alice/c=b.rs branch feat/search done' \
+         WHERE op_id = 'op-2'",
+    )
+    .await
+    .expect("set paths 2");
+    conn.execute_unprepared(
+        "UPDATE operation SET description = 'json {\"file\":\"/Users/alice/j.rs\"} [file](</Users/alice/i2.rs>)' \
+         WHERE op_id = 'op-3'",
+    )
+    .await
+    .expect("set paths 3");
+    conn.execute_unprepared(
+        "UPDATE operation SET description = 'win {\"file\":\"C:\\\\Users\\\\alice\\\\k.rs\"} done' \
+         WHERE op_id = 'op-4'",
+    )
+    .await
+    .expect("set paths 4");
+    conn.close().await.ok();
+    let read = super::operations::read_operations(&scope_for(&repo_dir))
+        .await
+        .expect("operations");
+    let first = read
+        .rows
+        .iter()
+        .find(|row| row.op_id == "op-1")
+        .expect("op-1");
+    let second = read
+        .rows
+        .iter()
+        .find(|row| row.op_id == "op-2")
+        .expect("op-2");
+    let one = &first.description;
+    assert!(!one.contains("/Users/"), "no absolute path survives: {one}");
+    assert!(!one.contains("C:\\work"), "no Windows path survives: {one}");
+    assert!(one.contains("file.rs") && one.contains("x.rs"));
+    let two = &second.description;
+    assert!(!two.contains("/Users/"), "no absolute path survives: {two}");
+    assert!(!two.contains("C:\\Users"), "no nested Windows path: {two}");
+    assert!(two.contains("f=b.rs"), "nested basename survives: {two}");
+    assert!(
+        two.contains("g=b.rs"),
+        "nested Windows basename survives: {two}"
+    );
+    assert!(two.contains("h.rs"), "colon path sanitized: {two}");
+    assert!(two.contains("i.rs"), "markdown link sanitized: {two}");
+    assert!(two.contains("e.rs"), "wrapped assignment sanitized: {two}");
+    assert!(two.contains("q.rs"), "arrow destination sanitized: {two}");
+    assert!(two.contains("c=b.rs"), "URL basename survives: {two}");
+    assert!(
+        two.contains("branch feat/search"),
+        "relative names survive: {two}"
+    );
+    let three = read
+        .rows
+        .iter()
+        .find(|row| row.op_id == "op-3")
+        .expect("op-3");
+    let json = &three.description;
+    assert!(!json.contains("/Users/"), "JSON path removed: {json}");
+    assert_eq!(
+        json, "json {\"file\":\"j.rs\"} [file](<i2.rs>)",
+        "the sanitized JSON is exact and well-formed"
+    );
+    assert!(
+        json.contains("i2.rs"),
+        "angle-bracket destination sanitized: {json}"
+    );
+    let four = read
+        .rows
+        .iter()
+        .find(|row| row.op_id == "op-4")
+        .expect("op-4");
+    let win_json = &four.description;
+    assert_eq!(
+        win_json, "win {\"file\":\"k.rs\"} done",
+        "the sanitized Windows JSON is exact"
+    );
+    assert!(
+        win_json.contains("k.rs"),
+        "JSON Windows basename survives: {win_json}"
+    );
+}
+
+#[test]
+fn uid04_filter_before_paging_reaches_later_matches() {
+    let rows: Vec<super::operations::OperationRow> = (0..450)
+        .map(|index| super::operations::OperationRow {
+            op_id: format!("op-{index:04}"),
+            command_name: "commit".into(),
+            description: if index == 350 {
+                "needle".to_string()
+            } else {
+                "haystack".to_string()
+            },
+            actor: "tester".into(),
+            status: "succeeded".into(),
+            start_ts: 1,
+            end_ts: Some(1),
+            view_id: "view".into(),
+        })
+        .collect();
+    let (page, page_count) = super::operations::filtered_page(&rows, "", "needle", 0);
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].op_id, "op-0350");
+    assert_eq!(page_count, 1, "page count follows the filtered sequence");
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn uid04_snapshot_cap_truncated() {
+    let repo_dir = tempdir().expect("temp repo");
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    insert_operations_bulk(&repo_dir, crate::command::op::OPERATION_SNAPSHOT_CAP).await;
+    let read = super::operations::read_operations(&scope_for(&repo_dir))
+        .await
+        .expect("operations");
+    assert_eq!(read.rows.len(), crate::command::op::OPERATION_SNAPSHOT_CAP);
+    assert!(!read.truncated, "exactly at the cap is not truncated");
+
+    let repo_dir = tempdir().expect("temp repo");
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    insert_operations_bulk(&repo_dir, crate::command::op::OPERATION_SNAPSHOT_CAP + 1).await;
+    let read = super::operations::read_operations(&scope_for(&repo_dir))
+        .await
+        .expect("operations");
+    assert_eq!(read.rows.len(), crate::command::op::OPERATION_SNAPSHOT_CAP);
+    assert!(read.truncated, "one past the cap is truncated");
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn uid04_read_budget_10k() {
+    let repo_dir = tempdir().expect("temp repo");
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    insert_operations_bulk(&repo_dir, 10_000).await;
+    let started = std::time::Instant::now();
+    let read = super::operations::read_operations(&scope_for(&repo_dir))
+        .await
+        .expect("operations");
+    let elapsed = started.elapsed();
+    assert_eq!(read.rows.len(), 10_000);
+    assert!(
+        elapsed < std::time::Duration::from_millis(150),
+        "10k production read took {elapsed:?}, over the 150ms budget"
+    );
+}
+
+#[test]
+fn uid04_snapshot_reset_to_page_one() {
+    assert_eq!(crate::gui::desktop::reset_page_for_new_snapshot(), 0);
+    let rows: Vec<super::operations::OperationRow> = (0..450)
+        .map(|index| super::operations::OperationRow {
+            op_id: format!("op-{index:04}"),
+            command_name: "commit".into(),
+            description: "summary".into(),
+            actor: "tester".into(),
+            status: "succeeded".into(),
+            start_ts: 1,
+            end_ts: Some(1),
+            view_id: "view".into(),
+        })
+        .collect();
+    let (second, _) = super::operations::filtered_page(&rows, "", "", 1);
+    let delivered = crate::gui::desktop::delivered_page(1);
+    assert_eq!(delivered, 0, "delivery resets a nonzero page");
+    let (reset, _) = super::operations::filtered_page(&rows, "", "", delivered);
+    assert_eq!(second[0].op_id, "op-0200");
+    assert_eq!(
+        reset[0].op_id, "op-0000",
+        "a new snapshot starts at page one"
+    );
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn uid04_terminalization_no_duplicate() {
+    let repo_dir = tempdir().expect("temp repo");
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    insert_operations_bulk(&repo_dir, 450).await;
+    let first = super::operations::read_operations(&scope_for(&repo_dir))
+        .await
+        .expect("first snapshot");
+    // Terminalize an operation between page reads: the SNAPSHOT is fixed, so
+    // traversal stays complete and duplicate-free.
+    let db_path = repo_dir
+        .path()
+        .join(crate::utils::util::ROOT_DIR)
+        .join(crate::utils::util::DATABASE);
+    let conn = db::open_database_without_migrations(&db_path)
+        .await
+        .expect("open repo db");
+    conn.execute_unprepared(
+        "UPDATE operation SET end_ts = end_ts + 1000, status = 'success' \
+         WHERE op_id = 'op-000200'",
+    )
+    .await
+    .expect("terminalize");
+    conn.close().await.ok();
+    let mut seen = std::collections::HashSet::new();
+    for page in 0..3 {
+        let (rows, _) = super::operations::filtered_page(&first.rows, "", "", page);
+        for row in rows {
+            assert!(
+                seen.insert(row.op_id.clone()),
+                "no row repeats across pages"
+            );
+        }
+    }
+    assert_eq!(seen.len(), 450, "every row appears exactly once");
+    let second = super::operations::read_operations(&scope_for(&repo_dir))
+        .await
+        .expect("second snapshot");
+    assert!(
+        second.rows.iter().any(|row| row.op_id == "op-000200"),
+        "the new snapshot still lists the terminalized row"
+    );
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn uid04_missing_schema_ledger_is_schema_old() {
+    let repo_dir = tempdir().expect("temp repo");
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    insert_operation(&repo_dir, "op-1", "commit", 1_700_000_100).await;
+    let db_path = repo_dir
+        .path()
+        .join(crate::utils::util::ROOT_DIR)
+        .join(crate::utils::util::DATABASE);
+    let conn = db::open_database_without_migrations(&db_path)
+        .await
+        .expect("open repo db");
+    conn.execute_unprepared("DROP TABLE schema_versions")
+        .await
+        .expect("drop schema ledger");
+    conn.close().await.ok();
+    let error = super::operations::read_operations(&scope_for(&repo_dir))
+        .await
+        .expect_err("a missing ledger is not Available");
+    assert_eq!(error.state, SourceState::SchemaOld);
+    // The read-only connection must not recreate the ledger.
+    let conn = db::open_database_without_migrations(&db_path)
+        .await
+        .expect("open repo db");
+    let exists = conn
+        .query_one_raw(sea_orm::Statement::from_string(
+            conn.get_database_backend(),
+            "SELECT COUNT(*) AS n FROM sqlite_master WHERE type='table' AND name='schema_versions'"
+                .to_string(),
+        ))
+        .await
+        .expect("table probe")
+        .and_then(|row| row.try_get::<i64>("", "n").ok())
+        .unwrap_or(0);
+    conn.close().await.ok();
+    assert_eq!(exists, 0, "the missing ledger was not recreated");
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn uid04_summary_cap_is_200_chars() {
+    let repo_dir = tempdir().expect("temp repo");
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    insert_operation(&repo_dir, "op-long", "commit", 1_700_000_100).await;
+    let db_path = repo_dir
+        .path()
+        .join(crate::utils::util::ROOT_DIR)
+        .join(crate::utils::util::DATABASE);
+    let conn = db::open_database_without_migrations(&db_path)
+        .await
+        .expect("open repo db");
+    let long = "x".repeat(250);
+    conn.execute_unprepared(&format!(
+        "UPDATE operation SET description = '{long}' WHERE op_id = 'op-long'"
+    ))
+    .await
+    .expect("set long summary");
+    conn.close().await.ok();
+    let read = super::operations::read_operations(&scope_for(&repo_dir))
+        .await
+        .expect("operations");
+    assert_eq!(read.rows[0].description.chars().count(), 200);
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn uid04_unreadable_database_is_an_error() {
+    let repo_dir = tempdir().expect("temp repo");
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    let db_path = repo_dir
+        .path()
+        .join(crate::utils::util::ROOT_DIR)
+        .join(crate::utils::util::DATABASE);
+    fs::write(&db_path, b"not a sqlite database").expect("corrupt database");
+    let error = super::operations::read_operations(&scope_for(&repo_dir))
+        .await
+        .expect_err("a corrupt repository database must not look empty");
+    assert_eq!(error.state, SourceState::Corrupt);
+    assert!(!error.message.is_empty());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[serial(cwd)]
+async fn uid04_permission_denied_is_unreadable() {
+    let repo_dir = tempdir().expect("temp repo");
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    insert_operation(&repo_dir, "op-1", "commit", 1_700_000_100).await;
+    let db_path = repo_dir
+        .path()
+        .join(crate::utils::util::ROOT_DIR)
+        .join(crate::utils::util::DATABASE);
+    let mut permissions = fs::metadata(&db_path).expect("stat database").permissions();
+    permissions.set_readonly(true);
+    fs::set_permissions(&db_path, permissions).expect("set readonly");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(&db_path).expect("stat database").permissions();
+        permissions.set_mode(0o000);
+        fs::set_permissions(&db_path, permissions).expect("set mode 000");
+    }
+    let error = super::operations::read_operations(&scope_for(&repo_dir))
+        .await
+        .expect_err("an unreadable database is not Available");
+    assert_eq!(
+        error.state,
+        SourceState::Unreadable {
+            kind: std::io::ErrorKind::PermissionDenied
+        }
+    );
+    // Restore so the tempdir can be cleaned up.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(&db_path).expect("stat database").permissions();
+        permissions.set_mode(0o644);
+        fs::set_permissions(&db_path, permissions).expect("restore mode");
+    }
+}
