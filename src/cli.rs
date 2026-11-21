@@ -3984,7 +3984,7 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
     // worktree sidecar, an agent-run manifest) and are therefore invisible to
     // a database transaction. Publishers never block each other; the cost is
     // one `flock` per command.
-    let _maintenance_lock = match preflight.storage.as_deref() {
+    let mut maintenance_lock = match preflight.storage.as_deref() {
         Some(storage) if command_holds_shared_maintenance_lock(&args.command) => Some(
             crate::internal::maintenance_lock::MaintenanceLock::shared(storage)?,
         ),
@@ -4283,7 +4283,17 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
             Commands::PackObjects(cmd_args) => {
                 command::pack_objects::execute_safe(cmd_args, &output).await?
             }
-            Commands::Fetch(cmd_args) => command::fetch::execute_safe(cmd_args, &output).await?,
+            Commands::Fetch(cmd_args) => {
+                // Git runs auto-maintenance after a successful fetch. The
+                // command-level shared hold is released first so `gc` can take
+                // its own maintenance lock.
+                let auto_gc = !cmd_args.dry_run && !cmd_args.no_auto_gc;
+                command::fetch::execute_safe(cmd_args, &output).await?;
+                if auto_gc {
+                    maintenance_lock.take();
+                    command::gc::run_auto_maintenance(&output).await;
+                }
+            }
             Commands::Fsck(cmd_args) => command::fsck::execute_safe(cmd_args, &output).await?,
             Commands::Gc(cmd_args) => command::gc::execute_safe(cmd_args, &output).await?,
             Commands::Maintenance(cmd_args) => {

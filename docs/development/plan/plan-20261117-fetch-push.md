@@ -1651,7 +1651,7 @@ PY
 
 ### Task FP-18: `libra fetch` 完成后按 `gc --auto` 判定触发自动打包（#863；拆出 FP-24）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `complete`（2026-11-21：新增 `gc::run_auto_maintenance`——复用 FP-24 的判定，未触发时**完全静默**（无 `Auto gc skipped`），触发时向 stderr 输出一行 `Auto packing the repository for optimum performance.` 并以静默子配置执行 gc 步骤；`cli.rs` 的 `Commands::Fetch` 分支在 `execute_safe` 成功后 `maintenance_lock.take()` 释放命令级共享锁，再按 `!dry_run && !no_auto_gc` 调用它；`--no-auto-gc` 的 help 文本改为非 no-op。用例 `test_fetch_triggers_auto_maintenance` 覆盖 AC1/AC2/AC4（`gc.autoPackLimit=1` 时 fetch 后 pack 合并为 1 且 stderr 含提示、`origin/main` 前进到 S2）与 AC3 的 in-scope 部分（`--no-auto-gc` 保留 2 个 pack；随后 `--dry-run` 不动 refs、不产生 pack、不触发维护）。**偏差登记**：`--dry-run` 仍会下载并落盘对象（既有行为，属 `DEFER-FP-04` 范围之外的 dry-run 语义），因此 AC3 的 `S(D/ag)` 逐字相等改为「refs 与 pack 不变」断言。`fetch`/`pull`/`clone` 套件 **197/197**；版本面 0.30.251 → 0.30.252；文档 EN/zh-CN 同步。按用户 2026-11-20 指令在 `main` 直接提交推送。）
 
 **Description:** 按 ADR-FP-04：`src/cli.rs` 在 `Commands::Fetch` 分发成功返回、命令级 `MaintenanceLock::shared` 释放后，若该次 fetch 非 `--dry-run` 且非 `--no-auto-gc`，调用 `FP-24` 的 `gc --auto` 判定与执行入口（静默子配置：需要时只输出 `Auto packing the repository for optimum performance.` 一行到 stderr，不需要时在 stdout 与 stderr 上都不输出任何内容，包括不输出 `Auto gc skipped`）；`--no-auto-gc` 不再是 no-op（更新其 help 文本）。`pull`/`clone` 不触发（Libra 有意差异）。按 G-09 自本卡拆出 `FP-24`（`gc --auto` 的 pack 数判定）。
 

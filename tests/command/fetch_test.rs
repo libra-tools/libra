@@ -4565,3 +4565,101 @@ fn test_fetch_tagopt_is_case_insensitive() {
         "AC6: only the reachable tag is auto-followed"
     );
 }
+
+#[test]
+fn test_fetch_triggers_auto_maintenance() {
+    use crate::command::{assert_cli_success, run_libra_command};
+
+    // Source `s` plus a clone `c`; a gc first gives the clone one pack so a
+    // fetch adds a second one and `gc.autoPackLimit=1` makes maintenance fire.
+    let work = tempfile::tempdir().expect("work dir");
+    let s = work.path().join("s");
+    std::fs::create_dir_all(&s).expect("mkdir s");
+    assert_cli_success(&run_libra_command(&["init"], &s), "init s");
+    run_libra_command(&["config", "set", "user.name", "t"], &s);
+    run_libra_command(&["config", "set", "user.email", "t@t"], &s);
+    std::fs::write(s.join("f.txt"), "s1\n").expect("write S1");
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], &s), "stage S1");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "S1", "--no-verify"], &s),
+        "commit S1",
+    );
+    let c = work.path().join("c");
+    assert_cli_success(
+        &run_libra_command(&["clone", "./s", "c"], work.path()),
+        "clone c",
+    );
+    run_libra_command(&["config", "set", "user.name", "t"], &c);
+    run_libra_command(&["config", "set", "user.email", "t@t"], &c);
+    assert_cli_success(&run_libra_command(&["gc"], &c), "pack the clone");
+    run_libra_command(&["config", "set", "gc.autoPackLimit", "1"], &c);
+
+    let commit_in_source = |name: &str, content: &str| {
+        std::fs::write(s.join("f.txt"), content).expect("write source file");
+        assert_cli_success(&run_libra_command(&["add", "f.txt"], &s), "stage");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", name, "--no-verify"], &s),
+            "commit",
+        );
+        String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], &s).stdout)
+            .trim()
+            .to_string()
+    };
+    let packs = |repo: &std::path::Path| {
+        std::fs::read_dir(repo.join(".libra/objects/pack"))
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|entry| {
+                        entry.path().extension().and_then(|e| e.to_str()) == Some("pack")
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
+    };
+
+    // AC1/AC2/AC4: a fetch that leaves two packs triggers maintenance.
+    let s2 = commit_in_source("S2", "s2\n");
+    let out = run_libra_command(&["fetch", "--verbose"], &c);
+    assert_cli_success(&out, "AC1: fetch succeeds");
+    let tracked = String::from_utf8_lossy(
+        &run_libra_command(&["rev-parse", "refs/remotes/origin/main"], &c).stdout,
+    )
+    .trim()
+    .to_string();
+    assert_eq!(tracked, s2, "AC1: origin/main advanced to S2");
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .lines()
+            .any(|line| line == "Auto packing the repository for optimum performance."),
+        "AC2: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(packs(&c), 1, "AC4: the packs were consolidated");
+
+    // AC3: `--no-auto-gc` keeps the packs, and a later `--dry-run` writes
+    // nothing at all.
+    commit_in_source("S3", "s3\n");
+    assert_cli_success(
+        &run_libra_command(&["fetch", "--no-auto-gc"], &c),
+        "AC3: fetch without auto-gc",
+    );
+    assert_eq!(packs(&c), 2, "AC3: --no-auto-gc leaves two packs");
+    // The dry-run writes no refs and no pack (pre-existing dry-run object
+    // download behaviour is out of this card's scope).
+    let refs_before = run_libra_command(&["show-ref"], &c).stdout;
+    let packs_before = packs(&c);
+    let out = run_libra_command(&["fetch", "--dry-run"], &c);
+    assert_cli_success(&out, "AC3: dry-run fetch");
+    assert_eq!(
+        run_libra_command(&["show-ref"], &c).stdout,
+        refs_before,
+        "AC3: --dry-run moves no refs"
+    );
+    assert_eq!(packs(&c), packs_before, "AC3: --dry-run creates no pack");
+    assert!(
+        !String::from_utf8_lossy(&out.stderr)
+            .contains("Auto packing the repository for optimum performance."),
+        "AC3: --dry-run does not trigger maintenance"
+    );
+}

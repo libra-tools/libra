@@ -336,6 +336,41 @@ fn silent_child(output: &OutputConfig) -> OutputConfig {
     child
 }
 
+/// Run the `gc --auto` decision from a maintenance-triggered caller (fetch).
+///
+/// Completely silent when maintenance is not warranted: no `Auto gc skipped`
+/// line, nothing on stdout or stderr. When it does run, one notice goes to
+/// stderr (Git parity) and the described default is used.
+pub async fn run_auto_maintenance(output: &crate::utils::output::OutputConfig) {
+    let Ok(repo_path) = try_get_storage_path(None) else {
+        return;
+    };
+    let Ok(loose_count) = list_loose_objects(&repo_path).map(|objects| objects.len()) else {
+        return;
+    };
+    let gc_auto = gc_auto_threshold().await.unwrap_or(DEFAULT_GC_AUTO);
+    let pack_limit = gc_auto_pack_limit()
+        .await
+        .unwrap_or(DEFAULT_GC_AUTO_PACK_LIMIT);
+    let packs = count_packs_without_keep(&repo_path).unwrap_or(0);
+    if !gc_auto_should_run(gc_auto, pack_limit, packs, loose_count) {
+        return;
+    }
+    if !output.is_json() && !output.quiet {
+        eprintln!("Auto packing the repository for optimum performance.");
+    }
+    // The steps run under a quiet child so only the notice above is visible.
+    let mut child = silent_child(output);
+    child.quiet = true;
+    let args = GcArgs {
+        prune: None,
+        no_prune: false,
+        aggressive: false,
+        auto: true,
+    };
+    let _ = execute_safe(args, &child).await;
+}
+
 /// Whether `gc --auto` should run (ADR-FP-04, the single source of truth).
 ///
 /// `gc.auto <= 0` disables auto-gc entirely. Otherwise the run is triggered by

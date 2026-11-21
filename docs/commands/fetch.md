@@ -176,6 +176,13 @@ libra config remote.origin.prune false  # but never for origin
 
 ## Options
 
+A successful, non-`--dry-run` fetch runs the same auto-maintenance decision as
+`libra gc --auto` once the command's maintenance lock is released: when it fires
+(stderr line `Auto packing the repository for optimum performance.`) the fetched
+packs are repacked; when it does not, fetch prints nothing extra. `--no-auto-gc`
+disables that pass; `--dry-run` never triggers it. `pull` and `clone` do not run
+auto-maintenance (intentional difference).
+
 `remote.<name>.tagOpt` is read case-insensitively (`tagopt`, `tagOpt`, `TAGOPT`
 all work): `--tags` fetches every tag, `--no-tags` fetches none, and any other
 value (or no value) auto-follows only tags whose objects the fetch already

@@ -803,9 +803,9 @@ pub struct FetchArgs {
     #[clap(long = "no-tags", overrides_with = "tags")]
     pub no_tags: bool,
 
-    /// Do not run a repacking/gc pass after fetching. Accepted for Git parity
-    /// and is a no-op: Libra's fetch never triggers an automatic gc, so there
-    /// is nothing to disable.
+    /// Do not run the `gc --auto` maintenance pass after fetching. Without it a
+    /// successful, non-dry-run fetch triggers the same decision as `libra gc
+    /// --auto` once the command's maintenance lock is released.
     #[clap(long = "no-auto-gc")]
     pub no_auto_gc: bool,
 
