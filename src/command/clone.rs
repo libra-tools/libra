@@ -241,6 +241,12 @@ pub struct CloneArgs {
     #[clap(long = "ref-storage-format", value_name = "format")]
     pub ref_storage_format: Option<String>,
 
+    /// Initialise a cone-mode sparse checkout: only the top-level files are
+    /// materialised and every deeper entry stays in the index with the
+    /// skip-worktree bit set (Git's `clone --sparse`).
+    #[clap(long = "sparse")]
+    pub sparse: bool,
+
     /// Deepen history to commits more recent than a date (Git's
     /// `--shallow-since <date>`). Accepted for compatibility but a no-op with a
     /// warning: Libra bounds shallow history only by `--depth`, so the date bound
@@ -261,7 +267,8 @@ pub struct CloneArgs {
     /// path(s) (repeatable). Implies `--notes` (the dependency graph must be
     /// fetched to compute the closure). intentionally-different (Git has no
     /// file-dependency concept); it is NOT partial-clone/`--filter` (objects are
-    /// never wire-filtered) and NOT `--sparse` (declined D10). The whole tree is
+    /// never wire-filtered) and is independent of `--sparse` (which narrows the working tree in cone mode).
+    /// The whole tree is
     /// still downloaded and checked out — only the sparse VIEW is narrowed (disk
     /// narrowing is deferred, D18). Only a local Libra source can travel the graph
     /// in v1 (D17). Conflicts with `--no-checkout`/`--bare`/`--mirror` (they skip
@@ -446,6 +453,57 @@ fn upload_pack_advertises_no_filter() -> bool {
             .ok()
             .as_deref()
             == Some("1")
+}
+
+/// Initialise cone-mode sparse checkout in the freshly cloned repository.
+///
+/// Cone mode with no directories keeps exactly the top-level files; every
+/// deeper entry stays in the index with the skip-worktree bit set. Cone rule
+/// persistence and rule management are still deferred (`DEFER-CL-04`).
+fn apply_sparse_cone_clone() -> Result<(), CloneError> {
+    use git_internal::internal::index::Index;
+
+    let index_path = crate::utils::path::index();
+    let mut index = Index::load(&index_path).map_err(|source| CloneError::SetupFailed {
+        message: format!("failed to read the index for --sparse: {source}"),
+    })?;
+    let deeper = index
+        .tracked_entries(0)
+        .into_iter()
+        .filter(|entry| entry.name.contains('/'))
+        .map(|entry| entry.name.clone())
+        .collect::<Vec<_>>();
+    for path in &deeper {
+        if !crate::utils::index_ext::set_skip_worktree(&mut index, path, true) {
+            return Err(CloneError::SetupFailed {
+                message: format!("failed to mark '{path}' skip-worktree"),
+            });
+        }
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(CloneError::SetupFailed {
+                    message: format!("failed to remove '{path}' from the sparse checkout: {error}"),
+                });
+            }
+        }
+    }
+    index
+        .save(&index_path)
+        .map_err(|source| CloneError::SetupFailed {
+            message: format!("failed to save the sparse index: {source}"),
+        })?;
+    // Prune the now-empty directories so the working tree matches cone mode.
+    let mut dirs = deeper
+        .iter()
+        .filter_map(|path| path.rsplit_once('/').map(|(dir, _)| dir.to_string()))
+        .collect::<Vec<_>>();
+    dirs.sort_by_key(|dir| std::cmp::Reverse(dir.matches('/').count()));
+    for dir in dirs {
+        let _ = std::fs::remove_dir(&dir);
+    }
+    Ok(())
 }
 
 /// The commit a source repository's detached HEAD points at, if it is detached.
@@ -2566,6 +2624,12 @@ async fn clone_into_destination(
         )
         .await?
     };
+
+    if args.sparse && !args.bare && !args.no_checkout {
+        apply_sparse_cone_clone()?;
+        let _ = ConfigKv::set("core.sparseCheckout", "true", false).await;
+        let _ = ConfigKv::set("core.sparseCheckoutCone", "true", false).await;
+    }
 
     // lore.md 2.11: auto-register the source as an object alternate for a LOCAL
     // LIBRA source (a Git source's `git gc` does not consult Libra's borrowers

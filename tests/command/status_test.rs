@@ -3944,7 +3944,9 @@ fn test_status_honors_skip_worktree_matrix() {
         "H4 commit -a must not delete s"
     );
 
-    // H5: core.sparseCheckout=true keeps the H1 behavior and warns once.
+    // H5: core.sparseCheckout=true keeps the H1 behavior. `clone --sparse`
+    // materialises cone mode natively (plan-20261117-clone CL-16), so `status`
+    // no longer reports sparse checkout as unsupported.
     assert_cli_success(
         &run_libra_command(&["config", "set", "core.sparseCheckout", "true"], root),
         "enable sparseCheckout",
@@ -3954,8 +3956,8 @@ fn test_status_honors_skip_worktree_matrix() {
     assert_cli_success(&status, "H5 status");
     let stderr = String::from_utf8_lossy(&status.stderr).to_string();
     assert!(
-        stderr.contains("core.sparseCheckout=true is not supported"),
-        "H5 one-time warning expected: {stderr}"
+        !stderr.contains("core.sparseCheckout=true is not supported"),
+        "H5 status must not warn once cone materialisation exists: {stderr}"
     );
     assert!(
         !output_mentions_path_s(&String::from_utf8_lossy(&status.stdout)),

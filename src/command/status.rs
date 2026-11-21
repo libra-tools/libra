@@ -560,7 +560,9 @@ pub(crate) async fn execute_safe_with_resolution(
     // ADR-FM-04 K6: an invalid `core.fileMode` fails status closed (no output,
     // zero writes) with the commit.verbose mapping.
     let _ = crate::internal::config::core_file_mode().await?;
-    crate::command::status::warn_sparse_checkout_unsupported_once().await;
+    // `clone --sparse` materialises cone mode natively, so `status` no longer
+    // reports the sparse checkout as unsupported (`add`/`commit`/`diff` keep
+    // their advisory warning until cone materialisation covers them).
 
     if let Some(resolution) = resolution {
         extras.rename_threshold = resolve_status_threshold(&args, Some(resolution))?;

@@ -232,6 +232,7 @@ async fn test_clone_branch() {
         mirror: false,
         filter: Vec::new(),
         ref_storage_format: None,
+        sparse: false,
         shallow_since: None,
         shallow_exclude: vec![],
         deps_of: vec![],
@@ -289,6 +290,7 @@ async fn test_clone_bare_repository() {
         mirror: false,
         filter: Vec::new(),
         ref_storage_format: None,
+        sparse: false,
         shallow_since: None,
         shallow_exclude: vec![],
         deps_of: vec![],
@@ -361,6 +363,7 @@ async fn test_clone_branch_single_branch() {
         mirror: false,
         filter: Vec::new(),
         ref_storage_format: None,
+        sparse: false,
         shallow_since: None,
         shallow_exclude: vec![],
         deps_of: vec![],
@@ -417,6 +420,7 @@ async fn test_clone_default_branch() {
         mirror: false,
         filter: Vec::new(),
         ref_storage_format: None,
+        sparse: false,
         shallow_since: None,
         shallow_exclude: vec![],
         deps_of: vec![],
@@ -473,6 +477,7 @@ async fn test_clone_default_branch_single_branch() {
         mirror: false,
         filter: Vec::new(),
         ref_storage_format: None,
+        sparse: false,
         shallow_since: None,
         shallow_exclude: vec![],
         deps_of: vec![],
@@ -531,6 +536,7 @@ async fn test_clone_to_existing_empty_dir() {
         mirror: false,
         filter: Vec::new(),
         ref_storage_format: None,
+        sparse: false,
         shallow_since: None,
         shallow_exclude: vec![],
         deps_of: vec![],
@@ -592,6 +598,7 @@ async fn test_clone_to_existing_dir() {
         mirror: false,
         filter: Vec::new(),
         ref_storage_format: None,
+        sparse: false,
         shallow_since: None,
         shallow_exclude: vec![],
         deps_of: vec![],
@@ -649,6 +656,7 @@ async fn test_clone_to_dir_with_existing_file_name() {
         mirror: false,
         filter: Vec::new(),
         ref_storage_format: None,
+        sparse: false,
         shallow_since: None,
         shallow_exclude: vec![],
         deps_of: vec![],
@@ -705,6 +713,7 @@ async fn test_clone_with_depth() {
         mirror: false,
         filter: Vec::new(),
         ref_storage_format: None,
+        sparse: false,
         shallow_since: None,
         shallow_exclude: vec![],
         deps_of: vec![],
@@ -763,6 +772,7 @@ async fn test_clone_with_depth_and_branch() {
         mirror: false,
         filter: Vec::new(),
         ref_storage_format: None,
+        sparse: false,
         shallow_since: None,
         shallow_exclude: vec![],
         deps_of: vec![],
@@ -4930,6 +4940,88 @@ fn test_sparse_preflight_merge_pull_rebase_cherry_pick_stash() {
             String::from_utf8_lossy(&out.stderr)
         );
     }
+}
+
+#[test]
+fn test_clone_sparse_cone_materializes_top_level() {
+    use crate::command::{assert_cli_success, run_libra_command};
+
+    let source = tempdir().expect("source");
+    let sp = source.path();
+    assert_cli_success(&run_libra_command(&["init"], sp), "init");
+    run_libra_command(&["config", "set", "user.name", "t"], sp);
+    run_libra_command(&["config", "set", "user.email", "t@t"], sp);
+    std::fs::write(sp.join("a.txt"), "one\n").expect("write a");
+    std::fs::create_dir_all(sp.join("sub")).expect("mkdir sub");
+    std::fs::write(sp.join("sub/b.txt"), "bee\n").expect("write b");
+    assert_cli_success(&run_libra_command(&["add", "-A"], sp), "stage s1");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "s1", "--no-verify"], sp),
+        "commit s1",
+    );
+    std::fs::write(sp.join("a.txt"), "two\n").expect("rewrite a");
+    assert_cli_success(&run_libra_command(&["add", "a.txt"], sp), "stage s2");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "s2", "--no-verify"], sp),
+        "commit s2",
+    );
+    let s2_a = {
+        let out = run_libra_command(&["cat-file", "-p", "HEAD:a.txt"], sp);
+        assert_cli_success(&out, "read S2:a.txt");
+        out.stdout
+    };
+
+    let root = tempdir().expect("dest root");
+    let d = root.path().join("d");
+    let source_url = format!("file://{}", sp.display());
+    assert_cli_success(
+        &run_libra_command(
+            &["clone", "--sparse", &source_url, d.to_str().expect("dest")],
+            root.path(),
+        ),
+        "clone --sparse",
+    );
+
+    let get = |key: &str| {
+        let out = run_libra_command(&["config", "get", key], &d);
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+    assert_eq!(get("core.sparseCheckout"), "true\n", "AC1");
+    assert_eq!(get("core.sparseCheckoutCone"), "true\n", "AC2");
+
+    assert_eq!(
+        std::fs::read(d.join("a.txt")).expect("read a.txt"),
+        s2_a,
+        "AC3: the top-level file matches HEAD"
+    );
+    assert!(
+        !d.join("sub").exists(),
+        "AC4: the nested directory stays out"
+    );
+
+    let listed = run_libra_command(&["ls-files", "-t"], &d);
+    assert_cli_success(&listed, "AC5: ls-files");
+    assert_eq!(
+        String::from_utf8_lossy(&listed.stdout),
+        "H a.txt\nS sub/b.txt\n",
+        "AC5"
+    );
+
+    let status = run_libra_command(&["status"], &d);
+    assert_cli_success(&status, "AC6: status");
+    assert!(
+        !String::from_utf8_lossy(&status.stderr)
+            .contains("core.sparseCheckout=true is not supported"),
+        "AC6: no sparse warning: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+
+    let help = run_libra_command(&["clone", "--help"], sp);
+    assert_cli_success(&help, "AC7: help");
+    assert!(
+        !String::from_utf8_lossy(&help.stdout).contains("declined D10"),
+        "AC7: the help no longer claims --sparse is declined"
+    );
 }
 
 #[test]

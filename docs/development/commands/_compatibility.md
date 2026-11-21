@@ -174,14 +174,15 @@ unsupported 子面。
 
 ### D10：`clone --sparse` 与顶层 `sparse-checkout` 命令
 
-- 状态：延后。Sparse checkout 依赖工作树配置和 skip-worktree 语义；Libra 已将 config/HEAD/refs 放入 SQLite，桥接成本高。
+- 状态：部分重开（2026-11-21）：`clone --sparse` 的 cone 物化已交付，其余入口见下方进展。
 - 重启条件：出现大型 monorepo 子树检出需求，并完成对象存储 + 部分检出的工程 RFC。
 
 - 进展（2026-09-20，issues/490 SW-01）：`git-internal` 已升级到 `=0.10.0`，索引 **v3 扩展标志字**（`CE_SKIP_WORKTREE` / `CE_INTENT_TO_ADD`）的读取、写入（按需输出 v3，否则保持 v2 字节不变）与未知扩展位 fail-closed 已落地；Libra 的 AI history 清理解析器接受 v3 并复用依赖的扩展位解码。设置/观察入口（`update-index --skip-worktree`、`ls-files` 的 `S` 标记）与 `status`/`add` 的尊重语义仍待 490 SW-03..SW-07，`clone --sparse` / 顶层 `sparse-checkout` 保持延后。
 
 - 进展（2026-09-20，issues/490 SW-07，部分重开完成）：索引位与尊重/保留语义**已交付**：`update-index --skip-worktree`/`--no-skip-worktree`（mark 优先于 `--force-remove`；未跟踪路径 `Unable to mark file` 128；skip-worktree 条目短路 add/remove——显式 `--remove` 删除条目、其余 no-op）、`ls-files -t`/`-v` 的 `S` 标记与 `-d`/`-m` 排除、`status`/`diff`/`add -u/-A`/`commit -a` 对该位的尊重（SW-05）、暂存/历史改写命令的位保留（SW-03/04）、`add` 稀疏诊断与 `--sparse`（plan-20260918 SW-06）。**命令与物化仍延后**：`sparse-checkout` 命令、`info/sparse-checkout` 模式、cone 模式、工作树物化、`clone --sparse` 不在本进度内。设置位后索引为 v3，旧版 Libra（≤ 0.23.x 索引读取器）无法读取；降级补偿步骤见 `docs/commands/update-index.md`。
 
-- lore.md 2.2 landed the NON-declined complement: `libra sparse-view`, a strictly READ-ONLY view filter over `ls-files`/`diff` (working-tree) output that NEVER materializes or prunes the working tree, never writes skip-worktree bits, and never filters the to-be-committed set (status stays honest). The materializing `sparse-checkout` command and `clone --sparse` remain declined here.
+- lore.md 2.2 landed the NON-declined complement: `libra sparse-view`, a strictly READ-ONLY view filter over `ls-files`/`diff` (working-tree) output that NEVER materializes or prunes the working tree, never writes skip-worktree bits, and never filters the to-be-committed set (status stays honest).
+- 进展（2026-11-21，plan-20261117-clone CL-16，D10 局部修订）：`libra clone --sparse` **已交付 cone 模式物化**——克隆后只物化顶层文件，更深的条目留在索引中并置 skip-worktree 位，写入 `core.sparseCheckout=true` 与 `core.sparseCheckoutCone=true`，`status` 不再提示 sparse 不受支持。仍未交付：`info/sparse-checkout` 式 cone 规则持久化与规则管理（DEFER-CL-04）、顶层 `sparse-checkout` 命令，以及在稀疏仓库中运行检出/历史写入类命令（`checkout`/`switch`/`reset`/`restore`/`merge`/`pull`/`rebase`/`cherry-pick`/`stash` 继续以 `LBR-UNSUPPORTED-001` fail-closed，`CL-26`/`CL-27`）。
 
 ### D15：跨命令 patch mode
 

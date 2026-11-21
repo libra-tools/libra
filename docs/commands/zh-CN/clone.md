@@ -104,6 +104,14 @@ libra clone --filter blob:none git@github.com:user/repo.git
 libra clone --shallow-since "2 weeks ago" git@github.com:user/repo.git
 ```
 
+### `--sparse`
+
+克隆后初始化 cone 模式的稀疏检出：只物化顶层文件，更深的路径保留在索引中并置上 skip-worktree 位（`libra ls-files -t` 显示为 `S`）。克隆会记录 `core.sparseCheckout=true` 与 `core.sparseCheckoutCone=true`；cone 规则文件与规则管理尚未实现，且在此类仓库中检出类命令（`checkout`、`switch`、`reset`、`restore`、`merge`、`pull`、`rebase`、`cherry-pick`、`stash`）以 `LBR-UNSUPPORTED-001` fail-closed。
+
+```bash
+libra clone --sparse --filter=blob:none git@github.com:user/repo.git
+```
+
 ### `--ref-storage-format <format>`
 
 对齐 Git 的 `--ref-storage-format`：Libra 的引用存储在 SQLite，因此 `sqlite` 被接受为 no-op，其余格式一律 fail-closed——`files` 与 `reftable` 未实现（`LBR-UNSUPPORTED-001`），未知取值按用法错误拒绝（`LBR-CLI-002`，对应 Git 的 `unknown ref storage format`）。`libra rev-parse --show-ref-storage-format` 如实输出当前后端。
