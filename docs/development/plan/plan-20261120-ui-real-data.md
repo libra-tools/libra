@@ -137,6 +137,7 @@
 
 | 时间 | 触发 | 变更内容 | 原卡 → 新卡 | 受影响的引用 |
 |---|---|---|---|---|
+| 2026-11-21 08:00:00 UTC | UID-02 执行期评审（Claude/Codex） | History 提交按提交时间倒序并截断 200 行；归属查询按 CaptureScope（repo/worktree/workspace/fence）过滤、scope 由注入仓库连接解析、fence 仅 SELECT；归属失败降级为 Human 而不隐藏提交；补 tombstone/merge/过滤用例；Verification 改用既有 `session_list_walks_keyset_pages`；写集补 `snapshot.rs`/`worker.rs`/`widgets.rs` | `UID-02` AC/VER/写集 | UID-02 AC/VER/写集、ADR-UID-03 |
 | 2026-11-21 06:00:00 UTC | UID-01 执行期评审（Codex 四轮） | 补 anyhow 链式池超时回归用例；ADR-UID-01 说明 `with_request_scope` 为 task-local（spawn 任务不继承）；A5 与 ADR 记录退出路径的预算内等待例外；A2 映射补真实 worker 仓库外用例 | `UID-01` A5/映射 | ADR-UID-01、UID-01 AC/VER |
 | 2026-11-21 05:20:00 UTC | UID-01 执行期评审（Codex 三轮 / Claude 三轮） | 池超时与连接获取超时统一归 `Busy`（`PoolTimedOut`/`Connection pool timed out`/错误链）；ADR-UID-01 scope API 更正为 `with_request_scope`；UID-01 AC→test 映射改为真实用例名；zh-CN 首页与开发文档措辞同步（真实上下文已接入、单一 runtime 已实现）；轮询在窗口销毁后停止；关闭期主线程等待标注为有意且受预算约束 | `UID-01` 映射与 ADR 措辞 | ADR-UID-01、UID-01 AC/VER、docs/commands/zh-CN/ui.md、docs/development/commands/ui.md |
 | 2026-11-21 04:40:00 UTC | UID-01 执行期评审（Codex 二轮） | ADR-UID-06 增 `worker` 源级状态（worker 启动失败不误报 `Corrupt`/fsck 提示）；记录 UID-01 的实现期修订 | `UID-01` 状态分类 | ADR-UID-06、UID-01 AC/VER |
@@ -394,7 +395,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `in-progress` / `locally-accepted`
+**Lifecycle / Acceptance:** `done` / `remote-pending`
 
 **Description:** 建立 `src/gui/data/` 只读接缝：用 `RequestScope::try_resolve`/`try_get_storage_path` 解析当前工作目录仓库，启动单一后台 worker（长期 runtime + 请求 scope（task-local）+ 注入连接 + 进程级 handle registry），向 GPUI 主线程投递带序号的不可变快照与 ADR-UID-06 的源级状态。行为轴是**数据获取的线程、生命周期、只读性与失败分类**。
 
@@ -469,7 +470,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `in-progress` / `locally-accepted`
 
 **Description:** 用真实提交历史替换 `screens/history.rs` 的静态 `COMMITS` 表，按真实归属数据（`agent_session_commit` 的 commit-keyed 批量查询）与真实父链重建筛选与拓扑，并移除该页残留的演示文案。行为轴是**History 表面的数据、归属与拓扑**。
 
@@ -496,12 +497,12 @@
 - [ ] A6 空仓库显示 `absent` 状态（"尚无提交"）。
 - [ ] A7 页面演示文案 "acme-libra"/"Design preview" 移除。
 
-**AC→test 映射（非计数）:** A1→`uid02_history_rows`；A2→`uid02_history_row_fields`；A3→`uid02_parent_chain_graph`；A4→`uid02_commit_keyed_attribution`；A5→`uid02_search_and_filter`；A6→`uid02_empty_repository`；A7→零命中守卫 `history.rs` 的演示文案。实现不变量→`uid02_batch_query_no_n_plus_one`、`uid02_read_only_receipt`；session→commits CLI 回归→`agent_checkpoint_reader_test::session_show_commit_links`（Verification）。
+**AC→test 映射（非计数）:** A1→`uid02_history_rows`；A2→`uid02_history_row_fields`；A3→`uid02_parent_chain_graph`；A4→`uid02_commit_keyed_attribution`；A5→`uid02_search_and_filter`；A6→`uid02_empty_repository`；A7→零命中守卫 `history.rs` 的演示文案。实现不变量→`uid02_batch_query_no_n_plus_one`、`uid02_read_only_receipt`；capture 会话分页回归→`agent_checkpoint_reader_test::session_list_walks_keyset_pages`（Verification）。
 
 **Verification:**
 
 - [ ] `source .env.test && cargo nextest run --lib -E 'test(uid02_)'` (new；含只读不变量用例)
-- [ ] `source .env.test && cargo nextest run --test agent_checkpoint_reader_test -E 'test(session_show_commit_links)'` (new；session→commits CLI 回归)
+- [ ] `source .env.test && cargo nextest run --test agent_checkpoint_reader_test -E 'test(session_list_walks_keyset_pages)'`
 - [ ] `source .env.test && cargo nextest run --test command_test -E 'test(command::ui_test)'`
 - [ ] 零命中守卫（模板三分支）：`rg -n '\bCOMMITS\b' src/gui/screens/history.rs`
 - [ ] 零命中守卫（模板三分支）：`rg -n 'acme-libra|Design preview' src/gui/screens/history.rs`
@@ -516,7 +517,7 @@
 
 **Deliverables:** N/A
 
-**Implementation write set:** `src/command/agent/session.rs`、`src/command/agent/mod.rs`、`src/gui/data/history.rs`、`src/gui/data/tests.rs`、`src/gui/data/mod.rs`、`src/gui/screens/history.rs`、`src/gui/desktop.rs`、`tests/agent_checkpoint_reader_test.rs`、`docs/commands/ui.md`、`docs/commands/zh-CN/ui.md`、`docs/development/commands/ui.md`、`docs/development/commands/README.md`、`COMPATIBILITY.md`、`../libra-backend/apps/tanstack-app/content/docs/commands/ui.en.md`
+**Implementation write set:** `src/command/agent/session.rs`、`src/command/agent/mod.rs`、`src/gui/data/history.rs`、`src/gui/data/tests.rs`、`src/gui/data/mod.rs`、`src/gui/data/snapshot.rs`、`src/gui/data/worker.rs`、`src/gui/screens/history.rs`、`src/gui/widgets.rs`、`src/gui/desktop.rs`、`docs/commands/ui.md`、`docs/commands/zh-CN/ui.md`、`docs/development/commands/ui.md`、`docs/development/commands/README.md`、`COMPATIBILITY.md`、`../libra-backend/apps/tanstack-app/content/docs/commands/ui.en.md`
 
 **Release write set:** Inherited
 

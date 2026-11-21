@@ -109,11 +109,13 @@ pub fn nav(page: Page, cx: &Context<Desktop>) -> Button {
 }
 pub fn action(
     id: &'static str,
-    text: &'static str,
+    text: impl Into<SharedString>,
     primary: bool,
     cx: &Context<Desktop>,
 ) -> Button {
     let entity = cx.entity();
+    let text: SharedString = text.into();
+    let notice_text = text.clone();
     Button::new(id, text)
         .size(ControlSize::Sm)
         .variant(if primary {
@@ -123,7 +125,9 @@ pub fn action(
         })
         .on_click(move |_, _, cx| {
             entity.update(cx, |s, cx| {
-                s.notice = Some(format!("{text} — interface preview; no changes were made."));
+                s.notice = Some(format!(
+                    "{notice_text} — interface preview; no changes were made."
+                ));
                 cx.notify();
             })
         })

@@ -29,8 +29,29 @@ pub const QUEUE_CAP: usize = 8;
 /// Budget for joining the worker when the window closes.
 pub const CLOSE_BUDGET: Duration = Duration::from_secs(3);
 
-/// One read result: state plus optional context and message.
-pub type ReadOutcome = (SourceState, Option<RepoContext>, Option<String>);
+/// One read result: state, optional context/message and History rows.
+#[derive(Debug, Clone)]
+pub struct ReadOutcome {
+    pub state: SourceState,
+    pub context: Option<RepoContext>,
+    pub message: Option<String>,
+    pub history: Vec<super::history::HistoryRow>,
+    /// History-specific failure while the context itself is available.
+    pub history_error: Option<String>,
+}
+
+impl ReadOutcome {
+    /// Build an outcome without history (tests and non-History readers).
+    pub fn new(state: SourceState, context: Option<RepoContext>, message: Option<String>) -> Self {
+        Self {
+            state,
+            context,
+            message,
+            history: Vec::new(),
+            history_error: None,
+        }
+    }
+}
 /// A boxed read future; readers are async so the worker can drive them on its
 /// own runtime instead of starting a nested runtime.
 pub type ReadFuture = Pin<Box<dyn Future<Output = Result<ReadOutcome, DataError>> + Send>>;
@@ -72,10 +93,39 @@ impl DataHandle {
         Self::spawn_with(|scope| {
             Box::pin(async move {
                 match scope {
-                    None => Ok((SourceState::Absent, None, Some("no repository".to_string()))),
+                    None => Ok(ReadOutcome::new(
+                        SourceState::Absent,
+                        None,
+                        Some("no repository".to_string()),
+                    )),
                     Some(scope) => match repo::read_context(&scope).await {
-                        Ok(context) => Ok((SourceState::Available, Some(context), None)),
-                        Err(error) => Ok((error.state, None, Some(error.message))),
+                        Ok(context) => {
+                            let head_oid = context.head_oid.clone();
+                            let history = match super::history::read_history(&scope, head_oid).await
+                            {
+                                Ok(history) => history,
+                                Err(error) => {
+                                    // The context read succeeded; keep it
+                                    // available and report only the history
+                                    // failure.
+                                    return Ok(ReadOutcome {
+                                        state: SourceState::Available,
+                                        context: Some(context),
+                                        message: None,
+                                        history: Vec::new(),
+                                        history_error: Some(error.message),
+                                    });
+                                }
+                            };
+                            Ok(ReadOutcome {
+                                state: SourceState::Available,
+                                context: Some(context),
+                                message: None,
+                                history,
+                                history_error: None,
+                            })
+                        }
+                        Err(error) => Ok(ReadOutcome::new(error.state, None, Some(error.message))),
                     },
                 }
             })
@@ -127,6 +177,8 @@ impl DataHandle {
                     state: SourceState::Worker,
                     context: None,
                     message: Some(format!("the data worker could not start: {error}")),
+                    history: Vec::new(),
+                    history_error: None,
                 });
                 shared.done = true;
                 cv.notify_all();
@@ -310,17 +362,21 @@ fn worker_loop(inner: Arc<(Mutex<Shared>, Condvar)>, reads: Arc<AtomicU64>, read
                 })),
             };
             let snapshot = match outcome {
-                Ok((state, context, message)) => Snapshot {
+                Ok(outcome) => Snapshot {
                     seq,
-                    state,
-                    context,
-                    message,
+                    state: outcome.state,
+                    context: outcome.context,
+                    message: outcome.message,
+                    history: outcome.history,
+                    history_error: outcome.history_error,
                 },
                 Err(error) => Snapshot {
                     seq,
                     state: error.state,
                     context: None,
                     message: Some(error.message),
+                    history: Vec::new(),
+                    history_error: None,
                 },
             };
             let (lock, _) = &*inner;
@@ -353,6 +409,8 @@ fn finish_with_error(inner: &Arc<(Mutex<Shared>, Condvar)>, message: String) {
         state: SourceState::Worker,
         context: None,
         message: Some(message),
+        history: Vec::new(),
+        history_error: None,
     });
     shared.done = true;
     cv.notify_all();

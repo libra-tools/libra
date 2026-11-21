@@ -57,6 +57,9 @@ fn join_close_coordinators() {
 /// Returns an error when Ely cannot load its fonts or the window fails to
 /// open. The message names that step.
 pub fn run() -> anyhow::Result<()> {
+    // The window is a UI-only process: never hydrate from remote tiers and
+    // never write fetched objects.
+    crate::utils::read_policy::set_read_policy(crate::utils::read_policy::ReadPolicy::LocalOnly);
     let startup_error = Arc::new(Mutex::new(None));
     let reported = Arc::clone(&startup_error);
     gpui_platform::application()

@@ -19,7 +19,10 @@ libra ui
 main thread; global flags on either side of the subcommand do not affect the
 window. The interface uses [Ely GPUI Components](https://github.com/ELY-Open-Source/Ely-GPUI-Components),
 pinned to repository revision `dd727f4`, with `gpui-pre` 0.3.10. It opens on
-History, with a commit graph, author filters, and a creation-history inspector.
+History, with real commits (newest first by commit time, from a traversal
+limited to 400 commits and capped at 200 rows; parents decide merge markers), the Human / Agent-authored / Has
+checkpoint attribution filters backed by the capture catalog, and a
+creation-history inspector.
 The toolbar and **All tools** (`⌘K`) open the other desktop views:
 
 - History, agent lanes, Sessions (Overview / Conversation / Changes), capability
@@ -39,10 +42,13 @@ This is an interface preview based on the supplied desktop design. The window
 reads the current working directory's repository **read-only**: the context bar shows
 the working-tree folder name, storage label, branch, HEAD and object format, and the read
 never creates operation rows, upgrades the schema or takes a writer boundary.
-Records outside the repository context bar are still bundled demonstration data. Navigation, selection,
-tabs and theme changes are local UI interactions. Repository, agent, trust,
-restore, network and account actions do not execute. The window is labeled
-**Design preview**; these actions show a preview notice. Close the window or
+All records outside the context bar, History's commit list and its attribution
+filters are bundled demonstration data. Inside History, the inspector's prompt,
+session, tool and checkpoint details are sample content; only the commit
+metadata and attribution counts are real. Navigation, selection, tabs and theme changes are local
+UI interactions. Repository, agent, trust,
+restore, network and account actions do not execute. These actions show a preview notice. Views other than History carry a
+**Design preview** label in the global navigation bar. Close the window or
 press `⌘Q` to exit; `Esc` dismisses the command palette.
 The logo is a bundled copy of `https://libra.tools/libra-logo-without-words.svg`;
 fonts and assets load offline. macOS is the current validation target.

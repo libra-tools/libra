@@ -18,6 +18,8 @@ pub struct RepoContext {
     pub head: String,
     /// Object format reported by the repository configuration.
     pub object_format: String,
+    /// Pinned HEAD commit (used to keep History on the same revision).
+    pub head_oid: Option<String>,
 }
 
 /// One immutable snapshot of a data source.
@@ -31,6 +33,10 @@ pub struct Snapshot {
     pub context: Option<RepoContext>,
     /// Extra explanation for a failed source.
     pub message: Option<String>,
+    /// History rows (empty for non-History readers).
+    pub history: Vec<super::history::HistoryRow>,
+    /// History-specific failure while the context itself is available.
+    pub history_error: Option<String>,
 }
 
 /// A typed read failure that the window renders as a source state.

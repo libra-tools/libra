@@ -14,10 +14,11 @@ libra ui
 ## 说明
 
 不带位置参数的 `libra ui` 在进程主线程打开 Libra 桌面界面，默认显示 History；
-顶部显示当前工作树目录名、存储标签、分支、HEAD 与对象格式等只读上下文；其余页面仍为演示数据；
+顶部显示当前工作树目录名、存储标签、分支、HEAD 与对象格式等只读上下文；History 的提交列表与归属筛选为真实数据；
 子命令前后的全局标志都不影响窗口。
 使用 [Ely GPUI Components](https://github.com/ELY-Open-Source/Ely-GPUI-Components)
-仓库版本 `dd727f4` 和 `gpui-pre` 0.3.10，实现提交图、作者筛选和创作历史检查器。
+仓库版本 `dd727f4` 和 `gpui-pre` 0.3.10。History 显示真实提交（按提交时间倒序；遍历上限 400 个提交、最多展示 200 行；父链决定合并标记），
+Human／Agent-authored／Has checkpoint 三个归属筛选来自捕获目录，另有创作历史检查器。
 顶栏和 **All tools**（`⌘K`）可进入全部 26 个设计页面：
 
 - History、Agent lanes、Sessions（Overview / Conversation / Changes）、能力地图、
@@ -35,7 +36,8 @@ Sessions 支持浅色／深色、可读内容搜索和本地筛选。表单输�
 也不获取 writer boundary。未接入的数据面仍显示内置演示数据。导航、选择、标签和
 主题切换仅改变界面状态；仓库、Agent、信任、恢复、网络和账户操作不会执行。
 Logo 来自官网，字体和图片内置，离线可用。当前以 macOS 为验证平台。
-窗口显示 **Design preview** 标记，未接入的操作会显示预览提示。
+未接入的操作会显示预览提示；除 History 外的视图在全局导航栏显示 **Design preview** 标记。
+除顶部上下文、History 提交列表与归属筛选外，其余记录均为内置演示数据。History 检查器里的 prompt、session、tool 与 checkpoint 细节是示例内容，只有提交元数据与归属计数是真实数据。
 关闭窗口或按 `⌘Q` 退出；`Esc` 关闭命令面板。
 
 此命令只读当前仓库，不写入仓库。仓库外启动时窗口显示明确的“未创建/未打开仓库”

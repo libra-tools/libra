@@ -1722,3 +1722,65 @@ mod tests {
         }
     }
 }
+
+/// Per-commit attribution derived from the capture catalog: how many captured
+/// sessions and checkpoints link to a commit. Capture-only read (no repository
+/// connection), used by the desktop History surface.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct CommitAttribution {
+    pub sessions: i64,
+    pub checkpoints: i64,
+}
+
+/// Batch attribution for a set of commit ids (one query, no per-commit N+1).
+pub(crate) async fn commit_attribution_batch<C: sea_orm::ConnectionTrait>(
+    conn: &C,
+    scope: &crate::internal::ai::capture_scope::CaptureScope,
+    commit_ids: &[String],
+) -> Result<std::collections::HashMap<String, CommitAttribution>, sea_orm::DbErr> {
+    if commit_ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let placeholders = vec!["?"; commit_ids.len()].join(", ");
+    // Reuse the CLI's scope predicate and values verbatim.
+    let scope_predicate =
+        crate::internal::ai::capture_scope::CaptureScope::matches_existing_sql("s");
+    let sql = format!(
+        "SELECT c.commit_oid AS oid, \
+                COUNT(DISTINCT c.session_id) AS sessions, \
+                COUNT(DISTINCT k.checkpoint_id) AS checkpoints \
+           FROM agent_session_commit c \
+           JOIN agent_session s ON s.session_id = c.session_id \
+           LEFT JOIN agent_checkpoint k ON k.session_id = c.session_id \
+           LEFT JOIN agent_import_tombstone t ON t.erased_session_id = c.session_id \
+          WHERE c.commit_oid IN ({placeholders}) AND t.tombstone_id IS NULL \
+            AND {scope_predicate} \
+          GROUP BY c.commit_oid"
+    );
+    let mut values: Vec<sea_orm::Value> = commit_ids
+        .iter()
+        .map(|id| sea_orm::Value::from(id.clone()))
+        .collect();
+    values.extend(scope.sql_values());
+    let rows = conn
+        .query_all_raw(sea_orm::Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            sql,
+            values,
+        ))
+        .await?;
+    let mut out = std::collections::HashMap::new();
+    for row in rows {
+        let oid: String = row.try_get("", "oid")?;
+        let sessions: i64 = row.try_get("", "sessions")?;
+        let checkpoints: i64 = row.try_get("", "checkpoints")?;
+        out.insert(
+            oid,
+            CommitAttribution {
+                sessions,
+                checkpoints,
+            },
+        );
+    }
+    Ok(out)
+}

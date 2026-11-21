@@ -5,15 +5,17 @@
 //! connection is injected and opened without schema management, so a window
 //! read cannot migrate the repository (ADR-UID-01/02).
 
+mod history;
 mod repo;
 mod snapshot;
 mod state;
 mod worker;
 
+pub use history::{AttributionFilter, HistoryRow, age_label};
 pub use repo::READ_BUSY_TIMEOUT;
 pub use snapshot::{DataError, RepoContext, Snapshot};
 pub use state::{ProbeOutcome, SourceState};
-pub use worker::{CLOSE_BUDGET, DataHandle, QUEUE_CAP};
+pub use worker::{CLOSE_BUDGET, DataHandle, QUEUE_CAP, ReadOutcome};
 
 #[cfg(test)]
 mod tests;

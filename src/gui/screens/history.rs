@@ -10,6 +10,7 @@ use gpui::{
 };
 
 use super::super::{
+    data::{AttributionFilter, HistoryRow},
     desktop::{Desktop, Page},
     widgets::{
         action, agent, badge, card, code, column, label, mono, muted, nav, note, row, table, tabs,
@@ -17,73 +18,134 @@ use super::super::{
     },
 };
 
-const COMMITS: [(&str, &str, &str, &str, &str); 9] = [
-    (
-        "Add token-bucket rate limiter to API gateway",
-        "Claude Code",
-        "9f2c4e1",
-        "12m",
-        "main",
-    ),
-    (
-        "Tighten limiter config validation",
-        "eli",
-        "41be07a",
-        "38m",
-        "",
-    ),
-    (
-        "feat(search): FTS5 index over checkpoints",
-        "Codex",
-        "c07d5aa",
-        "1h",
-        "feat/search",
-    ),
-    (
-        "Refactor request context propagation",
-        "eli",
-        "2a9e1f3",
-        "2h",
-        "",
-    ),
-    (
-        "Scaffold search module and CLI flag",
-        "Codex",
-        "7d13b20",
-        "3h",
-        "",
-    ),
-    (
-        "Merge branch feat/auth-session",
-        "eli",
-        "e5f0c88",
-        "1d",
-        "v0.4.0",
-    ),
-    (
-        "Rotate session cookies on privilege change",
-        "OpenCode",
-        "0b6a2d4",
-        "1d",
-        "",
-    ),
-    ("Bump tokio and axum", "eli", "f31c9e7", "2d", ""),
-    (
-        "Import from Git repository ./acme",
-        "eli",
-        "18ad40b",
-        "3d",
-        "",
-    ),
-];
+#[derive(Clone)]
+struct RowView {
+    subject: String,
+    author: String,
+    short: String,
+    oid: String,
+    parent_oids: Vec<String>,
+    age: String,
+    branch_label: String,
+    merge: bool,
+    parents: usize,
+    sessions: i64,
+    checkpoints: i64,
+}
+
+impl RowView {
+    fn empty() -> Self {
+        Self {
+            subject: "No matching commits".to_string(),
+            author: String::new(),
+            short: String::new(),
+            oid: String::new(),
+            parent_oids: Vec::new(),
+            age: String::new(),
+            branch_label: String::new(),
+            merge: false,
+            parents: 0,
+            sessions: 0,
+            checkpoints: 0,
+        }
+    }
+}
+
+fn visible_history(rows: &[HistoryRow], query: &str, filter: usize) -> Vec<(usize, RowView)> {
+    let query = query.trim().to_lowercase();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as usize)
+        .unwrap_or(0);
+    rows.iter()
+        .enumerate()
+        .filter(|(_, c)| {
+            (c.subject.to_lowercase().contains(&query)
+                || c.author.to_lowercase().contains(&query)
+                || c.short.contains(&query)
+                || c.oid.contains(&query))
+                && {
+                    let selected_filter = match filter {
+                        1 => AttributionFilter::Human,
+                        2 => AttributionFilter::AgentAuthored,
+                        3 => AttributionFilter::HasCheckpoint,
+                        _ => AttributionFilter::All,
+                    };
+                    c.matches(selected_filter)
+                }
+        })
+        .map(|(i, c)| {
+            (
+                i,
+                RowView {
+                    subject: c.subject.clone(),
+                    author: c.author.clone(),
+                    short: c.short.clone(),
+                    oid: c.oid.clone(),
+                    parent_oids: c.parent_oids.clone(),
+                    age: super::super::data::age_label(c.timestamp, now),
+                    branch_label: if c.parents > 1 {
+                        "merge".to_string()
+                    } else {
+                        String::new()
+                    },
+                    merge: c.parents > 1,
+                    parents: c.parents,
+                    sessions: c.sessions,
+                    checkpoints: c.checkpoints,
+                },
+            )
+        })
+        .collect()
+}
+
+/// A connector exists when ANY newer visible row lists the commit at
+/// `position` as a parent (covers merge branches and gaps from filtering).
+fn connector_between(visible: &[(usize, RowView)], position: usize) -> bool {
+    let Some((_, current)) = visible.get(position) else {
+        return false;
+    };
+    visible
+        .iter()
+        .take(position)
+        .any(|(_, prev)| prev.parent_oids.iter().any(|parent| parent == &current.oid))
+}
 
 pub fn render(s: &Desktop, cx: &Context<Desktop>, p: &Palette) -> AnyElement {
     let dark = cx.theme().is_dark();
-    let visible = visible_commits(&s.history_query, s.filter);
-    let selected = visible
-        .iter()
-        .find(|(i, _)| *i == s.selected)
-        .or_else(|| visible.first());
+    let repository_label = format!(
+        "▱  {}  ⌄",
+        s.snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.context.as_ref())
+            .map(|context| context.worktree_label.clone())
+            .unwrap_or_else(|| "no repository".to_string())
+    );
+    let branch_label = format!(
+        "⑂ {}   ↑0 ↓0",
+        s.snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.context.as_ref())
+            .map(|context| context.branch.clone())
+            .unwrap_or_else(|| "-".to_string())
+    );
+    let rows = s
+        .snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.history.as_slice())
+        .unwrap_or(&[]);
+    let visible = visible_history(rows, &s.history_query, s.filter);
+    let selected_index = if visible.iter().any(|(i, _)| *i == s.selected) {
+        Some(s.selected)
+    } else {
+        visible.first().map(|(i, _)| *i)
+    };
+    let selected_view = selected_index.and_then(|index| {
+        visible
+            .iter()
+            .find(|(i, _)| *i == index)
+            .map(|(_, view)| view.clone())
+    });
     let toolbar = row()
         .px_4()
         .py_2()
@@ -92,8 +154,8 @@ pub fn render(s: &Desktop, cx: &Context<Desktop>, p: &Palette) -> AnyElement {
         .bg(p.surface)
         .child(img("libra/logo.svg").size(px(28.0)))
         .child(div().font_weight(FontWeight::BOLD).child("Libra"))
-        .child(action("repository", "▱  acme-libra  ⌄", false, cx))
-        .child(mono("⑂ main   ↑1 ↓0"))
+        .child(action("repository", repository_label.clone(), false, cx))
+        .child(mono(&branch_label))
         .child(action("fetch", "Fetch", false, cx))
         .child(action("pull", "Pull", false, cx))
         .child(action("push", "Push", false, cx))
@@ -104,7 +166,6 @@ pub fn render(s: &Desktop, cx: &Context<Desktop>, p: &Palette) -> AnyElement {
                     .size(ControlSize::Sm),
             ),
         )
-        .child(badge("Design preview", 0x5b6474, 0xf4f5f7))
         .child(
             Button::new("history-theme", if dark { "Light" } else { "Dark" })
                 .size(ControlSize::Sm)
@@ -120,7 +181,7 @@ pub fn render(s: &Desktop, cx: &Context<Desktop>, p: &Palette) -> AnyElement {
         .flex_none()
         .p_3()
         .bg(p.bg)
-        .child(label("WORKSPACE", p))
+        .child(label("WORKSPACE · demo", p))
         .children(
             [
                 Page::Lanes,
@@ -220,17 +281,21 @@ pub fn render(s: &Desktop, cx: &Context<Desktop>, p: &Palette) -> AnyElement {
                 .gap_0()
                 .overflow_y_scroll()
                 .flex_1()
-                .children(visible.iter().copied().map(|(i, c)| {
-                    let is_branch = c.1 == "Codex";
+                .children(visible.iter().enumerate().map(|(position, (i, c))| {
+                    let index = *i;
+                    let is_branch = c.merge;
+                    // Newest-first rows: any earlier (newer) visible row that
+                    // lists this (older) commit as a parent links it.
+                    let linked = connector_between(&visible, position);
                     row()
-                        .id(("commit", i))
+                        .id(("commit", index))
                         .gap_2()
                         .h(px(48.0))
                         .px_3()
                         .flex_none()
                         .border_b_1()
                         .border_color(p.border)
-                        .bg(if selected.is_some_and(|(index, _)| *index == i) {
+                        .bg(if selected_index == Some(index) {
                             p.selection
                         } else {
                             p.surface
@@ -238,7 +303,7 @@ pub fn render(s: &Desktop, cx: &Context<Desktop>, p: &Palette) -> AnyElement {
                         .cursor_pointer()
                         .hover(|v| v.bg(p.hover))
                         .on_click(cx.listener(move |s, _, _, cx| {
-                            s.selected = i;
+                            s.selected = index;
                             cx.notify();
                         }))
                         .child(
@@ -246,15 +311,17 @@ pub fn render(s: &Desktop, cx: &Context<Desktop>, p: &Palette) -> AnyElement {
                                 .w(px(44.0))
                                 .h_full()
                                 .relative()
-                                .child(
-                                    div()
-                                        .absolute()
-                                        .left(px(10.0))
-                                        .w(px(2.0))
-                                        .h_full()
-                                        .bg(p.accent),
-                                )
-                                .when(i < 5, |d| {
+                                .when(linked, |d| {
+                                    d.child(
+                                        div()
+                                            .absolute()
+                                            .left(px(10.0))
+                                            .w(px(2.0))
+                                            .h_full()
+                                            .bg(p.accent),
+                                    )
+                                })
+                                .when(c.parents > 1, |d| {
                                     d.child(
                                         div()
                                             .absolute()
@@ -283,31 +350,30 @@ pub fn render(s: &Desktop, cx: &Context<Desktop>, p: &Palette) -> AnyElement {
                                 .flex_1()
                                 .gap_1()
                                 .overflow_hidden()
-                                .when(!c.4.is_empty(), |d| {
-                                    d.child(muted(c.4, p).text_color(p.accent))
+                                .when(!c.branch_label.is_empty(), |d| {
+                                    d.child(muted(&c.branch_label, p).text_color(p.accent))
                                 })
-                                .child(div().truncate().child(c.0)),
+                                .child(div().truncate().child(c.subject.clone())),
                         )
                         .child(
                             row()
                                 .w(px(150.0))
                                 .flex_none()
-                                .child(agent(c.1))
-                                .child(div().truncate().child(c.1)),
+                                .child(agent(&c.author))
+                                .child(div().truncate().child(c.author.clone())),
                         )
                         .child(
                             column()
                                 .gap_1()
                                 .w(px(70.0))
                                 .flex_none()
-                                .child(mono(c.2))
-                                .child(muted(c.3, p)),
+                                .child(mono(&c.short))
+                                .child(muted(&c.age, p)),
                         )
                 })),
         );
-    let c = selected
-        .map(|(_, commit)| *commit)
-        .unwrap_or(&("No matching commits", "", "", "", ""));
+    let has_selection = selected_view.is_some();
+    let c = selected_view.unwrap_or_else(RowView::empty);
     let inspector = column()
         .w(px(365.0))
         .flex_none()
@@ -321,17 +387,28 @@ pub fn render(s: &Desktop, cx: &Context<Desktop>, p: &Palette) -> AnyElement {
                 .p_4()
                 .border_b_1()
                 .border_color(p.border)
-                .when(selected.is_some(), |d| {
-                    d.child(muted(format!("{} · {} · {} ago", c.2, c.1, c.3), p))
+                .when(has_selection, |d| {
+                    d.child(muted(
+                        format!("{} · {} · {} ago", c.short, c.author, c.age),
+                        p,
+                    ))
                 })
                 .child(
                     div()
                         .text_size(px(16.0))
                         .font_weight(FontWeight::BOLD)
-                        .child(c.0),
+                        .child(c.subject.clone()),
                 )
-                .when(selected.is_some(), |d| {
-                    d.child(tabs(&["Creation history", "Changes · 3", "Raw"], s.tab, cx))
+                .when(has_selection, |d| {
+                    d.child(muted(
+                        "Inspector tabs are sample content; commit metadata above is real.",
+                        p,
+                    ))
+                    .child(tabs(
+                        &["Creation history", "Changes · 3", "Raw"],
+                        s.tab,
+                        cx,
+                    ))
                 }),
         )
         .child(
@@ -340,12 +417,31 @@ pub fn render(s: &Desktop, cx: &Context<Desktop>, p: &Palette) -> AnyElement {
                 .overflow_y_scroll()
                 .flex_1()
                 .p_4()
-                .children(if selected.is_some() {
-                    inspector_body(s, cx, p, c)
+                .children(if has_selection {
+                    inspector_body(s, cx, p, &c)
                 } else {
                     vec![
-                        muted("Clear the search or choose another author filter.", p)
-                            .into_any_element(),
+                        muted(
+                            match s.snapshot.as_ref() {
+                                None => "Loading history…",
+                                Some(snapshot) if snapshot.history_error.is_some() => snapshot
+                                    .history_error
+                                    .as_deref()
+                                    .unwrap_or("History is unavailable."),
+                                Some(snapshot) if !snapshot.state.is_available() => {
+                                    "The repository has no readable history."
+                                }
+                                Some(snapshot)
+                                    if snapshot.state.is_available()
+                                        && snapshot.history.is_empty() =>
+                                {
+                                    "No commits yet."
+                                }
+                                _ => "Clear the search or choose another attribution filter.",
+                            },
+                            p,
+                        )
+                        .into_any_element(),
                     ]
                 }),
         );
@@ -366,12 +462,7 @@ pub fn render(s: &Desktop, cx: &Context<Desktop>, p: &Palette) -> AnyElement {
         .into_any_element()
 }
 
-fn inspector_body(
-    s: &Desktop,
-    cx: &Context<Desktop>,
-    p: &Palette,
-    c: &(&str, &str, &str, &str, &str),
-) -> Vec<AnyElement> {
+fn inspector_body(s: &Desktop, cx: &Context<Desktop>, p: &Palette, c: &RowView) -> Vec<AnyElement> {
     if s.tab == 1 {
         return vec![
             table(
@@ -390,12 +481,12 @@ fn inspector_body(
         return vec![
             code(format!(
                 "commit {}\nauthor {}\n\n{}\n\nDemonstration record",
-                c.2, c.1, c.0
+                c.short, c.author, c.subject
             ))
             .into_any_element(),
         ];
     }
-    if c.1 == "eli" {
+    if c.sessions == 0 {
         return vec![
             title("No agent capture for this commit").into_any_element(),
             muted(
@@ -418,7 +509,7 @@ fn inspector_body(
             .into_any_element(),
         label("PROMPT", p).into_any_element(),
         note(
-            if c.1 == "Claude Code" {
+            if c.author == "Claude Code" {
                 "Add a token-bucket rate limiter to the gateway. 100 requests per minute per API key, configurable in \
                  gateway.toml. Keep the existing middleware order."
             } else {
@@ -429,12 +520,18 @@ fn inspector_body(
         .into_any_element(),
         label("SESSION", p).into_any_element(),
         row()
-            .child(agent(c.1))
+            .child(agent(&c.author))
             .child(
                 column()
                     .gap_1()
-                    .child(c.1.to_string())
-                    .child(muted("ses_7f3a91 · 14 turns · trusted adapter", p)),
+                    .child(c.author.clone())
+                    .child(muted(
+                        format!(
+                            "{} session(s) · {} checkpoint(s) linked",
+                            c.sessions, c.checkpoints
+                        ),
+                        p,
+                    )),
             )
             .into_any_element(),
         label("TOOL EVENTS", p).into_any_element(),
@@ -450,54 +547,98 @@ fn inspector_body(
         )
         .into_any_element(),
         card(p)
-            .child(mono("ckpt_0192"))
+            .child(mono(format!("{} checkpoint(s)", c.checkpoints)))
             .child(muted("3 files captured before commit", p))
             .child(action("export", "Export redacted…", true, cx))
             .into_any_element(),
         muted(
-            "Shown only from captured source evidence. Libra does not infer plans, test results or approvals.",
+            "Session, prompt and tool content is demonstration until capture details are connected. Libra does not infer plans, test results or approvals.",
             p,
         )
         .into_any_element(),
     ]
 }
 
-type Commit = (
-    &'static str,
-    &'static str,
-    &'static str,
-    &'static str,
-    &'static str,
-);
-
-fn visible_commits(query: &str, filter: usize) -> Vec<(usize, &'static Commit)> {
-    let query = query.trim().to_lowercase();
-    COMMITS
-        .iter()
-        .enumerate()
-        .filter(|(_, c)| {
-            (c.0.to_lowercase().contains(&query)
-                || c.1.to_lowercase().contains(&query)
-                || c.2.contains(&query))
-                && match filter {
-                    1 => c.1 == "eli",
-                    2 | 3 => c.1 != "eli",
-                    _ => true,
-                }
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
-    use super::visible_commits;
+    use super::{super::super::data::HistoryRow, RowView, connector_between, visible_history};
+
+    fn row(
+        subject: &str,
+        author: &str,
+        short: &str,
+        sessions: i64,
+        checkpoints: i64,
+    ) -> HistoryRow {
+        HistoryRow {
+            oid: format!("{short}0000000000000000000000000000000000"),
+            short: short.to_string(),
+            author: author.to_string(),
+            subject: subject.to_string(),
+            timestamp: 0,
+            parents: 1,
+            parent_oids: vec!["parent".to_string()],
+            sessions,
+            checkpoints,
+        }
+    }
 
     #[test]
-    fn filters_intersect_with_case_insensitive_search() {
-        assert_eq!(visible_commits("  CODEX  ", 2).len(), 2);
-        assert!(visible_commits("codex", 1).is_empty());
-        assert_eq!(visible_commits("C07D5AA", 0)[0].0, 2);
-        assert_eq!(visible_commits("", 1).len(), 5);
-        assert!(visible_commits("no matching record", 0).is_empty());
+    fn uid02_search_and_filter() {
+        let rows = vec![
+            row("Add limiter", "Claude Code", "9f2c4e1", 1, 0),
+            row("Tighten config", "eli", "41be07a", 0, 0),
+            row("feat(search): index", "Codex", "c07d5aa", 1, 2),
+        ];
+        let mut merged = row("merge branch", "eli", "deadbee", 0, 0);
+        merged.parents = 2;
+        let mut rows = rows;
+        rows.push(merged);
+        assert_eq!(visible_history(&rows, "  CODEX  ", 2).len(), 1);
+        assert!(visible_history(&rows, "codex", 1).is_empty());
+        assert_eq!(visible_history(&rows, "C07D5AA", 0)[0].1.short, "c07d5aa");
+        assert_eq!(visible_history(&rows, "", 1).len(), 2);
+        assert!(visible_history(&rows, "no matching record", 0).is_empty());
+        assert_eq!(
+            visible_history(&rows, "", 3)[0].1.short,
+            "c07d5aa",
+            "Has checkpoint keeps only checkpoint-linked rows"
+        );
+        assert_eq!(visible_history(&rows, "", 0).len(), 4);
+        let merge_row = visible_history(&rows, "merge branch", 0);
+        assert_eq!(merge_row[0].1.branch_label, "merge");
+
+        // Connector predicate: an intervening row keeps the merge edge
+        // (non-adjacent parent), while unrelated rows are not connected.
+        let view = |oid: &str, parents: &[&str]| RowView {
+            subject: oid.to_string(),
+            author: String::new(),
+            short: oid.to_string(),
+            oid: oid.to_string(),
+            parent_oids: parents.iter().map(|p| p.to_string()).collect(),
+            age: String::new(),
+            branch_label: String::new(),
+            merge: parents.len() > 1,
+            parents: parents.len(),
+            sessions: 0,
+            checkpoints: 0,
+        };
+        let chain = vec![
+            (0, view("m", &["a", "side"])),
+            (1, view("x", &["elsewhere"])),
+            (2, view("a", &["root"])),
+        ];
+        assert!(
+            connector_between(&chain, 2),
+            "an intervening row still links the non-adjacent merge parent"
+        );
+        assert!(
+            !connector_between(&chain, 0),
+            "no connector above the newest row"
+        );
+        assert!(
+            !connector_between(&chain, 1),
+            "an unrelated intervening row is not connected"
+        );
     }
 }

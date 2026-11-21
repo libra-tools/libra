@@ -39,7 +39,7 @@ Sessions 保留演示目录 `src/gui/sessions.json`，不读取仓库。官网 L
 
 ## 还未实现的功能
 
-- 把 log、diff、status 等数据面接进窗口（仓库上下文已接入；其余见 `plan-20261120-ui-real-data.md`）。
+- 把 diff、status 等数据面接进窗口（仓库上下文与 History 提交/归属已接入；其余见 `plan-20261120-ui-real-data.md`）。
 - 已由单一 worker runtime 承担：窗口读取不再每次新建 Tokio runtime。
 - 发布构建现在默认包含桌面窗口；Linux release runner 需安装 fontconfig 与 xkbcommon 开发头文件。
 - Linux 运行时需要 fontconfig 与 xkbcommon 共享库；`install.sh` 在 `ldconfig` 可用时会检测并警告缺失项。

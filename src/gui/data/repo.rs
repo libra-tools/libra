@@ -147,6 +147,7 @@ pub async fn read_context(scope: &RequestScope) -> Result<RepoContext, DataError
         branch,
         head: head_label,
         object_format,
+        head_oid: commit.map(|oid| oid.to_string()),
     })
 }
 
