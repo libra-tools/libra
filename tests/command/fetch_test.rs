@@ -3791,3 +3791,57 @@ fn fetch_without_repository_uses_git_default_remote() {
         "AC1: mirrored refs equal the source"
     );
 }
+
+#[test]
+fn fetch_dry_run_leaves_the_repository_unchanged() {
+    use crate::command::{run_libra_command, run_libra_command_with_env};
+
+    let root = tempdir().unwrap();
+    let src = root.path().join("s");
+    assert!(
+        run_libra_command(&["init", src.to_str().unwrap()], root.path())
+            .status
+            .success()
+    );
+    let identity: &[(&str, &str)] = &[
+        ("LIBRA_COMMITTER_NAME", "t"),
+        ("LIBRA_COMMITTER_EMAIL", "t@t"),
+        ("GIT_AUTHOR_NAME", "t"),
+        ("GIT_AUTHOR_EMAIL", "t@t"),
+    ];
+    std::fs::write(src.join("a.txt"), "1\n").unwrap();
+    assert!(run_libra_command(&["add", "a.txt"], &src).status.success());
+    assert!(
+        run_libra_command_with_env(&["commit", "--no-gpg-sign", "-m", "c1"], &src, identity)
+            .status
+            .success()
+    );
+
+    let c = root.path().join("c");
+    assert!(
+        run_libra_command(&["init", c.to_str().unwrap()], root.path())
+            .status
+            .success()
+    );
+    assert!(
+        run_libra_command(&["remote", "add", "origin", src.to_str().unwrap()], &c)
+            .status
+            .success()
+    );
+    assert!(run_libra_command(&["fetch", "origin"], &c).status.success());
+
+    let refmap =
+        || String::from_utf8_lossy(&run_libra_command(&["for-each-ref"], &c).stdout).into_owned();
+    let fetch_head = || std::fs::read_to_string(c.join(".libra/FETCH_HEAD")).unwrap_or_default();
+
+    let before_refs = refmap();
+    let before_fetch_head = fetch_head();
+    let out = run_libra_command(&["fetch", "--dry-run", "origin", "main"], &c);
+    assert!(out.status.success(), "--dry-run must succeed");
+    assert_eq!(refmap(), before_refs, "AC7: dry-run must not move refs");
+    assert_eq!(
+        fetch_head(),
+        before_fetch_head,
+        "AC7: dry-run must not touch FETCH_HEAD"
+    );
+}
