@@ -7,12 +7,42 @@ use std::{
     time::{Duration, Instant},
 };
 
-use sea_orm::ConnectionTrait;
+use sea_orm::{ConnectionTrait, TransactionTrait};
 use serial_test::serial;
 use tempfile::tempdir;
 
 use super::{DataHandle, QUEUE_CAP, ReadOutcome, SourceState, repo, state};
 use crate::{internal::db, utils::test};
+
+/// A logical read-only fingerprint: SQLite file bytes legitimately change when a
+/// reader checkpoints a WAL, so compare schema and operation rows.
+async fn count_rows_in(conn: &sea_orm::DatabaseConnection, sql: &str) -> i64 {
+    conn.query_one_raw(sea_orm::Statement::from_string(
+        conn.get_database_backend(),
+        sql.to_string(),
+    ))
+    .await
+    .expect("fingerprint query")
+    .and_then(|row| row.try_get::<i64>("", "n").ok())
+    .unwrap_or(0)
+}
+
+async fn receipt_fingerprint(db_path: &std::path::Path) -> (i64, Option<i64>) {
+    let conn = db::open_database_without_migrations(db_path)
+        .await
+        .expect("open repository database");
+    let schema = conn
+        .query_one_raw(sea_orm::Statement::from_string(
+            conn.get_database_backend(),
+            "SELECT MAX(version) AS n FROM schema_versions".to_string(),
+        ))
+        .await
+        .expect("schema query")
+        .and_then(|row| row.try_get::<i64>("", "n").ok());
+    let operations = count_rows_in(&conn, "SELECT COUNT(*) AS n FROM `operation`").await;
+    conn.close().await.ok();
+    (operations, schema)
+}
 
 fn wait_snapshot(handle: &DataHandle, budget: Duration) -> super::Snapshot {
     let deadline = Instant::now() + budget;
@@ -723,7 +753,7 @@ async fn uid02_read_only_receipt() {
         ..Default::default()
     })
     .await;
-    let before = fs::read(&db_path).expect("read database");
+    let before = receipt_fingerprint(&db_path).await;
     let scope = repo::resolve_scope(repo_dir.path().to_path_buf())
         .expect("scope")
         .expect("repository");
@@ -732,8 +762,11 @@ async fn uid02_read_only_receipt() {
         .await
         .expect("history");
     assert_eq!(rows.len(), 1, "the commit walk actually ran");
-    let after = fs::read(&db_path).expect("read database");
-    assert_eq!(before, after, "history reads must not modify the database");
+    let after = receipt_fingerprint(&db_path).await;
+    assert_eq!(
+        before, after,
+        "history reads must not modify logical state (schema, operation rows)"
+    );
 }
 
 #[tokio::test]
@@ -890,4 +923,1203 @@ async fn uid02_malformed_shallow_metadata_is_an_error() {
         .expect_err("malformed shallow metadata");
     assert_eq!(error.state, SourceState::Corrupt);
     assert!(error.message.contains("shallow"));
+}
+
+async fn scoped_capture(dir: &std::path::Path) -> (String, String, sea_orm::DatabaseConnection) {
+    let storage = dir.join(crate::utils::util::ROOT_DIR);
+    let conn = crate::internal::ai::capture::store::open(&storage, Duration::from_secs(2))
+        .await
+        .expect("open capture catalog");
+    let repo_conn =
+        db::open_database_without_migrations(&storage.join(crate::utils::util::DATABASE))
+            .await
+            .expect("open repository database");
+    let scope = crate::internal::ai::capture_scope::CaptureScope::resolve(&repo_conn, dir)
+        .await
+        .expect("capture scope");
+    (scope.repo_id.clone(), scope.worktree_id.clone(), conn)
+}
+
+async fn insert_session(
+    conn: &sea_orm::DatabaseConnection,
+    repo_id: &str,
+    worktree_id: &str,
+    id: &str,
+    metadata: &str,
+    started_at: i64,
+) {
+    insert_session_for(
+        conn,
+        repo_id,
+        worktree_id,
+        id,
+        "claude_code",
+        metadata,
+        started_at,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn insert_session_for(
+    conn: &sea_orm::DatabaseConnection,
+    repo_id: &str,
+    worktree_id: &str,
+    id: &str,
+    agent_kind: &str,
+    metadata: &str,
+    started_at: i64,
+) {
+    conn.execute_unprepared(&format!(
+        "INSERT INTO agent_session \
+         (session_id, agent_kind, provider_session_id, state, working_dir, metadata_json, \
+          redaction_report, started_at, last_event_at, scope_state, repo_id, worktree_id) \
+         VALUES ('{id}', '{agent_kind}', 'p-{id}', 'active', '/tmp/work', '{metadata}', \
+                 '{{}}', {started_at}, {started_at}, 'scoped', '{repo_id}', '{worktree_id}')"
+    ))
+    .await
+    .expect("insert session");
+}
+
+fn write_tree(
+    storage: &std::path::Path,
+    entries: &[(&str, &str, &str)],
+) -> git_internal::hash::ObjectHash {
+    let mut bytes = Vec::new();
+    for (mode, name, oid) in entries {
+        bytes.extend_from_slice(mode.as_bytes());
+        bytes.push(b' ');
+        bytes.extend_from_slice(name.as_bytes());
+        bytes.push(0);
+        for pair in oid.as_bytes().chunks(2) {
+            let high = (pair[0] as char).to_digit(16).expect("hex digit") as u8;
+            let low = (pair[1] as char).to_digit(16).expect("hex digit") as u8;
+            bytes.push((high << 4) | low);
+        }
+    }
+    crate::utils::object::write_git_object(storage, "tree", &bytes).expect("write tree")
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Write a real committed checkpoint whose metadata blob carries the summary
+/// facts the shared reader expects (the GUI never reads `metadata_json` facts).
+async fn write_metadata_checkpoint(
+    dir: &std::path::Path,
+    conn: &sea_orm::DatabaseConnection,
+    session_id: &str,
+    agent_kind: &str,
+    title: &str,
+    model: &str,
+    input_tokens: i64,
+    output_tokens: i64,
+) {
+    let storage = dir.join(crate::utils::util::ROOT_DIR);
+    let metadata = format!(
+        r#"{{"checkpoint_id":"k-{session_id}","session_id":"{session_id}","agent_kind":"{agent_kind}","extraction":{{"schema_version":1,"present":true,"partial":false,"model":"{model}","title":"{title}","prompt_count":3,"modified_file_count":1,"token_usage":{{"input_tokens":{input_tokens},"output_tokens":{output_tokens}}}}}}}"#
+    );
+    let blob = crate::utils::object::write_git_object(&storage, "blob", metadata.as_bytes())
+        .expect("write metadata blob");
+    // The catalog layout is checkpoint/<id[..2]>/<id[2..]>/metadata.json.
+    let checkpoint_id = format!("k-{session_id}");
+    let leaf = write_tree(&storage, &[("100644", "metadata.json", &blob.to_string())]);
+    let prefix = write_tree(
+        &storage,
+        &[("40000", &checkpoint_id[2..], &leaf.to_string())],
+    );
+    let wrapped = write_tree(
+        &storage,
+        &[("40000", &checkpoint_id[..2], &prefix.to_string())],
+    );
+    let tree = write_tree(&storage, &[("40000", "checkpoint", &wrapped.to_string())]);
+    conn.execute_unprepared(&format!(
+        "INSERT INTO agent_checkpoint \
+         (checkpoint_id, session_id, scope, tree_oid, metadata_blob_oid, traces_commit, created_at) \
+         VALUES ('{checkpoint_id}', '{session_id}', 'committed', '{tree}', '{blob}', 'c', 1700000001)"
+    ))
+    .await
+    .expect("insert checkpoint");
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn uid03_sessions_rows_and_usage() {
+    let repo_dir = tempdir().expect("temp repo");
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    let (repo_id, worktree_id, conn) = scoped_capture(repo_dir.path()).await;
+    insert_session_for(
+        &conn,
+        &repo_id,
+        &worktree_id,
+        "s-new",
+        "codex",
+        "{}",
+        1_700_000_200,
+    )
+    .await;
+    write_metadata_checkpoint(
+        repo_dir.path(),
+        &conn,
+        "s-new",
+        "codex",
+        "Fix parser crash",
+        "gpt-5-codex",
+        120,
+        40,
+    )
+    .await;
+    insert_session(
+        &conn,
+        &repo_id,
+        &worktree_id,
+        "s-old",
+        r#"{"model":"gpt-5","summary":"older session"}"#,
+        1_700_000_100,
+    )
+    .await;
+    conn.execute_unprepared(
+        "INSERT INTO agent_session_commit (session_id, hash_kind, commit_oid) \
+         VALUES ('s-new', 'sha1', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')",
+    )
+    .await
+    .expect("insert link");
+
+    let scope = repo::resolve_scope(repo_dir.path().to_path_buf())
+        .expect("scope")
+        .expect("repository");
+    let read = super::sessions::read_sessions(&scope)
+        .await
+        .expect("sessions");
+    let rows = read.rows;
+    assert_eq!(rows.len(), 2, "only scoped sessions are listed");
+    assert_eq!(rows[0].id, "s-new", "newest first");
+    assert_eq!(rows[0].model.as_deref(), Some("gpt-5-codex"));
+    assert_eq!(rows[0].usage_input, Some(120));
+    assert_eq!(rows[0].usage_output, Some(40));
+    assert_eq!(rows[0].usage_calls, Some(3));
+    assert_eq!(rows[0].checkpoints, 1);
+    assert_eq!(rows[0].commits.len(), 1);
+    assert_eq!(rows[0].commits[0], "aaaaaaaa", "real link, short oid");
+    assert_eq!(rows[0].workdir_label, "work", "never an absolute path");
+    assert_eq!(rows[1].id, "s-old");
+    assert_eq!(rows[1].usage_input, None, "missing usage stays unknown");
+    assert_eq!(rows[0].summary, "Fix parser crash");
+    assert_eq!(rows[0].summary_status, "available");
+    assert!(rows[0].readable);
+    assert!(
+        !rows[1].readable,
+        "no checkpoint summary means nothing readable"
+    );
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn uid03_summary_is_redacted() {
+    let repo_dir = tempdir().expect("temp repo");
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    let (repo_id, worktree_id, conn) = scoped_capture(repo_dir.path()).await;
+    let token = format!("ghp_{}", "a".repeat(36));
+    insert_session_for(
+        &conn,
+        &repo_id,
+        &worktree_id,
+        "s-secret",
+        "codex",
+        "{}",
+        1_700_000_000,
+    )
+    .await;
+    write_metadata_checkpoint(
+        repo_dir.path(),
+        &conn,
+        "s-secret",
+        "codex",
+        &format!("pushed with {token} ok"),
+        "gpt-5",
+        1,
+        1,
+    )
+    .await;
+    let scope = repo::resolve_scope(repo_dir.path().to_path_buf())
+        .expect("scope")
+        .expect("repository");
+    let read = super::sessions::read_sessions(&scope)
+        .await
+        .expect("sessions");
+    let rows = read.rows;
+    assert_eq!(rows.len(), 1);
+    assert!(
+        !rows[0].summary.contains(&token),
+        "the token must not reach the window: {}",
+        rows[0].summary
+    );
+    assert!(rows[0].summary.contains("pushed with"));
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn uid03_capture_absent_has_no_rows() {
+    let repo_dir = tempdir().expect("temp repo");
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    let scope = repo::resolve_scope(repo_dir.path().to_path_buf())
+        .expect("scope")
+        .expect("repository");
+    let read = super::sessions::read_sessions(&scope)
+        .await
+        .expect("sessions");
+    let rows = read.rows;
+    assert!(
+        rows.is_empty(),
+        "a repository without capture has no sessions"
+    );
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn uid03_read_only_receipt() {
+    let repo_dir = tempdir().expect("temp repo");
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    let (repo_id, worktree_id, conn) = scoped_capture(repo_dir.path()).await;
+    insert_session_for(
+        &conn,
+        &repo_id,
+        &worktree_id,
+        "s-1",
+        "codex",
+        "{}",
+        1_700_000_000,
+    )
+    .await;
+    write_metadata_checkpoint(repo_dir.path(), &conn, "s-1", "codex", "one", "gpt-5", 1, 1).await;
+    conn.close().await.ok();
+    let db_path = crate::internal::ai::capture::store::capture_database_path(
+        &repo_dir.path().join(crate::utils::util::ROOT_DIR),
+    );
+    let before = fs::read(&db_path).expect("read capture database");
+    let repo_db_path = repo_dir
+        .path()
+        .join(crate::utils::util::ROOT_DIR)
+        .join(crate::utils::util::DATABASE);
+    let repo_before = fs::read(&repo_db_path).expect("read repository database");
+    let scope = repo::resolve_scope(repo_dir.path().to_path_buf())
+        .expect("scope")
+        .expect("repository");
+    let read = super::sessions::read_sessions(&scope)
+        .await
+        .expect("sessions");
+    assert_eq!(read.rows.len(), 1, "the summary path actually ran");
+    assert_eq!(read.rows[0].model.as_deref(), Some("gpt-5"));
+    let after = fs::read(&db_path).expect("read capture database");
+    let repo_after = fs::read(&repo_db_path).expect("read repository database");
+    assert_eq!(before, after, "session reads must not modify the catalog");
+    assert_eq!(
+        repo_before, repo_after,
+        "session reads must not modify the repository database (schema, operation rows, \
+         conversion certificates)"
+    );
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn uid03_cap_is_200_rows() {
+    let repo_dir = tempdir().expect("temp repo");
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    let (repo_id, worktree_id, conn) = scoped_capture(repo_dir.path()).await;
+    for index in 0..210 {
+        insert_session(
+            &conn,
+            &repo_id,
+            &worktree_id,
+            &format!("s-{index:03}"),
+            r#"{"summary":"row"}"#,
+            1_700_000_000 + index as i64,
+        )
+        .await;
+    }
+    let scope = repo::resolve_scope(repo_dir.path().to_path_buf())
+        .expect("scope")
+        .expect("repository");
+    let read = super::sessions::read_sessions(&scope)
+        .await
+        .expect("sessions");
+    let rows = read.rows;
+    assert_eq!(rows.len(), super::sessions::SESSION_ROW_CAP);
+    assert_eq!(rows[0].id, "s-209", "newest first");
+}
+
+#[test]
+fn uid03_catalog_transition_uses_real_rows() {
+    let rows = vec![super::sessions::SessionRow {
+        id: "s-real".into(),
+        agent: "claude_code".into(),
+        state: "idle".into(),
+        started_at: 1_700_000_000,
+        last_event_at: 1_700_000_100,
+        stopped_at: None,
+        workdir_label: "work".into(),
+        model: Some("claude-sonnet-4".into()),
+        title: None,
+        summary: "real summary".into(),
+        usage_input: Some(1),
+        usage_output: Some(2),
+        usage_calls: Some(3),
+        checkpoints: 4,
+        commits: vec!["deadbeef".into()],
+        summary_status: "available".into(),
+        readable: true,
+    }];
+    let catalog = super::super::view::catalog_from_sessions(&rows, Vec::new());
+    assert_eq!(catalog.sessions.len(), 1);
+    let session = &catalog.sessions[0];
+    assert_eq!(session.id, "s-real");
+    assert_eq!(session.summary, "real summary");
+    assert_eq!(session.model, "claude-sonnet-4");
+    assert_eq!(session.start.get(..10), Some("2023-11-14"));
+    assert!(session.verification.is_empty(), "no invented verification");
+    assert_eq!(session.commits.len(), 1, "linked commit count is real");
+    assert!(
+        super::super::view::catalog_from_sessions(&[], Vec::new())
+            .sessions
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn uid03_tombstoned_sessions_are_hidden() {
+    let repo_dir = tempdir().expect("temp repo");
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    let (repo_id, worktree_id, conn) = scoped_capture(repo_dir.path()).await;
+    insert_session(
+        &conn,
+        &repo_id,
+        &worktree_id,
+        "s-erased",
+        r#"{"summary":"erased"}"#,
+        1_700_000_000,
+    )
+    .await;
+    conn.execute_unprepared(
+        "INSERT INTO agent_import_tombstone \
+         (agent_kind, provider_session_id, erased_session_id, erased_at) \
+         VALUES ('claude_code', 'p-s-erased', 's-erased', 1700000001)",
+    )
+    .await
+    .expect("insert tombstone");
+    let scope = repo::resolve_scope(repo_dir.path().to_path_buf())
+        .expect("scope")
+        .expect("repository");
+    let read = super::sessions::read_sessions(&scope)
+        .await
+        .expect("sessions");
+    let rows = read.rows;
+    assert!(
+        rows.is_empty(),
+        "a tombstoned session must not be resurrected in the list"
+    );
+}
+
+#[test]
+fn uid03_agent_labels_match_the_filter_chips() {
+    assert_eq!(super::sessions::agent_label("claude_code"), "Claude Code");
+    assert_eq!(super::sessions::agent_label("codex"), "Codex");
+    assert_eq!(super::sessions::agent_label("opencode"), "OpenCode");
+    assert_eq!(super::sessions::agent_label("custom"), "custom");
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn uid03_other_scope_session_is_hidden() {
+    let repo_dir = tempdir().expect("temp repo");
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    let (repo_id, worktree_id, conn) = scoped_capture(repo_dir.path()).await;
+    insert_session(
+        &conn,
+        &repo_id,
+        &worktree_id,
+        "s-here",
+        r#"{"summary":"here"}"#,
+        1_700_000_000,
+    )
+    .await;
+    insert_session(
+        &conn,
+        "foreign-repo",
+        "foreign-worktree",
+        "s-elsewhere",
+        r#"{"summary":"elsewhere"}"#,
+        1_700_000_100,
+    )
+    .await;
+    let scope = repo::resolve_scope(repo_dir.path().to_path_buf())
+        .expect("scope")
+        .expect("repository");
+    let read = super::sessions::read_sessions(&scope)
+        .await
+        .expect("sessions");
+    let rows = read.rows;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, "s-here", "foreign scope rows are excluded");
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn uid03_corrupt_catalog_is_an_error() {
+    let repo_dir = tempdir().expect("temp repo");
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    let storage = repo_dir.path().join(crate::utils::util::ROOT_DIR);
+    crate::internal::ai::capture::store::open(&storage, Duration::from_secs(2))
+        .await
+        .expect("create capture catalog")
+        .close()
+        .await
+        .ok();
+    let db_path = crate::internal::ai::capture::store::capture_database_path(&storage);
+    fs::write(&db_path, b"not a sqlite database").expect("write corrupt catalog");
+    let scope = repo::resolve_scope(repo_dir.path().to_path_buf())
+        .expect("scope")
+        .expect("repository");
+    let error = super::sessions::read_sessions(&scope)
+        .await
+        .expect_err("a corrupt catalog must not look empty");
+    assert!(!error.message.is_empty());
+    assert!(
+        !error.state.is_available(),
+        "corrupt catalogs fail closed: {:?}",
+        error.state
+    );
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn uid03_summary_cap_is_512_chars() {
+    let repo_dir = tempdir().expect("temp repo");
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    let (repo_id, worktree_id, conn) = scoped_capture(repo_dir.path()).await;
+    insert_session_for(
+        &conn,
+        &repo_id,
+        &worktree_id,
+        "s-long",
+        "codex",
+        "{}",
+        1_700_000_000,
+    )
+    .await;
+    let long_title = "x".repeat(600);
+    write_metadata_checkpoint(
+        repo_dir.path(),
+        &conn,
+        "s-long",
+        "codex",
+        &long_title,
+        "gpt-5",
+        1,
+        1,
+    )
+    .await;
+    let scope = repo::resolve_scope(repo_dir.path().to_path_buf())
+        .expect("scope")
+        .expect("repository");
+    let read = super::sessions::read_sessions(&scope)
+        .await
+        .expect("sessions");
+    let rows = read.rows;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].summary.chars().count(),
+        512,
+        "summaries are bounded display excerpts"
+    );
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn uid03_session_detail_fields_are_real() {
+    let repo_dir = tempdir().expect("temp repo");
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    let (repo_id, worktree_id, conn) = scoped_capture(repo_dir.path()).await;
+    insert_session_for(
+        &conn,
+        &repo_id,
+        &worktree_id,
+        "s-detail",
+        "codex",
+        "{}",
+        1_700_000_000,
+    )
+    .await;
+    write_metadata_checkpoint(
+        repo_dir.path(),
+        &conn,
+        "s-detail",
+        "codex",
+        "Detail title",
+        "gpt-5-codex",
+        11,
+        22,
+    )
+    .await;
+    conn.execute_unprepared(
+        "INSERT INTO agent_session_commit (session_id, hash_kind, commit_oid) \
+         VALUES ('s-detail', 'sha1', 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb')",
+    )
+    .await
+    .expect("insert link");
+    let scope = repo::resolve_scope(repo_dir.path().to_path_buf())
+        .expect("scope")
+        .expect("repository");
+    let read = super::sessions::read_sessions(&scope)
+        .await
+        .expect("sessions");
+    let rows = read.rows;
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+    assert_eq!(row.agent, "Codex");
+    assert_eq!(row.model.as_deref(), Some("gpt-5-codex"));
+    assert_eq!(row.title.as_deref(), Some("Detail title"));
+    assert_eq!(row.usage_input, Some(11));
+    assert_eq!(row.usage_output, Some(22));
+    assert_eq!(row.usage_calls, Some(3));
+    assert_eq!(row.checkpoints, 1);
+    assert_eq!(row.commits, vec!["bbbbbbbb".to_string()]);
+    assert_eq!(row.workdir_label, "work");
+    assert_eq!(row.started_at, 1_700_000_000);
+    assert_eq!(row.last_event_at, 1_700_000_000);
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn uid03_other_consumers_preserved() {
+    let repo_dir = tempdir().expect("temp repo");
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    let (repo_id, worktree_id, conn) = scoped_capture(repo_dir.path()).await;
+    insert_session(
+        &conn,
+        &repo_id,
+        &worktree_id,
+        "s-shared",
+        r#"{"summary":"shared"}"#,
+        1_700_000_000,
+    )
+    .await;
+    let scope = repo::resolve_scope(repo_dir.path().to_path_buf())
+        .expect("scope")
+        .expect("repository");
+    let read = super::sessions::read_sessions(&scope)
+        .await
+        .expect("sessions");
+    let _rows = read.rows;
+    // The shared column list still serves the CLI surface after a GUI read.
+    let count = conn
+        .query_one_raw(sea_orm::Statement::from_string(
+            conn.get_database_backend(),
+            format!(
+                "SELECT COUNT(*) AS count FROM ({})",
+                crate::command::agent::SESSION_PAGE_COLUMNS
+            ),
+        ))
+        .await
+        .expect("cli-shaped query")
+        .map(|row| row.try_get::<i64>("", "count").unwrap_or(0))
+        .unwrap_or(0);
+    assert_eq!(
+        count, 1,
+        "the capture catalog is unchanged for other readers"
+    );
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn uid03_non_codex_checkpoint_metadata_is_read() {
+    let repo_dir = tempdir().expect("temp repo");
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    let (repo_id, worktree_id, conn) = scoped_capture(repo_dir.path()).await;
+    insert_session_for(
+        &conn,
+        &repo_id,
+        &worktree_id,
+        "s-claude",
+        "claude_code",
+        "{}",
+        1_700_000_000,
+    )
+    .await;
+    write_metadata_checkpoint(
+        repo_dir.path(),
+        &conn,
+        "s-claude",
+        "claude_code",
+        "Claude title",
+        "claude-sonnet-4",
+        5,
+        6,
+    )
+    .await;
+    let read = super::sessions::read_sessions(&scope_for(&repo_dir))
+        .await
+        .expect("sessions");
+    assert_eq!(read.rows.len(), 1);
+    assert_eq!(read.rows[0].agent, "Claude Code");
+    assert_eq!(
+        read.rows[0].model.as_deref(),
+        Some("claude-sonnet-4"),
+        "the summary reader is agent-aware, not codex-only"
+    );
+}
+
+fn scope_for(repo_dir: &tempfile::TempDir) -> crate::internal::worktree_scope::RequestScope {
+    repo::resolve_scope(repo_dir.path().to_path_buf())
+        .expect("scope")
+        .expect("repository")
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn uid03_commit_links_cap_per_session() {
+    let repo_dir = tempdir().expect("temp repo");
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    let (repo_id, worktree_id, conn) = scoped_capture(repo_dir.path()).await;
+    for (session, links) in [("s-a", 4100), ("s-b", 25)] {
+        insert_session(
+            &conn,
+            &repo_id,
+            &worktree_id,
+            session,
+            r#"{"summary":"links"}"#,
+            1_700_000_000,
+        )
+        .await;
+        for index in 0..links {
+            conn.execute_unprepared(&format!(
+                "INSERT INTO agent_session_commit (session_id, hash_kind, commit_oid) \
+                 VALUES ('{session}', 'sha1', '{:040x}')",
+                index
+            ))
+            .await
+            .expect("insert link");
+        }
+    }
+    let read = super::sessions::read_sessions(&scope_for(&repo_dir))
+        .await
+        .expect("sessions");
+    assert_eq!(read.rows.len(), 2);
+    let later = read.rows.iter().find(|row| row.id == "s-b").expect("s-b");
+    assert_eq!(
+        later.commits.len(),
+        super::sessions::COMMIT_LINK_CAP,
+        "a later session keeps its links even past the first session's 4,000"
+    );
+    for row in &read.rows {
+        assert_eq!(
+            row.commits.len(),
+            super::sessions::COMMIT_LINK_CAP,
+            "the per-session cap is applied before any page cap"
+        );
+    }
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn uid03_schema_mismatch_is_typed() {
+    let repo_dir = tempdir().expect("temp repo");
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    let (_, _, conn) = scoped_capture(repo_dir.path()).await;
+    conn.execute_unprepared("UPDATE schema_versions SET version = 1")
+        .await
+        .expect("downgrade schema ledger");
+    let error = super::sessions::read_sessions(&scope_for(&repo_dir))
+        .await
+        .expect_err("an old schema must not look available");
+    assert_eq!(error.state, SourceState::SchemaOld);
+    conn.execute_unprepared("UPDATE schema_versions SET version = 999999999999")
+        .await
+        .expect("upgrade schema ledger");
+    let error = super::sessions::read_sessions(&scope_for(&repo_dir))
+        .await
+        .expect_err("a new schema must not look available");
+    assert_eq!(error.state, SourceState::SchemaNew);
+}
+
+#[test]
+fn uid03_capture_and_summary_labels_differ() {
+    let rows = vec![super::sessions::SessionRow {
+        id: "s-mixed".into(),
+        agent: "Codex".into(),
+        state: "active".into(),
+        started_at: 1_700_000_000,
+        last_event_at: 1_700_000_000,
+        stopped_at: None,
+        workdir_label: "work".into(),
+        model: Some("gpt-5".into()),
+        title: Some("title".into()),
+        summary: "title".into(),
+        usage_input: None,
+        usage_output: None,
+        usage_calls: None,
+        checkpoints: 2,
+        commits: Vec::new(),
+        summary_status: "partial".into(),
+        readable: true,
+    }];
+    let catalog = super::super::view::catalog_from_sessions(&rows, Vec::new());
+    let session = &catalog.sessions[0];
+    assert_eq!(session.capture_label, "2 checkpoint(s)");
+    assert_eq!(session.readable_label, "readable content · partial");
+    assert!(
+        session.capture_label != session.readable_label,
+        "capture completeness and summary status are separate questions"
+    );
+}
+
+#[test]
+fn uid03_readable_filter_choice_and_predicate_data() {
+    let rows = vec![
+        super::sessions::SessionRow {
+            id: "s-read".into(),
+            agent: "Codex".into(),
+            state: "active".into(),
+            started_at: 1_700_000_000,
+            last_event_at: 1_700_000_000,
+            stopped_at: Some(1_700_000_100),
+            workdir_label: "work".into(),
+            model: None,
+            title: Some("readable".into()),
+            summary: "readable".into(),
+            usage_input: None,
+            usage_output: None,
+            usage_calls: None,
+            checkpoints: 1,
+            commits: Vec::new(),
+            summary_status: "available".into(),
+            readable: true,
+        },
+        super::sessions::SessionRow {
+            id: "s-blind".into(),
+            agent: "Codex".into(),
+            state: "active".into(),
+            started_at: 1_700_000_001,
+            last_event_at: 1_700_000_001,
+            stopped_at: None,
+            workdir_label: "work".into(),
+            model: None,
+            title: None,
+            summary: String::new(),
+            usage_input: None,
+            usage_output: None,
+            usage_calls: None,
+            checkpoints: 0,
+            commits: Vec::new(),
+            summary_status: "unknown".into(),
+            readable: false,
+        },
+    ];
+    let catalog = super::super::view::catalog_from_sessions(&rows, Vec::new());
+    let readable: Vec<bool> = catalog.sessions.iter().map(|s| s.readable).collect();
+    assert_eq!(
+        readable,
+        vec![true, false],
+        "mixed rows keep their real flags"
+    );
+    let choices = super::super::view::filter_choices(&catalog);
+    assert!(
+        choices
+            .iter()
+            .any(|choice| choice.value == "readable:readable"),
+        "the readable-content filter chip exists"
+    );
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn uid03_summary_completion_errors_are_typed() {
+    let repo_dir = tempdir().expect("temp repo");
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    let (repo_id, worktree_id, conn) = scoped_capture(repo_dir.path()).await;
+    insert_session_for(
+        &conn,
+        &repo_id,
+        &worktree_id,
+        "s-bad",
+        "codex",
+        "{}",
+        1_700_000_000,
+    )
+    .await;
+    write_metadata_checkpoint(
+        repo_dir.path(),
+        &conn,
+        "s-bad",
+        "codex",
+        "title",
+        "gpt-5",
+        1,
+        1,
+    )
+    .await;
+    // Point the catalog row at a different blob than the tree entry: the role
+    // proof fails, so completion must be an integrity error, not "unknown".
+    let storage = repo_dir.path().join(crate::utils::util::ROOT_DIR);
+    let other =
+        crate::utils::object::write_git_object(&storage, "blob", b"{}").expect("write other blob");
+    conn.execute_unprepared(&format!(
+        "UPDATE agent_checkpoint SET metadata_blob_oid = '{other}' WHERE session_id = 's-bad'"
+    ))
+    .await
+    .expect("update checkpoint");
+    let read = super::sessions::read_sessions(&scope_for(&repo_dir))
+        .await
+        .expect("a broken metadata role degrades one row, not the page");
+    assert_eq!(read.state, SourceState::Available);
+    assert_eq!(read.rows.len(), 1, "the row stays visible");
+    assert_eq!(
+        read.rows[0].summary_status, "malformed",
+        "its summary is marked malformed"
+    );
+    assert!(!read.rows[0].readable);
+
+    // A valid checkpoint whose shared budget expires during completion must be
+    // reported as a budget error, not corruption.
+    insert_session_for(
+        &conn,
+        &repo_id,
+        &worktree_id,
+        "s-slow",
+        "codex",
+        "{}",
+        1_700_000_001,
+    )
+    .await;
+    write_metadata_checkpoint(
+        repo_dir.path(),
+        &conn,
+        "s-slow",
+        "codex",
+        "slow",
+        "gpt-5",
+        1,
+        1,
+    )
+    .await;
+    let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = cancelled.clone();
+    let budget = crate::internal::ai::checkpoint_reader::CheckpointReadBudget::new(
+        std::time::Instant::now() + Duration::from_secs(5),
+        std::sync::Arc::new(move || flag.load(std::sync::atomic::Ordering::SeqCst)),
+    );
+    let txn = conn.begin().await.expect("begin");
+    let prepared = crate::internal::ai::capture::summary::SessionSummaryRead::prepare_for(
+        &txn, &storage, "s-slow", "codex", budget,
+    )
+    .await
+    .expect("prepare");
+    let _ = txn.rollback().await;
+    cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        prepared.finish_result().await.unwrap_err(),
+        crate::internal::ai::capture::summary::SummaryErrorKind::Budget,
+        "completion preserves the budget classification"
+    );
+}
+
+#[test]
+fn uid03_readable_filter_predicate_filters_rows() {
+    use crate::gui::view::passes_filters;
+    let rows = vec![
+        super::sessions::SessionRow {
+            id: "s-read".into(),
+            agent: "Codex".into(),
+            state: "active".into(),
+            started_at: 1_700_000_000,
+            last_event_at: 1_700_000_000,
+            stopped_at: Some(1_700_000_100),
+            workdir_label: "work".into(),
+            model: None,
+            title: Some("readable".into()),
+            summary: "readable".into(),
+            usage_input: None,
+            usage_output: None,
+            usage_calls: None,
+            checkpoints: 1,
+            commits: Vec::new(),
+            summary_status: "available".into(),
+            readable: true,
+        },
+        super::sessions::SessionRow {
+            id: "s-blind".into(),
+            agent: "Codex".into(),
+            state: "active".into(),
+            started_at: 1_700_000_000,
+            last_event_at: 1_700_000_000,
+            stopped_at: Some(1_700_000_100),
+            workdir_label: "work".into(),
+            model: None,
+            title: None,
+            summary: String::new(),
+            usage_input: None,
+            usage_output: None,
+            usage_calls: None,
+            checkpoints: 0,
+            commits: Vec::new(),
+            summary_status: "unknown".into(),
+            readable: false,
+        },
+    ];
+    let catalog = super::super::view::catalog_from_sessions(&rows, Vec::new());
+    let visible = |readable_only: bool| -> Vec<String> {
+        catalog
+            .sessions
+            .iter()
+            .filter(|session| {
+                passes_filters(session, "all", &[], &[], &[], readable_only, &catalog.today)
+            })
+            .map(|session| session.id.clone())
+            .collect()
+    };
+    assert_eq!(visible(true), vec!["s-read"], "only readable rows remain");
+    assert_eq!(
+        visible(false),
+        vec!["s-read", "s-blind"],
+        "clearing the filter restores both rows"
+    );
+}
+
+#[test]
+fn uid03_selection_and_state_messages_are_stable() {
+    use crate::gui::view::{select_session, sessions_message};
+    let mut rows = vec![super::sessions::SessionRow {
+        id: "s-one".into(),
+        agent: "Codex".into(),
+        state: "active".into(),
+        started_at: 1_700_000_000,
+        last_event_at: 1_700_000_000,
+        stopped_at: None,
+        workdir_label: "work".into(),
+        model: None,
+        title: None,
+        summary: String::new(),
+        usage_input: None,
+        usage_output: None,
+        usage_calls: None,
+        checkpoints: 0,
+        commits: Vec::new(),
+        summary_status: "malformed".into(),
+        readable: false,
+    }];
+    let mut second = rows[0].clone();
+    second.id = "s-two".into();
+    rows.push(second);
+    let catalog = super::super::view::catalog_from_sessions(&rows, Vec::new());
+    assert_eq!(
+        select_session("s-two", &catalog),
+        "s-two",
+        "a non-first selection survives a refresh/reordering"
+    );
+    assert_eq!(
+        select_session("s-gone", &catalog),
+        "s-one",
+        "a removed selection falls back to the first row"
+    );
+    assert_eq!(
+        sessions_message(Some(&SourceState::Stale), None),
+        "Sessions were not checked yet."
+    );
+    assert_eq!(
+        sessions_message(Some(&SourceState::Absent), None),
+        "No captured sessions yet: this repository has no capture catalog."
+    );
+    let corrupt = sessions_message(Some(&SourceState::Corrupt), Some("bad rows"));
+    assert!(corrupt.contains("corrupt") && corrupt.contains("bad rows"));
+    assert_eq!(
+        catalog.sessions[0].readable_label, "no readable content · malformed",
+        "a malformed summary is visible instead of being hidden"
+    );
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn uid03_catalog_level_preparation_failure_fails_the_page() {
+    let repo_dir = tempdir().expect("temp repo");
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    let (repo_id, worktree_id, conn) = scoped_capture(repo_dir.path()).await;
+    insert_session(
+        &conn,
+        &repo_id,
+        &worktree_id,
+        "s-1",
+        r#"{"summary":"one"}"#,
+        1_700_000_000,
+    )
+    .await;
+    conn.execute_unprepared("DROP TABLE agent_checkpoint")
+        .await
+        .expect("drop checkpoint table");
+    // Directly prove summary preparation fails page-level, so reverting the
+    // classification cannot be masked by a later count query failing.
+    let direct = super::sessions::read_summaries(
+        &conn,
+        &repo_dir.path().join(crate::utils::util::ROOT_DIR),
+        &["s-1".to_string()],
+        &["claude_code".to_string()],
+    )
+    .await;
+    assert!(
+        direct.is_err(),
+        "summary preparation itself must fail the page"
+    );
+    let error = super::sessions::read_sessions(&scope_for(&repo_dir))
+        .await
+        .expect_err("a missing checkpoint table is a source-level failure");
+    assert!(
+        !error.state.is_available(),
+        "the page reports the source failure instead of an empty list"
+    );
+    assert!(!error.message.is_empty());
+}
+
+#[test]
+fn uid03_search_hits_real_rows() {
+    let rows = vec![super::sessions::SessionRow {
+        id: "s-search".into(),
+        agent: "Codex".into(),
+        state: "active".into(),
+        started_at: 1_700_000_000,
+        last_event_at: 1_700_000_000,
+        stopped_at: None,
+        workdir_label: "work".into(),
+        model: Some("gpt-5".into()),
+        title: Some("Fix parser crash".into()),
+        summary: "parser crash fixed".into(),
+        usage_input: None,
+        usage_output: None,
+        usage_calls: None,
+        checkpoints: 1,
+        commits: Vec::new(),
+        summary_status: "available".into(),
+        readable: true,
+    }];
+    let catalog = super::super::view::catalog_from_sessions(&rows, Vec::new());
+    let hits = super::super::view::search_hits(&catalog, "all", "parser");
+    assert!(
+        hits.iter()
+            .any(|hit| hit.id == "s-search" && hit.label == "Summary"),
+        "search reads the real summary text: {hits:?}"
+    );
+    assert!(
+        super::super::view::search_hits(&catalog, "all", "absent").is_empty(),
+        "a non-matching query yields no hits"
+    );
+}
+
+#[test]
+fn uid03_busy_causes_map_to_busy() {
+    let busy = anyhow::Error::from(
+        crate::internal::ai::checkpoint_reader::CheckpointReaderError::CatalogBusy,
+    );
+    assert_eq!(state::classify_error_chain(&busy), SourceState::Busy);
+    let pool = anyhow::anyhow!("Connection pool timed out while acquiring a connection");
+    assert_eq!(
+        state::classify_error_chain(&pool),
+        SourceState::Busy,
+        "sqlx pool timeout wording is transient"
+    );
+    let corrupt = anyhow::anyhow!("checkpoint object identity or type is inconsistent");
+    assert_eq!(state::classify_error_chain(&corrupt), SourceState::Corrupt);
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn uid03_active_and_stopped_sessions_render_distinctly() {
+    let repo_dir = tempdir().expect("temp repo");
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    let (repo_id, worktree_id, conn) = scoped_capture(repo_dir.path()).await;
+    insert_session(
+        &conn,
+        &repo_id,
+        &worktree_id,
+        "s-active",
+        r#"{"summary":"active"}"#,
+        1_700_000_000,
+    )
+    .await;
+    insert_session(
+        &conn,
+        &repo_id,
+        &worktree_id,
+        "s-stopped",
+        r#"{"summary":"stopped"}"#,
+        1_700_000_001,
+    )
+    .await;
+    conn.execute_unprepared(
+        "UPDATE agent_session SET stopped_at = 1700000100, state = 'stopped' \
+         WHERE session_id = 's-stopped'",
+    )
+    .await
+    .expect("mark stopped");
+    let read = super::sessions::read_sessions(&scope_for(&repo_dir))
+        .await
+        .expect("sessions");
+    let active = read
+        .rows
+        .iter()
+        .find(|row| row.id == "s-active")
+        .expect("active");
+    let stopped = read
+        .rows
+        .iter()
+        .find(|row| row.id == "s-stopped")
+        .expect("stopped");
+    assert_eq!(active.stopped_at, None, "an active session has no end time");
+    assert_eq!(stopped.stopped_at, Some(1_700_000_100));
+    let catalog = super::super::view::catalog_from_sessions(&read.rows, Vec::new());
+    let active_view = catalog
+        .sessions
+        .iter()
+        .find(|session| session.id == "s-active")
+        .expect("active view");
+    let stopped_view = catalog
+        .sessions
+        .iter()
+        .find(|session| session.id == "s-stopped")
+        .expect("stopped view");
+    assert_eq!(
+        active_view.end, "—",
+        "an active session does not invent an end"
+    );
+    assert_eq!(stopped_view.end, "2023-11-14 22:15");
+    assert_eq!(
+        crate::gui::view::end_label(active_view),
+        "Still running",
+        "the drawn state label follows the session state"
+    );
+    assert_eq!(
+        crate::gui::view::end_label(stopped_view),
+        "Ended at 22:15",
+        "a stopped session draws its real end time"
+    );
+    let mut stale = active_view.clone();
+    stale.end = "2023-11-14 23:00".to_string();
+    assert_eq!(
+        crate::gui::view::end_label(&stale),
+        "Still running",
+        "an active session with a stale end timestamp still shows as running"
+    );
+    assert_eq!(
+        crate::gui::model::clock(&active_view.end),
+        "—",
+        "the drawn clock preserves the missing-value marker"
+    );
+    assert_eq!(
+        crate::gui::model::clock(&stopped_view.end),
+        "22:15",
+        "a stopped session renders its real end time"
+    );
+    let mut quarantined = stopped_view.clone();
+    quarantined.running_label = "quarantined".to_string();
+    quarantined.end = "—".to_string();
+    assert_eq!(
+        crate::gui::view::end_label(&quarantined),
+        "No recorded end",
+        "a quarantined session with a cleared end is not 'Still running'"
+    );
 }

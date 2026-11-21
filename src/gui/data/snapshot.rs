@@ -35,6 +35,12 @@ pub struct Snapshot {
     pub message: Option<String>,
     /// History rows (empty for non-History readers).
     pub history: Vec<super::history::HistoryRow>,
+    /// Captured sessions for the Sessions surface.
+    pub sessions: Vec<super::sessions::SessionRow>,
+    /// Sessions-specific failure while the context itself is available.
+    pub sessions_error: Option<String>,
+    /// The typed Sessions source state.
+    pub sessions_state: SourceState,
     /// History-specific failure while the context itself is available.
     pub history_error: Option<String>,
 }

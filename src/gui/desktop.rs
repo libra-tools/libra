@@ -202,6 +202,7 @@ impl Desktop {
         let data = DataHandle::spawn();
         data.request();
         let polled = data.clone();
+        let sessions_handle = sessions.clone();
         cx.spawn(async move |this, cx| {
             loop {
                 if this.upgrade().is_none() {
@@ -211,8 +212,25 @@ impl Desktop {
                     .timer(Duration::from_millis(100))
                     .await;
                 if let Some(snapshot) = polled.take_snapshot() {
+                    let rows = snapshot.sessions.clone();
+                    let sessions_error = snapshot.sessions_error.clone();
+                    let sessions_state = snapshot.sessions_state.clone();
                     let delivered = this.update(cx, |desktop, cx| {
                         desktop.snapshot = Some(snapshot);
+                        sessions_handle.update(cx, |window, cx| {
+                            window.set_catalog(
+                                crate::gui::view::catalog_from_sessions(
+                                    &rows,
+                                    crate::gui::model::catalog()
+                                        .as_ref()
+                                        .map(|catalog| catalog.capability_map.clone())
+                                        .unwrap_or_default(),
+                                ),
+                                sessions_error,
+                                Some(sessions_state),
+                                cx,
+                            );
+                        });
                         cx.notify();
                     });
                     if delivered.is_err() {

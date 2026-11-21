@@ -380,6 +380,10 @@ fn extract_transcript_from_capture_identity(
     })
 }
 
+/// The column list shared by `session list` and the window's Sessions read.
+pub(crate) const SESSION_PAGE_COLUMNS: &str = "SELECT s.session_id, s.agent_kind, s.state, s.working_dir, s.started_at, \
+     s.last_event_at, s.stopped_at FROM agent_session s WHERE 1=1";
+
 /// Build the paginated `session list` SQL. Extracted so the EXPLAIN QUERY
 /// PLAN tests run the exact production statement against the
 /// `idx_agent_session_started_paging` index (never a table SCAN, never a
@@ -388,10 +392,7 @@ fn extract_transcript_from_capture_identity(
 /// `(started_at DESC, session_id ASC)` — see
 /// [`super::checkpoint::encode_page_cursor`].
 pub(super) fn session_page_sql(with_agent: bool, with_state: bool, with_cursor: bool) -> String {
-    let mut sql = String::from(
-        "SELECT session_id, agent_kind, state, working_dir, started_at, last_event_at \
-         FROM agent_session WHERE 1=1",
-    );
+    let mut sql = String::from(SESSION_PAGE_COLUMNS);
     if with_agent {
         sql.push_str(" AND agent_kind = ?");
     }

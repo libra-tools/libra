@@ -31,7 +31,7 @@ Cargo feature 控制。
 仓库上下文快照，源级状态按 ADR-UID-06 分类；主线程只渲染快照，不做 I/O。
 `src/gui/desktop.rs` 管理页面与本地预览状态，
 `src/gui/screens/` 放各设计页面，`widgets.rs` 提供原生 GPUI 布局和 Ely 控件。
-Sessions 保留演示目录 `src/gui/sessions.json`，不读取仓库。官网 Logo 内嵌在
+Sessions 由 `src/gui/data/sessions.rs` 从只读 capture 目录读取（按仓库 scope 过滤、倒序、200 行上限、默认脱敏），不再使用 `sessions.json`；能力地图仍来自演示目录。官网 Logo 内嵌在
 `src/gui/assets/libra-logo.svg`，通过组合 AssetSource 与 Ely 的字体、图标一起加载。
 
 2026-11-01 桌面设计来自 `libra-desktop-gui.zip`。`.dc.html` 是设计资料，
@@ -39,7 +39,7 @@ Sessions 保留演示目录 `src/gui/sessions.json`，不读取仓库。官网 L
 
 ## 还未实现的功能
 
-- 把 diff、status 等数据面接进窗口（仓库上下文与 History 提交/归属已接入；其余见 `plan-20261120-ui-real-data.md`）。
+- 把 diff、status 等数据面接进窗口（仓库上下文、History 提交/归属与 Sessions 已接入；其余见 `plan-20261120-ui-real-data.md`）。
 - 已由单一 worker runtime 承担：窗口读取不再每次新建 Tokio runtime。
 - 发布构建现在默认包含桌面窗口；Linux release runner 需安装 fontconfig 与 xkbcommon 开发头文件。
 - Linux 运行时需要 fontconfig 与 xkbcommon 共享库；`install.sh` 在 `ldconfig` 可用时会检测并警告缺失项。
@@ -48,7 +48,7 @@ Sessions 保留演示目录 `src/gui/sessions.json`，不读取仓库。官网 L
 
 26 个设计入口由 `Page::ALL` 注册，并由枚举穷尽匹配分派到原生视图。
 History 为默认页，All tools / `⌘K` 是完整页面入口。各页单独存放在
-`src/gui/screens/`；Sessions 沿用 `view.rs` 和 `sessions.json` 的可读内容边界。
+`src/gui/screens/`；Sessions 沿用 `view.rs` 的可读内容边界，数据来自 capture 只读投影。
 Ely 提供按钮、输入框、复选框、选择标签、主题、焦点与弹层；GPUI 提供布局、
 提交图、代码与归因行。没有 HTML/WebView，也不加载 `.dc.html` 的画布脚本。
 

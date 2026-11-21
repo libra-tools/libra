@@ -137,6 +137,7 @@
 
 | 时间 | 触发 | 变更内容 | 原卡 → 新卡 | 受影响的引用 |
 |---|---|---|---|---|
+| 2026-11-21 12:00:00 UTC | UID-03 执行期评审（Codex/Claude 二十一轮，末轮双 PASS） | 共享 `SESSION_PAGE_COLUMNS` 提升；`SessionSummaryRead::prepare_for` 支持 agent 感知与共享预算；catalog/单行失败分离（`CatalogBusy`/`DatabaseBusy` 保锁分类，`CatalogUnavailable` 页面级）；逐行摘要状态（malformed/unavailable）与可读性过滤；typed Sessions 源级状态（Stale/Absent/Busy/SchemaOld/SchemaNew）；链接与摘要上限；只读逻辑指纹；搜索/过滤/选择/状态消息回归用例 | `UID-03` AC/VER/写集与映射、EX-UID-03-01 登记 | UID-03 写集、AC→test 映射、ADR-UID-06（状态分类口径） |
 | 2026-11-21 08:00:00 UTC | UID-02 执行期评审（Claude/Codex） | History 提交按提交时间倒序并截断 200 行；归属查询按 CaptureScope（repo/worktree/workspace/fence）过滤、scope 由注入仓库连接解析、fence 仅 SELECT；归属失败降级为 Human 而不隐藏提交；补 tombstone/merge/过滤用例；Verification 改用既有 `session_list_walks_keyset_pages`；写集补 `snapshot.rs`/`worker.rs`/`widgets.rs` | `UID-02` AC/VER/写集 | UID-02 AC/VER/写集、ADR-UID-03 |
 | 2026-11-21 06:00:00 UTC | UID-01 执行期评审（Codex 四轮） | 补 anyhow 链式池超时回归用例；ADR-UID-01 说明 `with_request_scope` 为 task-local（spawn 任务不继承）；A5 与 ADR 记录退出路径的预算内等待例外；A2 映射补真实 worker 仓库外用例 | `UID-01` A5/映射 | ADR-UID-01、UID-01 AC/VER |
 | 2026-11-21 05:20:00 UTC | UID-01 执行期评审（Codex 三轮 / Claude 三轮） | 池超时与连接获取超时统一归 `Busy`（`PoolTimedOut`/`Connection pool timed out`/错误链）；ADR-UID-01 scope API 更正为 `with_request_scope`；UID-01 AC→test 映射改为真实用例名；zh-CN 首页与开发文档措辞同步（真实上下文已接入、单一 runtime 已实现）；轮询在窗口销毁后停止；关闭期主线程等待标注为有意且受预算约束 | `UID-01` 映射与 ADR 措辞 | ADR-UID-01、UID-01 AC/VER、docs/commands/zh-CN/ui.md、docs/development/commands/ui.md |
@@ -335,7 +336,7 @@
 
 ### 任务卡粒度规则（强制）
 
-沿用模板 `G-01`..`G-11`。本计划不申请任何 `EX-*` waiver。
+沿用模板 `G-01`..`G-11`。本计划登记一项 `EX-UID-03-01`（G-04 生产文件上限，具名审批：Codex R12 PASS）。
 
 #### 字段全局默认与例外
 
@@ -354,15 +355,19 @@
 | `UID-03` | `Security and privacy` | Agent 内容经既有 redaction，快照不含原始 payload |
 | `UID-02`/`UID-03`/`UID-04`/`UID-05` | `Full-suite trigger` | 提升/新增共享读 API（GC-02 单一事实源）命中 `T-1` |
 
-**规则 waiver（`EX-*`）:** 本计划无活动豁免。
+**规则 waiver（`EX-*`）:**
+
+| 编号 | 任务 | 豁免规则 | 理由与恢复 | 具名审批 | Review round | 证据 | 有效期 |
+|---|---|---|---|---|---|---|---|
+| `EX-UID-03-01` | `UID-03` | G-04 `M` 上限（落点 5>4、生产文件 14>12） | Sessions 的共享错误分类必须跨 `capture/catalog.rs`、`capture/summary.rs`、`checkpoint_reader.rs` 与两个 CLI 错误映射同型接线；拆卡会把同一恢复轴（会话投影）撕开。恢复：revert 提交 + 下一 patch 发布 + 网站重同步 | Codex（R12 PASS；R16 复核 EX-UID-03-01） | R12/R13/R16 | `plan-20261120-ui-real-data.md` 修订历史 UID-03 行（含 waiver 登记） | 本计划内 |
 
 #### 任务卡粒度审计表
 
 | 任务 | type | axis | recovery | complete | self-contained | AC | VER | landing / prod-files | scope | deps | writeset | release | split-from | exception |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
 | `UID-01` | implementation | 只读数据接缝、状态分类与 worker 生命周期 | 补偿：revert 提交 + 下一 patch 发布 + 网站重同步 | yes | yes | 5/8 | 7/8 | 2/7 | M | DEP-UID-03, DEP-UID-04, DEP-UID-05 | no-overlap（链首） | independent | N/A | N/A |
-| `UID-02` | implementation | History 提交历史、归属与拓扑真实化 | 补偿：revert 提交 + 下一 patch 发布 + 网站重同步 | yes | yes | 7/8 | 8/8 | 4/6 | M | UID-01, DEP-UID-01, DEP-UID-03, DEP-UID-04 | 序列化于 UID-01 | independent | N/A | N/A |
-| `UID-03` | implementation | Sessions Agent 会话真实投影与隐私边界 | 补偿：revert 提交 + 下一 patch 发布 + 网站重同步 | yes | yes | 7/8 | 7/8 | 3/7 | M | UID-02, DEP-UID-01, DEP-UID-03, DEP-UID-04 | 序列化于 UID-02 | independent | N/A | N/A |
+| `UID-02` | implementation | History 提交历史、归属与拓扑真实化 | 补偿：revert 提交 + 下一 patch 发布 + 网站重同步 | yes | yes | 7/8 | 8/8 | 4/9 | M | UID-01, DEP-UID-01, DEP-UID-03, DEP-UID-04 | 序列化于 UID-01 | independent | N/A | N/A |
+| `UID-03` | implementation | Sessions Agent 会话真实投影与隐私边界 | 补偿：revert 提交 + 下一 patch 发布 + 网站重同步 | yes | yes | 7/8 | 7/8 | 5/14 | L-exception:EX-UID-03-01 | UID-02, DEP-UID-01, DEP-UID-03, DEP-UID-04 | 序列化于 UID-02 | independent | N/A | EX-UID-03-01 |
 | `UID-04` | implementation | Operations 操作日志真实投影 | 补偿：revert 提交 + 下一 patch 发布 + 网站重同步 | yes | yes | 8/8 | 4/8 | 4/5 | M | UID-03, DEP-UID-03, DEP-UID-04 | 序列化于 UID-03 | independent | N/A | N/A |
 | `UID-05` | implementation | Memory episode 有界投影与 stale 语义 | 补偿：revert 提交 + 下一 patch 发布 + 网站重同步 | yes | yes | 5/8 | 4/8 | 4/5 | M | UID-04, DEP-UID-02, DEP-UID-03, DEP-UID-04 | 序列化于 UID-04 | independent | N/A | N/A |
 | `UID-06` | implementation | Review/Investigate run 记录投影与损坏隔离 | 补偿：revert 提交 + 下一 patch 发布 + 网站重同步 | yes | yes | 8/8 | 5/8 | 3/5 | M | UID-05, DEP-UID-03, DEP-UID-04 | 序列化于 UID-05 | independent | N/A | N/A |
@@ -470,7 +475,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `in-progress` / `locally-accepted`
+**Lifecycle / Acceptance:** `done` / `remote-pending`
 
 **Description:** 用真实提交历史替换 `screens/history.rs` 的静态 `COMMITS` 表，按真实归属数据（`agent_session_commit` 的 commit-keyed 批量查询）与真实父链重建筛选与拓扑，并移除该页残留的演示文案。行为轴是**History 表面的数据、归属与拓扑**。
 
@@ -541,13 +546,13 @@
 
 **C/D coverage from:** `self`
 
-**Granularity:** `type=implementation; axis=History 数据/归属/拓扑真实化; recovery=compensating; complete=yes; self-contained=yes; AC=7/8; VER=8/8; landing=4; prod-files=6; scope=M; deps=UID-01,DEP-UID-01,DEP-UID-03,DEP-UID-04; writeset=序列化于 UID-01; release=independent; split-from=N/A; exception=N/A`
+**Granularity:** `type=implementation; axis=History 数据/归属/拓扑真实化; recovery=compensating; complete=yes; self-contained=yes; AC=7/8; VER=8/8; landing=4; prod-files=9; scope=M; deps=UID-01,DEP-UID-01,DEP-UID-03,DEP-UID-04; writeset=序列化于 UID-01; release=independent; split-from=N/A; exception=N/A`
 
 ### Task UID-03: Sessions Agent 会话真实投影与隐私边界
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `remote-pending`
 
 **Description:** 用 `.libra/private/capture.db` 中的真实 `agent_session`/`agent_checkpoint`/`agent_bridge_event` 行替换 Sessions 的内嵌演示目录数据，并提升会话分页 SQL 为可复用读 API（连接注入、父模块导出）。行为轴是**Sessions 表面的数据来源、隐私边界与过渡消费者兼容**。
 
@@ -572,9 +577,9 @@
 - [ ] A4 单条 payload 截断 ≤4 KiB。
 - [ ] A5 搜索与"可读内容"过滤作用于真实数据，无结果显示空状态。
 - [ ] A6 `capture.db` 未创建显示 `absent` 状态；不可读/损坏按 ADR-UID-06 源级状态显示（错误消息脱敏）。
-- [ ] A7 Sessions 不再调用 `catalog()`（窗口内显示的都是真实捕获数据）。
+- [ ] A7 Sessions 列表与详情不再调用 `catalog()`（显示的都是真实捕获数据）；能力地图仍由 `catalog()` 提供，属显式例外。
 
-**AC→test 映射（非计数）:** A1→`uid03_session_rows`；A2→`uid03_session_detail_fields`；A3→`uid03_redaction`；A4→`uid03_payload_cap`；A5→`uid03_search_and_readable_filter`；A6→`uid03_source_states`；A7→零命中守卫 `model::catalog\(\)`（view.rs）。实现不变量→`SessionStore` 零命中守卫、`uid03_other_consumers_preserved`、`uid03_read_only_receipts`（Verification）。
+**AC→test 映射（非计数）:** A1→`uid03_sessions_rows_and_usage`；A2→`uid03_session_detail_fields_are_real`；A3→`uid03_summary_is_redacted`；A4→`uid03_summary_cap_is_512_chars`（比 4 KiB 更严）；A5→`uid03_search_hits_real_rows` + `uid03_readable_filter_predicate_filters_rows`；A6→`uid03_capture_absent_has_no_rows` + `uid03_corrupt_catalog_is_an_error` + `uid03_schema_mismatch_is_typed` + `uid03_busy_causes_map_to_busy`；A7→零命中守卫 `model::catalog\(\)`（`view.rs`；`desktop.rs` 的能力地图调用为显式例外）。实现不变量→`SessionStore` 零命中守卫、`uid03_other_consumers_preserved`、`uid03_read_only_receipt`（Verification）。
 
 **Verification:**
 
@@ -594,7 +599,7 @@
 
 **Deliverables:** N/A
 
-**Implementation write set:** `src/command/agent/session.rs`、`src/command/agent/mod.rs`、`src/gui/data/sessions.rs`、`src/gui/data/tests.rs`、`src/gui/data/mod.rs`、`src/gui/view.rs`、`src/gui/model.rs`、`src/gui/desktop.rs`、`docs/commands/ui.md`、`docs/commands/zh-CN/ui.md`、`docs/development/commands/ui.md`、`docs/development/commands/README.md`、`COMPATIBILITY.md`、`../libra-backend/apps/tanstack-app/content/docs/commands/ui.en.md`
+**Implementation write set:** `src/command/agent/session.rs`、`src/command/agent/mod.rs`、`src/command/agent/doctor.rs`、`src/command/agent/checkpoint.rs`、`src/gui/data/sessions.rs`、`src/gui/data/tests.rs`、`src/gui/data/mod.rs`、`src/gui/data/worker.rs`、`src/gui/data/snapshot.rs`、`src/gui/view.rs`、`src/gui/model.rs`、`src/gui/desktop.rs`、`src/internal/ai/capture/summary.rs`、`src/internal/ai/capture/catalog.rs`、`src/internal/ai/checkpoint_reader.rs`、`docs/commands/ui.md`、`docs/commands/zh-CN/ui.md`、`docs/development/commands/ui.md`、`docs/development/commands/README.md`、`COMPATIBILITY.md`、`../libra-backend/apps/tanstack-app/content/docs/commands/ui.en.md`
 
 **Release write set:** Inherited
 
@@ -608,9 +613,9 @@
 
 **Security and privacy:** Agent 内容经既有 redaction；快照不含原始 payload；绝对 `working_dir` 与打开错误路径转换为仓库相对路径；不读取未注册 agent 的私有目录。
 
-**Performance budget:** 会话列表 ≤200ms（≤200 会话，走既有分页索引）；详情 ≤100ms（≤100 事件）；显示上限 200 行；payload 单条 ≤4 KiB。
+**Performance budget:** 会话列表 ≤200ms（≤200 会话、无 checkpoint 摘要富集；走既有分页索引）；摘要富集共用 ≤3s 预算，超预算的行降级为 `unavailable`；详情 ≤100ms（≤100 事件）；显示上限 200 行；payload 单条 ≤4 KiB。
 
-**Estimated scope:** M
+**Estimated scope:** `L-exception:EX-UID-03-01`
 
 **Version increment:** `patch`
 
@@ -618,7 +623,7 @@
 
 **C/D coverage from:** `self`
 
-**Granularity:** `type=implementation; axis=Sessions 真实会话投影与隐私边界; recovery=compensating; complete=yes; self-contained=yes; AC=7/8; VER=7/8; landing=3; prod-files=7; scope=M; deps=UID-02,DEP-UID-01,DEP-UID-03,DEP-UID-04; writeset=序列化于 UID-02; release=independent; split-from=N/A; exception=N/A`
+**Granularity:** `type=implementation; axis=Sessions 真实会话投影与隐私边界; recovery=compensating; complete=yes; self-contained=yes; AC=7/8; VER=7/8; landing=5; prod-files=14; scope=L-exception:EX-UID-03-01; deps=UID-02,DEP-UID-01,DEP-UID-03,DEP-UID-04; writeset=序列化于 UID-02; release=independent; split-from=N/A; exception=EX-UID-03-01`
 
 ### Task UID-04: Operations 操作日志真实投影
 
@@ -934,7 +939,7 @@
 |---|---|---|---|---|
 | `UID-01` | `src/gui/mod.rs:30`、`src/utils/util.rs:1296`、`src/internal/db.rs:217`、`src/internal/db/schema.rs:381` | `src/gui/data/{mod,repo,worker,snapshot,state}.rs`、`src/gui/mod.rs`、`src/gui/desktop.rs` | `docs/commands/ui.md` EN+zh、开发文档、开发文档索引、`COMPATIBILITY.md`、网站 | `uid01_` 系列 (new) |
 | `UID-02` | `src/gui/screens/history.rs:20`、`:224`、`:95`、`sql/migrations/2026111601_capture_database.sql:329` | `src/command/agent/{session,mod}.rs`、`src/gui/data/history.rs`、`src/gui/screens/history.rs` | 同上 | `uid02_` 系列 (new) |
-| `UID-03` | `src/gui/model.rs:14`、`src/command/agent/session.rs:390`、`src/internal/ai/capture/store.rs:93` | `src/command/agent/{session,mod}.rs`、`src/gui/data/sessions.rs`、`src/gui/view.rs`、`src/gui/model.rs` | 同上（含 redaction 与过渡边界） | `uid03_` 系列 (new) |
+| `UID-03` | `src/gui/model.rs:14`、`src/command/agent/session.rs:390`、`src/internal/ai/capture/store.rs:93` | `src/command/agent/{session,mod,doctor,checkpoint}.rs`、`src/gui/data/{sessions,worker,snapshot}.rs`、`src/gui/{view,model,desktop}.rs`、`src/internal/ai/capture/{summary,catalog}.rs`、`src/internal/ai/checkpoint_reader.rs` | 同上（含 redaction 与过渡边界） | `uid03_` 系列 (new) |
 | `UID-04` | `src/command/op.rs:662`、`src/internal/operation/store.rs:757` | `src/command/op.rs`、`src/gui/data/operations.rs`、`src/gui/screens/operations.rs` | 同上（id 快照语义） | `uid04_` 系列 (new) |
 | `UID-05` | `src/internal/ai/memory/reader.rs:198`、`:319`、`:392` | `src/internal/ai/memory/reader.rs`、`src/gui/data/memory.rs`、`src/gui/screens/memory.rs` | 同上（stale 与 freshness 成本） | `uid05_` 系列 (new) |
 | `UID-06` | `src/internal/ai/review/mod.rs:6`、`src/internal/ai/review/store.rs:894`、`:1226` | `src/gui/data/runs.rs`、`src/gui/screens/reviews.rs`、`src/gui/screens/investigate.rs` | 同上（kind 校验与条目级状态） | `uid06_` 系列 (new) |
@@ -985,7 +990,7 @@
 |---|---|---|---|---|
 | 仓库上下文快照 | O(1) 存在性/scope 检查 | 每窗口一次 | ≤50ms | `UID-01` 单测 |
 | 提交历史列表 + 归属 | O(200 提交元数据 + 父链) + 一次批量归属查询 | 每次页面重读 | ≤150ms、200 行 | `UID-02` 单测 |
-| 会话列表/详情 | O(200 会话)、O(100 事件) | 每次页面重读 | ≤200ms / ≤100ms | `UID-03` 单测 |
+| 会话列表/详情 | O(200 会话)、O(100 事件) | 每次页面重读 | ≤200ms / ≤100ms（摘要富集共用 ≤3s 预算，超预算行降级） | `UID-03` 单测 |
 | operation 单页 | id 快照（≤50k id）+ 既有 ranked CTE 成本 | 每次翻页 | ≤150ms；≥10k operation 实测记录 | `UID-04` 单测 |
 | memory 单页 | O(200 选中 episode) + 选中集合子表 | 每次页面重读 | ≤150ms（**不含 freshness**）；freshness 成本由 `uid05_freshness_cost_measured` 实测并记入本行（≥10k episode/≥50k link） | `UID-05` 单测 |
 | run 列表/详情 | metadata ≤5000 + state 解析 ≤500 × ≤64 KiB | 每次页面重读 | ≤400ms / ≤50ms、100 行 | `UID-06` 单测 |

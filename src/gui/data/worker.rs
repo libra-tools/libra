@@ -38,6 +38,12 @@ pub struct ReadOutcome {
     pub history: Vec<super::history::HistoryRow>,
     /// History-specific failure while the context itself is available.
     pub history_error: Option<String>,
+    /// Captured sessions for the Sessions surface.
+    pub sessions: Vec<super::sessions::SessionRow>,
+    /// Sessions-specific failure while the context itself is available.
+    pub sessions_error: Option<String>,
+    /// The typed Sessions source state (absent, available, corrupt, …).
+    pub sessions_state: SourceState,
 }
 
 impl ReadOutcome {
@@ -49,6 +55,9 @@ impl ReadOutcome {
             message,
             history: Vec::new(),
             history_error: None,
+            sessions: Vec::new(),
+            sessions_error: None,
+            sessions_state: SourceState::Stale,
         }
     }
 }
@@ -100,6 +109,21 @@ impl DataHandle {
                     )),
                     Some(scope) => match repo::read_context(&scope).await {
                         Ok(context) => {
+                            // Sessions are read independently of History so one
+                            // surface's failure never hides the other.
+                            let sessions_outcome = super::sessions::read_sessions(&scope).await;
+                            let (sessions_read, sessions_error) = match sessions_outcome {
+                                Ok(read) => (read, None),
+                                Err(error) => (
+                                    super::sessions::SessionsRead {
+                                        state: error.state,
+                                        rows: Vec::new(),
+                                    },
+                                    Some(error.message),
+                                ),
+                            };
+                            let sessions = sessions_read.rows;
+                            let sessions_state = sessions_read.state;
                             let head_oid = context.head_oid.clone();
                             let history = match super::history::read_history(&scope, head_oid).await
                             {
@@ -114,6 +138,9 @@ impl DataHandle {
                                         message: None,
                                         history: Vec::new(),
                                         history_error: Some(error.message),
+                                        sessions,
+                                        sessions_error,
+                                        sessions_state,
                                     });
                                 }
                             };
@@ -123,6 +150,9 @@ impl DataHandle {
                                 message: None,
                                 history,
                                 history_error: None,
+                                sessions,
+                                sessions_error,
+                                sessions_state,
                             })
                         }
                         Err(error) => Ok(ReadOutcome::new(error.state, None, Some(error.message))),
@@ -179,6 +209,9 @@ impl DataHandle {
                     message: Some(format!("the data worker could not start: {error}")),
                     history: Vec::new(),
                     history_error: None,
+                    sessions: Vec::new(),
+                    sessions_error: None,
+                    sessions_state: SourceState::Stale,
                 });
                 shared.done = true;
                 cv.notify_all();
@@ -369,14 +402,20 @@ fn worker_loop(inner: Arc<(Mutex<Shared>, Condvar)>, reads: Arc<AtomicU64>, read
                     message: outcome.message,
                     history: outcome.history,
                     history_error: outcome.history_error,
+                    sessions: outcome.sessions,
+                    sessions_error: outcome.sessions_error,
+                    sessions_state: outcome.sessions_state,
                 },
                 Err(error) => Snapshot {
                     seq,
-                    state: error.state,
+                    state: error.state.clone(),
                     context: None,
                     message: Some(error.message),
                     history: Vec::new(),
                     history_error: None,
+                    sessions: Vec::new(),
+                    sessions_error: None,
+                    sessions_state: error.state,
                 },
             };
             let (lock, _) = &*inner;
@@ -411,6 +450,9 @@ fn finish_with_error(inner: &Arc<(Mutex<Shared>, Condvar)>, message: String) {
         message: Some(message),
         history: Vec::new(),
         history_error: None,
+        sessions: Vec::new(),
+        sessions_error: None,
+        sessions_state: SourceState::Stale,
     });
     shared.done = true;
     cv.notify_all();

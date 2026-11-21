@@ -1,7 +1,8 @@
 //! Sessions window laid out like the sessions prototype.
 //!
 //! The top bar, session list, and Overview / Conversation / Changes views are
-//! interactive. The rows are the bundled mock catalog, not a live repository.
+//! interactive. The rows are real captured sessions read from the read-only
+//! capture catalog; the capability map stays catalog-backed.
 
 use std::collections::HashSet;
 
@@ -18,7 +19,10 @@ use gpui::{
     SharedString, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
 };
 
-use super::model::{self, Catalog, Event, Session, clock, date_bucket};
+use super::{
+    data::{SessionRow, SourceState},
+    model::{self, Catalog, CommitRecord, Event, Session, Usage, clock, date_bucket},
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Pane {
@@ -69,6 +73,10 @@ pub struct SessionsWindow {
     statuses: Vec<String>,
     selected: String,
     expanded: HashSet<String>,
+    catalog: Option<Catalog>,
+    error: Option<String>,
+    source_state: Option<SourceState>,
+    readable_only: bool,
 }
 
 impl SessionsWindow {
@@ -94,23 +102,143 @@ impl SessionsWindow {
             agents: Vec::new(),
             dates: Vec::new(),
             statuses: Vec::new(),
-            selected: "s-cc-arch".into(),
+            selected: String::new(),
             expanded: HashSet::new(),
+            catalog: None,
+            error: None,
+            source_state: None,
+            readable_only: false,
         }
     }
 
-    fn catalog(&self) -> Result<&'static Catalog, &'static str> {
-        match model::catalog() {
-            Ok(catalog) => Ok(catalog),
-            Err(error) => Err(error.as_str()),
+    /// Install the real sessions read by the window worker.
+    pub fn set_catalog(
+        &mut self,
+        catalog: Catalog,
+        error: Option<String>,
+        source_state: Option<SourceState>,
+        cx: &mut Context<Self>,
+    ) {
+        self.selected = select_session(&self.selected, &catalog);
+        self.catalog = Some(catalog);
+        self.error = error;
+        self.source_state = source_state;
+        cx.notify();
+    }
+
+    fn catalog(&self) -> Result<&Catalog, &'static str> {
+        match self.catalog.as_ref() {
+            Some(catalog) => Ok(catalog),
+            None => Err("Sessions are loading from the capture catalog"),
         }
     }
+}
+
+/// Map real captured rows onto the sessions surface. Missing optional fields
+/// stay empty instead of being invented; the capability map stays catalog-backed
+/// elsewhere and is empty here.
+pub fn catalog_from_sessions(rows: &[SessionRow], capabilities: Vec<model::Capability>) -> Catalog {
+    let sessions = rows
+        .iter()
+        .map(|row| {
+            let start = stamp(row.started_at);
+            let end = row.stopped_at.map(stamp).unwrap_or_else(|| "—".to_string());
+            let commits: Vec<CommitRecord> = row
+                .commits
+                .iter()
+                .map(|sha| CommitRecord {
+                    sha: sha.clone(),
+                    message: String::new(),
+                    kind: "linked commit".into(),
+                })
+                .collect();
+            let evidence = if commits.is_empty() {
+                "—".to_string()
+            } else {
+                format!("{} linked commit(s)", commits.len())
+            };
+            Session {
+                id: row.id.clone(),
+                agent: row.agent.clone(),
+                title: row
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| format!("Session {}", short_id(&row.id))),
+                summary: row.summary.clone(),
+                summary_source: "captured".into(),
+                model: row.model.clone().unwrap_or_else(|| "—".into()),
+                start,
+                end,
+                worktree: row.workdir_label.clone(),
+                head: "—".into(),
+                running_label: row.state.clone(),
+                capture: row.state.clone(),
+                capture_label: format!("{} checkpoint(s)", row.checkpoints),
+                readable_label: format!(
+                    "{} · {}",
+                    if row.readable {
+                        "readable content"
+                    } else {
+                        "no readable content"
+                    },
+                    row.summary_status
+                ),
+                evidence,
+                readable: row.readable,
+                usage: Usage {
+                    input: number(row.usage_input),
+                    output: number(row.usage_output),
+                    calls: number(row.usage_calls),
+                    reasoning: "—".into(),
+                    cost_note: format!("{} checkpoint(s)", row.checkpoints),
+                },
+                verification: Vec::new(),
+                files: Vec::new(),
+                commits,
+                ai_summary: Vec::new(),
+                turns: Vec::new(),
+            }
+        })
+        .collect();
+    Catalog {
+        today: chrono::Utc::now().format("%Y-%m-%d").to_string(),
+        sessions,
+        capability_map: capabilities,
+    }
+}
+
+fn stamp(epoch: i64) -> String {
+    if epoch <= 0 {
+        return "—".into();
+    }
+    chrono::DateTime::<chrono::Utc>::from_timestamp(epoch, 0)
+        .map(|value| value.format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_else(|| "—".into())
+}
+
+fn number(value: Option<i64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "—".into())
+}
+
+fn short_id(id: &str) -> String {
+    id.chars().take(8).collect()
 }
 
 impl Render for SessionsWindow {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors.clone();
         let this = cx.entity();
+        if self.selected.is_empty()
+            && let Some(id) = self
+                .catalog
+                .as_ref()
+                .and_then(|catalog| catalog.sessions.first())
+                .map(|session| session.id.clone())
+        {
+            self.selected = id;
+        }
         let catalog = match self.catalog() {
             Ok(catalog) => catalog,
             Err(error) => {
@@ -130,9 +258,6 @@ impl Render for SessionsWindow {
             .copied()
             .find(|session| session.id == self.selected)
             .or_else(|| visible.first().copied());
-        if let Some(selected) = selected {
-            self.selected = selected.id.clone();
-        }
         let capture = selected
             .map(|session| session.capture_label.as_str())
             .unwrap_or("Capture status");
@@ -254,7 +379,7 @@ fn sidebar(
     this: Entity<SessionsWindow>,
     colors: &ely_gpui_component::theme::Palette,
 ) -> impl IntoElement {
-    let filters = filter_choices();
+    let filters = filter_choices(catalog);
     let selected_filters = selected_filters(window);
     div()
         .w(px(300.0))
@@ -279,6 +404,8 @@ fn sidebar(
                                 window.agents = take_prefix(&values, "agent:");
                                 window.dates = take_prefix(&values, "date:");
                                 window.statuses = take_prefix(&values, "status:");
+                                window.readable_only =
+                                    values.iter().any(|value| value == "readable:readable");
                                 cx.notify();
                             });
                         }
@@ -323,10 +450,11 @@ fn main_column(
     colors: &ely_gpui_component::theme::Palette,
 ) -> impl IntoElement {
     let Some(session) = session else {
+        let message = sessions_message(window.source_state.as_ref(), window.error.as_deref());
         return div()
             .flex_1()
             .p_8()
-            .child(Paragraph::new("No sessions match the current scope."))
+            .child(Paragraph::new(message))
             .into_any_element();
     };
     div()
@@ -488,7 +616,7 @@ fn overview(
                 .child(status_card(
                     "Is the session still running?",
                     &session.running_label,
-                    &format!("Ended at {}", clock(&session.end)),
+                    &end_label(session),
                     colors,
                 ))
                 .child(status_card(
@@ -921,7 +1049,7 @@ fn search_results(
     colors: &ely_gpui_component::theme::Palette,
 ) -> impl IntoElement {
     let query = window.query.trim().to_lowercase();
-    let hits = search_hits(catalog, window, &query);
+    let hits = search_hits(catalog, &window.worktree, &query);
     div()
         .id("search-results")
         .absolute()
@@ -1260,27 +1388,40 @@ fn toggle(window: &mut SessionsWindow, key: String) {
     }
 }
 
+/// The production Sessions filter predicate, shared by rendering and tests.
+pub(crate) fn passes_filters(
+    session: &Session,
+    worktree: &str,
+    agents: &[String],
+    dates: &[String],
+    statuses: &[String],
+    readable_only: bool,
+    today: &str,
+) -> bool {
+    (worktree == "all" || session.worktree == worktree)
+        && (agents.is_empty() || agents.iter().any(|agent| session.agent.starts_with(agent)))
+        && (dates.is_empty()
+            || dates
+                .iter()
+                .any(|date| date_bucket(&session.start, today) == date))
+        && (!readable_only || session.readable)
+        && (statuses.is_empty() || statuses.iter().any(|status| status == &session.capture))
+}
+
 fn visible_sessions<'a>(catalog: &'a Catalog, window: &SessionsWindow) -> Vec<&'a Session> {
     catalog
         .sessions
         .iter()
         .filter(|session| {
-            (window.worktree == "all" || session.worktree == window.worktree)
-                && (window.agents.is_empty()
-                    || window
-                        .agents
-                        .iter()
-                        .any(|agent| session.agent.starts_with(agent)))
-                && (window.dates.is_empty()
-                    || window
-                        .dates
-                        .iter()
-                        .any(|date| date_bucket(&session.start, &catalog.today) == date))
-                && (window.statuses.is_empty()
-                    || window
-                        .statuses
-                        .iter()
-                        .any(|status| status == &session.capture))
+            passes_filters(
+                session,
+                &window.worktree,
+                &window.agents,
+                &window.dates,
+                &window.statuses,
+                window.readable_only,
+                &catalog.today,
+            )
         })
         .collect()
 }
@@ -1318,23 +1459,88 @@ fn worktree_choices(catalog: &Catalog) -> Vec<Choice> {
     choices
 }
 
-fn filter_choices() -> Vec<Choice> {
-    [
+/// The running-state detail line: the session STATE decides whether it is
+/// still running, never the presence of an end timestamp (quarantined or
+/// stale rows can clear or keep it independently).
+pub(crate) fn end_label(session: &Session) -> String {
+    if session.running_label == "active" {
+        "Still running".to_string()
+    } else if session.end == "—" {
+        "No recorded end".to_string()
+    } else {
+        format!("Ended at {}", clock(&session.end))
+    }
+}
+
+/// Selection is kept across refreshes while its row still exists.
+pub(crate) fn select_session(current: &str, catalog: &Catalog) -> String {
+    if catalog.sessions.iter().any(|session| session.id == current) {
+        current.to_string()
+    } else {
+        catalog
+            .sessions
+            .first()
+            .map(|session| session.id.clone())
+            .unwrap_or_default()
+    }
+}
+
+/// The empty-state message for a Sessions source state.
+pub(crate) fn sessions_message(state: Option<&SourceState>, error: Option<&str>) -> String {
+    match state {
+        Some(SourceState::Absent) => {
+            "No captured sessions yet: this repository has no capture catalog.".to_string()
+        }
+        Some(SourceState::Stale) => "Sessions were not checked yet.".to_string(),
+        Some(state) if !state.is_available() => format!(
+            "Sessions source is {}: {} ({})",
+            state.label(),
+            source_hint(state),
+            error.unwrap_or("no detail")
+        ),
+        _ => error
+            .map(str::to_string)
+            .unwrap_or_else(|| "No sessions match the current scope.".to_string()),
+    }
+}
+
+fn source_hint(state: &SourceState) -> &'static str {
+    match state {
+        SourceState::Busy => "the capture catalog is locked; retry shortly",
+        SourceState::SchemaOld => "run `libra agent doctor`, then retry",
+        SourceState::SchemaNew => "upgrade Libra to read this catalog",
+        SourceState::Unreadable { .. } => "check the capture file and its permissions",
+        SourceState::Corrupt => "run `libra agent doctor`",
+        _ => "retry after the source becomes available",
+    }
+}
+
+pub(crate) fn filter_choices(catalog: &Catalog) -> Vec<Choice> {
+    let mut choices: Vec<Choice> = [
         ("agent:Claude Code", "Claude Code"),
         ("agent:Codex", "Codex"),
         ("agent:OpenCode", "OpenCode"),
         ("date:today", "Today"),
         ("date:yesterday", "Yesterday"),
         ("date:earlier", "Earlier"),
-        ("status:complete", "Capture complete"),
-        ("status:finalize_pending", "Finalize pending"),
-        ("status:oc_partial", "Coverage partial"),
-        ("status:partial", "Incomplete"),
-        ("status:metadata_only", "Metadata only"),
+        ("readable:readable", "Readable content"),
     ]
     .into_iter()
     .map(|(value, label)| Choice::new(value, label))
-    .collect()
+    .collect();
+    // Status chips reflect the statuses actually present, so selecting one
+    // never empties the list.
+    let mut seen = HashSet::new();
+    for session in &catalog.sessions {
+        if session.capture.is_empty() || !seen.insert(session.capture.clone()) {
+            continue;
+        }
+        choices.push(Choice::new(
+            format!("status:{}", session.capture),
+            session.capture.clone(),
+        ));
+    }
+    choices
 }
 
 fn selected_filters(window: &SessionsWindow) -> Vec<SharedString> {
@@ -1354,6 +1560,11 @@ fn selected_filters(window: &SessionsWindow) -> Vec<SharedString> {
                 .iter()
                 .map(|status| SharedString::from(format!("status:{status}"))),
         )
+        .chain(
+            window
+                .readable_only
+                .then(|| SharedString::from("readable:readable")),
+        )
         .collect()
 }
 
@@ -1364,13 +1575,14 @@ fn take_prefix(values: &[String], prefix: &str) -> Vec<String> {
         .collect()
 }
 
-struct Hit {
-    id: String,
-    title: String,
-    label: String,
+#[derive(Debug)]
+pub(crate) struct Hit {
+    pub(crate) id: String,
+    pub(crate) title: String,
+    pub(crate) label: String,
 }
 
-fn search_hits(catalog: &Catalog, window: &SessionsWindow, query: &str) -> Vec<Hit> {
+pub(crate) fn search_hits(catalog: &Catalog, worktree: &str, query: &str) -> Vec<Hit> {
     if query.is_empty() {
         return Vec::new();
     }
@@ -1378,7 +1590,7 @@ fn search_hits(catalog: &Catalog, window: &SessionsWindow, query: &str) -> Vec<H
     for session in catalog
         .sessions
         .iter()
-        .filter(|session| window.worktree == "all" || session.worktree == window.worktree)
+        .filter(|session| worktree == "all" || session.worktree == worktree)
     {
         push_hit(&mut hits, session, "Title", &session.title, query);
         push_hit(&mut hits, session, "Summary", &session.summary, query);

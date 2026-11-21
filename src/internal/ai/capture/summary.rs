@@ -21,11 +21,22 @@ use crate::internal::ai::{
     },
 };
 
+/// Why a summary could not be completed, kept separate from the view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SummaryErrorKind {
+    Budget,
+    Transient,
+    Corrupt,
+    /// A catalog-level failure (the source itself is unusable).
+    Catalog,
+}
+
 pub(crate) struct SessionSummaryRead {
     checkpoint: Option<CheckpointMetadataRead>,
     pending: bool,
     budget: CheckpointReadBudget,
     session_id: String,
+    agent_kind: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -67,6 +78,18 @@ impl SessionSummaryRead {
     ) -> anyhow::Result<Self> {
         let budget =
             CheckpointReadBudget::new(Instant::now() + Duration::from_secs(1), Arc::new(|| false));
+        Self::prepare_for(txn, storage, session_id, "codex", budget).await
+    }
+
+    /// Prepare with an explicit agent kind and a caller-shared read budget, so
+    /// a page of sessions cannot outlive one bounded read window.
+    pub(crate) async fn prepare_for(
+        txn: &DatabaseTransaction,
+        storage: &Path,
+        session_id: &str,
+        agent_kind: &str,
+        budget: CheckpointReadBudget,
+    ) -> anyhow::Result<Self> {
         let pending = CaptureCatalogStore::session_summary_is_pending(txn, session_id).await?;
         let checkpoint =
             latest_session_metadata_in_snapshot(txn, storage, session_id, &budget).await?;
@@ -75,17 +98,31 @@ impl SessionSummaryRead {
             pending,
             budget,
             session_id: session_id.to_owned(),
+            agent_kind: agent_kind.to_owned(),
         })
     }
 
     /// The database transaction has ended before the immutable object read.
     pub(crate) async fn finish(self) -> SessionSummaryView {
+        self.finish_result()
+            .await
+            .unwrap_or_else(|_| SessionSummaryView::unavailable())
+    }
+
+    /// Like [`Self::finish`], but preserves whether the failure was a bounded
+    /// read timeout or an integrity problem so callers can classify it.
+    pub(crate) async fn finish_result(self) -> Result<SessionSummaryView, SummaryErrorKind> {
         let pending = self.pending;
         let Some(checkpoint) = self.checkpoint else {
-            return SessionSummaryView::empty(if pending { "pending" } else { "unknown" });
+            return Ok(SessionSummaryView::empty(if pending {
+                "pending"
+            } else {
+                "unknown"
+            }));
         };
         let id = checkpoint.checkpoint_id().to_owned();
         let session = self.session_id;
+        let agent_kind = self.agent_kind;
         let result = tokio::task::spawn_blocking(move || {
             let bytes = checkpoint.read(&self.budget)?;
             parse_canon_value(&bytes)
@@ -94,7 +131,7 @@ impl SessionSummaryRead {
             for (field, expected) in [
                 ("checkpoint_id", id.as_str()),
                 ("session_id", session.as_str()),
-                ("agent_kind", "codex"),
+                ("agent_kind", agent_kind.as_str()),
             ] {
                 if metadata.get(field).and_then(serde_json::Value::as_str) != Some(expected) {
                     anyhow::bail!("summary metadata identity is inconsistent");
@@ -124,8 +161,28 @@ impl SessionSummaryRead {
         })
         .await;
         match result {
-            Ok(Ok(view)) => view,
-            _ => SessionSummaryView::unavailable(),
+            Ok(Ok(view)) => Ok(view),
+            Ok(Err(error)) => {
+                if let Some(reader) = error
+                    .downcast_ref::<crate::internal::ai::checkpoint_reader::CheckpointReaderError>(
+                ) {
+                    Err(match reader {
+                        crate::internal::ai::checkpoint_reader::CheckpointReaderError::Budget => {
+                            SummaryErrorKind::Budget
+                        }
+                        crate::internal::ai::checkpoint_reader::CheckpointReaderError::CatalogUnavailable
+                        | crate::internal::ai::checkpoint_reader::CheckpointReaderError::CatalogBusy => {
+                            SummaryErrorKind::Catalog
+                        }
+                        _ => SummaryErrorKind::Corrupt,
+                    })
+                } else if error.to_string().contains("budget") {
+                    Err(SummaryErrorKind::Budget)
+                } else {
+                    Err(SummaryErrorKind::Corrupt)
+                }
+            }
+            Err(_) => Err(SummaryErrorKind::Corrupt),
         }
     }
 }

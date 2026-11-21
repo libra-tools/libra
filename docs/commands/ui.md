@@ -42,10 +42,13 @@ This is an interface preview based on the supplied desktop design. The window
 reads the current working directory's repository **read-only**: the context bar shows
 the working-tree folder name, storage label, branch, HEAD and object format, and the read
 never creates operation rows, upgrades the schema or takes a writer boundary.
-All records outside the context bar, History's commit list and its attribution
-filters are bundled demonstration data. Inside History, the inspector's prompt,
-session, tool and checkpoint details are sample content; only the commit
-metadata and attribution counts are real. Navigation, selection, tabs and theme changes are local
+The context bar, History's commit list and attribution filters, and the Sessions
+list are real. Sessions come from the read-only capture catalog (filtered to this
+worktree/workspace scope, newest first, capped at 200 rows); model and usage fields may be
+absent, summaries are redacted before rendering, and a repository without capture
+shows an empty state. Inside History, the inspector's prompt, session, tool and
+checkpoint details are sample content; only the commit metadata and attribution
+counts are real. Navigation, selection, tabs and theme changes are local
 UI interactions. Repository, agent, trust,
 restore, network and account actions do not execute. These actions show a preview notice. Views other than History carry a
 **Design preview** label in the global navigation bar. Close the window or

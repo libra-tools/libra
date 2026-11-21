@@ -44,6 +44,8 @@ pub(crate) enum CheckpointReaderError {
         "checkpoint catalog is unavailable; retry after the repository writer finishes, or run `libra agent doctor`"
     )]
     CatalogUnavailable,
+    #[error("checkpoint catalog is busy; retry shortly")]
+    CatalogBusy,
     #[error(
         "checkpoint layout cannot be proved; run `libra agent doctor` and select a captured checkpoint"
     )]
@@ -1498,6 +1500,21 @@ pub(crate) async fn load_checkpoint_catalog(
     result
 }
 
+fn classify_catalog_io(message: &str) -> CheckpointReaderError {
+    let normalized = message.to_lowercase();
+    let transient = normalized.contains("locked")
+        || normalized.contains("busy")
+        || normalized.contains("timeout")
+        || normalized.contains("timed out")
+        || normalized.contains("timedout")
+        || normalized.contains("pooltimedout");
+    if transient {
+        CheckpointReaderError::CatalogBusy
+    } else {
+        CheckpointReaderError::CatalogUnavailable
+    }
+}
+
 async fn repository_object_format(storage: &Path) -> ReaderResult<(Option<String>, Option<i64>)> {
     use sea_orm::{ConnectionTrait, Statement};
 
@@ -1510,7 +1527,7 @@ async fn repository_object_format(storage: &Path) -> ReaderResult<(Option<String
         Duration::from_millis(200),
     )
     .await
-    .map_err(|_| CheckpointReaderError::CatalogUnavailable)?;
+    .map_err(|error| classify_catalog_io(&error.to_string()))?;
     let row = conn
         .query_one_raw(Statement::from_string(
             conn.get_database_backend(),
@@ -1519,7 +1536,7 @@ async fn repository_object_format(storage: &Path) -> ReaderResult<(Option<String
                 .to_owned(),
         ))
         .await
-        .map_err(|_| CheckpointReaderError::CatalogUnavailable)?;
+        .map_err(|error| classify_catalog_io(&error.to_string()))?;
     let Some(row) = row else {
         return Ok((None, None));
     };
@@ -3301,6 +3318,39 @@ mod tests {
         assert!(matches!(
             input.read_ordinary_file(0, 1024, &cancelled),
             Err(CheckpointReaderError::Budget)
+        ));
+    }
+}
+
+#[cfg(test)]
+mod catalog_io_classification_tests {
+    use super::{CheckpointReaderError, classify_catalog_io};
+
+    #[test]
+    fn timeout_and_lock_wording_is_transient() {
+        for wording in [
+            "Connection pool timed out while acquiring a connection",
+            "database is LOCKED",
+            "SqlxError(PoolTimedOut)",
+            "pooltimedout",
+            "timedout",
+            "connection busy",
+        ] {
+            assert!(
+                matches!(
+                    classify_catalog_io(wording),
+                    CheckpointReaderError::CatalogBusy
+                ),
+                "{wording} must be transient"
+            );
+        }
+        assert!(matches!(
+            classify_catalog_io("checkpoint object identity is inconsistent"),
+            CheckpointReaderError::CatalogUnavailable
+        ));
+        assert!(matches!(
+            classify_catalog_io("no such table"),
+            CheckpointReaderError::CatalogUnavailable
         ));
     }
 }

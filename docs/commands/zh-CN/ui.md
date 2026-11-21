@@ -37,7 +37,7 @@ Sessions 支持浅色／深色、可读内容搜索和本地筛选。表单输�
 主题切换仅改变界面状态；仓库、Agent、信任、恢复、网络和账户操作不会执行。
 Logo 来自官网，字体和图片内置，离线可用。当前以 macOS 为验证平台。
 未接入的操作会显示预览提示；除 History 外的视图在全局导航栏显示 **Design preview** 标记。
-除顶部上下文、History 提交列表与归属筛选外，其余记录均为内置演示数据。History 检查器里的 prompt、session、tool 与 checkpoint 细节是示例内容，只有提交元数据与归属计数是真实数据。
+顶部上下文、History 提交列表与归属筛选、以及 Sessions 列表均为真实数据：Sessions 来自只读 capture 目录（按当前 worktree/workspace scope 过滤、按时间倒序、最多 200 行），模型与用量字段可能缺失，摘要先脱敏再渲染，没有 capture 的仓库显示空列表。History 检查器里的 prompt、session、tool 与 checkpoint 细节仍是示例内容，只有提交元数据与归属计数是真实数据。
 关闭窗口或按 `⌘Q` 退出；`Esc` 关闭命令面板。
 
 此命令只读当前仓库，不写入仓库。仓库外启动时窗口显示明确的“未创建/未打开仓库”

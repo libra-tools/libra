@@ -2397,9 +2397,28 @@ pub(crate) enum CaptureCatalogError {
     CommitFailed,
     #[error("capture catalog database operation failed")]
     Database,
+    #[error("capture catalog database is busy; retry shortly")]
+    DatabaseBusy,
     #[allow(dead_code)] // Test-only in-memory port poison path.
     #[error("capture catalog fake store state is unavailable")]
     FakeStoreUnavailable,
+}
+
+/// Shared database-error classification for catalog reads: contention and
+/// timeouts are transient, anything else is a plain database failure.
+fn classify_database_message(message: &str) -> CaptureCatalogError {
+    let normalized = message.to_lowercase();
+    let transient = normalized.contains("locked")
+        || normalized.contains("busy")
+        || normalized.contains("timeout")
+        || normalized.contains("timed out")
+        || normalized.contains("timedout")
+        || normalized.contains("pooltimedout");
+    if transient {
+        CaptureCatalogError::DatabaseBusy
+    } else {
+        CaptureCatalogError::Database
+    }
 }
 
 /// The narrow port consumed by a future coordinator. It is deliberately
@@ -3439,7 +3458,7 @@ impl CaptureCatalogStore {
                 EXISTS(SELECT 1 FROM agent_import_identity i WHERE i.agent_kind=s.agent_kind AND i.provider_session_id=s.provider_session_id AND i.state IN ('leased','writing')) AS importing \
                 FROM agent_session s WHERE session_id=? LIMIT 1"),
             [session_id.into()],
-        )).await.map_err(|_| CaptureCatalogError::Database)?.ok_or(CaptureCatalogError::InvalidRequest)?;
+        )).await.map_err(|error| classify_database_message(&error.to_string()))?.ok_or(CaptureCatalogError::InvalidRequest)?;
         let metadata: String = row
             .try_get_by("metadata_json")
             .map_err(|_| CaptureCatalogError::MalformedReceiptLedger)?;
@@ -9497,6 +9516,34 @@ fn insert_fake_receipt(
         StoredReceiptStatus::Pending => CaptureReceiptDisposition::Pending,
         StoredReceiptStatus::Complete => CaptureReceiptDisposition::Complete,
     })
+}
+
+#[cfg(test)]
+mod database_classification_tests {
+    use super::{CaptureCatalogError, classify_database_message};
+
+    #[test]
+    fn contention_and_timeouts_are_busy() {
+        for wording in [
+            "database is LOCKED",
+            "connection busy",
+            "Connection pool timed out",
+            "SqlxError(PoolTimedOut)",
+            "pooltimedout",
+        ] {
+            assert!(
+                matches!(
+                    classify_database_message(wording),
+                    CaptureCatalogError::DatabaseBusy
+                ),
+                "{wording} must be transient"
+            );
+        }
+        assert!(matches!(
+            classify_database_message("no such table: agent_checkpoint"),
+            CaptureCatalogError::Database
+        ));
+    }
 }
 
 #[cfg(test)]

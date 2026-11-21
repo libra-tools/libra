@@ -634,7 +634,8 @@ async fn collect_codex_reconciliation(
                         Ok(checkpoint) => checkpoint,
                         Err(
                             error @ (CheckpointReaderError::Budget
-                            | CheckpointReaderError::CatalogUnavailable),
+                            | CheckpointReaderError::CatalogUnavailable
+                            | CheckpointReaderError::CatalogBusy),
                         ) => return Err(error.into()),
                         Err(_) => {
                             state = ReconciliationCatalogState::Unknown;

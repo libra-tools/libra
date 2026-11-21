@@ -42,6 +42,8 @@ pub struct Session {
     pub capture_label: String,
     pub readable_label: String,
     pub evidence: String,
+    #[serde(default)]
+    pub readable: bool,
     pub usage: Usage,
     pub verification: Vec<Verification>,
     pub files: Vec<FileRecord>,
@@ -177,7 +179,8 @@ fn civil_from_days(days: i32) -> (i32, u32, u32) {
 
 /// Clock `HH:MM` from an ISO local timestamp.
 pub fn clock(iso: &str) -> &str {
-    iso.get(11..16).unwrap_or("")
+    // A missing value ("—") must render as itself, not as an empty string.
+    iso.get(11..16).unwrap_or(iso)
 }
 
 #[cfg(test)]

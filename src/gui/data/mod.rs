@@ -7,12 +7,14 @@
 
 mod history;
 mod repo;
+mod sessions;
 mod snapshot;
 mod state;
 mod worker;
 
 pub use history::{AttributionFilter, HistoryRow, age_label};
 pub use repo::READ_BUSY_TIMEOUT;
+pub use sessions::{SESSION_ROW_CAP, SessionRow, clock_from_epoch};
 pub use snapshot::{DataError, RepoContext, Snapshot};
 pub use state::{ProbeOutcome, SourceState};
 pub use worker::{CLOSE_BUDGET, DataHandle, QUEUE_CAP, ReadOutcome};

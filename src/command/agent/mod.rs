@@ -46,7 +46,7 @@ pub mod review;
 pub mod investigate;
 mod rpc;
 mod session;
-pub(crate) use session::{CommitAttribution, commit_attribution_batch};
+pub(crate) use session::{CommitAttribution, SESSION_PAGE_COLUMNS, commit_attribution_batch};
 mod skill;
 mod status;
 

@@ -98,6 +98,9 @@ impl From<crate::internal::ai::checkpoint_reader::CheckpointReaderError> for Cli
                     "checkpoint catalog is unavailable; retry after the repository writer finishes, or run `libra agent doctor`",
                 )
             }
+            crate::internal::ai::checkpoint_reader::CheckpointReaderError::CatalogBusy => {
+                Self::fatal("checkpoint catalog is busy; retry shortly")
+            }
             error => Self::fatal(error.to_string())
                 .with_stable_code(StableErrorCode::AgentCheckpointStoreInconsistent),
         }
