@@ -1649,7 +1649,7 @@ PY
 ### Task CL-19: 实现 promisor 缺失对象读取触发按需 lazy fetch（#754）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `in-progress` / `locally-accepted`（2026-11-20：已实现 `fetch::lazy_fetch_object`——读 `extensions.partialClone` → `remote.<name>.url` → 本地/Git/bundle 客户端 `fetch_objects(&[], [oid], …)` → `read_fetch_stream_for_kind` + `write_pack_and_index` 落地；`command::load_object` 在缺失对象时用专用 runtime 线程阻塞桥接调用，`LIBRA_TEST=1` 时打印 `libra-test: lazy-fetch want=1`，`ReadPolicy::LocalOnly`（`--offline`）直接跳过。`clone_test` 61/61 无回归。**AC1–AC5 用例尚未跑通**：夹具需要「引用指向缺失对象」，而 `update-ref` 拒绝指向不存在对象、`clone --no-local` 的对象在 pack 内；下一轮需用「复制 pack 后按 pack 索引移除单个对象」或直接写 `reference` 行来构造。未验证前不转 `done`。)
 **Description:** 自 `CL-13` 拆出并前置至 `CL-12`/`CL-13` 之前：在对象读取与存储回退层（`src/utils/storage/local.rs`、`src/utils/object_ext.rs`、`src/command/fetch.rs`、`src/internal/protocol/local_client.rs`、`src/command/cat_file.rs`）实现 promisor 按 `extensions.partialClone` / `remote.<name>.promisor=true` 按需拉取单对象（按 OID；取回的对象按内容计算 OID 后写入对象库，天然以 OID 寻址；复用现有 `LocalClient` 与 `ProtocolClient` 传输接口），使 `libra cat-file -p <rev>:<path>` 在预置 promisor 夹具中自动 lazy fetch 缺失对象（进度输出由 `CL-21` 交付），且在 `--offline` 或 `LIBRA_READ_POLICY=local` 下 fail-closed 不发起网络请求；本卡新增测试接缝 `LIBRA_TEST_TRACE_LAZY_FETCH`（仅 `LIBRA_TEST=1` 时读取，每次发起按需拉取请求前向 stderr 写一行 `libra-test: lazy-fetch want=<n>`），供 AC6/AC8 与 `CL-20` 观测拉取次数。
 **Out of scope:** `clone --filter` CLI 解析与写入 promisor 配置（`CL-13`）。
 **Current evidence:**

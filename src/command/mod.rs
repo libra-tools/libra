@@ -255,8 +255,53 @@ where
     // Cheap no-op when no replacements exist.
     let hash = replace::resolve(*hash);
     let storage = util::try_objects_storage().map_err(GitError::IOError)?;
-    let data = storage.get(&hash)?;
+    let data = match storage.get(&hash) {
+        Ok(data) => data,
+        Err(error) => match lazy_fetch_missing_object(&hash) {
+            Some(data) => data,
+            None => return Err(error),
+        },
+    };
     T::from_bytes(&data.to_vec(), hash)
+}
+
+/// Promisor lazy fetch: when `extensions.partialClone` names a remote and the
+/// object is missing locally, fetch that single object and persist it.
+///
+/// `load_object` is synchronous, so the async fetch runs on a dedicated
+/// runtime thread. Under `LIBRA_TEST=1` the seam line
+/// `libra-test: lazy-fetch want=<n>` is written to stderr.
+fn lazy_fetch_missing_object(hash: &ObjectHash) -> Option<Vec<u8>> {
+    if matches!(
+        crate::utils::read_policy::read_policy(),
+        crate::utils::read_policy::ReadPolicy::LocalOnly
+    ) {
+        return None;
+    }
+    let hash = *hash;
+    let fetched = std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .ok()?;
+                runtime
+                    .block_on(crate::command::fetch::lazy_fetch_object(&hash))
+                    .ok()
+            })
+            .join()
+            .ok()
+            .flatten()
+    })?;
+    if !fetched {
+        return None;
+    }
+    if std::env::var_os("LIBRA_TEST").is_some() {
+        eprintln!("libra-test: lazy-fetch want=1");
+    }
+    let storage = util::try_objects_storage().ok()?;
+    storage.get(&hash).ok()
 }
 
 /// RAW load: NO `refs/replace` substitution (plan-20260714 §C.4.1.1 process

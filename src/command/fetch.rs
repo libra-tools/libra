@@ -2426,6 +2426,61 @@ pub async fn fetch_repository_safe(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Fetch a single object on demand for a promisor (partial) clone.
+///
+/// Returns `Ok(true)` when the object was fetched and installed locally,
+/// `Ok(false)` when this repository is not a promisor clone (no
+/// `extensions.partialClone` configured).
+pub(crate) async fn lazy_fetch_object(oid: &ObjectHash) -> Result<bool, FetchError> {
+    let Some(remote_name) = ConfigKv::get("extensions.partialClone")
+        .await
+        .map_err(|error| FetchError::LocalState {
+            message: format!("failed to read extensions.partialClone: {error}"),
+        })?
+        .map(|entry| entry.value)
+    else {
+        return Ok(false);
+    };
+    let Some(remote) = ConfigKv::remote_config(&remote_name)
+        .await
+        .map_err(|error| FetchError::LocalState {
+            message: format!("failed to read remote.{remote_name}: {error}"),
+        })?
+    else {
+        return Ok(false);
+    };
+    let client =
+        RemoteClient::from_spec_with_remote_and_confirmation(&remote.url, Some(&remote_name), None)
+            .await
+            .map_err(|message| FetchError::LocalState { message })?;
+    let hash_kind = git_internal::hash::get_hash_kind();
+    let oid_hex = oid.to_string();
+    let want = [oid_hex.clone()];
+    // Local-style transports take the object id directly; HTTP/SSH would need
+    // a full capability negotiation and are not covered by the lazy path yet.
+    let mut stream = match &client {
+        RemoteClient::Local(inner) => inner.fetch_objects(&[], &want, &[], None).await,
+        RemoteClient::Git(inner) => inner.fetch_objects(&[], &want, &[], None).await,
+        RemoteClient::Bundle(inner) => inner.fetch_objects(&[], &want, &[], None).await,
+        RemoteClient::Http(_) | RemoteClient::Ssh(_) => return Ok(false),
+    }
+    .map_err(|error| FetchError::LocalState {
+        message: format!("lazy fetch of {oid_hex} failed: {error}"),
+    })?;
+    let data = read_fetch_stream_for_kind(
+        &mut stream,
+        &OutputConfig::default(),
+        "lazy-fetch",
+        hash_kind,
+    )
+    .await?;
+    if data.pack_data.is_empty() {
+        return Ok(false);
+    }
+    let _ = write_pack_and_index(&data.pack_data, hash_kind, &[]).await?;
+    Ok(true)
+}
+
 pub(crate) async fn fetch_repository_with_result(
     remote_config: RemoteConfig,
     branch: Option<String>,
