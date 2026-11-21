@@ -1285,7 +1285,7 @@ PY
 ### Task CL-10: 实现 `clone --reference` / `--reference-if-able` alternates 借用（#751）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`（2026-11-20 解除阻塞：`DEP-CL-04` 的两项前置 `FP-07`（默认远端回退）与 `FP-15`（`--prune` 候选范围）均已在 `main` 完成（`0.30.220` / `0.30.223`），整条 `FP-13 → FP-14 → FP-15` 串行链已交付；本卡与后续 clone 链恢复可开工。实现方案见下方勘察记录。）
+**Lifecycle / Acceptance:** `in-progress` / `locally-accepted`（2026-11-20：`--reference` / `--reference-if-able` 在 init 之后、fetch 之前把参考库对象目录登记为 `objects/info/alternates`（绝对路径）；`--reference-if-able` 路径缺失时静默跳过、不写该文件。新用例 `clone_reference_registers_the_object_alternate` 覆盖 AC1（alternates 指向 `<R>/.libra/objects`）与 AC5（缺失路径不登记）；`clone_test`+`fetch_test` **126/126 通过**。**剩余**：AC2/AC3（`objects_fetched == 0` 且目标自身对象数为 0）需要「跳过 fetch、由 `discovery.refs` 装配 tracking/本地引用与 HEAD」；AC4（经 alternates 可读）在 AC3 满足后自然成立。）
 **Description:** 复用既有 alternates 支持（`src/command/alternates.rs` 与 `clone.rs:1554-1735` `--shared` 注册逻辑）使 `--reference <ref>`（及 `--reference-if-able`）真正注册 `objects/info/alternates` 并在 `fetch` / 协商阶段借用参考库对象以跳过重复传输（并将过时测试 `test_clone_object_alternates_flags_are_noops` 重命名/重写为 `test_clone_reference_alternates_borrows_objects` 与 `test_clone_reference_if_able_and_invalid_repo`）。（按 G-09 自本卡拆出 `CL-18` 处理 `--dissociate`。）
 **Out of scope:** `--dissociate`（由 `CL-18` 承接）。
 **Current evidence:**

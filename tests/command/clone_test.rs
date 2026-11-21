@@ -4885,3 +4885,68 @@ fn storage_config_unresolved_fetch_stays_local_clone() {
     );
     assert!(output.status.success(), "{text}");
 }
+
+#[test]
+fn clone_reference_registers_the_object_alternate() {
+    use crate::command::{assert_cli_success, create_committed_repo_via_cli, run_libra_command};
+
+    let src = create_committed_repo_via_cli();
+    let root = tempdir().unwrap();
+    let reference = root.path().join("R");
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "clone",
+                src.path().to_str().expect("src"),
+                reference.to_str().expect("reference"),
+            ],
+            root.path(),
+        ),
+        "clone the reference repository",
+    );
+
+    // AC1: `--reference` records the reference's object store.
+    let d = root.path().join("d");
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "clone",
+                "--reference",
+                reference.to_str().expect("reference"),
+                &format!("file://{}", src.path().display()),
+                d.to_str().expect("dest"),
+            ],
+            root.path(),
+        ),
+        "clone --reference",
+    );
+    let alternates = std::fs::read_to_string(d.join(".libra/objects/info/alternates"))
+        .expect("the reference alternate is recorded");
+    let recorded = alternates.lines().next().expect("one alternate").trim();
+    assert_eq!(
+        std::fs::canonicalize(recorded).expect("canonical alternate"),
+        std::fs::canonicalize(reference.join(".libra/objects"))
+            .expect("canonical reference objects"),
+        "AC1: the alternate points at the reference object store"
+    );
+
+    // AC5: `--reference-if-able` with a missing path is a silent no-op.
+    let d2 = root.path().join("d2");
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "clone",
+                "--reference-if-able",
+                root.path().join("missing").to_str().expect("missing"),
+                &format!("file://{}", src.path().display()),
+                d2.to_str().expect("dest"),
+            ],
+            root.path(),
+        ),
+        "clone --reference-if-able with a missing path",
+    );
+    assert!(
+        !d2.join(".libra/objects/info/alternates").exists(),
+        "AC5: no alternate is registered for a missing reference"
+    );
+}

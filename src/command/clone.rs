@@ -1967,6 +1967,45 @@ async fn clone_into_destination(
         let _ = ConfigKv::add(key, value, false).await;
     }
 
+    // `--reference <R>` / `--reference-if-able <R>`: register the reference's
+    // object store as an alternate of the fresh clone so its objects can be
+    // borrowed. `--reference` requires the path to exist; `--reference-if-able`
+    // silently skips a missing one.
+    if !args.no_local {
+        let mut references: Vec<PathBuf> = args
+            .reference
+            .iter()
+            .map(PathBuf::from)
+            .filter(|path| path.exists())
+            .collect();
+        references.extend(
+            args.reference_if_able
+                .iter()
+                .map(PathBuf::from)
+                .filter(|path| path.exists()),
+        );
+        if let Some(reference) = references.first() {
+            let source_objects = if reference.join(util::ROOT_DIR).is_dir() {
+                reference.join(util::ROOT_DIR).join("objects")
+            } else {
+                reference.join("objects")
+            };
+            if source_objects.is_dir() {
+                let dest_objects = local_path.join(util::ROOT_DIR).join("objects");
+                let info = dest_objects.join("info");
+                fs::create_dir_all(&info).map_err(|error| CloneError::SetupFailed {
+                    message: format!("could not create '{}': {error}", info.display()),
+                })?;
+                let absolute = fs::canonicalize(&source_objects).unwrap_or(source_objects);
+                fs::write(info.join("alternates"), format!("{}\n", absolute.display())).map_err(
+                    |error| CloneError::SetupFailed {
+                        message: format!("could not register the reference alternate: {error}"),
+                    },
+                )?;
+            }
+        }
+    }
+
     // --- Step 5: Fetch objects ---
     if !output.quiet && !output.is_json() {
         eprintln!("Fetching objects ...");
