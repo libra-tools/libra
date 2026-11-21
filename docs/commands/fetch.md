@@ -176,6 +176,11 @@ libra config remote.origin.prune false  # but never for origin
 
 ## Options
 
+`remote.<name>.tagOpt` is read case-insensitively (`tagopt`, `tagOpt`, `TAGOPT`
+all work): `--tags` fetches every tag, `--no-tags` fetches none, and any other
+value (or no value) auto-follows only tags whose objects the fetch already
+brought. An explicit `--tags`/`--no-tags` on the command line always wins.
+
 With `--tags`, a fetched tag that collides with a local tag pointing at a
 different object is reported as ` ! [rejected] <tag> -> <tag>  (would clobber
  existing tag)`: the local tag is kept, the other tags of the batch are still

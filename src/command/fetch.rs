@@ -5409,7 +5409,9 @@ async fn resolve_tag_mode(remote_name: &str, tag_cli: Option<TagFetchMode>) -> T
     if let Some(mode) = tag_cli {
         return mode;
     }
-    match ConfigKv::get(&format!("remote.{remote_name}.tagOpt")).await {
+    // Git resolves `remote.<name>.tagOpt` case-insensitively, so `tagopt`,
+    // `tagOpt` and `TAGOPT` all name the same variable.
+    match ConfigKv::get_var_case_insensitive(&format!("remote.{remote_name}."), "tagopt").await {
         Ok(Some(entry)) => match entry.value.trim() {
             "--tags" => TagFetchMode::All,
             "--no-tags" => TagFetchMode::NoTags,

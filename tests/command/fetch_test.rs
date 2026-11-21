@@ -4413,3 +4413,155 @@ fn test_fetch_tags_rejects_conflicting_local_tag() {
         "AC7: the local tag is untouched"
     );
 }
+
+#[test]
+fn test_fetch_tagopt_is_case_insensitive() {
+    use crate::command::{assert_cli_success, run_libra_command};
+
+    // Source: `main` → M1, `lone` → L1 (off main), tags `tag_one`→M1 and
+    // `tag_lone`→L1, so auto-follow can only see `tag_one`.
+    let work = tempfile::tempdir().expect("work dir");
+    let src = work.path().join("src");
+    std::fs::create_dir_all(&src).expect("mkdir src");
+    assert_cli_success(&run_libra_command(&["init"], &src), "init src");
+    run_libra_command(&["config", "set", "user.name", "t"], &src);
+    run_libra_command(&["config", "set", "user.email", "t@t"], &src);
+    std::fs::write(src.join("f.txt"), "m1\n").expect("write m1");
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], &src), "stage M1");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "M1", "--no-verify"], &src),
+        "commit M1",
+    );
+    let m1 = {
+        let out = run_libra_command(&["rev-parse", "HEAD"], &src);
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    assert_cli_success(&run_libra_command(&["tag", "tag_one"], &src), "tag_one");
+    assert_cli_success(&run_libra_command(&["branch", "lone"], &src), "branch lone");
+    assert_cli_success(&run_libra_command(&["switch", "lone"], &src), "switch lone");
+    std::fs::write(src.join("g.txt"), "l1\n").expect("write l1");
+    assert_cli_success(&run_libra_command(&["add", "g.txt"], &src), "stage L1");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "L1", "--no-verify"], &src),
+        "commit L1",
+    );
+    let l1 = {
+        let out = run_libra_command(&["rev-parse", "HEAD"], &src);
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    assert_cli_success(&run_libra_command(&["tag", "tag_lone"], &src), "tag_lone");
+    assert_cli_success(
+        &run_libra_command(&["switch", "main"], &src),
+        "back to main",
+    );
+
+    // A fresh consumer per AC: single-branch fetch refspec so auto-follow can
+    // only see M1.
+    let consumer = || {
+        let dir = work.path().join(format!(
+            "c{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir consumer");
+        assert_cli_success(&run_libra_command(&["init"], &dir), "init consumer");
+        run_libra_command(&["config", "set", "user.name", "t"], &dir);
+        run_libra_command(&["config", "set", "user.email", "t@t"], &dir);
+        assert_cli_success(
+            &run_libra_command(
+                &["remote", "add", "remote_one", src.to_str().expect("src")],
+                &dir,
+            ),
+            "add remote_one",
+        );
+        assert_cli_success(
+            &run_libra_command(
+                &[
+                    "config",
+                    "set",
+                    "remote.remote_one.fetch",
+                    "+refs/heads/main:refs/remotes/remote_one/main",
+                ],
+                &dir,
+            ),
+            "single-branch refspec",
+        );
+        dir
+    };
+    let tags = |repo: &std::path::Path| {
+        String::from_utf8_lossy(&run_libra_command(&["show-ref"], repo).stdout)
+            .lines()
+            .filter(|line| line.contains("refs/tags/"))
+            .map(str::to_string)
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+
+    // AC1/AC2: `tagopt` and `tagOpt` both disable tags.
+    for key in ["remote.remote_one.tagopt", "remote.remote_one.tagOpt"] {
+        let repo = consumer();
+        assert_cli_success(
+            &run_libra_command(&["config", "set", key, "--", "--no-tags"], &repo),
+            "configure tagopt",
+        );
+        assert_cli_success(
+            &run_libra_command(&["fetch", "remote_one"], &repo),
+            "fetch remote_one",
+        );
+        assert!(tags(&repo).is_empty(), "{key}: no tags may be written");
+    }
+
+    // AC3: `TAGOPT=--tags` fetches every tag, including the off-main one.
+    let repo = consumer();
+    assert_cli_success(
+        &run_libra_command(
+            &["config", "set", "remote.remote_one.TAGOPT", "--", "--tags"],
+            &repo,
+        ),
+        "configure TAGOPT",
+    );
+    assert_cli_success(&run_libra_command(&["fetch", "remote_one"], &repo), "fetch");
+    assert!(
+        tags(&repo).contains(&format!("{l1} refs/tags/tag_lone")),
+        "AC3: tag_lone points at L1"
+    );
+
+    // AC4: the CLI `--tags` overrides `--no-tags` in the configuration.
+    let repo = consumer();
+    run_libra_command(
+        &["config", "set", "remote.remote_one.tagopt", "--no-tags"],
+        &repo,
+    );
+    assert_cli_success(
+        &run_libra_command(&["fetch", "--tags", "remote_one"], &repo),
+        "AC4: fetch --tags",
+    );
+    assert!(
+        tags(&repo).contains(&format!("{l1} refs/tags/tag_lone")),
+        "AC4: tag_lone points at L1"
+    );
+
+    // AC5: the CLI `--no-tags` overrides `--tags` in the configuration.
+    let repo = consumer();
+    run_libra_command(
+        &["config", "set", "remote.remote_one.tagopt", "--tags"],
+        &repo,
+    );
+    assert_cli_success(
+        &run_libra_command(&["fetch", "--no-tags", "remote_one"], &repo),
+        "AC5: fetch --no-tags",
+    );
+    assert!(tags(&repo).is_empty(), "AC5: no tags may be written");
+
+    // AC6: unconfigured → auto-follow sees only the reachable tag.
+    let repo = consumer();
+    assert_cli_success(&run_libra_command(&["fetch", "remote_one"], &repo), "fetch");
+    assert_eq!(
+        tags(&repo),
+        [format!("{m1} refs/tags/tag_one")]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        "AC6: only the reachable tag is auto-followed"
+    );
+}

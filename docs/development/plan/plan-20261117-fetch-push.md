@@ -1594,7 +1594,7 @@ PY
 
 ### Task FP-17: fetch 按大小写不敏感读取 `remote.<name>.tagOpt`（#874）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `complete`（2026-11-21：`resolve_tag_mode` 改用既有的 `ConfigKv::get_var_case_insensitive`（前缀 `remote.<name>.`、变量 `tagopt`），因此 `tagopt`/`tagOpt`/`TAGOPT` 均生效；取值语义与 CLI 优先级不变。用例 `test_fetch_tagopt_is_case_insensitive` 覆盖 AC1–AC6（两种拼写的 `--no-tags` 均不写 tag、`TAGOPT=--tags` 取到 off-main 的 `tag_lone`、CLI `--tags` 覆盖配置的 `--no-tags`、CLI `--no-tags` 覆盖配置的 `--tags`、未配置时自动跟随只得到可达的 `tag_one`）；`fetch_test` **72/72**；版本面 0.30.249 → 0.30.250；文档 EN/zh-CN 同步。按用户 2026-11-20 指令在 `main` 直接提交推送。）
 
 **Description:** `resolve_tag_mode` 改用既有 `ConfigKv::get_var_case_insensitive`（前缀 `remote.<name>.`、变量 `tagopt`）读取，使 `tagopt`、`tagOpt`、`TAGOPT` 等拼写均生效；值仍为 `--tags`→全部 tag、`--no-tags`→不取 tag、其它→自动跟随；CLI `--tags`/`--no-tags` 优先于配置。
 
