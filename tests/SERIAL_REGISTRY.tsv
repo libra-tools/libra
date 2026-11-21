@@ -1,4 +1,20 @@
 test_fn	lane	reason
+a_bridge_publication_blocks_another_libra_index_writer	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+a_busy_claim_refuses_the_operation_and_keeps_the_id_retryable	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+a_denied_actor_replay_names_the_durable_outcome	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+a_failed_started_record_releases_the_review_slot	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+a_full_review_budget_keeps_the_operation_id_retryable	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+a_malformed_approval_does_not_leave_a_pending_operation	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+a_pending_replay_keeps_a_started_review_identity	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+a_pending_replay_reconciles_a_started_operation_it_finds	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+a_pending_replay_reports_a_completed_operation	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+a_refusal_that_loses_the_race_reports_the_started_operation	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+a_review_state_read_failure_is_retryable	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+a_review_without_a_state_reports_an_unknown_liveness	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+a_stale_refusal_never_commits_twice	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+a_stale_refusal_retry_never_repeats_a_started_operation	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+a_started_operation_is_never_repeated	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+a_started_replay_reports_the_completed_operation	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
 agent_checkpoint_rewind_dry_run_and_apply_restore_worktree_only	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 agent_checkpoint_subagent_scope_listed_and_linked	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 agent_kind_check_rebuild_discards_a_cancelled_connection	lane:env	PI-07: sets LIBRA_TEST and the agent_kind CHECK failpoint variables in-process (ScopedEnvVar)
@@ -32,6 +48,8 @@ agent_session_show_extract_transcript_rejects_corrupt_identity_without_output	la
 agent_skill_search	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; narrowed 2026-09-17 (DEFER-NP-02, user-directed) from the full named key set to the in-process closed set cwd+env+hash_kind — the classifier's process model can only prove pollution of these three lanes, so they carry the full in-process exclusion strength; cloud_live/workspace_failpoints were never resource evidence for this body and only serialized it inside the nextest `external` group
 agent_trailer_opt_in_links_scoped_codex_session_and_flag_omits_only_trailer	lane:cwd	local-only ignored commit association test changes the process working directory (ChangeDirGuard)
 agent_workspace_list_paginates_and_shows	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; narrowed 2026-09-17 (DEFER-NP-02, user-directed) from the full named key set to the in-process closed set cwd+env+hash_kind — the classifier's process model can only prove pollution of these three lanes, so they carry the full in-process exclusion strength; cloud_live/workspace_failpoints were never resource evidence for this body and only serialized it inside the nextest `external` group
+an_interrupted_mutation_reaches_a_terminal_outcome	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+an_operation_id_cannot_be_reused_for_another_method	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
 api_status_envelope_honors_status_config_defaults	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 api_warning_concurrent_isolated	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 api_warning_no_global_exit_pollution	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
@@ -45,11 +63,15 @@ blame_runs_with_sha1	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdi
 blame_runs_with_sha256	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; narrowed 2026-09-17 (DEFER-NP-02, user-directed) from the full named key set to the in-process closed set cwd+env+hash_kind — the classifier's process model can only prove pollution of these three lanes, so they carry the full in-process exclusion strength; cloud_live/workspace_failpoints were never resource evidence for this body and only serialized it inside the nextest `external` group
 branch_already_exists_with_track_returns_conflict	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 branch_vv_counts_upstream_shapes	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+bridge_publication_refuses_a_head_changed_after_admission	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+bridge_publication_refuses_head_advanced_by_another_process	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+bridge_publication_refuses_overlapping_external_ref_transaction	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
 catalog_insert_is_idempotent_across_crash_retries	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; narrowed 2026-09-17 (DEFER-NP-02, user-directed) from the full named key set to the in-process closed set cwd+env+hash_kind — the classifier's process model can only prove pollution of these three lanes, so they carry the full in-process exclusion strength; cloud_live/workspace_failpoints were never resource evidence for this body and only serialized it inside the nextest `external` group
 check_dirty_modified_row_content_hash_failure_is_blocked_and_kept	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; narrowed 2026-09-17 (DEFER-NP-02, user-directed) from the full named key set to the in-process closed set cwd+env+hash_kind — the classifier's process model can only prove pollution of these three lanes, so they carry the full in-process exclusion strength; cloud_live/workspace_failpoints were never resource evidence for this body and only serialized it inside the nextest `external` group
 checkout_b_resolves_bare_remote_start_point_and_sets_tracking	lane:cwd+env	uses an isolated repository, process working directory, and config environment while checking bare remote start-point tracking
 checkout_restore_rejects_sha1_hash_in_sha256_repo	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 checkpoint_restore_honours_the_fence_and_restores_the_worktree	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; narrowed 2026-09-17 (DEFER-NP-02, user-directed) from the full named key set to the in-process closed set cwd+env+hash_kind — the classifier's process model can only prove pollution of these three lanes, so they carry the full in-process exclusion strength; cloud_live/workspace_failpoints were never resource evidence for this body and only serialized it inside the nextest `external` group
+checkpoint_restore_refuses_a_cross_process_publisher	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
 checkpoint_without_a_commit_cannot_be_restored	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; narrowed 2026-09-17 (DEFER-NP-02, user-directed) from the full named key set to the in-process closed set cwd+env+hash_kind — the classifier's process model can only prove pollution of these three lanes, so they carry the full in-process exclusion strength; cloud_live/workspace_failpoints were never resource evidence for this body and only serialized it inside the nextest `external` group
 cherry_pick_state_roundtrip_persists_and_clears	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 clone_rejects_sha256_git_source	lane:cwd	B3-12 local Git sha256 clone reject; serial(cwd) while spawning CLI subprocesses
@@ -60,8 +82,23 @@ cloud_full_workflow_end_to_end	lane:cloud_live	shares a live cloud account/bucke
 cloud_sync_name_conflict	lane:cloud_live	shares a live cloud account/bucket with the other cloud tests
 cloud_tombstone_propagates_for_agent_capture	lane:cloud_live	shares a live cloud account/bucket with the other cloud tests
 commit_create_commits_the_index_and_replays_idempotently	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; narrowed 2026-09-17 (DEFER-NP-02, user-directed) from the full named key set to the in-process closed set cwd+env+hash_kind — the classifier's process model can only prove pollution of these three lanes, so they carry the full in-process exclusion strength; cloud_live/workspace_failpoints were never resource evidence for this body and only serialized it inside the nextest `external` group
+commit_create_concurrent_replay_stops_a_paused_execution	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+commit_create_keeps_the_commit_id_when_association_fails	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+commit_create_rechecks_head_after_waiting_for_gate	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+commit_create_recovers_a_prepared_object_after_owner_stops	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+commit_create_recovery_rejects_a_commit_that_predates_the_operation	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+commit_create_recovery_rejects_a_different_tree	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+commit_create_recovery_restores_the_missing_association	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+commit_create_refuses_an_intent_without_a_publication_record	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+commit_create_refuses_an_unreadable_head	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+commit_create_refuses_another_cross_process_publisher	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
 commit_create_refuses_on_head_drift	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; narrowed 2026-09-17 (DEFER-NP-02, user-directed) from the full named key set to the in-process closed set cwd+env+hash_kind — the classifier's process model can only prove pollution of these three lanes, so they carry the full in-process exclusion strength; cloud_live/workspace_failpoints were never resource evidence for this body and only serialized it inside the nextest `external` group
-commit_create_waits_for_a_deletion_phase_before_publishing	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; narrowed 2026-09-17 (DEFER-NP-02, user-directed) from the full named key set to the in-process closed set cwd+env+hash_kind — the classifier's process model can only prove pollution of these three lanes, so they carry the full in-process exclusion strength; cloud_live/workspace_failpoints were never resource evidence for this body and only serialized it inside the nextest `external` group
+commit_create_replay_rejects_corrupt_recorded_oid	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+commit_create_replay_restores_a_deleted_association	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+commit_create_replay_uses_the_publication_not_a_lookalike	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+commit_create_upgrades_a_publication_table_without_phase	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+commit_replay_refuses_reconciliation_during_a_cross_process_claim	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+commit_replay_routes_a_newly_recorded_intent_to_publication	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
 config_bare_read_encrypted_is_redacted	lane:env	mutates or depends on the process environment (set_var/remove_var/EnvVarGuard, or spawns without env_clear so children inherit the racing env — directly or via an expanded helper)
 config_bare_read_protected_key_interactive_pty	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; narrowed 2026-09-17 (DEFER-NP-02, user-directed) from the full named key set to the in-process closed set cwd+env+hash_kind — the classifier's process model can only prove pollution of these three lanes, so they carry the full in-process exclusion strength; cloud_live/workspace_failpoints were never resource evidence for this body and only serialized it inside the nextest `external` group
 config_cascade_uses_explicit_role	lane:cwd+env	uses isolated global/system configuration paths and cwd to prove read-only role routing
@@ -80,6 +117,8 @@ d1_batch	lane:cloud_live	shares a live cloud account/bucket with the other cloud
 d1_connection	lane:cloud_live	shares a live cloud account/bucket with the other cloud tests
 d1_ensure_table	lane:cloud_live	shares a live cloud account/bucket with the other cloud tests
 d1_upsert_and_query	lane:cloud_live	shares a live cloud account/bucket with the other cloud tests
+diff_get_preserves_backslash_separator_compatibility	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+diff_get_rejects_a_tracked_path_replaced_by_a_symlink_directory	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
 diff_get_rejects_untyped_selectors	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; narrowed 2026-09-17 (DEFER-NP-02, user-directed) from the full named key set to the in-process closed set cwd+env+hash_kind — the classifier's process model can only prove pollution of these three lanes, so they carry the full in-process exclusion strength; cloud_live/workspace_failpoints were never resource evidence for this body and only serialized it inside the nextest `external` group
 diff_get_reports_real_worktree_changes_and_is_path_scoped	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; narrowed 2026-09-17 (DEFER-NP-02, user-directed) from the full named key set to the in-process closed set cwd+env+hash_kind — the classifier's process model can only prove pollution of these three lanes, so they carry the full in-process exclusion strength; cloud_live/workspace_failpoints were never resource evidence for this body and only serialized it inside the nextest `external` group
 diff_get_without_a_repository_fails_closed_on_scope	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
@@ -91,6 +130,7 @@ every_tool_error_example_is_error	lane:env	sets LIBRA_TEST so the in-process MCP
 every_tool_error_matches_error_schema	lane:env	sets LIBRA_TEST so the in-process MCP registry includes the debug echo tool while the error schema runs
 every_tool_success_example_is_success	lane:env	sets LIBRA_TEST so the in-process MCP registry includes the debug echo tool while the success example runs
 every_tool_success_matches_success_branch	lane:env	sets LIBRA_TEST so the in-process MCP registry includes the debug echo tool while the success schema runs
+fenced_write_refuses_a_cross_process_publisher	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
 fetch_rejects_sha256_git_source	lane:cwd	B3-12 local Git sha256 fetch reject; serial(cwd) while spawning CLI subprocesses
 fsck_heal_restores_object_from_durable_tier	lane:cloud_live	shares a live cloud account/bucket with the other cloud tests
 fuse_repair_failure_closes_the_shared_audit_row_failed	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; narrowed 2026-09-17 (DEFER-NP-02, user-directed) from the full named key set to the in-process closed set cwd+env+hash_kind — the classifier's process model can only prove pollution of these three lanes, so they carry the full in-process exclusion strength; cloud_live/workspace_failpoints were never resource evidence for this body and only serialized it inside the nextest `external` group
@@ -102,9 +142,11 @@ get_best_effort_returns_err_outside_repository	lane:cwd	changes the process work
 global_and_system_bootstrap_create_no_repository_shape	lane:env	uses the shared config database fixture to isolate process configuration paths
 global_config_create_uses_global_role	lane:env+cwd	fixture temporarily points global config at a future-schema database while in-process init may read it
 got_remote_branch_suggests_track	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+i1062_conversion_failure_preserves_index_and_names_attribute_source	lane:cwd	changes the process working directory (ChangeDirGuard)
 import_keeps_signing_disabled_in_vault_false_repo	lane:cwd	runs in an isolated temp repository via ChangeDirGuard and per-command cwd (plan-20260921 ADR-VG-12 vault=false branch)
 import_partial_failure_rolls_back	lane:cwd	runs in an isolated temp repository via ChangeDirGuard and per-command cwd (plan-20260921 VG-02/03 partial import failure atomically rolls back)
 import_sets_vault_signing_true_when_unset	lane:cwd	runs in an isolated temp repository via ChangeDirGuard and per-command cwd (plan-20260921 ADR-VG-12 first-import signing enable)
+in_process_commit_waits_while_publish_gate_is_held	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
 index_pack_stdin_requires_explicit_output_path	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; narrowed 2026-09-17 (DEFER-NP-02, user-directed) from the full named key set to the in-process closed set cwd+env+hash_kind — the classifier's process model can only prove pollution of these three lanes, so they carry the full in-process exclusion strength; cloud_live/workspace_failpoints were never resource evidence for this body and only serialized it inside the nextest `external` group
 index_pack_stdin_writes_pack_and_index_and_reports_json_paths	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; narrowed 2026-09-17 (DEFER-NP-02, user-directed) from the full named key set to the in-process closed set cwd+env+hash_kind — the classifier's process model can only prove pollution of these three lanes, so they carry the full in-process exclusion strength; cloud_live/workspace_failpoints were never resource evidence for this body and only serialized it inside the nextest `external` group
 json_check_dirty_concurrent_invalidate_warning	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; narrowed 2026-09-17 (DEFER-NP-02, user-directed) from the full named key set to the in-process closed set cwd+env+hash_kind — the classifier's process model can only prove pollution of these three lanes, so they carry the full in-process exclusion strength; cloud_live/workspace_failpoints were never resource evidence for this body and only serialized it inside the nextest `external` group
@@ -178,6 +220,7 @@ resolve_env_sync_falls_back_to_process_env_when_vault_missing	lane:env+cwd	chang
 resolve_env_sync_returns_none_when_no_layer_supplies_value	lane:env+cwd	changes LIBRA_CONFIG_GLOBAL_DB; shares cwd with in-process init fixtures that read global defaults
 resolve_user_identity_sources_tolerates_corrupt_global_db	lane:env+cwd	changes LIBRA_CONFIG_GLOBAL_DB; shares cwd with in-process init fixtures that read global defaults
 resolved_conflict_with_stage0_emits_no_u_line	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+restore_fence_hides_the_host_path_behind_a_symlink_directory	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
 review_run_refuses_unlaunchable_reviewers_without_residue	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; narrowed 2026-09-17 (DEFER-NP-02, user-directed) from the full named key set to the in-process closed set cwd+env+hash_kind — the classifier's process model can only prove pollution of these three lanes, so they carry the full in-process exclusion strength; cloud_live/workspace_failpoints were never resource evidence for this body and only serialized it inside the nextest `external` group
 role_schema_up_fault_rolls_back_ledger	lane:env	injects schema failures only in databases owned by the shared config fixture
 role_scoped_schema_writer_keeps_ledgers_disjoint	lane:env	uses the shared config database fixture for the absent/old/current/future role matrix
@@ -269,10 +312,14 @@ test_bisect_terms_matrix	lane:cwd	changes the process working directory (ChangeD
 test_bisect_untracked_collision_refused_at_step	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_bisect_view_inside_active_session	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_bisect_view_without_session_errors	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_blame_date_formats_matrix	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_blame_empty_file_returns_empty_result	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; narrowed 2026-09-17 (DEFER-NP-02, user-directed) from the full named key set to the in-process closed set cwd+env+hash_kind — the classifier's process model can only prove pollution of these three lanes, so they carry the full in-process exclusion strength; cloud_live/workspace_failpoints were never resource evidence for this body and only serialized it inside the nextest `external` group
+test_blame_incremental_output	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_blame_json_assigns_lines_to_introducing_commits	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; narrowed 2026-09-17 (DEFER-NP-02, user-directed) from the full named key set to the in-process closed set cwd+env+hash_kind — the classifier's process model can only prove pollution of these three lanes, so they carry the full in-process exclusion strength; cloud_live/workspace_failpoints were never resource evidence for this body and only serialized it inside the nextest `external` group
 test_blame_json_line_range_filters_output	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; narrowed 2026-09-17 (DEFER-NP-02, user-directed) from the full named key set to the in-process closed set cwd+env+hash_kind — the classifier's process model can only prove pollution of these three lanes, so they carry the full in-process exclusion strength; cloud_live/workspace_failpoints were never resource evidence for this body and only serialized it inside the nextest `external` group
 test_blame_json_three_commit_chain_attributes_each_line	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; narrowed 2026-09-17 (DEFER-NP-02, user-directed) from the full named key set to the in-process closed set cwd+env+hash_kind — the classifier's process model can only prove pollution of these three lanes, so they carry the full in-process exclusion strength; cloud_live/workspace_failpoints were never resource evidence for this body and only serialized it inside the nextest `external` group
+test_blame_line_range_and_boundary_matrix	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_blame_move_copy_detection_matrix	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_blame_regex_line_range	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; narrowed 2026-09-17 (DEFER-NP-02, user-directed) from the full named key set to the in-process closed set cwd+env+hash_kind — the classifier's process model can only prove pollution of these three lanes, so they carry the full in-process exclusion strength; cloud_live/workspace_failpoints were never resource evidence for this body and only serialized it inside the nextest `external` group
 test_branch	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_branch_all_shows_unborn_head_even_with_remote_refs	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
@@ -391,6 +438,7 @@ test_config_get_with_default	lane:cwd	changes the process working directory (Cha
 test_config_import_global_from_git	lane:env+cwd	mutates or depends on the process environment (set_var/remove_var/EnvVarGuard, or spawns without env_clear so children inherit the racing env — directly or via an expanded helper); changes or depends on the process working directory (ChangeDirGuard/set_current_dir, or cwd-resolved APIs like ConfigKv/Head::current_commit, directly or via an expanded helper)
 test_config_import_local_from_git_repository	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_config_list	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_config_list_defaults_to_all_scopes_and_local_restricts	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_config_list_gpg_keys_outputs_configured_key_namespaces	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_config_list_name_only	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_config_list_ssh_keys_outputs_configured_public_keys	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
@@ -431,13 +479,20 @@ test_detach_head_extra	lane:cwd	changes the process working directory (ChangeDir
 test_diff_after_init	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_diff_algorithms	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_diff_between_commits	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_diff_dirstat_matrix	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_diff_empty_output_does_not_initialize_pager	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_diff_hunk_header_function_context	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_diff_hunk_headers_match_git_matrix	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_diff_index_cached	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_diff_index_files_raw_matrix	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_diff_output_to_file	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_diff_staged	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_diff_tree_raw_and_patch_matrix	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_diff_with_pathspec	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_execute_commit	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_execute_commit_with_empty_index_fail	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_execute_log	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_explicit_scope_missing_or_unreadable_store	lane:cwd+env	changes the process working directory and mutates process-wide environment variables
 test_fetch_all_with_depth_runs_across_remotes	lane:env+cwd	mutates or depends on the process environment (set_var/remove_var/EnvVarGuard, or spawns without env_clear so children inherit the racing env — directly or via an expanded helper); changes or depends on the process working directory (ChangeDirGuard/set_current_dir, or cwd-resolved APIs like ConfigKv/Head::current_commit, directly or via an expanded helper)
 test_fetch_atomic_all_or_nothing_on_non_fast_forward	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir) and spawns CLI subprocesses
 test_fetch_default_auto_follows_reachable_tags	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; narrowed 2026-09-17 (DEFER-NP-02, user-directed) from the full named key set to the in-process closed set cwd+env+hash_kind — the classifier's process model can only prove pollution of these three lanes, so they carry the full in-process exclusion strength; cloud_live/workspace_failpoints were never resource evidence for this body and only serialized it inside the nextest `external` group
@@ -481,6 +536,8 @@ test_fetch_update_head_ok_allows_fetch_into_checked_out_branch	lane:cwd	changes 
 test_fetch_verbose_announces_remote_on_stderr	lane:env+cwd	mutates or depends on the process environment (set_var/remove_var/EnvVarGuard, or spawns without env_clear so children inherit the racing env — directly or via an expanded helper); changes or depends on the process working directory (ChangeDirGuard/set_current_dir, or cwd-resolved APIs like ConfigKv/Head::current_commit, directly or via an expanded helper)
 test_fetch_with_depth_one_against_local_remote	lane:env+cwd	mutates or depends on the process environment (set_var/remove_var/EnvVarGuard, or spawns without env_clear so children inherit the racing env — directly or via an expanded helper); changes or depends on the process working directory (ChangeDirGuard/set_current_dir, or cwd-resolved APIs like ConfigKv/Head::current_commit, directly or via an expanded helper)
 test_fetch_writes_and_appends_fetch_head	lane:env+cwd	mutates or depends on the process environment (set_var/remove_var/EnvVarGuard, or spawns without env_clear so children inherit the racing env — directly or via an expanded helper); changes or depends on the process working directory (ChangeDirGuard/set_current_dir, or cwd-resolved APIs like ConfigKv/Head::current_commit, directly or via an expanded helper)
+test_file_write_bytes_match_git_matrix	lane:cwd+env	changes the process working directory and mutates process-wide environment variables
+test_file_write_roundtrip_through_reader	lane:cwd+env	changes the process working directory and mutates process-wide environment variables
 test_filter_branches_propagates_error_for_corrupt_commit	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_for_each_ref_author_committer_atoms	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; narrowed 2026-09-17 (DEFER-NP-02, user-directed) from the full named key set to the in-process closed set cwd+env+hash_kind — the classifier's process model can only prove pollution of these three lanes, so they carry the full in-process exclusion strength; cloud_live/workspace_failpoints were never resource evidence for this body and only serialized it inside the nextest `external` group
 test_for_each_ref_color_atom	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; narrowed 2026-09-17 (DEFER-NP-02, user-directed) from the full named key set to the in-process closed set cwd+env+hash_kind — the classifier's process model can only prove pollution of these three lanes, so they carry the full in-process exclusion strength; cloud_live/workspace_failpoints were never resource evidence for this body and only serialized it inside the nextest `external` group
@@ -529,11 +586,13 @@ test_global_vault_key_migrates_and_decrypts	lane:cwd+env+hash_kind	spawns the CL
 test_grep_after_context_marks_context_lines	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_grep_all_match_is_based_on_positive_pattern_presence_even_with_invert	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_grep_all_match_requires_all_patterns_in_same_file	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_grep_boolean_expressions_matrix	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_grep_break_inserts_blank_line_between_files	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_grep_byte_offset_reports_zero_based_match_offset	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_grep_count_reports_matching_lines_per_file	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_grep_default_output_is_unchanged	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_grep_files_without_matches_uses_plural_json_field	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_grep_function_and_numeric_context_matrix	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_grep_heading_and_break_combine	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_grep_heading_groups_matches_under_file_name	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_grep_heading_with_context_keeps_group_separator	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
@@ -545,6 +604,8 @@ test_grep_no_index_searches_ignored_files_inside_repo	lane:cwd	changes the proce
 test_grep_no_match_emits_no_output	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_grep_null_separates_fields_with_nul_byte	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_grep_null_with_context_uses_nul_and_literal_separator	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_grep_pattern_types_matrix	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_grep_perl_regexp_unsupported_syntax_is_rejected	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_grep_reads_patterns_from_file	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_grep_reports_total_files_as_number_of_matched_files	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_grep_returns_nonzero_when_no_matches_found	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
@@ -567,17 +628,26 @@ test_index_v3_fixture_roundtrip_matrix	lane:hash_kind	sets the thread-local obje
 test_index_v4_rejected	lane:hash_kind	sets the thread-local object hash kind
 test_internal_create_returns_metadata_for_annotated_tag	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; narrowed 2026-09-17 (DEFER-NP-02, user-directed) from the full named key set to the in-process closed set cwd+env+hash_kind — the classifier's process model can only prove pollution of these three lanes, so they carry the full in-process exclusion strength; cloud_live/workspace_failpoints were never resource evidence for this body and only serialized it inside the nextest `external` group
 test_invalid_branch_name	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_legacy_and_subcommand_parity_table	lane:cwd+env	changes the process working directory and mutates process-wide environment variables
 test_list_all_branches	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_list_and_get_regexp_order_format_matrix	lane:cwd+env	changes the process working directory and mutates process-wide environment variables
 test_list_tags	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; narrowed 2026-09-17 (DEFER-NP-02, user-directed) from the full named key set to the in-process closed set cwd+env+hash_kind — the classifier's process model can only prove pollution of these three lanes, so they carry the full in-process exclusion strength; cloud_live/workspace_failpoints were never resource evidence for this body and only serialized it inside the nextest `external` group
 test_log_abbrev_params	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_log_all_includes_branches	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_log_and_diff_stat_counts_consistent	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_log_corrupt_head_reference_returns_repo_corrupt	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_log_decorate_no_skips_corrupt_reference_map	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_log_default_layout_matches_git	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_log_displays_notes_matrix	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_log_double_dash_disables_short_number_rewrite	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_log_follow_detects_rename	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_log_format_last_one_wins	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_log_graph	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_log_graph_matches_git_fixtures	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_log_graph_octopus_fixture	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_log_graph_simple_chain	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_log_grep_filtering	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_log_grep_pattern_types_matrix	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_log_line_range_flag_accepted	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_log_oneline	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_log_only_trailers_display_and_errors	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; narrowed 2026-09-17 (DEFER-NP-02, user-directed) from the full named key set to the in-process closed set cwd+env+hash_kind — the classifier's process model can only prove pollution of these three lanes, so they carry the full in-process exclusion strength; cloud_live/workspace_failpoints were never resource evidence for this body and only serialized it inside the nextest `external` group
@@ -585,6 +655,7 @@ test_log_patch_fails_when_commit_blob_is_missing	lane:cwd	changes the process wo
 test_log_patch_no_pathspec	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_log_patch_with_pathspec	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_log_patch_with_stat_shows_diffstat_before_patch	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_log_perl_regexp_grep	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_log_positional_ambiguous_rev_and_path_errors	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_log_positional_parent_dir_path_not_misclassified	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; narrowed 2026-09-17 (DEFER-NP-02, user-directed) from the full named key set to the in-process closed set cwd+env+hash_kind — the classifier's process model can only prove pollution of these three lanes, so they carry the full in-process exclusion strength; cloud_live/workspace_failpoints were never resource evidence for this body and only serialized it inside the nextest `external` group
 test_log_positional_revision_range	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
@@ -637,6 +708,7 @@ test_mv_skip_errors_succeeds_when_all_sources_are_skipped	lane:cwd	changes the p
 test_mv_sparse_flag_is_accepted_as_json_noop	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_mv_usage_output_matches_command_text	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_mv_verbose_prints_rename_message	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_notes_blob_reuse_and_list_output	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_op_restore_force_allows_dirty_worktree_and_emits_confirmation	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_op_restore_json_records_new_operation_and_restores_head_and_branch_ref	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_open_no_remote	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
@@ -791,6 +863,7 @@ test_reset_with_head_reference	lane:cwd	changes the process working directory (C
 test_restore_source_does_not_fall_back_from_unborn_branch_to_hash_prefix	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_restore_worktree_refuses_ai_managed_current_branch	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_rev_list_accepts_fully_qualified_remote_tracking_ref	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_rev_list_grep_matches_log_semantics	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_rev_list_objects_errors_on_corrupt_subtree	lane:hash_kind	sets the process-wide hash kind
 test_rev_list_objects_skips_gitlinks	lane:hash_kind	sets the process-wide hash kind
 test_rev_parse_abbrev_ref_lowercase_head_resolves_branch_name	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
@@ -818,10 +891,14 @@ test_shortlog_email	lane:cwd	changes the process working directory (ChangeDirGua
 test_shortlog_no_merges_excludes_merge_commits	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_shortlog_numbered	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_shortlog_revision_argument_limits_history	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_shortlog_revision_ranges_matrix	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_shortlog_summary	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_shortlog_top_and_min_count_limit_output	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_show_dirstat	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_show_displays_default_notes	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_show_execute_safe_bad_ref_returns_cli_error	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_show_execute_safe_bad_rev_path_returns_cli_error	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_show_header_blank_line	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_show_json_blob_output_includes_content	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_show_json_commit_refs_are_best_effort_on_corrupt_branch_metadata	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_show_non_quiet_uses_forced_pager	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
@@ -848,6 +925,8 @@ test_show_ref_surfaces_corrupt_tag_storage	lane:cwd+env+hash_kind	fail-closed bo
 test_show_ref_verify_exact_ref_outputs_matching_ref	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; narrowed 2026-09-17 (DEFER-NP-02, user-directed) from the full named key set to the in-process closed set cwd+env+hash_kind — the classifier's process model can only prove pollution of these three lanes, so they carry the full in-process exclusion strength; cloud_live/workspace_failpoints were never resource evidence for this body and only serialized it inside the nextest `external` group
 test_show_ref_verify_head_accepts_head_refname	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; narrowed 2026-09-17 (DEFER-NP-02, user-directed) from the full named key set to the in-process closed set cwd+env+hash_kind — the classifier's process model can only prove pollution of these three lanes, so they carry the full in-process exclusion strength; cloud_live/workspace_failpoints were never resource evidence for this body and only serialized it inside the nextest `external` group
 test_show_ref_verify_short_name_is_not_exact_ref	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; narrowed 2026-09-17 (DEFER-NP-02, user-directed) from the full named key set to the in-process closed set cwd+env+hash_kind — the classifier's process model can only prove pollution of these three lanes, so they carry the full in-process exclusion strength; cloud_live/workspace_failpoints were never resource evidence for this body and only serialized it inside the nextest `external` group
+test_show_stat_matches_git	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_show_tree_objects_matrix	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_show_tree_output_uses_git_modes_and_types	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_ssh_changed_host_key_never_prompts	lane:cwd+env	uses an isolated repository and fake SSH/keyscan environment while proving changed keys never prompt
 test_stash_branch_refuses_corrupt_existing_branch	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
@@ -905,6 +984,7 @@ test_status_with_subdirectories	lane:cwd	changes the process working directory (
 test_strict_commit_bad_email	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; narrowed 2026-09-17 (DEFER-NP-02, user-directed) from the full named key set to the in-process closed set cwd+env+hash_kind — the classifier's process model can only prove pollution of these three lanes, so they carry the full in-process exclusion strength; cloud_live/workspace_failpoints were never resource evidence for this body and only serialized it inside the nextest `external` group
 test_strict_commit_bad_timezone	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; narrowed 2026-09-17 (DEFER-NP-02, user-directed) from the full named key set to the in-process closed set cwd+env+hash_kind — the classifier's process model can only prove pollution of these three lanes, so they carry the full in-process exclusion strength; cloud_live/workspace_failpoints were never resource evidence for this body and only serialized it inside the nextest `external` group
 test_strict_tree_unsorted	lane:hash_kind	sets the process-wide hash kind
+test_subcommand_spellings_matrix	lane:cwd+env	changes the process working directory and mutates process-wide environment variables
 test_switch_existing_agent_traces_branch_is_blocked	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_switch_guess_ambiguous_resolved_by_default_remote	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_switch_guess_config_disables_then_flag_overrides	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
@@ -913,13 +993,20 @@ test_switch_json_track_output_stays_clean	lane:cwd	changes the process working d
 test_switch_no_guess_rejects_remote_only_branch	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_switch_track_human_output_keeps_tracking_message	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_switch_track_sets_upstream	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
+test_t1300_expiry_date	lane:cwd+env	changes the process working directory and mutates process-wide environment variables
+test_t1300_get_regexp_name_only	lane:cwd+env	changes the process working directory and mutates process-wide environment variables
+test_t1300_type_color	lane:cwd+env	changes the process working directory and mutates process-wide environment variables
+test_t3301_notes_display_ports	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_t5505_add_another_remote	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir) and spawns CLI subprocesses
+test_t7007_show_tree_ports	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_tag_cli_corrupt_head_storage_returns_repo_corrupt	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_tag_create_only_validation_blocks_programmatic_entry	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_tag_delete_allows_invalid_target_hash	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_tag_json_delete_allows_invalid_target_hash	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_tag_json_delete_missing_target_emits_null_hash	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_tag_with_message	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; narrowed 2026-09-17 (DEFER-NP-02, user-directed) from the full named key set to the in-process closed set cwd+env+hash_kind — the classifier's process model can only prove pollution of these three lanes, so they carry the full in-process exclusion strength; cloud_live/workspace_failpoints were never resource evidence for this body and only serialized it inside the nextest `external` group
+test_type_color_matrix	lane:cwd+env	changes the process working directory and mutates process-wide environment variables
+test_type_expiry_date_matrix	lane:cwd+env	changes the process working directory and mutates process-wide environment variables
 test_worktree_add_creates_linked_directory	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_worktree_add_does_not_reset_index	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 test_worktree_add_duplicate_registered_path_does_not_create_directory	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
@@ -974,13 +1061,131 @@ trusted_dirs_env_allowlist_extra	lane:env	mutates process-wide environment varia
 undo_restores_current_symbolic_branch_tip_and_preserves_other_refs	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 unmerged_path_never_pairs_as_a_staged_rename_source	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 unmerged_stage_presence_to_xy_mapping	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
-vcs_commit_refuses_unselected_staged_paths	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; narrowed 2026-09-17 (DEFER-NP-02, user-directed) from the full named key set to the in-process closed set cwd+env+hash_kind — the classifier's process model can only prove pollution of these three lanes, so they carry the full in-process exclusion strength; cloud_live/workspace_failpoints were never resource evidence for this body and only serialized it inside the nextest `external` group
-vcs_commit_replay_keeps_a_published_result_after_failure	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; narrowed 2026-09-17 (DEFER-NP-02, user-directed) from the full named key set to the in-process closed set cwd+env+hash_kind — the classifier's process model can only prove pollution of these three lanes, so they carry the full in-process exclusion strength; cloud_live/workspace_failpoints were never resource evidence for this body and only serialized it inside the nextest `external` group
-vcs_fence_changes_when_file_content_changes	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; narrowed 2026-09-17 (DEFER-NP-02, user-directed) from the full named key set to the in-process closed set cwd+env+hash_kind — the classifier's process model can only prove pollution of these three lanes, so they carry the full in-process exclusion strength; cloud_live/workspace_failpoints were never resource evidence for this body and only serialized it inside the nextest `external` group
-vcs_fence_is_disabled_after_minor_one_handshake	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; narrowed 2026-09-17 (DEFER-NP-02, user-directed) from the full named key set to the in-process closed set cwd+env+hash_kind — the classifier's process model can only prove pollution of these three lanes, so they carry the full in-process exclusion strength; cloud_live/workspace_failpoints were never resource evidence for this body and only serialized it inside the nextest `external` group
-vcs_read_methods_report_identity_status_diff_and_log	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; narrowed 2026-09-17 (DEFER-NP-02, user-directed) from the full named key set to the in-process closed set cwd+env+hash_kind — the classifier's process model can only prove pollution of these three lanes, so they carry the full in-process exclusion strength; cloud_live/workspace_failpoints were never resource evidence for this body and only serialized it inside the nextest `external` group
-vcs_stage_replays_and_refuses_a_stale_fence	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; narrowed 2026-09-17 (DEFER-NP-02, user-directed) from the full named key set to the in-process closed set cwd+env+hash_kind — the classifier's process model can only prove pollution of these three lanes, so they carry the full in-process exclusion strength; cloud_live/workspace_failpoints were never resource evidence for this body and only serialized it inside the nextest `external` group
 v1_fixture_checkpoint_remains_readable_via_checkpoint_show	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; narrowed 2026-09-17 (DEFER-NP-02, user-directed) from the full named key set to the in-process closed set cwd+env+hash_kind — the classifier's process model can only prove pollution of these three lanes, so they carry the full in-process exclusion strength; cloud_live/workspace_failpoints were never resource evidence for this body and only serialized it inside the nextest `external` group
+vcs_commit_concurrent_replay_stops_a_paused_execution	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_commit_keeps_the_requested_spelling_after_a_case_only_directory_rename	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_commit_keeps_the_requested_spelling_after_a_case_only_rename	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_commit_matches_the_staged_set_from_a_subdirectory	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_commit_omits_an_empty_directory_after_its_last_file_is_deleted	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_commit_rechecks_worktree_after_pre_commit_hook	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_commit_records_a_staged_deletion	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_commit_recovers_a_prepared_object_after_owner_stops	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_commit_refuses_an_inexact_case_only_rename_scope	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_commit_refuses_two_case_colliding_index_entries_as_one_path	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_commit_refuses_unselected_staged_paths	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; narrowed 2026-09-17 (DEFER-NP-02, user-directed) from the full named key set to the in-process closed set cwd+env+hash_kind — the classifier's process model can only prove pollution of these three lanes, so they carry the full in-process exclusion strength; cloud_live/workspace_failpoints were never resource evidence for this body and only serialized it inside the nextest `external` group
+vcs_commit_replay_finalizes_an_operation_that_never_started	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_commit_replay_keeps_a_published_result_after_failure	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; narrowed 2026-09-17 (DEFER-NP-02, user-directed) from the full named key set to the in-process closed set cwd+env+hash_kind — the classifier's process model can only prove pollution of these three lanes, so they carry the full in-process exclusion strength; cloud_live/workspace_failpoints were never resource evidence for this body and only serialized it inside the nextest `external` group
+vcs_commit_replay_rejects_corrupt_commit_oid	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_commit_replay_restores_link_after_association_failure	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_commit_scope_keeps_distinct_entry_names_apart	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_diff_does_not_read_through_a_leaf_symlink	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_diff_omits_tracked_paths_replaced_by_a_symlink_directory	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_diff_rejects_a_path_through_a_symlink_directory	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_fence_changes_when_file_content_changes	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; narrowed 2026-09-17 (DEFER-NP-02, user-directed) from the full named key set to the in-process closed set cwd+env+hash_kind — the classifier's process model can only prove pollution of these three lanes, so they carry the full in-process exclusion strength; cloud_live/workspace_failpoints were never resource evidence for this body and only serialized it inside the nextest `external` group
+vcs_fence_changes_when_tracked_file_is_deleted	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_fence_hashes_a_literal_backslash_path	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_fence_ignores_files_reached_through_a_symlink_directory	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_fence_is_disabled_after_minor_one_handshake	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; narrowed 2026-09-17 (DEFER-NP-02, user-directed) from the full named key set to the in-process closed set cwd+env+hash_kind — the classifier's process model can only prove pollution of these three lanes, so they carry the full in-process exclusion strength; cloud_live/workspace_failpoints were never resource evidence for this body and only serialized it inside the nextest `external` group
+vcs_fence_uses_repository_relative_paths_from_subdirectory	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_read_methods_report_identity_status_diff_and_log	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; narrowed 2026-09-17 (DEFER-NP-02, user-directed) from the full named key set to the in-process closed set cwd+env+hash_kind — the classifier's process model can only prove pollution of these three lanes, so they carry the full in-process exclusion strength; cloud_live/workspace_failpoints were never resource evidence for this body and only serialized it inside the nextest `external` group
+vcs_stage_concurrent_replay_stops_a_paused_execution	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_stage_does_not_store_a_blob_when_a_later_path_becomes_invalid	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_stage_names_a_refusal_of_a_later_phase	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_stage_names_every_failing_path	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_stage_names_every_ignored_path	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_stage_names_every_unsupported_filter_path	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_stage_names_mixed_category_failures	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_stage_normalizes_dot_segments	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_stage_preserves_the_executable_bit	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_stage_rechecks_every_path_before_publishing	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_stage_rechecks_prepared_content_after_the_final_fence	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_stage_rechecks_the_fence_immediately_before_publication	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_stage_rechecks_the_fence_immediately_before_writing	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_stage_records_deletion_of_a_tracked_file	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_stage_records_symlink_text_without_following_it	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_stage_refuses_a_case_variant_of_an_indexed_entry	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_stage_refuses_a_filtered_path_without_publishing_any_blob	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_stage_refuses_a_path_that_changed_after_the_preparation	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_stage_refuses_a_skip_worktree_entry	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_stage_refuses_an_absent_submodule_entry	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_stage_refuses_to_drop_a_case_colliding_index_entry	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_stage_rejects_a_directory	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_stage_rejects_a_file_changed_after_preparation	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_stage_rejects_a_file_replaced_after_reading	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_stage_rejects_a_file_replaced_during_preparation	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_stage_rejects_a_file_that_disappears_during_preparation	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_stage_rejects_a_mode_change_between_reads	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_stage_rejects_a_path_below_a_file	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_stage_rejects_a_path_through_a_symlink_directory	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_stage_rejects_a_symlink_replaced_during_preparation	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_stage_rejects_a_tracked_file_recreated_during_preparation	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_stage_rejects_content_changed_during_add	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_stage_rejects_ignored_untracked_file	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_stage_rejects_lfs_without_publishing_content_or_pointer	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_stage_rejects_other_content_filters_without_publishing	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_stage_rejects_repository_metadata	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_stage_replaces_a_case_only_rename	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_stage_replay_finalization_stops_the_original_execution	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_stage_replay_recovers_a_publication_that_was_not_recorded	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_stage_replay_refuses_an_intent_that_never_landed	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_stage_replays_and_refuses_a_stale_fence	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; narrowed 2026-09-17 (DEFER-NP-02, user-directed) from the full named key set to the in-process closed set cwd+env+hash_kind — the classifier's process model can only prove pollution of these three lanes, so they carry the full in-process exclusion strength; cloud_live/workspace_failpoints were never resource evidence for this body and only serialized it inside the nextest `external` group
+vcs_stage_restores_index_after_a_real_mid_publish_failure	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_stage_rolls_back_when_a_later_path_is_invalid	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_stage_snapshots_the_batch_before_the_first_blob	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_stage_uses_libra_text_conversion	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_stage_uses_the_directory_spelling_for_unicode_names	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_status_answers_in_a_read_only_repository	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_status_answers_when_a_changed_path_exceeds_the_fence_bounds	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_status_answers_without_a_write_fence_when_no_snapshot_is_possible	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_status_binds_the_fence_to_the_observed_index	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_status_carries_an_unborn_head_as_null	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_status_fence_pins_the_content_a_write_stages	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_status_publishes_a_fence_beyond_a_clean_set_over_the_read_budget	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_status_publishes_a_fence_beyond_a_rehashed_clean_set	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_status_publishes_a_fence_for_a_staged_deletion	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_status_publishes_a_fence_for_two_modified_files_below_the_limit	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_status_publishes_no_fence_after_a_change_during_the_scan	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_status_publishes_no_fence_after_a_content_rewrite	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_status_publishes_no_fence_after_a_failed_directory_observation	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_status_publishes_no_fence_after_a_failed_metadata_capture	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_status_publishes_no_fence_after_a_failed_recapture	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_status_publishes_no_fence_after_a_failed_staged_capture	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_status_publishes_no_fence_after_a_failed_worktree_metadata_read	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_status_publishes_no_fence_after_a_file_becomes_a_directory	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_status_publishes_no_fence_after_a_new_path_appears	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_status_publishes_no_fence_after_a_path_vanishes_during_classification	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_status_publishes_no_fence_after_a_staged_path_changes_during_the_scan	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_status_publishes_no_fence_after_a_staged_path_disappears_during_the_scan	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_status_publishes_no_fence_after_an_unstable_staged_and_unstaged_path	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_status_publishes_no_fence_after_the_second_classification_hash	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_status_publishes_no_fence_when_a_staged_deletion_is_recreated_during_the_scan	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_status_publishes_no_fence_when_the_observation_root_cannot_be_pinned	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_status_refuses_a_corrupt_index	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_status_returns_the_write_fence_a_stage_accepts	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_unstage_does_not_change_a_case_variant_entry	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_unstage_keeps_a_literal_backslash_path_apart	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_unstage_names_every_failing_path	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_unstage_of_a_case_colliding_rename_needs_both_entries	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_unstage_of_a_case_only_rename_needs_both_spellings	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_unstage_of_a_rename_leaves_other_selected_paths_alone	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_unstage_of_a_rename_with_several_destinations_needs_every_path	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_unstage_of_a_staged_rename_requires_both_paths	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_unstage_of_an_ambiguous_rename_needs_every_candidate_path	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_unstage_of_two_renames_restores_each_source	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_unstage_refuses_an_unstaged_path_next_to_a_rename	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_unstage_rejects_a_directory_without_changing_descendants	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_unstage_rejects_a_missing_path_without_partial_updates	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_unstage_removes_a_newly_staged_file	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_unstage_resolves_paths_from_repository_root_in_subdirectory	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_unstage_restores_a_staged_deletion	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_unstage_restores_a_staged_gitlink_without_reading_it	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_unstage_restores_index_without_touching_the_worktree	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_unstage_restores_multiple_paths_without_touching_worktree	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_unstage_restores_the_head_spelling_after_a_case_rename	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_unstage_targets_the_exact_case_colliding_index_entry	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_unstage_works_in_a_repository_without_a_commit	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_write_refuses_a_null_head_fence_after_the_first_commit	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
+vcs_write_refuses_a_path_selector_with_a_backslash	lane:cwd+env+hash_kind	bridge integration test uses process cwd, environment, and hash kind while isolating Libra repository state
 verify_pack_rejects_duplicate_object_ids_even_with_valid_index_checksum	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; narrowed 2026-09-17 (DEFER-NP-02, user-directed) from the full named key set to the in-process closed set cwd+env+hash_kind — the classifier's process model can only prove pollution of these three lanes, so they carry the full in-process exclusion strength; cloud_live/workspace_failpoints were never resource evidence for this body and only serialized it inside the nextest `external` group
 wd_fuse_live_mount_boundary	lane:cwd	changes the process working directory for the live FUSE mount and opacity boundary test
 wd_move_cross_device_refuses_without_copy	lane:cwd	changes the process working directory for the cross-filesystem refusal test
@@ -999,48 +1204,3 @@ worktree_doctor_reports_scope_diagnostics	lane:cwd+env+hash_kind	fail-closed bod
 worktree_remove_keep_dir_preserves_or_tombstones_scope	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 worktree_remove_purges_layer_scope_rows	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
 writer_emits_all_six_e4_libra_entries	lane:cwd+env+hash_kind	fail-closed body (TA-01 global verdict) mechanically expanded by TA-03; narrowed 2026-09-17 (DEFER-NP-02, user-directed) from the full named key set to the in-process closed set cwd+env+hash_kind — the classifier's process model can only prove pollution of these three lanes, so they carry the full in-process exclusion strength; cloud_live/workspace_failpoints were never resource evidence for this body and only serialized it inside the nextest `external` group
-i1062_conversion_failure_preserves_index_and_names_attribute_source	lane:cwd	changes the process working directory (ChangeDirGuard)
-test_blame_date_formats_matrix	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
-test_blame_incremental_output	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
-test_blame_line_range_and_boundary_matrix	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
-test_blame_move_copy_detection_matrix	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
-test_config_list_defaults_to_all_scopes_and_local_restricts	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
-test_diff_dirstat_matrix	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
-test_diff_hunk_header_function_context	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
-test_diff_hunk_headers_match_git_matrix	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
-test_diff_index_cached	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
-test_diff_index_files_raw_matrix	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
-test_diff_tree_raw_and_patch_matrix	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
-test_explicit_scope_missing_or_unreadable_store	lane:cwd+env	changes the process working directory and mutates process-wide environment variables
-test_file_write_bytes_match_git_matrix	lane:cwd+env	changes the process working directory and mutates process-wide environment variables
-test_file_write_roundtrip_through_reader	lane:cwd+env	changes the process working directory and mutates process-wide environment variables
-test_grep_boolean_expressions_matrix	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
-test_grep_function_and_numeric_context_matrix	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
-test_grep_pattern_types_matrix	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
-test_grep_perl_regexp_unsupported_syntax_is_rejected	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
-test_legacy_and_subcommand_parity_table	lane:cwd+env	changes the process working directory and mutates process-wide environment variables
-test_list_and_get_regexp_order_format_matrix	lane:cwd+env	changes the process working directory and mutates process-wide environment variables
-test_log_and_diff_stat_counts_consistent	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
-test_log_default_layout_matches_git	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
-test_log_displays_notes_matrix	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
-test_log_format_last_one_wins	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
-test_log_graph_matches_git_fixtures	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
-test_log_graph_octopus_fixture	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
-test_log_grep_pattern_types_matrix	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
-test_log_perl_regexp_grep	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
-test_notes_blob_reuse_and_list_output	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
-test_rev_list_grep_matches_log_semantics	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
-test_shortlog_revision_ranges_matrix	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
-test_show_dirstat	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
-test_show_displays_default_notes	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
-test_show_header_blank_line	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
-test_show_stat_matches_git	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
-test_show_tree_objects_matrix	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
-test_subcommand_spellings_matrix	lane:cwd+env	changes the process working directory and mutates process-wide environment variables
-test_t1300_expiry_date	lane:cwd+env	changes the process working directory and mutates process-wide environment variables
-test_t1300_get_regexp_name_only	lane:cwd+env	changes the process working directory and mutates process-wide environment variables
-test_t1300_type_color	lane:cwd+env	changes the process working directory and mutates process-wide environment variables
-test_t3301_notes_display_ports	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
-test_t7007_show_tree_ports	lane:cwd	changes the process working directory (ChangeDirGuard/set_current_dir)
-test_type_color_matrix	lane:cwd+env	changes the process working directory and mutates process-wide environment variables
-test_type_expiry_date_matrix	lane:cwd+env	changes the process working directory and mutates process-wide environment variables

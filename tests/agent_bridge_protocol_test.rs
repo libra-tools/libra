@@ -12,10 +12,10 @@ use libra::internal::ai::agent_bridge::protocol::{
 };
 
 #[test]
-fn protocol_v1_allowlist_is_exactly_25_methods() {
+fn protocol_v1_allowlist_is_exactly_28_methods() {
     assert_eq!(
         libra::internal::ai::agent_bridge::protocol::METHOD_ALLOWLIST.len(),
-        25
+        28
     );
     assert_eq!(
         libra::internal::ai::agent_bridge::protocol::ProtocolVersion::current().minor,
@@ -23,11 +23,11 @@ fn protocol_v1_allowlist_is_exactly_25_methods() {
     );
 }
 
-/// The typed repository reads are negotiated: a peer that negotiated minor 1
-/// or higher sees them, an older peer does not, and the write methods stay
-/// disabled until LVC-06.
+/// The typed repository reads and writes are negotiated: a peer that
+/// negotiated the matching minor sees them, an older peer does not, and the
+/// removed fence method stays out.
 #[test]
-fn typed_vcs_reads_are_negotiated_and_writes_stay_disabled() {
+fn typed_vcs_methods_are_negotiated_by_minor() {
     use libra::internal::ai::agent_bridge::protocol::{
         admit_for_minor, dispatch_handshake, validate_method,
     };
@@ -59,12 +59,12 @@ fn typed_vcs_reads_are_negotiated_and_writes_stay_disabled() {
     }
     for method in writes {
         assert!(
-            !advertised
+            advertised
                 .iter()
                 .any(|entry| entry.as_str() == Some(method)),
-            "advertised {method}"
+            "not advertised {method}"
         );
-        assert!(validate_method(method).is_err(), "accepted {method}");
+        assert!(validate_method(method).is_ok(), "not accepted {method}");
     }
     assert!(
         !advertised
@@ -74,7 +74,7 @@ fn typed_vcs_reads_are_negotiated_and_writes_stay_disabled() {
     );
     assert!(validate_method("vcs.fence").is_err());
 
-    // A peer that negotiated minor 0 does not see the typed reads and cannot
+    // A peer that negotiated minor 0 does not see the typed methods and cannot
     // invoke them.
     let old = parse_request_line(r#"{"jsonrpc":"2.0","method":"initialize","params":{"protocol":{"major":1,"minor":0}},"id":1}"#).expect("request");
     let old_result = dispatch_handshake(&old)
@@ -83,7 +83,7 @@ fn typed_vcs_reads_are_negotiated_and_writes_stay_disabled() {
         .result
         .expect("result");
     let old_advertised = old_result["methods"].as_array().expect("methods");
-    for method in reads {
+    for method in reads.iter().chain(writes.iter()) {
         assert!(
             !old_advertised
                 .iter()

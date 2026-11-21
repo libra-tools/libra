@@ -113,6 +113,15 @@ impl DiffMode {
 /// ever name a path *inside* the repository and can never re-enter the
 /// pathspec mini-language with a broader meaning than the caller asked for.
 fn validate_path_selector(raw: &str) -> Result<String, BridgeError> {
+    validate_path_selector_plain(raw)
+}
+
+/// Preserve `diff.get`'s existing backslash-as-separator behavior.
+fn validate_legacy_path_selector(raw: &str) -> Result<String, BridgeError> {
+    validate_path_selector_plain(&raw.replace('\\', "/"))
+}
+
+fn validate_path_selector_plain(raw: &str) -> Result<String, BridgeError> {
     if raw.is_empty() {
         return Err(BridgeError::invalid_params(
             "path selector must not be empty",
@@ -144,8 +153,18 @@ fn validate_path_selector(raw: &str) -> Result<String, BridgeError> {
             "path selector '{raw}' contains pathspec glob syntax; the bridge accepts literal paths only"
         )));
     }
+    if raw.contains('\\') {
+        // A backslash is a separator on some platforms and an ordinary
+        // character in a file name on others. Rewriting it would turn a
+        // selector for one entry into a selector for another, so the bridge
+        // refuses it instead of choosing a meaning for it.
+        return Err(BridgeError::invalid_params(format!(
+            "path selector '{raw}' contains a backslash; the bridge accepts plain repository-relative \
+             paths only"
+        )));
+    }
     if raw
-        .split(['/', '\\'])
+        .split('/')
         .any(|component| component == ".." || component == "~")
     {
         return Err(BridgeError::invalid_params(format!(
@@ -153,7 +172,7 @@ fn validate_path_selector(raw: &str) -> Result<String, BridgeError> {
         )));
     }
     let normalized = raw
-        .split(['/', '\\'])
+        .split('/')
         .filter(|component| !component.is_empty() && *component != ".")
         .collect::<Vec<_>>()
         .join("/");
@@ -165,8 +184,20 @@ fn validate_path_selector(raw: &str) -> Result<String, BridgeError> {
     Ok(normalized)
 }
 
-/// Validate the optional `paths` array of a request.
+/// Validate the optional `paths` array of a typed VCS request.
 fn validate_paths(params: &Option<Value>) -> Result<Vec<String>, BridgeError> {
+    validate_paths_with(params, validate_path_selector)
+}
+
+/// Validate the optional `paths` array for the existing `diff.get` method.
+fn validate_legacy_paths(params: &Option<Value>) -> Result<Vec<String>, BridgeError> {
+    validate_paths_with(params, validate_legacy_path_selector)
+}
+
+fn validate_paths_with(
+    params: &Option<Value>,
+    validate: fn(&str) -> Result<String, BridgeError>,
+) -> Result<Vec<String>, BridgeError> {
     let Some(array) = params
         .as_ref()
         .and_then(|p| p.get("paths"))
@@ -188,7 +219,7 @@ fn validate_paths(params: &Option<Value>) -> Result<Vec<String>, BridgeError> {
         // Enabled `diff.get` keeps the caller's spelling. Resolving it through
         // `read_dir` follows symlink ancestors and can adopt names from outside
         // the worktree; case folding is not part of the released selector.
-        paths.push(validate_path_selector(raw)?);
+        paths.push(validate(raw)?);
     }
     Ok(paths)
 }
@@ -431,13 +462,27 @@ pub(crate) fn withheld_detail(_detail: impl std::fmt::Display) -> &'static str {
 
 /// Parse the typed `diff.get` params (mode + paths + limit).
 pub fn parse_diff_params(params: &Option<Value>) -> Result<(DiffMode, Vec<String>), BridgeError> {
+    parse_diff_params_with_paths(params, validate_paths)
+}
+
+/// Parse the existing `diff.get` params with its literal-backslash behavior.
+pub fn parse_legacy_diff_params(
+    params: &Option<Value>,
+) -> Result<(DiffMode, Vec<String>), BridgeError> {
+    parse_diff_params_with_paths(params, validate_legacy_paths)
+}
+
+fn parse_diff_params_with_paths(
+    params: &Option<Value>,
+    validate: fn(&Option<Value>) -> Result<Vec<String>, BridgeError>,
+) -> Result<(DiffMode, Vec<String>), BridgeError> {
     let mode = DiffMode::parse(
         params
             .as_ref()
             .and_then(|p| p.get("mode"))
             .and_then(Value::as_str),
     )?;
-    let paths = validate_paths(params)?;
+    let paths = validate(params)?;
     Ok((mode, paths))
 }
 

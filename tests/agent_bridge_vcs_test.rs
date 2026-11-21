@@ -11,7 +11,11 @@
 //!
 //! Every test is `#[serial]`: `ChangeDirGuard` mutates the process cwd.
 
-use std::{fs, io::Write, path::Path};
+use std::{
+    fs,
+    io::Write,
+    path::{Path, PathBuf},
+};
 
 use libra::{
     command::{
@@ -240,6 +244,43 @@ async fn diff_get_reports_real_worktree_changes_and_is_path_scoped() {
     assert!(
         files.iter().any(|f| f["path"] == "second.txt"),
         "the staged diff must report the newly staged file: {files:?}"
+    );
+}
+
+/// The legacy `diff.get` path contract continues to accept backslash separators.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+#[cfg(unix)]
+async fn diff_get_preserves_backslash_separator_compatibility() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    std::fs::create_dir(dir.path().join("src")).expect("src directory");
+    write_file(dir.path(), "src/main.rs", "before\n");
+    stage(&["src/main.rs"]).await;
+    cli_commit("add nested source path").await;
+    write_file(dir.path(), "src/main.rs", "before\nafter\n");
+
+    let ctx = bridge_ctx().await;
+    let response = read_dispatch(
+        &ctx,
+        &request(
+            r#"{"jsonrpc":"2.0","method":"diff.get","params":{"mode":"worktree","paths":["src\\main.rs"]},"id":1}"#,
+        ),
+    )
+    .await
+    .expect("diff.get keeps legacy path behavior")
+    .expect("response");
+    let result = response.result.expect("result envelope");
+    let files = envelope_data(&result)["files"]
+        .as_array()
+        .expect("files array");
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0]["path"], "src/main.rs");
+    assert!(
+        files[0]["patch"]
+            .as_str()
+            .expect("patch")
+            .contains("+after")
     );
 }
 
@@ -2332,11 +2373,11 @@ async fn vcs_stage_rejects_a_mode_change_between_reads() {
     );
 }
 
-/// Replacing the file after its bytes are reread does not change the staged mode.
+/// Replacing a file after its bytes are reread invalidates the stage fence.
 #[tokio::test]
 #[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
 #[serial(cwd, env, hash_kind)]
-async fn vcs_stage_keeps_mode_from_the_read_descriptor() {
+async fn vcs_stage_rejects_a_file_replaced_after_reading() {
     struct ClearHook;
     impl Drop for ClearHook {
         fn drop(&mut self) {
@@ -2357,6 +2398,8 @@ async fn vcs_stage_keeps_mode_from_the_read_descriptor() {
     let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
         .await
         .expect("fence");
+    let index_path = dir.path().join(".libra/index");
+    let index_before = fs::read(&index_path).expect("index before stage");
     libra::internal::ai::agent_bridge::vcs_write::set_mode_stat_rewrite_for_test(Some(
         dir.path().join("tool.sh"),
     ));
@@ -2364,28 +2407,22 @@ async fn vcs_stage_keeps_mode_from_the_read_descriptor() {
         r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-mode-fd","session_id":"s1","paths":["tool.sh"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
         fence.head, fence.index_generation, fence.worktree_generation
     );
-    mutation_dispatch(&ctx, &request(&frame))
+    let error = mutation_dispatch(&ctx, &request(&frame))
         .await
-        .expect("stage")
-        .expect("response")
-        .result
-        .expect("result");
-    let index =
-        git_internal::internal::index::Index::load(dir.path().join(".libra/index")).expect("index");
-    let entry = index.get("tool.sh", 0).expect("entry");
-    assert_eq!(entry.mode, 0o100755);
-    let approved = git_internal::hash::ObjectHash::from_type_and_data(
-        git_internal::internal::object::types::ObjectType::Blob,
-        b"#!/bin/sh\n",
+        .expect_err("file changed after its content was read");
+    assert_eq!(error.stable_code, "LBR-AGENT-038", "{}", error.message);
+    assert!(error.message.contains("stale_state"), "{}", error.message);
+    assert_eq!(
+        fs::read(&index_path).expect("index after refusal"),
+        index_before
     );
-    assert_eq!(entry.hash, approved);
 }
 
-/// A mode change during publish does not replace the snapshotted executable bit.
+/// A file replacement during stage preparation refuses publication rather than staging stale bytes.
 #[tokio::test]
 #[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
 #[serial(cwd, env, hash_kind)]
-async fn vcs_stage_keeps_the_snapshotted_executable_bit() {
+async fn vcs_stage_rejects_a_file_replaced_during_preparation() {
     struct ClearHook;
     impl Drop for ClearHook {
         fn drop(&mut self) {
@@ -2406,6 +2443,8 @@ async fn vcs_stage_keeps_the_snapshotted_executable_bit() {
     let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
         .await
         .expect("fence");
+    let index_path = dir.path().join(".libra/index");
+    let index_before = fs::read(&index_path).expect("index before stage");
     libra::internal::ai::agent_bridge::vcs_write::set_publish_rewrite_for_test(Some(
         dir.path().join("tool.sh"),
     ));
@@ -2413,21 +2452,15 @@ async fn vcs_stage_keeps_the_snapshotted_executable_bit() {
         r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-exec-race","session_id":"s1","paths":["tool.sh"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
         fence.head, fence.index_generation, fence.worktree_generation
     );
-    mutation_dispatch(&ctx, &request(&frame))
+    let error = mutation_dispatch(&ctx, &request(&frame))
         .await
-        .expect("stage")
-        .expect("response")
-        .result
-        .expect("result");
-    let index =
-        git_internal::internal::index::Index::load(dir.path().join(".libra/index")).expect("index");
-    let entry = index.get("tool.sh", 0).expect("entry");
-    assert_eq!(entry.mode, 0o100755);
-    let approved = git_internal::hash::ObjectHash::from_type_and_data(
-        git_internal::internal::object::types::ObjectType::Blob,
-        b"#!/bin/sh\n",
+        .expect_err("file replacement during stage");
+    assert_eq!(error.stable_code, "LBR-AGENT-038", "{}", error.message);
+    assert!(error.message.contains("stale_state"), "{}", error.message);
+    assert_eq!(
+        fs::read(&index_path).expect("index after refusal"),
+        index_before
     );
-    assert_eq!(entry.hash, approved);
 }
 
 /// Staging an executable regular file keeps mode 100755.
@@ -2634,6 +2667,1016 @@ async fn vcs_unstage_removes_a_newly_staged_file() {
     assert!(
         index.get("extra.txt", 0).is_none(),
         "new file must leave the index"
+    );
+}
+
+/// A directory selector is not a literal index entry and must not unstage its descendants.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_unstage_rejects_a_directory_without_changing_descendants() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    std::fs::create_dir_all(dir.path().join("dir/nested")).expect("create nested directory");
+    write_file(dir.path(), "dir/one.txt", "one\n");
+    write_file(dir.path(), "dir/nested/two.txt", "two\n");
+    stage(&["dir/one.txt", "dir/nested/two.txt"]).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    let index_path = dir.path().join(".libra/index");
+    let index_before = fs::read(&index_path).expect("index before unstage");
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.unstage","params":{{"operation_id":"op-unstage-directory","session_id":"s1","paths":["dir"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let error = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect_err("directory is not a literal staged path");
+    assert_eq!(error.stable_code, "LBR-AGENT-027", "{}", error.message);
+    assert!(
+        error.message.contains("did not match any staged file"),
+        "{}",
+        error.message
+    );
+    assert_eq!(
+        fs::read(&index_path).expect("index after unstage"),
+        index_before
+    );
+}
+
+/// A repository-relative unstage path resolves from the repository root while the process is in a subdirectory.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_unstage_resolves_paths_from_repository_root_in_subdirectory() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    std::fs::create_dir(dir.path().join("nested")).expect("nested directory");
+    write_file(dir.path(), "root.txt", "root\n");
+    write_file(dir.path(), "nested/root.txt", "nested\n");
+    stage(&["root.txt", "nested/root.txt"]).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    let _nested = ChangeDirGuard::new(dir.path().join("nested"));
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence from nested directory");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.unstage","params":{{"operation_id":"op-unstage-root-relative","session_id":"s1","paths":["root.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let result = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect("unstage")
+        .expect("response")
+        .result
+        .expect("result");
+    assert_eq!(result["outcome"], "applied");
+    let index =
+        git_internal::internal::index::Index::load(dir.path().join(".libra/index")).expect("index");
+    assert!(
+        index.get("root.txt", 0).is_none(),
+        "the requested root entry is unstaged"
+    );
+    assert!(
+        index.get("nested/root.txt", 0).is_some(),
+        "the similarly named nested entry remains staged"
+    );
+}
+
+/// Unstaging a staged deletion restores the HEAD entry.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_unstage_restores_a_staged_deletion() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    std::fs::remove_file(dir.path().join("tracked.txt")).expect("delete");
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let stage = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-stage-deletion","session_id":"s1","paths":["tracked.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    mutation_dispatch(&ctx, &request(&stage))
+        .await
+        .expect("stage the deletion")
+        .expect("response");
+    let index =
+        git_internal::internal::index::Index::load(dir.path().join(".libra/index")).expect("index");
+    assert!(
+        index.get("tracked.txt", 0).is_none(),
+        "the deletion is staged"
+    );
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("after stage");
+    let unstage = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.unstage","params":{{"operation_id":"op-unstage-deletion","session_id":"s1","paths":["tracked.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":2}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let result = mutation_dispatch(&ctx, &request(&unstage))
+        .await
+        .expect("unstage the deletion")
+        .expect("response")
+        .result
+        .expect("result");
+    assert_eq!(result["outcome"], "applied");
+    let index =
+        git_internal::internal::index::Index::load(dir.path().join(".libra/index")).expect("index");
+    let head_blob = git_internal::hash::ObjectHash::from_type_and_data(
+        git_internal::internal::object::types::ObjectType::Blob,
+        b"one\n",
+    );
+    assert_eq!(
+        index.get("tracked.txt", 0).expect("restored entry").hash,
+        head_blob,
+        "unstaging a deletion restores the HEAD content"
+    );
+}
+
+/// Unstaging must not change an index entry whose name differs only in case.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_unstage_does_not_change_a_case_variant_entry() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    // A case-sensitive filesystem can hold both spellings as different files.
+    write_file(dir.path(), "Foo", "upper\n");
+    if dir.path().join("Foo").exists() && !dir.path().join("foo").exists() {
+        stage(&["Foo"]).await;
+        cli_commit("add Foo").await;
+    }
+    if dir.path().join("foo").exists() {
+        // The filesystem folds case: the two spellings are one file, so this
+        // repository cannot hold the ambiguous pair the test describes.
+        return;
+    }
+    write_file(dir.path(), "foo", "lower\n");
+    stage(&["foo"]).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.unstage","params":{{"operation_id":"op-unstage-case-variant","session_id":"s1","paths":["foo"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let outcome = mutation_dispatch(&ctx, &request(&frame)).await;
+    let index =
+        git_internal::internal::index::Index::load(dir.path().join(".libra/index")).expect("index");
+    let upper = index.get("Foo", 0).expect("the tracked entry survives");
+    let upper_blob = git_internal::hash::ObjectHash::from_type_and_data(
+        git_internal::internal::object::types::ObjectType::Blob,
+        b"upper\n",
+    );
+    assert_eq!(
+        upper.hash, upper_blob,
+        "the entry the request did not name must keep its content"
+    );
+    if let Ok(Some(response)) = outcome {
+        let result = response.result.expect("result");
+        assert_eq!(result["outcome"], "applied");
+        assert!(
+            index.get("foo", 0).is_none(),
+            "the requested entry leaves the index"
+        );
+    }
+}
+
+/// Unstage uses the requested case spelling when both index spellings exist.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_unstage_targets_the_exact_case_colliding_index_entry() {
+    use git_internal::internal::index::{Index, IndexEntry};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    setup_with_new_libra_in(dir.path()).await;
+    let _guard = ChangeDirGuard::new(dir.path());
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), "Case.txt", "upper\n");
+    stage(&["Case.txt"]).await;
+
+    let index_path = dir.path().join(".libra/index");
+    let mut index = Index::load(&index_path).expect("load index");
+    let lower_hash = git_internal::hash::ObjectHash::from_type_and_data(
+        git_internal::internal::object::types::ObjectType::Blob,
+        b"lower\n",
+    );
+    index.add(IndexEntry::new_from_blob(
+        "case.txt".to_string(),
+        lower_hash,
+        6,
+    ));
+    index.save(&index_path).expect("save colliding entry");
+
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.unstage","params":{{"operation_id":"op-unstage-case-collision","session_id":"s1","paths":["case.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}} ,"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let result = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect("unstage the exact lower-case entry")
+        .expect("response")
+        .result
+        .expect("result");
+    assert_eq!(result["outcome"], "applied");
+    let index = Index::load(&index_path).expect("reload index");
+    assert!(
+        index.get("Case.txt", 0).is_some(),
+        "the unselected entry stays"
+    );
+    assert!(
+        index.get("case.txt", 0).is_none(),
+        "the selected entry leaves"
+    );
+}
+
+/// A commit request names repository-relative paths even when the bridge runs in a subdirectory.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_commit_matches_the_staged_set_from_a_subdirectory() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    std::fs::create_dir(dir.path().join("nested")).expect("nested directory");
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), "root.txt", "root\n");
+    stage(&["root.txt"]).await;
+    let _nested = ChangeDirGuard::new(dir.path().join("nested"));
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence from nested directory");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.commit","params":{{"operation_id":"op-commit-subdir","session_id":"s1","message":"feat: root file","paths":["root.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let result = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect("commit from nested directory")
+        .expect("response")
+        .result
+        .expect("result");
+    assert_eq!(result["outcome"], "applied");
+    let oid = result["commitOid"].as_str().expect("oid");
+    assert!(!oid.is_empty());
+}
+
+/// A repository without a commit can stage and unstage before its first commit.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_unstage_works_in_a_repository_without_a_commit() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    setup_with_new_libra_in(dir.path()).await;
+    let _guard = ChangeDirGuard::new(dir.path());
+    ConfigKv::set("user.name", "Bridge VCS Test", false)
+        .await
+        .expect("set user.name");
+    ConfigKv::set("user.email", "bridge-vcs@example.com", false)
+        .await
+        .expect("set user.email");
+    ConfigKv::set("commit.gpgSign", "false", false)
+        .await
+        .expect("disable fixture signing locally");
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), "first.txt", "first\n");
+    // The repository has no commit yet; staging creates the index the fence
+    // reads.
+    stage(&["first.txt"]).await;
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let stage = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-stage-unborn","session_id":"s1","paths":["first.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    mutation_dispatch(&ctx, &request(&stage))
+        .await
+        .expect("stage before the first commit")
+        .expect("response");
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("after stage");
+    let unstage = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.unstage","params":{{"operation_id":"op-unstage-unborn","session_id":"s1","paths":["first.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":2}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let result = mutation_dispatch(&ctx, &request(&unstage))
+        .await
+        .expect("unstage before the first commit")
+        .expect("response")
+        .result
+        .expect("result");
+    assert_eq!(result["outcome"], "applied");
+    let index =
+        git_internal::internal::index::Index::load(dir.path().join(".libra/index")).expect("index");
+    assert!(
+        index.get("first.txt", 0).is_none(),
+        "the staged addition leaves the index"
+    );
+    assert_eq!(
+        fs::read(dir.path().join("first.txt")).expect("worktree file"),
+        b"first\n"
+    );
+}
+
+/// Unstaging one side of a staged rename is refused; naming both sides undoes it.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_unstage_of_a_staged_rename_requires_both_paths() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    write_file(dir.path(), "old.txt", "same content\n");
+    stage(&["old.txt"]).await;
+    cli_commit("add old").await;
+    // A rename with unchanged content: the source is deleted and the target is
+    // added with the same blob.
+    std::fs::rename(dir.path().join("old.txt"), dir.path().join("new.txt")).expect("rename");
+    stage(&["old.txt", "new.txt"]).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let index_path = dir.path().join(".libra/index");
+    let index_before = fs::read(&index_path).expect("index before unstage");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.unstage","params":{{"operation_id":"op-unstage-rename-one","session_id":"s1","paths":["new.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let error = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect_err("a rename needs both of its paths");
+    assert_eq!(error.stable_code, "LBR-AGENT-027", "{}", error.message);
+    assert!(error.message.contains("staged rename"), "{}", error.message);
+    assert_eq!(
+        fs::read(&index_path).expect("index after refusal"),
+        index_before
+    );
+
+    // The source endpoint alone is refused as well: restoring it would leave
+    // the new path staged as an addition.
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence after refusal");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.unstage","params":{{"operation_id":"op-unstage-rename-source","session_id":"s1","paths":["old.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":2}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let error = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect_err("the source of a rename needs the destination too");
+    assert_eq!(error.stable_code, "LBR-AGENT-027", "{}", error.message);
+    assert!(error.message.contains("staged rename"), "{}", error.message);
+    assert_eq!(
+        fs::read(&index_path).expect("index after refusal"),
+        index_before
+    );
+
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence after refusal");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.unstage","params":{{"operation_id":"op-unstage-rename-both","session_id":"s1","paths":["new.txt","old.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":3}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let result = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect("unstage the rename")
+        .expect("response")
+        .result
+        .expect("result");
+    assert_eq!(result["outcome"], "applied");
+    let index =
+        git_internal::internal::index::Index::load(dir.path().join(".libra/index")).expect("index");
+    assert!(
+        index.get("new.txt", 0).is_none(),
+        "the renamed addition leaves the index"
+    );
+    let head_blob = git_internal::hash::ObjectHash::from_type_and_data(
+        git_internal::internal::object::types::ObjectType::Blob,
+        b"same content\n",
+    );
+    assert_eq!(
+        index
+            .get("old.txt", 0)
+            .expect("the source is restored")
+            .hash,
+        head_blob,
+        "the renamed source is restored"
+    );
+}
+
+/// A staged rename with several destinations needs every one of its paths.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_unstage_of_a_rename_with_several_destinations_needs_every_path() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    write_file(dir.path(), "old.txt", "shared\n");
+    stage(&["old.txt"]).await;
+    cli_commit("add old").await;
+    std::fs::remove_file(dir.path().join("old.txt")).expect("remove old");
+    write_file(dir.path(), "new-a.txt", "shared\n");
+    write_file(dir.path(), "new-b.txt", "shared\n");
+    stage(&["old.txt", "new-a.txt", "new-b.txt"]).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let index_path = dir.path().join(".libra/index");
+    let index_before = fs::read(&index_path).expect("index before unstage");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.unstage","params":{{"operation_id":"op-unstage-rename-partial","session_id":"s1","paths":["old.txt","new-a.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let error = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect_err("every path of the rename is needed");
+    assert_eq!(error.stable_code, "LBR-AGENT-027", "{}", error.message);
+    assert!(error.message.contains("staged rename"), "{}", error.message);
+    assert_eq!(
+        fs::read(&index_path).expect("index after refusal"),
+        index_before
+    );
+
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence after refusal");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.unstage","params":{{"operation_id":"op-unstage-rename-complete","session_id":"s1","paths":["old.txt","new-a.txt","new-b.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":2}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let result = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect("unstage the rename")
+        .expect("response")
+        .result
+        .expect("result");
+    assert_eq!(result["outcome"], "applied");
+    let index =
+        git_internal::internal::index::Index::load(dir.path().join(".libra/index")).expect("index");
+    assert!(index.get("new-a.txt", 0).is_none(), "the first copy leaves");
+    assert!(
+        index.get("new-b.txt", 0).is_none(),
+        "the second copy leaves"
+    );
+    let head_blob = git_internal::hash::ObjectHash::from_type_and_data(
+        git_internal::internal::object::types::ObjectType::Blob,
+        b"shared\n",
+    );
+    assert_eq!(
+        index
+            .get("old.txt", 0)
+            .expect("the source is restored")
+            .hash,
+        head_blob
+    );
+}
+
+/// A staged submodule deletion is restored without reading the submodule commit.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_unstage_restores_a_staged_gitlink_without_reading_it() {
+    use git_internal::{
+        hash::ObjectHash,
+        internal::index::{Index, IndexEntry},
+    };
+    use libra::utils::object_ext::{CommitExt, TreeExt};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    // A gitlink entry names a commit of another repository, which is normally
+    // absent from this object store.
+    let index_path = dir.path().join(".libra/index");
+    let mut index = Index::load(&index_path).expect("load index");
+    let mut entry = IndexEntry::new_from_blob("module".to_string(), ObjectHash::default(), 0);
+    entry.mode = 0o160000;
+    index.add(entry);
+    index.save(&index_path).expect("save index");
+    cli_commit("add submodule").await;
+    let head = Head::current_commit().await.expect("head");
+    let stored = git_internal::internal::object::commit::Commit::load(&head).expect("commit");
+    let tree = git_internal::internal::object::tree::Tree::load(&stored.tree_id).expect("tree");
+    let gitlink = tree
+        .tree_items
+        .iter()
+        .find(|item| item.name == "module")
+        .expect("the gitlink is in HEAD");
+    assert_eq!(
+        gitlink.mode,
+        git_internal::internal::object::tree::TreeItemMode::Commit
+    );
+
+    // Stage the submodule's deletion by dropping its index entry.
+    let mut index = Index::load(&index_path).expect("load index");
+    for stage in 0..4 {
+        index.remove("module", stage);
+    }
+    index.save(&index_path).expect("save index");
+
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.unstage","params":{{"operation_id":"op-unstage-gitlink","session_id":"s1","paths":["module"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let result = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect("unstage the submodule")
+        .expect("response")
+        .result
+        .expect("result");
+    assert_eq!(result["outcome"], "applied");
+    let index = Index::load(&index_path).expect("index");
+    let restored = index.get("module", 0).expect("the gitlink is restored");
+    assert_eq!(restored.mode, 0o160000);
+    assert_eq!(restored.hash, gitlink.id);
+}
+
+/// A rename in a request never changes another selected path's index entry.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_unstage_of_a_rename_leaves_other_selected_paths_alone() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    write_file(dir.path(), "old.txt", "renamed\n");
+    write_file(dir.path(), "edited.txt", "edited\n");
+    stage(&["old.txt", "edited.txt"]).await;
+    cli_commit("add both").await;
+    // A rename plus an unrelated modification.
+    std::fs::remove_file(dir.path().join("old.txt")).expect("remove old");
+    write_file(dir.path(), "new.txt", "renamed\n");
+    write_file(dir.path(), "edited.txt", "edited again\n");
+    stage(&["old.txt", "new.txt", "edited.txt"]).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.unstage","params":{{"operation_id":"op-unstage-rename-mixed","session_id":"s1","paths":["new.txt","old.txt","edited.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let result = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect("unstage the rename and the edit")
+        .expect("response")
+        .result
+        .expect("result");
+    assert_eq!(result["outcome"], "applied");
+    let index =
+        git_internal::internal::index::Index::load(dir.path().join(".libra/index")).expect("index");
+    let old_blob = git_internal::hash::ObjectHash::from_type_and_data(
+        git_internal::internal::object::types::ObjectType::Blob,
+        b"renamed\n",
+    );
+    assert_eq!(
+        index
+            .get("old.txt", 0)
+            .expect("the source is restored")
+            .hash,
+        old_blob
+    );
+    assert!(
+        index.get("new.txt", 0).is_none(),
+        "the renamed path leaves the index"
+    );
+    // The unrelated path was named by the request, so it is unstaged in its
+    // own right: its index entry is restored from HEAD. What must not happen is
+    // that the rename drops that entry or restores the rename's source in its
+    // place.
+    let edited_blob = git_internal::hash::ObjectHash::from_type_and_data(
+        git_internal::internal::object::types::ObjectType::Blob,
+        b"edited\n",
+    );
+    assert_eq!(
+        index
+            .get("edited.txt", 0)
+            .expect("the edit keeps its entry")
+            .hash,
+        edited_blob,
+        "the unrelated path must be restored from HEAD, not dropped"
+    );
+}
+
+/// A path that is not staged is refused even when the request also names a rename.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_unstage_refuses_an_unstaged_path_next_to_a_rename() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    write_file(dir.path(), "old.txt", "renamed\n");
+    stage(&["old.txt"]).await;
+    cli_commit("add old").await;
+    std::fs::remove_file(dir.path().join("old.txt")).expect("remove old");
+    write_file(dir.path(), "new.txt", "renamed\n");
+    stage(&["old.txt", "new.txt"]).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let index_path = dir.path().join(".libra/index");
+    let index_before = fs::read(&index_path).expect("index before unstage");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.unstage","params":{{"operation_id":"op-unstage-rename-missing","session_id":"s1","paths":["new.txt","old.txt","absent.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let error = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect_err("the absent path is refused");
+    assert_eq!(error.stable_code, "LBR-AGENT-027", "{}", error.message);
+    assert!(
+        error.message.contains("did not match any staged file"),
+        "{}",
+        error.message
+    );
+    assert_eq!(
+        fs::read(&index_path).expect("index after refusal"),
+        index_before
+    );
+}
+
+/// Two staged renames in one request each restore their own source.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_unstage_of_two_renames_restores_each_source() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    write_file(dir.path(), "old-a.txt", "first\n");
+    write_file(dir.path(), "old-b.txt", "second\n");
+    stage(&["old-a.txt", "old-b.txt"]).await;
+    cli_commit("add both").await;
+    std::fs::remove_file(dir.path().join("old-a.txt")).expect("remove a");
+    std::fs::remove_file(dir.path().join("old-b.txt")).expect("remove b");
+    write_file(dir.path(), "new-a.txt", "first\n");
+    write_file(dir.path(), "new-b.txt", "second\n");
+    stage(&["old-a.txt", "old-b.txt", "new-a.txt", "new-b.txt"]).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.unstage","params":{{"operation_id":"op-unstage-two-renames","session_id":"s1","paths":["new-a.txt","old-a.txt","new-b.txt","old-b.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let result = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect("unstage both renames")
+        .expect("response")
+        .result
+        .expect("result");
+    assert_eq!(result["outcome"], "applied");
+    let index =
+        git_internal::internal::index::Index::load(dir.path().join(".libra/index")).expect("index");
+    let first = git_internal::hash::ObjectHash::from_type_and_data(
+        git_internal::internal::object::types::ObjectType::Blob,
+        b"first\n",
+    );
+    let second = git_internal::hash::ObjectHash::from_type_and_data(
+        git_internal::internal::object::types::ObjectType::Blob,
+        b"second\n",
+    );
+    assert_eq!(
+        index.get("old-a.txt", 0).expect("the first source").hash,
+        first
+    );
+    assert_eq!(
+        index.get("old-b.txt", 0).expect("the second source").hash,
+        second
+    );
+    assert!(index.get("new-a.txt", 0).is_none(), "the first copy leaves");
+    assert!(
+        index.get("new-b.txt", 0).is_none(),
+        "the second copy leaves"
+    );
+}
+
+/// Several identical sources make a rename ambiguous; the whole group is then
+/// authorized together.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_unstage_of_an_ambiguous_rename_needs_every_candidate_path() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    write_file(dir.path(), "a.txt", "identical\n");
+    write_file(dir.path(), "b.txt", "identical\n");
+    stage(&["a.txt", "b.txt"]).await;
+    cli_commit("add both copies").await;
+    std::fs::remove_file(dir.path().join("a.txt")).expect("remove a");
+    std::fs::remove_file(dir.path().join("b.txt")).expect("remove b");
+    write_file(dir.path(), "c.txt", "identical\n");
+    stage(&["a.txt", "b.txt", "c.txt"]).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let index_path = dir.path().join(".libra/index");
+    let index_before = fs::read(&index_path).expect("index before unstage");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.unstage","params":{{"operation_id":"op-unstage-ambiguous-rename","session_id":"s1","paths":["c.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let error = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect_err("an ambiguous rename needs every candidate path");
+    assert_eq!(error.stable_code, "LBR-AGENT-027", "{}", error.message);
+    assert!(error.message.contains("staged rename"), "{}", error.message);
+    assert_eq!(
+        fs::read(&index_path).expect("index after refusal"),
+        index_before
+    );
+
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence after refusal");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.unstage","params":{{"operation_id":"op-unstage-ambiguous-rename-all","session_id":"s1","paths":["c.txt","a.txt","b.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":2}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let result = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect("unstage the ambiguous rename")
+        .expect("response")
+        .result
+        .expect("result");
+    assert_eq!(result["outcome"], "applied");
+    let index =
+        git_internal::internal::index::Index::load(dir.path().join(".libra/index")).expect("index");
+    assert!(
+        index.get("c.txt", 0).is_none(),
+        "the new path leaves the index"
+    );
+    let blob = git_internal::hash::ObjectHash::from_type_and_data(
+        git_internal::internal::object::types::ObjectType::Blob,
+        b"identical\n",
+    );
+    assert_eq!(index.get("a.txt", 0).expect("the first source").hash, blob);
+    assert_eq!(index.get("b.txt", 0).expect("the second source").hash, blob);
+}
+
+/// Two repository entries that differ only in case are two entries, and each
+/// one needs its own authorization.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_unstage_of_a_case_colliding_rename_needs_both_entries() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    write_file(dir.path(), "A", "colliding\n");
+    // Two spellings that differ only in case are two files only on a
+    // case-sensitive filesystem.
+    if dir.path().join("a").exists() {
+        return;
+    }
+    write_file(dir.path(), "a", "colliding\n");
+    stage(&["A", "a"]).await;
+    cli_commit("add both spellings").await;
+    std::fs::remove_file(dir.path().join("A")).expect("remove A");
+    std::fs::remove_file(dir.path().join("a")).expect("remove a");
+    write_file(dir.path(), "b", "colliding\n");
+    stage(&["A", "a", "b"]).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let index_path = dir.path().join(".libra/index");
+    let index_before = fs::read(&index_path).expect("index before unstage");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.unstage","params":{{"operation_id":"op-unstage-case-colliding","session_id":"s1","paths":["a","b"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let error = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect_err("the other spelling needs its own authorization");
+    assert_eq!(error.stable_code, "LBR-AGENT-027", "{}", error.message);
+    assert!(error.message.contains("staged rename"), "{}", error.message);
+    assert_eq!(
+        fs::read(&index_path).expect("index after refusal"),
+        index_before
+    );
+
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence after refusal");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.unstage","params":{{"operation_id":"op-unstage-case-colliding-all","session_id":"s1","paths":["a","A","b"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":2}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let result = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect("unstage the colliding rename")
+        .expect("response")
+        .result
+        .expect("result");
+    assert_eq!(result["outcome"], "applied");
+    let index =
+        git_internal::internal::index::Index::load(dir.path().join(".libra/index")).expect("index");
+    let blob = git_internal::hash::ObjectHash::from_type_and_data(
+        git_internal::internal::object::types::ObjectType::Blob,
+        b"colliding\n",
+    );
+    assert_eq!(index.get("A", 0).expect("the first entry").hash, blob);
+    assert_eq!(index.get("a", 0).expect("the second entry").hash, blob);
+    assert!(index.get("b", 0).is_none(), "the new path leaves the index");
+}
+
+/// A literal backslash in a repository path is not a path separator.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_unstage_keeps_a_literal_backslash_path_apart() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    std::fs::create_dir(dir.path().join("a")).expect("directory a");
+    write_file(dir.path(), "a/b", "slash\n");
+    write_file(dir.path(), "a\\b", "backslash\n");
+    stage(&["a/b", "a\\b"]).await;
+    cli_commit("add both names").await;
+    write_file(dir.path(), "a/b", "slash changed\n");
+    stage(&["a/b"]).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.unstage","params":{{"operation_id":"op-unstage-backslash","session_id":"s1","paths":["a/b"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let result = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect("unstage a/b")
+        .expect("response")
+        .result
+        .expect("result");
+    assert_eq!(result["outcome"], "applied");
+    let index =
+        git_internal::internal::index::Index::load(dir.path().join(".libra/index")).expect("index");
+    let slash = git_internal::hash::ObjectHash::from_type_and_data(
+        git_internal::internal::object::types::ObjectType::Blob,
+        b"slash\n",
+    );
+    let backslash = git_internal::hash::ObjectHash::from_type_and_data(
+        git_internal::internal::object::types::ObjectType::Blob,
+        b"backslash\n",
+    );
+    assert_eq!(
+        index.get("a/b", 0).expect("the slash path").hash,
+        slash,
+        "the slash path restores its own content"
+    );
+    assert_eq!(
+        index.get("a\\b", 0).expect("the backslash path").hash,
+        backslash,
+        "the backslash path keeps its own content"
+    );
+}
+
+/// A backslash in a path selector is refused instead of being redirected.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_write_refuses_a_path_selector_with_a_backslash() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), "plain.txt", "plain\n");
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let index_path = dir.path().join(".libra/index");
+    let index_before = fs::read(&index_path).expect("index before stage");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-stage-backslash","session_id":"s1","paths":["a\\b"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let error = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect_err("a backslash selector is refused");
+    assert_eq!(error.stable_code, "LBR-AGENT-027", "{}", error.message);
+    assert!(error.message.contains("backslash"), "{}", error.message);
+    assert_eq!(
+        fs::read(&index_path).expect("index after refusal"),
+        index_before
+    );
+}
+
+/// The commit scope compares exact repository entry names.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_commit_scope_keeps_distinct_entry_names_apart() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    std::fs::create_dir(dir.path().join("a")).expect("directory a");
+    write_file(dir.path(), "a/b", "slash\n");
+    write_file(dir.path(), "a\\b", "backslash\n");
+    stage(&["a/b", "a\\b"]).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let head_before = Head::current_commit().await.expect("head");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.commit","params":{{"operation_id":"op-commit-backslash","session_id":"s1","message":"feat: one entry","paths":["a/b"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let error = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect_err("the staged set holds two distinct entries");
+    assert!(
+        error.message.contains("do not match the staged set"),
+        "{}",
+        error.message
+    );
+    assert_eq!(
+        Head::current_commit().await.expect("unchanged"),
+        head_before
+    );
+}
+
+/// Two case-colliding index names remain separate authorization entries.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_commit_refuses_two_case_colliding_index_entries_as_one_path() {
+    use git_internal::internal::index::{Index, IndexEntry};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    write_file(dir.path(), "Case.txt", "staged once\n");
+    stage(&["Case.txt"]).await;
+
+    let index_path = dir.path().join(".libra/index");
+    let mut index = Index::load(&index_path).expect("load index");
+    let (hash, size, mode) = {
+        let entry = index.get("Case.txt", 0).expect("staged entry");
+        (entry.hash, entry.size, entry.mode)
+    };
+    let mut colliding = IndexEntry::new_from_blob("case.txt".to_string(), hash, size);
+    colliding.mode = mode;
+    index.add(colliding);
+    index.save(&index_path).expect("save case-colliding entry");
+    let index = Index::load(&index_path).expect("reload index");
+    assert!(index.get("Case.txt", 0).is_some());
+    assert!(index.get("case.txt", 0).is_some());
+
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let head_before = Head::current_commit().await.expect("head");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.commit","params":{{"operation_id":"op-commit-case-collision","session_id":"s1","message":"feat: commit one spelling","paths":["Case.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}} ,"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let error = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect_err("both changed index entries need authorization");
+    assert!(
+        error.message.contains("do not match the staged set"),
+        "{}",
+        error.message
+    );
+    assert_eq!(
+        Head::current_commit().await.expect("unchanged"),
+        head_before
+    );
+}
+
+/// The worktree fence hashes the exact repository-relative path.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_fence_hashes_a_literal_backslash_path() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    write_file(dir.path(), "a\\b", "one\n");
+    let before = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("first fence");
+    write_file(dir.path(), "a\\b", "one\nchanged\n");
+    let after = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("second fence");
+    assert_ne!(
+        before.worktree_generation, after.worktree_generation,
+        "a changed literal backslash path must change the fence"
     );
 }
 
@@ -3013,10 +4056,10 @@ async fn vcs_commit_omits_an_empty_directory_after_its_last_file_is_deleted() {
     );
 }
 
-/// A case-only directory rename keeps one index path and one tree path.
+/// A case-only directory rename keeps the spelling the request named.
 #[tokio::test]
 #[serial(cwd, env, hash_kind)]
-async fn vcs_commit_accepts_a_case_only_directory_rename() {
+async fn vcs_commit_keeps_the_requested_spelling_after_a_case_only_directory_rename() {
     use libra::utils::object_ext::{CommitExt, TreeExt};
     let dir = tempfile::tempdir().expect("tempdir");
     let _guard = repo_with_initial_commit(dir.path()).await;
@@ -3028,7 +4071,7 @@ async fn vcs_commit_accepts_a_case_only_directory_rename() {
     if !dir.path().join("sub").exists() {
         return;
     }
-    write_file(dir.path(), "Sub/nested.txt", "nested\nrenamed\n");
+    write_file(dir.path(), "Sub/nested.txt", "nested\nchanged\n");
     let ctx = bridge_ctx().await;
     open_session(&ctx, "s1").await;
     let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
@@ -3050,12 +4093,12 @@ async fn vcs_commit_accepts_a_case_only_directory_rename() {
         .map(|path| path.display().to_string().replace('\\', "/"))
         .filter(|name| name.eq_ignore_ascii_case("sub/nested.txt"))
         .collect();
-    assert_eq!(names, vec!["Sub/nested.txt".to_string()], "{names:?}");
+    assert_eq!(names, vec!["sub/nested.txt".to_string()], "{names:?}");
     let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
         .await
         .expect("after stage");
     let commit_frame = format!(
-        r#"{{"jsonrpc":"2.0","method":"vcs.commit","params":{{"operation_id":"op-commit-dir-case","session_id":"s1","message":"chore: rename directory case","paths":["SUB/NESTED.TXT"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":2}}"#,
+        r#"{{"jsonrpc":"2.0","method":"vcs.commit","params":{{"operation_id":"op-commit-dir-case","session_id":"s1","message":"chore: rename directory case","paths":["sub/nested.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":2}}"#,
         fence.head, fence.index_generation, fence.worktree_generation
     );
     let result = mutation_dispatch(&ctx, &request(&commit_frame))
@@ -3075,7 +4118,7 @@ async fn vcs_commit_accepts_a_case_only_directory_rename() {
         .iter()
         .find(|item| item.name.eq_ignore_ascii_case("sub"))
         .expect("subdirectory");
-    assert_eq!(sub.name, "Sub");
+    assert_eq!(sub.name, "sub");
     let nested = git_internal::internal::object::tree::Tree::load(&sub.id).expect("nested tree");
     let nested_names: Vec<_> = nested
         .tree_items
@@ -3087,6 +4130,10 @@ async fn vcs_commit_accepts_a_case_only_directory_rename() {
 }
 
 /// Unstaging a case-only rename restores the HEAD spelling in the index.
+///
+/// On a case-folding filesystem the two spellings are one path, so one name
+/// restores it. On a case-sensitive filesystem they are two paths and the
+/// rename needs both of them.
 #[tokio::test]
 #[serial(cwd, env, hash_kind)]
 async fn vcs_unstage_restores_the_head_spelling_after_a_case_rename() {
@@ -3098,6 +4145,8 @@ async fn vcs_unstage_restores_the_head_spelling_after_a_case_rename() {
     )
     .expect("rename");
     if !dir.path().join("tracked.txt").exists() {
+        // The filesystem folds case: the rename did not produce a second
+        // spelling, so there is no case-only rename to undo.
         return;
     }
     write_file(dir.path(), "Tracked.txt", "one\nrenamed\n");
@@ -3117,8 +4166,17 @@ async fn vcs_unstage_restores_the_head_spelling_after_a_case_rename() {
     let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
         .await
         .expect("after stage");
+    let alias = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.unstage","params":{{"operation_id":"op-unstage-case-alias","session_id":"s1","paths":["TRACKED.TXT"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":2}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let error = mutation_dispatch(&ctx, &request(&alias))
+        .await
+        .expect_err("an alias cannot authorize another index spelling");
+    assert!(error.message.contains("exact unambiguous index spelling"));
+
     let unstage = format!(
-        r#"{{"jsonrpc":"2.0","method":"vcs.unstage","params":{{"operation_id":"op-unstage-case","session_id":"s1","paths":["TRACKED.TXT"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":2}}"#,
+        r#"{{"jsonrpc":"2.0","method":"vcs.unstage","params":{{"operation_id":"op-unstage-case","session_id":"s1","paths":["Tracked.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":2}}"#,
         fence.head, fence.index_generation, fence.worktree_generation
     );
     let result = mutation_dispatch(&ctx, &request(&unstage))
@@ -3143,10 +4201,89 @@ async fn vcs_unstage_restores_the_head_spelling_after_a_case_rename() {
     );
 }
 
-/// Committing a case-only rename uses the single index name, not both spellings.
+/// On a case-sensitive filesystem a case-only rename has two paths, and each
+/// one needs its own authorization.
 #[tokio::test]
 #[serial(cwd, env, hash_kind)]
-async fn vcs_commit_accepts_a_case_only_rename() {
+async fn vcs_unstage_of_a_case_only_rename_needs_both_spellings() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    // Two spellings that differ only in case are two files only on a
+    // case-sensitive filesystem.
+    write_file(dir.path(), "Foo", "upper\n");
+    if dir.path().join("foo").exists() {
+        return;
+    }
+    write_file(dir.path(), "foo", "lower\n");
+    stage(&["Foo", "foo"]).await;
+    cli_commit("add both spellings").await;
+    // Stage a case-only rename: the source is deleted and the target is added
+    // with the same content.
+    std::fs::rename(dir.path().join("Foo"), dir.path().join("FOO")).expect("rename");
+    stage(&["Foo", "FOO"]).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let index_path = dir.path().join(".libra/index");
+    let index_before = fs::read(&index_path).expect("index before unstage");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.unstage","params":{{"operation_id":"op-unstage-case-one","session_id":"s1","paths":["FOO"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let error = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect_err("a case-only rename has two paths on this filesystem");
+    assert_eq!(error.stable_code, "LBR-AGENT-027", "{}", error.message);
+    assert!(error.message.contains("staged rename"), "{}", error.message);
+    assert_eq!(
+        fs::read(&index_path).expect("index after refusal"),
+        index_before
+    );
+
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence after refusal");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.unstage","params":{{"operation_id":"op-unstage-case-both","session_id":"s1","paths":["FOO","Foo"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":2}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let result = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect("unstage the case-only rename")
+        .expect("response")
+        .result
+        .expect("result");
+    assert_eq!(result["outcome"], "applied");
+    let index =
+        git_internal::internal::index::Index::load(dir.path().join(".libra/index")).expect("index");
+    assert!(
+        index.get("FOO", 0).is_none(),
+        "the renamed spelling leaves the index"
+    );
+    let head_blob = git_internal::hash::ObjectHash::from_type_and_data(
+        git_internal::internal::object::types::ObjectType::Blob,
+        b"upper\n",
+    );
+    assert_eq!(
+        index
+            .get("Foo", 0)
+            .expect("the source spelling is restored")
+            .hash,
+        head_blob
+    );
+}
+
+/// A case-only rename keeps the spelling the request named.
+///
+/// The index entry follows the request: staging `tracked.txt` updates the
+/// `tracked.txt` entry, exactly as `libra add tracked.txt` does, and the
+/// commit scope must name that entry. A differently spelled name is a
+/// different scope and is refused.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_commit_keeps_the_requested_spelling_after_a_case_only_rename() {
     let dir = tempfile::tempdir().expect("tempdir");
     let _guard = repo_with_initial_commit(dir.path()).await;
     std::fs::rename(
@@ -3157,7 +4294,7 @@ async fn vcs_commit_accepts_a_case_only_rename() {
     if !dir.path().join("tracked.txt").exists() {
         return;
     }
-    write_file(dir.path(), "Tracked.txt", "one\nrenamed\n");
+    write_file(dir.path(), "Tracked.txt", "one\nchanged\n");
     let ctx = bridge_ctx().await;
     open_session(&ctx, "s1").await;
     let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
@@ -3171,11 +4308,41 @@ async fn vcs_commit_accepts_a_case_only_rename() {
         .await
         .expect("stage")
         .expect("response");
+    let index =
+        git_internal::internal::index::Index::load(dir.path().join(".libra/index")).expect("index");
+    let names: Vec<String> = index
+        .tracked_files()
+        .into_iter()
+        .map(|path| path.display().to_string())
+        .filter(|name| name.eq_ignore_ascii_case("tracked.txt"))
+        .collect();
+    assert_eq!(names, vec!["tracked.txt".to_string()], "{names:?}");
+
     let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
         .await
         .expect("after stage");
+    let head_before = Head::current_commit()
+        .await
+        .expect("head before alias refusal");
+    let alias = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.commit","params":{{"operation_id":"op-commit-case-alias","session_id":"s1","message":"chore: rename case","paths":["TRACKED.TXT"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":2}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let error = mutation_dispatch(&ctx, &request(&alias))
+        .await
+        .expect_err("commit path aliases do not replace exact index spelling");
+    assert!(
+        error.message.contains("do not match the staged set"),
+        "{}",
+        error.message
+    );
+    assert_eq!(
+        Head::current_commit().await.expect("unchanged"),
+        head_before
+    );
+
     let commit = format!(
-        r#"{{"jsonrpc":"2.0","method":"vcs.commit","params":{{"operation_id":"op-commit-case","session_id":"s1","message":"chore: rename case","paths":["TRACKED.TXT"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":2}}"#,
+        r#"{{"jsonrpc":"2.0","method":"vcs.commit","params":{{"operation_id":"op-commit-case","session_id":"s1","message":"chore: rename case","paths":["tracked.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":3}}"#,
         fence.head, fence.index_generation, fence.worktree_generation
     );
     let result = mutation_dispatch(&ctx, &request(&commit))
@@ -3198,17 +4365,67 @@ async fn vcs_commit_accepts_a_case_only_rename() {
         .map(|item| item.name.as_str())
         .filter(|name| name.eq_ignore_ascii_case("tracked.txt"))
         .collect();
-    assert_eq!(names, ["Tracked.txt"], "{names:?}");
+    assert_eq!(names, ["tracked.txt"], "{names:?}");
     let renamed = git_internal::hash::ObjectHash::from_type_and_data(
         git_internal::internal::object::types::ObjectType::Blob,
-        b"one\nrenamed\n",
+        b"one\nchanged\n",
     );
     let item = tree
         .tree_items
         .iter()
-        .find(|item| item.name == "Tracked.txt")
+        .find(|item| item.name == "tracked.txt")
         .expect("tree item");
     assert_eq!(item.id, renamed);
+}
+
+/// A case-only rename with changed content is not a proven rename scope.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_commit_refuses_an_inexact_case_only_rename_scope() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    std::fs::rename(
+        dir.path().join("tracked.txt"),
+        dir.path().join("Tracked.txt"),
+    )
+    .expect("rename");
+    if !dir.path().join("tracked.txt").exists() {
+        return;
+    }
+    write_file(dir.path(), "Tracked.txt", "one\nchanged\n");
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let stage = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-stage-case-change","session_id":"s1","paths":["tracked.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}} ,"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    mutation_dispatch(&ctx, &request(&stage))
+        .await
+        .expect("stage changed case-only rename")
+        .expect("response");
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("after stage");
+    let head_before = Head::current_commit().await.expect("head");
+    let commit = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.commit","params":{{"operation_id":"op-commit-case-change","session_id":"s1","message":"chore: rename and edit case","paths":["Tracked.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}} ,"id":2}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let error = mutation_dispatch(&ctx, &request(&commit))
+        .await
+        .expect_err("a changed-content rename does not prove a one-path scope");
+    assert!(
+        error.message.contains("do not match the staged set"),
+        "{}",
+        error.message
+    );
+    assert_eq!(
+        Head::current_commit().await.expect("unchanged"),
+        head_before
+    );
 }
 
 /// A Unicode spelling that names an existing directory entry reuses that entry's name.
@@ -3295,16 +4512,17 @@ async fn vcs_stage_replaces_a_case_only_rename() {
     assert_eq!(index.get("Tracked.txt", 0).expect("entry").hash, changed);
 }
 
-/// A case-only path spelling does not create a second index entry.
+/// A case-only path spelling never changes a differently spelled entry.
 #[tokio::test]
 #[serial(cwd, env, hash_kind)]
-async fn vcs_stage_does_not_duplicate_a_case_variant() {
+async fn vcs_stage_refuses_a_case_variant_of_an_indexed_entry() {
     let dir = tempfile::tempdir().expect("tempdir");
     let _guard = repo_with_initial_commit(dir.path()).await;
     let ctx = bridge_ctx().await;
     open_session(&ctx, "s1").await;
     write_file(dir.path(), "tracked.txt", "one\nchanged\n");
-    let case_insensitive = dir.path().join("TRACKED.TXT").exists();
+    let index_path = dir.path().join(".libra/index");
+    let index_before = fs::read(&index_path).expect("index before stage");
     let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
         .await
         .expect("fence");
@@ -3312,34 +4530,1597 @@ async fn vcs_stage_does_not_duplicate_a_case_variant() {
         r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-case","session_id":"s1","paths":["TRACKED.TXT"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
         fence.head, fence.index_generation, fence.worktree_generation
     );
-    let dispatched = mutation_dispatch(&ctx, &request(&frame)).await;
-    let index =
-        git_internal::internal::index::Index::load(dir.path().join(".libra/index")).expect("index");
+    let error = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect_err("a case variant does not name the indexed entry");
+    assert!(error.message.contains("case variant"), "{}", error.message);
+    let index = git_internal::internal::index::Index::load(&index_path).expect("index");
     assert!(
         index.get("TRACKED.TXT", 0).is_none(),
         "case variant was stored as its own entry"
     );
-    if case_insensitive {
-        let result = dispatched
-            .expect("stage case variant")
-            .expect("response")
-            .result
-            .expect("result");
-        assert_eq!(result["outcome"], "applied");
-        let changed = git_internal::hash::ObjectHash::from_type_and_data(
-            git_internal::internal::object::types::ObjectType::Blob,
-            b"one\nchanged\n",
-        );
-        assert_eq!(
-            index.get("tracked.txt", 0).expect("canonical").hash,
-            changed
-        );
-    } else {
-        assert!(
-            dispatched.is_err(),
-            "case-sensitive volume must reject the variant"
+    assert!(
+        index.get("tracked.txt", 0).is_some(),
+        "the indexed entry the request did not name stays"
+    );
+    assert_eq!(
+        fs::read(&index_path).expect("index after refusal"),
+        index_before
+    );
+}
+
+/// One request names every path that failed.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_unstage_names_every_failing_path() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let index_path = dir.path().join(".libra/index");
+    let index_before = fs::read(&index_path).expect("index before unstage");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.unstage","params":{{"operation_id":"op-unstage-many-failures","session_id":"s1","paths":["missing-one.txt","missing-two.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let error = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect_err("both paths are unknown");
+    assert!(
+        error.message.contains("missing-one.txt"),
+        "{}",
+        error.message
+    );
+    assert!(
+        error.message.contains("missing-two.txt"),
+        "{}",
+        error.message
+    );
+    assert_eq!(
+        fs::read(&index_path).expect("index after refusal"),
+        index_before,
+        "a refused batch publishes nothing"
+    );
+}
+
+/// A stage request names every path that failed.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_stage_names_every_failing_path() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    std::fs::create_dir(dir.path().join("folder")).expect("folder");
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let index_path = dir.path().join(".libra/index");
+    let index_before = fs::read(&index_path).expect("index before stage");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-stage-many-failures","session_id":"s1","paths":["folder","missing.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let error = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect_err("a directory and a missing path");
+    assert!(error.message.contains("folder"), "{}", error.message);
+    assert!(error.message.contains("missing.txt"), "{}", error.message);
+    assert_eq!(
+        fs::read(&index_path).expect("index after refusal"),
+        index_before,
+        "a refused batch publishes nothing"
+    );
+}
+
+/// One stage request names every ignored path.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_stage_names_every_ignored_path() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), ".gitignore", "ignored-a.txt\nignored-b.txt\n");
+    write_file(dir.path(), "ignored-a.txt", "a\n");
+    write_file(dir.path(), "ignored-b.txt", "b\n");
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let index_path = dir.path().join(".libra/index");
+    let index_before = fs::read(&index_path).expect("index before stage");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-stage-many-ignored","session_id":"s1","paths":["ignored-a.txt","ignored-b.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let error = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect_err("both paths are ignored");
+    assert!(error.message.contains("ignored-a.txt"), "{}", error.message);
+    assert!(error.message.contains("ignored-b.txt"), "{}", error.message);
+    assert_eq!(
+        fs::read(&index_path).expect("index after refusal"),
+        index_before,
+        "a refused batch publishes nothing"
+    );
+}
+
+/// One stage request names every path with an unsupported filter.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_stage_names_every_unsupported_filter_path() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), ".gitattributes", "*.bin filter=missing\n");
+    write_file(dir.path(), "first.bin", "first\n");
+    write_file(dir.path(), "second.bin", "second\n");
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let index_path = dir.path().join(".libra/index");
+    let index_before = fs::read(&index_path).expect("index before stage");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-stage-many-filters","session_id":"s1","paths":["first.bin","second.bin"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let error = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect_err("neither path can be staged");
+    assert!(error.message.contains("first.bin"), "{}", error.message);
+    assert!(error.message.contains("second.bin"), "{}", error.message);
+    assert_eq!(
+        fs::read(&index_path).expect("index after refusal"),
+        index_before,
+        "a refused batch publishes nothing"
+    );
+}
+
+/// A stage request names every failure, whatever its category.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_stage_names_mixed_category_failures() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), ".gitignore", "ignored.txt\n");
+    write_file(dir.path(), "ignored.txt", "ignored\n");
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let index_path = dir.path().join(".libra/index");
+    let index_before = fs::read(&index_path).expect("index before stage");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-stage-mixed-failures","session_id":"s1","paths":["missing.txt","ignored.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let error = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect_err("one path is missing and one is ignored");
+    assert!(error.message.contains("missing.txt"), "{}", error.message);
+    assert!(error.message.contains("ignored.txt"), "{}", error.message);
+    assert_eq!(
+        fs::read(&index_path).expect("index after refusal"),
+        index_before,
+        "a refused batch publishes nothing"
+    );
+}
+
+/// A content rewrite after the status scan leaves the page without a fence.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+async fn vcs_status_publishes_no_fence_after_a_content_rewrite() {
+    use libra::internal::ai::agent_bridge::vcs_write::set_fence_observation_rewrite_for_test;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), "tracked.txt", "one\nchanged\n");
+
+    // The file is rewritten after the scan read its content, so the
+    // observation no longer describes the repository.
+    set_fence_observation_rewrite_for_test(Some(dir.path().join("tracked.txt")));
+    let response = read_dispatch(
+        &ctx,
+        &request(r#"{"jsonrpc":"2.0","method":"vcs.status","params":{},"id":1}"#),
+    )
+    .await
+    .expect("vcs.status")
+    .expect("response");
+    let result = response.result.expect("result envelope");
+    let entries = envelope_data(&result)["entries"]
+        .as_array()
+        .expect("entries");
+    assert!(
+        entries.iter().any(|entry| entry["path"] == "tracked.txt"),
+        "the page still reports the changed path: {entries:?}"
+    );
+    assert!(
+        envelope_data(&result)["writeFence"].is_null(),
+        "no fence may describe a repository that changed during the read: {result}"
+    );
+    assert!(
+        result["warnings"]
+            .as_array()
+            .expect("warnings")
+            .iter()
+            .any(|warning| warning["code"] == "write_fence_unavailable"),
+        "{result}"
+    );
+}
+
+/// A path that appears after the status scan leaves the page without a fence.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+async fn vcs_status_publishes_no_fence_after_a_new_path_appears() {
+    use libra::internal::ai::agent_bridge::vcs_write::set_fence_observation_rewrite_for_test;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), "tracked.txt", "one\nchanged\n");
+
+    // A new untracked path appears after the scan enumerated the worktree.
+    set_fence_observation_rewrite_for_test(Some(dir.path().join("late.txt")));
+    let response = read_dispatch(
+        &ctx,
+        &request(r#"{"jsonrpc":"2.0","method":"vcs.status","params":{},"id":1}"#),
+    )
+    .await
+    .expect("vcs.status")
+    .expect("response");
+    let result = response.result.expect("result envelope");
+    let entries = envelope_data(&result)["entries"]
+        .as_array()
+        .expect("entries");
+    assert!(
+        !entries.iter().any(|entry| entry["path"] == "late.txt"),
+        "the reported state must not contain a path that appeared afterwards: {entries:?}"
+    );
+    assert!(
+        envelope_data(&result)["writeFence"].is_null(),
+        "no fence may describe a repository that changed during the read: {result}"
+    );
+}
+
+/// A skip-worktree entry is refused: the status scan does not report it, so
+/// no fence covers it.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_stage_refuses_a_skip_worktree_entry() {
+    use git_internal::internal::index::{Index, IndexEntry};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), "sparse.txt", "sparse\n");
+
+    // Mark the tracked path as a sparse-checkout entry.
+    let index_path = dir.path().join(".libra/index");
+    let mut index = Index::load(&index_path).expect("load index");
+    let hash = git_internal::hash::ObjectHash::from_type_and_data(
+        git_internal::internal::object::types::ObjectType::Blob,
+        b"sparse\n",
+    );
+    let mut entry = IndexEntry::new_from_blob("sparse.txt".to_string(), hash, 10);
+    entry.flags.skip_worktree = true;
+    index.add(entry);
+    index.save(&index_path).expect("save index");
+
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let index_before = fs::read(&index_path).expect("index before stage");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-stage-skip-worktree","session_id":"s1","paths":["sparse.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let error = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect_err("a skip-worktree entry is not covered by the fence");
+    assert!(error.message.contains("skip-worktree"), "{}", error.message);
+    assert_eq!(
+        fs::read(&index_path).expect("index after refusal"),
+        index_before,
+        "a refused batch publishes nothing"
+    );
+}
+
+/// A staged deletion still yields a fence, so it can be unstaged or committed.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_status_publishes_a_fence_for_a_staged_deletion() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+
+    // Commit a file, then delete it from the worktree.
+    write_file(dir.path(), "gone.txt", "gone\n");
+    stage(&["gone.txt"]).await;
+    cli_commit("add the file").await;
+    std::fs::remove_file(dir.path().join("gone.txt")).expect("delete the file");
+
+    // Stage the deletion of a tracked file.
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-stage-deletion","session_id":"s1","paths":["gone.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect("stage the deletion");
+
+    // The status must still publish a fence for the staged deletion.
+    let response = read_dispatch(
+        &ctx,
+        &request(r#"{"jsonrpc":"2.0","method":"vcs.status","params":{},"id":2}"#),
+    )
+    .await
+    .expect("vcs.status")
+    .expect("response");
+    let result = response.result.expect("result envelope");
+    let entries = envelope_data(&result)["entries"]
+        .as_array()
+        .expect("entries");
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry["path"] == "gone.txt" && entry["state"] == "staged"),
+        "the page must report the staged deletion: {entries:?}"
+    );
+    let fence = envelope_data(&result)["writeFence"].clone();
+    assert!(
+        !fence.is_null(),
+        "a staged deletion needs a fence: {result}"
+    );
+    let head = fence["head"].as_str().expect("head");
+    let index = fence["indexGeneration"].as_str().expect("index");
+    let worktree = fence["worktreeGeneration"].as_str().expect("worktree");
+
+    // The fence unstage accepts.
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.unstage","params":{{"operation_id":"op-unstage-deletion","session_id":"s1","paths":["gone.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":3}}"#,
+        head, index, worktree
+    );
+    let unstage = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect("unstage the deletion")
+        .expect("response")
+        .result
+        .expect("result");
+    assert_eq!(unstage["outcome"], "applied", "{unstage}");
+}
+
+/// Recreating a staged deletion during the status walk leaves its observation
+/// unstable and omits the write fence.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+async fn vcs_status_publishes_no_fence_when_a_staged_deletion_is_recreated_during_the_scan() {
+    use libra::internal::ai::agent_bridge::vcs_write::set_staged_absence_recreate_for_test;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), "gone.txt", "gone\n");
+    stage(&["gone.txt"]).await;
+    cli_commit("add the file").await;
+    fs::remove_file(dir.path().join("gone.txt")).expect("delete the file");
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-stage-gone","session_id":"s1","paths":["gone.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect("stage the deletion");
+
+    set_staged_absence_recreate_for_test(Some(dir.path().join("gone.txt")));
+    let response = read_dispatch(
+        &ctx,
+        &request(r#"{"jsonrpc":"2.0","method":"vcs.status","params":{},"id":2}"#),
+    )
+    .await
+    .expect("vcs.status")
+    .expect("response");
+    let result = response.result.expect("result envelope");
+    assert!(
+        envelope_data(&result)["writeFence"].is_null(),
+        "the recreated path must not repair the staged absence: {result}"
+    );
+    assert!(
+        envelope_data(&result)["entries"]
+            .as_array()
+            .is_some_and(|entries| {
+                entries
+                    .iter()
+                    .any(|entry| entry["path"] == "gone.txt" && entry["state"] == "staged")
+            }),
+        "the status page still reports the staged deletion: {result}"
+    );
+}
+
+/// An absent submodule entry is refused: the status scan does not cover it.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_stage_refuses_an_absent_submodule_entry() {
+    use git_internal::internal::index::{Index, IndexEntry};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+
+    // A gitlink entry names another repository's commit.
+    let index_path = dir.path().join(".libra/index");
+    let mut index = Index::load(&index_path).expect("load index");
+    let hash = git_internal::hash::ObjectHash::from_type_and_data(
+        git_internal::internal::object::types::ObjectType::Commit,
+        b"submodule\n",
+    );
+    let mut entry = IndexEntry::new_from_blob("module".to_string(), hash, 0o160000);
+    entry.mode = 0o160000;
+    index.add(entry);
+    index.save(&index_path).expect("save index");
+
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let index_before = fs::read(&index_path).expect("index before stage");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-stage-submodule","session_id":"s1","paths":["module"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let error = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect_err("a submodule entry is not covered by the fence");
+    assert!(error.message.contains("submodule"), "{}", error.message);
+    assert_eq!(
+        fs::read(&index_path).expect("index after refusal"),
+        index_before,
+        "a refused batch publishes nothing"
+    );
+}
+
+/// A changed path beyond the fence's size bounds leaves the page without a
+/// fence, and the page still answers.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_status_answers_when_a_changed_path_exceeds_the_fence_bounds() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+
+    // A tracked file larger than the fence's per-path bound.
+    let big = dir.path().join("big.bin");
+    let file = std::fs::File::create(&big).expect("create");
+    file.set_len(17 * 1024 * 1024).expect("size");
+    drop(file);
+    stage(&["big.bin"]).await;
+    cli_commit("add the large file").await;
+    std::fs::write(&big, vec![b'x'; 17 * 1024 * 1024]).expect("rewrite");
+
+    let response = read_dispatch(
+        &ctx,
+        &request(r#"{"jsonrpc":"2.0","method":"vcs.status","params":{},"id":1}"#),
+    )
+    .await
+    .expect("vcs.status still answers")
+    .expect("response");
+    let result = response.result.expect("result envelope");
+    let entries = envelope_data(&result)["entries"]
+        .as_array()
+        .expect("entries");
+    assert!(
+        entries.iter().any(|entry| entry["path"] == "big.bin"),
+        "the page still reports the changed path: {entries:?}"
+    );
+    assert!(
+        envelope_data(&result)["writeFence"].is_null(),
+        "a path beyond the fence's bounds cannot be fenced: {result}"
+    );
+    assert!(
+        result["warnings"]
+            .as_array()
+            .expect("warnings")
+            .iter()
+            .any(|warning| warning["code"] == "write_fence_unavailable"),
+        "{result}"
+    );
+}
+
+/// A path that changes while the status scan classifies it leaves the page
+/// without a fence.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+async fn vcs_status_publishes_no_fence_after_a_change_during_the_scan() {
+    use libra::internal::ai::agent_bridge::vcs_write::set_classification_window_rewrite_for_test;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), "tracked.txt", "one\nchanged\n");
+
+    // The file changes between the scan's classification read and the
+    // verification of its observation, so the observation cannot describe it.
+    set_classification_window_rewrite_for_test(Some(dir.path().join("tracked.txt")));
+    let response = read_dispatch(
+        &ctx,
+        &request(r#"{"jsonrpc":"2.0","method":"vcs.status","params":{},"id":1}"#),
+    )
+    .await
+    .expect("vcs.status")
+    .expect("response");
+    let result = response.result.expect("result envelope");
+    let entries = envelope_data(&result)["entries"]
+        .as_array()
+        .expect("entries");
+    assert!(
+        entries.iter().any(|entry| entry["path"] == "tracked.txt"),
+        "the page still reports the changed path: {entries:?}"
+    );
+    assert!(
+        envelope_data(&result)["writeFence"].is_null(),
+        "no fence may describe a path that changed during the scan: {result}"
+    );
+    assert!(
+        result["warnings"]
+            .as_array()
+            .expect("warnings")
+            .iter()
+            .any(|warning| warning["code"] == "write_fence_unavailable"),
+        "{result}"
+    );
+}
+
+/// A rewrite after the second classification hash cannot produce a fence for
+/// content the scan classified earlier.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+async fn vcs_status_publishes_no_fence_after_the_second_classification_hash() {
+    use libra::internal::ai::agent_bridge::vcs_write::set_classification_digest_window_rewrite_for_test;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), "tracked.txt", "one\nchanged\n");
+
+    set_classification_digest_window_rewrite_for_test(Some(dir.path().join("tracked.txt")));
+    let response = read_dispatch(
+        &ctx,
+        &request(r#"{"jsonrpc":"2.0","method":"vcs.status","params":{},"id":1}"#),
+    )
+    .await
+    .expect("vcs.status")
+    .expect("response");
+    let result = response.result.expect("result envelope");
+    assert!(
+        envelope_data(&result)["entries"]
+            .as_array()
+            .is_some_and(|entries| entries.iter().any(|entry| entry["path"] == "tracked.txt")),
+        "status still reports the changed path: {result}"
+    );
+    assert!(
+        envelope_data(&result)["writeFence"].is_null(),
+        "the fence cannot pin a digest captured after the classification: {result}"
+    );
+}
+
+/// A staged path whose content capture fails leaves the page without a fence:
+/// the failure is never repaired by a later capture.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+async fn vcs_status_publishes_no_fence_after_a_failed_staged_capture() {
+    use libra::internal::ai::agent_bridge::vcs_write::set_forced_capture_failure_for_test;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), "staged.txt", "one\n");
+    stage(&["staged.txt"]).await;
+    cli_commit("add the staged file").await;
+    write_file(dir.path(), "staged.txt", "one\nstaged\n");
+    stage(&["staged.txt"]).await;
+
+    set_forced_capture_failure_for_test(Some(PathBuf::from("staged.txt")));
+    let response = read_dispatch(
+        &ctx,
+        &request(r#"{"jsonrpc":"2.0","method":"vcs.status","params":{},"id":1}"#),
+    )
+    .await
+    .expect("vcs.status")
+    .expect("response");
+    let result = response.result.expect("result envelope");
+    assert!(
+        envelope_data(&result)["writeFence"].is_null(),
+        "a failed capture must leave the path unfenceable: {result}"
+    );
+}
+
+/// A staged path whose later capture fails leaves the page without a fence:
+/// the earlier observation may not stay fenceable.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+async fn vcs_status_publishes_no_fence_after_a_failed_recapture() {
+    use libra::internal::ai::agent_bridge::vcs_write::set_forced_recapture_failure_for_test;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), "staged.txt", "one\n");
+    stage(&["staged.txt"]).await;
+    cli_commit("add the staged file").await;
+    write_file(dir.path(), "staged.txt", "one\nstaged\n");
+    stage(&["staged.txt"]).await;
+    // The worktree changes again, so the scan captures the path a second time.
+    write_file(dir.path(), "staged.txt", "one\nstaged\nunstaged\n");
+
+    // The staged capture succeeds; the later capture of the same path fails.
+    set_forced_recapture_failure_for_test(Some(PathBuf::from("staged.txt")));
+    let response = read_dispatch(
+        &ctx,
+        &request(r#"{"jsonrpc":"2.0","method":"vcs.status","params":{},"id":1}"#),
+    )
+    .await
+    .expect("vcs.status")
+    .expect("response");
+    let result = response.result.expect("result envelope");
+    assert!(
+        envelope_data(&result)["writeFence"].is_null(),
+        "a failed recapture must not leave the earlier observation fenceable: {result}"
+    );
+}
+
+/// A path that vanishes and returns while the scan classifies it leaves the
+/// page without a fence.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+async fn vcs_status_publishes_no_fence_after_a_path_vanishes_during_classification() {
+    use libra::internal::ai::agent_bridge::vcs_write::set_forced_vanishing_path_for_test;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), "tracked.txt", "one\nchanged\n");
+
+    set_forced_vanishing_path_for_test(Some(PathBuf::from("tracked.txt")));
+    let response = read_dispatch(
+        &ctx,
+        &request(r#"{"jsonrpc":"2.0","method":"vcs.status","params":{},"id":1}"#),
+    )
+    .await
+    .expect("vcs.status")
+    .expect("response");
+    let result = response.result.expect("result envelope");
+    assert!(
+        envelope_data(&result)["writeFence"].is_null(),
+        "a path that vanished during classification cannot be fenced: {result}"
+    );
+}
+
+/// An unpinnable observation root leaves the page without a fence, even on a
+/// clean worktree where an empty observation would look authoritative.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+async fn vcs_status_publishes_no_fence_when_the_observation_root_cannot_be_pinned() {
+    use libra::internal::ai::agent_bridge::vcs_write::set_force_observation_root_failure_for_test;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+
+    set_force_observation_root_failure_for_test(true);
+    let response = read_dispatch(
+        &ctx,
+        &request(r#"{"jsonrpc":"2.0","method":"vcs.status","params":{},"id":1}"#),
+    )
+    .await
+    .expect("vcs.status")
+    .expect("response");
+    let result = response.result.expect("result envelope");
+    assert!(
+        envelope_data(&result)["writeFence"].is_null(),
+        "an unobserved scan cannot authorize a fence: {result}"
+    );
+    assert!(
+        result["warnings"]
+            .as_array()
+            .expect("warnings")
+            .iter()
+            .any(|warning| warning["code"] == "write_fence_unavailable"),
+        "{result}"
+    );
+}
+
+/// A directory whose observation fails leaves the page without a fence: a
+/// failed observation is never recorded as an absence.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+async fn vcs_status_publishes_no_fence_after_a_failed_directory_observation() {
+    use libra::internal::ai::agent_bridge::vcs_write::set_forced_entry_failure_for_test;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), "tracked.txt", "one\nchanged\n");
+
+    // The walk cannot inspect the worktree root.
+    set_forced_entry_failure_for_test(Some(PathBuf::from("")));
+    let response = read_dispatch(
+        &ctx,
+        &request(r#"{"jsonrpc":"2.0","method":"vcs.status","params":{},"id":1}"#),
+    )
+    .await
+    .expect("vcs.status")
+    .expect("response");
+    let result = response.result.expect("result envelope");
+    assert!(
+        envelope_data(&result)["writeFence"].is_null(),
+        "a failed directory observation cannot be recorded as an absence: {result}"
+    );
+}
+
+/// A tracked path whose metadata read fails leaves the page without a fence:
+/// a failed read is not an absence.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+async fn vcs_status_publishes_no_fence_after_a_failed_worktree_metadata_read() {
+    use libra::internal::ai::agent_bridge::vcs_write::set_forced_worktree_metadata_failure_for_test;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), "tracked.txt", "one\nchanged\n");
+
+    set_forced_worktree_metadata_failure_for_test(Some(PathBuf::from("tracked.txt")));
+    let response = read_dispatch(
+        &ctx,
+        &request(r#"{"jsonrpc":"2.0","method":"vcs.status","params":{},"id":1}"#),
+    )
+    .await
+    .expect("vcs.status")
+    .expect("response");
+    let result = response.result.expect("result envelope");
+    assert!(
+        envelope_data(&result)["writeFence"].is_null(),
+        "a failed metadata read must not be recorded as an absence: {result}"
+    );
+}
+
+/// A tracked path whose metadata capture fails leaves the page without a
+/// fence.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+async fn vcs_status_publishes_no_fence_after_a_failed_metadata_capture() {
+    use libra::internal::ai::agent_bridge::vcs_write::set_forced_entry_failure_for_test;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), "tracked.txt", "one\nchanged\n");
+
+    set_forced_entry_failure_for_test(Some(PathBuf::from("tracked.txt")));
+    let response = read_dispatch(
+        &ctx,
+        &request(r#"{"jsonrpc":"2.0","method":"vcs.status","params":{},"id":1}"#),
+    )
+    .await
+    .expect("vcs.status")
+    .expect("response");
+    let result = response.result.expect("result envelope");
+    assert!(
+        envelope_data(&result)["writeFence"].is_null(),
+        "a failed metadata capture must leave the path unfenceable: {result}"
+    );
+}
+
+/// A staged path that disappears after the staged capture leaves the page
+/// without a fence: the two observations disagree.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+async fn vcs_status_publishes_no_fence_after_a_staged_path_disappears_during_the_scan() {
+    use libra::internal::ai::agent_bridge::vcs_write::set_remove_after_staged_capture_for_test;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), "staged.txt", "one\n");
+    stage(&["staged.txt"]).await;
+    cli_commit("add the staged file").await;
+    write_file(dir.path(), "staged.txt", "one\nstaged\n");
+    stage(&["staged.txt"]).await;
+
+    set_remove_after_staged_capture_for_test(Some(dir.path().join("staged.txt")));
+    let response = read_dispatch(
+        &ctx,
+        &request(r#"{"jsonrpc":"2.0","method":"vcs.status","params":{},"id":1}"#),
+    )
+    .await
+    .expect("vcs.status")
+    .expect("response");
+    let result = response.result.expect("result envelope");
+    assert!(
+        envelope_data(&result)["writeFence"].is_null(),
+        "a path that was present and is gone must not be fenced as absent: {result}"
+    );
+}
+
+/// A path with both staged and unstaged changes keeps its unstable
+/// observation: a later pass may not repair it.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+async fn vcs_status_publishes_no_fence_after_an_unstable_staged_and_unstaged_path() {
+    use libra::internal::ai::agent_bridge::vcs_write::set_classification_window_rewrite_for_test;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), "tracked.txt", "one\n");
+
+    // Stage one content, then change the file again in the worktree.
+    write_file(dir.path(), "tracked.txt", "one\nstaged\n");
+    stage(&["tracked.txt"]).await;
+    write_file(dir.path(), "tracked.txt", "one\nstaged\nunstaged\n");
+
+    // The path changes while the scan classifies it.
+    set_classification_window_rewrite_for_test(Some(dir.path().join("tracked.txt")));
+    let response = read_dispatch(
+        &ctx,
+        &request(r#"{"jsonrpc":"2.0","method":"vcs.status","params":{},"id":1}"#),
+    )
+    .await
+    .expect("vcs.status")
+    .expect("response");
+    let result = response.result.expect("result envelope");
+    assert!(
+        envelope_data(&result)["writeFence"].is_null(),
+        "an unstable observation must not be repaired by a later pass: {result}"
+    );
+}
+
+/// A fence that is published pins the content the write then stages.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_status_fence_pins_the_content_a_write_stages() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), "tracked.txt", "one\nchanged\n");
+
+    let response = read_dispatch(
+        &ctx,
+        &request(r#"{"jsonrpc":"2.0","method":"vcs.status","params":{},"id":1}"#),
+    )
+    .await
+    .expect("vcs.status")
+    .expect("response");
+    let result = response.result.expect("result envelope");
+    let fence = envelope_data(&result)["writeFence"].clone();
+    assert!(!fence.is_null(), "the fence must be published: {result}");
+    let head = fence["head"].as_str().expect("head");
+    let index = fence["indexGeneration"].as_str().expect("index");
+    let worktree = fence["worktreeGeneration"].as_str().expect("worktree");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-stage-pinned","session_id":"s1","paths":["tracked.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":2}}"#,
+        head, index, worktree
+    );
+    mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect("stage the pinned content")
+        .expect("response");
+
+    // The staged entry names exactly the content the fence pinned.
+    let index = git_internal::internal::index::Index::load(dir.path().join(".libra/index"))
+        .expect("load the published index");
+    let entry = index.get("tracked.txt", 0).expect("the staged entry");
+    let expected = git_internal::hash::ObjectHash::from_type_and_data(
+        git_internal::internal::object::types::ObjectType::Blob,
+        b"one\nchanged\n",
+    );
+    assert_eq!(
+        entry.hash, expected,
+        "the staged content must be the pinned content"
+    );
+}
+
+/// Many re-hashed clean files do not consume the fence's content budget.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_status_publishes_a_fence_beyond_a_rehashed_clean_set() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+
+    // Forty clean files of one MiB each: re-hashing them would exceed the
+    // fence's content budget if the clean candidates were charged for it.
+    for index in 0..40 {
+        write_file(
+            dir.path(),
+            &format!("clean-{index}.bin"),
+            &"x".repeat(1024 * 1024),
         );
     }
+    stage(&[
+        "clean-0.bin",
+        "clean-1.bin",
+        "clean-2.bin",
+        "clean-3.bin",
+        "clean-4.bin",
+        "clean-5.bin",
+        "clean-6.bin",
+        "clean-7.bin",
+        "clean-8.bin",
+        "clean-9.bin",
+        "clean-10.bin",
+        "clean-11.bin",
+        "clean-12.bin",
+        "clean-13.bin",
+        "clean-14.bin",
+        "clean-15.bin",
+        "clean-16.bin",
+        "clean-17.bin",
+        "clean-18.bin",
+        "clean-19.bin",
+        "clean-20.bin",
+        "clean-21.bin",
+        "clean-22.bin",
+        "clean-23.bin",
+        "clean-24.bin",
+        "clean-25.bin",
+        "clean-26.bin",
+        "clean-27.bin",
+        "clean-28.bin",
+        "clean-29.bin",
+        "clean-30.bin",
+        "clean-31.bin",
+        "clean-32.bin",
+        "clean-33.bin",
+        "clean-34.bin",
+        "clean-35.bin",
+        "clean-36.bin",
+        "clean-37.bin",
+        "clean-38.bin",
+        "clean-39.bin",
+    ])
+    .await;
+    cli_commit("add the clean files").await;
+
+    // Touch every clean file, so the scan has to re-hash all of them.
+    for index in 0..40 {
+        let path = dir.path().join(format!("clean-{index}.bin"));
+        let content = fs::read(&path).expect("read");
+        fs::write(&path, content).expect("touch");
+    }
+    // And change one small file.
+    write_file(dir.path(), "tracked.txt", "one\nchanged\n");
+
+    let response = read_dispatch(
+        &ctx,
+        &request(r#"{"jsonrpc":"2.0","method":"vcs.status","params":{},"id":1}"#),
+    )
+    .await
+    .expect("vcs.status")
+    .expect("response");
+    let result = response.result.expect("result envelope");
+    assert!(
+        !envelope_data(&result)["writeFence"].is_null(),
+        "clean candidates must not consume the fence's content budget: {result}"
+    );
+}
+
+/// A path that changes after the preparation confirmed it is refused, so the
+/// published index never carries content the repository no longer holds.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+async fn vcs_stage_refuses_a_path_that_changed_after_the_preparation() {
+    use libra::internal::ai::agent_bridge::vcs_write::set_stage_confirmed_rewrite_for_test;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), "tracked.txt", "one\nchanged\n");
+
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let index_path = dir.path().join(".libra/index");
+    let index_before = fs::read(&index_path).expect("index before stage");
+    set_stage_confirmed_rewrite_for_test(Some(dir.path().join("tracked.txt")));
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-stage-changed-after-prepare","session_id":"s1","paths":["tracked.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let error = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect_err("the path changed while the batch was prepared");
+    assert_eq!(error.stable_code, "LBR-AGENT-038", "{}", error.message);
+    assert_eq!(
+        fs::read(&index_path).expect("index after refusal"),
+        index_before,
+        "a refused batch publishes nothing"
+    );
+}
+
+/// Two modified files below the aggregate fence limit still get a fence.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_status_publishes_a_fence_for_two_modified_files_below_the_limit() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+
+    for name in ["first.bin", "second.bin"] {
+        fs::write(dir.path().join(name), vec![b'a'; 9 * 1024 * 1024]).expect("write");
+    }
+    stage(&["first.bin", "second.bin"]).await;
+    cli_commit("add the two files").await;
+    for name in ["first.bin", "second.bin"] {
+        fs::write(dir.path().join(name), vec![b'b'; 9 * 1024 * 1024]).expect("modify");
+    }
+
+    let response = read_dispatch(
+        &ctx,
+        &request(r#"{"jsonrpc":"2.0","method":"vcs.status","params":{},"id":1}"#),
+    )
+    .await
+    .expect("vcs.status")
+    .expect("response");
+    let result = response.result.expect("result envelope");
+    assert!(
+        !envelope_data(&result)["writeFence"].is_null(),
+        "a changed state below the aggregate limit must get a fence: {result}"
+    );
+}
+
+/// A tracked file that becomes a directory during the scan leaves the page
+/// without a fence: the directory walk must not repair the observation.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+async fn vcs_status_publishes_no_fence_after_a_file_becomes_a_directory() {
+    use libra::internal::ai::agent_bridge::vcs_write::set_classification_window_directory_for_test;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), "tracked.txt", "one\nchanged\n");
+
+    set_classification_window_directory_for_test(Some(dir.path().join("tracked.txt")));
+    let response = read_dispatch(
+        &ctx,
+        &request(r#"{"jsonrpc":"2.0","method":"vcs.status","params":{},"id":1}"#),
+    )
+    .await
+    .expect("vcs.status")
+    .expect("response");
+    let result = response.result.expect("result envelope");
+    assert!(
+        envelope_data(&result)["writeFence"].is_null(),
+        "the directory walk must not repair an unstable observation: {result}"
+    );
+}
+
+/// A clean set beyond the read budget still leaves a changed path fenceable.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_status_publishes_a_fence_beyond_a_clean_set_over_the_read_budget() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+
+    // Five clean files of fourteen MiB each: seventy MiB in total, beyond the
+    // scan's read budget.
+    let names: Vec<String> = (0..5).map(|index| format!("clean-{index}.bin")).collect();
+    for name in &names {
+        fs::write(dir.path().join(name), vec![b'a'; 14 * 1024 * 1024]).expect("write");
+    }
+    let paths: Vec<&str> = names.iter().map(String::as_str).collect();
+    stage(&paths).await;
+    cli_commit("add the clean files").await;
+
+    // Touch every clean file, so the scan has to re-hash all of them.
+    for name in &names {
+        let path = dir.path().join(name);
+        let content = fs::read(&path).expect("read");
+        fs::write(&path, content).expect("touch");
+    }
+    write_file(dir.path(), "tracked.txt", "one\nchanged\n");
+
+    let response = read_dispatch(
+        &ctx,
+        &request(r#"{"jsonrpc":"2.0","method":"vcs.status","params":{},"id":1}"#),
+    )
+    .await
+    .expect("vcs.status")
+    .expect("response");
+    let result = response.result.expect("result envelope");
+    assert!(
+        !envelope_data(&result)["writeFence"].is_null(),
+        "clean candidates must not starve the capture of a changed path: {result}"
+    );
+}
+
+/// A staged path that changes while the scan reads it leaves the page without
+/// a fence: the staged paths are captured inside the same scan.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+async fn vcs_status_publishes_no_fence_after_a_staged_path_changes_during_the_scan() {
+    use libra::internal::ai::agent_bridge::vcs_write::set_classification_window_rewrite_for_test;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+
+    // A staged modification, so the path is in the staged set.
+    write_file(dir.path(), "staged.txt", "one\n");
+    stage(&["staged.txt"]).await;
+    cli_commit("add the staged file").await;
+    write_file(dir.path(), "staged.txt", "one\nstaged\n");
+    stage(&["staged.txt"]).await;
+
+    // The staged path changes while the scan reads the worktree.
+    set_classification_window_rewrite_for_test(Some(dir.path().join("staged.txt")));
+    let response = read_dispatch(
+        &ctx,
+        &request(r#"{"jsonrpc":"2.0","method":"vcs.status","params":{},"id":1}"#),
+    )
+    .await
+    .expect("vcs.status")
+    .expect("response");
+    let result = response.result.expect("result envelope");
+    let entries = envelope_data(&result)["entries"]
+        .as_array()
+        .expect("entries");
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry["path"] == "staged.txt" && entry["state"] == "staged"),
+        "the page still reports the staged path: {entries:?}"
+    );
+    assert!(
+        envelope_data(&result)["writeFence"].is_null(),
+        "no fence may describe a staged path that changed during the scan: {result}"
+    );
+    assert!(
+        result["warnings"]
+            .as_array()
+            .expect("warnings")
+            .iter()
+            .any(|warning| warning["code"] == "write_fence_unavailable"),
+        "{result}"
+    );
+}
+
+/// A stage request names the failures of every phase.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_stage_names_a_refusal_of_a_later_phase() {
+    use git_internal::internal::index::{Index, IndexEntry};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), ".gitignore", "ignored.txt\n");
+    write_file(dir.path(), "ignored.txt", "ignored\n");
+
+    // An index entry that differs only in case from another one makes the
+    // case-alias check refuse the path.
+    let index_path = dir.path().join(".libra/index");
+    let mut index = Index::load(&index_path).expect("load index");
+    let hash = git_internal::hash::ObjectHash::from_type_and_data(
+        git_internal::internal::object::types::ObjectType::Blob,
+        b"colliding\n",
+    );
+    index.add(IndexEntry::new_from_blob(
+        "Colliding.txt".to_string(),
+        hash,
+        10,
+    ));
+    index.add(IndexEntry::new_from_blob(
+        "colliding.txt".to_string(),
+        hash,
+        10,
+    ));
+    index.save(&index_path).expect("save colliding entries");
+
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let index_before = fs::read(&index_path).expect("index before stage");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-stage-late-refusal","session_id":"s1","paths":["ignored.txt","Colliding.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let error = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect_err("one path is ignored and one has a colliding entry");
+    assert!(error.message.contains("ignored.txt"), "{}", error.message);
+    assert!(error.message.contains("Colliding.txt"), "{}", error.message);
+    assert_eq!(
+        fs::read(&index_path).expect("index after refusal"),
+        index_before,
+        "a refused batch publishes nothing"
+    );
+}
+
+/// The status read still answers when no index snapshot can be taken.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+async fn vcs_status_answers_without_a_write_fence_when_no_snapshot_is_possible() {
+    use libra::internal::ai::agent_bridge::vcs_read::set_status_snapshot_failure_for_test;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), "tracked.txt", "one\nchanged\n");
+
+    set_status_snapshot_failure_for_test(true);
+    let response = read_dispatch(
+        &ctx,
+        &request(r#"{"jsonrpc":"2.0","method":"vcs.status","params":{},"id":1}"#),
+    )
+    .await
+    .expect("vcs.status still answers")
+    .expect("response");
+    set_status_snapshot_failure_for_test(false);
+    let result = response.result.expect("result envelope");
+    let entries = envelope_data(&result)["entries"]
+        .as_array()
+        .expect("entries");
+    assert!(
+        entries.iter().any(|entry| entry["path"] == "tracked.txt"),
+        "the status must still report the changed path: {entries:?}"
+    );
+    assert!(
+        envelope_data(&result)["writeFence"].is_null(),
+        "no fence may be published without a snapshot: {result}"
+    );
+    let warnings = result["warnings"].as_array().expect("warnings");
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning["code"] == "write_fence_unavailable"),
+        "{warnings:?}"
+    );
+}
+
+/// The status read still answers in a repository that cannot be written.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_status_answers_in_a_read_only_repository() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), "tracked.txt", "one\nchanged\n");
+
+    // The repository metadata becomes read-only, so the observation cannot
+    // write its scratch index beside the live one.
+    let metadata = dir.path().join(".libra");
+    let mut permissions = std::fs::metadata(&metadata)
+        .expect("metadata")
+        .permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        permissions.set_mode(0o500);
+    }
+    std::fs::set_permissions(&metadata, permissions.clone()).expect("make the metadata read-only");
+    let response = read_dispatch(
+        &ctx,
+        &request(r#"{"jsonrpc":"2.0","method":"vcs.status","params":{},"id":1}"#),
+    )
+    .await
+    .expect("vcs.status still answers")
+    .expect("response");
+    let result = response.result.expect("result envelope");
+    let entries = envelope_data(&result)["entries"]
+        .as_array()
+        .expect("entries");
+    assert!(
+        entries.iter().any(|entry| entry["path"] == "tracked.txt"),
+        "the status must still report the changed path: {entries:?}"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        permissions.set_mode(0o700);
+    }
+    std::fs::set_permissions(&metadata, permissions).expect("restore the metadata permissions");
+}
+
+/// A conflict resolved after the status read does not change the fence.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+async fn vcs_status_binds_the_fence_to_the_observed_index() {
+    use git_internal::internal::index::{Index, IndexEntry};
+    use libra::internal::ai::agent_bridge::vcs_write::set_index_observation_rewrite_for_test;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+
+    // A conflicted index: the same path at stages 1, 2 and 3.
+    let index_path = dir.path().join(".libra/index");
+    let mut index = Index::load(&index_path).expect("load index");
+    let oid = git_internal::hash::ObjectHash::from_type_and_data(
+        git_internal::internal::object::types::ObjectType::Blob,
+        b"conflict\n",
+    );
+    for stage in [1_u8, 2, 3] {
+        let mut entry = IndexEntry::new_from_blob("conflicted.txt".to_string(), oid, 9);
+        entry.flags.stage = stage;
+        index.add(entry);
+    }
+    index.save(&index_path).expect("save conflicted index");
+
+    // The resolved index, written beside the repository.
+    let resolved_path = dir.path().join("resolved-index");
+    let mut resolved = Index::load(&index_path).expect("load conflicted index");
+    for stage in [1_u8, 2, 3] {
+        resolved.remove("conflicted.txt", stage);
+    }
+    resolved.save(&resolved_path).expect("save resolved index");
+
+    set_index_observation_rewrite_for_test(Some(resolved_path));
+    let response = read_dispatch(
+        &ctx,
+        &request(r#"{"jsonrpc":"2.0","method":"vcs.status","params":{},"id":1}"#),
+    )
+    .await
+    .expect("vcs.status")
+    .expect("response");
+    let result = response.result.expect("result envelope");
+    let entries = envelope_data(&result)["entries"]
+        .as_array()
+        .expect("entries");
+    assert!(
+        entries.iter().any(|entry| entry["state"] == "conflict"),
+        "the reported state must carry the conflict: {entries:?}"
+    );
+    let fence = envelope_data(&result)["writeFence"].clone();
+    assert!(!fence.is_null(), "the fence must be published: {result}");
+
+    // The fence describes the conflicted index the page reported, so the write
+    // is refused once the conflict was resolved behind it.
+    let head = fence["head"].as_str().expect("head");
+    let index_generation = fence["indexGeneration"].as_str().expect("index");
+    let worktree = fence["worktreeGeneration"].as_str().expect("worktree");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-stage-conflict-race","session_id":"s1","paths":["tracked.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":2}}"#,
+        head, index_generation, worktree
+    );
+    let error = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect_err("the index changed after the status was read");
+    assert_eq!(error.stable_code, "LBR-AGENT-038", "{}", error.message);
+}
+
+/// An unborn HEAD is carried as `null` in the fence.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_status_carries_an_unborn_head_as_null() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    setup_with_new_libra_in(dir.path()).await;
+    let _guard = ChangeDirGuard::new(dir.path());
+    ConfigKv::set("user.name", "Bridge VCS Test", false)
+        .await
+        .expect("set user.name");
+    ConfigKv::set("user.email", "bridge-vcs@example.com", false)
+        .await
+        .expect("set user.email");
+    ConfigKv::set("commit.gpgSign", "false", false)
+        .await
+        .expect("disable fixture signing locally");
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), "first.txt", "first\n");
+    stage(&["first.txt"]).await;
+
+    let response = read_dispatch(
+        &ctx,
+        &request(r#"{"jsonrpc":"2.0","method":"vcs.status","params":{},"id":1}"#),
+    )
+    .await
+    .expect("vcs.status")
+    .expect("response");
+    let result = response.result.expect("result envelope");
+    let fence = envelope_data(&result)["writeFence"].clone();
+    assert!(
+        fence["head"].is_null(),
+        "an unborn HEAD has no commit id: {fence}"
+    );
+    let index = fence["indexGeneration"].as_str().expect("index");
+    let worktree = fence["worktreeGeneration"].as_str().expect("worktree");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-stage-null-head","session_id":"s1","paths":["first.txt"],"expectedHead":null,"expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":2}}"#,
+        index, worktree
+    );
+    let result = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect("stage with a null HEAD fence")
+        .expect("response")
+        .result
+        .expect("result");
+    assert_eq!(result["outcome"], "applied");
+}
+
+/// A null HEAD fence is refused once the repository has a commit.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_write_refuses_a_null_head_fence_after_the_first_commit() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), "second.txt", "second\n");
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-stage-null-head-late","session_id":"s1","paths":["second.txt"],"expectedHead":null,"expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.index_generation, fence.worktree_generation
+    );
+    let error = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect_err("a null HEAD fence cannot name a repository that has a commit");
+    assert_eq!(error.stable_code, "LBR-AGENT-038", "{}", error.message);
+}
+
+/// The write fence is part of the negotiated status read.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_status_returns_the_write_fence_a_stage_accepts() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), "fenced.txt", "fenced\n");
+
+    let response = read_dispatch(
+        &ctx,
+        &request(r#"{"jsonrpc":"2.0","method":"vcs.status","params":{},"id":1}"#),
+    )
+    .await
+    .expect("vcs.status")
+    .expect("response");
+    let result = response.result.expect("result envelope");
+    let fence = envelope_data(&result)["writeFence"].clone();
+    let head = fence["head"].as_str().expect("head").to_string();
+    let index = fence["indexGeneration"]
+        .as_str()
+        .expect("index generation")
+        .to_string();
+    let worktree = fence["worktreeGeneration"]
+        .as_str()
+        .expect("worktree generation")
+        .to_string();
+    assert!(!head.is_empty());
+    assert_eq!(head.len(), 40, "the HEAD fence is the commit id");
+    assert_eq!(index.len(), 64);
+    assert_eq!(worktree.len(), 64);
+
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-stage-with-fence","session_id":"s1","paths":["fenced.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":2}}"#,
+        head, index, worktree
+    );
+    let result = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect("stage with the fence the status read returned")
+        .expect("response")
+        .result
+        .expect("result");
+    assert_eq!(result["outcome"], "applied");
+    assert_eq!(
+        result["paths"],
+        serde_json::json!(["fenced.txt"]),
+        "{:?}",
+        result["paths"]
+    );
+}
+
+/// Staging one case spelling must not delete a separate colliding index entry.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+async fn vcs_stage_refuses_to_drop_a_case_colliding_index_entry() {
+    use git_internal::internal::index::{Index, IndexEntry};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    setup_with_new_libra_in(dir.path()).await;
+    let _guard = ChangeDirGuard::new(dir.path());
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), "Case.txt", "first spelling\n");
+    stage(&["Case.txt"]).await;
+
+    let index_path = dir.path().join(".libra/index");
+    let mut index = Index::load(&index_path).expect("load index");
+    let (hash, size, mode) = {
+        let entry = index.get("Case.txt", 0).expect("first spelling");
+        (entry.hash, entry.size, entry.mode)
+    };
+    let mut colliding = IndexEntry::new_from_blob("case.txt".to_string(), hash, size);
+    colliding.mode = mode;
+    index.add(colliding);
+    index.save(&index_path).expect("save colliding entry");
+    let index_before = fs::read(&index_path).expect("index before selected stage");
+    write_file(dir.path(), "Case.txt", "updated first spelling\n");
+
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-stage-case-collision","session_id":"s1","paths":["Case.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}} ,"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    let error = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect_err("the other case spelling is a separate staged entry");
+    assert!(
+        error.message.contains("ambiguous case variant"),
+        "{}",
+        error.message
+    );
+    assert_eq!(
+        fs::read(&index_path).expect("index after refusal"),
+        index_before
+    );
+    let index = Index::load(&index_path).expect("reload index");
+    assert!(index.get("Case.txt", 0).is_some());
+    assert!(index.get("case.txt", 0).is_some());
 }
 
 /// A dotted path updates the canonical index entry instead of adding a second name.
@@ -3468,10 +6249,14 @@ async fn vcs_stage_rejects_lfs_without_publishing_content_or_pointer() {
         .await
         .expect_err("LFS must be refused");
     assert_eq!(error.stable_code, "LBR-AGENT-027");
-    assert_eq!(
-        error.message,
-        "vcs.stage: LFS snapshot staging is not supported; no index or object write was performed"
+    assert!(
+        error.message.contains(
+            "vcs.stage: LFS snapshot staging is not supported; no index or object write was performed"
+        ),
+        "{}",
+        error.message
     );
+    assert!(error.message.contains("payload.dat"), "{}", error.message);
     assert!(
         !error.message.contains(dir.path().to_str().unwrap_or("")),
         "{}",
@@ -3571,10 +6356,14 @@ async fn vcs_stage_rejects_other_content_filters_without_publishing() {
         .await
         .expect_err("filter must be refused");
     assert_eq!(error.stable_code, "LBR-AGENT-027");
-    assert_eq!(
-        error.message,
-        "vcs.stage: content filter staging is not supported; no index or object write was performed"
+    assert!(
+        error.message.contains(
+            "vcs.stage: content filter staging is not supported; no index or object write was performed"
+        ),
+        "{}",
+        error.message
     );
+    assert!(error.message.contains("note.secret"), "{}", error.message);
     assert_eq!(fs::read(dir.path().join(".libra/index")).unwrap(), before);
     let hash = git_internal::hash::ObjectHash::from_type_and_data(
         git_internal::internal::object::types::ObjectType::Blob,
@@ -5115,11 +7904,11 @@ async fn vcs_stage_rejects_a_directory() {
     );
 }
 
-/// Replacing a symlink during publish does not replace its snapshotted link text.
+/// Replacing a symlink during stage preparation invalidates the worktree fence.
 #[tokio::test]
 #[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
 #[serial(cwd, env, hash_kind)]
-async fn vcs_stage_keeps_snapshotted_symlink_text_during_publish() {
+async fn vcs_stage_rejects_a_symlink_replaced_during_preparation() {
     use std::os::unix::fs::symlink;
     struct ClearHook;
     impl Drop for ClearHook {
@@ -5137,6 +7926,8 @@ async fn vcs_stage_keeps_snapshotted_symlink_text_during_publish() {
     let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
         .await
         .expect("fence");
+    let index_path = dir.path().join(".libra/index");
+    let index_before = fs::read(&index_path).expect("index before stage");
     libra::internal::ai::agent_bridge::vcs_write::set_publish_rewrite_for_test(Some(
         dir.path().join("link"),
     ));
@@ -5144,22 +7935,15 @@ async fn vcs_stage_keeps_snapshotted_symlink_text_during_publish() {
         r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-link-publish","session_id":"s1","paths":["link"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
         fence.head, fence.index_generation, fence.worktree_generation
     );
-    let result = mutation_dispatch(&ctx, &request(&frame))
+    let error = mutation_dispatch(&ctx, &request(&frame))
         .await
-        .expect("stage snapshotted symlink")
-        .expect("response")
-        .result
-        .expect("result");
-    assert_eq!(result["outcome"], "applied");
-    let index =
-        git_internal::internal::index::Index::load(dir.path().join(".libra/index")).expect("index");
-    let entry = index.get("link", 0).expect("entry");
-    assert_eq!(entry.mode, 0o120000);
-    let link_blob = git_internal::hash::ObjectHash::from_type_and_data(
-        git_internal::internal::object::types::ObjectType::Blob,
-        b"secret.txt",
+        .expect_err("symlink changed during stage");
+    assert_eq!(error.stable_code, "LBR-AGENT-038", "{}", error.message);
+    assert!(error.message.contains("stale_state"), "{}", error.message);
+    assert_eq!(
+        fs::read(&index_path).expect("index after refusal"),
+        index_before
     );
-    assert_eq!(entry.hash, link_blob);
 }
 
 /// Staging a symlink records the link text, not the target file's bytes.
@@ -5263,11 +8047,11 @@ async fn vcs_commit_records_a_staged_deletion() {
     );
 }
 
-/// Deleting a file during publish still stages the bytes already snapshotted.
+/// Deleting a file during stage preparation invalidates the worktree fence.
 #[tokio::test]
 #[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
 #[serial(cwd, env, hash_kind)]
-async fn vcs_stage_publishes_a_snapshot_after_the_file_disappears() {
+async fn vcs_stage_rejects_a_file_that_disappears_during_preparation() {
     struct ClearHook;
     impl Drop for ClearHook {
         fn drop(&mut self) {
@@ -5283,6 +8067,8 @@ async fn vcs_stage_publishes_a_snapshot_after_the_file_disappears() {
     let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
         .await
         .expect("fence");
+    let index_path = dir.path().join(".libra/index");
+    let index_before = fs::read(&index_path).expect("index before stage");
     libra::internal::ai::agent_bridge::vcs_write::set_publish_remove_for_test(Some(
         dir.path().join("good.txt"),
     ));
@@ -5290,29 +8076,23 @@ async fn vcs_stage_publishes_a_snapshot_after_the_file_disappears() {
         r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-vanish","session_id":"s1","paths":["good.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
         fence.head, fence.index_generation, fence.worktree_generation
     );
-    let result = mutation_dispatch(&ctx, &request(&frame))
+    let error = mutation_dispatch(&ctx, &request(&frame))
         .await
-        .expect("stage vanished file")
-        .expect("response")
-        .result
-        .expect("result");
-    assert_eq!(result["outcome"], "applied");
-    let index =
-        git_internal::internal::index::Index::load(dir.path().join(".libra/index")).expect("index");
-    let entry = index.get("good.txt", 0).expect("entry");
-    let approved = git_internal::hash::ObjectHash::from_type_and_data(
-        git_internal::internal::object::types::ObjectType::Blob,
-        b"good\n",
+        .expect_err("file disappeared during stage");
+    assert_eq!(error.stable_code, "LBR-AGENT-038", "{}", error.message);
+    assert!(error.message.contains("stale_state"), "{}", error.message);
+    assert_eq!(
+        fs::read(&index_path).expect("index after refusal"),
+        index_before
     );
-    assert_eq!(entry.hash, approved);
     assert!(!dir.path().join("good.txt").exists());
 }
 
-/// A file recreated during publish does not undo a snapshotted deletion.
+/// A file recreated during stage preparation invalidates the deletion fence.
 #[tokio::test]
 #[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
 #[serial(cwd, env, hash_kind)]
-async fn vcs_stage_keeps_a_snapshotted_deletion_if_the_file_returns() {
+async fn vcs_stage_rejects_a_tracked_file_recreated_during_preparation() {
     struct ClearHook;
     impl Drop for ClearHook {
         fn drop(&mut self) {
@@ -5328,6 +8108,8 @@ async fn vcs_stage_keeps_a_snapshotted_deletion_if_the_file_returns() {
     let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
         .await
         .expect("fence");
+    let index_path = dir.path().join(".libra/index");
+    let index_before = fs::read(&index_path).expect("index before stage");
     libra::internal::ai::agent_bridge::vcs_write::set_publish_rewrite_for_test(Some(
         dir.path().join("tracked.txt"),
     ));
@@ -5335,18 +8117,14 @@ async fn vcs_stage_keeps_a_snapshotted_deletion_if_the_file_returns() {
         r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-delete-publish","session_id":"s1","paths":["tracked.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
         fence.head, fence.index_generation, fence.worktree_generation
     );
-    let result = mutation_dispatch(&ctx, &request(&frame))
+    let error = mutation_dispatch(&ctx, &request(&frame))
         .await
-        .expect("stage snapshotted deletion")
-        .expect("response")
-        .result
-        .expect("result");
-    assert_eq!(result["outcome"], "applied");
-    let index =
-        git_internal::internal::index::Index::load(dir.path().join(".libra/index")).expect("index");
-    assert!(
-        index.get("tracked.txt", 0).is_none(),
-        "snapshotted deletion must leave the index"
+        .expect_err("tracked file recreated during stage");
+    assert_eq!(error.stable_code, "LBR-AGENT-038", "{}", error.message);
+    assert!(error.message.contains("stale_state"), "{}", error.message);
+    assert_eq!(
+        fs::read(&index_path).expect("index after refusal"),
+        index_before
     );
     assert_eq!(
         fs::read(dir.path().join("tracked.txt")).expect("recreated worktree file"),
@@ -5438,11 +8216,11 @@ async fn vcs_stage_rejects_content_changed_during_add() {
     );
 }
 
-/// A file edited while the approved bytes are stored does not replace those bytes.
+/// A file edited after stage preparation invalidates the fence and leaves the index unchanged.
 #[tokio::test]
 #[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
 #[serial(cwd, env, hash_kind)]
-async fn vcs_stage_keeps_the_snapshot_if_the_file_changes_during_publish() {
+async fn vcs_stage_rejects_a_file_changed_after_preparation() {
     struct ClearHook;
     impl Drop for ClearHook {
         fn drop(&mut self) {
@@ -5458,6 +8236,8 @@ async fn vcs_stage_keeps_the_snapshot_if_the_file_changes_during_publish() {
     let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
         .await
         .expect("fence");
+    let index_path = dir.path().join(".libra/index");
+    let index_before = fs::read(&index_path).expect("index before stage");
     libra::internal::ai::agent_bridge::vcs_write::set_publish_rewrite_for_test(Some(
         dir.path().join("queued.txt"),
     ));
@@ -5465,20 +8245,15 @@ async fn vcs_stage_keeps_the_snapshot_if_the_file_changes_during_publish() {
         r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-publish","session_id":"s1","paths":["queued.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
         fence.head, fence.index_generation, fence.worktree_generation
     );
-    let result = mutation_dispatch(&ctx, &request(&frame))
+    let error = mutation_dispatch(&ctx, &request(&frame))
         .await
-        .expect("stage snapshot")
-        .expect("response")
-        .result
-        .expect("result");
-    assert_eq!(result["outcome"], "applied");
-    let approved = git_internal::hash::ObjectHash::from_type_and_data(
-        git_internal::internal::object::types::ObjectType::Blob,
-        b"queued\n",
+        .expect_err("file changed after stage preparation");
+    assert_eq!(error.stable_code, "LBR-AGENT-038", "{}", error.message);
+    assert!(error.message.contains("stale_state"), "{}", error.message);
+    assert_eq!(
+        fs::read(&index_path).expect("index after refusal"),
+        index_before
     );
-    let index =
-        git_internal::internal::index::Index::load(dir.path().join(".libra/index")).expect("index");
-    assert_eq!(index.get("queued.txt", 0).expect("entry").hash, approved);
     let unapproved = git_internal::hash::ObjectHash::from_type_and_data(
         git_internal::internal::object::types::ObjectType::Blob,
         b"changed while publishing\n",
@@ -5630,6 +8405,118 @@ async fn vcs_fence_uses_repository_relative_paths_from_subdirectory() {
         .await
         .expect("nested fence");
     assert_eq!(from_root, from_nested);
+}
+
+/// Stage refuses to publish when an editor changes the worktree after preparation.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+async fn vcs_stage_rechecks_the_fence_immediately_before_publication() {
+    use libra::internal::ai::agent_bridge::vcs_write::set_pre_publish_rewrite_for_test;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    write_file(dir.path(), "tracked.txt", "staged snapshot\n");
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let index_path = dir.path().join(".libra/index");
+    let index_before = fs::read(&index_path).expect("index before staging");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-stage-prepublish-race","session_id":"s1","paths":["tracked.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+    set_pre_publish_rewrite_for_test(Some(dir.path().join("tracked.txt")));
+    let error = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect_err("worktree change before publication");
+    assert_eq!(error.stable_code, "LBR-AGENT-038", "{}", error.message);
+    assert!(error.message.contains("stale_state"), "{}", error.message);
+    assert_eq!(
+        fs::read(&index_path).expect("index after refusal"),
+        index_before
+    );
+    assert_eq!(
+        fs::read(dir.path().join("tracked.txt")).expect("rewritten worktree file"),
+        b"changed after index preparation\n"
+    );
+
+    let replay_error = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect_err("the durable stale replay keeps its original RPC error");
+    assert_eq!(replay_error.stable_code, error.stable_code);
+    assert_eq!(replay_error.code, error.code);
+    assert_eq!(replay_error.message, error.message);
+    assert_eq!(
+        fs::read(&index_path).expect("index after replay"),
+        index_before
+    );
+}
+
+/// Stage refuses prepared bytes that differ from the content authorized by the
+/// final fence, even when the worktree returns to its original content.
+#[tokio::test]
+#[serial(cwd, env, hash_kind)]
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+async fn vcs_stage_rechecks_prepared_content_after_the_final_fence() {
+    use libra::internal::ai::agent_bridge::vcs_write::{
+        set_pre_publish_rewrite_for_test, set_stage_capture_rewrite_for_test,
+    };
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = repo_with_initial_commit(dir.path()).await;
+    let ctx = bridge_ctx().await;
+    open_session(&ctx, "s1").await;
+    let authorized = b"changed after index preparation\n";
+    fs::write(dir.path().join("tracked.txt"), authorized).expect("write authorized content");
+    let fence = libra::internal::ai::agent_bridge::vcs_write::current_write_fence()
+        .await
+        .expect("fence");
+    let index_path = dir.path().join(".libra/index");
+    let index_before = fs::read(&index_path).expect("index before staging");
+    let frame = format!(
+        r#"{{"jsonrpc":"2.0","method":"vcs.stage","params":{{"operation_id":"op-stage-prepared-content-return","session_id":"s1","paths":["tracked.txt"],"expectedHead":"{}","expectedIndex":"{}","expectedWorktree":"{}","approval":{{"decision":"approved","approver":"reviewer-1"}}}},"id":1}}"#,
+        fence.head, fence.index_generation, fence.worktree_generation
+    );
+
+    // After admission, the plan captures A. Immediately before the final fence
+    // read, restore B, which is the content the caller authorized.
+    set_stage_capture_rewrite_for_test(Some(dir.path().join("tracked.txt")));
+    set_pre_publish_rewrite_for_test(Some(dir.path().join("tracked.txt")));
+    let error = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect_err("prepared A must not be published against authorized B");
+    assert_eq!(error.stable_code, "LBR-AGENT-038", "{}", error.message);
+    assert!(
+        error
+            .message
+            .contains("changed while the batch was prepared"),
+        "{}",
+        error.message
+    );
+    assert_eq!(
+        fs::read(&index_path).expect("index after refusal"),
+        index_before
+    );
+    assert_eq!(
+        fs::read(dir.path().join("tracked.txt")).expect("worktree"),
+        authorized
+    );
+
+    // The refusal is durable: the same operation id reports the same refusal,
+    // not an uncertain publication.
+    let replay = mutation_dispatch(&ctx, &request(&frame))
+        .await
+        .expect_err("the replay reports the recorded refusal");
+    assert_eq!(replay.stable_code, error.stable_code);
+    assert_eq!(replay.code, error.code);
+    assert_eq!(replay.message, error.message);
+    assert_eq!(
+        fs::read(&index_path).expect("index after replay"),
+        index_before
+    );
 }
 
 /// (new) LVC-06: commit refuses when the index contains paths outside the request.

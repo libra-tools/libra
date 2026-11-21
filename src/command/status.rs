@@ -50,7 +50,7 @@ use crate::{
 // StatusData stays here so scan, cache, and renderers share one result shape.
 mod cache;
 mod input;
-mod output;
+pub(crate) mod output;
 mod scan;
 
 use cache::*;
@@ -1228,7 +1228,7 @@ pub fn changes_to_be_staged_with_file_mode(file_mode: bool) -> Result<Changes, S
 
 /// Platform default for `core.fileMode` when the config value is not resolved
 /// by a command entry: Unix enables mode comparison, other platforms do not.
-fn default_core_file_mode() -> bool {
+pub(crate) fn default_core_file_mode() -> bool {
     cfg!(unix)
 }
 
@@ -1277,7 +1277,7 @@ pub fn changes_to_be_staged_split_force() -> Result<(Changes, Changes), StatusEr
     changes_to_be_staged_split_force_with_ignore_case(ignore_case)
 }
 
-fn effective_ignore_case_for_workdir(workdir: &Path) -> Result<bool, StatusError> {
+pub(crate) fn effective_ignore_case_for_workdir(workdir: &Path) -> Result<bool, StatusError> {
     crate::utils::path_case::effective_ignore_case_for_dir_sync(workdir)
         .map_err(|source| StatusError::ConfigRead { source })
 }
@@ -1460,14 +1460,619 @@ fn changes_to_be_staged_split_force_with_index(
     Ok((visible, ignored))
 }
 
-fn changes_to_be_staged_split_with_index(
+/// A worktree entry's identity, metadata and content observed during status
+/// scanning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorktreeStamp {
+    pub identity: crate::utils::beneath::EntryIdentity,
+    pub stat: crate::utils::beneath::RawLstat,
+    /// The content digest in the write-fence row format, or `None` when the
+    /// path carries no content (a directory) or its content could not be read
+    /// within the fence's bounds.
+    pub digest: Option<String>,
+    /// The bytes the content digest covers, for the fence's byte budget.
+    pub bytes: u64,
+}
+
+/// What the status scan observed for one path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ObservedPath {
+    /// The path does not exist at the scan.
+    Absent,
+    /// The path was read, with its identity, metadata and content digest.
+    Observed(WorktreeStamp),
+    /// The path changed while the scan read it, so the scan cannot describe
+    /// it. The observation is never repaired afterwards.
+    Unstable,
+}
+
+/// Per-path observation of one status scan.
+pub(crate) type WorktreeStamps = HashMap<PathBuf, ObservedPath>;
+
+/// A fence covers at most 32 MiB of changed content. Status may capture the
+/// same path at admission, during classification, and after classification,
+/// so allow at most three times that amount of bounded capture work.
+const STATUS_CHANGED_CAPTURE_BUDGET: u64 = 96 * 1024 * 1024;
+
+/// The digest of one worktree path in the write-fence row format.
+///
+/// The bridge's write fence uses the same format, so a fence built from a
+/// status observation and a fence recomputed from the current worktree are
+/// directly comparable.
+pub(crate) fn worktree_content_digest(
+    root: &std::fs::File,
+    relative: &Path,
+    remaining: &mut u64,
+) -> io::Result<(String, u64)> {
+    use std::io::Read;
+    const MAX_BYTES: u64 = 16 * 1024 * 1024;
+    let metadata = match crate::utils::beneath::lstat_beneath(root, relative) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(("missing".into(), 0)),
+        Err(error) => return Err(error),
+    };
+    let mode = metadata.mode;
+    if metadata.is_symlink {
+        let (target, first_read) =
+            crate::utils::beneath::read_symlink_beneath_counted(root, relative);
+        // The bytes that were read are charged on every outcome, also when
+        // the read exceeded the budget: an unbounded read must not be free.
+        // The write-side recheck reads the target twice (before and after the
+        // identity checks) and charges both reads, so the status capture
+        // charges the same amount: a fence the status publishes must be
+        // consumable by the write that recomputes it.
+        // A successful read is charged twice, matching the write-side recheck
+        // that reads the link before and after its identity checks. A failed
+        // read charges only what it actually read.
+        let read = if target.is_ok() {
+            first_read.saturating_mul(2)
+        } else {
+            first_read
+        };
+        let over_budget = read > *remaining;
+        *remaining = remaining.saturating_sub(read);
+        if over_budget {
+            return Err(io::Error::other("worktree content budget exceeded"));
+        }
+        let target = target?;
+        return Ok((format!("symlink:{mode}:{}", sha256_hex(&target)), read));
+    }
+    if !metadata.is_file || metadata.len > MAX_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "unsupported or oversized worktree path",
+        ));
+    }
+    let file = crate::utils::beneath::open_file_beneath_nonblocking(root, relative)?;
+    let available = MAX_BYTES.min(*remaining);
+    let mut bytes = Vec::new();
+    let read_result = (&file).take(available + 1).read_to_end(&mut bytes);
+    // The bytes that were read are charged on every outcome, also when the
+    // read exceeded the budget or failed after a partial read.
+    *remaining = remaining.saturating_sub(bytes.len() as u64);
+    read_result.map_err(|error| io::Error::other(error.to_string()))?;
+    if bytes.len() as u64 > available {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "oversized worktree path",
+        ));
+    }
+    Ok((
+        format!("file:{mode}:{}", sha256_hex(&bytes)),
+        bytes.len() as u64,
+    ))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(bytes))
+}
+
+/// Capture one entry without following links, and verify its identity did not
+/// change while the metadata was read.
+pub(crate) fn capture_worktree_stamp(
+    root: &std::fs::File,
+    path: &Path,
+    remaining: &mut u64,
+) -> io::Result<Option<WorktreeStamp>> {
+    #[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+    if forced_path_matches(&FORCED_CAPTURE_FAILURE, path) {
+        return Err(io::Error::other("injected capture failure"));
+    }
+    let Some((identity, stat)) = capture_worktree_entry(root, path)? else {
+        return Ok(None);
+    };
+    let mut bytes = 0u64;
+    let digest = if stat.is_dir {
+        None
+    } else {
+        match worktree_content_digest(root, path, remaining) {
+            Ok((digest, charged)) => {
+                bytes = charged;
+                Some(digest)
+            }
+            // A path whose content is outside the fence's bounds does not
+            // become a fence row; the observation is simply not fenceable.
+            Err(_) => None,
+        }
+    };
+    Ok(Some(WorktreeStamp {
+        identity,
+        stat,
+        digest,
+        bytes,
+    }))
+}
+
+/// Capture one entry's identity and metadata without reading its content.
+pub(crate) fn capture_worktree_entry(
+    root: &std::fs::File,
+    path: &Path,
+) -> io::Result<
+    Option<(
+        crate::utils::beneath::EntryIdentity,
+        crate::utils::beneath::RawLstat,
+    )>,
+> {
+    #[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+    if forced_path_matches(&FORCED_ENTRY_FAILURE, path) {
+        return Err(io::Error::other("injected metadata capture failure"));
+    }
+    // The seam makes the path vanish between the two identity reads.
+    #[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+    if forced_path_matches(&FORCED_VANISHING_PATH, path) {
+        return Ok(None);
+    }
+    let identity_before = match crate::utils::beneath::entry_identity_beneath(root, path) {
+        Ok(identity) => identity,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let stat = crate::utils::beneath::lstat_beneath(root, path)?;
+    let identity_after = crate::utils::beneath::entry_identity_beneath(root, path)?;
+    if identity_before != identity_after {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "worktree entry changed while status captured its identity",
+        ));
+    }
+    Ok(Some((identity_before, stat)))
+}
+
+/// Capture the observation of one changed path: its identity, metadata and
+/// content digest, all taken while the scan classified it.
+fn capture_changed_stamp(
+    stamps: &mut Option<&mut WorktreeStamps>,
+    stamp_root: Option<&std::fs::File>,
+    budget: &mut u64,
+    path: &Path,
+) -> Option<WorktreeStamp> {
+    let (Some(stamps), Some(root)) = (stamps.as_deref_mut(), stamp_root) else {
+        return None;
+    };
+    // An unstable observation is never repaired: a path that changed while
+    // the scan read it stays unobserved.
+    if matches!(stamps.get(path), Some(ObservedPath::Unstable)) {
+        return None;
+    }
+    // The recapture seam fires on the tracked or untracked capture, so the
+    // staged capture of the same path still succeeds.
+    #[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+    if forced_path_matches(&FORCED_RECAPTURE_FAILURE, path) {
+        stamps.insert(path.to_path_buf(), ObservedPath::Unstable);
+        return None;
+    }
+    let Ok(Some(stamp)) = capture_worktree_stamp(root, path, budget) else {
+        // The capture could not be taken, so the scan cannot describe the
+        // path: an earlier observation may not remain fenceable.
+        stamps.insert(path.to_path_buf(), ObservedPath::Unstable);
+        return None;
+    };
+    // A path that was absent before and is present now changed during the
+    // scan: the scan cannot describe it.
+    if matches!(stamps.get(path), Some(ObservedPath::Absent)) {
+        stamps.insert(path.to_path_buf(), ObservedPath::Unstable);
+        return None;
+    }
+    // A path that was observed before is compared with that observation: the
+    // two captures must describe the same content, or the scan cannot describe
+    // the path. An observation without a digest (a capture that could not read
+    // the content) carries nothing to compare, so it is replaced by this one.
+    if let Some(ObservedPath::Observed(first)) = stamps.get(path) {
+        if first.identity != stamp.identity
+            || first.stat != stamp.stat
+            || first.digest != stamp.digest
+        {
+            stamps.insert(path.to_path_buf(), ObservedPath::Unstable);
+            return None;
+        }
+        if stamp.digest.is_some() {
+            stamps.insert(path.to_path_buf(), ObservedPath::Observed(stamp.clone()));
+        }
+        return Some(stamp);
+    }
+    stamps.insert(path.to_path_buf(), ObservedPath::Observed(stamp.clone()));
+    Some(stamp)
+}
+
+/// Verify that a path still matches the observation taken before the scan
+/// classified it.
+///
+/// A path that changed in between is dropped from the observation: the fence
+/// then cannot describe it, so the status answers without a fence instead of
+/// publishing one for content the scan never saw.
+fn verify_changed_stamp(
+    stamp_root: Option<&std::fs::File>,
+    stamps: &mut Option<&mut WorktreeStamps>,
+    path: &Path,
+    observed: Option<(
+        crate::utils::beneath::EntryIdentity,
+        crate::utils::beneath::RawLstat,
+    )>,
+) {
+    let (Some(root), Some(stamps)) = (stamp_root, stamps.as_deref_mut()) else {
+        return;
+    };
+    let Some((identity, ref stat)) = observed else {
+        // The path could not be observed before the classification, so there
+        // is nothing to compare: the path is observed after the classification
+        // instead, and the observation is not repaired by a later pass.
+        return;
+    };
+    let current = capture_worktree_entry(root, path).ok().flatten();
+    let unchanged = match current {
+        Some((current_identity, ref current_stat)) => {
+            current_identity == identity && current_stat == stat
+        }
+        None => false,
+    };
+    if !unchanged {
+        // The path changed while the scan read it: the observation is marked
+        // unstable, and no later pass may repair it.
+        stamps.insert(path.to_path_buf(), ObservedPath::Unstable);
+    }
+}
+
+/// Test seam: rewrite a path between the classification read and the
+/// verification of its observation.
+///
+/// The seam exists so a test can prove that a path which changed while the
+/// scan classified it cannot enter the fence. It is not used by the protocol.
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+static CLASSIFICATION_WINDOW_REWRITE: std::sync::Mutex<Option<PathBuf>> =
+    std::sync::Mutex::new(None);
+
+/// Test seam: rewrite a path between the classification read and the
+/// verification of its observation.
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+pub fn set_classification_window_rewrite_for_test(path: Option<PathBuf>) {
+    *CLASSIFICATION_WINDOW_REWRITE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = path;
+}
+
+/// Test seam: replace a path with a directory between the classification read
+/// and the verification.
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+static CLASSIFICATION_WINDOW_DIRECTORY: std::sync::Mutex<Option<PathBuf>> =
+    std::sync::Mutex::new(None);
+
+/// Test seam: replace a path with a directory between the classification read
+/// and the verification.
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+pub fn set_classification_window_directory_for_test(path: Option<PathBuf>) {
+    *CLASSIFICATION_WINDOW_DIRECTORY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = path;
+}
+
+/// Rewrite a path between the classification read and the verification.
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+fn rewrite_in_classification_window() {
+    if let Some(path) = CLASSIFICATION_WINDOW_DIRECTORY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
+    {
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::create_dir_all(&path);
+    }
+    let Some(path) = CLASSIFICATION_WINDOW_REWRITE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
+    else {
+        return;
+    };
+    let _ = std::fs::write(path, b"changed during the status scan\n");
+}
+
+#[cfg(not(all(feature = "test-bridge-hooks", debug_assertions)))]
+fn rewrite_in_classification_window() {}
+
+/// Whether a path-specific test seam names this path; a matching seam fires
+/// once and is cleared.
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+fn forced_path_matches(seam: &std::sync::Mutex<Option<PathBuf>>, path: &Path) -> bool {
+    let mut guard = seam.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if guard.as_deref() != Some(path) {
+        return false;
+    }
+    *guard = None;
+    true
+}
+
+/// Test seam: make the content capture of a path fail.
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+static FORCED_CAPTURE_FAILURE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+/// Test seam: make the content capture of a path fail.
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+pub fn set_forced_capture_failure_for_test(path: Option<PathBuf>) {
+    *FORCED_CAPTURE_FAILURE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = path;
+}
+
+/// Test seam: make the capture of an already observed path fail.
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+static FORCED_RECAPTURE_FAILURE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+/// Test seam: make the capture of an already observed path fail.
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+pub fn set_forced_recapture_failure_for_test(path: Option<PathBuf>) {
+    *FORCED_RECAPTURE_FAILURE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = path;
+}
+
+/// Test seam: make the metadata capture of a path fail.
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+static FORCED_ENTRY_FAILURE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+/// Test seam: make the metadata capture of a path fail.
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+pub fn set_forced_entry_failure_for_test(path: Option<PathBuf>) {
+    *FORCED_ENTRY_FAILURE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = path;
+}
+
+/// Test seam: make the observation root unpinnable.
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+static FORCE_OBSERVATION_ROOT_FAILURE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Test seam: make the observation root unpinnable.
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+pub fn set_force_observation_root_failure_for_test(enabled: bool) {
+    FORCE_OBSERVATION_ROOT_FAILURE.store(enabled, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Test seam: make a path vanish while its identity is captured.
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+static FORCED_VANISHING_PATH: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+/// Test seam: make a path vanish while its identity is captured.
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+pub fn set_forced_vanishing_path_for_test(path: Option<PathBuf>) {
+    *FORCED_VANISHING_PATH
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = path;
+}
+
+/// Test seam: make the worktree metadata read of a path fail.
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+static FORCED_WORKTREE_METADATA_FAILURE: std::sync::Mutex<Option<PathBuf>> =
+    std::sync::Mutex::new(None);
+
+/// Test seam: make the worktree metadata read of a path fail.
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+pub fn set_forced_worktree_metadata_failure_for_test(path: Option<PathBuf>) {
+    *FORCED_WORKTREE_METADATA_FAILURE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = path;
+}
+
+/// Test seam: remove a path after the staged capture.
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+static REMOVE_AFTER_STAGED_CAPTURE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+/// Test seam: remove a path after the staged capture.
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+pub fn set_remove_after_staged_capture_for_test(path: Option<PathBuf>) {
+    *REMOVE_AFTER_STAGED_CAPTURE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = path;
+}
+
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+fn remove_after_staged_capture() {
+    let Some(path) = REMOVE_AFTER_STAGED_CAPTURE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
+    else {
+        return;
+    };
+    let _ = std::fs::remove_file(path);
+}
+
+#[cfg(not(all(feature = "test-bridge-hooks", debug_assertions)))]
+fn remove_after_staged_capture() {}
+
+/// Test seam: rewrite a changed file after the second classification hash.
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+static CLASSIFICATION_DIGEST_WINDOW_REWRITE: std::sync::Mutex<Option<PathBuf>> =
+    std::sync::Mutex::new(None);
+
+/// Test seam: rewrite a changed file after the second classification hash.
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+pub fn set_classification_digest_window_rewrite_for_test(path: Option<PathBuf>) {
+    *CLASSIFICATION_DIGEST_WINDOW_REWRITE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = path;
+}
+
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+fn rewrite_after_second_classification_hash() {
+    let Some(path) = CLASSIFICATION_DIGEST_WINDOW_REWRITE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
+    else {
+        return;
+    };
+    let _ = std::fs::write(path, b"changed after the second classification hash\\n");
+}
+
+#[cfg(not(all(feature = "test-bridge-hooks", debug_assertions)))]
+fn rewrite_after_second_classification_hash() {}
+
+/// Test seam: recreate a staged deletion before the untracked walk observes it.
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+static STAGED_ABSENCE_RECREATE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+/// Test seam: recreate a staged deletion before the untracked walk observes it.
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+pub fn set_staged_absence_recreate_for_test(path: Option<PathBuf>) {
+    *STAGED_ABSENCE_RECREATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = path;
+}
+
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+fn recreate_staged_absence_before_untracked_walk() {
+    let Some(path) = STAGED_ABSENCE_RECREATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
+    else {
+        return;
+    };
+    let _ = std::fs::write(path, b"recreated during status scan\n");
+}
+
+#[cfg(not(all(feature = "test-bridge-hooks", debug_assertions)))]
+fn recreate_staged_absence_before_untracked_walk() {}
+
+/// [`changes_to_be_staged_split_with_index`] with the metadata captured during
+/// that same scan. The bridge uses these stamps to reject a fence if a path
+/// changes after status classified it.
+pub(crate) fn changes_to_be_staged_split_with_index_observation(
+    workdir: &PathBuf,
+    index: &Index,
+    ignore_case: bool,
+    file_mode: bool,
+    staged: &Changes,
+) -> Result<(Changes, Changes, Option<WorktreeStamps>), StatusError> {
+    let mut stamps = WorktreeStamps::new();
+    // A root that cannot be pinned means the scan cannot observe anything:
+    // the caller must withhold the fence instead of publishing one for an
+    // unobserved state, even if a later reopen happens to succeed.
+    #[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+    let forced_root_failure =
+        FORCE_OBSERVATION_ROOT_FAILURE.swap(false, std::sync::atomic::Ordering::SeqCst);
+    #[cfg(not(all(feature = "test-bridge-hooks", debug_assertions)))]
+    let forced_root_failure = false;
+    let opened_root = if forced_root_failure {
+        None
+    } else {
+        crate::utils::beneath::open_root(workdir).ok()
+    };
+    let stamp_root = match opened_root {
+        Some(root) => root,
+        None => {
+            let mut unobserved_budget = 0u64;
+            let (visible, ignored) = changes_to_be_staged_split_with_index_inner(
+                workdir,
+                index,
+                ignore_case,
+                file_mode,
+                None,
+                None,
+                &mut unobserved_budget,
+            )?;
+            return Ok((visible, ignored, None));
+        }
+    };
+    let stamp_root = Some(stamp_root);
+    // The staged paths are captured FIRST, so their content belongs to the
+    // same observation as the worktree scan: a later capture could describe
+    // content the scan never read. The staged captures and the tracked
+    // captures share ONE changed-path budget, so the capture work of one scan
+    // stays bounded.
+    let mut changed_budget = STATUS_CHANGED_CAPTURE_BUDGET;
+    if let Some(root) = stamp_root.as_ref() {
+        for path in staged
+            .new
+            .iter()
+            .chain(staged.modified.iter())
+            .chain(staged.deleted.iter())
+            .chain(staged.renamed.iter().map(|(_, new)| new))
+        {
+            match capture_worktree_stamp(root, path, &mut changed_budget) {
+                Ok(Some(stamp)) => {
+                    stamps.insert(path.clone(), ObservedPath::Observed(stamp));
+                }
+                Ok(None) => {
+                    stamps.insert(path.clone(), ObservedPath::Absent);
+                }
+                // A capture that could not be taken leaves the path
+                // unobserved: a later capture may not repair it.
+                Err(_) => {
+                    stamps.insert(path.clone(), ObservedPath::Unstable);
+                }
+            }
+        }
+    }
+    remove_after_staged_capture();
+    let (visible, ignored) = changes_to_be_staged_split_with_index_inner(
+        workdir,
+        index,
+        ignore_case,
+        file_mode,
+        Some(&mut stamps),
+        stamp_root.as_ref(),
+        &mut changed_budget,
+    )?;
+    Ok((visible, ignored, Some(stamps)))
+}
+
+pub(crate) fn changes_to_be_staged_split_with_index(
     workdir: &PathBuf,
     index: &Index,
     ignore_case: bool,
     file_mode: bool,
 ) -> Result<(Changes, Changes), StatusError> {
+    let mut changed_budget = STATUS_CHANGED_CAPTURE_BUDGET;
+    changes_to_be_staged_split_with_index_inner(
+        workdir,
+        index,
+        ignore_case,
+        file_mode,
+        None,
+        None,
+        &mut changed_budget,
+    )
+}
+
+fn changes_to_be_staged_split_with_index_inner(
+    workdir: &PathBuf,
+    index: &Index,
+    ignore_case: bool,
+    file_mode: bool,
+    mut stamps: Option<&mut WorktreeStamps>,
+    stamp_root: Option<&std::fs::File>,
+    changed_budget: &mut u64,
+) -> Result<(Changes, Changes), StatusError> {
     let mut visible = Changes::default();
     let mut ignored = Changes::default();
+    // Only changed-path raw captures consume the shared, non-refundable
+    // budget. A clean tracked candidate uses its classification hash without
+    // an extra raw capture, so clean paths cannot starve changed-path capture.
+    // The fence's own byte budget is enforced by the row collector over the
+    // retained changed state only.
     let tracked_files = index.tracked_files();
     let tracked_fold = tracked_files_by_fold(&tracked_files, ignore_case);
     let conversion = crate::command::status_io_worker::ConversionScan::new(workdir, index)
@@ -1536,8 +2141,47 @@ fn changes_to_be_staged_split_with_index(
             }
         }
         let file_abs = workdir.join(file);
+        // The seam makes the metadata read fail for another reason than
+        // absence.
+        #[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+        if forced_path_matches(&FORCED_WORKTREE_METADATA_FAILURE, file) {
+            visible.deleted.push(file.clone());
+            if let Some(stamps) = stamps.as_deref_mut() {
+                stamps.insert(file.clone(), ObservedPath::Unstable);
+            }
+            continue;
+        }
         match file_abs.symlink_metadata() {
-            Err(_) => visible.deleted.push(file.clone()),
+            Err(error)
+                if error.kind() == io::ErrorKind::NotFound
+                    || error.kind() == io::ErrorKind::NotADirectory =>
+            {
+                visible.deleted.push(file.clone());
+                if let Some(stamps) = stamps.as_deref_mut() {
+                    // A path that was observed as present and is gone now
+                    // changed during the scan, and an unstable observation is
+                    // never repaired: neither may become an absence.
+                    let observed_absent = match stamps.get(file) {
+                        Some(ObservedPath::Absent) => true,
+                        Some(ObservedPath::Unstable) => false,
+                        Some(ObservedPath::Observed(_)) => false,
+                        None => true,
+                    };
+                    if observed_absent {
+                        stamps.insert(file.clone(), ObservedPath::Absent);
+                    } else {
+                        stamps.insert(file.clone(), ObservedPath::Unstable);
+                    }
+                }
+            }
+            Err(_) => {
+                // The metadata could not be read, so the scan cannot tell
+                // whether the path is gone: the path is unfenceable.
+                visible.deleted.push(file.clone());
+                if let Some(stamps) = stamps.as_deref_mut() {
+                    stamps.insert(file.clone(), ObservedPath::Unstable);
+                }
+            }
             Ok(metadata) => {
                 // ADR-FM-05: with core.fileMode=true a regular file whose owner
                 // execute bit differs from the index is a mode-only change.
@@ -1554,6 +2198,7 @@ fn changes_to_be_staged_split_with_index(
                 });
                 if mode_only_change || type_change {
                     visible.modified.push(file.clone());
+                    capture_changed_stamp(&mut stamps, stamp_root, changed_budget, file);
                 } else if !policy_valid
                     || crate::command::status_untracked::index_stat_differs(
                         index,
@@ -1569,6 +2214,35 @@ fn changes_to_be_staged_split_with_index(
                         index_file_mtime,
                     )
                 {
+                    // The path's identity and metadata are captured before the
+                    // classification, and its content is classified and hashed
+                    // again after it: a path that changed across the
+                    // classification is left unstable, and no fence can
+                    // describe it.
+                    let observed_entry = match stamp_root {
+                        Some(root) => match capture_worktree_entry(root, file) {
+                            // The path was present a moment ago and is gone
+                            // now: it changed during the scan, so the scan
+                            // cannot describe it.
+                            Ok(None) => {
+                                if let Some(stamps) = stamps.as_deref_mut() {
+                                    stamps.insert(file.clone(), ObservedPath::Unstable);
+                                }
+                                None
+                            }
+                            Ok(entry) => entry,
+                            // The metadata could not be read, so the scan
+                            // cannot describe the path: no later capture may
+                            // repair it.
+                            Err(_) => {
+                                if let Some(stamps) = stamps.as_deref_mut() {
+                                    stamps.insert(file.clone(), ObservedPath::Unstable);
+                                }
+                                None
+                            }
+                        },
+                        None => None,
+                    };
                     let file_hash =
                         conversion
                             .hash(&file_abs)
@@ -1576,9 +2250,44 @@ fn changes_to_be_staged_split_with_index(
                                 path: file_abs.clone(),
                                 source,
                             })?;
-                    if !index.verify_hash(file_str, 0, &file_hash) {
+                    rewrite_in_classification_window();
+                    let modified = !index.verify_hash(file_str, 0, &file_hash);
+                    // The second hash and the observation checks exist only for
+                    // a caller that asked for fence observations: the ordinary
+                    // status scan must not reread every modified path.
+                    let observing = stamps.is_some();
+                    if modified {
                         visible.modified.push(file.clone());
+                        if !observing {
+                            continue;
+                        }
+                        // The content is captured on both sides of the second
+                        // classification read. Matching identity, metadata and
+                        // digest bind the fence to that read; any difference or
+                        // failed capture leaves the path unstable. A failed
+                        // second classification hash is also unstable, and the
+                        // status still answers.
+                        let captured_before_hash =
+                            capture_changed_stamp(&mut stamps, stamp_root, changed_budget, file);
+                        let after_hash = conversion.hash(&file_abs).ok();
+                        rewrite_after_second_classification_hash();
+                        let captured_after_hash =
+                            capture_changed_stamp(&mut stamps, stamp_root, changed_budget, file);
+                        let stable = after_hash == Some(file_hash)
+                            && captured_before_hash.is_some()
+                            && captured_before_hash == captured_after_hash;
+                        verify_changed_stamp(stamp_root, &mut stamps, file, observed_entry);
+                        if !stable && let Some(stamps) = stamps.as_deref_mut() {
+                            stamps.insert(file.clone(), ObservedPath::Unstable);
+                        }
+                    } else {
+                        verify_changed_stamp(stamp_root, &mut stamps, file, observed_entry);
                     }
+                    // The observation of an unchanged candidate is kept: a
+                    // staged path must not be captured again after the scan
+                    // classified it, or the fence could pin content the scan
+                    // never read. The observation of a path that changed while
+                    // the scan read it is never discarded either.
                 }
             }
         }
@@ -1599,16 +2308,24 @@ fn changes_to_be_staged_split_with_index(
             ),
         });
     }
-    let (files, ignored_files) =
-        list_workdir_files_split_safe(workdir).map_err(|source| StatusError::ListWorkdirFiles {
-            path: workdir.clone(),
-            source,
-        })?;
+    recreate_staged_absence_before_untracked_walk();
+    let listing = match (stamp_root, stamps.as_deref_mut()) {
+        (Some(root), Some(stamps)) => {
+            list_workdir_files_split_safe_with_stamps(workdir, root, stamps)
+        }
+        _ => list_workdir_files_split_safe(workdir),
+    };
+    let mut stamps = stamps;
+    let (files, ignored_files) = listing.map_err(|source| StatusError::ListWorkdirFiles {
+        path: workdir.clone(),
+        source,
+    })?;
     // §B.6.1: an undecodable name is untracked, not a fatal error — it can
     // never be an index key, so the lookup is simply skipped.
     for file in files {
         let untracked = file.to_str().is_none_or(|name| !index.tracked(name, 0));
         if untracked && !is_same_file_tracked_alias(workdir, &file, &tracked_fold) {
+            capture_changed_stamp(&mut stamps, stamp_root, changed_budget, &file);
             visible.new.push(file);
         }
     }
@@ -1648,6 +2365,22 @@ fn is_same_file_tracked_alias(
 }
 
 fn list_workdir_files_split_safe(workdir: &PathBuf) -> io::Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+    list_workdir_files_split_safe_inner(workdir, None, None)
+}
+
+fn list_workdir_files_split_safe_with_stamps(
+    workdir: &PathBuf,
+    root: &std::fs::File,
+    stamps: &mut WorktreeStamps,
+) -> io::Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+    list_workdir_files_split_safe_inner(workdir, Some(root), Some(stamps))
+}
+
+fn list_workdir_files_split_safe_inner(
+    workdir: &PathBuf,
+    stamp_root: Option<&std::fs::File>,
+    mut stamps: Option<&mut WorktreeStamps>,
+) -> io::Result<(Vec<PathBuf>, Vec<PathBuf>)> {
     let mut files = Vec::new();
     let mut ignored = Vec::new();
     let mut pending_dirs = vec![workdir.clone()];
@@ -1658,6 +2391,28 @@ fn list_workdir_files_split_safe(workdir: &PathBuf) -> io::Result<(Vec<PathBuf>,
     let layers = crate::internal::layer::ExclusionSnapshot::for_request();
 
     while let Some(dir) = pending_dirs.pop() {
+        if let (Some(root), Some(stamps)) = (stamp_root, stamps.as_deref_mut()) {
+            let relative = dir
+                .strip_prefix(workdir)
+                .map_err(|error| io::Error::other(error.to_string()))?;
+            let observed = match capture_worktree_entry(root, relative) {
+                Ok(Some((identity, stat))) => ObservedPath::Observed(WorktreeStamp {
+                    identity,
+                    stat,
+                    digest: None,
+                    bytes: 0,
+                }),
+                Ok(None) => ObservedPath::Absent,
+                // The directory could not be inspected, so the walk cannot
+                // describe it: an error is never recorded as an absence.
+                Err(_) => ObservedPath::Unstable,
+            };
+            // A path the scan already found unstable keeps that marker: the
+            // directory walk must not repair an observation.
+            if !matches!(stamps.get(relative), Some(ObservedPath::Unstable)) {
+                stamps.insert(relative.to_path_buf(), observed);
+            }
+        }
         for entry in std::fs::read_dir(&dir)? {
             let entry = entry?;
             let path = entry.path();
@@ -2481,6 +3236,65 @@ mod rename_destination_budget_test {
         assert!(
             budgets.objects_total <= objects_before,
             "object byte budget must never grow across a pass"
+        );
+    }
+}
+
+#[cfg(test)]
+mod capture_budget_test {
+    use super::*;
+
+    /// A failed symlink retry charges the bytes the first attempt read.
+    #[test]
+    #[cfg(all(unix, feature = "test-bridge-hooks", debug_assertions))]
+    fn a_failed_symlink_retry_charges_the_first_read() {
+        let dir = tempfile::tempdir().expect("fixture");
+        let target = "a".repeat(300);
+        std::os::unix::fs::symlink(&target, dir.path().join("link")).expect("symlink");
+        let root = crate::utils::beneath::open_root(dir.path()).expect("root");
+
+        crate::utils::beneath::set_fail_readlink_retry_for_test(true);
+        let mut remaining = 32_000_000u64;
+        worktree_content_digest(&root, Path::new("link"), &mut remaining)
+            .expect_err("the retried read fails");
+        assert_eq!(
+            remaining,
+            32_000_000 - 256,
+            "a failed read charges only the bytes it actually read"
+        );
+    }
+
+    /// An over-budget symlink read is charged, so the shared capture budget
+    /// cannot be spent twice on the same bytes.
+    #[test]
+    #[cfg(unix)]
+    fn an_over_budget_symlink_read_is_charged() {
+        let dir = tempfile::tempdir().expect("fixture");
+        let target = dir.path().join("target");
+        std::fs::write(&target, b"0123456789").expect("target");
+        std::os::unix::fs::symlink(&target, dir.path().join("link")).expect("symlink");
+        let root = crate::utils::beneath::open_root(dir.path()).expect("root");
+
+        // The symlink target is ten bytes, and the budget allows five.
+        let mut remaining = 5u64;
+        let error = worktree_content_digest(&root, Path::new("link"), &mut remaining)
+            .expect_err("the over-budget read is refused");
+        assert!(
+            error.to_string().contains("budget"),
+            "the refusal names the budget: {error}"
+        );
+        assert_eq!(
+            remaining, 0,
+            "the bytes that were read are charged even when the read exceeded the budget"
+        );
+
+        // The depleted budget refuses the next path as well.
+        let mut remaining = 0u64;
+        worktree_content_digest(&root, Path::new("target"), &mut remaining)
+            .expect_err("the depleted budget refuses the next read");
+        assert_eq!(
+            remaining, 0,
+            "a refused read leaves no budget for the next path"
         );
     }
 }

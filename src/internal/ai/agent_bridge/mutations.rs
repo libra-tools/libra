@@ -1667,6 +1667,40 @@ async fn replay_durable_operation(
     Ok(None)
 }
 
+fn replay_recorded_vcs_error(value: &Value) -> Result<BridgeError, BridgeError> {
+    let stable_code = match value.get("stableCode").and_then(Value::as_str) {
+        Some("LBR-AGENT-027") => "LBR-AGENT-027",
+        Some("LBR-AGENT-032") => "LBR-AGENT-032",
+        Some("LBR-AGENT-037") => "LBR-AGENT-037",
+        Some("LBR-AGENT-038") => "LBR-AGENT-038",
+        _ => {
+            return Err(BridgeError::internal(
+                "recorded VCS write error has an unsupported stable code",
+            ));
+        }
+    };
+    let code = value
+        .get("code")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| BridgeError::internal("recorded VCS write error has no code"))?;
+    let message = value
+        .get("message")
+        .and_then(Value::as_str)
+        .ok_or_else(|| BridgeError::internal("recorded VCS write error has no message"))?;
+    let mut error = BridgeError::new(code, stable_code, message);
+    if value
+        .get("retryable")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        error = error.retryable();
+    }
+    if let Some(resource) = value.get("resource").and_then(Value::as_str) {
+        error = error.resource(resource.to_string());
+    }
+    Ok(error)
+}
+
 fn replayed_result(
     method: &str,
     result_digest: &str,
@@ -1717,6 +1751,9 @@ fn replayed_result(
             let mut value: Value = serde_json::from_str(result_digest).map_err(|error| {
                 vcs::internal_hiding_host_paths("vcs replay payload is not JSON", error)
             })?;
+            if terminal_outcome && let Some(error) = value.get("vcsWriteError") {
+                return Err(replay_recorded_vcs_error(error)?);
+            }
             if let Some(object) = value.as_object_mut() {
                 // A terminal outcome keeps its own outcome; only a recorded
                 // success becomes a "replayed" success.
@@ -2220,6 +2257,48 @@ async fn review_run(
     Ok(state)
 }
 
+async fn record_vcs_write_failure_before_publish(
+    ctx: &BridgeContext,
+    operation_id: &str,
+    method: &str,
+    session_id: &str,
+    paths: &[String],
+    error: BridgeError,
+) -> Result<Value, BridgeError> {
+    let retryable = error.stable_code == "LBR-AGENT-038";
+    let durable_error = with_durable_state_hint(error.clone(), operation_id, retryable);
+    let outcome = if error.stable_code == "LBR-AGENT-038" {
+        "stale_state"
+    } else {
+        "failed"
+    };
+    let terminal = vcs_write_terminal_outcome_with(
+        operation_id,
+        outcome,
+        &durable_error.message,
+        json!({
+            "paths": paths,
+            "vcsWriteError": {
+                "code": durable_error.code,
+                "stableCode": durable_error.stable_code,
+                "message": durable_error.message,
+                "retryable": durable_error.retryable,
+                "resource": durable_error.resource,
+            }
+        }),
+    );
+    if record_terminal_outcome(ctx, operation_id, &terminal).await? {
+        return Err(error);
+    }
+    replay_durable_operation(ctx, operation_id, method, session_id)
+        .await?
+        .ok_or_else(|| {
+            BridgeError::internal(
+                "stale VCS write was rejected without a durable operation outcome",
+            )
+        })
+}
+
 async fn vcs_write(
     ctx: &BridgeContext,
     session: &storage::BridgeSessionRow,
@@ -2244,7 +2323,7 @@ async fn vcs_write(
             "vcs.stage, vcs.unstage, and vcs.commit require at least one repository-relative path",
         ));
     }
-    let expected_head = param_str(&request.params, "expectedHead")
+    let expected_head = param_head_fence(&request.params, "expectedHead")
         .ok_or_else(|| BridgeError::invalid_params("vcs write methods require expectedHead"))?;
     let expected_index = param_str(&request.params, "expectedIndex")
         .ok_or_else(|| BridgeError::invalid_params("vcs write methods require expectedIndex"))?;
@@ -2412,6 +2491,47 @@ async fn vcs_write(
             .map_err(|error| {
                 vcs::internal_hiding_host_paths("record prepared index publication", error)
             })?;
+        // The fence is re-read immediately before the live index is replaced.
+        // The preparation can take a while, and an editor does not take
+        // Libra's maintenance lock: a file may have changed in the meantime,
+        // and publishing against the stale authorized fence would report a
+        // success for a state the caller never saw.
+        super::vcs_write::rewrite_before_index_publication();
+        let before_publish = super::vcs_write::current_write_fence().await;
+        let fence_result = before_publish.and_then(|actual| {
+            super::vcs_write::require_matching_fence(
+                &actual,
+                &intent_head,
+                &intent_index,
+                &intent_worktree,
+            )
+        });
+        if let Err(error) = fence_result {
+            return record_vcs_write_failure_before_publish(
+                ctx,
+                operation_id,
+                method,
+                session_id,
+                prepared.applied(),
+                error,
+            )
+            .await;
+        }
+        // The prepared source snapshots must still be current at the
+        // publication boundary. A refusal here is definite: the index was not
+        // replaced, so it is recorded as this operation's terminal outcome
+        // instead of leaving an uncertain publication behind.
+        if let Err(error) = prepared.verify_prepared_sources() {
+            return record_vcs_write_failure_before_publish(
+                ctx,
+                operation_id,
+                method,
+                session_id,
+                prepared.applied(),
+                error,
+            )
+            .await;
+        }
         prepared.publish()?;
         publication::publish_index_publication(operation_id)
             .await
@@ -2622,6 +2742,19 @@ fn param_str(params: &Option<Value>, key: &str) -> Option<String> {
         .and_then(|p| p.get(key))
         .and_then(Value::as_str)
         .map(str::to_string)
+}
+
+/// The HEAD part of a write fence.
+///
+/// An unborn HEAD has no commit id, and the protocol contract carries that as
+/// `null`, so both `null` and the empty string name the same unborn HEAD.
+fn param_head_fence(params: &Option<Value>, key: &str) -> Option<String> {
+    let value = params.as_ref().and_then(|p| p.get(key))?;
+    match value {
+        Value::Null => Some(String::new()),
+        Value::String(head) => Some(head.clone()),
+        _ => None,
+    }
 }
 
 async fn checkpoint_create(

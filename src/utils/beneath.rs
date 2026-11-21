@@ -374,6 +374,43 @@ pub fn read_symlink_beneath(root: &fs::File, rel: &Path) -> io::Result<Vec<u8>> 
     read_symlink_in_dir(&directory, name, root)
 }
 
+/// Read one symlink target and report the bytes every read attempt returned.
+///
+/// The caller uses this to charge a shared byte budget for the real work a
+/// retried read performs.
+pub fn read_symlink_beneath_counted(root: &fs::File, rel: &Path) -> (io::Result<Vec<u8>>, u64) {
+    if rel.is_absolute() || is_root_rel(rel) {
+        return (
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "beneath symlink path must be a non-empty relative path",
+            )),
+            0,
+        );
+    }
+    if let Err(error) = reject_dotdot(rel) {
+        return (Err(error), 0);
+    }
+    let parent = rel.parent().filter(|parent| !is_root_rel(parent));
+    let Some(name) = rel.file_name() else {
+        return (
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "beneath symlink path has no final component",
+            )),
+            0,
+        );
+    };
+    let directory = match parent {
+        Some(parent) => open_beneath(root, parent),
+        None => dup_file(root),
+    };
+    match directory {
+        Ok(directory) => read_symlink_in_dir_counted(&directory, name, root),
+        Err(error) => (Err(error), 0),
+    }
+}
+
 fn open_file_in_dir(
     directory: &fs::File,
     name: &std::ffi::OsStr,
@@ -496,13 +533,46 @@ fn read_symlink_in_dir(
     name: &std::ffi::OsStr,
     root: &fs::File,
 ) -> io::Result<Vec<u8>> {
+    let (target, _read) = read_symlink_in_dir_counted(directory, name, root);
+    target
+}
+
+/// Read one symlink target and report the bytes every attempt returned.
+///
+/// A target longer than the initial buffer takes more than one `readlinkat`
+/// call; the caller's budget must charge the whole work, not only the final
+/// target length.
+/// Test seam: make the second `readlinkat` attempt of a long target fail.
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+static FAIL_READLINK_RETRY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Test seam: make the second `readlinkat` attempt of a long target fail.
+///
+/// Only the bridge fault-injection tests use it, so the dead-code lint is
+/// expected in a library build that enables the feature without those tests.
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+#[allow(dead_code)]
+pub fn set_fail_readlink_retry_for_test(enabled: bool) {
+    FAIL_READLINK_RETRY.store(enabled, std::sync::atomic::Ordering::SeqCst);
+}
+
+fn read_symlink_in_dir_counted(
+    directory: &fs::File,
+    name: &std::ffi::OsStr,
+    root: &fs::File,
+) -> (io::Result<Vec<u8>>, u64) {
     #[cfg(unix)]
     {
         use std::os::fd::AsRawFd;
 
         let _ = root;
-        let c_name = component_cstring(name)?;
+        let c_name = match component_cstring(name) {
+            Ok(name) => name,
+            Err(error) => return (Err(error), 0),
+        };
         let mut target = vec![0u8; 256];
+        let mut read = 0u64;
         loop {
             let size = unsafe {
                 libc::readlinkat(
@@ -513,19 +583,32 @@ fn read_symlink_in_dir(
                 )
             };
             if size < 0 {
-                return Err(io::Error::last_os_error());
+                return (Err(io::Error::last_os_error()), read);
             }
             let size = size as usize;
+            read = read.saturating_add(size as u64);
             if size < target.len() {
                 target.truncate(size);
-                return Ok(target);
+                return (Ok(target), read);
+            }
+            // The retried attempt fails after the first attempt returned
+            // bytes; the caller still charges them.
+            #[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+            if FAIL_READLINK_RETRY.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                return (
+                    Err(io::Error::other("injected readlink retry failure")),
+                    read,
+                );
             }
             let next = target.len().saturating_mul(2);
             if next <= target.len() || next > 16 * 1024 * 1024 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "beneath symlink target is too large",
-                ));
+                return (
+                    Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "beneath symlink target is too large",
+                    )),
+                    read,
+                );
             }
             target.resize(next, 0);
         }
@@ -536,19 +619,38 @@ fn read_symlink_in_dir(
 
         use windows_sys::Win32::Foundation::HANDLE;
 
-        let root_path = final_path_name(root.as_raw_handle() as HANDLE)?;
-        let directory_path = final_path_name(directory.as_raw_handle() as HANDLE)?;
-        let file = open_windows_nofollow(&directory_path.join(name), true, false, false)?;
-        assert_handle_beneath(&file, &root_path)?;
-        read_windows_symlink_target(&file)
+        let root_path = match final_path_name(root.as_raw_handle() as HANDLE) {
+            Ok(path) => path,
+            Err(error) => return (Err(error), 0),
+        };
+        let directory_path = match final_path_name(directory.as_raw_handle() as HANDLE) {
+            Ok(path) => path,
+            Err(error) => return (Err(error), 0),
+        };
+        let file = match open_windows_nofollow(&directory_path.join(name), true, false, false) {
+            Ok(file) => file,
+            Err(error) => return (Err(error), 0),
+        };
+        if let Err(error) = assert_handle_beneath(&file, &root_path) {
+            return (Err(error), 0);
+        }
+        let target = read_windows_symlink_target(&file);
+        let read = target
+            .as_ref()
+            .map(|target| target.len() as u64)
+            .unwrap_or(0);
+        (target, read)
     }
     #[cfg(not(any(unix, windows)))]
     {
         let _ = (directory, name, root);
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "beneath symlink read unsupported on this platform",
-        ))
+        (
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "beneath symlink read unsupported on this platform",
+            )),
+            0,
+        )
     }
 }
 
@@ -800,7 +902,7 @@ pub fn read_dir_fd(dir: fs::File) -> io::Result<FdReadDir> {
 }
 
 /// Portable lstat snapshot (Metadata cannot be built from `libc::stat`).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawLstat {
     pub is_symlink: bool,
     pub is_dir: bool,

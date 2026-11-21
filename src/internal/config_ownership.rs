@@ -395,6 +395,118 @@ pub const CODE_AGENT_PROCESS_CACHES: &[ProcessCacheSurface] = &[
                      with another bridge write; holds no repository state",
     },
     ProcessCacheSurface {
+        source_path: "src/internal/ai/agent_bridge/vcs_write.rs",
+        static_name: "FENCE_OBSERVATION_REWRITE",
+        discipline: "test-only fault list keyed by the worktree path a status observation \
+                     rewrites; compiled only under the test-bridge-hooks feature and holds \
+                     no repository state",
+    },
+    ProcessCacheSurface {
+        source_path: "src/internal/ai/agent_bridge/vcs_write.rs",
+        static_name: "FENCE_RECHECK_REWRITE",
+        discipline: "test-only fault list keyed by the worktree path a fenced write rewrites \
+                     between its two fence checks; compiled only under the test-bridge-hooks \
+                     feature and holds no repository state",
+    },
+    ProcessCacheSurface {
+        source_path: "src/internal/ai/agent_bridge/vcs_write.rs",
+        static_name: "STAGE_REWRITE",
+        discipline: "test-only fault list keyed by the worktree path a stage preparation \
+                     rewrites; compiled only under the test-bridge-hooks feature and holds no \
+                     repository state",
+    },
+    ProcessCacheSurface {
+        source_path: "src/internal/ai/agent_bridge/vcs_write.rs",
+        static_name: "MODE_CHMOD_BETWEEN_READS",
+        discipline: "test-only fault list keyed by the worktree path whose mode a stage \
+                     preparation changes between two reads; compiled only under the \
+                     test-bridge-hooks feature and holds no repository state",
+    },
+    ProcessCacheSurface {
+        source_path: "src/internal/ai/agent_bridge/vcs_write.rs",
+        static_name: "MODE_STAT_REWRITE",
+        discipline: "test-only fault list keyed by the worktree path whose mode a stage \
+                     preparation changes while it stats the file; compiled only under the \
+                     test-bridge-hooks feature and holds no repository state",
+    },
+    ProcessCacheSurface {
+        source_path: "src/internal/ai/agent_bridge/vcs_write.rs",
+        static_name: "BREAK_SECOND_STAGE",
+        discipline: "test-only fault list keyed by the worktree path whose second staging pass \
+                     is interrupted; compiled only under the test-bridge-hooks feature and \
+                     holds no repository state",
+    },
+    ProcessCacheSurface {
+        source_path: "src/internal/ai/agent_bridge/vcs_write.rs",
+        static_name: "BREAK_AT_PUBLISH",
+        discipline: "test-only fault list keyed by the worktree path whose publication is \
+                     interrupted; compiled only under the test-bridge-hooks feature and holds \
+                     no repository state",
+    },
+    ProcessCacheSurface {
+        source_path: "src/internal/ai/agent_bridge/vcs_write.rs",
+        static_name: "BREAK_ON_FIRST_PUBLISH",
+        discipline: "test-only fault list keyed by the worktree path whose first publication is \
+                     interrupted; compiled only under the test-bridge-hooks feature and holds \
+                     no repository state",
+    },
+    ProcessCacheSurface {
+        source_path: "src/internal/ai/agent_bridge/vcs_write.rs",
+        static_name: "PUBLISH_REWRITE",
+        discipline: "test-only fault list keyed by the worktree path a publication rewrites; \
+                     compiled only under the test-bridge-hooks feature and holds no repository \
+                     state",
+    },
+    ProcessCacheSurface {
+        source_path: "src/internal/ai/agent_bridge/vcs_write.rs",
+        static_name: "PUBLISH_REMOVE",
+        discipline: "test-only fault list keyed by the worktree path a publication removes; \
+                     compiled only under the test-bridge-hooks feature and holds no repository \
+                     state",
+    },
+    ProcessCacheSurface {
+        source_path: "src/internal/ai/agent_bridge/vcs_write.rs",
+        static_name: "PRE_PUBLISH_REWRITE",
+        discipline: "test-only fault list keyed by the worktree path a write rewrites just \
+                     before it publishes the index; compiled only under the test-bridge-hooks \
+                     feature and holds no repository state",
+    },
+    ProcessCacheSurface {
+        source_path: "src/internal/ai/agent_bridge/vcs_write.rs",
+        static_name: "INDEX_OBSERVATION_REWRITE",
+        discipline: "test-only fault list keyed by the prepared index a status observation \
+                     installs; compiled only under the test-bridge-hooks feature and holds \
+                     no repository state",
+    },
+    ProcessCacheSurface {
+        source_path: "src/internal/ai/agent_bridge/vcs_write.rs",
+        static_name: "STAGE_CONFIRMED_REWRITE",
+        discipline: "test-only fault list keyed by the worktree path a stage preparation changes \
+                     after it confirmed the path; compiled only under the test-bridge-hooks \
+                     feature and holds no repository state",
+    },
+    ProcessCacheSurface {
+        source_path: "src/internal/ai/agent_bridge/vcs_write.rs",
+        static_name: "STAGE_CAPTURE_REWRITE",
+        discipline: "test-only fault list keyed by the worktree path a stage preparation rewrites \
+                     before its plan is captured; compiled only under the test-bridge-hooks \
+                     feature and holds no repository state",
+    },
+    ProcessCacheSurface {
+        source_path: "src/internal/ai/agent_bridge/mutations.rs",
+        static_name: "PAUSE_BEFORE_CLAIM",
+        discipline: "test-only pause gate that stops the next VCS write before it claims its \
+                     operation; compiled only under the test-bridge-hooks feature and holds \
+                     no repository state",
+    },
+    ProcessCacheSurface {
+        source_path: "src/internal/ai/agent_bridge/mutations.rs",
+        static_name: "PAUSE_BEFORE_RECONCILIATION",
+        discipline: "test-only pause gate that stops the next replay before it reconciles its \
+                     operation; compiled only under the test-bridge-hooks feature and holds \
+                     no repository state",
+    },
+    ProcessCacheSurface {
         source_path: "src/main.rs",
         static_name: "CONTROLS",
         discipline: "test-only private-helper fault controls; process-local and restored by \

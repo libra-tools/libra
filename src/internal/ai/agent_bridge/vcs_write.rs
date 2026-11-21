@@ -4,21 +4,23 @@
 //! paths, an `operation_id`, and the HEAD/index/worktree fence the caller
 //! observed. A stale fence returns before any index or commit write.
 
-use std::{collections::BTreeSet, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+};
 
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
 use super::{protocol::BridgeError, vcs};
 use crate::{
-    command::{
-        restore::{RestoreArgs, execute_safe as restore_execute},
-        status::{changes_to_be_committed_safe, changes_to_be_staged},
-    },
+    command::status::{changes_to_be_committed_safe, changes_to_be_staged},
     utils::{path, util},
 };
 
 const MAX_FENCE_PATHS: usize = 256;
+/// The aggregate content budget of one fence, in bytes.
+const MAX_FENCE_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_STAGE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_CASE_DIR_ENTRIES: usize = 100_000;
 static WRITE_GATE: Mutex<()> = Mutex::const_new(());
@@ -27,6 +29,9 @@ static FENCE_RECHECK_REWRITE: std::sync::Mutex<Option<std::path::PathBuf>> =
     std::sync::Mutex::new(None);
 #[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
 static STAGE_REWRITE: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+static STAGE_CAPTURE_REWRITE: std::sync::Mutex<Option<std::path::PathBuf>> =
+    std::sync::Mutex::new(None);
 #[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
 static MODE_CHMOD_BETWEEN_READS: std::sync::Mutex<Option<std::path::PathBuf>> =
     std::sync::Mutex::new(None);
@@ -50,6 +55,15 @@ static PUBLISH_REWRITE: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync
 #[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
 static PUBLISH_REMOVE: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
 #[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+static PRE_PUBLISH_REWRITE: std::sync::Mutex<Option<std::path::PathBuf>> =
+    std::sync::Mutex::new(None);
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+static FENCE_OBSERVATION_REWRITE: std::sync::Mutex<Option<std::path::PathBuf>> =
+    std::sync::Mutex::new(None);
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+static INDEX_OBSERVATION_REWRITE: std::sync::Mutex<Option<std::path::PathBuf>> =
+    std::sync::Mutex::new(None);
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
 static MODE_STAT_REWRITE: std::sync::Mutex<Option<std::path::PathBuf>> =
     std::sync::Mutex::new(None);
 
@@ -66,6 +80,14 @@ pub fn set_fence_recheck_rewrite_for_test(path: Option<std::path::PathBuf>) {
 #[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
 pub fn set_stage_rewrite_for_test(path: Option<std::path::PathBuf>) {
     *STAGE_REWRITE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = path;
+}
+
+/// Test seam: change the file before its plan is captured.
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+pub fn set_stage_capture_rewrite_for_test(path: Option<std::path::PathBuf>) {
+    *STAGE_CAPTURE_REWRITE
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = path;
 }
@@ -119,6 +141,14 @@ pub fn set_publish_rewrite_for_test(path: Option<std::path::PathBuf>) {
 #[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
 pub fn set_publish_remove_for_test(path: Option<std::path::PathBuf>) {
     *PUBLISH_REMOVE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = path;
+}
+
+/// Test seam: rewrite a file after preparing the scratch index and before rechecking the fence.
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+pub fn set_pre_publish_rewrite_for_test(path: Option<std::path::PathBuf>) {
+    *PRE_PUBLISH_REWRITE
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = path;
 }
@@ -234,6 +264,18 @@ fn chmod_between_reads() {
 }
 
 #[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+fn rewrite_before_stage_plan_capture() {
+    let Some(path) = STAGE_CAPTURE_REWRITE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
+    else {
+        return;
+    };
+    let _ = std::fs::write(path, b"prepared snapshot differs from admission\n");
+}
+
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
 fn rewrite_staged_path() {
     let Some(path) = STAGE_REWRITE
         .lock()
@@ -255,6 +297,18 @@ fn rewrite_for_fence_recheck() {
         return;
     };
     let _ = std::fs::write(path, b"changed after the first fence check\n");
+}
+
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+pub(super) fn rewrite_before_index_publication() {
+    let Some(path) = PRE_PUBLISH_REWRITE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
+    else {
+        return;
+    };
+    let _ = std::fs::write(path, b"changed after index preparation\n");
 }
 
 #[cfg(not(all(feature = "test-bridge-hooks", debug_assertions)))]
@@ -282,7 +336,177 @@ fn chmod_between_reads() {}
 fn rewrite_staged_path() {}
 
 #[cfg(not(all(feature = "test-bridge-hooks", debug_assertions)))]
+fn rewrite_before_stage_plan_capture() {}
+
+#[cfg(not(all(feature = "test-bridge-hooks", debug_assertions)))]
 fn rewrite_for_fence_recheck() {}
+
+#[cfg(not(all(feature = "test-bridge-hooks", debug_assertions)))]
+pub(super) fn rewrite_before_index_publication() {}
+
+/// Test seam: change the staged path after the preparation confirmed it.
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+static STAGE_CONFIRMED_REWRITE: std::sync::Mutex<Option<std::path::PathBuf>> =
+    std::sync::Mutex::new(None);
+
+/// Test seam: change the staged path after the preparation confirmed it.
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+pub fn set_stage_confirmed_rewrite_for_test(path: Option<std::path::PathBuf>) {
+    *STAGE_CONFIRMED_REWRITE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = path;
+}
+
+/// Change the staged path after the preparation confirmed it.
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+pub(super) fn rewrite_after_stage_confirmation() {
+    let Some(path) = STAGE_CONFIRMED_REWRITE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
+    else {
+        return;
+    };
+    let _ = std::fs::write(path, b"changed after the preparation confirmed it\n");
+}
+
+#[cfg(not(all(feature = "test-bridge-hooks", debug_assertions)))]
+pub(super) fn rewrite_after_stage_confirmation() {}
+
+/// Test seam: replace a path with a directory between the status scan's
+/// classification read and the verification of its observation.
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+pub fn set_classification_window_directory_for_test(path: Option<std::path::PathBuf>) {
+    crate::command::status::set_classification_window_directory_for_test(path);
+}
+
+/// Test seam: recreate a staged deletion before the status walk sees it.
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+pub fn set_staged_absence_recreate_for_test(path: Option<std::path::PathBuf>) {
+    crate::command::status::set_staged_absence_recreate_for_test(path);
+}
+
+/// Test seam: change a file between the two fence observations of one read.
+///
+/// The seam exists so a test can prove that a fence is published only when it
+/// describes one stable observation. It is not used by the protocol.
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+pub fn set_fence_observation_rewrite_for_test(path: Option<std::path::PathBuf>) {
+    *FENCE_OBSERVATION_REWRITE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = path;
+}
+
+/// Test seam: rewrite a path between the status scan's classification read and
+/// the verification of its observation.
+///
+/// The seam exists so a test can prove that a path which changed while the
+/// scan classified it cannot enter the write fence. It is not used by the
+/// protocol.
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+pub fn set_classification_window_rewrite_for_test(path: Option<std::path::PathBuf>) {
+    crate::command::status::set_classification_window_rewrite_for_test(path);
+}
+
+/// Test seam: rewrite a path after its second classification hash.
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+pub fn set_classification_digest_window_rewrite_for_test(path: Option<std::path::PathBuf>) {
+    crate::command::status::set_classification_digest_window_rewrite_for_test(path);
+}
+
+/// Test seam: make the content capture of a path fail.
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+pub fn set_forced_capture_failure_for_test(path: Option<std::path::PathBuf>) {
+    crate::command::status::set_forced_capture_failure_for_test(path);
+}
+
+/// Test seam: make the capture of an already observed path fail.
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+pub fn set_forced_recapture_failure_for_test(path: Option<std::path::PathBuf>) {
+    crate::command::status::set_forced_recapture_failure_for_test(path);
+}
+
+/// Test seam: make a path vanish while its identity is captured.
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+pub fn set_forced_vanishing_path_for_test(path: Option<std::path::PathBuf>) {
+    crate::command::status::set_forced_vanishing_path_for_test(path);
+}
+
+/// Test seam: make the status observation root unpinnable.
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+pub fn set_force_observation_root_failure_for_test(enabled: bool) {
+    crate::command::status::set_force_observation_root_failure_for_test(enabled);
+}
+
+/// Test seam: make the worktree metadata read of a path fail.
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+pub fn set_forced_worktree_metadata_failure_for_test(path: Option<std::path::PathBuf>) {
+    crate::command::status::set_forced_worktree_metadata_failure_for_test(path);
+}
+
+/// Test seam: make the metadata capture of a path fail.
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+pub fn set_forced_entry_failure_for_test(path: Option<std::path::PathBuf>) {
+    crate::command::status::set_forced_entry_failure_for_test(path);
+}
+
+/// Test seam: remove a path after the staged capture.
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+pub fn set_remove_after_staged_capture_for_test(path: Option<std::path::PathBuf>) {
+    crate::command::status::set_remove_after_staged_capture_for_test(path);
+}
+
+/// Add a worktree path after the final status scan but before fence hashing.
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+pub(super) fn rewrite_after_final_status_scan() {
+    let Some(path) = FENCE_OBSERVATION_REWRITE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
+    else {
+        return;
+    };
+    let _ = std::fs::write(path, b"appeared after the final status scan\n");
+}
+
+#[cfg(not(all(feature = "test-bridge-hooks", debug_assertions)))]
+pub(super) fn rewrite_after_final_status_scan() {}
+
+/// Reconcile a changed index after the status observation test seam.
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+pub(super) fn rewrite_after_status_observation() {
+    replace_index_after_observation();
+}
+
+#[cfg(not(all(feature = "test-bridge-hooks", debug_assertions)))]
+pub(super) fn rewrite_after_status_observation() {}
+
+/// Test seam: replace the index after the observation read it.
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+pub fn set_index_observation_rewrite_for_test(path: Option<std::path::PathBuf>) {
+    *INDEX_OBSERVATION_REWRITE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = path;
+}
+
+/// Replace the index after the observation read it.
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+pub(super) fn replace_index_after_observation() {
+    let Some(prepared) = INDEX_OBSERVATION_REWRITE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
+    else {
+        return;
+    };
+    let Ok(live) = path::try_index() else {
+        return;
+    };
+    let Ok(bytes) = std::fs::read(&prepared) else {
+        return;
+    };
+    let _ = std::fs::write(&live, bytes);
+}
 
 /// Serialize in-process bridge publications. `MaintenanceLock::shared` joins an
 /// exclusive hold already owned by this process, so it cannot keep another
@@ -322,6 +546,160 @@ pub async fn current_write_fence() -> Result<WriteFence, BridgeError> {
         index_generation,
         worktree_generation: worktree_generation(&workdir).await?,
     })
+}
+
+/// The write fence for an observation the caller already made.
+///
+/// The change lists, the HEAD and the index generation are the ones the
+/// caller read, so the fence describes the same state as the page the caller
+/// saw. Reading the repository again here would let the fence describe a
+/// different state than the one the caller approved.
+pub fn fence_for_observation(
+    head: Option<git_internal::hash::ObjectHash>,
+    index_generation: String,
+    worktree_generation: String,
+) -> WriteFence {
+    WriteFence {
+        head: head.map(|oid| oid.to_string()).unwrap_or_default(),
+        index_generation,
+        worktree_generation,
+    }
+}
+
+/// The write fence generation of an observation the caller already made.
+///
+/// The rows come from the content digests the status scan captured while it
+/// classified the paths, so the generation describes exactly the content the
+/// scan observed. A later change to that content produces a different
+/// generation, and the write refuses the stale fence.
+pub(crate) async fn worktree_generation_for_observation(
+    workdir: &Path,
+    staged: &crate::command::status::Changes,
+    unstaged: &crate::command::status::Changes,
+    stamps: &crate::command::status::WorktreeStamps,
+) -> Result<String, BridgeError> {
+    let root = crate::utils::beneath::open_root(workdir)
+        .map_err(|error| vcs::internal_hiding_host_paths("vcs fence: cannot pin root", error))?;
+    verify_all_observed_stamps(&root, stamps)?;
+    let total = change_count(staged).saturating_add(change_count(unstaged));
+    if total > MAX_FENCE_PATHS {
+        return Err(BridgeError::invalid_params(format!(
+            "vcs fence refuses more than {MAX_FENCE_PATHS} changed paths"
+        )));
+    }
+    let mut rows = BTreeSet::new();
+    let mut remaining = MAX_FENCE_BYTES;
+    let mut charged = BTreeSet::new();
+    collect_rows_from_stamps(
+        staged,
+        "staged",
+        &mut rows,
+        stamps,
+        &mut remaining,
+        &mut charged,
+    )?;
+    collect_rows_from_stamps(
+        unstaged,
+        "unstaged",
+        &mut rows,
+        stamps,
+        &mut remaining,
+        &mut charged,
+    )?;
+    Ok(sha256_hex(
+        rows.into_iter().collect::<Vec<_>>().join("\n").as_bytes(),
+    ))
+}
+
+/// The fence rows of one change list, taken from the digests the scan
+/// captured.
+///
+/// The path count and the byte budget are the same ones the write-side
+/// recheck applies, so a published fence is always one a write can consume.
+fn collect_rows_from_stamps(
+    changes: &crate::command::status::Changes,
+    state: &str,
+    rows: &mut BTreeSet<String>,
+    stamps: &crate::command::status::WorktreeStamps,
+    remaining: &mut u64,
+    charged: &mut BTreeSet<std::path::PathBuf>,
+) -> Result<(), BridgeError> {
+    // A path that is both staged and unstaged is charged once: the fence
+    // covers its content once, and the repeated row reuses that digest.
+    if change_count(changes) > MAX_FENCE_PATHS {
+        return Err(BridgeError::invalid_params(format!(
+            "vcs fence refuses more than {MAX_FENCE_PATHS} changed paths"
+        )));
+    }
+    for path in changes
+        .new
+        .iter()
+        .chain(changes.modified.iter())
+        .chain(changes.deleted.iter())
+    {
+        // The repository-relative path is used verbatim: rewriting it would
+        // hash another file than the one that changed.
+        let rel = path.display().to_string();
+        let (digest, bytes) = observed_digest(stamps, path)?;
+        // A path that is both staged and unstaged is charged once: the fence
+        // covers its content once.
+        if charged.insert(path.to_path_buf()) {
+            *remaining = remaining.checked_sub(bytes).ok_or_else(|| {
+                BridgeError::invalid_params("vcs fence aggregate byte budget exceeded")
+            })?;
+        }
+        rows.insert(format!("{state}\t{rel}\t{digest}"));
+    }
+    for (old, new) in &changes.renamed {
+        let rel = new.display().to_string();
+        let from = old.display().to_string();
+        let (digest, bytes) = observed_digest(stamps, new)?;
+        if charged.insert(new.to_path_buf()) {
+            *remaining = remaining.checked_sub(bytes).ok_or_else(|| {
+                BridgeError::invalid_params("vcs fence aggregate byte budget exceeded")
+            })?;
+        }
+        rows.insert(format!("rename\t{from}\t{rel}\t{digest}"));
+    }
+    Ok(())
+}
+
+/// The content digest the status scan captured for one path, with the bytes
+/// it covers.
+fn observed_digest(
+    stamps: &crate::command::status::WorktreeStamps,
+    path: &Path,
+) -> Result<(String, u64), BridgeError> {
+    let Some(observed) = stamps.get(path) else {
+        return Err(BridgeError::stale_fence(format!(
+            "vcs fence: {} was not captured by the status scan",
+            path.display()
+        )));
+    };
+    match observed {
+        crate::command::status::ObservedPath::Absent => Ok(("missing".to_string(), 0)),
+        crate::command::status::ObservedPath::Observed(stamp) => match &stamp.digest {
+            Some(digest) => Ok((digest.clone(), stamp.bytes)),
+            None => Err(BridgeError::stale_fence(format!(
+                "vcs fence: {} carries no captured content",
+                path.display()
+            ))),
+        },
+        crate::command::status::ObservedPath::Unstable => Err(BridgeError::stale_fence(format!(
+            "vcs fence: {} changed while the status scan read it",
+            path.display()
+        ))),
+    }
+}
+
+/// The index bytes of one snapshot, read with the fence's own bounds.
+pub(crate) fn read_index_snapshot_bytes(index: &Path) -> Result<Vec<u8>, BridgeError> {
+    read_index_bounded(index)
+}
+
+/// The generation of an index snapshot.
+pub(crate) fn index_generation_of(bytes: &[u8]) -> String {
+    sha256_hex(bytes)
 }
 
 fn read_index_bounded(index: &Path) -> Result<Vec<u8>, BridgeError> {
@@ -593,6 +971,9 @@ pub struct PreparedIndexWrite {
     applied: Vec<String>,
     index_path: std::path::PathBuf,
     expected_snapshot: Vec<u8>,
+    /// The source snapshots whose bytes produced the prepared index.
+    /// These are rechecked at the final publication boundary.
+    stage_plans: Vec<StagePlan>,
 }
 
 impl PreparedIndexWrite {
@@ -606,6 +987,20 @@ impl PreparedIndexWrite {
         &self.applied
     }
 
+    /// Check that the source snapshots whose bytes produced this index are
+    /// still current.
+    ///
+    /// This runs at the publication boundary, immediately before the index is
+    /// replaced. A refusal here is definite: the index was not replaced, so
+    /// the caller records a terminal refusal instead of an uncertain
+    /// publication.
+    pub fn verify_prepared_sources(&self) -> Result<(), BridgeError> {
+        for plan in &self.stage_plans {
+            confirm_prepared_stage_plan(plan)?;
+        }
+        Ok(())
+    }
+
     /// Install the prepared index.
     ///
     /// The exclusive repository lock is the publication protocol shared with
@@ -617,6 +1012,10 @@ impl PreparedIndexWrite {
     /// lose its update in the window between the comparison and the rename.
     /// The published bytes are verified afterwards, which reports a writer
     /// that replaced the index after this publication.
+    ///
+    /// An error here leaves the publication uncertain: the replacement may
+    /// have happened. Only a refusal raised before the replacement starts is
+    /// definite, and it is raised by `verify_prepared_sources` instead.
     pub fn publish(&self) -> Result<(), BridgeError> {
         let live = read_index_bounded(&self.index_path)?;
         if live != self.expected_snapshot {
@@ -636,47 +1035,110 @@ impl PreparedIndexWrite {
     }
 }
 
-fn collapse_equivalent_spellings(paths: &mut std::collections::BTreeSet<String>) {
-    let names: Vec<String> = paths.iter().cloned().collect();
-    let mut groups: std::collections::BTreeMap<String, Vec<String>> =
-        std::collections::BTreeMap::new();
-    for name in names {
-        let Ok(on_disk) = on_disk_spelling(&name) else {
+fn staged_path_names(staged: &crate::command::status::Changes) -> BTreeSet<String> {
+    let mut paths = BTreeSet::new();
+    for path in staged
+        .new
+        .iter()
+        .chain(staged.modified.iter())
+        .chain(staged.deleted.iter())
+    {
+        // Each index change remains a separate authorization entry, even when
+        // the worktree filesystem resolves two spellings to the same file.
+        paths.insert(path.display().to_string());
+    }
+    for (_old, new) in &staged.renamed {
+        paths.insert(new.display().to_string());
+    }
+    paths
+}
+
+/// The sole case-folding exception is a content-proven 1:1 rename whose
+/// source no longer exists in the index and whose two path spellings resolve
+/// to the same worktree entry. All other staged paths stay exact.
+async fn case_only_rename_sources_to_omit(
+    staged_paths: &BTreeSet<String>,
+) -> Result<BTreeSet<String>, BridgeError> {
+    let paths: Vec<&str> = staged_paths.iter().map(String::as_str).collect();
+    let has_case_only_pair = paths.iter().enumerate().any(|(index, left)| {
+        paths
+            .iter()
+            .skip(index + 1)
+            .any(|right| left != right && left.eq_ignore_ascii_case(right))
+    });
+    if !has_case_only_pair {
+        return Ok(BTreeSet::new());
+    }
+
+    let workdir = util::try_working_dir()
+        .map_err(|error| vcs::internal_hiding_host_paths("vcs.commit: locate worktree", error))?;
+    if !crate::utils::path_case::probe_dir_ignore_case(&workdir) {
+        return Ok(BTreeSet::new());
+    }
+    let root = crate::utils::beneath::open_root(&workdir)
+        .map_err(|error| vcs::internal_hiding_host_paths("vcs.commit: pin worktree", error))?;
+    let index_path = path::try_index()
+        .map_err(|error| vcs::internal_hiding_host_paths("vcs.commit: locate index", error))?;
+    let index = git_internal::internal::index::Index::load(&index_path)
+        .map_err(|error| vcs::internal_hiding_host_paths("vcs.commit: load index", error))?;
+    let head_entries = head_tree_entries().await?;
+    let renames = proven_staged_renames(&head_entries, &index).await?;
+    let mut sources_to_omit = BTreeSet::new();
+
+    for rename in renames {
+        let [source] = rename.sources.as_slice() else {
             continue;
         };
-        groups.entry(on_disk).or_default().push(name);
-    }
-    let Ok(workdir) = util::try_working_dir() else {
-        return;
-    };
-    if !crate::utils::path_case::probe_dir_ignore_case(&workdir) {
-        return;
-    }
-    let Ok(root) = crate::utils::beneath::open_root(&workdir) else {
-        return;
-    };
-    for (on_disk, members) in groups {
-        if members.len() < 2 {
+        let [destination] = rename.destinations.as_slice() else {
+            continue;
+        };
+        if source == destination
+            || !source.eq_ignore_ascii_case(destination)
+            || !staged_paths.contains(source)
+            || !staged_paths.contains(destination)
+        {
             continue;
         }
-        let same_entry = members.iter().all(|member| {
-            member == &on_disk
-                || crate::utils::beneath::same_nofollow_entry(
-                    &root,
-                    Path::new(&on_disk),
-                    Path::new(member),
-                )
-                .ok()
-                    == Some(true)
-        });
-        if !same_entry {
+
+        // A differently-cased index entry is separate authorization scope,
+        // even when the worktree resolves it to the same directory entry.
+        let aliases: Vec<(u8, String)> = (0..4)
+            .flat_map(|stage| {
+                index
+                    .tracked_entries(stage)
+                    .into_iter()
+                    .map(move |entry| (stage, entry.name.clone()))
+            })
+            .filter(|(_, name)| name.eq_ignore_ascii_case(destination))
+            .collect();
+        if aliases.len() != 1 || aliases[0].0 != 0 || aliases[0].1 != *destination {
             continue;
         }
-        for member in members {
-            paths.remove(&member);
+        if crate::utils::beneath::same_nofollow_entry(
+            &root,
+            Path::new(source),
+            Path::new(destination),
+        )
+        .ok()
+            != Some(true)
+        {
+            continue;
         }
-        paths.insert(on_disk);
+        sources_to_omit.insert(source.clone());
     }
+    Ok(sources_to_omit)
+}
+
+fn require_exact_commit_scope(
+    staged_paths: &BTreeSet<String>,
+    requested_paths: &BTreeSet<String>,
+) -> Result<(), BridgeError> {
+    if staged_paths != requested_paths {
+        return Err(BridgeError::invalid_params(format!(
+            "vcs.commit paths {requested_paths:?} do not match the staged set {staged_paths:?}; refusing before creating a commit"
+        )));
+    }
+    Ok(())
 }
 
 pub async fn commit_index(
@@ -686,29 +1148,16 @@ pub async fn commit_index(
     let staged = crate::command::status::changes_to_be_committed_safe()
         .await
         .map_err(|error| vcs::internal_hiding_host_paths("vcs.commit: read index", error))?;
-    let relative = staged.to_relative();
-    let mut staged_paths = std::collections::BTreeSet::new();
-    for path in relative
-        .new
-        .iter()
-        .chain(relative.modified.iter())
-        .chain(relative.deleted.iter())
-    {
-        staged_paths.insert(path.display().to_string().replace('\\', "/"));
+    // The staged paths are repository-relative already. They are NOT converted
+    // to the process directory: the request names repository-relative paths, so
+    // converting one side and not the other would compare two different path
+    // bases and reject an authorized commit.
+    let mut staged_paths = staged_path_names(&staged);
+    for source in case_only_rename_sources_to_omit(&staged_paths).await? {
+        staged_paths.remove(&source);
     }
-    collapse_equivalent_spellings(&mut staged_paths);
-    for (_old, new) in &relative.renamed {
-        staged_paths.insert(new.display().to_string().replace('\\', "/"));
-    }
-    let requested_paths = requested
-        .iter()
-        .map(|path| on_disk_spelling(&path.replace('\\', "/")))
-        .collect::<Result<std::collections::BTreeSet<_>, _>>()?;
-    if staged_paths != requested_paths {
-        return Err(BridgeError::invalid_params(format!(
-            "vcs.commit paths {requested_paths:?} do not match the staged set {staged_paths:?}; refusing before creating a commit"
-        )));
-    }
+    let requested_paths: BTreeSet<String> = requested.iter().cloned().collect();
+    require_exact_commit_scope(&staged_paths, &requested_paths)?;
     let created = vcs::commit_create_unguarded(message, false, false).await?;
     Ok(serde_json::json!({
         "commitOid": created["commit"],
@@ -716,39 +1165,38 @@ pub async fn commit_index(
     }))
 }
 
-async fn apply_each(paths: &[String], stage: bool) -> Result<PreparedIndexWrite, BridgeError> {
-    let spelled = paths
+/// One refusal that names every path that failed.
+///
+/// The operation stays all-or-nothing: nothing is published when any path
+/// fails. The refusal identifies each failing path with its own reason, so a
+/// caller learns every problem from one request instead of one request per
+/// path.
+fn per_path_refusal(context: &str, failures: &[(String, BridgeError)]) -> BridgeError {
+    let Some((_, first)) = failures.first() else {
+        return BridgeError::internal(format!("{context}: no failure was recorded"));
+    };
+    let details = failures
         .iter()
-        .map(|path| on_disk_spelling(path))
-        .collect::<Result<Vec<_>, _>>()?;
-    let paths = spelled.as_slice();
+        .map(|(path, error)| format!("{path} ({})", error.message))
+        .collect::<Vec<_>>()
+        .join("; ");
+    BridgeError {
+        message: format!(
+            "{context}: {} of the selected paths failed: {details}",
+            failures.len()
+        ),
+        ..first.clone()
+    }
+}
+
+async fn apply_each(paths: &[String], stage: bool) -> Result<PreparedIndexWrite, BridgeError> {
     let mut applied = Vec::new();
-    let mut failed = Vec::new();
-    let mut first_error = None;
+    let mut failed: Vec<(String, BridgeError)> = Vec::new();
     let index_path = path::try_index().map_err(|error| {
         vcs::internal_hiding_host_paths("vcs write: cannot locate index snapshot", error)
     })?;
     let index_snapshot = read_index_bounded(&index_path)?;
     if stage {
-        for path in paths {
-            note_stage_attempt();
-            preflight_stage_path(path)?;
-        }
-        break_at_publish();
-        for path in paths {
-            preflight_stage_path(path)?;
-        }
-        let mut plans = Vec::with_capacity(paths.len());
-        for path in paths {
-            plans.push(capture_stage_plan(path)?);
-        }
-        break_on_first_publish();
-        for plan in &plans {
-            confirm_stage_plan(plan)?;
-        }
-        rewrite_before_mode_stat();
-        rewrite_during_publish();
-        remove_during_publish();
         let mut index = git_internal::internal::index::Index::load(&index_path)
             .map_err(|error| vcs::internal_hiding_host_paths("vcs.stage: load index", error))?;
         if read_index_bounded(&index_path)? != index_snapshot {
@@ -756,26 +1204,128 @@ async fn apply_each(paths: &[String], stage: bool) -> Result<PreparedIndexWrite,
                 "stale_state: index changed while preparing stage",
             ));
         }
+        let mut refusals: Vec<(String, BridgeError)> = Vec::new();
+        let mut failed_paths: BTreeSet<String> = BTreeSet::new();
+        let targets = resolve_stage_targets(&index, paths, &mut refusals, &mut failed_paths);
+        // Every selected path is checked before anything is stored, and every
+        // refusal is reported: one request names each failing path. A path that
+        // already failed is not checked again, so it is reported once.
+        for path in &targets {
+            if failed_paths.contains(path) {
+                continue;
+            }
+            note_stage_attempt();
+            if let Err(error) = preflight_stage_path(path) {
+                refusals.push((path.clone(), error));
+                failed_paths.insert(path.clone());
+            }
+        }
+        break_at_publish();
+        for path in &targets {
+            if failed_paths.contains(path) {
+                continue;
+            }
+            if let Err(error) = preflight_stage_path(path) {
+                refusals.push((path.clone(), error));
+                failed_paths.insert(path.clone());
+            }
+        }
+        let mut plans = Vec::with_capacity(targets.len());
+        rewrite_before_stage_plan_capture();
+        for path in &targets {
+            if failed_paths.contains(path) {
+                continue;
+            }
+            match capture_stage_plan(path) {
+                Ok(plan) => plans.push(plan),
+                Err(error) => {
+                    refusals.push((path.clone(), error));
+                    failed_paths.insert(path.clone());
+                }
+            }
+        }
+        break_on_first_publish();
+        for plan in &plans {
+            if let Err(error) = confirm_stage_plan(plan) {
+                refusals.push((plan.path().to_string(), error));
+                failed_paths.insert(plan.path().to_string());
+            }
+        }
+        rewrite_after_stage_confirmation();
+        rewrite_before_mode_stat();
+        rewrite_during_publish();
+        remove_during_publish();
+        if read_index_bounded(&index_path)? != index_snapshot {
+            return Err(BridgeError::stale_fence(
+                "stale_state: index changed while preparing stage",
+            ));
+        }
         // Every selected path is resolved before anything is stored, so one
         // refused path cannot leave another path's blob in the object store.
-        resolve_stage_conversions(&mut plans, &index)?;
+        // Every refusal is collected, so one request names each failing path.
+        resolve_stage_conversions(&mut plans, &index, &mut refusals, &mut failed_paths);
         for plan in &plans {
+            if failed_paths.contains(plan.path()) {
+                continue;
+            }
             if crate::utils::ignore::should_ignore(
                 Path::new(plan.path()),
                 crate::utils::ignore::IgnorePolicy::Respect,
                 &index,
             ) {
-                return Err(BridgeError::invalid_params(format!(
-                    "vcs.stage: {} is ignored; refusing to stage it without force",
-                    plan.path()
+                refusals.push((
+                    plan.path().to_string(),
+                    BridgeError::invalid_params(format!(
+                        "vcs.stage: {} is ignored; refusing to stage it without force",
+                        plan.path()
+                    )),
+                ));
+                failed_paths.insert(plan.path().to_string());
+            }
+        }
+        // The case-alias check can refuse a path, so it runs here as well: a
+        // batch must learn every refusal before it publishes anything.
+        for plan in &plans {
+            if failed_paths.contains(plan.path()) {
+                continue;
+            }
+            if let Err(error) = case_alias_to_remove(&index, plan.path()).await {
+                refusals.push((plan.path().to_string(), error));
+                failed_paths.insert(plan.path().to_string());
+            }
+        }
+        if !refusals.is_empty() {
+            return Err(per_path_refusal("vcs.stage", &refusals));
+        }
+        // The prepared content must still be the content the repository holds:
+        // a path that changed while the batch was prepared would otherwise be
+        // published with the prepared bytes instead of the authorized ones.
+        for plan in &plans {
+            if let Err(error) = confirm_stage_plan(plan) {
+                return Err(BridgeError::stale_fence(format!(
+                    "stale_state: {} changed while the batch was prepared; no index write was \
+                     performed ({})",
+                    plan.path(),
+                    error.message
                 )));
             }
         }
-        for plan in plans {
+        for plan in &plans {
             reject_second_publish()?;
             let path = plan.path().to_string();
-            publish_stage_plan(plan, &mut index).await?;
-            applied.push(path);
+            // A per-path refusal here is collected like the earlier ones: the
+            // live index is replaced only after every path succeeded, so the
+            // batch stays all-or-nothing.
+            match publish_stage_plan(plan, &mut index).await {
+                Ok(()) => applied.push(path),
+                Err(error) => {
+                    refusals.push((path.clone(), error));
+                    failed_paths.insert(path);
+                }
+            }
+        }
+        if !refusals.is_empty() {
+            return Err(per_path_refusal("vcs.stage", &refusals));
         }
         if read_index_bounded(&index_path)? != index_snapshot {
             return Err(BridgeError::stale_fence(
@@ -789,6 +1339,7 @@ async fn apply_each(paths: &[String], stage: bool) -> Result<PreparedIndexWrite,
             applied,
             index_path: index_path.clone(),
             expected_snapshot: index_snapshot,
+            stage_plans: plans,
         });
     }
     let parent = index_path
@@ -800,45 +1351,56 @@ async fn apply_each(paths: &[String], stage: bool) -> Result<PreparedIndexWrite,
     std::fs::write(scratch.path(), &index_snapshot).map_err(|error| {
         vcs::internal_hiding_host_paths("vcs.unstage: initialize temporary index", error)
     })?;
-    for selected in paths {
-        let output = quiet_output();
-        let result = path::with_index_override(
-            scratch.path().to_path_buf(),
-            restore_execute(
-                RestoreArgs {
-                    pathspec: vec![selected.clone()],
-                    staged: true,
-                    source: Some("HEAD".to_string()),
-                    ..RestoreArgs::default()
-                },
-                &output,
+    // The scratch index is updated by EXACT entry name. A pathspec would
+    // match every tracked path under a requested directory and would resolve
+    // the request against the process directory; neither is the authorized
+    // literal-path scope, so neither is used here.
+    let mut scratch_index = git_internal::internal::index::Index::load(scratch.path())
+        .map_err(|error| vcs::internal_hiding_host_paths("vcs.unstage: load index", error))?;
+    let mut head_entries: Option<
+        std::collections::HashMap<
+            String,
+            (
+                git_internal::internal::object::tree::TreeItemMode,
+                git_internal::hash::ObjectHash,
             ),
+        >,
+    > = None;
+    let mut renames: Option<Vec<RenameGroup>> = None;
+    // Two spellings that differ only in case name the same file only on a
+    // case-insensitive filesystem; there the repository's own spelling is
+    // restored, and never another entry's.
+    let case_insensitive = util::try_working_dir()
+        .ok()
+        .is_some_and(|workdir| crate::utils::path_case::probe_dir_ignore_case(&workdir));
+    for selected in paths {
+        match unstage_exact_entry(
+            &mut scratch_index,
+            selected,
+            &mut head_entries,
+            &mut renames,
+            paths,
+            case_insensitive,
         )
         .await
-        .map_err(|error| {
-            let message = error.to_string();
-            if message.contains("did not match any files") {
-                BridgeError::invalid_params("vcs.unstage: path did not match any files")
-            } else {
-                vcs::internal_hiding_host_paths("vcs.unstage: restore index", error)
-            }
-        });
-        match result {
+        {
             Ok(()) => applied.push(selected.clone()),
             Err(error) => {
-                failed.push(serde_json::json!({"path": selected, "message": error.message}));
-                if first_error.is_none() {
-                    first_error = Some(error);
-                }
+                failed.push((selected.clone(), error));
             }
         }
     }
-    if let Some(error) = first_error {
-        return Err(error);
+    if !failed.is_empty() {
+        // Nothing is published: the operation stays all-or-nothing, and the
+        // refusal names every path that failed.
+        return Err(per_path_refusal("vcs.unstage", &failed));
     }
     if applied.is_empty() {
         return Err(BridgeError::internal("vcs write applied no paths"));
     }
+    scratch_index
+        .save(scratch.path())
+        .map_err(|error| vcs::internal_hiding_host_paths("vcs.unstage: save index", error))?;
     let staged_bytes = read_index_bounded(scratch.path())?;
     if read_index_bounded(&index_path)? != index_snapshot {
         return Err(BridgeError::stale_fence(
@@ -851,7 +1413,432 @@ async fn apply_each(paths: &[String], stage: bool) -> Result<PreparedIndexWrite,
         applied,
         index_path: index_path.clone(),
         expected_snapshot: index_snapshot,
+        stage_plans: Vec::new(),
     })
+}
+
+/// The index entry names that differ from `name` only in case.
+fn case_variant_names(index: &git_internal::internal::index::Index, name: &str) -> Vec<String> {
+    (0..4)
+        .flat_map(|stage| index.tracked_entries(stage))
+        .map(|entry| entry.name.clone())
+        .filter(|entry| entry != name && entry.eq_ignore_ascii_case(name))
+        .collect()
+}
+
+/// Resolve the index entry each staged path names.
+///
+/// A request authorizes a repository-relative path, and the index stores that
+/// path under one exact name. The bridge changes exactly the entry it can
+/// prove belongs to the requested file:
+///
+/// - the index already holds an entry with the requested name: that entry is
+///   the one that changes;
+/// - the request names the file's own spelling and the index holds exactly
+///   one entry that differs only in case: the request is a case-only rename
+///   or a case-only spelling of the same file. The old entry is dropped only
+///   when the index proves it is an unchanged HEAD spelling of that same
+///   file, which `remove_case_aliases` checks;
+/// - the request names a case variant of an entry the index holds under the
+///   file's own spelling: the request is refused, because it does not name
+///   that entry and the caller can retry with the exact name;
+/// - the index holds nothing for the file: it is a new file, and it keeps
+///   the worktree's own spelling.
+fn resolve_stage_targets(
+    index: &git_internal::internal::index::Index,
+    requested: &[String],
+    refusals: &mut Vec<(String, BridgeError)>,
+    failed_paths: &mut BTreeSet<String>,
+) -> Vec<String> {
+    let mut targets = Vec::with_capacity(requested.len());
+    for path in requested {
+        if (0..4).any(|stage| index.tracked(path, stage)) {
+            // A skip-worktree entry names a sparse-checkout path whose
+            // worktree copy may be absent or stale. The status scan does not
+            // report it, so no fence covers it, and staging it would publish
+            // content the peer never saw.
+            if index
+                .get(path, 0)
+                .is_some_and(|entry| entry.flags.skip_worktree)
+            {
+                refusals.push((
+                    path.clone(),
+                    BridgeError::invalid_params(format!(
+                        "vcs.stage: {path} is a skip-worktree entry, so its worktree copy is not \
+                         covered by the write fence; refusing to stage it"
+                    )),
+                ));
+                failed_paths.insert(path.clone());
+                continue;
+            }
+            // A submodule (gitlink) entry names another repository's commit.
+            // The status scan does not report it, so no fence covers it, and
+            // staging its absence would remove a submodule the peer never saw
+            // as changed.
+            if crate::command::status::output::is_gitlink_index_entry(index, path) {
+                refusals.push((
+                    path.clone(),
+                    BridgeError::invalid_params(format!(
+                        "vcs.stage: {path} is a submodule entry, so the status scan does not \
+                         cover it; refusing to stage it"
+                    )),
+                ));
+                failed_paths.insert(path.clone());
+                continue;
+            }
+            targets.push(path.clone());
+            continue;
+        }
+        let on_disk = match on_disk_spelling(path) {
+            Ok(on_disk) => on_disk,
+            Err(error) => {
+                refusals.push((path.clone(), error));
+                failed_paths.insert(path.clone());
+                continue;
+            }
+        };
+        if on_disk == *path {
+            let variants = case_variant_names(index, path);
+            if variants.len() > 1 {
+                refusals.push((
+                    path.clone(),
+                    BridgeError::invalid_params(format!(
+                        "vcs.stage: {path} is ambiguous with {} indexed entries that differ only in \
+                         case; refusing to change another index entry",
+                        variants.len()
+                    )),
+                ));
+                failed_paths.insert(path.clone());
+                continue;
+            }
+            targets.push(path.clone());
+            continue;
+        }
+        if (0..4).any(|stage| index.tracked(&on_disk, stage)) {
+            refusals.push((
+                path.clone(),
+                BridgeError::invalid_params(format!(
+                    "vcs.stage: {path} names a case variant of the indexed entry {on_disk}; \
+                     refusing to change another index entry"
+                )),
+            ));
+            failed_paths.insert(path.clone());
+            continue;
+        }
+        targets.push(on_disk);
+    }
+    targets
+}
+
+/// Unstage exactly one index entry.
+///
+/// The entry is matched by its literal repository-relative name, so a request
+/// can never change an index entry it did not name. The HEAD version of that
+/// entry is restored: the path itself, or — when the staged change renamed
+/// it — the name the path had in HEAD. A staged deletion (the path is in HEAD
+/// but no longer in the index) restores the HEAD entry; a path that is in
+/// neither is not a staged change and is refused.
+async fn unstage_exact_entry(
+    index: &mut git_internal::internal::index::Index,
+    path: &str,
+    head_entries: &mut Option<
+        std::collections::HashMap<
+            String,
+            (
+                git_internal::internal::object::tree::TreeItemMode,
+                git_internal::hash::ObjectHash,
+            ),
+        >,
+    >,
+    renames: &mut Option<Vec<RenameGroup>>,
+    requested: &[String],
+    case_insensitive: bool,
+) -> Result<(), BridgeError> {
+    use git_internal::internal::index::IndexEntry;
+
+    use crate::utils::object_ext::BlobExt;
+
+    let mut tracked = false;
+    for stage in 0..4 {
+        if index.tracked(path, stage) {
+            tracked = true;
+            break;
+        }
+    }
+
+    if head_entries.is_none() {
+        *head_entries = Some(head_tree_entries().await?);
+    }
+    let head_entries = head_entries
+        .as_ref()
+        .ok_or_else(|| BridgeError::internal("vcs.unstage: HEAD entries were not loaded"))?;
+    if renames.is_none() {
+        *renames = Some(proven_staged_renames(head_entries, index).await?);
+    }
+    let renames = renames
+        .as_ref()
+        .ok_or_else(|| BridgeError::internal("vcs.unstage: staged renames were not loaded"))?;
+    // A staged rename has two or more endpoints. Undoing it restores the HEAD
+    // path and drops every new path, so the request must authorize all of
+    // them: naming only some of them would leave the rest of the rename
+    // staged. The group that matters here is the one the CURRENT path belongs
+    // to: a rename never changes another selected path's index entry.
+    let mut rename_source: Option<String> = None;
+    if let Some(group) = renames.iter().find(|group| {
+        group.sources.iter().any(|source| source == path)
+            || group.destinations.iter().any(|entry| entry == path)
+    }) {
+        // The authorization compares the repository entry names exactly: two
+        // entries that differ only in case are two entries, and a request that
+        // names one of them does not name the other.
+        let named = |candidate: &str| requested.iter().any(|name| name == candidate);
+        let paths = group
+            .sources
+            .iter()
+            .chain(group.destinations.iter())
+            .map(|entry| entry.as_str());
+        // Two spellings that differ only in case name the same path only on a
+        // case-folding filesystem; on a case-sensitive filesystem they are two
+        // different paths and each one needs its own authorization.
+        let single_spelling = case_insensitive
+            && group.sources.len() == 1
+            && group.destinations.len() == 1
+            && group.destinations[0].eq_ignore_ascii_case(&group.sources[0]);
+        if !single_spelling && !paths.clone().all(named) {
+            return Err(BridgeError::invalid_params(format!(
+                "vcs.unstage: {} is a staged rename to {}; name every path of the rename to undo it",
+                group.sources.join(", "),
+                group.destinations.join(", ")
+            )));
+        }
+        // A source restores itself. A destination restores the group's single
+        // source; with several sources the destination is ambiguous, so it is
+        // only dropped and each source is restored by its own path.
+        rename_source = if group.sources.iter().any(|source| source == path) {
+            Some(path.to_string())
+        } else if group.sources.len() == 1 {
+            group.sources.first().cloned()
+        } else {
+            None
+        };
+    }
+    // A staged rename is restored under its HEAD name, so the index keeps the
+    // repository's own spelling.
+    let head_name = rename_source.unwrap_or_else(|| path.to_string());
+
+    // The HEAD entry is looked up by the requested name. A case-insensitive
+    // lookup is only correct on a case-insensitive filesystem, where the two
+    // spellings name the same file; on a case-sensitive filesystem they are
+    // different entries and the fallback could change an entry the request did
+    // not name.
+    let mut head_entry = head_entries
+        .get(&head_name)
+        .copied()
+        .map(|entry| (head_name.clone(), entry));
+    if head_entry.is_none() && case_insensitive {
+        let variant = head_entries
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(&head_name))
+            .map(|(name, entry)| (name.clone(), *entry));
+        if let Some((variant_name, entry)) = variant {
+            let case_entries: Vec<(u8, String)> = (0..4)
+                .flat_map(|stage| {
+                    index
+                        .tracked_entries(stage)
+                        .into_iter()
+                        .map(move |entry| (stage, entry.name.clone()))
+                })
+                .filter(|(_, name)| name.eq_ignore_ascii_case(path))
+                .collect();
+            if case_entries.len() != 1 || case_entries[0].0 != 0 || case_entries[0].1 != path {
+                return Err(BridgeError::invalid_params(format!(
+                    "vcs.unstage: {path} is not the exact unambiguous index spelling for HEAD path \
+                     {variant_name}; refusing to change another index entry"
+                )));
+            }
+            head_entry = Some((variant_name, entry));
+        }
+    }
+
+    if !tracked && head_entry.is_none() {
+        return Err(BridgeError::invalid_params(format!(
+            "vcs.unstage: {path} did not match any staged file"
+        )));
+    }
+
+    // The staged entry is dropped first: a case-only rename cannot leave both
+    // spellings in the index.
+    for stage in 0..4 {
+        index.remove(path, stage);
+    }
+    let Some((head_path, (head_mode, oid))) = head_entry else {
+        // The path is not in HEAD: the staged addition is simply dropped.
+        return Ok(());
+    };
+    let mode = index_mode_for_tree_item(head_mode)?;
+    // A gitlink names a commit in another repository, which is normally absent
+    // from this object store; its index entry carries no content, so no blob is
+    // read for it.
+    let size = if matches!(
+        head_mode,
+        git_internal::internal::object::tree::TreeItemMode::Commit
+    ) {
+        0
+    } else {
+        let blob = <git_internal::internal::object::blob::Blob as BlobExt>::load(&oid).map_err(
+            |error| vcs::internal_hiding_host_paths("vcs.unstage: read HEAD blob", error),
+        )?;
+        u32::try_from(blob.data.len()).unwrap_or(u32::MAX)
+    };
+    let mut entry = IndexEntry::new_from_blob(head_path.to_string(), oid, size);
+    entry.mode = mode;
+    crate::utils::index_ext::update_preserving_flags(index, entry);
+    Ok(())
+}
+
+/// The entries of HEAD's tree, keyed by their repository-relative path.
+///
+/// The value keeps the tree mode, so a gitlink (a submodule entry) is
+/// recognized and never read as a blob.
+///
+/// An unborn HEAD has no tree: it is treated as an empty tree, so a staged
+/// addition can be unstaged before the repository's first commit.
+async fn head_tree_entries() -> Result<
+    std::collections::HashMap<
+        String,
+        (
+            git_internal::internal::object::tree::TreeItemMode,
+            git_internal::hash::ObjectHash,
+        ),
+    >,
+    BridgeError,
+> {
+    use crate::utils::object_ext::{CommitExt, TreeExt};
+
+    let Some(head) = crate::internal::head::Head::current_commit_result()
+        .await
+        .map_err(|error| vcs::internal_hiding_host_paths("vcs write: read HEAD", error))?
+    else {
+        return Ok(std::collections::HashMap::new());
+    };
+    let commit = <git_internal::internal::object::commit::Commit as CommitExt>::load(&head)
+        .map_err(|error| vcs::internal_hiding_host_paths("vcs write: load HEAD", error))?;
+    let tree = <git_internal::internal::object::tree::Tree as TreeExt>::load(&commit.tree_id)
+        .map_err(|error| vcs::internal_hiding_host_paths("vcs write: load HEAD tree", error))?;
+    let items = tree
+        .get_plain_items_with_mode()
+        .map_err(|error| vcs::internal_hiding_host_paths("vcs write: read HEAD tree", error))?;
+    Ok(items
+        .into_iter()
+        // The entry name is kept verbatim: a literal backslash is a valid
+        // character in a repository path, and rewriting it would let two
+        // distinct entries share one key.
+        .map(|(path, oid, mode)| (path.display().to_string(), (mode, oid)))
+        .collect())
+}
+
+/// The index mode a HEAD tree entry is stored under.
+fn index_mode_for_tree_item(
+    mode: git_internal::internal::object::tree::TreeItemMode,
+) -> Result<u32, BridgeError> {
+    use git_internal::internal::object::tree::TreeItemMode;
+    match mode {
+        TreeItemMode::Blob => Ok(0o100644),
+        TreeItemMode::BlobExecutable => Ok(0o100755),
+        TreeItemMode::Link => Ok(0o120000),
+        TreeItemMode::Commit => Ok(0o160000),
+        // INVARIANT: a tree entry is expanded into its files before it
+        // reaches the index, so a tree never names an index entry.
+        TreeItemMode::Tree => Err(BridgeError::internal(
+            "vcs.unstage: HEAD holds a tree entry, which is not an index entry",
+        )),
+    }
+}
+
+/// A proven staged rename: the HEAD paths and the index paths that carry the
+/// same content.
+///
+/// The group holds every path that could take part in the change, so an
+/// ambiguous case (several identical sources or several identical
+/// destinations) is authorized as a whole instead of guessed.
+struct RenameGroup {
+    sources: Vec<String>,
+    destinations: Vec<String>,
+}
+
+/// The staged renames the index proves.
+///
+/// A rename is proven when a path that HEAD has and the index no longer tracks
+/// is paired with the paths the index added that carry the same content. A
+/// rename that also changed the content is not proven here: the unstage then
+/// behaves like an ordinary restore, exactly as the repository's own restore
+/// does, and the commit scope check still refuses a commit that names only
+/// one side of the change.
+async fn proven_staged_renames(
+    head_entries: &std::collections::HashMap<
+        String,
+        (
+            git_internal::internal::object::tree::TreeItemMode,
+            git_internal::hash::ObjectHash,
+        ),
+    >,
+    index: &git_internal::internal::index::Index,
+) -> Result<Vec<RenameGroup>, BridgeError> {
+    let mut deleted_by_oid: std::collections::HashMap<git_internal::hash::ObjectHash, Vec<String>> =
+        std::collections::HashMap::new();
+    for (path, (_mode, oid)) in head_entries {
+        let mut tracked = false;
+        for stage in 0..4 {
+            if index.tracked(path, stage) {
+                tracked = true;
+                break;
+            }
+        }
+        if tracked {
+            continue;
+        }
+        deleted_by_oid.entry(*oid).or_default().push(path.clone());
+    }
+    let mut groups: std::collections::HashMap<
+        git_internal::hash::ObjectHash,
+        (Vec<String>, Vec<String>),
+    > = std::collections::HashMap::new();
+    for entry in index.tracked_entries(0) {
+        let path = entry.name.clone();
+        if head_entries.contains_key(&path) {
+            continue;
+        }
+        // The same content under a new name is a rename. Every path that
+        // carries that content joins the same group, so an ambiguous case is
+        // authorized as a whole rather than resolved by a guess.
+        groups.entry(entry.hash).or_default().1.push(path);
+    }
+    let mut renames: Vec<RenameGroup> = groups
+        .into_iter()
+        .filter_map(|(oid, (mut sources, mut destinations))| {
+            let deleted = deleted_by_oid.remove(&oid)?;
+            sources.extend(deleted);
+            if sources.is_empty() || destinations.is_empty() {
+                return None;
+            }
+            // The members are sorted, so the refusal message and the pairing
+            // do not depend on the iteration order.
+            sources.sort();
+            destinations.sort();
+            Some(RenameGroup {
+                sources,
+                destinations,
+            })
+        })
+        .collect();
+    // A stable order keeps the refusal message and the pairing deterministic.
+    renames.sort_by(|left, right| {
+        left.sources
+            .first()
+            .cmp(&right.sources.first())
+            .then_with(|| left.destinations.cmp(&right.destinations))
+    });
+    Ok(renames)
 }
 
 /// Repository metadata is never storable content. Ordinary `libra add`
@@ -989,9 +1976,16 @@ fn capture_stage_plan(path: &str) -> Result<StagePlan, BridgeError> {
 fn resolve_stage_conversions(
     plans: &mut [StagePlan],
     index: &git_internal::internal::index::Index,
-) -> Result<(), BridgeError> {
-    let workdir = util::try_working_dir()
-        .map_err(|_| BridgeError::scope_mismatch("not_a_repository: vcs.stage needs a worktree"))?;
+    refusals: &mut Vec<(String, BridgeError)>,
+    failed_paths: &mut BTreeSet<String>,
+) {
+    let Ok(workdir) = util::try_working_dir() else {
+        refusals.push((
+            String::new(),
+            BridgeError::scope_mismatch("not_a_repository: vcs.stage needs a worktree"),
+        ));
+        return;
+    };
     for plan in plans.iter_mut() {
         let StagePlan::File {
             path, bytes, clean, ..
@@ -999,6 +1993,9 @@ fn resolve_stage_conversions(
         else {
             continue;
         };
+        if failed_paths.contains(path) {
+            continue;
+        }
         let selected = crate::command::status_io_worker::selected_index_oid(index, Path::new(path));
         let converted = crate::utils::worktree_conversion::clean_captured_bytes(
             &workdir,
@@ -1006,10 +2003,15 @@ fn resolve_stage_conversions(
             bytes.clone(),
             || crate::command::status_io_worker::index_has_text_crlf(selected),
         )
-        .map_err(map_stage_conversion_error)?;
-        *clean = converted;
+        .map_err(map_stage_conversion_error);
+        match converted {
+            Ok(converted) => *clean = converted,
+            Err(error) => {
+                refusals.push((path.clone(), error));
+                failed_paths.insert(path.clone());
+            }
+        }
     }
-    Ok(())
 }
 
 fn confirm_stage_plan(plan: &StagePlan) -> Result<(), BridgeError> {
@@ -1019,10 +2021,10 @@ fn confirm_stage_plan(plan: &StagePlan) -> Result<(), BridgeError> {
         } => match read_optional_worktree_bytes(path)? {
             Some((now, now_mode)) if now == *bytes && now_mode == *mode => Ok(()),
             Some(_) => Err(BridgeError::stale_fence(format!(
-                "stale_state: {path} changed after its snapshot; no index or object write was performed"
+                "stale_state: {path} changed after its snapshot; no index write was performed"
             ))),
             None => Err(BridgeError::stale_fence(format!(
-                "stale_state: {path} disappeared after its snapshot; no index or object write was performed"
+                "stale_state: {path} disappeared after its snapshot; no index write was performed"
             ))),
         },
         StagePlan::Link { path, target } => {
@@ -1030,7 +2032,7 @@ fn confirm_stage_plan(plan: &StagePlan) -> Result<(), BridgeError> {
                 Ok(())
             } else {
                 Err(BridgeError::stale_fence(format!(
-                    "stale_state: symlink {path} changed after its snapshot; no index or object write was performed"
+                    "stale_state: symlink {path} changed after its snapshot; no index write was performed"
                 )))
             }
         }
@@ -1044,6 +2046,16 @@ fn confirm_stage_plan(plan: &StagePlan) -> Result<(), BridgeError> {
             }
         }
     }
+}
+
+/// Recheck a stage source at the final index publication boundary.
+fn confirm_prepared_stage_plan(plan: &StagePlan) -> Result<(), BridgeError> {
+    confirm_stage_plan(plan).map_err(|_| {
+        BridgeError::stale_fence(format!(
+            "stale_state: {} changed while the batch was prepared; no index write was performed",
+            plan.path()
+        ))
+    })
 }
 
 /// Deliberate filter refusals stay path-free. Every other conversion failure
@@ -1079,26 +2091,27 @@ fn reject_second_publish() -> Result<(), BridgeError> {
 }
 
 async fn publish_stage_plan(
-    plan: StagePlan,
+    plan: &StagePlan,
     index: &mut git_internal::internal::index::Index,
 ) -> Result<(), BridgeError> {
     use git_internal::internal::object::types::ObjectType;
     match plan {
         // The stored representation was resolved for every selected path
-        // before publication began, so this step cannot refuse.
+        // before publication began, and the case-alias check ran in the same
+        // preparation pass, so this step does not refuse for those reasons.
         StagePlan::File {
             path, clean, mode, ..
         } => {
             let snapshot =
-                git_internal::hash::ObjectHash::from_type_and_data(ObjectType::Blob, &clean);
-            publish_snapshot(&path, index, &clean, snapshot, mode).await
+                git_internal::hash::ObjectHash::from_type_and_data(ObjectType::Blob, clean);
+            publish_snapshot(path, index, clean, snapshot, *mode).await
         }
         StagePlan::Link { path, target } => {
             let snapshot =
-                git_internal::hash::ObjectHash::from_type_and_data(ObjectType::Blob, &target);
-            publish_snapshot(&path, index, &target, snapshot, 0o120000).await
+                git_internal::hash::ObjectHash::from_type_and_data(ObjectType::Blob, target);
+            publish_snapshot(path, index, target, snapshot, 0o120000).await
         }
-        StagePlan::Delete { path } => stage_tracked_deletion(&path, index),
+        StagePlan::Delete { path } => stage_tracked_deletion(path, index).await,
     }
 }
 
@@ -1123,7 +2136,7 @@ async fn publish_snapshot(
         .map_err(|error| vcs::internal_hiding_host_paths("vcs.stage: store blob", error))?;
     let workdir = util::try_working_dir()
         .map_err(|_| BridgeError::scope_mismatch("not_a_repository: vcs.stage needs a worktree"))?;
-    remove_case_aliases(index, path)?;
+    remove_case_aliases(index, path).await?;
     let mut entry =
         match crate::command::verified_index_entry(Path::new(path), blob.id, &workdir, None) {
             Ok(entry) => entry,
@@ -1180,48 +2193,83 @@ fn symlink_target(relative: &str) -> Result<Option<Vec<u8>>, BridgeError> {
     }
 }
 
-fn remove_case_aliases(
-    index: &mut git_internal::internal::index::Index,
+/// The case alias an index entry may replace, if any.
+///
+/// The check is separate from the removal so a batch can discover every
+/// refusal before anything is published.
+async fn case_alias_to_remove(
+    index: &git_internal::internal::index::Index,
     path: &str,
-) -> Result<(), BridgeError> {
-    let aliases = index
-        .tracked_files()
-        .into_iter()
-        .filter_map(|tracked| {
-            let name = tracked.display().to_string().replace('\\', "/");
-            (name != path && name.eq_ignore_ascii_case(path)).then_some(name)
+) -> Result<Option<String>, BridgeError> {
+    let case_entries: Vec<(u8, String)> = (0..4)
+        .flat_map(|stage| {
+            index
+                .tracked_entries(stage)
+                .into_iter()
+                .map(move |entry| (stage, entry.name.clone()))
         })
-        .collect::<Vec<_>>();
-    if aliases.is_empty() {
-        return Ok(());
+        .filter(|(_, name)| name.eq_ignore_ascii_case(path))
+        .collect();
+    if case_entries.iter().all(|(_, name)| name == path) {
+        return Ok(None);
     }
-    let refused = BridgeError::invalid_params(format!(
-        "vcs.stage: ambiguous case variant of {path}; refusing to change another index entry"
-    ));
-    let Ok(workdir) = util::try_working_dir() else {
-        return Err(refused);
-    };
-    if !crate::utils::path_case::probe_dir_ignore_case(&workdir) {
-        return Err(refused);
-    }
-    let root = crate::utils::beneath::open_root(&workdir).map_err(|_| {
+
+    let refused = || {
         BridgeError::invalid_params(format!(
             "vcs.stage: ambiguous case variant of {path}; refusing to change another index entry"
         ))
-    })?;
-    for alias in &aliases {
-        if crate::utils::beneath::same_nofollow_entry(&root, Path::new(path), Path::new(alias)).ok()
-            != Some(true)
-        {
-            return Err(BridgeError::invalid_params(format!(
-                "vcs.stage: ambiguous case variant of {path}; refusing to change another index entry"
-            )));
-        }
+    };
+    let Ok(workdir) = util::try_working_dir() else {
+        return Err(refused());
+    };
+    if !crate::utils::path_case::probe_dir_ignore_case(&workdir) {
+        return Err(refused());
     }
-    for alias in aliases {
-        for stage in 0..4 {
-            index.remove(&alias, stage);
-        }
+    let root = crate::utils::beneath::open_root(&workdir).map_err(|_| refused())?;
+    let [(0, source)] = case_entries.as_slice() else {
+        return Err(refused());
+    };
+    if source == path
+        || crate::utils::beneath::same_nofollow_entry(&root, Path::new(path), Path::new(source))
+            .ok()
+            != Some(true)
+    {
+        return Err(refused());
+    }
+
+    // Removing a case alias is allowed only for an unmodified HEAD spelling
+    // that is the sole index entry at this case-folded name. This recognizes a
+    // case-only rename while preserving any separately staged index spelling.
+    let head_entries = head_tree_entries().await?;
+    let head_aliases: Vec<_> = head_entries
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case(path))
+        .collect();
+    if head_aliases.len() != 1 || head_aliases[0].0 != source {
+        return Err(refused());
+    }
+    let (head_mode, head_oid) = head_aliases[0].1;
+    let Some(index_entry) = index.get(source, 0) else {
+        return Err(refused());
+    };
+    if index_entry.hash != *head_oid || index_entry.mode != index_mode_for_tree_item(*head_mode)? {
+        return Err(refused());
+    }
+
+    Ok(Some(source.clone()))
+}
+
+/// Remove the case alias an index entry may replace.
+///
+/// The check that decides whether the alias may be removed lives in
+/// [`case_alias_to_remove`], so a batch can run it for every path before it
+/// publishes anything.
+async fn remove_case_aliases(
+    index: &mut git_internal::internal::index::Index,
+    path: &str,
+) -> Result<(), BridgeError> {
+    if let Some(source) = case_alias_to_remove(index, path).await? {
+        index.remove(&source, 0);
     }
     Ok(())
 }
@@ -1384,11 +2432,11 @@ fn serialize_index(index: &git_internal::internal::index::Index) -> Result<Vec<u
     read_index_bounded(temporary.path())
 }
 
-fn stage_tracked_deletion(
+async fn stage_tracked_deletion(
     path: &str,
     index: &mut git_internal::internal::index::Index,
 ) -> Result<(), BridgeError> {
-    remove_case_aliases(index, path)?;
+    remove_case_aliases(index, path).await?;
     let mut removed = false;
     for stage in 0..4 {
         if index.remove(path, stage).is_some() {
@@ -1470,12 +2518,6 @@ fn index_mode_from_file(file: &std::fs::File) -> u32 {
     0o100644
 }
 
-fn quiet_output() -> crate::utils::output::OutputConfig {
-    let mut output = vcs::service_output();
-    output.json_format = None;
-    output
-}
-
 fn confirm_workdir_root(
     workdir: &Path,
     expected: &crate::utils::beneath::EntryIdentity,
@@ -1497,28 +2539,52 @@ fn confirm_workdir_root(
 }
 
 async fn worktree_generation(workdir: &Path) -> Result<String, BridgeError> {
+    let staged = changes_to_be_committed_safe()
+        .await
+        .map_err(|error| vcs::internal_hiding_host_paths("vcs fence: read index", error))?;
+    let unstaged = changes_to_be_staged()
+        .map_err(|error| vcs::internal_hiding_host_paths("vcs fence: read worktree", error))?;
+    worktree_generation_from(workdir, &staged, &unstaged).await
+}
+
+/// The worktree generation of a given observation of the changed paths.
+async fn worktree_generation_from(
+    workdir: &Path,
+    staged: &crate::command::status::Changes,
+    unstaged: &crate::command::status::Changes,
+) -> Result<String, BridgeError> {
     let root = crate::utils::beneath::open_root(workdir)
         .map_err(|error| vcs::internal_hiding_host_paths("vcs fence: cannot pin root", error))?;
     let identity =
         crate::utils::beneath::entry_identity_beneath(&root, Path::new("")).map_err(|error| {
             vcs::stale_fence_hiding_host_paths("vcs fence: cannot identify workdir root", error)
         })?;
-    let staged = changes_to_be_committed_safe()
-        .await
-        .map_err(|error| vcs::internal_hiding_host_paths("vcs fence: read index", error))?;
-    let unstaged = changes_to_be_staged()
-        .map_err(|error| vcs::internal_hiding_host_paths("vcs fence: read worktree", error))?;
     confirm_workdir_root(workdir, &identity)?;
-    let total = change_count(&staged).saturating_add(change_count(&unstaged));
+    let total = change_count(staged).saturating_add(change_count(unstaged));
     if total > MAX_FENCE_PATHS {
         return Err(BridgeError::invalid_params(format!(
             "vcs fence refuses more than {MAX_FENCE_PATHS} changed paths"
         )));
     }
     let mut rows = BTreeSet::new();
-    let mut remaining = 32 * 1024 * 1024u64;
-    collect_rows(&root, &staged, "staged", &mut rows, &mut remaining)?;
-    collect_rows(&root, &unstaged, "unstaged", &mut rows, &mut remaining)?;
+    let mut remaining = MAX_FENCE_BYTES;
+    let mut digests = BTreeMap::new();
+    collect_rows(
+        &root,
+        staged,
+        "staged",
+        &mut rows,
+        &mut remaining,
+        &mut digests,
+    )?;
+    collect_rows(
+        &root,
+        unstaged,
+        "unstaged",
+        &mut rows,
+        &mut remaining,
+        &mut digests,
+    )?;
     confirm_workdir_root(workdir, &identity)?;
     if rows.len() > MAX_FENCE_PATHS {
         return Err(BridgeError::invalid_params(format!(
@@ -1528,6 +2594,34 @@ async fn worktree_generation(workdir: &Path) -> Result<String, BridgeError> {
     Ok(sha256_hex(
         rows.into_iter().collect::<Vec<_>>().join("\n").as_bytes(),
     ))
+}
+
+fn verify_all_observed_stamps(
+    root: &std::fs::File,
+    stamps: &crate::command::status::WorktreeStamps,
+) -> Result<(), BridgeError> {
+    for (path, expected) in stamps {
+        let actual = crate::command::status::capture_worktree_entry(root, path).map_err(|_| {
+            BridgeError::stale_fence(format!(
+                "vcs fence: {} changed after the status scan",
+                path.display()
+            ))
+        })?;
+        let matches = match (expected, actual.as_ref()) {
+            (crate::command::status::ObservedPath::Absent, None) => true,
+            (crate::command::status::ObservedPath::Observed(expected), Some((identity, stat))) => {
+                expected.identity == *identity && expected.stat == *stat
+            }
+            _ => false,
+        };
+        if !matches {
+            return Err(BridgeError::stale_fence(format!(
+                "vcs fence: {} changed after the status scan",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn change_count(changes: &crate::command::status::Changes) -> usize {
@@ -1545,6 +2639,7 @@ fn collect_rows(
     state: &str,
     rows: &mut BTreeSet<String>,
     remaining: &mut u64,
+    digests: &mut BTreeMap<std::path::PathBuf, String>,
 ) -> Result<(), BridgeError> {
     if change_count(changes) > MAX_FENCE_PATHS {
         return Err(BridgeError::invalid_params(format!(
@@ -1557,18 +2652,47 @@ fn collect_rows(
         .chain(changes.modified.iter())
         .chain(changes.deleted.iter())
     {
-        let rel = path.display().to_string().replace('\\', "/");
-        rows.insert(format!(
-            "{state}\t{rel}\t{}",
-            content_digest(root, &rel, remaining)?
-        ));
+        // The repository-relative path is used verbatim: rewriting it would
+        // hash another file than the one that changed.
+        let rel = path.display().to_string();
+        // A path that is both staged and unstaged is read once: the fence
+        // covers its content once, and the repeated row reuses that digest
+        // instead of reading the file again.
+        let digest = match digests.get(path) {
+            Some(digest) => digest.clone(),
+            None => {
+                let digest = content_digest(root, &rel, remaining)?;
+                digests.insert(path.clone(), digest.clone());
+                digest
+            }
+        };
+        rows.insert(format!("{state}\t{rel}\t{digest}"));
     }
     for (old, new) in &changes.renamed {
-        let rel = new.display().to_string().replace('\\', "/");
-        let from = old.display().to_string().replace('\\', "/");
-        rows.insert(format!(
-            "rename\t{from}\t{rel}\t{}",
-            content_digest(root, &rel, remaining)?
+        let rel = new.display().to_string();
+        let from = old.display().to_string();
+        let digest = match digests.get(new) {
+            Some(digest) => digest.clone(),
+            None => {
+                let digest = content_digest(root, &rel, remaining)?;
+                digests.insert(new.clone(), digest.clone());
+                digest
+            }
+        };
+        rows.insert(format!("rename\t{from}\t{rel}\t{digest}"));
+    }
+    Ok(())
+}
+
+/// Charge bytes a fence read consumed against the aggregate budget.
+fn charge_fence_bytes(remaining: &mut u64, read: u64) -> Result<(), BridgeError> {
+    // The bytes are consumed before the refusal is reported, so a caller that
+    // continues cannot reuse an allowance those bytes already spent.
+    let over_budget = read > *remaining;
+    *remaining = remaining.saturating_sub(read);
+    if over_budget {
+        return Err(BridgeError::invalid_params(
+            "vcs fence aggregate byte budget exceeded",
         ));
     }
     Ok(())
@@ -1612,13 +2736,17 @@ fn content_digest(
         })?;
     let mode = metadata.mode;
     if metadata.is_symlink {
-        let target =
-            crate::utils::beneath::read_symlink_beneath(root, relative_path).map_err(|error| {
-                vcs::internal_hiding_host_paths(
-                    &format!("vcs fence: cannot read symlink {relative}"),
-                    error,
-                )
-            })?;
+        // Every read is charged as it happens, including a read that is
+        // followed by a refusal.
+        let (target, first_read) =
+            crate::utils::beneath::read_symlink_beneath_counted(root, relative_path);
+        charge_fence_bytes(remaining, first_read)?;
+        let target = target.map_err(|error| {
+            vcs::internal_hiding_host_paths(
+                &format!("vcs fence: cannot read symlink {relative}"),
+                error,
+            )
+        })?;
         let after_identity = crate::utils::beneath::entry_identity_beneath(root, relative_path)
             .map_err(|error| {
                 vcs::stale_fence_hiding_host_paths(
@@ -1633,13 +2761,15 @@ fn content_digest(
                     error,
                 )
             })?;
-        let target_after = crate::utils::beneath::read_symlink_beneath(root, relative_path)
-            .map_err(|error| {
-                vcs::stale_fence_hiding_host_paths(
-                    &format!("vcs fence: cannot reread link {relative}"),
-                    error,
-                )
-            })?;
+        let (target_after, second_read) =
+            crate::utils::beneath::read_symlink_beneath_counted(root, relative_path);
+        charge_fence_bytes(remaining, second_read)?;
+        let target_after = target_after.map_err(|error| {
+            vcs::stale_fence_hiding_host_paths(
+                &format!("vcs fence: cannot reread link {relative}"),
+                error,
+            )
+        })?;
         if before_identity != after_identity
             || !after_metadata.is_symlink
             || metadata.mode != after_metadata.mode
@@ -1651,9 +2781,6 @@ fn content_digest(
                 "vcs fence: {relative} changed while reading link"
             )));
         }
-        *remaining = remaining.checked_sub(target.len() as u64).ok_or_else(|| {
-            BridgeError::invalid_params("vcs fence aggregate byte budget exceeded")
-        })?;
         return Ok(format!("symlink:{mode}:{}", sha256_hex(&target)));
     }
     if !metadata.is_file || metadata.len > MAX_BYTES {
@@ -1698,12 +2825,13 @@ fn content_digest(
     }
     let available = MAX_BYTES.min(*remaining);
     let mut bytes = Vec::new();
-    (&file)
-        .take(available + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|error| {
-            vcs::internal_hiding_host_paths(&format!("vcs fence: cannot read {relative}"), error)
-        })?;
+    let read_result = (&file).take(available + 1).read_to_end(&mut bytes);
+    // The bytes that were read are charged on every outcome, also when the
+    // read failed or exceeded the allowance.
+    charge_fence_bytes(remaining, bytes.len() as u64)?;
+    read_result.map_err(|error| {
+        vcs::internal_hiding_host_paths(&format!("vcs fence: cannot read {relative}"), error)
+    })?;
     if bytes.len() as u64 > available {
         return Err(BridgeError::invalid_params(format!(
             "vcs fence: oversized path {relative}"
@@ -1739,7 +2867,6 @@ fn content_digest(
             "vcs fence: {relative} replaced while reading"
         )));
     }
-    *remaining -= bytes.len() as u64;
     Ok(format!("file:{mode}:{}", sha256_hex(&bytes)))
 }
 
@@ -1759,6 +2886,77 @@ mod fence_tests {
         assert!(error.message.contains("oversized"), "{}", error.message);
     }
 
+    /// The fence generation follows the content the status scan captured: a
+    /// later rewrite of the same length produces different fence rows, so the
+    /// write refuses the stale fence even when the path's metadata was
+    /// preserved.
+    #[test]
+    fn a_rewritten_path_invalidates_the_scanned_fence() {
+        use std::path::PathBuf;
+
+        let dir = tempfile::tempdir().expect("fixture");
+        std::fs::write(dir.path().join("file"), b"one").expect("write");
+        let root = crate::utils::beneath::open_root(dir.path()).expect("root");
+        let mut budget = 1024u64;
+        let stamp =
+            crate::command::status::capture_worktree_stamp(&root, Path::new("file"), &mut budget)
+                .expect("stamp")
+                .expect("present");
+        let mut stamps = crate::command::status::WorktreeStamps::new();
+        stamps.insert(
+            PathBuf::from("file"),
+            crate::command::status::ObservedPath::Observed(stamp),
+        );
+        let changes = crate::command::status::Changes {
+            modified: vec![PathBuf::from("file")],
+            ..Default::default()
+        };
+
+        let mut scanned_rows = BTreeSet::new();
+        let mut scanned_budget = MAX_FENCE_BYTES;
+        let mut charged = BTreeSet::new();
+        collect_rows_from_stamps(
+            &changes,
+            "unstaged",
+            &mut scanned_rows,
+            &stamps,
+            &mut scanned_budget,
+            &mut charged,
+        )
+        .expect("scanned rows");
+        std::fs::write(dir.path().join("file"), b"two").expect("rewrite");
+        let mut current_rows = BTreeSet::new();
+        let mut current_budget = 1024u64;
+        let mut digests = BTreeMap::new();
+        collect_rows(
+            &root,
+            &changes,
+            "unstaged",
+            &mut current_rows,
+            &mut current_budget,
+            &mut digests,
+        )
+        .expect("current rows");
+
+        assert_ne!(
+            scanned_rows, current_rows,
+            "a rewritten path must produce a different fence"
+        );
+    }
+
+    #[test]
+    fn commit_scope_keeps_case_colliding_index_names_distinct() {
+        let changes = crate::command::status::Changes {
+            new: vec!["Case.txt".into(), "case.txt".into()],
+            ..Default::default()
+        };
+        let staged = staged_path_names(&changes);
+        let requested = BTreeSet::from(["Case.txt".to_string()]);
+        let error = require_exact_commit_scope(&staged, &requested)
+            .expect_err("both index names require authorization");
+        assert!(error.message.contains("do not match the staged set"));
+    }
+
     #[cfg(not(all(feature = "test-bridge-hooks", debug_assertions)))]
     #[test]
     fn fault_hook_cannot_remove_a_file_without_test_feature() {
@@ -1769,8 +2967,8 @@ mod fence_tests {
         assert_eq!(std::fs::read(path).expect("file remains"), b"keep");
     }
 
-    #[test]
-    fn case_alias_does_not_delete_a_distinct_index_entry() {
+    #[tokio::test]
+    async fn case_alias_does_not_delete_a_distinct_index_entry() {
         use git_internal::internal::{
             index::{Index, IndexEntry},
             object::types::ObjectType,
@@ -1778,7 +2976,7 @@ mod fence_tests {
         let mut index = Index::new();
         let oid = git_internal::hash::ObjectHash::from_type_and_data(ObjectType::Blob, b"first");
         index.add(IndexEntry::new_from_blob("Name".into(), oid, 5));
-        assert!(remove_case_aliases(&mut index, "name").is_err());
+        assert!(remove_case_aliases(&mut index, "name").await.is_err());
         assert!(index.get("Name", 0).is_some(), "distinct entry was removed");
     }
 
@@ -1793,7 +2991,15 @@ mod fence_tests {
         let mut rows = BTreeSet::new();
         let fixture = tempfile::tempdir().expect("fixture");
         let root = crate::utils::beneath::open_root(fixture.path()).expect("root");
-        let result = collect_rows(&root, &changes, "unstaged", &mut rows, &mut 32_000_000);
+        let mut digests = BTreeMap::new();
+        let result = collect_rows(
+            &root,
+            &changes,
+            "unstaged",
+            &mut rows,
+            &mut 32_000_000,
+            &mut digests,
+        );
         let error = result.expect_err("count must be refused");
         assert!(error.message.contains("more than"), "{}", error.message);
         assert!(rows.is_empty(), "must reject count before hashing");
@@ -1807,6 +3013,28 @@ mod fence_tests {
         symlink("real", dir.path().join("alias")).expect("symlink");
         let root = crate::utils::beneath::open_root(dir.path()).expect("root");
         assert!(content_digest(&root, "alias/file", &mut 100).is_err());
+    }
+
+    #[test]
+    fn a_symlink_target_is_charged_for_both_reads() {
+        let dir = tempfile::tempdir().expect("fixture");
+        std::fs::write(dir.path().join("referent"), b"0123456789").expect("referent");
+        // `readlink` returns the six-byte target text, not the referent.
+        symlink("target", dir.path().join("link")).expect("symlink");
+        let root = crate::utils::beneath::open_root(dir.path()).expect("root");
+
+        // Six bytes cover one read of the link target but not the two reads the
+        // recheck performs, so this distinguishes double charging from single
+        // charging.
+        let mut remaining = 6u64;
+        let error = content_digest(&root, "link", &mut remaining)
+            .expect_err("both symlink reads are charged");
+        assert!(
+            error.message.contains("budget"),
+            "the refusal names the budget: {}",
+            error.message
+        );
+        assert_eq!(remaining, 0, "the first read is still charged");
     }
 
     #[test]
@@ -1906,12 +3134,68 @@ mod fence_tests {
     }
 
     #[test]
+    #[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+    fn a_failed_symlink_retry_charges_the_first_read() {
+        let dir = tempfile::tempdir().expect("fixture");
+        let target = "a".repeat(300);
+        symlink(&target, dir.path().join("link")).expect("symlink");
+        let root = crate::utils::beneath::open_root(dir.path()).expect("root");
+
+        crate::utils::beneath::set_fail_readlink_retry_for_test(true);
+        let mut remaining = 32_000_000u64;
+        let error =
+            content_digest(&root, "link", &mut remaining).expect_err("the retried read fails");
+        assert!(
+            error.message.contains("symlink") || error.message.contains("link"),
+            "{}",
+            error.message
+        );
+        assert_eq!(
+            remaining,
+            32_000_000 - 256,
+            "the first attempt's bytes are charged before the retry fails"
+        );
+    }
+
+    #[test]
+    fn a_long_symlink_target_is_charged_for_its_retried_reads() {
+        let dir = tempfile::tempdir().expect("fixture");
+        // A target longer than the reader's first 256-byte buffer is read
+        // twice inside the helper: once filling the buffer and once for the
+        // whole target.
+        let target = "a".repeat(300);
+        symlink(&target, dir.path().join("link")).expect("symlink");
+        let root = crate::utils::beneath::open_root(dir.path()).expect("root");
+
+        // One attempt reads 256 bytes and the retried attempt reads the whole
+        // 300-byte target, so the recheck consumes 556 bytes twice: an 800-byte
+        // allowance refuses it, and charging only the target length twice
+        // (600 bytes) would have accepted it.
+        let mut remaining = 800u64;
+        let error = content_digest(&root, "link", &mut remaining)
+            .expect_err("the retried reads are charged");
+        assert!(
+            error.message.contains("budget"),
+            "the refusal names the budget: {}",
+            error.message
+        );
+        assert!(
+            remaining < 800,
+            "the first read is charged before the retried read fails"
+        );
+    }
+
+    #[test]
     fn aggregate_budget_refuses_file_larger_than_remaining_budget() {
         let dir = tempfile::tempdir().expect("fixture");
         std::fs::write(dir.path().join("file"), b"12345").expect("write");
         let root = crate::utils::beneath::open_root(dir.path()).expect("root");
         let error = content_digest(&root, "file", &mut 4).expect_err("budget");
-        assert!(error.message.contains("oversized"));
+        assert!(
+            error.message.contains("budget") || error.message.contains("oversized"),
+            "{}",
+            error.message
+        );
     }
 
     #[test]

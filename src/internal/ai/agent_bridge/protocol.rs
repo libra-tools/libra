@@ -87,6 +87,10 @@ pub const METHOD_ALLOWLIST: &[&str] = &[
     "vcs.diff",
     "vcs.log",
     "vcs.show",
+    // Typed repository writes (LVC-06): protocol minor 2.
+    "vcs.stage",
+    "vcs.unstage",
+    "vcs.commit",
 ];
 
 /// The allowlist as an efficient set for O(1) membership checks.
@@ -580,8 +584,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn allowlist_has_exactly_25_methods() {
-        assert_eq!(METHOD_ALLOWLIST.len(), 25);
+    fn allowlist_has_exactly_28_methods() {
+        assert_eq!(METHOD_ALLOWLIST.len(), 28);
         assert_eq!(PROTOCOL_MINOR, 2);
         // The four handshake/session/ingress methods, projection, reads,
         // mutation and workspace groups must all be present.
@@ -611,6 +615,9 @@ mod tests {
             "vcs.diff",
             "vcs.log",
             "vcs.show",
+            "vcs.stage",
+            "vcs.unstage",
+            "vcs.commit",
         ] {
             assert!(
                 MethodAllowlist::contains(m),

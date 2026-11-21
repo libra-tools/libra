@@ -34,7 +34,6 @@ use crate::{
         diff::{DiffArgs, run_diff_for_service},
         load_object,
         log::get_reachable_commits,
-        status::{changes_to_be_committed_safe, changes_to_be_staged},
     },
     internal::head::Head,
     utils::{path, util},
@@ -82,10 +81,100 @@ pub async fn identity() -> Result<Value, BridgeError> {
 /// Paginated working-tree status. An empty page is returned only after
 /// discovery succeeds.
 pub async fn status(params: &Option<Value>) -> Result<Value, BridgeError> {
+    Ok(status_with_observation(params).await?.data)
+}
+
+/// One status observation: the page and the state it describes.
+///
+/// The change lists and the index generation come from ONE index snapshot:
+/// the index bytes are read once, parsed from a scratch copy of exactly those
+/// bytes, and hashed from the same bytes. A write fence derived from this
+/// observation therefore covers exactly the paths the page reports.
+pub(crate) struct StatusObservation {
+    pub data: Value,
+    pub head: Option<ObjectHash>,
+    /// The digest of the observed index bytes, or `None` when no snapshot
+    /// could be taken. Without it no write fence is published.
+    pub index_generation: Option<String>,
+    /// The content-aware digest of the observed changed paths, or `None` when
+    /// the observation could not be bound to one stable state.
+    pub worktree_generation: Option<String>,
+}
+
+/// The status page together with the state it was built from.
+pub(crate) async fn status_with_observation(
+    params: &Option<Value>,
+) -> Result<StatusObservation, BridgeError> {
     let workdir = discovered_workdir()?;
     let offset = cursor_offset(params)?;
     let limit = page_limit(params)?;
-    let mut entries = status_entries(&workdir).await?;
+    // The fence needs one index snapshot. The status does not: when the
+    // snapshot cannot be taken (a read-only repository, an index beyond the
+    // fence's bounds), the status still answers and the fence is omitted.
+    let snapshot = index_snapshot().await.ok();
+    let (mut entries, head, index_generation, worktree_generation) = match snapshot {
+        Some(snapshot) => {
+            let head = vcs::read_fence().await?.head;
+            let head_tree = match head.as_ref() {
+                Some(oid) => Some(
+                    crate::command::status::load_head_tree_snapshot(oid).map_err(status_error)?,
+                ),
+                None => None,
+            };
+            let staged = crate::command::status::changes_to_be_committed_with_head(
+                &snapshot.index,
+                head_tree.as_ref(),
+            );
+            let ignore_case = crate::command::status::effective_ignore_case_for_workdir(&workdir)
+                .map_err(status_error)?;
+            let file_mode = crate::command::status::default_core_file_mode();
+            // ONE scan produces the page's entries, the observation of every
+            // changed path and the content digests the fence is built from.
+            // The fence therefore describes exactly the content the scan read:
+            // a later change to that content yields a different fence, and the
+            // write refuses the stale one.
+            let (paths, _ignored, stamps) =
+                crate::command::status::changes_to_be_staged_split_with_index_observation(
+                    &workdir,
+                    &snapshot.index,
+                    ignore_case,
+                    file_mode,
+                    &staged,
+                )
+                .map_err(status_error)?;
+            super::vcs_write::rewrite_after_final_status_scan();
+            // A scan that could not observe the worktree publishes no fence.
+            let worktree_generation = match stamps {
+                Some(stamps) => super::vcs_write::worktree_generation_for_observation(
+                    &workdir, &staged, &paths, &stamps,
+                )
+                .await
+                .ok(),
+                None => None,
+            };
+            let (entries, _conflicts) = status_entries(&workdir, &snapshot.index, &staged, &paths)?;
+            (
+                entries,
+                head,
+                Some(snapshot.generation),
+                worktree_generation,
+            )
+        }
+        None => {
+            let index_path = path::try_index().map_err(|error| {
+                vcs::internal_hiding_host_paths("vcs.status: locate index", error)
+            })?;
+            let index = Index::load(&index_path).map_err(|error| {
+                vcs::internal_hiding_host_paths("vcs.status: read index", error)
+            })?;
+            let staged = crate::command::status::changes_to_be_committed_safe()
+                .await
+                .map_err(status_error)?;
+            let unstaged = crate::command::status::changes_to_be_staged().map_err(status_error)?;
+            let (entries, _conflicts) = status_entries(&workdir, &index, &staged, &unstaged)?;
+            (entries, None, None, None)
+        }
+    };
     if entries.len() > MAX_SHOW_FILES {
         return Err(BridgeError::invalid_params(
             "vcs.status refuses a worktree with more than 10000 status entries",
@@ -103,7 +192,72 @@ pub async fn status(params: &Option<Value>) -> Result<Value, BridgeError> {
                     .cmp(right["state"].as_str().unwrap_or_default())
             })
     });
-    Ok(page_of(entries, offset, limit))
+    Ok(StatusObservation {
+        data: page_of(entries, offset, limit),
+        head,
+        index_generation,
+        worktree_generation,
+    })
+}
+
+/// The index as one snapshot: the parsed entries and the digest of the very
+/// bytes they were parsed from.
+struct IndexSnapshot {
+    index: Index,
+    generation: String,
+}
+
+/// Test seam: refuse the index snapshot so the fallback path is exercised.
+///
+/// The seam exists so a test can prove that the status still answers when no
+/// snapshot can be taken. It is not used by the protocol.
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+static FORCE_SNAPSHOT_FAILURE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Test seam: refuse the index snapshot so the fallback path is exercised.
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+pub fn set_status_snapshot_failure_for_test(enabled: bool) {
+    FORCE_SNAPSHOT_FAILURE.store(enabled, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(not(all(feature = "test-bridge-hooks", debug_assertions)))]
+fn snapshot_forced_to_fail() -> bool {
+    false
+}
+
+#[cfg(all(feature = "test-bridge-hooks", debug_assertions))]
+fn snapshot_forced_to_fail() -> bool {
+    FORCE_SNAPSHOT_FAILURE.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Read the index once and derive both the parsed entries and the digest from
+/// the same bytes.
+async fn index_snapshot() -> Result<IndexSnapshot, BridgeError> {
+    if snapshot_forced_to_fail() {
+        return Err(BridgeError::internal(
+            "vcs.status: the index snapshot was refused by the test seam",
+        ));
+    }
+    let index_path = path::try_index()
+        .map_err(|error| vcs::internal_hiding_host_paths("vcs.status: locate index", error))?;
+    let bytes = super::vcs_write::read_index_snapshot_bytes(&index_path)?;
+    let generation = super::vcs_write::index_generation_of(&bytes);
+    // The index is parsed from a scratch copy of exactly the bytes the
+    // generation describes, so the reported entries and the published fence
+    // can never come from two different index states.
+    let parent = index_path
+        .parent()
+        .ok_or_else(|| BridgeError::internal("vcs.status: the index has no parent directory"))?;
+    let scratch = tempfile::NamedTempFile::new_in(parent).map_err(|error| {
+        vcs::internal_hiding_host_paths("vcs.status: create a temporary index", error)
+    })?;
+    std::fs::write(scratch.path(), &bytes).map_err(|error| {
+        vcs::internal_hiding_host_paths("vcs.status: write the temporary index", error)
+    })?;
+    let index = Index::load(scratch.path())
+        .map_err(|error| vcs::internal_hiding_host_paths("vcs.status: read index", error))?;
+    Ok(IndexSnapshot { index, generation })
 }
 
 /// Bounded diff. `sides` is a closed enum; `oid` is a single commit id.
@@ -370,26 +524,26 @@ fn discovered_workdir() -> Result<PathBuf, BridgeError> {
     })
 }
 
-async fn status_entries(workdir: &Path) -> Result<Vec<Value>, BridgeError> {
+/// The status entries and the index snapshot they were built from.
+fn status_entries(
+    workdir: &Path,
+    index: &Index,
+    staged: &crate::command::status::Changes,
+    unstaged: &crate::command::status::Changes,
+) -> Result<(Vec<Value>, BTreeSet<String>), BridgeError> {
     let mut conflicts = BTreeSet::new();
-    let index_path = path::try_index()
-        .map_err(|error| vcs::internal_hiding_host_paths("vcs.status: locate index", error))?;
-    let index = Index::load(&index_path)
-        .map_err(|error| vcs::internal_hiding_host_paths("vcs.status: read index", error))?;
     for stage in [1_u8, 2, 3] {
         for entry in index.tracked_entries(stage) {
             conflicts.insert(rel_path(workdir, Path::new(&entry.name))?);
         }
     }
-    let staged = changes_to_be_committed_safe().await.map_err(status_error)?;
-    let unstaged = changes_to_be_staged().map_err(status_error)?;
     let mut entries = Vec::new();
     for path in &conflicts {
         entries.push(entry(path, "conflict", None));
     }
-    push_changes(&mut entries, workdir, &staged, "staged", &conflicts)?;
-    push_changes(&mut entries, workdir, &unstaged, "unstaged", &conflicts)?;
-    Ok(entries)
+    push_changes(&mut entries, workdir, staged, "staged", &conflicts)?;
+    push_changes(&mut entries, workdir, unstaged, "unstaged", &conflicts)?;
+    Ok((entries, conflicts))
 }
 
 fn push_changes(

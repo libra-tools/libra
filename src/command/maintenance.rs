@@ -5514,6 +5514,10 @@ mod tests {
                 "the repository-scoped operation middleware lease; it contains no object ids and is never a GC root",
             ),
             (
+                "agent-bridge-writes.lock",
+                "the cross-process bridge write claim: an advisory lease that serializes bridge writers in this repository; it contains no object ids and is never a GC root",
+            ),
+            (
                 "config",
                 "repository configuration file (dual-layout compatibility); no object ids",
             ),

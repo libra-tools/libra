@@ -109,9 +109,59 @@ pub async fn dispatch(
         "vcs.identity" => Ok(Some(
             vcs_response(ctx, id, super::vcs_read::identity().await?).await,
         )),
-        "vcs.status" => Ok(Some(
-            vcs_response(ctx, id, super::vcs_read::status(&request.params).await?).await,
-        )),
+        "vcs.status" => {
+            // The page's entries come from the parsed index snapshot and the
+            // final worktree scan. The fence is published only when the
+            // candidate and final worktree observations agree on path kinds,
+            // identities, metadata and content. The write path rechecks it
+            // before publication; a status read alone is not an atomic
+            // filesystem snapshot.
+            let observation = super::vcs_read::status_with_observation(&request.params).await?;
+            let mut data = observation.data;
+            super::vcs_write::rewrite_after_status_observation();
+            let mut warnings: Vec<Value> = Vec::new();
+            let fence = match (
+                observation.index_generation.as_ref(),
+                observation.worktree_generation.as_ref(),
+            ) {
+                (Some(index_generation), Some(worktree_generation)) => {
+                    Some(super::vcs_write::fence_for_observation(
+                        observation.head,
+                        index_generation.clone(),
+                        worktree_generation.clone(),
+                    ))
+                }
+                _ => None,
+            };
+            match fence {
+                Some(fence) => {
+                    if let Some(object) = data.as_object_mut() {
+                        object.insert(
+                            "writeFence".to_string(),
+                            json!({
+                                "head": if fence.head.is_empty() {
+                                    Value::Null
+                                } else {
+                                    Value::String(fence.head)
+                                },
+                                "indexGeneration": fence.index_generation,
+                                "worktreeGeneration": fence.worktree_generation,
+                            }),
+                        );
+                    }
+                }
+                None => {
+                    warnings.push(json!({
+                        "code": "write_fence_unavailable",
+                        "message": "no write fence could be derived for this repository state, so \
+                                    none is published; the write methods refuse it as well"
+                    }));
+                }
+            }
+            let mut response = ok_envelope(ctx, data, "", json!(warnings));
+            response.id = id;
+            Ok(Some(response))
+        }
         "vcs.diff" => Ok(Some(
             vcs_response(ctx, id, super::vcs_read::diff(&request.params).await?).await,
         )),
@@ -293,7 +343,7 @@ async fn diff_get(
     ctx: &BridgeContext,
     request: &BridgeRequest,
 ) -> Result<BridgeResponse, BridgeError> {
-    let (mode, paths) = vcs::parse_diff_params(&request.params)?;
+    let (mode, paths) = vcs::parse_legacy_diff_params(&request.params)?;
     let (limit, mut warnings) = page_limit(&request.params);
     let against = if mode == DiffMode::Checkpoint {
         let checkpoint_id = param_str(&request.params, "checkpoint_id").ok_or_else(|| {
