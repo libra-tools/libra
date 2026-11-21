@@ -31,6 +31,8 @@ LFS 跟踪文件会在 HTTP 推送期间透明上传，不需要单独执行 `lf
 
 ## 选项
 
+`--force` 与 `--force-with-lease` 可以同时使用：`--force` 会覆盖过期的租约（或非快进拒绝）并执行更新，人读输出标记为强制更新（`(forced update)`）；未给 `--force` 时租约不匹配仍会拒绝。
+
 向本地 Libra 仓库推送、且目标仓库已检出该分支时，会读取目标的 `receive.denyCurrentBranch`：`warn` 更新分支并输出 `warning: updating the current branch`，`ignore` 静默更新，其它取值（或未配置）以 `LBR-REPO-003` 拒绝。允许更新时只改目标引用，目标工作区与索引保持不变（与 Git 一致，因此目标随后会把该检出文件报为已修改）。
 
 只给仓库的推送（`libra push <remote>`）会按配置写入顺序使用全部 `remote.<name>.push` 值，并与命令行 refspec 走同一引擎（支持通配符与负向 refspec）。命令行给出 refspec（或 `--tags`/`--mirror`）时完全忽略该配置；两者都没有时只给仓库的推送被拒绝（`repository-only push requires a refspec, --tags, or --mirror`，`LBR-CLI-002`；Git 此时按 `push.default` 回落，属有意差异）。

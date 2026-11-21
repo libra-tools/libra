@@ -3575,3 +3575,106 @@ fn test_push_honours_target_deny_current_branch() {
         "AC8: the target refs are unchanged"
     );
 }
+
+#[test]
+fn test_push_force_overrides_force_with_lease() {
+    use crate::command::{assert_cli_success, run_libra_command};
+
+    // `s` (main = A) pushes to a bare `o`; a second clone `w` rewrites the remote
+    // history to C, so `s`'s next push is non-fast-forward.
+    let work = tempfile::tempdir().expect("work dir");
+    let s = work.path().join("s");
+    std::fs::create_dir_all(&s).expect("mkdir s");
+    assert_cli_success(&run_libra_command(&["init"], &s), "init s");
+    run_libra_command(&["config", "set", "user.name", "t"], &s);
+    run_libra_command(&["config", "set", "user.email", "t@t"], &s);
+    std::fs::write(s.join("f.txt"), "a\n").expect("write a");
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], &s), "stage A");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "A", "--no-verify"], &s),
+        "commit A",
+    );
+    let o = work.path().join("o");
+    assert_cli_success(
+        &run_libra_command(&["init", "--bare", "o"], work.path()),
+        "init o",
+    );
+    assert_cli_success(
+        &run_libra_command(&["remote", "add", "origin", o.to_str().expect("o")], &s),
+        "add origin",
+    );
+    assert_cli_success(
+        &run_libra_command(&["push", "origin", "main"], &s),
+        "push A",
+    );
+
+    let w = work.path().join("w");
+    assert_cli_success(
+        &run_libra_command(&["clone", "./o", "w"], work.path()),
+        "clone w",
+    );
+    run_libra_command(&["config", "set", "user.name", "t"], &w);
+    run_libra_command(&["config", "set", "user.email", "t@t"], &w);
+    // The test sandbox has no vault unseal key.
+    run_libra_command(&["config", "set", "commit.gpgSign", "false"], &w);
+    run_libra_command(&["config", "set", "vault.signing", "false"], &w);
+    std::fs::write(w.join("f.txt"), "c\n").expect("write c");
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], &w), "stage C");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "C", "--no-verify"], &w),
+        "commit C",
+    );
+    assert_cli_success(
+        &run_libra_command(&["push", "origin", "main"], &w),
+        "push C",
+    );
+
+    std::fs::write(s.join("f.txt"), "d\n").expect("write d");
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], &s), "stage D");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "D", "--no-verify"], &s),
+        "commit D",
+    );
+    let d = {
+        let out = run_libra_command(&["rev-parse", "HEAD"], &s);
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+
+    // Without `--force` the stale lease refuses the update.
+    let refused = run_libra_command(
+        &[
+            "push",
+            &format!("--force-with-lease=main:{d}"),
+            "origin",
+            "main",
+        ],
+        &s,
+    );
+    assert!(
+        !refused.status.success(),
+        "a stale lease alone must refuse the non-fast-forward update"
+    );
+
+    // AC1/AC2: `--force` overrides the stale lease and marks the update forced.
+    let out = run_libra_command(
+        &[
+            "push",
+            "--force",
+            &format!("--force-with-lease=main:{d}"),
+            "origin",
+            "main",
+        ],
+        &s,
+    );
+    assert_cli_success(&out, "AC1: --force overrides the stale lease");
+    let remote_main =
+        String::from_utf8_lossy(&run_libra_command(&["rev-parse", "main"], &o).stdout)
+            .trim()
+            .to_string();
+    assert_eq!(remote_main, d, "AC1: the remote branch moved to D");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("(forced update)"),
+        "AC2: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}

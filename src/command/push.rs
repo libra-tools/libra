@@ -115,7 +115,7 @@ pub struct PushArgs {
 
     /// Force the update only if the remote ref still matches the expected (lease) OID.
     /// Forms: bare `--force-with-lease`, `=<refname>`, or `=<refname>:<expect>`
-    #[clap(long, num_args = 0..=1, require_equals = true, conflicts_with = "force")]
+    #[clap(long, num_args = 0..=1, require_equals = true)]
     pub force_with_lease: Option<Option<String>>,
 
     /// With --force-with-lease (All/Ref forms): additionally require the
@@ -1358,7 +1358,11 @@ pub async fn run_push(args: PushArgs, output: &OutputConfig) -> Result<PushOutpu
     // LFS, or sending anything. A failed lease aborts with no remote/local change.
     if let Some(lease) = parse_force_with_lease(&args.force_with_lease) {
         let tracking = collect_lease_tracking_oids(&repository, &plans).await;
-        validate_force_with_lease(&lease, &plans, &tracking)?;
+        // `--force` overrides a stale lease (Git marks the update forced instead
+        // of refusing); without it the lease keeps its full strength.
+        if !args.force {
+            validate_force_with_lease(&lease, &plans, &tracking)?;
+        }
         // `--force-if-includes` (lore.md 2.10): a lease REFINEMENT — beyond
         // "the remote still points where my tracking ref says", require the
         // tracking tip to have been INTEGRATED locally (reachable from a
@@ -4382,13 +4386,18 @@ mod test {
     }
 
     #[test]
-    fn force_with_lease_conflicts_with_force() {
+    fn force_with_lease_combines_with_force() {
         use clap::Parser as _;
-        assert!(
-            PushArgs::try_parse_from(["push", "--force", "--force-with-lease", "origin", "main"])
-                .is_err(),
-            "--force and --force-with-lease must conflict at the clap layer"
-        );
+        let args = PushArgs::try_parse_from([
+            "push",
+            "--force",
+            "--force-with-lease=main",
+            "origin",
+            "main",
+        ])
+        .expect("--force and --force-with-lease may be given together");
+        assert!(args.force);
+        assert!(args.force_with_lease.is_some());
     }
 
     #[test]

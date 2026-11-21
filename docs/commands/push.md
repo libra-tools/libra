@@ -75,6 +75,11 @@ these modes warn and are not authorization for remote synchronization.
 
 ## Options
 
+`--force` and `--force-with-lease` may be combined: `--force` overrides a stale
+lease (or a non-fast-forward rejection) and performs the update, marking it as a
+forced update in the human output (`(forced update)`). Without `--force`, a lease
+mismatch still refuses the update.
+
 Pushing into a local Libra repository that has the target branch checked out
 consults the target's `receive.denyCurrentBranch`: `warn` updates the branch and
 prints `warning: updating the current branch`, `ignore` does it silently, and any

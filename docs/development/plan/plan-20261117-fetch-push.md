@@ -697,7 +697,7 @@ PY
 
 ### Task FP-06: 解除 `push --force` 与 `--force-with-lease` 互斥并由 `--force` 覆盖租约拒绝（#1036；拆出 FP-21）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `complete`（2026-11-21：移除 `force_with_lease` 的 clap `conflicts_with = "force"`；租约校验改为仅在 `!args.force` 时执行，因此 `--force` 覆盖 stale 租约并以强制更新完成（人读输出含 `(forced update)`，见现有渲染路径），单元测试 `force_with_lease_conflicts_with_force` 改写为 `force_with_lease_combines_with_force`。用例 `test_push_force_overrides_force_with_lease` 覆盖 AC1/AC2（非快进 + stale 完整 OID 租约：单独租约拒绝，加 `--force` 后远端 `main` 移到 D 且 stdout 含 `(forced update)`）；`push` 套件 **40/40**、`push` 单测 **83/83**；版本面 0.30.245 → 0.30.246；文档 EN/zh-CN 同步。按用户 2026-11-20 指令在 `main` 直接提交推送。）
 
 **Description:** 按 ADR-FP-02 移除 `PushArgs::force_with_lease` 的 clap `conflicts_with = "force"`；同时给出 `--force` 与 `--force-with-lease` 时，租约不匹配（stale）或非快进的拒绝原因被 `--force` 覆盖，推送照常执行且该更新标记为强制更新（人读输出含 `(forced update)`，对齐 Git `set_ref_status_for_push`）；未给 `--force` 时租约校验保持不变。按 G-09 自本卡拆出 `FP-21`（无 `--force` 时的租约语义矩阵）。
 
