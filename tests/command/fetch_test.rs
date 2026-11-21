@@ -4004,3 +4004,118 @@ fn fetch_no_porcelain_overrides_porcelain() {
         "AC5: expected LBR-CLI-002"
     );
 }
+
+#[test]
+fn fetch_prune_honours_command_line_refspec_scope() {
+    use crate::command::{run_libra_command, run_libra_command_with_env};
+
+    let root = tempdir().unwrap();
+    let src = root.path().join("s");
+    assert!(
+        run_libra_command(&["init", src.to_str().unwrap()], root.path())
+            .status
+            .success()
+    );
+    let identity: &[(&str, &str)] = &[
+        ("LIBRA_COMMITTER_NAME", "t"),
+        ("LIBRA_COMMITTER_EMAIL", "t@t"),
+        ("GIT_AUTHOR_NAME", "t"),
+        ("GIT_AUTHOR_EMAIL", "t@t"),
+    ];
+    std::fs::write(src.join("a.txt"), "1\n").unwrap();
+    assert!(run_libra_command(&["add", "a.txt"], &src).status.success());
+    assert!(
+        run_libra_command_with_env(&["commit", "--no-gpg-sign", "-m", "c1"], &src, identity)
+            .status
+            .success()
+    );
+    for name in ["extrabranch", "foo/otherbranch"] {
+        assert!(run_libra_command(&["branch", name], &src).status.success());
+    }
+
+    let c = root.path().join("c");
+    assert!(
+        run_libra_command(&["init", c.to_str().unwrap()], root.path())
+            .status
+            .success()
+    );
+    assert!(
+        run_libra_command(&["remote", "add", "origin", src.to_str().unwrap()], &c)
+            .status
+            .success()
+    );
+    assert!(run_libra_command(&["fetch", "origin"], &c).status.success());
+    for name in ["extrabranch", "foo/otherbranch"] {
+        assert!(
+            run_libra_command(&["branch", "-D", name], &src)
+                .status
+                .success()
+        );
+    }
+    let tracking = |name: &str| {
+        String::from_utf8_lossy(
+            &run_libra_command(
+                &["for-each-ref", &format!("refs/remotes/origin/{name}")],
+                &c,
+            )
+            .stdout,
+        )
+        .contains(name)
+    };
+    assert!(tracking("extrabranch"), "fixture has a stale tracking ref");
+
+    // AC1: a bare refspec has no destination -> nothing is pruned.
+    assert!(
+        run_libra_command(&["fetch", "--prune", "origin", "main"], &c)
+            .status
+            .success()
+    );
+    assert!(tracking("extrabranch"), "AC1: bare refspec must not prune");
+
+    // AC2: an unrelated destination pattern prunes nothing.
+    assert!(
+        run_libra_command(
+            &[
+                "fetch",
+                "--prune",
+                "origin",
+                "refs/heads/a/*:refs/remotes/origin/a/*"
+            ],
+            &c
+        )
+        .status
+        .success()
+    );
+    assert!(
+        tracking("extrabranch"),
+        "AC2: unrelated pattern must not prune"
+    );
+
+    // AC4: a matching destination prunes only its own subtree.
+    assert!(
+        run_libra_command(
+            &[
+                "fetch",
+                "--prune",
+                "origin",
+                "refs/heads/foo/*:refs/remotes/origin/foo/*"
+            ],
+            &c
+        )
+        .status
+        .success()
+    );
+    assert!(
+        !tracking("foo/otherbranch"),
+        "AC4: the foo subtree is pruned"
+    );
+    assert!(tracking("extrabranch"), "AC4: the unrelated ref survives");
+
+    // AC5: no command-line refspec prunes the configured range.
+    assert!(
+        run_libra_command(&["fetch", "--prune", "origin"], &c)
+            .status
+            .success()
+    );
+    assert!(!tracking("extrabranch"), "AC5: the stale ref is pruned");
+}

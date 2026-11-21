@@ -1477,7 +1477,7 @@ PY
 
 ### Task FP-15: `fetch --prune` 带显式 refspec 时只修剪该 refspec 目标范围（#872）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `complete`（2026-11-20：`--prune` 候选范围按命令行 refspec 的目标模式收窄——过滤点位于 `prune_stale_remote_refs` **删除事务之前**（此前的「过滤返回值」会先删后筛，实测仍会删除陈旧引用）；无目标的命令行 refspec（如 `main`）不产生候选；`--tags` 不使 tag 成为候选；无命令行 refspec 时沿用 `remote.<name>.fetch` 全范围。新用例 `fetch_prune_honours_command_line_refspec_scope` 覆盖 AC1/AC2/AC4/AC5（AC3 由同一「裸 refspec 不修剪」规则覆盖）；`fetch_test` 全模块 **68/68 通过**；版本面 0.30.222 → 0.30.223。按用户 2026-11-20 指令在 `main` 直接提交推送。）
 
 **Description:** `--prune`（含 `fetch.prune`/`remote.<name>.prune` 生效时）在给出命令行 refspec 时，只把落在这些 refspec 目标模式内的本地引用作为修剪候选（无目标的 refspec 如 `main` 不产生候选）；无命令行 refspec 时沿用 `remote.<name>.fetch` 全范围修剪；`--tags` 引入的 tag refspec 不使本地 tag 成为 `--prune` 的修剪候选（tag 修剪只由既有 `--prune-tags` 控制，本卡不改）。
 

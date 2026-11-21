@@ -2467,6 +2467,8 @@ async fn fetch_repository_with_result_reusing(
     unshallow: bool,
     prior_results: &[FetchRepositoryResult],
 ) -> Result<FetchRepositoryResult, FetchError> {
+    let cli_prune_refspec = branch.clone();
+
     if single_branch {
         if let Some(requested) = branch.as_deref() {
             parse_fetch_refspec(requested, &remote_config.name)?;
@@ -2617,6 +2619,7 @@ async fn fetch_repository_with_result_reusing(
                 &prune_branch_names,
                 &discovery.refs,
                 true,
+                cli_prune_refspec.as_deref(),
             )
             .await?
         } else {
@@ -2658,6 +2661,7 @@ async fn fetch_repository_with_result_reusing(
                 &prune_branch_names,
                 &discovery.refs,
                 false,
+                cli_prune_refspec.as_deref(),
             )
             .await?
         } else {
@@ -2940,6 +2944,7 @@ async fn fetch_repository_with_result_reusing(
             &prune_branch_names,
             &discovery.refs,
             false,
+            cli_prune_refspec.as_deref(),
         )
         .await?
     } else {
@@ -4702,10 +4707,22 @@ pub(crate) fn resolve_remote_default_branch(
 /// entry (`<old> -> 0…0`) recorded **inside a single transaction**: a failure
 /// part-way through rolls back every deletion, so the repository never ends up
 /// in a partially-pruned state.
+fn refspec_pattern_matches(pattern: &str, reference_name: &str) -> bool {
+    match pattern.split_once('*') {
+        Some((prefix, suffix)) => {
+            reference_name.len() >= prefix.len() + suffix.len()
+                && reference_name.starts_with(prefix)
+                && reference_name.ends_with(suffix)
+        }
+        None => pattern == reference_name,
+    }
+}
+
 async fn prune_stale_remote_refs(
     remote_name: &str,
     remote_branch_names: &HashSet<String>,
     dry_run: bool,
+    cli_refspec: Option<&str>,
 ) -> Result<Vec<FetchPruneEntry>, FetchError> {
     let local = Branch::list_branches_result(Some(remote_name))
         .await
@@ -4715,6 +4732,15 @@ async fn prune_stale_remote_refs(
             ),
         })?;
 
+    // A command-line refspec restricts which local refs may be pruned: only the
+    // ones its destination pattern covers. A refspec without a destination (a
+    // bare branch name) prunes nothing (Git semantics).
+    let destination = cli_refspec.map(|spec| {
+        spec.strip_prefix('+')
+            .unwrap_or(spec)
+            .split_once(':')
+            .map(|(_, destination)| destination.to_string())
+    });
     let pruned: Vec<FetchPruneEntry> =
         classify_stale_tracking_branches(remote_name, remote_branch_names, &local)
             .into_iter()
@@ -4728,6 +4754,11 @@ async fn prune_stale_remote_refs(
                     branch: entry.branch,
                     old_oid,
                 }
+            })
+            .filter(|entry: &FetchPruneEntry| match &destination {
+                Some(Some(pattern)) => refspec_pattern_matches(pattern, &entry.remote_ref),
+                Some(None) => false,
+                None => true,
             })
             .collect();
 
@@ -4791,6 +4822,7 @@ async fn prune_after_fetch(
     remote_branch_names: &HashSet<String>,
     advertised: &[DiscRef],
     dry_run: bool,
+    cli_refspec: Option<&str>,
 ) -> Result<Vec<FetchPruneEntry>, FetchError> {
     let specs = configured_fetch_refspecs(remote_name).await?;
     if specs
@@ -4806,7 +4838,7 @@ async fn prune_after_fetch(
             .collect::<HashSet<_>>();
         prune_stale_mirror_refs(&live, dry_run).await
     } else {
-        prune_stale_remote_refs(remote_name, remote_branch_names, dry_run).await
+        prune_stale_remote_refs(remote_name, remote_branch_names, dry_run, cli_refspec).await
     }
 }
 
