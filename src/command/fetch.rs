@@ -1322,7 +1322,7 @@ pub async fn execute_safe(args: FetchArgs, output: &OutputConfig) -> CliResult<(
     if porcelain {
         render_fetch_porcelain(&result, output)
     } else {
-        render_fetch_output(&result, output, dry_run || !no_write_fetch_head)
+        render_fetch_output(&result, output, dry_run, !no_write_fetch_head)
     }
 }
 
@@ -1677,7 +1677,8 @@ async fn run_fetch(args: FetchArgs, output: &OutputConfig) -> CliResult<FetchOut
 fn render_fetch_output(
     result: &FetchOutput,
     output: &OutputConfig,
-    show_fetch_head_plan: bool,
+    dry_run: bool,
+    write_fetch_head: bool,
 ) -> CliResult<()> {
     if output.is_json() {
         return emit_json_data("fetch", result, output);
@@ -1697,7 +1698,7 @@ fn render_fetch_output(
         .remotes
         .iter()
         .all(|remote| remote.refs_updated.is_empty() && remote.pruned.is_empty());
-    if nothing_to_report {
+    if nothing_to_report && !dry_run {
         return Ok(());
     }
 
@@ -1727,16 +1728,7 @@ fn render_fetch_output(
         // Refs written only to `FETCH_HEAD` (no local destination) are reported
         // as ` * branch <src> -> FETCH_HEAD` (ADR-FP-05).
         for record in &remote.fetch_head_records {
-            let short = record
-                .source_ref
-                .rsplit('/')
-                .next()
-                .unwrap_or(record.source_ref.as_str());
-            let has_local_target = remote
-                .refs_updated
-                .iter()
-                .any(|update| update.remote_ref.ends_with(&format!("/{short}")));
-            if has_local_target || !show_fetch_head_plan {
+            if !write_fetch_head {
                 continue;
             }
             writeln!(

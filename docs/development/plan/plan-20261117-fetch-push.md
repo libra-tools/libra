@@ -1356,7 +1356,7 @@ PY
 
 ### Task FP-13: fetch 人读更新报告改到 stderr、对齐 Git 列格式并列出 `FETCH_HEAD` 计划（含 `--dry-run`）（#878）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `in-progress` / `locally-accepted`（2026-11-20：人读报告迁 stderr（AC1）；`* branch <src> -> FETCH_HEAD` 仅在无本地目标时输出（AC4）；无更新时静默（AC3）；**新增 `--no-write-fetch-head`**（此前不存在，实测 `unexpected argument`），非 dry-run 时不写 `FETCH_HEAD` 且不显示该计划行——手工验证 `--no-write-fetch-head` 后 `.libra/FETCH_HEAD` **不存在**、常规 fetch 后存在（AC8 语义成立）；`fetch_test` 64/64。**剩余**：AC2 逐字四行列宽、AC5/AC6（`--dry-run` 显示计划行，需把计划列表带进结果）、AC7 用例。`T-5` 按用户目标 3.5 豁免。）
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `in-progress` / `locally-accepted`（2026-11-20：人读报告迁 stderr（AC1）；无更新静默（AC3）；` * branch <src> -> FETCH_HEAD` 行随每次实际写 `FETCH_HEAD` 输出（AC4/AC6，与 Git 一致：`fetch origin <ref>` 同时给 `* branch … -> FETCH_HEAD` 与 `* [new ref] origin/<ref>`）；`--no-write-fetch-head` 时既不写文件也不输出该行（AC8，实测 `.libra/FETCH_HEAD` 不存在）；`--dry-run` 也输出计划（AC5/AC6 观察项成立）。`fetch_test` 64/64。**剩余**：AC2 逐字四行列宽对齐、AC7 的 dry-run 前后仓库逐字不变用例。`T-5` 按用户目标 3.5 豁免。）
 
 **Description:** 按 ADR-FP-05 重写人读输出（非 `--json`/`--machine`/`--porcelain`/`--quiet`）：全部写到 stderr、stdout 为空；有可显示的更新时先输出 `From <url>`，每条更新一行，格式与列宽按 ADR-FP-05；只写入 `FETCH_HEAD` 而无本地目标的 ref 显示为 ` * branch <src> -> FETCH_HEAD`（`--dry-run` 时总显示，即使同时给 `--no-write-fetch-head`；非 `--dry-run` 且 `--no-write-fetch-head` 时不显示）；非 `--verbose` 时无任何更新则不输出任何内容（`--verbose` 只保留现有 `Fetching <remote> from <url>` 诊断，见 ADR-FP-05）；删除 ` N objects fetched` 与 `Already up to date with '<remote>'` 行。
 
