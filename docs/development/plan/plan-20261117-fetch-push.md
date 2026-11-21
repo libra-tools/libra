@@ -1356,7 +1356,7 @@ PY
 
 ### Task FP-13: fetch 人读更新报告改到 stderr、对齐 Git 列格式并列出 `FETCH_HEAD` 计划（含 `--dry-run`）（#878）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `in-progress` / `locally-accepted`（2026-11-20：人读渲染已从 stdout 迁到 stderr（`render_fetch_output`），`--porcelain`/`--json`/`--machine` 仍走 stdout；`fetch_test` 全模块 **64/64 通过**，证明无既有断言依赖人读 stdout；版本面 patch 0.30.220 → 0.30.221。**剩余**：ADR-FP-05 的列宽规则与「仅写 `FETCH_HEAD` 的 ref 显示 ` * branch <src> -> FETCH_HEAD`」（含 `--dry-run` 总显示、非 dry-run 且 `--no-write-fetch-head` 不显示）尚未实现，故本卡保持 `in-progress`。`T-5` 全量门按用户目标 3.5 豁免。）
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `in-progress` / `locally-accepted`（2026-11-20：人读报告已迁到 stderr（`--porcelain`/`--json`/`--machine` 保持 stdout），并新增 ` * branch            <src> -> FETCH_HEAD` 行；`fetch_test` **64/64 通过**；手工实测 `libra fetch origin refs/heads/extra2` 输出 ` * branch            refs/heads/extra2 -> FETCH_HEAD` 与 ` * [new ref] origin/extra2`。版本面 0.30.221。**剩余**：ADR-FP-05 要求该行只在「无本地目标」时出现（当前对带 tracking 目标的 refspec 也会输出），以及列宽/`--dry-run`/`--no-write-fetch-head` 细则；`T-5` 全量门按用户目标 3.5 豁免。）
 
 **Description:** 按 ADR-FP-05 重写人读输出（非 `--json`/`--machine`/`--porcelain`/`--quiet`）：全部写到 stderr、stdout 为空；有可显示的更新时先输出 `From <url>`，每条更新一行，格式与列宽按 ADR-FP-05；只写入 `FETCH_HEAD` 而无本地目标的 ref 显示为 ` * branch <src> -> FETCH_HEAD`（`--dry-run` 时总显示，即使同时给 `--no-write-fetch-head`；非 `--dry-run` 且 `--no-write-fetch-head` 时不显示）；非 `--verbose` 时无任何更新则不输出任何内容（`--verbose` 只保留现有 `Fetching <remote> from <url>` 诊断，见 ADR-FP-05）；删除 ` N objects fetched` 与 `Already up to date with '<remote>'` 行。
 

@@ -1704,6 +1704,17 @@ fn render_fetch_output(result: &FetchOutput, output: &OutputConfig) -> CliResult
             continue;
         }
 
+        // Refs written only to `FETCH_HEAD` (no local destination) are reported
+        // as ` * branch <src> -> FETCH_HEAD` (ADR-FP-05).
+        for record in &remote.fetch_head_records {
+            writeln!(
+                writer,
+                " * branch            {} -> FETCH_HEAD",
+                record.source_ref
+            )
+            .map_err(|error| CliError::io(format!("failed to write fetch output: {error}")))?;
+        }
+
         for update in &remote.refs_updated {
             let is_tag = update.remote_ref.starts_with("refs/tags/");
             let ref_name = update
