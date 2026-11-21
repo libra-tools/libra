@@ -4068,10 +4068,10 @@ fn test_clone_filter_promisor_config_and_combine() {
 
     // AC5/AC6: combine forms and differing repeats fail closed.
     for (index, spec) in [
-        "combine:blob:none+tree:1",
-        "combine:tree:1+blob:none",
         "combine:blob:none+tree:2",
+        "combine:tree:2+blob:none",
         "combine:blob:none+object:type=blob",
+        "combine:blob:none+blob:limit=1024",
     ]
     .into_iter()
     .enumerate()
@@ -4094,10 +4094,10 @@ fn test_clone_filter_promisor_config_and_combine() {
         );
     }
     for (index, pair) in [
-        ("blob:none", "tree:1"),
-        ("tree:1", "blob:none"),
-        ("blob:none", "tree:2"),
+        ("tree:1", "tree:2"),
+        ("tree:2", "blob:none"),
         ("blob:none", "object:type=blob"),
+        ("blob:none", "blob:limit=1024"),
     ]
     .into_iter()
     .enumerate()
@@ -4135,12 +4135,189 @@ fn test_clone_filter_promisor_config_and_combine() {
             ("LIBRA_TEST_UPLOAD_PACK_NO_FILTER", "1"),
         ],
     );
-    assert!(!out.status.success(), "AC7: must refuse");
+    // CL-24 rewrote this transition assertion: a remote without the capability
+    // falls back to a full clone instead of refusing.
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("LBR-UNSUPPORTED-001"),
-        "AC7: {}",
+        out.status.success(),
+        "AC7: the fallback clone succeeds: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+#[test]
+fn test_clone_combine_tree_depth_and_fallback() {
+    use crate::command::{assert_cli_success, create_committed_repo_via_cli, run_libra_command};
+
+    let src = create_committed_repo_via_cli();
+    std::fs::create_dir_all(src.path().join("sub")).expect("mkdir sub");
+    std::fs::write(src.path().join("sub/inner.txt"), "inner\n").expect("write inner");
+    assert_cli_success(
+        &run_libra_command(&["add", "sub/inner.txt"], src.path()),
+        "stage the nested file",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "add a nested directory"], src.path()),
+        "commit the nested file",
+    );
+    let source_url = format!("file://{}", src.path().display());
+    let root = tempdir().unwrap();
+
+    // Collect the source's objects, their types, and each commit's root tree.
+    let listing = run_libra_command(&["rev-list", "--objects", "--all"], src.path());
+    assert_cli_success(&listing, "list the source objects");
+    let mut commits = Vec::new();
+    let mut blobs = Vec::new();
+    let mut trees = Vec::new();
+    for line in String::from_utf8_lossy(&listing.stdout).lines() {
+        let Some(oid) = line.split_whitespace().next() else {
+            continue;
+        };
+        let kind = run_libra_command(&["cat-file", "-t", oid], src.path());
+        match String::from_utf8_lossy(&kind.stdout).trim() {
+            "commit" => commits.push(oid.to_string()),
+            "blob" => blobs.push(oid.to_string()),
+            "tree" => trees.push(oid.to_string()),
+            _ => {}
+        }
+    }
+    assert!(!commits.is_empty() && !blobs.is_empty(), "fixture kinds");
+    let mut root_trees = Vec::new();
+    for commit in &commits {
+        let out = run_libra_command(&["rev-parse", &format!("{commit}^{{tree}}")], src.path());
+        let tree = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !tree.is_empty() {
+            root_trees.push(tree);
+        }
+    }
+    assert!(!root_trees.is_empty(), "root trees");
+    let non_root_trees = trees
+        .iter()
+        .filter(|tree| !root_trees.contains(tree))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let clone_bare = |name: &str, filters: &[&str]| {
+        let dest = root.path().join(name);
+        let mut argv = vec!["clone", "--bare"];
+        for filter in filters {
+            argv.push(filter);
+        }
+        argv.push(&source_url);
+        let dest_str = dest.to_str().expect("dest").to_string();
+        argv.push(&dest_str);
+        assert_cli_success(&run_libra_command(&argv, root.path()), "bare combine clone");
+        dest
+    };
+    let exists = |repo: &std::path::Path, oid: &str| {
+        run_libra_command(&["cat-file", "-e", oid], repo)
+            .status
+            .success()
+    };
+
+    // AC1: the canonical filter value is recorded.
+    let d = clone_bare("d", &["--filter=blob:none", "--filter=tree:1"]);
+    let out = run_libra_command(&["config", "get", "remote.origin.partialclonefilter"], &d);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "combine:blob:none+tree:1",
+        "AC1"
+    );
+
+    // AC2/AC3/AC4/AC5: commits and root trees stay, deeper trees and blobs go.
+    for commit in &commits {
+        assert!(exists(&d, commit), "AC2: commit {commit}");
+    }
+    for tree in &root_trees {
+        assert!(exists(&d, tree), "AC3: root tree {tree}");
+    }
+    for tree in &non_root_trees {
+        assert!(
+            !exists(&d, tree),
+            "AC4: non-root tree {tree} must be absent"
+        );
+    }
+    for blob in &blobs {
+        assert!(!exists(&d, blob), "AC5: blob {blob} must be absent");
+    }
+
+    // AC6: the three equivalent forms produce the same object set as `d`.
+    for (index, filters) in [
+        vec!["--filter=combine:blob:none+tree:1"],
+        vec!["--filter=combine:tree:1+blob:none"],
+        vec!["--filter=tree:1", "--filter=blob:none"],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let repo = clone_bare(&format!("e{index}"), &filters);
+        for oid in commits
+            .iter()
+            .chain(root_trees.iter())
+            .chain(non_root_trees.iter())
+            .chain(blobs.iter())
+        {
+            assert_eq!(
+                exists(&repo, oid),
+                exists(&d, oid),
+                "AC6: {filters:?} must match the canonical clone for {oid}"
+            );
+        }
+    }
+
+    // AC7: without the `filter` capability every form falls back to a full clone.
+    for (index, filters) in [
+        vec!["--filter=blob:none"],
+        vec!["--filter=blob:none", "--filter=tree:1"],
+        vec!["--filter=tree:1", "--filter=blob:none"],
+        vec!["--filter=combine:blob:none+tree:1"],
+        vec!["--filter=combine:tree:1+blob:none"],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let dest = root.path().join(format!("f{index}"));
+        let mut argv = vec!["clone", "--bare"];
+        argv.extend(filters.iter().copied());
+        argv.push(&source_url);
+        let dest_str = dest.to_str().expect("dest").to_string();
+        argv.push(&dest_str);
+        let out = crate::command::run_libra_command_with_env(
+            &argv,
+            root.path(),
+            &[
+                ("LIBRA_TEST", "1"),
+                ("LIBRA_TEST_UPLOAD_PACK_NO_FILTER", "1"),
+            ],
+        );
+        assert_cli_success(&out, "AC7: fallback clone");
+        for oid in commits.iter().chain(trees.iter()).chain(blobs.iter()) {
+            assert!(exists(&dest, oid), "AC7: {filters:?} must keep {oid}");
+        }
+    }
+
+    // AC8: other combinations keep failing closed.
+    for (index, sample) in [
+        vec!["--filter=combine:blob:none+tree:2"],
+        vec!["--filter=combine:blob:none+object:type=blob"],
+        vec!["--filter=blob:none", "--filter=tree:2"],
+        vec!["--filter=blob:none", "--filter=object:type=blob"],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let dest = root.path().join(format!("g{index}"));
+        let mut argv = vec!["clone"];
+        argv.extend(sample.iter().copied());
+        argv.push(&source_url);
+        let dest_str = dest.to_str().expect("dest").to_string();
+        argv.push(&dest_str);
+        let out = run_libra_command(&argv, root.path());
+        assert!(!out.status.success(), "AC8: {sample:?} must be refused");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("LBR-UNSUPPORTED-001"),
+            "AC8: {sample:?}"
+        );
+    }
 }
 
 #[test]

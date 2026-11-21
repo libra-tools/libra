@@ -446,22 +446,33 @@ fn upload_pack_advertises_no_filter() -> bool {
 /// One `blob:none` is honoured; one `sparse:oid=` is validated but not applied;
 /// everything else (including several differing values) fails closed.
 fn normalize_clone_filter(filters: &[String]) -> Result<Option<ObjectFilter>, CloneError> {
-    let specs = filters
+    let mut specs = filters
         .iter()
-        .map(|filter| filter.trim())
+        .map(|filter| filter.trim().to_string())
         .filter(|filter| !filter.is_empty())
         .collect::<Vec<_>>();
-    match specs.as_slice() {
-        [] => Ok(None),
+    if specs.is_empty() {
+        return Ok(None);
+    }
+    // An explicit `combine:a+b` is the same request as `--filter=a --filter=b`.
+    if specs.len() == 1
+        && let Some(body) = specs[0].strip_prefix("combine:")
+    {
+        specs = body.split('+').map(str::to_string).collect();
+    }
+    specs.sort();
+    let normalized = specs.iter().map(String::as_str).collect::<Vec<_>>();
+    match normalized.as_slice() {
         ["blob:none"] => Ok(Some(ObjectFilter::BlobNone)),
+        ["blob:none", "tree:1"] => Ok(Some(ObjectFilter::BlobNoneTreeDepth1)),
         [spec] if spec.starts_with("sparse:oid=") => Ok(None),
         [spec] => Err(CloneError::UnsupportedFilter {
             filter: (*spec).to_string(),
             kind: "unsupported filter",
         }),
         _ => Err(CloneError::UnsupportedFilter {
-            filter: specs.join(" --filter="),
-            kind: "multiple --filter values",
+            filter: normalized.join("+"),
+            kind: "unsupported filter combination",
         }),
     }
 }
@@ -2269,18 +2280,16 @@ async fn clone_into_destination(
         .await;
         let _ = ConfigKv::set(&format!("remote.{remote_name}.mirror"), "true", false).await;
     }
+    // A remote that does not advertise the `filter` capability cannot be
+    // partially cloned: fall back to a full clone (Git warns and does the same)
+    // instead of promising a promisor remote that cannot serve missing objects.
+    let object_filter = if upload_pack_advertises_no_filter() {
+        None
+    } else {
+        object_filter
+    };
     if let Some(filter) = object_filter {
-        // A remote that does not advertise the `filter` capability must not be
-        // silently cloned in full (Git fails closed here too).
-        if upload_pack_advertises_no_filter() {
-            return Err(CloneError::UnsupportedFilter {
-                filter: "blob:none".to_string(),
-                kind: "remote does not advertise filter",
-            });
-        }
-        let spec = match filter {
-            ObjectFilter::BlobNone => "blob:none",
-        };
+        let spec = filter.config_value();
         let _ = ConfigKv::set(&format!("remote.{remote_name}.promisor"), "true", false).await;
         let _ = ConfigKv::set(
             &format!("remote.{remote_name}.partialclonefilter"),

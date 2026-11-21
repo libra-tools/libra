@@ -618,10 +618,7 @@ impl LocalClient {
                     )?
                 };
                 let entries = match filter {
-                    Some(filter) => entries
-                        .into_iter()
-                        .filter(|entry| filter.keeps(entry.obj_type))
-                        .collect::<Vec<_>>(),
+                    Some(filter) => apply_object_filter(entries, filter),
                     None => entries,
                 };
                 encode_entries_to_fetch_response(entries, shallow, hash_kind).await
@@ -750,10 +747,7 @@ impl LocalClient {
                     // The Libra-native fetch path does not negotiate shallow
                     // boundaries, so no `shallow` lines are emitted.
                     let all_entries = match filter {
-                        Some(filter) => all_entries
-                            .into_iter()
-                            .filter(|entry| filter.keeps(entry.obj_type))
-                            .collect::<Vec<_>>(),
+                        Some(filter) => apply_object_filter(all_entries, filter),
                         None => all_entries,
                     };
                     encode_entries_to_fetch_response(all_entries, Vec::new(), repo_hash_kind).await
@@ -1331,6 +1325,37 @@ fn empty_pack_bytes(hash_kind: HashKind) -> Vec<u8> {
         }
     }
     pack
+}
+
+/// Apply `filter` to a pack's object list.
+///
+/// Tree-depth filtering depends on the commit set, so the surviving root trees
+/// are computed from the commit entries carried by the same pack.
+fn apply_object_filter(entries: Vec<Entry>, filter: ObjectFilter) -> Vec<Entry> {
+    match filter {
+        ObjectFilter::BlobNone => entries
+            .into_iter()
+            .filter(|entry| filter.keeps(entry.obj_type))
+            .collect(),
+        ObjectFilter::BlobNoneTreeDepth1 => {
+            let mut roots = std::collections::HashSet::new();
+            for entry in &entries {
+                if entry.obj_type == ObjectType::Commit
+                    && let Ok(commit) = Commit::from_bytes(&entry.data, entry.hash)
+                {
+                    roots.insert(commit.tree_id);
+                }
+            }
+            entries
+                .into_iter()
+                .filter(|entry| match entry.obj_type {
+                    ObjectType::Blob => false,
+                    ObjectType::Tree => roots.contains(&entry.hash),
+                    _ => true,
+                })
+                .collect()
+        }
+    }
 }
 
 async fn encode_entries_to_fetch_response(

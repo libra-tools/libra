@@ -211,13 +211,28 @@ pub fn get_wire_hash_kind() -> HashKind {
 pub enum ObjectFilter {
     /// Git's `blob:none`: commits and trees only.
     BlobNone,
+    /// `blob:none` plus tree depth 1: commits and their root trees only.
+    BlobNoneTreeDepth1,
 }
 
 impl ObjectFilter {
+    /// The `remote.<name>.partialclonefilter` value this filter records.
+    pub fn config_value(self) -> &'static str {
+        match self {
+            ObjectFilter::BlobNone => "blob:none",
+            ObjectFilter::BlobNoneTreeDepth1 => "combine:blob:none+tree:1",
+        }
+    }
+
     /// Whether an object of `object_type` survives this filter.
     pub fn keeps(self, object_type: git_internal::internal::object::types::ObjectType) -> bool {
         match self {
             ObjectFilter::BlobNone => {
+                object_type != git_internal::internal::object::types::ObjectType::Blob
+            }
+            // Root trees depend on the commit set, so they are selected by
+            // `apply_object_filter`; this predicate only drops blobs.
+            ObjectFilter::BlobNoneTreeDepth1 => {
                 object_type != git_internal::internal::object::types::ObjectType::Blob
             }
         }

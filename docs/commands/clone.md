@@ -187,11 +187,15 @@ and trees only and records the promisor configuration
 (`remote.<name>.promisor=true`, `remote.<name>.partialclonefilter=blob:none`,
 `extensions.partialClone=<name>`, using the effective remote name from `-o` or
 `clone.defaultRemoteName`); a missing object is then fetched on demand from that
-promisor remote. Every other filter spec fails closed with `LBR-UNSUPPORTED-001`
-(`tree:<depth>`, `object:type=<type>`, `blob:limit=<n>`, `sparse:path=<path>`,
-`combine:...`, and a repeated `--filter` with differing values);
+promisor remote. `combine:blob:none+tree:1` (and the equivalent `--filter=tree:1 --filter=blob:none`, in either order)
+transfers commits and their root trees only, recorded as
+`remote.<name>.partialclonefilter=combine:blob:none+tree:1`. Every other filter spec fails
+closed with `LBR-UNSUPPORTED-001` (`tree:<depth>` other than 1, `object:type=<type>`,
+`blob:limit=<n>`, `sparse:path=<path>`, any other `combine:...`, and repeated `--filter`
+values that do not normalize to one of the supported forms);
 `--filter=sparse:oid=<rev>:<path>` is validated against the source but not yet
-applied. Network filter negotiation is not implemented yet. `--shallow-since`
+applied. When the source does not advertise the `filter` capability the clone falls back to a
+full clone (no promisor rows are recorded). Network filter negotiation is not implemented yet. `--shallow-since`
 and `--shallow-exclude` bound shallow history by date or excluded ref, but
 **Libra's fetch uses only `--depth` to request a new shallow cutoff**, so those two
 are accepted but **ignored, with a warning**. Without `--depth`, Libra fetches the

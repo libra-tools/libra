@@ -1489,7 +1489,7 @@ PY
 ### Task CL-24: 实现 `combine:blob:none+tree:1` 过滤传输与无能力回退（#746, #754）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `complete`（2026-11-21：`ObjectFilter` 增 `BlobNoneTreeDepth1`，`LocalClient` 新增 `apply_object_filter`（按包内 commit entry 解析根 tree 集合，只保留提交 + 根 tree，丢弃更深 tree 与全部 blob）；`normalize_clone_filter` 把 `combine:blob:none+tree:1`、`combine:tree:1+blob:none` 与 `--filter=blob:none --filter=tree:1`（任一顺序）归一为同一过滤器，配置记 `combine:blob:none+tree:1`（AC1、AC6）；其余组合继续 `LBR-UNSUPPORTED-001`（AC8）；源不广告 `filter` 能力时按 Git 语义回退完整克隆、不写 promisor 行（AC7，改写 CL-13 过渡断言）。用例 `test_clone_combine_tree_depth_and_fallback` 覆盖 AC1–AC8（提交/根 tree 存在、非根 tree 与 blob 缺失、等价形式一致、回退全量、其余拒绝）；`clone_test` **66/66**、`fetch_test` 68/68、`compat_version_surface_sync` 2/2；版本面 0.30.229 → 0.30.230；文档 EN/zh-CN/开发同步。按用户 2026-11-20 指令在 `main` 直接提交推送。）
 **Description:** 自 `CL-13` 拆出：在 `local_client.rs`、`fetch.rs`、`protocol/mod.rs` 与 `clone.rs` 应用 `combine:blob:none+tree:1` 树深过滤（仅下载根 tree 与 commits；显式 `combine:` 的两种顺序与重复 `--filter` 的两种顺序都按该组合处理，其余组合持续以 `LBR-UNSUPPORTED-001` 拒绝，AC8，`DEFER-CL-10`），并实现远端未广告 `filter` 能力时的安全回退全量克隆（`blob:none` 与本卡组合形式均适用，AC7；是否输出 Git 式回退警告不属本卡契约，本卡不承诺其文案）；同卡改写 `CL-13` 测试的 AC5–AC7 过渡断言（`CL-12` 对无效 `sparse:` 与 AC5 样本表（单独 `tree:<n>`、`object:type=`、`blob:limit=`）的拒绝断言保留：本卡只接受与 `blob:none` 组合的 `tree:1`，见 `DEFER-CL-10`）。（按 G-09 拆出 `CL-29` 承接 `sparse:oid` 过滤与预期缺失对象边界。）
 **Out of scope:** promisor 配置写入（`CL-13`）；`Receiving objects` 进度与端到端 `cat-file` 验证（`CL-21`）。
 **Current evidence:**
