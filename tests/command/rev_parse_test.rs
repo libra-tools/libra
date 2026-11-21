@@ -1801,3 +1801,39 @@ fn test_rev_parse_resolves_describe_suffix() {
         "AC3: the literal branch wins"
     );
 }
+
+#[test]
+fn describe_suffix_missing_and_ambiguous() {
+    use crate::command::{assert_cli_success, run_libra_command};
+
+    let repo = tempfile::tempdir().expect("repo");
+    let p = repo.path();
+    assert_cli_success(&run_libra_command(&["init"], p), "init");
+    run_libra_command(&["config", "set", "user.name", "t"], p);
+    run_libra_command(&["config", "set", "user.email", "t@t"], p);
+    std::fs::write(p.join("f.txt"), "one\n").expect("write f");
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], p), "stage");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c1", "--no-verify"], p),
+        "commit c1",
+    );
+    let c1 = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], p).stdout)
+        .trim()
+        .to_string();
+
+    let fails = |spec: &str, label: &str| {
+        let out = run_libra_command(&["rev-parse", spec], p);
+        assert!(!out.status.success(), "{label}: '{spec}' must fail");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("LBR-CLI-003"),
+            "{label}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+
+    // AC1/AC2/AC6/AC7: missing, non-hex and too-short suffixes all fail.
+    fails("x-1-g00000000", "AC1");
+    fails("x-1-g0000000000000000000000000000000000000000", "AC2");
+    fails("x-1-gzzzzzzzz", "AC6");
+    fails(&format!("x-1-g{}", &c1[..3]), "AC7");
+}

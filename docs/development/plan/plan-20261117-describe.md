@@ -689,7 +689,7 @@
 
 ### Task DESC-09b: 后缀 OID 的无效、缺失与歧义按 Git 语义处理
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空` | **Priority / Selection:** P1 | **Issue:** [#798](https://github.com/libra-tools/libra/issues/798)、[#799](https://github.com/libra-tools/libra/issues/799)
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `complete`（2026-11-21：新增 `resolve_describe_hash_typed`——`<hex>` 少于 4 位、超长或含非十六进制直接 `invalid_reference`；全长 OID 变为**必须存在**（与纯十六进制路径不同）；候选去重后经纯函数 `pick_describe_candidate` 判定：唯一候选即胜出、多个候选时恰有一个 commit 则取该 commit，其余一律 `invalid_reference`（不输出歧义列表，贴近 Git `GET_OID_QUIETLY|GET_OID_COMMIT`）。用例：集成 `describe_suffix_missing_and_ambiguous` 覆盖 AC1/AC2/AC6/AC7（不存在缩写、不存在全长、非十六进制、3 位后缀均 `LBR-CLI-003`）；单测 `pick_describe_candidate_obeys_git_disambiguation` 覆盖 AC3/AC4/AC5 的判定（commit+blob→commit、两个 commit→失败、两个 blob→失败、单候选→胜出）。`rev_parse_test` **52/52**、util 单测通过；文档 EN/zh-CN 同步；版本面 0.30.262 → 0.30.263。本卡为 `REL-DESC-09` 子卡 2/16，只本地签名提交。按用户 2026-11-20 指令在 `main` 直接提交推送。） | **Priority / Selection:** P1 | **Issue:** [#798](https://github.com/libra-tools/libra/issues/798)、[#799](https://github.com/libra-tools/libra/issues/799)
 
 **Description:** 自 `DESC-09` 拆出；家族 `REL-DESC-09` 子卡（2/16）。按 `ADR-DESC-03` ② 为 describe 后缀 helper 实现 Git `GET_OID_QUIETLY | GET_OID_COMMIT` 语义：`<hex>` 含非十六进制字符或少于 4 位时经既有 `resolve_hash_atom_typed` 以 `LBR-CLI-003` 失败；后缀缩写/全长对象不存在时以 `InvalidReference`（`LBR-CLI-003`）失败（全长后缀须校验存在性，不同于纯 40 位十六进制）；歧义前缀中恰有一个 commit 候选时返回该 commit；其余歧义以 `LBR-CLI-003` 失败（实现上返回 `InvalidReference`、不输出候选提示以贴近 Git；提示文案不设判据）。不改变字面引用优先与 commit 放行范围。
 

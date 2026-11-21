@@ -2507,10 +2507,87 @@ async fn resolve_object_atom_typed(name: &str) -> Result<ResolvedAtom, CommitBas
     // Git's describe suffix (`<ref>-<count>-g<hex>`): the literal lookups above
     // win, then the trailing object id names the commit (ADR-DESC-03).
     if let Some((_base, _count, hash)) = split_describe_name(name) {
-        return resolve_hash_atom_typed(&hash).await;
+        return resolve_describe_hash_typed(&hash, name).await;
     }
 
     resolve_hash_atom_typed(name).await
+}
+
+/// Resolve the trailing object id of a describe name.
+///
+/// Git looks it up with `GET_OID_QUIETLY | GET_OID_COMMIT`: an abbreviated id
+/// must be unambiguous UNLESS exactly one candidate is a commit (that commit
+/// wins), a full-length id must actually exist, and nothing produces an
+/// ambiguity listing — every failure is a plain invalid reference.
+async fn resolve_describe_hash_typed(
+    hash: &str,
+    display_name: &str,
+) -> Result<ResolvedAtom, CommitBaseError> {
+    let hash_kind = git_internal::hash::get_hash_kind();
+    let expected_len = hash_kind.hex_len();
+    if hash.len() < 4
+        || hash.len() > expected_len
+        || !hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(invalid_reference(display_name));
+    }
+
+    let storage = objects_storage()?;
+    let mut matches = if hash.len() == expected_len {
+        // A full id is NOT trusted blindly on this path: it must exist.
+        let object_id = crate::internal::object_format::parse_repo_oid(hash)
+            .map_err(|_| invalid_reference(display_name))?;
+        if storage.get_object_type(&object_id).is_err() {
+            return Err(invalid_reference(display_name));
+        }
+        vec![object_id]
+    } else {
+        storage.search_result(hash).await.map_err(|error| {
+            CommitBaseError::classify_storage_failure(format!(
+                "failed to search objects while resolving '{display_name}': {error}"
+            ))
+        })?
+    };
+    matches.retain(|object_id| object_id.kind() == hash_kind);
+    matches.sort_unstable();
+    matches.dedup();
+
+    if matches.is_empty() {
+        return Err(invalid_reference(display_name));
+    }
+    let mut typed = Vec::with_capacity(matches.len());
+    for object_id in matches {
+        typed.push((
+            object_id,
+            object_type_typed(&storage, &object_id, display_name)?,
+        ));
+    }
+    pick_describe_candidate(&typed)
+        .map(|object_id| ResolvedAtom {
+            object_id,
+            reflog_ref: None,
+        })
+        .ok_or_else(|| invalid_reference(display_name))
+}
+
+/// Git's `GET_OID_COMMIT` disambiguation for a describe suffix.
+///
+/// A single candidate always wins; with several, exactly one commit resolves
+/// and anything else fails (no ambiguity listing on this path).
+fn pick_describe_candidate(candidates: &[(ObjectHash, ObjectType)]) -> Option<ObjectHash> {
+    match candidates {
+        [(object_id, _)] => Some(*object_id),
+        _ => {
+            let commits = candidates
+                .iter()
+                .filter(|(_, object_type)| *object_type == ObjectType::Commit)
+                .collect::<Vec<_>>();
+            match commits.as_slice() {
+                [(object_id, _)] => Some(*object_id),
+                _ => None,
+            }
+        }
+    }
 }
 
 /// Split a Git describe name `<ref>-<count>-g<hex>` into its parts.
@@ -4292,6 +4369,41 @@ pub fn is_valid_refname(refname: &str) -> bool {
 #[cfg(test)]
 mod test {
     use std::{env, fs, path::PathBuf};
+
+    #[test]
+    fn pick_describe_candidate_obeys_git_disambiguation() {
+        use git_internal::{
+            hash::{HashKind, set_hash_kind},
+            internal::object::types::ObjectType,
+        };
+
+        set_hash_kind(HashKind::Sha1);
+        let commit = |digit: char| {
+            git_internal::hash::ObjectHash::from_bytes(&[digit.to_digit(16).unwrap_or(0) as u8; 20])
+                .expect("hash")
+        };
+        let a = commit('a');
+        let b = commit('b');
+        let c = commit('c');
+
+        // AC3: one commit among a commit+blob pair resolves to the commit.
+        assert_eq!(
+            pick_describe_candidate(&[(a, ObjectType::Commit), (b, ObjectType::Blob)]),
+            Some(a)
+        );
+        // AC4: two commits are ambiguous.
+        assert_eq!(
+            pick_describe_candidate(&[(a, ObjectType::Commit), (b, ObjectType::Commit)]),
+            None
+        );
+        // AC5: two blobs are ambiguous.
+        assert_eq!(
+            pick_describe_candidate(&[(a, ObjectType::Blob), (b, ObjectType::Blob)]),
+            None
+        );
+        // A single candidate of any type resolves.
+        assert_eq!(pick_describe_candidate(&[(c, ObjectType::Blob)]), Some(c));
+    }
 
     use git_internal::internal::object::{
         signature::{Signature, SignatureType},
