@@ -520,7 +520,7 @@ PY
 
 ### Task FP-03: 支持 `remote.<name>.push` 配置 refspec 与仅指定仓库的 `libra push <remote>`（#683）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `complete`（2026-11-21：`execute_safe` 在未给 refspec/`--tags`/`--mirror` 且给出 `<repository>` 时，用新增 `configured_push_refspecs` 读取 `remote.<name>.push` 全部值（配置顺序）填入 `args.refspecs`，随后走 FP-04 的同一引擎（通配符与负向 refspec 一并生效）；命令行 refspec 优先、完全忽略配置；两者都没有时保持 `repository-only push requires a refspec, --tags, or --mirror`（`LBR-CLI-002`，Git 按 `push.default` 回落为有意差异）。用例 `test_push_repository_only_uses_configured_refspecs` 覆盖 AC1–AC5（单值、两值按序、配置通配映射、配置负向排除、命令行 refspec 覆盖配置）。`push` 套件 **38/38**；版本面 0.30.243 → 0.30.244；文档 EN/zh-CN 同步。按用户 2026-11-20 指令在 `main` 直接提交推送。）
 
 **Description:** `libra push <remote>` 未给命令行 refspec、`--tags`、`--mirror` 时读取 `remote.<remote>.push` 全部值（按配置写入顺序），经 `FP-04` 的同一 refspec 引擎展开（含通配符与负向）后推送；命令行给出 refspec 时完全忽略该配置；未配置时保持现有 `repository-only push requires a refspec, --tags, or --mirror` 拒绝（`LBR-CLI-002`，Git 此时按 `push.default` 回落，属已登记的有意差异）。
 

@@ -3304,3 +3304,153 @@ fn test_push_prune_wildcards_and_negative_refspecs() {
     assert_cli_success(&out, "AC6: dry-run prune");
     assert_eq!(refs(&three6), before, "AC6: nothing changed");
 }
+
+#[test]
+fn test_push_repository_only_uses_configured_refspecs() {
+    use crate::command::{assert_cli_success, run_libra_command};
+
+    // Source `s` with `main` (M2) and `topic` (M1), plus a fresh bare target per
+    // AC (each AC configures its own remote so the values never collide).
+    let work = tempfile::tempdir().expect("work dir");
+    let s = work.path().join("s");
+    std::fs::create_dir_all(&s).expect("mkdir s");
+    assert_cli_success(&run_libra_command(&["init"], &s), "init s");
+    run_libra_command(&["config", "set", "user.name", "t"], &s);
+    run_libra_command(&["config", "set", "user.email", "t@t"], &s);
+    std::fs::write(s.join("f.txt"), "x\n").expect("write f");
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], &s), "stage f");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "m1", "--no-verify"], &s),
+        "commit m1",
+    );
+    let m1 = {
+        let out = run_libra_command(&["rev-parse", "HEAD"], &s);
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    assert_cli_success(&run_libra_command(&["branch", "topic"], &s), "create topic");
+    std::fs::write(s.join("f.txt"), "y\n").expect("modify f");
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], &s), "stage m2");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "m2", "--no-verify"], &s),
+        "commit m2",
+    );
+    let m2 = {
+        let out = run_libra_command(&["rev-parse", "HEAD"], &s);
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+
+    let refs = |repo: &std::path::Path| {
+        run_libra_command(&["show-ref"], repo)
+            .stdout
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| String::from_utf8_lossy(line).to_string())
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    // A fresh bare target plus a remote pointing at it.
+    let target = |name: &str| {
+        let path = work.path().join(name);
+        assert_cli_success(
+            &run_libra_command(&["init", "--bare", name], work.path()),
+            "init target",
+        );
+        assert_cli_success(
+            &run_libra_command(&["remote", "add", name, path.to_str().expect("target")], &s),
+            "add remote",
+        );
+        path
+    };
+    let set_push = |remote: &str, values: &[&str]| {
+        let key = format!("remote.{remote}.push");
+        for (index, value) in values.iter().enumerate() {
+            let mut argv: Vec<&str> = vec!["config", "set"];
+            if index > 0 {
+                argv.push("--add");
+            }
+            argv.push(&key);
+            argv.push(value);
+            assert_cli_success(&run_libra_command(&argv, &s), "configure the push refspec");
+        }
+    };
+
+    // AC1: a single configured refspec drives `push <remote>`.
+    let o = target("o");
+    set_push("o", &["refs/heads/topic:refs/heads/published"]);
+    assert_cli_success(&run_libra_command(&["push", "o"], &s), "AC1: push o");
+    assert_eq!(
+        refs(&o),
+        [format!("{m1} refs/heads/published")]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        "AC1: published points at M1"
+    );
+
+    // AC2: both configured values are used, in configuration order.
+    let o2 = target("o2");
+    set_push(
+        "o2",
+        &[
+            "refs/heads/main:refs/heads/m1",
+            "refs/heads/topic:refs/heads/t1",
+        ],
+    );
+    assert_cli_success(&run_libra_command(&["push", "o2"], &s), "AC2: two refspecs");
+    assert_eq!(
+        refs(&o2),
+        [format!("{m2} refs/heads/m1"), format!("{m1} refs/heads/t1")]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        "AC2: both destinations landed"
+    );
+
+    // AC3: a configured wildcard mapping.
+    let o3 = target("o3");
+    set_push("o3", &["refs/heads/*:refs/heads/mirror/*"]);
+    assert_cli_success(
+        &run_libra_command(&["push", "o3"], &s),
+        "AC3: wildcard push",
+    );
+    assert_eq!(
+        refs(&o3),
+        [
+            format!("{m2} refs/heads/mirror/main"),
+            format!("{m1} refs/heads/mirror/topic"),
+        ]
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>(),
+        "AC3: the mirror namespace"
+    );
+
+    // AC4: a negative refspec from configuration.
+    let o4 = target("o4");
+    set_push(
+        "o4",
+        &["refs/heads/*:refs/heads/mirror/*", "^refs/heads/topic"],
+    );
+    assert_cli_success(
+        &run_libra_command(&["push", "o4"], &s),
+        "AC4: negative push",
+    );
+    assert_eq!(
+        refs(&o4),
+        [format!("{m2} refs/heads/mirror/main")]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        "AC4: topic was excluded"
+    );
+
+    // AC5: an explicit command-line refspec ignores the configuration.
+    let o5 = target("o5");
+    set_push("o5", &["refs/heads/topic:refs/heads/published"]);
+    assert_cli_success(
+        &run_libra_command(&["push", "o5", "main"], &s),
+        "AC5: explicit refspec",
+    );
+    assert_eq!(
+        refs(&o5),
+        [format!("{m2} refs/heads/main")]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        "AC5: only the command-line refspec was pushed"
+    );
+}

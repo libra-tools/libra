@@ -75,6 +75,13 @@ these modes warn and are not authorization for remote synchronization.
 
 ## Options
 
+A repository-only push (`libra push <remote>`) uses every `remote.<name>.push`
+value, in configuration order, through the same engine as command-line refspecs
+(wildcards and negative refspecs included). An explicit command-line refspec — or
+`--tags`/`--mirror` — ignores that configuration. Without either, a repository-only
+push is refused (`repository-only push requires a refspec, --tags, or --mirror`,
+`LBR-CLI-002`; Git falls back to `push.default` instead — an intentional difference).
+
 ### `--prune` / wildcard / negative refspecs
 
 A refspec may contain a single `*` wildcard: `refs/heads/feature/*` pushes every

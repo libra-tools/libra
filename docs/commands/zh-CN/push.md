@@ -31,6 +31,8 @@ LFS 跟踪文件会在 HTTP 推送期间透明上传，不需要单独执行 `lf
 
 ## 选项
 
+只给仓库的推送（`libra push <remote>`）会按配置写入顺序使用全部 `remote.<name>.push` 值，并与命令行 refspec 走同一引擎（支持通配符与负向 refspec）。命令行给出 refspec（或 `--tags`/`--mirror`）时完全忽略该配置；两者都没有时只给仓库的推送被拒绝（`repository-only push requires a refspec, --tags, or --mirror`，`LBR-CLI-002`；Git 此时按 `push.default` 回落，属有意差异）。
+
 ### `--prune` / 通配符 / 负向 refspec
 
 refspec 可含单个 `*` 通配符：`refs/heads/feature/*` 把每个匹配的本地分支推到同名远端引用，`refs/heads/ours/*:refs/heads/theirs/*` 把每个匹配映射到目标模式。负向 refspec（`^refs/heads/feature/wip`，精确或通配）在源侧与映射后的目标侧排除匹配项。

@@ -905,6 +905,16 @@ pub async fn execute_safe(args: PushArgs, output: &OutputConfig) -> CliResult<()
     )
     .map_err(CliError::from)?;
 
+    // `remote.<name>.push` supplies the refspecs for a repository-only push;
+    // explicit command-line refspecs (or `--tags`/`--mirror`) win outright.
+    if args.refspecs.is_empty()
+        && !args.tags
+        && !args.mirror
+        && let Some(repository) = args.repository.clone()
+    {
+        args.refspecs = configured_push_refspecs(&repository).await;
+    }
+
     validate_push_args(&args).map_err(CliError::from)?;
 
     // `--porcelain` is mutually exclusive with any JSON mode. The global
@@ -963,6 +973,21 @@ fn apply_delete_flag(
             }
         })
         .collect()
+}
+
+/// Every `remote.<name>.push` value, in configuration order.
+async fn configured_push_refspecs(remote: &str) -> Vec<String> {
+    let prefix = format!("remote.{remote}.");
+    crate::internal::config::ConfigKv::get_var_all_case_insensitive(&prefix, "push")
+        .await
+        .map(|entries| {
+            entries
+                .into_iter()
+                .filter(|entry| !entry.value.trim().is_empty())
+                .map(|entry| entry.value)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn validate_push_args(args: &PushArgs) -> Result<(), PushError> {
