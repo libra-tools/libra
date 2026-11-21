@@ -271,6 +271,11 @@ where
 /// `load_object` is synchronous, so the async fetch runs on a dedicated
 /// runtime thread. Under `LIBRA_TEST=1` the seam line
 /// `libra-test: lazy-fetch want=<n>` is written to stderr.
+/// Try the promisor lazy fetch for `hash`; returns `true` when it landed.
+pub(crate) fn try_lazy_fetch_object(hash: &ObjectHash) -> bool {
+    lazy_fetch_missing_object(hash).is_some()
+}
+
 fn lazy_fetch_missing_object(hash: &ObjectHash) -> Option<Vec<u8>> {
     if matches!(
         crate::utils::read_policy::read_policy(),

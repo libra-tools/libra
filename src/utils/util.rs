@@ -2168,11 +2168,23 @@ fn validate_referenced_object(
     expected_type: Option<ObjectType>,
 ) -> Result<ObjectHash, CommitBaseError> {
     let object_id = ensure_hash_kind(object_id, display_name, true)?;
-    let actual_type = storage.get_object_type(&object_id).map_err(|error| {
-        CommitBaseError::classify_storage_failure(format!(
-            "reference '{display_name}' points to unreadable object {object_id}: {error}"
-        ))
-    })?;
+    let actual_type = storage
+        .get_object_type(&object_id)
+        .or_else(|error| {
+            // Promisor clones fetch a missing object on demand.
+            if matches!(error, GitError::ObjectNotFound(_))
+                && crate::command::try_lazy_fetch_object(&object_id)
+            {
+                storage.get_object_type(&object_id)
+            } else {
+                Err(error)
+            }
+        })
+        .map_err(|error| {
+            CommitBaseError::classify_storage_failure(format!(
+                "reference '{display_name}' points to unreadable object {object_id}: {error}"
+            ))
+        })?;
     if let Some(expected_type) = expected_type
         && actual_type != expected_type
     {

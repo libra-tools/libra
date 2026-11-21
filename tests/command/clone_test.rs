@@ -3820,6 +3820,66 @@ fn clone_reference_borrows_every_object() {
 }
 
 #[test]
+fn clone_promisor_lazy_fetches_a_missing_object() {
+    use crate::command::{
+        assert_cli_success, create_committed_repo_via_cli, run_libra_command,
+        run_libra_command_with_env,
+    };
+
+    let src = create_committed_repo_via_cli();
+    let root = tempdir().unwrap();
+    let clone = |dir: &str| {
+        let dest = root.path().join(dir);
+        assert_cli_success(
+            &run_libra_command(
+                &[
+                    "clone",
+                    "--no-local",
+                    &format!("file://{}", src.path().display()),
+                    dest.to_str().expect("dest"),
+                ],
+                root.path(),
+            ),
+            "clone --no-local",
+        );
+        assert_cli_success(
+            &run_libra_command(
+                &["config", "set", "extensions.partialClone", "origin"],
+                &dest,
+            ),
+            "mark the clone as partial",
+        );
+        // Empty the local object store: every object is remote now.
+        let packs = dest.join(".libra/objects/pack");
+        if packs.is_dir() {
+            for entry in std::fs::read_dir(&packs).expect("read the pack dir") {
+                let path = entry.expect("pack entry").path();
+                let _ = std::fs::remove_file(path);
+            }
+        }
+        dest
+    };
+
+    // AC1/AC2/AC4: the read fetches the closure on demand, once, and persists it.
+    let d = clone("d");
+    let env: &[(&str, &str)] = &[("LIBRA_TEST", "1")];
+    let out = run_libra_command_with_env(&["cat-file", "-p", "HEAD:tracked.txt"], &d, env);
+    assert_cli_success(&out, "AC1: cat-file through the promisor remote");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let lazy_lines = stderr
+        .lines()
+        .filter(|line| line.starts_with("libra-test: lazy-fetch"))
+        .count();
+    assert_eq!(lazy_lines, 1, "AC2: exactly one lazy fetch: {stderr}");
+    assert!(
+        run_libra_command(&["cat-file", "-p", "HEAD:tracked.txt"], &d)
+            .status
+            .success(),
+        "AC4: the fetched objects are persisted"
+    );
+}
+
+#[test]
 fn test_clone_reject_shallow_local_git_source() {
     use super::{create_linear_git_repo, git_success, run_libra_command};
 
