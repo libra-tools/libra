@@ -714,6 +714,11 @@ pub struct FetchArgs {
     #[clap(long = "dry-run")]
     pub dry_run: bool,
 
+    /// Do not write `FETCH_HEAD` after the fetch, matching
+    /// `git fetch --no-write-fetch-head`.
+    #[clap(long = "no-write-fetch-head")]
+    pub no_write_fetch_head: bool,
+
     /// Append fetched ref records to `.libra/FETCH_HEAD` instead of overwriting
     /// it. Long-only: `-a` is reserved for `--all` (Git's `-a` is `--append`).
     #[clap(long)]
@@ -1303,9 +1308,10 @@ pub async fn execute_safe(args: FetchArgs, output: &OutputConfig) -> CliResult<(
     let porcelain = args.porcelain;
     let dry_run = args.dry_run;
     let append = args.append;
+    let no_write_fetch_head = args.no_write_fetch_head;
     let result = run_fetch(args, output).await?;
     // FETCH_HEAD records the fetched refs; `--dry-run` writes nothing.
-    if !dry_run {
+    if !dry_run && !no_write_fetch_head {
         write_fetch_head(&result, append).map_err(CliError::from)?;
     }
     // FETCH_HEAD (the fetch's last root record) has landed — release each
@@ -1316,7 +1322,7 @@ pub async fn execute_safe(args: FetchArgs, output: &OutputConfig) -> CliResult<(
     if porcelain {
         render_fetch_porcelain(&result, output)
     } else {
-        render_fetch_output(&result, output)
+        render_fetch_output(&result, output, dry_run || !no_write_fetch_head)
     }
 }
 
@@ -1451,6 +1457,7 @@ async fn run_fetch(args: FetchArgs, output: &OutputConfig) -> CliResult<FetchOut
         all,
         depth,
         dry_run,
+        no_write_fetch_head: _,
         append: _,
         verbose,
         porcelain: _,
@@ -1667,7 +1674,11 @@ async fn run_fetch(args: FetchArgs, output: &OutputConfig) -> CliResult<FetchOut
     })
 }
 
-fn render_fetch_output(result: &FetchOutput, output: &OutputConfig) -> CliResult<()> {
+fn render_fetch_output(
+    result: &FetchOutput,
+    output: &OutputConfig,
+    show_fetch_head_plan: bool,
+) -> CliResult<()> {
     if output.is_json() {
         return emit_json_data("fetch", result, output);
     }
@@ -1725,7 +1736,7 @@ fn render_fetch_output(result: &FetchOutput, output: &OutputConfig) -> CliResult
                 .refs_updated
                 .iter()
                 .any(|update| update.remote_ref.ends_with(&format!("/{short}")));
-            if has_local_target {
+            if has_local_target || !show_fetch_head_plan {
                 continue;
             }
             writeln!(

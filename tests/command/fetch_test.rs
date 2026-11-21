@@ -2310,6 +2310,7 @@ fn local_fetch_args(repository: &str, prune: bool, dry_run: bool) -> fetch::Fetc
         all: false,
         depth: None,
         dry_run,
+        no_write_fetch_head: false,
         append: false,
         verbose: false,
         porcelain: false,
