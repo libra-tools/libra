@@ -455,6 +455,96 @@ fn unsupported_object_filter(filter: &str) -> Option<&'static str> {
     Some("unknown filter")
 }
 
+/// Validate a `sparse:oid=<rev>:<path>` filter against a local Libra source.
+fn validate_sparse_oid_filter(
+    remote_client: &fetch::RemoteClient,
+    discovery: &DiscoveryResult,
+    spec: &str,
+    filter: &str,
+) -> Result<(), CloneError> {
+    let fetch::RemoteClient::Local(client) = remote_client else {
+        return Ok(());
+    };
+    if !client.is_libra_source() {
+        return Ok(());
+    }
+    let (rev, path) = match spec.split_once(':') {
+        Some((rev, path)) => (rev, path),
+        None => (spec, ""),
+    };
+    if path.is_empty() {
+        return Err(CloneError::SparseFilterInvalid {
+            filter: filter.to_string(),
+        });
+    }
+    let commit_oid = discovery
+        .refs
+        .iter()
+        .find(|reference| {
+            reference._ref == rev
+                || reference._ref == format!("refs/heads/{rev}")
+                || reference._ref == format!("refs/tags/{rev}")
+        })
+        .and_then(|reference| crate::internal::object_format::parse_repo_oid(&reference._hash).ok())
+        .ok_or_else(|| CloneError::SparseBlobUnreadable {
+            filter: filter.to_string(),
+        })?;
+    let storage = crate::utils::client_storage::ClientStorage::try_init_local(
+        client.repo_path().join("objects"),
+    )
+    .map_err(|_| CloneError::SparseBlobUnreadable {
+        filter: filter.to_string(),
+    })?;
+    let blob_oid = find_blob_in_commit(&storage, &commit_oid, path).map_err(|_| {
+        CloneError::SparseBlobUnreadable {
+            filter: filter.to_string(),
+        }
+    })?;
+    let bytes = storage
+        .get(&blob_oid)
+        .map_err(|_| CloneError::SparseBlobUnreadable {
+            filter: filter.to_string(),
+        })?;
+    let text = String::from_utf8_lossy(&bytes);
+    let parsed = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .all(|line| {
+            let line = line.trim();
+            line.starts_with('/') || line.starts_with('!') || !line.contains('\0')
+        });
+    if !parsed {
+        return Err(CloneError::SparseFilterInvalid {
+            filter: filter.to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Resolve `<path>` inside the commit's tree, returning the blob id.
+fn find_blob_in_commit(
+    storage: &crate::utils::client_storage::ClientStorage,
+    commit_oid: &git_internal::hash::ObjectHash,
+    path: &str,
+) -> Result<git_internal::hash::ObjectHash, String> {
+    use git_internal::internal::object::{ObjectTrait, commit::Commit, tree::Tree};
+    let commit_bytes = storage.get(commit_oid).map_err(|error| error.to_string())?;
+    let commit =
+        Commit::from_bytes(&commit_bytes, *commit_oid).map_err(|error| error.to_string())?;
+    let mut current = commit.tree_id;
+    for component in path.trim_matches('/').split('/') {
+        let tree_bytes = storage.get(&current).map_err(|error| error.to_string())?;
+        let tree = Tree::from_bytes(&tree_bytes, current).map_err(|error| error.to_string())?;
+        let entry = tree
+            .tree_items
+            .iter()
+            .find(|item| item.name == component)
+            .ok_or_else(|| format!("'{path}' not found in the commit tree"))?;
+        current = entry.id;
+    }
+    Ok(current)
+}
+
 fn clone_fetch_option_warnings(args: &CloneArgs, local_clone: bool) -> Vec<String> {
     if local_clone {
         local_clone_ignored_option_warnings(args)
@@ -690,6 +780,10 @@ pub enum CloneError {
     HardlinkFailed { message: String },
     #[error("object filter '{filter}' is not supported ({kind})")]
     UnsupportedFilter { filter: String, kind: &'static str },
+    #[error("unable to access sparse blob in '{filter}'")]
+    SparseBlobUnreadable { filter: String },
+    #[error("unable to parse sparse filter data in '{filter}'")]
+    SparseFilterInvalid { filter: String },
     #[error(
         "refusing to clone a Mega2 traces locator with libra clone; traces history is not part of the code view"
     )]
@@ -774,6 +868,14 @@ impl From<CloneError> for CliError {
                 .with_hint(
                     "the Cloudflare publish site host was removed; clone a git remote or use `libra cloud` for repository backup.",
                 ),
+            CloneError::SparseBlobUnreadable { ref filter } => {
+                CliError::command_usage(format!("unable to access sparse blob in '{filter}'"))
+                    .with_stable_code(crate::utils::error::StableErrorCode::CliInvalidTarget)
+            }
+            CloneError::SparseFilterInvalid { ref filter } => {
+                CliError::command_usage(format!("unable to parse sparse filter data in '{filter}'"))
+                    .with_stable_code(crate::utils::error::StableErrorCode::CliInvalidTarget)
+            }
             CloneError::UnsupportedFilter { ref filter, kind } => {
                 CliError::command_usage(format!(
                     "object filter '{filter}' is not supported ({kind})"
@@ -1714,6 +1816,15 @@ async fn execute_clone_inner(
     )
     .await
     .map_err(|source| (CloneError::DiscoverRemote { source }, None))?;
+
+    // `--filter=sparse:oid=<rev>:<path>` is validated against the source before
+    // the destination exists, like Git's `list-objects-filter` setup.
+    if let Some(filter) = args.filter.as_deref()
+        && let Some(spec) = filter.trim().strip_prefix("sparse:oid=")
+        && let Err(error) = validate_sparse_oid_filter(&remote_client, &discovery, spec, filter)
+    {
+        return Err((error, None));
+    }
 
     // Inspect a local Git source's `.git/shallow` before creating the dest so
     // `--reject-shallow` and corrupt metadata leave no partial clone behind.

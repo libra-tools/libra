@@ -3924,6 +3924,57 @@ fn clone_rejects_unimplemented_object_filters() {
 }
 
 #[test]
+fn clone_validates_sparse_oid_filters() {
+    use crate::command::{assert_cli_success, create_committed_repo_via_cli, run_libra_command};
+
+    let src = create_committed_repo_via_cli();
+    let root = tempdir().unwrap();
+    let clone_filter = |filter: &str, dir: &str| {
+        let dest = root.path().join(dir);
+        run_libra_command(
+            &[
+                "clone",
+                "--no-local",
+                "--bare",
+                filter,
+                src.path().to_str().expect("src"),
+                dest.to_str().expect("dest"),
+            ],
+            root.path(),
+        )
+    };
+
+    // AC1/AC2: a missing blob is an access error with Git's wording.
+    let out = clone_filter("--filter=sparse:oid=main:no-such-name", "e1");
+    assert!(!out.status.success(), "AC1: missing sparse blob must fail");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("LBR-CLI-003"), "AC1: {stderr}");
+    assert!(
+        stderr.contains("unable to access sparse blob in"),
+        "AC2: {stderr}"
+    );
+
+    // AC3/AC4: a commit (not a blob) is a parse error.
+    let out = clone_filter("--filter=sparse:oid=main", "e2");
+    assert!(!out.status.success(), "AC3: a commit oid must fail");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("LBR-CLI-003"), "AC3: {stderr}");
+    assert!(
+        stderr.contains("unable to parse sparse filter data in"),
+        "AC4: {stderr}"
+    );
+
+    // AC6: a well-formed rule blob is accepted.
+    std::fs::write(src.path().join("only-one"), "/a.txt\n").expect("write the rule file");
+    let add = run_libra_command(&["add", "only-one"], src.path());
+    assert_cli_success(&add, "stage the rule file");
+    let commit = run_libra_command(&["commit", "-m", "add the sparse rule file"], src.path());
+    assert_cli_success(&commit, "commit the rule file");
+    let out = clone_filter("--filter=sparse:oid=main:only-one", "e3");
+    assert_cli_success(&out, "AC6: the rule blob is accepted");
+}
+
+#[test]
 fn test_clone_reject_shallow_local_git_source() {
     use super::{create_linear_git_repo, git_success, run_libra_command};
 

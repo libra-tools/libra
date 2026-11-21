@@ -2481,6 +2481,9 @@ pub(crate) async fn lazy_fetch_object(oid: &ObjectHash) -> Result<bool, FetchErr
     Ok(true)
 }
 
+// The fetch pipeline mirrors Git's option surface; the arguments are already
+// grouped by caller and splitting them into a struct would churn every caller.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn fetch_repository_with_result(
     remote_config: RemoteConfig,
     branch: Option<String>,
