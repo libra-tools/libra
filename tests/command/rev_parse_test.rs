@@ -1929,3 +1929,63 @@ fn describe_suffix_blob_and_tree_objects() {
     assert_eq!(resolve(&format!("x-1-g{}", &tree[..8])), tree, "AC3");
     assert_eq!(resolve(&format!("x-1-g{tree}")), tree, "AC4");
 }
+
+#[test]
+fn describe_suffix_inside_the_tags_namespace() {
+    use crate::command::{assert_cli_success, run_libra_command};
+
+    let repo = tempfile::tempdir().expect("repo");
+    let p = repo.path();
+    assert_cli_success(&run_libra_command(&["init"], p), "init");
+    run_libra_command(&["config", "set", "user.name", "t"], p);
+    run_libra_command(&["config", "set", "user.email", "t@t"], p);
+    std::fs::write(p.join("f.txt"), "one\n").expect("write f");
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], p), "stage");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c1", "--no-verify"], p),
+        "commit c1",
+    );
+    let c1 = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], p).stdout)
+        .trim()
+        .to_string();
+    std::fs::write(p.join("f.txt"), "two\n").expect("write f2");
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], p), "stage f2");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c2", "--no-verify"], p),
+        "commit c2",
+    );
+
+    let short = &c1[..8];
+    let resolve = |spec: &str| {
+        let out = run_libra_command(&["rev-parse", spec], p);
+        assert_cli_success(&out, "describe suffix in the tags namespace");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+
+    // AC1/AC2: a `tags/`-prefixed describe suffix resolves to the commit.
+    assert_eq!(resolve(&format!("tags/x-1-g{short}")), c1, "AC1");
+    assert_eq!(resolve(&format!("tags/x-1-g{c1}")), c1, "AC2");
+
+    // AC3: a literal tag with that exact name wins over the suffix parse.
+    assert_cli_success(
+        &run_libra_command(&["tag", "-m", "t", &format!("tlit-1-g{short}")], p),
+        "literal tag",
+    );
+    let literal = resolve(&format!("tags/tlit-1-g{short}"));
+    assert_ne!(
+        literal, c1,
+        "AC3: the literal tag wins over the suffix object"
+    );
+
+    // AC6: a local branch literally named `tags/<describe>` is found by the
+    // complete-name lookup before the suffix parse.
+    assert_cli_success(
+        &run_libra_command(&["branch", &format!("tags/dw-1-g{short}"), &c1], p),
+        "literal branch",
+    );
+    assert_eq!(
+        resolve(&format!("tags/dw-1-g{short}")),
+        c1,
+        "AC6: the complete-name branch lookup wins"
+    );
+}

@@ -2476,9 +2476,21 @@ async fn resolve_object_atom_typed(name: &str) -> Result<ResolvedAtom, CommitBas
 
     if name.starts_with("refs/tags/") || name.starts_with("tags/") {
         let canonical = name.strip_prefix("tags/").unwrap_or(name);
-        return resolve_tag_atom_typed(canonical, name)
-            .await?
-            .ok_or_else(|| invalid_reference(name));
+        if let Some(tag) = resolve_tag_atom_typed(canonical, name).await? {
+            return Ok(tag);
+        }
+        // Git resolves the complete name against the other namespaces before it
+        // treats the name as a describe suffix (`ref_rev_parse_rules`).
+        if let Some(branch) = resolve_local_branch_atom_typed(name, name).await? {
+            return Ok(branch);
+        }
+        if let Some(branch) = resolve_remote_branch_atom_typed(name, name).await? {
+            return Ok(branch);
+        }
+        if let Some((_base, _count, hash)) = split_describe_name(canonical) {
+            return resolve_describe_hash_typed(&hash, name).await;
+        }
+        return Err(invalid_reference(name));
     }
     if name.starts_with("refs/heads/") || name.starts_with("heads/") {
         let canonical = name.strip_prefix("heads/").unwrap_or(name);
