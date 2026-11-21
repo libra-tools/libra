@@ -1971,6 +1971,7 @@ async fn clone_into_destination(
     // object store as an alternate of the fresh clone so its objects can be
     // borrowed. `--reference` requires the path to exist; `--reference-if-able`
     // silently skips a missing one.
+    let mut reference_alternate = false;
     if !args.no_local {
         let mut references: Vec<PathBuf> = args
             .reference
@@ -1997,6 +1998,7 @@ async fn clone_into_destination(
                     message: format!("could not create '{}': {error}", info.display()),
                 })?;
                 let absolute = fs::canonicalize(&source_objects).unwrap_or(source_objects);
+                reference_alternate = true;
                 fs::write(info.join("alternates"), format!("{}\n", absolute.display())).map_err(
                     |error| CloneError::SetupFailed {
                         message: format!("could not register the reference alternate: {error}"),
@@ -2081,29 +2083,51 @@ async fn clone_into_destination(
         .await;
         let _ = ConfigKv::set(&format!("remote.{remote_name}.mirror"), "true", false).await;
     }
-    let fetch_result = fetch::fetch_repository_with_result(
-        remote_config.clone(),
-        fetch_branch.clone(),
-        single_branch,
-        fetch_depth,
-        false,
-        Some(clone_tag_mode),
-        false,
-        // A fresh clone has no remote-tracking refs to prune.
-        false,
-        // A fresh clone has no tags to prune.
-        false,
-        // `--deps-of` needs the dependency graph to compute the closure, so it
-        // implies `--notes`; a plain clone never fetches notes (Git parity).
-        !args.deps_of.is_empty(),
-        &child_output,
-        false,
-        None,
-        &[],
-        false,
-    )
-    .await
-    .map_err(|source| CloneError::FetchFailed { source })?;
+    let fetch_result = if reference_alternate {
+        // Every object is borrowed from the reference: record the advertised
+        // tracking refs directly and transfer nothing (`objects_fetched == 0`).
+        for reference in discovery
+            .refs
+            .iter()
+            .filter(|reference| reference._ref.starts_with("refs/heads/"))
+        {
+            let name = reference._ref.trim_start_matches("refs/heads/").to_string();
+            Branch::update_branch(
+                &format!("refs/remotes/{remote_name}/{name}"),
+                &reference._hash,
+                Some(&remote_name),
+            )
+            .await
+            .map_err(|error| CloneError::SetupFailed {
+                message: format!("could not record tracking ref '{name}': {error}"),
+            })?;
+        }
+        fetch::FetchRepositoryResult::borrowed(remote_name.clone(), remote_url.to_string())
+    } else {
+        fetch::fetch_repository_with_result(
+            remote_config.clone(),
+            fetch_branch.clone(),
+            single_branch,
+            fetch_depth,
+            false,
+            Some(clone_tag_mode),
+            false,
+            // A fresh clone has no remote-tracking refs to prune.
+            false,
+            // A fresh clone has no tags to prune.
+            false,
+            // `--deps-of` needs the dependency graph to compute the closure, so it
+            // implies `--notes`; a plain clone never fetches notes (Git parity).
+            !args.deps_of.is_empty(),
+            &child_output,
+            false,
+            None,
+            &[],
+            false,
+        )
+        .await
+        .map_err(|source| CloneError::FetchFailed { source })?
+    };
     // Clone owns this fresh repository exclusively; the fetch's ref updates
     // landed inside — release the pack's `.keep` pin now.
     fetch_result.release_pack_pin();

@@ -894,6 +894,22 @@ pub struct FetchRepositoryResult {
 }
 
 impl FetchRepositoryResult {
+    /// A result for a clone that borrowed every object from a `--reference`
+    /// store instead of transferring anything.
+    pub fn borrowed(remote: String, url: String) -> Self {
+        Self {
+            remote,
+            url,
+            pack_keep_sentinel: None,
+            pack_keep_lock: None,
+            refs_updated: Vec::new(),
+            objects_fetched: 0,
+            bytes_received: 0,
+            pruned: Vec::new(),
+            fetch_head_records: Vec::new(),
+        }
+    }
+
     /// Release the fetch pack's `.keep` pin — call ONLY after the caller has
     /// recorded every root for this fetch (refs/tags inside `run_fetch`,
     /// plus FETCH_HEAD where the surface writes one). Idempotent.

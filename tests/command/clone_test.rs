@@ -3741,6 +3741,85 @@ fn test_clone_path_git_suffix_fallback() {
 }
 
 #[test]
+fn clone_reference_borrows_every_object() {
+    use crate::command::{assert_cli_success, create_committed_repo_via_cli, run_libra_command};
+
+    let src = create_committed_repo_via_cli();
+    let root = tempdir().unwrap();
+    let reference = root.path().join("R");
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "clone",
+                src.path().to_str().expect("src"),
+                reference.to_str().expect("reference"),
+            ],
+            root.path(),
+        ),
+        "clone the reference repository",
+    );
+
+    let dest = root.path().join("d");
+    let out = run_libra_command(
+        &[
+            "clone",
+            "--json",
+            "--reference",
+            reference.to_str().expect("reference"),
+            &format!("file://{}", src.path().display()),
+            dest.to_str().expect("dest"),
+        ],
+        root.path(),
+    );
+    assert_cli_success(&out, "clone --reference --json");
+
+    // AC2: nothing is transferred from the source.
+    let payload = String::from_utf8_lossy(&out.stdout);
+    let value: serde_json::Value = serde_json::from_str(payload.trim()).expect("clone json");
+    assert_eq!(
+        value["data"]["objects_fetched"]
+            .as_u64()
+            .unwrap_or(u64::MAX),
+        0,
+        "AC2: --reference must not transfer objects: {payload}"
+    );
+
+    // AC3: the destination object store itself stays empty.
+    fn count_files(dir: &std::path::Path) -> usize {
+        std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .filter_map(|entry| entry.ok())
+                    .map(|entry| {
+                        let path = entry.path();
+                        if path.is_dir() {
+                            if entry.file_name() == "info" {
+                                0
+                            } else {
+                                count_files(&path)
+                            }
+                        } else {
+                            1
+                        }
+                    })
+                    .sum()
+            })
+            .unwrap_or(0)
+    }
+    assert_eq!(
+        count_files(&dest.join(".libra/objects")),
+        0,
+        "AC3: the destination object store is empty"
+    );
+
+    // AC4: objects are readable through the borrowed store.
+    assert_cli_success(
+        &run_libra_command(&["cat-file", "-p", "HEAD:tracked.txt"], &dest),
+        "AC4: cat-file through the alternate",
+    );
+}
+
+#[test]
 fn test_clone_reject_shallow_local_git_source() {
     use super::{create_linear_git_repo, git_success, run_libra_command};
 
