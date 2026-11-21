@@ -4791,3 +4791,110 @@ fn test_fetch_multiple_refspecs_in_order() {
         "AC8: no upstream was written"
     );
 }
+
+#[test]
+fn test_fetch_custom_namespace_destinations() {
+    use crate::command::{assert_cli_success, run_libra_command};
+
+    // Source with `main` (S1) and `side` (S2); `c` clones it.
+    let work = tempfile::tempdir().expect("work dir");
+    let s = work.path().join("s");
+    std::fs::create_dir_all(&s).expect("mkdir s");
+    assert_cli_success(&run_libra_command(&["init"], &s), "init s");
+    run_libra_command(&["config", "set", "user.name", "t"], &s);
+    run_libra_command(&["config", "set", "user.email", "t@t"], &s);
+    std::fs::write(s.join("f.txt"), "s1\n").expect("write s1");
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], &s), "stage s1");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "S1", "--no-verify"], &s),
+        "commit S1",
+    );
+    let s1 = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], &s).stdout)
+        .trim()
+        .to_string();
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "side"], &s),
+        "branch side",
+    );
+    std::fs::write(s.join("f.txt"), "s2\n").expect("write s2");
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], &s), "stage s2");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "S2", "--no-verify"], &s),
+        "commit S2",
+    );
+    let s2 = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], &s).stdout)
+        .trim()
+        .to_string();
+    assert_cli_success(&run_libra_command(&["switch", "main"], &s), "back to main");
+
+    let c = work.path().join("c");
+    assert_cli_success(
+        &run_libra_command(&["clone", "./s", "c"], work.path()),
+        "clone c",
+    );
+    run_libra_command(&["config", "set", "user.name", "t"], &c);
+    run_libra_command(&["config", "set", "user.email", "t@t"], &c);
+
+    // AC2: a configured fetch refspec may map into a custom namespace and both
+    // refs are listed by `show-ref` afterwards.
+    let before = run_libra_command(&["show-ref"], &c).stdout;
+    assert_cli_success(
+        &run_libra_command(&["remote", "add", "rd", "../s"], &c),
+        "add the rd remote",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "config",
+                "set",
+                "remote.rd.fetch",
+                "+refs/heads/*:refs/rd/*",
+            ],
+            &c,
+        ),
+        "configure the custom namespace",
+    );
+    assert_cli_success(&run_libra_command(&["fetch", "rd"], &c), "AC2: fetch rd");
+    let after = run_libra_command(&["show-ref"], &c).stdout;
+    let added = String::from_utf8_lossy(&after)
+        .lines()
+        .filter(|line| {
+            !String::from_utf8_lossy(&before)
+                .lines()
+                .any(|old| old == *line)
+        })
+        .map(str::to_string)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        added,
+        [format!("{s1} refs/rd/main"), format!("{s2} refs/rd/side"),]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        "AC2: both namespace refs landed"
+    );
+    for (name, expected) in [("refs/rd/main", &s1), ("refs/rd/side", &s2)] {
+        let resolved = String::from_utf8_lossy(&run_libra_command(&["rev-parse", name], &c).stdout)
+            .trim()
+            .to_string();
+        assert_eq!(&resolved, expected, "AC2: {name} resolves");
+    }
+
+    // A `refs/remotes/<unconfigured>/...` destination is stored under its full
+    // name so `show-ref` still lists it.
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "fetch",
+                "rd",
+                "refs/heads/side:refs/remotes/extra_dir/repo_c/side",
+            ],
+            &c,
+        ),
+        "custom refs/remotes destination",
+    );
+    let listed = String::from_utf8_lossy(&run_libra_command(&["show-ref"], &c).stdout).to_string();
+    assert!(
+        listed.contains(&format!("{s2} refs/remotes/extra_dir/repo_c/side")),
+        "the unconfigured remote namespace is still listed: {listed}"
+    );
+}

@@ -1054,7 +1054,7 @@ PY
 
 ### Task FP-09: 允许 fetch refspec 写入 `refs/heads/`、`refs/remotes/` 之外的自定义命名空间（#722）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `complete`（2026-11-21：`validate_fetch_destination` 放宽为「任意 `refs/<ns>/...` 且 refname 合法」，仅保留 `refs/tags/*`（有意差异）与保留名 `refs/heads/HEAD`、`refs/remotes/<remote>/HEAD` 的拒绝；`fetch_destination_storage` 改为 async，`refs/remotes/<x>/...` 仅在 `<x>` 是**已配置 remote**（或即本次抓取的远端）时按 remote 作用域存储，否则按全名存储以便 `show-ref` 枚举。用例 `test_fetch_custom_namespace_destinations` 覆盖 AC2（`remote.rd.fetch=+refs/heads/*:refs/rd/*` 后恰新增 `refs/rd/main`→S1 与 `refs/rd/side`→S2，且 `rev-parse` 可解析）并额外验证未配置 remote 的 `refs/remotes/extra_dir/repo_c/side` 仍被 `show-ref` 列出。**未验收**：AC1 在原文即标注「草稿待整改」，其 `refs/libra/traces/unique` 目标依赖 traces 通道，未在本次交付中作为验收项。`fetch`/`pull`/`clone` 套件 **198/198**；版本面 0.30.253 → 0.30.254；文档 EN/zh-CN 同步。按用户 2026-11-20 指令在 `main` 直接提交推送。）
 
 **Description:** 放宽 `validate_fetch_destination`：除现有 `refs/heads/*`、`refs/remotes/<remote>/*` 外，允许任意通过 refname 校验的 `refs/<ns>/...` 目标（命令行与 `remote.<name>.fetch` 配置、含通配符、含 `fetch --all` 预校验），写入后的引用须能被 `libra rev-parse` 与 `libra show-ref` 读出：其中 `refs/remotes/<x>/...` 目标的 `<x>` 不是已配置 remote 时（如上游的 `refs/remotes/extra_dir/repo_c/extra_dir/*`），改为与其它 `refs/*` 目标一样按全名行（`remote` 为空）存储，避免挂在未配置 remote 名下而不被 `show-ref` 枚举；仍拒绝 `refs/tags/*` 目标（现有限制，有意差异）、现有保留目标 `refs/heads/HEAD` 与 `refs/remotes/<remote>/HEAD`（分支段恰为 `HEAD`；现有限制保持不变，Git 接受二者，有意差异）与不合法 refname（`..`、控制字符等）；`refs/remotes/<remote>/x/HEAD` 等嵌套名与新放宽的 `refs/<ns>/...` 目标（含末段为 `HEAD` 者，如 `refs/custom/HEAD`）不设额外 `HEAD` 限制，与 Git 一致。
 

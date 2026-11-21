@@ -2091,21 +2091,32 @@ fn validate_fetch_destination(destination: &str, refspec: &str) -> Result<(), Fe
             reason: "tag destinations are not supported by fetch refspecs; use --tags".to_string(),
         });
     }
-    let supported = destination
-        .strip_prefix("refs/heads/")
-        .is_some_and(|branch| !branch.is_empty() && branch != "HEAD")
-        || destination
+    // `refs/heads/<branch>` and `refs/remotes/<remote>/<branch>` keep their
+    // reserved `HEAD` restriction; every other `refs/<ns>/...` destination is a
+    // custom namespace and is accepted as long as the refname itself is valid.
+    let reserved_head = destination == "refs/heads/HEAD"
+        || (destination
             .strip_prefix("refs/remotes/")
             .and_then(|rest| rest.split_once('/'))
-            .is_some_and(|(remote, branch)| {
-                !remote.is_empty() && !branch.is_empty() && branch != "HEAD"
-            });
-    if supported {
+            .is_some_and(|(remote, branch)| !remote.is_empty() && branch == "HEAD"));
+    if reserved_head {
+        return Err(FetchError::InvalidRefspec {
+            refspec: refspec.to_string(),
+            reason: "destination must not be the reserved HEAD ref".to_string(),
+        });
+    }
+    let valid_namespace = destination
+        .strip_prefix("refs/")
+        .is_some_and(|rest| !rest.is_empty() && !rest.ends_with('/'));
+    if valid_namespace && refspec_ref_is_valid(destination) {
         Ok(())
     } else {
         Err(FetchError::InvalidRefspec {
             refspec: refspec.to_string(),
-            reason: "destination must be under refs/heads/* or refs/remotes/<remote>/* and must not be a reserved HEAD ref".to_string()})
+            reason: "destination must be a valid ref under refs/ (and must not be a reserved \
+                     HEAD ref)"
+                .to_string(),
+        })
     }
 }
 
@@ -4649,7 +4660,7 @@ async fn compute_fetch_ref_preview(
             continue;
         }
         let (storage_name, remote_scope) =
-            fetch_destination_storage(&plan.destination, &remote_config.name)?;
+            fetch_destination_storage(&plan.destination, &remote_config.name).await?;
         let old_oid = Branch::find_branch_result(&storage_name, remote_scope.as_deref())
             .await
             .map_err(|error| FetchError::UpdateRefs {
@@ -4742,7 +4753,7 @@ fn reject_checked_out_destination(
     Ok(())
 }
 
-fn fetch_destination_storage(
+async fn fetch_destination_storage(
     destination: &str,
     fetched_remote: &str,
 ) -> Result<(String, Option<String>), FetchError> {
@@ -4750,12 +4761,21 @@ fn fetch_destination_storage(
         return Ok((branch.to_string(), None));
     }
     if let Some(rest) = destination.strip_prefix("refs/remotes/") {
-        let remote = rest
+        // Only a CONFIGURED remote gets the remote-scoped storage row; an
+        // unconfigured first segment (e.g. `refs/remotes/extra_dir/...`) is
+        // stored like any other `refs/*` name so `show-ref` still lists it.
+        let candidate = rest
             .strip_prefix(fetched_remote)
             .filter(|suffix| suffix.starts_with('/'))
             .map(|_| fetched_remote.to_string())
             .or_else(|| rest.split_once('/').map(|(remote, _)| remote.to_string()));
-        if let Some(remote) = remote {
+        if let Some(remote) = candidate
+            && (remote == fetched_remote
+                || crate::internal::config::ConfigKv::all_remote_configs()
+                    .await
+                    .map(|remotes| remotes.iter().any(|config| config.name == remote))
+                    .unwrap_or(false))
+        {
             return Ok((destination.to_string(), Some(remote)));
         }
     }
@@ -5192,7 +5212,7 @@ async fn update_references(
                     continue;
                 }
                 let (storage_name, remote_scope) =
-                    fetch_destination_storage(&plan.destination, &remote_config.name)?;
+                    fetch_destination_storage(&plan.destination, &remote_config.name).await?;
                 let old_oid = Branch::find_branch_result_with_conn(
                     txn,
                     &storage_name,

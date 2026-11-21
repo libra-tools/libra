@@ -176,6 +176,14 @@ libra config remote.origin.prune false  # but never for origin
 
 ## Options
 
+A refspec destination may live in any `refs/<namespace>/...` (for example
+`+refs/heads/*:refs/rd/*`), not just `refs/heads/` and `refs/remotes/<remote>/`.
+Such refs are listed by `show-ref` and resolve through `rev-parse`. A
+`refs/remotes/<name>/...` destination whose `<name>` is not a configured remote is
+stored under its full name (so it stays visible) rather than as a
+remote-tracking row. `refs/tags/*` destinations remain refused, and the reserved
+`refs/heads/HEAD` / `refs/remotes/<remote>/HEAD` names stay rejected.
+
 Several refspecs may be given in one invocation (`libra fetch origin left right`).
 Every refspec is parsed before anything is fetched, each is fetched in order, and
 `FETCH_HEAD` records them in command-line order. Refs selected by a command-line

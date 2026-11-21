@@ -50,6 +50,8 @@ libra config set --add remote.origin.fetch \
 
 ## 选项
 
+refspec 目标可位于任意 `refs/<命名空间>/...`（例如 `+refs/heads/*:refs/rd/*`），不再限于 `refs/heads/` 与 `refs/remotes/<remote>/`；这类引用可被 `show-ref` 列出、也可用 `rev-parse` 解析。若 `refs/remotes/<name>/...` 的 `<name>` 不是已配置 remote，则按全名存储（保持可见），不再挂到未配置的 remote 名下。`refs/tags/*` 目标仍拒绝，保留名 `refs/heads/HEAD` / `refs/remotes/<remote>/HEAD` 仍拒绝。
+
 一次可给多个 refspec（`libra fetch origin left right`）：全部 refspec 在抓取前先解析，随后按命令行顺序逐个抓取，`FETCH_HEAD` 也按该顺序记录。命令行 refspec 选中的引用是可合并条目（不带 `not-for-merge`），由配置 refspec 或自动跟随带回的引用仍带该标记。`--json` 的 `refspec` 字段为空格连接的全部 refspec；`--set-upstream` 与多于一个 refspec 同用时输出 `multiple branches detected, incompatible with --set-upstream` 且不写 upstream。
 
 非 `--dry-run` 的成功 fetch 会在命令级维护锁释放后运行与 `libra gc --auto` 相同的判定：触发时（stderr 输出 `Auto packing the repository for optimum performance.`）重整本次取回的 pack，不触发时不输出任何额外内容。`--no-auto-gc` 关闭该步骤；`--dry-run` 不触发。`pull`/`clone` 不触发自动维护（有意差异）。
