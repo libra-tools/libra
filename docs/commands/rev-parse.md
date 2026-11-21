@@ -77,7 +77,8 @@ describe suffix after its own literal tag lookup and the complete-name lookups o
 local and remote-tracking branches, so a real ref with that exact name always wins.
 The same order applies inside the `heads/` and `remotes/` namespaces (literal
 branch, then the complete-name lookups in the other namespaces, then the describe
-suffix).
+suffix). The `refs/`-qualified forms (`refs/tags/`, `refs/heads/`,
+`refs/remotes/`) follow the same order.
 
 | Flag | Description |
 |------|-------------|
