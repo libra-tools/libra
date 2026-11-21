@@ -5029,6 +5029,324 @@ fn test_clone_sparse_cone_materializes_top_level() {
 }
 
 #[test]
+fn test_clone_sparse_partial_merge_lazy_fetch() {
+    use crate::command::{assert_cli_success, run_libra_command};
+
+    // Fixture M (Git t/t6421-merge-partial-clone.sh#2 shape): O carries three
+    // files under dir/, A renames dir/ to folder/ (contents unchanged), B-dir
+    // adds three files under dir/subdir/.
+    let source = tempdir().expect("source");
+    let mp = source.path();
+    assert_cli_success(&run_libra_command(&["init"], mp), "init M");
+    run_libra_command(&["config", "set", "user.name", "t"], mp);
+    run_libra_command(&["config", "set", "user.email", "t@t"], mp);
+    std::fs::create_dir_all(mp.join("dir/subdir")).expect("mkdir dir/subdir");
+    std::fs::write(mp.join("dir/Makefile_TOP_O"), "TOP_O\n").expect("write TOP_O");
+    std::fs::write(mp.join("dir/subdir/Makefile_SUB_O"), "SUB_O\n").expect("write SUB_O");
+    std::fs::write(mp.join("dir/e_O"), "e_O\n").expect("write e_O");
+    assert_cli_success(&run_libra_command(&["add", "-A"], mp), "stage O");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "O", "--no-verify"], mp),
+        "commit O",
+    );
+    assert_cli_success(&run_libra_command(&["branch", "A"], mp), "create A");
+    assert_cli_success(&run_libra_command(&["branch", "B-dir"], mp), "create B-dir");
+    assert_cli_success(&run_libra_command(&["switch", "A"], mp), "switch A");
+    std::fs::rename(mp.join("dir"), mp.join("folder")).expect("rename dir to folder");
+    assert_cli_success(&run_libra_command(&["add", "-A"], mp), "stage the rename");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "A", "--no-verify"], mp),
+        "commit A",
+    );
+    assert_cli_success(&run_libra_command(&["switch", "main"], mp), "back to main");
+    assert_cli_success(&run_libra_command(&["switch", "B-dir"], mp), "switch B-dir");
+    for name in ["newfile.java", "newfile.scala", "newfile.groovy"] {
+        std::fs::write(mp.join("dir/subdir").join(name), format!("{name}\n")).expect("write new");
+    }
+    assert_cli_success(&run_libra_command(&["add", "-A"], mp), "stage B-dir");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "B-dir", "--no-verify"], mp),
+        "commit B-dir",
+    );
+
+    let rev_parse = |repo: &std::path::Path, spec: &str| {
+        let out = run_libra_command(&["rev-parse", spec], repo);
+        assert_cli_success(&out, "rev-parse");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let expected_new = [
+        "dir/Makefile_TOP_O",
+        "dir/e_O",
+        "dir/subdir/Makefile_SUB_O",
+        "dir/subdir/newfile.java",
+        "dir/subdir/newfile.scala",
+        "dir/subdir/newfile.groovy",
+    ]
+    .into_iter()
+    .map(|path| rev_parse(mp, &format!("B-dir:{path}")))
+    .collect::<std::collections::BTreeSet<_>>();
+
+    let root = tempdir().expect("dest root");
+    let source_url = format!("file://{}", mp.display());
+    // A's tree as (path, mark) pairs for the cone check.
+    let a_files = {
+        let out = run_libra_command(&["ls-tree", "-r", "A", "--name-only"], mp);
+        assert_cli_success(&out, "list A's tree");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|path| {
+                let mark = if path.contains('/') { "S" } else { "H" };
+                format!("{mark} {path}")
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let d = root.path().join("d");
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "clone",
+                "--sparse",
+                "--filter=blob:none",
+                "--branch",
+                "A",
+                &source_url,
+                d.to_str().expect("dest"),
+            ],
+            root.path(),
+        ),
+        "AC1: sparse partial clone",
+    );
+    // AC7: the combined clone is in cone mode.
+    for key in ["core.sparseCheckout", "core.sparseCheckoutCone"] {
+        let out = run_libra_command(&["config", "get", key], &d);
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "true\n", "AC7: {key}");
+    }
+    // AC8: only the root files are inside the cone.
+    let listed = run_libra_command(&["ls-files", "-t"], &d);
+    assert_cli_success(&listed, "AC8: ls-files");
+    let mut marks = String::from_utf8_lossy(&listed.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    marks.sort();
+    let mut expected_marks = a_files.clone();
+    expected_marks.sort();
+    assert_eq!(marks, expected_marks, "AC8: cone membership");
+
+    let present = |repo: &std::path::Path, oid: &str| {
+        run_libra_command(&["--offline", "cat-file", "-e", oid], repo)
+            .status
+            .success()
+    };
+    let listing = run_libra_command(&["rev-list", "--objects", "--all"], mp);
+    assert_cli_success(&listing, "list M's objects");
+    let all_oids = String::from_utf8_lossy(&listing.stdout)
+        .lines()
+        .filter_map(|line| line.split_whitespace().next().map(str::to_string))
+        .filter(|oid| oid.len() >= 8)
+        .collect::<Vec<_>>();
+    let before = all_oids
+        .iter()
+        .map(|oid| (oid.clone(), present(&d, oid)))
+        .collect::<std::collections::BTreeMap<_, _>>();
+
+    run_libra_command(&["config", "set", "user.name", "t"], &d);
+    run_libra_command(&["config", "set", "user.email", "t@t"], &d);
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "merge.directoryRenames", "true"], &d),
+        "enable directory renames",
+    );
+    // The merge commit must not need the vault key in the test sandbox.
+    let _ = run_libra_command(&["config", "set", "commit.gpgSign", "false"], &d);
+    let _ = run_libra_command(&["config", "set", "vault.signing", "false"], &d);
+    let merge = crate::command::run_libra_command_with_env(
+        &["merge", "origin/B-dir"],
+        &d,
+        &[("LIBRA_TEST", "1"), ("LIBRA_TEST_TRACE_LAZY_FETCH", "1")],
+    );
+    assert_cli_success(&merge, "AC1: the rename merge succeeds");
+    let lazy_lines = String::from_utf8_lossy(&merge.stderr)
+        .lines()
+        .filter(|line| line.starts_with("libra-test: lazy-fetch"))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        lazy_lines,
+        vec!["libra-test: lazy-fetch want=6".to_string()],
+        "AC1: one batch of six objects: {}",
+        String::from_utf8_lossy(&merge.stderr)
+    );
+
+    // AC2: exactly the six blobs the merge needed appeared.
+    let newly_present = all_oids
+        .iter()
+        .filter(|oid| !before[*oid] && present(&d, oid))
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(newly_present, expected_new, "AC2: the newly fetched blobs");
+
+    // AC3: the rename landed the new files under folder/subdir/.
+    let staged = run_libra_command(&["ls-files", "-s"], &d);
+    assert_cli_success(&staged, "AC3: ls-files -s");
+    let mut got = std::collections::BTreeSet::new();
+    for line in String::from_utf8_lossy(&staged.stdout).lines() {
+        let mut parts = line.split_whitespace();
+        let _mode = parts.next();
+        let oid = parts.next().unwrap_or_default().to_string();
+        let _stage = parts.next();
+        let path = parts.next().unwrap_or_default().to_string();
+        if path.starts_with("folder/subdir/newfile.") {
+            got.insert((path, oid));
+        }
+    }
+    let want = ["java", "scala", "groovy"]
+        .into_iter()
+        .map(|ext| {
+            (
+                format!("folder/subdir/newfile.{ext}"),
+                rev_parse(mp, &format!("B-dir:dir/subdir/newfile.{ext}")),
+            )
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(got, want, "AC3: the renamed additions");
+
+    // AC4/AC5: the same merge in a non-sparse partial clone.
+    let d2 = root.path().join("d2");
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "clone",
+                "--filter=blob:none",
+                "--branch",
+                "A",
+                &source_url,
+                d2.to_str().expect("dest"),
+            ],
+            root.path(),
+        ),
+        "AC4: non-sparse partial clone",
+    );
+    run_libra_command(&["config", "set", "user.name", "t"], &d2);
+    run_libra_command(&["config", "set", "user.email", "t@t"], &d2);
+    run_libra_command(&["config", "set", "merge.directoryRenames", "true"], &d2);
+    let _ = run_libra_command(&["config", "set", "commit.gpgSign", "false"], &d2);
+    let _ = run_libra_command(&["config", "set", "vault.signing", "false"], &d2);
+    let merge = crate::command::run_libra_command_with_env(
+        &["merge", "origin/B-dir"],
+        &d2,
+        &[("LIBRA_TEST", "1"), ("LIBRA_TEST_TRACE_LAZY_FETCH", "1")],
+    );
+    assert_cli_success(&merge, "AC4: the non-sparse merge succeeds");
+    assert!(
+        String::from_utf8_lossy(&merge.stderr)
+            .lines()
+            .any(|line| line.starts_with("libra-test: lazy-fetch")),
+        "AC4: missing objects were fetched on demand"
+    );
+    let staged = run_libra_command(&["ls-files", "-s"], &d2);
+    assert_cli_success(&staged, "AC5: ls-files -s");
+    let mut got2 = std::collections::BTreeSet::new();
+    for line in String::from_utf8_lossy(&staged.stdout).lines() {
+        let mut parts = line.split_whitespace();
+        let _mode = parts.next();
+        let oid = parts.next().unwrap_or_default().to_string();
+        let _stage = parts.next();
+        let path = parts.next().unwrap_or_default().to_string();
+        if path.starts_with("folder/subdir/newfile.") {
+            got2.insert((path, oid));
+        }
+    }
+    assert_eq!(got2, want, "AC5: the renamed additions");
+
+    // AC6 (fixture N): content-modifying, deleting and conflicting merges stay
+    // refused in a sparse partial clone.
+    let n_source = tempdir().expect("source N");
+    let np = n_source.path();
+    assert_cli_success(&run_libra_command(&["init"], np), "init N");
+    run_libra_command(&["config", "set", "user.name", "t"], np);
+    run_libra_command(&["config", "set", "user.email", "t@t"], np);
+    std::fs::write(np.join("a.txt"), "one\n").expect("write a");
+    std::fs::create_dir_all(np.join("sub")).expect("mkdir sub");
+    std::fs::write(np.join("sub/b.txt"), "b\n").expect("write b");
+    assert_cli_success(&run_libra_command(&["add", "-A"], np), "stage S1");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "s1", "--no-verify"], np),
+        "commit s1",
+    );
+    let s1 = {
+        let out = run_libra_command(&["rev-parse", "HEAD"], np);
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    for branch in ["t-mod", "t-del", "t-conf"] {
+        assert_cli_success(
+            &run_libra_command(&["branch", branch, &s1], np),
+            "create branch",
+        );
+    }
+    assert_cli_success(&run_libra_command(&["switch", "t-mod"], np), "switch t-mod");
+    std::fs::write(np.join("sub/b.txt"), "b2\n").expect("modify b");
+    assert_cli_success(&run_libra_command(&["add", "-A"], np), "stage t-mod");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "t-mod", "--no-verify"], np),
+        "commit t-mod",
+    );
+    assert_cli_success(&run_libra_command(&["switch", "t-del"], np), "switch t-del");
+    std::fs::remove_file(np.join("sub/b.txt")).expect("delete b");
+    assert_cli_success(&run_libra_command(&["add", "-A"], np), "stage t-del");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "t-del", "--no-verify"], np),
+        "commit t-del",
+    );
+    assert_cli_success(
+        &run_libra_command(&["switch", "t-conf"], np),
+        "switch t-conf",
+    );
+    std::fs::write(np.join("a.txt"), "three\n").expect("modify a");
+    assert_cli_success(&run_libra_command(&["add", "-A"], np), "stage t-conf");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "t-conf", "--no-verify"], np),
+        "commit t-conf",
+    );
+    assert_cli_success(&run_libra_command(&["switch", "main"], np), "back to main");
+    std::fs::write(np.join("a.txt"), "two\n").expect("modify a on main");
+    assert_cli_success(&run_libra_command(&["add", "-A"], np), "stage S2");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "s2", "--no-verify"], np),
+        "commit s2",
+    );
+
+    let n = root.path().join("n");
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "clone",
+                "--sparse",
+                "--filter=blob:none",
+                &format!("file://{}", np.display()),
+                n.to_str().expect("dest"),
+            ],
+            root.path(),
+        ),
+        "AC6: sparse partial clone of N",
+    );
+    run_libra_command(&["config", "set", "user.name", "t"], &n);
+    run_libra_command(&["config", "set", "user.email", "t@t"], &n);
+    for branch in ["origin/t-mod", "origin/t-del", "origin/t-conf"] {
+        let out = run_libra_command(&["merge", branch], &n);
+        assert!(
+            !out.status.success(),
+            "AC6: merging {branch} must be refused"
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("LBR-UNSUPPORTED-001"),
+            "AC6: {branch}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+#[test]
 fn test_clone_reject_shallow_local_git_source() {
     use super::{create_linear_git_repo, git_success, run_libra_command};
 

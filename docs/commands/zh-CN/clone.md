@@ -106,7 +106,7 @@ libra clone --shallow-since "2 weeks ago" git@github.com:user/repo.git
 
 ### `--sparse`
 
-克隆后初始化 cone 模式的稀疏检出：只物化顶层文件，更深的路径保留在索引中并置上 skip-worktree 位（`libra ls-files -t` 显示为 `S`）。克隆会记录 `core.sparseCheckout=true` 与 `core.sparseCheckoutCone=true`；cone 规则文件与规则管理尚未实现，且在此类仓库中检出类命令（`checkout`、`switch`、`reset`、`restore`、`merge`、`pull`、`rebase`、`cherry-pick`、`stash`）以 `LBR-UNSUPPORTED-001` fail-closed。
+克隆过程中初始化 cone 模式的稀疏检出：只物化顶层文件（索引在任何写入之前就收窄，因此 `--filter=blob:none` 克隆只取回这些 blob），更深的路径保留在索引中并置上 skip-worktree 位（`libra ls-files -t` 显示为 `S`）。克隆会记录 `core.sparseCheckout=true` 与 `core.sparseCheckoutCone=true`；cone 规则文件与规则管理尚未实现，且在此类仓库中检出类命令（`checkout`、`switch`、`reset`、`restore`、`merge`、`pull`、`rebase`、`cherry-pick`、`stash`）以 `LBR-UNSUPPORTED-001` fail-closed；例外是目录重命名形状的 `merge`（我方整目录移动、他方仅新增文件），它会应用重命名并以**一次** promisor 批量拉取所需对象。
 
 ```bash
 libra clone --sparse --filter=blob:none git@github.com:user/repo.git

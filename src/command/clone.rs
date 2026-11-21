@@ -455,18 +455,135 @@ fn upload_pack_advertises_no_filter() -> bool {
             == Some("1")
 }
 
+/// Write the cone entries (the top-level files) into the working tree.
+///
+/// Only these blobs are read, so a `--sparse --filter=blob:none` clone keeps
+/// everything below the root missing until a merge or read asks for it.
+fn materialize_cone_entries() -> Result<(), CloneError> {
+    use git_internal::internal::{index::Index, object::blob::Blob};
+
+    let index =
+        Index::load(crate::utils::path::index()).map_err(|source| CloneError::SetupFailed {
+            message: format!("failed to read the sparse index: {source}"),
+        })?;
+    for entry in index.tracked_entries(0) {
+        if entry.name.contains('/') {
+            continue;
+        }
+        let path = std::path::Path::new(&entry.name);
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent).map_err(|source| CloneError::SetupFailed {
+                message: format!("failed to create '{}': {source}", parent.display()),
+            })?;
+        }
+        let blob = crate::command::load_object::<Blob>(&entry.hash).map_err(|source| {
+            CloneError::SetupFailed {
+                message: format!("failed to read the blob for '{}': {source}", entry.name),
+            }
+        })?;
+        // 0o120000 is a symlink, 0o100755 the executable bit.
+        if entry.mode == 0o120000 {
+            #[cfg(unix)]
+            {
+                let target = String::from_utf8_lossy(&blob.data).to_string();
+                let _ = std::fs::remove_file(path);
+                std::os::unix::fs::symlink(&target, path).map_err(|source| {
+                    CloneError::SetupFailed {
+                        message: format!("failed to create the symlink '{}': {source}", entry.name),
+                    }
+                })?;
+            }
+        } else {
+            std::fs::write(path, &blob.data).map_err(|source| CloneError::SetupFailed {
+                message: format!("failed to write '{}': {source}", entry.name),
+            })?;
+            #[cfg(unix)]
+            if entry.mode == 0o100755 {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Initialise cone-mode sparse checkout in the freshly cloned repository.
 ///
 /// Cone mode with no directories keeps exactly the top-level files; every
 /// deeper entry stays in the index with the skip-worktree bit set. Cone rule
 /// persistence and rule management are still deferred (`DEFER-CL-04`).
-fn apply_sparse_cone_clone() -> Result<(), CloneError> {
+async fn apply_sparse_cone_clone() -> Result<(), CloneError> {
     use git_internal::internal::index::Index;
 
     let index_path = crate::utils::path::index();
-    let mut index = Index::load(&index_path).map_err(|source| CloneError::SetupFailed {
-        message: format!("failed to read the index for --sparse: {source}"),
-    })?;
+    // A sparse clone skips the full checkout, so the index is built from HEAD
+    // first and only then narrowed to the cone.
+    let mut index = match Index::load(&index_path) {
+        Ok(index) if !index.tracked_entries(0).is_empty() => index,
+        _ => {
+            use git_internal::internal::object::tree::{Tree, TreeItemMode};
+
+            fn walk(
+                tree_id: git_internal::hash::ObjectHash,
+                prefix: &str,
+                index: &mut Index,
+            ) -> Result<(), CloneError> {
+                let tree: Tree = crate::command::load_object(&tree_id).map_err(|source| {
+                    CloneError::SetupFailed {
+                        message: format!("failed to read a tree for --sparse: {source}"),
+                    }
+                })?;
+                for item in &tree.tree_items {
+                    let path = format!("{prefix}{}", item.name);
+                    if matches!(item.mode, TreeItemMode::Tree) {
+                        walk(item.id, &format!("{path}/"), index)?;
+                    } else if matches!(item.mode, TreeItemMode::Blob) {
+                        let mut entry = git_internal::internal::index::IndexEntry {
+                            ctime: git_internal::internal::index::Time::from_system_time(
+                                std::time::UNIX_EPOCH,
+                            ),
+                            mtime: git_internal::internal::index::Time::from_system_time(
+                                std::time::UNIX_EPOCH,
+                            ),
+                            dev: 0,
+                            ino: 0,
+                            mode: 0o100644,
+                            uid: 0,
+                            gid: 0,
+                            size: 0,
+                            hash: item.id,
+                            flags: git_internal::internal::index::Flags::new(path.len() as u16),
+                            name: path.clone(),
+                        };
+                        entry.mode = if matches!(item.mode, TreeItemMode::BlobExecutable) {
+                            0o100755
+                        } else if matches!(item.mode, TreeItemMode::Link) {
+                            0o120000
+                        } else {
+                            0o100644
+                        };
+                        index.add(entry);
+                    }
+                }
+                Ok(())
+            }
+
+            let head = crate::internal::head::Head::current_commit()
+                .await
+                .ok_or_else(|| CloneError::SetupFailed {
+                    message: "the sparse clone has no HEAD to build the index from".to_string(),
+                })?;
+            let commit: git_internal::internal::object::commit::Commit =
+                crate::command::load_object(&head).map_err(|source| CloneError::SetupFailed {
+                    message: format!("failed to read HEAD for --sparse: {source}"),
+                })?;
+            let mut index = Index::new();
+            walk(commit.tree_id, "", &mut index)?;
+            index
+        }
+    };
     let deeper = index
         .tracked_entries(0)
         .into_iter()
@@ -2617,7 +2734,10 @@ async fn clone_into_destination(
         setup_repository(
             remote_config.clone(),
             fetch_branch,
-            !args.bare && !args.no_checkout,
+            // A sparse clone narrows the index BEFORE materialising anything,
+            // so only the cone entries are ever written (and only their blobs
+            // are fetched).
+            !args.bare && !args.no_checkout && !args.sparse,
             single_branch,
             advertised_head,
             detached_source,
@@ -2626,7 +2746,8 @@ async fn clone_into_destination(
     };
 
     if args.sparse && !args.bare && !args.no_checkout {
-        apply_sparse_cone_clone()?;
+        apply_sparse_cone_clone().await?;
+        materialize_cone_entries()?;
         let _ = ConfigKv::set("core.sparseCheckout", "true", false).await;
         let _ = ConfigKv::set("core.sparseCheckoutCone", "true", false).await;
     }

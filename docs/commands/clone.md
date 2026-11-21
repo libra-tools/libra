@@ -218,14 +218,17 @@ libra clone --shallow-since "2 weeks ago" git@github.com:user/repo.git
 
 ### `--sparse`
 
-Initialise a cone-mode sparse checkout after the clone: only the top-level files
-are materialised, while every deeper path stays in the index with the
+Initialise a cone-mode sparse checkout during the clone: only the top-level files
+are materialised (the index is narrowed before anything is written, so a
+`--filter=blob:none` clone fetches only those blobs), while every deeper path stays in the index with the
 skip-worktree bit set (`libra ls-files -t` shows them as `S`). The clone records
 `core.sparseCheckout=true` and `core.sparseCheckoutCone=true`; cone rule files and
 rule management are not implemented yet, and the checkout-family commands
 (`checkout`, `switch`, `reset`, `restore`, `merge`, `pull`, `rebase`,
 `cherry-pick`, `stash`) fail closed with `LBR-UNSUPPORTED-001` in such a
-repository.
+repository, except for `merge` of the directory-rename shape (our side moved a
+whole directory, their side only added files), which applies the rename and
+fetches every object it needs in a single promisor batch.
 
 ```bash
 libra clone --sparse --filter=blob:none git@github.com:user/repo.git
