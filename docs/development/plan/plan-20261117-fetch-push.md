@@ -1,7 +1,7 @@
 # Fetch 与 Push Git 兼容性修复计划（2026-11-17）
 
 > 模板版本：v2.16；继承 [plan-template.md](plan-template.md) 的 GC-01..13、ER-01..14、G-01..11。本计划不在 v2.16 具名 `code-only` 范围内，按版本化发布合同执行：每张 `implementation` 卡各自执行完整 C 组（含 `patch + 1`、`compat_version_surface_sync` 三处版本面同步、工具链刷新 `Cargo.lock`、`gh release create`）与适用 D 组。
-> 状态：Claude R19 与 Codex R19 双审 PASS（受审 SHA-256 前 12 位 `bda4c9f4798d`），计划可提交；全部任务 pending（`Lifecycle=pending`、`Acceptance` 为空），尚未执行。
+> 状态：2026-11-21 增补草稿待评审整改；历史 Claude R19 与 Codex R19 双审 PASS（受审 SHA-256 前 12 位 `bda4c9f4798d`）仅适用于旧字节。任务进度以各卡和 `plan-status.md` 为准；本次草稿未获 PASS，不可据此开工。
 > 审阅合同：按用户 2026-11-18 指令，本计划的计划文本提交门为 Claude（Subagent）与 Codex 双审，二者对同一受审字节（同一 SHA-256）均给出 `VERDICT: PASS` 方可提交（取代 2026-11-17「计划提交门为 Codex 单审，不再要求 Claude Review」口径）。执行期各卡的 ER-05 review（模板默认审查者 Codex）与网站交付的独立 Claude Code `PASS` 不受本条改变，三者互不替代。
 > 跟踪范围：GitHub open issues #683、#710、#719、#722、#749、#863、#864、#865、#867、#872、#873、#874、#877、#878、#879、#1000、#1031、#1036（共 18 项，2026-11-18 以 `gh issue view -R libra-tools/libra` 核对均为 OPEN）。
 
@@ -99,6 +99,7 @@
 
 | 时间 | 触发 | 变更内容 | 原卡 → 新卡 | 受影响的引用 |
 |---|---|---|---|---|
+| 2026-11-21 11:13:42 UTC | 本地 Artifacts 测试 | 新增 FP-23 后续验证及 FP-09 trace 验收草稿；Claude 对基于 `c84109a` 的候选文本给出 FAIL（5 项 P1），本草稿待整改与复审 | N/A | FP-23、FP-09 |
 | 2026-11-17 03:05:00 UTC | 初稿创建 | 建立覆盖 18 个 fetch/push 兼容问题的 18 张任务卡计划 | N/A | 全文 |
 | 2026-11-17 03:12:00 UTC | Claude R1 FAIL + Codex R1 FAIL | 修正 `FP-06` `--force` 覆盖 lease 语义与 `mod test` 过滤器；`FP-01`/`FP-02` 改由共享 `repository_arg.rs`（`T-1` + `DEP-FP-02`）解决裸目录名；补全 `FP-04` 负向 refspec、`FP-08`/`10` `cli.rs`（`T-1`）与 JSON/`fetch.all`/`--jobs`、`FP-09` 配置通配、`FP-12` `--all`、`FP-13` `T-5` 与 dry-run、`FP-15` single-branch/`--tags`、`FP-16` 非冲突 tag 与 stderr、`FP-18` `unpackLimit`/`autoPackLimit`；修正 `landing` 与独立谓词计数、锚点及 Git `2.56.0` pin | N/A | 事实基线、ADR-FP-01/02、依赖表、粒度审计表、FP-01..18 正文、review log |
 | 2026-11-17 03:24:00 UTC | Codex R2 FAIL | `FP-18` 区分 `fetch.unpackLimit` 接收阶段与 `gc.auto`/`gc.autoPackLimit` 维护阶段；`FP-15` 区分 `--tags` 与显式 tag refspec；`FP-03` 保留无配置拒绝错误；`FP-01` 纳入 `DEP-FP-02` 与 `DEP-FP-03`；`FP-08` 注明 `fetch_test.rs:2306` `local_fetch_args`；重算 `FP-03`/`FP-10`/`FP-18` 谓词计数；更新 D 组真实 CI job 名 | N/A | 依赖表、D 组、FP-01/03/08/10/15/18、粒度审计表、review log |
@@ -820,6 +821,8 @@ PY
 
 **Description:** 在 `parse_fetch_refspec` 中按 Git `get_local_ref` 规则补全命令行 refspec 的非 `refs/` 目标（`heads/`、`tags/`、`remotes/` 前缀补 `refs/`，其余补 `refs/heads/`），并让匿名本地仓库 fetch（`./<dir>`、绝对路径、`FP-01` 的裸目录名）在命令行 refspec 带显式目标时写入该目标引用；不带目标的匿名 fetch 行为不变。`tags/` 补全得到的 `refs/tags/*` 目标仍按 `validate_fetch_destination` 现有限制拒绝。
 
+> **后续验证草稿（未排期、未验收，不改变 FP-23 已完成的历史状态）：** 0.30.207 使用匿名 HTTP URL 显式映射曾在下载 trace 对象后遗漏目标 tracking ref；远端 `c84109a` 已修改匿名显式目标的共用路径，但 HTTP 与 trace 组合尚未验证。待 `ls-refs` 发现问题修复后，在 loopback smart HTTP 和临时虚构仓库中验证：`main`→M1，独有 `refs/libra/traces/unique`→T1，T1 的 `trace.txt` 内容为 `unique fictional trace payload\n`；以 Git 同夹具先核对 ref、OID 和文件，客户端先 clone main 并确认本地无 T1，再直接通过 URL fetch `refs/libra/traces/unique:refs/remotes/origin/trace-url`，以该 ref 读回 T1 和文件精确字节。测试服务须正确实现 v2，不使用请求改写代理宣称产品通过。本事项目前没有接收卡、执行者与测试服务；Claude 评审指出须补齐归属、依赖、写集、执行命令和门禁，完成并通过复审前不得称为已排期或使用本草稿开工。
+
 **Out of scope:** 仓库参数识别（`FP-01`）；`refs/tags/*` 目标支持（保持现有拒绝，`COMPATIBILITY.md` 有意差异）；配置 refspec 的目标命名空间放宽（`FP-09`）。
 
 **Current evidence:**
@@ -1070,7 +1073,7 @@ PY
 
 **Acceptance criteria:**
 
-- [ ] **AC1** `libra fetch origin refs/heads/main:refs/custom/main` 后 `refs/custom/main` 指向 S1。
+- [ ] **AC1（草稿待整改）** F09-TRACE 中 `libra fetch origin refs/libra/traces/unique:refs/libra/traces/unique` 后目标 trace ref 指向 T1。
 - [ ] **AC2** 配置 `remote.rd.fetch=+refs/heads/*:refs/rd/*` 后 `libra fetch rd` 使 `RefMap(w)` 恰比调用前多出 `refs/rd/main`→S1 与 `refs/rd/side`→S2 两项。
 - [ ] **AC3** `repo_c`、`repo_d` 两个非常规配置下 `libra fetch --all` 使 `RefMap(w)` 恰比调用前多出两个命名空间下的四项。
 - [ ] **AC4** `libra fetch origin refs/heads/main:refs/tags/x` 以 `LBR-CLI-002` 失败。
@@ -1082,7 +1085,7 @@ PY
 
 **AC → 断言映射:**（夹具 F09：临时目录 `D` 下源仓库 `D/s`（`main`→S1、`side`→S2，S1≠S2，无 tag）；工作仓库 `D/w`（提交 W1，无 tag）以 `libra remote add` 配置 `origin`→`../s`；AC2 的副本另配 remote `rd`→`../s`、`remote.rd.fetch=+refs/heads/*:refs/rd/*`；AC3 的副本不配置 `origin`，只配 remote `repo_c`→`../s`（`remote.repo_c.fetch=+refs/heads/*:refs/remotes/extra_dir/repo_c/extra_dir/*`）与 `repo_d`→`../s`（`remote.repo_d.fetch=+refs/heads/*:refs/repo_d/*`）；AC5、AC6 的副本只配置 `origin` 与 `bad`→`../s`（`remote.bad.fetch=+refs/heads/*:refs/a..b/*`）；每个 AC 在独立同构副本上执行；每个 AC 的调用另按「验证执行协议」第 4 项取所需快照；标注「Git 同夹具期望」的值按该项以钉选 Git 复核）
 
-- AC1 → `command::fetch_test::fetch_unconventional_destination_namespace`：期望 exit 0；`Ref(D/w, refs/custom/main)` 逐字等于 S1。
+- AC1 → `command::fetch_test::fetch_unconventional_destination_namespace`：独立 F09-TRACE 夹具使用临时 Git 裸源仓库，`main`→M1、`refs/libra/traces/unique`→T1；T1 为仅经 trace 可达的子提交，含 `trace.txt` 固定虚构内容 `unique fictional trace payload\n`。客户端仅 clone `main`，使用其 origin 指向该源，前置断言 T1 不在客户端对象库。上述 fetch 期望 exit 0，`rev-parse` 和 `show-ref` 读出目标 T1，以目标读取 `trace.txt` 得到相同字节；Git 同夹具同 refspec 对照。原 `refs/heads/main:refs/custom/main` 场景保留为回归对照（目标指向 S1）。**评审阻断：**该映射含多个独立判据并弱化原 AC1，实际计数超出 G-03；须拆分或重设计并同步审计表、依赖和验收后重新评审。
 - AC2 → `command::fetch_test::fetch_unconventional_destination_namespace`：期望 exit 0；调用后 `RefMap(D/w)` 逐字等于调用前加上 `{refs/rd/main→S1, refs/rd/side→S2}`。
 - AC3 → `command::fetch_test::fetch_unconventional_destination_namespace`：期望 exit 0；调用后 `RefMap(D/w)` 逐字等于调用前加上 `{refs/repo_d/main→S1, refs/repo_d/side→S2, refs/remotes/extra_dir/repo_c/extra_dir/main→S1, refs/remotes/extra_dir/repo_c/extra_dir/side→S2}`（Git 同夹具期望，`t2024:180`）。
 - AC4 → `command::fetch_test::fetch_unconventional_destination_namespace`：期望退出码非 0 且 stderr 含 `LBR-CLI-002`。
