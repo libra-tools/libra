@@ -950,7 +950,7 @@
 
 ### Task DESC-10b: `remotes/` 命名空间 describe 后缀解析 commit
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空` | **Priority / Selection:** P1 | **Issue:** [#798](https://github.com/libra-tools/libra/issues/798)、[#799](https://github.com/libra-tools/libra/issues/799)
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `complete`（2026-11-21：`remotes/` 早返回分支按同一 `ref_rev_parse_rules` 顺序——本命名空间字面远程跟踪分支 → 完整名字的 tag → 完整名字的本地分支 → describe 后缀，字面引用优先。用例 `describe_suffix_inside_the_remotes_namespace` 覆盖 AC1/AC2（`remotes/x-1-g<缩写|全长>` → commit）与 AC3（`remotes/origin/rlit-1-g<ab>` 字面跟踪分支优先）。`rev_parse_test` **57/57**；文档 EN/zh-CN 同步；版本面 0.30.267 → 0.30.268。本卡为 `REL-DESC-09` 子卡 7/16，只本地签名提交。按用户 2026-11-20 指令在 `main` 直接提交推送。） | **Priority / Selection:** P1 | **Issue:** [#798](https://github.com/libra-tools/libra/issues/798)、[#799](https://github.com/libra-tools/libra/issues/799)
 
 **Description:** 自 `DESC-09` 拆出；家族 `REL-DESC-09` 子卡（7/16）。在 `remotes/`/`refs/remotes/` 早返回分支（`src/utils/util.rs:2450-2455`）中，对以 `remotes/` 开头的名字：本命名空间字面查找未命中且名字符合 describe 语法时，先按 `ADR-DESC-03` ①「字面查找顺序」以完整名字查找 tag、本地分支与远程跟踪引用，仍未命中才调用 describe 后缀 helper（含 `DESC-09b` 的缺失与 commit 优先消歧语义）解析 commit；字面引用优先。非提交对象由同家族的 `DESC-10h` 放开、其它前缀由同家族各自的卡接入（家族内实现顺序：中间态只存在于本地子卡提交、不对外发布，故不设临时边界判据，见 `REL-DESC-09`）。
 

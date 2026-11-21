@@ -75,8 +75,9 @@ full-length id must exist, and a non-hex or shorter-than-4-character id fails wi
 namespace accepts every object type, like Git. The `tags/` namespace resolves a
 describe suffix after its own literal tag lookup and the complete-name lookups of
 local and remote-tracking branches, so a real ref with that exact name always wins.
-The same order applies inside the `heads/` namespace (literal branch, then
-the complete-name tag and remote-tracking lookups, then the describe suffix).
+The same order applies inside the `heads/` and `remotes/` namespaces (literal
+branch, then the complete-name lookups in the other namespaces, then the describe
+suffix).
 
 | Flag | Description |
 |------|-------------|
