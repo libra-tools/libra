@@ -545,6 +545,16 @@ async fn execute_with_output_contract(args: CatFileArgs, output: &OutputConfig) 
     let hash = resolve_object_safe(object_ref, &storage).await?;
     let obj_type = storage
         .get_object_type(&hash)
+        .or_else(|error| {
+            // A promisor clone fetches a missing object on demand.
+            if matches!(error, GitError::ObjectNotFound(_))
+                && crate::command::try_lazy_fetch_object(&hash)
+            {
+                storage.get_object_type(&hash)
+            } else {
+                Err(error)
+            }
+        })
         .map_err(|error| match error {
             GitError::ObjectNotFound(_) => invalid_object_name_error(object_ref),
             _ => CliError::fatal(format!(
@@ -988,7 +998,14 @@ fn format_batch_line(format: &str, hash: &ObjectHash, obj_type: &str, size: usiz
     result
 }
 
-async fn resolve_object_safe(object_ref: &str, _storage: &ClientStorage) -> CliResult<ObjectHash> {
+async fn resolve_object_safe(object_ref: &str, storage: &ClientStorage) -> CliResult<ObjectHash> {
+    // A promisor clone resolves a missing object by fetching it on demand; the
+    // id is already exact, so this needs no name resolution.
+    if let Ok(oid) = crate::internal::object_format::parse_repo_oid(object_ref.trim())
+        && storage.get_object_type(&oid).is_err()
+    {
+        let _ = crate::command::try_lazy_fetch_object(&oid);
+    }
     util::resolve_object_spec_with_auto_merge_typed(object_ref)
         .await
         .map_err(|error| match error {

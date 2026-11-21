@@ -1544,7 +1544,7 @@ PY
 ### Task CL-29: 实现 `sparse:oid` 过滤与预期缺失对象边界（#748；`PM-33`/`t5616#33` 前置）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `complete`（2026-11-21：`ObjectFilter::SparseOid { spec, rules }`（`ObjectFilter` 不再 `Copy`）；`apply_object_filter` 从包内 commit/tree entry 重建根 tree 集合并递归 walk，用 `sparse_rule_matches`（`/x` 锚定、否则按尾部件匹配）求命中 blob 集合——保留全部提交与 tree，只保留命中规则的 blob；`CL-12` 的 `validate_sparse_oid_filter` 改为返回规则集并由克隆装配过滤器，`remote.<n>.partialclonefilter` 原样记录 `sparse:oid=<rev>:<path>`；`LocalClient` 对 blob/tree want 直接成包（`direct_object_entry`），配合 `cat-file` 的 `resolve_object_safe`/`get_object_type` 懒加载钩子，被过滤的 blob 可按需拉取（AC5）。用例 `test_clone_sparse_oid_filter_and_missing_boundary` 覆盖 AC1–AC6（夹具三 blob OID 互异且与其余不同、克隆成功、对象存在性逐项等于「提交/tree 或 one.t」，promisor/partialclonefilter 逐字断言、`show-ref` 含 `refs/remotes/origin/main`、`cat-file -p <two.t>` 按需取回且内容一致）；CL-13/CL-24 用例的存在性检查改用 `--offline` 以免懒加载改变观测（语义变更登记）。`clone_test` **67/67**、`fetch_test` 68/68、`cat_file_test` 34/34、`compat_version_surface_sync` 2/2；版本面 0.30.230 → 0.30.231；文档 EN/zh-CN/开发同步。按用户 2026-11-20 指令在 `main` 直接提交推送。）
 **Description:** 自 `CL-24` 拆出：在 `clone.rs`、`fetch.rs`、`protocol/mod.rs` 与 `local_client.rs` 实现 `--filter=sparse:oid=<object-expression>` 的传输、稀疏对象闭包与 promisor 预期缺失元数据。对象表达式必须解析为包含稀疏匹配规则的 blob（不是 tree）；并同卡改写 `CL-12` 测试的 AC6 过渡断言（有效 `sparse:oid` 改为断言克隆成功）；使部分克隆能够表达并保留 Git `sparse:oid` 过滤边界，供 `PM-33`（自 `PM-03` 拆出，见 `DEP-CL-14`）的 `t5616#33`/`TC-0625` `--missing=print|allow-promisor|error` 验收消费。
 **Out of scope:** `rev-list --missing=<action>` 命令行为（`PM-33`）；`Receiving objects` 进度与最终 `cat-file` 收口（`CL-21`）。
 **Current evidence:**

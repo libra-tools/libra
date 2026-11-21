@@ -483,12 +483,12 @@ fn validate_sparse_oid_filter(
     discovery: &DiscoveryResult,
     spec: &str,
     filter: &str,
-) -> Result<(), CloneError> {
+) -> Result<Vec<String>, CloneError> {
     let fetch::RemoteClient::Local(client) = remote_client else {
-        return Ok(());
+        return Ok(Vec::new());
     };
     if !client.is_libra_source() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let (rev, path) = match spec.split_once(':') {
         Some((rev, path)) => (rev, path),
@@ -528,19 +528,23 @@ fn validate_sparse_oid_filter(
             filter: filter.to_string(),
         })?;
     let text = String::from_utf8_lossy(&bytes);
-    let parsed = text
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .all(|line| {
-            let line = line.trim();
-            line.starts_with('/') || line.starts_with('!') || !line.contains('\0')
-        });
-    if !parsed {
+    if text.contains('\0') {
         return Err(CloneError::SparseFilterInvalid {
             filter: filter.to_string(),
         });
     }
-    Ok(())
+    let rules = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if rules.is_empty() {
+        return Err(CloneError::SparseFilterInvalid {
+            filter: filter.to_string(),
+        });
+    }
+    Ok(rules)
 }
 
 /// Resolve `<path>` inside the commit's tree, returning the blob id.
@@ -1788,7 +1792,7 @@ async fn execute_clone_inner(
 
     // Filters this build does not implement fail closed instead of silently
     // cloning everything (Git's `list-objects-filter` validation).
-    let object_filter = match normalize_clone_filter(&args.filter) {
+    let mut object_filter = match normalize_clone_filter(&args.filter) {
         Ok(filter) => filter,
         Err(error) => return Err((error, None)),
     };
@@ -1842,11 +1846,16 @@ async fn execute_clone_inner(
     // `--filter=sparse:oid=<rev>:<path>` is validated against the source before
     // the destination exists, like Git's `list-objects-filter` setup.
     for filter in &args.filter {
-        if let Some(spec) = filter.trim().strip_prefix("sparse:oid=")
-            && let Err(error) =
-                validate_sparse_oid_filter(&remote_client, &discovery, spec, filter.trim())
-        {
-            return Err((error, None));
+        if let Some(spec) = filter.trim().strip_prefix("sparse:oid=") {
+            match validate_sparse_oid_filter(&remote_client, &discovery, spec, filter.trim()) {
+                Ok(rules) => {
+                    object_filter = Some(ObjectFilter::SparseOid {
+                        spec: filter.trim().to_string(),
+                        rules,
+                    });
+                }
+                Err(error) => return Err((error, None)),
+            }
         }
     }
 
@@ -2288,7 +2297,7 @@ async fn clone_into_destination(
     } else {
         object_filter
     };
-    if let Some(filter) = object_filter {
+    if let Some(filter) = &object_filter {
         let spec = filter.config_value();
         let _ = ConfigKv::set(&format!("remote.{remote_name}.promisor"), "true", false).await;
         let _ = ConfigKv::set(

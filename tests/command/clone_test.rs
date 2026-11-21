@@ -4057,7 +4057,9 @@ fn test_clone_filter_promisor_config_and_combine() {
         }
         let expect_present = kind != "blob";
         for repo in [&d, &d2, &d3] {
-            let present = run_libra_command(&["cat-file", "-e", oid], repo)
+            // `--offline` keeps the promisor lazy fetch from materialising the
+            // blob during the existence check (CL-29).
+            let present = run_libra_command(&["--offline", "cat-file", "-e", oid], repo)
                 .status
                 .success();
             assert_eq!(present, expect_present, "AC4: {oid} ({kind}) in {:?}", repo);
@@ -4208,8 +4210,10 @@ fn test_clone_combine_tree_depth_and_fallback() {
         assert_cli_success(&run_libra_command(&argv, root.path()), "bare combine clone");
         dest
     };
+    // `--offline` keeps the promisor lazy fetch from materialising an object
+    // during the existence check (CL-29).
     let exists = |repo: &std::path::Path, oid: &str| {
-        run_libra_command(&["cat-file", "-e", oid], repo)
+        run_libra_command(&["--offline", "cat-file", "-e", oid], repo)
             .status
             .success()
     };
@@ -4318,6 +4322,109 @@ fn test_clone_combine_tree_depth_and_fallback() {
             "AC8: {sample:?}"
         );
     }
+}
+
+#[test]
+fn test_clone_sparse_oid_filter_and_missing_boundary() {
+    use crate::command::{assert_cli_success, run_libra_command};
+
+    let source = tempdir().expect("source dir");
+    let sp = source.path();
+    assert_cli_success(&run_libra_command(&["init"], sp), "init source");
+    run_libra_command(&["config", "set", "user.name", "t"], sp);
+    run_libra_command(&["config", "set", "user.email", "t@t"], sp);
+    std::fs::write(sp.join("one.t"), "one\n").expect("write one.t");
+    std::fs::write(sp.join("two.t"), "two\n").expect("write two.t");
+    std::fs::write(sp.join("only-one"), "/one.t\n").expect("write only-one");
+    assert_cli_success(&run_libra_command(&["add", "."], sp), "stage the fixture");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c1", "--no-verify"], sp),
+        "commit the fixture",
+    );
+
+    let rev_parse = |spec: &str| {
+        let out = run_libra_command(&["rev-parse", spec], sp);
+        assert_cli_success(&out, "rev-parse");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let one_blob = rev_parse("HEAD:one.t");
+    let two_blob = rev_parse("HEAD:two.t");
+    let rules_blob = rev_parse("HEAD:only-one");
+    assert!(
+        one_blob != two_blob && one_blob != rules_blob && two_blob != rules_blob,
+        "the three fixture blobs must differ"
+    );
+
+    let root = tempdir().expect("dest root");
+    let dest = root.path().join("d");
+    let source_url = format!("file://{}", sp.display());
+    let clone = run_libra_command(
+        &[
+            "clone",
+            "--bare",
+            "--filter=sparse:oid=main:only-one",
+            &source_url,
+            dest.to_str().expect("dest"),
+        ],
+        root.path(),
+    );
+    // AC1
+    assert_cli_success(&clone, "AC1: sparse:oid clone");
+
+    // AC2: commits and trees stay; only the matched blob is present.
+    let listing = run_libra_command(&["rev-list", "--objects", "--all"], sp);
+    assert_cli_success(&listing, "AC2: list the source objects");
+    let mut checked = 0usize;
+    for line in String::from_utf8_lossy(&listing.stdout).lines() {
+        let Some(oid) = line.split_whitespace().next() else {
+            continue;
+        };
+        if oid.len() < 8 {
+            continue;
+        }
+        let kind = run_libra_command(&["cat-file", "-t", oid], sp);
+        let kind = String::from_utf8_lossy(&kind.stdout).trim().to_string();
+        if kind.is_empty() {
+            continue;
+        }
+        let present = run_libra_command(&["--offline", "cat-file", "-e", oid], &dest)
+            .status
+            .success();
+        let expected = kind == "commit" || kind == "tree" || oid == one_blob;
+        assert_eq!(present, expected, "AC2: {oid} ({kind})");
+        checked += 1;
+    }
+    assert!(checked > 0, "AC2: the object set must not be empty");
+
+    // AC3/AC6: the promisor rows record the filter verbatim.
+    let get = |key: &str| {
+        let out = run_libra_command(&["config", "get", key], &dest);
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+    assert_eq!(get("remote.origin.promisor"), "true\n", "AC3");
+    assert_eq!(
+        get("remote.origin.partialclonefilter"),
+        "sparse:oid=main:only-one\n",
+        "AC6"
+    );
+
+    // AC4: the bare clone still records the remote-tracking ref.
+    let show_ref = run_libra_command(&["show-ref"], &dest);
+    assert!(
+        String::from_utf8_lossy(&show_ref.stdout).contains("refs/remotes/origin/main"),
+        "AC4: {}",
+        String::from_utf8_lossy(&show_ref.stdout)
+    );
+
+    // AC5: the filtered-out blob is fetched on demand.
+    let source_content = run_libra_command(&["cat-file", "-p", "HEAD:two.t"], sp);
+    assert_cli_success(&source_content, "AC5: source content");
+    let fetched = run_libra_command(&["cat-file", "-p", &two_blob], &dest);
+    assert_cli_success(&fetched, "AC5: on-demand blob fetch");
+    assert_eq!(
+        fetched.stdout, source_content.stdout,
+        "AC5: fetched contents"
+    );
 }
 
 #[test]

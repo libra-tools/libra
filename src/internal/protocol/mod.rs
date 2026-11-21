@@ -207,31 +207,37 @@ pub fn get_wire_hash_kind() -> HashKind {
 /// advertisement parser and request builders.
 /// Object filters this build honours on a local transfer. Remote negotiation
 /// (network clients) is tracked separately (`DEFER-CL-08`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ObjectFilter {
     /// Git's `blob:none`: commits and trees only.
     BlobNone,
     /// `blob:none` plus tree depth 1: commits and their root trees only.
     BlobNoneTreeDepth1,
+    /// Git's `sparse:oid=<rev>:<path>`: every commit and tree, plus the blobs
+    /// whose path matches one of the sparse rules in `spec`.
+    SparseOid { spec: String, rules: Vec<String> },
 }
 
 impl ObjectFilter {
     /// The `remote.<name>.partialclonefilter` value this filter records.
-    pub fn config_value(self) -> &'static str {
+    pub fn config_value(&self) -> &str {
         match self {
             ObjectFilter::BlobNone => "blob:none",
             ObjectFilter::BlobNoneTreeDepth1 => "combine:blob:none+tree:1",
+            ObjectFilter::SparseOid { spec, .. } => spec,
         }
     }
 
-    /// Whether an object of `object_type` survives this filter.
-    pub fn keeps(self, object_type: git_internal::internal::object::types::ObjectType) -> bool {
+    /// Whether an object of `object_type` can survive this filter at all.
+    ///
+    /// `SparseOid` keeps every commit and tree, so only blobs are candidates;
+    /// the path match itself is resolved by `apply_object_filter`, which has the
+    /// pack's trees available.
+    pub fn keeps(&self, object_type: git_internal::internal::object::types::ObjectType) -> bool {
         match self {
-            ObjectFilter::BlobNone => {
+            ObjectFilter::BlobNone | ObjectFilter::SparseOid { .. } => {
                 object_type != git_internal::internal::object::types::ObjectType::Blob
             }
-            // Root trees depend on the commit set, so they are selected by
-            // `apply_object_filter`; this predicate only drops blobs.
             ObjectFilter::BlobNoneTreeDepth1 => {
                 object_type != git_internal::internal::object::types::ObjectType::Blob
             }

@@ -193,8 +193,10 @@ transfers commits and their root trees only, recorded as
 closed with `LBR-UNSUPPORTED-001` (`tree:<depth>` other than 1, `object:type=<type>`,
 `blob:limit=<n>`, `sparse:path=<path>`, any other `combine:...`, and repeated `--filter`
 values that do not normalize to one of the supported forms);
-`--filter=sparse:oid=<rev>:<path>` is validated against the source but not yet
-applied. When the source does not advertise the `filter` capability the clone falls back to a
+`--filter=sparse:oid=<rev>:<path>` reads the sparse rules from the blob at
+`<rev>:<path>` and keeps every commit and tree plus only the blobs whose path matches a
+rule, recording `remote.<name>.partialclonefilter=sparse:oid=<rev>:<path>`; a filtered-out
+blob is then fetched on demand from the promisor remote. When the source does not advertise the `filter` capability the clone falls back to a
 full clone (no promisor rows are recorded). Network filter negotiation is not implemented yet. `--shallow-since`
 and `--shallow-exclude` bound shallow history by date or excluded ref, but
 **Libra's fetch uses only `--depth` to request a new shallow cutoff**, so those two

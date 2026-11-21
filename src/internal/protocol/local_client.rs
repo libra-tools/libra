@@ -642,6 +642,9 @@ impl LocalClient {
                     // hash of its `to_data()` (otherwise the receiver re-hashes to a
                     // different OID and the fetched `refs/tags/*` dangles).
                     let mut tag_entries: Vec<Entry> = Vec::new();
+                    // Blob/tree wants are transferred verbatim: a promisor lazy
+                    // fetch asks for exactly one object.
+                    let mut direct_entries: Vec<Entry> = Vec::new();
                     let mut commit_targets: Vec<String> = Vec::new();
                     for want_hash in want {
                         let Ok(oid) = crate::internal::object_format::parse_repo_oid(want_hash)
@@ -649,6 +652,12 @@ impl LocalClient {
                             commit_targets.push(want_hash.clone());
                             continue;
                         };
+                        if let Some(entry) = direct_object_entry(&oid) {
+                            if seen.insert(oid.to_string()) {
+                                direct_entries.push(entry);
+                            }
+                            continue;
+                        }
                         match tag::load_object_trait(&oid).await {
                             Ok(tag::TagObject::Tag(tag_obj)) => {
                                 let mut current = tag_obj;
@@ -743,6 +752,7 @@ impl LocalClient {
                     all_entries.extend(tree_entries);
                     all_entries.extend(blob_entries);
                     all_entries.extend(tag_entries);
+                    all_entries.extend(direct_entries);
 
                     // The Libra-native fetch path does not negotiate shallow
                     // boundaries, so no `shallow` lines are emitted.
@@ -1327,6 +1337,46 @@ fn empty_pack_bytes(hash_kind: HashKind) -> Vec<u8> {
     pack
 }
 
+/// Build the pack entry for a blob or tree want, if `oid` is one.
+///
+/// A promisor lazy fetch asks for a single missing object, so those wants are
+/// transferred as-is instead of being walked as commits.
+fn direct_object_entry(oid: &ObjectHash) -> Option<Entry> {
+    let storage = ClientStorage::try_init(crate::utils::path::objects()).ok()?;
+    let object_type = storage.get_object_type(oid).ok()?;
+    match object_type {
+        ObjectType::Blob | ObjectType::Tree => {
+            let data = storage.get(oid).ok()?;
+            Some(Entry {
+                obj_type: object_type,
+                data,
+                hash: *oid,
+                chain_len: 0,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Match one sparse-rule line against a repository path.
+///
+/// `/x` is anchored at the root (the file itself or everything under `x/`);
+/// an unanchored rule matches any path whose trailing components match.
+fn sparse_rule_matches(rule: &str, path: &str) -> bool {
+    let rule = rule.trim();
+    if rule.is_empty() || rule.starts_with('#') || rule.starts_with('!') {
+        return false;
+    }
+    if let Some(anchored) = rule.strip_prefix('/') {
+        let anchored = anchored.trim_end_matches('/');
+        return path == anchored || path.starts_with(&format!("{anchored}/"));
+    }
+    let rule = rule.trim_end_matches('/');
+    path == rule
+        || path.ends_with(&format!("/{rule}"))
+        || path.split('/').any(|component| component == rule)
+}
+
 /// Apply `filter` to a pack's object list.
 ///
 /// Tree-depth filtering depends on the commit set, so the surviving root trees
@@ -1337,6 +1387,56 @@ fn apply_object_filter(entries: Vec<Entry>, filter: ObjectFilter) -> Vec<Entry> 
             .into_iter()
             .filter(|entry| filter.keeps(entry.obj_type))
             .collect(),
+        ObjectFilter::SparseOid { rules, .. } => {
+            let mut roots = std::collections::HashSet::new();
+            let mut trees = std::collections::HashMap::new();
+            for entry in &entries {
+                match entry.obj_type {
+                    ObjectType::Commit => {
+                        if let Ok(commit) = Commit::from_bytes(&entry.data, entry.hash) {
+                            roots.insert(commit.tree_id);
+                        }
+                    }
+                    ObjectType::Tree => {
+                        if let Ok(tree) = Tree::from_bytes(&entry.data, entry.hash) {
+                            trees.insert(entry.hash, tree);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let mut keep = std::collections::HashSet::new();
+            let mut pending: Vec<(ObjectHash, String)> = roots
+                .into_iter()
+                .map(|root| (root, String::new()))
+                .collect();
+            while let Some((tree_id, prefix)) = pending.pop() {
+                let Some(tree) = trees.get(&tree_id) else {
+                    continue;
+                };
+                for item in &tree.tree_items {
+                    let path = if prefix.is_empty() {
+                        item.name.clone()
+                    } else {
+                        format!("{prefix}/{}", item.name)
+                    };
+                    if matches!(item.mode, TreeItemMode::Tree) {
+                        pending.push((item.id, path));
+                    } else if matches!(item.mode, TreeItemMode::Blob)
+                        && rules.iter().any(|rule| sparse_rule_matches(rule, &path))
+                    {
+                        keep.insert(item.id);
+                    }
+                }
+            }
+            entries
+                .into_iter()
+                .filter(|entry| match entry.obj_type {
+                    ObjectType::Blob => keep.contains(&entry.hash),
+                    _ => true,
+                })
+                .collect()
+        }
         ObjectFilter::BlobNoneTreeDepth1 => {
             let mut roots = std::collections::HashSet::new();
             for entry in &entries {
