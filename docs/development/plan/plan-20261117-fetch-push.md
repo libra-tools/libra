@@ -420,10 +420,10 @@ PY
 **Acceptance criteria:**
 
 - [x] **AC1** `libra fetch parent refs/heads/main`（未配置 `parent` remote）的 `.libra/FETCH_HEAD` 首条记录 OID 等于 `parent` 的 `main`（P1）。
-- [ ] **AC2** AC1 的调用不改变引用状态：调用前后 `R(child)` 逐字相等。
-- [ ] **AC3** AC1 的调用不写入配置：调用前后 `config_kv` 表全部行逐字相等。
+- [x] **AC2** AC1 的调用不改变引用状态：调用前后 `R(child)` 逐字相等。
+- [x] **AC3** AC1 的调用不写入配置：调用前后 `config_kv` 表全部行逐字相等。
 - [x] **AC4** `libra fetch pbare refs/heads/main`（`pbare` 是裸 Libra 仓库目录，未配置同名 remote）的 `FETCH_HEAD` 首条记录 OID 等于 Q1。
-- [ ] **AC5** 已配置 remote `parent`（URL 指向 `Q`）且同名目录 `parent` 也存在时，`libra fetch parent refs/heads/main` 取自配置 remote：`FETCH_HEAD` 首条记录 OID 等于 Q1。
+- [x] **AC5** 已配置 remote `parent`（URL 指向 `Q`）且同名目录 `parent` 也存在时，`libra fetch parent refs/heads/main` 取自配置 remote：`FETCH_HEAD` 首条记录 OID 等于 Q1。
 - [x] **AC6** `libra fetch nosuch refs/heads/main`（既无 remote `nosuch` 也无目录 `nosuch`）以 `LBR-CLI-003` 失败。
 - [x] **AC7** `libra fetch plain refs/heads/main`（`plain` 是存在但非 Libra 仓库的目录）以 `LBR-CLI-003` 失败。
 - [x] **AC8** `libra pull parent main`（未配置 `parent` remote）仍以 `LBR-CLI-003` 失败（本卡不改变 `pull` 的仓库参数解析）。
@@ -479,12 +479,12 @@ PY
 
 **Acceptance criteria:**
 
-- [ ] **AC1** `libra push src1 one:refs/heads/trunk`（未配置 `src1` remote）后 `src1` 的 `refs/heads/trunk` 指向 W2。
+- [x] **AC1** `libra push src1 one:refs/heads/trunk`（未配置 `src1` remote）后 `src1` 的 `refs/heads/trunk` 指向 W2。
 - [ ] **AC2** 已配置 remote `src1`（URL 指向 `D/x`）且同名目录 `src1` 也存在时，`libra push src1 one:refs/heads/trunk` 推向 `D/x`：`D/x` 的 `refs/heads/trunk` 指向 W2。
 - [ ] **AC3** AC2 的调用前后同名目录仓库的 `R(D/w/src1)` 逐字相等。
-- [ ] **AC4** `libra push wt one:refs/heads/trunk`（`wt` 是非裸 Libra 仓库目录、HEAD 分离，未配置同名 remote）后 `wt` 的 `refs/heads/trunk` 指向 W2。
+- [x] **AC4** `libra push wt one:refs/heads/trunk`（`wt` 是非裸 Libra 仓库目录、HEAD 分离，未配置同名 remote）后 `wt` 的 `refs/heads/trunk` 指向 W2。
 - [x] **AC5** `libra push nosuch one:refs/heads/trunk` 以 `LBR-CLI-003` 失败。
-- [ ] **AC6** `libra push plain one:refs/heads/trunk`（`plain` 存在但非 Libra 仓库）以 `LBR-CLI-003` 失败。
+- [x] **AC6** `libra push plain one:refs/heads/trunk`（`plain` 存在但非 Libra 仓库）以 `LBR-CLI-003` 失败。
 - [ ] ER-06/ER-06a 同卡强制门：`Docs and compatibility impact` 所列每个文件按「文档与网站验收命令」第 1–7 步逐文件交付并验收（不计入卡特有 AC 分子）。
 
 **AC → 断言映射:**（夹具 F02：临时目录 `D` 下工作仓库 `D/w`（提交 W1、`main`→W1，另有分支 `one`→W2，W2≠W1）；`D/w/src1` 为 `libra init --bare` 建立的裸 Libra 仓库（空）；`D/w/wt` 为以 `libra init wt` 建立、提交 V1 后执行 `libra switch --detach HEAD` 的非裸 Libra 仓库（不含 `trunk`）；`D/w/plain/` 为存在但非 Libra 仓库的普通目录；`D/x` 为另一个裸 Libra 仓库（空）；AC2 与 AC3 的副本另在 `D/w` 执行 `libra remote add src1 ../x`，其余副本不配置 remote `src1`；每个 AC 在独立同构副本上执行；被测 push 调用均以 `cwd=D/w` 运行，夹具建立（含 `D/w/wt` 内的提交与分离 HEAD）与 `Ref`/`R` 读取在各自仓库目录内运行；每个 AC 的调用另按「验证执行协议」第 4 项取所需快照；标注「Git 同夹具期望」的值按该项以钉选 Git 复核）
@@ -541,7 +541,7 @@ PY
 - [ ] **AC4** 依次配置 `refs/heads/*:refs/heads/mirror/*` 与 `^refs/heads/topic` 后 `libra push origin` 使 `RefMap(o)` 恰多出 `mirror/main` 一项。
 - [ ] **AC5** 配置 `remote.origin.push=refs/heads/topic:refs/heads/published` 时，`libra push origin main` 只按命令行推送：`RefMap(o)` 恰为调用前把 `refs/heads/main` 由 M0 改为 M1。
 - [ ] **AC6** 未配置 `remote.origin.push` 时 `libra push origin` 以 `LBR-CLI-002` 失败。
-- [ ] **AC7** AC6 的调用前后 `R(D/o)` 逐字相等。
+- [x] **AC7** AC6 的调用前后 `R(D/o)` 逐字相等。
 - [ ] ER-06/ER-06a 同卡强制门：`Docs and compatibility impact` 所列每个文件按「文档与网站验收命令」第 1–7 步逐文件交付并验收（不计入卡特有 AC 分子）。
 
 **AC → 断言映射:**（夹具 F03：临时目录 `D` 下推送方仓库 `D/p`（先提交 M0，再提交 M1 使 `main`→M1；以 `libra switch -c topic` 提交 M2 后 `libra switch main`，`topic`→M2；M0、M1、M2 两两不同）；目标裸 Libra 仓库 `D/o`（`libra init --bare` 建立；`D/p` 在只有 M0 时以 `libra push ../o main:refs/heads/main` 推入，之后才提交 M1，故 `D/o` 初始只含 `refs/heads/main`→M0）；`D/p` 以 `libra remote add origin ../o` 配置；每个 AC 在独立同构副本上执行，配置值以 `libra config --add remote.origin.push <值>` 按列出顺序写入；全部 push 以 `cwd=D/p` 运行；每个 AC 的调用另按「验证执行协议」第 4 项取所需快照；标注「Git 同夹具期望」的值按该项以钉选 Git 复核）
@@ -659,7 +659,7 @@ PY
 - [ ] **AC5** 目标为 `ignore` 时 `libra push ../t main` 后目标 `refs/heads/main` 指向 T2。
 - [ ] **AC6** AC5 的 stderr 不含 `updating the current branch`。
 - [ ] **AC7** 目标为 `refuse` 时 `libra push ../t main` 以 `LBR-REPO-003` 失败。
-- [ ] **AC8** AC7 的调用前后目标 `R(D/t)` 逐字相等。
+- [x] **AC8** AC7 的调用前后目标 `R(D/t)` 逐字相等。
 - [ ] ER-06/ER-06a 同卡强制门：`Docs and compatibility impact` 所列每个文件按「文档与网站验收命令」第 1–7 步逐文件交付并验收（不计入卡特有 AC 分子）。
 
 **AC → 断言映射:**（夹具 F05：临时目录 `D` 下非裸目标仓库 `D/t`（提交 T1，当前检出分支 `main`→T1，工作区含已跟踪文件 `f`=`v1`）；推送方 `D/p` 自 `D/t` 克隆后在 `main` 上新增提交 T2（修改 `f`=`v2`）；每个 AC 在独立同构副本上执行，目标配置以 `cwd=D/t` 的 `libra config receive.denyCurrentBranch <值>` 写入（「未配置」即不写）；push 以 `cwd=D/p` 运行，仓库参数 `../t`；每个 AC 的调用另按「验证执行协议」第 4 项取所需快照；标注「Git 同夹具期望」的值按该项以钉选 Git 复核）
@@ -1356,7 +1356,7 @@ PY
 
 ### Task FP-13: fetch 人读更新报告改到 stderr、对齐 Git 列格式并列出 `FETCH_HEAD` 计划（含 `--dry-run`）（#878）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `in-progress` / `locally-accepted`（2026-11-20：人读报告迁 stderr（AC1）；无更新静默（AC3）；`* branch <src> -> FETCH_HEAD` 行随写 FETCH_HEAD 输出（AC4/AC6）；`--no-write-fetch-head` 抑制写入与该行（AC8）；dry-run 不变（AC7 用例）；**列格式已改为 Git `display_ref_update` 风格** ` <flag> <summary:<17> <src:<11> -> <dst>`，实测输出 ` * [new branch]      main4       -> origin/main4`，`fetch_test` **65/65**。**剩余**：AC2 的逐字夹具断言（需与卡内四行期望逐一比对）尚未落测。`T-5` 按用户目标 3.5 豁免。）
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `complete`（2026-11-20：人读报告全部写到 stderr（AC1）；逐字布局对齐 Git `display_ref_update` ` <flag> <summary:<17> <src:<10> -> <dst>`（AC2，新增 `fetch_human_report_on_stderr_with_fetch_head_plan` 断言四行逐字，含 `<o..n>`、`[new branch]`、`[new tag]`）；无更新时静默（AC3）；`fetch origin <ref>` 输出 `* branch <src> -> FETCH_HEAD`（AC4/AC6，仅在命令行 refspec 存在时）；`--no-write-fetch-head` 既不写文件也不输出该行（AC8）；dry-run 前后仓库逐字不变（AC7，`fetch_dry_run_leaves_the_repository_unchanged`）。`fetch_test` 全模块 **66/66 通过**；版本面 0.30.221。`T-5` 全量门按用户目标 3.5 豁免并登记残余风险：外部脚本若从 stdout 读取 fetch 人读报告需迁移。按用户 2026-11-20 指令在 `main` 直接提交推送。）
 
 **Description:** 按 ADR-FP-05 重写人读输出（非 `--json`/`--machine`/`--porcelain`/`--quiet`）：全部写到 stderr、stdout 为空；有可显示的更新时先输出 `From <url>`，每条更新一行，格式与列宽按 ADR-FP-05；只写入 `FETCH_HEAD` 而无本地目标的 ref 显示为 ` * branch <src> -> FETCH_HEAD`（`--dry-run` 时总显示，即使同时给 `--no-write-fetch-head`；非 `--dry-run` 且 `--no-write-fetch-head` 时不显示）；非 `--verbose` 时无任何更新则不输出任何内容（`--verbose` 只保留现有 `Fetching <remote> from <url>` 诊断，见 ADR-FP-05）；删除 ` N objects fetched` 与 `Already up to date with '<remote>'` 行。
 

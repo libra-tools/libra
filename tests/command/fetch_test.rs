@@ -3845,3 +3845,87 @@ fn fetch_dry_run_leaves_the_repository_unchanged() {
         "AC7: dry-run must not touch FETCH_HEAD"
     );
 }
+
+#[test]
+fn fetch_human_report_on_stderr_with_fetch_head_plan() {
+    use crate::command::{run_libra_command, run_libra_command_with_env};
+
+    let root = tempdir().unwrap();
+    let src = root.path().join("s");
+    assert!(
+        run_libra_command(&["init", src.to_str().unwrap()], root.path())
+            .status
+            .success()
+    );
+    let identity: &[(&str, &str)] = &[
+        ("LIBRA_COMMITTER_NAME", "t"),
+        ("LIBRA_COMMITTER_EMAIL", "t@t"),
+        ("GIT_AUTHOR_NAME", "t"),
+        ("GIT_AUTHOR_EMAIL", "t@t"),
+    ];
+    std::fs::write(src.join("a.txt"), "1\n").unwrap();
+    assert!(run_libra_command(&["add", "a.txt"], &src).status.success());
+    assert!(
+        run_libra_command_with_env(&["commit", "--no-gpg-sign", "-m", "c1"], &src, identity)
+            .status
+            .success()
+    );
+
+    let c = root.path().join("c");
+    assert!(
+        run_libra_command(&["init", c.to_str().unwrap()], root.path())
+            .status
+            .success()
+    );
+    assert!(
+        run_libra_command(&["remote", "add", "origin", src.to_str().unwrap()], &c)
+            .status
+            .success()
+    );
+    assert!(run_libra_command(&["fetch", "origin"], &c).status.success());
+    let old = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], &src).stdout)
+        .trim()
+        .to_string();
+
+    // Advance main, add a branch and a tag, then fetch without a refspec.
+    std::fs::write(src.join("a.txt"), "2\n").unwrap();
+    assert!(run_libra_command(&["add", "a.txt"], &src).status.success());
+    assert!(
+        run_libra_command_with_env(&["commit", "--no-gpg-sign", "-m", "c2"], &src, identity)
+            .status
+            .success()
+    );
+    assert!(
+        run_libra_command(&["branch", "side"], &src)
+            .status
+            .success()
+    );
+    assert!(run_libra_command(&["tag", "t1"], &src).status.success());
+    let new = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], &src).stdout)
+        .trim()
+        .to_string();
+
+    let out = run_libra_command(&["fetch", "origin"], &c);
+    assert!(out.status.success(), "fetch");
+    assert!(
+        out.stdout.is_empty(),
+        "AC1: human output must not use stdout"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let mut lines = stderr.lines();
+    assert!(
+        lines.next().is_some_and(|line| line.starts_with("From ")),
+        "AC2: the report starts with `From <url>`: {stderr}"
+    );
+    let expected = format!(
+        "   {}..{}  main       -> origin/main\n * [new branch]      side       -> origin/side\n * [new tag]         t1         -> t1\n 3 objects fetched",
+        &old[..7],
+        &new[..7]
+    );
+    let rest: Vec<&str> = lines.collect();
+    assert_eq!(
+        rest.join("\n"),
+        expected,
+        "AC2: exact git display_ref_update layout"
+    );
+}

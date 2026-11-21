@@ -1309,6 +1309,7 @@ pub async fn execute_safe(args: FetchArgs, output: &OutputConfig) -> CliResult<(
     let dry_run = args.dry_run;
     let append = args.append;
     let no_write_fetch_head = args.no_write_fetch_head;
+    let cli_refspec_present = args.refspec.is_some();
     let result = run_fetch(args, output).await?;
     // FETCH_HEAD records the fetched refs; `--dry-run` writes nothing.
     if !dry_run && !no_write_fetch_head {
@@ -1322,7 +1323,13 @@ pub async fn execute_safe(args: FetchArgs, output: &OutputConfig) -> CliResult<(
     if porcelain {
         render_fetch_porcelain(&result, output)
     } else {
-        render_fetch_output(&result, output, dry_run, !no_write_fetch_head)
+        render_fetch_output(
+            &result,
+            output,
+            dry_run,
+            !no_write_fetch_head,
+            cli_refspec_present,
+        )
     }
 }
 
@@ -1713,6 +1720,7 @@ fn render_fetch_output(
     output: &OutputConfig,
     dry_run: bool,
     write_fetch_head: bool,
+    cli_refspec_present: bool,
 ) -> CliResult<()> {
     if output.is_json() {
         return emit_json_data("fetch", result, output);
@@ -1762,7 +1770,7 @@ fn render_fetch_output(
         // Refs written only to `FETCH_HEAD` (no local destination) are reported
         // as ` * branch <src> -> FETCH_HEAD` (ADR-FP-05).
         for record in &remote.fetch_head_records {
-            if !write_fetch_head {
+            if !write_fetch_head || !cli_refspec_present {
                 continue;
             }
             let short_src = record
@@ -1795,7 +1803,7 @@ fn render_fetch_output(
                     }
                 }
             };
-            writeln!(writer, " {flag} {summary:<17} {src:<11} -> {dst}")
+            writeln!(writer, " {flag} {summary:<17} {src:<10} -> {dst}")
                 .map_err(|error| CliError::io(format!("failed to write fetch output: {error}")))?;
         }
 
