@@ -737,9 +737,15 @@ pub struct FetchArgs {
     pub dry_run: bool,
 
     /// Do not write `FETCH_HEAD` after the fetch, matching
-    /// `git fetch --no-write-fetch-head`.
-    #[clap(long = "no-write-fetch-head")]
+    /// `git fetch --no-write-fetch-head`: update objects and refs but leave
+    /// `FETCH_HEAD` untouched. `--dry-run` always implies this.
+    #[clap(long = "no-write-fetch-head", overrides_with = "write_fetch_head")]
     pub no_write_fetch_head: bool,
+
+    /// Undo a previous `--no-write-fetch-head` (the last flag wins); still
+    /// ignored under `--dry-run`.
+    #[clap(long = "write-fetch-head", overrides_with = "no_write_fetch_head")]
+    pub write_fetch_head: bool,
 
     /// Append fetched ref records to `.libra/FETCH_HEAD` instead of overwriting
     /// it. Long-only: `-a` is reserved for `--all` (Git's `-a` is `--append`).
@@ -1734,6 +1740,7 @@ async fn run_fetch(args: FetchArgs, output: &OutputConfig) -> CliResult<FetchOut
         multiple: _,
         jobs: _,
         no_all: _,
+        write_fetch_head: _,
     } = args;
     // The multi-refspec caller runs this once per refspec.
     let refspec = refspecs.first().cloned();

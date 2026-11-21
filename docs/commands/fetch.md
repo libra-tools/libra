@@ -176,6 +176,11 @@ libra config remote.origin.prune false  # but never for origin
 
 ## Options
 
+`--no-write-fetch-head` updates objects and refs but leaves `FETCH_HEAD`
+untouched (not created, not rewritten) for every form — single remote, `--all` and
+`--multiple`. `--write-fetch-head` undoes it (the last flag wins), and `--dry-run`
+always suppresses the file even with an explicit `--write-fetch-head`.
+
 With several remotes (`--all`, `--multiple` or `fetch.all`), one failing remote no
 longer aborts the run: the others are still fetched (their refs, objects and
 `FETCH_HEAD` records are kept) and each failure prints

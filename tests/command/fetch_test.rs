@@ -2319,6 +2319,7 @@ fn local_fetch_args(repository: &str, prune: bool, dry_run: bool) -> fetch::Fetc
         multiple: false,
         jobs: None,
         no_all: false,
+        write_fetch_head: false,
         all: false,
         depth: None,
         dry_run,
@@ -5289,4 +5290,139 @@ fn test_fetch_multiple_continues_after_remote_failure() {
     .trim()
     .to_string();
     assert_eq!(resolved, o1, "AC4: the good remote was still fetched");
+}
+
+#[test]
+fn fetch_write_fetch_head_switches() {
+    use crate::command::{assert_cli_success, run_libra_command};
+
+    // `s` (S1) → clone `c`; a later S2 in `s` gives the fetches something to do.
+    let work = tempfile::tempdir().expect("work dir");
+    let s = work.path().join("s");
+    std::fs::create_dir_all(&s).expect("mkdir s");
+    assert_cli_success(&run_libra_command(&["init"], &s), "init s");
+    run_libra_command(&["config", "set", "user.name", "t"], &s);
+    run_libra_command(&["config", "set", "user.email", "t@t"], &s);
+    std::fs::write(s.join("f.txt"), "s1\n").expect("write s1");
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], &s), "stage s1");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "S1", "--no-verify"], &s),
+        "commit S1",
+    );
+    let c = work.path().join("c");
+    assert_cli_success(
+        &run_libra_command(&["clone", "./s", "c"], work.path()),
+        "clone c",
+    );
+    run_libra_command(&["config", "set", "user.name", "t"], &c);
+    run_libra_command(&["config", "set", "user.email", "t@t"], &c);
+    let s2 = {
+        std::fs::write(s.join("f.txt"), "s2\n").expect("write s2");
+        assert_cli_success(&run_libra_command(&["add", "f.txt"], &s), "stage s2");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "S2", "--no-verify"], &s),
+            "commit S2",
+        );
+        String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], &s).stdout)
+            .trim()
+            .to_string()
+    };
+    let fetch_head = c.join(".libra/FETCH_HEAD");
+    let remove_head = || {
+        let _ = std::fs::remove_file(&fetch_head);
+        assert!(!fetch_head.exists(), "FETCH_HEAD absent before the call");
+    };
+
+    // AC1/AC2: no FETCH_HEAD, but the refs still move.
+    remove_head();
+    assert_cli_success(
+        &run_libra_command(&["fetch", "--no-write-fetch-head"], &c),
+        "AC1: fetch --no-write-fetch-head",
+    );
+    assert!(!fetch_head.exists(), "AC1: FETCH_HEAD was not created");
+    let tracked = String::from_utf8_lossy(
+        &run_libra_command(&["rev-parse", "refs/remotes/origin/main"], &c).stdout,
+    )
+    .trim()
+    .to_string();
+    assert_eq!(tracked, s2, "AC2: origin/main still advanced");
+
+    // AC3: an existing FETCH_HEAD keeps its bytes.
+    assert_cli_success(&run_libra_command(&["fetch"], &c), "seed FETCH_HEAD");
+    let bytes = std::fs::read(&fetch_head).expect("FETCH_HEAD");
+    std::fs::write(s.join("f.txt"), "s3\n").expect("write s3");
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], &s), "stage s3");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "S3", "--no-verify"], &s),
+        "commit S3",
+    );
+    let s3 = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], &s).stdout)
+        .trim()
+        .to_string();
+    assert_cli_success(
+        &run_libra_command(&["fetch", "--no-write-fetch-head"], &c),
+        "AC3: fetch again",
+    );
+    assert_eq!(
+        std::fs::read(&fetch_head).expect("FETCH_HEAD"),
+        bytes,
+        "AC3: the existing FETCH_HEAD is untouched"
+    );
+
+    // AC4: `--all --no-write-fetch-head`.
+    remove_head();
+    assert_cli_success(
+        &run_libra_command(&["fetch", "--all", "--no-write-fetch-head"], &c),
+        "AC4: fetch --all --no-write-fetch-head",
+    );
+    assert!(!fetch_head.exists(), "AC4: FETCH_HEAD was not created");
+
+    // AC5: the last flag wins (`--no-write-fetch-head --write-fetch-head`).
+    remove_head();
+    assert_cli_success(
+        &run_libra_command(
+            &["fetch", "--no-write-fetch-head", "--write-fetch-head"],
+            &c,
+        ),
+        "AC5: fetch --no-write-fetch-head --write-fetch-head",
+    );
+    let first = std::fs::read_to_string(&fetch_head).expect("FETCH_HEAD");
+    assert_eq!(
+        first
+            .lines()
+            .next()
+            .and_then(|line| line.split('\t').next()),
+        Some(s3.as_str()),
+        "AC5: the first record is the fetched tip"
+    );
+
+    // AC6: the opposite order suppresses it.
+    remove_head();
+    assert_cli_success(
+        &run_libra_command(
+            &["fetch", "--write-fetch-head", "--no-write-fetch-head"],
+            &c,
+        ),
+        "AC6: fetch --write-fetch-head --no-write-fetch-head",
+    );
+    assert!(!fetch_head.exists(), "AC6: FETCH_HEAD was not created");
+
+    // AC7: `--dry-run` always wins.
+    remove_head();
+    assert_cli_success(
+        &run_libra_command(&["fetch", "--dry-run", "--write-fetch-head"], &c),
+        "AC7: fetch --dry-run --write-fetch-head",
+    );
+    assert!(!fetch_head.exists(), "AC7: --dry-run writes no FETCH_HEAD");
+
+    // AC8: `--multiple ... --no-write-fetch-head`.
+    remove_head();
+    assert_cli_success(
+        &run_libra_command(
+            &["fetch", "--multiple", "origin", "--no-write-fetch-head"],
+            &c,
+        ),
+        "AC8: fetch --multiple ... --no-write-fetch-head",
+    );
+    assert!(!fetch_head.exists(), "AC8: FETCH_HEAD was not created");
 }

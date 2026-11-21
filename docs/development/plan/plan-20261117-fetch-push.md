@@ -1299,7 +1299,7 @@ PY
 
 ### Task FP-12: 支持 `libra fetch --[no-]write-fetch-head`（含 `--all`）（#864）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `complete`（2026-11-21：新增 `--write-fetch-head`（与 `--no-write-fetch-head` 双向 `overrides_with`，最后出现者生效）；写盘条件保持 `!dry_run && !no_write_fetch_head`，因此 `--dry-run` 始终不写；`--all` 与 `--multiple` 路径共用同一开关。用例 `fetch_write_fetch_head_switches` 覆盖 AC1–AC8（删除后 `--no-write-fetch-head` 不创建但引用前进；已有 `FETCH_HEAD` 字节不变；`--all`/`--multiple` 同样不写；两种标志顺序；`--dry-run --write-fetch-head` 仍不写；写入时首行为抓取到的 tip）；`fetch`/`pull`/`clone` 套件 **203/203**；版本面 0.30.257 → 0.30.258；文档 EN/zh-CN 同步。按用户 2026-11-20 指令在 `main` 直接提交推送。）
 
 **Description:** 新增 `--write-fetch-head`/`--no-write-fetch-head`（按最后出现者生效，默认写入）：关闭时完成对象与引用更新但不创建、不改写 `FETCH_HEAD`（单 remote、`--all`、`--multiple` 一致）；`--dry-run` 始终不写 `FETCH_HEAD`，即使显式 `--write-fetch-head`。
 

@@ -50,6 +50,8 @@ libra config set --add remote.origin.fetch \
 
 ## 选项
 
+`--no-write-fetch-head` 完成对象与引用更新但不创建、不改写 `FETCH_HEAD`（单 remote、`--all`、`--multiple` 一致）；`--write-fetch-head` 可撤销它（最后出现的标志生效），且 `--dry-run` 始终不写该文件（即使显式给出 `--write-fetch-head`）。
+
 多远程 fetch（`--all`、`--multiple`、`fetch.all`）中单个 remote 失败不再中止：其余 remote 照常抓取（已成功者的引用、对象与 `FETCH_HEAD` 记录保留），每个失败 remote 输出 `error: could not fetch '<remote>' (exit code: <n>)`，全部尝试后以第一个失败 remote 的稳定码整体失败。配置错误仍在任何传输前 fail-closed。
 
 `fetch.all=true` 时无参 `libra fetch` 等同 `--all`；显式 `<repository>` 始终覆盖该配置。`--no-all` 撤销 `--all`（最后出现的标志生效），回到当前分支的默认 remote。
