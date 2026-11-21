@@ -1040,3 +1040,125 @@ fn test_describe_contains_exact_match_renders_tag_peel() {
         "AC3: lightweight tags are not peeled"
     );
 }
+
+#[test]
+fn test_describe_no_match_clears_previous_patterns() {
+    use clap::Parser as _;
+
+    // c1 (annotated v1.0) → c2 (annotated v2.0) → c3.
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["tag", "-m", "v1", "v1.0"], p),
+        "annotated v1.0",
+    );
+    let c2 = {
+        std::fs::write(p.join("tracked.txt"), "second\n").expect("write second");
+        assert_cli_success(
+            &run_libra_command(&["add", "tracked.txt"], p),
+            "stage second",
+        );
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "c2", "--no-verify"], p),
+            "commit c2",
+        );
+        assert_cli_success(
+            &run_libra_command(&["tag", "-m", "v2", "v2.0"], p),
+            "annotated v2.0",
+        );
+        String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], p).stdout)
+            .trim()
+            .to_string()
+    };
+    std::fs::write(p.join("tracked.txt"), "third\n").expect("write third");
+    assert_cli_success(
+        &run_libra_command(&["add", "tracked.txt"], p),
+        "stage third",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c3", "--no-verify"], p),
+        "commit c3",
+    );
+    let short =
+        |out: &std::process::Output| String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let starts = |text: &str, prefix: &str| text.starts_with(prefix);
+
+    // AC1: `--no-match` clears every earlier `--match`.
+    let out = run_libra_command(
+        &[
+            "describe",
+            "--match",
+            "v1.*",
+            "--match",
+            "v0.*",
+            "--no-match",
+        ],
+        p,
+    );
+    assert_cli_success(&out, "AC1: describe --match --match --no-match");
+    assert!(starts(&short(&out), "v2.0-1-g"), "AC1: {}", short(&out));
+
+    // AC2: only the `--match` after `--no-match` applies.
+    let out = run_libra_command(
+        &[
+            "describe",
+            "--match",
+            "v2.*",
+            "--no-match",
+            "--match",
+            "v1.*",
+        ],
+        p,
+    );
+    assert_cli_success(&out, "AC2");
+    assert!(starts(&short(&out), "v1.0-2-g"), "AC2: {}", short(&out));
+
+    // AC3: `--contains` with a cleared match hits the annotated tag directly.
+    let out = run_libra_command(
+        &["describe", "--contains", "--match=B", "--no-match", &c2],
+        p,
+    );
+    assert_cli_success(&out, "AC3");
+    assert_eq!(
+        short(&out),
+        "v2.0^0",
+        "AC3: the annotated tag is a direct hit"
+    );
+
+    // AC4: `--no-match` alone is valid.
+    let out = run_libra_command(&["describe", "--no-match"], p);
+    assert_cli_success(&out, "AC4");
+    assert!(starts(&short(&out), "v2.0-1-g"), "AC4: {}", short(&out));
+
+    // AC5: a later `--exclude` still applies.
+    let out = run_libra_command(
+        &[
+            "describe",
+            "--match",
+            "v*",
+            "--no-match",
+            "--exclude",
+            "v2.*",
+        ],
+        p,
+    );
+    assert_cli_success(&out, "AC5");
+    assert!(starts(&short(&out), "v1.0-2-g"), "AC5: {}", short(&out));
+
+    // AC6: an earlier `--exclude` is untouched by `--no-match`.
+    let out = run_libra_command(&["describe", "--exclude", "v2.*", "--no-match"], p);
+    assert_cli_success(&out, "AC6");
+    assert!(starts(&short(&out), "v1.0-2-g"), "AC6: {}", short(&out));
+
+    // AC7: the parser clears the pattern list.
+    let args = libra::command::describe::DescribeArgs::try_parse_from([
+        "describe",
+        "--match",
+        "v1.*",
+        "--match",
+        "v0.*",
+        "--no-match",
+    ])
+    .expect("the combination parses");
+    assert!(args.match_patterns.is_empty(), "AC7: patterns were cleared");
+}

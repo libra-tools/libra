@@ -59,6 +59,7 @@ this command.
 | `--dirty[=<mark>]` | Append a dirty mark when tracked content differs from `HEAD`. | Off, default mark `-dirty` when enabled |
 | `--first-parent` | Follow only the first parent of merge commits when walking history. | Off |
 | `--match <pattern>` | Only consider tags whose name matches the glob (repeatable; OR semantics, wax globs ≤256 chars). | None |
+| `--no-match` | Clear every `--match` given so far; a later `--match` still applies and `--exclude` is unaffected. | Off |
 | `--exclude <pattern>` | Exclude tags whose name matches the glob (repeatable; takes precedence over `--match`). | None |
 | `--contains` | Inverse containment query (git name-rev): name the target by its nearest **descendant** tag, printing `<tag>` (lightweight) / `<tag>^0` (annotated direct hit), `<tag>~<n>`, or `<tag>~<n>^<m>~<k>`. Implies lightweight tags; equal-weight ties resolve by tag name; fails when no tag descends from the target. `--contains --exact-match` and `--contains --candidates 0` print the same `<tag>^0` for an annotated direct hit (and the bare `<tag>` for a lightweight one). | Off |
 

@@ -2,7 +2,7 @@
 
 ## 命令实现目标
 
-`libra describe` 的目标是根据可达 tag 为提交生成可读名称。当前实现刻意保持小而可验证的 Git 子集：支持 `[COMMIT]`、`--tags`、`--abbrev <N>`、`--always`、`--exact-match`、`--long`、`--dirty[=<mark>]`、`--first-parent`、`--match`/`--exclude`（wax glob，≤256 字符，exclude 优先于 match）、`--candidates <N>`（N=0 等价 exact-match）、`--all`（使用任意 ref：分支/远程跟踪/标签，带 `heads/`/`remotes/`/`tags/` 前缀）、`--contains`（git name-rev 反向包含查询：命名最近的「包含」目标的后代 tag，直接命中附注 tag 时输出 `<tag>^0`（轻量 tag 仍为 `<tag>`），其余输出 `<tag>~<n>`/`<tag>~<n>^<m>~<k>`；`--contains --exact-match`/`--contains --candidates 0` 同样在直接命中附注 tag 时输出 `<tag>^0`）与 JSON 输出，并在无法描述时给出稳定错误。
+`libra describe` 的目标是根据可达 tag 为提交生成可读名称。当前实现刻意保持小而可验证的 Git 子集：支持 `[COMMIT]`、`--tags`、`--abbrev <N>`、`--always`、`--exact-match`、`--long`、`--dirty[=<mark>]`、`--first-parent`、`--match`/`--exclude`（wax glob，≤256 字符，exclude 优先于 match）、`--no-match`（清除此前全部 `--match`，其后新值仍生效）、`--candidates <N>`（N=0 等价 exact-match）、`--all`（使用任意 ref：分支/远程跟踪/标签，带 `heads/`/`remotes/`/`tags/` 前缀）、`--contains`（git name-rev 反向包含查询：命名最近的「包含」目标的后代 tag，直接命中附注 tag 时输出 `<tag>^0`（轻量 tag 仍为 `<tag>`），其余输出 `<tag>~<n>`/`<tag>~<n>^<m>~<k>`；`--contains --exact-match`/`--contains --candidates 0` 同样在直接命中附注 tag 时输出 `<tag>^0`）与 JSON 输出，并在无法描述时给出稳定错误。
 
 ## 对比 Git 与兼容性
 

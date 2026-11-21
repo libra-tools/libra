@@ -103,6 +103,11 @@ pub struct DescribeArgs {
     #[clap(long = "match", value_name = "PATTERN")]
     pub match_patterns: Vec<String>,
 
+    /// Clear every `--match` given so far (Git's `--no-match`); a later
+    /// `--match` still applies, and `--exclude` is unaffected.
+    #[clap(long = "no-match", overrides_with = "match_patterns")]
+    pub no_match: bool,
+
     /// Exclude tags whose name matches the glob (repeatable; takes precedence over --match).
     #[clap(long, value_name = "PATTERN")]
     pub exclude: Vec<String>,
@@ -168,6 +173,7 @@ pub(crate) async fn describe_commit_for_atom(
         dirty: None,
         first_parent: false,
         match_patterns,
+        no_match: false,
         exclude,
         contains: false,
     };

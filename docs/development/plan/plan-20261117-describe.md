@@ -514,7 +514,7 @@
 
 ### Task DESC-02: 为 `libra describe` 增加 `--no-match` 并支持重置 `--match` 过滤（#796）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空` | **Priority / Selection:** P1；Git CLI 选项兼容 | **Issue:** [#796](https://github.com/libra-tools/libra/issues/796)
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `complete`（2026-11-21：`DescribeArgs` 新增 `--no-match`（`overrides_with = "match_patterns"`，命令行顺序语义：清除此前全部 `--match`，其后新给的 `--match` 仍生效，`--exclude` 不受影响），并同步 `describe_commit_for_atom` 的结构体字面量。用例 `test_describe_no_match_clears_previous_patterns` 覆盖 AC1–AC7（清空后取最近 tag；仅其后 `--match` 生效；`--contains` 清除后附注 tag 直接命中 `<tag>^0`；单独 `--no-match` 合法；其后与之前的 `--exclude` 均生效；解析层 `match_patterns` 为空）；`describe_test` **33/33**；文档 EN/zh-CN/开发版与 `COMPATIBILITY.md` 同步；版本面 0.30.259 → 0.30.260。按用户 2026-11-20 指令在 `main` 直接提交推送。） | **Priority / Selection:** P1；Git CLI 选项兼容 | **Issue:** [#796](https://github.com/libra-tools/libra/issues/796)
 
 **Description:** 在 `DescribeArgs` 中增加 `--no-match`，按 `ADR-DESC-01` 以 clap `overrides_with` 实现命令行顺序语义：清除此前所有 `--match` 模式、保留其后新传入的 `--match`，不影响 `--exclude`；同步更新 `describe_commit_for_atom` 的结构体字面量（`src/command/describe.rs:159-173`）。
 
