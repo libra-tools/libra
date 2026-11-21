@@ -29,6 +29,10 @@ the refspec described above. When the source's `HEAD` is detached and no
 of inventing a branch: no local branch and no `refs/remotes/<name>/<branch>` is
 created, and the recorded refspec places later fetches under
 `refs/remotes/<name>/_detached/*`.
+A plain clone records `remote.<name>.fetch=+refs/heads/*:refs/remotes/<name>/*`; a
+single-branch clone records the narrower `+refs/heads/<branch>:refs/remotes/<name>/<branch>`,
+and a `--revision` clone records none (it creates no remote-tracking refs). Appending
+another refspec with `config set --add remote.<name>.fetch` keeps the recorded entry first.
 Clone creates a `.libra` directory with a SQLite-backed metadata store, sets
 up the selected remote, and checks out the default branch (or the branch
 specified with `-b`). Vault signing is always bootstrapped during clone,

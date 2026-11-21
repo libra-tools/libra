@@ -5347,6 +5347,99 @@ fn test_clone_sparse_partial_merge_lazy_fetch() {
 }
 
 #[test]
+fn test_clone_persists_remote_fetch_refspec() {
+    use crate::command::{assert_cli_success, create_committed_repo_via_cli, run_libra_command};
+
+    let src = create_committed_repo_via_cli();
+    assert_cli_success(&run_libra_command(&["tag", "v1"], src.path()), "tag v1");
+    let source_url = format!("file://{}", src.path().display());
+    let root = tempdir().unwrap();
+
+    // AC1: a plain clone records the standard wildcard refspec.
+    let d = root.path().join("d");
+    assert_cli_success(
+        &run_libra_command(
+            &["clone", &source_url, d.to_str().expect("dest")],
+            root.path(),
+        ),
+        "AC1: default clone",
+    );
+    let out = run_libra_command(&["config", "get", "--all", "remote.origin.fetch"], &d);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "+refs/heads/*:refs/remotes/origin/*\n",
+        "AC1"
+    );
+
+    // AC2: the refspec follows the effective remote name.
+    let d2 = root.path().join("d2");
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "clone",
+                "-o",
+                "upstream",
+                "--branch",
+                "main",
+                &source_url,
+                d2.to_str().expect("dest"),
+            ],
+            root.path(),
+        ),
+        "AC2: -o upstream clone",
+    );
+    let out = run_libra_command(&["config", "get", "--all", "remote.upstream.fetch"], &d2);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "+refs/heads/*:refs/remotes/upstream/*\n",
+        "AC2"
+    );
+
+    // AC3: `--revision` writes no fetch refspec at all.
+    let d3 = root.path().join("d3");
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "clone",
+                "--bare",
+                "--revision=refs/tags/v1",
+                &source_url,
+                d3.to_str().expect("dest"),
+            ],
+            root.path(),
+        ),
+        "AC3: --revision clone",
+    );
+    let out = run_libra_command(&["config", "get", "--all", "remote.origin.fetch"], &d3);
+    assert!(
+        String::from_utf8_lossy(&out.stdout).trim().is_empty(),
+        "AC3: no fetch refspec: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    // AC4: appending keeps the recorded default on the first line.
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "config",
+                "set",
+                "--add",
+                "remote.origin.fetch",
+                "+refs/tags/*:refs/tags/*",
+            ],
+            &d,
+        ),
+        "AC4: append a refspec",
+    );
+    let out = run_libra_command(&["config", "get", "--all", "remote.origin.fetch"], &d);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "+refs/heads/*:refs/remotes/origin/*\n+refs/tags/*:refs/tags/*\n",
+        "AC4"
+    );
+}
+
+#[test]
 fn test_clone_reject_shallow_local_git_source() {
     use super::{create_linear_git_repo, git_success, run_libra_command};
 

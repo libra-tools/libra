@@ -112,6 +112,8 @@ libra clone --shallow-since "2 weeks ago" git@github.com:user/repo.git
 libra clone --sparse --filter=blob:none git@github.com:user/repo.git
 ```
 
+普通克隆会记录 `remote.<name>.fetch=+refs/heads/*:refs/remotes/<name>/*`；单分支克隆记录更窄的 `+refs/heads/<branch>:refs/remotes/<name>/<branch>`；`--revision` 克隆不写任何 fetch refspec（不建远端跟踪引用）。用 `config set --add remote.<name>.fetch` 追加时，已记录的条目仍保留在首行。
+
 ### `--ref-storage-format <format>`
 
 对齐 Git 的 `--ref-storage-format`：Libra 的引用存储在 SQLite，因此 `sqlite` 被接受为 no-op，其余格式一律 fail-closed——`files` 与 `reftable` 未实现（`LBR-UNSUPPORTED-001`），未知取值按用法错误拒绝（`LBR-CLI-002`，对应 Git 的 `unknown ref storage format`）。`libra rev-parse --show-ref-storage-format` 如实输出当前后端。

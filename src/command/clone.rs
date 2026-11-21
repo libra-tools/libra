@@ -3125,11 +3125,25 @@ pub(crate) async fn setup_repository(
                         false,
                     )
                     .await;
-                    if single_branch && !detached_source {
-                        let spec = format!(
+                    // Every non-mirror, non-revision clone records a fetch
+                    // refspec: single-branch narrows it to the checked-out
+                    // branch, a plain clone records the standard wildcard
+                    // (#876 — without it, appending a refspec later would make
+                    // `fetch --prune` trim fields it never owned).
+                    let spec = if single_branch && !detached_source {
+                        Some(format!(
                             "+refs/heads/{branch_name}:refs/remotes/{}/{branch_name}",
                             remote_config.name
-                        );
+                        ))
+                    } else if !single_branch && !detached_source {
+                        Some(format!(
+                            "+refs/heads/*:refs/remotes/{}/*",
+                            remote_config.name
+                        ))
+                    } else {
+                        None
+                    };
+                    if let Some(spec) = spec {
                         let _ = ConfigKv::add_with_conn(
                             txn,
                             &format!("remote.{}.fetch", remote_config.name),

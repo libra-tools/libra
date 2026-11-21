@@ -2008,7 +2008,7 @@ PY
 ### Task CL-17: 确保默认 `libra clone` 正确持久化 `remote.<name>.fetch`（#876）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `complete`（2026-11-21：`setup_repository` 的配置事务不再只在 `--single-branch` 时写 refspec——普通克隆写 `+refs/heads/*:refs/remotes/<name>/*`（`#876`），单分支克隆仍写窄 refspec，`--revision` 与游离源克隆不写（两者提前返回、不进入该事务）。用例 `test_clone_persists_remote_fetch_refspec` 覆盖 AC1–AC4（默认克隆 `+refs/heads/*:refs/remotes/origin/*`、`-o upstream --branch main` 得到 upstream 版本、`--revision` 无 `remote.origin.fetch`、`config set --add` 后两行且默认条目在首行）；AC3 以 `config get --all` 空输出判定（卡内建议直读 SQLite，语义等价）。`clone`/`fetch`/`clone_cli` 相关套件 **166/166**；版本面 0.30.238 → 0.30.239；文档 EN/zh-CN 同步。按用户 2026-11-20 指令在 `main` 直接提交推送。）
 **Description:** 修复默认 `libra clone` 未写入标准 `remote.<name>.fetch=+refs/heads/*:refs/remotes/<name>/*` 配置的缺口（当前仅 `--single-branch` 在 `clone.rs:2043-2054` 写入，`remote add` 已在 `remote.rs:822-834` 写入；`--revision` 克隆不写入，见 AC3），避免后续向 `remote.<name>.fetch` 追加 refspec 后 `fetch --prune` 发生越界修剪。
 **Out of scope:** `fetch --prune` 端到端（`#541` 与 `FP-15` 未就绪）。该场景只登记在 `DEFER-CL-03`，本卡不预置 `#[ignore]` 测试，也不把启用该测试拆成另一张实现卡。非 `--revision` 的 `--bare` 克隆的 refspec 持久化与 `refs/remotes/<name>/*` 布局维持现状（`PM-33` 依赖，见 `DEP-CL-14`）。
 **Current evidence:**
