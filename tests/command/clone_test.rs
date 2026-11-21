@@ -4931,7 +4931,11 @@ fn test_sparse_preflight_merge_pull_rebase_cherry_pick_stash() {
         ("AC4", vec!["cherry-pick", "topic"]),
         ("AC5", vec!["stash", "push"]),
     ] {
-        std::fs::write(rp.join("a.txt"), "dirty\n").expect("dirty a");
+        // Only `stash push` needs a dirty worktree: `merge` now owns its own
+        // sparse decision (CL-20) and runs its cleanliness check first.
+        if label == "AC5" {
+            std::fs::write(rp.join("a.txt"), "dirty\n").expect("dirty a");
+        }
         let out = run_libra_command(&argv, rp);
         assert!(!out.status.success(), "{label}: {argv:?} must be refused");
         assert!(

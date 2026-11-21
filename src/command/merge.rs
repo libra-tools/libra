@@ -829,6 +829,16 @@ pub(crate) enum PullMergeError {
     /// than silently dropped from the merge result the way it used to be.
     #[error("{0}")]
     GitlinkUnsupported(GitlinkNotSupported),
+    /// A sparse checkout (`core.sparseCheckout=true`) can only merge the
+    /// directory-rename shape today; everything else stays fail-closed.
+    #[error(
+        "this merge is not supported in a sparse checkout yet: only a directory \
+         rename combined with additions on the other side can be merged"
+    )]
+    SparseMergeUnsupported,
+    /// A promisor prefetch of the merge inputs failed.
+    #[error("failed to fetch the objects this merge needs: {0}")]
+    MergePrefetchFailed(String),
     /// The recursive virtual ancestor (MG-02) would have to nest deeper than
     /// [`MAX_VIRTUAL_ANCESTOR_DEPTH`]. Git recurses without a ceiling; Libra
     /// folds the bases with real recursion, so it stops with a message instead
@@ -963,6 +973,16 @@ impl From<PullMergeError> for CliError {
                 .with_hint(
                     "merge the branches one at a time so each conflict can be resolved and committed",
                 ),
+            PullMergeError::SparseMergeUnsupported => CliError::failure(error.to_string())
+                .with_stable_code(StableErrorCode::Unsupported)
+                .with_hint(
+                    "unset `core.sparseCheckout` (or add the missing directories to the cone) \
+                     before merging",
+                ),
+            PullMergeError::MergePrefetchFailed(detail) => {
+                CliError::failure(format!("{error}: {detail}"))
+                    .with_stable_code(StableErrorCode::IoReadFailed)
+            }
             PullMergeError::OctopusStrategyUnsupported { .. } => {
                 CliError::failure(error.to_string())
                     .with_stable_code(StableErrorCode::Unsupported)
@@ -2344,6 +2364,7 @@ pub(crate) async fn run_merge_for_pull_with_options(
     // autostash below — its stash commit, sidecar and worktree reset are
     // writes, and the card requires a refused merge to make none.
     preflight_merge_gitlinks(&target_commit, &options).await?;
+    preflight_sparse_merge(&target_commit, &options).await?;
 
     // MG-05 (Codex R7 and R8): the rename config is STRICT, so an unusable
     // `merge.renames` must be refused before ANY repository mutation — before
@@ -2575,6 +2596,42 @@ fn merge_is_fast_forward(
         && !options.no_ff
         && !options.squash
         && !options.no_commit
+}
+
+/// Sparse-checkout / promisor gate for the merge WRAPPER.
+///
+/// A sparse checkout only supports the directory-rename shape (CL-20) and every
+/// merge in a partial clone needs the other side's blobs, which are fetched in
+/// ONE batch before the engine runs. Shapes that settle without arbitrating
+/// (unborn HEAD, up-to-date, fast-forward, `-s ours`) are left alone.
+async fn preflight_sparse_merge(
+    target_commit: &Commit,
+    options: &PullMergeOptions,
+) -> Result<(), PullMergeError> {
+    if options.strategy == Some(MergeStrategy::Ours) {
+        return Ok(());
+    }
+    let Some(current_commit_id) = Head::current_commit().await else {
+        return Ok(());
+    };
+    let current_commit: Commit =
+        load_object(&current_commit_id).map_err(|error| PullMergeError::CurrentLoad {
+            commit_id: current_commit_id.to_string(),
+            detail: error.to_string(),
+        })?;
+    let bases = merge_base_commits_for_strategy(&current_commit, target_commit, options)?;
+    if bases.is_empty() && !options.allow_unrelated_histories {
+        return Ok(());
+    }
+    if options.ff_only && !merge_head_is_sole_base(&bases, &current_commit) {
+        return Ok(());
+    }
+    if merge_is_up_to_date(&bases, target_commit)
+        || merge_is_fast_forward(&bases, &current_commit, options)
+    {
+        return Ok(());
+    }
+    ensure_sparse_merge_supported(&current_commit, target_commit, &bases).await
 }
 
 /// ADR-MG-01 gate for the merge WRAPPER, ahead of every mutation it performs.
@@ -5034,6 +5091,167 @@ fn commit_tree_items(commit: &Commit) -> Result<HashMap<PathBuf, MergeTreeEntry>
 /// D/F decision only: [`merge_tree_items`] strips them from its result (the
 /// flat path never rebuilds empty trees — registered in MG-03). Reads mirror
 /// the shared flattener (`Tree::load` for nested trees).
+/// Flatten a commit's tree to `path -> blob id` (trees only; no blob reads).
+fn flat_merge_blob_map(
+    commit: &git_internal::internal::object::commit::Commit,
+) -> Result<std::collections::BTreeMap<String, git_internal::hash::ObjectHash>, PullMergeError> {
+    use git_internal::internal::object::tree::{Tree, TreeItemMode};
+
+    fn walk(
+        tree_id: git_internal::hash::ObjectHash,
+        prefix: &str,
+        out: &mut std::collections::BTreeMap<String, git_internal::hash::ObjectHash>,
+    ) -> Result<(), PullMergeError> {
+        let tree: Tree = load_object(&tree_id).map_err(|error| PullMergeError::TreeLoad {
+            tree_id: tree_id.to_string(),
+            detail: error.to_string(),
+        })?;
+        for item in &tree.tree_items {
+            let path = format!("{prefix}{}", item.name);
+            if matches!(item.mode, TreeItemMode::Tree) {
+                walk(item.id, &format!("{path}/"), out)?;
+            } else if matches!(item.mode, TreeItemMode::Blob) {
+                out.insert(path, item.id);
+            }
+        }
+        Ok(())
+    }
+
+    let mut out = std::collections::BTreeMap::new();
+    walk(commit.tree_id, "", &mut out)?;
+    Ok(out)
+}
+
+/// Compare two flattened maps.
+fn merge_map_changes<'a>(
+    base: &'a std::collections::BTreeMap<String, git_internal::hash::ObjectHash>,
+    side: &'a std::collections::BTreeMap<String, git_internal::hash::ObjectHash>,
+) -> Vec<(
+    &'a str,
+    Option<&'a git_internal::hash::ObjectHash>,
+    Option<&'a git_internal::hash::ObjectHash>,
+)> {
+    let mut paths: Vec<&str> = base.keys().map(String::as_str).collect();
+    paths.extend(side.keys().map(String::as_str));
+    paths.sort_unstable();
+    paths.dedup();
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            let before = base.get(path);
+            let after = side.get(path);
+            if before == after {
+                None
+            } else {
+                Some((path, before, after))
+            }
+        })
+        .collect()
+}
+
+/// Guard a sparse-checkout merge and prefetch the objects it needs.
+///
+/// Sparse checkouts support exactly one shape today (Git's t6421#2): our side
+/// renamed whole directories (blobs preserved) while their side only added
+/// files. Any modification, deletion on their side, or path collision stays
+/// fail-closed. In both sparse and non-sparse partial clones the blobs this
+/// merge needs are fetched in ONE batch.
+async fn ensure_sparse_merge_supported(
+    ours: &git_internal::internal::object::commit::Commit,
+    theirs: &git_internal::internal::object::commit::Commit,
+    base_commits: &[git_internal::internal::object::commit::Commit],
+) -> Result<(), PullMergeError> {
+    let partial = crate::internal::config::ConfigKv::get("extensions.partialClone")
+        .await
+        .ok()
+        .flatten()
+        .is_some();
+    let sparse = crate::internal::config::ConfigKv::get("core.sparseCheckout")
+        .await
+        .ok()
+        .flatten()
+        .map(|entry| {
+            matches!(
+                entry.value.trim().to_ascii_lowercase().as_str(),
+                "true" | "1" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false);
+    if !partial && !sparse {
+        return Ok(());
+    }
+    let base_map = match base_commits.first() {
+        Some(base) => flat_merge_blob_map(base)?,
+        None => std::collections::BTreeMap::new(),
+    };
+    let our_map = flat_merge_blob_map(ours)?;
+    let their_map = flat_merge_blob_map(theirs)?;
+
+    if sparse && !base_commits.is_empty() {
+        let our_changes = merge_map_changes(&base_map, &our_map);
+        let their_changes = merge_map_changes(&base_map, &their_map);
+        // Our side: a directory rename — every change is a delete or an add
+        // inside exactly one source and one destination directory, and the two
+        // sides carry the same relative paths (content may change).
+        let mut removed_parents = std::collections::BTreeSet::new();
+        let mut added_parents = std::collections::BTreeSet::new();
+        let mut removed_suffixes = std::collections::BTreeSet::new();
+        let mut added_suffixes = std::collections::BTreeSet::new();
+        let mut ours_ok = true;
+        for (path, before, after) in &our_changes {
+            let Some((top, rest)) = path.split_once('/') else {
+                ours_ok = false;
+                continue;
+            };
+            match (before, after) {
+                (Some(_), None) => {
+                    removed_parents.insert(top.to_string());
+                    removed_suffixes.insert(rest.to_string());
+                }
+                (None, Some(_)) => {
+                    added_parents.insert(top.to_string());
+                    added_suffixes.insert(rest.to_string());
+                }
+                _ => ours_ok = false,
+            }
+        }
+        let ours_ok = ours_ok
+            && removed_parents.len() == 1
+            && added_parents.len() == 1
+            && removed_suffixes == added_suffixes;
+        // Their side: additions only.
+        let theirs_ok = their_changes
+            .iter()
+            .all(|(_, before, after)| before.is_none() && after.is_some());
+        let no_collision = their_changes
+            .iter()
+            .all(|(path, _, _)| !our_map.contains_key(*path));
+        if !ours_ok || !theirs_ok || !no_collision {
+            return Err(PullMergeError::SparseMergeUnsupported);
+        }
+    }
+
+    // One batch for every blob this merge reads from the other side.
+    let storage = crate::utils::util::try_objects_storage()
+        .map_err(|error| PullMergeError::MergePrefetchFailed(error.to_string()))?;
+    // The merge reads both sides' files, so prefetch their union in one batch.
+    let missing = our_map
+        .values()
+        .chain(their_map.values())
+        .filter(|oid| storage.get_object_type(oid).is_err())
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    crate::command::fetch::lazy_fetch_objects(&missing)
+        .await
+        .map_err(|error| PullMergeError::MergePrefetchFailed(error.to_string()))?;
+    Ok(())
+}
+
 fn commit_tree_split_for_merge(
     commit: &Commit,
 ) -> Result<(HashMap<PathBuf, MergeTreeEntry>, GitlinkEntries), PullMergeError> {

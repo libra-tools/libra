@@ -1918,7 +1918,9 @@ async fn enforce_sparse_checkout_guard(command: &Commands) -> CliResult<()> {
             | Commands::Switch(_)
             | Commands::Reset(_)
             | Commands::Restore(_)
-            | Commands::Merge(_)
+            // `merge` decides for itself: a sparse checkout still supports the
+            // directory-rename shape (CL-20), and everything else is refused
+            // before any write.
             | Commands::Pull(_)
             | Commands::Rebase(_)
             | Commands::CherryPick(_)

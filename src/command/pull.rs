@@ -1180,6 +1180,12 @@ fn map_merge_error_to_cli(error: &merge::PullMergeError) -> CliError {
             CliError::command_usage(error.to_string())
                 .with_stable_code(StableErrorCode::CliInvalidArguments)
         }
+        merge::PullMergeError::SparseMergeUnsupported => CliError::failure(error.to_string())
+            .with_stable_code(StableErrorCode::Unsupported),
+        merge::PullMergeError::MergePrefetchFailed(detail) => {
+            CliError::failure(format!("{error}: {detail}"))
+                .with_stable_code(StableErrorCode::IoReadFailed)
+        }
         merge::PullMergeError::InvalidTarget(..) => CliError::command_usage(error.to_string())
             .with_stable_code(StableErrorCode::CliInvalidTarget),
         merge::PullMergeError::TargetLoad { .. }
