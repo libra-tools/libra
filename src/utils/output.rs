@@ -231,6 +231,7 @@ impl OutputConfig {
             }
         };
 
+        set_global_progress(progress);
         Self {
             json_format,
             color,
@@ -546,6 +547,30 @@ pub fn warning_was_emitted() -> bool {
 /// instead of leaking onto stderr, which is what keeps the "JSON delivers
 /// warnings only through `data.warnings[]`" contract exact.
 static STRUCTURED_OUTPUT: AtomicBool = AtomicBool::new(false);
+
+/// Resolved progress mode for the current invocation, so deep helpers (such as
+/// a promisor lazy fetch) can honour the global `--progress` setting without
+/// threading an [`OutputConfig`] through every object read.
+static GLOBAL_PROGRESS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Record the resolved progress mode for helpers that have no `OutputConfig`.
+pub fn set_global_progress(mode: ProgressMode) {
+    let encoded = match mode {
+        ProgressMode::None => 0,
+        ProgressMode::Text => 1,
+        ProgressMode::Json => 2,
+    };
+    GLOBAL_PROGRESS.store(encoded, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The progress mode of the current invocation (`None` when unset).
+pub fn global_progress() -> ProgressMode {
+    match GLOBAL_PROGRESS.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => ProgressMode::Text,
+        2 => ProgressMode::Json,
+        _ => ProgressMode::None,
+    }
+}
 
 /// Declare whether this invocation renders a structured envelope.
 pub fn set_structured_output(active: bool) {

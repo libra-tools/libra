@@ -2475,17 +2475,27 @@ pub(crate) async fn lazy_fetch_object(oid: &ObjectHash) -> Result<bool, FetchErr
     .map_err(|error| FetchError::LocalState {
         message: format!("lazy fetch of {oid_hex} failed: {error}"),
     })?;
-    let data = read_fetch_stream_for_kind(
-        &mut stream,
-        &OutputConfig::default(),
-        "lazy-fetch",
-        hash_kind,
-    )
-    .await?;
+    // The progress meter follows the invocation's global `--progress` setting:
+    // `auto` already resolved to `none` off a terminal, and `none` stays silent.
+    let lazy_output = OutputConfig {
+        progress: crate::utils::output::global_progress(),
+        ..Default::default()
+    };
+    let data =
+        read_fetch_stream_for_kind(&mut stream, &lazy_output, "lazy-fetch", hash_kind).await?;
     if data.pack_data.is_empty() {
         return Ok(false);
     }
     let _ = write_pack_and_index(&data.pack_data, hash_kind, &[]).await?;
+    // A promisor lazy fetch reports like any other transfer. The global
+    // `--progress` setting decides: `text` always draws it, `auto` resolved to
+    // `none` when stderr is not a terminal, and `none` stays byte-clean.
+    if matches!(
+        crate::utils::output::global_progress(),
+        crate::utils::output::ProgressMode::Text
+    ) {
+        eprintln!("Receiving objects: 100%");
+    }
     Ok(true)
 }
 

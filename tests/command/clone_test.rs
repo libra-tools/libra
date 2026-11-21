@@ -4427,6 +4427,184 @@ fn test_clone_sparse_oid_filter_and_missing_boundary() {
     );
 }
 
+/// Run `libra` on a pty with stdout redirected to a file, returning whether the
+/// child succeeded and everything the terminal (that is, stderr) saw.
+fn run_libra_in_pty_with_stdout_file(
+    args: &[&str],
+    cwd: &std::path::Path,
+    stdout_path: &std::path::Path,
+) -> (bool, String) {
+    use std::io::Read;
+
+    use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("open pty");
+    let mut cmd = CommandBuilder::new("sh");
+    let quoted = args
+        .iter()
+        .map(|arg| format!("'{}'", arg.replace('\'', "'\\''")))
+        .collect::<Vec<_>>()
+        .join(" ");
+    cmd.arg("-c");
+    cmd.arg(format!("{quoted} >'{}'", stdout_path.display()));
+    cmd.cwd(cwd);
+    let mut child = pair.slave.spawn_command(cmd).expect("spawn on the pty");
+    drop(pair.slave);
+    let mut reader = pair.master.try_clone_reader().expect("pty reader");
+    let mut terminal = String::new();
+    let _ = reader.read_to_string(&mut terminal);
+    let status = child.wait().expect("wait for the child");
+    (status.success(), terminal)
+}
+
+#[test]
+fn test_clone_partial_progress_and_e2e_lazy_fetch() {
+    use crate::command::{assert_cli_success, run_libra_command};
+
+    // Source: commit 1 carries a.txt, commit 2 drops it, so a.txt's blob is
+    // reachable from S1 only.
+    let source = tempdir().expect("source dir");
+    let sp = source.path();
+    assert_cli_success(&run_libra_command(&["init"], sp), "init source");
+    run_libra_command(&["config", "set", "user.name", "t"], sp);
+    run_libra_command(&["config", "set", "user.email", "t@t"], sp);
+    std::fs::write(sp.join("a.txt"), "alpha\n").expect("write a.txt");
+    assert_cli_success(&run_libra_command(&["add", "a.txt"], sp), "stage a.txt");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c1", "--no-verify"], sp),
+        "commit c1",
+    );
+    let s1 = {
+        let out = run_libra_command(&["rev-parse", "HEAD"], sp);
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    std::fs::remove_file(sp.join("a.txt")).expect("remove a.txt");
+    std::fs::write(sp.join("b.txt"), "beta\n").expect("write b.txt");
+    assert_cli_success(&run_libra_command(&["add", "-A"], sp), "stage the removal");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c2", "--no-verify"], sp),
+        "commit c2",
+    );
+
+    let blob = {
+        let out = run_libra_command(&["rev-parse", &format!("{s1}:a.txt")], sp);
+        assert_cli_success(&out, "resolve a.txt blob");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let source_stdout = {
+        let out = run_libra_command(&["cat-file", "-p", &blob], sp);
+        assert_cli_success(&out, "source stdout");
+        out.stdout
+    };
+
+    let root = tempdir().expect("dest root");
+    let source_url = format!("file://{}", sp.display());
+    let bare_clone = |name: &str| {
+        let dest = root.path().join(name);
+        assert_cli_success(
+            &run_libra_command(
+                &[
+                    "clone",
+                    "--bare",
+                    "--filter=blob:none",
+                    &source_url,
+                    dest.to_str().expect("dest"),
+                ],
+                root.path(),
+            ),
+            "bare blob:none clone",
+        );
+        dest
+    };
+
+    // AC1: the filtered blob is absent before any on-demand fetch.
+    let d = bare_clone("d");
+    assert!(
+        !run_libra_command(&["--offline", "cat-file", "-e", &blob], &d)
+            .status
+            .success(),
+        "AC1: a.txt must be missing"
+    );
+
+    // AC2/AC3: a non-terminal read fetches on demand and prints no progress.
+    let fetched = run_libra_command(&["cat-file", "-p", &format!("{s1}:a.txt")], &d);
+    assert_cli_success(&fetched, "AC2: on-demand rev:path fetch");
+    assert_eq!(fetched.stdout, source_stdout, "AC2: stdout");
+    assert!(
+        !String::from_utf8_lossy(&fetched.stderr).contains("Receiving objects"),
+        "AC3: auto progress on a non-terminal stays silent: {}",
+        String::from_utf8_lossy(&fetched.stderr)
+    );
+
+    // AC4: the fetch persisted the blob.
+    assert!(
+        run_libra_command(&["--offline", "cat-file", "-e", &blob], &d)
+            .status
+            .success(),
+        "AC4: the blob is local after the fetch"
+    );
+
+    // AC5: on a terminal, `auto` progress draws on stderr.
+    let d2 = bare_clone("d2");
+    let out_path = root.path().join("stdout-ac5");
+    let (ok, terminal) = run_libra_in_pty_with_stdout_file(
+        &[
+            env!("CARGO_BIN_EXE_libra"),
+            "cat-file",
+            "-p",
+            &format!("{s1}:a.txt"),
+        ],
+        &d2,
+        &out_path,
+    );
+    assert!(ok, "AC5: the pty run succeeds: {terminal}");
+    assert!(
+        terminal.contains("Receiving objects"),
+        "AC5: terminal progress: {terminal}"
+    );
+
+    // AC6: `--progress=none` keeps the terminal clean.
+    let d3 = bare_clone("d3");
+    let out_path = root.path().join("stdout-ac6");
+    let (ok, terminal) = run_libra_in_pty_with_stdout_file(
+        &[
+            env!("CARGO_BIN_EXE_libra"),
+            "--progress=none",
+            "cat-file",
+            "-p",
+            &format!("{s1}:a.txt"),
+        ],
+        &d3,
+        &out_path,
+    );
+    assert!(ok, "AC6: the pty run succeeds: {terminal}");
+    assert!(
+        !terminal.contains("Receiving objects"),
+        "AC6: no progress: {terminal}"
+    );
+
+    // AC7/AC8: `--progress=text` draws on a redirected stderr, never on stdout.
+    let d4 = bare_clone("d4");
+    let forced = run_libra_command(
+        &["--progress=text", "cat-file", "-p", &format!("{s1}:a.txt")],
+        &d4,
+    );
+    assert_cli_success(&forced, "AC7: --progress=text fetch");
+    assert!(
+        String::from_utf8_lossy(&forced.stderr).contains("Receiving objects"),
+        "AC7: stderr carries the progress: {}",
+        String::from_utf8_lossy(&forced.stderr)
+    );
+    assert_eq!(forced.stdout, source_stdout, "AC8: stdout stays clean");
+}
+
 #[test]
 fn test_clone_reject_shallow_local_git_source() {
     use super::{create_linear_git_repo, git_success, run_libra_command};

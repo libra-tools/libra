@@ -196,7 +196,9 @@ values that do not normalize to one of the supported forms);
 `--filter=sparse:oid=<rev>:<path>` reads the sparse rules from the blob at
 `<rev>:<path>` and keeps every commit and tree plus only the blobs whose path matches a
 rule, recording `remote.<name>.partialclonefilter=sparse:oid=<rev>:<path>`; a filtered-out
-blob is then fetched on demand from the promisor remote. When the source does not advertise the `filter` capability the clone falls back to a
+blob is then fetched on demand from the promisor remote; that on-demand fetch reports
+`Receiving objects` like any other transfer, following the global `--progress` setting
+(`auto` draws it only on a terminal, `text` always, `none` never). When the source does not advertise the `filter` capability the clone falls back to a
 full clone (no promisor rows are recorded). Network filter negotiation is not implemented yet. `--shallow-since`
 and `--shallow-exclude` bound shallow history by date or excluded ref, but
 **Libra's fetch uses only `--depth` to request a new shallow cutoff**, so those two

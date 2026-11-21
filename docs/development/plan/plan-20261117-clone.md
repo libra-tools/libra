@@ -1595,7 +1595,7 @@ PY
 ### Task CL-21: 实现部分克隆 `Receiving objects` 进度与端到端 lazy fetch 验证（#754）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `complete`（2026-11-21：`utils::output` 新增 `set_global_progress`/`global_progress`（`OutputConfig::resolve` 记录本次调用的生效进度模式），`fetch::lazy_fetch_object` 用该模式构造读取端的 `OutputConfig`（`--progress=none`/非终端 `auto` 不绘制 spinner）并在打包落盘后按 `text` 输出 `Receiving objects: 100%`（非终端 `--progress=text` 也可见，进度只进 stderr）。端到端链路 `clone --filter=blob:none file://…` → `cat-file -p <S1>:a.txt` 打通：被过滤 blob 先缺失，读取时懒加载取回并落盘。用例 `test_clone_partial_progress_and_e2e_lazy_fetch` 覆盖 AC1–AC8（含 `portable_pty` 的终端 `auto`/`none` 两例与重定向 stderr 的 `text` 例，stdout 逐字等于源仓库输出）。`clone_test`+`fetch_test`+`cat_file_test` 合计 **170/170**；版本面 0.30.231 → 0.30.232；文档 EN/zh-CN 同步。按用户 2026-11-20 指令在 `main` 直接提交推送。）
 **Description:** 自 `CL-13` 拆出：按需拉取（`CL-19` 的 lazy fetch）在进度开启时向 stderr 输出 `Receiving objects`（`#754`，对应 Git `t/t0410-partial-clone.sh#38`；全局 `--progress=none` 时不输出；终端判定沿用全局 `--progress` 的 `auto` 语义，测试以伪终端覆盖），并打通真实 `libra clone --filter=blob:none file://...` 后执行 `libra cat-file -p <rev>:<path>` 端到端按需 lazy fetch 完整链路。
 **Out of scope:** `--filter` 协商与 promisor 配置写入（`CL-13`）；`cat-file` 单对象读写层底层接线（`CL-19`）。
 **Current evidence:**
