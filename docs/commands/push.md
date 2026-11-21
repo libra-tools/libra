@@ -75,6 +75,13 @@ these modes warn and are not authorization for remote synchronization.
 
 ## Options
 
+Pushing into a local Libra repository that has the target branch checked out
+consults the target's `receive.denyCurrentBranch`: `warn` updates the branch and
+prints `warning: updating the current branch`, `ignore` does it silently, and any
+other value (or no value) refuses with `LBR-REPO-003`. When the update is allowed
+only the target's refs change — its working tree and index are left alone, exactly
+like Git (so the target then reports the checked-out file as modified).
+
 A repository-only push (`libra push <remote>`) uses every `remote.<name>.push`
 value, in configuration order, through the same engine as command-line refspecs
 (wildcards and negative refspecs included). An explicit command-line refspec — or

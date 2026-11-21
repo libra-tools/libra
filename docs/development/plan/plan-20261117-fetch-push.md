@@ -636,7 +636,7 @@ PY
 
 ### Task FP-05: 本地推送遵循目标 `receive.denyCurrentBranch=warn|ignore`（#1031）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `complete`（2026-11-21：`apply_local_push_to_libra` 读取**目标仓库**的 `receive.denyCurrentBranch`（`ConfigKv::get_with_conn(&target_db, …)`），新增 `DenyCurrentBranch{Refuse,Warn,Ignore}`：`warn` 允许更新检出分支并回传 `updating the current branch`（渲染器补 `warning: ` 前缀），`ignore` 静默允许，其余（含未配置）保持 `refusing to update checked-out branch`→`LBR-REPO-003`；函数返回警告列表并由 `run_push` 并入 `PushOutput.warnings`；允许更新时只改目标引用，目标工作区与索引不动。用例 `test_push_honours_target_deny_current_branch` 覆盖 AC1–AC8（`--mirror` 与单分支推送到 `warn` 目标均移动分支且输出警告、工作区文件与 `.libra/index` 逐字不变、`ignore` 静默、`refuse` 以 `LBR-REPO-003` 拒绝且 `show-ref` 不变）；`push` 套件 **39/39**；版本面 0.30.244 → 0.30.245；文档 EN/zh-CN 同步。按用户 2026-11-20 指令在 `main` 直接提交推送。）
 
 **Description:** `apply_local_push_to_libra` 在更新目标非裸仓库的当前检出分支前读取目标仓库的 `receive.denyCurrentBranch`：`warn` 时更新该分支并向推送方 stderr 输出 `warning: updating the current branch`；`ignore` 时静默更新；未配置、`refuse` 及其它值保持现有拒绝（`LBR-REPO-003`）。允许更新时只改目标引用，不改目标工作区与索引（与 Git 一致）。
 

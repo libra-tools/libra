@@ -39,7 +39,7 @@ pub(crate) async fn apply_local_push_to_libra(
     objs: &HashSet<Entry>,
     dry_run: bool,
     force_override: bool,
-) -> Result<(), String> {
+) -> Result<Vec<String>, String> {
     let storage_dir = try_get_storage_path(Some(target_path.to_path_buf())).map_err(|e| {
         format!(
             "failed to open target repository '{}': {e}",
@@ -69,17 +69,35 @@ pub(crate) async fn apply_local_push_to_libra(
             )
         })?;
     let checked_out = target_checked_out_branch(&db).await?;
+    // Git's `receive.denyCurrentBranch`: `warn` updates the checked-out branch
+    // and tells the pusher, `ignore` does it silently, anything else refuses.
+    let deny = match ConfigKv::get_with_conn(&db, "receive.denyCurrentBranch")
+        .await
+        .ok()
+        .flatten()
+        .map(|entry| entry.value.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("warn") => DenyCurrentBranch::Warn,
+        Some("ignore") => DenyCurrentBranch::Ignore,
+        _ => DenyCurrentBranch::Refuse,
+    };
     let updates_owned = updates.to_vec();
     let checked_out_owned = checked_out.clone();
-
-    write_transaction::<_, _, (), String>(&db, |txn| {
+    write_transaction::<_, _, Vec<String>, String>(&db, |txn| {
         let updates = updates_owned.clone();
         let checked_out = checked_out_owned.clone();
         Box::pin(async move {
+            let mut warnings = Vec::new();
             for update in &updates {
-                apply_one_update(txn, update, &checked_out, hash_kind, force_override).await?;
+                if apply_one_update(txn, update, &checked_out, hash_kind, force_override, deny)
+                    .await?
+                {
+                    // The renderer prefixes `warning: `.
+                    warnings.push("updating the current branch".to_string());
+                }
             }
-            Ok::<_, String>(())
+            Ok::<_, String>(warnings)
         })
     })
     .await
@@ -89,13 +107,22 @@ pub(crate) async fn apply_local_push_to_libra(
     })
 }
 
+/// Git's `receive.denyCurrentBranch` policy for the target repository.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DenyCurrentBranch {
+    Refuse,
+    Warn,
+    Ignore,
+}
+
 async fn apply_one_update<C: ConnectionTrait>(
     txn: &C,
     update: &PushRefUpdate,
     checked_out: &Option<String>,
     hash_kind: HashKind,
     force_override: bool,
-) -> Result<(), String> {
+    deny: DenyCurrentBranch,
+) -> Result<bool, String> {
     let remote_ref = &update.remote_ref;
     let (storage_name, remote_scope) = target_branch_storage(remote_ref);
 
@@ -104,11 +131,20 @@ async fn apply_one_update<C: ConnectionTrait>(
         .map_err(|e| format!("failed to inspect target ref '{remote_ref}': {e}"))?
         .map(|b| b.commit.to_string());
 
-    // Checked-out branch protection.
+    // Checked-out branch protection, following the target's policy: `warn`
+    // allows the update and reports it, `ignore` allows it silently.
+    let mut warned_checked_out = false;
     if checked_out.as_deref().is_some_and(|b| b == storage_name) {
-        return Err(format!(
-            "refusing to update checked-out branch '{storage_name}' (target ref {remote_ref})"
-        ));
+        match deny {
+            DenyCurrentBranch::Refuse => {
+                return Err(format!(
+                    "refusing to update checked-out branch '{storage_name}' (target ref \
+                     {remote_ref})"
+                ));
+            }
+            DenyCurrentBranch::Warn => warned_checked_out = true,
+            DenyCurrentBranch::Ignore => {}
+        }
     }
 
     match update.kind {
@@ -156,7 +192,7 @@ async fn apply_one_update<C: ConnectionTrait>(
             .map_err(|e| format!("failed to update '{remote_ref}': {e}"))?;
         }
     }
-    Ok(())
+    Ok(warned_checked_out)
 }
 
 async fn reflog_entry<C: ConnectionTrait>(

@@ -3454,3 +3454,124 @@ fn test_push_repository_only_uses_configured_refspecs() {
         "AC5: only the command-line refspec was pushed"
     );
 }
+
+#[test]
+fn test_push_honours_target_deny_current_branch() {
+    use crate::command::{assert_cli_success, run_libra_command};
+
+    // `s` is the source; `t` is a clone of it whose `main` is checked out, so a
+    // push into it updates a checked-out branch.
+    let fixture = || {
+        let work = tempfile::tempdir().expect("work dir");
+        let s = work.path().join("s");
+        std::fs::create_dir_all(&s).expect("mkdir s");
+        assert_cli_success(&run_libra_command(&["init"], &s), "init s");
+        run_libra_command(&["config", "set", "user.name", "t"], &s);
+        run_libra_command(&["config", "set", "user.email", "t@t"], &s);
+        std::fs::write(s.join("f.txt"), "one\n").expect("write f");
+        assert_cli_success(&run_libra_command(&["add", "f.txt"], &s), "stage f");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "t1", "--no-verify"], &s),
+            "commit t1",
+        );
+        let t = work.path().join("t");
+        assert_cli_success(
+            &run_libra_command(&["clone", "./s", "t"], work.path()),
+            "clone t",
+        );
+        run_libra_command(&["config", "set", "user.name", "t"], &t);
+        run_libra_command(&["config", "set", "user.email", "t@t"], &t);
+        std::fs::write(s.join("f.txt"), "two\n").expect("modify f");
+        assert_cli_success(&run_libra_command(&["add", "f.txt"], &s), "stage T2");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "t2", "--no-verify"], &s),
+            "commit t2",
+        );
+        let t2 = {
+            let out = run_libra_command(&["rev-parse", "HEAD"], &s);
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        assert_cli_success(
+            &run_libra_command(&["remote", "add", "t", "../t"], &s),
+            "add the t remote",
+        );
+        (work, s, t, t2)
+    };
+    let target_main = |t: &std::path::Path| {
+        String::from_utf8_lossy(&run_libra_command(&["rev-parse", "main"], t).stdout)
+            .trim()
+            .to_string()
+    };
+
+    // AC1/AC2: `warn` lets a mirror push update the checked-out branch.
+    let (_work, s, t, t2) = fixture();
+    run_libra_command(&["config", "set", "receive.denyCurrentBranch", "warn"], &t);
+    let out = run_libra_command(&["push", "--mirror", "../t"], &s);
+    assert_cli_success(&out, "AC1: mirror push into a `warn` target");
+    assert_eq!(target_main(&t), t2, "AC1: the target branch moved");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("warning: updating the current branch"),
+        "AC2: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // AC3/AC4: the same for a single-branch push, without touching the target's
+    // working tree or index.
+    let (_work3, s3, t3, t23) = fixture();
+    run_libra_command(&["config", "set", "receive.denyCurrentBranch", "warn"], &t3);
+    let worktree_before = std::fs::read(t3.join("f.txt")).expect("read target f");
+    let index_before = std::fs::read(t3.join(".libra/index")).expect("read target index");
+    assert_cli_success(
+        &run_libra_command(&["push", "../t", "main"], &s3),
+        "AC3: push into a `warn` target",
+    );
+    assert_eq!(target_main(&t3), t23, "AC3: the target branch moved");
+    assert_eq!(
+        std::fs::read(t3.join("f.txt")).expect("read target f"),
+        worktree_before,
+        "AC4: the target working tree is untouched"
+    );
+    assert_eq!(
+        std::fs::read(t3.join(".libra/index")).expect("read target index"),
+        index_before,
+        "AC4: the target index is unchanged"
+    );
+
+    // AC5/AC6: `ignore` updates silently.
+    let (_work5, s5, t5, t25) = fixture();
+    run_libra_command(
+        &["config", "set", "receive.denyCurrentBranch", "ignore"],
+        &t5,
+    );
+    let out = run_libra_command(&["push", "../t", "main"], &s5);
+    assert_cli_success(&out, "AC5: push into an `ignore` target");
+    assert_eq!(target_main(&t5), t25, "AC5: the target branch moved");
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("updating the current branch"),
+        "AC6: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // AC7/AC8: `refuse` (and the default) keeps the refusal and changes nothing.
+    let (_work7, s7, t7, _t27) = fixture();
+    run_libra_command(
+        &["config", "set", "receive.denyCurrentBranch", "refuse"],
+        &t7,
+    );
+    let before = run_libra_command(&["show-ref"], &t7).stdout;
+    let out = run_libra_command(&["push", "../t", "main"], &s7);
+    assert!(
+        !out.status.success(),
+        "AC7: a `refuse` target rejects the push"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("LBR-REPO-003"),
+        "AC7: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        run_libra_command(&["show-ref"], &t7).stdout,
+        before,
+        "AC8: the target refs are unchanged"
+    );
+}

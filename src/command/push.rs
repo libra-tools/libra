@@ -1641,16 +1641,18 @@ pub async fn run_push(args: PushArgs, output: &OutputConfig) -> Result<PushOutpu
                 .map(|plan| plan.update.clone())
                 .collect::<Vec<_>>();
             if local_client.is_libra_source() {
-                crate::internal::protocol::local_push::apply_local_push_to_libra(
-                    &target_path,
-                    discovery.hash_kind,
-                    &updates,
-                    &objs,
-                    args.dry_run,
-                    args.force,
-                )
-                .await
-                .map_err(|e| PushError::LocalPush(e.to_string()))?;
+                let local_warnings =
+                    crate::internal::protocol::local_push::apply_local_push_to_libra(
+                        &target_path,
+                        discovery.hash_kind,
+                        &updates,
+                        &objs,
+                        args.dry_run,
+                        args.force,
+                    )
+                    .await
+                    .map_err(|e| PushError::LocalPush(e.to_string()))?;
+                warnings.extend(local_warnings);
             } else {
                 crate::internal::protocol::local_push_git::apply_local_push_to_git(
                     &target_path,
