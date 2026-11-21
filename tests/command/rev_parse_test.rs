@@ -2301,3 +2301,82 @@ fn describe_suffix_inside_the_refs_heads_namespace() {
         "AC5: the complete-name tag lookup wins"
     );
 }
+
+#[test]
+fn describe_suffix_inside_the_refs_remotes_namespace() {
+    use crate::command::{assert_cli_success, run_libra_command};
+
+    let repo = tempfile::tempdir().expect("repo");
+    let p = repo.path();
+    assert_cli_success(&run_libra_command(&["init"], p), "init");
+    run_libra_command(&["config", "set", "user.name", "t"], p);
+    run_libra_command(&["config", "set", "user.email", "t@t"], p);
+    std::fs::write(p.join("f.txt"), "one\n").expect("write f");
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], p), "stage");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c1", "--no-verify"], p),
+        "commit c1",
+    );
+    let c1 = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], p).stdout)
+        .trim()
+        .to_string();
+    std::fs::write(p.join("f.txt"), "two\n").expect("write f2");
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], p), "stage f2");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c2", "--no-verify"], p),
+        "commit c2",
+    );
+    let short = &c1[..8];
+    let resolve = |spec: &str| {
+        let out = run_libra_command(&["rev-parse", spec], p);
+        assert_cli_success(&out, "describe suffix in refs/remotes");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+
+    // AC1/AC2: `refs/remotes/`-prefixed describe suffixes resolve to the commit.
+    assert_eq!(resolve(&format!("refs/remotes/x-1-g{short}")), c1, "AC1");
+    assert_eq!(resolve(&format!("refs/remotes/x-1-g{c1}")), c1, "AC2");
+
+    // AC3: an existing remote-tracking ref with that exact name wins.
+    let remote_dir = tempfile::tempdir().expect("remote root");
+    let remote_path = remote_dir.path().join("origin-remote");
+    std::fs::create_dir_all(&remote_path).expect("mkdir remote");
+    assert_cli_success(&run_libra_command(&["init"], &remote_path), "init remote");
+    run_libra_command(&["config", "set", "user.name", "t"], &remote_path);
+    run_libra_command(&["config", "set", "user.email", "t@t"], &remote_path);
+    std::fs::write(remote_path.join("g.txt"), "g\n").expect("write g");
+    assert_cli_success(
+        &run_libra_command(&["add", "g.txt"], &remote_path),
+        "stage g",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "sc", "--no-verify"], &remote_path),
+        "commit sc",
+    );
+    let sc =
+        String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], &remote_path).stdout)
+            .trim()
+            .to_string();
+    assert_cli_success(
+        &run_libra_command(&["branch", &format!("rlit-1-g{short}"), &sc], &remote_path),
+        "describe-shaped branch on the remote",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "remote",
+                "add",
+                "origin",
+                remote_path.to_str().expect("remote"),
+            ],
+            p,
+        ),
+        "add origin",
+    );
+    assert_cli_success(&run_libra_command(&["fetch", "origin"], p), "fetch origin");
+    assert_eq!(
+        resolve(&format!("refs/remotes/origin/rlit-1-g{short}")),
+        sc,
+        "AC3: the literal remote-tracking branch wins"
+    );
+}
