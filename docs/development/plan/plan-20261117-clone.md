@@ -1384,7 +1384,7 @@ PY
 ### Task CL-12: 校验并拒绝无效 `sparse:` filter 规格（#748）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `in-progress` / `locally-accepted`（2026-11-20：新增 `unsupported_object_filter` 分类与 `CloneError::UnsupportedFilter`，对 `tree:*`、`object:type=*`、`blob:limit=*`、`sparse:path=*` 与未知过滤器**在创建任何目录前**以 `LBR-UNSUPPORTED-001` 拒绝（AC5，表驱动 8 例通过）；`blob:none`、`sparse:oid=`、`combine:` 仍放行（由 CL-13/CL-24/CL-29 承接）。`clone_test` 全模块 **63/63**；版本面 0.30.226 → 0.30.227。**剩余**：AC1–AC4（`sparse:oid` 的源仓库解析与 Git 原文诊断）、AC6（规则 blob 过渡断言）待后续实现，未验证前不转 `done`。）
 **Description:** 在 `clone --filter=sparse:...` 时由传输/协议与本地客户端层（`local_client.rs`、`protocol/mod.rs`、`clone.rs`）校验 sparse filter 表达式（覆盖 `#748` 的两类可解析失败情形：指向不存在 OID 与指向非 blob 对象），输出 Git 兼容错误消息并清理新建目标目录（将旧 `test_clone_unsupported_fetch_optimizations_warn_and_full_clone` 重命名为 `test_clone_rejects_invalid_sparse_filter`；旧用例中与 `--filter` 无关的 `--shallow-since`/`--shallow-exclude` 警告断言原样保留在重写后的用例中，不计入本卡 AC）。本卡发布提交上，以下尚未实现的 filter 以 `LBR-UNSUPPORTED-001` 拒绝：`--filter=blob:none`（AC7 过渡断言，由 `CL-13` 同卡改写）与有效 `sparse:oid`（AC6 过渡断言，由 `CL-29` 同卡改写）；Git 定义而本计划不实现的单独 filter（`tree:<n>`、`object:type=<type>`、`blob:limit=<n>` 等）由解析器默认拒绝：除 `blob:none`、`sparse:oid=`（及 `CL-13`/`CL-24` 处理的组合形式）外的规格一律以 `LBR-UNSUPPORTED-001` 拒绝，自本卡起持续成立、后继卡不改写（AC5 以样本表验收，`DEFER-CL-10`），不静默全量克隆。
 **Out of scope:** promisor lazy fetch（`CL-19`）；多 `--filter` 组合与协商（`CL-13`）。
 **Current evidence:**

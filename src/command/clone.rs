@@ -432,6 +432,29 @@ fn local_clone_ignored_option_warnings(args: &CloneArgs) -> Vec<String> {
     warnings
 }
 
+/// Classify an object filter this build does not implement. `blob:none` and
+/// `sparse:oid=` are handled by their own cards; everything else fails closed.
+fn unsupported_object_filter(filter: &str) -> Option<&'static str> {
+    let filter = filter.trim();
+    if filter == "blob:none" || filter.starts_with("sparse:oid=") || filter.starts_with("combine:")
+    {
+        return None;
+    }
+    if filter.starts_with("tree:") {
+        return Some("tree:<depth>");
+    }
+    if filter.starts_with("sparse:path=") {
+        return Some("sparse:path");
+    }
+    if filter.starts_with("object:type=") {
+        return Some("object:type=<type>");
+    }
+    if filter.starts_with("blob:limit=") {
+        return Some("blob:limit=<n>");
+    }
+    Some("unknown filter")
+}
+
 fn clone_fetch_option_warnings(args: &CloneArgs, local_clone: bool) -> Vec<String> {
     if local_clone {
         local_clone_ignored_option_warnings(args)
@@ -665,6 +688,8 @@ pub enum CloneError {
     InvalidConfigEntry { entry: String },
     #[error("local object transfer failed: {message}")]
     HardlinkFailed { message: String },
+    #[error("object filter '{filter}' is not supported ({kind})")]
+    UnsupportedFilter { filter: String, kind: &'static str },
     #[error(
         "refusing to clone a Mega2 traces locator with libra clone; traces history is not part of the code view"
     )]
@@ -749,6 +774,13 @@ impl From<CloneError> for CliError {
                 .with_hint(
                     "the Cloudflare publish site host was removed; clone a git remote or use `libra cloud` for repository backup.",
                 ),
+            CloneError::UnsupportedFilter { ref filter, kind } => {
+                CliError::command_usage(format!(
+                    "object filter '{filter}' is not supported ({kind})"
+                ))
+                .with_stable_code(crate::utils::error::StableErrorCode::Unsupported)
+                .with_hint("supported filters today: blob:none, sparse:oid=<rev>:<path>")
+            }
             CloneError::HardlinkFailed { ref message } => CliError::fatal(format!(
                 "local object transfer failed: {message}"
             ))
@@ -1621,6 +1653,20 @@ async fn execute_clone_inner(
     // working tree) is refused up front, before anything is created.
     if args.separate_git_dir.is_some() && (args.bare || args.mirror) {
         return Err((CloneError::SeparateGitDirWithBare, None));
+    }
+
+    // Filters this build does not implement fail closed instead of silently
+    // cloning everything (Git's `list-objects-filter` validation).
+    if let Some(filter) = args.filter.as_deref()
+        && let Some(kind) = unsupported_object_filter(filter)
+    {
+        return Err((
+            CloneError::UnsupportedFilter {
+                filter: filter.to_string(),
+                kind,
+            },
+            None,
+        ));
     }
 
     let mut remote_repo = args.remote_repo.clone();

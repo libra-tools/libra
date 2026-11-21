@@ -3880,6 +3880,50 @@ fn clone_promisor_lazy_fetches_a_missing_object() {
 }
 
 #[test]
+fn clone_rejects_unimplemented_object_filters() {
+    use crate::command::{create_committed_repo_via_cli, run_libra_command};
+
+    let src = create_committed_repo_via_cli();
+    let root = tempdir().unwrap();
+    for (index, filter) in [
+        "tree:0",
+        "tree:1",
+        "tree:2",
+        "object:type=blob",
+        "object:type=tree",
+        "object:type=commit",
+        "blob:limit=1024",
+        "sparse:path=/tmp/sparse",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let dest = root.path().join(format!("r{index}"));
+        let out = run_libra_command(
+            &[
+                "clone",
+                "--no-local",
+                "--bare",
+                &format!("--filter={filter}"),
+                src.path().to_str().expect("src"),
+                dest.to_str().expect("dest"),
+            ],
+            root.path(),
+        );
+        assert!(!out.status.success(), "filter {filter} must be refused");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("LBR-UNSUPPORTED-001"),
+            "filter {filter}: expected LBR-UNSUPPORTED-001: {stderr}"
+        );
+        assert!(
+            !dest.exists(),
+            "filter {filter} must not create the destination"
+        );
+    }
+}
+
+#[test]
 fn test_clone_reject_shallow_local_git_source() {
     use super::{create_linear_git_repo, git_success, run_libra_command};
 
