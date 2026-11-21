@@ -1650,8 +1650,13 @@ async fn run_fetch(args: FetchArgs, output: &OutputConfig) -> CliResult<FetchOut
             .with_hint("use 'libra remote -v' to inspect configured remotes"));
     };
     // For an anonymous spec we suppress tracking-ref updates (matching
-    // `--refmap=`), so only `FETCH_HEAD` is written.
-    let effective_refmap = if anonymous && refmap.is_none() {
+    // `--refmap=`), so only `FETCH_HEAD` is written — unless the command-line
+    // refspec names an explicit destination, which is written as asked.
+    let cli_has_explicit_destination = refspec.as_deref().is_some_and(|spec| {
+        let body = spec.strip_prefix('+').unwrap_or(spec);
+        body.split_once(':').is_some()
+    });
+    let effective_refmap = if anonymous && refmap.is_none() && !cli_has_explicit_destination {
         Some(String::new())
     } else {
         refmap
@@ -2035,6 +2040,25 @@ fn validate_fetch_destination(destination: &str, refspec: &str) -> Result<(), Fe
     }
 }
 
+/// Complete a command-line refspec destination the way Git's `get_local_ref`
+/// does: already-`refs/` names are kept, the `heads/`, `tags/` and `remotes/`
+/// prefixes gain `refs/`, and everything else becomes `refs/heads/<name>`.
+fn complete_refspec_destination(destination: &str) -> String {
+    if destination.starts_with("refs/")
+        || destination == "HEAD"
+        || destination.contains('*')
+        || destination.is_empty()
+    {
+        return destination.to_string();
+    }
+    for prefix in ["heads/", "tags/", "remotes/"] {
+        if destination.starts_with(prefix) {
+            return format!("refs/{destination}");
+        }
+    }
+    format!("refs/heads/{destination}")
+}
+
 fn parse_fetch_refspec(raw: &str, remote: &str) -> Result<FetchRefspec, FetchError> {
     if raw.is_empty() || raw.matches(':').count() > 1 {
         return Err(FetchError::InvalidRefspec {
@@ -2068,7 +2092,10 @@ fn parse_fetch_refspec(raw: &str, remote: &str) -> Result<FetchRefspec, FetchErr
     };
     let source = normalize_branch_ref(source_raw);
     let destination = match destination_raw {
-        Some(destination) => destination.to_string(),
+        // Git's `get_local_ref` completes a short destination: `heads/`,
+        // `tags/` and `remotes/` gain a `refs/` prefix, anything else becomes a
+        // local branch (`remote.c:2118-2132`).
+        Some(destination) => complete_refspec_destination(destination),
         None => default_fetch_destination(remote, &source)?,
     };
 

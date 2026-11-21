@@ -10,6 +10,8 @@ libra fetch [OPTIONS] [<repository> [<refspec>]]
 
 ## 说明
 
+命令行 refspec 的目标按 Git `get_local_ref` 规则补全：`refs/…` 原样，`heads/`、`tags/`、`remotes/` 前缀补 `refs/`，其余补为 `refs/heads/<name>`（因此 `main:origin` 写入 `refs/heads/origin`）。匿名 fetch（路径、`./dir` 或裸目录名）会写入该显式目标；不带目标时仍只写 `FETCH_HEAD`；`refs/tags/…` 目标继续拒绝（`LBR-CLI-002`，请用 `--tags`）。
+
 未配置为 remote、且指向一个 Libra 仓库的**裸目录名**会按匿名本地仓库解析：先看当前目录，再看其父目录（同级仓库）。此时与 `libra fetch ./<dir>` 完全一致——只写 `FETCH_HEAD`，不创建远端跟踪引用、不写 `remote.<name>` 配置；既非配置 remote 也不是 Libra 仓库的名字仍以 `remote '<name>' not found`（`LBR-CLI-003`）拒绝。
 
 `libra fetch` 联系远程仓库，协商本地存储缺少哪些对象，将它们作为 pack 文件下载，索引该 pack，并更新对应的远程跟踪引用（例如 `refs/remotes/origin/main`）。它永远不会修改工作树或当前分支；要进行这些操作，请使用 `libra pull` 或 `libra merge`。

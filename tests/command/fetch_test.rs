@@ -4188,3 +4188,104 @@ fn test_fetch_bare_directory_name_resolves_as_anonymous() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+#[test]
+fn test_fetch_short_destination_completion_and_anonymous_targets() {
+    use crate::command::{assert_cli_success, run_libra_command};
+
+    let work = tempdir().expect("work dir");
+    let parent = work.path().join("parent");
+    std::fs::create_dir_all(&parent).expect("mkdir parent");
+    assert_cli_success(&run_libra_command(&["init"], &parent), "init parent");
+    run_libra_command(&["config", "set", "user.name", "t"], &parent);
+    run_libra_command(&["config", "set", "user.email", "t@t"], &parent);
+    std::fs::write(parent.join("f.txt"), "x\n").expect("write f");
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], &parent), "stage f");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "p1", "--no-verify"], &parent),
+        "commit p1",
+    );
+    let p1 = {
+        let out = run_libra_command(&["rev-parse", "main"], &parent);
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+
+    // A clone of `parent` gives us a configured remote plus a sibling copy.
+    let child = work.path().join("child");
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "clone",
+                &format!("file://{}", parent.display()),
+                child.to_str().unwrap(),
+            ],
+            work.path(),
+        ),
+        "clone child",
+    );
+    run_libra_command(&["config", "set", "user.name", "t"], &child);
+    run_libra_command(&["config", "set", "user.email", "t@t"], &child);
+    let show = |repo: &std::path::Path| {
+        String::from_utf8_lossy(&run_libra_command(&["show-ref"], repo).stdout).to_string()
+    };
+
+    // AC1: a bare directory name plus a short destination.
+    let before = show(&child);
+    assert_cli_success(
+        &run_libra_command(&["fetch", "parent", "main:origin"], &child),
+        "AC1: bare directory with a short destination",
+    );
+    let after = show(&child);
+    let added = after
+        .lines()
+        .filter(|line| !before.lines().any(|old| old == *line))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    assert_eq!(added, vec![format!("{p1} refs/heads/origin")], "AC1");
+
+    // AC2: an explicit `./parent` plus a full destination.
+    assert_cli_success(
+        &run_libra_command(
+            // `../parent` is the sibling form (`./parent` would need the source
+            // nested inside the clone).
+            &["fetch", "../parent", "refs/heads/main:refs/heads/x"],
+            &child,
+        ),
+        "AC2: explicit relative path",
+    );
+    assert!(
+        show(&child).contains(&format!("{p1} refs/heads/x")),
+        "AC2: refs/heads/x points at P1"
+    );
+
+    // AC3/AC4: `remotes/` and `heads/` prefixes gain `refs/`.
+    assert_cli_success(
+        &run_libra_command(&["fetch", "origin", "main:remotes/origin/copy"], &child),
+        "AC3: remotes/ prefix",
+    );
+    assert!(
+        show(&child).contains(&format!("{p1} refs/remotes/origin/copy")),
+        "AC3: refs/remotes/origin/copy exists"
+    );
+    assert_cli_success(
+        &run_libra_command(&["fetch", "origin", "main:heads/h"], &child),
+        "AC4: heads/ prefix",
+    );
+    assert!(
+        show(&child).contains(&format!("{p1} refs/heads/h")),
+        "AC4: refs/heads/h exists"
+    );
+
+    // AC5–AC7: a completed tag destination keeps the tag refusal and writes
+    // nothing.
+    let before_tags = show(&child);
+    let out = run_libra_command(&["fetch", "origin", "main:tags/t"], &child);
+    assert!(!out.status.success(), "AC5: tag destinations are refused");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("LBR-CLI-002"), "AC5: {stderr}");
+    assert!(
+        stderr.contains("tag destinations are not supported"),
+        "AC6: {stderr}"
+    );
+    assert_eq!(show(&child), before_tags, "AC7: nothing was written");
+}

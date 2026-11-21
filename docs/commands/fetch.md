@@ -24,6 +24,13 @@ all advertised branches use the default `refs/remotes/<name>/*` mapping.
 
 A `<repository>` may also be an anonymous local repository spec — a `file://` URL,
 absolute path, or a relative path such as `.` — which fetches into `FETCH_HEAD`
+A command-line refspec's destination is completed the way Git's `get_local_ref`
+does: `refs/…` is kept, `heads/`, `tags/` and `remotes/` gain a `refs/` prefix, and
+anything else becomes `refs/heads/<name>` (so `main:origin` writes `refs/heads/origin`).
+An anonymous fetch (a path, `./dir`, or a bare repository directory name) writes that
+explicit destination; without a destination it still writes only `FETCH_HEAD`.
+`refs/tags/…` destinations stay refused (`LBR-CLI-002`, use `--tags`).
+
 A bare directory name is resolved as an anonymous local repository when it is not a
 configured remote and it names a Libra repository: the current directory is checked
 first, then its parent (a sibling repository). The fetch then behaves exactly like

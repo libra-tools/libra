@@ -816,7 +816,7 @@ PY
 
 ### Task FP-23: 命令行 fetch refspec 的短目标补全与匿名 fetch 写入显式目标（#719；自 FP-01 拆出）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `complete`（2026-11-21：`parse_fetch_refspec` 对目标套用 Git `get_local_ref` 补全（新增 `complete_refspec_destination`：`refs/…` 原样、`heads/`/`tags/`/`remotes/` 补 `refs/`、其余补 `refs/heads/`；`HEAD`、通配与空目标不补全）；匿名 fetch 仅在命令行 refspec **不带目标**时才用空 refmap 抑制写入，带显式目标时按目标写入（`effective_refmap` 条件增加 `cli_has_explicit_destination`），`refs/tags/…` 目标仍由 `validate_fetch_destination` 以 `tag destinations are not supported` 拒绝（`LBR-CLI-002`）。用例 `test_fetch_short_destination_completion_and_anonymous_targets` 覆盖 AC1–AC7（裸目录名 + 短目标只新增 `refs/heads/origin`、`../parent` 全目标写 `refs/heads/x`、`remotes/` 与 `heads/` 前缀补全、`tags/t` 拒绝且不写入）；AC2 使用同级相对路径 `../parent`（`./parent` 需源嵌套在克隆内）。`fetch`/`pull`/`clone`/`remote` 套件 **249/249**；版本面 0.30.240 → 0.30.241；文档 EN/zh-CN 同步。按用户 2026-11-20 指令在 `main` 直接提交推送。）
 
 **Description:** 在 `parse_fetch_refspec` 中按 Git `get_local_ref` 规则补全命令行 refspec 的非 `refs/` 目标（`heads/`、`tags/`、`remotes/` 前缀补 `refs/`，其余补 `refs/heads/`），并让匿名本地仓库 fetch（`./<dir>`、绝对路径、`FP-01` 的裸目录名）在命令行 refspec 带显式目标时写入该目标引用；不带目标的匿名 fetch 行为不变。`tags/` 补全得到的 `refs/tags/*` 目标仍按 `validate_fetch_destination` 现有限制拒绝。
 
