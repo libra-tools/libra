@@ -840,7 +840,7 @@
 
 ### Task DESC-10: `tags/` 命名空间 describe 后缀解析 commit
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `in-progress` / `locally-accepted`（2026-11-21：`tags/` 早返回分支改为「本命名空间字面 tag → 完整名字的本地分支 → 完整名字的远程跟踪分支 → describe 后缀」顺序；已完成并验证 AC1/AC2（`tags/x-1-g<缩写|全长>` 解析为 commit）、AC3（同名 tag 字面优先）、AC6（完整名字的本地分支优先）。**剩余**：AC4（commit 与 blob 共享前缀需构造碰撞夹具）、AC5（后缀原子后继续 `~1` 等运算——当前 `tags/` 前缀把整串当一个原子，需接入 rev 后缀拆解）、AC7（远程跟踪级完整名字）；以及文档同步与版本 bump。未验证前不转 `done`。） | **Priority / Selection:** P1 | **Issue:** [#798](https://github.com/libra-tools/libra/issues/798)、[#799](https://github.com/libra-tools/libra/issues/799)
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `complete`（2026-11-21：`tags/` 早返回分支按 Git `ref_rev_parse_rules` 顺序解析——本命名空间字面 tag → 完整名字的本地分支 → 完整名字的远程跟踪分支 → describe 后缀（复用 `DESC-09b` 的缺失与 commit 优先消歧语义），字面引用始终优先；后缀原子经既有 `first_revision_operator` 拆分，因此可与后续 `~`/`^` 运算组合。用例 `describe_suffix_inside_the_tags_namespace` 覆盖 AC1/AC2（`tags/x-1-g<缩写|全长>` → commit）、AC3（同名 tag 字面优先）、AC5（`tags/x-1-g<有父提交>~1` → 父提交）、AC6（完整名字的本地分支优先）、AC7（远程 `tags` 的 `dwr-1-g<ab>` 跟踪分支优先）；AC4（commit 与 blob 共享前缀 → 取 commit）由 `DESC-09b` 的纯判定单测 `pick_describe_candidate_obeys_git_disambiguation` 覆盖（构造真实前缀碰撞夹具不可控）。`rev_parse_test` **55/55**；文档 EN/zh-CN 同步；版本面 0.30.265 → 0.30.266。本卡为 `REL-DESC-09` 子卡 5/16，只本地签名提交。按用户 2026-11-20 指令在 `main` 直接提交推送。）
 
 **Description:** 自 `DESC-09` 拆出；家族 `REL-DESC-09` 子卡（5/16）。在 `tags/`/`refs/tags/` 早返回分支（`src/utils/util.rs:2438-2443`）中，对以 `tags/` 开头的名字：本命名空间字面查找未命中且名字符合 describe 语法时，先按 `ADR-DESC-03` ①「字面查找顺序」以完整名字查找 tag、本地分支与远程跟踪引用，仍未命中才调用 describe 后缀 helper（含 `DESC-09b` 的缺失与 commit 优先消歧语义）解析 commit；字面引用优先。非提交对象由同家族的 `DESC-10f` 放开、其它前缀由同家族各自的卡接入（家族内实现顺序：中间态只存在于本地子卡提交、不对外发布，故不设临时边界判据，见 `REL-DESC-09`）。
 

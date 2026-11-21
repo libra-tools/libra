@@ -72,7 +72,9 @@ be unambiguous unless exactly one candidate is a commit (that commit wins), a
 full-length id must exist, and a non-hex or shorter-than-4-character id fails with
 `LBR-CLI-003` (no ambiguity listing is printed). An annotated tag object named by the suffix resolves to that tag object itself
 (unpeeled), and blob and tree suffixes resolve to those objects — the root
-namespace accepts every object type, like Git.
+namespace accepts every object type, like Git. The `tags/` namespace resolves a
+describe suffix after its own literal tag lookup and the complete-name lookups of
+local and remote-tracking branches, so a real ref with that exact name always wins.
 
 | Flag | Description |
 |------|-------------|

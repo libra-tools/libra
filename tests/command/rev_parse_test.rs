@@ -1977,6 +1977,63 @@ fn describe_suffix_inside_the_tags_namespace() {
         "AC3: the literal tag wins over the suffix object"
     );
 
+    // AC5: the describe atom composes with later revision operators.
+    assert_cli_success(
+        &run_libra_command(&["tag", "v-parent"], p),
+        "tag for the parented commit",
+    );
+    let head = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], p).stdout)
+        .trim()
+        .to_string();
+    assert_eq!(
+        resolve(&format!("tags/x-1-g{head}~1")),
+        c1,
+        "AC5: the suffix atom is peeled one commit back"
+    );
+
+    // AC7: the complete-name lookup also reaches remote-tracking branches.
+    let remote_dir = tempfile::tempdir().expect("remote root");
+    let remote_path = remote_dir.path().join("tags-remote");
+    std::fs::create_dir_all(&remote_path).expect("mkdir remote");
+    assert_cli_success(&run_libra_command(&["init"], &remote_path), "init remote");
+    run_libra_command(&["config", "set", "user.name", "t"], &remote_path);
+    run_libra_command(&["config", "set", "user.email", "t@t"], &remote_path);
+    std::fs::write(remote_path.join("g.txt"), "g\n").expect("write g");
+    assert_cli_success(
+        &run_libra_command(&["add", "g.txt"], &remote_path),
+        "stage g",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "sc", "--no-verify"], &remote_path),
+        "commit sc",
+    );
+    let sc =
+        String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], &remote_path).stdout)
+            .trim()
+            .to_string();
+    assert_cli_success(
+        &run_libra_command(&["branch", &format!("dwr-1-g{short}"), &sc], &remote_path),
+        "branch with a describe-shaped name on the remote",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "remote",
+                "add",
+                "tags",
+                remote_path.to_str().expect("remote"),
+            ],
+            p,
+        ),
+        "add the tags remote",
+    );
+    assert_cli_success(&run_libra_command(&["fetch", "tags"], p), "fetch tags");
+    assert_eq!(
+        resolve(&format!("tags/dwr-1-g{short}")),
+        sc,
+        "AC7: the remote-tracking branch wins the complete-name lookup"
+    );
+
     // AC6: a local branch literally named `tags/<describe>` is found by the
     // complete-name lookup before the suffix parse.
     assert_cli_success(
