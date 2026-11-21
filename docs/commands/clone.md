@@ -181,17 +181,23 @@ libra clone --mirror git@github.com:user/repo.git repo-mirror.git
 
 ### `--filter <spec>` / `--shallow-since <date>` / `--shallow-exclude <rev>`
 
-Git's fetch-shaping flags that *reduce* what is transferred: `--filter` (e.g.
-`blob:none`) is a partial clone, and `--shallow-since`/`--shallow-exclude` bound
-shallow history by date or excluded ref. **Libra has no partial-clone/promisor
-support, and its fetch uses only `--depth` to request a new shallow cutoff**, so these
-flags are accepted but **ignored, with a warning** — their requested trimming
-is not applied to the selected refs (subject to `--depth` if also given).
-Without `--depth`, Libra fetches the history available from the source; an
-already-shallow source still produces a shallow clone with its advertised
-boundaries preserved. Git similarly warns and falls back to an unfiltered clone
-when a server cannot honor `--filter`. `--shallow-exclude` may be given multiple
-times.
+Git's fetch-shaping flags that *reduce* what is transferred. `--filter=blob:none`
+is a partial clone: a local transport (`file://` or `--no-local`) transfers commits
+and trees only and records the promisor configuration
+(`remote.<name>.promisor=true`, `remote.<name>.partialclonefilter=blob:none`,
+`extensions.partialClone=<name>`, using the effective remote name from `-o` or
+`clone.defaultRemoteName`); a missing object is then fetched on demand from that
+promisor remote. Every other filter spec fails closed with `LBR-UNSUPPORTED-001`
+(`tree:<depth>`, `object:type=<type>`, `blob:limit=<n>`, `sparse:path=<path>`,
+`combine:...`, and a repeated `--filter` with differing values);
+`--filter=sparse:oid=<rev>:<path>` is validated against the source but not yet
+applied. Network filter negotiation is not implemented yet. `--shallow-since`
+and `--shallow-exclude` bound shallow history by date or excluded ref, but
+**Libra's fetch uses only `--depth` to request a new shallow cutoff**, so those two
+are accepted but **ignored, with a warning**. Without `--depth`, Libra fetches the
+history available from the source; an already-shallow source still produces a
+shallow clone with its advertised boundaries preserved. `--shallow-exclude` may be
+given multiple times.
 
 ```bash
 libra clone --filter blob:none git@github.com:user/repo.git

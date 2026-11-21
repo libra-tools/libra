@@ -205,6 +205,25 @@ pub fn get_wire_hash_kind() -> HashKind {
 /// Only the smart-HTTP transport negotiates v2 today; every other transport and
 /// every fallback path reports [`ProtocolVersion::V0`] and keeps the legacy
 /// advertisement parser and request builders.
+/// Object filters this build honours on a local transfer. Remote negotiation
+/// (network clients) is tracked separately (`DEFER-CL-08`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObjectFilter {
+    /// Git's `blob:none`: commits and trees only.
+    BlobNone,
+}
+
+impl ObjectFilter {
+    /// Whether an object of `object_type` survives this filter.
+    pub fn keeps(self, object_type: git_internal::internal::object::types::ObjectType) -> bool {
+        match self {
+            ObjectFilter::BlobNone => {
+                object_type != git_internal::internal::object::types::ObjectType::Blob
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ProtocolVersion {
     /// Git protocol v0/v1: `<oid> <ref>\0<capabilities>` advertisement.

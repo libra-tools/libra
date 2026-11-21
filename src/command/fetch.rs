@@ -47,7 +47,7 @@ use crate::{
         head::Head,
         model::reference as ref_model,
         protocol::{
-            DiscRef, DiscoveryResult, FetchStream, ProtocolClient, ProtocolVersion,
+            DiscRef, DiscoveryResult, FetchStream, ObjectFilter, ProtocolClient, ProtocolVersion,
             bundle_client::BundleClient,
             git_client::GitClient,
             https_client::HttpsClient,
@@ -291,6 +291,7 @@ impl RemoteClient {
         expected_shallow_boundaries: &[String],
         version: ProtocolVersion,
         hash_kind: HashKind,
+        filter: Option<ObjectFilter>,
     ) -> Result<FetchStream, IoError> {
         match self {
             RemoteClient::Http(client) => {
@@ -306,7 +307,11 @@ impl RemoteClient {
                     )
                     .await
             }
-            RemoteClient::Local(client) => client.fetch_objects(have, want, shallow, depth).await,
+            RemoteClient::Local(client) => {
+                client
+                    .fetch_objects(have, want, shallow, depth, filter)
+                    .await
+            }
             RemoteClient::Git(client) => {
                 client
                     .fetch_objects_with_expected_shallow_boundaries(
@@ -1580,6 +1585,7 @@ async fn run_fetch(args: FetchArgs, output: &OutputConfig) -> CliResult<FetchOut
                 &negotiation_tip,
                 unshallow,
                 &results,
+                None,
             )
             .await
             .map_err(CliError::from)?;
@@ -1683,6 +1689,7 @@ async fn run_fetch(args: FetchArgs, output: &OutputConfig) -> CliResult<FetchOut
         effective_refmap.as_deref(),
         &negotiation_tip,
         unshallow,
+        None,
     )
     .await
     .map_err(CliError::from)?;
@@ -2414,6 +2421,7 @@ pub async fn fetch_repository_safe(
         None,
         &[],
         false,
+        None,
     )
     .await
     .map(|result| {
@@ -2459,7 +2467,7 @@ pub(crate) async fn lazy_fetch_object(oid: &ObjectHash) -> Result<bool, FetchErr
     // Local-style transports take the object id directly; HTTP/SSH would need
     // a full capability negotiation and are not covered by the lazy path yet.
     let mut stream = match &client {
-        RemoteClient::Local(inner) => inner.fetch_objects(&[], &want, &[], None).await,
+        RemoteClient::Local(inner) => inner.fetch_objects(&[], &want, &[], None, None).await,
         RemoteClient::Git(inner) => inner.fetch_objects(&[], &want, &[], None).await,
         RemoteClient::Bundle(inner) => inner.fetch_objects(&[], &want, &[], None).await,
         RemoteClient::Http(_) | RemoteClient::Ssh(_) => return Ok(false),
@@ -2500,6 +2508,7 @@ pub(crate) async fn fetch_repository_with_result(
     refmap: Option<&str>,
     negotiation_tip: &[String],
     unshallow: bool,
+    filter: Option<ObjectFilter>,
 ) -> Result<FetchRepositoryResult, FetchError> {
     fetch_repository_with_result_reusing(
         remote_config,
@@ -2518,6 +2527,7 @@ pub(crate) async fn fetch_repository_with_result(
         negotiation_tip,
         unshallow,
         &[],
+        filter,
     )
     .await
 }
@@ -2540,6 +2550,7 @@ async fn fetch_repository_with_result_reusing(
     negotiation_tip: &[String],
     unshallow: bool,
     prior_results: &[FetchRepositoryResult],
+    filter: Option<ObjectFilter>,
 ) -> Result<FetchRepositoryResult, FetchError> {
     let cli_prune_refspec = branch.clone();
 
@@ -2783,6 +2794,7 @@ async fn fetch_repository_with_result_reusing(
             &discovery.shallow_boundaries,
             discovery.version,
             discovery.hash_kind,
+            filter,
         )
         .await
         .map_err(|source| FetchError::FetchObjects {

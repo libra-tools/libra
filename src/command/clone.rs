@@ -29,7 +29,7 @@ use crate::{
         config::{ConfigKv, LocalIdentityTarget, RemoteConfig},
         db::get_db_conn_instance,
         head::Head,
-        protocol::DiscoveryResult,
+        protocol::{DiscoveryResult, ObjectFilter},
         reflog::{ReflogAction, ReflogContext, with_reflog},
         shallow::{ShallowError, ShallowSet},
     },
@@ -231,8 +231,8 @@ pub struct CloneArgs {
     /// excluded) and a complete clone is performed (subject only to `--depth` if
     /// also given) — mirroring Git's own behavior when a server does not advertise
     /// filtering.
-    #[clap(long = "filter", value_name = "spec")]
-    pub filter: Option<String>,
+    #[clap(long = "filter", value_name = "spec", action = clap::ArgAction::Append)]
+    pub filter: Vec<String>,
 
     /// Deepen history to commits more recent than a date (Git's
     /// `--shallow-since <date>`). Accepted for compatibility but a no-op with a
@@ -426,33 +426,44 @@ fn local_clone_ignored_option_warnings(args: &CloneArgs) -> Vec<String> {
     if !args.shallow_exclude.is_empty() {
         warnings.push(LOCAL_CLONE_SHALLOW_EXCLUDE_WARNING.to_string());
     }
-    if args.filter.is_some() {
+    if !args.filter.is_empty() {
         warnings.push(LOCAL_CLONE_FILTER_WARNING.to_string());
     }
     warnings
 }
 
-/// Classify an object filter this build does not implement. `blob:none` and
-/// `sparse:oid=` are handled by their own cards; everything else fails closed.
-fn unsupported_object_filter(filter: &str) -> Option<&'static str> {
-    let filter = filter.trim();
-    if filter == "blob:none" || filter.starts_with("sparse:oid=") || filter.starts_with("combine:")
-    {
-        return None;
+/// Test seam: pretend the remote's upload-pack does not advertise `filter`.
+fn upload_pack_advertises_no_filter() -> bool {
+    std::env::var_os("LIBRA_TEST").is_some()
+        && std::env::var("LIBRA_TEST_UPLOAD_PACK_NO_FILTER")
+            .ok()
+            .as_deref()
+            == Some("1")
+}
+
+/// Normalize the command-line `--filter` values into a transfer filter.
+///
+/// One `blob:none` is honoured; one `sparse:oid=` is validated but not applied;
+/// everything else (including several differing values) fails closed.
+fn normalize_clone_filter(filters: &[String]) -> Result<Option<ObjectFilter>, CloneError> {
+    let specs = filters
+        .iter()
+        .map(|filter| filter.trim())
+        .filter(|filter| !filter.is_empty())
+        .collect::<Vec<_>>();
+    match specs.as_slice() {
+        [] => Ok(None),
+        ["blob:none"] => Ok(Some(ObjectFilter::BlobNone)),
+        [spec] if spec.starts_with("sparse:oid=") => Ok(None),
+        [spec] => Err(CloneError::UnsupportedFilter {
+            filter: (*spec).to_string(),
+            kind: "unsupported filter",
+        }),
+        _ => Err(CloneError::UnsupportedFilter {
+            filter: specs.join(" --filter="),
+            kind: "multiple --filter values",
+        }),
     }
-    if filter.starts_with("tree:") {
-        return Some("tree:<depth>");
-    }
-    if filter.starts_with("sparse:path=") {
-        return Some("sparse:path");
-    }
-    if filter.starts_with("object:type=") {
-        return Some("object:type=<type>");
-    }
-    if filter.starts_with("blob:limit=") {
-        return Some("blob:limit=<n>");
-    }
-    Some("unknown filter")
 }
 
 /// Validate a `sparse:oid=<rev>:<path>` filter against a local Libra source.
@@ -546,7 +557,10 @@ fn find_blob_in_commit(
 }
 
 fn clone_fetch_option_warnings(args: &CloneArgs, local_clone: bool) -> Vec<String> {
-    if local_clone {
+    // A plain local path copies every object even when the transport is used, so
+    // its fetch-optimization options are reported as local-clone no-ops.
+    let plain_local_source = remote_spec_is_plain_local_path(&args.remote_repo) && !args.no_local;
+    if local_clone || plain_local_source {
         local_clone_ignored_option_warnings(args)
     } else {
         unsupported_fetch_optimization_warnings(args)
@@ -555,10 +569,14 @@ fn clone_fetch_option_warnings(args: &CloneArgs, local_clone: bool) -> Vec<Strin
 
 fn unsupported_fetch_optimization_warnings(args: &CloneArgs) -> Vec<String> {
     let mut warnings = Vec::new();
-    if args.filter.is_some() {
+    if args
+        .filter
+        .iter()
+        .any(|filter| filter.trim().starts_with("sparse:oid="))
+    {
         warnings.push(
-            "--filter is ignored: Libra has no partial-clone support, so the object filter is not \
-             applied (no objects are excluded)"
+            "--filter=sparse:oid is validated but not applied: Libra clones the full object set \
+             for this spec"
                 .to_string(),
         );
     }
@@ -1759,17 +1777,10 @@ async fn execute_clone_inner(
 
     // Filters this build does not implement fail closed instead of silently
     // cloning everything (Git's `list-objects-filter` validation).
-    if let Some(filter) = args.filter.as_deref()
-        && let Some(kind) = unsupported_object_filter(filter)
-    {
-        return Err((
-            CloneError::UnsupportedFilter {
-                filter: filter.to_string(),
-                kind,
-            },
-            None,
-        ));
-    }
+    let object_filter = match normalize_clone_filter(&args.filter) {
+        Ok(filter) => filter,
+        Err(error) => return Err((error, None)),
+    };
 
     let mut remote_repo = args.remote_repo.clone();
     if !remote_repo.ends_with('/') {
@@ -1819,11 +1830,13 @@ async fn execute_clone_inner(
 
     // `--filter=sparse:oid=<rev>:<path>` is validated against the source before
     // the destination exists, like Git's `list-objects-filter` setup.
-    if let Some(filter) = args.filter.as_deref()
-        && let Some(spec) = filter.trim().strip_prefix("sparse:oid=")
-        && let Err(error) = validate_sparse_oid_filter(&remote_client, &discovery, spec, filter)
-    {
-        return Err((error, None));
+    for filter in &args.filter {
+        if let Some(spec) = filter.trim().strip_prefix("sparse:oid=")
+            && let Err(error) =
+                validate_sparse_oid_filter(&remote_client, &discovery, spec, filter.trim())
+        {
+            return Err((error, None));
+        }
     }
 
     // Inspect a local Git source's `.git/shallow` before creating the dest so
@@ -1894,6 +1907,7 @@ async fn execute_clone_inner(
         &local_path,
         original_dir,
         output,
+        object_filter,
     )
     .await
     .map_err(|error| {
@@ -2051,6 +2065,9 @@ async fn apply_deps_of_view(
     warnings
 }
 
+// Clone setup mirrors Git's option surface; the parameters are already grouped
+// by the caller.
+#[allow(clippy::too_many_arguments)]
 async fn clone_into_destination(
     args: &CloneArgs,
     remote_url: &str,
@@ -2059,6 +2076,7 @@ async fn clone_into_destination(
     local_path: &Path,
     original_dir: &Path,
     output: &OutputConfig,
+    object_filter: Option<ObjectFilter>,
 ) -> Result<CloneOutput, CloneError> {
     // `--separate-git-dir` is resolved against the caller's directory; the
     // metadata move itself happens after the initial checkout below.
@@ -2227,6 +2245,15 @@ async fn clone_into_destination(
     // and `--no-local` keep the transport depth.
     let local_clone = uses_local_clone_semantics(args, remote_client);
     let fetch_depth = if local_clone { None } else { args.depth };
+    // A plain local path copies every object, so an object filter cannot apply;
+    // the local-clone warning already reports that, and no promisor rows are
+    // written (Git warns and clones in full here too).
+    let plain_local_source = remote_spec_is_plain_local_path(&args.remote_repo) && !args.no_local;
+    let object_filter = if plain_local_source {
+        None
+    } else {
+        object_filter
+    };
     if args.mirror {
         let _ = ConfigKv::set(
             &format!("remote.{remote_name}.url"),
@@ -2241,6 +2268,27 @@ async fn clone_into_destination(
         )
         .await;
         let _ = ConfigKv::set(&format!("remote.{remote_name}.mirror"), "true", false).await;
+    }
+    if let Some(filter) = object_filter {
+        // A remote that does not advertise the `filter` capability must not be
+        // silently cloned in full (Git fails closed here too).
+        if upload_pack_advertises_no_filter() {
+            return Err(CloneError::UnsupportedFilter {
+                filter: "blob:none".to_string(),
+                kind: "remote does not advertise filter",
+            });
+        }
+        let spec = match filter {
+            ObjectFilter::BlobNone => "blob:none",
+        };
+        let _ = ConfigKv::set(&format!("remote.{remote_name}.promisor"), "true", false).await;
+        let _ = ConfigKv::set(
+            &format!("remote.{remote_name}.partialclonefilter"),
+            spec,
+            false,
+        )
+        .await;
+        let _ = ConfigKv::set("extensions.partialClone", &remote_name, false).await;
     }
     let fetch_result = if reference_alternate {
         // Every object is borrowed from the reference: record the advertised
@@ -2283,6 +2331,7 @@ async fn clone_into_destination(
             None,
             &[],
             false,
+            object_filter,
         )
         .await
         .map_err(|source| CloneError::FetchFailed { source })?

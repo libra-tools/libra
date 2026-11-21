@@ -230,7 +230,7 @@ async fn test_clone_branch() {
         no_shared: false,
         dissociate: false,
         mirror: false,
-        filter: None,
+        filter: Vec::new(),
         shallow_since: None,
         shallow_exclude: vec![],
         deps_of: vec![],
@@ -286,7 +286,7 @@ async fn test_clone_bare_repository() {
         no_shared: false,
         dissociate: false,
         mirror: false,
-        filter: None,
+        filter: Vec::new(),
         shallow_since: None,
         shallow_exclude: vec![],
         deps_of: vec![],
@@ -357,7 +357,7 @@ async fn test_clone_branch_single_branch() {
         no_shared: false,
         dissociate: false,
         mirror: false,
-        filter: None,
+        filter: Vec::new(),
         shallow_since: None,
         shallow_exclude: vec![],
         deps_of: vec![],
@@ -412,7 +412,7 @@ async fn test_clone_default_branch() {
         no_shared: false,
         dissociate: false,
         mirror: false,
-        filter: None,
+        filter: Vec::new(),
         shallow_since: None,
         shallow_exclude: vec![],
         deps_of: vec![],
@@ -467,7 +467,7 @@ async fn test_clone_default_branch_single_branch() {
         no_shared: false,
         dissociate: false,
         mirror: false,
-        filter: None,
+        filter: Vec::new(),
         shallow_since: None,
         shallow_exclude: vec![],
         deps_of: vec![],
@@ -524,7 +524,7 @@ async fn test_clone_to_existing_empty_dir() {
         no_shared: false,
         dissociate: false,
         mirror: false,
-        filter: None,
+        filter: Vec::new(),
         shallow_since: None,
         shallow_exclude: vec![],
         deps_of: vec![],
@@ -584,7 +584,7 @@ async fn test_clone_to_existing_dir() {
         no_shared: false,
         dissociate: false,
         mirror: false,
-        filter: None,
+        filter: Vec::new(),
         shallow_since: None,
         shallow_exclude: vec![],
         deps_of: vec![],
@@ -640,7 +640,7 @@ async fn test_clone_to_dir_with_existing_file_name() {
         no_shared: false,
         dissociate: false,
         mirror: false,
-        filter: None,
+        filter: Vec::new(),
         shallow_since: None,
         shallow_exclude: vec![],
         deps_of: vec![],
@@ -695,7 +695,7 @@ async fn test_clone_with_depth() {
         no_shared: false,
         dissociate: false,
         mirror: false,
-        filter: None,
+        filter: Vec::new(),
         shallow_since: None,
         shallow_exclude: vec![],
         deps_of: vec![],
@@ -752,7 +752,7 @@ async fn test_clone_with_depth_and_branch() {
         no_shared: false,
         dissociate: false,
         mirror: false,
-        filter: None,
+        filter: Vec::new(),
         shallow_since: None,
         shallow_exclude: vec![],
         deps_of: vec![],
@@ -3972,6 +3972,175 @@ fn clone_validates_sparse_oid_filters() {
     assert_cli_success(&commit, "commit the rule file");
     let out = clone_filter("--filter=sparse:oid=main:only-one", "e3");
     assert_cli_success(&out, "AC6: the rule blob is accepted");
+}
+
+#[test]
+fn test_clone_filter_promisor_config_and_combine() {
+    use crate::command::{assert_cli_success, create_committed_repo_via_cli, run_libra_command};
+
+    let src = create_committed_repo_via_cli();
+    std::fs::create_dir_all(src.path().join("sub")).expect("mkdir sub");
+    std::fs::write(src.path().join("sub/inner.txt"), "inner\n").expect("write inner");
+    assert_cli_success(
+        &run_libra_command(&["add", "sub/inner.txt"], src.path()),
+        "stage the nested file",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "add a nested directory"], src.path()),
+        "commit the nested file",
+    );
+    let source_url = format!("file://{}", src.path().display());
+    let root = tempdir().unwrap();
+
+    let bare_clone = |name: &str, extra: &[&str]| {
+        let dest = root.path().join(name);
+        let mut argv = vec!["clone", "--bare"];
+        argv.extend_from_slice(extra);
+        argv.push(&source_url);
+        let dest_str = dest.to_str().expect("dest").to_string();
+        argv.push(&dest_str);
+        assert_cli_success(
+            &run_libra_command(&argv, root.path()),
+            "bare blob:none clone",
+        );
+        dest
+    };
+    let config_get = |repo: &std::path::Path, key: &str| {
+        let out = run_libra_command(&["config", "get", key], repo);
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+
+    // AC1/AC2/AC3: the promisor rows follow the effective remote name.
+    let d = bare_clone("d", &["-o", "upstream", "--filter=blob:none"]);
+    for (key, expected) in [
+        ("remote.upstream.promisor", "true"),
+        ("remote.upstream.partialclonefilter", "blob:none"),
+        ("extensions.partialClone", "upstream"),
+    ] {
+        assert_eq!(config_get(&d, key), expected, "AC1: {key}");
+    }
+    let d2 = bare_clone(
+        "d2",
+        &["-c", "clone.defaultRemoteName=cfg", "--filter=blob:none"],
+    );
+    for (key, expected) in [
+        ("remote.cfg.promisor", "true"),
+        ("remote.cfg.partialclonefilter", "blob:none"),
+        ("extensions.partialClone", "cfg"),
+    ] {
+        assert_eq!(config_get(&d2, key), expected, "AC2: {key}");
+    }
+    let d3 = bare_clone("d3", &["--filter=blob:none"]);
+    for (key, expected) in [
+        ("remote.origin.promisor", "true"),
+        ("remote.origin.partialclonefilter", "blob:none"),
+        ("extensions.partialClone", "origin"),
+    ] {
+        assert_eq!(config_get(&d3, key), expected, "AC3: {key}");
+    }
+
+    // AC4: commits and trees present, blobs absent, in all three clones.
+    let listing = run_libra_command(&["rev-list", "--objects", "--all"], src.path());
+    assert_cli_success(&listing, "AC4: list the source objects");
+    let mut checked = 0usize;
+    for line in String::from_utf8_lossy(&listing.stdout).lines() {
+        let Some(oid) = line.split_whitespace().next() else {
+            continue;
+        };
+        if oid.len() < 8 {
+            continue;
+        }
+        let kind = run_libra_command(&["cat-file", "-t", oid], src.path());
+        let kind = String::from_utf8_lossy(&kind.stdout).trim().to_string();
+        if kind.is_empty() {
+            continue;
+        }
+        let expect_present = kind != "blob";
+        for repo in [&d, &d2, &d3] {
+            let present = run_libra_command(&["cat-file", "-e", oid], repo)
+                .status
+                .success();
+            assert_eq!(present, expect_present, "AC4: {oid} ({kind}) in {:?}", repo);
+            checked += 1;
+        }
+    }
+    assert!(checked > 0, "AC4: the object set must not be empty");
+
+    // AC5/AC6: combine forms and differing repeats fail closed.
+    for (index, spec) in [
+        "combine:blob:none+tree:1",
+        "combine:tree:1+blob:none",
+        "combine:blob:none+tree:2",
+        "combine:blob:none+object:type=blob",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let dest = root.path().join(format!("c{index}"));
+        let out = run_libra_command(
+            &[
+                "clone",
+                &format!("--filter={spec}"),
+                &source_url,
+                dest.to_str().expect("dest"),
+            ],
+            root.path(),
+        );
+        assert!(!out.status.success(), "AC5: {spec} must be refused");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("LBR-UNSUPPORTED-001"),
+            "AC5: {spec}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    for (index, pair) in [
+        ("blob:none", "tree:1"),
+        ("tree:1", "blob:none"),
+        ("blob:none", "tree:2"),
+        ("blob:none", "object:type=blob"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let dest = root.path().join(format!("m{index}"));
+        let out = run_libra_command(
+            &[
+                "clone",
+                &format!("--filter={}", pair.0),
+                &format!("--filter={}", pair.1),
+                &source_url,
+                dest.to_str().expect("dest"),
+            ],
+            root.path(),
+        );
+        assert!(!out.status.success(), "AC6: {pair:?} must be refused");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("LBR-UNSUPPORTED-001"),
+            "AC6: {pair:?}"
+        );
+    }
+
+    // AC7: a remote that does not advertise `filter` fails closed.
+    let dest = root.path().join("e3");
+    let out = crate::command::run_libra_command_with_env(
+        &[
+            "clone",
+            "--filter=blob:none",
+            &source_url,
+            dest.to_str().expect("dest"),
+        ],
+        root.path(),
+        &[
+            ("LIBRA_TEST", "1"),
+            ("LIBRA_TEST_UPLOAD_PACK_NO_FILTER", "1"),
+        ],
+    );
+    assert!(!out.status.success(), "AC7: must refuse");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("LBR-UNSUPPORTED-001"),
+        "AC7: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]

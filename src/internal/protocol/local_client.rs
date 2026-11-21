@@ -29,7 +29,7 @@ use git_internal::{
 use tokio::sync::Mutex;
 use url::Url;
 
-use super::{DiscoveryResult, FetchStream, ProtocolClient};
+use super::{DiscoveryResult, FetchStream, ObjectFilter, ProtocolClient};
 use crate::{
     command::{load_object, log::get_reachable_commits},
     git_protocol::ServiceType,
@@ -589,6 +589,7 @@ impl LocalClient {
         want: &[String],
         shallow: &[String],
         depth: Option<usize>,
+        filter: Option<ObjectFilter>,
     ) -> Result<FetchStream, IoError> {
         match self.source_type {
             RepoType::GitRepo => {
@@ -615,6 +616,13 @@ impl LocalClient {
                             ))
                         },
                     )?
+                };
+                let entries = match filter {
+                    Some(filter) => entries
+                        .into_iter()
+                        .filter(|entry| filter.keeps(entry.obj_type))
+                        .collect::<Vec<_>>(),
+                    None => entries,
                 };
                 encode_entries_to_fetch_response(entries, shallow, hash_kind).await
             }
@@ -741,6 +749,13 @@ impl LocalClient {
 
                     // The Libra-native fetch path does not negotiate shallow
                     // boundaries, so no `shallow` lines are emitted.
+                    let all_entries = match filter {
+                        Some(filter) => all_entries
+                            .into_iter()
+                            .filter(|entry| filter.keeps(entry.obj_type))
+                            .collect::<Vec<_>>(),
+                        None => all_entries,
+                    };
                     encode_entries_to_fetch_response(all_entries, Vec::new(), repo_hash_kind).await
                 })
                 .await
@@ -1770,7 +1785,10 @@ mod tests {
 
         let want = vec![head];
         let have = Vec::new();
-        let stream = client.fetch_objects(&have, &want, &[], None).await.unwrap();
+        let stream = client
+            .fetch_objects(&have, &want, &[], None, None)
+            .await
+            .unwrap();
         let mut reader = StreamReader::new(stream);
         let mut buf = Vec::new();
         reader.read_to_end(&mut buf).await.unwrap();
@@ -1785,7 +1803,7 @@ mod tests {
 
         let client = LocalClient::from_path(repo_dir.path()).unwrap();
         let want = vec!["not-a-valid-hash".to_string()];
-        let error = match client.fetch_objects(&[], &want, &[], None).await {
+        let error = match client.fetch_objects(&[], &want, &[], None, None).await {
             Ok(_) => panic!("invalid want should fail instead of returning an empty pack"),
             Err(error) => error,
         };

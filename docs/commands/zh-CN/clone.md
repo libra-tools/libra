@@ -96,7 +96,7 @@ libra clone --mirror git@github.com:user/repo.git repo-mirror.git
 
 ### `--filter <spec>` / `--shallow-since <date>` / `--shallow-exclude <rev>`
 
-Git 用于*减少*传输内容的 fetch 整形标志：`--filter`（如 `blob:none`）是部分克隆，`--shallow-since`/`--shallow-exclude` 按日期或排除 ref 限定浅历史。**Libra 没有 partial-clone/promisor 支持，其 fetch 也只支持 `--depth` 主动限定浅历史**，故这些标志被接受但**忽略并告警**——不会按这些标志裁剪所选引用的历史（若同时给出 `--depth`，仍按深度限定）。不带 `--depth` 时会获取源中可用的历史；若源本身已浅，克隆仍为浅克隆，并保留源通告的边界。Git 在服务器无法处理 `--filter` 时也会告警并回退到未过滤的克隆。`--shallow-exclude` 可多次给出。
+Git 用于*减少*传输内容的 fetch 整形标志。`--filter=blob:none` 是部分克隆：本地传输（`file://` 或 `--no-local`）只传输提交与 tree，并记录 promisor 配置（`remote.<name>.promisor=true`、`remote.<name>.partialclonefilter=blob:none`、`extensions.partialClone=<name>`，远端名取 `-o` 或 `clone.defaultRemoteName` 的生效值），缺失对象随后按需从该 promisor 远端拉取。其余 filter 规格一律 fail-closed 并以 `LBR-UNSUPPORTED-001` 拒绝（`tree:<depth>`、`object:type=<type>`、`blob:limit=<n>`、`sparse:path=<path>`、`combine:...` 以及取值不同的重复 `--filter`）；`--filter=sparse:oid=<rev>:<path>` 会先对源仓库校验，但暂不应用。网络远端的 filter 协商尚未实现。`--shallow-since`/`--shallow-exclude` 按日期或排除 ref 限定浅历史，但 **Libra 的 fetch 只支持用 `--depth` 主动限定浅历史**，因此这两个标志被接受但**忽略并告警**。不带 `--depth` 时会获取源中可用的历史；若源本身已浅，克隆仍为浅克隆并保留源通告的边界。`--shallow-exclude` 可多次给出。
 
 ```bash
 libra clone --filter blob:none git@github.com:user/repo.git
@@ -408,7 +408,7 @@ Libra 使用 `.libraignore` 作为忽略策略。非裸克隆期间，每个检�
 | Verbose / 进度 | `--progress` / `--verbose` | N/A | `--progress` 是 clone 的布尔开关；裸 `--progress` 在重定向 stderr 时输出完成行；`--progress=<mode>` 选择显式全局模式；`--verbose` N/A |
 | 不检出 | `-n` / `--no-checkout` | N/A | `--no-checkout` |
 | 稀疏检出 | `--sparse` | N/A | N/A |
-| Filter（部分克隆） | `--filter=<spec>` | N/A | Git 远程按 no-op 接受（忽略+告警；仅 `--depth` 可新增深度限制；保留源浅边界） |
+| Filter（部分克隆） | `--filter=<spec>` | `blob:none` 本地传输生效（只传提交/tree + promisor 配置 + 按需拉取）；`sparse:oid=` 仅校验；其余 `LBR-UNSUPPORTED-001` | 网络远端 filter 协商未实现；`--depth` 仍可叠加 |
 | Bundle URI | `--bundle-uri=<uri>` | N/A | N/A |
 | Vault 签名引导 | N/A | N/A | 始终启用（匹配 init） |
 | SSH key 检测 | N/A | N/A | 自动检测 + 提示 |
