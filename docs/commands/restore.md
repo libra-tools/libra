@@ -66,6 +66,8 @@ Restored files carry the source entry's permission bits: `100755` is created exe
 
 ## Options
 
+When `core.sparseCheckout=true` this command fails closed with `LBR-UNSUPPORTED-001`: it would materialise the whole working tree instead of the sparse view (sparse cone materialisation is not implemented yet).
+
 | Option | Short | Long | Description |
 |--------|-------|------|-------------|
 | Pathspec | | positional (optional with `--pathspec-from-file`) | One or more files or directories to restore. Supports shared pathspec magic. Use `.` for all files. |

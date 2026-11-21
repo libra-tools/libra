@@ -41,6 +41,8 @@ libra reset [<target>] --pathspec-from-file=<file> [--pathspec-file-nul]
 
 ## 选项
 
+当 `core.sparseCheckout=true` 时本命令以 `LBR-UNSUPPORTED-001` fail-closed：它会物化整个工作区而不是稀疏视图（稀疏 cone 物化尚未实现）。
+
 | 标志 | 长选项 | 值 | 说明 |
 |------|------|-------|-------------|
 | | `<target>` | 位置参数（默认：`HEAD`） | 要重置到的提交、分支或修订表达式 |

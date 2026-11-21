@@ -1908,6 +1908,44 @@ fn pointer_layout_permits(command: &Commands) -> bool {
     }
 }
 
+/// The checkout-family commands materialise the whole tree, so a sparse
+/// checkout (`core.sparseCheckout=true`) is not implemented for them yet: they
+/// fail closed instead of silently writing files outside the sparse view.
+async fn enforce_sparse_checkout_guard(command: &Commands) -> CliResult<()> {
+    let guarded = matches!(
+        command,
+        Commands::Checkout(_) | Commands::Switch(_) | Commands::Reset(_) | Commands::Restore(_)
+    );
+    if !guarded {
+        return Ok(());
+    }
+    // Reading configuration needs a repository; outside one the command's own
+    // preflight reports the missing repository.
+    if crate::utils::util::try_get_storage_path(None).is_err() {
+        return Ok(());
+    }
+    let enabled = crate::internal::config::ConfigKv::get("core.sparseCheckout")
+        .await
+        .ok()
+        .flatten()
+        .map(|entry| {
+            matches!(
+                entry.value.trim().to_ascii_lowercase().as_str(),
+                "true" | "1" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false);
+    if !enabled {
+        return Ok(());
+    }
+    Err(CliError::command_usage(
+        "this command cannot run in a sparse checkout yet: it would materialise the whole \
+         working tree instead of the configured sparse view",
+    )
+    .with_stable_code(crate::utils::error::StableErrorCode::Unsupported)
+    .with_hint("unset `core.sparseCheckout` or use a full checkout to run this command"))
+}
+
 fn command_preflight(command: &Commands, structured_output: bool) -> CliResult<CommandPreflight> {
     if pointer_layout_storage().is_some() && !pointer_layout_permits(command) {
         return Err(CliError::command_usage(
@@ -3833,6 +3871,7 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
         command::format_patch::validate_cli_args(format_patch_args)?;
     }
     let require_complete_object_index = command_requires_complete_object_index(&args.command);
+    enforce_sparse_checkout_guard(&args.command).await?;
     let preflight = command_preflight(&args.command, args.json.is_some() || args.machine)?;
     // ADR-IG-04 (issue #487): an interrupted Git conversion leaves a
     // valid-looking but history-less repository. Refuse every command except

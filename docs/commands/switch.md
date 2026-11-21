@@ -40,6 +40,8 @@ Switching materializes the target entry's permission bits under the process `uma
 
 ## Options
 
+When `core.sparseCheckout=true` this command fails closed with `LBR-UNSUPPORTED-001`: it would materialise the whole working tree instead of the sparse view (sparse cone materialisation is not implemented yet).
+
 | Flag | Long | Value | Description |
 |------|------|-------|-------------|
 | | `<branch>` | positional (optional) | Target local branch, `-` for the previous checkout target, or a commit/tag/branch with `--detach` |

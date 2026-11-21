@@ -47,6 +47,8 @@ Worktree materialization is mode-aware (plan issues/470 FM-02): files are create
 
 ## Options
 
+When `core.sparseCheckout=true` this command fails closed with `LBR-UNSUPPORTED-001`: it would materialise the whole working tree instead of the sparse view (sparse cone materialisation is not implemented yet).
+
 Revert currently stores textual conflicts as stage-0 blobs. A whole-tree reset also checks those staged blobs at the stopped revert's conflict paths: remaining `<<<<<<<` markers or an unreadable blob preserve the revert state and emit a recovery warning. This includes `--soft` even when `ls-files --unmerged` is empty. Resolving and staging the content (or removing the path from the index), or replacing the index with a clean `--mixed`/`--hard` reset, allows conclusion. Markers left only in the working tree do not prevent a mixed reset from concluding the stop. The existing revert conflict representation and `--continue` behavior are unchanged.
 
 | Flag | Long | Value | Description |

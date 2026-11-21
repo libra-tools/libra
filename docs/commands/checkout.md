@@ -53,6 +53,8 @@ Checking out branches or paths materializes entries with their mode's permission
 
 ## Options
 
+When `core.sparseCheckout=true` this command fails closed with `LBR-UNSUPPORTED-001`: it would materialise the whole working tree instead of the sparse view (sparse cone materialisation is not implemented yet).
+
 | Flag | Long | Value | Description |
 |------|------|-------|-------------|
 | | `<branch>` | positional (optional) | Target branch, or `-` for the previous checkout target. Omit to show current branch. |

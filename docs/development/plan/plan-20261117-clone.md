@@ -1806,7 +1806,7 @@ PY
 ### Task CL-26: 在 `cli.rs` 为稀疏工作区的检出类命令增加 `fail-closed` 护栏（#756）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `complete`（2026-11-21：`src/cli.rs` 新增异步 `enforce_sparse_checkout_guard`，在 `command_preflight` 之前对 `checkout`/`switch`/`reset`/`restore` 读取 `core.sparseCheckout`，为真（`true`/`1`/`yes`/`on`）时以 `LBR-UNSUPPORTED-001` fail-closed 并给出 unsets 提示；仓库外先行返回（`try_get_storage_path`），避免在无仓库目录读取配置触发 `storage_path()` panic——该缺陷由本卡回归测试 `reset_test`/`restore_test` 的 outside-repository 用例捕获并当场修复。用例 `test_sparse_preflight_checkout_switch_reset_restore` 覆盖 AC1–AC4；`checkout/switch/reset/restore/sparse_view/add` 相关套件 **284/284**（修复后重跑 3/3 复验）、`compat_version_surface_sync` 2/2；版本面 0.30.234 → 0.30.235；四命令 EN/zh-CN 文档与 `COMPATIBILITY.md` 同步。按用户 2026-11-20 指令在 `main` 直接提交推送。）
 **Description:** 自 `CL-16` 拆出并前置（G-09）：在 `src/cli.rs` `command_preflight`（:1755+）中，对未适配稀疏 cone 的检出类命令建立 `core.sparseCheckout=true` 中央 `fail-closed` 护栏。本卡只覆盖 `checkout`、`switch`、`reset`、`restore`。本卡拆出 `CL-27`，由它承接 `merge`、`pull`、`rebase`、`cherry-pick`、`stash`。
 **Out of scope:** `merge`/`pull`/`rebase`/`cherry-pick`/`stash` 护栏（`CL-27`）；`clone --sparse` cone 物化（`CL-16`）；`merge` 解禁（`CL-20`）；全量 cone 适配（`DEFER-CL-04`）。
 **Current evidence:**

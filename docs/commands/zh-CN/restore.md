@@ -42,6 +42,8 @@ stat，避免 status 信任不匹配的快照。符号链接元数据按 no-foll
 
 ## 选项
 
+当 `core.sparseCheckout=true` 时本命令以 `LBR-UNSUPPORTED-001` fail-closed：它会物化整个工作区而不是稀疏视图（稀疏 cone 物化尚未实现）。
+
 | 选项 | 短选项 | 长选项 | 说明 |
 |--------|-------|------|-------------|
 | Pathspec | | 位置参数（必需） | 要恢复的一个或多个文件或目录。支持共享 pathspec magic；使用 `.` 表示所有文件。 |

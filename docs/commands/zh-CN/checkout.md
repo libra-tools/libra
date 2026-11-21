@@ -46,6 +46,8 @@ libra checkout [<tree-ish>] [--] <pathspec>...
 
 ## 选项
 
+当 `core.sparseCheckout=true` 时本命令以 `LBR-UNSUPPORTED-001` fail-closed：它会物化整个工作区而不是稀疏视图（稀疏 cone 物化尚未实现）。
+
 | 标志 | 长选项 | 值 | 说明 |
 |------|------|-------|-------------|
 | | `<branch>` | 位置参数（可选） | 要切换到的目标分支，或表示上一 checkout 目标的 `-`。省略时显示当前分支。 |
