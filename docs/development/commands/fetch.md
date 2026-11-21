@@ -435,3 +435,6 @@ See the user-facing command page for capability-first discovery, `object-format=
 ## B3-12 local Git sha256 reject
 
 See the user-facing `fetch` page for the local-path Git `objectformat=sha256` reject (`LBR-CLI-002`), unknown/corrupt (`LBR-REPO-002`), and unreadable (`LBR-IO-001`) mappings. Network Git sha256 remains DEFER-B3-10. Named tests: `fetch_rejects_sha256_git_source`.
+
+
+**无参 `fetch` 的默认远程（2026-11-20，FP-07）：** `ConfigKv::get_current_remote()` 之后新增 `default_fetch_remote()` 回退——唯一 remote 或 `origin`；双非 origin remote 保持 `LBR-REPO-003`。用例 `command::fetch_test::fetch_without_repository_uses_git_default_remote` 覆盖 AC1–AC8。

@@ -497,3 +497,6 @@ HTTP(S) 广告声明仓库为空后，仍会校验剩余的全部 pkt-line 帧�
 ## Issue #477 notes
 
 拒绝对本地 upstream（`remote=.`）执行
+
+
+> **默认远程（未给 `<repository>` 参数）：** 优先使用当前分支配置的 `branch.<name>.remote`；否则在只有一个 remote 时使用它，存在多个时使用 `origin`。两个及以上 remote 且没有 `origin` 时没有默认值，`fetch` 以 `LBR-REPO-003` 失败（对齐 `git fetch`）。

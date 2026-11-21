@@ -745,3 +745,6 @@ existing command hints and structured error fields retain their behavior.
 ## Issue #477 notes
 
 refuses a local upstream (`branch.<name>.remote=.`)
+
+
+> **Default remote (no `<repository>` argument):** a configured `branch.<name>.remote` wins; otherwise the only configured remote is used, and if several remotes exist `origin` is chosen. Two or more remotes without `origin` have no default and `fetch` fails with `LBR-REPO-003` (matching `git fetch`).
