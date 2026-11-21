@@ -31,6 +31,8 @@ LFS 跟踪文件会在 HTTP 推送期间透明上传，不需要单独执行 `lf
 
 ## 选项
 
+空期望租约（`--force-with-lease=<ref>:`）表示远端该引用必须不存在：不存在时按普通推送创建；远端已存在时以 `LBR-CONFLICT-002`（stale 租约）拒绝，即使该推送本来是快进。
+
 `--force-with-lease=<ref>:<expect>` 的期望值按本地修订表达式解析（因此 `main:main^` 表示「远端仍指向我 `main` 的父提交」）。租约不匹配时以 `LBR-CONFLICT-002` 拒绝，诊断含 `stale info`，远端引用不变；租约匹配时允许非快进更新与删除。
 
 `--force` 与 `--force-with-lease` 可以同时使用：`--force` 会覆盖过期的租约（或非快进拒绝）并执行更新，人读输出标记为强制更新（`(forced update)`）；未给 `--force` 时租约不匹配仍会拒绝。

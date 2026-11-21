@@ -879,7 +879,7 @@ PY
 
 ### Task FP-25: `--force-with-lease=<ref>:` 空期望租约要求远端引用不存在（#1036；自 FP-21 拆出）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `complete`（2026-11-21：`lease_oid_matches` 增加空期望分支——`Some("")` 仅在远端不存在时为真、远端存在时一律 stale（即使推送本是快进）；`StaleLease` 的期望值显示把空串渲染为 `(absent)`。用例 `push_force_with_lease_empty_expectation` 覆盖 AC1–AC3 与前置断言：空租约创建远端 `branch`→C；不带租约同样推送为快进（证明前置成立）；远端 `branch` 已在 B 时同一空租约推送 C 以 `LBR-CONFLICT-002` + `stale info` 拒绝且 `src` 引用逐字不变。`push` 套件 **42/42**、`push` 单测 **83/83**；版本面 0.30.247 → 0.30.248；文档 EN/zh-CN 同步。按用户 2026-11-20 指令在 `main` 直接提交推送。）
 
 **Description:** 对齐 Git 的空期望租约：`--force-with-lease=<ref>:`（冒号后为空）表示远端该 ref 必须不存在——远端不存在时允许按普通推送创建；远端已存在时（无论不带租约时是否为快进）以 `LBR-CONFLICT-002` 拒绝该推送且远端引用不变。
 

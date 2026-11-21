@@ -75,6 +75,11 @@ these modes warn and are not authorization for remote synchronization.
 
 ## Options
 
+An empty lease expectation (`--force-with-lease=<ref>:`) means the remote ref must
+not exist: the push creates it when it is absent, and is refused with
+`LBR-CONFLICT-002` (stale lease) when the remote already has it — even if the push
+would otherwise be a fast-forward.
+
 A `--force-with-lease=<ref>:<expect>` expectation is resolved as a local revision
 expression (so `main:main^` means "the remote still points at my `main`'s parent").
 When the lease does not match, the push is refused with `LBR-CONFLICT-002` and the

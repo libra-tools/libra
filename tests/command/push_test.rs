@@ -3825,3 +3825,110 @@ fn test_push_force_with_lease_resolves_rev_expressions() {
     assert_eq!(remote_main, d, "AC6: the remote main moved to D");
     assert_ne!(remote_main, c, "AC6: it left C behind");
 }
+
+#[test]
+fn push_force_with_lease_empty_expectation() {
+    use crate::command::{assert_cli_success, run_libra_command};
+
+    // Fixture: `tpl` commits A→B→C; `src` is a clone with a detached HEAD (so
+    // `main` is not checked out); `dst` clones `src` and creates `branch` at C.
+    let fixture = || {
+        let work = tempfile::tempdir().expect("work dir");
+        let tpl = work.path().join("tpl");
+        std::fs::create_dir_all(&tpl).expect("mkdir tpl");
+        assert_cli_success(&run_libra_command(&["init"], &tpl), "init tpl");
+        run_libra_command(&["config", "set", "user.name", "t"], &tpl);
+        run_libra_command(&["config", "set", "user.email", "t@t"], &tpl);
+        for name in ["A", "B", "C"] {
+            std::fs::write(tpl.join("f.txt"), format!("{name}\n")).expect("write f");
+            assert_cli_success(&run_libra_command(&["add", "f.txt"], &tpl), "stage");
+            assert_cli_success(
+                &run_libra_command(&["commit", "-m", name, "--no-verify"], &tpl),
+                "commit",
+            );
+        }
+        let src = work.path().join("src");
+        assert_cli_success(
+            &run_libra_command(&["clone", "./tpl", "src"], work.path()),
+            "clone src",
+        );
+        run_libra_command(&["config", "set", "user.name", "t"], &src);
+        run_libra_command(&["config", "set", "user.email", "t@t"], &src);
+        run_libra_command(&["config", "set", "commit.gpgSign", "false"], &src);
+        run_libra_command(&["config", "set", "vault.signing", "false"], &src);
+        assert_cli_success(
+            &run_libra_command(&["switch", "--detach", "HEAD"], &src),
+            "detach src HEAD",
+        );
+        let dst = work.path().join("dst");
+        assert_cli_success(
+            &run_libra_command(&["clone", "./src", "dst"], work.path()),
+            "clone dst",
+        );
+        run_libra_command(&["config", "set", "user.name", "t"], &dst);
+        run_libra_command(&["config", "set", "user.email", "t@t"], &dst);
+        assert_cli_success(
+            &run_libra_command(&["branch", "branch", "main"], &dst),
+            "create branch at C",
+        );
+        (work, src, dst)
+    };
+    let ref_of = |repo: &std::path::Path, name: &str| {
+        String::from_utf8_lossy(&run_libra_command(&["show-ref"], repo).stdout)
+            .lines()
+            .find(|line| line.ends_with(name))
+            .and_then(|line| line.split_whitespace().next())
+            .map(str::to_string)
+    };
+
+    // AC1: an empty expectation lets a genuinely new branch through.
+    let (_work, src, dst) = fixture();
+    let c = ref_of(&src, "refs/heads/main").expect("src main");
+    assert_cli_success(
+        &run_libra_command(
+            &["push", "--force-with-lease=branch:", "origin", "branch"],
+            &dst,
+        ),
+        "AC1: empty lease creates the branch",
+    );
+    assert_eq!(
+        ref_of(&src, "refs/heads/branch"),
+        Some(c.clone()),
+        "AC1: src/branch points at C"
+    );
+
+    // The same push without a lease is a plain fast-forward (precondition).
+    let (_work_ff, src_ff, dst_ff) = fixture();
+    let c_ff = ref_of(&src_ff, "refs/heads/main").expect("src_ff main");
+    assert_cli_success(
+        &run_libra_command(&["push", "origin", "branch"], &dst_ff),
+        "precondition: without a lease the push is a fast-forward",
+    );
+    assert_eq!(ref_of(&src_ff, "refs/heads/branch"), Some(c_ff));
+
+    // AC2/AC3: an existing remote branch is stale even though the push would be
+    // a fast-forward, and nothing changes.
+    let (_work2, src2, dst2) = fixture();
+    let b = {
+        let out = run_libra_command(&["rev-parse", "main^"], &src2);
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    assert_cli_success(
+        &run_libra_command(&["branch", "branch", &b], &src2),
+        "seed src/branch at B",
+    );
+    let before = run_libra_command(&["show-ref"], &src2).stdout;
+    let out = run_libra_command(
+        &["push", "--force-with-lease=branch:", "origin", "branch"],
+        &dst2,
+    );
+    assert!(!out.status.success(), "AC2: the empty lease is stale");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("LBR-CONFLICT-002"), "AC2: {stderr}");
+    assert!(stderr.contains("stale info"), "AC2: {stderr}");
+    assert_eq!(
+        run_libra_command(&["show-ref"], &src2).stdout,
+        before,
+        "AC3: the remote refs are unchanged"
+    );
+}

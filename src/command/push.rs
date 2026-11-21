@@ -2129,6 +2129,10 @@ fn lease_ref_matches(remote_ref: &str, name: &str) -> bool {
 /// short hash). `None` means the ref is absent on that side.
 fn lease_oid_matches(expected: Option<&str>, server: Option<&str>) -> bool {
     match (expected, server) {
+        // `--force-with-lease=<ref>:` (empty expectation) requires the remote ref
+        // to be ABSENT; an existing ref is stale whatever its position.
+        (Some(""), None) => true,
+        (Some(""), Some(_)) => false,
         (None, None) => true,
         (Some(expected), Some(server)) => {
             server == expected || server.starts_with(expected) || expected.starts_with(server)
@@ -2168,7 +2172,11 @@ fn validate_force_with_lease(
         if !lease_oid_matches(expected.as_deref(), plan.update.old_oid.as_deref()) {
             return Err(PushError::StaleLease {
                 remote_ref: remote_ref.clone(),
-                expected: expected.clone().unwrap_or_else(|| "(absent)".to_string()),
+                // An empty expectation means "must not exist".
+                expected: match expected.as_deref() {
+                    None | Some("") => "(absent)".to_string(),
+                    Some(value) => value.to_string(),
+                },
                 found: plan
                     .update
                     .old_oid
