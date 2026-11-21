@@ -2315,7 +2315,7 @@ async fn setup_multi_branch_remote_and_fetch() -> (TempDir, PathBuf, String, Cha
 fn local_fetch_args(repository: &str, prune: bool, dry_run: bool) -> fetch::FetchArgs {
     fetch::FetchArgs {
         repository: Some(repository.to_string()),
-        refspec: None,
+        refspecs: Vec::new(),
         all: false,
         depth: None,
         dry_run,
@@ -4661,5 +4661,133 @@ fn test_fetch_triggers_auto_maintenance() {
         !String::from_utf8_lossy(&out.stderr)
             .contains("Auto packing the repository for optimum performance."),
         "AC3: --dry-run does not trigger maintenance"
+    );
+}
+
+#[test]
+fn test_fetch_multiple_refspecs_in_order() {
+    use crate::command::{assert_cli_success, run_libra_command};
+
+    // Source with distinct `left` (L1) and `right` (R1) branches; `c` clones it.
+    let work = tempfile::tempdir().expect("work dir");
+    let s = work.path().join("s");
+    std::fs::create_dir_all(&s).expect("mkdir s");
+    assert_cli_success(&run_libra_command(&["init"], &s), "init s");
+    run_libra_command(&["config", "set", "user.name", "t"], &s);
+    run_libra_command(&["config", "set", "user.email", "t@t"], &s);
+    std::fs::write(s.join("f.txt"), "s1\n").expect("write s1");
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], &s), "stage s1");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "S1", "--no-verify"], &s),
+        "commit S1",
+    );
+    assert_cli_success(&run_libra_command(&["branch", "left"], &s), "branch left");
+    assert_cli_success(&run_libra_command(&["branch", "right"], &s), "branch right");
+    assert_cli_success(&run_libra_command(&["switch", "left"], &s), "switch left");
+    std::fs::write(s.join("f.txt"), "l1\n").expect("write l1");
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], &s), "stage l1");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "L1", "--no-verify"], &s),
+        "commit L1",
+    );
+    let l1 = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], &s).stdout)
+        .trim()
+        .to_string();
+    assert_cli_success(&run_libra_command(&["switch", "right"], &s), "switch right");
+    std::fs::write(s.join("f.txt"), "r1\n").expect("write r1");
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], &s), "stage r1");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "R1", "--no-verify"], &s),
+        "commit R1",
+    );
+    let r1 = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], &s).stdout)
+        .trim()
+        .to_string();
+    assert_ne!(l1, r1, "the fixture branches differ");
+
+    let c = work.path().join("c");
+    assert_cli_success(
+        &run_libra_command(&["clone", "./s", "c"], work.path()),
+        "clone c",
+    );
+    run_libra_command(&["config", "set", "user.name", "t"], &c);
+    run_libra_command(&["config", "set", "user.email", "t@t"], &c);
+    let _ = std::fs::remove_file(c.join(".libra/FETCH_HEAD"));
+
+    // AC1/AC2: both refspecs are recorded in command-line order and are mergeable.
+    assert_cli_success(
+        &run_libra_command(&["fetch", "origin", "left", "right"], &c),
+        "AC1: fetch two refspecs",
+    );
+    let body = std::fs::read_to_string(c.join(".libra/FETCH_HEAD")).expect("FETCH_HEAD");
+    let oids = body
+        .lines()
+        .map(|line| line.split('\t').next().unwrap_or_default().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(oids, vec![l1.clone(), r1.clone()], "AC1: FETCH_HEAD order");
+    assert!(
+        !body.contains("not-for-merge"),
+        "AC2: command-line refspecs are mergeable: {body}"
+    );
+
+    // AC3: explicit destinations land in one invocation.
+    let _ = std::fs::remove_file(c.join(".libra/FETCH_HEAD"));
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "fetch",
+                "origin",
+                "refs/heads/left:refs/heads/l2",
+                "refs/heads/right:refs/heads/r2",
+            ],
+            &c,
+        ),
+        "AC3: explicit destinations",
+    );
+    let ref_of = |name: &str| {
+        String::from_utf8_lossy(&run_libra_command(&["rev-parse", name], &c).stdout)
+            .trim()
+            .to_string()
+    };
+    assert_eq!(ref_of("refs/heads/l2"), l1, "AC3: l2 points at L1");
+    assert_eq!(ref_of("refs/heads/r2"), r1, "AC3: r2 points at R1");
+
+    // AC4/AC5: an invalid second refspec refuses the whole command, no writes.
+    let refs_before = run_libra_command(&["show-ref"], &c).stdout;
+    let out = run_libra_command(&["fetch", "origin", "left", "refs/heads/bad..x"], &c);
+    assert!(
+        !out.status.success(),
+        "AC4: the invalid refspec fails the fetch"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("LBR-CLI-002"),
+        "AC4: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        run_libra_command(&["show-ref"], &c).stdout,
+        refs_before,
+        "AC5: nothing changed"
+    );
+
+    // AC6: `--json` reports every refspec joined in order.
+    let json = run_libra_command(&["--json", "fetch", "origin", "left", "right"], &c);
+    assert_cli_success(&json, "AC6: json fetch");
+    let text = String::from_utf8_lossy(&json.stdout);
+    assert!(text.contains("\"refspec\": \"left right\""), "AC6: {text}");
+
+    // AC7/AC8: `--set-upstream` with several refspecs warns and writes nothing.
+    let config_before = run_libra_command(&["config", "get", "branch.main.remote"], &c).stdout;
+    let out = run_libra_command(&["fetch", "--set-upstream", "origin", "left", "right"], &c);
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("multiple branches detected, incompatible with --set-upstream"),
+        "AC7: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        run_libra_command(&["config", "get", "branch.main.remote"], &c).stdout,
+        config_before,
+        "AC8: no upstream was written"
     );
 }

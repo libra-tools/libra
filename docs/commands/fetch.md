@@ -176,6 +176,15 @@ libra config remote.origin.prune false  # but never for origin
 
 ## Options
 
+Several refspecs may be given in one invocation (`libra fetch origin left right`).
+Every refspec is parsed before anything is fetched, each is fetched in order, and
+`FETCH_HEAD` records them in command-line order. Refs selected by a command-line
+refspec are merge candidates and carry no `not-for-merge` marker; refs brought in
+by the configured refspec or an automatic tag follow keep it. `--json` reports the
+refspec field as the space-joined list, and `--set-upstream` with more than one
+refspec warns `multiple branches detected, incompatible with --set-upstream` and
+writes no upstream.
+
 A successful, non-`--dry-run` fetch runs the same auto-maintenance decision as
 `libra gc --auto` once the command's maintenance lock is released: when it fires
 (stderr line `Auto packing the repository for optimum performance.`) the fetched

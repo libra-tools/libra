@@ -992,7 +992,7 @@ PY
 
 ### Task FP-08: 支持 `libra fetch` 一次传入多个 refspec 并按序写入 `FETCH_HEAD`（#1000）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `complete`（2026-11-21：`FetchArgs::refspec` 改为多值 `refspecs: Vec<String>`（`Clone` 派生以支持逐条重跑）；`execute_safe` 在多于一个 refspec 时进入新增 `run_multi_refspec_fetch`——先解析全部 refspec（任一非法即 `LBR-CLI-002` 且零写入），再逐条走既有单 refspec 路径并聚合 `remotes`，最后**一次性**写 `FETCH_HEAD`（顺序即命令行顺序）；`format_fetch_head` 对命令行 refspec 选中的源不再写 `not-for-merge`（配 refspec/自动跟随仍保留）；`--json` 的 `refspec` 为空格连接的全部值；`--set-upstream` 多于一个 refspec 时输出 `multiple branches detected, incompatible with --set-upstream` 且不写 upstream。用例 `test_fetch_multiple_refspecs_in_order` 覆盖 AC1–AC8（顺序记录且无 `not-for-merge`、双显式目标 l2/r2、非法第二条整体拒绝且引用不变、JSON `refspec` 为 `left right`、多 refspec 的 `--set-upstream` 告警且不写配置）；`fetch`/`pull`/`clone` 套件 **198/198**；版本面 0.30.252 → 0.30.253；文档 EN/zh-CN 同步。按用户 2026-11-20 指令在 `main` 直接提交推送。）
 
 **Description:** 把 `FetchArgs::refspec` 改为可多值的位置参数 `refspecs: Vec<String>`，一次 fetch 在任何网络交互与写入前解析全部 refspec（任一无效即整体拒绝）、在同一事务中更新显式目标，并按命令行顺序写入 `FETCH_HEAD`；命令行 refspec 拉取的记录均为可合并（无 `not-for-merge`），与 Git 一致。`--json` 的 `refspec` 字段改为按命令行顺序以单个空格连接的全部 refspec（单个 refspec 时取值与现状相同）；`--set-upstream` 与多于一个命令行 refspec 同用时一律输出告警 `multiple branches detected, incompatible with --set-upstream` 且不写 upstream（Libra 规则：Git 按本次 ref 映射中无本地目标即只进 `FETCH_HEAD` 的条目计数——多于一个才输出该告警，恰一个时以其设置 upstream，全部带目标时告警 `no source branch found`，`builtin/fetch.c:2114-2165`、`remote.c:2158-2159`；两者只在全部 refspec 均不带目标时一致，带目标 refspec 参与时的差异登记为有意差异）。`pull`/`clone` 复用的 `fetch_repository_with_result` 单 refspec 签名不变，多 refspec 走新增内部入口。
 

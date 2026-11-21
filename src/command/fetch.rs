@@ -696,15 +696,16 @@ async fn load_config(configuration: &str, name: Option<&str>, key: &str) -> Opti
     }
 }
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(after_help = FETCH_EXAMPLES)]
 pub struct FetchArgs {
     /// Repository to fetch from
     pub repository: Option<String>,
 
-    /// Source ref or `<src>:<dst>` mapping to fetch
+    /// Source ref or `<src>:<dst>` mapping to fetch. May be repeated: every
+    /// listed refspec is fetched and recorded in `FETCH_HEAD` in order.
     #[clap(requires("repository"))]
-    pub refspec: Option<String>,
+    pub refspecs: Vec<String>,
 
     /// Fetch all remotes.
     #[clap(long, short, conflicts_with("repository"))]
@@ -1322,7 +1323,7 @@ pub async fn execute_safe(args: FetchArgs, output: &OutputConfig) -> CliResult<(
     }
     // `--refmap` overrides the mapping for a command-line refspec; without one
     // it is meaningless (Git errors).
-    if args.refmap.is_some() && args.refspec.is_none() {
+    if args.refmap.is_some() && args.refspecs.is_empty() {
         return Err(
             CliError::command_usage("--refmap requires a command-line refspec")
                 .with_stable_code(StableErrorCode::CliInvalidArguments),
@@ -1339,7 +1340,10 @@ pub async fn execute_safe(args: FetchArgs, output: &OutputConfig) -> CliResult<(
     let dry_run = args.dry_run;
     let append = args.append;
     let no_write_fetch_head = args.no_write_fetch_head;
-    let cli_refspec_present = args.refspec.is_some();
+    let cli_refspec_present = !args.refspecs.is_empty();
+    if args.refspecs.len() > 1 {
+        return run_multi_refspec_fetch(args, output).await;
+    }
     let result = run_fetch(args, output).await?;
     // FETCH_HEAD records the fetched refs; `--dry-run` writes nothing.
     if !dry_run && !no_write_fetch_head {
@@ -1360,6 +1364,60 @@ pub async fn execute_safe(args: FetchArgs, output: &OutputConfig) -> CliResult<(
             !no_write_fetch_head,
             cli_refspec_present,
         )
+    }
+}
+
+/// Fetch several command-line refspecs in one invocation.
+///
+/// Every refspec is parsed before anything is fetched (an invalid one refuses
+/// the whole command with no write), each is then fetched through the ordinary
+/// single-refspec path, and `FETCH_HEAD` is recorded once in command-line order.
+async fn run_multi_refspec_fetch(args: FetchArgs, output: &OutputConfig) -> CliResult<()> {
+    let dry_run = args.dry_run;
+    let append = args.append;
+    let no_write_fetch_head = args.no_write_fetch_head;
+    let porcelain = args.porcelain;
+    let set_upstream = args.set_upstream;
+    let refspecs = args.refspecs.clone();
+
+    // Parse everything up front so a bad refspec cannot leave a partial fetch.
+    for spec in &refspecs {
+        parse_fetch_refspec(spec, "origin").map_err(CliError::from)?;
+    }
+    if set_upstream {
+        emit_warning("multiple branches detected, incompatible with --set-upstream");
+    }
+
+    let all_refspecs = refspecs.clone();
+    let mut combined: Option<FetchOutput> = None;
+    for spec in refspecs {
+        let mut single = args.clone();
+        single.refspecs = vec![spec];
+        // `--set-upstream` is handled above for the multi-refspec form.
+        single.set_upstream = false;
+        let partial = run_fetch(single, output).await?;
+        combined = Some(match combined {
+            None => partial,
+            Some(mut accumulated) => {
+                accumulated.remotes.extend(partial.remotes);
+                accumulated
+            }
+        });
+    }
+    let mut result = combined.ok_or_else(|| CliError::command_usage("no refspec to fetch"))?;
+    // The JSON `refspec` field carries every command-line refspec, in order.
+    result.refspec = Some(all_refspecs.join(" "));
+
+    if !dry_run && !no_write_fetch_head {
+        write_fetch_head(&result, append).map_err(CliError::from)?;
+    }
+    for remote in &result.remotes {
+        remote.release_pack_pin();
+    }
+    if porcelain {
+        render_fetch_porcelain(&result, output)
+    } else {
+        render_fetch_output(&result, output, dry_run, !no_write_fetch_head, true)
     }
 }
 
@@ -1490,7 +1548,7 @@ async fn run_fetch(args: FetchArgs, output: &OutputConfig) -> CliResult<FetchOut
 
     let FetchArgs {
         repository,
-        refspec,
+        refspecs,
         all,
         depth,
         dry_run,
@@ -1515,6 +1573,8 @@ async fn run_fetch(args: FetchArgs, output: &OutputConfig) -> CliResult<FetchOut
         no_prune,
         notes,
     } = args;
+    // The multi-refspec caller runs this once per refspec.
+    let refspec = refspecs.first().cloned();
 
     // `--no-progress` forces progress reporting off (the "Receiving objects"
     // spinner and any NDJSON progress events), mirroring `git fetch
@@ -1718,7 +1778,8 @@ async fn run_fetch(args: FetchArgs, output: &OutputConfig) -> CliResult<FetchOut
     Ok(FetchOutput {
         all: false,
         requested_remote: Some(remote),
-        refspec,
+        // Every command-line refspec, in order, as one space-joined value.
+        refspec: (!refspecs.is_empty()).then(|| refspecs.join(" ")),
         remotes: vec![result],
     })
 }
@@ -4724,16 +4785,39 @@ fn fetch_head_path() -> Result<PathBuf, FetchError> {
         })
 }
 
-/// Render the `FETCH_HEAD` body: one `<oid>\t<not-for-merge>\t<desc>` line per
-/// fetched ref. Libra fetch never designates a merge target (merge with
-/// `libra pull`), so every line is marked `not-for-merge`.
+/// Render the `FETCH_HEAD` body: one `<oid>\t[<not-for-merge>\t]<desc>` line per
+/// fetched ref.
+///
+/// Refs selected by a command-line refspec are merge candidates, so they are
+/// recorded without the `not-for-merge` marker (Git's `FETCH_HEAD_MERGE`);
+/// everything a configured refspec or an automatic follow brought in stays
+/// `not-for-merge`.
 fn format_fetch_head(result: &FetchOutput) -> String {
+    let mergeable_sources: std::collections::HashSet<String> = result
+        .refspec
+        .as_deref()
+        .map(|specs| {
+            specs
+                .split(' ')
+                .map(|spec| {
+                    let body = spec.strip_prefix('+').unwrap_or(spec);
+                    let source = match body.split_once(':') {
+                        Some((source, _)) => source,
+                        None => body,
+                    };
+                    normalize_branch_ref(source)
+                })
+                .collect::<std::collections::HashSet<_>>()
+        })
+        .unwrap_or_default();
     let mut lines = Vec::new();
     for remote in &result.remotes {
         for record in &remote.fetch_head_records {
+            let mergeable = mergeable_sources.contains(&record.source_ref);
+            let marker = if mergeable { "" } else { "not-for-merge\t" };
             if let Some(tag_name) = record.source_ref.strip_prefix("refs/tags/") {
                 lines.push(format!(
-                    "{}\tnot-for-merge\ttag '{}' of {}",
+                    "{}\t{marker}tag '{}' of {}",
                     record.oid, tag_name, remote.url
                 ));
                 continue;
@@ -4744,7 +4828,7 @@ fn format_fetch_head(result: &FetchOutput) -> String {
                 .or_else(|| record.source_ref.strip_prefix("refs/mr/"))
                 .unwrap_or(&record.source_ref);
             lines.push(format!(
-                "{}\tnot-for-merge\tbranch '{}' of {}",
+                "{}\t{marker}branch '{}' of {}",
                 record.oid, branch, remote.url
             ));
         }
