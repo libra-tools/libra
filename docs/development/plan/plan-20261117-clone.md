@@ -1700,6 +1700,8 @@ PY
 
 > **2026-11-20 前置缺口（实测）：** 本卡要求的「缺失对象按需拉取」需要**按 OID 向远端 want 单个对象**；`CL-05` 已实测当前客户端的 OID want 被拒（`fatal: couldn't find remote ref <oid>`），即 fetch/协议层没有对象级 want 支持。因此 `CL-19` 的真实实现面是：①传输层新增按 OID want（含 `upload-pack` 能力协商与本地客户端的对象定位）；②`src/command/mod.rs:249 load_object`（同步）用阻塞桥接到异步拉取；③`LIBRA_TEST_TRACE_LAZY_FETCH` 接缝与 `--offline` 拒绝；④8 条 AC 用例。这是一次跨协议层的较大改动，需独立实现窗口。
 
+> **2026-11-20 范围收敛：** 上条实测的 OID want 拒绝来自 **refspec 解析器**（`fetch <remote> <oid>` 要求 ref 名），而非传输客户端本身：`LocalClient::fetch_objects(have, want, …)` 的 `want` 是对象 ID 列表，本地客户端按 want 打包，理论上可直接接受 OID。因此 `CL-19` 可按「新增 `lazy_fetch_object(oid)`：读 `extensions.partialClone`/`remote.<name>.promisor` → 用客户端 `fetch_objects(&[], [oid], …)` 取包 → 用既有 `ClientStorage` 落地」实现，无需改 wire 协议；`load_object`（`src/command/mod.rs:249`，同步）以阻塞桥接调用该函数，并在 `LIBRA_TEST=1` 时打印 `libra-test: lazy-fetch want=<n>`。
+
 ---
 
 ### Task CL-14: 支持 `clone --ref-storage-format` 与 `rev-parse --show-ref-storage-format`（#750）
