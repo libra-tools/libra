@@ -32,6 +32,8 @@ libra gc [--prune=<date>] [--no-prune] [--aggressive] [--auto]
 
 ## 选项
 
+`--auto` 只在值得维护时运行：`gc.auto <= 0` 从不触发；否则当**不带 `.keep` 的 pack 数**超过 `gc.autoPackLimit`（默认 50，非正值关闭该触发条件）或松散对象数达到 `gc.auto`（默认 6700）时运行。触发时向 stderr 输出 `Auto packing the repository for optimum performance.`。该判定与 `fetch` 的自动打包共用同一函数。
+
 ### `--prune <DATE>`
 
 删除早于 `<DATE>` 的不可达松散对象。缺省取 `gc.pruneExpire` 配置，回退到

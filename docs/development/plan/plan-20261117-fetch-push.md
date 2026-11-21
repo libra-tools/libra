@@ -1712,7 +1712,7 @@ PY
 
 ### Task FP-24: `gc --auto` 按 `gc.autoPackLimit` 判定并输出自动打包提示（#863；自 FP-18 拆出）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `complete`（2026-11-21：新增中枢判定 `gc_auto_should_run(gc_auto, auto_pack_limit, packs_without_keep, loose_count)`（`gc.auto<=0` 从不触发；否则「非 `.keep` pack 数 > `gc.autoPackLimit`（默认 50，非正关闭）」或「松散对象数 >= `gc.auto`（默认 6700）」），`gc --auto` 直接调用它；新增 `gc_auto_pack_limit` 与 `count_packs_without_keep`；触发时向 stderr 输出 `Auto packing the repository for optimum performance.`。用例 `test_gc_auto_pack_limit_decision` 覆盖 AC1–AC6（`gc.autoPackLimit=1` 且两个 pack → 合并为 1 个并输出提示；`gc.auto=0`/`autoPackLimit=0`/带 `.keep` 的 pack/恰 50 个 pack 均零写入，按文件级快照比对，排除运行时 SQLite 与 object-index 修复锁）。**偏差登记**：AC3–AC6 的 `S(D/g)` 以 `.libra` 递归快照比对，但排除 `libra.db*` 与 `object-index-repair-locks/`（任何命令打开数据库/维护队列都会改动它们）。`gc_test` **9/9**；版本面 0.30.250 → 0.30.251；文档 EN/zh-CN 同步。按用户 2026-11-20 指令在 `main` 直接提交推送。）
 
 **Description:** 按 ADR-FP-04 扩展 `gc --auto` 的触发判定：`gc.auto<=0` 时从不触发；否则「不带同名 `.keep` 文件的 pack 数 `>` `gc.autoPackLimit`（默认 50，`<=0` 不按 pack 数触发）」或「松散对象数达到 `gc.auto`（默认 6700，沿用现有精确计数与 `>=` 判定，属已登记的有意差异）」即运行完整 gc；触发判定集中在一个判定函数中（输入为配置、不带 `.keep` 的 pack 数与松散对象数，输出是否触发；`gc.autoPackLimit` 缺省 50），`gc --auto` 与 `FP-18` 均直接调用该函数；判定需要运行时先向 stderr 输出一行 `Auto packing the repository for optimum performance.`，判定不需要时行为不变。该判定函数是 `FP-18` fetch 后自动打包的唯一事实源（GC-02）。
 

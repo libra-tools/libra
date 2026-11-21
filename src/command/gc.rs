@@ -50,6 +50,8 @@ use crate::{
 };
 
 const DEFAULT_GC_AUTO: i64 = 6700;
+/// Git's `gc.autoPackLimit` default.
+const DEFAULT_GC_AUTO_PACK_LIMIT: i64 = 50;
 const DEFAULT_PRUNE_EXPIRE: &str = "2.weeks.ago";
 
 /// `--help` examples shown in `libra gc --help` output.
@@ -161,7 +163,10 @@ pub async fn execute_safe(args: GcArgs, output: &OutputConfig) -> CliResult<()> 
     // non-positive thresholds also skip without writing.
     if args.auto {
         let threshold = gc_auto_threshold().await?;
-        if threshold <= 0 || (loose_count as i64) < threshold {
+        let pack_limit = gc_auto_pack_limit().await?;
+        let packs = count_packs_without_keep(&repo_path)
+            .map_err(|e| CliError::fatal(format!("failed to list packs: {e}")))?;
+        if !gc_auto_should_run(threshold, pack_limit, packs, loose_count) {
             if output.is_json() {
                 emit_json_data(
                     "gc",
@@ -181,6 +186,10 @@ pub async fn execute_safe(args: GcArgs, output: &OutputConfig) -> CliResult<()> 
                 );
             }
             return Ok(());
+        }
+        // The decision runs a full gc: say so on stderr (Git parity).
+        if !output.is_json() && !output.quiet {
+            eprintln!("Auto packing the repository for optimum performance.");
         }
     }
 
@@ -325,6 +334,62 @@ fn silent_child(output: &OutputConfig) -> OutputConfig {
     child.json_format = None;
     child.quiet = true;
     child
+}
+
+/// Whether `gc --auto` should run (ADR-FP-04, the single source of truth).
+///
+/// `gc.auto <= 0` disables auto-gc entirely. Otherwise the run is triggered by
+/// either too many packs without a `.keep` file (`gc.autoPackLimit`, default 50,
+/// non-positive disables that trigger) or by the loose object count reaching
+/// `gc.auto` (default 6700).
+pub(crate) fn gc_auto_should_run(
+    gc_auto: i64,
+    auto_pack_limit: i64,
+    packs_without_keep: usize,
+    loose_count: usize,
+) -> bool {
+    if gc_auto <= 0 {
+        return false;
+    }
+    if auto_pack_limit > 0 && (packs_without_keep as i64) > auto_pack_limit {
+        return true;
+    }
+    (loose_count as i64) >= gc_auto
+}
+
+/// Resolve `gc.autoPackLimit` (default 50).
+async fn gc_auto_pack_limit() -> CliResult<i64> {
+    match ConfigKv::get("gc.autoPackLimit").await {
+        Ok(Some(entry)) => Ok(entry
+            .value
+            .trim()
+            .parse::<i64>()
+            .unwrap_or(DEFAULT_GC_AUTO_PACK_LIMIT)),
+        Ok(None) => Ok(DEFAULT_GC_AUTO_PACK_LIMIT),
+        Err(error) => Err(CliError::fatal(format!(
+            "failed to read gc.autoPackLimit config: {error}"
+        ))),
+    }
+}
+
+/// Count the packs that no `.keep` file pins.
+fn count_packs_without_keep(repo_path: &std::path::Path) -> std::io::Result<usize> {
+    let pack_dir = repo_path.join("objects").join("pack");
+    let Ok(entries) = std::fs::read_dir(&pack_dir) else {
+        return Ok(0);
+    };
+    let mut packs = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("pack") {
+            continue;
+        }
+        if path.with_extension("keep").exists() {
+            continue;
+        }
+        packs += 1;
+    }
+    Ok(packs)
 }
 
 /// Resolve `gc.auto` (default 6700). A non-positive value disables auto-gc

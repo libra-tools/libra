@@ -38,6 +38,13 @@ step (task, success, and per-step counters such as `objects_removed`,
 
 ## Options
 
+`--auto` runs only when maintenance is worthwhile: `gc.auto <= 0` never triggers;
+otherwise a run happens when the number of packs without a `.keep` file exceeds
+`gc.autoPackLimit` (default 50; a non-positive value disables that trigger) or the
+loose object count reaches `gc.auto` (default 6700). A triggered run prints
+`Auto packing the repository for optimum performance.` on stderr. The decision is
+shared with the automatic packing that `fetch` performs.
+
 ### `--prune <DATE>`
 
 Prune unreachable loose objects older than `<DATE>`. Defaults to the

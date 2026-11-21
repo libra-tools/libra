@@ -463,3 +463,175 @@ fn test_gc_matrix_prune_expiry_forms() {
         "--prune=0.days.ago must delete the fresh orphan"
     );
 }
+
+/// A recursive snapshot of a repository's `.libra` directory: relative path →
+/// file bytes. A no-write `gc --auto` must leave it byte-identical.
+fn libra_dir_snapshot(repo: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    fn walk(base: &Path, dir: &Path, out: &mut std::collections::BTreeMap<String, Vec<u8>>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(base, &path, out);
+            } else {
+                let rel = path
+                    .strip_prefix(base)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .into_owned();
+                // The SQLite database is touched by any command that opens it
+                // (WAL checkpointing), so the no-write assertion covers the
+                // object/ref files gc actually writes.
+                if rel.starts_with("libra.db") || rel.starts_with("object-index-repair-locks/") {
+                    continue;
+                }
+                if let Ok(bytes) = fs::read(&path) {
+                    out.insert(rel, bytes);
+                }
+            }
+        }
+    }
+    let mut out = std::collections::BTreeMap::new();
+    walk(&repo.join(".libra"), &repo.join(".libra"), &mut out);
+    out
+}
+
+/// Compare two snapshots, reporting only the paths that changed.
+fn assert_snapshot_unchanged(
+    before: &std::collections::BTreeMap<String, Vec<u8>>,
+    after: &std::collections::BTreeMap<String, Vec<u8>>,
+    label: &str,
+) {
+    let mut changed = Vec::new();
+    for (path, bytes) in before {
+        match after.get(path) {
+            Some(new) if new == bytes => {}
+            Some(_) => changed.push(format!("{path} (modified)")),
+            None => changed.push(format!("{path} (removed)")),
+        }
+    }
+    for path in after.keys() {
+        if !before.contains_key(path) {
+            changed.push(format!("{path} (added)"));
+        }
+    }
+    assert!(changed.is_empty(), "{label}: changed files: {changed:?}");
+}
+
+/// Build a repository holding two packs (a gc pack plus a fetched pack).
+fn repo_with_two_packs(root: &Path) -> std::path::PathBuf {
+    let g = root.join("g");
+    fs::create_dir_all(&g).expect("mkdir g");
+    assert_cli_success(&run_libra_command(&["init"], &g), "init g");
+    run_libra_command(&["config", "set", "user.name", "t"], &g);
+    run_libra_command(&["config", "set", "user.email", "t@t"], &g);
+    fs::write(g.join("f.txt"), "a\n").expect("write f");
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], &g), "stage A");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "A", "--no-verify"], &g),
+        "commit A",
+    );
+    assert_cli_success(&run_libra_command(&["gc"], &g), "pack the first set");
+
+    let other = root.join("other");
+    fs::create_dir_all(&other).expect("mkdir other");
+    assert_cli_success(&run_libra_command(&["init"], &other), "init other");
+    run_libra_command(&["config", "set", "user.name", "t"], &other);
+    run_libra_command(&["config", "set", "user.email", "t@t"], &other);
+    fs::write(other.join("g.txt"), "b\n").expect("write g");
+    assert_cli_success(&run_libra_command(&["add", "g.txt"], &other), "stage B");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "B", "--no-verify"], &other),
+        "commit B",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &["remote", "add", "other", other.to_str().expect("other")],
+            &g,
+        ),
+        "add remote",
+    );
+    assert_cli_success(
+        &run_libra_command(&["fetch", "other"], &g),
+        "fetch the second pack",
+    );
+    g
+}
+
+fn packs_of(repo: &Path) -> usize {
+    fs::read_dir(repo.join(".libra/objects/pack"))
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|entry| entry.path().extension().and_then(|e| e.to_str()) == Some("pack"))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+#[test]
+fn test_gc_auto_pack_limit_decision() {
+    // AC1/AC2: two packs and `gc.autoPackLimit=1` trigger a full gc.
+    let work = tempfile::tempdir().expect("work dir");
+    let g = repo_with_two_packs(work.path());
+    assert_eq!(packs_of(&g), 2, "fixture has two packs");
+    run_libra_command(&["config", "set", "gc.autoPackLimit", "1"], &g);
+    let out = run_libra_command(&["gc", "--auto"], &g);
+    assert_cli_success(&out, "AC1: gc --auto runs");
+    assert_eq!(packs_of(&g), 1, "AC1: the packs were consolidated");
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .lines()
+            .any(|line| line == "Auto packing the repository for optimum performance."),
+        "AC2: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // AC3: `gc.auto=0` disables auto-gc even when the pack limit is exceeded.
+    let work3 = tempfile::tempdir().expect("work dir");
+    let g3 = repo_with_two_packs(work3.path());
+    run_libra_command(&["config", "set", "gc.autoPackLimit", "1"], &g3);
+    run_libra_command(&["config", "set", "gc.auto", "0"], &g3);
+    let before = libra_dir_snapshot(&g3);
+    assert_cli_success(&run_libra_command(&["gc", "--auto"], &g3), "AC3: gc --auto");
+    assert_snapshot_unchanged(&before, &libra_dir_snapshot(&g3), "AC3");
+
+    // AC4: a non-positive pack limit never triggers by pack count.
+    let work4 = tempfile::tempdir().expect("work dir");
+    let g4 = repo_with_two_packs(work4.path());
+    run_libra_command(&["config", "set", "gc.autoPackLimit", "0"], &g4);
+    let before = libra_dir_snapshot(&g4);
+    assert_cli_success(&run_libra_command(&["gc", "--auto"], &g4), "AC4: gc --auto");
+    assert_snapshot_unchanged(&before, &libra_dir_snapshot(&g4), "AC4");
+
+    // AC5: a `.keep`-pinned pack does not count towards the limit.
+    let work5 = tempfile::tempdir().expect("work dir");
+    let g5 = repo_with_two_packs(work5.path());
+    run_libra_command(&["config", "set", "gc.autoPackLimit", "1"], &g5);
+    let pack = fs::read_dir(g5.join(".libra/objects/pack"))
+        .expect("read pack dir")
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| path.extension().and_then(|e| e.to_str()) == Some("pack"))
+        .expect("a pack file");
+    fs::write(pack.with_extension("keep"), b"").expect("write .keep");
+    let before = libra_dir_snapshot(&g5);
+    assert_cli_success(&run_libra_command(&["gc", "--auto"], &g5), "AC5: gc --auto");
+    assert_snapshot_unchanged(&before, &libra_dir_snapshot(&g5), "AC5");
+
+    // AC6: exactly 50 non-keep packs do not exceed the default limit of 50.
+    let work6 = tempfile::tempdir().expect("work dir");
+    let g6 = work6.path().join("g");
+    fs::create_dir_all(&g6).expect("mkdir g6");
+    assert_cli_success(&run_libra_command(&["init"], &g6), "init g6");
+    let pack_dir = g6.join(".libra/objects/pack");
+    fs::create_dir_all(&pack_dir).expect("mkdir pack dir");
+    for index in 0..50 {
+        fs::write(pack_dir.join(format!("pack-{index:02}.pack")), b"stub").expect("write pack");
+    }
+    let before = libra_dir_snapshot(&g6);
+    assert_cli_success(&run_libra_command(&["gc", "--auto"], &g6), "AC6: gc --auto");
+    assert_snapshot_unchanged(&before, &libra_dir_snapshot(&g6), "AC6");
+}
