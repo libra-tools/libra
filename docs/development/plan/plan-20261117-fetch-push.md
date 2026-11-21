@@ -1178,7 +1178,7 @@ PY
 
 ### Task FP-11: `fetch --all`/`--multiple` 在单个 remote 失败后继续其余 remote 并整体失败（#865, #867）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `complete`（2026-11-21：`--all` 循环与 `run_multiple_remote_fetch` 均改为「逐 remote 尝试、失败记录后继续」，每个失败输出 `error: could not fetch '<remote>' (exit code: <n>)`（`<n>` 取自该错误的 `CliError::exit_code()`），全部尝试后以第一个失败错误的原样返回（保留其稳定码，如 `LBR-REPO-001`）；已成功 remote 的引用/对象/`FETCH_HEAD` 保留；`--all` 传输前的配置预检仍 fail-closed。用例 `test_fetch_multiple_continues_after_remote_failure` 覆盖 AC1–AC4（`bad`+`one/two/three` 时三个好 remote 全部拉取、整体以 `LBR-REPO-001` 失败、stderr 含该行；`--multiple bad one` 仍取回 `one/main`）；`fetch`/`pull`/`clone` 套件 **202/202**；版本面 0.30.256 → 0.30.257；文档 EN/zh-CN 同步。按用户 2026-11-20 指令在 `main` 直接提交推送。）
 
 **Description:** 多远程 fetch（`--all`、`--multiple`、`fetch.all`，含 `--jobs`）中某个 remote 的网络/仓库错误不再中止：记录后继续其余 remote（已成功 remote 的引用、对象与 `FETCH_HEAD` 记录保留），每个失败 remote 向 stderr 输出一行 `error: could not fetch '<remote>' (exit code: <n>)`（Libra 统一格式：`<n>` 为该 remote 错误的稳定码在当前退出码配置下的退出码；Git 并行模式为不带 `error: ` 前缀的 `could not fetch '<remote>' (exit code: <n>)`，顺序模式为 `error: could not fetch <remote>`），全部尝试后以第一个失败 remote 的稳定码整体失败。`--all` 现有「任何网络 fetch 前校验全部 remote 配置」的 fail-closed 预检保持不变（配置错误不进入「继续」路径）。
 

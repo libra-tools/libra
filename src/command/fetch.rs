@@ -1471,21 +1471,42 @@ async fn run_multiple_remote_fetch(args: FetchArgs, output: &OutputConfig) -> Cl
     let no_write_fetch_head = args.no_write_fetch_head;
     let porcelain = args.porcelain;
     let mut combined: Option<FetchOutput> = None;
+    let mut first_failure: Option<CliError> = None;
     for remote in &remotes {
         let mut single = args.clone();
         single.repository = Some(remote.clone());
         single.refspecs = Vec::new();
         single.multiple = false;
-        let partial = run_fetch(single, output).await?;
-        combined = Some(match combined {
-            None => partial,
-            Some(mut accumulated) => {
-                accumulated.remotes.extend(partial.remotes);
-                accumulated
+        match run_fetch(single, output).await {
+            Ok(partial) => {
+                combined = Some(match combined {
+                    None => partial,
+                    Some(mut accumulated) => {
+                        accumulated.remotes.extend(partial.remotes);
+                        accumulated
+                    }
+                });
             }
-        });
+            Err(error) => {
+                // One failing remote must not abort the others (Git parity).
+                eprintln!(
+                    "error: could not fetch '{remote}' (exit code: {})",
+                    error.exit_code()
+                );
+                if first_failure.is_none() {
+                    first_failure = Some(error);
+                }
+            }
+        }
     }
-    let mut result = combined.ok_or_else(|| CliError::command_usage("no remote to fetch"))?;
+    let mut result = match combined {
+        Some(result) => result,
+        None => {
+            return Err(
+                first_failure.unwrap_or_else(|| CliError::command_usage("no remote to fetch"))
+            );
+        }
+    };
     result.refspec = None;
 
     if !dry_run && !no_write_fetch_head {
@@ -1495,10 +1516,14 @@ async fn run_multiple_remote_fetch(args: FetchArgs, output: &OutputConfig) -> Cl
         remote.release_pack_pin();
     }
     if porcelain {
-        render_fetch_porcelain(&result, output)
+        render_fetch_porcelain(&result, output)?;
     } else {
-        render_fetch_output(&result, output, dry_run, !no_write_fetch_head, false)
+        render_fetch_output(&result, output, dry_run, !no_write_fetch_head, false)?;
     }
+    if let Some(error) = first_failure {
+        return Err(error);
+    }
+    Ok(())
 }
 
 /// Fetch several command-line refspecs in one invocation.
@@ -1762,6 +1787,7 @@ async fn run_fetch(args: FetchArgs, output: &OutputConfig) -> CliResult<FetchOut
         }
 
         let mut results = Vec::with_capacity(remotes.len());
+        let mut first_failure: Option<CliError> = None;
         for (remote, prune) in remotes.into_iter().zip(prune_modes) {
             if verbose {
                 eprintln!(
@@ -1770,6 +1796,7 @@ async fn run_fetch(args: FetchArgs, output: &OutputConfig) -> CliResult<FetchOut
                     redact_url_credentials(&remote.url)
                 );
             }
+            let remote_name = remote.name.clone();
             let fetched = fetch_repository_with_result_reusing(
                 remote,
                 None,
@@ -1790,8 +1817,23 @@ async fn run_fetch(args: FetchArgs, output: &OutputConfig) -> CliResult<FetchOut
                 None,
             )
             .await
-            .map_err(CliError::from)?;
-            results.push(fetched);
+            .map_err(CliError::from);
+            match fetched {
+                Ok(fetched) => results.push(fetched),
+                Err(error) => {
+                    // Keep going: one unreachable remote must not hide the rest.
+                    eprintln!(
+                        "error: could not fetch '{remote_name}' (exit code: {})",
+                        error.exit_code()
+                    );
+                    if first_failure.is_none() {
+                        first_failure = Some(error);
+                    }
+                }
+            }
+        }
+        if let Some(error) = first_failure {
+            return Err(error);
         }
 
         return Ok(FetchOutput {

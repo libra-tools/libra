@@ -5186,3 +5186,107 @@ fn test_fetch_all_config_and_no_all() {
     );
     assert!(tracked(&w4).is_empty(), "--no-all fetched nothing");
 }
+
+#[test]
+fn test_fetch_multiple_continues_after_remote_failure() {
+    use crate::command::{assert_cli_success, run_libra_command};
+
+    let work = tempfile::tempdir().expect("work dir");
+    let make_source = |name: &str| {
+        let dir = work.path().join(name);
+        std::fs::create_dir_all(&dir).expect("mkdir source");
+        assert_cli_success(&run_libra_command(&["init"], &dir), "init source");
+        run_libra_command(&["config", "set", "user.name", "t"], &dir);
+        run_libra_command(&["config", "set", "user.email", "t@t"], &dir);
+        std::fs::write(dir.join("f.txt"), format!("{name}\n")).expect("write f");
+        assert_cli_success(&run_libra_command(&["add", "f.txt"], &dir), "stage");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", name, "--no-verify"], &dir),
+            "commit",
+        );
+        String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], &dir).stdout)
+            .trim()
+            .to_string()
+    };
+    let o1 = make_source("one");
+    make_source("two");
+    make_source("three");
+
+    let w = work.path().join("w");
+    std::fs::create_dir_all(&w).expect("mkdir w");
+    assert_cli_success(&run_libra_command(&["init"], &w), "init w");
+    run_libra_command(&["config", "set", "user.name", "t"], &w);
+    run_libra_command(&["config", "set", "user.email", "t@t"], &w);
+    for remote in ["one", "two", "three"] {
+        assert_cli_success(
+            &run_libra_command(&["remote", "add", remote, &format!("../{remote}")], &w),
+            "add remote",
+        );
+    }
+    assert_cli_success(
+        &run_libra_command(&["remote", "add", "bad", "../non-existing"], &w),
+        "add the broken remote",
+    );
+    let tracked = |repo: &std::path::Path| {
+        String::from_utf8_lossy(&run_libra_command(&["show-ref"], repo).stdout)
+            .lines()
+            .filter(|line| line.contains("refs/remotes/") && !line.ends_with("/HEAD"))
+            .map(|line| {
+                line.split_whitespace()
+                    .nth(1)
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+
+    // AC1–AC3: `--all` keeps fetching after the broken remote and fails overall
+    // with that remote's stable code.
+    let out = run_libra_command(&["fetch", "--all"], &w);
+    assert!(!out.status.success(), "AC2: --all fails overall");
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        stderr.contains("LBR-REPO-001"),
+        "AC2: the first failure's stable code: {stderr}"
+    );
+    assert!(
+        stderr
+            .lines()
+            .any(|line| line == "error: could not fetch 'bad' (exit code: 128)"),
+        "AC3: {stderr}"
+    );
+    assert_eq!(
+        tracked(&w),
+        ["one", "two", "three"]
+            .into_iter()
+            .map(|name| format!("refs/remotes/{name}/main"))
+            .collect::<std::collections::BTreeSet<_>>(),
+        "AC1: every good remote was still fetched"
+    );
+
+    // AC4: `--multiple` behaves the same way.
+    let w2 = work.path().join("w2");
+    std::fs::create_dir_all(&w2).expect("mkdir w2");
+    assert_cli_success(&run_libra_command(&["init"], &w2), "init w2");
+    run_libra_command(&["config", "set", "user.name", "t"], &w2);
+    run_libra_command(&["config", "set", "user.email", "t@t"], &w2);
+    for remote in ["one", "bad"] {
+        let target = if remote == "bad" {
+            "../non-existing".to_string()
+        } else {
+            format!("../{remote}")
+        };
+        assert_cli_success(
+            &run_libra_command(&["remote", "add", remote, &target], &w2),
+            "add remote",
+        );
+    }
+    let out = run_libra_command(&["fetch", "--multiple", "bad", "one"], &w2);
+    assert!(!out.status.success(), "AC4: --multiple fails overall");
+    let resolved = String::from_utf8_lossy(
+        &run_libra_command(&["rev-parse", "refs/remotes/one/main"], &w2).stdout,
+    )
+    .trim()
+    .to_string();
+    assert_eq!(resolved, o1, "AC4: the good remote was still fetched");
+}

@@ -50,6 +50,8 @@ libra config set --add remote.origin.fetch \
 
 ## 选项
 
+多远程 fetch（`--all`、`--multiple`、`fetch.all`）中单个 remote 失败不再中止：其余 remote 照常抓取（已成功者的引用、对象与 `FETCH_HEAD` 记录保留），每个失败 remote 输出 `error: could not fetch '<remote>' (exit code: <n>)`，全部尝试后以第一个失败 remote 的稳定码整体失败。配置错误仍在任何传输前 fail-closed。
+
 `fetch.all=true` 时无参 `libra fetch` 等同 `--all`；显式 `<repository>` 始终覆盖该配置。`--no-all` 撤销 `--all`（最后出现的标志生效），回到当前分支的默认 remote。
 
 `--multiple`/`-m` 把每个位置参数都当作 remote 名，按顺序逐个抓取（任一名字不是已配置 remote 时在任何传输前以 `LBR-CLI-003` 整体拒绝）。未给 `--append` 时先截断 `FETCH_HEAD` 再按 remote 顺序追加；给出 `--append` 时保留旧记录后追加。`--jobs`/`-j <n>` 为 Git 兼容而接受——Libra 串行抓取，取值只影响写入绝对路径 `GIT_TRACE` 的 `preparing to run up to <n> tasks` 行（`0` 取 CPU 核数，未给或负值为 1）。

@@ -176,6 +176,13 @@ libra config remote.origin.prune false  # but never for origin
 
 ## Options
 
+With several remotes (`--all`, `--multiple` or `fetch.all`), one failing remote no
+longer aborts the run: the others are still fetched (their refs, objects and
+`FETCH_HEAD` records are kept) and each failure prints
+`error: could not fetch '<remote>' (exit code: <n>)`; the command then fails as a
+whole with the first failure's stable code. Configuration errors still fail closed
+before any transfer.
+
 `fetch.all=true` makes a bare `libra fetch` behave like `--all`; an explicit
 `<repository>` always overrides it. `--no-all` undoes `--all` (last flag wins) and
 returns to the default remote for the current branch.
