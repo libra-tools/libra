@@ -1521,6 +1521,8 @@ PY
 
 **Granularity:** `type=implementation; axis=fetch--prune的显式refspec作用域; recovery=immutable-release; complete=yes; self-contained=yes; AC=5/8; VER=2/8; landing=1; prod-files=1; scope=M; deps=FP-14,DEP-FP-01,DEP-FP-05,DEP-FP-08; writeset=序列化于FP-14; release=independent; split-from=N/A; exception=N/A`
 
+> **2026-11-20 勘察记录（实现前必读）：** 命令行 refspec 由 `execute_fetch` 以 `fetch_repository_with_result(remote, refspec.clone(), refspec.is_some(), …)` 传入（`fetch.rs:1635-1652`），即落在 `branch` + `single_branch` 上；`build_fetch_ref_plans` 仅在 `single_branch` 时使用 `branch`。两次挂钩尝试（在 `prune_after_fetch` 增加 `cli_refspec` 过滤、以及从 `branch` 克隆作用域）均被 AC1 实测证伪（`fetch --prune origin main` 仍删除了陈旧跟踪引用），相关改动已还原。下一步须在一次带 `DEBUG` 打印的定点构建中确认 `single_branch` 路径实际走的修剪入口，再把 destination 模式显式下传；夹具用「源建分支 → fetch 造引用 → 源删分支」制造陈旧引用（`update-ref` 仅支持 `refs/heads/*`）。
+
 ---
 
 ### Task FP-16: `fetch --tags` 拒绝覆盖冲突的本地 tag 并整体失败（#873）
