@@ -31,6 +31,8 @@ LFS 跟踪文件会在 HTTP 推送期间透明上传，不需要单独执行 `lf
 
 ## 选项
 
+未配置为 remote、且指向一个 Libra 仓库的**裸目录名**会按匿名本地目标解析：先看当前目录，再看其父目录（同级仓库），裸仓库与带工作树的仓库都支持。同名已配置 remote 仍优先；既非配置 remote 也不是 Libra 仓库的名字以 `remote '<name>' not found`（`LBR-CLI-003`）拒绝。
+
 | 标志 / 参数 | 说明 | 示例 |
 |-------------|------|------|
 | `<repository>` | 远程名称（例如 `origin`）。使用 `<refspec>`、`--tags` 或 `--mirror` 时必需。 | `libra push origin main` |

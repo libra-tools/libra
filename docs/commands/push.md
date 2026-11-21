@@ -75,6 +75,12 @@ these modes warn and are not authorization for remote synchronization.
 
 ## Options
 
+A bare directory name is resolved as an anonymous local target when it is not a
+configured remote and it names a Libra repository: the current directory is checked
+first, then its parent (a sibling repository), bare or with a working tree. A
+configured remote of the same name still wins, and a name that is neither configured
+nor a Libra repository fails with `remote '<name>' not found` (`LBR-CLI-003`).
+
 | Flag / Argument | Description | Example |
 |-----------------|-------------|---------|
 | `<repository>` | Remote name (e.g. `origin`). Required when `<refspec>`, `--tags`, or `--mirror` is used. | `libra push origin main` |

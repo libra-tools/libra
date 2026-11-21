@@ -30,6 +30,12 @@ pub fn is_anonymous_repository_spec(spec: &str) -> bool {
         || spec.starts_with("..\\")
 }
 
+/// Whether `path` is a Libra repository: a working-tree checkout carries a
+/// `.libra` directory, a bare one keeps `libra.db` at its root.
+fn is_libra_repository_dir(path: &Path) -> bool {
+    path.join(".libra").is_dir() || path.join("libra.db").is_file()
+}
+
 /// Opt-in variant of [`is_anonymous_repository_spec`] that also treats a bare
 /// relative directory name as an anonymous local repository when it resolves to
 /// an existing Libra repository (bare or with a working tree).
@@ -51,16 +57,13 @@ pub fn is_anonymous_repository_spec_with_bare_dir(spec: &str) -> bool {
     {
         return false;
     }
-    // A Libra repository (bare included) always carries a `.libra` directory.
     // A bare directory name is resolved against the current directory first,
     // then against its parent, which is how a sibling repository in a work tree
     // (`sibling-a/`, `sibling-b/`) is addressed without a `../` prefix.
-    if path.join(".libra").is_dir() {
+    if is_libra_repository_dir(path) {
         return true;
     }
-    path.parent()
-        .map(|_| Path::new("..").join(path))
-        .is_some_and(|sibling| sibling.join(".libra").is_dir())
+    is_libra_repository_dir(&Path::new("..").join(path))
 }
 
 /// Resolve a bare-directory anonymous spec to a path the transport can open.
@@ -72,11 +75,11 @@ pub fn resolve_anonymous_local_spec(spec: &str) -> String {
         return spec.to_string();
     }
     let path = Path::new(spec);
-    if path.join(".libra").is_dir() {
+    if is_libra_repository_dir(path) {
         return spec.to_string();
     }
     let sibling = Path::new("..").join(path);
-    if sibling.join(".libra").is_dir() {
+    if is_libra_repository_dir(&sibling) {
         return sibling.to_string_lossy().into_owned();
     }
     spec.to_string()

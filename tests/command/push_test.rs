@@ -2997,3 +2997,115 @@ fn blake3_push_round_trip() {
         String::from_utf8_lossy(&ls.stdout)
     );
 }
+
+#[test]
+fn test_push_bare_directory_name_resolves_as_anonymous() {
+    use crate::command::{assert_cli_success, run_libra_command};
+
+    let work = tempfile::tempdir().expect("work dir");
+    let w = work.path().join("w");
+    std::fs::create_dir_all(&w).expect("mkdir w");
+    assert_cli_success(&run_libra_command(&["init"], &w), "init w");
+    run_libra_command(&["config", "set", "user.name", "t"], &w);
+    run_libra_command(&["config", "set", "user.email", "t@t"], &w);
+    std::fs::write(w.join("f.txt"), "x\n").expect("write f");
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], &w), "stage f");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "w1", "--no-verify"], &w),
+        "commit w1",
+    );
+    std::fs::write(w.join("f.txt"), "y\n").expect("modify f");
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], &w), "stage w2");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "w2", "--no-verify"], &w),
+        "commit w2",
+    );
+    let w2 = {
+        let out = run_libra_command(&["rev-parse", "HEAD"], &w);
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let ref_of = |repo: &std::path::Path, name: &str| {
+        String::from_utf8_lossy(&run_libra_command(&["show-ref"], repo).stdout)
+            .lines()
+            .find(|line| line.ends_with(name))
+            .and_then(|line| line.split_whitespace().next())
+            .unwrap_or_default()
+            .to_string()
+    };
+
+    // AC1: a sibling bare repository directory name.
+    let src1 = work.path().join("src1");
+    assert_cli_success(
+        &run_libra_command(&["init", "--bare", "src1"], work.path()),
+        "init src1",
+    );
+    assert_cli_success(
+        &run_libra_command(&["push", "src1", "main:refs/heads/trunk"], &w),
+        "AC1: push to a bare directory name",
+    );
+    assert_eq!(
+        ref_of(&src1, "refs/heads/trunk"),
+        w2,
+        "AC1: trunk points at W2"
+    );
+
+    // AC2/AC3: a configured remote of the same name wins.
+    let x = work.path().join("x");
+    assert_cli_success(
+        &run_libra_command(&["init", "--bare", "x"], work.path()),
+        "init x",
+    );
+    assert_cli_success(
+        &run_libra_command(&["remote", "add", "src1", x.to_str().expect("x")], &w),
+        "configure the src1 remote",
+    );
+    let dir_before = run_libra_command(&["show-ref"], &src1).stdout;
+    assert_cli_success(
+        &run_libra_command(&["push", "src1", "main:refs/heads/trunk"], &w),
+        "AC2: the configured remote wins",
+    );
+    assert_eq!(
+        ref_of(&x, "refs/heads/trunk"),
+        w2,
+        "AC2: x/trunk points at W2"
+    );
+    assert_eq!(
+        run_libra_command(&["show-ref"], &src1).stdout,
+        dir_before,
+        "AC3: the same-named directory is untouched"
+    );
+
+    // AC4: a non-bare sibling repository is accepted too.
+    let wt = work.path().join("wt");
+    assert_cli_success(&run_libra_command(&["init", "wt"], work.path()), "init wt");
+    run_libra_command(&["config", "set", "user.name", "t"], &wt);
+    run_libra_command(&["config", "set", "user.email", "t@t"], &wt);
+    assert_cli_success(
+        &run_libra_command(&["push", "wt", "main:refs/heads/trunk"], &w),
+        "AC4: push to a non-bare directory name",
+    );
+    assert_eq!(
+        ref_of(&wt, "refs/heads/trunk"),
+        w2,
+        "AC4: wt/trunk points at W2"
+    );
+
+    // AC5: a name that is neither configured nor a repository is refused.
+    let out = run_libra_command(&["push", "nosuch", "main:refs/heads/trunk"], &w);
+    assert!(!out.status.success(), "AC5: unknown name must fail");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("LBR-CLI-003"),
+        "AC5: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // AC6: an existing directory that is not a Libra repository is refused.
+    std::fs::create_dir_all(work.path().join("plain")).expect("mkdir plain");
+    let out = run_libra_command(&["push", "plain", "main:refs/heads/trunk"], &w);
+    assert!(!out.status.success(), "AC6: a plain directory must fail");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("LBR-CLI-003"),
+        "AC6: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

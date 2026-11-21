@@ -963,11 +963,17 @@ pub async fn run_push(args: PushArgs, output: &OutputConfig) -> Result<PushOutpu
     let repo_url = match ConfigKv::get_remote_url(&repository).await {
         Ok(url) => url,
         Err(_) => {
+            // `FP-02`/`ADR-FP-01`: a bare directory name that resolves to a Libra
+            // repository is pushed to as an anonymous local target (a configured
+            // remote of the same name already won above).
             if crate::internal::protocol::repository_arg::is_anonymous_repository_spec(&repository)
+                || crate::internal::protocol::repository_arg::is_anonymous_repository_spec_with_bare_dir(
+                    &repository,
+                )
             {
                 // An anonymous local-path / URL remote is resolved directly;
                 // the local push target check below governs whether it is usable.
-                repository.clone()
+                crate::internal::protocol::repository_arg::resolve_anonymous_local_spec(&repository)
             } else {
                 // Cross-Cutting F: fuzzy match for remote name suggestion
                 let suggestion = suggest_remote_name(&repository).await;

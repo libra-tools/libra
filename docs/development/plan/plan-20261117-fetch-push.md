@@ -463,7 +463,7 @@ PY
 
 ### Task FP-02: 修复 `libra push` 把裸本地仓库目录名当作 remote 名（#710）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `complete`（2026-11-21：`run_push` 的仓库解析复用 FP-01 的 opt-in helper 与 `resolve_anonymous_local_spec`——未命中配置 remote 但在当前目录/同级目录解析为 Libra 仓库（裸仓库或带工作树）时按匿名本地目标推送；已配置同名 remote 仍优先；顺带修正仓库目录判定为「`.libra` 目录或根部 `libra.db`」（裸仓库无 `.libra`，此前会让裸目录名判定失败）。用例 `test_push_bare_directory_name_resolves_as_anonymous` 覆盖 AC1–AC6（同级裸仓库写 `refs/heads/trunk`、配置同名 remote 时推向配置 URL 且同名目录零变化、非裸同级仓库可用、未知名字与普通目录均 `LBR-CLI-003`）；`push`/`fetch` 套件 **106/106**；版本面 0.30.241 → 0.30.242；文档 EN/zh-CN 同步。按用户 2026-11-20 指令在 `main` 直接提交推送。）
 
 **Description:** 在 `run_push` 解析 `<repository>` 时复用 `FP-01` 的 `is_anonymous_repository_spec_with_bare_dir`：未命中已配置 remote、但在当前目录下解析为存在的 Libra 仓库目录（含裸仓库）时，按本地仓库推送（不切换进程 CWD）；已配置同名 remote 仍优先；既非配置 remote 也非 Libra 仓库目录时保持 `remote '<name>' not found`（`LBR-CLI-003`）。
 
