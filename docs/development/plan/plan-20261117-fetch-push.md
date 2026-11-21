@@ -1417,6 +1417,8 @@ PY
 
 > **2026-11-20 续作指引：** 剩余 AC2/AC5/AC7/AC8 需要把 `dry_run` 与 `no_write_fetch_head` 带入渲染层——`FetchRepositoryResult`（`fetch.rs:856`）当前没有这两个字段，需在其构造点（`fetch.rs:2445/2562/2603/2914` 附近的 `FetchRepositoryResult { … }`）补字段，或在 `FetchOutput` 层携带；随后 `render_fetch_output` 用它们决定：`--dry-run` 总显示 ` * branch … -> FETCH_HEAD`、非 dry-run 且 `--no-write-fetch-head` 不显示、dry-run 前后仓库逐字不变（AC7 用例）。
 
+> **2026-11-20 阻塞点（实测）：** `libra fetch --no-write-fetch-head` 目前**不是已存在的 CLI 参数**（实测返回 `LBR-CLI-002: unexpected argument '--no-write-fetch-head'`），而 AC5/AC8 以该参数为前提；同时 `--dry-run origin <refspec>` 当前**不输出** ` * branch … -> FETCH_HEAD` 计划行（AC6 未满足）。因此本卡剩余 AC 需要先由承接卡实现 `--no-write-fetch-head` 参数并把 dry-run 计划行带入渲染层；建议在 `FP-14`/`FP-15` 或新拆子卡中承接并在计划中登记依赖。
+
 ---
 
 ### Task FP-14: 支持 `libra fetch --no-porcelain` 并与 `--porcelain` 按最后出现者生效（#879）
