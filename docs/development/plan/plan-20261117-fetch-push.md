@@ -1413,6 +1413,8 @@ PY
 
 **Granularity:** `type=implementation; axis=fetch人读更新报告; recovery=immutable-release; complete=yes; self-contained=yes; AC=8/8; VER=2/8; landing=1; prod-files=1; scope=M; deps=FP-12,DEP-FP-01,DEP-FP-08; writeset=序列化于FP-12; release=independent; split-from=N/A; exception=N/A`
 
+> **2026-11-20 门控裁决（用户指令）：** 用户目标第 3.5 项明确「不进行全量测试，只对任务卡相关的测试用例进行测试」，因此本卡的 `T-5` 全量门按该指令**豁免**：执行 A 组 focused 门（`fetch_test` 相关用例）+ `cargo +nightly fmt --all --check` + `cargo clippy --all-targets --all-features -- -D warnings`，并在完成记录中登记该豁免与残余风险（外部调用方对 stdout 的依赖未做全量回归）。
+
 ---
 
 ### Task FP-14: 支持 `libra fetch --no-porcelain` 并与 `--porcelain` 按最后出现者生效（#879）
