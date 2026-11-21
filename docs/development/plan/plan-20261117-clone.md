@@ -1952,7 +1952,7 @@ PY
 ### Task CL-20: 实现 `clone --sparse` 部分克隆与目录重命名合并按需 lazy fetch（#756）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `in-progress` / `locally-accepted`（2026-11-21 第一段：`fetch::lazy_fetch_objects(&[ObjectHash])` 以**一次**客户端调用取回整批对象（单 pack、单次落盘），`lazy_fetch_object` 改为其单对象包装；`libra-test: lazy-fetch want=<n>` 接缝从 `command` 桥接层移入 fetch 层并输出真实批大小（`LIBRA_TEST=1` 时），同时保留 `--progress` 驱动的 `Receiving objects` 行。回归：`clone_promisor_lazy_fetches_a_missing_object`（want=1 仍逐字成立）、`test_clone_sparse_oid_filter_and_missing_boundary`、`test_clone_partial_progress_and_e2e_lazy_fetch` 全绿。**剩余**：合并阶段按需批量预取（AC1/AC4）、`command_preflight` 仅为目录重命名合并解禁（AC6 的其他合并仍拒绝）、AC2/AC3/AC5（对象差集与 `folder/subdir/newfile.*` 索引）与 AC7/AC8（组合克隆的 cone 状态）待实现与用例化；未验证前不转 `done`。）
 **Description:** 自 `CL-16` 拆出：在 `src/command/clone.rs` 打通 `--sparse --filter=blob:none` 的稀疏部分克隆（与 `CL-16` 的 cone 初始化叠加）并在 `src/cli.rs` `command_preflight` 只为目录重命名合并解开 `core.sparseCheckout=true` 护栏，内容修改、删除和冲突合并继续拒绝，同时在 `src/command/merge.rs`、`src/command/merge/rename_merge.rs`、`src/command/merge/tree_merge.rs` 与 `src/command/fetch.rs` 中新增批量多 OID `fetch_objects_batch` 预取 helper 并打通 `clone --sparse --filter=blob:none`（cone 模式，AC7–AC8）及目录重命名合并时的单次批量按需 lazy fetch（对应 `#756` 的 `TC-0734`，即 Git `t/t6421-merge-partial-clone.sh#2`：1 次拉取取回 6 个对象；拉取次数与对象数经 `CL-19` 新增的 stderr 测试接缝 `LIBRA_TEST_TRACE_LAZY_FETCH`（仅 `LIBRA_TEST=1` 时读取）观测），确保稀疏工作区合并时不会遗漏重命名目标文件。
 **Out of scope:** `--sparse` 基础 cone 初始化与 skip-worktree（`CL-16`）；`checkout`/`switch`/`reset` 护栏（`CL-26`/`DEFER-CL-04`）；`#756` 验收第 4 条（完整 `t6421#2` 需在稀疏仓库内 `checkout`，随 `DEFER-CL-04`）；离线模式下按需拉取被拒绝（`CL-19` AC5–AC6）。
 **Current evidence:**

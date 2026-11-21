@@ -2440,6 +2440,19 @@ pub async fn fetch_repository_safe(
 /// `Ok(false)` when this repository is not a promisor clone (no
 /// `extensions.partialClone` configured).
 pub(crate) async fn lazy_fetch_object(oid: &ObjectHash) -> Result<bool, FetchError> {
+    Ok(lazy_fetch_objects(&[*oid]).await? > 0)
+}
+
+/// Fetch several missing promisor objects in ONE transfer.
+///
+/// Returns how many objects were requested (0 when this repository is not a
+/// promisor clone or the remote produced nothing). Under `LIBRA_TEST=1` the
+/// seam line `libra-test: lazy-fetch want=<n>` reports the batch size, which is
+/// how the sparse/partial merge contract ("one fetch, six objects") is observed.
+pub(crate) async fn lazy_fetch_objects(oids: &[ObjectHash]) -> Result<usize, FetchError> {
+    if oids.is_empty() {
+        return Ok(0);
+    }
     let Some(remote_name) = ConfigKv::get("extensions.partialClone")
         .await
         .map_err(|error| FetchError::LocalState {
@@ -2447,7 +2460,7 @@ pub(crate) async fn lazy_fetch_object(oid: &ObjectHash) -> Result<bool, FetchErr
         })?
         .map(|entry| entry.value)
     else {
-        return Ok(false);
+        return Ok(0);
     };
     let Some(remote) = ConfigKv::remote_config(&remote_name)
         .await
@@ -2455,25 +2468,24 @@ pub(crate) async fn lazy_fetch_object(oid: &ObjectHash) -> Result<bool, FetchErr
             message: format!("failed to read remote.{remote_name}: {error}"),
         })?
     else {
-        return Ok(false);
+        return Ok(0);
     };
     let client =
         RemoteClient::from_spec_with_remote_and_confirmation(&remote.url, Some(&remote_name), None)
             .await
             .map_err(|message| FetchError::LocalState { message })?;
     let hash_kind = git_internal::hash::get_hash_kind();
-    let oid_hex = oid.to_string();
-    let want = [oid_hex.clone()];
-    // Local-style transports take the object id directly; HTTP/SSH would need
+    let want = oids.iter().map(|oid| oid.to_string()).collect::<Vec<_>>();
+    // Local-style transports take the object ids directly; HTTP/SSH would need
     // a full capability negotiation and are not covered by the lazy path yet.
     let mut stream = match &client {
         RemoteClient::Local(inner) => inner.fetch_objects(&[], &want, &[], None, None).await,
         RemoteClient::Git(inner) => inner.fetch_objects(&[], &want, &[], None).await,
         RemoteClient::Bundle(inner) => inner.fetch_objects(&[], &want, &[], None).await,
-        RemoteClient::Http(_) | RemoteClient::Ssh(_) => return Ok(false),
+        RemoteClient::Http(_) | RemoteClient::Ssh(_) => return Ok(0),
     }
     .map_err(|error| FetchError::LocalState {
-        message: format!("lazy fetch of {oid_hex} failed: {error}"),
+        message: format!("lazy fetch of {} object(s) failed: {error}", oids.len()),
     })?;
     // The progress meter follows the invocation's global `--progress` setting:
     // `auto` already resolved to `none` off a terminal, and `none` stays silent.
@@ -2484,7 +2496,7 @@ pub(crate) async fn lazy_fetch_object(oid: &ObjectHash) -> Result<bool, FetchErr
     let data =
         read_fetch_stream_for_kind(&mut stream, &lazy_output, "lazy-fetch", hash_kind).await?;
     if data.pack_data.is_empty() {
-        return Ok(false);
+        return Ok(0);
     }
     let _ = write_pack_and_index(&data.pack_data, hash_kind, &[]).await?;
     // A promisor lazy fetch reports like any other transfer. The global
@@ -2496,7 +2508,10 @@ pub(crate) async fn lazy_fetch_object(oid: &ObjectHash) -> Result<bool, FetchErr
     ) {
         eprintln!("Receiving objects: 100%");
     }
-    Ok(true)
+    if std::env::var_os("LIBRA_TEST").is_some() {
+        eprintln!("libra-test: lazy-fetch want={}", oids.len());
+    }
+    Ok(oids.len())
 }
 
 // The fetch pipeline mirrors Git's option surface; the arguments are already

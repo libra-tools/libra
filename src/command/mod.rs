@@ -302,9 +302,7 @@ fn lazy_fetch_missing_object(hash: &ObjectHash) -> Option<Vec<u8>> {
     if !fetched {
         return None;
     }
-    if std::env::var_os("LIBRA_TEST").is_some() {
-        eprintln!("libra-test: lazy-fetch want=1");
-    }
+    // The batch size seam lives in `fetch::lazy_fetch_objects`.
     let storage = util::try_objects_storage().ok()?;
     storage.get(&hash).ok()
 }
