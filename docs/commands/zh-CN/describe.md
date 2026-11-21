@@ -44,6 +44,7 @@ libra describe [OPTIONS] [COMMIT]
 | `--first-parent` | 遍历历史时只跟随合并提交的第一个父。 | 关闭 |
 | `--match <pattern>` | 仅考虑名称匹配该 glob 的标签（可重复；OR 语义，wax glob ≤256 字符）。 | 无 |
 | `--no-match` | 清除此前给出的全部 `--match`；其后新给的 `--match` 仍生效，`--exclude` 不受影响。 | 关闭 |
+| `--all` 过滤 | 与 `--all` 同用时，`--match`/`--exclude` 也过滤分支候选：本地分支按短名（`br-x`）、远程跟踪分支按 `o/main`。 | — |
 | `--exclude <pattern>` | 排除名称匹配该 glob 的标签（可重复；优先于 `--match`）。 | 无 |
 | `--contains` | 反向包含查询（git name-rev）：用最近的「后代」标签命名目标，输出 `<tag>`（轻量 tag）/`<tag>^0`（附注 tag 直接命中）、`<tag>~<n>` 或 `<tag>~<n>^<m>~<k>`。隐含含轻量标签；等权重并列按标签名字典序确定；无后代标签时报错。`--contains --exact-match` 与 `--contains --candidates 0` 同样在直接命中附注 tag 时输出 `<tag>^0`（轻量 tag 仍为裸 `<tag>`）。 | 关闭 |
 

@@ -274,8 +274,18 @@ async fn run_describe(args: DescribeArgs) -> Result<DescribeOutput, DescribeErro
             .map_err(|e| DescribeError::CorruptReference(e.to_string()))?;
         locals.sort_by(|a, b| a.name.cmp(&b.name));
         for branch in locals {
+            // Branch candidates obey the same `--match`/`--exclude` filters as
+            // tags, matched on the short branch name (`br-x`).
+            let short = branch
+                .name
+                .strip_prefix("refs/heads/")
+                .unwrap_or(&branch.name)
+                .to_string();
+            if !tag_passes_filters(&short, &matchers, &excluders) {
+                continue;
+            }
             tag_map.entry(branch.commit).or_insert_with(|| TagInfo {
-                name: format!("heads/{}", branch.name),
+                name: format!("heads/{short}"),
                 is_annotated: false,
             });
         }
@@ -286,8 +296,18 @@ async fn run_describe(args: DescribeArgs) -> Result<DescribeOutput, DescribeErro
                 .map_err(|e| DescribeError::CorruptReference(e.to_string()))?;
             remote_branches.sort_by(|a, b| a.name.cmp(&b.name));
             for branch in remote_branches {
+                // Remote-tracking candidates match on `<remote>/<branch>`; the
+                // stored name is sometimes already the full ref.
+                let suffix = branch
+                    .name
+                    .strip_prefix(&format!("refs/remotes/{remote}/"))
+                    .unwrap_or(&branch.name);
+                let short = format!("{remote}/{suffix}");
+                if !tag_passes_filters(&short, &matchers, &excluders) {
+                    continue;
+                }
                 tag_map.entry(branch.commit).or_insert_with(|| TagInfo {
-                    name: format!("remotes/{}/{}", remote, branch.name),
+                    name: format!("remotes/{short}"),
                     is_annotated: false,
                 });
             }

@@ -573,7 +573,7 @@
 
 ### Task DESC-03: 修复 `libra describe --all` 忽略 `--match`/`--exclude` 过滤（#797）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空` | **Priority / Selection:** P1；Git 过滤语义缺陷 | **Issue:** [#797](https://github.com/libra-tools/libra/issues/797)
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `complete`（2026-11-21：`--all` 收集的本地分支与远程跟踪分支同样经 `tag_passes_filters` 过滤——本地按短名（`br-x`，剥离可能存在的 `refs/heads/` 前缀）、远程按 `<remote>/<branch>`（剥离 `refs/remotes/<remote>/` 前缀），显示名同步改为 `heads/<short>` 与 `remotes/<remote>/<branch>`（此前远程候选会重复拼接成 `remotes/o/refs/remotes/o/main`）；`--contains --all` 与普通 `--all` 共用同一候选表，因此两条路径过滤一致；无候选时按既有 `LBR-REPO-003` 返回。用例 `test_describe_all_filters_branch_candidates` 覆盖 AC1–AC8（无匹配报错、`br-*` 命中本地、`main`/`o/*` 排除后只剩 tag、`o/m*` 命中远程跟踪分支、`--contains --all` 同样过滤、tag 在共享提交上优先、无过滤时输出 `heads/*`、唯一匹配被排除后报错）；`describe_test` **34/34**；文档 EN/zh-CN 与 `COMPATIBILITY.md` 同步；版本面 0.30.260 → 0.30.261。按用户 2026-11-20 指令在 `main` 直接提交推送。） | **Priority / Selection:** P1；Git 过滤语义缺陷 | **Issue:** [#797](https://github.com/libra-tools/libra/issues/797)
 
 **Description:** 使 `--all` 收集的本地分支与远程跟踪分支同样经过 `--match`/`--exclude` 过滤：非 `--contains` 路径按 Git `get_name()` 以去掉 `refs/heads/`、`refs/remotes/` 后的短名（如 `br-x`、`o/main`）匹配；`--contains --all` 按 Git 传给 `name-rev` 的 `--refs=refs/{tags,heads,remotes}/<pat>` 等价规则匹配；无候选时按既有错误返回。过滤沿用既有 `compile_globs`/`tag_passes_filters`（`wax`）语义，只把作用范围扩到分支候选；glob 中 `*` 是否跨 `/` 与 Git `wildmatch` 的差异不在本卡改变（`DEFER-DESC-07`）。
 

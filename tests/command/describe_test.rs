@@ -1162,3 +1162,152 @@ fn test_describe_no_match_clears_previous_patterns() {
     .expect("the combination parses");
     assert!(args.match_patterns.is_empty(), "AC7: patterns were cleared");
 }
+
+#[test]
+fn test_describe_all_filters_branch_candidates() {
+    // `rel` (annotated) and `br-x` both point at the first commit; a remote `o`
+    // contributes `o/main` on a different commit.
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["tag", "-m", "rel", "rel"], p),
+        "annotated rel",
+    );
+    assert_cli_success(&run_libra_command(&["branch", "br-x"], p), "branch br-x");
+    let head = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], p).stdout)
+        .trim()
+        .to_string();
+
+    // A dedicated temp dir: sibling directories of the repo temp dir are shared
+    // across tests.
+    let remote_root = tempfile::tempdir().expect("remote root");
+    let remote_dir = remote_root.path().join("o-remote");
+    std::fs::create_dir_all(&remote_dir).expect("mkdir remote");
+    assert_cli_success(&run_libra_command(&["init"], &remote_dir), "init remote");
+    run_libra_command(&["config", "set", "user.name", "t"], &remote_dir);
+    run_libra_command(&["config", "set", "user.email", "t@t"], &remote_dir);
+    std::fs::write(remote_dir.join("g.txt"), "g\n").expect("write g");
+    assert_cli_success(
+        &run_libra_command(&["add", "g.txt"], &remote_dir),
+        "stage g",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "o1", "--no-verify"], &remote_dir),
+        "commit o1",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &["remote", "add", "o", remote_dir.to_str().expect("remote")],
+            p,
+        ),
+        "add remote o",
+    );
+    assert_cli_success(&run_libra_command(&["fetch", "o"], p), "fetch o");
+
+    let stdout =
+        |out: &std::process::Output| String::from_utf8_lossy(&out.stdout).trim().to_string();
+
+    // AC1: nothing matches → the existing "no names" error.
+    let out = run_libra_command(
+        &["describe", "--contains", "--all", "--match", "zzz*", &head],
+        p,
+    );
+    assert!(!out.status.success(), "AC1: no match must fail");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("LBR-REPO-003"),
+        "AC1: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // AC2: local branches match on their short name.
+    let out = run_libra_command(&["describe", "--all", "--match", "br-*", &head], p);
+    assert_cli_success(&out, "AC2");
+    assert_eq!(stdout(&out), "heads/br-x", "AC2");
+
+    // AC3: exclusions apply to local and remote short names.
+    let out = run_libra_command(
+        &[
+            "describe",
+            "--all",
+            "--exclude",
+            "main",
+            "--exclude",
+            "o/*",
+            &head,
+        ],
+        p,
+    );
+    assert_cli_success(&out, "AC3");
+    assert_eq!(stdout(&out), "tags/rel", "AC3: only the tag survives");
+
+    // AC4: remote-tracking branches match on `<remote>/<branch>`.
+    let out = run_libra_command(
+        &[
+            "describe",
+            "--all",
+            "--match",
+            "o/m*",
+            "refs/remotes/o/main",
+        ],
+        p,
+    );
+    assert_cli_success(&out, "AC4");
+    assert_eq!(stdout(&out), "remotes/o/main", "AC4");
+
+    // AC5: `--contains --all` filters local branches the same way.
+    let out = run_libra_command(
+        &["describe", "--contains", "--all", "--match", "br-*", &head],
+        p,
+    );
+    assert_cli_success(&out, "AC5");
+    assert_eq!(stdout(&out), "heads/br-x", "AC5");
+
+    // AC6: a tag that also matches wins over the branch on the same commit.
+    assert_cli_success(
+        &run_libra_command(&["tag", "-m", "rel", "rel2"], p),
+        "second tag",
+    );
+    let out = run_libra_command(
+        &[
+            "describe", "--all", "--match", "rel*", "--match", "br-*", &head,
+        ],
+        p,
+    );
+    assert_cli_success(&out, "AC6");
+    assert!(
+        stdout(&out).starts_with("tags/rel"),
+        "AC6: {}",
+        stdout(&out)
+    );
+
+    // AC7: without filters a branch-only repository names the commit by branch.
+    let plain = create_committed_repo_via_cli();
+    let plain_out = run_libra_command(&["describe", "--all", "HEAD"], plain.path());
+    assert_cli_success(&plain_out, "AC7");
+    assert!(
+        stdout(&plain_out).starts_with("heads/"),
+        "AC7: {}",
+        stdout(&plain_out)
+    );
+
+    // AC8: excluding the only matching branch fails the contains query.
+    let out = run_libra_command(
+        &[
+            "describe",
+            "--contains",
+            "--all",
+            "--match",
+            "br-*",
+            "--exclude",
+            "br-x",
+            &head,
+        ],
+        p,
+    );
+    assert!(!out.status.success(), "AC8: the only match was excluded");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("LBR-REPO-003"),
+        "AC8: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
