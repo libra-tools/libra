@@ -24,7 +24,11 @@ to check out but does not narrow the fetched refs. Fetch becomes single-branch
 only with `--single-branch` or the implicit single-branch mode enabled by
 `--depth`, `--shallow-since`, or `--shallow-exclude`; `--no-single-branch`
 cancels single-branch mode (the last conflicting flag wins). `--mirror` uses
-the refspec described above.
+the refspec described above. When the source's `HEAD` is detached and no
+`--branch` is given, `--single-branch` reproduces that detached `HEAD` instead
+of inventing a branch: no local branch and no `refs/remotes/<name>/<branch>` is
+created, and the recorded refspec places later fetches under
+`refs/remotes/<name>/_detached/*`.
 Clone creates a `.libra` directory with a SQLite-backed metadata store, sets
 up the selected remote, and checks out the default branch (or the branch
 specified with `-b`). Vault signing is always bootstrapped during clone,

@@ -448,6 +448,29 @@ fn upload_pack_advertises_no_filter() -> bool {
             == Some("1")
 }
 
+/// The commit a source repository's detached HEAD points at, if it is detached.
+///
+/// A `symref=HEAD:` capability means HEAD is symbolic; otherwise HEAD is
+/// attached when its advertised object id matches a branch tip.
+fn source_detached_head_oid(discovery: &DiscoveryResult) -> Option<git_internal::hash::ObjectHash> {
+    if discovery
+        .capabilities
+        .iter()
+        .any(|capability| capability.starts_with("symref=HEAD:"))
+    {
+        return None;
+    }
+    let head = discovery.refs.iter().find(|r| r._ref == "HEAD")?;
+    let attached = discovery
+        .refs
+        .iter()
+        .any(|r| r._ref.starts_with("refs/heads/") && r._hash == head._hash);
+    if attached {
+        return None;
+    }
+    crate::internal::object_format::parse_repo_oid(&head._hash).ok()
+}
+
 /// Normalize the command-line `--filter` values into a transfer filter.
 ///
 /// One `blob:none` is honoured; one `sparse:oid=` is validated but not applied;
@@ -2403,26 +2426,68 @@ async fn clone_into_destination(
     // landed inside — release the pack's `.keep` pin now.
     fetch_result.release_pack_pin();
 
-    // `--revision`: check out exactly one advertised revision as a detached
-    // HEAD. No local branch, tag or remote-tracking ref is created, and
-    // `remote.<name>.fetch` is never written (Git's `clone --revision`).
-    if let Some(revision) = &args.revision {
-        let oid = discovery
-            .refs
-            .iter()
-            .find(|reference| reference._ref == *revision)
-            .and_then(|reference| {
-                crate::internal::object_format::parse_repo_oid(&reference._hash).ok()
-            })
-            .ok_or_else(|| CloneError::RevisionNotFound {
-                revision: revision.clone(),
-            })?;
+    // A detached source HEAD cloned with `--single-branch` (and no `--branch`)
+    // reproduces that detached HEAD: no local branch and no remote-tracking
+    // branch is invented for it.
+    let detached_source = args.single_branch && args.branch.is_none() && args.revision.is_none();
+    let detached_head_oid = if detached_source {
+        source_detached_head_oid(discovery)
+    } else {
+        None
+    };
+    let detached_source = detached_source && detached_head_oid.is_some();
+    let detached_target: Option<(git_internal::hash::ObjectHash, Option<String>)> =
+        if let Some(revision) = &args.revision {
+            let oid = discovery
+                .refs
+                .iter()
+                .find(|reference| reference._ref == *revision)
+                .and_then(|reference| {
+                    crate::internal::object_format::parse_repo_oid(&reference._hash).ok()
+                })
+                .ok_or_else(|| CloneError::RevisionNotFound {
+                    revision: revision.clone(),
+                })?;
+            Some((oid, Some(revision.clone())))
+        } else if detached_source {
+            detached_head_oid.map(|oid| (oid, None))
+        } else {
+            None
+        };
+
+    // `--revision` (and the detached-source form): check out exactly that
+    // commit as a detached HEAD. No local branch, tag or remote-tracking ref is
+    // created, and `remote.<name>.fetch` is never written.
+    if let Some((oid, revision_label)) = detached_target {
+        // Record the remote URL so a later `libra fetch` still finds it; no
+        // `remote.<name>.fetch` refspec is written for a detached clone.
+        let _ = ConfigKv::set(&format!("remote.{remote_name}.url"), remote_url, false).await;
+        // The clone tracks no branch, so a later fetch must not invent a
+        // remote-tracking branch: the recorded refspec names a source ref that
+        // no repository advertises (a ref whose name is a commit id).
+        // The clone tracks no branch, so a later fetch records the remote's
+        // branches under a private namespace instead of inventing
+        // `refs/remotes/<name>/<branch>`.
+        if revision_label.is_none() {
+            let no_branch_spec = format!("+refs/heads/*:refs/remotes/{remote_name}/_detached/*");
+            let _ = ConfigKv::add(
+                &format!("remote.{remote_name}.fetch"),
+                &no_branch_spec,
+                false,
+            )
+            .await;
+        }
         Head::update(Head::Detached(oid), None).await;
         if !args.bare && !args.no_checkout {
             crate::command::switch::restore_to_commit(oid, output)
                 .await
                 .map_err(|error| CloneError::SetupFailed {
-                    message: format!("failed to check out revision '{revision}': {error}"),
+                    message: match &revision_label {
+                        Some(revision) => {
+                            format!("failed to check out revision '{revision}': {error}")
+                        }
+                        None => format!("failed to check out the source HEAD {oid}: {error}"),
+                    },
                 })?;
         }
         let tracking = Branch::list_branches_result(Some(&remote_name))
@@ -2497,6 +2562,7 @@ async fn clone_into_destination(
             !args.bare && !args.no_checkout,
             single_branch,
             advertised_head,
+            detached_source,
         )
         .await?
     };
@@ -2798,6 +2864,7 @@ pub(crate) async fn setup_repository(
     checkout_worktree: bool,
     single_branch: bool,
     advertised_head: bool,
+    detached_source: bool,
 ) -> Result<SetupResult, CloneError> {
     let db = get_db_conn_instance().await;
     let remote_head = Head::remote_current_with_conn(&db, &remote_config.name).await;
@@ -2873,7 +2940,7 @@ pub(crate) async fn setup_repository(
                         false,
                     )
                     .await;
-                    if single_branch {
+                    if single_branch && !detached_source {
                         let spec = format!(
                             "+refs/heads/{branch_name}:refs/remotes/{}/{branch_name}",
                             remote_config.name

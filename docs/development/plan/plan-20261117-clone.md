@@ -1760,7 +1760,7 @@ PY
 ### Task CL-15: 修复 `clone --single-branch` 从游离 HEAD 克隆错误创建 `refs/remotes/origin/main`（#753）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `complete`（2026-11-21：新增 `source_detached_head_oid`（无 `symref=HEAD:` 能力且 HEAD OID 不等于任何 `refs/heads/*` 尖端即判为游离），`clone --single-branch` 且未给 `--branch`/`--revision` 时走「复现游离 HEAD」分支：只写 `remote.<n>.url`、把 refspec 记为 `+refs/heads/*:refs/remotes/<n>/_detached/*`、`Head::Detached(oid)` 并 `restore_to_commit` 检出，随后删除远端跟踪分支与标签后提前返回；`setup_repository` 新增 `detached_source` 参数以跳过 `remote.<n>.fetch` 的单分支写法（`--revision` 仍完全不写 refspec，保持 CL-05 契约）。用例 `test_clone_single_branch_from_detached_head` 覆盖 AC1–AC4（前两行 `# branch.head (detached)`/`# branch.oid <C>`、无 `refs/remotes/origin/main`、随后 `fetch` 也不生成、显式 `--branch main` 的正控制存在）。**偏差登记**：AC2/AC3/AC4 的引用存在性以 `libra show-ref` 判定（卡内建议直读 SQLite `reference` 表），语义等价；AC3 下后续 fetch 会把 `main` 记到 `refs/remotes/origin/_detached/main` 这一私有命名空间。`clone_test` **70/70**；版本面 0.30.233 → 0.30.234；文档 EN/zh-CN 同步。按用户 2026-11-20 指令在 `main` 直接提交推送。）
 **Description:** 当源仓库处于游离 HEAD 且执行 `libra clone --single-branch`（未指定 `--branch`）时，仅建立游离 HEAD 而不虚构 `refs/remotes/origin/main`，且后续执行 `libra fetch` 同样不会创建 `refs/remotes/origin/main`。
 **Out of scope:** 正常有分支 HEAD 的 `--single-branch` 克隆（由既有实现承接）。
 **Current evidence:**

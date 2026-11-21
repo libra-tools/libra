@@ -64,6 +64,7 @@ libra clone -b develop git@github.com:user/repo.git
 ### `--single-branch`
 
 只获取通向单个分支 tip 的历史（HEAD，或 `-b` 给出的分支）。当大型仓库只需要一个分支时，可减少传输量。`--depth`、`--shallow-since`、`--shallow-exclude` 在未给出 `--no-single-branch` 时隐含此标志（对齐 `git clone`）。单分支克隆会写入 `remote.<name>.fetch=+refs/heads/<branch>:refs/remotes/<name>/<branch>`。只有 Git 远程支持这种传输优化。
+源仓库 `HEAD` 处于游离状态且未给 `--branch` 时，`--single-branch` 如实复现该游离 `HEAD`，不会虚构分支：既不创建本地分支，也不创建 `refs/remotes/<name>/<branch>`，记录的 refspec 让后续 fetch 落在 `refs/remotes/<name>/_detached/*` 下。
 
 ```bash
 libra clone --single-branch -b main git@github.com:user/repo.git

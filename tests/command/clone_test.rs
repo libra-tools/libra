@@ -4700,6 +4700,108 @@ fn test_clone_ref_storage_format() {
 }
 
 #[test]
+fn test_clone_single_branch_from_detached_head() {
+    use crate::command::{assert_cli_success, run_libra_command};
+
+    let source = tempdir().expect("source dir");
+    let sp = source.path();
+    assert_cli_success(&run_libra_command(&["init"], sp), "init source");
+    run_libra_command(&["config", "set", "user.name", "t"], sp);
+    run_libra_command(&["config", "set", "user.email", "t@t"], sp);
+    std::fs::write(sp.join("f.txt"), "one\n").expect("write f");
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], sp), "stage f");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c1", "--no-verify"], sp),
+        "commit c1",
+    );
+    let detached_oid = {
+        let out = run_libra_command(&["rev-parse", "HEAD"], sp);
+        assert_cli_success(&out, "resolve c1");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    // Advance `main` so the detached commit is not a branch tip.
+    std::fs::write(sp.join("g.txt"), "two\n").expect("write g");
+    assert_cli_success(&run_libra_command(&["add", "g.txt"], sp), "stage g");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c2", "--no-verify"], sp),
+        "commit c2",
+    );
+    assert_cli_success(
+        &run_libra_command(&["checkout", "--detach", &detached_oid], sp),
+        "detach the source HEAD",
+    );
+    let head_now = run_libra_command(&["rev-parse", "HEAD"], sp);
+    assert_eq!(
+        String::from_utf8_lossy(&head_now.stdout).trim(),
+        detached_oid,
+        "the fixture HEAD is detached at c1"
+    );
+
+    let source_url = format!("file://{}", sp.display());
+    let root = tempdir().expect("dest root");
+    let tracking_ref = "refs/remotes/origin/main";
+    let has_tracking = |repo: &std::path::Path| {
+        let out = run_libra_command(&["show-ref"], repo);
+        String::from_utf8_lossy(&out.stdout).contains(tracking_ref)
+    };
+
+    // AC1/AC2: the clone reproduces the detached HEAD without inventing a ref.
+    let d = root.path().join("d");
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "clone",
+                "--single-branch",
+                &source_url,
+                d.to_str().expect("dest"),
+            ],
+            root.path(),
+        ),
+        "clone --single-branch from a detached source",
+    );
+    let status = run_libra_command(&["status", "--porcelain=v2", "--branch"], &d);
+    let lines = String::from_utf8_lossy(&status.stdout);
+    let mut first_two = lines.lines().take(2);
+    assert_eq!(
+        first_two.next(),
+        Some("# branch.head (detached)"),
+        "AC1 head"
+    );
+    assert_eq!(
+        first_two.next(),
+        Some(format!("# branch.oid {detached_oid}").as_str()),
+        "AC1 oid"
+    );
+    assert!(!has_tracking(&d), "AC2: no refs/remotes/origin/main");
+
+    // AC3: a later fetch does not recreate it either.
+    let fetch = run_libra_command(&["fetch"], &d);
+    assert_cli_success(&fetch, "AC3: fetch succeeds");
+    assert!(
+        !has_tracking(&d),
+        "AC3: fetch must not invent the tracking ref"
+    );
+
+    // AC4: the same query is positive when a branch is requested explicitly.
+    let d2 = root.path().join("d2");
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "clone",
+                "--single-branch",
+                "--branch",
+                "main",
+                &source_url,
+                d2.to_str().expect("dest"),
+            ],
+            root.path(),
+        ),
+        "AC4: explicit --branch main",
+    );
+    assert!(has_tracking(&d2), "AC4: the tracking ref exists");
+}
+
+#[test]
 fn test_clone_reject_shallow_local_git_source() {
     use super::{create_linear_git_repo, git_success, run_libra_command};
 
