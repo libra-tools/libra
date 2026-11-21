@@ -3625,7 +3625,6 @@ fn storage_config_unresolved_fetch_stays_local_fetch() {
 fn fetch_without_repository_uses_git_default_remote() {
     use crate::command::{run_libra_command, run_libra_command_with_env};
 
-    // Source repository with one commit on `main`.
     let root = tempdir().unwrap();
     let src = root.path().join("s");
     assert!(
@@ -3633,24 +3632,36 @@ fn fetch_without_repository_uses_git_default_remote() {
             .status
             .success()
     );
-    std::fs::write(src.join("a.txt"), "a\n").unwrap();
-    assert!(run_libra_command(&["add", "a.txt"], &src).status.success());
     let identity: &[(&str, &str)] = &[
         ("LIBRA_COMMITTER_NAME", "t"),
         ("LIBRA_COMMITTER_EMAIL", "t@t"),
         ("GIT_AUTHOR_NAME", "t"),
         ("GIT_AUTHOR_EMAIL", "t@t"),
     ];
-    assert!(
-        run_libra_command_with_env(&["commit", "--no-gpg-sign", "-m", "s1"], &src, identity)
+    let mut tips = Vec::new();
+    for n in 1..=3 {
+        std::fs::write(src.join("a.txt"), format!("{n}\n")).unwrap();
+        assert!(run_libra_command(&["add", "a.txt"], &src).status.success());
+        assert!(
+            run_libra_command_with_env(
+                &["commit", "--no-gpg-sign", "-m", &format!("s{n}")],
+                &src,
+                identity
+            )
             .status
             .success()
-    );
-    let s1 = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], &src).stdout)
-        .trim()
-        .to_string();
+        );
+        tips.push(
+            String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], &src).stdout)
+                .trim()
+                .to_string(),
+        );
+    }
+    assert!(run_libra_command(&["tag", "v1"], &src).status.success());
+    let s3 = tips[2].clone();
+    let src_url = src.to_str().unwrap().to_string();
 
-    let clone_with_remote = |dir: &str, remotes: &[(&str, &str)]| {
+    let repo = |dir: &str, remotes: &[(&str, &str)]| {
         let dst = root.path().join(dir);
         assert!(
             run_libra_command(&["init", dst.to_str().unwrap()], root.path())
@@ -3661,44 +3672,121 @@ fn fetch_without_repository_uses_git_default_remote() {
             assert!(
                 run_libra_command(&["remote", "add", name, url], &dst)
                     .status
-                    .success(),
-                "remote add {name}"
+                    .success()
             );
         }
         dst
     };
-    let src_url = src.to_str().unwrap().to_string();
+    let tip = |dir: &std::path::Path, name: &str| {
+        let out = run_libra_command(&["rev-parse", name], dir);
+        assert!(out.status.success(), "rev-parse {name}");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
 
-    // AC2: no upstream, only `origin` -> origin is used.
-    let c = clone_with_remote("c", &[("origin", &src_url)]);
+    // AC2: no upstream, only `origin`.
+    let c = repo("c", &[("origin", &src_url)]);
+    assert!(run_libra_command(&["fetch"], &c).status.success());
+    assert_eq!(tip(&c, "refs/remotes/origin/main"), s3, "AC2");
+
+    // AC3: detached HEAD, only `origin`.
+    let d = repo("d", &[("origin", &src_url)]);
+    assert!(run_libra_command(&["fetch", "origin"], &d).status.success());
     assert!(
-        run_libra_command(&["fetch"], &c).status.success(),
-        "AC2 fetch"
+        run_libra_command(&["checkout", "--detach", "refs/remotes/origin/main"], &d)
+            .status
+            .success(),
+        "detach the fixture HEAD"
     );
-    let tip = run_libra_command(&["rev-parse", "refs/remotes/origin/main"], &c);
-    assert!(tip.status.success(), "AC2 tracking ref");
-    assert_eq!(String::from_utf8_lossy(&tip.stdout).trim(), s1);
-
-    // AC4: no upstream, the only remote is `up` -> up is used.
-    let n1 = clone_with_remote("n1", &[("up", &src_url)]);
     assert!(
-        run_libra_command(&["fetch"], &n1).status.success(),
-        "AC4 fetch"
+        run_libra_command(&["fetch"], &d).status.success(),
+        "AC3 fetch"
     );
-    let tip = run_libra_command(&["rev-parse", "refs/remotes/up/main"], &n1);
-    assert!(tip.status.success(), "AC4 tracking ref");
-    assert_eq!(String::from_utf8_lossy(&tip.stdout).trim(), s1);
+    assert_eq!(tip(&d, "refs/remotes/origin/main"), s3, "AC3");
 
-    // AC7: two remotes, neither named origin -> no default remote.
-    let n2 = clone_with_remote("n2", &[("up", &src_url), ("other", &src_url)]);
+    // AC4: no upstream, the only remote is `up`.
+    let n1 = repo("n1", &[("up", &src_url)]);
+    assert!(run_libra_command(&["fetch"], &n1).status.success());
+    assert_eq!(tip(&n1, "refs/remotes/up/main"), s3, "AC4");
+
+    // AC5/AC6: `branch.main.remote=up` wins; `origin` refs stay put.
+    let u = repo("u", &[("origin", &src_url), ("up", &src_url)]);
+    assert!(run_libra_command(&["fetch", "origin"], &u).status.success());
+    let origin_before = String::from_utf8_lossy(
+        &run_libra_command(&["for-each-ref", "refs/remotes/origin"], &u).stdout,
+    )
+    .into_owned();
+    assert!(
+        run_libra_command(&["config", "set", "branch.main.remote", "up"], &u)
+            .status
+            .success()
+    );
+    assert!(
+        run_libra_command(&["fetch"], &u).status.success(),
+        "AC5 fetch"
+    );
+    assert_eq!(tip(&u, "refs/remotes/up/main"), s3, "AC5");
+    let origin_after = String::from_utf8_lossy(
+        &run_libra_command(&["for-each-ref", "refs/remotes/origin"], &u).stdout,
+    )
+    .into_owned();
+    assert_eq!(origin_before, origin_after, "AC6");
+
+    // AC7/AC8: two remotes without `origin` fails and leaves the source alone.
+    let n2 = repo("n2", &[("up", &src_url), ("other", &src_url)]);
+    let before =
+        String::from_utf8_lossy(&run_libra_command(&["show-ref"], &src).stdout).into_owned();
     let out = run_libra_command(&["fetch"], &n2);
-    assert!(
-        !out.status.success(),
-        "AC7 must fail without a default remote"
-    );
+    assert!(!out.status.success(), "AC7 must fail");
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("LBR-REPO-003"),
-        "AC7: expected LBR-REPO-003: {}",
-        String::from_utf8_lossy(&out.stderr)
+        "AC7: expected LBR-REPO-003"
+    );
+    let after =
+        String::from_utf8_lossy(&run_libra_command(&["show-ref"], &src).stdout).into_owned();
+    assert_eq!(before, after, "AC8: the source is unchanged");
+
+    // AC1: a mirror-configured bare clone mirrors every ref.
+    let mir = root.path().join("mir");
+    assert!(
+        run_libra_command(&["init", "--bare", mir.to_str().unwrap()], root.path())
+            .status
+            .success()
+    );
+    assert!(
+        run_libra_command(&["remote", "add", "origin", &src_url], &mir)
+            .status
+            .success()
+    );
+    assert!(
+        run_libra_command(&["config", "set", "remote.origin.mirror", "true"], &mir)
+            .status
+            .success()
+    );
+    assert!(
+        run_libra_command(
+            &["config", "set", "remote.origin.fetch", "+refs/*:refs/*"],
+            &mir
+        )
+        .status
+        .success()
+    );
+    assert!(
+        run_libra_command(&["fetch"], &mir).status.success(),
+        "AC1 fetch"
+    );
+    let refs_of = |dir: &std::path::Path| {
+        let out = run_libra_command(&["for-each-ref", "--format=%(refname) %(objectname)"], dir);
+        let mut lines: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|line| line.starts_with("refs/heads/") || line.starts_with("refs/tags/"))
+            .map(str::to_owned)
+            .collect();
+        lines.sort();
+        lines
+    };
+    assert_eq!(
+        refs_of(&mir),
+        refs_of(&src),
+        "AC1: mirrored refs equal the source"
     );
 }

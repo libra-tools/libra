@@ -419,14 +419,14 @@ PY
 
 **Acceptance criteria:**
 
-- [ ] **AC1** `libra fetch parent refs/heads/main`（未配置 `parent` remote）的 `.libra/FETCH_HEAD` 首条记录 OID 等于 `parent` 的 `main`（P1）。
+- [x] **AC1** `libra fetch parent refs/heads/main`（未配置 `parent` remote）的 `.libra/FETCH_HEAD` 首条记录 OID 等于 `parent` 的 `main`（P1）。
 - [ ] **AC2** AC1 的调用不改变引用状态：调用前后 `R(child)` 逐字相等。
 - [ ] **AC3** AC1 的调用不写入配置：调用前后 `config_kv` 表全部行逐字相等。
-- [ ] **AC4** `libra fetch pbare refs/heads/main`（`pbare` 是裸 Libra 仓库目录，未配置同名 remote）的 `FETCH_HEAD` 首条记录 OID 等于 Q1。
+- [x] **AC4** `libra fetch pbare refs/heads/main`（`pbare` 是裸 Libra 仓库目录，未配置同名 remote）的 `FETCH_HEAD` 首条记录 OID 等于 Q1。
 - [ ] **AC5** 已配置 remote `parent`（URL 指向 `Q`）且同名目录 `parent` 也存在时，`libra fetch parent refs/heads/main` 取自配置 remote：`FETCH_HEAD` 首条记录 OID 等于 Q1。
-- [ ] **AC6** `libra fetch nosuch refs/heads/main`（既无 remote `nosuch` 也无目录 `nosuch`）以 `LBR-CLI-003` 失败。
-- [ ] **AC7** `libra fetch plain refs/heads/main`（`plain` 是存在但非 Libra 仓库的目录）以 `LBR-CLI-003` 失败。
-- [ ] **AC8** `libra pull parent main`（未配置 `parent` remote）仍以 `LBR-CLI-003` 失败（本卡不改变 `pull` 的仓库参数解析）。
+- [x] **AC6** `libra fetch nosuch refs/heads/main`（既无 remote `nosuch` 也无目录 `nosuch`）以 `LBR-CLI-003` 失败。
+- [x] **AC7** `libra fetch plain refs/heads/main`（`plain` 是存在但非 Libra 仓库的目录）以 `LBR-CLI-003` 失败。
+- [x] **AC8** `libra pull parent main`（未配置 `parent` remote）仍以 `LBR-CLI-003` 失败（本卡不改变 `pull` 的仓库参数解析）。
 - [ ] ER-06/ER-06a 同卡强制门：`Docs and compatibility impact` 所列每个文件按「文档与网站验收命令」第 1–7 步逐文件交付并验收（不计入卡特有 AC 分子）。
 
 **AC → 断言映射:**（夹具 F01：临时目录 `D` 下工作仓库 `D/child`（`libra init`，提交 C1，当前分支 `main`）；其内以 `libra init` 建嵌套 Libra 仓库子目录 `D/child/parent`（提交 P1，`main`→P1，无 tag）、以 `libra clone --bare ../q pbare` 建嵌套裸 Libra 仓库 `D/child/pbare`（`main`→Q1，无 tag），以及普通目录 `D/child/plain/`（只含普通文件 `x`，无 `.libra`）；另建独立 Libra 仓库 `D/q`（提交 Q1，`main`→Q1）；P1、Q1、C1 两两不同；被测 fetch/pull 调用均以 `cwd=D/child` 运行（裸目录名 `parent`、`plain` 相对该目录解析），夹具建立（含各仓库内的提交）与 `Ref`/`R`/`config_kv` 读取在各自仓库目录内运行；AC5 的副本另以 `libra remote add parent ../q` 配置同名 remote，其余副本不配置 remote `parent`；每个 AC 在独立同构副本上执行，执行前删除 `D/child/.libra/FETCH_HEAD`（若存在）；每个 AC 的调用另按「验证执行协议」第 4 项取所需快照；标注「Git 同夹具期望」的值按该项以钉选 Git 复核）
@@ -483,7 +483,7 @@ PY
 - [ ] **AC2** 已配置 remote `src1`（URL 指向 `D/x`）且同名目录 `src1` 也存在时，`libra push src1 one:refs/heads/trunk` 推向 `D/x`：`D/x` 的 `refs/heads/trunk` 指向 W2。
 - [ ] **AC3** AC2 的调用前后同名目录仓库的 `R(D/w/src1)` 逐字相等。
 - [ ] **AC4** `libra push wt one:refs/heads/trunk`（`wt` 是非裸 Libra 仓库目录、HEAD 分离，未配置同名 remote）后 `wt` 的 `refs/heads/trunk` 指向 W2。
-- [ ] **AC5** `libra push nosuch one:refs/heads/trunk` 以 `LBR-CLI-003` 失败。
+- [x] **AC5** `libra push nosuch one:refs/heads/trunk` 以 `LBR-CLI-003` 失败。
 - [ ] **AC6** `libra push plain one:refs/heads/trunk`（`plain` 存在但非 Libra 仓库）以 `LBR-CLI-003` 失败。
 - [ ] ER-06/ER-06a 同卡强制门：`Docs and compatibility impact` 所列每个文件按「文档与网站验收命令」第 1–7 步逐文件交付并验收（不计入卡特有 AC 分子）。
 
@@ -595,7 +595,7 @@ PY
 
 - [ ] **AC1** `libra push ../three 'refs/heads/prune/*'` 后 `RefMap(three)` 恰比调用前多出 `prune/a`、`prune/b`、`prune/c` 三项（均→T1）、其余不变。
 - [ ] **AC2** 删除本地 `prune/a`、`prune/b` 后，`libra push --prune ../three 'refs/heads/prune/*' '^refs/heads/prune/b'` 使 `RefMap(three)` 恰比调用前少 `refs/heads/prune/a` 一项、其余不变。
-- [ ] **AC3** `libra push ../three 'refs/heads/ours/*:refs/heads/theirs/*'` 后 `RefMap(three)` 恰比调用前多出 `theirs/a`、`theirs/b`、`theirs/c` 三项（均→T1）、其余不变。
+- [x] **AC3** `libra push ../three 'refs/heads/ours/*:refs/heads/theirs/*'` 后 `RefMap(three)` 恰比调用前多出 `theirs/a`、`theirs/b`、`theirs/c` 三项（均→T1）、其余不变。
 - [ ] **AC4** 删除本地 `ours/a`、`ours/b` 后，`libra push --prune ../three 'refs/heads/ours/*:refs/heads/theirs/*' '^refs/heads/theirs/b'` 使 `RefMap(three)` 恰比调用前少 `refs/heads/theirs/a` 一项、其余不变。
 - [ ] **AC5** 在未推送过 `prune/*` 的副本上 `libra push ../three 'refs/heads/prune/*' '^refs/heads/prune/b'` 使 `RefMap(three)` 恰比调用前多出 `prune/a`、`prune/c` 两项（源侧负向排除 `prune/b`）。
 - [ ] **AC6** 与 AC2 同初始状态下 `libra push --dry-run --prune ../three 'refs/heads/prune/*' '^refs/heads/prune/b'` 前后 `R(D/three)` 逐字相等。
@@ -835,7 +835,7 @@ PY
 **Acceptance criteria:**
 
 - [ ] **AC1** `libra fetch parent main:origin` 后 `RefMap(child)` 恰比调用前多出 `refs/heads/origin`→P1 一项、其余不变。
-- [ ] **AC2** `libra fetch ./parent refs/heads/main:refs/heads/x` 后 `refs/heads/x` 指向 P1。
+- [x] **AC2** `libra fetch ./parent refs/heads/main:refs/heads/x` 后 `refs/heads/x` 指向 P1。
 - [ ] **AC3** `libra fetch origin main:remotes/origin/copy` 后 `refs/remotes/origin/copy` 指向 U1。
 - [ ] **AC4** `libra fetch origin main:heads/h` 后 `refs/heads/h` 指向 U1。
 - [ ] **AC5** `libra fetch origin main:tags/t` 以 `LBR-CLI-002` 失败（补全为 `refs/tags/t` 后仍按现有标签目标限制拒绝）。
@@ -927,7 +927,7 @@ PY
 
 ### Task FP-07: 无参 `libra fetch` 在无上游时按 Git 选择默认 remote（镜像克隆、无上游分支与分离 HEAD）（#749）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `in-progress` / `locally-accepted`（2026-11-20：`fetch` 无参远端选择已实现 Git `remotes_remote_for_branch` 回退——`branch.<name>.remote` 优先，否则唯一 remote，否则 `origin`；两个及以上 remote 且无 `origin` 时保持 `LBR-REPO-003`。新增 `default_fetch_remote()`；`command::fetch_test::fetch_without_repository_uses_git_default_remote` 目前覆盖 AC2（仅 origin）、AC4（唯一 `up`）、AC7（双非 origin 拒绝）；`fetch_test` 全模块 63 passed / 0 failed。**AC1（裸/镜像全引用）、AC3（分离 HEAD）、AC5/AC6（`branch.main.remote=up` 与上游不变性）、AC8（失败时源仓库逐字不变）尚未落地**，故本卡保持 `in-progress`/`locally-accepted`。）
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `complete`（2026-11-20：无参 `libra fetch` 按 Git `remotes_remote_for_branch` 选远程——`branch.<name>.remote` 优先，否则唯一 remote，否则 `origin`；多个 remote 且无 `origin` 时保持 `LBR-REPO-003`（新增 `default_fetch_remote()`）。`command::fetch_test::fetch_without_repository_uses_git_default_remote` 覆盖 AC1–AC8：镜像仓库引用集合与源相等（AC1）、仅 origin 的无上游分支（AC2）、分离 HEAD（AC3）、唯一 `up`（AC4）、`branch.main.remote=up` 优先（AC5）且 `origin` 跟踪引用不变（AC6）、双非 origin remote 拒绝（AC7）且源仓库 `show-ref` 逐字不变（AC8）；`fetch_test` 全模块 64 passed / 0 failed；版本面 patch 0.30.219 → 0.30.220。按用户 2026-11-20 指令在 `main` 直接提交推送。）
 
 **Description:** 无 `<repository>` 且非 `--all` 时，按 Git `remotes_remote_for_branch`：当前分支配置了 `branch.<name>.remote` 则用之；否则（当前分支无上游、HEAD 分离，或裸/镜像仓库 HEAD 指向无上游的分支）若恰好配置了一个 remote 则用该 remote，否则用 `origin`；所选 remote 未配置时保持 `no configured remote for the current branch`（`LBR-REPO-003`）。读取当前分支与配置的存储错误按既有 `IoReadFailed` 路径失败，不得当作无上游而回落。镜像克隆的 `+refs/*:refs/*` 映射与既有 prune 语义不变。
 
