@@ -1674,6 +1674,40 @@ async fn run_fetch(args: FetchArgs, output: &OutputConfig) -> CliResult<FetchOut
     })
 }
 
+/// Short source name shown in the fetch report (`main`, `t1`, …).
+fn fetch_display_src(update: &FetchRefUpdate) -> String {
+    if let Some(rest) = update.remote_ref.strip_prefix("refs/heads/") {
+        return rest.to_string();
+    }
+    if let Some(rest) = update.remote_ref.strip_prefix("refs/tags/") {
+        return rest.to_string();
+    }
+    // `refs/remotes/<remote>/<branch>` shows the branch name in the src column.
+    if let Some(rest) = update.remote_ref.strip_prefix("refs/remotes/") {
+        return rest
+            .split_once('/')
+            .map(|(_, branch)| branch.to_string())
+            .unwrap_or_else(|| rest.to_string());
+    }
+    update.remote_ref.clone()
+}
+
+/// Destination shown after `->` (`origin/main`, a tag name, …).
+fn fetch_display_dst(update: &FetchRefUpdate, is_tag: bool) -> String {
+    if is_tag {
+        return update
+            .remote_ref
+            .strip_prefix("refs/tags/")
+            .unwrap_or(&update.remote_ref)
+            .to_string();
+    }
+    update
+        .remote_ref
+        .strip_prefix("refs/remotes/")
+        .unwrap_or(&update.remote_ref)
+        .to_string()
+}
+
 fn render_fetch_output(
     result: &FetchOutput,
     output: &OutputConfig,
@@ -1731,48 +1765,38 @@ fn render_fetch_output(
             if !write_fetch_head {
                 continue;
             }
-            writeln!(
-                writer,
-                " * branch            {} -> FETCH_HEAD",
-                record.source_ref
-            )
-            .map_err(|error| CliError::io(format!("failed to write fetch output: {error}")))?;
+            let short_src = record
+                .source_ref
+                .strip_prefix("refs/heads/")
+                .unwrap_or(&record.source_ref);
+            writeln!(writer, " * branch            {short_src} -> FETCH_HEAD")
+                .map_err(|error| CliError::io(format!("failed to write fetch output: {error}")))?;
         }
 
+        // Git's `display_ref_update` layout (ADR-FP-05):
+        // ` <flag> <summary:<17> <src:<11> -> <dst>`.
         for update in &remote.refs_updated {
             let is_tag = update.remote_ref.starts_with("refs/tags/");
-            let ref_name = update
-                .remote_ref
-                .strip_prefix("refs/remotes/")
-                .unwrap_or(&update.remote_ref);
-            match &update.old_oid {
-                None if is_tag => {
-                    writeln!(writer, " * [new tag]         {}", ref_name).map_err(|error| {
-                        CliError::io(format!("failed to write fetch output: {error}"))
-                    })?
+            let src = fetch_display_src(update);
+            let dst = fetch_display_dst(update, is_tag);
+            let (flag, summary) = match &update.old_oid {
+                None if is_tag => ('*', "[new tag]".to_string()),
+                None if update.remote_ref.starts_with("refs/remotes/") => {
+                    ('*', "[new branch]".to_string())
                 }
-                None => writeln!(writer, " * [new ref]         {}", ref_name).map_err(|error| {
-                    CliError::io(format!("failed to write fetch output: {error}"))
-                })?,
+                None => ('*', "[new ref]".to_string()),
                 Some(old_oid) => {
                     let old_short = &old_oid[..7.min(old_oid.len())];
                     let new_short = &update.new_oid[..7.min(update.new_oid.len())];
                     if update.forced {
-                        writeln!(
-                            writer,
-                            " + {}...{}  {} (forced update)",
-                            old_short, new_short, ref_name
-                        )
-                        .map_err(|error| {
-                            CliError::io(format!("failed to write fetch output: {error}"))
-                        })?;
+                        ('+', format!("{old_short}...{new_short}"))
                     } else {
-                        writeln!(writer, "   {}..{}  {}", old_short, new_short, ref_name).map_err(
-                            |error| CliError::io(format!("failed to write fetch output: {error}")),
-                        )?;
+                        (' ', format!("{old_short}..{new_short}"))
                     }
                 }
-            }
+            };
+            writeln!(writer, " {flag} {summary:<17} {src:<11} -> {dst}")
+                .map_err(|error| CliError::io(format!("failed to write fetch output: {error}")))?;
         }
 
         // `--prune`/`-p`: report each removed stale remote-tracking ref, in the
