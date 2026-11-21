@@ -1415,6 +1415,8 @@ PY
 
 > **2026-11-20 门控裁决（用户指令）：** 用户目标第 3.5 项明确「不进行全量测试，只对任务卡相关的测试用例进行测试」，因此本卡的 `T-5` 全量门按该指令**豁免**：执行 A 组 focused 门（`fetch_test` 相关用例）+ `cargo +nightly fmt --all --check` + `cargo clippy --all-targets --all-features -- -D warnings`，并在完成记录中登记该豁免与残余风险（外部调用方对 stdout 的依赖未做全量回归）。
 
+> **2026-11-20 续作指引：** 剩余 AC2/AC5/AC7/AC8 需要把 `dry_run` 与 `no_write_fetch_head` 带入渲染层——`FetchRepositoryResult`（`fetch.rs:856`）当前没有这两个字段，需在其构造点（`fetch.rs:2445/2562/2603/2914` 附近的 `FetchRepositoryResult { … }`）补字段，或在 `FetchOutput` 层携带；随后 `render_fetch_output` 用它们决定：`--dry-run` 总显示 ` * branch … -> FETCH_HEAD`、非 dry-run 且 `--no-write-fetch-head` 不显示、dry-run 前后仓库逐字不变（AC7 用例）。
+
 ---
 
 ### Task FP-14: 支持 `libra fetch --no-porcelain` 并与 `--porcelain` 按最后出现者生效（#879）
