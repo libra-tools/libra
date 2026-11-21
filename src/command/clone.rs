@@ -234,6 +234,13 @@ pub struct CloneArgs {
     #[clap(long = "filter", value_name = "spec", action = clap::ArgAction::Append)]
     pub filter: Vec<String>,
 
+    /// Ref storage format for the new repository (Git's
+    /// `--ref-storage-format <format>`). Libra stores refs in SQLite, so only
+    /// `sqlite` is accepted; `files`/`reftable` are not implemented and unknown
+    /// formats are a usage error.
+    #[clap(long = "ref-storage-format", value_name = "format")]
+    pub ref_storage_format: Option<String>,
+
     /// Deepen history to commits more recent than a date (Git's
     /// `--shallow-since <date>`). Accepted for compatibility but a no-op with a
     /// warning: Libra bounds shallow history only by `--depth`, so the date bound
@@ -813,6 +820,10 @@ pub enum CloneError {
     HardlinkFailed { message: String },
     #[error("object filter '{filter}' is not supported ({kind})")]
     UnsupportedFilter { filter: String, kind: &'static str },
+    #[error("ref storage format '{format}' is not supported; libra stores refs in sqlite")]
+    UnsupportedRefStorageFormat { format: String },
+    #[error("unknown ref storage format '{format}'")]
+    UnknownRefStorageFormat { format: String },
     #[error("unable to access sparse blob in '{filter}'")]
     SparseBlobUnreadable { filter: String },
     #[error("unable to parse sparse filter data in '{filter}'")]
@@ -901,6 +912,17 @@ impl From<CloneError> for CliError {
                 .with_hint(
                     "the Cloudflare publish site host was removed; clone a git remote or use `libra cloud` for repository backup.",
                 ),
+            CloneError::UnsupportedRefStorageFormat { ref format } => {
+                CliError::command_usage(format!(
+                    "ref storage format '{format}' is not supported; libra stores refs in sqlite"
+                ))
+                .with_stable_code(crate::utils::error::StableErrorCode::Unsupported)
+                .with_hint("supported ref storage format: sqlite")
+            }
+            CloneError::UnknownRefStorageFormat { ref format } => {
+                CliError::command_usage(format!("unknown ref storage format '{format}'"))
+                    .with_stable_code(crate::utils::error::StableErrorCode::CliInvalidArguments)
+            }
             CloneError::SparseBlobUnreadable { ref filter } => {
                 CliError::command_usage(format!("unable to access sparse blob in '{filter}'"))
                     .with_stable_code(crate::utils::error::StableErrorCode::CliInvalidTarget)
@@ -1792,6 +1814,29 @@ async fn execute_clone_inner(
 
     // Filters this build does not implement fail closed instead of silently
     // cloning everything (Git's `list-objects-filter` validation).
+    if let Some(format) = args.ref_storage_format.as_deref() {
+        match format.trim() {
+            // The only backend Libra implements; nothing to negotiate.
+            "sqlite" => {}
+            "files" | "reftable" => {
+                return Err((
+                    CloneError::UnsupportedRefStorageFormat {
+                        format: format.trim().to_string(),
+                    },
+                    None,
+                ));
+            }
+            other => {
+                return Err((
+                    CloneError::UnknownRefStorageFormat {
+                        format: other.to_string(),
+                    },
+                    None,
+                ));
+            }
+        }
+    }
+
     let mut object_filter = match normalize_clone_filter(&args.filter) {
         Ok(filter) => filter,
         Err(error) => return Err((error, None)),

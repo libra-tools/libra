@@ -231,6 +231,7 @@ async fn test_clone_branch() {
         dissociate: false,
         mirror: false,
         filter: Vec::new(),
+        ref_storage_format: None,
         shallow_since: None,
         shallow_exclude: vec![],
         deps_of: vec![],
@@ -287,6 +288,7 @@ async fn test_clone_bare_repository() {
         dissociate: false,
         mirror: false,
         filter: Vec::new(),
+        ref_storage_format: None,
         shallow_since: None,
         shallow_exclude: vec![],
         deps_of: vec![],
@@ -358,6 +360,7 @@ async fn test_clone_branch_single_branch() {
         dissociate: false,
         mirror: false,
         filter: Vec::new(),
+        ref_storage_format: None,
         shallow_since: None,
         shallow_exclude: vec![],
         deps_of: vec![],
@@ -413,6 +416,7 @@ async fn test_clone_default_branch() {
         dissociate: false,
         mirror: false,
         filter: Vec::new(),
+        ref_storage_format: None,
         shallow_since: None,
         shallow_exclude: vec![],
         deps_of: vec![],
@@ -468,6 +472,7 @@ async fn test_clone_default_branch_single_branch() {
         dissociate: false,
         mirror: false,
         filter: Vec::new(),
+        ref_storage_format: None,
         shallow_since: None,
         shallow_exclude: vec![],
         deps_of: vec![],
@@ -525,6 +530,7 @@ async fn test_clone_to_existing_empty_dir() {
         dissociate: false,
         mirror: false,
         filter: Vec::new(),
+        ref_storage_format: None,
         shallow_since: None,
         shallow_exclude: vec![],
         deps_of: vec![],
@@ -585,6 +591,7 @@ async fn test_clone_to_existing_dir() {
         dissociate: false,
         mirror: false,
         filter: Vec::new(),
+        ref_storage_format: None,
         shallow_since: None,
         shallow_exclude: vec![],
         deps_of: vec![],
@@ -641,6 +648,7 @@ async fn test_clone_to_dir_with_existing_file_name() {
         dissociate: false,
         mirror: false,
         filter: Vec::new(),
+        ref_storage_format: None,
         shallow_since: None,
         shallow_exclude: vec![],
         deps_of: vec![],
@@ -696,6 +704,7 @@ async fn test_clone_with_depth() {
         dissociate: false,
         mirror: false,
         filter: Vec::new(),
+        ref_storage_format: None,
         shallow_since: None,
         shallow_exclude: vec![],
         deps_of: vec![],
@@ -753,6 +762,7 @@ async fn test_clone_with_depth_and_branch() {
         dissociate: false,
         mirror: false,
         filter: Vec::new(),
+        ref_storage_format: None,
         shallow_since: None,
         shallow_exclude: vec![],
         deps_of: vec![],
@@ -4603,6 +4613,90 @@ fn test_clone_partial_progress_and_e2e_lazy_fetch() {
         String::from_utf8_lossy(&forced.stderr)
     );
     assert_eq!(forced.stdout, source_stdout, "AC8: stdout stays clean");
+}
+
+#[test]
+fn test_clone_ref_storage_format() {
+    use crate::command::{assert_cli_success, create_committed_repo_via_cli, run_libra_command};
+
+    let src = create_committed_repo_via_cli();
+    let source_url = format!("file://{}", src.path().display());
+    let root = tempdir().unwrap();
+
+    // AC1/AC3: an explicit `sqlite` is accepted and reported.
+    let d = root.path().join("d");
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "clone",
+                "--ref-storage-format=sqlite",
+                &source_url,
+                d.to_str().expect("dest"),
+            ],
+            root.path(),
+        ),
+        "AC1: clone --ref-storage-format=sqlite",
+    );
+    let out = run_libra_command(&["rev-parse", "--show-ref-storage-format"], &d);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "sqlite\n",
+        "AC3: the clone reports its ref backend"
+    );
+
+    // AC2: the mirror clone accepts it too.
+    let m = root.path().join("m");
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "clone",
+                "--mirror",
+                "--ref-storage-format=sqlite",
+                &source_url,
+                m.to_str().expect("dest"),
+            ],
+            root.path(),
+        ),
+        "AC2: mirror clone",
+    );
+
+    // AC4: the answer reflects the backend, not any clone-written config.
+    let i = root.path().join("i");
+    std::fs::create_dir_all(&i).expect("mkdir i");
+    assert_cli_success(&run_libra_command(&["init"], &i), "init");
+    for repo in [&m, &i] {
+        let out = run_libra_command(&["rev-parse", "--show-ref-storage-format"], repo);
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "sqlite\n",
+            "AC4: {:?}",
+            repo
+        );
+    }
+
+    // AC5/AC6/AC7: unimplemented and unknown formats fail closed.
+    for (index, (format, code)) in [
+        ("files", "LBR-UNSUPPORTED-001"),
+        ("reftable", "LBR-UNSUPPORTED-001"),
+        ("bogus", "LBR-CLI-002"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let dest = root.path().join(format!("e{index}"));
+        let out = run_libra_command(
+            &[
+                "clone",
+                &format!("--ref-storage-format={format}"),
+                &source_url,
+                dest.to_str().expect("dest"),
+            ],
+            root.path(),
+        );
+        assert!(!out.status.success(), "{format} must be refused");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(code), "{format}: expected {code}: {stderr}");
+    }
 }
 
 #[test]

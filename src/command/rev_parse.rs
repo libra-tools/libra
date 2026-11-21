@@ -57,6 +57,12 @@ EXAMPLES:
 #[derive(Parser, Debug)]
 #[command(after_help = REV_PARSE_EXAMPLES)]
 pub struct RevParseArgs {
+    /// Print the repository's ref storage format. Libra always stores refs in
+    /// SQLite, so this reports `sqlite` (Git's `files`/`reftable` backends are
+    /// not implemented).
+    #[clap(long = "show-ref-storage-format")]
+    pub show_ref_storage_format: bool,
+
     /// Show a non-ambiguous short object name. Accepts an optional length
     /// (e.g. `--short=8`) to request a specific abbreviation.
     #[clap(long, num_args = 0..=1, require_equals = true, default_missing_value = "7", conflicts_with_all = ["abbrev_ref", "show_toplevel"])]
@@ -231,6 +237,21 @@ fn split_positionals(args: &RevParseArgs) -> (Vec<String>, Vec<String>, bool) {
 pub async fn execute_safe(args: RevParseArgs, output: &OutputConfig) -> CliResult<()> {
     if !args.show_toplevel {
         util::require_repo().map_err(|_| CliError::repo_not_found())?;
+    }
+
+    if args.show_ref_storage_format {
+        // Libra has exactly one ref backend; report it truthfully instead of
+        // pretending to honour Git's `files`/`reftable` choices.
+        if output.is_json() {
+            crate::utils::output::emit_json_data(
+                "rev-parse",
+                &serde_json::json!({ "ref_storage_format": "sqlite" }),
+                output,
+            )?;
+        } else {
+            println!("sqlite");
+        }
+        return Ok(());
     }
 
     let any_filter = args.flags || args.no_flags || args.revs_only || args.no_revs;

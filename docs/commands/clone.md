@@ -212,6 +212,18 @@ libra clone --filter blob:none git@github.com:user/repo.git
 libra clone --shallow-since "2 weeks ago" git@github.com:user/repo.git
 ```
 
+### `--ref-storage-format <format>`
+
+Git's `--ref-storage-format`: Libra stores refs in SQLite, so `sqlite` is accepted
+as a no-op and every other format fails closed — `files` and `reftable` are
+unimplemented (`LBR-UNSUPPORTED-001`), an unknown value is a usage error
+(`LBR-CLI-002`, Git's `unknown ref storage format`). `libra rev-parse
+--show-ref-storage-format` reports the backend truthfully.
+
+```bash
+libra clone --ref-storage-format=sqlite git@github.com:user/repo.git
+```
+
 ### `-l, --local` / `--no-local`
 
 Match Git's local-clone vs transport choice for a **plain filesystem Git path**.

@@ -51,6 +51,17 @@ tree, including conflict markers. It disappears after `merge --continue`,
 six historical pseudo-refs (`ORIG_HEAD`, `MERGE_HEAD`, `CHERRY_PICK_HEAD`,
 `REVERT_HEAD`, `REBASE_HEAD`, and `FETCH_HEAD`) remain rejected as revisions.
 
+### `--show-ref-storage-format`
+
+Print the repository's ref storage backend. Libra stores refs in SQLite, so this
+always prints `sqlite` (Git's `files`/`reftable` backends are not implemented —
+see `COMPATIBILITY.md`, intentionally-different). `--json` returns
+`{"ref_storage_format": "sqlite"}`.
+
+```bash
+libra rev-parse --show-ref-storage-format
+```
+
 ## Options
 
 | Flag | Description |

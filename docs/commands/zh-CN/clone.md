@@ -103,6 +103,14 @@ libra clone --filter blob:none git@github.com:user/repo.git
 libra clone --shallow-since "2 weeks ago" git@github.com:user/repo.git
 ```
 
+### `--ref-storage-format <format>`
+
+对齐 Git 的 `--ref-storage-format`：Libra 的引用存储在 SQLite，因此 `sqlite` 被接受为 no-op，其余格式一律 fail-closed——`files` 与 `reftable` 未实现（`LBR-UNSUPPORTED-001`），未知取值按用法错误拒绝（`LBR-CLI-002`，对应 Git 的 `unknown ref storage format`）。`libra rev-parse --show-ref-storage-format` 如实输出当前后端。
+
+```bash
+libra clone --ref-storage-format=sqlite git@github.com:user/repo.git
+```
+
 ### `-l, --local` / `--no-local`
 
 对齐 Git：对**普通本地 Git 路径**选择「本地克隆」还是传输。非浅源的普通路径默认走本地克隆（`-l`/`--local` 也恢复该语义）：`--depth`、`--shallow-since`、`--shallow-exclude`、`--filter` 被忽略，并输出 Git 原文警告（`warning: --depth is ignored in local clones; use file:// instead.` 及其对应行）。已有浅边界的 Git 源走传输，以保留边界。`--no-local` 或 `file://` 走传输并尊重 `--depth`。Libra 仍从不硬链接，始终复制对象。两 flag 互相覆盖，最后出现者生效。本地 Libra 源不变：普通路径与 `file://` 上的 `--depth` 都以 `LBR-REPO-002` fail-closed。

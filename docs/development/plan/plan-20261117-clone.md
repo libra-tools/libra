@@ -1707,7 +1707,8 @@ PY
 ### Task CL-14: 支持 `clone --ref-storage-format` 与 `rev-parse --show-ref-storage-format`（#750）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `complete`（2026-11-21：`CloneArgs` 新增 `--ref-storage-format=<format>`，`sqlite` 接受为 no-op，`files`/`reftable` 以 `LBR-UNSUPPORTED-001` 拒绝（`CloneError::UnsupportedRefStorageFormat`），未知格式以 `LBR-CLI-002` 拒绝（`CloneError::UnknownRefStorageFormat`，对应 Git `unknown ref storage format`），均在创建目标目录前 fail-closed；`RevParseArgs` 新增 `--show-ref-storage-format`，文本输出 `sqlite`、`--json` 输出 `{"ref_storage_format": "sqlite"}`。用例 `test_clone_ref_storage_format` 覆盖 AC1–AC7（显式 sqlite 克隆、mirror 克隆、克隆库/mirror/`init` 新库三处输出逐字为 `sqlite
+`、三种拒绝及稳定码）；`clone_test`+`rev_parse_test` 合计 **119/119**；版本面 0.30.232 → 0.30.233；文档 clone/rev-parse 的 EN、zh-CN、开发版与 `COMPATIBILITY.md` 同步。按用户 2026-11-20 指令在 `main` 直接提交推送。）
 **Description:** 按 ADR-CL-04 在 `src/command/clone.rs` 新增 `--ref-storage-format=<format>` 解析（接受 `sqlite`，对未实现的 `files`/`reftable` 或未知格式 fail-closed 报错，不修改 `src/command/init.rs` 与 D25），并为 `RevParseArgs` 新增 `--show-ref-storage-format` 如实输出 `sqlite`（并在 `COMPATIBILITY.md` 记为 `intentionally-different`，`files`/`reftable` 存储后端延后至 `DEFER-CL-01`）。
 **Out of scope:** 修改 `init --ref-format`（保留 D25）；实现 Git `files` 或 `reftable` ref 存储后端（`DEFER-CL-01`）。
 **Current evidence:**

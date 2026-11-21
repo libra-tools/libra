@@ -27,6 +27,14 @@ Index path spec 解析当前 worktree 的 index：`:<path>` 读取 stage-0 条�
 `AUTO_MERGE` 是本命令唯一接受的伪引用：非 squash 合并因冲突暂停时，它解析为包含冲突标记的自动结果 tree。`merge --continue`、`--abort` 或 `--quit` 后会消失；干净合并和 squash 合并时不可用。六个历史伪引用（`ORIG_HEAD`、`MERGE_HEAD`、`CHERRY_PICK_HEAD`、`REVERT_HEAD`、`REBASE_HEAD`、`FETCH_HEAD`）仍会作为 revision 被拒绝。
 
 ## 选项
+### `--show-ref-storage-format`
+
+输出仓库的引用存储后端。Libra 的引用存于 SQLite，因此始终输出 `sqlite`（Git 的 `files`/`reftable` 后端未实现，见 `COMPATIBILITY.md` 的 intentionally-different）。`--json` 返回 `{"ref_storage_format": "sqlite"}`。
+
+```bash
+libra rev-parse --show-ref-storage-format
+```
+
 
 | 标志 | 说明 |
 |------|-------------|
