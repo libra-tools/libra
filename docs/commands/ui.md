@@ -1,6 +1,6 @@
 # `libra ui`
 
-Open the Libra desktop design preview with bundled demonstration data.
+Open the Libra desktop design preview with read-only repository context and bundled demonstration data.
 This is a Libra extension. Git has no equivalent.
 
 The window is part of every standard Libra build. No Cargo feature flag is
@@ -35,8 +35,11 @@ are inspectable illustrations in All tools; they do not run repository checks.
 Sessions has light and dark themes, readable-content search and local filters.
 Form editing and checkboxes affect the preview only. No settings are saved.
 
-This is an interface preview based on the supplied desktop design. All records
-and status indicators are bundled demonstration data. Navigation, selection,
+This is an interface preview based on the supplied desktop design. The window
+reads the current working directory's repository **read-only**: the context bar shows
+the working-tree folder name, storage label, branch, HEAD and object format, and the read
+never creates operation rows, upgrades the schema or takes a writer boundary.
+Records outside the repository context bar are still bundled demonstration data. Navigation, selection,
 tabs and theme changes are local UI interactions. Repository, agent, trust,
 restore, network and account actions do not execute. The window is labeled
 **Design preview**; these actions show a preview notice. Close the window or
@@ -44,7 +47,9 @@ press `⌘Q` to exit; `Esc` dismisses the command palette.
 The logo is a bundled copy of `https://libra.tools/libra-logo-without-words.svg`;
 fonts and assets load offline. macOS is the current validation target.
 
-The command does not read or write a repository.
+The command reads the current repository read-only and never writes it. Outside
+a repository the window opens with a clear "not created"/"no repository" state
+instead of failing.
 
 `libra ui --help` prints this command's usage and does not open a window.
 Any other argument except a global flag is a usage error, also without opening

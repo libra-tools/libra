@@ -3,10 +3,14 @@
 //! GPUI owns the process main thread. [`run`] is called from `main` before
 //! the CLI worker thread starts. It is not safe to call from `cli::parse`.
 
-use std::sync::{Arc, Mutex};
+use std::{
+    sync::{Arc, Mutex, OnceLock},
+    thread::JoinHandle,
+};
 
 use anyhow::Context;
 mod assets;
+pub mod data;
 mod desktop;
 mod model;
 mod screens;
@@ -20,6 +24,31 @@ use gpui::{
 };
 
 gpui::actions!(libra_application, [Quit]);
+
+/// Close coordinators started by window teardown; joined before the process
+/// exits so a bounded shutdown outcome is never lost.
+static CLOSE_HANDLES: OnceLock<Mutex<Vec<JoinHandle<()>>>> = OnceLock::new();
+
+fn close_registry() -> &'static Mutex<Vec<JoinHandle<()>>> {
+    CLOSE_HANDLES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Register a close coordinator thread.
+pub(crate) fn register_close(handle: JoinHandle<()>) {
+    if let Ok(mut slot) = close_registry().lock() {
+        slot.push(handle);
+    }
+}
+
+fn join_close_coordinators() {
+    let handles = match close_registry().lock() {
+        Ok(mut slot) => std::mem::take(&mut *slot),
+        Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
+    };
+    for handle in handles {
+        let _ = handle.join();
+    }
+}
 
 /// Open one window and run until the user closes it.
 ///
@@ -41,6 +70,7 @@ pub fn run() -> anyhow::Result<()> {
                 cx.quit();
             }
         });
+    join_close_coordinators();
     match startup_error.lock() {
         Ok(mut slot) => slot.take().map_or(Ok(()), Err),
         Err(poisoned) => poisoned.into_inner().take().map_or(Ok(()), Err),
@@ -104,8 +134,24 @@ fn open_window(cx: &mut App) -> anyhow::Result<()> {
         }),
         ..Default::default()
     };
-    cx.open_window(options, |window, cx| cx.new(|cx| Desktop::new(window, cx)))
+    let window = cx
+        .open_window(options, |window, cx| cx.new(|cx| Desktop::new(window, cx)))
         .context("failed to open the Libra window")?;
+    // macOS terminates through AppKit without returning through `run`; perform
+    // the bounded worker shutdown in the awaited quit callback instead. This is
+    // the one intended main-thread wait at quit time (bounded by the close
+    // budget), so a stalled worker's outcome is never lost.
+    let data = window
+        .read(cx)
+        .map(|desktop| desktop.data.clone())
+        .context("the Libra window was not created")?;
+    cx.on_app_quit(move |_cx| {
+        let data = data.clone();
+        async move {
+            data.shutdown();
+        }
+    })
+    .detach();
     cx.activate(true);
     Ok(())
 }

@@ -26,7 +26,10 @@ Cargo feature 控制。
 
 ## 当前状态
 
-`libra ui` 打开桌面 History 页面。`src/gui/desktop.rs` 管理页面与本地预览状态，
+`libra ui` 打开桌面 History 页面。`src/gui/data/` 提供只读数据接缝：单一后台 worker
+（`with_request_scope` 把读取 future 绑定到请求 scope；spawn 出的任务不继承、需显式重绑；注入的无 schema 管理连接；进程级 handle registry）按请求序号投递
+仓库上下文快照，源级状态按 ADR-UID-06 分类；主线程只渲染快照，不做 I/O。
+`src/gui/desktop.rs` 管理页面与本地预览状态，
 `src/gui/screens/` 放各设计页面，`widgets.rs` 提供原生 GPUI 布局和 Ely 控件。
 Sessions 保留演示目录 `src/gui/sessions.json`，不读取仓库。官网 Logo 内嵌在
 `src/gui/assets/libra-logo.svg`，通过组合 AssetSource 与 Ely 的字体、图标一起加载。
@@ -36,8 +39,8 @@ Sessions 保留演示目录 `src/gui/sessions.json`，不读取仓库。官网 L
 
 ## 还未实现的功能
 
-- 把 status、log、diff 接进窗口。
-- 从窗口调用 Libra 库函数，而不是每次新建一个 Tokio runtime。
+- 把 log、diff、status 等数据面接进窗口（仓库上下文已接入；其余见 `plan-20261120-ui-real-data.md`）。
+- 已由单一 worker runtime 承担：窗口读取不再每次新建 Tokio runtime。
 - 发布构建现在默认包含桌面窗口；Linux release runner 需安装 fontconfig 与 xkbcommon 开发头文件。
 - Linux 运行时需要 fontconfig 与 xkbcommon 共享库；`install.sh` 在 `ldconfig` 可用时会检测并警告缺失项。
 
@@ -49,7 +52,7 @@ History 为默认页，All tools / `⌘K` 是完整页面入口。各页单独�
 Ely 提供按钮、输入框、复选框、选择标签、主题、焦点与弹层；GPUI 提供布局、
 提交图、代码与归因行。没有 HTML/WebView，也不加载 `.dc.html` 的画布脚本。
 
-所有状态均为演示状态；`widgets::action` 只显示预览提示，不调用命令、数据库、
+除仓库上下文与源级错误状态外，其余状态均为演示状态；`widgets::action` 只显示预览提示，不调用命令、数据库、
 网络、凭据存储或外部 Agent。表单状态仅在窗口内存中存在。启动图示不会假装
 完成真实配置或安全检查，About 的版本、工具包、系统与架构来自构建信息。
 

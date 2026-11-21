@@ -1,6 +1,6 @@
 //! Navigation and presentation-only state for the desktop design.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Duration};
 
 use ely_gpui_component::{
     buttons::{Button, ButtonVariant},
@@ -14,6 +14,7 @@ use gpui::{
 };
 
 use super::{
+    data::{DataHandle, Snapshot},
     screens,
     view::SessionsWindow,
     widgets::{badge, muted, nav, row},
@@ -159,6 +160,10 @@ pub struct Desktop {
     pub toggles: HashMap<&'static str, bool>,
     pub draft: Entity<TextInput>,
     pub review_comment: Entity<TextInput>,
+    /// Background read worker; the UI only sends requests and takes snapshots.
+    pub data: DataHandle,
+    /// Latest snapshot delivered by the worker.
+    pub snapshot: Option<Snapshot>,
 }
 
 impl Desktop {
@@ -194,7 +199,32 @@ impl Desktop {
             .new(|cx| TextInput::new(window, cx).placeholder("What should this lane accomplish?"));
         let review_comment =
             cx.new(|cx| TextInput::new(window, cx).placeholder("Leave a review comment…"));
+        let data = DataHandle::spawn();
+        data.request();
+        let polled = data.clone();
+        cx.spawn(async move |this, cx| {
+            loop {
+                if this.upgrade().is_none() {
+                    break;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_millis(100))
+                    .await;
+                if let Some(snapshot) = polled.take_snapshot() {
+                    let delivered = this.update(cx, |desktop, cx| {
+                        desktop.snapshot = Some(snapshot);
+                        cx.notify();
+                    });
+                    if delivered.is_err() {
+                        break;
+                    }
+                }
+            }
+        })
+        .detach();
         Self {
+            data,
+            snapshot: None,
             history_input,
             history_query: String::new(),
             review_comment,
@@ -226,6 +256,27 @@ impl Desktop {
         };
         self.filter = 0;
         self.notice = None;
+    }
+}
+
+impl Drop for Desktop {
+    fn drop(&mut self) {
+        // Bounded shutdown runs off the GPUI main thread: a stalled worker
+        // never blocks the close path, and its handle stays owned by the
+        // process-lifetime registry instead of being detached.
+        let data = self.data.clone();
+        match std::thread::Builder::new()
+            .name("libra-ui-close".to_string())
+            .spawn(move || {
+                data.shutdown();
+            }) {
+            Ok(handle) => super::register_close(handle),
+            // If the coordinator cannot start, do the bounded shutdown inline
+            // rather than skipping cancellation.
+            Err(_) => {
+                self.data.shutdown();
+            }
+        }
     }
 }
 
@@ -282,10 +333,14 @@ impl Render for Desktop {
                 cx.notify();
             }))
             .size_full()
+            .flex()
+            .flex_col()
+            .child(context_bar(self.snapshot.as_ref(), &p))
             .child(
                 FocusScope::new(&self.focus)
                     .root()
-                    .size_full()
+                    .flex_1()
+                    .min_h(px(0.0))
                     .flex()
                     .flex_col()
                     .bg(p.bg)
@@ -376,4 +431,40 @@ impl Render for Desktop {
                     }),
             )
     }
+}
+
+/// Repository context bar: shows the snapshot state or the real context.
+fn context_bar(snapshot: Option<&Snapshot>, p: &ely_gpui_component::theme::Palette) -> gpui::Div {
+    let text = match snapshot {
+        None => "Reading repository…".to_string(),
+        Some(snapshot) => match (&snapshot.state, &snapshot.context) {
+            (super::data::SourceState::Available, Some(context)) => format!(
+                "{} · {} · {} · {} · {}",
+                context.worktree_label,
+                context.storage_label,
+                context.branch,
+                context.head,
+                context.object_format
+            ),
+            (state, _) => {
+                let mut text = state.label().to_string();
+                if let Some(message) = snapshot.message.as_deref() {
+                    text.push_str(" — ");
+                    text.push_str(message);
+                }
+                if let Some(hint) = state.hint() {
+                    text.push_str(" — ");
+                    text.push_str(hint);
+                }
+                text
+            }
+        },
+    };
+    row()
+        .h(px(26.0))
+        .px_4()
+        .border_b_1()
+        .border_color(p.border)
+        .bg(p.surface)
+        .child(muted(text, p).overflow_hidden().text_ellipsis())
 }

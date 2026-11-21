@@ -137,6 +137,9 @@
 
 | 时间 | 触发 | 变更内容 | 原卡 → 新卡 | 受影响的引用 |
 |---|---|---|---|---|
+| 2026-11-21 06:00:00 UTC | UID-01 执行期评审（Codex 四轮） | 补 anyhow 链式池超时回归用例；ADR-UID-01 说明 `with_request_scope` 为 task-local（spawn 任务不继承）；A5 与 ADR 记录退出路径的预算内等待例外；A2 映射补真实 worker 仓库外用例 | `UID-01` A5/映射 | ADR-UID-01、UID-01 AC/VER |
+| 2026-11-21 05:20:00 UTC | UID-01 执行期评审（Codex 三轮 / Claude 三轮） | 池超时与连接获取超时统一归 `Busy`（`PoolTimedOut`/`Connection pool timed out`/错误链）；ADR-UID-01 scope API 更正为 `with_request_scope`；UID-01 AC→test 映射改为真实用例名；zh-CN 首页与开发文档措辞同步（真实上下文已接入、单一 runtime 已实现）；轮询在窗口销毁后停止；关闭期主线程等待标注为有意且受预算约束 | `UID-01` 映射与 ADR 措辞 | ADR-UID-01、UID-01 AC/VER、docs/commands/zh-CN/ui.md、docs/development/commands/ui.md |
+| 2026-11-21 04:40:00 UTC | UID-01 执行期评审（Codex 二轮） | ADR-UID-06 增 `worker` 源级状态（worker 启动失败不误报 `Corrupt`/fsck 提示）；记录 UID-01 的实现期修订 | `UID-01` 状态分类 | ADR-UID-06、UID-01 AC/VER |
 | 2026-11-21 03:10:00 UTC | R11 双评 PASS 后的 P2/P3 清理 | availability 预算改"无争用 ≤80ms"并明确 `busy` 只由该探测产生、`stale` 取 memory 快照；UID-07 A7 收窄为"search 删除 catalog 后显示空状态"；UID-06 映射顺序整理；补 R10/R11 评审行与 §一/§二 措辞 | `UID-07` A7 措辞 | 各卡 AC/VER、ADR-UID-06、粒度审计表、性能摘要、§一/§二 |
 | 2026-11-21 02:50:00 UTC | R10 双评 PASS 后的 P2/P3 清理 | About 的 `未检查` 占位符登记进 ADR 并把状态来源移出 AC；UID-07 延后页徽标改"新增"并给出 `desktop.rs` 按 `Page` 枚举绘制；`search` 保留 demo 徽标而 `capabilities` 显示真实数据；计数口径补"显示与回退合并"规则；UID-05 freshness 成本测试进入映射与性能行；可用性探测给出 ≤200ms busy timeout 与 `busy` 显示；traceability 去 dirty 口径；人工验收改"临时仓库"；映射顺序整理 | `UID-07` AC 调整 | 各卡 AC/VER、ADR-UID-06、粒度审计表、性能摘要、追溯表 |
 | 2026-11-21 02:10:00 UTC | R9 双评 PASS 后的 P2/P3 清理 | UID-04 A5 拆为 id 快照/截断/重置三谓词、UID-07 拆出导入文案与延后页 demo 徽标、UID-06 A5 去实现注释、UID-02 A1 去 `COMMITS` 条款与措辞统一、UID-01 scope 措辞改线程局部；About 的 `stale`/`busy` 取自对应屏幕快照且 80ms 预算只含存在性/读打开/schema；freshness 成本由具名测试记录；deadline 澄清为锁等待上限；计数同步 | `UID-04`/`UID-07` AC 调整 | 各卡 AC/VER、粒度审计表、性能摘要 |
@@ -157,9 +160,9 @@
 
 - **Status:** Accepted
 - **Context:** GPUI 必须占用进程主线程（`src/gui/mod.rs:30`）；读取涉及 SQLite、对象库与文件系统；`storage_path()`/`working_dir()` 在仓库外 panic（`src/utils/util.rs:1296`、`:1491`）；既有读面多为 async API；`std::thread` 的 `join` 无超时，阻塞读无法被中断；`gui::run` 返回后局部变量即释放。
-- **Decision:** `src/gui/data/` 提供一个常驻 `std::thread` worker：线程内建立**一个长期存在的 current-thread Tokio runtime** 执行 async 读 API，并用 `with_request_scope_sync`（`src/internal/worktree_scope/context.rs:136`）为 worker 线程安装**线程局部**请求 scope，不依赖进程级 fallback。连接由调用方注入：仓库库用 `open_connection_without_schema_management(path, busy_timeout ≤2s)`（`src/internal/db.rs:217`），capture 库用真正只读的 `open_readonly`（`src/internal/ai/capture/store.rs:93`、`:796`）；worker 不调用 `get_db_conn_instance()`。每次请求带 deadline（busy timeout + 行/字节上限）；worker 在请求边界检查取消标志。关闭窗口时只有两种可声明结果：
+- **Decision:** `src/gui/data/` 提供一个常驻 `std::thread` worker：线程内建立**一个长期存在的 current-thread Tokio runtime** 执行 async 读 API，并用 `with_request_scope`（`src/internal/worktree_scope/context.rs:128`）把读取 future 绑定到请求 scope（Tokio task-local；该 future 内 spawn 出的任务不继承，需显式重绑），不依赖进程级 fallback。连接由调用方注入：仓库库用 `open_connection_without_schema_management(path, busy_timeout ≤2s)`（`src/internal/db.rs:217`），capture 库用真正只读的 `open_readonly`（`src/internal/ai/capture/store.rs:93`、`:796`）；worker 不调用 `get_db_conn_instance()`。每次请求带 deadline（busy timeout + 行/字节上限）；worker 在请求边界检查取消标志。关闭窗口时只有两种可声明结果：
   (a) **joined**：worker 在关闭预算（3s）内结束；
-  (b) **stalled**：worker 仍在不可中断的阻塞读中，**由控制侧**（窗口关闭路径）记录 `worker stalled` 状态；线程 handle 存入**进程级 registry**（`src/gui/data/worker.rs` 内的 `static WORKER_HANDLE: OnceLock<Mutex<Option<JoinHandle<()>>>>`），因此 `gui::run` 返回后仍持有该线程（不 detach、不等待），窗口在预算内返回、主线程不阻塞，进程退出时由 OS 回收。
+  (b) **stalled**：worker 仍在不可中断的阻塞读中，**由控制侧**（窗口关闭路径）记录 `worker stalled` 状态；线程 handle 存入**进程级 registry**（`src/gui/data/worker.rs` 内的按 handle 分项的 `WORKER_HANDLES`），因此 `gui::run` 返回后仍持有该线程（不 detach、不等待），窗口在预算内返回，进程退出时由 OS 回收。**唯一的主线程等待**发生在退出路径：`on_app_quit` 在原生终止前按关闭预算（≤3s）等待 worker 结束，以便记录 joined/stalled。
 - **Alternatives considered:** GPUI executor 上做 I/O；每次操作新建 runtime；在阻塞读上等待 join（无超时）；把 handle 放在 `gui::run` 局部变量（返回即 drop → detach）。
 - **Consequences:** 引入 supersession、取消、scope pin 与进程级 stalled 归属语义；禁止主线程直接调用 `storage_path()`/`get_db_conn_instance()`；数据层测试必须无显示器且能注入不可合作的慢读。
 - **Revisit when:** GPUI 提供稳定的后台 executor，或需要流式刷新（`DEFER-UID-02`）。
@@ -212,7 +215,7 @@
 - **Context:** 同一缺失数据源曾被同时定义为错误和空状态；源级损坏与条目级损坏恢复语义不同；现有 open API 会把连接失败包装为 `io::Error::other`，`capture::open_readonly` 用 `is_file()` 会把不可访问父目录当作 NotFound；两个库使用 DELETE journal，写者会短暂阻塞读者。
 - **Decision:** 分类函数只返回以下状态，GUI 按返回值渲染：
 
-  - **源级**：`available`（可读且 schema 兼容）、`absent`（未创建 → 空状态）、`unreadable`（读打开探测保留 `io::ErrorKind`，含 PermissionDenied → 类型化错误）、`corrupt`（读打开成功但连接/结构失败 → 类型化错误）、`busy`（写者持锁且超过 busy timeout → 可重试提示）、`schema-old`（库版本低于二进制 → "用 CLI 升级"）、`schema-new`（库版本高于二进制 → "二进制过旧"）、`stale`（投影过期 → 提示 `libra memory rebuild`；**零行显示**，fail-closed）。
+  - **源级**：`available`（可读且 schema 兼容）、`absent`（未创建 → 空状态）、`unreadable`（读打开探测保留 `io::ErrorKind`，含 PermissionDenied → 类型化错误）、`corrupt`（读打开成功但连接/结构失败 → 类型化错误）、`busy`（写者持锁且超过 busy timeout → 可重试提示）、`schema-old`（库版本低于二进制 → "用 CLI 升级"）、`schema-new`（库版本高于二进制 → "二进制过旧"）、`stale`（投影过期 → 提示 `libra memory rebuild`；**零行显示**，fail-closed）、`worker`（窗口数据 worker 启动失败 → 提示重开窗口，不误报数据库损坏）。
   - **条目级**：`ok`、`malformed`（内容不可解析 → 该行不可读）、`oversized`（超过字节上限 → 该行标记超大）、`incomplete`（产物缺件 → 该行提示不完整）、**读取顺序固定：先读 `kind` 字段，再用对应 kind 的 wire 类型解析**；其他已知 kind 的记录被本页静默隐藏；`kind` 值未知的记录按条目级 `malformed` 处理。
 
   源级判定顺序：先 `std::fs::metadata`（保留 NotFound/PermissionDenied），再做**读打开探测**（`std::fs::File::open`）保留其 io kind，最后才打开数据库；数据库打开失败若读打开已成功则归类 `corrupt`，busy/locked 归类 `busy`。capture 打开错误消息在渲染前脱敏。schema 判定用按连接 API `inspect_schema_for_connection(conn, role)`（`src/internal/db/schema.rs:381`）；Capture 角色不被按角色 API 接受（`:875`），因此 capture 库的 `schema-old`/`schema-new` 由注入的 capture 连接读取其 `schema_versions` 判定。**显示占位符 `未检查`** 仅表示"该屏幕尚未加载、因此尚无源级判定"，不是数据源状态。
@@ -391,9 +394,9 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `in-progress` / `locally-accepted`
 
-**Description:** 建立 `src/gui/data/` 只读接缝：用 `RequestScope::try_resolve`/`try_get_storage_path` 解析当前工作目录仓库，启动单一后台 worker（长期 runtime + 线程局部 scope + 注入连接 + 进程级 handle registry），向 GPUI 主线程投递带序号的不可变快照与 ADR-UID-06 的源级状态。行为轴是**数据获取的线程、生命周期、只读性与失败分类**。
+**Description:** 建立 `src/gui/data/` 只读接缝：用 `RequestScope::try_resolve`/`try_get_storage_path` 解析当前工作目录仓库，启动单一后台 worker（长期 runtime + 请求 scope（task-local）+ 注入连接 + 进程级 handle registry），向 GPUI 主线程投递带序号的不可变快照与 ADR-UID-06 的源级状态。行为轴是**数据获取的线程、生命周期、只读性与失败分类**。
 
 **Out of scope:** 各表面行数据 → `UID-02`..`UID-07`；dirty 摘要 → `DEFER-UID-09`；条目级状态 → `UID-03`..`UID-06`；写操作 → `DEFER-UID-01`；流式刷新 → `DEFER-UID-02`。
 
@@ -404,7 +407,7 @@
 | GPUI 在主线程运行 | `src/gui/mod.rs:30`、`src/main.rs:539` |
 | `Desktop` 只有页面/选择/输入状态 | `src/gui/desktop.rs:145` |
 | `storage_path()`/`working_dir()` 在仓库外 panic | `src/utils/util.rs:1296`、`:1491` |
-| `RequestScope` 解析与线程局部 scope API | `src/internal/worktree_scope.rs:80`、`src/internal/worktree_scope/context.rs:136` |
+| `RequestScope` 解析与请求 scope API | `src/internal/worktree_scope.rs:80`、`src/internal/worktree_scope/context.rs:128` |
 | 连接默认允许 schema 升级；连接错误被包装 | `src/internal/db.rs:624`、`:277` |
 | 无 schema 管理连接（可传 busy timeout） | `src/internal/db.rs:217` |
 | 按连接检查 schema；按角色 API 拒绝 Capture | `src/internal/db/schema.rs:381`、`:875` |
@@ -415,9 +418,9 @@
 - [ ] A2 仓库外启动窗口时正常打开并显示 `absent` 源级状态，不报错退出。
 - [ ] A3 源级状态按 ADR-UID-06 渲染（`absent`/`unreadable`/`corrupt`/`busy`/`schema-old`/`schema-new`）。
 - [ ] A4 过期响应不会覆盖较新快照（窗口不显示回退数据）。
-- [ ] A5 关闭窗口在预算内返回，不阻塞主线程。
+- [ ] A5 关闭窗口在预算内返回；唯一例外是退出路径（`on_app_quit`）按预算（≤3s）等待 worker 结束。
 
-**AC→test 映射（非计数）:** A1→`uid01_context_snapshot_in_repository`；A2→`uid01_outside_repository_absent`；A3→`uid01_source_state_classification`；A4→`uid01_supersession`；A5→`uid01_close_returns_within_budget`。实现不变量→`uid01_main_thread_read_count_zero`、`uid01_queue_cap`、`uid01_shutdown_joined_or_stalled`、`uid01_read_only_receipt_and_head`（Verification）。
+**AC→test 映射（非计数）:** A1→`uid01_context_snapshot_in_repository`；A2→`uid01_outside_repository_absent`+`uid01_real_worker_outside_repository_is_absent`；A3→`uid01_source_state_classification`+`uid01_probe_and_schema_classification`+`uid01_corrupt_and_schema_old`；A4→`uid01_supersession_and_queue_cap`+`uid01_obsolete_in_flight_response_is_dropped`；A5→`uid01_shutdown_and_close_budget`。实现不变量→`uid01_main_thread_read_count_zero`、`uid01_worker_thread_identity`、`uid01_read_only_receipt_and_head`、`uid01_busy_state_is_rendered`、`uid01_startup_failure_is_displayed`（Verification）。
 
 **Verification:**
 
@@ -952,7 +955,7 @@
 | worker 启动后窗口打开前失败 | 无 | 重开窗口或显示状态 | 主线程 panic |
 | 读取中途数据库被外部迁移 | 无（不写） | 显示 `schema-old`/`schema-new`，用户用 CLI 升级 | 自动迁移或静默降级 |
 | 写者持锁超时 | 无（不写） | 显示 `busy` 并允许重试 | 把 busy 当 corrupt |
-| 窗口关闭时 worker 仍在读 | 已投递旧快照（丢弃） | 预算内 joined，或控制侧记录 `worker stalled` 并由进程级 registry 持有 handle | 无限等待、主线程阻塞或线程无主 |
+| 窗口关闭时 worker 仍在读 | 已投递旧快照（丢弃） | 预算内 joined，或控制侧记录 `worker stalled` 并由进程级 registry 持有 handle；退出路径按关闭预算等待 | 无限等待、退出路径以外的阻塞或线程无主 |
 | `capture.db` 未创建 | 无 | 显示 `absent` | 回退演示数据 |
 | `capture.db` 不可读/权限拒绝 | 无 | 显示 `unreadable`（读打开探测保留 io kind，消息脱敏） | 把不可读当空状态 |
 | 库结构损坏 | 无 | 显示 `corrupt` | 把损坏当空状态 |
