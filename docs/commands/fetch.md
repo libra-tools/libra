@@ -176,6 +176,10 @@ libra config remote.origin.prune false  # but never for origin
 
 ## Options
 
+`fetch.all=true` makes a bare `libra fetch` behave like `--all`; an explicit
+`<repository>` always overrides it. `--no-all` undoes `--all` (last flag wins) and
+returns to the default remote for the current branch.
+
 `--multiple`/`-m` treats every positional argument as a remote name: each listed
 remote is fetched in order (an unknown name refuses the whole command with
 `LBR-CLI-003` before any transfer). `FETCH_HEAD` is truncated first unless

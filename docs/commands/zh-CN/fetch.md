@@ -50,6 +50,8 @@ libra config set --add remote.origin.fetch \
 
 ## 选项
 
+`fetch.all=true` 时无参 `libra fetch` 等同 `--all`；显式 `<repository>` 始终覆盖该配置。`--no-all` 撤销 `--all`（最后出现的标志生效），回到当前分支的默认 remote。
+
 `--multiple`/`-m` 把每个位置参数都当作 remote 名，按顺序逐个抓取（任一名字不是已配置 remote 时在任何传输前以 `LBR-CLI-003` 整体拒绝）。未给 `--append` 时先截断 `FETCH_HEAD` 再按 remote 顺序追加；给出 `--append` 时保留旧记录后追加。`--jobs`/`-j <n>` 为 Git 兼容而接受——Libra 串行抓取，取值只影响写入绝对路径 `GIT_TRACE` 的 `preparing to run up to <n> tasks` 行（`0` 取 CPU 核数，未给或负值为 1）。
 
 refspec 目标可位于任意 `refs/<命名空间>/...`（例如 `+refs/heads/*:refs/rd/*`），不再限于 `refs/heads/` 与 `refs/remotes/<remote>/`；这类引用可被 `show-ref` 列出、也可用 `rev-parse` 解析。若 `refs/remotes/<name>/...` 的 `<name>` 不是已配置 remote，则按全名存储（保持可见），不再挂到未配置的 remote 名下。`refs/tags/*` 目标仍拒绝，保留名 `refs/heads/HEAD` / `refs/remotes/<remote>/HEAD` 仍拒绝。

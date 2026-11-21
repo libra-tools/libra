@@ -2318,6 +2318,7 @@ fn local_fetch_args(repository: &str, prune: bool, dry_run: bool) -> fetch::Fetc
         refspecs: Vec::new(),
         multiple: false,
         jobs: None,
+        no_all: false,
         all: false,
         depth: None,
         dry_run,
@@ -5071,4 +5072,117 @@ fn test_fetch_multiple_remotes_and_jobs() {
             .contains("preparing to run up to 2 tasks"),
         "AC8"
     );
+}
+
+#[test]
+fn test_fetch_all_config_and_no_all() {
+    use crate::command::{assert_cli_success, run_libra_command};
+
+    let work = tempfile::tempdir().expect("work dir");
+    let make_source = |name: &str| {
+        let dir = work.path().join(name);
+        std::fs::create_dir_all(&dir).expect("mkdir source");
+        assert_cli_success(&run_libra_command(&["init"], &dir), "init source");
+        run_libra_command(&["config", "set", "user.name", "t"], &dir);
+        run_libra_command(&["config", "set", "user.email", "t@t"], &dir);
+        std::fs::write(dir.join("f.txt"), format!("{name}\n")).expect("write f");
+        assert_cli_success(&run_libra_command(&["add", "f.txt"], &dir), "stage");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", name, "--no-verify"], &dir),
+            "commit",
+        );
+    };
+    make_source("one");
+    make_source("two");
+    // A consumer without a clone: only the two remotes are configured.
+    let consumer = || {
+        let dir = work.path().join(format!(
+            "w{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir consumer");
+        assert_cli_success(&run_libra_command(&["init"], &dir), "init consumer");
+        run_libra_command(&["config", "set", "user.name", "t"], &dir);
+        run_libra_command(&["config", "set", "user.email", "t@t"], &dir);
+        for remote in ["one", "two"] {
+            assert_cli_success(
+                &run_libra_command(&["remote", "add", remote, &format!("../{remote}")], &dir),
+                "add remote",
+            );
+        }
+        dir
+    };
+    let tracked = |repo: &std::path::Path| {
+        String::from_utf8_lossy(&run_libra_command(&["show-ref"], repo).stdout)
+            .lines()
+            .filter(|line| line.contains("refs/remotes/") && !line.ends_with("/HEAD"))
+            .map(|line| {
+                line.split_whitespace()
+                    .nth(1)
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    let both = ["refs/remotes/one/main", "refs/remotes/two/main"]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<std::collections::BTreeSet<_>>();
+
+    // AC1: `fetch.all=true` makes a bare `fetch` behave like `--all`.
+    let w1 = consumer();
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "fetch.all", "true"], &w1),
+        "config",
+    );
+    assert_cli_success(&run_libra_command(&["fetch"], &w1), "AC1: bare fetch");
+    assert_eq!(
+        tracked(&w1),
+        both,
+        "AC1: every configured remote was fetched"
+    );
+
+    // AC2: an explicit repository overrides `fetch.all`.
+    let w2 = consumer();
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "fetch.all", "true"], &w2),
+        "config",
+    );
+    assert_cli_success(&run_libra_command(&["fetch", "one"], &w2), "AC2: fetch one");
+    assert_eq!(
+        tracked(&w2),
+        ["refs/remotes/one/main"]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        "AC2: only the named remote moved"
+    );
+
+    // AC3: `fetch.all=false` still honours an explicit `--all`.
+    let w3 = consumer();
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "fetch.all", "false"], &w3),
+        "config",
+    );
+    assert_cli_success(
+        &run_libra_command(&["fetch", "--all"], &w3),
+        "AC3: fetch --all",
+    );
+    assert_eq!(tracked(&w3), both, "AC3: --all beats the configuration");
+
+    // `--no-all` returns to the default remote (none configured here).
+    let w4 = consumer();
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "fetch.all", "true"], &w4),
+        "config",
+    );
+    let out = run_libra_command(&["fetch", "--no-all"], &w4);
+    assert!(
+        !out.status.success(),
+        "--no-all must fall back to the (absent) default remote"
+    );
+    assert!(tracked(&w4).is_empty(), "--no-all fetched nothing");
 }

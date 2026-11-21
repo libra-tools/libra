@@ -708,8 +708,13 @@ pub struct FetchArgs {
     pub refspecs: Vec<String>,
 
     /// Fetch all remotes.
-    #[clap(long, short, conflicts_with("repository"))]
+    #[clap(long, short, overrides_with = "no_all", conflicts_with("repository"))]
     pub all: bool,
+
+    /// Undo a previous `--all` (and ignore `fetch.all`), fetching the default
+    /// remote instead.
+    #[clap(long, overrides_with = "all")]
+    pub no_all: bool,
 
     /// Treat every positional argument as a remote name (Git's `--multiple`):
     /// each listed remote is fetched in order.
@@ -1323,7 +1328,7 @@ pub async fn execute(args: FetchArgs) {
 /// Returns [`CliError`] when remote configuration is invalid or missing,
 /// authentication/network/pack negotiation fails, object writes fail, or
 /// remote-tracking refs cannot be updated.
-pub async fn execute_safe(args: FetchArgs, output: &OutputConfig) -> CliResult<()> {
+pub async fn execute_safe(mut args: FetchArgs, output: &OutputConfig) -> CliResult<()> {
     // `--porcelain` and `--json` are both machine formats; `--json` is a global
     // flag so this exclusion is enforced here (usage error 129), not by clap.
     if args.porcelain && output.is_json() {
@@ -1340,6 +1345,14 @@ pub async fn execute_safe(args: FetchArgs, output: &OutputConfig) -> CliResult<(
                 .with_stable_code(StableErrorCode::CliInvalidArguments),
         );
     }
+    // Git's `all < 0` fallback: without `--all`/`--no-all` and without a
+    // repository argument, `fetch.all=true` behaves like `--all`; an explicit
+    // repository always overrides the configuration.
+    if !args.all && !args.no_all && args.repository.is_none() && configured_fetch_all().await? {
+        args.all = true;
+    }
+    args.no_all = false;
+
     // Part C W1 (§C.4.2): `FETCH_HEAD` is now worktree-local (see
     // `fetch_head_path`), and fetch's other writes — the shared object store and
     // `refs/remotes/*` — are repository-scoped by design, so a standalone fetch
@@ -1695,6 +1708,7 @@ async fn run_fetch(args: FetchArgs, output: &OutputConfig) -> CliResult<FetchOut
         notes,
         multiple: _,
         jobs: _,
+        no_all: _,
     } = args;
     // The multi-refspec caller runs this once per refspec.
     let refspec = refspecs.first().cloned();
@@ -5627,6 +5641,30 @@ async fn configured_fetch_prune(remote_name: &str) -> Result<Option<bool>, CliEr
         };
     }
     Ok(None)
+}
+
+/// `fetch.all`: a strict Git boolean that turns a bare `libra fetch` into
+/// `--all` (Git's `builtin/fetch.c:2541`).
+async fn configured_fetch_all() -> CliResult<bool> {
+    use crate::internal::config::{
+        LocalIdentityTarget, parse_git_config_bool, read_cascaded_config_value_strict,
+    };
+
+    let value = read_cascaded_config_value_strict(LocalIdentityTarget::CurrentRepo, "fetch.all")
+        .await
+        .map_err(|error| {
+            CliError::fatal(format!("failed to read config 'fetch.all': {error:#}"))
+                .with_stable_code(StableErrorCode::IoReadFailed)
+        })?;
+    let Some(value) = value else {
+        return Ok(false);
+    };
+    parse_git_config_bool(&value).ok_or_else(|| {
+        CliError::command_usage(format!(
+            "bad config value '{value}' for 'fetch.all' (expected a Git boolean)"
+        ))
+        .with_stable_code(StableErrorCode::CliInvalidArguments)
+    })
 }
 
 /// Resolve the effective [`TagFetchMode`] for `remote_name`: an explicit CLI

@@ -1239,7 +1239,7 @@ PY
 
 ### Task FP-19: 支持 `fetch.all` 配置与 `--no-all`（`t5514` #15–#25）（#867；自 FP-10 拆出）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `complete`（2026-11-21：新增 `--no-all`（`overrides_with` 双向，最后出现者生效）与 `configured_fetch_all`（严格 Git 布尔读取 `fetch.all`，非法值 `LBR-CLI-002`）；`execute_safe` 在既未给 `--all`/`--no-all`、也未给 `<repository>` 时按 `fetch.all` 打开 all 模式，显式 `<repository>` 始终覆盖配置。用例 `test_fetch_all_config_and_no_all` 覆盖 AC1–AC3 与 `--no-all` 回落到默认 remote 的行为；`fetch`/`pull`/`clone` 套件 **201/201**；版本面 0.30.255 → 0.30.256；文档 EN/zh-CN 同步。按用户 2026-11-20 指令在 `main` 直接提交推送。）
 
 **Description:** 新增 `--no-all`（与 `--all` 按最后出现者生效），并在既未给 `--all`/`--no-all`、也未给 `<repository>` 时读取 `fetch.all`（复用 `configured_fetch_prune` 同一严格布尔读取 helper）：为真时等同 `--all`；显式 `<repository>` 覆盖 `fetch.all`；`--no-all` 回到默认 remote。
 
