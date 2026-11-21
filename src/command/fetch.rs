@@ -1681,6 +1681,15 @@ fn render_fetch_output(result: &FetchOutput, output: &OutputConfig) -> CliResult
     let stderr = io::stderr();
     let mut writer = stderr.lock();
 
+    // AC3: without `--verbose`, a fetch that changed nothing prints nothing.
+    let nothing_to_report = result
+        .remotes
+        .iter()
+        .all(|remote| remote.refs_updated.is_empty() && remote.pruned.is_empty());
+    if nothing_to_report {
+        return Ok(());
+    }
+
     if result.remotes.is_empty() {
         writeln!(writer, "No remotes configured")
             .map_err(|error| CliError::io(format!("failed to write fetch output: {error}")))?;
