@@ -1631,14 +1631,18 @@ async fn run_fetch(args: FetchArgs, output: &OutputConfig) -> CliResult<FetchOut
     // local-repo spec that is not a configured remote. It negotiates directly
     // against the target, writes only `FETCH_HEAD` (no tracking ref), and
     // records no `remote.*` config.
-    let anonymous =
-        configured_remote.is_none() && repository_arg::is_anonymous_repository_spec(&remote);
+    // `ADR-FP-01`: a bare directory name that resolves to a Libra repository is
+    // fetched as an anonymous local repository (a configured remote of the same
+    // name still wins, and `pull` keeps the stricter helper).
+    let anonymous = configured_remote.is_none()
+        && (repository_arg::is_anonymous_repository_spec(&remote)
+            || repository_arg::is_anonymous_repository_spec_with_bare_dir(&remote));
     let remote_config = if let Some(cfg) = configured_remote {
         cfg
     } else if anonymous {
         RemoteConfig {
             name: repository_arg::anonymous_remote_name(&remote),
-            url: remote.clone(),
+            url: repository_arg::resolve_anonymous_local_spec(&remote),
         }
     } else {
         return Err(CliError::fatal(format!("remote '{remote}' not found"))

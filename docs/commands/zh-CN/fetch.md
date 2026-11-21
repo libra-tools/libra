@@ -10,6 +10,8 @@ libra fetch [OPTIONS] [<repository> [<refspec>]]
 
 ## 说明
 
+未配置为 remote、且指向一个 Libra 仓库的**裸目录名**会按匿名本地仓库解析：先看当前目录，再看其父目录（同级仓库）。此时与 `libra fetch ./<dir>` 完全一致——只写 `FETCH_HEAD`，不创建远端跟踪引用、不写 `remote.<name>` 配置；既非配置 remote 也不是 Libra 仓库的名字仍以 `remote '<name>' not found`（`LBR-CLI-003`）拒绝。
+
 `libra fetch` 联系远程仓库，协商本地存储缺少哪些对象，将它们作为 pack 文件下载，索引该 pack，并更新对应的远程跟踪引用（例如 `refs/remotes/origin/main`）。它永远不会修改工作树或当前分支；要进行这些操作，请使用 `libra pull` 或 `libra merge`。
 
 不带参数调用时，它从当前分支配置的 upstream 获取。已配置的本地 upstream（`branch.<name>.remote=.`）会在任何网络或 `FETCH_HEAD` 写入前被拒绝（`LBR-CLI-003`，退出 129）；Git 2.54 的 `fetch` 可以对本地 upstream 操作——该支持延后到 [issues/480 HP-16](https://github.com/libra-tools/libra/issues/480)。显式仓库参数 `.` 仍走现有的 `remote '.' not found`。给出 `--all` 时，会依次获取每个已配置远程。指定某个 `<repository>` 时，只联系该远程。可选 `<refspec>` 选择一个源引用，并可用 `<src>:<dst>` 精确映射到本地目标。未显式给出 refspec 时会遵守 `remote.<name>.fetch`；该配置不存在时才回退为把所有远程分支映射到 `refs/remotes/<name>/*`。

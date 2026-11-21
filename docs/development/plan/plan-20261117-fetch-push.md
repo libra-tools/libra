@@ -401,7 +401,7 @@ PY
 
 ### Task FP-01: 修复 `libra fetch` 把裸本地仓库目录名当作 remote 名（#719；拆出 FP-23）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `complete`（2026-11-21：`repository_arg` 新增 opt-in `is_anonymous_repository_spec_with_bare_dir`（单组件裸目录名：先看当前目录的 `.libra`，再看父目录的同级仓库）与 `resolve_anonymous_local_spec`（命中后把 spec 解析成可打开的路径）；仅在 `fetch` 接入——已配置的同名 remote 优先，非 Libra 目录仍报 `remote '<name>' not found`（`LBR-CLI-003`）；`pull` 保持原解析（ADR-FP-01）。用例 `test_fetch_bare_directory_name_resolves_as_anonymous` 覆盖 AC1–AC3 及负例：同级 `parent` 仓库的 `main` 写入 `FETCH_HEAD` 首条、`show-ref` 与 `config list` 逐字不变、未知名字仍拒绝。`fetch`/`pull`/`ls_remote` 套件 **129/129**；版本面 0.30.239 → 0.30.240；文档 EN/zh-CN 同步。按用户 2026-11-20 指令在 `main` 直接提交推送。）
 
 **Description:** 按 ADR-FP-01 在 `src/internal/protocol/repository_arg.rs` 新增 opt-in helper `is_anonymous_repository_spec_with_bare_dir`，并只在 `src/command/fetch.rs` 接入：`<repository>` 既不是已配置 remote、又不满足现有 `is_anonymous_repository_spec`，但相对当前目录解析为一个存在的 Libra 仓库目录（含裸仓库）时，按现有匿名本地仓库路径 fetch（与 `./<dir>` 一致：不创建远程跟踪引用、不写 `remote.*` 配置）。已配置的同名 remote 仍优先；既非配置 remote 也非 Libra 仓库目录时保持 `remote '<name>' not found`（`LBR-CLI-003`）。按 G-09 自本卡拆出 `FP-23`（命令行 refspec 的短目标补全与匿名 fetch 写显式目标）。
 

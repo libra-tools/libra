@@ -24,6 +24,13 @@ all advertised branches use the default `refs/remotes/<name>/*` mapping.
 
 A `<repository>` may also be an anonymous local repository spec — a `file://` URL,
 absolute path, or a relative path such as `.` — which fetches into `FETCH_HEAD`
+A bare directory name is resolved as an anonymous local repository when it is not a
+configured remote and it names a Libra repository: the current directory is checked
+first, then its parent (a sibling repository). The fetch then behaves exactly like
+`libra fetch ./<dir>` — it writes only `FETCH_HEAD`, creates no remote-tracking refs
+and no `remote.<name>` configuration. A name that is neither configured nor a Libra
+repository still fails with `remote '<name>' not found` (`LBR-CLI-003`).
+
 only (no tracking ref, no `remote.*` config), matching Git's unnamed-remote
 transport. A configured remote name always wins over a same-named directory. A
 requested remote ref that does not exist reports `couldn't find remote ref

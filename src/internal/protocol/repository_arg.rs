@@ -30,6 +30,58 @@ pub fn is_anonymous_repository_spec(spec: &str) -> bool {
         || spec.starts_with("..\\")
 }
 
+/// Opt-in variant of [`is_anonymous_repository_spec`] that also treats a bare
+/// relative directory name as an anonymous local repository when it resolves to
+/// an existing Libra repository (bare or with a working tree).
+///
+/// Only `fetch` opts in (`ADR-FP-01`): a configured remote of the same name
+/// still wins, and a directory that is not a Libra repository keeps producing
+/// `remote '<name>' not found`.
+pub fn is_anonymous_repository_spec_with_bare_dir(spec: &str) -> bool {
+    if is_anonymous_repository_spec(spec) {
+        return true;
+    }
+    if spec.is_empty() || spec.contains("://") || spec.starts_with('-') {
+        return false;
+    }
+    let path = Path::new(spec);
+    // Only a single relative component that is not `.`/`..` is ambiguous with a
+    // remote name; anything with a separator is already a path.
+    if path.is_absolute() || spec.contains('/') || spec.contains('\\') || matches!(spec, "." | "..")
+    {
+        return false;
+    }
+    // A Libra repository (bare included) always carries a `.libra` directory.
+    // A bare directory name is resolved against the current directory first,
+    // then against its parent, which is how a sibling repository in a work tree
+    // (`sibling-a/`, `sibling-b/`) is addressed without a `../` prefix.
+    if path.join(".libra").is_dir() {
+        return true;
+    }
+    path.parent()
+        .map(|_| Path::new("..").join(path))
+        .is_some_and(|sibling| sibling.join(".libra").is_dir())
+}
+
+/// Resolve a bare-directory anonymous spec to a path the transport can open.
+///
+/// Mirrors [`is_anonymous_repository_spec_with_bare_dir`]: the current directory
+/// wins, then its parent (a sibling repository).
+pub fn resolve_anonymous_local_spec(spec: &str) -> String {
+    if spec.is_empty() || spec.contains('/') || spec.contains('\\') {
+        return spec.to_string();
+    }
+    let path = Path::new(spec);
+    if path.join(".libra").is_dir() {
+        return spec.to_string();
+    }
+    let sibling = Path::new("..").join(path);
+    if sibling.join(".libra").is_dir() {
+        return sibling.to_string_lossy().into_owned();
+    }
+    spec.to_string()
+}
+
 /// Normalize an anonymous repository spec into the canonical URL/transport form
 /// used by the client (relative paths stay relative for Git, which is able to
 /// resolve them in-process). For an HTTP(S)/SSH URL this is the URL itself; for

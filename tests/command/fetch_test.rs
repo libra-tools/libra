@@ -4119,3 +4119,72 @@ fn fetch_prune_honours_command_line_refspec_scope() {
     );
     assert!(!tracking("extrabranch"), "AC5: the stale ref is pruned");
 }
+
+#[test]
+fn test_fetch_bare_directory_name_resolves_as_anonymous() {
+    use crate::command::{assert_cli_success, run_libra_command};
+
+    let work = tempdir().expect("work dir");
+    // `parent` and `child` are siblings: `libra fetch parent` runs inside child.
+    let parent = work.path().join("parent");
+    std::fs::create_dir_all(&parent).expect("mkdir parent");
+    assert_cli_success(&run_libra_command(&["init"], &parent), "init parent");
+    run_libra_command(&["config", "set", "user.name", "t"], &parent);
+    run_libra_command(&["config", "set", "user.email", "t@t"], &parent);
+    std::fs::write(parent.join("f.txt"), "x\n").expect("write f");
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], &parent), "stage f");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c1", "--no-verify"], &parent),
+        "commit c1",
+    );
+    let parent_main = {
+        let out = run_libra_command(&["rev-parse", "main"], &parent);
+        assert_cli_success(&out, "resolve parent main");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+
+    let child = work.path().join("child");
+    std::fs::create_dir_all(&child).expect("mkdir child");
+    assert_cli_success(&run_libra_command(&["init"], &child), "init child");
+    run_libra_command(&["config", "set", "user.name", "t"], &child);
+    run_libra_command(&["config", "set", "user.email", "t@t"], &child);
+    std::fs::write(child.join("g.txt"), "y\n").expect("write g");
+    assert_cli_success(&run_libra_command(&["add", "g.txt"], &child), "stage g");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c0", "--no-verify"], &child),
+        "commit c0",
+    );
+
+    let refs_before = run_libra_command(&["show-ref"], &child).stdout;
+    let config_before = run_libra_command(&["config", "list"], &child).stdout;
+
+    // A bare directory name that is not a configured remote resolves to the
+    // sibling Libra repository and is fetched anonymously.
+    let out = run_libra_command(&["fetch", "parent", "refs/heads/main"], &child);
+    assert_cli_success(&out, "AC1: anonymous fetch of a sibling repository");
+    let fetch_head = std::fs::read_to_string(child.join(".libra/FETCH_HEAD")).expect("FETCH_HEAD");
+    let first_oid = fetch_head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().next())
+        .unwrap_or_default()
+        .to_string();
+    assert_eq!(first_oid, parent_main, "AC1: the fetched tip");
+
+    // AC2: no reference state changed.
+    let refs_after = run_libra_command(&["show-ref"], &child).stdout;
+    assert_eq!(refs_after, refs_before, "AC2: refs are untouched");
+
+    // AC3: no configuration rows were written.
+    let config_after = run_libra_command(&["config", "list"], &child).stdout;
+    assert_eq!(config_after, config_before, "AC3: config is untouched");
+
+    // A name that is neither configured nor a Libra repository stays an error.
+    let out = run_libra_command(&["fetch", "nosuchdir", "refs/heads/main"], &child);
+    assert!(!out.status.success(), "unknown names must still fail");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("LBR-CLI-003"),
+        "unknown names keep the stable code: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
