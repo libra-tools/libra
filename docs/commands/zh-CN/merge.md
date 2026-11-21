@@ -236,6 +236,8 @@ Libra 接受 `conflict`，以及 `true`/`false` 的 Git 兼容布尔拼写（包
 
 ## 选项
 
+当 `core.sparseCheckout=true` 时本命令以 `LBR-UNSUPPORTED-001` fail-closed：它会围绕整棵树改写工作区（或索引/stash），而不是稀疏视图（稀疏 cone 物化尚未实现）。
+
 | 选项 | 说明 |
 |--------|-------------|
 | `<branch>...` | 一个或多个目标分支、提交或远程跟踪引用；两个及以上进入原子 octopus 路径。 |

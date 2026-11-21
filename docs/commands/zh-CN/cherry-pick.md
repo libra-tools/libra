@@ -44,6 +44,8 @@ libra cherry-pick (--continue | --skip | --abort | --quit)
 
 ## 选项
 
+当 `core.sparseCheckout=true` 时本命令以 `LBR-UNSUPPORTED-001` fail-closed：它会围绕整棵树改写工作区（或索引/stash），而不是稀疏视图（稀疏 cone 物化尚未实现）。
+
 ### `-n`, `--no-commit`
 
 将源提交的更改应用到索引和工作树，但**不**创建新提交。这样你可以在手动运行 `libra commit` 前检查或组合更改。

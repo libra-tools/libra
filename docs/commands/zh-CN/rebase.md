@@ -47,6 +47,8 @@ Rebase 状态（剩余和已完成提交列表、原始 HEAD 和目标 base）�
 
 ## 选项
 
+当 `core.sparseCheckout=true` 时本命令以 `LBR-UNSUPPORTED-001` fail-closed：它会围绕整棵树改写工作区（或索引/stash），而不是稀疏视图（稀疏 cone 物化尚未实现）。
+
 | 选项 | 长选项 | 说明 |
 |--------|------|-------------|
 | `<upstream>` | | 要 rebase 到的 upstream 分支或提交。除非指定 `--continue`、`--abort`、`--skip` 或 `--root`，否则必需。可以是分支名、提交哈希或任何 Git 引用。 |

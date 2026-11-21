@@ -56,6 +56,8 @@ fast-forward 与 already-up-to-date 不读取该配置。任意 clean/smudge fil
 
 ## 选项
 
+当 `core.sparseCheckout=true` 时本命令以 `LBR-UNSUPPORTED-001` fail-closed：它会围绕整棵树改写工作区（或索引/stash），而不是稀疏视图（稀疏 cone 物化尚未实现）。
+
 | 标志 / 参数 | 说明 | 示例 |
 |-----------------|-------------|---------|
 | `<repository>` | 要从中 pull 的远程名称。省略时使用当前分支已配置的 upstream。 | `libra pull origin` |

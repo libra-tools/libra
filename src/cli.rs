@@ -1914,7 +1914,15 @@ fn pointer_layout_permits(command: &Commands) -> bool {
 async fn enforce_sparse_checkout_guard(command: &Commands) -> CliResult<()> {
     let guarded = matches!(
         command,
-        Commands::Checkout(_) | Commands::Switch(_) | Commands::Reset(_) | Commands::Restore(_)
+        Commands::Checkout(_)
+            | Commands::Switch(_)
+            | Commands::Reset(_)
+            | Commands::Restore(_)
+            | Commands::Merge(_)
+            | Commands::Pull(_)
+            | Commands::Rebase(_)
+            | Commands::CherryPick(_)
+            | Commands::Stash(_)
     );
     if !guarded {
         return Ok(());

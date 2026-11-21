@@ -48,6 +48,8 @@ Worktree materialization is mode-aware (plan issues/470 FM-02): files are create
 
 ## Options
 
+When `core.sparseCheckout=true` this command fails closed with `LBR-UNSUPPORTED-001`: it would rewrite the working tree (or the index/stash) around the whole tree instead of the sparse view (sparse cone materialisation is not implemented yet).
+
 | Option | Long | Description |
 |--------|------|-------------|
 | `<upstream>` | | The upstream branch or commit to rebase onto. Required unless `--continue`, `--abort`, `--skip`, or `--root` is specified. Can be a branch name, commit hash, or any Git reference. |

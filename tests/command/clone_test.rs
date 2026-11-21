@@ -4868,6 +4868,71 @@ fn test_sparse_preflight_checkout_switch_reset_restore() {
 }
 
 #[test]
+fn test_sparse_preflight_merge_pull_rebase_cherry_pick_stash() {
+    use crate::command::{assert_cli_success, run_libra_command};
+
+    let repo = tempdir().expect("repo");
+    let rp = repo.path();
+    assert_cli_success(&run_libra_command(&["init"], rp), "init");
+    run_libra_command(&["config", "set", "user.name", "t"], rp);
+    run_libra_command(&["config", "set", "user.email", "t@t"], rp);
+    std::fs::write(rp.join("a.txt"), "one\n").expect("write a");
+    assert_cli_success(&run_libra_command(&["add", "a.txt"], rp), "stage a");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "s1", "--no-verify"], rp),
+        "commit s1",
+    );
+    let s1 = {
+        let out = run_libra_command(&["rev-parse", "HEAD"], rp);
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    assert_cli_success(
+        &run_libra_command(&["branch", "other", &s1], rp),
+        "create other",
+    );
+    assert_cli_success(
+        &run_libra_command(&["branch", "topic", &s1], rp),
+        "create topic",
+    );
+    assert_cli_success(&run_libra_command(&["switch", "topic"], rp), "switch topic");
+    std::fs::write(rp.join("a.txt"), "topic\n").expect("rewrite a on topic");
+    assert_cli_success(&run_libra_command(&["add", "a.txt"], rp), "stage topic");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "topic", "--no-verify"], rp),
+        "commit topic",
+    );
+    assert_cli_success(&run_libra_command(&["switch", "main"], rp), "back to main");
+    std::fs::write(rp.join("a.txt"), "two\n").expect("rewrite a on main");
+    assert_cli_success(&run_libra_command(&["add", "a.txt"], rp), "stage s2");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "s2", "--no-verify"], rp),
+        "commit s2",
+    );
+
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "core.sparseCheckout", "true"], rp),
+        "enable sparse checkout",
+    );
+
+    for (label, argv) in [
+        ("AC1", vec!["merge", "topic"]),
+        ("AC2", vec!["pull"]),
+        ("AC3", vec!["rebase", "topic"]),
+        ("AC4", vec!["cherry-pick", "topic"]),
+        ("AC5", vec!["stash", "push"]),
+    ] {
+        std::fs::write(rp.join("a.txt"), "dirty\n").expect("dirty a");
+        let out = run_libra_command(&argv, rp);
+        assert!(!out.status.success(), "{label}: {argv:?} must be refused");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("LBR-UNSUPPORTED-001"),
+            "{label}: {argv:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+#[test]
 fn test_clone_reject_shallow_local_git_source() {
     use super::{create_linear_git_repo, git_success, run_libra_command};
 

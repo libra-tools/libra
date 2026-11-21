@@ -1852,7 +1852,7 @@ PY
 ### Task CL-27: 在 `cli.rs` 为稀疏工作区的历史类命令增加 `fail-closed` 护栏（#756）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `complete`（2026-11-21：`enforce_sparse_checkout_guard` 的 `matches!` 名单扩展为 `merge`/`pull`/`rebase`/`cherry-pick`/`stash`（与 CL-26 共用同一中枢护栏，均在 `command_preflight` 之前、仓库外直接放行）。用例 `test_sparse_preflight_merge_pull_rebase_cherry_pick_stash` 覆盖 AC1–AC5（五条命令均以 `LBR-UNSUPPORTED-001` 拒绝）；`merge/pull/rebase/cherry_pick/stash` 相关套件 **585/585**；版本面 0.30.235 → 0.30.236；五命令 EN/zh-CN 文档与 `COMPATIBILITY.md` 同步。按用户 2026-11-20 指令在 `main` 直接提交推送。）
 **Description:** 自 `CL-26` 拆出（G-09）：在同一 `command_preflight` 护栏上覆盖 `merge`、`pull`、`rebase`、`cherry-pick`、`stash`。只有目录重命名合并的解禁由 `CL-20` 承接，其它 `merge` 继续拒绝；本卡 AC1 使用内容修改合并夹具，因而在最终树上继续成立。
 **Out of scope:** `checkout`/`switch`/`reset`/`restore`（`CL-26`）；`merge` 稀疏 lazy fetch 解禁（`CL-20`）。
 **Current evidence:**

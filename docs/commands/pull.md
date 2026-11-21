@@ -96,6 +96,8 @@ these modes warn and are not authorization for remote synchronization.
 
 ## Options
 
+When `core.sparseCheckout=true` this command fails closed with `LBR-UNSUPPORTED-001`: it would rewrite the working tree (or the index/stash) around the whole tree instead of the sparse view (sparse cone materialisation is not implemented yet).
+
 | Flag / Argument | Description | Example |
 |-----------------|-------------|---------|
 | `<repository>` | Remote name to pull from. When omitted, uses the current branch's configured upstream. | `libra pull origin` |

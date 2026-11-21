@@ -35,6 +35,8 @@ Stash 条目以特殊结构的提交对象存储在 `.libra/refs/stash` 下，�
 
 ## 选项
 
+当 `core.sparseCheckout=true` 时本命令以 `LBR-UNSUPPORTED-001` fail-closed：它会围绕整棵树改写工作区（或索引/stash），而不是稀疏视图（稀疏 cone 物化尚未实现）。
+
 ### 子命令
 
 #### `push`
