@@ -1335,7 +1335,7 @@ PY
 ### Task CL-18: 实现 `clone --dissociate` 拷贝借用对象并解除 alternates（#751）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `complete`（2026-11-20：`--dissociate` 现使克隆自包含——既不登记 `objects/info/alternates`，也不走 CL-10 的「借用参考库、跳过传输」路径（`reference_alternate` 在 `!args.dissociate` 时才为真），因此对象完整复制。用例 `clone_reference_dissociate_is_self_contained` 覆盖 AC1（无 alternates）、AC2（`--json` 的 `objects_fetched > 0`）、AC3（删除 R 后 `fsck` 通过）、AC4（`--shared --dissociate` 无 alternates）、AC5（删除源后 `fsck` 通过）；`clone_test` 全模块 61 passed；版本面 patch 0.30.224 → 0.30.225。按用户 2026-11-20 指令在 `main` 直接提交推送。）
 **Description:** 自 `CL-10` 拆出：在 `clone --reference <ref> --dissociate` 与 `clone --shared --dissociate` 完成后，分别补全本地缺失对象拷贝并移除 `objects/info/alternates`，保证两种克隆库都完全独立。`--shared --dissociate` 已由既有实现以「不注册 alternates」处理（`src/command/clone.rs:178-182,1567`），`CL-08` 之后其对象按本地克隆规则硬链接或复制——两者都使目标在删除源后完整可读（与 Git 默认本地克隆的硬链接独立性一致），本卡对它只补回归验收（AC4–AC5），不要求对象为独立副本；`--reference --dissociate` 依赖 `CL-10` 新增的借用，是本卡的实现部分。
 **Out of scope:** `--reference` 初始借用协商（`CL-10`）。
 **Current evidence:**

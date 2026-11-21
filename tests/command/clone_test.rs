@@ -5029,3 +5029,82 @@ fn clone_reference_registers_the_object_alternate() {
         "AC5: no alternate is registered for a missing reference"
     );
 }
+
+#[test]
+fn clone_reference_dissociate_is_self_contained() {
+    use crate::command::{assert_cli_success, create_committed_repo_via_cli, run_libra_command};
+
+    let src = create_committed_repo_via_cli();
+    let root = tempdir().unwrap();
+    let reference = root.path().join("R");
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "clone",
+                src.path().to_str().expect("src"),
+                reference.to_str().expect("reference"),
+            ],
+            root.path(),
+        ),
+        "clone the reference repository",
+    );
+
+    // AC1/AC2: `--dissociate` copies instead of borrowing.
+    let d = root.path().join("d");
+    let out = run_libra_command(
+        &[
+            "clone",
+            "--json",
+            "--reference",
+            reference.to_str().expect("reference"),
+            "--dissociate",
+            &format!("file://{}", src.path().display()),
+            d.to_str().expect("dest"),
+        ],
+        root.path(),
+    );
+    assert_cli_success(&out, "clone --reference --dissociate");
+    assert!(
+        !d.join(".libra/objects/info/alternates").exists(),
+        "AC1: --dissociate must not register an alternate"
+    );
+    let payload = String::from_utf8_lossy(&out.stdout);
+    let value: serde_json::Value = serde_json::from_str(payload.trim()).expect("clone json");
+    assert!(
+        value["data"]["objects_fetched"].as_u64().unwrap_or(0) > 0,
+        "AC2: --dissociate transfers the objects: {payload}"
+    );
+
+    // AC3: the clone survives deleting the reference.
+    std::fs::remove_dir_all(&reference).expect("remove the reference");
+    assert_cli_success(
+        &run_libra_command(&["fsck"], &d),
+        "AC3: fsck after deleting the reference",
+    );
+
+    // AC4/AC5: `--shared --dissociate` is self-contained too.
+    let src2 = create_committed_repo_via_cli();
+    let d2 = root.path().join("d2");
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "clone",
+                "--shared",
+                "--dissociate",
+                src2.path().to_str().expect("src"),
+                d2.to_str().expect("dest"),
+            ],
+            root.path(),
+        ),
+        "clone --shared --dissociate",
+    );
+    assert!(
+        !d2.join(".libra/objects/info/alternates").exists(),
+        "AC4: --shared --dissociate must not register an alternate"
+    );
+    drop(src2);
+    assert_cli_success(
+        &run_libra_command(&["fsck"], &d2),
+        "AC5: fsck after deleting the source",
+    );
+}

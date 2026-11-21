@@ -1972,7 +1972,9 @@ async fn clone_into_destination(
     // borrowed. `--reference` requires the path to exist; `--reference-if-able`
     // silently skips a missing one.
     let mut reference_alternate = false;
-    if !args.no_local {
+    // `--dissociate` keeps the clone self-contained: never register (or borrow
+    // from) the reference store.
+    if !args.no_local && !args.dissociate {
         let mut references: Vec<PathBuf> = args
             .reference
             .iter()
