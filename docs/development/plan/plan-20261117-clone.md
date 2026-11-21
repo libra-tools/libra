@@ -1285,7 +1285,7 @@ PY
 ### Task CL-10: 实现 `clone --reference` / `--reference-if-able` alternates 借用（#751）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `blocked` / `空`（2026-11-20：`DEP-CL-04` 要求 `plan-20261117-fetch-push.md#FP-07` 与 `FP-15` 先合入 `src/command/fetch.rs` 与 `COMPATIBILITY.md`；核验二者当前仍为 `pending`，故本卡按依赖语义置 `blocked`，其后串行链 `CL-18 → CL-19 → CL-12 → CL-13 → CL-24 → CL-29 → CL-21 → CL-14 → …` 同步不可开工。实现方案已勘察完毕：`--reference` 场景不调用 fetch，改由 `discovery.refs` 写 `refs/remotes/<remote>/*` 与 HEAD，并提前注册 `objects/info/alternates`；`fetch` 的 `have` 来自 `current_have_safe`（本地引用），全新克隆为空，因此提前注册 alternates 不足以让 `objects_fetched == 0`。2026-11-20 补充：解除本卡阻塞需要 `fetch-push` 计划内的串行链 `FP-13 → FP-14 → FP-15`（`FP-14` 依赖 `FP-13`，`FP-15` 依赖 `FP-14`），当前 `FP-13`/`FP-14`/`FP-15` 均为 `pending`；`FP-07` 已完成（`0.30.220`）。）
+**Lifecycle / Acceptance:** `pending` / `空`（2026-11-20 解除阻塞：`DEP-CL-04` 的两项前置 `FP-07`（默认远端回退）与 `FP-15`（`--prune` 候选范围）均已在 `main` 完成（`0.30.220` / `0.30.223`），整条 `FP-13 → FP-14 → FP-15` 串行链已交付；本卡与后续 clone 链恢复可开工。实现方案见下方勘察记录。）
 **Description:** 复用既有 alternates 支持（`src/command/alternates.rs` 与 `clone.rs:1554-1735` `--shared` 注册逻辑）使 `--reference <ref>`（及 `--reference-if-able`）真正注册 `objects/info/alternates` 并在 `fetch` / 协商阶段借用参考库对象以跳过重复传输（并将过时测试 `test_clone_object_alternates_flags_are_noops` 重命名/重写为 `test_clone_reference_alternates_borrows_objects` 与 `test_clone_reference_if_able_and_invalid_repo`）。（按 G-09 自本卡拆出 `CL-18` 处理 `--dissociate`。）
 **Out of scope:** `--dissociate`（由 `CL-18` 承接）。
 **Current evidence:**
