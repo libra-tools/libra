@@ -1536,7 +1536,7 @@ PY
 
 ### Task FP-16: `fetch --tags` 拒绝覆盖冲突的本地 tag 并整体失败（#873）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `complete`（2026-11-21：`persist_fetched_tags` 新增 `fail_on_conflict`（仅 `--tags` 即 `TagFetchMode::All` 为真）——同名不同目标且未 `--force` 时保留本地 tag、把该 ref 记入 `rejected`，事务提交后逐条输出 ` ! [rejected] <tag> -> <tag>  (would clobber existing tag)` 并以新增 `FetchError::TagConflict` 整体失败（`LBR-CONFLICT-002`，fetch/pull 双侧映射）；自动跟随模式保持原行为（跳过 + tracing 警告，不失败）。强制更新 tag 的人读行改为 Git 的 ` t [tag update]`。用例 `test_fetch_tags_rejects_conflicting_local_tag` 覆盖 AC1–AC7；既有 `test_fetch_tags_does_not_clobber_existing_local_tag` 的过渡断言随语义更新（现在失败但仍保留本地 tag）。`fetch`/`pull`/`clone` 套件 **195/195**；版本面 0.30.248 → 0.30.249；文档 EN/zh-CN 同步。按用户 2026-11-20 指令在 `main` 直接提交推送。）
 
 **Description:** `--tags` 获取的 tag 与本地同名 tag 指向不同对象且未给 `--force` 时：保留本地 tag、在人读报告中输出 ` ! [rejected] <src> -> <dst>  (would clobber existing tag)` 行、继续写入同批其它非冲突 tag，全部完成后以 `LBR-CONFLICT-002` 整体失败；给 `--force` 时更新该 tag 并输出 ` t [tag update] <src> -> <dst>` 行。默认自动跟随（未给 `--tags`）不更新已存在的本地 tag、也不因此失败（与 Git 一致）。
 

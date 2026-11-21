@@ -1915,9 +1915,18 @@ async fn test_fetch_tags_does_not_clobber_existing_local_tag() {
         "local tag light-1",
     );
 
-    assert_cli_success(
-        &run_libra_command(&["fetch", "origin", "--tags"], &repo_dir),
-        "fetch origin --tags",
+    // `--tags` now reports the clobber attempt and fails the fetch as a whole
+    // (plan-20261117-fetch-push FP-16), while still keeping the local tag.
+    let out = run_libra_command(&["fetch", "origin", "--tags"], &repo_dir);
+    assert!(
+        !out.status.success(),
+        "fetch --tags must fail on a clobbering tag"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("LBR-CONFLICT-002"), "FP-16: {stderr}");
+    assert!(
+        stderr.contains("would clobber existing tag"),
+        "FP-16: {stderr}"
     );
 
     // The local tag must still resolve to the local commit (not clobbered).
@@ -4288,4 +4297,119 @@ fn test_fetch_short_destination_completion_and_anonymous_targets() {
         "AC6: {stderr}"
     );
     assert_eq!(show(&child), before_tags, "AC7: nothing was written");
+}
+
+#[test]
+fn test_fetch_tags_rejects_conflicting_local_tag() {
+    use crate::command::{assert_cli_success, run_libra_command};
+
+    // `s` has an E1 commit with `tag-1` and `tag-2`; `c` is an unrelated clone
+    // with its own `tag-1`; `s` then advances to E2 and moves `tag-1`.
+    let work = tempfile::tempdir().expect("work dir");
+    let s = work.path().join("s");
+    std::fs::create_dir_all(&s).expect("mkdir s");
+    assert_cli_success(&run_libra_command(&["init"], &s), "init s");
+    run_libra_command(&["config", "set", "user.name", "t"], &s);
+    run_libra_command(&["config", "set", "user.email", "t@t"], &s);
+    std::fs::write(s.join("f.txt"), "e1\n").expect("write e1");
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], &s), "stage E1");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "E1", "--no-verify"], &s),
+        "commit E1",
+    );
+    let e1 = {
+        let out = run_libra_command(&["rev-parse", "HEAD"], &s);
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    assert_cli_success(&run_libra_command(&["tag", "tag-1"], &s), "tag-1 at E1");
+    assert_cli_success(&run_libra_command(&["tag", "tag-2"], &s), "tag-2 at E1");
+
+    let c = work.path().join("c");
+    std::fs::create_dir_all(&c).expect("mkdir c");
+    assert_cli_success(&run_libra_command(&["init"], &c), "init c");
+    run_libra_command(&["config", "set", "user.name", "t"], &c);
+    run_libra_command(&["config", "set", "user.email", "t@t"], &c);
+    std::fs::write(c.join("g.txt"), "x\n").expect("write g");
+    assert_cli_success(&run_libra_command(&["add", "g.txt"], &c), "stage X");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "X", "--no-verify"], &c),
+        "commit X",
+    );
+    let local_tag = {
+        let out = run_libra_command(&["rev-parse", "HEAD"], &c);
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    assert_cli_success(&run_libra_command(&["tag", "tag-1"], &c), "local tag-1");
+    assert_cli_success(
+        &run_libra_command(&["remote", "add", "origin", s.to_str().expect("s")], &c),
+        "add origin",
+    );
+
+    std::fs::write(s.join("f.txt"), "e2\n").expect("write e2");
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], &s), "stage E2");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "E2", "--no-verify"], &s),
+        "commit E2",
+    );
+    let e2 = {
+        let out = run_libra_command(&["rev-parse", "HEAD"], &s);
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    assert_cli_success(
+        &run_libra_command(&["tag", "-f", "tag-1"], &s),
+        "move tag-1",
+    );
+
+    let tag_of = |repo: &std::path::Path, name: &str| {
+        let out = run_libra_command(&["rev-parse", &format!("refs/tags/{name}")], repo);
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+
+    // AC1–AC4: the conflict fails the fetch but the other tag still lands.
+    let out = run_libra_command(&["fetch", "--tags"], &c);
+    assert!(
+        !out.status.success(),
+        "AC1: the conflicting tag fails the fetch"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("LBR-CONFLICT-002"), "AC1: {stderr}");
+    assert!(stderr.contains("tag-1"), "AC2: {stderr}");
+    assert_eq!(tag_of(&c, "tag-1"), local_tag, "AC3: the local tag is kept");
+    assert_eq!(tag_of(&c, "tag-2"), e1, "AC4: the other tag was written");
+
+    // AC5/AC6: `--force` moves the tag and reports a tag update.
+    let out = run_libra_command(&["fetch", "--tags", "--force"], &c);
+    assert_cli_success(&out, "AC5: --force updates the tag");
+    assert_eq!(tag_of(&c, "tag-1"), e2, "AC5: tag-1 points at E2");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("tag-1"),
+        "AC6: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // AC7: auto-follow never clobbers an existing local tag.
+    let c2 = work.path().join("c2");
+    std::fs::create_dir_all(&c2).expect("mkdir c2");
+    assert_cli_success(&run_libra_command(&["init"], &c2), "init c2");
+    run_libra_command(&["config", "set", "user.name", "t"], &c2);
+    run_libra_command(&["config", "set", "user.email", "t@t"], &c2);
+    std::fs::write(c2.join("h.txt"), "y\n").expect("write h");
+    assert_cli_success(&run_libra_command(&["add", "h.txt"], &c2), "stage Y");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "Y", "--no-verify"], &c2),
+        "commit Y",
+    );
+    assert_cli_success(&run_libra_command(&["tag", "tag-1"], &c2), "local tag-1");
+    let kept = tag_of(&c2, "tag-1");
+    assert_cli_success(
+        &run_libra_command(&["remote", "add", "origin", s.to_str().expect("s")], &c2),
+        "add origin",
+    );
+    let out = run_libra_command(&["fetch"], &c2);
+    assert_cli_success(&out, "AC7: a plain fetch succeeds");
+    assert_eq!(
+        tag_of(&c2, "tag-1"),
+        kept,
+        "AC7: the local tag is untouched"
+    );
 }

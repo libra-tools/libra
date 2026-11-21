@@ -50,6 +50,8 @@ libra config set --add remote.origin.fetch \
 
 ## 选项
 
+使用 `--tags` 时，若远端 tag 与本地同名 tag 指向不同对象，会输出 ` ! [rejected] <tag> -> <tag>  (would clobber existing tag)`：保留本地 tag、同批其它 tag 仍写入，随后整次 fetch 以 `LBR-CONFLICT-002` 失败。`--tags --force` 改为移动该 tag（` t [tag update]`）。未给 `--tags` 的自动跟随不会覆盖已存在的本地 tag，也不会因此失败。
+
 | 标志 / 参数 | 说明 | 示例 |
 |-----------------|-------------|---------|
 | `<repository>` | 要从中 fetch 的远程名称或 URL。省略时使用当前分支的 upstream 远程。 | `libra fetch origin` |

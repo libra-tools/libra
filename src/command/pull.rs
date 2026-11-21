@@ -1057,6 +1057,9 @@ fn map_fetch_error_to_cli(error: &fetch::FetchError) -> CliError {
         }
         fetch::FetchError::InvalidRefspec { .. } => CliError::command_usage(error.to_string())
             .with_stable_code(StableErrorCode::CliInvalidArguments),
+        fetch::FetchError::TagConflict { .. } => CliError::failure(error.to_string())
+            .with_stable_code(StableErrorCode::ConflictOperationBlocked)
+            .with_hint("pass --force to overwrite the local tag"),
         fetch::FetchError::ConfigRead { .. } => {
             CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
         }

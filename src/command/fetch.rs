@@ -1023,6 +1023,8 @@ pub enum FetchError {
     RemoteBranchNotFound { branch: String, remote: String },
     #[error("invalid fetch refspec '{refspec}': {reason}")]
     InvalidRefspec { refspec: String, reason: String },
+    #[error("refusing to clobber the existing tag(s): {tags} (use --force to overwrite)")]
+    TagConflict { tags: String },
     #[error("failed to read fetch configuration '{key}': {message}")]
     ConfigRead { key: String, message: String },
     #[error("failed to fetch objects from '{remote}': {source}")]
@@ -1135,6 +1137,9 @@ impl From<FetchError> for CliError {
             FetchError::RemoteBranchNotFound { .. } => CliError::command_usage(error.to_string())
                 .with_stable_code(StableErrorCode::CliInvalidTarget)
                 .with_hint("verify the remote branch name and try again"),
+            FetchError::TagConflict { .. } => CliError::failure(error.to_string())
+                .with_stable_code(StableErrorCode::ConflictOperationBlocked)
+                .with_hint("pass --force to overwrite the local tag"),
             FetchError::InvalidRefspec { .. } => CliError::command_usage(error.to_string())
                 .with_stable_code(StableErrorCode::CliInvalidArguments)
                 .with_hint(
@@ -1833,7 +1838,10 @@ fn render_fetch_output(
                 Some(old_oid) => {
                     let old_short = &old_oid[..7.min(old_oid.len())];
                     let new_short = &update.new_oid[..7.min(update.new_oid.len())];
-                    if update.forced {
+                    if update.forced && is_tag {
+                        // Git renders a forced tag move as ` t [tag update]`.
+                        ('t', "[tag update]".to_string())
+                    } else if update.forced {
                         ('+', format!("{old_short}...{new_short}"))
                     } else {
                         (' ', format!("{old_short}..{new_short}"))
@@ -3058,7 +3066,14 @@ async fn fetch_repository_with_result_reusing(
         oid: tag._hash.clone(),
         source_ref: tag._ref.clone(),
     }));
-    refs_updated.extend(persist_fetched_tags(&tags_to_persist, force).await?);
+    refs_updated.extend(
+        persist_fetched_tags(
+            &tags_to_persist,
+            force,
+            matches!(tag_mode, TagFetchMode::All),
+        )
+        .await?,
+    );
 
     // Dependency-graph notes (`refs/notes/deps`, lore.md 3.2). When `--notes` (or
     // the persisted `remote.<name>.fetchNotesDeps` opt-in) is set, pull the
@@ -5456,6 +5471,7 @@ fn select_autofollow_tags(
 async fn persist_fetched_tags(
     tags: &[DiscRef],
     force: bool,
+    fail_on_conflict: bool,
 ) -> Result<Vec<FetchRefUpdate>, FetchError> {
     if tags.is_empty() {
         return Ok(Vec::new());
@@ -5467,6 +5483,7 @@ async fn persist_fetched_tags(
     crate::internal::db::write_transaction(&db, |txn| {
         Box::pin(async move {
             let mut updates = Vec::new();
+            let mut rejected: Vec<String> = Vec::new();
             for tag in &tags {
                 if tag._ref.ends_with("^{}") || !tag._ref.starts_with("refs/tags/") {
                     continue;
@@ -5477,7 +5494,8 @@ async fn persist_fetched_tags(
                     .one(txn)
                     .await
                     .map_err(|error| FetchError::UpdateRefs {
-                        message: format!("failed to inspect existing tag '{}': {error}", tag._ref)})?;
+                        message: format!("failed to inspect existing tag '{}': {error}", tag._ref),
+                    })?;
                 match existing {
                     Some(row) if row.commit.as_deref() == Some(tag._hash.as_str()) => {
                         // Already up to date — nothing to report.
@@ -5493,12 +5511,21 @@ async fn persist_fetched_tags(
                                 message: format!(
                                     "failed to force-update tag '{}': {source}",
                                     tag._ref
-                                )})?;
+                                ),
+                            })?;
                         updates.push(FetchRefUpdate {
                             remote_ref: tag._ref.clone(),
                             old_oid: old,
                             new_oid: tag._hash.clone(),
-                            forced: true});
+                            forced: true,
+                        });
+                    }
+                    Some(_) if fail_on_conflict => {
+                        // Keep the local tag but remember the rejection: the
+                        // fetch reports it and fails as a whole once the other
+                        // tags of this batch have landed (Git parity). An
+                        // auto-follow fetch (no `--tags`) never fails here.
+                        rejected.push(tag._ref.clone());
                     }
                     Some(_) => {
                         tracing::warn!(
@@ -5517,23 +5544,39 @@ async fn persist_fetched_tags(
                             .insert(txn)
                             .await
                             .map_err(|source| FetchError::UpdateRefs {
-                                message: format!("failed to persist tag '{}': {source}", tag._ref)})?;
+                                message: format!("failed to persist tag '{}': {source}", tag._ref),
+                            })?;
                         updates.push(FetchRefUpdate {
                             remote_ref: tag._ref.clone(),
                             old_oid: None,
                             new_oid: tag._hash.clone(),
-                            forced: false});
+                            forced: false,
+                        });
                     }
                 }
             }
-            Ok::<_, FetchError>(updates)
+            Ok::<_, FetchError>((updates, rejected))
         })
     })
     .await
     .map_err(|source| FetchError::UpdateRefs {
         message: match source {
             TransactionError::Connection(error) => error.to_string(),
-            TransactionError::Transaction(error) => error.to_string()}})
+            TransactionError::Transaction(error) => error.to_string(),
+        },
+    })
+    .and_then(|(updates, rejected)| {
+        if rejected.is_empty() {
+            return Ok(updates);
+        }
+        for name in &rejected {
+            let short = name.strip_prefix("refs/tags/").unwrap_or(name);
+            eprintln!(" ! [rejected]        {short} -> {short}  (would clobber existing tag)");
+        }
+        Err(FetchError::TagConflict {
+            tags: rejected.join(", "),
+        })
+    })
 }
 
 /// Soft cap on the number of commits we walk back from each branch tip when

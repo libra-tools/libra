@@ -176,6 +176,13 @@ libra config remote.origin.prune false  # but never for origin
 
 ## Options
 
+With `--tags`, a fetched tag that collides with a local tag pointing at a
+different object is reported as ` ! [rejected] <tag> -> <tag>  (would clobber
+ existing tag)`: the local tag is kept, the other tags of the batch are still
+written, and the fetch then fails as a whole with `LBR-CONFLICT-002`.
+`--tags --force` moves such a tag instead (` t [tag update]`) . Without `--tags`
+auto-follow never overwrites an existing local tag and never fails for it.
+
 | Flag / Argument | Description | Example |
 |-----------------|-------------|---------|
 | `<repository>` | Remote name or URL to fetch from. When omitted, uses the current branch's upstream remote. | `libra fetch origin` |
