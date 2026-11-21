@@ -28,7 +28,7 @@ Index path spec 解析当前 worktree 的 index：`:<path>` 读取 stage-0 条�
 
 ## 选项
 
-Git describe 名称（`<ref>-<count>-g<hex>`）也可解析：在 tag、本地分支、远程分支的字面查找都未命中后，末尾的对象 ID 即目标提交（如 `v1-2-gabc1234`）；若存在恰为该名字的引用，则字面引用优先。此后缀按 Git 的 `GET_OID_COMMIT` 规则解析：缩写必须无歧义，除非候选中恰有一个提交（该提交胜出）；全长 OID 必须真实存在；含非十六进制字符或少于 4 位的后缀以 `LBR-CLI-003` 失败（不输出歧义候选列表）。
+Git describe 名称（`<ref>-<count>-g<hex>`）也可解析：在 tag、本地分支、远程分支的字面查找都未命中后，末尾的对象 ID 即目标提交（如 `v1-2-gabc1234`）；若存在恰为该名字的引用，则字面引用优先。此后缀按 Git 的 `GET_OID_COMMIT` 规则解析：缩写必须无歧义，除非候选中恰有一个提交（该提交胜出）；全长 OID 必须真实存在；含非十六进制字符或少于 4 位的后缀以 `LBR-CLI-003` 失败（不输出歧义候选列表）；后缀指向附注 tag 对象时返回该 tag 对象本身（不剥皮）。
 ### `--show-ref-storage-format`
 
 输出仓库的引用存储后端。Libra 的引用存于 SQLite，因此始终输出 `sqlite`（Git 的 `files`/`reftable` 后端未实现，见 `COMPATIBILITY.md` 的 intentionally-different）。`--json` 返回 `{"ref_storage_format": "sqlite"}`。

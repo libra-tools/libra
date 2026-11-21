@@ -744,7 +744,7 @@
 
 ### Task DESC-09c: 根命名空间后缀解析附注 tag 对象
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空` | **Priority / Selection:** P1 | **Issue:** [#798](https://github.com/libra-tools/libra/issues/798)、[#799](https://github.com/libra-tools/libra/issues/799)
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `complete`（2026-11-21：`resolve_describe_hash_typed` 的单候选分支本就返回候选对象**自身**（不按类型剥皮），因此附注 tag 对象的缩写/全长后缀直接解析为该 tag 对象——本卡只补回归用例与文档：`describe_suffix_tag_object` 断言 `x-1-g<tag 对象 8 位>` 与 `x-1-g<tag 对象全长>` 的 stdout 恰为 tag 对象 OID（而非其指向的 commit）。`rev_parse_test` **53/53**；文档 EN/zh-CN 同步；版本面 0.30.263 → 0.30.264。本卡为 `REL-DESC-09` 子卡 3/16，只本地签名提交。按用户 2026-11-20 指令在 `main` 直接提交推送。） | **Priority / Selection:** P1 | **Issue:** [#798](https://github.com/libra-tools/libra/issues/798)、[#799](https://github.com/libra-tools/libra/issues/799)
 
 **Description:** 自 `DESC-09` 拆出；家族 `REL-DESC-09` 子卡（3/16）。根命名空间 describe 后缀解析到附注 tag 对象时返回该 tag 对象自身（不剥皮为 commit，对齐 Git）；blob/tree 由同一家族的 `DESC-09a` 放开（家族内实现顺序，不设临时边界判据）。
 

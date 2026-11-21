@@ -1837,3 +1837,53 @@ fn describe_suffix_missing_and_ambiguous() {
     fails("x-1-gzzzzzzzz", "AC6");
     fails(&format!("x-1-g{}", &c1[..3]), "AC7");
 }
+
+#[test]
+fn describe_suffix_tag_object() {
+    use crate::command::{assert_cli_success, run_libra_command};
+
+    let repo = tempfile::tempdir().expect("repo");
+    let p = repo.path();
+    assert_cli_success(&run_libra_command(&["init"], p), "init");
+    run_libra_command(&["config", "set", "user.name", "t"], p);
+    run_libra_command(&["config", "set", "user.email", "t@t"], p);
+    std::fs::write(p.join("f.txt"), "one\n").expect("write f");
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], p), "stage");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c1", "--no-verify"], p),
+        "commit c1",
+    );
+    assert_cli_success(
+        &run_libra_command(&["tag", "-m", "v1", "v1"], p),
+        "annotated v1",
+    );
+    let tag_oid =
+        String::from_utf8_lossy(&run_libra_command(&["rev-parse", "refs/tags/v1"], p).stdout)
+            .trim()
+            .to_string();
+    let commit_oid = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], p).stdout)
+        .trim()
+        .to_string();
+    assert_ne!(tag_oid, commit_oid, "the annotated tag is its own object");
+    let short = &tag_oid[..8];
+
+    let resolve = |spec: &str| run_libra_command(&["rev-parse", spec], p);
+
+    // AC1: the abbreviated suffix resolves to the TAG OBJECT, not its commit.
+    let out = resolve(&format!("x-1-g{short}"));
+    assert_cli_success(&out, "AC1: abbreviated tag object");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        tag_oid,
+        "AC1: the tag object itself, unpeeled"
+    );
+
+    // AC2: same for the full object id.
+    let out = resolve(&format!("x-1-g{tag_oid}"));
+    assert_cli_success(&out, "AC2: full tag object");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        tag_oid,
+        "AC2: the tag object itself, unpeeled"
+    );
+}

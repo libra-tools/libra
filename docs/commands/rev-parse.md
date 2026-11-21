@@ -70,7 +70,8 @@ the commit (`v1-2-gabc1234`). An existing ref with exactly that name still wins.
 The suffix is resolved with Git's `GET_OID_COMMIT` rules: an abbreviated id must
 be unambiguous unless exactly one candidate is a commit (that commit wins), a
 full-length id must exist, and a non-hex or shorter-than-4-character id fails with
-`LBR-CLI-003` (no ambiguity listing is printed).
+`LBR-CLI-003` (no ambiguity listing is printed). An annotated tag object named by
+the suffix resolves to that tag object itself (unpeeled).
 
 | Flag | Description |
 |------|-------------|
