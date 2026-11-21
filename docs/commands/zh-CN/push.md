@@ -31,6 +31,8 @@ LFS 跟踪文件会在 HTTP 推送期间透明上传，不需要单独执行 `lf
 
 ## 选项
 
+`--force-with-lease=<ref>:<expect>` 的期望值按本地修订表达式解析（因此 `main:main^` 表示「远端仍指向我 `main` 的父提交」）。租约不匹配时以 `LBR-CONFLICT-002` 拒绝，诊断含 `stale info`，远端引用不变；租约匹配时允许非快进更新与删除。
+
 `--force` 与 `--force-with-lease` 可以同时使用：`--force` 会覆盖过期的租约（或非快进拒绝）并执行更新，人读输出标记为强制更新（`(forced update)`）；未给 `--force` 时租约不匹配仍会拒绝。
 
 向本地 Libra 仓库推送、且目标仓库已检出该分支时，会读取目标的 `receive.denyCurrentBranch`：`warn` 更新分支并输出 `warning: updating the current branch`，`ignore` 静默更新，其它取值（或未配置）以 `LBR-REPO-003` 拒绝。允许更新时只改目标引用，目标工作区与索引保持不变（与 Git 一致，因此目标随后会把该检出文件报为已修改）。

@@ -3678,3 +3678,150 @@ fn test_push_force_overrides_force_with_lease() {
         String::from_utf8_lossy(&out.stdout)
     );
 }
+
+#[test]
+fn test_push_force_with_lease_resolves_rev_expressions() {
+    use crate::command::{assert_cli_success, run_libra_command};
+
+    // `s` builds A→B and pushes to a bare `o`; `w` clones `o`, commits C and
+    // pushes, so `w` knows C and its `main^` is B.
+    let work = tempfile::tempdir().expect("work dir");
+    let s = work.path().join("s");
+    std::fs::create_dir_all(&s).expect("mkdir s");
+    assert_cli_success(&run_libra_command(&["init"], &s), "init s");
+    run_libra_command(&["config", "set", "user.name", "t"], &s);
+    run_libra_command(&["config", "set", "user.email", "t@t"], &s);
+    std::fs::write(s.join("f.txt"), "a\n").expect("write a");
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], &s), "stage A");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "A", "--no-verify"], &s),
+        "commit A",
+    );
+    std::fs::write(s.join("f.txt"), "b\n").expect("write b");
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], &s), "stage B");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "B", "--no-verify"], &s),
+        "commit B",
+    );
+    let o = work.path().join("o");
+    assert_cli_success(
+        &run_libra_command(&["init", "--bare", "o"], work.path()),
+        "init o",
+    );
+    assert_cli_success(
+        &run_libra_command(&["remote", "add", "origin", o.to_str().expect("o")], &s),
+        "add origin",
+    );
+    assert_cli_success(
+        &run_libra_command(&["push", "origin", "main"], &s),
+        "push B",
+    );
+
+    let w = work.path().join("w");
+    assert_cli_success(
+        &run_libra_command(&["clone", "./o", "w"], work.path()),
+        "clone w",
+    );
+    for (key, value) in [
+        ("user.name", "t"),
+        ("user.email", "t@t"),
+        ("commit.gpgSign", "false"),
+        ("vault.signing", "false"),
+    ] {
+        run_libra_command(&["config", "set", key, value], &w);
+    }
+    std::fs::write(w.join("f.txt"), "c\n").expect("write c");
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], &w), "stage C");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "C", "--no-verify"], &w),
+        "commit C",
+    );
+    assert_cli_success(
+        &run_libra_command(&["push", "origin", "main"], &w),
+        "push C",
+    );
+    let c = {
+        let out = run_libra_command(&["rev-parse", "main"], &w);
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let shown = |repo: &std::path::Path| run_libra_command(&["show-ref"], repo).stdout;
+
+    // AC4/AC5: `main^` resolves to B, the remote is C, so deleting `main` by
+    // lease is stale and changes nothing.
+    let w_refs = shown(&w);
+    let o_refs = shown(&o);
+    let out = run_libra_command(
+        &["push", "--force-with-lease=main:main^", "origin", ":main"],
+        &w,
+    );
+    assert!(
+        !out.status.success(),
+        "AC4: the stale lease refuses the deletion"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("LBR-CONFLICT-002"),
+        "AC4: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("stale info"),
+        "AC4: the diagnostic names the stale lease"
+    );
+    assert_eq!(shown(&w), w_refs, "AC5: the source refs are unchanged");
+    assert_eq!(shown(&o), o_refs, "AC5: the remote refs are unchanged");
+
+    // AC1–AC3: with D on top of C, the full-OID lease `main:main` expects D but
+    // the remote is still C, so the push is stale and nothing moves.
+    std::fs::write(w.join("f.txt"), "d\n").expect("write d");
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], &w), "stage D");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "D", "--no-verify"], &w),
+        "commit D",
+    );
+    let d = {
+        let out = run_libra_command(&["rev-parse", "main"], &w);
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    // Snapshot after the local commit: AC3 compares against the state the push
+    // starts from.
+    let w_refs_before_push = shown(&w);
+    let out = run_libra_command(
+        &["push", "--force-with-lease=main:main", "origin", "main"],
+        &w,
+    );
+    assert!(
+        !out.status.success(),
+        "AC1: the stale lease refuses the push"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("LBR-CONFLICT-002"),
+        "AC1: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("stale info"),
+        "AC2: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        shown(&w),
+        w_refs_before_push,
+        "AC3: the source refs are unchanged"
+    );
+
+    // AC6: the same expression now resolves to C, which the remote still is, so
+    // the lease matches and the push lands.
+    assert_cli_success(
+        &run_libra_command(
+            &["push", "--force-with-lease=main:main^", "origin", "main"],
+            &w,
+        ),
+        "AC6: a matching lease allows the update",
+    );
+    let remote_main =
+        String::from_utf8_lossy(&run_libra_command(&["rev-parse", "main"], &o).stdout)
+            .trim()
+            .to_string();
+    assert_eq!(remote_main, d, "AC6: the remote main moved to D");
+    assert_ne!(remote_main, c, "AC6: it left C behind");
+}

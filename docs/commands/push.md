@@ -75,6 +75,12 @@ these modes warn and are not authorization for remote synchronization.
 
 ## Options
 
+A `--force-with-lease=<ref>:<expect>` expectation is resolved as a local revision
+expression (so `main:main^` means "the remote still points at my `main`'s parent").
+When the lease does not match, the push is refused with `LBR-CONFLICT-002` and the
+diagnostic names the stale lease (`stale info`); the remote is left untouched. A
+matching lease allows non-fast-forward updates and deletions.
+
 `--force` and `--force-with-lease` may be combined: `--force` overrides a stale
 lease (or a non-fast-forward rejection) and performs the update, marking it as a
 forced update in the human output (`(forced update)`). Without `--force`, a lease

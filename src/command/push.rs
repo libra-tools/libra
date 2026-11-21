@@ -309,6 +309,16 @@ pub enum PushError {
         remote_ref: String,
     },
 
+    #[error(
+        "cannot push to '{remote_ref}': stale info — the lease expects {expected}, \
+         but the remote ref is {found}"
+    )]
+    StaleLease {
+        remote_ref: String,
+        expected: String,
+        found: String,
+    },
+
     #[error("remote object format '{remote}' does not match local '{local}'")]
     HashKindMismatch { remote: String, local: String },
 
@@ -480,6 +490,9 @@ impl From<PushError> for CliError {
                 .with_hint(
                     "drop --force-if-includes only if discarding the remote update is intended",
                 ),
+            PushError::StaleLease { .. } => CliError::failure(error.to_string())
+                .with_stable_code(StableErrorCode::ConflictOperationBlocked)
+                .with_hint("fetch first, or pass --force to overwrite intentionally"),
             PushError::NonFastForward { .. } => CliError::fatal(error.to_string())
                 .with_stable_code(StableErrorCode::ConflictOperationBlocked)
                 .with_hint("pull and integrate remote changes first: 'libra pull'")
@@ -1360,6 +1373,7 @@ pub async fn run_push(args: PushArgs, output: &OutputConfig) -> Result<PushOutpu
         let tracking = collect_lease_tracking_oids(&repository, &plans).await;
         // `--force` overrides a stale lease (Git marks the update forced instead
         // of refusing); without it the lease keeps its full strength.
+        let lease = resolve_lease_expectation(lease).await?;
         if !args.force {
             validate_force_with_lease(&lease, &plans, &tracking)?;
         }
@@ -2083,6 +2097,26 @@ fn parse_force_with_lease(raw: &Option<Option<String>>) -> Option<ForceWithLease
     }
 }
 
+/// Resolve a lease `<expect>` revision expression (e.g. `main^`) to a full OID.
+///
+/// Failure keeps the raw value, so an abbreviated hash still compares by prefix.
+async fn resolve_lease_expectation(lease: ForceWithLease) -> Result<ForceWithLease, PushError> {
+    match lease {
+        ForceWithLease::Exact { refname, expect } if !expect.is_empty() => {
+            let resolved = crate::utils::util::resolve_object_spec_with_auto_merge_typed(&expect)
+                .await
+                .ok()
+                .map(|oid| oid.to_string())
+                .unwrap_or(expect.clone());
+            Ok(ForceWithLease::Exact {
+                refname,
+                expect: resolved,
+            })
+        }
+        other => Ok(other),
+    }
+}
+
 /// Whether a full remote ref (`refs/heads/main`) is named by a lease `<refname>`
 /// (which may be short `main` or fully qualified `refs/heads/main`).
 fn lease_ref_matches(remote_ref: &str, name: &str) -> bool {
@@ -2132,9 +2166,14 @@ fn validate_force_with_lease(
             }
         };
         if !lease_oid_matches(expected.as_deref(), plan.update.old_oid.as_deref()) {
-            return Err(PushError::NonFastForward {
-                local_ref: plan.update.local_ref.clone(),
+            return Err(PushError::StaleLease {
                 remote_ref: remote_ref.clone(),
+                expected: expected.clone().unwrap_or_else(|| "(absent)".to_string()),
+                found: plan
+                    .update
+                    .old_oid
+                    .clone()
+                    .unwrap_or_else(|| "(absent)".to_string()),
             });
         }
     }
@@ -4425,11 +4464,11 @@ mod test {
         let ok = vec![lease_plan("refs/heads/main", Some("aaaa"))];
         assert!(validate_force_with_lease(&ForceWithLease::All, &ok, &tracking).is_ok());
 
-        // server moved on → reject
+        // server moved on → reject as a stale lease
         let moved = vec![lease_plan("refs/heads/main", Some("bbbb"))];
         assert!(matches!(
             validate_force_with_lease(&ForceWithLease::All, &moved, &tracking),
-            Err(PushError::NonFastForward { .. })
+            Err(PushError::StaleLease { .. })
         ));
     }
 

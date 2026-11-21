@@ -756,7 +756,7 @@ PY
 
 ### Task FP-21: 无 `--force` 时 `--force-with-lease` 租约语义对齐 Git（#1036；自 FP-06 拆出；拆出 FP-25）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `complete`（2026-11-21：新增 `resolve_lease_expectation`——`Exact{refname, expect}` 的非空 `expect` 经 `util::resolve_object_spec_with_auto_merge_typed` 解析为完整 OID（`main^` 等表达式可用），解析失败保留原值以便缩写前缀比较；新增 `PushError::StaleLease`（诊断含 `stale info`，映射 `LBR-CONFLICT-002`，取代此前的 `NonFastForward`），租约匹配时仍允许非快进与删除。用例 `test_push_force_with_lease_resolves_rev_expressions` 覆盖 AC1–AC6（`main:main` 期望 D≠远端 C → stale 拒绝且源/远端引用不变；`main:main^` 在未提交 D 时解析为 B → 删除 `:main` 被 stale 拒绝；提交 D 后 `main^` 解析为 C=远端 → 推送成功且远端 main 指向 D）；既有单测 `force_with_lease_all_matches_and_rejects` 的期望错误改为 `StaleLease`。`push` 套件 **41/41**、`push` 单测 **83/83**；版本面 0.30.246 → 0.30.247；文档 EN/zh-CN 同步。按用户 2026-11-20 指令在 `main` 直接提交推送。）
 
 **Description:** 对齐 Git 的租约判定：`--force-with-lease=<ref>:<expect>` 的非空 `<expect>` 在本地按修订表达式解析为 OID（如 `main^`）后再与远端比较；`=<ref>` 与裸形式以本地远程跟踪引用为期望值；租约匹配时允许非快进更新与删除；租约不匹配（stale）时以 `LBR-CONFLICT-002` 拒绝该推送、远端引用不变，且诊断含 `stale info`。
 
