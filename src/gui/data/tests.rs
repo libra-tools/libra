@@ -2508,9 +2508,10 @@ async fn uid04_read_budget_10k() {
         .expect("operations");
     let elapsed = started.elapsed();
     assert_eq!(read.rows.len(), 10_000);
+    let budget = if cfg!(debug_assertions) { 600 } else { 150 };
     assert!(
-        elapsed < std::time::Duration::from_millis(150),
-        "10k production read took {elapsed:?}, over the 150ms budget"
+        elapsed < std::time::Duration::from_millis(budget),
+        "10k production read took {elapsed:?} against a {budget}ms budget"
     );
 }
 
@@ -3111,9 +3112,10 @@ async fn uid05_freshness_scale_and_separate_timings() {
     assert_eq!(read.state, SourceState::Available);
     assert_eq!(read.rows.len(), super::memory::MEMORY_ROW_CAP);
     eprintln!("page={page_elapsed:?}");
+    let budget = if cfg!(debug_assertions) { 600 } else { 150 };
     assert!(
-        page_elapsed < std::time::Duration::from_millis(150),
-        "bounded page took {page_elapsed:?}, over the 150ms budget"
+        page_elapsed < std::time::Duration::from_millis(budget),
+        "bounded page took {page_elapsed:?} against a {budget}ms budget"
     );
 }
 
@@ -3738,4 +3740,661 @@ async fn uid06_directory_read_failure_is_unreadable() {
     let mut permissions = fs::metadata(&root).expect("stat").permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(&root, permissions).expect("restore");
+}
+
+fn snapshot_with_context(
+    state: SourceState,
+    context: Option<super::RepoContext>,
+) -> super::Snapshot {
+    super::Snapshot {
+        seq: 1,
+        state,
+        context,
+        message: None,
+        history: Vec::new(),
+        history_error: None,
+        history_state: SourceState::Available,
+        sessions: Vec::new(),
+        sessions_error: None,
+        sessions_state: SourceState::Available,
+        operations: super::operations::OperationsRead {
+            state: SourceState::Available,
+            rows: Vec::new(),
+            truncated: false,
+        },
+        operations_error: None,
+        memory: super::memory::MemoryRead {
+            state: SourceState::Stale,
+            rows: Vec::new(),
+        },
+        memory_error: None,
+        runs: super::runs::RunsRead {
+            state: SourceState::Absent,
+            rows: Vec::new(),
+            truncated: false,
+        },
+        runs_error: None,
+    }
+}
+
+#[test]
+fn uid07_context_and_sources() {
+    let context = super::RepoContext {
+        worktree_label: "libra".into(),
+        storage_label: ".libra".into(),
+        branch: "main".into(),
+        head: "9d1e4c7".into(),
+        object_format: "sha1".into(),
+        head_oid: Some("9d1e4c7".into()),
+    };
+    let snapshot = snapshot_with_context(SourceState::Available, Some(context));
+    let availability = super::availability(Some(&snapshot));
+    assert_eq!(availability.repo, SourceState::Available);
+    assert_eq!(availability.repo_label, "libra");
+    assert_eq!(availability.branch, "main");
+    assert_eq!(availability.head, "9d1e4c7");
+    assert_eq!(availability.object_format, "sha1");
+    assert_eq!(availability.sources.len(), 5);
+    assert_eq!(
+        availability
+            .sources
+            .iter()
+            .find(|source| source.name == "memory")
+            .expect("memory")
+            .state,
+        SourceState::Stale
+    );
+    assert_eq!(
+        availability
+            .sources
+            .iter()
+            .find(|source| source.name == "runs")
+            .expect("runs")
+            .state,
+        SourceState::Absent
+    );
+}
+
+#[test]
+fn uid07_about_availability() {
+    let unchecked = super::availability(None);
+    assert_eq!(unchecked.repo, SourceState::Unchecked);
+    assert_eq!(unchecked.repo_label, "未检查");
+    assert!(
+        unchecked
+            .sources
+            .iter()
+            .all(|source| source.label == "未检查")
+    );
+    let absent = super::availability(Some(&snapshot_with_context(SourceState::Absent, None)));
+    assert_eq!(absent.repo, SourceState::Absent);
+    assert_eq!(absent.branch, "—");
+}
+
+#[test]
+fn uid07_capability_map_states() {
+    let snapshot = snapshot_with_context(SourceState::Available, None);
+    let availability = super::availability(Some(&snapshot));
+    let rows = super::capabilities(&availability);
+    assert_eq!(rows.len(), 5);
+    assert!(
+        rows.iter()
+            .any(|row| row.capability == "memory" && row.data == "stale")
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row.capability == "capture" && row.data == "available")
+    );
+}
+
+#[test]
+fn uid07_search_after_catalog_removal() {
+    // The catalog module no longer exposes `catalog()`; availability is the
+    // only source of surface state for search.
+    let availability = super::availability(None);
+    assert_eq!(availability.sources.len(), 5);
+}
+
+#[test]
+fn uid07_welcome_in_and_out() {
+    let inside = super::availability(Some(&snapshot_with_context(SourceState::Available, None)));
+    assert!(inside.repo.is_available());
+    let outside = super::availability(Some(&snapshot_with_context(SourceState::Absent, None)));
+    assert!(!outside.repo.is_available());
+}
+
+#[test]
+fn uid07_label_copy() {
+    assert_eq!(crate::gui::desktop::WINDOW_LABEL, "Read-only preview");
+    assert!(!crate::gui::desktop::WINDOW_LABEL.contains("Design preview"));
+}
+
+#[test]
+fn uid07_import_copy() {
+    assert_eq!(crate::gui::desktop::WINDOW_LABEL, "Read-only preview");
+    assert_eq!(
+        crate::gui::screens::cloud::IMPORT_EXAMPLE,
+        "your-repository"
+    );
+    assert!(!crate::gui::screens::cloud::IMPORT_EXAMPLE.contains("acme"));
+}
+
+#[test]
+fn uid07_deferred_pages_badge() {
+    use crate::gui::desktop::{Page, is_demo_page};
+    for page in [
+        Page::SplashError,
+        Page::Settings,
+        Page::Mega,
+        Page::Deps,
+        Page::Views,
+        Page::Cloud,
+        Page::Rebase,
+        Page::Refs,
+        Page::Bisect,
+        Page::Blame,
+        Page::Conflict,
+        Page::Automation,
+        Page::Review,
+        Page::Agents,
+        Page::Lanes,
+        Page::Search,
+    ] {
+        assert!(is_demo_page(page), "{page:?} is a demo page");
+    }
+    for page in [
+        Page::History,
+        Page::Sessions,
+        Page::Operations,
+        Page::Memory,
+        Page::Reviews,
+        Page::Investigate,
+        Page::Capabilities,
+        Page::Welcome,
+        Page::About,
+        Page::Splash,
+    ] {
+        assert!(!is_demo_page(page), "{page:?} carries real data");
+    }
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn uid07_read_only_no_certificate() {
+    let repo_dir = tempdir().expect("temp repo");
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    commit_memory_fixture(&repo_dir, "uid07").await;
+    let db_path = repo_dir
+        .path()
+        .join(crate::utils::util::ROOT_DIR)
+        .join(crate::utils::util::DATABASE);
+    let before = receipt_fingerprint(&db_path).await;
+    let _guard = test::ChangeDirGuard::new(repo_dir.path());
+    let handle = super::DataHandle::spawn();
+    handle.request();
+    let snapshot = wait_snapshot(&handle, Duration::from_secs(10));
+    let availability = super::availability(Some(&snapshot));
+    assert_eq!(availability.repo, SourceState::Available);
+    assert!(!availability.sources.is_empty());
+    drop(handle);
+    let after = receipt_fingerprint(&db_path).await;
+    assert_eq!(
+        before, after,
+        "availability/status reads write no schema receipt, operation or certificate"
+    );
+}
+
+#[tokio::test]
+async fn uid07_bounded_probe() {
+    let started = std::time::Instant::now();
+    let availability = super::context::probe_availability(None).await;
+    assert!(started.elapsed() < std::time::Duration::from_millis(80));
+    assert_eq!(availability.repo_label, "no repository");
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn uid07_probe_delivery_precedes_rows() {
+    let repo_dir = tempdir().expect("temp repo");
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    let _guard = test::ChangeDirGuard::new(repo_dir.path());
+    // Block the reader until released: the probe must arrive while the
+    // snapshot is still unavailable, proving ordering.
+    let (release, released) = std::sync::mpsc::channel();
+    let released = std::sync::Arc::new(std::sync::Mutex::new(released));
+    let handle = super::DataHandle::spawn_with(move |_scope| {
+        let released = released.clone();
+        Box::pin(async move {
+            let _ = tokio::task::spawn_blocking(move || {
+                released
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .recv()
+            })
+            .await;
+            Ok(super::ReadOutcome::new(SourceState::Available, None, None))
+        })
+    });
+    handle.request();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let probe = loop {
+        if let Some(probe) = handle.take_probe() {
+            break probe;
+        }
+        assert!(std::time::Instant::now() < deadline, "probe did not arrive");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(probe.repo, SourceState::Available);
+    assert!(handle.take_snapshot().is_none(), "rows are still blocked");
+    release.send(()).expect("release reader");
+    let snapshot = wait_snapshot(&handle, Duration::from_secs(10));
+    assert!(snapshot.state.is_available());
+}
+
+#[test]
+fn uid07_repo_failure_states_propagate() {
+    let outcome = super::worker::ReadOutcome::new(SourceState::Corrupt, None, None);
+    assert_eq!(outcome.history_state, SourceState::Corrupt);
+    let outcome = super::worker::ReadOutcome::new(SourceState::Busy, None, None);
+    assert_eq!(outcome.history_state, SourceState::Busy);
+    let handle = super::DataHandle::spawn_with_startup_failure("boom".to_string());
+    let snapshot = handle.take_snapshot().expect("worker failure snapshot");
+    assert_eq!(snapshot.sessions_state, SourceState::Worker);
+    assert_eq!(snapshot.operations.state, SourceState::Worker);
+    assert_eq!(snapshot.memory.state, SourceState::Worker);
+    assert_eq!(snapshot.runs.state, SourceState::Worker);
+    assert_eq!(snapshot.history_state, SourceState::Worker);
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn uid07_probe_real_fixtures_and_states() {
+    let repo_dir = tempdir().expect("temp repo");
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    commit_memory_fixture(&repo_dir, "probe").await;
+    let scope = scope_for(&repo_dir);
+    let started = std::time::Instant::now();
+    let availability = super::context::probe_availability(Some(&scope)).await;
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(400),
+        "probe stayed within its bounded budget"
+    );
+    assert_eq!(availability.repo, SourceState::Available);
+    assert_eq!(
+        availability
+            .sources
+            .iter()
+            .find(|source| source.name == "operation")
+            .expect("operation")
+            .state,
+        SourceState::Available
+    );
+    // No capture catalog yet: absent, not unreadable.
+    assert_eq!(
+        availability
+            .sources
+            .iter()
+            .find(|source| source.name == "capture")
+            .expect("capture")
+            .state,
+        SourceState::Absent
+    );
+    // A real capture catalog probes as Available.
+    let storage = repo_dir.path().join(crate::utils::util::ROOT_DIR);
+    crate::internal::ai::capture::store::open(&storage, Duration::from_secs(2))
+        .await
+        .expect("create capture catalog")
+        .close()
+        .await
+        .ok();
+    let availability = super::context::probe_availability(Some(&scope)).await;
+    assert_eq!(
+        availability
+            .sources
+            .iter()
+            .find(|source| source.name == "capture")
+            .expect("capture")
+            .state,
+        SourceState::Available
+    );
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn uid07_probe_outside_repository_is_absent() {
+    let availability = super::context::probe_availability(None).await;
+    assert_eq!(availability.repo, SourceState::Absent);
+    assert!(
+        availability
+            .sources
+            .iter()
+            .all(|source| source.state == SourceState::Absent)
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[serial(cwd)]
+async fn uid07_probe_fifo_directory_does_not_block() {
+    let repo_dir = tempdir().expect("temp repo");
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    let root = run_root(&repo_dir);
+    fs::create_dir_all(root.parent().expect("sessions dir")).expect("sessions");
+    let status = std::process::Command::new("mkfifo")
+        .arg(&root)
+        .status()
+        .expect("mkfifo");
+    assert!(status.success(), "agent-runs itself is a FIFO");
+    let scope = scope_for(&repo_dir);
+    let started = std::time::Instant::now();
+    let availability = super::context::probe_availability(Some(&scope)).await;
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    assert_eq!(
+        availability
+            .sources
+            .iter()
+            .find(|source| source.name == "runs")
+            .expect("runs")
+            .state,
+        SourceState::Unreadable {
+            kind: std::io::ErrorKind::NotADirectory
+        }
+    );
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn uid07_probe_failure_classification() {
+    // Corrupt database.
+    let repo_dir = tempdir().expect("temp repo");
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    let db_path = repo_dir
+        .path()
+        .join(crate::utils::util::ROOT_DIR)
+        .join(crate::utils::util::DATABASE);
+    fs::write(&db_path, b"not a sqlite database").expect("corrupt db");
+    let scope = scope_for(&repo_dir);
+    let availability = super::context::probe_availability(Some(&scope)).await;
+    assert_eq!(availability.repo, SourceState::Corrupt);
+
+    // Schema mismatch.
+    let repo_dir = tempdir().expect("temp repo");
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    let db_path = repo_dir
+        .path()
+        .join(crate::utils::util::ROOT_DIR)
+        .join(crate::utils::util::DATABASE);
+    let conn = db::open_database_without_migrations(&db_path)
+        .await
+        .expect("db");
+    conn.execute_unprepared(
+        "DELETE FROM schema_versions; INSERT INTO schema_versions (version, name, applied_at) VALUES (1, 'old', 'now')",
+    )
+    .await
+    .expect("downgrade");
+    conn.close().await.ok();
+    let scope = scope_for(&repo_dir);
+    let availability = super::context::probe_availability(Some(&scope)).await;
+    assert_eq!(availability.repo, SourceState::SchemaOld);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[serial(cwd)]
+async fn uid07_probe_permission_denied_is_unreadable() {
+    let repo_dir = tempdir().expect("temp repo");
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    let db_path = repo_dir
+        .path()
+        .join(crate::utils::util::ROOT_DIR)
+        .join(crate::utils::util::DATABASE);
+    use std::os::unix::fs::PermissionsExt;
+    let mut permissions = fs::metadata(&db_path).expect("stat").permissions();
+    permissions.set_mode(0o000);
+    fs::set_permissions(&db_path, permissions).expect("chmod 000");
+    let scope = scope_for(&repo_dir);
+    let availability = super::context::probe_availability(Some(&scope)).await;
+    assert_eq!(
+        availability.repo,
+        SourceState::Unreadable {
+            kind: std::io::ErrorKind::PermissionDenied
+        }
+    );
+    let mut permissions = fs::metadata(&db_path).expect("stat").permissions();
+    permissions.set_mode(0o644);
+    fs::set_permissions(&db_path, permissions).expect("restore");
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn uid07_probe_contention_is_busy() {
+    let repo_dir = tempdir().expect("temp repo");
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    let db_path = repo_dir
+        .path()
+        .join(crate::utils::util::ROOT_DIR)
+        .join(crate::utils::util::DATABASE);
+    let holder = db::open_database_without_migrations(&db_path)
+        .await
+        .expect("holder db");
+    holder
+        .execute_unprepared("PRAGMA journal_mode=DELETE")
+        .await
+        .expect("rollback journal");
+    holder
+        .execute_unprepared("PRAGMA locking_mode=EXCLUSIVE")
+        .await
+        .expect("exclusive locking mode");
+    holder
+        .execute_unprepared("BEGIN EXCLUSIVE")
+        .await
+        .expect("hold exclusive lock");
+    let scope = scope_for(&repo_dir);
+    let started = std::time::Instant::now();
+    let availability = super::context::probe_availability(Some(&scope)).await;
+    let elapsed = started.elapsed();
+    holder.execute_unprepared("COMMIT").await.expect("release");
+    holder.close().await.ok();
+    assert_eq!(
+        availability.repo,
+        SourceState::Busy,
+        "exclusive writer contention is retryable Busy"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "contention stayed within the bounded probe budget"
+    );
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn uid07_probe_capture_failures_and_future_schema() {
+    // Capture corrupt.
+    let repo_dir = tempdir().expect("temp repo");
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    let storage = repo_dir.path().join(crate::utils::util::ROOT_DIR);
+    crate::internal::ai::capture::store::open(&storage, Duration::from_secs(2))
+        .await
+        .expect("create capture")
+        .close()
+        .await
+        .ok();
+    let capture_path = crate::internal::ai::capture::store::capture_database_path(&storage);
+    fs::write(&capture_path, b"not sqlite").expect("corrupt capture");
+    let scope = scope_for(&repo_dir);
+    let availability = super::context::probe_availability(Some(&scope)).await;
+    assert_eq!(
+        availability
+            .sources
+            .iter()
+            .find(|source| source.name == "capture")
+            .expect("capture")
+            .state,
+        SourceState::Corrupt
+    );
+
+    // Capture old schema.
+    let repo_dir = tempdir().expect("temp repo");
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    let storage = repo_dir.path().join(crate::utils::util::ROOT_DIR);
+    let conn = crate::internal::ai::capture::store::open(&storage, Duration::from_secs(2))
+        .await
+        .expect("create capture");
+    conn.execute_unprepared(
+        "DELETE FROM schema_versions; INSERT INTO schema_versions (version, name, applied_at) VALUES (1, 'old', 'now')",
+    )
+    .await
+    .expect("downgrade capture");
+    conn.close().await.ok();
+    let scope = scope_for(&repo_dir);
+    let availability = super::context::probe_availability(Some(&scope)).await;
+    assert_eq!(
+        availability
+            .sources
+            .iter()
+            .find(|source| source.name == "capture")
+            .expect("capture")
+            .state,
+        SourceState::SchemaOld
+    );
+
+    // Repository future schema.
+    let repo_dir = tempdir().expect("temp repo");
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    let db_path = repo_dir
+        .path()
+        .join(crate::utils::util::ROOT_DIR)
+        .join(crate::utils::util::DATABASE);
+    let conn = db::open_database_without_migrations(&db_path)
+        .await
+        .expect("db");
+    conn.execute_unprepared(
+        "DELETE FROM schema_versions; INSERT INTO schema_versions (version, name, applied_at) VALUES (999999999999, 'future', 'now')",
+    )
+    .await
+    .expect("future schema");
+    conn.close().await.ok();
+    let scope = scope_for(&repo_dir);
+    let availability = super::context::probe_availability(Some(&scope)).await;
+    assert_eq!(availability.repo, SourceState::SchemaNew);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[serial(cwd)]
+async fn uid07_probe_capture_permission_denied() {
+    let repo_dir = tempdir().expect("temp repo");
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    let storage = repo_dir.path().join(crate::utils::util::ROOT_DIR);
+    crate::internal::ai::capture::store::open(&storage, Duration::from_secs(2))
+        .await
+        .expect("create capture")
+        .close()
+        .await
+        .ok();
+    let capture_path = crate::internal::ai::capture::store::capture_database_path(&storage);
+    use std::os::unix::fs::PermissionsExt;
+    let mut permissions = fs::metadata(&capture_path).expect("stat").permissions();
+    permissions.set_mode(0o000);
+    fs::set_permissions(&capture_path, permissions).expect("chmod");
+    let scope = scope_for(&repo_dir);
+    let availability = super::context::probe_availability(Some(&scope)).await;
+    assert_eq!(
+        availability
+            .sources
+            .iter()
+            .find(|source| source.name == "capture")
+            .expect("capture")
+            .state,
+        SourceState::Unreadable {
+            kind: std::io::ErrorKind::PermissionDenied
+        }
+    );
+    let mut permissions = fs::metadata(&capture_path).expect("stat").permissions();
+    permissions.set_mode(0o600);
+    fs::set_permissions(&capture_path, permissions).expect("restore");
+}
+
+#[test]
+fn uid07_unresolved_scope_is_unchecked() {
+    let availability = super::unresolved_availability();
+    assert_eq!(availability.repo, SourceState::Unchecked);
+    assert!(
+        availability
+            .sources
+            .iter()
+            .all(|source| source.state == SourceState::Unchecked)
+    );
+    assert_eq!(availability.repo_label, "unresolved");
+}
+
+#[test]
+fn uid07_merge_preserves_independent_probe_sources() {
+    let mut probe = super::availability(None);
+    probe.repo = SourceState::Available;
+    for source in &mut probe.sources {
+        if source.name == "capture" {
+            source.state = SourceState::Available;
+            source.label = "available";
+        }
+    }
+    let mut snapshot = snapshot_with_context(SourceState::Corrupt, None);
+    snapshot.sessions_state = SourceState::Unchecked;
+    let merged = super::merge_availability(&probe, &snapshot);
+    assert_eq!(merged.repo, SourceState::Corrupt, "the repo error wins");
+    assert_eq!(
+        merged
+            .sources
+            .iter()
+            .find(|source| source.name == "capture")
+            .expect("capture")
+            .state,
+        SourceState::Available,
+        "an unaffected probe verdict survives a repository failure"
+    );
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn uid07_production_context_failure_preserves_probe() {
+    let repo_dir = tempdir().expect("temp repo");
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    // Healthy capture catalog, corrupt repository database.
+    let storage = repo_dir.path().join(crate::utils::util::ROOT_DIR);
+    crate::internal::ai::capture::store::open(&storage, Duration::from_secs(2))
+        .await
+        .expect("create capture")
+        .close()
+        .await
+        .ok();
+    fs::write(storage.join(crate::utils::util::DATABASE), b"not sqlite").expect("corrupt db");
+    let _guard = test::ChangeDirGuard::new(repo_dir.path());
+    let handle = super::DataHandle::spawn();
+    handle.request();
+    let snapshot = wait_snapshot(&handle, Duration::from_secs(10));
+    assert!(snapshot.context.is_none(), "the context read failed");
+    assert_eq!(snapshot.sessions_state, SourceState::Unchecked);
+    assert_eq!(snapshot.history_state, SourceState::Corrupt);
+    assert_eq!(snapshot.operations.state, SourceState::Corrupt);
+    assert_eq!(snapshot.memory.state, SourceState::Corrupt);
+    assert_eq!(snapshot.runs.state, SourceState::Unchecked);
+    let probe = handle.take_probe().expect("probe retained");
+    let merged = super::merge_availability(&probe, &snapshot);
+    assert_eq!(merged.repo, SourceState::Corrupt);
+    assert_eq!(
+        merged
+            .sources
+            .iter()
+            .find(|source| source.name == "capture")
+            .expect("capture")
+            .state,
+        SourceState::Available,
+        "a healthy capture probe survives the repository failure"
+    );
+    let capabilities = super::availability_capabilities(&merged);
+    assert!(
+        capabilities
+            .iter()
+            .any(|row| row.capability == "capture" && row.data == "available")
+    );
 }

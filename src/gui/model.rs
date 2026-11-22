@@ -3,18 +3,7 @@
 //! The rows come from the sessions prototype (`libra-sessions-v2`). They are
 //! demonstration data, not a live capture index.
 
-use std::sync::OnceLock;
-
 use serde::Deserialize;
-
-/// One catalog load. A parse failure is shown in the window instead of panicking.
-pub fn catalog() -> &'static Result<Catalog, String> {
-    static CATALOG: OnceLock<Result<Catalog, String>> = OnceLock::new();
-    CATALOG.get_or_init(|| {
-        serde_json::from_str(include_str!("sessions.json"))
-            .map_err(|error| format!("the bundled session catalog is unreadable: {error}"))
-    })
-}
 
 /// The prototype's session list and capability map.
 #[derive(Debug, Clone, Deserialize)]
@@ -186,21 +175,6 @@ pub fn clock(iso: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn bundled_catalog_loads_the_prototype_sessions() {
-        let catalog = catalog().as_ref().expect("catalog json");
-        assert_eq!(catalog.today, "2026-10-20");
-        assert_eq!(catalog.sessions.len(), 8);
-        assert!(!catalog.capability_map.is_empty());
-        assert!(
-            catalog
-                .sessions
-                .iter()
-                .any(|session| session.id == "s-cc-arch"),
-            "the prototype's opening session should be present"
-        );
-    }
 
     #[test]
     fn date_bucket_uses_the_catalog_today() {

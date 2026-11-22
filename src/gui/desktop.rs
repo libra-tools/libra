@@ -182,6 +182,10 @@ pub struct Desktop {
     pub data: DataHandle,
     /// Latest snapshot delivered by the worker.
     pub snapshot: Option<Snapshot>,
+    /// Bounded availability probe (published before row loading).
+    pub availability: crate::gui::data::Availability,
+    /// The raw probe, kept for merging with failed snapshots.
+    pub probe_availability: Option<crate::gui::data::Availability>,
 }
 
 /// A new snapshot always starts on the first page (A7).
@@ -192,6 +196,32 @@ pub fn reset_page_for_new_snapshot() -> usize {
 /// Page state after a replacement snapshot is delivered: always page one.
 pub fn delivered_page(_previous: usize) -> usize {
     reset_page_for_new_snapshot()
+}
+
+/// The window's status label (UID-07 A6).
+pub const WINDOW_LABEL: &str = "Read-only preview";
+
+/// Pages that still render bundled demonstration content (UID-07 A8).
+pub fn is_demo_page(page: Page) -> bool {
+    matches!(
+        page,
+        Page::SplashError
+            | Page::Settings
+            | Page::Mega
+            | Page::Deps
+            | Page::Views
+            | Page::Cloud
+            | Page::Rebase
+            | Page::Refs
+            | Page::Bisect
+            | Page::Blame
+            | Page::Conflict
+            | Page::Automation
+            | Page::Review
+            | Page::Agents
+            | Page::Lanes
+            | Page::Search
+    )
 }
 
 impl Desktop {
@@ -267,23 +297,55 @@ impl Desktop {
                 cx.background_executor()
                     .timer(Duration::from_millis(100))
                     .await;
+                if let Some(probe) = polled.take_probe() {
+                    let delivered = this.update(cx, |desktop, cx| {
+                        if let Some(snapshot) = desktop.snapshot.as_ref() {
+                            desktop.availability = if snapshot.context.is_some() {
+                                crate::gui::data::availability(Some(snapshot))
+                            } else {
+                                crate::gui::data::merge_availability(&probe, snapshot)
+                            };
+                        } else {
+                            desktop.availability = probe.clone();
+                        }
+                        let capabilities = crate::gui::data::capabilities(&desktop.availability);
+                        sessions_handle.update(cx, |window, cx| {
+                            window.set_capabilities(capabilities, cx);
+                        });
+                        desktop.probe_availability = Some(probe);
+                        cx.notify();
+                    });
+                    if delivered.is_err() {
+                        break;
+                    }
+                }
                 if let Some(snapshot) = polled.take_snapshot() {
                     let rows = snapshot.sessions.clone();
                     let sessions_error = snapshot.sessions_error.clone();
                     let sessions_state = snapshot.sessions_state.clone();
                     let delivered = this.update(cx, |desktop, cx| {
+                        let had_context = snapshot.context.is_some();
                         desktop.snapshot = Some(snapshot);
+                        if had_context {
+                            desktop.availability =
+                                crate::gui::data::availability(desktop.snapshot.as_ref());
+                        } else if let (Some(probe), Some(snapshot)) = (
+                            desktop.probe_availability.as_ref(),
+                            desktop.snapshot.as_ref(),
+                        ) {
+                            desktop.availability =
+                                crate::gui::data::merge_availability(probe, snapshot);
+                        } else {
+                            desktop.availability =
+                                crate::gui::data::availability(desktop.snapshot.as_ref());
+                        }
+                        let merged_capabilities =
+                            crate::gui::data::capabilities(&desktop.availability);
                         desktop.ops_page = delivered_page(desktop.ops_page);
                         desktop.selected = 0;
                         sessions_handle.update(cx, |window, cx| {
                             window.set_catalog(
-                                crate::gui::view::catalog_from_sessions(
-                                    &rows,
-                                    crate::gui::model::catalog()
-                                        .as_ref()
-                                        .map(|catalog| catalog.capability_map.clone())
-                                        .unwrap_or_default(),
-                                ),
+                                crate::gui::view::catalog_from_sessions(&rows, merged_capabilities),
                                 sessions_error,
                                 Some(sessions_state),
                                 cx,
@@ -301,6 +363,8 @@ impl Desktop {
         Self {
             data,
             snapshot: None,
+            availability: crate::gui::data::Availability::unchecked(),
+            probe_availability: None,
             history_input,
             history_query: String::new(),
             review_comment,
@@ -420,7 +484,14 @@ impl Render for Desktop {
             .size_full()
             .flex()
             .flex_col()
-            .child(context_bar(self.snapshot.as_ref(), &p))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(context_bar(self.snapshot.as_ref(), &p))
+                    .child(badge(WINDOW_LABEL, 0x5b6474, 0xf4f5f7)),
+            )
             .child(
                 FocusScope::new(&self.focus)
                     .root()
@@ -466,10 +537,13 @@ impl Render for Desktop {
                                         })
                                     }),
                                 )
+                                .when(is_demo_page(self.page), |nav| {
+                                    nav.child(badge("demo", 0x5b6474, 0xf4f5f7))
+                                })
                                 .child(div().flex_1())
                                 .child(nav(Page::Search, cx))
                                 .child(nav(Page::Settings, cx))
-                                .child(badge("Design preview", 0x5b6474, 0xf4f5f7))
+                                .child(badge(WINDOW_LABEL, 0x5b6474, 0xf4f5f7))
                                 .child(
                                     Button::new("theme", if dark { "Light" } else { "Dark" })
                                         .size(ControlSize::Sm)

@@ -38,6 +38,8 @@ pub struct ReadOutcome {
     pub history: Vec<super::history::HistoryRow>,
     /// History-specific failure while the context itself is available.
     pub history_error: Option<String>,
+    /// The typed History source state.
+    pub history_state: SourceState,
     /// Captured sessions for the Sessions surface.
     pub sessions: Vec<super::sessions::SessionRow>,
     /// Sessions-specific failure while the context itself is available.
@@ -62,15 +64,18 @@ impl ReadOutcome {
     /// Build an outcome without history (tests and non-History readers).
     pub fn new(state: SourceState, context: Option<RepoContext>, message: Option<String>) -> Self {
         let operations_state = state.clone();
+        let sessions_state = state.clone();
+        let history_state = state.clone();
         Self {
             state,
             context,
             message,
             history: Vec::new(),
             history_error: None,
+            history_state,
             sessions: Vec::new(),
             sessions_error: None,
-            sessions_state: SourceState::Stale,
+            sessions_state,
             operations: super::operations::OperationsRead {
                 state: operations_state.clone(),
                 rows: Vec::new(),
@@ -115,6 +120,8 @@ struct Shared {
     cancelled: bool,
     done: bool,
     stalled: bool,
+    probe: Option<super::context::Availability>,
+    probe_taken: bool,
 }
 
 /// Handle to the window's data worker.
@@ -205,6 +212,7 @@ impl DataHandle {
                                         message: None,
                                         history: Vec::new(),
                                         history_error: Some(error.message),
+                                        history_state: error.state.clone(),
                                         sessions,
                                         sessions_error,
                                         sessions_state,
@@ -223,6 +231,7 @@ impl DataHandle {
                                 message: None,
                                 history,
                                 history_error: None,
+                                history_state: SourceState::Available,
                                 sessions,
                                 sessions_error,
                                 sessions_state,
@@ -234,7 +243,7 @@ impl DataHandle {
                                 runs_error,
                             })
                         }
-                        Err(error) => Ok(ReadOutcome::new(error.state, None, Some(error.message))),
+                        Err(error) => Err(error),
                     },
                 }
             })
@@ -255,6 +264,8 @@ impl DataHandle {
                 cancelled: false,
                 done: false,
                 stalled: false,
+                probe: None,
+                probe_taken: false,
             }),
             Condvar::new(),
         ));
@@ -288,22 +299,23 @@ impl DataHandle {
                     message: Some(format!("the data worker could not start: {error}")),
                     history: Vec::new(),
                     history_error: None,
+                    history_state: SourceState::Worker,
                     sessions: Vec::new(),
                     sessions_error: None,
-                    sessions_state: SourceState::Stale,
+                    sessions_state: SourceState::Worker,
                     operations: super::operations::OperationsRead {
-                        state: SourceState::Stale,
+                        state: SourceState::Worker,
                         rows: Vec::new(),
                         truncated: false,
                     },
                     operations_error: None,
                     memory: super::memory::MemoryRead {
-                        state: SourceState::Stale,
+                        state: SourceState::Worker,
                         rows: Vec::new(),
                     },
                     memory_error: None,
                     runs: super::runs::RunsRead {
-                        state: SourceState::Stale,
+                        state: SourceState::Worker,
                         rows: Vec::new(),
                         truncated: false,
                     },
@@ -332,6 +344,8 @@ impl DataHandle {
                 cancelled: false,
                 done: false,
                 stalled: false,
+                probe: None,
+                probe_taken: false,
             }),
             Condvar::new(),
         ));
@@ -369,6 +383,17 @@ impl DataHandle {
         }
         shared.delivered = Some(seq);
         shared.latest.clone()
+    }
+
+    /// Take the bounded availability probe (published without a snapshot).
+    pub fn take_probe(&self) -> Option<super::context::Availability> {
+        let (lock, _) = &*self.inner;
+        let mut shared = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if shared.probe_taken {
+            return None;
+        }
+        shared.probe_taken = true;
+        shared.probe.clone()
     }
 
     /// Number of requests waiting in the bounded queue (test seam).
@@ -485,6 +510,19 @@ fn worker_loop(inner: Arc<(Mutex<Shared>, Condvar)>, reads: Arc<AtomicU64>, read
                 Ok(scope) => scope.clone(),
                 Err(_) => None,
             };
+            // Publish the bounded availability probe WITHOUT consuming a
+            // snapshot sequence, so `request()`/supersession stays intact.
+            let probe = match &scope {
+                Ok(_) => runtime.block_on(super::context::probe_availability(scope_value.as_ref())),
+                Err(_) => super::context::unresolved_availability(),
+            };
+            {
+                let (lock, cv) = &*inner;
+                let mut shared = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                shared.probe = Some(probe);
+                shared.probe_taken = false;
+                cv.notify_all();
+            }
             let outcome = match &scope {
                 Err(error) => Err(error.clone()),
                 Ok(scope) => runtime.block_on(with_request_scope(scope_value, async {
@@ -499,6 +537,7 @@ fn worker_loop(inner: Arc<(Mutex<Shared>, Condvar)>, reads: Arc<AtomicU64>, read
                     message: outcome.message,
                     history: outcome.history,
                     history_error: outcome.history_error,
+                    history_state: outcome.history_state,
                     sessions: outcome.sessions,
                     sessions_error: outcome.sessions_error,
                     sessions_state: outcome.sessions_state,
@@ -516,9 +555,10 @@ fn worker_loop(inner: Arc<(Mutex<Shared>, Condvar)>, reads: Arc<AtomicU64>, read
                     message: Some(error.message),
                     history: Vec::new(),
                     history_error: None,
+                    history_state: error.state.clone(),
                     sessions: Vec::new(),
                     sessions_error: None,
-                    sessions_state: error.state.clone(),
+                    sessions_state: SourceState::Unchecked,
                     operations: super::operations::OperationsRead {
                         state: error.state.clone(),
                         rows: Vec::new(),
@@ -531,7 +571,7 @@ fn worker_loop(inner: Arc<(Mutex<Shared>, Condvar)>, reads: Arc<AtomicU64>, read
                     },
                     memory_error: None,
                     runs: super::runs::RunsRead {
-                        state: error.state,
+                        state: SourceState::Unchecked,
                         rows: Vec::new(),
                         truncated: false,
                     },
@@ -543,6 +583,9 @@ fn worker_loop(inner: Arc<(Mutex<Shared>, Condvar)>, reads: Arc<AtomicU64>, read
             // Publish only when this response still answers the newest request;
             // obsolete in-flight responses are dropped (supersession).
             if seq == shared.seq {
+                // Keep the probe available for late polls (a fast failure can
+                // finish before the window's next tick).
+                shared.probe_taken = false;
                 shared.latest = Some(snapshot);
             }
         }
@@ -570,22 +613,23 @@ fn finish_with_error(inner: &Arc<(Mutex<Shared>, Condvar)>, message: String) {
         message: Some(message),
         history: Vec::new(),
         history_error: None,
+        history_state: SourceState::Worker,
         sessions: Vec::new(),
         sessions_error: None,
-        sessions_state: SourceState::Stale,
+        sessions_state: SourceState::Worker,
         operations: super::operations::OperationsRead {
-            state: SourceState::Stale,
+            state: SourceState::Worker,
             rows: Vec::new(),
             truncated: false,
         },
         operations_error: None,
         memory: super::memory::MemoryRead {
-            state: SourceState::Stale,
+            state: SourceState::Worker,
             rows: Vec::new(),
         },
         memory_error: None,
         runs: super::runs::RunsRead {
-            state: SourceState::Stale,
+            state: SourceState::Worker,
             rows: Vec::new(),
             truncated: false,
         },

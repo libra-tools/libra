@@ -5,6 +5,7 @@
 //! connection is injected and opened without schema management, so a window
 //! read cannot migrate the repository (ADR-UID-01/02).
 
+mod context;
 mod history;
 mod memory;
 mod operations;
@@ -15,6 +16,10 @@ mod snapshot;
 mod state;
 mod worker;
 
+pub use context::{
+    Availability, SourceAvailability, availability, availability_capabilities, capabilities,
+    merge_availability, unresolved_availability,
+};
 pub use history::{AttributionFilter, HistoryRow, age_label};
 pub use memory::{MEMORY_ROW_CAP, MemoryRead, MemoryRow, matches_filter as memory_matches_filter};
 pub use operations::{

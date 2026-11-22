@@ -55,6 +55,8 @@ pub struct Snapshot {
     pub sessions_state: SourceState,
     /// History-specific failure while the context itself is available.
     pub history_error: Option<String>,
+    /// The typed History source state.
+    pub history_state: SourceState,
 }
 
 /// A typed read failure that the window renders as a source state.

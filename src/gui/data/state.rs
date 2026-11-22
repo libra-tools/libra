@@ -26,6 +26,8 @@ pub enum SourceState {
     SchemaOld,
     /// The on-disk schema is newer than this binary.
     SchemaNew,
+    /// Not checked yet (placeholder before a source verdict).
+    Unchecked,
     /// A projection is stale (zero rows are shown).
     Stale,
     /// The window's data worker could not start.
@@ -43,6 +45,7 @@ impl SourceState {
             Self::Busy => "busy",
             Self::SchemaOld => "schema upgrade required",
             Self::SchemaNew => "schema too new",
+            Self::Unchecked => "未检查",
             Self::Stale => "stale",
             Self::Worker => "worker failed",
         }
@@ -59,6 +62,7 @@ impl SourceState {
             }
             Self::SchemaNew => Some("use a newer `libra` binary"),
             Self::Stale => Some("run `libra memory rebuild`"),
+            Self::Unchecked => None,
             Self::Worker => Some("reopen the window"),
             Self::Available | Self::Absent => None,
         }

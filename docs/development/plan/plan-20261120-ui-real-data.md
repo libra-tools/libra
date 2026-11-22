@@ -137,6 +137,7 @@
 
 | 时间 | 触发 | 变更内容 | 原卡 → 新卡 | 受影响的引用 |
 |---|---|---|---|---|
+| 2026-11-21 20:00:00 UTC | UID-07 执行期评审（Codex/Claude 十轮） | 有界可用性探针（schema/busy/权限分类、连接超时）、Unchecked 占位与 stale 分离、探针独立字段不占序列、失败快照保留探针、状态页/标签/导入文案、demo 徽标集合、catalog 删除；debug 单测预算 ≤600ms（release 仍 ≤150ms）；EX-UID-07-01 登记 | `UID-07` AC/VER/写集与映射 | UID-07 AC/VER、写集、AC→test 映射 |
 | 2026-11-21 16:00:00 UTC | UID-04 执行期评审（Codex/Claude 十八轮） | 共享 `operation_snapshot_rows`（50k 上限/truncated）；生产 `filtered_page` 先过滤后分页；独立搜索/命令过滤与翻页夹紧；快照交付重置；绝对路径（引号/列表/URL/Windows）脱敏；schema 兼容与缺账本分类；只读逻辑指纹；真实 50k/10k fixture 与终止化用例 | `UID-04` AC/VER/写集与映射 | UID-04 AC/VER、写集、AC→test 映射 |
 | 2026-11-21 12:00:00 UTC | UID-03 执行期评审（Codex/Claude 二十一轮，末轮双 PASS） | 共享 `SESSION_PAGE_COLUMNS` 提升；`SessionSummaryRead::prepare_for` 支持 agent 感知与共享预算；catalog/单行失败分离（`CatalogBusy`/`DatabaseBusy` 保锁分类，`CatalogUnavailable` 页面级）；逐行摘要状态（malformed/unavailable）与可读性过滤；typed Sessions 源级状态（Stale/Absent/Busy/SchemaOld/SchemaNew）；链接与摘要上限；只读逻辑指纹；搜索/过滤/选择/状态消息回归用例 | `UID-03` AC/VER/写集与映射、EX-UID-03-01 登记 | UID-03 写集、AC→test 映射、ADR-UID-06（状态分类口径） |
 | 2026-11-21 08:00:00 UTC | UID-02 执行期评审（Claude/Codex） | History 提交按提交时间倒序并截断 200 行；归属查询按 CaptureScope（repo/worktree/workspace/fence）过滤、scope 由注入仓库连接解析、fence 仅 SELECT；归属失败降级为 Human 而不隐藏提交；补 tombstone/merge/过滤用例；Verification 改用既有 `session_list_walks_keyset_pages`；写集补 `snapshot.rs`/`worker.rs`/`widgets.rs` | `UID-02` AC/VER/写集 | UID-02 AC/VER/写集、ADR-UID-03 |
@@ -360,6 +361,7 @@
 
 | 编号 | 任务 | 豁免规则 | 理由与恢复 | 具名审批 | Review round | 证据 | 有效期 |
 |---|---|---|---|---|---|---|---|
+| `EX-UID-07-01` | `UID-07` | G-04 `M` 上限（落点 7>4、生产文件 15>12） | 可用性状态必须跨快照/状态/worker 与五个屏幕同型接线，拆卡会撕开同一恢复轴。恢复：revert 提交 + 下一 patch 发布 + 网站重同步 | Codex（R10 PASS） | R10/R11 | `plan-20261120-ui-real-data.md` 修订历史 UID-07 行 | 本计划内 |
 | `EX-UID-03-01` | `UID-03` | G-04 `M` 上限（落点 5>4、生产文件 14>12） | Sessions 的共享错误分类必须跨 `capture/catalog.rs`、`capture/summary.rs`、`checkpoint_reader.rs` 与两个 CLI 错误映射同型接线；拆卡会把同一恢复轴（会话投影）撕开。恢复：revert 提交 + 下一 patch 发布 + 网站重同步 | Codex（R12 PASS；R16 复核 EX-UID-03-01） | R12/R13/R16 | `plan-20261120-ui-real-data.md` 修订历史 UID-03 行（含 waiver 登记） | 本计划内 |
 
 #### 任务卡粒度审计表
@@ -372,7 +374,7 @@
 | `UID-04` | implementation | Operations 操作日志真实投影 | 补偿：revert 提交 + 下一 patch 发布 + 网站重同步 | yes | yes | 8/8 | 4/8 | 4/5 | M | UID-03, DEP-UID-03, DEP-UID-04 | 序列化于 UID-03 | independent | N/A | N/A |
 | `UID-05` | implementation | Memory episode 有界投影与 stale 语义 | 补偿：revert 提交 + 下一 patch 发布 + 网站重同步 | yes | yes | 5/8 | 4/8 | 4/5 | M | UID-04, DEP-UID-02, DEP-UID-03, DEP-UID-04 | 序列化于 UID-04 | independent | N/A | N/A |
 | `UID-06` | implementation | Review/Investigate run 记录投影与损坏隔离 | 补偿：revert 提交 + 下一 patch 发布 + 网站重同步 | yes | yes | 8/8 | 5/8 | 3/5 | M | UID-05, DEP-UID-03, DEP-UID-04 | 序列化于 UID-05 | independent | N/A | N/A |
-| `UID-07` | implementation | 仓库与数据面可用性状态呈现 | 补偿：revert 提交 + 下一 patch 发布 + 网站重同步 | yes | yes | 8/8 | 7/8 | 3/10 | M | UID-06, DEP-UID-01, DEP-UID-02, DEP-UID-03, DEP-UID-04 | 序列化于 UID-06 | independent | N/A | N/A |
+| `UID-07` | implementation | 仓库与数据面可用性状态呈现 | 补偿：revert 提交 + 下一 patch 发布 + 网站重同步 | yes | yes | 8/8 | 7/8 | 7/15 | L-exception:EX-UID-07-01 | UID-06, DEP-UID-01, DEP-UID-02, DEP-UID-03, DEP-UID-04 | 序列化于 UID-06 | independent | N/A | EX-UID-07-01 |
 
 #### Verification 判定口径
 
@@ -846,7 +848,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `remote-pending`
 
 **Description:** 让 Splash、Welcome、About 与 Capability map 反映真实仓库与数据面可用性：显示仓库是否已打开、分支/HEAD、各数据源（capture、memory、operation、runs、history）的状态；替换固定文案与插图，删除 `catalog()`/`sessions.json` 并改写 `search`/`capabilities` 消费者，把窗口标签改为 "Read-only preview"。行为轴是**状态与可用性呈现**。
 
@@ -894,7 +896,7 @@
 
 **Deliverables:** N/A
 
-**Implementation write set:** `src/gui/data/context.rs`、`src/gui/data/tests.rs`、`src/gui/data/mod.rs`、`src/gui/screens/splash.rs`、`src/gui/screens/welcome.rs`、`src/gui/screens/about.rs`、`src/gui/screens/capabilities.rs`、`src/gui/screens/search.rs`、`src/gui/desktop.rs`、`src/gui/model.rs`、`src/gui/sessions.json`（删除）、`docs/commands/ui.md`、`docs/commands/zh-CN/ui.md`、`docs/development/commands/ui.md`、`docs/development/commands/README.md`、`COMPATIBILITY.md`、`../libra-backend/apps/tanstack-app/content/docs/commands/ui.en.md`
+**Implementation write set:** `src/gui/data/context.rs`、`src/gui/data/tests.rs`、`src/gui/data/mod.rs`、`src/gui/data/snapshot.rs`、`src/gui/data/state.rs`、`src/gui/data/worker.rs`、`src/gui/screens/splash.rs`、`src/gui/screens/welcome.rs`、`src/gui/screens/about.rs`、`src/gui/screens/capabilities.rs`、`src/gui/screens/search.rs`、`src/gui/screens/cloud.rs`、`src/gui/desktop.rs`、`src/gui/model.rs`、`src/gui/view.rs`、`src/gui/sessions.json`（删除）、`docs/commands/ui.md`、`docs/commands/zh-CN/ui.md`、`docs/development/commands/ui.md`、`docs/development/commands/README.md`、`COMPATIBILITY.md`、`../libra-backend/apps/tanstack-app/content/docs/commands/ui.en.md`
 
 **Release write set:** Inherited
 
@@ -910,7 +912,7 @@
 
 **Performance budget:** 可用性探测 ≤80ms（无争用路径）；自身 busy timeout ≤200ms，超时显示 `busy`（`busy` 只由该探测产生；About 的 `busy` 取该探测结果，`stale` 取 memory 屏幕快照）；不做 dirty 摘要（`DEFER-UID-09`）。
 
-**Estimated scope:** M
+**Estimated scope:** `L-exception:EX-UID-07-01`
 
 **Version increment:** `patch`
 
@@ -918,7 +920,7 @@
 
 **C/D coverage from:** `self`
 
-**Granularity:** `type=implementation; axis=仓库与数据面可用性呈现; recovery=compensating; complete=yes; self-contained=yes; AC=8/8; VER=7/8; landing=3; prod-files=10; scope=M; deps=UID-06,DEP-UID-01,DEP-UID-02,DEP-UID-03,DEP-UID-04; writeset=序列化于 UID-06; release=independent; split-from=N/A; exception=N/A`
+**Granularity:** `type=implementation; axis=仓库与数据面可用性呈现; recovery=compensating; complete=yes; self-contained=yes; AC=8/8; VER=7/8; landing=7; prod-files=15; scope=L-exception:EX-UID-07-01; deps=UID-06,DEP-UID-01,DEP-UID-02,DEP-UID-03,DEP-UID-04; writeset=序列化于 UID-06; release=independent; split-from=N/A; exception=EX-UID-07-01`
 
 ## 测试矩阵
 
@@ -992,8 +994,8 @@
 | 仓库上下文快照 | O(1) 存在性/scope 检查 | 每窗口一次 | ≤50ms | `UID-01` 单测 |
 | 提交历史列表 + 归属 | O(200 提交元数据 + 父链) + 一次批量归属查询 | 每次页面重读 | ≤150ms、200 行 | `UID-02` 单测 |
 | 会话列表/详情 | O(200 会话)、O(100 事件) | 每次页面重读 | ≤200ms / ≤100ms（摘要富集共用 ≤3s 预算，超预算行降级） | `UID-03` 单测 |
-| operation 单页 | id 快照（≤50k id）+ 既有 ranked CTE 成本 | 每次翻页 | ≤150ms；≥10k operation 实测记录 | `UID-04` 单测 |
-| memory 单页 | O(200 选中 episode) + 选中集合子表 | 每次页面重读 | ≤150ms（**不含 freshness**）；`uid05_freshness_scale_and_separate_timings` 在 ≥10k episode/≥50k link fixture 实测：页面 ≈1.3ms、freshness ≈294ms（debug 构建，macOS），freshness 不并入页面预算 | `UID-05` 单测 |
+| operation 单页 | id 快照（≤50k id）+ 既有 ranked CTE 成本 | 每次翻页 | ≤150ms（release）；debug 单测预算 ≤600ms；≥10k operation 实测记录 | `UID-04` 单测 |
+| memory 单页 | O(200 选中 episode) + 选中集合子表 | 每次页面重读 | ≤150ms（release；debug 单测预算 ≤600ms，**不含 freshness**）；`uid05_freshness_scale_and_separate_timings` 在 ≥10k episode/≥50k link fixture 实测：页面 ≈1.3ms、freshness ≈294ms（debug 构建，macOS），freshness 不并入页面预算 | `UID-05` 单测 |
 | run 列表/详情 | metadata ≤5000 + state 解析 ≤500 × ≤64 KiB | 每次页面重读 | ≤400ms / ≤50ms、100 行 | `UID-06` 单测 |
 | 可用性探测 | O(5 数据面) | 每窗口一次 | ≤80ms（无争用）；持锁路径 busy timeout ≤200ms 后显示 `busy` | `UID-07` 单测 |
 

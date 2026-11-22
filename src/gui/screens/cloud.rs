@@ -11,6 +11,9 @@ use super::super::{
         action, badge, card, check, code, column, field, mono, muted, note, row, table, title,
     },
 };
+/// Placeholder/example repository name shown by the import preview.
+pub const IMPORT_EXAMPLE: &str = "your-repository";
+
 pub fn render(s: &Desktop, cx: &Context<Desktop>, p: &Palette) -> AnyElement {
     row()
         .id("cloud-page")
@@ -33,7 +36,7 @@ pub fn render(s: &Desktop, cx: &Context<Desktop>, p: &Palette) -> AnyElement {
                         .child(table(
                             &["Property", "Value"],
                             &[
-                                vec!["Project name", "acme-libra"],
+                                vec!["Project name", "your-repository"],
                                 vec!["Repository ID", "7c1f0a52-3e9b-4d1a-9b55-0e2f4c8d61aa"],
                                 vec!["Last sync", "yesterday 18:40"],
                                 vec!["Includes", "objects, refs, agent-capture catalog"],
@@ -56,7 +59,7 @@ pub fn render(s: &Desktop, cx: &Context<Desktop>, p: &Palette) -> AnyElement {
                 .child(
                     card(p)
                         .child(title("Restore from cloud"))
-                        .child(field("PROJECT NAME OR REPOSITORY ID", "acme-libra", p))
+                        .child(field("PROJECT NAME OR REPOSITORY ID", IMPORT_EXAMPLE, p))
                         .child(check(
                             "metadata-only",
                             "Metadata only (skip object download)",

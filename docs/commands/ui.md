@@ -33,8 +33,8 @@ The toolbar and **All tools** (`⌘K`) open the other desktop views:
 - Cloud/remotes, sparse views/layers, file dependencies, Mega2, settings, splash,
   startup-error illustration and About.
 
-These views cover the 26 supplied design screens using native GPUI components. Splash and startup error
-are inspectable illustrations in All tools; they do not run repository checks.
+These views cover the 26 supplied design screens using native GPUI components. Splash shows the real repository/data-surface availability; the startup-error
+screen is an inspectable illustration in All tools and runs no repository checks.
 Sessions has light and dark themes, readable-content search and local filters.
 Form editing and checkboxes affect the preview only. No settings are saved.
 
@@ -49,6 +49,11 @@ paging slices that snapshot, so pages never repeat or drop rows, and a new
 snapshot resets the list to page one. Summaries are redacted excerpts.
 The Memory page shows bounded real episodes (≤200) from the projection; a stale
 projection shows zero rows with a `libra memory rebuild` hint, matching the CLI.
+Splash, Welcome, About and the capability map show the real repository context and
+each data surface's observed state (unchecked surfaces show `未检查`). The window
+label is **Read-only preview**; pages that still render bundled demonstration
+content carry a per-page `demo` badge. Search covers pages and surface states,
+and the bundled session catalog has been removed.
 Reviews and Investigate show real run directories (newest 100 per kind) with
 item-level states: a corrupt, oversized, incomplete or unknown-kind run affects
 only its own row, and a scan cap marks the list as a truncated subset.
@@ -60,8 +65,7 @@ shows an empty state. Inside History, the inspector's prompt, session, tool and
 checkpoint details are sample content; only the commit metadata and attribution
 counts are real. Navigation, selection, tabs and theme changes are local
 UI interactions. Repository, agent, trust,
-restore, network and account actions do not execute. These actions show a preview notice. Views other than History carry a
-**Design preview** label in the global navigation bar. Close the window or
+restore, network and account actions do not execute. These actions show a preview notice. Every page carries a **Read-only preview** label beside the shared context bar (and in the global navigation bar where that bar is shown). Close the window or
 press `⌘Q` to exit; `Esc` dismisses the command palette.
 The logo is a bundled copy of `https://libra.tools/libra-logo-without-words.svg`;
 fonts and assets load offline. macOS is the current validation target.

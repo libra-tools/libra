@@ -1,51 +1,31 @@
-//! Data requirements and missing-evidence states.
+//! Capability map: real availability of the five data surfaces.
 use ely_gpui_component::theme::Palette;
-use gpui::{
-    AnyElement, Context, InteractiveElement, IntoElement, ParentElement,
-    StatefulInteractiveElement, Styled, px,
-};
+use gpui::{AnyElement, Context, IntoElement, ParentElement, Styled};
 
 use super::super::{
-    desktop::{Desktop, Page},
-    model,
-    widgets::{column, muted, nav, note, row, table, title},
+    desktop::Desktop,
+    widgets::{column, label, mono, muted, title},
 };
-pub fn render(_: &Desktop, cx: &Context<Desktop>, p: &Palette) -> AnyElement {
-    let rows = match model::catalog() {
-        Ok(catalog) => catalog
-            .capability_map
-            .iter()
-            .map(|r| {
-                vec![
-                    r.capability.as_str(),
-                    r.basis.as_str(),
-                    r.data.as_str(),
-                    r.missing.as_str(),
-                ]
-            })
-            .collect::<Vec<_>>(),
-        Err(error) => return note(error.clone(), p).into_any_element(),
-    };
+
+pub fn render(s: &Desktop, _cx: &Context<Desktop>, p: &Palette) -> AnyElement {
+    let availability = &s.availability;
     column()
-        .id("capabilities")
         .size_full()
-        .overflow_y_scroll()
         .p_6()
-        .gap_5()
-        .child(
-            row()
-                .child(title("Interface capability"))
-                .child(nav(Page::Sessions, cx)),
-        )
+        .gap_2()
+        .child(title("Capability map"))
         .child(muted(
-            "Plan basis, data required, and what to show when it is missing. The rows are mocked.",
+            "Each surface is labelled with the state the window actually observed.",
             p,
         ))
-        .child(note(
-            "Captured source evidence is the boundary. Missing reasoning, usage, test results or approvals remain \
-             missing.",
-            p,
-        ))
-        .child(table(&["Capability", "Basis", "Data required", "When missing"], &rows, p).min_w(px(900.0)))
+        .child(label("SURFACE · STATE", p))
+        .children(availability.sources.iter().map(|source| {
+            mono(format!(
+                "{}: {} ({})",
+                source.name,
+                source.label,
+                source.state.label()
+            ))
+        }))
         .into_any_element()
 }

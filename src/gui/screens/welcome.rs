@@ -1,112 +1,70 @@
-//! Welcome and import form. The preview never opens or creates repositories.
+//! Welcome: repository summary inside a repository, entry points outside.
 use ely_gpui_component::theme::Palette;
-use gpui::{
-    AnyElement, Context, InteractiveElement, IntoElement, ParentElement,
-    StatefulInteractiveElement, Styled, div, img, px,
-};
+use gpui::{AnyElement, Context, IntoElement, ParentElement, Styled, div, prelude::FluentBuilder};
 
 use super::super::{
-    desktop::{Desktop, Page},
-    widgets::{
-        action, badge, card, check, code, column, field, label, muted, nav, note, row, tabs, title,
-    },
+    desktop::Desktop,
+    widgets::{badge, card, column, field, label, mono, muted, title},
 };
-pub fn render(s: &Desktop, cx: &Context<Desktop>, p: &Palette) -> AnyElement {
-    row()
-        .id("welcome")
+
+pub fn render(s: &Desktop, _cx: &Context<Desktop>, p: &Palette) -> AnyElement {
+    let availability = &s.availability;
+    column()
         .size_full()
-        .overflow_y_scroll()
-        .items_start()
-        .p_8()
-        .gap_8()
-        .child(
-            column()
-                .flex_1()
-                .gap_5()
-                .p_5()
-                .child(img("libra/logo.svg").size(px(96.0)))
-                .child(title("Version control that remembers how work was done").text_size(px(34.0)))
-                .child(
-                    muted(
-                        "Git-compatible. Local-first. Records prompts, agent sessions and checkpoints next to your \
-                         commits.",
-                        p,
-                    )
-                    .text_size(px(15.0)),
-                )
-                .child(tabs(&["Import from Git", "Clone", "Open", "New"], s.tab, cx))
-                .child(label("RECENT", p))
-                .children(
-                    [
-                        ("acme-libra", "~/work/acme-libra · main", "2 agents capturing"),
-                        ("gateway-sdk", "~/work/gateway-sdk · release/0.4", "capture off"),
-                        ("docs-site", "~/work/docs-site · main", "capture off"),
-                    ]
-                    .iter()
-                    .map(|(name, path, state)| {
+        .p_6()
+        .gap_2()
+        .child(title("Welcome to Libra"))
+        .when(availability.repo.is_available(), |body| {
+            body.child(badge("repository opened", 0x2f6f4e, 0xf2f7f3))
+                .child(mono(format!(
+                    "{} · {} · HEAD {} · {}",
+                    availability.repo_label,
+                    availability.branch,
+                    availability.head,
+                    availability.object_format
+                )))
+                .child(label("SURFACES", p))
+                .children(availability.sources.iter().map(|source| {
+                    mono(format!("{}: {}", source.name, source.label))
+                }))
+        })
+        .when(
+            !availability.repo.is_available()
+                && !matches!(availability.repo, crate::gui::data::SourceState::Absent),
+            |body| {
+                body.child(muted(
+                    format!(
+                        "The repository is {}: {}",
+                        availability.repo.label(),
+                        availability.repo.hint().unwrap_or("retry shortly")
+                    ),
+                    p,
+                ))
+            },
+        )
+        .when(matches!(availability.repo, crate::gui::data::SourceState::Absent), |body| {
+            body.child(muted(
+                "No repository is open here. Import, clone or open a repository from the entries below.",
+                p,
+            ))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
                         card(p)
-                            .id(gpui::SharedString::from(format!("recent-{name}")))
-                            .child(
-                                row()
-                                    .child(*name)
-                                    .child(div().flex_1())
-                                    .child(badge(*state, 0x166534, 0xf0fdf4)),
-                            )
-                            .child(muted(*path, p))
-                            .child(nav(Page::History, cx))
-                    }),
-                ),
-        )
-        .child(
-            card(p)
-                .flex_1()
-                .mt_5()
-                .p_6()
-                .gap_5()
-                .child(title(
-                    [
-                        "Import a Git repository",
-                        "Clone a repository",
-                        "Open a Libra repository",
-                        "Create a new repository",
-                    ]
-                    .get(s.tab)
-                    .copied()
-                    .unwrap_or("Import a Git repository"),
-                ))
-                .child(muted(
-                    "Libra uses Git's object model. History, branches and remotes come along.",
-                    p,
-                ))
-                .child(field(
-                    if s.tab == 1 { "REMOTE URL" } else { "GIT REPOSITORY" },
-                    if s.tab == 1 {
-                        "https://github.com/acme/acme.git"
-                    } else {
-                        "~/work/acme"
-                    },
-                    p,
-                ))
-                .child(action("browse-import", "Browse…", false, cx))
-                .child(field("NEW LIBRA REPOSITORY", "~/work/acme-libra", p))
-                .child(label("AFTER IMPORT", p))
-                .child(check("import-claude", "Enable capture for Claude Code", true, s, cx))
-                .child(check("import-codex", "Enable capture for Codex", true, s, cx))
-                .child(check("import-opencode", "Enable capture for OpenCode", false, s, cx))
-                .child(note(
-                    "Each agent's RPC adapter stays closed until you trust it. You can change this later in Agents.",
-                    p,
-                ))
-                .child(label("EQUIVALENT COMMAND", p))
-                .child(code(
-                    "libra init --from-git-repository ./acme ./acme-libra\nlibra agent enable --agent claude-code",
-                ))
-                .child(row().child(action("cancel-import", "Cancel", false, cx)).child(action(
-                    "import-repo",
-                    "Import repository",
-                    true,
-                    cx,
-                ))),
-        )
+                            .child(title("Import a repository"))
+                            .child(field(
+                                "PROJECT NAME OR REPOSITORY ID",
+                                crate::gui::screens::cloud::IMPORT_EXAMPLE,
+                                p,
+                            ))
+                            .child(muted("Preview only; import does not execute here.", p)),
+                    )
+                    .child(card(p).child(title("Clone a repository")))
+                    .child(card(p).child(title("Open a repository"))),
+            )
+        })
         .into_any_element()
 }

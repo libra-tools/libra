@@ -111,6 +111,18 @@ impl SessionsWindow {
         }
     }
 
+    /// Refresh only the capability rows (late availability merges).
+    pub fn set_capabilities(
+        &mut self,
+        capabilities: Vec<model::Capability>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(catalog) = self.catalog.as_mut() {
+            catalog.capability_map = capabilities;
+            cx.notify();
+        }
+    }
+
     /// Install the real sessions read by the window worker.
     pub fn set_catalog(
         &mut self,
