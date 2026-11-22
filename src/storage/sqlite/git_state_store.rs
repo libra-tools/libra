@@ -22,28 +22,137 @@ use crate::{
         backend::StorageBackendKind,
         error::{StorageBackendError, StorageResult},
         git_state_store::{
-            AiOperationLinkRecord, BisectStateRecord, ChangeIdentityRecord,
-            ChangePredecessorRecord, ChangeRevisionRecord, GitStateStore, LayerPathRecord,
-            LayerRecord, OP_HEAD_GENERATION_SENTINEL, OperationHeadCasOutcome,
-            OperationHeadConvergeOutcome, OperationHeadsSnapshot, OperationJournalRecord,
-            OperationRecord, OperationScopeKind, OperationScopeProvenance, RebaseStateRecord,
-            SequenceStateRecord, SparseViewSnapshot, WorkingDirtyEntryRecord,
-            WorkingDirtyMetaRecord, WorkspaceLeaseAcquireOutcome, WorkspaceLeaseMutationOutcome,
-            WorkspaceRecordKind, WorkspaceRecordOwnerKind, WorkspaceRecordRow,
-            WorkspaceRecordState, WorktreeIntentOp, WorktreeIntentRecord, WorktreeIntentWrite,
-            WorktreeLifecycleRecord, WorktreeLifecycleState, normalize_op_heads,
-            validate_ai_operation_link, validate_bisect_state, validate_change_identity,
+            AiDecisionProposalRecord, AiFinalDecisionRecord, AiIndexIntentContextFrameRecord,
+            AiIndexIntentPlanRecord, AiIndexIntentTaskRecord, AiIndexPlanStepTaskRecord,
+            AiIndexRunEventRecord, AiIndexRunPatchsetRecord, AiIndexTaskRunRecord,
+            AiLiveContextWindowRecord, AiOperationLinkRecord, AiRiskScoreBreakdownRecord,
+            AiSchedulerPlanHeadRecord, AiSchedulerSelectedPlanRecord, AiSchedulerStateRecord,
+            AiThreadIntentRecord, AiThreadParticipantRecord, AiThreadProviderMetadataRecord,
+            AiThreadRecord, AiValidationReportRecord, ApprovedPermissionRecord,
+            AutomationLogRecord, BisectStateRecord, BridgeIndexPublicationRecord,
+            ChangeIdentityRecord, ChangePredecessorRecord, ChangeRevisionRecord, GitStateStore,
+            LayerPathRecord, LayerRecord, MemoryEpisodeEvidenceRecord, MemoryEpisodePathRecord,
+            MemoryEpisodeRecord, MemoryEpisodeSearchDocRecord, MemoryEvidenceKind,
+            MemoryLinkConfidence, MemoryOutcome, MemoryPathChangeKind, MemoryProjectionStateRecord,
+            MemoryResolutionStatus, MemorySourceKind, OP_HEAD_GENERATION_SENTINEL,
+            OperationHeadCasOutcome, OperationHeadConvergeOutcome, OperationHeadsSnapshot,
+            OperationJournalRecord, OperationRecord, OperationScopeKind, OperationScopeProvenance,
+            RebaseStateRecord, SequenceStateRecord, SourceCallLogRecord, SparseViewSnapshot,
+            WorkingDirtyEntryRecord, WorkingDirtyMetaRecord, WorkspaceLeaseAcquireOutcome,
+            WorkspaceLeaseMutationOutcome, WorkspaceRecordKind, WorkspaceRecordOwnerKind,
+            WorkspaceRecordRow, WorkspaceRecordState, WorktreeIntentOp, WorktreeIntentRecord,
+            WorktreeIntentWrite, WorktreeLifecycleRecord, WorktreeLifecycleState,
+            normalize_op_heads, validate_ai_decision_proposal, validate_ai_final_decision,
+            validate_ai_index_intent_context_frame, validate_ai_index_intent_plan,
+            validate_ai_index_intent_task, validate_ai_index_plan_step_task,
+            validate_ai_index_run_event, validate_ai_index_run_patchset,
+            validate_ai_index_task_run, validate_ai_live_context_window,
+            validate_ai_operation_link, validate_ai_risk_score_breakdown,
+            validate_ai_scheduler_plan_head, validate_ai_scheduler_selected_plan,
+            validate_ai_scheduler_state, validate_ai_thread, validate_ai_thread_intent,
+            validate_ai_thread_participant, validate_ai_thread_provider_metadata,
+            validate_ai_validation_report, validate_approved_permission, validate_automation_log,
+            validate_bisect_state, validate_bridge_operation_id, validate_change_identity,
             validate_change_predecessor, validate_change_revision, validate_layer_path_record,
-            validate_layer_record, validate_no_nul, validate_operation_journal,
+            validate_layer_record, validate_memory_code_path, validate_memory_episode,
+            validate_memory_episode_evidence, validate_memory_episode_path,
+            validate_memory_projection_state, validate_no_nul, validate_operation_journal,
             validate_operation_record, validate_opt_hex_oid, validate_opt_no_nul,
-            validate_rebase_state, validate_sequence_state, validate_working_dirty_entry,
-            validate_working_dirty_meta, validate_workspace_record, validate_worktree_intent_write,
-            validate_worktree_lifecycle,
+            validate_rebase_state, validate_sequence_state, validate_source_call_log,
+            validate_working_dirty_entry, validate_working_dirty_meta, validate_workspace_record,
+            validate_worktree_intent_write, validate_worktree_lifecycle,
         },
-        git_store::{validate_hex_oid, validate_non_empty_identifier},
+        git_store::{
+            BridgePublicationPhase, BridgePublicationRecord, validate_hex_oid,
+            validate_non_empty_identifier,
+        },
         sqlite::map_sqlite_db_err,
     },
 };
+
+const CREATE_BRIDGE_PUBLICATION_SQL: &str = "\
+CREATE TABLE IF NOT EXISTS agent_bridge_publication ( \
+    operation_id TEXT PRIMARY KEY, \
+    commit_oid TEXT NOT NULL, \
+    phase TEXT NOT NULL DEFAULT 'published' \
+)";
+
+const CREATE_BRIDGE_INDEX_PUBLICATION_SQL: &str = "\
+CREATE TABLE IF NOT EXISTS agent_bridge_index_publication ( \
+    operation_id TEXT PRIMARY KEY, \
+    index_digest TEXT NOT NULL, \
+    phase TEXT NOT NULL DEFAULT 'prepared' \
+)";
+
+async fn ensure_bridge_publication_tables(conn: &DatabaseConnection) -> StorageResult<()> {
+    let backend = conn.get_database_backend();
+    conn.execute_raw(Statement::from_string(
+        backend,
+        CREATE_BRIDGE_PUBLICATION_SQL.to_string(),
+    ))
+    .await
+    .map_err(|err| {
+        map_sqlite_db_err(
+            DatabaseRole::Repository,
+            "create agent_bridge_publication table",
+            err,
+        )
+    })?;
+    let col_row = conn
+        .query_one_raw(Statement::from_string(
+            backend,
+            "SELECT COUNT(*) FROM pragma_table_info('agent_bridge_publication') WHERE name = 'phase'"
+                .to_string(),
+        ))
+        .await
+        .map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "inspect agent_bridge_publication columns",
+                err,
+            )
+        })?;
+    let count: i64 = col_row
+        .ok_or_else(|| StorageBackendError::BackendInternal {
+            detail: "failed to inspect agent_bridge_publication phase column".to_string(),
+        })?
+        .try_get_by_index(0)
+        .map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "decode agent_bridge_publication column count",
+                err,
+            )
+        })?;
+    if count == 0 {
+        conn.execute_raw(Statement::from_string(
+            backend,
+            "ALTER TABLE agent_bridge_publication ADD COLUMN phase TEXT NOT NULL DEFAULT 'published'"
+                .to_string(),
+        ))
+        .await
+        .map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "add phase column to agent_bridge_publication",
+                err,
+            )
+        })?;
+    }
+    conn.execute_raw(Statement::from_string(
+        backend,
+        CREATE_BRIDGE_INDEX_PUBLICATION_SQL.to_string(),
+    ))
+    .await
+    .map_err(|err| {
+        map_sqlite_db_err(
+            DatabaseRole::Repository,
+            "create agent_bridge_index_publication table",
+            err,
+        )
+    })?;
+    Ok(())
+}
 
 async fn insert_operation_records_in_txn<C: ConnectionTrait>(
     txn: &C,
@@ -191,6 +300,7 @@ impl SqliteGitStateStore {
         let conn = create_database_for_role(path_str, DatabaseRole::Repository)
             .await
             .map_err(|err| StorageBackendError::io("create sqlite git state store", err))?;
+        ensure_bridge_publication_tables(&conn).await?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -219,6 +329,7 @@ impl SqliteGitStateStore {
         let conn = establish_connection_for_role(path_str, DatabaseRole::Repository)
             .await
             .map_err(|err| StorageBackendError::io("open sqlite git state store", err))?;
+        ensure_bridge_publication_tables(&conn).await?;
         Ok(Self {
             conn,
             read_only: false,
@@ -2831,4 +2942,3382 @@ impl GitStateStore for SqliteGitStateStore {
             map_sqlite_db_err(DatabaseRole::Repository, "commit clear_sparse_view", err)
         })
     }
+
+    // -------------------------------------------------------------------------
+    // RB-05b AC1: 19 `ai_*` Tables
+    // -------------------------------------------------------------------------
+
+    async fn upsert_ai_thread(&self, record: &AiThreadRecord) -> StorageResult<()> {
+        self.ensure_writable()?;
+        validate_ai_thread(record)?;
+        let txn = begin_write_transaction(&self.conn).await.map_err(|err| {
+            map_sqlite_db_err(DatabaseRole::Repository, "begin upsert_ai_thread", err)
+        })?;
+        let backend = txn.get_database_backend();
+        txn.execute_raw(Statement::from_sql_and_values(
+            backend,
+            "INSERT INTO ai_thread \
+             (thread_id, title, owner_kind, owner_id, owner_display_name, current_intent_id, \
+              latest_intent_id, metadata_json, archived, version, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(thread_id) DO UPDATE SET \
+               title = excluded.title, owner_kind = excluded.owner_kind, \
+               owner_id = excluded.owner_id, owner_display_name = excluded.owner_display_name, \
+               current_intent_id = excluded.current_intent_id, \
+               latest_intent_id = excluded.latest_intent_id, \
+               metadata_json = excluded.metadata_json, archived = excluded.archived, \
+               version = excluded.version, created_at = excluded.created_at, \
+               updated_at = excluded.updated_at",
+            [
+                record.thread_id.clone().into(),
+                record.title.clone().into(),
+                record.owner_kind.clone().into(),
+                record.owner_id.clone().into(),
+                record.owner_display_name.clone().into(),
+                record.current_intent_id.clone().into(),
+                record.latest_intent_id.clone().into(),
+                record.metadata_json.clone().into(),
+                i64::from(record.archived).into(),
+                record.version.into(),
+                record.created_at.into(),
+                record.updated_at.into(),
+            ],
+        ))
+        .await
+        .map_err(|err| map_sqlite_db_err(DatabaseRole::Repository, "upsert ai_thread", err))?;
+        txn.commit().await.map_err(|err| {
+            map_sqlite_db_err(DatabaseRole::Repository, "commit upsert_ai_thread", err)
+        })
+    }
+
+    async fn get_ai_thread(&self, thread_id: &str) -> StorageResult<Option<AiThreadRecord>> {
+        validate_non_empty_identifier(thread_id, "ai_thread thread_id")?;
+        let backend = self.conn.get_database_backend();
+        let row = self
+            .conn
+            .query_one_raw(Statement::from_sql_and_values(
+                backend,
+                "SELECT thread_id, title, owner_kind, owner_id, owner_display_name, \
+                        current_intent_id, latest_intent_id, metadata_json, archived, \
+                        version, created_at, updated_at \
+                 FROM ai_thread WHERE thread_id = ?",
+                [thread_id.into()],
+            ))
+            .await
+            .map_err(|err| map_sqlite_db_err(DatabaseRole::Repository, "get ai_thread", err))?;
+        row.as_ref().map(decode_ai_thread).transpose()
+    }
+
+    async fn list_ai_threads(
+        &self,
+        archived_filter: Option<bool>,
+    ) -> StorageResult<Vec<AiThreadRecord>> {
+        let backend = self.conn.get_database_backend();
+        let stmt = match archived_filter {
+            Some(archived) => Statement::from_sql_and_values(
+                backend,
+                "SELECT thread_id, title, owner_kind, owner_id, owner_display_name, \
+                        current_intent_id, latest_intent_id, metadata_json, archived, \
+                        version, created_at, updated_at \
+                 FROM ai_thread WHERE archived = ? ORDER BY updated_at DESC, thread_id ASC",
+                [i64::from(archived).into()],
+            ),
+            None => Statement::from_string(
+                backend,
+                "SELECT thread_id, title, owner_kind, owner_id, owner_display_name, \
+                        current_intent_id, latest_intent_id, metadata_json, archived, \
+                        version, created_at, updated_at \
+                 FROM ai_thread ORDER BY updated_at DESC, thread_id ASC"
+                    .to_string(),
+            ),
+        };
+        let rows =
+            self.conn.query_all_raw(stmt).await.map_err(|err| {
+                map_sqlite_db_err(DatabaseRole::Repository, "list ai_thread", err)
+            })?;
+        rows.iter().map(decode_ai_thread).collect()
+    }
+
+    async fn delete_ai_thread(&self, thread_id: &str) -> StorageResult<bool> {
+        self.ensure_writable()?;
+        validate_non_empty_identifier(thread_id, "ai_thread thread_id")?;
+        let txn = begin_write_transaction(&self.conn).await.map_err(|err| {
+            map_sqlite_db_err(DatabaseRole::Repository, "begin delete_ai_thread", err)
+        })?;
+        let backend = txn.get_database_backend();
+        for sql in [
+            "DELETE FROM ai_thread_participant WHERE thread_id = ?",
+            "DELETE FROM ai_thread_intent WHERE thread_id = ?",
+            "DELETE FROM ai_thread_provider_metadata WHERE thread_id = ?",
+            "DELETE FROM ai_scheduler_state WHERE thread_id = ?",
+            "DELETE FROM ai_scheduler_plan_head WHERE thread_id = ?",
+            "DELETE FROM ai_scheduler_selected_plan WHERE thread_id = ?",
+            "DELETE FROM ai_live_context_window WHERE thread_id = ?",
+            "DELETE FROM ai_validation_report WHERE thread_id = ?",
+            "DELETE FROM ai_risk_score_breakdown WHERE thread_id = ?",
+            "DELETE FROM ai_decision_proposal WHERE thread_id = ?",
+            "DELETE FROM ai_final_decision WHERE thread_id = ?",
+        ] {
+            txn.execute_raw(Statement::from_sql_and_values(
+                backend,
+                sql,
+                [thread_id.into()],
+            ))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(
+                    DatabaseRole::Repository,
+                    "cascade delete ai_thread child",
+                    err,
+                )
+            })?;
+        }
+        let res = txn
+            .execute_raw(Statement::from_sql_and_values(
+                backend,
+                "DELETE FROM ai_thread WHERE thread_id = ?",
+                [thread_id.into()],
+            ))
+            .await
+            .map_err(|err| map_sqlite_db_err(DatabaseRole::Repository, "delete ai_thread", err))?;
+        txn.commit().await.map_err(|err| {
+            map_sqlite_db_err(DatabaseRole::Repository, "commit delete_ai_thread", err)
+        })?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    async fn upsert_ai_thread_participant(
+        &self,
+        record: &AiThreadParticipantRecord,
+    ) -> StorageResult<()> {
+        self.ensure_writable()?;
+        validate_ai_thread_participant(record)?;
+        let txn = begin_write_transaction(&self.conn).await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "begin upsert_ai_thread_participant",
+                err,
+            )
+        })?;
+        ensure_ai_thread_exists_in_txn(&txn, &record.thread_id).await?;
+        let backend = txn.get_database_backend();
+        txn.execute_raw(Statement::from_sql_and_values(
+            backend,
+            "INSERT INTO ai_thread_participant \
+             (thread_id, actor_kind, actor_id, actor_display_name, role, joined_at) \
+             VALUES (?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(thread_id, actor_kind, actor_id) DO UPDATE SET \
+               actor_display_name = excluded.actor_display_name, \
+               role = excluded.role, joined_at = excluded.joined_at",
+            [
+                record.thread_id.clone().into(),
+                record.actor_kind.clone().into(),
+                record.actor_id.clone().into(),
+                record.actor_display_name.clone().into(),
+                record.role.clone().into(),
+                record.joined_at.into(),
+            ],
+        ))
+        .await
+        .map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "upsert ai_thread_participant",
+                err,
+            )
+        })?;
+        txn.commit().await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "commit upsert_ai_thread_participant",
+                err,
+            )
+        })
+    }
+
+    async fn list_ai_thread_participants(
+        &self,
+        thread_id: &str,
+    ) -> StorageResult<Vec<AiThreadParticipantRecord>> {
+        validate_non_empty_identifier(thread_id, "ai_thread_participant thread_id")?;
+        let backend = self.conn.get_database_backend();
+        let rows = self
+            .conn
+            .query_all_raw(Statement::from_sql_and_values(
+                backend,
+                "SELECT thread_id, actor_kind, actor_id, actor_display_name, role, joined_at \
+                 FROM ai_thread_participant WHERE thread_id = ? \
+                 ORDER BY actor_kind ASC, actor_id ASC",
+                [thread_id.into()],
+            ))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(DatabaseRole::Repository, "list ai_thread_participant", err)
+            })?;
+        rows.iter().map(decode_ai_thread_participant).collect()
+    }
+
+    async fn upsert_ai_thread_intent(&self, record: &AiThreadIntentRecord) -> StorageResult<()> {
+        self.ensure_writable()?;
+        validate_ai_thread_intent(record)?;
+        let txn = begin_write_transaction(&self.conn).await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "begin upsert_ai_thread_intent",
+                err,
+            )
+        })?;
+        ensure_ai_thread_exists_in_txn(&txn, &record.thread_id).await?;
+        let backend = txn.get_database_backend();
+        txn.execute_raw(Statement::from_sql_and_values(
+            backend,
+            "INSERT INTO ai_thread_intent \
+             (thread_id, intent_id, ordinal, is_head, linked_at, link_reason) \
+             VALUES (?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(thread_id, intent_id) DO UPDATE SET \
+               ordinal = excluded.ordinal, is_head = excluded.is_head, \
+               linked_at = excluded.linked_at, link_reason = excluded.link_reason",
+            [
+                record.thread_id.clone().into(),
+                record.intent_id.clone().into(),
+                record.ordinal.into(),
+                i64::from(record.is_head).into(),
+                record.linked_at.into(),
+                record.link_reason.clone().into(),
+            ],
+        ))
+        .await
+        .map_err(|err| {
+            map_sqlite_db_err(DatabaseRole::Repository, "upsert ai_thread_intent", err)
+        })?;
+        txn.commit().await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "commit upsert_ai_thread_intent",
+                err,
+            )
+        })
+    }
+
+    async fn list_ai_thread_intents(
+        &self,
+        thread_id: &str,
+    ) -> StorageResult<Vec<AiThreadIntentRecord>> {
+        validate_non_empty_identifier(thread_id, "ai_thread_intent thread_id")?;
+        let backend = self.conn.get_database_backend();
+        let rows = self
+            .conn
+            .query_all_raw(Statement::from_sql_and_values(
+                backend,
+                "SELECT thread_id, intent_id, ordinal, is_head, linked_at, link_reason \
+                 FROM ai_thread_intent WHERE thread_id = ? \
+                 ORDER BY ordinal ASC, intent_id ASC",
+                [thread_id.into()],
+            ))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(DatabaseRole::Repository, "list ai_thread_intent", err)
+            })?;
+        rows.iter().map(decode_ai_thread_intent).collect()
+    }
+
+    async fn upsert_ai_thread_provider_metadata(
+        &self,
+        record: &AiThreadProviderMetadataRecord,
+    ) -> StorageResult<()> {
+        self.ensure_writable()?;
+        validate_ai_thread_provider_metadata(record)?;
+        let txn = begin_write_transaction(&self.conn).await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "begin upsert_ai_thread_provider_metadata",
+                err,
+            )
+        })?;
+        ensure_ai_thread_exists_in_txn(&txn, &record.thread_id).await?;
+        let backend = txn.get_database_backend();
+        txn.execute_raw(Statement::from_sql_and_values(
+            backend,
+            "INSERT INTO ai_thread_provider_metadata \
+             (thread_id, legacy_session_id, provider_thread_id, provider_kind, metadata_json, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(thread_id) DO UPDATE SET \
+               legacy_session_id = excluded.legacy_session_id, \
+               provider_thread_id = excluded.provider_thread_id, \
+               provider_kind = excluded.provider_kind, \
+               metadata_json = excluded.metadata_json, updated_at = excluded.updated_at",
+            [
+                record.thread_id.clone().into(),
+                record.legacy_session_id.clone().into(),
+                record.provider_thread_id.clone().into(),
+                record.provider_kind.clone().into(),
+                record.metadata_json.clone().into(),
+                record.updated_at.into(),
+            ],
+        ))
+        .await
+        .map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "upsert ai_thread_provider_metadata",
+                err,
+            )
+        })?;
+        txn.commit().await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "commit upsert_ai_thread_provider_metadata",
+                err,
+            )
+        })
+    }
+
+    async fn get_ai_thread_provider_metadata(
+        &self,
+        thread_id: &str,
+    ) -> StorageResult<Option<AiThreadProviderMetadataRecord>> {
+        validate_non_empty_identifier(thread_id, "ai_thread_provider_metadata thread_id")?;
+        let backend = self.conn.get_database_backend();
+        let row = self
+            .conn
+            .query_one_raw(Statement::from_sql_and_values(
+                backend,
+                "SELECT thread_id, legacy_session_id, provider_thread_id, provider_kind, \
+                        metadata_json, updated_at \
+                 FROM ai_thread_provider_metadata WHERE thread_id = ?",
+                [thread_id.into()],
+            ))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(
+                    DatabaseRole::Repository,
+                    "get ai_thread_provider_metadata",
+                    err,
+                )
+            })?;
+        row.as_ref()
+            .map(decode_ai_thread_provider_metadata)
+            .transpose()
+    }
+
+    async fn upsert_ai_scheduler_state(
+        &self,
+        record: &AiSchedulerStateRecord,
+    ) -> StorageResult<()> {
+        self.ensure_writable()?;
+        validate_ai_scheduler_state(record)?;
+        let txn = begin_write_transaction(&self.conn).await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "begin upsert_ai_scheduler_state",
+                err,
+            )
+        })?;
+        ensure_ai_thread_exists_in_txn(&txn, &record.thread_id).await?;
+        let backend = txn.get_database_backend();
+        txn.execute_raw(Statement::from_sql_and_values(
+            backend,
+            "INSERT INTO ai_scheduler_state \
+             (thread_id, selected_plan_id, active_task_id, active_run_id, metadata_json, version, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(thread_id) DO UPDATE SET \
+               selected_plan_id = excluded.selected_plan_id, \
+               active_task_id = excluded.active_task_id, \
+               active_run_id = excluded.active_run_id, \
+               metadata_json = excluded.metadata_json, \
+               version = excluded.version, updated_at = excluded.updated_at",
+            [
+                record.thread_id.clone().into(),
+                record.selected_plan_id.clone().into(),
+                record.active_task_id.clone().into(),
+                record.active_run_id.clone().into(),
+                record.metadata_json.clone().into(),
+                record.version.into(),
+                record.updated_at.into(),
+            ],
+        ))
+        .await
+        .map_err(|err| {
+            map_sqlite_db_err(DatabaseRole::Repository, "upsert ai_scheduler_state", err)
+        })?;
+        txn.commit().await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "commit upsert_ai_scheduler_state",
+                err,
+            )
+        })
+    }
+
+    async fn get_ai_scheduler_state(
+        &self,
+        thread_id: &str,
+    ) -> StorageResult<Option<AiSchedulerStateRecord>> {
+        validate_non_empty_identifier(thread_id, "ai_scheduler_state thread_id")?;
+        let backend = self.conn.get_database_backend();
+        let row = self
+            .conn
+            .query_one_raw(Statement::from_sql_and_values(
+                backend,
+                "SELECT thread_id, selected_plan_id, active_task_id, active_run_id, \
+                        metadata_json, version, updated_at \
+                 FROM ai_scheduler_state WHERE thread_id = ?",
+                [thread_id.into()],
+            ))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(DatabaseRole::Repository, "get ai_scheduler_state", err)
+            })?;
+        row.as_ref().map(decode_ai_scheduler_state).transpose()
+    }
+
+    async fn replace_ai_scheduler_plan_heads(
+        &self,
+        thread_id: &str,
+        heads: &[AiSchedulerPlanHeadRecord],
+    ) -> StorageResult<()> {
+        self.ensure_writable()?;
+        validate_non_empty_identifier(thread_id, "ai_scheduler_plan_head thread_id")?;
+        let mut seen_plans = BTreeSet::new();
+        let mut seen_ords = BTreeSet::new();
+        for h in heads {
+            validate_ai_scheduler_plan_head(h)?;
+            if h.thread_id != thread_id {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: "ai_scheduler_plan_head thread_id mismatch".to_string(),
+                });
+            }
+            if !seen_plans.insert(h.plan_id.as_str()) || !seen_ords.insert(h.ordinal) {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: "duplicate plan_id or ordinal in ai_scheduler_plan_head".to_string(),
+                });
+            }
+        }
+        let txn = begin_write_transaction(&self.conn).await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "begin replace_ai_scheduler_plan_heads",
+                err,
+            )
+        })?;
+        ensure_ai_thread_exists_in_txn(&txn, thread_id).await?;
+        let backend = txn.get_database_backend();
+        txn.execute_raw(Statement::from_sql_and_values(
+            backend,
+            "DELETE FROM ai_scheduler_plan_head WHERE thread_id = ?",
+            [thread_id.into()],
+        ))
+        .await
+        .map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "clear ai_scheduler_plan_head",
+                err,
+            )
+        })?;
+        for h in heads {
+            txn.execute_raw(Statement::from_sql_and_values(
+                backend,
+                "INSERT INTO ai_scheduler_plan_head (thread_id, plan_id, ordinal) VALUES (?, ?, ?)",
+                [
+                    h.thread_id.clone().into(),
+                    h.plan_id.clone().into(),
+                    h.ordinal.into(),
+                ],
+            ))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(
+                    DatabaseRole::Repository,
+                    "insert ai_scheduler_plan_head",
+                    err,
+                )
+            })?;
+        }
+        txn.commit().await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "commit replace_ai_scheduler_plan_heads",
+                err,
+            )
+        })
+    }
+
+    async fn list_ai_scheduler_plan_heads(
+        &self,
+        thread_id: &str,
+    ) -> StorageResult<Vec<AiSchedulerPlanHeadRecord>> {
+        validate_non_empty_identifier(thread_id, "ai_scheduler_plan_head thread_id")?;
+        let backend = self.conn.get_database_backend();
+        let rows = self
+            .conn
+            .query_all_raw(Statement::from_sql_and_values(
+                backend,
+                "SELECT thread_id, plan_id, ordinal FROM ai_scheduler_plan_head \
+                 WHERE thread_id = ? ORDER BY ordinal ASC, plan_id ASC",
+                [thread_id.into()],
+            ))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(DatabaseRole::Repository, "list ai_scheduler_plan_head", err)
+            })?;
+        rows.iter().map(decode_ai_scheduler_plan_head).collect()
+    }
+
+    async fn replace_ai_scheduler_selected_plans(
+        &self,
+        thread_id: &str,
+        plans: &[AiSchedulerSelectedPlanRecord],
+    ) -> StorageResult<()> {
+        self.ensure_writable()?;
+        validate_non_empty_identifier(thread_id, "ai_scheduler_selected_plan thread_id")?;
+        let mut seen_plans = BTreeSet::new();
+        let mut seen_ords = BTreeSet::new();
+        for p in plans {
+            validate_ai_scheduler_selected_plan(p)?;
+            if p.thread_id != thread_id {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: "ai_scheduler_selected_plan thread_id mismatch".to_string(),
+                });
+            }
+            if !seen_plans.insert(p.plan_id.as_str()) || !seen_ords.insert(p.ordinal) {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: "duplicate plan_id or ordinal in ai_scheduler_selected_plan"
+                        .to_string(),
+                });
+            }
+        }
+        let txn = begin_write_transaction(&self.conn).await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "begin replace_ai_scheduler_selected_plans",
+                err,
+            )
+        })?;
+        ensure_ai_thread_exists_in_txn(&txn, thread_id).await?;
+        let backend = txn.get_database_backend();
+        txn.execute_raw(Statement::from_sql_and_values(
+            backend,
+            "DELETE FROM ai_scheduler_selected_plan WHERE thread_id = ?",
+            [thread_id.into()],
+        ))
+        .await
+        .map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "clear ai_scheduler_selected_plan",
+                err,
+            )
+        })?;
+        for p in plans {
+            txn.execute_raw(Statement::from_sql_and_values(
+                backend,
+                "INSERT INTO ai_scheduler_selected_plan (thread_id, plan_id, ordinal) VALUES (?, ?, ?)",
+                [
+                    p.thread_id.clone().into(),
+                    p.plan_id.clone().into(),
+                    p.ordinal.into(),
+                ],
+            ))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(
+                    DatabaseRole::Repository,
+                    "insert ai_scheduler_selected_plan",
+                    err,
+                )
+            })?;
+        }
+        txn.commit().await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "commit replace_ai_scheduler_selected_plans",
+                err,
+            )
+        })
+    }
+
+    async fn list_ai_scheduler_selected_plans(
+        &self,
+        thread_id: &str,
+    ) -> StorageResult<Vec<AiSchedulerSelectedPlanRecord>> {
+        validate_non_empty_identifier(thread_id, "ai_scheduler_selected_plan thread_id")?;
+        let backend = self.conn.get_database_backend();
+        let rows = self
+            .conn
+            .query_all_raw(Statement::from_sql_and_values(
+                backend,
+                "SELECT thread_id, plan_id, ordinal FROM ai_scheduler_selected_plan \
+                 WHERE thread_id = ? ORDER BY ordinal ASC, plan_id ASC",
+                [thread_id.into()],
+            ))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(
+                    DatabaseRole::Repository,
+                    "list ai_scheduler_selected_plan",
+                    err,
+                )
+            })?;
+        rows.iter().map(decode_ai_scheduler_selected_plan).collect()
+    }
+
+    async fn replace_ai_live_context_window(
+        &self,
+        thread_id: &str,
+        entries: &[AiLiveContextWindowRecord],
+    ) -> StorageResult<()> {
+        self.ensure_writable()?;
+        validate_non_empty_identifier(thread_id, "ai_live_context_window thread_id")?;
+        let mut seen_frames = BTreeSet::new();
+        let mut seen_pos = BTreeSet::new();
+        for e in entries {
+            validate_ai_live_context_window(e)?;
+            if e.thread_id != thread_id {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: "ai_live_context_window thread_id mismatch".to_string(),
+                });
+            }
+            if !seen_frames.insert(e.context_frame_id.as_str()) || !seen_pos.insert(e.position) {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: "duplicate context_frame_id or position in ai_live_context_window"
+                        .to_string(),
+                });
+            }
+        }
+        let txn = begin_write_transaction(&self.conn).await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "begin replace_ai_live_context_window",
+                err,
+            )
+        })?;
+        ensure_ai_thread_exists_in_txn(&txn, thread_id).await?;
+        let backend = txn.get_database_backend();
+        txn.execute_raw(Statement::from_sql_and_values(
+            backend,
+            "DELETE FROM ai_live_context_window WHERE thread_id = ?",
+            [thread_id.into()],
+        ))
+        .await
+        .map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "clear ai_live_context_window",
+                err,
+            )
+        })?;
+        for e in entries {
+            txn.execute_raw(Statement::from_sql_and_values(
+                backend,
+                "INSERT INTO ai_live_context_window \
+                 (thread_id, context_frame_id, position, source_kind, pin_kind, inserted_at) \
+                 VALUES (?, ?, ?, ?, ?, ?)",
+                [
+                    e.thread_id.clone().into(),
+                    e.context_frame_id.clone().into(),
+                    e.position.into(),
+                    e.source_kind.clone().into(),
+                    e.pin_kind.clone().into(),
+                    e.inserted_at.into(),
+                ],
+            ))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(
+                    DatabaseRole::Repository,
+                    "insert ai_live_context_window",
+                    err,
+                )
+            })?;
+        }
+        txn.commit().await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "commit replace_ai_live_context_window",
+                err,
+            )
+        })
+    }
+
+    async fn list_ai_live_context_window(
+        &self,
+        thread_id: &str,
+    ) -> StorageResult<Vec<AiLiveContextWindowRecord>> {
+        validate_non_empty_identifier(thread_id, "ai_live_context_window thread_id")?;
+        let backend = self.conn.get_database_backend();
+        let rows = self
+            .conn
+            .query_all_raw(Statement::from_sql_and_values(
+                backend,
+                "SELECT thread_id, context_frame_id, position, source_kind, pin_kind, inserted_at \
+                 FROM ai_live_context_window WHERE thread_id = ? \
+                 ORDER BY position ASC, context_frame_id ASC",
+                [thread_id.into()],
+            ))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(DatabaseRole::Repository, "list ai_live_context_window", err)
+            })?;
+        rows.iter().map(decode_ai_live_context_window).collect()
+    }
+
+    async fn upsert_ai_index_intent_plan(
+        &self,
+        record: &AiIndexIntentPlanRecord,
+    ) -> StorageResult<()> {
+        self.ensure_writable()?;
+        validate_ai_index_intent_plan(record)?;
+        let txn = begin_write_transaction(&self.conn).await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "begin upsert_ai_index_intent_plan",
+                err,
+            )
+        })?;
+        let backend = txn.get_database_backend();
+        txn.execute_raw(Statement::from_sql_and_values(
+            backend,
+            "INSERT INTO ai_index_intent_plan (intent_id, plan_id, created_at) \
+             VALUES (?, ?, ?) \
+             ON CONFLICT(intent_id, plan_id) DO UPDATE SET created_at = excluded.created_at",
+            [
+                record.intent_id.clone().into(),
+                record.plan_id.clone().into(),
+                record.created_at.into(),
+            ],
+        ))
+        .await
+        .map_err(|err| {
+            map_sqlite_db_err(DatabaseRole::Repository, "upsert ai_index_intent_plan", err)
+        })?;
+        txn.commit().await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "commit upsert_ai_index_intent_plan",
+                err,
+            )
+        })
+    }
+
+    async fn list_ai_index_intent_plans(
+        &self,
+        intent_id: &str,
+    ) -> StorageResult<Vec<AiIndexIntentPlanRecord>> {
+        validate_non_empty_identifier(intent_id, "ai_index_intent_plan intent_id")?;
+        let backend = self.conn.get_database_backend();
+        let rows = self
+            .conn
+            .query_all_raw(Statement::from_sql_and_values(
+                backend,
+                "SELECT intent_id, plan_id, created_at FROM ai_index_intent_plan \
+                 WHERE intent_id = ? ORDER BY created_at ASC, plan_id ASC",
+                [intent_id.into()],
+            ))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(DatabaseRole::Repository, "list ai_index_intent_plan", err)
+            })?;
+        rows.iter().map(decode_ai_index_intent_plan).collect()
+    }
+
+    async fn upsert_ai_index_intent_task(
+        &self,
+        record: &AiIndexIntentTaskRecord,
+    ) -> StorageResult<()> {
+        self.ensure_writable()?;
+        validate_ai_index_intent_task(record)?;
+        let txn = begin_write_transaction(&self.conn).await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "begin upsert_ai_index_intent_task",
+                err,
+            )
+        })?;
+        let backend = txn.get_database_backend();
+        txn.execute_raw(Statement::from_sql_and_values(
+            backend,
+            "INSERT INTO ai_index_intent_task \
+             (intent_id, task_id, parent_task_id, origin_step_id, created_at) \
+             VALUES (?, ?, ?, ?, ?) \
+             ON CONFLICT(intent_id, task_id) DO UPDATE SET \
+               parent_task_id = excluded.parent_task_id, \
+               origin_step_id = excluded.origin_step_id, created_at = excluded.created_at",
+            [
+                record.intent_id.clone().into(),
+                record.task_id.clone().into(),
+                record.parent_task_id.clone().into(),
+                record.origin_step_id.clone().into(),
+                record.created_at.into(),
+            ],
+        ))
+        .await
+        .map_err(|err| {
+            map_sqlite_db_err(DatabaseRole::Repository, "upsert ai_index_intent_task", err)
+        })?;
+        txn.commit().await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "commit upsert_ai_index_intent_task",
+                err,
+            )
+        })
+    }
+
+    async fn list_ai_index_intent_tasks(
+        &self,
+        intent_id: &str,
+    ) -> StorageResult<Vec<AiIndexIntentTaskRecord>> {
+        validate_non_empty_identifier(intent_id, "ai_index_intent_task intent_id")?;
+        let backend = self.conn.get_database_backend();
+        let rows = self
+            .conn
+            .query_all_raw(Statement::from_sql_and_values(
+                backend,
+                "SELECT intent_id, task_id, parent_task_id, origin_step_id, created_at \
+                 FROM ai_index_intent_task WHERE intent_id = ? \
+                 ORDER BY created_at ASC, task_id ASC",
+                [intent_id.into()],
+            ))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(DatabaseRole::Repository, "list ai_index_intent_task", err)
+            })?;
+        rows.iter().map(decode_ai_index_intent_task).collect()
+    }
+
+    async fn upsert_ai_index_plan_step_task(
+        &self,
+        record: &AiIndexPlanStepTaskRecord,
+    ) -> StorageResult<()> {
+        self.ensure_writable()?;
+        validate_ai_index_plan_step_task(record)?;
+        let txn = begin_write_transaction(&self.conn).await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "begin upsert_ai_index_plan_step_task",
+                err,
+            )
+        })?;
+        let backend = txn.get_database_backend();
+        txn.execute_raw(Statement::from_sql_and_values(
+            backend,
+            "INSERT INTO ai_index_plan_step_task (plan_id, task_id, step_id, created_at) \
+             VALUES (?, ?, ?, ?) \
+             ON CONFLICT(plan_id, task_id) DO UPDATE SET \
+               step_id = excluded.step_id, created_at = excluded.created_at",
+            [
+                record.plan_id.clone().into(),
+                record.task_id.clone().into(),
+                record.step_id.clone().into(),
+                record.created_at.into(),
+            ],
+        ))
+        .await
+        .map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "upsert ai_index_plan_step_task",
+                err,
+            )
+        })?;
+        txn.commit().await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "commit upsert_ai_index_plan_step_task",
+                err,
+            )
+        })
+    }
+
+    async fn list_ai_index_plan_step_tasks(
+        &self,
+        plan_id: &str,
+    ) -> StorageResult<Vec<AiIndexPlanStepTaskRecord>> {
+        validate_non_empty_identifier(plan_id, "ai_index_plan_step_task plan_id")?;
+        let backend = self.conn.get_database_backend();
+        let rows = self
+            .conn
+            .query_all_raw(Statement::from_sql_and_values(
+                backend,
+                "SELECT plan_id, task_id, step_id, created_at FROM ai_index_plan_step_task \
+                 WHERE plan_id = ? ORDER BY step_id ASC, created_at ASC, task_id ASC",
+                [plan_id.into()],
+            ))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(
+                    DatabaseRole::Repository,
+                    "list ai_index_plan_step_task",
+                    err,
+                )
+            })?;
+        rows.iter().map(decode_ai_index_plan_step_task).collect()
+    }
+
+    async fn upsert_ai_index_task_run(&self, record: &AiIndexTaskRunRecord) -> StorageResult<()> {
+        self.ensure_writable()?;
+        validate_ai_index_task_run(record)?;
+        let txn = begin_write_transaction(&self.conn).await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "begin upsert_ai_index_task_run",
+                err,
+            )
+        })?;
+        let backend = txn.get_database_backend();
+        if record.is_latest {
+            txn.execute_raw(Statement::from_sql_and_values(
+                backend,
+                "UPDATE ai_index_task_run SET is_latest = 0 \
+                 WHERE task_id = ? AND is_latest = 1 AND run_id <> ?",
+                [record.task_id.clone().into(), record.run_id.clone().into()],
+            ))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(
+                    DatabaseRole::Repository,
+                    "clear previous latest ai_index_task_run",
+                    err,
+                )
+            })?;
+        }
+        txn.execute_raw(Statement::from_sql_and_values(
+            backend,
+            "INSERT INTO ai_index_task_run \
+             (task_id, run_id, is_latest, created_at, base_commit_ref) \
+             VALUES (?, ?, ?, ?, ?) \
+             ON CONFLICT(task_id, run_id) DO UPDATE SET \
+               is_latest = excluded.is_latest, created_at = excluded.created_at, \
+               base_commit_ref = excluded.base_commit_ref",
+            [
+                record.task_id.clone().into(),
+                record.run_id.clone().into(),
+                i64::from(record.is_latest).into(),
+                record.created_at.into(),
+                record.base_commit_ref.clone().into(),
+            ],
+        ))
+        .await
+        .map_err(|err| {
+            map_sqlite_db_err(DatabaseRole::Repository, "upsert ai_index_task_run", err)
+        })?;
+        txn.commit().await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "commit upsert_ai_index_task_run",
+                err,
+            )
+        })
+    }
+
+    async fn list_ai_index_task_runs(
+        &self,
+        task_id: &str,
+    ) -> StorageResult<Vec<AiIndexTaskRunRecord>> {
+        validate_non_empty_identifier(task_id, "ai_index_task_run task_id")?;
+        let backend = self.conn.get_database_backend();
+        let rows = self
+            .conn
+            .query_all_raw(Statement::from_sql_and_values(
+                backend,
+                "SELECT task_id, run_id, is_latest, created_at, base_commit_ref \
+                 FROM ai_index_task_run WHERE task_id = ? \
+                 ORDER BY created_at ASC, run_id ASC",
+                [task_id.into()],
+            ))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(DatabaseRole::Repository, "list ai_index_task_run", err)
+            })?;
+        rows.iter().map(decode_ai_index_task_run).collect()
+    }
+
+    async fn upsert_ai_index_run_event(&self, record: &AiIndexRunEventRecord) -> StorageResult<()> {
+        self.ensure_writable()?;
+        validate_ai_index_run_event(record)?;
+        let txn = begin_write_transaction(&self.conn).await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "begin upsert_ai_index_run_event",
+                err,
+            )
+        })?;
+        let backend = txn.get_database_backend();
+        if record.is_latest {
+            txn.execute_raw(Statement::from_sql_and_values(
+                backend,
+                "UPDATE ai_index_run_event SET is_latest = 0 \
+                 WHERE run_id = ? AND is_latest = 1 AND event_id <> ?",
+                [record.run_id.clone().into(), record.event_id.clone().into()],
+            ))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(
+                    DatabaseRole::Repository,
+                    "clear previous latest ai_index_run_event",
+                    err,
+                )
+            })?;
+        }
+        txn.execute_raw(Statement::from_sql_and_values(
+            backend,
+            "INSERT INTO ai_index_run_event (run_id, event_id, event_kind, is_latest, created_at) \
+             VALUES (?, ?, ?, ?, ?) \
+             ON CONFLICT(run_id, event_id) DO UPDATE SET \
+               event_kind = excluded.event_kind, is_latest = excluded.is_latest, \
+               created_at = excluded.created_at",
+            [
+                record.run_id.clone().into(),
+                record.event_id.clone().into(),
+                record.event_kind.clone().into(),
+                i64::from(record.is_latest).into(),
+                record.created_at.into(),
+            ],
+        ))
+        .await
+        .map_err(|err| {
+            map_sqlite_db_err(DatabaseRole::Repository, "upsert ai_index_run_event", err)
+        })?;
+        txn.commit().await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "commit upsert_ai_index_run_event",
+                err,
+            )
+        })
+    }
+
+    async fn list_ai_index_run_events(
+        &self,
+        run_id: &str,
+    ) -> StorageResult<Vec<AiIndexRunEventRecord>> {
+        validate_non_empty_identifier(run_id, "ai_index_run_event run_id")?;
+        let backend = self.conn.get_database_backend();
+        let rows = self
+            .conn
+            .query_all_raw(Statement::from_sql_and_values(
+                backend,
+                "SELECT run_id, event_id, event_kind, is_latest, created_at \
+                 FROM ai_index_run_event WHERE run_id = ? \
+                 ORDER BY created_at ASC, event_id ASC",
+                [run_id.into()],
+            ))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(DatabaseRole::Repository, "list ai_index_run_event", err)
+            })?;
+        rows.iter().map(decode_ai_index_run_event).collect()
+    }
+
+    async fn upsert_ai_index_run_patchset(
+        &self,
+        record: &AiIndexRunPatchsetRecord,
+    ) -> StorageResult<()> {
+        self.ensure_writable()?;
+        validate_ai_index_run_patchset(record)?;
+        let txn = begin_write_transaction(&self.conn).await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "begin upsert_ai_index_run_patchset",
+                err,
+            )
+        })?;
+        let backend = txn.get_database_backend();
+        if record.is_latest {
+            txn.execute_raw(Statement::from_sql_and_values(
+                backend,
+                "UPDATE ai_index_run_patchset SET is_latest = 0 \
+                 WHERE run_id = ? AND is_latest = 1 AND patchset_id <> ?",
+                [
+                    record.run_id.clone().into(),
+                    record.patchset_id.clone().into(),
+                ],
+            ))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(
+                    DatabaseRole::Repository,
+                    "clear previous latest ai_index_run_patchset",
+                    err,
+                )
+            })?;
+        }
+        txn.execute_raw(Statement::from_sql_and_values(
+            backend,
+            "INSERT INTO ai_index_run_patchset \
+             (run_id, patchset_id, sequence, is_latest, created_at) \
+             VALUES (?, ?, ?, ?, ?) \
+             ON CONFLICT(run_id, patchset_id) DO UPDATE SET \
+               sequence = excluded.sequence, is_latest = excluded.is_latest, \
+               created_at = excluded.created_at",
+            [
+                record.run_id.clone().into(),
+                record.patchset_id.clone().into(),
+                record.sequence.into(),
+                i64::from(record.is_latest).into(),
+                record.created_at.into(),
+            ],
+        ))
+        .await
+        .map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "upsert ai_index_run_patchset",
+                err,
+            )
+        })?;
+        txn.commit().await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "commit upsert_ai_index_run_patchset",
+                err,
+            )
+        })
+    }
+
+    async fn list_ai_index_run_patchsets(
+        &self,
+        run_id: &str,
+    ) -> StorageResult<Vec<AiIndexRunPatchsetRecord>> {
+        validate_non_empty_identifier(run_id, "ai_index_run_patchset run_id")?;
+        let backend = self.conn.get_database_backend();
+        let rows = self
+            .conn
+            .query_all_raw(Statement::from_sql_and_values(
+                backend,
+                "SELECT run_id, patchset_id, sequence, is_latest, created_at \
+                 FROM ai_index_run_patchset WHERE run_id = ? \
+                 ORDER BY sequence ASC, patchset_id ASC",
+                [run_id.into()],
+            ))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(DatabaseRole::Repository, "list ai_index_run_patchset", err)
+            })?;
+        rows.iter().map(decode_ai_index_run_patchset).collect()
+    }
+
+    async fn upsert_ai_index_intent_context_frame(
+        &self,
+        record: &AiIndexIntentContextFrameRecord,
+    ) -> StorageResult<()> {
+        self.ensure_writable()?;
+        validate_ai_index_intent_context_frame(record)?;
+        let txn = begin_write_transaction(&self.conn).await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "begin upsert_ai_index_intent_context_frame",
+                err,
+            )
+        })?;
+        let backend = txn.get_database_backend();
+        txn.execute_raw(Statement::from_sql_and_values(
+            backend,
+            "INSERT INTO ai_index_intent_context_frame \
+             (intent_id, context_frame_id, relation_kind, created_at) \
+             VALUES (?, ?, ?, ?) \
+             ON CONFLICT(intent_id, context_frame_id, relation_kind) DO UPDATE SET \
+               created_at = excluded.created_at",
+            [
+                record.intent_id.clone().into(),
+                record.context_frame_id.clone().into(),
+                record.relation_kind.clone().into(),
+                record.created_at.into(),
+            ],
+        ))
+        .await
+        .map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "upsert ai_index_intent_context_frame",
+                err,
+            )
+        })?;
+        txn.commit().await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "commit upsert_ai_index_intent_context_frame",
+                err,
+            )
+        })
+    }
+
+    async fn list_ai_index_intent_context_frames(
+        &self,
+        intent_id: &str,
+    ) -> StorageResult<Vec<AiIndexIntentContextFrameRecord>> {
+        validate_non_empty_identifier(intent_id, "ai_index_intent_context_frame intent_id")?;
+        let backend = self.conn.get_database_backend();
+        let rows = self
+            .conn
+            .query_all_raw(Statement::from_sql_and_values(
+                backend,
+                "SELECT intent_id, context_frame_id, relation_kind, created_at \
+                 FROM ai_index_intent_context_frame WHERE intent_id = ? \
+                 ORDER BY relation_kind ASC, created_at ASC, context_frame_id ASC",
+                [intent_id.into()],
+            ))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(
+                    DatabaseRole::Repository,
+                    "list ai_index_intent_context_frame",
+                    err,
+                )
+            })?;
+        rows.iter()
+            .map(decode_ai_index_intent_context_frame)
+            .collect()
+    }
+
+    async fn upsert_ai_validation_report(
+        &self,
+        record: &AiValidationReportRecord,
+    ) -> StorageResult<()> {
+        self.ensure_writable()?;
+        validate_ai_validation_report(record)?;
+        let txn = begin_write_transaction(&self.conn).await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "begin upsert_ai_validation_report",
+                err,
+            )
+        })?;
+        ensure_ai_thread_exists_in_txn(&txn, &record.thread_id).await?;
+        let backend = txn.get_database_backend();
+        if record.is_latest {
+            txn.execute_raw(Statement::from_sql_and_values(
+                backend,
+                "UPDATE ai_validation_report SET is_latest = 0 \
+                 WHERE thread_id = ? AND is_latest = 1 AND report_id <> ?",
+                [
+                    record.thread_id.clone().into(),
+                    record.report_id.clone().into(),
+                ],
+            ))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(
+                    DatabaseRole::Repository,
+                    "clear previous latest ai_validation_report",
+                    err,
+                )
+            })?;
+        }
+        txn.execute_raw(Statement::from_sql_and_values(
+            backend,
+            "INSERT INTO ai_validation_report \
+             (report_id, thread_id, run_id, policy_version, stale, is_latest, summary_json, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(report_id) DO UPDATE SET \
+               thread_id = excluded.thread_id, run_id = excluded.run_id, \
+               policy_version = excluded.policy_version, stale = excluded.stale, \
+               is_latest = excluded.is_latest, summary_json = excluded.summary_json, \
+               created_at = excluded.created_at, updated_at = excluded.updated_at",
+            [
+                record.report_id.clone().into(),
+                record.thread_id.clone().into(),
+                record.run_id.clone().into(),
+                record.policy_version.clone().into(),
+                i64::from(record.stale).into(),
+                i64::from(record.is_latest).into(),
+                record.summary_json.clone().into(),
+                record.created_at.into(),
+                record.updated_at.into(),
+            ],
+        ))
+        .await
+        .map_err(|err| {
+            map_sqlite_db_err(DatabaseRole::Repository, "upsert ai_validation_report", err)
+        })?;
+        txn.commit().await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "commit upsert_ai_validation_report",
+                err,
+            )
+        })
+    }
+
+    async fn list_ai_validation_reports(
+        &self,
+        thread_id: &str,
+    ) -> StorageResult<Vec<AiValidationReportRecord>> {
+        validate_non_empty_identifier(thread_id, "ai_validation_report thread_id")?;
+        let backend = self.conn.get_database_backend();
+        let rows = self
+            .conn
+            .query_all_raw(Statement::from_sql_and_values(
+                backend,
+                "SELECT report_id, thread_id, run_id, policy_version, stale, is_latest, \
+                        summary_json, created_at, updated_at \
+                 FROM ai_validation_report WHERE thread_id = ? \
+                 ORDER BY created_at ASC, report_id ASC",
+                [thread_id.into()],
+            ))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(DatabaseRole::Repository, "list ai_validation_report", err)
+            })?;
+        rows.iter().map(decode_ai_validation_report).collect()
+    }
+
+    async fn upsert_ai_risk_score_breakdown(
+        &self,
+        record: &AiRiskScoreBreakdownRecord,
+    ) -> StorageResult<()> {
+        self.ensure_writable()?;
+        validate_ai_risk_score_breakdown(record)?;
+        let txn = begin_write_transaction(&self.conn).await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "begin upsert_ai_risk_score_breakdown",
+                err,
+            )
+        })?;
+        ensure_ai_thread_exists_in_txn(&txn, &record.thread_id).await?;
+        let backend = txn.get_database_backend();
+        if record.is_latest {
+            txn.execute_raw(Statement::from_sql_and_values(
+                backend,
+                "UPDATE ai_risk_score_breakdown SET is_latest = 0 \
+                 WHERE thread_id = ? AND is_latest = 1 AND breakdown_id <> ?",
+                [
+                    record.thread_id.clone().into(),
+                    record.breakdown_id.clone().into(),
+                ],
+            ))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(
+                    DatabaseRole::Repository,
+                    "clear previous latest ai_risk_score_breakdown",
+                    err,
+                )
+            })?;
+        }
+        txn.execute_raw(Statement::from_sql_and_values(
+            backend,
+            "INSERT INTO ai_risk_score_breakdown \
+             (breakdown_id, thread_id, validation_report_id, policy_version, stale, is_latest, summary_json, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(breakdown_id) DO UPDATE SET \
+               thread_id = excluded.thread_id, \
+               validation_report_id = excluded.validation_report_id, \
+               policy_version = excluded.policy_version, stale = excluded.stale, \
+               is_latest = excluded.is_latest, summary_json = excluded.summary_json, \
+               created_at = excluded.created_at, updated_at = excluded.updated_at",
+            [
+                record.breakdown_id.clone().into(),
+                record.thread_id.clone().into(),
+                record.validation_report_id.clone().into(),
+                record.policy_version.clone().into(),
+                i64::from(record.stale).into(),
+                i64::from(record.is_latest).into(),
+                record.summary_json.clone().into(),
+                record.created_at.into(),
+                record.updated_at.into(),
+            ],
+        ))
+        .await
+        .map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "upsert ai_risk_score_breakdown",
+                err,
+            )
+        })?;
+        txn.commit().await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "commit upsert_ai_risk_score_breakdown",
+                err,
+            )
+        })
+    }
+
+    async fn list_ai_risk_score_breakdowns(
+        &self,
+        thread_id: &str,
+    ) -> StorageResult<Vec<AiRiskScoreBreakdownRecord>> {
+        validate_non_empty_identifier(thread_id, "ai_risk_score_breakdown thread_id")?;
+        let backend = self.conn.get_database_backend();
+        let rows = self
+            .conn
+            .query_all_raw(Statement::from_sql_and_values(
+                backend,
+                "SELECT breakdown_id, thread_id, validation_report_id, policy_version, stale, \
+                        is_latest, summary_json, created_at, updated_at \
+                 FROM ai_risk_score_breakdown WHERE thread_id = ? \
+                 ORDER BY created_at ASC, breakdown_id ASC",
+                [thread_id.into()],
+            ))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(
+                    DatabaseRole::Repository,
+                    "list ai_risk_score_breakdown",
+                    err,
+                )
+            })?;
+        rows.iter().map(decode_ai_risk_score_breakdown).collect()
+    }
+
+    async fn upsert_ai_decision_proposal(
+        &self,
+        record: &AiDecisionProposalRecord,
+    ) -> StorageResult<()> {
+        self.ensure_writable()?;
+        validate_ai_decision_proposal(record)?;
+        let txn = begin_write_transaction(&self.conn).await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "begin upsert_ai_decision_proposal",
+                err,
+            )
+        })?;
+        ensure_ai_thread_exists_in_txn(&txn, &record.thread_id).await?;
+        let backend = txn.get_database_backend();
+        if record.is_latest {
+            txn.execute_raw(Statement::from_sql_and_values(
+                backend,
+                "UPDATE ai_decision_proposal SET is_latest = 0 \
+                 WHERE thread_id = ? AND is_latest = 1 AND proposal_id <> ?",
+                [
+                    record.thread_id.clone().into(),
+                    record.proposal_id.clone().into(),
+                ],
+            ))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(
+                    DatabaseRole::Repository,
+                    "clear previous latest ai_decision_proposal",
+                    err,
+                )
+            })?;
+        }
+        txn.execute_raw(Statement::from_sql_and_values(
+            backend,
+            "INSERT INTO ai_decision_proposal \
+             (proposal_id, thread_id, validation_report_id, risk_score_breakdown_id, \
+              policy_version, stale, is_latest, summary_json, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(proposal_id) DO UPDATE SET \
+               thread_id = excluded.thread_id, \
+               validation_report_id = excluded.validation_report_id, \
+               risk_score_breakdown_id = excluded.risk_score_breakdown_id, \
+               policy_version = excluded.policy_version, stale = excluded.stale, \
+               is_latest = excluded.is_latest, summary_json = excluded.summary_json, \
+               created_at = excluded.created_at, updated_at = excluded.updated_at",
+            [
+                record.proposal_id.clone().into(),
+                record.thread_id.clone().into(),
+                record.validation_report_id.clone().into(),
+                record.risk_score_breakdown_id.clone().into(),
+                record.policy_version.clone().into(),
+                i64::from(record.stale).into(),
+                i64::from(record.is_latest).into(),
+                record.summary_json.clone().into(),
+                record.created_at.into(),
+                record.updated_at.into(),
+            ],
+        ))
+        .await
+        .map_err(|err| {
+            map_sqlite_db_err(DatabaseRole::Repository, "upsert ai_decision_proposal", err)
+        })?;
+        txn.commit().await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "commit upsert_ai_decision_proposal",
+                err,
+            )
+        })
+    }
+
+    async fn list_ai_decision_proposals(
+        &self,
+        thread_id: &str,
+    ) -> StorageResult<Vec<AiDecisionProposalRecord>> {
+        validate_non_empty_identifier(thread_id, "ai_decision_proposal thread_id")?;
+        let backend = self.conn.get_database_backend();
+        let rows = self
+            .conn
+            .query_all_raw(Statement::from_sql_and_values(
+                backend,
+                "SELECT proposal_id, thread_id, validation_report_id, risk_score_breakdown_id, \
+                        policy_version, stale, is_latest, summary_json, created_at, updated_at \
+                 FROM ai_decision_proposal WHERE thread_id = ? \
+                 ORDER BY created_at ASC, proposal_id ASC",
+                [thread_id.into()],
+            ))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(DatabaseRole::Repository, "list ai_decision_proposal", err)
+            })?;
+        rows.iter().map(decode_ai_decision_proposal).collect()
+    }
+
+    async fn upsert_ai_final_decision(&self, record: &AiFinalDecisionRecord) -> StorageResult<()> {
+        self.ensure_writable()?;
+        validate_ai_final_decision(record)?;
+        let txn = begin_write_transaction(&self.conn).await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "begin upsert_ai_final_decision",
+                err,
+            )
+        })?;
+        ensure_ai_thread_exists_in_txn(&txn, &record.thread_id).await?;
+        let backend = txn.get_database_backend();
+        if record.is_latest {
+            txn.execute_raw(Statement::from_sql_and_values(
+                backend,
+                "UPDATE ai_final_decision SET is_latest = 0 \
+                 WHERE thread_id = ? AND is_latest = 1 AND decision_id <> ?",
+                [
+                    record.thread_id.clone().into(),
+                    record.decision_id.clone().into(),
+                ],
+            ))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(
+                    DatabaseRole::Repository,
+                    "clear previous latest ai_final_decision",
+                    err,
+                )
+            })?;
+        }
+        txn.execute_raw(Statement::from_sql_and_values(
+            backend,
+            "INSERT INTO ai_final_decision \
+             (decision_id, thread_id, decision_proposal_id, validation_report_id, \
+              policy_version, verdict, stale, is_latest, summary_json, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(decision_id) DO UPDATE SET \
+               thread_id = excluded.thread_id, \
+               decision_proposal_id = excluded.decision_proposal_id, \
+               validation_report_id = excluded.validation_report_id, \
+               policy_version = excluded.policy_version, verdict = excluded.verdict, \
+               stale = excluded.stale, is_latest = excluded.is_latest, \
+               summary_json = excluded.summary_json, created_at = excluded.created_at, \
+               updated_at = excluded.updated_at",
+            [
+                record.decision_id.clone().into(),
+                record.thread_id.clone().into(),
+                record.decision_proposal_id.clone().into(),
+                record.validation_report_id.clone().into(),
+                record.policy_version.clone().into(),
+                record.verdict.clone().into(),
+                i64::from(record.stale).into(),
+                i64::from(record.is_latest).into(),
+                record.summary_json.clone().into(),
+                record.created_at.into(),
+                record.updated_at.into(),
+            ],
+        ))
+        .await
+        .map_err(|err| {
+            map_sqlite_db_err(DatabaseRole::Repository, "upsert ai_final_decision", err)
+        })?;
+        txn.commit().await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "commit upsert_ai_final_decision",
+                err,
+            )
+        })
+    }
+
+    async fn list_ai_final_decisions(
+        &self,
+        thread_id: &str,
+    ) -> StorageResult<Vec<AiFinalDecisionRecord>> {
+        validate_non_empty_identifier(thread_id, "ai_final_decision thread_id")?;
+        let backend = self.conn.get_database_backend();
+        let rows = self
+            .conn
+            .query_all_raw(Statement::from_sql_and_values(
+                backend,
+                "SELECT decision_id, thread_id, decision_proposal_id, validation_report_id, \
+                        policy_version, verdict, stale, is_latest, summary_json, \
+                        created_at, updated_at \
+                 FROM ai_final_decision WHERE thread_id = ? \
+                 ORDER BY created_at ASC, decision_id ASC",
+                [thread_id.into()],
+            ))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(DatabaseRole::Repository, "list ai_final_decision", err)
+            })?;
+        rows.iter().map(decode_ai_final_decision).collect()
+    }
+
+    // -------------------------------------------------------------------------
+    // RB-05b AC2 & AC3: 5 `memory_*` Tables + `MEMORY_BY_PATH` Query
+    // -------------------------------------------------------------------------
+
+    async fn upsert_memory_episode(&self, record: &MemoryEpisodeRecord) -> StorageResult<()> {
+        self.ensure_writable()?;
+        validate_memory_episode(record)?;
+        let txn = begin_write_transaction(&self.conn).await.map_err(|err| {
+            map_sqlite_db_err(DatabaseRole::Repository, "begin upsert_memory_episode", err)
+        })?;
+        let backend = txn.get_database_backend();
+        txn.execute_raw(Statement::from_sql_and_values(
+            backend,
+            "INSERT INTO memory_episode \
+             (episode_id, repo_id, source_kind, source_key, outcome, actor, started_at, \
+              ended_at, anchor_commit, change_id, title, body, content_digest, producer, rules_version) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(episode_id) DO UPDATE SET \
+               repo_id = excluded.repo_id, source_kind = excluded.source_kind, \
+               source_key = excluded.source_key, outcome = excluded.outcome, \
+               actor = excluded.actor, started_at = excluded.started_at, \
+               ended_at = excluded.ended_at, anchor_commit = excluded.anchor_commit, \
+               change_id = excluded.change_id, title = excluded.title, body = excluded.body, \
+               content_digest = excluded.content_digest, producer = excluded.producer, \
+               rules_version = excluded.rules_version",
+            [
+                record.episode_id.clone().into(),
+                record.repo_id.clone().into(),
+                record.source_kind.as_str().into(),
+                record.source_key.clone().into(),
+                record.outcome.as_str().into(),
+                record.actor.clone().into(),
+                record.started_at.into(),
+                record.ended_at.into(),
+                record.anchor_commit.clone().into(),
+                record.change_id.clone().into(),
+                record.title.clone().into(),
+                record.body.clone().into(),
+                record.content_digest.clone().into(),
+                record.producer.clone().into(),
+                record.rules_version.into(),
+            ],
+        ))
+        .await
+        .map_err(|err| map_sqlite_db_err(DatabaseRole::Repository, "upsert memory_episode", err))?;
+        txn.commit().await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "commit upsert_memory_episode",
+                err,
+            )
+        })
+    }
+
+    async fn get_memory_episode(
+        &self,
+        episode_id: &str,
+    ) -> StorageResult<Option<MemoryEpisodeRecord>> {
+        validate_non_empty_identifier(episode_id, "memory_episode episode_id")?;
+        let backend = self.conn.get_database_backend();
+        let row = self
+            .conn
+            .query_one_raw(Statement::from_sql_and_values(
+                backend,
+                "SELECT episode_id, repo_id, source_kind, source_key, outcome, actor, \
+                        started_at, ended_at, anchor_commit, change_id, title, body, \
+                        content_digest, producer, rules_version \
+                 FROM memory_episode WHERE episode_id = ?",
+                [episode_id.into()],
+            ))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(DatabaseRole::Repository, "get memory_episode", err)
+            })?;
+        row.as_ref().map(decode_memory_episode).transpose()
+    }
+
+    async fn list_memory_episodes(&self, repo_id: &str) -> StorageResult<Vec<MemoryEpisodeRecord>> {
+        validate_non_empty_identifier(repo_id, "memory_episode repo_id")?;
+        let backend = self.conn.get_database_backend();
+        let rows = self
+            .conn
+            .query_all_raw(Statement::from_sql_and_values(
+                backend,
+                "SELECT episode_id, repo_id, source_kind, source_key, outcome, actor, \
+                        started_at, ended_at, anchor_commit, change_id, title, body, \
+                        content_digest, producer, rules_version \
+                 FROM memory_episode WHERE repo_id = ? \
+                 ORDER BY ended_at DESC, episode_id ASC",
+                [repo_id.into()],
+            ))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(DatabaseRole::Repository, "list memory_episode", err)
+            })?;
+        rows.iter().map(decode_memory_episode).collect()
+    }
+
+    async fn delete_memory_episode(&self, episode_id: &str) -> StorageResult<bool> {
+        self.ensure_writable()?;
+        validate_non_empty_identifier(episode_id, "memory_episode episode_id")?;
+        let txn = begin_write_transaction(&self.conn).await.map_err(|err| {
+            map_sqlite_db_err(DatabaseRole::Repository, "begin delete_memory_episode", err)
+        })?;
+        let backend = txn.get_database_backend();
+        for sql in [
+            "DELETE FROM memory_episode_evidence WHERE episode_id = ?",
+            "DELETE FROM memory_episode_path WHERE episode_id = ?",
+            "DELETE FROM memory_episode_search_doc WHERE episode_id = ?",
+        ] {
+            txn.execute_raw(Statement::from_sql_and_values(
+                backend,
+                sql,
+                [episode_id.into()],
+            ))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(
+                    DatabaseRole::Repository,
+                    "cascade delete memory_episode child",
+                    err,
+                )
+            })?;
+        }
+        let res = txn
+            .execute_raw(Statement::from_sql_and_values(
+                backend,
+                "DELETE FROM memory_episode WHERE episode_id = ?",
+                [episode_id.into()],
+            ))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(DatabaseRole::Repository, "delete memory_episode", err)
+            })?;
+        txn.commit().await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "commit delete_memory_episode",
+                err,
+            )
+        })?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    async fn replace_memory_episode_evidence(
+        &self,
+        episode_id: &str,
+        evidence: &[MemoryEpisodeEvidenceRecord],
+    ) -> StorageResult<()> {
+        self.ensure_writable()?;
+        validate_non_empty_identifier(episode_id, "memory_episode_evidence episode_id")?;
+        let mut seen_ords = BTreeSet::new();
+        for ev in evidence {
+            validate_memory_episode_evidence(ev)?;
+            if ev.episode_id != episode_id {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: "memory_episode_evidence episode_id mismatch".to_string(),
+                });
+            }
+            if !seen_ords.insert(ev.ordinal) {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: "duplicate ordinal in memory_episode_evidence".to_string(),
+                });
+            }
+        }
+        let txn = begin_write_transaction(&self.conn).await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "begin replace_memory_episode_evidence",
+                err,
+            )
+        })?;
+        ensure_memory_episode_exists_in_txn(&txn, episode_id).await?;
+        let backend = txn.get_database_backend();
+        txn.execute_raw(Statement::from_sql_and_values(
+            backend,
+            "DELETE FROM memory_episode_evidence WHERE episode_id = ?",
+            [episode_id.into()],
+        ))
+        .await
+        .map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "clear memory_episode_evidence",
+                err,
+            )
+        })?;
+        for ev in evidence {
+            txn.execute_raw(Statement::from_sql_and_values(
+                backend,
+                "INSERT INTO memory_episode_evidence \
+                 (episode_id, ordinal, kind, ref_id, link_confidence, resolution_status) \
+                 VALUES (?, ?, ?, ?, ?, ?)",
+                [
+                    ev.episode_id.clone().into(),
+                    ev.ordinal.into(),
+                    ev.kind.as_str().into(),
+                    ev.ref_id.clone().into(),
+                    ev.link_confidence.as_str().into(),
+                    ev.resolution_status.as_str().into(),
+                ],
+            ))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(
+                    DatabaseRole::Repository,
+                    "insert memory_episode_evidence",
+                    err,
+                )
+            })?;
+        }
+        txn.commit().await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "commit replace_memory_episode_evidence",
+                err,
+            )
+        })
+    }
+
+    async fn list_memory_episode_evidence(
+        &self,
+        episode_id: &str,
+    ) -> StorageResult<Vec<MemoryEpisodeEvidenceRecord>> {
+        validate_non_empty_identifier(episode_id, "memory_episode_evidence episode_id")?;
+        let backend = self.conn.get_database_backend();
+        let rows = self
+            .conn
+            .query_all_raw(Statement::from_sql_and_values(
+                backend,
+                "SELECT episode_id, ordinal, kind, ref_id, link_confidence, resolution_status \
+                 FROM memory_episode_evidence WHERE episode_id = ? ORDER BY ordinal ASC",
+                [episode_id.into()],
+            ))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(
+                    DatabaseRole::Repository,
+                    "list memory_episode_evidence",
+                    err,
+                )
+            })?;
+        rows.iter().map(decode_memory_episode_evidence).collect()
+    }
+
+    async fn upsert_memory_projection_state(
+        &self,
+        record: &MemoryProjectionStateRecord,
+    ) -> StorageResult<()> {
+        self.ensure_writable()?;
+        validate_memory_projection_state(record)?;
+        let txn = begin_write_transaction(&self.conn).await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "begin upsert_memory_projection_state",
+                err,
+            )
+        })?;
+        let backend = txn.get_database_backend();
+        txn.execute_raw(Statement::from_sql_and_values(
+            backend,
+            "INSERT INTO memory_projection_state \
+             (repo_id, source_kind, cursor_json, fingerprint, rules_version, schema_version, \
+              horizon_truncated, revoked_count, aged_out_count, rebuilt_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(repo_id, source_kind) DO UPDATE SET \
+               cursor_json = excluded.cursor_json, fingerprint = excluded.fingerprint, \
+               rules_version = excluded.rules_version, schema_version = excluded.schema_version, \
+               horizon_truncated = excluded.horizon_truncated, \
+               revoked_count = excluded.revoked_count, aged_out_count = excluded.aged_out_count, \
+               rebuilt_at = excluded.rebuilt_at",
+            [
+                record.repo_id.clone().into(),
+                record.source_kind.as_str().into(),
+                record.cursor_json.clone().into(),
+                record.fingerprint.clone().into(),
+                record.rules_version.into(),
+                record.schema_version.into(),
+                i64::from(record.horizon_truncated).into(),
+                record.revoked_count.into(),
+                record.aged_out_count.into(),
+                record.rebuilt_at.into(),
+            ],
+        ))
+        .await
+        .map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "upsert memory_projection_state",
+                err,
+            )
+        })?;
+        txn.commit().await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "commit upsert_memory_projection_state",
+                err,
+            )
+        })
+    }
+
+    async fn get_memory_projection_state(
+        &self,
+        repo_id: &str,
+        source_kind: MemorySourceKind,
+    ) -> StorageResult<Option<MemoryProjectionStateRecord>> {
+        validate_non_empty_identifier(repo_id, "memory_projection_state repo_id")?;
+        let backend = self.conn.get_database_backend();
+        let row = self
+            .conn
+            .query_one_raw(Statement::from_sql_and_values(
+                backend,
+                "SELECT repo_id, source_kind, cursor_json, fingerprint, rules_version, \
+                        schema_version, horizon_truncated, revoked_count, aged_out_count, rebuilt_at \
+                 FROM memory_projection_state WHERE repo_id = ? AND source_kind = ?",
+                [repo_id.into(), source_kind.as_str().into()],
+            ))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(DatabaseRole::Repository, "get memory_projection_state", err)
+            })?;
+        row.as_ref().map(decode_memory_projection_state).transpose()
+    }
+
+    async fn list_memory_projection_states(
+        &self,
+        repo_id: &str,
+    ) -> StorageResult<Vec<MemoryProjectionStateRecord>> {
+        validate_non_empty_identifier(repo_id, "memory_projection_state repo_id")?;
+        let backend = self.conn.get_database_backend();
+        let rows = self
+            .conn
+            .query_all_raw(Statement::from_sql_and_values(
+                backend,
+                "SELECT repo_id, source_kind, cursor_json, fingerprint, rules_version, \
+                        schema_version, horizon_truncated, revoked_count, aged_out_count, rebuilt_at \
+                 FROM memory_projection_state WHERE repo_id = ? ORDER BY source_kind ASC",
+                [repo_id.into()],
+            ))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(DatabaseRole::Repository, "list memory_projection_state", err)
+            })?;
+        rows.iter().map(decode_memory_projection_state).collect()
+    }
+
+    async fn upsert_memory_episode_path(
+        &self,
+        record: &MemoryEpisodePathRecord,
+    ) -> StorageResult<()> {
+        self.ensure_writable()?;
+        validate_memory_episode_path(record)?;
+        let txn = begin_write_transaction(&self.conn).await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "begin upsert_memory_episode_path",
+                err,
+            )
+        })?;
+        ensure_memory_episode_exists_in_txn(&txn, &record.episode_id).await?;
+        let backend = txn.get_database_backend();
+        txn.execute_raw(Statement::from_sql_and_values(
+            backend,
+            "INSERT INTO memory_episode_path \
+             (episode_id, code_path, change_kind, blob_oid_at_end, ended_at) \
+             VALUES (?, ?, ?, ?, ?) \
+             ON CONFLICT(episode_id, code_path) DO UPDATE SET \
+               change_kind = excluded.change_kind, \
+               blob_oid_at_end = excluded.blob_oid_at_end, ended_at = excluded.ended_at",
+            [
+                record.episode_id.clone().into(),
+                Value::Bytes(Some(record.code_path.clone())),
+                record.change_kind.as_str().into(),
+                record.blob_oid_at_end.clone().into(),
+                record.ended_at.into(),
+            ],
+        ))
+        .await
+        .map_err(|err| {
+            map_sqlite_db_err(DatabaseRole::Repository, "upsert memory_episode_path", err)
+        })?;
+        txn.commit().await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "commit upsert_memory_episode_path",
+                err,
+            )
+        })
+    }
+
+    async fn list_memory_episode_paths(
+        &self,
+        episode_id: &str,
+    ) -> StorageResult<Vec<MemoryEpisodePathRecord>> {
+        validate_non_empty_identifier(episode_id, "memory_episode_path episode_id")?;
+        let backend = self.conn.get_database_backend();
+        let rows = self
+            .conn
+            .query_all_raw(Statement::from_sql_and_values(
+                backend,
+                "SELECT episode_id, code_path, change_kind, blob_oid_at_end, ended_at \
+                 FROM memory_episode_path WHERE episode_id = ? ORDER BY code_path ASC",
+                [episode_id.into()],
+            ))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(DatabaseRole::Repository, "list memory_episode_path", err)
+            })?;
+        rows.iter().map(decode_memory_episode_path).collect()
+    }
+
+    async fn query_memory_paths_by_path(
+        &self,
+        code_path: &[u8],
+        since_ended_at: Option<i64>,
+        until_ended_at: Option<i64>,
+        limit: Option<usize>,
+    ) -> StorageResult<Vec<MemoryEpisodePathRecord>> {
+        validate_memory_code_path(code_path)?;
+        if limit == Some(0) {
+            return Ok(Vec::new());
+        }
+        if let (Some(since), Some(until)) = (since_ended_at, until_ended_at)
+            && since > until
+        {
+            return Ok(Vec::new());
+        }
+        let backend = self.conn.get_database_backend();
+        let mut sql = String::from(
+            "SELECT episode_id, code_path, change_kind, blob_oid_at_end, ended_at \
+             FROM memory_episode_path WHERE code_path = ?",
+        );
+        let mut params: Vec<Value> = vec![Value::Bytes(Some(code_path.to_vec()))];
+        if let Some(since) = since_ended_at {
+            sql.push_str(" AND ended_at >= ?");
+            params.push(since.into());
+        }
+        if let Some(until) = until_ended_at {
+            sql.push_str(" AND ended_at <= ?");
+            params.push(until.into());
+        }
+        sql.push_str(" ORDER BY ended_at DESC, episode_id ASC");
+        if let Some(lim) = limit {
+            let lim_i64 = i64::try_from(lim).unwrap_or(i64::MAX);
+            sql.push_str(" LIMIT ?");
+            params.push(lim_i64.into());
+        }
+        let rows = self
+            .conn
+            .query_all_raw(Statement::from_sql_and_values(backend, sql, params))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(
+                    DatabaseRole::Repository,
+                    "query memory_episode_path by path",
+                    err,
+                )
+            })?;
+        rows.iter().map(decode_memory_episode_path).collect()
+    }
+
+    async fn upsert_memory_episode_search_doc(
+        &self,
+        episode_id: &str,
+        title: &str,
+        body: &str,
+        paths_text: &str,
+    ) -> StorageResult<MemoryEpisodeSearchDocRecord> {
+        self.ensure_writable()?;
+        validate_non_empty_identifier(episode_id, "memory_episode_search_doc episode_id")?;
+        validate_no_nul(title, "memory_episode_search_doc title")?;
+        validate_no_nul(body, "memory_episode_search_doc body")?;
+        validate_no_nul(paths_text, "memory_episode_search_doc paths_text")?;
+
+        let txn = begin_write_transaction(&self.conn).await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "begin upsert_memory_episode_search_doc",
+                err,
+            )
+        })?;
+        ensure_memory_episode_exists_in_txn(&txn, episode_id).await?;
+        let backend = txn.get_database_backend();
+        let existing = txn
+            .query_one_raw(Statement::from_sql_and_values(
+                backend,
+                "SELECT rowid FROM memory_episode_search_doc WHERE episode_id = ?",
+                [episode_id.into()],
+            ))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(
+                    DatabaseRole::Repository,
+                    "lookup memory_episode_search_doc rowid",
+                    err,
+                )
+            })?;
+
+        let rowid: i64 = if let Some(row) = existing {
+            let rid: i64 = col(&row, 0, "memory_episode_search_doc.rowid")?;
+            txn.execute_raw(Statement::from_sql_and_values(
+                backend,
+                "UPDATE memory_episode_search_doc SET title = ?, body = ?, paths_text = ? \
+                 WHERE rowid = ?",
+                [title.into(), body.into(), paths_text.into(), rid.into()],
+            ))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(
+                    DatabaseRole::Repository,
+                    "update memory_episode_search_doc",
+                    err,
+                )
+            })?;
+            rid
+        } else {
+            txn.execute_raw(Statement::from_sql_and_values(
+                backend,
+                "INSERT INTO memory_episode_search_doc (episode_id, title, body, paths_text) \
+                 VALUES (?, ?, ?, ?)",
+                [
+                    episode_id.into(),
+                    title.into(),
+                    body.into(),
+                    paths_text.into(),
+                ],
+            ))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(
+                    DatabaseRole::Repository,
+                    "insert memory_episode_search_doc",
+                    err,
+                )
+            })?;
+            let row = txn
+                .query_one_raw(Statement::from_sql_and_values(
+                    backend,
+                    "SELECT rowid FROM memory_episode_search_doc WHERE episode_id = ?",
+                    [episode_id.into()],
+                ))
+                .await
+                .map_err(|err| {
+                    map_sqlite_db_err(
+                        DatabaseRole::Repository,
+                        "read inserted memory_episode_search_doc rowid",
+                        err,
+                    )
+                })?
+                .ok_or_else(|| StorageBackendError::BackendInternal {
+                    detail: "inserted memory_episode_search_doc row missing".to_string(),
+                })?;
+            col(&row, 0, "memory_episode_search_doc.rowid")?
+        };
+
+        txn.commit().await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "commit upsert_memory_episode_search_doc",
+                err,
+            )
+        })?;
+        Ok(MemoryEpisodeSearchDocRecord {
+            rowid,
+            episode_id: episode_id.to_string(),
+            title: title.to_string(),
+            body: body.to_string(),
+            paths_text: paths_text.to_string(),
+        })
+    }
+
+    async fn get_memory_episode_search_doc(
+        &self,
+        episode_id: &str,
+    ) -> StorageResult<Option<MemoryEpisodeSearchDocRecord>> {
+        validate_non_empty_identifier(episode_id, "memory_episode_search_doc episode_id")?;
+        let backend = self.conn.get_database_backend();
+        let row = self
+            .conn
+            .query_one_raw(Statement::from_sql_and_values(
+                backend,
+                "SELECT rowid, episode_id, title, body, paths_text \
+                 FROM memory_episode_search_doc WHERE episode_id = ?",
+                [episode_id.into()],
+            ))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(
+                    DatabaseRole::Repository,
+                    "get memory_episode_search_doc",
+                    err,
+                )
+            })?;
+        row.as_ref()
+            .map(decode_memory_episode_search_doc)
+            .transpose()
+    }
+
+    async fn list_memory_episode_search_docs(
+        &self,
+    ) -> StorageResult<Vec<MemoryEpisodeSearchDocRecord>> {
+        let backend = self.conn.get_database_backend();
+        let rows = self
+            .conn
+            .query_all_raw(Statement::from_string(
+                backend,
+                "SELECT rowid, episode_id, title, body, paths_text \
+                 FROM memory_episode_search_doc ORDER BY rowid ASC"
+                    .to_string(),
+            ))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(
+                    DatabaseRole::Repository,
+                    "list memory_episode_search_doc",
+                    err,
+                )
+            })?;
+        rows.iter().map(decode_memory_episode_search_doc).collect()
+    }
+
+    // -------------------------------------------------------------------------
+    // RB-05b AC4: Governance & Audit (`approved_permission`, `automation_log`, `source_call_log`)
+    // -------------------------------------------------------------------------
+
+    async fn upsert_approved_permission(
+        &self,
+        record: &ApprovedPermissionRecord,
+    ) -> StorageResult<()> {
+        self.ensure_writable()?;
+        validate_approved_permission(record)?;
+        let txn = begin_write_transaction(&self.conn).await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "begin upsert_approved_permission",
+                err,
+            )
+        })?;
+        let backend = txn.get_database_backend();
+        txn.execute_raw(Statement::from_sql_and_values(
+            backend,
+            "INSERT INTO approved_permission \
+             (project_id, permission, pattern, created_at, source_worktree_id, \
+              source_session_id, source_workspace_id) \
+             VALUES (?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(project_id, permission, pattern) DO UPDATE SET \
+               created_at = excluded.created_at, \
+               source_worktree_id = excluded.source_worktree_id, \
+               source_session_id = excluded.source_session_id, \
+               source_workspace_id = excluded.source_workspace_id",
+            [
+                record.project_id.clone().into(),
+                record.permission.clone().into(),
+                record.pattern.clone().into(),
+                record.created_at.into(),
+                record.source_worktree_id.clone().into(),
+                record.source_session_id.clone().into(),
+                record.source_workspace_id.clone().into(),
+            ],
+        ))
+        .await
+        .map_err(|err| {
+            map_sqlite_db_err(DatabaseRole::Repository, "upsert approved_permission", err)
+        })?;
+        txn.commit().await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "commit upsert_approved_permission",
+                err,
+            )
+        })
+    }
+
+    async fn list_approved_permissions(
+        &self,
+        project_id: &str,
+    ) -> StorageResult<Vec<ApprovedPermissionRecord>> {
+        validate_non_empty_identifier(project_id, "approved_permission project_id")?;
+        let backend = self.conn.get_database_backend();
+        let rows = self
+            .conn
+            .query_all_raw(Statement::from_sql_and_values(
+                backend,
+                "SELECT project_id, permission, pattern, created_at, source_worktree_id, \
+                        source_session_id, source_workspace_id \
+                 FROM approved_permission WHERE project_id = ? \
+                 ORDER BY created_at ASC, permission ASC, pattern ASC",
+                [project_id.into()],
+            ))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(DatabaseRole::Repository, "list approved_permission", err)
+            })?;
+        rows.iter().map(decode_approved_permission).collect()
+    }
+
+    async fn delete_approved_permission(
+        &self,
+        project_id: &str,
+        permission: &str,
+        pattern: &str,
+    ) -> StorageResult<bool> {
+        self.ensure_writable()?;
+        validate_non_empty_identifier(project_id, "approved_permission project_id")?;
+        validate_non_empty_identifier(permission, "approved_permission permission")?;
+        validate_non_empty_identifier(pattern, "approved_permission pattern")?;
+        let txn = begin_write_transaction(&self.conn).await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "begin delete_approved_permission",
+                err,
+            )
+        })?;
+        let backend = txn.get_database_backend();
+        let res = txn
+            .execute_raw(Statement::from_sql_and_values(
+                backend,
+                "DELETE FROM approved_permission \
+                 WHERE project_id = ? AND permission = ? AND pattern = ?",
+                [project_id.into(), permission.into(), pattern.into()],
+            ))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(DatabaseRole::Repository, "delete approved_permission", err)
+            })?;
+        txn.commit().await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "commit delete_approved_permission",
+                err,
+            )
+        })?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    async fn append_automation_log(&self, record: &AutomationLogRecord) -> StorageResult<()> {
+        self.ensure_writable()?;
+        validate_automation_log(record)?;
+        let txn = begin_write_transaction(&self.conn).await.map_err(|err| {
+            map_sqlite_db_err(DatabaseRole::Repository, "begin append_automation_log", err)
+        })?;
+        let backend = txn.get_database_backend();
+        txn.execute_raw(Statement::from_sql_and_values(
+            backend,
+            "INSERT INTO automation_log \
+             (id, rule_id, trigger_kind, action_kind, status, message, started_at, \
+              finished_at, details_json) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                record.id.clone().into(),
+                record.rule_id.clone().into(),
+                record.trigger_kind.clone().into(),
+                record.action_kind.clone().into(),
+                record.status.clone().into(),
+                record.message.clone().into(),
+                record.started_at.clone().into(),
+                record.finished_at.clone().into(),
+                record.details_json.clone().into(),
+            ],
+        ))
+        .await
+        .map_err(|err| map_sqlite_db_err(DatabaseRole::Repository, "insert automation_log", err))?;
+        txn.commit().await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "commit append_automation_log",
+                err,
+            )
+        })
+    }
+
+    async fn list_automation_logs(
+        &self,
+        rule_id: Option<&str>,
+        limit: Option<usize>,
+    ) -> StorageResult<Vec<AutomationLogRecord>> {
+        if let Some(r) = rule_id {
+            validate_non_empty_identifier(r, "automation_log rule_id")?;
+        }
+        if limit == Some(0) {
+            return Ok(Vec::new());
+        }
+        let backend = self.conn.get_database_backend();
+        let mut sql = String::from(
+            "SELECT id, rule_id, trigger_kind, action_kind, status, message, started_at, \
+                    finished_at, details_json \
+             FROM automation_log",
+        );
+        let mut params: Vec<Value> = Vec::new();
+        if let Some(r) = rule_id {
+            sql.push_str(" WHERE rule_id = ?");
+            params.push(r.into());
+        }
+        sql.push_str(" ORDER BY finished_at DESC, id ASC");
+        if let Some(lim) = limit {
+            let lim_i64 = i64::try_from(lim).unwrap_or(i64::MAX);
+            sql.push_str(" LIMIT ?");
+            params.push(lim_i64.into());
+        }
+        let rows = self
+            .conn
+            .query_all_raw(Statement::from_sql_and_values(backend, sql, params))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(DatabaseRole::Repository, "list automation_log", err)
+            })?;
+        rows.iter().map(decode_automation_log).collect()
+    }
+
+    async fn append_source_call_log(&self, record: &SourceCallLogRecord) -> StorageResult<()> {
+        self.ensure_writable()?;
+        validate_source_call_log(record)?;
+        let txn = begin_write_transaction(&self.conn).await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "begin append_source_call_log",
+                err,
+            )
+        })?;
+        let backend = txn.get_database_backend();
+        txn.execute_raw(Statement::from_sql_and_values(
+            backend,
+            "INSERT INTO source_call_log \
+             (id, session_id, source_slug, tool_name, registered_tool_name, tool_call_id, \
+              credential_ref, latency_ms, input_bytes, output_bytes, cost_estimate_micros, \
+              approval_decision, state_namespace, success, created_at, agent_run_id) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                record.id.clone().into(),
+                record.session_id.clone().into(),
+                record.source_slug.clone().into(),
+                record.tool_name.clone().into(),
+                record.registered_tool_name.clone().into(),
+                record.tool_call_id.clone().into(),
+                record.credential_ref.clone().into(),
+                record.latency_ms.into(),
+                record.input_bytes.into(),
+                record.output_bytes.into(),
+                record.cost_estimate_micros.into(),
+                record.approval_decision.clone().into(),
+                record.state_namespace.clone().into(),
+                i64::from(record.success).into(),
+                record.created_at.clone().into(),
+                record.agent_run_id.clone().into(),
+            ],
+        ))
+        .await
+        .map_err(|err| {
+            map_sqlite_db_err(DatabaseRole::Repository, "insert source_call_log", err)
+        })?;
+        txn.commit().await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "commit append_source_call_log",
+                err,
+            )
+        })
+    }
+
+    async fn list_source_call_logs(
+        &self,
+        session_id: Option<&str>,
+        agent_run_id: Option<&str>,
+    ) -> StorageResult<Vec<SourceCallLogRecord>> {
+        if let Some(s) = session_id {
+            validate_non_empty_identifier(s, "source_call_log session_id")?;
+        }
+        if let Some(r) = agent_run_id {
+            validate_non_empty_identifier(r, "source_call_log agent_run_id")?;
+        }
+        let backend = self.conn.get_database_backend();
+        let mut sql = String::from(
+            "SELECT id, session_id, source_slug, tool_name, registered_tool_name, tool_call_id, \
+                    credential_ref, latency_ms, input_bytes, output_bytes, cost_estimate_micros, \
+                    approval_decision, state_namespace, success, created_at, agent_run_id \
+             FROM source_call_log",
+        );
+        let mut clauses = Vec::new();
+        let mut params: Vec<Value> = Vec::new();
+        if let Some(s) = session_id {
+            clauses.push("session_id = ?");
+            params.push(s.into());
+        }
+        if let Some(r) = agent_run_id {
+            clauses.push("agent_run_id = ?");
+            params.push(r.into());
+        }
+        if !clauses.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&clauses.join(" AND "));
+        }
+        sql.push_str(" ORDER BY created_at ASC, id ASC");
+        let rows = self
+            .conn
+            .query_all_raw(Statement::from_sql_and_values(backend, sql, params))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(DatabaseRole::Repository, "list source_call_log", err)
+            })?;
+        rows.iter().map(decode_source_call_log).collect()
+    }
+
+    // -------------------------------------------------------------------------
+    // RB-05b AC5: Bridge Two-Phase Publication (`prepared` -> `published`)
+    // -------------------------------------------------------------------------
+
+    async fn prepare_bridge_commit_publication(
+        &self,
+        operation_id: &str,
+        commit_oid: &str,
+    ) -> StorageResult<BridgePublicationRecord> {
+        self.ensure_writable()?;
+        validate_bridge_operation_id(operation_id)?;
+        validate_hex_oid(commit_oid, "agent_bridge_publication commit_oid")?;
+        let txn = begin_write_transaction(&self.conn).await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "begin prepare_bridge_commit_publication",
+                err,
+            )
+        })?;
+        let backend = txn.get_database_backend();
+        let existing = txn
+            .query_one_raw(Statement::from_sql_and_values(
+                backend,
+                "SELECT commit_oid, phase FROM agent_bridge_publication WHERE operation_id = ?",
+                [operation_id.into()],
+            ))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(
+                    DatabaseRole::Repository,
+                    "read agent_bridge_publication",
+                    err,
+                )
+            })?;
+        let rec = match existing {
+            Some(row) => {
+                let existing_oid: String = col(&row, 0, "agent_bridge_publication.commit_oid")?;
+                let existing_phase_str: String = col(&row, 1, "agent_bridge_publication.phase")?;
+                let existing_phase = parse_bridge_phase(&existing_phase_str)?;
+                if existing_oid != commit_oid {
+                    return Err(StorageBackendError::BackendInternal {
+                        detail: "bridge commit publication already bound to a different commit"
+                            .to_string(),
+                    });
+                }
+                BridgePublicationRecord {
+                    operation_id: operation_id.to_string(),
+                    commit_oid: existing_oid,
+                    phase: existing_phase,
+                }
+            }
+            None => {
+                txn.execute_raw(Statement::from_sql_and_values(
+                    backend,
+                    "INSERT INTO agent_bridge_publication (operation_id, commit_oid, phase) \
+                     VALUES (?, ?, 'prepared')",
+                    [operation_id.into(), commit_oid.into()],
+                ))
+                .await
+                .map_err(|err| {
+                    map_sqlite_db_err(
+                        DatabaseRole::Repository,
+                        "insert prepared agent_bridge_publication",
+                        err,
+                    )
+                })?;
+                BridgePublicationRecord {
+                    operation_id: operation_id.to_string(),
+                    commit_oid: commit_oid.to_string(),
+                    phase: BridgePublicationPhase::Prepared,
+                }
+            }
+        };
+        txn.commit().await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "commit prepare_bridge_commit_publication",
+                err,
+            )
+        })?;
+        Ok(rec)
+    }
+
+    async fn publish_bridge_commit_publication(
+        &self,
+        operation_id: &str,
+        commit_oid: &str,
+    ) -> StorageResult<BridgePublicationRecord> {
+        self.ensure_writable()?;
+        validate_bridge_operation_id(operation_id)?;
+        validate_hex_oid(commit_oid, "agent_bridge_publication commit_oid")?;
+        let txn = begin_write_transaction(&self.conn).await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "begin publish_bridge_commit_publication",
+                err,
+            )
+        })?;
+        let backend = txn.get_database_backend();
+        let existing = txn
+            .query_one_raw(Statement::from_sql_and_values(
+                backend,
+                "SELECT commit_oid, phase FROM agent_bridge_publication WHERE operation_id = ?",
+                [operation_id.into()],
+            ))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(
+                    DatabaseRole::Repository,
+                    "read agent_bridge_publication",
+                    err,
+                )
+            })?;
+        let row = existing.ok_or_else(|| StorageBackendError::BackendInternal {
+            detail: "cannot publish bridge commit publication before prepare phase".to_string(),
+        })?;
+        let existing_oid: String = col(&row, 0, "agent_bridge_publication.commit_oid")?;
+        if existing_oid != commit_oid {
+            return Err(StorageBackendError::BackendInternal {
+                detail: "bridge commit publication already bound to a different commit".to_string(),
+            });
+        }
+        txn.execute_raw(Statement::from_sql_and_values(
+            backend,
+            "UPDATE agent_bridge_publication SET phase = 'published' \
+             WHERE operation_id = ? AND commit_oid = ?",
+            [operation_id.into(), commit_oid.into()],
+        ))
+        .await
+        .map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "publish agent_bridge_publication",
+                err,
+            )
+        })?;
+        txn.commit().await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "commit publish_bridge_commit_publication",
+                err,
+            )
+        })?;
+        Ok(BridgePublicationRecord {
+            operation_id: operation_id.to_string(),
+            commit_oid: commit_oid.to_string(),
+            phase: BridgePublicationPhase::Published,
+        })
+    }
+
+    async fn get_bridge_commit_publication(
+        &self,
+        operation_id: &str,
+    ) -> StorageResult<Option<BridgePublicationRecord>> {
+        validate_bridge_operation_id(operation_id)?;
+        let txn = self.conn.begin().await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "begin get_bridge_commit_publication snapshot",
+                err,
+            )
+        })?;
+        let exists = table_exists_in_txn(&txn, "agent_bridge_publication").await?;
+        if !exists {
+            return Ok(None);
+        }
+        let backend = txn.get_database_backend();
+        let phase_col_count: i64 = txn
+            .query_one_raw(Statement::from_string(
+                backend,
+                "SELECT COUNT(*) FROM pragma_table_info('agent_bridge_publication') WHERE name = 'phase'"
+                    .to_string(),
+            ))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(
+                    DatabaseRole::Repository,
+                    "inspect agent_bridge_publication phase column",
+                    err,
+                )
+            })?
+            .ok_or_else(|| StorageBackendError::BackendInternal {
+                detail: "failed to inspect agent_bridge_publication phase column".to_string(),
+            })?
+            .try_get_by_index(0)
+            .map_err(|err| {
+                map_sqlite_db_err(
+                    DatabaseRole::Repository,
+                    "decode agent_bridge_publication phase column count",
+                    err,
+                )
+            })?;
+
+        if phase_col_count == 0 {
+            let Some(row) = txn
+                .query_one_raw(Statement::from_sql_and_values(
+                    backend,
+                    "SELECT commit_oid FROM agent_bridge_publication WHERE operation_id = ?",
+                    [operation_id.into()],
+                ))
+                .await
+                .map_err(|err| {
+                    map_sqlite_db_err(
+                        DatabaseRole::Repository,
+                        "get legacy agent_bridge_publication",
+                        err,
+                    )
+                })?
+            else {
+                return Ok(None);
+            };
+            let commit_oid: String = col(&row, 0, "agent_bridge_publication.commit_oid")?;
+            return Ok(Some(BridgePublicationRecord {
+                operation_id: operation_id.to_string(),
+                commit_oid,
+                phase: BridgePublicationPhase::Published,
+            }));
+        }
+
+        let Some(row) = txn
+            .query_one_raw(Statement::from_sql_and_values(
+                backend,
+                "SELECT commit_oid, phase FROM agent_bridge_publication WHERE operation_id = ?",
+                [operation_id.into()],
+            ))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(
+                    DatabaseRole::Repository,
+                    "get agent_bridge_publication",
+                    err,
+                )
+            })?
+        else {
+            return Ok(None);
+        };
+        let commit_oid: String = col(&row, 0, "agent_bridge_publication.commit_oid")?;
+        let phase_str: String = col(&row, 1, "agent_bridge_publication.phase")?;
+        Ok(Some(BridgePublicationRecord {
+            operation_id: operation_id.to_string(),
+            commit_oid,
+            phase: parse_bridge_phase(&phase_str)?,
+        }))
+    }
+
+    async fn prepare_bridge_index_publication(
+        &self,
+        operation_id: &str,
+        index_digest: &str,
+    ) -> StorageResult<BridgeIndexPublicationRecord> {
+        self.ensure_writable()?;
+        validate_bridge_operation_id(operation_id)?;
+        validate_non_empty_identifier(index_digest, "agent_bridge_index_publication index_digest")?;
+        let txn = begin_write_transaction(&self.conn).await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "begin prepare_bridge_index_publication",
+                err,
+            )
+        })?;
+        let backend = txn.get_database_backend();
+        let existing = txn
+            .query_one_raw(Statement::from_sql_and_values(
+                backend,
+                "SELECT index_digest, phase FROM agent_bridge_index_publication \
+                 WHERE operation_id = ?",
+                [operation_id.into()],
+            ))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(
+                    DatabaseRole::Repository,
+                    "read agent_bridge_index_publication",
+                    err,
+                )
+            })?;
+        let rec = match existing {
+            Some(row) => {
+                let existing_digest: String =
+                    col(&row, 0, "agent_bridge_index_publication.index_digest")?;
+                let existing_phase_str: String =
+                    col(&row, 1, "agent_bridge_index_publication.phase")?;
+                let existing_phase = parse_bridge_phase(&existing_phase_str)?;
+                if existing_digest != index_digest {
+                    return Err(StorageBackendError::BackendInternal {
+                        detail: "bridge index publication already bound to a different digest"
+                            .to_string(),
+                    });
+                }
+                BridgeIndexPublicationRecord {
+                    operation_id: operation_id.to_string(),
+                    index_digest: existing_digest,
+                    phase: existing_phase,
+                }
+            }
+            None => {
+                txn.execute_raw(Statement::from_sql_and_values(
+                    backend,
+                    "INSERT INTO agent_bridge_index_publication (operation_id, index_digest, phase) \
+                     VALUES (?, ?, 'prepared')",
+                    [operation_id.into(), index_digest.into()],
+                ))
+                .await
+                .map_err(|err| {
+                    map_sqlite_db_err(
+                        DatabaseRole::Repository,
+                        "insert prepared agent_bridge_index_publication",
+                        err,
+                    )
+                })?;
+                BridgeIndexPublicationRecord {
+                    operation_id: operation_id.to_string(),
+                    index_digest: index_digest.to_string(),
+                    phase: BridgePublicationPhase::Prepared,
+                }
+            }
+        };
+        txn.commit().await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "commit prepare_bridge_index_publication",
+                err,
+            )
+        })?;
+        Ok(rec)
+    }
+
+    async fn publish_bridge_index_publication(
+        &self,
+        operation_id: &str,
+    ) -> StorageResult<Option<BridgeIndexPublicationRecord>> {
+        self.ensure_writable()?;
+        validate_bridge_operation_id(operation_id)?;
+        let txn = begin_write_transaction(&self.conn).await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "begin publish_bridge_index_publication",
+                err,
+            )
+        })?;
+        let backend = txn.get_database_backend();
+        let Some(row) = txn
+            .query_one_raw(Statement::from_sql_and_values(
+                backend,
+                "SELECT index_digest FROM agent_bridge_index_publication WHERE operation_id = ?",
+                [operation_id.into()],
+            ))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(
+                    DatabaseRole::Repository,
+                    "read agent_bridge_index_publication for publish",
+                    err,
+                )
+            })?
+        else {
+            drop(txn);
+            return Ok(None);
+        };
+        let index_digest: String = col(&row, 0, "agent_bridge_index_publication.index_digest")?;
+        txn.execute_raw(Statement::from_sql_and_values(
+            backend,
+            "UPDATE agent_bridge_index_publication SET phase = 'published' WHERE operation_id = ?",
+            [operation_id.into()],
+        ))
+        .await
+        .map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "publish agent_bridge_index_publication",
+                err,
+            )
+        })?;
+        txn.commit().await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "commit publish_bridge_index_publication",
+                err,
+            )
+        })?;
+        Ok(Some(BridgeIndexPublicationRecord {
+            operation_id: operation_id.to_string(),
+            index_digest,
+            phase: BridgePublicationPhase::Published,
+        }))
+    }
+
+    async fn get_bridge_index_publication(
+        &self,
+        operation_id: &str,
+    ) -> StorageResult<Option<BridgeIndexPublicationRecord>> {
+        validate_bridge_operation_id(operation_id)?;
+        let txn = self.conn.begin().await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "begin get_bridge_index_publication snapshot",
+                err,
+            )
+        })?;
+        let exists = table_exists_in_txn(&txn, "agent_bridge_index_publication").await?;
+        if !exists {
+            return Ok(None);
+        }
+        let backend = txn.get_database_backend();
+        let Some(row) = txn
+            .query_one_raw(Statement::from_sql_and_values(
+                backend,
+                "SELECT index_digest, phase FROM agent_bridge_index_publication \
+                 WHERE operation_id = ?",
+                [operation_id.into()],
+            ))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(
+                    DatabaseRole::Repository,
+                    "get agent_bridge_index_publication",
+                    err,
+                )
+            })?
+        else {
+            return Ok(None);
+        };
+        let index_digest: String = col(&row, 0, "agent_bridge_index_publication.index_digest")?;
+        let phase_str: String = col(&row, 1, "agent_bridge_index_publication.phase")?;
+        Ok(Some(BridgeIndexPublicationRecord {
+            operation_id: operation_id.to_string(),
+            index_digest,
+            phase: parse_bridge_phase(&phase_str)?,
+        }))
+    }
+}
+
+async fn table_exists_in_txn<C: ConnectionTrait>(txn: &C, table: &str) -> StorageResult<bool> {
+    let backend = txn.get_database_backend();
+    let row = txn
+        .query_one_raw(Statement::from_sql_and_values(
+            backend,
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1",
+            [table.into()],
+        ))
+        .await
+        .map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "check sqlite table existence",
+                err,
+            )
+        })?;
+    Ok(row.is_some())
+}
+
+async fn ensure_ai_thread_exists_in_txn<C: ConnectionTrait>(
+    txn: &C,
+    thread_id: &str,
+) -> StorageResult<()> {
+    let backend = txn.get_database_backend();
+    let exists = txn
+        .query_one_raw(Statement::from_sql_and_values(
+            backend,
+            "SELECT 1 FROM ai_thread WHERE thread_id = ? LIMIT 1",
+            [thread_id.into()],
+        ))
+        .await
+        .map_err(|err| map_sqlite_db_err(DatabaseRole::Repository, "check ai_thread parent", err))?
+        .is_some();
+    if !exists {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "referenced ai_thread does not exist".to_string(),
+        });
+    }
+    Ok(())
+}
+
+async fn ensure_memory_episode_exists_in_txn<C: ConnectionTrait>(
+    txn: &C,
+    episode_id: &str,
+) -> StorageResult<()> {
+    let backend = txn.get_database_backend();
+    let exists = txn
+        .query_one_raw(Statement::from_sql_and_values(
+            backend,
+            "SELECT 1 FROM memory_episode WHERE episode_id = ? LIMIT 1",
+            [episode_id.into()],
+        ))
+        .await
+        .map_err(|err| {
+            map_sqlite_db_err(DatabaseRole::Repository, "check memory_episode parent", err)
+        })?
+        .is_some();
+    if !exists {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "referenced memory_episode does not exist".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn parse_bridge_phase(raw: &str) -> StorageResult<BridgePublicationPhase> {
+    match raw {
+        "prepared" => Ok(BridgePublicationPhase::Prepared),
+        "published" => Ok(BridgePublicationPhase::Published),
+        _ => Err(StorageBackendError::BackendInternal {
+            detail: "invalid bridge publication phase value".to_string(),
+        }),
+    }
+}
+
+fn decode_ai_thread(row: &QueryResult) -> StorageResult<AiThreadRecord> {
+    let archived: i64 = col(row, 8, "ai_thread.archived")?;
+    Ok(AiThreadRecord {
+        thread_id: col(row, 0, "ai_thread.thread_id")?,
+        title: col(row, 1, "ai_thread.title")?,
+        owner_kind: col(row, 2, "ai_thread.owner_kind")?,
+        owner_id: col(row, 3, "ai_thread.owner_id")?,
+        owner_display_name: col(row, 4, "ai_thread.owner_display_name")?,
+        current_intent_id: col(row, 5, "ai_thread.current_intent_id")?,
+        latest_intent_id: col(row, 6, "ai_thread.latest_intent_id")?,
+        metadata_json: col(row, 7, "ai_thread.metadata_json")?,
+        archived: archived != 0,
+        version: col(row, 9, "ai_thread.version")?,
+        created_at: col(row, 10, "ai_thread.created_at")?,
+        updated_at: col(row, 11, "ai_thread.updated_at")?,
+    })
+}
+
+fn decode_ai_thread_participant(row: &QueryResult) -> StorageResult<AiThreadParticipantRecord> {
+    Ok(AiThreadParticipantRecord {
+        thread_id: col(row, 0, "ai_thread_participant.thread_id")?,
+        actor_kind: col(row, 1, "ai_thread_participant.actor_kind")?,
+        actor_id: col(row, 2, "ai_thread_participant.actor_id")?,
+        actor_display_name: col(row, 3, "ai_thread_participant.actor_display_name")?,
+        role: col(row, 4, "ai_thread_participant.role")?,
+        joined_at: col(row, 5, "ai_thread_participant.joined_at")?,
+    })
+}
+
+fn decode_ai_thread_intent(row: &QueryResult) -> StorageResult<AiThreadIntentRecord> {
+    let is_head: i64 = col(row, 3, "ai_thread_intent.is_head")?;
+    Ok(AiThreadIntentRecord {
+        thread_id: col(row, 0, "ai_thread_intent.thread_id")?,
+        intent_id: col(row, 1, "ai_thread_intent.intent_id")?,
+        ordinal: col(row, 2, "ai_thread_intent.ordinal")?,
+        is_head: is_head != 0,
+        linked_at: col(row, 4, "ai_thread_intent.linked_at")?,
+        link_reason: col(row, 5, "ai_thread_intent.link_reason")?,
+    })
+}
+
+fn decode_ai_thread_provider_metadata(
+    row: &QueryResult,
+) -> StorageResult<AiThreadProviderMetadataRecord> {
+    Ok(AiThreadProviderMetadataRecord {
+        thread_id: col(row, 0, "ai_thread_provider_metadata.thread_id")?,
+        legacy_session_id: col(row, 1, "ai_thread_provider_metadata.legacy_session_id")?,
+        provider_thread_id: col(row, 2, "ai_thread_provider_metadata.provider_thread_id")?,
+        provider_kind: col(row, 3, "ai_thread_provider_metadata.provider_kind")?,
+        metadata_json: col(row, 4, "ai_thread_provider_metadata.metadata_json")?,
+        updated_at: col(row, 5, "ai_thread_provider_metadata.updated_at")?,
+    })
+}
+
+fn decode_ai_scheduler_state(row: &QueryResult) -> StorageResult<AiSchedulerStateRecord> {
+    Ok(AiSchedulerStateRecord {
+        thread_id: col(row, 0, "ai_scheduler_state.thread_id")?,
+        selected_plan_id: col(row, 1, "ai_scheduler_state.selected_plan_id")?,
+        active_task_id: col(row, 2, "ai_scheduler_state.active_task_id")?,
+        active_run_id: col(row, 3, "ai_scheduler_state.active_run_id")?,
+        metadata_json: col(row, 4, "ai_scheduler_state.metadata_json")?,
+        version: col(row, 5, "ai_scheduler_state.version")?,
+        updated_at: col(row, 6, "ai_scheduler_state.updated_at")?,
+    })
+}
+
+fn decode_ai_scheduler_plan_head(row: &QueryResult) -> StorageResult<AiSchedulerPlanHeadRecord> {
+    Ok(AiSchedulerPlanHeadRecord {
+        thread_id: col(row, 0, "ai_scheduler_plan_head.thread_id")?,
+        plan_id: col(row, 1, "ai_scheduler_plan_head.plan_id")?,
+        ordinal: col(row, 2, "ai_scheduler_plan_head.ordinal")?,
+    })
+}
+
+fn decode_ai_scheduler_selected_plan(
+    row: &QueryResult,
+) -> StorageResult<AiSchedulerSelectedPlanRecord> {
+    Ok(AiSchedulerSelectedPlanRecord {
+        thread_id: col(row, 0, "ai_scheduler_selected_plan.thread_id")?,
+        plan_id: col(row, 1, "ai_scheduler_selected_plan.plan_id")?,
+        ordinal: col(row, 2, "ai_scheduler_selected_plan.ordinal")?,
+    })
+}
+
+fn decode_ai_live_context_window(row: &QueryResult) -> StorageResult<AiLiveContextWindowRecord> {
+    Ok(AiLiveContextWindowRecord {
+        thread_id: col(row, 0, "ai_live_context_window.thread_id")?,
+        context_frame_id: col(row, 1, "ai_live_context_window.context_frame_id")?,
+        position: col(row, 2, "ai_live_context_window.position")?,
+        source_kind: col(row, 3, "ai_live_context_window.source_kind")?,
+        pin_kind: col(row, 4, "ai_live_context_window.pin_kind")?,
+        inserted_at: col(row, 5, "ai_live_context_window.inserted_at")?,
+    })
+}
+
+fn decode_ai_index_intent_plan(row: &QueryResult) -> StorageResult<AiIndexIntentPlanRecord> {
+    Ok(AiIndexIntentPlanRecord {
+        intent_id: col(row, 0, "ai_index_intent_plan.intent_id")?,
+        plan_id: col(row, 1, "ai_index_intent_plan.plan_id")?,
+        created_at: col(row, 2, "ai_index_intent_plan.created_at")?,
+    })
+}
+
+fn decode_ai_index_intent_task(row: &QueryResult) -> StorageResult<AiIndexIntentTaskRecord> {
+    Ok(AiIndexIntentTaskRecord {
+        intent_id: col(row, 0, "ai_index_intent_task.intent_id")?,
+        task_id: col(row, 1, "ai_index_intent_task.task_id")?,
+        parent_task_id: col(row, 2, "ai_index_intent_task.parent_task_id")?,
+        origin_step_id: col(row, 3, "ai_index_intent_task.origin_step_id")?,
+        created_at: col(row, 4, "ai_index_intent_task.created_at")?,
+    })
+}
+
+fn decode_ai_index_plan_step_task(row: &QueryResult) -> StorageResult<AiIndexPlanStepTaskRecord> {
+    Ok(AiIndexPlanStepTaskRecord {
+        plan_id: col(row, 0, "ai_index_plan_step_task.plan_id")?,
+        task_id: col(row, 1, "ai_index_plan_step_task.task_id")?,
+        step_id: col(row, 2, "ai_index_plan_step_task.step_id")?,
+        created_at: col(row, 3, "ai_index_plan_step_task.created_at")?,
+    })
+}
+
+fn decode_ai_index_task_run(row: &QueryResult) -> StorageResult<AiIndexTaskRunRecord> {
+    let is_latest: i64 = col(row, 2, "ai_index_task_run.is_latest")?;
+    Ok(AiIndexTaskRunRecord {
+        task_id: col(row, 0, "ai_index_task_run.task_id")?,
+        run_id: col(row, 1, "ai_index_task_run.run_id")?,
+        is_latest: is_latest != 0,
+        created_at: col(row, 3, "ai_index_task_run.created_at")?,
+        base_commit_ref: col(row, 4, "ai_index_task_run.base_commit_ref")?,
+    })
+}
+
+fn decode_ai_index_run_event(row: &QueryResult) -> StorageResult<AiIndexRunEventRecord> {
+    let is_latest: i64 = col(row, 3, "ai_index_run_event.is_latest")?;
+    Ok(AiIndexRunEventRecord {
+        run_id: col(row, 0, "ai_index_run_event.run_id")?,
+        event_id: col(row, 1, "ai_index_run_event.event_id")?,
+        event_kind: col(row, 2, "ai_index_run_event.event_kind")?,
+        is_latest: is_latest != 0,
+        created_at: col(row, 4, "ai_index_run_event.created_at")?,
+    })
+}
+
+fn decode_ai_index_run_patchset(row: &QueryResult) -> StorageResult<AiIndexRunPatchsetRecord> {
+    let is_latest: i64 = col(row, 3, "ai_index_run_patchset.is_latest")?;
+    Ok(AiIndexRunPatchsetRecord {
+        run_id: col(row, 0, "ai_index_run_patchset.run_id")?,
+        patchset_id: col(row, 1, "ai_index_run_patchset.patchset_id")?,
+        sequence: col(row, 2, "ai_index_run_patchset.sequence")?,
+        is_latest: is_latest != 0,
+        created_at: col(row, 4, "ai_index_run_patchset.created_at")?,
+    })
+}
+
+fn decode_ai_index_intent_context_frame(
+    row: &QueryResult,
+) -> StorageResult<AiIndexIntentContextFrameRecord> {
+    Ok(AiIndexIntentContextFrameRecord {
+        intent_id: col(row, 0, "ai_index_intent_context_frame.intent_id")?,
+        context_frame_id: col(row, 1, "ai_index_intent_context_frame.context_frame_id")?,
+        relation_kind: col(row, 2, "ai_index_intent_context_frame.relation_kind")?,
+        created_at: col(row, 3, "ai_index_intent_context_frame.created_at")?,
+    })
+}
+
+fn decode_ai_validation_report(row: &QueryResult) -> StorageResult<AiValidationReportRecord> {
+    let stale: i64 = col(row, 4, "ai_validation_report.stale")?;
+    let is_latest: i64 = col(row, 5, "ai_validation_report.is_latest")?;
+    Ok(AiValidationReportRecord {
+        report_id: col(row, 0, "ai_validation_report.report_id")?,
+        thread_id: col(row, 1, "ai_validation_report.thread_id")?,
+        run_id: col(row, 2, "ai_validation_report.run_id")?,
+        policy_version: col(row, 3, "ai_validation_report.policy_version")?,
+        stale: stale != 0,
+        is_latest: is_latest != 0,
+        summary_json: col(row, 6, "ai_validation_report.summary_json")?,
+        created_at: col(row, 7, "ai_validation_report.created_at")?,
+        updated_at: col(row, 8, "ai_validation_report.updated_at")?,
+    })
+}
+
+fn decode_ai_risk_score_breakdown(row: &QueryResult) -> StorageResult<AiRiskScoreBreakdownRecord> {
+    let stale: i64 = col(row, 4, "ai_risk_score_breakdown.stale")?;
+    let is_latest: i64 = col(row, 5, "ai_risk_score_breakdown.is_latest")?;
+    Ok(AiRiskScoreBreakdownRecord {
+        breakdown_id: col(row, 0, "ai_risk_score_breakdown.breakdown_id")?,
+        thread_id: col(row, 1, "ai_risk_score_breakdown.thread_id")?,
+        validation_report_id: col(row, 2, "ai_risk_score_breakdown.validation_report_id")?,
+        policy_version: col(row, 3, "ai_risk_score_breakdown.policy_version")?,
+        stale: stale != 0,
+        is_latest: is_latest != 0,
+        summary_json: col(row, 6, "ai_risk_score_breakdown.summary_json")?,
+        created_at: col(row, 7, "ai_risk_score_breakdown.created_at")?,
+        updated_at: col(row, 8, "ai_risk_score_breakdown.updated_at")?,
+    })
+}
+
+fn decode_ai_decision_proposal(row: &QueryResult) -> StorageResult<AiDecisionProposalRecord> {
+    let stale: i64 = col(row, 5, "ai_decision_proposal.stale")?;
+    let is_latest: i64 = col(row, 6, "ai_decision_proposal.is_latest")?;
+    Ok(AiDecisionProposalRecord {
+        proposal_id: col(row, 0, "ai_decision_proposal.proposal_id")?,
+        thread_id: col(row, 1, "ai_decision_proposal.thread_id")?,
+        validation_report_id: col(row, 2, "ai_decision_proposal.validation_report_id")?,
+        risk_score_breakdown_id: col(row, 3, "ai_decision_proposal.risk_score_breakdown_id")?,
+        policy_version: col(row, 4, "ai_decision_proposal.policy_version")?,
+        stale: stale != 0,
+        is_latest: is_latest != 0,
+        summary_json: col(row, 7, "ai_decision_proposal.summary_json")?,
+        created_at: col(row, 8, "ai_decision_proposal.created_at")?,
+        updated_at: col(row, 9, "ai_decision_proposal.updated_at")?,
+    })
+}
+
+fn decode_ai_final_decision(row: &QueryResult) -> StorageResult<AiFinalDecisionRecord> {
+    let stale: i64 = col(row, 6, "ai_final_decision.stale")?;
+    let is_latest: i64 = col(row, 7, "ai_final_decision.is_latest")?;
+    Ok(AiFinalDecisionRecord {
+        decision_id: col(row, 0, "ai_final_decision.decision_id")?,
+        thread_id: col(row, 1, "ai_final_decision.thread_id")?,
+        decision_proposal_id: col(row, 2, "ai_final_decision.decision_proposal_id")?,
+        validation_report_id: col(row, 3, "ai_final_decision.validation_report_id")?,
+        policy_version: col(row, 4, "ai_final_decision.policy_version")?,
+        verdict: col(row, 5, "ai_final_decision.verdict")?,
+        stale: stale != 0,
+        is_latest: is_latest != 0,
+        summary_json: col(row, 8, "ai_final_decision.summary_json")?,
+        created_at: col(row, 9, "ai_final_decision.created_at")?,
+        updated_at: col(row, 10, "ai_final_decision.updated_at")?,
+    })
+}
+
+fn decode_memory_episode(row: &QueryResult) -> StorageResult<MemoryEpisodeRecord> {
+    let sk: String = col(row, 2, "memory_episode.source_kind")?;
+    let outcome: String = col(row, 4, "memory_episode.outcome")?;
+    Ok(MemoryEpisodeRecord {
+        episode_id: col(row, 0, "memory_episode.episode_id")?,
+        repo_id: col(row, 1, "memory_episode.repo_id")?,
+        source_kind: MemorySourceKind::parse(&sk)?,
+        source_key: col(row, 3, "memory_episode.source_key")?,
+        outcome: MemoryOutcome::parse(&outcome)?,
+        actor: col(row, 5, "memory_episode.actor")?,
+        started_at: col(row, 6, "memory_episode.started_at")?,
+        ended_at: col(row, 7, "memory_episode.ended_at")?,
+        anchor_commit: col(row, 8, "memory_episode.anchor_commit")?,
+        change_id: col(row, 9, "memory_episode.change_id")?,
+        title: col(row, 10, "memory_episode.title")?,
+        body: col(row, 11, "memory_episode.body")?,
+        content_digest: col(row, 12, "memory_episode.content_digest")?,
+        producer: col(row, 13, "memory_episode.producer")?,
+        rules_version: col(row, 14, "memory_episode.rules_version")?,
+    })
+}
+
+fn decode_memory_episode_evidence(row: &QueryResult) -> StorageResult<MemoryEpisodeEvidenceRecord> {
+    let kind: String = col(row, 2, "memory_episode_evidence.kind")?;
+    let conf: String = col(row, 4, "memory_episode_evidence.link_confidence")?;
+    let status: String = col(row, 5, "memory_episode_evidence.resolution_status")?;
+    Ok(MemoryEpisodeEvidenceRecord {
+        episode_id: col(row, 0, "memory_episode_evidence.episode_id")?,
+        ordinal: col(row, 1, "memory_episode_evidence.ordinal")?,
+        kind: MemoryEvidenceKind::parse(&kind)?,
+        ref_id: col(row, 3, "memory_episode_evidence.ref_id")?,
+        link_confidence: MemoryLinkConfidence::parse(&conf)?,
+        resolution_status: MemoryResolutionStatus::parse(&status)?,
+    })
+}
+
+fn decode_memory_projection_state(row: &QueryResult) -> StorageResult<MemoryProjectionStateRecord> {
+    let sk: String = col(row, 1, "memory_projection_state.source_kind")?;
+    let trunc: i64 = col(row, 6, "memory_projection_state.horizon_truncated")?;
+    Ok(MemoryProjectionStateRecord {
+        repo_id: col(row, 0, "memory_projection_state.repo_id")?,
+        source_kind: MemorySourceKind::parse(&sk)?,
+        cursor_json: col(row, 2, "memory_projection_state.cursor_json")?,
+        fingerprint: col(row, 3, "memory_projection_state.fingerprint")?,
+        rules_version: col(row, 4, "memory_projection_state.rules_version")?,
+        schema_version: col(row, 5, "memory_projection_state.schema_version")?,
+        horizon_truncated: trunc != 0,
+        revoked_count: col(row, 7, "memory_projection_state.revoked_count")?,
+        aged_out_count: col(row, 8, "memory_projection_state.aged_out_count")?,
+        rebuilt_at: col(row, 9, "memory_projection_state.rebuilt_at")?,
+    })
+}
+
+fn decode_memory_episode_path(row: &QueryResult) -> StorageResult<MemoryEpisodePathRecord> {
+    let ck: String = col(row, 2, "memory_episode_path.change_kind")?;
+    Ok(MemoryEpisodePathRecord {
+        episode_id: col(row, 0, "memory_episode_path.episode_id")?,
+        code_path: col(row, 1, "memory_episode_path.code_path")?,
+        change_kind: MemoryPathChangeKind::parse(&ck)?,
+        blob_oid_at_end: col(row, 3, "memory_episode_path.blob_oid_at_end")?,
+        ended_at: col(row, 4, "memory_episode_path.ended_at")?,
+    })
+}
+
+fn decode_memory_episode_search_doc(
+    row: &QueryResult,
+) -> StorageResult<MemoryEpisodeSearchDocRecord> {
+    Ok(MemoryEpisodeSearchDocRecord {
+        rowid: col(row, 0, "memory_episode_search_doc.rowid")?,
+        episode_id: col(row, 1, "memory_episode_search_doc.episode_id")?,
+        title: col(row, 2, "memory_episode_search_doc.title")?,
+        body: col(row, 3, "memory_episode_search_doc.body")?,
+        paths_text: col(row, 4, "memory_episode_search_doc.paths_text")?,
+    })
+}
+
+fn decode_approved_permission(row: &QueryResult) -> StorageResult<ApprovedPermissionRecord> {
+    Ok(ApprovedPermissionRecord {
+        project_id: col(row, 0, "approved_permission.project_id")?,
+        permission: col(row, 1, "approved_permission.permission")?,
+        pattern: col(row, 2, "approved_permission.pattern")?,
+        created_at: col(row, 3, "approved_permission.created_at")?,
+        source_worktree_id: col(row, 4, "approved_permission.source_worktree_id")?,
+        source_session_id: col(row, 5, "approved_permission.source_session_id")?,
+        source_workspace_id: col(row, 6, "approved_permission.source_workspace_id")?,
+    })
+}
+
+fn decode_automation_log(row: &QueryResult) -> StorageResult<AutomationLogRecord> {
+    Ok(AutomationLogRecord {
+        id: col(row, 0, "automation_log.id")?,
+        rule_id: col(row, 1, "automation_log.rule_id")?,
+        trigger_kind: col(row, 2, "automation_log.trigger_kind")?,
+        action_kind: col(row, 3, "automation_log.action_kind")?,
+        status: col(row, 4, "automation_log.status")?,
+        message: col(row, 5, "automation_log.message")?,
+        started_at: col(row, 6, "automation_log.started_at")?,
+        finished_at: col(row, 7, "automation_log.finished_at")?,
+        details_json: col(row, 8, "automation_log.details_json")?,
+    })
+}
+
+fn decode_source_call_log(row: &QueryResult) -> StorageResult<SourceCallLogRecord> {
+    let success: i64 = col(row, 13, "source_call_log.success")?;
+    Ok(SourceCallLogRecord {
+        id: col(row, 0, "source_call_log.id")?,
+        session_id: col(row, 1, "source_call_log.session_id")?,
+        source_slug: col(row, 2, "source_call_log.source_slug")?,
+        tool_name: col(row, 3, "source_call_log.tool_name")?,
+        registered_tool_name: col(row, 4, "source_call_log.registered_tool_name")?,
+        tool_call_id: col(row, 5, "source_call_log.tool_call_id")?,
+        credential_ref: col(row, 6, "source_call_log.credential_ref")?,
+        latency_ms: col(row, 7, "source_call_log.latency_ms")?,
+        input_bytes: col(row, 8, "source_call_log.input_bytes")?,
+        output_bytes: col(row, 9, "source_call_log.output_bytes")?,
+        cost_estimate_micros: col(row, 10, "source_call_log.cost_estimate_micros")?,
+        approval_decision: col(row, 11, "source_call_log.approval_decision")?,
+        state_namespace: col(row, 12, "source_call_log.state_namespace")?,
+        success: success != 0,
+        created_at: col(row, 14, "source_call_log.created_at")?,
+        agent_run_id: col(row, 15, "source_call_log.agent_run_id")?,
+    })
 }

@@ -65,16 +65,29 @@ pub use git_state_store::RedbGitStateStore;
 #[cfg(feature = "storage-sqlite")]
 pub use git_state_store::SqliteGitStateStore;
 pub use git_state_store::{
-    AiOperationLinkRecord, BisectStateRecord, ChangeIdentityRecord, ChangePredecessorRecord,
-    ChangeRevisionRecord, GitStateStore, INITIAL_WORKTREE_REGISTRY_CAPABILITIES, LayerPathRecord,
-    LayerRecord, OP_HEAD_GENERATION_SENTINEL, OperationHeadCasOutcome,
+    AiDecisionProposalRecord, AiFinalDecisionRecord, AiIndexIntentContextFrameRecord,
+    AiIndexIntentPlanRecord, AiIndexIntentTaskRecord, AiIndexPlanStepTaskRecord,
+    AiIndexRunEventRecord, AiIndexRunPatchsetRecord, AiIndexTaskRunRecord,
+    AiLiveContextWindowRecord, AiOperationLinkRecord, AiRiskScoreBreakdownRecord,
+    AiSchedulerPlanHeadRecord, AiSchedulerSelectedPlanRecord, AiSchedulerStateRecord,
+    AiThreadIntentRecord, AiThreadParticipantRecord, AiThreadProviderMetadataRecord,
+    AiThreadRecord, AiValidationReportRecord, ApprovedPermissionRecord, AutomationLogRecord,
+    BisectStateRecord, BridgeIndexPublicationRecord, CONFIG_STORE_REPO_SOURCE_TABLES,
+    ChangeIdentityRecord, ChangePredecessorRecord, ChangeRevisionRecord,
+    GIT_STORE_CORE_SOURCE_TABLES, GitStateStore, INITIAL_WORKTREE_REGISTRY_CAPABILITIES,
+    LayerPathRecord, LayerRecord, MEMORY_BY_PATH_INDEX_NAME, MemoryEpisodeEvidenceRecord,
+    MemoryEpisodePathRecord, MemoryEpisodeRecord, MemoryEpisodeSearchDocRecord, MemoryEvidenceKind,
+    MemoryLinkConfidence, MemoryOutcome, MemoryPathChangeKind, MemoryProjectionStateRecord,
+    MemoryResolutionStatus, MemorySourceKind, OP_HEAD_GENERATION_SENTINEL, OperationHeadCasOutcome,
     OperationHeadConvergeOutcome, OperationHeadsSnapshot, OperationJournalRecord, OperationRecord,
     OperationScopeKind, OperationScopeProvenance, RB05_WORKFLOW_STATE_SOURCE_TABLES,
-    RebaseStateRecord, SequenceStateRecord, SparseViewSnapshot, WorkingDirtyEntryRecord,
-    WorkingDirtyMetaRecord, WorkspaceLeaseAcquireOutcome, WorkspaceLeaseMutationOutcome,
-    WorkspaceRecordKind, WorkspaceRecordOwnerKind, WorkspaceRecordRow, WorkspaceRecordState,
-    WorktreeIntentOp, WorktreeIntentRecord, WorktreeIntentWrite, WorktreeLifecycleRecord,
-    WorktreeLifecycleState,
+    RB05B_AI_MEMORY_BRIDGE_SOURCE_TABLES, REPOSITORY_ACTIVE_SOURCE_TABLES_COUNT,
+    RETIRED_REPOSITORY_SOURCE_TABLES, RebaseStateRecord, SequenceStateRecord, SourceCallLogRecord,
+    SparseViewSnapshot, WorkingDirtyEntryRecord, WorkingDirtyMetaRecord,
+    WorkspaceLeaseAcquireOutcome, WorkspaceLeaseMutationOutcome, WorkspaceRecordKind,
+    WorkspaceRecordOwnerKind, WorkspaceRecordRow, WorkspaceRecordState, WorktreeIntentOp,
+    WorktreeIntentRecord, WorktreeIntentWrite, WorktreeLifecycleRecord, WorktreeLifecycleState,
+    repository_active_source_tables,
 };
 #[cfg(feature = "storage-redb")]
 pub use git_store::RedbGitStore;

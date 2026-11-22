@@ -31,24 +31,50 @@ use crate::{
         codec::{decode_versioned, encode_versioned},
         error::{StorageBackendError, StorageResult},
         git_state_store::{
-            AiOperationLinkRecord, BisectStateRecord, ChangeIdentityRecord,
-            ChangePredecessorRecord, ChangeRevisionRecord, GitStateStore,
+            AiDecisionProposalRecord, AiFinalDecisionRecord, AiIndexIntentContextFrameRecord,
+            AiIndexIntentPlanRecord, AiIndexIntentTaskRecord, AiIndexPlanStepTaskRecord,
+            AiIndexRunEventRecord, AiIndexRunPatchsetRecord, AiIndexTaskRunRecord,
+            AiLiveContextWindowRecord, AiOperationLinkRecord, AiRiskScoreBreakdownRecord,
+            AiSchedulerPlanHeadRecord, AiSchedulerSelectedPlanRecord, AiSchedulerStateRecord,
+            AiThreadIntentRecord, AiThreadParticipantRecord, AiThreadProviderMetadataRecord,
+            AiThreadRecord, AiValidationReportRecord, ApprovedPermissionRecord,
+            AutomationLogRecord, BisectStateRecord, BridgeIndexPublicationRecord,
+            ChangeIdentityRecord, ChangePredecessorRecord, ChangeRevisionRecord, GitStateStore,
             INITIAL_WORKTREE_REGISTRY_CAPABILITIES, LayerPathRecord, LayerRecord,
-            OP_HEAD_GENERATION_SENTINEL, OperationHeadCasOutcome, OperationHeadConvergeOutcome,
-            OperationHeadsSnapshot, OperationJournalRecord, OperationRecord,
-            RB05_WORKFLOW_STATE_SOURCE_TABLES, RebaseStateRecord, SequenceStateRecord,
-            SparseViewSnapshot, WorkingDirtyEntryRecord, WorkingDirtyMetaRecord,
-            WorkspaceLeaseAcquireOutcome, WorkspaceLeaseMutationOutcome, WorkspaceRecordKind,
-            WorkspaceRecordRow, WorkspaceRecordState, WorktreeIntentRecord, WorktreeIntentWrite,
-            WorktreeLifecycleRecord, normalize_op_heads, validate_ai_operation_link,
-            validate_bisect_state, validate_change_identity, validate_change_predecessor,
-            validate_change_revision, validate_layer_path_record, validate_layer_record,
-            validate_no_nul, validate_operation_journal, validate_operation_record,
-            validate_opt_hex_oid, validate_opt_no_nul, validate_rebase_state,
-            validate_sequence_state, validate_working_dirty_entry, validate_working_dirty_meta,
-            validate_workspace_record, validate_worktree_intent_write, validate_worktree_lifecycle,
+            MEMORY_BY_PATH_INDEX_NAME, MemoryEpisodeEvidenceRecord, MemoryEpisodePathRecord,
+            MemoryEpisodeRecord, MemoryEpisodeSearchDocRecord, MemoryProjectionStateRecord,
+            MemorySourceKind, OP_HEAD_GENERATION_SENTINEL, OperationHeadCasOutcome,
+            OperationHeadConvergeOutcome, OperationHeadsSnapshot, OperationJournalRecord,
+            OperationRecord, RB05_WORKFLOW_STATE_SOURCE_TABLES,
+            RB05B_AI_MEMORY_BRIDGE_SOURCE_TABLES, RebaseStateRecord, SequenceStateRecord,
+            SourceCallLogRecord, SparseViewSnapshot, WorkingDirtyEntryRecord,
+            WorkingDirtyMetaRecord, WorkspaceLeaseAcquireOutcome, WorkspaceLeaseMutationOutcome,
+            WorkspaceRecordKind, WorkspaceRecordRow, WorkspaceRecordState, WorktreeIntentRecord,
+            WorktreeIntentWrite, WorktreeLifecycleRecord, invert_ended_at, normalize_op_heads,
+            validate_ai_decision_proposal, validate_ai_final_decision,
+            validate_ai_index_intent_context_frame, validate_ai_index_intent_plan,
+            validate_ai_index_intent_task, validate_ai_index_plan_step_task,
+            validate_ai_index_run_event, validate_ai_index_run_patchset,
+            validate_ai_index_task_run, validate_ai_live_context_window,
+            validate_ai_operation_link, validate_ai_risk_score_breakdown,
+            validate_ai_scheduler_plan_head, validate_ai_scheduler_selected_plan,
+            validate_ai_scheduler_state, validate_ai_thread, validate_ai_thread_intent,
+            validate_ai_thread_participant, validate_ai_thread_provider_metadata,
+            validate_ai_validation_report, validate_approved_permission, validate_automation_log,
+            validate_bisect_state, validate_bridge_operation_id, validate_change_identity,
+            validate_change_predecessor, validate_change_revision, validate_layer_path_record,
+            validate_layer_record, validate_memory_code_path, validate_memory_episode,
+            validate_memory_episode_evidence, validate_memory_episode_path,
+            validate_memory_projection_state, validate_no_nul, validate_operation_journal,
+            validate_operation_record, validate_opt_hex_oid, validate_opt_no_nul,
+            validate_rebase_state, validate_sequence_state, validate_source_call_log,
+            validate_working_dirty_entry, validate_working_dirty_meta, validate_workspace_record,
+            validate_worktree_intent_write, validate_worktree_lifecycle,
         },
-        git_store::{validate_hex_oid, validate_non_empty_identifier},
+        git_store::{
+            BridgePublicationPhase, BridgePublicationRecord, validate_hex_oid,
+            validate_non_empty_identifier,
+        },
         manifest::fsync_dir,
         meta::{begin_checked_read, begin_checked_write_blocking, init_meta_schema},
         opener::{
@@ -118,6 +144,85 @@ pub const CHANGE_REVISION_BY_COMMIT_TABLE: TableDefinition<'static, (&str, &str)
     TableDefinition::new(CHANGE_REVISION_BY_COMMIT_INDEX_NAME);
 pub const GIT_STATE_SEQ_TABLE: TableDefinition<'static, &str, &[u8]> =
     TableDefinition::new(GIT_STATE_SEQ_TABLE_NAME);
+
+// 29 RB-05b source tables (19 `ai_*`, 3 governance/audit, 5 `memory_*`, 2 bridge publication)
+pub const AI_THREAD_TABLE: TableDefinition<'static, &str, &[u8]> =
+    TableDefinition::new("ai_thread");
+pub const AI_THREAD_PARTICIPANT_TABLE: TableDefinition<'static, (&str, &str, &str), &[u8]> =
+    TableDefinition::new("ai_thread_participant");
+pub const AI_THREAD_INTENT_TABLE: TableDefinition<'static, (&str, &str), &[u8]> =
+    TableDefinition::new("ai_thread_intent");
+pub const AI_THREAD_PROVIDER_METADATA_TABLE: TableDefinition<'static, &str, &[u8]> =
+    TableDefinition::new("ai_thread_provider_metadata");
+pub const AI_SCHEDULER_STATE_TABLE: TableDefinition<'static, &str, &[u8]> =
+    TableDefinition::new("ai_scheduler_state");
+pub const AI_SCHEDULER_PLAN_HEAD_TABLE: TableDefinition<'static, (&str, &str), &[u8]> =
+    TableDefinition::new("ai_scheduler_plan_head");
+pub const AI_SCHEDULER_SELECTED_PLAN_TABLE: TableDefinition<'static, (&str, &str), &[u8]> =
+    TableDefinition::new("ai_scheduler_selected_plan");
+pub const AI_LIVE_CONTEXT_WINDOW_TABLE: TableDefinition<'static, (&str, &str), &[u8]> =
+    TableDefinition::new("ai_live_context_window");
+pub const AI_INDEX_INTENT_PLAN_TABLE: TableDefinition<'static, (&str, &str), &[u8]> =
+    TableDefinition::new("ai_index_intent_plan");
+pub const AI_INDEX_INTENT_TASK_TABLE: TableDefinition<'static, (&str, &str), &[u8]> =
+    TableDefinition::new("ai_index_intent_task");
+pub const AI_INDEX_PLAN_STEP_TASK_TABLE: TableDefinition<'static, (&str, &str), &[u8]> =
+    TableDefinition::new("ai_index_plan_step_task");
+pub const AI_INDEX_TASK_RUN_TABLE: TableDefinition<'static, (&str, &str), &[u8]> =
+    TableDefinition::new("ai_index_task_run");
+pub const AI_INDEX_RUN_EVENT_TABLE: TableDefinition<'static, (&str, &str), &[u8]> =
+    TableDefinition::new("ai_index_run_event");
+pub const AI_INDEX_RUN_PATCHSET_TABLE: TableDefinition<'static, (&str, &str), &[u8]> =
+    TableDefinition::new("ai_index_run_patchset");
+pub const AI_INDEX_INTENT_CONTEXT_FRAME_TABLE: TableDefinition<'static, (&str, &str, &str), &[u8]> =
+    TableDefinition::new("ai_index_intent_context_frame");
+pub const AI_VALIDATION_REPORT_TABLE: TableDefinition<'static, &str, &[u8]> =
+    TableDefinition::new("ai_validation_report");
+pub const AI_RISK_SCORE_BREAKDOWN_TABLE: TableDefinition<'static, &str, &[u8]> =
+    TableDefinition::new("ai_risk_score_breakdown");
+pub const AI_DECISION_PROPOSAL_TABLE: TableDefinition<'static, &str, &[u8]> =
+    TableDefinition::new("ai_decision_proposal");
+pub const AI_FINAL_DECISION_TABLE: TableDefinition<'static, &str, &[u8]> =
+    TableDefinition::new("ai_final_decision");
+pub const APPROVED_PERMISSION_TABLE: TableDefinition<'static, (&str, &str, &str), &[u8]> =
+    TableDefinition::new("approved_permission");
+pub const AUTOMATION_LOG_TABLE: TableDefinition<'static, &str, &[u8]> =
+    TableDefinition::new("automation_log");
+pub const SOURCE_CALL_LOG_TABLE: TableDefinition<'static, &str, &[u8]> =
+    TableDefinition::new("source_call_log");
+pub const MEMORY_EPISODE_TABLE: TableDefinition<'static, &str, &[u8]> =
+    TableDefinition::new("memory_episode");
+pub const MEMORY_EPISODE_EVIDENCE_TABLE: TableDefinition<'static, (&str, i64), &[u8]> =
+    TableDefinition::new("memory_episode_evidence");
+pub const MEMORY_PROJECTION_STATE_TABLE: TableDefinition<'static, (&str, &str), &[u8]> =
+    TableDefinition::new("memory_projection_state");
+pub const MEMORY_EPISODE_PATH_TABLE: TableDefinition<'static, (&str, &[u8]), &[u8]> =
+    TableDefinition::new("memory_episode_path");
+pub const MEMORY_EPISODE_SEARCH_DOC_TABLE: TableDefinition<'static, i64, &[u8]> =
+    TableDefinition::new("memory_episode_search_doc");
+/// Shared wire-for-wire with [`crate::storage::git_store::redb::BRIDGE_PUBLICATION_TABLE`].
+pub const AGENT_BRIDGE_PUBLICATION_TABLE: TableDefinition<'static, &str, &[u8]> =
+    TableDefinition::new("agent_bridge_publication");
+pub const AGENT_BRIDGE_INDEX_PUBLICATION_TABLE: TableDefinition<'static, &str, &[u8]> =
+    TableDefinition::new("agent_bridge_index_publication");
+
+/// Same-transaction secondary index for `memory_episode_path` ordered by
+/// `(code_path, invert_ended_at(ended_at), episode_id)` -> `(ended_at DESC, episode_id ASC)`.
+pub const MEMORY_BY_PATH_TABLE: TableDefinition<'static, (&[u8], u64, &str), &[u8]> =
+    TableDefinition::new(MEMORY_BY_PATH_INDEX_NAME);
+
+/// Wire-compatible value layout matching `RedbGitStore::BRIDGE_PUBLICATION_TABLE` (`RB-04`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct BridgePublicationStoredRow {
+    commit_oid: String,
+    phase: BridgePublicationPhase,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct BridgeIndexPublicationStoredRow {
+    index_digest: String,
+    phase: BridgePublicationPhase,
+}
 
 static GIT_STATE_TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -263,13 +368,153 @@ fn initialize_rb05_state_tables(wtx: &WriteTransaction) -> StorageResult<()> {
     Ok(())
 }
 
-fn verify_rb05_tables_read(rtx: &ReadTransaction) -> StorageResult<bool> {
+fn rb05b_new_table_names() -> Vec<&'static str> {
+    let mut names = Vec::with_capacity(RB05B_AI_MEMORY_BRIDGE_SOURCE_TABLES.len());
+    for name in RB05B_AI_MEMORY_BRIDGE_SOURCE_TABLES {
+        // `agent_bridge_publication` may already exist on pre-RB-05b `RB-04`/`RB-04b`
+        // stores, so classify it alongside the 28 new RB-05b source tables + `MEMORY_BY_PATH`.
+        if name != "agent_bridge_publication" {
+            names.push(name);
+        }
+    }
+    names.push(MEMORY_BY_PATH_INDEX_NAME);
+    names
+}
+
+fn classify_rb05b_table_layout(existing: &[String]) -> StorageResult<bool> {
+    let expected = rb05b_new_table_names();
+    let present = expected
+        .iter()
+        .filter(|name| existing.iter().any(|e| e == *name))
+        .count();
+    if present == expected.len() {
+        if !existing.iter().any(|e| e == "agent_bridge_publication") {
+            return Err(StorageBackendError::BackendInternal {
+                detail: "redb git state store has incomplete RB-05b schema; missing `agent_bridge_publication`"
+                    .to_string(),
+            });
+        }
+        Ok(true)
+    } else if present == 0 {
+        Ok(false)
+    } else {
+        let missing = expected
+            .iter()
+            .find(|name| !existing.iter().any(|e| e == *name))
+            .copied()
+            .unwrap_or("unknown");
+        Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "redb git state store has incomplete RB-05b schema; missing `{missing}`"
+            ),
+        })
+    }
+}
+
+fn initialize_rb05b_state_tables(wtx: &WriteTransaction) -> StorageResult<()> {
+    let _ = wtx
+        .open_table(AI_THREAD_TABLE)
+        .map_err(|err| map_redb_table_err(err, "init ai_thread"))?;
+    let _ = wtx
+        .open_table(AI_THREAD_PARTICIPANT_TABLE)
+        .map_err(|err| map_redb_table_err(err, "init ai_thread_participant"))?;
+    let _ = wtx
+        .open_table(AI_THREAD_INTENT_TABLE)
+        .map_err(|err| map_redb_table_err(err, "init ai_thread_intent"))?;
+    let _ = wtx
+        .open_table(AI_THREAD_PROVIDER_METADATA_TABLE)
+        .map_err(|err| map_redb_table_err(err, "init ai_thread_provider_metadata"))?;
+    let _ = wtx
+        .open_table(AI_SCHEDULER_STATE_TABLE)
+        .map_err(|err| map_redb_table_err(err, "init ai_scheduler_state"))?;
+    let _ = wtx
+        .open_table(AI_SCHEDULER_PLAN_HEAD_TABLE)
+        .map_err(|err| map_redb_table_err(err, "init ai_scheduler_plan_head"))?;
+    let _ = wtx
+        .open_table(AI_SCHEDULER_SELECTED_PLAN_TABLE)
+        .map_err(|err| map_redb_table_err(err, "init ai_scheduler_selected_plan"))?;
+    let _ = wtx
+        .open_table(AI_LIVE_CONTEXT_WINDOW_TABLE)
+        .map_err(|err| map_redb_table_err(err, "init ai_live_context_window"))?;
+    let _ = wtx
+        .open_table(AI_INDEX_INTENT_PLAN_TABLE)
+        .map_err(|err| map_redb_table_err(err, "init ai_index_intent_plan"))?;
+    let _ = wtx
+        .open_table(AI_INDEX_INTENT_TASK_TABLE)
+        .map_err(|err| map_redb_table_err(err, "init ai_index_intent_task"))?;
+    let _ = wtx
+        .open_table(AI_INDEX_PLAN_STEP_TASK_TABLE)
+        .map_err(|err| map_redb_table_err(err, "init ai_index_plan_step_task"))?;
+    let _ = wtx
+        .open_table(AI_INDEX_TASK_RUN_TABLE)
+        .map_err(|err| map_redb_table_err(err, "init ai_index_task_run"))?;
+    let _ = wtx
+        .open_table(AI_INDEX_RUN_EVENT_TABLE)
+        .map_err(|err| map_redb_table_err(err, "init ai_index_run_event"))?;
+    let _ = wtx
+        .open_table(AI_INDEX_RUN_PATCHSET_TABLE)
+        .map_err(|err| map_redb_table_err(err, "init ai_index_run_patchset"))?;
+    let _ = wtx
+        .open_table(AI_INDEX_INTENT_CONTEXT_FRAME_TABLE)
+        .map_err(|err| map_redb_table_err(err, "init ai_index_intent_context_frame"))?;
+    let _ = wtx
+        .open_table(AI_VALIDATION_REPORT_TABLE)
+        .map_err(|err| map_redb_table_err(err, "init ai_validation_report"))?;
+    let _ = wtx
+        .open_table(AI_RISK_SCORE_BREAKDOWN_TABLE)
+        .map_err(|err| map_redb_table_err(err, "init ai_risk_score_breakdown"))?;
+    let _ = wtx
+        .open_table(AI_DECISION_PROPOSAL_TABLE)
+        .map_err(|err| map_redb_table_err(err, "init ai_decision_proposal"))?;
+    let _ = wtx
+        .open_table(AI_FINAL_DECISION_TABLE)
+        .map_err(|err| map_redb_table_err(err, "init ai_final_decision"))?;
+    let _ = wtx
+        .open_table(APPROVED_PERMISSION_TABLE)
+        .map_err(|err| map_redb_table_err(err, "init approved_permission"))?;
+    let _ = wtx
+        .open_table(AUTOMATION_LOG_TABLE)
+        .map_err(|err| map_redb_table_err(err, "init automation_log"))?;
+    let _ = wtx
+        .open_table(SOURCE_CALL_LOG_TABLE)
+        .map_err(|err| map_redb_table_err(err, "init source_call_log"))?;
+    let _ = wtx
+        .open_table(MEMORY_EPISODE_TABLE)
+        .map_err(|err| map_redb_table_err(err, "init memory_episode"))?;
+    let _ = wtx
+        .open_table(MEMORY_EPISODE_EVIDENCE_TABLE)
+        .map_err(|err| map_redb_table_err(err, "init memory_episode_evidence"))?;
+    let _ = wtx
+        .open_table(MEMORY_PROJECTION_STATE_TABLE)
+        .map_err(|err| map_redb_table_err(err, "init memory_projection_state"))?;
+    let _ = wtx
+        .open_table(MEMORY_EPISODE_PATH_TABLE)
+        .map_err(|err| map_redb_table_err(err, "init memory_episode_path"))?;
+    let _ = wtx
+        .open_table(MEMORY_BY_PATH_TABLE)
+        .map_err(|err| map_redb_table_err(err, "init MEMORY_BY_PATH"))?;
+    let _ = wtx
+        .open_table(MEMORY_EPISODE_SEARCH_DOC_TABLE)
+        .map_err(|err| map_redb_table_err(err, "init memory_episode_search_doc"))?;
+    // Open idempotently without disturbing any pre-existing `RB-04` bridge rows.
+    let _ = wtx
+        .open_table(AGENT_BRIDGE_PUBLICATION_TABLE)
+        .map_err(|err| map_redb_table_err(err, "init agent_bridge_publication"))?;
+    let _ = wtx
+        .open_table(AGENT_BRIDGE_INDEX_PUBLICATION_TABLE)
+        .map_err(|err| map_redb_table_err(err, "init agent_bridge_index_publication"))?;
+    Ok(())
+}
+
+fn verify_rb05_tables_read(rtx: &ReadTransaction) -> StorageResult<(bool, bool)> {
     let existing: Vec<String> = rtx
         .list_tables()
         .map_err(|err| map_redb_storage_err(err, "list redb git state tables"))?
         .map(|h| h.name().to_string())
         .collect();
-    classify_rb05_table_layout(&existing)
+    let has_rb05 = classify_rb05_table_layout(&existing)?;
+    let has_rb05b = classify_rb05b_table_layout(&existing)?;
+    Ok((has_rb05, has_rb05b))
 }
 
 fn verify_rb05_tables_write(wtx: &WriteTransaction) -> StorageResult<()> {
@@ -278,9 +523,9 @@ fn verify_rb05_tables_write(wtx: &WriteTransaction) -> StorageResult<()> {
         .map_err(|err| map_redb_storage_err(err, "list redb git state tables for write"))?
         .map(|h| h.name().to_string())
         .collect();
-    if !classify_rb05_table_layout(&existing)? {
+    if !classify_rb05_table_layout(&existing)? || !classify_rb05b_table_layout(&existing)? {
         return Err(StorageBackendError::BackendInternal {
-            detail: "redb git state store requires RB-05 table initialization before write"
+            detail: "redb git state store requires RB-05/RB-05b table initialization before write"
                 .to_string(),
         });
     }
@@ -289,21 +534,28 @@ fn verify_rb05_tables_write(wtx: &WriteTransaction) -> StorageResult<()> {
 
 fn upgrade_rb05_tables_if_needed(db: &Database, timeout: Duration) -> StorageResult<()> {
     let rtx = begin_checked_read(db, DatabaseRole::Repository)?;
-    let has_rb05 = verify_rb05_tables_read(&rtx)?;
+    let (has_rb05, has_rb05b) = verify_rb05_tables_read(&rtx)?;
     drop(rtx);
-    if has_rb05 {
+    if has_rb05 && has_rb05b {
         return Ok(());
     }
     let wtx = begin_checked_write_blocking(db, DatabaseRole::Repository, timeout)?;
     let existing: Vec<String> = wtx
         .list_tables()
-        .map_err(|err| map_redb_storage_err(err, "list redb tables for RB-05 upgrade"))?
+        .map_err(|err| map_redb_storage_err(err, "list redb tables for RB-05/RB-05b upgrade"))?
         .map(|h| h.name().to_string())
         .collect();
-    if !classify_rb05_table_layout(&existing)? {
-        initialize_rb05_state_tables(&wtx)?;
+    let cur_rb05 = classify_rb05_table_layout(&existing)?;
+    let cur_rb05b = classify_rb05b_table_layout(&existing)?;
+    if !cur_rb05 || !cur_rb05b {
+        if !cur_rb05 {
+            initialize_rb05_state_tables(&wtx)?;
+        }
+        if !cur_rb05b {
+            initialize_rb05b_state_tables(&wtx)?;
+        }
         wtx.commit()
-            .map_err(|err| map_redb_commit_err(err, "commit RB-05 redb schema upgrade"))?;
+            .map_err(|err| map_redb_commit_err(err, "commit RB-05/RB-05b redb schema upgrade"))?;
     }
     Ok(())
 }
@@ -642,6 +894,7 @@ impl RedbGitStateStore {
             )?;
             init_meta_schema(&wtx, DatabaseRole::Repository)?;
             initialize_rb05_state_tables(&wtx)?;
+            initialize_rb05b_state_tables(&wtx)?;
             wtx.commit()
                 .map_err(|err| map_redb_commit_err(err, "commit initial redb git state schema"))?;
         }
@@ -705,6 +958,20 @@ impl RedbGitStateStore {
     #[must_use]
     pub fn is_read_only(&self) -> bool {
         matches!(self.handle, RedbGitStateHandle::ReadOnly(_))
+    }
+
+    /// Returns all currently materialized redb table names in this database.
+    pub async fn list_table_names(&self) -> StorageResult<Vec<String>> {
+        self.run_read(|rtx| {
+            let mut names: Vec<String> = rtx
+                .list_tables()
+                .map_err(|err| map_redb_storage_err(err, "list redb git state table names"))?
+                .map(|h| h.name().to_string())
+                .collect();
+            names.sort();
+            Ok(names)
+        })
+        .await
     }
 
     fn writable_db(&self) -> StorageResult<Arc<Database>> {
@@ -2746,4 +3013,2719 @@ impl GitStateStore for RedbGitStateStore {
         })
         .await
     }
+
+    // -------------------------------------------------------------------------
+    // RB-05b AC1: 19 `ai_*` Tables
+    // -------------------------------------------------------------------------
+
+    async fn upsert_ai_thread(&self, record: &AiThreadRecord) -> StorageResult<()> {
+        validate_ai_thread(record)?;
+        let rec = record.clone();
+        self.run_write_conditional(move |wtx| {
+            let mut table = wtx
+                .open_table(AI_THREAD_TABLE)
+                .map_err(|err| map_redb_table_err(err, "open ai_thread"))?;
+            let bytes = encode_versioned(GIT_STATE_CODEC_VERSION, &rec)?;
+            table
+                .insert(rec.thread_id.as_str(), bytes.as_slice())
+                .map_err(|err| map_redb_storage_err(err, "upsert ai_thread"))?;
+            Ok((true, ()))
+        })
+        .await
+    }
+
+    async fn get_ai_thread(&self, thread_id: &str) -> StorageResult<Option<AiThreadRecord>> {
+        validate_non_empty_identifier(thread_id, "ai_thread thread_id")?;
+        let tid = thread_id.to_string();
+        self.run_read(move |rtx| {
+            let Some(table) = open_opt_table(rtx, AI_THREAD_TABLE, "open ai_thread")? else {
+                return Ok(None);
+            };
+            let Some(g) = table
+                .get(tid.as_str())
+                .map_err(|err| map_redb_storage_err(err, "get ai_thread"))?
+            else {
+                return Ok(None);
+            };
+            decode_versioned(g.value(), GIT_STATE_CODEC_VERSION).map(Some)
+        })
+        .await
+    }
+
+    async fn list_ai_threads(
+        &self,
+        archived_filter: Option<bool>,
+    ) -> StorageResult<Vec<AiThreadRecord>> {
+        self.run_read(move |rtx| {
+            let Some(table) = open_opt_table(rtx, AI_THREAD_TABLE, "open ai_thread")? else {
+                return Ok(Vec::new());
+            };
+            let mut out = Vec::new();
+            for entry in table
+                .iter()
+                .map_err(|err| map_redb_storage_err(err, "iter ai_thread"))?
+            {
+                let (_, v) = entry.map_err(|err| map_redb_storage_err(err, "read ai_thread"))?;
+                let rec: AiThreadRecord = decode_versioned(v.value(), GIT_STATE_CODEC_VERSION)?;
+                if archived_filter.is_none_or(|f| rec.archived == f) {
+                    out.push(rec);
+                }
+            }
+            out.sort_by(|a, b| {
+                b.updated_at
+                    .cmp(&a.updated_at)
+                    .then_with(|| a.thread_id.cmp(&b.thread_id))
+            });
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn delete_ai_thread(&self, thread_id: &str) -> StorageResult<bool> {
+        validate_non_empty_identifier(thread_id, "ai_thread thread_id")?;
+        let tid = thread_id.to_string();
+        self.run_write_conditional(move |wtx| {
+            // Cascade delete all 11 child tables referencing `ai_thread(thread_id)`.
+            {
+                let mut t = wtx
+                    .open_table(AI_THREAD_PARTICIPANT_TABLE)
+                    .map_err(|err| map_redb_table_err(err, "open ai_thread_participant"))?;
+                let keys: Vec<(String, String)> = {
+                    let mut acc = Vec::new();
+                    let range = t
+                        .range((tid.as_str(), "", "")..)
+                        .map_err(|err| map_redb_storage_err(err, "scan ai_thread_participant"))?;
+                    for entry in range {
+                        let (k, _) = entry.map_err(|err| {
+                            map_redb_storage_err(err, "read ai_thread_participant")
+                        })?;
+                        let (t_id, ak, aid) = k.value();
+                        if t_id != tid {
+                            break;
+                        }
+                        acc.push((ak.to_string(), aid.to_string()));
+                    }
+                    acc
+                };
+                for (ak, aid) in keys {
+                    let _ = t
+                        .remove((tid.as_str(), ak.as_str(), aid.as_str()))
+                        .map_err(|err| map_redb_storage_err(err, "delete ai_thread_participant"))?;
+                }
+            }
+            delete_str_pair_prefix(wtx, AI_THREAD_INTENT_TABLE, &tid, "ai_thread_intent")?;
+            {
+                let mut t = wtx
+                    .open_table(AI_THREAD_PROVIDER_METADATA_TABLE)
+                    .map_err(|err| map_redb_table_err(err, "open ai_thread_provider_metadata"))?;
+                let _ = t.remove(tid.as_str()).map_err(|err| {
+                    map_redb_storage_err(err, "delete ai_thread_provider_metadata")
+                })?;
+            }
+            {
+                let mut t = wtx
+                    .open_table(AI_SCHEDULER_STATE_TABLE)
+                    .map_err(|err| map_redb_table_err(err, "open ai_scheduler_state"))?;
+                let _ = t
+                    .remove(tid.as_str())
+                    .map_err(|err| map_redb_storage_err(err, "delete ai_scheduler_state"))?;
+            }
+            delete_str_pair_prefix(
+                wtx,
+                AI_SCHEDULER_PLAN_HEAD_TABLE,
+                &tid,
+                "ai_scheduler_plan_head",
+            )?;
+            delete_str_pair_prefix(
+                wtx,
+                AI_SCHEDULER_SELECTED_PLAN_TABLE,
+                &tid,
+                "ai_scheduler_selected_plan",
+            )?;
+            delete_str_pair_prefix(
+                wtx,
+                AI_LIVE_CONTEXT_WINDOW_TABLE,
+                &tid,
+                "ai_live_context_window",
+            )?;
+            delete_by_thread_filter::<AiValidationReportRecord>(
+                wtx,
+                AI_VALIDATION_REPORT_TABLE,
+                &tid,
+                |r| r.thread_id.as_str(),
+                "ai_validation_report",
+            )?;
+            delete_by_thread_filter::<AiRiskScoreBreakdownRecord>(
+                wtx,
+                AI_RISK_SCORE_BREAKDOWN_TABLE,
+                &tid,
+                |r| r.thread_id.as_str(),
+                "ai_risk_score_breakdown",
+            )?;
+            delete_by_thread_filter::<AiDecisionProposalRecord>(
+                wtx,
+                AI_DECISION_PROPOSAL_TABLE,
+                &tid,
+                |r| r.thread_id.as_str(),
+                "ai_decision_proposal",
+            )?;
+            delete_by_thread_filter::<AiFinalDecisionRecord>(
+                wtx,
+                AI_FINAL_DECISION_TABLE,
+                &tid,
+                |r| r.thread_id.as_str(),
+                "ai_final_decision",
+            )?;
+            let mut thread_table = wtx
+                .open_table(AI_THREAD_TABLE)
+                .map_err(|err| map_redb_table_err(err, "open ai_thread"))?;
+            let removed = thread_table
+                .remove(tid.as_str())
+                .map_err(|err| map_redb_storage_err(err, "delete ai_thread"))?
+                .is_some();
+            Ok((removed, removed))
+        })
+        .await
+    }
+
+    async fn upsert_ai_thread_participant(
+        &self,
+        record: &AiThreadParticipantRecord,
+    ) -> StorageResult<()> {
+        validate_ai_thread_participant(record)?;
+        let rec = record.clone();
+        self.run_write_conditional(move |wtx| {
+            ensure_ai_thread_exists_in_wtx(wtx, &rec.thread_id)?;
+            let mut table = wtx
+                .open_table(AI_THREAD_PARTICIPANT_TABLE)
+                .map_err(|err| map_redb_table_err(err, "open ai_thread_participant"))?;
+            let bytes = encode_versioned(GIT_STATE_CODEC_VERSION, &rec)?;
+            table
+                .insert(
+                    (
+                        rec.thread_id.as_str(),
+                        rec.actor_kind.as_str(),
+                        rec.actor_id.as_str(),
+                    ),
+                    bytes.as_slice(),
+                )
+                .map_err(|err| map_redb_storage_err(err, "upsert ai_thread_participant"))?;
+            Ok((true, ()))
+        })
+        .await
+    }
+
+    async fn list_ai_thread_participants(
+        &self,
+        thread_id: &str,
+    ) -> StorageResult<Vec<AiThreadParticipantRecord>> {
+        validate_non_empty_identifier(thread_id, "ai_thread_participant thread_id")?;
+        let tid = thread_id.to_string();
+        self.run_read(move |rtx| {
+            let Some(table) = open_opt_table(
+                rtx,
+                AI_THREAD_PARTICIPANT_TABLE,
+                "open ai_thread_participant",
+            )?
+            else {
+                return Ok(Vec::new());
+            };
+            let mut out = Vec::new();
+            let range = table
+                .range((tid.as_str(), "", "")..)
+                .map_err(|err| map_redb_storage_err(err, "scan ai_thread_participant"))?;
+            for entry in range {
+                let (k, v) =
+                    entry.map_err(|err| map_redb_storage_err(err, "read ai_thread_participant"))?;
+                if k.value().0 != tid {
+                    break;
+                }
+                out.push(decode_versioned(v.value(), GIT_STATE_CODEC_VERSION)?);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn upsert_ai_thread_intent(&self, record: &AiThreadIntentRecord) -> StorageResult<()> {
+        validate_ai_thread_intent(record)?;
+        let rec = record.clone();
+        self.run_write_conditional(move |wtx| {
+            ensure_ai_thread_exists_in_wtx(wtx, &rec.thread_id)?;
+            let mut table = wtx
+                .open_table(AI_THREAD_INTENT_TABLE)
+                .map_err(|err| map_redb_table_err(err, "open ai_thread_intent"))?;
+            // Enforce SQLite's `uq_ai_thread_intent_intent (intent_id)` and
+            // `idx_ai_thread_intent_thread_ordinal (thread_id, ordinal)`.
+            {
+                let iter = table
+                    .iter()
+                    .map_err(|err| map_redb_storage_err(err, "scan ai_thread_intent"))?;
+                for entry in iter {
+                    let (_, v) =
+                        entry.map_err(|err| map_redb_storage_err(err, "read ai_thread_intent"))?;
+                    let other: AiThreadIntentRecord =
+                        decode_versioned(v.value(), GIT_STATE_CODEC_VERSION)?;
+                    if other.intent_id == rec.intent_id && other.thread_id != rec.thread_id {
+                        return Err(StorageBackendError::BackendInternal {
+                            detail: "ai_thread_intent intent_id already linked to another thread"
+                                .to_string(),
+                        });
+                    }
+                    if other.thread_id == rec.thread_id
+                        && other.ordinal == rec.ordinal
+                        && other.intent_id != rec.intent_id
+                    {
+                        return Err(StorageBackendError::BackendInternal {
+                            detail: "duplicate (thread_id, ordinal) in ai_thread_intent"
+                                .to_string(),
+                        });
+                    }
+                }
+            }
+            let bytes = encode_versioned(GIT_STATE_CODEC_VERSION, &rec)?;
+            table
+                .insert(
+                    (rec.thread_id.as_str(), rec.intent_id.as_str()),
+                    bytes.as_slice(),
+                )
+                .map_err(|err| map_redb_storage_err(err, "upsert ai_thread_intent"))?;
+            Ok((true, ()))
+        })
+        .await
+    }
+
+    async fn list_ai_thread_intents(
+        &self,
+        thread_id: &str,
+    ) -> StorageResult<Vec<AiThreadIntentRecord>> {
+        validate_non_empty_identifier(thread_id, "ai_thread_intent thread_id")?;
+        let tid = thread_id.to_string();
+        self.run_read(move |rtx| {
+            let Some(table) = open_opt_table(rtx, AI_THREAD_INTENT_TABLE, "open ai_thread_intent")?
+            else {
+                return Ok(Vec::new());
+            };
+            let mut out = Vec::new();
+            let range = table
+                .range((tid.as_str(), "")..)
+                .map_err(|err| map_redb_storage_err(err, "scan ai_thread_intent"))?;
+            for entry in range {
+                let (k, v) =
+                    entry.map_err(|err| map_redb_storage_err(err, "read ai_thread_intent"))?;
+                if k.value().0 != tid {
+                    break;
+                }
+                let rec: AiThreadIntentRecord =
+                    decode_versioned(v.value(), GIT_STATE_CODEC_VERSION)?;
+                out.push(rec);
+            }
+            out.sort_by(|a, b| {
+                a.ordinal
+                    .cmp(&b.ordinal)
+                    .then_with(|| a.intent_id.cmp(&b.intent_id))
+            });
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn upsert_ai_thread_provider_metadata(
+        &self,
+        record: &AiThreadProviderMetadataRecord,
+    ) -> StorageResult<()> {
+        validate_ai_thread_provider_metadata(record)?;
+        let rec = record.clone();
+        self.run_write_conditional(move |wtx| {
+            ensure_ai_thread_exists_in_wtx(wtx, &rec.thread_id)?;
+            let mut table = wtx
+                .open_table(AI_THREAD_PROVIDER_METADATA_TABLE)
+                .map_err(|err| map_redb_table_err(err, "open ai_thread_provider_metadata"))?;
+            let bytes = encode_versioned(GIT_STATE_CODEC_VERSION, &rec)?;
+            table
+                .insert(rec.thread_id.as_str(), bytes.as_slice())
+                .map_err(|err| map_redb_storage_err(err, "upsert ai_thread_provider_metadata"))?;
+            Ok((true, ()))
+        })
+        .await
+    }
+
+    async fn get_ai_thread_provider_metadata(
+        &self,
+        thread_id: &str,
+    ) -> StorageResult<Option<AiThreadProviderMetadataRecord>> {
+        validate_non_empty_identifier(thread_id, "ai_thread_provider_metadata thread_id")?;
+        let tid = thread_id.to_string();
+        self.run_read(move |rtx| {
+            let Some(table) = open_opt_table(
+                rtx,
+                AI_THREAD_PROVIDER_METADATA_TABLE,
+                "open ai_thread_provider_metadata",
+            )?
+            else {
+                return Ok(None);
+            };
+            let Some(g) = table
+                .get(tid.as_str())
+                .map_err(|err| map_redb_storage_err(err, "get ai_thread_provider_metadata"))?
+            else {
+                return Ok(None);
+            };
+            decode_versioned(g.value(), GIT_STATE_CODEC_VERSION).map(Some)
+        })
+        .await
+    }
+
+    async fn upsert_ai_scheduler_state(
+        &self,
+        record: &AiSchedulerStateRecord,
+    ) -> StorageResult<()> {
+        validate_ai_scheduler_state(record)?;
+        let rec = record.clone();
+        self.run_write_conditional(move |wtx| {
+            ensure_ai_thread_exists_in_wtx(wtx, &rec.thread_id)?;
+            let mut table = wtx
+                .open_table(AI_SCHEDULER_STATE_TABLE)
+                .map_err(|err| map_redb_table_err(err, "open ai_scheduler_state"))?;
+            let bytes = encode_versioned(GIT_STATE_CODEC_VERSION, &rec)?;
+            table
+                .insert(rec.thread_id.as_str(), bytes.as_slice())
+                .map_err(|err| map_redb_storage_err(err, "upsert ai_scheduler_state"))?;
+            Ok((true, ()))
+        })
+        .await
+    }
+
+    async fn get_ai_scheduler_state(
+        &self,
+        thread_id: &str,
+    ) -> StorageResult<Option<AiSchedulerStateRecord>> {
+        validate_non_empty_identifier(thread_id, "ai_scheduler_state thread_id")?;
+        let tid = thread_id.to_string();
+        self.run_read(move |rtx| {
+            let Some(table) =
+                open_opt_table(rtx, AI_SCHEDULER_STATE_TABLE, "open ai_scheduler_state")?
+            else {
+                return Ok(None);
+            };
+            let Some(g) = table
+                .get(tid.as_str())
+                .map_err(|err| map_redb_storage_err(err, "get ai_scheduler_state"))?
+            else {
+                return Ok(None);
+            };
+            decode_versioned(g.value(), GIT_STATE_CODEC_VERSION).map(Some)
+        })
+        .await
+    }
+
+    async fn replace_ai_scheduler_plan_heads(
+        &self,
+        thread_id: &str,
+        heads: &[AiSchedulerPlanHeadRecord],
+    ) -> StorageResult<()> {
+        validate_non_empty_identifier(thread_id, "ai_scheduler_plan_head thread_id")?;
+        let mut seen_plans = BTreeSet::new();
+        let mut seen_ords = BTreeSet::new();
+        for h in heads {
+            validate_ai_scheduler_plan_head(h)?;
+            if h.thread_id != thread_id {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: "ai_scheduler_plan_head thread_id mismatch".to_string(),
+                });
+            }
+            if !seen_plans.insert(h.plan_id.as_str()) || !seen_ords.insert(h.ordinal) {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: "duplicate plan_id or ordinal in ai_scheduler_plan_head".to_string(),
+                });
+            }
+        }
+        let tid = thread_id.to_string();
+        let owned = heads.to_vec();
+        self.run_write_conditional(move |wtx| {
+            ensure_ai_thread_exists_in_wtx(wtx, &tid)?;
+            delete_str_pair_prefix(
+                wtx,
+                AI_SCHEDULER_PLAN_HEAD_TABLE,
+                &tid,
+                "ai_scheduler_plan_head",
+            )?;
+            let mut table = wtx
+                .open_table(AI_SCHEDULER_PLAN_HEAD_TABLE)
+                .map_err(|err| map_redb_table_err(err, "open ai_scheduler_plan_head"))?;
+            for h in &owned {
+                let bytes = encode_versioned(GIT_STATE_CODEC_VERSION, h)?;
+                table
+                    .insert((h.thread_id.as_str(), h.plan_id.as_str()), bytes.as_slice())
+                    .map_err(|err| map_redb_storage_err(err, "insert ai_scheduler_plan_head"))?;
+            }
+            Ok((true, ()))
+        })
+        .await
+    }
+
+    async fn list_ai_scheduler_plan_heads(
+        &self,
+        thread_id: &str,
+    ) -> StorageResult<Vec<AiSchedulerPlanHeadRecord>> {
+        validate_non_empty_identifier(thread_id, "ai_scheduler_plan_head thread_id")?;
+        let tid = thread_id.to_string();
+        self.run_read(move |rtx| {
+            let Some(table) = open_opt_table(
+                rtx,
+                AI_SCHEDULER_PLAN_HEAD_TABLE,
+                "open ai_scheduler_plan_head",
+            )?
+            else {
+                return Ok(Vec::new());
+            };
+            let mut out = Vec::new();
+            let range = table
+                .range((tid.as_str(), "")..)
+                .map_err(|err| map_redb_storage_err(err, "scan ai_scheduler_plan_head"))?;
+            for entry in range {
+                let (k, v) = entry
+                    .map_err(|err| map_redb_storage_err(err, "read ai_scheduler_plan_head"))?;
+                if k.value().0 != tid {
+                    break;
+                }
+                let rec: AiSchedulerPlanHeadRecord =
+                    decode_versioned(v.value(), GIT_STATE_CODEC_VERSION)?;
+                out.push(rec);
+            }
+            out.sort_by(|a, b| {
+                a.ordinal
+                    .cmp(&b.ordinal)
+                    .then_with(|| a.plan_id.cmp(&b.plan_id))
+            });
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn replace_ai_scheduler_selected_plans(
+        &self,
+        thread_id: &str,
+        plans: &[AiSchedulerSelectedPlanRecord],
+    ) -> StorageResult<()> {
+        validate_non_empty_identifier(thread_id, "ai_scheduler_selected_plan thread_id")?;
+        let mut seen_plans = BTreeSet::new();
+        let mut seen_ords = BTreeSet::new();
+        for p in plans {
+            validate_ai_scheduler_selected_plan(p)?;
+            if p.thread_id != thread_id {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: "ai_scheduler_selected_plan thread_id mismatch".to_string(),
+                });
+            }
+            if !seen_plans.insert(p.plan_id.as_str()) || !seen_ords.insert(p.ordinal) {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: "duplicate plan_id or ordinal in ai_scheduler_selected_plan"
+                        .to_string(),
+                });
+            }
+        }
+        let tid = thread_id.to_string();
+        let owned = plans.to_vec();
+        self.run_write_conditional(move |wtx| {
+            ensure_ai_thread_exists_in_wtx(wtx, &tid)?;
+            delete_str_pair_prefix(
+                wtx,
+                AI_SCHEDULER_SELECTED_PLAN_TABLE,
+                &tid,
+                "ai_scheduler_selected_plan",
+            )?;
+            let mut table = wtx
+                .open_table(AI_SCHEDULER_SELECTED_PLAN_TABLE)
+                .map_err(|err| map_redb_table_err(err, "open ai_scheduler_selected_plan"))?;
+            for p in &owned {
+                let bytes = encode_versioned(GIT_STATE_CODEC_VERSION, p)?;
+                table
+                    .insert((p.thread_id.as_str(), p.plan_id.as_str()), bytes.as_slice())
+                    .map_err(|err| {
+                        map_redb_storage_err(err, "insert ai_scheduler_selected_plan")
+                    })?;
+            }
+            Ok((true, ()))
+        })
+        .await
+    }
+
+    async fn list_ai_scheduler_selected_plans(
+        &self,
+        thread_id: &str,
+    ) -> StorageResult<Vec<AiSchedulerSelectedPlanRecord>> {
+        validate_non_empty_identifier(thread_id, "ai_scheduler_selected_plan thread_id")?;
+        let tid = thread_id.to_string();
+        self.run_read(move |rtx| {
+            let Some(table) = open_opt_table(
+                rtx,
+                AI_SCHEDULER_SELECTED_PLAN_TABLE,
+                "open ai_scheduler_selected_plan",
+            )?
+            else {
+                return Ok(Vec::new());
+            };
+            let mut out = Vec::new();
+            let range = table
+                .range((tid.as_str(), "")..)
+                .map_err(|err| map_redb_storage_err(err, "scan ai_scheduler_selected_plan"))?;
+            for entry in range {
+                let (k, v) = entry
+                    .map_err(|err| map_redb_storage_err(err, "read ai_scheduler_selected_plan"))?;
+                if k.value().0 != tid {
+                    break;
+                }
+                let rec: AiSchedulerSelectedPlanRecord =
+                    decode_versioned(v.value(), GIT_STATE_CODEC_VERSION)?;
+                out.push(rec);
+            }
+            out.sort_by(|a, b| {
+                a.ordinal
+                    .cmp(&b.ordinal)
+                    .then_with(|| a.plan_id.cmp(&b.plan_id))
+            });
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn replace_ai_live_context_window(
+        &self,
+        thread_id: &str,
+        entries: &[AiLiveContextWindowRecord],
+    ) -> StorageResult<()> {
+        validate_non_empty_identifier(thread_id, "ai_live_context_window thread_id")?;
+        let mut seen_frames = BTreeSet::new();
+        let mut seen_pos = BTreeSet::new();
+        for e in entries {
+            validate_ai_live_context_window(e)?;
+            if e.thread_id != thread_id {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: "ai_live_context_window thread_id mismatch".to_string(),
+                });
+            }
+            if !seen_frames.insert(e.context_frame_id.as_str()) || !seen_pos.insert(e.position) {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: "duplicate context_frame_id or position in ai_live_context_window"
+                        .to_string(),
+                });
+            }
+        }
+        let tid = thread_id.to_string();
+        let owned = entries.to_vec();
+        self.run_write_conditional(move |wtx| {
+            ensure_ai_thread_exists_in_wtx(wtx, &tid)?;
+            delete_str_pair_prefix(
+                wtx,
+                AI_LIVE_CONTEXT_WINDOW_TABLE,
+                &tid,
+                "ai_live_context_window",
+            )?;
+            let mut table = wtx
+                .open_table(AI_LIVE_CONTEXT_WINDOW_TABLE)
+                .map_err(|err| map_redb_table_err(err, "open ai_live_context_window"))?;
+            for e in &owned {
+                let bytes = encode_versioned(GIT_STATE_CODEC_VERSION, e)?;
+                table
+                    .insert(
+                        (e.thread_id.as_str(), e.context_frame_id.as_str()),
+                        bytes.as_slice(),
+                    )
+                    .map_err(|err| map_redb_storage_err(err, "insert ai_live_context_window"))?;
+            }
+            Ok((true, ()))
+        })
+        .await
+    }
+
+    async fn list_ai_live_context_window(
+        &self,
+        thread_id: &str,
+    ) -> StorageResult<Vec<AiLiveContextWindowRecord>> {
+        validate_non_empty_identifier(thread_id, "ai_live_context_window thread_id")?;
+        let tid = thread_id.to_string();
+        self.run_read(move |rtx| {
+            let Some(table) = open_opt_table(
+                rtx,
+                AI_LIVE_CONTEXT_WINDOW_TABLE,
+                "open ai_live_context_window",
+            )?
+            else {
+                return Ok(Vec::new());
+            };
+            let mut out = Vec::new();
+            let range = table
+                .range((tid.as_str(), "")..)
+                .map_err(|err| map_redb_storage_err(err, "scan ai_live_context_window"))?;
+            for entry in range {
+                let (k, v) = entry
+                    .map_err(|err| map_redb_storage_err(err, "read ai_live_context_window"))?;
+                if k.value().0 != tid {
+                    break;
+                }
+                let rec: AiLiveContextWindowRecord =
+                    decode_versioned(v.value(), GIT_STATE_CODEC_VERSION)?;
+                out.push(rec);
+            }
+            out.sort_by(|a, b| {
+                a.position
+                    .cmp(&b.position)
+                    .then_with(|| a.context_frame_id.cmp(&b.context_frame_id))
+            });
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn upsert_ai_index_intent_plan(
+        &self,
+        record: &AiIndexIntentPlanRecord,
+    ) -> StorageResult<()> {
+        validate_ai_index_intent_plan(record)?;
+        let rec = record.clone();
+        self.run_write_conditional(move |wtx| {
+            let mut table = wtx
+                .open_table(AI_INDEX_INTENT_PLAN_TABLE)
+                .map_err(|err| map_redb_table_err(err, "open ai_index_intent_plan"))?;
+            let bytes = encode_versioned(GIT_STATE_CODEC_VERSION, &rec)?;
+            table
+                .insert(
+                    (rec.intent_id.as_str(), rec.plan_id.as_str()),
+                    bytes.as_slice(),
+                )
+                .map_err(|err| map_redb_storage_err(err, "upsert ai_index_intent_plan"))?;
+            Ok((true, ()))
+        })
+        .await
+    }
+
+    async fn list_ai_index_intent_plans(
+        &self,
+        intent_id: &str,
+    ) -> StorageResult<Vec<AiIndexIntentPlanRecord>> {
+        validate_non_empty_identifier(intent_id, "ai_index_intent_plan intent_id")?;
+        let iid = intent_id.to_string();
+        self.run_read(move |rtx| {
+            let Some(table) =
+                open_opt_table(rtx, AI_INDEX_INTENT_PLAN_TABLE, "open ai_index_intent_plan")?
+            else {
+                return Ok(Vec::new());
+            };
+            let mut out = Vec::new();
+            let range = table
+                .range((iid.as_str(), "")..)
+                .map_err(|err| map_redb_storage_err(err, "scan ai_index_intent_plan"))?;
+            for entry in range {
+                let (k, v) =
+                    entry.map_err(|err| map_redb_storage_err(err, "read ai_index_intent_plan"))?;
+                if k.value().0 != iid {
+                    break;
+                }
+                let rec: AiIndexIntentPlanRecord =
+                    decode_versioned(v.value(), GIT_STATE_CODEC_VERSION)?;
+                out.push(rec);
+            }
+            out.sort_by(|a, b| {
+                a.created_at
+                    .cmp(&b.created_at)
+                    .then_with(|| a.plan_id.cmp(&b.plan_id))
+            });
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn upsert_ai_index_intent_task(
+        &self,
+        record: &AiIndexIntentTaskRecord,
+    ) -> StorageResult<()> {
+        validate_ai_index_intent_task(record)?;
+        let rec = record.clone();
+        self.run_write_conditional(move |wtx| {
+            let mut table = wtx
+                .open_table(AI_INDEX_INTENT_TASK_TABLE)
+                .map_err(|err| map_redb_table_err(err, "open ai_index_intent_task"))?;
+            let bytes = encode_versioned(GIT_STATE_CODEC_VERSION, &rec)?;
+            table
+                .insert(
+                    (rec.intent_id.as_str(), rec.task_id.as_str()),
+                    bytes.as_slice(),
+                )
+                .map_err(|err| map_redb_storage_err(err, "upsert ai_index_intent_task"))?;
+            Ok((true, ()))
+        })
+        .await
+    }
+
+    async fn list_ai_index_intent_tasks(
+        &self,
+        intent_id: &str,
+    ) -> StorageResult<Vec<AiIndexIntentTaskRecord>> {
+        validate_non_empty_identifier(intent_id, "ai_index_intent_task intent_id")?;
+        let iid = intent_id.to_string();
+        self.run_read(move |rtx| {
+            let Some(table) =
+                open_opt_table(rtx, AI_INDEX_INTENT_TASK_TABLE, "open ai_index_intent_task")?
+            else {
+                return Ok(Vec::new());
+            };
+            let mut out = Vec::new();
+            let range = table
+                .range((iid.as_str(), "")..)
+                .map_err(|err| map_redb_storage_err(err, "scan ai_index_intent_task"))?;
+            for entry in range {
+                let (k, v) =
+                    entry.map_err(|err| map_redb_storage_err(err, "read ai_index_intent_task"))?;
+                if k.value().0 != iid {
+                    break;
+                }
+                let rec: AiIndexIntentTaskRecord =
+                    decode_versioned(v.value(), GIT_STATE_CODEC_VERSION)?;
+                out.push(rec);
+            }
+            out.sort_by(|a, b| {
+                a.created_at
+                    .cmp(&b.created_at)
+                    .then_with(|| a.task_id.cmp(&b.task_id))
+            });
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn upsert_ai_index_plan_step_task(
+        &self,
+        record: &AiIndexPlanStepTaskRecord,
+    ) -> StorageResult<()> {
+        validate_ai_index_plan_step_task(record)?;
+        let rec = record.clone();
+        self.run_write_conditional(move |wtx| {
+            let mut table = wtx
+                .open_table(AI_INDEX_PLAN_STEP_TASK_TABLE)
+                .map_err(|err| map_redb_table_err(err, "open ai_index_plan_step_task"))?;
+            let bytes = encode_versioned(GIT_STATE_CODEC_VERSION, &rec)?;
+            table
+                .insert(
+                    (rec.plan_id.as_str(), rec.task_id.as_str()),
+                    bytes.as_slice(),
+                )
+                .map_err(|err| map_redb_storage_err(err, "upsert ai_index_plan_step_task"))?;
+            Ok((true, ()))
+        })
+        .await
+    }
+
+    async fn list_ai_index_plan_step_tasks(
+        &self,
+        plan_id: &str,
+    ) -> StorageResult<Vec<AiIndexPlanStepTaskRecord>> {
+        validate_non_empty_identifier(plan_id, "ai_index_plan_step_task plan_id")?;
+        let pid = plan_id.to_string();
+        self.run_read(move |rtx| {
+            let Some(table) = open_opt_table(
+                rtx,
+                AI_INDEX_PLAN_STEP_TASK_TABLE,
+                "open ai_index_plan_step_task",
+            )?
+            else {
+                return Ok(Vec::new());
+            };
+            let mut out = Vec::new();
+            let range = table
+                .range((pid.as_str(), "")..)
+                .map_err(|err| map_redb_storage_err(err, "scan ai_index_plan_step_task"))?;
+            for entry in range {
+                let (k, v) = entry
+                    .map_err(|err| map_redb_storage_err(err, "read ai_index_plan_step_task"))?;
+                if k.value().0 != pid {
+                    break;
+                }
+                let rec: AiIndexPlanStepTaskRecord =
+                    decode_versioned(v.value(), GIT_STATE_CODEC_VERSION)?;
+                out.push(rec);
+            }
+            out.sort_by(|a, b| {
+                a.step_id
+                    .cmp(&b.step_id)
+                    .then_with(|| a.created_at.cmp(&b.created_at))
+                    .then_with(|| a.task_id.cmp(&b.task_id))
+            });
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn upsert_ai_index_task_run(&self, record: &AiIndexTaskRunRecord) -> StorageResult<()> {
+        validate_ai_index_task_run(record)?;
+        let rec = record.clone();
+        self.run_write_conditional(move |wtx| {
+            let mut table = wtx
+                .open_table(AI_INDEX_TASK_RUN_TABLE)
+                .map_err(|err| map_redb_table_err(err, "open ai_index_task_run"))?;
+            if rec.is_latest {
+                let mut to_clear: Vec<AiIndexTaskRunRecord> = Vec::new();
+                {
+                    let range = table
+                        .range((rec.task_id.as_str(), "")..)
+                        .map_err(|err| map_redb_storage_err(err, "scan ai_index_task_run"))?;
+                    for entry in range {
+                        let (k, v) = entry
+                            .map_err(|err| map_redb_storage_err(err, "read ai_index_task_run"))?;
+                        if k.value().0 != rec.task_id {
+                            break;
+                        }
+                        let mut existing: AiIndexTaskRunRecord =
+                            decode_versioned(v.value(), GIT_STATE_CODEC_VERSION)?;
+                        if existing.is_latest && existing.run_id != rec.run_id {
+                            existing.is_latest = false;
+                            to_clear.push(existing);
+                        }
+                    }
+                }
+                for row in to_clear {
+                    let b = encode_versioned(GIT_STATE_CODEC_VERSION, &row)?;
+                    table
+                        .insert((row.task_id.as_str(), row.run_id.as_str()), b.as_slice())
+                        .map_err(|err| {
+                            map_redb_storage_err(err, "clear previous latest ai_index_task_run")
+                        })?;
+                }
+            }
+            let bytes = encode_versioned(GIT_STATE_CODEC_VERSION, &rec)?;
+            table
+                .insert(
+                    (rec.task_id.as_str(), rec.run_id.as_str()),
+                    bytes.as_slice(),
+                )
+                .map_err(|err| map_redb_storage_err(err, "upsert ai_index_task_run"))?;
+            Ok((true, ()))
+        })
+        .await
+    }
+
+    async fn list_ai_index_task_runs(
+        &self,
+        task_id: &str,
+    ) -> StorageResult<Vec<AiIndexTaskRunRecord>> {
+        validate_non_empty_identifier(task_id, "ai_index_task_run task_id")?;
+        let tid = task_id.to_string();
+        self.run_read(move |rtx| {
+            let Some(table) =
+                open_opt_table(rtx, AI_INDEX_TASK_RUN_TABLE, "open ai_index_task_run")?
+            else {
+                return Ok(Vec::new());
+            };
+            let mut out = Vec::new();
+            let range = table
+                .range((tid.as_str(), "")..)
+                .map_err(|err| map_redb_storage_err(err, "scan ai_index_task_run"))?;
+            for entry in range {
+                let (k, v) =
+                    entry.map_err(|err| map_redb_storage_err(err, "read ai_index_task_run"))?;
+                if k.value().0 != tid {
+                    break;
+                }
+                let rec: AiIndexTaskRunRecord =
+                    decode_versioned(v.value(), GIT_STATE_CODEC_VERSION)?;
+                out.push(rec);
+            }
+            out.sort_by(|a, b| {
+                a.created_at
+                    .cmp(&b.created_at)
+                    .then_with(|| a.run_id.cmp(&b.run_id))
+            });
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn upsert_ai_index_run_event(&self, record: &AiIndexRunEventRecord) -> StorageResult<()> {
+        validate_ai_index_run_event(record)?;
+        let rec = record.clone();
+        self.run_write_conditional(move |wtx| {
+            let mut table = wtx
+                .open_table(AI_INDEX_RUN_EVENT_TABLE)
+                .map_err(|err| map_redb_table_err(err, "open ai_index_run_event"))?;
+            if rec.is_latest {
+                let mut to_clear: Vec<AiIndexRunEventRecord> = Vec::new();
+                {
+                    let range = table
+                        .range((rec.run_id.as_str(), "")..)
+                        .map_err(|err| map_redb_storage_err(err, "scan ai_index_run_event"))?;
+                    for entry in range {
+                        let (k, v) = entry
+                            .map_err(|err| map_redb_storage_err(err, "read ai_index_run_event"))?;
+                        if k.value().0 != rec.run_id {
+                            break;
+                        }
+                        let mut existing: AiIndexRunEventRecord =
+                            decode_versioned(v.value(), GIT_STATE_CODEC_VERSION)?;
+                        if existing.is_latest && existing.event_id != rec.event_id {
+                            existing.is_latest = false;
+                            to_clear.push(existing);
+                        }
+                    }
+                }
+                for row in to_clear {
+                    let b = encode_versioned(GIT_STATE_CODEC_VERSION, &row)?;
+                    table
+                        .insert((row.run_id.as_str(), row.event_id.as_str()), b.as_slice())
+                        .map_err(|err| {
+                            map_redb_storage_err(err, "clear previous latest ai_index_run_event")
+                        })?;
+                }
+            }
+            let bytes = encode_versioned(GIT_STATE_CODEC_VERSION, &rec)?;
+            table
+                .insert(
+                    (rec.run_id.as_str(), rec.event_id.as_str()),
+                    bytes.as_slice(),
+                )
+                .map_err(|err| map_redb_storage_err(err, "upsert ai_index_run_event"))?;
+            Ok((true, ()))
+        })
+        .await
+    }
+
+    async fn list_ai_index_run_events(
+        &self,
+        run_id: &str,
+    ) -> StorageResult<Vec<AiIndexRunEventRecord>> {
+        validate_non_empty_identifier(run_id, "ai_index_run_event run_id")?;
+        let rid = run_id.to_string();
+        self.run_read(move |rtx| {
+            let Some(table) =
+                open_opt_table(rtx, AI_INDEX_RUN_EVENT_TABLE, "open ai_index_run_event")?
+            else {
+                return Ok(Vec::new());
+            };
+            let mut out = Vec::new();
+            let range = table
+                .range((rid.as_str(), "")..)
+                .map_err(|err| map_redb_storage_err(err, "scan ai_index_run_event"))?;
+            for entry in range {
+                let (k, v) =
+                    entry.map_err(|err| map_redb_storage_err(err, "read ai_index_run_event"))?;
+                if k.value().0 != rid {
+                    break;
+                }
+                let rec: AiIndexRunEventRecord =
+                    decode_versioned(v.value(), GIT_STATE_CODEC_VERSION)?;
+                out.push(rec);
+            }
+            out.sort_by(|a, b| {
+                a.created_at
+                    .cmp(&b.created_at)
+                    .then_with(|| a.event_id.cmp(&b.event_id))
+            });
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn upsert_ai_index_run_patchset(
+        &self,
+        record: &AiIndexRunPatchsetRecord,
+    ) -> StorageResult<()> {
+        validate_ai_index_run_patchset(record)?;
+        let rec = record.clone();
+        self.run_write_conditional(move |wtx| {
+            let mut table = wtx
+                .open_table(AI_INDEX_RUN_PATCHSET_TABLE)
+                .map_err(|err| map_redb_table_err(err, "open ai_index_run_patchset"))?;
+            if rec.is_latest {
+                let mut to_clear: Vec<AiIndexRunPatchsetRecord> = Vec::new();
+                {
+                    let range = table
+                        .range((rec.run_id.as_str(), "")..)
+                        .map_err(|err| map_redb_storage_err(err, "scan ai_index_run_patchset"))?;
+                    for entry in range {
+                        let (k, v) = entry.map_err(|err| {
+                            map_redb_storage_err(err, "read ai_index_run_patchset")
+                        })?;
+                        if k.value().0 != rec.run_id {
+                            break;
+                        }
+                        let mut existing: AiIndexRunPatchsetRecord =
+                            decode_versioned(v.value(), GIT_STATE_CODEC_VERSION)?;
+                        if existing.is_latest && existing.patchset_id != rec.patchset_id {
+                            existing.is_latest = false;
+                            to_clear.push(existing);
+                        }
+                    }
+                }
+                for row in to_clear {
+                    let b = encode_versioned(GIT_STATE_CODEC_VERSION, &row)?;
+                    table
+                        .insert(
+                            (row.run_id.as_str(), row.patchset_id.as_str()),
+                            b.as_slice(),
+                        )
+                        .map_err(|err| {
+                            map_redb_storage_err(err, "clear previous latest ai_index_run_patchset")
+                        })?;
+                }
+            }
+            let bytes = encode_versioned(GIT_STATE_CODEC_VERSION, &rec)?;
+            table
+                .insert(
+                    (rec.run_id.as_str(), rec.patchset_id.as_str()),
+                    bytes.as_slice(),
+                )
+                .map_err(|err| map_redb_storage_err(err, "upsert ai_index_run_patchset"))?;
+            Ok((true, ()))
+        })
+        .await
+    }
+
+    async fn list_ai_index_run_patchsets(
+        &self,
+        run_id: &str,
+    ) -> StorageResult<Vec<AiIndexRunPatchsetRecord>> {
+        validate_non_empty_identifier(run_id, "ai_index_run_patchset run_id")?;
+        let rid = run_id.to_string();
+        self.run_read(move |rtx| {
+            let Some(table) = open_opt_table(
+                rtx,
+                AI_INDEX_RUN_PATCHSET_TABLE,
+                "open ai_index_run_patchset",
+            )?
+            else {
+                return Ok(Vec::new());
+            };
+            let mut out = Vec::new();
+            let range = table
+                .range((rid.as_str(), "")..)
+                .map_err(|err| map_redb_storage_err(err, "scan ai_index_run_patchset"))?;
+            for entry in range {
+                let (k, v) =
+                    entry.map_err(|err| map_redb_storage_err(err, "read ai_index_run_patchset"))?;
+                if k.value().0 != rid {
+                    break;
+                }
+                let rec: AiIndexRunPatchsetRecord =
+                    decode_versioned(v.value(), GIT_STATE_CODEC_VERSION)?;
+                out.push(rec);
+            }
+            out.sort_by(|a, b| {
+                a.sequence
+                    .cmp(&b.sequence)
+                    .then_with(|| a.patchset_id.cmp(&b.patchset_id))
+            });
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn upsert_ai_index_intent_context_frame(
+        &self,
+        record: &AiIndexIntentContextFrameRecord,
+    ) -> StorageResult<()> {
+        validate_ai_index_intent_context_frame(record)?;
+        let rec = record.clone();
+        self.run_write_conditional(move |wtx| {
+            let mut table = wtx
+                .open_table(AI_INDEX_INTENT_CONTEXT_FRAME_TABLE)
+                .map_err(|err| map_redb_table_err(err, "open ai_index_intent_context_frame"))?;
+            let bytes = encode_versioned(GIT_STATE_CODEC_VERSION, &rec)?;
+            table
+                .insert(
+                    (
+                        rec.intent_id.as_str(),
+                        rec.context_frame_id.as_str(),
+                        rec.relation_kind.as_str(),
+                    ),
+                    bytes.as_slice(),
+                )
+                .map_err(|err| map_redb_storage_err(err, "upsert ai_index_intent_context_frame"))?;
+            Ok((true, ()))
+        })
+        .await
+    }
+
+    async fn list_ai_index_intent_context_frames(
+        &self,
+        intent_id: &str,
+    ) -> StorageResult<Vec<AiIndexIntentContextFrameRecord>> {
+        validate_non_empty_identifier(intent_id, "ai_index_intent_context_frame intent_id")?;
+        let iid = intent_id.to_string();
+        self.run_read(move |rtx| {
+            let Some(table) = open_opt_table(
+                rtx,
+                AI_INDEX_INTENT_CONTEXT_FRAME_TABLE,
+                "open ai_index_intent_context_frame",
+            )?
+            else {
+                return Ok(Vec::new());
+            };
+            let mut out = Vec::new();
+            let range = table
+                .range((iid.as_str(), "", "")..)
+                .map_err(|err| map_redb_storage_err(err, "scan ai_index_intent_context_frame"))?;
+            for entry in range {
+                let (k, v) = entry.map_err(|err| {
+                    map_redb_storage_err(err, "read ai_index_intent_context_frame")
+                })?;
+                if k.value().0 != iid {
+                    break;
+                }
+                let rec: AiIndexIntentContextFrameRecord =
+                    decode_versioned(v.value(), GIT_STATE_CODEC_VERSION)?;
+                out.push(rec);
+            }
+            out.sort_by(|a, b| {
+                a.relation_kind
+                    .cmp(&b.relation_kind)
+                    .then_with(|| a.created_at.cmp(&b.created_at))
+                    .then_with(|| a.context_frame_id.cmp(&b.context_frame_id))
+            });
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn upsert_ai_validation_report(
+        &self,
+        record: &AiValidationReportRecord,
+    ) -> StorageResult<()> {
+        validate_ai_validation_report(record)?;
+        let rec = record.clone();
+        self.run_write_conditional(move |wtx| {
+            ensure_ai_thread_exists_in_wtx(wtx, &rec.thread_id)?;
+            let mut table = wtx
+                .open_table(AI_VALIDATION_REPORT_TABLE)
+                .map_err(|err| map_redb_table_err(err, "open ai_validation_report"))?;
+            if rec.is_latest {
+                clear_latest_for_thread::<AiValidationReportRecord>(
+                    &mut table,
+                    &rec.thread_id,
+                    &rec.report_id,
+                    |r| (&r.thread_id, &r.report_id, r.is_latest),
+                    |r| r.is_latest = false,
+                    "ai_validation_report",
+                )?;
+            }
+            let bytes = encode_versioned(GIT_STATE_CODEC_VERSION, &rec)?;
+            table
+                .insert(rec.report_id.as_str(), bytes.as_slice())
+                .map_err(|err| map_redb_storage_err(err, "upsert ai_validation_report"))?;
+            Ok((true, ()))
+        })
+        .await
+    }
+
+    async fn list_ai_validation_reports(
+        &self,
+        thread_id: &str,
+    ) -> StorageResult<Vec<AiValidationReportRecord>> {
+        validate_non_empty_identifier(thread_id, "ai_validation_report thread_id")?;
+        let tid = thread_id.to_string();
+        self.run_read(move |rtx| {
+            let Some(table) =
+                open_opt_table(rtx, AI_VALIDATION_REPORT_TABLE, "open ai_validation_report")?
+            else {
+                return Ok(Vec::new());
+            };
+            let mut out = Vec::new();
+            for entry in table
+                .iter()
+                .map_err(|err| map_redb_storage_err(err, "iter ai_validation_report"))?
+            {
+                let (_, v) =
+                    entry.map_err(|err| map_redb_storage_err(err, "read ai_validation_report"))?;
+                let rec: AiValidationReportRecord =
+                    decode_versioned(v.value(), GIT_STATE_CODEC_VERSION)?;
+                if rec.thread_id == tid {
+                    out.push(rec);
+                }
+            }
+            out.sort_by(|a, b| {
+                a.created_at
+                    .cmp(&b.created_at)
+                    .then_with(|| a.report_id.cmp(&b.report_id))
+            });
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn upsert_ai_risk_score_breakdown(
+        &self,
+        record: &AiRiskScoreBreakdownRecord,
+    ) -> StorageResult<()> {
+        validate_ai_risk_score_breakdown(record)?;
+        let rec = record.clone();
+        self.run_write_conditional(move |wtx| {
+            ensure_ai_thread_exists_in_wtx(wtx, &rec.thread_id)?;
+            let mut table = wtx
+                .open_table(AI_RISK_SCORE_BREAKDOWN_TABLE)
+                .map_err(|err| map_redb_table_err(err, "open ai_risk_score_breakdown"))?;
+            if rec.is_latest {
+                clear_latest_for_thread::<AiRiskScoreBreakdownRecord>(
+                    &mut table,
+                    &rec.thread_id,
+                    &rec.breakdown_id,
+                    |r| (&r.thread_id, &r.breakdown_id, r.is_latest),
+                    |r| r.is_latest = false,
+                    "ai_risk_score_breakdown",
+                )?;
+            }
+            let bytes = encode_versioned(GIT_STATE_CODEC_VERSION, &rec)?;
+            table
+                .insert(rec.breakdown_id.as_str(), bytes.as_slice())
+                .map_err(|err| map_redb_storage_err(err, "upsert ai_risk_score_breakdown"))?;
+            Ok((true, ()))
+        })
+        .await
+    }
+
+    async fn list_ai_risk_score_breakdowns(
+        &self,
+        thread_id: &str,
+    ) -> StorageResult<Vec<AiRiskScoreBreakdownRecord>> {
+        validate_non_empty_identifier(thread_id, "ai_risk_score_breakdown thread_id")?;
+        let tid = thread_id.to_string();
+        self.run_read(move |rtx| {
+            let Some(table) = open_opt_table(
+                rtx,
+                AI_RISK_SCORE_BREAKDOWN_TABLE,
+                "open ai_risk_score_breakdown",
+            )?
+            else {
+                return Ok(Vec::new());
+            };
+            let mut out = Vec::new();
+            for entry in table
+                .iter()
+                .map_err(|err| map_redb_storage_err(err, "iter ai_risk_score_breakdown"))?
+            {
+                let (_, v) = entry
+                    .map_err(|err| map_redb_storage_err(err, "read ai_risk_score_breakdown"))?;
+                let rec: AiRiskScoreBreakdownRecord =
+                    decode_versioned(v.value(), GIT_STATE_CODEC_VERSION)?;
+                if rec.thread_id == tid {
+                    out.push(rec);
+                }
+            }
+            out.sort_by(|a, b| {
+                a.created_at
+                    .cmp(&b.created_at)
+                    .then_with(|| a.breakdown_id.cmp(&b.breakdown_id))
+            });
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn upsert_ai_decision_proposal(
+        &self,
+        record: &AiDecisionProposalRecord,
+    ) -> StorageResult<()> {
+        validate_ai_decision_proposal(record)?;
+        let rec = record.clone();
+        self.run_write_conditional(move |wtx| {
+            ensure_ai_thread_exists_in_wtx(wtx, &rec.thread_id)?;
+            let mut table = wtx
+                .open_table(AI_DECISION_PROPOSAL_TABLE)
+                .map_err(|err| map_redb_table_err(err, "open ai_decision_proposal"))?;
+            if rec.is_latest {
+                clear_latest_for_thread::<AiDecisionProposalRecord>(
+                    &mut table,
+                    &rec.thread_id,
+                    &rec.proposal_id,
+                    |r| (&r.thread_id, &r.proposal_id, r.is_latest),
+                    |r| r.is_latest = false,
+                    "ai_decision_proposal",
+                )?;
+            }
+            let bytes = encode_versioned(GIT_STATE_CODEC_VERSION, &rec)?;
+            table
+                .insert(rec.proposal_id.as_str(), bytes.as_slice())
+                .map_err(|err| map_redb_storage_err(err, "upsert ai_decision_proposal"))?;
+            Ok((true, ()))
+        })
+        .await
+    }
+
+    async fn list_ai_decision_proposals(
+        &self,
+        thread_id: &str,
+    ) -> StorageResult<Vec<AiDecisionProposalRecord>> {
+        validate_non_empty_identifier(thread_id, "ai_decision_proposal thread_id")?;
+        let tid = thread_id.to_string();
+        self.run_read(move |rtx| {
+            let Some(table) =
+                open_opt_table(rtx, AI_DECISION_PROPOSAL_TABLE, "open ai_decision_proposal")?
+            else {
+                return Ok(Vec::new());
+            };
+            let mut out = Vec::new();
+            for entry in table
+                .iter()
+                .map_err(|err| map_redb_storage_err(err, "iter ai_decision_proposal"))?
+            {
+                let (_, v) =
+                    entry.map_err(|err| map_redb_storage_err(err, "read ai_decision_proposal"))?;
+                let rec: AiDecisionProposalRecord =
+                    decode_versioned(v.value(), GIT_STATE_CODEC_VERSION)?;
+                if rec.thread_id == tid {
+                    out.push(rec);
+                }
+            }
+            out.sort_by(|a, b| {
+                a.created_at
+                    .cmp(&b.created_at)
+                    .then_with(|| a.proposal_id.cmp(&b.proposal_id))
+            });
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn upsert_ai_final_decision(&self, record: &AiFinalDecisionRecord) -> StorageResult<()> {
+        validate_ai_final_decision(record)?;
+        let rec = record.clone();
+        self.run_write_conditional(move |wtx| {
+            ensure_ai_thread_exists_in_wtx(wtx, &rec.thread_id)?;
+            let mut table = wtx
+                .open_table(AI_FINAL_DECISION_TABLE)
+                .map_err(|err| map_redb_table_err(err, "open ai_final_decision"))?;
+            if rec.is_latest {
+                clear_latest_for_thread::<AiFinalDecisionRecord>(
+                    &mut table,
+                    &rec.thread_id,
+                    &rec.decision_id,
+                    |r| (&r.thread_id, &r.decision_id, r.is_latest),
+                    |r| r.is_latest = false,
+                    "ai_final_decision",
+                )?;
+            }
+            let bytes = encode_versioned(GIT_STATE_CODEC_VERSION, &rec)?;
+            table
+                .insert(rec.decision_id.as_str(), bytes.as_slice())
+                .map_err(|err| map_redb_storage_err(err, "upsert ai_final_decision"))?;
+            Ok((true, ()))
+        })
+        .await
+    }
+
+    async fn list_ai_final_decisions(
+        &self,
+        thread_id: &str,
+    ) -> StorageResult<Vec<AiFinalDecisionRecord>> {
+        validate_non_empty_identifier(thread_id, "ai_final_decision thread_id")?;
+        let tid = thread_id.to_string();
+        self.run_read(move |rtx| {
+            let Some(table) =
+                open_opt_table(rtx, AI_FINAL_DECISION_TABLE, "open ai_final_decision")?
+            else {
+                return Ok(Vec::new());
+            };
+            let mut out = Vec::new();
+            for entry in table
+                .iter()
+                .map_err(|err| map_redb_storage_err(err, "iter ai_final_decision"))?
+            {
+                let (_, v) =
+                    entry.map_err(|err| map_redb_storage_err(err, "read ai_final_decision"))?;
+                let rec: AiFinalDecisionRecord =
+                    decode_versioned(v.value(), GIT_STATE_CODEC_VERSION)?;
+                if rec.thread_id == tid {
+                    out.push(rec);
+                }
+            }
+            out.sort_by(|a, b| {
+                a.created_at
+                    .cmp(&b.created_at)
+                    .then_with(|| a.decision_id.cmp(&b.decision_id))
+            });
+            Ok(out)
+        })
+        .await
+    }
+
+    // -------------------------------------------------------------------------
+    // RB-05b AC2 & AC3: 5 `memory_*` Tables + `MEMORY_BY_PATH` Secondary Index
+    // -------------------------------------------------------------------------
+
+    async fn upsert_memory_episode(&self, record: &MemoryEpisodeRecord) -> StorageResult<()> {
+        validate_memory_episode(record)?;
+        let rec = record.clone();
+        self.run_write_conditional(move |wtx| {
+            let mut table = wtx
+                .open_table(MEMORY_EPISODE_TABLE)
+                .map_err(|err| map_redb_table_err(err, "open memory_episode"))?;
+            // Enforce SQLite's `UNIQUE(repo_id, source_kind, source_key)`.
+            {
+                let iter = table
+                    .iter()
+                    .map_err(|err| map_redb_storage_err(err, "scan memory_episode"))?;
+                for entry in iter {
+                    let (_, v) =
+                        entry.map_err(|err| map_redb_storage_err(err, "read memory_episode"))?;
+                    let existing: MemoryEpisodeRecord =
+                        decode_versioned(v.value(), GIT_STATE_CODEC_VERSION)?;
+                    if existing.episode_id != rec.episode_id
+                        && existing.repo_id == rec.repo_id
+                        && existing.source_kind == rec.source_kind
+                        && existing.source_key == rec.source_key
+                    {
+                        return Err(StorageBackendError::BackendInternal {
+                            detail:
+                                "duplicate (repo_id, source_kind, source_key) in memory_episode"
+                                    .to_string(),
+                        });
+                    }
+                }
+            }
+            let bytes = encode_versioned(GIT_STATE_CODEC_VERSION, &rec)?;
+            table
+                .insert(rec.episode_id.as_str(), bytes.as_slice())
+                .map_err(|err| map_redb_storage_err(err, "upsert memory_episode"))?;
+            Ok((true, ()))
+        })
+        .await
+    }
+
+    async fn get_memory_episode(
+        &self,
+        episode_id: &str,
+    ) -> StorageResult<Option<MemoryEpisodeRecord>> {
+        validate_non_empty_identifier(episode_id, "memory_episode episode_id")?;
+        let eid = episode_id.to_string();
+        self.run_read(move |rtx| {
+            let Some(table) = open_opt_table(rtx, MEMORY_EPISODE_TABLE, "open memory_episode")?
+            else {
+                return Ok(None);
+            };
+            let Some(g) = table
+                .get(eid.as_str())
+                .map_err(|err| map_redb_storage_err(err, "get memory_episode"))?
+            else {
+                return Ok(None);
+            };
+            decode_versioned(g.value(), GIT_STATE_CODEC_VERSION).map(Some)
+        })
+        .await
+    }
+
+    async fn list_memory_episodes(&self, repo_id: &str) -> StorageResult<Vec<MemoryEpisodeRecord>> {
+        validate_non_empty_identifier(repo_id, "memory_episode repo_id")?;
+        let rid = repo_id.to_string();
+        self.run_read(move |rtx| {
+            let Some(table) = open_opt_table(rtx, MEMORY_EPISODE_TABLE, "open memory_episode")?
+            else {
+                return Ok(Vec::new());
+            };
+            let mut out = Vec::new();
+            for entry in table
+                .iter()
+                .map_err(|err| map_redb_storage_err(err, "iter memory_episode"))?
+            {
+                let (_, v) =
+                    entry.map_err(|err| map_redb_storage_err(err, "read memory_episode"))?;
+                let rec: MemoryEpisodeRecord =
+                    decode_versioned(v.value(), GIT_STATE_CODEC_VERSION)?;
+                if rec.repo_id == rid {
+                    out.push(rec);
+                }
+            }
+            out.sort_by(|a, b| {
+                b.ended_at
+                    .cmp(&a.ended_at)
+                    .then_with(|| a.episode_id.cmp(&b.episode_id))
+            });
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn delete_memory_episode(&self, episode_id: &str) -> StorageResult<bool> {
+        validate_non_empty_identifier(episode_id, "memory_episode episode_id")?;
+        let eid = episode_id.to_string();
+        self.run_write_conditional(move |wtx| {
+            // Cascade delete `memory_episode_evidence`.
+            {
+                let mut ev_table = wtx
+                    .open_table(MEMORY_EPISODE_EVIDENCE_TABLE)
+                    .map_err(|err| map_redb_table_err(err, "open memory_episode_evidence"))?;
+                let mut ords = Vec::new();
+                {
+                    let range = ev_table
+                        .range((eid.as_str(), i64::MIN)..=(eid.as_str(), i64::MAX))
+                        .map_err(|err| map_redb_storage_err(err, "scan memory_episode_evidence"))?;
+                    for entry in range {
+                        let (k, _) = entry.map_err(|err| {
+                            map_redb_storage_err(err, "read memory_episode_evidence")
+                        })?;
+                        ords.push(k.value().1);
+                    }
+                }
+                for ord in ords {
+                    let _ = ev_table.remove((eid.as_str(), ord)).map_err(|err| {
+                        map_redb_storage_err(err, "delete memory_episode_evidence")
+                    })?;
+                }
+            }
+
+            // Cascade delete `memory_episode_path` AND same-tx `MEMORY_BY_PATH` index entries.
+            {
+                let mut path_table = wtx
+                    .open_table(MEMORY_EPISODE_PATH_TABLE)
+                    .map_err(|err| map_redb_table_err(err, "open memory_episode_path"))?;
+                let mut to_remove: Vec<(Vec<u8>, u64)> = Vec::new();
+                {
+                    let range = path_table
+                        .range((eid.as_str(), &[][..])..)
+                        .map_err(|err| map_redb_storage_err(err, "scan memory_episode_path"))?;
+                    for entry in range {
+                        let (k, v) = entry
+                            .map_err(|err| map_redb_storage_err(err, "read memory_episode_path"))?;
+                        if k.value().0 != eid {
+                            break;
+                        }
+                        let rec: MemoryEpisodePathRecord =
+                            decode_versioned(v.value(), GIT_STATE_CODEC_VERSION)?;
+                        to_remove.push((rec.code_path, invert_ended_at(rec.ended_at)));
+                    }
+                }
+                let mut idx_table = wtx
+                    .open_table(MEMORY_BY_PATH_TABLE)
+                    .map_err(|err| map_redb_table_err(err, "open MEMORY_BY_PATH"))?;
+                for (code_path, inv_ts) in to_remove {
+                    let _ = path_table
+                        .remove((eid.as_str(), code_path.as_slice()))
+                        .map_err(|err| map_redb_storage_err(err, "delete memory_episode_path"))?;
+                    let _ = idx_table
+                        .remove((code_path.as_slice(), inv_ts, eid.as_str()))
+                        .map_err(|err| map_redb_storage_err(err, "delete MEMORY_BY_PATH"))?;
+                }
+            }
+
+            // Cascade delete `memory_episode_search_doc`.
+            {
+                let mut doc_table = wtx
+                    .open_table(MEMORY_EPISODE_SEARCH_DOC_TABLE)
+                    .map_err(|err| map_redb_table_err(err, "open memory_episode_search_doc"))?;
+                let mut to_remove = Vec::new();
+                {
+                    for entry in doc_table.iter().map_err(|err| {
+                        map_redb_storage_err(err, "scan memory_episode_search_doc")
+                    })? {
+                        let (k, v) = entry.map_err(|err| {
+                            map_redb_storage_err(err, "read memory_episode_search_doc")
+                        })?;
+                        let rec: MemoryEpisodeSearchDocRecord =
+                            decode_versioned(v.value(), GIT_STATE_CODEC_VERSION)?;
+                        if rec.episode_id == eid {
+                            to_remove.push(k.value());
+                        }
+                    }
+                }
+                for rid in to_remove {
+                    let _ = doc_table.remove(rid).map_err(|err| {
+                        map_redb_storage_err(err, "delete memory_episode_search_doc")
+                    })?;
+                }
+            }
+
+            let mut ep_table = wtx
+                .open_table(MEMORY_EPISODE_TABLE)
+                .map_err(|err| map_redb_table_err(err, "open memory_episode"))?;
+            let removed = ep_table
+                .remove(eid.as_str())
+                .map_err(|err| map_redb_storage_err(err, "delete memory_episode"))?
+                .is_some();
+            Ok((removed, removed))
+        })
+        .await
+    }
+
+    async fn replace_memory_episode_evidence(
+        &self,
+        episode_id: &str,
+        evidence: &[MemoryEpisodeEvidenceRecord],
+    ) -> StorageResult<()> {
+        validate_non_empty_identifier(episode_id, "memory_episode_evidence episode_id")?;
+        let mut seen_ords = BTreeSet::new();
+        for ev in evidence {
+            validate_memory_episode_evidence(ev)?;
+            if ev.episode_id != episode_id {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: "memory_episode_evidence episode_id mismatch".to_string(),
+                });
+            }
+            if !seen_ords.insert(ev.ordinal) {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: "duplicate ordinal in memory_episode_evidence".to_string(),
+                });
+            }
+        }
+        let eid = episode_id.to_string();
+        let owned = evidence.to_vec();
+        self.run_write_conditional(move |wtx| {
+            ensure_memory_episode_exists_in_wtx(wtx, &eid)?;
+            let mut table = wtx
+                .open_table(MEMORY_EPISODE_EVIDENCE_TABLE)
+                .map_err(|err| map_redb_table_err(err, "open memory_episode_evidence"))?;
+            let mut old_ords = Vec::new();
+            {
+                let range = table
+                    .range((eid.as_str(), i64::MIN)..=(eid.as_str(), i64::MAX))
+                    .map_err(|err| map_redb_storage_err(err, "scan memory_episode_evidence"))?;
+                for entry in range {
+                    let (k, _) = entry
+                        .map_err(|err| map_redb_storage_err(err, "read memory_episode_evidence"))?;
+                    old_ords.push(k.value().1);
+                }
+            }
+            for ord in old_ords {
+                let _ = table
+                    .remove((eid.as_str(), ord))
+                    .map_err(|err| map_redb_storage_err(err, "clear memory_episode_evidence"))?;
+            }
+            for ev in &owned {
+                let bytes = encode_versioned(GIT_STATE_CODEC_VERSION, ev)?;
+                table
+                    .insert((ev.episode_id.as_str(), ev.ordinal), bytes.as_slice())
+                    .map_err(|err| map_redb_storage_err(err, "insert memory_episode_evidence"))?;
+            }
+            Ok((true, ()))
+        })
+        .await
+    }
+
+    async fn list_memory_episode_evidence(
+        &self,
+        episode_id: &str,
+    ) -> StorageResult<Vec<MemoryEpisodeEvidenceRecord>> {
+        validate_non_empty_identifier(episode_id, "memory_episode_evidence episode_id")?;
+        let eid = episode_id.to_string();
+        self.run_read(move |rtx| {
+            let Some(table) = open_opt_table(
+                rtx,
+                MEMORY_EPISODE_EVIDENCE_TABLE,
+                "open memory_episode_evidence",
+            )?
+            else {
+                return Ok(Vec::new());
+            };
+            let mut out = Vec::new();
+            let range = table
+                .range((eid.as_str(), i64::MIN)..=(eid.as_str(), i64::MAX))
+                .map_err(|err| map_redb_storage_err(err, "scan memory_episode_evidence"))?;
+            for entry in range {
+                let (_, v) = entry
+                    .map_err(|err| map_redb_storage_err(err, "read memory_episode_evidence"))?;
+                out.push(decode_versioned(v.value(), GIT_STATE_CODEC_VERSION)?);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn upsert_memory_projection_state(
+        &self,
+        record: &MemoryProjectionStateRecord,
+    ) -> StorageResult<()> {
+        validate_memory_projection_state(record)?;
+        let rec = record.clone();
+        self.run_write_conditional(move |wtx| {
+            let mut table = wtx
+                .open_table(MEMORY_PROJECTION_STATE_TABLE)
+                .map_err(|err| map_redb_table_err(err, "open memory_projection_state"))?;
+            let bytes = encode_versioned(GIT_STATE_CODEC_VERSION, &rec)?;
+            table
+                .insert(
+                    (rec.repo_id.as_str(), rec.source_kind.as_str()),
+                    bytes.as_slice(),
+                )
+                .map_err(|err| map_redb_storage_err(err, "upsert memory_projection_state"))?;
+            Ok((true, ()))
+        })
+        .await
+    }
+
+    async fn get_memory_projection_state(
+        &self,
+        repo_id: &str,
+        source_kind: MemorySourceKind,
+    ) -> StorageResult<Option<MemoryProjectionStateRecord>> {
+        validate_non_empty_identifier(repo_id, "memory_projection_state repo_id")?;
+        let rid = repo_id.to_string();
+        let sk = source_kind.as_str();
+        self.run_read(move |rtx| {
+            let Some(table) = open_opt_table(
+                rtx,
+                MEMORY_PROJECTION_STATE_TABLE,
+                "open memory_projection_state",
+            )?
+            else {
+                return Ok(None);
+            };
+            let Some(g) = table
+                .get((rid.as_str(), sk))
+                .map_err(|err| map_redb_storage_err(err, "get memory_projection_state"))?
+            else {
+                return Ok(None);
+            };
+            decode_versioned(g.value(), GIT_STATE_CODEC_VERSION).map(Some)
+        })
+        .await
+    }
+
+    async fn list_memory_projection_states(
+        &self,
+        repo_id: &str,
+    ) -> StorageResult<Vec<MemoryProjectionStateRecord>> {
+        validate_non_empty_identifier(repo_id, "memory_projection_state repo_id")?;
+        let rid = repo_id.to_string();
+        self.run_read(move |rtx| {
+            let Some(table) = open_opt_table(
+                rtx,
+                MEMORY_PROJECTION_STATE_TABLE,
+                "open memory_projection_state",
+            )?
+            else {
+                return Ok(Vec::new());
+            };
+            let mut out = Vec::new();
+            let range = table
+                .range((rid.as_str(), "")..)
+                .map_err(|err| map_redb_storage_err(err, "scan memory_projection_state"))?;
+            for entry in range {
+                let (k, v) = entry
+                    .map_err(|err| map_redb_storage_err(err, "read memory_projection_state"))?;
+                if k.value().0 != rid {
+                    break;
+                }
+                out.push(decode_versioned(v.value(), GIT_STATE_CODEC_VERSION)?);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn upsert_memory_episode_path(
+        &self,
+        record: &MemoryEpisodePathRecord,
+    ) -> StorageResult<()> {
+        validate_memory_episode_path(record)?;
+        let rec = record.clone();
+        self.run_write_conditional(move |wtx| {
+            ensure_memory_episode_exists_in_wtx(wtx, &rec.episode_id)?;
+            let mut path_table = wtx
+                .open_table(MEMORY_EPISODE_PATH_TABLE)
+                .map_err(|err| map_redb_table_err(err, "open memory_episode_path"))?;
+            let old_ended_at = match path_table
+                .get((rec.episode_id.as_str(), rec.code_path.as_slice()))
+                .map_err(|err| map_redb_storage_err(err, "read prior memory_episode_path"))?
+            {
+                Some(g) => {
+                    let prev: MemoryEpisodePathRecord =
+                        decode_versioned(g.value(), GIT_STATE_CODEC_VERSION)?;
+                    Some(prev.ended_at)
+                }
+                None => None,
+            };
+            let bytes = encode_versioned(GIT_STATE_CODEC_VERSION, &rec)?;
+            path_table
+                .insert(
+                    (rec.episode_id.as_str(), rec.code_path.as_slice()),
+                    bytes.as_slice(),
+                )
+                .map_err(|err| map_redb_storage_err(err, "upsert memory_episode_path"))?;
+            drop(path_table);
+
+            let mut idx_table = wtx
+                .open_table(MEMORY_BY_PATH_TABLE)
+                .map_err(|err| map_redb_table_err(err, "open MEMORY_BY_PATH"))?;
+            if let Some(old_ts) = old_ended_at
+                && old_ts != rec.ended_at
+            {
+                let _ = idx_table
+                    .remove((
+                        rec.code_path.as_slice(),
+                        invert_ended_at(old_ts),
+                        rec.episode_id.as_str(),
+                    ))
+                    .map_err(|err| map_redb_storage_err(err, "remove stale MEMORY_BY_PATH"))?;
+            }
+            let marker = encode_versioned(GIT_STATE_CODEC_VERSION, &UnitMarker)?;
+            idx_table
+                .insert(
+                    (
+                        rec.code_path.as_slice(),
+                        invert_ended_at(rec.ended_at),
+                        rec.episode_id.as_str(),
+                    ),
+                    marker.as_slice(),
+                )
+                .map_err(|err| map_redb_storage_err(err, "upsert MEMORY_BY_PATH"))?;
+            Ok((true, ()))
+        })
+        .await
+    }
+
+    async fn list_memory_episode_paths(
+        &self,
+        episode_id: &str,
+    ) -> StorageResult<Vec<MemoryEpisodePathRecord>> {
+        validate_non_empty_identifier(episode_id, "memory_episode_path episode_id")?;
+        let eid = episode_id.to_string();
+        self.run_read(move |rtx| {
+            let Some(table) =
+                open_opt_table(rtx, MEMORY_EPISODE_PATH_TABLE, "open memory_episode_path")?
+            else {
+                return Ok(Vec::new());
+            };
+            let mut out = Vec::new();
+            let range = table
+                .range((eid.as_str(), &[][..])..)
+                .map_err(|err| map_redb_storage_err(err, "scan memory_episode_path"))?;
+            for entry in range {
+                let (k, v) =
+                    entry.map_err(|err| map_redb_storage_err(err, "read memory_episode_path"))?;
+                if k.value().0 != eid {
+                    break;
+                }
+                out.push(decode_versioned(v.value(), GIT_STATE_CODEC_VERSION)?);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn query_memory_paths_by_path(
+        &self,
+        code_path: &[u8],
+        since_ended_at: Option<i64>,
+        until_ended_at: Option<i64>,
+        limit: Option<usize>,
+    ) -> StorageResult<Vec<MemoryEpisodePathRecord>> {
+        validate_memory_code_path(code_path)?;
+        if limit == Some(0) {
+            return Ok(Vec::new());
+        }
+        if let (Some(since), Some(until)) = (since_ended_at, until_ended_at)
+            && since > until
+        {
+            return Ok(Vec::new());
+        }
+        let target_path = code_path.to_vec();
+        let inv_start = until_ended_at.map(invert_ended_at).unwrap_or(0);
+        let inv_end = since_ended_at.map(invert_ended_at).unwrap_or(u64::MAX);
+        self.run_read(move |rtx| {
+            let Some(idx_table) = open_opt_table(rtx, MEMORY_BY_PATH_TABLE, "open MEMORY_BY_PATH")?
+            else {
+                return Ok(Vec::new());
+            };
+            let Some(path_table) =
+                open_opt_table(rtx, MEMORY_EPISODE_PATH_TABLE, "open memory_episode_path")?
+            else {
+                return Ok(Vec::new());
+            };
+            let mut out = Vec::new();
+            let range = idx_table
+                .range((target_path.as_slice(), inv_start, "")..)
+                .map_err(|err| map_redb_storage_err(err, "scan MEMORY_BY_PATH"))?;
+            for entry in range {
+                let (k, _) =
+                    entry.map_err(|err| map_redb_storage_err(err, "read MEMORY_BY_PATH"))?;
+                let (found_path, found_inv_ts, ep_id) = k.value();
+                if found_path != target_path.as_slice() || found_inv_ts > inv_end {
+                    break;
+                }
+                let guard = path_table
+                    .get((ep_id, found_path))
+                    .map_err(|err| map_redb_storage_err(err, "get memory_episode_path via index"))?
+                    .ok_or_else(|| StorageBackendError::BackendInternal {
+                        detail: "MEMORY_BY_PATH references missing memory_episode_path row"
+                            .to_string(),
+                    })?;
+                out.push(decode_versioned(guard.value(), GIT_STATE_CODEC_VERSION)?);
+                if let Some(lim) = limit
+                    && out.len() >= lim
+                {
+                    break;
+                }
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn upsert_memory_episode_search_doc(
+        &self,
+        episode_id: &str,
+        title: &str,
+        body: &str,
+        paths_text: &str,
+    ) -> StorageResult<MemoryEpisodeSearchDocRecord> {
+        validate_non_empty_identifier(episode_id, "memory_episode_search_doc episode_id")?;
+        validate_no_nul(title, "memory_episode_search_doc title")?;
+        validate_no_nul(body, "memory_episode_search_doc body")?;
+        validate_no_nul(paths_text, "memory_episode_search_doc paths_text")?;
+        let eid = episode_id.to_string();
+        let title_owned = title.to_string();
+        let body_owned = body.to_string();
+        let paths_owned = paths_text.to_string();
+        self.run_write_conditional(move |wtx| {
+            ensure_memory_episode_exists_in_wtx(wtx, &eid)?;
+            let mut table = wtx
+                .open_table(MEMORY_EPISODE_SEARCH_DOC_TABLE)
+                .map_err(|err| map_redb_table_err(err, "open memory_episode_search_doc"))?;
+            let mut existing_rowid: Option<i64> = None;
+            {
+                for entry in table
+                    .iter()
+                    .map_err(|err| map_redb_storage_err(err, "scan memory_episode_search_doc"))?
+                {
+                    let (k, v) = entry.map_err(|err| {
+                        map_redb_storage_err(err, "read memory_episode_search_doc")
+                    })?;
+                    let row: MemoryEpisodeSearchDocRecord =
+                        decode_versioned(v.value(), GIT_STATE_CODEC_VERSION)?;
+                    if row.episode_id == eid {
+                        existing_rowid = Some(k.value());
+                        break;
+                    }
+                }
+            }
+            let rowid = match existing_rowid {
+                Some(rid) => rid,
+                None => {
+                    let last_id = table
+                        .last()
+                        .map_err(|err| {
+                            map_redb_storage_err(err, "read last memory_episode_search_doc rowid")
+                        })?
+                        .map(|(k, _)| k.value())
+                        .unwrap_or(0);
+                    last_id
+                        .checked_add(1)
+                        .ok_or_else(|| StorageBackendError::BackendInternal {
+                            detail: "memory_episode_search_doc rowid overflowed i64".to_string(),
+                        })?
+                }
+            };
+            let rec = MemoryEpisodeSearchDocRecord {
+                rowid,
+                episode_id: eid,
+                title: title_owned,
+                body: body_owned,
+                paths_text: paths_owned,
+            };
+            let bytes = encode_versioned(GIT_STATE_CODEC_VERSION, &rec)?;
+            table
+                .insert(rowid, bytes.as_slice())
+                .map_err(|err| map_redb_storage_err(err, "upsert memory_episode_search_doc"))?;
+            Ok((true, rec))
+        })
+        .await
+    }
+
+    async fn get_memory_episode_search_doc(
+        &self,
+        episode_id: &str,
+    ) -> StorageResult<Option<MemoryEpisodeSearchDocRecord>> {
+        validate_non_empty_identifier(episode_id, "memory_episode_search_doc episode_id")?;
+        let eid = episode_id.to_string();
+        self.run_read(move |rtx| {
+            let Some(table) = open_opt_table(
+                rtx,
+                MEMORY_EPISODE_SEARCH_DOC_TABLE,
+                "open memory_episode_search_doc",
+            )?
+            else {
+                return Ok(None);
+            };
+            for entry in table
+                .iter()
+                .map_err(|err| map_redb_storage_err(err, "iter memory_episode_search_doc"))?
+            {
+                let (_, v) = entry
+                    .map_err(|err| map_redb_storage_err(err, "read memory_episode_search_doc"))?;
+                let rec: MemoryEpisodeSearchDocRecord =
+                    decode_versioned(v.value(), GIT_STATE_CODEC_VERSION)?;
+                if rec.episode_id == eid {
+                    return Ok(Some(rec));
+                }
+            }
+            Ok(None)
+        })
+        .await
+    }
+
+    async fn list_memory_episode_search_docs(
+        &self,
+    ) -> StorageResult<Vec<MemoryEpisodeSearchDocRecord>> {
+        self.run_read(move |rtx| {
+            let Some(table) = open_opt_table(
+                rtx,
+                MEMORY_EPISODE_SEARCH_DOC_TABLE,
+                "open memory_episode_search_doc",
+            )?
+            else {
+                return Ok(Vec::new());
+            };
+            let mut out = Vec::new();
+            for entry in table
+                .iter()
+                .map_err(|err| map_redb_storage_err(err, "iter memory_episode_search_doc"))?
+            {
+                let (_, v) = entry
+                    .map_err(|err| map_redb_storage_err(err, "read memory_episode_search_doc"))?;
+                out.push(decode_versioned(v.value(), GIT_STATE_CODEC_VERSION)?);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    // -------------------------------------------------------------------------
+    // RB-05b AC4: Governance & Audit (`approved_permission`, `automation_log`, `source_call_log`)
+    // -------------------------------------------------------------------------
+
+    async fn upsert_approved_permission(
+        &self,
+        record: &ApprovedPermissionRecord,
+    ) -> StorageResult<()> {
+        validate_approved_permission(record)?;
+        let rec = record.clone();
+        self.run_write_conditional(move |wtx| {
+            let mut table = wtx
+                .open_table(APPROVED_PERMISSION_TABLE)
+                .map_err(|err| map_redb_table_err(err, "open approved_permission"))?;
+            let bytes = encode_versioned(GIT_STATE_CODEC_VERSION, &rec)?;
+            table
+                .insert(
+                    (
+                        rec.project_id.as_str(),
+                        rec.permission.as_str(),
+                        rec.pattern.as_str(),
+                    ),
+                    bytes.as_slice(),
+                )
+                .map_err(|err| map_redb_storage_err(err, "upsert approved_permission"))?;
+            Ok((true, ()))
+        })
+        .await
+    }
+
+    async fn list_approved_permissions(
+        &self,
+        project_id: &str,
+    ) -> StorageResult<Vec<ApprovedPermissionRecord>> {
+        validate_non_empty_identifier(project_id, "approved_permission project_id")?;
+        let pid = project_id.to_string();
+        self.run_read(move |rtx| {
+            let Some(table) =
+                open_opt_table(rtx, APPROVED_PERMISSION_TABLE, "open approved_permission")?
+            else {
+                return Ok(Vec::new());
+            };
+            let mut out = Vec::new();
+            let range = table
+                .range((pid.as_str(), "", "")..)
+                .map_err(|err| map_redb_storage_err(err, "scan approved_permission"))?;
+            for entry in range {
+                let (k, v) =
+                    entry.map_err(|err| map_redb_storage_err(err, "read approved_permission"))?;
+                if k.value().0 != pid {
+                    break;
+                }
+                let rec: ApprovedPermissionRecord =
+                    decode_versioned(v.value(), GIT_STATE_CODEC_VERSION)?;
+                out.push(rec);
+            }
+            out.sort_by(|a, b| {
+                a.created_at
+                    .cmp(&b.created_at)
+                    .then_with(|| a.permission.cmp(&b.permission))
+                    .then_with(|| a.pattern.cmp(&b.pattern))
+            });
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn delete_approved_permission(
+        &self,
+        project_id: &str,
+        permission: &str,
+        pattern: &str,
+    ) -> StorageResult<bool> {
+        validate_non_empty_identifier(project_id, "approved_permission project_id")?;
+        validate_non_empty_identifier(permission, "approved_permission permission")?;
+        validate_non_empty_identifier(pattern, "approved_permission pattern")?;
+        let pid = project_id.to_string();
+        let perm = permission.to_string();
+        let pat = pattern.to_string();
+        self.run_write_conditional(move |wtx| {
+            let mut table = wtx
+                .open_table(APPROVED_PERMISSION_TABLE)
+                .map_err(|err| map_redb_table_err(err, "open approved_permission"))?;
+            let removed = table
+                .remove((pid.as_str(), perm.as_str(), pat.as_str()))
+                .map_err(|err| map_redb_storage_err(err, "delete approved_permission"))?
+                .is_some();
+            Ok((removed, removed))
+        })
+        .await
+    }
+
+    async fn append_automation_log(&self, record: &AutomationLogRecord) -> StorageResult<()> {
+        validate_automation_log(record)?;
+        let rec = record.clone();
+        self.run_write_conditional(move |wtx| {
+            let mut table = wtx
+                .open_table(AUTOMATION_LOG_TABLE)
+                .map_err(|err| map_redb_table_err(err, "open automation_log"))?;
+            if table
+                .get(rec.id.as_str())
+                .map_err(|err| map_redb_storage_err(err, "check duplicate automation_log id"))?
+                .is_some()
+            {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: "duplicate automation_log id".to_string(),
+                });
+            }
+            let bytes = encode_versioned(GIT_STATE_CODEC_VERSION, &rec)?;
+            table
+                .insert(rec.id.as_str(), bytes.as_slice())
+                .map_err(|err| map_redb_storage_err(err, "insert automation_log"))?;
+            Ok((true, ()))
+        })
+        .await
+    }
+
+    async fn list_automation_logs(
+        &self,
+        rule_id: Option<&str>,
+        limit: Option<usize>,
+    ) -> StorageResult<Vec<AutomationLogRecord>> {
+        if let Some(r) = rule_id {
+            validate_non_empty_identifier(r, "automation_log rule_id")?;
+        }
+        if limit == Some(0) {
+            return Ok(Vec::new());
+        }
+        let filter = rule_id.map(str::to_string);
+        self.run_read(move |rtx| {
+            let Some(table) = open_opt_table(rtx, AUTOMATION_LOG_TABLE, "open automation_log")?
+            else {
+                return Ok(Vec::new());
+            };
+            let mut out = Vec::new();
+            for entry in table
+                .iter()
+                .map_err(|err| map_redb_storage_err(err, "iter automation_log"))?
+            {
+                let (_, v) =
+                    entry.map_err(|err| map_redb_storage_err(err, "read automation_log"))?;
+                let rec: AutomationLogRecord =
+                    decode_versioned(v.value(), GIT_STATE_CODEC_VERSION)?;
+                if filter.as_deref().is_none_or(|f| rec.rule_id == f) {
+                    out.push(rec);
+                }
+            }
+            out.sort_by(|a, b| {
+                b.finished_at
+                    .cmp(&a.finished_at)
+                    .then_with(|| a.id.cmp(&b.id))
+            });
+            if let Some(lim) = limit {
+                out.truncate(lim);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn append_source_call_log(&self, record: &SourceCallLogRecord) -> StorageResult<()> {
+        validate_source_call_log(record)?;
+        let rec = record.clone();
+        self.run_write_conditional(move |wtx| {
+            let mut table = wtx
+                .open_table(SOURCE_CALL_LOG_TABLE)
+                .map_err(|err| map_redb_table_err(err, "open source_call_log"))?;
+            if table
+                .get(rec.id.as_str())
+                .map_err(|err| map_redb_storage_err(err, "check duplicate source_call_log id"))?
+                .is_some()
+            {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: "duplicate source_call_log id".to_string(),
+                });
+            }
+            let bytes = encode_versioned(GIT_STATE_CODEC_VERSION, &rec)?;
+            table
+                .insert(rec.id.as_str(), bytes.as_slice())
+                .map_err(|err| map_redb_storage_err(err, "insert source_call_log"))?;
+            Ok((true, ()))
+        })
+        .await
+    }
+
+    async fn list_source_call_logs(
+        &self,
+        session_id: Option<&str>,
+        agent_run_id: Option<&str>,
+    ) -> StorageResult<Vec<SourceCallLogRecord>> {
+        if let Some(s) = session_id {
+            validate_non_empty_identifier(s, "source_call_log session_id")?;
+        }
+        if let Some(r) = agent_run_id {
+            validate_non_empty_identifier(r, "source_call_log agent_run_id")?;
+        }
+        let s_filter = session_id.map(str::to_string);
+        let r_filter = agent_run_id.map(str::to_string);
+        self.run_read(move |rtx| {
+            let Some(table) = open_opt_table(rtx, SOURCE_CALL_LOG_TABLE, "open source_call_log")?
+            else {
+                return Ok(Vec::new());
+            };
+            let mut out = Vec::new();
+            for entry in table
+                .iter()
+                .map_err(|err| map_redb_storage_err(err, "iter source_call_log"))?
+            {
+                let (_, v) =
+                    entry.map_err(|err| map_redb_storage_err(err, "read source_call_log"))?;
+                let rec: SourceCallLogRecord =
+                    decode_versioned(v.value(), GIT_STATE_CODEC_VERSION)?;
+                if s_filter.as_deref().is_none_or(|f| rec.session_id == f)
+                    && r_filter
+                        .as_deref()
+                        .is_none_or(|f| rec.agent_run_id.as_deref() == Some(f))
+                {
+                    out.push(rec);
+                }
+            }
+            out.sort_by(|a, b| {
+                a.created_at
+                    .cmp(&b.created_at)
+                    .then_with(|| a.id.cmp(&b.id))
+            });
+            Ok(out)
+        })
+        .await
+    }
+
+    // -------------------------------------------------------------------------
+    // RB-05b AC5: Bridge Two-Phase Publication (`prepared` -> `published`)
+    // -------------------------------------------------------------------------
+
+    async fn prepare_bridge_commit_publication(
+        &self,
+        operation_id: &str,
+        commit_oid: &str,
+    ) -> StorageResult<BridgePublicationRecord> {
+        validate_bridge_operation_id(operation_id)?;
+        validate_hex_oid(commit_oid, "agent_bridge_publication commit_oid")?;
+        let op_id = operation_id.to_string();
+        let oid = commit_oid.to_string();
+        self.run_write_conditional(move |wtx| {
+            let mut table = wtx
+                .open_table(AGENT_BRIDGE_PUBLICATION_TABLE)
+                .map_err(|err| map_redb_table_err(err, "open agent_bridge_publication"))?;
+            let existing: Option<BridgePublicationStoredRow> = match table
+                .get(op_id.as_str())
+                .map_err(|err| map_redb_storage_err(err, "read agent_bridge_publication"))?
+            {
+                Some(g) => Some(decode_versioned(g.value(), GIT_STATE_CODEC_VERSION)?),
+                None => None,
+            };
+            match existing {
+                Some(row) if row.commit_oid == oid => Ok((
+                    false,
+                    BridgePublicationRecord {
+                        operation_id: op_id,
+                        commit_oid: row.commit_oid,
+                        phase: row.phase,
+                    },
+                )),
+                Some(_) => Err(StorageBackendError::BackendInternal {
+                    detail: "bridge commit publication already bound to a different commit"
+                        .to_string(),
+                }),
+                None => {
+                    let stored = BridgePublicationStoredRow {
+                        commit_oid: oid.clone(),
+                        phase: BridgePublicationPhase::Prepared,
+                    };
+                    let bytes = encode_versioned(GIT_STATE_CODEC_VERSION, &stored)?;
+                    table
+                        .insert(op_id.as_str(), bytes.as_slice())
+                        .map_err(|err| {
+                            map_redb_storage_err(err, "insert prepared agent_bridge_publication")
+                        })?;
+                    Ok((
+                        true,
+                        BridgePublicationRecord {
+                            operation_id: op_id,
+                            commit_oid: oid,
+                            phase: BridgePublicationPhase::Prepared,
+                        },
+                    ))
+                }
+            }
+        })
+        .await
+    }
+
+    async fn publish_bridge_commit_publication(
+        &self,
+        operation_id: &str,
+        commit_oid: &str,
+    ) -> StorageResult<BridgePublicationRecord> {
+        validate_bridge_operation_id(operation_id)?;
+        validate_hex_oid(commit_oid, "agent_bridge_publication commit_oid")?;
+        let op_id = operation_id.to_string();
+        let oid = commit_oid.to_string();
+        self.run_write_conditional(move |wtx| {
+            let mut table = wtx
+                .open_table(AGENT_BRIDGE_PUBLICATION_TABLE)
+                .map_err(|err| map_redb_table_err(err, "open agent_bridge_publication"))?;
+            let existing: Option<BridgePublicationStoredRow> = match table
+                .get(op_id.as_str())
+                .map_err(|err| map_redb_storage_err(err, "read agent_bridge_publication"))?
+            {
+                Some(g) => Some(decode_versioned(g.value(), GIT_STATE_CODEC_VERSION)?),
+                None => None,
+            };
+            let row = existing.ok_or_else(|| StorageBackendError::BackendInternal {
+                detail: "cannot publish bridge commit publication before prepare phase".to_string(),
+            })?;
+            if row.commit_oid != oid {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: "bridge commit publication already bound to a different commit"
+                        .to_string(),
+                });
+            }
+            if row.phase == BridgePublicationPhase::Published {
+                return Ok((
+                    false,
+                    BridgePublicationRecord {
+                        operation_id: op_id,
+                        commit_oid: oid,
+                        phase: BridgePublicationPhase::Published,
+                    },
+                ));
+            }
+            let stored = BridgePublicationStoredRow {
+                commit_oid: oid.clone(),
+                phase: BridgePublicationPhase::Published,
+            };
+            let bytes = encode_versioned(GIT_STATE_CODEC_VERSION, &stored)?;
+            table
+                .insert(op_id.as_str(), bytes.as_slice())
+                .map_err(|err| map_redb_storage_err(err, "publish agent_bridge_publication"))?;
+            Ok((
+                true,
+                BridgePublicationRecord {
+                    operation_id: op_id,
+                    commit_oid: oid,
+                    phase: BridgePublicationPhase::Published,
+                },
+            ))
+        })
+        .await
+    }
+
+    async fn get_bridge_commit_publication(
+        &self,
+        operation_id: &str,
+    ) -> StorageResult<Option<BridgePublicationRecord>> {
+        validate_bridge_operation_id(operation_id)?;
+        let op_id = operation_id.to_string();
+        self.run_read(move |rtx| {
+            let Some(table) = open_opt_table(
+                rtx,
+                AGENT_BRIDGE_PUBLICATION_TABLE,
+                "open agent_bridge_publication",
+            )?
+            else {
+                return Ok(None);
+            };
+            let Some(g) = table
+                .get(op_id.as_str())
+                .map_err(|err| map_redb_storage_err(err, "get agent_bridge_publication"))?
+            else {
+                return Ok(None);
+            };
+            let stored: BridgePublicationStoredRow =
+                decode_versioned(g.value(), GIT_STATE_CODEC_VERSION)?;
+            Ok(Some(BridgePublicationRecord {
+                operation_id: op_id,
+                commit_oid: stored.commit_oid,
+                phase: stored.phase,
+            }))
+        })
+        .await
+    }
+
+    async fn prepare_bridge_index_publication(
+        &self,
+        operation_id: &str,
+        index_digest: &str,
+    ) -> StorageResult<BridgeIndexPublicationRecord> {
+        validate_bridge_operation_id(operation_id)?;
+        validate_non_empty_identifier(index_digest, "agent_bridge_index_publication index_digest")?;
+        let op_id = operation_id.to_string();
+        let digest = index_digest.to_string();
+        self.run_write_conditional(move |wtx| {
+            let mut table = wtx
+                .open_table(AGENT_BRIDGE_INDEX_PUBLICATION_TABLE)
+                .map_err(|err| map_redb_table_err(err, "open agent_bridge_index_publication"))?;
+            let existing: Option<BridgeIndexPublicationStoredRow> = match table
+                .get(op_id.as_str())
+                .map_err(|err| map_redb_storage_err(err, "read agent_bridge_index_publication"))?
+            {
+                Some(g) => Some(decode_versioned(g.value(), GIT_STATE_CODEC_VERSION)?),
+                None => None,
+            };
+            match existing {
+                Some(row) if row.index_digest == digest => Ok((
+                    false,
+                    BridgeIndexPublicationRecord {
+                        operation_id: op_id,
+                        index_digest: row.index_digest,
+                        phase: row.phase,
+                    },
+                )),
+                Some(_) => Err(StorageBackendError::BackendInternal {
+                    detail: "bridge index publication already bound to a different digest"
+                        .to_string(),
+                }),
+                None => {
+                    let stored = BridgeIndexPublicationStoredRow {
+                        index_digest: digest.clone(),
+                        phase: BridgePublicationPhase::Prepared,
+                    };
+                    let bytes = encode_versioned(GIT_STATE_CODEC_VERSION, &stored)?;
+                    table
+                        .insert(op_id.as_str(), bytes.as_slice())
+                        .map_err(|err| {
+                            map_redb_storage_err(
+                                err,
+                                "insert prepared agent_bridge_index_publication",
+                            )
+                        })?;
+                    Ok((
+                        true,
+                        BridgeIndexPublicationRecord {
+                            operation_id: op_id,
+                            index_digest: digest,
+                            phase: BridgePublicationPhase::Prepared,
+                        },
+                    ))
+                }
+            }
+        })
+        .await
+    }
+
+    async fn publish_bridge_index_publication(
+        &self,
+        operation_id: &str,
+    ) -> StorageResult<Option<BridgeIndexPublicationRecord>> {
+        validate_bridge_operation_id(operation_id)?;
+        let op_id = operation_id.to_string();
+        self.run_write_conditional(move |wtx| {
+            let mut table = wtx
+                .open_table(AGENT_BRIDGE_INDEX_PUBLICATION_TABLE)
+                .map_err(|err| map_redb_table_err(err, "open agent_bridge_index_publication"))?;
+            let existing: Option<BridgeIndexPublicationStoredRow> = match table
+                .get(op_id.as_str())
+                .map_err(|err| map_redb_storage_err(err, "read agent_bridge_index_publication"))?
+            {
+                Some(g) => Some(decode_versioned(g.value(), GIT_STATE_CODEC_VERSION)?),
+                None => None,
+            };
+            let Some(mut row) = existing else {
+                return Ok((false, None));
+            };
+            row.phase = BridgePublicationPhase::Published;
+            let bytes = encode_versioned(GIT_STATE_CODEC_VERSION, &row)?;
+            table
+                .insert(op_id.as_str(), bytes.as_slice())
+                .map_err(|err| {
+                    map_redb_storage_err(err, "publish agent_bridge_index_publication")
+                })?;
+            Ok((
+                true,
+                Some(BridgeIndexPublicationRecord {
+                    operation_id: op_id,
+                    index_digest: row.index_digest,
+                    phase: BridgePublicationPhase::Published,
+                }),
+            ))
+        })
+        .await
+    }
+
+    async fn get_bridge_index_publication(
+        &self,
+        operation_id: &str,
+    ) -> StorageResult<Option<BridgeIndexPublicationRecord>> {
+        validate_bridge_operation_id(operation_id)?;
+        let op_id = operation_id.to_string();
+        self.run_read(move |rtx| {
+            let Some(table) = open_opt_table(
+                rtx,
+                AGENT_BRIDGE_INDEX_PUBLICATION_TABLE,
+                "open agent_bridge_index_publication",
+            )?
+            else {
+                return Ok(None);
+            };
+            let Some(g) = table
+                .get(op_id.as_str())
+                .map_err(|err| map_redb_storage_err(err, "get agent_bridge_index_publication"))?
+            else {
+                return Ok(None);
+            };
+            let stored: BridgeIndexPublicationStoredRow =
+                decode_versioned(g.value(), GIT_STATE_CODEC_VERSION)?;
+            Ok(Some(BridgeIndexPublicationRecord {
+                operation_id: op_id,
+                index_digest: stored.index_digest,
+                phase: stored.phase,
+            }))
+        })
+        .await
+    }
+}
+
+fn ensure_ai_thread_exists_in_wtx(wtx: &WriteTransaction, thread_id: &str) -> StorageResult<()> {
+    let table = wtx
+        .open_table(AI_THREAD_TABLE)
+        .map_err(|err| map_redb_table_err(err, "open ai_thread"))?;
+    if table
+        .get(thread_id)
+        .map_err(|err| map_redb_storage_err(err, "check ai_thread parent"))?
+        .is_none()
+    {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "referenced ai_thread does not exist".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn ensure_memory_episode_exists_in_wtx(
+    wtx: &WriteTransaction,
+    episode_id: &str,
+) -> StorageResult<()> {
+    let table = wtx
+        .open_table(MEMORY_EPISODE_TABLE)
+        .map_err(|err| map_redb_table_err(err, "open memory_episode"))?;
+    if table
+        .get(episode_id)
+        .map_err(|err| map_redb_storage_err(err, "check memory_episode parent"))?
+        .is_none()
+    {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "referenced memory_episode does not exist".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn delete_str_pair_prefix(
+    wtx: &WriteTransaction,
+    def: TableDefinition<'static, (&'static str, &'static str), &'static [u8]>,
+    prefix: &str,
+    label: &'static str,
+) -> StorageResult<()> {
+    let mut table = wtx
+        .open_table(def)
+        .map_err(|err| map_redb_table_err(err, label))?;
+    let mut keys = Vec::new();
+    {
+        let range = table
+            .range((prefix, "")..)
+            .map_err(|err| map_redb_storage_err(err, label))?;
+        for entry in range {
+            let (k, _) = entry.map_err(|err| map_redb_storage_err(err, label))?;
+            let (p, second) = k.value();
+            if p != prefix {
+                break;
+            }
+            keys.push(second.to_string());
+        }
+    }
+    for second in keys {
+        let _ = table
+            .remove((prefix, second.as_str()))
+            .map_err(|err| map_redb_storage_err(err, label))?;
+    }
+    Ok(())
+}
+
+fn delete_by_thread_filter<T: serde::de::DeserializeOwned>(
+    wtx: &WriteTransaction,
+    def: TableDefinition<'static, &'static str, &'static [u8]>,
+    thread_id: &str,
+    get_thread: impl Fn(&T) -> &str,
+    label: &'static str,
+) -> StorageResult<()> {
+    let mut table = wtx
+        .open_table(def)
+        .map_err(|err| map_redb_table_err(err, label))?;
+    let mut keys = Vec::new();
+    {
+        for entry in table
+            .iter()
+            .map_err(|err| map_redb_storage_err(err, label))?
+        {
+            let (k, v) = entry.map_err(|err| map_redb_storage_err(err, label))?;
+            let row: T = decode_versioned(v.value(), GIT_STATE_CODEC_VERSION)?;
+            if get_thread(&row) == thread_id {
+                keys.push(k.value().to_string());
+            }
+        }
+    }
+    for key in keys {
+        let _ = table
+            .remove(key.as_str())
+            .map_err(|err| map_redb_storage_err(err, label))?;
+    }
+    Ok(())
+}
+
+fn clear_latest_for_thread<T: Serialize + serde::de::DeserializeOwned>(
+    table: &mut redb::Table<'_, &'static str, &'static [u8]>,
+    thread_id: &str,
+    keep_id: &str,
+    inspect: impl Fn(&T) -> (&str, &str, bool),
+    clear_flag: impl Fn(&mut T),
+    label: &'static str,
+) -> StorageResult<()> {
+    let mut to_update: Vec<(String, T)> = Vec::new();
+    {
+        for entry in table
+            .iter()
+            .map_err(|err| map_redb_storage_err(err, label))?
+        {
+            let (_, v) = entry.map_err(|err| map_redb_storage_err(err, label))?;
+            let mut row: T = decode_versioned(v.value(), GIT_STATE_CODEC_VERSION)?;
+            let (row_tid, row_id, is_latest) = inspect(&row);
+            if row_tid == thread_id && is_latest && row_id != keep_id {
+                let id_owned = row_id.to_string();
+                clear_flag(&mut row);
+                to_update.push((id_owned, row));
+            }
+        }
+    }
+    for (id, row) in to_update {
+        let b = encode_versioned(GIT_STATE_CODEC_VERSION, &row)?;
+        table
+            .insert(id.as_str(), b.as_slice())
+            .map_err(|err| map_redb_storage_err(err, label))?;
+    }
+    Ok(())
 }

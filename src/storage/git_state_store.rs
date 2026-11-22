@@ -28,7 +28,10 @@ use serde::{Deserialize, Serialize};
 use crate::storage::{
     backend::StorageBackendKind,
     error::{StorageBackendError, StorageResult},
-    git_store::{validate_hex_oid, validate_non_empty_identifier},
+    git_store::{
+        BridgePublicationPhase, BridgePublicationRecord, is_valid_bridge_operation_id,
+        validate_hex_oid, validate_non_empty_identifier,
+    },
 };
 
 #[cfg(feature = "storage-redb")]
@@ -51,6 +54,23 @@ pub const OP_HEAD_GENERATION_SENTINEL: &str = "__scope_generation__";
 /// Baseline `worktree_registry_capability` versions seeded by repository schema
 /// initialization (`2026072401`, `2026073005`, `2026101902`).
 pub const INITIAL_WORKTREE_REGISTRY_CAPABILITIES: [i64; 3] = [2, 3, 4];
+
+/// Static manifest of the 4 `ConfigStore` / `MetadataStore` repository source
+/// tables (`RB-03`).
+pub const CONFIG_STORE_REPO_SOURCE_TABLES: [&str; 4] =
+    ["schema_versions", "config", "config_kv", "metadata_kv"];
+
+/// Static manifest of the 7 `GitStore` core repository source tables
+/// (`RB-04` + `RB-04b`).
+pub const GIT_STORE_CORE_SOURCE_TABLES: [&str; 7] = [
+    "reference",
+    "reflog",
+    "notes",
+    "object_index",
+    "object_obliteration",
+    "revision_ordinal",
+    "revision_ordinal_meta",
+];
 
 /// Static manifest of the 21 workflow, worktree/workspace, OpLog v2, change
 /// lineage, and dirty/layer/sparse repository source tables implemented by
@@ -78,6 +98,78 @@ pub const RB05_WORKFLOW_STATE_SOURCE_TABLES: [&str; 21] = [
     "sparse_view",
     "sparse_view_meta",
 ];
+
+/// Static manifest of the 29 AI, memory, governance/audit, and bridge
+/// two-phase publication repository source tables completed in `RB-05b`
+/// (28 newly added to `GitStateStore` plus `agent_bridge_publication` shared
+/// with `GitStore`).
+pub const RB05B_AI_MEMORY_BRIDGE_SOURCE_TABLES: [&str; 29] = [
+    // 19 `ai_*` tables
+    "ai_thread",
+    "ai_thread_participant",
+    "ai_thread_intent",
+    "ai_thread_provider_metadata",
+    "ai_scheduler_state",
+    "ai_scheduler_plan_head",
+    "ai_scheduler_selected_plan",
+    "ai_live_context_window",
+    "ai_index_intent_plan",
+    "ai_index_intent_task",
+    "ai_index_plan_step_task",
+    "ai_index_task_run",
+    "ai_index_run_event",
+    "ai_index_run_patchset",
+    "ai_index_intent_context_frame",
+    "ai_validation_report",
+    "ai_risk_score_breakdown",
+    "ai_decision_proposal",
+    "ai_final_decision",
+    // 3 governance & audit tables
+    "automation_log",
+    "approved_permission",
+    "source_call_log",
+    // 5 `memory_*` projection tables
+    "memory_episode",
+    "memory_episode_evidence",
+    "memory_projection_state",
+    "memory_episode_path",
+    "memory_episode_search_doc",
+    // 2 bridge two-phase publication tables
+    "agent_bridge_publication",
+    "agent_bridge_index_publication",
+];
+
+/// The 7 retired repository tables explicitly excluded from the 61 active
+/// persistent repository source table manifest (`plan-20261121`清单 A).
+pub const RETIRED_REPOSITORY_SOURCE_TABLES: [&str; 7] = [
+    "legacy_operation",
+    "legacy_operation_parent",
+    "legacy_operation_view",
+    "legacy_operation_view_ref",
+    "legacy_operation_view_workspace",
+    "cherry_pick_state",
+    "revert_sequence",
+];
+
+/// Exact count of active persistent Repository source tables (`4 + 7 + 21 + 29 = 61`).
+pub const REPOSITORY_ACTIVE_SOURCE_TABLES_COUNT: usize = 61;
+
+/// Canonical same-transaction redb secondary index name for `memory_episode_path`
+/// lookups ordered by `(code_path, ended_at DESC, episode_id ASC)` (`RB-05b`).
+pub const MEMORY_BY_PATH_INDEX_NAME: &str = "MEMORY_BY_PATH";
+
+/// Returns the deduplicated, lexicographically sorted manifest of all 61 active
+/// persistent Repository source tables across `ConfigStore`, `GitStore`, and
+/// `GitStateStore`.
+#[must_use]
+pub fn repository_active_source_tables() -> Vec<&'static str> {
+    let mut set = BTreeSet::new();
+    set.extend(CONFIG_STORE_REPO_SOURCE_TABLES);
+    set.extend(GIT_STORE_CORE_SOURCE_TABLES);
+    set.extend(RB05_WORKFLOW_STATE_SOURCE_TABLES);
+    set.extend(RB05B_AI_MEMORY_BRIDGE_SOURCE_TABLES);
+    set.into_iter().collect()
+}
 
 // =============================================================================
 // Group 1: Sequencer / Workflow State (`sequence_state`, `rebase_state`, `bisect_state`)
@@ -628,6 +720,551 @@ pub struct SparseViewSnapshot {
 }
 
 // =============================================================================
+// Group 6 (`RB-05b` AC1): 19 `ai_*` Thread, Scheduler, Runtime-Contract & Index Tables
+// =============================================================================
+
+/// One row in `ai_thread`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiThreadRecord {
+    pub thread_id: String,
+    pub title: Option<String>,
+    pub owner_kind: String,
+    pub owner_id: String,
+    pub owner_display_name: Option<String>,
+    pub current_intent_id: Option<String>,
+    pub latest_intent_id: Option<String>,
+    pub metadata_json: Option<String>,
+    pub archived: bool,
+    pub version: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// One row in `ai_thread_participant`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiThreadParticipantRecord {
+    pub thread_id: String,
+    pub actor_kind: String,
+    pub actor_id: String,
+    pub actor_display_name: Option<String>,
+    pub role: String,
+    pub joined_at: i64,
+}
+
+/// One row in `ai_thread_intent`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiThreadIntentRecord {
+    pub thread_id: String,
+    pub intent_id: String,
+    pub ordinal: i64,
+    pub is_head: bool,
+    pub linked_at: i64,
+    pub link_reason: String,
+}
+
+/// One row in `ai_thread_provider_metadata`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiThreadProviderMetadataRecord {
+    pub thread_id: String,
+    pub legacy_session_id: Option<String>,
+    pub provider_thread_id: Option<String>,
+    pub provider_kind: Option<String>,
+    pub metadata_json: Option<String>,
+    pub updated_at: i64,
+}
+
+/// One row in `ai_scheduler_state`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiSchedulerStateRecord {
+    pub thread_id: String,
+    pub selected_plan_id: Option<String>,
+    pub active_task_id: Option<String>,
+    pub active_run_id: Option<String>,
+    pub metadata_json: Option<String>,
+    pub version: i64,
+    pub updated_at: i64,
+}
+
+/// One row in `ai_scheduler_plan_head`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiSchedulerPlanHeadRecord {
+    pub thread_id: String,
+    pub plan_id: String,
+    pub ordinal: i64,
+}
+
+/// One row in `ai_scheduler_selected_plan`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiSchedulerSelectedPlanRecord {
+    pub thread_id: String,
+    pub plan_id: String,
+    pub ordinal: i64,
+}
+
+/// One row in `ai_live_context_window`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiLiveContextWindowRecord {
+    pub thread_id: String,
+    pub context_frame_id: String,
+    pub position: i64,
+    pub source_kind: String,
+    pub pin_kind: Option<String>,
+    pub inserted_at: i64,
+}
+
+/// One row in `ai_index_intent_plan`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiIndexIntentPlanRecord {
+    pub intent_id: String,
+    pub plan_id: String,
+    pub created_at: i64,
+}
+
+/// One row in `ai_index_intent_task`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiIndexIntentTaskRecord {
+    pub intent_id: String,
+    pub task_id: String,
+    pub parent_task_id: Option<String>,
+    pub origin_step_id: Option<String>,
+    pub created_at: i64,
+}
+
+/// One row in `ai_index_plan_step_task`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiIndexPlanStepTaskRecord {
+    pub plan_id: String,
+    pub task_id: String,
+    pub step_id: String,
+    pub created_at: i64,
+}
+
+/// One row in `ai_index_task_run` (including additive `base_commit_ref` from `2026090701`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiIndexTaskRunRecord {
+    pub task_id: String,
+    pub run_id: String,
+    pub is_latest: bool,
+    pub created_at: i64,
+    pub base_commit_ref: Option<String>,
+}
+
+/// One row in `ai_index_run_event`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiIndexRunEventRecord {
+    pub run_id: String,
+    pub event_id: String,
+    pub event_kind: String,
+    pub is_latest: bool,
+    pub created_at: i64,
+}
+
+/// One row in `ai_index_run_patchset`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiIndexRunPatchsetRecord {
+    pub run_id: String,
+    pub patchset_id: String,
+    pub sequence: i64,
+    pub is_latest: bool,
+    pub created_at: i64,
+}
+
+/// One row in `ai_index_intent_context_frame`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiIndexIntentContextFrameRecord {
+    pub intent_id: String,
+    pub context_frame_id: String,
+    pub relation_kind: String,
+    pub created_at: i64,
+}
+
+/// One row in `ai_validation_report`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiValidationReportRecord {
+    pub report_id: String,
+    pub thread_id: String,
+    pub run_id: Option<String>,
+    pub policy_version: String,
+    pub stale: bool,
+    pub is_latest: bool,
+    pub summary_json: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// One row in `ai_risk_score_breakdown`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiRiskScoreBreakdownRecord {
+    pub breakdown_id: String,
+    pub thread_id: String,
+    pub validation_report_id: Option<String>,
+    pub policy_version: String,
+    pub stale: bool,
+    pub is_latest: bool,
+    pub summary_json: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// One row in `ai_decision_proposal`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiDecisionProposalRecord {
+    pub proposal_id: String,
+    pub thread_id: String,
+    pub validation_report_id: Option<String>,
+    pub risk_score_breakdown_id: Option<String>,
+    pub policy_version: String,
+    pub stale: bool,
+    pub is_latest: bool,
+    pub summary_json: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// One row in `ai_final_decision` (`2026053101`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiFinalDecisionRecord {
+    pub decision_id: String,
+    pub thread_id: String,
+    pub decision_proposal_id: Option<String>,
+    pub validation_report_id: Option<String>,
+    pub policy_version: String,
+    pub verdict: String,
+    pub stale: bool,
+    pub is_latest: bool,
+    pub summary_json: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+// =============================================================================
+// Group 7 (`RB-05b` AC2 & AC3): 5 `memory_*` Tables + `MEMORY_BY_PATH` Index
+// =============================================================================
+
+/// Storage spelling matching `memory_episode.source_kind` and `memory_projection_state.source_kind`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum MemorySourceKind {
+    Commit,
+    AgentSession,
+    AgentRun,
+    BridgeOperation,
+}
+
+impl MemorySourceKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Commit => "commit",
+            Self::AgentSession => "agent_session",
+            Self::AgentRun => "agent_run",
+            Self::BridgeOperation => "bridge_operation",
+        }
+    }
+
+    pub fn parse(raw: &str) -> StorageResult<Self> {
+        match raw {
+            "commit" => Ok(Self::Commit),
+            "agent_session" => Ok(Self::AgentSession),
+            "agent_run" => Ok(Self::AgentRun),
+            "bridge_operation" => Ok(Self::BridgeOperation),
+            _ => Err(StorageBackendError::BackendInternal {
+                detail: "invalid memory source_kind value".to_string(),
+            }),
+        }
+    }
+}
+
+/// Storage spelling matching `memory_episode.outcome`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum MemoryOutcome {
+    Succeeded,
+    Failed,
+    Aborted,
+    Partial,
+    Unknown,
+}
+
+impl MemoryOutcome {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Aborted => "aborted",
+            Self::Partial => "partial",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    pub fn parse(raw: &str) -> StorageResult<Self> {
+        match raw {
+            "succeeded" => Ok(Self::Succeeded),
+            "failed" => Ok(Self::Failed),
+            "aborted" => Ok(Self::Aborted),
+            "partial" => Ok(Self::Partial),
+            "unknown" => Ok(Self::Unknown),
+            _ => Err(StorageBackendError::BackendInternal {
+                detail: "invalid memory_episode outcome value".to_string(),
+            }),
+        }
+    }
+}
+
+/// Storage spelling matching `memory_episode_evidence.kind`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum MemoryEvidenceKind {
+    Commit,
+    Checkpoint,
+    ReviewRun,
+    Operation,
+}
+
+impl MemoryEvidenceKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Commit => "commit",
+            Self::Checkpoint => "checkpoint",
+            Self::ReviewRun => "review_run",
+            Self::Operation => "operation",
+        }
+    }
+
+    pub fn parse(raw: &str) -> StorageResult<Self> {
+        match raw {
+            "commit" => Ok(Self::Commit),
+            "checkpoint" => Ok(Self::Checkpoint),
+            "review_run" => Ok(Self::ReviewRun),
+            "operation" => Ok(Self::Operation),
+            _ => Err(StorageBackendError::BackendInternal {
+                detail: "invalid memory_episode_evidence kind value".to_string(),
+            }),
+        }
+    }
+}
+
+/// Storage spelling matching `memory_episode_evidence.link_confidence`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum MemoryLinkConfidence {
+    Identity,
+    Operation,
+    Temporal,
+}
+
+impl MemoryLinkConfidence {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Identity => "identity",
+            Self::Operation => "operation",
+            Self::Temporal => "temporal",
+        }
+    }
+
+    pub fn parse(raw: &str) -> StorageResult<Self> {
+        match raw {
+            "identity" => Ok(Self::Identity),
+            "operation" => Ok(Self::Operation),
+            "temporal" => Ok(Self::Temporal),
+            _ => Err(StorageBackendError::BackendInternal {
+                detail: "invalid memory_episode_evidence link_confidence value".to_string(),
+            }),
+        }
+    }
+}
+
+/// Storage spelling matching `memory_episode_evidence.resolution_status`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum MemoryResolutionStatus {
+    Resolved,
+    Unresolved,
+}
+
+impl MemoryResolutionStatus {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Resolved => "resolved",
+            Self::Unresolved => "unresolved",
+        }
+    }
+
+    pub fn parse(raw: &str) -> StorageResult<Self> {
+        match raw {
+            "resolved" => Ok(Self::Resolved),
+            "unresolved" => Ok(Self::Unresolved),
+            _ => Err(StorageBackendError::BackendInternal {
+                detail: "invalid memory_episode_evidence resolution_status value".to_string(),
+            }),
+        }
+    }
+}
+
+/// Storage spelling matching `memory_episode_path.change_kind`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum MemoryPathChangeKind {
+    Added,
+    Modified,
+    Deleted,
+    Renamed,
+}
+
+impl MemoryPathChangeKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Added => "added",
+            Self::Modified => "modified",
+            Self::Deleted => "deleted",
+            Self::Renamed => "renamed",
+        }
+    }
+
+    pub fn parse(raw: &str) -> StorageResult<Self> {
+        match raw {
+            "added" => Ok(Self::Added),
+            "modified" => Ok(Self::Modified),
+            "deleted" => Ok(Self::Deleted),
+            "renamed" => Ok(Self::Renamed),
+            _ => Err(StorageBackendError::BackendInternal {
+                detail: "invalid memory_episode_path change_kind value".to_string(),
+            }),
+        }
+    }
+}
+
+/// One row in `memory_episode` (`2026092901`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryEpisodeRecord {
+    pub episode_id: String,
+    pub repo_id: String,
+    pub source_kind: MemorySourceKind,
+    pub source_key: String,
+    pub outcome: MemoryOutcome,
+    pub actor: Option<String>,
+    pub started_at: i64,
+    pub ended_at: i64,
+    pub anchor_commit: Option<String>,
+    pub change_id: Option<String>,
+    pub title: String,
+    pub body: String,
+    pub content_digest: String,
+    pub producer: String,
+    pub rules_version: i64,
+}
+
+/// One row in `memory_episode_evidence` (`2026092901`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryEpisodeEvidenceRecord {
+    pub episode_id: String,
+    pub ordinal: i64,
+    pub kind: MemoryEvidenceKind,
+    pub ref_id: String,
+    pub link_confidence: MemoryLinkConfidence,
+    pub resolution_status: MemoryResolutionStatus,
+}
+
+/// One row in `memory_projection_state` (`2026092901`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryProjectionStateRecord {
+    pub repo_id: String,
+    pub source_kind: MemorySourceKind,
+    pub cursor_json: String,
+    pub fingerprint: String,
+    pub rules_version: i64,
+    pub schema_version: i64,
+    pub horizon_truncated: bool,
+    pub revoked_count: i64,
+    pub aged_out_count: i64,
+    pub rebuilt_at: i64,
+}
+
+/// One row in `memory_episode_path` (`2026092902`).
+///
+/// `code_path` is raw Git path bytes (non-empty and must not start with `b'/'`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryEpisodePathRecord {
+    pub episode_id: String,
+    pub code_path: Vec<u8>,
+    pub change_kind: MemoryPathChangeKind,
+    pub blob_oid_at_end: Option<String>,
+    pub ended_at: i64,
+}
+
+/// One row in `memory_episode_search_doc` (`2026092902`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryEpisodeSearchDocRecord {
+    pub rowid: i64,
+    pub episode_id: String,
+    pub title: String,
+    pub body: String,
+    pub paths_text: String,
+}
+
+// =============================================================================
+// Group 8 (`RB-05b` AC4): Governance & Audit (`approved_permission`, `automation_log`, `source_call_log`)
+// =============================================================================
+
+/// One row in `approved_permission` (`2026050601` + `2026081301`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovedPermissionRecord {
+    pub project_id: String,
+    pub permission: String,
+    pub pattern: String,
+    pub created_at: i64,
+    pub source_worktree_id: String,
+    pub source_session_id: String,
+    pub source_workspace_id: String,
+}
+
+/// One row in `automation_log` (`2026050301`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutomationLogRecord {
+    pub id: String,
+    pub rule_id: String,
+    pub trigger_kind: String,
+    pub action_kind: String,
+    pub status: String,
+    pub message: String,
+    pub started_at: String,
+    pub finished_at: String,
+    pub details_json: String,
+}
+
+/// One row in `source_call_log` (`2026052301` + `2026060201`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceCallLogRecord {
+    pub id: String,
+    pub session_id: String,
+    pub source_slug: String,
+    pub tool_name: String,
+    pub registered_tool_name: String,
+    pub tool_call_id: String,
+    pub credential_ref: Option<String>,
+    pub latency_ms: Option<i64>,
+    pub input_bytes: i64,
+    pub output_bytes: i64,
+    pub cost_estimate_micros: Option<i64>,
+    pub approval_decision: Option<String>,
+    pub state_namespace: String,
+    pub success: bool,
+    pub created_at: String,
+    pub agent_run_id: Option<String>,
+}
+
+// =============================================================================
+// Group 9 (`RB-05b` AC5): Bridge Two-Phase Index Publication
+// =============================================================================
+
+/// One row in `agent_bridge_index_publication` (`agent_bridge/publication.rs:36`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BridgeIndexPublicationRecord {
+    pub operation_id: String,
+    pub index_digest: String,
+    pub phase: BridgePublicationPhase,
+}
+
+// =============================================================================
 // Validation helpers shared by SQLite and redb implementations
 // =============================================================================
 
@@ -907,6 +1544,345 @@ pub(crate) fn validate_layer_path_record(rec: &LayerPathRecord) -> StorageResult
     validate_non_empty_identifier(&rec.materialized_at, "layer_path materialized_at")
 }
 
+pub(crate) fn validate_ai_thread(rec: &AiThreadRecord) -> StorageResult<()> {
+    validate_non_empty_identifier(&rec.thread_id, "ai_thread thread_id")?;
+    validate_opt_no_nul(rec.title.as_deref(), "ai_thread title")?;
+    validate_non_empty_identifier(&rec.owner_kind, "ai_thread owner_kind")?;
+    validate_non_empty_identifier(&rec.owner_id, "ai_thread owner_id")?;
+    validate_opt_no_nul(
+        rec.owner_display_name.as_deref(),
+        "ai_thread owner_display_name",
+    )?;
+    validate_opt_no_nul(
+        rec.current_intent_id.as_deref(),
+        "ai_thread current_intent_id",
+    )?;
+    validate_opt_no_nul(
+        rec.latest_intent_id.as_deref(),
+        "ai_thread latest_intent_id",
+    )?;
+    validate_opt_no_nul(rec.metadata_json.as_deref(), "ai_thread metadata_json")
+}
+
+pub(crate) fn validate_ai_thread_participant(rec: &AiThreadParticipantRecord) -> StorageResult<()> {
+    validate_non_empty_identifier(&rec.thread_id, "ai_thread_participant thread_id")?;
+    validate_non_empty_identifier(&rec.actor_kind, "ai_thread_participant actor_kind")?;
+    validate_non_empty_identifier(&rec.actor_id, "ai_thread_participant actor_id")?;
+    validate_opt_no_nul(
+        rec.actor_display_name.as_deref(),
+        "ai_thread_participant actor_display_name",
+    )?;
+    validate_non_empty_identifier(&rec.role, "ai_thread_participant role")
+}
+
+pub(crate) fn validate_ai_thread_intent(rec: &AiThreadIntentRecord) -> StorageResult<()> {
+    validate_non_empty_identifier(&rec.thread_id, "ai_thread_intent thread_id")?;
+    validate_non_empty_identifier(&rec.intent_id, "ai_thread_intent intent_id")?;
+    validate_non_empty_identifier(&rec.link_reason, "ai_thread_intent link_reason")
+}
+
+pub(crate) fn validate_ai_thread_provider_metadata(
+    rec: &AiThreadProviderMetadataRecord,
+) -> StorageResult<()> {
+    validate_non_empty_identifier(&rec.thread_id, "ai_thread_provider_metadata thread_id")?;
+    validate_opt_no_nul(
+        rec.legacy_session_id.as_deref(),
+        "ai_thread_provider_metadata legacy_session_id",
+    )?;
+    validate_opt_no_nul(
+        rec.provider_thread_id.as_deref(),
+        "ai_thread_provider_metadata provider_thread_id",
+    )?;
+    validate_opt_no_nul(
+        rec.provider_kind.as_deref(),
+        "ai_thread_provider_metadata provider_kind",
+    )?;
+    validate_opt_no_nul(
+        rec.metadata_json.as_deref(),
+        "ai_thread_provider_metadata metadata_json",
+    )
+}
+
+pub(crate) fn validate_ai_scheduler_state(rec: &AiSchedulerStateRecord) -> StorageResult<()> {
+    validate_non_empty_identifier(&rec.thread_id, "ai_scheduler_state thread_id")?;
+    validate_opt_no_nul(
+        rec.selected_plan_id.as_deref(),
+        "ai_scheduler_state selected_plan_id",
+    )?;
+    validate_opt_no_nul(
+        rec.active_task_id.as_deref(),
+        "ai_scheduler_state active_task_id",
+    )?;
+    validate_opt_no_nul(
+        rec.active_run_id.as_deref(),
+        "ai_scheduler_state active_run_id",
+    )?;
+    validate_opt_no_nul(
+        rec.metadata_json.as_deref(),
+        "ai_scheduler_state metadata_json",
+    )
+}
+
+pub(crate) fn validate_ai_scheduler_plan_head(
+    rec: &AiSchedulerPlanHeadRecord,
+) -> StorageResult<()> {
+    validate_non_empty_identifier(&rec.thread_id, "ai_scheduler_plan_head thread_id")?;
+    validate_non_empty_identifier(&rec.plan_id, "ai_scheduler_plan_head plan_id")
+}
+
+pub(crate) fn validate_ai_scheduler_selected_plan(
+    rec: &AiSchedulerSelectedPlanRecord,
+) -> StorageResult<()> {
+    validate_non_empty_identifier(&rec.thread_id, "ai_scheduler_selected_plan thread_id")?;
+    validate_non_empty_identifier(&rec.plan_id, "ai_scheduler_selected_plan plan_id")
+}
+
+pub(crate) fn validate_ai_live_context_window(
+    rec: &AiLiveContextWindowRecord,
+) -> StorageResult<()> {
+    validate_non_empty_identifier(&rec.thread_id, "ai_live_context_window thread_id")?;
+    validate_non_empty_identifier(
+        &rec.context_frame_id,
+        "ai_live_context_window context_frame_id",
+    )?;
+    validate_non_empty_identifier(&rec.source_kind, "ai_live_context_window source_kind")?;
+    validate_opt_no_nul(rec.pin_kind.as_deref(), "ai_live_context_window pin_kind")
+}
+
+pub(crate) fn validate_ai_index_intent_plan(rec: &AiIndexIntentPlanRecord) -> StorageResult<()> {
+    validate_non_empty_identifier(&rec.intent_id, "ai_index_intent_plan intent_id")?;
+    validate_non_empty_identifier(&rec.plan_id, "ai_index_intent_plan plan_id")
+}
+
+pub(crate) fn validate_ai_index_intent_task(rec: &AiIndexIntentTaskRecord) -> StorageResult<()> {
+    validate_non_empty_identifier(&rec.intent_id, "ai_index_intent_task intent_id")?;
+    validate_non_empty_identifier(&rec.task_id, "ai_index_intent_task task_id")?;
+    validate_opt_no_nul(
+        rec.parent_task_id.as_deref(),
+        "ai_index_intent_task parent_task_id",
+    )?;
+    validate_opt_no_nul(
+        rec.origin_step_id.as_deref(),
+        "ai_index_intent_task origin_step_id",
+    )
+}
+
+pub(crate) fn validate_ai_index_plan_step_task(
+    rec: &AiIndexPlanStepTaskRecord,
+) -> StorageResult<()> {
+    validate_non_empty_identifier(&rec.plan_id, "ai_index_plan_step_task plan_id")?;
+    validate_non_empty_identifier(&rec.task_id, "ai_index_plan_step_task task_id")?;
+    validate_non_empty_identifier(&rec.step_id, "ai_index_plan_step_task step_id")
+}
+
+pub(crate) fn validate_ai_index_task_run(rec: &AiIndexTaskRunRecord) -> StorageResult<()> {
+    validate_non_empty_identifier(&rec.task_id, "ai_index_task_run task_id")?;
+    validate_non_empty_identifier(&rec.run_id, "ai_index_task_run run_id")?;
+    validate_opt_no_nul(
+        rec.base_commit_ref.as_deref(),
+        "ai_index_task_run base_commit_ref",
+    )
+}
+
+pub(crate) fn validate_ai_index_run_event(rec: &AiIndexRunEventRecord) -> StorageResult<()> {
+    validate_non_empty_identifier(&rec.run_id, "ai_index_run_event run_id")?;
+    validate_non_empty_identifier(&rec.event_id, "ai_index_run_event event_id")?;
+    validate_non_empty_identifier(&rec.event_kind, "ai_index_run_event event_kind")
+}
+
+pub(crate) fn validate_ai_index_run_patchset(rec: &AiIndexRunPatchsetRecord) -> StorageResult<()> {
+    validate_non_empty_identifier(&rec.run_id, "ai_index_run_patchset run_id")?;
+    validate_non_empty_identifier(&rec.patchset_id, "ai_index_run_patchset patchset_id")
+}
+
+pub(crate) fn validate_ai_index_intent_context_frame(
+    rec: &AiIndexIntentContextFrameRecord,
+) -> StorageResult<()> {
+    validate_non_empty_identifier(&rec.intent_id, "ai_index_intent_context_frame intent_id")?;
+    validate_non_empty_identifier(
+        &rec.context_frame_id,
+        "ai_index_intent_context_frame context_frame_id",
+    )?;
+    validate_non_empty_identifier(
+        &rec.relation_kind,
+        "ai_index_intent_context_frame relation_kind",
+    )
+}
+
+pub(crate) fn validate_ai_validation_report(rec: &AiValidationReportRecord) -> StorageResult<()> {
+    validate_non_empty_identifier(&rec.report_id, "ai_validation_report report_id")?;
+    validate_non_empty_identifier(&rec.thread_id, "ai_validation_report thread_id")?;
+    validate_opt_no_nul(rec.run_id.as_deref(), "ai_validation_report run_id")?;
+    validate_non_empty_identifier(&rec.policy_version, "ai_validation_report policy_version")?;
+    validate_no_nul(&rec.summary_json, "ai_validation_report summary_json")
+}
+
+pub(crate) fn validate_ai_risk_score_breakdown(
+    rec: &AiRiskScoreBreakdownRecord,
+) -> StorageResult<()> {
+    validate_non_empty_identifier(&rec.breakdown_id, "ai_risk_score_breakdown breakdown_id")?;
+    validate_non_empty_identifier(&rec.thread_id, "ai_risk_score_breakdown thread_id")?;
+    validate_opt_no_nul(
+        rec.validation_report_id.as_deref(),
+        "ai_risk_score_breakdown validation_report_id",
+    )?;
+    validate_non_empty_identifier(
+        &rec.policy_version,
+        "ai_risk_score_breakdown policy_version",
+    )?;
+    validate_no_nul(&rec.summary_json, "ai_risk_score_breakdown summary_json")
+}
+
+pub(crate) fn validate_ai_decision_proposal(rec: &AiDecisionProposalRecord) -> StorageResult<()> {
+    validate_non_empty_identifier(&rec.proposal_id, "ai_decision_proposal proposal_id")?;
+    validate_non_empty_identifier(&rec.thread_id, "ai_decision_proposal thread_id")?;
+    validate_opt_no_nul(
+        rec.validation_report_id.as_deref(),
+        "ai_decision_proposal validation_report_id",
+    )?;
+    validate_opt_no_nul(
+        rec.risk_score_breakdown_id.as_deref(),
+        "ai_decision_proposal risk_score_breakdown_id",
+    )?;
+    validate_non_empty_identifier(&rec.policy_version, "ai_decision_proposal policy_version")?;
+    validate_no_nul(&rec.summary_json, "ai_decision_proposal summary_json")
+}
+
+pub(crate) fn validate_ai_final_decision(rec: &AiFinalDecisionRecord) -> StorageResult<()> {
+    validate_non_empty_identifier(&rec.decision_id, "ai_final_decision decision_id")?;
+    validate_non_empty_identifier(&rec.thread_id, "ai_final_decision thread_id")?;
+    validate_opt_no_nul(
+        rec.decision_proposal_id.as_deref(),
+        "ai_final_decision decision_proposal_id",
+    )?;
+    validate_opt_no_nul(
+        rec.validation_report_id.as_deref(),
+        "ai_final_decision validation_report_id",
+    )?;
+    validate_non_empty_identifier(&rec.policy_version, "ai_final_decision policy_version")?;
+    validate_non_empty_identifier(&rec.verdict, "ai_final_decision verdict")?;
+    validate_no_nul(&rec.summary_json, "ai_final_decision summary_json")
+}
+
+pub(crate) fn validate_memory_episode(rec: &MemoryEpisodeRecord) -> StorageResult<()> {
+    validate_non_empty_identifier(&rec.episode_id, "memory_episode episode_id")?;
+    validate_non_empty_identifier(&rec.repo_id, "memory_episode repo_id")?;
+    validate_non_empty_identifier(&rec.source_key, "memory_episode source_key")?;
+    validate_opt_no_nul(rec.actor.as_deref(), "memory_episode actor")?;
+    validate_opt_hex_oid(rec.anchor_commit.as_deref(), "memory_episode anchor_commit")?;
+    validate_opt_no_nul(rec.change_id.as_deref(), "memory_episode change_id")?;
+    validate_no_nul(&rec.title, "memory_episode title")?;
+    validate_no_nul(&rec.body, "memory_episode body")?;
+    validate_non_empty_identifier(&rec.content_digest, "memory_episode content_digest")?;
+    validate_non_empty_identifier(&rec.producer, "memory_episode producer")
+}
+
+pub(crate) fn validate_memory_episode_evidence(
+    rec: &MemoryEpisodeEvidenceRecord,
+) -> StorageResult<()> {
+    validate_non_empty_identifier(&rec.episode_id, "memory_episode_evidence episode_id")?;
+    validate_non_empty_identifier(&rec.ref_id, "memory_episode_evidence ref_id")
+}
+
+pub(crate) fn validate_memory_projection_state(
+    rec: &MemoryProjectionStateRecord,
+) -> StorageResult<()> {
+    validate_non_empty_identifier(&rec.repo_id, "memory_projection_state repo_id")?;
+    validate_no_nul(&rec.cursor_json, "memory_projection_state cursor_json")?;
+    validate_non_empty_identifier(&rec.fingerprint, "memory_projection_state fingerprint")
+}
+
+pub(crate) fn validate_memory_code_path(code_path: &[u8]) -> StorageResult<()> {
+    if code_path.is_empty() || code_path[0] == b'/' {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "memory_episode_path code_path must be non-empty and relative (must not start with '/')"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_memory_episode_path(rec: &MemoryEpisodePathRecord) -> StorageResult<()> {
+    validate_non_empty_identifier(&rec.episode_id, "memory_episode_path episode_id")?;
+    validate_memory_code_path(&rec.code_path)?;
+    validate_opt_hex_oid(
+        rec.blob_oid_at_end.as_deref(),
+        "memory_episode_path blob_oid_at_end",
+    )
+}
+
+pub(crate) fn validate_approved_permission(rec: &ApprovedPermissionRecord) -> StorageResult<()> {
+    validate_non_empty_identifier(&rec.project_id, "approved_permission project_id")?;
+    validate_non_empty_identifier(&rec.permission, "approved_permission permission")?;
+    validate_non_empty_identifier(&rec.pattern, "approved_permission pattern")?;
+    validate_no_nul(
+        &rec.source_worktree_id,
+        "approved_permission source_worktree_id",
+    )?;
+    validate_no_nul(
+        &rec.source_session_id,
+        "approved_permission source_session_id",
+    )?;
+    validate_no_nul(
+        &rec.source_workspace_id,
+        "approved_permission source_workspace_id",
+    )
+}
+
+pub(crate) fn validate_automation_log(rec: &AutomationLogRecord) -> StorageResult<()> {
+    validate_non_empty_identifier(&rec.id, "automation_log id")?;
+    validate_non_empty_identifier(&rec.rule_id, "automation_log rule_id")?;
+    validate_non_empty_identifier(&rec.trigger_kind, "automation_log trigger_kind")?;
+    validate_non_empty_identifier(&rec.action_kind, "automation_log action_kind")?;
+    validate_non_empty_identifier(&rec.status, "automation_log status")?;
+    validate_no_nul(&rec.message, "automation_log message")?;
+    validate_non_empty_identifier(&rec.started_at, "automation_log started_at")?;
+    validate_non_empty_identifier(&rec.finished_at, "automation_log finished_at")?;
+    validate_no_nul(&rec.details_json, "automation_log details_json")
+}
+
+pub(crate) fn validate_source_call_log(rec: &SourceCallLogRecord) -> StorageResult<()> {
+    validate_non_empty_identifier(&rec.id, "source_call_log id")?;
+    validate_non_empty_identifier(&rec.session_id, "source_call_log session_id")?;
+    validate_non_empty_identifier(&rec.source_slug, "source_call_log source_slug")?;
+    validate_non_empty_identifier(&rec.tool_name, "source_call_log tool_name")?;
+    validate_non_empty_identifier(
+        &rec.registered_tool_name,
+        "source_call_log registered_tool_name",
+    )?;
+    validate_non_empty_identifier(&rec.tool_call_id, "source_call_log tool_call_id")?;
+    validate_opt_no_nul(
+        rec.credential_ref.as_deref(),
+        "source_call_log credential_ref",
+    )?;
+    validate_opt_no_nul(
+        rec.approval_decision.as_deref(),
+        "source_call_log approval_decision",
+    )?;
+    validate_non_empty_identifier(&rec.state_namespace, "source_call_log state_namespace")?;
+    validate_non_empty_identifier(&rec.created_at, "source_call_log created_at")?;
+    validate_opt_no_nul(rec.agent_run_id.as_deref(), "source_call_log agent_run_id")
+}
+
+pub(crate) fn validate_bridge_operation_id(operation_id: &str) -> StorageResult<()> {
+    if !is_valid_bridge_operation_id(operation_id) {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "bridge publication operation_id is empty or contains invalid characters"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Order-reversing bijection `i64 -> u64` so ascending B-tree iteration over
+/// `(code_path, invert_ended_at(ended_at), episode_id)` visits `ended_at DESC,
+/// episode_id ASC` without overflow even at `i64::MIN` / `i64::MAX`.
+#[cfg(feature = "storage-redb")]
+#[must_use]
+pub(crate) const fn invert_ended_at(ts: i64) -> u64 {
+    !((ts as u64) ^ (1u64 << 63))
+}
+
 // =============================================================================
 // Object-Safe `GitStateStore` Trait
 // =============================================================================
@@ -1164,6 +2140,304 @@ pub trait GitStateStore: Send + Sync + fmt::Debug {
     async fn get_sparse_view(&self, worktree_id: &str)
     -> StorageResult<Option<SparseViewSnapshot>>;
     async fn clear_sparse_view(&self, worktree_id: &str) -> StorageResult<()>;
+
+    // -------------------------------------------------------------------------
+    // RB-05b AC1: 19 `ai_*` Thread, Scheduler, Runtime-Contract & Index Tables
+    // -------------------------------------------------------------------------
+
+    async fn upsert_ai_thread(&self, record: &AiThreadRecord) -> StorageResult<()>;
+    async fn get_ai_thread(&self, thread_id: &str) -> StorageResult<Option<AiThreadRecord>>;
+    async fn list_ai_threads(
+        &self,
+        archived_filter: Option<bool>,
+    ) -> StorageResult<Vec<AiThreadRecord>>;
+    async fn delete_ai_thread(&self, thread_id: &str) -> StorageResult<bool>;
+
+    async fn upsert_ai_thread_participant(
+        &self,
+        record: &AiThreadParticipantRecord,
+    ) -> StorageResult<()>;
+    async fn list_ai_thread_participants(
+        &self,
+        thread_id: &str,
+    ) -> StorageResult<Vec<AiThreadParticipantRecord>>;
+
+    async fn upsert_ai_thread_intent(&self, record: &AiThreadIntentRecord) -> StorageResult<()>;
+    async fn list_ai_thread_intents(
+        &self,
+        thread_id: &str,
+    ) -> StorageResult<Vec<AiThreadIntentRecord>>;
+
+    async fn upsert_ai_thread_provider_metadata(
+        &self,
+        record: &AiThreadProviderMetadataRecord,
+    ) -> StorageResult<()>;
+    async fn get_ai_thread_provider_metadata(
+        &self,
+        thread_id: &str,
+    ) -> StorageResult<Option<AiThreadProviderMetadataRecord>>;
+
+    async fn upsert_ai_scheduler_state(&self, record: &AiSchedulerStateRecord)
+    -> StorageResult<()>;
+    async fn get_ai_scheduler_state(
+        &self,
+        thread_id: &str,
+    ) -> StorageResult<Option<AiSchedulerStateRecord>>;
+
+    async fn replace_ai_scheduler_plan_heads(
+        &self,
+        thread_id: &str,
+        heads: &[AiSchedulerPlanHeadRecord],
+    ) -> StorageResult<()>;
+    async fn list_ai_scheduler_plan_heads(
+        &self,
+        thread_id: &str,
+    ) -> StorageResult<Vec<AiSchedulerPlanHeadRecord>>;
+
+    async fn replace_ai_scheduler_selected_plans(
+        &self,
+        thread_id: &str,
+        plans: &[AiSchedulerSelectedPlanRecord],
+    ) -> StorageResult<()>;
+    async fn list_ai_scheduler_selected_plans(
+        &self,
+        thread_id: &str,
+    ) -> StorageResult<Vec<AiSchedulerSelectedPlanRecord>>;
+
+    async fn replace_ai_live_context_window(
+        &self,
+        thread_id: &str,
+        entries: &[AiLiveContextWindowRecord],
+    ) -> StorageResult<()>;
+    async fn list_ai_live_context_window(
+        &self,
+        thread_id: &str,
+    ) -> StorageResult<Vec<AiLiveContextWindowRecord>>;
+
+    async fn upsert_ai_index_intent_plan(
+        &self,
+        record: &AiIndexIntentPlanRecord,
+    ) -> StorageResult<()>;
+    async fn list_ai_index_intent_plans(
+        &self,
+        intent_id: &str,
+    ) -> StorageResult<Vec<AiIndexIntentPlanRecord>>;
+
+    async fn upsert_ai_index_intent_task(
+        &self,
+        record: &AiIndexIntentTaskRecord,
+    ) -> StorageResult<()>;
+    async fn list_ai_index_intent_tasks(
+        &self,
+        intent_id: &str,
+    ) -> StorageResult<Vec<AiIndexIntentTaskRecord>>;
+
+    async fn upsert_ai_index_plan_step_task(
+        &self,
+        record: &AiIndexPlanStepTaskRecord,
+    ) -> StorageResult<()>;
+    async fn list_ai_index_plan_step_tasks(
+        &self,
+        plan_id: &str,
+    ) -> StorageResult<Vec<AiIndexPlanStepTaskRecord>>;
+
+    async fn upsert_ai_index_task_run(&self, record: &AiIndexTaskRunRecord) -> StorageResult<()>;
+    async fn list_ai_index_task_runs(
+        &self,
+        task_id: &str,
+    ) -> StorageResult<Vec<AiIndexTaskRunRecord>>;
+
+    async fn upsert_ai_index_run_event(&self, record: &AiIndexRunEventRecord) -> StorageResult<()>;
+    async fn list_ai_index_run_events(
+        &self,
+        run_id: &str,
+    ) -> StorageResult<Vec<AiIndexRunEventRecord>>;
+
+    async fn upsert_ai_index_run_patchset(
+        &self,
+        record: &AiIndexRunPatchsetRecord,
+    ) -> StorageResult<()>;
+    async fn list_ai_index_run_patchsets(
+        &self,
+        run_id: &str,
+    ) -> StorageResult<Vec<AiIndexRunPatchsetRecord>>;
+
+    async fn upsert_ai_index_intent_context_frame(
+        &self,
+        record: &AiIndexIntentContextFrameRecord,
+    ) -> StorageResult<()>;
+    async fn list_ai_index_intent_context_frames(
+        &self,
+        intent_id: &str,
+    ) -> StorageResult<Vec<AiIndexIntentContextFrameRecord>>;
+
+    async fn upsert_ai_validation_report(
+        &self,
+        record: &AiValidationReportRecord,
+    ) -> StorageResult<()>;
+    async fn list_ai_validation_reports(
+        &self,
+        thread_id: &str,
+    ) -> StorageResult<Vec<AiValidationReportRecord>>;
+
+    async fn upsert_ai_risk_score_breakdown(
+        &self,
+        record: &AiRiskScoreBreakdownRecord,
+    ) -> StorageResult<()>;
+    async fn list_ai_risk_score_breakdowns(
+        &self,
+        thread_id: &str,
+    ) -> StorageResult<Vec<AiRiskScoreBreakdownRecord>>;
+
+    async fn upsert_ai_decision_proposal(
+        &self,
+        record: &AiDecisionProposalRecord,
+    ) -> StorageResult<()>;
+    async fn list_ai_decision_proposals(
+        &self,
+        thread_id: &str,
+    ) -> StorageResult<Vec<AiDecisionProposalRecord>>;
+
+    async fn upsert_ai_final_decision(&self, record: &AiFinalDecisionRecord) -> StorageResult<()>;
+    async fn list_ai_final_decisions(
+        &self,
+        thread_id: &str,
+    ) -> StorageResult<Vec<AiFinalDecisionRecord>>;
+
+    // -------------------------------------------------------------------------
+    // RB-05b AC2 & AC3: 5 `memory_*` Tables + `MEMORY_BY_PATH` Secondary Index
+    // -------------------------------------------------------------------------
+
+    async fn upsert_memory_episode(&self, record: &MemoryEpisodeRecord) -> StorageResult<()>;
+    async fn get_memory_episode(
+        &self,
+        episode_id: &str,
+    ) -> StorageResult<Option<MemoryEpisodeRecord>>;
+    async fn list_memory_episodes(&self, repo_id: &str) -> StorageResult<Vec<MemoryEpisodeRecord>>;
+    async fn delete_memory_episode(&self, episode_id: &str) -> StorageResult<bool>;
+
+    async fn replace_memory_episode_evidence(
+        &self,
+        episode_id: &str,
+        evidence: &[MemoryEpisodeEvidenceRecord],
+    ) -> StorageResult<()>;
+    async fn list_memory_episode_evidence(
+        &self,
+        episode_id: &str,
+    ) -> StorageResult<Vec<MemoryEpisodeEvidenceRecord>>;
+
+    async fn upsert_memory_projection_state(
+        &self,
+        record: &MemoryProjectionStateRecord,
+    ) -> StorageResult<()>;
+    async fn get_memory_projection_state(
+        &self,
+        repo_id: &str,
+        source_kind: MemorySourceKind,
+    ) -> StorageResult<Option<MemoryProjectionStateRecord>>;
+    async fn list_memory_projection_states(
+        &self,
+        repo_id: &str,
+    ) -> StorageResult<Vec<MemoryProjectionStateRecord>>;
+
+    async fn upsert_memory_episode_path(
+        &self,
+        record: &MemoryEpisodePathRecord,
+    ) -> StorageResult<()>;
+    async fn list_memory_episode_paths(
+        &self,
+        episode_id: &str,
+    ) -> StorageResult<Vec<MemoryEpisodePathRecord>>;
+    /// Queries `memory_episode_path` via the `MEMORY_BY_PATH` path + time
+    /// secondary index ordered strictly by `(ended_at DESC, episode_id ASC)`.
+    async fn query_memory_paths_by_path(
+        &self,
+        code_path: &[u8],
+        since_ended_at: Option<i64>,
+        until_ended_at: Option<i64>,
+        limit: Option<usize>,
+    ) -> StorageResult<Vec<MemoryEpisodePathRecord>>;
+
+    async fn upsert_memory_episode_search_doc(
+        &self,
+        episode_id: &str,
+        title: &str,
+        body: &str,
+        paths_text: &str,
+    ) -> StorageResult<MemoryEpisodeSearchDocRecord>;
+    async fn get_memory_episode_search_doc(
+        &self,
+        episode_id: &str,
+    ) -> StorageResult<Option<MemoryEpisodeSearchDocRecord>>;
+    async fn list_memory_episode_search_docs(
+        &self,
+    ) -> StorageResult<Vec<MemoryEpisodeSearchDocRecord>>;
+
+    // -------------------------------------------------------------------------
+    // RB-05b AC4: Governance & Audit (`approved_permission`, `automation_log`, `source_call_log`)
+    // -------------------------------------------------------------------------
+
+    async fn upsert_approved_permission(
+        &self,
+        record: &ApprovedPermissionRecord,
+    ) -> StorageResult<()>;
+    async fn list_approved_permissions(
+        &self,
+        project_id: &str,
+    ) -> StorageResult<Vec<ApprovedPermissionRecord>>;
+    async fn delete_approved_permission(
+        &self,
+        project_id: &str,
+        permission: &str,
+        pattern: &str,
+    ) -> StorageResult<bool>;
+
+    async fn append_automation_log(&self, record: &AutomationLogRecord) -> StorageResult<()>;
+    async fn list_automation_logs(
+        &self,
+        rule_id: Option<&str>,
+        limit: Option<usize>,
+    ) -> StorageResult<Vec<AutomationLogRecord>>;
+
+    async fn append_source_call_log(&self, record: &SourceCallLogRecord) -> StorageResult<()>;
+    async fn list_source_call_logs(
+        &self,
+        session_id: Option<&str>,
+        agent_run_id: Option<&str>,
+    ) -> StorageResult<Vec<SourceCallLogRecord>>;
+
+    // -------------------------------------------------------------------------
+    // RB-05b AC5: Bridge Two-Phase Publication (`prepared` -> `published`)
+    // -------------------------------------------------------------------------
+
+    async fn prepare_bridge_commit_publication(
+        &self,
+        operation_id: &str,
+        commit_oid: &str,
+    ) -> StorageResult<BridgePublicationRecord>;
+    async fn publish_bridge_commit_publication(
+        &self,
+        operation_id: &str,
+        commit_oid: &str,
+    ) -> StorageResult<BridgePublicationRecord>;
+    async fn get_bridge_commit_publication(
+        &self,
+        operation_id: &str,
+    ) -> StorageResult<Option<BridgePublicationRecord>>;
+
+    async fn prepare_bridge_index_publication(
+        &self,
+        operation_id: &str,
+        index_digest: &str,
+    ) -> StorageResult<BridgeIndexPublicationRecord>;
+    async fn publish_bridge_index_publication(
+        &self,
+        operation_id: &str,
+    ) -> StorageResult<Option<BridgeIndexPublicationRecord>>;
+    async fn get_bridge_index_publication(
+        &self,
+        operation_id: &str,
+    ) -> StorageResult<Option<BridgeIndexPublicationRecord>>;
 }
 
 #[cfg(test)]
@@ -2613,6 +3887,1678 @@ mod tests {
                 .await
                 .expect("ro op")
                 .is_some()
+        );
+    }
+
+    async fn run_all_rb05b_ac_assertions(stores: &[Arc<dyn GitStateStore>]) {
+        assert!(!stores.is_empty());
+        let repo_id = "repo-rb05b-001";
+
+        // =====================================================================
+        // AC1: All 19 `ai_*` thread, scheduler, runtime-contract & index tables
+        // =====================================================================
+        let thread1 = AiThreadRecord {
+            thread_id: "thr-001".to_string(),
+            title: Some("Storage refactor thread".to_string()),
+            owner_kind: "human".to_string(),
+            owner_id: "user-1".to_string(),
+            owner_display_name: Some("Eli".to_string()),
+            current_intent_id: Some("int-002".to_string()),
+            latest_intent_id: Some("int-002".to_string()),
+            metadata_json: Some("{\"priority\":\"high\"}".to_string()),
+            archived: false,
+            version: 2,
+            created_at: 1_795_400_000,
+            updated_at: 1_795_400_100,
+        };
+        let thread_temp = AiThreadRecord {
+            thread_id: "thr-cascade".to_string(),
+            title: Some("Cascade delete probe".to_string()),
+            owner_kind: "agent".to_string(),
+            owner_id: "bot-9".to_string(),
+            owner_display_name: None,
+            current_intent_id: None,
+            latest_intent_id: None,
+            metadata_json: None,
+            archived: true,
+            version: 1,
+            created_at: 1_795_400_050,
+            updated_at: 1_795_400_050,
+        };
+        let part1 = AiThreadParticipantRecord {
+            thread_id: "thr-001".to_string(),
+            actor_kind: "agent".to_string(),
+            actor_id: "codex-1".to_string(),
+            actor_display_name: Some("Codex".to_string()),
+            role: "reviewer".to_string(),
+            joined_at: 1_795_400_005,
+        };
+        let intent1 = AiThreadIntentRecord {
+            thread_id: "thr-001".to_string(),
+            intent_id: "int-001".to_string(),
+            ordinal: 0,
+            is_head: false,
+            linked_at: 1_795_400_010,
+            link_reason: "initial".to_string(),
+        };
+        let intent2 = AiThreadIntentRecord {
+            thread_id: "thr-001".to_string(),
+            intent_id: "int-002".to_string(),
+            ordinal: 1,
+            is_head: true,
+            linked_at: 1_795_400_020,
+            link_reason: "follow-up".to_string(),
+        };
+        let prov_meta = AiThreadProviderMetadataRecord {
+            thread_id: "thr-001".to_string(),
+            legacy_session_id: Some("legacy-s1".to_string()),
+            provider_thread_id: Some("prov-t1".to_string()),
+            provider_kind: Some("openai".to_string()),
+            metadata_json: Some("{\"model\":\"o3\"}".to_string()),
+            updated_at: 1_795_400_030,
+        };
+        let sched_state = AiSchedulerStateRecord {
+            thread_id: "thr-001".to_string(),
+            selected_plan_id: Some("plan-002".to_string()),
+            active_task_id: Some("task-001".to_string()),
+            active_run_id: Some("run-002".to_string()),
+            metadata_json: Some("{\"phase\":\"verify\"}".to_string()),
+            version: 3,
+            updated_at: 1_795_400_040,
+        };
+        let plan_heads = vec![
+            AiSchedulerPlanHeadRecord {
+                thread_id: "thr-001".to_string(),
+                plan_id: "plan-001".to_string(),
+                ordinal: 0,
+            },
+            AiSchedulerPlanHeadRecord {
+                thread_id: "thr-001".to_string(),
+                plan_id: "plan-002".to_string(),
+                ordinal: 1,
+            },
+        ];
+        let selected_plans = vec![AiSchedulerSelectedPlanRecord {
+            thread_id: "thr-001".to_string(),
+            plan_id: "plan-002".to_string(),
+            ordinal: 0,
+        }];
+        let context_window = vec![
+            AiLiveContextWindowRecord {
+                thread_id: "thr-001".to_string(),
+                context_frame_id: "frame-001".to_string(),
+                position: 0,
+                source_kind: "user_pin".to_string(),
+                pin_kind: Some("hard".to_string()),
+                inserted_at: 1_795_400_011,
+            },
+            AiLiveContextWindowRecord {
+                thread_id: "thr-001".to_string(),
+                context_frame_id: "frame-002".to_string(),
+                position: 1,
+                source_kind: "auto".to_string(),
+                pin_kind: None,
+                inserted_at: 1_795_400_012,
+            },
+        ];
+        let idx_ip = AiIndexIntentPlanRecord {
+            intent_id: "int-001".to_string(),
+            plan_id: "plan-001".to_string(),
+            created_at: 1_795_400_015,
+        };
+        let idx_it = AiIndexIntentTaskRecord {
+            intent_id: "int-001".to_string(),
+            task_id: "task-001".to_string(),
+            parent_task_id: None,
+            origin_step_id: Some("step-001".to_string()),
+            created_at: 1_795_400_016,
+        };
+        let idx_pst = AiIndexPlanStepTaskRecord {
+            plan_id: "plan-001".to_string(),
+            task_id: "task-001".to_string(),
+            step_id: "step-001".to_string(),
+            created_at: 1_795_400_017,
+        };
+        let tr1 = AiIndexTaskRunRecord {
+            task_id: "task-001".to_string(),
+            run_id: "run-001".to_string(),
+            is_latest: true,
+            created_at: 1_795_400_020,
+            base_commit_ref: Some(format!("sha1:{}", sha1(1))),
+        };
+        let tr2 = AiIndexTaskRunRecord {
+            task_id: "task-001".to_string(),
+            run_id: "run-002".to_string(),
+            is_latest: true,
+            created_at: 1_795_400_025,
+            base_commit_ref: Some(format!("sha256:{}", sha256(2))),
+        };
+        let ev1 = AiIndexRunEventRecord {
+            run_id: "run-002".to_string(),
+            event_id: "ev-001".to_string(),
+            event_kind: "tool_call".to_string(),
+            is_latest: true,
+            created_at: 1_795_400_026,
+        };
+        let ev2 = AiIndexRunEventRecord {
+            run_id: "run-002".to_string(),
+            event_id: "ev-002".to_string(),
+            event_kind: "finished".to_string(),
+            is_latest: true,
+            created_at: 1_795_400_027,
+        };
+        let ps1 = AiIndexRunPatchsetRecord {
+            run_id: "run-002".to_string(),
+            patchset_id: "ps-001".to_string(),
+            sequence: 1,
+            is_latest: true,
+            created_at: 1_795_400_028,
+        };
+        let ps2 = AiIndexRunPatchsetRecord {
+            run_id: "run-002".to_string(),
+            patchset_id: "ps-002".to_string(),
+            sequence: 2,
+            is_latest: true,
+            created_at: 1_795_400_029,
+        };
+        let icf = AiIndexIntentContextFrameRecord {
+            intent_id: "int-001".to_string(),
+            context_frame_id: "frame-001".to_string(),
+            relation_kind: "seed".to_string(),
+            created_at: 1_795_400_011,
+        };
+        let vr1 = AiValidationReportRecord {
+            report_id: "vr-001".to_string(),
+            thread_id: "thr-001".to_string(),
+            run_id: Some("run-001".to_string()),
+            policy_version: "v1".to_string(),
+            stale: true,
+            is_latest: true,
+            summary_json: "{\"ok\":false}".to_string(),
+            created_at: 1_795_400_030,
+            updated_at: 1_795_400_031,
+        };
+        let vr2 = AiValidationReportRecord {
+            report_id: "vr-002".to_string(),
+            thread_id: "thr-001".to_string(),
+            run_id: Some("run-002".to_string()),
+            policy_version: "v1".to_string(),
+            stale: false,
+            is_latest: true,
+            summary_json: "{\"ok\":true}".to_string(),
+            created_at: 1_795_400_035,
+            updated_at: 1_795_400_036,
+        };
+        let risk1 = AiRiskScoreBreakdownRecord {
+            breakdown_id: "rs-001".to_string(),
+            thread_id: "thr-001".to_string(),
+            validation_report_id: Some("vr-001".to_string()),
+            policy_version: "v1".to_string(),
+            stale: true,
+            is_latest: true,
+            summary_json: "{\"score\":80}".to_string(),
+            created_at: 1_795_400_032,
+            updated_at: 1_795_400_032,
+        };
+        let risk2 = AiRiskScoreBreakdownRecord {
+            breakdown_id: "rs-002".to_string(),
+            thread_id: "thr-001".to_string(),
+            validation_report_id: Some("vr-002".to_string()),
+            policy_version: "v1".to_string(),
+            stale: false,
+            is_latest: true,
+            summary_json: "{\"score\":12}".to_string(),
+            created_at: 1_795_400_037,
+            updated_at: 1_795_400_037,
+        };
+        let prop1 = AiDecisionProposalRecord {
+            proposal_id: "dp-001".to_string(),
+            thread_id: "thr-001".to_string(),
+            validation_report_id: Some("vr-001".to_string()),
+            risk_score_breakdown_id: Some("rs-001".to_string()),
+            policy_version: "v1".to_string(),
+            stale: true,
+            is_latest: true,
+            summary_json: "{\"route\":\"human\"}".to_string(),
+            created_at: 1_795_400_033,
+            updated_at: 1_795_400_033,
+        };
+        let prop2 = AiDecisionProposalRecord {
+            proposal_id: "dp-002".to_string(),
+            thread_id: "thr-001".to_string(),
+            validation_report_id: Some("vr-002".to_string()),
+            risk_score_breakdown_id: Some("rs-002".to_string()),
+            policy_version: "v1".to_string(),
+            stale: false,
+            is_latest: true,
+            summary_json: "{\"route\":\"auto_accept\"}".to_string(),
+            created_at: 1_795_400_038,
+            updated_at: 1_795_400_038,
+        };
+        let dec1 = AiFinalDecisionRecord {
+            decision_id: "fd-001".to_string(),
+            thread_id: "thr-001".to_string(),
+            decision_proposal_id: Some("dp-001".to_string()),
+            validation_report_id: Some("vr-001".to_string()),
+            policy_version: "v1".to_string(),
+            verdict: "request_changes".to_string(),
+            stale: true,
+            is_latest: true,
+            summary_json: "{\"final\":false}".to_string(),
+            created_at: 1_795_400_034,
+            updated_at: 1_795_400_034,
+        };
+        let dec2 = AiFinalDecisionRecord {
+            decision_id: "fd-002".to_string(),
+            thread_id: "thr-001".to_string(),
+            decision_proposal_id: Some("dp-002".to_string()),
+            validation_report_id: Some("vr-002".to_string()),
+            policy_version: "v1".to_string(),
+            verdict: "approved".to_string(),
+            stale: false,
+            is_latest: true,
+            summary_json: "{\"final\":true}".to_string(),
+            created_at: 1_795_400_039,
+            updated_at: 1_795_400_039,
+        };
+
+        for store in stores {
+            // Reject orphan child referencing missing `ai_thread`.
+            assert!(store.upsert_ai_thread_participant(&part1).await.is_err());
+
+            store.upsert_ai_thread(&thread1).await.expect("upsert thr1");
+            store
+                .upsert_ai_thread(&thread_temp)
+                .await
+                .expect("upsert thr_temp");
+            assert_eq!(
+                store.get_ai_thread("thr-001").await.expect("get thr1"),
+                Some(thread1.clone())
+            );
+            assert_eq!(
+                store
+                    .list_ai_threads(Some(false))
+                    .await
+                    .expect("list active threads"),
+                vec![thread1.clone()]
+            );
+
+            store
+                .upsert_ai_thread_participant(&part1)
+                .await
+                .expect("upsert participant");
+            store
+                .upsert_ai_thread_intent(&intent1)
+                .await
+                .expect("upsert intent1");
+            store
+                .upsert_ai_thread_intent(&intent2)
+                .await
+                .expect("upsert intent2");
+            // Cross-thread duplicate `intent_id` must be rejected identically on both backends.
+            let cross_dup_intent = AiThreadIntentRecord {
+                thread_id: "thr-cascade".to_string(),
+                intent_id: "int-001".to_string(),
+                ordinal: 0,
+                is_head: true,
+                linked_at: 1_795_400_021,
+                link_reason: "dup".to_string(),
+            };
+            assert!(
+                store
+                    .upsert_ai_thread_intent(&cross_dup_intent)
+                    .await
+                    .is_err()
+            );
+            store
+                .upsert_ai_thread_provider_metadata(&prov_meta)
+                .await
+                .expect("upsert prov meta");
+            store
+                .upsert_ai_scheduler_state(&sched_state)
+                .await
+                .expect("upsert sched state");
+            store
+                .replace_ai_scheduler_plan_heads("thr-001", &plan_heads)
+                .await
+                .expect("replace plan heads");
+            store
+                .replace_ai_scheduler_selected_plans("thr-001", &selected_plans)
+                .await
+                .expect("replace selected plans");
+            store
+                .replace_ai_live_context_window("thr-001", &context_window)
+                .await
+                .expect("replace context window");
+            store
+                .upsert_ai_index_intent_plan(&idx_ip)
+                .await
+                .expect("upsert idx_ip");
+            store
+                .upsert_ai_index_intent_task(&idx_it)
+                .await
+                .expect("upsert idx_it");
+            store
+                .upsert_ai_index_plan_step_task(&idx_pst)
+                .await
+                .expect("upsert idx_pst");
+            store
+                .upsert_ai_index_task_run(&tr1)
+                .await
+                .expect("upsert tr1");
+            store
+                .upsert_ai_index_task_run(&tr2)
+                .await
+                .expect("upsert tr2 clears tr1 is_latest");
+            let runs = store
+                .list_ai_index_task_runs("task-001")
+                .await
+                .expect("list task runs");
+            assert_eq!(runs.len(), 2);
+            assert!(!runs[0].is_latest && runs[1].is_latest);
+
+            store
+                .upsert_ai_index_run_event(&ev1)
+                .await
+                .expect("upsert ev1");
+            store
+                .upsert_ai_index_run_event(&ev2)
+                .await
+                .expect("upsert ev2");
+            let events = store
+                .list_ai_index_run_events("run-002")
+                .await
+                .expect("list run events");
+            assert!(!events[0].is_latest && events[1].is_latest);
+
+            store
+                .upsert_ai_index_run_patchset(&ps1)
+                .await
+                .expect("upsert ps1");
+            store
+                .upsert_ai_index_run_patchset(&ps2)
+                .await
+                .expect("upsert ps2");
+            let patchsets = store
+                .list_ai_index_run_patchsets("run-002")
+                .await
+                .expect("list run patchsets");
+            assert!(!patchsets[0].is_latest && patchsets[1].is_latest);
+
+            store
+                .upsert_ai_index_intent_context_frame(&icf)
+                .await
+                .expect("upsert icf");
+
+            store
+                .upsert_ai_validation_report(&vr1)
+                .await
+                .expect("upsert vr1");
+            store
+                .upsert_ai_validation_report(&vr2)
+                .await
+                .expect("upsert vr2");
+            let vrs = store
+                .list_ai_validation_reports("thr-001")
+                .await
+                .expect("list vr");
+            assert!(!vrs[0].is_latest && vrs[1].is_latest);
+
+            store
+                .upsert_ai_risk_score_breakdown(&risk1)
+                .await
+                .expect("upsert risk1");
+            store
+                .upsert_ai_risk_score_breakdown(&risk2)
+                .await
+                .expect("upsert risk2");
+            let risks = store
+                .list_ai_risk_score_breakdowns("thr-001")
+                .await
+                .expect("list risk");
+            assert!(!risks[0].is_latest && risks[1].is_latest);
+
+            store
+                .upsert_ai_decision_proposal(&prop1)
+                .await
+                .expect("upsert prop1");
+            store
+                .upsert_ai_decision_proposal(&prop2)
+                .await
+                .expect("upsert prop2");
+            let props = store
+                .list_ai_decision_proposals("thr-001")
+                .await
+                .expect("list prop");
+            assert!(!props[0].is_latest && props[1].is_latest);
+
+            store
+                .upsert_ai_final_decision(&dec1)
+                .await
+                .expect("upsert dec1");
+            store
+                .upsert_ai_final_decision(&dec2)
+                .await
+                .expect("upsert dec2");
+            let decs = store
+                .list_ai_final_decisions("thr-001")
+                .await
+                .expect("list dec");
+            assert!(!decs[0].is_latest && decs[1].is_latest);
+
+            // Cascade delete `thr-cascade` with a child participant + report.
+            let cascade_part = AiThreadParticipantRecord {
+                thread_id: "thr-cascade".to_string(),
+                ..part1.clone()
+            };
+            store
+                .upsert_ai_thread_participant(&cascade_part)
+                .await
+                .expect("upsert cascade child");
+            assert!(
+                store
+                    .delete_ai_thread("thr-cascade")
+                    .await
+                    .expect("delete cascade thread")
+            );
+            assert!(
+                store
+                    .list_ai_thread_participants("thr-cascade")
+                    .await
+                    .expect("cascade cleared")
+                    .is_empty()
+            );
+        }
+
+        // =====================================================================
+        // AC2 & AC3: 5 `memory_*` tables + `MEMORY_BY_PATH` path+time index
+        // =====================================================================
+        let ep1 = MemoryEpisodeRecord {
+            episode_id: "ep-001".to_string(),
+            repo_id: repo_id.to_string(),
+            source_kind: MemorySourceKind::Commit,
+            source_key: sha1(501),
+            outcome: MemoryOutcome::Succeeded,
+            actor: Some("eli".to_string()),
+            started_at: 1000,
+            ended_at: 1100,
+            anchor_commit: Some(sha1(501)),
+            change_id: Some("chg-m1".to_string()),
+            title: "Initial storage commit".to_string(),
+            body: "Added redb opener".to_string(),
+            content_digest: sha256(501),
+            producer: "derived-v1".to_string(),
+            rules_version: 1,
+        };
+        let ep2 = MemoryEpisodeRecord {
+            episode_id: "ep-002".to_string(),
+            repo_id: repo_id.to_string(),
+            source_kind: MemorySourceKind::AgentRun,
+            source_key: "run-502".to_string(),
+            outcome: MemoryOutcome::Partial,
+            actor: Some("agent-1".to_string()),
+            started_at: 2000,
+            ended_at: 2500,
+            anchor_commit: Some(sha1(502)),
+            change_id: None,
+            title: "Follow-up refactor".to_string(),
+            body: "Refined git state store".to_string(),
+            content_digest: sha256(502),
+            producer: "derived-v1".to_string(),
+            rules_version: 1,
+        };
+        let ep3 = MemoryEpisodeRecord {
+            episode_id: "ep-003".to_string(),
+            repo_id: repo_id.to_string(),
+            source_kind: MemorySourceKind::BridgeOperation,
+            source_key: "op-503".to_string(),
+            outcome: MemoryOutcome::Succeeded,
+            actor: None,
+            started_at: 2400,
+            ended_at: 2500, // tie on ended_at with ep-002 to verify deterministic tie-break!
+            anchor_commit: None,
+            change_id: None,
+            title: "Bridge tie timestamp".to_string(),
+            body: "Tied timestamp ordering test".to_string(),
+            content_digest: sha256(503),
+            producer: "derived-v1".to_string(),
+            rules_version: 1,
+        };
+        let ep_del = MemoryEpisodeRecord {
+            episode_id: "ep-delete-me".to_string(),
+            repo_id: repo_id.to_string(),
+            source_kind: MemorySourceKind::AgentSession,
+            source_key: "sess-del".to_string(),
+            outcome: MemoryOutcome::Aborted,
+            actor: None,
+            started_at: 3000,
+            ended_at: 3500,
+            anchor_commit: None,
+            change_id: None,
+            title: "Will be deleted".to_string(),
+            body: "Cascade removes MEMORY_BY_PATH entry".to_string(),
+            content_digest: sha256(504),
+            producer: "derived-v1".to_string(),
+            rules_version: 1,
+        };
+
+        let shared_path = b"src/storage/git_state_store.rs".to_vec();
+        let non_utf8_path = vec![
+            b'd', b'a', b't', b'a', b'/', 0xff, 0xfe, b'.', b'b', b'i', b'n',
+        ];
+
+        let ev_list = vec![
+            MemoryEpisodeEvidenceRecord {
+                episode_id: "ep-001".to_string(),
+                ordinal: 0,
+                kind: MemoryEvidenceKind::Commit,
+                ref_id: sha1(501),
+                link_confidence: MemoryLinkConfidence::Identity,
+                resolution_status: MemoryResolutionStatus::Resolved,
+            },
+            MemoryEpisodeEvidenceRecord {
+                episode_id: "ep-001".to_string(),
+                ordinal: 1,
+                kind: MemoryEvidenceKind::Operation,
+                ref_id: "op-001".to_string(),
+                link_confidence: MemoryLinkConfidence::Operation,
+                resolution_status: MemoryResolutionStatus::Unresolved,
+            },
+        ];
+        let proj_state = MemoryProjectionStateRecord {
+            repo_id: repo_id.to_string(),
+            source_kind: MemorySourceKind::Commit,
+            cursor_json: "{\"head\":\"abc\"}".to_string(),
+            fingerprint: "fp-v1".to_string(),
+            rules_version: 1,
+            schema_version: 2,
+            horizon_truncated: true,
+            revoked_count: 3,
+            aged_out_count: 1,
+            rebuilt_at: 1_795_401_000,
+        };
+
+        for store in stores {
+            store.upsert_memory_episode(&ep1).await.expect("ep1");
+            store.upsert_memory_episode(&ep2).await.expect("ep2");
+            store.upsert_memory_episode(&ep3).await.expect("ep3");
+            store.upsert_memory_episode(&ep_del).await.expect("ep_del");
+
+            // Reject duplicate natural key `(repo_id, source_kind, source_key)` on distinct episode_id.
+            let dup_ep = MemoryEpisodeRecord {
+                episode_id: "ep-dup".to_string(),
+                ..ep1.clone()
+            };
+            assert!(store.upsert_memory_episode(&dup_ep).await.is_err());
+
+            // Reject leading '/' path per SQLite CHECK constraint.
+            assert!(
+                store
+                    .upsert_memory_episode_path(&MemoryEpisodePathRecord {
+                        episode_id: "ep-001".to_string(),
+                        code_path: b"/abs/forbidden.rs".to_vec(),
+                        change_kind: MemoryPathChangeKind::Added,
+                        blob_oid_at_end: None,
+                        ended_at: 1100,
+                    })
+                    .await
+                    .is_err()
+            );
+
+            store
+                .replace_memory_episode_evidence("ep-001", &ev_list)
+                .await
+                .expect("replace evidence");
+            store
+                .upsert_memory_projection_state(&proj_state)
+                .await
+                .expect("upsert proj state");
+
+            // Insert paths including a timestamp update (to prove old MEMORY_BY_PATH entry is pruned)
+            // and a raw non-UTF-8 Git path.
+            store
+                .upsert_memory_episode_path(&MemoryEpisodePathRecord {
+                    episode_id: "ep-001".to_string(),
+                    code_path: shared_path.clone(),
+                    change_kind: MemoryPathChangeKind::Added,
+                    blob_oid_at_end: Some(sha1(601)),
+                    ended_at: 900,
+                })
+                .await
+                .expect("insert ep1 path old ts");
+            store
+                .upsert_memory_episode_path(&MemoryEpisodePathRecord {
+                    episode_id: "ep-001".to_string(),
+                    code_path: shared_path.clone(),
+                    change_kind: MemoryPathChangeKind::Modified,
+                    blob_oid_at_end: Some(sha1(602)),
+                    ended_at: 1100,
+                })
+                .await
+                .expect("update ep1 path new ts");
+            store
+                .upsert_memory_episode_path(&MemoryEpisodePathRecord {
+                    episode_id: "ep-002".to_string(),
+                    code_path: shared_path.clone(),
+                    change_kind: MemoryPathChangeKind::Modified,
+                    blob_oid_at_end: Some(sha1(603)),
+                    ended_at: 2500,
+                })
+                .await
+                .expect("insert ep2 path");
+            store
+                .upsert_memory_episode_path(&MemoryEpisodePathRecord {
+                    episode_id: "ep-003".to_string(),
+                    code_path: shared_path.clone(),
+                    change_kind: MemoryPathChangeKind::Renamed,
+                    blob_oid_at_end: None,
+                    ended_at: 2500,
+                })
+                .await
+                .expect("insert ep3 tied path");
+            store
+                .upsert_memory_episode_path(&MemoryEpisodePathRecord {
+                    episode_id: "ep-002".to_string(),
+                    code_path: non_utf8_path.clone(),
+                    change_kind: MemoryPathChangeKind::Added,
+                    blob_oid_at_end: Some(sha256(604)),
+                    ended_at: -50, // negative timestamp verifies signed order inversion
+                })
+                .await
+                .expect("insert non-utf8 negative ts path");
+            store
+                .upsert_memory_episode_path(&MemoryEpisodePathRecord {
+                    episode_id: "ep-delete-me".to_string(),
+                    code_path: shared_path.clone(),
+                    change_kind: MemoryPathChangeKind::Deleted,
+                    blob_oid_at_end: None,
+                    ended_at: 3500,
+                })
+                .await
+                .expect("insert ep_del path");
+
+            let doc1 = store
+                .upsert_memory_episode_search_doc("ep-001", "T1", "B1", "src/storage")
+                .await
+                .expect("insert doc1");
+            let doc1_upd = store
+                .upsert_memory_episode_search_doc("ep-001", "T1-upd", "B1-upd", "src/storage")
+                .await
+                .expect("update doc1 keeps rowid");
+            assert_eq!(doc1.rowid, doc1_upd.rowid);
+            let _doc_del = store
+                .upsert_memory_episode_search_doc("ep-delete-me", "TD", "BD", "src/storage")
+                .await
+                .expect("insert doc_del");
+
+            // Delete `ep-delete-me` and verify cascade purges `MEMORY_BY_PATH` & `search_doc`.
+            assert!(
+                store
+                    .delete_memory_episode("ep-delete-me")
+                    .await
+                    .expect("delete ep_del")
+            );
+            assert_eq!(
+                store
+                    .get_memory_episode_search_doc("ep-delete-me")
+                    .await
+                    .expect("deleted search doc"),
+                None
+            );
+
+            // AC3: `MEMORY_BY_PATH` exact ordering: `(ended_at DESC, episode_id ASC)`.
+            let all_for_path = store
+                .query_memory_paths_by_path(&shared_path, None, None, None)
+                .await
+                .expect("query MEMORY_BY_PATH all");
+            let ids: Vec<&str> = all_for_path.iter().map(|r| r.episode_id.as_str()).collect();
+            assert_eq!(ids, vec!["ep-002", "ep-003", "ep-001"]);
+
+            // Explicitly verify stale timestamp `900` for `ep-001` was pruned from `MEMORY_BY_PATH`.
+            assert!(
+                store
+                    .query_memory_paths_by_path(&shared_path, Some(800), Some(950), None)
+                    .await
+                    .expect("old timestamp window must be empty")
+                    .is_empty()
+            );
+
+            // Re-update an existing `(ep-001, shared_path)` timestamp from 1100 -> 3000 AFTER
+            // `ep-002`/`ep-003` exist, proving stale index pruning & re-ordering across both windows.
+            store
+                .upsert_memory_episode_path(&MemoryEpisodePathRecord {
+                    episode_id: "ep-001".to_string(),
+                    code_path: shared_path.clone(),
+                    change_kind: MemoryPathChangeKind::Modified,
+                    blob_oid_at_end: Some(sha1(605)),
+                    ended_at: 3000,
+                })
+                .await
+                .expect("promote ep1 ended_at 1100 -> 3000");
+            assert!(
+                store
+                    .query_memory_paths_by_path(&shared_path, Some(1000), Some(1200), None)
+                    .await
+                    .expect("previous 1100 window must now be empty")
+                    .is_empty()
+            );
+            let promoted_win = store
+                .query_memory_paths_by_path(&shared_path, Some(2900), Some(3100), None)
+                .await
+                .expect("new 3000 window must contain ep-001");
+            assert_eq!(promoted_win.len(), 1);
+            assert_eq!(promoted_win[0].episode_id, "ep-001");
+            assert_eq!(promoted_win[0].ended_at, 3000);
+            let reordered = store
+                .query_memory_paths_by_path(&shared_path, None, None, None)
+                .await
+                .expect("query MEMORY_BY_PATH after timestamp promotion");
+            let reordered_ids: Vec<&str> =
+                reordered.iter().map(|r| r.episode_id.as_str()).collect();
+            assert_eq!(reordered_ids, vec!["ep-001", "ep-002", "ep-003"]);
+
+            // Move `ep-001` back to 1100 and verify deterministic bounded range + limit query.
+            store
+                .upsert_memory_episode_path(&MemoryEpisodePathRecord {
+                    episode_id: "ep-001".to_string(),
+                    code_path: shared_path.clone(),
+                    change_kind: MemoryPathChangeKind::Modified,
+                    blob_oid_at_end: Some(sha1(602)),
+                    ended_at: 1100,
+                })
+                .await
+                .expect("restore ep1 ended_at 3000 -> 1100");
+            assert!(
+                store
+                    .query_memory_paths_by_path(&shared_path, Some(2900), Some(3100), None)
+                    .await
+                    .expect("pruned 3000 window must now be empty")
+                    .is_empty()
+            );
+            let windowed = store
+                .query_memory_paths_by_path(&shared_path, Some(1000), Some(2500), Some(2))
+                .await
+                .expect("query MEMORY_BY_PATH windowed");
+            let win_ids: Vec<&str> = windowed.iter().map(|r| r.episode_id.as_str()).collect();
+            assert_eq!(win_ids, vec!["ep-002", "ep-003"]);
+
+            let non_utf8_res = store
+                .query_memory_paths_by_path(&non_utf8_path, Some(-100), Some(0), None)
+                .await
+                .expect("query non-utf8 negative ts");
+            assert_eq!(non_utf8_res.len(), 1);
+            assert_eq!(non_utf8_res[0].episode_id, "ep-002");
+        }
+
+        // =====================================================================
+        // AC4: Governance & Audit (`approved_permission`, `automation_log`, `source_call_log`)
+        // =====================================================================
+        let perm1 = ApprovedPermissionRecord {
+            project_id: "proj-001".to_string(),
+            permission: "bash".to_string(),
+            pattern: "cargo nextest*".to_string(),
+            created_at: 1_795_402_000,
+            source_worktree_id: "wt-alpha".to_string(),
+            source_session_id: "sess-1".to_string(),
+            source_workspace_id: "ws-1".to_string(),
+        };
+        let perm2 = ApprovedPermissionRecord {
+            project_id: "proj-001".to_string(),
+            permission: "edit".to_string(),
+            pattern: "src/storage/**".to_string(),
+            created_at: 1_795_402_005,
+            source_worktree_id: String::new(),
+            source_session_id: "sess-2".to_string(),
+            source_workspace_id: String::new(),
+        };
+        let auto1 = AutomationLogRecord {
+            id: "auto-001".to_string(),
+            rule_id: "rule-fmt".to_string(),
+            trigger_kind: "pre_commit".to_string(),
+            action_kind: "run_cmd".to_string(),
+            status: "succeeded".to_string(),
+            message: "formatted cleanly".to_string(),
+            started_at: "2026-11-22T19:00:00Z".to_string(),
+            finished_at: "2026-11-22T19:00:02Z".to_string(),
+            details_json: "{\"exit\":0}".to_string(),
+        };
+        let auto2 = AutomationLogRecord {
+            id: "auto-002".to_string(),
+            rule_id: "rule-fmt".to_string(),
+            trigger_kind: "pre_push".to_string(),
+            action_kind: "run_cmd".to_string(),
+            status: "failed".to_string(),
+            message: "clippy warning".to_string(),
+            started_at: "2026-11-22T19:05:00Z".to_string(),
+            finished_at: "2026-11-22T19:05:09Z".to_string(),
+            details_json: "{\"exit\":101}".to_string(),
+        };
+        let scl1 = SourceCallLogRecord {
+            id: "scl-001".to_string(),
+            session_id: "sess-1".to_string(),
+            source_slug: "github".to_string(),
+            tool_name: "get_pr".to_string(),
+            registered_tool_name: "github__get_pr".to_string(),
+            tool_call_id: "call-1".to_string(),
+            credential_ref: Some("vault:gh-1".to_string()),
+            latency_ms: Some(142),
+            input_bytes: 128,
+            output_bytes: 2048,
+            cost_estimate_micros: Some(500),
+            approval_decision: Some("always".to_string()),
+            state_namespace: "default".to_string(),
+            success: true,
+            created_at: "2026-11-22T19:10:00Z".to_string(),
+            agent_run_id: Some("run-sub-1".to_string()),
+        };
+        let scl2 = SourceCallLogRecord {
+            id: "scl-002".to_string(),
+            session_id: "sess-1".to_string(),
+            source_slug: "github".to_string(),
+            tool_name: "list_issues".to_string(),
+            registered_tool_name: "github__list_issues".to_string(),
+            tool_call_id: "call-2".to_string(),
+            credential_ref: None,
+            latency_ms: None,
+            input_bytes: 64,
+            output_bytes: 0,
+            cost_estimate_micros: None,
+            approval_decision: None,
+            state_namespace: "default".to_string(),
+            success: false,
+            created_at: "2026-11-22T19:11:00Z".to_string(),
+            agent_run_id: None,
+        };
+
+        for store in stores {
+            store
+                .upsert_approved_permission(&perm1)
+                .await
+                .expect("upsert perm1");
+            store
+                .upsert_approved_permission(&perm2)
+                .await
+                .expect("upsert perm2");
+            assert_eq!(
+                store
+                    .list_approved_permissions("proj-001")
+                    .await
+                    .expect("list perms"),
+                vec![perm1.clone(), perm2.clone()]
+            );
+            assert!(
+                store
+                    .delete_approved_permission("proj-001", "edit", "src/storage/**")
+                    .await
+                    .expect("delete perm2")
+            );
+            store
+                .upsert_approved_permission(&perm2)
+                .await
+                .expect("restore perm2");
+
+            store
+                .append_automation_log(&auto1)
+                .await
+                .expect("append auto1");
+            store
+                .append_automation_log(&auto2)
+                .await
+                .expect("append auto2");
+            assert!(store.append_automation_log(&auto1).await.is_err());
+            assert_eq!(
+                store
+                    .list_automation_logs(Some("rule-fmt"), Some(1))
+                    .await
+                    .expect("latest auto log"),
+                vec![auto2.clone()]
+            );
+
+            store
+                .append_source_call_log(&scl1)
+                .await
+                .expect("append scl1");
+            store
+                .append_source_call_log(&scl2)
+                .await
+                .expect("append scl2");
+            assert!(store.append_source_call_log(&scl1).await.is_err());
+            assert_eq!(
+                store
+                    .list_source_call_logs(Some("sess-1"), Some("run-sub-1"))
+                    .await
+                    .expect("filtered scl"),
+                vec![scl1.clone()]
+            );
+        }
+
+        // =====================================================================
+        // AC5: Two-phase `agent_bridge_publication` & `agent_bridge_index_publication`
+        // =====================================================================
+        let commit_oid = sha1(777);
+        let other_oid = sha1(888);
+        for store in stores {
+            assert_eq!(
+                store
+                    .get_bridge_commit_publication("bridge-op-01")
+                    .await
+                    .expect("absent commit pub"),
+                None
+            );
+            // Publishing before prepare MUST fail closed and leave no row behind!
+            assert!(
+                store
+                    .publish_bridge_commit_publication("bridge-op-01", &commit_oid)
+                    .await
+                    .is_err(),
+                "publish_bridge_commit_publication must reject unprepared operation_id"
+            );
+            assert_eq!(
+                store
+                    .get_bridge_commit_publication("bridge-op-01")
+                    .await
+                    .expect("still absent after rejected publish"),
+                None
+            );
+            let prep_c = store
+                .prepare_bridge_commit_publication("bridge-op-01", &commit_oid)
+                .await
+                .expect("prepare commit pub");
+            assert_eq!(prep_c.phase, BridgePublicationPhase::Prepared);
+
+            // Idempotent re-prepare with same commit_oid succeeds; different oid fails closed!
+            assert_eq!(
+                store
+                    .prepare_bridge_commit_publication("bridge-op-01", &commit_oid)
+                    .await
+                    .expect("idempotent prepare"),
+                prep_c
+            );
+            assert!(
+                store
+                    .prepare_bridge_commit_publication("bridge-op-01", &other_oid)
+                    .await
+                    .is_err()
+            );
+
+            // Promote `prepared` -> `published`.
+            let pub_c = store
+                .publish_bridge_commit_publication("bridge-op-01", &commit_oid)
+                .await
+                .expect("publish commit pub");
+            assert_eq!(pub_c.phase, BridgePublicationPhase::Published);
+
+            // Re-preparing an already-published binding MUST NOT downgrade `Published` to `Prepared`!
+            assert_eq!(
+                store
+                    .prepare_bridge_commit_publication("bridge-op-01", &commit_oid)
+                    .await
+                    .expect("prepare after publish stays published")
+                    .phase,
+                BridgePublicationPhase::Published
+            );
+            assert!(
+                store
+                    .publish_bridge_commit_publication("bridge-op-01", &other_oid)
+                    .await
+                    .is_err()
+            );
+
+            // Index publication two-phase: absent publish -> None; prepare -> Prepared -> publish -> Published.
+            assert_eq!(
+                store
+                    .publish_bridge_index_publication("bridge-idx-01")
+                    .await
+                    .expect("publish missing idx"),
+                None
+            );
+            let prep_i = store
+                .prepare_bridge_index_publication("bridge-idx-01", "sha256:idx-v1")
+                .await
+                .expect("prepare idx pub");
+            assert_eq!(prep_i.phase, BridgePublicationPhase::Prepared);
+            // Idempotent re-prepare with same digest succeeds; different digest fails closed!
+            assert_eq!(
+                store
+                    .prepare_bridge_index_publication("bridge-idx-01", "sha256:idx-v1")
+                    .await
+                    .expect("idempotent prepare idx pub"),
+                prep_i
+            );
+            assert!(
+                store
+                    .prepare_bridge_index_publication("bridge-idx-01", "sha256:idx-conflict")
+                    .await
+                    .is_err(),
+                "prepare_bridge_index_publication must reject conflicting digest"
+            );
+            assert_eq!(
+                store
+                    .get_bridge_index_publication("bridge-idx-01")
+                    .await
+                    .expect("get prepared idx"),
+                Some(prep_i)
+            );
+            let pub_i = store
+                .publish_bridge_index_publication("bridge-idx-01")
+                .await
+                .expect("publish idx pub")
+                .expect("idx row present");
+            assert_eq!(pub_i.phase, BridgePublicationPhase::Published);
+            assert_eq!(pub_i.index_digest, "sha256:idx-v1");
+            // Re-preparing an already-published index binding MUST preserve Published (no downgrade)
+            // and reject a different digest!
+            assert_eq!(
+                store
+                    .prepare_bridge_index_publication("bridge-idx-01", "sha256:idx-v1")
+                    .await
+                    .expect("prepare after publish stays published"),
+                pub_i
+            );
+            assert!(
+                store
+                    .prepare_bridge_index_publication("bridge-idx-01", "sha256:idx-v2")
+                    .await
+                    .is_err(),
+                "prepare after publish with different digest must fail closed"
+            );
+            assert_eq!(
+                store
+                    .get_bridge_index_publication("bridge-idx-01")
+                    .await
+                    .expect("get published idx"),
+                Some(pub_i)
+            );
+        }
+
+        // Exact cross-backend equivalence diff when both SQLite and redb stores are paired.
+        if stores.len() == 2 {
+            let sq = &stores[0];
+            let rb = &stores[1];
+            assert_eq!(
+                sq.list_ai_threads(None).await.expect("sq"),
+                rb.list_ai_threads(None).await.expect("rb")
+            );
+            assert_eq!(
+                sq.list_ai_thread_participants("thr-001").await.expect("sq"),
+                rb.list_ai_thread_participants("thr-001").await.expect("rb")
+            );
+            assert_eq!(
+                sq.list_ai_thread_intents("thr-001").await.expect("sq"),
+                rb.list_ai_thread_intents("thr-001").await.expect("rb")
+            );
+            assert_eq!(
+                sq.get_ai_thread_provider_metadata("thr-001")
+                    .await
+                    .expect("sq"),
+                rb.get_ai_thread_provider_metadata("thr-001")
+                    .await
+                    .expect("rb")
+            );
+            assert_eq!(
+                sq.get_ai_scheduler_state("thr-001").await.expect("sq"),
+                rb.get_ai_scheduler_state("thr-001").await.expect("rb")
+            );
+            assert_eq!(
+                sq.list_ai_scheduler_plan_heads("thr-001")
+                    .await
+                    .expect("sq"),
+                rb.list_ai_scheduler_plan_heads("thr-001")
+                    .await
+                    .expect("rb")
+            );
+            assert_eq!(
+                sq.list_ai_scheduler_selected_plans("thr-001")
+                    .await
+                    .expect("sq"),
+                rb.list_ai_scheduler_selected_plans("thr-001")
+                    .await
+                    .expect("rb")
+            );
+            assert_eq!(
+                sq.list_ai_live_context_window("thr-001").await.expect("sq"),
+                rb.list_ai_live_context_window("thr-001").await.expect("rb")
+            );
+            assert_eq!(
+                sq.list_ai_index_intent_plans("int-001").await.expect("sq"),
+                rb.list_ai_index_intent_plans("int-001").await.expect("rb")
+            );
+            assert_eq!(
+                sq.list_ai_index_intent_tasks("int-001").await.expect("sq"),
+                rb.list_ai_index_intent_tasks("int-001").await.expect("rb")
+            );
+            assert_eq!(
+                sq.list_ai_index_plan_step_tasks("plan-001")
+                    .await
+                    .expect("sq"),
+                rb.list_ai_index_plan_step_tasks("plan-001")
+                    .await
+                    .expect("rb")
+            );
+            assert_eq!(
+                sq.list_ai_index_task_runs("task-001").await.expect("sq"),
+                rb.list_ai_index_task_runs("task-001").await.expect("rb")
+            );
+            assert_eq!(
+                sq.list_ai_index_run_events("run-002").await.expect("sq"),
+                rb.list_ai_index_run_events("run-002").await.expect("rb")
+            );
+            assert_eq!(
+                sq.list_ai_index_run_patchsets("run-002").await.expect("sq"),
+                rb.list_ai_index_run_patchsets("run-002").await.expect("rb")
+            );
+            assert_eq!(
+                sq.list_ai_index_intent_context_frames("int-001")
+                    .await
+                    .expect("sq"),
+                rb.list_ai_index_intent_context_frames("int-001")
+                    .await
+                    .expect("rb")
+            );
+            assert_eq!(
+                sq.list_ai_validation_reports("thr-001").await.expect("sq"),
+                rb.list_ai_validation_reports("thr-001").await.expect("rb")
+            );
+            assert_eq!(
+                sq.list_ai_risk_score_breakdowns("thr-001")
+                    .await
+                    .expect("sq"),
+                rb.list_ai_risk_score_breakdowns("thr-001")
+                    .await
+                    .expect("rb")
+            );
+            assert_eq!(
+                sq.list_ai_decision_proposals("thr-001").await.expect("sq"),
+                rb.list_ai_decision_proposals("thr-001").await.expect("rb")
+            );
+            assert_eq!(
+                sq.list_ai_final_decisions("thr-001").await.expect("sq"),
+                rb.list_ai_final_decisions("thr-001").await.expect("rb")
+            );
+            assert_eq!(
+                sq.list_memory_episodes(repo_id).await.expect("sq"),
+                rb.list_memory_episodes(repo_id).await.expect("rb")
+            );
+            assert_eq!(
+                sq.list_memory_episode_evidence("ep-001").await.expect("sq"),
+                rb.list_memory_episode_evidence("ep-001").await.expect("rb")
+            );
+            assert_eq!(
+                sq.list_memory_projection_states(repo_id).await.expect("sq"),
+                rb.list_memory_projection_states(repo_id).await.expect("rb")
+            );
+            assert_eq!(
+                sq.list_memory_episode_paths("ep-001").await.expect("sq"),
+                rb.list_memory_episode_paths("ep-001").await.expect("rb")
+            );
+            assert_eq!(
+                sq.query_memory_paths_by_path(&shared_path, None, None, None)
+                    .await
+                    .expect("sq"),
+                rb.query_memory_paths_by_path(&shared_path, None, None, None)
+                    .await
+                    .expect("rb")
+            );
+            assert_eq!(
+                sq.list_memory_episode_search_docs().await.expect("sq"),
+                rb.list_memory_episode_search_docs().await.expect("rb")
+            );
+            assert_eq!(
+                sq.list_approved_permissions("proj-001").await.expect("sq"),
+                rb.list_approved_permissions("proj-001").await.expect("rb")
+            );
+            assert_eq!(
+                sq.list_automation_logs(None, None).await.expect("sq"),
+                rb.list_automation_logs(None, None).await.expect("rb")
+            );
+            assert_eq!(
+                sq.list_source_call_logs(None, None).await.expect("sq"),
+                rb.list_source_call_logs(None, None).await.expect("rb")
+            );
+            assert_eq!(
+                sq.get_bridge_commit_publication("bridge-op-01")
+                    .await
+                    .expect("sq"),
+                rb.get_bridge_commit_publication("bridge-op-01")
+                    .await
+                    .expect("rb")
+            );
+            assert_eq!(
+                sq.get_bridge_index_publication("bridge-idx-01")
+                    .await
+                    .expect("sq"),
+                rb.get_bridge_index_publication("bridge-idx-01")
+                    .await
+                    .expect("rb")
+            );
+        }
+    }
+
+    /// `RB-05b` (AC1–AC5): Dual-backend equivalence across all 19 `ai_*`,
+    /// 5 `memory_*` (+ `MEMORY_BY_PATH`), 3 governance/audit, and 2 bridge
+    /// two-phase publication tables + `RedbGitStore` interoperability check.
+    #[cfg(all(feature = "storage-sqlite", feature = "storage-redb"))]
+    #[tokio::test]
+    async fn dual_backend_28_ai_memory_bridge_tables_equivalence() {
+        let dir = tempdir().expect("create RB-05b tempdir");
+        let sqlite_store = SqliteGitStateStore::create(dir.path().join("libra.db"))
+            .await
+            .expect("create SqliteGitStateStore");
+        let redb_path = dir.path().join("git.redb");
+        let redb_store = RedbGitStateStore::create(&redb_path).expect("create RedbGitStateStore");
+        let stores: [Arc<dyn GitStateStore>; 2] = [Arc::new(sqlite_store), Arc::new(redb_store)];
+
+        run_all_rb05b_ac_assertions(&stores).await;
+
+        // Verify wire-level interoperability of `agent_bridge_publication` between
+        // `RedbGitStore` (`RB-04`) and `RedbGitStateStore` (`RB-05b`) on the SAME `git.redb`!
+        let shared_path = dir.path().join("shared_bridge_interop.redb");
+        let git_store = crate::storage::git_store::RedbGitStore::create(&shared_path)
+            .expect("create RedbGitStore");
+        let head_ref = crate::storage::git_store::RefKey::LocalHead { worktree_id: None };
+        let main_ref = crate::storage::git_store::RefKey::LocalBranch {
+            name: "main".to_string(),
+        };
+        crate::storage::git_store::GitStore::update_ref_cas(
+            &git_store,
+            &head_ref,
+            None,
+            Some(&crate::storage::git_store::RefTarget::Symbolic(
+                "main".to_string(),
+            )),
+            &[],
+        )
+        .await
+        .expect("point HEAD at main");
+        let commit1 = sha1(999);
+        crate::storage::git_store::GitStore::update_ref_cas_with_bridge_publication(
+            &git_store,
+            &main_ref,
+            None,
+            Some(&crate::storage::git_store::RefTarget::Direct(
+                commit1.clone(),
+            )),
+            &[],
+            &BridgePublicationRecord {
+                operation_id: "interop-op-01".to_string(),
+                commit_oid: commit1.clone(),
+                phase: BridgePublicationPhase::Published,
+            },
+        )
+        .await
+        .expect("publish bridge op via RedbGitStore");
+        drop(git_store);
+
+        // Read-only `RedbGitStateStore` BEFORE RB-05b upgrade reads `RedbGitStore`'s binding cleanly.
+        let state_ro = RedbGitStateStore::open_read_only(&shared_path)
+            .expect("read-only reopen pre-RB-05b git.redb");
+        assert_eq!(
+            state_ro
+                .get_bridge_commit_publication("interop-op-01")
+                .await
+                .expect("read interop bridge pub before upgrade"),
+            Some(BridgePublicationRecord {
+                operation_id: "interop-op-01".to_string(),
+                commit_oid: commit1.clone(),
+                phase: BridgePublicationPhase::Published,
+            })
+        );
+        drop(state_ro);
+
+        // Writable upgrade preserves `RedbGitStore`'s bridge binding and enables `RB-05b` writes!
+        let state_rw =
+            RedbGitStateStore::open_read_write(&shared_path).expect("upgrade git.redb to RB-05b");
+        assert_eq!(
+            state_rw
+                .get_bridge_commit_publication("interop-op-01")
+                .await
+                .expect("preserved bridge pub after upgrade"),
+            Some(BridgePublicationRecord {
+                operation_id: "interop-op-01".to_string(),
+                commit_oid: commit1,
+                phase: BridgePublicationPhase::Published,
+            })
+        );
+        let prep_commit = sha1(1000);
+        let prep = state_rw
+            .prepare_bridge_commit_publication("interop-op-02", &prep_commit)
+            .await
+            .expect("prepare op-02 via RedbGitStateStore");
+        assert_eq!(prep.phase, BridgePublicationPhase::Prepared);
+        drop(state_rw);
+
+        // Reopen with `RedbGitStore` and promote `interop-op-02` atomically with ref update!
+        let git_store2 = crate::storage::git_store::RedbGitStore::open_read_write(&shared_path)
+            .expect("reopen RedbGitStore after RB-05b");
+        let _ = crate::storage::git_store::GitStore::update_ref_cas_with_bridge_publication(
+            &git_store2,
+            &main_ref,
+            Some(&crate::storage::git_store::RefTarget::Direct(sha1(999))),
+            Some(&crate::storage::git_store::RefTarget::Direct(
+                prep_commit.clone(),
+            )),
+            &[],
+            &BridgePublicationRecord {
+                operation_id: "interop-op-02".to_string(),
+                commit_oid: prep_commit.clone(),
+                phase: BridgePublicationPhase::Published,
+            },
+        )
+        .await
+        .expect("promote op-02 via RedbGitStore");
+        assert_eq!(
+            crate::storage::git_store::GitStore::get_bridge_publication(
+                &git_store2,
+                "interop-op-02"
+            )
+            .await
+            .expect("verify promoted op-02"),
+            Some(BridgePublicationRecord {
+                operation_id: "interop-op-02".to_string(),
+                commit_oid: prep_commit,
+                phase: BridgePublicationPhase::Published,
+            })
+        );
+    }
+
+    /// `RB-05b` (AC6): Static & live-disk manifest guard asserting that
+    /// `ConfigStore` (4) + `GitStore` (7) + `GitStateStore` (21 + 29 = 50)
+    /// matches the exact **61** active persistent Repository source tables from
+    /// baseline — excluding the 7 retired tables and all `META_*`/secondary
+    /// index internal tables. Runs on dual-feature, pure-redb, and pure-sqlite.
+    #[tokio::test]
+    async fn repository_61_source_tables_manifest_complete() {
+        // 1. Disjointness & exact cardinality across the 4 storage domain slices.
+        assert_eq!(CONFIG_STORE_REPO_SOURCE_TABLES.len(), 4);
+        assert_eq!(GIT_STORE_CORE_SOURCE_TABLES.len(), 7);
+        assert_eq!(RB05_WORKFLOW_STATE_SOURCE_TABLES.len(), 21);
+        assert_eq!(RB05B_AI_MEMORY_BRIDGE_SOURCE_TABLES.len(), 29);
+
+        let manifest = repository_active_source_tables();
+        assert_eq!(
+            manifest.len(),
+            REPOSITORY_ACTIVE_SOURCE_TABLES_COUNT,
+            "expected exactly 61 distinct active Repository source tables (4 + 7 + 21 + 29)"
+        );
+
+        let manifest_set: BTreeSet<&str> = manifest.iter().copied().collect();
+
+        // 2. Zero overlap with the 7 retired tables.
+        for retired in RETIRED_REPOSITORY_SOURCE_TABLES {
+            assert!(
+                !manifest_set.contains(retired),
+                "retired table `{retired}` must NOT appear in the 61 active source tables"
+            );
+        }
+
+        // 3. Zero contamination from `META_*`, `QUEUE_HIGHWATER_*`, or internal/secondary index tables.
+        for name in &manifest {
+            let upper = name.to_ascii_uppercase();
+            assert!(
+                !upper.starts_with("META_") && !upper.starts_with("QUEUE_HIGHWATER_"),
+                "internal metadata table `{name}` must NOT be counted as a source table"
+            );
+        }
+        for internal_or_index in [
+            "META_SCHEMA",
+            "meta_schema",
+            "META_GENERATION",
+            "meta_generation",
+            "META_CROSS_STORE_INTENT",
+            "meta_cross_store_intent",
+            "QUEUE_HIGHWATER_PRIORITY",
+            "QUEUE_HIGHWATER_NORMAL",
+            "REFS_BY_WORKTREE",
+            "OBJECT_BY_PACK",
+            "object_by_pack",
+            "reflog_by_ref",
+            "revision_ordinal_by_oid",
+            "config_kv_by_key",
+            "config_sequences",
+            "change_revision_by_commit",
+            "git_sequences",
+            "git_state_sequences",
+            MEMORY_BY_PATH_INDEX_NAME,
+        ] {
+            assert!(
+                !manifest_set.contains(internal_or_index),
+                "internal/index table `{internal_or_index}` must NOT be counted as a source table"
+            );
+        }
+
+        // 4. Exact name-for-name equality against repository baseline:
+        //    `MUTABLE_STATE_OWNERSHIP` (minus 24 capture-only tables and 7 retired tables)
+        //    union the 5 zero-authority `memory_*` projection tables = exact 61!
+        let capture_only: BTreeSet<&str> = [
+            "capture_catalog_copy_receipt",
+            "agent_audit_log",
+            "agent_bridge_checkpoint",
+            "agent_bridge_event",
+            "agent_bridge_link",
+            "agent_bridge_operation",
+            "agent_bridge_session",
+            "agent_capture_cloud_base",
+            "agent_capture_incarnation",
+            "agent_checkpoint",
+            "agent_checkpoint_prune_tombstone",
+            "agent_coverage_claim",
+            "agent_coverage_conflict",
+            "agent_coverage_revision",
+            "agent_export_job",
+            "agent_import_identity",
+            "agent_import_tombstone",
+            "agent_session",
+            "agent_session_commit",
+            "agent_subagent_content_claim",
+            "agent_subagent_content_revision",
+            "agent_subagent_link",
+            "agent_usage_stats",
+            "agent_workspace_scope_audit",
+        ]
+        .into_iter()
+        .collect();
+        let retired_set: BTreeSet<&str> = RETIRED_REPOSITORY_SOURCE_TABLES.into_iter().collect();
+        let memory_projection_5: BTreeSet<&str> = [
+            "memory_episode",
+            "memory_episode_evidence",
+            "memory_projection_state",
+            "memory_episode_path",
+            "memory_episode_search_doc",
+        ]
+        .into_iter()
+        .collect();
+
+        let mut baseline: BTreeSet<&str> =
+            crate::internal::mutable_state_ownership::MUTABLE_STATE_OWNERSHIP
+                .iter()
+                .map(|s| s.table)
+                .filter(|t| !capture_only.contains(t) && !retired_set.contains(t))
+                .collect();
+        baseline.extend(memory_projection_5);
+
+        assert_eq!(
+            manifest_set, baseline,
+            "61-table manifest diverged from MUTABLE_STATE_OWNERSHIP + memory_* baseline"
+        );
+
+        // 5. Under `storage-redb`, verify live on-disk redb initialization materializes
+        //    all 50 `GitStateStore` source tables + `MEMORY_BY_PATH` & `change_revision_by_commit`,
+        //    and that combined with `RedbGitStore` & `RedbConfigStore` covers all 61 source tables.
+        #[cfg(feature = "storage-redb")]
+        {
+            use ::redb::TableHandle;
+
+            let dir = tempdir().expect("create manifest redb tempdir");
+            let cfg_redb = dir.path().join("cfg_repo.redb");
+            let git_redb = dir.path().join("git.redb");
+
+            // Initialize ConfigStore (4 source tables) and GitStore (7) + GitStateStore (50).
+            let cfg_store = crate::storage::redb::RedbConfigStore::create(
+                &cfg_redb,
+                crate::internal::db::schema::DatabaseRole::Repository,
+            )
+            .expect("create RedbConfigStore(Repository)");
+            drop(cfg_store);
+            let cfg_ro = crate::storage::opener::open_redb_read_only(
+                &cfg_redb,
+                crate::internal::db::schema::DatabaseRole::Repository,
+            )
+            .expect("open cfg_repo.redb read-only");
+            let cfg_rtx = crate::storage::meta::begin_checked_read(
+                &cfg_ro,
+                crate::internal::db::schema::DatabaseRole::Repository,
+            )
+            .expect("begin cfg read tx");
+            let cfg_tables: BTreeSet<String> = cfg_rtx
+                .list_tables()
+                .expect("list cfg_repo.redb tables")
+                .map(|h| h.name().to_string())
+                .collect();
+            drop(cfg_rtx);
+            drop(cfg_ro);
+
+            let git_store = crate::storage::git_store::RedbGitStore::create(&git_redb)
+                .expect("create RedbGitStore");
+            drop(git_store);
+            let state_store = RedbGitStateStore::open_read_write(&git_redb)
+                .expect("upgrade git.redb with RedbGitStateStore RB-05+RB-05b tables");
+
+            let git_tables: BTreeSet<String> = state_store
+                .list_table_names()
+                .await
+                .expect("list live git.redb tables")
+                .into_iter()
+                .collect();
+
+            let mut all_live_tables = cfg_tables;
+            all_live_tables.extend(git_tables.iter().cloned());
+
+            // Every one of the 61 active source tables MUST be materialized across
+            // RedbConfigStore (4) + RedbGitStore (7) + RedbGitStateStore (50).
+            for expected in &manifest {
+                assert!(
+                    all_live_tables.contains(*expected),
+                    "live redb repository stores missing active source table `{expected}`"
+                );
+            }
+            // Required internal & secondary index tables are present and kept strictly separate.
+            let known_internal_and_index: BTreeSet<&str> = [
+                crate::storage::meta::META_SCHEMA_TABLE.name(),
+                "config_kv_by_key",
+                "config_sequences",
+                "reflog_by_ref",
+                "git_sequences",
+                "object_by_pack",
+                "revision_ordinal_by_oid",
+                "change_revision_by_commit",
+                "git_state_sequences",
+                MEMORY_BY_PATH_INDEX_NAME,
+            ]
+            .into_iter()
+            .collect();
+            for required_internal in &known_internal_and_index {
+                assert!(
+                    all_live_tables.contains(*required_internal),
+                    "live redb repository stores missing expected internal/index table `{required_internal}`"
+                );
+            }
+            // Strict bidirectional equality: live tables minus known internal/index tables == exact 61!
+            let live_source_tables: BTreeSet<&str> = all_live_tables
+                .iter()
+                .map(String::as_str)
+                .filter(|t| !known_internal_and_index.contains(t))
+                .collect();
+            assert_eq!(
+                live_source_tables, manifest_set,
+                "live redb repository source tables diverged from the 61-table manifest"
+            );
+
+            // Also run the full RB-05b AC1–AC5 suite on pure-redb!
+            let redb_only_store: [Arc<dyn GitStateStore>; 1] = [Arc::new(state_store)];
+            run_all_rb05b_ac_assertions(&redb_only_store).await;
+        }
+    }
+
+    /// `RB-05b` single-feature SQLite regression smoke test covering AC1–AC5
+    /// and read-only tolerance of absent on-demand bridge publication tables.
+    #[cfg(feature = "storage-sqlite")]
+    #[tokio::test]
+    async fn sqlite_ai_memory_bridge_tables_smoke() {
+        let dir = tempdir().expect("create RB-05b sqlite smoke tempdir");
+        let db_path = dir.path().join("libra.db");
+        let sqlite_store = SqliteGitStateStore::create(&db_path)
+            .await
+            .expect("create SqliteGitStateStore");
+        assert_eq!(sqlite_store.backend(), StorageBackendKind::Sqlite);
+        let stores: [Arc<dyn GitStateStore>; 1] = [Arc::new(sqlite_store)];
+        run_all_rb05b_ac_assertions(&stores).await;
+
+        // Verify read-only open on a fresh SQLite DB without bridge tables returns `Ok(None)`.
+        let bare_path = dir.path().join("bare_no_bridge.db");
+        let bare_conn = crate::internal::db::schema::create_database_for_role(
+            bare_path.to_str().expect("utf8 path"),
+            crate::internal::db::schema::DatabaseRole::Repository,
+        )
+        .await
+        .expect("create bare sqlite repo db");
+        drop(bare_conn);
+        let ro = SqliteGitStateStore::open_read_only(&bare_path)
+            .await
+            .expect("open_read_only bare sqlite db");
+        assert_eq!(
+            ro.get_bridge_commit_publication("absent-op")
+                .await
+                .expect("absent commit table ok"),
+            None
+        );
+        assert_eq!(
+            ro.get_bridge_index_publication("absent-op")
+                .await
+                .expect("absent index table ok"),
+            None
+        );
+        drop(ro);
+
+        // Verify read-only open on a legacy 2-column `agent_bridge_publication` table
+        // (without the `phase` column) succeeds and defaults `phase` to `Published`.
+        {
+            use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+            let legacy_conn = crate::internal::db::schema::establish_connection_for_role(
+                bare_path.to_str().expect("utf8 path"),
+                crate::internal::db::schema::DatabaseRole::Repository,
+            )
+            .await
+            .expect("open bare sqlite db to create legacy 2-col bridge table");
+            legacy_conn
+                .execute_raw(Statement::from_string(
+                    DatabaseBackend::Sqlite,
+                    "CREATE TABLE agent_bridge_publication (operation_id TEXT PRIMARY KEY, commit_oid TEXT NOT NULL)"
+                        .to_string(),
+                ))
+                .await
+                .expect("create legacy 2-column agent_bridge_publication");
+            legacy_conn
+                .execute_raw(Statement::from_sql_and_values(
+                    DatabaseBackend::Sqlite,
+                    "INSERT INTO agent_bridge_publication (operation_id, commit_oid) VALUES (?, ?)",
+                    ["legacy-op-01".into(), sha1(4242).into()],
+                ))
+                .await
+                .expect("insert legacy bridge publication row");
+        }
+        let ro_legacy = SqliteGitStateStore::open_read_only(&bare_path)
+            .await
+            .expect("open_read_only legacy 2-col bridge db");
+        assert_eq!(
+            ro_legacy
+                .get_bridge_commit_publication("legacy-op-01")
+                .await
+                .expect("read legacy 2-col bridge publication"),
+            Some(BridgePublicationRecord {
+                operation_id: "legacy-op-01".to_string(),
+                commit_oid: sha1(4242),
+                phase: BridgePublicationPhase::Published,
+            })
         );
     }
 }
