@@ -8516,3 +8516,95 @@ fn line_history_maps_range_through_parents() {
     assert_eq!(commits, vec![&c3[..7], &c1[..7]], "commit set: {stdout}");
     assert!(!stdout.contains(&c2[..7]), "insertion excluded: {stdout}");
 }
+
+#[test]
+fn find_object_filter() {
+    use super::{assert_cli_success, run_libra_command};
+
+    // C1 adds x.txt, C2 renames it to y.txt (same blob), C3 edits y.txt.
+    let work = tempfile::tempdir().expect("work dir");
+    let repo = work.path().join("r");
+    std::fs::create_dir_all(&repo).expect("mkdir repo");
+    assert_cli_success(&run_libra_command(&["init"], &repo), "init");
+    run_libra_command(&["config", "set", "user.name", "t"], &repo);
+    run_libra_command(&["config", "set", "user.email", "t@t"], &repo);
+    let head = || {
+        let result = run_libra_command(&["rev-parse", "HEAD"], &repo);
+        assert_cli_success(&result, "rev-parse HEAD");
+        String::from_utf8_lossy(&result.stdout).trim().to_string()
+    };
+    std::fs::write(repo.join("x.txt"), "hello\n").expect("write x");
+    assert_cli_success(&run_libra_command(&["add", "x.txt"], &repo), "add x");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c1", "--no-verify"], &repo),
+        "commit c1",
+    );
+    let c1 = head();
+    let tree = {
+        let result = run_libra_command(&["rev-parse", "HEAD^{tree}"], &repo);
+        assert_cli_success(&result, "rev-parse tree");
+        String::from_utf8_lossy(&result.stdout).trim().to_string()
+    };
+    let blob = {
+        let result = run_libra_command(&["rev-parse", "HEAD:x.txt"], &repo);
+        assert_cli_success(&result, "rev-parse blob");
+        String::from_utf8_lossy(&result.stdout).trim().to_string()
+    };
+    assert_cli_success(
+        &run_libra_command(&["mv", "x.txt", "y.txt"], &repo),
+        "mv x -> y",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c2", "--no-verify"], &repo),
+        "commit c2",
+    );
+    let c2 = head();
+    std::fs::write(repo.join("y.txt"), "hello\nmore\n").expect("edit y");
+    assert_cli_success(&run_libra_command(&["add", "y.txt"], &repo), "add y");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c3", "--no-verify"], &repo),
+        "commit c3",
+    );
+    let c3 = head();
+
+    let out = |args: &[&str]| {
+        let result = run_libra_command(args, &repo);
+        assert_cli_success(&result, &format!("log {args:?}"));
+        String::from_utf8_lossy(&result.stdout).to_string()
+    };
+
+    // AC1: the unchanged blob still matches the rename commit (path move with
+    // the same object id).
+    let blob_spec = format!("--find-object={blob}");
+    let blob_hits = out(&["log", &blob_spec, "--format=%H"]);
+    assert_eq!(
+        blob_hits,
+        format!("{c3}\n{c2}\n{c1}\n"),
+        "AC1 blob matches creation, rename and edit"
+    );
+    // AC2: a tree id matches the commits around it.
+    let tree_spec = format!("--find-object={tree}");
+    let tree_hits = out(&["log", &tree_spec, "--format=%H"]);
+    assert!(tree_hits.contains(&c1), "AC2 tree matches c1: {tree_hits}");
+    assert!(
+        !tree_hits.contains(&c3),
+        "AC2 tree does not match c3: {tree_hits}"
+    );
+    // AC3: multiple values form a union.
+    let union = out(&[
+        "log",
+        &blob_spec,
+        &format!("--find-object={tree}"),
+        "--format=%H",
+    ]);
+    let mut union_lines: Vec<&str> = union.lines().collect();
+    let mut expected: Vec<&str> = vec![c1.as_str(), c2.as_str(), c3.as_str()];
+    union_lines.sort();
+    expected.sort();
+    assert_eq!(union_lines, expected, "AC3 union");
+    // AC4: an unresolvable object is a target error.
+    let bad = run_libra_command(&["log", "--find-object=bogus"], &repo);
+    assert!(!bad.status.success(), "AC4 must fail");
+    let stderr = String::from_utf8_lossy(&bad.stderr);
+    assert!(stderr.contains("LBR-CLI-003"), "AC4 code: {stderr}");
+}

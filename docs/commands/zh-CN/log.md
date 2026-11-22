@@ -65,6 +65,15 @@ libra log --format=format:
 libra log --format= --stat
 ```
 
+### `--find-object=<object>`
+
+只保留「相对第一个父提交的 diff 触及 `<object>`」的提交：变更文件对的任一侧（因此同一 blob 的重命名也算命中）或仅出现在一侧的树。选项可重复，多值取并集；无法解析的对象 ID 以 `LBR-CLI-003` 失败。
+
+```bash
+libra log --find-object=<blob> --oneline
+libra log --find-object=<blob> --find-object=<tree> --format=%H
+```
+
 ### `-R`
 
 `-R`（长写法 `--reverse-diff`）交换每个提交 diff 的新旧两侧：标签变为 `diff --git b/<path> a/<path>`，index 哈希互换，hunk 显示反向编辑，与 `git log -R` 一致；它**不**改变提交顺序（需要反转顺序请用 `--reverse`）。

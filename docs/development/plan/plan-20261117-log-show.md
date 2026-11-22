@@ -1410,7 +1410,7 @@ PY
 
 ### Task LS-18: 实现 `log --find-object=<object>`（#968）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-21：`LogArgs.find_objects: Vec<String>`（`--find-object`，可重复）；`resolve_find_objects` 以 `parse::<ObjectHash>` 解析，失败 → `LBR-CLI-003`；`commit_touches_objects` 对提交与首个父提交分别构建 `get_plain_items` 映射与 `collect_tree_ids`（递归枚举子树 ID），变更文件对的任一侧 blob 命中或仅出现在一侧的树命中即保留；`apply_find_object_filter` 在两处遍历管线接入，多值取并集。实测：blob 场景选出「创建 + 同 blob 重命名 + 编辑」三个提交，与 `git log --find-object=<blob>` 的提交集一致；tree 场景只命中其出现前后的提交。AC1–AC4 由 `command::log_test::find_object_filter` 覆盖，`log_test` 全绿；严格 Clippy exit 0；EN/zh/开发文档与 `COMPATIBILITY.md` 同卡同步。**Codex/Claude 审计按用户 2026-11-21 指令取消**。）
 
 **Description:** 在 `LogArgs` 新增 `--find-object=<object>`（可重复），按 pinned Git 的文件对语义筛选提交：在该提交相对父提交的递归 diff（含树条目）中，只要任一变更文件对的旧侧或新侧对象 ID 属于给定对象集合即命中；不是按对象出现总次数判定，因此路径移动而总数不变的提交同样命中。
 

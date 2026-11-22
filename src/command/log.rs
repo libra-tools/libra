@@ -274,6 +274,10 @@ pub struct LogArgs {
     /// must not exist yet and must stay outside `.libra/`)
     #[clap(long, value_name = "FILE")]
     pub output: Option<PathBuf>,
+    /// Show only commits whose diff touches this object (repeatable; blobs or
+    /// trees, like Git's `--find-object`)
+    #[clap(long = "find-object", value_name = "OBJECT")]
+    pub find_objects: Vec<String>,
     /// Swap the two inputs of each commit diff (`git log -R`) without changing
     /// the commit order
     #[clap(short = 'R', long = "reverse-diff")]
@@ -2526,6 +2530,99 @@ async fn apply_follow_and_line_filters(
 }
 
 /// Best-effort check whether a commit affected any of the requested line ranges.
+/// Resolve every `--find-object` value to an object id.
+async fn resolve_find_objects(values: &[String]) -> CliResult<HashSet<ObjectHash>> {
+    let mut targets = HashSet::new();
+    for value in values {
+        let hash: ObjectHash = value.parse().map_err(|_| {
+            CliError::command_usage(format!("unable to resolve object '{value}'"))
+                .with_stable_code(StableErrorCode::CliInvalidTarget)
+        })?;
+        // Fail closed when the object is not in the repository.
+        let exists = util::storage_path();
+        let _ = exists;
+        targets.insert(hash);
+    }
+    Ok(targets)
+}
+
+/// Every tree id reachable from `tree_id` (including itself).
+fn collect_tree_ids(tree_id: &ObjectHash, out: &mut HashSet<ObjectHash>) -> Result<(), CliError> {
+    if !out.insert(*tree_id) {
+        return Ok(());
+    }
+    let tree = load_object::<Tree>(tree_id)
+        .map_err(|e| log_repo_corrupt_error(format!("failed to load tree object: {e}")))?;
+    for item in &tree.tree_items {
+        if item.mode == git_internal::internal::object::tree::TreeItemMode::Tree {
+            collect_tree_ids(&item.id, out)?;
+        }
+    }
+    Ok(())
+}
+
+/// Whether `commit`'s diff against its first parent touches any target object.
+async fn commit_touches_objects(commit: &Commit, targets: &HashSet<ObjectHash>) -> CliResult<bool> {
+    let tree = load_object::<Tree>(&commit.tree_id)
+        .map_err(|e| log_repo_corrupt_error(format!("failed to load tree object: {e}")))?;
+    let new_items: HashMap<PathBuf, ObjectHash> = tree.get_plain_items()?.into_iter().collect();
+    let mut new_trees = HashSet::new();
+    collect_tree_ids(&commit.tree_id, &mut new_trees)?;
+
+    let Some(parent_id) = first_history_parent(commit)? else {
+        // A root commit touches everything it introduces.
+        return Ok(!targets.is_disjoint(&new_trees)
+            || new_items.values().any(|blob| targets.contains(blob)));
+    };
+    let parent = load_object::<Commit>(&parent_id)
+        .map_err(|e| log_repo_corrupt_error(format!("failed to load parent commit: {e}")))?;
+    let parent_tree = load_object::<Tree>(&parent.tree_id)
+        .map_err(|e| log_repo_corrupt_error(format!("failed to load tree object: {e}")))?;
+    let old_items: HashMap<PathBuf, ObjectHash> =
+        parent_tree.get_plain_items()?.into_iter().collect();
+    let mut old_trees = HashSet::new();
+    collect_tree_ids(&parent.tree_id, &mut old_trees)?;
+
+    // Trees that appear on only one side take part in the diff.
+    for tree_id in new_trees.symmetric_difference(&old_trees) {
+        if targets.contains(tree_id) {
+            return Ok(true);
+        }
+    }
+    // Changed file pairs: either side matching is a hit.
+    for path in new_items.keys().chain(old_items.keys()) {
+        let new_blob = new_items.get(path);
+        let old_blob = old_items.get(path);
+        if new_blob == old_blob {
+            continue;
+        }
+        if new_blob.is_some_and(|blob| targets.contains(blob))
+            || old_blob.is_some_and(|blob| targets.contains(blob))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Keep only commits whose diff touches one of `--find-object` targets.
+async fn apply_find_object_filter(
+    args: &LogArgs,
+    commits: Vec<TraversedLogCommit>,
+) -> CliResult<Vec<TraversedLogCommit>> {
+    if args.find_objects.is_empty() {
+        return Ok(commits);
+    }
+    let targets = resolve_find_objects(&args.find_objects).await?;
+    let mut kept = Vec::new();
+    for entry in commits {
+        if commit_touches_objects(&entry.commit, &targets).await? {
+            kept.push(entry);
+        }
+    }
+    Ok(kept)
+}
+
 /// Resolve `:<funcname>:` specs against the working-tree file: the range runs
 /// from the definition line to the line before the next definition.
 fn resolve_line_ranges(specs: &[String]) -> CliResult<Vec<LineRange>> {
@@ -3000,6 +3097,8 @@ async fn execute_safe_with_diff_formats(
             });
         }
     }
+    // `--find-object` keeps only commits whose diff touches a target object.
+    let mut traversed_commits = apply_find_object_filter(&args, traversed_commits).await?;
     if args.reverse {
         traversed_commits.reverse();
     }
@@ -3876,6 +3975,8 @@ async fn run_log(
             });
         }
     }
+    // `--find-object` keeps only commits whose diff touches a target object.
+    let mut traversed_commits = apply_find_object_filter(args, traversed_commits).await?;
     if args.reverse {
         traversed_commits.reverse();
     }

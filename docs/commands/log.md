@@ -96,6 +96,18 @@ libra log --format=format:
 libra log --format= --stat
 ```
 
+### `--find-object=<object>`
+
+Keep only the commits whose diff against their first parent touches `<object>`:
+either side of a changed file pair (so a rename with the same blob still matches)
+or a tree that appears on only one side. The option is repeatable and the values
+form a union. An object id that cannot be parsed fails with `LBR-CLI-003`.
+
+```bash
+libra log --find-object=<blob> --oneline
+libra log --find-object=<blob> --find-object=<tree> --format=%H
+```
+
 ### `-R`
 
 `-R` (long spelling `--reverse-diff`) swaps the two inputs of every commit diff:
