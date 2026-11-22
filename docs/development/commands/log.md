@@ -118,3 +118,5 @@ flowchart TD
 - 2026-11-21（LS-10 / #956）：新增 `--no-walk[=sorted|unsorted]`（只展示指定提交；`sorted` 按提交时间、`unsorted` 按命令行顺序；未知模式 `LBR-CLI-002`）与 `--tags[=<glob>]`（以匹配 `refs/tags/` 的标签所指提交为起点，无显式修订时取代隐式 `HEAD`）。回归：`command::log_test::no_walk_and_tags`（AC1–AC6）。
 
 - 2026-11-21（LS-11 / #965）：`--since`/`--until` 增加可见别名 `--after`/`--before`（同解析、同错误文本、`LBR-CLI-002`/129），`--help` 中显示别名。回归：`command::log_test::before_and_after_aliases`（AC1–AC7）。
+
+- 2026-11-21（LS-12 / #969）：新增 `-R`/`--reverse-diff`，以 log 专用 `reverse_patch` 交换 diff 的标签、index 哈希、hunk 范围与 +/- 内容行（`generate_diff`/`CommitDiffOptions` 签名不变，提交顺序不变）；澄清 #969 标题所称「`--reverse` 短别名」不符 Git 语义，按 Git `-R` 实现。回归：`command::log_test::diff_reverse_flag_r`（AC1–AC3）。

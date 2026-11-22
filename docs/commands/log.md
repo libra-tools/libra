@@ -66,6 +66,17 @@ Set the length of abbreviated commit hashes.
 libra log --abbrev 8
 ```
 
+### `-R`
+
+`-R` (long spelling `--reverse-diff`) swaps the two inputs of every commit diff:
+the labels become `diff --git b/<path> a/<path>`, the index hashes trade places and
+the hunk shows the reverse edit, matching `git log -R`. It does **not** reorder the
+commits — use `--reverse` for that.
+
+```bash
+libra log -R -p -1
+```
+
 ### `--after` / `--before`
 
 `--after=<date>` is a visible alias of `--since` and `--before=<date>` of `--until`;

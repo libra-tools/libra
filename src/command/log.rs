@@ -270,6 +270,10 @@ pub struct LogArgs {
         require_equals = true
     )]
     pub no_walk: Option<String>,
+    /// Swap the two inputs of each commit diff (`git log -R`) without changing
+    /// the commit order
+    #[clap(short = 'R', long = "reverse-diff")]
+    pub diff_reverse: bool,
     /// Pretend as if every ref under `refs/tags/` matching the pattern is
     /// listed on the command line
     #[clap(
@@ -3050,7 +3054,10 @@ async fn execute_safe_with_diff_formats(
                     block.push_str("\n\n");
                 }
             }
-            let patch_output = generate_diff(&commit, commit_path_filters.clone()).await?;
+            let mut patch_output = generate_diff(&commit, commit_path_filters.clone()).await?;
+            if args.diff_reverse {
+                patch_output = reverse_patch(&patch_output);
+            }
             block.push_str(&patch_output);
             if !block.is_empty() {
                 if !message.ends_with('\n') {
@@ -4753,6 +4760,67 @@ async fn create_reference_commit_map() -> HashMap<ObjectHash, Vec<Reference>> {
 }
 
 /// Generate unified diff between commit and its first parent (or empty tree)
+/// Swap the two sides of a rendered patch (`git log -R`): labels, index
+/// hashes, hunk ranges and the +/- content lines all flip, the commit order is
+/// untouched.
+fn reverse_patch(patch: &str) -> String {
+    let swap_prefix = |token: &str| -> String {
+        if let Some(rest) = token.strip_prefix("a/") {
+            format!("b/{rest}")
+        } else if let Some(rest) = token.strip_prefix("b/") {
+            format!("a/{rest}")
+        } else {
+            token.to_string()
+        }
+    };
+    let mut out = String::with_capacity(patch.len());
+    for line in patch.split_inclusive('\n') {
+        let (body, newline) = match line.strip_suffix('\n') {
+            Some(body) => (body, "\n"),
+            None => (line, ""),
+        };
+        let rewritten = if let Some(rest) = body.strip_prefix("diff --git ") {
+            // Swap the two path tokens, Git prints `diff --git b/x a/x`.
+            let mut tokens = rest.splitn(2, ' ');
+            match (tokens.next(), tokens.next()) {
+                (Some(first), Some(second)) => {
+                    format!("diff --git {second} {first}")
+                }
+                _ => body.to_string(),
+            }
+        } else if body.starts_with("--- ") || body.starts_with("+++ ") {
+            let (marker, path) = body.split_at(4);
+            format!("{marker}{}", swap_prefix(path))
+        } else if let Some(rest) = body.strip_prefix("index ") {
+            match rest.split_once(' ') {
+                Some((ranges, mode)) => match ranges.split_once("..") {
+                    Some((old, new)) => format!("index {new}..{old} {mode}"),
+                    None => body.to_string(),
+                },
+                None => body.to_string(),
+            }
+        } else if let Some(rest) = body.strip_prefix("@@ -") {
+            // `@@ -a,b +c,d @@` -> `@@ -c,d +a,b @@`.
+            match rest.split_once(" @@") {
+                Some((ranges, tail)) => match ranges.split_once(" +") {
+                    Some((minus, plus)) => format!("@@ -{plus} +{minus} @@{tail}"),
+                    None => body.to_string(),
+                },
+                None => body.to_string(),
+            }
+        } else if let Some(rest) = body.strip_prefix('+') {
+            format!("-{rest}")
+        } else if let Some(rest) = body.strip_prefix('-') {
+            format!("+{rest}")
+        } else {
+            body.to_string()
+        };
+        out.push_str(&rewritten);
+        out.push_str(newline);
+    }
+    out
+}
+
 pub(crate) async fn generate_diff(
     commit: &Commit,
     paths: Vec<PathBuf>,

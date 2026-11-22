@@ -7770,3 +7770,72 @@ fn before_and_after_aliases() {
     assert!(help.contains("--after"), "AC6");
     assert!(help.contains("--before"), "AC7");
 }
+
+#[test]
+fn diff_reverse_flag_r() {
+    use super::{assert_cli_success, run_libra_command};
+
+    // Fixture F12: C1 adds a.txt (line1/line2), C2 appends line3.
+    let work = tempfile::tempdir().expect("work dir");
+    let repo = work.path().join("r");
+    std::fs::create_dir_all(&repo).expect("mkdir repo");
+    assert_cli_success(&run_libra_command(&["init"], &repo), "init");
+    run_libra_command(&["config", "set", "user.name", "t"], &repo);
+    run_libra_command(&["config", "set", "user.email", "t@t"], &repo);
+    std::fs::write(repo.join("a.txt"), "line1\nline2\n").expect("write a");
+    assert_cli_success(&run_libra_command(&["add", "a.txt"], &repo), "add a");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c1", "--no-verify"], &repo),
+        "commit c1",
+    );
+    let c1 = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], &repo).stdout)
+        .trim()
+        .to_string();
+    std::fs::write(repo.join("a.txt"), "line1\nline2\nline3\n").expect("write b");
+    assert_cli_success(&run_libra_command(&["add", "a.txt"], &repo), "add b");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c2", "--no-verify"], &repo),
+        "commit c2",
+    );
+    let c2 = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], &repo).stdout)
+        .trim()
+        .to_string();
+
+    let out = |args: &[&str]| {
+        let result = run_libra_command(args, &repo);
+        assert_cli_success(&result, &format!("log {args:?}"));
+        String::from_utf8_lossy(&result.stdout).to_string()
+    };
+
+    // AC1: the patch body matches `git log -R -p -1` byte for byte (labels
+    // swapped, index hashes swapped, `line3` shown as a deletion).
+    let patch = out(&["log", "-R", "-p", "-1"]);
+    let body = patch
+        .split_once("diff --git ")
+        .map(|(_, rest)| format!("diff --git {rest}"))
+        .expect("patch body");
+    assert_eq!(
+        body,
+        "diff --git b/a.txt a/a.txt\n\
+         index 83db48f..c0d0fb4 100644\n\
+         --- b/a.txt\n\
+         +++ a/a.txt\n\
+         @@ -1,3 +1,2 @@\n\
+         \x20line1\n\
+         \x20line2\n\
+         -line3\n",
+        "AC1"
+    );
+    // AC2: `-R` leaves the commit order untouched.
+    assert_eq!(
+        out(&["log", "-R", "--format=%H"]),
+        out(&["log", "--format=%H"]),
+        "AC2"
+    );
+    // AC3: `--reverse` still prints oldest first.
+    assert_eq!(
+        out(&["log", "--reverse", "--format=%H"]),
+        format!("{c1}\n{c2}\n"),
+        "AC3"
+    );
+}

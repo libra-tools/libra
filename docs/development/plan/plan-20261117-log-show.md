@@ -935,7 +935,7 @@ PY
 
 ### Task LS-12: 支持 `log -R` 反转 diff 输入方向（#969）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-21：新增 `-R`/`--reverse-diff`；按 ADR-LS-01 的边界以 log 专用 `reverse_patch` 实现——交换 `diff --git` 两个路径、`---`/`+++` 前缀、`index` 哈希、`@@ -a +b @@` 范围与 +/- 内容行；`generate_diff`/`generate_diff_with_options`/`CommitDiffOptions` 签名与字段未变，`format_patch` 不受影响，提交顺序不变；#969 标题「`--reverse` 短别名」的表述与本卡按 Git 权威语义（`-R` 反转 diff 输入）实现并在卡内记录澄清。AC1–AC3 由 `command::log_test::diff_reverse_flag_r` 覆盖（AC1 与 `git log -R -p -1` 的 patch 主体逐字节一致），`command::format_patch_test` 与 `log_test` 全绿；严格 Clippy exit 0。**Codex/Claude 审计按用户 2026-11-21 指令取消**。）
 
 **Description:** 在 `LogArgs` 新增 `-R`：按 `ADR-LS-01` 首次引入 log 专用 `pub(crate) struct LogDiffOptions`（初始字段 `reverse`）与 log 专用 diff 生成入口，在该入口内交换每个提交 diff 的新旧两侧，与 `git log -R` 一致，**不改变**提交遍历顺序；既有 `generate_diff` / `generate_diff_with_options` 签名与 `CommitDiffOptions` 字段保持不变（`src/command/format_patch.rs` 不改）。注：#969 标题误称 `--reverse` 短别名，本卡按 Git 权威语义实现并记录澄清以关闭 #969。
 

@@ -55,6 +55,14 @@ libra log --abbrev-commit
 libra log --abbrev 8
 ```
 
+### `-R`
+
+`-R`（长写法 `--reverse-diff`）交换每个提交 diff 的新旧两侧：标签变为 `diff --git b/<path> a/<path>`，index 哈希互换，hunk 显示反向编辑，与 `git log -R` 一致；它**不**改变提交顺序（需要反转顺序请用 `--reverse`）。
+
+```bash
+libra log -R -p -1
+```
+
 ### `--after` / `--before`
 
 `--after=<date>` 是 `--since` 的可见别名，`--before=<date>` 是 `--until` 的可见别名；两种拼写的解析与报错完全一致（无法解析的日期仍为 `LBR-CLI-002`、退出码 129）。
