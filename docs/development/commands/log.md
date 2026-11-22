@@ -106,3 +106,5 @@ flowchart TD
 - 2026-11-21（LS-02 / #950）：`log.decorate` 现在接受 Git 布尔值（真值→`short`、假值→`no`）且非法值等同关闭但不报错；命令行 `--pretty=raw`/`--format=raw` 抑制配置装饰（显式 `--decorate` 优先，`format.pretty=raw` 不抑制）。回归：`command::log_test::test_log_decorate_config_boolean_and_raw_suppression`。
 
 - 2026-11-21（LS-03 / #951）：`log.excludeDecoration` 多值配置参与装饰过滤（显式 `--decorate-refs` 覆盖配置）；空串值按 Git 空排除模式处理，`HEAD` 标记保留；Libra 配置无「无值键」形态，缺值诊断登记为有意差异。回归：`command::log_test::log_exclude_decoration_config`。
+
+- 2026-11-21（LS-05 / #953）：新增 `--simplify-by-decoration`——保留经装饰过滤后的被引用提交与仓库根提交，其余丢弃；与本机 `git 2.56.0` 同夹具输出逐字一致（线性、分支、合并与 `--decorate-refs`/`--decorate-refs-exclude` 过滤）。回归：`command::log_test::simplify_by_decoration`。

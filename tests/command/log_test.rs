@@ -7240,3 +7240,92 @@ fn decorate_refs_issue_952_remaining() {
         "AC4"
     );
 }
+
+#[test]
+fn simplify_by_decoration() {
+    use super::{assert_cli_success, run_libra_command};
+
+    // Fixture F05: root → a → b(tag v1) → c on main; side branches from `a`
+    // (s1, s2 tag v2) and is merged back into main.
+    let repo = tempfile::tempdir().expect("repo");
+    let p = repo.path();
+    assert_cli_success(&run_libra_command(&["init"], p), "init");
+    run_libra_command(&["config", "set", "user.name", "t"], p);
+    run_libra_command(&["config", "set", "user.email", "t@t"], p);
+    let commit = |msg: &str, file: &str, content: &str| {
+        std::fs::write(p.join(file), content).expect("write file");
+        assert_cli_success(&run_libra_command(&["add", file], p), "stage");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", msg, "--no-verify"], p),
+            "commit",
+        );
+        String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], p).stdout)
+            .trim()
+            .to_string()
+    };
+    let root = commit("root", "f", "r\n");
+    let a = commit("a", "f", "a\n");
+    let b = commit("b", "f", "b\n");
+    assert_cli_success(&run_libra_command(&["tag", "-m", "v1", "v1"], p), "tag v1");
+    let c = commit("c", "f", "c\n");
+    assert_cli_success(
+        &run_libra_command(&["branch", "side", &a], p),
+        "branch side",
+    );
+    assert_cli_success(&run_libra_command(&["switch", "side"], p), "switch side");
+    commit("s1", "s", "s1\n");
+    let s2 = commit("s2", "s", "s2\n");
+    assert_cli_success(&run_libra_command(&["tag", "-m", "v2", "v2"], p), "tag v2");
+    assert_cli_success(&run_libra_command(&["switch", "main"], p), "back to main");
+    assert_cli_success(
+        &run_libra_command(&["merge", "side", "-m", "merge", "--no-ff"], p),
+        "merge side",
+    );
+    let merge = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], p).stdout)
+        .trim()
+        .to_string();
+    assert!(
+        !merge.is_empty() && merge != c,
+        "the merge created a commit"
+    );
+
+    let list = |args: &[&str]| {
+        let out = run_libra_command(args, p);
+        assert_cli_success(&out, "log runs");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+
+    // AC1: decorated commits plus the repository root (Git 2.56.0 fixture).
+    assert_eq!(
+        list(&["log", "--simplify-by-decoration", "--format=%H"]),
+        vec![merge.clone(), s2.clone(), b.clone(), root.clone()],
+        "AC1"
+    );
+
+    // AC2: only `v2` decorates → s2 plus the root.
+    assert_eq!(
+        list(&[
+            "log",
+            "--simplify-by-decoration",
+            "--decorate-refs=refs/tags/v2",
+            "--format=%H",
+        ]),
+        vec![s2.clone(), root.clone()],
+        "AC2"
+    );
+
+    // AC3: excluding `v2` keeps the branch/merge decorations.
+    assert_eq!(
+        list(&[
+            "log",
+            "--simplify-by-decoration",
+            "--decorate-refs-exclude=refs/tags/v2",
+            "--format=%H",
+        ]),
+        vec![merge, s2, b, root],
+        "AC3"
+    );
+}

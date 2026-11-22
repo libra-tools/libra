@@ -566,7 +566,7 @@ PY
 
 ### Task LS-05: 实现 `log --simplify-by-decoration`（#953）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `complete`（2026-11-21：`LogArgs` 新增 `--simplify-by-decoration`；实现为「保留经装饰过滤后的被引用提交 + 仓库根提交」，装饰过滤复用 `decorate_name_allowed`/`decorate_ref_allowed`（含 `log.excludeDecoration`）；简化时即使装饰输出关闭也会构建引用映射。用例 `simplify_by_decoration` 覆盖 AC1–AC3（线性+分支+合并夹具）：输出序列 `merge, s2, b, root`、`s2, root`、`merge, s2, b, root`，与本机 `git 2.56.0` 同夹具 `git log --simplify-by-decoration` 结果逐字一致。`log_test` **259/259**；文档 EN/zh-CN/开发版同步；版本面 0.30.282 → 0.30.283。按用户 2026-11-20 指令在 `main` 直接提交推送。）
 
 **Description:** 在 `LogArgs` 新增 `--simplify-by-decoration`，按 Git 语义以装饰为依据简化历史：被（经装饰过滤后的）分支或 tag 引用的提交必选，Git 为保持有意义的历史还会额外显示部分未装饰提交（`git@6de20f6092:Documentation/rev-list-options.adoc` 的 `--simplify-by-decoration` 段）；输出以 `git@6de20f6092` 同夹具输出为准，不以「只输出被装饰提交」实现。
 

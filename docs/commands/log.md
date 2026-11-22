@@ -415,6 +415,12 @@ cannot represent Git's valueless `[log] excludeDecoration` key (config values ar
 Decorations include remote-tracking refs (`origin/main`) between tags and local
 branch names, matching Git's ordering.
 
+### `--simplify-by-decoration`
+
+Keep only the commits referenced by a (filtered) decoration plus the repository
+root(s), dropping the commits in between. `--decorate-refs`/`--decorate-refs-exclude`
+narrow which references count, so the simplification follows the filtered set.
+
 ### `--no-decorate`
 
 Do not print ref names. Overrides `--decorate`.

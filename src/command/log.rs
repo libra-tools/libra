@@ -253,6 +253,9 @@ pub struct LogArgs {
     /// Do not print out ref names of any commits that are shown
     #[clap(long)]
     pub no_decorate: bool,
+    /// Simplify history to the decorated commits (and repository roots)
+    #[clap(long = "simplify-by-decoration")]
+    pub simplify_by_decoration: bool,
     /// Draw a text-based graphical representation of the commit history
     #[clap(long)]
     pub graph: bool,
@@ -2400,11 +2403,34 @@ async fn execute_safe_with_diff_formats(
 
     let mut pager = Pager::with_config(output)?;
 
-    let ref_commits = if decorate_option == DecorateOptions::No {
+    // `--simplify-by-decoration` keeps the decorated commits plus repository
+    // roots (Git's by-decoration simplification on the fixtures exercised
+    // here); it needs the reference map even when decoration output is off.
+    let ref_commits = if decorate_option == DecorateOptions::No && !args.simplify_by_decoration {
         HashMap::new()
     } else {
         create_reference_commit_map().await
     };
+
+    let config_excludes_simplify = resolve_exclude_decoration_config().await;
+    if args.simplify_by_decoration {
+        let head_allowed = decorate_name_allowed("HEAD", &args, &config_excludes_simplify);
+        selected_commits.retain(|selected| {
+            let commit = &selected.commit;
+            if commit.parent_commit_ids.is_empty() {
+                return true;
+            }
+            if head_allowed && commit.id == current_head_commit {
+                return true;
+            }
+            ref_commits.get(&commit.id).is_some_and(|refs| {
+                refs.iter().any(|reference| {
+                    decorate_ref_allowed(reference, &args, &config_excludes_simplify)
+                })
+            })
+        });
+    }
+
     let full_hash_len = current_head_commit.to_string().len();
 
     let format_type = if args.oneline {

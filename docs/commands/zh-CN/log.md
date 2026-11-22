@@ -315,6 +315,10 @@ libra log --decorate=full
 
 装饰包含远程跟踪引用（`origin/main`），按 Git 顺序排在 tag 之后、本地分支之前。
 
+### `--simplify-by-decoration`
+
+只保留被（过滤后的）装饰引用的提交与仓库根提交，丢弃中间提交；`--decorate-refs`/`--decorate-refs-exclude` 会收窄参与简化的引用集合。
+
 ### `--no-decorate`
 
 不打印 ref 名称。覆盖 `--decorate`。
