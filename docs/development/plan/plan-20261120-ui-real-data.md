@@ -137,7 +137,7 @@
 
 | 时间 | 触发 | 变更内容 | 原卡 → 新卡 | 受影响的引用 |
 |---|---|---|---|---|
-| 2026-11-21 20:00:00 UTC | UID-07 执行期评审（Codex/Claude 十轮） | 有界可用性探针（schema/busy/权限分类、连接超时）、Unchecked 占位与 stale 分离、探针独立字段不占序列、失败快照保留探针、状态页/标签/导入文案、demo 徽标集合、catalog 删除；debug 单测预算 ≤600ms（release 仍 ≤150ms）；EX-UID-07-01 登记 | `UID-07` AC/VER/写集与映射 | UID-07 AC/VER、写集、AC→test 映射 |
+| 2026-11-21 20:00:00 UTC | UID-07 执行期评审（Codex/Claude 十轮） | 有界可用性探针（schema/busy/权限分类、连接超时）、Unchecked 占位与 stale 分离、探针独立字段不占序列、失败快照保留探针、状态页/标签/导入文案、demo 徽标集合、catalog 删除；debug 单测预算 ≤600ms（release 仍 ≤150ms）；EX-UID-07-01 登记；Windows release 用 nightly toolchain 并通过（v0.30.317） | `UID-07` AC/VER/写集与映射 | UID-07 AC/VER、写集、AC→test 映射 |
 | 2026-11-21 16:00:00 UTC | UID-04 执行期评审（Codex/Claude 十八轮） | 共享 `operation_snapshot_rows`（50k 上限/truncated）；生产 `filtered_page` 先过滤后分页；独立搜索/命令过滤与翻页夹紧；快照交付重置；绝对路径（引号/列表/URL/Windows）脱敏；schema 兼容与缺账本分类；只读逻辑指纹；真实 50k/10k fixture 与终止化用例 | `UID-04` AC/VER/写集与映射 | UID-04 AC/VER、写集、AC→test 映射 |
 | 2026-11-21 12:00:00 UTC | UID-03 执行期评审（Codex/Claude 二十一轮，末轮双 PASS） | 共享 `SESSION_PAGE_COLUMNS` 提升；`SessionSummaryRead::prepare_for` 支持 agent 感知与共享预算；catalog/单行失败分离（`CatalogBusy`/`DatabaseBusy` 保锁分类，`CatalogUnavailable` 页面级）；逐行摘要状态（malformed/unavailable）与可读性过滤；typed Sessions 源级状态（Stale/Absent/Busy/SchemaOld/SchemaNew）；链接与摘要上限；只读逻辑指纹；搜索/过滤/选择/状态消息回归用例 | `UID-03` AC/VER/写集与映射、EX-UID-03-01 登记 | UID-03 写集、AC→test 映射、ADR-UID-06（状态分类口径） |
 | 2026-11-21 08:00:00 UTC | UID-02 执行期评审（Claude/Codex） | History 提交按提交时间倒序并截断 200 行；归属查询按 CaptureScope（repo/worktree/workspace/fence）过滤、scope 由注入仓库连接解析、fence 仅 SELECT；归属失败降级为 Human 而不隐藏提交；补 tombstone/merge/过滤用例；Verification 改用既有 `session_list_walks_keyset_pages`；写集补 `snapshot.rs`/`worker.rs`/`widgets.rs` | `UID-02` AC/VER/写集 | UID-02 AC/VER/写集、ADR-UID-03 |
@@ -848,7 +848,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `done` / `remote-pending`
+**Lifecycle / Acceptance:** `done` / `complete`
 
 **Description:** 让 Splash、Welcome、About 与 Capability map 反映真实仓库与数据面可用性：显示仓库是否已打开、分支/HEAD、各数据源（capture、memory、operation、runs、history）的状态；替换固定文案与插图，删除 `catalog()`/`sessions.json` 并改写 `search`/`capabilities` 消费者，把窗口标签改为 "Read-only preview"。行为轴是**状态与可用性呈现**。
 
@@ -1057,7 +1057,7 @@ Result 只允许 `PASS` 或 `FAIL`。`FAIL` 必须列出 P0/P1 条目并在下�
 - [x] 必要的 docs/compat/error-code/test-index 更新已完成（含网站 `cf` 交付、Claude Code PASS 与部署检查）。
 - [x] 每张卡的 `Rollback mode` 已被实际验证：收口时对 UID-07 提交做一次 `libra revert --no-commit` 补偿演练（树恢复编译通过），随后 `libra reset --hard` 回到发布树；其余卡按同一 `compensating` 模式登记。
 - [x] Codex（或维护者指定 reviewer）最终结论为 `PASS`，P0/P1 全部关闭（UID-07 round 19 双 PASS）。
-- [x] 每张卡已 `patch + 1`、版本面集合一致、`Cargo.lock` 仅由工具链刷新、`gh release create` 触发 `release.yml`：0.30.229/0.30.240/0.30.253/0.30.276/0.30.277/0.30.284/0.30.299 均已发布。D 组证据：各卡 `codeql.yml` success、`base.yml`/`release.yml` 以 Linux jobs success 为主；最新 0.30.299 的 `release.yml` 仅 Windows job 失败（`error[E0658] use of unstable library feature windows_by_handle`，来自上游依赖的 Windows runner MSRV，非本计划代码），macOS job 被后续上游提交 supersede-cancel，登记 `FIX-UID-07-01`。
+- [x] 每张卡已 `patch + 1`、版本面集合一致、`Cargo.lock` 仅由工具链刷新、`gh release create` 触发 `release.yml`：0.30.229/0.30.240/0.30.253/0.30.276/0.30.277/0.30.284/0.30.299 均已发布。D 组证据：`UID-01`..`UID-06` 的 `release.yml`/`codeql.yml` 均 success；`UID-07` 的 `release.yml` 曾因 Windows `windows_by_handle` unstable 失败，已用 nightly Windows toolchain + crate feature attr 修复并发布 v0.30.317，四平台与 homebrew/manifest 全部 success（`FIX-UID-07-01` 已关闭）。
 - [x] 「修订历史」已记录成稿后的全部规范性变更（G-09）。
 - [x] 本计划未新建证据文件或证据文件夹（v2.12）。
 - [x] `plan-status.md` 的计划行与 §五/§六 登记、`plan-long.md` 日期计划索引已同步。
