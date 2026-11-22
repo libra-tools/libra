@@ -1321,7 +1321,7 @@
 
 ### Task DESC-10i: `refs/tags/` 命名空间 describe 后缀解析非提交对象（tree、blob、附注 tag）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空` | **Priority / Selection:** P1 | **Issue:** [#798](https://github.com/libra-tools/libra/issues/798)、[#799](https://github.com/libra-tools/libra/issues/799)
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `complete`（2026-11-21：`refs/` 限定形式的非提交对象放行——`resolve_describe_hash_typed` 的单候选分支返回对象自身，与短形式一致；共享用例 `describe_suffix_refs_namespaces_accept_non_commit_objects` 对 `refs/tags/`、`refs/heads/`、`refs/remotes/` 三种前缀的 blob/tree 后缀逐项断言。`rev_parse_test` **64/64**；版本面 0.30.274 → 0.30.275。本卡为 `REL-DESC-09` 子卡，只本地签名提交。按用户 2026-11-20 指令在 `main` 直接提交推送。） | **Priority / Selection:** P1 | **Issue:** [#798](https://github.com/libra-tools/libra/issues/798)、[#799](https://github.com/libra-tools/libra/issues/799)
 
 **Description:** 自 `DESC-09` 拆出；家族 `REL-DESC-09` 子卡（14/16）。为 `DESC-10c` 已接入的 `refs/tags/` describe 后缀放开 tree、blob 与附注 tag 对象（均返回对象自身，tag 不剥皮），至此 `refs/tags/` 与 Git 的对象类型范围一致；两 blob 共享前缀仍按 `ADR-DESC-03` ② 以 `LBR-CLI-003` 失败。
 
@@ -1374,7 +1374,7 @@
 
 ### Task DESC-10j: `refs/heads/` 命名空间 describe 后缀解析非提交对象（tree、blob、附注 tag）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空` | **Priority / Selection:** P1 | **Issue:** [#798](https://github.com/libra-tools/libra/issues/798)、[#799](https://github.com/libra-tools/libra/issues/799)
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `complete`（2026-11-21：`refs/` 限定形式的非提交对象放行——`resolve_describe_hash_typed` 的单候选分支返回对象自身，与短形式一致；共享用例 `describe_suffix_refs_namespaces_accept_non_commit_objects` 对 `refs/tags/`、`refs/heads/`、`refs/remotes/` 三种前缀的 blob/tree 后缀逐项断言。`rev_parse_test` **64/64**；版本面 0.30.274 → 0.30.275。本卡为 `REL-DESC-09` 子卡，只本地签名提交。按用户 2026-11-20 指令在 `main` 直接提交推送。） | **Priority / Selection:** P1 | **Issue:** [#798](https://github.com/libra-tools/libra/issues/798)、[#799](https://github.com/libra-tools/libra/issues/799)
 
 **Description:** 自 `DESC-09` 拆出；家族 `REL-DESC-09` 子卡（15/16）。为 `DESC-10d` 已接入的 `refs/heads/` describe 后缀放开 tree、blob 与附注 tag 对象（均返回对象自身，tag 不剥皮），至此 `refs/heads/` 与 Git 的对象类型范围一致；两 blob 共享前缀仍按 `ADR-DESC-03` ② 以 `LBR-CLI-003` 失败。
 
@@ -1427,7 +1427,7 @@
 
 ### Task DESC-10k: `refs/remotes/` 命名空间 describe 后缀解析非提交对象（tree、blob、附注 tag）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空` | **Priority / Selection:** P1 | **Issue:** [#798](https://github.com/libra-tools/libra/issues/798)、[#799](https://github.com/libra-tools/libra/issues/799)
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `complete`（2026-11-21：`refs/` 限定形式的非提交对象放行——`resolve_describe_hash_typed` 的单候选分支返回对象自身，与短形式一致；共享用例 `describe_suffix_refs_namespaces_accept_non_commit_objects` 对 `refs/tags/`、`refs/heads/`、`refs/remotes/` 三种前缀的 blob/tree 后缀逐项断言。`rev_parse_test` **64/64**；版本面 0.30.274 → 0.30.275。本卡为 `REL-DESC-09` 子卡，只本地签名提交。按用户 2026-11-20 指令在 `main` 直接提交推送。） | **Priority / Selection:** P1 | **Issue:** [#798](https://github.com/libra-tools/libra/issues/798)、[#799](https://github.com/libra-tools/libra/issues/799)
 
 **Description:** 自 `DESC-09` 拆出；家族 `REL-DESC-09` 子卡（16/16）。为 `DESC-10e` 已接入的 `refs/remotes/` describe 后缀放开 tree、blob 与附注 tag 对象（均返回对象自身，tag 不剥皮），至此 `refs/remotes/` 与 Git 的对象类型范围一致；两 blob 共享前缀仍按 `ADR-DESC-03` ② 以 `LBR-CLI-003` 失败。
 
