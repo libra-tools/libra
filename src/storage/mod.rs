@@ -18,6 +18,8 @@ pub mod backend;
 #[cfg(any(feature = "storage-redb", feature = "storage-queue"))]
 pub mod codec;
 pub mod error;
+#[cfg(feature = "storage-redb")]
+pub mod opener;
 
 pub use backend::{
     LIBRA_STORAGE_BACKEND_ENV, REDB_RUNTIME_UNLOCKED, StorageBackendKind,

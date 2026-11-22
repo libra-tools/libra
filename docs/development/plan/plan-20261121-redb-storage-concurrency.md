@@ -955,7 +955,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `remote-pending`
 
 **Description:** 100% 在 `src/storage/` 内交付 `redb` 多进程打开器（`opener.rs`）：统一配置 `ConcurrencyMode::MultiWriter` 与分层缓存上限（只读 `16 MiB`、常规写 `32 MiB`、长驻 `64 MiB`），并经 `spawn_blocking` 实现有界 `try_begin_write` 退避与 `commit()`。
 
@@ -970,17 +970,17 @@
 | `redb 5.0.0` 默认 `ExclusiveWriter` + `1 GiB` 缓存，多进程并发打开须显式配置 `MultiWriter` 与按角色缓存上限 | `redb-5.0.0/src/db.rs:2253-2333,2454-2460` |
 
 **Acceptance criteria:**
-- [ ] 打开器统一配置 `ConcurrencyMode::MultiWriter`。
-- [ ] 只读打开配置强制缓存上限为 `16 MiB`。
-- [ ] 常规写打开配置强制缓存上限为 `32 MiB`。
-- [ ] 长驻进程（`agent bridge`/`daemon`/消费者）打开配置强制缓存上限为 `64 MiB`。
-- [ ] 同一 `.redb` 文件支持多进程并发打开 `Database` 与 `ReadOnlyDatabase`，不触发 `DatabaseAlreadyOpen`。
-- [ ] `begin_write_bounded` 在另一进程持写锁超过 deadline 时按期返回类型化忙错误。
+- [x] 打开器统一配置 `ConcurrencyMode::MultiWriter`。
+- [x] 只读打开配置强制缓存上限为 `16 MiB`。
+- [x] 常规写打开配置强制缓存上限为 `32 MiB`。
+- [x] 长驻进程（`agent bridge`/`daemon`/消费者）打开配置强制缓存上限为 `64 MiB`。
+- [x] 同一 `.redb` 文件支持多进程并发打开 `Database` 与 `ReadOnlyDatabase`，不触发 `DatabaseAlreadyOpen`。
+- [x] `begin_write_bounded` 在另一进程持写锁超过 deadline 时按期返回类型化忙错误。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --no-default-features --features storage-redb,storage-queue --lib -E 'test(=storage::opener::tests::multiwriter_concurrent_open_and_bounded_write_timeout)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=storage::opener::tests::multiwriter_concurrent_open_and_bounded_write_timeout)'`（new，覆盖 AC1–AC6）
-- [ ] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 2 文件实现白名单（`src/storage/mod.rs`、`src/storage/opener.rs`）。
+- [x] `source .env.test && cargo nextest list --no-default-features --features storage-redb,storage-queue --lib -E 'test(=storage::opener::tests::multiwriter_concurrent_open_and_bounded_write_timeout)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=storage::opener::tests::multiwriter_concurrent_open_and_bounded_write_timeout)'`（new，覆盖 AC1–AC6）
+- [x] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 2 文件实现白名单（`src/storage/mod.rs`、`src/storage/opener.rs`）。
 
 **Full-suite trigger:** `none`
 
@@ -10015,8 +10015,9 @@
 | `RB-01` | `done` / `remote-pending` | `57fed0f`（`main`） | `0.30.278` | 2026-11-22 03:39:49 UTC：AC1–AC8（未暂存+已暂存双态）、4 特性编译矩阵（`redb 5.0.0`/`postcard 1.2.0`/`crc32c 0.6.9`）、`cargo +nightly fmt --all --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo doc --no-deps --all-features`、`compat_version_surface_sync`、`compat_matrix_alignment`、`compat_serial_registry` 全绿；Codex 只读审查 `01a20155-954e-7f10-a16a-d2edb84b0569` `VERDICT: PASS`（P0/P1/P2=0） |
 | `RB-01d` | `done` / `remote-pending` | `5f74eba`（`main`） | `0.30.279` | 2026-11-22 03:46:22 UTC：Stage 1 精确 1 文件写集、AC1–AC6（双关 `compile_error!` + 4 特性编译矩阵 + `storage-redb` 隐式 `storage-queue` 断言）、fmt、严格 clippy、rustdoc、`compat_version_surface_sync` 全绿；Codex `01a2015b-e3a7-75f0-8d1a-27bd39e38f6d` `VERDICT: PASS`（P0/P1/P2=0） |
 | `RB-01b` | `done` / `remote-pending` | `63088e8`（`main`） | `0.30.285` | 2026-11-22 06:45:49 UTC：Stage 1 精确 3 文件写集、`versioned_postcard_roundtrip_and_corrupt_reject` 与 `io_error_display_and_cli_error_do_not_leak_sensitive_source_text`（含跨版本显式分发与 `anyhow` `{error:#}` 链路脱敏）全绿、4 特性矩阵、fmt、严格 clippy、rustdoc、`compat_version_surface_sync` 全绿；Codex R3 `01a20200-379a-7b71-aaab-73ab6e680f74` `VERDICT: PASS` |
-| `RB-01c` | `done` / `remote-pending` | 本提交（`main`） | `0.30.286` | 2026-11-22 07:17:48 UTC：Stage 1 精确 2 文件写集、`sqlite_only_rejects_redb_override`/`redb_only_rejects_sqlite_override`/`dual_feature_resolution_and_pre_release_cli_gate`（含独立子进程实测 `resolve()` 与非法值占位脱敏）全绿、fmt、严格 clippy、`compat_version_surface_sync` 全绿；Codex R2 `01a2021d-77b7-7c90-9146-40618689ff47` `VERDICT: PASS` |
-| `RB-02`..`RB-34c`（剩余 150 卡） | `pending` | — | — | 按实施顺序于 `main` 逐卡推进 |
+| `RB-01c` | `done` / `remote-pending` | `0ae1cfb`（`main`） | `0.30.286` | 2026-11-22 07:17:48 UTC：Stage 1 精确 2 文件写集、`sqlite_only_rejects_redb_override`/`redb_only_rejects_sqlite_override`/`dual_feature_resolution_and_pre_release_cli_gate`（含独立子进程实测 `resolve()` 与非法值占位脱敏）全绿、fmt、严格 clippy、`compat_version_surface_sync` 全绿；Codex R2 `01a2021d-77b7-7c90-9146-40618689ff47` `VERDICT: PASS` |
+| `RB-02` | `done` / `remote-pending` | 本提交（`main`） | `0.30.287` | 2026-11-22 07:57:32 UTC：Stage 1 精确 2 文件写集、`multiwriter_concurrent_open_and_bounded_write_timeout`（含 `RecordingBuilder` 校验 `MultiWriter` + `16/32/64 MiB`、阻塞池饱和 `Duration::ZERO` 及非零 deadline、多进程并发打开与有界写锁超时、`UpgradeRequired` 按格式版本可操作指引）全绿、4 特性矩阵、fmt、严格 clippy、rustdoc、`compat_version_surface_sync` 全绿；Codex R5 `01a20241-78d9-70d1-be41-35093cc20ca8` `VERDICT: PASS` |
+| `RB-02d`..`RB-34c`（剩余 149 卡） | `pending` | — | — | 按实施顺序于 `main` 逐卡推进 |
 
 ## Codex review log
 
