@@ -23,6 +23,14 @@ use std::{
     },
     time::Duration,
 };
+#[cfg(unix)]
+use std::{
+    ffi::{CString, OsStr},
+    os::unix::{
+        ffi::OsStrExt,
+        io::{AsRawFd, FromRawFd, OwnedFd},
+    },
+};
 
 use async_trait::async_trait;
 use redb::{
@@ -31,6 +39,17 @@ use redb::{
 };
 use serde::{Deserialize, Serialize};
 
+#[cfg(unix)]
+use crate::storage::{
+    capture_store::{CAPTURE_DB_FILE_MODE, CAPTURE_PRIVATE_DIR_MODE},
+    opener::CACHE_SIZE_READ_ONLY,
+    redb::{map_capture_owner_mismatch_err, map_capture_symlink_err, map_redb_database_err},
+};
+#[cfg(not(unix))]
+use crate::storage::{
+    manifest::fsync_dir,
+    opener::{create_redb_writable, open_redb_read_only, open_redb_writable},
+};
 use crate::{
     internal::db::schema::{CAPTURE_SCHEMA_NAME, CAPTURE_SCHEMA_VERSION, DatabaseRole},
     storage::{
@@ -67,12 +86,8 @@ use crate::{
         },
         codec::{decode_versioned, encode_versioned},
         error::{StorageBackendError, StorageResult},
-        manifest::fsync_dir,
         meta::{begin_checked_read, begin_checked_write_blocking, init_meta_schema},
-        opener::{
-            RedbRepairContext, begin_write_bounded_blocking, create_redb_writable,
-            open_redb_read_only, open_redb_writable,
-        },
+        opener::{RedbRepairContext, begin_write_bounded_blocking},
         redb::{
             map_append_only_err, map_redb_commit_err, map_redb_storage_err, map_redb_table_err,
             map_tombstone_protected_err,
@@ -1058,9 +1073,67 @@ fn delete_checkpoint_in_wtx(wtx: &WriteTransaction, checkpoint_id: &str) -> Stor
 
 /// RAII rollback guard for [`RedbCaptureStore::create`].
 ///
-/// Cleans up the sibling temporary file and, if post-publication `fsync_dir`,
-/// `open_redb_writable`, or caller cancellation aborts creation, removes the
-/// freshly linked destination file so retries do not hit spurious `AlreadyExists`.
+/// On Unix, performs cleanup strictly relative to the validated parent
+/// directory descriptor (`unlinkat` + `fsync`) and verifies the target entry's
+/// `(st_dev, st_ino)` matches `expected_inode` before unlinking so rollback can
+/// never delete a replacement file planted by a concurrent actor (`RB-06d`).
+#[cfg(unix)]
+struct RedbCreatePublishGuard {
+    dir_fd: OwnedFd,
+    tmp_name: CString,
+    dest_name: CString,
+    expected_inode: (libc::dev_t, libc::ino_t),
+    published: bool,
+    committed: bool,
+}
+
+#[cfg(unix)]
+fn unlinkat_if_matching_inode(
+    dir_fd: &OwnedFd,
+    cname: &CString,
+    expected_inode: (libc::dev_t, libc::ino_t),
+) -> bool {
+    let mut st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: `dir_fd` is valid and `cname` is NUL-terminated.
+    let rc = unsafe {
+        libc::fstatat(
+            dir_fd.as_raw_fd(),
+            cname.as_ptr(),
+            st.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if rc != 0 {
+        return false;
+    }
+    // SAFETY: `fstatat` succeeded.
+    let st = unsafe { st.assume_init() };
+    if (st.st_dev, st.st_ino) != expected_inode {
+        return false;
+    }
+    // SAFETY: `dir_fd` is valid and `cname` is NUL-terminated.
+    unsafe { libc::unlinkat(dir_fd.as_raw_fd(), cname.as_ptr(), 0) == 0 }
+}
+
+#[cfg(unix)]
+impl Drop for RedbCreatePublishGuard {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let _ = unlinkat_if_matching_inode(&self.dir_fd, &self.tmp_name, self.expected_inode);
+        if self.published
+            && unlinkat_if_matching_inode(&self.dir_fd, &self.dest_name, self.expected_inode)
+        {
+            // SAFETY: `dir_fd` is valid.
+            unsafe {
+                let _ = libc::fsync(self.dir_fd.as_raw_fd());
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
 struct RedbCreatePublishGuard {
     tmp_path: PathBuf,
     dest_path: PathBuf,
@@ -1069,6 +1142,7 @@ struct RedbCreatePublishGuard {
     committed: bool,
 }
 
+#[cfg(not(unix))]
 impl Drop for RedbCreatePublishGuard {
     fn drop(&mut self) {
         if self.committed {
@@ -1095,13 +1169,980 @@ impl Drop for CancelFlagGuard {
     }
 }
 
-/// Execute the blocking phase of [`RedbCaptureStore::create`], returning the
-/// opened [`Database`] paired with an UNCOMMITTED [`RedbCreatePublishGuard`].
+/// Expected effective UIDs checked against `.libra/private/` and
+/// `capture.gen-<id>.redb` on Unix (`RB-06d`).
 ///
-/// Tuple field order `(Database, RedbCreatePublishGuard)` guarantees that if
-/// the caller cancels/drops the `spawn_blocking` handle before consuming the
-/// result, `Database` drops first and `RedbCreatePublishGuard::drop` then
-/// unlinks the freshly published destination file cleanly.
+/// Production code always constructs [`Self::current_effective`] using
+/// `libc::geteuid()`. Tests may override `dir_uid` or `file_uid` independently
+/// when running unprivileged without `CAP_CHOWN`.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UnixExpectedOwners {
+    pub(crate) dir_uid: u32,
+    pub(crate) file_uid: u32,
+}
+
+#[cfg(unix)]
+impl UnixExpectedOwners {
+    pub(crate) fn current_effective() -> Self {
+        // SAFETY: `geteuid(2)` is always safe to call and never fails.
+        let uid = unsafe { libc::geteuid() };
+        Self {
+            dir_uid: uid,
+            file_uid: uid,
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+pub(crate) type AfterTempCreateHook = Box<dyn FnOnce() -> StorageResult<()> + Send>;
+
+#[cfg(all(test, unix))]
+pub(crate) type AfterTmpInitHook = Box<dyn FnOnce(&Path) + Send>;
+
+/// Deterministic fault/race injection hooks used solely by Unix security tests
+/// (`RB-06d`). Compiled out in non-test builds.
+#[cfg(all(test, unix))]
+#[derive(Default)]
+pub(crate) struct UnixCreateTestHooks {
+    pub(crate) after_temp_create: Option<AfterTempCreateHook>,
+    pub(crate) after_tmp_init: Option<AfterTmpInitHook>,
+    pub(crate) before_publish: Option<Box<dyn FnOnce() + Send>>,
+    pub(crate) after_publish: Option<Box<dyn FnOnce() + Send>>,
+}
+
+#[cfg(unix)]
+fn osstr_to_cstring(s: &OsStr, context: &'static str) -> StorageResult<CString> {
+    CString::new(s.as_bytes()).map_err(|_| StorageBackendError::BackendInternal {
+        detail: format!("{context}: path component contains interior NUL byte"),
+    })
+}
+
+#[cfg(unix)]
+fn path_to_cstring(path: &Path, context: &'static str) -> StorageResult<CString> {
+    osstr_to_cstring(path.as_os_str(), context)
+}
+
+#[cfg(unix)]
+fn split_capture_target_path(target: &Path) -> StorageResult<(PathBuf, std::ffi::OsString)> {
+    let file_name = target
+        .file_name()
+        .ok_or_else(|| StorageBackendError::BackendInternal {
+            detail: "capture database path has no final file name".to_string(),
+        })?
+        .to_os_string();
+    let parent = target
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    Ok((parent, file_name))
+}
+
+#[cfg(unix)]
+fn fstat_fd(fd: &OwnedFd, context: &'static str) -> StorageResult<libc::stat> {
+    let mut st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: `fd` is a valid open file descriptor and `st` points to writable `libc::stat`.
+    let rc = unsafe { libc::fstat(fd.as_raw_fd(), st.as_mut_ptr()) };
+    if rc != 0 {
+        return Err(StorageBackendError::io(context, io::Error::last_os_error()));
+    }
+    // SAFETY: `fstat` returned 0, fully initializing `st`.
+    Ok(unsafe { st.assume_init() })
+}
+
+#[cfg(unix)]
+fn unix_perm_bits(mode: libc::mode_t) -> u32 {
+    // `mode_t` is `u16` on macOS/BSD and `u32` on Linux.
+    #[allow(clippy::useless_conversion)]
+    let raw = u32::from(mode);
+    raw & 0o7777
+}
+
+#[cfg(unix)]
+fn fchmod_fd(fd: &OwnedFd, mode: u32, context: &'static str) -> StorageResult<()> {
+    // SAFETY: `fd` is a valid open file descriptor.
+    let rc = unsafe { libc::fchmod(fd.as_raw_fd(), mode as libc::mode_t) };
+    if rc != 0 {
+        return Err(StorageBackendError::io(context, io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn fsync_fd(fd: &OwnedFd, context: &'static str) -> StorageResult<()> {
+    // SAFETY: `fd` is a valid open file descriptor.
+    let rc = unsafe { libc::fsync(fd.as_raw_fd()) };
+    if rc != 0 {
+        return Err(StorageBackendError::io(context, io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn is_symlink_errno(err: &io::Error, path: &Path) -> bool {
+    match err.raw_os_error() {
+        Some(libc::ELOOP) => true,
+        // Some Unix kernels return ENOTDIR when O_DIRECTORY | O_NOFOLLOW hits a symlink.
+        Some(libc::ENOTDIR) => {
+            fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink())
+        }
+        _ => false,
+    }
+}
+
+#[cfg(unix)]
+fn is_symlink_errno_at(err: &io::Error, dir_fd: &OwnedFd, cname: &CString) -> bool {
+    match err.raw_os_error() {
+        Some(libc::ELOOP) => true,
+        Some(libc::ENOTDIR) => {
+            let mut st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+            // SAFETY: `dir_fd` is valid and `cname` is NUL-terminated.
+            let rc = unsafe {
+                libc::fstatat(
+                    dir_fd.as_raw_fd(),
+                    cname.as_ptr(),
+                    st.as_mut_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            if rc == 0 {
+                // SAFETY: `fstatat` succeeded.
+                let st = unsafe { st.assume_init() };
+                (st.st_mode & libc::S_IFMT) == libc::S_IFLNK
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Open a directory using `O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC`,
+/// failing closed on symlinks (AC3), non-directories, or non-owner UID (AC5).
+#[cfg(unix)]
+fn open_dir_nofollow(dir: &Path, expected_uid: u32) -> StorageResult<(OwnedFd, libc::stat)> {
+    let cdir = path_to_cstring(dir, "open capture private directory")?;
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    // SAFETY: `cdir` is a valid NUL-terminated C string.
+    let raw_fd = unsafe { libc::open(cdir.as_ptr(), flags) };
+    if raw_fd < 0 {
+        let err = io::Error::last_os_error();
+        if is_symlink_errno(&err, dir) {
+            return Err(map_capture_symlink_err("capture private directory"));
+        }
+        return Err(StorageBackendError::io(
+            "open capture private directory",
+            err,
+        ));
+    }
+    // SAFETY: `raw_fd >= 0` is a newly opened descriptor owned exclusively here.
+    let dir_fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+    let st = fstat_fd(&dir_fd, "stat capture private directory")?;
+    if (st.st_mode & libc::S_IFMT) != libc::S_IFDIR {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "capture private directory path is not a directory".to_string(),
+        });
+    }
+    if st.st_uid != expected_uid {
+        return Err(map_capture_owner_mismatch_err("capture private directory"));
+    }
+    Ok((dir_fd, st))
+}
+
+/// Open a child directory relative to `parent_fd` using
+/// `O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC`, verifying directory type
+/// and expected owner UID.
+#[cfg(unix)]
+fn openat_dir_nofollow(
+    parent_fd: &OwnedFd,
+    dir_name: &OsStr,
+    expected_uid: u32,
+) -> StorageResult<(OwnedFd, libc::stat)> {
+    let cname = osstr_to_cstring(dir_name, "open capture private directory")?;
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    // SAFETY: `parent_fd` is valid and `cname` is NUL-terminated.
+    let raw_fd = unsafe { libc::openat(parent_fd.as_raw_fd(), cname.as_ptr(), flags) };
+    if raw_fd < 0 {
+        let err = io::Error::last_os_error();
+        if is_symlink_errno_at(&err, parent_fd, &cname) {
+            return Err(map_capture_symlink_err("capture private directory"));
+        }
+        return Err(StorageBackendError::io(
+            "open capture private directory",
+            err,
+        ));
+    }
+    // SAFETY: `raw_fd >= 0` is owned exclusively here.
+    let dir_fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+    let st = fstat_fd(&dir_fd, "stat capture private directory")?;
+    if (st.st_mode & libc::S_IFMT) != libc::S_IFDIR {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "capture private directory path is not a directory".to_string(),
+        });
+    }
+    if st.st_uid != expected_uid {
+        return Err(map_capture_owner_mismatch_err("capture private directory"));
+    }
+    Ok((dir_fd, st))
+}
+
+/// Fix permissions on a newly `mkdirat`-created directory to exact `0700`
+/// without ever following symlinks, even when a restrictive process `umask`
+/// (such as `0777`) stripped owner bits (`0000`) or an ancestor setgid bit
+/// added `2000` (`RB-06d` AC1).
+#[cfg(unix)]
+fn fix_newly_created_dir_mode_nofollow(
+    grandparent_fd: &OwnedFd,
+    dir_name: &OsStr,
+    expected_uid: u32,
+) -> StorageResult<()> {
+    let cname = osstr_to_cstring(dir_name, "fix capture private directory mode")?;
+    let mut st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: `grandparent_fd` is valid and `cname` is NUL-terminated.
+    let rc = unsafe {
+        libc::fstatat(
+            grandparent_fd.as_raw_fd(),
+            cname.as_ptr(),
+            st.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if rc != 0 {
+        return Err(StorageBackendError::io(
+            "inspect newly created capture private directory",
+            io::Error::last_os_error(),
+        ));
+    }
+    // SAFETY: `fstatat` succeeded.
+    let st = unsafe { st.assume_init() };
+    if (st.st_mode & libc::S_IFMT) == libc::S_IFLNK {
+        return Err(map_capture_symlink_err("capture private directory"));
+    }
+    if (st.st_mode & libc::S_IFMT) != libc::S_IFDIR {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "capture private directory path is not a directory".to_string(),
+        });
+    }
+    if st.st_uid != expected_uid {
+        return Err(map_capture_owner_mismatch_err("capture private directory"));
+    }
+    if unix_perm_bits(st.st_mode) == CAPTURE_PRIVATE_DIR_MODE {
+        return Ok(());
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        // Linux supports `O_PATH | O_DIRECTORY | O_NOFOLLOW` even on mode `0000`,
+        // pinning the exact inode before updating permissions via `/proc/self/fd`.
+        let path_flags = libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        // SAFETY: `grandparent_fd` is valid and `cname` is NUL-terminated.
+        let raw_fd =
+            unsafe { libc::openat(grandparent_fd.as_raw_fd(), cname.as_ptr(), path_flags) };
+        if raw_fd < 0 {
+            let err = io::Error::last_os_error();
+            if is_symlink_errno_at(&err, grandparent_fd, &cname) {
+                return Err(map_capture_symlink_err("capture private directory"));
+            }
+            return Err(StorageBackendError::io(
+                "open newly created capture private directory O_PATH",
+                err,
+            ));
+        }
+        // SAFETY: `raw_fd >= 0` is owned exclusively here.
+        let path_fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+        let pst = fstat_fd(&path_fd, "stat newly created capture private directory")?;
+        if (pst.st_mode & libc::S_IFMT) != libc::S_IFDIR {
+            return Err(StorageBackendError::BackendInternal {
+                detail: "capture private directory path is not a directory".to_string(),
+            });
+        }
+        if pst.st_uid != expected_uid {
+            return Err(map_capture_owner_mismatch_err("capture private directory"));
+        }
+        let proc_path =
+            CString::new(format!("/proc/self/fd/{}", path_fd.as_raw_fd())).map_err(|_| {
+                StorageBackendError::BackendInternal {
+                    detail: "capture private directory proc fd path invalid".to_string(),
+                }
+            })?;
+        // SAFETY: `proc_path` refers directly to our pinned `path_fd`.
+        let chmod_rc =
+            unsafe { libc::chmod(proc_path.as_ptr(), CAPTURE_PRIVATE_DIR_MODE as libc::mode_t) };
+        if chmod_rc != 0 {
+            return Err(StorageBackendError::io(
+                "enforce 0700 mode on newly created capture private directory",
+                io::Error::last_os_error(),
+            ));
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // macOS / BSD support `AT_SYMLINK_NOFOLLOW` natively on `fchmodat(2)`.
+        // SAFETY: `grandparent_fd` is valid and `cname` is NUL-terminated.
+        let chmod_rc = unsafe {
+            libc::fchmodat(
+                grandparent_fd.as_raw_fd(),
+                cname.as_ptr(),
+                CAPTURE_PRIVATE_DIR_MODE as libc::mode_t,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if chmod_rc != 0 {
+            let err = io::Error::last_os_error();
+            if is_symlink_errno_at(&err, grandparent_fd, &cname) {
+                return Err(map_capture_symlink_err("capture private directory"));
+            }
+            return Err(StorageBackendError::io(
+                "enforce 0700 mode on newly created capture private directory",
+                err,
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Ensure all missing ancestor directories up to `grandparent` exist and remain
+/// accessible to the owner even under owner-bit-stripping restrictive `umask`
+/// (such as `0777`), returning an open directory descriptor to `grandparent`
+/// (`RB-06d` AC1).
+#[cfg(unix)]
+fn open_or_create_ancestor_dir(grandparent: &Path, expected_uid: u32) -> StorageResult<OwnedFd> {
+    let mut missing_components: Vec<std::ffi::OsString> = Vec::new();
+    let mut cursor = grandparent.to_path_buf();
+
+    let mut cur_fd = loop {
+        let open_target = if cursor.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            cursor.as_path()
+        };
+        let cpath = path_to_cstring(open_target, "open capture parent ancestor directory")?;
+        // SAFETY: `cpath` is a valid NUL-terminated path.
+        let raw_fd = unsafe {
+            libc::open(
+                cpath.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        if raw_fd >= 0 {
+            // SAFETY: `raw_fd >= 0` is owned exclusively here.
+            break unsafe { OwnedFd::from_raw_fd(raw_fd) };
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() != io::ErrorKind::NotFound {
+            return Err(StorageBackendError::io(
+                "open capture parent ancestor directory",
+                err,
+            ));
+        }
+        let Some(name) = cursor.file_name() else {
+            return Err(StorageBackendError::io(
+                "open capture parent ancestor directory",
+                err,
+            ));
+        };
+        missing_components.push(name.to_os_string());
+        match cursor.parent() {
+            Some(parent) => cursor = parent.to_path_buf(),
+            None => {
+                return Err(StorageBackendError::io(
+                    "open capture parent ancestor directory",
+                    err,
+                ));
+            }
+        }
+    };
+
+    for comp in missing_components.into_iter().rev() {
+        let cname = osstr_to_cstring(&comp, "create capture parent ancestor directory")?;
+        // SAFETY: `cur_fd` is valid and `cname` is NUL-terminated.
+        let mkdir_rc = unsafe {
+            libc::mkdirat(
+                cur_fd.as_raw_fd(),
+                cname.as_ptr(),
+                CAPTURE_PRIVATE_DIR_MODE as libc::mode_t,
+            )
+        };
+        let created_now = if mkdir_rc == 0 {
+            true
+        } else {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::AlreadyExists {
+                false
+            } else {
+                return Err(StorageBackendError::io(
+                    "create capture parent ancestor directory",
+                    err,
+                ));
+            }
+        };
+        if created_now {
+            fix_newly_created_dir_mode_nofollow(&cur_fd, &comp, expected_uid)?;
+        }
+        let next_flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        // SAFETY: `cur_fd` is valid and `cname` is NUL-terminated.
+        let next_raw = unsafe { libc::openat(cur_fd.as_raw_fd(), cname.as_ptr(), next_flags) };
+        if next_raw < 0 {
+            let err = io::Error::last_os_error();
+            if is_symlink_errno_at(&err, &cur_fd, &cname) {
+                return Err(map_capture_symlink_err("capture private directory"));
+            }
+            return Err(StorageBackendError::io(
+                "open capture parent ancestor directory",
+                err,
+            ));
+        }
+        // SAFETY: `next_raw >= 0` is owned exclusively here.
+        let next_fd = unsafe { OwnedFd::from_raw_fd(next_raw) };
+        if created_now {
+            fsync_fd(&cur_fd, "fsync capture parent ancestor directory")?;
+        }
+        cur_fd = next_fd;
+    }
+
+    Ok(cur_fd)
+}
+
+/// Open or create the parent directory for `RedbCaptureStore::create`.
+///
+/// Newly created directories are enforced to exact `0700` (resilient under
+/// `umask(0777)` and inherited setgid). Already-existing directories are
+/// validated (`O_NOFOLLOW`, `S_ISDIR`, effective-UID owner) and never mutated
+/// (`RB-06d` AC1, AC3, AC5).
+#[cfg(unix)]
+fn open_or_create_private_dir_nofollow(
+    parent: &Path,
+    expected_uid: u32,
+) -> StorageResult<(OwnedFd, libc::stat)> {
+    match open_dir_nofollow(parent, expected_uid) {
+        Ok((dir_fd, st)) => Ok((dir_fd, st)),
+        Err(StorageBackendError::Io {
+            kind: io::ErrorKind::NotFound,
+            ..
+        }) => {
+            let dir_name =
+                parent
+                    .file_name()
+                    .ok_or_else(|| StorageBackendError::BackendInternal {
+                        detail: "capture private directory path has no final component".to_string(),
+                    })?;
+            let grandparent = parent
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            let grandparent_fd = open_or_create_ancestor_dir(grandparent, expected_uid)?;
+            let cname = osstr_to_cstring(dir_name, "create capture private directory")?;
+
+            // SAFETY: `grandparent_fd` is valid and `cname` is NUL-terminated.
+            let mkdir_rc = unsafe {
+                libc::mkdirat(
+                    grandparent_fd.as_raw_fd(),
+                    cname.as_ptr(),
+                    CAPTURE_PRIVATE_DIR_MODE as libc::mode_t,
+                )
+            };
+            let created_now = if mkdir_rc == 0 {
+                true
+            } else {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::AlreadyExists {
+                    false
+                } else {
+                    return Err(StorageBackendError::io(
+                        "create capture private directory",
+                        err,
+                    ));
+                }
+            };
+
+            if created_now {
+                fix_newly_created_dir_mode_nofollow(&grandparent_fd, dir_name, expected_uid)?;
+            }
+
+            let (dir_fd, st) = openat_dir_nofollow(&grandparent_fd, dir_name, expected_uid)?;
+            if created_now {
+                fchmod_fd(
+                    &dir_fd,
+                    CAPTURE_PRIVATE_DIR_MODE,
+                    "enforce 0700 mode on capture private directory",
+                )?;
+                let verified = fstat_fd(&dir_fd, "verify capture private directory mode")?;
+                if unix_perm_bits(verified.st_mode) != CAPTURE_PRIVATE_DIR_MODE {
+                    return Err(StorageBackendError::BackendInternal {
+                        detail: "capture private directory permissions failed to settle at 0700"
+                            .to_string(),
+                    });
+                }
+                fsync_fd(&grandparent_fd, "fsync capture parent ancestor directory")?;
+                Ok((dir_fd, verified))
+            } else {
+                Ok((dir_fd, st))
+            }
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// Fail closed if `file_name` already exists inside `dir_fd`, distinguishing
+/// symlinks (AC4) from regular `AlreadyExists`.
+#[cfg(unix)]
+fn ensure_target_absent_nofollow(dir_fd: &OwnedFd, file_name: &OsStr) -> StorageResult<()> {
+    let cname = osstr_to_cstring(file_name, "inspect capture database file")?;
+    let mut st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: `dir_fd` is valid, `cname` is NUL-terminated, `st` is writable.
+    let rc = unsafe {
+        libc::fstatat(
+            dir_fd.as_raw_fd(),
+            cname.as_ptr(),
+            st.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if rc == 0 {
+        // SAFETY: `fstatat` returned 0, fully initializing `st`.
+        let st = unsafe { st.assume_init() };
+        if (st.st_mode & libc::S_IFMT) == libc::S_IFLNK {
+            return Err(map_capture_symlink_err("capture database file"));
+        }
+        return Err(StorageBackendError::Io {
+            context: "create capture redb database",
+            kind: io::ErrorKind::AlreadyExists,
+            raw_os_error: None,
+        });
+    }
+    let err = io::Error::last_os_error();
+    if err.kind() == io::ErrorKind::NotFound {
+        Ok(())
+    } else {
+        Err(StorageBackendError::io(
+            "inspect capture database file",
+            err,
+        ))
+    }
+}
+
+/// Atomically create a private `0600` regular temp file inside `dir_fd` via
+/// `openat(..., O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)`.
+///
+/// Immediately captures `(st_dev, st_ino)` and returns the open descriptor
+/// **paired with an inode-pinned [`RedbCreatePublishGuard`]** so even failures
+/// in `fchmod` or subsequent initialization unlink only the exact created inode
+/// relative to `dir_fd` with zero orphan leftovers (`RB-06d` AC2).
+#[cfg(unix)]
+fn create_private_temp_file_with_guard(
+    dir_fd: &OwnedFd,
+    tmp_name: &OsStr,
+    dest_name: &OsStr,
+    expected_uid: u32,
+    #[cfg(test)] after_temp_create: Option<Box<dyn FnOnce() -> StorageResult<()> + Send>>,
+) -> StorageResult<(fs::File, (libc::dev_t, libc::ino_t), RedbCreatePublishGuard)> {
+    let ctmp = osstr_to_cstring(tmp_name, "create capture redb temp file")?;
+    let cdest = osstr_to_cstring(dest_name, "publish capture redb target name")?;
+    let guard_dir_fd = dir_fd
+        .try_clone()
+        .map_err(|err| StorageBackendError::io("clone capture directory descriptor", err))?;
+
+    let flags = libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    // SAFETY: `dir_fd` is valid and `ctmp` is NUL-terminated; variadic `mode`
+    // is promoted to `libc::c_uint` for portability across Linux and macOS.
+    let raw_fd = unsafe {
+        libc::openat(
+            dir_fd.as_raw_fd(),
+            ctmp.as_ptr(),
+            flags,
+            CAPTURE_DB_FILE_MODE as libc::c_uint,
+        )
+    };
+    if raw_fd < 0 {
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ELOOP) {
+            return Err(map_capture_symlink_err("capture database file"));
+        }
+        return Err(StorageBackendError::io(
+            "create capture redb temp file",
+            err,
+        ));
+    }
+    // SAFETY: `raw_fd >= 0` is a newly opened descriptor owned exclusively here.
+    let file_fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+    let st = match fstat_fd(&file_fd, "stat capture redb temp file") {
+        Ok(st) => st,
+        Err(err) => {
+            // SAFETY: `guard_dir_fd` is valid and `ctmp` was just created with O_EXCL.
+            unsafe {
+                let _ = libc::unlinkat(guard_dir_fd.as_raw_fd(), ctmp.as_ptr(), 0);
+            }
+            return Err(err);
+        }
+    };
+    let created_inode = (st.st_dev, st.st_ino);
+
+    // Arm inode-pinned descriptor-relative rollback guard IMMEDIATELY.
+    let guard = RedbCreatePublishGuard {
+        dir_fd: guard_dir_fd,
+        tmp_name: ctmp,
+        dest_name: cdest,
+        expected_inode: created_inode,
+        published: false,
+        committed: false,
+    };
+
+    #[cfg(test)]
+    if let Some(hook) = after_temp_create {
+        hook()?;
+    }
+
+    if (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "capture database temp path is not a regular file".to_string(),
+        });
+    }
+    if st.st_uid != expected_uid {
+        return Err(map_capture_owner_mismatch_err("capture database file"));
+    }
+    fchmod_fd(
+        &file_fd,
+        CAPTURE_DB_FILE_MODE,
+        "enforce 0600 mode on capture database temp file",
+    )?;
+    let verified = fstat_fd(&file_fd, "verify capture redb temp file mode")?;
+    if unix_perm_bits(verified.st_mode) != CAPTURE_DB_FILE_MODE {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "capture database temp file permissions failed to settle at 0600".to_string(),
+        });
+    }
+    Ok((fs::File::from(file_fd), created_inode, guard))
+}
+
+/// Re-open a file relative to `dir_fd` with `O_NOFOLLOW | O_NONBLOCK`, verify
+/// regular-file type, owner UID, AND exact `(st_dev, st_ino)` identity BEFORE
+/// enforcing `0600` mode (`RB-06d`).
+#[cfg(unix)]
+fn enforce_private_file_mode_in_dir(
+    dir_fd: &OwnedFd,
+    file_name: &OsStr,
+    expected_uid: u32,
+    expected_inode: (libc::dev_t, libc::ino_t),
+) -> StorageResult<libc::stat> {
+    let cname = osstr_to_cstring(file_name, "enforce capture database file mode")?;
+    let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
+    // SAFETY: `dir_fd` is valid and `cname` is NUL-terminated.
+    let raw_fd = unsafe { libc::openat(dir_fd.as_raw_fd(), cname.as_ptr(), flags) };
+    if raw_fd < 0 {
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ELOOP) {
+            return Err(map_capture_symlink_err("capture database file"));
+        }
+        return Err(StorageBackendError::io(
+            "open capture database file to enforce mode",
+            err,
+        ));
+    }
+    // SAFETY: `raw_fd >= 0` is owned exclusively here.
+    let file_fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+    let st = fstat_fd(&file_fd, "stat capture database file")?;
+    if (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "capture database path is not a regular file".to_string(),
+        });
+    }
+    if st.st_uid != expected_uid {
+        return Err(map_capture_owner_mismatch_err("capture database file"));
+    }
+    if (st.st_dev, st.st_ino) != expected_inode {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "capture database temp inode changed before publish".to_string(),
+        });
+    }
+    fchmod_fd(
+        &file_fd,
+        CAPTURE_DB_FILE_MODE,
+        "enforce 0600 mode on capture database file",
+    )?;
+    let verified = fstat_fd(&file_fd, "verify capture database file mode")?;
+    if unix_perm_bits(verified.st_mode) != CAPTURE_DB_FILE_MODE {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "capture database file permissions failed to settle at 0600".to_string(),
+        });
+    }
+    Ok(verified)
+}
+
+/// Atomically publish `tmp_name` to `target_name` inside the validated `dir_fd`
+/// using `linkat` (non-overwriting), distinguishing symlink races (`RB-06d`).
+#[cfg(unix)]
+fn linkat_nofollow_in_dir(
+    dir_fd: &OwnedFd,
+    tmp_name: &OsStr,
+    target_name: &OsStr,
+) -> StorageResult<()> {
+    let ctmp = osstr_to_cstring(tmp_name, "publish capture redb temp name")?;
+    let ctarget = osstr_to_cstring(target_name, "publish capture redb target name")?;
+    // SAFETY: `dir_fd` is valid and both names are NUL-terminated.
+    let rc = unsafe {
+        libc::linkat(
+            dir_fd.as_raw_fd(),
+            ctmp.as_ptr(),
+            dir_fd.as_raw_fd(),
+            ctarget.as_ptr(),
+            0,
+        )
+    };
+    if rc != 0 {
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EEXIST) {
+            ensure_target_absent_nofollow(dir_fd, target_name)?;
+        }
+        return Err(StorageBackendError::io(
+            "publish initial capture redb database",
+            err,
+        ));
+    }
+    Ok(())
+}
+
+/// Open an existing `capture.gen-<id>.redb` relative to `dir_fd` using
+/// `O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK`, returning the verified [`fs::File`]
+/// descriptor directly for [`redb::backends::FileBackend::new`] so there is
+/// zero TOCTOU pathname reopen (`RB-06d` AC4, AC6).
+#[cfg(unix)]
+fn open_existing_file_in_dir(
+    dir_fd: &OwnedFd,
+    file_name: &OsStr,
+    expected_uid: u32,
+    writable: bool,
+) -> StorageResult<(fs::File, libc::stat)> {
+    let cname = osstr_to_cstring(file_name, "open capture database file")?;
+    let access = if writable {
+        libc::O_RDWR
+    } else {
+        libc::O_RDONLY
+    };
+    let flags = access | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
+    // SAFETY: `dir_fd` is valid and `cname` is NUL-terminated.
+    let raw_fd = unsafe { libc::openat(dir_fd.as_raw_fd(), cname.as_ptr(), flags) };
+    if raw_fd < 0 {
+        let err = io::Error::last_os_error();
+        if is_symlink_errno_at(&err, dir_fd, &cname) {
+            return Err(map_capture_symlink_err("capture database file"));
+        }
+        let mut lst = std::mem::MaybeUninit::<libc::stat>::zeroed();
+        // SAFETY: `dir_fd` is valid and `cname` is NUL-terminated.
+        if unsafe {
+            libc::fstatat(
+                dir_fd.as_raw_fd(),
+                cname.as_ptr(),
+                lst.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } == 0
+        {
+            // SAFETY: `fstatat` succeeded.
+            let lst = unsafe { lst.assume_init() };
+            let ftype = lst.st_mode & libc::S_IFMT;
+            if ftype == libc::S_IFLNK {
+                return Err(map_capture_symlink_err("capture database file"));
+            }
+            if ftype != libc::S_IFREG {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: "capture database path is not a regular file".to_string(),
+                });
+            }
+            if lst.st_uid != expected_uid {
+                return Err(map_capture_owner_mismatch_err("capture database file"));
+            }
+        }
+        return Err(StorageBackendError::io(
+            "open capture database file with O_NOFOLLOW",
+            err,
+        ));
+    }
+    // SAFETY: `raw_fd >= 0` is owned exclusively here.
+    let file_fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+    let st = fstat_fd(&file_fd, "stat capture database file")?;
+    if (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "capture database path is not a regular file".to_string(),
+        });
+    }
+    if st.st_uid != expected_uid {
+        return Err(map_capture_owner_mismatch_err("capture database file"));
+    }
+    if writable && (st.st_mode & 0o222) == 0 {
+        return Err(StorageBackendError::Io {
+            context: "verify capture redb write access before repair",
+            kind: io::ErrorKind::PermissionDenied,
+            raw_os_error: None,
+        });
+    }
+    Ok((fs::File::from(file_fd), st))
+}
+
+/// Open a `redb` read-only handle directly from a descriptor-validated
+/// [`fs::File`] (`MultiWriter`, `16 MiB` cache, zero write upgrades, zero
+/// pathname reopen).
+#[cfg(unix)]
+fn open_redb_read_only_from_fd(file: fs::File) -> StorageResult<ReadOnlyDatabase> {
+    let mut builder = redb::Builder::new();
+    builder
+        .set_concurrency_mode(redb::ConcurrencyMode::MultiWriter)
+        .set_cache_size(CACHE_SIZE_READ_ONLY);
+    builder
+        .open_read_only_with_backend(redb::backends::FileBackend::new(file))
+        .map_err(|err| {
+            map_redb_database_err(err, DatabaseRole::Capture, "open capture redb read-only")
+        })
+}
+
+/// Open or initialize a `redb` writable handle directly from a
+/// descriptor-validated [`fs::File`] (`MultiWriter`, role-bounded cache, zero
+/// pathname reopen).
+#[cfg(unix)]
+fn open_redb_writable_from_fd(
+    file: fs::File,
+    st: Option<libc::stat>,
+    context: RedbRepairContext,
+    allow_empty_create: bool,
+) -> StorageResult<Database> {
+    if !allow_empty_create
+        && let Some(st) = st
+        && st.st_size == 0
+    {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "open capture redb writable: database file is empty".to_string(),
+        });
+    }
+    let mut builder = redb::Builder::new();
+    builder
+        .set_concurrency_mode(redb::ConcurrencyMode::MultiWriter)
+        .set_cache_size(context.write_profile().cache_size_bytes());
+    builder
+        .create_with_backend(redb::backends::FileBackend::new(file))
+        .map_err(|err| {
+            map_redb_database_err(err, DatabaseRole::Capture, "open capture redb writable")
+        })
+}
+
+/// Execute the blocking phase of [`RedbCaptureStore::create`], returning the
+/// opened [`Database`] paired with an UNCOMMITTED descriptor-relative
+/// [`RedbCreatePublishGuard`].
+///
+/// Every file create, redb initialization, `linkat`, `unlinkat`, `fsync`, and
+/// post-publish open executes strictly relative to the validated `dir_fd` and
+/// file descriptors — zero pathname reopens (`RB-06d`).
+#[cfg(unix)]
+fn create_redb_capture_blocking_with_owners(
+    target: PathBuf,
+    cancel_worker: Arc<AtomicBool>,
+    owners: UnixExpectedOwners,
+    #[cfg(test)] mut hooks: UnixCreateTestHooks,
+) -> StorageResult<(Database, RedbCreatePublishGuard)> {
+    let (parent, target_name) = split_capture_target_path(&target)?;
+    let (dir_fd, _) = open_or_create_private_dir_nofollow(&parent, owners.dir_uid)?;
+    ensure_target_absent_nofollow(&dir_fd, &target_name)?;
+
+    let seq = CAPTURE_TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp_name_str = format!(".capture.init.{}.{seq}.tmp", std::process::id());
+    let tmp_name = OsStr::new(&tmp_name_str);
+
+    // Atomically create `tmp_name` (`O_CREAT|O_EXCL|O_NOFOLLOW`, `0600`) and
+    // arm an inode-pinned descriptor-relative rollback guard immediately.
+    let (tmp_file, created_inode, mut guard) = create_private_temp_file_with_guard(
+        &dir_fd,
+        tmp_name,
+        &target_name,
+        owners.file_uid,
+        #[cfg(test)]
+        hooks.after_temp_create.take(),
+    )?;
+
+    let tmp_db = open_redb_writable_from_fd(tmp_file, None, RedbRepairContext::WriteCommand, true)?;
+    let wtx = begin_write_bounded_blocking(
+        &tmp_db,
+        DatabaseRole::Capture,
+        DEFAULT_CAPTURE_WRITE_TIMEOUT,
+    )?;
+    init_meta_schema(&wtx, DatabaseRole::Capture)?;
+    open_all_capture_tables_for_init(&wtx)?;
+    wtx.commit()
+        .map_err(|err| map_redb_commit_err(err, "commit initial capture redb"))?;
+    drop(tmp_db);
+
+    #[cfg(test)]
+    if let Some(hook) = hooks.after_tmp_init.take() {
+        hook(&parent.join(tmp_name));
+    }
+
+    let _ = enforce_private_file_mode_in_dir(&dir_fd, tmp_name, owners.file_uid, created_inode)?;
+
+    #[cfg(test)]
+    if let Some(hook) = hooks.before_publish.take() {
+        hook();
+    }
+
+    if cancel_worker.load(Ordering::Acquire) {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "capture redb create cancelled before publish".to_string(),
+        });
+    }
+
+    linkat_nofollow_in_dir(&dir_fd, tmp_name, &target_name)?;
+    guard.published = true;
+    // Remove temp link strictly relative to `dir_fd` only if it still points
+    // to our initialized inode, then fsync `dir_fd`.
+    let _ = unlinkat_if_matching_inode(&dir_fd, &guard.tmp_name, created_inode);
+    fsync_fd(&dir_fd, "fsync capture private directory")?;
+
+    #[cfg(test)]
+    if let Some(hook) = hooks.after_publish.take() {
+        hook();
+    }
+
+    let (published_file, published_st) =
+        open_existing_file_in_dir(&dir_fd, &target_name, owners.file_uid, true)?;
+    if unix_perm_bits(published_st.st_mode) != CAPTURE_DB_FILE_MODE {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "published capture database file permissions are not 0600".to_string(),
+        });
+    }
+    if (published_st.st_dev, published_st.st_ino) != created_inode {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "published capture database inode changed unexpectedly during create"
+                .to_string(),
+        });
+    }
+    drop(dir_fd);
+
+    let db = open_redb_writable_from_fd(
+        published_file,
+        Some(published_st),
+        RedbRepairContext::WriteCommand,
+        false,
+    )?;
+    if cancel_worker.load(Ordering::Acquire) {
+        drop(db);
+        return Err(StorageBackendError::BackendInternal {
+            detail: "capture redb create cancelled before return".to_string(),
+        });
+    }
+    Ok((db, guard))
+}
+
+#[cfg(all(test, unix))]
+fn create_redb_capture_blocking(
+    target: PathBuf,
+    cancel_worker: Arc<AtomicBool>,
+) -> StorageResult<(Database, RedbCreatePublishGuard)> {
+    create_redb_capture_blocking_with_owners(
+        target,
+        cancel_worker,
+        UnixExpectedOwners::current_effective(),
+        UnixCreateTestHooks::default(),
+    )
+}
+
+#[cfg(not(unix))]
 fn create_redb_capture_blocking(
     target: PathBuf,
     cancel_worker: Arc<AtomicBool>,
@@ -1185,8 +2226,88 @@ fn create_redb_capture_blocking(
 impl RedbCaptureStore {
     /// Atomically create a new `capture.gen-<id>.redb` database with
     /// `DatabaseRole::Capture` `META_SCHEMA`, all 25 source tables, segregated
-    /// internal/queue tables, and secondary indexes.
+    /// internal/queue tables, secondary indexes, and Unix private security
+    /// posture (`0700` dir, `0600` file, `O_NOFOLLOW`, effective-UID owner).
     pub async fn create(path: impl AsRef<Path>) -> StorageResult<Self> {
+        #[cfg(unix)]
+        {
+            Self::create_with_expected_owners(path, UnixExpectedOwners::current_effective()).await
+        }
+        #[cfg(not(unix))]
+        {
+            let path = path.as_ref().to_path_buf();
+            let target = path.clone();
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let cancel_worker = Arc::clone(&cancelled);
+            let mut cancel_guard = CancelFlagGuard {
+                cancelled,
+                completed: false,
+            };
+            let (db, mut publish_guard) = tokio::task::spawn_blocking(move || {
+                create_redb_capture_blocking(target, cancel_worker)
+            })
+            .await
+            .map_err(|err| StorageBackendError::BackendInternal {
+                detail: format!("capture redb create task panicked or cancelled: {err}"),
+            })??;
+            // Commit publication ONLY after the async caller has received the handle.
+            publish_guard.committed = true;
+            cancel_guard.completed = true;
+
+            Ok(Self {
+                handle: Arc::new(RedbCaptureHandle::ReadWrite(Arc::new(db))),
+                path,
+                write_timeout: DEFAULT_CAPTURE_WRITE_TIMEOUT,
+                write_tx_count: Arc::new(AtomicU64::new(0)),
+            })
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) async fn create_with_expected_owners(
+        path: impl AsRef<Path>,
+        owners: UnixExpectedOwners,
+    ) -> StorageResult<Self> {
+        #[cfg(test)]
+        {
+            Self::create_with_hooks(path, owners, UnixCreateTestHooks::default()).await
+        }
+        #[cfg(not(test))]
+        {
+            let path = path.as_ref().to_path_buf();
+            let target = path.clone();
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let cancel_worker = Arc::clone(&cancelled);
+            let mut cancel_guard = CancelFlagGuard {
+                cancelled,
+                completed: false,
+            };
+            let (db, mut publish_guard) = tokio::task::spawn_blocking(move || {
+                create_redb_capture_blocking_with_owners(target, cancel_worker, owners)
+            })
+            .await
+            .map_err(|err| StorageBackendError::BackendInternal {
+                detail: format!("capture redb create task panicked or cancelled: {err}"),
+            })??;
+            // Commit publication ONLY after the async caller has received the handle.
+            publish_guard.committed = true;
+            cancel_guard.completed = true;
+
+            Ok(Self {
+                handle: Arc::new(RedbCaptureHandle::ReadWrite(Arc::new(db))),
+                path,
+                write_timeout: DEFAULT_CAPTURE_WRITE_TIMEOUT,
+                write_tx_count: Arc::new(AtomicU64::new(0)),
+            })
+        }
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) async fn create_with_hooks(
+        path: impl AsRef<Path>,
+        owners: UnixExpectedOwners,
+        hooks: UnixCreateTestHooks,
+    ) -> StorageResult<Self> {
         let path = path.as_ref().to_path_buf();
         let target = path.clone();
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -1196,7 +2317,7 @@ impl RedbCaptureStore {
             completed: false,
         };
         let (db, mut publish_guard) = tokio::task::spawn_blocking(move || {
-            create_redb_capture_blocking(target, cancel_worker)
+            create_redb_capture_blocking_with_owners(target, cancel_worker, owners, hooks)
         })
         .await
         .map_err(|err| StorageBackendError::BackendInternal {
@@ -1215,16 +2336,108 @@ impl RedbCaptureStore {
     }
 
     /// Open an existing `capture.gen-<id>.redb` database for read-write access,
-    /// validating `META_SCHEMA` (`DatabaseRole::Capture`, `LBR-AGENT-048` on
-    /// future schema, `RepositoryMigrated` on tombstone) and required tables.
+    /// enforcing descriptor-backed Unix `O_NOFOLLOW` & effective-UID ownership
+    /// on both the private directory and DB file (`RB-06d`), plus `META_SCHEMA`
+    /// (`DatabaseRole::Capture`, `LBR-AGENT-048` on future schema,
+    /// `RepositoryMigrated` on tombstone) and required tables.
     pub async fn open_read_write(
         path: impl AsRef<Path>,
         context: RedbRepairContext,
     ) -> StorageResult<Self> {
+        #[cfg(unix)]
+        {
+            Self::open_read_write_with_expected_owners(
+                path,
+                context,
+                UnixExpectedOwners::current_effective(),
+            )
+            .await
+        }
+        #[cfg(not(unix))]
+        {
+            let path = path.as_ref().to_path_buf();
+            let target = path.clone();
+            let db = tokio::task::spawn_blocking(move || -> StorageResult<Database> {
+                let db = open_redb_writable(&target, DatabaseRole::Capture, context)?;
+                let rtx = begin_checked_read(&db, DatabaseRole::Capture)?;
+                verify_required_capture_tables(&rtx)?;
+                drop(rtx);
+                ensure_tombstone_indexes_synced(&db)?;
+                Ok(db)
+            })
+            .await
+            .map_err(|err| StorageBackendError::BackendInternal {
+                detail: format!("capture redb open_read_write task failed: {err}"),
+            })??;
+
+            Ok(Self {
+                handle: Arc::new(RedbCaptureHandle::ReadWrite(Arc::new(db))),
+                path,
+                write_timeout: DEFAULT_CAPTURE_WRITE_TIMEOUT,
+                write_tx_count: Arc::new(AtomicU64::new(0)),
+            })
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) async fn open_read_write_with_expected_owners(
+        path: impl AsRef<Path>,
+        context: RedbRepairContext,
+        owners: UnixExpectedOwners,
+    ) -> StorageResult<Self> {
+        #[cfg(test)]
+        {
+            Self::open_read_write_with_hook(path, context, owners, None).await
+        }
+        #[cfg(not(test))]
+        {
+            let path = path.as_ref().to_path_buf();
+            let target = path.clone();
+            let db = tokio::task::spawn_blocking(move || -> StorageResult<Database> {
+                let (parent, file_name) = split_capture_target_path(&target)?;
+                let (dir_fd, _) = open_dir_nofollow(&parent, owners.dir_uid)?;
+                let (file, st) =
+                    open_existing_file_in_dir(&dir_fd, &file_name, owners.file_uid, true)?;
+                drop(dir_fd);
+                let db = open_redb_writable_from_fd(file, Some(st), context, false)?;
+                let rtx = begin_checked_read(&db, DatabaseRole::Capture)?;
+                verify_required_capture_tables(&rtx)?;
+                drop(rtx);
+                ensure_tombstone_indexes_synced(&db)?;
+                Ok(db)
+            })
+            .await
+            .map_err(|err| StorageBackendError::BackendInternal {
+                detail: format!("capture redb open_read_write task failed: {err}"),
+            })??;
+
+            Ok(Self {
+                handle: Arc::new(RedbCaptureHandle::ReadWrite(Arc::new(db))),
+                path,
+                write_timeout: DEFAULT_CAPTURE_WRITE_TIMEOUT,
+                write_tx_count: Arc::new(AtomicU64::new(0)),
+            })
+        }
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) async fn open_read_write_with_hook(
+        path: impl AsRef<Path>,
+        context: RedbRepairContext,
+        owners: UnixExpectedOwners,
+        after_dir_open: Option<Box<dyn FnOnce() + Send>>,
+    ) -> StorageResult<Self> {
         let path = path.as_ref().to_path_buf();
         let target = path.clone();
         let db = tokio::task::spawn_blocking(move || -> StorageResult<Database> {
-            let db = open_redb_writable(&target, DatabaseRole::Capture, context)?;
+            let (parent, file_name) = split_capture_target_path(&target)?;
+            let (dir_fd, _) = open_dir_nofollow(&parent, owners.dir_uid)?;
+            if let Some(hook) = after_dir_open {
+                hook();
+            }
+            let (file, st) = open_existing_file_in_dir(&dir_fd, &file_name, owners.file_uid, true)?;
+            drop(dir_fd);
+            let db = open_redb_writable_from_fd(file, Some(st), context, false)?;
             let rtx = begin_checked_read(&db, DatabaseRole::Capture)?;
             verify_required_capture_tables(&rtx)?;
             drop(rtx);
@@ -1245,13 +2458,96 @@ impl RedbCaptureStore {
     }
 
     /// Open an existing `capture.gen-<id>.redb` database strictly read-only
-    /// (`16 MiB` cache, `MultiWriter`, zero write upgrades, `LBR-AGENT-048` on
-    /// future schema).
+    /// (`16 MiB` cache, `MultiWriter`, zero write upgrades, descriptor-backed
+    /// Unix `O_NOFOLLOW` & effective-UID ownership, `LBR-AGENT-048` on future
+    /// schema).
     pub async fn open_read_only(path: impl AsRef<Path>) -> StorageResult<Self> {
+        #[cfg(unix)]
+        {
+            Self::open_read_only_with_expected_owners(path, UnixExpectedOwners::current_effective())
+                .await
+        }
+        #[cfg(not(unix))]
+        {
+            let path = path.as_ref().to_path_buf();
+            let target = path.clone();
+            let db = tokio::task::spawn_blocking(move || -> StorageResult<ReadOnlyDatabase> {
+                let db = open_redb_read_only(&target, DatabaseRole::Capture)?;
+                let rtx = begin_checked_read(&db, DatabaseRole::Capture)?;
+                verify_required_capture_tables(&rtx)?;
+                drop(rtx);
+                Ok(db)
+            })
+            .await
+            .map_err(|err| StorageBackendError::BackendInternal {
+                detail: format!("capture redb open_read_only task failed: {err}"),
+            })??;
+
+            Ok(Self {
+                handle: Arc::new(RedbCaptureHandle::ReadOnly(Arc::new(db))),
+                path,
+                write_timeout: DEFAULT_CAPTURE_WRITE_TIMEOUT,
+                write_tx_count: Arc::new(AtomicU64::new(0)),
+            })
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) async fn open_read_only_with_expected_owners(
+        path: impl AsRef<Path>,
+        owners: UnixExpectedOwners,
+    ) -> StorageResult<Self> {
+        #[cfg(test)]
+        {
+            Self::open_read_only_with_hook(path, owners, None).await
+        }
+        #[cfg(not(test))]
+        {
+            let path = path.as_ref().to_path_buf();
+            let target = path.clone();
+            let db = tokio::task::spawn_blocking(move || -> StorageResult<ReadOnlyDatabase> {
+                let (parent, file_name) = split_capture_target_path(&target)?;
+                let (dir_fd, _) = open_dir_nofollow(&parent, owners.dir_uid)?;
+                let (file, _) =
+                    open_existing_file_in_dir(&dir_fd, &file_name, owners.file_uid, false)?;
+                drop(dir_fd);
+                let db = open_redb_read_only_from_fd(file)?;
+                let rtx = begin_checked_read(&db, DatabaseRole::Capture)?;
+                verify_required_capture_tables(&rtx)?;
+                drop(rtx);
+                Ok(db)
+            })
+            .await
+            .map_err(|err| StorageBackendError::BackendInternal {
+                detail: format!("capture redb open_read_only task failed: {err}"),
+            })??;
+
+            Ok(Self {
+                handle: Arc::new(RedbCaptureHandle::ReadOnly(Arc::new(db))),
+                path,
+                write_timeout: DEFAULT_CAPTURE_WRITE_TIMEOUT,
+                write_tx_count: Arc::new(AtomicU64::new(0)),
+            })
+        }
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) async fn open_read_only_with_hook(
+        path: impl AsRef<Path>,
+        owners: UnixExpectedOwners,
+        after_dir_open: Option<Box<dyn FnOnce() + Send>>,
+    ) -> StorageResult<Self> {
         let path = path.as_ref().to_path_buf();
         let target = path.clone();
         let db = tokio::task::spawn_blocking(move || -> StorageResult<ReadOnlyDatabase> {
-            let db = open_redb_read_only(&target, DatabaseRole::Capture)?;
+            let (parent, file_name) = split_capture_target_path(&target)?;
+            let (dir_fd, _) = open_dir_nofollow(&parent, owners.dir_uid)?;
+            if let Some(hook) = after_dir_open {
+                hook();
+            }
+            let (file, _) = open_existing_file_in_dir(&dir_fd, &file_name, owners.file_uid, false)?;
+            drop(dir_fd);
+            let db = open_redb_read_only_from_fd(file)?;
             let rtx = begin_checked_read(&db, DatabaseRole::Capture)?;
             verify_required_capture_tables(&rtx)?;
             drop(rtx);
@@ -3814,36 +5110,92 @@ mod create_guard_tests {
         let tmp = dir.path().join("tmp.redb");
         let dest = dir.path().join("dest.redb");
         fs::write(&tmp, b"tmp").expect("write tmp");
-        fs::write(&dest, b"dest").expect("write dest");
+        fs::hard_link(&tmp, &dest).expect("link dest to tmp");
 
-        {
-            let guard = RedbCreatePublishGuard {
-                tmp_path: tmp.clone(),
-                dest_path: dest.clone(),
-                parent: dir.path().to_path_buf(),
-                published: true,
-                committed: false,
+        #[cfg(unix)]
+        let make_guard =
+            |published: bool, committed: bool, expected_inode: (libc::dev_t, libc::ino_t)| {
+                let (dir_fd, _) =
+                    open_dir_nofollow(dir.path(), UnixExpectedOwners::current_effective().dir_uid)
+                        .expect("open temp dir");
+                RedbCreatePublishGuard {
+                    dir_fd,
+                    tmp_name: CString::new("tmp.redb").expect("tmp cstr"),
+                    dest_name: CString::new("dest.redb").expect("dest cstr"),
+                    expected_inode,
+                    published,
+                    committed,
+                }
             };
-            drop(guard);
-        }
-        assert!(!tmp.exists(), "uncommitted drop must remove temp file");
-        assert!(
-            !dest.exists(),
-            "uncommitted drop after publish must remove freshly published destination"
-        );
+        #[cfg(not(unix))]
+        let make_guard = |published: bool, committed: bool| RedbCreatePublishGuard {
+            tmp_path: tmp.clone(),
+            dest_path: dest.clone(),
+            parent: dir.path().to_path_buf(),
+            published,
+            committed,
+        };
 
-        fs::write(&dest, b"dest-ok").expect("write dest-ok");
+        #[cfg(unix)]
         {
-            let mut guard = RedbCreatePublishGuard {
-                tmp_path: tmp.clone(),
-                dest_path: dest.clone(),
-                parent: dir.path().to_path_buf(),
-                published: true,
-                committed: false,
-            };
-            guard.committed = true;
+            use std::os::unix::fs::MetadataExt;
+            let meta = fs::symlink_metadata(&tmp).expect("stat tmp");
+            let inode = (meta.dev() as libc::dev_t, meta.ino() as libc::ino_t);
+            {
+                let guard = make_guard(true, false, inode);
+                drop(guard);
+            }
+            assert!(!tmp.exists(), "uncommitted drop must remove temp file");
+            assert!(
+                !dest.exists(),
+                "uncommitted drop after publish must remove freshly published destination"
+            );
+
+            // Replacement destination with a different inode must NEVER be deleted by rollback!
+            fs::write(&dest, b"replacement-other-inode").expect("write replacement dest");
+            {
+                let guard = make_guard(true, false, inode);
+                drop(guard);
+            }
+            assert!(
+                dest.exists(),
+                "inode-pinned rollback guard must preserve replacement destination"
+            );
+            assert_eq!(
+                fs::read(&dest).expect("read replacement"),
+                b"replacement-other-inode"
+            );
+
+            let dest_meta = fs::symlink_metadata(&dest).expect("stat dest");
+            let dest_inode = (
+                dest_meta.dev() as libc::dev_t,
+                dest_meta.ino() as libc::ino_t,
+            );
+            {
+                let guard = make_guard(true, true, dest_inode);
+                drop(guard);
+            }
+            assert!(dest.exists(), "committed guard must preserve destination");
         }
-        assert!(dest.exists(), "committed guard must preserve destination");
+        #[cfg(not(unix))]
+        {
+            {
+                let guard = make_guard(true, false);
+                drop(guard);
+            }
+            assert!(!tmp.exists(), "uncommitted drop must remove temp file");
+            assert!(
+                !dest.exists(),
+                "uncommitted drop after publish must remove freshly published destination"
+            );
+
+            fs::write(&dest, b"dest-ok").expect("write dest-ok");
+            {
+                let guard = make_guard(true, true);
+                drop(guard);
+            }
+            assert!(dest.exists(), "committed guard must preserve destination");
+        }
     }
 
     #[tokio::test]

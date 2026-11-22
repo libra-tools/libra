@@ -133,6 +133,44 @@ pub fn is_capture_append_only_error(err: &StorageBackendError) -> bool {
     )
 }
 
+/// Exact Unix permission bits required for `.libra/private/` (`0700`, `RB-06d`).
+#[cfg(unix)]
+pub const CAPTURE_PRIVATE_DIR_MODE: u32 = 0o700;
+
+/// Exact Unix permission bits required for `capture.gen-<id>.redb` (`0600`, `RB-06d`).
+#[cfg(unix)]
+pub const CAPTURE_DB_FILE_MODE: u32 = 0o600;
+
+/// Stable error prefix surfaced when `O_NOFOLLOW` rejects a symlinked capture
+/// private directory or database file (`RB-06d`).
+pub const CAPTURE_SECURITY_SYMLINK_ERROR_PREFIX: &str = "capture private storage symlink rejected";
+
+/// Stable error prefix surfaced when a capture private directory or database
+/// file is not owned by the current effective Unix UID (`RB-06d`).
+pub const CAPTURE_SECURITY_OWNER_ERROR_PREFIX: &str = "capture private storage owner mismatch";
+
+/// Returns `true` when `err` represents a Unix `O_NOFOLLOW` symlink rejection
+/// on `.libra/private/` or `capture.gen-<id>.redb` (`RB-06d`).
+#[must_use]
+pub fn is_capture_symlink_rejected_error(err: &StorageBackendError) -> bool {
+    matches!(
+        err,
+        StorageBackendError::BackendInternal { detail }
+            if detail.starts_with(CAPTURE_SECURITY_SYMLINK_ERROR_PREFIX)
+    )
+}
+
+/// Returns `true` when `err` represents a Unix effective-UID ownership mismatch
+/// on `.libra/private/` or `capture.gen-<id>.redb` (`RB-06d`).
+#[must_use]
+pub fn is_capture_owner_mismatch_error(err: &StorageBackendError) -> bool {
+    matches!(
+        err,
+        StorageBackendError::BackendInternal { detail }
+            if detail.starts_with(CAPTURE_SECURITY_OWNER_ERROR_PREFIX)
+    )
+}
+
 /// Maximum UTF-8 byte length of a single bridge event payload (`256 KiB`,
 /// matching `agent_bridge_event` `CHECK(length(payload) <= 262144)` and
 /// `MAX_EVENT_PAYLOAD_BYTES`).
@@ -4618,6 +4656,821 @@ mod tests {
             .await
             .expect_err("delete_workspace_scope_audit must fail closed on append-only table");
         assert!(is_capture_append_only_error(&err_wsa_del_missing));
+    }
+
+    /// `RB-06d` AC1–AC6: Unix private directory (`0700`) and DB file (`0600`)
+    /// creation permissions (resilient under permissive/restrictive umask),
+    /// `O_NOFOLLOW` fail-closed symlink rejection on both `.libra/private/` and
+    /// `capture.gen-<id>.redb`, and effective-UID ownership rejection on both
+    /// `.libra/private/` and `capture.gen-<id>.redb`.
+    #[cfg(feature = "storage-redb")]
+    #[tokio::test]
+    async fn redb_private_dir_and_db_unix_permissions_nofollow_and_owner() {
+        #[cfg(unix)]
+        {
+            use std::{
+                fs,
+                os::unix::fs::{MetadataExt, PermissionsExt, symlink},
+                path::Path,
+            };
+
+            use crate::storage::{
+                capture_store::redb_capture_store::{UnixCreateTestHooks, UnixExpectedOwners},
+                opener::RedbRepairContext,
+            };
+
+            // Isolated child mode for verifying umask immunity without mutating
+            // the parent test binary's global process umask.
+            if let Ok(umask_octal) = std::env::var("LIBRA_RB06D_CHILD_UMASK") {
+                let target_db = std::env::var("LIBRA_RB06D_CHILD_DB")
+                    .expect("LIBRA_RB06D_CHILD_DB must be set in child mode");
+                let mask = u32::from_str_radix(&umask_octal, 8).expect("parse octal umask");
+                // SAFETY: Isolated child process exclusively owned by this test.
+                unsafe {
+                    libc::umask(mask as libc::mode_t);
+                }
+                let db_path = Path::new(&target_db);
+                let private_dir = db_path.parent().expect("child db parent");
+                let created = RedbCaptureStore::create(db_path)
+                    .await
+                    .expect("create RedbCaptureStore under child umask");
+                drop(created);
+
+                let dir_mode = fs::symlink_metadata(private_dir)
+                    .expect("stat child private dir")
+                    .permissions()
+                    .mode()
+                    & 0o7777;
+                let file_mode = fs::symlink_metadata(db_path)
+                    .expect("stat child capture redb")
+                    .permissions()
+                    .mode()
+                    & 0o7777;
+                assert_eq!(
+                    dir_mode, CAPTURE_PRIVATE_DIR_MODE,
+                    "private dir must have exact 0700 under umask {umask_octal}"
+                );
+                assert_eq!(
+                    file_mode, CAPTURE_DB_FILE_MODE,
+                    "capture db must have exact 0600 under umask {umask_octal}"
+                );
+                println!("RB06D_UMASK_CHILD_OK:{umask_octal}");
+                return;
+            }
+
+            let dir = tempfile::tempdir().expect("tempdir");
+            let secret_marker = "secret-private-tenant-rb06d";
+            let repo_root = dir.path().join(secret_marker);
+            let dot_libra = repo_root.join(".libra");
+            fs::create_dir_all(&dot_libra).expect("create .libra");
+
+            // --- AC1 & AC2: Exact 0700 on `.libra/private/` and 0600 on `capture.gen-<id>.redb` ---
+            let private_dir = dot_libra.join("private");
+            let db_path = private_dir.join("capture.gen-00000001.redb");
+            let store = RedbCaptureStore::create(&db_path)
+                .await
+                .expect("create RedbCaptureStore in .libra/private/");
+            store
+                .upsert_session(&sample_session("sess-rb06d", "prov-rb06d", 1000))
+                .await
+                .expect("write session to newly created private capture db");
+            drop(store);
+
+            let dir_meta = fs::symlink_metadata(&private_dir).expect("stat .libra/private");
+            assert!(dir_meta.is_dir());
+            assert_eq!(
+                dir_meta.permissions().mode() & 0o7777,
+                CAPTURE_PRIVATE_DIR_MODE,
+                "AC1: .libra/private/ must have exact 0700 permissions"
+            );
+            let file_meta = fs::symlink_metadata(&db_path).expect("stat capture.gen-00000001.redb");
+            assert!(file_meta.is_file());
+            assert_eq!(
+                file_meta.permissions().mode() & 0o7777,
+                CAPTURE_DB_FILE_MODE,
+                "AC2: capture.gen-<id>.redb must have exact 0600 permissions"
+            );
+
+            // Re-verify AC1 & AC2 under permissive (0000), private (0077), AND
+            // owner-bit-stripping restrictive (0777) umasks in isolated child processes,
+            // testing both pre-existing `.libra` AND initially absent `.libra` ancestors.
+            let exe = std::env::current_exe().expect("locate current test executable");
+            for (umask_octal, precreate_dot_libra) in [
+                ("0000", true),
+                ("0077", true),
+                ("0777", true),
+                ("0777", false),
+            ] {
+                let tag = if precreate_dot_libra {
+                    format!("umask-{umask_octal}-pre")
+                } else {
+                    format!("umask-{umask_octal}-missing-ancestors")
+                };
+                let child_root = dir.path().join(tag).join(".libra");
+                if precreate_dot_libra {
+                    fs::create_dir_all(&child_root).expect("create child .libra");
+                }
+                let child_db = child_root.join("private").join("capture.gen-00000001.redb");
+                let out = std::process::Command::new(&exe)
+                    .arg("--exact")
+                    .arg("storage::capture_store::tests::redb_private_dir_and_db_unix_permissions_nofollow_and_owner")
+                    .arg("--nocapture")
+                    .env("LIBRA_RB06D_CHILD_UMASK", umask_octal)
+                    .env("LIBRA_RB06D_CHILD_DB", &child_db)
+                    .output()
+                    .expect("spawn umask child");
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                assert!(
+                    out.status.success()
+                        && stdout.contains(&format!("RB06D_UMASK_CHILD_OK:{umask_octal}")),
+                    "child umask={umask_octal} precreate={precreate_dot_libra} check failed (status={:?}):\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                    out.status
+                );
+            }
+
+            // Inherited setgid bit on `.libra/` must be stripped so `.libra/private/` is exact 0700.
+            let setgid_dot_libra = dir.path().join("setgid-parent").join(".libra");
+            fs::create_dir_all(&setgid_dot_libra).expect("create setgid .libra");
+            let _ = fs::set_permissions(&setgid_dot_libra, fs::Permissions::from_mode(0o2755));
+            let setgid_private = setgid_dot_libra.join("private");
+            let setgid_db = setgid_private.join("capture.gen-00000001.redb");
+            let setgid_store = RedbCaptureStore::create(&setgid_db)
+                .await
+                .expect("create under setgid parent");
+            drop(setgid_store);
+            assert_eq!(
+                fs::symlink_metadata(&setgid_private)
+                    .expect("stat setgid private")
+                    .permissions()
+                    .mode()
+                    & 0o7777,
+                CAPTURE_PRIVATE_DIR_MODE,
+                "AC1: setgid must not survive on newly created .libra/private/"
+            );
+            assert_eq!(
+                fs::symlink_metadata(&setgid_db)
+                    .expect("stat setgid db")
+                    .permissions()
+                    .mode()
+                    & 0o7777,
+                CAPTURE_DB_FILE_MODE
+            );
+
+            // Failed create on an already-existing target must NEVER mutate existing parent mode,
+            // and create into an existing non-`private` directory must leave its mode untouched.
+            let shared_dir = dir.path().join("shared-existing-dir");
+            fs::create_dir_all(&shared_dir).expect("create shared dir");
+            fs::set_permissions(&shared_dir, fs::Permissions::from_mode(0o755))
+                .expect("chmod 0755 shared dir");
+            let shared_db = shared_dir.join("capture.gen-00000001.redb");
+            let shared_store = RedbCaptureStore::create(&shared_db)
+                .await
+                .expect("create db inside existing non-private dir");
+            drop(shared_store);
+            assert_eq!(
+                fs::symlink_metadata(&shared_dir)
+                    .expect("stat shared dir")
+                    .permissions()
+                    .mode()
+                    & 0o7777,
+                0o755,
+                "existing non-private directory permissions must not be silently mutated"
+            );
+            assert_eq!(
+                fs::symlink_metadata(&shared_db)
+                    .expect("stat shared db")
+                    .permissions()
+                    .mode()
+                    & 0o7777,
+                CAPTURE_DB_FILE_MODE,
+                "newly created capture DB must still be exact 0600"
+            );
+            let wide_private = dir
+                .path()
+                .join("failed-create-repo")
+                .join(".libra")
+                .join("private");
+            fs::create_dir_all(&wide_private).expect("create wide private");
+            let existing_target = wide_private.join("capture.gen-00000001.redb");
+            fs::write(&existing_target, b"occupied").expect("occupy target");
+            fs::set_permissions(&wide_private, fs::Permissions::from_mode(0o755))
+                .expect("chmod 0755 wide private");
+            let err_exists = RedbCaptureStore::create(&existing_target)
+                .await
+                .expect_err("create on existing target must fail");
+            assert_eq!(
+                err_exists.io_kind(),
+                Some(std::io::ErrorKind::AlreadyExists)
+            );
+            assert_eq!(
+                fs::symlink_metadata(&wide_private)
+                    .expect("stat wide private after failed create")
+                    .permissions()
+                    .mode()
+                    & 0o7777,
+                0o755,
+                "failed create must not mutate existing parent directory permissions"
+            );
+
+            // Confirm normal read-write & read-only opens succeed when posture is valid.
+            let ro = RedbCaptureStore::open_read_only(&db_path)
+                .await
+                .expect("open_read_only on valid private capture db");
+            assert!(
+                ro.get_session("sess-rb06d")
+                    .await
+                    .expect("read session")
+                    .is_some()
+            );
+            drop(ro);
+            let rw = RedbCaptureStore::open_read_write(&db_path, RedbRepairContext::WriteCommand)
+                .await
+                .expect("open_read_write on valid private capture db");
+            drop(rw);
+
+            // --- AC3: O_NOFOLLOW fail-closed rejection when `.libra/private/` is a symlink ---
+            let symlink_repo = dir.path().join(secret_marker).join("symlink-dir-repo");
+            let symlink_dot_libra = symlink_repo.join(".libra");
+            fs::create_dir_all(&symlink_dot_libra).expect("create symlink-dir .libra");
+            let symlink_private = symlink_dot_libra.join("private");
+            symlink(&private_dir, &symlink_private).expect("symlink .libra/private");
+            let via_symlink_dir = symlink_private.join("capture.gen-00000001.redb");
+
+            let err_dir_ro = RedbCaptureStore::open_read_only(&via_symlink_dir)
+                .await
+                .expect_err("AC3: open_read_only must reject symlinked .libra/private/");
+            assert!(
+                is_capture_symlink_rejected_error(&err_dir_ro),
+                "expected symlink rejection, got {err_dir_ro:?}"
+            );
+            assert!(err_dir_ro.to_string().contains("capture private directory"));
+            assert!(!err_dir_ro.to_string().contains(secret_marker));
+
+            let err_dir_rw = RedbCaptureStore::open_read_write(
+                &via_symlink_dir,
+                RedbRepairContext::WriteCommand,
+            )
+            .await
+            .expect_err("AC3: open_read_write must reject symlinked .libra/private/");
+            assert!(is_capture_symlink_rejected_error(&err_dir_rw));
+            assert!(err_dir_rw.to_string().contains("capture private directory"));
+            assert!(!err_dir_rw.to_string().contains(secret_marker));
+
+            let create_via_symlink_dir = symlink_private.join("capture.gen-00000002.redb");
+            let err_dir_create = RedbCaptureStore::create(&create_via_symlink_dir)
+                .await
+                .expect_err("AC3: create must reject symlinked .libra/private/");
+            assert!(is_capture_symlink_rejected_error(&err_dir_create));
+            assert!(
+                !private_dir.join("capture.gen-00000002.redb").exists(),
+                "rejected create through symlinked private dir must not create target file"
+            );
+
+            // Dangling symlink at `.libra/private/` must also be rejected without creating target.
+            let dangling_repo = dir.path().join(secret_marker).join("dangling-dir-repo");
+            let dangling_dot_libra = dangling_repo.join(".libra");
+            fs::create_dir_all(&dangling_dot_libra).expect("create dangling-dir .libra");
+            let dangling_target = dir.path().join("never-created-private-target");
+            let dangling_private = dangling_dot_libra.join("private");
+            symlink(&dangling_target, &dangling_private).expect("dangling private symlink");
+            let err_dangling_dir =
+                RedbCaptureStore::create(dangling_private.join("capture.gen-00000001.redb"))
+                    .await
+                    .expect_err("AC3: create must reject dangling symlinked .libra/private/");
+            assert!(is_capture_symlink_rejected_error(&err_dangling_dir));
+            assert!(!dangling_target.exists());
+
+            // --- AC4: O_NOFOLLOW fail-closed rejection when `capture.gen-<id>.redb` is a symlink or FIFO ---
+            let file_symlink_repo = dir.path().join(secret_marker).join("symlink-file-repo");
+            let file_symlink_private = file_symlink_repo.join(".libra").join("private");
+            fs::create_dir_all(&file_symlink_private).expect("create real private dir");
+            fs::set_permissions(
+                &file_symlink_private,
+                fs::Permissions::from_mode(CAPTURE_PRIVATE_DIR_MODE),
+            )
+            .expect("chmod 0700 private dir");
+            let symlink_db = file_symlink_private.join("capture.gen-00000001.redb");
+            symlink(&db_path, &symlink_db).expect("symlink capture.gen-00000001.redb");
+
+            let err_file_ro = RedbCaptureStore::open_read_only(&symlink_db)
+                .await
+                .expect_err("AC4: open_read_only must reject symlinked capture.gen-<id>.redb");
+            assert!(
+                is_capture_symlink_rejected_error(&err_file_ro),
+                "expected symlink rejection, got {err_file_ro:?}"
+            );
+            assert!(err_file_ro.to_string().contains("capture database file"));
+            assert!(!err_file_ro.to_string().contains(secret_marker));
+
+            let err_file_rw =
+                RedbCaptureStore::open_read_write(&symlink_db, RedbRepairContext::WriteCommand)
+                    .await
+                    .expect_err("AC4: open_read_write must reject symlinked capture.gen-<id>.redb");
+            assert!(is_capture_symlink_rejected_error(&err_file_rw));
+            assert!(err_file_rw.to_string().contains("capture database file"));
+            assert!(!err_file_rw.to_string().contains(secret_marker));
+
+            let err_file_create = RedbCaptureStore::create(&symlink_db)
+                .await
+                .expect_err("AC4: create must reject symlinked capture.gen-<id>.redb");
+            assert!(is_capture_symlink_rejected_error(&err_file_create));
+            assert!(
+                err_file_create
+                    .to_string()
+                    .contains("capture database file")
+            );
+
+            // Dangling symlink at `capture.gen-<id>.redb` must also fail closed via O_NOFOLLOW.
+            let dangling_db_target = dir.path().join("never-created-db.redb");
+            let dangling_db = file_symlink_private.join("capture.gen-00000002.redb");
+            symlink(&dangling_db_target, &dangling_db).expect("dangling db symlink");
+            let err_dangling_db_ro = RedbCaptureStore::open_read_only(&dangling_db)
+                .await
+                .expect_err("AC4: open_read_only must reject dangling symlink DB");
+            assert!(is_capture_symlink_rejected_error(&err_dangling_db_ro));
+            let err_dangling_db_create = RedbCaptureStore::create(&dangling_db)
+                .await
+                .expect_err("AC4: create must reject dangling symlink DB");
+            assert!(is_capture_symlink_rejected_error(&err_dangling_db_create));
+            assert!(!dangling_db_target.exists());
+
+            // FIFO at `capture.gen-<id>.redb` must fail closed immediately without blocking (O_NONBLOCK).
+            let fifo_db = file_symlink_private.join("capture.gen-00000003.redb");
+            let cfifo = std::ffi::CString::new(fifo_db.as_os_str().as_encoded_bytes())
+                .expect("fifo cstring");
+            // SAFETY: `cfifo` is NUL-terminated.
+            let mkfifo_rc = unsafe { libc::mkfifo(cfifo.as_ptr(), 0o600) };
+            assert_eq!(mkfifo_rc, 0, "mkfifo must succeed");
+            let err_fifo_ro = RedbCaptureStore::open_read_only(&fifo_db)
+                .await
+                .expect_err("open_read_only must reject FIFO immediately");
+            assert!(
+                err_fifo_ro.to_string().contains("not a regular file"),
+                "expected non-regular file error for FIFO read-only, got {err_fifo_ro:?}"
+            );
+            let err_fifo_rw =
+                RedbCaptureStore::open_read_write(&fifo_db, RedbRepairContext::WriteCommand)
+                    .await
+                    .expect_err("open_read_write must reject FIFO immediately");
+            assert!(
+                err_fifo_rw.to_string().contains("not a regular file"),
+                "expected non-regular file error for FIFO read-write, got {err_fifo_rw:?}"
+            );
+
+            // --- Deterministic replacement-race tests (descriptor-backed open & publication) ---
+            let effective_owners = UnixExpectedOwners::current_effective();
+            // SAFETY: `geteuid(2)` is always safe.
+            let current_uid = unsafe { libc::geteuid() };
+            assert_eq!(
+                effective_owners,
+                UnixExpectedOwners {
+                    dir_uid: current_uid,
+                    file_uid: current_uid,
+                }
+            );
+
+            // Race 1 (read-only): swap `.libra/private` at the pathname to an attacker symlink
+            // AFTER `dir_fd` opens -> descriptor-backed `openat` ignores the pathname swap and
+            // opens the original verified DB inode (never follows attacker symlink).
+            let race_dir_repo = dir.path().join("race-dir-swap");
+            let race_private = race_dir_repo.join(".libra").join("private");
+            let race_db = race_private.join("capture.gen-00000001.redb");
+            let race_store = RedbCaptureStore::create(&race_db)
+                .await
+                .expect("create race db");
+            race_store
+                .upsert_session(&sample_session("sess-legit-inode", "prov-legit", 1111))
+                .await
+                .expect("seed legit session");
+            drop(race_store);
+
+            let attacker_dir = dir.path().join("attacker-private");
+            fs::create_dir_all(&attacker_dir).expect("create attacker dir");
+            let attacker_db = attacker_dir.join("capture.gen-00000001.redb");
+            let attacker_store = RedbCaptureStore::create(&attacker_db)
+                .await
+                .expect("create attacker db");
+            attacker_store
+                .upsert_session(&sample_session("sess-attacker", "prov-attacker", 2222))
+                .await
+                .expect("seed attacker session");
+            drop(attacker_store);
+
+            let moved_legit = race_dir_repo.join(".libra").join("private-moved");
+            let rp_clone = race_private.clone();
+            let ml_clone = moved_legit.clone();
+            let atk_clone = attacker_dir.clone();
+            let race_ro = RedbCaptureStore::open_read_only_with_hook(
+                &race_db,
+                effective_owners,
+                Some(Box::new(move || {
+                    fs::rename(&rp_clone, &ml_clone).expect("move legit private dir");
+                    symlink(&atk_clone, &rp_clone).expect("plant attacker symlink at pathname");
+                })),
+            )
+            .await
+            .expect("descriptor-backed open_read_only must bind to validated dir_fd");
+            assert!(
+                race_ro
+                    .get_session("sess-legit-inode")
+                    .await
+                    .expect("read legit session")
+                    .is_some(),
+                "must read original validated DB, not attacker symlink"
+            );
+            assert!(
+                race_ro
+                    .get_session("sess-attacker")
+                    .await
+                    .expect("check attacker session absent")
+                    .is_none()
+            );
+            drop(race_ro);
+            // Restore legit dir for RW race test.
+            fs::remove_file(&race_private).expect("remove attacker symlink");
+            fs::rename(&moved_legit, &race_private).expect("restore legit private dir");
+
+            // Race 2 (read-write): replace `capture.gen-00000001.redb` inside `dir_fd` with a
+            // symlink AFTER `dir_fd` opens and BEFORE `openat` -> must fail closed via O_NOFOLLOW.
+            let rdb_clone = race_db.clone();
+            let backup_db = dir.path().join("race-db-backup.redb");
+            let bdb_clone = backup_db.clone();
+            let atk_db_clone = attacker_db.clone();
+            let err_race_rw = RedbCaptureStore::open_read_write_with_hook(
+                &race_db,
+                RedbRepairContext::WriteCommand,
+                effective_owners,
+                Some(Box::new(move || {
+                    fs::rename(&rdb_clone, &bdb_clone).expect("move legit db");
+                    symlink(&atk_db_clone, &rdb_clone).expect("swap db with symlink");
+                })),
+            )
+            .await
+            .expect_err("open_read_write must fail closed when DB is swapped to symlink");
+            assert!(is_capture_symlink_rejected_error(&err_race_rw));
+            assert!(err_race_rw.to_string().contains("capture database file"));
+
+            // Race 3 (create): plant a symlink at `target_name` right before `linkat` -> must
+            // fail closed with symlink rejection AND leave zero temp files or modified target.
+            let create_race_private = dir
+                .path()
+                .join("race-create")
+                .join(".libra")
+                .join("private");
+            let create_race_db = create_race_private.join("capture.gen-00000001.redb");
+            let crdb_clone = create_race_db.clone();
+            let atk_db_clone2 = attacker_db.clone();
+            let err_race_create = RedbCaptureStore::create_with_hooks(
+                &create_race_db,
+                effective_owners,
+                UnixCreateTestHooks {
+                    after_temp_create: None,
+                    after_tmp_init: None,
+                    before_publish: Some(Box::new(move || {
+                        symlink(&atk_db_clone2, &crdb_clone)
+                            .expect("plant symlink at target before publish");
+                    })),
+                    after_publish: None,
+                },
+            )
+            .await
+            .expect_err("create must fail closed if symlink appears at target before linkat");
+            assert!(is_capture_symlink_rejected_error(&err_race_create));
+            let tmp_leftovers: Vec<_> = fs::read_dir(&create_race_private)
+                .expect("read race-create private dir")
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+                .collect();
+            assert!(
+                tmp_leftovers.is_empty(),
+                "rollback guard must clean up temp files after publish race"
+            );
+
+            // Race 4 (create temp replacement): replace the temp file with another valid DB
+            // right after `drop(tmp_db)` and BEFORE `enforce_private_file_mode_in_dir` -> must
+            // fail closed on inode mismatch without publishing the replacement!
+            let tmp_swap_private = dir
+                .path()
+                .join("race-tmp-swap")
+                .join(".libra")
+                .join("private");
+            let tmp_swap_db = tmp_swap_private.join("capture.gen-00000001.redb");
+            let atk_copy_src = attacker_db.clone();
+            let err_tmp_swap = RedbCaptureStore::create_with_hooks(
+                &tmp_swap_db,
+                effective_owners,
+                UnixCreateTestHooks {
+                    after_temp_create: None,
+                    after_tmp_init: Some(Box::new(move |tmp_path: &Path| {
+                        let swapped = tmp_path.with_extension("attacker");
+                        fs::copy(&atk_copy_src, &swapped).expect("copy attacker db");
+                        fs::set_permissions(
+                            &swapped,
+                            fs::Permissions::from_mode(CAPTURE_DB_FILE_MODE),
+                        )
+                        .expect("chmod 0600 attacker copy");
+                        fs::rename(&swapped, tmp_path).expect("replace temp file with attacker db");
+                    })),
+                    before_publish: None,
+                    after_publish: None,
+                },
+            )
+            .await
+            .expect_err("create must reject temp file replaced with a different inode");
+            assert!(
+                err_tmp_swap.to_string().contains("temp inode changed"),
+                "expected temp inode mismatch error, got {err_tmp_swap:?}"
+            );
+            assert!(
+                !tmp_swap_db.exists(),
+                "replaced temp file must never be published to destination"
+            );
+
+            // Race 5 (create post-publish destination replacement): replace `target_name` with a
+            // concurrent actor's DB right after `linkat` and BEFORE post-publish inode verification ->
+            // create must fail closed AND inode-pinned rollback must NOT delete the replacement!
+            let dest_swap_private = dir
+                .path()
+                .join("race-dest-swap")
+                .join(".libra")
+                .join("private");
+            let dest_swap_db = dest_swap_private.join("capture.gen-00000001.redb");
+            let dsd_clone = dest_swap_db.clone();
+            let atk_copy_src2 = attacker_db.clone();
+            let err_dest_swap = RedbCaptureStore::create_with_hooks(
+                &dest_swap_db,
+                effective_owners,
+                UnixCreateTestHooks {
+                    after_temp_create: None,
+                    after_tmp_init: None,
+                    before_publish: None,
+                    after_publish: Some(Box::new(move || {
+                        let replacement = dsd_clone.with_extension("replacement");
+                        fs::copy(&atk_copy_src2, &replacement).expect("copy replacement db");
+                        fs::set_permissions(
+                            &replacement,
+                            fs::Permissions::from_mode(CAPTURE_DB_FILE_MODE),
+                        )
+                        .expect("chmod 0600 replacement");
+                        fs::rename(&replacement, &dsd_clone)
+                            .expect("replace published dest with concurrent file");
+                    })),
+                },
+            )
+            .await
+            .expect_err("create must fail closed when published destination inode changes");
+            assert!(
+                err_dest_swap.to_string().contains("inode changed"),
+                "expected published inode mismatch error, got {err_dest_swap:?}"
+            );
+            assert!(
+                dest_swap_db.exists(),
+                "inode-pinned rollback guard must preserve concurrent replacement destination"
+            );
+            let preserved_replacement = RedbCaptureStore::open_read_only(&dest_swap_db)
+                .await
+                .expect("preserved replacement DB must remain intact and readable");
+            assert!(
+                preserved_replacement
+                    .get_session("sess-attacker")
+                    .await
+                    .expect("read preserved replacement")
+                    .is_some()
+            );
+            drop(preserved_replacement);
+
+            // Early temp-file failure (P2) + failed-create non-mutation of existing private dir:
+            // pre-create `early-fail/.libra/private` with 0755, inject failure right after
+            // `openat(O_CREAT|O_EXCL)` -> verify zero temp orphans AND 0755 parent mode unchanged.
+            let early_fail_private = dir.path().join("early-fail").join(".libra").join("private");
+            fs::create_dir_all(&early_fail_private).expect("precreate early-fail private");
+            fs::set_permissions(&early_fail_private, fs::Permissions::from_mode(0o755))
+                .expect("chmod 0755 early-fail private");
+            let early_fail_db = early_fail_private.join("capture.gen-00000001.redb");
+            let err_early = RedbCaptureStore::create_with_hooks(
+                &early_fail_db,
+                effective_owners,
+                UnixCreateTestHooks {
+                    after_temp_create: Some(Box::new(|| {
+                        Err(StorageBackendError::BackendInternal {
+                            detail: "injected early post-temp-create failure".to_string(),
+                        })
+                    })),
+                    after_tmp_init: None,
+                    before_publish: None,
+                    after_publish: None,
+                },
+            )
+            .await
+            .expect_err("injected early post-temp-create failure must abort create");
+            assert!(err_early.to_string().contains("injected early"));
+            let early_leftovers: Vec<_> = fs::read_dir(&early_fail_private)
+                .expect("read early-fail private dir")
+                .filter_map(|e| e.ok())
+                .collect();
+            assert!(
+                early_leftovers.is_empty(),
+                "early failure after openat(O_CREAT|O_EXCL) must leave zero temp orphans: {early_leftovers:?}"
+            );
+            assert_eq!(
+                fs::symlink_metadata(&early_fail_private)
+                    .expect("stat early-fail private after failure")
+                    .permissions()
+                    .mode()
+                    & 0o7777,
+                0o755,
+                "failure after target-absence check must not mutate existing private directory permissions"
+            );
+
+            // --- AC5: Fail-closed rejection when `.libra/private/` is not owned by effective UID ---
+            let mismatch_uid = current_uid.wrapping_add(1);
+            if current_uid != 0 {
+                // Non-root: unconditionally test the UNPARAMETERIZED public API against a real
+                // OS directory owned by another UID (uid 0).
+                let foreign_dir = ["/etc", "/private/etc", "/usr"]
+                    .into_iter()
+                    .map(Path::new)
+                    .find(|p| {
+                        fs::symlink_metadata(p).is_ok_and(|m| {
+                            m.is_dir() && !m.file_type().is_symlink() && m.uid() != current_uid
+                        })
+                    })
+                    .expect("non-root Unix environment must have a real root-owned directory (/etc or /usr)");
+                let foreign_db = foreign_dir.join("capture.gen-00000001.redb");
+                let err_foreign_ro = RedbCaptureStore::open_read_only(&foreign_db)
+                    .await
+                    .expect_err("AC5: public open_read_only must reject real foreign-owned dir");
+                assert!(is_capture_owner_mismatch_error(&err_foreign_ro));
+                assert!(
+                    err_foreign_ro
+                        .to_string()
+                        .contains("capture private directory")
+                );
+                let err_foreign_rw =
+                    RedbCaptureStore::open_read_write(&foreign_db, RedbRepairContext::WriteCommand)
+                        .await
+                        .expect_err(
+                            "AC5: public open_read_write must reject real foreign-owned dir",
+                        );
+                assert!(is_capture_owner_mismatch_error(&err_foreign_rw));
+                assert!(
+                    err_foreign_rw
+                        .to_string()
+                        .contains("capture private directory")
+                );
+                let err_foreign_create = RedbCaptureStore::create(&foreign_db)
+                    .await
+                    .expect_err("AC5: public create must reject real foreign-owned dir");
+                assert!(is_capture_owner_mismatch_error(&err_foreign_create));
+                assert!(
+                    err_foreign_create
+                        .to_string()
+                        .contains("capture private directory")
+                );
+            }
+
+            let wrong_dir_owners = UnixExpectedOwners {
+                dir_uid: mismatch_uid,
+                file_uid: current_uid,
+            };
+            let err_dir_owner_ro =
+                RedbCaptureStore::open_read_only_with_expected_owners(&db_path, wrong_dir_owners)
+                    .await
+                    .expect_err("AC5: open_read_only must reject non-owner .libra/private/");
+            assert!(is_capture_owner_mismatch_error(&err_dir_owner_ro));
+            assert!(
+                err_dir_owner_ro
+                    .to_string()
+                    .contains("capture private directory")
+            );
+            assert!(!err_dir_owner_ro.to_string().contains(secret_marker));
+
+            let err_dir_owner_rw = RedbCaptureStore::open_read_write_with_expected_owners(
+                &db_path,
+                RedbRepairContext::WriteCommand,
+                wrong_dir_owners,
+            )
+            .await
+            .expect_err("AC5: open_read_write must reject non-owner .libra/private/");
+            assert!(is_capture_owner_mismatch_error(&err_dir_owner_rw));
+            assert!(
+                err_dir_owner_rw
+                    .to_string()
+                    .contains("capture private directory")
+            );
+
+            let new_under_wrong_dir = private_dir.join("capture.gen-00000099.redb");
+            let err_dir_owner_create = RedbCaptureStore::create_with_expected_owners(
+                &new_under_wrong_dir,
+                wrong_dir_owners,
+            )
+            .await
+            .expect_err("AC5: create must reject non-owner .libra/private/");
+            assert!(is_capture_owner_mismatch_error(&err_dir_owner_create));
+            assert!(!new_under_wrong_dir.exists());
+
+            // --- AC6: Fail-closed rejection when `capture.gen-<id>.redb` is not owned by effective UID ---
+            // Attempt genuine `chown` first so privileged/root runs test the unparameterized public API
+            // directly against a foreign-owned file inside a `current_uid`-owned `.libra/private/`.
+            let chown_private = dir.path().join("chown-test").join(".libra").join("private");
+            let chown_db = chown_private.join("capture.gen-00000001.redb");
+            let chown_store = RedbCaptureStore::create(&chown_db)
+                .await
+                .expect("create chown fixture db");
+            drop(chown_store);
+            let c_chown_db = std::ffi::CString::new(chown_db.as_os_str().as_encoded_bytes())
+                .expect("chown db cstring");
+            // SAFETY: `c_chown_db` is NUL-terminated.
+            let chown_rc = unsafe { libc::chown(c_chown_db.as_ptr(), mismatch_uid, u32::MAX) };
+            if chown_rc == 0 {
+                let err_real_file_ro = RedbCaptureStore::open_read_only(&chown_db)
+                    .await
+                    .expect_err("AC6: public open_read_only must reject chowned foreign DB file");
+                assert!(is_capture_owner_mismatch_error(&err_real_file_ro));
+                assert!(
+                    err_real_file_ro
+                        .to_string()
+                        .contains("capture database file")
+                );
+                let err_real_file_rw =
+                    RedbCaptureStore::open_read_write(&chown_db, RedbRepairContext::WriteCommand)
+                        .await
+                        .expect_err(
+                            "AC6: public open_read_write must reject chowned foreign DB file",
+                        );
+                assert!(is_capture_owner_mismatch_error(&err_real_file_rw));
+                assert!(
+                    err_real_file_rw
+                        .to_string()
+                        .contains("capture database file")
+                );
+                // Also verify chowned foreign directory via public API under root.
+                let c_chown_dir =
+                    std::ffi::CString::new(chown_private.as_os_str().as_encoded_bytes())
+                        .expect("chown dir cstring");
+                // SAFETY: `c_chown_dir` is NUL-terminated.
+                assert_eq!(
+                    unsafe { libc::chown(c_chown_dir.as_ptr(), mismatch_uid, u32::MAX) },
+                    0
+                );
+                let err_real_dir_ro = RedbCaptureStore::open_read_only(&chown_db)
+                    .await
+                    .expect_err(
+                        "AC5: public open_read_only must reject chowned foreign private dir",
+                    );
+                assert!(is_capture_owner_mismatch_error(&err_real_dir_ro));
+                assert!(
+                    err_real_dir_ro
+                        .to_string()
+                        .contains("capture private directory")
+                );
+            } else {
+                let chown_err = std::io::Error::last_os_error();
+                assert_eq!(
+                    chown_err.kind(),
+                    std::io::ErrorKind::PermissionDenied,
+                    "unexpected chown error (expected EPERM when unprivileged): {chown_err}"
+                );
+                eprintln!(
+                    "RB-06d: unprivileged uid={current_uid} cannot chown fixture (EPERM); \
+                     public effective-UID wiring verified above, verifying real fstat(st_uid) \
+                     file-owner check via open_*_with_expected_owners"
+                );
+            }
+
+            // Always verify independent AC6 file-owner comparison with `dir_uid == current_uid`
+            // so directory check succeeds and `open_existing_file_in_dir` independently rejects.
+            let wrong_file_owners = UnixExpectedOwners {
+                dir_uid: current_uid,
+                file_uid: mismatch_uid,
+            };
+            let err_file_owner_ro =
+                RedbCaptureStore::open_read_only_with_expected_owners(&db_path, wrong_file_owners)
+                    .await
+                    .expect_err("AC6: open_read_only must reject non-owner capture.gen-<id>.redb");
+            assert!(is_capture_owner_mismatch_error(&err_file_owner_ro));
+            assert!(
+                err_file_owner_ro
+                    .to_string()
+                    .contains("capture database file")
+            );
+            assert!(!err_file_owner_ro.to_string().contains(secret_marker));
+
+            let err_file_owner_rw = RedbCaptureStore::open_read_write_with_expected_owners(
+                &db_path,
+                RedbRepairContext::WriteCommand,
+                wrong_file_owners,
+            )
+            .await
+            .expect_err("AC6: open_read_write must reject non-owner capture.gen-<id>.redb");
+            assert!(is_capture_owner_mismatch_error(&err_file_owner_rw));
+            assert!(
+                err_file_owner_rw
+                    .to_string()
+                    .contains("capture database file")
+            );
+        }
     }
 
     /// Smoke test ensuring `SqliteCaptureStore` builds and works cleanly under

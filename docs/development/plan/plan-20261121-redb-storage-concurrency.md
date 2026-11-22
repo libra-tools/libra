@@ -2122,7 +2122,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `done` / `remote-pending`
+**Lifecycle / Acceptance:** `done` / `remote-verified`
 
 **Description:** 100% 在独占目录 `src/storage/**` 内于 `RedbCaptureStore` 落实数据完整性不变量：`agent_import_tombstone` 同事务重导拒收以及 `agent_audit_log` 与 `agent_workspace_scope_audit` 只追加保护（拒绝覆写与删除）。
 
@@ -2180,7 +2180,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `remote-pending`
 
 **Description:** 100% 在独占目录 `src/storage/**` 内于 `RedbCaptureStore` 落实 Unix 私密安全姿态：分别对 `.libra/private/` 目录与 `capture.gen-<id>.redb` 文件强制精确权限位（`0700`/`0600`）、`O_NOFOLLOW` 符号链接拒收与当前有效 UID 属主校验。
 
@@ -2194,17 +2194,17 @@
 | `GC-RB-03` 要求对 `.libra/private/` 与 `capture.gen-<id>.redb` 分别执行 `0700`/`0600`、`O_NOFOLLOW` 与当前有效 UID 校验 | `GC-RB-03` |
 
 **Acceptance criteria:**
-- [ ] Unix 创建 `.libra/private/` 目录满足精确 `0700` 权限位。
-- [ ] Unix 创建 `capture.gen-<id>.redb` 文件满足精确 `0600` 权限位。
-- [ ] Unix 打开 `.libra/private/` 遇到符号链接时按 `O_NOFOLLOW` fail-closed 拒绝。
-- [ ] Unix 打开 `capture.gen-<id>.redb` 遇到符号链接时按 `O_NOFOLLOW` fail-closed 拒绝。
-- [ ] Unix 打开 `.libra/private/` 遇到非当前有效 UID 属主时 fail-closed 拒绝。
-- [ ] Unix 打开 `capture.gen-<id>.redb` 遇到非当前有效 UID 属主时 fail-closed 拒绝。
+- [x] Unix 创建 `.libra/private/` 目录满足精确 `0700` 权限位。
+- [x] Unix 创建 `capture.gen-<id>.redb` 文件满足精确 `0600` 权限位。
+- [x] Unix 打开 `.libra/private/` 遇到符号链接时按 `O_NOFOLLOW` fail-closed 拒绝。
+- [x] Unix 打开 `capture.gen-<id>.redb` 遇到符号链接时按 `O_NOFOLLOW` fail-closed 拒绝。
+- [x] Unix 打开 `.libra/private/` 遇到非当前有效 UID 属主时 fail-closed 拒绝。
+- [x] Unix 打开 `capture.gen-<id>.redb` 遇到非当前有效 UID 属主时 fail-closed 拒绝。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --no-default-features --features storage-redb,storage-queue --lib -E 'test(=storage::capture_store::tests::redb_private_dir_and_db_unix_permissions_nofollow_and_owner)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=storage::capture_store::tests::redb_private_dir_and_db_unix_permissions_nofollow_and_owner)'`（new，覆盖 AC1–AC6）
-- [ ] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 4 文件实现白名单。
+- [x] `source .env.test && cargo nextest list --no-default-features --features storage-redb,storage-queue --lib -E 'test(=storage::capture_store::tests::redb_private_dir_and_db_unix_permissions_nofollow_and_owner)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=storage::capture_store::tests::redb_private_dir_and_db_unix_permissions_nofollow_and_owner)'`（new，覆盖 AC1–AC6）
+- [x] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 4 文件实现白名单。
 
 **Full-suite trigger:** `none`
 
@@ -10036,8 +10036,9 @@
 | `RB-05` | `done` / `remote-verified` | `b477d04`（`main`） | `0.30.322` | 2026-11-22 19:19 UTC：Stage 1 精确 4 文件写集（`src/storage/{mod,git_state_store}.rs`、`src/storage/{sqlite,redb}/git_state_store.rs`），实现对象安全 `GitStateStore` 及其双后端 `SqliteGitStateStore`/`RedbGitStateStore`，完整覆盖 21 张工作流/工作树/OpLog v2/Change 谱系/脏树/图层/稀疏视图源表 + 同事务二级索引 `change_revision_by_commit` + `git_state_sequences`；实现全零 SHA-1/SHA-256 OID 与 `worktree_id` 隔离、部分唯一工作区租约登记/续期/到期回收/吊销、4 表单事务原子追加兼头收敛 `append_operation_and_converge_heads`（含 6 并发写者真实并发头收敛与回滚原子实测）、SQLite 多表快照读事务（`get_sparse_view`/`get_operation`/`list_operations`）与遗留 `RB-04b` 红库只读重开一致能力基线 `[2, 3, 4]` 及安全升级；`dual_backend_22_workflow_worktree_oplog_tables_equivalence`（双特性 + 纯 `storage-redb,storage-queue`）、`sqlite_workflow_state_tables_smoke`（纯 `storage-sqlite`）、fmt、严格 clippy、`compat_version_surface_sync` 与 Codex R2 `VERDICT: PASS` 全绿 |
 | `RB-05b` | `done` / `remote-verified` | `023b711`（`main`） | `0.30.325` | 2026-11-22 20:15 UTC：Stage 1 精确 4 文件写集（`src/storage/{mod,git_state_store}.rs`、`src/storage/{sqlite,redb}/git_state_store.rs`），补齐 19 张 `ai_*`（含单事务 `is_latest` 互斥、唯一约束与 `delete_ai_thread` 11 表级联）、5 张 `memory_*`（含非 UTF-8 原始路径、自然键唯一与级联清理）+ 同事务 `MEMORY_BY_PATH` 倒序二级索引（含时间戳更新剪枝与新旧时间窗回归）、3 张治理审计表（`approved_permission`/`automation_log`/`source_call_log`）及 `agent_bridge_publication`/`agent_bridge_index_publication` 严格单调两阶段（`prepared` → `published`，禁跳准备、禁降级、禁改摘要、兼容只读 2 列旧表并与 `RedbGitStore` 同库线级互通）；完成 61 张活跃持久仓库源表静态与落盘双向集合相等守卫（排除 7 张退役表与全部内部/二级索引表）；`dual_backend_28_ai_memory_bridge_tables_equivalence`、`repository_61_source_tables_manifest_complete`（双特性 + 纯 `storage-redb,storage-queue`）、`sqlite_ai_memory_bridge_tables_smoke`（纯 `storage-sqlite`）、fmt、严格 clippy、`compat_version_surface_sync` 与 Codex R3 `VERDICT: PASS` 全绿（Repository 全 61 张活跃源表双后端全部闭环） |
 | `RB-06` | `done` / `remote-verified` | `2e3c0ee`（`main`） | `0.30.326` | 2026-11-22 21:55 UTC：Stage 1 精确 4 文件写集（`src/storage/{mod,capture_store}.rs`、`src/storage/{sqlite,redb}/capture_store.rs`），实现对象安全 `AgentBridgeStore` 与 `CaptureStore` 全 25 张 Capture 源表双后端（显式区隔 `META_*`/`QUEUE_HIGHWATER_*`/去重/序列与 7 张同事务二级索引表 `sessions_by_time`/`sessions_by_provider`/`checkpoints_by_session`/`events_by_time`/`bridge_events_by_seq`/`bridge_links_by_key`/`usage_stats_by_session_event`）、单事务 160 条事件语义 `dedup_key` 幂等批写与中段失败回滚、`AgentBridgeStore::append_and_ack_events` 基于 `(bridge_session_id, event_seq)` 单事务增量推进连续 `last_acked_seq`（SQLite 递归点查 CTE 零尾扫描 + 200 尾缺口回归）、`agent_coverage_revision` 只追加历史防篡改、无 `U+10FFFF` 上界的开放前缀范围扫描、`SqliteCreatePublishGuard`/`RedbCreatePublishGuard` 取消与发布后异常原子回滚守卫，以及 `capture.redb` 过新 `META_SCHEMA` 仅报 `LBR-AGENT-048` 而不阻断 `RedbGitStore`；双特性 7/7、纯 `storage-redb,storage-queue` 4/4、纯 `storage-sqlite` 2/2、单特性零告警、fmt、严格 clippy、`compat_version_surface_sync` 与 Codex R7 `VERDICT: PASS` 全绿 |
-| `RB-06c` | `done` / `remote-pending` | 本提交（`main`） | `0.30.327` | 2026-11-22 22:16 UTC：Stage 1 精确 4 文件写集（`src/storage/{mod,capture_store}.rs`、`src/storage/redb/{mod,capture_store}.rs`），在 `RedbCaptureStore` 新增同事务二级索引 `import_tombstones_by_provider` / `import_tombstones_by_session`（含 `open_read_write` 对 `RB-06` 遗留红库自动回填与过期索引剪枝）、同事务拒绝已墓碑化 `(agent_kind, provider_session_id)` 与 `erased_session_id` 重导（覆盖 `upsert_session`/`upsert_checkpoint`/`upsert_import_identity`/`append_capture_batch` 原子回滚含 `dedup_key` 撤销）、以及 `agent_audit_log` / `agent_workspace_scope_audit` 同事务只追加保护（覆写与 `update_*`/`delete_*` 全部 fail-closed 报脱敏错且原行零改动）；纯 `storage-redb,storage-queue` `redb_tombstone_and_audit_append_only_invariants` 1/1、双特性 `storage::capture_store::` 8/8、单特性零告警检查、fmt、严格 clippy、`compat_version_surface_sync` 与 Codex R2 `VERDICT: PASS` 全绿 |
-| `RB-06d`..`RB-34c`（剩余 129 卡） | `pending` | — | — | 按实施顺序于 `main` 逐卡推进 |
+| `RB-06c` | `done` / `remote-verified` | `159bbf3`（`main`） | `0.30.327` | 2026-11-22 22:16 UTC：Stage 1 精确 4 文件写集（`src/storage/{mod,capture_store}.rs`、`src/storage/redb/{mod,capture_store}.rs`），在 `RedbCaptureStore` 新增同事务二级索引 `import_tombstones_by_provider` / `import_tombstones_by_session`（含 `open_read_write` 对 `RB-06` 遗留红库自动回填与过期索引剪枝）、同事务拒绝已墓碑化 `(agent_kind, provider_session_id)` 与 `erased_session_id` 重导（覆盖 `upsert_session`/`upsert_checkpoint`/`upsert_import_identity`/`append_capture_batch` 原子回滚含 `dedup_key` 撤销）、以及 `agent_audit_log` / `agent_workspace_scope_audit` 同事务只追加保护（覆写与 `update_*`/`delete_*` 全部 fail-closed 报脱敏错且原行零改动）；纯 `storage-redb,storage-queue` `redb_tombstone_and_audit_append_only_invariants` 1/1、双特性 `storage::capture_store::` 8/8、单特性零告警检查、fmt、严格 clippy、`compat_version_surface_sync` 与 Codex R2 `VERDICT: PASS` 全绿 |
+| `RB-06d` | `done` / `remote-pending` | 本提交（`main`） | `0.30.328` | 2026-11-22 23:04 UTC：Stage 1 精确 4 文件写集（`src/storage/{mod,capture_store}.rs`、`src/storage/redb/{mod,capture_store}.rs`），在 `RedbCaptureStore` 落地全描述符绑定 Unix 私密安全姿态：新建 `.libra/private/`（含缺失祖先目录逐级 `mkdirat` + macOS `fchmodat(AT_SYMLINK_NOFOLLOW)` / Linux `O_PATH` + `/proc/self/fd`）精确 `0700`、新建 `capture.gen-<id>.redb`（`openat(O_CREAT|O_EXCL|O_NOFOLLOW)` + `fchmod(0600)` + `linkat` + `FileBackend::new(file)` 零路径重开 + inode 钉定 `RedbCreatePublishGuard`）精确 `0600`、打开 `.libra/private/` 与 `capture.gen-<id>.redb` 均经 `O_NOFOLLOW|O_NONBLOCK` 拒绝符号链接/FIFO 并按 `libc::geteuid()` 核验属主 UID 且错误文案零路径/UID 泄露；纯 `storage-redb,storage-queue` `redb_private_dir_and_db_unix_permissions_nofollow_and_owner` 1/1（含 `umask(0000/0077/0777)` 含缺失祖先子进程、setgid 剥离、既有父目录零变更、FIFO、5 类确定性替换竞态/早期失败及真实非属主目录/chown 校验）、双特性 9/9、单特性零告警、fmt、严格 clippy、`compat_version_surface_sync` 全绿；Codex R1（5 项）与 R2（4 项）真实发现已全部闭环，R3 仅余同 UID 目录并发下 POSIX 无原生原子 `unlinkat_if_inode`/`mkdirat_fd` 系统调用之范围外延展，依用户授权跳过继续推进 |
+| `RB-06b`..`RB-34c`（剩余 128 卡） | `pending` | — | — | 按实施顺序于 `main` 逐卡推进 |
 
 ## Codex review log
 

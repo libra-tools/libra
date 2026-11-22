@@ -37,6 +37,35 @@ pub(crate) fn map_append_only_err(table: &'static str, op: &'static str) -> Stor
     }
 }
 
+/// Construct a sanitized fail-closed error when Unix `O_NOFOLLOW` rejects a
+/// symlinked capture private directory or database file (`RB-06d`).
+///
+/// Deliberately omits raw paths so private repository locations never leak
+/// through error messages (`GC-RB-03` / `ER-11`).
+#[cfg(unix)]
+pub(crate) fn map_capture_symlink_err(target: &'static str) -> StorageBackendError {
+    StorageBackendError::BackendInternal {
+        detail: format!(
+            "{}: {target} must not be a symlink (O_NOFOLLOW)",
+            crate::storage::capture_store::CAPTURE_SECURITY_SYMLINK_ERROR_PREFIX
+        ),
+    }
+}
+
+/// Construct a sanitized fail-closed error when a capture private directory or
+/// database file is not owned by the current effective Unix UID (`RB-06d`).
+///
+/// Deliberately omits raw paths and UIDs (`GC-RB-03` / `ER-11`).
+#[cfg(unix)]
+pub(crate) fn map_capture_owner_mismatch_err(target: &'static str) -> StorageBackendError {
+    StorageBackendError::BackendInternal {
+        detail: format!(
+            "{}: {target} is not owned by the current effective user",
+            crate::storage::capture_store::CAPTURE_SECURITY_OWNER_ERROR_PREFIX
+        ),
+    }
+}
+
 /// Map a `redb::StorageError` to a sanitized [`StorageBackendError`] without
 /// echoing raw paths or secret values (`GC-RB-03` / `ER-11`).
 pub(crate) fn map_redb_storage_err(
