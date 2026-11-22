@@ -64,9 +64,12 @@ pub use git_store::RedbGitStore;
 #[cfg(feature = "storage-sqlite")]
 pub use git_store::SqliteGitStore;
 pub use git_store::{
-    BridgePublicationPhase, BridgePublicationRecord, GitStore, MAX_BRIDGE_OPERATION_ID_LEN,
-    REFLOG_HEAD_REF_NAME, RefCasOutcome, RefKey, RefRecord, RefTarget, ReflogEntry, ReflogWrite,
-    is_valid_bridge_operation_id,
+    BridgePublicationPhase, BridgePublicationRecord, DEFAULT_NOTES_REF_PREFIX, GitStore,
+    MAX_BRIDGE_OPERATION_ID_LEN, NoteBatchOutcome, NoteCasOp, NoteRecord, NoteWriteOutcome,
+    OBLITERATION_FENCE_ERROR_PREFIX, ObjectHashKind, ObjectIndexRecord, ObjectObliterationRecord,
+    ObliterationRequest, ObliterationState, REFLOG_HEAD_REF_NAME, RefCasOutcome, RefKey, RefRecord,
+    RefTarget, ReflogEntry, ReflogWrite, RevisionOrdinalAppendOutcome, RevisionOrdinalMeta,
+    is_obliteration_fenced_error, is_valid_bridge_operation_id,
 };
 pub use manifest::{
     INITIAL_STORAGE_GENERATION, LEGACY_SQLITE_DB_FILE, ManifestOrigin, PRIVATE_SUBDIR,

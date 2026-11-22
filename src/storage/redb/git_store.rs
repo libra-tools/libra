@@ -1,9 +1,11 @@
-//! `redb 5.0` implementation of [`GitStore`] (`RB-04`).
+//! `redb 5.0` implementation of [`GitStore`] (`RB-04`, `RB-04b`).
 //!
-//! Stores core repository references (`reference`), reflog entries (`reflog` +
-//! same-transaction secondary index `reflog_by_ref`), and atomic bridge
-//! operation bindings (`agent_bridge_publication`) inside `git.redb` using the
-//! versioned `[schema_ver: u16_le][postcard]` envelope (`crate::storage::codec`).
+//! Stores all 7 core repository tables (`reference`, `reflog`, `object_index`,
+//! `object_obliteration`, `notes`, `revision_ordinal`, `revision_ordinal_meta`),
+//! same-transaction secondary indexes (`reflog_by_ref`, `object_by_pack`,
+//! `revision_ordinal_by_oid`), and atomic bridge operation bindings
+//! (`agent_bridge_publication`) inside `git.redb` using the versioned
+//! `[schema_ver: u16_le][postcard]` envelope (`crate::storage::codec`).
 //!
 //! Every read and write transaction validates `META_SCHEMA` (`Repository` role,
 //! format version, and `u32::MAX` handle migration tombstone fence) as step 1
@@ -11,6 +13,7 @@
 //! cache, `MultiWriter`, zero write upgrades).
 
 use std::{
+    collections::HashSet,
     fs, io,
     path::{Path, PathBuf},
     sync::{
@@ -34,10 +37,18 @@ use crate::{
         codec::{decode_versioned, encode_versioned},
         error::{StorageBackendError, StorageResult},
         git_store::{
-            BridgePublicationPhase, BridgePublicationRecord, GitStore, REFLOG_HEAD_REF_NAME,
+            BridgePublicationPhase, BridgePublicationRecord, GitStore, NoteBatchOutcome, NoteCasOp,
+            NoteRecord, NoteWriteOutcome, ObjectHashKind, ObjectIndexRecord,
+            ObjectObliterationRecord, ObliterationRequest, ObliterationState, REFLOG_HEAD_REF_NAME,
             RefCasOutcome, RefKey, RefRecord, RefTarget, ReflogEntry, ReflogWrite,
-            is_valid_bridge_operation_id, validate_bridge_publication_binding, validate_ref_key,
-            validate_ref_target, validate_reflog_writes_for_key, validate_worktree_filter,
+            RevisionOrdinalAppendOutcome, RevisionOrdinalMeta, is_valid_bridge_operation_id,
+            obliteration_fenced_read_error, obliteration_fenced_write_error,
+            should_promote_object_index_type, validate_bridge_publication_binding,
+            validate_hex_oid, validate_non_empty_identifier, validate_note_cas_op,
+            validate_notes_ref, validate_object_index_record, validate_obliteration_request,
+            validate_oid_for_hash_kind, validate_ref_key, validate_ref_target,
+            validate_reflog_writes_for_key, validate_revision_ordinal_append,
+            validate_revision_ordinal_entries, validate_worktree_filter,
         },
         manifest::fsync_dir,
         meta::{begin_checked_read, begin_checked_write_blocking, init_meta_schema},
@@ -53,12 +64,26 @@ use crate::{
 pub const GIT_REF_CODEC_VERSION: u16 = 1;
 /// Current postcard codec version for `reflog` table values.
 pub const GIT_REFLOG_CODEC_VERSION: u16 = 1;
-/// Current postcard codec version for `reflog_by_ref` secondary index markers.
+/// Current postcard codec version for secondary index markers.
 pub const GIT_REFLOG_INDEX_CODEC_VERSION: u16 = 1;
 /// Current postcard codec version for `agent_bridge_publication` rows.
 pub const GIT_BRIDGE_PUB_CODEC_VERSION: u16 = 1;
 /// Current postcard codec version for monotonic sequence counters.
 pub const GIT_SEQ_CODEC_VERSION: u16 = 1;
+/// Current postcard codec version for `object_index` rows.
+pub const GIT_OBJECT_INDEX_CODEC_VERSION: u16 = 1;
+/// Current postcard codec version for `object_by_pack` secondary index markers.
+pub const GIT_OBJECT_BY_PACK_CODEC_VERSION: u16 = 1;
+/// Current postcard codec version for `object_obliteration` rows.
+pub const GIT_OBJECT_OBLITERATION_CODEC_VERSION: u16 = 1;
+/// Current postcard codec version for `notes` rows.
+pub const GIT_NOTES_CODEC_VERSION: u16 = 1;
+/// Current postcard codec version for `revision_ordinal` rows.
+pub const GIT_REVISION_ORDINAL_CODEC_VERSION: u16 = 1;
+/// Current postcard codec version for `revision_ordinal_by_oid` secondary index rows.
+pub const GIT_REVISION_ORDINAL_BY_OID_CODEC_VERSION: u16 = 1;
+/// Current postcard codec version for `revision_ordinal_meta` rows.
+pub const GIT_REVISION_ORDINAL_META_CODEC_VERSION: u16 = 1;
 
 /// Default bounded write-lock timeout for [`RedbGitStore`] (`30s`).
 pub const DEFAULT_GIT_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -68,6 +93,13 @@ const REFLOG_TABLE_NAME: &str = "reflog";
 const REFLOG_BY_REF_INDEX_NAME: &str = "reflog_by_ref";
 const BRIDGE_PUBLICATION_TABLE_NAME: &str = "agent_bridge_publication";
 const GIT_SEQ_TABLE_NAME: &str = "git_sequences";
+const OBJECT_INDEX_TABLE_NAME: &str = "object_index";
+const OBJECT_BY_PACK_INDEX_NAME: &str = "object_by_pack";
+const OBJECT_OBLITERATION_TABLE_NAME: &str = "object_obliteration";
+const NOTES_TABLE_NAME: &str = "notes";
+const REVISION_ORDINAL_TABLE_NAME: &str = "revision_ordinal";
+const REVISION_ORDINAL_BY_OID_INDEX_NAME: &str = "revision_ordinal_by_oid";
+const REVISION_ORDINAL_META_TABLE_NAME: &str = "revision_ordinal_meta";
 
 const SEQ_KEY_REFLOG: &str = "reflog";
 
@@ -102,6 +134,35 @@ pub const BRIDGE_PUBLICATION_TABLE: TableDefinition<'static, &str, &[u8]> =
 pub const GIT_SEQ_TABLE: TableDefinition<'static, &str, &[u8]> =
     TableDefinition::new(GIT_SEQ_TABLE_NAME);
 
+/// Primary table for `object_index` (`(repo_id, o_id) -> versioned ObjectIndexStoredRow`).
+pub const OBJECT_INDEX_TABLE: TableDefinition<'static, (&str, &str), &[u8]> =
+    TableDefinition::new(OBJECT_INDEX_TABLE_NAME);
+
+/// Same-transaction secondary index `OBJECT_BY_PACK` keyed by `(pack_id, repo_id, o_id)` (`RB-04b`).
+pub const OBJECT_BY_PACK_TABLE: TableDefinition<'static, (&str, &str, &str), &[u8]> =
+    TableDefinition::new(OBJECT_BY_PACK_INDEX_NAME);
+
+/// Primary table for permanent compliance tombstones
+/// (`(oid, hash_kind) -> versioned ObjectObliterationStoredRow`).
+pub const OBJECT_OBLITERATION_TABLE: TableDefinition<'static, (&str, &str), &[u8]> =
+    TableDefinition::new(OBJECT_OBLITERATION_TABLE_NAME);
+
+/// Primary table for `notes` (`(notes_ref, object) -> versioned NoteStoredRow`).
+pub const NOTES_TABLE: TableDefinition<'static, (&str, &str), &[u8]> =
+    TableDefinition::new(NOTES_TABLE_NAME);
+
+/// Primary table for `revision_ordinal` (`(ref_name, ordinal) -> versioned RevisionOrdinalStoredRow`).
+pub const REVISION_ORDINAL_TABLE: TableDefinition<'static, (&str, i64), &[u8]> =
+    TableDefinition::new(REVISION_ORDINAL_TABLE_NAME);
+
+/// Same-transaction reverse index for `revision_ordinal` (`(ref_name, oid) -> versioned ordinal`).
+pub const REVISION_ORDINAL_BY_OID_TABLE: TableDefinition<'static, (&str, &str), &[u8]> =
+    TableDefinition::new(REVISION_ORDINAL_BY_OID_INDEX_NAME);
+
+/// Primary table for `revision_ordinal_meta` (`ref_name -> versioned RevisionOrdinalMetaStoredRow`).
+pub const REVISION_ORDINAL_META_TABLE: TableDefinition<'static, &str, &[u8]> =
+    TableDefinition::new(REVISION_ORDINAL_META_TABLE_NAME);
+
 static GIT_STORE_TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -134,6 +195,53 @@ struct BridgePublicationStoredRow {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 struct GitSequenceValue {
     last_id: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ObjectIndexStoredRow {
+    o_type: String,
+    o_size: i64,
+    created_at: i64,
+    is_synced: bool,
+    pack_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct ObjectByPackMarker;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ObjectObliterationStoredRow {
+    state: ObliterationState,
+    reason: Option<String>,
+    actor: Option<String>,
+    approval_source: Option<String>,
+    requested_at: String,
+    tombstone_written_at: String,
+    payload_deleted_at: Option<String>,
+    updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct NoteStoredRow {
+    blob: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct RevisionOrdinalStoredRow {
+    oid: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct RevisionOrdinalByOidStoredRow {
+    ordinal: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct RevisionOrdinalMetaStoredRow {
+    tip_oid: String,
+    replace_sig: String,
+    max_ordinal: i64,
+    built_at: String,
 }
 
 fn encode_ref_key(key: &RefKey) -> (u8, &str, &str) {
@@ -253,6 +361,121 @@ fn decode_seq_value(bytes: &[u8]) -> StorageResult<u64> {
     Ok(seq.last_id)
 }
 
+fn decode_object_index_row(bytes: &[u8]) -> StorageResult<ObjectIndexStoredRow> {
+    decode_versioned(bytes, GIT_OBJECT_INDEX_CODEC_VERSION)
+}
+
+fn object_index_record_from_stored(
+    repo_id: String,
+    o_id: String,
+    row: ObjectIndexStoredRow,
+) -> ObjectIndexRecord {
+    ObjectIndexRecord {
+        repo_id,
+        o_id,
+        o_type: row.o_type,
+        o_size: row.o_size,
+        created_at: row.created_at,
+        is_synced: row.is_synced,
+    }
+}
+
+fn decode_obliteration_row(
+    oid: String,
+    hash_kind_str: &str,
+    bytes: &[u8],
+) -> StorageResult<ObjectObliterationRecord> {
+    let row: ObjectObliterationStoredRow =
+        decode_versioned(bytes, GIT_OBJECT_OBLITERATION_CODEC_VERSION)?;
+    Ok(ObjectObliterationRecord {
+        oid,
+        hash_kind: ObjectHashKind::parse(hash_kind_str)?,
+        state: row.state,
+        reason: row.reason,
+        actor: row.actor,
+        approval_source: row.approval_source,
+        requested_at: row.requested_at,
+        tombstone_written_at: row.tombstone_written_at,
+        payload_deleted_at: row.payload_deleted_at,
+        updated_at: row.updated_at,
+    })
+}
+
+fn decode_note_row(bytes: &[u8]) -> StorageResult<String> {
+    let row: NoteStoredRow = decode_versioned(bytes, GIT_NOTES_CODEC_VERSION)?;
+    Ok(row.blob)
+}
+
+fn decode_revision_ordinal_row(bytes: &[u8]) -> StorageResult<String> {
+    let row: RevisionOrdinalStoredRow =
+        decode_versioned(bytes, GIT_REVISION_ORDINAL_CODEC_VERSION)?;
+    Ok(row.oid)
+}
+
+fn decode_revision_ordinal_by_oid(bytes: &[u8]) -> StorageResult<i64> {
+    let row: RevisionOrdinalByOidStoredRow =
+        decode_versioned(bytes, GIT_REVISION_ORDINAL_BY_OID_CODEC_VERSION)?;
+    Ok(row.ordinal)
+}
+
+fn decode_revision_ordinal_meta(
+    ref_name: String,
+    bytes: &[u8],
+) -> StorageResult<RevisionOrdinalMeta> {
+    let row: RevisionOrdinalMetaStoredRow =
+        decode_versioned(bytes, GIT_REVISION_ORDINAL_META_CODEC_VERSION)?;
+    Ok(RevisionOrdinalMeta {
+        ref_name,
+        tip_oid: row.tip_oid,
+        replace_sig: row.replace_sig,
+        max_ordinal: row.max_ordinal,
+        built_at: row.built_at,
+    })
+}
+
+fn lookup_obliteration_in_table<T: ReadableTable<(&'static str, &'static str), &'static [u8]>>(
+    table: &T,
+    oid: &str,
+) -> StorageResult<Option<ObjectObliterationRecord>> {
+    let mut range = table
+        .range((oid, "")..)
+        .map_err(|err| map_redb_storage_err(err, "range scan object_obliteration by oid"))?;
+    if let Some(entry) = range.next() {
+        let (k, v) =
+            entry.map_err(|err| map_redb_storage_err(err, "read object_obliteration entry"))?;
+        let (found_oid, found_kind) = k.value();
+        if found_oid == oid {
+            return decode_obliteration_row(found_oid.to_string(), found_kind, v.value()).map(Some);
+        }
+    }
+    Ok(None)
+}
+
+fn initialize_rb04b_git_tables(wtx: &WriteTransaction) -> StorageResult<()> {
+    let _ = wtx
+        .open_table(OBJECT_INDEX_TABLE)
+        .map_err(|err| map_redb_table_err(err, "init object_index table"))?;
+    let _ = wtx
+        .open_table(OBJECT_BY_PACK_TABLE)
+        .map_err(|err| map_redb_table_err(err, "init object_by_pack index"))?;
+    let _ = wtx
+        .open_table(OBJECT_OBLITERATION_TABLE)
+        .map_err(|err| map_redb_table_err(err, "init object_obliteration table"))?;
+    let _ = wtx
+        .open_table(NOTES_TABLE)
+        .map_err(|err| map_redb_table_err(err, "init notes table"))?;
+    let _ = wtx
+        .open_table(REVISION_ORDINAL_TABLE)
+        .map_err(|err| map_redb_table_err(err, "init revision_ordinal table"))?;
+    let _ = wtx
+        .open_table(REVISION_ORDINAL_BY_OID_TABLE)
+        .map_err(|err| map_redb_table_err(err, "init revision_ordinal_by_oid index"))?;
+    let _ = wtx
+        .open_table(REVISION_ORDINAL_META_TABLE)
+        .map_err(|err| map_redb_table_err(err, "init revision_ordinal_meta table"))?;
+    Ok(())
+}
+
 fn initialize_core_git_tables(wtx: &WriteTransaction) -> StorageResult<()> {
     let _ = wtx
         .open_table(REFERENCE_TABLE)
@@ -272,10 +495,11 @@ fn initialize_core_git_tables(wtx: &WriteTransaction) -> StorageResult<()> {
     let zero = encode_versioned(GIT_SEQ_CODEC_VERSION, &GitSequenceValue { last_id: 0 })?;
     seq.insert(SEQ_KEY_REFLOG, zero.as_slice())
         .map_err(|err| map_redb_storage_err(err, "seed reflog sequence"))?;
-    Ok(())
+    drop(seq);
+    initialize_rb04b_git_tables(wtx)
 }
 
-fn required_core_table_names() -> [&'static str; 5] {
+fn required_base_table_names() -> [&'static str; 5] {
     [
         REFERENCE_TABLE_NAME,
         REFLOG_TABLE_NAME,
@@ -285,20 +509,62 @@ fn required_core_table_names() -> [&'static str; 5] {
     ]
 }
 
-fn verify_required_tables_read(rtx: &ReadTransaction) -> StorageResult<()> {
-    let existing: Vec<String> = rtx
-        .list_tables()
-        .map_err(|err| map_redb_storage_err(err, "list redb git store tables"))?
-        .map(|handle| handle.name().to_string())
-        .collect();
-    for required in required_core_table_names() {
+fn rb04b_extended_table_names() -> [&'static str; 7] {
+    [
+        OBJECT_INDEX_TABLE_NAME,
+        OBJECT_BY_PACK_INDEX_NAME,
+        OBJECT_OBLITERATION_TABLE_NAME,
+        NOTES_TABLE_NAME,
+        REVISION_ORDINAL_TABLE_NAME,
+        REVISION_ORDINAL_BY_OID_INDEX_NAME,
+        REVISION_ORDINAL_META_TABLE_NAME,
+    ]
+}
+
+/// Inspect existing table names against the RB-04 (5 base tables) and RB-04b
+/// (+7 extended tables) schema generations.
+///
+/// Returns `Ok(true)` if all 12 tables exist, `Ok(false)` if this is a clean
+/// legacy RB-04 store with only the 5 base tables, or `Err` if any required
+/// base table is missing or only a corrupt partial subset of RB-04b tables exists.
+fn classify_table_layout(existing: &[String]) -> StorageResult<bool> {
+    for required in required_base_table_names() {
         if !existing.iter().any(|name| name == required) {
             return Err(StorageBackendError::BackendInternal {
                 detail: format!("redb git store is missing required table `{required}`"),
             });
         }
     }
-    Ok(())
+    let extended = rb04b_extended_table_names();
+    let present_extended = extended
+        .iter()
+        .filter(|name| existing.iter().any(|e| e == *name))
+        .count();
+    if present_extended == extended.len() {
+        Ok(true)
+    } else if present_extended == 0 {
+        Ok(false)
+    } else {
+        let missing = extended
+            .iter()
+            .find(|name| !existing.iter().any(|e| e == *name))
+            .copied()
+            .unwrap_or("unknown");
+        Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "redb git store has incomplete RB-04b schema; missing table `{missing}`"
+            ),
+        })
+    }
+}
+
+fn verify_required_tables_read(rtx: &ReadTransaction) -> StorageResult<bool> {
+    let existing: Vec<String> = rtx
+        .list_tables()
+        .map_err(|err| map_redb_storage_err(err, "list redb git store tables"))?
+        .map(|handle| handle.name().to_string())
+        .collect();
+    classify_table_layout(&existing)
 }
 
 fn verify_required_tables_write(wtx: &WriteTransaction) -> StorageResult<()> {
@@ -307,14 +573,45 @@ fn verify_required_tables_write(wtx: &WriteTransaction) -> StorageResult<()> {
         .map_err(|err| map_redb_storage_err(err, "list redb git store tables for write"))?
         .map(|handle| handle.name().to_string())
         .collect();
-    for required in required_core_table_names() {
-        if !existing.iter().any(|name| name == required) {
-            return Err(StorageBackendError::BackendInternal {
-                detail: format!("redb git store is missing required table `{required}`"),
-            });
-        }
+    if !classify_table_layout(&existing)? {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "redb git store requires RB-04b schema upgrade before write".to_string(),
+        });
     }
     Ok(())
+}
+
+fn upgrade_rb04_tables_if_needed(db: &Database, timeout: Duration) -> StorageResult<()> {
+    let rtx = begin_checked_read(db, DatabaseRole::Repository)?;
+    let has_extended = verify_required_tables_read(&rtx)?;
+    drop(rtx);
+    if has_extended {
+        return Ok(());
+    }
+    let wtx = begin_checked_write_blocking(db, DatabaseRole::Repository, timeout)?;
+    let existing: Vec<String> = wtx
+        .list_tables()
+        .map_err(|err| map_redb_storage_err(err, "list redb git store tables for upgrade"))?
+        .map(|handle| handle.name().to_string())
+        .collect();
+    if !classify_table_layout(&existing)? {
+        initialize_rb04b_git_tables(&wtx)?;
+        wtx.commit()
+            .map_err(|err| map_redb_commit_err(err, "commit RB-04b redb git schema upgrade"))?;
+    }
+    Ok(())
+}
+
+fn open_optional_read_table<K: redb::Key + 'static, V: redb::Value + 'static>(
+    rtx: &ReadTransaction,
+    definition: TableDefinition<'_, K, V>,
+    context: &'static str,
+) -> StorageResult<Option<redb::ReadOnlyTable<K, V>>> {
+    match rtx.open_table(definition) {
+        Ok(table) => Ok(Some(table)),
+        Err(redb::TableError::TableDoesNotExist(_)) => Ok(None),
+        Err(err) => Err(map_redb_table_err(err, context)),
+    }
 }
 
 fn next_reflog_id(wtx: &WriteTransaction) -> StorageResult<u64> {
@@ -467,14 +764,16 @@ impl RedbGitStore {
 
     /// Open an existing `git.redb` store writable under an explicit
     /// [`RedbRepairContext`] (`32 MiB` or `64 MiB` cache, `MultiWriter`).
+    ///
+    /// Clean RB-04 stores containing only the original 5 core tables are safely
+    /// upgraded in one transaction to initialize the 7 RB-04b tables without
+    /// touching existing reference/reflog/bridge data.
     pub fn open_read_write_with_context(
         path: impl AsRef<Path>,
         context: RedbRepairContext,
     ) -> StorageResult<Self> {
         let db = open_redb_writable(path, DatabaseRole::Repository, context)?;
-        let rtx = begin_checked_read(&db, DatabaseRole::Repository)?;
-        verify_required_tables_read(&rtx)?;
-        drop(rtx);
+        upgrade_rb04_tables_if_needed(&db, DEFAULT_GIT_WRITE_TIMEOUT)?;
         Ok(Self {
             handle: RedbGitHandle::ReadWrite(Arc::new(db)),
             write_timeout: DEFAULT_GIT_WRITE_TIMEOUT,
@@ -483,10 +782,14 @@ impl RedbGitStore {
 
     /// Open an existing `git.redb` store strictly read-only (`open_read_only`,
     /// `16 MiB` cache, `MultiWriter`, zero write upgrades).
+    ///
+    /// Accepts both full 12-table RB-04b stores and legacy 5-table RB-04 stores
+    /// without mutating disk; fails closed if base tables are missing or only a
+    /// partial corrupt subset of RB-04b tables exists.
     pub fn open_read_only(path: impl AsRef<Path>) -> StorageResult<Self> {
         let db = open_redb_read_only(path, DatabaseRole::Repository)?;
         let rtx = begin_checked_read(&db, DatabaseRole::Repository)?;
-        verify_required_tables_read(&rtx)?;
+        let _ = verify_required_tables_read(&rtx)?;
         drop(rtx);
         Ok(Self {
             handle: RedbGitHandle::ReadOnly(Arc::new(db)),
@@ -497,9 +800,7 @@ impl RedbGitStore {
     /// Wrap an already-opened writable `Arc<Database>` whose `META_SCHEMA` and
     /// core Git tables are initialized for [`DatabaseRole::Repository`].
     pub fn from_database(db: Arc<Database>) -> StorageResult<Self> {
-        let rtx = begin_checked_read(db.as_ref(), DatabaseRole::Repository)?;
-        verify_required_tables_read(&rtx)?;
-        drop(rtx);
+        upgrade_rb04_tables_if_needed(db.as_ref(), DEFAULT_GIT_WRITE_TIMEOUT)?;
         Ok(Self {
             handle: RedbGitHandle::ReadWrite(db),
             write_timeout: DEFAULT_GIT_WRITE_TIMEOUT,
@@ -543,7 +844,7 @@ impl RedbGitStore {
                     begin_checked_read(db.as_ref(), DatabaseRole::Repository)?
                 }
             };
-            verify_required_tables_read(&rtx)?;
+            let _ = verify_required_tables_read(&rtx)?;
             op(&rtx)
         })
         .await
@@ -937,6 +1238,317 @@ impl RedbGitStore {
         self.update_ref_cas_inner(key, expected, new_target, reflogs, Some(publication), true)
             .await
     }
+
+    /// Construct a genuine RB-04-format 5-table `git.redb` (pre-RB-04b schema)
+    /// containing one seeded `main` branch and reflog row, or a corrupt 6-table
+    /// partial-schema variant when `add_corrupt_partial_object_index` is `true`.
+    #[cfg(all(test, feature = "storage-sqlite"))]
+    pub(crate) fn create_legacy_rb04_five_table_store_for_test(
+        path: impl AsRef<Path>,
+        seed_oid: &str,
+        add_corrupt_partial_object_index: bool,
+    ) -> StorageResult<()> {
+        let db = create_redb_writable(
+            path.as_ref(),
+            DatabaseRole::Repository,
+            RedbRepairContext::WriteCommand,
+        )?;
+        let wtx =
+            begin_write_bounded_blocking(&db, DatabaseRole::Repository, DEFAULT_GIT_WRITE_TIMEOUT)?;
+        init_meta_schema(&wtx, DatabaseRole::Repository)?;
+
+        let mut ref_table = wtx
+            .open_table(REFERENCE_TABLE)
+            .map_err(|err| map_redb_table_err(err, "seed legacy reference table"))?;
+        let branch_key = RefKey::LocalBranch {
+            name: "main".to_string(),
+        };
+        let target_bytes = encode_versioned(
+            GIT_REF_CODEC_VERSION,
+            &RefTargetStored {
+                target: RefTarget::Direct(seed_oid.to_string()),
+            },
+        )?;
+        ref_table
+            .insert(encode_ref_key(&branch_key), target_bytes.as_slice())
+            .map_err(|err| map_redb_storage_err(err, "insert legacy main branch"))?;
+        drop(ref_table);
+
+        let mut reflog_table = wtx
+            .open_table(REFLOG_TABLE)
+            .map_err(|err| map_redb_table_err(err, "seed legacy reflog table"))?;
+        let reflog_bytes = encode_versioned(
+            GIT_REFLOG_CODEC_VERSION,
+            &ReflogStoredRow {
+                ref_name: "refs/heads/main".to_string(),
+                old_oid: "0".repeat(40),
+                new_oid: seed_oid.to_string(),
+                timestamp: 1_795_360_001,
+                committer_name: "Legacy Author".to_string(),
+                committer_email: "legacy@example.com".to_string(),
+                action: "commit".to_string(),
+                message: "rb04 legacy commit".to_string(),
+                worktree_id: None,
+            },
+        )?;
+        reflog_table
+            .insert(1u64, reflog_bytes.as_slice())
+            .map_err(|err| map_redb_storage_err(err, "insert legacy reflog"))?;
+        drop(reflog_table);
+
+        let mut idx_table = wtx
+            .open_table(REFLOG_BY_REF_INDEX)
+            .map_err(|err| map_redb_table_err(err, "seed legacy reflog index"))?;
+        let marker = encode_versioned(GIT_REFLOG_INDEX_CODEC_VERSION, &ReflogIndexMarker)?;
+        idx_table
+            .insert(("refs/heads/main", "", 1u64), marker.as_slice())
+            .map_err(|err| map_redb_storage_err(err, "insert legacy reflog index"))?;
+        drop(idx_table);
+
+        let _ = wtx
+            .open_table(BRIDGE_PUBLICATION_TABLE)
+            .map_err(|err| map_redb_table_err(err, "seed legacy bridge table"))?;
+        let mut seq_table = wtx
+            .open_table(GIT_SEQ_TABLE)
+            .map_err(|err| map_redb_table_err(err, "seed legacy sequence table"))?;
+        let one = encode_versioned(GIT_SEQ_CODEC_VERSION, &GitSequenceValue { last_id: 1 })?;
+        seq_table
+            .insert(SEQ_KEY_REFLOG, one.as_slice())
+            .map_err(|err| map_redb_storage_err(err, "seed legacy reflog sequence"))?;
+        drop(seq_table);
+
+        if add_corrupt_partial_object_index {
+            let _ = wtx
+                .open_table(OBJECT_INDEX_TABLE)
+                .map_err(|err| map_redb_table_err(err, "seed partial object_index table"))?;
+        }
+
+        wtx.commit()
+            .map_err(|err| map_redb_commit_err(err, "commit legacy RB-04 fixture"))?;
+        Ok(())
+    }
+
+    async fn upsert_object_index_batch_inner(
+        &self,
+        records: &[ObjectIndexRecord],
+        pack_override: Option<Option<&str>>,
+    ) -> StorageResult<()> {
+        for rec in records {
+            validate_object_index_record(rec)?;
+        }
+        if let Some(Some(pack_id)) = pack_override {
+            validate_non_empty_identifier(pack_id, "object_by_pack pack_id")?;
+        }
+        if records.is_empty() {
+            // Still enforce writable check even on empty batch.
+            let _ = self.writable_db()?;
+            return Ok(());
+        }
+
+        let records_owned = records.to_vec();
+        let pack_override_owned = pack_override.map(|opt| opt.map(str::to_string));
+
+        self.run_write_conditional(move |wtx| {
+            // Step 1: enforce the `object_obliteration` write fence across the
+            // entire batch BEFORE mutating any table so rejection is atomic.
+            {
+                let ob_table = wtx.open_table(OBJECT_OBLITERATION_TABLE).map_err(|err| {
+                    map_redb_table_err(err, "open object_obliteration table for write fence")
+                })?;
+                let mut checked = HashSet::with_capacity(records_owned.len());
+                for rec in &records_owned {
+                    if checked.insert(rec.o_id.as_str())
+                        && let Some(tomb) = lookup_obliteration_in_table(&ob_table, &rec.o_id)?
+                    {
+                        return Err(obliteration_fenced_write_error(tomb.state));
+                    }
+                }
+            }
+
+            let mut obj_table = wtx
+                .open_table(OBJECT_INDEX_TABLE)
+                .map_err(|err| map_redb_table_err(err, "open object_index table for write"))?;
+            let mut pack_table = wtx
+                .open_table(OBJECT_BY_PACK_TABLE)
+                .map_err(|err| map_redb_table_err(err, "open object_by_pack index for write"))?;
+            let pack_marker =
+                encode_versioned(GIT_OBJECT_BY_PACK_CODEC_VERSION, &ObjectByPackMarker)?;
+
+            for rec in records_owned {
+                let existing = match obj_table
+                    .get((rec.repo_id.as_str(), rec.o_id.as_str()))
+                    .map_err(|err| map_redb_storage_err(err, "read object_index entry"))?
+                {
+                    Some(guard) => Some(decode_object_index_row(guard.value())?),
+                    None => None,
+                };
+
+                let (old_pack_id, next_row) = match existing {
+                    Some(prev) => {
+                        let old_pack = prev.pack_id.clone();
+                        let next_pack = match &pack_override_owned {
+                            Some(override_val) => override_val.clone(),
+                            None => prev.pack_id,
+                        };
+                        let (o_type, o_size, is_synced) =
+                            if should_promote_object_index_type(&prev.o_type, &rec.o_type) {
+                                (rec.o_type, rec.o_size, false)
+                            } else {
+                                (prev.o_type, prev.o_size, prev.is_synced)
+                            };
+                        (
+                            old_pack,
+                            ObjectIndexStoredRow {
+                                o_type,
+                                o_size,
+                                created_at: prev.created_at,
+                                is_synced,
+                                pack_id: next_pack,
+                            },
+                        )
+                    }
+                    None => {
+                        let next_pack = match &pack_override_owned {
+                            Some(override_val) => override_val.clone(),
+                            None => None,
+                        };
+                        (
+                            None,
+                            ObjectIndexStoredRow {
+                                o_type: rec.o_type,
+                                o_size: rec.o_size,
+                                created_at: rec.created_at,
+                                is_synced: rec.is_synced,
+                                pack_id: next_pack,
+                            },
+                        )
+                    }
+                };
+
+                if old_pack_id != next_row.pack_id {
+                    if let Some(old_pack) = old_pack_id.as_deref() {
+                        let _ = pack_table
+                            .remove((old_pack, rec.repo_id.as_str(), rec.o_id.as_str()))
+                            .map_err(|err| {
+                                map_redb_storage_err(err, "remove stale object_by_pack entry")
+                            })?;
+                    }
+                    if let Some(new_pack) = next_row.pack_id.as_deref() {
+                        pack_table
+                            .insert(
+                                (new_pack, rec.repo_id.as_str(), rec.o_id.as_str()),
+                                pack_marker.as_slice(),
+                            )
+                            .map_err(|err| {
+                                map_redb_storage_err(err, "insert object_by_pack entry")
+                            })?;
+                    }
+                }
+
+                let encoded = encode_versioned(GIT_OBJECT_INDEX_CODEC_VERSION, &next_row)?;
+                obj_table
+                    .insert(
+                        (rec.repo_id.as_str(), rec.o_id.as_str()),
+                        encoded.as_slice(),
+                    )
+                    .map_err(|err| map_redb_storage_err(err, "upsert object_index entry"))?;
+            }
+
+            Ok((true, ()))
+        })
+        .await
+    }
+
+    /// Atomically upsert `object_index` records together with same-transaction
+    /// `OBJECT_BY_PACK` secondary index maintenance (`RB-04b`).
+    ///
+    /// Pass `Some(pack_id)` to bind/rebind every object in `records` to `pack_id`,
+    /// or `None` to clear their pack binding (loose objects), removing any stale
+    /// `(old_pack_id, repo_id, o_id)` index rows inside the same `WriteTransaction`.
+    pub async fn upsert_object_index_batch_with_pack(
+        &self,
+        records: &[ObjectIndexRecord],
+        pack_id: Option<&str>,
+    ) -> StorageResult<()> {
+        self.upsert_object_index_batch_inner(records, Some(pack_id))
+            .await
+    }
+
+    /// List live `object_index` records indexed under `pack_id` via the
+    /// same-transaction `OBJECT_BY_PACK` secondary index (`RB-04b`), optionally
+    /// scoped to `repo_id` and excluding any OID fenced by `object_obliteration`.
+    pub async fn list_object_index_by_pack(
+        &self,
+        pack_id: &str,
+        repo_id: Option<&str>,
+    ) -> StorageResult<Vec<ObjectIndexRecord>> {
+        validate_non_empty_identifier(pack_id, "object_by_pack pack_id")?;
+        if let Some(rid) = repo_id {
+            validate_non_empty_identifier(rid, "object_index repo_id")?;
+        }
+        let pack_owned = pack_id.to_string();
+        let repo_owned = repo_id.map(str::to_string);
+
+        self.run_read(move |rtx| {
+            let Some(pack_table) =
+                open_optional_read_table(rtx, OBJECT_BY_PACK_TABLE, "open object_by_pack index")?
+            else {
+                return Ok(Vec::new());
+            };
+            let Some(obj_table) =
+                open_optional_read_table(rtx, OBJECT_INDEX_TABLE, "open object_index table")?
+            else {
+                return Ok(Vec::new());
+            };
+            let Some(ob_table) = open_optional_read_table(
+                rtx,
+                OBJECT_OBLITERATION_TABLE,
+                "open object_obliteration table",
+            )?
+            else {
+                return Ok(Vec::new());
+            };
+
+            let start_repo = repo_owned.as_deref().unwrap_or("");
+            let range = pack_table
+                .range((pack_owned.as_str(), start_repo, "")..)
+                .map_err(|err| map_redb_storage_err(err, "range scan object_by_pack"))?;
+            let mut out = Vec::new();
+            for entry in range {
+                let (k, _) =
+                    entry.map_err(|err| map_redb_storage_err(err, "read object_by_pack entry"))?;
+                let (found_pack, found_repo, found_oid) = k.value();
+                if found_pack != pack_owned {
+                    break;
+                }
+                if let Some(expected_repo) = repo_owned.as_deref()
+                    && found_repo != expected_repo
+                {
+                    break;
+                }
+                if lookup_obliteration_in_table(&ob_table, found_oid)?.is_some() {
+                    continue;
+                }
+                let row_guard = obj_table
+                    .get((found_repo, found_oid))
+                    .map_err(|err| {
+                        map_redb_storage_err(err, "read object_index via object_by_pack")
+                    })?
+                    .ok_or_else(|| StorageBackendError::BackendInternal {
+                        detail: "object_by_pack index references missing object_index primary row"
+                            .to_string(),
+                    })?;
+                let stored = decode_object_index_row(row_guard.value())?;
+                out.push(object_index_record_from_stored(
+                    found_repo.to_string(),
+                    found_oid.to_string(),
+                    stored,
+                ));
+            }
+            Ok(out)
+        })
+        .await
+    }
 }
 
 #[async_trait]
@@ -1189,4 +1801,1219 @@ impl GitStore for RedbGitStore {
         })
         .await
     }
+
+    async fn upsert_object_index_batch(&self, records: &[ObjectIndexRecord]) -> StorageResult<()> {
+        self.upsert_object_index_batch_inner(records, None).await
+    }
+
+    async fn get_object_index(
+        &self,
+        repo_id: &str,
+        o_id: &str,
+    ) -> StorageResult<Option<ObjectIndexRecord>> {
+        validate_non_empty_identifier(repo_id, "object_index repo_id")?;
+        validate_hex_oid(o_id, "object_index o_id")?;
+        let repo_owned = repo_id.to_string();
+        let oid_owned = o_id.to_string();
+
+        self.run_read(move |rtx| {
+            let Some(ob_table) = open_optional_read_table(
+                rtx,
+                OBJECT_OBLITERATION_TABLE,
+                "open object_obliteration table",
+            )?
+            else {
+                return Ok(None);
+            };
+            if let Some(tomb) = lookup_obliteration_in_table(&ob_table, &oid_owned)? {
+                return Err(obliteration_fenced_read_error(tomb.state));
+            }
+            let Some(obj_table) =
+                open_optional_read_table(rtx, OBJECT_INDEX_TABLE, "open object_index table")?
+            else {
+                return Ok(None);
+            };
+            let Some(guard) = obj_table
+                .get((repo_owned.as_str(), oid_owned.as_str()))
+                .map_err(|err| map_redb_storage_err(err, "read object_index entry"))?
+            else {
+                return Ok(None);
+            };
+            let stored = decode_object_index_row(guard.value())?;
+            Ok(Some(object_index_record_from_stored(
+                repo_owned, oid_owned, stored,
+            )))
+        })
+        .await
+    }
+
+    async fn get_object_index_preserved_address(
+        &self,
+        repo_id: &str,
+        o_id: &str,
+    ) -> StorageResult<Option<ObjectIndexRecord>> {
+        validate_non_empty_identifier(repo_id, "object_index repo_id")?;
+        validate_hex_oid(o_id, "object_index o_id")?;
+        let repo_owned = repo_id.to_string();
+        let oid_owned = o_id.to_string();
+
+        self.run_read(move |rtx| {
+            let Some(obj_table) =
+                open_optional_read_table(rtx, OBJECT_INDEX_TABLE, "open object_index table")?
+            else {
+                return Ok(None);
+            };
+            let Some(guard) = obj_table
+                .get((repo_owned.as_str(), oid_owned.as_str()))
+                .map_err(|err| map_redb_storage_err(err, "read preserved object_index entry"))?
+            else {
+                return Ok(None);
+            };
+            let stored = decode_object_index_row(guard.value())?;
+            Ok(Some(object_index_record_from_stored(
+                repo_owned, oid_owned, stored,
+            )))
+        })
+        .await
+    }
+
+    async fn list_object_index_by_repo(
+        &self,
+        repo_id: &str,
+        synced_filter: Option<bool>,
+    ) -> StorageResult<Vec<ObjectIndexRecord>> {
+        validate_non_empty_identifier(repo_id, "object_index repo_id")?;
+        let repo_owned = repo_id.to_string();
+
+        self.run_read(move |rtx| {
+            let Some(obj_table) =
+                open_optional_read_table(rtx, OBJECT_INDEX_TABLE, "open object_index table")?
+            else {
+                return Ok(Vec::new());
+            };
+            let Some(ob_table) = open_optional_read_table(
+                rtx,
+                OBJECT_OBLITERATION_TABLE,
+                "open object_obliteration table",
+            )?
+            else {
+                return Ok(Vec::new());
+            };
+
+            let mut out = Vec::new();
+            let range = obj_table
+                .range((repo_owned.as_str(), "")..)
+                .map_err(|err| map_redb_storage_err(err, "range scan object_index"))?;
+            for entry in range {
+                let (k, v) =
+                    entry.map_err(|err| map_redb_storage_err(err, "read object_index entry"))?;
+                let (found_repo, found_oid) = k.value();
+                if found_repo != repo_owned {
+                    break;
+                }
+                if lookup_obliteration_in_table(&ob_table, found_oid)?.is_some() {
+                    continue;
+                }
+                let stored = decode_object_index_row(v.value())?;
+                if let Some(expected_synced) = synced_filter
+                    && stored.is_synced != expected_synced
+                {
+                    continue;
+                }
+                out.push(object_index_record_from_stored(
+                    found_repo.to_string(),
+                    found_oid.to_string(),
+                    stored,
+                ));
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn mark_object_index_synced(
+        &self,
+        repo_id: &str,
+        o_ids: &[String],
+    ) -> StorageResult<usize> {
+        validate_non_empty_identifier(repo_id, "object_index repo_id")?;
+        for oid in o_ids {
+            validate_hex_oid(oid, "object_index o_id")?;
+        }
+        if o_ids.is_empty() {
+            let _ = self.writable_db()?;
+            return Ok(0);
+        }
+        let repo_owned = repo_id.to_string();
+        let oids_owned = o_ids.to_vec();
+
+        self.run_write_conditional(move |wtx| {
+            let mut distinct = Vec::with_capacity(oids_owned.len());
+            let mut seen = HashSet::with_capacity(oids_owned.len());
+            for oid in oids_owned {
+                if seen.insert(oid.clone()) {
+                    distinct.push(oid);
+                }
+            }
+
+            {
+                let ob_table = wtx.open_table(OBJECT_OBLITERATION_TABLE).map_err(|err| {
+                    map_redb_table_err(err, "open object_obliteration table for sync fence")
+                })?;
+                for oid in &distinct {
+                    if let Some(tomb) = lookup_obliteration_in_table(&ob_table, oid)? {
+                        return Err(obliteration_fenced_write_error(tomb.state));
+                    }
+                }
+            }
+
+            let mut obj_table = wtx
+                .open_table(OBJECT_INDEX_TABLE)
+                .map_err(|err| map_redb_table_err(err, "open object_index table for sync"))?;
+            let mut updated = 0usize;
+            for oid in &distinct {
+                let existing = match obj_table
+                    .get((repo_owned.as_str(), oid.as_str()))
+                    .map_err(|err| map_redb_storage_err(err, "read object_index for sync"))?
+                {
+                    Some(guard) => Some(decode_object_index_row(guard.value())?),
+                    None => None,
+                };
+                if let Some(mut row) = existing
+                    && !row.is_synced
+                {
+                    row.is_synced = true;
+                    let encoded = encode_versioned(GIT_OBJECT_INDEX_CODEC_VERSION, &row)?;
+                    obj_table
+                        .insert((repo_owned.as_str(), oid.as_str()), encoded.as_slice())
+                        .map_err(|err| {
+                            map_redb_storage_err(err, "update object_index is_synced")
+                        })?;
+                    updated += 1;
+                }
+            }
+            Ok((updated > 0, updated))
+        })
+        .await
+    }
+
+    async fn begin_object_obliteration(
+        &self,
+        req: &ObliterationRequest,
+    ) -> StorageResult<ObjectObliterationRecord> {
+        validate_obliteration_request(req)?;
+        let req_owned = req.clone();
+
+        self.run_write_conditional(move |wtx| {
+            let mut ob_table = wtx.open_table(OBJECT_OBLITERATION_TABLE).map_err(|err| {
+                map_redb_table_err(err, "open object_obliteration table for begin")
+            })?;
+            let kind_str = req_owned.hash_kind.as_str();
+            let existing = match ob_table
+                .get((req_owned.oid.as_str(), kind_str))
+                .map_err(|err| map_redb_storage_err(err, "read object_obliteration"))?
+            {
+                Some(guard) => Some(decode_obliteration_row(
+                    req_owned.oid.clone(),
+                    kind_str,
+                    guard.value(),
+                )?),
+                None => None,
+            };
+            if let Some(record) = existing {
+                return Ok((false, record));
+            }
+            let stored = ObjectObliterationStoredRow {
+                state: ObliterationState::Obliterating,
+                reason: req_owned.reason.clone(),
+                actor: req_owned.actor.clone(),
+                approval_source: req_owned.approval_source.clone(),
+                requested_at: req_owned.recorded_at.clone(),
+                tombstone_written_at: req_owned.recorded_at.clone(),
+                payload_deleted_at: None,
+                updated_at: req_owned.recorded_at.clone(),
+            };
+            let encoded = encode_versioned(GIT_OBJECT_OBLITERATION_CODEC_VERSION, &stored)?;
+            ob_table
+                .insert((req_owned.oid.as_str(), kind_str), encoded.as_slice())
+                .map_err(|err| map_redb_storage_err(err, "insert object_obliteration tombstone"))?;
+            Ok((
+                true,
+                ObjectObliterationRecord {
+                    oid: req_owned.oid,
+                    hash_kind: req_owned.hash_kind,
+                    state: stored.state,
+                    reason: stored.reason,
+                    actor: stored.actor,
+                    approval_source: stored.approval_source,
+                    requested_at: stored.requested_at,
+                    tombstone_written_at: stored.tombstone_written_at,
+                    payload_deleted_at: stored.payload_deleted_at,
+                    updated_at: stored.updated_at,
+                },
+            ))
+        })
+        .await
+    }
+
+    async fn mark_object_obliterated(
+        &self,
+        oid: &str,
+        hash_kind: ObjectHashKind,
+        deleted_at: &str,
+    ) -> StorageResult<ObjectObliterationRecord> {
+        validate_oid_for_hash_kind(oid, hash_kind)?;
+        validate_non_empty_identifier(deleted_at, "obliteration deleted_at")?;
+        let oid_owned = oid.to_string();
+        let deleted_owned = deleted_at.to_string();
+
+        self.run_write_conditional(move |wtx| {
+            let mut ob_table = wtx.open_table(OBJECT_OBLITERATION_TABLE).map_err(|err| {
+                map_redb_table_err(err, "open object_obliteration table for finalize")
+            })?;
+            let kind_str = hash_kind.as_str();
+            let existing = match ob_table
+                .get((oid_owned.as_str(), kind_str))
+                .map_err(|err| map_redb_storage_err(err, "read object_obliteration for finalize"))?
+            {
+                Some(guard) => decode_obliteration_row(oid_owned.clone(), kind_str, guard.value())?,
+                None => {
+                    return Err(StorageBackendError::NotFound {
+                        resource: "object_obliteration tombstone".to_string(),
+                    });
+                }
+            };
+            if existing.state == ObliterationState::Obliterated {
+                return Ok((false, existing));
+            }
+            let updated_row = ObjectObliterationStoredRow {
+                state: ObliterationState::Obliterated,
+                reason: existing.reason.clone(),
+                actor: existing.actor.clone(),
+                approval_source: existing.approval_source.clone(),
+                requested_at: existing.requested_at.clone(),
+                tombstone_written_at: existing.tombstone_written_at.clone(),
+                payload_deleted_at: Some(deleted_owned.clone()),
+                updated_at: deleted_owned.clone(),
+            };
+            let encoded = encode_versioned(GIT_OBJECT_OBLITERATION_CODEC_VERSION, &updated_row)?;
+            ob_table
+                .insert((oid_owned.as_str(), kind_str), encoded.as_slice())
+                .map_err(|err| map_redb_storage_err(err, "finalize object_obliteration"))?;
+            Ok((
+                true,
+                ObjectObliterationRecord {
+                    oid: oid_owned,
+                    hash_kind,
+                    state: ObliterationState::Obliterated,
+                    reason: updated_row.reason,
+                    actor: updated_row.actor,
+                    approval_source: updated_row.approval_source,
+                    requested_at: updated_row.requested_at,
+                    tombstone_written_at: updated_row.tombstone_written_at,
+                    payload_deleted_at: updated_row.payload_deleted_at,
+                    updated_at: updated_row.updated_at,
+                },
+            ))
+        })
+        .await
+    }
+
+    async fn get_object_obliteration(
+        &self,
+        oid: &str,
+    ) -> StorageResult<Option<ObjectObliterationRecord>> {
+        validate_hex_oid(oid, "object_obliteration oid")?;
+        let oid_owned = oid.to_string();
+        self.run_read(move |rtx| {
+            let Some(ob_table) = open_optional_read_table(
+                rtx,
+                OBJECT_OBLITERATION_TABLE,
+                "open object_obliteration table",
+            )?
+            else {
+                return Ok(None);
+            };
+            lookup_obliteration_in_table(&ob_table, &oid_owned)
+        })
+        .await
+    }
+
+    async fn is_object_obliterated(&self, oid: &str) -> StorageResult<bool> {
+        Ok(self.get_object_obliteration(oid).await?.is_some())
+    }
+
+    async fn list_incomplete_obliterations(&self) -> StorageResult<Vec<ObjectObliterationRecord>> {
+        self.run_read(move |rtx| {
+            let Some(ob_table) = open_optional_read_table(
+                rtx,
+                OBJECT_OBLITERATION_TABLE,
+                "open object_obliteration table",
+            )?
+            else {
+                return Ok(Vec::new());
+            };
+            let mut out = Vec::new();
+            let iter = ob_table
+                .iter()
+                .map_err(|err| map_redb_storage_err(err, "iterate object_obliteration"))?;
+            for entry in iter {
+                let (k, v) = entry
+                    .map_err(|err| map_redb_storage_err(err, "read object_obliteration entry"))?;
+                let (oid, kind_str) = k.value();
+                let record = decode_obliteration_row(oid.to_string(), kind_str, v.value())?;
+                if record.state == ObliterationState::Obliterating {
+                    out.push(record);
+                }
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn list_obliterated_oids(&self) -> StorageResult<Vec<String>> {
+        self.run_read(move |rtx| {
+            let Some(ob_table) = open_optional_read_table(
+                rtx,
+                OBJECT_OBLITERATION_TABLE,
+                "open object_obliteration table",
+            )?
+            else {
+                return Ok(Vec::new());
+            };
+            let mut out: Vec<String> = Vec::new();
+            let iter = ob_table
+                .iter()
+                .map_err(|err| map_redb_storage_err(err, "iterate object_obliteration"))?;
+            for entry in iter {
+                let (k, _) = entry
+                    .map_err(|err| map_redb_storage_err(err, "read object_obliteration key"))?;
+                let oid = k.value().0;
+                if out.last().map(String::as_str) != Some(oid) {
+                    out.push(oid.to_string());
+                }
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn run_fenced_object_read(
+        &self,
+        oid: &str,
+        read_payload: Box<dyn FnOnce() -> StorageResult<Vec<u8>> + Send>,
+    ) -> StorageResult<Vec<u8>> {
+        validate_hex_oid(oid, "object OID")?;
+        if let Some(rec) = self.get_object_obliteration(oid).await? {
+            return Err(obliteration_fenced_read_error(rec.state));
+        }
+        let payload_result = tokio::task::spawn_blocking(read_payload)
+            .await
+            .map_err(|err| StorageBackendError::BackendInternal {
+                detail: format!("fenced object read task failed: {err}"),
+            })?;
+        // Post-read monotonic verification: if an obliteration tombstone
+        // committed while `read_payload` ran, discard loaded bytes (or replace
+        // a post-unlink error) and fail closed with the obliteration fence error.
+        if let Some(rec) = self.get_object_obliteration(oid).await? {
+            return Err(obliteration_fenced_read_error(rec.state));
+        }
+        payload_result
+    }
+
+    async fn run_fenced_object_write(
+        &self,
+        record: &ObjectIndexRecord,
+        write_payload: Box<dyn FnOnce() -> StorageResult<()> + Send>,
+    ) -> StorageResult<()> {
+        validate_object_index_record(record)?;
+        let rec = record.clone();
+
+        self.run_write_conditional(move |wtx| {
+            {
+                let ob_table = wtx.open_table(OBJECT_OBLITERATION_TABLE).map_err(|err| {
+                    map_redb_table_err(err, "open object_obliteration table for fenced write")
+                })?;
+                if let Some(tomb) = lookup_obliteration_in_table(&ob_table, &rec.o_id)? {
+                    return Err(obliteration_fenced_write_error(tomb.state));
+                }
+            }
+
+            // Execute payload materialization while holding `redb`'s cross-process
+            // exclusive `WriteTransaction` so no concurrent `begin_object_obliteration`
+            // can commit between the fence check and index registration.
+            write_payload()?;
+
+            let mut obj_table = wtx.open_table(OBJECT_INDEX_TABLE).map_err(|err| {
+                map_redb_table_err(err, "open object_index table for fenced write")
+            })?;
+            let existing = match obj_table
+                .get((rec.repo_id.as_str(), rec.o_id.as_str()))
+                .map_err(|err| map_redb_storage_err(err, "read object_index entry"))?
+            {
+                Some(guard) => Some(decode_object_index_row(guard.value())?),
+                None => None,
+            };
+            let next_row = match existing {
+                Some(prev) => {
+                    let (o_type, o_size, is_synced) =
+                        if should_promote_object_index_type(&prev.o_type, &rec.o_type) {
+                            (rec.o_type, rec.o_size, false)
+                        } else {
+                            (prev.o_type, prev.o_size, prev.is_synced)
+                        };
+                    ObjectIndexStoredRow {
+                        o_type,
+                        o_size,
+                        created_at: prev.created_at,
+                        is_synced,
+                        pack_id: prev.pack_id,
+                    }
+                }
+                None => ObjectIndexStoredRow {
+                    o_type: rec.o_type,
+                    o_size: rec.o_size,
+                    created_at: rec.created_at,
+                    is_synced: rec.is_synced,
+                    pack_id: None,
+                },
+            };
+            let encoded = encode_versioned(GIT_OBJECT_INDEX_CODEC_VERSION, &next_row)?;
+            obj_table
+                .insert(
+                    (rec.repo_id.as_str(), rec.o_id.as_str()),
+                    encoded.as_slice(),
+                )
+                .map_err(|err| map_redb_storage_err(err, "upsert fenced object_index entry"))?;
+            Ok((true, ()))
+        })
+        .await
+    }
+
+    async fn get_note(&self, notes_ref: &str, object: &str) -> StorageResult<Option<NoteRecord>> {
+        validate_notes_ref(notes_ref)?;
+        validate_hex_oid(object, "note object OID")?;
+        let ref_owned = notes_ref.to_string();
+        let obj_owned = object.to_string();
+        self.run_read(move |rtx| {
+            let Some(table) = open_optional_read_table(rtx, NOTES_TABLE, "open notes table")?
+            else {
+                return Ok(None);
+            };
+            let Some(guard) = table
+                .get((ref_owned.as_str(), obj_owned.as_str()))
+                .map_err(|err| map_redb_storage_err(err, "get note entry"))?
+            else {
+                return Ok(None);
+            };
+            let blob = decode_note_row(guard.value())?;
+            Ok(Some(NoteRecord {
+                notes_ref: ref_owned,
+                object: obj_owned,
+                blob,
+            }))
+        })
+        .await
+    }
+
+    async fn list_notes(&self, notes_ref: &str) -> StorageResult<Vec<NoteRecord>> {
+        validate_notes_ref(notes_ref)?;
+        let ref_owned = notes_ref.to_string();
+        self.run_read(move |rtx| {
+            let Some(table) = open_optional_read_table(rtx, NOTES_TABLE, "open notes table")?
+            else {
+                return Ok(Vec::new());
+            };
+            let mut out = Vec::new();
+            let range = table
+                .range((ref_owned.as_str(), "")..)
+                .map_err(|err| map_redb_storage_err(err, "range scan notes table"))?;
+            for entry in range {
+                let (k, v) = entry.map_err(|err| map_redb_storage_err(err, "read note entry"))?;
+                let (found_ref, found_obj) = k.value();
+                if found_ref != ref_owned {
+                    break;
+                }
+                let blob = decode_note_row(v.value())?;
+                out.push(NoteRecord {
+                    notes_ref: found_ref.to_string(),
+                    object: found_obj.to_string(),
+                    blob,
+                });
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn put_note(
+        &self,
+        notes_ref: &str,
+        object: &str,
+        blob: &str,
+        overwrite: bool,
+    ) -> StorageResult<NoteWriteOutcome> {
+        validate_notes_ref(notes_ref)?;
+        validate_hex_oid(object, "note object OID")?;
+        validate_hex_oid(blob, "note blob OID")?;
+        let ref_owned = notes_ref.to_string();
+        let obj_owned = object.to_string();
+        let blob_owned = blob.to_string();
+
+        self.run_write_conditional(move |wtx| {
+            let mut table = wtx
+                .open_table(NOTES_TABLE)
+                .map_err(|err| map_redb_table_err(err, "open notes table for write"))?;
+            let existing = match table
+                .get((ref_owned.as_str(), obj_owned.as_str()))
+                .map_err(|err| map_redb_storage_err(err, "read note entry"))?
+            {
+                Some(guard) => Some(decode_note_row(guard.value())?),
+                None => None,
+            };
+            match existing {
+                None => {
+                    let encoded = encode_versioned(
+                        GIT_NOTES_CODEC_VERSION,
+                        &NoteStoredRow { blob: blob_owned },
+                    )?;
+                    table
+                        .insert((ref_owned.as_str(), obj_owned.as_str()), encoded.as_slice())
+                        .map_err(|err| map_redb_storage_err(err, "insert note entry"))?;
+                    Ok((true, NoteWriteOutcome::Inserted))
+                }
+                Some(existing_blob) if !overwrite => {
+                    Ok((false, NoteWriteOutcome::AlreadyExists { existing_blob }))
+                }
+                Some(previous_blob) => {
+                    let encoded = encode_versioned(
+                        GIT_NOTES_CODEC_VERSION,
+                        &NoteStoredRow { blob: blob_owned },
+                    )?;
+                    table
+                        .insert((ref_owned.as_str(), obj_owned.as_str()), encoded.as_slice())
+                        .map_err(|err| map_redb_storage_err(err, "update note entry"))?;
+                    Ok((true, NoteWriteOutcome::Replaced { previous_blob }))
+                }
+            }
+        })
+        .await
+    }
+
+    async fn remove_note_cas(
+        &self,
+        notes_ref: &str,
+        object: &str,
+        expected_blob: Option<&str>,
+    ) -> StorageResult<bool> {
+        validate_notes_ref(notes_ref)?;
+        validate_hex_oid(object, "note object OID")?;
+        if let Some(exp) = expected_blob {
+            validate_hex_oid(exp, "note expected_blob OID")?;
+        }
+        let ref_owned = notes_ref.to_string();
+        let obj_owned = object.to_string();
+        let expected_owned = expected_blob.map(str::to_string);
+
+        self.run_write_conditional(move |wtx| {
+            let mut table = wtx
+                .open_table(NOTES_TABLE)
+                .map_err(|err| map_redb_table_err(err, "open notes table for delete"))?;
+            let existing = match table
+                .get((ref_owned.as_str(), obj_owned.as_str()))
+                .map_err(|err| map_redb_storage_err(err, "read note entry for delete"))?
+            {
+                Some(guard) => Some(decode_note_row(guard.value())?),
+                None => None,
+            };
+            let Some(actual) = existing else {
+                return Ok((false, false));
+            };
+            if let Some(exp) = expected_owned.as_deref()
+                && actual != exp
+            {
+                return Ok((false, false));
+            }
+            let _ = table
+                .remove((ref_owned.as_str(), obj_owned.as_str()))
+                .map_err(|err| map_redb_storage_err(err, "delete note entry"))?;
+            Ok((true, true))
+        })
+        .await
+    }
+
+    async fn apply_notes_cas_batch(
+        &self,
+        notes_ref: &str,
+        ops: &[NoteCasOp],
+    ) -> StorageResult<NoteBatchOutcome> {
+        validate_notes_ref(notes_ref)?;
+        for op in ops {
+            validate_note_cas_op(op)?;
+        }
+        if ops.is_empty() {
+            let _ = self.writable_db()?;
+            return Ok(NoteBatchOutcome::Applied {
+                inserted: 0,
+                updated: 0,
+                deleted: 0,
+            });
+        }
+        let ref_owned = notes_ref.to_string();
+        let ops_owned = ops.to_vec();
+
+        self.run_write_conditional(move |wtx| {
+            let mut table = wtx
+                .open_table(NOTES_TABLE)
+                .map_err(|err| map_redb_table_err(err, "open notes table for batch"))?;
+            let mut inserted = 0usize;
+            let mut updated = 0usize;
+            let mut deleted = 0usize;
+
+            for op in ops_owned {
+                match op {
+                    NoteCasOp::InsertIfAbsent { object, blob } => {
+                        let actual = match table
+                            .get((ref_owned.as_str(), object.as_str()))
+                            .map_err(|err| map_redb_storage_err(err, "read note for insert CAS"))?
+                        {
+                            Some(guard) => Some(decode_note_row(guard.value())?),
+                            None => None,
+                        };
+                        if let Some(actual_blob) = actual {
+                            return Ok((
+                                false,
+                                NoteBatchOutcome::CasConflict {
+                                    object,
+                                    actual_blob: Some(actual_blob),
+                                },
+                            ));
+                        }
+                        let encoded =
+                            encode_versioned(GIT_NOTES_CODEC_VERSION, &NoteStoredRow { blob })?;
+                        table
+                            .insert((ref_owned.as_str(), object.as_str()), encoded.as_slice())
+                            .map_err(|err| map_redb_storage_err(err, "batch insert note"))?;
+                        inserted += 1;
+                    }
+                    NoteCasOp::UpdateIfMatches {
+                        object,
+                        expected_blob,
+                        new_blob,
+                    } => {
+                        let actual = match table
+                            .get((ref_owned.as_str(), object.as_str()))
+                            .map_err(|err| map_redb_storage_err(err, "read note for update CAS"))?
+                        {
+                            Some(guard) => Some(decode_note_row(guard.value())?),
+                            None => None,
+                        };
+                        if actual.as_deref() != Some(expected_blob.as_str()) {
+                            return Ok((
+                                false,
+                                NoteBatchOutcome::CasConflict {
+                                    object,
+                                    actual_blob: actual,
+                                },
+                            ));
+                        }
+                        let encoded = encode_versioned(
+                            GIT_NOTES_CODEC_VERSION,
+                            &NoteStoredRow { blob: new_blob },
+                        )?;
+                        table
+                            .insert((ref_owned.as_str(), object.as_str()), encoded.as_slice())
+                            .map_err(|err| map_redb_storage_err(err, "batch update note"))?;
+                        updated += 1;
+                    }
+                    NoteCasOp::DeleteIfMatches {
+                        object,
+                        expected_blob,
+                    } => {
+                        let actual = match table
+                            .get((ref_owned.as_str(), object.as_str()))
+                            .map_err(|err| map_redb_storage_err(err, "read note for delete CAS"))?
+                        {
+                            Some(guard) => Some(decode_note_row(guard.value())?),
+                            None => None,
+                        };
+                        if actual.as_deref() != Some(expected_blob.as_str()) {
+                            return Ok((
+                                false,
+                                NoteBatchOutcome::CasConflict {
+                                    object,
+                                    actual_blob: actual,
+                                },
+                            ));
+                        }
+                        let _ = table
+                            .remove((ref_owned.as_str(), object.as_str()))
+                            .map_err(|err| map_redb_storage_err(err, "batch delete note"))?;
+                        deleted += 1;
+                    }
+                }
+            }
+
+            Ok((
+                true,
+                NoteBatchOutcome::Applied {
+                    inserted,
+                    updated,
+                    deleted,
+                },
+            ))
+        })
+        .await
+    }
+
+    async fn get_revision_ordinal_meta(
+        &self,
+        ref_name: &str,
+    ) -> StorageResult<Option<RevisionOrdinalMeta>> {
+        validate_non_empty_identifier(ref_name, "revision_ordinal ref_name")?;
+        let ref_owned = ref_name.to_string();
+        self.run_read(move |rtx| {
+            let Some(table) = open_optional_read_table(
+                rtx,
+                REVISION_ORDINAL_META_TABLE,
+                "open revision_ordinal_meta table",
+            )?
+            else {
+                return Ok(None);
+            };
+            let Some(guard) = table
+                .get(ref_owned.as_str())
+                .map_err(|err| map_redb_storage_err(err, "get revision_ordinal_meta"))?
+            else {
+                return Ok(None);
+            };
+            decode_revision_ordinal_meta(ref_owned, guard.value()).map(Some)
+        })
+        .await
+    }
+
+    async fn list_revision_ordinal_metas(&self) -> StorageResult<Vec<RevisionOrdinalMeta>> {
+        self.run_read(move |rtx| {
+            let Some(table) = open_optional_read_table(
+                rtx,
+                REVISION_ORDINAL_META_TABLE,
+                "open revision_ordinal_meta table",
+            )?
+            else {
+                return Ok(Vec::new());
+            };
+            let mut out = Vec::new();
+            let iter = table
+                .iter()
+                .map_err(|err| map_redb_storage_err(err, "iterate revision_ordinal_meta"))?;
+            for entry in iter {
+                let (k, v) =
+                    entry.map_err(|err| map_redb_storage_err(err, "read revision_ordinal_meta"))?;
+                out.push(decode_revision_ordinal_meta(
+                    k.value().to_string(),
+                    v.value(),
+                )?);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn replace_revision_ordinals(
+        &self,
+        meta: &RevisionOrdinalMeta,
+        entries: &[(i64, String)],
+    ) -> StorageResult<()> {
+        validate_revision_ordinal_entries(meta, entries)?;
+        let meta_owned = meta.clone();
+        let entries_owned = entries.to_vec();
+
+        self.run_write_conditional(move |wtx| {
+            let mut ord_table = wtx
+                .open_table(REVISION_ORDINAL_TABLE)
+                .map_err(|err| map_redb_table_err(err, "open revision_ordinal table"))?;
+            let mut by_oid_table = wtx
+                .open_table(REVISION_ORDINAL_BY_OID_TABLE)
+                .map_err(|err| map_redb_table_err(err, "open revision_ordinal_by_oid index"))?;
+            let mut meta_table = wtx
+                .open_table(REVISION_ORDINAL_META_TABLE)
+                .map_err(|err| map_redb_table_err(err, "open revision_ordinal_meta table"))?;
+
+            clear_revision_ordinals_for_ref(
+                &mut ord_table,
+                &mut by_oid_table,
+                &meta_owned.ref_name,
+            )?;
+
+            for (ordinal, oid) in &entries_owned {
+                let encoded_oid = encode_versioned(
+                    GIT_REVISION_ORDINAL_CODEC_VERSION,
+                    &RevisionOrdinalStoredRow { oid: oid.clone() },
+                )?;
+                ord_table
+                    .insert(
+                        (meta_owned.ref_name.as_str(), *ordinal),
+                        encoded_oid.as_slice(),
+                    )
+                    .map_err(|err| map_redb_storage_err(err, "insert revision_ordinal row"))?;
+                let encoded_ord = encode_versioned(
+                    GIT_REVISION_ORDINAL_BY_OID_CODEC_VERSION,
+                    &RevisionOrdinalByOidStoredRow { ordinal: *ordinal },
+                )?;
+                by_oid_table
+                    .insert(
+                        (meta_owned.ref_name.as_str(), oid.as_str()),
+                        encoded_ord.as_slice(),
+                    )
+                    .map_err(|err| {
+                        map_redb_storage_err(err, "insert revision_ordinal_by_oid index")
+                    })?;
+            }
+
+            let encoded_meta = encode_versioned(
+                GIT_REVISION_ORDINAL_META_CODEC_VERSION,
+                &RevisionOrdinalMetaStoredRow {
+                    tip_oid: meta_owned.tip_oid,
+                    replace_sig: meta_owned.replace_sig,
+                    max_ordinal: meta_owned.max_ordinal,
+                    built_at: meta_owned.built_at,
+                },
+            )?;
+            meta_table
+                .insert(meta_owned.ref_name.as_str(), encoded_meta.as_slice())
+                .map_err(|err| map_redb_storage_err(err, "upsert revision_ordinal_meta"))?;
+            Ok((true, ()))
+        })
+        .await
+    }
+
+    async fn append_revision_ordinals(
+        &self,
+        ref_name: &str,
+        expected_tip_oid: &str,
+        expected_replace_sig: &str,
+        new_meta: &RevisionOrdinalMeta,
+        suffix_oids: &[String],
+    ) -> StorageResult<RevisionOrdinalAppendOutcome> {
+        validate_revision_ordinal_append(
+            ref_name,
+            expected_tip_oid,
+            expected_replace_sig,
+            new_meta,
+            suffix_oids,
+        )?;
+        let ref_owned = ref_name.to_string();
+        let exp_tip = expected_tip_oid.to_string();
+        let exp_sig = expected_replace_sig.to_string();
+        let meta_owned = new_meta.clone();
+        let suffix_owned = suffix_oids.to_vec();
+
+        self.run_write_conditional(move |wtx| {
+            let mut ord_table = wtx
+                .open_table(REVISION_ORDINAL_TABLE)
+                .map_err(|err| map_redb_table_err(err, "open revision_ordinal table"))?;
+            let mut by_oid_table = wtx
+                .open_table(REVISION_ORDINAL_BY_OID_TABLE)
+                .map_err(|err| map_redb_table_err(err, "open revision_ordinal_by_oid index"))?;
+            let mut meta_table = wtx
+                .open_table(REVISION_ORDINAL_META_TABLE)
+                .map_err(|err| map_redb_table_err(err, "open revision_ordinal_meta table"))?;
+
+            let existing = match meta_table
+                .get(ref_owned.as_str())
+                .map_err(|err| map_redb_storage_err(err, "read revision_ordinal_meta"))?
+            {
+                Some(guard) => Some(decode_revision_ordinal_meta(
+                    ref_owned.clone(),
+                    guard.value(),
+                )?),
+                None => None,
+            };
+            let Some(existing) = existing else {
+                return Ok((false, RevisionOrdinalAppendOutcome::Stale { actual: None }));
+            };
+            if existing.tip_oid != exp_tip || existing.replace_sig != exp_sig {
+                return Ok((
+                    false,
+                    RevisionOrdinalAppendOutcome::Stale {
+                        actual: Some(existing),
+                    },
+                ));
+            }
+            let suffix_len = i64::try_from(suffix_owned.len()).map_err(|_| {
+                StorageBackendError::BackendInternal {
+                    detail: "revision_ordinal suffix count overflowed i64".to_string(),
+                }
+            })?;
+            let expected_new_max =
+                existing.max_ordinal.checked_add(suffix_len).ok_or_else(|| {
+                    StorageBackendError::BackendInternal {
+                        detail: "revision_ordinal max_ordinal overflowed i64".to_string(),
+                    }
+                })?;
+            if meta_owned.max_ordinal != expected_new_max {
+                return Err(StorageBackendError::BackendInternal {
+                    detail:
+                        "revision_ordinal append new_meta.max_ordinal does not match existing + suffix"
+                            .to_string(),
+                });
+            }
+
+            // Enforce `UNIQUE(ref_name, oid)` before inserting any rows.
+            for oid in &suffix_owned {
+                if by_oid_table
+                    .get((ref_owned.as_str(), oid.as_str()))
+                    .map_err(|err| {
+                        map_redb_storage_err(err, "check duplicate oid in revision_ordinal")
+                    })?
+                    .is_some()
+                {
+                    return Err(StorageBackendError::BackendInternal {
+                        detail: "duplicate OID in revision_ordinal append for ref".to_string(),
+                    });
+                }
+            }
+
+            let mut ord = existing.max_ordinal;
+            for oid in &suffix_owned {
+                ord += 1;
+                let encoded_oid = encode_versioned(
+                    GIT_REVISION_ORDINAL_CODEC_VERSION,
+                    &RevisionOrdinalStoredRow { oid: oid.clone() },
+                )?;
+                ord_table
+                    .insert((ref_owned.as_str(), ord), encoded_oid.as_slice())
+                    .map_err(|err| map_redb_storage_err(err, "append revision_ordinal row"))?;
+                let encoded_ord = encode_versioned(
+                    GIT_REVISION_ORDINAL_BY_OID_CODEC_VERSION,
+                    &RevisionOrdinalByOidStoredRow { ordinal: ord },
+                )?;
+                by_oid_table
+                    .insert((ref_owned.as_str(), oid.as_str()), encoded_ord.as_slice())
+                    .map_err(|err| {
+                        map_redb_storage_err(err, "append revision_ordinal_by_oid index")
+                    })?;
+            }
+
+            let encoded_meta = encode_versioned(
+                GIT_REVISION_ORDINAL_META_CODEC_VERSION,
+                &RevisionOrdinalMetaStoredRow {
+                    tip_oid: meta_owned.tip_oid.clone(),
+                    replace_sig: meta_owned.replace_sig.clone(),
+                    max_ordinal: meta_owned.max_ordinal,
+                    built_at: meta_owned.built_at.clone(),
+                },
+            )?;
+            meta_table
+                .insert(ref_owned.as_str(), encoded_meta.as_slice())
+                .map_err(|err| map_redb_storage_err(err, "update revision_ordinal_meta"))?;
+
+            Ok((true, RevisionOrdinalAppendOutcome::Applied { meta: meta_owned }))
+        })
+        .await
+    }
+
+    async fn find_revision_oid_by_ordinal(
+        &self,
+        ref_name: &str,
+        ordinal: i64,
+    ) -> StorageResult<Option<String>> {
+        validate_non_empty_identifier(ref_name, "revision_ordinal ref_name")?;
+        if ordinal < 1 {
+            return Ok(None);
+        }
+        let ref_owned = ref_name.to_string();
+        self.run_read(move |rtx| {
+            let Some(table) = open_optional_read_table(
+                rtx,
+                REVISION_ORDINAL_TABLE,
+                "open revision_ordinal table",
+            )?
+            else {
+                return Ok(None);
+            };
+            let Some(guard) = table
+                .get((ref_owned.as_str(), ordinal))
+                .map_err(|err| map_redb_storage_err(err, "get revision_ordinal by ordinal"))?
+            else {
+                return Ok(None);
+            };
+            decode_revision_ordinal_row(guard.value()).map(Some)
+        })
+        .await
+    }
+
+    async fn find_revision_ordinal_by_oid(
+        &self,
+        ref_name: &str,
+        oid: &str,
+    ) -> StorageResult<Option<i64>> {
+        validate_non_empty_identifier(ref_name, "revision_ordinal ref_name")?;
+        validate_hex_oid(oid, "revision_ordinal oid")?;
+        let ref_owned = ref_name.to_string();
+        let oid_owned = oid.to_string();
+        self.run_read(move |rtx| {
+            let Some(table) = open_optional_read_table(
+                rtx,
+                REVISION_ORDINAL_BY_OID_TABLE,
+                "open revision_ordinal_by_oid index",
+            )?
+            else {
+                return Ok(None);
+            };
+            let Some(guard) = table
+                .get((ref_owned.as_str(), oid_owned.as_str()))
+                .map_err(|err| map_redb_storage_err(err, "get revision_ordinal by oid"))?
+            else {
+                return Ok(None);
+            };
+            decode_revision_ordinal_by_oid(guard.value()).map(Some)
+        })
+        .await
+    }
+
+    async fn list_revision_ordinals(&self, ref_name: &str) -> StorageResult<Vec<(i64, String)>> {
+        validate_non_empty_identifier(ref_name, "revision_ordinal ref_name")?;
+        let ref_owned = ref_name.to_string();
+        self.run_read(move |rtx| {
+            let Some(table) = open_optional_read_table(
+                rtx,
+                REVISION_ORDINAL_TABLE,
+                "open revision_ordinal table",
+            )?
+            else {
+                return Ok(Vec::new());
+            };
+            let mut out = Vec::new();
+            let range = table
+                .range((ref_owned.as_str(), i64::MIN)..=(ref_owned.as_str(), i64::MAX))
+                .map_err(|err| map_redb_storage_err(err, "range scan revision_ordinal"))?;
+            for entry in range {
+                let (k, v) =
+                    entry.map_err(|err| map_redb_storage_err(err, "read revision_ordinal"))?;
+                out.push((k.value().1, decode_revision_ordinal_row(v.value())?));
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn count_revision_ordinals(&self, ref_name: &str) -> StorageResult<u64> {
+        validate_non_empty_identifier(ref_name, "revision_ordinal ref_name")?;
+        let ref_owned = ref_name.to_string();
+        self.run_read(move |rtx| {
+            let Some(table) = open_optional_read_table(
+                rtx,
+                REVISION_ORDINAL_TABLE,
+                "open revision_ordinal table",
+            )?
+            else {
+                return Ok(0);
+            };
+            let range = table
+                .range((ref_owned.as_str(), i64::MIN)..=(ref_owned.as_str(), i64::MAX))
+                .map_err(|err| map_redb_storage_err(err, "range scan revision_ordinal count"))?;
+            let mut count = 0u64;
+            for entry in range {
+                let _ = entry
+                    .map_err(|err| map_redb_storage_err(err, "read revision_ordinal count"))?;
+                count += 1;
+            }
+            Ok(count)
+        })
+        .await
+    }
+
+    async fn prune_revision_ordinals_except(&self, live_refs: &[String]) -> StorageResult<usize> {
+        for r in live_refs {
+            validate_non_empty_identifier(r, "revision_ordinal live ref")?;
+        }
+        let live_set: HashSet<String> = live_refs.iter().cloned().collect();
+
+        self.run_write_conditional(move |wtx| {
+            let mut ord_table = wtx
+                .open_table(REVISION_ORDINAL_TABLE)
+                .map_err(|err| map_redb_table_err(err, "open revision_ordinal table for prune"))?;
+            let mut by_oid_table =
+                wtx.open_table(REVISION_ORDINAL_BY_OID_TABLE)
+                    .map_err(|err| {
+                        map_redb_table_err(err, "open revision_ordinal_by_oid index for prune")
+                    })?;
+            let mut meta_table = wtx.open_table(REVISION_ORDINAL_META_TABLE).map_err(|err| {
+                map_redb_table_err(err, "open revision_ordinal_meta table for prune")
+            })?;
+
+            let mut to_prune = Vec::new();
+            {
+                let iter = meta_table.iter().map_err(|err| {
+                    map_redb_storage_err(err, "iterate revision_ordinal_meta for prune")
+                })?;
+                for entry in iter {
+                    let (k, _) = entry.map_err(|err| {
+                        map_redb_storage_err(err, "read revision_ordinal_meta key for prune")
+                    })?;
+                    let ref_name = k.value().to_string();
+                    if !live_set.contains(&ref_name) {
+                        to_prune.push(ref_name);
+                    }
+                }
+            }
+
+            let pruned = to_prune.len();
+            for ref_name in &to_prune {
+                clear_revision_ordinals_for_ref(&mut ord_table, &mut by_oid_table, ref_name)?;
+                let _ = meta_table.remove(ref_name.as_str()).map_err(|err| {
+                    map_redb_storage_err(err, "delete pruned revision_ordinal_meta")
+                })?;
+            }
+            Ok((pruned > 0, pruned))
+        })
+        .await
+    }
+}
+
+fn clear_revision_ordinals_for_ref(
+    ord_table: &mut redb::Table<'_, (&'static str, i64), &'static [u8]>,
+    by_oid_table: &mut redb::Table<'_, (&'static str, &'static str), &'static [u8]>,
+    ref_name: &str,
+) -> StorageResult<()> {
+    let mut ordinals = Vec::new();
+    {
+        let range = ord_table
+            .range((ref_name, i64::MIN)..=(ref_name, i64::MAX))
+            .map_err(|err| map_redb_storage_err(err, "scan revision_ordinal for clear"))?;
+        for entry in range {
+            let (k, _) = entry
+                .map_err(|err| map_redb_storage_err(err, "read revision_ordinal for clear"))?;
+            ordinals.push(k.value().1);
+        }
+    }
+    for ordinal in ordinals {
+        let _ = ord_table
+            .remove((ref_name, ordinal))
+            .map_err(|err| map_redb_storage_err(err, "remove old revision_ordinal row"))?;
+    }
+
+    let mut oids = Vec::new();
+    {
+        let range = by_oid_table
+            .range((ref_name, "")..)
+            .map_err(|err| map_redb_storage_err(err, "scan revision_ordinal_by_oid for clear"))?;
+        for entry in range {
+            let (k, _) = entry.map_err(|err| {
+                map_redb_storage_err(err, "read revision_ordinal_by_oid for clear")
+            })?;
+            let (found_ref, found_oid) = k.value();
+            if found_ref != ref_name {
+                break;
+            }
+            oids.push(found_oid.to_string());
+        }
+    }
+    for oid in oids {
+        let _ = by_oid_table
+            .remove((ref_name, oid.as_str()))
+            .map_err(|err| map_redb_storage_err(err, "remove old revision_ordinal_by_oid row"))?;
+    }
+    Ok(())
 }

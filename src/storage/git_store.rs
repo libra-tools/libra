@@ -1,11 +1,12 @@
-//! Object-safe [`GitStore`] core reference, reflog, worktree isolation, and
-//! atomic bridge publication storage trait (`ADR-RB-04`, `RB-04`).
+//! Object-safe [`GitStore`] core repository storage trait (`ADR-RB-04`,
+//! `RB-04`, `RB-04b`).
 //!
-//! Covers the core reference/reflog/bridge-binding domain (`reference`,
-//! `reflog`, and same-transaction `agent_bridge_publication`) with identical
+//! Covers all 7 core repository tables (`reference`, `reflog`, `object_index`,
+//! `object_obliteration`, `notes`, `revision_ordinal`, `revision_ordinal_meta`)
+//! plus same-transaction `agent_bridge_publication` bindings with identical
 //! semantics across [`SqliteGitStore`] and [`RedbGitStore`].
 
-use std::fmt;
+use std::{collections::HashSet, fmt};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -32,6 +33,252 @@ pub const REFLOG_HEAD_REF_NAME: &str = "HEAD";
 
 /// Maximum allowed byte length for an `agent_bridge_publication.operation_id`.
 pub const MAX_BRIDGE_OPERATION_ID_LEN: usize = 128;
+
+/// Required prefix for canonical Git/Libra notes references (`src/internal/notes.rs`).
+pub const DEFAULT_NOTES_REF_PREFIX: &str = "refs/notes/";
+
+/// Canonical error detail prefix emitted when `object_obliteration` fences a read or write.
+pub const OBLITERATION_FENCE_ERROR_PREFIX: &str = "object_obliteration fence blocked";
+
+/// Canonical Git object hash algorithm stored in `object_obliteration.hash_kind`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum ObjectHashKind {
+    /// 40-character lowercase hexadecimal SHA-1 OID.
+    Sha1,
+    /// 64-character lowercase hexadecimal SHA-256 OID.
+    Sha256,
+}
+
+impl ObjectHashKind {
+    /// Canonical SQL text representation (`"sha1"` or `"sha256"`).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Sha1 => "sha1",
+            Self::Sha256 => "sha256",
+        }
+    }
+
+    /// Expected lowercase hex string length for OIDs of this hash kind.
+    #[must_use]
+    pub const fn oid_hex_len(self) -> usize {
+        match self {
+            Self::Sha1 => 40,
+            Self::Sha256 => 64,
+        }
+    }
+
+    /// Parse canonical SQL text representation (`"sha1"` or `"sha256"`).
+    pub fn parse(raw: &str) -> StorageResult<Self> {
+        match raw {
+            "sha1" => Ok(Self::Sha1),
+            "sha256" => Ok(Self::Sha256),
+            _ => Err(StorageBackendError::BackendInternal {
+                detail: "invalid object_obliteration hash_kind value".to_string(),
+            }),
+        }
+    }
+}
+
+/// One row in the `object_index` table (`sql/sqlite_20260309_init.sql`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectIndexRecord {
+    /// Repository UUID (`repo_id`).
+    pub repo_id: String,
+    /// Canonical lowercase hex object ID (`o_id`, SHA-1 40-hex or SHA-256 64-hex).
+    pub o_id: String,
+    /// Object type (`"blob"`, `"tree"`, `"commit"`, `"tag"`, or semantic `"agent_*"`).
+    pub o_type: String,
+    /// Uncompressed object payload size in bytes (`>= 0`).
+    pub o_size: i64,
+    /// Unix timestamp in seconds when the object was indexed.
+    pub created_at: i64,
+    /// Whether the object has been synchronized to remote cloud storage.
+    pub is_synced: bool,
+}
+
+/// State machine phase stored in `object_obliteration.state` (`lore.md` §2.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum ObliterationState {
+    /// Tombstone written and fsynced before physical payload removal.
+    Obliterating,
+    /// Payload physically deleted; permanent intentional-absence tombstone retained.
+    Obliterated,
+}
+
+impl ObliterationState {
+    /// Canonical SQL text representation (`"obliterating"` or `"obliterated"`).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Obliterating => "obliterating",
+            Self::Obliterated => "obliterated",
+        }
+    }
+
+    /// Parse canonical SQL text representation.
+    pub fn parse(raw: &str) -> StorageResult<Self> {
+        match raw {
+            "obliterating" => Ok(Self::Obliterating),
+            "obliterated" => Ok(Self::Obliterated),
+            _ => Err(StorageBackendError::BackendInternal {
+                detail: "invalid object_obliteration state value".to_string(),
+            }),
+        }
+    }
+}
+
+/// Input payload to begin an index-flagged obliteration (`Live -> Obliterating`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObliterationRequest {
+    /// Canonical lowercase hex OID whose payload is being obliterated.
+    pub oid: String,
+    /// Hash algorithm matching `oid` length (`Sha1` => 40, `Sha256` => 64).
+    pub hash_kind: ObjectHashKind,
+    /// Optional compliance erasure reason.
+    pub reason: Option<String>,
+    /// Optional actor initiating the obliteration.
+    pub actor: Option<String>,
+    /// Optional approval source identifier.
+    pub approval_source: Option<String>,
+    /// Timestamp string recorded for `requested_at`, `tombstone_written_at`, and `updated_at`.
+    pub recorded_at: String,
+}
+
+/// Materialized permanent tombstone row in `object_obliteration`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectObliterationRecord {
+    /// Content OID whose payload is being or has been removed.
+    pub oid: String,
+    /// Hash algorithm (`sha1` or `sha256`).
+    pub hash_kind: ObjectHashKind,
+    /// Current state (`obliterating` or `obliterated`).
+    pub state: ObliterationState,
+    /// Optional erasure reason.
+    pub reason: Option<String>,
+    /// Optional initiating actor.
+    pub actor: Option<String>,
+    /// Optional approval source.
+    pub approval_source: Option<String>,
+    /// Timestamp when obliteration was requested.
+    pub requested_at: String,
+    /// Timestamp when the durable tombstone was persisted.
+    pub tombstone_written_at: String,
+    /// Timestamp when payload bytes were physically deleted (`Some` once `Obliterated`).
+    pub payload_deleted_at: Option<String>,
+    /// Timestamp of the last state transition.
+    pub updated_at: String,
+}
+
+/// One row in the `notes` table mapping `(notes_ref, object) -> blob`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NoteRecord {
+    /// Notes reference starting with `"refs/notes/"`.
+    pub notes_ref: String,
+    /// Canonical lowercase hex OID of the annotated object.
+    pub object: String,
+    /// Canonical lowercase hex OID of the note blob.
+    pub blob: String,
+}
+
+/// Result of [`GitStore::put_note`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NoteWriteOutcome {
+    /// New note row inserted for `(notes_ref, object)`.
+    Inserted,
+    /// Existing note row replaced (`overwrite = true`).
+    Replaced { previous_blob: String },
+    /// Existing note row already present and left untouched (`overwrite = false`).
+    AlreadyExists { existing_blob: String },
+}
+
+/// Single compare-and-swap operation inside [`GitStore::apply_notes_cas_batch`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NoteCasOp {
+    /// Insert `(notes_ref, object) -> blob` only if no note currently exists.
+    InsertIfAbsent { object: String, blob: String },
+    /// Update `(notes_ref, object)` to `new_blob` only if its current blob equals `expected_blob`.
+    UpdateIfMatches {
+        object: String,
+        expected_blob: String,
+        new_blob: String,
+    },
+    /// Delete `(notes_ref, object)` only if its current blob equals `expected_blob`.
+    DeleteIfMatches {
+        object: String,
+        expected_blob: String,
+    },
+}
+
+/// Result of [`GitStore::apply_notes_cas_batch`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NoteBatchOutcome {
+    /// Every operation's CAS precondition matched and committed in one transaction.
+    Applied {
+        inserted: usize,
+        updated: usize,
+        deleted: usize,
+    },
+    /// At least one operation's CAS precondition failed; entire transaction rolled back.
+    CasConflict {
+        object: String,
+        actual_blob: Option<String>,
+    },
+}
+
+/// Freshness metadata stored in `revision_ordinal_meta` (`lore.md` §1.16).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RevisionOrdinalMeta {
+    /// Full reference name (e.g. `"refs/heads/main"`).
+    pub ref_name: String,
+    /// Canonical lowercase hex tip OID (SHA-1, SHA-256, or all-zero OID).
+    pub tip_oid: String,
+    /// Replace-set fingerprint digest (`""` when no replace refs exist).
+    pub replace_sig: String,
+    /// Highest 1-based ordinal indexed for `ref_name` (`0` when empty).
+    pub max_ordinal: i64,
+    /// Timestamp string when the index was built or last extended.
+    pub built_at: String,
+}
+
+/// Result of [`GitStore::append_revision_ordinals`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RevisionOrdinalAppendOutcome {
+    /// Expected `(tip_oid, replace_sig)` matched; suffix appended and meta stamped atomically.
+    Applied { meta: RevisionOrdinalMeta },
+    /// Stored metadata was absent or did not match `(expected_tip_oid, expected_replace_sig)`;
+    /// transaction aborted with zero writes.
+    Stale { actual: Option<RevisionOrdinalMeta> },
+}
+
+/// Returns `true` when `error` indicates that `object_obliteration` fenced a
+/// read or write attempt against an obliterated or obliterating object OID.
+#[must_use]
+pub fn is_obliteration_fenced_error(error: &StorageBackendError) -> bool {
+    matches!(
+        error,
+        StorageBackendError::BackendInternal { detail }
+            if detail.starts_with(OBLITERATION_FENCE_ERROR_PREFIX)
+    )
+}
+
+pub(crate) fn obliteration_fenced_read_error(state: ObliterationState) -> StorageBackendError {
+    StorageBackendError::BackendInternal {
+        detail: format!(
+            "{OBLITERATION_FENCE_ERROR_PREFIX} read of tombstoned object (state={})",
+            state.as_str()
+        ),
+    }
+}
+
+pub(crate) fn obliteration_fenced_write_error(state: ObliterationState) -> StorageBackendError {
+    StorageBackendError::BackendInternal {
+        detail: format!(
+            "{OBLITERATION_FENCE_ERROR_PREFIX} write of tombstoned object (state={})",
+            state.as_str()
+        ),
+    }
+}
 
 /// Canonical identity of one row in the `reference` table (`RB-04`).
 ///
@@ -232,10 +479,242 @@ pub fn is_valid_bridge_operation_id(operation_id: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':'))
 }
 
-fn validate_non_empty_identifier(value: &str, label: &'static str) -> StorageResult<()> {
+pub(crate) fn validate_non_empty_identifier(value: &str, label: &'static str) -> StorageResult<()> {
     if value.is_empty() || value.contains('\0') {
         return Err(StorageBackendError::BackendInternal {
             detail: format!("{label} must be non-empty and contain no NUL bytes"),
+        });
+    }
+    Ok(())
+}
+
+fn validate_optional_no_nul(value: Option<&str>, label: &'static str) -> StorageResult<()> {
+    if let Some(v) = value
+        && v.contains('\0')
+    {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!("{label} must not contain NUL bytes"),
+        });
+    }
+    Ok(())
+}
+
+/// Validate a canonical lowercase hexadecimal Git object ID.
+///
+/// Accepts 40-char SHA-1 OIDs, 64-char SHA-256 OIDs, and all-zero OIDs of
+/// either length. Rejects uppercase hex so `object_obliteration` fence lookups
+/// cannot be bypassed via case variation.
+pub(crate) fn validate_hex_oid(oid: &str, label: &'static str) -> StorageResult<()> {
+    let valid_len = matches!(oid.len(), 40 | 64);
+    let valid_hex = oid.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    if !valid_len || !valid_hex {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!("{label} must be a 40- or 64-character lowercase hexadecimal OID"),
+        });
+    }
+    Ok(())
+}
+
+/// Validate that `oid` is canonical lowercase hex matching `hash_kind`.
+pub(crate) fn validate_oid_for_hash_kind(
+    oid: &str,
+    hash_kind: ObjectHashKind,
+) -> StorageResult<()> {
+    validate_hex_oid(oid, "object OID")?;
+    if oid.len() != hash_kind.oid_hex_len() {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "object OID length does not match hash_kind `{}`",
+                hash_kind.as_str()
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Validate one [`ObjectIndexRecord`] before entering a transaction.
+pub(crate) fn validate_object_index_record(record: &ObjectIndexRecord) -> StorageResult<()> {
+    validate_non_empty_identifier(&record.repo_id, "object_index repo_id")?;
+    validate_hex_oid(&record.o_id, "object_index o_id")?;
+    validate_non_empty_identifier(&record.o_type, "object_index o_type")?;
+    if record.o_size < 0 {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "object_index o_size must be non-negative".to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Canonical `object_index` conflict promotion rule (`src/utils/client_storage.rs`):
+/// a semantic `agent_*` type promotes a generic non-`agent_*` row (resetting
+/// `is_synced = false`), whereas a later generic write never demotes an
+/// existing semantic row or reopens a synced upload.
+#[cfg_attr(not(feature = "storage-redb"), allow(dead_code))]
+pub(crate) fn should_promote_object_index_type(existing_type: &str, incoming_type: &str) -> bool {
+    incoming_type.starts_with("agent_") && !existing_type.starts_with("agent_")
+}
+
+/// Validate an [`ObliterationRequest`] before entering a write transaction.
+pub(crate) fn validate_obliteration_request(req: &ObliterationRequest) -> StorageResult<()> {
+    validate_oid_for_hash_kind(&req.oid, req.hash_kind)?;
+    validate_non_empty_identifier(&req.recorded_at, "obliteration recorded_at")?;
+    validate_optional_no_nul(req.reason.as_deref(), "obliteration reason")?;
+    validate_optional_no_nul(req.actor.as_deref(), "obliteration actor")?;
+    validate_optional_no_nul(
+        req.approval_source.as_deref(),
+        "obliteration approval_source",
+    )
+}
+
+/// Validate a canonical notes reference (`refs/notes/<name>`).
+pub(crate) fn validate_notes_ref(notes_ref: &str) -> StorageResult<()> {
+    if !notes_ref.starts_with(DEFAULT_NOTES_REF_PREFIX)
+        || notes_ref.len() == DEFAULT_NOTES_REF_PREFIX.len()
+        || notes_ref.contains('\0')
+    {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "notes_ref must start with `refs/notes/` followed by a non-empty name"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Validate one [`NoteCasOp`] before entering a write transaction.
+pub(crate) fn validate_note_cas_op(op: &NoteCasOp) -> StorageResult<()> {
+    match op {
+        NoteCasOp::InsertIfAbsent { object, blob } => {
+            validate_hex_oid(object, "note object OID")?;
+            validate_hex_oid(blob, "note blob OID")
+        }
+        NoteCasOp::UpdateIfMatches {
+            object,
+            expected_blob,
+            new_blob,
+        } => {
+            validate_hex_oid(object, "note object OID")?;
+            validate_hex_oid(expected_blob, "note expected_blob OID")?;
+            validate_hex_oid(new_blob, "note new_blob OID")
+        }
+        NoteCasOp::DeleteIfMatches {
+            object,
+            expected_blob,
+        } => {
+            validate_hex_oid(object, "note object OID")?;
+            validate_hex_oid(expected_blob, "note expected_blob OID")
+        }
+    }
+}
+
+/// Validate a [`RevisionOrdinalMeta`] header.
+pub(crate) fn validate_revision_ordinal_meta(meta: &RevisionOrdinalMeta) -> StorageResult<()> {
+    validate_non_empty_identifier(&meta.ref_name, "revision_ordinal ref_name")?;
+    validate_hex_oid(&meta.tip_oid, "revision_ordinal tip_oid")?;
+    if meta.replace_sig.contains('\0') {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "revision_ordinal replace_sig must not contain NUL bytes".to_string(),
+        });
+    }
+    if meta.max_ordinal < 0 {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "revision_ordinal max_ordinal must be non-negative".to_string(),
+        });
+    }
+    validate_non_empty_identifier(&meta.built_at, "revision_ordinal built_at")
+}
+
+/// Validate a full `replace_revision_ordinals` payload (1-based contiguous ordinals,
+/// unique canonical OIDs, and `meta.tip_oid` agreement).
+pub(crate) fn validate_revision_ordinal_entries(
+    meta: &RevisionOrdinalMeta,
+    entries: &[(i64, String)],
+) -> StorageResult<()> {
+    validate_revision_ordinal_meta(meta)?;
+    let expected_len =
+        i64::try_from(entries.len()).map_err(|_| StorageBackendError::BackendInternal {
+            detail: "revision_ordinal entry count overflowed i64".to_string(),
+        })?;
+    if meta.max_ordinal != expected_len {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "revision_ordinal meta.max_ordinal must match entries length".to_string(),
+        });
+    }
+    let mut seen_oids = HashSet::with_capacity(entries.len());
+    for (idx, (ordinal, oid)) in entries.iter().enumerate() {
+        let expected_ord =
+            i64::try_from(idx + 1).map_err(|_| StorageBackendError::BackendInternal {
+                detail: "revision_ordinal index overflowed i64".to_string(),
+            })?;
+        if *ordinal != expected_ord {
+            return Err(StorageBackendError::BackendInternal {
+                detail: "revision_ordinal entries must carry contiguous 1-based ordinals"
+                    .to_string(),
+            });
+        }
+        validate_hex_oid(oid, "revision_ordinal oid")?;
+        if !seen_oids.insert(oid.as_str()) {
+            return Err(StorageBackendError::BackendInternal {
+                detail: "revision_ordinal entries must not contain duplicate OIDs for a ref"
+                    .to_string(),
+            });
+        }
+    }
+    if let Some((_, tip_entry_oid)) = entries.last()
+        && tip_entry_oid != &meta.tip_oid
+    {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "revision_ordinal meta.tip_oid must match the highest-ordinal entry OID"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Validate an incremental `append_revision_ordinals` request before opening a transaction.
+pub(crate) fn validate_revision_ordinal_append(
+    ref_name: &str,
+    expected_tip_oid: &str,
+    expected_replace_sig: &str,
+    new_meta: &RevisionOrdinalMeta,
+    suffix_oids: &[String],
+) -> StorageResult<()> {
+    validate_non_empty_identifier(ref_name, "revision_ordinal ref_name")?;
+    validate_hex_oid(expected_tip_oid, "revision_ordinal expected_tip_oid")?;
+    if expected_replace_sig.contains('\0') {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "revision_ordinal expected_replace_sig must not contain NUL bytes".to_string(),
+        });
+    }
+    validate_revision_ordinal_meta(new_meta)?;
+    if new_meta.ref_name != ref_name {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "revision_ordinal append new_meta.ref_name must match ref_name".to_string(),
+        });
+    }
+    if new_meta.replace_sig != expected_replace_sig {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "revision_ordinal append cannot change replace_sig; use full rebuild"
+                .to_string(),
+        });
+    }
+    if suffix_oids.is_empty() {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "revision_ordinal append requires at least one suffix OID".to_string(),
+        });
+    }
+    let mut seen = HashSet::with_capacity(suffix_oids.len());
+    for oid in suffix_oids {
+        validate_hex_oid(oid, "revision_ordinal suffix oid")?;
+        if !seen.insert(oid.as_str()) {
+            return Err(StorageBackendError::BackendInternal {
+                detail: "revision_ordinal suffix must not contain duplicate OIDs".to_string(),
+            });
+        }
+    }
+    if suffix_oids.last().map(String::as_str) != Some(new_meta.tip_oid.as_str()) {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "revision_ordinal append new_meta.tip_oid must match the final suffix OID"
+                .to_string(),
         });
     }
     Ok(())
@@ -481,6 +960,219 @@ pub trait GitStore: Send + Sync + fmt::Debug {
 
     /// List all `agent_bridge_publication` records sorted by `operation_id ASC`.
     async fn list_bridge_publications(&self) -> StorageResult<Vec<BridgePublicationRecord>>;
+
+    // -------------------------------------------------------------------------
+    // `object_index` (`RB-04b` AC1–AC3)
+    // -------------------------------------------------------------------------
+
+    /// Atomically and idempotently upsert `records` into `object_index` in a
+    /// single database write transaction (`RB-04b` AC1, AC3).
+    ///
+    /// Enforces the `object_obliteration` write fence across the entire batch:
+    /// if ANY `record.o_id` is tombstoned (`obliterating` or `obliterated`),
+    /// the entire transaction aborts with zero partial writes.
+    async fn upsert_object_index_batch(&self, records: &[ObjectIndexRecord]) -> StorageResult<()>;
+
+    /// Look up one `object_index` row for `(repo_id, o_id)` with atomic
+    /// `object_obliteration` read-fence enforcement (`RB-04b` AC2).
+    ///
+    /// Fails closed with an obliteration-fenced error when `o_id` carries an
+    /// `object_obliteration` tombstone (in either `obliterating` or
+    /// `obliterated` state), even if the historical registry row is preserved.
+    async fn get_object_index(
+        &self,
+        repo_id: &str,
+        o_id: &str,
+    ) -> StorageResult<Option<ObjectIndexRecord>>;
+
+    /// Compliance/fsck read of a preserved `object_index` address row without
+    /// triggering the payload-read obliteration fence (`lore.md` §2.5).
+    async fn get_object_index_preserved_address(
+        &self,
+        repo_id: &str,
+        o_id: &str,
+    ) -> StorageResult<Option<ObjectIndexRecord>>;
+
+    /// List live `object_index` rows for `repo_id` (optionally filtered by
+    /// `is_synced`), deterministically sorted by `o_id ASC` and excluding any
+    /// OID fenced by `object_obliteration`.
+    async fn list_object_index_by_repo(
+        &self,
+        repo_id: &str,
+        synced_filter: Option<bool>,
+    ) -> StorageResult<Vec<ObjectIndexRecord>>;
+
+    /// Atomically mark live `object_index` rows as synced (`is_synced = true`)
+    /// inside a single write transaction, returning the number of rows
+    /// transitioned from unsynced to synced. Fails closed with zero writes if
+    /// any requested OID is tombstoned in `object_obliteration`.
+    async fn mark_object_index_synced(
+        &self,
+        repo_id: &str,
+        o_ids: &[String],
+    ) -> StorageResult<usize>;
+
+    // -------------------------------------------------------------------------
+    // `object_obliteration` fence (`RB-04b` AC2–AC3)
+    // -------------------------------------------------------------------------
+
+    /// Record a permanent `obliterating` tombstone (`Live -> Obliterating`),
+    /// idempotent on `(oid, hash_kind)`.
+    async fn begin_object_obliteration(
+        &self,
+        req: &ObliterationRequest,
+    ) -> StorageResult<ObjectObliterationRecord>;
+
+    /// Finalize an existing tombstone (`Obliterating -> Obliterated`) after
+    /// physical payload deletion; idempotent once `Obliterated`, and returns
+    /// `NotFound` if no tombstone exists yet.
+    async fn mark_object_obliterated(
+        &self,
+        oid: &str,
+        hash_kind: ObjectHashKind,
+        deleted_at: &str,
+    ) -> StorageResult<ObjectObliterationRecord>;
+
+    /// Look up the permanent `object_obliteration` tombstone for `oid`.
+    async fn get_object_obliteration(
+        &self,
+        oid: &str,
+    ) -> StorageResult<Option<ObjectObliterationRecord>>;
+
+    /// Return `true` if `oid` has a tombstone in ANY state (`obliterating` or `obliterated`).
+    async fn is_object_obliterated(&self, oid: &str) -> StorageResult<bool>;
+
+    /// List all incomplete (`state = 'obliterating'`) tombstones sorted by `(oid, hash_kind)`.
+    async fn list_incomplete_obliterations(&self) -> StorageResult<Vec<ObjectObliterationRecord>>;
+
+    /// List all tombstoned OIDs (in either state) sorted ascending.
+    async fn list_obliterated_oids(&self) -> StorageResult<Vec<String>>;
+
+    /// Execute a payload read under the monotonic `object_obliteration` read
+    /// fence (`RB-04b` AC2).
+    ///
+    /// Checks `object_obliteration` before invoking `read_payload` and
+    /// re-verifies after `read_payload` completes (discarding loaded bytes or
+    /// overriding post-unlink I/O misses if a tombstone committed mid-read).
+    /// Because tombstones transition strictly monotonically
+    /// (`Live -> Obliterating -> Obliterated`) and commit before payload
+    /// unlinking, this closes the read-vs-obliteration TOCTOU window without
+    /// taking write locks on reads.
+    async fn run_fenced_object_read(
+        &self,
+        oid: &str,
+        read_payload: Box<dyn FnOnce() -> StorageResult<Vec<u8>> + Send>,
+    ) -> StorageResult<Vec<u8>>;
+
+    /// Execute a payload write together with `object_index` registration inside
+    /// a single exclusive cross-process write transaction guarded by the
+    /// `object_obliteration` write fence (`RB-04b` AC3).
+    ///
+    /// Holds the backend's exclusive write transaction (`BEGIN IMMEDIATE` in
+    /// SQLite, `WriteTransaction` in `redb`) across the tombstone check,
+    /// `write_payload`, and `object_index` upsert so no concurrent
+    /// `begin_object_obliteration` can interleave between the check and payload
+    /// materialization. If `record.o_id` is tombstoned, `write_payload` is
+    /// never invoked.
+    async fn run_fenced_object_write(
+        &self,
+        record: &ObjectIndexRecord,
+        write_payload: Box<dyn FnOnce() -> StorageResult<()> + Send>,
+    ) -> StorageResult<()>;
+
+    // -------------------------------------------------------------------------
+    // `notes` (`RB-04b` AC4)
+    // -------------------------------------------------------------------------
+
+    /// Look up one note mapping `(notes_ref, object) -> blob`.
+    async fn get_note(&self, notes_ref: &str, object: &str) -> StorageResult<Option<NoteRecord>>;
+
+    /// List all notes under `notes_ref` sorted deterministically by `object ASC`.
+    async fn list_notes(&self, notes_ref: &str) -> StorageResult<Vec<NoteRecord>>;
+
+    /// Insert or (when `overwrite == true`) replace the note for `(notes_ref, object)`.
+    async fn put_note(
+        &self,
+        notes_ref: &str,
+        object: &str,
+        blob: &str,
+        overwrite: bool,
+    ) -> StorageResult<NoteWriteOutcome>;
+
+    /// Remove the note for `(notes_ref, object)`, optionally compare-and-swapping
+    /// against `expected_blob`. Returns `true` if a row was deleted.
+    async fn remove_note_cas(
+        &self,
+        notes_ref: &str,
+        object: &str,
+        expected_blob: Option<&str>,
+    ) -> StorageResult<bool>;
+
+    /// Atomically apply a batch of CAS note mutations inside one transaction,
+    /// rolling back completely on the first CAS conflict.
+    async fn apply_notes_cas_batch(
+        &self,
+        notes_ref: &str,
+        ops: &[NoteCasOp],
+    ) -> StorageResult<NoteBatchOutcome>;
+
+    // -------------------------------------------------------------------------
+    // `revision_ordinal` & `revision_ordinal_meta` (`RB-04b` AC5)
+    // -------------------------------------------------------------------------
+
+    /// Read freshness metadata for `ref_name`.
+    async fn get_revision_ordinal_meta(
+        &self,
+        ref_name: &str,
+    ) -> StorageResult<Option<RevisionOrdinalMeta>>;
+
+    /// List all `revision_ordinal_meta` records sorted by `ref_name ASC`.
+    async fn list_revision_ordinal_metas(&self) -> StorageResult<Vec<RevisionOrdinalMeta>>;
+
+    /// Atomically replace all `revision_ordinal` rows and `revision_ordinal_meta`
+    /// for `meta.ref_name` in one transaction (supports SHA-1, SHA-256, and
+    /// all-zero OIDs).
+    async fn replace_revision_ordinals(
+        &self,
+        meta: &RevisionOrdinalMeta,
+        entries: &[(i64, String)],
+    ) -> StorageResult<()>;
+
+    /// Atomically append a fast-forward suffix of OIDs when stored metadata
+    /// matches `(expected_tip_oid, expected_replace_sig)`, or abort cleanly
+    /// returning [`RevisionOrdinalAppendOutcome::Stale`].
+    async fn append_revision_ordinals(
+        &self,
+        ref_name: &str,
+        expected_tip_oid: &str,
+        expected_replace_sig: &str,
+        new_meta: &RevisionOrdinalMeta,
+        suffix_oids: &[String],
+    ) -> StorageResult<RevisionOrdinalAppendOutcome>;
+
+    /// Forward lookup: `(ref_name, ordinal) -> oid`.
+    async fn find_revision_oid_by_ordinal(
+        &self,
+        ref_name: &str,
+        ordinal: i64,
+    ) -> StorageResult<Option<String>>;
+
+    /// Reverse lookup: `(ref_name, oid) -> ordinal`.
+    async fn find_revision_ordinal_by_oid(
+        &self,
+        ref_name: &str,
+        oid: &str,
+    ) -> StorageResult<Option<i64>>;
+
+    /// List `(ordinal, oid)` rows for `ref_name` ordered by `ordinal ASC`.
+    async fn list_revision_ordinals(&self, ref_name: &str) -> StorageResult<Vec<(i64, String)>>;
+
+    /// Count indexed `revision_ordinal` rows for `ref_name`.
+    async fn count_revision_ordinals(&self, ref_name: &str) -> StorageResult<u64>;
+
+    /// Atomically prune `revision_ordinal` and `revision_ordinal_meta` rows for
+    /// all refs not present in `live_refs`, returning the number of pruned refs.
+    async fn prune_revision_ordinals_except(&self, live_refs: &[String]) -> StorageResult<usize>;
 }
 
 #[cfg(test)]
@@ -1988,6 +2680,1802 @@ mod tests {
                 .filter(|r| r.key == main_branch)
                 .count(),
             1
+        );
+    }
+
+    #[cfg(feature = "storage-sqlite")]
+    fn sha1_oid(n: u64) -> String {
+        format!("{n:040x}")
+    }
+
+    #[cfg(all(feature = "storage-sqlite", feature = "storage-redb"))]
+    fn sha256_oid(n: u64) -> String {
+        format!("{n:064x}")
+    }
+
+    /// `RB-04b` (AC1–AC5): Verify exact dual-backend equivalence between
+    /// `SqliteGitStore` and `RedbGitStore` across:
+    /// - AC1: `upsert_object_index_batch` idempotently upserts >= 1,000 rows in
+    ///   one write transaction (plus `RedbGitStore` same-tx `OBJECT_BY_PACK` index).
+    /// - AC2: `object_obliteration` fence blocks read path for tombstoned OIDs
+    ///   (`obliterating` and `obliterated`) across SHA-1 & SHA-256 while preserving
+    ///   the historical `object_index` address row.
+    /// - AC3: `object_obliteration` fence blocks write path atomically with zero
+    ///   partial writes for tombstoned OIDs.
+    /// - AC4: `notes` CRUD + CAS batch parity across SQLite and Redb.
+    /// - AC5: `revision_ordinal` & `revision_ordinal_meta` parity across SHA-1,
+    ///   SHA-256, and all-zero OIDs.
+    #[cfg(all(feature = "storage-sqlite", feature = "storage-redb"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dual_backend_object_index_obliteration_notes_and_ordinals() {
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("create RB-04b dual-backend tempdir");
+        let sqlite_path = dir.path().join("libra.db");
+        let redb_path = dir.path().join("git.redb");
+        let sqlite_store = SqliteGitStore::create(&sqlite_path)
+            .await
+            .expect("create SqliteGitStore");
+        let redb_store = RedbGitStore::create(&redb_path).expect("create RedbGitStore");
+
+        let backends: [Arc<dyn GitStore>; 2] =
+            [Arc::new(sqlite_store.clone()), Arc::new(redb_store.clone())];
+
+        // ---------------------------------------------------------------------
+        // AC1: Single-transaction batch upsert of >= 1,000 object_index records
+        // with idempotent replay, semantic `agent_*` promotion, non-demotion,
+        // and `mark_object_index_synced` parity.
+        // ---------------------------------------------------------------------
+        const BATCH_LEN: usize = 1_024;
+        let repo_a = "repo-alpha";
+        let repo_b = "repo-beta";
+        let mut batch = Vec::with_capacity(BATCH_LEN);
+        for idx in 1..=BATCH_LEN {
+            let n = u64::try_from(idx).expect("batch idx fits u64");
+            batch.push(ObjectIndexRecord {
+                repo_id: repo_a.to_string(),
+                o_id: sha1_oid(n),
+                o_type: if idx % 4 == 0 {
+                    "commit".to_string()
+                } else {
+                    "blob".to_string()
+                },
+                o_size: i64::try_from(idx * 16).expect("size fits i64"),
+                created_at: 1_795_370_000 + i64::try_from(idx).expect("ts fits i64"),
+                is_synced: false,
+            });
+        }
+        // Include an extra repo_b row to verify multi-repo isolation.
+        let repo_b_row = ObjectIndexRecord {
+            repo_id: repo_b.to_string(),
+            o_id: sha256_oid(77),
+            o_type: "tree".to_string(),
+            o_size: 4096,
+            created_at: 1_795_370_999,
+            is_synced: true,
+        };
+
+        for store in &backends {
+            store
+                .upsert_object_index_batch(&batch)
+                .await
+                .expect("AC1: initial 1,024-row upsert");
+            // Idempotent re-upsert must not duplicate or corrupt rows.
+            store
+                .upsert_object_index_batch(&batch)
+                .await
+                .expect("AC1: idempotent replay upsert");
+            store
+                .upsert_object_index_batch(std::slice::from_ref(&repo_b_row))
+                .await
+                .expect("upsert repo_b row");
+        }
+
+        let sq_all = backends[0]
+            .list_object_index_by_repo(repo_a, None)
+            .await
+            .expect("sqlite list repo_a");
+        let rb_all = backends[1]
+            .list_object_index_by_repo(repo_a, None)
+            .await
+            .expect("redb list repo_a");
+        assert_eq!(sq_all.len(), BATCH_LEN);
+        assert_eq!(
+            sq_all, rb_all,
+            "AC1: 1,024 object_index rows must match identically"
+        );
+
+        // Mark first 10 rows synced, then test semantic `agent_*` promotion vs generic non-demotion.
+        let synced_ids: Vec<String> = (1u64..=10).map(sha1_oid).collect();
+        let promoted_oid = sha1_oid(1);
+        let kept_synced_oid = sha1_oid(2);
+        for store in &backends {
+            let count = store
+                .mark_object_index_synced(repo_a, &synced_ids)
+                .await
+                .expect("mark synced");
+            assert_eq!(count, 10);
+            // Re-marking already synced rows returns 0.
+            assert_eq!(
+                store
+                    .mark_object_index_synced(repo_a, &synced_ids)
+                    .await
+                    .expect("idempotent mark synced"),
+                0
+            );
+            // Promote oid(1) from generic `blob` -> `agent_session` (reopens is_synced = false)
+            // and replay generic `blob` on oid(2) (keeps is_synced = true and original size).
+            let promo_batch = vec![
+                ObjectIndexRecord {
+                    repo_id: repo_a.to_string(),
+                    o_id: promoted_oid.clone(),
+                    o_type: "agent_session".to_string(),
+                    o_size: 999,
+                    created_at: 1_795_399_999,
+                    is_synced: true,
+                },
+                ObjectIndexRecord {
+                    repo_id: repo_a.to_string(),
+                    o_id: kept_synced_oid.clone(),
+                    o_type: "blob".to_string(),
+                    o_size: 888,
+                    created_at: 1_795_399_999,
+                    is_synced: false,
+                },
+            ];
+            store
+                .upsert_object_index_batch(&promo_batch)
+                .await
+                .expect("promotion upsert");
+            // Subsequent generic write must NOT demote `agent_session`.
+            store
+                .upsert_object_index_batch(&[ObjectIndexRecord {
+                    repo_id: repo_a.to_string(),
+                    o_id: promoted_oid.clone(),
+                    o_type: "blob".to_string(),
+                    o_size: 1,
+                    created_at: 1_795_400_000,
+                    is_synced: true,
+                }])
+                .await
+                .expect("non-demotion upsert");
+        }
+
+        for store in &backends {
+            let promoted = store
+                .get_object_index(repo_a, &promoted_oid)
+                .await
+                .expect("get promoted")
+                .expect("promoted row exists");
+            assert_eq!(promoted.o_type, "agent_session");
+            assert_eq!(promoted.o_size, 999);
+            assert!(!promoted.is_synced, "promotion must reset is_synced=false");
+            assert_eq!(
+                promoted.created_at, 1_795_370_001,
+                "original created_at preserved"
+            );
+
+            let kept = store
+                .get_object_index(repo_a, &kept_synced_oid)
+                .await
+                .expect("get kept")
+                .expect("kept row exists");
+            assert_eq!(kept.o_type, "blob");
+            assert_eq!(kept.o_size, 32);
+            assert!(
+                kept.is_synced,
+                "generic conflict must not reopen synced upload"
+            );
+
+            let synced_only = store
+                .list_object_index_by_repo(repo_a, Some(true))
+                .await
+                .expect("list synced");
+            assert_eq!(synced_only.len(), 9);
+        }
+        assert_eq!(
+            backends[0]
+                .list_object_index_by_repo(repo_a, Some(true))
+                .await
+                .expect("sq synced"),
+            backends[1]
+                .list_object_index_by_repo(repo_a, Some(true))
+                .await
+                .expect("rb synced"),
+        );
+
+        // Same-transaction `OBJECT_BY_PACK` secondary index verification on RedbGitStore.
+        let pack_obj_a = ObjectIndexRecord {
+            repo_id: repo_a.to_string(),
+            o_id: sha1_oid(5_001),
+            o_type: "blob".to_string(),
+            o_size: 128,
+            created_at: 1_795_371_000,
+            is_synced: false,
+        };
+        let pack_obj_b = ObjectIndexRecord {
+            repo_id: repo_a.to_string(),
+            o_id: sha1_oid(5_002),
+            o_type: "tree".to_string(),
+            o_size: 256,
+            created_at: 1_795_371_001,
+            is_synced: false,
+        };
+        redb_store
+            .upsert_object_index_batch_with_pack(
+                &[pack_obj_a.clone(), pack_obj_b.clone()],
+                Some("pack-001"),
+            )
+            .await
+            .expect("bind objects to pack-001");
+        assert_eq!(
+            redb_store
+                .list_object_index_by_pack("pack-001", Some(repo_a))
+                .await
+                .expect("list pack-001"),
+            vec![pack_obj_a.clone(), pack_obj_b.clone()]
+        );
+        // Repack `pack_obj_a` into `pack-002` and verify stale `pack-001` entry is removed atomically.
+        redb_store
+            .upsert_object_index_batch_with_pack(
+                std::slice::from_ref(&pack_obj_a),
+                Some("pack-002"),
+            )
+            .await
+            .expect("repack pack_obj_a to pack-002");
+        assert_eq!(
+            redb_store
+                .list_object_index_by_pack("pack-001", Some(repo_a))
+                .await
+                .expect("list pack-001 after repack"),
+            vec![pack_obj_b.clone()]
+        );
+        assert_eq!(
+            redb_store
+                .list_object_index_by_pack("pack-002", Some(repo_a))
+                .await
+                .expect("list pack-002 after repack"),
+            vec![pack_obj_a.clone()]
+        );
+
+        // ---------------------------------------------------------------------
+        // AC2 & AC3: `object_obliteration` fence blocks BOTH read and write
+        // paths across `Obliterating` and `Obliterated` states (SHA-1 & SHA-256)
+        // with atomic zero-partial-write rollback.
+        // ---------------------------------------------------------------------
+        let oblit_sha1_existing = sha1_oid(5); // already indexed in repo_a
+        let oblit_sha256_unindexed = sha256_oid(999); // never indexed before
+
+        let req_sha1 = ObliterationRequest {
+            oid: oblit_sha1_existing.clone(),
+            hash_kind: ObjectHashKind::Sha1,
+            reason: Some("gdpr-erasure".to_string()),
+            actor: Some("compliance-bot".to_string()),
+            approval_source: Some("ticket-42".to_string()),
+            recorded_at: "2026-11-22T18:00:00Z".to_string(),
+        };
+        let req_sha256 = ObliterationRequest {
+            oid: oblit_sha256_unindexed.clone(),
+            hash_kind: ObjectHashKind::Sha256,
+            reason: Some("secret-purge".to_string()),
+            actor: Some("security-ops".to_string()),
+            approval_source: Some("incident-7".to_string()),
+            recorded_at: "2026-11-22T18:01:00Z".to_string(),
+        };
+
+        for store in &backends {
+            // Cannot mark_object_obliterated before writing the `obliterating` tombstone.
+            let not_found_err = store
+                .mark_object_obliterated(
+                    &oblit_sha1_existing,
+                    ObjectHashKind::Sha1,
+                    "2026-11-22T18:02:00Z",
+                )
+                .await
+                .expect_err("mark_object_obliterated before begin must fail closed");
+            assert!(matches!(
+                not_found_err,
+                StorageBackendError::NotFound { .. }
+            ));
+
+            // Live -> Obliterating (idempotent).
+            let t1 = store
+                .begin_object_obliteration(&req_sha1)
+                .await
+                .expect("begin sha1 obliteration");
+            assert_eq!(t1.state, ObliterationState::Obliterating);
+            assert_eq!(t1.payload_deleted_at, None);
+            let t1_replay = store
+                .begin_object_obliteration(&req_sha1)
+                .await
+                .expect("idempotent begin sha1");
+            assert_eq!(t1_replay, t1);
+
+            let t2 = store
+                .begin_object_obliteration(&req_sha256)
+                .await
+                .expect("begin sha256 obliteration");
+            assert_eq!(t2.state, ObliterationState::Obliterating);
+
+            // AC2 (Obliterating state): read path MUST be intercepted!
+            let read_err = store
+                .get_object_index(repo_a, &oblit_sha1_existing)
+                .await
+                .expect_err("AC2: get_object_index must fence obliterating OID");
+            assert!(
+                is_obliteration_fenced_error(&read_err),
+                "unexpected error: {read_err}"
+            );
+            let read_invoked = Arc::new(AtomicBool::new(false));
+            let read_invoked_c = Arc::clone(&read_invoked);
+            assert!(is_obliteration_fenced_error(
+                &store
+                    .run_fenced_object_read(
+                        &oblit_sha1_existing,
+                        Box::new(move || {
+                            read_invoked_c.store(true, Ordering::SeqCst);
+                            Ok(b"must-not-read".to_vec())
+                        }),
+                    )
+                    .await
+                    .expect_err("AC2: run_fenced_object_read must fence obliterating OID")
+            ));
+            assert!(
+                !read_invoked.load(Ordering::SeqCst),
+                "pre-check must reject tombstoned read without invoking payload loader"
+            );
+            // Un-indexed tombstoned OID must ALSO be fenced on read (not Ok(None)).
+            assert!(is_obliteration_fenced_error(
+                &store
+                    .get_object_index(repo_a, &oblit_sha256_unindexed)
+                    .await
+                    .expect_err("AC2: get_object_index must fence unindexed tombstoned OID")
+            ));
+            // Historical `object_index` address row is preserved for compliance/fsck.
+            assert!(
+                store
+                    .get_object_index_preserved_address(repo_a, &oblit_sha1_existing)
+                    .await
+                    .expect("preserved address read")
+                    .is_some()
+            );
+            // `list_object_index_by_repo` excludes tombstoned OIDs.
+            assert!(
+                !store
+                    .list_object_index_by_repo(repo_a, None)
+                    .await
+                    .expect("list repo_a excludes tombstoned")
+                    .iter()
+                    .any(|r| r.o_id == oblit_sha1_existing)
+            );
+
+            // AC3 (Obliterating state): write path MUST be intercepted atomically!
+            let fresh_live_oid = sha1_oid(99_001);
+            let poisoned_batch = vec![
+                ObjectIndexRecord {
+                    repo_id: repo_a.to_string(),
+                    o_id: fresh_live_oid.clone(),
+                    o_type: "blob".to_string(),
+                    o_size: 42,
+                    created_at: 1_795_372_000,
+                    is_synced: false,
+                },
+                ObjectIndexRecord {
+                    repo_id: repo_a.to_string(),
+                    o_id: oblit_sha1_existing.clone(),
+                    o_type: "blob".to_string(),
+                    o_size: 99,
+                    created_at: 1_795_372_001,
+                    is_synced: false,
+                },
+            ];
+            let write_err = store
+                .upsert_object_index_batch(&poisoned_batch)
+                .await
+                .expect_err("AC3: batch containing obliterating OID must fail");
+            assert!(
+                is_obliteration_fenced_error(&write_err),
+                "unexpected error: {write_err}"
+            );
+            // Zero partial writes: `fresh_live_oid` must NOT have been committed!
+            assert_eq!(
+                store
+                    .get_object_index(repo_a, &fresh_live_oid)
+                    .await
+                    .expect("verify atomic rollback"),
+                None
+            );
+            let write_invoked = Arc::new(AtomicBool::new(false));
+            let write_invoked_c = Arc::clone(&write_invoked);
+            assert!(is_obliteration_fenced_error(
+                &store
+                    .run_fenced_object_write(
+                        &ObjectIndexRecord {
+                            repo_id: repo_a.to_string(),
+                            o_id: oblit_sha256_unindexed.clone(),
+                            o_type: "blob".to_string(),
+                            o_size: 7,
+                            created_at: 1_795_372_002,
+                            is_synced: false,
+                        },
+                        Box::new(move || {
+                            write_invoked_c.store(true, Ordering::SeqCst);
+                            Ok(())
+                        }),
+                    )
+                    .await
+                    .expect_err("AC3: run_fenced_object_write must fence obliterating OID")
+            ));
+            assert!(
+                !write_invoked.load(Ordering::SeqCst),
+                "tombstoned write must fail before invoking payload writer"
+            );
+
+            // Obliterating -> Obliterated (idempotent).
+            let done_t1 = store
+                .mark_object_obliterated(
+                    &oblit_sha1_existing,
+                    ObjectHashKind::Sha1,
+                    "2026-11-22T18:05:00Z",
+                )
+                .await
+                .expect("finalize sha1 obliteration");
+            assert_eq!(done_t1.state, ObliterationState::Obliterated);
+            assert_eq!(
+                done_t1.payload_deleted_at.as_deref(),
+                Some("2026-11-22T18:05:00Z")
+            );
+            // Replay mark_object_obliterated keeps original payload_deleted_at.
+            let done_t1_replay = store
+                .mark_object_obliterated(
+                    &oblit_sha1_existing,
+                    ObjectHashKind::Sha1,
+                    "2026-11-22T19:00:00Z",
+                )
+                .await
+                .expect("idempotent finalize");
+            assert_eq!(done_t1_replay, done_t1);
+
+            // AC2 & AC3 (Obliterated state): read & write paths remain fenced permanently!
+            assert!(is_obliteration_fenced_error(
+                &store
+                    .get_object_index(repo_a, &oblit_sha1_existing)
+                    .await
+                    .expect_err("AC2: get_object_index fences obliterated OID")
+            ));
+            assert!(is_obliteration_fenced_error(
+                &store
+                    .run_fenced_object_read(
+                        &oblit_sha1_existing,
+                        Box::new(|| Ok(b"erased".to_vec())),
+                    )
+                    .await
+                    .expect_err("AC2: run_fenced_object_read fences obliterated OID")
+            ));
+            assert!(is_obliteration_fenced_error(
+                &store
+                    .run_fenced_object_write(
+                        &ObjectIndexRecord {
+                            repo_id: repo_a.to_string(),
+                            o_id: oblit_sha1_existing.clone(),
+                            o_type: "blob".to_string(),
+                            o_size: 12,
+                            created_at: 1_795_372_003,
+                            is_synced: false,
+                        },
+                        Box::new(|| Ok(())),
+                    )
+                    .await
+                    .expect_err("AC3: run_fenced_object_write fences obliterated OID")
+            ));
+            // `mark_object_index_synced` also fails atomically when an obliterated OID is included.
+            let sync_target_live = sha1_oid(20);
+            let sync_err = store
+                .mark_object_index_synced(
+                    repo_a,
+                    &[sync_target_live.clone(), oblit_sha1_existing.clone()],
+                )
+                .await
+                .expect_err("AC3: mark_object_index_synced fences obliterated OID");
+            assert!(is_obliteration_fenced_error(&sync_err));
+            assert!(
+                !store
+                    .get_object_index(repo_a, &sync_target_live)
+                    .await
+                    .expect("check rollback of live sync row")
+                    .expect("live row exists")
+                    .is_synced,
+                "AC3: failed mark_object_index_synced must leave zero partial updates"
+            );
+            assert!(
+                store
+                    .is_object_obliterated(&oblit_sha1_existing)
+                    .await
+                    .expect("is_oblit")
+            );
+            assert!(
+                !store
+                    .is_object_obliterated(&sha1_oid(20))
+                    .await
+                    .expect("live not oblit")
+            );
+        }
+
+        // Verify `RedbGitStore` `OBJECT_BY_PACK` also rolls back on obliteration fence
+        // and excludes tombstoned objects from pack reads.
+        let pack_rollback_err = redb_store
+            .upsert_object_index_batch_with_pack(
+                &[
+                    ObjectIndexRecord {
+                        repo_id: repo_a.to_string(),
+                        o_id: sha1_oid(5_099),
+                        o_type: "blob".to_string(),
+                        o_size: 10,
+                        created_at: 1_795_373_000,
+                        is_synced: false,
+                    },
+                    ObjectIndexRecord {
+                        repo_id: repo_a.to_string(),
+                        o_id: oblit_sha1_existing.clone(),
+                        o_type: "blob".to_string(),
+                        o_size: 10,
+                        created_at: 1_795_373_000,
+                        is_synced: false,
+                    },
+                ],
+                Some("pack-rollback"),
+            )
+            .await
+            .expect_err("pack upsert with obliterated OID must roll back");
+        assert!(is_obliteration_fenced_error(&pack_rollback_err));
+        assert!(
+            redb_store
+                .list_object_index_by_pack("pack-rollback", Some(repo_a))
+                .await
+                .expect("empty pack after rollback")
+                .is_empty()
+        );
+        // Tombstoning `pack_obj_b` hides it from `list_object_index_by_pack`.
+        redb_store
+            .begin_object_obliteration(&ObliterationRequest {
+                oid: pack_obj_b.o_id.clone(),
+                hash_kind: ObjectHashKind::Sha1,
+                reason: Some("pack-read-fence".to_string()),
+                actor: None,
+                approval_source: None,
+                recorded_at: "2026-11-22T18:06:00Z".to_string(),
+            })
+            .await
+            .expect("tombstone pack_obj_b");
+        assert!(
+            redb_store
+                .list_object_index_by_pack("pack-001", Some(repo_a))
+                .await
+                .expect("pack-001 excludes tombstoned object")
+                .is_empty()
+        );
+
+        // Mirror `pack_obj_b` tombstone onto SQLite too so global obliteration lists match 1:1.
+        sqlite_store
+            .begin_object_obliteration(&ObliterationRequest {
+                oid: pack_obj_b.o_id.clone(),
+                hash_kind: ObjectHashKind::Sha1,
+                reason: Some("pack-read-fence".to_string()),
+                actor: None,
+                approval_source: None,
+                recorded_at: "2026-11-22T18:06:00Z".to_string(),
+            })
+            .await
+            .expect("mirror tombstone on sqlite");
+
+        assert_eq!(
+            backends[0]
+                .list_incomplete_obliterations()
+                .await
+                .expect("sq incomplete"),
+            backends[1]
+                .list_incomplete_obliterations()
+                .await
+                .expect("rb incomplete"),
+        );
+        assert_eq!(
+            backends[0]
+                .list_obliterated_oids()
+                .await
+                .expect("sq oblit oids"),
+            backends[1]
+                .list_obliterated_oids()
+                .await
+                .expect("rb oblit oids"),
+        );
+        assert_eq!(
+            backends[0]
+                .get_object_obliteration(&oblit_sha1_existing)
+                .await
+                .expect("sq get oblit"),
+            backends[1]
+                .get_object_obliteration(&oblit_sha1_existing)
+                .await
+                .expect("rb get oblit"),
+        );
+
+        // ---------------------------------------------------------------------
+        // AC4: `notes` CRUD + CAS batch equivalence across SQLite and Redb.
+        // ---------------------------------------------------------------------
+        let notes_commits = "refs/notes/commits";
+        let notes_review = "refs/notes/review";
+        let obj1 = sha1_oid(101);
+        let obj2 = sha1_oid(102);
+        let obj3 = sha256_oid(103);
+        let blob1 = sha1_oid(201);
+        let blob2 = sha1_oid(202);
+        let blob3 = sha256_oid(203);
+
+        for store in &backends {
+            // Invalid notes ref rejected identically.
+            assert!(
+                store
+                    .put_note("refs/heads/main", &obj1, &blob1, false)
+                    .await
+                    .is_err()
+            );
+
+            assert_eq!(
+                store
+                    .put_note(notes_commits, &obj1, &blob1, false)
+                    .await
+                    .expect("insert note 1"),
+                NoteWriteOutcome::Inserted
+            );
+            assert_eq!(
+                store
+                    .put_note(notes_commits, &obj1, &blob2, false)
+                    .await
+                    .expect("conflict without overwrite"),
+                NoteWriteOutcome::AlreadyExists {
+                    existing_blob: blob1.clone()
+                }
+            );
+            assert_eq!(
+                store
+                    .put_note(notes_commits, &obj1, &blob2, true)
+                    .await
+                    .expect("overwrite note 1"),
+                NoteWriteOutcome::Replaced {
+                    previous_blob: blob1.clone()
+                }
+            );
+            assert_eq!(
+                store
+                    .put_note(notes_review, &obj3, &blob3, false)
+                    .await
+                    .expect("insert sha256 review note"),
+                NoteWriteOutcome::Inserted
+            );
+
+            // Atomic CAS batch conflict rolls back ALL earlier ops in the batch.
+            let conflict = store
+                .apply_notes_cas_batch(
+                    notes_commits,
+                    &[
+                        NoteCasOp::InsertIfAbsent {
+                            object: obj2.clone(),
+                            blob: blob1.clone(),
+                        },
+                        NoteCasOp::UpdateIfMatches {
+                            object: obj1.clone(),
+                            expected_blob: blob1.clone(), // stale! actual is blob2
+                            new_blob: blob3.clone(),
+                        },
+                    ],
+                )
+                .await
+                .expect("batch CAS conflict returns Ok(CasConflict)");
+            assert_eq!(
+                conflict,
+                NoteBatchOutcome::CasConflict {
+                    object: obj1.clone(),
+                    actual_blob: Some(blob2.clone()),
+                }
+            );
+            assert_eq!(
+                store
+                    .get_note(notes_commits, &obj2)
+                    .await
+                    .expect("obj2 rolled back"),
+                None
+            );
+
+            // Atomic CAS batch apply succeeds across insert + update.
+            let applied = store
+                .apply_notes_cas_batch(
+                    notes_commits,
+                    &[
+                        NoteCasOp::InsertIfAbsent {
+                            object: obj2.clone(),
+                            blob: blob1.clone(),
+                        },
+                        NoteCasOp::UpdateIfMatches {
+                            object: obj1.clone(),
+                            expected_blob: blob2.clone(),
+                            new_blob: blob3.clone(),
+                        },
+                    ],
+                )
+                .await
+                .expect("batch CAS apply");
+            assert_eq!(
+                applied,
+                NoteBatchOutcome::Applied {
+                    inserted: 1,
+                    updated: 1,
+                    deleted: 0,
+                }
+            );
+
+            // `remove_note_cas` respects expected_blob guard.
+            assert!(
+                !store
+                    .remove_note_cas(notes_commits, &obj2, Some(&blob2))
+                    .await
+                    .expect("cas mismatch remove")
+            );
+            assert!(
+                store
+                    .remove_note_cas(notes_commits, &obj2, Some(&blob1))
+                    .await
+                    .expect("cas match remove")
+            );
+        }
+
+        for r in [notes_commits, notes_review] {
+            assert_eq!(
+                backends[0].list_notes(r).await.expect("sq notes"),
+                backends[1].list_notes(r).await.expect("rb notes"),
+                "AC4: list_notes({r}) must match identically"
+            );
+        }
+
+        // ---------------------------------------------------------------------
+        // AC5: `revision_ordinal` & `revision_ordinal_meta` parity across
+        // SHA-1 (40-hex), SHA-256 (64-hex), and all-zero OIDs.
+        // ---------------------------------------------------------------------
+        let zero_sha1 = "0".repeat(40);
+        let zero_sha256 = "0".repeat(64);
+
+        let sha1_ref = "refs/heads/sha1-main";
+        let sha1_entries = vec![
+            (1, zero_sha1.clone()),
+            (2, sha1_oid(301)),
+            (3, sha1_oid(302)),
+        ];
+        let sha1_meta = RevisionOrdinalMeta {
+            ref_name: sha1_ref.to_string(),
+            tip_oid: sha1_oid(302),
+            replace_sig: "sig-v1".to_string(),
+            max_ordinal: 3,
+            built_at: "2026-11-22T18:10:00Z".to_string(),
+        };
+
+        let sha256_ref = "refs/heads/sha256-main";
+        let sha256_entries = vec![(1, sha256_oid(401)), (2, zero_sha256.clone())];
+        let sha256_meta = RevisionOrdinalMeta {
+            ref_name: sha256_ref.to_string(),
+            tip_oid: zero_sha256.clone(),
+            replace_sig: String::new(),
+            max_ordinal: 2,
+            built_at: "2026-11-22T18:11:00Z".to_string(),
+        };
+
+        let empty_zero_ref = "refs/heads/unborn-zero";
+        let empty_zero_meta = RevisionOrdinalMeta {
+            ref_name: empty_zero_ref.to_string(),
+            tip_oid: zero_sha1.clone(),
+            replace_sig: String::new(),
+            max_ordinal: 0,
+            built_at: "2026-11-22T18:12:00Z".to_string(),
+        };
+
+        for store in &backends {
+            store
+                .replace_revision_ordinals(&sha1_meta, &sha1_entries)
+                .await
+                .expect("replace sha1 ordinals");
+            store
+                .replace_revision_ordinals(&sha256_meta, &sha256_entries)
+                .await
+                .expect("replace sha256 ordinals");
+            store
+                .replace_revision_ordinals(&empty_zero_meta, &[])
+                .await
+                .expect("replace empty zero-oid meta");
+
+            // Stale replace_sig append returns Stale with zero writes.
+            let stale_meta = RevisionOrdinalMeta {
+                ref_name: sha1_ref.to_string(),
+                tip_oid: sha1_oid(303),
+                replace_sig: "sig-v2".to_string(),
+                max_ordinal: 4,
+                built_at: "2026-11-22T18:13:00Z".to_string(),
+            };
+            let stale_out = store
+                .append_revision_ordinals(
+                    sha1_ref,
+                    &sha1_oid(302),
+                    "sig-v2",
+                    &stale_meta,
+                    &[sha1_oid(303)],
+                )
+                .await
+                .expect("stale append returns Ok(Stale)");
+            assert_eq!(
+                stale_out,
+                RevisionOrdinalAppendOutcome::Stale {
+                    actual: Some(sha1_meta.clone())
+                }
+            );
+
+            // Matching fast-forward append advances max_ordinal 3 -> 5 atomically.
+            let ff_meta = RevisionOrdinalMeta {
+                ref_name: sha1_ref.to_string(),
+                tip_oid: sha1_oid(304),
+                replace_sig: "sig-v1".to_string(),
+                max_ordinal: 5,
+                built_at: "2026-11-22T18:14:00Z".to_string(),
+            };
+            let ff_out = store
+                .append_revision_ordinals(
+                    sha1_ref,
+                    &sha1_oid(302),
+                    "sig-v1",
+                    &ff_meta,
+                    &[sha1_oid(303), sha1_oid(304)],
+                )
+                .await
+                .expect("fast-forward append");
+            assert_eq!(
+                ff_out,
+                RevisionOrdinalAppendOutcome::Applied {
+                    meta: ff_meta.clone()
+                }
+            );
+
+            // Duplicate OID in append must fail closed leaving rows untouched!
+            let dup_meta = RevisionOrdinalMeta {
+                ref_name: sha1_ref.to_string(),
+                tip_oid: sha1_oid(301),
+                replace_sig: "sig-v1".to_string(),
+                max_ordinal: 6,
+                built_at: "2026-11-22T18:15:00Z".to_string(),
+            };
+            assert!(
+                store
+                    .append_revision_ordinals(
+                        sha1_ref,
+                        &sha1_oid(304),
+                        "sig-v1",
+                        &dup_meta,
+                        &[sha1_oid(301)],
+                    )
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                store
+                    .count_revision_ordinals(sha1_ref)
+                    .await
+                    .expect("count after dup"),
+                5
+            );
+
+            // Full rebuild shrinking `sha256_ref` must clear stale reverse-index entries.
+            let rebuilt_sha256_meta = RevisionOrdinalMeta {
+                ref_name: sha256_ref.to_string(),
+                tip_oid: zero_sha256.clone(),
+                replace_sig: "sig-rebuilt".to_string(),
+                max_ordinal: 1,
+                built_at: "2026-11-22T18:16:00Z".to_string(),
+            };
+            store
+                .replace_revision_ordinals(&rebuilt_sha256_meta, &[(1, zero_sha256.clone())])
+                .await
+                .expect("rebuild sha256 ref");
+            assert_eq!(
+                store
+                    .find_revision_ordinal_by_oid(sha256_ref, &sha256_oid(401))
+                    .await
+                    .expect("old oid cleared from reverse index"),
+                None
+            );
+            assert_eq!(
+                store
+                    .find_revision_ordinal_by_oid(sha256_ref, &zero_sha256)
+                    .await
+                    .expect("all-zero sha256 reverse lookup"),
+                Some(1)
+            );
+            assert_eq!(
+                store
+                    .find_revision_oid_by_ordinal(sha1_ref, 1)
+                    .await
+                    .expect("all-zero sha1 forward lookup"),
+                Some(zero_sha1.clone())
+            );
+            assert_eq!(
+                store
+                    .find_revision_ordinal_by_oid(sha1_ref, &zero_sha1)
+                    .await
+                    .expect("all-zero sha1 reverse lookup"),
+                Some(1)
+            );
+
+            // Prune `empty_zero_ref`, keeping `sha1_ref` and `sha256_ref`.
+            let pruned = store
+                .prune_revision_ordinals_except(&[sha1_ref.to_string(), sha256_ref.to_string()])
+                .await
+                .expect("prune missing refs");
+            assert_eq!(pruned, 1);
+            assert_eq!(
+                store
+                    .get_revision_ordinal_meta(empty_zero_ref)
+                    .await
+                    .expect("pruned meta gone"),
+                None
+            );
+        }
+
+        // Exact final parity assertions across all revision ordinal queries.
+        assert_eq!(
+            backends[0]
+                .list_revision_ordinal_metas()
+                .await
+                .expect("sq metas"),
+            backends[1]
+                .list_revision_ordinal_metas()
+                .await
+                .expect("rb metas"),
+        );
+        for ref_name in [sha1_ref, sha256_ref] {
+            assert_eq!(
+                backends[0]
+                    .list_revision_ordinals(ref_name)
+                    .await
+                    .expect("sq ordinals"),
+                backends[1]
+                    .list_revision_ordinals(ref_name)
+                    .await
+                    .expect("rb ordinals"),
+                "AC5: revision_ordinal rows for {ref_name} must match identically"
+            );
+            assert_eq!(
+                backends[0]
+                    .count_revision_ordinals(ref_name)
+                    .await
+                    .expect("sq count"),
+                backends[1]
+                    .count_revision_ordinals(ref_name)
+                    .await
+                    .expect("rb count"),
+            );
+        }
+
+        // ---------------------------------------------------------------------
+        // Contested obliteration interleavings on BOTH SQLite and Redb (separate
+        // store handles): verifies race-free `run_fenced_object_read` and
+        // mutually-exclusive `run_fenced_object_write`.
+        // ---------------------------------------------------------------------
+        let sqlite_peer = SqliteGitStore::open(&sqlite_path)
+            .await
+            .expect("open second SqliteGitStore handle");
+        let redb_peer =
+            RedbGitStore::open_read_write(&redb_path).expect("open second RedbGitStore handle");
+        let peer_pairs: [(Arc<dyn GitStore>, Arc<dyn GitStore>); 2] = [
+            (Arc::clone(&backends[0]), Arc::new(sqlite_peer)),
+            (Arc::clone(&backends[1]), Arc::new(redb_peer)),
+        ];
+
+        for (idx, (primary, peer)) in peer_pairs.iter().enumerate() {
+            let base = u64::try_from(70_000 + idx * 100).expect("fits u64");
+
+            // (a) Contested read interleaving: tombstone commits AFTER pre-check
+            // and BEFORE `read_payload` returns `Ok(secret)` -> post-check MUST
+            // discard the payload bytes and return `obliteration_fenced_read_error`.
+            let race_read_oid = sha1_oid(base + 1);
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+            let (tombstoned_tx, tombstoned_rx) = std::sync::mpsc::channel::<()>();
+            let peer_for_read = Arc::clone(peer);
+            let oid_for_tomb = race_read_oid.clone();
+            let oblit_task = tokio::spawn(async move {
+                entered_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("read_payload entered");
+                peer_for_read
+                    .begin_object_obliteration(&ObliterationRequest {
+                        oid: oid_for_tomb,
+                        hash_kind: ObjectHashKind::Sha1,
+                        reason: Some("contested-read-race".to_string()),
+                        actor: None,
+                        approval_source: None,
+                        recorded_at: "2026-11-22T18:30:00Z".to_string(),
+                    })
+                    .await
+                    .expect("commit tombstone during payload read");
+                tombstoned_tx.send(()).expect("signal tombstone committed");
+            });
+            let raced_read_err = primary
+                .run_fenced_object_read(
+                    &race_read_oid,
+                    Box::new(move || {
+                        entered_tx.send(()).expect("signal read entered");
+                        tombstoned_rx
+                            .recv_timeout(std::time::Duration::from_secs(5))
+                            .expect("tombstone committed before read returns");
+                        Ok(b"sensitive-erased-payload".to_vec())
+                    }),
+                )
+                .await
+                .expect_err("contested read must discard bytes and fail closed");
+            oblit_task.await.expect("join read-race oblit task");
+            assert!(
+                is_obliteration_fenced_error(&raced_read_err),
+                "contested read must return obliteration fence error: {raced_read_err}"
+            );
+
+            // (b) Contested read interleaving when payload returns `NotFound`
+            // after concurrent unlink -> post-check overrides with obliteration fence error.
+            let race_read_miss_oid = sha1_oid(base + 2);
+            let (entered_tx2, entered_rx2) = std::sync::mpsc::channel::<()>();
+            let (tombstoned_tx2, tombstoned_rx2) = std::sync::mpsc::channel::<()>();
+            let peer_for_miss = Arc::clone(peer);
+            let oid_for_miss = race_read_miss_oid.clone();
+            let oblit_miss_task = tokio::spawn(async move {
+                entered_rx2
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("read_payload miss entered");
+                peer_for_miss
+                    .begin_object_obliteration(&ObliterationRequest {
+                        oid: oid_for_miss,
+                        hash_kind: ObjectHashKind::Sha1,
+                        reason: Some("contested-read-unlink".to_string()),
+                        actor: None,
+                        approval_source: None,
+                        recorded_at: "2026-11-22T18:30:30Z".to_string(),
+                    })
+                    .await
+                    .expect("commit tombstone before NotFound");
+                tombstoned_tx2.send(()).expect("signal miss tombstone");
+            });
+            let miss_err = primary
+                .run_fenced_object_read(
+                    &race_read_miss_oid,
+                    Box::new(move || {
+                        entered_tx2.send(()).expect("signal miss read entered");
+                        tombstoned_rx2
+                            .recv_timeout(std::time::Duration::from_secs(5))
+                            .expect("miss tombstone committed");
+                        Err(StorageBackendError::NotFound {
+                            resource: "loose payload unlinked".to_string(),
+                        })
+                    }),
+                )
+                .await
+                .expect_err("post-unlink NotFound must surface obliteration fence error");
+            oblit_miss_task.await.expect("join miss oblit task");
+            assert!(
+                is_obliteration_fenced_error(&miss_err),
+                "expected obliteration fence error over NotFound, got: {miss_err}"
+            );
+
+            // (c) Contested write interleaving: `run_fenced_object_write` holds
+            // the exclusive write transaction across `write_payload` + index
+            // registration, serializing any concurrent `begin_object_obliteration`
+            // strictly AFTER the write commits; subsequent fenced writes fail
+            // closed without invoking `write_payload`.
+            let race_write_oid = sha1_oid(base + 3);
+            let timeline = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+            let (write_entered_tx, write_entered_rx) = std::sync::mpsc::channel::<()>();
+            let peer_for_write = Arc::clone(peer);
+            let oid_for_write_oblit = race_write_oid.clone();
+            let timeline_oblit = Arc::clone(&timeline);
+            let oblit_write_task = tokio::spawn(async move {
+                write_entered_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("write_payload entered");
+                peer_for_write
+                    .begin_object_obliteration(&ObliterationRequest {
+                        oid: oid_for_write_oblit,
+                        hash_kind: ObjectHashKind::Sha1,
+                        reason: Some("contested-write-race".to_string()),
+                        actor: None,
+                        approval_source: None,
+                        recorded_at: "2026-11-22T18:31:00Z".to_string(),
+                    })
+                    .await
+                    .expect("tombstone completes strictly after fenced write commits");
+                timeline_oblit
+                    .lock()
+                    .expect("lock timeline")
+                    .push("oblit_done");
+            });
+            let timeline_writer = Arc::clone(&timeline);
+            let write_rec = ObjectIndexRecord {
+                repo_id: repo_a.to_string(),
+                o_id: race_write_oid.clone(),
+                o_type: "blob".to_string(),
+                o_size: 512,
+                created_at: 1_795_375_000,
+                is_synced: false,
+            };
+            primary
+                .run_fenced_object_write(
+                    &write_rec,
+                    Box::new(move || {
+                        timeline_writer
+                            .lock()
+                            .expect("lock timeline")
+                            .push("write_start");
+                        write_entered_tx.send(()).expect("signal write entered");
+                        std::thread::sleep(std::time::Duration::from_millis(120));
+                        timeline_writer
+                            .lock()
+                            .expect("lock timeline")
+                            .push("write_end");
+                        Ok(())
+                    }),
+                )
+                .await
+                .expect("first fenced write succeeds before concurrent tombstone");
+            oblit_write_task.await.expect("join write-race oblit task");
+            assert_eq!(
+                *timeline.lock().expect("lock timeline"),
+                vec!["write_start", "write_end", "oblit_done"],
+                "begin_object_obliteration must serialize strictly after run_fenced_object_write"
+            );
+            // Subsequent fenced write against the now-tombstoned OID must fail
+            // closed before invoking `write_payload`.
+            let second_write_invoked = Arc::new(AtomicBool::new(false));
+            let second_write_invoked_c = Arc::clone(&second_write_invoked);
+            let second_write_err = primary
+                .run_fenced_object_write(
+                    &write_rec,
+                    Box::new(move || {
+                        second_write_invoked_c.store(true, Ordering::SeqCst);
+                        Ok(())
+                    }),
+                )
+                .await
+                .expect_err("post-obliteration fenced write must fail closed");
+            assert!(is_obliteration_fenced_error(&second_write_err));
+            assert!(
+                !second_write_invoked.load(Ordering::SeqCst),
+                "post-obliteration write_payload must never run"
+            );
+
+            // (d) Cancelled writer safety on BOTH SQLite and Redb: aborting the
+            // caller's `run_fenced_object_write` future while `write_payload` is
+            // still running MUST keep the DB write-lock fence held until
+            // `write_payload` exits, then roll back the transaction before any
+            // concurrent `begin_object_obliteration` can commit.
+            let cancel_oid = sha1_oid(base + 4);
+            let cancel_timeline = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+            let (cancel_entered_tx, cancel_entered_rx) = std::sync::mpsc::channel::<()>();
+            let (cancel_release_tx, cancel_release_rx) = std::sync::mpsc::channel::<()>();
+            let cancel_rec = ObjectIndexRecord {
+                repo_id: repo_a.to_string(),
+                o_id: cancel_oid.clone(),
+                o_type: "blob".to_string(),
+                o_size: 64,
+                created_at: 1_795_375_100,
+                is_synced: false,
+            };
+            let primary_for_cancel = Arc::clone(primary);
+            let cancel_rec_for_task = cancel_rec.clone();
+            let cancel_timeline_writer = Arc::clone(&cancel_timeline);
+            let cancel_write_task = tokio::spawn(async move {
+                primary_for_cancel
+                    .run_fenced_object_write(
+                        &cancel_rec_for_task,
+                        Box::new(move || {
+                            cancel_timeline_writer
+                                .lock()
+                                .expect("lock cancel timeline")
+                                .push("cancel_write_entered");
+                            cancel_entered_tx
+                                .send(())
+                                .expect("signal cancel writer entered");
+                            cancel_release_rx
+                                .recv_timeout(std::time::Duration::from_secs(5))
+                                .expect("wait for cancel writer release");
+                            cancel_timeline_writer
+                                .lock()
+                                .expect("lock cancel timeline")
+                                .push("cancel_write_exited");
+                            Ok(())
+                        }),
+                    )
+                    .await
+            });
+
+            cancel_entered_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("paused writer entered payload callback");
+            // Cancel/drop the caller future while `write_payload` is still paused.
+            cancel_write_task.abort();
+            let _ = cancel_write_task.await;
+
+            // Start concurrent obliteration on peer handle; it MUST remain
+            // blocked while the detached payload writer still holds the fence.
+            let peer_for_cancel = Arc::clone(peer);
+            let cancel_oid_for_oblit = cancel_oid.clone();
+            let cancel_timeline_oblit = Arc::clone(&cancel_timeline);
+            let mut cancel_oblit_task = tokio::spawn(async move {
+                peer_for_cancel
+                    .begin_object_obliteration(&ObliterationRequest {
+                        oid: cancel_oid_for_oblit,
+                        hash_kind: ObjectHashKind::Sha1,
+                        reason: Some("cancelled-writer-fence".to_string()),
+                        actor: None,
+                        approval_source: None,
+                        recorded_at: "2026-11-22T18:32:00Z".to_string(),
+                    })
+                    .await
+                    .expect("obliteration commits after cancelled writer exits");
+                cancel_timeline_oblit
+                    .lock()
+                    .expect("lock cancel timeline")
+                    .push("cancel_oblit_done");
+            });
+
+            assert!(
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(120),
+                    &mut cancel_oblit_task,
+                )
+                .await
+                .is_err(),
+                "obliteration must stay blocked while cancelled writer's payload task is still running"
+            );
+
+            // Release the paused writer; it must roll back its transaction and
+            // only then let `begin_object_obliteration` commit.
+            cancel_release_tx
+                .send(())
+                .expect("release paused cancelled writer");
+            cancel_oblit_task
+                .await
+                .expect("join cancel-case oblit task");
+            assert_eq!(
+                *cancel_timeline.lock().expect("lock cancel timeline"),
+                vec![
+                    "cancel_write_entered",
+                    "cancel_write_exited",
+                    "cancel_oblit_done",
+                ],
+                "cancelled writer must hold fence until payload exit before obliteration commits"
+            );
+            assert_eq!(
+                primary
+                    .get_object_index_preserved_address(repo_a, &cancel_oid)
+                    .await
+                    .expect("cancelled writer must roll back object_index row"),
+                None
+            );
+            assert!(
+                primary
+                    .is_object_obliterated(&cancel_oid)
+                    .await
+                    .expect("tombstone persisted after cancelled writer rollback")
+            );
+        }
+
+        // (e) Runtime-shutdown fence safety on BOTH SQLite and Redb: pausing
+        // `write_payload` inside a dedicated Tokio runtime and calling
+        // `shutdown_background()` MUST keep the DB write-lock fence held until
+        // `write_payload` exits before a concurrent obliteration on another
+        // handle/runtime can commit.
+        for is_redb in [false, true] {
+            let sd_oid = sha1_oid(if is_redb { 71_002 } else { 71_001 });
+            let sd_timeline = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+            let (sd_entered_tx, sd_entered_rx) = std::sync::mpsc::channel::<()>();
+            let (sd_release_tx, sd_release_rx) = std::sync::mpsc::channel::<()>();
+            let sd_rec = ObjectIndexRecord {
+                repo_id: repo_a.to_string(),
+                o_id: sd_oid.clone(),
+                o_type: "blob".to_string(),
+                o_size: 80,
+                created_at: 1_795_375_200,
+                is_synced: false,
+            };
+
+            let ephemeral_rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .expect("build ephemeral runtime");
+            let sd_timeline_writer = Arc::clone(&sd_timeline);
+            let sd_rec_clone = sd_rec.clone();
+            let sqlite_path_clone = sqlite_path.clone();
+            let redb_path_clone = redb_path.clone();
+            ephemeral_rt.spawn(async move {
+                let writer_store: Arc<dyn GitStore> = if is_redb {
+                    Arc::new(
+                        RedbGitStore::open_read_write(&redb_path_clone)
+                            .expect("open redb store for shutdown test"),
+                    )
+                } else {
+                    Arc::new(
+                        SqliteGitStore::open(&sqlite_path_clone)
+                            .await
+                            .expect("open sqlite store for shutdown test"),
+                    )
+                };
+                let _ = writer_store
+                    .run_fenced_object_write(
+                        &sd_rec_clone,
+                        Box::new(move || {
+                            sd_timeline_writer
+                                .lock()
+                                .expect("lock shutdown timeline")
+                                .push("shutdown_write_entered");
+                            sd_entered_tx
+                                .send(())
+                                .expect("signal shutdown writer entered");
+                            sd_release_rx
+                                .recv_timeout(std::time::Duration::from_secs(5))
+                                .expect("wait for shutdown writer release");
+                            sd_timeline_writer
+                                .lock()
+                                .expect("lock shutdown timeline")
+                                .push("shutdown_write_exited");
+                            Ok(())
+                        }),
+                    )
+                    .await;
+            });
+
+            sd_entered_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("ephemeral writer entered payload callback");
+            // Shut down the originating runtime in the background while the
+            // blocking payload callback is still paused.
+            ephemeral_rt.shutdown_background();
+
+            let observer_store: Arc<dyn GitStore> = if is_redb {
+                Arc::clone(&backends[1])
+            } else {
+                Arc::clone(&backends[0])
+            };
+            let oblit_store = Arc::clone(&observer_store);
+            let sd_oid_oblit = sd_oid.clone();
+            let sd_timeline_oblit = Arc::clone(&sd_timeline);
+            let mut sd_oblit_task = tokio::spawn(async move {
+                oblit_store
+                    .begin_object_obliteration(&ObliterationRequest {
+                        oid: sd_oid_oblit,
+                        hash_kind: ObjectHashKind::Sha1,
+                        reason: Some("runtime-shutdown-fence".to_string()),
+                        actor: None,
+                        approval_source: None,
+                        recorded_at: "2026-11-22T18:33:00Z".to_string(),
+                    })
+                    .await
+                    .expect("obliteration commits after paused writer exits");
+                sd_timeline_oblit
+                    .lock()
+                    .expect("lock shutdown timeline")
+                    .push("shutdown_oblit_done");
+            });
+
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(120), &mut sd_oblit_task,)
+                    .await
+                    .is_err(),
+                "obliteration must stay blocked across runtime shutdown until payload callback exits (is_redb={is_redb})"
+            );
+
+            sd_release_tx
+                .send(())
+                .expect("release paused writer after runtime shutdown");
+            sd_oblit_task
+                .await
+                .expect("join runtime-shutdown oblit task");
+            assert_eq!(
+                *sd_timeline.lock().expect("lock shutdown timeline"),
+                vec![
+                    "shutdown_write_entered",
+                    "shutdown_write_exited",
+                    "shutdown_oblit_done",
+                ],
+                "fence must remain held through runtime shutdown until payload exits (is_redb={is_redb})"
+            );
+            assert_eq!(
+                observer_store
+                    .get_object_index_preserved_address(repo_a, &sd_oid)
+                    .await
+                    .expect("abandoned writer row must not commit"),
+                None
+            );
+            assert!(
+                observer_store
+                    .is_object_obliterated(&sd_oid)
+                    .await
+                    .expect("tombstone persisted after abandoned writer exited")
+            );
+        }
+
+        // ---------------------------------------------------------------------
+        // RB-04 -> RB-04b backward-compatible reopening & safe upgrade test on
+        // RedbGitStore:
+        // 1. A 5-table RB-04 store opens cleanly read-only (serving refs/reflog
+        //    and empty RB-04b reads without mutating disk).
+        // 2. A corrupt 6-table partial store (object_index without
+        //    object_obliteration) fails closed on BOTH read-only & writable open.
+        // 3. Writable open of the 5-table RB-04 store safely upgrades to all 12
+        //    tables while preserving seeded refs/reflogs and enabling RB-04b writes.
+        // ---------------------------------------------------------------------
+        let legacy_path = dir.path().join("legacy_rb04.redb");
+        let legacy_seed_oid = sha1_oid(888);
+        RedbGitStore::create_legacy_rb04_five_table_store_for_test(
+            &legacy_path,
+            &legacy_seed_oid,
+            false,
+        )
+        .expect("create legacy 5-table RB-04 store");
+
+        let legacy_ro = RedbGitStore::open_read_only(&legacy_path)
+            .expect("legacy 5-table RB-04 store must open read-only");
+        let main_key = RefKey::LocalBranch {
+            name: "main".to_string(),
+        };
+        assert_eq!(
+            legacy_ro.get_ref(&main_key).await.expect("read legacy ref"),
+            Some(RefTarget::Direct(legacy_seed_oid.clone()))
+        );
+        assert_eq!(
+            legacy_ro
+                .list_reflog("refs/heads/main", None, None)
+                .await
+                .expect("read legacy reflog")
+                .len(),
+            1
+        );
+        // Uninitialized RB-04b tables answer cleanly as empty on read-only open.
+        assert_eq!(
+            legacy_ro
+                .get_object_index(repo_a, &legacy_seed_oid)
+                .await
+                .expect("legacy ro object_index"),
+            None
+        );
+        assert!(
+            legacy_ro
+                .list_object_index_by_repo(repo_a, None)
+                .await
+                .expect("legacy ro list object_index")
+                .is_empty()
+        );
+        assert!(
+            legacy_ro
+                .list_object_index_by_pack("pack-001", None)
+                .await
+                .expect("legacy ro list pack")
+                .is_empty()
+        );
+        assert_eq!(
+            legacy_ro
+                .get_object_obliteration(&legacy_seed_oid)
+                .await
+                .expect("legacy ro oblit"),
+            None
+        );
+        assert!(
+            legacy_ro
+                .list_incomplete_obliterations()
+                .await
+                .expect("legacy ro incomplete")
+                .is_empty()
+        );
+        assert!(
+            legacy_ro
+                .list_obliterated_oids()
+                .await
+                .expect("legacy ro oblit oids")
+                .is_empty()
+        );
+        assert_eq!(
+            legacy_ro
+                .get_note("refs/notes/commits", &legacy_seed_oid)
+                .await
+                .expect("legacy ro get note"),
+            None
+        );
+        assert!(
+            legacy_ro
+                .list_notes("refs/notes/commits")
+                .await
+                .expect("legacy ro list notes")
+                .is_empty()
+        );
+        assert_eq!(
+            legacy_ro
+                .get_revision_ordinal_meta("refs/heads/main")
+                .await
+                .expect("legacy ro ordinal meta"),
+            None
+        );
+        assert!(
+            legacy_ro
+                .list_revision_ordinal_metas()
+                .await
+                .expect("legacy ro list metas")
+                .is_empty()
+        );
+        assert_eq!(
+            legacy_ro
+                .find_revision_oid_by_ordinal("refs/heads/main", 1)
+                .await
+                .expect("legacy ro find by ord"),
+            None
+        );
+        assert_eq!(
+            legacy_ro
+                .find_revision_ordinal_by_oid("refs/heads/main", &legacy_seed_oid)
+                .await
+                .expect("legacy ro find by oid"),
+            None
+        );
+        assert!(
+            legacy_ro
+                .list_revision_ordinals("refs/heads/main")
+                .await
+                .expect("legacy ro list ordinals")
+                .is_empty()
+        );
+        assert_eq!(
+            legacy_ro
+                .count_revision_ordinals("refs/heads/main")
+                .await
+                .expect("legacy ro count ordinals"),
+            0
+        );
+        drop(legacy_ro);
+
+        // Corrupt partial-schema store (object_index present without object_obliteration)
+        // must fail closed on BOTH read-only and writable open.
+        let corrupt_partial_path = dir.path().join("corrupt_partial_rb04b.redb");
+        RedbGitStore::create_legacy_rb04_five_table_store_for_test(
+            &corrupt_partial_path,
+            &legacy_seed_oid,
+            true,
+        )
+        .expect("create corrupt partial 6-table store");
+        assert!(
+            RedbGitStore::open_read_only(&corrupt_partial_path).is_err(),
+            "partial RB-04b schema missing object_obliteration must fail closed read-only"
+        );
+        assert!(
+            RedbGitStore::open_read_write(&corrupt_partial_path).is_err(),
+            "partial RB-04b schema missing object_obliteration must fail closed read-write"
+        );
+
+        // Safe writable upgrade of the valid 5-table RB-04 store to all 12 tables.
+        let upgraded_rw = RedbGitStore::open_read_write(&legacy_path)
+            .expect("writable open must safely upgrade 5-table RB-04 store");
+        assert_eq!(
+            upgraded_rw
+                .get_ref(&main_key)
+                .await
+                .expect("preserved ref after upgrade"),
+            Some(RefTarget::Direct(legacy_seed_oid.clone()))
+        );
+        assert_eq!(
+            upgraded_rw
+                .list_reflog("refs/heads/main", None, None)
+                .await
+                .expect("preserved reflog after upgrade")
+                .len(),
+            1
+        );
+        upgraded_rw
+            .upsert_object_index_batch(&[ObjectIndexRecord {
+                repo_id: repo_a.to_string(),
+                o_id: legacy_seed_oid.clone(),
+                o_type: "commit".to_string(),
+                o_size: 256,
+                created_at: 1_795_376_000,
+                is_synced: false,
+            }])
+            .await
+            .expect("RB-04b write succeeds on upgraded store");
+        assert_eq!(
+            upgraded_rw
+                .put_note(
+                    "refs/notes/commits",
+                    &legacy_seed_oid,
+                    &sha1_oid(889),
+                    false
+                )
+                .await
+                .expect("notes write succeeds on upgraded store"),
+            NoteWriteOutcome::Inserted
+        );
+        drop(upgraded_rw);
+
+        let upgraded_ro =
+            RedbGitStore::open_read_only(&legacy_path).expect("reopen upgraded store read-only");
+        assert!(
+            upgraded_ro
+                .get_object_index(repo_a, &legacy_seed_oid)
+                .await
+                .expect("read upgraded object_index")
+                .is_some()
+        );
+    }
+
+    /// `RB-04b` single-feature SQLite regression smoke test covering
+    /// `object_index` batch upsert, `object_obliteration` read/write fences,
+    /// `notes`, and `revision_ordinal` + `revision_ordinal_meta` without
+    /// requiring `storage-redb`.
+    #[cfg(feature = "storage-sqlite")]
+    #[tokio::test]
+    async fn sqlite_object_index_and_obliteration_smoke() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("create sqlite RB-04b smoke tempdir");
+        let store = SqliteGitStore::create(dir.path().join("libra.db"))
+            .await
+            .expect("create SqliteGitStore");
+        assert_eq!(store.backend(), StorageBackendKind::Sqlite);
+
+        let repo_id = "sqlite-smoke-repo";
+        let records: Vec<ObjectIndexRecord> = (1u64..=1_000)
+            .map(|n| ObjectIndexRecord {
+                repo_id: repo_id.to_string(),
+                o_id: sha1_oid(n),
+                o_type: "blob".to_string(),
+                o_size: i64::try_from(n).expect("fits i64"),
+                created_at: 1_795_380_000,
+                is_synced: false,
+            })
+            .collect();
+        store
+            .upsert_object_index_batch(&records)
+            .await
+            .expect("upsert 1,000 rows");
+        store
+            .upsert_object_index_batch(&records)
+            .await
+            .expect("idempotent re-upsert");
+        assert_eq!(
+            store
+                .list_object_index_by_repo(repo_id, None)
+                .await
+                .expect("list 1,000 rows")
+                .len(),
+            1_000
+        );
+
+        // Obliteration fence blocks both read and write paths.
+        let target = sha1_oid(42);
+        store
+            .begin_object_obliteration(&ObliterationRequest {
+                oid: target.clone(),
+                hash_kind: ObjectHashKind::Sha1,
+                reason: Some("smoke".to_string()),
+                actor: None,
+                approval_source: None,
+                recorded_at: "2026-11-22T18:20:00Z".to_string(),
+            })
+            .await
+            .expect("begin obliteration");
+        assert!(is_obliteration_fenced_error(
+            &store
+                .get_object_index(repo_id, &target)
+                .await
+                .expect_err("read fenced")
+        ));
+        assert!(is_obliteration_fenced_error(
+            &store
+                .upsert_object_index_batch(&[ObjectIndexRecord {
+                    repo_id: repo_id.to_string(),
+                    o_id: target.clone(),
+                    o_type: "blob".to_string(),
+                    o_size: 1,
+                    created_at: 1_795_380_001,
+                    is_synced: false,
+                }])
+                .await
+                .expect_err("write fenced")
+        ));
+        store
+            .mark_object_obliterated(&target, ObjectHashKind::Sha1, "2026-11-22T18:21:00Z")
+            .await
+            .expect("mark obliterated");
+        let read_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let read_called_clone = std::sync::Arc::clone(&read_called);
+        assert!(is_obliteration_fenced_error(
+            &store
+                .run_fenced_object_read(
+                    &target,
+                    Box::new(move || {
+                        read_called_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+                        Ok(b"should-not-run".to_vec())
+                    }),
+                )
+                .await
+                .expect_err("fenced read blocked")
+        ));
+        assert!(!read_called.load(std::sync::atomic::Ordering::SeqCst));
+
+        let write_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let write_called_clone = std::sync::Arc::clone(&write_called);
+        assert!(is_obliteration_fenced_error(
+            &store
+                .run_fenced_object_write(
+                    &ObjectIndexRecord {
+                        repo_id: repo_id.to_string(),
+                        o_id: target.clone(),
+                        o_type: "blob".to_string(),
+                        o_size: 1,
+                        created_at: 1_795_380_002,
+                        is_synced: false,
+                    },
+                    Box::new(move || {
+                        write_called_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+                        Ok(())
+                    }),
+                )
+                .await
+                .expect_err("fenced write blocked")
+        ));
+        assert!(!write_called.load(std::sync::atomic::Ordering::SeqCst));
+
+        // Notes & revision_ordinal smoke (including all-zero SHA-256 OID).
+        let zero256 = "0".repeat(64);
+        assert_eq!(
+            store
+                .put_note("refs/notes/commits", &sha1_oid(1), &sha1_oid(2), false)
+                .await
+                .expect("put note"),
+            NoteWriteOutcome::Inserted
+        );
+        assert_eq!(
+            store
+                .list_notes("refs/notes/commits")
+                .await
+                .expect("list notes")
+                .len(),
+            1
+        );
+        let meta = RevisionOrdinalMeta {
+            ref_name: "refs/heads/main".to_string(),
+            tip_oid: zero256.clone(),
+            replace_sig: String::new(),
+            max_ordinal: 1,
+            built_at: "2026-11-22T18:22:00Z".to_string(),
+        };
+        store
+            .replace_revision_ordinals(&meta, &[(1, zero256.clone())])
+            .await
+            .expect("replace ordinals");
+        assert_eq!(
+            store
+                .find_revision_oid_by_ordinal("refs/heads/main", 1)
+                .await
+                .expect("forward lookup"),
+            Some(zero256.clone())
+        );
+        assert_eq!(
+            store
+                .find_revision_ordinal_by_oid("refs/heads/main", &zero256)
+                .await
+                .expect("reverse lookup"),
+            Some(1)
         );
     }
 }

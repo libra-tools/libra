@@ -1,15 +1,22 @@
-//! SQLite implementation of [`GitStore`] (`RB-04`).
+//! SQLite implementation of [`GitStore`] (`RB-04`, `RB-04b`).
 //!
 //! Operates directly against the canonical repository SQLite tables
-//! (`reference`, `reflog`, and `agent_bridge_publication`) inside single
-//! `BEGIN IMMEDIATE` write transactions (`begin_write_transaction`).
+//! (`reference`, `reflog`, `object_index`, `object_obliteration`, `notes`,
+//! `revision_ordinal`, `revision_ordinal_meta`, and `agent_bridge_publication`)
+//! inside single `BEGIN IMMEDIATE` write transactions (`begin_write_transaction`).
 
-use std::{path::Path, time::Duration};
+use std::{
+    collections::BTreeSet,
+    path::Path,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectOptions, ConnectionTrait, Database,
     DatabaseConnection, EntityTrait, ModelTrait, QueryFilter, QueryOrder, QuerySelect, Statement,
+    Value,
 };
 
 use crate::{
@@ -28,10 +35,17 @@ use crate::{
         backend::StorageBackendKind,
         error::{StorageBackendError, StorageResult},
         git_store::{
-            BridgePublicationPhase, BridgePublicationRecord, GitStore, REFLOG_HEAD_REF_NAME,
+            BridgePublicationPhase, BridgePublicationRecord, GitStore, NoteBatchOutcome, NoteCasOp,
+            NoteRecord, NoteWriteOutcome, ObjectHashKind, ObjectIndexRecord,
+            ObjectObliterationRecord, ObliterationRequest, ObliterationState, REFLOG_HEAD_REF_NAME,
             RefCasOutcome, RefKey, RefRecord, RefTarget, ReflogEntry, ReflogWrite,
-            is_valid_bridge_operation_id, validate_bridge_publication_binding, validate_ref_key,
-            validate_ref_target, validate_reflog_writes_for_key, validate_worktree_filter,
+            RevisionOrdinalAppendOutcome, RevisionOrdinalMeta, is_valid_bridge_operation_id,
+            obliteration_fenced_read_error, obliteration_fenced_write_error,
+            validate_bridge_publication_binding, validate_hex_oid, validate_non_empty_identifier,
+            validate_note_cas_op, validate_notes_ref, validate_object_index_record,
+            validate_obliteration_request, validate_oid_for_hash_kind, validate_ref_key,
+            validate_ref_target, validate_reflog_writes_for_key, validate_revision_ordinal_append,
+            validate_revision_ordinal_entries, validate_worktree_filter,
         },
         sqlite::map_sqlite_db_err,
     },
@@ -962,4 +976,1680 @@ impl GitStore for SqliteGitStore {
         }
         Ok(out)
     }
+
+    async fn upsert_object_index_batch(&self, records: &[ObjectIndexRecord]) -> StorageResult<()> {
+        self.ensure_writable()?;
+        for rec in records {
+            validate_object_index_record(rec)?;
+        }
+        if records.is_empty() {
+            return Ok(());
+        }
+
+        let txn = begin_write_transaction(&self.conn).await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "begin upsert_object_index_batch transaction",
+                err,
+            )
+        })?;
+
+        // Enforce the `object_obliteration` write fence across the entire batch
+        // inside the same write transaction before mutating any row.
+        let distinct_oids: BTreeSet<&str> = records.iter().map(|r| r.o_id.as_str()).collect();
+        check_oids_not_obliterated_for_write_in_conn(&txn, &distinct_oids).await?;
+
+        const UPSERT_CHUNK: usize = 150;
+        let backend = txn.get_database_backend();
+        for chunk in records.chunks(UPSERT_CHUNK) {
+            let mut sql = String::from(
+                "INSERT INTO object_index \
+                 (o_id, o_type, o_size, repo_id, created_at, is_synced) VALUES ",
+            );
+            let mut values = Vec::with_capacity(chunk.len() * 6);
+            for (idx, rec) in chunk.iter().enumerate() {
+                if idx != 0 {
+                    sql.push_str(", ");
+                }
+                sql.push_str("(?, ?, ?, ?, ?, ?)");
+                values.extend([
+                    Value::from(rec.o_id.clone()),
+                    Value::from(rec.o_type.clone()),
+                    Value::from(rec.o_size),
+                    Value::from(rec.repo_id.clone()),
+                    Value::from(rec.created_at),
+                    Value::from(i32::from(rec.is_synced)),
+                ]);
+            }
+            sql.push_str(
+                " ON CONFLICT(repo_id, o_id) DO UPDATE SET \
+                 o_type = CASE \
+                   WHEN substr(excluded.o_type, 1, 6) = 'agent_' \
+                    AND substr(object_index.o_type, 1, 6) != 'agent_' \
+                   THEN excluded.o_type ELSE object_index.o_type END, \
+                 o_size = CASE \
+                   WHEN substr(excluded.o_type, 1, 6) = 'agent_' \
+                    AND substr(object_index.o_type, 1, 6) != 'agent_' \
+                   THEN excluded.o_size ELSE object_index.o_size END, \
+                 is_synced = CASE \
+                   WHEN substr(excluded.o_type, 1, 6) = 'agent_' \
+                    AND substr(object_index.o_type, 1, 6) != 'agent_' \
+                   THEN 0 ELSE object_index.is_synced END",
+            );
+            txn.execute_raw(Statement::from_sql_and_values(backend, sql, values))
+                .await
+                .map_err(|err| {
+                    map_sqlite_db_err(
+                        DatabaseRole::Repository,
+                        "upsert object_index batch chunk",
+                        err,
+                    )
+                })?;
+        }
+
+        txn.commit().await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "commit upsert_object_index_batch transaction",
+                err,
+            )
+        })?;
+        Ok(())
+    }
+
+    async fn get_object_index(
+        &self,
+        repo_id: &str,
+        o_id: &str,
+    ) -> StorageResult<Option<ObjectIndexRecord>> {
+        validate_non_empty_identifier(repo_id, "object_index repo_id")?;
+        validate_hex_oid(o_id, "object_index o_id")?;
+        let backend = self.conn.get_database_backend();
+        // Single SQL statement guarantees atomic MVCC snapshot visibility across
+        // both `object_obliteration` and `object_index` on read-only & read-write connections.
+        let row = self
+            .conn
+            .query_one_raw(Statement::from_sql_and_values(
+                backend,
+                "SELECT \
+                   (SELECT state FROM object_obliteration WHERE oid = ? LIMIT 1) AS fence_state, \
+                   oi.repo_id, oi.o_id, oi.o_type, oi.o_size, oi.created_at, oi.is_synced \
+                 FROM (SELECT 1) AS _probe \
+                 LEFT JOIN object_index oi ON oi.repo_id = ? AND oi.o_id = ?",
+                [o_id.into(), repo_id.into(), o_id.into()],
+            ))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(DatabaseRole::Repository, "get fenced object_index row", err)
+            })?
+            .ok_or_else(|| StorageBackendError::BackendInternal {
+                detail: "fenced object_index probe query returned zero rows".to_string(),
+            })?;
+
+        let fence_state: Option<String> = row.try_get_by_index(0).map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "decode object_obliteration fence_state",
+                err,
+            )
+        })?;
+        if let Some(state_str) = fence_state {
+            let state = ObliterationState::parse(&state_str)?;
+            return Err(obliteration_fenced_read_error(state));
+        }
+
+        let found_repo: Option<String> = row.try_get_by_index(1).map_err(|err| {
+            map_sqlite_db_err(DatabaseRole::Repository, "decode object_index repo_id", err)
+        })?;
+        let Some(found_repo) = found_repo else {
+            return Ok(None);
+        };
+        let found_oid: String = row.try_get_by_index(2).map_err(|err| {
+            map_sqlite_db_err(DatabaseRole::Repository, "decode object_index o_id", err)
+        })?;
+        let o_type: String = row.try_get_by_index(3).map_err(|err| {
+            map_sqlite_db_err(DatabaseRole::Repository, "decode object_index o_type", err)
+        })?;
+        let o_size: i64 = row.try_get_by_index(4).map_err(|err| {
+            map_sqlite_db_err(DatabaseRole::Repository, "decode object_index o_size", err)
+        })?;
+        let created_at: i64 = row.try_get_by_index(5).map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "decode object_index created_at",
+                err,
+            )
+        })?;
+        let is_synced: i32 = row.try_get_by_index(6).map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "decode object_index is_synced",
+                err,
+            )
+        })?;
+        Ok(Some(ObjectIndexRecord {
+            repo_id: found_repo,
+            o_id: found_oid,
+            o_type,
+            o_size,
+            created_at,
+            is_synced: is_synced != 0,
+        }))
+    }
+
+    async fn get_object_index_preserved_address(
+        &self,
+        repo_id: &str,
+        o_id: &str,
+    ) -> StorageResult<Option<ObjectIndexRecord>> {
+        validate_non_empty_identifier(repo_id, "object_index repo_id")?;
+        validate_hex_oid(o_id, "object_index o_id")?;
+        let backend = self.conn.get_database_backend();
+        let row = self
+            .conn
+            .query_one_raw(Statement::from_sql_and_values(
+                backend,
+                "SELECT repo_id, o_id, o_type, o_size, created_at, is_synced \
+                 FROM object_index WHERE repo_id = ? AND o_id = ?",
+                [repo_id.into(), o_id.into()],
+            ))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(
+                    DatabaseRole::Repository,
+                    "get preserved object_index address",
+                    err,
+                )
+            })?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        decode_object_index_row(&row).map(Some)
+    }
+
+    async fn list_object_index_by_repo(
+        &self,
+        repo_id: &str,
+        synced_filter: Option<bool>,
+    ) -> StorageResult<Vec<ObjectIndexRecord>> {
+        validate_non_empty_identifier(repo_id, "object_index repo_id")?;
+        let backend = self.conn.get_database_backend();
+        let stmt = match synced_filter {
+            Some(synced) => Statement::from_sql_and_values(
+                backend,
+                "SELECT oi.repo_id, oi.o_id, oi.o_type, oi.o_size, oi.created_at, oi.is_synced \
+                 FROM object_index oi \
+                 WHERE oi.repo_id = ? AND oi.is_synced = ? \
+                   AND NOT EXISTS (SELECT 1 FROM object_obliteration ob WHERE ob.oid = oi.o_id) \
+                 ORDER BY oi.o_id ASC",
+                [repo_id.into(), i32::from(synced).into()],
+            ),
+            None => Statement::from_sql_and_values(
+                backend,
+                "SELECT oi.repo_id, oi.o_id, oi.o_type, oi.o_size, oi.created_at, oi.is_synced \
+                 FROM object_index oi \
+                 WHERE oi.repo_id = ? \
+                   AND NOT EXISTS (SELECT 1 FROM object_obliteration ob WHERE ob.oid = oi.o_id) \
+                 ORDER BY oi.o_id ASC",
+                [repo_id.into()],
+            ),
+        };
+        let rows = self.conn.query_all_raw(stmt).await.map_err(|err| {
+            map_sqlite_db_err(DatabaseRole::Repository, "list object_index rows", err)
+        })?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            out.push(decode_object_index_row(&row)?);
+        }
+        Ok(out)
+    }
+
+    async fn mark_object_index_synced(
+        &self,
+        repo_id: &str,
+        o_ids: &[String],
+    ) -> StorageResult<usize> {
+        self.ensure_writable()?;
+        validate_non_empty_identifier(repo_id, "object_index repo_id")?;
+        for oid in o_ids {
+            validate_hex_oid(oid, "object_index o_id")?;
+        }
+        if o_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let txn = begin_write_transaction(&self.conn).await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "begin mark_object_index_synced transaction",
+                err,
+            )
+        })?;
+        let distinct_oids: BTreeSet<&str> = o_ids.iter().map(String::as_str).collect();
+        check_oids_not_obliterated_for_write_in_conn(&txn, &distinct_oids).await?;
+
+        let backend = txn.get_database_backend();
+        let mut updated = 0usize;
+        let ordered: Vec<&str> = distinct_oids.into_iter().collect();
+        for chunk in ordered.chunks(400) {
+            let placeholders = vec!["?"; chunk.len()].join(", ");
+            let sql = format!(
+                "UPDATE object_index SET is_synced = 1 \
+                 WHERE repo_id = ? AND is_synced = 0 AND o_id IN ({placeholders})"
+            );
+            let mut values = Vec::with_capacity(chunk.len() + 1);
+            values.push(Value::from(repo_id.to_string()));
+            for oid in chunk {
+                values.push(Value::from((*oid).to_string()));
+            }
+            let res = txn
+                .execute_raw(Statement::from_sql_and_values(backend, sql, values))
+                .await
+                .map_err(|err| {
+                    map_sqlite_db_err(DatabaseRole::Repository, "mark object_index synced", err)
+                })?;
+            updated += usize::try_from(res.rows_affected()).unwrap_or(usize::MAX);
+        }
+
+        txn.commit().await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "commit mark_object_index_synced transaction",
+                err,
+            )
+        })?;
+        Ok(updated)
+    }
+
+    async fn begin_object_obliteration(
+        &self,
+        req: &ObliterationRequest,
+    ) -> StorageResult<ObjectObliterationRecord> {
+        self.ensure_writable()?;
+        validate_obliteration_request(req)?;
+        let txn = begin_write_transaction(&self.conn).await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "begin object_obliteration transaction",
+                err,
+            )
+        })?;
+        let backend = txn.get_database_backend();
+        txn.execute_raw(Statement::from_sql_and_values(
+            backend,
+            "INSERT OR IGNORE INTO object_obliteration \
+             (oid, hash_kind, state, reason, actor, approval_source, requested_at, tombstone_written_at, payload_deleted_at, updated_at) \
+             VALUES (?, ?, 'obliterating', ?, ?, ?, ?, ?, NULL, ?)",
+            [
+                req.oid.clone().into(),
+                req.hash_kind.as_str().into(),
+                req.reason.clone().into(),
+                req.actor.clone().into(),
+                req.approval_source.clone().into(),
+                req.recorded_at.clone().into(),
+                req.recorded_at.clone().into(),
+                req.recorded_at.clone().into(),
+            ],
+        ))
+        .await
+        .map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "insert object_obliteration tombstone",
+                err,
+            )
+        })?;
+
+        let record = query_obliteration_by_oid_and_kind(&txn, &req.oid, req.hash_kind)
+            .await?
+            .ok_or_else(|| StorageBackendError::BackendInternal {
+                detail: "object_obliteration tombstone was not visible after insert".to_string(),
+            })?;
+        txn.commit().await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "commit object_obliteration transaction",
+                err,
+            )
+        })?;
+        Ok(record)
+    }
+
+    async fn mark_object_obliterated(
+        &self,
+        oid: &str,
+        hash_kind: ObjectHashKind,
+        deleted_at: &str,
+    ) -> StorageResult<ObjectObliterationRecord> {
+        self.ensure_writable()?;
+        validate_oid_for_hash_kind(oid, hash_kind)?;
+        validate_non_empty_identifier(deleted_at, "obliteration deleted_at")?;
+
+        let txn = begin_write_transaction(&self.conn).await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "begin mark_object_obliterated transaction",
+                err,
+            )
+        })?;
+        let Some(existing) = query_obliteration_by_oid_and_kind(&txn, oid, hash_kind).await? else {
+            return Err(StorageBackendError::NotFound {
+                resource: "object_obliteration tombstone".to_string(),
+            });
+        };
+        if existing.state == ObliterationState::Obliterated {
+            drop(txn);
+            return Ok(existing);
+        }
+        let backend = txn.get_database_backend();
+        txn.execute_raw(Statement::from_sql_and_values(
+            backend,
+            "UPDATE object_obliteration \
+             SET state = 'obliterated', payload_deleted_at = ?, updated_at = ? \
+             WHERE oid = ? AND hash_kind = ?",
+            [
+                deleted_at.into(),
+                deleted_at.into(),
+                oid.into(),
+                hash_kind.as_str().into(),
+            ],
+        ))
+        .await
+        .map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "update object_obliteration to obliterated",
+                err,
+            )
+        })?;
+
+        let updated = query_obliteration_by_oid_and_kind(&txn, oid, hash_kind)
+            .await?
+            .ok_or_else(|| StorageBackendError::BackendInternal {
+                detail: "object_obliteration tombstone disappeared after finalize".to_string(),
+            })?;
+        txn.commit().await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "commit mark_object_obliterated transaction",
+                err,
+            )
+        })?;
+        Ok(updated)
+    }
+
+    async fn get_object_obliteration(
+        &self,
+        oid: &str,
+    ) -> StorageResult<Option<ObjectObliterationRecord>> {
+        validate_hex_oid(oid, "object_obliteration oid")?;
+        let backend = self.conn.get_database_backend();
+        let row = self
+            .conn
+            .query_one_raw(Statement::from_sql_and_values(
+                backend,
+                "SELECT oid, hash_kind, state, reason, actor, approval_source, \
+                        requested_at, tombstone_written_at, payload_deleted_at, updated_at \
+                 FROM object_obliteration WHERE oid = ? ORDER BY hash_kind ASC LIMIT 1",
+                [oid.into()],
+            ))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(
+                    DatabaseRole::Repository,
+                    "query object_obliteration by oid",
+                    err,
+                )
+            })?;
+        match row {
+            Some(row) => decode_obliteration_row(&row).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    async fn is_object_obliterated(&self, oid: &str) -> StorageResult<bool> {
+        Ok(self.get_object_obliteration(oid).await?.is_some())
+    }
+
+    async fn list_incomplete_obliterations(&self) -> StorageResult<Vec<ObjectObliterationRecord>> {
+        let backend = self.conn.get_database_backend();
+        let rows = self
+            .conn
+            .query_all_raw(Statement::from_string(
+                backend,
+                "SELECT oid, hash_kind, state, reason, actor, approval_source, \
+                        requested_at, tombstone_written_at, payload_deleted_at, updated_at \
+                 FROM object_obliteration WHERE state = 'obliterating' \
+                 ORDER BY oid ASC, hash_kind ASC"
+                    .to_string(),
+            ))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(
+                    DatabaseRole::Repository,
+                    "list incomplete object_obliteration rows",
+                    err,
+                )
+            })?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            out.push(decode_obliteration_row(&row)?);
+        }
+        Ok(out)
+    }
+
+    async fn list_obliterated_oids(&self) -> StorageResult<Vec<String>> {
+        let backend = self.conn.get_database_backend();
+        let rows = self
+            .conn
+            .query_all_raw(Statement::from_string(
+                backend,
+                "SELECT DISTINCT oid FROM object_obliteration ORDER BY oid ASC".to_string(),
+            ))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(DatabaseRole::Repository, "list obliterated OIDs", err)
+            })?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            out.push(row.try_get_by_index(0).map_err(|err| {
+                map_sqlite_db_err(DatabaseRole::Repository, "decode obliterated oid", err)
+            })?);
+        }
+        Ok(out)
+    }
+
+    async fn run_fenced_object_read(
+        &self,
+        oid: &str,
+        read_payload: Box<dyn FnOnce() -> StorageResult<Vec<u8>> + Send>,
+    ) -> StorageResult<Vec<u8>> {
+        validate_hex_oid(oid, "object OID")?;
+        if let Some(rec) = self.get_object_obliteration(oid).await? {
+            return Err(obliteration_fenced_read_error(rec.state));
+        }
+        let payload_result = tokio::task::spawn_blocking(read_payload)
+            .await
+            .map_err(|err| StorageBackendError::BackendInternal {
+                detail: format!("fenced object read task failed: {err}"),
+            })?;
+        // Post-read monotonic verification: if an obliteration tombstone
+        // committed while `read_payload` ran, discard the bytes (or replace a
+        // post-unlink error) and fail closed with the obliteration fence error.
+        if let Some(rec) = self.get_object_obliteration(oid).await? {
+            return Err(obliteration_fenced_read_error(rec.state));
+        }
+        payload_result
+    }
+
+    async fn run_fenced_object_write(
+        &self,
+        record: &ObjectIndexRecord,
+        write_payload: Box<dyn FnOnce() -> StorageResult<()> + Send>,
+    ) -> StorageResult<()> {
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum CancelState {
+            Pending,
+            Cancelled,
+            Committing,
+        }
+
+        struct CancelOnDrop {
+            state: Arc<Mutex<CancelState>>,
+            armed: bool,
+        }
+
+        impl Drop for CancelOnDrop {
+            fn drop(&mut self) {
+                if self.armed
+                    && let Ok(mut guard) = self.state.lock()
+                    && *guard == CancelState::Pending
+                {
+                    *guard = CancelState::Cancelled;
+                }
+            }
+        }
+
+        self.ensure_writable()?;
+        validate_object_index_record(record)?;
+
+        let state = Arc::new(Mutex::new(CancelState::Pending));
+        let mut guard = CancelOnDrop {
+            state: Arc::clone(&state),
+            armed: true,
+        };
+        let worker_state = Arc::clone(&state);
+        let conn = self.conn.clone();
+        let rec = record.clone();
+
+        // Own the SQLite `BEGIN IMMEDIATE` transaction inside a spawned worker
+        // task rather than the caller's future. If the caller cancels or drops
+        // this future while `write_payload` is running, the worker keeps the
+        // SQLite write lock held until `write_payload` returns, and only then
+        // rolls back the transaction — preventing any concurrent obliteration
+        // from interleaving with an in-flight payload write.
+        let worker = tokio::spawn(async move {
+            let is_cancelled = || -> bool {
+                worker_state
+                    .lock()
+                    .map(|s| *s == CancelState::Cancelled)
+                    .unwrap_or(true)
+            };
+            if is_cancelled() {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: "sqlite fenced object write cancelled before starting".to_string(),
+                });
+            }
+
+            let txn = begin_write_transaction(&conn).await.map_err(|err| {
+                map_sqlite_db_err(
+                    DatabaseRole::Repository,
+                    "begin run_fenced_object_write transaction",
+                    err,
+                )
+            })?;
+
+            if is_cancelled() {
+                let _ = txn.rollback().await;
+                return Err(StorageBackendError::BackendInternal {
+                    detail: "sqlite fenced object write cancelled after acquiring write lock"
+                        .to_string(),
+                });
+            }
+
+            let mut distinct = BTreeSet::new();
+            distinct.insert(rec.o_id.as_str());
+            if let Err(err) = check_oids_not_obliterated_for_write_in_conn(&txn, &distinct).await {
+                let _ = txn.rollback().await;
+                return Err(err);
+            }
+
+            if is_cancelled() {
+                let _ = txn.rollback().await;
+                return Err(StorageBackendError::BackendInternal {
+                    detail: "sqlite fenced object write cancelled before payload write".to_string(),
+                });
+            }
+
+            // Move `txn` ownership onto the blocking OS thread alongside
+            // `write_payload` so SQLite's `BEGIN IMMEDIATE` write lock remains
+            // held until `write_payload` exits — even if the caller cancels the
+            // future AND the originating Tokio runtime executes
+            // `shutdown_background()` or `shutdown_timeout()`.
+            let (txn, payload_res) = tokio::task::spawn_blocking(move || {
+                let res = write_payload();
+                (txn, res)
+            })
+            .await
+            .map_err(|err| StorageBackendError::BackendInternal {
+                detail: format!("fenced object write task failed: {err}"),
+            })?;
+
+            if let Err(err) = payload_res {
+                let _ = txn.rollback().await;
+                return Err(err);
+            }
+
+            if is_cancelled() {
+                let _ = txn.rollback().await;
+                return Err(StorageBackendError::BackendInternal {
+                    detail: "sqlite fenced object write cancelled during payload write".to_string(),
+                });
+            }
+
+            let backend = txn.get_database_backend();
+            if let Err(err) = txn
+                .execute_raw(Statement::from_sql_and_values(
+                    backend,
+                    "INSERT INTO object_index \
+                     (o_id, o_type, o_size, repo_id, created_at, is_synced) VALUES (?, ?, ?, ?, ?, ?) \
+                     ON CONFLICT(repo_id, o_id) DO UPDATE SET \
+                       o_type = CASE \
+                         WHEN substr(excluded.o_type, 1, 6) = 'agent_' \
+                          AND substr(object_index.o_type, 1, 6) != 'agent_' \
+                         THEN excluded.o_type ELSE object_index.o_type END, \
+                       o_size = CASE \
+                         WHEN substr(excluded.o_type, 1, 6) = 'agent_' \
+                          AND substr(object_index.o_type, 1, 6) != 'agent_' \
+                         THEN excluded.o_size ELSE object_index.o_size END, \
+                       is_synced = CASE \
+                         WHEN substr(excluded.o_type, 1, 6) = 'agent_' \
+                          AND substr(object_index.o_type, 1, 6) != 'agent_' \
+                         THEN 0 ELSE object_index.is_synced END",
+                    [
+                        Value::from(rec.o_id.clone()),
+                        Value::from(rec.o_type.clone()),
+                        Value::from(rec.o_size),
+                        Value::from(rec.repo_id.clone()),
+                        Value::from(rec.created_at),
+                        Value::from(i32::from(rec.is_synced)),
+                    ],
+                ))
+                .await
+                .map_err(|err| {
+                    map_sqlite_db_err(
+                        DatabaseRole::Repository,
+                        "upsert fenced object_index row",
+                        err,
+                    )
+                })
+            {
+                let _ = txn.rollback().await;
+                return Err(err);
+            }
+
+            let cancelled_before_commit = {
+                let mut st =
+                    worker_state
+                        .lock()
+                        .map_err(|_| StorageBackendError::BackendInternal {
+                            detail: "sqlite fenced write cancellation state poisoned".to_string(),
+                        })?;
+                if *st == CancelState::Cancelled {
+                    true
+                } else {
+                    *st = CancelState::Committing;
+                    false
+                }
+            };
+            if cancelled_before_commit {
+                let _ = txn.rollback().await;
+                return Err(StorageBackendError::BackendInternal {
+                    detail: "sqlite fenced object write cancelled before commit".to_string(),
+                });
+            }
+
+            txn.commit().await.map_err(|err| {
+                map_sqlite_db_err(
+                    DatabaseRole::Repository,
+                    "commit run_fenced_object_write transaction",
+                    err,
+                )
+            })?;
+            Ok(())
+        });
+
+        let result = worker
+            .await
+            .map_err(|err| StorageBackendError::BackendInternal {
+                detail: format!("sqlite fenced object write worker failed: {err}"),
+            })?;
+        guard.armed = false;
+        result
+    }
+
+    async fn get_note(&self, notes_ref: &str, object: &str) -> StorageResult<Option<NoteRecord>> {
+        validate_notes_ref(notes_ref)?;
+        validate_hex_oid(object, "note object OID")?;
+        let blob = find_note_blob_in_conn(&self.conn, notes_ref, object).await?;
+        Ok(blob.map(|blob| NoteRecord {
+            notes_ref: notes_ref.to_string(),
+            object: object.to_string(),
+            blob,
+        }))
+    }
+
+    async fn list_notes(&self, notes_ref: &str) -> StorageResult<Vec<NoteRecord>> {
+        validate_notes_ref(notes_ref)?;
+        let backend = self.conn.get_database_backend();
+        let rows = self
+            .conn
+            .query_all_raw(Statement::from_sql_and_values(
+                backend,
+                "SELECT notes_ref, object, blob FROM notes WHERE notes_ref = ? ORDER BY object ASC",
+                [notes_ref.into()],
+            ))
+            .await
+            .map_err(|err| map_sqlite_db_err(DatabaseRole::Repository, "list notes rows", err))?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            out.push(NoteRecord {
+                notes_ref: row.try_get_by_index(0).map_err(|err| {
+                    map_sqlite_db_err(DatabaseRole::Repository, "decode note notes_ref", err)
+                })?,
+                object: row.try_get_by_index(1).map_err(|err| {
+                    map_sqlite_db_err(DatabaseRole::Repository, "decode note object", err)
+                })?,
+                blob: row.try_get_by_index(2).map_err(|err| {
+                    map_sqlite_db_err(DatabaseRole::Repository, "decode note blob", err)
+                })?,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn put_note(
+        &self,
+        notes_ref: &str,
+        object: &str,
+        blob: &str,
+        overwrite: bool,
+    ) -> StorageResult<NoteWriteOutcome> {
+        self.ensure_writable()?;
+        validate_notes_ref(notes_ref)?;
+        validate_hex_oid(object, "note object OID")?;
+        validate_hex_oid(blob, "note blob OID")?;
+
+        let txn = begin_write_transaction(&self.conn).await.map_err(|err| {
+            map_sqlite_db_err(DatabaseRole::Repository, "begin put_note transaction", err)
+        })?;
+        let existing = find_note_blob_in_conn(&txn, notes_ref, object).await?;
+        let backend = txn.get_database_backend();
+        let outcome = match existing {
+            None => {
+                txn.execute_raw(Statement::from_sql_and_values(
+                    backend,
+                    "INSERT INTO notes (notes_ref, object, blob) VALUES (?, ?, ?)",
+                    [notes_ref.into(), object.into(), blob.into()],
+                ))
+                .await
+                .map_err(|err| {
+                    map_sqlite_db_err(DatabaseRole::Repository, "insert note row", err)
+                })?;
+                NoteWriteOutcome::Inserted
+            }
+            Some(existing_blob) if !overwrite => {
+                drop(txn);
+                return Ok(NoteWriteOutcome::AlreadyExists { existing_blob });
+            }
+            Some(previous_blob) => {
+                txn.execute_raw(Statement::from_sql_and_values(
+                    backend,
+                    "UPDATE notes SET blob = ? WHERE notes_ref = ? AND object = ?",
+                    [blob.into(), notes_ref.into(), object.into()],
+                ))
+                .await
+                .map_err(|err| {
+                    map_sqlite_db_err(DatabaseRole::Repository, "update note row", err)
+                })?;
+                NoteWriteOutcome::Replaced { previous_blob }
+            }
+        };
+        txn.commit().await.map_err(|err| {
+            map_sqlite_db_err(DatabaseRole::Repository, "commit put_note transaction", err)
+        })?;
+        Ok(outcome)
+    }
+
+    async fn remove_note_cas(
+        &self,
+        notes_ref: &str,
+        object: &str,
+        expected_blob: Option<&str>,
+    ) -> StorageResult<bool> {
+        self.ensure_writable()?;
+        validate_notes_ref(notes_ref)?;
+        validate_hex_oid(object, "note object OID")?;
+        if let Some(exp) = expected_blob {
+            validate_hex_oid(exp, "note expected_blob OID")?;
+        }
+
+        let txn = begin_write_transaction(&self.conn).await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "begin remove_note_cas transaction",
+                err,
+            )
+        })?;
+        let backend = txn.get_database_backend();
+        let res = match expected_blob {
+            Some(exp) => txn
+                .execute_raw(Statement::from_sql_and_values(
+                    backend,
+                    "DELETE FROM notes WHERE notes_ref = ? AND object = ? AND blob = ?",
+                    [notes_ref.into(), object.into(), exp.into()],
+                ))
+                .await
+                .map_err(|err| {
+                    map_sqlite_db_err(DatabaseRole::Repository, "delete note row cas", err)
+                })?,
+            None => txn
+                .execute_raw(Statement::from_sql_and_values(
+                    backend,
+                    "DELETE FROM notes WHERE notes_ref = ? AND object = ?",
+                    [notes_ref.into(), object.into()],
+                ))
+                .await
+                .map_err(|err| {
+                    map_sqlite_db_err(DatabaseRole::Repository, "delete note row", err)
+                })?,
+        };
+        txn.commit().await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "commit remove_note_cas transaction",
+                err,
+            )
+        })?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    async fn apply_notes_cas_batch(
+        &self,
+        notes_ref: &str,
+        ops: &[NoteCasOp],
+    ) -> StorageResult<NoteBatchOutcome> {
+        self.ensure_writable()?;
+        validate_notes_ref(notes_ref)?;
+        for op in ops {
+            validate_note_cas_op(op)?;
+        }
+        if ops.is_empty() {
+            return Ok(NoteBatchOutcome::Applied {
+                inserted: 0,
+                updated: 0,
+                deleted: 0,
+            });
+        }
+
+        let txn = begin_write_transaction(&self.conn).await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "begin apply_notes_cas_batch transaction",
+                err,
+            )
+        })?;
+        let backend = txn.get_database_backend();
+        let mut inserted = 0usize;
+        let mut updated = 0usize;
+        let mut deleted = 0usize;
+
+        for op in ops {
+            match op {
+                NoteCasOp::InsertIfAbsent { object, blob } => {
+                    if let Some(actual) = find_note_blob_in_conn(&txn, notes_ref, object).await? {
+                        drop(txn);
+                        return Ok(NoteBatchOutcome::CasConflict {
+                            object: object.clone(),
+                            actual_blob: Some(actual),
+                        });
+                    }
+                    txn.execute_raw(Statement::from_sql_and_values(
+                        backend,
+                        "INSERT INTO notes (notes_ref, object, blob) VALUES (?, ?, ?)",
+                        [notes_ref.into(), object.clone().into(), blob.clone().into()],
+                    ))
+                    .await
+                    .map_err(|err| {
+                        map_sqlite_db_err(DatabaseRole::Repository, "batch insert note row", err)
+                    })?;
+                    inserted += 1;
+                }
+                NoteCasOp::UpdateIfMatches {
+                    object,
+                    expected_blob,
+                    new_blob,
+                } => {
+                    let actual = find_note_blob_in_conn(&txn, notes_ref, object).await?;
+                    if actual.as_deref() != Some(expected_blob.as_str()) {
+                        drop(txn);
+                        return Ok(NoteBatchOutcome::CasConflict {
+                            object: object.clone(),
+                            actual_blob: actual,
+                        });
+                    }
+                    txn.execute_raw(Statement::from_sql_and_values(
+                        backend,
+                        "UPDATE notes SET blob = ? WHERE notes_ref = ? AND object = ? AND blob = ?",
+                        [
+                            new_blob.clone().into(),
+                            notes_ref.into(),
+                            object.clone().into(),
+                            expected_blob.clone().into(),
+                        ],
+                    ))
+                    .await
+                    .map_err(|err| {
+                        map_sqlite_db_err(DatabaseRole::Repository, "batch update note row", err)
+                    })?;
+                    updated += 1;
+                }
+                NoteCasOp::DeleteIfMatches {
+                    object,
+                    expected_blob,
+                } => {
+                    let actual = find_note_blob_in_conn(&txn, notes_ref, object).await?;
+                    if actual.as_deref() != Some(expected_blob.as_str()) {
+                        drop(txn);
+                        return Ok(NoteBatchOutcome::CasConflict {
+                            object: object.clone(),
+                            actual_blob: actual,
+                        });
+                    }
+                    txn.execute_raw(Statement::from_sql_and_values(
+                        backend,
+                        "DELETE FROM notes WHERE notes_ref = ? AND object = ? AND blob = ?",
+                        [
+                            notes_ref.into(),
+                            object.clone().into(),
+                            expected_blob.clone().into(),
+                        ],
+                    ))
+                    .await
+                    .map_err(|err| {
+                        map_sqlite_db_err(DatabaseRole::Repository, "batch delete note row", err)
+                    })?;
+                    deleted += 1;
+                }
+            }
+        }
+
+        txn.commit().await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "commit apply_notes_cas_batch transaction",
+                err,
+            )
+        })?;
+        Ok(NoteBatchOutcome::Applied {
+            inserted,
+            updated,
+            deleted,
+        })
+    }
+
+    async fn get_revision_ordinal_meta(
+        &self,
+        ref_name: &str,
+    ) -> StorageResult<Option<RevisionOrdinalMeta>> {
+        validate_non_empty_identifier(ref_name, "revision_ordinal ref_name")?;
+        query_revision_ordinal_meta_in_conn(&self.conn, ref_name).await
+    }
+
+    async fn list_revision_ordinal_metas(&self) -> StorageResult<Vec<RevisionOrdinalMeta>> {
+        let backend = self.conn.get_database_backend();
+        let rows = self
+            .conn
+            .query_all_raw(Statement::from_string(
+                backend,
+                "SELECT ref_name, tip_oid, replace_sig, max_ordinal, built_at \
+                 FROM revision_ordinal_meta ORDER BY ref_name ASC"
+                    .to_string(),
+            ))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(
+                    DatabaseRole::Repository,
+                    "list revision_ordinal_meta rows",
+                    err,
+                )
+            })?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            out.push(decode_revision_ordinal_meta_row(&row)?);
+        }
+        Ok(out)
+    }
+
+    async fn replace_revision_ordinals(
+        &self,
+        meta: &RevisionOrdinalMeta,
+        entries: &[(i64, String)],
+    ) -> StorageResult<()> {
+        self.ensure_writable()?;
+        validate_revision_ordinal_entries(meta, entries)?;
+
+        let txn = begin_write_transaction(&self.conn).await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "begin replace_revision_ordinals transaction",
+                err,
+            )
+        })?;
+        let backend = txn.get_database_backend();
+        txn.execute_raw(Statement::from_sql_and_values(
+            backend,
+            "DELETE FROM revision_ordinal WHERE ref_name = ?",
+            [meta.ref_name.clone().into()],
+        ))
+        .await
+        .map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "clear revision_ordinal rows for rebuild",
+                err,
+            )
+        })?;
+
+        insert_revision_ordinal_rows_in_conn(&txn, &meta.ref_name, entries).await?;
+        upsert_revision_ordinal_meta_in_conn(&txn, meta).await?;
+
+        txn.commit().await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "commit replace_revision_ordinals transaction",
+                err,
+            )
+        })?;
+        Ok(())
+    }
+
+    async fn append_revision_ordinals(
+        &self,
+        ref_name: &str,
+        expected_tip_oid: &str,
+        expected_replace_sig: &str,
+        new_meta: &RevisionOrdinalMeta,
+        suffix_oids: &[String],
+    ) -> StorageResult<RevisionOrdinalAppendOutcome> {
+        self.ensure_writable()?;
+        validate_revision_ordinal_append(
+            ref_name,
+            expected_tip_oid,
+            expected_replace_sig,
+            new_meta,
+            suffix_oids,
+        )?;
+
+        let txn = begin_write_transaction(&self.conn).await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "begin append_revision_ordinals transaction",
+                err,
+            )
+        })?;
+        let actual = query_revision_ordinal_meta_in_conn(&txn, ref_name).await?;
+        let Some(existing) = actual else {
+            drop(txn);
+            return Ok(RevisionOrdinalAppendOutcome::Stale { actual: None });
+        };
+        if existing.tip_oid != expected_tip_oid || existing.replace_sig != expected_replace_sig {
+            drop(txn);
+            return Ok(RevisionOrdinalAppendOutcome::Stale {
+                actual: Some(existing),
+            });
+        }
+        let suffix_len =
+            i64::try_from(suffix_oids.len()).map_err(|_| StorageBackendError::BackendInternal {
+                detail: "revision_ordinal suffix count overflowed i64".to_string(),
+            })?;
+        let expected_new_max = existing
+            .max_ordinal
+            .checked_add(suffix_len)
+            .ok_or_else(|| StorageBackendError::BackendInternal {
+                detail: "revision_ordinal max_ordinal overflowed i64".to_string(),
+            })?;
+        if new_meta.max_ordinal != expected_new_max {
+            return Err(StorageBackendError::BackendInternal {
+                detail:
+                    "revision_ordinal append new_meta.max_ordinal does not match existing + suffix"
+                        .to_string(),
+            });
+        }
+
+        let mut rows = Vec::with_capacity(suffix_oids.len());
+        let mut ord = existing.max_ordinal;
+        for oid in suffix_oids {
+            ord += 1;
+            rows.push((ord, oid.clone()));
+        }
+        insert_revision_ordinal_rows_in_conn(&txn, ref_name, &rows).await?;
+        upsert_revision_ordinal_meta_in_conn(&txn, new_meta).await?;
+
+        txn.commit().await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "commit append_revision_ordinals transaction",
+                err,
+            )
+        })?;
+        Ok(RevisionOrdinalAppendOutcome::Applied {
+            meta: new_meta.clone(),
+        })
+    }
+
+    async fn find_revision_oid_by_ordinal(
+        &self,
+        ref_name: &str,
+        ordinal: i64,
+    ) -> StorageResult<Option<String>> {
+        validate_non_empty_identifier(ref_name, "revision_ordinal ref_name")?;
+        if ordinal < 1 {
+            return Ok(None);
+        }
+        let backend = self.conn.get_database_backend();
+        let row = self
+            .conn
+            .query_one_raw(Statement::from_sql_and_values(
+                backend,
+                "SELECT oid FROM revision_ordinal WHERE ref_name = ? AND ordinal = ? LIMIT 1",
+                [ref_name.into(), ordinal.into()],
+            ))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(
+                    DatabaseRole::Repository,
+                    "query revision_ordinal by ordinal",
+                    err,
+                )
+            })?;
+        match row {
+            Some(row) => row.try_get_by_index::<String>(0).map(Some).map_err(|err| {
+                map_sqlite_db_err(DatabaseRole::Repository, "decode revision_ordinal oid", err)
+            }),
+            None => Ok(None),
+        }
+    }
+
+    async fn find_revision_ordinal_by_oid(
+        &self,
+        ref_name: &str,
+        oid: &str,
+    ) -> StorageResult<Option<i64>> {
+        validate_non_empty_identifier(ref_name, "revision_ordinal ref_name")?;
+        validate_hex_oid(oid, "revision_ordinal oid")?;
+        let backend = self.conn.get_database_backend();
+        let row = self
+            .conn
+            .query_one_raw(Statement::from_sql_and_values(
+                backend,
+                "SELECT ordinal FROM revision_ordinal WHERE ref_name = ? AND oid = ? LIMIT 1",
+                [ref_name.into(), oid.into()],
+            ))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(
+                    DatabaseRole::Repository,
+                    "query revision_ordinal by oid",
+                    err,
+                )
+            })?;
+        match row {
+            Some(row) => row.try_get_by_index::<i64>(0).map(Some).map_err(|err| {
+                map_sqlite_db_err(
+                    DatabaseRole::Repository,
+                    "decode revision_ordinal ordinal",
+                    err,
+                )
+            }),
+            None => Ok(None),
+        }
+    }
+
+    async fn list_revision_ordinals(&self, ref_name: &str) -> StorageResult<Vec<(i64, String)>> {
+        validate_non_empty_identifier(ref_name, "revision_ordinal ref_name")?;
+        let backend = self.conn.get_database_backend();
+        let rows = self
+            .conn
+            .query_all_raw(Statement::from_sql_and_values(
+                backend,
+                "SELECT ordinal, oid FROM revision_ordinal WHERE ref_name = ? ORDER BY ordinal ASC",
+                [ref_name.into()],
+            ))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(DatabaseRole::Repository, "list revision_ordinal rows", err)
+            })?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let ordinal: i64 = row.try_get_by_index(0).map_err(|err| {
+                map_sqlite_db_err(
+                    DatabaseRole::Repository,
+                    "decode revision_ordinal ordinal",
+                    err,
+                )
+            })?;
+            let oid: String = row.try_get_by_index(1).map_err(|err| {
+                map_sqlite_db_err(DatabaseRole::Repository, "decode revision_ordinal oid", err)
+            })?;
+            out.push((ordinal, oid));
+        }
+        Ok(out)
+    }
+
+    async fn count_revision_ordinals(&self, ref_name: &str) -> StorageResult<u64> {
+        validate_non_empty_identifier(ref_name, "revision_ordinal ref_name")?;
+        let backend = self.conn.get_database_backend();
+        let row = self
+            .conn
+            .query_one_raw(Statement::from_sql_and_values(
+                backend,
+                "SELECT COUNT(*) FROM revision_ordinal WHERE ref_name = ?",
+                [ref_name.into()],
+            ))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(DatabaseRole::Repository, "count revision_ordinal rows", err)
+            })?
+            .ok_or_else(|| StorageBackendError::BackendInternal {
+                detail: "count revision_ordinal query returned zero rows".to_string(),
+            })?;
+        let count: i64 = row.try_get_by_index(0).map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "decode revision_ordinal count",
+                err,
+            )
+        })?;
+        u64::try_from(count).map_err(|_| StorageBackendError::BackendInternal {
+            detail: "revision_ordinal count was negative".to_string(),
+        })
+    }
+
+    async fn prune_revision_ordinals_except(&self, live_refs: &[String]) -> StorageResult<usize> {
+        self.ensure_writable()?;
+        for r in live_refs {
+            validate_non_empty_identifier(r, "revision_ordinal live ref")?;
+        }
+        let live_set: BTreeSet<&str> = live_refs.iter().map(String::as_str).collect();
+        let txn = begin_write_transaction(&self.conn).await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "begin prune_revision_ordinals_except transaction",
+                err,
+            )
+        })?;
+        let backend = txn.get_database_backend();
+        let rows = txn
+            .query_all_raw(Statement::from_string(
+                backend,
+                "SELECT ref_name FROM revision_ordinal_meta ORDER BY ref_name ASC".to_string(),
+            ))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(
+                    DatabaseRole::Repository,
+                    "list revision_ordinal_meta refs for prune",
+                    err,
+                )
+            })?;
+        let mut pruned = 0usize;
+        for row in rows {
+            let ref_name: String = row.try_get_by_index(0).map_err(|err| {
+                map_sqlite_db_err(
+                    DatabaseRole::Repository,
+                    "decode revision_ordinal_meta ref_name",
+                    err,
+                )
+            })?;
+            if !live_set.contains(ref_name.as_str()) {
+                txn.execute_raw(Statement::from_sql_and_values(
+                    backend,
+                    "DELETE FROM revision_ordinal WHERE ref_name = ?",
+                    [ref_name.clone().into()],
+                ))
+                .await
+                .map_err(|err| {
+                    map_sqlite_db_err(DatabaseRole::Repository, "prune revision_ordinal rows", err)
+                })?;
+                txn.execute_raw(Statement::from_sql_and_values(
+                    backend,
+                    "DELETE FROM revision_ordinal_meta WHERE ref_name = ?",
+                    [ref_name.into()],
+                ))
+                .await
+                .map_err(|err| {
+                    map_sqlite_db_err(
+                        DatabaseRole::Repository,
+                        "prune revision_ordinal_meta row",
+                        err,
+                    )
+                })?;
+                pruned += 1;
+            }
+        }
+        txn.commit().await.map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "commit prune_revision_ordinals_except transaction",
+                err,
+            )
+        })?;
+        Ok(pruned)
+    }
+}
+
+async fn check_oids_not_obliterated_for_write_in_conn<C: ConnectionTrait>(
+    conn: &C,
+    distinct_oids: &BTreeSet<&str>,
+) -> StorageResult<()> {
+    if distinct_oids.is_empty() {
+        return Ok(());
+    }
+    let backend = conn.get_database_backend();
+    let ordered: Vec<&str> = distinct_oids.iter().copied().collect();
+    for chunk in ordered.chunks(400) {
+        let placeholders = vec!["?"; chunk.len()].join(", ");
+        let sql = format!(
+            "SELECT state FROM object_obliteration WHERE oid IN ({placeholders}) \
+             ORDER BY oid ASC LIMIT 1"
+        );
+        let values: Vec<Value> = chunk
+            .iter()
+            .map(|oid| Value::from((*oid).to_string()))
+            .collect();
+        if let Some(row) = conn
+            .query_one_raw(Statement::from_sql_and_values(backend, sql, values))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(
+                    DatabaseRole::Repository,
+                    "check object_obliteration write fence",
+                    err,
+                )
+            })?
+        {
+            let state_str: String = row.try_get_by_index(0).map_err(|err| {
+                map_sqlite_db_err(
+                    DatabaseRole::Repository,
+                    "decode object_obliteration state",
+                    err,
+                )
+            })?;
+            let state = ObliterationState::parse(&state_str)?;
+            return Err(obliteration_fenced_write_error(state));
+        }
+    }
+    Ok(())
+}
+
+fn decode_object_index_row(row: &sea_orm::QueryResult) -> StorageResult<ObjectIndexRecord> {
+    let repo_id: String = row.try_get_by_index(0).map_err(|err| {
+        map_sqlite_db_err(DatabaseRole::Repository, "decode object_index repo_id", err)
+    })?;
+    let o_id: String = row.try_get_by_index(1).map_err(|err| {
+        map_sqlite_db_err(DatabaseRole::Repository, "decode object_index o_id", err)
+    })?;
+    let o_type: String = row.try_get_by_index(2).map_err(|err| {
+        map_sqlite_db_err(DatabaseRole::Repository, "decode object_index o_type", err)
+    })?;
+    let o_size: i64 = row.try_get_by_index(3).map_err(|err| {
+        map_sqlite_db_err(DatabaseRole::Repository, "decode object_index o_size", err)
+    })?;
+    let created_at: i64 = row.try_get_by_index(4).map_err(|err| {
+        map_sqlite_db_err(
+            DatabaseRole::Repository,
+            "decode object_index created_at",
+            err,
+        )
+    })?;
+    let is_synced: i32 = row.try_get_by_index(5).map_err(|err| {
+        map_sqlite_db_err(
+            DatabaseRole::Repository,
+            "decode object_index is_synced",
+            err,
+        )
+    })?;
+    Ok(ObjectIndexRecord {
+        repo_id,
+        o_id,
+        o_type,
+        o_size,
+        created_at,
+        is_synced: is_synced != 0,
+    })
+}
+
+async fn query_obliteration_by_oid_and_kind<C: ConnectionTrait>(
+    conn: &C,
+    oid: &str,
+    hash_kind: ObjectHashKind,
+) -> StorageResult<Option<ObjectObliterationRecord>> {
+    let backend = conn.get_database_backend();
+    let row = conn
+        .query_one_raw(Statement::from_sql_and_values(
+            backend,
+            "SELECT oid, hash_kind, state, reason, actor, approval_source, \
+                    requested_at, tombstone_written_at, payload_deleted_at, updated_at \
+             FROM object_obliteration WHERE oid = ? AND hash_kind = ? LIMIT 1",
+            [oid.into(), hash_kind.as_str().into()],
+        ))
+        .await
+        .map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "query object_obliteration row",
+                err,
+            )
+        })?;
+    match row {
+        Some(row) => decode_obliteration_row(&row).map(Some),
+        None => Ok(None),
+    }
+}
+
+fn decode_obliteration_row(row: &sea_orm::QueryResult) -> StorageResult<ObjectObliterationRecord> {
+    let oid: String = row.try_get_by_index(0).map_err(|err| {
+        map_sqlite_db_err(
+            DatabaseRole::Repository,
+            "decode object_obliteration oid",
+            err,
+        )
+    })?;
+    let hash_kind_str: String = row.try_get_by_index(1).map_err(|err| {
+        map_sqlite_db_err(
+            DatabaseRole::Repository,
+            "decode object_obliteration hash_kind",
+            err,
+        )
+    })?;
+    let state_str: String = row.try_get_by_index(2).map_err(|err| {
+        map_sqlite_db_err(
+            DatabaseRole::Repository,
+            "decode object_obliteration state",
+            err,
+        )
+    })?;
+    let reason: Option<String> = row.try_get_by_index(3).map_err(|err| {
+        map_sqlite_db_err(
+            DatabaseRole::Repository,
+            "decode object_obliteration reason",
+            err,
+        )
+    })?;
+    let actor: Option<String> = row.try_get_by_index(4).map_err(|err| {
+        map_sqlite_db_err(
+            DatabaseRole::Repository,
+            "decode object_obliteration actor",
+            err,
+        )
+    })?;
+    let approval_source: Option<String> = row.try_get_by_index(5).map_err(|err| {
+        map_sqlite_db_err(
+            DatabaseRole::Repository,
+            "decode object_obliteration approval_source",
+            err,
+        )
+    })?;
+    let requested_at: String = row.try_get_by_index(6).map_err(|err| {
+        map_sqlite_db_err(
+            DatabaseRole::Repository,
+            "decode object_obliteration requested_at",
+            err,
+        )
+    })?;
+    let tombstone_written_at: String = row.try_get_by_index(7).map_err(|err| {
+        map_sqlite_db_err(
+            DatabaseRole::Repository,
+            "decode object_obliteration tombstone_written_at",
+            err,
+        )
+    })?;
+    let payload_deleted_at: Option<String> = row.try_get_by_index(8).map_err(|err| {
+        map_sqlite_db_err(
+            DatabaseRole::Repository,
+            "decode object_obliteration payload_deleted_at",
+            err,
+        )
+    })?;
+    let updated_at: String = row.try_get_by_index(9).map_err(|err| {
+        map_sqlite_db_err(
+            DatabaseRole::Repository,
+            "decode object_obliteration updated_at",
+            err,
+        )
+    })?;
+    Ok(ObjectObliterationRecord {
+        oid,
+        hash_kind: ObjectHashKind::parse(&hash_kind_str)?,
+        state: ObliterationState::parse(&state_str)?,
+        reason,
+        actor,
+        approval_source,
+        requested_at,
+        tombstone_written_at,
+        payload_deleted_at,
+        updated_at,
+    })
+}
+
+async fn find_note_blob_in_conn<C: ConnectionTrait>(
+    conn: &C,
+    notes_ref: &str,
+    object: &str,
+) -> StorageResult<Option<String>> {
+    let backend = conn.get_database_backend();
+    let row = conn
+        .query_one_raw(Statement::from_sql_and_values(
+            backend,
+            "SELECT blob FROM notes WHERE notes_ref = ? AND object = ? LIMIT 1",
+            [notes_ref.into(), object.into()],
+        ))
+        .await
+        .map_err(|err| map_sqlite_db_err(DatabaseRole::Repository, "query note blob", err))?;
+    match row {
+        Some(row) => row
+            .try_get_by_index::<String>(0)
+            .map(Some)
+            .map_err(|err| map_sqlite_db_err(DatabaseRole::Repository, "decode note blob", err)),
+        None => Ok(None),
+    }
+}
+
+async fn query_revision_ordinal_meta_in_conn<C: ConnectionTrait>(
+    conn: &C,
+    ref_name: &str,
+) -> StorageResult<Option<RevisionOrdinalMeta>> {
+    let backend = conn.get_database_backend();
+    let row = conn
+        .query_one_raw(Statement::from_sql_and_values(
+            backend,
+            "SELECT ref_name, tip_oid, replace_sig, max_ordinal, built_at \
+             FROM revision_ordinal_meta WHERE ref_name = ? LIMIT 1",
+            [ref_name.into()],
+        ))
+        .await
+        .map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "query revision_ordinal_meta row",
+                err,
+            )
+        })?;
+    match row {
+        Some(row) => decode_revision_ordinal_meta_row(&row).map(Some),
+        None => Ok(None),
+    }
+}
+
+fn decode_revision_ordinal_meta_row(
+    row: &sea_orm::QueryResult,
+) -> StorageResult<RevisionOrdinalMeta> {
+    Ok(RevisionOrdinalMeta {
+        ref_name: row.try_get_by_index(0).map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "decode revision_ordinal_meta ref_name",
+                err,
+            )
+        })?,
+        tip_oid: row.try_get_by_index(1).map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "decode revision_ordinal_meta tip_oid",
+                err,
+            )
+        })?,
+        replace_sig: row.try_get_by_index(2).map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "decode revision_ordinal_meta replace_sig",
+                err,
+            )
+        })?,
+        max_ordinal: row.try_get_by_index(3).map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "decode revision_ordinal_meta max_ordinal",
+                err,
+            )
+        })?,
+        built_at: row.try_get_by_index(4).map_err(|err| {
+            map_sqlite_db_err(
+                DatabaseRole::Repository,
+                "decode revision_ordinal_meta built_at",
+                err,
+            )
+        })?,
+    })
+}
+
+async fn insert_revision_ordinal_rows_in_conn<C: ConnectionTrait>(
+    conn: &C,
+    ref_name: &str,
+    rows: &[(i64, String)],
+) -> StorageResult<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    const INSERT_CHUNK: usize = 250;
+    let backend = conn.get_database_backend();
+    for chunk in rows.chunks(INSERT_CHUNK) {
+        let mut sql = String::from("INSERT INTO revision_ordinal (ref_name, ordinal, oid) VALUES ");
+        let mut values = Vec::with_capacity(chunk.len() * 3);
+        for (idx, (ordinal, oid)) in chunk.iter().enumerate() {
+            if idx != 0 {
+                sql.push_str(", ");
+            }
+            sql.push_str("(?, ?, ?)");
+            values.extend([
+                Value::from(ref_name.to_string()),
+                Value::from(*ordinal),
+                Value::from(oid.clone()),
+            ]);
+        }
+        conn.execute_raw(Statement::from_sql_and_values(backend, sql, values))
+            .await
+            .map_err(|err| {
+                map_sqlite_db_err(
+                    DatabaseRole::Repository,
+                    "insert revision_ordinal rows",
+                    err,
+                )
+            })?;
+    }
+    Ok(())
+}
+
+async fn upsert_revision_ordinal_meta_in_conn<C: ConnectionTrait>(
+    conn: &C,
+    meta: &RevisionOrdinalMeta,
+) -> StorageResult<()> {
+    let backend = conn.get_database_backend();
+    conn.execute_raw(Statement::from_sql_and_values(
+        backend,
+        "INSERT INTO revision_ordinal_meta (ref_name, tip_oid, replace_sig, max_ordinal, built_at) \
+         VALUES (?, ?, ?, ?, ?) \
+         ON CONFLICT(ref_name) DO UPDATE SET \
+           tip_oid = excluded.tip_oid, \
+           replace_sig = excluded.replace_sig, \
+           max_ordinal = excluded.max_ordinal, \
+           built_at = excluded.built_at",
+        [
+            meta.ref_name.clone().into(),
+            meta.tip_oid.clone().into(),
+            meta.replace_sig.clone().into(),
+            meta.max_ordinal.into(),
+            meta.built_at.clone().into(),
+        ],
+    ))
+    .await
+    .map_err(|err| {
+        map_sqlite_db_err(
+            DatabaseRole::Repository,
+            "upsert revision_ordinal_meta row",
+            err,
+        )
+    })?;
+    Ok(())
 }
