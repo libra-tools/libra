@@ -1014,7 +1014,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `remote-pending`
 
 **Description:** 100% 在 `src/storage/` 内于 `opener.rs` 落实 `ADR-RB-03` #2 的严格只读 `RepairAborted` 合同与显式可写修复边界：只读上下文遇 `DatabaseError::RepairAborted` 绝不升写修改磁盘，显式可写/修复上下文在只读挂载 fail-closed、在可写崩溃夹具上并发安全完成恢复。
 
@@ -1028,15 +1028,15 @@
 | `redb 5.0.0` `open_read_only` 遇未完成恢复崩溃库返回 `DatabaseError::RepairAborted` | `redb-5.0.0/src/error.rs:466-474`；`ADR-RB-03` #2 |
 
 **Acceptance criteria:**
-- [ ] 只读上下文遇 `DatabaseError::RepairAborted` 时返回类型化 `LBR-IO-001`（附显式修复指引）。
-- [ ] 只读上下文遇 `DatabaseError::RepairAborted` 时绝不以可写模式打开或修改 `.redb` 磁盘字节。
-- [ ] 显式允许的可写/修复上下文在只读挂载文件系统上 fail-closed 报 `LBR-IO-001`。
-- [ ] 显式允许的可写/修复上下文在可写崩溃夹具上并发安全完成恢复。
+- [x] 只读上下文遇 `DatabaseError::RepairAborted` 时返回类型化 `LBR-IO-001`（附显式修复指引）。
+- [x] 只读上下文遇 `DatabaseError::RepairAborted` 时绝不以可写模式打开或修改 `.redb` 磁盘字节。
+- [x] 显式允许的可写/修复上下文在只读挂载文件系统上 fail-closed 报 `LBR-IO-001`。
+- [x] 显式允许的可写/修复上下文在可写崩溃夹具上并发安全完成恢复。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --no-default-features --features storage-redb,storage-queue --lib -E 'test(=storage::opener::tests::readonly_repair_aborted_ro_fs_and_concurrent_explicit_repair)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=storage::opener::tests::readonly_repair_aborted_ro_fs_and_concurrent_explicit_repair)'`（new，覆盖 AC1–AC4）
-- [ ] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 2 文件实现白名单（`src/storage/mod.rs`、`src/storage/opener.rs`）。
+- [x] `source .env.test && cargo nextest list --no-default-features --features storage-redb,storage-queue --lib -E 'test(=storage::opener::tests::readonly_repair_aborted_ro_fs_and_concurrent_explicit_repair)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=storage::opener::tests::readonly_repair_aborted_ro_fs_and_concurrent_explicit_repair)'`（new，覆盖 AC1–AC4）
+- [x] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 2 文件实现白名单（`src/storage/mod.rs`、`src/storage/opener.rs`）。
 
 **Full-suite trigger:** `none`
 
@@ -10016,8 +10016,9 @@
 | `RB-01d` | `done` / `remote-pending` | `5f74eba`（`main`） | `0.30.279` | 2026-11-22 03:46:22 UTC：Stage 1 精确 1 文件写集、AC1–AC6（双关 `compile_error!` + 4 特性编译矩阵 + `storage-redb` 隐式 `storage-queue` 断言）、fmt、严格 clippy、rustdoc、`compat_version_surface_sync` 全绿；Codex `01a2015b-e3a7-75f0-8d1a-27bd39e38f6d` `VERDICT: PASS`（P0/P1/P2=0） |
 | `RB-01b` | `done` / `remote-pending` | `63088e8`（`main`） | `0.30.285` | 2026-11-22 06:45:49 UTC：Stage 1 精确 3 文件写集、`versioned_postcard_roundtrip_and_corrupt_reject` 与 `io_error_display_and_cli_error_do_not_leak_sensitive_source_text`（含跨版本显式分发与 `anyhow` `{error:#}` 链路脱敏）全绿、4 特性矩阵、fmt、严格 clippy、rustdoc、`compat_version_surface_sync` 全绿；Codex R3 `01a20200-379a-7b71-aaab-73ab6e680f74` `VERDICT: PASS` |
 | `RB-01c` | `done` / `remote-pending` | `0ae1cfb`（`main`） | `0.30.286` | 2026-11-22 07:17:48 UTC：Stage 1 精确 2 文件写集、`sqlite_only_rejects_redb_override`/`redb_only_rejects_sqlite_override`/`dual_feature_resolution_and_pre_release_cli_gate`（含独立子进程实测 `resolve()` 与非法值占位脱敏）全绿、fmt、严格 clippy、`compat_version_surface_sync` 全绿；Codex R2 `01a2021d-77b7-7c90-9146-40618689ff47` `VERDICT: PASS` |
-| `RB-02` | `done` / `remote-pending` | 本提交（`main`） | `0.30.287` | 2026-11-22 07:57:32 UTC：Stage 1 精确 2 文件写集、`multiwriter_concurrent_open_and_bounded_write_timeout`（含 `RecordingBuilder` 校验 `MultiWriter` + `16/32/64 MiB`、阻塞池饱和 `Duration::ZERO` 及非零 deadline、多进程并发打开与有界写锁超时、`UpgradeRequired` 按格式版本可操作指引）全绿、4 特性矩阵、fmt、严格 clippy、rustdoc、`compat_version_surface_sync` 全绿；Codex R5 `01a20241-78d9-70d1-be41-35093cc20ca8` `VERDICT: PASS` |
-| `RB-02d`..`RB-34c`（剩余 149 卡） | `pending` | — | — | 按实施顺序于 `main` 逐卡推进 |
+| `RB-02` | `done` / `remote-pending` | `16c6ac7`（`main`） | `0.30.287` | 2026-11-22 07:57:32 UTC：Stage 1 精确 2 文件写集、`multiwriter_concurrent_open_and_bounded_write_timeout`（含 `RecordingBuilder` 校验 `MultiWriter` + `16/32/64 MiB`、阻塞池饱和 `Duration::ZERO` 及非零 deadline、多进程并发打开与有界写锁超时、`UpgradeRequired` 按格式版本可操作指引）全绿、4 特性矩阵、fmt、严格 clippy、rustdoc、`compat_version_surface_sync` 全绿；Codex R5 `01a20241-78d9-70d1-be41-35093cc20ca8` `VERDICT: PASS` |
+| `RB-02d` | `done` / `remote-pending` | 本提交（`main`） | `0.30.290` | 2026-11-22 08:38:12 UTC：Stage 1 精确 2 文件写集、封闭 `RedbRepairContext` 门控并私有化 `redb_builder_for`、`readonly_repair_aborted_ro_fs_and_concurrent_explicit_repair`（含真实 `CrashBackend` 崩溃夹具严格只读 `RepairAborted` 零改盘、真实 `hdiutil -readonly` 只读挂载 `EROFS` fail-closed 零改盘及 4 进程并发安全修复）全绿、4 特性矩阵、fmt、严格 clippy、rustdoc、`compat_version_surface_sync` 全绿；Codex R3 `01a2025d-810c-7b83-9f63-98f634fb5752` `VERDICT: PASS` |
+| `RB-02b`..`RB-34c`（剩余 148 卡） | `pending` | — | — | 按实施顺序于 `main` 逐卡推进 |
 
 ## Codex review log
 

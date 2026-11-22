@@ -26,6 +26,13 @@ pub use backend::{
     assert_redb_runtime_unlocked,
 };
 pub use error::{StorageBackendError, StorageResult};
+#[cfg(feature = "storage-redb")]
+pub use opener::{
+    CACHE_SIZE_LONG_LIVED, CACHE_SIZE_READ_ONLY, CACHE_SIZE_STANDARD_WRITE, RedbOpenProfile,
+    RedbRepairContext, RedbRepairReport, RedbWriteProfile, begin_write_bounded,
+    begin_write_bounded_blocking, commit_write_bounded, create_redb_writable, open_redb_read_only,
+    open_redb_writable, open_redb_writable_for_repair, repair_redb_explicit,
+};
 
 /// Returns whether the SQLite storage backend was compiled into this binary.
 #[must_use]
