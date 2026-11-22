@@ -838,7 +838,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `remote-pending`（2026-11-22 06:45:49 UTC，版本 `0.30.285`，于 `main` 直接提交推送；Stage 1 精确 3 文件写集、AC1–AC5、`nextest list`/`run`、跨版本显式分发与 `Io` 脱敏 `anyhow` 链回归、4 特性矩阵、fmt、严格 clippy、rustdoc 与 Codex R3 `01a20200-379a-7b71-aaab-73ab6e680f74` `VERDICT: PASS` 全绿）
 
 **Description:** 100% 在独占目录 `src/storage/` 内交付统一存储错误类型 `StorageBackendError`（`error.rs`）与 `[schema_ver: u16_le][postcard_bytes]` 版本化编解码器（`codec.rs`），严格区分无损往返、损坏负载、缺失版本头截断、半截负载截断与未知高版本拒绝。
 
@@ -853,16 +853,16 @@
 | `ADR-RB-04` #2 要求所有 `redb` 值采用 `[schema_ver: u16_le][postcard_bytes]` 显式版本头封装并对损坏、截断与未知高版本返回类型化错误 | `ADR-RB-04` |
 
 **Acceptance criteria:**
-- [ ] `storage::codec` 按 `[schema_ver: u16_le][postcard_bytes]` 编码并无损往返解码。
-- [ ] `storage::codec` 对损坏负载字节返回类型化 `StorageBackendError`。
-- [ ] `storage::codec` 对不足 2 字节（缺失版本头）截断输入返回类型化 `StorageBackendError`。
-- [ ] `storage::codec` 对版本头完整但负载半截的截断输入返回类型化 `StorageBackendError`。
-- [ ] `storage::codec` 对未知高 `schema_ver` 返回类型化 `StorageBackendError`。
+- [x] `storage::codec` 按 `[schema_ver: u16_le][postcard_bytes]` 编码并无损往返解码。
+- [x] `storage::codec` 对损坏负载字节返回类型化 `StorageBackendError`。
+- [x] `storage::codec` 对不足 2 字节（缺失版本头）截断输入返回类型化 `StorageBackendError`。
+- [x] `storage::codec` 对版本头完整但负载半截的截断输入返回类型化 `StorageBackendError`。
+- [x] `storage::codec` 对未知高 `schema_ver` 返回类型化 `StorageBackendError`。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --no-default-features --features storage-redb,storage-queue --lib -E 'test(=storage::codec::tests::versioned_postcard_roundtrip_and_corrupt_reject)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=storage::codec::tests::versioned_postcard_roundtrip_and_corrupt_reject)'`（new，覆盖 AC1–AC5）
-- [ ] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 3 文件实现白名单（`src/storage/mod.rs`、`src/storage/error.rs`、`src/storage/codec.rs`）。
+- [x] `source .env.test && cargo nextest list --no-default-features --features storage-redb,storage-queue --lib -E 'test(=storage::codec::tests::versioned_postcard_roundtrip_and_corrupt_reject)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=storage::codec::tests::versioned_postcard_roundtrip_and_corrupt_reject)'`（new，覆盖 AC1–AC5）
+- [x] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 3 文件实现白名单（`src/storage/mod.rs`、`src/storage/error.rs`、`src/storage/codec.rs`）。
 
 **Full-suite trigger:** `none`
 
@@ -10013,8 +10013,9 @@
 | 任务 | 状态 | Commit SHA | 版本 | 关键验证 / CI / Release 证据 |
 |---|---|---|---|---|
 | `RB-01` | `done` / `remote-pending` | `57fed0f`（`main`） | `0.30.278` | 2026-11-22 03:39:49 UTC：AC1–AC8（未暂存+已暂存双态）、4 特性编译矩阵（`redb 5.0.0`/`postcard 1.2.0`/`crc32c 0.6.9`）、`cargo +nightly fmt --all --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo doc --no-deps --all-features`、`compat_version_surface_sync`、`compat_matrix_alignment`、`compat_serial_registry` 全绿；Codex 只读审查 `01a20155-954e-7f10-a16a-d2edb84b0569` `VERDICT: PASS`（P0/P1/P2=0） |
-| `RB-01d` | `done` / `remote-pending` | 本提交（`main`） | `0.30.279` | 2026-11-22 03:46:22 UTC：Stage 1 精确 1 文件写集、AC1–AC6（双关 `compile_error!` + 4 特性编译矩阵 + `storage-redb` 隐式 `storage-queue` 断言）、fmt、严格 clippy、rustdoc、`compat_version_surface_sync` 全绿；Codex `01a2015b-e3a7-75f0-8d1a-27bd39e38f6d` `VERDICT: PASS`（P0/P1/P2=0） |
-| `RB-01b`..`RB-34c`（剩余 152 卡） | `pending` | — | — | 按实施顺序于 `main` 逐卡推进 |
+| `RB-01d` | `done` / `remote-pending` | `5f74eba`（`main`） | `0.30.279` | 2026-11-22 03:46:22 UTC：Stage 1 精确 1 文件写集、AC1–AC6（双关 `compile_error!` + 4 特性编译矩阵 + `storage-redb` 隐式 `storage-queue` 断言）、fmt、严格 clippy、rustdoc、`compat_version_surface_sync` 全绿；Codex `01a2015b-e3a7-75f0-8d1a-27bd39e38f6d` `VERDICT: PASS`（P0/P1/P2=0） |
+| `RB-01b` | `done` / `remote-pending` | 本提交（`main`） | `0.30.285` | 2026-11-22 06:45:49 UTC：Stage 1 精确 3 文件写集、`versioned_postcard_roundtrip_and_corrupt_reject` 与 `io_error_display_and_cli_error_do_not_leak_sensitive_source_text`（含跨版本显式分发与 `anyhow` `{error:#}` 链路脱敏）全绿、4 特性矩阵、fmt、严格 clippy、rustdoc、`compat_version_surface_sync` 全绿；Codex R3 `01a20200-379a-7b71-aaab-73ab6e680f74` `VERDICT: PASS` |
+| `RB-01c`..`RB-34c`（剩余 151 卡） | `pending` | — | — | 按实施顺序于 `main` 逐卡推进 |
 
 ## Codex review log
 

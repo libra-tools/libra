@@ -14,6 +14,12 @@ const _: () = assert!(
     "Enabling `storage-redb` must implicitly enable `storage-queue`."
 );
 
+#[cfg(any(feature = "storage-redb", feature = "storage-queue"))]
+pub mod codec;
+pub mod error;
+
+pub use error::{StorageBackendError, StorageResult};
+
 /// Returns whether the SQLite storage backend was compiled into this binary.
 #[must_use]
 pub const fn has_sqlite_backend() -> bool {
