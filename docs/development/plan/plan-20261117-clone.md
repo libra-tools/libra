@@ -673,6 +673,8 @@ PY
 ---
 
 ### Task CL-25: 发布 `REL-CL-01`（`clone --separate-git-dir` 指针布局家族发布点）（#740）
+> **2026-11-21 冲突记录（待上游处理）：** `tests/command/init_separate_libra_dir_test.rs::legacy_separate_layout_repo_is_no_longer_detected` 要求「`.libra` 为 `gitdir:` 指针时不再被识别」，与本计划的 `CL-04`（已交付：`clone --separate-git-dir` 写出的正是该指针文件）和本发布点直接矛盾；两者内容格式完全相同（均为 `gitdir: <绝对路径>`），无法同时成立。当前实现与 `docs/commands/clone.md` §`--separate-git-dir`、`COMPATIBILITY.md` 均按「支持指针布局」交付，因此该测试应改；若最终决定移除，则需同步回滚 `CL-04` 与其文档。该项是全量门最后一条红项。
+
 
 **Task type:** `release`
 **Lifecycle / Acceptance:** `done` / `remote-pending`（2026-11-20：`REL-CL-01` 家族发布点。三张子卡 `CL-04`（`2335f3f`+`d9189cc`）、`CL-23`（`05698cd`）、`CL-28`（`5d3079f`）均已是本卡受测提交的祖先；版本面 patch 0.30.218 → 0.30.219（`Cargo.toml`/`install.sh`/`install.ps1` + `Cargo.lock`），`compat_version_surface_sync` 2 passed；家族聚合守卫 3 passed（`test_clone_separate_git_dir_and_bare_mutex`、`test_clone_separate_git_dir_pointer_commands`、`test_clone_separate_git_dir_default_deny`）；`cargo build --release --bin libra` exit 0。按用户 2026-11-20 指令：全量 `T-2` 未执行（3.5「不进行全量测试」），PR/`gh pr merge` 流程由「main 直接提交推送」替代（3.1），`gh release create` 与 tag 尚未执行（需用户批准后补）。`remote-pending` 指远端发布流水线与 Release 产物仍待用户批准。
