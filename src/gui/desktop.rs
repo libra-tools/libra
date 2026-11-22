@@ -164,6 +164,10 @@ pub struct Desktop {
     pub memory_query: String,
     /// Dedicated Memory search input.
     pub memory_input: Entity<TextInput>,
+    /// Dedicated Runs search input (Reviews/Investigate).
+    pub runs_input: Entity<TextInput>,
+    /// Runs free-text search.
+    pub runs_query: String,
     pub rebase_actions: [usize; 6],
     pub notice: Option<String>,
     pub sessions: Entity<SessionsWindow>,
@@ -242,6 +246,15 @@ impl Desktop {
             }
         })
         .detach();
+        let runs_input = cx.new(|cx| TextInput::new(window, cx).placeholder("Search runs"));
+        cx.subscribe(&runs_input, |s, input, event: &InputEvent, cx| {
+            if *event == InputEvent::Changed || *event == InputEvent::Focus {
+                s.runs_query = input.read(cx).text().to_string();
+                s.selected = 0;
+                cx.notify();
+            }
+        })
+        .detach();
         let data = DataHandle::spawn();
         data.request();
         let polled = data.clone();
@@ -307,6 +320,8 @@ impl Desktop {
             memory_source: String::new(),
             memory_query: String::new(),
             memory_input,
+            runs_input,
+            runs_query: String::new(),
             rebase_actions: [0, 4, 3, 1, 0, 5],
             notice: None,
             sessions,

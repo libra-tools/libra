@@ -49,6 +49,9 @@ paging slices that snapshot, so pages never repeat or drop rows, and a new
 snapshot resets the list to page one. Summaries are redacted excerpts.
 The Memory page shows bounded real episodes (≤200) from the projection; a stale
 projection shows zero rows with a `libra memory rebuild` hint, matching the CLI.
+Reviews and Investigate show real run directories (newest 100 per kind) with
+item-level states: a corrupt, oversized, incomplete or unknown-kind run affects
+only its own row, and a scan cap marks the list as a truncated subset.
 Sessions come from the read-only capture catalog (filtered to this
 worktree/workspace scope, newest first, capped at 200 rows); model and usage
 fields may be absent, summaries are redacted before rendering, and a repository

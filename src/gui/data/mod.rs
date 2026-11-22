@@ -9,6 +9,7 @@ mod history;
 mod memory;
 mod operations;
 mod repo;
+mod runs;
 mod sessions;
 mod snapshot;
 mod state;
@@ -21,6 +22,10 @@ pub use operations::{
     page_slice,
 };
 pub use repo::READ_BUSY_TIMEOUT;
+pub use runs::{
+    RUN_FILE_CAP, RUN_METADATA_CAP, RUN_ROWS_PER_KIND, RUN_STATE_CAP, RunRow, RunsRead,
+    matches_filter as runs_matches_filter, visible_on,
+};
 pub use sessions::{SESSION_ROW_CAP, SessionRow, clock_from_epoch};
 pub use snapshot::{DataError, RepoContext, Snapshot};
 pub use state::{ProbeOutcome, SourceState};

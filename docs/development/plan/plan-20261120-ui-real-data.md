@@ -772,7 +772,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `remote-pending`
 
 **Description:** 用 `.libra/sessions/agent-runs/<run_id>/` 的真实 run 目录替换 Reviews/Investigate 页面静态卡片：全目录扫描（上限 5000 metadata，按 metadata mtime 倒序取候选）、逐项**打开句柄的有界读**（≤64 KiB）解析公开 wire 类型（解析上限 500 个 state），先读 kind 再用对应 wire 类型解析（未知 kind 记 `malformed`）、按 `state.json` 的 `created_at`/`started_at` 排序并显示每 kind 最新 100，使损坏/超大/缺件行成为条目级状态而不是整页失败。行为轴是**运行记录面的逐项读取与损坏隔离**。
 

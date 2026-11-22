@@ -3145,3 +3145,597 @@ async fn uid05_empty_projection_is_absent() {
     );
     assert!(read.rows.is_empty());
 }
+
+fn review_state(run_id: &str, created_at: &str, terminal: &str) -> String {
+    format!(
+        r#"{{"schema_version":2,"run_id":"{run_id}","kind":"review","agents":[{{"slug":"claude-code"}},{{"slug":"codex"}}],"starting_sha":"abc","target_scope":"HEAD~1..HEAD","terminal_state":"{terminal}","created_at":"{created_at}","updated_at":"{created_at}","cancel_requested":false}}"#
+    )
+}
+
+fn investigate_state(run_id: &str, started_at: &str, terminal: &str) -> String {
+    format!(
+        r#"{{"schema_version":2,"run_id":"{run_id}","topic":"investigation topic","kind":"investigate","agents":["codex"],"max_turns":4,"quorum":2,"completed_rounds":1,"turn":1,"next_agent_idx":0,"stances":[],"findings_doc":"findings.md","starting_sha":"abc","started_at":"{started_at}","updated_at":"{started_at}","terminal_state":"{terminal}","cancel_requested":false}}"#
+    )
+}
+
+fn run_root(dir: &tempfile::TempDir) -> std::path::PathBuf {
+    dir.path()
+        .join(crate::utils::util::ROOT_DIR)
+        .join("sessions")
+        .join("agent-runs")
+}
+
+fn manifest_json(run_id: &str, kind: &str) -> String {
+    format!(
+        r#"{{"schema_version":2,"run_id":"{run_id}","kind":"{kind}","agents":[],"starting_sha":"a","target_scope":"scope","terminal_state":null,"created_at":"2024-01-01T00:00:00Z","updated_at":"2024-01-01T00:00:00Z","findings_oid":null,"redaction_report":{{"matches":0,"bytes_scanned":0,"bytes_redacted":0}},"manual_attach":[]}}"#
+    )
+}
+
+fn write_run(dir: &tempfile::TempDir, run_id: &str, state: &str, manifest: bool) {
+    let root = run_root(dir).join(run_id);
+    fs::create_dir_all(&root).expect("run dir");
+    fs::write(root.join("state.json"), state).expect("state.json");
+    if manifest {
+        let kind = if state.contains("\"kind\":\"investigate\"") {
+            "investigate"
+        } else {
+            "review"
+        };
+        fs::write(root.join("manifest.json"), manifest_json(run_id, kind)).expect("manifest.json");
+    }
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn uid06_run_rows_and_detail() {
+    let repo_dir = tempdir().expect("temp repo");
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    write_run(
+        &repo_dir,
+        "rv-1",
+        &review_state("rv-1", "2023-11-14T22:15:00Z", "error"),
+        true,
+    );
+    write_run(
+        &repo_dir,
+        "iv-1",
+        &investigate_state("iv-1", "2023-11-14T22:15:00Z", "max_turns"),
+        true,
+    );
+    let read = super::runs::read_runs(&scope_for(&repo_dir))
+        .await
+        .expect("runs");
+    assert_eq!(read.state, SourceState::Available);
+    assert_eq!(read.rows.len(), 2);
+    let review = read
+        .rows
+        .iter()
+        .find(|row| row.run_id == "rv-1")
+        .expect("rv");
+    assert_eq!(review.kind, "review");
+    assert_eq!(review.status, "error");
+    assert_eq!(review.started_at, 1_700_000_100);
+    assert_eq!(review.summary, "HEAD~1..HEAD");
+    assert_eq!(review.reviewers, vec!["claude-code", "codex"]);
+    assert_eq!(review.item_state, "available");
+    let investigate = read
+        .rows
+        .iter()
+        .find(|row| row.run_id == "iv-1")
+        .expect("iv");
+    assert_eq!(investigate.kind, "investigate");
+    assert_eq!(investigate.started_at, 1_700_000_100);
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn uid06_malformed_isolation() {
+    let repo_dir = tempdir().expect("temp repo");
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    write_run(
+        &repo_dir,
+        "rv-good",
+        &review_state("rv-good", "2024-01-01T00:00:00Z", "success"),
+        true,
+    );
+    write_run(&repo_dir, "rv-bad", "not json", true);
+    let read = super::runs::read_runs(&scope_for(&repo_dir))
+        .await
+        .expect("runs");
+    assert_eq!(read.state, SourceState::Available);
+    let good = read
+        .rows
+        .iter()
+        .find(|row| row.run_id == "rv-good")
+        .expect("good");
+    let bad = read
+        .rows
+        .iter()
+        .find(|row| row.run_id == "rv-bad")
+        .expect("bad");
+    assert_eq!(good.item_state, "available");
+    assert_eq!(bad.item_state, "malformed");
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn uid06_incomplete_and_oversized_items() {
+    let repo_dir = tempdir().expect("temp repo");
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    write_run(
+        &repo_dir,
+        "rv-nomanifest",
+        &review_state("rv-nomanifest", "2024-01-01T00:00:00Z", "success"),
+        false,
+    );
+    let big = format!(
+        r#"{{"schema_version":2,"run_id":"rv-big","kind":"review","agents":[],"starting_sha":"a","target_scope":"{}","terminal_state":"success","created_at":"2024-01-01T00:00:00Z","updated_at":"2024-01-01T00:00:00Z","cancel_requested":false}}"#,
+        "x".repeat(70 * 1024)
+    );
+    write_run(&repo_dir, "rv-big", &big, true);
+    let read = super::runs::read_runs(&scope_for(&repo_dir))
+        .await
+        .expect("runs");
+    let no_manifest = read
+        .rows
+        .iter()
+        .find(|row| row.run_id == "rv-nomanifest")
+        .expect("nomanifest");
+    let oversized = read
+        .rows
+        .iter()
+        .find(|row| row.run_id == "rv-big")
+        .expect("big");
+    assert_eq!(no_manifest.item_state, "incomplete");
+    assert_eq!(oversized.item_state, "oversized");
+    assert!(
+        read.truncated,
+        "an oversized file marks the subset truncated"
+    );
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn uid06_unknown_kind_is_malformed() {
+    let repo_dir = tempdir().expect("temp repo");
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    write_run(
+        &repo_dir,
+        "run-x",
+        r#"{"kind":"experiment","terminal_state":"success"}"#,
+        true,
+    );
+    let read = super::runs::read_runs(&scope_for(&repo_dir))
+        .await
+        .expect("runs");
+    assert_eq!(read.rows[0].kind, "unknown");
+    assert!(read.rows[0].summary.contains("experiment"));
+    assert_eq!(read.rows[0].item_state, "malformed");
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn uid06_truncated_subset() {
+    let repo_dir = tempdir().expect("temp repo");
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    for index in 0..(super::runs::RUN_STATE_CAP + 1) {
+        write_run(
+            &repo_dir,
+            &format!("rv-{index:04}"),
+            &review_state(&format!("rv-{index:04}"), "2024-01-01T00:00:00Z", "success"),
+            true,
+        );
+    }
+    let read = super::runs::read_runs(&scope_for(&repo_dir))
+        .await
+        .expect("runs");
+    assert_eq!(read.rows.len(), super::runs::RUN_ROWS_PER_KIND);
+    assert!(read.truncated, "state parsing hit its cap");
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn uid06_source_states() {
+    let repo_dir = tempdir().expect("temp repo");
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    let read = super::runs::read_runs(&scope_for(&repo_dir))
+        .await
+        .expect("runs");
+    assert_eq!(read.state, SourceState::Absent);
+    assert!(read.rows.is_empty());
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn uid06_read_only() {
+    let repo_dir = tempdir().expect("temp repo");
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    write_run(
+        &repo_dir,
+        "rv-1",
+        r#"{"kind":"review","terminal_state":"success"}"#,
+        true,
+    );
+    let db_path = repo_dir
+        .path()
+        .join(crate::utils::util::ROOT_DIR)
+        .join(crate::utils::util::DATABASE);
+    let before = receipt_fingerprint(&db_path).await;
+    let _read = super::runs::read_runs(&scope_for(&repo_dir))
+        .await
+        .expect("runs");
+    let after = receipt_fingerprint(&db_path).await;
+    assert_eq!(before, after, "run reads write no rows");
+}
+
+#[test]
+fn uid06_filter_uses_real_fields() {
+    let row = super::runs::RunRow {
+        run_id: "rv-1".into(),
+        kind: "review".into(),
+        started_at: 1,
+        status: "success".into(),
+        summary: "rate limiter review".into(),
+        reviewers: vec!["codex".into()],
+        rounds: None,
+        conclusion: String::new(),
+        conclusion_state: "unavailable".to_string(),
+        started_at_ms: 1000,
+        item_state: "available".into(),
+    };
+    assert!(super::runs::matches_filter(&row, "", "limiter"));
+    assert!(super::runs::matches_filter(&row, "review", ""));
+    assert!(!super::runs::matches_filter(&row, "investigate", ""));
+    assert!(!super::runs::matches_filter(&row, "", "absent"));
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn uid06_manifest_bounds_and_ordering() {
+    let repo_dir = tempdir().expect("temp repo");
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    // Manifest over the cap must become item-level oversized.
+    write_run(
+        &repo_dir,
+        "rv-big-manifest",
+        &review_state("rv-big-manifest", "2024-01-01T00:00:00Z", "success"),
+        false,
+    );
+    let root = run_root(&repo_dir).join("rv-big-manifest");
+    fs::write(root.join("manifest.json"), "x".repeat(70 * 1024)).expect("big manifest");
+    // Directory mtime order opposite to the record time: the record time wins.
+    write_run(
+        &repo_dir,
+        "rv-old-dir-new-record",
+        &review_state("rv-old-dir-new-record", "2024-01-02T00:00:00Z", "success"),
+        true,
+    );
+    write_run(
+        &repo_dir,
+        "rv-new-dir-old-record",
+        &review_state("rv-new-dir-old-record", "2023-01-01T00:00:00Z", "success"),
+        true,
+    );
+    let read = super::runs::read_runs(&scope_for(&repo_dir))
+        .await
+        .expect("runs");
+    let big = read
+        .rows
+        .iter()
+        .find(|row| row.run_id == "rv-big-manifest")
+        .expect("big manifest");
+    assert_eq!(big.item_state, "oversized");
+    assert_eq!(
+        read.rows[0].run_id, "rv-old-dir-new-record",
+        "records sort by their own timestamp, not directory mtime"
+    );
+}
+
+#[test]
+fn uid06_screens_show_unclassified_rows() {
+    let mut row = super::runs::RunRow {
+        run_id: "rv-bad".into(),
+        kind: "unknown".into(),
+        started_at: 1,
+        status: "unknown".into(),
+        summary: String::new(),
+        reviewers: Vec::new(),
+        rounds: None,
+        conclusion: String::new(),
+        conclusion_state: "unavailable".to_string(),
+        started_at_ms: 1000,
+        item_state: "malformed".into(),
+    };
+    assert!(super::runs::visible_on(&row, "review"));
+    assert!(super::runs::visible_on(&row, "investigate"));
+    row.kind = "review".into();
+    row.item_state = "malformed".into();
+    assert!(super::runs::visible_on(&row, "review"));
+    assert!(!super::runs::visible_on(&row, "investigate"));
+    row.item_state = "available".into();
+    assert!(super::runs::visible_on(&row, "review"));
+    assert!(!super::runs::visible_on(&row, "investigate"));
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn uid06_paused_and_precision() {
+    let repo_dir = tempdir().expect("temp repo");
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    let paused = r#"{"schema_version":2,"run_id":"iv-paused","topic":"paused topic","kind":"investigate","agents":["codex"],"max_turns":4,"quorum":2,"completed_rounds":1,"turn":1,"next_agent_idx":0,"stances":[],"findings_doc":"findings.md","starting_sha":"a","started_at":"2024-01-01T00:00:00.500Z","updated_at":"2024-01-01T00:00:00.500Z","pending_turn":{"turn":1,"agent_idx":0,"slug":"codex","reason":"agent_failure"},"cancel_requested":false}"#;
+    write_run(&repo_dir, "iv-paused", paused, true);
+    write_run(
+        &repo_dir,
+        "rv-later",
+        &review_state("rv-later", "2024-01-01T00:00:00.900Z", "success"),
+        true,
+    );
+    let read = super::runs::read_runs(&scope_for(&repo_dir))
+        .await
+        .expect("runs");
+    let paused_row = read
+        .rows
+        .iter()
+        .find(|row| row.run_id == "iv-paused")
+        .expect("paused");
+    assert_eq!(paused_row.status, "paused");
+    assert_eq!(paused_row.rounds, Some(1));
+    assert_eq!(
+        read.rows[0].run_id, "rv-later",
+        "microsecond precision orders runs"
+    );
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn uid06_conclusions_and_identity() {
+    let repo_dir = tempdir().expect("temp repo");
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    write_run(
+        &repo_dir,
+        "rv-concl",
+        &review_state("rv-concl", "2024-01-01T00:00:00Z", "success"),
+        true,
+    );
+    fs::write(
+        run_root(&repo_dir).join("rv-concl").join("findings.md"),
+        "# Review findings\n\n- run_id: rv-concl\n- terminal_state: success\n\n## claude-code — success\n<<<untrusted-reviewer-output slug=\"claude-code\">>>\nConclusion: no regressions found\n<<<end-untrusted-reviewer-output>>>",
+    )
+    .expect("findings");
+    let stance = r#"{"schema_version":2,"run_id":"iv-concl","topic":"topic","kind":"investigate","agents":["codex"],"max_turns":4,"quorum":2,"completed_rounds":2,"turn":2,"next_agent_idx":0,"stances":[{"turn":2,"agent_idx":0,"slug":"codex","disposition":"concluding","summary":"final stance summary"}],"findings_doc":"findings.md","starting_sha":"a","started_at":"2024-01-01T00:00:00Z","updated_at":"2024-01-01T00:00:00Z","terminal_state":"quorum","cancel_requested":false}"#;
+    write_run(&repo_dir, "iv-concl", stance, true);
+    // Identity mismatches must be item-level malformed.
+    let mismatched = r#"{"schema_version":2,"run_id":"someone-else","topic":"t","kind":"investigate","agents":[],"max_turns":1,"quorum":1,"completed_rounds":0,"turn":0,"next_agent_idx":0,"stances":[],"findings_doc":"findings.md","starting_sha":"a","started_at":"2024-01-01T00:00:00Z","updated_at":"2024-01-01T00:00:00Z","terminal_state":null,"cancel_requested":false}"#;
+    write_run(&repo_dir, "iv-mismatch", mismatched, true);
+    let read = super::runs::read_runs(&scope_for(&repo_dir))
+        .await
+        .expect("runs");
+    let review = read
+        .rows
+        .iter()
+        .find(|row| row.run_id == "rv-concl")
+        .expect("rv");
+    assert!(review.conclusion.contains("no regressions"));
+    let investigate = read
+        .rows
+        .iter()
+        .find(|row| row.run_id == "iv-concl")
+        .expect("iv");
+    assert_eq!(investigate.conclusion, "final stance summary");
+    assert_eq!(investigate.rounds, Some(2));
+    let mismatch = read
+        .rows
+        .iter()
+        .find(|row| row.run_id == "iv-mismatch")
+        .expect("mismatch");
+    assert_eq!(mismatch.item_state, "malformed");
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn uid06_legacy_schema_and_conclusion_states() {
+    let repo_dir = tempdir().expect("temp repo");
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    write_run(
+        &repo_dir,
+        "rv-legacy",
+        &review_state("rv-legacy", "2024-01-01T00:00:00Z", "success"),
+        true,
+    );
+    // Supported legacy manifest schema 1 must stay available.
+    let legacy_manifest = r#"{"schema_version":1,"run_id":"rv-legacy","kind":"review","agents":[],"starting_sha":"a","target_scope":"scope","terminal_state":null,"created_at":"2024-01-01T00:00:00Z","updated_at":"2024-01-01T00:00:00Z","findings_oid":null,"redaction_report":{"matches":0,"bytes_scanned":0,"bytes_redacted":0},"manual_attach":[]}"#;
+    fs::write(
+        run_root(&repo_dir).join("rv-legacy").join("manifest.json"),
+        legacy_manifest,
+    )
+    .expect("legacy manifest");
+    // Heading-only findings are an empty conclusion, not "recorded".
+    write_run(
+        &repo_dir,
+        "rv-empty",
+        &review_state("rv-empty", "2024-01-01T00:00:00Z", "success"),
+        true,
+    );
+    fs::write(
+        run_root(&repo_dir).join("rv-empty").join("findings.md"),
+        "# Review findings\n\n## claude-code — success (exit code 0)\n",
+    )
+    .expect("empty findings");
+    // Oversized findings are an explicit oversized conclusion.
+    write_run(
+        &repo_dir,
+        "rv-oversized",
+        &review_state("rv-oversized", "2024-01-01T00:00:00Z", "success"),
+        true,
+    );
+    fs::write(
+        run_root(&repo_dir).join("rv-oversized").join("findings.md"),
+        "y".repeat(70 * 1024),
+    )
+    .expect("oversized findings");
+    let read = super::runs::read_runs(&scope_for(&repo_dir))
+        .await
+        .expect("runs");
+    let legacy = read
+        .rows
+        .iter()
+        .find(|row| row.run_id == "rv-legacy")
+        .expect("legacy");
+    assert_eq!(legacy.item_state, "available", "schema 1 is supported");
+    let empty = read
+        .rows
+        .iter()
+        .find(|row| row.run_id == "rv-empty")
+        .expect("empty");
+    assert_eq!(empty.conclusion_state, "empty");
+    assert!(empty.conclusion.is_empty());
+    let oversized = read
+        .rows
+        .iter()
+        .find(|row| row.run_id == "rv-oversized")
+        .expect("oversized");
+    assert_eq!(oversized.conclusion_state, "oversized");
+}
+
+#[test]
+fn uid06_future_schema_is_malformed() {
+    // Data-level guard: a schema newer than the supported set is rejected by
+    // the typed manifest identity check (covered through read_runs above for
+    // legacy; this pins the comparison contract directly).
+    let supported = [
+        1,
+        crate::internal::ai::review::store::REVIEW_MANIFEST_SCHEMA_VERSION,
+    ];
+    assert!(supported.contains(&1));
+    assert!(!supported.contains(&99));
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn uid06_future_schemas_are_malformed() {
+    let repo_dir = tempdir().expect("temp repo");
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    let review_state_json = r#"{"schema_version":99,"run_id":"rv-future","kind":"review","agents":[],"starting_sha":"a","target_scope":"s","terminal_state":"success","created_at":"2024-01-01T00:00:00Z","updated_at":"2024-01-01T00:00:00Z","cancel_requested":false}"#;
+    write_run(&repo_dir, "rv-future", review_state_json, true);
+    let investigate_state_json = r#"{"schema_version":99,"run_id":"iv-future","topic":"t","kind":"investigate","agents":[],"max_turns":1,"quorum":1,"completed_rounds":0,"turn":0,"next_agent_idx":0,"stances":[],"findings_doc":"findings.md","starting_sha":"a","started_at":"2024-01-01T00:00:00Z","updated_at":"2024-01-01T00:00:00Z","terminal_state":null,"cancel_requested":false}"#;
+    write_run(&repo_dir, "iv-future", investigate_state_json, true);
+    // Manifest schema 99 for both kinds must also be malformed.
+    write_run(
+        &repo_dir,
+        "rv-bad-manifest",
+        &review_state("rv-bad-manifest", "2024-01-01T00:00:00Z", "success"),
+        true,
+    );
+    fs::write(
+        run_root(&repo_dir)
+            .join("rv-bad-manifest")
+            .join("manifest.json"),
+        manifest_json("rv-bad-manifest", "review")
+            .replace("\"schema_version\":2", "\"schema_version\":99"),
+    )
+    .expect("bad manifest");
+    write_run(
+        &repo_dir,
+        "iv-bad-manifest",
+        &investigate_state("iv-bad-manifest", "2024-01-01T00:00:00Z", "quorum"),
+        true,
+    );
+    fs::write(
+        run_root(&repo_dir)
+            .join("iv-bad-manifest")
+            .join("manifest.json"),
+        manifest_json("iv-bad-manifest", "investigate")
+            .replace("\"schema_version\":2", "\"schema_version\":99"),
+    )
+    .expect("bad investigate manifest");
+    let read = super::runs::read_runs(&scope_for(&repo_dir))
+        .await
+        .expect("runs");
+    for id in [
+        "rv-future",
+        "iv-future",
+        "rv-bad-manifest",
+        "iv-bad-manifest",
+    ] {
+        let row = read.rows.iter().find(|row| row.run_id == id).expect(id);
+        assert_eq!(row.item_state, "malformed", "{id} must be malformed");
+    }
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn uid06_future_state_schema_is_malformed() {
+    let repo_dir = tempdir().expect("temp repo");
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    let state = r#"{"schema_version":99,"run_id":"rv-future","kind":"review","agents":[],"starting_sha":"a","target_scope":"s","terminal_state":"success","created_at":"2024-01-01T00:00:00Z","updated_at":"2024-01-01T00:00:00Z","cancel_requested":false}"#;
+    write_run(&repo_dir, "rv-future", state, true);
+    let read = super::runs::read_runs(&scope_for(&repo_dir))
+        .await
+        .expect("runs");
+    assert_eq!(read.rows[0].item_state, "malformed");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[serial(cwd)]
+async fn uid06_fifo_state_does_not_block() {
+    let repo_dir = tempdir().expect("temp repo");
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    let dir = run_root(&repo_dir).join("rv-fifo");
+    fs::create_dir_all(&dir).expect("dir");
+    fs::write(
+        dir.join("manifest.json"),
+        manifest_json("rv-fifo", "review"),
+    )
+    .expect("manifest");
+    let status = std::process::Command::new("mkfifo")
+        .arg(dir.join("state.json"))
+        .status()
+        .expect("mkfifo");
+    assert!(status.success(), "the FIFO fixture was created");
+    // Run the read on a worker thread with a watchdog: tokio's timer cannot
+    // interrupt synchronous filesystem I/O, so a blocked FIFO must be caught
+    // by recv_timeout instead of hanging the test process.
+    let scope = scope_for(&repo_dir);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let result = runtime.block_on(super::runs::read_runs(&scope));
+        let _ = sender.send(result);
+    });
+    let read = receiver
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("a FIFO must not block the read")
+        .expect("runs");
+    assert_eq!(read.rows.len(), 1);
+    assert_eq!(read.rows[0].item_state, "incomplete");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[serial(cwd)]
+async fn uid06_directory_read_failure_is_unreadable() {
+    let repo_dir = tempdir().expect("temp repo");
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    let root = run_root(&repo_dir);
+    fs::create_dir_all(&root).expect("run root");
+    use std::os::unix::fs::PermissionsExt;
+    let mut permissions = fs::metadata(&root).expect("stat").permissions();
+    permissions.set_mode(0o000);
+    fs::set_permissions(&root, permissions).expect("chmod 000");
+    let error = super::runs::read_runs(&scope_for(&repo_dir))
+        .await
+        .expect_err("a non-searchable directory is not absent");
+    assert_eq!(
+        error.state,
+        SourceState::Unreadable {
+            kind: std::io::ErrorKind::PermissionDenied
+        }
+    );
+    let mut permissions = fs::metadata(&root).expect("stat").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&root, permissions).expect("restore");
+}

@@ -45,6 +45,10 @@ pub struct Snapshot {
     pub memory: super::memory::MemoryRead,
     /// Memory-specific failure while the context itself is available.
     pub memory_error: Option<String>,
+    /// Run records for Reviews/Investigate.
+    pub runs: super::runs::RunsRead,
+    /// Runs-specific failure while the context itself is available.
+    pub runs_error: Option<String>,
     /// Sessions-specific failure while the context itself is available.
     pub sessions_error: Option<String>,
     /// The typed Sessions source state.
