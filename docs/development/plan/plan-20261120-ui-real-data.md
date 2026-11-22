@@ -403,7 +403,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `done` / `remote-pending`
+**Lifecycle / Acceptance:** `done` / `complete`
 
 **Description:** 建立 `src/gui/data/` 只读接缝：用 `RequestScope::try_resolve`/`try_get_storage_path` 解析当前工作目录仓库，启动单一后台 worker（长期 runtime + 请求 scope（task-local）+ 注入连接 + 进程级 handle registry），向 GPUI 主线程投递带序号的不可变快照与 ADR-UID-06 的源级状态。行为轴是**数据获取的线程、生命周期、只读性与失败分类**。
 
@@ -478,7 +478,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `done` / `remote-pending`
+**Lifecycle / Acceptance:** `done` / `complete`
 
 **Description:** 用真实提交历史替换 `screens/history.rs` 的静态 `COMMITS` 表，按真实归属数据（`agent_session_commit` 的 commit-keyed 批量查询）与真实父链重建筛选与拓扑，并移除该页残留的演示文案。行为轴是**History 表面的数据、归属与拓扑**。
 
@@ -555,7 +555,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `done` / `remote-pending`
+**Lifecycle / Acceptance:** `done` / `complete`
 
 **Description:** 用 `.libra/private/capture.db` 中的真实 `agent_session`/`agent_checkpoint`/`agent_bridge_event` 行替换 Sessions 的内嵌演示目录数据，并提升会话分页 SQL 为可复用读 API（连接注入、父模块导出）。行为轴是**Sessions 表面的数据来源、隐私边界与过渡消费者兼容**。
 
@@ -632,7 +632,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `done` / `remote-pending`
+**Lifecycle / Acceptance:** `done` / `complete`
 
 **Description:** 用 operation v2 journal 替换 Operations 页面静态卡片，并新增命令层共享 `operation_snapshot_rows` 快照读取（CLI 输出不变）；分页以 **一次性快照**为基准（不依赖可变的 `end_ts` 排序）。行为轴是**Operations 表面的分页数据投影**。
 
@@ -705,7 +705,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `done` / `remote-pending`
+**Lifecycle / Acceptance:** `done` / `complete`
 
 **Description:** 用 memory episode 只读投影替换 Memory 页面静态卡片，并新增**伴生**有界读 API（保留 `list_episodes` 原签名），把 episode 行与子表证据/路径限制在本页选中的 episode 集合；freshness 保留既有全源指纹语义（成本如实登记）。行为轴是**Memory 表面的有界投影与 stale 语义**。
 
@@ -774,7 +774,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `done` / `remote-pending`
+**Lifecycle / Acceptance:** `done` / `complete`
 
 **Description:** 用 `.libra/sessions/agent-runs/<run_id>/` 的真实 run 目录替换 Reviews/Investigate 页面静态卡片：全目录扫描（上限 5000 metadata，按 metadata mtime 倒序取候选）、逐项**打开句柄的有界读**（≤64 KiB）解析公开 wire 类型（解析上限 500 个 state），先读 kind 再用对应 wire 类型解析（未知 kind 记 `malformed`）、按 `state.json` 的 `created_at`/`started_at` 排序并显示每 kind 最新 100，使损坏/超大/缺件行成为条目级状态而不是整页失败。行为轴是**运行记录面的逐项读取与损坏隔离**。
 
