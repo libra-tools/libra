@@ -912,6 +912,19 @@ were used to choose the abbreviation length.
 
 ### `--follow`
 
+`--follow` is a boolean flag: the single pathspec names the file whose history is
+traced through renames. No pathspec, or more than one, fails with `LBR-CLI-002`
+and Git's wording `--follow requires exactly one pathspec`. The deprecated
+`--follow=<FILE>` spelling keeps working for existing scripts and is equivalent
+to `--follow -- <FILE>`.
+
+```bash
+libra log --follow --oneline -- b.txt
+libra log --follow=b.txt --oneline
+```
+
+### `--follow`
+
 `--follow` performs best-effort rename detection by walking history backwards,
 switching to an exact-blob predecessor path at a rename. It does not handle
 complex directory renames, content-changing/content-similar renames, or every

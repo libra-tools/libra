@@ -1251,7 +1251,7 @@ PY
 
 ### Task LS-16: 将 `log --follow` 改为无参布尔标志（#962）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-21：`LogArgs::follow` 改为 `num_args=0..=1` + `default_missing_value=""` + `require_equals` 的无值布尔标志；新增 `resolve_follow_path`——显式 `=FILE` 优先，裸标志要求恰好一个位置 pathspec，否则 `CliError::command_usage("--follow requires exactly one pathspec")` + `StableErrorCode::CliInvalidArguments`（`LBR-CLI-002`）；两处 `effective_follow` 计算改用该 helper，`resolve_log_config` 的「显式 `--follow`」判定仍以 `is_some()` 成立；旧写法 `--follow=<FILE>` 保留并在 `COMPATIBILITY.md` 登记为有意差异。AC1–AC7 由 `command::log_test::follow_boolean_flag_single_pathspec` 覆盖（AC1/AC2/AC7 逐字相等且含重命名前 C1；AC3–AC6 校验码与诊断文本），`log_test` 全绿；严格 Clippy exit 0。**Codex/Claude 审计按用户 2026-11-21 指令取消**。）
 
 **Description:** 将 `LogArgs::follow` 从 `--follow <FILE>` 改为 Git 兼容的无值标志，由唯一位置 pathspec 决定跟踪文件；0 个或多于 1 个路径时按 Git 报 `--follow requires exactly one pathspec`（`LBR-CLI-002`）。为不在 `patch` 版本中破坏既有脚本（ER-08），保留旧写法 `--follow=<FILE>`（`require_equals`，已弃用，等价于 `--follow -- <FILE>`），并在 `COMPATIBILITY.md` 登记为有意差异；`--follow <FILE>`（空格分隔）在新语义下自然解析为位置 pathspec，结果不变。
 

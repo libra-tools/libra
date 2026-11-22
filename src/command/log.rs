@@ -501,8 +501,17 @@ pub struct LogArgs {
     #[clap(long)]
     pub all: bool,
 
-    /// Show history of a single file, following renames across commits.
-    #[clap(long, value_name = "FILE", conflicts_with = "no_follow")]
+    /// Show history of a single file, following renames across commits. The
+    /// file comes from the single pathspec; `--follow=<FILE>` (deprecated) is
+    /// still accepted for script compatibility.
+    #[clap(
+        long,
+        value_name = "FILE",
+        num_args = 0..=1,
+        default_missing_value = "",
+        require_equals = true,
+        conflicts_with = "no_follow"
+    )]
     pub follow: Option<String>,
 
     /// Do not follow renames, overriding `log.follow=true`.
@@ -1742,6 +1751,22 @@ async fn tag_tip_commits(pattern: &str) -> CliResult<Vec<ObjectHash>> {
     Ok(tips)
 }
 
+/// Resolve `--follow`: an explicit `=FILE` wins, otherwise the single pathspec
+/// selects the tracked file (Git's `--follow requires exactly one pathspec`).
+fn resolve_follow_path(args: &LogArgs, paths: &[String]) -> CliResult<Option<std::path::PathBuf>> {
+    match args.follow.as_deref() {
+        None => Ok(None),
+        Some("") => match paths {
+            [single] => Ok(Some(util::to_workdir_path(single))),
+            _ => Err(
+                CliError::command_usage("--follow requires exactly one pathspec")
+                    .with_stable_code(StableErrorCode::CliInvalidArguments),
+            ),
+        },
+        Some(explicit) => Ok(Some(util::to_workdir_path(explicit))),
+    }
+}
+
 async fn resolve_log_start_commits(
     args: &LogArgs,
     ranges: &[String],
@@ -2541,11 +2566,8 @@ async fn execute_safe_with_diff_formats(
     let (ranges, paths) = resolve_log_inputs(&args).await?;
     let path_filters: Vec<PathBuf> = paths.iter().map(util::to_workdir_path).collect();
     let configured_follow = configured_follow_path(&path_filters, log_config.follow);
-    let effective_follow = args
-        .follow
-        .as_deref()
-        .map(util::to_workdir_path)
-        .or_else(|| configured_follow.clone());
+    let effective_follow =
+        resolve_follow_path(&args, &paths)?.or_else(|| configured_follow.clone());
     let selection_path_filters = if effective_follow.is_some() {
         Vec::new()
     } else {
@@ -3418,11 +3440,7 @@ async fn run_log(
     let (ranges, paths) = resolve_log_inputs(args).await?;
     let path_filters: Vec<PathBuf> = paths.iter().map(util::to_workdir_path).collect();
     let configured_follow = configured_follow_path(&path_filters, log_config.follow);
-    let effective_follow = args
-        .follow
-        .as_deref()
-        .map(util::to_workdir_path)
-        .or_else(|| configured_follow.clone());
+    let effective_follow = resolve_follow_path(args, &paths)?.or_else(|| configured_follow.clone());
     let selection_path_filters = if effective_follow.is_some() {
         Vec::new()
     } else {

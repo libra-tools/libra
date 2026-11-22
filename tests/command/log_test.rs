@@ -8217,3 +8217,93 @@ fn output_json_to_file() {
         "AC1 contents"
     );
 }
+
+#[test]
+fn follow_boolean_flag_single_pathspec() {
+    use super::{assert_cli_success, run_libra_command};
+
+    // Fixture F16: C1 adds a.txt, C2 renames it to b.txt, C3 edits b.txt.
+    let work = tempfile::tempdir().expect("work dir");
+    let repo = work.path().join("r");
+    std::fs::create_dir_all(&repo).expect("mkdir repo");
+    assert_cli_success(&run_libra_command(&["init"], &repo), "init");
+    run_libra_command(&["config", "set", "user.name", "t"], &repo);
+    run_libra_command(&["config", "set", "user.email", "t@t"], &repo);
+    let head = || {
+        let result = run_libra_command(&["rev-parse", "HEAD"], &repo);
+        assert_cli_success(&result, "rev-parse HEAD");
+        String::from_utf8_lossy(&result.stdout).trim().to_string()
+    };
+    std::fs::write(repo.join("a.txt"), "1\n").expect("write a");
+    assert_cli_success(&run_libra_command(&["add", "a.txt"], &repo), "add a");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c1", "--no-verify"], &repo),
+        "commit c1",
+    );
+    let c1 = head();
+    assert_cli_success(
+        &run_libra_command(&["mv", "a.txt", "b.txt"], &repo),
+        "mv a -> b",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c2", "--no-verify"], &repo),
+        "commit c2",
+    );
+    let c2 = head();
+    std::fs::write(repo.join("b.txt"), "1\n2\n").expect("edit b");
+    assert_cli_success(&run_libra_command(&["add", "b.txt"], &repo), "add b");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c3", "--no-verify"], &repo),
+        "commit c3",
+    );
+    let c3 = head();
+
+    let out = |args: &[&str]| {
+        let result = run_libra_command(args, &repo);
+        assert_cli_success(&result, &format!("log {args:?}"));
+        String::from_utf8_lossy(&result.stdout).to_string()
+    };
+    let expected = format!(
+        "{} {}\n{} {}\n{} {}\n",
+        &c3[..7],
+        "c3",
+        &c2[..7],
+        "c2",
+        &c1[..7],
+        "c1"
+    );
+
+    // AC1: the pathspec form walks through the rename back to C1.
+    assert_eq!(
+        out(&["log", "--follow", "--oneline", "--", "b.txt"]),
+        expected,
+        "AC1"
+    );
+    // AC2: the bare positional pathspec behaves identically.
+    assert_eq!(
+        out(&["log", "--follow", "--oneline", "b.txt"]),
+        expected,
+        "AC2"
+    );
+    // AC7: the deprecated `--follow=<FILE>` spelling is unchanged.
+    assert_eq!(
+        out(&["log", "--follow=b.txt", "--oneline"]),
+        expected,
+        "AC7"
+    );
+
+    // AC3/AC4: no pathspec is a usage error with Git's wording.
+    for args in [
+        vec!["log", "--follow"],
+        vec!["log", "--follow", "--", "a.txt", "b.txt"],
+    ] {
+        let result = run_libra_command(&args, &repo);
+        assert!(!result.status.success(), "{args:?} must fail");
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(stderr.contains("LBR-CLI-002"), "{args:?} code: {stderr}");
+        assert!(
+            stderr.contains("--follow requires exactly one pathspec"),
+            "{args:?} wording: {stderr}"
+        );
+    }
+}

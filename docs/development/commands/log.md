@@ -128,3 +128,5 @@ flowchart TD
 - 2026-11-21（LS-37 / #963）：`--output` 开放既有目标原地覆盖——以「只写、不创建、不截断」打开，`fstat` 取 `(dev,inode,nlink)` 与预检 `stat` 比对（检查后被替换即拒绝），`nlink>1` 时遍历 `.libra/` 比对 inode（含硬链接/符号链接触及仓库文件），核验通过后才经同一描述符截断；目录目标以 `LBR-IO-002` 失败。同步按协议删除 `output_to_file` 中 LS-15 的「既有目标拒绝」断言。回归：`command::log_test::output_overwrite_and_protection`（AC1–AC8）。
 
 - 2026-11-21（LS-36 / #963）：开放 `--json` 与 `--output` 组合——新增 `utils::output::json_command_envelope_bytes`（`emit_json_data` 复用之），JSON 信封经 `LogSink` 写入目标文件、stdout 为空，`.libra/` 与失败诊断沿用 LS-15/LS-37；按协议删除 `output_to_file` 中 LS-15 的「`--json --output` 拒绝」断言。回归：`command::log_test::output_json_to_file`（AC1–AC2）。
+
+- 2026-11-21（LS-16 / #962）：`--follow` 改为无值布尔标志（`num_args=0..=1` + `default_missing_value=""` + `require_equals`），由唯一位置 pathspec 决定跟踪文件；0/多路径以 `LBR-CLI-002` 拒绝并输出 Git 同文 `--follow requires exactly one pathspec`；旧写法 `--follow=<FILE>` 保留（等价 `--follow -- <FILE>`）并登记为有意差异。回归：`command::log_test::follow_boolean_flag_single_pathspec`（AC1–AC7）。

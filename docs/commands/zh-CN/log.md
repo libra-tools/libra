@@ -655,6 +655,15 @@ Git 接受 `git log A..B` 这种位置修订表达式（其后可跟 pathspec）
 
 ### `--follow`
 
+`--follow` 为无值布尔标志：由唯一位置 pathspec 指定被跟踪的文件，跨重命名回溯历史。无路径或多于一个路径以 `LBR-CLI-002` 拒绝，诊断与 Git 同文：`--follow requires exactly one pathspec`。旧写法 `--follow=<FILE>` 继续可用（等价于 `--follow -- <FILE>`，已在兼容表中登记为有意差异）。
+
+```bash
+libra log --follow --oneline -- b.txt
+libra log --follow=b.txt --oneline
+```
+
+### `--follow`
+
 `--follow` 反向遍历历史，并在重命名处切换到 exact-blob 匹配的父路径。它不能处理复杂目录重命名、内容发生变化/仅相似的重命名或所有非线性历史场景。
 
 ### `-L`
