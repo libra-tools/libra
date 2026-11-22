@@ -703,7 +703,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `remote-pending`
 
 **Description:** 用 memory episode 只读投影替换 Memory 页面静态卡片，并新增**伴生**有界读 API（保留 `list_episodes` 原签名），把 episode 行与子表证据/路径限制在本页选中的 episode 集合；freshness 保留既有全源指纹语义（成本如实登记）。行为轴是**Memory 表面的有界投影与 stale 语义**。
 
@@ -993,7 +993,7 @@
 | 提交历史列表 + 归属 | O(200 提交元数据 + 父链) + 一次批量归属查询 | 每次页面重读 | ≤150ms、200 行 | `UID-02` 单测 |
 | 会话列表/详情 | O(200 会话)、O(100 事件) | 每次页面重读 | ≤200ms / ≤100ms（摘要富集共用 ≤3s 预算，超预算行降级） | `UID-03` 单测 |
 | operation 单页 | id 快照（≤50k id）+ 既有 ranked CTE 成本 | 每次翻页 | ≤150ms；≥10k operation 实测记录 | `UID-04` 单测 |
-| memory 单页 | O(200 选中 episode) + 选中集合子表 | 每次页面重读 | ≤150ms（**不含 freshness**）；freshness 成本由 `uid05_freshness_cost_measured` 实测并记入本行（≥10k episode/≥50k link） | `UID-05` 单测 |
+| memory 单页 | O(200 选中 episode) + 选中集合子表 | 每次页面重读 | ≤150ms（**不含 freshness**）；`uid05_freshness_scale_and_separate_timings` 在 ≥10k episode/≥50k link fixture 实测：页面 ≈1.3ms、freshness ≈294ms（debug 构建，macOS），freshness 不并入页面预算 | `UID-05` 单测 |
 | run 列表/详情 | metadata ≤5000 + state 解析 ≤500 × ≤64 KiB | 每次页面重读 | ≤400ms / ≤50ms、100 行 | `UID-06` 单测 |
 | 可用性探测 | O(5 数据面) | 每窗口一次 | ≤80ms（无争用）；持锁路径 busy timeout ≤200ms 后显示 `busy` | `UID-07` 单测 |
 

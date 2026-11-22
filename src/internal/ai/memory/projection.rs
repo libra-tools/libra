@@ -266,15 +266,22 @@ async fn commit_operations<C: sea_orm::ConnectionTrait>(
     if op_ids.is_empty() {
         return Ok(Vec::new());
     }
-    let ops = operation::Entity::find()
-        .filter(operation::Column::OpId.is_in(op_ids))
-        .order_by_asc(operation::Column::OpId)
-        .all(conn)
-        .await?;
-    Ok(ops
-        .into_iter()
-        .map(|op| (op.op_id, op.status, op.end_ts))
-        .collect())
+    // Batch the IN clauses to stay under SQLite's bind-variable limit while
+    // preserving the canonical op-id ordering.
+    let mut ops: Vec<(String, String, Option<i64>)> = Vec::with_capacity(op_ids.len());
+    for batch in op_ids.chunks(500) {
+        let mut rows = operation::Entity::find()
+            .filter(operation::Column::OpId.is_in(batch.iter().cloned()))
+            .order_by_asc(operation::Column::OpId)
+            .all(conn)
+            .await?
+            .into_iter()
+            .map(|op| (op.op_id, op.status, op.end_ts))
+            .collect::<Vec<_>>();
+        ops.append(&mut rows);
+    }
+    ops.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(ops)
 }
 
 #[cfg(test)]

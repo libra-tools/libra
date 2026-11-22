@@ -2171,8 +2171,7 @@ async fn insert_operations_bulk(dir: &tempfile::TempDir, count: usize) {
             }
             batch.clear();
             batch.push_str(
-                "INSERT INTO operation (op_id, repo_id, kind, status, command_name, description, \
-                 actor, worktree_id, scope_kind, pre_view_oid, post_view_oid, start_ts, end_ts) VALUES ",
+                "INSERT INTO operation (op_id, repo_id, kind, status, command_name, description, actor, worktree_id, scope_kind, pre_view_oid, post_view_oid, start_ts, end_ts) VALUES ",
             );
         } else {
             batch.push(',');
@@ -2706,4 +2705,443 @@ async fn uid04_permission_denied_is_unreadable() {
         permissions.set_mode(0o644);
         fs::set_permissions(&db_path, permissions).expect("restore mode");
     }
+}
+
+async fn rebuild_memory(dir: &tempfile::TempDir) {
+    let _guard = test::ChangeDirGuard::new(dir.path());
+    crate::command::memory::execute(crate::command::memory::MemoryArgs {
+        command: crate::command::memory::MemoryCommand::Rebuild,
+        allow_stale: false,
+    })
+    .await
+    .expect("memory rebuild");
+}
+
+async fn insert_ai_operation(dir: &tempfile::TempDir, op_id: &str) {
+    let db_path = dir
+        .path()
+        .join(crate::utils::util::ROOT_DIR)
+        .join(crate::utils::util::DATABASE);
+    let conn = db::open_database_without_migrations(&db_path)
+        .await
+        .expect("open repo db");
+    let repo_id = crate::internal::config::ConfigKv::get_with_conn(&conn, "libra.repoid")
+        .await
+        .expect("repo id")
+        .expect("repo id")
+        .value;
+    conn.execute_unprepared(&format!(
+        "INSERT INTO operation (op_id, repo_id, kind, status, command_name, description, \
+         actor, worktree_id, scope_kind, pre_view_oid, post_view_oid, start_ts, end_ts) \
+         VALUES ('{op_id}', '{repo_id}', 'commit', 'success', 'commit', 'fixture', 'tester', \
+         '', 'main', 'view', 'view', 1700000000, 1700000001); \
+         INSERT INTO ai_operation_link (operation_id, repo_id, redaction_version) VALUES ('{op_id}', '{repo_id}', '1')"
+    ))
+    .await
+    .expect("insert ai operation");
+    conn.close().await.ok();
+}
+
+async fn commit_memory_fixture(dir: &tempfile::TempDir, message: &str) {
+    let _guard = test::ChangeDirGuard::new(dir.path());
+    crate::command::commit::execute(crate::command::commit::CommitArgs {
+        message: Some(message.to_string()),
+        allow_empty: true,
+        disable_pre: true,
+        no_verify: true,
+        ..Default::default()
+    })
+    .await;
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn uid05_episode_rows_and_fields() {
+    let repo_dir = tempdir().expect("temp repo");
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    commit_memory_fixture(&repo_dir, "memory fixture").await;
+    rebuild_memory(&repo_dir).await;
+    let read = super::memory::read_memory(&scope_for(&repo_dir))
+        .await
+        .expect("memory");
+    assert_eq!(read.state, SourceState::Available);
+    assert!(!read.rows.is_empty(), "the projection has real episodes");
+    assert!(read.rows.len() <= super::memory::MEMORY_ROW_CAP);
+    let row = &read.rows[0];
+    assert!(!row.episode_id.is_empty());
+    assert!(!row.source_kind.is_empty());
+    assert!(!row.title.is_empty());
+    assert!(row.title.chars().count() <= 200);
+    assert!(row.body.chars().count() <= 200);
+    assert!(row.ended_at >= row.started_at);
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn uid05_stale_state_hides_rows() {
+    let repo_dir = tempdir().expect("temp repo");
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    commit_memory_fixture(&repo_dir, "first").await;
+    rebuild_memory(&repo_dir).await;
+    // A new linked operation changes the fingerprint, making the projection stale.
+    insert_ai_operation(&repo_dir, "op-stale").await;
+    let read = super::memory::read_memory(&scope_for(&repo_dir))
+        .await
+        .expect("memory");
+    assert_eq!(read.state, SourceState::Stale);
+    assert!(read.rows.is_empty(), "stale projections show zero rows");
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn uid05_absent_before_first_rebuild() {
+    let repo_dir = tempdir().expect("temp repo");
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    let read = super::memory::read_memory(&scope_for(&repo_dir))
+        .await
+        .expect("memory");
+    assert_eq!(read.state, SourceState::Absent);
+    assert!(read.rows.is_empty());
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn uid05_bounded_children_and_signature() {
+    let repo_dir = tempdir().expect("temp repo");
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    for index in 0..3 {
+        commit_memory_fixture(&repo_dir, &format!("commit {index}")).await;
+    }
+    rebuild_memory(&repo_dir).await;
+    let db_path = repo_dir
+        .path()
+        .join(crate::utils::util::ROOT_DIR)
+        .join(crate::utils::util::DATABASE);
+    let conn = db::open_database_without_migrations(&db_path)
+        .await
+        .expect("open repo db");
+    let repo_id = crate::internal::config::ConfigKv::get_with_conn(&conn, "libra.repoid")
+        .await
+        .expect("repo id")
+        .expect("repo id")
+        .value;
+    let bounded = crate::internal::ai::memory::reader::list_episodes_bounded(&conn, &repo_id, 2)
+        .await
+        .expect("bounded episodes");
+    assert_eq!(bounded.len(), 2);
+    let all = crate::internal::ai::memory::reader::list_episodes(&conn, &repo_id)
+        .await
+        .expect("all episodes");
+    assert_eq!(
+        all.len(),
+        3,
+        "the original signature still returns everything"
+    );
+    conn.close().await.ok();
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn uid05_read_only_receipt() {
+    let repo_dir = tempdir().expect("temp repo");
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    commit_memory_fixture(&repo_dir, "receipt").await;
+    rebuild_memory(&repo_dir).await;
+    let db_path = repo_dir
+        .path()
+        .join(crate::utils::util::ROOT_DIR)
+        .join(crate::utils::util::DATABASE);
+    let before = receipt_fingerprint(&db_path).await;
+    let _read = super::memory::read_memory(&scope_for(&repo_dir))
+        .await
+        .expect("memory");
+    let after = receipt_fingerprint(&db_path).await;
+    assert_eq!(before, after, "memory reads write no rows");
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn uid05_freshness_cost_measured() {
+    let repo_dir = tempdir().expect("temp repo");
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    commit_memory_fixture(&repo_dir, "cost").await;
+    rebuild_memory(&repo_dir).await;
+    let started = std::time::Instant::now();
+    let read = super::memory::read_memory(&scope_for(&repo_dir))
+        .await
+        .expect("memory");
+    let elapsed = started.elapsed();
+    assert_eq!(read.state, SourceState::Available);
+    assert!(
+        elapsed < std::time::Duration::from_millis(150),
+        "bounded memory read took {elapsed:?}, over the 150ms budget"
+    );
+}
+
+#[test]
+fn uid05_search_and_filter_use_real_fields() {
+    let row = super::memory::MemoryRow {
+        episode_id: "ep-1".into(),
+        source_kind: "commit".into(),
+        started_at: 1,
+        ended_at: 2,
+        title: "rate limiter".into(),
+        body: "token bucket".into(),
+        actor: Some("tester".into()),
+        outcome: "succeeded".into(),
+        evidence_count: 0,
+        path_count: 0,
+    };
+    assert!(super::memory::matches_filter(&row, "", "limiter"));
+    assert!(super::memory::matches_filter(&row, "commit", ""));
+    assert!(!super::memory::matches_filter(&row, "agent_session", ""));
+    assert!(!super::memory::matches_filter(&row, "", "absent"));
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn uid05_privacy_redacts_and_sanitizes() {
+    let repo_dir = tempdir().expect("temp repo");
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    commit_memory_fixture(&repo_dir, "privacy").await;
+    rebuild_memory(&repo_dir).await;
+    let db_path = repo_dir
+        .path()
+        .join(crate::utils::util::ROOT_DIR)
+        .join(crate::utils::util::DATABASE);
+    let conn = db::open_database_without_migrations(&db_path)
+        .await
+        .expect("open repo db");
+    let token = format!("ghp_{}", "c".repeat(36));
+    let actor = format!("{token} {}", "x".repeat(250));
+    conn.execute_unprepared(&format!(
+        "UPDATE memory_episode SET title = 'edited path=\"/Users/alice/x.rs\" and `/Users/alice/bt`', \
+         body = 'C:\\Users\\alice\\y.rs \\\\server\\share\\f.rs {token}', actor = '{actor}'"
+    ))
+    .await
+    .expect("set privacy fixture");
+    conn.close().await.ok();
+    let read = super::memory::read_memory(&scope_for(&repo_dir))
+        .await
+        .expect("memory");
+    assert_eq!(read.state, SourceState::Available);
+    for row in &read.rows {
+        assert!(!row.title.contains("/Users/"), "title path: {}", row.title);
+        assert!(!row.body.contains("/Users/"), "body path: {}", row.body);
+        assert!(!row.body.contains("C:"), "body Windows path: {}", row.body);
+        assert!(!row.body.contains("server"), "UNC path: {}", row.body);
+        assert!(!row.title.contains(&token) && !row.body.contains(&token));
+        let actor = row.actor.as_deref().unwrap_or("");
+        assert!(!actor.contains(&token), "actor secret");
+        assert!(actor.chars().count() <= 200, "actor is capped");
+        assert!(row.title.chars().count() <= 200);
+        assert!(row.body.chars().count() <= 200);
+    }
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn uid05_bounded_children_match_selected_rows() {
+    let repo_dir = tempdir().expect("temp repo");
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    for index in 0..3 {
+        commit_memory_fixture(&repo_dir, &format!("child {index}")).await;
+    }
+    rebuild_memory(&repo_dir).await;
+    let db_path = repo_dir
+        .path()
+        .join(crate::utils::util::ROOT_DIR)
+        .join(crate::utils::util::DATABASE);
+    let conn = db::open_database_without_migrations(&db_path)
+        .await
+        .expect("open repo db");
+    let repo_id = crate::internal::config::ConfigKv::get_with_conn(&conn, "libra.repoid")
+        .await
+        .expect("repo id")
+        .expect("repo id")
+        .value;
+    let all = crate::internal::ai::memory::reader::list_episodes(&conn, &repo_id)
+        .await
+        .expect("all");
+    assert_eq!(all.len(), 3);
+    let selected = all[0].episode_id.clone();
+    let excluded = all[2].episode_id.clone();
+    conn.execute_unprepared(&format!(
+        "INSERT INTO memory_episode_evidence (episode_id, ordinal, kind, ref_id, link_confidence, \
+         resolution_status) VALUES ('{selected}', 1, 'commit', 'ev-selected', 'identity', 'resolved'), \
+         ('{excluded}', 1, 'commit', 'ev-excluded', 'identity', 'resolved'); \
+         INSERT INTO memory_episode_path (episode_id, code_path, change_kind, blob_oid_at_end, \
+         ended_at) VALUES ('{selected}', 'src/selected.rs', 'modified', NULL, 1), \
+         ('{excluded}', 'src/excluded.rs', 'modified', NULL, 1)"
+    ))
+    .await
+    .expect("seed children");
+    let bounded = crate::internal::ai::memory::reader::list_episodes_bounded(&conn, &repo_id, 1)
+        .await
+        .expect("bounded");
+    assert_eq!(bounded.len(), 1);
+    let episode = &bounded[0];
+    assert_eq!(episode.episode_id, selected);
+    assert!(
+        episode
+            .evidence
+            .iter()
+            .any(|edge| edge.ref_id == "ev-selected"),
+        "selected episode keeps its evidence"
+    );
+    assert!(
+        !episode
+            .evidence
+            .iter()
+            .any(|edge| edge.ref_id == "ev-excluded"),
+        "excluded episode children are not attached"
+    );
+    assert!(
+        episode.paths.iter().any(|path| {
+            crate::internal::ai::memory::reader::render_code_path(&path.code_path)
+                == "src/selected.rs"
+        }),
+        "selected episode keeps its paths"
+    );
+    conn.close().await.ok();
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn uid05_freshness_scale_and_separate_timings() {
+    let repo_dir = tempdir().expect("temp repo");
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    let db_path = repo_dir
+        .path()
+        .join(crate::utils::util::ROOT_DIR)
+        .join(crate::utils::util::DATABASE);
+    let conn = db::open_database_without_migrations(&db_path)
+        .await
+        .expect("open repo db");
+    let repo_id = crate::internal::config::ConfigKv::get_with_conn(&conn, "libra.repoid")
+        .await
+        .expect("repo id")
+        .expect("repo id")
+        .value;
+    // 50k linked operations exercise the freshness fingerprint scale.
+    let mut op_batch = String::new();
+    let mut link_batch = String::new();
+    for index in 0..50_000 {
+        if index % 500 == 0 {
+            if !op_batch.is_empty() {
+                conn.execute_unprepared(&op_batch).await.expect("ops");
+                conn.execute_unprepared(&link_batch).await.expect("links");
+            }
+            op_batch.clear();
+            link_batch.clear();
+            op_batch.push_str(
+                "INSERT INTO operation (op_id, repo_id, kind, status, command_name, description, 
+                 actor, worktree_id, scope_kind, pre_view_oid, post_view_oid, start_ts, end_ts) VALUES ",
+            );
+            link_batch.push_str(
+                "INSERT INTO ai_operation_link (operation_id, repo_id, redaction_version) VALUES ",
+            );
+        } else {
+            op_batch.push(',');
+            link_batch.push(',');
+        }
+        op_batch.push_str(&format!(
+            "('op-{index:06}', '{repo_id}', 'commit', 'success', 'commit', 'd', 'a', '', 
+             'main', 'v', 'v', 1, 2)"
+        ));
+        link_batch.push_str(&format!("('op-{index:06}', '{repo_id}', '1')"));
+    }
+    if !op_batch.is_empty() {
+        conn.execute_unprepared(&op_batch).await.expect("ops");
+        conn.execute_unprepared(&link_batch).await.expect("links");
+    }
+    conn.close().await.ok();
+    rebuild_memory(&repo_dir).await;
+    let conn = db::open_database_without_migrations(&db_path)
+        .await
+        .expect("open repo db");
+    let mut batch = String::new();
+    for index in 0..10_000 {
+        if index % 500 == 0 {
+            if !batch.is_empty() {
+                conn.execute_unprepared(&batch).await.expect("episodes");
+            }
+            batch.clear();
+            batch.push_str(
+                "INSERT INTO memory_episode (episode_id, repo_id, source_kind, source_key, 
+                 outcome, actor, started_at, ended_at, title, body, content_digest, 
+                 rules_version) VALUES ",
+            );
+        } else {
+            batch.push(',');
+        }
+        batch.push_str(&format!(
+            "('ep-{index:05}', '{repo_id}', 'commit', 'k{index}', 'succeeded', 'tester', 
+             {ts}, {ts}, 'title {index}', 'body {index}', 'digest', 1)",
+            ts = 1_700_000_000_i64 + index as i64
+        ));
+    }
+    if !batch.is_empty() {
+        conn.execute_unprepared(&batch).await.expect("episodes");
+    }
+
+    let conn = db::open_database_without_migrations(&db_path)
+        .await
+        .expect("open repo db");
+    let freshness_started = std::time::Instant::now();
+    let stale = crate::internal::ai::memory::reader::projection_is_stale(&conn, &repo_id).await;
+    let freshness = freshness_started.elapsed();
+    eprintln!("freshness={freshness:?}");
+    conn.close().await.ok();
+    assert_eq!(stale.expect("status"), Some(false), "the rebuild is fresh");
+    // The page budget excludes freshness (recorded separately above).
+    let conn = db::open_database_without_migrations(&db_path)
+        .await
+        .expect("open repo db");
+    let page_started = std::time::Instant::now();
+    let page = crate::internal::ai::memory::reader::list_episodes_bounded(&conn, &repo_id, 200)
+        .await
+        .expect("bounded page");
+    let page_elapsed = page_started.elapsed();
+    conn.close().await.ok();
+    assert_eq!(page.len(), super::memory::MEMORY_ROW_CAP);
+    let read = super::memory::read_memory(&scope_for(&repo_dir))
+        .await
+        .expect("memory");
+    assert_eq!(read.state, SourceState::Available);
+    assert_eq!(read.rows.len(), super::memory::MEMORY_ROW_CAP);
+    eprintln!("page={page_elapsed:?}");
+    assert!(
+        page_elapsed < std::time::Duration::from_millis(150),
+        "bounded page took {page_elapsed:?}, over the 150ms budget"
+    );
+}
+
+#[test]
+fn uid05_worker_fallback_preserves_state() {
+    let outcome = super::worker::ReadOutcome::new(
+        SourceState::Absent,
+        None,
+        Some("no repository".to_string()),
+    );
+    assert_eq!(outcome.memory.state, SourceState::Absent);
+    let outcome = super::worker::ReadOutcome::new(SourceState::Corrupt, None, None);
+    assert_eq!(outcome.memory.state, SourceState::Corrupt);
+}
+
+#[tokio::test]
+#[serial(cwd)]
+async fn uid05_empty_projection_is_absent() {
+    let repo_dir = tempdir().expect("temp repo");
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    rebuild_memory(&repo_dir).await;
+    let read = super::memory::read_memory(&scope_for(&repo_dir))
+        .await
+        .expect("memory");
+    assert_eq!(
+        read.state,
+        SourceState::Absent,
+        "a fresh projection with no episodes is absent, not available"
+    );
+    assert!(read.rows.is_empty());
 }

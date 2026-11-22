@@ -158,6 +158,12 @@ pub struct Desktop {
     pub ops_query: String,
     /// Dedicated Operations search input (never the command palette text).
     pub ops_input: Entity<TextInput>,
+    /// Memory source filter.
+    pub memory_source: String,
+    /// Memory free-text search.
+    pub memory_query: String,
+    /// Dedicated Memory search input.
+    pub memory_input: Entity<TextInput>,
     pub rebase_actions: [usize; 6],
     pub notice: Option<String>,
     pub sessions: Entity<SessionsWindow>,
@@ -227,6 +233,15 @@ impl Desktop {
             }
         })
         .detach();
+        let memory_input = cx.new(|cx| TextInput::new(window, cx).placeholder("Search memory"));
+        cx.subscribe(&memory_input, |s, input, event: &InputEvent, cx| {
+            if *event == InputEvent::Changed || *event == InputEvent::Focus {
+                s.memory_query = input.read(cx).text().to_string();
+                s.selected = 0;
+                cx.notify();
+            }
+        })
+        .detach();
         let data = DataHandle::spawn();
         data.request();
         let polled = data.clone();
@@ -289,6 +304,9 @@ impl Desktop {
             ops_command: String::new(),
             ops_query: String::new(),
             ops_input,
+            memory_source: String::new(),
+            memory_query: String::new(),
+            memory_input,
             rebase_actions: [0, 4, 3, 1, 0, 5],
             notice: None,
             sessions,

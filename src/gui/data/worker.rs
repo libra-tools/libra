@@ -48,6 +48,10 @@ pub struct ReadOutcome {
     pub operations: super::operations::OperationsRead,
     /// Operations-specific failure while the context itself is available.
     pub operations_error: Option<String>,
+    /// Memory projection for the Memory surface.
+    pub memory: super::memory::MemoryRead,
+    /// Memory-specific failure while the context itself is available.
+    pub memory_error: Option<String>,
 }
 
 impl ReadOutcome {
@@ -64,11 +68,16 @@ impl ReadOutcome {
             sessions_error: None,
             sessions_state: SourceState::Stale,
             operations: super::operations::OperationsRead {
-                state: operations_state,
+                state: operations_state.clone(),
                 rows: Vec::new(),
                 truncated: false,
             },
             operations_error: None,
+            memory: super::memory::MemoryRead {
+                state: operations_state,
+                rows: Vec::new(),
+            },
+            memory_error: None,
         }
     }
 }
@@ -149,6 +158,17 @@ impl DataHandle {
                                     Some(error.message),
                                 ),
                             };
+                            let memory_outcome = super::memory::read_memory(&scope).await;
+                            let (memory, memory_error) = match memory_outcome {
+                                Ok(read) => (read, None),
+                                Err(error) => (
+                                    super::memory::MemoryRead {
+                                        state: error.state,
+                                        rows: Vec::new(),
+                                    },
+                                    Some(error.message),
+                                ),
+                            };
                             let head_oid = context.head_oid.clone();
                             let history = match super::history::read_history(&scope, head_oid).await
                             {
@@ -168,6 +188,8 @@ impl DataHandle {
                                         sessions_state,
                                         operations,
                                         operations_error,
+                                        memory,
+                                        memory_error,
                                     });
                                 }
                             };
@@ -182,6 +204,8 @@ impl DataHandle {
                                 sessions_state,
                                 operations,
                                 operations_error,
+                                memory,
+                                memory_error,
                             })
                         }
                         Err(error) => Ok(ReadOutcome::new(error.state, None, Some(error.message))),
@@ -247,6 +271,11 @@ impl DataHandle {
                         truncated: false,
                     },
                     operations_error: None,
+                    memory: super::memory::MemoryRead {
+                        state: SourceState::Stale,
+                        rows: Vec::new(),
+                    },
+                    memory_error: None,
                 });
                 shared.done = true;
                 cv.notify_all();
@@ -443,6 +472,8 @@ fn worker_loop(inner: Arc<(Mutex<Shared>, Condvar)>, reads: Arc<AtomicU64>, read
                     sessions_state: outcome.sessions_state,
                     operations: outcome.operations,
                     operations_error: outcome.operations_error,
+                    memory: outcome.memory,
+                    memory_error: outcome.memory_error,
                 },
                 Err(error) => Snapshot {
                     seq,
@@ -455,11 +486,16 @@ fn worker_loop(inner: Arc<(Mutex<Shared>, Condvar)>, reads: Arc<AtomicU64>, read
                     sessions_error: None,
                     sessions_state: error.state.clone(),
                     operations: super::operations::OperationsRead {
-                        state: error.state,
+                        state: error.state.clone(),
                         rows: Vec::new(),
                         truncated: false,
                     },
                     operations_error: None,
+                    memory: super::memory::MemoryRead {
+                        state: error.state,
+                        rows: Vec::new(),
+                    },
+                    memory_error: None,
                 },
             };
             let (lock, _) = &*inner;
@@ -503,6 +539,11 @@ fn finish_with_error(inner: &Arc<(Mutex<Shared>, Condvar)>, message: String) {
             truncated: false,
         },
         operations_error: None,
+        memory: super::memory::MemoryRead {
+            state: SourceState::Stale,
+            rows: Vec::new(),
+        },
+        memory_error: None,
     });
     shared.done = true;
     cv.notify_all();

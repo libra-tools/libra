@@ -1,45 +1,71 @@
 //! Memory episodes and stale projection display.
-use ely_gpui_component::{buttons::Button, theme::Palette};
+//!
+//! Rows come from the bounded, read-only memory projection read by the window
+//! worker; a stale projection shows zero rows with a rebuild hint.
+use ely_gpui_component::{
+    forms::{Choice, ChoiceChips},
+    theme::Palette,
+};
 use gpui::{
-    AnyElement, Context, InteractiveElement, IntoElement, ParentElement,
-    StatefulInteractiveElement, Styled, px,
+    AnyElement, Context, InteractiveElement, IntoElement, ParentElement, SharedString,
+    StatefulInteractiveElement, Styled, div, prelude::FluentBuilder, px,
 };
 
 use super::super::{
-    desktop::{Desktop, Page},
-    widgets::{
-        action, agent, badge, banner, card, check, column, label, mono, muted, nav, note, row,
-        table, title,
-    },
+    data::{MemoryRead, SourceState, memory_matches_filter},
+    desktop::Desktop,
+    widgets::{banner, card, column, label, mono, muted, note, row, title},
 };
+
 pub fn render(s: &Desktop, cx: &Context<Desktop>, p: &Palette) -> AnyElement {
-    let episodes = [
-        (
-            "ep-0042",
-            "agent session",
-            "Kept synchronous checkpoint writes after async trade-off review",
+    let empty = MemoryRead {
+        state: SourceState::Stale,
+        rows: Vec::new(),
+    };
+    let read = s
+        .snapshot
+        .as_ref()
+        .map(|snapshot| &snapshot.memory)
+        .unwrap_or(&empty);
+    let filtered: Vec<_> = read
+        .rows
+        .iter()
+        .filter(|row| memory_matches_filter(row, &s.memory_source, &s.memory_query))
+        .collect();
+    let mut sources = vec![Choice::new("", "All sources")];
+    let mut seen = std::collections::HashSet::new();
+    for row in &read.rows {
+        if seen.insert(row.source_kind.clone()) {
+            sources.push(Choice::new(
+                row.source_kind.clone(),
+                row.source_kind.clone(),
+            ));
+        }
+    }
+    let selected = filtered
+        .get(s.selected)
+        .copied()
+        .or_else(|| filtered.first().copied());
+    let status = match &read.state {
+        SourceState::Stale => {
+            "Memory projection is stale; rebuild it with `libra memory rebuild`.".to_string()
+        }
+        SourceState::Absent => "No memory projection yet.".to_string(),
+        state if !state.is_available() => format!(
+            "Memory source is {}: {} ({})",
+            state.label(),
+            state.hint().unwrap_or("retry shortly"),
+            s.snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.memory_error.clone())
+                .unwrap_or_else(|| "no detail".to_string())
         ),
-        (
-            "ep-0041",
-            "commit",
-            "Add token-bucket rate limiter to API gateway",
-        ),
-        (
-            "ep-0040",
-            "agent run",
-            "Review found shared bucket across API keys",
-        ),
-        ("ep-0039", "bridge op", "Imported a captured checkpoint"),
-    ];
-    let e = episodes.get(s.selected).unwrap_or(&episodes[0]);
+        _ => format!("{} episode(s) in the current window", read.rows.len()),
+    };
     column()
         .size_full()
         .gap_0()
-        .child(
-            banner("Memory projection is stale. 2 commits and 1 agent session landed since the last rebuild.", p)
-                .child(check("allow-stale", "Allow stale", true, s, cx))
-                .child(action("rebuild", "Rebuild now", false, cx)),
-        )
+        .child(banner(&status, p))
         .child(
             row()
                 .items_stretch()
@@ -48,23 +74,49 @@ pub fn render(s: &Desktop, cx: &Context<Desktop>, p: &Palette) -> AnyElement {
                 .min_h(px(0.0))
                 .child(
                     column()
-                        .id("episodes")
+                        .id("memory-list")
                         .overflow_y_scroll()
                         .w(px(330.0))
                         .p_4()
-                        .child(title("Episodes"))
-                        .child(label("ALL SOURCES · IN WINDOW", p))
-                        .children(episodes.iter().enumerate().map(|(i, e)| {
+                        .child(title("Memory"))
+                        .child(s.memory_input.clone())
+                        .child(
+                            ChoiceChips::new("memory-source", sources)
+                                .selected(if s.memory_source.is_empty() {
+                                    Vec::new()
+                                } else {
+                                    vec![SharedString::from(s.memory_source.clone())]
+                                })
+                                .on_change(cx.listener(|s, values: &[SharedString], _, cx| {
+                                    s.memory_source = values
+                                        .first()
+                                        .map(|value| value.to_string())
+                                        .unwrap_or_default();
+                                    s.selected = 0;
+                                    cx.notify();
+                                })),
+                        )
+                        .children(filtered.iter().enumerate().map(|(index, entry)| {
                             card(p)
-                                .id(("episode", i))
+                                .id(("memory", index))
                                 .cursor_pointer()
-                                .bg(if s.selected == i { p.selection } else { p.surface })
+                                .bg(if s.selected == index {
+                                    p.selection
+                                } else {
+                                    p.surface
+                                })
                                 .on_click(cx.listener(move |s, _, _, cx| {
-                                    s.selected = i;
+                                    s.selected = index;
                                     cx.notify();
                                 }))
-                                .child(row().child(mono(e.0)).child(muted(e.1, p)))
-                                .child(e.2)
+                                .child(
+                                    row()
+                                        .child(mono(&entry.source_kind))
+                                        .child(div().flex_1())
+                                        .child(muted(clock(entry.ended_at), p)),
+                                )
+                                .child(muted(short_id(&entry.episode_id), p))
+                                .child(muted(entry.title.clone(), p))
                         })),
                 )
                 .child(
@@ -74,66 +126,37 @@ pub fn render(s: &Desktop, cx: &Context<Desktop>, p: &Palette) -> AnyElement {
                         .flex_1()
                         .p_6()
                         .bg(p.surface)
-                        .child(
-                            row()
-                                .child(mono(e.0))
-                                .child(badge(e.1, 0xc2410c, 0xfff1e8))
-                                .child(muted("outcome: decision recorded", p)),
-                        )
-                        .child(title(e.2))
-                        .child(
-                            card(p)
-                                .child(row().child(title("Body")).child(
-                                    Button::new("reveal-memory", "Reveal full body").on_click(cx.listener(
-                                        |s, _, _, cx| {
-                                            let v = s.toggles.entry("memory-body").or_default();
-                                            *v = !*v;
-                                            cx.notify();
-                                        },
-                                    )),
-                                ))
-                                .child(note(
-                                    if s.toggles.get("memory-body") == Some(&true) {
-                                        "The session compared recovery guarantees and kept synchronous checkpoint \
-                                         writes. This demonstration episode is derived from the captured discussion."
-                                    } else {
-                                        "Body elided. Reveal to read the derived text; it is rendered from the source \
-                                         facts below and is not stored anywhere else."
-                                    },
+                        .when_some(selected.cloned(), |body, row| {
+                            body.child(mono(row.episode_id.clone()))
+                                .child(title(row.title.clone()))
+                                .child(muted(
+                                    format!(
+                                        "{} · {} · by {} · {} evidence · {} paths",
+                                        row.source_kind,
+                                        row.outcome,
+                                        row.actor.clone().unwrap_or_else(|| "unknown".into()),
+                                        row.evidence_count,
+                                        row.path_count
+                                    ),
                                     p,
-                                )),
-                        )
-                        .child(
-                            card(p)
-                                .child(title("Derived from"))
-                                .child(
-                                    row()
-                                        .child(agent("Claude Code"))
-                                        .child("Effect of async checkpoint writes on recovery consistency"),
-                                )
-                                .child(mono("s-cc-arch"))
-                                .child(nav(Page::Sessions, cx))
-                                .child(mono("◆ HEAD at capture   9d1e4c7")),
-                        )
-                        .child(card(p).child(title("Projection status")).child(table(
-                            &["Field", "Value"],
-                            &[
-                                vec!["schema_version", "1"],
-                                vec!["selector_version", "1"],
-                                vec!["rules_version", "1"],
-                                vec!["horizon_truncated", "false"],
-                                vec!["revoked_count", "0"],
-                                vec!["aged_out_count", "0"],
-                                vec!["rebuilt_at", "today 22:16"],
-                            ],
-                            p,
-                        )))
-                        .child(note(
-                            "Zero-authority · Every episode is a pure function of committed facts. There is nothing \
-                             to edit here; to change memory, change the facts and rebuild.",
-                            p,
-                        )),
+                                ))
+                                .child(label("SUMMARY", p))
+                                .child(note(row.body.clone(), p))
+                        })
+                        .when(selected.is_none(), |body| {
+                            body.child(muted("No episodes match the current search.", p))
+                        }),
                 ),
         )
         .into_any_element()
+}
+
+fn clock(ts: i64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp(ts, 0)
+        .map(|value| value.format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_else(|| "—".to_string())
+}
+
+fn short_id(id: &str) -> String {
+    id.chars().take(8).collect()
 }

@@ -221,6 +221,121 @@ pub async fn list_episodes<C: ConnectionTrait>(
     Ok(episodes)
 }
 
+/// A bounded, deterministic episode read: at most `limit` rows in projection
+/// order, with evidence/paths restricted to that selected set. The original
+/// [`list_episodes`] signature is unchanged.
+pub async fn list_episodes_bounded<C: ConnectionTrait>(
+    conn: &C,
+    repo_id: &str,
+    limit: usize,
+) -> Result<Vec<Episode>, MemoryError> {
+    use sea_orm::{Statement, Value};
+
+    let episode_rows = conn
+        .query_all_raw(Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            "SELECT * FROM `memory_episode` WHERE repo_id = ? \
+             ORDER BY source_kind ASC, source_key ASC LIMIT ?",
+            [
+                Value::from(repo_id.to_string()),
+                Value::from(i64::try_from(limit).unwrap_or(i64::MAX)),
+            ],
+        ))
+        .await?;
+    let mut episodes = Vec::with_capacity(episode_rows.len());
+    for row in episode_rows {
+        episodes.push(row_to_episode(&row)?);
+    }
+    attach_evidence_and_paths_for(conn, repo_id, &mut episodes).await?;
+    Ok(episodes)
+}
+
+/// Attach children only for the SELECTED episode ids (bounded child reads).
+async fn attach_evidence_and_paths_for<C: ConnectionTrait>(
+    conn: &C,
+    repo_id: &str,
+    episodes: &mut [Episode],
+) -> Result<(), MemoryError> {
+    if episodes.is_empty() {
+        return Ok(());
+    }
+    let ids: Vec<String> = episodes.iter().map(|e| e.episode_id.clone()).collect();
+    let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let _ = repo_id;
+    let values: Vec<sea_orm::Value> = ids
+        .iter()
+        .map(|id| sea_orm::Value::from(id.clone()))
+        .collect();
+    let mut evidence: Vec<(String, crate::internal::ai::memory::episode::EvidenceEdge)> =
+        Vec::new();
+    for row in conn
+        .query_all_raw(sea_orm::Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            format!(
+                "SELECT episode_id, kind, ref_id, link_confidence, resolution_status \
+                 FROM `memory_episode_evidence` WHERE episode_id IN ({placeholders})"
+            ),
+            values.clone(),
+        ))
+        .await?
+    {
+        let id: String = row.try_get("", "episode_id").unwrap_or_default();
+        evidence.push((
+            id,
+            crate::internal::ai::memory::episode::EvidenceEdge {
+                kind: row.try_get("", "kind").unwrap_or_default(),
+                ref_id: row.try_get("", "ref_id").unwrap_or_default(),
+                link_confidence: row.try_get("", "link_confidence").unwrap_or_default(),
+                resolution_status: row.try_get("", "resolution_status").unwrap_or_default(),
+            },
+        ));
+    }
+    let mut paths: Vec<(String, crate::internal::ai::memory::episode::PathRow)> = Vec::new();
+    for row in conn
+        .query_all_raw(sea_orm::Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            format!(
+                "SELECT episode_id, code_path, change_kind, blob_oid_at_end, ended_at \
+                 FROM `memory_episode_path` WHERE episode_id IN ({placeholders})"
+            ),
+            values,
+        ))
+        .await?
+    {
+        let id: String = row.try_get("", "episode_id").unwrap_or_default();
+        paths.push((
+            id,
+            crate::internal::ai::memory::episode::PathRow {
+                code_path: row.try_get("", "code_path").unwrap_or_default(),
+                change_kind: row.try_get("", "change_kind").unwrap_or_default(),
+                blob_oid_at_end: row.try_get("", "blob_oid_at_end").ok().flatten(),
+                ended_at: row.try_get("", "ended_at").unwrap_or(0),
+            },
+        ));
+    }
+    let evidence_map = group_by_episode(evidence);
+    let path_map = group_by_episode(paths);
+    for episode in episodes.iter_mut() {
+        episode.evidence = evidence_map
+            .get(&episode.episode_id)
+            .cloned()
+            .unwrap_or_default();
+        episode.paths = path_map
+            .get(&episode.episode_id)
+            .cloned()
+            .unwrap_or_default();
+    }
+    Ok(())
+}
+
+fn group_by_episode<T>(items: Vec<(String, T)>) -> std::collections::HashMap<String, Vec<T>> {
+    let mut map: std::collections::HashMap<String, Vec<T>> = std::collections::HashMap::new();
+    for (id, item) in items {
+        map.entry(id).or_default().push(item);
+    }
+    map
+}
+
 /// Read a single Episode by id; `None` when absent (caller must map to
 /// `LBR-MEMORY-002`).
 pub async fn read_episode<C: ConnectionTrait>(
@@ -399,15 +514,22 @@ async fn commit_operations<C: ConnectionTrait>(
     if op_ids.is_empty() {
         return Ok(Vec::new());
     }
-    let ops = operation::Entity::find()
-        .filter(operation::Column::OpId.is_in(op_ids))
-        .order_by_asc(operation::Column::OpId)
-        .all(conn)
-        .await?;
-    Ok(ops
-        .into_iter()
-        .map(|op| (op.op_id, op.status, op.end_ts))
-        .collect())
+    // Keep each IN clause well below SQLite's bind-variable limit while
+    // preserving the canonical op-id ordering across batches.
+    let mut ops: Vec<(String, String, Option<i64>)> = Vec::with_capacity(op_ids.len());
+    for batch in op_ids.chunks(500) {
+        let mut rows = operation::Entity::find()
+            .filter(operation::Column::OpId.is_in(batch.iter().cloned()))
+            .order_by_asc(operation::Column::OpId)
+            .all(conn)
+            .await?
+            .into_iter()
+            .map(|op| (op.op_id, op.status, op.end_ts))
+            .collect::<Vec<_>>();
+        ops.append(&mut rows);
+    }
+    ops.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(ops)
 }
 
 /// Present a stored `code_path` byte string for human / JSON output: decode as

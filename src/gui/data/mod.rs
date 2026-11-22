@@ -6,6 +6,7 @@
 //! read cannot migrate the repository (ADR-UID-01/02).
 
 mod history;
+mod memory;
 mod operations;
 mod repo;
 mod sessions;
@@ -14,6 +15,7 @@ mod state;
 mod worker;
 
 pub use history::{AttributionFilter, HistoryRow, age_label};
+pub use memory::{MEMORY_ROW_CAP, MemoryRead, MemoryRow, matches_filter as memory_matches_filter};
 pub use operations::{
     OPERATIONS_PAGE_SIZE, OperationRow, OperationsRead, filtered_page, matches_filter, page_range,
     page_slice,

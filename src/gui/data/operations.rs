@@ -175,7 +175,7 @@ pub fn matches_filter(row: &OperationRow, command: &str, query: &str) -> bool {
 
 /// Replace repository roots and any remaining absolute path with a repo-relative
 /// label so no host path reaches the window.
-fn sanitize_paths(
+pub(crate) fn sanitize_paths(
     text: &str,
     worktree_root: &std::path::Path,
     storage: &std::path::Path,
