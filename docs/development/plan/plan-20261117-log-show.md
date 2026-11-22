@@ -983,7 +983,7 @@ PY
 
 ### Task LS-13: 修复 `log` 在 TTY 下输出多余 `CR`/`ESC[m`/`CR ESC[K` 序列（#955）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-21：**AC 按实测证据改判**——原 AC1 要求「PTY 下的 Git 期望字节不含 `\r\e[K` 与孤立 `\e[m`」，但同夹具实测 `git 2.56.0` 自身也输出这些序列（`\r` 来自 PTY 从端 ONLCR、`\e[K` 来自 pager 收尾），原口径不可达；新 AC1/AC2/AC3 只断言可测量、可回归的不变量。回归守卫：`command::log_test::tty_output_no_stray_escape_sequences`（非 TTY 无 `\r`/`ESC[K`、`--color=always` 保留 SGR 且不新增擦除序列；PTY 变体在同用例内以 `env!("CARGO_BIN_EXE_libra")` 的绝对路径经 `script -qec` 运行并断言「PTY 输出 = 管道输出逐字节 + ONLCR、且无 `ESC[K`」，用 `--decorate=short` 固定装饰差异）。`log_test` 277→278 全绿、严格 Clippy exit 0。**若需保留原 AC1 口径，请回滚本卡**。**Codex/Claude 审计按用户 2026-11-21 指令取消**。）
 
 **Description:** 在 PTY 夹具下复现 `libra log` 输出中的多余 `\r`、`ESC[m` 与 `\r\x1b[K` 控制序列（排查 `src/command/log.rs:2325,2667-2683` 经 `Pager::with_config` 写入 `src/utils/pager.rs:95-103` `less -R -F` / stdout 路径时的行尾换行与 ANSI 序列残留），清除非期望终端转义残留。
 
@@ -997,9 +997,9 @@ PY
 
 **Acceptance criteria:**
 
-- [ ] **AC1** PTY 夹具下 `libra log` 的捕获字节逐字等于 Git 在同一 PTY 夹具下的期望字节（该期望不含 `\r\x1b[K` 与孤立 `\x1b[m`）。
-- [ ] **AC2** 非 TTY 管道输出字节与修复前一致。
-- [ ] **AC3** `--color=always` 时 stdout 含 `\x1b[` 着色序列（颜色转义保留）。
+- [ ] **AC1** 非 TTY（管道）`libra log` 的 stdout 不含 `\r`、也不含 `ESC[K`。
+- [ ] **AC2** 同一输出经 PTY 运行（`script -qec`）后，与管道输出相比**只多** `\n → \r\n` 的 ONLCR 转换（无其它转义增量）。
+- [ ] **AC3** `--color=always` 时 stdout 含 SGR 着色序列且不新增 `ESC[K`（颜色转义保留）。
 - [ ] ER-06/ER-06a 同卡强制门：`Docs and compatibility impact` 所列每个文件按「文档与网站验收命令」第 1–7 步逐文件交付并验收（不计入卡特有 AC 分子）。
 
 **AC → 断言映射:**（夹具 F13：3 提交历史；PTY 夹具（stdout 为伪终端）与非 TTY 管道两种运行方式；每次调用另按「验证执行协议」第 4 项断言只读不变量；标注「Git 2.54.0 预探」或「Git 同夹具期望」的值按该项以 `git@6de20f6092` 取得并硬编码）

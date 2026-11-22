@@ -8786,9 +8786,42 @@ fn tty_output_no_stray_escape_sequences() {
         "explicit colour must not add erase-line sequences"
     );
 
-    // The PTY variant (only ONLCR differs) is verified manually with
-    // `script -qec "libra log --no-pager --color=always" /dev/null`; the test
-    // harness cannot guarantee which `libra` binary the shell resolves.
+    // AC2: under a real PTY the bytes are the piped bytes plus ONLCR only.
+    let piped_pinned = run_libra_command(
+        &["log", "--no-pager", "--color=always", "--decorate=short"],
+        &repo,
+    );
+    assert_cli_success(&piped_pinned, "pinned piped log");
+    let script_available = std::process::Command::new("script")
+        .arg("--version")
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false);
+    if script_available {
+        let binary = env!("CARGO_BIN_EXE_libra");
+        let pty = std::process::Command::new("script")
+            .arg("-qec")
+            .arg(format!(
+                "{binary} log --no-pager --color=always --decorate=short"
+            ))
+            .arg("/dev/null")
+            .current_dir(&repo)
+            .output()
+            .expect("run log under a PTY");
+        assert_cli_success(&pty, "pty log");
+        let mut expected = Vec::new();
+        for byte in &piped_pinned.stdout {
+            if *byte == b'\n' {
+                expected.push(b'\r');
+            }
+            expected.push(*byte);
+        }
+        assert_eq!(pty.stdout, expected, "AC2 PTY output differs beyond ONLCR");
+        assert!(
+            !pty.stdout.windows(3).any(|window| window == b"\x1b[K"),
+            "AC2 PTY output must not contain an erase-line sequence"
+        );
+    }
 }
 
 #[test]

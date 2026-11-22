@@ -694,6 +694,10 @@ libra log --follow=b.txt --oneline
 
 Libra 将 `--graph` 实现为基于文本的 ASCII/Unicode 图渲染器，类似 Git 内置 graph 输出。与 GUI 工具（GitKraken、SourceTree）或带外部 graph renderer 的 Git `--format` 不同，Libra 的图直接在终端内渲染。这让 CLI 自包含，并确保跨平台输出一致。Graph renderer 处理分支、合并和 octopus merges，绘制父子提交之间的连接线。
 
+### 终端输出
+
+非 TTY（管道/文件）输出不含回车符 `\r`，也不含擦除行序列 `ESC[K`。在真实终端下唯一的差异是终端驱动的 `\n → \r\n` 转换，因此去掉 CR 后可与管道输出逐字节比较。`--color=always` 保留 SGR 着色且不新增擦除序列。
+
 ### `--output=<file>`
 
 `--output=<file>` 把人类可读输出写入 `<file>`，stdout 为空。已存在的普通文件会被原地覆盖（inode 与权限不变，经已核验的描述符截断，与 Git 的 `xfopen(path, "w")` 一致）；目录目标以 `LBR-IO-002` 失败；最终目标位于仓库元数据目录 `.libra/` 内同样拒绝（含经符号链接或硬链接触及仓库文件的情形；Libra 专有防护，Git 无此限制）。配合全局 `--json` 时，JSON 信封本身写入该文件，stdout 为空。

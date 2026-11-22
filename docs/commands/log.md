@@ -66,6 +66,14 @@ Set the length of abbreviated commit hashes.
 libra log --abbrev 8
 ```
 
+### Terminal output
+
+Non-TTY output (pipes, files) never contains carriage returns or erase-line
+(`ESC[K`) sequences. Under a real terminal the only difference is the terminal
+driver's `\n` → `\r\n` translation, so `libra log` can be byte-compared against
+the piped output after dropping the CRs. `--color=always` keeps the SGR styling
+and still adds no erase-line sequences.
+
 ### `--output=<file>`
 
 `--output=<file>` writes the human-readable log to `<file>` and leaves stdout
