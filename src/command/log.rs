@@ -1019,7 +1019,10 @@ impl CommitFilter {
 
 fn str_to_decorate_option(s: &str) -> Result<DecorateOptions, String> {
     match s {
-        "no" => Ok(DecorateOptions::No),
+        // Git parses `log.decorate` with the same decoration-style parser, so
+        // plain booleans map to `short` (true) and `no` (false).
+        "true" | "yes" | "on" | "1" => Ok(DecorateOptions::Short),
+        "no" | "false" | "off" | "0" => Ok(DecorateOptions::No),
         "short" => Ok(DecorateOptions::Short),
         "full" => Ok(DecorateOptions::Full),
         "auto" => {
@@ -1062,12 +1065,23 @@ async fn determine_decorate_option(args: &LogArgs) -> Result<DecorateOptions, St
         }
     };
 
+    // A command-line `--pretty=raw`/`--format=raw` suppresses the configured
+    // decoration (Git's `rev->pretty_given` check); `format.pretty=raw` does
+    // NOT, because it is only a default.
+    let cli_raw_pretty = matches!(args.pretty.as_deref(), Some("raw"))
+        || matches!(args.format.as_deref(), Some("raw"));
+    if cli_raw_pretty {
+        return Ok(DecorateOptions::No);
+    }
+
+    // An invalid `log.decorate` value means "no decoration" in Git (the parsed
+    // style is 0); it must not error, and must not fall back to `auto`.
     if let Some(config_deco) = ConfigKv::get("log.decorate")
         .await
         .ok()
         .flatten()
         .map(|e| e.value)
-        .and_then(|s| str_to_decorate_option(&s).ok())
+        .map(|s| str_to_decorate_option(&s).unwrap_or(DecorateOptions::No))
     {
         Ok(config_deco)
     } else {

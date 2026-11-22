@@ -6944,3 +6944,108 @@ fn decorate_nested_annotated_tags() {
         assert!(forced.contains("tag: t1"), "{forced}");
     }
 }
+
+#[test]
+fn test_log_decorate_config_boolean_and_raw_suppression() {
+    use super::{assert_cli_success, create_committed_repo_via_cli, run_libra_command};
+
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["tag", "-m", "v1", "v1"], p),
+        "annotated v1",
+    );
+    let oid = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], p).stdout)
+        .trim()
+        .to_string();
+    let short = &oid[..7];
+    let set = |key: &str, value: &str| {
+        assert_cli_success(
+            &run_libra_command(&["config", "set", key, value], p),
+            "config set",
+        );
+    };
+    let stdout = |args: &[&str]| {
+        let out = run_libra_command(args, p);
+        assert_cli_success(&out, "log runs");
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+
+    // AC1: Git boolean true values enable short decoration.
+    for value in ["true", "yes", "on", "1"] {
+        set("log.decorate", value);
+        assert_eq!(
+            stdout(&["log", "-1", "--oneline"]),
+            format!(
+                "{short} (HEAD -> main, tag: v1) {}\n",
+                first_subject(&stdout(&["log", "-1", "--oneline"]))
+            ),
+            "AC1: {value}"
+        );
+    }
+    // AC2: false values disable it.
+    for value in ["false", "no", "off", "0"] {
+        set("log.decorate", value);
+        assert!(
+            !stdout(&["log", "-1", "--oneline"]).contains("HEAD -> main"),
+            "AC2: {value} must not decorate"
+        );
+    }
+    // AC3/AC4: an invalid value behaves like `no`, silently.
+    set("log.decorate", "bogus");
+    let out = run_libra_command(&["log", "-1", "--oneline"], p);
+    assert_cli_success(&out, "AC4: no error for an invalid value");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        stdout(&["log", "-1", "--oneline"]),
+        "AC3"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).is_empty(),
+        "AC4: stderr must stay empty"
+    );
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("HEAD -> main"));
+
+    // AC5: `--pretty=raw` suppresses the configured decoration.
+    set("log.decorate", "short");
+    let raw = stdout(&["log", "-1", "--pretty=raw"]);
+    assert_eq!(
+        raw.lines().next(),
+        Some(format!("commit {oid}").as_str()),
+        "AC5"
+    );
+
+    // AC6: an explicit `--decorate=short` still wins.
+    let explicit = stdout(&["log", "-1", "--pretty=raw", "--decorate=short"]);
+    assert_eq!(
+        explicit.lines().next(),
+        Some(format!("commit {oid} (HEAD -> main, tag: v1)").as_str()),
+        "AC6"
+    );
+
+    // AC7: `format.pretty=raw` is only a default and does not suppress.
+    set("format.pretty", "raw");
+    let from_config = stdout(&["log", "-1"]);
+    assert_eq!(
+        from_config.lines().next(),
+        Some(format!("commit {oid} (HEAD -> main, tag: v1)").as_str()),
+        "AC7"
+    );
+
+    // AC8: `--format=raw` suppresses like `--pretty=raw`.
+    let format_raw = stdout(&["log", "-1", "--format=raw"]);
+    assert_eq!(
+        format_raw.lines().next(),
+        Some(format!("commit {oid}").as_str()),
+        "AC8"
+    );
+}
+
+/// The subject line of a one-line `log -1 --oneline` output.
+fn first_subject(line: &str) -> String {
+    line.split_once(") ")
+        .map(|(_, subject)| subject)
+        .unwrap_or(line)
+        .trim()
+        .to_string()
+}

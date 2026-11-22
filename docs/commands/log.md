@@ -399,6 +399,13 @@ libra log --decorate
 libra log --decorate=full
 ```
 
+`log.decorate` accepts Git's decoration styles (`no`, `short`, `full`, `auto`) and plain
+booleans: truthy values (`true`/`yes`/`on`/`1`) select `short`, falsy values
+(`false`/`no`/`off`/`0`) disable decorations, and an unrecognized value also disables
+them without an error (Git parses the style to 0). A command-line `--pretty=raw` or
+`--format=raw` suppresses the configured decoration; an explicit `--decorate=<style>`
+still wins, and a `format.pretty=raw` default does not suppress it.
+
 ### `--no-decorate`
 
 Do not print ref names. Overrides `--decorate`.

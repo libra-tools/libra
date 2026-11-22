@@ -406,7 +406,7 @@ PY
 
 ### Task LS-02: 修复 `log.decorate=true` 与 `--pretty=raw` 装饰规则（#950）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `complete`（2026-11-21：`str_to_decorate_option` 增加 Git 布尔映射（`true`/`yes`/`on`/`1`→`short`，`false`/`no`/`off`/`0`→`no`）；配置路径把非法取值映射为 `no`（Git 解析为 0，不报错、不再回落 `auto`）；`determine_decorate_option` 在显式命令行装饰之后、读取配置之前检测命令行 `--pretty=raw`/`--format=raw` 并直接返回 `No`（`format.pretty=raw` 不触发抑制）。用例 `test_log_decorate_config_boolean_and_raw_suppression` 覆盖 AC1–AC8（真/假值表驱动、非法值等同 `no` 且 stderr 为空、`--pretty=raw` 抑制、显式 `--decorate=short` 优先、`format.pretty=raw` 不抑制、`--format=raw` 抑制）；`log_test` **256/256**；文档 EN/zh-CN/开发版与 `COMPATIBILITY.md` 同步；版本面 0.30.275 → 0.30.276。按用户 2026-11-20 指令在 `main` 直接提交推送。）
 
 **Description:** 修复 `str_to_decorate_option` / `determine_decorate_option`：`log.decorate` 接受 Git 布尔真值（启用 `short`）与假值（关闭），非法值按 Git `parse_decoration_style` 负值语义等同关闭且不报错；命令行 `--pretty=raw`/`--format=raw` 时不应用 `log.decorate` 配置装饰（显式 `--decorate` 仍生效），`format.pretty=raw` 配置不触发该抑制（与 Git 一致）。
 
