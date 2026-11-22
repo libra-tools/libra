@@ -1309,6 +1309,257 @@ PY
 
 **Task type:** `implementation` | **Lifecycle / Acceptance:** `in-progress` / `partially-accepted`（2026-11-21 第一段：修复 `-L` **无任何输出**的根因——`apply_follow_and_line_filters` 在未带 `--follow` 时 `path_to_check` 恒为 `None`，`-L` 提交全被丢弃；改为回退到 `ranges[0].file`。`commit_affects_line_range` 由「内容有变即纳入」改为**按 hunk 新侧范围与请求范围求交**（`patch_hunk_ranges`）；`-L` 隐含 `-p`（`resolved_diff_formats` 中强制 `patch=true`）；新增 `filter_patch_to_ranges` 只保留涉及请求范围的 hunk。实测：`-L 1,5:f.txt` 只选创建提交、`-L 18,22:f.txt` 选出改动提交+创建提交并打印 hunk（`-20`/`+twenty`）。回归：`command::log_test::line_history_emits_range_hunks`。**剩余（未验收 AC）**：① hunk 收窄已与 Git 对齐（`@@ -18,5 +18,5 @@` + 范围内行，逐字一致）；② `:<funcname>:<file>` **已解析**——`LineRange.func` 保留函数名，`resolve_line_ranges` 从文件定义行到下一个定义前解析范围（`is_function_definition`/`line_names_function`，支持 Rust `fn`、`def`/`function` 与列首 C 风格），未知函数名以 `LBR-CLI-002` + `cannot find function '<name>' in '<file>'` 拒绝；提交筛选改为**只按变更行**（`patch_changed_lines`）判定范围，`:alpha:` 正确排除只改 `:beta:` 的提交，`:beta:` 输出 `@@ -5,3 +5,3 @@` 与 `-    two();`/`+    three();`。回归：`command::log_test::line_history_function_name_ranges`。**仍差 Git**：ⓐ `@@` 尾随上下文已对齐（`@@ -5,3 +5,3 @@ fn alpha() {`）；ⓑ 创建 hunk 已按函数范围收窄并使用旧侧 0 基（`@@ -0,0 +1,4 @@`），仅余 `index … 100644` 后缀（既有 diff 头部格式，非 `-L` 特有）；ⓒ **父提交行号映射已实现**——遍历 newest→oldest 时按每个 hunk 的 `(new_start, new_len, old_len)` 把跟踪范围回推到父提交编号（`patch_hunk_spans` + `remap_ranges_to_parent`），实测在「函数上方插入 2 行」的历史里 `-L :beta:f.rs` 与 `git log -L :beta:f.rs` 选出**同一提交集**（编辑提交 + 文件创建，插入提交被正确排除）。回归：`command::log_test::line_history_maps_range_through_parents`。`log_test` 273/273；严格 Clippy exit 0。）### Task LS-21: `log` 透传 diff 空白忽略选项（`-w` / `-b`）（#967；拆出 LS-28、LS-29、LS-30）
 
+**Description:** 修复 `log -L <start>,<end>:<file>` / `-L :<funcname>:<file>` 仅过滤提交却不输出行级 diff hunk 的缺陷：输出演进提交与被追踪范围的 hunk，函数名语法识别函数边界（移除 `src/command/log.rs:1907` 退化为整文件的实现），并随历史把行号范围映射到父提交。拆出 `LS-32`（`-L` 参数校验）。
+
+**Out of scope:** `-L` 与位置 pathspec / `--follow` 的互斥及非法语法、文件不存在诊断（由 `LS-32` 处理）；复杂跨文件函数重命名追踪（尚未排期）。
+
+**Current evidence:**
+
+| 事实 | 证据 |
+|---|---|
+| `log.rs` 已解析 `line_range` 并调 `commit_affects_line_range`，但未渲染对应行范围 diff；函数名语法在 `1907` 退化为整文件 | `src/command/log.rs:479-480,1894-1910,1981-2030` |
+
+**Acceptance criteria:**
+
+- [ ] **AC1** `libra log -L 1,5:file.txt --format=%H` 的结果提交序列等于 Git 同夹具期望。
+- [ ] **AC2** `libra log -L 1,5:file.txt` 的完整输出逐字等于 Git 同夹具期望（每个结果提交只输出与被追踪范围相交的 hunk）。
+- [ ] **AC3** `libra log -L :fn_name:file.txt` 的结果提交序列等于 Git 同夹具期望（只修改函数体外行的提交不出现）。
+- [ ] **AC4** `libra log -L :fn_name:file.txt` 的完整输出（含各 hunk）逐字等于 Git 同夹具期望（hunk 只覆盖函数体，不退化为整文件）。
+- [ ] **AC5** `libra log -L <s>,<e>:file.txt`（`<s>,<e>` 为 HEAD 中函数体所在行号，位于第 4 个提交插入的 2 行之后）的完整输出逐字等于 Git 同夹具期望（更早提交中的同一范围按插入偏移正确映射；与 AC4 为不同调用）。
+- [ ] **AC6** `libra log -L :nofn:file.txt`（函数名未匹配）以 `LBR-CLI-003` 失败。
+- [ ] ER-06/ER-06a 同卡强制门：`Docs and compatibility impact` 所列每个文件按「文档与网站验收命令」第 1–7 步逐文件交付并验收（不计入卡特有 AC 分子）。
+
+**AC → 断言映射:**（夹具 F17：`file.txt` 含函数 `fn_name` 与函数外行；提交依次为：新增文件、修改函数体、只修改函数体外行、在函数上方插入 2 行、再修改函数体；每次调用另按「验证执行协议」第 4 项断言只读不变量；标注「Git 2.54.0 预探」或「Git 同夹具期望」的值按该项以 `git@6de20f6092` 取得并硬编码）
+
+- AC1 → `command::log_test::line_range_history_output`：期望 exit 0；stdout 中提交 OID 序列逐字等于 Git 同夹具期望。
+- AC2 → `command::log_test::line_range_history_output`：期望 exit 0；stdout 逐字等于 Git 同夹具期望。
+- AC3 → `command::log_test::line_range_history_output`：期望 exit 0；stdout 提交序列逐字等于 Git 同夹具期望。
+- AC4 → `command::log_test::line_range_history_output`：期望 exit 0；stdout 逐字等于 Git 同夹具期望。
+- AC5 → `command::log_test::line_range_history_output`：期望 exit 0；stdout 逐字等于 Git 同夹具期望。
+- AC6 → `command::log_test::line_range_history_output`：期望 stderr 含 `LBR-CLI-003`（Git：`-L parameter 'nofn' starting at line 1: no match`）。
+- 文档 AC → 「文档与网站验收命令」第 1–7 步（逐文件 SHA-256、关键字命中、网站同步与漂移检查、typecheck/build、Claude Code PASS、精确提交推送、部署核验）。
+
+**Verification:**
+
+- [ ] `source .env.test && cargo nextest run --test command_test -E 'test(=command::log_test::line_range_history_output)'`（卡特有 `(new)`，`tests/command/log_test.rs` 内新增；覆盖 AC1–AC6；按「验证执行协议」第 1–4 项执行）
+- [ ] `source .env.test && cargo nextest run --test command_test -E 'test(=command::log_test::test_log_line_range_flag_accepted) | test(=command::log_test::log_ineligible_follow_line_range_pathspec_walk_full_history)'`（共享回归组：既有 `-L` 接受与 follow/-L/pathspec 遍历用例；预期 N = 2；按「验证执行协议」第 5 项先以同一过滤 `cargo nextest list` 核对，要求 exit 0、通过 = N、失败 = 0、跳过 = 0；不计为卡特有 AC 证据）
+
+**Full-suite trigger:** `T-1: 版本面集合同步修改 install.sh / install.ps1（ER-08 / ER-13 T-1）` | **Dependencies:** `LS-16`, `DEP-LS-01`, `DEP-LS-03`
+
+**Implementation write set:** `src/command/log.rs`, `tests/command/log_test.rs`, `docs/commands/log.md`, `docs/commands/zh-CN/log.md`, `docs/development/commands/log.md`, `COMPATIBILITY.md`, `/Volumes/Data/gitmono/libra-backend/apps/tanstack-app/content/docs/commands/log.en.md`
+
+**Release write set:** `Inherited` | **Files likely touched:** `src/command/log.rs`, `tests/command/log_test.rs`, `COMPATIBILITY.md`
+
+**Docs and compatibility impact:** 必须同卡更新：`docs/commands/log.md`、`docs/commands/zh-CN/log.md` 与网站页 `/Volumes/Data/gitmono/libra-backend/apps/tanstack-app/content/docs/commands/log.en.md`（由 `--only log` 同步生成；网站 zh-CN 在渲染时镜像 EN，无独立文件）；文档关键字（用于 EN/zh 命令页）：`-L`。逐文件语义核对：`docs/development/commands/log.md` 与 `COMPATIBILITY.md` 的 `| log |` 行（基线第 196 行）——受本卡行为影响即同卡更新（兼容矩阵原地修改，不增删行），否则按第 1 步记录理由与未变 SHA-256。按「文档与网站验收命令」第 1–7 步逐文件交付并验收。`docs/error-codes.md`：N/A（复用既有稳定码）。
+
+**Rollback mode:** `immutable-release` | **Estimated scope:** `M` | **Version increment:** `patch` | **Release boundary:** `independent` | **C/D coverage from:** `self`
+
+**Granularity:** `type=implementation; axis=log_-L行级历史输出; recovery=immutable-release; complete=yes; self-contained=yes; AC=6/8; VER=4/8; landing=1; prod-files=1; scope=M; deps=LS-16,DEP-LS-01,DEP-LS-03; writeset=序列化于LS-16; release=independent; split-from=N/A; exception=N/A`
+
+---
+
+### Task LS-32: `log -L` 与 pathspec/`--follow` 互斥及参数诊断（#961；自 LS-17 拆出）
+
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+
+**Description:** 增加 `-L` 的参数校验：与位置 pathspec 同用、与 `--follow` 同用（Git 中二者因 `--follow requires exactly one pathspec` 与 `-L<range>:<file> cannot be used with pathspec` 不可同时满足）、非法 `-L` 语法与不存在的文件分别返回稳定错误。
+
+**Out of scope:** `-L` 行级输出与函数边界（由 `LS-17` 处理）。
+
+**Current evidence:**
+
+| 事实 | 证据 |
+|---|---|
+| `parse_line_range` 已对非法格式返回 `CliInvalidArguments`；无 `-L` 与 pathspec / `--follow` 的互斥校验 | `src/command/log.rs:1894-1902,1981-2030` |
+| Git 2.54.0 预探的四类诊断文本与退出码 128 | 本机 Git 2.54.0（开工时以 `git@6de20f6092` 复核） |
+
+**Acceptance criteria:**
+
+- [ ] **AC1** `libra log -L 1,1:f -- f` 以 `LBR-CLI-002` 拒绝。
+- [ ] **AC2** `libra log -L 1,1:f --follow` 以 `LBR-CLI-002` 拒绝。
+- [ ] **AC3** `libra log -L foo` 以 `LBR-CLI-002` 拒绝。
+- [ ] **AC4** `libra log -L 1,1:nofile` 以 `LBR-CLI-003` 拒绝。
+- [ ] ER-06/ER-06a 同卡强制门：`Docs and compatibility impact` 所列每个文件按「文档与网站验收命令」第 1–7 步逐文件交付并验收（不计入卡特有 AC 分子）。
+
+**AC → 断言映射:**（夹具 F32：单文件 `f` 的 2 提交历史；每次调用另按「验证执行协议」第 4 项断言只读不变量；标注「Git 2.54.0 预探」或「Git 同夹具期望」的值按该项以 `git@6de20f6092` 取得并硬编码）
+
+- AC1 → `command::log_test::line_range_argument_validation`：期望 stderr 含 `LBR-CLI-002`（Git：`-L<range>:<file> cannot be used with pathspec`）。
+- AC2 → `command::log_test::line_range_argument_validation`：期望 stderr 含 `LBR-CLI-002`（Git：`--follow requires exactly one pathspec`）。
+- AC3 → `command::log_test::line_range_argument_validation`：期望 stderr 含 `LBR-CLI-002`（Git：`-L argument not 'start,end:file' or ':funcname:file'`）。
+- AC4 → `command::log_test::line_range_argument_validation`：期望 stderr 含 `LBR-CLI-003`（Git：`There is no path nofile in the commit`）。
+- 文档 AC → 「文档与网站验收命令」第 1–7 步（逐文件 SHA-256、关键字命中、网站同步与漂移检查、typecheck/build、Claude Code PASS、精确提交推送、部署核验）。
+
+**Verification:**
+
+- [ ] `source .env.test && cargo nextest run --test command_test -E 'test(=command::log_test::line_range_argument_validation)'`（卡特有 `(new)`，`tests/command/log_test.rs` 内新增；覆盖 AC1–AC4；按「验证执行协议」第 1–4 项执行）
+- [ ] `source .env.test && cargo nextest run --test command_test -E 'test(=command::log_test::test_log_line_range_flag_accepted) | test(=command::log_test::log_ineligible_follow_line_range_pathspec_walk_full_history)'`（共享回归组：既有 `-L` 接受与 follow/-L/pathspec 遍历用例；预期 N = 2；按「验证执行协议」第 5 项先以同一过滤 `cargo nextest list` 核对，要求 exit 0、通过 = N、失败 = 0、跳过 = 0；不计为卡特有 AC 证据）
+
+**Full-suite trigger:** `T-1: 版本面集合同步修改 install.sh / install.ps1（ER-08 / ER-13 T-1）` | **Dependencies:** `LS-17`, `DEP-LS-01`, `DEP-LS-03`
+
+**Implementation write set:** `src/command/log.rs`, `tests/command/log_test.rs`, `docs/commands/log.md`, `docs/commands/zh-CN/log.md`, `docs/development/commands/log.md`, `COMPATIBILITY.md`, `/Volumes/Data/gitmono/libra-backend/apps/tanstack-app/content/docs/commands/log.en.md`
+
+**Release write set:** `Inherited` | **Files likely touched:** `src/command/log.rs`, `tests/command/log_test.rs`, `COMPATIBILITY.md`
+
+**Docs and compatibility impact:** 必须同卡更新：`docs/commands/log.md`、`docs/commands/zh-CN/log.md` 与网站页 `/Volumes/Data/gitmono/libra-backend/apps/tanstack-app/content/docs/commands/log.en.md`（由 `--only log` 同步生成；网站 zh-CN 在渲染时镜像 EN，无独立文件）；文档关键字（用于 EN/zh 命令页）：`-L`。逐文件语义核对：`docs/development/commands/log.md` 与 `COMPATIBILITY.md` 的 `| log |` 行（基线第 196 行）——受本卡行为影响即同卡更新（兼容矩阵原地修改，不增删行），否则按第 1 步记录理由与未变 SHA-256。按「文档与网站验收命令」第 1–7 步逐文件交付并验收。`docs/error-codes.md`：N/A（复用既有稳定码）。
+
+**Rollback mode:** `immutable-release` | **Estimated scope:** `M` | **Version increment:** `patch` | **Release boundary:** `independent` | **C/D coverage from:** `self`
+
+**Granularity:** `type=implementation; axis=log_-L参数校验; recovery=immutable-release; complete=yes; self-contained=yes; AC=4/8; VER=4/8; landing=1; prod-files=1; scope=M; deps=LS-17,DEP-LS-01,DEP-LS-03; writeset=序列化于LS-17; release=independent; split-from=LS-17; exception=N/A`
+
+---
+
+### Task LS-18: 实现 `log --find-object=<object>`（#968）
+
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+
+**Description:** 在 `LogArgs` 新增 `--find-object=<object>`（可重复），按 pinned Git 的文件对语义筛选提交：在该提交相对父提交的递归 diff（含树条目）中，只要任一变更文件对的旧侧或新侧对象 ID 属于给定对象集合即命中；不是按对象出现总次数判定，因此路径移动而总数不变的提交同样命中。
+
+**Out of scope:** `--pickaxe-all`（仅当后续需要时另开）。
+
+**Current evidence:**
+
+| 事实 | 证据 |
+|---|---|
+| `LogArgs` 仅有 `-S`/`-G` 文本 pickaxe，无 `find_object` | `src/command/log.rs:398-408` |
+| Git 按文件对旧侧或新侧 OID 属于查找集合判定，并开启 `tree_in_recursive` 使树条目参与比较 | `git@6de20f6092:diffcore-pickaxe.c:137-145`、`git@6de20f6092:diff.c:5501-5519` |
+
+**Acceptance criteria:**
+
+- [ ] **AC1** `libra log --find-object=<X> --format=%H` 的提交集合等于 Git 同夹具期望（含 X 总数不变的路径移动提交 C6）。
+- [ ] **AC2** `libra log --find-object=<T> --format=%H`（tree OID）的提交集合等于 Git 同夹具期望。
+- [ ] **AC3** `libra log --find-object=<X> --find-object=<Y> --format=%H` 的提交集合等于 Git 同夹具期望（多值取并集）。
+- [ ] **AC4** `--find-object=bogus` 以 `LBR-CLI-003` 拒绝。
+- [ ] ER-06/ER-06a 同卡强制门：`Docs and compatibility impact` 所列每个文件按「文档与网站验收命令」第 1–7 步逐文件交付并验收（不计入卡特有 AC 分子）。
+
+**AC → 断言映射:**（夹具 F18：C1 新增内容相同的 `a.txt` 与 `b.txt`（blob X）及目录 `d/`（tree T）；C2 只修改无关文件；C3 把 `a.txt` 改为 blob Y；C4 删除 `b.txt`；C5 新增内容为 X 的 `c.txt`；C6 把 `c.txt` 移动为 `e.txt`（X 的总出现次数不变）；C7 修改 `d/` 内文件（tree T 被替换）；每次调用另按「验证执行协议」第 4 项断言只读不变量；标注「Git 2.54.0 预探」或「Git 同夹具期望」的值按该项以 `git@6de20f6092` 取得并硬编码）
+
+- AC1 → `command::log_test::find_object`：期望 exit 0；stdout 提交集合逐字等于 Git 同夹具期望。
+- AC2 → `command::log_test::find_object`：期望 exit 0；stdout 提交集合逐字等于 Git 同夹具期望。
+- AC3 → `command::log_test::find_object`：期望 exit 0；stdout 提交集合逐字等于 Git 同夹具期望。
+- AC4 → `command::log_test::find_object`：期望 stderr 含 `LBR-CLI-003`（Git：`unable to resolve 'bogus'`）。
+- 文档 AC → 「文档与网站验收命令」第 1–7 步（逐文件 SHA-256、关键字命中、网站同步与漂移检查、typecheck/build、Claude Code PASS、精确提交推送、部署核验）。
+
+**Verification:**
+
+- [ ] `source .env.test && cargo nextest run --test command_test -E 'test(=command::log_test::find_object)'`（卡特有 `(new)`，`tests/command/log_test.rs` 内新增；覆盖 AC1–AC4；按「验证执行协议」第 1–4 项执行）
+- [ ] `source .env.test && cargo nextest run --test command_test -E 'test(=command::log_test::test_log_pickaxe_s_finds_commit_that_changes_string_count) | test(=command::log_test::test_log_pickaxe_g_matches_diff_line_regex)'`（共享回归组：既有 `-S`/`-G` pickaxe 用例；预期 N = 2；按「验证执行协议」第 5 项先以同一过滤 `cargo nextest list` 核对，要求 exit 0、通过 = N、失败 = 0、跳过 = 0；不计为卡特有 AC 证据）
+
+**Full-suite trigger:** `T-1: 版本面集合同步修改 install.sh / install.ps1（ER-08 / ER-13 T-1）` | **Dependencies:** `LS-32`, `DEP-LS-01`, `DEP-LS-03`
+
+**Implementation write set:** `src/command/log.rs`, `tests/command/log_test.rs`, `docs/commands/log.md`, `docs/commands/zh-CN/log.md`, `docs/development/commands/log.md`, `COMPATIBILITY.md`, `/Volumes/Data/gitmono/libra-backend/apps/tanstack-app/content/docs/commands/log.en.md`
+
+**Release write set:** `Inherited` | **Files likely touched:** `src/command/log.rs`, `tests/command/log_test.rs`, `COMPATIBILITY.md`
+
+**Docs and compatibility impact:** 必须同卡更新：`docs/commands/log.md`、`docs/commands/zh-CN/log.md` 与网站页 `/Volumes/Data/gitmono/libra-backend/apps/tanstack-app/content/docs/commands/log.en.md`（由 `--only log` 同步生成；网站 zh-CN 在渲染时镜像 EN，无独立文件）；文档关键字（用于 EN/zh 命令页）：`--find-object`。逐文件语义核对：`docs/development/commands/log.md` 与 `COMPATIBILITY.md` 的 `| log |` 行（基线第 196 行）——受本卡行为影响即同卡更新（兼容矩阵原地修改，不增删行），否则按第 1 步记录理由与未变 SHA-256。按「文档与网站验收命令」第 1–7 步逐文件交付并验收。`docs/error-codes.md`：N/A（复用既有稳定码）。
+
+**Rollback mode:** `immutable-release` | **Estimated scope:** `M` | **Version increment:** `patch` | **Release boundary:** `independent` | **C/D coverage from:** `self`
+
+**Granularity:** `type=implementation; axis=log_--find-object; recovery=immutable-release; complete=yes; self-contained=yes; AC=4/8; VER=4/8; landing=1; prod-files=1; scope=M; deps=LS-32,DEP-LS-01,DEP-LS-03; writeset=序列化于LS-32; release=independent; split-from=N/A; exception=N/A`
+
+---
+
+### Task LS-19: 实现 `log --cc` 合并提交紧凑组合差异（#833）
+
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+
+**Description:** 在 `LogArgs` 新增 `--cc`（dense combined diff），对合并提交仅输出在所有父提交中均发生变更的文件及其 `@@@` 组合 hunk，单父提交仍正常输出普通 patch。
+
+**Out of scope:** `-c` 非紧凑组合差异或 `--combined-all-paths`（仅实现 `--cc`）。
+
+**Current evidence:**
+
+| 事实 | 证据 |
+|---|---|
+| `LogArgs` 无 `--cc` 字段 | `src/command/log.rs:172-486` |
+
+**Acceptance criteria:**
+
+- [ ] **AC1** `libra log --cc -1 M` 的 stdout 逐字等于 Git 同夹具期望（含 `diff --cc c.txt` 与 `@@@` 组合 hunk）。
+- [ ] **AC2** M 的 `--cc` 输出所列文件集合恰为 {`c.txt`}（仅一侧改动的 `one.txt` 不出现）。
+- [ ] **AC3** 对非合并提交 N，`libra log --cc -1 N` 的 stdout 与 `libra log -p -1 N` 逐字相同（普通 patch）。
+- [ ] ER-06/ER-06a 同卡强制门：`Docs and compatibility impact` 所列每个文件按「文档与网站验收命令」第 1–7 步逐文件交付并验收（不计入卡特有 AC 分子）。
+
+**AC → 断言映射:**（夹具 F19：分支两侧都修改 `c.txt` 并手工解决冲突的合并提交 M（另一侧单独修改 `one.txt`）；以及普通提交 N；每次调用另按「验证执行协议」第 4 项断言只读不变量；标注「Git 2.54.0 预探」或「Git 同夹具期望」的值按该项以 `git@6de20f6092` 取得并硬编码）
+
+- AC1 → `command::log_test::log_cc_combined_diff`：期望 exit 0；stdout 逐字等于 Git 同夹具期望。
+- AC2 → `command::log_test::log_cc_combined_diff`：期望 exit 0；stdout 中 `diff --cc` 头的文件集合恰为 {`c.txt`}。
+- AC3 → `command::log_test::log_cc_combined_diff`：期望 两次调用均 exit 0；stdout 逐字相同。
+- 文档 AC → 「文档与网站验收命令」第 1–7 步（逐文件 SHA-256、关键字命中、网站同步与漂移检查、typecheck/build、Claude Code PASS、精确提交推送、部署核验）。
+
+**Verification:**
+
+- [ ] `source .env.test && cargo nextest run --test command_test -E 'test(=command::log_test::log_cc_combined_diff)'`（卡特有 `(new)`，`tests/command/log_test.rs` 内新增；覆盖 AC1–AC3；按「验证执行协议」第 1–4 项执行）
+- [ ] `source .env.test && cargo nextest run --test command_test -E 'test(=command::log_test::test_log_first_parent_skips_merged_branch_commits)'`（共享回归组：既有合并提交遍历用例；预期 N = 1；按「验证执行协议」第 5 项先以同一过滤 `cargo nextest list` 核对，要求 exit 0、通过 = N、失败 = 0、跳过 = 0；不计为卡特有 AC 证据）
+
+**Full-suite trigger:** `T-1: 版本面集合同步修改 install.sh / install.ps1（ER-08 / ER-13 T-1）` | **Dependencies:** `LS-18`, `DEP-LS-01`, `DEP-LS-03`
+
+**Implementation write set:** `src/command/log.rs`, `tests/command/log_test.rs`, `docs/commands/log.md`, `docs/commands/zh-CN/log.md`, `docs/development/commands/log.md`, `COMPATIBILITY.md`, `/Volumes/Data/gitmono/libra-backend/apps/tanstack-app/content/docs/commands/log.en.md`
+
+**Release write set:** `Inherited` | **Files likely touched:** `src/command/log.rs`, `tests/command/log_test.rs`, `COMPATIBILITY.md`
+
+**Docs and compatibility impact:** 必须同卡更新：`docs/commands/log.md`、`docs/commands/zh-CN/log.md` 与网站页 `/Volumes/Data/gitmono/libra-backend/apps/tanstack-app/content/docs/commands/log.en.md`（由 `--only log` 同步生成；网站 zh-CN 在渲染时镜像 EN，无独立文件）；文档关键字（用于 EN/zh 命令页）：`--cc`。逐文件语义核对：`docs/development/commands/log.md` 与 `COMPATIBILITY.md` 的 `| log |` 行（基线第 196 行）——受本卡行为影响即同卡更新（兼容矩阵原地修改，不增删行），否则按第 1 步记录理由与未变 SHA-256。按「文档与网站验收命令」第 1–7 步逐文件交付并验收。`docs/error-codes.md`：N/A（复用既有稳定码）。
+
+**Rollback mode:** `immutable-release` | **Estimated scope:** `M` | **Version increment:** `patch` | **Release boundary:** `independent` | **C/D coverage from:** `self`
+
+**Granularity:** `type=implementation; axis=log_--cc组合差异; recovery=immutable-release; complete=yes; self-contained=yes; AC=3/8; VER=4/8; landing=1; prod-files=1; scope=M; deps=LS-18,DEP-LS-01,DEP-LS-03; writeset=序列化于LS-18; release=independent; split-from=N/A; exception=N/A`
+
+---
+
+### Task LS-20: `log` 支持 `--raw`、`--numstat` 与 `--dirstat` 差异格式选项（#964）
+
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+
+**Description:** 在 `LogArgs` 补齐 `--raw` 与 `--numstat`（`--dirstat` 在 `log.rs` 已有 `compute_commit_dirstat` (`log.rs:3416`) + `utils::diff_format::format_dirstat`，且 `format_diff_dirstat` (`diff/render.rs:412`) 已为 `pub(crate)`，仅核实对齐）。按 `ADR-LS-01` 与 `DEP-LS-02` 等待 `issues/529.md` `FP-05`/`FP-07` `done`/`complete` 后直接复用其公开的 `pub(crate) mod render` 与独立 `numstat` 渲染函数（当前 `numstat` 为 `diff/render.rs:278` `render_diff_output` 内分支，不重复实现），并将 `src/command/diff/render.rs:503` 的 `format_diff_raw`（当前为 `pub(super)`）提升为 `pub(crate)` 供 `LogDiffOptions` 复用，且均参与 `-s`/`--no-patch` 顺序清除。
+
+**Out of scope:** 不改变 `diff` 命令自身格式，不修改 `CommitDiffOptions`。
+
+**Current evidence:**
+
+| 事实 | 证据 |
+|---|---|
+| `LogArgs` 已有 `dirstat`/`dirstat_by_file` 与 `compute_commit_dirstat`（`log.rs:3416`），缺少 `raw` 与 `numstat`；`numstat` 当前为 `render_diff_output`（`diff/render.rs:278`）内分支（由 `529.md` `FP-07` 抽取）；`format_diff_raw` 位于 `diff/render.rs:503`（`pub(super)`），`format_diff_dirstat` 位于 `diff/render.rs:412`（已 `pub(crate)`） | `src/command/log.rs:201-280,3416`、`src/command/diff/render.rs:278,412,503` |
+
+**Acceptance criteria:**
+
+- [ ] **AC1** `libra log --raw -1` 的 stdout 逐字等于 Git 同夹具期望（含 `:<oldmode> <newmode> <oldsha> <newsha> <status>\t<path>` 行）。
+- [ ] **AC2** `libra log --numstat -1` 的 stdout 逐字等于 Git 同夹具期望（含 `<ins>\t<del>\t<path>` 行）。
+- [ ] **AC3** `libra log --dirstat -1` 的 stdout 逐字等于 Git 同夹具期望（核实既有 `compute_commit_dirstat` 对齐）。
+- [ ] **AC4** `libra log -1 --raw -s` 的输出与 `libra log -1 -s` 逐字相同（后续 `-s` 清除 `--raw`）。
+- [ ] **AC5** `libra log -1 --numstat -s` 的输出与 `libra log -1 -s` 逐字相同（后续 `-s` 清除 `--numstat`）。
+- [ ] **AC6** `libra log -1 --dirstat --no-patch` 的输出与 `libra log -1 --no-patch` 逐字相同（后续 `--no-patch` 清除 `--dirstat`）。
+- [ ] ER-06/ER-06a 同卡强制门：`Docs and compatibility impact` 所列每个文件按「文档与网站验收命令」第 1–7 步逐文件交付并验收（不计入卡特有 AC 分子）。
+
+**AC → 断言映射:**（夹具 F20：一个提交同时含新增、修改、删除与模式变更文件；每次调用另按「验证执行协议」第 4 项断言只读不变量；标注「Git 2.54.0 预探」或「Git 同夹具期望」的值按该项以 `git@6de20f6092` 取得并硬编码）
+
+- AC1 → `command::log_test::raw_numstat_dirstat_formats`：期望 exit 0；stdout 逐字等于 Git 同夹具期望。
+- AC2 → `command::log_test::raw_numstat_dirstat_formats`：期望 exit 0；stdout 逐字等于 Git 同夹具期望。
+- AC3 → `command::log_test::raw_numstat_dirstat_formats`：期望 exit 0；stdout 逐字等于 Git 同夹具期望。
+- AC4 → `command::log_test::raw_numstat_dirstat_formats`：期望 两次调用均 exit 0；stdout 逐字相同。
+- AC5 → `command::log_test::raw_numstat_dirstat_formats`：期望 两次调用均 exit 0；stdout 逐字相同。
+- AC6 → `command::log_test::raw_numstat_dirstat_formats`：期望 两次调用均 exit 0；stdout 逐字相同。
+- 文档 AC → 「文档与网站验收命令」第 1–7 步（逐文件 SHA-256、关键字命中、网站同步与漂移检查、typecheck/build、Claude Code PASS、精确提交推送、部署核验）。
+
+**Verification:**
+
+- [ ] `source .env.test && cargo nextest run --test command_test -E 'test(=command::log_test::raw_numstat_dirstat_formats)'`（卡特有 `(new)`，`tests/command/log_test.rs` 内新增；覆盖 AC1–AC6；按「验证执行协议」第 1–4 项执行）
+- [ ] `source .env.test && cargo nextest run --test command_test -E 'test(/^command::diff_test::/)'`（共享回归组：`command::diff_test` 模块族，守护 `src/command/diff/` 共享逻辑；N 以运行前 list 结果为准（≥1）；按「验证执行协议」第 5 项先以同一过滤 `cargo nextest list` 核对，要求 exit 0、通过 = N、失败 = 0、跳过 = 0；不计为卡特有 AC 证据）
+
+**Full-suite trigger:** `T-1: 版本面集合同步修改 install.sh / install.ps1（ER-08 / ER-13 T-1）` | **Dependencies:** `LS-19`, `DEP-LS-01`, `DEP-LS-02`, `DEP-LS-03`
+
+**Implementation write set:** `src/command/log.rs`, `src/command/diff.rs`, `src/command/diff/render.rs`, `tests/command/log_test.rs`, `docs/commands/log.md`, `docs/commands/zh-CN/log.md`, `docs/development/commands/log.md`, `COMPATIBILITY.md`, `/Volumes/Data/gitmono/libra-backend/apps/tanstack-app/content/docs/commands/log.en.md`
+
+**Release write set:** `Inherited` | **Files likely touched:** `src/command/log.rs`, `src/command/diff.rs`, `src/command/diff/render.rs`, `tests/command/log_test.rs`, `COMPATIBILITY.md`
+
+**Docs and compatibility impact:** 必须同卡更新：`docs/commands/log.md`、`docs/commands/zh-CN/log.md` 与网站页 `/Volumes/Data/gitmono/libra-backend/apps/tanstack-app/content/docs/commands/log.en.md`（由 `--only log` 同步生成；网站 zh-CN 在渲染时镜像 EN，无独立文件）；文档关键字（用于 EN/zh 命令页）：`--numstat`。逐文件语义核对：`docs/development/commands/log.md` 与 `COMPATIBILITY.md` 的 `| log |` 行（基线第 196 行）——受本卡行为影响即同卡更新（兼容矩阵原地修改，不增删行），否则按第 1 步记录理由与未变 SHA-256。按「文档与网站验收命令」第 1–7 步逐文件交付并验收。`docs/error-codes.md`：N/A（复用既有稳定码）。
+
+**Rollback mode:** `immutable-release` | **Estimated scope:** `M` | **Version increment:** `patch` | **Release boundary:** `independent` | **C/D coverage from:** `self`
+
+**Granularity:** `type=implementation; axis=log_--raw/--numstat/--dirstat; recovery=immutable-release; complete=yes; self-contained=yes; AC=6/8; VER=4/8; landing=2; prod-files=3; scope=M; deps=LS-19,DEP-LS-01,DEP-LS-02,DEP-LS-03; writeset=序列化于LS-19; release=independent; split-from=N/A; exception=N/A`
+
+---
+
+### Task LS-21: `log` 透传 diff 空白忽略选项（`-w` / `-b`）（#967；拆出 LS-28、LS-29、LS-30）
+
 **Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
 
 **Description:** 在 `LogArgs` 新增 `-w`/`--ignore-all-space` 与 `-b`/`--ignore-space-change` 并经 `LogDiffOptions` 复用 `src/command/diff/compare.rs:405-417` 与 `src/command/diff.rs:4728` 空白归一化对比逻辑。
