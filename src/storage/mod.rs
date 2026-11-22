@@ -19,6 +19,8 @@ pub mod backend;
 pub mod codec;
 pub mod error;
 #[cfg(feature = "storage-redb")]
+pub mod meta;
+#[cfg(feature = "storage-redb")]
 pub mod opener;
 
 pub use backend::{
@@ -26,6 +28,14 @@ pub use backend::{
     assert_redb_runtime_unlocked,
 };
 pub use error::{StorageBackendError, StorageResult};
+#[cfg(feature = "storage-redb")]
+pub use meta::{
+    CURRENT_REDB_FORMAT_VERSION, MAX_SUPPORTED_READER_VERSION, META_SCHEMA_CODEC_VERSION,
+    META_SCHEMA_SINGLETON_KEY, META_SCHEMA_TABLE, MIGRATION_TOMBSTONE_MIN_READER_VERSION,
+    MetaSchemaRecord, MetaSchemaRole, begin_checked_read, begin_checked_write,
+    begin_checked_write_blocking, init_meta_schema, validate_meta_schema, verify_meta_schema_read,
+    verify_meta_schema_write, write_migration_tombstone,
+};
 #[cfg(feature = "storage-redb")]
 pub use opener::{
     CACHE_SIZE_LONG_LIVED, CACHE_SIZE_READ_ONLY, CACHE_SIZE_STANDARD_WRITE, RedbOpenProfile,

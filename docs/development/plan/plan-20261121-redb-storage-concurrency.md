@@ -1070,7 +1070,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `remote-pending`
 
 **Description:** 100% 在 `src/storage/` 内交付 `META_SCHEMA` 账本与句柄迁移围栏校验模块（`meta.rs`）：核验角色、最低读取版本与 `min_reader_version == u32::MAX` 迁移围栏哨兵，在每次读/写事务入口物理阻断已打开废弃红库句柄继续读写。
 
@@ -1084,15 +1084,15 @@
 | `ADR-RB-03` #3 与 `ADR-RB-04` #4 要求每库内置 `META_SCHEMA` 并在每次事务入口检查 `min_reader_version == u32::MAX` 围栏 | `ADR-RB-03`、`ADR-RB-04` |
 
 **Acceptance criteria:**
-- [ ] `META_SCHEMA` 校验拒绝角色不匹配（如用 `Repository` 打开 `Capture`）的 `.redb` 文件。
-- [ ] `META_SCHEMA` 校验拒绝 `min_reader_version` 高于当前二进制版本的 `.redb` 文件。
-- [ ] 读事务入口遇到 `META_SCHEMA` 迁移围栏哨兵（`min_reader_version == u32::MAX`）时立即中止并返回 `StorageBackendError::RepositoryMigrated`。
-- [ ] 写事务入口遇到 `META_SCHEMA` 迁移围栏哨兵（`min_reader_version == u32::MAX`）时立即中止并返回 `StorageBackendError::RepositoryMigrated`。
+- [x] `META_SCHEMA` 校验拒绝角色不匹配（如用 `Repository` 打开 `Capture`）的 `.redb` 文件。
+- [x] `META_SCHEMA` 校验拒绝 `min_reader_version` 高于当前二进制版本的 `.redb` 文件。
+- [x] 读事务入口遇到 `META_SCHEMA` 迁移围栏哨兵（`min_reader_version == u32::MAX`）时立即中止并返回 `StorageBackendError::RepositoryMigrated`。
+- [x] 写事务入口遇到 `META_SCHEMA` 迁移围栏哨兵（`min_reader_version == u32::MAX`）时立即中止并返回 `StorageBackendError::RepositoryMigrated`。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --no-default-features --features storage-redb,storage-queue --lib -E 'test(=storage::meta::tests::meta_schema_role_future_version_and_migration_tombstone_fence)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=storage::meta::tests::meta_schema_role_future_version_and_migration_tombstone_fence)'`（new，覆盖 AC1、AC2、AC3、AC4）
-- [ ] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 2 文件实现白名单（`src/storage/mod.rs`、`src/storage/meta.rs`）。
+- [x] `source .env.test && cargo nextest list --no-default-features --features storage-redb,storage-queue --lib -E 'test(=storage::meta::tests::meta_schema_role_future_version_and_migration_tombstone_fence)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=storage::meta::tests::meta_schema_role_future_version_and_migration_tombstone_fence)'`（new，覆盖 AC1、AC2、AC3、AC4）
+- [x] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 2 文件实现白名单（`src/storage/mod.rs`、`src/storage/meta.rs`）。
 
 **Full-suite trigger:** `none`
 
@@ -10017,8 +10017,9 @@
 | `RB-01b` | `done` / `remote-pending` | `63088e8`（`main`） | `0.30.285` | 2026-11-22 06:45:49 UTC：Stage 1 精确 3 文件写集、`versioned_postcard_roundtrip_and_corrupt_reject` 与 `io_error_display_and_cli_error_do_not_leak_sensitive_source_text`（含跨版本显式分发与 `anyhow` `{error:#}` 链路脱敏）全绿、4 特性矩阵、fmt、严格 clippy、rustdoc、`compat_version_surface_sync` 全绿；Codex R3 `01a20200-379a-7b71-aaab-73ab6e680f74` `VERDICT: PASS` |
 | `RB-01c` | `done` / `remote-pending` | `0ae1cfb`（`main`） | `0.30.286` | 2026-11-22 07:17:48 UTC：Stage 1 精确 2 文件写集、`sqlite_only_rejects_redb_override`/`redb_only_rejects_sqlite_override`/`dual_feature_resolution_and_pre_release_cli_gate`（含独立子进程实测 `resolve()` 与非法值占位脱敏）全绿、fmt、严格 clippy、`compat_version_surface_sync` 全绿；Codex R2 `01a2021d-77b7-7c90-9146-40618689ff47` `VERDICT: PASS` |
 | `RB-02` | `done` / `remote-pending` | `16c6ac7`（`main`） | `0.30.287` | 2026-11-22 07:57:32 UTC：Stage 1 精确 2 文件写集、`multiwriter_concurrent_open_and_bounded_write_timeout`（含 `RecordingBuilder` 校验 `MultiWriter` + `16/32/64 MiB`、阻塞池饱和 `Duration::ZERO` 及非零 deadline、多进程并发打开与有界写锁超时、`UpgradeRequired` 按格式版本可操作指引）全绿、4 特性矩阵、fmt、严格 clippy、rustdoc、`compat_version_surface_sync` 全绿；Codex R5 `01a20241-78d9-70d1-be41-35093cc20ca8` `VERDICT: PASS` |
-| `RB-02d` | `done` / `remote-pending` | 本提交（`main`） | `0.30.290` | 2026-11-22 08:38:12 UTC：Stage 1 精确 2 文件写集、封闭 `RedbRepairContext` 门控并私有化 `redb_builder_for`、`readonly_repair_aborted_ro_fs_and_concurrent_explicit_repair`（含真实 `CrashBackend` 崩溃夹具严格只读 `RepairAborted` 零改盘、真实 `hdiutil -readonly` 只读挂载 `EROFS` fail-closed 零改盘及 4 进程并发安全修复）全绿、4 特性矩阵、fmt、严格 clippy、rustdoc、`compat_version_surface_sync` 全绿；Codex R3 `01a2025d-810c-7b83-9f63-98f634fb5752` `VERDICT: PASS` |
-| `RB-02b`..`RB-34c`（剩余 148 卡） | `pending` | — | — | 按实施顺序于 `main` 逐卡推进 |
+| `RB-02d` | `done` / `remote-pending` | `f60d17e`（`main`） | `0.30.290` | 2026-11-22 08:38:12 UTC：Stage 1 精确 2 文件写集、封闭 `RedbRepairContext` 门控并私有化 `redb_builder_for`、`readonly_repair_aborted_ro_fs_and_concurrent_explicit_repair`（含真实 `CrashBackend` 崩溃夹具严格只读 `RepairAborted` 零改盘、真实 `hdiutil -readonly` 只读挂载 `EROFS` fail-closed 零改盘及 4 进程并发安全修复）全绿、4 特性矩阵、fmt、严格 clippy、rustdoc、`compat_version_surface_sync` 全绿；Codex R3 `01a2025d-810c-7b83-9f63-98f634fb5752` `VERDICT: PASS` |
+| `RB-02b` | `done` / `remote-pending` | 本提交（`main`） | `0.30.292` | 2026-11-22 09:08:13 UTC：Stage 1 精确 2 文件写集、`meta_schema_role_future_version_and_migration_tombstone_fence`（含角色失配/Derived 拒绝、未来版本按角色错误码 `LBR-AGENT-048`/`LBR-CONFIG-001`/`LBR-IO-001`、已有普通表/multimap 表/空 `META_SCHEMA` 防重贴标签及跨进程 `u32::MAX` 围栏+`unlink` 已打开读写句柄阻断）全绿、4 特性矩阵、fmt、严格 clippy、rustdoc、`compat_version_surface_sync` 全绿；Codex R3 `01a20282-120a-7123-bc17-168bae3ff386` `VERDICT: PASS` |
+| `RB-02c`..`RB-34c`（剩余 147 卡） | `pending` | — | — | 按实施顺序于 `main` 逐卡推进 |
 
 ## Codex review log
 
