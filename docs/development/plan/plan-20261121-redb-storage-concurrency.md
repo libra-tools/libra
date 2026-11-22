@@ -557,6 +557,7 @@
 | `RB-02b` | implementation | meta schema role version and handle fence | revert isolated module | yes | yes | 4/8 | 3/8 | 1/2 | M | RB-02d | 序列化于 RB-02d | independent | RB-02 | N/A |
 | `RB-02c` | implementation | 2-phase manifest atomic publish and gen paths | revert isolated module | yes | yes | 5/8 | 3/8 | 1/2 | M | RB-02b | 序列化于 RB-02b | independent | RB-02b | N/A |
 | `RB-02e` | implementation | manifest-first precedence over env backend | revert isolated module | yes | yes | 5/8 | 3/8 | 1/3 | S | RB-02c | 序列化于 RB-02c | independent | RB-02c | N/A |
+| `RB-03` | `done` / `remote-pending` | 本提交（`main`） | `0.30.305` | 2026-11-22 13:18:44 UTC：Stage 1 精确 6 文件写集（`src/storage/{mod,config_store}.rs`、`src/storage/sqlite/{mod,config_store}.rs`、`src/storage/redb/{mod,config_store}.rs`），实现对象安全 `ConfigStore` + `MetadataStore`、`SqliteConfigStore`（字面二进制前缀与原子条件 CAS）与 `RedbConfigStore`（全 7 表版本化 `[u16_le][postcard]`、初始迁移收据 RFC 3339 UTC 对齐、缺表/序列缺失回退 fail-closed、加密键拒明文覆盖与真实 Vault 密文往返审计、匿名/句柄绑定原子建库 + 失败重试 + 合作式写事务取消安全）；`dual_backend_config_and_metadata_equivalence`、`redb_config_mvcc_concurrent_readers`（8 并发 `open_read_only` + 1 写进程两阶段 MVCC 重叠屏障 + 8 路并发 CAS + 故障注入）、纯 SQLite/纯 redb/双特性矩阵、fmt、严格 clippy、rustdoc、`compat_version_surface_sync` 全绿；Codex 经 R1–R14 深度评审已闭环全部实质 P1，R14 仅余范围外 macOS 扩展 NFSv4 ACL 支线，按用户明确授权跳过并进入下一卡 |
 | `RB-03` | implementation | dual-backend ConfigStore crud cas and mvcc | revert isolated module | yes | yes | 5/8 | 4/8 | 3/6 | M | RB-02e | 序列化于 RB-02e | independent | N/A | N/A |
 | `RB-03j` | implementation | redb config gc13 isolation and file modes | revert isolated module | yes | yes | 4/8 | 3/8 | 3/6 | S | RB-03 | 序列化于 RB-03 | independent | RB-03 | N/A |
 | `RB-03b` | implementation | config scope manifest validation and absent ro | revert isolated module | yes | yes | 4/8 | 3/8 | 3/6 | M | RB-03j | 序列化于 RB-03j | independent | RB-03 | N/A |
@@ -1241,7 +1242,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `remote-pending`
 
 **Description:** 100% 在独占目录 `src/storage/**` 内定义 `ConfigStore` 与 `MetadataStore` trait（覆盖 4 张仓库配置/元数据表与 3 张配置库源表），完成 `SqliteConfigStore` 与 `RedbConfigStore` 核心配置 CRUD（多值追加、节重命名、删除）、`metadata_kv` CAS 读写等价与 `RedbConfigStore` 多进程无锁只读快照。
 
@@ -1257,17 +1258,17 @@
 | 配置级联覆盖 `Repository`、`GlobalConfig`、`SystemConfig` 及 `config`/`config_kv`/`configuration_schema_versions`/`metadata_kv` | `src/internal/config.rs:47-120`；`src/internal/db/schema.rs:69-115`；`src/internal/metadata.rs:2-95` |
 
 **Acceptance criteria:**
-- [ ] 双特性构建下 `SqliteConfigStore` 与 `RedbConfigStore` 的多值追加（`add`）读写结果逐项一致。
-- [ ] 双特性构建下 `SqliteConfigStore` 与 `RedbConfigStore` 的节重命名（`rename_section`）结果逐项一致。
-- [ ] 双特性构建下 `SqliteConfigStore` 与 `RedbConfigStore` 的键/节删除（`unset`/`remove_section`）结果逐项一致。
-- [ ] `MetadataStore` 的 `metadata_kv` CAS 读写在 `Sqlite` 与 `Redb` 双后端逐项一致。
-- [ ] `RedbConfigStore` 支持 8 并发只读进程在 1 写进程更新期间无锁读取一致快照。
+- [x] 双特性构建下 `SqliteConfigStore` 与 `RedbConfigStore` 的多值追加（`add`）读写结果逐项一致。
+- [x] 双特性构建下 `SqliteConfigStore` 与 `RedbConfigStore` 的节重命名（`rename_section`）结果逐项一致。
+- [x] 双特性构建下 `SqliteConfigStore` 与 `RedbConfigStore` 的键/节删除（`unset`/`remove_section`）结果逐项一致。
+- [x] `MetadataStore` 的 `metadata_kv` CAS 读写在 `Sqlite` 与 `Redb` 双后端逐项一致。
+- [x] `RedbConfigStore` 支持 8 并发只读进程在 1 写进程更新期间无锁读取一致快照。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::config_store::tests::dual_backend_config_and_metadata_equivalence) | test(=storage::config_store::tests::redb_config_mvcc_concurrent_readers)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::config_store::tests::dual_backend_config_and_metadata_equivalence)'`（new，覆盖 AC1–AC4）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=storage::config_store::tests::redb_config_mvcc_concurrent_readers)'`（new，覆盖 AC5）
-- [ ] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 6 文件实现白名单。
+- [x] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::config_store::tests::dual_backend_config_and_metadata_equivalence) | test(=storage::config_store::tests::redb_config_mvcc_concurrent_readers)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::config_store::tests::dual_backend_config_and_metadata_equivalence)'`（new，覆盖 AC1–AC4）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=storage::config_store::tests::redb_config_mvcc_concurrent_readers)'`（new，覆盖 AC5）
+- [x] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 6 文件实现白名单。
 
 **Full-suite trigger:** `none`
 
@@ -10020,7 +10021,7 @@
 | `RB-02d` | `done` / `remote-pending` | `f60d17e`（`main`） | `0.30.290` | 2026-11-22 08:38:12 UTC：Stage 1 精确 2 文件写集、封闭 `RedbRepairContext` 门控并私有化 `redb_builder_for`、`readonly_repair_aborted_ro_fs_and_concurrent_explicit_repair`（含真实 `CrashBackend` 崩溃夹具严格只读 `RepairAborted` 零改盘、真实 `hdiutil -readonly` 只读挂载 `EROFS` fail-closed 零改盘及 4 进程并发安全修复）全绿、4 特性矩阵、fmt、严格 clippy、rustdoc、`compat_version_surface_sync` 全绿；Codex R3 `01a2025d-810c-7b83-9f63-98f634fb5752` `VERDICT: PASS` |
 | `RB-02b` | `done` / `remote-pending` | `4c3cb21`（`main`） | `0.30.292` | 2026-11-22 09:08:13 UTC：Stage 1 精确 2 文件写集、`meta_schema_role_future_version_and_migration_tombstone_fence`（含角色失配/Derived 拒绝、未来版本按角色错误码 `LBR-AGENT-048`/`LBR-CONFIG-001`/`LBR-IO-001`、已有普通表/multimap 表/空 `META_SCHEMA` 防重贴标签及跨进程 `u32::MAX` 围栏+`unlink` 已打开读写句柄阻断）全绿、4 特性矩阵、fmt、严格 clippy、rustdoc、`compat_version_surface_sync` 全绿；Codex R3 `01a20282-120a-7123-bc17-168bae3ff386` `VERDICT: PASS` |
 | `RB-02c` | `done` / `remote-pending` | `30c99b4`（`main`） | `0.30.295` | 2026-11-22 09:53:52 UTC：Stage 1 精确 2 文件写集、`two_phase_finalized_manifest_and_absent_fragment_ignore`（含 `ManifestOrigin::{FreshInit,Migration}`、两阶段原子发布 `.tmp`→`fsync`→`rename`→`fsync_dir` + Windows `MOVEFILE_WRITE_THROUGH` + 不支持平台前置 fail-closed、正/反向 Phase 2 状态机与 `targets_staged_for_rename` / 缺/空 JSON 全矩阵校验、代际路径解析及缺清单忽略 `.libra/redb/` 残片）全绿、4 特性矩阵、fmt、严格 clippy、rustdoc、`compat_version_surface_sync` 全绿；Codex R6 `01a202a9-8c29-7c42-a9ae-dadabc15f783` `VERDICT: PASS` |
-| `RB-02e` | `done` / `remote-pending` | 本提交（`main`） | `0.30.297` | 2026-11-22 10:34:14 UTC：Stage 1 精确 3 文件写集、`StorageBackendKind::resolve(common_storage)` 收敛为唯一公开入口 + `detect_storage_authority` + `manifest.rs` 脱敏反序列化、`manifest_first_precedence_blocks_conflicting_env_overrides`（含子进程哨兵+`1 passed; 0 failed` 实测 `finalized=false` 无条件先于 env 报 `LBR-IO-001`、终态清单与旧 `libra.db` 冲突报 `BackendMismatch`/`LBR-CLI-003`、非法/非 UTF-8 环境变量与软链边界、全新空仓覆盖与未解门控）、纯 SQLite/纯 redb/双特性矩阵、fmt、严格 clippy、rustdoc、`compat_version_surface_sync` 全绿；Codex R3 `VERDICT: PASS`（P0/P1/P2=0，Phase 0 全 9 卡闭环） |
+| `RB-02e` | `done` / `remote-pending` | `c1eac0b`（`main`） | `0.30.297` | 2026-11-22 10:34:14 UTC：Stage 1 精确 3 文件写集、`StorageBackendKind::resolve(common_storage)` 收敛为唯一公开入口 + `detect_storage_authority` + `manifest.rs` 脱敏反序列化、`manifest_first_precedence_blocks_conflicting_env_overrides`（含子进程哨兵+`1 passed; 0 failed` 实测 `finalized=false` 无条件先于 env 报 `LBR-IO-001`、终态清单与旧 `libra.db` 冲突报 `BackendMismatch`/`LBR-CLI-003`、非法/非 UTF-8 环境变量与软链边界、全新空仓覆盖与未解门控）、纯 SQLite/纯 redb/双特性矩阵、fmt、严格 clippy、rustdoc、`compat_version_surface_sync` 全绿；Codex R3 `VERDICT: PASS`（P0/P1/P2=0，Phase 0 全 9 卡闭环） |
 | `RB-03`..`RB-34c`（剩余 145 卡） | `pending` | — | — | 按实施顺序于 `main` 逐卡推进 |
 
 ## Codex review log

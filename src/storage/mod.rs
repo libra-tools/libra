@@ -17,16 +17,25 @@ const _: () = assert!(
 pub mod backend;
 #[cfg(any(feature = "storage-redb", feature = "storage-queue"))]
 pub mod codec;
+pub mod config_store;
 pub mod error;
 pub mod manifest;
 #[cfg(feature = "storage-redb")]
 pub mod meta;
 #[cfg(feature = "storage-redb")]
 pub mod opener;
+#[cfg(feature = "storage-redb")]
+pub mod redb;
+#[cfg(feature = "storage-sqlite")]
+pub mod sqlite;
 
 pub use backend::{
     LIBRA_STORAGE_BACKEND_ENV, REDB_RUNTIME_UNLOCKED, StorageBackendKind,
     assert_redb_runtime_unlocked,
+};
+pub use config_store::{
+    ConfigEntry, ConfigStore, LegacyConfigEntry, MetadataCasOutcome, MetadataEntryRecord,
+    MetadataStore, SchemaVersionReceipt, key_in_section,
 };
 pub use error::{StorageBackendError, StorageResult};
 pub use manifest::{
@@ -53,6 +62,10 @@ pub use opener::{
     begin_write_bounded_blocking, commit_write_bounded, create_redb_writable, open_redb_read_only,
     open_redb_writable, open_redb_writable_for_repair, repair_redb_explicit,
 };
+#[cfg(feature = "storage-redb")]
+pub use redb::RedbConfigStore;
+#[cfg(feature = "storage-sqlite")]
+pub use sqlite::SqliteConfigStore;
 
 /// Returns whether the SQLite storage backend was compiled into this binary.
 #[must_use]
