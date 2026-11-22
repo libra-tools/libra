@@ -1509,6 +1509,8 @@ PY
 
 
 **2026-11-21 全量门回归修复：** `generate_cc_diff` 改为经 `ShallowSet::parents_for_walk` 取父提交（此前直接遍历 `commit.parent_commit_ids`，被 `compat_shallow_walk_helper` 判为未走 shallow helper；修复后该 target 2/2 通过），并在 `log.rs` 的 `parent_commit_ids.is_empty()` 处按守卫要求标注 `// SHALLOW-DISPLAY`（仅存在性判断、不遍历父链）。
+
+**2026-11-21 全量门第二处回归修复：** `internal::log::formatter::tests::format_custom_all_placeholders` 因 `%d` 改用 `decoration_wrapped` 而失败（测试夹具只填了 `decoration`）；已把夹具补为 ` (tag: v1.0)`，该模块 5/5 通过。此前的卡内验证只跑 `command::log_test::`，漏掉了 lib 单测族——后续卡应同时跑 `internal::log::formatter::tests`。
 ### Task LS-20: `log` 支持 `--raw`、`--numstat` 与 `--dirstat` 差异格式选项（#964）
 
 **Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`

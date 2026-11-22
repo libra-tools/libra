@@ -842,7 +842,7 @@ mod tests {
         let ctx = FormatContext {
             graph_prefix: "* ",
             decoration: "tag: v1.0",
-            decoration_wrapped: "",
+            decoration_wrapped: " (tag: v1.0)",
 
             commit_color: None,
             abbrev_len: 8,
