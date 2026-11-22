@@ -108,3 +108,5 @@ flowchart TD
 - 2026-11-21（LS-03 / #951）：`log.excludeDecoration` 多值配置参与装饰过滤（显式 `--decorate-refs` 覆盖配置）；空串值按 Git 空排除模式处理，`HEAD` 标记保留；Libra 配置无「无值键」形态，缺值诊断登记为有意差异。回归：`command::log_test::log_exclude_decoration_config`。
 
 - 2026-11-21（LS-05 / #953）：新增 `--simplify-by-decoration`——保留经装饰过滤后的被引用提交与仓库根提交，其余丢弃；与本机 `git 2.56.0` 同夹具输出逐字一致（线性、分支、合并与 `--decorate-refs`/`--decorate-refs-exclude` 过滤）。回归：`command::log_test::simplify_by_decoration`。
+
+- 2026-11-21（LS-06 / #954）：新增 `--clear-decorations`（清除此前 `--decorate-refs*` 并放开默认命名空间过滤）与 `log.initialDecorationSet=all`；`refs/notes/*` 行按 notes 命名空间装饰（`notes/<name>`）且默认隐藏。回归：`command::log_test::log_clear_decorations_and_initial_decoration_set`。

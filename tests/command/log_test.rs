@@ -7329,3 +7329,66 @@ fn simplify_by_decoration() {
         "AC3"
     );
 }
+
+#[test]
+fn log_clear_decorations_and_initial_decoration_set() {
+    use super::{assert_cli_success, create_committed_repo_via_cli, run_libra_command};
+
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    let oid = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], p).stdout)
+        .trim()
+        .to_string();
+    // Libra has no command that writes a `refs/notes/*` reference row, so the
+    // fixture inserts one directly (the `reference` table accepts full names).
+    let db = p.join(".libra/libra.db");
+    let script = format!(
+        "import sqlite3\ncon=sqlite3.connect({db:?})\ncon.execute('INSERT INTO \"reference\" (\"name\",\"kind\",\"commit\",\"remote\") VALUES (?,?,?,?)',('refs/notes/custom','Branch',{oid:?},None))\ncon.commit()\n",
+        db = db.to_string_lossy(),
+        oid = oid
+    );
+    let status = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(&script)
+        .status()
+        .expect("python3 available");
+    assert!(status.success(), "seeding the notes reference");
+
+    let decoration = |args: &[&str]| {
+        let out = run_libra_command(args, p);
+        assert_cli_success(&out, "log runs");
+        let text = String::from_utf8_lossy(&out.stdout).to_string();
+        text.lines().next().unwrap_or_default().to_string()
+    };
+
+    // Default: `refs/notes/*` is outside Git's decoration namespaces.
+    let default_line = decoration(&["log", "-1", "--oneline", "--decorate=short"]);
+    assert!(
+        !default_line.contains("notes/custom"),
+        "default must hide notes: {default_line}"
+    );
+
+    // `--clear-decorations` widens the namespaces.
+    let cleared = decoration(&[
+        "log",
+        "-1",
+        "--oneline",
+        "--decorate=short",
+        "--clear-decorations",
+    ]);
+    assert!(
+        cleared.contains("notes/custom"),
+        "--clear-decorations must show notes: {cleared}"
+    );
+
+    // `log.initialDecorationSet=all` behaves the same way.
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "log.initialDecorationSet", "all"], p),
+        "set initialDecorationSet",
+    );
+    let all_line = decoration(&["log", "-1", "--oneline", "--decorate=short"]);
+    assert!(
+        all_line.contains("notes/custom"),
+        "initialDecorationSet=all must show notes: {all_line}"
+    );
+}

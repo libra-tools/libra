@@ -253,6 +253,10 @@ pub struct LogArgs {
     /// Do not print out ref names of any commits that are shown
     #[clap(long)]
     pub no_decorate: bool,
+    /// Clear every earlier `--decorate-refs`/`--decorate-refs-exclude` and stop
+    /// applying the default decoration namespace filter
+    #[clap(long = "clear-decorations", overrides_with_all = ["decorate_refs", "decorate_refs_exclude"])]
+    pub clear_decorations: bool,
     /// Simplify history to the decorated commits (and repository roots)
     #[clap(long = "simplify-by-decoration")]
     pub simplify_by_decoration: bool,
@@ -650,7 +654,27 @@ fn parse_trailer_filters(specs: &[String]) -> Result<Vec<TrailerFilter>, CliErro
 /// `--decorate-refs-exclude` filters: an implicit `refs/` prefix, wildcard or
 /// component-boundary prefix matching, and excludes win over includes.
 /// `HEAD` is filtered like any other decoration, by its own literal name.
-fn decorate_name_allowed(name: &str, args: &LogArgs, config_excludes: &[String]) -> bool {
+fn decorate_name_allowed(
+    name: &str,
+    args: &LogArgs,
+    config_excludes: &[String],
+    initial_all: bool,
+) -> bool {
+    // Git's default decoration filter only covers HEAD, refs/heads/,
+    // refs/tags/, refs/remotes/ and refs/stash; other namespaces (notably
+    // refs/notes/) stay hidden unless `--clear-decorations` or
+    // `log.initialDecorationSet=all` widens the set.
+    if !args.clear_decorations
+        && args.decorate_refs.is_empty()
+        && !initial_all
+        && !name.starts_with("refs/heads/")
+        && !name.starts_with("refs/tags/")
+        && !name.starts_with("refs/remotes/")
+        && !name.starts_with("refs/stash")
+        && name != "HEAD"
+    {
+        return false;
+    }
     if !args.decorate_refs.is_empty()
         && !args
             .decorate_refs
@@ -682,6 +706,17 @@ fn decorate_name_allowed(name: &str, args: &LogArgs, config_excludes: &[String])
     true
 }
 
+/// `log.initialDecorationSet=all` widens the default decoration filter.
+///
+/// Git recognises only `all`; any other value is ignored silently.
+async fn initial_decoration_set_is_all() -> bool {
+    ConfigKv::get("log.initialDecorationSet")
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|entry| entry.value.trim() == "all")
+}
+
 /// Every `log.excludeDecoration` value, in configuration order.
 async fn resolve_exclude_decoration_config() -> Vec<String> {
     ConfigKv::get_var_all_case_insensitive("log.", "excludeDecoration")
@@ -691,11 +726,17 @@ async fn resolve_exclude_decoration_config() -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn decorate_ref_allowed(reference: &Reference, args: &LogArgs, config_excludes: &[String]) -> bool {
+fn decorate_ref_allowed(
+    reference: &Reference,
+    args: &LogArgs,
+    config_excludes: &[String],
+    initial_all: bool,
+) -> bool {
     decorate_name_allowed(
         &format!("{}{}", reference_namespace(&reference.kind), reference.name),
         args,
         config_excludes,
+        initial_all,
     )
 }
 
@@ -1195,6 +1236,7 @@ enum ReferenceKind {
     Tag,    // decorate color = yellow
     Remote, // red
     Local,  // green
+    Notes,  // not part of Git's default decoration namespaces
 }
 
 #[derive(PartialEq, Eq, PartialOrd, Ord, Clone)]
@@ -1208,6 +1250,7 @@ fn reference_namespace(kind: &ReferenceKind) -> &'static str {
         ReferenceKind::Tag => "refs/tags/",
         ReferenceKind::Remote => "refs/remotes/",
         ReferenceKind::Local => "refs/heads/",
+        ReferenceKind::Notes => "refs/notes/",
     }
 }
 
@@ -2413,8 +2456,14 @@ async fn execute_safe_with_diff_formats(
     };
 
     let config_excludes_simplify = resolve_exclude_decoration_config().await;
+    let initial_all_simplify = initial_decoration_set_is_all().await;
     if args.simplify_by_decoration {
-        let head_allowed = decorate_name_allowed("HEAD", &args, &config_excludes_simplify);
+        let head_allowed = decorate_name_allowed(
+            "HEAD",
+            &args,
+            &config_excludes_simplify,
+            initial_all_simplify,
+        );
         selected_commits.retain(|selected| {
             let commit = &selected.commit;
             if commit.parent_commit_ids.is_empty() {
@@ -2425,7 +2474,12 @@ async fn execute_safe_with_diff_formats(
             }
             ref_commits.get(&commit.id).is_some_and(|refs| {
                 refs.iter().any(|reference| {
-                    decorate_ref_allowed(reference, &args, &config_excludes_simplify)
+                    decorate_ref_allowed(
+                        reference,
+                        &args,
+                        &config_excludes_simplify,
+                        initial_all_simplify,
+                    )
                 })
             })
         });
@@ -2534,6 +2588,7 @@ async fn execute_safe_with_diff_formats(
     };
 
     let config_excludes = resolve_exclude_decoration_config().await;
+    let initial_all = initial_decoration_set_is_all().await;
     let mut first_commit = true;
     for selected in selected_commits {
         let SelectedLogCommit {
@@ -2546,9 +2601,14 @@ async fn execute_safe_with_diff_formats(
             // `HEAD` marks the commit HEAD points to, not the first rendered
             // one, and it passes the same filters as any other decoration.
             // The arrow needs both `HEAD` and the branch it points to.
-            let head_allowed = decorate_name_allowed("HEAD", &args, &config_excludes);
+            let head_allowed = decorate_name_allowed("HEAD", &args, &config_excludes, initial_all);
             let branch_allowed = branch_name.as_ref().is_some_and(|name| {
-                decorate_name_allowed(&format!("refs/heads/{name}"), &args, &config_excludes)
+                decorate_name_allowed(
+                    &format!("refs/heads/{name}"),
+                    &args,
+                    &config_excludes,
+                    initial_all,
+                )
             });
             let head_arrow = head_allowed && branch_allowed;
             if commit.id == current_head_commit && head_allowed {
@@ -2575,7 +2635,7 @@ async fn execute_safe_with_diff_formats(
                 &mut refs
                     .iter()
                     .filter_map(|r| {
-                        if !decorate_ref_allowed(r, &args, &config_excludes) {
+                        if !decorate_ref_allowed(r, &args, &config_excludes, initial_all) {
                             return None;
                         }
                         // The branch is represented by the `HEAD -> branch`
@@ -2619,6 +2679,17 @@ async fn execute_safe_with_diff_formats(
                                     r.name
                                 )
                                 .green()
+                                .to_string(),
+                                ReferenceKind::Notes => format!(
+                                    "{}{}",
+                                    if decorate_option == DecorateOptions::Full {
+                                        "refs/notes/"
+                                    } else {
+                                        "notes/"
+                                    },
+                                    r.name
+                                )
+                                .cyan()
                                 .to_string(),
                             })
                         }
@@ -3248,6 +3319,7 @@ fn collect_log_refs(
         refs.push(match reference.kind {
             ReferenceKind::Tag => format!("tag: {}", reference.name),
             ReferenceKind::Remote | ReferenceKind::Local => reference.name,
+            ReferenceKind::Notes => format!("notes/{}", reference.name),
         });
     }
 
@@ -4315,9 +4387,18 @@ async fn create_reference_commit_map() -> HashMap<ObjectHash, Vec<Reference>> {
                     name: format!("{}/{}", remote, branch.name),
                     kind: ReferenceKind::Remote,
                 },
-                None => Reference {
-                    name: branch.name,
-                    kind: ReferenceKind::Local,
+                None => match branch.name.strip_prefix("refs/notes/") {
+                    // A row stored under `refs/notes/*` is a notes reference,
+                    // not a local branch: it stays out of the default
+                    // decoration namespaces.
+                    Some(note) => Reference {
+                        name: note.to_string(),
+                        kind: ReferenceKind::Notes,
+                    },
+                    None => Reference {
+                        name: branch.name,
+                        kind: ReferenceKind::Local,
+                    },
                 },
             });
     }

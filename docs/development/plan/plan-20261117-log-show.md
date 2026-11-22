@@ -613,7 +613,7 @@ PY
 
 ### Task LS-06: 支持 `--clear-decorations` 与 `log.initialDecorationSet`（#954）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `complete`（2026-11-21：新增 `--clear-decorations`（`overrides_with_all` 清除此前 `--decorate-refs`/`--decorate-refs-exclude`）与 `log.initialDecorationSet=all`；`decorate_name_allowed` 增加默认命名空间过滤（仅 `HEAD`/`refs/heads/`/`refs/tags/`/`refs/remotes/`/`refs/stash`），`create_reference_commit_map` 把名为 `refs/notes/*` 的 `reference` 行分类为 `ReferenceKind::Notes` 并以 `notes/<name>` 显示。用例 `log_clear_decorations_and_initial_decoration_set` 覆盖三态（默认隐藏 notes、`--clear-decorations` 显示、`initialDecorationSet=all` 显示），夹具按卡内说明直接向 `reference` 表插入 `refs/notes/custom` 行；`log_test` **260/260**；fmt + 严格 Clippy exit 0；文档 EN/zh-CN/开发版同步；版本面 0.30.283 → 0.30.284。按用户 2026-11-20 指令在 `main` 直接提交推送。）
 
 **Description:** 在 `LogArgs` 新增 `--clear-decorations`（清除其前出现的 `--decorate-refs` / `--decorate-refs-exclude` 并放开默认装饰命名空间过滤），并支持 `log.initialDecorationSet=all`（等价于放开默认过滤）；其它取值按 Git 忽略且不报错。装饰收集须能覆盖默认命名空间之外的引用。Libra 自身命令目前不生成这类引用（`libra notes` 把 notes 存于 SQLite `notes` 表，`libra update-ref` 只支持 `refs/heads/*`，`libra clone` 不导入源仓库的 `refs/notes/*`——2026-11-18 以 libra 0.30.207 预探），但 `reference` 表可保存名为 `refs/notes/*` 的行且 `log` 已有读取路径 `collect_notes_reference_tips`，本卡以这一形态的引用为验收对象，并让装饰收集按完整引用名把名为 `refs/notes/*` 的行识别为 notes 命名空间引用（当前它们若以 `kind = 'Branch'` 存储，会被 `Branch::list_branches_best_effort` 当作本地分支装饰），从而在默认过滤下不显示、放开后显示。
 

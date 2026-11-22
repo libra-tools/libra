@@ -319,6 +319,10 @@ libra log --decorate=full
 
 只保留被（过滤后的）装饰引用的提交与仓库根提交，丢弃中间提交；`--decorate-refs`/`--decorate-refs-exclude` 会收窄参与简化的引用集合。
 
+### `--clear-decorations`
+
+清除此前全部 `--decorate-refs`/`--decorate-refs-exclude` 并放开默认装饰命名空间（因此 `refs/notes/*` 装饰会出现）。`log.initialDecorationSet=all` 作为默认值具有相同的放开效果；其它取值被忽略。默认隐藏 `refs/notes/*`，因为 Git 的默认装饰命名空间只有 `HEAD`、`refs/heads/`、`refs/tags/`、`refs/remotes/` 与 `refs/stash`。
+
 ### `--no-decorate`
 
 不打印 ref 名称。覆盖 `--decorate`。

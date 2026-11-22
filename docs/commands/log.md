@@ -421,6 +421,15 @@ Keep only the commits referenced by a (filtered) decoration plus the repository
 root(s), dropping the commits in between. `--decorate-refs`/`--decorate-refs-exclude`
 narrow which references count, so the simplification follows the filtered set.
 
+### `--clear-decorations`
+
+Drop every earlier `--decorate-refs`/`--decorate-refs-exclude` and stop applying the
+default decoration namespaces (so `refs/notes/*` decorations appear).
+`log.initialDecorationSet=all` has the same widening effect as a default; any other
+value is ignored, and `refs/notes/*` is hidden by default because Git's default
+decoration namespaces are only `HEAD`, `refs/heads/`, `refs/tags/`, `refs/remotes/`
+and `refs/stash`.
+
 ### `--no-decorate`
 
 Do not print ref names. Overrides `--decorate`.
