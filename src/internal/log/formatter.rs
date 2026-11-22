@@ -35,6 +35,10 @@ pub enum FormatType {
     Oneline,
     Custom(String),
     Preset(LogPreset),
+    /// `--format=` / `--format=tformat:` / `--pretty=`: no bytes per commit.
+    Silent,
+    /// `--format=format:`: only the separating newlines between commits.
+    Separator,
 }
 
 /// Extra context supplied by the log renderer (graph/decorations).
@@ -95,6 +99,7 @@ impl CommitFormatter {
             FormatType::Oneline => self.format_oneline(commit, ctx),
             FormatType::Custom(template) => self.format_custom(commit, ctx, template),
             FormatType::Preset(preset) => self.format_preset(commit, ctx, *preset),
+            FormatType::Silent | FormatType::Separator => String::new(),
         }
     }
 

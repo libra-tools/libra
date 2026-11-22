@@ -7839,3 +7839,46 @@ fn diff_reverse_flag_r() {
         "AC3"
     );
 }
+
+#[test]
+fn empty_format_or_pretty_omits_header() {
+    use super::{assert_cli_success, run_libra_command};
+
+    // Fixture F14: three commits, each touching one file.
+    let work = tempfile::tempdir().expect("work dir");
+    let repo = work.path().join("r");
+    std::fs::create_dir_all(&repo).expect("mkdir repo");
+    assert_cli_success(&run_libra_command(&["init"], &repo), "init");
+    run_libra_command(&["config", "set", "user.name", "t"], &repo);
+    run_libra_command(&["config", "set", "user.email", "t@t"], &repo);
+    for (index, name) in ["a.txt", "b.txt", "c.txt"].iter().enumerate() {
+        std::fs::write(repo.join(name), format!("line{index}\n")).expect("write file");
+        assert_cli_success(&run_libra_command(&["add", name], &repo), "add");
+        let message = format!("c{index}");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", &message, "--no-verify"], &repo),
+            "commit",
+        );
+    }
+
+    let run = |args: &[&str]| {
+        let result = run_libra_command(args, &repo);
+        assert_cli_success(&result, &format!("log {args:?}"));
+        result.stdout
+    };
+
+    // AC1/AC2/AC3: empty formats emit no bytes at all.
+    assert!(run(&["log", "--format="]).is_empty(), "AC1");
+    assert!(run(&["log", "--pretty="]).is_empty(), "AC2");
+    assert!(run(&["log", "--format=tformat:"]).is_empty(), "AC3");
+    // AC4: `format:` emits only the separators between the three commits.
+    assert_eq!(run(&["log", "--format=format:"]), b"\n\n".to_vec(), "AC4");
+    // AC5 (partial): `--stat` keeps its diffstat blocks but no commit header.
+    let stat = String::from_utf8_lossy(&run(&["log", "--format=", "--stat"])).to_string();
+    assert!(!stat.contains("commit "), "AC5 no commit header: {stat}");
+    assert!(!stat.contains("Author:"), "AC5 no author line: {stat}");
+    assert!(
+        stat.contains("1 file changed"),
+        "AC5 keeps diffstat: {stat}"
+    );
+}

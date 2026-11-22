@@ -2753,7 +2753,7 @@ async fn execute_safe_with_diff_formats(
             | FormatType::Preset(LogPreset::Fuller)
             | FormatType::Preset(LogPreset::Raw)
     );
-    let mut formatter = CommitFormatter::new(format_type)
+    let mut formatter = CommitFormatter::new(format_type.clone())
         .with_date_mode(log_config.date.clone().unwrap_or_default())
         .with_color_enabled(color_enabled);
     if args.only_trailers {
@@ -3017,7 +3017,7 @@ async fn execute_safe_with_diff_formats(
         }
         if let Some(graph) = &graph {
             for line in &graph.trailing {
-                if !message.ends_with('\n') {
+                if !message.is_empty() && !message.ends_with('\n') {
                     message.push('\n');
                 }
                 message.push_str(line);
@@ -3032,7 +3032,7 @@ async fn execute_safe_with_diff_formats(
             let dirstat =
                 compute_commit_dirstat(&commit, commit_path_filters.clone(), param).await?;
             if !dirstat.is_empty() {
-                if !message.ends_with('\n') {
+                if !message.is_empty() && !message.ends_with('\n') {
                     message.push('\n');
                 }
                 // Git separates the commit message from the dirstat block with
@@ -3060,7 +3060,7 @@ async fn execute_safe_with_diff_formats(
             }
             block.push_str(&patch_output);
             if !block.is_empty() {
-                if !message.ends_with('\n') {
+                if !message.is_empty() && !message.ends_with('\n') {
                     message.push('\n');
                 }
                 message.push_str(&block);
@@ -3069,7 +3069,7 @@ async fn execute_safe_with_diff_formats(
             let stats = compute_commit_stat(&commit, commit_path_filters.clone()).await?;
             let stat_output = format_stat_output(&stats);
             if !stat_output.is_empty() {
-                if !message.ends_with('\n') {
+                if !message.is_empty() && !message.ends_with('\n') {
                     message.push('\n');
                 }
                 message.push_str(&stat_output);
@@ -3078,7 +3078,7 @@ async fn execute_safe_with_diff_formats(
             let stats = compute_commit_stat(&commit, commit_path_filters).await?;
             let shortstat_output = format_shortstat_output(&stats);
             if !shortstat_output.is_empty() {
-                if !message.ends_with('\n') {
+                if !message.is_empty() && !message.ends_with('\n') {
                     message.push('\n');
                 }
                 message.push_str(&shortstat_output);
@@ -3094,11 +3094,16 @@ async fn execute_safe_with_diff_formats(
             // ADR-LG-05 item 1: the separator belongs *before* each commit
             // after the first, so no blank line is emitted after the last
             // commit. Only the blank-line formats get an extra newline.
-            if !first_commit && blank_line_between_commits {
+            let separator_between =
+                blank_line_between_commits || matches!(format_type, FormatType::Separator);
+            if !first_commit && separator_between && !matches!(format_type, FormatType::Silent) {
                 pager.write_str("\n")?;
             }
             pager.write_str(&message)?;
-            if !message.ends_with('\n') {
+            if !message.is_empty()
+                && !message.ends_with('\n')
+                && !matches!(format_type, FormatType::Separator)
+            {
                 pager.write_str("\n")?;
             }
         }
@@ -3555,7 +3560,12 @@ fn commit_diff_matches_regex(commit: &Commit, regex: &regex::Regex) -> Result<bo
 pub(crate) fn parse_pretty_format(pretty: String) -> FormatType {
     match pretty.as_str() {
         "oneline" => FormatType::Oneline,
-        "medium" | "" => FormatType::Full,
+        "medium" => FormatType::Full,
+        // Git prints nothing for an empty format (and `tformat:`); `format:`
+        // only emits the separators between commits.
+        "" => FormatType::Silent,
+        "tformat:" => FormatType::Silent,
+        "format:" => FormatType::Separator,
         "short" => FormatType::Preset(LogPreset::Short),
         "full" => FormatType::Preset(LogPreset::Full),
         "fuller" => FormatType::Preset(LogPreset::Fuller),
@@ -3762,7 +3772,7 @@ fn append_changed_paths(
             message.push_str(&format_changes(changes, include_status, true));
         }
     } else if !changes.is_empty() {
-        if !message.ends_with('\n') {
+        if !message.is_empty() && !message.ends_with('\n') {
             message.push('\n');
         }
         message.push('\n');
@@ -5301,9 +5311,18 @@ mod tests {
             parse_pretty_format("medium".into()),
             FormatType::Full
         ));
+        // Git prints nothing for an empty format; `format:` only separates.
         assert!(matches!(
             parse_pretty_format(String::new()),
-            FormatType::Full
+            FormatType::Silent
+        ));
+        assert!(matches!(
+            parse_pretty_format("tformat:".into()),
+            FormatType::Silent
+        ));
+        assert!(matches!(
+            parse_pretty_format("format:".into()),
+            FormatType::Separator
         ));
         match parse_pretty_format("format:%h %s".into()) {
             FormatType::Custom(t) => assert_eq!(t, "%h %s"),

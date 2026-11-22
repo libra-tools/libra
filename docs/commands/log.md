@@ -66,6 +66,19 @@ Set the length of abbreviated commit hashes.
 libra log --abbrev 8
 ```
 
+### Empty `--format=` / `--pretty=`
+
+An empty format prints nothing per commit, matching Git: `--format=`,
+`--pretty=` and `--format=tformat:` emit no bytes, while `--format=format:` emits
+only the newline separators between commits. Diff output (`--stat`, `-p`) still
+prints, without the commit header.
+
+```bash
+libra log --format=
+libra log --format=format:
+libra log --format= --stat
+```
+
 ### `-R`
 
 `-R` (long spelling `--reverse-diff`) swaps the two inputs of every commit diff:

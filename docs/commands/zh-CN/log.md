@@ -55,6 +55,16 @@ libra log --abbrev-commit
 libra log --abbrev 8
 ```
 
+### 空 `--format=` / `--pretty=`
+
+空格式按 Git 语义逐提交不输出任何字节：`--format=`、`--pretty=` 与 `--format=tformat:` 均输出 0 字节，`--format=format:` 只输出提交之间的换行分隔符；`--stat`/`-p` 仍输出 diff，但不含提交头。
+
+```bash
+libra log --format=
+libra log --format=format:
+libra log --format= --stat
+```
+
 ### `-R`
 
 `-R`（长写法 `--reverse-diff`）交换每个提交 diff 的新旧两侧：标签变为 `diff --git b/<path> a/<path>`，index 哈希互换，hunk 显示反向编辑，与 `git log -R` 一致；它**不**改变提交顺序（需要反转顺序请用 `--reverse`）。
