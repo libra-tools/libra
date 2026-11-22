@@ -2545,11 +2545,11 @@ fn resolve_line_ranges(specs: &[String]) -> CliResult<Vec<LineRange>> {
                 .iter()
                 .position(|line| line_names_function(line, &func))
             else {
+                // Git: `-L parameter '<name>' starting at line 1: no match`.
                 return Err(CliError::command_usage(format!(
-                    "cannot find function '{func}' in '{}'",
-                    range.file.display()
+                    "-L parameter '{func}' starting at line 1: no match"
                 ))
-                .with_stable_code(StableErrorCode::CliInvalidArguments));
+                .with_stable_code(StableErrorCode::CliInvalidTarget));
             };
             let next = lines
                 .iter()

@@ -130,3 +130,5 @@ flowchart TD
 - 2026-11-21（LS-36 / #963）：开放 `--json` 与 `--output` 组合——新增 `utils::output::json_command_envelope_bytes`（`emit_json_data` 复用之），JSON 信封经 `LogSink` 写入目标文件、stdout 为空，`.libra/` 与失败诊断沿用 LS-15/LS-37；按协议删除 `output_to_file` 中 LS-15 的「`--json --output` 拒绝」断言。回归：`command::log_test::output_json_to_file`（AC1–AC2）。
 
 - 2026-11-21（LS-16 / #962）：`--follow` 改为无值布尔标志（`num_args=0..=1` + `default_missing_value=""` + `require_equals`），由唯一位置 pathspec 决定跟踪文件；0/多路径以 `LBR-CLI-002` 拒绝并输出 Git 同文 `--follow requires exactly one pathspec`；旧写法 `--follow=<FILE>` 保留（等价 `--follow -- <FILE>`）并登记为有意差异。回归：`command::log_test::follow_boolean_flag_single_pathspec`（AC1–AC7）。
+
+- 2026-11-21（LS-17 / #961）：`-L` 由「仅路径过滤」改为真正的行级历史——按 hunk 变更行判定范围、`-L` 隐含 `-p`、`filter_patch_to_ranges` 收窄 hunk（Git 头部/尾随上下文/创建 hunk 0 基）、`:<funcname>:` 由定义解析（`resolve_line_ranges`）、`patch_hunk_spans` + `remap_ranges_to_parent` 把范围回推到父提交编号；未知函数名 → `LBR-CLI-003` + Git 同文诊断。回归：`line_history_emits_range_hunks`、`line_history_function_name_ranges`、`line_history_maps_range_through_parents`。

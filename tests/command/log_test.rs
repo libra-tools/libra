@@ -8445,7 +8445,12 @@ fn line_history_function_name_ranges() {
     let missing = run_libra_command(&["log", "-L", ":nope:f.rs"], &repo);
     assert!(!missing.status.success(), "unknown function must fail");
     let stderr = String::from_utf8_lossy(&missing.stderr);
-    assert!(stderr.contains("cannot find function"), "stderr: {stderr}");
+    // Git: `-L parameter 'nope' starting at line 1: no match` (LBR-CLI-003).
+    assert!(stderr.contains("LBR-CLI-003"), "stderr code: {stderr}");
+    assert!(
+        stderr.contains("-L parameter 'nope' starting at line 1: no match"),
+        "stderr wording: {stderr}"
+    );
 }
 
 #[test]

@@ -717,11 +717,21 @@ libra log --children
 
 ### `-L <RANGE:FILE>`
 
-Accept Git-style line-range syntax. Full blame-level precision is not yet
-implemented; the flag is parsed and applied as a path filter.
+`-L <start>,<end>:<file>` traces the history of a line range: only commits that
+change a line inside the range are shown, and each is printed with just the hunks
+that overlap it (Git-narrowed headers, including the trailing definition context
+and the `-0,0` numbering of creation hunks). Walk direction matters — the range is
+mapped back to each parent's numbering, so commits before an insertion above the
+range still match.
+
+`-L :<funcname>:<file>` derives the range from the file's definitions: it starts at
+the definition line and stops before the next definition (Rust `fn`, `def`,
+`function`, and column-0 C-like signatures). An unknown name fails with
+`LBR-CLI-003` and Git's wording `-L parameter '<name>' starting at line 1: no match`.
 
 ```bash
-libra log -L1,10:src/main.rs
+libra log -L 1,10:src/main.rs
+libra log -L :parse_line_range:src/command/log.rs
 ```
 
 ### `[PATHS...]`
