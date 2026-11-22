@@ -4511,6 +4511,10 @@ async fn vcs_stage_replaces_a_case_only_rename() {
 }
 
 /// A case-only path spelling never changes a differently spelled entry.
+///
+/// The scenario needs a case-insensitive filesystem (macOS/APFS defaults); on a
+/// case-sensitive one `TRACKED.TXT` simply is a different, untracked path.
+#[cfg(target_os = "macos")]
 #[tokio::test]
 #[serial(cwd, env, hash_kind)]
 async fn vcs_stage_refuses_a_case_variant_of_an_indexed_entry() {
