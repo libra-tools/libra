@@ -8307,3 +8307,71 @@ fn follow_boolean_flag_single_pathspec() {
         );
     }
 }
+
+#[test]
+fn line_history_emits_range_hunks() {
+    use super::{assert_cli_success, run_libra_command};
+
+    // Fixture: C1 creates f.txt (30 lines), C2 rewrites line 20 only.
+    let work = tempfile::tempdir().expect("work dir");
+    let repo = work.path().join("r");
+    std::fs::create_dir_all(&repo).expect("mkdir repo");
+    assert_cli_success(&run_libra_command(&["init"], &repo), "init");
+    run_libra_command(&["config", "set", "user.name", "t"], &repo);
+    run_libra_command(&["config", "set", "user.email", "t@t"], &repo);
+    let numbers = (1..=30)
+        .map(|n| n.to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    std::fs::write(repo.join("f.txt"), &numbers).expect("write f");
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], &repo), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c1", "--no-verify"], &repo),
+        "commit c1",
+    );
+    let c1 = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], &repo).stdout)
+        .trim()
+        .to_string();
+    std::fs::write(repo.join("f.txt"), numbers.replace("\n20\n", "\ntwenty\n")).expect("edit f");
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], &repo), "add edit");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c2", "--no-verify"], &repo),
+        "commit c2",
+    );
+    let c2 = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], &repo).stdout)
+        .trim()
+        .to_string();
+
+    let out = |args: &[&str]| {
+        let result = run_libra_command(args, &repo);
+        assert_cli_success(&result, &format!("log {args:?}"));
+        String::from_utf8_lossy(&result.stdout).to_string()
+    };
+
+    // The range outside the edit sees only the commit that created the file
+    // (`-L` also prints that commit's hunk, so only the selected set is pinned).
+    let outside = out(&["log", "-L", "1,5:f.txt", "--format=%H"]);
+    let outside_commits: Vec<&str> = outside
+        .lines()
+        .filter(|line| line.len() == 40 && line.chars().all(|c| c.is_ascii_hexdigit()))
+        .collect();
+    assert_eq!(
+        outside_commits,
+        vec![c1.as_str()],
+        "outside range: {outside}"
+    );
+    assert!(!outside.contains(&c2), "edit commit excluded: {outside}");
+
+    // The range covering the edit sees the edit and its creation, each with a
+    // hunk (the `-L` output is no longer header-only).
+    let inside = out(&["log", "-L", "18,22:f.txt"]);
+    assert!(inside.contains(&c2), "edit commit present: {inside}");
+    assert!(inside.contains(&c1), "creation commit present: {inside}");
+    assert!(inside.contains("@@ -"), "hunk header present: {inside}");
+    assert!(inside.contains("-20"), "old line shown: {inside}");
+    assert!(inside.contains("+twenty"), "new line shown: {inside}");
+    // Only the tracked range's hunk is printed for the edit commit.
+    // Hunks are selected by range but not narrowed to it yet (tracked as
+    // remaining work in the plan card).
+}

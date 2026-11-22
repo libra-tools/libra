@@ -1307,7 +1307,7 @@ PY
 
 ### Task LS-17: 实现 `log -L` 行级历史输出（#961；拆出 LS-32）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `in-progress` / `partially-accepted`（2026-11-21 第一段：修复 `-L` **无任何输出**的根因——`apply_follow_and_line_filters` 在未带 `--follow` 时 `path_to_check` 恒为 `None`，`-L` 提交全被丢弃；改为回退到 `ranges[0].file`。`commit_affects_line_range` 由「内容有变即纳入」改为**按 hunk 新侧范围与请求范围求交**（`patch_hunk_ranges`）；`-L` 隐含 `-p`（`resolved_diff_formats` 中强制 `patch=true`）；新增 `filter_patch_to_ranges` 只保留涉及请求范围的 hunk。实测：`-L 1,5:f.txt` 只选创建提交、`-L 18,22:f.txt` 选出改动提交+创建提交并打印 hunk（`-20`/`+twenty`）。回归：`command::log_test::line_history_emits_range_hunks`。**剩余（未验收 AC）**：① hunk 尚未按范围**收窄**（创建提交的 hunk 仍打印整文件 1–30 行，Git 只打印范围内的行）；② `:<funcname>:<file>` 语法仍退化为整文件（`parse_line_range`）；③ 行号范围尚未随历史映射到父提交；④ 与 Git 的 hunk 头部（`@@ -18,5 +18,5 @@`）逐字一致。本卡保持 `in-progress`，上述四项需在后续窗口完成后再按 AC 验收。`log_test` 全绿；严格 Clippy exit 0。）
 
 **Description:** 修复 `log -L <start>,<end>:<file>` / `-L :<funcname>:<file>` 仅过滤提交却不输出行级 diff hunk 的缺陷：输出演进提交与被追踪范围的 hunk，函数名语法识别函数边界（移除 `src/command/log.rs:1907` 退化为整文件的实现），并随历史把行号范围映射到父提交。拆出 `LS-32`（`-L` 参数校验）。
 

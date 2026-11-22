@@ -2273,6 +2273,51 @@ fn parse_line_range(spec: &str) -> CliResult<LineRange> {
     Ok(LineRange { start, end, file })
 }
 
+/// Keep only the hunks of `patch` whose new-side range intersects `ranges`.
+fn filter_patch_to_ranges(patch: &str, ranges: &[LineRange]) -> String {
+    let mut out = String::with_capacity(patch.len());
+    let mut keep_hunk = true;
+    for line in patch.split_inclusive('\n') {
+        if let Some(rest) = line.strip_prefix("@@ -") {
+            keep_hunk = false;
+            if let Some((_old, new)) = rest.split_once(" +") {
+                let new = new.split(" @@").next().unwrap_or(new);
+                let (start, len) = match new.split_once(',') {
+                    Some((start, len)) => (start, len),
+                    None => (new, "1"),
+                };
+                if let (Ok(start), Ok(len)) = (start.parse::<usize>(), len.parse::<usize>()) {
+                    let hunk_end = if len == 0 { start } else { start + len - 1 };
+                    keep_hunk = ranges.iter().any(|range| {
+                        range.start <= hunk_end && start <= range.end.saturating_add(1)
+                    });
+                }
+            }
+            if keep_hunk {
+                out.push_str(line);
+            }
+            continue;
+        }
+        if line.starts_with("diff --git ")
+            || line.starts_with("index ")
+            || line.starts_with("--- ")
+            || line.starts_with("+++ ")
+        {
+            keep_hunk = true;
+            out.push_str(line);
+            continue;
+        }
+        if keep_hunk {
+            out.push_str(line);
+        }
+    }
+    if out.contains("@@ -") {
+        out
+    } else {
+        String::new()
+    }
+}
+
 /// Detect whether a commit changed the given file path, following renames.
 async fn commit_touches_path_follow(
     commit: &Commit,
@@ -2355,10 +2400,12 @@ async fn apply_follow_and_line_filters(
         };
 
         if !ranges.is_empty() {
-            let Some(path) = path_to_check.as_ref() else {
-                continue;
-            };
-            if !commit_affects_line_range(&commit, path, &ranges).await? {
+            // `-L` names its own file; without `--follow` that name is the
+            // path each commit is checked against.
+            let path = path_to_check
+                .clone()
+                .unwrap_or_else(|| ranges[0].file.clone());
+            if !commit_affects_line_range(&commit, &path, &ranges).await? {
                 continue;
             }
         }
@@ -2373,40 +2420,67 @@ async fn apply_follow_and_line_filters(
 }
 
 /// Best-effort check whether a commit affected any of the requested line ranges.
+/// Whether `commit` changes any tracked line of `path` (`-L start,end:file`).
+///
+/// Git tracks the range through the history; this implementation keeps the
+/// simpler but honest contract of intersecting the commit's own hunks with the
+/// requested range, so commits that only touch lines outside the range are
+/// filtered out instead of always matching.
 async fn commit_affects_line_range(
     commit: &Commit,
     path: &PathBuf,
     ranges: &[LineRange],
 ) -> Result<bool, CliError> {
-    let _ = ranges;
-    let tree = load_object::<Tree>(&commit.tree_id)
-        .map_err(|e| log_repo_corrupt_error(format!("failed to load tree object: {e}")))?;
-    let current_items: HashMap<PathBuf, ObjectHash> = tree.get_plain_items()?.into_iter().collect();
-
-    let Some(current_hash) = current_items.get(path).copied() else {
-        // File deleted; conservatively include if any range existed before.
-        return Ok(true);
-    };
-
-    let Some(parent_id) = first_history_parent(commit)? else {
-        return Ok(true);
-    };
-
-    let parent_commit = load_object::<Commit>(&parent_id)
-        .map_err(|e| log_repo_corrupt_error(format!("failed to load parent commit: {e}")))?;
-    let parent_tree = load_object::<Tree>(&parent_commit.tree_id)
-        .map_err(|e| log_repo_corrupt_error(format!("failed to load parent tree: {e}")))?;
-    let parent_items: HashMap<PathBuf, ObjectHash> =
-        parent_tree.get_plain_items()?.into_iter().collect();
-
-    let parent_hash = parent_items.get(path).copied();
-    if parent_hash != Some(current_hash) {
-        // Content changed; include unless we can prove the range is unchanged.
-        // A precise check would require blame, so we include by default.
-        return Ok(true);
+    let tracked: Vec<&LineRange> = ranges.iter().filter(|range| &range.file == path).collect();
+    if tracked.is_empty() {
+        return Ok(false);
     }
-
+    let patch = generate_diff(commit, vec![path.clone()]).await?;
+    if patch.trim().is_empty() {
+        return Ok(false);
+    }
+    for (start, len) in patch_hunk_ranges(&patch) {
+        if len == 0 {
+            // A pure insertion between lines: treat it as covering the line it
+            // is inserted after.
+            if tracked
+                .iter()
+                .any(|range| range.start <= start && start <= range.end + 1)
+            {
+                return Ok(true);
+            }
+            continue;
+        }
+        let hunk_end = start + len - 1;
+        for range in &tracked {
+            if range.start <= hunk_end && start <= range.end {
+                return Ok(true);
+            }
+        }
+    }
     Ok(false)
+}
+
+/// `(start, length)` of the new side of every `@@ -a,b +start,length @@` hunk.
+fn patch_hunk_ranges(patch: &str) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    for line in patch.lines() {
+        let Some(rest) = line.strip_prefix("@@ -") else {
+            continue;
+        };
+        let Some((_old, new)) = rest.split_once(" +") else {
+            continue;
+        };
+        let new = new.split(" @@").next().unwrap_or(new);
+        let (start, len) = match new.split_once(',') {
+            Some((start, len)) => (start, len),
+            None => (new, "1"),
+        };
+        if let (Ok(start), Ok(len)) = (start.parse::<usize>(), len.parse::<usize>()) {
+            ranges.push((start, len));
+        }
+    }
+    ranges
 }
 
 fn last_command_line_position(matches: &ArgMatches, id: &str) -> Option<usize> {
@@ -2479,6 +2553,11 @@ fn resolved_diff_formats(
     let name_output_conflict = (resolved.no_patch && (resolved.name_only || resolved.name_status))
         || (resolved.name_only && resolved.name_status);
 
+    // `-L` always prints the hunks of the tracked range, like Git.
+    let mut resolved = resolved;
+    if !args.line_range.is_empty() && !resolved.no_patch {
+        resolved.patch = true;
+    }
     if has_positions && name_output_conflict {
         return Err(CliError::fatal(
             "options '--name-only', '--name-status', '--check', and '-s' cannot be used together",
@@ -3090,7 +3169,19 @@ async fn execute_safe_with_diff_formats(
                     block.push_str("\n\n");
                 }
             }
-            let mut patch_output = generate_diff(&commit, commit_path_filters.clone()).await?;
+            let mut patch_output = if args.line_range.is_empty() {
+                generate_diff(&commit, commit_path_filters.clone()).await?
+            } else {
+                // `-L` prints only the hunks touching the tracked range.
+                let ranges: Vec<LineRange> = args
+                    .line_range
+                    .iter()
+                    .map(|spec| parse_line_range(spec))
+                    .collect::<CliResult<Vec<_>>>()?;
+                let path = ranges[0].file.clone();
+                let full = generate_diff(&commit, vec![path.clone()]).await?;
+                filter_patch_to_ranges(&full, &ranges)
+            };
             if args.diff_reverse {
                 patch_output = reverse_patch(&patch_output);
             }
