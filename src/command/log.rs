@@ -2237,6 +2237,8 @@ struct LineRange {
     file: PathBuf,
     /// `:<funcname>:` form: resolved from the file's definitions.
     func: Option<String>,
+    /// Enclosing definition line, appended to `@@` like Git's hunk context.
+    context: Option<String>,
 }
 
 fn parse_line_range(spec: &str) -> CliResult<LineRange> {
@@ -2278,6 +2280,7 @@ fn parse_line_range(spec: &str) -> CliResult<LineRange> {
         end,
         file,
         func,
+        context: None,
     })
 }
 
@@ -2319,7 +2322,18 @@ fn filter_patch_to_ranges(patch: &str, ranges: &[LineRange]) -> String {
     let flush = |hunk: &mut Option<(usize, usize, Vec<String>)>, kept: &mut Vec<String>| {
         if let Some((start, _end, lines)) = hunk.take() {
             let numbers = numbered(start, &lines);
-            let relevant = |index: usize| -> bool { in_range(numbers[index].0, numbers[index].1) };
+            // A pure creation has no old side, so only new lines count.
+            let creation = !lines
+                .iter()
+                .any(|line| line.starts_with('-') && !line.starts_with("---"));
+            let relevant = |index: usize| -> bool {
+                let (old_no, new_no) = numbers[index];
+                if creation {
+                    in_range(new_no, new_no)
+                } else {
+                    in_range(old_no, new_no)
+                }
+            };
             let mut begin = 0;
             while begin < lines.len() && !relevant(begin) {
                 begin += 1;
@@ -2343,9 +2357,26 @@ fn filter_patch_to_ranges(patch: &str, ranges: &[LineRange]) -> String {
                         .filter(|line| !line.starts_with('-'))
                         .count();
                     let (old_start, new_start) = numbers[begin];
-                    kept.push(format!(
-                        "@@ -{old_start},{old_len} +{new_start},{new_len} @@\n"
-                    ));
+                    // Git numbers a creation hunk's old side from 0.
+                    let old_start = if old_len == 0 { 0 } else { old_start };
+                    // Git only annotates hunks that have an old side.
+                    let context = if old_len == 0 {
+                        String::new()
+                    } else {
+                        ranges
+                            .iter()
+                            .find_map(|range| range.context.clone())
+                            .unwrap_or_default()
+                    };
+                    if context.is_empty() {
+                        kept.push(format!(
+                            "@@ -{old_start},{old_len} +{new_start},{new_len} @@\n"
+                        ));
+                    } else {
+                        kept.push(format!(
+                            "@@ -{old_start},{old_len} +{new_start},{new_len} @@ {context}\n"
+                        ));
+                    }
                     kept.extend(lines[begin..finish].iter().cloned());
                 }
             }
@@ -2525,6 +2556,15 @@ fn resolve_line_ranges(specs: &[String]) -> CliResult<Vec<LineRange>> {
                 .unwrap_or(lines.len());
             range.start = start_index + 1;
             range.end = next;
+            // Git appends the definition enclosing the hunk start, which is the
+            // previous one when the hunk starts on this function's first line.
+            range.context = lines
+                .iter()
+                .take(start_index)
+                .rev()
+                .find(|line| is_function_definition(line))
+                .or(Some(&lines[start_index]))
+                .map(|line| line.trim_end().to_string());
         }
         ranges.push(range);
     }

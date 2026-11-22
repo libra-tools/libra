@@ -8431,6 +8431,16 @@ fn line_history_function_name_ranges() {
         !alpha.contains(&c2[..7]),
         "alpha must exclude the edit: {alpha}"
     );
+    // The hunk header carries Git's trailing definition context and the
+    // creation hunk is narrowed to the resolved function range.
+    assert!(
+        beta.contains("@@ -5,3 +5,3 @@ fn alpha() {"),
+        "beta hunk context: {beta}"
+    );
+    assert!(
+        alpha.contains("@@ -0,0 +1,4 @@"),
+        "alpha creation hunk narrowed: {alpha}"
+    );
     // An unknown function name is a usage error.
     let missing = run_libra_command(&["log", "-L", ":nope:f.rs"], &repo);
     assert!(!missing.status.success(), "unknown function must fail");

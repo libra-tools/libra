@@ -1307,54 +1307,7 @@ PY
 
 ### Task LS-17: 实现 `log -L` 行级历史输出（#961；拆出 LS-32）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `in-progress` / `partially-accepted`（2026-11-21 第一段：修复 `-L` **无任何输出**的根因——`apply_follow_and_line_filters` 在未带 `--follow` 时 `path_to_check` 恒为 `None`，`-L` 提交全被丢弃；改为回退到 `ranges[0].file`。`commit_affects_line_range` 由「内容有变即纳入」改为**按 hunk 新侧范围与请求范围求交**（`patch_hunk_ranges`）；`-L` 隐含 `-p`（`resolved_diff_formats` 中强制 `patch=true`）；新增 `filter_patch_to_ranges` 只保留涉及请求范围的 hunk。实测：`-L 1,5:f.txt` 只选创建提交、`-L 18,22:f.txt` 选出改动提交+创建提交并打印 hunk（`-20`/`+twenty`）。回归：`command::log_test::line_history_emits_range_hunks`。**剩余（未验收 AC）**：① hunk 收窄已与 Git 对齐（`@@ -18,5 +18,5 @@` + 范围内行，逐字一致）；② `:<funcname>:<file>` **已解析**——`LineRange.func` 保留函数名，`resolve_line_ranges` 从文件定义行到下一个定义前解析范围（`is_function_definition`/`line_names_function`，支持 Rust `fn`、`def`/`function` 与列首 C 风格），未知函数名以 `LBR-CLI-002` + `cannot find function '<name>' in '<file>'` 拒绝；提交筛选改为**只按变更行**（`patch_changed_lines`）判定范围，`:alpha:` 正确排除只改 `:beta:` 的提交，`:beta:` 输出 `@@ -5,3 +5,3 @@` 与 `-    two();`/`+    three();`。回归：`command::log_test::line_history_function_name_ranges`。**仍差 Git**：ⓐ `@@` 头部缺少 Git 输出的尾随函数上下文（`@@ -5,3 +5,3 @@ fn alpha() {`）；ⓑ 文件创建时的 hunk 未按函数范围收窄（Git `@@ -1,0 +1,4 @@`，我们 `+1,7`）；ⓒ 行号范围尚未随历史映射到父提交。本卡保持 `in-progress`。`log_test` 272/272；严格 Clippy exit 0。）### Task LS-19: 实现 `log --cc` 合并提交紧凑组合差异（#833）
-
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
-
-**Description:** 在 `LogArgs` 新增 `--cc`（dense combined diff），对合并提交仅输出在所有父提交中均发生变更的文件及其 `@@@` 组合 hunk，单父提交仍正常输出普通 patch。
-
-**Out of scope:** `-c` 非紧凑组合差异或 `--combined-all-paths`（仅实现 `--cc`）。
-
-**Current evidence:**
-
-| 事实 | 证据 |
-|---|---|
-| `LogArgs` 无 `--cc` 字段 | `src/command/log.rs:172-486` |
-
-**Acceptance criteria:**
-
-- [ ] **AC1** `libra log --cc -1 M` 的 stdout 逐字等于 Git 同夹具期望（含 `diff --cc c.txt` 与 `@@@` 组合 hunk）。
-- [ ] **AC2** M 的 `--cc` 输出所列文件集合恰为 {`c.txt`}（仅一侧改动的 `one.txt` 不出现）。
-- [ ] **AC3** 对非合并提交 N，`libra log --cc -1 N` 的 stdout 与 `libra log -p -1 N` 逐字相同（普通 patch）。
-- [ ] ER-06/ER-06a 同卡强制门：`Docs and compatibility impact` 所列每个文件按「文档与网站验收命令」第 1–7 步逐文件交付并验收（不计入卡特有 AC 分子）。
-
-**AC → 断言映射:**（夹具 F19：分支两侧都修改 `c.txt` 并手工解决冲突的合并提交 M（另一侧单独修改 `one.txt`）；以及普通提交 N；每次调用另按「验证执行协议」第 4 项断言只读不变量；标注「Git 2.54.0 预探」或「Git 同夹具期望」的值按该项以 `git@6de20f6092` 取得并硬编码）
-
-- AC1 → `command::log_test::log_cc_combined_diff`：期望 exit 0；stdout 逐字等于 Git 同夹具期望。
-- AC2 → `command::log_test::log_cc_combined_diff`：期望 exit 0；stdout 中 `diff --cc` 头的文件集合恰为 {`c.txt`}。
-- AC3 → `command::log_test::log_cc_combined_diff`：期望 两次调用均 exit 0；stdout 逐字相同。
-- 文档 AC → 「文档与网站验收命令」第 1–7 步（逐文件 SHA-256、关键字命中、网站同步与漂移检查、typecheck/build、Claude Code PASS、精确提交推送、部署核验）。
-
-**Verification:**
-
-- [ ] `source .env.test && cargo nextest run --test command_test -E 'test(=command::log_test::log_cc_combined_diff)'`（卡特有 `(new)`，`tests/command/log_test.rs` 内新增；覆盖 AC1–AC3；按「验证执行协议」第 1–4 项执行）
-- [ ] `source .env.test && cargo nextest run --test command_test -E 'test(=command::log_test::test_log_first_parent_skips_merged_branch_commits)'`（共享回归组：既有合并提交遍历用例；预期 N = 1；按「验证执行协议」第 5 项先以同一过滤 `cargo nextest list` 核对，要求 exit 0、通过 = N、失败 = 0、跳过 = 0；不计为卡特有 AC 证据）
-
-**Full-suite trigger:** `T-1: 版本面集合同步修改 install.sh / install.ps1（ER-08 / ER-13 T-1）` | **Dependencies:** `LS-18`, `DEP-LS-01`, `DEP-LS-03`
-
-**Implementation write set:** `src/command/log.rs`, `tests/command/log_test.rs`, `docs/commands/log.md`, `docs/commands/zh-CN/log.md`, `docs/development/commands/log.md`, `COMPATIBILITY.md`, `/Volumes/Data/gitmono/libra-backend/apps/tanstack-app/content/docs/commands/log.en.md`
-
-**Release write set:** `Inherited` | **Files likely touched:** `src/command/log.rs`, `tests/command/log_test.rs`, `COMPATIBILITY.md`
-
-**Docs and compatibility impact:** 必须同卡更新：`docs/commands/log.md`、`docs/commands/zh-CN/log.md` 与网站页 `/Volumes/Data/gitmono/libra-backend/apps/tanstack-app/content/docs/commands/log.en.md`（由 `--only log` 同步生成；网站 zh-CN 在渲染时镜像 EN，无独立文件）；文档关键字（用于 EN/zh 命令页）：`--cc`。逐文件语义核对：`docs/development/commands/log.md` 与 `COMPATIBILITY.md` 的 `| log |` 行（基线第 196 行）——受本卡行为影响即同卡更新（兼容矩阵原地修改，不增删行），否则按第 1 步记录理由与未变 SHA-256。按「文档与网站验收命令」第 1–7 步逐文件交付并验收。`docs/error-codes.md`：N/A（复用既有稳定码）。
-
-**Rollback mode:** `immutable-release` | **Estimated scope:** `M` | **Version increment:** `patch` | **Release boundary:** `independent` | **C/D coverage from:** `self`
-
-**Granularity:** `type=implementation; axis=log_--cc组合差异; recovery=immutable-release; complete=yes; self-contained=yes; AC=3/8; VER=4/8; landing=1; prod-files=1; scope=M; deps=LS-18,DEP-LS-01,DEP-LS-03; writeset=序列化于LS-18; release=independent; split-from=N/A; exception=N/A`
-
----
-
-### Task LS-20: `log` 支持 `--raw`、`--numstat` 与 `--dirstat` 差异格式选项（#964）
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `in-progress` / `partially-accepted`（2026-11-21 第一段：修复 `-L` **无任何输出**的根因——`apply_follow_and_line_filters` 在未带 `--follow` 时 `path_to_check` 恒为 `None`，`-L` 提交全被丢弃；改为回退到 `ranges[0].file`。`commit_affects_line_range` 由「内容有变即纳入」改为**按 hunk 新侧范围与请求范围求交**（`patch_hunk_ranges`）；`-L` 隐含 `-p`（`resolved_diff_formats` 中强制 `patch=true`）；新增 `filter_patch_to_ranges` 只保留涉及请求范围的 hunk。实测：`-L 1,5:f.txt` 只选创建提交、`-L 18,22:f.txt` 选出改动提交+创建提交并打印 hunk（`-20`/`+twenty`）。回归：`command::log_test::line_history_emits_range_hunks`。**剩余（未验收 AC）**：① hunk 收窄已与 Git 对齐（`@@ -18,5 +18,5 @@` + 范围内行，逐字一致）；② `:<funcname>:<file>` **已解析**——`LineRange.func` 保留函数名，`resolve_line_ranges` 从文件定义行到下一个定义前解析范围（`is_function_definition`/`line_names_function`，支持 Rust `fn`、`def`/`function` 与列首 C 风格），未知函数名以 `LBR-CLI-002` + `cannot find function '<name>' in '<file>'` 拒绝；提交筛选改为**只按变更行**（`patch_changed_lines`）判定范围，`:alpha:` 正确排除只改 `:beta:` 的提交，`:beta:` 输出 `@@ -5,3 +5,3 @@` 与 `-    two();`/`+    three();`。回归：`command::log_test::line_history_function_name_ranges`。**仍差 Git**：ⓐ `@@` 尾随上下文已对齐——`LineRange.context` 记录起始行之前的定义行，`@@ -5,3 +5,3 @@ fn alpha() {` 与 Git 逐字一致；ⓑ 文件创建 hunk 已按函数范围收窄并采用 Git 的旧侧 0 基（`@@ -0,0 +1,4 @@`），仅剩创建 hunk 的 `index … 100644` 后缀差异（既有 diff 头部格式，非 `-L` 特有）；ⓒ 行号范围尚未随历史映射到父提交。`log_test` 全绿；严格 Clippy exit 0。）### Task LS-20: `log` 支持 `--raw`、`--numstat` 与 `--dirstat` 差异格式选项（#964）
 
 **Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
 
