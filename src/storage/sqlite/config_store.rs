@@ -128,6 +128,37 @@ impl SqliteConfigStore {
         let conn = Database::connect(options)
             .await
             .map_err(|err| map_sqlite_db_err(role, "open sqlite config store read-only", err))?;
+        if matches!(
+            role,
+            DatabaseRole::GlobalConfig | DatabaseRole::SystemConfig
+        ) {
+            let inspection = crate::internal::db::schema::inspect_configuration_schema(&conn, role)
+                .await
+                .map_err(|err| {
+                    StorageBackendError::io("validate sqlite configuration schema", err)
+                })?;
+            if let Some(issue) = inspection.issue {
+                return Err(match issue.kind {
+                    crate::internal::db::schema::ConfigurationSchemaIssueKind::Future => {
+                        StorageBackendError::SchemaTooNew {
+                            role,
+                            found: u32::try_from(issue.current_version.max(0)).unwrap_or(u32::MAX),
+                            max_supported: issue
+                                .latest_version
+                                .and_then(|v| u32::try_from(v.max(0)).ok())
+                                .unwrap_or(0),
+                        }
+                    }
+                    crate::internal::db::schema::ConfigurationSchemaIssueKind::UnregisteredReceipt => {
+                        StorageBackendError::BackendInternal {
+                            detail: format!(
+                                "{role} configuration database contains an unsupported or unregistered schema receipt"
+                            ),
+                        }
+                    }
+                });
+            }
+        }
         Ok(Self {
             conn,
             role,
@@ -162,6 +193,26 @@ impl SqliteConfigStore {
         ledger_for_role(self.role)
             .map(|ledger| ledger.table_name())
             .map_err(|err| StorageBackendError::io("resolve schema ledger table", err))
+    }
+
+    /// Check whether a read-only `GlobalConfig` / `SystemConfig` SQLite store
+    /// carries `config_kv`. Pre-ledger files containing only the legacy
+    /// `config` table return `Ok(false)` (treated as absent keys without
+    /// mutating the DB), while receipted databases missing `config_kv` fail
+    /// closed as corrupt (`src/internal/db/schema.rs::configuration_has_kv`).
+    async fn has_config_kv(&self) -> StorageResult<bool> {
+        if !self.read_only || self.role == DatabaseRole::Repository {
+            return Ok(true);
+        }
+        crate::internal::db::schema::configuration_has_kv(&self.conn, self.role)
+            .await
+            .map_err(|err| StorageBackendError::io("inspect sqlite config_kv schema", err))
+    }
+
+    async fn has_table(&self, table: &str) -> StorageResult<bool> {
+        crate::internal::db::sqlite_schema_contains(&self.conn, "table", table)
+            .await
+            .map_err(|err| map_sqlite_db_err(self.role, "inspect sqlite table existence", err))
     }
 }
 
@@ -213,6 +264,9 @@ impl ConfigStore for SqliteConfigStore {
     }
 
     async fn get(&self, key: &str) -> StorageResult<Option<ConfigEntry>> {
+        if !self.has_config_kv().await? {
+            return Ok(None);
+        }
         let row = config_kv::Entity::find()
             .filter(config_kv::Column::Key.eq(key))
             .order_by_desc(config_kv::Column::Id)
@@ -223,6 +277,9 @@ impl ConfigStore for SqliteConfigStore {
     }
 
     async fn get_all(&self, key: &str) -> StorageResult<Vec<ConfigEntry>> {
+        if !self.has_config_kv().await? {
+            return Ok(Vec::new());
+        }
         let rows = config_kv::Entity::find()
             .filter(config_kv::Column::Key.eq(key))
             .order_by_asc(config_kv::Column::Id)
@@ -233,6 +290,9 @@ impl ConfigStore for SqliteConfigStore {
     }
 
     async fn get_by_prefix(&self, prefix: &str) -> StorageResult<Vec<ConfigEntry>> {
+        if !self.has_config_kv().await? {
+            return Ok(Vec::new());
+        }
         // Use binary `>=` lower bound (case-sensitive, wildcard-free) plus exact
         // Rust `starts_with` so `%`, `_`, and ASCII case behave identically to redb.
         let mut query = config_kv::Entity::find();
@@ -253,6 +313,9 @@ impl ConfigStore for SqliteConfigStore {
     }
 
     async fn list_all(&self) -> StorageResult<Vec<ConfigEntry>> {
+        if !self.has_config_kv().await? {
+            return Ok(Vec::new());
+        }
         let rows = config_kv::Entity::find()
             .order_by_asc(config_kv::Column::Id)
             .all(&self.conn)
@@ -539,6 +602,9 @@ impl ConfigStore for SqliteConfigStore {
     }
 
     async fn list_legacy_entries(&self) -> StorageResult<Vec<LegacyConfigEntry>> {
+        if self.read_only && !self.has_table("config").await? {
+            return Ok(Vec::new());
+        }
         let rows = config::Entity::find()
             .order_by_asc(config::Column::Id)
             .all(&self.conn)
@@ -573,6 +639,10 @@ impl ConfigStore for SqliteConfigStore {
 
     async fn list_schema_receipts(&self) -> StorageResult<Vec<SchemaVersionReceipt>> {
         let table = self.schema_ledger_table()?;
+        if self.read_only && self.role != DatabaseRole::Repository && !self.has_table(table).await?
+        {
+            return Ok(Vec::new());
+        }
         let sql = format!("SELECT version, name, applied_at FROM {table} ORDER BY version ASC");
         let rows = self
             .conn

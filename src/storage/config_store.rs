@@ -1846,6 +1846,270 @@ pub async fn open_config_scope_read_write_with_deadline(
     Ok(locked.store_arc())
 }
 
+fn migrate_hint_for_role(role: DatabaseRole) -> &'static str {
+    match role {
+        DatabaseRole::GlobalConfig => "libra-migrate --global",
+        DatabaseRole::SystemConfig => "libra-migrate --system",
+        _ => "libra-migrate",
+    }
+}
+
+fn lock_and_inspect_config_scope_for_read(
+    dir_owned: &Path,
+    role: DatabaseRole,
+    lock_deadline: Duration,
+) -> StorageResult<(Option<ConfigScopeLock>, ConfigScopeAuthority)> {
+    let dir_meta = match fs::metadata(dir_owned) {
+        Ok(meta) if meta.is_dir() => meta,
+        Ok(_) => {
+            return Err(StorageBackendError::BackendInternal {
+                detail: "config scope path must be a directory".to_string(),
+            });
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            if fs::symlink_metadata(dir_owned).is_ok() {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: "config scope path is a dangling symlink".to_string(),
+                });
+            }
+            return Err(StorageBackendError::NotFound {
+                resource: format!("{role} configuration scope"),
+            });
+        }
+        Err(err) => return Err(StorageBackendError::io("stat config scope directory", err)),
+    };
+
+    if !scope_dir_has_any_tracked_entry(dir_owned)? {
+        return Err(StorageBackendError::NotFound {
+            resource: format!("{role} configuration scope"),
+        });
+    }
+
+    // First try locking an already-existing `config-migration.lock` strictly
+    // read-only (succeeds even in `0555` non-root `SystemConfig` dirs).
+    let lock = match ConfigScopeLock::try_lock_shared_if_present_bounded(
+        dir_owned,
+        role,
+        lock_deadline,
+    )? {
+        Some(lock) => Some(lock),
+        None => {
+            // `ADR-RB-02` #2 / `RB-03h` AC4: unlocked read-only fallback is
+            // restricted strictly to non-writable `SystemConfig` directories
+            // where `config-migration.lock` does not yet exist. All writable
+            // directories and all `GlobalConfig` directories must acquire
+            // `LOCK_SH` or fail closed (`LBR-IO-001`).
+            if role == DatabaseRole::SystemConfig
+                && is_scope_dir_non_writable_for_lock_create(dir_owned, &dir_meta)
+            {
+                None
+            } else {
+                match ConfigScopeLock::try_lock_shared_bounded(dir_owned, role, lock_deadline) {
+                    Ok(lock) => Some(lock),
+                    Err(err)
+                        if role == DatabaseRole::SystemConfig
+                            && matches!(
+                                err.io_kind(),
+                                Some(
+                                    io::ErrorKind::PermissionDenied
+                                        | io::ErrorKind::ReadOnlyFilesystem
+                                )
+                            ) =>
+                    {
+                        // Permit unlocked fallback ONLY for `SystemConfig`
+                        // after confirming BOTH `config-migration.lock` is
+                        // still absent AND the directory is non-writable for
+                        // effective credentials. Any error on an existing
+                        // lock file fails closed (`LBR-IO-001`).
+                        let lock_still_absent = matches!(
+                            fs::symlink_metadata(config_migration_lock_path(dir_owned)),
+                            Err(e) if e.kind() == io::ErrorKind::NotFound
+                        );
+                        let dir_now_non_writable = fs::metadata(dir_owned)
+                            .map(|m| is_scope_dir_non_writable_for_lock_create(dir_owned, &m))
+                            .unwrap_or(false);
+                        if lock_still_absent && dir_now_non_writable {
+                            None
+                        } else {
+                            return Err(err);
+                        }
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+        }
+    };
+
+    let authority = inspect_config_scope_authority(dir_owned, role)?;
+    Ok((lock, authority))
+}
+
+async fn open_store_for_runtime_read(
+    authority: ConfigScopeAuthority,
+    role: DatabaseRole,
+    runtime_backend: StorageBackendKind,
+    sqlite_compiled_in: bool,
+) -> StorageResult<Arc<dyn ConfigStore>> {
+    let migrate_hint = migrate_hint_for_role(role);
+    if runtime_backend == StorageBackendKind::Redb && !cfg!(feature = "storage-redb") {
+        return Err(StorageBackendError::UnsupportedBackend {
+            requested: StorageBackendKind::Redb.to_string(),
+            detail: "redb storage backend is not compiled into this binary".to_string(),
+        });
+    }
+    match authority {
+        ConfigScopeAuthority::Empty => Err(StorageBackendError::NotFound {
+            resource: format!("{role} configuration scope"),
+        }),
+        ConfigScopeAuthority::Manifest { manifest, db_path } => match runtime_backend {
+            StorageBackendKind::Sqlite => {
+                if !sqlite_compiled_in {
+                    let _ = db_path;
+                    return Err(StorageBackendError::UnsupportedBackend {
+                        requested: StorageBackendKind::Sqlite.to_string(),
+                        detail: "sqlite storage backend is not compiled into this binary"
+                            .to_string(),
+                    });
+                }
+                match manifest.backend {
+                    StorageBackendKind::Sqlite => {
+                        #[cfg(feature = "storage-sqlite")]
+                        {
+                            let store = crate::storage::sqlite::SqliteConfigStore::open_read_only(
+                                &db_path, role,
+                            )
+                            .await?;
+                            Ok(Arc::new(store))
+                        }
+                        #[cfg(not(feature = "storage-sqlite"))]
+                        {
+                            let _ = db_path;
+                            Err(StorageBackendError::UnsupportedBackend {
+                                requested: StorageBackendKind::Sqlite.to_string(),
+                                detail: format!(
+                                    "{role} config scope uses sqlite, which is not compiled into this binary; run `{migrate_hint}`"
+                                ),
+                            })
+                        }
+                    }
+                    StorageBackendKind::Redb => Err(StorageBackendError::BackendMismatch {
+                        detail: format!(
+                            "{role} config scope authority is `redb` (finalized), incompatible with `sqlite` reader; run `{migrate_hint}`"
+                        ),
+                    }),
+                }
+            }
+            StorageBackendKind::Redb => match manifest.backend {
+                StorageBackendKind::Redb => {
+                    #[cfg(feature = "storage-redb")]
+                    {
+                        let store =
+                            crate::storage::redb::RedbConfigStore::open_read_only(&db_path, role)?;
+                        Ok(Arc::new(store))
+                    }
+                    #[cfg(not(feature = "storage-redb"))]
+                    {
+                        let _ = db_path;
+                        Err(StorageBackendError::UnsupportedBackend {
+                            requested: StorageBackendKind::Redb.to_string(),
+                            detail: format!(
+                                "{role} config scope uses redb, which is not compiled into this binary; run `{migrate_hint}`"
+                            ),
+                        })
+                    }
+                }
+                StorageBackendKind::Sqlite => {
+                    // `ADR-RB-02` #2 (3) + Branch B: finalized `sqlite` manifest
+                    // under `Redb` runtime follows the legacy SQLite read policy
+                    // (dual-feature read-only fallback; pure `storage-redb` fail-closed).
+                    if sqlite_compiled_in {
+                        #[cfg(feature = "storage-sqlite")]
+                        {
+                            let store = crate::storage::sqlite::SqliteConfigStore::open_read_only(
+                                &db_path, role,
+                            )
+                            .await?;
+                            return Ok(Arc::new(store));
+                        }
+                    }
+                    let _ = db_path;
+                    Err(StorageBackendError::UnsupportedBackend {
+                        requested: StorageBackendKind::Sqlite.to_string(),
+                        detail: format!(
+                            "{role} config scope uses unmigrated sqlite config.db, which is not compiled into this binary; run `{migrate_hint}`"
+                        ),
+                    })
+                }
+            },
+        },
+        ConfigScopeAuthority::LegacySqlite { db_path } => match runtime_backend {
+            StorageBackendKind::Sqlite => {
+                if !sqlite_compiled_in {
+                    let _ = db_path;
+                    return Err(StorageBackendError::UnsupportedBackend {
+                        requested: StorageBackendKind::Sqlite.to_string(),
+                        detail: format!(
+                            "{role} config scope has an unmigrated legacy sqlite config.db; run `{migrate_hint}`"
+                        ),
+                    });
+                }
+                #[cfg(feature = "storage-sqlite")]
+                {
+                    let store =
+                        crate::storage::sqlite::SqliteConfigStore::open_read_only(&db_path, role)
+                            .await?;
+                    Ok(Arc::new(store))
+                }
+                #[cfg(not(feature = "storage-sqlite"))]
+                {
+                    let _ = db_path;
+                    Err(StorageBackendError::UnsupportedBackend {
+                        requested: StorageBackendKind::Sqlite.to_string(),
+                        detail: format!(
+                            "{role} config scope has an unmigrated legacy sqlite config.db; run `{migrate_hint}`"
+                        ),
+                    })
+                }
+            }
+            StorageBackendKind::Redb => {
+                // `ADR-RB-02` #2 Branch B:
+                // - Dual-feature (`storage-sqlite` + `storage-redb`): transparent
+                //   read-only fallback to legacy `config.db`.
+                // - Pure `storage-redb`: fail closed `LBR-CLI-003` (never empty).
+                if sqlite_compiled_in {
+                    #[cfg(feature = "storage-sqlite")]
+                    {
+                        let store = crate::storage::sqlite::SqliteConfigStore::open_read_only(
+                            &db_path, role,
+                        )
+                        .await?;
+                        return Ok(Arc::new(store));
+                    }
+                }
+                let _ = db_path;
+                Err(StorageBackendError::UnsupportedBackend {
+                    requested: StorageBackendKind::Sqlite.to_string(),
+                    detail: format!(
+                        "{role} config scope has an unmigrated legacy sqlite config.db; run `{migrate_hint}`"
+                    ),
+                })
+            }
+        },
+        ConfigScopeAuthority::UnmanifestedRedb { .. } => match runtime_backend {
+            StorageBackendKind::Sqlite => Err(StorageBackendError::BackendMismatch {
+                detail: format!(
+                    "{role} config scope contains config.redb without config.db; incompatible with sqlite reader; run `{migrate_hint}`"
+                ),
+            }),
+            StorageBackendKind::Redb => Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "{role} config scope contains unmanifested config.redb without config-format.json"
+                ),
+            }),
+        },
+    }
+}
+
 /// Open a `GlobalConfig` or `SystemConfig` scope strictly read-only under a
 /// bounded shared [`ConfigScopeLock`] (or direct read-only manifest inspection
 /// fallback when `config-migration.lock` is absent in a read-only `SystemConfig`
@@ -1869,90 +2133,7 @@ pub async fn open_locked_config_scope_read_only(
     validate_config_scope_role(role)?;
     let dir_owned = scope_dir.to_path_buf();
     let (lock, authority) = tokio::task::spawn_blocking(move || {
-        let dir_meta = match fs::metadata(&dir_owned) {
-            Ok(meta) if meta.is_dir() => meta,
-            Ok(_) => {
-                return Err(StorageBackendError::BackendInternal {
-                    detail: "config scope path must be a directory".to_string(),
-                });
-            }
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                if fs::symlink_metadata(&dir_owned).is_ok() {
-                    return Err(StorageBackendError::BackendInternal {
-                        detail: "config scope path is a dangling symlink".to_string(),
-                    });
-                }
-                return Err(StorageBackendError::NotFound {
-                    resource: format!("{role} configuration scope"),
-                });
-            }
-            Err(err) => return Err(StorageBackendError::io("stat config scope directory", err)),
-        };
-
-        if !scope_dir_has_any_tracked_entry(&dir_owned)? {
-            return Err(StorageBackendError::NotFound {
-                resource: format!("{role} configuration scope"),
-            });
-        }
-
-        // First try locking an already-existing `config-migration.lock` strictly
-        // read-only (succeeds even in `0555` non-root `SystemConfig` dirs).
-        let lock = match ConfigScopeLock::try_lock_shared_if_present_bounded(
-            &dir_owned,
-            role,
-            lock_deadline,
-        )? {
-            Some(lock) => Some(lock),
-            None => {
-                // `ADR-RB-02` #2 / `RB-03h` AC4: unlocked read-only fallback is
-                // restricted strictly to non-writable `SystemConfig` directories
-                // where `config-migration.lock` does not yet exist. All writable
-                // directories and all `GlobalConfig` directories must acquire
-                // `LOCK_SH` or fail closed (`LBR-IO-001`).
-                if role == DatabaseRole::SystemConfig
-                    && is_scope_dir_non_writable_for_lock_create(&dir_owned, &dir_meta)
-                {
-                    None
-                } else {
-                    match ConfigScopeLock::try_lock_shared_bounded(&dir_owned, role, lock_deadline)
-                    {
-                        Ok(lock) => Some(lock),
-                        Err(err)
-                            if role == DatabaseRole::SystemConfig
-                                && matches!(
-                                    err.io_kind(),
-                                    Some(
-                                        io::ErrorKind::PermissionDenied
-                                            | io::ErrorKind::ReadOnlyFilesystem
-                                    )
-                                ) =>
-                        {
-                            // Permit unlocked fallback ONLY for `SystemConfig`
-                            // after confirming BOTH `config-migration.lock` is
-                            // still absent AND the directory is non-writable for
-                            // effective credentials. Any error on an existing
-                            // lock file fails closed (`LBR-IO-001`).
-                            let lock_still_absent = matches!(
-                                fs::symlink_metadata(config_migration_lock_path(&dir_owned)),
-                                Err(e) if e.kind() == io::ErrorKind::NotFound
-                            );
-                            let dir_now_non_writable = fs::metadata(&dir_owned)
-                                .map(|m| is_scope_dir_non_writable_for_lock_create(&dir_owned, &m))
-                                .unwrap_or(false);
-                            if lock_still_absent && dir_now_non_writable {
-                                None
-                            } else {
-                                return Err(err);
-                            }
-                        }
-                        Err(err) => return Err(err),
-                    }
-                }
-            }
-        };
-
-        let authority = inspect_config_scope_authority(&dir_owned, role)?;
-        Ok((lock, authority))
+        lock_and_inspect_config_scope_for_read(&dir_owned, role, lock_deadline)
     })
     .await
     .map_err(|err| StorageBackendError::BackendInternal {
@@ -1964,6 +2145,86 @@ pub async fn open_locked_config_scope_read_only(
         store: Arc::new(ScopeLockedConfigStore { inner: store, lock }),
         role,
     })
+}
+
+/// Open a `GlobalConfig` or `SystemConfig` scope strictly read-only using
+/// runtime-backend dispatch (`ADR-RB-02` #2 Branch A & Branch B, `RB-03c`/`RB-03g`).
+///
+/// - `Sqlite` runtime (Branch A): reads existing `config.db` (manifested or
+///   legacy); returns `NotFound` without creating files on empty dir; fails
+///   closed with `BackendMismatch` (`LBR-CLI-003`) if only `config.redb` exists
+///   or `config-format.json(finalized=true)` declares `redb`.
+/// - `Redb` runtime (Branch B): reads finalized `config.redb`; transparently
+///   falls back to read-only `config.db` in dual-feature builds; fails closed
+///   with `UnsupportedBackend` (`LBR-CLI-003`) in pure `storage-redb` builds.
+pub async fn open_locked_config_scope_for_read(
+    scope_dir: &Path,
+    role: DatabaseRole,
+    runtime_backend: StorageBackendKind,
+    lock_deadline: Duration,
+) -> StorageResult<LockedConfigScope> {
+    open_locked_config_scope_for_read_with_sqlite_capability(
+        scope_dir,
+        role,
+        runtime_backend,
+        lock_deadline,
+        cfg!(feature = "storage-sqlite"),
+    )
+    .await
+}
+
+async fn open_locked_config_scope_for_read_with_sqlite_capability(
+    scope_dir: &Path,
+    role: DatabaseRole,
+    runtime_backend: StorageBackendKind,
+    lock_deadline: Duration,
+    sqlite_compiled_in: bool,
+) -> StorageResult<LockedConfigScope> {
+    validate_config_scope_role(role)?;
+    let dir_owned = scope_dir.to_path_buf();
+    let (lock, authority) = tokio::task::spawn_blocking(move || {
+        lock_and_inspect_config_scope_for_read(&dir_owned, role, lock_deadline)
+    })
+    .await
+    .map_err(|err| StorageBackendError::BackendInternal {
+        detail: format!("config scope runtime read lock task failed: {err}"),
+    })??;
+
+    let store =
+        open_store_for_runtime_read(authority, role, runtime_backend, sqlite_compiled_in).await?;
+    Ok(LockedConfigScope {
+        store: Arc::new(ScopeLockedConfigStore { inner: store, lock }),
+        role,
+    })
+}
+
+/// Open a `GlobalConfig` or `SystemConfig` scope strictly read-only for
+/// `runtime_backend` using the default bounded lock deadline (`2s`).
+pub async fn open_config_scope_for_read(
+    scope_dir: &Path,
+    role: DatabaseRole,
+    runtime_backend: StorageBackendKind,
+) -> StorageResult<Arc<dyn ConfigStore>> {
+    open_config_scope_for_read_with_deadline(
+        scope_dir,
+        role,
+        runtime_backend,
+        DEFAULT_CONFIG_SCOPE_LOCK_TIMEOUT,
+    )
+    .await
+}
+
+/// Open a `GlobalConfig` or `SystemConfig` scope strictly read-only for
+/// `runtime_backend` with a caller-specified bounded `ConfigScopeLock` deadline.
+pub async fn open_config_scope_for_read_with_deadline(
+    scope_dir: &Path,
+    role: DatabaseRole,
+    runtime_backend: StorageBackendKind,
+    lock_deadline: Duration,
+) -> StorageResult<Arc<dyn ConfigStore>> {
+    let locked =
+        open_locked_config_scope_for_read(scope_dir, role, runtime_backend, lock_deadline).await?;
+    Ok(locked.store_arc())
 }
 
 /// Open a `GlobalConfig` or `SystemConfig` scope strictly read-only using the
@@ -2201,7 +2462,6 @@ fn ensure_scope_dir_exists_for_write(scope_dir: &Path, role: DatabaseRole) -> St
 }
 
 #[cfg(feature = "storage-redb")]
-#[cfg(feature = "storage-redb")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FreshCreateEntry {
     /// Clean empty scope directory: run Step F1 -> Step F2 -> Step F3 -> Step F4.
@@ -2220,7 +2480,7 @@ enum FreshCreateEntry {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(not(all(test, feature = "storage-redb")), allow(dead_code))]
 pub(crate) enum FreshCreateStep {
     StepF1HardLinkTombstone,
     StepF2PublishFreshCreateManifest,
@@ -2771,13 +3031,14 @@ where
         detail: format!("config scope write lock task failed: {err}"),
     })??;
 
+    let migrate_hint = migrate_hint_for_role(role);
     match plan {
         LockPlan::Existing { lock, authority } => match authority {
             ConfigScopeAuthority::Manifest { manifest, db_path } => {
                 if manifest.backend != runtime_backend {
                     return Err(StorageBackendError::BackendMismatch {
                         detail: format!(
-                            "{role} config scope authority is `{}` (finalized), incompatible with `{runtime_backend}` writer; run `libra-migrate`",
+                            "{role} config scope authority is `{}` (finalized), incompatible with `{runtime_backend}` writer; run `{migrate_hint}`",
                             manifest.backend
                         ),
                     });
@@ -2798,30 +3059,68 @@ where
             }
             ConfigScopeAuthority::LegacySqlite { db_path } => match runtime_backend {
                 StorageBackendKind::Sqlite => {
-                    let store = open_store_from_authority(
-                        ConfigScopeAuthority::LegacySqlite { db_path },
-                        role,
-                        true,
-                    )
-                    .await?;
-                    Ok(LockedConfigScope {
-                        store: Arc::new(ScopeLockedConfigStore {
-                            inner: store,
-                            lock: Some(lock),
-                        }),
-                        role,
-                    })
+                    #[cfg(feature = "storage-sqlite")]
+                    {
+                        let dir_for_manifest = scope_dir.to_path_buf();
+                        // Self-heal missing `config-format.json` for an existing
+                        // valid SQLite `config.db` while holding `LOCK_EX` across
+                        // open + manifest publication (`ADR-RB-02` #2).
+                        let (lock, store) = tokio::spawn(async move {
+                            let store =
+                                crate::storage::sqlite::SqliteConfigStore::open(&db_path, role)
+                                    .await?;
+                            let lock = tokio::task::spawn_blocking(move || {
+                                let manifest = ConfigFormatManifest::new_sqlite_finalized(1, role)?;
+                                publish_config_format_manifest(&dir_for_manifest, role, &manifest)?;
+                                Ok::<ConfigScopeLock, StorageBackendError>(lock)
+                            })
+                            .await
+                            .map_err(|err| {
+                                StorageBackendError::BackendInternal {
+                                    detail: format!(
+                                        "sqlite legacy manifest self-heal task failed: {err}"
+                                    ),
+                                }
+                            })??;
+                            Ok::<
+                                (ConfigScopeLock, crate::storage::sqlite::SqliteConfigStore),
+                                StorageBackendError,
+                            >((lock, store))
+                        })
+                        .await
+                        .map_err(|err| {
+                            StorageBackendError::BackendInternal {
+                                detail: format!("sqlite legacy config write task failed: {err}"),
+                            }
+                        })??;
+                        Ok(LockedConfigScope {
+                            store: Arc::new(ScopeLockedConfigStore {
+                                inner: Arc::new(store),
+                                lock: Some(lock),
+                            }),
+                            role,
+                        })
+                    }
+                    #[cfg(not(feature = "storage-sqlite"))]
+                    {
+                        let _ = (lock, db_path);
+                        Err(StorageBackendError::UnsupportedBackend {
+                            requested: StorageBackendKind::Sqlite.to_string(),
+                            detail: "sqlite storage backend is not compiled into this binary"
+                                .to_string(),
+                        })
+                    }
                 }
                 StorageBackendKind::Redb => Err(StorageBackendError::BackendMismatch {
                     detail: format!(
-                        "{role} config scope has an unmigrated legacy config.db; refusing to create config.redb — run `libra-migrate`"
+                        "{role} config scope has an unmigrated legacy config.db; refusing to create config.redb — run `{migrate_hint}`"
                     ),
                 }),
             },
             ConfigScopeAuthority::UnmanifestedRedb { .. } => match runtime_backend {
                 StorageBackendKind::Sqlite => Err(StorageBackendError::BackendMismatch {
                     detail: format!(
-                        "{role} config scope contains config.redb without config.db; incompatible with sqlite writer"
+                        "{role} config scope contains config.redb without config.db; incompatible with sqlite writer; run `{migrate_hint}`"
                     ),
                 }),
                 StorageBackendKind::Redb => Err(StorageBackendError::BackendInternal {
@@ -10251,5 +10550,726 @@ mod tests {
             "RB-03i child failed (status={:?}):\nstdout:\n{stdout}\nstderr:\n{stderr}",
             output.status
         );
+    }
+
+    /// `RB-03c` (AC1–AC5): Verify `ADR-RB-02` #2 Branch A runtime-aware dispatch
+    /// for `Sqlite` runtime in both dual-feature (`storage-sqlite,storage-redb`)
+    /// and pure `storage-sqlite` builds:
+    /// - AC1: Existing `config.db` reads cleanly under `Sqlite` runtime (and
+    ///   absent/empty dirs return `NotFound` creating zero files).
+    /// - AC2: Existing `config.db` writes cleanly under `Sqlite` runtime without
+    ///   ever creating `config.redb` (self-healing `config-format.json` and using
+    ///   concurrent `LOCK_SH` on steady-state writes).
+    /// - AC3: Empty dir first-write under `Sqlite` runtime holds `LOCK_EX` and
+    ///   creates `config.db` + `config-format.json(backend="sqlite",
+    ///   finalized=true, legacy_sqlite_tombstone=false)`.
+    /// - AC4: Directory containing only `config.redb` (no `config.db`) fails
+    ///   closed with `LBR-CLI-003` (`BackendMismatch`) on both read and write.
+    /// - AC5: Finalized `config-format.json` whose authoritative backend
+    ///   mismatches the active write runtime fails closed with `LBR-CLI-003`
+    ///   (`BackendMismatch`) in both directions (`redb` authority vs `sqlite`
+    ///   writer, and in dual-feature `sqlite` authority vs `redb` writer).
+    #[cfg(feature = "storage-sqlite")]
+    #[tokio::test]
+    async fn dual_feature_sqlite_runtime_config_dispatch_and_authority_guard() {
+        use tempfile::tempdir;
+
+        use crate::storage::sqlite::SqliteConfigStore;
+
+        fn set_tombstone_readonly(path: &Path, role: DatabaseRole) {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = expected_config_tombstone_mode(role).expect("role tombstone mode");
+                fs::set_permissions(path, fs::Permissions::from_mode(mode))
+                    .expect("set tombstone mode");
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = role;
+                let mut perms = fs::metadata(path).expect("stat tombstone").permissions();
+                perms.set_readonly(true);
+                fs::set_permissions(path, perms).expect("set tombstone readonly");
+            }
+        }
+
+        fn restore_writable_for_cleanup(path: &Path) {
+            if !path.exists() {
+                return;
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+            }
+            #[cfg(not(unix))]
+            if let Ok(meta) = fs::metadata(path) {
+                let mut perms = meta.permissions();
+                perms.set_readonly(false);
+                let _ = fs::set_permissions(path, perms);
+            }
+        }
+
+        for role in [DatabaseRole::GlobalConfig, DatabaseRole::SystemConfig] {
+            let root = tempdir().expect("create RB-03c temp root");
+
+            // -----------------------------------------------------------------
+            // AC1 + AC2: Existing legacy `config.db` (no manifest) reads and
+            // writes cleanly under `Sqlite` runtime, never creates `config.redb`.
+            // -----------------------------------------------------------------
+            let existing_dir = root.path().join("existing-sqlite");
+            fs::create_dir_all(&existing_dir).expect("create existing-sqlite dir");
+            let existing_sqlite = config_sqlite_path_in_scope_dir(&existing_dir);
+            let existing_redb = config_redb_path_in_scope_dir(&existing_dir);
+            {
+                let seed = SqliteConfigStore::create(&existing_sqlite, role)
+                    .await
+                    .expect("seed existing config.db");
+                seed.set("user.name", "legacy-alice", false)
+                    .await
+                    .expect("seed user.name");
+                seed.set("core.editor", "vim", false)
+                    .await
+                    .expect("seed core.editor");
+            }
+            assert!(!config_format_manifest_path(&existing_dir).exists());
+
+            // AC1: Read existing `config.db` via runtime-aware SQLite dispatch.
+            let ro = open_locked_config_scope_for_read(
+                &existing_dir,
+                role,
+                StorageBackendKind::Sqlite,
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("AC1: Sqlite runtime must read existing config.db");
+            assert!(ro.is_locked());
+            assert_eq!(ro.store().backend(), StorageBackendKind::Sqlite);
+            assert_eq!(
+                ro.store()
+                    .get("user.name")
+                    .await
+                    .expect("get user.name")
+                    .map(|e| e.value),
+                Some("legacy-alice".to_string())
+            );
+            assert_eq!(
+                ro.store()
+                    .get("core.editor")
+                    .await
+                    .expect("get core.editor")
+                    .map(|e| e.value),
+                Some("vim".to_string())
+            );
+            drop(ro);
+            assert!(
+                !existing_redb.exists(),
+                "AC1: Sqlite read must never create config.redb"
+            );
+            assert!(
+                !config_format_manifest_path(&existing_dir).exists(),
+                "AC1: read-only open must not create config-format.json"
+            );
+
+            // Empty/absent dir read returns NotFound and creates zero files (`ADR-CF-06`).
+            let absent_dir = root.path().join("absent-scope");
+            let absent_err = open_locked_config_scope_for_read(
+                &absent_dir,
+                role,
+                StorageBackendKind::Sqlite,
+                Duration::from_secs(5),
+            )
+            .await
+            .expect_err("absent scope dir must return NotFound");
+            assert!(
+                matches!(absent_err, StorageBackendError::NotFound { .. }),
+                "expected NotFound, got {absent_err:?}"
+            );
+            assert!(
+                !absent_dir.exists(),
+                "read on absent scope dir must not create directory"
+            );
+
+            // AC1 (pre-ledger legacy fixture): An older `config.db` containing
+            // ONLY the legacy `config` table (no `config_kv`, no schema ledger)
+            // must read cleanly without SQL error and without modifying the file.
+            {
+                use sea_orm::{ConnectOptions, ConnectionTrait, Database, Statement};
+
+                let pre_ledger_dir = root.path().join("pre-ledger-legacy-sqlite");
+                fs::create_dir_all(&pre_ledger_dir).expect("create pre-ledger dir");
+                let pre_ledger_db = config_sqlite_path_in_scope_dir(&pre_ledger_dir);
+                let url = format!("sqlite://{}?mode=rwc", pre_ledger_db.display());
+                let mut opts = ConnectOptions::new(url);
+                opts.max_connections(1).sqlx_logging(false);
+                let conn = Database::connect(opts)
+                    .await
+                    .expect("create pre-ledger sqlite fixture");
+                let backend = conn.get_database_backend();
+                conn.execute_raw(Statement::from_string(
+                    backend,
+                    "CREATE TABLE config (id INTEGER PRIMARY KEY AUTOINCREMENT, configuration TEXT NOT NULL, name TEXT, key TEXT NOT NULL, value TEXT NOT NULL);",
+                ))
+                .await
+                .expect("create legacy config table");
+                conn.execute_raw(Statement::from_string(
+                    backend,
+                    "INSERT INTO config (configuration, name, key, value) VALUES ('user', NULL, 'name', 'pre-ledger-bob');",
+                ))
+                .await
+                .expect("insert legacy config row");
+                conn.close().await.expect("close pre-ledger fixture");
+                let pre_ledger_bytes_before =
+                    fs::read(&pre_ledger_db).expect("read pre-ledger bytes");
+
+                let pre_ro = open_locked_config_scope_for_read(
+                    &pre_ledger_dir,
+                    role,
+                    StorageBackendKind::Sqlite,
+                    Duration::from_secs(5),
+                )
+                .await
+                .expect("AC1: pre-ledger config.db must open read-only cleanly");
+                assert_eq!(
+                    pre_ro
+                        .store()
+                        .get("user.name")
+                        .await
+                        .expect("AC1: missing config_kv on pre-ledger DB must return Ok(None)"),
+                    None
+                );
+                assert!(
+                    pre_ro
+                        .store()
+                        .get_all("user.name")
+                        .await
+                        .expect("pre-ledger get_all")
+                        .is_empty()
+                );
+                assert!(
+                    pre_ro
+                        .store()
+                        .get_by_prefix("user.")
+                        .await
+                        .expect("pre-ledger get_by_prefix")
+                        .is_empty()
+                );
+                assert!(
+                    pre_ro
+                        .store()
+                        .list_all()
+                        .await
+                        .expect("pre-ledger list_all")
+                        .is_empty()
+                );
+                assert!(
+                    pre_ro
+                        .store()
+                        .list_schema_receipts()
+                        .await
+                        .expect("pre-ledger list_schema_receipts")
+                        .is_empty()
+                );
+                let legacy_rows = pre_ro
+                    .store()
+                    .list_legacy_entries()
+                    .await
+                    .expect("pre-ledger list_legacy_entries");
+                assert_eq!(
+                    legacy_rows,
+                    vec![LegacyConfigEntry {
+                        configuration: "user".to_string(),
+                        name: None,
+                        key: "name".to_string(),
+                        value: "pre-ledger-bob".to_string(),
+                    }]
+                );
+                drop(pre_ro);
+                assert_eq!(
+                    fs::read(&pre_ledger_db).expect("re-read pre-ledger bytes"),
+                    pre_ledger_bytes_before,
+                    "AC1: pre-ledger read must not modify config.db"
+                );
+                assert!(!config_format_manifest_path(&pre_ledger_dir).exists());
+
+                // Corrupt receipted DB missing `config_kv` must STILL fail closed (not hidden as None).
+                let corrupt_dir = root.path().join("corrupt-receipted-no-kv");
+                fs::create_dir_all(&corrupt_dir).expect("create corrupt receipted dir");
+                let corrupt_db = config_sqlite_path_in_scope_dir(&corrupt_dir);
+                {
+                    let seed = SqliteConfigStore::create(&corrupt_db, role)
+                        .await
+                        .expect("seed receipted config.db");
+                    drop(seed);
+                }
+                let url = format!("sqlite://{}?mode=rw", corrupt_db.display());
+                let mut opts = ConnectOptions::new(url);
+                opts.max_connections(1).sqlx_logging(false);
+                let conn = Database::connect(opts)
+                    .await
+                    .expect("open receipted db to drop config_kv");
+                let backend = conn.get_database_backend();
+                conn.execute_raw(Statement::from_string(backend, "DROP TABLE config_kv;"))
+                    .await
+                    .expect("drop config_kv");
+                conn.close().await.expect("close corrupt receipted db");
+
+                let corrupt_ro = open_locked_config_scope_for_read(
+                    &corrupt_dir,
+                    role,
+                    StorageBackendKind::Sqlite,
+                    Duration::from_secs(5),
+                )
+                .await
+                .expect("open corrupt receipted db read-only");
+                let corrupt_err = corrupt_ro
+                    .store()
+                    .get("user.name")
+                    .await
+                    .expect_err("receipted config.db missing config_kv must fail closed");
+                assert_eq!(corrupt_err.stable_code_str(), "LBR-IO-001");
+
+                // Future-schema SQLite config DB (carrying `config_kv` AND a newer
+                // receipt in `configuration_schema_versions`) must fail closed at
+                // read-only open time with `SchemaTooNew` (`LBR-CONFIG-001`) and
+                // leave the database bytes untouched.
+                let future_dir = root.path().join("future-schema-sqlite");
+                fs::create_dir_all(&future_dir).expect("create future-schema dir");
+                let future_db = config_sqlite_path_in_scope_dir(&future_dir);
+                {
+                    let seed = SqliteConfigStore::create(&future_db, role)
+                        .await
+                        .expect("seed future-schema config.db");
+                    seed.set("user.name", "future-user", false)
+                        .await
+                        .expect("seed future config_kv row");
+                }
+                let future_url = format!("sqlite://{}?mode=rw", future_db.display());
+                let mut future_opts = ConnectOptions::new(future_url);
+                future_opts.max_connections(1).sqlx_logging(false);
+                let future_conn = Database::connect(future_opts)
+                    .await
+                    .expect("open future-schema db to inject future receipt");
+                let future_backend = future_conn.get_database_backend();
+                future_conn
+                    .execute_raw(Statement::from_string(
+                        future_backend,
+                        "INSERT INTO configuration_schema_versions (version, name, applied_at) VALUES (2099010101, 'future_config_v99', '2099-01-01T00:00:00Z');",
+                    ))
+                    .await
+                    .expect("insert future configuration schema receipt");
+                future_conn
+                    .close()
+                    .await
+                    .expect("close future-schema fixture");
+                let future_bytes_before = fs::read(&future_db).expect("read future db bytes");
+
+                let future_err = open_locked_config_scope_for_read(
+                    &future_dir,
+                    role,
+                    StorageBackendKind::Sqlite,
+                    Duration::from_secs(5),
+                )
+                .await
+                .expect_err("future-schema SQLite config.db must fail closed on read-only open");
+                assert!(
+                    matches!(
+                        future_err,
+                        StorageBackendError::SchemaTooNew { role: err_role, .. } if err_role == role
+                    ),
+                    "expected SchemaTooNew for {role}, got {future_err:?}"
+                );
+                assert_eq!(future_err.stable_code_str(), "LBR-CONFIG-001");
+                assert_eq!(
+                    fs::read(&future_db).expect("re-read future db bytes"),
+                    future_bytes_before,
+                    "future-schema rejection must not modify config.db"
+                );
+            }
+
+            // AC2: Write to existing `config.db` under `Sqlite` runtime.
+            let rw = open_or_create_locked_config_scope_for_write(
+                &existing_dir,
+                role,
+                StorageBackendKind::Sqlite,
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("AC2: Sqlite runtime must write existing config.db");
+            assert!(rw.is_locked());
+            assert_eq!(rw.store().backend(), StorageBackendKind::Sqlite);
+            rw.store()
+                .set("user.email", "alice@example.com", false)
+                .await
+                .expect("write user.email");
+            rw.store()
+                .set("core.editor", "nvim", false)
+                .await
+                .expect("update core.editor");
+            drop(rw);
+            assert!(
+                !existing_redb.exists(),
+                "AC2: Sqlite write to existing config.db must never create config.redb"
+            );
+            let healed_manifest = read_config_format_manifest(&existing_dir, role)
+                .expect("read self-healed sqlite manifest")
+                .expect(
+                    "Sqlite write on legacy config.db should publish finalized sqlite manifest",
+                );
+            assert_eq!(healed_manifest.backend, StorageBackendKind::Sqlite);
+            assert!(healed_manifest.finalized);
+            assert_eq!(healed_manifest.init_phase, None);
+            assert!(!healed_manifest.legacy_sqlite_tombstone);
+
+            // Verify steady-state writes acquire `LOCK_SH` (two concurrent Sqlite writers coexist
+            // while mutually excluding `LOCK_EX`) and never create `config.redb`.
+            let rw_a = open_or_create_locked_config_scope_for_write(
+                &existing_dir,
+                role,
+                StorageBackendKind::Sqlite,
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("steady-state Sqlite writer A");
+            let rw_b = open_or_create_locked_config_scope_for_write(
+                &existing_dir,
+                role,
+                StorageBackendKind::Sqlite,
+                Duration::ZERO,
+            )
+            .await
+            .expect("steady-state Sqlite writer B must share LOCK_SH");
+            let ex_busy =
+                ConfigScopeLock::try_lock_exclusive_bounded(&existing_dir, role, Duration::ZERO)
+                    .expect_err(
+                        "LOCK_EX must block while steady-state Sqlite writers hold LOCK_SH",
+                    );
+            assert_eq!(ex_busy.stable_code_str(), "LBR-IO-001");
+            rw_b.store()
+                .set("core.pager", "less", false)
+                .await
+                .expect("steady-state write");
+            drop(rw_b);
+            drop(rw_a);
+            assert!(!existing_redb.exists());
+
+            // Read back all written keys through both runtime read API and direct SQLite store.
+            let verify_ro =
+                open_config_scope_for_read(&existing_dir, role, StorageBackendKind::Sqlite)
+                    .await
+                    .expect("read back updated config.db");
+            assert_eq!(
+                verify_ro
+                    .get("user.name")
+                    .await
+                    .expect("get user.name")
+                    .map(|e| e.value),
+                Some("legacy-alice".to_string())
+            );
+            assert_eq!(
+                verify_ro
+                    .get("user.email")
+                    .await
+                    .expect("get user.email")
+                    .map(|e| e.value),
+                Some("alice@example.com".to_string())
+            );
+            assert_eq!(
+                verify_ro
+                    .get("core.editor")
+                    .await
+                    .expect("get core.editor")
+                    .map(|e| e.value),
+                Some("nvim".to_string())
+            );
+            assert_eq!(
+                verify_ro
+                    .get("core.pager")
+                    .await
+                    .expect("get core.pager")
+                    .map(|e| e.value),
+                Some("less".to_string())
+            );
+            drop(verify_ro);
+
+            // -----------------------------------------------------------------
+            // AC3: Empty dir first-write under `Sqlite` runtime requires `LOCK_EX`
+            // and creates `config.db` + `config-format.json(backend="sqlite",
+            // finalized=true, legacy_sqlite_tombstone=false)`.
+            // -----------------------------------------------------------------
+            let fresh_dir = root.path().join("fresh-sqlite");
+            fs::create_dir_all(&fresh_dir).expect("create fresh-sqlite dir");
+            let fresh_sqlite = config_sqlite_path_in_scope_dir(&fresh_dir);
+            let fresh_redb = config_redb_path_in_scope_dir(&fresh_dir);
+
+            // Proof of `LOCK_EX`: holding an external `LOCK_SH` blocks first-write
+            // immediately with `WriteLockBusy` (`LBR-IO-001`) and creates zero DB/manifest.
+            let blocking_sh =
+                ConfigScopeLock::try_lock_shared_bounded(&fresh_dir, role, Duration::from_secs(1))
+                    .expect("acquire external LOCK_SH on fresh dir");
+            let blocked_first = open_or_create_locked_config_scope_for_write(
+                &fresh_dir,
+                role,
+                StorageBackendKind::Sqlite,
+                Duration::ZERO,
+            )
+            .await
+            .expect_err("AC3: first-write must require LOCK_EX and fail when LOCK_SH is held");
+            assert!(
+                matches!(blocked_first, StorageBackendError::WriteLockBusy { .. }),
+                "expected WriteLockBusy, got {blocked_first:?}"
+            );
+            assert_eq!(blocked_first.stable_code_str(), "LBR-IO-001");
+            assert!(!fresh_sqlite.exists());
+            assert!(!fresh_redb.exists());
+            assert!(!config_format_manifest_path(&fresh_dir).exists());
+            drop(blocking_sh);
+
+            // Now run first-write cleanly and verify `LOCK_EX` is held on the returned guard.
+            let created = open_or_create_locked_config_scope_for_write(
+                &fresh_dir,
+                role,
+                StorageBackendKind::Sqlite,
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("AC3: Sqlite first-write in empty dir must succeed");
+            assert!(created.is_locked());
+            assert_eq!(created.store().backend(), StorageBackendKind::Sqlite);
+            let sh_while_creating =
+                ConfigScopeLock::try_lock_shared_bounded(&fresh_dir, role, Duration::ZERO)
+                    .expect_err("AC3: first-write guard must actively hold LOCK_EX");
+            assert_eq!(sh_while_creating.stable_code_str(), "LBR-IO-001");
+            created
+                .store()
+                .set("init.defaultBranch", "main", false)
+                .await
+                .expect("write initial key");
+            drop(created);
+
+            assert!(fresh_sqlite.is_file(), "AC3: config.db must be created");
+            assert!(!fresh_redb.exists(), "AC3: config.redb must NOT be created");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let expected = expected_config_file_mode(role).expect("expected role mode");
+                let db_mode = fs::metadata(&fresh_sqlite)
+                    .expect("stat fresh config.db")
+                    .permissions()
+                    .mode()
+                    & 0o777;
+                assert_eq!(db_mode, expected, "AC3: fresh config.db role mode");
+            }
+            let fresh_manifest = read_config_format_manifest(&fresh_dir, role)
+                .expect("read fresh sqlite manifest")
+                .expect("AC3: config-format.json must exist after Sqlite first-write");
+            assert_eq!(fresh_manifest.backend, StorageBackendKind::Sqlite);
+            assert!(fresh_manifest.finalized);
+            assert_eq!(fresh_manifest.init_phase, None);
+            assert!(!fresh_manifest.legacy_sqlite_tombstone);
+            assert!(!fresh_manifest.targets_staged_for_rename);
+
+            // -----------------------------------------------------------------
+            // AC4: Only `config.redb` exists (no `config.db`, no manifest) ->
+            // `Sqlite` runtime fails closed `LBR-CLI-003` on BOTH read and write.
+            // -----------------------------------------------------------------
+            let redb_only_dir = root.path().join("only-redb-no-manifest");
+            fs::create_dir_all(&redb_only_dir).expect("create only-redb dir");
+            let redb_only_path = config_redb_path_in_scope_dir(&redb_only_dir);
+            #[cfg(feature = "storage-redb")]
+            {
+                let seed_redb =
+                    crate::storage::redb::RedbConfigStore::create(&redb_only_path, role)
+                        .expect("create real config.redb fixture");
+                seed_redb
+                    .set("user.name", "redb-only-user", false)
+                    .await
+                    .expect("seed redb key");
+            }
+            #[cfg(not(feature = "storage-redb"))]
+            {
+                fs::write(&redb_only_path, b"redb-fixture-bytes")
+                    .expect("create config.redb fixture");
+            }
+            let redb_bytes_before = fs::read(&redb_only_path).expect("read config.redb bytes");
+
+            let ac4_read_err = open_locked_config_scope_for_read(
+                &redb_only_dir,
+                role,
+                StorageBackendKind::Sqlite,
+                Duration::from_secs(5),
+            )
+            .await
+            .expect_err("AC4: Sqlite read on config.redb-only dir must fail closed");
+            assert!(
+                matches!(ac4_read_err, StorageBackendError::BackendMismatch { .. }),
+                "AC4: expected BackendMismatch on read, got {ac4_read_err:?}"
+            );
+            assert_eq!(ac4_read_err.stable_code_str(), "LBR-CLI-003");
+
+            let ac4_write_err = open_or_create_locked_config_scope_for_write(
+                &redb_only_dir,
+                role,
+                StorageBackendKind::Sqlite,
+                Duration::from_secs(5),
+            )
+            .await
+            .expect_err("AC4: Sqlite write on config.redb-only dir must fail closed");
+            assert!(
+                matches!(ac4_write_err, StorageBackendError::BackendMismatch { .. }),
+                "AC4: expected BackendMismatch on write, got {ac4_write_err:?}"
+            );
+            assert_eq!(ac4_write_err.stable_code_str(), "LBR-CLI-003");
+            assert!(
+                !config_sqlite_path_in_scope_dir(&redb_only_dir).exists(),
+                "AC4: Sqlite write must not create config.db"
+            );
+            assert!(
+                !config_format_manifest_path(&redb_only_dir).exists(),
+                "AC4: Sqlite write must not create config-format.json"
+            );
+            assert_eq!(
+                fs::read(&redb_only_path).expect("re-read config.redb bytes"),
+                redb_bytes_before,
+                "AC4: config.redb must remain untouched"
+            );
+
+            // -----------------------------------------------------------------
+            // AC5: Finalized `config-format.json` authority mismatches write
+            // runtime -> non-authoritative write path fails closed `LBR-CLI-003`.
+            // -----------------------------------------------------------------
+            // Direction 1: Finalized `redb` authority vs `Sqlite` runtime (read & write).
+            let finalized_redb_dir = root.path().join("finalized-redb");
+            fs::create_dir_all(&finalized_redb_dir).expect("create finalized-redb dir");
+            let fin_redb_path = config_redb_path_in_scope_dir(&finalized_redb_dir);
+            let fin_tombstone_path = config_sqlite_path_in_scope_dir(&finalized_redb_dir);
+            #[cfg(feature = "storage-redb")]
+            {
+                let seed_redb = crate::storage::redb::RedbConfigStore::create(&fin_redb_path, role)
+                    .expect("create finalized config.redb");
+                seed_redb
+                    .set("core.authority", "redb", false)
+                    .await
+                    .expect("seed finalized redb key");
+            }
+            #[cfg(not(feature = "storage-redb"))]
+            {
+                fs::write(&fin_redb_path, b"finalized-redb-fixture")
+                    .expect("create finalized config.redb fixture");
+            }
+            fs::write(&fin_tombstone_path, CONFIG_SQLITE_TOMBSTONE_SENTINEL)
+                .expect("write sentinel tombstone");
+            set_tombstone_readonly(&fin_tombstone_path, role);
+            let fin_redb_manifest = ConfigFormatManifest::new_redb_finalized(1, true, role)
+                .expect("build finalized redb manifest");
+            publish_config_format_manifest(&finalized_redb_dir, role, &fin_redb_manifest)
+                .expect("publish finalized redb manifest");
+
+            let ac5_sqlite_write_err = open_or_create_locked_config_scope_for_write(
+                &finalized_redb_dir,
+                role,
+                StorageBackendKind::Sqlite,
+                Duration::from_secs(5),
+            )
+            .await
+            .expect_err("AC5: Sqlite write against finalized redb authority must fail closed");
+            assert!(
+                matches!(
+                    ac5_sqlite_write_err,
+                    StorageBackendError::BackendMismatch { .. }
+                ),
+                "AC5: expected BackendMismatch, got {ac5_sqlite_write_err:?}"
+            );
+            assert_eq!(ac5_sqlite_write_err.stable_code_str(), "LBR-CLI-003");
+
+            let ac5_sqlite_read_err = open_locked_config_scope_for_read(
+                &finalized_redb_dir,
+                role,
+                StorageBackendKind::Sqlite,
+                Duration::from_secs(5),
+            )
+            .await
+            .expect_err("AC5: Sqlite read against finalized redb authority must fail closed");
+            assert!(
+                matches!(
+                    ac5_sqlite_read_err,
+                    StorageBackendError::BackendMismatch { .. }
+                ),
+                "AC5: expected BackendMismatch on read, got {ac5_sqlite_read_err:?}"
+            );
+            assert_eq!(ac5_sqlite_read_err.stable_code_str(), "LBR-CLI-003");
+            assert_eq!(
+                fs::read(&fin_tombstone_path).expect("read sentinel"),
+                CONFIG_SQLITE_TOMBSTONE_SENTINEL,
+                "AC5: sentinel config.db must remain untouched"
+            );
+            restore_writable_for_cleanup(&fin_tombstone_path);
+
+            // Direction 2 (dual-feature): Finalized `sqlite` authority vs `Redb` writer.
+            #[cfg(feature = "storage-redb")]
+            {
+                let ac5_redb_write_err = open_or_create_locked_config_scope_for_write(
+                    &fresh_dir,
+                    role,
+                    StorageBackendKind::Redb,
+                    Duration::from_secs(5),
+                )
+                .await
+                .expect_err("AC5: Redb write against finalized sqlite authority must fail closed");
+                assert!(
+                    matches!(
+                        ac5_redb_write_err,
+                        StorageBackendError::BackendMismatch { .. }
+                    ),
+                    "AC5: expected BackendMismatch, got {ac5_redb_write_err:?}"
+                );
+                assert_eq!(ac5_redb_write_err.stable_code_str(), "LBR-CLI-003");
+                let expected_hint = match role {
+                    DatabaseRole::GlobalConfig => "libra-migrate --global",
+                    DatabaseRole::SystemConfig => "libra-migrate --system",
+                    _ => unreachable!(),
+                };
+                assert!(
+                    ac5_redb_write_err.to_string().contains(expected_hint),
+                    "AC5: error should mention `{expected_hint}`, got `{ac5_redb_write_err}`"
+                );
+                assert!(
+                    !fresh_redb.exists(),
+                    "AC5: rejected Redb write must NOT create config.redb"
+                );
+            }
+
+            // Unfinalized manifest (`finalized=false`) always fails closed `LBR-IO-001`
+            // prior to runtime dispatch.
+            let unfinalized_dir = root.path().join("unfinalized-manifest");
+            fs::create_dir_all(&unfinalized_dir).expect("create unfinalized dir");
+            let unfinalized = ConfigFormatManifest {
+                schema_version: CONFIG_FORMAT_MANIFEST_VERSION,
+                backend: StorageBackendKind::Redb,
+                finalized: false,
+                init_phase: Some(ConfigInitPhase::Migration),
+                generation: 1,
+                legacy_sqlite_tombstone: false,
+                targets_staged_for_rename: false,
+                source_db_state: None,
+                backup_sha256: None,
+                source_logical_sha256: None,
+            };
+            publish_config_format_manifest(&unfinalized_dir, role, &unfinalized)
+                .expect("publish unfinalized manifest");
+            let unfin_err = open_locked_config_scope_for_read(
+                &unfinalized_dir,
+                role,
+                StorageBackendKind::Sqlite,
+                Duration::from_secs(5),
+            )
+            .await
+            .expect_err("unfinalized manifest must fail closed LBR-IO-001");
+            assert!(
+                matches!(unfin_err, StorageBackendError::ManifestNotFinalized { .. }),
+                "expected ManifestNotFinalized, got {unfin_err:?}"
+            );
+            assert_eq!(unfin_err.stable_code_str(), "LBR-IO-001");
+        }
     }
 }

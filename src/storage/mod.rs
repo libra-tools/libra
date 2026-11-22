@@ -43,12 +43,13 @@ pub use config_store::{
     TombstoneReserveOutcome, config_format_manifest_path, config_migration_lock_path,
     config_redb_path_in_scope_dir, config_scope_dir_from_db_path, config_sqlite_path_in_scope_dir,
     inspect_config_scope_authority, is_config_sqlite_fenced_tombstone,
-    is_config_sqlite_tombstone_sentinel, key_in_section, open_config_scope_read_only,
+    is_config_sqlite_tombstone_sentinel, key_in_section, open_config_scope_for_read,
+    open_config_scope_for_read_with_deadline, open_config_scope_read_only,
     open_config_scope_read_only_with_deadline, open_config_scope_read_write,
-    open_config_scope_read_write_with_deadline, open_locked_config_scope_read_only,
-    open_locked_config_scope_read_write, open_or_create_locked_config_scope_for_write,
-    publish_config_format_manifest, read_config_format_manifest,
-    reserve_config_sqlite_tombstone_hard_link,
+    open_config_scope_read_write_with_deadline, open_locked_config_scope_for_read,
+    open_locked_config_scope_read_only, open_locked_config_scope_read_write,
+    open_or_create_locked_config_scope_for_write, publish_config_format_manifest,
+    read_config_format_manifest, reserve_config_sqlite_tombstone_hard_link,
 };
 #[cfg(unix)]
 pub use config_store::{

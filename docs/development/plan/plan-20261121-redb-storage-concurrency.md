@@ -1648,7 +1648,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `done` / `remote-pending`（2026-11-22 15:59 UTC，`v0.30.313`，于 `main` 直接提交推送；Stage 1 精确 1/6 文件写集 `src/storage/config_store.rs`、AC1–AC4 独立子进程 `LIBRA_CONFIG_SYSTEM_DB` + 严苛 `umask(0o077)` 下全 3 边界收敛与 `0644`/`0444` 权限实测、fmt、严格 clippy 与 Codex R1 `VERDICT: PASS` 全绿）
+**Lifecycle / Acceptance:** `done` / `remote-verified`（`14f3403`，`v0.30.313`，2026-11-22 15:59 UTC 于 `main` 提交并推送 `origin/main`；Stage 1 精确 1/6 文件写集 `src/storage/config_store.rs`、AC1–AC4 独立子进程 `LIBRA_CONFIG_SYSTEM_DB` + `umask(0o077)` 下全 3 边界收敛与 `0644`/`0444` 权限实测、fmt、严格 clippy 与 Codex R1 `VERDICT: PASS` 全绿）
 
 **Description:** 100% 在独占目录 `src/storage/**` 内针对隔离夹具 `LIBRA_CONFIG_SYSTEM_DB` 逐项验证首次 `Redb` 系统配置建库全部 3 处崩溃边界恢复，并确保收敛后的 `config.redb`（`0644`）与路径墓碑 `config.db`（`0444`）权限与数据完整性完全满足 `GC-13`。
 
@@ -1704,7 +1704,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `remote-pending`（2026-11-22 16:31 UTC，`v0.30.314`，于 `main` 直接提交推送；Stage 1 精确 3/6 文件写集 `src/storage/{mod,config_store}.rs` 与 `src/storage/sqlite/config_store.rs`、AC1–AC5 双特性 + 纯 `storage-sqlite` 零警告全绿含 pre-ledger 旧表只读与未来 schema `LBR-CONFIG-001` 拒收、纯 `storage-redb` 编译通过、fmt、严格 clippy 与 Codex R3 `VERDICT: PASS` 全绿）
 
 **Description:** 100% 在独占目录 `src/storage/**` 内落实 `ADR-RB-02` #2 分支 A（双特性构建下默认 `Sqlite` 运行时，对应 `RB-30`/`RB-32` 切默认前态）：确保对已有 `config.db` 的读与写均零破坏保持，两文件皆无时在 `LOCK_EX` 下创建 `config.db` + `config-format.json(backend="sqlite", finalized=true, legacy_sqlite_tombstone=false)`（绝不建 `config.redb`），且遇仅存 `config.redb` 或已定稿清单权威不匹配时 fail-closed 返回 `LBR-CLI-003`。
 
@@ -1719,17 +1719,17 @@
 | `RB-33` 切默认前双特性 `Sqlite` 运行时对 `config.db` 的读、写与首次新建必须零破坏 | `src/internal/config.rs:47-120`；`ADR-RB-02` #2 |
 
 **Acceptance criteria:**
-- [ ] 双特性构建 + `Sqlite` 运行时对已有 `config.db` 正常读取。
-- [ ] 双特性构建 + `Sqlite` 运行时对已有 `config.db` 正常写入（绝不创建 `config.redb`）。
-- [ ] 双特性构建 + `Sqlite` 运行时在两文件皆无时首次写入在 `LOCK_EX` 下创建 `config.db` 与 `config-format.json(backend="sqlite", finalized=true, legacy_sqlite_tombstone=false)`。
-- [ ] 双特性构建 + `Sqlite` 运行时遇仅存在 `config.redb`（无 `config.db`）时 fail-closed 报 `LBR-CLI-003`。
-- [ ] 当 `config-format.json(finalized = true)` 声明的权威后端与当前写运行时不匹配时，非权威写路径 fail-closed 报 `LBR-CLI-003`。
+- [x] 双特性构建 + `Sqlite` 运行时对已有 `config.db` 正常读取。
+- [x] 双特性构建 + `Sqlite` 运行时对已有 `config.db` 正常写入（绝不创建 `config.redb`）。
+- [x] 双特性构建 + `Sqlite` 运行时在两文件皆无时首次写入在 `LOCK_EX` 下创建 `config.db` 与 `config-format.json(backend="sqlite", finalized=true, legacy_sqlite_tombstone=false)`。
+- [x] 双特性构建 + `Sqlite` 运行时遇仅存在 `config.redb`（无 `config.db`）时 fail-closed 报 `LBR-CLI-003`。
+- [x] 当 `config-format.json(finalized = true)` 声明的权威后端与当前写运行时不匹配时，非权威写路径 fail-closed 报 `LBR-CLI-003`。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::config_store::tests::dual_feature_sqlite_runtime_config_dispatch_and_authority_guard)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::config_store::tests::dual_feature_sqlite_runtime_config_dispatch_and_authority_guard)'`（new，覆盖 AC1–AC5）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-sqlite --lib -E 'test(=storage::config_store::tests::dual_feature_sqlite_runtime_config_dispatch_and_authority_guard)'`（验证纯 SQLite 构建编译与回归通过，覆盖 AC1–AC3）
-- [ ] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 6 文件实现白名单。
+- [x] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::config_store::tests::dual_feature_sqlite_runtime_config_dispatch_and_authority_guard)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::config_store::tests::dual_feature_sqlite_runtime_config_dispatch_and_authority_guard)'`（new，覆盖 AC1–AC5）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-sqlite --lib -E 'test(=storage::config_store::tests::dual_feature_sqlite_runtime_config_dispatch_and_authority_guard)'`（验证纯 SQLite 构建编译与回归通过，覆盖 AC1–AC3）
+- [x] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 6 文件实现白名单。
 
 **Full-suite trigger:** `none`
 
@@ -10028,8 +10028,9 @@
 | `RB-03d` | `done` / `remote-verified` | `c52cff5`（`main`） | `0.30.310` | Step F1 非覆写 `hard_link` 墓碑预占、双重检查锁、异步取消持锁安全与 `GlobalConfig` 并发首写/旧二进制竞态实测；Codex R4 `VERDICT: PASS` |
 | `RB-03f` | `done` / `remote-verified` | `e5f2777`（`main`） | `0.30.311` | `SqliteConfigStore::create` 精确 `0600`/`0644` 权限与 `SystemConfig` `0444`/`0644` Step F1 预占/并发/旧二进制竞态实测；Codex R1 `VERDICT: PASS` |
 | `RB-03e` | `done` / `remote-verified` | `717364c`（`main`） | `0.30.312` | 4 步 `init_phase="fresh_create"` 状态机、Windows `sync_all` 恢复刷盘与 `GlobalConfig` 边界 1/2/3a/3b 崩溃恢复；Codex R1–R4 全部发现闭环 |
-| `RB-03i` | `done` / `remote-pending` | 本提交（`main`） | `0.30.313` | 2026-11-22 15:59 UTC：Stage 1 精确 1/6 文件写集 `src/storage/config_store.rs`，`system_config_fresh_create_crash_boundaries_1_2_3_and_modes` 在隔离 `LIBRA_CONFIG_SYSTEM_DB` + `umask(0o077)` 子进程实测 `SystemConfig` 边界 1/2/3a/3b 恢复、零覆写保留与严格 `0644`/`0444` 权限，fmt、严格 clippy、`compat_version_surface_sync` 与 Codex R1 `VERDICT: PASS` 全绿 |
-| `RB-03c`..`RB-34c`（剩余 137 卡） | `pending` | — | — | 按实施顺序于 `main` 逐卡推进 |
+| `RB-03i` | `done` / `remote-verified` | `14f3403`（`main`） | `0.30.313` | 2026-11-22 15:59 UTC：Stage 1 精确 1/6 文件写集 `src/storage/config_store.rs`，`system_config_fresh_create_crash_boundaries_1_2_3_and_modes` 在隔离 `LIBRA_CONFIG_SYSTEM_DB` + `umask(0o077)` 子进程实测 `SystemConfig` 边界 1/2/3a/3b 恢复、零覆写保留与严格 `0644`/`0444` 权限，fmt、严格 clippy、`compat_version_surface_sync` 与 Codex R1 `VERDICT: PASS` 全绿 |
+| `RB-03c` | `done` / `remote-pending` | 本提交（`main`） | `0.30.314` | 2026-11-22 16:31 UTC：Stage 1 精确 3/6 文件写集（`src/storage/{mod,config_store}.rs`、`src/storage/sqlite/config_store.rs`），落实 `ADR-RB-02` #2 分支 A 运行时感知只读分派 `open_locked_config_scope_for_read`、既有 `config.db` 写入清单自愈、`SqliteConfigStore::open_read_only` 的 pre-ledger 旧表容忍与 `inspect_configuration_schema` 未来版本 `LBR-CONFIG-001` 拒收；`dual_feature_sqlite_runtime_config_dispatch_and_authority_guard`（双特性 15/15 + 纯 `storage-sqlite` 零警告全绿）、纯 `storage-redb` 编译、fmt、严格 clippy、`compat_version_surface_sync` 与 Codex R3 `VERDICT: PASS` 全绿 |
+| `RB-03g`..`RB-34c`（剩余 136 卡） | `pending` | — | — | 按实施顺序于 `main` 逐卡推进 |
 
 ## Codex review log
 
