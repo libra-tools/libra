@@ -7392,3 +7392,126 @@ fn log_clear_decorations_and_initial_decoration_set() {
         "initialDecorationSet=all must show notes: {all_line}"
     );
 }
+
+#[test]
+fn log_colour_decorate_slots_match_git_bytes() {
+    use super::{assert_cli_success, run_libra_command};
+
+    // Commit C with HEAD -> main, an annotated tag v1 and origin/main, matching
+    // the fixture used to probe `git 2.56.0`.
+    let work = tempfile::tempdir().expect("work dir");
+    let bare = work.path().join("origin");
+    std::fs::create_dir_all(&bare).expect("mkdir bare");
+    assert_cli_success(&run_libra_command(&["init", "--bare"], &bare), "init bare");
+    let repo = work.path().join("r");
+    std::fs::create_dir_all(&repo).expect("mkdir repo");
+    assert_cli_success(&run_libra_command(&["init"], &repo), "init repo");
+    run_libra_command(&["config", "set", "user.name", "t"], &repo);
+    run_libra_command(&["config", "set", "user.email", "t@t"], &repo);
+    std::fs::write(repo.join("f.txt"), "a\n").expect("write f");
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], &repo), "stage");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c1", "--no-verify"], &repo),
+        "commit c1",
+    );
+    let oid = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], &repo).stdout)
+        .trim()
+        .to_string();
+    assert_cli_success(
+        &run_libra_command(&["tag", "-m", "v1", "v1"], &repo),
+        "tag v1",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &["remote", "add", "origin", bare.to_str().expect("bare")],
+            &repo,
+        ),
+        "add origin",
+    );
+    assert_cli_success(
+        &run_libra_command(&["push", "origin", "main"], &repo),
+        "push",
+    );
+    assert_cli_success(&run_libra_command(&["fetch", "origin"], &repo), "fetch");
+
+    let first_line = || {
+        let out = run_libra_command(&["log", "-1", "--decorate=short", "--color=always"], &repo);
+        assert_cli_success(&out, "log runs");
+        let text = String::from_utf8_lossy(&out.stdout).to_string();
+        text.lines().next().unwrap_or_default().to_string()
+    };
+    let expected = |commit_sgr: &str, head: &str, branch: &str, tag: &str, remote: &str| {
+        format!(
+            "\x1b[{commit_sgr}mcommit {oid}\x1b[m\x1b[{commit_sgr}m (\x1b[m\x1b[{head}mHEAD\x1b[m\x1b[{commit_sgr}m -> \x1b[m\x1b[{branch}mmain\x1b[m\x1b[{commit_sgr}m, \x1b[m\x1b[{tag}mtag: \x1b[m\x1b[{tag}mv1\x1b[m\x1b[{commit_sgr}m, \x1b[m\x1b[{remote}morigin/main\x1b[m\x1b[{commit_sgr}m)\x1b[m"
+        )
+    };
+
+    // Baseline: Git's default palette.
+    assert_eq!(
+        first_line(),
+        expected("33", "1;36", "1;32", "1;33", "1;31"),
+        "default palette"
+    );
+
+    let set = |key: &str, value: &str| {
+        assert_cli_success(
+            &run_libra_command(&["config", "set", key, value], &repo),
+            "config",
+        );
+    };
+    let unset = |key: &str| {
+        let _ = run_libra_command(&["config", "unset", key], &repo);
+    };
+
+    // AC1: color.decorate.branch=blue.
+    set("color.decorate.branch", "blue");
+    assert_eq!(
+        first_line(),
+        expected("33", "1;36", "34", "1;33", "1;31"),
+        "AC1"
+    );
+    unset("color.decorate.branch");
+
+    // AC2: color.decorate.remoteBranch=blue.
+    set("color.decorate.remoteBranch", "blue");
+    assert_eq!(
+        first_line(),
+        expected("33", "1;36", "1;32", "1;33", "34"),
+        "AC2"
+    );
+    unset("color.decorate.remoteBranch");
+
+    // AC3: color.decorate.tag=blue (prefix and name are separate segments).
+    set("color.decorate.tag", "blue");
+    assert_eq!(
+        first_line(),
+        expected("33", "1;36", "1;32", "34", "1;31"),
+        "AC3"
+    );
+    unset("color.decorate.tag");
+
+    // AC4: color.decorate.HEAD=blue.
+    set("color.decorate.HEAD", "blue");
+    assert_eq!(
+        first_line(),
+        expected("33", "34", "1;32", "1;33", "1;31"),
+        "AC4"
+    );
+    unset("color.decorate.HEAD");
+
+    // AC5: color.diff.commit=blue colours the commit line and separators.
+    set("color.diff.commit", "blue");
+    assert_eq!(
+        first_line(),
+        expected("34", "1;36", "1;32", "1;33", "1;31"),
+        "AC5"
+    );
+    // AC6: the legacy `diff.color.commit` spelling behaves identically.
+    unset("color.diff.commit");
+    set("diff.color.commit", "blue");
+    assert_eq!(
+        first_line(),
+        expected("34", "1;36", "1;32", "1;33", "1;31"),
+        "AC6"
+    );
+}

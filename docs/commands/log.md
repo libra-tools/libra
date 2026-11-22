@@ -421,6 +421,17 @@ Keep only the commits referenced by a (filtered) decoration plus the repository
 root(s), dropping the commits in between. `--decorate-refs`/`--decorate-refs-exclude`
 narrow which references count, so the simplification follows the filtered set.
 
+### Decoration colours
+
+`color.decorate.HEAD`, `color.decorate.branch`, `color.decorate.remoteBranch` and
+`color.decorate.tag` style each decoration slot, and `color.diff.commit` (legacy
+`diff.color.commit`) styles the `commit <id>` line together with the decoration
+parentheses and separators. Values are Git colour specs — a basic colour name
+(`black`…`white`), attributes such as `bold`/`dim`/`underline`, `#rrggbb`, `normal`,
+or a space-separated combination; unknown values leave the slot unstyled. The
+default palette matches Git (`commit` yellow, `HEAD` bold cyan, branches bold green,
+remote-tracking refs bold red, tags bold yellow).
+
 ### `--clear-decorations`
 
 Drop every earlier `--decorate-refs`/`--decorate-refs-exclude` and stop applying the

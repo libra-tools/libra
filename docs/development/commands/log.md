@@ -110,3 +110,5 @@ flowchart TD
 - 2026-11-21（LS-05 / #953）：新增 `--simplify-by-decoration`——保留经装饰过滤后的被引用提交与仓库根提交，其余丢弃；与本机 `git 2.56.0` 同夹具输出逐字一致（线性、分支、合并与 `--decorate-refs`/`--decorate-refs-exclude` 过滤）。回归：`command::log_test::simplify_by_decoration`。
 
 - 2026-11-21（LS-06 / #954）：新增 `--clear-decorations`（清除此前 `--decorate-refs*` 并放开默认命名空间过滤）与 `log.initialDecorationSet=all`；`refs/notes/*` 行按 notes 命名空间装饰（`notes/<name>`）且默认隐藏。回归：`command::log_test::log_clear_decorations_and_initial_decoration_set`。
+
+- 2026-11-21（LS-07 / #959）：装饰与 `commit <id>` 着色改为显式 SGR，读取 `color.decorate.{HEAD,branch,remoteBranch,tag}` 与 `color.diff.commit`（含旧名 `diff.color.commit`），默认调色板与 Git 实测一致；分隔符按 commit 色分段着色；`%d` 与 `%D` 分别使用带括号着色与纯文本形式。回归：`command::log_test::log_colour_decorate_slots_match_git_bytes`。

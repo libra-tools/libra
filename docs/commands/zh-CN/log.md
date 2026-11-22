@@ -319,6 +319,10 @@ libra log --decorate=full
 
 只保留被（过滤后的）装饰引用的提交与仓库根提交，丢弃中间提交；`--decorate-refs`/`--decorate-refs-exclude` 会收窄参与简化的引用集合。
 
+### 装饰颜色
+
+`color.decorate.HEAD`、`color.decorate.branch`、`color.decorate.remoteBranch`、`color.decorate.tag` 分别控制各装饰槽的着色，`color.diff.commit`（旧名 `diff.color.commit`）控制 `commit <id>` 行以及装饰括号与分隔符的颜色。取值遵循 Git 颜色语法：基本色名（`black`…`white`）、`bold`/`dim`/`underline` 等属性、`#rrggbb`、`normal`，或用空格组合；未知取值不着色。默认调色板与 Git 一致（`commit` 黄、`HEAD` 粗体青、分支粗体绿、远程跟踪引用粗体红、标签粗体黄）。
+
 ### `--clear-decorations`
 
 清除此前全部 `--decorate-refs`/`--decorate-refs-exclude` 并放开默认装饰命名空间（因此 `refs/notes/*` 装饰会出现）。`log.initialDecorationSet=all` 作为默认值具有相同的放开效果；其它取值被忽略。默认隐藏 `refs/notes/*`，因为 Git 的默认装饰命名空间只有 `HEAD`、`refs/heads/`、`refs/tags/`、`refs/remotes/` 与 `refs/stash`。
