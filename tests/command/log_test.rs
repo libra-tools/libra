@@ -8860,16 +8860,23 @@ fn log_cc_merge_combined_diff() {
         !combined.contains("diff --git "),
         "AC2 dense combined headers: {combined}"
     );
-    // AC1 (shape): one `@@@` hunk with a column per parent.
-    assert!(combined.contains("@@@ -"), "AC1 hunk header: {combined}");
-    assert!(
-        combined.contains("@@@ -1,"),
-        "AC1 parent columns: {combined}"
+    // AC1: the combined hunk matches Git's bytes for this conflict — one
+    // column per parent, both parents' replaced lines, then the resolution.
+    let expected = concat!(
+        "diff --cc c.txt\n",
+        "index ba2906d,2299c37..2ab19ae\n",
+        "--- a/c.txt\n",
+        "+++ b/c.txt\n",
+        "@@@ -1,1 -1,1 +1,1 @@@\n",
+        "- main\n",
+        " -side\n",
+        "++resolved\n",
     );
-    assert!(
-        combined.contains("+resolved"),
-        "AC1 resolution line: {combined}"
-    );
+    let combined_diff = combined
+        .split_once("diff --cc ")
+        .map(|(_, rest)| format!("diff --cc {rest}"))
+        .expect("combined diff body");
+    assert_eq!(combined_diff, expected, "AC1 dense combined bytes");
     // AC3: a non-merge commit keeps the ordinary patch bytes.
     let non_merge = out(&["log", "--cc", "-1", "HEAD~1"]);
     let plain = out(&["log", "-p", "-1", "HEAD~1"]);

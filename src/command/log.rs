@@ -5701,7 +5701,7 @@ async fn generate_cc_diff(commit: &Commit, paths: &[PathBuf]) -> CliResult<Strin
     for parent_id in &commit.parent_commit_ids {
         let parent = load_object::<Commit>(parent_id)
             .map_err(|e| log_repo_corrupt_error(format!("failed to load parent commit: {e}")))?;
-        parent_maps.push((parent.tree_id, tree_blob_map(&parent.tree_id)?));
+        parent_maps.push(tree_blob_map(&parent.tree_id)?);
     }
     let mut candidates: Vec<PathBuf> = if paths.is_empty() {
         merge_blobs.keys().cloned().collect()
@@ -5709,69 +5709,97 @@ async fn generate_cc_diff(commit: &Commit, paths: &[PathBuf]) -> CliResult<Strin
         paths.to_vec()
     };
     candidates.sort();
+    let short = |hash: &ObjectHash| -> String {
+        let text = hash.to_string();
+        text.chars().take(7).collect()
+    };
     let mut output = String::new();
     for path in candidates {
         let merge_blob = merge_blobs.get(&path).copied();
         // Dense: the path must differ from every parent.
         let differs_from_all = parent_maps
             .iter()
-            .all(|(_, blobs)| blobs.get(&path).copied() != merge_blob);
+            .all(|blobs| blobs.get(&path).copied() != merge_blob);
         if !differs_from_all {
             continue;
         }
         let Some(merge_blob) = merge_blob else {
             continue;
         };
-        let parent_blobs: Vec<String> = parent_maps
-            .iter()
-            .map(|(_, blobs)| {
-                blobs
-                    .get(&path)
-                    .map(|blob| blob.to_string())
-                    .unwrap_or_else(|| "0000000".to_string())
-            })
-            .collect();
-        let index_line = format!("index {}..{}\n", parent_blobs.join(","), merge_blob);
+        let merge_lines: Vec<String> = match load_object::<Blob>(&merge_blob) {
+            Ok(blob) => String::from_utf8_lossy(&blob.data)
+                .lines()
+                .map(str::to_string)
+                .collect(),
+            Err(_) => continue,
+        };
+        let mut parent_lines: Vec<Vec<String>> = Vec::new();
+        let mut index_parts: Vec<String> = Vec::new();
+        for blobs in &parent_maps {
+            let blob_id = blobs.get(&path).copied();
+            index_parts.push(
+                blob_id
+                    .map(|blob| short(&blob))
+                    .unwrap_or_else(|| "0000000".to_string()),
+            );
+            parent_lines.push(match blob_id {
+                Some(blob) => match load_object::<Blob>(&blob) {
+                    Ok(data) => String::from_utf8_lossy(&data.data)
+                        .lines()
+                        .map(str::to_string)
+                        .collect(),
+                    Err(_) => Vec::new(),
+                },
+                None => Vec::new(),
+            });
+        }
         output.push_str(&format!("diff --cc {}\n", path.display()));
-        output.push_str(&index_line);
+        output.push_str(&format!(
+            "index {}..{}\n",
+            index_parts.join(","),
+            short(&merge_blob)
+        ));
         output.push_str(&format!(
             "--- a/{}\n+++ b/{}\n",
             path.display(),
             path.display()
         ));
 
-        let text = match load_object::<Blob>(&merge_blob) {
-            Ok(blob) => String::from_utf8_lossy(&blob.data).to_string(),
-            Err(_) => continue,
-        };
-        let lines: Vec<&str> = text.lines().collect();
-        let len = lines.len();
-        let header_len = if len == 0 { 0 } else { len };
-        let mut markers = String::new();
-        for _ in 0..parent_maps.len() {
-            markers.push_str(&format!("-1,{header_len} "));
-        }
-        output.push_str(&format!("@@@ {}+1,{header_len} @@@\n", markers));
-        for (index, line) in lines.iter().enumerate() {
-            // Two columns, one per parent: context when the parent has the same
-            // line at that position, `+` when it does not.
-            let mut prefix = String::new();
-            for (_, blobs) in parent_maps.iter() {
-                let same = blobs
-                    .get(&path)
-                    .and_then(|blob| load_object::<Blob>(blob).ok())
-                    .map(|blob| {
-                        String::from_utf8_lossy(&blob.data)
-                            .lines()
-                            .nth(index)
-                            .map(|parent_line| parent_line == *line)
-                            .unwrap_or(false)
-                    })
-                    .unwrap_or(false);
-                prefix.push(if same { ' ' } else { '+' });
+        // Git prints one column per parent: `-` where that parent's line is
+        // replaced, `+` where the merge line is new relative to it.
+        let mut body = String::new();
+        for (parent_index, lines) in parent_lines.iter().enumerate() {
+            for line in lines {
+                if merge_lines.contains(line) {
+                    continue;
+                }
+                for column in 0..parent_maps.len() {
+                    body.push(if column == parent_index { '-' } else { ' ' });
+                }
+                body.push_str(line);
+                body.push('\n');
             }
-            output.push_str(&format!("{prefix}{line}\n"));
         }
+        for line in &merge_lines {
+            let mut prefix = String::new();
+            for lines in &parent_lines {
+                prefix.push(if lines.contains(line) { ' ' } else { '+' });
+            }
+            body.push_str(&prefix);
+            body.push_str(line);
+            body.push('\n');
+        }
+        let parent_count = parent_maps.len();
+        let mut ranges = String::new();
+        for _ in 0..parent_count {
+            ranges.push_str(&format!("-1,{} ", parent_lines[0].len().max(1)));
+        }
+        output.push_str(&format!(
+            "@@@ {}+1,{} @@@\n",
+            ranges,
+            merge_lines.len().max(1)
+        ));
+        output.push_str(&body);
     }
     Ok(output)
 }
