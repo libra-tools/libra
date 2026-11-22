@@ -8447,3 +8447,67 @@ fn line_history_function_name_ranges() {
     let stderr = String::from_utf8_lossy(&missing.stderr);
     assert!(stderr.contains("cannot find function"), "stderr: {stderr}");
 }
+
+#[test]
+fn line_history_maps_range_through_parents() {
+    use super::{assert_cli_success, run_libra_command};
+
+    // An insertion above the tracked function must not hide the earlier
+    // commits: the range is mapped back to each parent's line numbers.
+    let work = tempfile::tempdir().expect("work dir");
+    let repo = work.path().join("r");
+    std::fs::create_dir_all(&repo).expect("mkdir repo");
+    assert_cli_success(&run_libra_command(&["init"], &repo), "init");
+    run_libra_command(&["config", "set", "user.name", "t"], &repo);
+    run_libra_command(&["config", "set", "user.email", "t@t"], &repo);
+    let base = "a\nb\nc\nfn alpha() {\n  one();\n}\n\nfn beta() {\n  two();\n}\n";
+    std::fs::write(repo.join("f.rs"), base).expect("write base");
+    assert_cli_success(&run_libra_command(&["add", "f.rs"], &repo), "add base");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c1", "--no-verify"], &repo),
+        "commit c1",
+    );
+    let c1 = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], &repo).stdout)
+        .trim()
+        .to_string();
+    let inserted = base.replace("c\n", "NEW1\nNEW2\nc\n");
+    std::fs::write(repo.join("f.rs"), &inserted).expect("write insert");
+    assert_cli_success(&run_libra_command(&["add", "f.rs"], &repo), "add insert");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c2-insert", "--no-verify"], &repo),
+        "commit c2",
+    );
+    let c2 = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], &repo).stdout)
+        .trim()
+        .to_string();
+    std::fs::write(
+        repo.join("f.rs"),
+        inserted.replace("  two();", "  three();"),
+    )
+    .expect("write edit");
+    assert_cli_success(&run_libra_command(&["add", "f.rs"], &repo), "add edit");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c3-edit", "--no-verify"], &repo),
+        "commit c3",
+    );
+    let c3 = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], &repo).stdout)
+        .trim()
+        .to_string();
+
+    let out = run_libra_command(&["log", "-L", ":beta:f.rs", "--oneline"], &repo);
+    assert_cli_success(&out, "log -L :beta:");
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let commits: Vec<&str> = stdout
+        .lines()
+        .filter(|line| {
+            line.len() > 8
+                && line.as_bytes().get(7) == Some(&b' ')
+                && line[..7].chars().all(|ch| ch.is_ascii_hexdigit())
+        })
+        .map(|line| &line[..7])
+        .collect();
+    // Same set as `git log -L :beta:f.rs`: the edit and the file creation, not
+    // the unrelated insertion above the function.
+    assert_eq!(commits, vec![&c3[..7], &c1[..7]], "commit set: {stdout}");
+    assert!(!stdout.contains(&c2[..7]), "insertion excluded: {stdout}");
+}

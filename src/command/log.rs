@@ -2481,7 +2481,7 @@ async fn apply_follow_and_line_filters(
 ) -> Result<Vec<TraversedLogCommit>, CliError> {
     let mut result = Vec::new();
     let mut current_path = follow.clone();
-    let ranges: Vec<LineRange> = resolve_line_ranges(line_ranges)?;
+    let mut ranges: Vec<LineRange> = resolve_line_ranges(line_ranges)?;
 
     for commit in commits {
         let (path_to_check, follow_paths) = if let Some(path) = &current_path {
@@ -2510,6 +2510,10 @@ async fn apply_follow_and_line_filters(
             if !commit_affects_line_range(&commit, &path, &ranges).await? {
                 continue;
             }
+            // Walking newest → oldest: shift the tracked range back over each
+            // hunk that sits entirely before it, so earlier commits are judged
+            // against the line numbers they actually had.
+            ranges = remap_ranges_to_parent(&commit, ranges, &path).await?;
         }
 
         result.push(TraversedLogCommit {
@@ -2647,6 +2651,66 @@ fn patch_changed_lines(patch: &str) -> Vec<usize> {
         }
     }
     changed
+}
+
+/// `(new_start, new_len, old_len)` for every hunk of `patch`, used to map a
+/// tracked line range back to the parent commit.
+fn patch_hunk_spans(patch: &str) -> Vec<(usize, usize, usize)> {
+    let mut spans = Vec::new();
+    for line in patch.lines() {
+        let Some(rest) = line.strip_prefix("@@ -") else {
+            continue;
+        };
+        let Some((old, new)) = rest.split_once(" +") else {
+            continue;
+        };
+        let new = new.split(" @@").next().unwrap_or(new);
+        let parse = |text: &str, default: usize| -> (usize, usize) {
+            match text.split_once(',') {
+                Some((start, len)) => (
+                    start.parse().unwrap_or(default),
+                    len.parse().unwrap_or(default),
+                ),
+                None => (text.parse().unwrap_or(default), default),
+            }
+        };
+        let (old_start, old_len) = parse(old, 1);
+        let (new_start, new_len) = parse(new, 1);
+        let _ = old_start;
+        spans.push((new_start, new_len, old_len));
+    }
+    spans
+}
+
+/// Shift `ranges` back to the parent's line numbering.
+async fn remap_ranges_to_parent(
+    commit: &Commit,
+    ranges: Vec<LineRange>,
+    path: &PathBuf,
+) -> Result<Vec<LineRange>, CliError> {
+    let patch = generate_diff(commit, vec![path.clone()]).await?;
+    if patch.is_empty() {
+        return Ok(ranges);
+    }
+    let spans = patch_hunk_spans(&patch);
+    let mut remapped = ranges;
+    for range in &mut remapped {
+        if &range.file != path {
+            continue;
+        }
+        for (new_start, new_len, old_len) in &spans {
+            let new_end = new_start + new_len.saturating_sub(1);
+            if *new_start > range.start {
+                continue;
+            }
+            let shift = *old_len as isize - *new_len as isize;
+            if new_end < range.start {
+                range.start = (range.start as isize + shift).max(1) as usize;
+                range.end = (range.end as isize + shift).max(1) as usize;
+            }
+        }
+    }
+    Ok(remapped)
 }
 
 /// Whether `commit` changes any tracked line of `path` (`-L start,end:file`).
