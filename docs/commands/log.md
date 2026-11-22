@@ -317,7 +317,9 @@ libra log -z --name-status --format=%s
 ### `--stat`
 
 Show diffstat (file change statistics) for each commit, showing insertions and deletions
-per file.
+per file. The change column is padded to the widest count in the block and the
+summary line omits the insertion/deletion clauses that are zero, so the bytes match
+`git log --stat`.
 
 ### `--shortstat`
 

@@ -243,7 +243,7 @@ libra log -z --name-status --format=%s
 
 ### `--stat`
 
-显示每个提交的 diffstat（文件变更统计），展示每个文件的插入和删除。
+显示每个提交的 diffstat（文件变更统计），展示每个文件的插入和删除。变更列宽按本块最宽计数对齐，汇总行省略为零的插入/删除子句，因此字节与 `git log --stat` 一致。
 
 ### `--shortstat`
 
