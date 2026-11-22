@@ -29,8 +29,8 @@ use crate::{
         codec::{decode_versioned, encode_versioned},
         config_store::{
             ConfigEntry, ConfigStore, LegacyConfigEntry, MetadataCasOutcome, MetadataEntryRecord,
-            MetadataStore, SchemaVersionReceipt, key_in_section, validate_config_role,
-            validate_metadata_role, validate_section_name,
+            MetadataStore, SchemaVersionReceipt, config_redb_path_in_scope_dir, key_in_section,
+            validate_config_role, validate_metadata_role, validate_section_name,
         },
         error::{StorageBackendError, StorageResult},
         meta::{begin_checked_read, begin_checked_write_blocking, init_meta_schema},
@@ -1036,6 +1036,31 @@ impl RedbConfigStore {
         Self::create_inner(path.as_ref(), role, || Ok(()), |_| {})
     }
 
+    /// Create a brand-new `config.redb` inside an existing `GlobalConfig` or
+    /// `SystemConfig` scope directory with exact role permissions (`0600` for
+    /// `GlobalConfig`, `0644` for `SystemConfig` on Unix; protected role ACL on
+    /// Windows) (`GC-13`, `RB-03j`).
+    ///
+    /// Rejects non-scope roles (`Repository`, `Capture`, `Derived`) so
+    /// repository mutations can never target global or system configuration
+    /// directories.
+    pub fn create_in_scope_dir(
+        scope_dir: impl AsRef<Path>,
+        role: DatabaseRole,
+    ) -> StorageResult<Self> {
+        if !matches!(
+            role,
+            DatabaseRole::GlobalConfig | DatabaseRole::SystemConfig
+        ) {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "{role} role cannot create a scoped config.redb (expected GlobalConfig or SystemConfig)"
+                ),
+            });
+        }
+        Self::create(config_redb_path_in_scope_dir(scope_dir.as_ref()), role)
+    }
+
     #[cfg(test)]
     pub(crate) fn create_with_test_hooks<F1, F2>(
         path: impl AsRef<Path>,
@@ -1081,13 +1106,10 @@ impl RedbConfigStore {
 
         let (parent_dir_fd, parent_id) = unix_create::open_parent_dir(parent)?;
         unix_create::ensure_target_absent(&parent_dir_fd, &target_cname)?;
-        let target_mode = match role {
-            DatabaseRole::SystemConfig => 0o644,
-            DatabaseRole::Repository
-            | DatabaseRole::GlobalConfig
-            | DatabaseRole::Capture
-            | DatabaseRole::Derived => 0o600,
-        };
+        let target_mode = crate::storage::config_store::expected_config_file_mode(role)
+            .ok_or_else(|| StorageBackendError::BackendInternal {
+                detail: format!("{role} database role has no defined config store file mode"),
+            })?;
         let (anon_file, expected_id) =
             unix_create::create_anonymous_staged_file(&parent_dir_fd, file_name, target_mode)?;
         let raw_fd = anon_file.as_raw_fd();
@@ -1160,13 +1182,10 @@ impl RedbConfigStore {
 
         let (parent_dir_fd, parent_id) = unix_create::open_parent_dir(parent)?;
         unix_create::ensure_target_absent(&parent_dir_fd, &target_cname)?;
-        let target_mode = match role {
-            DatabaseRole::SystemConfig => 0o644,
-            DatabaseRole::Repository
-            | DatabaseRole::GlobalConfig
-            | DatabaseRole::Capture
-            | DatabaseRole::Derived => 0o600,
-        };
+        let target_mode = crate::storage::config_store::expected_config_file_mode(role)
+            .ok_or_else(|| StorageBackendError::BackendInternal {
+                detail: format!("{role} database role has no defined config store file mode"),
+            })?;
         let (anon_file, _anon_id) =
             unix_create::create_anonymous_staged_file(&parent_dir_fd, file_name, target_mode)?;
         let raw_fd = anon_file.as_raw_fd();

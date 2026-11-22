@@ -5,6 +5,8 @@
 //! `config`, `config_kv`, `metadata_kv`) and the 3 configuration-database
 //! source tables (`config`, `config_kv`, `configuration_schema_versions`).
 
+use std::path::{Path, PathBuf};
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
@@ -15,6 +17,67 @@ use crate::{
         error::{StorageBackendError, StorageResult},
     },
 };
+
+/// Environment variable overriding the global configuration database path (`GC-13`).
+pub const LIBRA_CONFIG_GLOBAL_DB_ENV: &str = "LIBRA_CONFIG_GLOBAL_DB";
+
+/// Environment variable overriding the system configuration database path (`GC-13`).
+pub const LIBRA_CONFIG_SYSTEM_DB_ENV: &str = "LIBRA_CONFIG_SYSTEM_DB";
+
+/// Canonical `redb` configuration filename inside a `GlobalConfig` or `SystemConfig` directory.
+pub const CONFIG_REDB_FILE_NAME: &str = "config.redb";
+
+/// Canonical SQLite configuration filename inside a `GlobalConfig` or `SystemConfig` directory.
+pub const CONFIG_SQLITE_FILE_NAME: &str = "config.db";
+
+/// Required Unix permission mode for repository `redb` configuration/git stores (`0600`).
+#[cfg(unix)]
+pub const REPOSITORY_CONFIG_FILE_MODE: u32 = 0o600;
+
+/// Required Unix permission mode for `GlobalConfig` `config.redb` (`0600`, private to owner).
+#[cfg(unix)]
+pub const GLOBAL_CONFIG_FILE_MODE: u32 = 0o600;
+
+/// Required Unix permission mode for `SystemConfig` `config.redb` (`0644`, world-readable).
+#[cfg(unix)]
+pub const SYSTEM_CONFIG_FILE_MODE: u32 = 0o644;
+
+/// Return the exact Unix POSIX mode bits required for a configuration-bearing
+/// [`DatabaseRole`], or `None` for non-config roles (`GC-13`, `RB-03j`).
+#[cfg(unix)]
+#[must_use]
+pub const fn expected_config_file_mode(role: DatabaseRole) -> Option<u32> {
+    match role {
+        DatabaseRole::Repository => Some(REPOSITORY_CONFIG_FILE_MODE),
+        DatabaseRole::GlobalConfig => Some(GLOBAL_CONFIG_FILE_MODE),
+        DatabaseRole::SystemConfig => Some(SYSTEM_CONFIG_FILE_MODE),
+        DatabaseRole::Capture | DatabaseRole::Derived => None,
+    }
+}
+
+/// Extract the parent scope directory from a global/system configuration DB
+/// path (such as `LIBRA_CONFIG_GLOBAL_DB` or `LIBRA_CONFIG_SYSTEM_DB`).
+pub fn config_scope_dir_from_db_path(db_path: &Path) -> StorageResult<PathBuf> {
+    let parent = db_path
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .ok_or_else(|| StorageBackendError::BackendInternal {
+            detail: "configuration database path must include a parent scope directory".to_string(),
+        })?;
+    Ok(parent.to_path_buf())
+}
+
+/// Return `<scope_dir>/config.redb`.
+#[must_use]
+pub fn config_redb_path_in_scope_dir(scope_dir: &Path) -> PathBuf {
+    scope_dir.join(CONFIG_REDB_FILE_NAME)
+}
+
+/// Return `<scope_dir>/config.db`.
+#[must_use]
+pub fn config_sqlite_path_in_scope_dir(scope_dir: &Path) -> PathBuf {
+    scope_dir.join(CONFIG_SQLITE_FILE_NAME)
+}
 
 /// One flat configuration entry stored in `config_kv`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2864,5 +2927,470 @@ mod tests {
                 .all(|e| e.key.starts_with(&expected_prefix)),
             "final entries must all be at generation {WRITER_ROUNDS}: {final_entries:?}"
         );
+    }
+
+    #[cfg(feature = "storage-redb")]
+    #[tokio::test]
+    async fn redb_config_gc13_repo_isolation_and_scope_file_modes() {
+        use std::{
+            env, fs,
+            path::PathBuf,
+            process::{Command, Stdio},
+        };
+
+        use tempfile::tempdir;
+
+        use crate::storage::redb::RedbConfigStore;
+
+        // Isolated child mode so `LIBRA_CONFIG_GLOBAL_DB`, `LIBRA_CONFIG_SYSTEM_DB`,
+        // and Unix `umask` mutations never affect parallel tests in the parent process.
+        if let Some(child_mode) = env::var_os("LIBRA_RB03J_CHILD_MODE") {
+            let mode_str = child_mode.to_string_lossy();
+            match mode_str.as_ref() {
+                "repo_isolation" => {
+                    let repo_db = PathBuf::from(
+                        env::var_os("LIBRA_RB03J_REPO_DB").expect("repo db path env"),
+                    );
+                    let store = RedbConfigStore::create(&repo_db, DatabaseRole::Repository)
+                        .expect("create Repository RedbConfigStore");
+                    store
+                        .set("user.name", "Repo Isolated User", false)
+                        .await
+                        .expect("set repo user.name");
+                    store
+                        .set("user.global", "repo-must-not-touch-global", false)
+                        .await
+                        .expect("set repo user.global");
+                    store
+                        .set("core.system", "repo-must-not-touch-system", false)
+                        .await
+                        .expect("set repo core.system");
+                    store
+                        .add(
+                            "remote.origin.fetch",
+                            "+refs/heads/*:refs/remotes/origin/*",
+                            false,
+                        )
+                        .await
+                        .expect("add repo fetch");
+                    store
+                        .rename_section("remote.origin", "remote.upstream")
+                        .await
+                        .expect("rename repo section");
+                    store
+                        .remove_section("remote.upstream")
+                        .await
+                        .expect("remove repo section");
+                    store
+                        .insert_legacy_entry(&LegacyConfigEntry {
+                            configuration: "core".to_string(),
+                            name: None,
+                            key: "bare".to_string(),
+                            value: "false".to_string(),
+                        })
+                        .await
+                        .expect("insert repo legacy entry");
+                    store
+                        .record_schema_receipt(&SchemaVersionReceipt {
+                            version: 99,
+                            name: "rb03j_isolation_receipt".to_string(),
+                            applied_at: "2026-11-22T00:00:00Z".to_string(),
+                        })
+                        .await
+                        .expect("record repo receipt");
+                    store
+                        .set_metadata("branch", "main", "note", "repo-only", "text")
+                        .await
+                        .expect("set repo metadata");
+                    let cas = store
+                        .cas_metadata(
+                            "branch",
+                            "main",
+                            "note",
+                            Some("repo-only"),
+                            Some(("repo-only-v2", "text")),
+                        )
+                        .await
+                        .expect("cas repo metadata");
+                    assert!(matches!(cas, MetadataCasOutcome::Swapped { .. }));
+                    println!("RB03J_CHILD_OK:repo_isolation");
+                    return;
+                }
+                "global_mode_permissive_umask" => {
+                    #[cfg(unix)]
+                    // SAFETY: Single-threaded isolated child process; setting permissive umask
+                    // proves `GlobalConfig` enforces `0600` explicitly rather than via umask.
+                    unsafe {
+                        libc::umask(0o000);
+                    }
+                    let global_db_env = PathBuf::from(
+                        env::var_os(LIBRA_CONFIG_GLOBAL_DB_ENV).expect("global db env"),
+                    );
+                    let scope_dir = config_scope_dir_from_db_path(&global_db_env)
+                        .expect("resolve global scope dir");
+                    let store = RedbConfigStore::create_in_scope_dir(
+                        &scope_dir,
+                        DatabaseRole::GlobalConfig,
+                    )
+                    .expect("create GlobalConfig RedbConfigStore in empty scope dir");
+                    assert_eq!(store.role(), DatabaseRole::GlobalConfig);
+                    store
+                        .set("user.email", "global@example.com", false)
+                        .await
+                        .expect("write global config key");
+                    store
+                        .add("alias.st", "status", false)
+                        .await
+                        .expect("add global alias");
+                    // GlobalConfig must reject Repository-only `metadata_kv` mutations (`GC-13`).
+                    let meta_err = store
+                        .set_metadata("branch", "main", "k", "v", "text")
+                        .await
+                        .expect_err("GlobalConfig must reject metadata_kv writes");
+                    assert!(matches!(
+                        meta_err,
+                        StorageBackendError::RoleMismatch {
+                            expected: DatabaseRole::Repository,
+                            found: DatabaseRole::GlobalConfig,
+                        }
+                    ));
+                    println!("RB03J_CHILD_OK:global_mode_permissive_umask");
+                    return;
+                }
+                "system_mode_restrictive_umask" => {
+                    #[cfg(unix)]
+                    // SAFETY: Single-threaded isolated child process; setting restrictive umask
+                    // `0o077` proves `SystemConfig` enforces exact `0644` explicitly despite umask.
+                    unsafe {
+                        libc::umask(0o077);
+                    }
+                    let system_db_env = PathBuf::from(
+                        env::var_os(LIBRA_CONFIG_SYSTEM_DB_ENV).expect("system db env"),
+                    );
+                    let scope_dir = config_scope_dir_from_db_path(&system_db_env)
+                        .expect("resolve system scope dir");
+                    let store = RedbConfigStore::create_in_scope_dir(
+                        &scope_dir,
+                        DatabaseRole::SystemConfig,
+                    )
+                    .expect("create SystemConfig RedbConfigStore in empty scope dir");
+                    assert_eq!(store.role(), DatabaseRole::SystemConfig);
+                    store
+                        .set("core.editor", "vim", false)
+                        .await
+                        .expect("write system config key");
+                    store
+                        .add("http.extraHeader", "X-Test: 1", false)
+                        .await
+                        .expect("add system multi-value key");
+                    // SystemConfig must reject Repository-only `metadata_kv` mutations (`GC-13`).
+                    let meta_err = store
+                        .set_metadata("branch", "main", "k", "v", "text")
+                        .await
+                        .expect_err("SystemConfig must reject metadata_kv writes");
+                    assert!(matches!(
+                        meta_err,
+                        StorageBackendError::RoleMismatch {
+                            expected: DatabaseRole::Repository,
+                            found: DatabaseRole::SystemConfig,
+                        }
+                    ));
+                    println!("RB03J_CHILD_OK:system_mode_restrictive_umask");
+                    return;
+                }
+                other => panic!("unexpected LIBRA_RB03J_CHILD_MODE: {other}"),
+            }
+        }
+
+        let exe = env::current_exe().expect("locate current test executable");
+        let run_child = |mode: &str, envs: &[(&str, PathBuf)]| {
+            let mut cmd = Command::new(&exe);
+            cmd.arg("--exact")
+                .arg("storage::config_store::tests::redb_config_gc13_repo_isolation_and_scope_file_modes")
+                .arg("--nocapture")
+                .env("LIBRA_RB03J_CHILD_MODE", mode)
+                .env("LIBRA_TEST", "1")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            for (k, v) in envs {
+                cmd.env(k, v);
+            }
+            let output = cmd.output().expect("spawn RB-03j child");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let sentinel = format!("RB03J_CHILD_OK:{mode}");
+            assert!(
+                output.status.success()
+                    && stdout.contains(&sentinel)
+                    && stdout.contains("1 passed; 0 failed"),
+                "RB-03j child `{mode}` failed (status={:?}):\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                output.status
+            );
+        };
+
+        let root = tempdir().expect("create RB-03j temp root");
+
+        // -----------------------------------------------------------------
+        // AC1 & AC2 (Part A): Absent `LIBRA_CONFIG_GLOBAL_DB` and
+        // `LIBRA_CONFIG_SYSTEM_DB` fixtures must NEVER be created when a
+        // `Repository` `RedbConfigStore` is created and written to.
+        // -----------------------------------------------------------------
+        let repo_a_dir = root.path().join("repo-a");
+        fs::create_dir_all(&repo_a_dir).expect("create repo-a dir");
+        let repo_a_db = repo_a_dir.join("git.gen-00000001.redb");
+        let absent_global_dir = root.path().join("absent-global");
+        let absent_global_db = absent_global_dir.join(CONFIG_SQLITE_FILE_NAME);
+        let absent_system_dir = root.path().join("absent-system");
+        let absent_system_db = absent_system_dir.join(CONFIG_SQLITE_FILE_NAME);
+
+        run_child(
+            "repo_isolation",
+            &[
+                ("LIBRA_RB03J_REPO_DB", repo_a_db.clone()),
+                (LIBRA_CONFIG_GLOBAL_DB_ENV, absent_global_db.clone()),
+                (LIBRA_CONFIG_SYSTEM_DB_ENV, absent_system_db.clone()),
+            ],
+        );
+
+        assert!(
+            !absent_global_dir.exists() && !absent_global_db.exists(),
+            "GC-13 violation: Repository write created absent LIBRA_CONFIG_GLOBAL_DB fixture"
+        );
+        assert!(
+            !absent_system_dir.exists() && !absent_system_db.exists(),
+            "GC-13 violation: Repository write created absent LIBRA_CONFIG_SYSTEM_DB fixture"
+        );
+        assert!(
+            !config_redb_path_in_scope_dir(&absent_global_dir).exists()
+                && !config_redb_path_in_scope_dir(&absent_system_dir).exists(),
+            "GC-13 violation: Repository write created config.redb in absent global/system scope"
+        );
+
+        // Verify `create_in_scope_dir` refuses `DatabaseRole::Repository`.
+        let bad_scope_err =
+            RedbConfigStore::create_in_scope_dir(&repo_a_dir, DatabaseRole::Repository)
+                .expect_err("create_in_scope_dir must reject DatabaseRole::Repository");
+        assert_eq!(bad_scope_err.stable_code_str(), "LBR-IO-001");
+
+        // -----------------------------------------------------------------
+        // AC3 & AC4: Empty `GlobalConfig` scope dir creates exact `0600`
+        // `config.redb` (even under permissive `umask(0o000)`), and empty
+        // `SystemConfig` scope dir creates exact `0644` `config.redb` (even
+        // under restrictive `umask(0o077)`).
+        // -----------------------------------------------------------------
+        let global_scope_dir = root.path().join("empty-global-scope");
+        let system_scope_dir = root.path().join("empty-system-scope");
+        fs::create_dir_all(&global_scope_dir).expect("create empty global scope dir");
+        fs::create_dir_all(&system_scope_dir).expect("create empty system scope dir");
+
+        let global_env_db = config_sqlite_path_in_scope_dir(&global_scope_dir);
+        let system_env_db = config_sqlite_path_in_scope_dir(&system_scope_dir);
+        let global_redb = config_redb_path_in_scope_dir(&global_scope_dir);
+        let system_redb = config_redb_path_in_scope_dir(&system_scope_dir);
+
+        run_child(
+            "global_mode_permissive_umask",
+            &[(LIBRA_CONFIG_GLOBAL_DB_ENV, global_env_db.clone())],
+        );
+        run_child(
+            "system_mode_restrictive_umask",
+            &[(LIBRA_CONFIG_SYSTEM_DB_ENV, system_env_db.clone())],
+        );
+
+        assert!(
+            global_redb.is_file(),
+            "GlobalConfig config.redb must be created in empty scope dir"
+        );
+        assert!(
+            system_redb.is_file(),
+            "SystemConfig config.redb must be created in empty scope dir"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let global_mode = fs::symlink_metadata(&global_redb)
+                .expect("stat GlobalConfig config.redb")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                global_mode, GLOBAL_CONFIG_FILE_MODE,
+                "GlobalConfig config.redb must have exact 0600 permissions, got {global_mode:04o}"
+            );
+
+            let system_mode = fs::symlink_metadata(&system_redb)
+                .expect("stat SystemConfig config.redb")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                system_mode, SYSTEM_CONFIG_FILE_MODE,
+                "SystemConfig config.redb must have exact 0644 permissions, got {system_mode:04o}"
+            );
+
+            let repo_mode = fs::symlink_metadata(&repo_a_db)
+                .expect("stat Repository redb store")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                repo_mode, REPOSITORY_CONFIG_FILE_MODE,
+                "Repository redb store must have exact 0600 permissions, got {repo_mode:04o}"
+            );
+
+            assert_eq!(
+                expected_config_file_mode(DatabaseRole::Repository),
+                Some(0o600)
+            );
+            assert_eq!(
+                expected_config_file_mode(DatabaseRole::GlobalConfig),
+                Some(0o600)
+            );
+            assert_eq!(
+                expected_config_file_mode(DatabaseRole::SystemConfig),
+                Some(0o644)
+            );
+            assert_eq!(expected_config_file_mode(DatabaseRole::Capture), None);
+            assert_eq!(expected_config_file_mode(DatabaseRole::Derived), None);
+        }
+
+        // Verify persisted values and cross-role rejection on GlobalConfig and SystemConfig.
+        let global_ro = RedbConfigStore::open_read_only(&global_redb, DatabaseRole::GlobalConfig)
+            .expect("open GlobalConfig read-only");
+        assert_eq!(
+            global_ro.get("user.email").await.expect("read global key"),
+            Some(ConfigEntry {
+                key: "user.email".to_string(),
+                value: "global@example.com".to_string(),
+                encrypted: false,
+            })
+        );
+        let wrong_global_role =
+            RedbConfigStore::open_read_only(&global_redb, DatabaseRole::Repository)
+                .expect_err("opening GlobalConfig store as Repository must fail closed");
+        assert!(matches!(
+            wrong_global_role,
+            StorageBackendError::RoleMismatch {
+                expected: DatabaseRole::Repository,
+                found: DatabaseRole::GlobalConfig,
+            }
+        ));
+        drop(global_ro);
+
+        let system_ro = RedbConfigStore::open_read_only(&system_redb, DatabaseRole::SystemConfig)
+            .expect("open SystemConfig read-only");
+        assert_eq!(
+            system_ro.get("core.editor").await.expect("read system key"),
+            Some(ConfigEntry {
+                key: "core.editor".to_string(),
+                value: "vim".to_string(),
+                encrypted: false,
+            })
+        );
+        let wrong_system_role =
+            RedbConfigStore::open_read_only(&system_redb, DatabaseRole::GlobalConfig)
+                .expect_err("opening SystemConfig store as GlobalConfig must fail closed");
+        assert!(matches!(
+            wrong_system_role,
+            StorageBackendError::RoleMismatch {
+                expected: DatabaseRole::GlobalConfig,
+                found: DatabaseRole::SystemConfig,
+            }
+        ));
+        drop(system_ro);
+
+        // -----------------------------------------------------------------
+        // AC1 & AC2 (Part B): Pre-existing populated `LIBRA_CONFIG_GLOBAL_DB`
+        // and `LIBRA_CONFIG_SYSTEM_DB` fixtures (both `config.db` and
+        // `config.redb`) must remain byte-for-byte untouched after full
+        // `Repository` `RedbConfigStore` creation and mutations.
+        // -----------------------------------------------------------------
+        fs::write(&global_env_db, b"PREEXISTING_GLOBAL_SQLITE_FIXTURE\n")
+            .expect("seed preexisting global config.db fixture");
+        fs::write(&system_env_db, b"PREEXISTING_SYSTEM_SQLITE_FIXTURE\n")
+            .expect("seed preexisting system config.db fixture");
+
+        let global_db_before = fs::read(&global_env_db).expect("read global config.db before");
+        let global_redb_before = fs::read(&global_redb).expect("read global config.redb before");
+        let system_db_before = fs::read(&system_env_db).expect("read system config.db before");
+        let system_redb_before = fs::read(&system_redb).expect("read system config.redb before");
+
+        let repo_b_dir = root.path().join("repo-b");
+        fs::create_dir_all(&repo_b_dir).expect("create repo-b dir");
+        let repo_b_db = repo_b_dir.join("git.gen-00000001.redb");
+
+        run_child(
+            "repo_isolation",
+            &[
+                ("LIBRA_RB03J_REPO_DB", repo_b_db.clone()),
+                (LIBRA_CONFIG_GLOBAL_DB_ENV, global_env_db.clone()),
+                (LIBRA_CONFIG_SYSTEM_DB_ENV, system_env_db.clone()),
+            ],
+        );
+
+        assert_eq!(
+            fs::read(&global_env_db).expect("read global config.db after"),
+            global_db_before,
+            "GC-13 violation: Repository write modified preexisting LIBRA_CONFIG_GLOBAL_DB"
+        );
+        assert_eq!(
+            fs::read(&global_redb).expect("read global config.redb after"),
+            global_redb_before,
+            "GC-13 violation: Repository write modified preexisting GlobalConfig config.redb"
+        );
+        assert_eq!(
+            fs::read(&system_env_db).expect("read system config.db after"),
+            system_db_before,
+            "GC-13 violation: Repository write modified preexisting LIBRA_CONFIG_SYSTEM_DB"
+        );
+        assert_eq!(
+            fs::read(&system_redb).expect("read system config.redb after"),
+            system_redb_before,
+            "GC-13 violation: Repository write modified preexisting SystemConfig config.redb"
+        );
+
+        // Confirm subsequent writable reopen & mutation on GlobalConfig and SystemConfig
+        // preserves exact `0600` / `0644` modes on Unix.
+        let global_rw = RedbConfigStore::open_read_write(&global_redb, DatabaseRole::GlobalConfig)
+            .expect("reopen GlobalConfig rw");
+        global_rw
+            .set("user.name", "Global Mutated", false)
+            .await
+            .expect("mutate GlobalConfig");
+        drop(global_rw);
+
+        let system_rw = RedbConfigStore::open_read_write(&system_redb, DatabaseRole::SystemConfig)
+            .expect("reopen SystemConfig rw");
+        system_rw
+            .set("core.pager", "less", false)
+            .await
+            .expect("mutate SystemConfig");
+        drop(system_rw);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            assert_eq!(
+                fs::symlink_metadata(&global_redb)
+                    .expect("stat GlobalConfig after reopen write")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                GLOBAL_CONFIG_FILE_MODE,
+                "GlobalConfig config.redb must retain exact 0600 mode after writes"
+            );
+            assert_eq!(
+                fs::symlink_metadata(&system_redb)
+                    .expect("stat SystemConfig after reopen write")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                SYSTEM_CONFIG_FILE_MODE,
+                "SystemConfig config.redb must retain exact 0644 mode after writes"
+            );
+        }
     }
 }

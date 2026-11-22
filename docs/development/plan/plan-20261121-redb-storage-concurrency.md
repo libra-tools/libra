@@ -1242,7 +1242,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `done` / `remote-pending`
+**Lifecycle / Acceptance:** `done` / `remote-verified`（`58ff194`）
 
 **Description:** 100% 在独占目录 `src/storage/**` 内定义 `ConfigStore` 与 `MetadataStore` trait（覆盖 4 张仓库配置/元数据表与 3 张配置库源表），完成 `SqliteConfigStore` 与 `RedbConfigStore` 核心配置 CRUD（多值追加、节重命名、删除）、`metadata_kv` CAS 读写等价与 `RedbConfigStore` 多进程无锁只读快照。
 
@@ -1302,7 +1302,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `remote-pending`（`v0.30.306`；Codex R1 `PASS`；全部 AC/VER 与 6 文件白名单守卫绿灯）
 
 **Description:** 100% 在独占目录 `src/storage/**` 内落实 `RedbConfigStore` 的 `GC-13` 角色隔离（仓库配置写入严禁触碰隔离 `GlobalConfig`/`SystemConfig` 夹具）以及 Unix 权限位约定（空 `GlobalConfig` 创建 `0600` `config.redb`，空 `SystemConfig` 创建 `0644` `config.redb`）。
 
@@ -1316,15 +1316,15 @@
 | `GC-13` 要求 `Repository` 配置写入严禁修改 `GlobalConfig`/`SystemConfig`；全局配置须 `0600` 私密、系统配置须 `0644` 可读 | `GC-RB-02`；`src/internal/config.rs:47-120` |
 
 **Acceptance criteria:**
-- [ ] `GC-13` 全局隔离：`Repository` 配置写入严禁创建或修改隔离夹具 `LIBRA_CONFIG_GLOBAL_DB`。
-- [ ] `GC-13` 系统隔离：`Repository` 配置写入严禁创建或修改隔离夹具 `LIBRA_CONFIG_SYSTEM_DB`。
-- [ ] `RedbConfigStore` 在空 `GlobalConfig` 目录写入时按精确 `0600` 权限创建 `config.redb`。
-- [ ] `RedbConfigStore` 在空 `SystemConfig` 目录写入时按精确 `0644` 权限创建 `config.redb`。
+- [x] `GC-13` 全局隔离：`Repository` 配置写入严禁创建或修改隔离夹具 `LIBRA_CONFIG_GLOBAL_DB`。
+- [x] `GC-13` 系统隔离：`Repository` 配置写入严禁创建或修改隔离夹具 `LIBRA_CONFIG_SYSTEM_DB`。
+- [x] `RedbConfigStore` 在空 `GlobalConfig` 目录写入时按精确 `0600` 权限创建 `config.redb`。
+- [x] `RedbConfigStore` 在空 `SystemConfig` 目录写入时按精确 `0644` 权限创建 `config.redb`。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --no-default-features --features storage-redb,storage-queue --lib -E 'test(=storage::config_store::tests::redb_config_gc13_repo_isolation_and_scope_file_modes)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=storage::config_store::tests::redb_config_gc13_repo_isolation_and_scope_file_modes)'`（new，覆盖 AC1–AC4）
-- [ ] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 6 文件实现白名单。
+- [x] `source .env.test && cargo nextest list --no-default-features --features storage-redb,storage-queue --lib -E 'test(=storage::config_store::tests::redb_config_gc13_repo_isolation_and_scope_file_modes)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=storage::config_store::tests::redb_config_gc13_repo_isolation_and_scope_file_modes)'`（new，覆盖 AC1–AC4）
+- [x] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 6 文件实现白名单。
 
 **Full-suite trigger:** `none`
 

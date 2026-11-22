@@ -34,8 +34,15 @@ pub use backend::{
     assert_redb_runtime_unlocked,
 };
 pub use config_store::{
-    ConfigEntry, ConfigStore, LegacyConfigEntry, MetadataCasOutcome, MetadataEntryRecord,
-    MetadataStore, SchemaVersionReceipt, key_in_section,
+    CONFIG_REDB_FILE_NAME, CONFIG_SQLITE_FILE_NAME, ConfigEntry, ConfigStore,
+    LIBRA_CONFIG_GLOBAL_DB_ENV, LIBRA_CONFIG_SYSTEM_DB_ENV, LegacyConfigEntry, MetadataCasOutcome,
+    MetadataEntryRecord, MetadataStore, SchemaVersionReceipt, config_redb_path_in_scope_dir,
+    config_scope_dir_from_db_path, config_sqlite_path_in_scope_dir, key_in_section,
+};
+#[cfg(unix)]
+pub use config_store::{
+    GLOBAL_CONFIG_FILE_MODE, REPOSITORY_CONFIG_FILE_MODE, SYSTEM_CONFIG_FILE_MODE,
+    expected_config_file_mode,
 };
 pub use error::{StorageBackendError, StorageResult};
 pub use manifest::{
