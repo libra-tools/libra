@@ -1029,6 +1029,8 @@ PY
 ---
 
 
+**2026-11-21 回归守卫已落地：** 新增 `command::log_test::tty_output_no_stray_escape_sequences`，断言非 TTY 输出**不含 `\r`、不含 `\x1b[K`**，且 `--color=always` 保留 SGR 而不新增擦除序列；PTY 变体（仅多 ONLCR）以 `script` 手工取证（测试轨道无法保证 shell 解析到哪个 `libra` 二进制），已在用例注释中写明。该守卫不能替代 AC1（其前提仍不成立），本卡维持 `pending`，等待改判。
+
 **2026-11-21 探查结论（前提不成立，未落码）：** 在同一 PTY 夹具（`script -qec "<cmd>" /dev/null`，F13 三提交仓库）下对 `git 2.56.0` 与 `libra` 逐字节采样，两者输出**形状一致**：每行以 `\r\n` 结尾（PTY 从端 ONLCR，内核转换，非 Libra 代码），行尾均有 `\e[m`，末尾各有 1 个 `\e[K`（pager 收尾），即 `git` 侧同样出现 `\r`、行尾 `\e[m` 与 `\r\e[K`。因此 AC1 所要求的「Git 期望字节不含 `\r\e[K` 与孤立 `\e[m`」在该夹具下**不存在**，`\r` 也不可能通过改 Libra 消除（除非关闭终端 ONLCR）。`libra --no-pager log` 在 PTY 下同样只剩 ONLCR 产生的 `\r`、无 `\e[K`；非 TTY 管道输出与修复前一致（AC2 天然成立），`--color=always` 保留着色（AC3 天然成立）。本卡保持 `pending`，建议改判为「前提不成立/无法按 AC 验收」或重新定义 AC（例如断言非 TTY 与 PTY 输出仅差 ONLCR、且无 pager 收尾序列）。未提交代码改动。
 ### Task LS-14: 修复空 `--format=` / `--pretty=` 值仍输出默认提交头（Git 不输出提交头字节）（#972）
 

@@ -8740,3 +8740,53 @@ fn decorate_replaced_and_env_base() {
         "AC2 marker: {custom_stdout}"
     );
 }
+
+#[test]
+fn tty_output_no_stray_escape_sequences() {
+    use super::{assert_cli_success, run_libra_command};
+
+    // Non-TTY output must stay free of carriage returns and erase-line
+    // sequences; only a real PTY adds `\r` (the kernel's ONLCR).
+    let work = tempfile::tempdir().expect("work dir");
+    let repo = work.path().join("r");
+    std::fs::create_dir_all(&repo).expect("mkdir repo");
+    assert_cli_success(&run_libra_command(&["init"], &repo), "init");
+    run_libra_command(&["config", "set", "user.name", "t"], &repo);
+    run_libra_command(&["config", "set", "user.email", "t@t"], &repo);
+    for index in 0..3 {
+        let name = format!("f{index}.txt");
+        std::fs::write(repo.join(&name), format!("line{index}\n")).expect("write");
+        assert_cli_success(&run_libra_command(&["add", &name], &repo), "add");
+        let message = format!("c{index}");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", &message, "--no-verify"], &repo),
+            "commit",
+        );
+    }
+
+    let piped = run_libra_command(&["log", "--no-pager"], &repo);
+    assert_cli_success(&piped, "piped log");
+    assert!(
+        !piped.stdout.contains(&b'\r'),
+        "non-TTY output must not contain CR"
+    );
+    assert!(
+        !piped.stdout.windows(3).any(|window| window == b"\x1b[K"),
+        "non-TTY output must not contain an erase-line sequence"
+    );
+
+    let coloured = run_libra_command(&["log", "--no-pager", "--color=always"], &repo);
+    assert_cli_success(&coloured, "coloured log");
+    assert!(
+        coloured.stdout.windows(2).any(|window| window == b"\x1b["),
+        "explicit colour keeps SGR sequences"
+    );
+    assert!(
+        !coloured.stdout.windows(3).any(|window| window == b"\x1b[K"),
+        "explicit colour must not add erase-line sequences"
+    );
+
+    // The PTY variant (only ONLCR differs) is verified manually with
+    // `script -qec "libra log --no-pager --color=always" /dev/null`; the test
+    // harness cannot guarantee which `libra` binary the shell resolves.
+}
