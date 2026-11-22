@@ -122,3 +122,5 @@ flowchart TD
 - 2026-11-21（LS-12 / #969）：新增 `-R`/`--reverse-diff`，以 log 专用 `reverse_patch` 交换 diff 的标签、index 哈希、hunk 范围与 +/- 内容行（`generate_diff`/`CommitDiffOptions` 签名不变，提交顺序不变）；澄清 #969 标题所称「`--reverse` 短别名」不符 Git 语义，按 Git `-R` 实现。回归：`command::log_test::diff_reverse_flag_r`（AC1–AC3）。
 
 - 2026-11-21（LS-14 / #972）：`--format=`/`--pretty=`/`--format=tformat:` 改为 `FormatType::Silent`（0 字节），`--format=format:` 为 `FormatType::Separator`（仅提交间换行）；有内容时不再追加多余换行，静默头下 `--stat`/`-p` 不再注入前置空行；同步更新 `test_parse_pretty_format_presets` 断言。回归：`command::log_test::empty_format_or_pretty_omits_header`。
+
+- 2026-11-21（LS-15 / #963）：新增 `--output=<file>`（`LogSink` 分流 pager/文件）：逐级解析符号链接取最终目标、`create_new` 独占创建、已存在目标与 `.libra/` 内目标以 `LBR-IO-002` 拒绝、`--json` 组合以 `LBR-CLI-002` 拒绝；pager 策略不变（启动时收空输出）。回归：`command::log_test::output_to_file`（AC1–AC8，含 `.libra` 清单不变断言）。

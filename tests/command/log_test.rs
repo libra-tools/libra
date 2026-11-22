@@ -7882,3 +7882,174 @@ fn empty_format_or_pretty_omits_header() {
         "AC5 keeps diffstat: {stat}"
     );
 }
+
+#[test]
+fn output_to_file() {
+    use super::{assert_cli_success, run_libra_command};
+
+    // Fixture F15: three commits plus the `--output` guard targets.
+    let work = tempfile::tempdir().expect("work dir");
+    let repo = work.path().join("r");
+    std::fs::create_dir_all(&repo).expect("mkdir repo");
+    assert_cli_success(&run_libra_command(&["init"], &repo), "init");
+    run_libra_command(&["config", "set", "user.name", "t"], &repo);
+    run_libra_command(&["config", "set", "user.email", "t@t"], &repo);
+    for index in 0..3 {
+        let name = format!("f{index}.txt");
+        std::fs::write(repo.join(&name), format!("line{index}\n")).expect("write file");
+        assert_cli_success(&run_libra_command(&["add", &name], &repo), "add");
+        let message = format!("c{index}");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", &message, "--no-verify"], &repo),
+            "commit",
+        );
+    }
+    let plain = {
+        let result = run_libra_command(&["log", "--oneline"], &repo);
+        assert_cli_success(&result, "plain log");
+        result.stdout
+    };
+    let stderr_of = |args: &[&str]| {
+        let result = run_libra_command(args, &repo);
+        String::from_utf8_lossy(&result.stderr).to_string()
+    };
+    // The repository metadata manifest (volatile SQLite files excluded) so
+    // AC6 can prove nothing inside `.libra/` changed.
+    let manifest = || {
+        let storage = repo.join(".libra");
+        let mut entries: Vec<(String, String)> = Vec::new();
+        let mut stack = vec![storage.clone()];
+        while let Some(dir) = stack.pop() {
+            let Ok(read) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in read.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                let name = path
+                    .strip_prefix(&storage)
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                // Volatile bookkeeping (SQLite, oplog, logs, lock generations)
+                // changes on every command and is not output-related state.
+                if name.contains("libra.db")
+                    || name.contains("oplog")
+                    || name.contains("logs")
+                    || name.ends_with(".lock")
+                {
+                    continue;
+                }
+                let bytes = std::fs::read(&path).unwrap_or_default();
+                // A tiny FNV-1a digest is enough for equality checks here.
+                let mut hash: u64 = 0xcbf29ce484222325;
+                for byte in bytes {
+                    hash ^= byte as u64;
+                    hash = hash.wrapping_mul(0x100000001b3);
+                }
+                entries.push((name, format!("{hash:016x}")));
+            }
+        }
+        entries.sort();
+        entries
+    };
+
+    // AC1/AC2: a brand-new target receives the output, stdout stays empty.
+    let out_arg = "out.log";
+    let created = run_libra_command(&["log", "--oneline", "--output=out.log"], &repo);
+    assert_cli_success(&created, "AC1 run");
+    assert!(created.stdout.is_empty(), "AC2 stdout must be empty");
+    assert_eq!(
+        std::fs::read(repo.join(out_arg)).expect("read out.log"),
+        plain,
+        "AC1 contents"
+    );
+
+    // AC3: a dangling symlink creates its final target.
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink("target.txt", repo.join("S.link")).expect("symlink");
+        let linked = run_libra_command(&["log", "--oneline", "--output=S.link"], &repo);
+        assert_cli_success(&linked, "AC3 run");
+        assert_eq!(
+            std::fs::read(repo.join("target.txt")).expect("read target.txt"),
+            plain,
+            "AC3 contents"
+        );
+    }
+
+    // AC4/AC5/AC8 (and AC7) reject without touching the repository.
+    let before = manifest();
+    assert!(
+        stderr_of(&["log", "--output=.libra/new-target"]).contains("LBR-IO-002"),
+        "AC4"
+    );
+    std::fs::write(repo.join(".libra/existing-inside.txt"), "keep\n").expect("seed .libra file");
+    std::fs::write(repo.join("exists.txt"), "keep\n").expect("seed file");
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(".libra/existing-inside.txt", repo.join("L.link"))
+            .expect("symlink inside");
+        std::fs::hard_link(repo.join(".libra/existing-inside.txt"), repo.join("H.link"))
+            .expect("hard link");
+    }
+    let sealed = manifest();
+    assert!(
+        stderr_of(&["log", "--output=exists.txt"]).contains("LBR-IO-002"),
+        "AC5"
+    );
+    #[cfg(unix)]
+    {
+        assert!(
+            stderr_of(&["log", "--output=L.link"]).contains("LBR-IO-002"),
+            "AC6 symlink target inside .libra"
+        );
+        assert!(
+            stderr_of(&["log", "--output=H.link"]).contains("LBR-IO-002"),
+            "AC6 hard link to .libra file"
+        );
+    }
+    // AC7: the JSON combination is still closed in this card.
+    assert!(
+        stderr_of(&["--json", "log", "--output=out.json"]).contains("LBR-CLI-002"),
+        "AC7"
+    );
+    // AC8: an unwritable directory fails instead of truncating anything.
+    let readonly = repo.join("R");
+    std::fs::create_dir_all(&readonly).expect("mkdir R");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&readonly, std::fs::Permissions::from_mode(0o555))
+            .expect("chmod R");
+    }
+    assert!(
+        stderr_of(&["log", "--output=R/out.log"]).contains("LBR-IO-002"),
+        "AC8"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&readonly, std::fs::Permissions::from_mode(0o755))
+            .expect("restore R");
+    }
+    // AC6: every rejected call left `.libra/` byte-identical (the two files the
+    // test itself seeded are the only additions, both outside `.libra/`).
+    let after = manifest();
+    let added: Vec<&String> = after
+        .iter()
+        .map(|(name, _)| name)
+        .filter(|name| !before.iter().any(|(other, _)| other == *name))
+        .collect();
+    assert_eq!(added, vec!["existing-inside.txt"], "AC6 additions");
+    for (name, hash) in &before {
+        let now = after
+            .iter()
+            .find(|(candidate, _)| candidate == name)
+            .map(|(_, hash)| hash.clone());
+        assert_eq!(now.as_ref(), Some(hash), "AC6 {name} unchanged");
+    }
+    assert!(sealed.iter().any(|(name, _)| name == "existing-inside.txt"));
+}

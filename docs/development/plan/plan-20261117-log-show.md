@@ -1085,7 +1085,7 @@ PY
 
 ### Task LS-15: 实现 `log --output=<file>` 新目标写入与 `.libra/` 防护（#963；拆出 LS-36、LS-37）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-21：`LogArgs` 新增 `output: Option<PathBuf>`；新增 `LogSink`（Pager / File）分流：逐级解析符号链接取最终目标、`create_new` 独占创建、已存在目标与 `.libra/` 内目标以 `LBR-IO-002` 拒绝、`--json` 组合在 JSON 分支前以 `LBR-CLI-002` 拒绝（`--json` 与 `--output` 不同时产出文件）；pager 策略未变（仍经 `Pager::with_config`，启动时只收到空输出）。AC1–AC8 由 `command::log_test::output_to_file` 覆盖（AC6 以 `.libra` 相对路径+FNV 摘要清单比对，排除 SQLite/oplog/logs/`.lock` 等易变簿记），`log_test` 全绿；严格 Clippy exit 0。**Codex/Claude 审计按用户 2026-11-21 指令取消**。）
 
 **Description:** 在 `LogArgs` 新增 `--output=<file>`，本卡只开放**新目标**：把目标路径逐级跟随符号链接解析出最终目标，最终目标不存在时在其所在目录以「独占创建」（`create_new`）打开并写入本次人类可读输出，stdout 为空——悬空符号链接因此与 Git `fopen(path, "w")`（`git@6de20f6092:diff.c:5809` `xfopen`）一样创建其指向的文件；独占创建也使检查后在该路径新放置的文件或符号链接导致打开失败。最终目标已存在（不论文件类型）时本卡以 `LBR-IO-002` 拒绝、不打开、不截断，覆盖既有目标的 Git 语义（原地截断、保留 inode 与权限）及既有目标的描述符级防护由 `LS-37` 开放与验收。`.libra/` 写入防护（GC-07）随本卡生效：最终目标路径（规范化父目录后）位于当前仓库 `.libra/` 内部即以 `LBR-IO-002` 拒绝，不创建任何文件（Libra 专有防护，Git 无此限制，在 `COMPATIBILITY.md` 的 `| log |` 行登记为有意差异）。新目标创建失败（如父目录不可写）以 `LBR-IO-002` 失败。全局 `--json` 与 `--output` 的组合在本卡以 `LBR-CLI-002` 拒绝，由 `LS-36` 开放。分页器策略不变：Git 的 `cmd_log_init_finish` 不论是否带 `--output` 都调用 `setup_pager`（`git@6de20f6092:builtin/log.c:388`），是否真正启动分页器由其分页器配置与 stdout 是否为终端决定（`git@6de20f6092:pager.c` 的 `setup_pager`）；Libra 同样不因 `--output` 改变策略，仍按现有 `LIBRA_PAGER`/TTY 策略经 `Pager::with_config` 决定是否启动分页器，启动时分页器只收到空输出。拆出 `LS-36`、`LS-37`。
 

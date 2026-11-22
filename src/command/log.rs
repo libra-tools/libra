@@ -270,6 +270,10 @@ pub struct LogArgs {
         require_equals = true
     )]
     pub no_walk: Option<String>,
+    /// Write the human-readable output to FILE instead of stdout (the file
+    /// must not exist yet and must stay outside `.libra/`)
+    #[clap(long, value_name = "FILE")]
+    pub output: Option<PathBuf>,
     /// Swap the two inputs of each commit diff (`git log -R`) without changing
     /// the commit order
     #[clap(short = 'R', long = "reverse-diff")]
@@ -2505,6 +2509,12 @@ async fn execute_safe_with_diff_formats(
     let decorate_option = resolve_decorate_option(&args).await?;
 
     if output.is_json() {
+        if args.output.is_some() {
+            return Err(
+                CliError::command_usage("--output cannot be combined with --json yet")
+                    .with_stable_code(StableErrorCode::CliInvalidArguments),
+            );
+        }
         let result = run_log(&args, &log_config, &identity_filters).await?;
         return emit_json_data("log", &result, output);
     }
@@ -2673,7 +2683,7 @@ async fn execute_safe_with_diff_formats(
         .await;
     }
 
-    let mut pager = Pager::with_config(output)?;
+    let mut pager = LogSink::open(&args, output).await?;
 
     // `--simplify-by-decoration` keeps the decorated commits plus repository
     // roots (Git's by-decoration simplification on the fixtures exercised
@@ -3112,6 +3122,147 @@ async fn execute_safe_with_diff_formats(
 
     pager.finish()?;
     Ok(())
+}
+
+/// Output sink for the human-readable log: the configured pager, or a freshly
+/// created `--output` file.
+enum LogSink {
+    Pager(Pager),
+    File(std::fs::File),
+}
+
+impl LogSink {
+    async fn open(args: &LogArgs, output: &OutputConfig) -> CliResult<Self> {
+        let Some(target) = args.output.as_deref() else {
+            return Ok(LogSink::Pager(Pager::with_config(output)?));
+        };
+        if output.is_json() {
+            return Err(
+                CliError::command_usage("--output cannot be combined with --json yet")
+                    .with_stable_code(StableErrorCode::CliInvalidArguments),
+            );
+        }
+        // Follow the whole symlink chain so a dangling link creates its final
+        // target, like Git's `fopen(path, "w")`.
+        let mut final_target = target.to_path_buf();
+        for _ in 0..40 {
+            match std::fs::symlink_metadata(&final_target) {
+                Ok(meta) if meta.file_type().is_symlink() => {
+                    let link = std::fs::read_link(&final_target).map_err(|error| {
+                        CliError::fatal(format!(
+                            "failed to resolve --output symlink {}: {error}",
+                            final_target.display()
+                        ))
+                        .with_stable_code(StableErrorCode::IoWriteFailed)
+                    })?;
+                    final_target = if link.is_absolute() {
+                        link
+                    } else {
+                        final_target
+                            .parent()
+                            .unwrap_or_else(|| std::path::Path::new("."))
+                            .join(link)
+                    };
+                }
+                Ok(meta) if meta.file_type().is_dir() => {
+                    return Err(CliError::fatal(format!(
+                        "--output target {} is a directory",
+                        final_target.display()
+                    ))
+                    .with_stable_code(StableErrorCode::IoWriteFailed));
+                }
+                Ok(_) => break,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => break,
+                Err(error) => {
+                    return Err(CliError::fatal(format!(
+                        "failed to inspect --output target {}: {error}",
+                        final_target.display()
+                    ))
+                    .with_stable_code(StableErrorCode::IoWriteFailed));
+                }
+            }
+        }
+        // `.libra/` is repository state, never an output target.
+        let storage = util::storage_path();
+        let parent = final_target
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let absolute_parent = if parent.is_absolute() {
+            parent.clone()
+        } else {
+            std::env::current_dir()
+                .map_err(|error| {
+                    CliError::fatal(format!("failed to resolve the current directory: {error}"))
+                        .with_stable_code(StableErrorCode::IoWriteFailed)
+                })?
+                .join(&parent)
+        };
+        // Compare the lexically normalized paths so a path that does not exist
+        // yet is still recognised as living inside `.libra/`.
+        let normalize = |path: &std::path::Path| -> std::path::PathBuf {
+            let mut out = std::path::PathBuf::new();
+            for component in path.components() {
+                match component {
+                    std::path::Component::ParentDir => {
+                        out.pop();
+                    }
+                    std::path::Component::CurDir => {}
+                    other => out.push(other),
+                }
+            }
+            out
+        };
+        let normalized_parent = normalize(&absolute_parent);
+        let normalized_storage = normalize(&storage);
+        if normalized_parent.starts_with(&normalized_storage) {
+            return Err(CliError::fatal(format!(
+                "refusing to write log output inside the repository metadata directory ({})",
+                normalized_parent.display()
+            ))
+            .with_stable_code(StableErrorCode::IoWriteFailed));
+        }
+        // `LS-15` only opens new targets; overwriting an existing file is
+        // reserved for `LS-37`.
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&final_target)
+            .map_err(|error| {
+                CliError::fatal(format!(
+                    "failed to create --output file {}: {error}",
+                    final_target.display()
+                ))
+                .with_stable_code(StableErrorCode::IoWriteFailed)
+            })?;
+        Ok(LogSink::File(file))
+    }
+
+    fn write_str(&mut self, text: &str) -> CliResult<()> {
+        match self {
+            LogSink::Pager(pager) => pager.write_str(text),
+            LogSink::File(file) => {
+                use std::io::Write;
+                file.write_all(text.as_bytes()).map_err(|error| {
+                    CliError::fatal(format!("failed to write --output file: {error}"))
+                        .with_stable_code(StableErrorCode::IoWriteFailed)
+                })
+            }
+        }
+    }
+
+    fn finish(self) -> CliResult<()> {
+        match self {
+            LogSink::Pager(pager) => pager.finish(),
+            LogSink::File(mut file) => {
+                use std::io::Write;
+                file.flush().map_err(|error| {
+                    CliError::fatal(format!("failed to flush --output file: {error}"))
+                        .with_stable_code(StableErrorCode::IoWriteFailed)
+                })
+            }
+        }
+    }
 }
 
 async fn run_log(

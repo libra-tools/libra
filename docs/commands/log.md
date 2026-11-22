@@ -66,6 +66,20 @@ Set the length of abbreviated commit hashes.
 libra log --abbrev 8
 ```
 
+### `--output=<file>`
+
+`--output=<file>` writes the human-readable log to `<file>` and leaves stdout
+empty. The target must be new: an existing path is rejected with `LBR-IO-002`
+(overwriting arrives with LS-37), and so is any path whose final target lives
+inside the repository metadata directory `.libra/` — a Libra-only guard, since
+Git has no such restriction. Symbolic links are followed to their final target,
+so a dangling link creates the file it points at, matching Git. Combining
+`--output` with `--json` is rejected with `LBR-CLI-002`.
+
+```bash
+libra log --oneline --output=log.txt
+```
+
 ### Empty `--format=` / `--pretty=`
 
 An empty format prints nothing per commit, matching Git: `--format=`,
