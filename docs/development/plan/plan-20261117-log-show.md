@@ -1507,6 +1507,8 @@ PY
 
 ---
 
+
+**2026-11-21 全量门回归修复：** `generate_cc_diff` 改为经 `ShallowSet::parents_for_walk` 取父提交（此前直接遍历 `commit.parent_commit_ids`，被 `compat_shallow_walk_helper` 判为未走 shallow helper；修复后该 target 2/2 通过），并在 `log.rs` 的 `parent_commit_ids.is_empty()` 处按守卫要求标注 `// SHALLOW-DISPLAY`（仅存在性判断、不遍历父链）。
 ### Task LS-20: `log` 支持 `--raw`、`--numstat` 与 `--dirstat` 差异格式选项（#964）
 
 **Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`

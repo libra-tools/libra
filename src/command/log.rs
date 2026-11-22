@@ -3235,6 +3235,7 @@ async fn execute_safe_with_diff_formats(
         selected_commits.retain(|selected| {
             let commit = &selected.commit;
             if commit.parent_commit_ids.is_empty() {
+                // SHALLOW-DISPLAY: presence check only, no parent walk.
                 return true;
             }
             if head_allowed && commit.id == current_head_commit {
@@ -5723,12 +5724,14 @@ fn lcs_alignment(a: &[String], b: &[String]) -> Vec<(usize, usize)> {
 /// column per parent, interleaved in the merge's own line order.
 async fn generate_cc_diff(commit: &Commit, paths: &[PathBuf]) -> CliResult<String> {
     // A non-merge commit keeps the ordinary patch (Git's `--cc` behaviour).
-    if commit.parent_commit_ids.len() < 2 {
+    let shallow = load_walk_shallow()?;
+    let parents = shallow.parents_for_walk(&commit.id, &commit.parent_commit_ids);
+    if parents.len() < 2 {
         return generate_diff(commit, paths.to_vec()).await;
     }
     let merge_blobs = tree_blob_map(&commit.tree_id)?;
     let mut parent_maps = Vec::new();
-    for parent_id in &commit.parent_commit_ids {
+    for parent_id in parents {
         let parent = load_object::<Commit>(parent_id)
             .map_err(|e| log_repo_corrupt_error(format!("failed to load parent commit: {e}")))?;
         parent_maps.push(tree_blob_map(&parent.tree_id)?);
