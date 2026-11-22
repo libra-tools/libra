@@ -28,7 +28,7 @@ jobs:
           - { rust: x86_64-unknown-linux-gnu, os: linux, arch: amd64, runner: ubuntu-latest }
           - { rust: aarch64-unknown-linux-gnu, os: linux, arch: arm64, runner: ubuntu-24.04-arm }
           - { rust: aarch64-apple-darwin, os: darwin, arch: arm64, runner: macos-latest }
-          - { rust: x86_64-pc-windows-msvc, os: windows, arch: amd64, runner: windows-latest }
+          - { rust: x86_64-pc-windows-msvc, os: windows, arch: amd64, runner: windows-latest, toolchain: nightly }
 
     steps:
       - name: Checkout code
@@ -39,7 +39,7 @@ jobs:
       - name: Set up Rust
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
-          toolchain: stable
+          toolchain: ${{ matrix.target.toolchain || 'stable' }}
           target: ${{ matrix.target.rust }}
 
       - name: Install Linux dependencies
