@@ -2000,7 +2000,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `done` / `remote-pending`
+**Lifecycle / Acceptance:** `done` / `remote-verified`
 
 **Description:** 100% 在独占目录 `src/storage/**` 内补齐「可复现源表清单 A」剩余 **28 张**活跃仓库源表（19 张 `ai_*`、5 张 `memory_*`、`approved_permission`/`automation_log`/`source_call_log`、以及 `agent_bridge_publication` 与 `agent_bridge_index_publication` 两阶段发布表）的双后端实现与 61 活跃源表静态清单守卫。
 
@@ -2060,7 +2060,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `remote-pending`
 
 **Description:** 100% 在独占目录 `src/storage/**` 内定义 `CaptureStore` trait，完成 `SqliteCaptureStore` 与 `RedbCaptureStore`（`.libra/private/capture.gen-<id>.redb`）全部 **25 张 Capture 源表**建模、单事务批量去重写入、`AgentBridgeStore` 连续序列确认以及 `capture.redb` 过新版本隔离（`LBR-AGENT-048`），同时显式区隔 `META_*`/`QUEUE_HIGHWATER_*` 与二级索引表。
 
@@ -2076,19 +2076,19 @@
 | `2026111601_capture_database.sql` 精确定义 25 条 `CREATE TABLE`（2 账本/收据 + 23 业务目录表） | `sql/migrations/2026111601_capture_database.sql:7-453` |
 
 **Acceptance criteria:**
-- [ ] 静态表清单断言校验 `CaptureStore` 精确覆盖 25 张 Capture 源表，并将 `META_*`/`QUEUE_HIGHWATER_*` 与二级索引表单独登记不混入源表计数。
-- [ ] 双特性等价测试在 `SqliteCaptureStore` 与 `RedbCaptureStore` 上覆盖全部 25 张 Capture 源表结果逐项一致。
-- [ ] `append_capture_batch` 在单次写事务内批量写入 ≥ 128 条事件。
-- [ ] `append_capture_batch` 按完整语义 `dedup_key` 幂等去重，重复帧不产生重复行。
-- [ ] `AgentBridgeStore::append_and_ack_events` 基于 `(session_id, event_seq)` 复合键单事务推进连续 `acked_seq`。
-- [ ] `capture.redb` `META_SCHEMA` 过新时仅报 `LBR-AGENT-048` 而不阻断 `GitStore` 正常读写。
+- [x] 静态表清单断言校验 `CaptureStore` 精确覆盖 25 张 Capture 源表，并将 `META_*`/`QUEUE_HIGHWATER_*` 与二级索引表单独登记不混入源表计数。
+- [x] 双特性等价测试在 `SqliteCaptureStore` 与 `RedbCaptureStore` 上覆盖全部 25 张 Capture 源表结果逐项一致。
+- [x] `append_capture_batch` 在单次写事务内批量写入 ≥ 128 条事件。
+- [x] `append_capture_batch` 按完整语义 `dedup_key` 幂等去重，重复帧不产生重复行。
+- [x] `AgentBridgeStore::append_and_ack_events` 基于 `(session_id, event_seq)` 复合键单事务推进连续 `acked_seq`。
+- [x] `capture.redb` `META_SCHEMA` 过新时仅报 `LBR-AGENT-048` 而不阻断 `GitStore` 正常读写。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::capture_store::tests::dual_backend_25_source_tables_equivalence) | test(=storage::capture_store::tests::redb_bridge_contiguous_ack_and_batch_dedup) | test(=storage::capture_store::tests::redb_capture_future_schema_isolated_from_git_store)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::capture_store::tests::dual_backend_25_source_tables_equivalence)'`（new，覆盖 AC1、AC2）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=storage::capture_store::tests::redb_bridge_contiguous_ack_and_batch_dedup)'`（new，覆盖 AC3、AC4、AC5）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=storage::capture_store::tests::redb_capture_future_schema_isolated_from_git_store)'`（new，覆盖 AC6）
-- [ ] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 4 文件实现白名单。
+- [x] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::capture_store::tests::dual_backend_25_source_tables_equivalence) | test(=storage::capture_store::tests::redb_bridge_contiguous_ack_and_batch_dedup) | test(=storage::capture_store::tests::redb_capture_future_schema_isolated_from_git_store)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::capture_store::tests::dual_backend_25_source_tables_equivalence)'`（new，覆盖 AC1、AC2）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=storage::capture_store::tests::redb_bridge_contiguous_ack_and_batch_dedup)'`（new，覆盖 AC3、AC4、AC5）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=storage::capture_store::tests::redb_capture_future_schema_isolated_from_git_store)'`（new，覆盖 AC6）
+- [x] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 4 文件实现白名单。
 
 **Full-suite trigger:** `none`
 
@@ -10034,8 +10034,9 @@
 | `RB-04` | `done` / `remote-verified` | `11ecda0`（`main`） | `0.30.318` | 2026-11-22 17:39 UTC：Stage 1 精确 4 文件写集（`src/storage/{mod,git_store}.rs`、`src/storage/{sqlite,redb}/git_store.rs`），实现对象安全 `GitStore`、`SqliteGitStore`（SQL 下推 `LIMIT`、`BEGIN IMMEDIATE` 单事务 CAS+Reflog+`agent_bridge_publication`）与 `RedbGitStore`（`MultiWriter`、版本化 `[u16_le][postcard]`、合作式写取消安全、符号 `HEAD` 同提交解析拒收与 Reflog 工作树跨界拒收）；`dual_backend_core_refs_reflog_and_bridge_cas_equivalence`、`redb_multiprocess_cas_linearizability_and_mvcc_reads`（4 写 + 8 读共 12 进程零停顿活体并发线性化压测）、`sqlite_core_refs_reflog_smoke`、fmt、严格 clippy、`compat_version_surface_sync` 与 Codex R4 `VERDICT: PASS` 全绿 |
 | `RB-04b` | `done` / `remote-verified` | `87a299d`（`main`） | `0.30.320` | 2026-11-22 18:30 UTC：Stage 1 精确 4 文件写集（`src/storage/{mod,git_store}.rs`、`src/storage/{sqlite,redb}/git_store.rs`），补齐 `GitStore` 核心 7 表其余 5 张源表（`object_index`、`object_obliteration`、`notes`、`revision_ordinal`、`revision_ordinal_meta`）及同事务二级索引 `OBJECT_BY_PACK` / `revision_ordinal_by_oid`；实现 1,024 条单事务幂等批量写入、读前/读后单调防 TOCTOU `run_fenced_object_read`、跨进程独占事务且取消/运行时关闭安全（`txn` 随 `spawn_blocking` 持有）`run_fenced_object_write`、遗留 5 表 `RB-04` 红库只读兼容重开与安全升级 12 表及残缺半表 fail-closed；`dual_backend_object_index_obliteration_notes_and_ordinals`（含 AC1–AC5、竞争交错、取消安全、运行时关闭与 RB-04 升级回归）、`sqlite_object_index_and_obliteration_smoke`、纯 redb 检查、fmt、严格 clippy、`compat_version_surface_sync` 与 Codex R5 `VERDICT: PASS` 全绿 |
 | `RB-05` | `done` / `remote-verified` | `b477d04`（`main`） | `0.30.322` | 2026-11-22 19:19 UTC：Stage 1 精确 4 文件写集（`src/storage/{mod,git_state_store}.rs`、`src/storage/{sqlite,redb}/git_state_store.rs`），实现对象安全 `GitStateStore` 及其双后端 `SqliteGitStateStore`/`RedbGitStateStore`，完整覆盖 21 张工作流/工作树/OpLog v2/Change 谱系/脏树/图层/稀疏视图源表 + 同事务二级索引 `change_revision_by_commit` + `git_state_sequences`；实现全零 SHA-1/SHA-256 OID 与 `worktree_id` 隔离、部分唯一工作区租约登记/续期/到期回收/吊销、4 表单事务原子追加兼头收敛 `append_operation_and_converge_heads`（含 6 并发写者真实并发头收敛与回滚原子实测）、SQLite 多表快照读事务（`get_sparse_view`/`get_operation`/`list_operations`）与遗留 `RB-04b` 红库只读重开一致能力基线 `[2, 3, 4]` 及安全升级；`dual_backend_22_workflow_worktree_oplog_tables_equivalence`（双特性 + 纯 `storage-redb,storage-queue`）、`sqlite_workflow_state_tables_smoke`（纯 `storage-sqlite`）、fmt、严格 clippy、`compat_version_surface_sync` 与 Codex R2 `VERDICT: PASS` 全绿 |
-| `RB-05b` | `done` / `remote-pending` | 本提交（`main`） | `0.30.325` | 2026-11-22 20:15 UTC：Stage 1 精确 4 文件写集（`src/storage/{mod,git_state_store}.rs`、`src/storage/{sqlite,redb}/git_state_store.rs`），补齐 19 张 `ai_*`（含单事务 `is_latest` 互斥、唯一约束与 `delete_ai_thread` 11 表级联）、5 张 `memory_*`（含非 UTF-8 原始路径、自然键唯一与级联清理）+ 同事务 `MEMORY_BY_PATH` 倒序二级索引（含时间戳更新剪枝与新旧时间窗回归）、3 张治理审计表（`approved_permission`/`automation_log`/`source_call_log`）及 `agent_bridge_publication`/`agent_bridge_index_publication` 严格单调两阶段（`prepared` → `published`，禁跳准备、禁降级、禁改摘要、兼容只读 2 列旧表并与 `RedbGitStore` 同库线级互通）；完成 61 张活跃持久仓库源表静态与落盘双向集合相等守卫（排除 7 张退役表与全部内部/二级索引表）；`dual_backend_28_ai_memory_bridge_tables_equivalence`、`repository_61_source_tables_manifest_complete`（双特性 + 纯 `storage-redb,storage-queue`）、`sqlite_ai_memory_bridge_tables_smoke`（纯 `storage-sqlite`）、fmt、严格 clippy、`compat_version_surface_sync` 与 Codex R3 `VERDICT: PASS` 全绿（Repository 全 61 张活跃源表双后端全部闭环） |
-| `RB-06`..`RB-34c`（剩余 131 卡） | `pending` | — | — | 按实施顺序于 `main` 逐卡推进 |
+| `RB-05b` | `done` / `remote-verified` | `023b711`（`main`） | `0.30.325` | 2026-11-22 20:15 UTC：Stage 1 精确 4 文件写集（`src/storage/{mod,git_state_store}.rs`、`src/storage/{sqlite,redb}/git_state_store.rs`），补齐 19 张 `ai_*`（含单事务 `is_latest` 互斥、唯一约束与 `delete_ai_thread` 11 表级联）、5 张 `memory_*`（含非 UTF-8 原始路径、自然键唯一与级联清理）+ 同事务 `MEMORY_BY_PATH` 倒序二级索引（含时间戳更新剪枝与新旧时间窗回归）、3 张治理审计表（`approved_permission`/`automation_log`/`source_call_log`）及 `agent_bridge_publication`/`agent_bridge_index_publication` 严格单调两阶段（`prepared` → `published`，禁跳准备、禁降级、禁改摘要、兼容只读 2 列旧表并与 `RedbGitStore` 同库线级互通）；完成 61 张活跃持久仓库源表静态与落盘双向集合相等守卫（排除 7 张退役表与全部内部/二级索引表）；`dual_backend_28_ai_memory_bridge_tables_equivalence`、`repository_61_source_tables_manifest_complete`（双特性 + 纯 `storage-redb,storage-queue`）、`sqlite_ai_memory_bridge_tables_smoke`（纯 `storage-sqlite`）、fmt、严格 clippy、`compat_version_surface_sync` 与 Codex R3 `VERDICT: PASS` 全绿（Repository 全 61 张活跃源表双后端全部闭环） |
+| `RB-06` | `done` / `remote-pending` | 本提交（`main`） | `0.30.326` | 2026-11-22 21:55 UTC：Stage 1 精确 4 文件写集（`src/storage/{mod,capture_store}.rs`、`src/storage/{sqlite,redb}/capture_store.rs`），实现对象安全 `AgentBridgeStore` 与 `CaptureStore` 全 25 张 Capture 源表双后端（显式区隔 `META_*`/`QUEUE_HIGHWATER_*`/去重/序列与 7 张同事务二级索引表 `sessions_by_time`/`sessions_by_provider`/`checkpoints_by_session`/`events_by_time`/`bridge_events_by_seq`/`bridge_links_by_key`/`usage_stats_by_session_event`）、单事务 160 条事件语义 `dedup_key` 幂等批写与中段失败回滚、`AgentBridgeStore::append_and_ack_events` 基于 `(bridge_session_id, event_seq)` 单事务增量推进连续 `last_acked_seq`（SQLite 递归点查 CTE 零尾扫描 + 200 尾缺口回归）、`agent_coverage_revision` 只追加历史防篡改、无 `U+10FFFF` 上界的开放前缀范围扫描、`SqliteCreatePublishGuard`/`RedbCreatePublishGuard` 取消与发布后异常原子回滚守卫，以及 `capture.redb` 过新 `META_SCHEMA` 仅报 `LBR-AGENT-048` 而不阻断 `RedbGitStore`；双特性 7/7、纯 `storage-redb,storage-queue` 4/4、纯 `storage-sqlite` 2/2、单特性零告警、fmt、严格 clippy、`compat_version_surface_sync` 与 Codex R7 `VERDICT: PASS` 全绿 |
+| `RB-06c`..`RB-34c`（剩余 130 卡） | `pending` | — | — | 按实施顺序于 `main` 逐卡推进 |
 
 ## Codex review log
 

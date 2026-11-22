@@ -15,6 +15,7 @@ const _: () = assert!(
 );
 
 pub mod backend;
+pub mod capture_store;
 #[cfg(any(feature = "storage-redb", feature = "storage-queue"))]
 pub mod codec;
 pub mod config_store;
@@ -34,6 +35,33 @@ pub mod sqlite;
 pub use backend::{
     LIBRA_STORAGE_BACKEND_ENV, REDB_RUNTIME_UNLOCKED, StorageBackendKind,
     assert_redb_runtime_unlocked,
+};
+#[cfg(feature = "storage-redb")]
+pub use capture_store::RedbCaptureStore;
+#[cfg(feature = "storage-sqlite")]
+pub use capture_store::SqliteCaptureStore;
+pub use capture_store::{
+    AgentAuditLogRecord, AgentBridgeCheckpointRecord, AgentBridgeEventRecord,
+    AgentBridgeLinkRecord, AgentBridgeOperationRecord, AgentBridgeSessionRecord, AgentBridgeStore,
+    AgentCaptureCloudBaseRecord, AgentCaptureIncarnationRecord,
+    AgentCheckpointPruneTombstoneRecord, AgentCheckpointRecord, AgentCoverageClaimRecord,
+    AgentCoverageConflictRecord, AgentCoverageRevisionRecord, AgentExportJobRecord,
+    AgentImportIdentityRecord, AgentImportTombstoneRecord, AgentSessionCommitRecord,
+    AgentSessionRecord, AgentSubagentContentClaimRecord, AgentSubagentContentRevisionRecord,
+    AgentSubagentLinkRecord, AgentUsageStatsRecord, AgentWorkspaceScopeAuditRecord,
+    BRIDGE_SOURCE_DEEPSEEK_HARNESS, BridgeEventAppendInput, BridgeEventAppendOutcome,
+    BridgeEventStatus, BridgeLinkSourceType, BridgeLinkWrite, BridgeOperationStatus,
+    BridgeSessionOpenInput, BridgeSessionState, CAPTURE_INTERNAL_META_AND_QUEUE_TABLES,
+    CAPTURE_SECONDARY_INDEX_TABLES, CAPTURE_SOURCE_NAMESPACE_LEN, CAPTURE_SOURCE_TABLES,
+    CAPTURE_SOURCE_TABLES_COUNT, CaptureAgentKind, CaptureBatchItem, CaptureBatchOutcome,
+    CaptureBatchPayload, CaptureCatalogCopyReceiptRecord, CaptureCheckpointScope,
+    CaptureCompleteness, CaptureCoverageClaimState, CaptureExportJobState, CaptureHashKind,
+    CaptureImportIdentityState, CaptureQueueHighwater, CaptureQueueLane,
+    CaptureSchemaVersionRecord, CaptureScopeState, CaptureSessionState, CaptureSourceChannel,
+    CaptureStore, CaptureSubagentClaimState, CaptureSubagentLinkState,
+    CaptureSubagentSourceChannel, MAX_BRIDGE_EVENT_PAYLOAD_BYTES, MAX_CAPTURE_DEDUP_KEY_BYTES,
+    WORKSPACE_SCOPE_AUDIT_ACTION, capture_declared_non_source_tables, capture_sha256_hex,
+    capture_source_tables_from_sql, invert_capture_timestamp,
 };
 pub use config_store::{
     CONFIG_FORMAT_MANIFEST_FILE, CONFIG_FORMAT_MANIFEST_VERSION, CONFIG_MIGRATION_LOCK_FILE,
