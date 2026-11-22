@@ -136,3 +136,5 @@ flowchart TD
 - 2026-11-21（LS-18 / #968）：新增 `--find-object=<object>`（可重复）——按提交相对首个父提交的递归 diff 匹配：变更文件对的旧/新 blob 或仅出现在一侧的树（`collect_tree_ids` 枚举子树 ID，`commit_touches_objects` 比对），多值并集；不可解析对象 → `LBR-CLI-003`。回归：`command::log_test::find_object_filter`（AC1–AC4）。
 
 - 2026-11-21（LS-32 / #961）：新增 `validate_line_range_args`——`-L` 与位置 pathspec 同用 → `LBR-CLI-002` + `-L<range>:<file> cannot be used with pathspec`；与 `--follow` 同用 → `LBR-CLI-002` + `--follow requires exactly one pathspec`；被跟踪文件不存在 → `LBR-CLI-003` + `There is no path <file> in the commit`；非法语法仍为 `LBR-CLI-002`。回归：`command::log_test::line_range_argument_diagnostics`（AC1–AC4）。
+
+- 2026-11-21（LS-08 / #960）：`log` 对 replace 引用显示 `replaced` 装饰——`load_history_commit` 在内容被替换后恢复**原始 oid**（`commit.id = commit_id`），`has_replace_ref` 读取 `GIT_REPLACE_REF_BASE`（默认 `refs/replace/`）判断标记，调色板新增 `color.decorate.replaced`（默认 `1;34`），标记追加在其它装饰之后。回归：`command::log_test::decorate_replaced_and_env_base`（AC1–AC2）。

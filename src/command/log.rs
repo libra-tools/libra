@@ -766,6 +766,7 @@ struct DecorateColors {
     branch: Option<String>,
     remote: Option<String>,
     tag: Option<String>,
+    replaced: Option<String>,
 }
 
 /// Strip SGR sequences from `text` (the plain `%D` form).
@@ -851,6 +852,7 @@ async fn resolve_decorate_colors(enabled: bool) -> DecorateColors {
         branch: Some("1;32".to_string()),
         remote: Some("1;31".to_string()),
         tag: Some("1;33".to_string()),
+        replaced: Some("1;34".to_string()),
     };
     if let Some(value) = resolve_color_slot("color.diff.commit").await {
         colors.commit = Some(value);
@@ -868,6 +870,9 @@ async fn resolve_decorate_colors(enabled: bool) -> DecorateColors {
     }
     if let Some(value) = resolve_color_slot("color.decorate.tag").await {
         colors.tag = Some(value);
+    }
+    if let Some(value) = resolve_color_slot("color.decorate.replaced").await {
+        colors.replaced = Some(value);
     }
     colors
 }
@@ -2021,7 +2026,12 @@ pub(crate) fn reset_debug_log_commits_loaded() {
 ///
 /// `get_reachable_commits` stays uncounted: it is a set helper for other commands.
 fn load_history_commit(commit_id: &ObjectHash) -> Result<Commit, CliError> {
-    let commit = load_object::<Commit>(commit_id).map_err(log_missing_history_error)?;
+    let mut commit = load_object::<Commit>(commit_id).map_err(log_missing_history_error)?;
+    // `refs/replace/<oid>` substitutes the object *content*; Git still prints the
+    // original oid and decorates it with `replaced`.
+    if commit.id != *commit_id {
+        commit.id = *commit_id;
+    }
     note_history_commit_loaded();
     Ok(commit)
 }
@@ -2559,6 +2569,27 @@ fn validate_line_range_args(args: &LogArgs, paths: &[String]) -> CliResult<()> {
         }
     }
     Ok(())
+}
+
+/// The replace-ref namespace, honouring `GIT_REPLACE_REF_BASE`.
+fn replace_ref_base() -> String {
+    let base = std::env::var("GIT_REPLACE_REF_BASE")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "refs/replace/".to_string());
+    if base.ends_with('/') {
+        base
+    } else {
+        format!("{base}/")
+    }
+}
+
+/// Whether a replace ref maps `id` to another object.
+fn has_replace_ref(id: &ObjectHash) -> bool {
+    util::storage_path()
+        .join(replace_ref_base())
+        .join(id.to_string())
+        .exists()
 }
 
 /// Resolve every `--find-object` value to an object id.
@@ -3430,6 +3461,10 @@ async fn execute_safe_with_diff_formats(
                     })
                     .collect(),
             );
+            // Git appends the `replaced` marker after the other decorations.
+            if has_replace_ref(&commit.id) {
+                ref_msgs.push(paint(&decorate_colors.replaced, "replaced", color_enabled));
+            }
             let ref_msgs_plain: Vec<String> =
                 ref_msgs.iter().map(|segment| strip_sgr(segment)).collect();
             if ref_msgs.is_empty() {

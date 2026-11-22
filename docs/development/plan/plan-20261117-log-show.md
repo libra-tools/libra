@@ -726,7 +726,7 @@ PY
 
 ### Task LS-08: `log --decorate` 显示 `replaced` 标记与支持 `GIT_REPLACE_REF_BASE`（#960）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-21：解除了此前的阻塞——`load_history_commit` 在 `load_object` 应用 replace 之后把 `commit.id` 恢复为**原始 oid**（内容仍来自替换对象），因此原始提交可以正确标注；`has_replace_ref` 按 `GIT_REPLACE_REF_BASE`（默认 `refs/replace/`，自动补尾 `/`）检查松散引用；`DecorateColors.replaced` 默认 `1;34` 并支持 `color.decorate.replaced`；标记追加在其它装饰之后（与 Git 相同），彩色输出为 ` (\e[1;34mreplaced\e[m)`。AC1（默认命名空间）与 AC2（仅自定义命名空间）由 `command::log_test::decorate_replaced_and_env_base` 覆盖；`log_test` 全绿；严格 Clippy exit 0；EN/zh/开发文档与 `COMPATIBILITY.md` 同卡同步。**Codex/Claude 审计按用户 2026-11-21 指令取消**。）
 
 **Description:** 装饰收集读取 replace 引用（默认前缀 `refs/replace/`，可由 `GIT_REPLACE_REF_BASE` 覆盖），为存在替换的提交输出 `replaced` 装饰。
 

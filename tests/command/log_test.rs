@@ -8664,3 +8664,77 @@ fn line_range_argument_diagnostics() {
         "AC4 wording: {stderr}"
     );
 }
+
+#[test]
+fn decorate_replaced_and_env_base() {
+    use super::{assert_cli_success, run_libra_command, run_libra_command_with_env};
+
+    // C1 is replaced by C2; the decoration must show `(replaced)` on C1's own
+    // oid, honouring `GIT_REPLACE_REF_BASE`.
+    let work = tempfile::tempdir().expect("work dir");
+    let repo = work.path().join("r");
+    std::fs::create_dir_all(&repo).expect("mkdir repo");
+    assert_cli_success(&run_libra_command(&["init"], &repo), "init");
+    run_libra_command(&["config", "set", "user.name", "t"], &repo);
+    run_libra_command(&["config", "set", "user.email", "t@t"], &repo);
+    std::fs::write(repo.join("f.txt"), "a\n").expect("write a");
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], &repo), "add a");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c1", "--no-verify"], &repo),
+        "commit c1",
+    );
+    let c1 = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], &repo).stdout)
+        .trim()
+        .to_string();
+    std::fs::write(repo.join("f.txt"), "b\n").expect("write b");
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], &repo), "add b");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c2", "--no-verify"], &repo),
+        "commit c2",
+    );
+    let c2 = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], &repo).stdout)
+        .trim()
+        .to_string();
+    assert_cli_success(
+        &run_libra_command(&["replace", &c1, &c2], &repo),
+        "replace c1",
+    );
+
+    let out = |args: &[&str]| {
+        let result = run_libra_command(args, &repo);
+        assert_cli_success(&result, &format!("log {args:?}"));
+        String::from_utf8_lossy(&result.stdout).to_string()
+    };
+    // AC1: the default `refs/replace/` namespace marks the original commit.
+    let default_base = out(&["log", "--oneline", "--decorate=short"]);
+    let c1_line = default_base
+        .lines()
+        .find(|line| line.starts_with(&c1[..7]))
+        .unwrap_or_default()
+        .to_string();
+    assert!(c1_line.contains("(replaced)"), "AC1 marker: {default_base}");
+    // AC2: only the custom namespace carries the replacement.
+    std::fs::remove_file(repo.join(format!(".libra/refs/replace/{c1}"))).expect("drop replace ref");
+    std::fs::create_dir_all(repo.join(".libra/refs/custom-replace")).expect("mkdir custom base");
+    std::fs::write(
+        repo.join(format!(".libra/refs/custom-replace/{c1}")),
+        format!("{c2}\n"),
+    )
+    .expect("custom replace ref");
+    let custom = run_libra_command_with_env(
+        &["log", "--oneline", "--decorate=short"],
+        &repo,
+        &[("GIT_REPLACE_REF_BASE", "refs/custom-replace/")],
+    );
+    assert_cli_success(&custom, "AC2 run");
+    let custom_stdout = String::from_utf8_lossy(&custom.stdout).to_string();
+    let custom_line = custom_stdout
+        .lines()
+        .find(|line| line.starts_with(&c1[..7]))
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        custom_line.contains("(replaced)"),
+        "AC2 marker: {custom_stdout}"
+    );
+}

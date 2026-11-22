@@ -509,6 +509,19 @@ Keep only the commits referenced by a (filtered) decoration plus the repository
 root(s), dropping the commits in between. `--decorate-refs`/`--decorate-refs-exclude`
 narrow which references count, so the simplification follows the filtered set.
 
+### `replaced` decorations
+
+A commit whose object is substituted by a replace ref is printed with its **original**
+object id and a `replaced` decoration, the way Git does; the substitution only swaps
+the content that is read. Replace refs live under `refs/replace/` unless
+`GIT_REPLACE_REF_BASE` points at another namespace (for example
+`refs/custom-replace/`), and only the active namespace is consulted.
+
+```bash
+libra replace <old> <new>
+libra log --oneline --decorate=short   # <old> … (replaced)
+```
+
 ### Decoration colours
 
 `color.decorate.HEAD`, `color.decorate.branch`, `color.decorate.remoteBranch` and
