@@ -284,7 +284,14 @@ pub fn resolve_dot_libra_pointer(worktree: &Path) -> Option<PathBuf> {
     if fs::symlink_metadata(&pointer).ok()?.file_type().is_dir() {
         return None;
     }
-    read_gitdir_file(&pointer, worktree)
+    let target = read_gitdir_file(&pointer, worktree)?;
+    // A `.libra` pointer resolving to another `.libra` directory is the removed
+    // legacy relocation layout; only `clone --separate-git-dir <DIR>` pointers
+    // (metadata in its own directory) are honoured.
+    if target.file_name().is_some_and(|name| name == ROOT_DIR) {
+        return None;
+    }
+    Some(target)
 }
 
 fn resolve_dot_git_dir(worktree: &Path) -> Option<PathBuf> {

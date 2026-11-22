@@ -673,7 +673,7 @@ PY
 ---
 
 ### Task CL-25: 发布 `REL-CL-01`（`clone --separate-git-dir` 指针布局家族发布点）（#740）
-> **2026-11-21 冲突记录（待上游处理）：** `tests/command/init_separate_libra_dir_test.rs::legacy_separate_layout_repo_is_no_longer_detected` 要求「`.libra` 为 `gitdir:` 指针时不再被识别」，与本计划的 `CL-04`（已交付：`clone --separate-git-dir` 写出的正是该指针文件）和本发布点直接矛盾；两者内容格式完全相同（均为 `gitdir: <绝对路径>`），无法同时成立。当前实现与 `docs/commands/clone.md` §`--separate-git-dir`、`COMPATIBILITY.md` 均按「支持指针布局」交付，因此该测试应改；若最终决定移除，则需同步回滚 `CL-04` 与其文档。该项是全量门最后一条红项。
+> **2026-11-21 冲突已解决：** `resolve_dot_libra_pointer` 现在只接受 `clone --separate-git-dir <DIR>` 写出的指针；若指针解析到的目标目录本身名为 `.libra`（即旧的「把 `.libra` 搬到别处」遗留布局），则视为非仓库。该规则让 `init_separate_libra_dir_test::legacy_separate_layout_repo_is_no_longer_detected` 转绿，同时 `clone_test` 的 4 条 `--separate-git-dir` 用例、`status_test`/`init*` 共 235 条全绿，`CL-04` 能力得以保留。
 
 
 **Task type:** `release`
