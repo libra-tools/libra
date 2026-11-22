@@ -777,7 +777,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `remote-pending`（2026-11-22 03:46:22 UTC，版本 `0.30.279`，于 `main` 直接提交推送；Stage 1 精确 1 文件写集、AC1–AC6、四组特征矩阵、fmt、严格 clippy、rustdoc 与 Codex `01a2015b-e3a7-75f0-8d1a-27bd39e38f6d` `VERDICT: PASS` 全绿）
 
 **Description:** 100% 在独占文件 `src/storage/mod.rs` 内补齐双存储关闭时的 `compile_error!` 守卫、`#[cfg(feature = "storage-redb")]` 编译期断言（确保 `cfg!(feature = "storage-queue")` 恒为真）与条件导出守卫，并逐一验证 4 组独立存储特性组合零告警通过编译。
 
@@ -791,20 +791,20 @@
 | `ADR-RB-01` #1 要求关闭两存储后端触发 `compile_error!`、一切启用 `storage-redb` 的构建自动蕴含 `storage-queue`，且 4 组存储特征组合均须零告警独立编译通过 | `ADR-RB-01` #1；`GC-RB-05`；`RB-01` |
 
 **Acceptance criteria:**
-- [ ] 关闭两个存储后端（`--no-default-features`）时 `src/storage/mod.rs` 触发非零退出的 `compile_error!`。
-- [ ] `--no-default-features --features storage-sqlite` 编译通过零告警。
-- [ ] `--no-default-features --features storage-redb`（不显式传 `storage-queue`）编译通过零告警。
-- [ ] `src/storage/mod.rs` 中 `#[cfg(feature = "storage-redb")]` 静态断言确保 `cfg!(feature = "storage-queue")` 恒为真。
-- [ ] `--no-default-features --features storage-redb,storage-queue` 编译通过零告警。
-- [ ] `--features storage-sqlite,storage-redb,storage-queue` 双特性叠加编译通过零告警。
+- [x] 关闭两个存储后端（`--no-default-features`）时 `src/storage/mod.rs` 触发非零退出的 `compile_error!`。
+- [x] `--no-default-features --features storage-sqlite` 编译通过零告警。
+- [x] `--no-default-features --features storage-redb`（不显式传 `storage-queue`）编译通过零告警。
+- [x] `src/storage/mod.rs` 中 `#[cfg(feature = "storage-redb")]` 静态断言确保 `cfg!(feature = "storage-queue")` 恒为真。
+- [x] `--no-default-features --features storage-redb,storage-queue` 编译通过零告警。
+- [x] `--features storage-sqlite,storage-redb,storage-queue` 双特性叠加编译通过零告警。
 
 **Verification:**
-- [ ] `bash -euo pipefail -c 'set +e; out="$(cargo check --no-default-features 2>&1)"; status=$?; set -e; test "$status" -ne 0 && printf "%s\n" "$out" | rg -q "storage-sqlite|storage-redb"'`（覆盖 AC1）
-- [ ] `cargo check --no-default-features --features storage-sqlite`（覆盖 AC2）
-- [ ] `cargo check --no-default-features --features storage-redb`（覆盖 AC3、AC4）
-- [ ] `cargo check --no-default-features --features storage-redb,storage-queue`（覆盖 AC5）
-- [ ] `cargo check --features storage-sqlite,storage-redb,storage-queue`（覆盖 AC6）
-- [ ] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 1 文件实现白名单（`src/storage/mod.rs`）。
+- [x] `bash -euo pipefail -c 'set +e; out="$(cargo check --no-default-features 2>&1)"; status=$?; set -e; test "$status" -ne 0 && printf "%s\n" "$out" | rg -q "storage-sqlite|storage-redb"'`（覆盖 AC1）
+- [x] `cargo check --no-default-features --features storage-sqlite`（覆盖 AC2）
+- [x] `cargo check --no-default-features --features storage-redb`（覆盖 AC3、AC4）
+- [x] `cargo check --no-default-features --features storage-redb,storage-queue`（覆盖 AC5）
+- [x] `cargo check --features storage-sqlite,storage-redb,storage-queue`（覆盖 AC6）
+- [x] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 1 文件实现白名单（`src/storage/mod.rs`）。
 
 **Full-suite trigger:** `none`
 
@@ -10012,8 +10012,9 @@
 
 | 任务 | 状态 | Commit SHA | 版本 | 关键验证 / CI / Release 证据 |
 |---|---|---|---|---|
-| `RB-01` | `done` / `remote-pending` | 本提交（`main`） | `0.30.278` | 2026-11-22 03:39:49 UTC：AC1–AC8（未暂存+已暂存双态）、4 特性编译矩阵（`redb 5.0.0`/`postcard 1.2.0`/`crc32c 0.6.9`）、`cargo +nightly fmt --all --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo doc --no-deps --all-features`、`compat_version_surface_sync`、`compat_matrix_alignment`、`compat_serial_registry` 全绿；Codex 只读审查 `01a20155-954e-7f10-a16a-d2edb84b0569` `VERDICT: PASS`（P0/P1/P2=0） |
-| `RB-01d`..`RB-34c`（剩余 153 卡） | `pending` | — | — | 按实施顺序于 `main` 逐卡推进 |
+| `RB-01` | `done` / `remote-pending` | `57fed0f`（`main`） | `0.30.278` | 2026-11-22 03:39:49 UTC：AC1–AC8（未暂存+已暂存双态）、4 特性编译矩阵（`redb 5.0.0`/`postcard 1.2.0`/`crc32c 0.6.9`）、`cargo +nightly fmt --all --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo doc --no-deps --all-features`、`compat_version_surface_sync`、`compat_matrix_alignment`、`compat_serial_registry` 全绿；Codex 只读审查 `01a20155-954e-7f10-a16a-d2edb84b0569` `VERDICT: PASS`（P0/P1/P2=0） |
+| `RB-01d` | `done` / `remote-pending` | 本提交（`main`） | `0.30.279` | 2026-11-22 03:46:22 UTC：Stage 1 精确 1 文件写集、AC1–AC6（双关 `compile_error!` + 4 特性编译矩阵 + `storage-redb` 隐式 `storage-queue` 断言）、fmt、严格 clippy、rustdoc、`compat_version_surface_sync` 全绿；Codex `01a2015b-e3a7-75f0-8d1a-27bd39e38f6d` `VERDICT: PASS`（P0/P1/P2=0） |
+| `RB-01b`..`RB-34c`（剩余 152 卡） | `pending` | — | — | 按实施顺序于 `main` 逐卡推进 |
 
 ## Codex review log
 
