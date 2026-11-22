@@ -5689,8 +5689,38 @@ fn tree_blob_map(tree_id: &ObjectHash) -> CliResult<HashMap<PathBuf, ObjectHash>
     Ok(tree.get_plain_items()?.into_iter().collect())
 }
 
+/// Longest-common-subsequence alignment of two line lists.
+fn lcs_alignment(a: &[String], b: &[String]) -> Vec<(usize, usize)> {
+    let (n, m) = (a.len(), b.len());
+    let mut table = vec![vec![0usize; m + 1]; n + 1];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            table[i][j] = if a[i] == b[j] {
+                table[i + 1][j + 1] + 1
+            } else {
+                table[i + 1][j].max(table[i][j + 1])
+            };
+        }
+    }
+    let mut pairs = Vec::new();
+    let (mut i, mut j) = (0, 0);
+    while i < n && j < m {
+        if a[i] == b[j] {
+            pairs.push((i, j));
+            i += 1;
+            j += 1;
+        } else if table[i + 1][j] >= table[i][j + 1] {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    pairs
+}
+
 /// Dense combined diff (`git log --cc`): only the paths that changed against
-/// *every* parent are printed, with one `@@@` hunk per file.
+/// *every* parent are printed, with one `@@@` hunk per file whose body carries a
+/// column per parent, interleaved in the merge's own line order.
 async fn generate_cc_diff(commit: &Commit, paths: &[PathBuf]) -> CliResult<String> {
     // A non-merge commit keeps the ordinary patch (Git's `--cc` behaviour).
     if commit.parent_commit_ids.len() < 2 {
@@ -5709,14 +5739,10 @@ async fn generate_cc_diff(commit: &Commit, paths: &[PathBuf]) -> CliResult<Strin
         paths.to_vec()
     };
     candidates.sort();
-    let short = |hash: &ObjectHash| -> String {
-        let text = hash.to_string();
-        text.chars().take(7).collect()
-    };
+    let short = |hash: &ObjectHash| -> String { hash.to_string().chars().take(7).collect() };
     let mut output = String::new();
     for path in candidates {
         let merge_blob = merge_blobs.get(&path).copied();
-        // Dense: the path must differ from every parent.
         let differs_from_all = parent_maps
             .iter()
             .all(|blobs| blobs.get(&path).copied() != merge_blob);
@@ -5753,6 +5779,73 @@ async fn generate_cc_diff(commit: &Commit, paths: &[PathBuf]) -> CliResult<Strin
                 None => Vec::new(),
             });
         }
+        // Per parent: which merge line each parent line aligns with, and which
+        // merge lines matched.
+        let mut pending: Vec<Vec<(usize, String)>> = Vec::new();
+        let mut matched: Vec<Vec<bool>> = Vec::new();
+        for lines in &parent_lines {
+            let pairs = lcs_alignment(lines, &merge_lines);
+            let mut parent_pending = Vec::new();
+            let parent_matched = vec![false; merge_lines.len()];
+            let mut matched_merge: Vec<bool> = parent_matched;
+            // Insertion slot: the merge line *after* the last match, so a
+            // removed line lands after its context and before the next line.
+            let mut last_merge_index = 0usize;
+            let mut seen_match = false;
+            let pair_map: std::collections::HashMap<usize, usize> =
+                pairs.iter().map(|(p, m)| (*p, *m)).collect();
+            for (index, line) in lines.iter().enumerate() {
+                match pair_map.get(&index) {
+                    Some(merge_index) => {
+                        matched_merge[*merge_index] = true;
+                        last_merge_index = *merge_index + 1;
+                        seen_match = true;
+                    }
+                    None => parent_pending
+                        .push((if seen_match { last_merge_index } else { 0 }, line.clone())),
+                }
+            }
+            pending.push(parent_pending);
+            matched.push(matched_merge);
+        }
+        let mut body = String::new();
+        for (merge_index, line) in merge_lines.iter().enumerate() {
+            for (parent_index, parent_pending) in pending.iter_mut().enumerate() {
+                let mut remaining = Vec::new();
+                for (position, pending_line) in parent_pending.drain(..) {
+                    if position <= merge_index {
+                        for column in 0..parent_lines.len() {
+                            body.push(if column == parent_index { '-' } else { ' ' });
+                        }
+                        body.push_str(&pending_line);
+                        body.push('\n');
+                    } else {
+                        remaining.push((position, pending_line));
+                    }
+                }
+                *parent_pending = remaining;
+            }
+            let mut prefix = String::new();
+            for parent_matched in &matched {
+                prefix.push(if parent_matched[merge_index] {
+                    ' '
+                } else {
+                    '+'
+                });
+            }
+            body.push_str(&prefix);
+            body.push_str(line);
+            body.push('\n');
+        }
+        for (parent_index, parent_pending) in pending.iter().enumerate() {
+            for (_, pending_line) in parent_pending {
+                for column in 0..parent_lines.len() {
+                    body.push(if column == parent_index { '-' } else { ' ' });
+                }
+                body.push_str(pending_line);
+                body.push('\n');
+            }
+        }
         output.push_str(&format!("diff --cc {}\n", path.display()));
         output.push_str(&format!(
             "index {}..{}\n",
@@ -5764,35 +5857,9 @@ async fn generate_cc_diff(commit: &Commit, paths: &[PathBuf]) -> CliResult<Strin
             path.display(),
             path.display()
         ));
-
-        // Git prints one column per parent: `-` where that parent's line is
-        // replaced, `+` where the merge line is new relative to it.
-        let mut body = String::new();
-        for (parent_index, lines) in parent_lines.iter().enumerate() {
-            for line in lines {
-                if merge_lines.contains(line) {
-                    continue;
-                }
-                for column in 0..parent_maps.len() {
-                    body.push(if column == parent_index { '-' } else { ' ' });
-                }
-                body.push_str(line);
-                body.push('\n');
-            }
-        }
-        for line in &merge_lines {
-            let mut prefix = String::new();
-            for lines in &parent_lines {
-                prefix.push(if lines.contains(line) { ' ' } else { '+' });
-            }
-            body.push_str(&prefix);
-            body.push_str(line);
-            body.push('\n');
-        }
-        let parent_count = parent_maps.len();
         let mut ranges = String::new();
-        for _ in 0..parent_count {
-            ranges.push_str(&format!("-1,{} ", parent_lines[0].len().max(1)));
+        for lines in &parent_lines {
+            ranges.push_str(&format!("-1,{} ", lines.len().max(1)));
         }
         output.push_str(&format!(
             "@@@ {}+1,{} @@@\n",

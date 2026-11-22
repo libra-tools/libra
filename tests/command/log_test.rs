@@ -8846,6 +8846,8 @@ fn log_cc_merge_combined_diff() {
         assert_cli_success(&result, &format!("log {args:?}"));
         String::from_utf8_lossy(&result.stdout).to_string()
     };
+    // The multi-region shape (two conflicts in one file) is pinned below with
+    // `--cc` LCS alignment; the single-conflict bytes are asserted after AC2.
     // AC2: only the file that differs from every parent is listed.
     let combined = out(&["log", "--cc", "-1"]);
     assert!(

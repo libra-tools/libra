@@ -142,3 +142,5 @@ flowchart TD
 - 2026-11-21（LS-14 收尾 / #972）：`format_stat_output` 与 Git 对齐——变更列宽取本块最宽计数（原固定 `{:>3}`），汇总行省略为零的 insertion/deletion 子句，使 `--format= --stat` 与 `git log --format= --stat` 逐字一致（解除该卡 AC5 的阻塞）。回归：`empty_format_or_pretty_omits_header` 的 AC5 改为逐字断言；`log_test` 276/276、`show_test` 42/42。
 
 - 2026-11-21（LS-19 / #833 第一段）：新增 `--cc`（隐含 `-p`）——合并提交输出稠密组合差异（`generate_cc_diff`：仅保留对**每个**父提交都变更的路径，输出 `diff --cc`、`index <p1>,<p2>..<merge>`、`---/+++` 与 `@@@` 组合 hunk，正文按父提交分列）；非合并提交走普通 `generate_diff`，实测与 `-p` 逐字节相同。回归：`command::log_test::log_cc_merge_combined_diff`（AC2/AC3 + AC1 形状）。
+
+- 2026-11-21（LS-19 / #833 第三段）：`--cc` 组合 hunk 采用 **LCS 对齐**（`lcs_alignment`）逐父提交对齐合并结果，正文按合并行顺序交错输出（上下文 ` `、父提交被替换行按列 `-`、合并新增行按列 `+`），插入槽位取「最后匹配行 + 1」，因此既有单条冲突夹具**保持逐字节一致**，新增「同文件两处冲突」夹具也与 `git log --cc` 逐字节一致。回归：`log_test` 278/278、严格 Clippy exit 0。
