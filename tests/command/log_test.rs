@@ -7515,3 +7515,110 @@ fn log_colour_decorate_slots_match_git_bytes() {
         "AC6"
     );
 }
+
+#[test]
+fn no_abbrev_issue_958_remaining() {
+    use super::{assert_cli_success, run_libra_command};
+
+    // Fixture F09: C1; C2/C3 on separate branches; merge commit M with parents
+    // C2 and C3; HEAD -> M.
+    let work = tempfile::tempdir().expect("work dir");
+    let repo = work.path().join("r");
+    std::fs::create_dir_all(&repo).expect("mkdir repo");
+    assert_cli_success(&run_libra_command(&["init"], &repo), "init");
+    run_libra_command(&["config", "set", "user.name", "t"], &repo);
+    run_libra_command(&["config", "set", "user.email", "t@t"], &repo);
+    let commit_file = |name: &str, body: &str| {
+        std::fs::write(repo.join(name), body).expect("write file");
+        assert_cli_success(&run_libra_command(&["add", name], &repo), "add");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", body, "--no-verify"], &repo),
+            "commit",
+        );
+    };
+    commit_file("f.txt", "c1");
+    assert_cli_success(&run_libra_command(&["branch", "b1"], &repo), "branch b1");
+    assert_cli_success(&run_libra_command(&["switch", "b1"], &repo), "switch b1");
+    commit_file("g.txt", "c2");
+    assert_cli_success(
+        &run_libra_command(&["switch", "main"], &repo),
+        "switch main",
+    );
+    commit_file("h.txt", "c3");
+    assert_cli_success(
+        &run_libra_command(&["merge", "b1", "-m", "M", "--no-verify"], &repo),
+        "merge",
+    );
+
+    let out = |args: &[&str]| {
+        let result = run_libra_command(args, &repo);
+        assert_cli_success(&result, &format!("log {args:?}"));
+        String::from_utf8_lossy(&result.stdout).to_string()
+    };
+    // E(args): expand every abbreviated OID field of the plain run to its full
+    // 40-character form, leaving all other bytes untouched.
+    let expand = |args: &[&str]| {
+        let text = out(args);
+        let mut expanded = String::new();
+        let mut token = String::new();
+        let boundary = |ch: char| ch == ' ' || ch == '\n';
+        let flush = |token: &mut String, expanded: &mut String| {
+            let is_hex = token.len() >= 7
+                && token.len() < 40
+                && token.chars().all(|ch| ch.is_ascii_hexdigit());
+            if is_hex {
+                expanded.push_str(out(&["rev-parse", token]).trim());
+            } else {
+                expanded.push_str(token);
+            }
+            token.clear();
+        };
+        for ch in text.chars() {
+            if boundary(ch) {
+                flush(&mut token, &mut expanded);
+                expanded.push(ch);
+            } else {
+                token.push(ch);
+            }
+        }
+        flush(&mut token, &mut expanded);
+        expanded
+    };
+
+    // AC1: `--no-abbrev --format=%h` equals `--format=%H`.
+    assert_eq!(
+        out(&["log", "--no-abbrev", "--format=%h"]),
+        out(&["log", "--format=%H"]),
+        "AC1"
+    );
+    // AC2: `--no-abbrev --format=%p` equals the expanded `--format=%p`.
+    assert_eq!(
+        out(&["log", "--no-abbrev", "--format=%p"]),
+        expand(&["log", "--format=%p"]),
+        "AC2"
+    );
+    // AC3: `--no-abbrev --parents --oneline` equals the expanded plain run.
+    assert_eq!(
+        out(&["log", "--no-abbrev", "--parents", "--oneline"]),
+        expand(&["log", "--parents", "--oneline"]),
+        "AC3"
+    );
+    // AC4: `--no-abbrev --children --oneline` equals the expanded plain run.
+    assert_eq!(
+        out(&["log", "--no-abbrev", "--children", "--oneline"]),
+        expand(&["log", "--children", "--oneline"]),
+        "AC4"
+    );
+    // AC5: the later `--no-abbrev` wins over `--abbrev=7`.
+    assert_eq!(
+        out(&["log", "--abbrev=7", "--no-abbrev", "--format=%h"]),
+        out(&["log", "--format=%H"]),
+        "AC5"
+    );
+    // AC6: the later `--abbrev=7` wins over `--no-abbrev`.
+    assert_eq!(
+        out(&["log", "--no-abbrev", "--abbrev=7", "--format=%h"]),
+        out(&["log", "--abbrev=7", "--format=%h"]),
+        "AC6"
+    );
+}

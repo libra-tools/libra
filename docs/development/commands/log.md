@@ -112,3 +112,5 @@ flowchart TD
 - 2026-11-21（LS-06 / #954）：新增 `--clear-decorations`（清除此前 `--decorate-refs*` 并放开默认命名空间过滤）与 `log.initialDecorationSet=all`；`refs/notes/*` 行按 notes 命名空间装饰（`notes/<name>`）且默认隐藏。回归：`command::log_test::log_clear_decorations_and_initial_decoration_set`。
 
 - 2026-11-21（LS-07 / #959）：装饰与 `commit <id>` 着色改为显式 SGR，读取 `color.decorate.{HEAD,branch,remoteBranch,tag}` 与 `color.diff.commit`（含旧名 `diff.color.commit`），默认调色板与 Git 实测一致；分隔符按 commit 色分段着色；`%d` 与 `%D` 分别使用带括号着色与纯文本形式。回归：`command::log_test::log_colour_decorate_slots_match_git_bytes`。
+
+- 2026-11-21（LS-09 / #958）：核实 `--no-abbrev` 在 `%h`、`%p`、`--parents`、`--children` 及与 `--abbrev=<N>` 的先后覆盖关系上已全部输出 40 位 OID（LO-09 已修复，本卡补回归）：新增 `command::log_test::no_abbrev_issue_958_remaining`（AC1–AC6，含 E() 展开对照）。
