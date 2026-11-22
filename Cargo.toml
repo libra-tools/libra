@@ -1,6 +1,6 @@
 [package]
 name = "libra"
-version = "0.30.277"
+version = "0.30.278"
 edition = "2024"
 license = "MIT"
 description = "AI agent-native version control system with Git on-disk compatibility, SQLite-backed metadata, and tiered cloud storage"
@@ -12,7 +12,10 @@ categories = ["command-line-utilities", "development-tools"]
 readme = "README.md"
 
 [features]
-default        = []
+default = ["storage-sqlite"]
+storage-sqlite = []
+storage-redb = ["storage-queue", "dep:redb", "dep:postcard", "dep:crc32c"]
+storage-queue = ["dep:postcard", "dep:crc32c"]
 worktree-fuse  = []   # Unix FUSE-backed worktree commands (optional)
 test-network   = []   # L2: tests requiring outbound network but no secrets
 test-live-ai   = []   # L3: tests calling real LLM APIs
@@ -149,6 +152,11 @@ tracing-opentelemetry = { version = "0.33.0", optional = true }
 # secret-service transport with VENDORED libdbus (static, no runtime dylib
 # dependency on end-user machines); macOS/Windows use native stores.
 keyring = { version = "3", optional = true, default-features = false, features = ["apple-native", "windows-native", "sync-secret-service", "vendored"] }
+
+# Storage engine optional backends (plan-20261121-redb-storage-concurrency)
+redb = { version = "5.0.0", optional = true }
+postcard = { version = "1.1", features = ["use-std"], optional = true }
+crc32c = { version = "0.6.9", optional = true }
 
 [target.'cfg(unix)'.dependencies] # only on Unix
 libfuse-fs = "0.1.13"

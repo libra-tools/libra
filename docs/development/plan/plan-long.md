@@ -1319,6 +1319,7 @@ MEM-03 → MEM-04；LR-09（plan-20260913 `FL-04/05` 收口）；LR-10；MEM-05 
 
 | 日期计划 | 主要归属 | 当前状态 | 说明 |
 |---|---|---|---|
+| [`plan-20261121-redb-storage-concurrency.md`](plan-20261121-redb-storage-concurrency.md) | 横切（redb 双库存储与 Capture 帧队列并发改进，不新增 LR） | 实施中 | 2026-11-22 03:39:49 UTC 登记开工；154 卡（Codex R34 `PASS`）；`RB-01` `done`/`remote-pending`（`0.30.278`），其余 `pending`，按用户指令于 `main` 逐卡提交推送。 |
 | [`plan-20261120-ui-real-data.md`](plan-20261120-ui-real-data.md) | D（`libra ui` 桌面窗口真实数据接入，无新 LR） | 未启动 | 2026-11-20 17:10:00 UTC 登记；7 卡 `UID-01`..`UID-07` 均 `pending`/空，R1-R7 双评 FAIL、R8 Codex FAIL、R9/R10/R11 双评 PASS，R12 最终字节确认待；串行链 `UID-01 → … → UID-07`，`UID-02`..`UID-05` 命中 `T-1`；不新增 LR，不改统计口径 |
 | [`plan-20261116-capture-queue.md`](plan-20261116-capture-queue.md) | B（AG-ATTR 捕获入库，无新 LR） | 实施完成 | 2026-11-17 22:21:33 UTC：CQ-01..CQ-07 全部 done/complete，FIX-CQ-01/02 关闭，收口全量 11845/11845 通过；`v0.30.209`/`v0.30.210` 发布与网站同步待操作者执行。 |
 | [`plan-20261105-linux-x86-baseline.md`](plan-20261105-linux-x86-baseline.md) | 发行兼容（无新 LR） | 未启动 | 2026-11-05 08:58:07 UTC 登记 Issue [#1060](https://github.com/libra-tools/libra/issues/1060)。ISA-01 `pending` / 空：Linux amd64 release 的 C 编译基线恢复为 x86-64，并以 N5105 验收官方产物。未实施。 |

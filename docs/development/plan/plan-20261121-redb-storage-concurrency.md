@@ -1,7 +1,7 @@
 # redb 双库存储与捕获帧队列并发访问改进计划（2026-11-21）
 
 > **模板版本：** `v2.16`；继承 [`plan-template.md`](plan-template.md) 的 `GC-01`..`GC-13`、`ER-01`..`ER-14`、`G-01`..`G-11`。
-> **状态：** **Codex R34 `VERDICT: PASS`（`P0=0, P1=0, P2=0`，session `01a1ffdd-79dc-7591-8f67-44678a2fb712`，受审冻结版 SHA-256 `594acd82f37aadab8da23c1a2806a57c8ee1f45f94a27b27ffaf399e5f4b038e`）**，已通过开工前全部计划准入门禁（共 **154 卡**：Track A 114 卡含 110 张 `src/storage/**` 连续独占卡 + Track B 40 卡，120 个发布窗口，146 个唯一 `REL-RB-01` 接线生产文件；全部 154 张活动任务卡当前均为 `pending` / 空，尚未执行）。本次仅追加 R34 `PASS` 审查记录与更新顶部状态栏，未改动任何实质规范或任务卡正文；待首卡开工时再按规定同步 [`plan-status.md`](plan-status.md) 与 [`plan-long.md`](plan-long.md)。
+> **状态：** **实施中（按用户 2026-11-22 指令于 `main` 分支逐卡提交推送，不建分支/PR；patch +1；Codex Review 异常授权跳过）**；开工前计划已获 Codex R34 `VERDICT: PASS`（`P0=0, P1=0, P2=0`，session `01a1ffdd-79dc-7591-8f67-44678a2fb712`，受审冻结版 SHA-256 `594acd82f37aadab8da23c1a2806a57c8ee1f45f94a27b27ffaf399e5f4b038e`）。共 154 卡；实时进度以各卡 `Lifecycle / Acceptance`、「实施证据汇总」及 [`plan-status.md`](plan-status.md) 为准。
 > **基线快照：** `/Volumes/Data/gitmono/libra` `HEAD = d242b90f978196da443319836b64321c8c716c3d`（`Cargo.toml` 版本 `0.30.237`，核对时间 `2026-11-21 20:47:24 UTC`，`Cargo.toml:15` 当前为 `default = []`，`Cargo.toml:187` 含 dev 依赖 `syn = { version = "2.0", features = ["full", "visit", "visit-mut"] }`）。
 > **网站交付路径（遵循 `AGENTS.md:135` 现行指令与 `DEP-RB-03` 交付前硬门）：** 按现行 [`AGENTS.md:135`](../../../AGENTS.md#L135) 长期交付指令，权威网站交付工作区定为 **`$LIBRA_BACKEND = /Volumes/Sea/libra-backend`**（生产分支 `cf`，直接工作于 `cf`、**保留无关未提交改动**、精确暂存本卡目标文件、同步检查与前端构建、独立 Claude Code `VERDICT: PASS`、签名提交推送并核验 Cloudflare 部署）。**现场客观观测与强制前置门（`DEP-RB-03`）：** `2026-11-21 12:36:00 UTC` 本机只读实测 `/Volumes/Sea/libra-backend` 当前尚未挂载/不存在（`No such file or directory`），而同级目录 `/Volumes/Data/gitmono/libra-backend` 存在且位于 `cf`（含 `.libra/` 无 `.git`、`remote.origin.url = git@github.com:libra-tools/libra-backend.git/`、`## cf...origin/cf`）。历史计划记录（如 `plan-20261117-fetch-push.md:10`）与模板默认路径（`plan-template.md:332`）**不得覆盖现行 `AGENTS.md:135`**；因此 `DEP-RB-03` 作为 `RB-30` 与 `RB-33c` 的强制外部先决条件（**不阻塞 Track A `RB-01`..`RB-12` 与 Track B 本地实现 `RB-13`..`RB-29b`**），在进入任何网站交付卡前必须满足二选一，否则**立即 STOP，严禁擅自写入未获授权路径**：① `/Volumes/Sea/libra-backend` 已就绪并通过 `.libra`/`origin`/`cf` 校验；或 ② 交付前由用户在当前会话新作出明确书面裁定批准改用 `/Volumes/Data/gitmono/libra-backend` 并同步修订 `DEP-RB-03` 与 `AGENTS.md:135`。
 
@@ -708,7 +708,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `remote-pending`（2026-11-22 03:39:49 UTC，版本 `0.30.278`，按用户 2026-11-22 指令于 `main` 直接提交推送；AC1–AC8、四特性编译矩阵、fmt、严格 clippy `--all-targets --all-features`、rustdoc、`compat_version_surface_sync`/`compat_matrix_alignment`/`compat_serial_registry` 与 Codex 只读审查 `01a20155-954e-7f10-a16a-d2edb84b0569` `VERDICT: PASS` 全部通过；远端 CI 门待推后观测）
 
 **Description:** 在 `Cargo.toml` 注册可叠加存储特性 `default = ["storage-sqlite"]`、`storage-redb = ["storage-queue", "dep:redb", "dep:postcard", "dep:crc32c"]`（自动蕴含 `storage-queue`）、`storage-queue = ["dep:postcard", "dep:crc32c"]` 及三项可选依赖 `redb = { version = "5.0.0", optional = true }`、`postcard = { version = "1.1", features = ["use-std"], optional = true }`、`crc32c = { version = "0.6.9", optional = true }`（保持 `sea-orm` 原样常驻），在 `src/lib.rs` 仅新增 1 行 `pub mod storage;`，并在 `src/storage/mod.rs` 落位最小占位模块。
 
@@ -720,30 +720,30 @@
 
 **Current evidence:**
 
-| 事实（已核实基线 `d242b90` / `0.30.237`） | 证据 |
+| 事实（已核实基线 `58ad55a` / `0.30.277`） | 证据 |
 |---|---|
-| `Cargo.toml` 当前 `default = []`，无 `storage-*` feature，无 `crc32c` 依赖 | `Cargo.toml:15-27,103` |
+| `Cargo.toml` 原 `default = []`，无 `storage-*` feature，无 `crc32c` 依赖 | `Cargo.toml:15-27,103` |
 | `src/storage/` 不存在，`src/lib.rs` 未导出 `storage` 模块 | `src/lib.rs:20-27` |
 
 **Acceptance criteria:**
-- [ ] `Cargo.toml` 定义默认特性 `default = ["storage-sqlite"]`。
-- [ ] `Cargo.toml` 定义可叠加特性 `storage-redb = ["storage-queue", "dep:redb", "dep:postcard", "dep:crc32c"]`。
-- [ ] `Cargo.toml` 定义可叠加特性 `storage-queue = ["dep:postcard", "dep:crc32c"]`。
-- [ ] `Cargo.toml` 声明可选依赖 `redb = { version = "5.0.0", optional = true }`。
-- [ ] `Cargo.toml` 声明可选依赖 `postcard = { version = "1.1", features = ["use-std"], optional = true }`。
-- [ ] `Cargo.toml` 声明可选依赖 `crc32c = { version = "0.6.9", optional = true }`。
-- [ ] `Cargo.toml` 中既有常驻依赖 `sea-orm` 声明保持原样零改动。
-- [ ] `src/lib.rs` 相对显式前置基线（`PRE_CARD_BASE`，同时核验工作区未暂存态与 `libra add` 已暂存态）的完整变更恰好为新增 1 行 `pub mod storage;`（0 行删除）。
+- [x] `Cargo.toml` 定义默认特性 `default = ["storage-sqlite"]`。
+- [x] `Cargo.toml` 定义可叠加特性 `storage-redb = ["storage-queue", "dep:redb", "dep:postcard", "dep:crc32c"]`。
+- [x] `Cargo.toml` 定义可叠加特性 `storage-queue = ["dep:postcard", "dep:crc32c"]`。
+- [x] `Cargo.toml` 声明可选依赖 `redb = { version = "5.0.0", optional = true }`。
+- [x] `Cargo.toml` 声明可选依赖 `postcard = { version = "1.1", features = ["use-std"], optional = true }`。
+- [x] `Cargo.toml` 声明可选依赖 `crc32c = { version = "0.6.9", optional = true }`。
+- [x] `Cargo.toml` 中既有常驻依赖 `sea-orm` 声明保持原样零改动。
+- [x] `src/lib.rs` 相对显式前置基线（`PRE_CARD_BASE`，同时核验工作区未暂存态与 `libra add` 已暂存态）的完整变更恰好为新增 1 行 `pub mod storage;`（0 行删除）。
 
 **Verification:**
-- [ ] `rg -q '^default = \["storage-sqlite"\]$' Cargo.toml`（覆盖 AC1）
-- [ ] `rg -q '^storage-redb = \["storage-queue", "dep:redb", "dep:postcard", "dep:crc32c"\]$' Cargo.toml`（覆盖 AC2）
-- [ ] `rg -q '^storage-queue = \["dep:postcard", "dep:crc32c"\]$' Cargo.toml`（覆盖 AC3）
-- [ ] `rg -q '^redb = \{ version = "5\.0\.0", optional = true \}$' Cargo.toml`（覆盖 AC4）
-- [ ] `rg -q '^postcard = \{ version = "1\.1", features = \["use-std"\], optional = true \}$' Cargo.toml`（覆盖 AC5）
-- [ ] `rg -q '^crc32c = \{ version = "0\.6\.9", optional = true \}$' Cargo.toml`（覆盖 AC6）
-- [ ] `python3 -c 'import os, subprocess; from pathlib import Path; run=lambda c: subprocess.check_output(c, text=True); extract=lambda t: (lambda lines: "".join(lines))(next(([l for l in t.splitlines(True)[i:]][:next(j for j,x in enumerate(t.splitlines(True)[i:],1) if "}" in x)] for i,line in enumerate(t.splitlines(True)) if line.startswith("sea-orm =")), [])); st=run(["libra","status","--porcelain=v1","--","Cargo.toml"]).strip(); base_ref=os.environ.get("PRE_CARD_BASE") or ("HEAD" if st else "HEAD~1"); old=extract(run(["libra","--no-pager","show",f"{base_ref}:Cargo.toml"])); wt=extract(Path("Cargo.toml").read_text(encoding="utf-8")); idx=extract(run(["libra","--no-pager","show",":Cargo.toml"])); assert old and old==wt and old==idx, "sea-orm block modified"'`（开工前捕获 `export PRE_CARD_BASE=$(libra rev-parse HEAD)`；零临时文件、零 `mktemp`、零 `/dev/fd`，纯内存双验工作区与暂存索引 `:Cargo.toml` 的多行 `sea-orm = { ... }` 块相对基线逐字节一致，覆盖 AC7）
-- [ ] `python3 -c 'import os, subprocess; from pathlib import Path; run=lambda c: subprocess.check_output(c, text=True); ok=lambda old,cur: len(cur)==len(old)+1 and any(cur[:i]==old[:i] and cur[i]=="pub mod storage;\n" and cur[i+1:]==old[i:] for i in range(len(old)+1)); st=run(["libra","status","--porcelain=v1","--","src/lib.rs"]).strip(); base_ref=os.environ.get("PRE_CARD_BASE") or ("HEAD" if st else "HEAD~1"); old=run(["libra","--no-pager","show",f"{base_ref}:src/lib.rs"]).splitlines(True); assert not ok(old, old+["pub mod storage;\n","+extra\n"]) and not ok(old+["-del\n"], old+["pub mod storage;\n"]) and not ok(old, old[:-1]+["pub mod storage;\n"]), "self-test failed"; wt=Path("src/lib.rs").read_text(encoding="utf-8").splitlines(True); idx=run(["libra","--no-pager","show",":src/lib.rs"]).splitlines(True); assert ok(old, wt), "worktree src/lib.rs mismatch"; assert idx==old or ok(old, idx), "staged index src/lib.rs mismatch"'`（开工前捕获 `export PRE_CARD_BASE=$(libra rev-parse HEAD)`，并于 `libra add src/lib.rs` 前的未暂存态与 `libra add src/lib.rs` 后的已暂存态**双态均执行**；零临时文件纯内存完整行列表比对工作区与索引 `:src/lib.rs` 相对基线严格仅插入唯一一行 `pub mod storage;\n` 且内置 `+`/`-` 行与删改行负例自测，彻底消除 unified diff 正则漏检，覆盖 AC8）
+- [x] `rg -q '^default = \["storage-sqlite"\]$' Cargo.toml`（覆盖 AC1）
+- [x] `rg -q '^storage-redb = \["storage-queue", "dep:redb", "dep:postcard", "dep:crc32c"\]$' Cargo.toml`（覆盖 AC2）
+- [x] `rg -q '^storage-queue = \["dep:postcard", "dep:crc32c"\]$' Cargo.toml`（覆盖 AC3）
+- [x] `rg -q '^redb = \{ version = "5\.0\.0", optional = true \}$' Cargo.toml`（覆盖 AC4）
+- [x] `rg -q '^postcard = \{ version = "1\.1", features = \["use-std"\], optional = true \}$' Cargo.toml`（覆盖 AC5）
+- [x] `rg -q '^crc32c = \{ version = "0\.6\.9", optional = true \}$' Cargo.toml`（覆盖 AC6）
+- [x] `python3 -c 'import os, subprocess; from pathlib import Path; run=lambda c: subprocess.check_output(c, text=True); extract=lambda t: (lambda lines: "".join(lines))(next(([l for l in t.splitlines(True)[i:]][:next(j for j,x in enumerate(t.splitlines(True)[i:],1) if "}" in x)] for i,line in enumerate(t.splitlines(True)) if line.startswith("sea-orm =")), [])); st=run(["libra","status","--porcelain=v1","--","Cargo.toml"]).strip(); base_ref=os.environ.get("PRE_CARD_BASE") or ("HEAD" if st else "HEAD~1"); old=extract(run(["libra","--no-pager","show",f"{base_ref}:Cargo.toml"])); wt=extract(Path("Cargo.toml").read_text(encoding="utf-8")); idx=extract(run(["libra","--no-pager","show",":Cargo.toml"])); assert old and old==wt and old==idx, "sea-orm block modified"'`（开工前捕获 `export PRE_CARD_BASE=$(libra rev-parse HEAD)`；零临时文件、零 `mktemp`、零 `/dev/fd`，纯内存双验工作区与暂存索引 `:Cargo.toml` 的多行 `sea-orm = { ... }` 块相对基线逐字节一致，覆盖 AC7）
+- [x] `python3 -c 'import os, subprocess; from pathlib import Path; run=lambda c: subprocess.check_output(c, text=True); ok=lambda old,cur: len(cur)==len(old)+1 and any(cur[:i]==old[:i] and cur[i]=="pub mod storage;\n" and cur[i+1:]==old[i:] for i in range(len(old)+1)); st=run(["libra","status","--porcelain=v1","--","src/lib.rs"]).strip(); base_ref=os.environ.get("PRE_CARD_BASE") or ("HEAD" if st else "HEAD~1"); old=run(["libra","--no-pager","show",f"{base_ref}:src/lib.rs"]).splitlines(True); assert not ok(old, old+["pub mod storage;\n","+extra\n"]) and not ok(old+["-del\n"], old+["pub mod storage;\n"]) and not ok(old, old[:-1]+["pub mod storage;\n"]), "self-test failed"; wt=Path("src/lib.rs").read_text(encoding="utf-8").splitlines(True); idx=run(["libra","--no-pager","show",":src/lib.rs"]).splitlines(True); assert ok(old, wt), "worktree src/lib.rs mismatch"; assert idx==old or ok(old, idx), "staged index src/lib.rs mismatch"'`（开工前捕获 `export PRE_CARD_BASE=$(libra rev-parse HEAD)`，并于 `libra add src/lib.rs` 前的未暂存态与 `libra add src/lib.rs` 后的已暂存态**双态均执行**；零临时文件纯内存完整行列表比对工作区与索引 `:src/lib.rs` 相对基线严格仅插入唯一一行 `pub mod storage;\n` 且内置 `+`/`-` 行与删改行负例自测，彻底消除 unified diff 正则漏检，覆盖 AC8）
 
 **Full-suite trigger:** `T-1: 修改 Cargo.toml 非版本依赖与 features 定义`
 
@@ -10008,11 +10008,12 @@
 
 ## 实施证据汇总
 
-> 全部 154 张任务卡尚未开工；开工后按 `v2.12` 仅在本节内联登记每卡提交 SHA、测试摘要、CI/Release run ID 与网站部署核验，严禁在仓库内创建外部证据目录或文件。
+> 按 `v2.12` 仅在本节内联登记每卡提交状态、版本与验证证据，严禁在仓库内创建外部证据目录或文件。
 
 | 任务 | 状态 | Commit SHA | 版本 | 关键验证 / CI / Release 证据 |
 |---|---|---|---|---|
-| `RB-01`..`RB-34c`（含全部 `G-09` 拆分子卡共 154 卡） | `pending` | — | — | 待 Codex 计划审阅 `PASS` 后按实施顺序执行 |
+| `RB-01` | `done` / `remote-pending` | 本提交（`main`） | `0.30.278` | 2026-11-22 03:39:49 UTC：AC1–AC8（未暂存+已暂存双态）、4 特性编译矩阵（`redb 5.0.0`/`postcard 1.2.0`/`crc32c 0.6.9`）、`cargo +nightly fmt --all --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo doc --no-deps --all-features`、`compat_version_surface_sync`、`compat_matrix_alignment`、`compat_serial_registry` 全绿；Codex 只读审查 `01a20155-954e-7f10-a16a-d2edb84b0569` `VERDICT: PASS`（P0/P1/P2=0） |
+| `RB-01d`..`RB-34c`（剩余 153 卡） | `pending` | — | — | 按实施顺序于 `main` 逐卡推进 |
 
 ## Codex review log
 

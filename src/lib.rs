@@ -24,6 +24,7 @@ pub mod git_protocol;
 pub mod gui;
 pub mod internal;
 pub mod lfs_structs;
+pub mod storage;
 pub mod utils;
 
 pub use utils::error::{CliError, CliErrorKind, CliResult};
