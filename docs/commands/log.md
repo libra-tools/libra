@@ -96,6 +96,18 @@ libra log --format=format:
 libra log --format= --stat
 ```
 
+### `--cc`
+
+`--cc` prints a dense combined diff for merge commits: only the paths that differ
+from **every** parent are listed, each with `diff --cc <path>`, an `index
+<p1>,<p2>..<merge>` line and one `@@@ -… -… +… @@@` hunk whose body carries a column
+per parent. Non-merge commits keep the ordinary patch, so `log --cc -1 <commit>`
+equals `log -p -1 <commit>` there. The option implies `-p`.
+
+```bash
+libra log --cc -1 <merge>
+```
+
 ### `--find-object=<object>`
 
 Keep only the commits whose diff against their first parent touches `<object>`:

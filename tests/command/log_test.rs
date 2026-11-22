@@ -8790,3 +8790,88 @@ fn tty_output_no_stray_escape_sequences() {
     // `script -qec "libra log --no-pager --color=always" /dev/null`; the test
     // harness cannot guarantee which `libra` binary the shell resolves.
 }
+
+#[test]
+fn log_cc_merge_combined_diff() {
+    use super::{assert_cli_success, run_libra_command};
+
+    // Conflicting edits on both sides; the merge resolution is what `--cc`
+    // must report (dense: only paths that differ from every parent).
+    let work = tempfile::tempdir().expect("work dir");
+    let repo = work.path().join("r");
+    std::fs::create_dir_all(&repo).expect("mkdir repo");
+    assert_cli_success(&run_libra_command(&["init"], &repo), "init");
+    run_libra_command(&["config", "set", "user.name", "t"], &repo);
+    run_libra_command(&["config", "set", "user.email", "t@t"], &repo);
+    std::fs::write(repo.join("c.txt"), "base\n").expect("write base c");
+    std::fs::write(repo.join("one.txt"), "one\n").expect("write one");
+    assert_cli_success(&run_libra_command(&["add", "."], &repo), "add base");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], &repo),
+        "commit base",
+    );
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "side"], &repo),
+        "branch side",
+    );
+    std::fs::write(repo.join("c.txt"), "side\n").expect("write side c");
+    assert_cli_success(&run_libra_command(&["add", "c.txt"], &repo), "add side");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "side-edit", "--no-verify"], &repo),
+        "commit side",
+    );
+    assert_cli_success(
+        &run_libra_command(&["switch", "main"], &repo),
+        "switch main",
+    );
+    std::fs::write(repo.join("c.txt"), "main\n").expect("write main c");
+    assert_cli_success(&run_libra_command(&["add", "c.txt"], &repo), "add main");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "main-edit", "--no-verify"], &repo),
+        "commit main",
+    );
+    let _ = run_libra_command(&["merge", "side", "-m", "M", "--no-verify"], &repo);
+    std::fs::write(repo.join("c.txt"), "resolved\n").expect("resolve");
+    assert_cli_success(
+        &run_libra_command(&["add", "c.txt"], &repo),
+        "add resolution",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "M", "--no-verify"], &repo),
+        "commit merge",
+    );
+
+    let out = |args: &[&str]| {
+        let result = run_libra_command(args, &repo);
+        assert_cli_success(&result, &format!("log {args:?}"));
+        String::from_utf8_lossy(&result.stdout).to_string()
+    };
+    // AC2: only the file that differs from every parent is listed.
+    let combined = out(&["log", "--cc", "-1"]);
+    assert!(
+        combined.contains("diff --cc c.txt"),
+        "AC2 c.txt: {combined}"
+    );
+    assert!(
+        !combined.contains("diff --cc one.txt"),
+        "AC2 one.txt: {combined}"
+    );
+    assert!(
+        !combined.contains("diff --git "),
+        "AC2 dense combined headers: {combined}"
+    );
+    // AC1 (shape): one `@@@` hunk with a column per parent.
+    assert!(combined.contains("@@@ -"), "AC1 hunk header: {combined}");
+    assert!(
+        combined.contains("@@@ -1,"),
+        "AC1 parent columns: {combined}"
+    );
+    assert!(
+        combined.contains("+resolved"),
+        "AC1 resolution line: {combined}"
+    );
+    // AC3: a non-merge commit keeps the ordinary patch bytes.
+    let non_merge = out(&["log", "--cc", "-1", "HEAD~1"]);
+    let plain = out(&["log", "-p", "-1", "HEAD~1"]);
+    assert_eq!(non_merge, plain, "AC3 non-merge passthrough");
+}

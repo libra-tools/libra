@@ -1462,7 +1462,7 @@ PY
 
 ### Task LS-19: 实现 `log --cc` 合并提交紧凑组合差异（#833）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `in-progress` / `partially-accepted`（2026-11-21 第一段：新增 `LogArgs.cc`（隐含 `-p`）；`generate_cc_diff` 对合并提交按「与每个父提交都不同」筛路径并输出 `diff --cc`、`index <p1>,<p2>..<merge>`、`---`/`+++` 与 `@@@ -1,n -1,n +1,n @@@` 组合 hunk（正文按父提交分列）；非合并提交回退普通 `generate_diff`。实测：冲突后解冲突产生的合并提交只列出 `c.txt`（`one.txt` 不出现），非合并提交 `--cc` 与 `-p` 逐字节相同。回归：`command::log_test::log_cc_merge_combined_diff`（AC2/AC3 + AC1 形状）。**仍差 Git**：AC1 的 hunk **字节级**对齐（Git 的 `@@@` 起始/长度由三路行对齐得出、正文列位按父提交实际差异标注），当前实现按整文件与「同位置相同即空白列」规则生成，尚未与 `git log --cc` 逐字一致。本卡保持 `in-progress`。`log_test` 全绿；严格 Clippy exit 0。）
 
 **Description:** 在 `LogArgs` 新增 `--cc`（dense combined diff），对合并提交仅输出在所有父提交中均发生变更的文件及其 `@@@` 组合 hunk，单父提交仍正常输出普通 patch。
 

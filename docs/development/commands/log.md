@@ -140,3 +140,5 @@ flowchart TD
 - 2026-11-21（LS-08 / #960）：`log` 对 replace 引用显示 `replaced` 装饰——`load_history_commit` 在内容被替换后恢复**原始 oid**（`commit.id = commit_id`），`has_replace_ref` 读取 `GIT_REPLACE_REF_BASE`（默认 `refs/replace/`）判断标记，调色板新增 `color.decorate.replaced`（默认 `1;34`），标记追加在其它装饰之后。回归：`command::log_test::decorate_replaced_and_env_base`（AC1–AC2）。
 
 - 2026-11-21（LS-14 收尾 / #972）：`format_stat_output` 与 Git 对齐——变更列宽取本块最宽计数（原固定 `{:>3}`），汇总行省略为零的 insertion/deletion 子句，使 `--format= --stat` 与 `git log --format= --stat` 逐字一致（解除该卡 AC5 的阻塞）。回归：`empty_format_or_pretty_omits_header` 的 AC5 改为逐字断言；`log_test` 276/276、`show_test` 42/42。
+
+- 2026-11-21（LS-19 / #833 第一段）：新增 `--cc`（隐含 `-p`）——合并提交输出稠密组合差异（`generate_cc_diff`：仅保留对**每个**父提交都变更的路径，输出 `diff --cc`、`index <p1>,<p2>..<merge>`、`---/+++` 与 `@@@` 组合 hunk，正文按父提交分列）；非合并提交走普通 `generate_diff`，实测与 `-p` 逐字节相同。回归：`command::log_test::log_cc_merge_combined_diff`（AC2/AC3 + AC1 形状）。

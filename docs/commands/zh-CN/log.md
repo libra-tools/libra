@@ -65,6 +65,14 @@ libra log --format=format:
 libra log --format= --stat
 ```
 
+### `--cc`
+
+`--cc` 对合并提交输出稠密组合差异：只列出与**每个**父提交都不同的路径，每项包含 `diff --cc <path>`、`index <p1>,<p2>..<merge>` 与一条 `@@@ -… -… +… @@@` 组合 hunk（每行按父提交分列）。非合并提交保持普通 patch，因此 `log --cc -1 <commit>` 与 `log -p -1 <commit>` 等价。该选项隐含 `-p`。
+
+```bash
+libra log --cc -1 <merge>
+```
+
 ### `--find-object=<object>`
 
 只保留「相对第一个父提交的 diff 触及 `<object>`」的提交：变更文件对的任一侧（因此同一 blob 的重命名也算命中）或仅出现在一侧的树。选项可重复，多值取并集；无法解析的对象 ID 以 `LBR-CLI-003` 失败。

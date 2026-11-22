@@ -274,6 +274,9 @@ pub struct LogArgs {
     /// must not exist yet and must stay outside `.libra/`)
     #[clap(long, value_name = "FILE")]
     pub output: Option<PathBuf>,
+    /// Show a dense combined diff (`diff --cc`, `@@@` hunks) for merge commits
+    #[clap(long = "cc")]
+    pub cc: bool,
     /// Show only commits whose diff touches this object (repeatable; blobs or
     /// trees, like Git's `--find-object`)
     #[clap(long = "find-object", value_name = "OBJECT")]
@@ -2973,7 +2976,7 @@ fn resolved_diff_formats(
 
     // `-L` always prints the hunks of the tracked range, like Git.
     let mut resolved = resolved;
-    if !args.line_range.is_empty() && !resolved.no_patch {
+    if (!args.line_range.is_empty() || args.cc) && !resolved.no_patch {
         resolved.patch = true;
     }
     if has_positions && name_output_conflict {
@@ -3594,7 +3597,9 @@ async fn execute_safe_with_diff_formats(
                     block.push_str("\n\n");
                 }
             }
-            let mut patch_output = if args.line_range.is_empty() {
+            let mut patch_output = if args.cc {
+                generate_cc_diff(&commit, &commit_path_filters).await?
+            } else if args.line_range.is_empty() {
                 generate_diff(&commit, commit_path_filters.clone()).await?
             } else {
                 // `-L` prints only the hunks touching the tracked range.
@@ -5675,6 +5680,100 @@ fn reverse_patch(patch: &str) -> String {
         out.push_str(newline);
     }
     out
+}
+
+/// Blob map of a commit's tree, keyed by workdir-relative path.
+fn tree_blob_map(tree_id: &ObjectHash) -> CliResult<HashMap<PathBuf, ObjectHash>> {
+    let tree = load_object::<Tree>(tree_id)
+        .map_err(|e| log_repo_corrupt_error(format!("failed to load tree object: {e}")))?;
+    Ok(tree.get_plain_items()?.into_iter().collect())
+}
+
+/// Dense combined diff (`git log --cc`): only the paths that changed against
+/// *every* parent are printed, with one `@@@` hunk per file.
+async fn generate_cc_diff(commit: &Commit, paths: &[PathBuf]) -> CliResult<String> {
+    // A non-merge commit keeps the ordinary patch (Git's `--cc` behaviour).
+    if commit.parent_commit_ids.len() < 2 {
+        return generate_diff(commit, paths.to_vec()).await;
+    }
+    let merge_blobs = tree_blob_map(&commit.tree_id)?;
+    let mut parent_maps = Vec::new();
+    for parent_id in &commit.parent_commit_ids {
+        let parent = load_object::<Commit>(parent_id)
+            .map_err(|e| log_repo_corrupt_error(format!("failed to load parent commit: {e}")))?;
+        parent_maps.push((parent.tree_id, tree_blob_map(&parent.tree_id)?));
+    }
+    let mut candidates: Vec<PathBuf> = if paths.is_empty() {
+        merge_blobs.keys().cloned().collect()
+    } else {
+        paths.to_vec()
+    };
+    candidates.sort();
+    let mut output = String::new();
+    for path in candidates {
+        let merge_blob = merge_blobs.get(&path).copied();
+        // Dense: the path must differ from every parent.
+        let differs_from_all = parent_maps
+            .iter()
+            .all(|(_, blobs)| blobs.get(&path).copied() != merge_blob);
+        if !differs_from_all {
+            continue;
+        }
+        let Some(merge_blob) = merge_blob else {
+            continue;
+        };
+        let parent_blobs: Vec<String> = parent_maps
+            .iter()
+            .map(|(_, blobs)| {
+                blobs
+                    .get(&path)
+                    .map(|blob| blob.to_string())
+                    .unwrap_or_else(|| "0000000".to_string())
+            })
+            .collect();
+        let index_line = format!("index {}..{}\n", parent_blobs.join(","), merge_blob);
+        output.push_str(&format!("diff --cc {}\n", path.display()));
+        output.push_str(&index_line);
+        output.push_str(&format!(
+            "--- a/{}\n+++ b/{}\n",
+            path.display(),
+            path.display()
+        ));
+
+        let text = match load_object::<Blob>(&merge_blob) {
+            Ok(blob) => String::from_utf8_lossy(&blob.data).to_string(),
+            Err(_) => continue,
+        };
+        let lines: Vec<&str> = text.lines().collect();
+        let len = lines.len();
+        let header_len = if len == 0 { 0 } else { len };
+        let mut markers = String::new();
+        for _ in 0..parent_maps.len() {
+            markers.push_str(&format!("-1,{header_len} "));
+        }
+        output.push_str(&format!("@@@ {}+1,{header_len} @@@\n", markers));
+        for (index, line) in lines.iter().enumerate() {
+            // Two columns, one per parent: context when the parent has the same
+            // line at that position, `+` when it does not.
+            let mut prefix = String::new();
+            for (_, blobs) in parent_maps.iter() {
+                let same = blobs
+                    .get(&path)
+                    .and_then(|blob| load_object::<Blob>(blob).ok())
+                    .map(|blob| {
+                        String::from_utf8_lossy(&blob.data)
+                            .lines()
+                            .nth(index)
+                            .map(|parent_line| parent_line == *line)
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                prefix.push(if same { ' ' } else { '+' });
+            }
+            output.push_str(&format!("{prefix}{line}\n"));
+        }
+    }
+    Ok(output)
 }
 
 pub(crate) async fn generate_diff(
