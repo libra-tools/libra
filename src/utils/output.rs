@@ -425,13 +425,28 @@ pub fn emit_json_data<T: Serialize>(
     data: &T,
     config: &OutputConfig,
 ) -> CliResult<()> {
+    let bytes = json_command_envelope_bytes(command, data, config)?;
+    let stdout = io::stdout();
+    let mut writer = stdout.lock();
+    writer
+        .write_all(&bytes)
+        .map_err(|e| stdout_write_error("write JSON output", e))
+}
+
+/// Render the JSON command envelope into memory, so `--output` can redirect it
+/// without touching stdout.
+pub fn json_command_envelope_bytes<T: Serialize>(
+    command: &str,
+    data: &T,
+    config: &OutputConfig,
+) -> CliResult<Vec<u8>> {
     let format = config.json_format.ok_or_else(|| {
         CliError::internal("emit_json_data called without an active JSON output mode")
     })?;
-    let stdout = io::stdout();
-    let mut writer = stdout.lock();
-    write_json_command_envelope(&mut writer, command, data, format)
-        .map_err(|e| stdout_write_error("write JSON output", e))
+    let mut buffer = Vec::new();
+    write_json_command_envelope(&mut buffer, command, data, format)
+        .map_err(|e| stdout_write_error("write JSON output", e))?;
+    Ok(buffer)
 }
 
 /// Emit each item in an iterator as a separate NDJSON line, or collect into a

@@ -1204,7 +1204,7 @@ PY
 
 ### Task LS-36: `log --json` 输出写入 `--output` 文件（#963；自 LS-15 拆出）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-21：新增 `utils::output::json_command_envelope_bytes`（`emit_json_data` 改为复用），`--json` 分支在 `args.output.is_some()` 时把信封字节经 `LogSink` 写入目标文件（stdout 为空），`.libra/` 防护与失败诊断沿用 LS-15/LS-37（`LogSink::open` 移除 json 拒绝）；按协议删除 `output_to_file` 中 LS-15 的「`--json --output` 以 `LBR-CLI-002` 拒绝」断言，其余保留。AC1–AC2 由 `command::log_test::output_json_to_file` 覆盖（文件内容逐字等于不带 `--output` 的 JSON stdout、stdout 0 字节），`log_test` 全绿；严格 Clippy exit 0。**Codex/Claude 审计按用户 2026-11-21 指令取消**。）
 
 **Description:** 开放 `LS-15` 暂时拒绝的全局 `--json` 与 `--output=<file>` 组合：JSON 输出（`LogOutput`）写入目标文件，stdout 为空，`.libra/` 防护与失败诊断沿用 `LS-15`/`LS-37`；同卡删除 `command::log_test::output_to_file` 中「`--json --output` 被拒绝」的断言（该行为由本卡取代），其余断言保持不变。期望基准为 Libra 自身不带 `--output` 的 JSON 输出（Git 无 `--json`）。
 

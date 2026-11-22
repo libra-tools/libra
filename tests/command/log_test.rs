@@ -8009,11 +8009,8 @@ fn output_to_file() {
             "AC6 hard link to .libra file"
         );
     }
-    // AC7: the JSON combination is still closed in this card.
-    assert!(
-        stderr_of(&["--json", "log", "--output=out.json"]).contains("LBR-CLI-002"),
-        "AC7"
-    );
+    // The `--json` + `--output` combination moved to `output_json_to_file`
+    // (`LS-36`), which supersedes this card's rejection.
     // AC8: an unwritable directory fails instead of truncating anything.
     let readonly = repo.join("R");
     std::fs::create_dir_all(&readonly).expect("mkdir R");
@@ -8181,5 +8178,42 @@ fn output_overwrite_and_protection() {
     assert!(
         stderr_of(&["log", "--output=D"]).contains("LBR-IO-002"),
         "AC8"
+    );
+}
+
+#[test]
+fn output_json_to_file() {
+    use super::{assert_cli_success, run_libra_command};
+
+    // Fixture F36: three commits plus a fresh JSON output path.
+    let work = tempfile::tempdir().expect("work dir");
+    let repo = work.path().join("r");
+    std::fs::create_dir_all(&repo).expect("mkdir repo");
+    assert_cli_success(&run_libra_command(&["init"], &repo), "init");
+    run_libra_command(&["config", "set", "user.name", "t"], &repo);
+    run_libra_command(&["config", "set", "user.email", "t@t"], &repo);
+    for index in 0..3 {
+        let name = format!("f{index}.txt");
+        std::fs::write(repo.join(&name), format!("line{index}\n")).expect("write file");
+        assert_cli_success(&run_libra_command(&["add", &name], &repo), "add");
+        let message = format!("c{index}");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", &message, "--no-verify"], &repo),
+            "commit",
+        );
+    }
+    let plain = {
+        let result = run_libra_command(&["--json", "log"], &repo);
+        assert_cli_success(&result, "plain json log");
+        result.stdout
+    };
+    // AC1/AC2: the envelope goes to the file, stdout stays empty.
+    let redirected = run_libra_command(&["--json", "log", "--output=out.json"], &repo);
+    assert_cli_success(&redirected, "AC1 run");
+    assert!(redirected.stdout.is_empty(), "AC2 stdout must be empty");
+    assert_eq!(
+        std::fs::read(repo.join("out.json")).expect("read out.json"),
+        plain,
+        "AC1 contents"
     );
 }

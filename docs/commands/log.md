@@ -75,8 +75,9 @@ permissions, truncated through the verified descriptor, like Git's
 whose final target lives inside the repository metadata directory `.libra/` is
 refused as well, including through a symbolic or hard link that reaches a
 repository file; this is a Libra-only guard, since Git has no such restriction. Symbolic links are followed to their final target,
-so a dangling link creates the file it points at, matching Git. Combining
-`--output` with `--json` is rejected with `LBR-CLI-002`.
+so a dangling link creates the file it points at, matching Git. With the global
+`--json` flag the JSON envelope itself is written to the file instead, leaving
+stdout empty.
 
 ```bash
 libra log --oneline --output=log.txt

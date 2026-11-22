@@ -2509,13 +2509,17 @@ async fn execute_safe_with_diff_formats(
     let decorate_option = resolve_decorate_option(&args).await?;
 
     if output.is_json() {
-        if args.output.is_some() {
-            return Err(
-                CliError::command_usage("--output cannot be combined with --json yet")
-                    .with_stable_code(StableErrorCode::CliInvalidArguments),
-            );
-        }
         let result = run_log(&args, &log_config, &identity_filters).await?;
+        if args.output.is_some() {
+            // `--output` redirects the JSON envelope; stdout stays empty.
+            let bytes = crate::utils::output::json_command_envelope_bytes("log", &result, output)?;
+            let text = String::from_utf8(bytes).map_err(|error| {
+                CliError::internal(format!("JSON envelope was not valid UTF-8: {error}"))
+            })?;
+            let mut sink = LogSink::open(&args, output).await?;
+            sink.write_str(&text)?;
+            return sink.finish();
+        }
         return emit_json_data("log", &result, output);
     }
 
@@ -3205,12 +3209,6 @@ impl LogSink {
         let Some(target) = args.output.as_deref() else {
             return Ok(LogSink::Pager(Pager::with_config(output)?));
         };
-        if output.is_json() {
-            return Err(
-                CliError::command_usage("--output cannot be combined with --json yet")
-                    .with_stable_code(StableErrorCode::CliInvalidArguments),
-            );
-        }
         // Follow the whole symlink chain so a dangling link creates its final
         // target, like Git's `fopen(path, "w")`.
         let mut final_target = target.to_path_buf();
