@@ -7996,10 +7996,8 @@ fn output_to_file() {
             .expect("hard link");
     }
     let sealed = manifest();
-    assert!(
-        stderr_of(&["log", "--output=exists.txt"]).contains("LBR-IO-002"),
-        "AC5"
-    );
+    // `LS-37` opened in-place overwriting of existing targets, so this case
+    // moved to `output_overwrite_and_protection`.
     #[cfg(unix)]
     {
         assert!(
@@ -8052,4 +8050,136 @@ fn output_to_file() {
         assert_eq!(now.as_ref(), Some(hash), "AC6 {name} unchanged");
     }
     assert!(sealed.iter().any(|(name, _)| name == "existing-inside.txt"));
+}
+
+#[test]
+fn output_overwrite_and_protection() {
+    use super::{assert_cli_success, run_libra_command};
+
+    // Fixture F37: three commits, plus the overwrite/protection targets.
+    let work = tempfile::tempdir().expect("work dir");
+    let repo = work.path().join("r");
+    std::fs::create_dir_all(&repo).expect("mkdir repo");
+    assert_cli_success(&run_libra_command(&["init"], &repo), "init");
+    run_libra_command(&["config", "set", "user.name", "t"], &repo);
+    run_libra_command(&["config", "set", "user.email", "t@t"], &repo);
+    for index in 0..3 {
+        let name = format!("f{index}.txt");
+        std::fs::write(repo.join(&name), format!("line{index}\n")).expect("write file");
+        assert_cli_success(&run_libra_command(&["add", &name], &repo), "add");
+        let message = format!("c{index}");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", &message, "--no-verify"], &repo),
+            "commit",
+        );
+    }
+    let plain = {
+        let result = run_libra_command(&["log", "--oneline"], &repo);
+        assert_cli_success(&result, "plain log");
+        result.stdout
+    };
+    let stderr_of = |args: &[&str]| {
+        let result = run_libra_command(args, &repo);
+        String::from_utf8_lossy(&result.stderr).to_string()
+    };
+    let manifest = || {
+        let storage = repo.join(".libra");
+        let mut entries: Vec<(String, String)> = Vec::new();
+        let mut stack = vec![storage.clone()];
+        while let Some(dir) = stack.pop() {
+            let Ok(read) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in read.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                let name = path
+                    .strip_prefix(&storage)
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                if name.contains("libra.db")
+                    || name.contains("oplog")
+                    || name.contains("logs")
+                    || name.ends_with(".lock")
+                {
+                    continue;
+                }
+                let bytes = std::fs::read(&path).unwrap_or_default();
+                let mut hash: u64 = 0xcbf29ce484222325;
+                for byte in bytes {
+                    hash ^= byte as u64;
+                    hash = hash.wrapping_mul(0x100000001b3);
+                }
+                entries.push((name, format!("{hash:016x}")));
+            }
+        }
+        entries.sort();
+        entries
+    };
+
+    // AC1/AC2/AC3: an existing target is truncated in place (same inode and
+    // permissions, no stale bytes).
+    let existing = repo.join("E.txt");
+    std::fs::write(&existing, "old content that must disappear\n").expect("seed E");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o640))
+            .expect("chmod E");
+    }
+    #[cfg(unix)]
+    let inode_before = {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(&existing).expect("stat E").ino()
+    };
+    let overwritten = run_libra_command(&["log", "--oneline", "--output=E.txt"], &repo);
+    assert_cli_success(&overwritten, "AC1 run");
+    assert_eq!(
+        std::fs::read(&existing).expect("read E"),
+        plain,
+        "AC1 overwritten contents"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let metadata = std::fs::metadata(&existing).expect("stat E");
+        assert_eq!(metadata.ino(), inode_before, "AC2 inode preserved");
+        assert_eq!(
+            metadata.permissions().mode() & 0o777,
+            0o640,
+            "AC3 mode preserved"
+        );
+    }
+
+    // AC4/AC5/AC6: repository metadata stays unreachable through any link.
+    std::fs::write(repo.join(".libra/inside.txt"), "repository state\n").expect("seed .libra");
+    let before = manifest();
+    assert!(
+        stderr_of(&["log", "--output=.libra/inside.txt"]).contains("LBR-IO-002"),
+        "AC4"
+    );
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(".libra/inside.txt", repo.join("L.link")).expect("symlink L");
+        std::fs::hard_link(repo.join(".libra/inside.txt"), repo.join("H.link")).expect("hard link");
+        assert!(
+            stderr_of(&["log", "--output=L.link"]).contains("LBR-IO-002"),
+            "AC5"
+        );
+        assert!(
+            stderr_of(&["log", "--output=H.link"]).contains("LBR-IO-002"),
+            "AC6"
+        );
+    }
+    // AC7: the rejected calls left `.libra/` byte-identical.
+    assert_eq!(manifest(), before, "AC7 manifest unchanged");
+    // AC8: a directory target fails closed.
+    std::fs::create_dir_all(repo.join("D")).expect("mkdir D");
+    assert!(
+        stderr_of(&["log", "--output=D"]).contains("LBR-IO-002"),
+        "AC8"
+    );
 }

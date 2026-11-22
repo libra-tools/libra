@@ -3124,6 +3124,75 @@ async fn execute_safe_with_diff_formats(
     Ok(())
 }
 
+/// Physical identity of an open file or a stat result: `(device, inode)` on
+/// Unix, `(volume serial, file index)` on Windows.
+fn file_identity(metadata: &std::fs::Metadata) -> (u64, u128) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        (metadata.dev(), metadata.ino() as u128)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        (
+            metadata.volume_serial_number().unwrap_or(0) as u64,
+            metadata.file_index().unwrap_or(0) as u128,
+        )
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = metadata;
+        (0, 0)
+    }
+}
+
+/// Hard-link count of an open file.
+fn link_count(metadata: &std::fs::Metadata) -> u64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        metadata.nlink()
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        metadata.number_of_links().unwrap_or(1) as u64
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = metadata;
+        1
+    }
+}
+
+/// Whether any file inside `root` shares the identity of `metadata`.
+fn inode_reachable_from(root: &std::path::Path, metadata: &std::fs::Metadata) -> bool {
+    let identity = file_identity(metadata);
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            let path = entry.path();
+            if file_type.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if let Ok(candidate) = std::fs::metadata(&path)
+                && file_identity(&candidate) == identity
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Output sink for the human-readable log: the configured pager, or a freshly
 /// created `--output` file.
 enum LogSink {
@@ -3222,8 +3291,84 @@ impl LogSink {
             ))
             .with_stable_code(StableErrorCode::IoWriteFailed));
         }
-        // `LS-15` only opens new targets; overwriting an existing file is
-        // reserved for `LS-37`.
+        // `LS-37`: existing regular files are overwritten in place, the way
+        // Git's `xfopen(path, "w")` truncates them — same inode, same mode.
+        match std::fs::metadata(&final_target) {
+            Ok(metadata) if metadata.is_dir() => {
+                return Err(CliError::fatal(format!(
+                    "could not open '{}' for writing: Is a directory",
+                    final_target.display()
+                ))
+                .with_stable_code(StableErrorCode::IoWriteFailed));
+            }
+            Ok(metadata) => {
+                // The path-level guard must also catch a target that is itself
+                // inside `.libra/` (its parent may be the storage root).
+                let normalized_target = if final_target.is_absolute() {
+                    normalize(&final_target)
+                } else {
+                    normalize(&absolute_parent.join(&final_target))
+                };
+                if normalized_target.starts_with(&normalized_storage) {
+                    return Err(CliError::fatal(format!(
+                        "refusing to write log output inside the repository metadata directory ({})",
+                        normalized_target.display()
+                    ))
+                    .with_stable_code(StableErrorCode::IoWriteFailed));
+                }
+                // Open without creating or truncating so the descriptor can be
+                // verified before any byte is destroyed.
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&final_target)
+                    .map_err(|error| {
+                        CliError::fatal(format!(
+                            "could not open '{}' for writing: {error}",
+                            final_target.display()
+                        ))
+                        .with_stable_code(StableErrorCode::IoWriteFailed)
+                    })?;
+                let opened = file.metadata().map_err(|error| {
+                    CliError::fatal(format!(
+                        "failed to inspect the opened --output target {}: {error}",
+                        final_target.display()
+                    ))
+                    .with_stable_code(StableErrorCode::IoWriteFailed)
+                })?;
+                if file_identity(&opened) != file_identity(&metadata) {
+                    return Err(CliError::fatal(format!(
+                        "--output target {} changed while it was being opened",
+                        final_target.display()
+                    ))
+                    .with_stable_code(StableErrorCode::IoWriteFailed));
+                }
+                // A second link could point at repository state: refuse when
+                // this inode is also reachable inside `.libra/`.
+                if link_count(&opened) > 1 && inode_reachable_from(&normalized_storage, &opened) {
+                    return Err(CliError::fatal(format!(
+                        "refusing to overwrite {} because it shares an inode with repository metadata",
+                        final_target.display()
+                    ))
+                    .with_stable_code(StableErrorCode::IoWriteFailed));
+                }
+                file.set_len(0).map_err(|error| {
+                    CliError::fatal(format!(
+                        "failed to truncate --output file {}: {error}",
+                        final_target.display()
+                    ))
+                    .with_stable_code(StableErrorCode::IoWriteFailed)
+                })?;
+                return Ok(LogSink::File(file));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(CliError::fatal(format!(
+                    "failed to inspect --output target {}: {error}",
+                    final_target.display()
+                ))
+                .with_stable_code(StableErrorCode::IoWriteFailed));
+            }
+        }
         let file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)

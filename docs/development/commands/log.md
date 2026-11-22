@@ -124,3 +124,5 @@ flowchart TD
 - 2026-11-21（LS-14 / #972）：`--format=`/`--pretty=`/`--format=tformat:` 改为 `FormatType::Silent`（0 字节），`--format=format:` 为 `FormatType::Separator`（仅提交间换行）；有内容时不再追加多余换行，静默头下 `--stat`/`-p` 不再注入前置空行；同步更新 `test_parse_pretty_format_presets` 断言。回归：`command::log_test::empty_format_or_pretty_omits_header`。
 
 - 2026-11-21（LS-15 / #963）：新增 `--output=<file>`（`LogSink` 分流 pager/文件）：逐级解析符号链接取最终目标、`create_new` 独占创建、已存在目标与 `.libra/` 内目标以 `LBR-IO-002` 拒绝、`--json` 组合以 `LBR-CLI-002` 拒绝；pager 策略不变（启动时收空输出）。回归：`command::log_test::output_to_file`（AC1–AC8，含 `.libra` 清单不变断言）。
+
+- 2026-11-21（LS-37 / #963）：`--output` 开放既有目标原地覆盖——以「只写、不创建、不截断」打开，`fstat` 取 `(dev,inode,nlink)` 与预检 `stat` 比对（检查后被替换即拒绝），`nlink>1` 时遍历 `.libra/` 比对 inode（含硬链接/符号链接触及仓库文件），核验通过后才经同一描述符截断；目录目标以 `LBR-IO-002` 失败。同步按协议删除 `output_to_file` 中 LS-15 的「既有目标拒绝」断言。回归：`command::log_test::output_overwrite_and_protection`（AC1–AC8）。

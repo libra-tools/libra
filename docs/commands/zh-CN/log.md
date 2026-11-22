@@ -665,6 +665,31 @@ Git 接受 `git log A..B` 这种位置修订表达式（其后可跟 pathspec）
 
 Libra 将 `--graph` 实现为基于文本的 ASCII/Unicode 图渲染器，类似 Git 内置 graph 输出。与 GUI 工具（GitKraken、SourceTree）或带外部 graph renderer 的 Git `--format` 不同，Libra 的图直接在终端内渲染。这让 CLI 自包含，并确保跨平台输出一致。Graph renderer 处理分支、合并和 octopus merges，绘制父子提交之间的连接线。
 
+### `--output=<file>`
+
+`--output=<file>` 把人类可读输出写入 `<file>`，stdout 为空。已存在的普通文件会被原地覆盖（inode 与权限不变，经已核验的描述符截断，与 Git 的 `xfopen(path, "w")` 一致）；目录目标以 `LBR-IO-002` 失败；最终目标位于仓库元数据目录 `.libra/` 内同样拒绝（含经符号链接或硬链接触及仓库文件的情形；Libra 专有防护，Git 无此限制）。`--output` 与 `--json` 组合以 `LBR-CLI-002` 拒绝。
+
+```bash
+libra log --oneline --output=log.txt
+```
+
+### 空 `--format=` / `--pretty=`
+
+空格式按 Git 语义逐提交不输出任何字节：`--format=`、`--pretty=` 与 `--format=tformat:` 均输出 0 字节，`--format=format:` 只输出提交之间的换行分隔符；`--stat`/`-p` 仍输出 diff，但不含提交头。
+
+```bash
+libra log --format=
+libra log --format=format:
+```
+
+### `-R`
+
+`-R`（长写法 `--reverse-diff`）交换每个提交 diff 的新旧两侧：标签变为 `diff --git b/<path> a/<path>`，index 哈希互换，hunk 显示反向编辑，与 `git log -R` 一致；它**不**改变提交顺序。
+
+### 装饰颜色
+
+`color.decorate.HEAD`、`color.decorate.branch`、`color.decorate.remoteBranch`、`color.decorate.tag` 分别控制各装饰槽着色，`color.diff.commit`（旧名 `diff.color.commit`）控制 `commit <id>` 行与装饰括号/分隔符；默认调色板与 Git 一致。
+
 ### JSON 始终返回 `refs` 数组，不受 `--decorate` 影响
 
 在人类输出中，`--decorate` 控制是否在提交哈希旁显示 ref 名称（分支、标签）。在 JSON 模式中，无论 `--decorate` 标志如何，`refs` 数组总是填充。这一设计选择体现了 JSON 输出应为程序消费者提供最大信息量的原则。解析 JSON 输出的 AI 代理或 CI 工具不应需要记得传 `--decorate` 才能获得 ref 信息。`--decorate` 标志只影响人类渲染层。
