@@ -770,6 +770,8 @@ PY
 
 ---
 
+
+**2026-11-21 探查结论（阻塞，未落码）：** `libra log --oneline` 对**被替换提交**输出的是替换目标的对象 ID（`libra rev-parse HEAD~1` = `f5f5130…`，而 `log` 两行都打印 `261ff39…` = 替换目标），因此装饰收集阶段拿不到原始 oid，`has_replace_ref` 永不命中，AC1/AC2 的 `(replaced)` 无法在现有 `log` 语义下产生。根因在 `src/command/mod.rs` 的 `load_object` 于读取前 `replace::resolve`，使 `Commit.id` 变成目标对象；Git 的语义是**保留原始 oid、替换内容**。修复需让 `log` 的遍历在加载后恢复 `commit.id = 原始 oid`（内容仍为替换内容），或在遍历层单独传递 display oid。该改动跨出本卡 `Out of scope`（不改变 `log` 对替换对象内容的读取语义）的边界，需另开卡或授权扩围。本卡保持 `pending`，未提交任何代码（实验改动已 `libra restore` 回退）。
 ### Task LS-09: 核实 `534` 后 `#958` `--no-abbrev` 剩余边界并修复（#958）
 
 **Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
