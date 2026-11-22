@@ -171,6 +171,10 @@ vcs.stage / vcs.unstage / vcs.commit
 
 LVC-02 已启用 `vcs.identity`、`vcs.status`、`vcs.diff`、`vcs.log`、`vcs.show` 五个 minor 1 reads，LVC-06 已启用 `vcs.stage`、`vcs.unstage`、`vcs.commit` 三个 minor 2 writes：它们都在 allowlist 中，只对协商到对应 minor 及以上的 peer 广告；未协商到该 minor 的旧 1.x peer 看不到这些方法，调用时在 dispatch 前 fail closed，既有行为不变。`vcs.fence` 不在 allowlist：写方法自带 `expectedHead` / `expectedIndex` / `expectedWorktree` fence，这三个值由已协商的 `vcs.status` 读取（`data.writeFence`：HEAD commit id、index generation、内容感知的 worktree generation），client 读状态时一并取回再发回即可。`status.get` 仍是 bridge telemetry（session/event/checkpoint 计数），不是 worktree status。
 
+## REL-01 发布证据（2026-11-22）
+
+Libra `0.30.251` 是供 Harness 插件使用的 REL-01 发布版本；`initialize` 协商 protocol `1.2`（major 1 / minor 2）、`source: "deepseek-harness"`，并广告 28 个 method（含 `vcs.identity/status/diff/log/show/stage/unstage/commit`）。`vcs.fence` 与 Memory extension methods 不在该版本的广告列表中。发布二进制 SHA-256 为 `6fdb3ca37a8a17ccc4f81979b7f17969b8afc0ceab7864c12cfc73d452a338a5`；插件 REL-02 工件为 `@libra-tools/dsh-bundle@0.2.0` tarball `0b1d6c3a…`、`dist/index.js` `742eea51…`。
+
 模型可见 facade 名称（`libra_context`、`libra_status`、…）只是上述 method 的工具层别名；实现与测试必须以 allowlist 字面名为准，不得另发明 method。
 
 `create_intent`、`create_task`、`create_run` 等低层对象操作只作为 Rust ingress

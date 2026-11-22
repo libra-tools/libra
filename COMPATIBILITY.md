@@ -2014,6 +2014,10 @@ The read contract is bounded and repository-scoped: `vcs.identity` returns stabl
 
 `status.get` remains bridge session/event/checkpoint telemetry, not worktree status; `commit.create` retains its existing contract.
 
+## DeepSeek Harness bridge release evidence (REL-01)
+
+Libra `0.30.251` is the REL-01 release consumed by the Harness plugin: its `libra agent bridge --stdio` negotiates protocol `1.2` (`major` 1, `minor` 2), `source: "deepseek-harness"`, and advertises these 28 methods in `initialize`: `initialize`, `session.open`, `event.append`, `session.flush`, `session.close`, `evidence.append`, `provenance.append`, `context.get`, `status.get`, `diff.get`, `history.search`, `checkpoint.create`, `checkpoint.list`, `checkpoint.show`, `checkpoint.restore`, `commit.create`, `review.run`, `workspace.claim`, `workspace.renew`, `workspace.release`, `vcs.identity`, `vcs.status`, `vcs.diff`, `vcs.log`, `vcs.show`, `vcs.stage`, `vcs.unstage`, `vcs.commit`. `vcs.fence` and the Memory extension methods are not advertised by this release. The released binary SHA-256 is `6fdb3ca37a8a17ccc4f81979b7f17969b8afc0ceab7864c12cfc73d452a338a5`; the Harness-side artifact and hashes are recorded in the plugin README (`@libra-tools/dsh-bundle@0.2.0`, tarball `0b1d6c3a…`, `dist/index.js` `742eea51…`).
+
 ## DeepSeek Harness bridge write methods (LVC-06)
 
 The typed repository writes are additive protocol minor 2 methods: `vcs.stage`, `vcs.unstage` and `vcs.commit` are in the current 28-method allowlist and are advertised to a peer that negotiated minor 2 or higher. A peer that negotiated an older minor does not see them and cannot invoke them; the fence method stays disabled.
