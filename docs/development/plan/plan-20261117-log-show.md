@@ -880,7 +880,7 @@ PY
 
 ### Task LS-11: 支持 `log --before` / `--after` 日期过滤别名（#965）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-21：`LogArgs::since` 加 `visible_alias = "after"`、`until` 加 `visible_alias = "before"`，与主拼写共享同一解析路径与错误文本（`LBR-CLI-002`/129），`--help` 显示别名。AC1–AC7 由 `command::log_test::before_and_after_aliases` 覆盖，`log_test` 全绿；严格 Clippy exit 0。**Codex/Claude 审计按用户 2026-11-21 指令取消**。）
 
 **Description:** 为 `LogArgs::since` 添加 `visible_alias = "after"`，为 `LogArgs::until` 添加 `visible_alias = "before"`，使其与 `--since`/`--until` 完全等价（含相同的错误输出）。
 

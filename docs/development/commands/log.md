@@ -116,3 +116,5 @@ flowchart TD
 - 2026-11-21（LS-09 / #958）：核实 `--no-abbrev` 在 `%h`、`%p`、`--parents`、`--children` 及与 `--abbrev=<N>` 的先后覆盖关系上已全部输出 40 位 OID（LO-09 已修复，本卡补回归）：新增 `command::log_test::no_abbrev_issue_958_remaining`（AC1–AC6，含 E() 展开对照）。
 
 - 2026-11-21（LS-10 / #956）：新增 `--no-walk[=sorted|unsorted]`（只展示指定提交；`sorted` 按提交时间、`unsorted` 按命令行顺序；未知模式 `LBR-CLI-002`）与 `--tags[=<glob>]`（以匹配 `refs/tags/` 的标签所指提交为起点，无显式修订时取代隐式 `HEAD`）。回归：`command::log_test::no_walk_and_tags`（AC1–AC6）。
+
+- 2026-11-21（LS-11 / #965）：`--since`/`--until` 增加可见别名 `--after`/`--before`（同解析、同错误文本、`LBR-CLI-002`/129），`--help` 中显示别名。回归：`command::log_test::before_and_after_aliases`（AC1–AC7）。

@@ -226,10 +226,10 @@ pub struct LogArgs {
     #[clap(long, value_name = "PATTERN")]
     pub author: Option<String>,
     /// Show commits more recent than DATE (RFC3339, `YYYY-MM-DD`, or relative like `24h` / `7d`)
-    #[clap(long, value_name = "DATE")]
+    #[clap(long, value_name = "DATE", visible_alias = "after")]
     pub since: Option<String>,
     /// Show commits older than DATE (RFC3339, `YYYY-MM-DD`, or relative like `1h`)
-    #[clap(long, value_name = "DATE")]
+    #[clap(long, value_name = "DATE", visible_alias = "before")]
     pub until: Option<String>,
     /// Custom pretty format string (e.g. `%h - %s`)
     #[clap(long, value_name = "FORMAT", overrides_with_all = ["oneline", "format"])]

@@ -55,6 +55,15 @@ libra log --abbrev-commit
 libra log --abbrev 8
 ```
 
+### `--after` / `--before`
+
+`--after=<date>` 是 `--since` 的可见别名，`--before=<date>` 是 `--until` 的可见别名；两种拼写的解析与报错完全一致（无法解析的日期仍为 `LBR-CLI-002`、退出码 129）。
+
+```bash
+libra log --after=2026-01-15 --oneline
+libra log --before=2026-02-15 --oneline
+```
+
 ### `--no-walk[=<mode>]`
 
 `--no-walk` 只显示命令行给出的提交，不沿父链遍历。裸标志（等同 `--no-walk=sorted`）按提交时间从新到旧排序；`--no-walk=unsorted` 保持命令行顺序；其他取值以 `LBR-CLI-002` 拒绝。

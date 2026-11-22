@@ -7705,3 +7705,68 @@ fn no_walk_and_tags() {
     let stderr = String::from_utf8_lossy(&bad.stderr);
     assert!(stderr.contains("LBR-CLI-002"), "AC6 stderr: {stderr}");
 }
+
+#[test]
+fn before_and_after_aliases() {
+    use super::{assert_cli_success, run_libra_command, run_libra_command_with_env};
+
+    // Fixture F11: C1 (2026-01-01), C2 (2026-02-01), C3 (2026-03-01), linear.
+    let work = tempfile::tempdir().expect("work dir");
+    let repo = work.path().join("r");
+    std::fs::create_dir_all(&repo).expect("mkdir repo");
+    assert_cli_success(&run_libra_command(&["init"], &repo), "init");
+    run_libra_command(&["config", "set", "user.name", "t"], &repo);
+    run_libra_command(&["config", "set", "user.email", "t@t"], &repo);
+    let mut ids = Vec::new();
+    for month in ["01", "02", "03"] {
+        let body = format!("c{month}");
+        std::fs::write(repo.join("f.txt"), &body).expect("write f");
+        assert_cli_success(&run_libra_command(&["add", "f.txt"], &repo), "add");
+        let date = format!("2026-{month}-01 00:00:00 +0000");
+        let result = run_libra_command_with_env(
+            &["commit", "-m", &body, "--no-verify"],
+            &repo,
+            &[("GIT_AUTHOR_DATE", &date), ("GIT_COMMITTER_DATE", &date)],
+        );
+        assert_cli_success(&result, "commit");
+        let head = run_libra_command(&["rev-parse", "HEAD"], &repo);
+        assert_cli_success(&head, "rev-parse HEAD");
+        ids.push(String::from_utf8_lossy(&head.stdout).trim().to_string());
+    }
+    let (c1, c2, c3) = (ids[0].clone(), ids[1].clone(), ids[2].clone());
+
+    let out = |args: &[&str]| {
+        let result = run_libra_command(args, &repo);
+        assert_cli_success(&result, &format!("log {args:?}"));
+        String::from_utf8_lossy(&result.stdout).to_string()
+    };
+
+    // AC1/AC2: the aliases behave exactly like `--since`/`--until`.
+    assert_eq!(
+        out(&["log", "--after=2026-01-15", "--format=%H"]),
+        format!("{c3}\n{c2}\n"),
+        "AC1"
+    );
+    assert_eq!(
+        out(&["log", "--before=2026-02-15", "--format=%H"]),
+        format!("{c2}\n{c1}\n"),
+        "AC2"
+    );
+
+    // AC3/AC4/AC5: both spellings reject an unparseable date identically.
+    let mut stderrs = Vec::new();
+    for flag in ["--after=bogus", "--since=bogus"] {
+        let result = run_libra_command(&["log", flag], &repo);
+        assert!(!result.status.success(), "{flag} must fail");
+        assert_eq!(result.status.code(), Some(129), "{flag} exit code (AC4)");
+        let stderr = String::from_utf8_lossy(&result.stderr).to_string();
+        assert!(stderr.contains("LBR-CLI-002"), "{flag} stderr: {stderr}");
+        stderrs.push(stderr);
+    }
+    assert_eq!(stderrs[0], stderrs[1], "AC5 stderr must match");
+
+    // AC6/AC7: both aliases are documented in `--help`.
+    let help = out(&["log", "--help"]);
+    assert!(help.contains("--after"), "AC6");
+    assert!(help.contains("--before"), "AC7");
+}

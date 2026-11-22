@@ -66,6 +66,17 @@ Set the length of abbreviated commit hashes.
 libra log --abbrev 8
 ```
 
+### `--after` / `--before`
+
+`--after=<date>` is a visible alias of `--since` and `--before=<date>` of `--until`;
+both spellings parse and fail identically (an unparseable date stays `LBR-CLI-002`,
+exit 129).
+
+```bash
+libra log --after=2026-01-15 --oneline
+libra log --before=2026-02-15 --oneline
+```
+
 ### `--no-walk[=<mode>]`
 
 With `--no-walk` log shows only the commits named on the command line and does not
