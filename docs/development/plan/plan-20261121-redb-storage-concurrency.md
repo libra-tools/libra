@@ -1474,7 +1474,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `done` / `remote-pending`（`v0.30.310`；Codex R4 `PASS`；覆盖 `GlobalConfig` Step F1 非覆写 `hard_link` 墓碑预占、不支持硬链拒收、并发首写串行化、旧二进制胜出零覆写与 `SQLITE_NOTADB` 阻断，及 Redb/SQLite 异步取消持锁回归）
+**Lifecycle / Acceptance:** `done` / `remote-verified`（`c52cff5` / `v0.30.310`；Codex R4 `PASS`；覆盖 `GlobalConfig` Step F1 非覆写 `hard_link` 墓碑预占、不支持硬链拒收、并发首写串行化、旧二进制胜出零覆写与 `SQLITE_NOTADB` 阻断，及 Redb/SQLite 异步取消持锁回归）
 
 **Description:** 100% 在独占目录 `src/storage/**` 内落实 `ADR-RB-02` #2 Step F1（`GlobalConfig` 作用域与共享 `hard_link` 失败分支）：空 `LIBRA_CONFIG_GLOBAL_DB` 目录首次新建 `Redb` 配置库在持 `LOCK_EX` 内、**创建 `config.redb` 之前**，先将已写满且 `sync_all()` + 设 `0400` 的 31 字节非 SQLite 哨兵 `LIBRA_CONFIG_AUTHORITY_IS_REDB\n` 经**绝不覆盖目标的 `std::fs::hard_link(tmp, config.db)`** 原子预占 `config.db`（不支持硬链返回 `Unsupported`/`EXDEV` 立即清理 `.tmp` 并 fail-closed 报 `LBR-IO-001`；遇 `AlreadyExists` 放弃建红库并完整保留旧二进制写入），并在 `GlobalConfig` 作用域实测新运行时并发首写、旧写者胜出零覆写与墓碑预占后旧二进制阻断。
 
@@ -1534,7 +1534,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `remote-pending`（`v0.30.311`；Codex R1 `PASS`；覆盖 `SystemConfig` `0444`/`0644` 墓碑预占、并发首写串行化、旧二进制胜出零覆写与 `SQLITE_NOTADB` 阻断）
 
 **Description:** 100% 在独占目录 `src/storage/**` 内落实 `SystemConfig` 作用域（隔离 `LIBRA_CONFIG_SYSTEM_DB`）的 `ADR-RB-02` #2 Step F1 首次建库 `0444` 哨兵 `hard_link` 预占与 `0644` `config.redb` 权限姿态，逐项实测系统域并发首写竞态、不持锁旧写者胜出零覆写与墓碑预占后旧二进制阻断。
 
@@ -1548,16 +1548,16 @@
 | `SystemConfig` 具有独立可变库路径（`/etc/libra/config.db` / `LIBRA_CONFIG_SYSTEM_DB`）与 `0644`/`0444` 权限姿态，须独立验收并发首写与旧写者竞态 | `src/command/config.rs:257-295`；`ADR-RB-02` #2 Step F1 |
 
 **Acceptance criteria:**
-- [ ] `SystemConfig` 空目录首次新建 `Redb` 配置库在持 `LOCK_EX` 内、创建 `0644` `config.redb` 之前，经非覆写 `std::fs::hard_link` 原子预占 `0444` 哨兵 `config.db`。
-- [ ] **新运行时并发首写竞态（`SystemConfig`）：** 在空 `LIBRA_CONFIG_SYSTEM_DB` 目录并发发起 `Sqlite` 与 `Redb` 写者，仅 1 方建立单权威（`0644`）与 `config-format.json(finalized = true)`，另一方 fail-closed 报 `LBR-CLI-003`。
-- [ ] **旧二进制胜出零覆写实测（`SystemConfig`）：** 不持锁旧二进制先经 `create_new` 创建并写入系统 `config.db` 时，首次 `Redb` 写入命中 `AlreadyExists` 立即 fail-closed 报 `LBR-CLI-003` 且绝不建 `config.redb`，旧写入 100% 保留。
-- [ ] **墓碑预占后旧二进制阻断实测（`SystemConfig`）：** `Redb` 先预占 `0444` 墓碑并建库后，旧版 `libra config get/set --system` 打开 `config.db` 立报 `SQLITE_NOTADB` fail-closed。
+- [x] `SystemConfig` 空目录首次新建 `Redb` 配置库在持 `LOCK_EX` 内、创建 `0644` `config.redb` 之前，经非覆写 `std::fs::hard_link` 原子预占 `0444` 哨兵 `config.db`。
+- [x] **新运行时并发首写竞态（`SystemConfig`）：** 在空 `LIBRA_CONFIG_SYSTEM_DB` 目录并发发起 `Sqlite` 与 `Redb` 写者，仅 1 方建立单权威（`0644`）与 `config-format.json(finalized = true)`，另一方 fail-closed 报 `LBR-CLI-003`。
+- [x] **旧二进制胜出零覆写实测（`SystemConfig`）：** 不持锁旧二进制先经 `create_new` 创建并写入系统 `config.db` 时，首次 `Redb` 写入命中 `AlreadyExists` 立即 fail-closed 报 `LBR-CLI-003` 且绝不建 `config.redb`，旧写入 100% 保留。
+- [x] **墓碑预占后旧二进制阻断实测（`SystemConfig`）：** `Redb` 先预占 `0444` 墓碑并建库后，旧版 `libra config get/set --system` 打开 `config.db` 立报 `SQLITE_NOTADB` fail-closed。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::config_store::tests::system_config_hardlink_reserve_and_concurrent_first_write) | test(=storage::config_store::tests::system_config_hardlink_yields_to_legacy_writer_and_blocks_post_reserve)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::config_store::tests::system_config_hardlink_reserve_and_concurrent_first_write)'`（new，覆盖 AC1、AC2）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::config_store::tests::system_config_hardlink_yields_to_legacy_writer_and_blocks_post_reserve)'`（new，覆盖 AC3、AC4）
-- [ ] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 6 文件实现白名单。
+- [x] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::config_store::tests::system_config_hardlink_reserve_and_concurrent_first_write) | test(=storage::config_store::tests::system_config_hardlink_yields_to_legacy_writer_and_blocks_post_reserve)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::config_store::tests::system_config_hardlink_reserve_and_concurrent_first_write)'`（new，覆盖 AC1、AC2）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::config_store::tests::system_config_hardlink_yields_to_legacy_writer_and_blocks_post_reserve)'`（new，覆盖 AC3、AC4）
+- [x] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 6 文件实现白名单。
 
 **Full-suite trigger:** `none`
 

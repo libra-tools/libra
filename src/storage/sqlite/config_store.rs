@@ -70,6 +70,14 @@ impl SqliteConfigStore {
         let conn = create_database_for_role(path_str, role)
             .await
             .map_err(|err| StorageBackendError::io("create sqlite config store", err))?;
+        #[cfg(unix)]
+        if let Some(target_mode) = crate::storage::config_store::expected_config_file_mode(role) {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path.as_ref(), std::fs::Permissions::from_mode(target_mode))
+                .map_err(|err| {
+                StorageBackendError::io("chmod sqlite config store to role mode", err)
+            })?;
+        }
         Ok(Self {
             conn,
             role,

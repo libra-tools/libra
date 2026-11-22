@@ -8115,4 +8115,519 @@ mod tests {
             let _ = fs::set_permissions(&post_sqlite, fs::Permissions::from_mode(0o600));
         }
     }
+
+    #[cfg(all(feature = "storage-sqlite", feature = "storage-redb"))]
+    #[tokio::test]
+    async fn system_config_hardlink_reserve_and_concurrent_first_write() {
+        use std::{
+            env, fs,
+            path::PathBuf,
+            process::{Child, Command, Stdio},
+            sync::{
+                Arc,
+                atomic::{AtomicBool, Ordering},
+            },
+        };
+
+        use tempfile::tempdir;
+
+        const CHILD_TIMEOUT: Duration = Duration::from_secs(20);
+
+        struct ChildReaper(Vec<(String, Child)>);
+        impl Drop for ChildReaper {
+            fn drop(&mut self) {
+                for (_, mut child) in self.0.drain(..) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        }
+
+        // Child worker mode for AC2: barrier-synchronized `Sqlite` vs `Redb`
+        // concurrent first-write race against an empty `LIBRA_CONFIG_SYSTEM_DB` directory.
+        if let Some(backend_str) = env::var_os("LIBRA_RB03F_RACE_BACKEND") {
+            let system_db_env = PathBuf::from(
+                env::var_os(LIBRA_CONFIG_SYSTEM_DB_ENV).expect("LIBRA_CONFIG_SYSTEM_DB env"),
+            );
+            let scope_dir =
+                config_scope_dir_from_db_path(&system_db_env).expect("derive system scope dir");
+            let sync_dir =
+                PathBuf::from(env::var_os("LIBRA_RB03F_SYNC_DIR").expect("sync dir env"));
+            let backend = match backend_str.to_string_lossy().as_ref() {
+                "sqlite" => StorageBackendKind::Sqlite,
+                "redb" => StorageBackendKind::Redb,
+                other => panic!("unexpected LIBRA_RB03F_RACE_BACKEND: {other}"),
+            };
+
+            fs::write(sync_dir.join(format!("ready-{backend}")), b"1").expect("signal ready");
+            let go_file = sync_dir.join("go");
+            let wait_deadline = Instant::now() + CHILD_TIMEOUT;
+            while !go_file.exists() {
+                assert!(
+                    Instant::now() < wait_deadline,
+                    "system race child `{backend}` timed out waiting for go barrier"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+
+            match open_or_create_locked_config_scope_for_write(
+                &scope_dir,
+                DatabaseRole::SystemConfig,
+                backend,
+                Duration::from_secs(10),
+            )
+            .await
+            {
+                Ok(locked) => {
+                    locked
+                        .store()
+                        .set("system.race.winner", &backend.to_string(), false)
+                        .await
+                        .expect("system winner write must succeed");
+                    drop(locked);
+                    println!("RB03F_RACE_RESULT:{backend}:WINNER");
+                }
+                Err(err) => {
+                    assert!(
+                        matches!(err, StorageBackendError::BackendMismatch { .. }),
+                        "system loser `{backend}` must receive BackendMismatch, got {err:?}"
+                    );
+                    assert_eq!(err.stable_code_str(), "LBR-CLI-003");
+                    println!("RB03F_RACE_RESULT:{backend}:LOSER_CLI_003");
+                }
+            }
+            return;
+        }
+
+        let root = tempdir().expect("create RB-03f AC1/AC2 temp root");
+
+        // -----------------------------------------------------------------
+        // AC1: Empty `SystemConfig` dir fresh `Redb` creation reserves exact
+        // `0444` 31-byte sentinel `config.db` via non-overwriting `hard_link`
+        // BEFORE creating exact `0644` `config.redb`.
+        // -----------------------------------------------------------------
+        let sys_dir = root.path().join("system-ac1");
+        fs::create_dir_all(&sys_dir).expect("create system-ac1 dir");
+        let sys_sqlite = config_sqlite_path_in_scope_dir(&sys_dir);
+        let sys_redb = config_redb_path_in_scope_dir(&sys_dir);
+
+        let hook_verified = Arc::new(AtomicBool::new(false));
+        let hook_flag = Arc::clone(&hook_verified);
+
+        let locked = open_or_create_locked_config_scope_for_write_with_hooks(
+            &sys_dir,
+            DatabaseRole::SystemConfig,
+            StorageBackendKind::Redb,
+            Duration::from_secs(5),
+            || {},
+            move |dir| {
+                let db_p = config_sqlite_path_in_scope_dir(dir);
+                let redb_p = config_redb_path_in_scope_dir(dir);
+                assert!(
+                    !redb_p.exists(),
+                    "AC1 violation: SystemConfig config.redb must NOT exist before Step F1 tombstone reservation"
+                );
+                let bytes = fs::read(&db_p).expect("SystemConfig config.db sentinel must exist");
+                assert_eq!(
+                    bytes.as_slice(),
+                    CONFIG_SQLITE_TOMBSTONE_SENTINEL,
+                    "AC1 violation: SystemConfig config.db must contain exact 31-byte sentinel"
+                );
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let mode = fs::symlink_metadata(&db_p)
+                        .expect("stat SystemConfig reserved config.db")
+                        .permissions()
+                        .mode()
+                        & 0o777;
+                    assert_eq!(
+                        mode, SYSTEM_CONFIG_TOMBSTONE_MODE,
+                        "AC1 violation: SystemConfig tombstone must be exact 0444 before config.redb creation, got {mode:04o}"
+                    );
+                }
+                hook_flag.store(true, Ordering::SeqCst);
+            },
+            || {},
+        )
+        .await
+        .expect("fresh SystemConfig Redb creation must succeed");
+        assert!(hook_verified.load(Ordering::SeqCst));
+        locked
+            .store()
+            .set("core.editor", "vim-system", false)
+            .await
+            .expect("write initial SystemConfig key");
+        drop(locked);
+
+        assert!(sys_redb.is_file());
+        assert_eq!(
+            fs::read(&sys_sqlite).expect("read final SystemConfig tombstone"),
+            CONFIG_SQLITE_TOMBSTONE_SENTINEL
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::symlink_metadata(&sys_redb)
+                    .expect("stat SystemConfig config.redb")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                SYSTEM_CONFIG_FILE_MODE,
+                "SystemConfig config.redb must have exact 0644 mode"
+            );
+            assert_eq!(
+                fs::symlink_metadata(&sys_sqlite)
+                    .expect("stat SystemConfig config.db")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                SYSTEM_CONFIG_TOMBSTONE_MODE,
+                "SystemConfig config.db tombstone must have exact 0444 mode"
+            );
+            assert_eq!(
+                fs::symlink_metadata(config_format_manifest_path(&sys_dir))
+                    .expect("stat SystemConfig config-format.json")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                SYSTEM_CONFIG_FILE_MODE
+            );
+            assert_eq!(
+                fs::symlink_metadata(config_migration_lock_path(&sys_dir))
+                    .expect("stat SystemConfig config-migration.lock")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                SYSTEM_CONFIG_FILE_MODE
+            );
+            let _ = fs::set_permissions(&sys_sqlite, fs::Permissions::from_mode(0o644));
+        }
+
+        // -----------------------------------------------------------------
+        // AC2: Concurrent first-write race in empty `LIBRA_CONFIG_SYSTEM_DB`
+        // directory between `Sqlite` and `Redb` writers: exactly 1 establishes
+        // single authority (`0644`) + finalized `config-format.json`, and the
+        // other fails closed with `LBR-CLI-003`.
+        // -----------------------------------------------------------------
+        let exe = env::current_exe().expect("locate current test executable");
+        for round in 0..4 {
+            let scope_dir = root.path().join(format!("system-race-round-{round}"));
+            let sync_dir = root.path().join(format!("system-sync-round-{round}"));
+            fs::create_dir_all(&scope_dir).expect("create empty system scope dir");
+            fs::create_dir_all(&sync_dir).expect("create system sync dir");
+            let system_db_env = config_sqlite_path_in_scope_dir(&scope_dir);
+
+            let mut reaper = ChildReaper(Vec::new());
+            let order = if round % 2 == 0 {
+                ["sqlite", "redb"]
+            } else {
+                ["redb", "sqlite"]
+            };
+            for backend in order {
+                let child = Command::new(&exe)
+                    .arg("--exact")
+                    .arg("storage::config_store::tests::system_config_hardlink_reserve_and_concurrent_first_write")
+                    .arg("--nocapture")
+                    .env("LIBRA_RB03F_RACE_BACKEND", backend)
+                    .env(LIBRA_CONFIG_SYSTEM_DB_ENV, &system_db_env)
+                    .env("LIBRA_RB03F_SYNC_DIR", &sync_dir)
+                    .env("LIBRA_TEST", "1")
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .expect("spawn system race child");
+                reaper.0.push((backend.to_string(), child));
+            }
+
+            let barrier_deadline = Instant::now() + CHILD_TIMEOUT;
+            for backend in ["sqlite", "redb"] {
+                let ready = sync_dir.join(format!("ready-{backend}"));
+                while !ready.exists() {
+                    assert!(
+                        Instant::now() < barrier_deadline,
+                        "system round {round}: timed out waiting for `{backend}` ready"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+            fs::write(sync_dir.join("go"), b"go").expect("release system race barrier");
+
+            let mut winners = Vec::new();
+            let mut losers = Vec::new();
+            for (backend, child) in reaper.0.drain(..) {
+                let output = child.wait_with_output().expect("join system race child");
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(
+                    output.status.success() && stdout.contains("1 passed; 0 failed"),
+                    "system round {round} `{backend}` failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+                );
+                if stdout.contains(&format!("RB03F_RACE_RESULT:{backend}:WINNER")) {
+                    winners.push(backend);
+                } else if stdout.contains(&format!("RB03F_RACE_RESULT:{backend}:LOSER_CLI_003")) {
+                    losers.push(backend);
+                } else {
+                    panic!(
+                        "system round {round} `{backend}` missing result marker:\nstdout:\n{stdout}"
+                    );
+                }
+            }
+
+            assert_eq!(winners.len(), 1);
+            assert_eq!(losers.len(), 1);
+
+            let winner = winners[0].as_str();
+            let manifest = read_config_format_manifest(&scope_dir, DatabaseRole::SystemConfig)
+                .expect("read post-race system manifest")
+                .expect("finalized system manifest must exist");
+            assert!(manifest.finalized);
+            assert!(manifest.init_phase.is_none());
+
+            let ro = open_config_scope_read_only(&scope_dir, DatabaseRole::SystemConfig)
+                .await
+                .expect("post-race system RO open must succeed");
+            assert_eq!(
+                ro.get("system.race.winner")
+                    .await
+                    .expect("read system.race.winner")
+                    .map(|e| e.value),
+                Some(winner.to_string())
+            );
+            drop(ro);
+
+            let sqlite_path = config_sqlite_path_in_scope_dir(&scope_dir);
+            let redb_path = config_redb_path_in_scope_dir(&scope_dir);
+            match winner {
+                "sqlite" => {
+                    assert_eq!(manifest.backend, StorageBackendKind::Sqlite);
+                    assert!(!manifest.legacy_sqlite_tombstone);
+                    assert!(sqlite_path.is_file());
+                    assert!(!redb_path.exists());
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        assert_eq!(
+                            fs::symlink_metadata(&sqlite_path)
+                                .expect("stat winning SystemConfig config.db")
+                                .permissions()
+                                .mode()
+                                & 0o777,
+                            SYSTEM_CONFIG_FILE_MODE,
+                            "SystemConfig winning config.db must have exact 0644 mode"
+                        );
+                    }
+                }
+                "redb" => {
+                    assert_eq!(manifest.backend, StorageBackendKind::Redb);
+                    assert!(manifest.legacy_sqlite_tombstone);
+                    assert!(redb_path.is_file());
+                    assert_eq!(
+                        fs::read(&sqlite_path).expect("read winning system tombstone"),
+                        CONFIG_SQLITE_TOMBSTONE_SENTINEL
+                    );
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        assert_eq!(
+                            fs::symlink_metadata(&redb_path)
+                                .expect("stat winning SystemConfig config.redb")
+                                .permissions()
+                                .mode()
+                                & 0o777,
+                            SYSTEM_CONFIG_FILE_MODE
+                        );
+                        assert_eq!(
+                            fs::symlink_metadata(&sqlite_path)
+                                .expect("stat winning SystemConfig tombstone")
+                                .permissions()
+                                .mode()
+                                & 0o777,
+                            SYSTEM_CONFIG_TOMBSTONE_MODE
+                        );
+                        let _ =
+                            fs::set_permissions(&sqlite_path, fs::Permissions::from_mode(0o644));
+                    }
+                }
+                other => panic!("unexpected system race winner `{other}`"),
+            }
+        }
+    }
+
+    #[cfg(all(feature = "storage-sqlite", feature = "storage-redb"))]
+    #[tokio::test]
+    async fn system_config_hardlink_yields_to_legacy_writer_and_blocks_post_reserve() {
+        use std::fs;
+
+        use tempfile::tempdir;
+
+        use crate::{
+            internal::{
+                config::ConfigKv,
+                db::schema::{create_configuration_database, open_configuration_database},
+            },
+            storage::sqlite::SqliteConfigStore,
+        };
+
+        let root = tempdir().expect("create RB-03f AC3/AC4 temp root");
+
+        // -----------------------------------------------------------------
+        // AC3: Un-locked legacy binary creates & writes `SystemConfig`
+        // `config.db` via `create_new` first (tested BOTH mid-flight before
+        // Step F1 `hard_link` and pre-existing): `Redb` hits `AlreadyExists`,
+        // returns `LBR-CLI-003`, creates ZERO `config.redb` / manifest, and
+        // preserves 100% of legacy writes!
+        // -----------------------------------------------------------------
+        let mid_dir = root.path().join("system-ac3-midflight");
+        fs::create_dir_all(&mid_dir).expect("create system ac3 dir");
+        let mid_sqlite = config_sqlite_path_in_scope_dir(&mid_dir);
+        let mid_redb = config_redb_path_in_scope_dir(&mid_dir);
+        let mid_sqlite_hook = mid_sqlite.clone();
+
+        let mid_err = open_or_create_locked_config_scope_for_write_with_hooks(
+            &mid_dir,
+            DatabaseRole::SystemConfig,
+            StorageBackendKind::Redb,
+            Duration::from_secs(5),
+            move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build legacy system writer runtime");
+                rt.block_on(async {
+                    let conn =
+                        create_configuration_database(&mid_sqlite_hook, DatabaseRole::SystemConfig)
+                            .await
+                            .expect(
+                                "legacy SystemConfig create_configuration_database must succeed",
+                            );
+                    ConfigKv::set_with_conn(
+                        &conn,
+                        "core.system_legacy",
+                        "legacy-system-won",
+                        false,
+                    )
+                    .await
+                    .expect("legacy SystemConfig write must succeed");
+                    conn.close().await.expect("close legacy system conn");
+                });
+            },
+            |_| panic!("after_tombstone hook must NOT run when hard_link hits AlreadyExists"),
+            || {},
+        )
+        .await
+        .expect_err("SystemConfig Redb first write must fail closed when legacy binary wins");
+
+        assert!(matches!(
+            mid_err,
+            StorageBackendError::BackendMismatch { .. }
+        ));
+        assert_eq!(mid_err.stable_code_str(), "LBR-CLI-003");
+        assert!(!mid_redb.exists());
+        assert!(!config_format_manifest_path(&mid_dir).exists());
+
+        let legacy_verify =
+            SqliteConfigStore::open_read_only(&mid_sqlite, DatabaseRole::SystemConfig)
+                .await
+                .expect("legacy SystemConfig config.db must remain 100% intact");
+        assert_eq!(
+            legacy_verify
+                .get("core.system_legacy")
+                .await
+                .expect("read legacy system key")
+                .map(|e| e.value),
+            Some("legacy-system-won".to_string())
+        );
+        drop(legacy_verify);
+
+        // Pre-existing legacy `SystemConfig` `config.db` also fails closed `LBR-CLI-003`.
+        let preexist_err = open_or_create_locked_config_scope_for_write(
+            &mid_dir,
+            DatabaseRole::SystemConfig,
+            StorageBackendKind::Redb,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("Redb write against pre-existing legacy SystemConfig config.db must fail");
+        assert_eq!(preexist_err.stable_code_str(), "LBR-CLI-003");
+        assert!(!mid_redb.exists());
+
+        // -----------------------------------------------------------------
+        // AC4: `Redb` reserves `0444` tombstone & creates `0644` `config.redb`;
+        // legacy `libra config get/set --system` (`open_configuration_database`
+        // at `config.rs:262`) immediately fails closed with `SQLITE_NOTADB`!
+        // -----------------------------------------------------------------
+        let post_dir = root.path().join("system-ac4-post-reserve");
+        fs::create_dir_all(&post_dir).expect("create system ac4 dir");
+        let post_sqlite = config_sqlite_path_in_scope_dir(&post_dir);
+
+        let locked_redb = open_or_create_locked_config_scope_for_write(
+            &post_dir,
+            DatabaseRole::SystemConfig,
+            StorageBackendKind::Redb,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("Redb creates SystemConfig scope first");
+        locked_redb
+            .store()
+            .set("core.pager", "less-system-redb", false)
+            .await
+            .expect("write Redb system key");
+        drop(locked_redb);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::symlink_metadata(&post_sqlite)
+                    .expect("stat post-reserve system tombstone")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                SYSTEM_CONFIG_TOMBSTONE_MODE
+            );
+        }
+
+        let legacy_open_err = open_configuration_database(&post_sqlite, DatabaseRole::SystemConfig)
+            .await
+            .expect_err("legacy SystemConfig open must fail on 0444 sentinel tombstone");
+        let err_msg = legacy_open_err.to_string().to_ascii_lowercase();
+        assert!(
+            err_msg.contains("not a database")
+                || err_msg.contains("sqlite_notadb")
+                || err_msg.contains("code: 26"),
+            "AC4 violation: expected SQLITE_NOTADB / 'file is not a database' from legacy system open, got: {legacy_open_err}"
+        );
+
+        let legacy_create_err =
+            create_configuration_database(&post_sqlite, DatabaseRole::SystemConfig)
+                .await
+                .expect_err("legacy SystemConfig create must fail with AlreadyExists");
+        assert_eq!(legacy_create_err.kind(), io::ErrorKind::AlreadyExists);
+
+        assert_eq!(
+            fs::read(&post_sqlite).expect("read system sentinel after legacy open attempt"),
+            CONFIG_SQLITE_TOMBSTONE_SENTINEL
+        );
+        let redb_verify = open_config_scope_read_only(&post_dir, DatabaseRole::SystemConfig)
+            .await
+            .expect("reopen Redb SystemConfig");
+        assert_eq!(
+            redb_verify
+                .get("core.pager")
+                .await
+                .expect("read core.pager")
+                .map(|e| e.value),
+            Some("less-system-redb".to_string())
+        );
+        drop(redb_verify);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&post_sqlite, fs::Permissions::from_mode(0o644));
+        }
+    }
 }
