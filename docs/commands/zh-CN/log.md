@@ -55,6 +55,24 @@ libra log --abbrev-commit
 libra log --abbrev 8
 ```
 
+### `--no-walk[=<mode>]`
+
+`--no-walk` 只显示命令行给出的提交，不沿父链遍历。裸标志（等同 `--no-walk=sorted`）按提交时间从新到旧排序；`--no-walk=unsorted` 保持命令行顺序；其他取值以 `LBR-CLI-002` 拒绝。
+
+```bash
+libra log --no-walk --format=%H <commit-a> <commit-b>
+libra log --no-walk=unsorted --oneline <commit-a> <commit-b>
+```
+
+### `--tags[=<pattern>]`
+
+`--tags` 相当于把 `refs/tags/` 下的所有引用都列在命令行：没有显式修订时它取代隐式的 `HEAD` 起点，pattern（Git wildmatch）用于筛选标签；与 `--no-walk` 组合可精确列出被标记的提交。
+
+```bash
+libra log --tags --oneline
+libra log --tags='v*' --no-walk --format=%H
+```
+
 ### `--no-abbrev`
 
 `--no-abbrev` 在人类可读输出中显示完整对象名，包括 `--oneline`、`%h`、

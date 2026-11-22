@@ -66,6 +66,30 @@ Set the length of abbreviated commit hashes.
 libra log --abbrev 8
 ```
 
+### `--no-walk[=<mode>]`
+
+With `--no-walk` log shows only the commits named on the command line and does not
+walk their ancestry. The bare flag (=`--no-walk=sorted`) orders them by commit time,
+newest first; `--no-walk=unsorted` keeps the command-line order. Any other mode is
+rejected with `LBR-CLI-002`.
+
+```bash
+libra log --no-walk --format=%H <commit-a> <commit-b>
+libra log --no-walk=unsorted --oneline <commit-a> <commit-b>
+```
+
+### `--tags[=<pattern>]`
+
+`--tags` pretends every ref under `refs/tags/` is listed on the command line: without
+an explicit revision it replaces the implicit `HEAD` start, and the pattern (Git
+wildmatch) restricts the tags taken. Combine it with `--no-walk` to list exactly the
+tagged commits.
+
+```bash
+libra log --tags --oneline
+libra log --tags='v*' --no-walk --format=%H
+```
+
 ### `--no-abbrev`
 
 `--no-abbrev` shows full object names in human-readable output, including

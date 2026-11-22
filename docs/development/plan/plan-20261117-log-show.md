@@ -827,7 +827,7 @@ PY
 
 ### Task LS-10: 实现 `log --no-walk` 与 `--tags`（#956）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-21：`LogArgs` 新增 `no_walk: Option<String>` 与 `tags: Option<String>`；`validate_no_walk` 拒绝未知模式（`StableErrorCode::CliInvalidArguments` → `LBR-CLI-002`）；`tag_tip_commits` 复用 tag 链剥离逻辑并以 `decorate_filter::wildmatch` 过滤；无显式修订时 `--tags` 取代隐式 `HEAD` 起点；`--no-walk` 在遍历后按 `sorted`（提交时间倒序）/`unsorted`（命令行顺序）裁剪排序。AC1–AC6 由 `command::log_test::no_walk_and_tags` 覆盖，`log_test` 全绿；严格 Clippy exit 0。**Codex/Claude 审计按用户 2026-11-21 指令取消**。）
 
 **Description:** 在 `LogArgs` 新增 `--no-walk[=sorted|unsorted]`（只展示给定提交，不沿父链遍历）与 `--tags[=<pattern>]`（把匹配 `refs/tags/` 的提交加入起点）。
 

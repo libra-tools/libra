@@ -114,3 +114,5 @@ flowchart TD
 - 2026-11-21（LS-07 / #959）：装饰与 `commit <id>` 着色改为显式 SGR，读取 `color.decorate.{HEAD,branch,remoteBranch,tag}` 与 `color.diff.commit`（含旧名 `diff.color.commit`），默认调色板与 Git 实测一致；分隔符按 commit 色分段着色；`%d` 与 `%D` 分别使用带括号着色与纯文本形式。回归：`command::log_test::log_colour_decorate_slots_match_git_bytes`。
 
 - 2026-11-21（LS-09 / #958）：核实 `--no-abbrev` 在 `%h`、`%p`、`--parents`、`--children` 及与 `--abbrev=<N>` 的先后覆盖关系上已全部输出 40 位 OID（LO-09 已修复，本卡补回归）：新增 `command::log_test::no_abbrev_issue_958_remaining`（AC1–AC6，含 E() 展开对照）。
+
+- 2026-11-21（LS-10 / #956）：新增 `--no-walk[=sorted|unsorted]`（只展示指定提交；`sorted` 按提交时间、`unsorted` 按命令行顺序；未知模式 `LBR-CLI-002`）与 `--tags[=<glob>]`（以匹配 `refs/tags/` 的标签所指提交为起点，无显式修订时取代隐式 `HEAD`）。回归：`command::log_test::no_walk_and_tags`（AC1–AC6）。

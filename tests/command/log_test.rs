@@ -7622,3 +7622,86 @@ fn no_abbrev_issue_958_remaining() {
         "AC6"
     );
 }
+
+#[test]
+fn no_walk_and_tags() {
+    use super::{assert_cli_success, run_libra_command, run_libra_command_with_env};
+
+    // Fixture F10: linear C1 -> C2 -> C3 (HEAD -> main) with distinct commit
+    // dates, tagged v1 -> C1, v2 -> C2, rc1 -> C3.
+    let work = tempfile::tempdir().expect("work dir");
+    let repo = work.path().join("r");
+    std::fs::create_dir_all(&repo).expect("mkdir repo");
+    assert_cli_success(&run_libra_command(&["init"], &repo), "init");
+    run_libra_command(&["config", "set", "user.name", "t"], &repo);
+    run_libra_command(&["config", "set", "user.email", "t@t"], &repo);
+    let mut ids = Vec::new();
+    for month in ["01", "02", "03"] {
+        let body = format!("c{month}");
+        std::fs::write(repo.join("f.txt"), &body).expect("write f");
+        assert_cli_success(&run_libra_command(&["add", "f.txt"], &repo), "add");
+        let date = format!("2026-{month}-01 00:00:00 +0000");
+        let result = run_libra_command_with_env(
+            &["commit", "-m", &body, "--no-verify"],
+            &repo,
+            &[("GIT_AUTHOR_DATE", &date), ("GIT_COMMITTER_DATE", &date)],
+        );
+        assert_cli_success(&result, "commit");
+        let head = run_libra_command(&["rev-parse", "HEAD"], &repo);
+        assert_cli_success(&head, "rev-parse HEAD");
+        ids.push(String::from_utf8_lossy(&head.stdout).trim().to_string());
+    }
+    let (c1, c2, c3) = (ids[0].clone(), ids[1].clone(), ids[2].clone());
+    for (tag, target) in [("v1", &c1), ("v2", &c2), ("rc1", &c3)] {
+        assert_cli_success(&run_libra_command(&["tag", tag, target], &repo), "tag");
+    }
+
+    let out = |args: &[&str]| {
+        let result = run_libra_command(args, &repo);
+        assert_cli_success(&result, &format!("log {args:?}"));
+        String::from_utf8_lossy(&result.stdout).to_string()
+    };
+
+    // AC1: `--no-walk` sorts by commit time (newest first).
+    assert_eq!(
+        out(&["log", "--no-walk", "--format=%H", &c1, &c3]),
+        format!("{c3}\n{c1}\n"),
+        "AC1"
+    );
+    // AC2: `--no-walk=unsorted` keeps the command-line order.
+    assert_eq!(
+        out(&["log", "--no-walk=unsorted", "--format=%H", &c1, &c3]),
+        format!("{c1}\n{c3}\n"),
+        "AC2"
+    );
+    // AC3: `--tags --no-walk` yields every tagged commit exactly once.
+    let mut all = out(&["log", "--tags", "--no-walk", "--format=%H"])
+        .lines()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    all.sort();
+    let mut expected = vec![c1.clone(), c2.clone(), c3.clone()];
+    expected.sort();
+    assert_eq!(all, expected, "AC3");
+    // AC4: the pattern restricts the tag set.
+    let mut matching = out(&["log", "--tags=v*", "--no-walk", "--format=%H"])
+        .lines()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    matching.sort();
+    let mut expected_matching = vec![c1.clone(), c2.clone()];
+    expected_matching.sort();
+    assert_eq!(matching, expected_matching, "AC4");
+    // AC5: without `--no-walk` the tags seed a full history walk (Git order:
+    // newest commit first).
+    assert_eq!(
+        out(&["log", "--tags", "--format=%H"]),
+        format!("{c3}\n{c2}\n{c1}\n"),
+        "AC5"
+    );
+    // AC6: an unknown mode is rejected with LBR-CLI-002.
+    let bad = run_libra_command(&["log", "--no-walk=bogus"], &repo);
+    assert!(!bad.status.success(), "AC6 must fail");
+    let stderr = String::from_utf8_lossy(&bad.stderr);
+    assert!(stderr.contains("LBR-CLI-002"), "AC6 stderr: {stderr}");
+}

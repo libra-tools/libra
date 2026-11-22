@@ -260,6 +260,26 @@ pub struct LogArgs {
     /// Simplify history to the decorated commits (and repository roots)
     #[clap(long = "simplify-by-decoration")]
     pub simplify_by_decoration: bool,
+    /// Show only the given commits without walking their ancestry (`sorted` by
+    /// commit time, `unsorted` in command-line order)
+    #[clap(
+        long = "no-walk",
+        value_name = "MODE",
+        num_args = 0..=1,
+        default_missing_value = "sorted",
+        require_equals = true
+    )]
+    pub no_walk: Option<String>,
+    /// Pretend as if every ref under `refs/tags/` matching the pattern is
+    /// listed on the command line
+    #[clap(
+        long = "tags",
+        value_name = "PATTERN",
+        num_args = 0..=1,
+        default_missing_value = "*",
+        require_equals = true
+    )]
+    pub tags: Option<String>,
     /// Draw a text-based graphical representation of the commit history
     #[clap(long)]
     pub graph: bool,
@@ -1657,6 +1677,63 @@ fn configured_follow_path(paths: &[PathBuf], enabled: bool) -> Option<PathBuf> {
 /// Resolve the starting commit(s) and optional exclusion set from CLI arguments.
 /// `ranges` carries the effective revision specs (`--range` plus any positional
 /// revisions) computed by [`resolve_log_inputs`].
+/// Reject an unsupported `--no-walk` mode.
+fn validate_no_walk(mode: Option<&str>) -> CliResult<()> {
+    match mode {
+        None | Some("sorted") | Some("unsorted") => Ok(()),
+        Some(other) => Err(CliError::command_usage(format!(
+            "invalid --no-walk mode '{other}': expected 'sorted' or 'unsorted'"
+        ))
+        .with_stable_code(StableErrorCode::CliInvalidArguments)),
+    }
+}
+
+/// Commits pointed to by tags whose short name matches `pattern`.
+async fn tag_tip_commits(pattern: &str) -> CliResult<Vec<ObjectHash>> {
+    let tags = tag::list()
+        .await
+        .map_err(|error| CliError::fatal(format!("failed to list tags for --tags: {error}")))?;
+    let edges: HashMap<ObjectHash, ObjectHash> = tags
+        .iter()
+        .filter_map(|tag| match &tag.object {
+            TagObject::Tag(t) => Some((t.id, t.object_hash)),
+            _ => None,
+        })
+        .collect();
+    let mut tips = Vec::new();
+    for tag in tags {
+        if !decorate_filter::wildmatch(pattern, &tag.name) {
+            continue;
+        }
+        let commit_id = match tag.object {
+            TagObject::Commit(c) => c.id,
+            TagObject::Tag(t) => {
+                let mut target = t.object_hash;
+                let mut seen = HashSet::new();
+                while let Some(next) = edges.get(&target) {
+                    if !seen.insert(target) {
+                        break;
+                    }
+                    target = next.to_owned();
+                }
+                match util::peel_to_non_tag_typed(target, &tag.name) {
+                    Ok((id, git_internal::internal::object::types::ObjectType::Commit)) => id,
+                    Ok(_) => continue,
+                    Err(error) => {
+                        tracing::warn!(tag = %tag.name, %error, "failed to peel tag chain for --tags");
+                        continue;
+                    }
+                }
+            }
+            _ => continue,
+        };
+        if !tips.contains(&commit_id) {
+            tips.push(commit_id);
+        }
+    }
+    Ok(tips)
+}
+
 async fn resolve_log_start_commits(
     args: &LogArgs,
     ranges: &[String],
@@ -2488,7 +2565,22 @@ async fn execute_safe_with_diff_formats(
     .with_pathspec(path_specs);
 
     let (branch_name, current_head_commit) = resolve_log_head_commit().await?;
-    let (start_commits, excludes) = resolve_log_start_commits(&args, &ranges).await?;
+    let (mut start_commits, excludes) = resolve_log_start_commits(&args, &ranges).await?;
+    validate_no_walk(args.no_walk.as_deref())?;
+    if let Some(pattern) = args.tags.as_deref() {
+        let tips = tag_tip_commits(pattern).await?;
+        if ranges.is_empty() && !args.all {
+            // Git replaces the implicit `HEAD` start with the tag tips.
+            start_commits = tips;
+        } else {
+            for tip in tips {
+                if !start_commits.contains(&tip) {
+                    start_commits.push(tip);
+                }
+            }
+        }
+    }
+    let no_walk_order = start_commits.clone();
     if start_commits.is_empty() {
         return Err(log_no_commits_error(branch_name.as_deref()));
     }
@@ -2511,6 +2603,25 @@ async fn execute_safe_with_diff_formats(
     let mut traversed_commits =
         apply_follow_and_line_filters(reachable_commits, &effective_follow, &args.line_range)
             .await?;
+    if let Some(mode) = args.no_walk.as_deref() {
+        // `--no-walk` keeps only the explicitly named starting commits.
+        traversed_commits.retain(|entry| no_walk_order.contains(&entry.commit.id));
+        if mode == "sorted" {
+            traversed_commits.sort_by(|a, b| {
+                b.commit
+                    .committer
+                    .timestamp
+                    .cmp(&a.commit.committer.timestamp)
+            });
+        } else {
+            traversed_commits.sort_by_key(|entry| {
+                no_walk_order
+                    .iter()
+                    .position(|id| *id == entry.commit.id)
+                    .unwrap_or(usize::MAX)
+            });
+        }
+    }
     if args.reverse {
         traversed_commits.reverse();
     }
@@ -3044,7 +3155,22 @@ async fn run_log(
 
     let json_notes_refs = resolve_notes_display_refs(args, false).await?;
     let (branch_name, current_head_commit) = resolve_log_head_commit().await?;
-    let (start_commits, excludes) = resolve_log_start_commits(args, &ranges).await?;
+    let (mut start_commits, excludes) = resolve_log_start_commits(args, &ranges).await?;
+    validate_no_walk(args.no_walk.as_deref())?;
+    if let Some(pattern) = args.tags.as_deref() {
+        let tips = tag_tip_commits(pattern).await?;
+        if ranges.is_empty() && !args.all {
+            // Git replaces the implicit `HEAD` start with the tag tips.
+            start_commits = tips;
+        } else {
+            for tip in tips {
+                if !start_commits.contains(&tip) {
+                    start_commits.push(tip);
+                }
+            }
+        }
+    }
+    let no_walk_order = start_commits.clone();
     if start_commits.is_empty() {
         return Err(log_no_commits_error(branch_name.as_deref()));
     }
@@ -3061,6 +3187,25 @@ async fn run_log(
     let mut traversed_commits =
         apply_follow_and_line_filters(reachable_commits, &effective_follow, &args.line_range)
             .await?;
+    if let Some(mode) = args.no_walk.as_deref() {
+        // `--no-walk` keeps only the explicitly named starting commits.
+        traversed_commits.retain(|entry| no_walk_order.contains(&entry.commit.id));
+        if mode == "sorted" {
+            traversed_commits.sort_by(|a, b| {
+                b.commit
+                    .committer
+                    .timestamp
+                    .cmp(&a.commit.committer.timestamp)
+            });
+        } else {
+            traversed_commits.sort_by_key(|entry| {
+                no_walk_order
+                    .iter()
+                    .position(|id| *id == entry.commit.id)
+                    .unwrap_or(usize::MAX)
+            });
+        }
+    }
     if args.reverse {
         traversed_commits.reverse();
     }
