@@ -914,7 +914,18 @@ async fn run_rename_remote(old: String, new: String) -> Result<RemoteOutput, Rem
                 .filter(reference::Column::Remote.eq(&new_for_txn))
                 .all(txn)
                 .await?;
-            if !target_rows.is_empty() {
+            // A refspec can create `refs/remotes/<new>/...` rows whose `remote`
+            // column still names the *source* remote, so also match by name.
+            use sea_orm::Condition;
+            let prefixed_rows = reference::Entity::find()
+                .filter(
+                    Condition::any()
+                        .add(reference::Column::Name.like(format!("refs/remotes/{new_for_txn}/%")))
+                        .add(reference::Column::Name.like(format!("{new_for_txn}/%"))),
+                )
+                .all(txn)
+                .await?;
+            if !target_rows.is_empty() || !prefixed_rows.is_empty() {
                 return Err(anyhow::anyhow!(
                     "tracking reference namespace for remote '{}' already exists",
                     new_for_txn

@@ -2280,15 +2280,30 @@ fn validate_fetch_destination(destination: &str, refspec: &str) -> Result<(), Fe
     // `refs/heads/<branch>` and `refs/remotes/<remote>/<branch>` keep their
     // reserved `HEAD` restriction; every other `refs/<ns>/...` destination is a
     // custom namespace and is accepted as long as the refname itself is valid.
+    let last_segment = destination.rsplit('/').next().unwrap_or("");
+    let wildcard_prefix = last_segment.trim_end_matches('*');
+    let wildcard_hits_head = last_segment.contains('*')
+        && !wildcard_prefix.is_empty()
+        && wildcard_prefix.len() < "HEAD".len()
+        && "HEAD".starts_with(wildcard_prefix);
     let reserved_head = destination == "refs/heads/HEAD"
         || (destination
             .strip_prefix("refs/remotes/")
             .and_then(|rest| rest.split_once('/'))
-            .is_some_and(|(remote, branch)| !remote.is_empty() && branch == "HEAD"));
+            .is_some_and(|(remote, branch)| !remote.is_empty() && branch == "HEAD"))
+        || wildcard_hits_head;
     if reserved_head {
         return Err(FetchError::InvalidRefspec {
             refspec: refspec.to_string(),
-            reason: "destination must not be the reserved HEAD ref".to_string(),
+            reason: "destination must not be the reserved HEAD ref; use refs/heads/* or \
+                     refs/remotes/<remote>/*"
+                .to_string(),
+        });
+    }
+    if destination.starts_with("refs/notes/") {
+        return Err(FetchError::InvalidRefspec {
+            refspec: refspec.to_string(),
+            reason: "destination must match refs/heads/* or refs/remotes/<remote>/*".to_string(),
         });
     }
     let valid_namespace = destination
@@ -2299,8 +2314,8 @@ fn validate_fetch_destination(destination: &str, refspec: &str) -> Result<(), Fe
     } else {
         Err(FetchError::InvalidRefspec {
             refspec: refspec.to_string(),
-            reason: "destination must be a valid ref under refs/ (and must not be a reserved \
-                     HEAD ref)"
+            reason: "destination must be a valid ref matching refs/heads/* or \
+                     refs/remotes/<remote>/* (and must not be a reserved HEAD ref)"
                 .to_string(),
         })
     }
