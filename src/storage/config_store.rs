@@ -5,7 +5,15 @@
 //! `config`, `config_kv`, `metadata_kv`) and the 3 configuration-database
 //! source tables (`config`, `config_kv`, `configuration_schema_versions`).
 
-use std::path::{Path, PathBuf};
+use std::{
+    fs::{self, File, OpenOptions},
+    io::{self, Read, Write},
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -15,6 +23,7 @@ use crate::{
     storage::{
         backend::StorageBackendKind,
         error::{StorageBackendError, StorageResult},
+        manifest::{Phase2DbState, fsync_dir},
     },
 };
 
@@ -29,6 +38,55 @@ pub const CONFIG_REDB_FILE_NAME: &str = "config.redb";
 
 /// Canonical SQLite configuration filename inside a `GlobalConfig` or `SystemConfig` directory.
 pub const CONFIG_SQLITE_FILE_NAME: &str = "config.db";
+
+/// Canonical two-phase scope format manifest filename (`ADR-RB-02` #2).
+pub const CONFIG_FORMAT_MANIFEST_FILE: &str = "config-format.json";
+
+/// Current JSON schema version for [`ConfigFormatManifest`].
+pub const CONFIG_FORMAT_MANIFEST_VERSION: u32 = 1;
+
+/// Canonical cross-runtime coordination lock filename inside a config scope directory (`ADR-RB-02` #2).
+pub const CONFIG_MIGRATION_LOCK_FILE: &str = "config-migration.lock";
+
+/// Fixed 31-byte non-SQLite sentinel written into `config.db` when `redb` owns a
+/// `GlobalConfig` or `SystemConfig` scope (`ADR-RB-02` #2 Step F1).
+pub const CONFIG_SQLITE_TOMBSTONE_SENTINEL: &[u8] = b"LIBRA_CONFIG_AUTHORITY_IS_REDB\n";
+
+/// SQLite `sqlite_master` table name installed by forward migration rollback-journal
+/// fencing (`ADR-RB-07` #1).
+pub const SQLITE_MIGRATED_FENCE_TABLE: &str = "__libra_migrated_fence__";
+
+/// Malformed SQL string written to `sqlite_master.sql` for [`SQLITE_MIGRATED_FENCE_TABLE`]
+/// so any legacy SQLite connection fails closed with `malformed database schema`.
+pub const SQLITE_MIGRATED_FENCE_SQL: &str = "LIBRA_MIGRATED_TO_REDB_FENCE_SYNTAX_ERROR";
+
+/// Required Unix permission mode for `GlobalConfig` `config.db` tombstone (`0400`).
+#[cfg(unix)]
+pub const GLOBAL_CONFIG_TOMBSTONE_MODE: u32 = 0o400;
+
+/// Required Unix permission mode for `SystemConfig` `config.db` tombstone (`0444`).
+#[cfg(unix)]
+pub const SYSTEM_CONFIG_TOMBSTONE_MODE: u32 = 0o444;
+
+/// Return the exact Unix POSIX mode bits required for a `config.db` tombstone
+/// file belonging to `role` (`0400` Global, `0444` System).
+#[cfg(unix)]
+#[must_use]
+pub const fn expected_config_tombstone_mode(role: DatabaseRole) -> Option<u32> {
+    match role {
+        DatabaseRole::GlobalConfig => Some(GLOBAL_CONFIG_TOMBSTONE_MODE),
+        DatabaseRole::SystemConfig => Some(SYSTEM_CONFIG_TOMBSTONE_MODE),
+        DatabaseRole::Repository | DatabaseRole::Capture | DatabaseRole::Derived => None,
+    }
+}
+
+/// Defensive upper bound on `config-format.json` size to prevent unbounded allocation.
+const MAX_CONFIG_MANIFEST_BYTES: u64 = 1024 * 1024;
+
+/// Maximum retries for unique atomic temp filename creation during manifest publish.
+const MAX_CONFIG_MANIFEST_TEMP_ATTEMPTS: usize = 64;
+
+static CONFIG_MANIFEST_TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Required Unix permission mode for repository `redb` configuration/git stores (`0600`).
 #[cfg(unix)]
@@ -77,6 +135,1249 @@ pub fn config_redb_path_in_scope_dir(scope_dir: &Path) -> PathBuf {
 #[must_use]
 pub fn config_sqlite_path_in_scope_dir(scope_dir: &Path) -> PathBuf {
     scope_dir.join(CONFIG_SQLITE_FILE_NAME)
+}
+
+/// Return `<scope_dir>/config-format.json`.
+#[must_use]
+pub fn config_format_manifest_path(scope_dir: &Path) -> PathBuf {
+    scope_dir.join(CONFIG_FORMAT_MANIFEST_FILE)
+}
+
+/// Return `<scope_dir>/config-migration.lock`.
+#[must_use]
+pub fn config_migration_lock_path(scope_dir: &Path) -> PathBuf {
+    scope_dir.join(CONFIG_MIGRATION_LOCK_FILE)
+}
+
+/// Validate that `role` is a scoped external configuration role
+/// (`GlobalConfig` or `SystemConfig`).
+pub(crate) fn validate_config_scope_role(role: DatabaseRole) -> StorageResult<()> {
+    match role {
+        DatabaseRole::GlobalConfig | DatabaseRole::SystemConfig => Ok(()),
+        other => Err(StorageBackendError::BackendInternal {
+            detail: format!("{other} role does not use a scoped config-format.json manifest"),
+        }),
+    }
+}
+
+const fn default_config_manifest_schema_version() -> u32 {
+    CONFIG_FORMAT_MANIFEST_VERSION
+}
+
+const fn default_config_generation() -> u64 {
+    1
+}
+
+/// Initialization/migration phase recorded in `config-format.json` while
+/// `finalized == false` (`ADR-RB-02` #2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigInitPhase {
+    /// Fresh `redb` config database 4-step initialization (`Step F1..F4`).
+    FreshCreate,
+    /// Two-phase `SQLite <-> redb` config scope migration.
+    Migration,
+}
+
+/// Authoritative two-phase scope manifest stored at `<scope_dir>/config-format.json`
+/// for [`DatabaseRole::GlobalConfig`] and [`DatabaseRole::SystemConfig`] (`ADR-RB-02` #2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigFormatManifest {
+    /// Manifest format version (currently [`CONFIG_FORMAT_MANIFEST_VERSION`] = `1`).
+    #[serde(default = "default_config_manifest_schema_version")]
+    pub schema_version: u32,
+    /// Authoritative storage backend for this config scope (`sqlite` or `redb`).
+    pub backend: StorageBackendKind,
+    /// `false` during fresh creation or migration cutover; `true` once finalized.
+    pub finalized: bool,
+    /// Active unfinalized phase (`fresh_create` or `migration`), `None` once finalized.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub init_phase: Option<ConfigInitPhase>,
+    /// Monotonically increasing scope generation (`>= 1`).
+    #[serde(default = "default_config_generation")]
+    pub generation: u64,
+    /// `true` when `config.db` in this scope directory is an intentional read-only
+    /// tombstone/fence guarding a `redb` authority against legacy SQLite binaries.
+    #[serde(default)]
+    pub legacy_sqlite_tombstone: bool,
+    /// `true` once staged target database bytes are ready for atomic rename publish.
+    #[serde(default)]
+    pub targets_staged_for_rename: bool,
+    /// Source database cutover progress during two-phase migration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_db_state: Option<Phase2DbState>,
+    /// SHA-256 of verified migration backup archive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup_sha256: Option<String>,
+    /// Canonical logical SHA-256 of the source config database captured before cutover.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_logical_sha256: Option<String>,
+}
+
+impl ConfigFormatManifest {
+    /// Construct a finalized `sqlite` scope manifest (`legacy_sqlite_tombstone = false`).
+    pub fn new_sqlite_finalized(generation: u64, role: DatabaseRole) -> StorageResult<Self> {
+        let manifest = Self {
+            schema_version: CONFIG_FORMAT_MANIFEST_VERSION,
+            backend: StorageBackendKind::Sqlite,
+            finalized: true,
+            init_phase: None,
+            generation,
+            legacy_sqlite_tombstone: false,
+            targets_staged_for_rename: false,
+            source_db_state: None,
+            backup_sha256: None,
+            source_logical_sha256: None,
+        };
+        manifest.validate(role)?;
+        Ok(manifest)
+    }
+
+    /// Construct a finalized `redb` scope manifest.
+    pub fn new_redb_finalized(
+        generation: u64,
+        legacy_sqlite_tombstone: bool,
+        role: DatabaseRole,
+    ) -> StorageResult<Self> {
+        let manifest = Self {
+            schema_version: CONFIG_FORMAT_MANIFEST_VERSION,
+            backend: StorageBackendKind::Redb,
+            finalized: true,
+            init_phase: None,
+            generation,
+            legacy_sqlite_tombstone,
+            targets_staged_for_rename: false,
+            source_db_state: None,
+            backup_sha256: None,
+            source_logical_sha256: None,
+        };
+        manifest.validate(role)?;
+        Ok(manifest)
+    }
+
+    /// Construct an unfinalized `redb` fresh-create manifest (`init_phase = "fresh_create"`).
+    pub fn new_redb_fresh_create(
+        generation: u64,
+        targets_staged_for_rename: bool,
+        role: DatabaseRole,
+    ) -> StorageResult<Self> {
+        let manifest = Self {
+            schema_version: CONFIG_FORMAT_MANIFEST_VERSION,
+            backend: StorageBackendKind::Redb,
+            finalized: false,
+            init_phase: Some(ConfigInitPhase::FreshCreate),
+            generation,
+            legacy_sqlite_tombstone: true,
+            targets_staged_for_rename,
+            source_db_state: None,
+            backup_sha256: None,
+            source_logical_sha256: None,
+        };
+        manifest.validate(role)?;
+        Ok(manifest)
+    }
+
+    /// Validate structural invariants of `config-format.json` for `role`.
+    pub fn validate(&self, role: DatabaseRole) -> StorageResult<()> {
+        validate_config_scope_role(role)?;
+        if self.schema_version == 0 {
+            return Err(StorageBackendError::BackendInternal {
+                detail: "config-format.json has invalid schema_version 0".to_string(),
+            });
+        }
+        if self.schema_version > CONFIG_FORMAT_MANIFEST_VERSION {
+            return Err(StorageBackendError::SchemaTooNew {
+                role,
+                found: self.schema_version,
+                max_supported: CONFIG_FORMAT_MANIFEST_VERSION,
+            });
+        }
+        if self.generation == 0 {
+            return Err(StorageBackendError::BackendInternal {
+                detail: "config-format.json generation must be >= 1".to_string(),
+            });
+        }
+        if self.backend == StorageBackendKind::Sqlite && self.legacy_sqlite_tombstone {
+            return Err(StorageBackendError::BackendInternal {
+                detail: "sqlite config-format.json cannot set legacy_sqlite_tombstone=true"
+                    .to_string(),
+            });
+        }
+        if self.backend == StorageBackendKind::Sqlite
+            && self.init_phase == Some(ConfigInitPhase::FreshCreate)
+        {
+            return Err(StorageBackendError::BackendInternal {
+                detail: "sqlite config-format.json cannot use init_phase=fresh_create".to_string(),
+            });
+        }
+        if self.finalized {
+            if self.init_phase.is_some() {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: "finalized config-format.json must have init_phase=null".to_string(),
+                });
+            }
+            if self.targets_staged_for_rename {
+                return Err(StorageBackendError::BackendInternal {
+                    detail:
+                        "finalized config-format.json must have targets_staged_for_rename=false"
+                            .to_string(),
+                });
+            }
+        } else if self.init_phase == Some(ConfigInitPhase::FreshCreate)
+            && !self.legacy_sqlite_tombstone
+        {
+            return Err(StorageBackendError::BackendInternal {
+                detail: "fresh_create config-format.json must set legacy_sqlite_tombstone=true"
+                    .to_string(),
+            });
+        }
+
+        for (field, val) in [
+            ("backup_sha256", &self.backup_sha256),
+            ("source_logical_sha256", &self.source_logical_sha256),
+        ] {
+            if let Some(digest) = val
+                && digest.trim().is_empty()
+            {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: format!("config-format.json `{field}` must not be empty"),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Authoritative scope state detected directly from `<scope_dir>` WITHOUT
+/// creating files or consulting `LIBRA_STORAGE_BACKEND` (`ADR-RB-02` #2, `RB-03b`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigScopeAuthority {
+    /// A finalized `config-format.json` manifest governs this scope.
+    Manifest {
+        /// Validated finalized manifest.
+        manifest: ConfigFormatManifest,
+        /// Authoritative database path (`config.redb` or `config.db`).
+        db_path: PathBuf,
+    },
+    /// No manifest exists, and only an unmigrated `config.db` exists.
+    LegacySqlite {
+        /// Path to `<scope_dir>/config.db`.
+        db_path: PathBuf,
+    },
+    /// No manifest exists, and only an unmanifested `config.redb` exists.
+    UnmanifestedRedb {
+        /// Path to `<scope_dir>/config.redb`.
+        db_path: PathBuf,
+    },
+    /// Scope directory does not exist or contains neither manifest nor database files.
+    Empty,
+}
+
+impl ConfigScopeAuthority {
+    /// Return the authoritative backend when determined by finalized manifest or
+    /// legacy `config.db`, or `None` when empty / unmanifested.
+    #[must_use]
+    pub const fn backend(&self) -> Option<StorageBackendKind> {
+        match self {
+            Self::Manifest { manifest, .. } => Some(manifest.backend),
+            Self::LegacySqlite { .. } => Some(StorageBackendKind::Sqlite),
+            Self::UnmanifestedRedb { .. } | Self::Empty => None,
+        }
+    }
+}
+
+#[cfg(windows)]
+fn durable_atomic_rename_config_manifest(tmp_path: &Path, final_path: &Path) -> StorageResult<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    let source: Vec<u16> = tmp_path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let destination: Vec<u16> = final_path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: `source` and `destination` are NUL-terminated UTF-16 buffers alive
+    // for the duration of `MoveFileExW`.
+    let moved = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        return Err(StorageBackendError::io(
+            "atomically rename config-format.json temp file with write-through",
+            io::Error::last_os_error(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn durable_atomic_rename_config_manifest(tmp_path: &Path, final_path: &Path) -> StorageResult<()> {
+    fs::rename(tmp_path, final_path)
+        .map_err(|err| StorageBackendError::io("atomically rename config-format.json", err))
+}
+
+struct ConfigManifestTempGuard(Option<PathBuf>);
+
+impl Drop for ConfigManifestTempGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+/// Atomically publish `<scope_dir>/config-format.json` via `.tmp` (`O_CREAT | O_EXCL`)
+/// → role permission mode → `sync_all()` → atomic rename → `fsync_dir(scope_dir)`.
+pub fn publish_config_format_manifest(
+    scope_dir: &Path,
+    role: DatabaseRole,
+    manifest: &ConfigFormatManifest,
+) -> StorageResult<PathBuf> {
+    manifest.validate(role)?;
+
+    #[cfg(not(any(unix, windows)))]
+    return Err(StorageBackendError::BackendInternal {
+        detail: "durable config-format.json publication is unsupported on this target platform"
+            .to_string(),
+    });
+
+    let dir_meta = fs::metadata(scope_dir).map_err(|err| {
+        StorageBackendError::io(
+            "verify scope directory before config-format.json publish",
+            err,
+        )
+    })?;
+    if !dir_meta.is_dir() {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "cannot publish config-format.json: scope path is not a directory".to_string(),
+        });
+    }
+
+    let final_path = config_format_manifest_path(scope_dir);
+    if let Ok(meta) = fs::symlink_metadata(&final_path)
+        && (meta.file_type().is_symlink() || !meta.is_file())
+    {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "refusing to overwrite non-regular config-format.json target".to_string(),
+        });
+    }
+
+    let mut payload = serde_json::to_vec_pretty(manifest).map_err(|err| {
+        StorageBackendError::BackendInternal {
+            detail: format!(
+                "failed to serialize config-format.json ({:?})",
+                err.classify()
+            ),
+        }
+    })?;
+    payload.push(b'\n');
+
+    #[cfg(unix)]
+    let target_mode =
+        expected_config_file_mode(role).ok_or_else(|| StorageBackendError::BackendInternal {
+            detail: format!("{role} has no defined config-format.json file mode"),
+        })?;
+
+    let mut created = None;
+    for _ in 0..MAX_CONFIG_MANIFEST_TEMP_ATTEMPTS {
+        let seq = CONFIG_MANIFEST_TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp_name = format!(
+            "{CONFIG_FORMAT_MANIFEST_FILE}.{}.{}.tmp",
+            std::process::id(),
+            seq
+        );
+        let candidate = scope_dir.join(tmp_name);
+        let mut opts = OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        match opts.open(&candidate) {
+            Ok(file) => {
+                created = Some((candidate, file));
+                break;
+            }
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(StorageBackendError::io(
+                    "create config-format.json temp file",
+                    err,
+                ));
+            }
+        }
+    }
+
+    let (tmp_path, mut file) = created.ok_or_else(|| StorageBackendError::BackendInternal {
+        detail: "exhausted temp filename attempts while publishing config-format.json".to_string(),
+    })?;
+    let mut guard = ConfigManifestTempGuard(Some(tmp_path.clone()));
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(target_mode))
+            .map_err(|err| StorageBackendError::io("fchmod config-format.json temp file", err))?;
+    }
+
+    file.write_all(&payload)
+        .map_err(|err| StorageBackendError::io("write config-format.json temp file", err))?;
+    file.sync_all()
+        .map_err(|err| StorageBackendError::io("fsync config-format.json temp file", err))?;
+    drop(file);
+
+    durable_atomic_rename_config_manifest(&tmp_path, &final_path)?;
+    guard.0 = None;
+    fsync_dir(scope_dir)?;
+    Ok(final_path)
+}
+
+/// Read and validate `<scope_dir>/config-format.json` if present (strictly read-only).
+///
+/// Returns `Ok(None)` when `config-format.json` does not exist on disk.
+/// Rejects symlinks, directories, oversized files, invalid JSON, future
+/// `schema_version` (`SchemaTooNew`), and structurally invalid manifests.
+pub fn read_config_format_manifest(
+    scope_dir: &Path,
+    role: DatabaseRole,
+) -> StorageResult<Option<ConfigFormatManifest>> {
+    validate_config_scope_role(role)?;
+    let path = config_format_manifest_path(scope_dir);
+    let meta = match fs::symlink_metadata(&path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(StorageBackendError::io("stat config-format.json", err)),
+    };
+
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return Err(StorageBackendError::BackendInternal {
+            detail:
+                "config-format.json must be a regular file (symlinks and directories are rejected)"
+                    .to_string(),
+        });
+    }
+
+    if meta.len() > MAX_CONFIG_MANIFEST_BYTES {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "config-format.json exceeds maximum allowed size ({} > {MAX_CONFIG_MANIFEST_BYTES} bytes)",
+                meta.len()
+            ),
+        });
+    }
+
+    let file =
+        File::open(&path).map_err(|err| StorageBackendError::io("open config-format.json", err))?;
+    let mut raw = Vec::with_capacity(meta.len().min(MAX_CONFIG_MANIFEST_BYTES) as usize);
+    file.take(MAX_CONFIG_MANIFEST_BYTES + 1)
+        .read_to_end(&mut raw)
+        .map_err(|err| StorageBackendError::io("read config-format.json", err))?;
+    if raw.len() as u64 > MAX_CONFIG_MANIFEST_BYTES {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "config-format.json exceeds maximum allowed size ({MAX_CONFIG_MANIFEST_BYTES} bytes)"
+            ),
+        });
+    }
+
+    let json_val: serde_json::Value =
+        serde_json::from_slice(&raw).map_err(|err| StorageBackendError::BackendInternal {
+            detail: format!(
+                "config-format.json contains invalid JSON ({:?})",
+                err.classify()
+            ),
+        })?;
+
+    if let Some(ver) = json_val
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        && ver > u64::from(CONFIG_FORMAT_MANIFEST_VERSION)
+    {
+        return Err(StorageBackendError::SchemaTooNew {
+            role,
+            found: u32::try_from(ver).unwrap_or(u32::MAX),
+            max_supported: CONFIG_FORMAT_MANIFEST_VERSION,
+        });
+    }
+
+    let manifest: ConfigFormatManifest =
+        serde_json::from_value(json_val).map_err(|err| StorageBackendError::BackendInternal {
+            detail: format!(
+                "config-format.json failed schema validation ({:?})",
+                err.classify()
+            ),
+        })?;
+    manifest.validate(role)?;
+    Ok(Some(manifest))
+}
+
+fn probe_regular_scope_file(path: &Path, label: &'static str) -> StorageResult<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() || !meta.is_file() {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: format!(
+                        "{label} in config scope must be a regular file (symlinks and directories are rejected)"
+                    ),
+                });
+            }
+            Ok(true)
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(StorageBackendError::io(label, err)),
+    }
+}
+
+/// Returns `true` if `path` is a regular file whose exact contents match
+/// [`CONFIG_SQLITE_TOMBSTONE_SENTINEL`] (`LIBRA_CONFIG_AUTHORITY_IS_REDB\n`).
+///
+/// Rejects symlinks and directories fail-closed.
+pub fn is_config_sqlite_tombstone_sentinel(path: &Path) -> StorageResult<bool> {
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(StorageBackendError::io("stat config.db tombstone", err)),
+    };
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return Err(StorageBackendError::BackendInternal {
+            detail:
+                "config.db in config scope must be a regular file (symlinks and directories are rejected)"
+                    .to_string(),
+        });
+    }
+    if meta.len() != CONFIG_SQLITE_TOMBSTONE_SENTINEL.len() as u64 {
+        return Ok(false);
+    }
+    let mut file = File::open(path)
+        .map_err(|err| StorageBackendError::io("open config.db for tombstone check", err))?;
+    let mut buf = [0u8; 32];
+    let n = file
+        .read(&mut buf)
+        .map_err(|err| StorageBackendError::io("read config.db for tombstone check", err))?;
+    Ok(
+        n == CONFIG_SQLITE_TOMBSTONE_SENTINEL.len()
+            && &buf[..n] == CONFIG_SQLITE_TOMBSTONE_SENTINEL,
+    )
+}
+
+const SQLITE_HEADER_MAGIC: &[u8; 16] = b"SQLite format 3\0";
+const MAX_SQLITE_MASTER_PAGES: usize = 64;
+const MAX_SQLITE_RECORD_BYTES: usize = 256 * 1024;
+
+fn read_sqlite_varint(buf: &[u8]) -> Option<(u64, usize)> {
+    let mut val = 0u64;
+    for (i, &byte) in buf.iter().take(9).enumerate() {
+        if i == 8 {
+            val = (val << 8) | u64::from(byte);
+            return Some((val, 9));
+        }
+        val = (val << 7) | u64::from(byte & 0x7F);
+        if (byte & 0x80) == 0 {
+            return Some((val, i + 1));
+        }
+    }
+    None
+}
+
+fn read_sqlite_page(file: &mut File, page_no: u32, page_size: usize) -> StorageResult<Vec<u8>> {
+    use std::io::Seek;
+
+    if page_no == 0 {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "invalid SQLite page number 0".to_string(),
+        });
+    }
+    let offset = u64::from(page_no - 1)
+        .checked_mul(page_size as u64)
+        .ok_or_else(|| StorageBackendError::BackendInternal {
+            detail: "SQLite page offset overflow".to_string(),
+        })?;
+    file.seek(io::SeekFrom::Start(offset))
+        .map_err(|err| StorageBackendError::io("seek sqlite tombstone page", err))?;
+    let mut buf = vec![0u8; page_size];
+    file.read_exact(&mut buf)
+        .map_err(|err| StorageBackendError::io("read sqlite tombstone page", err))?;
+    Ok(buf)
+}
+
+fn sqlite_master_record_matches_fence(payload: &[u8]) -> bool {
+    let Some((hdr_len_u64, mut hdr_pos)) = read_sqlite_varint(payload) else {
+        return false;
+    };
+    let Ok(hdr_len) = usize::try_from(hdr_len_u64) else {
+        return false;
+    };
+    if hdr_len < hdr_pos || hdr_len > payload.len() {
+        return false;
+    }
+
+    let mut serial_types = Vec::with_capacity(5);
+    while hdr_pos < hdr_len {
+        let Some((st, used)) = read_sqlite_varint(&payload[hdr_pos..hdr_len]) else {
+            return false;
+        };
+        hdr_pos += used;
+        serial_types.push(st);
+        if serial_types.len() > 8 {
+            return false;
+        }
+    }
+    if serial_types.len() != 5 {
+        return false;
+    }
+
+    let mut body_pos = hdr_len;
+    let mut cols: [Option<&str>; 5] = [None; 5];
+    for (idx, st) in serial_types.into_iter().enumerate() {
+        let col_len: usize = match st {
+            0 | 8 | 9 => 0,
+            1 => 1,
+            2 => 2,
+            3 => 3,
+            4 => 4,
+            5 => 6,
+            6 | 7 => 8,
+            10 | 11 => return false,
+            n if n >= 12 => {
+                let Ok(len) = usize::try_from((n - 12) / 2) else {
+                    return false;
+                };
+                len
+            }
+            _ => return false,
+        };
+        let Some(end) = body_pos.checked_add(col_len) else {
+            return false;
+        };
+        if end > payload.len() {
+            return false;
+        }
+        if st >= 13 && (st & 1) == 1 {
+            cols[idx] = std::str::from_utf8(&payload[body_pos..end]).ok();
+        }
+        body_pos = end;
+    }
+
+    cols[0] == Some("table")
+        && cols[1] == Some(SQLITE_MIGRATED_FENCE_TABLE)
+        && cols[2] == Some(SQLITE_MIGRATED_FENCE_TABLE)
+        && cols[4] == Some(SQLITE_MIGRATED_FENCE_SQL)
+}
+
+fn sqlite_sidecar_has_bytes(db_path: &Path, suffix: &str) -> StorageResult<bool> {
+    let mut os = db_path.as_os_str().to_os_string();
+    os.push(suffix);
+    let sidecar = PathBuf::from(os);
+    match fs::symlink_metadata(&sidecar) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() || !meta.is_file() {
+                return Ok(true);
+            }
+            Ok(meta.len() > 0)
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(StorageBackendError::io(
+            "stat sqlite tombstone sidecar",
+            err,
+        )),
+    }
+}
+
+/// Returns `true` if `path` is a regular SQLite 3 database whose `sqlite_master`
+/// B-tree (root page 1) contains the exact committed `__libra_migrated_fence__`
+/// tombstone record (`ADR-RB-07` #1) and has no active non-empty `-journal` or
+/// `-wal` sidecar.
+///
+/// Operates strictly read-only directly on SQLite B-tree page 1 (never writes
+/// sidecars, works identically across `storage-sqlite` and `storage-redb`-only
+/// builds, and ignores user data in `config_kv` pages).
+pub fn is_config_sqlite_fenced_tombstone(path: &Path) -> StorageResult<bool> {
+    use std::collections::HashSet;
+
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(StorageBackendError::io("stat sqlite tombstone", err)),
+    };
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return Err(StorageBackendError::BackendInternal {
+            detail:
+                "config.db in config scope must be a regular file (symlinks and directories are rejected)"
+                    .to_string(),
+        });
+    }
+    if meta.len() < 512 {
+        return Ok(false);
+    }
+    if sqlite_sidecar_has_bytes(path, "-journal")? || sqlite_sidecar_has_bytes(path, "-wal")? {
+        return Ok(false);
+    }
+
+    let mut file = File::open(path)
+        .map_err(|err| StorageBackendError::io("open config.db for fence check", err))?;
+    let mut header = [0u8; 100];
+    if file.read_exact(&mut header).is_err() {
+        return Ok(false);
+    }
+    if &header[0..16] != SQLITE_HEADER_MAGIC {
+        return Ok(false);
+    }
+    let raw_ps = u16::from_be_bytes([header[16], header[17]]);
+    let page_size = if raw_ps == 1 {
+        65536usize
+    } else {
+        usize::from(raw_ps)
+    };
+    if !(512..=65536).contains(&page_size) || !page_size.is_power_of_two() {
+        return Ok(false);
+    }
+    let reserved = usize::from(header[20]);
+    let Some(usable_size) = page_size.checked_sub(reserved) else {
+        return Ok(false);
+    };
+    if usable_size < 480 {
+        return Ok(false);
+    }
+    let text_encoding = u32::from_be_bytes([header[56], header[57], header[58], header[59]]);
+    if text_encoding != 1 {
+        return Ok(false);
+    }
+    let file_pages = meta.len() / (page_size as u64);
+    if file_pages == 0 {
+        return Ok(false);
+    }
+
+    let mut stack = vec![1u32];
+    let mut visited = HashSet::new();
+    while let Some(page_no) = stack.pop() {
+        if visited.len() >= MAX_SQLITE_MASTER_PAGES || !visited.insert(page_no) {
+            return Ok(false);
+        }
+        if u64::from(page_no) > file_pages {
+            return Ok(false);
+        }
+        let Ok(page) = read_sqlite_page(&mut file, page_no, page_size) else {
+            return Ok(false);
+        };
+        let hdr_off = if page_no == 1 { 100usize } else { 0usize };
+        if hdr_off + 8 > usable_size {
+            return Ok(false);
+        }
+        let page_type = page[hdr_off];
+        let cell_count = usize::from(u16::from_be_bytes([page[hdr_off + 3], page[hdr_off + 4]]));
+
+        match page_type {
+            0x05 => {
+                // Table B-tree interior page (12-byte header + right_child).
+                let ptr_base = hdr_off + 12;
+                let Some(ptr_end) = ptr_base.checked_add(cell_count.saturating_mul(2)) else {
+                    return Ok(false);
+                };
+                if ptr_end > usable_size {
+                    return Ok(false);
+                }
+                let right_child = u32::from_be_bytes([
+                    page[hdr_off + 8],
+                    page[hdr_off + 9],
+                    page[hdr_off + 10],
+                    page[hdr_off + 11],
+                ]);
+                if right_child > 0 {
+                    stack.push(right_child);
+                }
+                for i in 0..cell_count {
+                    let p_off = ptr_base + i * 2;
+                    let cell_off = usize::from(u16::from_be_bytes([page[p_off], page[p_off + 1]]));
+                    if cell_off + 4 > usable_size {
+                        return Ok(false);
+                    }
+                    let left_child = u32::from_be_bytes([
+                        page[cell_off],
+                        page[cell_off + 1],
+                        page[cell_off + 2],
+                        page[cell_off + 3],
+                    ]);
+                    if left_child > 0 {
+                        stack.push(left_child);
+                    }
+                }
+            }
+            0x0d => {
+                // Table B-tree leaf page (8-byte header).
+                let ptr_base = hdr_off + 8;
+                let Some(ptr_end) = ptr_base.checked_add(cell_count.saturating_mul(2)) else {
+                    return Ok(false);
+                };
+                if ptr_end > usable_size {
+                    return Ok(false);
+                }
+                let max_inline = usable_size - 35;
+                let min_inline = ((usable_size - 12) * 32 / 255).saturating_sub(23);
+
+                for i in 0..cell_count {
+                    let p_off = ptr_base + i * 2;
+                    let cell_off = usize::from(u16::from_be_bytes([page[p_off], page[p_off + 1]]));
+                    if cell_off >= usable_size {
+                        return Ok(false);
+                    }
+                    let Some((payload_len_u64, n1)) =
+                        read_sqlite_varint(&page[cell_off..usable_size])
+                    else {
+                        return Ok(false);
+                    };
+                    let Ok(payload_len) = usize::try_from(payload_len_u64) else {
+                        return Ok(false);
+                    };
+                    if payload_len > MAX_SQLITE_RECORD_BYTES {
+                        continue;
+                    }
+                    let after_len = cell_off + n1;
+                    let Some((_, n2)) = read_sqlite_varint(&page[after_len..usable_size]) else {
+                        return Ok(false);
+                    };
+                    let data_start = after_len + n2;
+
+                    let payload = if payload_len <= max_inline {
+                        let Some(data_end) = data_start.checked_add(payload_len) else {
+                            return Ok(false);
+                        };
+                        if data_end > usable_size {
+                            return Ok(false);
+                        }
+                        page[data_start..data_end].to_vec()
+                    } else {
+                        let k = min_inline + ((payload_len - min_inline) % (usable_size - 4));
+                        let inline_len = if k <= max_inline { k } else { min_inline };
+                        let Some(ovf_ptr_off) = data_start.checked_add(inline_len) else {
+                            return Ok(false);
+                        };
+                        if ovf_ptr_off + 4 > usable_size {
+                            return Ok(false);
+                        }
+                        let mut out = Vec::with_capacity(payload_len);
+                        out.extend_from_slice(&page[data_start..ovf_ptr_off]);
+                        let mut next_ovf = u32::from_be_bytes([
+                            page[ovf_ptr_off],
+                            page[ovf_ptr_off + 1],
+                            page[ovf_ptr_off + 2],
+                            page[ovf_ptr_off + 3],
+                        ]);
+                        let mut ovf_visited = HashSet::new();
+                        while out.len() < payload_len {
+                            if next_ovf == 0
+                                || u64::from(next_ovf) > file_pages
+                                || !ovf_visited.insert(next_ovf)
+                                || ovf_visited.len() > MAX_SQLITE_MASTER_PAGES
+                            {
+                                return Ok(false);
+                            }
+                            let Ok(ovf_page) = read_sqlite_page(&mut file, next_ovf, page_size)
+                            else {
+                                return Ok(false);
+                            };
+                            next_ovf = u32::from_be_bytes([
+                                ovf_page[0],
+                                ovf_page[1],
+                                ovf_page[2],
+                                ovf_page[3],
+                            ]);
+                            let take = (payload_len - out.len()).min(usable_size - 4);
+                            out.extend_from_slice(&ovf_page[4..4 + take]);
+                        }
+                        out
+                    };
+
+                    if sqlite_master_record_matches_fence(&payload) {
+                        return Ok(true);
+                    }
+                }
+            }
+            _ => return Ok(false),
+        }
+    }
+
+    Ok(false)
+}
+
+/// Verify that `sqlite_path` exists as a read-only regular file carrying either
+/// the 31-byte `LIBRA_CONFIG_AUTHORITY_IS_REDB\n` sentinel or a valid committed
+/// `__libra_migrated_fence__` SQLite fence (`ADR-RB-02` #2, `RB-03b`).
+fn verify_config_sqlite_tombstone(sqlite_path: &Path, role: DatabaseRole) -> StorageResult<()> {
+    let meta = match fs::symlink_metadata(sqlite_path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "{role} finalized redb manifest requires legacy_sqlite_tombstone=true, but config.db tombstone is missing"
+                ),
+            });
+        }
+        Err(err) => {
+            return Err(StorageBackendError::io(
+                "stat required config.db tombstone",
+                err,
+            ));
+        }
+    };
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "{role} config.db tombstone must be a regular file (symlinks and directories are rejected)"
+            ),
+        });
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode() & 0o777;
+        if (mode & 0o222) != 0 {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "{role} config.db tombstone must be read-only (non-writable), found mode {mode:04o}"
+                ),
+            });
+        }
+        if role == DatabaseRole::GlobalConfig && (mode & 0o077) != 0 {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "GlobalConfig config.db tombstone must not grant group/other permissions, found mode {mode:04o}"
+                ),
+            });
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        if !meta.permissions().readonly() {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!("{role} config.db tombstone must have readonly attribute set"),
+            });
+        }
+    }
+
+    if is_config_sqlite_tombstone_sentinel(sqlite_path)?
+        || is_config_sqlite_fenced_tombstone(sqlite_path)?
+    {
+        return Ok(());
+    }
+
+    Err(StorageBackendError::BackendInternal {
+        detail: format!(
+            "{role} config.db is neither a valid redb sentinel nor a fenced migrated SQLite tombstone"
+        ),
+    })
+}
+
+/// Inspect `<scope_dir>` strictly read-only to establish config scope authority
+/// BEFORE consulting `LIBRA_STORAGE_BACKEND` (`ADR-RB-02` #2, `RB-03b`).
+///
+/// Enforces:
+/// 1. `config-format.json` with `finalized == false` ALWAYS fails closed with
+///    [`StorageBackendError::ManifestNotFinalized`] (`LBR-IO-001`), ignoring
+///    `LIBRA_STORAGE_BACKEND`.
+/// 2. Missing `config-format.json` with BOTH `config.db` and `config.redb`
+///    present fails closed with `LBR-IO-001` (split-brain guard).
+/// 3. Finalized `redb` manifest with `legacy_sqlite_tombstone == true` requires
+///    and verifies a read-only regular `config.db` tombstone (either the 31-byte
+///    sentinel `LIBRA_CONFIG_AUTHORITY_IS_REDB\n` or a committed
+///    `__libra_migrated_fence__` SQLite fence) before accepting the scope.
+/// 4. Missing or empty scope directory returns [`ConfigScopeAuthority::Empty`]
+///    without creating any directory, lock file, manifest, or database file
+///    (`ADR-CF-06`).
+pub fn inspect_config_scope_authority(
+    scope_dir: &Path,
+    role: DatabaseRole,
+) -> StorageResult<ConfigScopeAuthority> {
+    validate_config_scope_role(role)?;
+
+    let dir_meta = match fs::metadata(scope_dir) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            if fs::symlink_metadata(scope_dir).is_ok() {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: "config scope path is a dangling symlink".to_string(),
+                });
+            }
+            return Ok(ConfigScopeAuthority::Empty);
+        }
+        Err(err) => return Err(StorageBackendError::io("stat config scope directory", err)),
+    };
+    if !dir_meta.is_dir() {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "config scope path must be a directory".to_string(),
+        });
+    }
+
+    let sqlite_path = config_sqlite_path_in_scope_dir(scope_dir);
+    let redb_path = config_redb_path_in_scope_dir(scope_dir);
+
+    if let Some(manifest) = read_config_format_manifest(scope_dir, role)? {
+        if !manifest.finalized {
+            return Err(StorageBackendError::ManifestNotFinalized {
+                detail: format!(
+                    "{role} config-format.json for backend `{}` generation {} has finalized=false",
+                    manifest.backend, manifest.generation
+                ),
+            });
+        }
+        let has_sqlite = probe_regular_scope_file(&sqlite_path, "config.db")?;
+        let has_redb = probe_regular_scope_file(&redb_path, "config.redb")?;
+
+        return match manifest.backend {
+            StorageBackendKind::Redb => {
+                if manifest.legacy_sqlite_tombstone {
+                    verify_config_sqlite_tombstone(&sqlite_path, role)?;
+                } else if has_sqlite {
+                    return Err(StorageBackendError::BackendInternal {
+                        detail: format!(
+                            "{role} config scope has finalized redb manifest without legacy_sqlite_tombstone=true while config.db coexists"
+                        ),
+                    });
+                }
+                if !has_redb {
+                    return Err(StorageBackendError::BackendInternal {
+                        detail: format!(
+                            "{role} finalized redb config-format.json is missing authoritative config.redb"
+                        ),
+                    });
+                }
+                Ok(ConfigScopeAuthority::Manifest {
+                    manifest,
+                    db_path: redb_path,
+                })
+            }
+            StorageBackendKind::Sqlite => {
+                if has_redb {
+                    return Err(StorageBackendError::BackendInternal {
+                        detail: format!(
+                            "{role} config scope has finalized sqlite manifest while config.redb coexists"
+                        ),
+                    });
+                }
+                if !has_sqlite {
+                    return Err(StorageBackendError::BackendInternal {
+                        detail: format!(
+                            "{role} finalized sqlite config-format.json is missing authoritative config.db"
+                        ),
+                    });
+                }
+                Ok(ConfigScopeAuthority::Manifest {
+                    manifest,
+                    db_path: sqlite_path,
+                })
+            }
+        };
+    }
+
+    // No `config-format.json` present.
+    let has_sqlite = probe_regular_scope_file(&sqlite_path, "config.db")?;
+    let has_redb = probe_regular_scope_file(&redb_path, "config.redb")?;
+
+    match (has_sqlite, has_redb) {
+        (true, true) => Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "{role} config scope contains both config.db and config.redb without config-format.json (split-brain)"
+            ),
+        }),
+        (true, false) => {
+            if is_config_sqlite_tombstone_sentinel(&sqlite_path)?
+                || is_config_sqlite_fenced_tombstone(&sqlite_path)?
+            {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: format!(
+                        "{role} config scope contains a fenced/tombstone config.db without config-format.json"
+                    ),
+                });
+            }
+            Ok(ConfigScopeAuthority::LegacySqlite {
+                db_path: sqlite_path,
+            })
+        }
+        (false, true) => Ok(ConfigScopeAuthority::UnmanifestedRedb { db_path: redb_path }),
+        (false, false) => Ok(ConfigScopeAuthority::Empty),
+    }
+}
+
+/// Open an existing `GlobalConfig` or `SystemConfig` scope writable after
+/// validating `config-format.json` authority (`ADR-RB-02` #2, `RB-03b`).
+///
+/// Enforces the exact same manifest pre-validation guard as
+/// [`open_config_scope_read_only`] (`finalized == false` -> `LBR-IO-001`,
+/// dual-file without manifest -> `LBR-IO-001`, verified read-only tombstone
+/// required when `legacy_sqlite_tombstone == true`). Does not create a brand-new
+/// database in an empty directory (returns `NotFound`; locked fresh creation is
+/// provided by `RB-03h`/`RB-03d`/`RB-03f`/`RB-03e`).
+pub async fn open_config_scope_read_write(
+    scope_dir: &Path,
+    role: DatabaseRole,
+) -> StorageResult<Arc<dyn ConfigStore>> {
+    match inspect_config_scope_authority(scope_dir, role)? {
+        ConfigScopeAuthority::Empty => Err(StorageBackendError::NotFound {
+            resource: format!("{role} configuration scope"),
+        }),
+        ConfigScopeAuthority::Manifest { manifest, db_path } => match manifest.backend {
+            StorageBackendKind::Redb => {
+                #[cfg(feature = "storage-redb")]
+                {
+                    let store =
+                        crate::storage::redb::RedbConfigStore::open_read_write(&db_path, role)?;
+                    Ok(Arc::new(store))
+                }
+                #[cfg(not(feature = "storage-redb"))]
+                {
+                    let _ = db_path;
+                    Err(StorageBackendError::UnsupportedBackend {
+                        requested: StorageBackendKind::Redb.to_string(),
+                        detail: format!(
+                            "{role} config scope uses redb, which is not compiled into this binary"
+                        ),
+                    })
+                }
+            }
+            StorageBackendKind::Sqlite => {
+                #[cfg(feature = "storage-sqlite")]
+                {
+                    let store =
+                        crate::storage::sqlite::SqliteConfigStore::open(&db_path, role).await?;
+                    Ok(Arc::new(store))
+                }
+                #[cfg(not(feature = "storage-sqlite"))]
+                {
+                    let _ = db_path;
+                    Err(StorageBackendError::UnsupportedBackend {
+                        requested: StorageBackendKind::Sqlite.to_string(),
+                        detail: format!(
+                            "{role} config scope uses sqlite, which is not compiled into this binary"
+                        ),
+                    })
+                }
+            }
+        },
+        ConfigScopeAuthority::LegacySqlite { db_path } => {
+            #[cfg(feature = "storage-sqlite")]
+            {
+                let store = crate::storage::sqlite::SqliteConfigStore::open(&db_path, role).await?;
+                Ok(Arc::new(store))
+            }
+            #[cfg(not(feature = "storage-sqlite"))]
+            {
+                let _ = db_path;
+                Err(StorageBackendError::UnsupportedBackend {
+                    requested: StorageBackendKind::Sqlite.to_string(),
+                    detail: format!(
+                        "{role} config scope has an unmigrated legacy sqlite config.db; run `libra-migrate`"
+                    ),
+                })
+            }
+        }
+        ConfigScopeAuthority::UnmanifestedRedb { .. } => {
+            Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "{role} config scope contains unmanifested config.redb without config-format.json"
+                ),
+            })
+        }
+    }
+}
+
+/// Open a `GlobalConfig` or `SystemConfig` scope strictly read-only after
+/// validating `config-format.json` authority (`ADR-RB-02` #2, `ADR-CF-06`, `RB-03b`).
+///
+/// Guarantees:
+/// - Never reads `LIBRA_STORAGE_BACKEND` to bypass an unfinalized manifest.
+/// - Never creates `<scope_dir>`, `config-migration.lock`, `config-format.json`,
+///   `config.db`, or `config.redb`.
+/// - Returns [`StorageBackendError::NotFound`] when the scope directory is absent
+///   or contains no config store.
+/// - Accepts coexisting `config.db` tombstone when `config-format.json` is
+///   `backend="redb", finalized=true, legacy_sqlite_tombstone=true`.
+pub async fn open_config_scope_read_only(
+    scope_dir: &Path,
+    role: DatabaseRole,
+) -> StorageResult<Arc<dyn ConfigStore>> {
+    match inspect_config_scope_authority(scope_dir, role)? {
+        ConfigScopeAuthority::Empty => Err(StorageBackendError::NotFound {
+            resource: format!("{role} configuration scope"),
+        }),
+        ConfigScopeAuthority::Manifest { manifest, db_path } => match manifest.backend {
+            StorageBackendKind::Redb => {
+                #[cfg(feature = "storage-redb")]
+                {
+                    let store =
+                        crate::storage::redb::RedbConfigStore::open_read_only(&db_path, role)?;
+                    Ok(Arc::new(store))
+                }
+                #[cfg(not(feature = "storage-redb"))]
+                {
+                    let _ = db_path;
+                    Err(StorageBackendError::UnsupportedBackend {
+                        requested: StorageBackendKind::Redb.to_string(),
+                        detail: format!(
+                            "{role} config scope uses redb, which is not compiled into this binary"
+                        ),
+                    })
+                }
+            }
+            StorageBackendKind::Sqlite => {
+                #[cfg(feature = "storage-sqlite")]
+                {
+                    let store =
+                        crate::storage::sqlite::SqliteConfigStore::open_read_only(&db_path, role)
+                            .await?;
+                    Ok(Arc::new(store))
+                }
+                #[cfg(not(feature = "storage-sqlite"))]
+                {
+                    let _ = db_path;
+                    Err(StorageBackendError::UnsupportedBackend {
+                        requested: StorageBackendKind::Sqlite.to_string(),
+                        detail: format!(
+                            "{role} config scope uses sqlite, which is not compiled into this binary"
+                        ),
+                    })
+                }
+            }
+        },
+        ConfigScopeAuthority::LegacySqlite { db_path } => {
+            #[cfg(feature = "storage-sqlite")]
+            {
+                let store =
+                    crate::storage::sqlite::SqliteConfigStore::open_read_only(&db_path, role)
+                        .await?;
+                Ok(Arc::new(store))
+            }
+            #[cfg(not(feature = "storage-sqlite"))]
+            {
+                let _ = db_path;
+                Err(StorageBackendError::UnsupportedBackend {
+                    requested: StorageBackendKind::Sqlite.to_string(),
+                    detail: format!(
+                        "{role} config scope has an unmigrated legacy sqlite config.db; run `libra-migrate`"
+                    ),
+                })
+            }
+        }
+        ConfigScopeAuthority::UnmanifestedRedb { .. } => {
+            Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "{role} config scope contains unmanifested config.redb without config-format.json"
+                ),
+            })
+        }
+    }
 }
 
 /// One flat configuration entry stored in `config_kv`.
@@ -223,7 +1524,7 @@ pub fn key_in_section(key: &str, section: &str) -> bool {
 /// Object-safe configuration store abstraction backed by SQLite or `redb 5.0`
 /// (`ADR-RB-04` #1).
 #[async_trait]
-pub trait ConfigStore: Send + Sync {
+pub trait ConfigStore: Send + Sync + std::fmt::Debug {
     /// Owner [`DatabaseRole`] (`Repository`, `GlobalConfig`, or `SystemConfig`).
     fn role(&self) -> DatabaseRole;
 
@@ -3392,5 +4693,486 @@ mod tests {
                 "SystemConfig config.redb must retain exact 0644 mode after writes"
             );
         }
+    }
+
+    #[cfg(all(feature = "storage-sqlite", feature = "storage-redb"))]
+    #[tokio::test]
+    async fn config_scope_manifest_pending_dual_file_and_tombstone_acceptance() {
+        use std::{
+            env, fs,
+            path::PathBuf,
+            process::{Command, Stdio},
+        };
+
+        use tempfile::tempdir;
+
+        use crate::storage::{
+            backend::LIBRA_STORAGE_BACKEND_ENV, redb::RedbConfigStore, sqlite::SqliteConfigStore,
+        };
+
+        // Isolated child mode for AC1: prove `LIBRA_STORAGE_BACKEND=sqlite` and
+        // `LIBRA_STORAGE_BACKEND=redb` CANNOT bypass `config-format.json(finalized=false)`.
+        if let Some(child_dir) = env::var_os("LIBRA_RB03B_PENDING_DIR") {
+            let role = match env::var("LIBRA_RB03B_ROLE").expect("role env").as_str() {
+                "global" => DatabaseRole::GlobalConfig,
+                "system" => DatabaseRole::SystemConfig,
+                other => panic!("unexpected LIBRA_RB03B_ROLE: {other}"),
+            };
+            let dir_path = PathBuf::from(child_dir);
+            let inspect_err = inspect_config_scope_authority(&dir_path, role)
+                .expect_err("inspect must fail closed when finalized=false");
+            assert!(
+                matches!(
+                    inspect_err,
+                    StorageBackendError::ManifestNotFinalized { .. }
+                ),
+                "expected ManifestNotFinalized from inspect, got {inspect_err:?}"
+            );
+            assert_eq!(inspect_err.stable_code_str(), "LBR-IO-001");
+
+            let open_err = open_config_scope_read_only(&dir_path, role)
+                .await
+                .expect_err("open_config_scope_read_only must fail closed when finalized=false");
+            assert!(
+                matches!(open_err, StorageBackendError::ManifestNotFinalized { .. }),
+                "expected ManifestNotFinalized from open_read_only, got {open_err:?}"
+            );
+            assert_eq!(open_err.stable_code_str(), "LBR-IO-001");
+
+            let open_rw_err = open_config_scope_read_write(&dir_path, role)
+                .await
+                .expect_err("open_config_scope_read_write must fail closed when finalized=false");
+            assert!(
+                matches!(
+                    open_rw_err,
+                    StorageBackendError::ManifestNotFinalized { .. }
+                ),
+                "expected ManifestNotFinalized from open_read_write, got {open_rw_err:?}"
+            );
+            assert_eq!(open_rw_err.stable_code_str(), "LBR-IO-001");
+            println!("RB03B_PENDING_CHILD_OK");
+            return;
+        }
+
+        let set_readonly_tombstone_mode = |path: &Path, role: DatabaseRole| {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = expected_config_tombstone_mode(role).expect("tombstone mode");
+                fs::set_permissions(path, fs::Permissions::from_mode(mode))
+                    .expect("set readonly tombstone mode");
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = role;
+                let mut perms = fs::metadata(path).expect("stat tombstone").permissions();
+                perms.set_readonly(true);
+                fs::set_permissions(path, perms).expect("set readonly attribute");
+            }
+        };
+
+        let clear_readonly_mode = |path: &Path| {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+            }
+            #[cfg(not(unix))]
+            {
+                if let Ok(meta) = fs::metadata(path) {
+                    let mut perms = meta.permissions();
+                    perms.set_readonly(false);
+                    let _ = fs::set_permissions(path, perms);
+                }
+            }
+        };
+
+        let exe = env::current_exe().expect("locate current test executable");
+        let root = tempdir().expect("create RB-03b temp root");
+
+        for (role_label, role) in [
+            ("global", DatabaseRole::GlobalConfig),
+            ("system", DatabaseRole::SystemConfig),
+        ] {
+            // -------------------------------------------------------------
+            // AC1: `config-format.json` with `finalized == false` (both
+            // `init_phase="migration"` and `init_phase="fresh_create"`) MUST
+            // fail closed with `LBR-IO-001` ignoring `LIBRA_STORAGE_BACKEND`.
+            // -------------------------------------------------------------
+            for (phase_label, manifest) in [
+                (
+                    "migration",
+                    ConfigFormatManifest {
+                        schema_version: CONFIG_FORMAT_MANIFEST_VERSION,
+                        backend: StorageBackendKind::Redb,
+                        finalized: false,
+                        init_phase: Some(ConfigInitPhase::Migration),
+                        generation: 1,
+                        legacy_sqlite_tombstone: false,
+                        targets_staged_for_rename: false,
+                        source_db_state: Some(Phase2DbState::Pending),
+                        backup_sha256: Some("abc123".to_string()),
+                        source_logical_sha256: Some("def456".to_string()),
+                    },
+                ),
+                (
+                    "fresh_create",
+                    ConfigFormatManifest::new_redb_fresh_create(1, false, role)
+                        .expect("build fresh_create manifest"),
+                ),
+            ] {
+                let pending_dir = root
+                    .path()
+                    .join(format!("{role_label}-pending-{phase_label}"));
+                fs::create_dir_all(&pending_dir).expect("create pending scope dir");
+                publish_config_format_manifest(&pending_dir, role, &manifest)
+                    .expect("publish unfinalized config-format.json");
+                let read_back = read_config_format_manifest(&pending_dir, role)
+                    .expect("read back unfinalized manifest")
+                    .expect("manifest must exist");
+                assert_eq!(read_back, manifest);
+
+                for env_override in ["sqlite", "redb"] {
+                    let output = Command::new(&exe)
+                        .arg("--exact")
+                        .arg("storage::config_store::tests::config_scope_manifest_pending_dual_file_and_tombstone_acceptance")
+                        .arg("--nocapture")
+                        .env("LIBRA_RB03B_PENDING_DIR", &pending_dir)
+                        .env("LIBRA_RB03B_ROLE", role_label)
+                        .env(LIBRA_STORAGE_BACKEND_ENV, env_override)
+                        .env("LIBRA_TEST", "1")
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .output()
+                        .expect("spawn RB-03b pending child");
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    assert!(
+                        output.status.success()
+                            && stdout.contains("RB03B_PENDING_CHILD_OK")
+                            && stdout.contains("1 passed; 0 failed"),
+                        "RB-03b pending child ({role_label}/{phase_label}/env={env_override}) failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+                    );
+                }
+            }
+
+            // -------------------------------------------------------------
+            // AC2: Missing `config-format.json` with BOTH `config.db` and
+            // `config.redb` present MUST fail closed with `LBR-IO-001`.
+            // -------------------------------------------------------------
+            let split_dir = root.path().join(format!("{role_label}-split-no-manifest"));
+            fs::create_dir_all(&split_dir).expect("create split scope dir");
+            let split_sqlite = config_sqlite_path_in_scope_dir(&split_dir);
+            let split_redb = config_redb_path_in_scope_dir(&split_dir);
+            SqliteConfigStore::create(&split_sqlite, role)
+                .await
+                .expect("create split config.db");
+            RedbConfigStore::create(&split_redb, role).expect("create split config.redb");
+
+            let split_inspect_err = inspect_config_scope_authority(&split_dir, role)
+                .expect_err("dual files without config-format.json must fail closed");
+            assert_eq!(split_inspect_err.stable_code_str(), "LBR-IO-001");
+            let split_open_err = open_config_scope_read_only(&split_dir, role)
+                .await
+                .expect_err("open_config_scope_read_only must reject dual files without manifest");
+            assert_eq!(split_open_err.stable_code_str(), "LBR-IO-001");
+            let split_rw_err = open_config_scope_read_write(&split_dir, role)
+                .await
+                .expect_err("open_config_scope_read_write must reject dual files without manifest");
+            assert_eq!(split_rw_err.stable_code_str(), "LBR-IO-001");
+
+            // Also verify lone unmanifested sentinel tombstone fails closed with LBR-IO-001.
+            let orphan_tombstone_dir = root.path().join(format!("{role_label}-orphan-tombstone"));
+            fs::create_dir_all(&orphan_tombstone_dir).expect("create orphan tombstone dir");
+            fs::write(
+                config_sqlite_path_in_scope_dir(&orphan_tombstone_dir),
+                CONFIG_SQLITE_TOMBSTONE_SENTINEL,
+            )
+            .expect("write orphan sentinel tombstone");
+            assert!(
+                is_config_sqlite_tombstone_sentinel(&config_sqlite_path_in_scope_dir(
+                    &orphan_tombstone_dir
+                ))
+                .expect("detect tombstone sentinel")
+            );
+            let orphan_tombstone_err = open_config_scope_read_only(&orphan_tombstone_dir, role)
+                .await
+                .expect_err("orphan tombstone without manifest must fail closed");
+            assert_eq!(orphan_tombstone_err.stable_code_str(), "LBR-IO-001");
+
+            // -------------------------------------------------------------
+            // AC3: `config-format.json(backend="redb", finalized=true,
+            // legacy_sqlite_tombstone=true)` MUST require and verify a valid
+            // read-only `config.db` tombstone (31-byte sentinel OR committed
+            // `__libra_migrated_fence__` SQLite fence) and reject missing,
+            // writable, or unfenced SQLite `config.db` files with `LBR-IO-001`.
+            // -------------------------------------------------------------
+            let tombstone_dir = root
+                .path()
+                .join(format!("{role_label}-finalized-tombstone"));
+            fs::create_dir_all(&tombstone_dir).expect("create finalized tombstone scope dir");
+            let tomb_sqlite = config_sqlite_path_in_scope_dir(&tombstone_dir);
+            let tomb_redb = config_redb_path_in_scope_dir(&tombstone_dir);
+
+            let redb_store = RedbConfigStore::create(&tomb_redb, role)
+                .expect("create authoritative config.redb");
+            redb_store
+                .set("authority.source", "from-redb-with-tombstone", false)
+                .await
+                .expect("seed authoritative config.redb");
+            drop(redb_store);
+
+            let finalized_with_tombstone = ConfigFormatManifest::new_redb_finalized(1, true, role)
+                .expect("build finalized redb tombstone manifest");
+            publish_config_format_manifest(&tombstone_dir, role, &finalized_with_tombstone)
+                .expect("publish finalized redb tombstone manifest");
+
+            // AC3 negative 1: missing `config.db` while `legacy_sqlite_tombstone=true` MUST fail closed.
+            let missing_tomb_err = open_config_scope_read_only(&tombstone_dir, role)
+                .await
+                .expect_err("missing config.db when legacy_sqlite_tombstone=true must fail closed");
+            assert_eq!(missing_tomb_err.stable_code_str(), "LBR-IO-001");
+
+            // AC3 negative 2: writable sentinel `config.db` MUST fail closed until read-only.
+            fs::write(&tomb_sqlite, CONFIG_SQLITE_TOMBSTONE_SENTINEL)
+                .expect("write writable sentinel config.db");
+            let writable_tomb_err = open_config_scope_read_only(&tombstone_dir, role)
+                .await
+                .expect_err("writable sentinel config.db must fail closed");
+            assert_eq!(writable_tomb_err.stable_code_str(), "LBR-IO-001");
+
+            // AC3 positive 1: read-only 31-byte sentinel `config.db` (`0400`/`0444`) is accepted
+            // for both read-only and read-write scoped opens.
+            set_readonly_tombstone_mode(&tomb_sqlite, role);
+            let authority = inspect_config_scope_authority(&tombstone_dir, role)
+                .expect("finalized redb manifest with verified sentinel tombstone must succeed");
+            assert_eq!(authority.backend(), Some(StorageBackendKind::Redb));
+            assert!(matches!(
+                authority,
+                ConfigScopeAuthority::Manifest { ref db_path, .. } if db_path == &tomb_redb
+            ));
+
+            let opened = open_config_scope_read_only(&tombstone_dir, role)
+                .await
+                .expect("open_config_scope_read_only must open authoritative config.redb");
+            assert_eq!(opened.backend(), StorageBackendKind::Redb);
+            assert_eq!(opened.role(), role);
+            assert_eq!(
+                opened
+                    .get("authority.source")
+                    .await
+                    .expect("read key from authoritative config.redb"),
+                Some(ConfigEntry {
+                    key: "authority.source".to_string(),
+                    value: "from-redb-with-tombstone".to_string(),
+                    encrypted: false,
+                })
+            );
+            drop(opened);
+
+            let opened_rw = open_config_scope_read_write(&tombstone_dir, role)
+                .await
+                .expect("open_config_scope_read_write must open authoritative config.redb");
+            opened_rw
+                .set("authority.rw", "ok", false)
+                .await
+                .expect("write through guarded read-write redb scope");
+            drop(opened_rw);
+
+            // AC3 negative 3: ordinary unfenced SQLite DB (even marked read-only and even storing
+            // the fence SQL string inside `config_kv`) MUST fail closed with `LBR-IO-001`.
+            let unfenced_dir = root
+                .path()
+                .join(format!("{role_label}-unfenced-sqlite-tombstone"));
+            fs::create_dir_all(&unfenced_dir).expect("create unfenced sqlite scope dir");
+            let unfenced_sqlite = config_sqlite_path_in_scope_dir(&unfenced_dir);
+            let unfenced_redb = config_redb_path_in_scope_dir(&unfenced_dir);
+            RedbConfigStore::create(&unfenced_redb, role).expect("create redb in unfenced scope");
+            {
+                let decoy_sqlite = SqliteConfigStore::create(&unfenced_sqlite, role)
+                    .await
+                    .expect("create unfenced decoy sqlite config.db");
+                decoy_sqlite
+                    .set(
+                        SQLITE_MIGRATED_FENCE_TABLE,
+                        SQLITE_MIGRATED_FENCE_SQL,
+                        false,
+                    )
+                    .await
+                    .expect("store decoy fence string inside config_kv");
+            }
+            // Switch decoy SQLite to DELETE journal mode (removing any WAL/SHM) on a single-connection
+            // pool so only the absence of a real `sqlite_master` fence distinguishes it.
+            {
+                use sea_orm::{ConnectOptions, ConnectionTrait, Database, Statement};
+                let mut opts = ConnectOptions::new("sqlite://rb03b-decoy-single");
+                opts.max_connections(1).sqlx_logging(false);
+                let db_file = unfenced_sqlite.clone();
+                opts.map_sqlx_sqlite_opts(move |o| o.filename(&db_file).create_if_missing(false));
+                let conn = Database::connect(opts)
+                    .await
+                    .expect("open single-conn decoy sqlite");
+                conn.execute_raw(Statement::from_string(
+                    sea_orm::DatabaseBackend::Sqlite,
+                    "PRAGMA journal_mode = DELETE;",
+                ))
+                .await
+                .expect("switch decoy sqlite to DELETE journal mode");
+                conn.close().await.expect("close decoy sqlite");
+            }
+            set_readonly_tombstone_mode(&unfenced_sqlite, role);
+            publish_config_format_manifest(&unfenced_dir, role, &finalized_with_tombstone)
+                .expect("publish manifest in unfenced scope");
+            assert!(
+                !is_config_sqlite_fenced_tombstone(&unfenced_sqlite)
+                    .expect("decoy sqlite fence check must run cleanly"),
+                "unfenced sqlite storing fence text in config_kv must NOT pass sqlite_master check"
+            );
+            let unfenced_err = open_config_scope_read_only(&unfenced_dir, role)
+                .await
+                .expect_err("unfenced sqlite config.db must fail closed even when read-only");
+            assert_eq!(unfenced_err.stable_code_str(), "LBR-IO-001");
+            clear_readonly_mode(&unfenced_sqlite);
+
+            // AC3 positive 2: real SQLite DB fenced via `ADR-RB-07` #1 `__libra_migrated_fence__`
+            // rollback-journal fence and marked read-only (`0400`/`0444`) MUST be accepted!
+            {
+                use sea_orm::{ConnectOptions, ConnectionTrait, Database, Statement};
+                let mut opts = ConnectOptions::new("sqlite://rb03b-fence-single");
+                opts.max_connections(1).sqlx_logging(false);
+                let db_file = unfenced_sqlite.clone();
+                opts.map_sqlx_sqlite_opts(move |o| o.filename(&db_file).create_if_missing(false));
+                let conn = Database::connect(opts)
+                    .await
+                    .expect("open single-conn sqlite for real fence");
+                for stmt in [
+                    "PRAGMA journal_mode = DELETE;".to_string(),
+                    "PRAGMA synchronous = FULL;".to_string(),
+                    "BEGIN EXCLUSIVE;".to_string(),
+                    format!("CREATE TABLE {SQLITE_MIGRATED_FENCE_TABLE} (x INTEGER);"),
+                    "PRAGMA writable_schema = ON;".to_string(),
+                    format!(
+                        "UPDATE sqlite_master SET sql = '{SQLITE_MIGRATED_FENCE_SQL}' \
+                         WHERE name = '{SQLITE_MIGRATED_FENCE_TABLE}';"
+                    ),
+                    "PRAGMA writable_schema = OFF;".to_string(),
+                    "COMMIT;".to_string(),
+                ] {
+                    conn.execute_raw(Statement::from_string(
+                        sea_orm::DatabaseBackend::Sqlite,
+                        stmt,
+                    ))
+                    .await
+                    .expect("execute sqlite fence statement");
+                }
+                conn.close().await.expect("close fenced sqlite");
+            }
+            set_readonly_tombstone_mode(&unfenced_sqlite, role);
+            assert!(
+                is_config_sqlite_fenced_tombstone(&unfenced_sqlite)
+                    .expect("detect real __libra_migrated_fence__"),
+                "real __libra_migrated_fence__ SQLite DB must pass sqlite_master fence verification"
+            );
+            let fenced_opened = open_config_scope_read_only(&unfenced_dir, role)
+                .await
+                .expect("real fenced migrated SQLite tombstone must be accepted");
+            assert_eq!(fenced_opened.backend(), StorageBackendKind::Redb);
+            drop(fenced_opened);
+            clear_readonly_mode(&unfenced_sqlite);
+
+            // AC3 negative 4: flipping `legacy_sqlite_tombstone = false` while `config.db` still
+            // exists MUST immediately fail closed with `LBR-IO-001`.
+            let finalized_no_tombstone = ConfigFormatManifest::new_redb_finalized(1, false, role)
+                .expect("build finalized redb non-tombstone manifest");
+            publish_config_format_manifest(&tombstone_dir, role, &finalized_no_tombstone)
+                .expect("publish finalized redb non-tombstone manifest");
+            let unexpected_coexist_err = open_config_scope_read_only(&tombstone_dir, role)
+                .await
+                .expect_err("coexisting config.db without legacy_sqlite_tombstone=true must fail");
+            assert_eq!(unexpected_coexist_err.stable_code_str(), "LBR-IO-001");
+            clear_readonly_mode(&tomb_sqlite);
+
+            // -------------------------------------------------------------
+            // AC4: Empty or non-existent config scope dir opened read-only
+            // MUST return `NotFound` and create ZERO directories, lock files,
+            // manifests, or databases (`ADR-CF-06`).
+            // -------------------------------------------------------------
+            let nonexistent_dir = root.path().join(format!("{role_label}-nonexistent-scope"));
+            let missing_err = open_config_scope_read_only(&nonexistent_dir, role)
+                .await
+                .expect_err("nonexistent scope dir read-only open must return NotFound");
+            assert!(
+                matches!(missing_err, StorageBackendError::NotFound { .. }),
+                "expected NotFound for nonexistent scope dir, got {missing_err:?}"
+            );
+            assert!(
+                !nonexistent_dir.exists(),
+                "ADR-CF-06 violation: read-only open created missing scope directory"
+            );
+            assert!(
+                !config_migration_lock_path(&nonexistent_dir).exists(),
+                "ADR-CF-06 violation: read-only open created config-migration.lock"
+            );
+
+            let empty_dir = root.path().join(format!("{role_label}-empty-scope"));
+            fs::create_dir_all(&empty_dir).expect("create empty scope dir");
+            let empty_err = open_config_scope_read_only(&empty_dir, role)
+                .await
+                .expect_err("empty scope dir read-only open must return NotFound");
+            assert!(
+                matches!(empty_err, StorageBackendError::NotFound { .. }),
+                "expected NotFound for empty scope dir, got {empty_err:?}"
+            );
+            let remaining_entries: Vec<_> = fs::read_dir(&empty_dir)
+                .expect("read empty scope dir")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("collect empty scope dir entries");
+            assert!(
+                remaining_entries.is_empty(),
+                "ADR-CF-06 violation: read-only open created files in empty scope dir: {remaining_entries:?}"
+            );
+        }
+
+        // Extra defense-in-depth checks: future `schema_version` maps to `LBR-CFG-002`
+        // (`ConfigSchemaFuture`), invalid JSON never leaks secret values, and
+        // `DatabaseRole::Repository` is rejected by scope manifest APIs.
+        let future_dir = root.path().join("future-manifest-schema");
+        fs::create_dir_all(&future_dir).expect("create future manifest dir");
+        fs::write(
+            config_format_manifest_path(&future_dir),
+            r#"{"schema_version":99,"backend":"redb","finalized":true,"generation":1}"#,
+        )
+        .expect("write future schema manifest");
+        let future_err = inspect_config_scope_authority(&future_dir, DatabaseRole::GlobalConfig)
+            .expect_err("future schema_version must fail closed");
+        assert!(matches!(
+            future_err,
+            StorageBackendError::SchemaTooNew {
+                role: DatabaseRole::GlobalConfig,
+                found: 99,
+                max_supported: CONFIG_FORMAT_MANIFEST_VERSION,
+            }
+        ));
+        assert_eq!(future_err.stable_code_str(), "LBR-CONFIG-001");
+
+        let corrupt_dir = root.path().join("corrupt-manifest");
+        fs::create_dir_all(&corrupt_dir).expect("create corrupt manifest dir");
+        let secret_marker = "sk-secret-must-not-leak-rb03b";
+        fs::write(
+            config_format_manifest_path(&corrupt_dir),
+            format!(r#"{{"schema_version":1,"backend":"{secret_marker}","finalized":true}}"#),
+        )
+        .expect("write corrupt manifest with secret value");
+        let corrupt_err = inspect_config_scope_authority(&corrupt_dir, DatabaseRole::GlobalConfig)
+            .expect_err("corrupt backend value must fail closed");
+        assert_eq!(corrupt_err.stable_code_str(), "LBR-IO-001");
+        assert!(
+            !corrupt_err.to_string().contains(secret_marker),
+            "error output must not leak raw JSON field values: {corrupt_err}"
+        );
+
+        let repo_role_err = inspect_config_scope_authority(&future_dir, DatabaseRole::Repository)
+            .expect_err("Repository role must be rejected by config scope manifest inspector");
+        assert_eq!(repo_role_err.stable_code_str(), "LBR-IO-001");
     }
 }

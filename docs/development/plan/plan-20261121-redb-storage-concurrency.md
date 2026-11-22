@@ -1302,7 +1302,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `done` / `remote-pending`（`v0.30.306`；Codex R1 `PASS`；全部 AC/VER 与 6 文件白名单守卫绿灯）
+**Lifecycle / Acceptance:** `done` / `remote-verified`（`890d410` / `v0.30.306`；Codex R1 `PASS`；全部 AC/VER 与 6 文件白名单守卫绿灯）
 
 **Description:** 100% 在独占目录 `src/storage/**` 内落实 `RedbConfigStore` 的 `GC-13` 角色隔离（仓库配置写入严禁触碰隔离 `GlobalConfig`/`SystemConfig` 夹具）以及 Unix 权限位约定（空 `GlobalConfig` 创建 `0600` `config.redb`，空 `SystemConfig` 创建 `0644` `config.redb`）。
 
@@ -1358,7 +1358,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `remote-pending`（`v0.30.307`；Codex R2 `PASS`；覆盖 pending 清单、双文件分裂、哨兵与真 SQLite `__libra_migrated_fence__` 墓碑校验及空目录只读零建文件）
 
 **Description:** 100% 在独占目录 `src/storage/**` 内落实 `ADR-RB-02` #2 的跨运行时作用域清单前置校验：覆盖 `finalized == false` 中间态拒访、无清单双文件共存分裂拒访、带 `legacy_sqlite_tombstone = true` 的已定稿 `Redb` 清单对共存 `config.db` 墓碑的合法识别，以及空配置目录只读零建文件（`ADR-CF-06`）。
 
@@ -1375,15 +1375,15 @@
 | 配置运行时必须通过清单前置校验拦截中间态与双文件分裂、识别保留型墓碑并维持空目录只读零建文件 | `src/internal/config.rs:47-120`；`ADR-RB-02` #2 |
 
 **Acceptance criteria:**
-- [ ] 当 `<scope_dir>/config-format.json` 存在且 `finalized == false`（非 `RB-03e` 专属恢复路径）时，运行时打开（忽略 `LIBRA_STORAGE_BACKEND`）立即 fail-closed 报 `LBR-IO-001`。
-- [ ] 当 `config-format.json` 缺失但 `config.db` 与 `config.redb` 共存时，运行路径 fail-closed 报 `LBR-IO-001`。
-- [ ] 当 `config-format.json` 为 `backend="redb", finalized=true, legacy_sqlite_tombstone=true` 时，运行时将同目录共存的 `config.db` 墓碑视为合法路径围栏而不误报分裂。
-- [ ] 空配置目录只读打开直接返回 `NotFound` 且不在磁盘创建任何目录或 `config-migration.lock` 文件（保留 `ADR-CF-06`）。
+- [x] 当 `<scope_dir>/config-format.json` 存在且 `finalized == false`（非 `RB-03e` 专属恢复路径）时，运行时打开（忽略 `LIBRA_STORAGE_BACKEND`）立即 fail-closed 报 `LBR-IO-001`。
+- [x] 当 `config-format.json` 缺失但 `config.db` 与 `config.redb` 共存时，运行路径 fail-closed 报 `LBR-IO-001`。
+- [x] 当 `config-format.json` 为 `backend="redb", finalized=true, legacy_sqlite_tombstone=true` 时，运行时将同目录共存的 `config.db` 墓碑视为合法路径围栏而不误报分裂。
+- [x] 空配置目录只读打开直接返回 `NotFound` 且不在磁盘创建任何目录或 `config-migration.lock` 文件（保留 `ADR-CF-06`）。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::config_store::tests::config_scope_manifest_pending_dual_file_and_tombstone_acceptance)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::config_store::tests::config_scope_manifest_pending_dual_file_and_tombstone_acceptance)'`（new，覆盖 AC1–AC4）
-- [ ] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 6 文件实现白名单。
+- [x] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::config_store::tests::config_scope_manifest_pending_dual_file_and_tombstone_acceptance)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::config_store::tests::config_scope_manifest_pending_dual_file_and_tombstone_acceptance)'`（new，覆盖 AC1–AC4）
+- [x] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 6 文件实现白名单。
 
 **Full-suite trigger:** `none`
 
