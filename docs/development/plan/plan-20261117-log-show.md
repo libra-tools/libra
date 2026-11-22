@@ -1360,7 +1360,7 @@ PY
 
 ### Task LS-32: `log -L` 与 pathspec/`--follow` 互斥及参数诊断（#961；自 LS-17 拆出）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-21：新增 `validate_line_range_args`，在 `run_log` 解析输入后立即校验，先于任何历史遍历：① `-L` + 位置 pathspec → `LBR-CLI-002` + `-L<range>:<file> cannot be used with pathspec`；② `-L` + `--follow` → `LBR-CLI-002` + `--follow requires exactly one pathspec`；③ 非法 `-L` 语法（如 `-L foo`）→ `LBR-CLI-002`（沿用 `parse_line_range`）；④ 被跟踪文件不存在 → `LBR-CLI-003` + `There is no path <file> in the commit`。回归：`command::log_test::line_range_argument_diagnostics`（AC1–AC4），`log_test` 全绿；严格 Clippy exit 0；EN/zh/开发文档同卡同步。**Codex/Claude 审计按用户 2026-11-21 指令取消**。）
 
 **Description:** 增加 `-L` 的参数校验：与位置 pathspec 同用、与 `--follow` 同用（Git 中二者因 `--follow requires exactly one pathspec` 与 `-L<range>:<file> cannot be used with pathspec` 不可同时满足）、非法 `-L` 语法与不存在的文件分别返回稳定错误。
 

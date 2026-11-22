@@ -8608,3 +8608,59 @@ fn find_object_filter() {
     let stderr = String::from_utf8_lossy(&bad.stderr);
     assert!(stderr.contains("LBR-CLI-003"), "AC4 code: {stderr}");
 }
+
+#[test]
+fn line_range_argument_diagnostics() {
+    use super::{assert_cli_success, run_libra_command};
+
+    // `-L` refuses the combinations Git refuses, before walking history.
+    let work = tempfile::tempdir().expect("work dir");
+    let repo = work.path().join("r");
+    std::fs::create_dir_all(&repo).expect("mkdir repo");
+    assert_cli_success(&run_libra_command(&["init"], &repo), "init");
+    run_libra_command(&["config", "set", "user.name", "t"], &repo);
+    run_libra_command(&["config", "set", "user.email", "t@t"], &repo);
+    std::fs::write(repo.join("f.txt"), "one\ntwo\n").expect("write f");
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], &repo), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c1", "--no-verify"], &repo),
+        "commit",
+    );
+
+    let run = |args: &[&str]| {
+        let result = run_libra_command(args, &repo);
+        (
+            result.status.code(),
+            String::from_utf8_lossy(&result.stderr).to_string(),
+        )
+    };
+
+    // AC1: pathspec plus `-L` is a usage error.
+    let (code, stderr) = run(&["log", "-L", "1,1:f.txt", "--", "f.txt"]);
+    assert_eq!(code, Some(129), "AC1 exit: {stderr}");
+    assert!(stderr.contains("LBR-CLI-002"), "AC1 code: {stderr}");
+    assert!(
+        stderr.contains("-L<range>:<file> cannot be used with pathspec"),
+        "AC1 wording: {stderr}"
+    );
+    // AC2: `--follow` plus `-L` is a usage error.
+    let (code, stderr) = run(&["log", "-L", "1,1:f.txt", "--follow"]);
+    assert_eq!(code, Some(129), "AC2 exit: {stderr}");
+    assert!(stderr.contains("LBR-CLI-002"), "AC2 code: {stderr}");
+    assert!(
+        stderr.contains("--follow requires exactly one pathspec"),
+        "AC2 wording: {stderr}"
+    );
+    // AC3: malformed range syntax is a usage error.
+    let (code, stderr) = run(&["log", "-L", "foo"]);
+    assert_eq!(code, Some(129), "AC3 exit: {stderr}");
+    assert!(stderr.contains("LBR-CLI-002"), "AC3 code: {stderr}");
+    // AC4: a tracked file that does not exist is a target error.
+    let (code, stderr) = run(&["log", "-L", "1,1:nofile"]);
+    assert_eq!(code, Some(129), "AC4 exit: {stderr}");
+    assert!(stderr.contains("LBR-CLI-003"), "AC4 code: {stderr}");
+    assert!(
+        stderr.contains("There is no path nofile in the commit"),
+        "AC4 wording: {stderr}"
+    );
+}

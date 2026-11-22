@@ -2530,6 +2530,37 @@ async fn apply_follow_and_line_filters(
 }
 
 /// Best-effort check whether a commit affected any of the requested line ranges.
+/// Reject the `-L` combinations Git refuses (pathspec / `--follow`) and a
+/// missing tracked file, before any history walk starts.
+fn validate_line_range_args(args: &LogArgs, paths: &[String]) -> CliResult<()> {
+    if args.line_range.is_empty() {
+        return Ok(());
+    }
+    if !paths.is_empty() {
+        return Err(
+            CliError::command_usage("-L<range>:<file> cannot be used with pathspec")
+                .with_stable_code(StableErrorCode::CliInvalidArguments),
+        );
+    }
+    if args.follow.is_some() {
+        return Err(
+            CliError::command_usage("--follow requires exactly one pathspec")
+                .with_stable_code(StableErrorCode::CliInvalidArguments),
+        );
+    }
+    let ranges = resolve_line_ranges(&args.line_range)?;
+    for range in &ranges {
+        if !range.file.exists() {
+            return Err(CliError::command_usage(format!(
+                "There is no path {} in the commit",
+                range.file.display()
+            ))
+            .with_stable_code(StableErrorCode::CliInvalidTarget));
+        }
+    }
+    Ok(())
+}
+
 /// Resolve every `--find-object` value to an object id.
 async fn resolve_find_objects(values: &[String]) -> CliResult<HashSet<ObjectHash>> {
     let mut targets = HashSet::new();
@@ -2999,6 +3030,7 @@ async fn execute_safe_with_diff_formats(
     let since = args.since.as_deref().map(parse_date_arg).transpose()?;
     let until = args.until.as_deref().map(parse_date_arg).transpose()?;
     let (ranges, paths) = resolve_log_inputs(&args).await?;
+    validate_line_range_args(&args, &paths)?;
     let path_filters: Vec<PathBuf> = paths.iter().map(util::to_workdir_path).collect();
     let configured_follow = configured_follow_path(&path_filters, log_config.follow);
     let effective_follow =

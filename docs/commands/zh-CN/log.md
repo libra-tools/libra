@@ -529,7 +529,7 @@ libra log --children
 
 `-L <start>,<end>:<file>` 追踪行范围的历史：只输出在该范围内发生改动的提交，且每个提交只打印与范围相交的 hunk（头部按 Git 收窄，含尾随定义上下文与创建 hunk 的 `-0,0` 编号）；范围会随历史回推到父提交编号，因此在范围上方插入过行的历史中，更早的提交仍能正确命中。
 
-`-L :<funcname>:<file>` 由文件定义推导范围：从定义行开始，到下一个定义之前结束（支持 Rust `fn`、`def`、`function` 与列首 C 风格签名）。函数名不存在时以 `LBR-CLI-003` 失败，诊断与 Git 同文：`-L parameter '<name>' starting at line 1: no match`。
+`-L :<funcname>:<file>` 由文件定义推导范围：从定义行开始，到下一个定义之前结束（支持 Rust `fn`、`def`、`function` 与列首 C 风格签名）。函数名不存在时以 `LBR-CLI-003` 失败，诊断与 Git 同文：`-L parameter '<name>' starting at line 1: no match`；被跟踪文件不存在时同样以 `LBR-CLI-003` 失败，诊断为 `There is no path <file> in the commit`。`-L` 与位置 pathspec 同用会以 `-L<range>:<file> cannot be used with pathspec` 拒绝，与 `--follow` 同用会以 `--follow requires exactly one pathspec` 拒绝（均为 `LBR-CLI-002`）。
 
 ```bash
 libra log -L 1,10:src/main.rs

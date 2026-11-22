@@ -739,7 +739,11 @@ range still match.
 `-L :<funcname>:<file>` derives the range from the file's definitions: it starts at
 the definition line and stops before the next definition (Rust `fn`, `def`,
 `function`, and column-0 C-like signatures). An unknown name fails with
-`LBR-CLI-003` and Git's wording `-L parameter '<name>' starting at line 1: no match`.
+`LBR-CLI-003` and Git's wording `-L parameter '<name>' starting at line 1: no match`;
+a tracked file that does not exist fails with `LBR-CLI-003` and
+`There is no path <file> in the commit`. Combining `-L` with a positional
+pathspec fails with `-L<range>:<file> cannot be used with pathspec`, and with
+`--follow` with `--follow requires exactly one pathspec` (both `LBR-CLI-002`).
 
 ```bash
 libra log -L 1,10:src/main.rs
