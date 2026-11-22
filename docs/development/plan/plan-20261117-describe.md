@@ -1268,7 +1268,7 @@
 
 ### Task DESC-10h: `remotes/` 命名空间 describe 后缀解析非提交对象（tree、blob、附注 tag）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空` | **Priority / Selection:** P1 | **Issue:** [#798](https://github.com/libra-tools/libra/issues/798)、[#799](https://github.com/libra-tools/libra/issues/799)
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `complete`（2026-11-21：`remotes/` 与 `refs/remotes/` 的后缀解析复用 `resolve_describe_hash_typed`，非提交对象（blob/tree）同样放行。用例 `describe_suffix_remotes_namespace_non_commit_objects` 断言四个 `remotes/` 形式与两个 `refs/remotes/` 形式均返回对应对象。`rev_parse_test` **63/63**；版本面 0.30.273 → 0.30.274。本卡为 `REL-DESC-09` 子卡 13/16，只本地签名提交。按用户 2026-11-20 指令在 `main` 直接提交推送。） | **Priority / Selection:** P1 | **Issue:** [#798](https://github.com/libra-tools/libra/issues/798)、[#799](https://github.com/libra-tools/libra/issues/799)
 
 **Description:** 自 `DESC-09` 拆出；家族 `REL-DESC-09` 子卡（13/16）。为 `DESC-10b` 已接入的 `remotes/` describe 后缀放开 tree、blob 与附注 tag 对象（均返回对象自身，tag 不剥皮），至此 `remotes/` 与 Git 的对象类型范围一致；两 blob 共享前缀仍按 `ADR-DESC-03` ② 以 `LBR-CLI-003` 失败。
 
