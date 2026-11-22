@@ -4779,6 +4779,12 @@ pub fn format_stat_output(stats: &[FileStat]) -> String {
     let total_insertions: usize = stats.iter().map(|s| s.insertions).sum();
     let total_deletions: usize = stats.iter().map(|s| s.deletions).sum();
     let total_files = stats.len();
+    // Git pads the change column to the widest count in this block.
+    let width = stats
+        .iter()
+        .map(|stat| (stat.insertions + stat.deletions).to_string().len())
+        .max()
+        .unwrap_or(1);
 
     for stat in stats {
         let changes = stat.insertions + stat.deletions;
@@ -4794,25 +4800,39 @@ pub fn format_stat_output(stats: &[FileStat]) -> String {
         let minus_count = bar_width.saturating_sub(plus_count);
 
         output.push_str(&format!(
-            " {} | {:>3} {}{}\n",
+            " {} | {:>width$} {}{}\n",
             stat.path,
             changes,
             "+".repeat(plus_count).green(),
-            "-".repeat(minus_count).red()
+            "-".repeat(minus_count).red(),
+            width = width
         ));
     }
 
-    output.push_str(&format!(
-        " {} file{} changed, {} insertion{}({}), {} deletion{}({})\n",
+    // Git omits the insertion/deletion clauses that are zero.
+    let mut summary = format!(
+        " {} file{} changed",
         total_files,
-        if total_files == 1 { "" } else { "s" },
-        total_insertions,
-        if total_insertions == 1 { "" } else { "s" },
-        "+".green(),
-        total_deletions,
-        if total_deletions == 1 { "" } else { "s" },
-        "-".red()
-    ));
+        if total_files == 1 { "" } else { "s" }
+    );
+    if total_insertions > 0 {
+        summary.push_str(&format!(
+            ", {} insertion{}({})",
+            total_insertions,
+            if total_insertions == 1 { "" } else { "s" },
+            "+".green()
+        ));
+    }
+    if total_deletions > 0 {
+        summary.push_str(&format!(
+            ", {} deletion{}({})",
+            total_deletions,
+            if total_deletions == 1 { "" } else { "s" },
+            "-".red()
+        ));
+    }
+    output.push_str(&summary);
+    output.push('\n');
 
     output
 }

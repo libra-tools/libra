@@ -138,3 +138,5 @@ flowchart TD
 - 2026-11-21（LS-32 / #961）：新增 `validate_line_range_args`——`-L` 与位置 pathspec 同用 → `LBR-CLI-002` + `-L<range>:<file> cannot be used with pathspec`；与 `--follow` 同用 → `LBR-CLI-002` + `--follow requires exactly one pathspec`；被跟踪文件不存在 → `LBR-CLI-003` + `There is no path <file> in the commit`；非法语法仍为 `LBR-CLI-002`。回归：`command::log_test::line_range_argument_diagnostics`（AC1–AC4）。
 
 - 2026-11-21（LS-08 / #960）：`log` 对 replace 引用显示 `replaced` 装饰——`load_history_commit` 在内容被替换后恢复**原始 oid**（`commit.id = commit_id`），`has_replace_ref` 读取 `GIT_REPLACE_REF_BASE`（默认 `refs/replace/`）判断标记，调色板新增 `color.decorate.replaced`（默认 `1;34`），标记追加在其它装饰之后。回归：`command::log_test::decorate_replaced_and_env_base`（AC1–AC2）。
+
+- 2026-11-21（LS-14 收尾 / #972）：`format_stat_output` 与 Git 对齐——变更列宽取本块最宽计数（原固定 `{:>3}`），汇总行省略为零的 insertion/deletion 子句，使 `--format= --stat` 与 `git log --format= --stat` 逐字一致（解除该卡 AC5 的阻塞）。回归：`empty_format_or_pretty_omits_header` 的 AC5 改为逐字断言；`log_test` 276/276、`show_test` 42/42。

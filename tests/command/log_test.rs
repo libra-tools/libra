@@ -7873,13 +7873,15 @@ fn empty_format_or_pretty_omits_header() {
     assert!(run(&["log", "--format=tformat:"]).is_empty(), "AC3");
     // AC4: `format:` emits only the separators between the three commits.
     assert_eq!(run(&["log", "--format=format:"]), b"\n\n".to_vec(), "AC4");
-    // AC5 (partial): `--stat` keeps its diffstat blocks but no commit header.
+    // AC5: `--stat` keeps the diffstat blocks, emits no commit header, and now
+    // matches Git's column width and zero-clause omission byte for byte.
     let stat = String::from_utf8_lossy(&run(&["log", "--format=", "--stat"])).to_string();
     assert!(!stat.contains("commit "), "AC5 no commit header: {stat}");
     assert!(!stat.contains("Author:"), "AC5 no author line: {stat}");
-    assert!(
-        stat.contains("1 file changed"),
-        "AC5 keeps diffstat: {stat}"
+    assert_eq!(
+        stat,
+        " c.txt | 1 +\n 1 file changed, 1 insertion(+)\n b.txt | 1 +\n 1 file changed, 1 insertion(+)\n a.txt | 1 +\n 1 file changed, 1 insertion(+)\n",
+        "AC5 diffstat bytes"
     );
 }
 
