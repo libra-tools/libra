@@ -673,6 +673,8 @@ PY
 ---
 
 ### Task CL-25: 发布 `REL-CL-01`（`clone --separate-git-dir` 指针布局家族发布点）（#740）
+> **2026-11-21 发布前证据齐备（等待用户批准执行发布）：** ① `cargo build --release` 通过（`release/libra --version` = `0.30.324`）；② `cargo +nightly fmt --all --check` 通过；③ `cargo clippy --all-targets --all-features -- -D warnings` 通过；④ 全量 `cargo nextest run --all --no-fail-fast --retries 2` → **12240 条全部通过（0 失败 / 51 跳过 / 无 flaky，EXIT=0）**；⑤ 站点 `log`/`show`/`clone`/`describe` 等命令页漂移检查为 0。当前仅缺用户对 `gh release create` 的授权；未执行发布、未打 tag。
+
 > **2026-11-21 冲突已解决：** `resolve_dot_libra_pointer` 现在只接受 `clone --separate-git-dir <DIR>` 写出的指针；若指针解析到的目标目录本身名为 `.libra`（即旧的「把 `.libra` 搬到别处」遗留布局），则视为非仓库。该规则让 `init_separate_libra_dir_test::legacy_separate_layout_repo_is_no_longer_detected` 转绿，同时 `clone_test` 的 4 条 `--separate-git-dir` 用例、`status_test`/`init*` 共 235 条全绿，`CL-04` 能力得以保留。
 
 
