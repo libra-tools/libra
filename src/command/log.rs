@@ -717,6 +717,120 @@ async fn initial_decoration_set_is_all() -> bool {
         .is_some_and(|entry| entry.value.trim() == "all")
 }
 
+/// Decoration colours resolved from `color.decorate.*` and `color.diff.commit`.
+#[derive(Clone, Default)]
+struct DecorateColors {
+    commit: Option<String>,
+    head: Option<String>,
+    branch: Option<String>,
+    remote: Option<String>,
+    tag: Option<String>,
+}
+
+/// Strip SGR sequences from `text` (the plain `%D` form).
+fn strip_sgr(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            for next in chars.by_ref() {
+                if next == 'm' {
+                    break;
+                }
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// Wrap `text` in its SGR sequence when colour is on and a slot is set.
+fn paint(sgr: &Option<String>, text: &str, enabled: bool) -> String {
+    match (enabled, sgr) {
+        (true, Some(sgr)) => format!("\x1b[{sgr}m{text}\x1b[m"),
+        _ => text.to_string(),
+    }
+}
+
+/// Parse a Git colour slot value into SGR parameters (`None` = unset/invalid).
+fn color_slot_to_sgr(value: &str) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    for token in value.split_whitespace() {
+        let part = match token {
+            "normal" | "default" => continue,
+            "black" => "30".to_string(),
+            "red" => "31".to_string(),
+            "green" => "32".to_string(),
+            "yellow" => "33".to_string(),
+            "blue" => "34".to_string(),
+            "magenta" => "35".to_string(),
+            "cyan" => "36".to_string(),
+            "white" => "37".to_string(),
+            "bold" => "1".to_string(),
+            "dim" => "2".to_string(),
+            "italic" => "3".to_string(),
+            "underline" => "4".to_string(),
+            "blink" => "5".to_string(),
+            "reverse" => "7".to_string(),
+            hex if hex.starts_with('#') && hex.len() == 7 => {
+                let r = u8::from_str_radix(&hex[1..3], 16).ok()?;
+                let g = u8::from_str_radix(&hex[3..5], 16).ok()?;
+                let b = u8::from_str_radix(&hex[5..7], 16).ok()?;
+                format!("38;2;{r};{g};{b}")
+            }
+            _ => return None,
+        };
+        parts.push(part);
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(";"))
+    }
+}
+
+/// Read one colour configuration slot (`None` when unset or unparseable).
+async fn resolve_color_slot(key: &str) -> Option<String> {
+    ConfigKv::get(key)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|entry| color_slot_to_sgr(&entry.value))
+}
+
+/// Resolve the decoration palette (Git's defaults, overridden by config).
+async fn resolve_decorate_colors(enabled: bool) -> DecorateColors {
+    if !enabled {
+        return DecorateColors::default();
+    }
+    let mut colors = DecorateColors {
+        commit: Some("33".to_string()),
+        head: Some("1;36".to_string()),
+        branch: Some("1;32".to_string()),
+        remote: Some("1;31".to_string()),
+        tag: Some("1;33".to_string()),
+    };
+    if let Some(value) = resolve_color_slot("color.diff.commit").await {
+        colors.commit = Some(value);
+    } else if let Some(value) = resolve_color_slot("diff.color.commit").await {
+        colors.commit = Some(value);
+    }
+    if let Some(value) = resolve_color_slot("color.decorate.HEAD").await {
+        colors.head = Some(value);
+    }
+    if let Some(value) = resolve_color_slot("color.decorate.branch").await {
+        colors.branch = Some(value);
+    }
+    if let Some(value) = resolve_color_slot("color.decorate.remoteBranch").await {
+        colors.remote = Some(value);
+    }
+    if let Some(value) = resolve_color_slot("color.decorate.tag").await {
+        colors.tag = Some(value);
+    }
+    colors
+}
+
 /// Every `log.excludeDecoration` value, in configuration order.
 async fn resolve_exclude_decoration_config() -> Vec<String> {
     ConfigKv::get_var_all_case_insensitive("log.", "excludeDecoration")
@@ -2589,6 +2703,7 @@ async fn execute_safe_with_diff_formats(
 
     let config_excludes = resolve_exclude_decoration_config().await;
     let initial_all = initial_decoration_set_is_all().await;
+    let decorate_colors = resolve_decorate_colors(color_enabled).await;
     let mut first_commit = true;
     for selected in selected_commits {
         let SelectedLogCommit {
@@ -2612,21 +2727,27 @@ async fn execute_safe_with_diff_formats(
             });
             let head_arrow = head_allowed && branch_allowed;
             if commit.id == current_head_commit && head_allowed {
-                ref_msgs.push(match (&branch_name, head_arrow) {
-                    (Some(b_name), true) => format!(
-                        "{} -> {}{}",
-                        "HEAD".cyan(),
-                        (if decorate_option == DecorateOptions::Full {
-                            "refs/heads/"
-                        } else {
-                            ""
-                        })
-                        .green(),
-                        b_name.green()
-                    ),
-                    _ => "HEAD".cyan().to_string(),
-                });
-            };
+                let head = paint(&decorate_colors.head, "HEAD", color_enabled);
+                match (&branch_name, head_arrow) {
+                    (Some(b_name), true) => {
+                        let target = format!(
+                            "{}{}",
+                            if decorate_option == DecorateOptions::Full {
+                                "refs/heads/"
+                            } else {
+                                ""
+                            },
+                            b_name
+                        );
+                        ref_msgs.push(format!(
+                            "{head}{}{}",
+                            paint(&decorate_colors.commit, " -> ", color_enabled),
+                            paint(&decorate_colors.branch, &target, color_enabled)
+                        ));
+                    }
+                    _ => ref_msgs.push(head),
+                }
+            }
 
             let mut refs = ref_commits.get(&commit.id).cloned().unwrap_or_default();
             sort_references_by_full_ref_name_descending(&mut refs);
@@ -2646,60 +2767,70 @@ async fn execute_safe_with_diff_formats(
                         {
                             None
                         } else {
+                            let full = decorate_option == DecorateOptions::Full;
                             Some(match r.kind {
                                 ReferenceKind::Tag => format!(
-                                    "tag: {}{}",
-                                    if decorate_option == DecorateOptions::Full {
-                                        "refs/tags/"
-                                    } else {
-                                        ""
-                                    },
-                                    r.name
-                                )
-                                .yellow()
-                                .to_string(),
-                                ReferenceKind::Remote => format!(
                                     "{}{}",
-                                    if decorate_option == DecorateOptions::Full {
-                                        "refs/remotes/"
-                                    } else {
-                                        ""
-                                    },
-                                    r.name
-                                )
-                                .red()
-                                .to_string(),
-                                ReferenceKind::Local => format!(
-                                    "{}{}",
-                                    if decorate_option == DecorateOptions::Full {
-                                        "refs/heads/"
-                                    } else {
-                                        ""
-                                    },
-                                    r.name
-                                )
-                                .green()
-                                .to_string(),
-                                ReferenceKind::Notes => format!(
-                                    "{}{}",
-                                    if decorate_option == DecorateOptions::Full {
-                                        "refs/notes/"
-                                    } else {
-                                        "notes/"
-                                    },
-                                    r.name
-                                )
-                                .cyan()
-                                .to_string(),
+                                    paint(&decorate_colors.tag, "tag: ", color_enabled),
+                                    paint(
+                                        &decorate_colors.tag,
+                                        &format!(
+                                            "{}{}",
+                                            if full { "refs/tags/" } else { "" },
+                                            r.name
+                                        ),
+                                        color_enabled,
+                                    )
+                                ),
+                                ReferenceKind::Remote => paint(
+                                    &decorate_colors.remote,
+                                    &format!(
+                                        "{}{}",
+                                        if full { "refs/remotes/" } else { "" },
+                                        r.name
+                                    ),
+                                    color_enabled,
+                                ),
+                                ReferenceKind::Local => paint(
+                                    &decorate_colors.branch,
+                                    &format!("{}{}", if full { "refs/heads/" } else { "" }, r.name),
+                                    color_enabled,
+                                ),
+                                ReferenceKind::Notes => paint(
+                                    &decorate_colors.tag,
+                                    &format!(
+                                        "{}{}",
+                                        if full { "refs/notes/" } else { "notes/" },
+                                        r.name
+                                    ),
+                                    color_enabled,
+                                ),
                             })
                         }
                     })
                     .collect(),
             );
-            ref_msgs.join(", ")
+            let ref_msgs_plain: Vec<String> =
+                ref_msgs.iter().map(|segment| strip_sgr(segment)).collect();
+            if ref_msgs.is_empty() {
+                (String::new(), String::new())
+            } else {
+                // Git colours the parentheses and separators with the commit
+                // colour and wraps every decoration segment on its own.
+                let separator = paint(&decorate_colors.commit, ", ", color_enabled);
+                let wrapped = format!(
+                    "{}{}{}",
+                    paint(&decorate_colors.commit, " (", color_enabled),
+                    ref_msgs.join(&separator),
+                    paint(&decorate_colors.commit, ")", color_enabled)
+                );
+                let plain = ref_msgs_plain.join(", ");
+                (plain, wrapped)
+            }
         } else {
-            String::new()
+            (String::new(), String::new())
         };
+        let (ref_msg_plain, ref_msg) = ref_msg;
 
         let graph = graph_state.as_mut().map(|gs| gs.render(&commit));
         let graph_prefix = graph.as_ref().map(|g| g.prefix.as_str()).unwrap_or("");
@@ -2756,7 +2887,9 @@ async fn execute_safe_with_diff_formats(
 
         let ctx = FormatContext {
             graph_prefix,
-            decoration: &ref_msg,
+            decoration: &ref_msg_plain,
+            decoration_wrapped: &ref_msg,
+            commit_color: decorate_colors.commit.as_deref(),
             abbrev_len,
             extra_hashes: &extra_hashes,
             notes: &note_text,

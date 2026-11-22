@@ -324,6 +324,8 @@ fn render_diff_tree_header(format: &DiffTreeHeaderFormat, commit: &Commit) -> St
             let context = FormatContext {
                 graph_prefix: "",
                 decoration: "",
+                decoration_wrapped: "",
+                commit_color: None,
                 abbrev_len: 7,
                 extra_hashes: "",
                 notes: "",

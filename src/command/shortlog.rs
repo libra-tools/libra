@@ -525,6 +525,8 @@ fn aggregate_shortlog(
                 let ctx = FormatContext {
                     graph_prefix: "",
                     decoration: "",
+                    decoration_wrapped: "",
+                    commit_color: None,
                     abbrev_len,
                     extra_hashes: "",
                     notes: "",

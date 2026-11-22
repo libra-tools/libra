@@ -673,7 +673,7 @@ PY
 
 ### Task LS-07: 支持 `color.decorate.*` 与 `diff.color.commit` 着色配置（#959）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `in-progress` / `locally-accepted`（2026-11-21：装饰着色改为**显式 SGR 拼接**——新增 `DecorateColors`、`paint`、`color_slot_to_sgr`（`normal`/基本八色/`bold` 等属性/`#rrggbb`）与 `resolve_decorate_colors`（默认调色板按 Git 实测：`commit` 33、`HEAD` 1;36、`branch` 1;32、`remoteBranch` 1;31、`tag` 1;33），`color.diff.commit` 支持旧名 `diff.color.commit`；装饰段按 Git 分段着色（` (`, `, `, `)` 用 commit 色，`tag: ` 与 tag 名各一段），`FormatContext` 拆分 `decoration`（纯文本，供 `%D`）与 `decoration_wrapped`（带括号与颜色，供内建格式与 `%d`），`commit <oid>` 由 `commit_color` 着色。与 `git 2.56.0` 默认输出逐段比对一致；`log_test` **260/260**、严格 Clippy exit 0。**剩余**：AC1–AC6 的逐字节断言用例（需要把 6 组 Git 期望字节硬编码进测试）尚未落地，故本卡暂记 `in-progress`。）
 
 **Description:** 读取 `color.decorate.{branch,remoteBranch,tag,HEAD}` 与 `color.diff.commit`（及其旧名 `diff.color.commit`），在 `libra log -1 --decorate=short --color=always`（medium 格式，首行为 `commit <oid> (<装饰>)`）下按配置为装饰与 `commit <oid>` 着色，替换硬编码颜色；着色字节按 Git 分段输出（例如 tag 装饰的 `tag: ` 前缀与 tag 名各自包裹 SGR，`git@6de20f6092:log-tree.c` 的 `format_decorations`）。
 

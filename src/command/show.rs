@@ -1157,6 +1157,8 @@ fn display_commit_info(
         let ctx = FormatContext {
             graph_prefix: "",
             decoration: "",
+            decoration_wrapped: "",
+            commit_color: None,
             abbrev_len: 7,
             extra_hashes: "",
             notes,

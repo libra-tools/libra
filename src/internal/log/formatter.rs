@@ -41,6 +41,12 @@ pub enum FormatType {
 pub struct FormatContext<'a> {
     pub graph_prefix: &'a str,
     pub decoration: &'a str,
+    /// The same decorations wrapped in parentheses (and styled when colour is
+    /// on), as the built-in presets and `%d` print them.
+    pub decoration_wrapped: &'a str,
+    /// SGR parameters for `commit <id>` (`color.diff.commit`); `None` keeps the
+    /// legacy yellow styling.
+    pub commit_color: Option<&'a str>,
     pub abbrev_len: usize,
     /// Pre-formatted parent or child commit ids (already abbreviated and
     /// space-joined) appended after the commit hash for `--parents`/`--children`
@@ -101,18 +107,18 @@ impl CommitFormatter {
         } else {
             full_hash
         };
-        let mut header = format!(
-            "{}{} {}",
-            ctx.graph_prefix,
-            "commit".yellow(),
-            display_hash.yellow()
-        );
+        let commit_text = format!("commit {display_hash}");
+        let commit_text = match ctx.commit_color {
+            Some(sgr) => format!("\x1b[{sgr}m{commit_text}\x1b[m"),
+            None => commit_text.yellow().to_string(),
+        };
+        let mut header = format!("{}{}", ctx.graph_prefix, commit_text);
         if !ctx.extra_hashes.is_empty() {
             header.push(' ');
             header.push_str(ctx.extra_hashes);
         }
         if !ctx.decoration.is_empty() {
-            header.push_str(&format!(" ({})", ctx.decoration));
+            header.push_str(ctx.decoration_wrapped);
         }
         header
     }
@@ -265,7 +271,7 @@ impl CommitFormatter {
             commit.id.to_string().yellow()
         );
         if !ctx.decoration.is_empty() {
-            header.push_str(&format!(" ({})", ctx.decoration));
+            header.push_str(ctx.decoration_wrapped);
         }
         let mut out = header;
         out.push('\n');
@@ -330,8 +336,8 @@ impl CommitFormatter {
             format!("{}{} {}", ctx.graph_prefix, hash_part, first_line)
         } else {
             format!(
-                "{}{} ({}) {}",
-                ctx.graph_prefix, hash_part, ctx.decoration, first_line
+                "{}{}{} {}",
+                ctx.graph_prefix, hash_part, ctx.decoration_wrapped, first_line
             )
         }
     }
@@ -357,7 +363,7 @@ impl CommitFormatter {
         let decoration = if ctx.decoration.is_empty() {
             String::new()
         } else {
-            format!(" ({})", ctx.decoration)
+            ctx.decoration_wrapped.to_string()
         };
         let raw_decoration = ctx.decoration.to_string();
         let author_iso = format_strict_iso_with_timezone(
@@ -723,6 +729,9 @@ mod tests {
         let ctx = FormatContext {
             graph_prefix: "",
             decoration: "",
+            decoration_wrapped: "",
+
+            commit_color: None,
             abbrev_len: 7,
             notes: "",
             extra_hashes: "",
@@ -743,6 +752,9 @@ mod tests {
         let ctx = FormatContext {
             graph_prefix: "",
             decoration: "",
+            decoration_wrapped: "",
+
+            commit_color: None,
             abbrev_len: 8,
             notes: "",
             extra_hashes: "",
@@ -770,6 +782,9 @@ mod tests {
         let ctx = FormatContext {
             graph_prefix: "",
             decoration: "",
+            decoration_wrapped: "",
+
+            commit_color: None,
             abbrev_len: 7,
             notes: "",
             extra_hashes: "",
@@ -822,6 +837,9 @@ mod tests {
         let ctx = FormatContext {
             graph_prefix: "* ",
             decoration: "tag: v1.0",
+            decoration_wrapped: "",
+
+            commit_color: None,
             abbrev_len: 8,
             notes: "",
             extra_hashes: "",
