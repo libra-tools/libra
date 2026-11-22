@@ -1,3 +1,5 @@
+#![cfg_attr(windows, feature(windows_by_handle))]
+
 //! Binary entry point for the `libra` CLI.
 //!
 //! Responsibilities, in order:

@@ -1,3 +1,5 @@
+#![cfg_attr(windows, feature(windows_by_handle))]
+
 //! Library entry for the Libra CLI.
 //!
 //! This crate has two faces:
