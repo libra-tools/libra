@@ -1462,7 +1462,7 @@ PY
 
 ### Task LS-19: 实现 `log --cc` 合并提交紧凑组合差异（#833）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `in-progress` / `partially-accepted`（2026-11-21：`--cc` 三段落地。① `LogArgs.cc`（隐含 `-p`）+ `generate_cc_diff` 稠密筛路径；② `index` 7 位缩写 + 组合 hunk 头部与 Git 对齐；③ **LCS 三路对齐**（`lcs_alignment`）——逐父提交与合并结果对齐，正文按合并行顺序交错（上下文 ` `、父侧替换行按列 `-`、合并新增行按列 `+`，插入槽位=最后匹配行+1）。实测：单条冲突夹具与「同文件两处冲突」夹具的 `diff --cc` 段均与 `git log --cc -1` **逐字节一致**；非合并提交 `--cc` 与 `-p` 逐字节相同；文件集为「与每个父提交都不同」的交集。回归：`command::log_test::log_cc_merge_combined_diff`（AC1 逐字节、AC2 文件集、AC3 非合并等价），`log_test` 278/278、严格 Clippy exit 0；EN/zh/开发文档与 `COMPATIBILITY.md` 同步。**仍差 Git（一般化边界）**：hunk 仍按整文件输出（未按上下文 3 行拆分多 hunk），当变更区域相距较远时 Git 会切成多个 `@@@`；八爪鱼合并（>2 父）的列序未逐一比对。本卡保持 `in-progress`。）
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `in-progress` / `partially-accepted`（2026-11-21：`--cc` 三段落地。① `LogArgs.cc`（隐含 `-p`）+ `generate_cc_diff` 稠密筛路径；② `index` 7 位缩写 + 组合 hunk 头部与 Git 对齐；③ **LCS 三路对齐**（`lcs_alignment`）——逐父提交与合并结果对齐，正文按合并行顺序交错（上下文 ` `、父侧替换行按列 `-`、合并新增行按列 `+`，插入槽位=最后匹配行+1）。实测：单条冲突夹具与「同文件两处冲突」夹具的 `diff --cc` 段均与 `git log --cc -1` **逐字节一致**；非合并提交 `--cc` 与 `-p` 逐字节相同；文件集为「与每个父提交都不同」的交集。回归：`command::log_test::log_cc_merge_combined_diff`（AC1 逐字节、AC2 文件集、AC3 非合并等价），`log_test` 278/278、严格 Clippy exit 0；EN/zh/开发文档与 `COMPATIBILITY.md` 同步。**仍差 Git（一般化边界，已实测）**：hunk 仍按整文件输出。用「第 2 行与第 28 行各一处冲突」的 30 行夹具实测，`git log --cc -1` 输出 **2 个 `@@@` hunk**（`@@@ -1,5 -1,5 +1,9 @@@` 等），我们仍给整文件单 hunk；八爪鱼合并（>2 父）列序亦未逐一比对（`libra merge` 当前不产生 3 父合并，无法在同夹具中对照）。本卡保持 `in-progress`。）
 
 **Description:** 在 `LogArgs` 新增 `--cc`（dense combined diff），对合并提交仅输出在所有父提交中均发生变更的文件及其 `@@@` 组合 hunk，单父提交仍正常输出普通 patch。
 
