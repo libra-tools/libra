@@ -98,7 +98,40 @@ pub const CAPTURE_SECONDARY_INDEX_TABLES: &[&str] = &[
     "bridge_events_by_seq",
     "bridge_links_by_key",
     "usage_stats_by_session_event",
+    "import_tombstones_by_provider",
+    "import_tombstones_by_session",
 ];
+
+/// Stable error prefix surfaced when `agent_import_tombstone` blocks re-import
+/// of an erased session, checkpoint, or import identity (`RB-06c`).
+pub const CAPTURE_TOMBSTONE_ERROR_PREFIX: &str = "capture import tombstone blocks re-import";
+
+/// Stable error prefix surfaced when an overwrite or delete is attempted on
+/// append-only audit tables (`agent_audit_log`, `agent_workspace_scope_audit`,
+/// `RB-06c`).
+pub const CAPTURE_APPEND_ONLY_ERROR_PREFIX: &str = "capture audit table is append-only";
+
+/// Returns `true` when `err` represents an `agent_import_tombstone` re-import
+/// rejection (`RB-06c`).
+#[must_use]
+pub fn is_capture_tombstone_error(err: &StorageBackendError) -> bool {
+    matches!(
+        err,
+        StorageBackendError::BackendInternal { detail }
+            if detail.starts_with(CAPTURE_TOMBSTONE_ERROR_PREFIX)
+    )
+}
+
+/// Returns `true` when `err` represents an append-only violation on
+/// `agent_audit_log` or `agent_workspace_scope_audit` (`RB-06c`).
+#[must_use]
+pub fn is_capture_append_only_error(err: &StorageBackendError) -> bool {
+    matches!(
+        err,
+        StorageBackendError::BackendInternal { detail }
+            if detail.starts_with(CAPTURE_APPEND_ONLY_ERROR_PREFIX)
+    )
+}
 
 /// Maximum UTF-8 byte length of a single bridge event payload (`256 KiB`,
 /// matching `agent_bridge_event` `CHECK(length(payload) <= 262144)` and
@@ -2249,7 +2282,7 @@ mod tests {
         }
     }
 
-    #[cfg(all(feature = "storage-sqlite", feature = "storage-redb"))]
+    #[cfg(feature = "storage-redb")]
     fn sample_checkpoint(id: &str, session_id: &str, created_at: i64) -> AgentCheckpointRecord {
         AgentCheckpointRecord {
             checkpoint_id: id.to_string(),
@@ -4023,6 +4056,568 @@ mod tests {
             git_ro.get_ref(&main_key).await.expect("git_ro read"),
             Some(target)
         );
+    }
+
+    /// `RB-06c` AC1–AC5: `RedbCaptureStore` enforces same-transaction
+    /// `agent_import_tombstone` re-import rejection and append-only protection
+    /// (rejecting both overwrite and delete) on `agent_audit_log` and
+    /// `agent_workspace_scope_audit`.
+    #[cfg(feature = "storage-redb")]
+    #[tokio::test]
+    async fn redb_tombstone_and_audit_append_only_invariants() {
+        use crate::{
+            internal::db::schema::DatabaseRole,
+            storage::{
+                capture_store::redb_capture_store::{
+                    IMPORT_TOMBSTONES_BY_PROVIDER_TABLE, IMPORT_TOMBSTONES_BY_SESSION_TABLE,
+                },
+                opener::{RedbRepairContext, open_redb_writable},
+            },
+        };
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let redb_path = dir.path().join("capture.gen-000001.redb");
+        let store = RedbCaptureStore::create(&redb_path)
+            .await
+            .expect("create RedbCaptureStore");
+
+        // --- AC1: agent_import_tombstone same-tx re-import rejection ---
+        let erased_provider = "secret-erased-provider-id-42";
+        let erased_session_id = "codex__secret-erased-provider-id-42";
+        store
+            .put_import_tombstone(&AgentImportTombstoneRecord {
+                tombstone_id: "tomb-ac1".to_string(),
+                agent_kind: "codex".to_string(),
+                provider_session_id: erased_provider.to_string(),
+                erased_session_id: erased_session_id.to_string(),
+                source_fingerprint: Some("fp-erased-42".to_string()),
+                erased_at: 1000,
+            })
+            .await
+            .expect("insert import tombstone");
+
+        // 1a. Reject re-importing session matching (agent_kind, provider_session_id),
+        // even under a fresh session_id.
+        let err_by_provider = store
+            .upsert_session(&sample_session(
+                "sess-reimport-alias",
+                erased_provider,
+                2000,
+            ))
+            .await
+            .expect_err("tombstoned (agent_kind, provider_session_id) session must be rejected");
+        assert!(is_capture_tombstone_error(&err_by_provider));
+        assert!(
+            !err_by_provider.to_string().contains(erased_provider),
+            "tombstone error must not leak raw provider_session_id"
+        );
+        assert!(
+            store
+                .get_session("sess-reimport-alias")
+                .await
+                .expect("read rejected session")
+                .is_none()
+        );
+
+        // 1b. Reject re-importing session matching erased_session_id even with a different provider ID.
+        let err_by_sid = store
+            .upsert_session(&sample_session(
+                erased_session_id,
+                "other-provider-id",
+                2001,
+            ))
+            .await
+            .expect_err("tombstoned erased_session_id must be rejected");
+        assert!(is_capture_tombstone_error(&err_by_sid));
+        assert!(
+            !err_by_sid.to_string().contains(erased_session_id),
+            "tombstone error must not leak raw erased_session_id"
+        );
+        assert!(
+            store
+                .get_session(erased_session_id)
+                .await
+                .expect("read rejected erased_session_id")
+                .is_none()
+        );
+
+        // 1c. Reject updating an existing live session into a tombstoned (agent_kind, provider_session_id).
+        let live_session = sample_session("sess-live-clean", "prov-live-clean", 1500);
+        store
+            .upsert_session(&live_session)
+            .await
+            .expect("insert live session");
+        let mut hijacked = live_session.clone();
+        hijacked.provider_session_id = erased_provider.to_string();
+        let err_update = store
+            .upsert_session(&hijacked)
+            .await
+            .expect_err("updating live session into tombstoned identity must be rejected");
+        assert!(is_capture_tombstone_error(&err_update));
+        assert_eq!(
+            store
+                .get_session("sess-live-clean")
+                .await
+                .expect("read live session after rejected update"),
+            Some(live_session.clone())
+        );
+
+        // 1d. Reject re-importing an import identity matching a tombstoned (agent_kind, provider_session_id).
+        let err_identity = store
+            .upsert_import_identity(&AgentImportIdentityRecord {
+                identity_id: "imp-tombstoned".to_string(),
+                agent_kind: "codex".to_string(),
+                provider_session_id: erased_provider.to_string(),
+                source_kind: "jsonl".to_string(),
+                source_id: "rel/reimport.jsonl".to_string(),
+                schema_version: 1,
+                observed_digest: Some("a".repeat(64)),
+                committed_digest: None,
+                attempt_id: None,
+                attempt_checkpoint_id: None,
+                next_ordinal: 0,
+                state: CaptureImportIdentityState::Discovered,
+                owner: None,
+                lease_expires_at: None,
+                fence_token: None,
+                last_error_code: None,
+                created_at: 2010,
+                updated_at: 2010,
+                repo_id: None,
+                worktree_id: None,
+                workspace_id: None,
+                workspace_fence: None,
+                scope_state: CaptureScopeState::LegacyUnknown,
+            })
+            .await
+            .expect_err("tombstoned import identity must be rejected");
+        assert!(is_capture_tombstone_error(&err_identity));
+        assert!(
+            store
+                .get_import_identity("imp-tombstoned")
+                .await
+                .expect("read rejected identity")
+                .is_none()
+        );
+
+        // 1e. Reject inserting a checkpoint for a tombstoned session (even when the session row
+        // existed before the tombstone was recorded!).
+        let pre_erase_session = sample_session("codex__pre-erase-prov", "pre-erase-prov", 1600);
+        store
+            .upsert_session(&pre_erase_session)
+            .await
+            .expect("insert pre-erase session");
+        store
+            .put_import_tombstone(&AgentImportTombstoneRecord {
+                tombstone_id: "tomb-pre-erase".to_string(),
+                agent_kind: "codex".to_string(),
+                provider_session_id: "pre-erase-prov".to_string(),
+                erased_session_id: "codex__pre-erase-prov".to_string(),
+                source_fingerprint: None,
+                erased_at: 1700,
+            })
+            .await
+            .expect("insert tombstone after session");
+        let err_cp = store
+            .upsert_checkpoint(&sample_checkpoint(
+                "cp-blocked",
+                "codex__pre-erase-prov",
+                1710,
+            ))
+            .await
+            .expect_err("checkpoint for tombstoned session must be rejected");
+        assert!(is_capture_tombstone_error(&err_cp));
+        assert!(
+            store
+                .get_checkpoint("cp-blocked")
+                .await
+                .expect("read rejected checkpoint")
+                .is_none()
+        );
+
+        // 1f. Same-tx rollback in append_capture_batch when a tombstoned session appears mid-batch
+        let batch_tomb_err = store
+            .append_capture_batch(
+                &[
+                    CaptureBatchItem {
+                        dedup_key: "tomb-batch:valid-usage".to_string(),
+                        payload: CaptureBatchPayload::InsertUsageStats(sample_usage(
+                            "usage-tomb-rollback",
+                            "sess-live-clean",
+                            "ev-tomb-rollback",
+                        )),
+                    },
+                    CaptureBatchItem {
+                        dedup_key: "tomb-batch:blocked-session".to_string(),
+                        payload: CaptureBatchPayload::UpsertSession(sample_session(
+                            "sess-batch-reimport",
+                            erased_provider,
+                            2100,
+                        )),
+                    },
+                ],
+                Some((
+                    CaptureQueueLane::Normal,
+                    CaptureQueueHighwater {
+                        segment_id: 0,
+                        byte_offset: 512,
+                    },
+                )),
+            )
+            .await
+            .expect_err("batch with tombstoned re-import must abort atomically");
+        assert!(is_capture_tombstone_error(&batch_tomb_err));
+        assert!(
+            store
+                .get_usage_stats("usage-tomb-rollback")
+                .await
+                .expect("rolled back usage")
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .get_queue_highwater(CaptureQueueLane::Normal)
+                .await
+                .expect("highwater unchanged after tombstone abort"),
+            CaptureQueueHighwater::default()
+        );
+        // Verify preceding dedup_key was rolled back too (retrying same key applies cleanly).
+        let retry_tomb = store
+            .append_capture_batch(
+                &[CaptureBatchItem {
+                    dedup_key: "tomb-batch:valid-usage".to_string(),
+                    payload: CaptureBatchPayload::InsertUsageStats(sample_usage(
+                        "usage-tomb-rollback",
+                        "sess-live-clean",
+                        "ev-tomb-rollback",
+                    )),
+                }],
+                None,
+            )
+            .await
+            .expect("retry rolled-back usage item with same dedup_key");
+        assert_eq!(retry_tomb.applied_count, 1);
+        assert_eq!(retry_tomb.deduplicated_count, 0);
+        assert!(
+            store
+                .get_usage_stats("usage-tomb-rollback")
+                .await
+                .expect("read retried usage")
+                .is_some()
+        );
+
+        // 1g. Legacy pre-RB-06c DB upgrade: drop the two tombstone index tables and verify
+        // open_read_write backfills BOTH indexes from agent_import_tombstone and still blocks
+        // provider re-import, erased-session re-import, and checkpoint re-import.
+        drop(store);
+        {
+            let raw_db = open_redb_writable(
+                &redb_path,
+                DatabaseRole::Capture,
+                RedbRepairContext::WriteCommand,
+            )
+            .expect("open raw redb");
+            let wtx = raw_db.begin_write().expect("begin raw write");
+            let deleted_provider_idx = wtx
+                .delete_table(IMPORT_TOMBSTONES_BY_PROVIDER_TABLE)
+                .expect("delete import_tombstones_by_provider");
+            let deleted_session_idx = wtx
+                .delete_table(IMPORT_TOMBSTONES_BY_SESSION_TABLE)
+                .expect("delete import_tombstones_by_session");
+            assert!(
+                deleted_provider_idx,
+                "import_tombstones_by_provider must have existed and been deleted"
+            );
+            assert!(
+                deleted_session_idx,
+                "import_tombstones_by_session must have existed and been deleted"
+            );
+            wtx.commit().expect("commit dropped tombstone indexes");
+        }
+        let store = RedbCaptureStore::open_read_write(&redb_path, RedbRepairContext::WriteCommand)
+            .await
+            .expect("reopen and backfill tombstone indexes");
+        let err_after_reopen_provider = store
+            .upsert_session(&sample_session(
+                "sess-after-backfill-prov",
+                erased_provider,
+                2200,
+            ))
+            .await
+            .expect_err("reopened DB must backfill provider tombstone index and block re-import");
+        assert!(is_capture_tombstone_error(&err_after_reopen_provider));
+        let err_after_reopen_session = store
+            .upsert_session(&sample_session(
+                erased_session_id,
+                "prov-fresh-after-backfill",
+                2205,
+            ))
+            .await
+            .expect_err("reopened DB must backfill session tombstone index and block re-import");
+        assert!(is_capture_tombstone_error(&err_after_reopen_session));
+        let err_after_reopen_cp = store
+            .upsert_checkpoint(&sample_checkpoint(
+                "cp-blocked-after-backfill",
+                "codex__pre-erase-prov",
+                2210,
+            ))
+            .await
+            .expect_err("reopened DB must block checkpoint for tombstoned session");
+        assert!(is_capture_tombstone_error(&err_after_reopen_cp));
+
+        // --- AC2 & AC3: agent_audit_log append-only (reject overwrite AND delete) ---
+        let orig_audit = AgentAuditLogRecord {
+            audit_id: "audit-immut-1".to_string(),
+            timestamp: "2026-11-22T22:00:00Z".to_string(),
+            user_id: Some("eli@patch.sh".to_string()),
+            user_name: Some("Eli".to_string()),
+            action: "raw_export".to_string(),
+            checkpoint_id: "cp-orig".to_string(),
+            scope: "transcript".to_string(),
+            export_path: Some("/tmp/audit.json".to_string()),
+            justification: Some("initial immutable entry".to_string()),
+            granted: true,
+        };
+        store
+            .append_audit_log(&orig_audit)
+            .await
+            .expect("append initial agent_audit_log");
+
+        let mut tampered_audit = orig_audit.clone();
+        tampered_audit.granted = false;
+        tampered_audit.justification = Some("tampered".to_string());
+
+        // AC2: reject overwrite via append_audit_log, update_audit_log, and append_capture_batch
+        let err_audit_dup = store
+            .append_audit_log(&tampered_audit)
+            .await
+            .expect_err("duplicate append_audit_log overwrite must be rejected");
+        assert!(is_capture_append_only_error(&err_audit_dup));
+
+        let err_audit_upd = store
+            .update_audit_log(&tampered_audit)
+            .await
+            .expect_err("update_audit_log overwrite must be rejected");
+        assert!(is_capture_append_only_error(&err_audit_upd));
+
+        let err_audit_batch = store
+            .append_capture_batch(
+                &[
+                    CaptureBatchItem {
+                        dedup_key: "audit-batch:valid-usage".to_string(),
+                        payload: CaptureBatchPayload::InsertUsageStats(sample_usage(
+                            "usage-audit-rollback",
+                            "sess-live-clean",
+                            "ev-audit-rollback",
+                        )),
+                    },
+                    CaptureBatchItem {
+                        dedup_key: "audit-batch:overwrite-audit".to_string(),
+                        payload: CaptureBatchPayload::AppendAuditLog(tampered_audit.clone()),
+                    },
+                ],
+                Some((
+                    CaptureQueueLane::Priority,
+                    CaptureQueueHighwater {
+                        segment_id: 0,
+                        byte_offset: 128,
+                    },
+                )),
+            )
+            .await
+            .expect_err("batch attempting agent_audit_log overwrite must abort atomically");
+        assert!(is_capture_append_only_error(&err_audit_batch));
+        assert!(
+            store
+                .get_usage_stats("usage-audit-rollback")
+                .await
+                .expect("usage rolled back after audit overwrite attempt")
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .get_queue_highwater(CaptureQueueLane::Priority)
+                .await
+                .expect("priority highwater unchanged"),
+            CaptureQueueHighwater::default()
+        );
+        let retry_audit = store
+            .append_capture_batch(
+                &[CaptureBatchItem {
+                    dedup_key: "audit-batch:valid-usage".to_string(),
+                    payload: CaptureBatchPayload::InsertUsageStats(sample_usage(
+                        "usage-audit-rollback",
+                        "sess-live-clean",
+                        "ev-audit-rollback",
+                    )),
+                }],
+                None,
+            )
+            .await
+            .expect("retry rolled-back usage after audit overwrite abort");
+        assert_eq!(retry_audit.applied_count, 1);
+        assert_eq!(retry_audit.deduplicated_count, 0);
+        assert!(
+            store
+                .get_usage_stats("usage-audit-rollback")
+                .await
+                .expect("read retried audit usage")
+                .is_some()
+        );
+        assert_eq!(
+            store
+                .get_audit_log("audit-immut-1")
+                .await
+                .expect("read audit log after rejected overwrites"),
+            Some(orig_audit.clone())
+        );
+
+        // AC3: reject delete on existing primary key (and preserve row intact)
+        let err_audit_del = store
+            .delete_audit_log("audit-immut-1")
+            .await
+            .expect_err("delete_audit_log on existing PK must be rejected");
+        assert!(is_capture_append_only_error(&err_audit_del));
+        assert_eq!(
+            store
+                .get_audit_log("audit-immut-1")
+                .await
+                .expect("audit log remains intact after rejected delete"),
+            Some(orig_audit)
+        );
+        let err_audit_del_missing = store
+            .delete_audit_log("audit-nonexistent")
+            .await
+            .expect_err("delete_audit_log must fail closed on append-only table");
+        assert!(is_capture_append_only_error(&err_audit_del_missing));
+
+        // --- AC4 & AC5: agent_workspace_scope_audit append-only (reject overwrite AND delete) ---
+        let orig_wsa = AgentWorkspaceScopeAuditRecord {
+            audit_id: "wsa-immut-1".to_string(),
+            action: WORKSPACE_SCOPE_AUDIT_ACTION.to_string(),
+            agent_kind: "codex".to_string(),
+            provider_session_id: "prov-live-clean".to_string(),
+            repo_id: "repo-rb06c".to_string(),
+            worktree_id: "wt-main".to_string(),
+            workspace_id: Some("ws-1".to_string()),
+            workspace_fence: Some(9),
+            actor: Some("eli".to_string()),
+            created_at: 3000,
+        };
+        store
+            .append_workspace_scope_audit(&orig_wsa)
+            .await
+            .expect("append initial agent_workspace_scope_audit");
+
+        let mut tampered_wsa = orig_wsa.clone();
+        tampered_wsa.actor = Some("attacker".to_string());
+        tampered_wsa.workspace_fence = Some(999);
+
+        // AC4: reject overwrite via append, update, and append_capture_batch
+        let err_wsa_dup = store
+            .append_workspace_scope_audit(&tampered_wsa)
+            .await
+            .expect_err("duplicate append_workspace_scope_audit overwrite must be rejected");
+        assert!(is_capture_append_only_error(&err_wsa_dup));
+
+        let err_wsa_upd = store
+            .update_workspace_scope_audit(&tampered_wsa)
+            .await
+            .expect_err("update_workspace_scope_audit overwrite must be rejected");
+        assert!(is_capture_append_only_error(&err_wsa_upd));
+
+        let err_wsa_batch = store
+            .append_capture_batch(
+                &[
+                    CaptureBatchItem {
+                        dedup_key: "wsa-batch:valid-usage".to_string(),
+                        payload: CaptureBatchPayload::InsertUsageStats(sample_usage(
+                            "usage-wsa-rollback",
+                            "sess-live-clean",
+                            "ev-wsa-rollback",
+                        )),
+                    },
+                    CaptureBatchItem {
+                        dedup_key: "wsa-batch:overwrite-wsa".to_string(),
+                        payload: CaptureBatchPayload::AppendWorkspaceScopeAudit(
+                            tampered_wsa.clone(),
+                        ),
+                    },
+                ],
+                Some((
+                    CaptureQueueLane::Priority,
+                    CaptureQueueHighwater {
+                        segment_id: 0,
+                        byte_offset: 256,
+                    },
+                )),
+            )
+            .await
+            .expect_err("batch attempting workspace_scope_audit overwrite must abort atomically");
+        assert!(is_capture_append_only_error(&err_wsa_batch));
+        assert!(
+            store
+                .get_usage_stats("usage-wsa-rollback")
+                .await
+                .expect("usage rolled back after wsa overwrite attempt")
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .get_queue_highwater(CaptureQueueLane::Priority)
+                .await
+                .expect("priority highwater unchanged"),
+            CaptureQueueHighwater::default()
+        );
+        let retry_wsa = store
+            .append_capture_batch(
+                &[CaptureBatchItem {
+                    dedup_key: "wsa-batch:valid-usage".to_string(),
+                    payload: CaptureBatchPayload::InsertUsageStats(sample_usage(
+                        "usage-wsa-rollback",
+                        "sess-live-clean",
+                        "ev-wsa-rollback",
+                    )),
+                }],
+                None,
+            )
+            .await
+            .expect("retry rolled-back usage after wsa overwrite abort");
+        assert_eq!(retry_wsa.applied_count, 1);
+        assert_eq!(retry_wsa.deduplicated_count, 0);
+        assert!(
+            store
+                .get_usage_stats("usage-wsa-rollback")
+                .await
+                .expect("read retried wsa usage")
+                .is_some()
+        );
+        assert_eq!(
+            store
+                .get_workspace_scope_audit("wsa-immut-1")
+                .await
+                .expect("workspace scope audit remains intact after rejected overwrites"),
+            Some(orig_wsa.clone())
+        );
+
+        // AC5: reject delete on existing primary key (and preserve row intact)
+        let err_wsa_del = store
+            .delete_workspace_scope_audit("wsa-immut-1")
+            .await
+            .expect_err("delete_workspace_scope_audit on existing PK must be rejected");
+        assert!(is_capture_append_only_error(&err_wsa_del));
+        assert_eq!(
+            store
+                .get_workspace_scope_audit("wsa-immut-1")
+                .await
+                .expect("workspace scope audit remains intact after rejected delete"),
+            Some(orig_wsa)
+        );
+        let err_wsa_del_missing = store
+            .delete_workspace_scope_audit("wsa-nonexistent")
+            .await
+            .expect_err("delete_workspace_scope_audit must fail closed on append-only table");
+        assert!(is_capture_append_only_error(&err_wsa_del_missing));
     }
 
     /// Smoke test ensuring `SqliteCaptureStore` builds and works cleanly under

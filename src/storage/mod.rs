@@ -51,9 +51,10 @@ pub use capture_store::{
     AgentSubagentLinkRecord, AgentUsageStatsRecord, AgentWorkspaceScopeAuditRecord,
     BRIDGE_SOURCE_DEEPSEEK_HARNESS, BridgeEventAppendInput, BridgeEventAppendOutcome,
     BridgeEventStatus, BridgeLinkSourceType, BridgeLinkWrite, BridgeOperationStatus,
-    BridgeSessionOpenInput, BridgeSessionState, CAPTURE_INTERNAL_META_AND_QUEUE_TABLES,
-    CAPTURE_SECONDARY_INDEX_TABLES, CAPTURE_SOURCE_NAMESPACE_LEN, CAPTURE_SOURCE_TABLES,
-    CAPTURE_SOURCE_TABLES_COUNT, CaptureAgentKind, CaptureBatchItem, CaptureBatchOutcome,
+    BridgeSessionOpenInput, BridgeSessionState, CAPTURE_APPEND_ONLY_ERROR_PREFIX,
+    CAPTURE_INTERNAL_META_AND_QUEUE_TABLES, CAPTURE_SECONDARY_INDEX_TABLES,
+    CAPTURE_SOURCE_NAMESPACE_LEN, CAPTURE_SOURCE_TABLES, CAPTURE_SOURCE_TABLES_COUNT,
+    CAPTURE_TOMBSTONE_ERROR_PREFIX, CaptureAgentKind, CaptureBatchItem, CaptureBatchOutcome,
     CaptureBatchPayload, CaptureCatalogCopyReceiptRecord, CaptureCheckpointScope,
     CaptureCompleteness, CaptureCoverageClaimState, CaptureExportJobState, CaptureHashKind,
     CaptureImportIdentityState, CaptureQueueHighwater, CaptureQueueLane,
@@ -61,7 +62,8 @@ pub use capture_store::{
     CaptureStore, CaptureSubagentClaimState, CaptureSubagentLinkState,
     CaptureSubagentSourceChannel, MAX_BRIDGE_EVENT_PAYLOAD_BYTES, MAX_CAPTURE_DEDUP_KEY_BYTES,
     WORKSPACE_SCOPE_AUDIT_ACTION, capture_declared_non_source_tables, capture_sha256_hex,
-    capture_source_tables_from_sql, invert_capture_timestamp,
+    capture_source_tables_from_sql, invert_capture_timestamp, is_capture_append_only_error,
+    is_capture_tombstone_error,
 };
 pub use config_store::{
     CONFIG_FORMAT_MANIFEST_FILE, CONFIG_FORMAT_MANIFEST_VERSION, CONFIG_MIGRATION_LOCK_FILE,

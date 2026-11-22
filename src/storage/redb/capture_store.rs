@@ -73,7 +73,10 @@ use crate::{
             RedbRepairContext, begin_write_bounded_blocking, create_redb_writable,
             open_redb_read_only, open_redb_writable,
         },
-        redb::{map_redb_commit_err, map_redb_storage_err, map_redb_table_err},
+        redb::{
+            map_append_only_err, map_redb_commit_err, map_redb_storage_err, map_redb_table_err,
+            map_tombstone_protected_err,
+        },
     },
 };
 
@@ -198,6 +201,14 @@ pub const SESSIONS_BY_PROVIDER_TABLE: TableDefinition<'static, (&str, &str), &[u
 /// enforcing `UNIQUE(source_type, source_id, target_type, target_id)` in O(log N).
 pub const BRIDGE_LINKS_BY_KEY_TABLE: TableDefinition<'static, (&str, &str, &str, &str), &[u8]> =
     TableDefinition::new("bridge_links_by_key");
+/// `IMPORT_TOMBSTONES_BY_PROVIDER`: `(agent_kind, provider_session_id) -> TombstoneIndexEntry`
+/// enforcing same-transaction re-import rejection and unique constraints in O(log N) (`RB-06c`).
+pub const IMPORT_TOMBSTONES_BY_PROVIDER_TABLE: TableDefinition<'static, (&str, &str), &[u8]> =
+    TableDefinition::new("import_tombstones_by_provider");
+/// `IMPORT_TOMBSTONES_BY_SESSION`: `erased_session_id -> TombstoneIndexEntry`
+/// enforcing same-transaction checkpoint/session re-import rejection in O(log N) (`RB-06c`).
+pub const IMPORT_TOMBSTONES_BY_SESSION_TABLE: TableDefinition<'static, &str, &[u8]> =
+    TableDefinition::new("import_tombstones_by_session");
 
 // ============================================================================
 // Internal Stored Envelope Structs
@@ -240,6 +251,11 @@ struct SessionProviderIndexEntry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 struct BridgeLinkIndexEntry {
     link_id: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct TombstoneIndexEntry {
+    tombstone_id: String,
 }
 
 enum RedbCaptureHandle {
@@ -401,6 +417,12 @@ fn open_all_capture_tables_for_init(wtx: &WriteTransaction) -> StorageResult<()>
     let _ = wtx
         .open_table(BRIDGE_LINKS_BY_KEY_TABLE)
         .map_err(|e| map_redb_table_err(e, "init bridge_links_by_key"))?;
+    let _ = wtx
+        .open_table(IMPORT_TOMBSTONES_BY_PROVIDER_TABLE)
+        .map_err(|e| map_redb_table_err(e, "init import_tombstones_by_provider"))?;
+    let _ = wtx
+        .open_table(IMPORT_TOMBSTONES_BY_SESSION_TABLE)
+        .map_err(|e| map_redb_table_err(e, "init import_tombstones_by_session"))?;
 
     // Seed initial capture schema_versions receipt matching SQLite bootstrap
     {
@@ -523,7 +545,113 @@ fn write_highwater_in_wtx(
     Ok(())
 }
 
+fn ensure_tombstone_indexes_synced(db: &Database) -> StorageResult<()> {
+    let needs_backfill = {
+        let rtx = begin_checked_read(db, DatabaseRole::Capture)?;
+        let present: BTreeSet<String> = rtx
+            .list_tables()
+            .map_err(|e| map_redb_storage_err(e, "list redb capture tables for tombstone sync"))?
+            .map(|h| h.name().to_string())
+            .collect();
+        !present.contains(IMPORT_TOMBSTONES_BY_PROVIDER_TABLE.name())
+            || !present.contains(IMPORT_TOMBSTONES_BY_SESSION_TABLE.name())
+    };
+    if !needs_backfill {
+        return Ok(());
+    }
+
+    let wtx =
+        begin_checked_write_blocking(db, DatabaseRole::Capture, DEFAULT_CAPTURE_WRITE_TIMEOUT)?;
+    let rows: Vec<AgentImportTombstoneRecord> = {
+        let tbl = wtx
+            .open_table(AGENT_IMPORT_TOMBSTONE_TABLE)
+            .map_err(|e| map_redb_table_err(e, "open agent_import_tombstone for backfill"))?;
+        let mut out = Vec::new();
+        for entry in tbl
+            .iter()
+            .map_err(|e| map_redb_storage_err(e, "iter agent_import_tombstone for backfill"))?
+        {
+            let (_, v) =
+                entry.map_err(|e| map_redb_storage_err(e, "read tombstone for backfill"))?;
+            out.push(dec(v.value())?);
+        }
+        out
+    };
+    let mut by_provider = wtx
+        .open_table(IMPORT_TOMBSTONES_BY_PROVIDER_TABLE)
+        .map_err(|e| map_redb_table_err(e, "open import_tombstones_by_provider for backfill"))?;
+    let mut by_session = wtx
+        .open_table(IMPORT_TOMBSTONES_BY_SESSION_TABLE)
+        .map_err(|e| map_redb_table_err(e, "open import_tombstones_by_session for backfill"))?;
+    for row in rows {
+        let idx = enc(&TombstoneIndexEntry {
+            tombstone_id: row.tombstone_id,
+        })?;
+        by_provider
+            .insert(
+                (row.agent_kind.as_str(), row.provider_session_id.as_str()),
+                idx.as_slice(),
+            )
+            .map_err(|e| map_redb_storage_err(e, "backfill import_tombstones_by_provider"))?;
+        by_session
+            .insert(row.erased_session_id.as_str(), idx.as_slice())
+            .map_err(|e| map_redb_storage_err(e, "backfill import_tombstones_by_session"))?;
+    }
+    drop(by_provider);
+    drop(by_session);
+    wtx.commit()
+        .map_err(|e| map_redb_commit_err(e, "commit tombstone index backfill"))?;
+    Ok(())
+}
+
+fn ensure_not_tombstoned_by_provider(
+    wtx: &WriteTransaction,
+    agent_kind: &str,
+    provider_session_id: &str,
+    entity: &'static str,
+) -> StorageResult<()> {
+    let by_provider = wtx
+        .open_table(IMPORT_TOMBSTONES_BY_PROVIDER_TABLE)
+        .map_err(|e| map_redb_table_err(e, "open import_tombstones_by_provider"))?;
+    if by_provider
+        .get((agent_kind, provider_session_id))
+        .map_err(|e| map_redb_storage_err(e, "check import_tombstones_by_provider"))?
+        .is_some()
+    {
+        return Err(map_tombstone_protected_err(entity));
+    }
+    Ok(())
+}
+
+fn ensure_not_tombstoned_by_session(
+    wtx: &WriteTransaction,
+    session_id: &str,
+    entity: &'static str,
+) -> StorageResult<()> {
+    let by_session = wtx
+        .open_table(IMPORT_TOMBSTONES_BY_SESSION_TABLE)
+        .map_err(|e| map_redb_table_err(e, "open import_tombstones_by_session"))?;
+    if by_session
+        .get(session_id)
+        .map_err(|e| map_redb_storage_err(e, "check import_tombstones_by_session"))?
+        .is_some()
+    {
+        return Err(map_tombstone_protected_err(entity));
+    }
+    Ok(())
+}
+
 fn upsert_session_in_wtx(wtx: &WriteTransaction, rec: &AgentSessionRecord) -> StorageResult<()> {
+    // RB-06c AC1: Enforce same-transaction agent_import_tombstone re-import rejection
+    // on both (agent_kind, provider_session_id) and erased_session_id.
+    ensure_not_tombstoned_by_provider(
+        wtx,
+        rec.agent_kind.as_str(),
+        rec.provider_session_id.as_str(),
+        "agent_session",
+    )?;
+    ensure_not_tombstoned_by_session(wtx, rec.session_id.as_str(), "agent_session")?;
+
     let mut sessions = wtx
         .open_table(AGENT_SESSION_TABLE)
         .map_err(|e| map_redb_table_err(e, "open agent_session for write"))?;
@@ -613,21 +741,31 @@ fn upsert_checkpoint_in_wtx(
     wtx: &WriteTransaction,
     rec: &AgentCheckpointRecord,
 ) -> StorageResult<()> {
-    // FK: session_id must exist in agent_session
-    {
+    // RB-06c AC1: Enforce same-transaction agent_import_tombstone rejection for
+    // checkpoints referencing an erased session.
+    ensure_not_tombstoned_by_session(wtx, rec.session_id.as_str(), "agent_checkpoint")?;
+
+    // FK: session_id must exist in agent_session (and its provider identity must not be tombstoned)
+    let parent_session = {
         let sessions = wtx
             .open_table(AGENT_SESSION_TABLE)
             .map_err(|e| map_redb_table_err(e, "open agent_session for checkpoint FK"))?;
-        if sessions
+        let Some(raw) = sessions
             .get(rec.session_id.as_str())
             .map_err(|e| map_redb_storage_err(e, "check checkpoint session FK"))?
-            .is_none()
-        {
+        else {
             return Err(StorageBackendError::BackendInternal {
                 detail: "agent_checkpoint foreign key violation: session_id not found".to_string(),
             });
-        }
-    }
+        };
+        dec::<AgentSessionRecord>(raw.value())?
+    };
+    ensure_not_tombstoned_by_provider(
+        wtx,
+        parent_session.agent_kind.as_str(),
+        parent_session.provider_session_id.as_str(),
+        "agent_checkpoint",
+    )?;
 
     let mut checkpoints = wtx
         .open_table(AGENT_CHECKPOINT_TABLE)
@@ -778,9 +916,7 @@ fn append_audit_log_in_wtx(wtx: &WriteTransaction, rec: &AgentAuditLogRecord) ->
         .map_err(|e| map_redb_storage_err(e, "check agent_audit_log"))?
         .is_some()
     {
-        return Err(StorageBackendError::BackendInternal {
-            detail: "agent_audit_log is append-only: duplicate audit_id rejected".to_string(),
-        });
+        return Err(map_append_only_err("agent_audit_log", "overwrite"));
     }
     let bytes = enc(rec)?;
     tbl.insert(rec.audit_id.as_str(), bytes.as_slice())
@@ -800,10 +936,10 @@ fn append_workspace_scope_audit_in_wtx(
         .map_err(|e| map_redb_storage_err(e, "check agent_workspace_scope_audit"))?
         .is_some()
     {
-        return Err(StorageBackendError::BackendInternal {
-            detail: "agent_workspace_scope_audit is append-only: duplicate audit_id rejected"
-                .to_string(),
-        });
+        return Err(map_append_only_err(
+            "agent_workspace_scope_audit",
+            "overwrite",
+        ));
     }
     let bytes = enc(rec)?;
     tbl.insert(rec.audit_id.as_str(), bytes.as_slice())
@@ -1092,6 +1228,7 @@ impl RedbCaptureStore {
             let rtx = begin_checked_read(&db, DatabaseRole::Capture)?;
             verify_required_capture_tables(&rtx)?;
             drop(rtx);
+            ensure_tombstone_indexes_synced(&db)?;
             Ok(db)
         })
         .await
@@ -1152,6 +1289,77 @@ impl RedbCaptureStore {
     #[must_use]
     pub fn write_transaction_count(&self) -> u64 {
         self.write_tx_count.load(Ordering::Acquire)
+    }
+
+    /// Reject overwriting an `agent_audit_log` record inside a checked write
+    /// transaction (`RB-06c` AC2).
+    pub async fn update_audit_log(&self, record: &AgentAuditLogRecord) -> StorageResult<()> {
+        validate_audit_log_record(record)?;
+        let audit_id = record.audit_id.clone();
+        self.write_tx("update_audit_log", move |wtx| {
+            let tbl = wtx
+                .open_table(AGENT_AUDIT_LOG_TABLE)
+                .map_err(|e| map_redb_table_err(e, "open agent_audit_log"))?;
+            let _ = tbl
+                .get(audit_id.as_str())
+                .map_err(|e| map_redb_storage_err(e, "check agent_audit_log"))?;
+            Err(map_append_only_err("agent_audit_log", "update"))
+        })
+        .await
+    }
+
+    /// Reject deleting an `agent_audit_log` record inside a checked write
+    /// transaction (`RB-06c` AC3).
+    pub async fn delete_audit_log(&self, audit_id: &str) -> StorageResult<()> {
+        validate_non_empty_no_nul(audit_id, "audit_id")?;
+        let id = audit_id.to_string();
+        self.write_tx("delete_audit_log", move |wtx| {
+            let tbl = wtx
+                .open_table(AGENT_AUDIT_LOG_TABLE)
+                .map_err(|e| map_redb_table_err(e, "open agent_audit_log"))?;
+            let _ = tbl
+                .get(id.as_str())
+                .map_err(|e| map_redb_storage_err(e, "check agent_audit_log"))?;
+            Err(map_append_only_err("agent_audit_log", "delete"))
+        })
+        .await
+    }
+
+    /// Reject overwriting an `agent_workspace_scope_audit` record inside a
+    /// checked write transaction (`RB-06c` AC4).
+    pub async fn update_workspace_scope_audit(
+        &self,
+        record: &AgentWorkspaceScopeAuditRecord,
+    ) -> StorageResult<()> {
+        validate_workspace_scope_audit_record(record)?;
+        let audit_id = record.audit_id.clone();
+        self.write_tx("update_workspace_scope_audit", move |wtx| {
+            let tbl = wtx
+                .open_table(AGENT_WORKSPACE_SCOPE_AUDIT_TABLE)
+                .map_err(|e| map_redb_table_err(e, "open agent_workspace_scope_audit"))?;
+            let _ = tbl
+                .get(audit_id.as_str())
+                .map_err(|e| map_redb_storage_err(e, "check agent_workspace_scope_audit"))?;
+            Err(map_append_only_err("agent_workspace_scope_audit", "update"))
+        })
+        .await
+    }
+
+    /// Reject deleting an `agent_workspace_scope_audit` record inside a checked
+    /// write transaction (`RB-06c` AC5).
+    pub async fn delete_workspace_scope_audit(&self, audit_id: &str) -> StorageResult<()> {
+        validate_non_empty_no_nul(audit_id, "audit_id")?;
+        let id = audit_id.to_string();
+        self.write_tx("delete_workspace_scope_audit", move |wtx| {
+            let tbl = wtx
+                .open_table(AGENT_WORKSPACE_SCOPE_AUDIT_TABLE)
+                .map_err(|e| map_redb_table_err(e, "open agent_workspace_scope_audit"))?;
+            let _ = tbl
+                .get(id.as_str())
+                .map_err(|e| map_redb_storage_err(e, "check agent_workspace_scope_audit"))?;
+            Err(map_append_only_err("agent_workspace_scope_audit", "delete"))
+        })
+        .await
     }
 
     /// Return all live table names currently registered inside this `.redb` file.
@@ -2971,6 +3179,14 @@ impl CaptureStore for RedbCaptureStore {
         validate_import_identity_record(record)?;
         let rec = record.clone();
         self.write_tx("upsert_import_identity", move |wtx| {
+            // RB-06c AC1: Enforce same-transaction agent_import_tombstone rejection
+            ensure_not_tombstoned_by_provider(
+                wtx,
+                rec.agent_kind.as_str(),
+                rec.provider_session_id.as_str(),
+                "agent_import_identity",
+            )?;
+
             let mut tbl = wtx
                 .open_table(AGENT_IMPORT_IDENTITY_TABLE)
                 .map_err(|e| map_redb_table_err(e, "open agent_import_identity"))?;
@@ -3043,28 +3259,74 @@ impl CaptureStore for RedbCaptureStore {
             let mut tbl = wtx
                 .open_table(AGENT_IMPORT_TOMBSTONE_TABLE)
                 .map_err(|e| map_redb_table_err(e, "open agent_import_tombstone"))?;
-            for entry in tbl
-                .iter()
-                .map_err(|e| map_redb_storage_err(e, "scan agent_import_tombstone"))?
+            let mut by_provider = wtx
+                .open_table(IMPORT_TOMBSTONES_BY_PROVIDER_TABLE)
+                .map_err(|e| map_redb_table_err(e, "open import_tombstones_by_provider"))?;
+            let mut by_session = wtx
+                .open_table(IMPORT_TOMBSTONES_BY_SESSION_TABLE)
+                .map_err(|e| map_redb_table_err(e, "open import_tombstones_by_session"))?;
+
+            let existing_self = tbl
+                .get(rec.tombstone_id.as_str())
+                .map_err(|e| map_redb_storage_err(e, "read existing import tombstone"))?
+                .map(|g| dec::<AgentImportTombstoneRecord>(g.value()))
+                .transpose()?;
+
+            let provider_key = (rec.agent_kind.as_str(), rec.provider_session_id.as_str());
+            if let Some(owner_raw) = by_provider
+                .get(provider_key)
+                .map_err(|e| map_redb_storage_err(e, "lookup import_tombstones_by_provider"))?
             {
-                let (k, v) =
-                    entry.map_err(|e| map_redb_storage_err(e, "iter agent_import_tombstone"))?;
-                if k.value() == rec.tombstone_id {
-                    continue;
-                }
-                let row: AgentImportTombstoneRecord = dec(v.value())?;
-                if row.erased_session_id == rec.erased_session_id
-                    || (row.agent_kind == rec.agent_kind
-                        && row.provider_session_id == rec.provider_session_id)
-                {
+                let owner: TombstoneIndexEntry = dec(owner_raw.value())?;
+                if owner.tombstone_id != rec.tombstone_id {
                     return Err(StorageBackendError::BackendInternal {
                         detail: "agent_import_tombstone unique constraint violated".to_string(),
                     });
                 }
             }
+            if let Some(owner_raw) = by_session
+                .get(rec.erased_session_id.as_str())
+                .map_err(|e| map_redb_storage_err(e, "lookup import_tombstones_by_session"))?
+            {
+                let owner: TombstoneIndexEntry = dec(owner_raw.value())?;
+                if owner.tombstone_id != rec.tombstone_id {
+                    return Err(StorageBackendError::BackendInternal {
+                        detail: "agent_import_tombstone unique constraint violated".to_string(),
+                    });
+                }
+            }
+
+            if let Some(old) = existing_self {
+                if old.agent_kind != rec.agent_kind
+                    || old.provider_session_id != rec.provider_session_id
+                {
+                    by_provider
+                        .remove((old.agent_kind.as_str(), old.provider_session_id.as_str()))
+                        .map_err(|e| {
+                            map_redb_storage_err(e, "prune stale import_tombstones_by_provider")
+                        })?;
+                }
+                if old.erased_session_id != rec.erased_session_id {
+                    by_session
+                        .remove(old.erased_session_id.as_str())
+                        .map_err(|e| {
+                            map_redb_storage_err(e, "prune stale import_tombstones_by_session")
+                        })?;
+                }
+            }
+
             let bytes = enc(&rec)?;
             tbl.insert(rec.tombstone_id.as_str(), bytes.as_slice())
                 .map_err(|e| map_redb_storage_err(e, "insert agent_import_tombstone"))?;
+            let idx_bytes = enc(&TombstoneIndexEntry {
+                tombstone_id: rec.tombstone_id.clone(),
+            })?;
+            by_provider
+                .insert(provider_key, idx_bytes.as_slice())
+                .map_err(|e| map_redb_storage_err(e, "insert import_tombstones_by_provider"))?;
+            by_session
+                .insert(rec.erased_session_id.as_str(), idx_bytes.as_slice())
+                .map_err(|e| map_redb_storage_err(e, "insert import_tombstones_by_session"))?;
             Ok(())
         })
         .await

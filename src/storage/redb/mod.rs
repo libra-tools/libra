@@ -11,6 +11,32 @@ pub mod config_store;
 
 pub use config_store::RedbConfigStore;
 
+pub use crate::storage::capture_store::RedbCaptureStore;
+
+/// Construct a sanitized fail-closed error when `agent_import_tombstone`
+/// blocks re-importing a previously erased session or checkpoint (`RB-06c`).
+///
+/// Deliberately omits raw provider session IDs and paths (`GC-RB-03` / `ER-11`).
+pub(crate) fn map_tombstone_protected_err(entity: &'static str) -> StorageBackendError {
+    StorageBackendError::BackendInternal {
+        detail: format!(
+            "{}: {entity} is protected by an erasure tombstone",
+            crate::storage::capture_store::CAPTURE_TOMBSTONE_ERROR_PREFIX
+        ),
+    }
+}
+
+/// Construct a sanitized fail-closed error when an overwrite or delete is
+/// attempted against an append-only capture audit table (`RB-06c`).
+pub(crate) fn map_append_only_err(table: &'static str, op: &'static str) -> StorageBackendError {
+    StorageBackendError::BackendInternal {
+        detail: format!(
+            "{}: {op} is not permitted on {table}",
+            crate::storage::capture_store::CAPTURE_APPEND_ONLY_ERROR_PREFIX
+        ),
+    }
+}
+
 /// Map a `redb::StorageError` to a sanitized [`StorageBackendError`] without
 /// echoing raw paths or secret values (`GC-RB-03` / `ER-11`).
 pub(crate) fn map_redb_storage_err(
