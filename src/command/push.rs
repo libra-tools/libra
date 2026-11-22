@@ -310,8 +310,8 @@ pub enum PushError {
     },
 
     #[error(
-        "cannot push to '{remote_ref}': stale info — the lease expects {expected}, \
-         but the remote ref is {found}"
+        "cannot push to '{remote_ref}': non-fast-forward update (stale info — the lease \
+         expects {expected}, but the remote ref is {found})"
     )]
     StaleLease {
         remote_ref: String,
