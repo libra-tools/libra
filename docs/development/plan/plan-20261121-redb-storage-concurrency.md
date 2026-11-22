@@ -1534,7 +1534,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `done` / `remote-pending`（`v0.30.311`；Codex R1 `PASS`；覆盖 `SystemConfig` `0444`/`0644` 墓碑预占、并发首写串行化、旧二进制胜出零覆写与 `SQLITE_NOTADB` 阻断）
+**Lifecycle / Acceptance:** `done` / `remote-verified`（`e5f2777` / `v0.30.311`；Codex R1 `PASS`；覆盖 `SystemConfig` `0444`/`0644` 墓碑预占、并发首写串行化、旧二进制胜出零覆写与 `SQLITE_NOTADB` 阻断）
 
 **Description:** 100% 在独占目录 `src/storage/**` 内落实 `SystemConfig` 作用域（隔离 `LIBRA_CONFIG_SYSTEM_DB`）的 `ADR-RB-02` #2 Step F1 首次建库 `0444` 哨兵 `hard_link` 预占与 `0644` `config.redb` 权限姿态，逐项实测系统域并发首写竞态、不持锁旧写者胜出零覆写与墓碑预占后旧二进制阻断。
 
@@ -1591,7 +1591,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `remote-pending`（`v0.30.312`；Codex R1–R4 全项发现含 Windows 恢复刷盘与回归测试已全部闭环，按用户授权免第五轮复跑直接落地 Stage 2）
 
 **Description:** 100% 在独占目录 `src/storage/**` 内落实 `ADR-RB-02` #2 的首次 `Redb` 配置建库 4 步可恢复状态机（Step F1 `hard_link` 预占墓碑 → Step F2 发布 `config-format.json(finalized=false, init_phase="fresh_create", legacy_sqlite_tombstone=true, targets_staged_for_rename=false)` → Step F3 `config.redb.tmp` + `targets_staged_for_rename=true` + `rename` → Step F4 `finalized=true`），并在 `GlobalConfig` 作用域逐边界实测 3 处崩溃幂等恢复。
 
@@ -1606,16 +1606,16 @@
 | 若首次建库在创建 `config.redb` 与发布清单/墓碑之间崩溃且无持久化 `init_phase="fresh_create"` 状态，重启将落入误报损坏或放行缺墓碑孤立红库的死角 | `ADR-RB-02` #2 Step F1–F4 |
 
 **Acceptance criteria:**
-- [ ] 首次 `Redb` 配置建库在持 `LOCK_EX` 下严格按 Step F1 → Step F2 → Step F3 → Step F4 顺序落盘并完成 `fsync_dir`。
-- [ ] **`GlobalConfig` 边界 1 崩溃（Step F1 `hard_link` 后、Step F2 清单落盘前）：** 后续 `Redb` 写者识别精确哨兵 `config.db`，幂等收敛至 `0600` `config.redb` + `finalized = true`。
-- [ ] **`GlobalConfig` 边界 2 崩溃（Step F2 `init_phase="fresh_create", finalized=false, targets_staged_for_rename=false`）：** 后续 `Redb` 写者清理残 `.tmp` 并幂等收敛至 `finalized = true`。
-- [ ] **`GlobalConfig` 边界 3 崩溃（Step F3 `targets_staged_for_rename=true` 且 `config.redb` 已就位、`finalized=true` 未落盘）：** 续跑零覆写保留已有 `config.redb` 全部键值并晋升 `finalized = true`。
+- [x] 首次 `Redb` 配置建库在持 `LOCK_EX` 下严格按 Step F1 → Step F2 → Step F3 → Step F4 顺序落盘并完成 `fsync_dir`。
+- [x] **`GlobalConfig` 边界 1 崩溃（Step F1 `hard_link` 后、Step F2 清单落盘前）：** 后续 `Redb` 写者识别精确哨兵 `config.db`，幂等收敛至 `0600` `config.redb` + `finalized = true`。
+- [x] **`GlobalConfig` 边界 2 崩溃（Step F2 `init_phase="fresh_create", finalized=false, targets_staged_for_rename=false`）：** 后续 `Redb` 写者清理残 `.tmp` 并幂等收敛至 `finalized = true`。
+- [x] **`GlobalConfig` 边界 3 崩溃（Step F3 `targets_staged_for_rename=true` 且 `config.redb` 已就位、`finalized=true` 未落盘）：** 续跑零覆写保留已有 `config.redb` 全部键值并晋升 `finalized = true`。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::config_store::tests::config_fresh_create_4step_state_machine_order_and_fsync) | test(=storage::config_store::tests::global_config_fresh_create_crash_boundaries_1_2_3)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::config_store::tests::config_fresh_create_4step_state_machine_order_and_fsync)'`（new，覆盖 AC1）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::config_store::tests::global_config_fresh_create_crash_boundaries_1_2_3)'`（new，覆盖 AC2–AC4）
-- [ ] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 6 文件实现白名单。
+- [x] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::config_store::tests::config_fresh_create_4step_state_machine_order_and_fsync) | test(=storage::config_store::tests::global_config_fresh_create_crash_boundaries_1_2_3)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::config_store::tests::config_fresh_create_4step_state_machine_order_and_fsync)'`（new，覆盖 AC1）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::config_store::tests::global_config_fresh_create_crash_boundaries_1_2_3)'`（new，覆盖 AC2–AC4）
+- [x] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 6 文件实现白名单。
 
 **Full-suite trigger:** `none`
 

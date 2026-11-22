@@ -327,13 +327,23 @@ impl ConfigFormatManifest {
                             .to_string(),
                 });
             }
-        } else if self.init_phase == Some(ConfigInitPhase::FreshCreate)
-            && !self.legacy_sqlite_tombstone
-        {
-            return Err(StorageBackendError::BackendInternal {
-                detail: "fresh_create config-format.json must set legacy_sqlite_tombstone=true"
-                    .to_string(),
-            });
+        } else if self.init_phase == Some(ConfigInitPhase::FreshCreate) {
+            if !self.legacy_sqlite_tombstone {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: "fresh_create config-format.json must set legacy_sqlite_tombstone=true"
+                        .to_string(),
+                });
+            }
+            if self.source_db_state.is_some()
+                || self.backup_sha256.is_some()
+                || self.source_logical_sha256.is_some()
+            {
+                return Err(StorageBackendError::BackendInternal {
+                    detail:
+                        "fresh_create config-format.json must not carry migration-only source_db_state or backup/logical digests"
+                            .to_string(),
+                });
+            }
         }
 
         for (field, val) in [
@@ -442,6 +452,16 @@ impl Drop for ConfigManifestTempGuard {
     }
 }
 
+#[cfg(test)]
+static CONFIG_SCOPE_FSYNC_DIR_COUNT: AtomicU64 = AtomicU64::new(0);
+
+fn fsync_config_scope_dir(scope_dir: &Path) -> StorageResult<()> {
+    fsync_dir(scope_dir)?;
+    #[cfg(test)]
+    CONFIG_SCOPE_FSYNC_DIR_COUNT.fetch_add(1, Ordering::SeqCst);
+    Ok(())
+}
+
 /// Atomically publish `<scope_dir>/config-format.json` via `.tmp` (`O_CREAT | O_EXCL`)
 /// → role permission mode → `sync_all()` → atomic rename → `fsync_dir(scope_dir)`.
 pub fn publish_config_format_manifest(
@@ -545,7 +565,7 @@ pub fn publish_config_format_manifest(
 
     durable_atomic_rename_config_manifest(&tmp_path, &final_path)?;
     guard.0 = None;
-    fsync_dir(scope_dir)?;
+    fsync_config_scope_dir(scope_dir)?;
     Ok(final_path)
 }
 
@@ -2090,6 +2110,20 @@ fn reserve_config_sqlite_tombstone_hard_link_with_ops(
             cleanup.0 = None;
             #[cfg(windows)]
             {
+                // Flush the newly linked `config.db` via its published path
+                // BEFORE marking readonly so NTFS commits the link & metadata
+                // durably prior to Step F2 `config-format.json`.
+                let linked = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&sqlite_path)
+                    .map_err(|err| {
+                        StorageBackendError::io("open linked config.db tombstone for flush", err)
+                    })?;
+                linked.sync_all().map_err(|err| {
+                    StorageBackendError::io("flush linked config.db tombstone", err)
+                })?;
+                drop(linked);
                 let mut perms = fs::metadata(&sqlite_path)
                     .map_err(|err| StorageBackendError::io("stat config.db tombstone", err))?
                     .permissions();
@@ -2098,7 +2132,7 @@ fn reserve_config_sqlite_tombstone_hard_link_with_ops(
                     StorageBackendError::io("set readonly on config.db tombstone", err)
                 })?;
             }
-            fsync_dir(scope_dir)?;
+            fsync_config_scope_dir(scope_dir)?;
             Ok(TombstoneReserveOutcome::Reserved)
         }
         Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
@@ -2167,39 +2201,398 @@ fn ensure_scope_dir_exists_for_write(scope_dir: &Path, role: DatabaseRole) -> St
 }
 
 #[cfg(feature = "storage-redb")]
-fn fresh_create_redb_config_scope_under_ex_lock<FBeforeLink, FAfterReserve>(
-    scope_dir: &Path,
-    role: DatabaseRole,
-    before_hard_link: FBeforeLink,
-    after_tombstone_before_redb: FAfterReserve,
-) -> StorageResult<Arc<dyn ConfigStore>>
-where
-    FBeforeLink: FnOnce(),
-    FAfterReserve: FnOnce(&Path),
-{
-    let redb_path = config_redb_path_in_scope_dir(scope_dir);
-    let redb_tmp_path = scope_dir.join(format!("{CONFIG_REDB_FILE_NAME}.tmp"));
+#[cfg(feature = "storage-redb")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FreshCreateEntry {
+    /// Clean empty scope directory: run Step F1 -> Step F2 -> Step F3 -> Step F4.
+    FreshEmpty,
+    /// Boundary 1 crash (after Step F1 `hard_link`, before Step F2 manifest):
+    /// skip Step F1, clean leftover `.tmp`, and advance Step F2 -> F3 -> F4.
+    Boundary1AfterHardLink,
+    /// Boundary 2 crash (after Step F2 `init_phase="fresh_create", finalized=false,
+    /// targets_staged_for_rename=false`, before Step F3 `rename`): clean leftover
+    /// `.tmp` and advance Step F3 -> Step F4.
+    Boundary2AfterStepF2 { generation: u64 },
+    /// Boundary 3 crash (after Step F3 `targets_staged_for_rename=true`, before
+    /// Step F4 `finalized=true`): preserve existing `config.redb` zero-overwrite
+    /// (or promote valid `config.redb.tmp`), clean stale `.tmp`, and advance Step F4.
+    Boundary3AfterTargetsStaged { generation: u64 },
+}
 
-    // Step F1: Reserve `config.db` sentinel BEFORE creating `config.redb`.
-    before_hard_link();
-    match reserve_config_sqlite_tombstone_hard_link(scope_dir, role)? {
-        TombstoneReserveOutcome::Reserved => {}
-        TombstoneReserveOutcome::AlreadyExists => {
-            return Err(StorageBackendError::BackendMismatch {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) enum FreshCreateStep {
+    StepF1HardLinkTombstone,
+    StepF2PublishFreshCreateManifest,
+    StepF3StageRedbTmp,
+    StepF3MarkTargetsStaged,
+    StepF3RenameRedbAndFsyncDir,
+    StepF4PublishFinalizedManifest,
+}
+
+#[cfg(feature = "storage-redb")]
+fn flush_boundary1_tombstone_link_durably(
+    scope_dir: &Path,
+    sqlite_path: &Path,
+) -> StorageResult<()> {
+    #[cfg(windows)]
+    {
+        let meta = fs::metadata(sqlite_path)
+            .map_err(|err| StorageBackendError::io("stat Boundary 1 config.db tombstone", err))?;
+        if !meta.permissions().readonly() {
+            // Crash occurred after `hard_link` and before `sync_all()` +
+            // `set_readonly(true)`: flush the linked path to disk BEFORE
+            // marking readonly and before Step F2 publishes `config-format.json`.
+            let linked = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(sqlite_path)
+                .map_err(|err| {
+                    StorageBackendError::io("open Boundary 1 config.db tombstone for flush", err)
+                })?;
+            linked.sync_all().map_err(|err| {
+                StorageBackendError::io("flush Boundary 1 config.db tombstone", err)
+            })?;
+            drop(linked);
+            let mut perms = meta.permissions();
+            perms.set_readonly(true);
+            fs::set_permissions(sqlite_path, perms).map_err(|err| {
+                StorageBackendError::io("set readonly on Boundary 1 config.db tombstone", err)
+            })?;
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = sqlite_path;
+    // Always flush the parent directory before Step F2 in case the original
+    // crash occurred after `hard_link` / `unlink(.tmp)` and before `fsync_dir`.
+    fsync_config_scope_dir(scope_dir)?;
+    Ok(())
+}
+
+#[cfg(feature = "storage-redb")]
+fn verify_fresh_create_sentinel_tombstone(
+    sqlite_path: &Path,
+    role: DatabaseRole,
+    allow_windows_unset_readonly: bool,
+) -> StorageResult<()> {
+    let meta = match fs::symlink_metadata(sqlite_path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            return Err(StorageBackendError::BackendInternal {
                 detail: format!(
-                    "{role} legacy config.db already exists (created concurrently by a legacy binary); refusing to create config.redb — run `libra-migrate`"
+                    "{role} fresh_create recovery requires sentinel config.db tombstone, but it is missing"
+                ),
+            });
+        }
+        Err(err) => {
+            return Err(StorageBackendError::io(
+                "stat config.db sentinel during fresh_create recovery",
+                err,
+            ));
+        }
+    };
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "{role} config.db sentinel must be a regular file during fresh_create recovery"
+            ),
+        });
+    }
+    if !is_config_sqlite_tombstone_sentinel(sqlite_path)? {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "{role} config.db does not contain exact fresh_create sentinel bytes; refusing recovery"
+            ),
+        });
+    }
+
+    #[cfg(unix)]
+    {
+        let _ = allow_windows_unset_readonly;
+        use std::os::unix::fs::PermissionsExt;
+        let expected_mode = expected_config_tombstone_mode(role).ok_or_else(|| {
+            StorageBackendError::BackendInternal {
+                detail: format!("{role} has no defined config.db tombstone mode"),
+            }
+        })?;
+        let actual_mode = meta.permissions().mode() & 0o777;
+        if actual_mode != expected_mode {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "{role} config.db sentinel has mode {actual_mode:04o}, expected exact {expected_mode:04o}"
                 ),
             });
         }
     }
-    after_tombstone_before_redb(scope_dir);
+    #[cfg(not(unix))]
+    {
+        if !meta.permissions().readonly() && !allow_windows_unset_readonly {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "{role} config.db sentinel must have readonly attribute set during fresh_create recovery"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
 
-    // Step F2: Persist `init_phase="fresh_create", finalized=false, targets_staged_for_rename=false`.
-    let step_f2_manifest = ConfigFormatManifest::new_redb_fresh_create(1, false, role)?;
-    publish_config_format_manifest(scope_dir, role, &step_f2_manifest)?;
+#[cfg(feature = "storage-redb")]
+fn cleanup_stale_fresh_create_temps(scope_dir: &Path) -> StorageResult<bool> {
+    let mut removed_any = false;
+    let entries = fs::read_dir(scope_dir)
+        .map_err(|err| StorageBackendError::io("scan config scope dir for stale temps", err))?;
+    for entry in entries {
+        let entry =
+            entry.map_err(|err| StorageBackendError::io("read config scope dir entry", err))?;
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        let is_managed_tmp = name_str == format!("{CONFIG_REDB_FILE_NAME}.tmp")
+            || (name_str.starts_with("config.db.tombstone.") && name_str.ends_with(".tmp"))
+            || (name_str.starts_with("config-format.json.") && name_str.ends_with(".tmp"));
+        if !is_managed_tmp {
+            continue;
+        }
+        let path = entry.path();
+        let meta = fs::symlink_metadata(&path)
+            .map_err(|err| StorageBackendError::io("stat stale fresh_create temp file", err))?;
+        if meta.file_type().is_symlink() || !meta.is_file() {
+            return Err(StorageBackendError::BackendInternal {
+                detail: "refusing to remove non-regular temp entry during fresh_create recovery"
+                    .to_string(),
+            });
+        }
+        #[cfg(windows)]
+        if meta.permissions().readonly() {
+            let mut perms = meta.permissions();
+            perms.set_readonly(false);
+            let _ = fs::set_permissions(&path, perms);
+        }
+        fs::remove_file(&path)
+            .map_err(|err| StorageBackendError::io("remove stale fresh_create temp file", err))?;
+        removed_any = true;
+    }
+    if removed_any {
+        fsync_dir(scope_dir)?;
+    }
+    Ok(removed_any)
+}
 
-    // Step F3: Stage `config.redb.tmp` (with exact role mode `0600`/`0644`),
-    // publish `targets_staged_for_rename=true`, and atomically rename to `config.redb`.
+#[cfg(feature = "storage-redb")]
+fn classify_redb_fresh_create_recovery(
+    scope_dir: &Path,
+    role: DatabaseRole,
+) -> StorageResult<Option<FreshCreateEntry>> {
+    let sqlite_path = config_sqlite_path_in_scope_dir(scope_dir);
+    let redb_path = config_redb_path_in_scope_dir(scope_dir);
+
+    if let Some(manifest) = read_config_format_manifest(scope_dir, role)? {
+        if !manifest.finalized
+            && manifest.backend == StorageBackendKind::Redb
+            && manifest.init_phase == Some(ConfigInitPhase::FreshCreate)
+        {
+            if !manifest.legacy_sqlite_tombstone {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: "fresh_create manifest missing legacy_sqlite_tombstone=true"
+                        .to_string(),
+                });
+            }
+            // Allow Windows non-readonly exact 31B sentinel during classification
+            // (in case a prior Windows recovery crashed between unlinking a
+            // hard-linked `.tmp` alias and restoring `readonly=true`); recovery
+            // immediately flushes, restores `readonly=true`, and strictly
+            // verifies under `LOCK_EX` before advancing.
+            verify_fresh_create_sentinel_tombstone(&sqlite_path, role, true)?;
+            let has_redb = probe_regular_scope_file(&redb_path, "config.redb")?;
+            if !manifest.targets_staged_for_rename {
+                if has_redb {
+                    return Err(StorageBackendError::BackendInternal {
+                        detail: format!(
+                            "{role} config.redb exists while fresh_create targets_staged_for_rename=false"
+                        ),
+                    });
+                }
+                return Ok(Some(FreshCreateEntry::Boundary2AfterStepF2 {
+                    generation: manifest.generation,
+                }));
+            }
+            return Ok(Some(FreshCreateEntry::Boundary3AfterTargetsStaged {
+                generation: manifest.generation,
+            }));
+        }
+        return Ok(None);
+    }
+
+    // No `config-format.json`: detect Boundary 1 (crashed right after Step F1 `hard_link`).
+    let has_sqlite = probe_regular_scope_file(&sqlite_path, "config.db")?;
+    let has_redb = probe_regular_scope_file(&redb_path, "config.redb")?;
+    if has_sqlite && !has_redb && is_config_sqlite_tombstone_sentinel(&sqlite_path)? {
+        verify_fresh_create_sentinel_tombstone(&sqlite_path, role, true)?;
+        return Ok(Some(FreshCreateEntry::Boundary1AfterHardLink));
+    }
+
+    Ok(None)
+}
+
+#[cfg(feature = "storage-redb")]
+fn fresh_create_or_recover_redb_config_scope_under_ex_lock<
+    FBeforeLink,
+    FAfterReserve,
+    FStepObserver,
+>(
+    scope_dir: &Path,
+    role: DatabaseRole,
+    entry: FreshCreateEntry,
+    before_hard_link: FBeforeLink,
+    after_tombstone_before_redb: FAfterReserve,
+    mut on_step: FStepObserver,
+) -> StorageResult<Arc<dyn ConfigStore>>
+where
+    FBeforeLink: FnOnce(),
+    FAfterReserve: FnOnce(&Path),
+    FStepObserver: FnMut(FreshCreateStep, &Path),
+{
+    let redb_path = config_redb_path_in_scope_dir(scope_dir);
+    let redb_tmp_path = scope_dir.join(format!("{CONFIG_REDB_FILE_NAME}.tmp"));
+    let generation = match entry {
+        FreshCreateEntry::FreshEmpty | FreshCreateEntry::Boundary1AfterHardLink => 1,
+        FreshCreateEntry::Boundary2AfterStepF2 { generation }
+        | FreshCreateEntry::Boundary3AfterTargetsStaged { generation } => generation,
+    };
+
+    // -----------------------------------------------------------------
+    // Boundary 3 recovery (`targets_staged_for_rename = true`, before Step F4):
+    // NEVER overwrite an already-published valid `config.redb`.
+    // -----------------------------------------------------------------
+    if matches!(entry, FreshCreateEntry::Boundary3AfterTargetsStaged { .. }) {
+        let has_redb = probe_regular_scope_file(&redb_path, "config.redb")?;
+        if has_redb {
+            // Verify the already-published `config.redb` is valid and has exact role mode.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let expected_mode = expected_config_file_mode(role).ok_or_else(|| {
+                    StorageBackendError::BackendInternal {
+                        detail: format!("{role} has no defined config.redb mode"),
+                    }
+                })?;
+                let actual_mode = fs::symlink_metadata(&redb_path)
+                    .map_err(|err| StorageBackendError::io("stat recovered config.redb", err))?
+                    .permissions()
+                    .mode()
+                    & 0o777;
+                if actual_mode != expected_mode {
+                    fs::set_permissions(&redb_path, fs::Permissions::from_mode(expected_mode))
+                        .map_err(|err| {
+                            StorageBackendError::io("chmod recovered config.redb to role mode", err)
+                        })?;
+                }
+            }
+            let store = crate::storage::redb::RedbConfigStore::open_read_write(&redb_path, role)?;
+            // Clean any obsolete `.tmp` residue, restore/flush sentinel readonly
+            // if a Windows temp alias was cleared, and verify sentinel strictly.
+            cleanup_stale_fresh_create_temps(scope_dir)?;
+            let sqlite_path = config_sqlite_path_in_scope_dir(scope_dir);
+            flush_boundary1_tombstone_link_durably(scope_dir, &sqlite_path)?;
+            verify_fresh_create_sentinel_tombstone(&sqlite_path, role, false)?;
+            let step_f4_manifest =
+                ConfigFormatManifest::new_redb_finalized(generation, true, role)?;
+            publish_config_format_manifest(scope_dir, role, &step_f4_manifest)?;
+            on_step(FreshCreateStep::StepF4PublishFinalizedManifest, scope_dir);
+            return Ok(Arc::new(store));
+        }
+
+        // Sub-case 3b: `targets_staged_for_rename=true` but `config.redb` is still absent.
+        // If `config.redb.tmp` exists, verify it cleanly and fail closed (retaining
+        // `config.redb.tmp` untouched) on any open/validation error rather than
+        // silently discarding staged data; only re-stage when `config.redb.tmp` is
+        // genuinely absent.
+        let sqlite_path = config_sqlite_path_in_scope_dir(scope_dir);
+        let has_staged_tmp = probe_regular_scope_file(&redb_tmp_path, "config.redb.tmp")?;
+        if has_staged_tmp {
+            let verified =
+                crate::storage::redb::RedbConfigStore::open_read_only(&redb_tmp_path, role)?;
+            drop(verified);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let expected_mode = expected_config_file_mode(role).ok_or_else(|| {
+                    StorageBackendError::BackendInternal {
+                        detail: format!("{role} has no defined config.redb mode"),
+                    }
+                })?;
+                fs::set_permissions(&redb_tmp_path, fs::Permissions::from_mode(expected_mode))
+                    .map_err(|err| StorageBackendError::io("chmod staged config.redb.tmp", err))?;
+            }
+        } else {
+            cleanup_stale_fresh_create_temps(scope_dir)?;
+            flush_boundary1_tombstone_link_durably(scope_dir, &sqlite_path)?;
+            verify_fresh_create_sentinel_tombstone(&sqlite_path, role, false)?;
+            let staged = crate::storage::redb::RedbConfigStore::create(&redb_tmp_path, role)?;
+            drop(staged);
+            on_step(FreshCreateStep::StepF3StageRedbTmp, scope_dir);
+        }
+
+        durable_atomic_rename_config_manifest(&redb_tmp_path, &redb_path)?;
+        fsync_config_scope_dir(scope_dir)?;
+        on_step(FreshCreateStep::StepF3RenameRedbAndFsyncDir, scope_dir);
+        cleanup_stale_fresh_create_temps(scope_dir)?;
+        flush_boundary1_tombstone_link_durably(scope_dir, &sqlite_path)?;
+        verify_fresh_create_sentinel_tombstone(&sqlite_path, role, false)?;
+
+        let step_f4_manifest = ConfigFormatManifest::new_redb_finalized(generation, true, role)?;
+        publish_config_format_manifest(scope_dir, role, &step_f4_manifest)?;
+        on_step(FreshCreateStep::StepF4PublishFinalizedManifest, scope_dir);
+
+        let store = crate::storage::redb::RedbConfigStore::open_read_write(&redb_path, role)?;
+        return Ok(Arc::new(store));
+    }
+
+    // -----------------------------------------------------------------
+    // Step F1 (FreshEmpty only; Boundary 1 & 2 already have verified sentinel).
+    // -----------------------------------------------------------------
+    let sqlite_path = config_sqlite_path_in_scope_dir(scope_dir);
+    if matches!(entry, FreshCreateEntry::FreshEmpty) {
+        before_hard_link();
+        match reserve_config_sqlite_tombstone_hard_link(scope_dir, role)? {
+            TombstoneReserveOutcome::Reserved => {}
+            TombstoneReserveOutcome::AlreadyExists => {
+                return Err(StorageBackendError::BackendMismatch {
+                    detail: format!(
+                        "{role} legacy config.db already exists (created concurrently by a legacy binary); refusing to create config.redb — run `libra-migrate`"
+                    ),
+                });
+            }
+        }
+        after_tombstone_before_redb(scope_dir);
+        on_step(FreshCreateStep::StepF1HardLinkTombstone, scope_dir);
+    } else {
+        // Boundary 1 or Boundary 2 recovery: clean leftover `.tmp` residue,
+        // flush the tombstone link durably before Step F2 (in case the crash
+        // interrupted Step F1 between `hard_link` and its flush), and re-verify
+        // the sentinel tombstone readonly attribute before advancing.
+        cleanup_stale_fresh_create_temps(scope_dir)?;
+        flush_boundary1_tombstone_link_durably(scope_dir, &sqlite_path)?;
+        verify_fresh_create_sentinel_tombstone(&sqlite_path, role, false)?;
+    }
+
+    // -----------------------------------------------------------------
+    // Step F2 (FreshEmpty & Boundary 1; Boundary 2 already has Step F2 manifest).
+    // -----------------------------------------------------------------
+    if matches!(
+        entry,
+        FreshCreateEntry::FreshEmpty | FreshCreateEntry::Boundary1AfterHardLink
+    ) {
+        let step_f2_manifest =
+            ConfigFormatManifest::new_redb_fresh_create(generation, false, role)?;
+        publish_config_format_manifest(scope_dir, role, &step_f2_manifest)?;
+        on_step(FreshCreateStep::StepF2PublishFreshCreateManifest, scope_dir);
+    }
+
+    // -----------------------------------------------------------------
+    // Step F3: Stage `config.redb.tmp` (exact `0600`/`0644`), publish
+    // `targets_staged_for_rename=true` + `fsync_dir`, atomic rename + `fsync_dir`.
+    // -----------------------------------------------------------------
     if let Ok(meta) = fs::symlink_metadata(&redb_tmp_path) {
         if meta.file_type().is_symlink() || !meta.is_file() {
             return Err(StorageBackendError::BackendInternal {
@@ -2219,16 +2612,22 @@ where
         let staged = crate::storage::redb::RedbConfigStore::create(&redb_tmp_path, role)?;
         drop(staged);
     }
+    on_step(FreshCreateStep::StepF3StageRedbTmp, scope_dir);
 
-    let step_f3_manifest = ConfigFormatManifest::new_redb_fresh_create(1, true, role)?;
+    let step_f3_manifest = ConfigFormatManifest::new_redb_fresh_create(generation, true, role)?;
     publish_config_format_manifest(scope_dir, role, &step_f3_manifest)?;
+    on_step(FreshCreateStep::StepF3MarkTargetsStaged, scope_dir);
 
     durable_atomic_rename_config_manifest(&redb_tmp_path, &redb_path)?;
-    fsync_dir(scope_dir)?;
+    fsync_config_scope_dir(scope_dir)?;
+    on_step(FreshCreateStep::StepF3RenameRedbAndFsyncDir, scope_dir);
 
+    // -----------------------------------------------------------------
     // Step F4: Publish terminal `finalized=true, init_phase=null, legacy_sqlite_tombstone=true`.
-    let step_f4_manifest = ConfigFormatManifest::new_redb_finalized(1, true, role)?;
+    // -----------------------------------------------------------------
+    let step_f4_manifest = ConfigFormatManifest::new_redb_finalized(generation, true, role)?;
     publish_config_format_manifest(scope_dir, role, &step_f4_manifest)?;
+    on_step(FreshCreateStep::StepF4PublishFinalizedManifest, scope_dir);
 
     let store = crate::storage::redb::RedbConfigStore::open_read_write(&redb_path, role)?;
     Ok(Arc::new(store))
@@ -2236,16 +2635,16 @@ where
 
 /// Open or initialize a `GlobalConfig` or `SystemConfig` scope for writing
 /// under `ADR-RB-02` #2's double-checked bounded locking and Step F1–F4
-/// protocol (`RB-03d`/`RB-03f`/`RB-03e`/`RB-03c`/`RB-03g`).
+/// protocol (`RB-03d`/`RB-03f`/`RB-03e`/`RB-03i`/`RB-03c`/`RB-03g`).
 ///
 /// - Steady-state finalized scope matching `runtime_backend`: acquires bounded
 ///   `LOCK_SH` so same-backend writers execute concurrently while mutually
 ///   excluding `LOCK_EX` migrations.
-/// - Missing `config-format.json` (empty dir or unmanifested legacy store):
-///   acquires bounded `LOCK_EX`, re-validates on-disk state under `LOCK_EX`,
-///   and serializes first-write creation so competing `Sqlite` and `Redb`
-///   writers produce exactly one single-authority scope (`LBR-CLI-003` for the
-///   non-authoritative runtime).
+/// - Missing `config-format.json` (empty dir or unmanifested legacy store) or
+///   unfinalized `init_phase="fresh_create"`: acquires bounded `LOCK_EX`,
+///   re-validates on-disk state under `LOCK_EX`, serializes first-write
+///   creation, and for `Redb` writers idempotently recovers all 3 fresh-create
+///   crash boundaries (`ADR-RB-02` #2 Step F1–F4).
 /// - For fresh `Redb` creation in an empty directory, Step F1 atomically
 ///   reserves `config.db` via non-overwriting `hard_link` BEFORE creating
 ///   `config.redb`, yielding cleanly (`LBR-CLI-003`) to any un-locked legacy
@@ -2264,14 +2663,17 @@ pub async fn open_or_create_locked_config_scope_for_write(
         || {},
         |_| {},
         || {},
+        |_, _| {},
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn open_or_create_locked_config_scope_for_write_with_hooks<
     FBeforeLink,
     FAfterReserve,
     FBeforeSqliteManifest,
+    FStepObserver,
 >(
     scope_dir: &Path,
     role: DatabaseRole,
@@ -2280,11 +2682,13 @@ async fn open_or_create_locked_config_scope_for_write_with_hooks<
     before_hard_link: FBeforeLink,
     after_tombstone_before_redb: FAfterReserve,
     before_sqlite_manifest: FBeforeSqliteManifest,
+    on_step: FStepObserver,
 ) -> StorageResult<LockedConfigScope>
 where
     FBeforeLink: FnOnce() + Send + 'static,
     FAfterReserve: FnOnce(&Path) + Send + 'static,
     FBeforeSqliteManifest: FnOnce() + Send + 'static,
+    FStepObserver: FnMut(FreshCreateStep, &Path) + Send + 'static,
 {
     validate_config_scope_role(role)?;
 
@@ -2315,6 +2719,8 @@ where
         },
         FreshCreateUnderExclusive {
             lock: ConfigScopeLock,
+            #[cfg(feature = "storage-redb")]
+            redb_entry: FreshCreateEntry,
         },
     }
 
@@ -2322,7 +2728,7 @@ where
         ensure_scope_dir_exists_for_write(&dir_owned, role)?;
 
         // Peek `config-format.json` to decide whether steady-state `LOCK_SH`
-        // suffices or first-write/unmanifested `LOCK_EX` serialization is needed.
+        // suffices or first-write/unmanifested/recovery `LOCK_EX` serialization is needed.
         if let Some(peek) = read_config_format_manifest(&dir_owned, role)?
             && peek.finalized
         {
@@ -2337,9 +2743,23 @@ where
 
         // First-write / missing manifest / unfinalized state: serialize strictly under `LOCK_EX`.
         let lock = ConfigScopeLock::try_lock_exclusive_bounded(&dir_owned, role, lock_deadline)?;
+
+        // Dedicated `RB-03e`/`RB-03i` recovery path: ONLY `Redb` writers holding
+        // `LOCK_EX` may recover interrupted `fresh_create` Boundaries 1, 2, or 3.
+        #[cfg(feature = "storage-redb")]
+        if runtime_backend == StorageBackendKind::Redb
+            && let Some(redb_entry) = classify_redb_fresh_create_recovery(&dir_owned, role)?
+        {
+            return Ok(LockPlan::FreshCreateUnderExclusive { lock, redb_entry });
+        }
+
         let authority = inspect_config_scope_authority(&dir_owned, role)?;
         match authority {
-            ConfigScopeAuthority::Empty => Ok(LockPlan::FreshCreateUnderExclusive { lock }),
+            ConfigScopeAuthority::Empty => Ok(LockPlan::FreshCreateUnderExclusive {
+                lock,
+                #[cfg(feature = "storage-redb")]
+                redb_entry: FreshCreateEntry::FreshEmpty,
+            }),
             other => Ok(LockPlan::Existing {
                 lock,
                 authority: other,
@@ -2415,10 +2835,17 @@ where
                     .to_string(),
             }),
         },
-        LockPlan::FreshCreateUnderExclusive { lock } => match runtime_backend {
+        LockPlan::FreshCreateUnderExclusive {
+            lock,
+            #[cfg(feature = "storage-redb")]
+            redb_entry,
+        } => match runtime_backend {
             StorageBackendKind::Sqlite => {
                 #[cfg(feature = "storage-sqlite")]
                 {
+                    let _ = on_step;
+                    #[cfg(feature = "storage-redb")]
+                    let _ = redb_entry;
                     let sqlite_path = config_sqlite_path_in_scope_dir(scope_dir);
                     let dir_for_manifest = scope_dir.to_path_buf();
                     // Run SQLite creation + finalized manifest publication inside
@@ -2469,6 +2896,8 @@ where
                 #[cfg(not(feature = "storage-sqlite"))]
                 {
                     let _ = (lock, before_sqlite_manifest);
+                    #[cfg(feature = "storage-redb")]
+                    let _ = (redb_entry, on_step);
                     Err(StorageBackendError::UnsupportedBackend {
                         requested: StorageBackendKind::Sqlite.to_string(),
                         detail: "sqlite storage backend is not compiled into this binary"
@@ -2482,13 +2911,15 @@ where
                     let dir_for_create = scope_dir.to_path_buf();
                     // Move `lock` INTO `spawn_blocking` so `LOCK_EX` cannot be
                     // released prematurely if the async caller is cancelled while
-                    // Step F1..F4 creation is still running.
+                    // Step F1..F4 creation or crash recovery is still running.
                     let (lock, store) = tokio::task::spawn_blocking(move || {
-                        let store = fresh_create_redb_config_scope_under_ex_lock(
+                        let store = fresh_create_or_recover_redb_config_scope_under_ex_lock(
                             &dir_for_create,
                             role,
+                            redb_entry,
                             before_hard_link,
                             after_tombstone_before_redb,
+                            on_step,
                         )?;
                         Ok::<(ConfigScopeLock, Arc<dyn ConfigStore>), StorageBackendError>((
                             lock, store,
@@ -2510,7 +2941,7 @@ where
                 }
                 #[cfg(not(feature = "storage-redb"))]
                 {
-                    let _ = (lock, before_hard_link, after_tombstone_before_redb);
+                    let _ = (lock, before_hard_link, after_tombstone_before_redb, on_step);
                     Err(StorageBackendError::UnsupportedBackend {
                         requested: StorageBackendKind::Redb.to_string(),
                         detail: "redb storage backend is not compiled into this binary".to_string(),
@@ -7453,6 +7884,7 @@ mod tests {
                 hook_flag.store(true, Ordering::SeqCst);
             },
             || {},
+            |_, _| {},
         )
         .await
         .expect("fresh GlobalConfig Redb creation must succeed");
@@ -7548,6 +7980,7 @@ mod tests {
                         let _ = release_rx.recv_timeout(Duration::from_secs(10));
                     },
                     || {},
+                    |_, _| {},
                 )
                 .await
             });
@@ -7608,6 +8041,7 @@ mod tests {
                         let _ = sq_entered_tx.send(());
                         let _ = sq_release_rx.recv_timeout(Duration::from_secs(10));
                     },
+                    |_, _| {},
                 )
                 .await
             });
@@ -7990,6 +8424,7 @@ mod tests {
             },
             |_| panic!("after_tombstone hook must NOT run when hard_link hits AlreadyExists"),
             || {},
+            |_, _| {},
         )
         .await
         .expect_err("Redb first write must fail closed when legacy binary wins hard_link race");
@@ -8249,6 +8684,7 @@ mod tests {
                 hook_flag.store(true, Ordering::SeqCst);
             },
             || {},
+            |_, _| {},
         )
         .await
         .expect("fresh SystemConfig Redb creation must succeed");
@@ -8515,6 +8951,7 @@ mod tests {
             },
             |_| panic!("after_tombstone hook must NOT run when hard_link hits AlreadyExists"),
             || {},
+            |_, _| {},
         )
         .await
         .expect_err("SystemConfig Redb first write must fail closed when legacy binary wins");
@@ -8628,6 +9065,747 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt;
             let _ = fs::set_permissions(&post_sqlite, fs::Permissions::from_mode(0o644));
+        }
+    }
+
+    #[cfg(all(feature = "storage-sqlite", feature = "storage-redb"))]
+    #[tokio::test]
+    async fn config_fresh_create_4step_state_machine_order_and_fsync() {
+        use std::{
+            fs,
+            sync::{Arc, Mutex},
+        };
+
+        use tempfile::tempdir;
+
+        let root = tempdir().expect("create RB-03e AC1 temp root");
+        let scope_dir = root.path().join("global-4step-order");
+        fs::create_dir_all(&scope_dir).expect("create empty global scope dir");
+
+        let observed: Arc<Mutex<Vec<(FreshCreateStep, u64)>>> = Arc::new(Mutex::new(Vec::new()));
+        let observed_hook = Arc::clone(&observed);
+        let baseline_fsyncs = CONFIG_SCOPE_FSYNC_DIR_COUNT.load(Ordering::SeqCst);
+
+        let locked = open_or_create_locked_config_scope_for_write_with_hooks(
+            &scope_dir,
+            DatabaseRole::GlobalConfig,
+            StorageBackendKind::Redb,
+            Duration::from_secs(5),
+            || {},
+            |_| {},
+            || {},
+            move |step, dir| {
+                // Confirm `LOCK_EX` is continuously held at EVERY state transition!
+                let lock_err = ConfigScopeLock::try_lock_exclusive_bounded(
+                    dir,
+                    DatabaseRole::GlobalConfig,
+                    Duration::ZERO,
+                )
+                .expect_err("LOCK_EX must remain held during every Step F1..F4 transition");
+                assert_eq!(lock_err.stable_code_str(), "LBR-IO-001");
+
+                let sqlite_p = config_sqlite_path_in_scope_dir(dir);
+                let redb_p = config_redb_path_in_scope_dir(dir);
+                let redb_tmp_p = dir.join(format!("{CONFIG_REDB_FILE_NAME}.tmp"));
+                let manifest_opt = read_config_format_manifest(dir, DatabaseRole::GlobalConfig)
+                    .expect("read manifest in step observer");
+
+                match step {
+                    FreshCreateStep::StepF1HardLinkTombstone => {
+                        assert_eq!(
+                            fs::read(&sqlite_p).expect("read Step F1 sentinel"),
+                            CONFIG_SQLITE_TOMBSTONE_SENTINEL
+                        );
+                        assert!(
+                            manifest_opt.is_none(),
+                            "Step F1 must precede Step F2 manifest"
+                        );
+                        assert!(!redb_tmp_p.exists(), "Step F1 must precede config.redb.tmp");
+                        assert!(!redb_p.exists(), "Step F1 must precede config.redb");
+                    }
+                    FreshCreateStep::StepF2PublishFreshCreateManifest => {
+                        let m = manifest_opt.expect("Step F2 manifest must exist");
+                        assert_eq!(m.backend, StorageBackendKind::Redb);
+                        assert!(!m.finalized);
+                        assert_eq!(m.init_phase, Some(ConfigInitPhase::FreshCreate));
+                        assert!(m.legacy_sqlite_tombstone);
+                        assert!(!m.targets_staged_for_rename);
+                        assert!(!redb_tmp_p.exists(), "Step F2 must precede config.redb.tmp");
+                        assert!(!redb_p.exists(), "Step F2 must precede config.redb");
+                    }
+                    FreshCreateStep::StepF3StageRedbTmp => {
+                        assert!(redb_tmp_p.is_file(), "Step F3 must stage config.redb.tmp");
+                        assert!(!redb_p.exists(), "config.redb must not exist before rename");
+                        let m = manifest_opt.expect("Step F2 manifest must remain before mark");
+                        assert!(!m.finalized);
+                        assert!(!m.targets_staged_for_rename);
+                    }
+                    FreshCreateStep::StepF3MarkTargetsStaged => {
+                        let m = manifest_opt.expect("Step F3 staged manifest must exist");
+                        assert!(!m.finalized);
+                        assert_eq!(m.init_phase, Some(ConfigInitPhase::FreshCreate));
+                        assert!(m.legacy_sqlite_tombstone);
+                        assert!(m.targets_staged_for_rename);
+                        assert!(redb_tmp_p.is_file());
+                        assert!(
+                            !redb_p.exists(),
+                            "rename must occur AFTER targets_staged=true"
+                        );
+                    }
+                    FreshCreateStep::StepF3RenameRedbAndFsyncDir => {
+                        assert!(
+                            redb_p.is_file(),
+                            "config.redb must exist after Step F3 rename"
+                        );
+                        assert!(
+                            !redb_tmp_p.exists(),
+                            "config.redb.tmp must be consumed by rename"
+                        );
+                        let m = manifest_opt.expect("Step F3 manifest must still be unfinalized");
+                        assert!(!m.finalized);
+                        assert!(m.targets_staged_for_rename);
+                    }
+                    FreshCreateStep::StepF4PublishFinalizedManifest => {
+                        let m = manifest_opt.expect("Step F4 finalized manifest must exist");
+                        assert_eq!(m.backend, StorageBackendKind::Redb);
+                        assert!(m.finalized);
+                        assert!(m.init_phase.is_none());
+                        assert!(m.legacy_sqlite_tombstone);
+                        assert!(!m.targets_staged_for_rename);
+                        assert!(redb_p.is_file());
+                    }
+                }
+
+                let fsync_count = CONFIG_SCOPE_FSYNC_DIR_COUNT.load(Ordering::SeqCst);
+                observed_hook
+                    .lock()
+                    .expect("lock observed steps")
+                    .push((step, fsync_count));
+            },
+        )
+        .await
+        .expect("fresh 4-step GlobalConfig Redb creation must succeed");
+        locked
+            .store()
+            .set("user.name", "StepF4Done", false)
+            .await
+            .expect("write after Step F4");
+        drop(locked);
+
+        let steps = observed.lock().expect("read observed steps").clone();
+        let step_kinds: Vec<FreshCreateStep> = steps.iter().map(|(s, _)| *s).collect();
+        assert_eq!(
+            step_kinds,
+            vec![
+                FreshCreateStep::StepF1HardLinkTombstone,
+                FreshCreateStep::StepF2PublishFreshCreateManifest,
+                FreshCreateStep::StepF3StageRedbTmp,
+                FreshCreateStep::StepF3MarkTargetsStaged,
+                FreshCreateStep::StepF3RenameRedbAndFsyncDir,
+                FreshCreateStep::StepF4PublishFinalizedManifest,
+            ],
+            "4-step fresh_create state machine must execute in exact Step F1 -> F2 -> F3 -> F4 order"
+        );
+
+        // Verify `fsync_dir` monotonically increased across EVERY durable transition:
+        // Step F1 > baseline, Step F2 > Step F1, Step F3 mark > Step F2,
+        // Step F3 rename > Step F3 mark, Step F4 > Step F3 rename.
+        assert!(steps[0].1 > baseline_fsyncs, "Step F1 must fsync_dir");
+        assert!(steps[1].1 > steps[0].1, "Step F2 must fsync_dir");
+        assert!(
+            steps[3].1 > steps[1].1,
+            "Step F3 targets_staged publish must fsync_dir"
+        );
+        assert!(steps[4].1 > steps[3].1, "Step F3 rename must fsync_dir");
+        assert!(
+            steps[5].1 > steps[4].1,
+            "Step F4 finalized publish must fsync_dir"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(
+                config_sqlite_path_in_scope_dir(&scope_dir),
+                fs::Permissions::from_mode(0o600),
+            );
+        }
+    }
+
+    #[cfg(all(feature = "storage-sqlite", feature = "storage-redb"))]
+    #[tokio::test]
+    async fn global_config_fresh_create_crash_boundaries_1_2_3() {
+        use std::fs;
+
+        use tempfile::tempdir;
+
+        use crate::storage::redb::RedbConfigStore;
+
+        let root = tempdir().expect("create RB-03e AC2-AC4 temp root");
+
+        let set_global_tombstone_mode = |path: &Path| {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(
+                    path,
+                    fs::Permissions::from_mode(GLOBAL_CONFIG_TOMBSTONE_MODE),
+                )
+                .expect("chmod 0400 global tombstone");
+            }
+            #[cfg(not(unix))]
+            {
+                let mut perms = fs::metadata(path).expect("stat tombstone").permissions();
+                perms.set_readonly(true);
+                fs::set_permissions(path, perms).expect("set readonly tombstone");
+            }
+        };
+        let restore_writable = |path: &Path| {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+            }
+            #[cfg(not(unix))]
+            {
+                if let Ok(meta) = fs::metadata(path) {
+                    let mut perms = meta.permissions();
+                    perms.set_readonly(false);
+                    let _ = fs::set_permissions(path, perms);
+                }
+            }
+        };
+
+        // -----------------------------------------------------------------
+        // AC2: Boundary 1 crash (after Step F1 `hard_link`, before Step F2
+        // manifest). Concurrent RO and `Sqlite` writer MUST fail closed
+        // `LBR-IO-001`; subsequent `Redb` writer recognizes exact sentinel
+        // `config.db`, cleans leftover `.tmp`, and idempotently converges to
+        // `0600` `config.redb` + `0400` `config.db` + `finalized = true`.
+        // -----------------------------------------------------------------
+        let b1_dir = root.path().join("global-boundary-1");
+        fs::create_dir_all(&b1_dir).expect("create boundary 1 dir");
+        let b1_sqlite = config_sqlite_path_in_scope_dir(&b1_dir);
+        let b1_redb = config_redb_path_in_scope_dir(&b1_dir);
+        let b1_stale_tmp = b1_dir.join("config.db.tombstone.99999.0.tmp");
+
+        assert_eq!(
+            reserve_config_sqlite_tombstone_hard_link(&b1_dir, DatabaseRole::GlobalConfig)
+                .expect("simulate Step F1 hard_link"),
+            TombstoneReserveOutcome::Reserved
+        );
+        fs::write(&b1_stale_tmp, b"leftover-tmp").expect("seed leftover tombstone tmp");
+
+        // Concurrent RO and Sqlite writer must both fail closed LBR-IO-001.
+        let b1_ro_err = open_config_scope_read_only(&b1_dir, DatabaseRole::GlobalConfig)
+            .await
+            .expect_err("Boundary 1 read-only open must fail closed");
+        assert_eq!(b1_ro_err.stable_code_str(), "LBR-IO-001");
+        let b1_sq_err = open_or_create_locked_config_scope_for_write(
+            &b1_dir,
+            DatabaseRole::GlobalConfig,
+            StorageBackendKind::Sqlite,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("Boundary 1 Sqlite writer must fail closed without overwriting sentinel");
+        assert_eq!(b1_sq_err.stable_code_str(), "LBR-IO-001");
+        assert_eq!(
+            fs::read(&b1_sqlite).expect("sentinel untouched after rejected Sqlite write"),
+            CONFIG_SQLITE_TOMBSTONE_SENTINEL
+        );
+
+        // Subsequent Redb writer recovers idempotently to `0600` config.redb + finalized=true,
+        // flushing the Boundary 1 tombstone link durably BEFORE Step F2 even when no `.tmp` existed.
+        let b1_pre_fsyncs = CONFIG_SCOPE_FSYNC_DIR_COUNT.load(Ordering::SeqCst);
+        let b1_f2_fsyncs = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let b1_f2_hook = std::sync::Arc::clone(&b1_f2_fsyncs);
+        let b1_recovered = open_or_create_locked_config_scope_for_write_with_hooks(
+            &b1_dir,
+            DatabaseRole::GlobalConfig,
+            StorageBackendKind::Redb,
+            Duration::from_secs(5),
+            || {},
+            |_| {},
+            || {},
+            move |step, _| {
+                if step == FreshCreateStep::StepF2PublishFreshCreateManifest {
+                    b1_f2_hook.store(
+                        CONFIG_SCOPE_FSYNC_DIR_COUNT.load(Ordering::SeqCst),
+                        Ordering::SeqCst,
+                    );
+                }
+            },
+        )
+        .await
+        .expect("Boundary 1 Redb writer must recover cleanly");
+        assert!(
+            b1_f2_fsyncs.load(Ordering::SeqCst) >= b1_pre_fsyncs + 2,
+            "Boundary 1 recovery must flush tombstone link durably before Step F2 manifest fsync"
+        );
+        b1_recovered
+            .store()
+            .set("user.boundary", "b1-ok", false)
+            .await
+            .expect("write after Boundary 1 recovery");
+        drop(b1_recovered);
+
+        assert!(
+            !b1_stale_tmp.exists(),
+            "Boundary 1 recovery must remove stale .tmp"
+        );
+        let b1_manifest = read_config_format_manifest(&b1_dir, DatabaseRole::GlobalConfig)
+            .expect("read b1 manifest")
+            .expect("b1 finalized manifest must exist");
+        assert_eq!(b1_manifest.backend, StorageBackendKind::Redb);
+        assert!(b1_manifest.finalized);
+        assert!(b1_manifest.init_phase.is_none());
+        assert!(b1_manifest.legacy_sqlite_tombstone);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::symlink_metadata(&b1_redb)
+                    .expect("stat b1 config.redb")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                GLOBAL_CONFIG_FILE_MODE
+            );
+            assert_eq!(
+                fs::symlink_metadata(&b1_sqlite)
+                    .expect("stat b1 config.db")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                GLOBAL_CONFIG_TOMBSTONE_MODE
+            );
+        }
+        let b1_ro = open_config_scope_read_only(&b1_dir, DatabaseRole::GlobalConfig)
+            .await
+            .expect("Boundary 1 post-recovery RO open must succeed");
+        assert_eq!(
+            b1_ro
+                .get("user.boundary")
+                .await
+                .expect("read b1 key")
+                .map(|e| e.value),
+            Some("b1-ok".to_string())
+        );
+        drop(b1_ro);
+        restore_writable(&b1_sqlite);
+
+        // -----------------------------------------------------------------
+        // AC3: Boundary 2 crash (Step F2 `init_phase="fresh_create",
+        // finalized=false, targets_staged_for_rename=false` + corrupt `.tmp`
+        // residue). Concurrent RO and Sqlite fail closed `LBR-IO-001`; Redb
+        // writer cleans `.tmp` and converges to `0600` `config.redb` +
+        // `finalized = true`.
+        // -----------------------------------------------------------------
+        let b2_dir = root.path().join("global-boundary-2");
+        fs::create_dir_all(&b2_dir).expect("create boundary 2 dir");
+        let b2_sqlite = config_sqlite_path_in_scope_dir(&b2_dir);
+        let b2_redb = config_redb_path_in_scope_dir(&b2_dir);
+        let b2_corrupt_tmp = b2_dir.join(format!("{CONFIG_REDB_FILE_NAME}.tmp"));
+
+        fs::write(&b2_sqlite, CONFIG_SQLITE_TOMBSTONE_SENTINEL).expect("write b2 sentinel");
+        set_global_tombstone_mode(&b2_sqlite);
+        let b2_f2 =
+            ConfigFormatManifest::new_redb_fresh_create(1, false, DatabaseRole::GlobalConfig)
+                .expect("build Step F2 manifest");
+        publish_config_format_manifest(&b2_dir, DatabaseRole::GlobalConfig, &b2_f2)
+            .expect("publish Step F2 manifest");
+        fs::write(&b2_corrupt_tmp, b"truncated-half-written-redb")
+            .expect("seed corrupt config.redb.tmp residue");
+
+        let b2_ro_err = open_config_scope_read_only(&b2_dir, DatabaseRole::GlobalConfig)
+            .await
+            .expect_err("Boundary 2 RO open must fail closed");
+        assert_eq!(b2_ro_err.stable_code_str(), "LBR-IO-001");
+        let b2_sq_err = open_or_create_locked_config_scope_for_write(
+            &b2_dir,
+            DatabaseRole::GlobalConfig,
+            StorageBackendKind::Sqlite,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("Boundary 2 Sqlite writer must fail closed");
+        assert_eq!(b2_sq_err.stable_code_str(), "LBR-IO-001");
+
+        let b2_recovered = open_or_create_locked_config_scope_for_write(
+            &b2_dir,
+            DatabaseRole::GlobalConfig,
+            StorageBackendKind::Redb,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("Boundary 2 Redb writer must clean .tmp and recover");
+        b2_recovered
+            .store()
+            .set("user.boundary", "b2-ok", false)
+            .await
+            .expect("write after Boundary 2 recovery");
+        drop(b2_recovered);
+
+        assert!(
+            !b2_corrupt_tmp.exists(),
+            "Boundary 2 recovery must remove corrupt .tmp"
+        );
+        let b2_manifest = read_config_format_manifest(&b2_dir, DatabaseRole::GlobalConfig)
+            .expect("read b2 manifest")
+            .expect("b2 finalized manifest must exist");
+        assert!(b2_manifest.finalized);
+        assert!(b2_manifest.init_phase.is_none());
+        assert!(b2_manifest.legacy_sqlite_tombstone);
+        assert!(!b2_manifest.targets_staged_for_rename);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::symlink_metadata(&b2_redb)
+                    .expect("stat b2 config.redb")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                GLOBAL_CONFIG_FILE_MODE
+            );
+        }
+        let b2_ro = open_config_scope_read_only(&b2_dir, DatabaseRole::GlobalConfig)
+            .await
+            .expect("Boundary 2 post-recovery RO open must succeed");
+        assert_eq!(
+            b2_ro
+                .get("user.boundary")
+                .await
+                .expect("read b2 key")
+                .map(|e| e.value),
+            Some("b2-ok".to_string())
+        );
+        drop(b2_ro);
+        restore_writable(&b2_sqlite);
+
+        // -----------------------------------------------------------------
+        // AC4: Boundary 3 crash (Step F3 `targets_staged_for_rename=true` AND
+        // `config.redb` already in place with existing keys, `finalized=true`
+        // not yet published). Recovery MUST preserve 100% of existing keys
+        // zero-overwrite, remove stale `.tmp`, and promote to `finalized=true`.
+        // -----------------------------------------------------------------
+        let b3_dir = root.path().join("global-boundary-3");
+        fs::create_dir_all(&b3_dir).expect("create boundary 3 dir");
+        let b3_sqlite = config_sqlite_path_in_scope_dir(&b3_dir);
+        let b3_redb = config_redb_path_in_scope_dir(&b3_dir);
+        let b3_stale_tmp = b3_dir.join(format!("{CONFIG_REDB_FILE_NAME}.tmp"));
+
+        fs::write(&b3_sqlite, CONFIG_SQLITE_TOMBSTONE_SENTINEL).expect("write b3 sentinel");
+        set_global_tombstone_mode(&b3_sqlite);
+        {
+            let existing = RedbConfigStore::create(&b3_redb, DatabaseRole::GlobalConfig)
+                .expect("seed existing post-rename config.redb");
+            existing
+                .set("user.preserved", "must-not-be-overwritten", false)
+                .await
+                .expect("seed preserved singleton");
+            existing
+                .add("alias.keep", "v1", false)
+                .await
+                .expect("seed preserved multi-value 1");
+            existing
+                .add("alias.keep", "v2", false)
+                .await
+                .expect("seed preserved multi-value 2");
+        }
+        fs::write(&b3_stale_tmp, b"stale-tmp-must-be-deleted").expect("seed stale tmp");
+        let b3_f3 =
+            ConfigFormatManifest::new_redb_fresh_create(1, true, DatabaseRole::GlobalConfig)
+                .expect("build Step F3 manifest");
+        publish_config_format_manifest(&b3_dir, DatabaseRole::GlobalConfig, &b3_f3)
+            .expect("publish Step F3 manifest");
+
+        let b3_ro_err = open_config_scope_read_only(&b3_dir, DatabaseRole::GlobalConfig)
+            .await
+            .expect_err("Boundary 3 RO open must fail closed before recovery");
+        assert_eq!(b3_ro_err.stable_code_str(), "LBR-IO-001");
+        let b3_sq_err = open_or_create_locked_config_scope_for_write(
+            &b3_dir,
+            DatabaseRole::GlobalConfig,
+            StorageBackendKind::Sqlite,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("Boundary 3 Sqlite writer must fail closed");
+        assert_eq!(b3_sq_err.stable_code_str(), "LBR-IO-001");
+
+        let b3_recovered = open_or_create_locked_config_scope_for_write(
+            &b3_dir,
+            DatabaseRole::GlobalConfig,
+            StorageBackendKind::Redb,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("Boundary 3 Redb writer must promote finalized=true zero-overwrite");
+        b3_recovered
+            .store()
+            .set("user.appended", "b3-new", false)
+            .await
+            .expect("append new key after Boundary 3 recovery");
+        drop(b3_recovered);
+
+        assert!(
+            !b3_stale_tmp.exists(),
+            "Boundary 3 recovery must clean obsolete .tmp"
+        );
+        let b3_manifest = read_config_format_manifest(&b3_dir, DatabaseRole::GlobalConfig)
+            .expect("read b3 manifest")
+            .expect("b3 finalized manifest must exist");
+        assert!(b3_manifest.finalized);
+        assert!(b3_manifest.init_phase.is_none());
+        assert!(b3_manifest.legacy_sqlite_tombstone);
+        assert!(!b3_manifest.targets_staged_for_rename);
+
+        let b3_ro = open_config_scope_read_only(&b3_dir, DatabaseRole::GlobalConfig)
+            .await
+            .expect("Boundary 3 post-recovery RO open must succeed");
+        assert_eq!(
+            b3_ro
+                .get("user.preserved")
+                .await
+                .expect("read preserved singleton")
+                .map(|e| e.value),
+            Some("must-not-be-overwritten".to_string()),
+            "AC4 violation: Boundary 3 recovery overwrote existing config.redb key"
+        );
+        assert_eq!(
+            b3_ro
+                .get_all("alias.keep")
+                .await
+                .expect("read preserved multi-value")
+                .into_iter()
+                .map(|e| e.value)
+                .collect::<Vec<_>>(),
+            vec!["v1".to_string(), "v2".to_string()],
+            "AC4 violation: Boundary 3 recovery lost multi-value entries"
+        );
+        assert_eq!(
+            b3_ro
+                .get("user.appended")
+                .await
+                .expect("read appended key")
+                .map(|e| e.value),
+            Some("b3-new".to_string())
+        );
+        drop(b3_ro);
+        restore_writable(&b3_sqlite);
+
+        // Sub-case 3b: `targets_staged_for_rename=true` with `config.redb` still
+        // absent and valid `config.redb.tmp` present -> promotes `config.redb.tmp`
+        // atomically without losing staged data.
+        let b3b_dir = root.path().join("global-boundary-3b-pre-rename");
+        fs::create_dir_all(&b3b_dir).expect("create boundary 3b dir");
+        let b3b_sqlite = config_sqlite_path_in_scope_dir(&b3b_dir);
+        let b3b_tmp = b3b_dir.join(format!("{CONFIG_REDB_FILE_NAME}.tmp"));
+        fs::write(&b3b_sqlite, CONFIG_SQLITE_TOMBSTONE_SENTINEL).expect("write b3b sentinel");
+        set_global_tombstone_mode(&b3b_sqlite);
+        {
+            let staged = RedbConfigStore::create(&b3b_tmp, DatabaseRole::GlobalConfig)
+                .expect("seed valid staged config.redb.tmp");
+            staged
+                .set("user.staged", "promoted-from-tmp", false)
+                .await
+                .expect("seed staged key");
+        }
+        publish_config_format_manifest(&b3b_dir, DatabaseRole::GlobalConfig, &b3_f3)
+            .expect("publish b3b Step F3 manifest");
+
+        let b3b_recovered = open_or_create_locked_config_scope_for_write(
+            &b3b_dir,
+            DatabaseRole::GlobalConfig,
+            StorageBackendKind::Redb,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("Boundary 3b Redb writer must promote valid config.redb.tmp");
+        assert_eq!(
+            b3b_recovered
+                .store()
+                .get("user.staged")
+                .await
+                .expect("read promoted staged key")
+                .map(|e| e.value),
+            Some("promoted-from-tmp".to_string())
+        );
+        drop(b3b_recovered);
+        assert!(!b3b_tmp.exists());
+        restore_writable(&b3b_sqlite);
+
+        // Negative guard: unfinalized `init_phase="migration"` MUST NOT be recovered
+        // by runtime `Redb` writers (always fail-closed `ManifestNotFinalized` `LBR-IO-001`).
+        let mig_dir = root.path().join("global-migration-unfinalized");
+        fs::create_dir_all(&mig_dir).expect("create migration pending dir");
+        let mig_manifest = ConfigFormatManifest {
+            schema_version: CONFIG_FORMAT_MANIFEST_VERSION,
+            backend: StorageBackendKind::Redb,
+            finalized: false,
+            init_phase: Some(ConfigInitPhase::Migration),
+            generation: 1,
+            legacy_sqlite_tombstone: false,
+            targets_staged_for_rename: false,
+            source_db_state: Some(Phase2DbState::Pending),
+            backup_sha256: Some("abc".to_string()),
+            source_logical_sha256: Some("def".to_string()),
+        };
+        publish_config_format_manifest(&mig_dir, DatabaseRole::GlobalConfig, &mig_manifest)
+            .expect("publish migration pending manifest");
+        let mig_err = open_or_create_locked_config_scope_for_write(
+            &mig_dir,
+            DatabaseRole::GlobalConfig,
+            StorageBackendKind::Redb,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("unfinalized migration manifest must NEVER be auto-recovered by runtime");
+        assert!(matches!(
+            mig_err,
+            StorageBackendError::ManifestNotFinalized { .. }
+        ));
+        assert_eq!(mig_err.stable_code_str(), "LBR-IO-001");
+
+        // Regression (Codex R1 P1 #3): In Boundary 3b (`targets_staged_for_rename=true`,
+        // `config.redb` absent), if `config.redb.tmp` fails to open/validate, recovery
+        // MUST fail closed (`LBR-IO-001`) and RETAIN `config.redb.tmp` rather than
+        // silently deleting it and finalizing an empty replacement!
+        let b3_bad_tmp_dir = root.path().join("global-boundary-3b-bad-tmp");
+        fs::create_dir_all(&b3_bad_tmp_dir).expect("create bad tmp dir");
+        let b3_bad_sqlite = config_sqlite_path_in_scope_dir(&b3_bad_tmp_dir);
+        let b3_bad_tmp = b3_bad_tmp_dir.join(format!("{CONFIG_REDB_FILE_NAME}.tmp"));
+        fs::write(&b3_bad_sqlite, CONFIG_SQLITE_TOMBSTONE_SENTINEL).expect("write sentinel");
+        set_global_tombstone_mode(&b3_bad_sqlite);
+        fs::write(&b3_bad_tmp, b"unopenable-staged-payload").expect("write bad staged tmp");
+        publish_config_format_manifest(&b3_bad_tmp_dir, DatabaseRole::GlobalConfig, &b3_f3)
+            .expect("publish Step F3 manifest");
+        let bad_tmp_err = open_or_create_locked_config_scope_for_write(
+            &b3_bad_tmp_dir,
+            DatabaseRole::GlobalConfig,
+            StorageBackendKind::Redb,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("unopenable config.redb.tmp when targets_staged=true must fail closed");
+        assert_eq!(bad_tmp_err.stable_code_str(), "LBR-IO-001");
+        assert_eq!(
+            fs::read(&b3_bad_tmp).expect("failed config.redb.tmp must be retained for diagnosis"),
+            b"unopenable-staged-payload"
+        );
+        assert!(
+            !config_redb_path_in_scope_dir(&b3_bad_tmp_dir).exists(),
+            "must NOT publish empty replacement config.redb when staged tmp failed open"
+        );
+        restore_writable(&b3_bad_sqlite);
+
+        // Regression (Codex R1 P1 #4): Contradictory `init_phase="fresh_create"`
+        // manifest carrying migration-only `source_db_state` or digests MUST fail
+        // closed (`LBR-IO-001`) before cleaning or modifying any files.
+        let contra_dir = root.path().join("global-contradictory-fresh-create");
+        fs::create_dir_all(&contra_dir).expect("create contradictory dir");
+        let contra_sqlite = config_sqlite_path_in_scope_dir(&contra_dir);
+        let contra_tmp = contra_dir.join(format!("{CONFIG_REDB_FILE_NAME}.tmp"));
+        fs::write(&contra_sqlite, CONFIG_SQLITE_TOMBSTONE_SENTINEL).expect("write sentinel");
+        set_global_tombstone_mode(&contra_sqlite);
+        fs::write(&contra_tmp, b"must-not-be-deleted").expect("write staged tmp");
+        fs::write(
+            config_format_manifest_path(&contra_dir),
+            r#"{"schema_version":1,"backend":"redb","finalized":false,"init_phase":"fresh_create","generation":1,"legacy_sqlite_tombstone":true,"targets_staged_for_rename":false,"source_db_state":"pending","backup_sha256":"deadbeef"}"#,
+        )
+        .expect("write contradictory fresh_create manifest");
+        let contra_err = open_or_create_locked_config_scope_for_write(
+            &contra_dir,
+            DatabaseRole::GlobalConfig,
+            StorageBackendKind::Redb,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("contradictory fresh_create manifest with migration fields must fail closed");
+        assert_eq!(contra_err.stable_code_str(), "LBR-IO-001");
+        assert_eq!(
+            fs::read(&contra_tmp).expect("staged tmp must remain untouched on validation failure"),
+            b"must-not-be-deleted"
+        );
+        restore_writable(&contra_sqlite);
+
+        // Regression (Codex R3/R4 Windows): On Windows, if a prior recovery
+        // crashed after clearing readonly on a hard-linked `.tmp` alias before
+        // restoring `readonly=true` on `config.db`, Boundary 2 and Boundary 3
+        // retries MUST still recover, restore `readonly=true`, and preserve
+        // existing keys in Boundary 3.
+        #[cfg(windows)]
+        {
+            // Windows Boundary 2 with `readonly=false` on sentinel `config.db`:
+            let win_b2_dir = root.path().join("global-win-b2-unset-ro");
+            fs::create_dir_all(&win_b2_dir).expect("create win b2 dir");
+            let win_b2_sqlite = config_sqlite_path_in_scope_dir(&win_b2_dir);
+            fs::write(&win_b2_sqlite, CONFIG_SQLITE_TOMBSTONE_SENTINEL)
+                .expect("write non-readonly win b2 sentinel");
+            publish_config_format_manifest(&win_b2_dir, DatabaseRole::GlobalConfig, &b2_f2)
+                .expect("publish win b2 Step F2 manifest");
+            let win_b2_rec = open_or_create_locked_config_scope_for_write(
+                &win_b2_dir,
+                DatabaseRole::GlobalConfig,
+                StorageBackendKind::Redb,
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("Windows Boundary 2 with unset readonly must recover cleanly");
+            drop(win_b2_rec);
+            assert!(
+                fs::metadata(&win_b2_sqlite)
+                    .expect("stat win b2 sentinel")
+                    .permissions()
+                    .readonly(),
+                "Windows Boundary 2 recovery must restore readonly=true on config.db"
+            );
+            restore_writable(&win_b2_sqlite);
+
+            // Windows Boundary 3 with `readonly=false` on sentinel + existing keys in `config.redb`:
+            let win_b3_dir = root.path().join("global-win-b3-unset-ro");
+            fs::create_dir_all(&win_b3_dir).expect("create win b3 dir");
+            let win_b3_sqlite = config_sqlite_path_in_scope_dir(&win_b3_dir);
+            let win_b3_redb = config_redb_path_in_scope_dir(&win_b3_dir);
+            fs::write(&win_b3_sqlite, CONFIG_SQLITE_TOMBSTONE_SENTINEL)
+                .expect("write non-readonly win b3 sentinel");
+            {
+                let seed = RedbConfigStore::create(&win_b3_redb, DatabaseRole::GlobalConfig)
+                    .expect("seed win b3 config.redb");
+                seed.set("user.win_keep", "preserved-win-b3", false)
+                    .await
+                    .expect("seed win b3 key");
+            }
+            publish_config_format_manifest(&win_b3_dir, DatabaseRole::GlobalConfig, &b3_f3)
+                .expect("publish win b3 Step F3 manifest");
+            let win_b3_rec = open_or_create_locked_config_scope_for_write(
+                &win_b3_dir,
+                DatabaseRole::GlobalConfig,
+                StorageBackendKind::Redb,
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("Windows Boundary 3 with unset readonly must recover cleanly");
+            assert_eq!(
+                win_b3_rec
+                    .store()
+                    .get("user.win_keep")
+                    .await
+                    .expect("read preserved win b3 key")
+                    .map(|e| e.value),
+                Some("preserved-win-b3".to_string())
+            );
+            drop(win_b3_rec);
+            assert!(
+                fs::metadata(&win_b3_sqlite)
+                    .expect("stat win b3 sentinel")
+                    .permissions()
+                    .readonly(),
+                "Windows Boundary 3 recovery must restore readonly=true on config.db"
+            );
+            restore_writable(&win_b3_sqlite);
         }
     }
 }
