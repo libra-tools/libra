@@ -13,6 +13,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
@@ -47,6 +48,9 @@ pub const CONFIG_FORMAT_MANIFEST_VERSION: u32 = 1;
 
 /// Canonical cross-runtime coordination lock filename inside a config scope directory (`ADR-RB-02` #2).
 pub const CONFIG_MIGRATION_LOCK_FILE: &str = "config-migration.lock";
+
+/// Default bounded wait deadline for runtime [`ConfigScopeLock`] acquisition (`2s`, `ADR-RB-02` #2).
+pub const DEFAULT_CONFIG_SCOPE_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Fixed 31-byte non-SQLite sentinel written into `config.db` when `redb` owns a
 /// `GlobalConfig` or `SystemConfig` scope (`ADR-RB-02` #2 Step F1).
@@ -1211,20 +1215,459 @@ pub fn inspect_config_scope_authority(
     }
 }
 
-/// Open an existing `GlobalConfig` or `SystemConfig` scope writable after
-/// validating `config-format.json` authority (`ADR-RB-02` #2, `RB-03b`).
+/// Cross-runtime advisory lock on `<scope_dir>/config-migration.lock`
+/// (`ADR-RB-02` #2, `RB-03h`).
 ///
-/// Enforces the exact same manifest pre-validation guard as
-/// [`open_config_scope_read_only`] (`finalized == false` -> `LBR-IO-001`,
-/// dual-file without manifest -> `LBR-IO-001`, verified read-only tombstone
-/// required when `legacy_sqlite_tombstone == true`). Does not create a brand-new
-/// database in an empty directory (returns `NotFound`; locked fresh creation is
-/// provided by `RB-03h`/`RB-03d`/`RB-03f`/`RB-03e`).
-pub async fn open_config_scope_read_write(
+/// Participated in by both `Sqlite` and `Redb` runtime paths as well as
+/// `libra-migrate --global/--system`. Always enforces bounded wait deadlines
+/// (`1ms -> 25ms` jittered backoff; supports `Duration::ZERO` for immediate
+/// non-blocking checks) and fails closed with [`StorageBackendError::WriteLockBusy`]
+/// (`LBR-IO-001`) when contention exceeds `deadline`.
+#[derive(Debug)]
+pub struct ConfigScopeLock {
+    file: File,
+    role: DatabaseRole,
+    exclusive: bool,
+}
+
+impl Drop for ConfigScopeLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+fn verify_scope_dir_exists(scope_dir: &Path) -> StorageResult<()> {
+    let dir_meta = match fs::metadata(scope_dir) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            if fs::symlink_metadata(scope_dir).is_ok() {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: "config scope path is a dangling symlink".to_string(),
+                });
+            }
+            return Err(StorageBackendError::NotFound {
+                resource: "configuration scope directory".to_string(),
+            });
+        }
+        Err(err) => return Err(StorageBackendError::io("stat config scope directory", err)),
+    };
+    if !dir_meta.is_dir() {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "config scope path must be a directory".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn open_existing_lock_file(lock_path: &Path, writable: bool) -> StorageResult<Option<File>> {
+    match fs::symlink_metadata(lock_path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() || !meta.is_file() {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: "config-migration.lock must be a regular file (symlinks and directories are rejected)"
+                        .to_string(),
+                });
+            }
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(StorageBackendError::io("stat config-migration.lock", err)),
+    }
+
+    let mut opts = OpenOptions::new();
+    opts.read(true);
+    if writable {
+        opts.write(true);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+
+    let file = match opts.open(lock_path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(StorageBackendError::io("open config-migration.lock", err)),
+    };
+
+    let meta = file
+        .metadata()
+        .map_err(|err| StorageBackendError::io("fstat config-migration.lock", err))?;
+    if !meta.file_type().is_file() {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "config-migration.lock must be a regular file".to_string(),
+        });
+    }
+    Ok(Some(file))
+}
+
+fn open_or_create_lock_file(
     scope_dir: &Path,
     role: DatabaseRole,
+    writable: bool,
+) -> StorageResult<File> {
+    verify_scope_dir_exists(scope_dir)?;
+    let lock_path = config_migration_lock_path(scope_dir);
+
+    for _ in 0..8 {
+        if let Some(existing) = open_existing_lock_file(&lock_path, writable)? {
+            return Ok(existing);
+        }
+
+        #[cfg(unix)]
+        let target_mode = expected_config_file_mode(role).ok_or_else(|| {
+            StorageBackendError::BackendInternal {
+                detail: format!("{role} has no defined config-migration.lock mode"),
+            }
+        })?;
+
+        let mut create_opts = OpenOptions::new();
+        create_opts.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            create_opts
+                .mode(target_mode)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        }
+        match create_opts.open(&lock_path) {
+            Ok(file) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    file.set_permissions(fs::Permissions::from_mode(target_mode))
+                        .map_err(|err| {
+                            StorageBackendError::io("fchmod config-migration.lock", err)
+                        })?;
+                }
+                fsync_dir(scope_dir)?;
+                if !writable {
+                    drop(file);
+                    if let Some(reopened) = open_existing_lock_file(&lock_path, false)? {
+                        return Ok(reopened);
+                    }
+                    continue;
+                }
+                return Ok(file);
+            }
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(StorageBackendError::io("create config-migration.lock", err));
+            }
+        }
+    }
+
+    Err(StorageBackendError::BackendInternal {
+        detail: "exhausted retry attempts opening config-migration.lock".to_string(),
+    })
+}
+
+fn acquire_lock_bounded(
+    file: File,
+    role: DatabaseRole,
+    exclusive: bool,
+    deadline: Duration,
+) -> StorageResult<ConfigScopeLock> {
+    let start = Instant::now();
+    let end = start + deadline;
+    let mut backoff_ms = 1u64;
+    let mut attempt = 0u64;
+
+    loop {
+        let attempt_res = if exclusive {
+            file.try_lock()
+        } else {
+            file.try_lock_shared()
+        };
+        match attempt_res {
+            Ok(()) => {
+                return Ok(ConfigScopeLock {
+                    file,
+                    role,
+                    exclusive,
+                });
+            }
+            Err(fs::TryLockError::WouldBlock) => {
+                let now = Instant::now();
+                if now >= end {
+                    let waited_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+                    return Err(StorageBackendError::WriteLockBusy { role, waited_ms });
+                }
+                let remaining = end.saturating_duration_since(now);
+                let jitter_ms = (attempt
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1)
+                    >> 62)
+                    % 3;
+                let sleep_dur =
+                    Duration::from_millis((backoff_ms + jitter_ms).min(25)).min(remaining);
+                std::thread::sleep(sleep_dur);
+                backoff_ms = backoff_ms.saturating_mul(2).min(25);
+                attempt = attempt.saturating_add(1);
+            }
+            Err(fs::TryLockError::Error(err)) => {
+                return Err(StorageBackendError::io(
+                    "acquire config-migration.lock",
+                    err,
+                ));
+            }
+        }
+    }
+}
+
+impl ConfigScopeLock {
+    /// Acquire a bounded shared (`LOCK_SH`) lock on `<scope_dir>/config-migration.lock`,
+    /// creating the lock file (`0600` Global / `0644` System) if absent.
+    ///
+    /// Multiple processes may hold shared locks concurrently while mutually
+    /// excluding an exclusive migration or first-write lock (`LOCK_EX`).
+    /// Returns [`StorageBackendError::WriteLockBusy`] (`LBR-IO-001`) if
+    /// contention exceeds `deadline` (supports `Duration::ZERO`).
+    pub fn try_lock_shared_bounded(
+        scope_dir: &Path,
+        role: DatabaseRole,
+        deadline: Duration,
+    ) -> StorageResult<Self> {
+        validate_config_scope_role(role)?;
+        let file = open_or_create_lock_file(scope_dir, role, false)?;
+        acquire_lock_bounded(file, role, false, deadline)
+    }
+
+    /// Acquire a bounded exclusive (`LOCK_EX`) lock on `<scope_dir>/config-migration.lock`,
+    /// creating the lock file (`0600` Global / `0644` System) if absent.
+    ///
+    /// Mutually excludes all concurrent shared readers/writers and other exclusive
+    /// holders. Returns [`StorageBackendError::WriteLockBusy`] (`LBR-IO-001`) if
+    /// contention exceeds `deadline` (supports `Duration::ZERO`).
+    pub fn try_lock_exclusive_bounded(
+        scope_dir: &Path,
+        role: DatabaseRole,
+        deadline: Duration,
+    ) -> StorageResult<Self> {
+        validate_config_scope_role(role)?;
+        let file = open_or_create_lock_file(scope_dir, role, true)?;
+        acquire_lock_bounded(file, role, true, deadline)
+    }
+
+    /// Acquire a bounded shared (`LOCK_SH`) lock ONLY if
+    /// `<scope_dir>/config-migration.lock` already exists on disk.
+    ///
+    /// Strictly read-only: NEVER attempts to create `config-migration.lock`
+    /// (`ADR-RB-02` #2, `RB-03h` AC4). Returns `Ok(None)` when the lock file is
+    /// absent, or `Err(WriteLockBusy)` (`LBR-IO-001`) if an existing lock file
+    /// is exclusively held past `deadline`.
+    pub fn try_lock_shared_if_present_bounded(
+        scope_dir: &Path,
+        role: DatabaseRole,
+        deadline: Duration,
+    ) -> StorageResult<Option<Self>> {
+        validate_config_scope_role(role)?;
+        verify_scope_dir_exists(scope_dir)?;
+        let lock_path = config_migration_lock_path(scope_dir);
+        let Some(file) = open_existing_lock_file(&lock_path, false)? else {
+            return Ok(None);
+        };
+        acquire_lock_bounded(file, role, false, deadline).map(Some)
+    }
+
+    /// Owner configuration role (`GlobalConfig` or `SystemConfig`).
+    #[must_use]
+    pub const fn role(&self) -> DatabaseRole {
+        self.role
+    }
+
+    /// Returns `true` if this guard holds an exclusive (`LOCK_EX`) lock.
+    #[must_use]
+    pub const fn is_exclusive(&self) -> bool {
+        self.exclusive
+    }
+}
+
+/// Internal wrapper keeping [`ConfigScopeLock`] alive for the entire lifetime of
+/// any returned `Arc<dyn ConfigStore>` so concurrent `LOCK_EX` migrations remain
+/// blocked until the last store handle is dropped (`RB-03h`).
+struct ScopeLockedConfigStore {
+    inner: Arc<dyn ConfigStore>,
+    lock: Option<ConfigScopeLock>,
+}
+
+impl std::fmt::Debug for ScopeLockedConfigStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScopeLockedConfigStore")
+            .field("inner", &self.inner)
+            .field("locked", &self.lock.is_some())
+            .finish()
+    }
+}
+
+#[async_trait]
+impl ConfigStore for ScopeLockedConfigStore {
+    fn role(&self) -> DatabaseRole {
+        self.inner.role()
+    }
+
+    fn backend(&self) -> StorageBackendKind {
+        self.inner.backend()
+    }
+
+    async fn get(&self, key: &str) -> StorageResult<Option<ConfigEntry>> {
+        self.inner.get(key).await
+    }
+
+    async fn get_all(&self, key: &str) -> StorageResult<Vec<ConfigEntry>> {
+        self.inner.get_all(key).await
+    }
+
+    async fn get_by_prefix(&self, prefix: &str) -> StorageResult<Vec<ConfigEntry>> {
+        self.inner.get_by_prefix(prefix).await
+    }
+
+    async fn list_all(&self) -> StorageResult<Vec<ConfigEntry>> {
+        self.inner.list_all().await
+    }
+
+    async fn set(&self, key: &str, value: &str, encrypted: bool) -> StorageResult<()> {
+        self.inner.set(key, value, encrypted).await
+    }
+
+    async fn add(&self, key: &str, value: &str, encrypted: bool) -> StorageResult<()> {
+        self.inner.add(key, value, encrypted).await
+    }
+
+    async fn unset(&self, key: &str) -> StorageResult<usize> {
+        self.inner.unset(key).await
+    }
+
+    async fn unset_all(&self, key: &str) -> StorageResult<usize> {
+        self.inner.unset_all(key).await
+    }
+
+    async fn remove_section(&self, section: &str) -> StorageResult<usize> {
+        self.inner.remove_section(section).await
+    }
+
+    async fn rename_section(&self, old_section: &str, new_section: &str) -> StorageResult<usize> {
+        self.inner.rename_section(old_section, new_section).await
+    }
+
+    async fn list_legacy_entries(&self) -> StorageResult<Vec<LegacyConfigEntry>> {
+        self.inner.list_legacy_entries().await
+    }
+
+    async fn insert_legacy_entry(&self, entry: &LegacyConfigEntry) -> StorageResult<()> {
+        self.inner.insert_legacy_entry(entry).await
+    }
+
+    async fn list_schema_receipts(&self) -> StorageResult<Vec<SchemaVersionReceipt>> {
+        self.inner.list_schema_receipts().await
+    }
+
+    async fn record_schema_receipt(&self, receipt: &SchemaVersionReceipt) -> StorageResult<()> {
+        self.inner.record_schema_receipt(receipt).await
+    }
+}
+
+/// Guard holding an opened scoped [`ConfigStore`] whose coordination
+/// [`ConfigScopeLock`] is retained for the entire lifetime of the store (and any
+/// `Arc<dyn ConfigStore>` cloned from [`Self::store_arc`]) (`ADR-RB-02` #2, `RB-03h`).
+#[derive(Debug)]
+pub struct LockedConfigScope {
+    store: Arc<ScopeLockedConfigStore>,
+    role: DatabaseRole,
+}
+
+impl LockedConfigScope {
+    /// Borrow the underlying lock-retaining [`ConfigStore`] trait object.
+    #[must_use]
+    pub fn store(&self) -> &dyn ConfigStore {
+        self.store.as_ref()
+    }
+
+    /// Clone an `Arc<dyn ConfigStore>` that retains the underlying
+    /// [`ConfigScopeLock`] until the last clone is dropped.
+    #[must_use]
+    pub fn store_arc(&self) -> Arc<dyn ConfigStore> {
+        Arc::clone(&self.store) as Arc<dyn ConfigStore>
+    }
+
+    /// Returns `true` when an advisory `config-migration.lock` is actively held,
+    /// or `false` when read-only access fell back directly to manifest inspection
+    /// on a read-only `SystemConfig` directory without a lock file (`RB-03h` AC4).
+    #[must_use]
+    pub fn is_locked(&self) -> bool {
+        self.store.lock.is_some()
+    }
+
+    /// Configuration scope role (`GlobalConfig` or `SystemConfig`).
+    #[must_use]
+    pub const fn role(&self) -> DatabaseRole {
+        self.role
+    }
+}
+
+/// Determine without attempting any file creation whether `scope_dir` is
+/// non-writable for the current process (read-only permissions or read-only
+/// filesystem mount) so read-only `SystemConfig` lookups can fall back without
+/// trying to create `config-migration.lock` (`RB-03h` AC4).
+fn is_scope_dir_non_writable_for_lock_create(scope_dir: &Path, dir_meta: &fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::{ffi::CString, os::unix::ffi::OsStrExt};
+
+        let _ = dir_meta;
+        if let Ok(c_dir) = CString::new(scope_dir.as_os_str().as_bytes()) {
+            // SAFETY: `c_dir` is a valid NUL-terminated path; `faccessat` with
+            // `W_OK | AT_EACCESS` asks the kernel for effective-credential write
+            // access (including EROFS read-only mounts) without creating any file.
+            let rc = unsafe {
+                libc::faccessat(libc::AT_FDCWD, c_dir.as_ptr(), libc::W_OK, libc::AT_EACCESS)
+            };
+            if rc != 0 {
+                let err = io::Error::last_os_error();
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::PermissionDenied | io::ErrorKind::ReadOnlyFilesystem
+                ) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = scope_dir;
+        dir_meta.permissions().readonly()
+    }
+}
+
+fn scope_dir_has_any_tracked_entry(scope_dir: &Path) -> StorageResult<bool> {
+    for candidate in [
+        config_format_manifest_path(scope_dir),
+        config_sqlite_path_in_scope_dir(scope_dir),
+        config_redb_path_in_scope_dir(scope_dir),
+        config_migration_lock_path(scope_dir),
+    ] {
+        match fs::symlink_metadata(&candidate) {
+            Ok(_) => return Ok(true),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(StorageBackendError::io(
+                    "probe config scope tracked files",
+                    err,
+                ));
+            }
+        }
+    }
+    Ok(false)
+}
+
+async fn open_store_from_authority(
+    authority: ConfigScopeAuthority,
+    role: DatabaseRole,
+    writable: bool,
 ) -> StorageResult<Arc<dyn ConfigStore>> {
-    match inspect_config_scope_authority(scope_dir, role)? {
+    match authority {
         ConfigScopeAuthority::Empty => Err(StorageBackendError::NotFound {
             resource: format!("{role} configuration scope"),
         }),
@@ -1232,13 +1675,16 @@ pub async fn open_config_scope_read_write(
             StorageBackendKind::Redb => {
                 #[cfg(feature = "storage-redb")]
                 {
-                    let store =
-                        crate::storage::redb::RedbConfigStore::open_read_write(&db_path, role)?;
+                    let store = if writable {
+                        crate::storage::redb::RedbConfigStore::open_read_write(&db_path, role)?
+                    } else {
+                        crate::storage::redb::RedbConfigStore::open_read_only(&db_path, role)?
+                    };
                     Ok(Arc::new(store))
                 }
                 #[cfg(not(feature = "storage-redb"))]
                 {
-                    let _ = db_path;
+                    let _ = (db_path, writable);
                     Err(StorageBackendError::UnsupportedBackend {
                         requested: StorageBackendKind::Redb.to_string(),
                         detail: format!(
@@ -1250,13 +1696,17 @@ pub async fn open_config_scope_read_write(
             StorageBackendKind::Sqlite => {
                 #[cfg(feature = "storage-sqlite")]
                 {
-                    let store =
-                        crate::storage::sqlite::SqliteConfigStore::open(&db_path, role).await?;
+                    let store = if writable {
+                        crate::storage::sqlite::SqliteConfigStore::open(&db_path, role).await?
+                    } else {
+                        crate::storage::sqlite::SqliteConfigStore::open_read_only(&db_path, role)
+                            .await?
+                    };
                     Ok(Arc::new(store))
                 }
                 #[cfg(not(feature = "storage-sqlite"))]
                 {
-                    let _ = db_path;
+                    let _ = (db_path, writable);
                     Err(StorageBackendError::UnsupportedBackend {
                         requested: StorageBackendKind::Sqlite.to_string(),
                         detail: format!(
@@ -1269,12 +1719,17 @@ pub async fn open_config_scope_read_write(
         ConfigScopeAuthority::LegacySqlite { db_path } => {
             #[cfg(feature = "storage-sqlite")]
             {
-                let store = crate::storage::sqlite::SqliteConfigStore::open(&db_path, role).await?;
+                let store = if writable {
+                    crate::storage::sqlite::SqliteConfigStore::open(&db_path, role).await?
+                } else {
+                    crate::storage::sqlite::SqliteConfigStore::open_read_only(&db_path, role)
+                        .await?
+                };
                 Ok(Arc::new(store))
             }
             #[cfg(not(feature = "storage-sqlite"))]
             {
-                let _ = db_path;
+                let _ = (db_path, writable);
                 Err(StorageBackendError::UnsupportedBackend {
                     requested: StorageBackendKind::Sqlite.to_string(),
                     detail: format!(
@@ -1293,91 +1748,223 @@ pub async fn open_config_scope_read_write(
     }
 }
 
-/// Open a `GlobalConfig` or `SystemConfig` scope strictly read-only after
-/// validating `config-format.json` authority (`ADR-RB-02` #2, `ADR-CF-06`, `RB-03b`).
+/// Open an existing `GlobalConfig` or `SystemConfig` scope writable under a
+/// bounded shared [`ConfigScopeLock`] (`ADR-RB-02` #2, `RB-03b`, `RB-03h`).
+///
+/// Keeps `LOCK_SH` held inside the returned [`LockedConfigScope`] guard for the
+/// duration of the caller's write operation so steady-state same-backend writers
+/// run concurrently while mutually excluding `LOCK_EX` migrations.
+pub async fn open_locked_config_scope_read_write(
+    scope_dir: &Path,
+    role: DatabaseRole,
+    lock_deadline: Duration,
+) -> StorageResult<LockedConfigScope> {
+    validate_config_scope_role(role)?;
+    let dir_owned = scope_dir.to_path_buf();
+    let (lock, authority) = tokio::task::spawn_blocking(move || {
+        match fs::metadata(&dir_owned) {
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: "config scope path must be a directory".to_string(),
+                });
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                if fs::symlink_metadata(&dir_owned).is_ok() {
+                    return Err(StorageBackendError::BackendInternal {
+                        detail: "config scope path is a dangling symlink".to_string(),
+                    });
+                }
+                return Err(StorageBackendError::NotFound {
+                    resource: format!("{role} configuration scope"),
+                });
+            }
+            Err(err) => return Err(StorageBackendError::io("stat config scope directory", err)),
+        }
+        if !scope_dir_has_any_tracked_entry(&dir_owned)? {
+            return Err(StorageBackendError::NotFound {
+                resource: format!("{role} configuration scope"),
+            });
+        }
+        let lock = ConfigScopeLock::try_lock_shared_bounded(&dir_owned, role, lock_deadline)?;
+        let authority = inspect_config_scope_authority(&dir_owned, role)?;
+        Ok((lock, authority))
+    })
+    .await
+    .map_err(|err| StorageBackendError::BackendInternal {
+        detail: format!("config scope writable lock task failed: {err}"),
+    })??;
+
+    let store = open_store_from_authority(authority, role, true).await?;
+    Ok(LockedConfigScope {
+        store: Arc::new(ScopeLockedConfigStore {
+            inner: store,
+            lock: Some(lock),
+        }),
+        role,
+    })
+}
+
+/// Open an existing `GlobalConfig` or `SystemConfig` scope writable using the
+/// default bounded lock deadline (`2s`).
+pub async fn open_config_scope_read_write(
+    scope_dir: &Path,
+    role: DatabaseRole,
+) -> StorageResult<Arc<dyn ConfigStore>> {
+    open_config_scope_read_write_with_deadline(scope_dir, role, DEFAULT_CONFIG_SCOPE_LOCK_TIMEOUT)
+        .await
+}
+
+/// Open an existing `GlobalConfig` or `SystemConfig` scope writable with a
+/// caller-specified bounded `ConfigScopeLock` deadline.
+pub async fn open_config_scope_read_write_with_deadline(
+    scope_dir: &Path,
+    role: DatabaseRole,
+    lock_deadline: Duration,
+) -> StorageResult<Arc<dyn ConfigStore>> {
+    let locked = open_locked_config_scope_read_write(scope_dir, role, lock_deadline).await?;
+    Ok(locked.store_arc())
+}
+
+/// Open a `GlobalConfig` or `SystemConfig` scope strictly read-only under a
+/// bounded shared [`ConfigScopeLock`] (or direct read-only manifest inspection
+/// fallback when `config-migration.lock` is absent in a read-only `SystemConfig`
+/// directory) (`ADR-RB-02` #2, `ADR-CF-06`, `RB-03b`, `RB-03h`).
 ///
 /// Guarantees:
 /// - Never reads `LIBRA_STORAGE_BACKEND` to bypass an unfinalized manifest.
-/// - Never creates `<scope_dir>`, `config-migration.lock`, `config-format.json`,
-///   `config.db`, or `config.redb`.
-/// - Returns [`StorageBackendError::NotFound`] when the scope directory is absent
-///   or contains no config store.
-/// - Accepts coexisting `config.db` tombstone when `config-format.json` is
-///   `backend="redb", finalized=true, legacy_sqlite_tombstone=true`.
+/// - Empty/missing scope directory immediately returns `NotFound` without
+///   creating any directory or `config-migration.lock` (`ADR-CF-06`).
+/// - Non-root read-only `SystemConfig` directory without `config-migration.lock`
+///   never attempts to create the lock file and falls back safely to read-only
+///   manifest inspection (`RB-03h` AC4).
+/// - When `config-migration.lock` exists, acquires bounded `LOCK_SH` strictly
+///   via read-only fd (`O_RDONLY | O_NOFOLLOW`) and fails closed with
+///   `WriteLockBusy` (`LBR-IO-001`) if exclusively held past `lock_deadline`.
+pub async fn open_locked_config_scope_read_only(
+    scope_dir: &Path,
+    role: DatabaseRole,
+    lock_deadline: Duration,
+) -> StorageResult<LockedConfigScope> {
+    validate_config_scope_role(role)?;
+    let dir_owned = scope_dir.to_path_buf();
+    let (lock, authority) = tokio::task::spawn_blocking(move || {
+        let dir_meta = match fs::metadata(&dir_owned) {
+            Ok(meta) if meta.is_dir() => meta,
+            Ok(_) => {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: "config scope path must be a directory".to_string(),
+                });
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                if fs::symlink_metadata(&dir_owned).is_ok() {
+                    return Err(StorageBackendError::BackendInternal {
+                        detail: "config scope path is a dangling symlink".to_string(),
+                    });
+                }
+                return Err(StorageBackendError::NotFound {
+                    resource: format!("{role} configuration scope"),
+                });
+            }
+            Err(err) => return Err(StorageBackendError::io("stat config scope directory", err)),
+        };
+
+        if !scope_dir_has_any_tracked_entry(&dir_owned)? {
+            return Err(StorageBackendError::NotFound {
+                resource: format!("{role} configuration scope"),
+            });
+        }
+
+        // First try locking an already-existing `config-migration.lock` strictly
+        // read-only (succeeds even in `0555` non-root `SystemConfig` dirs).
+        let lock = match ConfigScopeLock::try_lock_shared_if_present_bounded(
+            &dir_owned,
+            role,
+            lock_deadline,
+        )? {
+            Some(lock) => Some(lock),
+            None => {
+                // `ADR-RB-02` #2 / `RB-03h` AC4: unlocked read-only fallback is
+                // restricted strictly to non-writable `SystemConfig` directories
+                // where `config-migration.lock` does not yet exist. All writable
+                // directories and all `GlobalConfig` directories must acquire
+                // `LOCK_SH` or fail closed (`LBR-IO-001`).
+                if role == DatabaseRole::SystemConfig
+                    && is_scope_dir_non_writable_for_lock_create(&dir_owned, &dir_meta)
+                {
+                    None
+                } else {
+                    match ConfigScopeLock::try_lock_shared_bounded(&dir_owned, role, lock_deadline)
+                    {
+                        Ok(lock) => Some(lock),
+                        Err(err)
+                            if role == DatabaseRole::SystemConfig
+                                && matches!(
+                                    err.io_kind(),
+                                    Some(
+                                        io::ErrorKind::PermissionDenied
+                                            | io::ErrorKind::ReadOnlyFilesystem
+                                    )
+                                ) =>
+                        {
+                            // Permit unlocked fallback ONLY for `SystemConfig`
+                            // after confirming BOTH `config-migration.lock` is
+                            // still absent AND the directory is non-writable for
+                            // effective credentials. Any error on an existing
+                            // lock file fails closed (`LBR-IO-001`).
+                            let lock_still_absent = matches!(
+                                fs::symlink_metadata(config_migration_lock_path(&dir_owned)),
+                                Err(e) if e.kind() == io::ErrorKind::NotFound
+                            );
+                            let dir_now_non_writable = fs::metadata(&dir_owned)
+                                .map(|m| is_scope_dir_non_writable_for_lock_create(&dir_owned, &m))
+                                .unwrap_or(false);
+                            if lock_still_absent && dir_now_non_writable {
+                                None
+                            } else {
+                                return Err(err);
+                            }
+                        }
+                        Err(err) => return Err(err),
+                    }
+                }
+            }
+        };
+
+        let authority = inspect_config_scope_authority(&dir_owned, role)?;
+        Ok((lock, authority))
+    })
+    .await
+    .map_err(|err| StorageBackendError::BackendInternal {
+        detail: format!("config scope read-only lock task failed: {err}"),
+    })??;
+
+    let store = open_store_from_authority(authority, role, false).await?;
+    Ok(LockedConfigScope {
+        store: Arc::new(ScopeLockedConfigStore { inner: store, lock }),
+        role,
+    })
+}
+
+/// Open a `GlobalConfig` or `SystemConfig` scope strictly read-only using the
+/// default bounded lock deadline (`2s`).
 pub async fn open_config_scope_read_only(
     scope_dir: &Path,
     role: DatabaseRole,
 ) -> StorageResult<Arc<dyn ConfigStore>> {
-    match inspect_config_scope_authority(scope_dir, role)? {
-        ConfigScopeAuthority::Empty => Err(StorageBackendError::NotFound {
-            resource: format!("{role} configuration scope"),
-        }),
-        ConfigScopeAuthority::Manifest { manifest, db_path } => match manifest.backend {
-            StorageBackendKind::Redb => {
-                #[cfg(feature = "storage-redb")]
-                {
-                    let store =
-                        crate::storage::redb::RedbConfigStore::open_read_only(&db_path, role)?;
-                    Ok(Arc::new(store))
-                }
-                #[cfg(not(feature = "storage-redb"))]
-                {
-                    let _ = db_path;
-                    Err(StorageBackendError::UnsupportedBackend {
-                        requested: StorageBackendKind::Redb.to_string(),
-                        detail: format!(
-                            "{role} config scope uses redb, which is not compiled into this binary"
-                        ),
-                    })
-                }
-            }
-            StorageBackendKind::Sqlite => {
-                #[cfg(feature = "storage-sqlite")]
-                {
-                    let store =
-                        crate::storage::sqlite::SqliteConfigStore::open_read_only(&db_path, role)
-                            .await?;
-                    Ok(Arc::new(store))
-                }
-                #[cfg(not(feature = "storage-sqlite"))]
-                {
-                    let _ = db_path;
-                    Err(StorageBackendError::UnsupportedBackend {
-                        requested: StorageBackendKind::Sqlite.to_string(),
-                        detail: format!(
-                            "{role} config scope uses sqlite, which is not compiled into this binary"
-                        ),
-                    })
-                }
-            }
-        },
-        ConfigScopeAuthority::LegacySqlite { db_path } => {
-            #[cfg(feature = "storage-sqlite")]
-            {
-                let store =
-                    crate::storage::sqlite::SqliteConfigStore::open_read_only(&db_path, role)
-                        .await?;
-                Ok(Arc::new(store))
-            }
-            #[cfg(not(feature = "storage-sqlite"))]
-            {
-                let _ = db_path;
-                Err(StorageBackendError::UnsupportedBackend {
-                    requested: StorageBackendKind::Sqlite.to_string(),
-                    detail: format!(
-                        "{role} config scope has an unmigrated legacy sqlite config.db; run `libra-migrate`"
-                    ),
-                })
-            }
-        }
-        ConfigScopeAuthority::UnmanifestedRedb { .. } => {
-            Err(StorageBackendError::BackendInternal {
-                detail: format!(
-                    "{role} config scope contains unmanifested config.redb without config-format.json"
-                ),
-            })
-        }
-    }
+    open_config_scope_read_only_with_deadline(scope_dir, role, DEFAULT_CONFIG_SCOPE_LOCK_TIMEOUT)
+        .await
+}
+
+/// Open a `GlobalConfig` or `SystemConfig` scope strictly read-only with a
+/// caller-specified bounded `ConfigScopeLock` deadline.
+pub async fn open_config_scope_read_only_with_deadline(
+    scope_dir: &Path,
+    role: DatabaseRole,
+    lock_deadline: Duration,
+) -> StorageResult<Arc<dyn ConfigStore>> {
+    let locked = open_locked_config_scope_read_only(scope_dir, role, lock_deadline).await?;
+    Ok(locked.store_arc())
 }
 
 /// One flat configuration entry stored in `config_kv`.
@@ -5174,5 +5761,1063 @@ mod tests {
         let repo_role_err = inspect_config_scope_authority(&future_dir, DatabaseRole::Repository)
             .expect_err("Repository role must be rejected by config scope manifest inspector");
         assert_eq!(repo_role_err.stable_code_str(), "LBR-IO-001");
+    }
+
+    #[cfg(all(feature = "storage-sqlite", feature = "storage-redb"))]
+    #[tokio::test]
+    async fn config_scope_bounded_lock_shared_concurrency_and_timeout_error() {
+        use std::{
+            env, fs,
+            path::PathBuf,
+            process::{Child, Command, Stdio},
+        };
+
+        use tempfile::tempdir;
+
+        use crate::storage::redb::RedbConfigStore;
+
+        const CONCURRENT_WORKERS: usize = 4;
+        const CHILD_TIMEOUT: Duration = Duration::from_secs(20);
+
+        struct ChildReaper(Vec<(String, Child)>);
+        impl Drop for ChildReaper {
+            fn drop(&mut self) {
+                for (_, mut child) in self.0.drain(..) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        }
+
+        // Child worker mode for genuine multi-process flock verification.
+        if let Some(child_mode) = env::var_os("LIBRA_RB03H_CHILD_MODE") {
+            let scope_dir =
+                PathBuf::from(env::var_os("LIBRA_RB03H_SCOPE_DIR").expect("scope dir env"));
+            let sync_dir =
+                PathBuf::from(env::var_os("LIBRA_RB03H_SYNC_DIR").expect("sync dir env"));
+            let role = match env::var("LIBRA_RB03H_ROLE").expect("role env").as_str() {
+                "global" => DatabaseRole::GlobalConfig,
+                "system" => DatabaseRole::SystemConfig,
+                other => panic!("unexpected LIBRA_RB03H_ROLE: {other}"),
+            };
+
+            match child_mode.to_string_lossy().as_ref() {
+                "shared_worker" => {
+                    let worker_id = env::var("LIBRA_RB03H_WORKER_ID").expect("worker id env");
+                    let locked = open_locked_config_scope_read_write(
+                        &scope_dir,
+                        role,
+                        Duration::from_secs(5),
+                    )
+                    .await
+                    .expect("shared worker must acquire LOCK_SH and open store");
+                    assert!(locked.is_locked());
+
+                    // Signal that this process currently holds `LOCK_SH`, then wait
+                    // until ALL sibling processes simultaneously hold `LOCK_SH` too.
+                    fs::write(sync_dir.join(format!("held-{worker_id}")), b"ok")
+                        .expect("signal shared lock held");
+                    let release_marker = sync_dir.join("release-shared");
+                    let wait_deadline = Instant::now() + CHILD_TIMEOUT;
+                    while !release_marker.exists() {
+                        assert!(
+                            Instant::now() < wait_deadline,
+                            "shared worker `{worker_id}` timed out waiting for release signal"
+                        );
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+
+                    // Perform a real same-backend read + write while still holding `LOCK_SH`.
+                    let seeded = locked
+                        .store()
+                        .get("scope.seed")
+                        .await
+                        .expect("shared worker read");
+                    assert_eq!(seeded.map(|e| e.value), Some("shared-ready".to_string()));
+                    locked
+                        .store()
+                        .set(&format!("worker.{worker_id}"), "committed", false)
+                        .await
+                        .expect("shared worker write");
+                    drop(locked);
+                    println!("RB03H_CHILD_OK:shared_worker:{worker_id}");
+                    return;
+                }
+                "hold_exclusive" => {
+                    let _lock = ConfigScopeLock::try_lock_exclusive_bounded(
+                        &scope_dir,
+                        role,
+                        Duration::from_secs(5),
+                    )
+                    .expect("exclusive holder must acquire LOCK_EX");
+                    assert!(_lock.is_exclusive());
+                    fs::write(sync_dir.join("ex-held"), b"ok").expect("signal LOCK_EX held");
+                    let release_marker = sync_dir.join("release-ex");
+                    let wait_deadline = Instant::now() + CHILD_TIMEOUT;
+                    while !release_marker.exists() {
+                        assert!(
+                            Instant::now() < wait_deadline,
+                            "exclusive holder timed out waiting for release"
+                        );
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    drop(_lock);
+                    println!("RB03H_CHILD_OK:hold_exclusive");
+                    return;
+                }
+                "hold_shared" => {
+                    let _lock = ConfigScopeLock::try_lock_shared_bounded(
+                        &scope_dir,
+                        role,
+                        Duration::from_secs(5),
+                    )
+                    .expect("shared holder must acquire LOCK_SH");
+                    assert!(!_lock.is_exclusive());
+                    fs::write(sync_dir.join("sh-held"), b"ok").expect("signal LOCK_SH held");
+                    let release_marker = sync_dir.join("release-sh");
+                    let wait_deadline = Instant::now() + CHILD_TIMEOUT;
+                    while !release_marker.exists() {
+                        assert!(
+                            Instant::now() < wait_deadline,
+                            "shared holder timed out waiting for release"
+                        );
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    drop(_lock);
+                    println!("RB03H_CHILD_OK:hold_shared");
+                    return;
+                }
+                other => panic!("unexpected LIBRA_RB03H_CHILD_MODE: {other}"),
+            }
+        }
+
+        let exe = env::current_exe().expect("locate current test executable");
+        let root = tempdir().expect("create RB-03h lock test temp root");
+        let scope_dir = root.path().join("global-scope");
+        let sync_dir = root.path().join("sync");
+        fs::create_dir_all(&scope_dir).expect("create global scope dir");
+        fs::create_dir_all(&sync_dir).expect("create sync dir");
+
+        // Seed finalized redb scope + verified read-only sentinel tombstone.
+        let redb_path = config_redb_path_in_scope_dir(&scope_dir);
+        let sqlite_path = config_sqlite_path_in_scope_dir(&scope_dir);
+        let seed = RedbConfigStore::create(&redb_path, DatabaseRole::GlobalConfig)
+            .expect("create seeded redb config store");
+        seed.set("scope.seed", "shared-ready", false)
+            .await
+            .expect("seed scope.seed");
+        drop(seed);
+        fs::write(&sqlite_path, CONFIG_SQLITE_TOMBSTONE_SENTINEL).expect("write tombstone");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                &sqlite_path,
+                fs::Permissions::from_mode(GLOBAL_CONFIG_TOMBSTONE_MODE),
+            )
+            .expect("chmod 0400 tombstone");
+        }
+        #[cfg(not(unix))]
+        {
+            let mut perms = fs::metadata(&sqlite_path)
+                .expect("stat tombstone")
+                .permissions();
+            perms.set_readonly(true);
+            fs::set_permissions(&sqlite_path, perms).expect("set readonly tombstone");
+        }
+        let manifest =
+            ConfigFormatManifest::new_redb_finalized(1, true, DatabaseRole::GlobalConfig)
+                .expect("build finalized global manifest");
+        publish_config_format_manifest(&scope_dir, DatabaseRole::GlobalConfig, &manifest)
+            .expect("publish finalized global manifest");
+
+        // -----------------------------------------------------------------
+        // AC1: Multi-process steady-state concurrent `LOCK_SH` acquisition
+        // and concurrent same-backend reads/writes across 4 OS processes.
+        // -----------------------------------------------------------------
+        let mut reaper = ChildReaper(Vec::new());
+        for idx in 0..CONCURRENT_WORKERS {
+            let child = Command::new(&exe)
+                .arg("--exact")
+                .arg("storage::config_store::tests::config_scope_bounded_lock_shared_concurrency_and_timeout_error")
+                .arg("--nocapture")
+                .env("LIBRA_RB03H_CHILD_MODE", "shared_worker")
+                .env("LIBRA_RB03H_SCOPE_DIR", &scope_dir)
+                .env("LIBRA_RB03H_SYNC_DIR", &sync_dir)
+                .env("LIBRA_RB03H_ROLE", "global")
+                .env("LIBRA_RB03H_WORKER_ID", idx.to_string())
+                .env("LIBRA_TEST", "1")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn shared worker");
+            reaper.0.push((format!("worker-{idx}"), child));
+        }
+
+        // Wait until ALL 4 OS processes simultaneously hold `LOCK_SH` (proving true
+        // shared lock concurrency — if the lock were exclusive this would deadlock).
+        let barrier_deadline = Instant::now() + CHILD_TIMEOUT;
+        for idx in 0..CONCURRENT_WORKERS {
+            let marker = sync_dir.join(format!("held-{idx}"));
+            while !marker.exists() {
+                assert!(
+                    Instant::now() < barrier_deadline,
+                    "timed out waiting for shared worker {idx} to acquire LOCK_SH concurrently"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        // While all 4 processes hold `LOCK_SH`, an exclusive lock MUST time out immediately
+        // with `WriteLockBusy` (`LBR-IO-001`) under `Duration::ZERO` (AC3).
+        let ex_while_sh_err = ConfigScopeLock::try_lock_exclusive_bounded(
+            &scope_dir,
+            DatabaseRole::GlobalConfig,
+            Duration::ZERO,
+        )
+        .expect_err("try_lock_exclusive_bounded must fail closed while shared locks are held");
+        assert!(
+            matches!(
+                ex_while_sh_err,
+                StorageBackendError::WriteLockBusy {
+                    role: DatabaseRole::GlobalConfig,
+                    ..
+                }
+            ),
+            "expected WriteLockBusy on exclusive vs shared contention, got {ex_while_sh_err:?}"
+        );
+        assert_eq!(ex_while_sh_err.stable_code_str(), "LBR-IO-001");
+
+        // Release all 4 shared workers and confirm every worker's write committed cleanly.
+        fs::write(sync_dir.join("release-shared"), b"go").expect("release shared workers");
+        for (idx, (name, child)) in reaper.0.drain(..).enumerate() {
+            let output = child.wait_with_output().expect("join shared worker");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success()
+                    && stdout.contains(&format!("RB03H_CHILD_OK:shared_worker:{idx}"))
+                    && stdout.contains("1 passed; 0 failed"),
+                "shared worker `{name}` failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            );
+        }
+
+        let verify_ro = open_config_scope_read_only(&scope_dir, DatabaseRole::GlobalConfig)
+            .await
+            .expect("verify shared writes via read-only open");
+        for idx in 0..CONCURRENT_WORKERS {
+            assert_eq!(
+                verify_ro
+                    .get(&format!("worker.{idx}"))
+                    .await
+                    .expect("read worker key")
+                    .map(|e| e.value),
+                Some("committed".to_string())
+            );
+        }
+        drop(verify_ro);
+
+        // Verify `config-migration.lock` has exact `0600` mode for GlobalConfig on Unix.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let lock_mode = fs::symlink_metadata(config_migration_lock_path(&scope_dir))
+                .expect("stat global config-migration.lock")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                lock_mode, GLOBAL_CONFIG_FILE_MODE,
+                "GlobalConfig config-migration.lock must have mode 0600, got {lock_mode:04o}"
+            );
+        }
+
+        // -----------------------------------------------------------------
+        // AC2 & AC3: External process holds `LOCK_EX`; both
+        // `try_lock_shared_bounded` AND `try_lock_exclusive_bounded` (plus
+        // runtime RO/RW opens) MUST return typed `WriteLockBusy` (`LBR-IO-001`)
+        // under `Duration::ZERO` and bounded non-zero deadline without hanging.
+        // -----------------------------------------------------------------
+        let ex_child = Command::new(&exe)
+            .arg("--exact")
+            .arg("storage::config_store::tests::config_scope_bounded_lock_shared_concurrency_and_timeout_error")
+            .arg("--nocapture")
+            .env("LIBRA_RB03H_CHILD_MODE", "hold_exclusive")
+            .env("LIBRA_RB03H_SCOPE_DIR", &scope_dir)
+            .env("LIBRA_RB03H_SYNC_DIR", &sync_dir)
+            .env("LIBRA_RB03H_ROLE", "global")
+            .env("LIBRA_TEST", "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn exclusive holder child");
+        reaper.0.push(("hold_exclusive".to_string(), ex_child));
+
+        let ex_marker = sync_dir.join("ex-held");
+        let ex_wait = Instant::now() + CHILD_TIMEOUT;
+        while !ex_marker.exists() {
+            assert!(
+                Instant::now() < ex_wait,
+                "timed out waiting for external LOCK_EX holder"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // AC2: `try_lock_shared_bounded` with `Duration::ZERO` -> `LBR-IO-001`.
+        let sh_zero_err = ConfigScopeLock::try_lock_shared_bounded(
+            &scope_dir,
+            DatabaseRole::GlobalConfig,
+            Duration::ZERO,
+        )
+        .expect_err("try_lock_shared_bounded(0) must fail while LOCK_EX is held");
+        assert!(matches!(
+            sh_zero_err,
+            StorageBackendError::WriteLockBusy {
+                role: DatabaseRole::GlobalConfig,
+                ..
+            }
+        ));
+        assert_eq!(sh_zero_err.stable_code_str(), "LBR-IO-001");
+
+        // AC2: `try_lock_shared_bounded` with short non-zero deadline -> bounded `LBR-IO-001`.
+        let t0 = Instant::now();
+        let sh_short_err = ConfigScopeLock::try_lock_shared_bounded(
+            &scope_dir,
+            DatabaseRole::GlobalConfig,
+            Duration::from_millis(45),
+        )
+        .expect_err("try_lock_shared_bounded(45ms) must fail while LOCK_EX is held");
+        let elapsed_sh = t0.elapsed();
+        assert_eq!(sh_short_err.stable_code_str(), "LBR-IO-001");
+        assert!(
+            elapsed_sh >= Duration::from_millis(35) && elapsed_sh < Duration::from_secs(2),
+            "bounded shared lock wait elapsed out of expected window: {elapsed_sh:?}"
+        );
+
+        // AC2 on runtime RO & RW entrypoints.
+        let ro_busy = open_config_scope_read_only_with_deadline(
+            &scope_dir,
+            DatabaseRole::GlobalConfig,
+            Duration::ZERO,
+        )
+        .await
+        .expect_err("runtime RO open must return LBR-IO-001 when LOCK_EX is held");
+        assert_eq!(ro_busy.stable_code_str(), "LBR-IO-001");
+
+        let rw_busy = open_config_scope_read_write_with_deadline(
+            &scope_dir,
+            DatabaseRole::GlobalConfig,
+            Duration::ZERO,
+        )
+        .await
+        .expect_err("runtime RW open must return LBR-IO-001 when LOCK_EX is held");
+        assert_eq!(rw_busy.stable_code_str(), "LBR-IO-001");
+
+        // AC3: `try_lock_exclusive_bounded` with `Duration::ZERO` and short deadline -> `LBR-IO-001`.
+        let ex_zero_err = ConfigScopeLock::try_lock_exclusive_bounded(
+            &scope_dir,
+            DatabaseRole::GlobalConfig,
+            Duration::ZERO,
+        )
+        .expect_err("try_lock_exclusive_bounded(0) must fail while LOCK_EX is held");
+        assert!(matches!(
+            ex_zero_err,
+            StorageBackendError::WriteLockBusy {
+                role: DatabaseRole::GlobalConfig,
+                ..
+            }
+        ));
+        assert_eq!(ex_zero_err.stable_code_str(), "LBR-IO-001");
+
+        let t1 = Instant::now();
+        let ex_short_err = ConfigScopeLock::try_lock_exclusive_bounded(
+            &scope_dir,
+            DatabaseRole::GlobalConfig,
+            Duration::from_millis(45),
+        )
+        .expect_err("try_lock_exclusive_bounded(45ms) must fail while LOCK_EX is held");
+        let elapsed_ex = t1.elapsed();
+        assert_eq!(ex_short_err.stable_code_str(), "LBR-IO-001");
+        assert!(
+            elapsed_ex >= Duration::from_millis(35) && elapsed_ex < Duration::from_secs(2),
+            "bounded exclusive lock wait elapsed out of expected window: {elapsed_ex:?}"
+        );
+
+        // Release external `LOCK_EX` and verify immediate acquisition succeeds again.
+        fs::write(sync_dir.join("release-ex"), b"go").expect("release exclusive holder");
+        for (_, child) in reaper.0.drain(..) {
+            let output = child.wait_with_output().expect("join exclusive holder");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("RB03H_CHILD_OK:hold_exclusive"),
+                "exclusive holder did not exit cleanly: {stdout}"
+            );
+        }
+
+        let post_ex_lock = ConfigScopeLock::try_lock_exclusive_bounded(
+            &scope_dir,
+            DatabaseRole::GlobalConfig,
+            Duration::ZERO,
+        )
+        .expect("LOCK_EX must succeed immediately after external holder releases");
+        drop(post_ex_lock);
+
+        // Regression (Codex R1 P1 #1): Returned `Arc<dyn ConfigStore>` handles
+        // from `open_config_scope_read_only`, `open_config_scope_read_write`,
+        // AND cloned `LockedConfigScope::store_arc()` (even after the guard
+        // itself drops) MUST retain `LOCK_SH` for their entire lifetime,
+        // keeping `try_lock_exclusive_bounded(..., Duration::ZERO)` blocked
+        // with `WriteLockBusy` (`LBR-IO-001`) until the final `Arc` drops.
+        {
+            let ro_handle = open_config_scope_read_only(&scope_dir, DatabaseRole::GlobalConfig)
+                .await
+                .expect("open RO handle for lock-lifetime verification");
+            let blocked_ro = ConfigScopeLock::try_lock_exclusive_bounded(
+                &scope_dir,
+                DatabaseRole::GlobalConfig,
+                Duration::ZERO,
+            )
+            .expect_err("LOCK_EX must remain blocked while RO Arc<dyn ConfigStore> is alive");
+            assert_eq!(blocked_ro.stable_code_str(), "LBR-IO-001");
+            assert!(
+                ro_handle
+                    .get("scope.seed")
+                    .await
+                    .expect("read under held RO lock")
+                    .is_some()
+            );
+            drop(ro_handle);
+            drop(
+                ConfigScopeLock::try_lock_exclusive_bounded(
+                    &scope_dir,
+                    DatabaseRole::GlobalConfig,
+                    Duration::ZERO,
+                )
+                .expect("LOCK_EX must succeed immediately after RO handle drops"),
+            );
+
+            let rw_handle = open_config_scope_read_write(&scope_dir, DatabaseRole::GlobalConfig)
+                .await
+                .expect("open RW handle for lock-lifetime verification");
+            let blocked_rw = ConfigScopeLock::try_lock_exclusive_bounded(
+                &scope_dir,
+                DatabaseRole::GlobalConfig,
+                Duration::ZERO,
+            )
+            .expect_err("LOCK_EX must remain blocked while RW Arc<dyn ConfigStore> is alive");
+            assert_eq!(blocked_rw.stable_code_str(), "LBR-IO-001");
+            rw_handle
+                .set("lock.lifetime", "held", false)
+                .await
+                .expect("write under held RW lock");
+            drop(rw_handle);
+            drop(
+                ConfigScopeLock::try_lock_exclusive_bounded(
+                    &scope_dir,
+                    DatabaseRole::GlobalConfig,
+                    Duration::ZERO,
+                )
+                .expect("LOCK_EX must succeed immediately after RW handle drops"),
+            );
+
+            let guard = open_locked_config_scope_read_only(
+                &scope_dir,
+                DatabaseRole::GlobalConfig,
+                Duration::ZERO,
+            )
+            .await
+            .expect("open locked guard for store_arc lifetime verification");
+            let cloned_arc = guard.store_arc();
+            drop(guard);
+            let blocked_arc = ConfigScopeLock::try_lock_exclusive_bounded(
+                &scope_dir,
+                DatabaseRole::GlobalConfig,
+                Duration::ZERO,
+            )
+            .expect_err("LOCK_EX must remain blocked while cloned store_arc() outlives guard");
+            assert_eq!(blocked_arc.stable_code_str(), "LBR-IO-001");
+            drop(cloned_arc);
+            drop(
+                ConfigScopeLock::try_lock_exclusive_bounded(
+                    &scope_dir,
+                    DatabaseRole::GlobalConfig,
+                    Duration::ZERO,
+                )
+                .expect("LOCK_EX must succeed immediately after cloned store_arc() drops"),
+            );
+        }
+
+        // Verify external `LOCK_SH` also blocks `try_lock_exclusive_bounded` (`LBR-IO-001`).
+        let sh_child = Command::new(&exe)
+            .arg("--exact")
+            .arg("storage::config_store::tests::config_scope_bounded_lock_shared_concurrency_and_timeout_error")
+            .arg("--nocapture")
+            .env("LIBRA_RB03H_CHILD_MODE", "hold_shared")
+            .env("LIBRA_RB03H_SCOPE_DIR", &scope_dir)
+            .env("LIBRA_RB03H_SYNC_DIR", &sync_dir)
+            .env("LIBRA_RB03H_ROLE", "global")
+            .env("LIBRA_TEST", "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn shared holder child");
+        reaper.0.push(("hold_shared".to_string(), sh_child));
+
+        let sh_marker = sync_dir.join("sh-held");
+        let sh_wait = Instant::now() + CHILD_TIMEOUT;
+        while !sh_marker.exists() {
+            assert!(
+                Instant::now() < sh_wait,
+                "timed out waiting for external LOCK_SH holder"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let ex_blocked_by_sh = ConfigScopeLock::try_lock_exclusive_bounded(
+            &scope_dir,
+            DatabaseRole::GlobalConfig,
+            Duration::ZERO,
+        )
+        .expect_err("LOCK_EX must fail closed with LBR-IO-001 while external LOCK_SH is held");
+        assert_eq!(ex_blocked_by_sh.stable_code_str(), "LBR-IO-001");
+        fs::write(sync_dir.join("release-sh"), b"go").expect("release shared holder");
+        for (_, child) in reaper.0.drain(..) {
+            let output = child.wait_with_output().expect("join shared holder");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("RB03H_CHILD_OK:hold_shared"),
+                "shared holder did not exit cleanly: {stdout}"
+            );
+        }
+
+        // Restore writable mode on tombstone before tempdir cleanup.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&sqlite_path, fs::Permissions::from_mode(0o600));
+        }
+        #[cfg(not(unix))]
+        {
+            if let Ok(meta) = fs::metadata(&sqlite_path) {
+                let mut perms = meta.permissions();
+                perms.set_readonly(false);
+                let _ = fs::set_permissions(&sqlite_path, perms);
+            }
+        }
+    }
+
+    #[cfg(all(feature = "storage-sqlite", feature = "storage-redb"))]
+    #[tokio::test]
+    async fn config_scope_readonly_absent_and_ro_system_dir_fallback() {
+        use std::{fs, path::PathBuf};
+
+        use tempfile::tempdir;
+
+        use crate::storage::redb::RedbConfigStore;
+
+        /// Ensures directory and file permissions are restored before `TempDir` drops.
+        struct ModeRestoreGuard {
+            dirs: Vec<PathBuf>,
+            files: Vec<PathBuf>,
+        }
+
+        impl Drop for ModeRestoreGuard {
+            fn drop(&mut self) {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    for d in &self.dirs {
+                        let _ = fs::set_permissions(d, fs::Permissions::from_mode(0o755));
+                    }
+                    for f in &self.files {
+                        let _ = fs::set_permissions(f, fs::Permissions::from_mode(0o644));
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    for f in &self.files {
+                        if let Ok(meta) = fs::metadata(f) {
+                            let mut perms = meta.permissions();
+                            perms.set_readonly(false);
+                            let _ = fs::set_permissions(f, perms);
+                        }
+                    }
+                }
+            }
+        }
+
+        let root = tempdir().expect("create RB-03h RO system dir temp root");
+        let mut restore = ModeRestoreGuard {
+            dirs: Vec::new(),
+            files: Vec::new(),
+        };
+
+        // 1. Absent and empty `SystemConfig` / `GlobalConfig` dirs return `NotFound`
+        //    without creating any directory or `config-migration.lock` (`ADR-CF-06`).
+        for (label, role) in [
+            ("global", DatabaseRole::GlobalConfig),
+            ("system", DatabaseRole::SystemConfig),
+        ] {
+            let missing_dir = root.path().join(format!("{label}-missing"));
+            let err = open_locked_config_scope_read_only(&missing_dir, role, Duration::ZERO)
+                .await
+                .expect_err("missing scope dir must return NotFound");
+            assert!(matches!(err, StorageBackendError::NotFound { .. }));
+            assert!(!missing_dir.exists());
+            assert!(!config_migration_lock_path(&missing_dir).exists());
+
+            let empty_dir = root.path().join(format!("{label}-empty"));
+            fs::create_dir_all(&empty_dir).expect("create empty scope dir");
+            let err_empty = open_locked_config_scope_read_only(&empty_dir, role, Duration::ZERO)
+                .await
+                .expect_err("empty scope dir must return NotFound");
+            assert!(matches!(err_empty, StorageBackendError::NotFound { .. }));
+            assert!(!config_migration_lock_path(&empty_dir).exists());
+        }
+
+        // 2. AC4: Read-only (`0555`) `SystemConfig` directory WITHOUT
+        //    `config-migration.lock` MUST degrade safely to direct read-only
+        //    manifest inspection and NEVER attempt to create the lock file.
+        let ro_sys_dir = root.path().join("ro-system-no-lock");
+        fs::create_dir_all(&ro_sys_dir).expect("create ro system dir");
+        let sys_redb = config_redb_path_in_scope_dir(&ro_sys_dir);
+        let sys_sqlite = config_sqlite_path_in_scope_dir(&ro_sys_dir);
+
+        let seed = RedbConfigStore::create(&sys_redb, DatabaseRole::SystemConfig)
+            .expect("create SystemConfig config.redb");
+        seed.set("core.editor", "nano-system-ro", false)
+            .await
+            .expect("seed SystemConfig core.editor");
+        drop(seed);
+
+        fs::write(&sys_sqlite, CONFIG_SQLITE_TOMBSTONE_SENTINEL)
+            .expect("write system config.db tombstone");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                &sys_sqlite,
+                fs::Permissions::from_mode(SYSTEM_CONFIG_TOMBSTONE_MODE),
+            )
+            .expect("chmod 0444 system tombstone");
+        }
+        #[cfg(not(unix))]
+        {
+            let mut perms = fs::metadata(&sys_sqlite)
+                .expect("stat tombstone")
+                .permissions();
+            perms.set_readonly(true);
+            fs::set_permissions(&sys_sqlite, perms).expect("set readonly tombstone");
+        }
+        restore.files.push(sys_sqlite.clone());
+
+        let sys_manifest =
+            ConfigFormatManifest::new_redb_finalized(1, true, DatabaseRole::SystemConfig)
+                .expect("build finalized system manifest");
+        publish_config_format_manifest(&ro_sys_dir, DatabaseRole::SystemConfig, &sys_manifest)
+            .expect("publish finalized system manifest");
+
+        // Ensure `config-migration.lock` does NOT exist, then lock down directory to `0555`.
+        let missing_lock = config_migration_lock_path(&ro_sys_dir);
+        assert!(!missing_lock.exists());
+        restore.dirs.push(ro_sys_dir.clone());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&ro_sys_dir, fs::Permissions::from_mode(0o555))
+                .expect("chmod 0555 read-only system dir");
+        }
+
+        #[cfg(not(unix))]
+        {
+            let mut perms = fs::metadata(&ro_sys_dir)
+                .expect("stat ro system dir")
+                .permissions();
+            perms.set_readonly(true);
+            fs::set_permissions(&ro_sys_dir, perms).expect("set readonly on system dir");
+        }
+
+        let is_privileged_unix_root = {
+            #[cfg(unix)]
+            {
+                // SAFETY: `geteuid` has no preconditions and always succeeds.
+                unsafe { libc::geteuid() == 0 }
+            }
+            #[cfg(not(unix))]
+            {
+                false
+            }
+        };
+
+        let locked_ro = open_locked_config_scope_read_only(
+            &ro_sys_dir,
+            DatabaseRole::SystemConfig,
+            Duration::ZERO,
+        )
+        .await
+        .expect("RO SystemConfig dir without config-migration.lock must open cleanly");
+        if is_privileged_unix_root {
+            assert!(
+                locked_ro.is_locked(),
+                "privileged root process with effective write access must still coordinate via LOCK_SH"
+            );
+            assert!(
+                missing_lock.is_file(),
+                "privileged root process must create config-migration.lock rather than bypassing coordination"
+            );
+        } else {
+            assert!(
+                !locked_ro.is_locked(),
+                "non-root RO SystemConfig dir without lock file must use unlocked direct-manifest fallback"
+            );
+        }
+        assert_eq!(locked_ro.role(), DatabaseRole::SystemConfig);
+        assert_eq!(
+            locked_ro
+                .store()
+                .get("core.editor")
+                .await
+                .expect("read core.editor from RO SystemConfig"),
+            Some(ConfigEntry {
+                key: "core.editor".to_string(),
+                value: "nano-system-ro".to_string(),
+                encrypted: false,
+            })
+        );
+        drop(locked_ro);
+        if !is_privileged_unix_root {
+            assert!(
+                !missing_lock.exists(),
+                "AC4 violation: non-root RO SystemConfig lookup must NEVER create config-migration.lock"
+            );
+        }
+
+        // Also verify direct `open_config_scope_read_only` works identically and creates zero lock file when non-root.
+        let direct_ro = open_config_scope_read_only(&ro_sys_dir, DatabaseRole::SystemConfig)
+            .await
+            .expect("open_config_scope_read_only on RO SystemConfig dir must succeed");
+        assert_eq!(
+            direct_ro
+                .get("core.editor")
+                .await
+                .expect("read via direct RO open")
+                .map(|e| e.value),
+            Some("nano-system-ro".to_string())
+        );
+        drop(direct_ro);
+        if !is_privileged_unix_root {
+            assert!(!missing_lock.exists());
+        }
+
+        // 3. When `config-migration.lock` (`0644`) DOES exist inside a `0555`
+        //    read-only `SystemConfig` directory, read-only open MUST acquire
+        //    `LOCK_SH` strictly via read-only fd (`is_locked() == true`), and
+        //    still honor an external `LOCK_EX` with `LBR-IO-001`.
+        let ro_sys_with_lock = root.path().join("ro-system-with-lock");
+        fs::create_dir_all(&ro_sys_with_lock).expect("create ro system dir with lock");
+        let sys2_redb = config_redb_path_in_scope_dir(&ro_sys_with_lock);
+        let sys2_sqlite = config_sqlite_path_in_scope_dir(&ro_sys_with_lock);
+        let seed2 = RedbConfigStore::create(&sys2_redb, DatabaseRole::SystemConfig)
+            .expect("create second SystemConfig redb");
+        seed2
+            .set("core.pager", "cat", false)
+            .await
+            .expect("seed core.pager");
+        drop(seed2);
+        fs::write(&sys2_sqlite, CONFIG_SQLITE_TOMBSTONE_SENTINEL)
+            .expect("write second system tombstone");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                &sys2_sqlite,
+                fs::Permissions::from_mode(SYSTEM_CONFIG_TOMBSTONE_MODE),
+            )
+            .expect("chmod 0444 second system tombstone");
+        }
+        #[cfg(not(unix))]
+        {
+            let mut perms = fs::metadata(&sys2_sqlite)
+                .expect("stat tombstone")
+                .permissions();
+            perms.set_readonly(true);
+            fs::set_permissions(&sys2_sqlite, perms).expect("set readonly tombstone");
+        }
+        restore.files.push(sys2_sqlite.clone());
+        publish_config_format_manifest(
+            &ro_sys_with_lock,
+            DatabaseRole::SystemConfig,
+            &sys_manifest,
+        )
+        .expect("publish second system manifest");
+
+        // Pre-create `config-migration.lock` with SystemConfig mode `0644` before locking down dir.
+        let init_lock = ConfigScopeLock::try_lock_exclusive_bounded(
+            &ro_sys_with_lock,
+            DatabaseRole::SystemConfig,
+            Duration::ZERO,
+        )
+        .expect("create SystemConfig config-migration.lock");
+        drop(init_lock);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let lock_mode = fs::symlink_metadata(config_migration_lock_path(&ro_sys_with_lock))
+                .expect("stat system config-migration.lock")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                lock_mode, SYSTEM_CONFIG_FILE_MODE,
+                "SystemConfig config-migration.lock must have exact mode 0644, got {lock_mode:04o}"
+            );
+        }
+
+        restore.dirs.push(ro_sys_with_lock.clone());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&ro_sys_with_lock, fs::Permissions::from_mode(0o555))
+                .expect("chmod 0555 second RO system dir");
+        }
+
+        let locked_sys2 = open_locked_config_scope_read_only(
+            &ro_sys_with_lock,
+            DatabaseRole::SystemConfig,
+            Duration::ZERO,
+        )
+        .await
+        .expect("RO SystemConfig dir with existing 0644 lock file must acquire LOCK_SH");
+        assert!(
+            locked_sys2.is_locked(),
+            "RO SystemConfig dir with existing lock file must hold LOCK_SH"
+        );
+        assert_eq!(
+            locked_sys2
+                .store()
+                .get("core.pager")
+                .await
+                .expect("read core.pager")
+                .map(|e| e.value),
+            Some("cat".to_string())
+        );
+        drop(locked_sys2);
+
+        // 4. Regression (Codex R1 P1 #2): In a WRITABLE `SystemConfig` directory
+        //    where `config-migration.lock` is initially absent, read-only open
+        //    MUST NOT bypass locking — it MUST create `0644` `config-migration.lock`,
+        //    acquire `LOCK_SH`, and block a concurrent `LOCK_EX` migration until
+        //    the returned store handle drops.
+        let writable_sys_dir = root.path().join("writable-system-no-lock");
+        fs::create_dir_all(&writable_sys_dir).expect("create writable system dir");
+        let wsys_redb = config_redb_path_in_scope_dir(&writable_sys_dir);
+        let wsys_sqlite = config_sqlite_path_in_scope_dir(&writable_sys_dir);
+        let seed_w = RedbConfigStore::create(&wsys_redb, DatabaseRole::SystemConfig)
+            .expect("create writable SystemConfig redb");
+        seed_w
+            .set("core.autocrlf", "false", false)
+            .await
+            .expect("seed writable SystemConfig");
+        drop(seed_w);
+        fs::write(&wsys_sqlite, CONFIG_SQLITE_TOMBSTONE_SENTINEL)
+            .expect("write writable system tombstone");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                &wsys_sqlite,
+                fs::Permissions::from_mode(SYSTEM_CONFIG_TOMBSTONE_MODE),
+            )
+            .expect("chmod 0444 writable system tombstone");
+        }
+        #[cfg(not(unix))]
+        {
+            let mut perms = fs::metadata(&wsys_sqlite)
+                .expect("stat tombstone")
+                .permissions();
+            perms.set_readonly(true);
+            fs::set_permissions(&wsys_sqlite, perms).expect("set readonly tombstone");
+        }
+        restore.files.push(wsys_sqlite);
+        publish_config_format_manifest(
+            &writable_sys_dir,
+            DatabaseRole::SystemConfig,
+            &sys_manifest,
+        )
+        .expect("publish writable system manifest");
+        let wsys_lock_path = config_migration_lock_path(&writable_sys_dir);
+        assert!(!wsys_lock_path.exists());
+
+        let locked_writable_sys = open_locked_config_scope_read_only(
+            &writable_sys_dir,
+            DatabaseRole::SystemConfig,
+            Duration::ZERO,
+        )
+        .await
+        .expect("writable SystemConfig RO open must create and lock config-migration.lock");
+        assert!(
+            locked_writable_sys.is_locked(),
+            "writable SystemConfig RO open must hold LOCK_SH rather than unlocked fallback"
+        );
+        assert!(wsys_lock_path.is_file());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::symlink_metadata(&wsys_lock_path)
+                .expect("stat created system lock")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, SYSTEM_CONFIG_FILE_MODE);
+        }
+        // Concurrent migration (`LOCK_EX`) must be blocked while writable system reader is live.
+        let mig_blocked = ConfigScopeLock::try_lock_exclusive_bounded(
+            &writable_sys_dir,
+            DatabaseRole::SystemConfig,
+            Duration::ZERO,
+        )
+        .expect_err("concurrent migration LOCK_EX must be blocked while writable SystemConfig reader holds LOCK_SH");
+        assert_eq!(mig_blocked.stable_code_str(), "LBR-IO-001");
+        assert_eq!(
+            locked_writable_sys
+                .store()
+                .get("core.autocrlf")
+                .await
+                .expect("read writable system key")
+                .map(|e| e.value),
+            Some("false".to_string())
+        );
+        drop(locked_writable_sys);
+        drop(
+            ConfigScopeLock::try_lock_exclusive_bounded(
+                &writable_sys_dir,
+                DatabaseRole::SystemConfig,
+                Duration::ZERO,
+            )
+            .expect("migration LOCK_EX must succeed once writable SystemConfig reader drops"),
+        );
+
+        // Verify symlink at `config-migration.lock` fails closed (`LBR-IO-001`) and
+        // never silently degrades to unlocked fallback.
+        #[cfg(unix)]
+        {
+            let sym_dir = root.path().join("system-symlink-lock");
+            fs::create_dir_all(&sym_dir).expect("create symlink lock dir");
+            let sym_redb = config_redb_path_in_scope_dir(&sym_dir);
+            let sym_sqlite = config_sqlite_path_in_scope_dir(&sym_dir);
+            RedbConfigStore::create(&sym_redb, DatabaseRole::SystemConfig)
+                .expect("create sym redb");
+            fs::write(&sym_sqlite, CONFIG_SQLITE_TOMBSTONE_SENTINEL).expect("write sym tomb");
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(
+                    &sym_sqlite,
+                    fs::Permissions::from_mode(SYSTEM_CONFIG_TOMBSTONE_MODE),
+                )
+                .expect("chmod sym tomb");
+            }
+            restore.files.push(sym_sqlite);
+            publish_config_format_manifest(&sym_dir, DatabaseRole::SystemConfig, &sys_manifest)
+                .expect("publish sym manifest");
+            std::os::unix::fs::symlink(&sym_redb, config_migration_lock_path(&sym_dir))
+                .expect("create symlink config-migration.lock");
+            let sym_err = open_locked_config_scope_read_only(
+                &sym_dir,
+                DatabaseRole::SystemConfig,
+                Duration::ZERO,
+            )
+            .await
+            .expect_err("symlink config-migration.lock must fail closed");
+            assert_eq!(sym_err.stable_code_str(), "LBR-IO-001");
+
+            // Regression (Codex R2 P1): an existing unreadable (`0000`) lock file
+            // inside a writable directory must FAIL CLOSED (`LBR-IO-001`) instead
+            // of degrading to unlocked fallback (when running as non-root).
+            // SAFETY: `geteuid` has no preconditions and always succeeds.
+            if unsafe { libc::geteuid() } != 0 {
+                let unreadable_dir = root.path().join("system-unreadable-lock");
+                fs::create_dir_all(&unreadable_dir).expect("create unreadable lock dir");
+                let ur_redb = config_redb_path_in_scope_dir(&unreadable_dir);
+                let ur_sqlite = config_sqlite_path_in_scope_dir(&unreadable_dir);
+                RedbConfigStore::create(&ur_redb, DatabaseRole::SystemConfig)
+                    .expect("create ur redb");
+                fs::write(&ur_sqlite, CONFIG_SQLITE_TOMBSTONE_SENTINEL).expect("write ur tomb");
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(
+                        &ur_sqlite,
+                        fs::Permissions::from_mode(SYSTEM_CONFIG_TOMBSTONE_MODE),
+                    )
+                    .expect("chmod ur tomb");
+                }
+                restore.files.push(ur_sqlite);
+                publish_config_format_manifest(
+                    &unreadable_dir,
+                    DatabaseRole::SystemConfig,
+                    &sys_manifest,
+                )
+                .expect("publish ur manifest");
+                let ur_lock = config_migration_lock_path(&unreadable_dir);
+                fs::write(&ur_lock, b"").expect("create unreadable lock file");
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(&ur_lock, fs::Permissions::from_mode(0o000))
+                        .expect("chmod 0000 lock file");
+                }
+                restore.files.push(ur_lock);
+                let ur_err = open_locked_config_scope_read_only(
+                    &unreadable_dir,
+                    DatabaseRole::SystemConfig,
+                    Duration::ZERO,
+                )
+                .await
+                .expect_err("existing unreadable lock file in writable dir must fail closed");
+                assert_eq!(ur_err.stable_code_str(), "LBR-IO-001");
+
+                // Regression (Codex R3 P1 #2): read-only `0555` `GlobalConfig`
+                // directory without `config-migration.lock` MUST fail closed
+                // (`LBR-IO-001`) instead of using the `SystemConfig`-only fallback.
+                let ro_global_dir = root.path().join("ro-global-no-lock");
+                fs::create_dir_all(&ro_global_dir).expect("create ro global dir");
+                let rg_redb = config_redb_path_in_scope_dir(&ro_global_dir);
+                let rg_sqlite = config_sqlite_path_in_scope_dir(&ro_global_dir);
+                RedbConfigStore::create(&rg_redb, DatabaseRole::GlobalConfig)
+                    .expect("create rg redb");
+                fs::write(&rg_sqlite, CONFIG_SQLITE_TOMBSTONE_SENTINEL).expect("write rg tomb");
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(
+                        &rg_sqlite,
+                        fs::Permissions::from_mode(GLOBAL_CONFIG_TOMBSTONE_MODE),
+                    )
+                    .expect("chmod rg tomb");
+                }
+                restore.files.push(rg_sqlite);
+                let global_manifest =
+                    ConfigFormatManifest::new_redb_finalized(1, true, DatabaseRole::GlobalConfig)
+                        .expect("build global manifest");
+                publish_config_format_manifest(
+                    &ro_global_dir,
+                    DatabaseRole::GlobalConfig,
+                    &global_manifest,
+                )
+                .expect("publish rg manifest");
+                restore.dirs.push(ro_global_dir.clone());
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(&ro_global_dir, fs::Permissions::from_mode(0o555))
+                        .expect("chmod 0555 ro global dir");
+                }
+                let ro_global_err = open_locked_config_scope_read_only(
+                    &ro_global_dir,
+                    DatabaseRole::GlobalConfig,
+                    Duration::ZERO,
+                )
+                .await
+                .expect_err("RO GlobalConfig dir without lock file must fail closed");
+                assert_eq!(ro_global_err.stable_code_str(), "LBR-IO-001");
+                assert!(!config_migration_lock_path(&ro_global_dir).exists());
+            }
+        }
     }
 }

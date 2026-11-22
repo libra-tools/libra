@@ -1358,7 +1358,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `done` / `remote-pending`（`v0.30.307`；Codex R2 `PASS`；覆盖 pending 清单、双文件分裂、哨兵与真 SQLite `__libra_migrated_fence__` 墓碑校验及空目录只读零建文件）
+**Lifecycle / Acceptance:** `done` / `remote-verified`（`600b335` / `v0.30.307`；Codex R2 `PASS`；覆盖 pending 清单、双文件分裂、哨兵与真 SQLite `__libra_migrated_fence__` 墓碑校验及空目录只读零建文件）
 
 **Description:** 100% 在独占目录 `src/storage/**` 内落实 `ADR-RB-02` #2 的跨运行时作用域清单前置校验：覆盖 `finalized == false` 中间态拒访、无清单双文件共存分裂拒访、带 `legacy_sqlite_tombstone = true` 的已定稿 `Redb` 清单对共存 `config.db` 墓碑的合法识别，以及空配置目录只读零建文件（`ADR-CF-06`）。
 
@@ -1417,7 +1417,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `remote-pending`（`v0.30.308`；Codex R1–R3 全项真实 P1 已闭环并绿灯，R4 提出与本卡 AC4 / `ADR-RB-02` #2 明文降级契约冲突的要求，按用户授权跳过后续 Review 直接推进 Stage 2）
 
 **Description:** 100% 在独占目录 `src/storage/**` 内落实 `ConfigScopeLock::try_lock_shared_bounded` / `try_lock_exclusive_bounded` 有界协调锁契约（防止跨进程锁竞争无限挂起）及非 root 无写权限只读 `SystemConfig` 目录缺锁文件时的安全只读降级。
 
@@ -1431,16 +1431,16 @@
 | 配置运行时必须通过有界锁获取契约避免无限挂起，并在非 root 只读系统目录无权建锁文件时安全降级为只读直查清单 | `ADR-RB-02` #2 |
 
 **Acceptance criteria:**
-- [ ] 稳态读写路径通过 `ConfigScopeLock::try_lock_shared_bounded(deadline)` 获取共享锁并允许同后端多进程并发访问。
-- [ ] 外部持排他 `LOCK_EX` 超过 `deadline`（单测支持 `Duration::ZERO`）时，`try_lock_shared_bounded` 返回类型化 `LBR-IO-001`。
-- [ ] 外部持锁超过 `deadline`（单测支持 `Duration::ZERO`）时，`try_lock_exclusive_bounded` 返回类型化 `LBR-IO-001`。
-- [ ] 无写权限的非 root 只读 `SystemConfig` 目录在 `config-migration.lock` 尚不存在时安全降级为只读直查清单，不尝试创建锁文件。
+- [x] 稳态读写路径通过 `ConfigScopeLock::try_lock_shared_bounded(deadline)` 获取共享锁并允许同后端多进程并发访问。
+- [x] 外部持排他 `LOCK_EX` 超过 `deadline`（单测支持 `Duration::ZERO`）时，`try_lock_shared_bounded` 返回类型化 `LBR-IO-001`。
+- [x] 外部持锁超过 `deadline`（单测支持 `Duration::ZERO`）时，`try_lock_exclusive_bounded` 返回类型化 `LBR-IO-001`。
+- [x] 无写权限的非 root 只读 `SystemConfig` 目录在 `config-migration.lock` 尚不存在时安全降级为只读直查清单，不尝试创建锁文件。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::config_store::tests::config_scope_bounded_lock_shared_concurrency_and_timeout_error) | test(=storage::config_store::tests::config_scope_readonly_absent_and_ro_system_dir_fallback)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::config_store::tests::config_scope_bounded_lock_shared_concurrency_and_timeout_error)'`（new，覆盖 AC1、AC2、AC3）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::config_store::tests::config_scope_readonly_absent_and_ro_system_dir_fallback)'`（new，覆盖 AC4）
-- [ ] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 6 文件实现白名单。
+- [x] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::config_store::tests::config_scope_bounded_lock_shared_concurrency_and_timeout_error) | test(=storage::config_store::tests::config_scope_readonly_absent_and_ro_system_dir_fallback)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::config_store::tests::config_scope_bounded_lock_shared_concurrency_and_timeout_error)'`（new，覆盖 AC1、AC2、AC3）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::config_store::tests::config_scope_readonly_absent_and_ro_system_dir_fallback)'`（new，覆盖 AC4）
+- [x] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 6 文件实现白名单。
 
 **Full-suite trigger:** `none`
 

@@ -36,14 +36,17 @@ pub use backend::{
 pub use config_store::{
     CONFIG_FORMAT_MANIFEST_FILE, CONFIG_FORMAT_MANIFEST_VERSION, CONFIG_MIGRATION_LOCK_FILE,
     CONFIG_REDB_FILE_NAME, CONFIG_SQLITE_FILE_NAME, CONFIG_SQLITE_TOMBSTONE_SENTINEL, ConfigEntry,
-    ConfigFormatManifest, ConfigInitPhase, ConfigScopeAuthority, ConfigStore,
-    LIBRA_CONFIG_GLOBAL_DB_ENV, LIBRA_CONFIG_SYSTEM_DB_ENV, LegacyConfigEntry, MetadataCasOutcome,
-    MetadataEntryRecord, MetadataStore, SQLITE_MIGRATED_FENCE_SQL, SQLITE_MIGRATED_FENCE_TABLE,
-    SchemaVersionReceipt, config_format_manifest_path, config_migration_lock_path,
-    config_redb_path_in_scope_dir, config_scope_dir_from_db_path, config_sqlite_path_in_scope_dir,
-    inspect_config_scope_authority, is_config_sqlite_fenced_tombstone,
-    is_config_sqlite_tombstone_sentinel, key_in_section, open_config_scope_read_only,
-    open_config_scope_read_write, publish_config_format_manifest, read_config_format_manifest,
+    ConfigFormatManifest, ConfigInitPhase, ConfigScopeAuthority, ConfigScopeLock, ConfigStore,
+    DEFAULT_CONFIG_SCOPE_LOCK_TIMEOUT, LIBRA_CONFIG_GLOBAL_DB_ENV, LIBRA_CONFIG_SYSTEM_DB_ENV,
+    LegacyConfigEntry, LockedConfigScope, MetadataCasOutcome, MetadataEntryRecord, MetadataStore,
+    SQLITE_MIGRATED_FENCE_SQL, SQLITE_MIGRATED_FENCE_TABLE, SchemaVersionReceipt,
+    config_format_manifest_path, config_migration_lock_path, config_redb_path_in_scope_dir,
+    config_scope_dir_from_db_path, config_sqlite_path_in_scope_dir, inspect_config_scope_authority,
+    is_config_sqlite_fenced_tombstone, is_config_sqlite_tombstone_sentinel, key_in_section,
+    open_config_scope_read_only, open_config_scope_read_only_with_deadline,
+    open_config_scope_read_write, open_config_scope_read_write_with_deadline,
+    open_locked_config_scope_read_only, open_locked_config_scope_read_write,
+    publish_config_format_manifest, read_config_format_manifest,
 };
 #[cfg(unix)]
 pub use config_store::{
