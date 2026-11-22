@@ -9808,4 +9808,448 @@ mod tests {
             restore_writable(&win_b3_sqlite);
         }
     }
+
+    #[cfg(all(feature = "storage-sqlite", feature = "storage-redb"))]
+    #[tokio::test]
+    async fn system_config_fresh_create_crash_boundaries_1_2_3_and_modes() {
+        use std::{
+            env, fs,
+            path::PathBuf,
+            process::{Command, Stdio},
+        };
+
+        use tempfile::tempdir;
+
+        use crate::storage::redb::RedbConfigStore;
+
+        // Run inside an isolated child with `LIBRA_CONFIG_SYSTEM_DB` and restrictive
+        // `umask(0o077)` on Unix so we prove all 3 `SystemConfig` crash boundaries
+        // converge strictly to `0644` `config.redb` + `0444` `config.db` tombstone
+        // even under a restrictive process umask.
+        if let Some(sys_root_env) = env::var_os("LIBRA_RB03I_CHILD_ROOT") {
+            #[cfg(unix)]
+            // SAFETY: Single-threaded isolated child process verifying explicit `0644`/`0444` modes.
+            unsafe {
+                libc::umask(0o077);
+            }
+            let sys_root = PathBuf::from(sys_root_env);
+            let set_sys_tombstone_mode = |path: &Path| {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(
+                        path,
+                        fs::Permissions::from_mode(SYSTEM_CONFIG_TOMBSTONE_MODE),
+                    )
+                    .expect("chmod 0444 system tombstone");
+                }
+                #[cfg(not(unix))]
+                {
+                    let mut perms = fs::metadata(path).expect("stat tombstone").permissions();
+                    perms.set_readonly(true);
+                    fs::set_permissions(path, perms).expect("set readonly tombstone");
+                }
+            };
+            let restore_writable = |path: &Path| {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o644));
+                }
+                #[cfg(not(unix))]
+                {
+                    if let Ok(meta) = fs::metadata(path) {
+                        let mut perms = meta.permissions();
+                        perms.set_readonly(false);
+                        let _ = fs::set_permissions(path, perms);
+                    }
+                }
+            };
+            let assert_system_modes = |scope_dir: &Path, label: &str| {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let redb_mode = fs::symlink_metadata(config_redb_path_in_scope_dir(scope_dir))
+                        .expect("stat recovered SystemConfig config.redb")
+                        .permissions()
+                        .mode()
+                        & 0o777;
+                    assert_eq!(
+                        redb_mode, SYSTEM_CONFIG_FILE_MODE,
+                        "{label}: SystemConfig config.redb must have exact 0644 mode, got {redb_mode:04o}"
+                    );
+                    let tomb_mode =
+                        fs::symlink_metadata(config_sqlite_path_in_scope_dir(scope_dir))
+                            .expect("stat recovered SystemConfig config.db tombstone")
+                            .permissions()
+                            .mode()
+                            & 0o777;
+                    assert_eq!(
+                        tomb_mode, SYSTEM_CONFIG_TOMBSTONE_MODE,
+                        "{label}: SystemConfig config.db tombstone must have exact 0444 mode, got {tomb_mode:04o}"
+                    );
+                    let manifest_mode =
+                        fs::symlink_metadata(config_format_manifest_path(scope_dir))
+                            .expect("stat recovered SystemConfig config-format.json")
+                            .permissions()
+                            .mode()
+                            & 0o777;
+                    assert_eq!(
+                        manifest_mode, SYSTEM_CONFIG_FILE_MODE,
+                        "{label}: SystemConfig config-format.json must have exact 0644 mode, got {manifest_mode:04o}"
+                    );
+                    let lock_mode = fs::symlink_metadata(config_migration_lock_path(scope_dir))
+                        .expect("stat recovered SystemConfig config-migration.lock")
+                        .permissions()
+                        .mode()
+                        & 0o777;
+                    assert_eq!(
+                        lock_mode, SYSTEM_CONFIG_FILE_MODE,
+                        "{label}: SystemConfig config-migration.lock must have exact 0644 mode, got {lock_mode:04o}"
+                    );
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = label;
+                    assert!(
+                        fs::metadata(config_sqlite_path_in_scope_dir(scope_dir))
+                            .expect("stat recovered SystemConfig tombstone")
+                            .permissions()
+                            .readonly()
+                    );
+                }
+            };
+
+            // -------------------------------------------------------------
+            // AC1 & AC4: SystemConfig Boundary 1 crash (after Step F1
+            // `hard_link`, before Step F2 manifest).
+            // -------------------------------------------------------------
+            let b1_env = PathBuf::from(
+                env::var_os(LIBRA_CONFIG_SYSTEM_DB_ENV).expect("LIBRA_CONFIG_SYSTEM_DB env"),
+            );
+            let b1_dir = config_scope_dir_from_db_path(&b1_env).expect("derive b1 system dir");
+            fs::create_dir_all(&b1_dir).expect("create system b1 dir");
+            let b1_sqlite = config_sqlite_path_in_scope_dir(&b1_dir);
+            let b1_stale_tmp = b1_dir.join("config.db.tombstone.77777.0.tmp");
+
+            assert_eq!(
+                reserve_config_sqlite_tombstone_hard_link(&b1_dir, DatabaseRole::SystemConfig)
+                    .expect("simulate SystemConfig Step F1 hard_link"),
+                TombstoneReserveOutcome::Reserved
+            );
+            fs::write(&b1_stale_tmp, b"stale-system-b1-tmp").expect("seed b1 tmp");
+
+            assert_eq!(
+                open_config_scope_read_only(&b1_dir, DatabaseRole::SystemConfig)
+                    .await
+                    .expect_err("SystemConfig Boundary 1 RO must fail closed")
+                    .stable_code_str(),
+                "LBR-IO-001"
+            );
+            assert_eq!(
+                open_or_create_locked_config_scope_for_write(
+                    &b1_dir,
+                    DatabaseRole::SystemConfig,
+                    StorageBackendKind::Sqlite,
+                    Duration::from_secs(5),
+                )
+                .await
+                .expect_err("SystemConfig Boundary 1 Sqlite writer must fail closed")
+                .stable_code_str(),
+                "LBR-IO-001"
+            );
+
+            let b1_rec = open_or_create_locked_config_scope_for_write(
+                &b1_dir,
+                DatabaseRole::SystemConfig,
+                StorageBackendKind::Redb,
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("SystemConfig Boundary 1 Redb recovery must succeed");
+            b1_rec
+                .store()
+                .set("core.system_b1", "recovered-sys-b1", false)
+                .await
+                .expect("write after SystemConfig Boundary 1 recovery");
+            drop(b1_rec);
+
+            assert!(!b1_stale_tmp.exists());
+            let b1_m = read_config_format_manifest(&b1_dir, DatabaseRole::SystemConfig)
+                .expect("read b1 system manifest")
+                .expect("b1 system manifest must exist");
+            assert_eq!(b1_m.backend, StorageBackendKind::Redb);
+            assert!(b1_m.finalized);
+            assert!(b1_m.init_phase.is_none());
+            assert!(b1_m.legacy_sqlite_tombstone);
+            assert_system_modes(&b1_dir, "SystemConfig Boundary 1");
+            assert_eq!(
+                open_config_scope_read_only(&b1_dir, DatabaseRole::SystemConfig)
+                    .await
+                    .expect("reopen b1 system RO")
+                    .get("core.system_b1")
+                    .await
+                    .expect("read b1 system key")
+                    .map(|e| e.value),
+                Some("recovered-sys-b1".to_string())
+            );
+            restore_writable(&b1_sqlite);
+
+            // -------------------------------------------------------------
+            // AC2 & AC4: SystemConfig Boundary 2 crash (Step F2 manifest,
+            // `targets_staged_for_rename=false` + residual corrupt `.tmp`).
+            // -------------------------------------------------------------
+            let b2_dir = sys_root.join("system-boundary-2");
+            fs::create_dir_all(&b2_dir).expect("create system b2 dir");
+            let b2_sqlite = config_sqlite_path_in_scope_dir(&b2_dir);
+            let b2_tmp = b2_dir.join(format!("{CONFIG_REDB_FILE_NAME}.tmp"));
+            fs::write(&b2_sqlite, CONFIG_SQLITE_TOMBSTONE_SENTINEL).expect("write b2 sentinel");
+            set_sys_tombstone_mode(&b2_sqlite);
+            let b2_f2 =
+                ConfigFormatManifest::new_redb_fresh_create(1, false, DatabaseRole::SystemConfig)
+                    .expect("build SystemConfig Step F2 manifest");
+            publish_config_format_manifest(&b2_dir, DatabaseRole::SystemConfig, &b2_f2)
+                .expect("publish SystemConfig Step F2 manifest");
+            fs::write(&b2_tmp, b"corrupt-system-b2-tmp").expect("seed b2 tmp");
+
+            assert_eq!(
+                open_config_scope_read_only(&b2_dir, DatabaseRole::SystemConfig)
+                    .await
+                    .expect_err("SystemConfig Boundary 2 RO must fail closed")
+                    .stable_code_str(),
+                "LBR-IO-001"
+            );
+            assert_eq!(
+                open_or_create_locked_config_scope_for_write(
+                    &b2_dir,
+                    DatabaseRole::SystemConfig,
+                    StorageBackendKind::Sqlite,
+                    Duration::from_secs(5),
+                )
+                .await
+                .expect_err("SystemConfig Boundary 2 Sqlite writer must fail closed")
+                .stable_code_str(),
+                "LBR-IO-001"
+            );
+
+            let b2_rec = open_or_create_locked_config_scope_for_write(
+                &b2_dir,
+                DatabaseRole::SystemConfig,
+                StorageBackendKind::Redb,
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("SystemConfig Boundary 2 Redb recovery must succeed");
+            b2_rec
+                .store()
+                .set("core.system_b2", "recovered-sys-b2", false)
+                .await
+                .expect("write after SystemConfig Boundary 2 recovery");
+            drop(b2_rec);
+
+            assert!(!b2_tmp.exists());
+            let b2_m = read_config_format_manifest(&b2_dir, DatabaseRole::SystemConfig)
+                .expect("read b2 system manifest")
+                .expect("b2 system manifest must exist");
+            assert!(b2_m.finalized);
+            assert!(b2_m.init_phase.is_none());
+            assert!(b2_m.legacy_sqlite_tombstone);
+            assert!(!b2_m.targets_staged_for_rename);
+            assert_system_modes(&b2_dir, "SystemConfig Boundary 2");
+            assert_eq!(
+                open_config_scope_read_only(&b2_dir, DatabaseRole::SystemConfig)
+                    .await
+                    .expect("reopen b2 system RO")
+                    .get("core.system_b2")
+                    .await
+                    .expect("read b2 system key")
+                    .map(|e| e.value),
+                Some("recovered-sys-b2".to_string())
+            );
+            restore_writable(&b2_sqlite);
+
+            // -------------------------------------------------------------
+            // AC3 & AC4: SystemConfig Boundary 3 crash (Step F3
+            // `targets_staged_for_rename=true` AND `0644` `config.redb`
+            // already in place with data, `finalized=true` unpublished).
+            // Zero-overwrite preservation + `0644`/`0444` mode convergence.
+            // -------------------------------------------------------------
+            let b3_dir = sys_root.join("system-boundary-3");
+            fs::create_dir_all(&b3_dir).expect("create system b3 dir");
+            let b3_sqlite = config_sqlite_path_in_scope_dir(&b3_dir);
+            let b3_redb = config_redb_path_in_scope_dir(&b3_dir);
+            let b3_stale_tmp = b3_dir.join(format!("{CONFIG_REDB_FILE_NAME}.tmp"));
+            fs::write(&b3_sqlite, CONFIG_SQLITE_TOMBSTONE_SENTINEL).expect("write b3 sentinel");
+            set_sys_tombstone_mode(&b3_sqlite);
+            {
+                let existing = RedbConfigStore::create(&b3_redb, DatabaseRole::SystemConfig)
+                    .expect("seed existing SystemConfig config.redb");
+                existing
+                    .set("core.system_keep", "preserve-system-b3", false)
+                    .await
+                    .expect("seed preserved system singleton");
+                existing
+                    .add("http.extraHeader", "X-Sys-1: a", false)
+                    .await
+                    .expect("seed preserved system multi 1");
+                existing
+                    .add("http.extraHeader", "X-Sys-2: b", false)
+                    .await
+                    .expect("seed preserved system multi 2");
+            }
+            fs::write(&b3_stale_tmp, b"stale-system-b3-tmp").expect("seed b3 stale tmp");
+            let b3_f3 =
+                ConfigFormatManifest::new_redb_fresh_create(1, true, DatabaseRole::SystemConfig)
+                    .expect("build SystemConfig Step F3 manifest");
+            publish_config_format_manifest(&b3_dir, DatabaseRole::SystemConfig, &b3_f3)
+                .expect("publish SystemConfig Step F3 manifest");
+
+            assert_eq!(
+                open_config_scope_read_only(&b3_dir, DatabaseRole::SystemConfig)
+                    .await
+                    .expect_err("SystemConfig Boundary 3 RO must fail closed before recovery")
+                    .stable_code_str(),
+                "LBR-IO-001"
+            );
+            assert_eq!(
+                open_or_create_locked_config_scope_for_write(
+                    &b3_dir,
+                    DatabaseRole::SystemConfig,
+                    StorageBackendKind::Sqlite,
+                    Duration::from_secs(5),
+                )
+                .await
+                .expect_err("SystemConfig Boundary 3 Sqlite writer must fail closed")
+                .stable_code_str(),
+                "LBR-IO-001"
+            );
+
+            let b3_rec = open_or_create_locked_config_scope_for_write(
+                &b3_dir,
+                DatabaseRole::SystemConfig,
+                StorageBackendKind::Redb,
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("SystemConfig Boundary 3 Redb recovery must preserve data and finalize");
+            b3_rec
+                .store()
+                .set("core.system_appended", "appended-sys-b3", false)
+                .await
+                .expect("append new key after SystemConfig Boundary 3 recovery");
+            drop(b3_rec);
+
+            assert!(!b3_stale_tmp.exists());
+            let b3_m = read_config_format_manifest(&b3_dir, DatabaseRole::SystemConfig)
+                .expect("read b3 system manifest")
+                .expect("b3 system manifest must exist");
+            assert!(b3_m.finalized);
+            assert!(b3_m.init_phase.is_none());
+            assert!(b3_m.legacy_sqlite_tombstone);
+            assert!(!b3_m.targets_staged_for_rename);
+            assert_system_modes(&b3_dir, "SystemConfig Boundary 3");
+
+            let b3_ro = open_config_scope_read_only(&b3_dir, DatabaseRole::SystemConfig)
+                .await
+                .expect("reopen b3 system RO");
+            assert_eq!(
+                b3_ro
+                    .get("core.system_keep")
+                    .await
+                    .expect("read preserved system key")
+                    .map(|e| e.value),
+                Some("preserve-system-b3".to_string()),
+                "AC3 violation: SystemConfig Boundary 3 recovery overwrote existing data"
+            );
+            assert_eq!(
+                b3_ro
+                    .get_all("http.extraHeader")
+                    .await
+                    .expect("read preserved system multi-value")
+                    .into_iter()
+                    .map(|e| e.value)
+                    .collect::<Vec<_>>(),
+                vec!["X-Sys-1: a".to_string(), "X-Sys-2: b".to_string()]
+            );
+            assert_eq!(
+                b3_ro
+                    .get("core.system_appended")
+                    .await
+                    .expect("read appended system key")
+                    .map(|e| e.value),
+                Some("appended-sys-b3".to_string())
+            );
+            drop(b3_ro);
+            restore_writable(&b3_sqlite);
+
+            // Also verify Boundary 3b (pre-rename staged `config.redb.tmp` promotion) converges to `0644`/`0444`.
+            let b3b_dir = sys_root.join("system-boundary-3b");
+            fs::create_dir_all(&b3b_dir).expect("create system b3b dir");
+            let b3b_sqlite = config_sqlite_path_in_scope_dir(&b3b_dir);
+            let b3b_tmp = b3b_dir.join(format!("{CONFIG_REDB_FILE_NAME}.tmp"));
+            fs::write(&b3b_sqlite, CONFIG_SQLITE_TOMBSTONE_SENTINEL).expect("write b3b sentinel");
+            set_sys_tombstone_mode(&b3b_sqlite);
+            {
+                let staged = RedbConfigStore::create(&b3b_tmp, DatabaseRole::SystemConfig)
+                    .expect("seed staged SystemConfig config.redb.tmp");
+                staged
+                    .set("core.system_staged", "promoted-sys-tmp", false)
+                    .await
+                    .expect("seed staged system key");
+            }
+            publish_config_format_manifest(&b3b_dir, DatabaseRole::SystemConfig, &b3_f3)
+                .expect("publish b3b system Step F3 manifest");
+            let b3b_rec = open_or_create_locked_config_scope_for_write(
+                &b3b_dir,
+                DatabaseRole::SystemConfig,
+                StorageBackendKind::Redb,
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("SystemConfig Boundary 3b promotion must succeed");
+            assert_eq!(
+                b3b_rec
+                    .store()
+                    .get("core.system_staged")
+                    .await
+                    .expect("read promoted staged system key")
+                    .map(|e| e.value),
+                Some("promoted-sys-tmp".to_string())
+            );
+            drop(b3b_rec);
+            assert!(!b3b_tmp.exists());
+            assert_system_modes(&b3b_dir, "SystemConfig Boundary 3b");
+            restore_writable(&b3b_sqlite);
+
+            println!("RB03I_CHILD_OK");
+            return;
+        }
+
+        let root = tempdir().expect("create RB-03i temp root");
+        let b1_system_db = root
+            .path()
+            .join("system-boundary-1")
+            .join(CONFIG_SQLITE_FILE_NAME);
+        let exe = env::current_exe().expect("locate current test executable");
+        let output = Command::new(exe)
+            .arg("--exact")
+            .arg("storage::config_store::tests::system_config_fresh_create_crash_boundaries_1_2_3_and_modes")
+            .arg("--nocapture")
+            .env("LIBRA_RB03I_CHILD_ROOT", root.path())
+            .env(LIBRA_CONFIG_SYSTEM_DB_ENV, &b1_system_db)
+            .env("LIBRA_TEST", "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("spawn RB-03i isolated child");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success()
+                && stdout.contains("RB03I_CHILD_OK")
+                && stdout.contains("1 passed; 0 failed"),
+            "RB-03i child failed (status={:?}):\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            output.status
+        );
+    }
 }

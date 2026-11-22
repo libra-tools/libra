@@ -557,7 +557,6 @@
 | `RB-02b` | implementation | meta schema role version and handle fence | revert isolated module | yes | yes | 4/8 | 3/8 | 1/2 | M | RB-02d | 序列化于 RB-02d | independent | RB-02 | N/A |
 | `RB-02c` | implementation | 2-phase manifest atomic publish and gen paths | revert isolated module | yes | yes | 5/8 | 3/8 | 1/2 | M | RB-02b | 序列化于 RB-02b | independent | RB-02b | N/A |
 | `RB-02e` | implementation | manifest-first precedence over env backend | revert isolated module | yes | yes | 5/8 | 3/8 | 1/3 | S | RB-02c | 序列化于 RB-02c | independent | RB-02c | N/A |
-| `RB-03` | `done` / `remote-pending` | 本提交（`main`） | `0.30.305` | 2026-11-22 13:18:44 UTC：Stage 1 精确 6 文件写集（`src/storage/{mod,config_store}.rs`、`src/storage/sqlite/{mod,config_store}.rs`、`src/storage/redb/{mod,config_store}.rs`），实现对象安全 `ConfigStore` + `MetadataStore`、`SqliteConfigStore`（字面二进制前缀与原子条件 CAS）与 `RedbConfigStore`（全 7 表版本化 `[u16_le][postcard]`、初始迁移收据 RFC 3339 UTC 对齐、缺表/序列缺失回退 fail-closed、加密键拒明文覆盖与真实 Vault 密文往返审计、匿名/句柄绑定原子建库 + 失败重试 + 合作式写事务取消安全）；`dual_backend_config_and_metadata_equivalence`、`redb_config_mvcc_concurrent_readers`（8 并发 `open_read_only` + 1 写进程两阶段 MVCC 重叠屏障 + 8 路并发 CAS + 故障注入）、纯 SQLite/纯 redb/双特性矩阵、fmt、严格 clippy、rustdoc、`compat_version_surface_sync` 全绿；Codex 经 R1–R14 深度评审已闭环全部实质 P1，R14 仅余范围外 macOS 扩展 NFSv4 ACL 支线，按用户明确授权跳过并进入下一卡 |
 | `RB-03` | implementation | dual-backend ConfigStore crud cas and mvcc | revert isolated module | yes | yes | 5/8 | 4/8 | 3/6 | M | RB-02e | 序列化于 RB-02e | independent | N/A | N/A |
 | `RB-03j` | implementation | redb config gc13 isolation and file modes | revert isolated module | yes | yes | 4/8 | 3/8 | 3/6 | S | RB-03 | 序列化于 RB-03 | independent | RB-03 | N/A |
 | `RB-03b` | implementation | config scope manifest validation and absent ro | revert isolated module | yes | yes | 4/8 | 3/8 | 3/6 | M | RB-03j | 序列化于 RB-03j | independent | RB-03 | N/A |
@@ -1591,7 +1590,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `done` / `remote-pending`（`v0.30.312`；Codex R1–R4 全项发现含 Windows 恢复刷盘与回归测试已全部闭环，按用户授权免第五轮复跑直接落地 Stage 2）
+**Lifecycle / Acceptance:** `done` / `remote-verified`（`717364c`，`v0.30.312`；Codex R1–R4 全项发现含 Windows 恢复刷盘与回归测试已全部闭环，按用户授权免第五轮复跑直接落地并推送 `origin/main`）
 
 **Description:** 100% 在独占目录 `src/storage/**` 内落实 `ADR-RB-02` #2 的首次 `Redb` 配置建库 4 步可恢复状态机（Step F1 `hard_link` 预占墓碑 → Step F2 发布 `config-format.json(finalized=false, init_phase="fresh_create", legacy_sqlite_tombstone=true, targets_staged_for_rename=false)` → Step F3 `config.redb.tmp` + `targets_staged_for_rename=true` + `rename` → Step F4 `finalized=true`），并在 `GlobalConfig` 作用域逐边界实测 3 处崩溃幂等恢复。
 
@@ -1649,7 +1648,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `remote-pending`（2026-11-22 15:59 UTC，`v0.30.313`，于 `main` 直接提交推送；Stage 1 精确 1/6 文件写集 `src/storage/config_store.rs`、AC1–AC4 独立子进程 `LIBRA_CONFIG_SYSTEM_DB` + 严苛 `umask(0o077)` 下全 3 边界收敛与 `0644`/`0444` 权限实测、fmt、严格 clippy 与 Codex R1 `VERDICT: PASS` 全绿）
 
 **Description:** 100% 在独占目录 `src/storage/**` 内针对隔离夹具 `LIBRA_CONFIG_SYSTEM_DB` 逐项验证首次 `Redb` 系统配置建库全部 3 处崩溃边界恢复，并确保收敛后的 `config.redb`（`0644`）与路径墓碑 `config.db`（`0444`）权限与数据完整性完全满足 `GC-13`。
 
@@ -1663,15 +1662,15 @@
 | `SystemConfig` 独立可变目录拥有专属 `0644`/`0444` 权限要求，须独立实证全部 3 处首次建库崩溃恢复边界 | `ADR-RB-02` #2 Step F1–F4；`GC-RB-02` |
 
 **Acceptance criteria:**
-- [ ] **`SystemConfig` 边界 1 崩溃（Step F1 `hard_link` 后、Step F2 清单落盘前）：** 在 `LIBRA_CONFIG_SYSTEM_DB` 识别精确哨兵 `config.db`，幂等收敛至 `0644` `config.redb` + `0444` 墓碑 + `finalized = true`。
-- [ ] **`SystemConfig` 边界 2 崩溃（Step F2 `init_phase="fresh_create", finalized=false, targets_staged_for_rename=false`）：** 清理残 `.tmp` 并幂等收敛至 `0644` `config.redb` + `finalized = true`。
-- [ ] **`SystemConfig` 边界 3 崩溃（Step F3 `targets_staged_for_rename=true` 且 `config.redb` 已就位、`finalized=true` 未落盘）：** 零覆写保留已有 `0644` `config.redb` 数据并晋升 `finalized = true`。
-- [ ] `SystemConfig` 上述 3 边界恢复完成后，`config.redb` 权限严格为 `0644` 且 `config.db` 墓碑权限严格为 `0444`。
+- [x] **`SystemConfig` 边界 1 崩溃（Step F1 `hard_link` 后、Step F2 清单落盘前）：** 在 `LIBRA_CONFIG_SYSTEM_DB` 识别精确哨兵 `config.db`，幂等收敛至 `0644` `config.redb` + `0444` 墓碑 + `finalized = true`。
+- [x] **`SystemConfig` 边界 2 崩溃（Step F2 `init_phase="fresh_create", finalized=false, targets_staged_for_rename=false`）：** 清理残 `.tmp` 并幂等收敛至 `0644` `config.redb` + `finalized = true`。
+- [x] **`SystemConfig` 边界 3 崩溃（Step F3 `targets_staged_for_rename=true` 且 `config.redb` 已就位、`finalized=true` 未落盘）：** 零覆写保留已有 `0644` `config.redb` 数据并晋升 `finalized = true`。
+- [x] `SystemConfig` 上述 3 边界恢复完成后，`config.redb` 权限严格为 `0644` 且 `config.db` 墓碑权限严格为 `0444`。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::config_store::tests::system_config_fresh_create_crash_boundaries_1_2_3_and_modes)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::config_store::tests::system_config_fresh_create_crash_boundaries_1_2_3_and_modes)'`（new，覆盖 AC1–AC4）
-- [ ] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 6 文件实现白名单。
+- [x] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::config_store::tests::system_config_fresh_create_crash_boundaries_1_2_3_and_modes)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::config_store::tests::system_config_fresh_create_crash_boundaries_1_2_3_and_modes)'`（new，覆盖 AC1–AC4）
+- [x] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 6 文件实现白名单。
 
 **Full-suite trigger:** `none`
 
@@ -10022,7 +10021,15 @@
 | `RB-02b` | `done` / `remote-pending` | `4c3cb21`（`main`） | `0.30.292` | 2026-11-22 09:08:13 UTC：Stage 1 精确 2 文件写集、`meta_schema_role_future_version_and_migration_tombstone_fence`（含角色失配/Derived 拒绝、未来版本按角色错误码 `LBR-AGENT-048`/`LBR-CONFIG-001`/`LBR-IO-001`、已有普通表/multimap 表/空 `META_SCHEMA` 防重贴标签及跨进程 `u32::MAX` 围栏+`unlink` 已打开读写句柄阻断）全绿、4 特性矩阵、fmt、严格 clippy、rustdoc、`compat_version_surface_sync` 全绿；Codex R3 `01a20282-120a-7123-bc17-168bae3ff386` `VERDICT: PASS` |
 | `RB-02c` | `done` / `remote-pending` | `30c99b4`（`main`） | `0.30.295` | 2026-11-22 09:53:52 UTC：Stage 1 精确 2 文件写集、`two_phase_finalized_manifest_and_absent_fragment_ignore`（含 `ManifestOrigin::{FreshInit,Migration}`、两阶段原子发布 `.tmp`→`fsync`→`rename`→`fsync_dir` + Windows `MOVEFILE_WRITE_THROUGH` + 不支持平台前置 fail-closed、正/反向 Phase 2 状态机与 `targets_staged_for_rename` / 缺/空 JSON 全矩阵校验、代际路径解析及缺清单忽略 `.libra/redb/` 残片）全绿、4 特性矩阵、fmt、严格 clippy、rustdoc、`compat_version_surface_sync` 全绿；Codex R6 `01a202a9-8c29-7c42-a9ae-dadabc15f783` `VERDICT: PASS` |
 | `RB-02e` | `done` / `remote-pending` | `c1eac0b`（`main`） | `0.30.297` | 2026-11-22 10:34:14 UTC：Stage 1 精确 3 文件写集、`StorageBackendKind::resolve(common_storage)` 收敛为唯一公开入口 + `detect_storage_authority` + `manifest.rs` 脱敏反序列化、`manifest_first_precedence_blocks_conflicting_env_overrides`（含子进程哨兵+`1 passed; 0 failed` 实测 `finalized=false` 无条件先于 env 报 `LBR-IO-001`、终态清单与旧 `libra.db` 冲突报 `BackendMismatch`/`LBR-CLI-003`、非法/非 UTF-8 环境变量与软链边界、全新空仓覆盖与未解门控）、纯 SQLite/纯 redb/双特性矩阵、fmt、严格 clippy、rustdoc、`compat_version_surface_sync` 全绿；Codex R3 `VERDICT: PASS`（P0/P1/P2=0，Phase 0 全 9 卡闭环） |
-| `RB-03`..`RB-34c`（剩余 145 卡） | `pending` | — | — | 按实施顺序于 `main` 逐卡推进 |
+| `RB-03` | `done` / `remote-verified` | `58ff194`（`main`） | `0.30.305` | 2026-11-22 13:18:44 UTC：Stage 1 精确 6 文件写集，实现对象安全 `ConfigStore` + `MetadataStore`、`SqliteConfigStore` 与 `RedbConfigStore`（MVCC、原子建库、取消安全）；Codex R1–R14 实质 P1 全闭环，R14 范围外支线按授权跳过 |
+| `RB-03j` | `done` / `remote-verified` | `890d410`（`main`） | `0.30.306` | `GC-13` 隔离、`expected_config_file_mode` 与 `0600`/`0644` 权限实测；Codex R1 `VERDICT: PASS` |
+| `RB-03b` | `done` / `remote-verified` | `600b335`（`main`） | `0.30.307` | `ConfigFormatManifest`、纯 Rust 只读 SQLite `__libra_migrated_fence__` 校验与 `ADR-CF-06` 零文件 `NotFound`；Codex R2 `VERDICT: PASS` |
+| `RB-03h` | `done` / `remote-verified` | `e5df194`（`main`） | `0.30.308` | `ConfigScopeLock`、`ScopeLockedConfigStore` 持锁生命周期与 `faccessat(W_OK\|AT_EACCESS)` 非 root 只读 `SystemConfig` 回退；Codex R1–R3 全闭环，R4 与 AC4 冲突按授权跳过 |
+| `RB-03d` | `done` / `remote-verified` | `c52cff5`（`main`） | `0.30.310` | Step F1 非覆写 `hard_link` 墓碑预占、双重检查锁、异步取消持锁安全与 `GlobalConfig` 并发首写/旧二进制竞态实测；Codex R4 `VERDICT: PASS` |
+| `RB-03f` | `done` / `remote-verified` | `e5f2777`（`main`） | `0.30.311` | `SqliteConfigStore::create` 精确 `0600`/`0644` 权限与 `SystemConfig` `0444`/`0644` Step F1 预占/并发/旧二进制竞态实测；Codex R1 `VERDICT: PASS` |
+| `RB-03e` | `done` / `remote-verified` | `717364c`（`main`） | `0.30.312` | 4 步 `init_phase="fresh_create"` 状态机、Windows `sync_all` 恢复刷盘与 `GlobalConfig` 边界 1/2/3a/3b 崩溃恢复；Codex R1–R4 全部发现闭环 |
+| `RB-03i` | `done` / `remote-pending` | 本提交（`main`） | `0.30.313` | 2026-11-22 15:59 UTC：Stage 1 精确 1/6 文件写集 `src/storage/config_store.rs`，`system_config_fresh_create_crash_boundaries_1_2_3_and_modes` 在隔离 `LIBRA_CONFIG_SYSTEM_DB` + `umask(0o077)` 子进程实测 `SystemConfig` 边界 1/2/3a/3b 恢复、零覆写保留与严格 `0644`/`0444` 权限，fmt、严格 clippy、`compat_version_surface_sync` 与 Codex R1 `VERDICT: PASS` 全绿 |
+| `RB-03c`..`RB-34c`（剩余 137 卡） | `pending` | — | — | 按实施顺序于 `main` 逐卡推进 |
 
 ## Codex review log
 
