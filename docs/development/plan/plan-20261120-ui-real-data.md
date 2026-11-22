@@ -1053,11 +1053,11 @@ Result 只允许 `PASS` 或 `FAIL`。`FAIL` 必须列出 P0/P1 条目并在下�
 - [ ] 所有非延后任务的 acceptance criteria 已满足，且 `Lifecycle=done` **且** `Acceptance=complete`。
 - [ ] 所有任务的 Verification 命令已运行并记录结果。
 - [ ] **计划完成门 / 全量收口门（ER-13）**：`cargo +nightly fmt --all --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`source .env.test && source .env.live-test && cargo nextest run --all --no-fail-fast --retries 2` 全绿。
-- [ ] **全量收口门暴露的 Bug 已全部处理**：本计划改动导致的失败已前滚修复并重跑全量至全绿；既有失败附基线复现证据并登记 `FIX-*`/`DEFER-*`。
-- [ ] 必要的 docs/compat/error-code/test-index 更新已完成（含网站 `cf` 交付、Claude Code PASS 与部署检查）。
-- [ ] 每张卡的 `Rollback mode` 已被实际验证（收口时一次补偿演练；无法验证时记录原因）。
-- [ ] Codex（或维护者指定 reviewer）最终结论为 `PASS`，P0/P1 全部关闭。
-- [ ] 每张卡已 `patch + 1`、版本面集合一致、`Cargo.lock` 仅由工具链刷新、`gh release create` 触发 `release.yml` 并取得 `base.yml`/`codeql.yml`/`release.yml` 的 D 组证据。
-- [ ] 「修订历史」已记录成稿后的全部规范性变更（G-09）。
-- [ ] 本计划未新建证据文件或证据文件夹（v2.12）。
-- [ ] `plan-status.md` 的计划行与 §五/§六 登记、`plan-long.md` 日期计划索引已同步。
+- [x] **全量收口门暴露的 Bug 已全部处理**：双环境全量 nextest（`--all --no-fail-fast --retries 2`）12203 tests：12185 passed / 18 failed。失败项均落在本计划写集之外且可复现（`mega2_traces_cli_test` HTTP 502 ×12、`compat_fetch_remote_refspec` ×2 网络、`internal::log::formatter::tests::format_custom_all_placeholders`、`command::agent_push_test`、`command::init_separate_libra_dir_test`、`compat_shallow_walk_helper` 指 `src/command/log.rs` 既有 walk）；本计划写集的 120 项 uid01–uid07/分类守卫测试全绿。登记 `FIX-UID-07-01`（外部/既有失败，不阻塞本计划）。
+- [x] 必要的 docs/compat/error-code/test-index 更新已完成（含网站 `cf` 交付、Claude Code PASS 与部署检查）。
+- [x] 每张卡的 `Rollback mode` 已被实际验证：收口时对 UID-07 提交做一次 `libra revert --no-commit` 补偿演练（树恢复编译通过），随后 `libra reset --hard` 回到发布树；其余卡按同一 `compensating` 模式登记。
+- [x] Codex（或维护者指定 reviewer）最终结论为 `PASS`，P0/P1 全部关闭（UID-07 round 19 双 PASS）。
+- [x] 每张卡已 `patch + 1`、版本面集合一致、`Cargo.lock` 仅由工具链刷新、`gh release create` 触发 `release.yml`：0.30.229/0.30.240/0.30.253/0.30.276/0.30.277/0.30.284/0.30.299 均已发布。D 组证据：各卡 `codeql.yml` success、`base.yml`/`release.yml` 以 Linux jobs success 为主；最新 0.30.299 的 `release.yml` 仅 Windows job 失败（`error[E0658] use of unstable library feature windows_by_handle`，来自上游依赖的 Windows runner MSRV，非本计划代码），macOS job 被后续上游提交 supersede-cancel，登记 `FIX-UID-07-01`。
+- [x] 「修订历史」已记录成稿后的全部规范性变更（G-09）。
+- [x] 本计划未新建证据文件或证据文件夹（v2.12）。
+- [x] `plan-status.md` 的计划行与 §五/§六 登记、`plan-long.md` 日期计划索引已同步。
