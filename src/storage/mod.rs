@@ -19,6 +19,7 @@ pub mod backend;
 pub mod codec;
 pub mod config_store;
 pub mod error;
+pub mod git_state_store;
 pub mod git_store;
 pub mod manifest;
 #[cfg(feature = "storage-redb")]
@@ -59,6 +60,22 @@ pub use config_store::{
     expected_config_tombstone_mode,
 };
 pub use error::{StorageBackendError, StorageResult};
+#[cfg(feature = "storage-redb")]
+pub use git_state_store::RedbGitStateStore;
+#[cfg(feature = "storage-sqlite")]
+pub use git_state_store::SqliteGitStateStore;
+pub use git_state_store::{
+    AiOperationLinkRecord, BisectStateRecord, ChangeIdentityRecord, ChangePredecessorRecord,
+    ChangeRevisionRecord, GitStateStore, INITIAL_WORKTREE_REGISTRY_CAPABILITIES, LayerPathRecord,
+    LayerRecord, OP_HEAD_GENERATION_SENTINEL, OperationHeadCasOutcome,
+    OperationHeadConvergeOutcome, OperationHeadsSnapshot, OperationJournalRecord, OperationRecord,
+    OperationScopeKind, OperationScopeProvenance, RB05_WORKFLOW_STATE_SOURCE_TABLES,
+    RebaseStateRecord, SequenceStateRecord, SparseViewSnapshot, WorkingDirtyEntryRecord,
+    WorkingDirtyMetaRecord, WorkspaceLeaseAcquireOutcome, WorkspaceLeaseMutationOutcome,
+    WorkspaceRecordKind, WorkspaceRecordOwnerKind, WorkspaceRecordRow, WorkspaceRecordState,
+    WorktreeIntentOp, WorktreeIntentRecord, WorktreeIntentWrite, WorktreeLifecycleRecord,
+    WorktreeLifecycleState,
+};
 #[cfg(feature = "storage-redb")]
 pub use git_store::RedbGitStore;
 #[cfg(feature = "storage-sqlite")]

@@ -1882,7 +1882,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `done` / `remote-pending`
+**Lifecycle / Acceptance:** `done` / `remote-verified`
 
 **Description:** 100% 在独占目录 `src/storage/**` 内补齐 `GitStore` 核心 7 表的其余 5 张源表（`object_index`、`object_obliteration`、`notes`、`revision_ordinal`、`revision_ordinal_meta`）及同事务二级索引 `OBJECT_BY_PACK`，支持对象索引批量幂等写入、抹除对象读写双向拦截与 SHA-1/SHA-256/全零 OID 往返。
 
@@ -1940,7 +1940,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `remote-pending`
 
 **Description:** 100% 在独占目录 `src/storage/**` 内实现「可复现源表清单 A」中 Git 核心工作流、Worktree 租约、OpLog v2、Change 谱系及脏树/稀疏视图共 **22 张**活跃仓库状态表的双后端存储与等价契约。
 
@@ -1955,18 +1955,18 @@
 | `mutable_state_ownership.rs`（`L45-350`）与 `operation/store.rs` 定义 22 张工作流、Worktree、OpLog 与 Change 活跃状态表 | `src/internal/mutable_state_ownership.rs:45-350`；`src/internal/operation/store.rs:17-180` |
 
 **Acceptance criteria:**
-- [ ] `sequence_state`、`rebase_state`、`bisect_state` 按 `worktree_id` 隔离并精确往返全零 OID。
-- [ ] `workspace_record` 与 `worktree_*`（4 表）租约注册、续期与吊销在双后端逐项一致。
-- [ ] OpLog v2（4 表：`operation`、`operation_parent`、`operation_head`、`operation_journal`）支持单事务原子追加与并发操作头收敛。
-- [ ] `change_identity`、`change_revision`、`change_predecessor` 与 `ai_operation_link`（4 表）在双后端等价测试中逐项一致。
-- [ ] `working_dirty*`、`layer*`、`sparse_view*`（6 表）在双后端等价测试中逐项一致。
+- [x] `sequence_state`、`rebase_state`、`bisect_state` 按 `worktree_id` 隔离并精确往返全零 OID。
+- [x] `workspace_record` 与 `worktree_*`（4 表）租约注册、续期与吊销在双后端逐项一致。
+- [x] OpLog v2（4 表：`operation`、`operation_parent`、`operation_head`、`operation_journal`）支持单事务原子追加与并发操作头收敛。
+- [x] `change_identity`、`change_revision`、`change_predecessor` 与 `ai_operation_link`（4 表）在双后端等价测试中逐项一致。
+- [x] `working_dirty*`、`layer*`、`sparse_view*`（6 表）在双后端等价测试中逐项一致。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::git_state_store::tests::dual_backend_22_workflow_worktree_oplog_tables_equivalence) | test(=storage::git_state_store::tests::sqlite_workflow_state_tables_smoke)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::git_state_store::tests::dual_backend_22_workflow_worktree_oplog_tables_equivalence)'`（new，覆盖 AC1–AC5）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=storage::git_state_store::tests::dual_backend_22_workflow_worktree_oplog_tables_equivalence)'`（单特性红库回归，覆盖 AC1–AC5）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-sqlite --lib -E 'test(=storage::git_state_store::tests::sqlite_workflow_state_tables_smoke)'`（new，单特性 SQLite 回归）
-- [ ] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 4 文件实现白名单。
+- [x] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::git_state_store::tests::dual_backend_22_workflow_worktree_oplog_tables_equivalence) | test(=storage::git_state_store::tests::sqlite_workflow_state_tables_smoke)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::git_state_store::tests::dual_backend_22_workflow_worktree_oplog_tables_equivalence)'`（new，覆盖 AC1–AC5）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=storage::git_state_store::tests::dual_backend_22_workflow_worktree_oplog_tables_equivalence)'`（单特性红库回归，覆盖 AC1–AC5）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-sqlite --lib -E 'test(=storage::git_state_store::tests::sqlite_workflow_state_tables_smoke)'`（new，单特性 SQLite 回归）
+- [x] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 4 文件实现白名单。
 
 **Full-suite trigger:** `none`
 
@@ -10032,8 +10032,9 @@
 | `RB-03c` | `done` / `remote-verified` | `a380e51`（`main`） | `0.30.314` | 2026-11-22 16:40 UTC：Stage 1 精确 3/6 文件写集（`src/storage/{mod,config_store}.rs`、`src/storage/sqlite/config_store.rs`），落实 `ADR-RB-02` #2 分支 A 运行时感知只读分派 `open_locked_config_scope_for_read`、既有 `config.db` 写入清单自愈、`SqliteConfigStore::open_read_only` 的 pre-ledger 旧表容忍与 `inspect_configuration_schema` 未来版本 `LBR-CONFIG-001` 拒收；`dual_feature_sqlite_runtime_config_dispatch_and_authority_guard`（双特性 15/15 + 纯 `storage-sqlite` 零警告全绿）、纯 `storage-redb` 编译、fmt、严格 clippy、`compat_version_surface_sync` 与 Codex R3 `VERDICT: PASS` 全绿 |
 | `RB-03g` | `done` / `remote-verified` | `9da4b2a`（`main`） | `0.30.316` | 2026-11-22 16:57 UTC：Stage 1 精确 1/6 文件写集 `src/storage/config_store.rs`，落实 `ADR-RB-02` #2 分支 B（双特性 `Redb` 运行时只读透明回退旧 `config.db` + 写拒收 `LBR-CLI-003` 提示 `libra-migrate --global/--system`；纯 `storage-redb` 构建读写双拒收 `LBR-CLI-003` 绝不返回空配置或建 `config.redb`）；`dual_feature_redb_runtime_legacy_config_db_read_fallback_and_write_reject`、`redb_only_legacy_config_db_read_and_write_fail_closed`（双特性与 `--no-default-features --features storage-redb` 全绿）、纯 `storage-sqlite` 编译、fmt、严格 clippy、`compat_version_surface_sync` 与 Codex R1 `VERDICT: PASS` 全绿（`RB-03*` 配置作用域全系列 10 卡闭环） |
 | `RB-04` | `done` / `remote-verified` | `11ecda0`（`main`） | `0.30.318` | 2026-11-22 17:39 UTC：Stage 1 精确 4 文件写集（`src/storage/{mod,git_store}.rs`、`src/storage/{sqlite,redb}/git_store.rs`），实现对象安全 `GitStore`、`SqliteGitStore`（SQL 下推 `LIMIT`、`BEGIN IMMEDIATE` 单事务 CAS+Reflog+`agent_bridge_publication`）与 `RedbGitStore`（`MultiWriter`、版本化 `[u16_le][postcard]`、合作式写取消安全、符号 `HEAD` 同提交解析拒收与 Reflog 工作树跨界拒收）；`dual_backend_core_refs_reflog_and_bridge_cas_equivalence`、`redb_multiprocess_cas_linearizability_and_mvcc_reads`（4 写 + 8 读共 12 进程零停顿活体并发线性化压测）、`sqlite_core_refs_reflog_smoke`、fmt、严格 clippy、`compat_version_surface_sync` 与 Codex R4 `VERDICT: PASS` 全绿 |
-| `RB-04b` | `done` / `remote-pending` | 本提交（`main`） | `0.30.320` | 2026-11-22 18:30 UTC：Stage 1 精确 4 文件写集（`src/storage/{mod,git_store}.rs`、`src/storage/{sqlite,redb}/git_store.rs`），补齐 `GitStore` 核心 7 表其余 5 张源表（`object_index`、`object_obliteration`、`notes`、`revision_ordinal`、`revision_ordinal_meta`）及同事务二级索引 `OBJECT_BY_PACK` / `revision_ordinal_by_oid`；实现 1,024 条单事务幂等批量写入、读前/读后单调防 TOCTOU `run_fenced_object_read`、跨进程独占事务且取消/运行时关闭安全（`txn` 随 `spawn_blocking` 持有）`run_fenced_object_write`、遗留 5 表 `RB-04` 红库只读兼容重开与安全升级 12 表及残缺半表 fail-closed；`dual_backend_object_index_obliteration_notes_and_ordinals`（含 AC1–AC5、竞争交错、取消安全、运行时关闭与 RB-04 升级回归）、`sqlite_object_index_and_obliteration_smoke`、纯 redb 检查、fmt、严格 clippy、`compat_version_surface_sync` 与 Codex R5 `VERDICT: PASS` 全绿 |
-| `RB-05`..`RB-34c`（剩余 133 卡） | `pending` | — | — | 按实施顺序于 `main` 逐卡推进 |
+| `RB-04b` | `done` / `remote-verified` | `87a299d`（`main`） | `0.30.320` | 2026-11-22 18:30 UTC：Stage 1 精确 4 文件写集（`src/storage/{mod,git_store}.rs`、`src/storage/{sqlite,redb}/git_store.rs`），补齐 `GitStore` 核心 7 表其余 5 张源表（`object_index`、`object_obliteration`、`notes`、`revision_ordinal`、`revision_ordinal_meta`）及同事务二级索引 `OBJECT_BY_PACK` / `revision_ordinal_by_oid`；实现 1,024 条单事务幂等批量写入、读前/读后单调防 TOCTOU `run_fenced_object_read`、跨进程独占事务且取消/运行时关闭安全（`txn` 随 `spawn_blocking` 持有）`run_fenced_object_write`、遗留 5 表 `RB-04` 红库只读兼容重开与安全升级 12 表及残缺半表 fail-closed；`dual_backend_object_index_obliteration_notes_and_ordinals`（含 AC1–AC5、竞争交错、取消安全、运行时关闭与 RB-04 升级回归）、`sqlite_object_index_and_obliteration_smoke`、纯 redb 检查、fmt、严格 clippy、`compat_version_surface_sync` 与 Codex R5 `VERDICT: PASS` 全绿 |
+| `RB-05` | `done` / `remote-pending` | 本提交（`main`） | `0.30.322` | 2026-11-22 19:19 UTC：Stage 1 精确 4 文件写集（`src/storage/{mod,git_state_store}.rs`、`src/storage/{sqlite,redb}/git_state_store.rs`），实现对象安全 `GitStateStore` 及其双后端 `SqliteGitStateStore`/`RedbGitStateStore`，完整覆盖 21 张工作流/工作树/OpLog v2/Change 谱系/脏树/图层/稀疏视图源表 + 同事务二级索引 `change_revision_by_commit` + `git_state_sequences`；实现全零 SHA-1/SHA-256 OID 与 `worktree_id` 隔离、部分唯一工作区租约登记/续期/到期回收/吊销、4 表单事务原子追加兼头收敛 `append_operation_and_converge_heads`（含 6 并发写者真实并发头收敛与回滚原子实测）、SQLite 多表快照读事务（`get_sparse_view`/`get_operation`/`list_operations`）与遗留 `RB-04b` 红库只读重开一致能力基线 `[2, 3, 4]` 及安全升级；`dual_backend_22_workflow_worktree_oplog_tables_equivalence`（双特性 + 纯 `storage-redb,storage-queue`）、`sqlite_workflow_state_tables_smoke`（纯 `storage-sqlite`）、fmt、严格 clippy、`compat_version_surface_sync` 与 Codex R2 `VERDICT: PASS` 全绿 |
+| `RB-05b`..`RB-34c`（剩余 132 卡） | `pending` | — | — | 按实施顺序于 `main` 逐卡推进 |
 
 ## Codex review log
 
