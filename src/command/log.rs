@@ -5808,44 +5808,139 @@ async fn generate_cc_diff(commit: &Commit, paths: &[PathBuf]) -> CliResult<Strin
             pending.push(parent_pending);
             matched.push(matched_merge);
         }
-        let mut body = String::new();
-        for (merge_index, line) in merge_lines.iter().enumerate() {
-            for (parent_index, parent_pending) in pending.iter_mut().enumerate() {
-                let mut remaining = Vec::new();
-                for (position, pending_line) in parent_pending.drain(..) {
-                    if position <= merge_index {
-                        for column in 0..parent_lines.len() {
-                            body.push(if column == parent_index { '-' } else { ' ' });
-                        }
-                        body.push_str(&pending_line);
-                        body.push('\n');
-                    } else {
-                        remaining.push((position, pending_line));
-                    }
+        // Regions: changed merge lines plus three lines of context, merged
+        // when they overlap (Git's default unified context). A single region
+        // reproduces the whole-file hunk exactly.
+        let mut changed = vec![false; merge_lines.len()];
+        for parent_index in 0..parent_lines.len() {
+            for (index, is_matched) in matched[parent_index].iter().enumerate() {
+                if !is_matched {
+                    changed[index] = true;
                 }
-                *parent_pending = remaining;
             }
-            let mut prefix = String::new();
-            for parent_matched in &matched {
-                prefix.push(if parent_matched[merge_index] {
-                    ' '
-                } else {
-                    '+'
-                });
+            for (slot, _) in &pending[parent_index] {
+                if *slot < changed.len() {
+                    changed[*slot] = true;
+                } else if let Some(last) = changed.last_mut() {
+                    *last = true;
+                }
             }
-            body.push_str(&prefix);
-            body.push_str(line);
-            body.push('\n');
         }
-        for (parent_index, parent_pending) in pending.iter().enumerate() {
-            for (_, pending_line) in parent_pending {
-                for column in 0..parent_lines.len() {
-                    body.push(if column == parent_index { '-' } else { ' ' });
+        const CONTEXT: usize = 3;
+        let mut regions: Vec<(usize, usize)> = Vec::new();
+        for (index, is_changed) in changed.iter().enumerate() {
+            if !is_changed {
+                continue;
+            }
+            let region_start = index.saturating_sub(CONTEXT);
+            let region_end = (index + CONTEXT).min(merge_lines.len().saturating_sub(1));
+            match regions.last_mut() {
+                Some((_, last_end)) if region_start <= *last_end + 1 => {
+                    *last_end = (*last_end).max(region_end);
                 }
-                body.push_str(pending_line);
+                _ => regions.push((region_start, region_end)),
+            }
+        }
+        if regions.is_empty() {
+            continue;
+        }
+        // Emit one `@@@` block per region; every block reuses the pending lines
+        // whose insertion slot falls inside it.
+        let mut bodies: Vec<(String, String)> = Vec::new();
+        for (region_start, region_end) in &regions {
+            let mut ranges = String::new();
+            for parent_index in 0..parent_lines.len() {
+                let matched_before = matched[parent_index][..*region_start]
+                    .iter()
+                    .filter(|value| **value)
+                    .count();
+                // Lines whose slot equals `region_start` are printed inside
+                // this region (before its first merge line), not before it.
+                let pending_before = pending[parent_index]
+                    .iter()
+                    .filter(|(slot, _)| *slot < *region_start)
+                    .count();
+                let matched_inside = matched[parent_index][*region_start..=*region_end]
+                    .iter()
+                    .filter(|value| **value)
+                    .count();
+                let pending_inside = pending[parent_index]
+                    .iter()
+                    .filter(|(slot, _)| *slot >= *region_start && *slot <= *region_end)
+                    .count();
+                ranges.push_str(&format!(
+                    "-{},{} ",
+                    matched_before + pending_before + 1,
+                    (matched_inside + pending_inside).max(1)
+                ));
+            }
+            let header = format!(
+                "@@@ {}+{},{} @@@\n",
+                ranges,
+                region_start + 1,
+                region_end - region_start + 1
+            );
+            let mut body = String::new();
+            for index in *region_start..=*region_end {
+                // Removed lines keep first-appearance order; a line removed by
+                // several parents is printed once with every column marked.
+                let mut removed: Vec<(String, Vec<usize>)> = Vec::new();
+                for (parent_index, parent_pending) in pending.iter_mut().enumerate() {
+                    let mut remaining = Vec::new();
+                    for (position, pending_line) in parent_pending.drain(..) {
+                        if position <= index {
+                            match removed.iter_mut().find(|(text, _)| *text == pending_line) {
+                                Some((_, parents)) => parents.push(parent_index),
+                                None => removed.push((pending_line, vec![parent_index])),
+                            }
+                        } else {
+                            remaining.push((position, pending_line));
+                        }
+                    }
+                    *parent_pending = remaining;
+                }
+                for (text, parents) in removed {
+                    for column in 0..parent_lines.len() {
+                        body.push(if parents.contains(&column) { '-' } else { ' ' });
+                    }
+                    body.push_str(&text);
+                    body.push('\n');
+                }
+                let mut prefix = String::new();
+                for parent_matched in &matched {
+                    prefix.push(if parent_matched[index] { ' ' } else { '+' });
+                }
+                body.push_str(&prefix);
+                body.push_str(&merge_lines[index]);
                 body.push('\n');
             }
+            bodies.push((header, body));
         }
+        // Trailing parent lines that fall after the last region.
+        let mut tail = String::new();
+        let mut trailing: Vec<(String, Vec<usize>)> = Vec::new();
+        for (parent_index, parent_pending) in pending.iter().enumerate() {
+            for (_, pending_line) in parent_pending {
+                match trailing.iter_mut().find(|(text, _)| *text == *pending_line) {
+                    Some((_, parents)) => parents.push(parent_index),
+                    None => trailing.push((pending_line.clone(), vec![parent_index])),
+                }
+            }
+        }
+        for (text, parents) in trailing {
+            for column in 0..parent_lines.len() {
+                tail.push(if parents.contains(&column) { '-' } else { ' ' });
+            }
+            tail.push_str(&text);
+            tail.push('\n');
+        }
+        if let Some((_, last_body)) = bodies.last_mut() {
+            last_body.push_str(&tail);
+        }
+        let body: String = bodies
+            .iter()
+            .map(|(header, body)| format!("{header}{body}"))
+            .collect();
         output.push_str(&format!("diff --cc {}\n", path.display()));
         output.push_str(&format!(
             "index {}..{}\n",
@@ -5856,15 +5951,6 @@ async fn generate_cc_diff(commit: &Commit, paths: &[PathBuf]) -> CliResult<Strin
             "--- a/{}\n+++ b/{}\n",
             path.display(),
             path.display()
-        ));
-        let mut ranges = String::new();
-        for lines in &parent_lines {
-            ranges.push_str(&format!("-1,{} ", lines.len().max(1)));
-        }
-        output.push_str(&format!(
-            "@@@ {}+1,{} @@@\n",
-            ranges,
-            merge_lines.len().max(1)
         ));
         output.push_str(&body);
     }
