@@ -27,6 +27,9 @@ use crate::{
 /// Canonical filename for the repository storage format manifest under `.libra/`.
 pub const STORAGE_FORMAT_MANIFEST_FILE: &str = "storage-format.json";
 
+/// Canonical filename for the legacy SQLite repository database under `.libra/`.
+pub const LEGACY_SQLITE_DB_FILE: &str = "libra.db";
+
 /// Current JSON schema version for [`StorageFormatManifest`].
 pub const STORAGE_FORMAT_MANIFEST_VERSION: u32 = 1;
 
@@ -199,6 +202,43 @@ pub struct ResolvedStorageLayout {
     pub capture_db_path: PathBuf,
     /// Full validated manifest record.
     pub manifest: StorageFormatManifest,
+}
+
+/// Authoritative repository storage state detected directly from `<common_storage>`
+/// BEFORE inspecting `LIBRA_STORAGE_BACKEND` (`ADR-RB-01` #3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StorageAuthority {
+    /// A finalized `storage-format.json` manifest governs the repository.
+    Manifest(Box<ResolvedStorageLayout>),
+    /// No manifest exists, but legacy `<common_storage>/libra.db` exists.
+    LegacySqlite {
+        /// Absolute path to `<common_storage>/libra.db`.
+        git_db_path: PathBuf,
+    },
+    /// Neither `storage-format.json` nor `libra.db` exists (brand-new repository).
+    /// Any uncommitted `.libra/redb/*.redb` or `*.tmp` fragments are ignored.
+    FreshEmpty,
+}
+
+impl StorageAuthority {
+    /// Return the authoritative backend enforced by on-disk state, or `None` for
+    /// a fresh empty repository where `LIBRA_STORAGE_BACKEND` may override the
+    /// compiled default.
+    #[must_use]
+    pub const fn backend(&self) -> Option<StorageBackendKind> {
+        match self {
+            Self::Manifest(layout) => Some(layout.backend),
+            Self::LegacySqlite { .. } => Some(StorageBackendKind::Sqlite),
+            Self::FreshEmpty => None,
+        }
+    }
+
+    /// Returns `true` only when the repository is brand-new (no manifest and no
+    /// legacy `libra.db`).
+    #[must_use]
+    pub const fn is_fresh_empty(&self) -> bool {
+        matches!(self, Self::FreshEmpty)
+    }
 }
 
 /// Format a numeric generation as an 8-digit zero-padded string (e.g. `1` -> `"00000001"`).
@@ -1001,7 +1041,10 @@ fn publish_storage_manifest_with_ops(
 
     let mut payload = serde_json::to_vec_pretty(manifest).map_err(|err| {
         StorageBackendError::BackendInternal {
-            detail: format!("failed to serialize storage-format.json: {err}"),
+            detail: format!(
+                "failed to serialize storage-format.json ({:?})",
+                err.classify()
+            ),
         }
     })?;
     payload.push(b'\n');
@@ -1102,9 +1145,16 @@ pub fn read_storage_manifest(
 
     // Parse generic JSON value first so future `schema_version` values report
     // `SchemaTooNew` even if the future schema changed field shapes.
+    // Sanitize serde diagnostics so corrupt field values (such as private paths
+    // or tokens inside enum fields) can never leak into user-facing errors.
     let json_val: serde_json::Value =
         serde_json::from_slice(&raw).map_err(|err| StorageBackendError::BackendInternal {
-            detail: format!("storage-format.json is corrupt or invalid JSON: {err}"),
+            detail: format!(
+                "storage-format.json is corrupt or invalid JSON ({:?} at line {}, column {})",
+                err.classify(),
+                err.line(),
+                err.column()
+            ),
         })?;
     if let Some(ver_u64) = json_val
         .get("schema_version")
@@ -1121,7 +1171,10 @@ pub fn read_storage_manifest(
 
     let manifest: StorageFormatManifest =
         serde_json::from_value(json_val).map_err(|err| StorageBackendError::BackendInternal {
-            detail: format!("storage-format.json failed schema deserialization: {err}"),
+            detail: format!(
+                "storage-format.json failed schema deserialization ({:?})",
+                err.classify()
+            ),
         })?;
     manifest.validate()?;
     Ok(Some(manifest))
@@ -1171,6 +1224,70 @@ pub fn resolve_redb_generation_paths(
         git_db_path: layout.git_db_path,
         capture_db_path: layout.capture_db_path,
     }))
+}
+
+/// Detect the authoritative on-disk storage state for `<common_storage>` BEFORE
+/// inspecting `LIBRA_STORAGE_BACKEND` (`ADR-RB-01` #3).
+///
+/// Resolution precedence:
+/// 1. Missing `<common_storage>` directory → [`StorageAuthority::FreshEmpty`].
+///    (A regular file or dangling symlink at `<common_storage>` fails closed with `LBR-IO-001`.)
+/// 2. `<common_storage>/storage-format.json`:
+///    - `finalized == false` → `Err(ManifestNotFinalized)` (`LBR-IO-001`).
+///    - corrupt/symlink/future-schema → fail closed (`LBR-IO-001`).
+///    - `finalized == true` → [`StorageAuthority::Manifest`].
+/// 3. Absent manifest + regular `<common_storage>/libra.db` →
+///    [`StorageAuthority::LegacySqlite`] (symlinks/directories at `libra.db` fail closed).
+/// 4. Absent manifest + absent `libra.db` → [`StorageAuthority::FreshEmpty`]
+///    (uncommitted `.libra/redb/*.redb` or `*.tmp` fragments are ignored).
+pub fn detect_storage_authority(common_storage: &Path) -> StorageResult<StorageAuthority> {
+    match fs::symlink_metadata(common_storage) {
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            return Ok(StorageAuthority::FreshEmpty);
+        }
+        Err(err) => {
+            return Err(StorageBackendError::io("stat storage directory", err));
+        }
+        Ok(sym_meta) => {
+            if sym_meta.file_type().is_symlink() {
+                let target_meta = fs::metadata(common_storage).map_err(|err| {
+                    StorageBackendError::io("resolve storage directory symlink", err)
+                })?;
+                if !target_meta.is_dir() {
+                    return Err(StorageBackendError::BackendInternal {
+                        detail: "storage root path symlink does not point to a directory"
+                            .to_string(),
+                    });
+                }
+            } else if !sym_meta.is_dir() {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: "storage root path is not a directory".to_string(),
+                });
+            }
+        }
+    }
+
+    if let Some(layout) = resolve_storage_layout(common_storage)? {
+        return Ok(StorageAuthority::Manifest(Box::new(layout)));
+    }
+
+    let legacy_db_path = common_storage.join(LEGACY_SQLITE_DB_FILE);
+    match fs::symlink_metadata(&legacy_db_path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() || !meta.is_file() {
+                return Err(StorageBackendError::BackendInternal {
+                    detail:
+                        "legacy libra.db must be a regular file (symlinks and directories are rejected)"
+                            .to_string(),
+                });
+            }
+            Ok(StorageAuthority::LegacySqlite {
+                git_db_path: legacy_db_path,
+            })
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(StorageAuthority::FreshEmpty),
+        Err(err) => Err(StorageBackendError::io("stat legacy libra.db", err)),
+    }
 }
 
 #[cfg(test)]

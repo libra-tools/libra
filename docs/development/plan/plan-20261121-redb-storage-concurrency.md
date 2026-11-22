@@ -1184,7 +1184,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `remote-pending`
 
 **Description:** 100% 在 `src/storage/` 内将 `manifest.rs` 接入 `src/storage/backend.rs` 的 `StorageBackendKind::resolve` 清单前置优先级链路，在双特性构建下强制清单与旧库状态严格先于 `LIBRA_STORAGE_BACKEND` 生效。
 
@@ -1198,16 +1198,16 @@
 | `ADR-RB-01` #3 要求清单先于 `LIBRA_STORAGE_BACKEND`：`finalized == false` 无条件 `LBR-IO-001`、冲突覆盖报 `LBR-CLI-003`、仅全新空仓允许覆盖 | `ADR-RB-01` #3 |
 
 **Acceptance criteria:**
-- [ ] 双特性构建下遇 `finalized == false` 清单时，设置 `LIBRA_STORAGE_BACKEND=redb` 覆盖无条件 fail-closed 报 `LBR-IO-001`。
-- [ ] 双特性构建下遇 `finalized == false` 清单时，设置 `LIBRA_STORAGE_BACKEND=sqlite` 覆盖无条件 fail-closed 报 `LBR-IO-001`。
-- [ ] 双特性构建下遇 `finalized == true` 清单时，与 `manifest.backend` 冲突的 `LIBRA_STORAGE_BACKEND` 覆盖 fail-closed 报 `LBR-CLI-003`。
-- [ ] 双特性构建下遇无清单但存在 `.libra/libra.db` 的旧仓时，`LIBRA_STORAGE_BACKEND=redb` 覆盖 fail-closed 报 `LBR-CLI-003`。
-- [ ] 仅全新空仓库（无清单且无 `libra.db`）允许 `LIBRA_STORAGE_BACKEND` 覆盖编译期默认后端（仍受门控约束）。
+- [x] 双特性构建下遇 `finalized == false` 清单时，设置 `LIBRA_STORAGE_BACKEND=redb` 覆盖无条件 fail-closed 报 `LBR-IO-001`。
+- [x] 双特性构建下遇 `finalized == false` 清单时，设置 `LIBRA_STORAGE_BACKEND=sqlite` 覆盖无条件 fail-closed 报 `LBR-IO-001`。
+- [x] 双特性构建下遇 `finalized == true` 清单时，与 `manifest.backend` 冲突的 `LIBRA_STORAGE_BACKEND` 覆盖 fail-closed 报 `LBR-CLI-003`。
+- [x] 双特性构建下遇无清单但存在 `.libra/libra.db` 的旧仓时，`LIBRA_STORAGE_BACKEND=redb` 覆盖 fail-closed 报 `LBR-CLI-003`。
+- [x] 仅全新空仓库（无清单且无 `libra.db`）允许 `LIBRA_STORAGE_BACKEND` 覆盖编译期默认后端（仍受门控约束）。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::backend::tests::manifest_first_precedence_blocks_conflicting_env_overrides)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::backend::tests::manifest_first_precedence_blocks_conflicting_env_overrides)'`（new，双特性构建下证明清单前置优先级非缺特性误报，覆盖 AC1–AC5）
-- [ ] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 3 文件实现白名单（`src/storage/mod.rs`、`src/storage/backend.rs`、`src/storage/manifest.rs`）。
+- [x] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::backend::tests::manifest_first_precedence_blocks_conflicting_env_overrides)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::backend::tests::manifest_first_precedence_blocks_conflicting_env_overrides)'`（new，双特性构建下证明清单前置优先级非缺特性误报，覆盖 AC1–AC5）
+- [x] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 3 文件实现白名单（`src/storage/mod.rs`、`src/storage/backend.rs`、`src/storage/manifest.rs`）。
 
 **Full-suite trigger:** `none`
 
@@ -10019,8 +10019,9 @@
 | `RB-02` | `done` / `remote-pending` | `16c6ac7`（`main`） | `0.30.287` | 2026-11-22 07:57:32 UTC：Stage 1 精确 2 文件写集、`multiwriter_concurrent_open_and_bounded_write_timeout`（含 `RecordingBuilder` 校验 `MultiWriter` + `16/32/64 MiB`、阻塞池饱和 `Duration::ZERO` 及非零 deadline、多进程并发打开与有界写锁超时、`UpgradeRequired` 按格式版本可操作指引）全绿、4 特性矩阵、fmt、严格 clippy、rustdoc、`compat_version_surface_sync` 全绿；Codex R5 `01a20241-78d9-70d1-be41-35093cc20ca8` `VERDICT: PASS` |
 | `RB-02d` | `done` / `remote-pending` | `f60d17e`（`main`） | `0.30.290` | 2026-11-22 08:38:12 UTC：Stage 1 精确 2 文件写集、封闭 `RedbRepairContext` 门控并私有化 `redb_builder_for`、`readonly_repair_aborted_ro_fs_and_concurrent_explicit_repair`（含真实 `CrashBackend` 崩溃夹具严格只读 `RepairAborted` 零改盘、真实 `hdiutil -readonly` 只读挂载 `EROFS` fail-closed 零改盘及 4 进程并发安全修复）全绿、4 特性矩阵、fmt、严格 clippy、rustdoc、`compat_version_surface_sync` 全绿；Codex R3 `01a2025d-810c-7b83-9f63-98f634fb5752` `VERDICT: PASS` |
 | `RB-02b` | `done` / `remote-pending` | `4c3cb21`（`main`） | `0.30.292` | 2026-11-22 09:08:13 UTC：Stage 1 精确 2 文件写集、`meta_schema_role_future_version_and_migration_tombstone_fence`（含角色失配/Derived 拒绝、未来版本按角色错误码 `LBR-AGENT-048`/`LBR-CONFIG-001`/`LBR-IO-001`、已有普通表/multimap 表/空 `META_SCHEMA` 防重贴标签及跨进程 `u32::MAX` 围栏+`unlink` 已打开读写句柄阻断）全绿、4 特性矩阵、fmt、严格 clippy、rustdoc、`compat_version_surface_sync` 全绿；Codex R3 `01a20282-120a-7123-bc17-168bae3ff386` `VERDICT: PASS` |
-| `RB-02c` | `done` / `remote-pending` | 本提交（`main`） | `0.30.295` | 2026-11-22 09:53:52 UTC：Stage 1 精确 2 文件写集、`two_phase_finalized_manifest_and_absent_fragment_ignore`（含 `ManifestOrigin::{FreshInit,Migration}`、两阶段原子发布 `.tmp`→`fsync`→`rename`→`fsync_dir` + Windows `MOVEFILE_WRITE_THROUGH` + 不支持平台前置 fail-closed、正/反向 Phase 2 状态机与 `targets_staged_for_rename` / 缺/空 JSON 全矩阵校验、代际路径解析及缺清单忽略 `.libra/redb/` 残片）全绿、4 特性矩阵、fmt、严格 clippy、rustdoc、`compat_version_surface_sync` 全绿；Codex R6 `01a202a9-8c29-7c42-a9ae-dadabc15f783` `VERDICT: PASS` |
-| `RB-02e`..`RB-34c`（剩余 146 卡） | `pending` | — | — | 按实施顺序于 `main` 逐卡推进 |
+| `RB-02c` | `done` / `remote-pending` | `30c99b4`（`main`） | `0.30.295` | 2026-11-22 09:53:52 UTC：Stage 1 精确 2 文件写集、`two_phase_finalized_manifest_and_absent_fragment_ignore`（含 `ManifestOrigin::{FreshInit,Migration}`、两阶段原子发布 `.tmp`→`fsync`→`rename`→`fsync_dir` + Windows `MOVEFILE_WRITE_THROUGH` + 不支持平台前置 fail-closed、正/反向 Phase 2 状态机与 `targets_staged_for_rename` / 缺/空 JSON 全矩阵校验、代际路径解析及缺清单忽略 `.libra/redb/` 残片）全绿、4 特性矩阵、fmt、严格 clippy、rustdoc、`compat_version_surface_sync` 全绿；Codex R6 `01a202a9-8c29-7c42-a9ae-dadabc15f783` `VERDICT: PASS` |
+| `RB-02e` | `done` / `remote-pending` | 本提交（`main`） | `0.30.297` | 2026-11-22 10:34:14 UTC：Stage 1 精确 3 文件写集、`StorageBackendKind::resolve(common_storage)` 收敛为唯一公开入口 + `detect_storage_authority` + `manifest.rs` 脱敏反序列化、`manifest_first_precedence_blocks_conflicting_env_overrides`（含子进程哨兵+`1 passed; 0 failed` 实测 `finalized=false` 无条件先于 env 报 `LBR-IO-001`、终态清单与旧 `libra.db` 冲突报 `BackendMismatch`/`LBR-CLI-003`、非法/非 UTF-8 环境变量与软链边界、全新空仓覆盖与未解门控）、纯 SQLite/纯 redb/双特性矩阵、fmt、严格 clippy、rustdoc、`compat_version_surface_sync` 全绿；Codex R3 `VERDICT: PASS`（P0/P1/P2=0，Phase 0 全 9 卡闭环） |
+| `RB-03`..`RB-34c`（剩余 145 卡） | `pending` | — | — | 按实施顺序于 `main` 逐卡推进 |
 
 ## Codex review log
 

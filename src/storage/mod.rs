@@ -30,12 +30,13 @@ pub use backend::{
 };
 pub use error::{StorageBackendError, StorageResult};
 pub use manifest::{
-    INITIAL_STORAGE_GENERATION, ManifestOrigin, PRIVATE_SUBDIR, Phase2DbState, Phase2Progress,
-    REDB_SUBDIR, RedbGenerationPaths, ResolvedStorageLayout, STORAGE_FORMAT_MANIFEST_FILE,
-    STORAGE_FORMAT_MANIFEST_VERSION, SourceDigests, StorageFormatManifest,
-    canonical_capture_redb_rel_path, canonical_git_redb_rel_path, format_generation_id,
-    publish_storage_manifest, read_storage_manifest, resolve_redb_generation_paths,
-    resolve_storage_layout, storage_manifest_path,
+    INITIAL_STORAGE_GENERATION, LEGACY_SQLITE_DB_FILE, ManifestOrigin, PRIVATE_SUBDIR,
+    Phase2DbState, Phase2Progress, REDB_SUBDIR, RedbGenerationPaths, ResolvedStorageLayout,
+    STORAGE_FORMAT_MANIFEST_FILE, STORAGE_FORMAT_MANIFEST_VERSION, SourceDigests, StorageAuthority,
+    StorageFormatManifest, canonical_capture_redb_rel_path, canonical_git_redb_rel_path,
+    detect_storage_authority, format_generation_id, publish_storage_manifest,
+    read_storage_manifest, resolve_redb_generation_paths, resolve_storage_layout,
+    storage_manifest_path,
 };
 #[cfg(feature = "storage-redb")]
 pub use meta::{
@@ -73,14 +74,16 @@ pub const fn has_storage_queue() -> bool {
 
 #[cfg(test)]
 mod tests {
+    use tempfile::tempdir;
+
     use super::*;
 
     #[cfg(feature = "storage-sqlite")]
     #[test]
     fn sqlite_only_rejects_redb_override() {
         #[cfg(not(feature = "storage-redb"))]
-        if std::env::var_os("LIBRA_RB01C_SQLITE_ONLY_CHILD").is_some() {
-            let real_err = StorageBackendKind::resolve().expect_err(
+        if let Some(dir) = std::env::var_os("LIBRA_RB01C_SQLITE_ONLY_CHILD_DIR") {
+            let real_err = StorageBackendKind::resolve(std::path::Path::new(&dir)).expect_err(
                 "sqlite-only build must reject LIBRA_STORAGE_BACKEND=redb via resolve()",
             );
             assert!(
@@ -88,11 +91,14 @@ mod tests {
                 "expected UnsupportedBackend in sqlite-only child process, got {real_err:?}"
             );
             assert_eq!(real_err.stable_code_str(), "LBR-CLI-003");
+            println!("RB01C_SQLITE_ONLY_CHILD_OK");
             return;
         }
 
-        let err = StorageBackendKind::resolve_with_capabilities(Some("redb"), true, false)
-            .expect_err("sqlite-only capability must reject redb override");
+        let fresh = tempdir().expect("create fresh storage dir");
+        let err =
+            StorageBackendKind::resolve_with_capabilities(fresh.path(), Some("redb"), true, false)
+                .expect_err("sqlite-only capability must reject redb override");
         assert!(
             matches!(err, StorageBackendError::UnsupportedBackend { .. }),
             "expected UnsupportedBackend, got {err:?}"
@@ -102,25 +108,30 @@ mod tests {
         #[cfg(not(feature = "storage-redb"))]
         {
             let exe = std::env::current_exe().expect("locate current test executable");
-            let status = std::process::Command::new(exe)
+            let output = std::process::Command::new(exe)
                 .arg("--exact")
                 .arg("storage::tests::sqlite_only_rejects_redb_override")
                 .arg("--nocapture")
-                .env("LIBRA_RB01C_SQLITE_ONLY_CHILD", "1")
+                .env("LIBRA_RB01C_SQLITE_ONLY_CHILD_DIR", fresh.path())
                 .env(LIBRA_STORAGE_BACKEND_ENV, "redb")
                 .env("LIBRA_TEST", "1")
-                .status()
+                .output()
                 .expect("spawn isolated sqlite-only resolve child");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
             assert!(
-                status.success(),
-                "isolated sqlite-only resolve child failed with {status}"
+                output.status.success()
+                    && stdout.contains("RB01C_SQLITE_ONLY_CHILD_OK")
+                    && stdout.contains("1 passed; 0 failed"),
+                "isolated sqlite-only resolve child did not execute expected test (status={:?}):\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                output.status
             );
 
-            let resolved = StorageBackendKind::resolve_from_override(Some("sqlite"))
+            let resolved = StorageBackendKind::resolve_from_override(fresh.path(), Some("sqlite"))
                 .expect("sqlite-only build must accept sqlite override");
             assert_eq!(resolved, StorageBackendKind::Sqlite);
 
-            let default_resolved = StorageBackendKind::resolve_from_override(None)
+            let default_resolved = StorageBackendKind::resolve_from_override(fresh.path(), None)
                 .expect("sqlite-only build must default to sqlite");
             assert_eq!(default_resolved, StorageBackendKind::Sqlite);
         }
@@ -130,8 +141,8 @@ mod tests {
     #[test]
     fn redb_only_rejects_sqlite_override() {
         #[cfg(not(feature = "storage-sqlite"))]
-        if std::env::var_os("LIBRA_RB01C_REDB_ONLY_CHILD").is_some() {
-            let real_err = StorageBackendKind::resolve().expect_err(
+        if let Some(dir) = std::env::var_os("LIBRA_RB01C_REDB_ONLY_CHILD_DIR") {
+            let real_err = StorageBackendKind::resolve(std::path::Path::new(&dir)).expect_err(
                 "redb-only build must reject LIBRA_STORAGE_BACKEND=sqlite via resolve()",
             );
             assert!(
@@ -139,11 +150,18 @@ mod tests {
                 "expected UnsupportedBackend in redb-only child process, got {real_err:?}"
             );
             assert_eq!(real_err.stable_code_str(), "LBR-CLI-003");
+            println!("RB01C_REDB_ONLY_CHILD_OK");
             return;
         }
 
-        let err = StorageBackendKind::resolve_with_capabilities(Some("sqlite"), false, true)
-            .expect_err("redb-only capability must reject sqlite override");
+        let fresh = tempdir().expect("create fresh storage dir");
+        let err = StorageBackendKind::resolve_with_capabilities(
+            fresh.path(),
+            Some("sqlite"),
+            false,
+            true,
+        )
+        .expect_err("redb-only capability must reject sqlite override");
         assert!(
             matches!(err, StorageBackendError::UnsupportedBackend { .. }),
             "expected UnsupportedBackend, got {err:?}"
@@ -153,18 +171,23 @@ mod tests {
         #[cfg(not(feature = "storage-sqlite"))]
         {
             let exe = std::env::current_exe().expect("locate current test executable");
-            let status = std::process::Command::new(exe)
+            let output = std::process::Command::new(exe)
                 .arg("--exact")
                 .arg("storage::tests::redb_only_rejects_sqlite_override")
                 .arg("--nocapture")
-                .env("LIBRA_RB01C_REDB_ONLY_CHILD", "1")
+                .env("LIBRA_RB01C_REDB_ONLY_CHILD_DIR", fresh.path())
                 .env(LIBRA_STORAGE_BACKEND_ENV, "sqlite")
                 .env("LIBRA_TEST", "1")
-                .status()
+                .output()
                 .expect("spawn isolated redb-only resolve child");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
             assert!(
-                status.success(),
-                "isolated redb-only resolve child failed with {status}"
+                output.status.success()
+                    && stdout.contains("RB01C_REDB_ONLY_CHILD_OK")
+                    && stdout.contains("1 passed; 0 failed"),
+                "isolated redb-only resolve child did not execute expected test (status={:?}):\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                output.status
             );
         }
     }
