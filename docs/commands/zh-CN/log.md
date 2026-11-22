@@ -313,6 +313,8 @@ libra log --decorate=full
 
 `log.excludeDecoration`（可重复）把匹配的引用排除在装饰之外；显式 `--decorate-refs` 会替换该配置过滤。空串值即 Git 的空排除模式：隐藏全部引用但保留 `HEAD` 标记。Libra 无法表示 Git 的无值键 `[log] excludeDecoration`（配置值为 `NOT NULL`），因此 Git 的「缺值」诊断在此无对应形态。
 
+装饰包含远程跟踪引用（`origin/main`），按 Git 顺序排在 tag 之后、本地分支之前。
+
 ### `--no-decorate`
 
 不打印 ref 名称。覆盖 `--decorate`。

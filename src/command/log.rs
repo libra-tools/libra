@@ -4296,6 +4296,26 @@ async fn create_reference_commit_map() -> HashMap<ObjectHash, Vec<Reference>> {
             });
     }
 
+    // Remote-tracking refs decorate too (Git lists them after tags and before
+    // local branches). The stored name is sometimes the full ref.
+    if let Ok(remotes) = ConfigKv::all_remote_configs().await {
+        for remote in remotes {
+            for branch in Branch::list_branches_best_effort(Some(&remote.name)).await {
+                let short = branch
+                    .name
+                    .strip_prefix(&format!("refs/remotes/{}/", remote.name))
+                    .unwrap_or(&branch.name);
+                commit_to_refs
+                    .entry(branch.commit)
+                    .or_default()
+                    .push(Reference {
+                        name: format!("{}/{}", remote.name, short),
+                        kind: ReferenceKind::Remote,
+                    });
+            }
+        }
+    }
+
     let all_tags = tag::list().await.unwrap_or_else(|e| {
         tracing::warn!("failed to list tags for log decoration: {e}");
         Vec::new()

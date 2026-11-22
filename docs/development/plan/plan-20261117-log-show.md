@@ -517,7 +517,7 @@ PY
 
 ### Task LS-04: 核实 `534` 后 `#952` `--decorate-refs` 剩余边界并修复（#952）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `complete`（2026-11-21：复现发现 `create_reference_commit_map` 只枚举本地分支，装饰中缺失 `refs/remotes/*`；补上按已配置 remote 枚举远端跟踪分支（并剥离可能存在的 `refs/remotes/<remote>/` 前缀）后，AC1–AC4 输出与 Git 同夹具期望逐字一致：`(tag: v1-tag)`、`(HEAD)`、`(tag: v1-tag, origin/main, topic, main)`、`(HEAD -> main, tag: v1-tag, origin/main, topic)`。用例 `decorate_refs_issue_952_remaining` 覆盖 AC1–AC4；`log_test` **258/258**；文档 EN/zh-CN 同步；版本面 0.30.281 → 0.30.282。按用户 2026-11-20 指令在 `main` 直接提交推送。）
 
 **Description:** 按 GC-01 核实 `issues/534.md`（`LO-05..LO-08`）已合入的 `--decorate-refs` / `--decorate-refs-exclude` 匹配、HEAD 过滤与排列，针对 `#952` 仍未关闭的边界（与 `git@6de20f6092` 对照复现）修复。开工复现到下列 AC 之外的失败场景时，先把每个场景作为独立 AC 补入本卡并重算 G-03（超过 8 条按 ER-03 拆卡），不得在实现中静默扩张。
 

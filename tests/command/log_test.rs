@@ -7137,3 +7137,106 @@ fn log_exclude_decoration_config() {
     let first = line.lines().next().unwrap_or_default();
     assert!(first.contains("(HEAD)"), "AC4: {}", first);
 }
+
+#[test]
+fn decorate_refs_issue_952_remaining() {
+    use super::{assert_cli_success, run_libra_command};
+
+    // Fixture F04: commit C is HEAD -> main, also branch `topic`, tag `v1-tag`
+    // and the remote-tracking `origin/main`.
+    let work = tempfile::tempdir().expect("work dir");
+    let bare = work.path().join("origin");
+    std::fs::create_dir_all(&bare).expect("mkdir bare");
+    assert_cli_success(&run_libra_command(&["init", "--bare"], &bare), "init bare");
+    let repo = work.path().join("r");
+    std::fs::create_dir_all(&repo).expect("mkdir repo");
+    assert_cli_success(&run_libra_command(&["init"], &repo), "init repo");
+    run_libra_command(&["config", "set", "user.name", "t"], &repo);
+    run_libra_command(&["config", "set", "user.email", "t@t"], &repo);
+    std::fs::write(repo.join("f.txt"), "a\n").expect("write f");
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], &repo), "stage");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c1", "--no-verify"], &repo),
+        "commit c1",
+    );
+    assert_cli_success(
+        &run_libra_command(&["tag", "-m", "v", "v1-tag"], &repo),
+        "tag v1-tag",
+    );
+    assert_cli_success(
+        &run_libra_command(&["branch", "topic"], &repo),
+        "branch topic",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &["remote", "add", "origin", bare.to_str().expect("bare")],
+            &repo,
+        ),
+        "add origin",
+    );
+    assert_cli_success(
+        &run_libra_command(&["push", "origin", "main"], &repo),
+        "push main",
+    );
+    assert_cli_success(
+        &run_libra_command(&["fetch", "origin"], &repo),
+        "fetch origin",
+    );
+
+    let decoration = |args: &[&str]| {
+        let out = run_libra_command(args, &repo);
+        assert_cli_success(&out, "log runs");
+        let text = String::from_utf8_lossy(&out.stdout).to_string();
+        let line = text.lines().next().unwrap_or_default();
+        match (line.find('('), line.rfind(')')) {
+            (Some(start), Some(end)) if end > start => line[start..=end].to_string(),
+            _ => String::new(),
+        }
+    };
+
+    // AC1: an unprefixed wildcard selects only the tag.
+    assert_eq!(
+        decoration(&[
+            "log",
+            "-1",
+            "--oneline",
+            "--decorate=short",
+            "--decorate-refs=*tag*"
+        ]),
+        "(tag: v1-tag)",
+        "AC1"
+    );
+
+    // AC2: only HEAD survives its own include filter.
+    assert_eq!(
+        decoration(&[
+            "log",
+            "-1",
+            "--oneline",
+            "--decorate=short",
+            "--decorate-refs=HEAD"
+        ]),
+        "(HEAD)",
+        "AC2"
+    );
+
+    // AC3: excluding HEAD leaves the remaining decorations, arrow removed.
+    assert_eq!(
+        decoration(&[
+            "log",
+            "-1",
+            "--oneline",
+            "--decorate=short",
+            "--decorate-refs-exclude=HEAD",
+        ]),
+        "(tag: v1-tag, origin/main, topic, main)",
+        "AC3"
+    );
+
+    // AC4: the default order is HEAD arrow, tags, remote-tracking, local.
+    assert_eq!(
+        decoration(&["log", "-1", "--oneline", "--decorate=short"]),
+        "(HEAD -> main, tag: v1-tag, origin/main, topic)",
+        "AC4"
+    );
+}

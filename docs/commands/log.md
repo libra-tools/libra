@@ -412,6 +412,9 @@ empty exclusion pattern: every ref is hidden but the `HEAD` marker remains. Libr
 cannot represent Git's valueless `[log] excludeDecoration` key (config values are
 `NOT NULL`), so Git's `missing value` diagnostic has no equivalent here.
 
+Decorations include remote-tracking refs (`origin/main`) between tags and local
+branch names, matching Git's ordering.
+
 ### `--no-decorate`
 
 Do not print ref names. Overrides `--decorate`.
