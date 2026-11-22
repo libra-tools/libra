@@ -1763,7 +1763,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `done` / `remote-pending`（2026-11-22 16:50 UTC，`v0.30.316`，于 `main` 直接提交推送；Stage 1 精确 1/6 文件写集 `src/storage/config_store.rs`、AC1–AC4 双特性只读回退/写拒收与纯 `storage-redb` 读写双拒收 `LBR-CLI-003` 全绿、纯 `storage-sqlite` 编译通过、fmt、严格 clippy 与 Codex R1 `VERDICT: PASS` 全绿；`RB-03*` 全系列闭环）
+**Lifecycle / Acceptance:** `done` / `remote-verified`（`9da4b2a`，`v0.30.316`，2026-11-22 16:57 UTC 于 `main` 提交并推送 `origin/main`；Stage 1 精确 1/6 文件写集 `src/storage/config_store.rs`、AC1–AC4 双特性只读回退/写拒收与纯 `storage-redb` 读写双拒收 `LBR-CLI-003` 全绿、纯 `storage-sqlite` 编译通过、fmt、严格 clippy 与 Codex R1 `VERDICT: PASS` 全绿；`RB-03*` 全系列闭环）
 
 **Description:** 100% 在独占目录 `src/storage/**` 内落实 `ADR-RB-02` #2 分支 B（`Redb` 运行时遇未迁移旧 `config.db`）：在双特性构建下只读透明回退旧值、写操作 fail-closed 提示 `libra-migrate --global/--system`；在纯 `storage-redb` 构建下读操作与写操作均显式 fail-closed 返回 `LBR-CLI-003`，绝不静默返回空配置。
 
@@ -1820,7 +1820,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `remote-pending`（2026-11-22 17:39 UTC，`v0.30.318`，于 `main` 直接提交推送；Stage 1 精确 4 文件写集 `src/storage/{mod,git_store}.rs` 与 `src/storage/{sqlite,redb}/git_store.rs`、AC1–AC6 三组特性矩阵含 4 写 + 8 读 12 进程零停顿活体并发线性化压测、桥接符号 `HEAD` 同提交解析拒收与 Reflog 工作树跨界拒收、fmt、严格 clippy 与 Codex R4 `VERDICT: PASS` 全绿）
 
 **Description:** 100% 在独占目录 `src/storage/**` 内定义并双后端实现 `GitStore` 核心引用与 Reflog 域（`reference`、`reflog` 及同事务 `agent_bridge_publication` 绑定），提供工作树作用域局部 `HEAD` 隔离、共享引用可见性与多进程线性化 CAS 读写。
 
@@ -1836,19 +1836,19 @@
 | 引用与 Reflog 支持 worktree 作用域、符号引用与 CAS 原子更新；`agent_bridge_publication` 须与 `HEAD` 同事务提交 | `src/internal/head.rs:7-171`；`src/internal/reflog.rs:11-90`；`src/internal/ai/agent_bridge/publication.rs:5-26` |
 
 **Acceptance criteria:**
-- [ ] `update_ref_cas` 在单写事务内原子完成旧值比较、引用更新与 Reflog 追加。
-- [ ] `update_ref_cas` 旧值不匹配时返回 `CasConflict` 不产生孤立 Reflog 行。
-- [ ] `update_ref_cas_with_bridge_publication` 在同一 `git.redb` 写事务内原子提交 `HEAD` 移动与 `agent_bridge_publication` 记录，回滚时不留孤行。
-- [ ] 主工作树与 linked worktree 的局部 `HEAD` 严格按 `worktree_id` 隔离。
-- [ ] 主工作树与 linked worktree 的非局部共享引用在双后端一致可见。
-- [ ] 多进程压测：4 写进程循环 `update_ref_cas` + 8 只读进程循环 `list_refs`/`get_ref` 线性化无锁错。
+- [x] `update_ref_cas` 在单写事务内原子完成旧值比较、引用更新与 Reflog 追加。
+- [x] `update_ref_cas` 旧值不匹配时返回 `CasConflict` 不产生孤立 Reflog 行。
+- [x] `update_ref_cas_with_bridge_publication` 在同一 `git.redb` 写事务内原子提交 `HEAD` 移动与 `agent_bridge_publication` 记录，回滚时不留孤行。
+- [x] 主工作树与 linked worktree 的局部 `HEAD` 严格按 `worktree_id` 隔离。
+- [x] 主工作树与 linked worktree 的非局部共享引用在双后端一致可见。
+- [x] 多进程压测：4 写进程循环 `update_ref_cas` + 8 只读进程循环 `list_refs`/`get_ref` 线性化无锁错。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::git_store::tests::dual_backend_core_refs_reflog_and_bridge_cas_equivalence) | test(=storage::git_store::tests::redb_multiprocess_cas_linearizability_and_mvcc_reads) | test(=storage::git_store::tests::sqlite_core_refs_reflog_smoke)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::git_store::tests::dual_backend_core_refs_reflog_and_bridge_cas_equivalence)'`（new，覆盖 AC1–AC5）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=storage::git_store::tests::redb_multiprocess_cas_linearizability_and_mvcc_reads)'`（new，覆盖 AC6）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-sqlite --lib -E 'test(=storage::git_store::tests::sqlite_core_refs_reflog_smoke)'`（new，单特性 SQLite 回归）
-- [ ] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 4 文件实现白名单。
+- [x] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::git_store::tests::dual_backend_core_refs_reflog_and_bridge_cas_equivalence) | test(=storage::git_store::tests::redb_multiprocess_cas_linearizability_and_mvcc_reads) | test(=storage::git_store::tests::sqlite_core_refs_reflog_smoke)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::git_store::tests::dual_backend_core_refs_reflog_and_bridge_cas_equivalence)'`（new，覆盖 AC1–AC5）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=storage::git_store::tests::redb_multiprocess_cas_linearizability_and_mvcc_reads)'`（new，覆盖 AC6）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-sqlite --lib -E 'test(=storage::git_store::tests::sqlite_core_refs_reflog_smoke)'`（new，单特性 SQLite 回归）
+- [x] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 4 文件实现白名单。
 
 **Full-suite trigger:** `none`
 
@@ -10030,8 +10030,9 @@
 | `RB-03e` | `done` / `remote-verified` | `717364c`（`main`） | `0.30.312` | 4 步 `init_phase="fresh_create"` 状态机、Windows `sync_all` 恢复刷盘与 `GlobalConfig` 边界 1/2/3a/3b 崩溃恢复；Codex R1–R4 全部发现闭环 |
 | `RB-03i` | `done` / `remote-verified` | `14f3403`（`main`） | `0.30.313` | 2026-11-22 15:59 UTC：Stage 1 精确 1/6 文件写集 `src/storage/config_store.rs`，`system_config_fresh_create_crash_boundaries_1_2_3_and_modes` 在隔离 `LIBRA_CONFIG_SYSTEM_DB` + `umask(0o077)` 子进程实测 `SystemConfig` 边界 1/2/3a/3b 恢复、零覆写保留与严格 `0644`/`0444` 权限，fmt、严格 clippy、`compat_version_surface_sync` 与 Codex R1 `VERDICT: PASS` 全绿 |
 | `RB-03c` | `done` / `remote-verified` | `a380e51`（`main`） | `0.30.314` | 2026-11-22 16:40 UTC：Stage 1 精确 3/6 文件写集（`src/storage/{mod,config_store}.rs`、`src/storage/sqlite/config_store.rs`），落实 `ADR-RB-02` #2 分支 A 运行时感知只读分派 `open_locked_config_scope_for_read`、既有 `config.db` 写入清单自愈、`SqliteConfigStore::open_read_only` 的 pre-ledger 旧表容忍与 `inspect_configuration_schema` 未来版本 `LBR-CONFIG-001` 拒收；`dual_feature_sqlite_runtime_config_dispatch_and_authority_guard`（双特性 15/15 + 纯 `storage-sqlite` 零警告全绿）、纯 `storage-redb` 编译、fmt、严格 clippy、`compat_version_surface_sync` 与 Codex R3 `VERDICT: PASS` 全绿 |
-| `RB-03g` | `done` / `remote-pending` | 本提交（`main`） | `0.30.316` | 2026-11-22 16:50 UTC：Stage 1 精确 1/6 文件写集 `src/storage/config_store.rs`，落实 `ADR-RB-02` #2 分支 B（双特性 `Redb` 运行时只读透明回退旧 `config.db` + 写拒收 `LBR-CLI-003` 提示 `libra-migrate --global/--system`；纯 `storage-redb` 构建读写双拒收 `LBR-CLI-003` 绝不返回空配置或建 `config.redb`）；`dual_feature_redb_runtime_legacy_config_db_read_fallback_and_write_reject`、`redb_only_legacy_config_db_read_and_write_fail_closed`（双特性与 `--no-default-features --features storage-redb` 全绿）、纯 `storage-sqlite` 编译、fmt、严格 clippy、`compat_version_surface_sync` 与 Codex R1 `VERDICT: PASS` 全绿（`RB-03*` 配置作用域全系列 10 卡闭环） |
-| `RB-04`..`RB-34c`（剩余 135 卡） | `pending` | — | — | 按实施顺序于 `main` 逐卡推进 |
+| `RB-03g` | `done` / `remote-verified` | `9da4b2a`（`main`） | `0.30.316` | 2026-11-22 16:57 UTC：Stage 1 精确 1/6 文件写集 `src/storage/config_store.rs`，落实 `ADR-RB-02` #2 分支 B（双特性 `Redb` 运行时只读透明回退旧 `config.db` + 写拒收 `LBR-CLI-003` 提示 `libra-migrate --global/--system`；纯 `storage-redb` 构建读写双拒收 `LBR-CLI-003` 绝不返回空配置或建 `config.redb`）；`dual_feature_redb_runtime_legacy_config_db_read_fallback_and_write_reject`、`redb_only_legacy_config_db_read_and_write_fail_closed`（双特性与 `--no-default-features --features storage-redb` 全绿）、纯 `storage-sqlite` 编译、fmt、严格 clippy、`compat_version_surface_sync` 与 Codex R1 `VERDICT: PASS` 全绿（`RB-03*` 配置作用域全系列 10 卡闭环） |
+| `RB-04` | `done` / `remote-pending` | 本提交（`main`） | `0.30.318` | 2026-11-22 17:39 UTC：Stage 1 精确 4 文件写集（`src/storage/{mod,git_store}.rs`、`src/storage/{sqlite,redb}/git_store.rs`），实现对象安全 `GitStore`、`SqliteGitStore`（SQL 下推 `LIMIT`、`BEGIN IMMEDIATE` 单事务 CAS+Reflog+`agent_bridge_publication`）与 `RedbGitStore`（`MultiWriter`、版本化 `[u16_le][postcard]`、合作式写取消安全、符号 `HEAD` 同提交解析拒收与 Reflog 工作树跨界拒收）；`dual_backend_core_refs_reflog_and_bridge_cas_equivalence`、`redb_multiprocess_cas_linearizability_and_mvcc_reads`（4 写 + 8 读共 12 进程零停顿活体并发线性化压测）、`sqlite_core_refs_reflog_smoke`、fmt、严格 clippy、`compat_version_surface_sync` 与 Codex R4 `VERDICT: PASS` 全绿 |
+| `RB-04b`..`RB-34c`（剩余 134 卡） | `pending` | — | — | 按实施顺序于 `main` 逐卡推进 |
 
 ## Codex review log
 

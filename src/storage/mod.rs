@@ -19,6 +19,7 @@ pub mod backend;
 pub mod codec;
 pub mod config_store;
 pub mod error;
+pub mod git_store;
 pub mod manifest;
 #[cfg(feature = "storage-redb")]
 pub mod meta;
@@ -58,6 +59,15 @@ pub use config_store::{
     expected_config_tombstone_mode,
 };
 pub use error::{StorageBackendError, StorageResult};
+#[cfg(feature = "storage-redb")]
+pub use git_store::RedbGitStore;
+#[cfg(feature = "storage-sqlite")]
+pub use git_store::SqliteGitStore;
+pub use git_store::{
+    BridgePublicationPhase, BridgePublicationRecord, GitStore, MAX_BRIDGE_OPERATION_ID_LEN,
+    REFLOG_HEAD_REF_NAME, RefCasOutcome, RefKey, RefRecord, RefTarget, ReflogEntry, ReflogWrite,
+    is_valid_bridge_operation_id,
+};
 pub use manifest::{
     INITIAL_STORAGE_GENERATION, LEGACY_SQLITE_DB_FILE, ManifestOrigin, PRIVATE_SUBDIR,
     Phase2DbState, Phase2Progress, REDB_SUBDIR, RedbGenerationPaths, ResolvedStorageLayout,
