@@ -465,7 +465,7 @@ PY
 
 ### Task LS-03: 支持 `log.excludeDecoration` 配置（#951；无值键诊断在 Libra 不适用）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `complete`（2026-11-21：`decorate_name_allowed` 接收 `log.excludeDecoration` 多值配置；显式 `--decorate-refs` 替换该配置过滤；空串值按 Git 空排除模式处理（隐藏全部引用但保留 `HEAD` 标记）；配置读取走 `get_var_all_case_insensitive("log.", "excludeDecoration")`。用例 `log_exclude_decoration_config` 覆盖 AC1–AC4；Libra 无「无值键」形态（`config_kv.value NOT NULL`），Git 的缺值诊断在 `COMPATIBILITY.md` 登记为有意差异。`log_test` **257/257**；文档 EN/zh-CN/开发版与 `COMPATIBILITY.md` 同步；版本面 0.30.280 → 0.30.281。按用户 2026-11-20 指令在 `main` 直接提交推送。）
 
 **Description:** 读取多值配置 `log.excludeDecoration` 作为配置级排除模式参与装饰过滤（存在时不再套用默认装饰命名空间过滤，命令行 `--decorate-refs` 可覆盖，语义对齐 Git `set_default_decoration_filter`）；空串值按 Git 语义作为空排除模式（匹配全部引用）。`#951` 所述 Git「无值键」（`[log] excludeDecoration` 不带 `=`，`t/t4202-log.sh:865-878` 期望 `error: missing value for 'log.excludeDecoration'`）在 Libra 无法表示：`config_kv.value` 为 `NOT NULL`，`libra config --add <key>` 不给值即以 `LBR-CLI-002` 拒绝；因此缺值诊断在 Libra 不适用，本卡在 `COMPATIBILITY.md` 的 `| log |` 行登记该有意差异并据此关闭 `#951` 的该部分。
 

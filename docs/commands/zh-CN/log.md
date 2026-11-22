@@ -311,6 +311,8 @@ libra log --decorate=full
 
 `log.decorate` 既接受 Git 的装饰样式（`no`、`short`、`full`、`auto`），也接受布尔值：真值（`true`/`yes`/`on`/`1`）等同 `short`，假值（`false`/`no`/`off`/`0`）关闭装饰，无法识别的取值同样关闭装饰且不报错（Git 将样式解析为 0）。命令行 `--pretty=raw` 或 `--format=raw` 会抑制配置装饰；显式 `--decorate=<样式>` 仍然优先，而 `format.pretty=raw` 默认值不会抑制。
 
+`log.excludeDecoration`（可重复）把匹配的引用排除在装饰之外；显式 `--decorate-refs` 会替换该配置过滤。空串值即 Git 的空排除模式：隐藏全部引用但保留 `HEAD` 标记。Libra 无法表示 Git 的无值键 `[log] excludeDecoration`（配置值为 `NOT NULL`），因此 Git 的「缺值」诊断在此无对应形态。
+
 ### `--no-decorate`
 
 不打印 ref 名称。覆盖 `--decorate`。

@@ -406,6 +406,12 @@ them without an error (Git parses the style to 0). A command-line `--pretty=raw`
 `--format=raw` suppresses the configured decoration; an explicit `--decorate=<style>`
 still wins, and a `format.pretty=raw` default does not suppress it.
 
+`log.excludeDecoration` (repeatable) excludes matching refs from the decorations; an
+explicit `--decorate-refs` replaces that configured filter. An empty value is Git's
+empty exclusion pattern: every ref is hidden but the `HEAD` marker remains. Libra
+cannot represent Git's valueless `[log] excludeDecoration` key (config values are
+`NOT NULL`), so Git's `missing value` diagnostic has no equivalent here.
+
 ### `--no-decorate`
 
 Do not print ref names. Overrides `--decorate`.

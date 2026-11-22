@@ -104,3 +104,5 @@ flowchart TD
 **`--separate-git-dir` 指针布局（2026-11-20，CL-23）：** `<worktree>/.libra` 为 `gitdir: <dir>` 指针文件时，`util::resolve_dot_libra_pointer` 解析真实元数据目录，仓库发现（`try_get_paths_full_with_storage_lookup`）、`info/*` 候选与 `alternates` 的 objects 解析都改读 `<dir>`。会写 ref 的子命令仍由 `CL-28` 默认拒绝。
 
 - 2026-11-21（LS-02 / #950）：`log.decorate` 现在接受 Git 布尔值（真值→`short`、假值→`no`）且非法值等同关闭但不报错；命令行 `--pretty=raw`/`--format=raw` 抑制配置装饰（显式 `--decorate` 优先，`format.pretty=raw` 不抑制）。回归：`command::log_test::test_log_decorate_config_boolean_and_raw_suppression`。
+
+- 2026-11-21（LS-03 / #951）：`log.excludeDecoration` 多值配置参与装饰过滤（显式 `--decorate-refs` 覆盖配置）；空串值按 Git 空排除模式处理，`HEAD` 标记保留；Libra 配置无「无值键」形态，缺值诊断登记为有意差异。回归：`command::log_test::log_exclude_decoration_config`。

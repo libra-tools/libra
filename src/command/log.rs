@@ -647,7 +647,7 @@ fn parse_trailer_filters(specs: &[String]) -> Result<Vec<TrailerFilter>, CliErro
 /// `--decorate-refs-exclude` filters: an implicit `refs/` prefix, wildcard or
 /// component-boundary prefix matching, and excludes win over includes.
 /// `HEAD` is filtered like any other decoration, by its own literal name.
-fn decorate_name_allowed(name: &str, args: &LogArgs) -> bool {
+fn decorate_name_allowed(name: &str, args: &LogArgs, config_excludes: &[String]) -> bool {
     if !args.decorate_refs.is_empty()
         && !args
             .decorate_refs
@@ -656,6 +656,14 @@ fn decorate_name_allowed(name: &str, args: &LogArgs) -> bool {
     {
         return false;
     }
+    let config_matches = |pattern: &str| {
+        if pattern.is_empty() {
+            // Git's empty exclusion pattern matches every ref; the `HEAD`
+            // decoration itself survives (probed against Git 2.54.0).
+            return name != "HEAD";
+        }
+        decorate_filter::ref_pattern_matches(pattern, name)
+    };
     if args
         .decorate_refs_exclude
         .iter()
@@ -663,13 +671,28 @@ fn decorate_name_allowed(name: &str, args: &LogArgs) -> bool {
     {
         return false;
     }
+    // `log.excludeDecoration` applies unless an explicit `--decorate-refs`
+    // overrides the whole filter (Git's `set_default_decoration_filter`).
+    if args.decorate_refs.is_empty() && config_excludes.iter().any(|p| config_matches(p)) {
+        return false;
+    }
     true
 }
 
-fn decorate_ref_allowed(reference: &Reference, args: &LogArgs) -> bool {
+/// Every `log.excludeDecoration` value, in configuration order.
+async fn resolve_exclude_decoration_config() -> Vec<String> {
+    ConfigKv::get_var_all_case_insensitive("log.", "excludeDecoration")
+        .await
+        .ok()
+        .map(|entries| entries.into_iter().map(|entry| entry.value).collect())
+        .unwrap_or_default()
+}
+
+fn decorate_ref_allowed(reference: &Reference, args: &LogArgs, config_excludes: &[String]) -> bool {
     decorate_name_allowed(
         &format!("{}{}", reference_namespace(&reference.kind), reference.name),
         args,
+        config_excludes,
     )
 }
 
@@ -2484,6 +2507,7 @@ async fn execute_safe_with_diff_formats(
         std::collections::HashMap::new()
     };
 
+    let config_excludes = resolve_exclude_decoration_config().await;
     let mut first_commit = true;
     for selected in selected_commits {
         let SelectedLogCommit {
@@ -2496,10 +2520,10 @@ async fn execute_safe_with_diff_formats(
             // `HEAD` marks the commit HEAD points to, not the first rendered
             // one, and it passes the same filters as any other decoration.
             // The arrow needs both `HEAD` and the branch it points to.
-            let head_allowed = decorate_name_allowed("HEAD", &args);
-            let branch_allowed = branch_name
-                .as_ref()
-                .is_some_and(|name| decorate_name_allowed(&format!("refs/heads/{name}"), &args));
+            let head_allowed = decorate_name_allowed("HEAD", &args, &config_excludes);
+            let branch_allowed = branch_name.as_ref().is_some_and(|name| {
+                decorate_name_allowed(&format!("refs/heads/{name}"), &args, &config_excludes)
+            });
             let head_arrow = head_allowed && branch_allowed;
             if commit.id == current_head_commit && head_allowed {
                 ref_msgs.push(match (&branch_name, head_arrow) {
@@ -2525,7 +2549,7 @@ async fn execute_safe_with_diff_formats(
                 &mut refs
                     .iter()
                     .filter_map(|r| {
-                        if !decorate_ref_allowed(r, &args) {
+                        if !decorate_ref_allowed(r, &args, &config_excludes) {
                             return None;
                         }
                         // The branch is represented by the `HEAD -> branch`

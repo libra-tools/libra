@@ -7049,3 +7049,91 @@ fn first_subject(line: &str) -> String {
         .trim()
         .to_string()
 }
+
+#[test]
+fn log_exclude_decoration_config() {
+    use super::{assert_cli_success, create_committed_repo_via_cli, run_libra_command};
+
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["tag", "-m", "v", "v1"], p),
+        "annotated v1",
+    );
+    let set = |key: &str, value: &str| {
+        assert_cli_success(
+            &run_libra_command(&["config", "set", key, value], p),
+            "config set",
+        );
+    };
+    let decoration = |args: &[&str]| {
+        let out = run_libra_command(args, p);
+        assert_cli_success(&out, "log runs");
+        let line = String::from_utf8_lossy(&out.stdout).to_string();
+        let line = line.lines().next().unwrap_or_default().to_string();
+        // Return just the decoration, without the subject.
+        match (line.find('('), line.rfind(')')) {
+            (Some(start), Some(end)) if end > start => line[start..=end].to_string(),
+            _ => String::new(),
+        }
+    };
+
+    // AC1: exclude tags → only the HEAD arrow remains.
+    set("log.excludeDecoration", "refs/tags/*");
+    assert_eq!(
+        decoration(&["log", "-1", "--oneline", "--decorate=short"]),
+        "(HEAD -> main)",
+        "AC1"
+    );
+
+    // AC2: a second exclude value also applies.
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "config",
+                "set",
+                "--add",
+                "log.excludeDecoration",
+                "refs/heads/*",
+            ],
+            p,
+        ),
+        "second exclude value",
+    );
+    assert_eq!(
+        decoration(&["log", "-1", "--oneline", "--decorate=short"]),
+        "(HEAD)",
+        "AC2"
+    );
+
+    // AC3: an explicit `--decorate-refs` overrides the configured excludes.
+    assert_eq!(
+        decoration(&[
+            "log",
+            "-1",
+            "--oneline",
+            "--decorate=short",
+            "--decorate-refs=refs/tags/v1",
+        ]),
+        "(tag: v1)",
+        "AC3"
+    );
+
+    // AC4: an empty value is Git's empty exclusion pattern (HEAD survives).
+    let empty = create_committed_repo_via_cli();
+    assert_cli_success(
+        &run_libra_command(
+            &["config", "set", "log.excludeDecoration", ""],
+            empty.path(),
+        ),
+        "empty exclude value",
+    );
+    let out = run_libra_command(
+        &["log", "-1", "--oneline", "--decorate=short"],
+        empty.path(),
+    );
+    assert_cli_success(&out, "AC4: log runs");
+    let line = String::from_utf8_lossy(&out.stdout).to_string();
+    let first = line.lines().next().unwrap_or_default();
+    assert!(first.contains("(HEAD)"), "AC4: {}", first);
+}
