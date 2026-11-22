@@ -896,7 +896,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `remote-pending`（2026-11-22 07:17:48 UTC，版本 `0.30.286`，于 `main` 直接提交推送；Stage 1 精确 2 文件写集、AC1–AC4、三组特性 `nextest list`/`run` 含子进程实测公开 `resolve()` 与非法值占位脱敏、fmt、严格 clippy 与 Codex R2 `01a2021d-77b7-7c90-9146-40618689ff47` `VERDICT: PASS` 全绿）
 
 **Description:** 100% 在独占目录 `src/storage/` 内交付 `src/storage/backend.rs`：实现 `StorageBackendKind` 特性编译门控（单后端拒绝未编译覆盖）与编译期常量 `pub const REDB_RUNTIME_UNLOCKED: bool = false;` 不可旁路预集成门控（忽略 `LIBRA_TEST`）。
 
@@ -911,17 +911,17 @@
 | `ADR-RB-01` #3 要求单后端不兼容 env 覆盖 fail-closed 报 `LBR-CLI-003`，且 `REDB_RUNTIME_UNLOCKED = false` 期间不可通过环境变量旁路 | `ADR-RB-01` |
 
 **Acceptance criteria:**
-- [ ] 纯 `storage-sqlite` 构建收到 `LIBRA_STORAGE_BACKEND=redb` 覆盖时返回 fail-closed 错误 `LBR-CLI-003`。
-- [ ] 纯 `storage-redb` 构建收到 `LIBRA_STORAGE_BACKEND=sqlite` 覆盖时返回 fail-closed 错误 `LBR-CLI-003`。
-- [ ] 编译期常量 `REDB_RUNTIME_UNLOCKED = false` 下，`StorageBackendKind::resolve` 对选用 `Redb` 的请求（忽略 `LIBRA_TEST`）返回 `LBR-CLI-003`。
-- [ ] 编译期常量 `REDB_RUNTIME_UNLOCKED = false` 下，`assert_redb_runtime_unlocked()` 返回 `LBR-CLI-003`（生产 `libra-migrate` 接入在 `RB-11c` 实测、生产 `libra` CLI 接入在 `RB-16` 实测）。
+- [x] 纯 `storage-sqlite` 构建收到 `LIBRA_STORAGE_BACKEND=redb` 覆盖时返回 fail-closed 错误 `LBR-CLI-003`。
+- [x] 纯 `storage-redb` 构建收到 `LIBRA_STORAGE_BACKEND=sqlite` 覆盖时返回 fail-closed 错误 `LBR-CLI-003`。
+- [x] 编译期常量 `REDB_RUNTIME_UNLOCKED = false` 下，`StorageBackendKind::resolve` 对选用 `Redb` 的请求（忽略 `LIBRA_TEST`）返回 `LBR-CLI-003`。
+- [x] 编译期常量 `REDB_RUNTIME_UNLOCKED = false` 下，`assert_redb_runtime_unlocked()` 返回 `LBR-CLI-003`（生产 `libra-migrate` 接入在 `RB-11c` 实测、生产 `libra` CLI 接入在 `RB-16` 实测）。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::tests::sqlite_only_rejects_redb_override) | test(=storage::tests::redb_only_rejects_sqlite_override) | test(=storage::backend::tests::dual_feature_resolution_and_pre_release_cli_gate)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-sqlite --lib -E 'test(=storage::tests::sqlite_only_rejects_redb_override)'`（new，覆盖 AC1）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=storage::tests::redb_only_rejects_sqlite_override)'`（new，覆盖 AC2）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::backend::tests::dual_feature_resolution_and_pre_release_cli_gate)'`（new，覆盖 AC3、AC4）
-- [ ] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 2 文件实现白名单（`src/storage/mod.rs`、`src/storage/backend.rs`）。
+- [x] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::tests::sqlite_only_rejects_redb_override) | test(=storage::tests::redb_only_rejects_sqlite_override) | test(=storage::backend::tests::dual_feature_resolution_and_pre_release_cli_gate)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-sqlite --lib -E 'test(=storage::tests::sqlite_only_rejects_redb_override)'`（new，覆盖 AC1）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=storage::tests::redb_only_rejects_sqlite_override)'`（new，覆盖 AC2）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::backend::tests::dual_feature_resolution_and_pre_release_cli_gate)'`（new，覆盖 AC3、AC4）
+- [x] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 2 文件实现白名单（`src/storage/mod.rs`、`src/storage/backend.rs`）。
 
 **Full-suite trigger:** `none`
 
@@ -10014,8 +10014,9 @@
 |---|---|---|---|---|
 | `RB-01` | `done` / `remote-pending` | `57fed0f`（`main`） | `0.30.278` | 2026-11-22 03:39:49 UTC：AC1–AC8（未暂存+已暂存双态）、4 特性编译矩阵（`redb 5.0.0`/`postcard 1.2.0`/`crc32c 0.6.9`）、`cargo +nightly fmt --all --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo doc --no-deps --all-features`、`compat_version_surface_sync`、`compat_matrix_alignment`、`compat_serial_registry` 全绿；Codex 只读审查 `01a20155-954e-7f10-a16a-d2edb84b0569` `VERDICT: PASS`（P0/P1/P2=0） |
 | `RB-01d` | `done` / `remote-pending` | `5f74eba`（`main`） | `0.30.279` | 2026-11-22 03:46:22 UTC：Stage 1 精确 1 文件写集、AC1–AC6（双关 `compile_error!` + 4 特性编译矩阵 + `storage-redb` 隐式 `storage-queue` 断言）、fmt、严格 clippy、rustdoc、`compat_version_surface_sync` 全绿；Codex `01a2015b-e3a7-75f0-8d1a-27bd39e38f6d` `VERDICT: PASS`（P0/P1/P2=0） |
-| `RB-01b` | `done` / `remote-pending` | 本提交（`main`） | `0.30.285` | 2026-11-22 06:45:49 UTC：Stage 1 精确 3 文件写集、`versioned_postcard_roundtrip_and_corrupt_reject` 与 `io_error_display_and_cli_error_do_not_leak_sensitive_source_text`（含跨版本显式分发与 `anyhow` `{error:#}` 链路脱敏）全绿、4 特性矩阵、fmt、严格 clippy、rustdoc、`compat_version_surface_sync` 全绿；Codex R3 `01a20200-379a-7b71-aaab-73ab6e680f74` `VERDICT: PASS` |
-| `RB-01c`..`RB-34c`（剩余 151 卡） | `pending` | — | — | 按实施顺序于 `main` 逐卡推进 |
+| `RB-01b` | `done` / `remote-pending` | `63088e8`（`main`） | `0.30.285` | 2026-11-22 06:45:49 UTC：Stage 1 精确 3 文件写集、`versioned_postcard_roundtrip_and_corrupt_reject` 与 `io_error_display_and_cli_error_do_not_leak_sensitive_source_text`（含跨版本显式分发与 `anyhow` `{error:#}` 链路脱敏）全绿、4 特性矩阵、fmt、严格 clippy、rustdoc、`compat_version_surface_sync` 全绿；Codex R3 `01a20200-379a-7b71-aaab-73ab6e680f74` `VERDICT: PASS` |
+| `RB-01c` | `done` / `remote-pending` | 本提交（`main`） | `0.30.286` | 2026-11-22 07:17:48 UTC：Stage 1 精确 2 文件写集、`sqlite_only_rejects_redb_override`/`redb_only_rejects_sqlite_override`/`dual_feature_resolution_and_pre_release_cli_gate`（含独立子进程实测 `resolve()` 与非法值占位脱敏）全绿、fmt、严格 clippy、`compat_version_surface_sync` 全绿；Codex R2 `01a2021d-77b7-7c90-9146-40618689ff47` `VERDICT: PASS` |
+| `RB-02`..`RB-34c`（剩余 150 卡） | `pending` | — | — | 按实施顺序于 `main` 逐卡推进 |
 
 ## Codex review log
 
