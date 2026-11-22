@@ -18,6 +18,7 @@ pub mod backend;
 #[cfg(any(feature = "storage-redb", feature = "storage-queue"))]
 pub mod codec;
 pub mod error;
+pub mod manifest;
 #[cfg(feature = "storage-redb")]
 pub mod meta;
 #[cfg(feature = "storage-redb")]
@@ -28,6 +29,14 @@ pub use backend::{
     assert_redb_runtime_unlocked,
 };
 pub use error::{StorageBackendError, StorageResult};
+pub use manifest::{
+    INITIAL_STORAGE_GENERATION, ManifestOrigin, PRIVATE_SUBDIR, Phase2DbState, Phase2Progress,
+    REDB_SUBDIR, RedbGenerationPaths, ResolvedStorageLayout, STORAGE_FORMAT_MANIFEST_FILE,
+    STORAGE_FORMAT_MANIFEST_VERSION, SourceDigests, StorageFormatManifest,
+    canonical_capture_redb_rel_path, canonical_git_redb_rel_path, format_generation_id,
+    publish_storage_manifest, read_storage_manifest, resolve_redb_generation_paths,
+    resolve_storage_layout, storage_manifest_path,
+};
 #[cfg(feature = "storage-redb")]
 pub use meta::{
     CURRENT_REDB_FORMAT_VERSION, MAX_SUPPORTED_READER_VERSION, META_SCHEMA_CODEC_VERSION,
