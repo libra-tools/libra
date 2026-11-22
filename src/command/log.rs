@@ -2273,49 +2273,116 @@ fn parse_line_range(spec: &str) -> CliResult<LineRange> {
     Ok(LineRange { start, end, file })
 }
 
-/// Keep only the hunks of `patch` whose new-side range intersects `ranges`.
+/// Keep only the hunks of `patch` whose new-side range intersects `ranges`,
+/// trimming context and change lines outside the tracked range so the printed
+/// hunk covers the requested lines (Git's `-L` narrows the diff to the range).
 fn filter_patch_to_ranges(patch: &str, ranges: &[LineRange]) -> String {
     let mut out = String::with_capacity(patch.len());
-    let mut keep_hunk = true;
-    for line in patch.split_inclusive('\n') {
-        if let Some(rest) = line.strip_prefix("@@ -") {
-            keep_hunk = false;
-            if let Some((_old, new)) = rest.split_once(" +") {
-                let new = new.split(" @@").next().unwrap_or(new);
-                let (start, len) = match new.split_once(',') {
-                    Some((start, len)) => (start, len),
-                    None => (new, "1"),
-                };
-                if let (Ok(start), Ok(len)) = (start.parse::<usize>(), len.parse::<usize>()) {
-                    let hunk_end = if len == 0 { start } else { start + len - 1 };
-                    keep_hunk = ranges.iter().any(|range| {
-                        range.start <= hunk_end && start <= range.end.saturating_add(1)
-                    });
+    let mut header_lines: Vec<String> = Vec::new();
+    let mut kept_hunks: Vec<String> = Vec::new();
+    let mut hunk: Option<(usize, usize, Vec<String>)> = None;
+
+    let bounded = |line: usize| -> bool {
+        ranges
+            .iter()
+            .any(|range| range.start <= line && line <= range.end)
+    };
+
+    let flush = |hunk: &mut Option<(usize, usize, Vec<String>)>, kept: &mut Vec<String>| {
+        if let Some((start, end, lines)) = hunk.take() {
+            // Trim context that falls outside the tracked range on both ends.
+            let mut begin = 0;
+            let mut finish = lines.len();
+            while begin < finish {
+                let candidate = start + begin;
+                if bounded(candidate)
+                    || lines[begin].starts_with('+')
+                    || lines[begin].starts_with('-')
+                {
+                    break;
                 }
+                begin += 1;
             }
-            if keep_hunk {
-                out.push_str(line);
+            while finish > begin {
+                let candidate = start + finish - 1;
+                if bounded(candidate)
+                    || lines[finish - 1].starts_with('+')
+                    || lines[finish - 1].starts_with('-')
+                {
+                    break;
+                }
+                finish -= 1;
             }
+            if begin < finish {
+                let old_len = lines[begin..finish]
+                    .iter()
+                    .filter(|line| !line.starts_with('+'))
+                    .count();
+                let new_len = lines[begin..finish]
+                    .iter()
+                    .filter(|line| !line.starts_with('-'))
+                    .count();
+                // Hunk headers count only the lines each side actually has:
+                // `+` lines advance the new numbering, `-` lines the old one.
+                let old_skipped = lines[..begin]
+                    .iter()
+                    .filter(|line| !line.starts_with('+'))
+                    .count();
+                let new_skipped = lines[..begin]
+                    .iter()
+                    .filter(|line| !line.starts_with('-'))
+                    .count();
+                let _ = end;
+                kept.push(format!(
+                    "@@ -{},{} +{},{} @@\n",
+                    start + old_skipped,
+                    old_len,
+                    start + new_skipped,
+                    new_len
+                ));
+                kept.extend(lines[begin..finish].iter().cloned());
+            }
+        }
+    };
+
+    for line in patch.split_inclusive('\n') {
+        let owned = line.to_string();
+        if let Some(rest) = line.strip_prefix("@@ -") {
+            flush(&mut hunk, &mut kept_hunks);
+            let start = rest
+                .split(',')
+                .next()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(1);
+            hunk = Some((start, start, Vec::new()));
             continue;
         }
-        if line.starts_with("diff --git ")
-            || line.starts_with("index ")
-            || line.starts_with("--- ")
-            || line.starts_with("+++ ")
+        if owned.starts_with("diff --git ")
+            || owned.starts_with("index ")
+            || owned.starts_with("--- ")
+            || owned.starts_with("+++ ")
+            || owned.starts_with("new file mode ")
+            || owned.starts_with("deleted file mode ")
         {
-            keep_hunk = true;
-            out.push_str(line);
+            flush(&mut hunk, &mut kept_hunks);
+            header_lines.push(owned.clone());
             continue;
         }
-        if keep_hunk {
-            out.push_str(line);
+        if let Some((_, _, lines)) = hunk.as_mut() {
+            lines.push(owned.clone());
         }
     }
-    if out.contains("@@ -") {
-        out
-    } else {
-        String::new()
+    flush(&mut hunk, &mut kept_hunks);
+    if kept_hunks.is_empty() {
+        return String::new();
     }
+    for line in header_lines {
+        out.push_str(&line);
+    }
+    for line in kept_hunks {
+        out.push_str(&line);
+    }
+    out
 }
 
 /// Detect whether a commit changed the given file path, following renames.

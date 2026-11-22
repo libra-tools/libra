@@ -1307,58 +1307,7 @@ PY
 
 ### Task LS-17: 实现 `log -L` 行级历史输出（#961；拆出 LS-32）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `in-progress` / `partially-accepted`（2026-11-21 第一段：修复 `-L` **无任何输出**的根因——`apply_follow_and_line_filters` 在未带 `--follow` 时 `path_to_check` 恒为 `None`，`-L` 提交全被丢弃；改为回退到 `ranges[0].file`。`commit_affects_line_range` 由「内容有变即纳入」改为**按 hunk 新侧范围与请求范围求交**（`patch_hunk_ranges`）；`-L` 隐含 `-p`（`resolved_diff_formats` 中强制 `patch=true`）；新增 `filter_patch_to_ranges` 只保留涉及请求范围的 hunk。实测：`-L 1,5:f.txt` 只选创建提交、`-L 18,22:f.txt` 选出改动提交+创建提交并打印 hunk（`-20`/`+twenty`）。回归：`command::log_test::line_history_emits_range_hunks`。**剩余（未验收 AC）**：① hunk 尚未按范围**收窄**（创建提交的 hunk 仍打印整文件 1–30 行，Git 只打印范围内的行）；② `:<funcname>:<file>` 语法仍退化为整文件（`parse_line_range`）；③ 行号范围尚未随历史映射到父提交；④ 与 Git 的 hunk 头部（`@@ -18,5 +18,5 @@`）逐字一致。本卡保持 `in-progress`，上述四项需在后续窗口完成后再按 AC 验收。`log_test` 全绿；严格 Clippy exit 0。）
-
-**Description:** 修复 `log -L <start>,<end>:<file>` / `-L :<funcname>:<file>` 仅过滤提交却不输出行级 diff hunk 的缺陷：输出演进提交与被追踪范围的 hunk，函数名语法识别函数边界（移除 `src/command/log.rs:1907` 退化为整文件的实现），并随历史把行号范围映射到父提交。拆出 `LS-32`（`-L` 参数校验）。
-
-**Out of scope:** `-L` 与位置 pathspec / `--follow` 的互斥及非法语法、文件不存在诊断（由 `LS-32` 处理）；复杂跨文件函数重命名追踪（尚未排期）。
-
-**Current evidence:**
-
-| 事实 | 证据 |
-|---|---|
-| `log.rs` 已解析 `line_range` 并调 `commit_affects_line_range`，但未渲染对应行范围 diff；函数名语法在 `1907` 退化为整文件 | `src/command/log.rs:479-480,1894-1910,1981-2030` |
-
-**Acceptance criteria:**
-
-- [ ] **AC1** `libra log -L 1,5:file.txt --format=%H` 的结果提交序列等于 Git 同夹具期望。
-- [ ] **AC2** `libra log -L 1,5:file.txt` 的完整输出逐字等于 Git 同夹具期望（每个结果提交只输出与被追踪范围相交的 hunk）。
-- [ ] **AC3** `libra log -L :fn_name:file.txt` 的结果提交序列等于 Git 同夹具期望（只修改函数体外行的提交不出现）。
-- [ ] **AC4** `libra log -L :fn_name:file.txt` 的完整输出（含各 hunk）逐字等于 Git 同夹具期望（hunk 只覆盖函数体，不退化为整文件）。
-- [ ] **AC5** `libra log -L <s>,<e>:file.txt`（`<s>,<e>` 为 HEAD 中函数体所在行号，位于第 4 个提交插入的 2 行之后）的完整输出逐字等于 Git 同夹具期望（更早提交中的同一范围按插入偏移正确映射；与 AC4 为不同调用）。
-- [ ] **AC6** `libra log -L :nofn:file.txt`（函数名未匹配）以 `LBR-CLI-003` 失败。
-- [ ] ER-06/ER-06a 同卡强制门：`Docs and compatibility impact` 所列每个文件按「文档与网站验收命令」第 1–7 步逐文件交付并验收（不计入卡特有 AC 分子）。
-
-**AC → 断言映射:**（夹具 F17：`file.txt` 含函数 `fn_name` 与函数外行；提交依次为：新增文件、修改函数体、只修改函数体外行、在函数上方插入 2 行、再修改函数体；每次调用另按「验证执行协议」第 4 项断言只读不变量；标注「Git 2.54.0 预探」或「Git 同夹具期望」的值按该项以 `git@6de20f6092` 取得并硬编码）
-
-- AC1 → `command::log_test::line_range_history_output`：期望 exit 0；stdout 中提交 OID 序列逐字等于 Git 同夹具期望。
-- AC2 → `command::log_test::line_range_history_output`：期望 exit 0；stdout 逐字等于 Git 同夹具期望。
-- AC3 → `command::log_test::line_range_history_output`：期望 exit 0；stdout 提交序列逐字等于 Git 同夹具期望。
-- AC4 → `command::log_test::line_range_history_output`：期望 exit 0；stdout 逐字等于 Git 同夹具期望。
-- AC5 → `command::log_test::line_range_history_output`：期望 exit 0；stdout 逐字等于 Git 同夹具期望。
-- AC6 → `command::log_test::line_range_history_output`：期望 stderr 含 `LBR-CLI-003`（Git：`-L parameter 'nofn' starting at line 1: no match`）。
-- 文档 AC → 「文档与网站验收命令」第 1–7 步（逐文件 SHA-256、关键字命中、网站同步与漂移检查、typecheck/build、Claude Code PASS、精确提交推送、部署核验）。
-
-**Verification:**
-
-- [ ] `source .env.test && cargo nextest run --test command_test -E 'test(=command::log_test::line_range_history_output)'`（卡特有 `(new)`，`tests/command/log_test.rs` 内新增；覆盖 AC1–AC6；按「验证执行协议」第 1–4 项执行）
-- [ ] `source .env.test && cargo nextest run --test command_test -E 'test(=command::log_test::test_log_line_range_flag_accepted) | test(=command::log_test::log_ineligible_follow_line_range_pathspec_walk_full_history)'`（共享回归组：既有 `-L` 接受与 follow/-L/pathspec 遍历用例；预期 N = 2；按「验证执行协议」第 5 项先以同一过滤 `cargo nextest list` 核对，要求 exit 0、通过 = N、失败 = 0、跳过 = 0；不计为卡特有 AC 证据）
-
-**Full-suite trigger:** `T-1: 版本面集合同步修改 install.sh / install.ps1（ER-08 / ER-13 T-1）` | **Dependencies:** `LS-16`, `DEP-LS-01`, `DEP-LS-03`
-
-**Implementation write set:** `src/command/log.rs`, `tests/command/log_test.rs`, `docs/commands/log.md`, `docs/commands/zh-CN/log.md`, `docs/development/commands/log.md`, `COMPATIBILITY.md`, `/Volumes/Data/gitmono/libra-backend/apps/tanstack-app/content/docs/commands/log.en.md`
-
-**Release write set:** `Inherited` | **Files likely touched:** `src/command/log.rs`, `tests/command/log_test.rs`, `COMPATIBILITY.md`
-
-**Docs and compatibility impact:** 必须同卡更新：`docs/commands/log.md`、`docs/commands/zh-CN/log.md` 与网站页 `/Volumes/Data/gitmono/libra-backend/apps/tanstack-app/content/docs/commands/log.en.md`（由 `--only log` 同步生成；网站 zh-CN 在渲染时镜像 EN，无独立文件）；文档关键字（用于 EN/zh 命令页）：`-L`。逐文件语义核对：`docs/development/commands/log.md` 与 `COMPATIBILITY.md` 的 `| log |` 行（基线第 196 行）——受本卡行为影响即同卡更新（兼容矩阵原地修改，不增删行），否则按第 1 步记录理由与未变 SHA-256。按「文档与网站验收命令」第 1–7 步逐文件交付并验收。`docs/error-codes.md`：N/A（复用既有稳定码）。
-
-**Rollback mode:** `immutable-release` | **Estimated scope:** `M` | **Version increment:** `patch` | **Release boundary:** `independent` | **C/D coverage from:** `self`
-
-**Granularity:** `type=implementation; axis=log_-L行级历史输出; recovery=immutable-release; complete=yes; self-contained=yes; AC=6/8; VER=4/8; landing=1; prod-files=1; scope=M; deps=LS-16,DEP-LS-01,DEP-LS-03; writeset=序列化于LS-16; release=independent; split-from=N/A; exception=N/A`
-
----
-
-### Task LS-32: `log -L` 与 pathspec/`--follow` 互斥及参数诊断（#961；自 LS-17 拆出）
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `in-progress` / `partially-accepted`（2026-11-21 第一段：修复 `-L` **无任何输出**的根因——`apply_follow_and_line_filters` 在未带 `--follow` 时 `path_to_check` 恒为 `None`，`-L` 提交全被丢弃；改为回退到 `ranges[0].file`。`commit_affects_line_range` 由「内容有变即纳入」改为**按 hunk 新侧范围与请求范围求交**（`patch_hunk_ranges`）；`-L` 隐含 `-p`（`resolved_diff_formats` 中强制 `patch=true`）；新增 `filter_patch_to_ranges` 只保留涉及请求范围的 hunk。实测：`-L 1,5:f.txt` 只选创建提交、`-L 18,22:f.txt` 选出改动提交+创建提交并打印 hunk（`-20`/`+twenty`）。回归：`command::log_test::line_history_emits_range_hunks`。**剩余（未验收 AC）**：① hunk 已按范围收窄上下文（`filter_patch_to_ranges` 修剪范围外的上下文并重算头部，实测得到 `@@ -18,4 +18,4 @@` + 范围内 18/19/-20/+twenty/21/22），但与 Git 的 `@@ -18,5 +18,5 @@` 在**计数**上仍差 1（旧侧/新侧计数受 `+`/`-` 行导致的编号偏移影响），尚未逐字一致；② `:<funcname>:<file>` 语法仍退化为整文件（`parse_line_range`）；③ 行号范围尚未随历史映射到父提交。本卡保持 `in-progress`，上述三项需在后续窗口完成后按 AC 验收。`log_test` 271/271；严格 Clippy exit 0。）### Task LS-32: `log -L` 与 pathspec/`--follow` 互斥及参数诊断（#961；自 LS-17 拆出）
 
 **Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
 
