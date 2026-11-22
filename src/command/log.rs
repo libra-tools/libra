@@ -2235,6 +2235,8 @@ struct LineRange {
     start: usize,
     end: usize,
     file: PathBuf,
+    /// `:<funcname>:` form: resolved from the file's definitions.
+    func: Option<String>,
 }
 
 fn parse_line_range(spec: &str) -> CliResult<LineRange> {
@@ -2249,8 +2251,9 @@ fn parse_line_range(spec: &str) -> CliResult<LineRange> {
     let file = PathBuf::from(parts[0]);
     let range_spec = parts[1];
 
-    let (start, end) = if range_spec.starts_with(':') {
-        // function-name syntax not supported yet; fall back to whole file
+    let mut func = None;
+    let (start, end) = if let Some(name) = range_spec.strip_prefix(':') {
+        func = Some(name.to_string());
         (1, usize::MAX)
     } else if let Some((s, e)) = range_spec.split_once(',') {
         let start = s.parse::<usize>().map_err(|_| {
@@ -2270,7 +2273,12 @@ fn parse_line_range(spec: &str) -> CliResult<LineRange> {
         (line, line)
     };
 
-    Ok(LineRange { start, end, file })
+    Ok(LineRange {
+        start,
+        end,
+        file,
+        func,
+    })
 }
 
 /// Keep only the hunks of `patch` whose new-side range intersects `ranges`,
@@ -2311,12 +2319,7 @@ fn filter_patch_to_ranges(patch: &str, ranges: &[LineRange]) -> String {
     let flush = |hunk: &mut Option<(usize, usize, Vec<String>)>, kept: &mut Vec<String>| {
         if let Some((start, _end, lines)) = hunk.take() {
             let numbers = numbered(start, &lines);
-            let relevant = |index: usize| -> bool {
-                let (old_no, new_no) = numbers[index];
-                lines[index].starts_with('+')
-                    || lines[index].starts_with('-')
-                    || in_range(old_no, new_no)
-            };
+            let relevant = |index: usize| -> bool { in_range(numbers[index].0, numbers[index].1) };
             let mut begin = 0;
             while begin < lines.len() && !relevant(begin) {
                 begin += 1;
@@ -2447,10 +2450,7 @@ async fn apply_follow_and_line_filters(
 ) -> Result<Vec<TraversedLogCommit>, CliError> {
     let mut result = Vec::new();
     let mut current_path = follow.clone();
-    let ranges: Vec<LineRange> = line_ranges
-        .iter()
-        .map(|s| parse_line_range(s))
-        .collect::<Result<Vec<_>, _>>()?;
+    let ranges: Vec<LineRange> = resolve_line_ranges(line_ranges)?;
 
     for commit in commits {
         let (path_to_check, follow_paths) = if let Some(path) = &current_path {
@@ -2491,6 +2491,124 @@ async fn apply_follow_and_line_filters(
 }
 
 /// Best-effort check whether a commit affected any of the requested line ranges.
+/// Resolve `:<funcname>:` specs against the working-tree file: the range runs
+/// from the definition line to the line before the next definition.
+fn resolve_line_ranges(specs: &[String]) -> CliResult<Vec<LineRange>> {
+    let mut ranges = Vec::new();
+    for spec in specs {
+        let mut range = parse_line_range(spec)?;
+        if let Some(func) = range.func.clone() {
+            let content = std::fs::read_to_string(&range.file).map_err(|error| {
+                CliError::command_usage(format!(
+                    "cannot read '{}' for -L :{func}: {error}",
+                    range.file.display()
+                ))
+                .with_stable_code(StableErrorCode::CliInvalidArguments)
+            })?;
+            let lines: Vec<&str> = content.lines().collect();
+            let Some(start_index) = lines
+                .iter()
+                .position(|line| line_names_function(line, &func))
+            else {
+                return Err(CliError::command_usage(format!(
+                    "cannot find function '{func}' in '{}'",
+                    range.file.display()
+                ))
+                .with_stable_code(StableErrorCode::CliInvalidArguments));
+            };
+            let next = lines
+                .iter()
+                .enumerate()
+                .skip(start_index + 1)
+                .find(|(_, line)| is_function_definition(line))
+                .map(|(index, _)| index)
+                .unwrap_or(lines.len());
+            range.start = start_index + 1;
+            range.end = next;
+        }
+        ranges.push(range);
+    }
+    Ok(ranges)
+}
+
+/// Heuristic definition line (Rust `fn`, shell/Python/JS `def`/`function`, or a
+/// column-0 C-like `name(...)`).
+fn is_function_definition(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    let keyword = trimmed.starts_with("fn ")
+        || trimmed.starts_with("pub fn ")
+        || trimmed.starts_with("pub async fn ")
+        || trimmed.starts_with("pub(crate) fn ")
+        || trimmed.starts_with("async fn ")
+        || trimmed.starts_with("def ")
+        || trimmed.starts_with("function ");
+    if keyword {
+        return true;
+    }
+    !line.starts_with(char::is_whitespace)
+        && line.contains('(')
+        && !trimmed.starts_with("//")
+        && !trimmed.starts_with('#')
+}
+
+/// Whether `line` defines the requested function name.
+fn line_names_function(line: &str, name: &str) -> bool {
+    if !is_function_definition(line) {
+        return false;
+    }
+    let Some(position) = line.find(name) else {
+        return false;
+    };
+    let boundary_before = line[..position]
+        .chars()
+        .next_back()
+        .is_none_or(|ch| !ch.is_alphanumeric() && ch != '_');
+    let boundary_after = line[position + name.len()..]
+        .chars()
+        .next()
+        .is_none_or(|ch| !ch.is_alphanumeric() && ch != '_');
+    boundary_before && boundary_after
+}
+
+/// New-side numbers of added lines and old-side numbers of removed lines: only
+/// changed lines decide whether a commit touches a range, not its context.
+fn patch_changed_lines(patch: &str) -> Vec<usize> {
+    let mut changed = Vec::new();
+    let mut old_no = 0usize;
+    let mut new_no = 0usize;
+    for line in patch.lines() {
+        if let Some(rest) = line.strip_prefix("@@ -") {
+            if let Some((old, new)) = rest.split_once(" +") {
+                old_no = old
+                    .split(',')
+                    .next()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(1);
+                new_no = new
+                    .split(" @@")
+                    .next()
+                    .unwrap_or(new)
+                    .split(',')
+                    .next()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(1);
+            }
+            continue;
+        }
+        if line.starts_with('+') && !line.starts_with("+++") {
+            changed.push(new_no);
+            new_no += 1;
+        } else if line.starts_with('-') && !line.starts_with("---") {
+            changed.push(old_no);
+            old_no += 1;
+        } else if !line.starts_with('\\') {
+            old_no += 1;
+            new_no += 1;
+        }
+    }
+    changed
+}
+
 /// Whether `commit` changes any tracked line of `path` (`-L start,end:file`).
 ///
 /// Git tracks the range through the history; this implementation keeps the
@@ -2510,48 +2628,14 @@ async fn commit_affects_line_range(
     if patch.trim().is_empty() {
         return Ok(false);
     }
-    for (start, len) in patch_hunk_ranges(&patch) {
-        if len == 0 {
-            // A pure insertion between lines: treat it as covering the line it
-            // is inserted after.
-            if tracked
-                .iter()
-                .any(|range| range.start <= start && start <= range.end + 1)
-            {
-                return Ok(true);
-            }
-            continue;
-        }
-        let hunk_end = start + len - 1;
-        for range in &tracked {
-            if range.start <= hunk_end && start <= range.end {
-                return Ok(true);
-            }
-        }
+    if patch_changed_lines(&patch).iter().any(|line| {
+        tracked
+            .iter()
+            .any(|range| range.start <= *line && *line <= range.end.saturating_add(1))
+    }) {
+        return Ok(true);
     }
     Ok(false)
-}
-
-/// `(start, length)` of the new side of every `@@ -a,b +start,length @@` hunk.
-fn patch_hunk_ranges(patch: &str) -> Vec<(usize, usize)> {
-    let mut ranges = Vec::new();
-    for line in patch.lines() {
-        let Some(rest) = line.strip_prefix("@@ -") else {
-            continue;
-        };
-        let Some((_old, new)) = rest.split_once(" +") else {
-            continue;
-        };
-        let new = new.split(" @@").next().unwrap_or(new);
-        let (start, len) = match new.split_once(',') {
-            Some((start, len)) => (start, len),
-            None => (new, "1"),
-        };
-        if let (Ok(start), Ok(len)) = (start.parse::<usize>(), len.parse::<usize>()) {
-            ranges.push((start, len));
-        }
-    }
-    ranges
 }
 
 fn last_command_line_position(matches: &ArgMatches, id: &str) -> Option<usize> {
@@ -3244,11 +3328,7 @@ async fn execute_safe_with_diff_formats(
                 generate_diff(&commit, commit_path_filters.clone()).await?
             } else {
                 // `-L` prints only the hunks touching the tracked range.
-                let ranges: Vec<LineRange> = args
-                    .line_range
-                    .iter()
-                    .map(|spec| parse_line_range(spec))
-                    .collect::<CliResult<Vec<_>>>()?;
+                let ranges: Vec<LineRange> = resolve_line_ranges(&args.line_range)?;
                 let path = ranges[0].file.clone();
                 let full = generate_diff(&commit, vec![path.clone()]).await?;
                 filter_patch_to_ranges(&full, &ranges)

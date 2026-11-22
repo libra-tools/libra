@@ -8379,3 +8379,61 @@ fn line_history_emits_range_hunks() {
     );
     assert!(inside.contains(" 22"), "range end line kept: {inside}");
 }
+
+#[test]
+fn line_history_function_name_ranges() {
+    use super::{assert_cli_success, run_libra_command};
+
+    // `-L :<funcname>:<file>` resolves the range from the definition and stops
+    // at the next definition, so only the edited function's commits match.
+    let work = tempfile::tempdir().expect("work dir");
+    let repo = work.path().join("r");
+    std::fs::create_dir_all(&repo).expect("mkdir repo");
+    assert_cli_success(&run_libra_command(&["init"], &repo), "init");
+    run_libra_command(&["config", "set", "user.name", "t"], &repo);
+    run_libra_command(&["config", "set", "user.email", "t@t"], &repo);
+    let source = "fn alpha() {\n    one();\n}\n\nfn beta() {\n    two();\n}\n";
+    std::fs::write(repo.join("f.rs"), source).expect("write f.rs");
+    assert_cli_success(&run_libra_command(&["add", "f.rs"], &repo), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c1", "--no-verify"], &repo),
+        "commit c1",
+    );
+    let c1 = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], &repo).stdout)
+        .trim()
+        .to_string();
+    std::fs::write(repo.join("f.rs"), source.replace("two", "three")).expect("edit f.rs");
+    assert_cli_success(&run_libra_command(&["add", "f.rs"], &repo), "add edit");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c2", "--no-verify"], &repo),
+        "commit c2",
+    );
+    let c2 = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], &repo).stdout)
+        .trim()
+        .to_string();
+
+    let out = |args: &[&str]| {
+        let result = run_libra_command(args, &repo);
+        assert_cli_success(&result, &format!("log {args:?}"));
+        String::from_utf8_lossy(&result.stdout).to_string()
+    };
+
+    // `:beta:` covers the edited function and its creation.
+    let beta = out(&["log", "-L", ":beta:f.rs", "--oneline"]);
+    assert!(beta.contains(&c2[..7]), "beta edit commit: {beta}");
+    assert!(beta.contains(&c1[..7]), "beta creation commit: {beta}");
+    assert!(beta.contains("-    two();"), "beta old line: {beta}");
+    assert!(beta.contains("+    three();"), "beta new line: {beta}");
+    // `:alpha:` stops before the beta definition, so the edit is excluded.
+    let alpha = out(&["log", "-L", ":alpha:f.rs", "--oneline"]);
+    assert!(alpha.contains(&c1[..7]), "alpha creation commit: {alpha}");
+    assert!(
+        !alpha.contains(&c2[..7]),
+        "alpha must exclude the edit: {alpha}"
+    );
+    // An unknown function name is a usage error.
+    let missing = run_libra_command(&["log", "-L", ":nope:f.rs"], &repo);
+    assert!(!missing.status.success(), "unknown function must fail");
+    let stderr = String::from_utf8_lossy(&missing.stderr);
+    assert!(stderr.contains("cannot find function"), "stderr: {stderr}");
+}

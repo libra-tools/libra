@@ -1307,57 +1307,7 @@ PY
 
 ### Task LS-17: 实现 `log -L` 行级历史输出（#961；拆出 LS-32）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `in-progress` / `partially-accepted`（2026-11-21 第一段：修复 `-L` **无任何输出**的根因——`apply_follow_and_line_filters` 在未带 `--follow` 时 `path_to_check` 恒为 `None`，`-L` 提交全被丢弃；改为回退到 `ranges[0].file`。`commit_affects_line_range` 由「内容有变即纳入」改为**按 hunk 新侧范围与请求范围求交**（`patch_hunk_ranges`）；`-L` 隐含 `-p`（`resolved_diff_formats` 中强制 `patch=true`）；新增 `filter_patch_to_ranges` 只保留涉及请求范围的 hunk。实测：`-L 1,5:f.txt` 只选创建提交、`-L 18,22:f.txt` 选出改动提交+创建提交并打印 hunk（`-20`/`+twenty`）。回归：`command::log_test::line_history_emits_range_hunks`。**剩余（未验收 AC）**：① hunk 收窄已与 Git 对齐——改为**逐行新旧编号**（`+` 只推新侧、`-` 只推旧侧、上下文两侧同推）后修剪范围外行并重算头部，`-L 18,22:f.txt` 实测得到 `@@ -18,5 +18,5 @@` 与范围内 18/19/-20/+twenty/21/22，**与 Git 同夹具逐字一致**；② `:<funcname>:<file>` 语法仍退化为整文件（`parse_line_range`）；③ 行号范围尚未随历史映射到父提交。本卡保持 `in-progress`，②③ 需在后续窗口完成后按 AC 验收。`log_test` 271/271；严格 Clippy exit 0。）### Task LS-18: 实现 `log --find-object=<object>`（#968）
-
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
-
-**Description:** 在 `LogArgs` 新增 `--find-object=<object>`（可重复），按 pinned Git 的文件对语义筛选提交：在该提交相对父提交的递归 diff（含树条目）中，只要任一变更文件对的旧侧或新侧对象 ID 属于给定对象集合即命中；不是按对象出现总次数判定，因此路径移动而总数不变的提交同样命中。
-
-**Out of scope:** `--pickaxe-all`（仅当后续需要时另开）。
-
-**Current evidence:**
-
-| 事实 | 证据 |
-|---|---|
-| `LogArgs` 仅有 `-S`/`-G` 文本 pickaxe，无 `find_object` | `src/command/log.rs:398-408` |
-| Git 按文件对旧侧或新侧 OID 属于查找集合判定，并开启 `tree_in_recursive` 使树条目参与比较 | `git@6de20f6092:diffcore-pickaxe.c:137-145`、`git@6de20f6092:diff.c:5501-5519` |
-
-**Acceptance criteria:**
-
-- [ ] **AC1** `libra log --find-object=<X> --format=%H` 的提交集合等于 Git 同夹具期望（含 X 总数不变的路径移动提交 C6）。
-- [ ] **AC2** `libra log --find-object=<T> --format=%H`（tree OID）的提交集合等于 Git 同夹具期望。
-- [ ] **AC3** `libra log --find-object=<X> --find-object=<Y> --format=%H` 的提交集合等于 Git 同夹具期望（多值取并集）。
-- [ ] **AC4** `--find-object=bogus` 以 `LBR-CLI-003` 拒绝。
-- [ ] ER-06/ER-06a 同卡强制门：`Docs and compatibility impact` 所列每个文件按「文档与网站验收命令」第 1–7 步逐文件交付并验收（不计入卡特有 AC 分子）。
-
-**AC → 断言映射:**（夹具 F18：C1 新增内容相同的 `a.txt` 与 `b.txt`（blob X）及目录 `d/`（tree T）；C2 只修改无关文件；C3 把 `a.txt` 改为 blob Y；C4 删除 `b.txt`；C5 新增内容为 X 的 `c.txt`；C6 把 `c.txt` 移动为 `e.txt`（X 的总出现次数不变）；C7 修改 `d/` 内文件（tree T 被替换）；每次调用另按「验证执行协议」第 4 项断言只读不变量；标注「Git 2.54.0 预探」或「Git 同夹具期望」的值按该项以 `git@6de20f6092` 取得并硬编码）
-
-- AC1 → `command::log_test::find_object`：期望 exit 0；stdout 提交集合逐字等于 Git 同夹具期望。
-- AC2 → `command::log_test::find_object`：期望 exit 0；stdout 提交集合逐字等于 Git 同夹具期望。
-- AC3 → `command::log_test::find_object`：期望 exit 0；stdout 提交集合逐字等于 Git 同夹具期望。
-- AC4 → `command::log_test::find_object`：期望 stderr 含 `LBR-CLI-003`（Git：`unable to resolve 'bogus'`）。
-- 文档 AC → 「文档与网站验收命令」第 1–7 步（逐文件 SHA-256、关键字命中、网站同步与漂移检查、typecheck/build、Claude Code PASS、精确提交推送、部署核验）。
-
-**Verification:**
-
-- [ ] `source .env.test && cargo nextest run --test command_test -E 'test(=command::log_test::find_object)'`（卡特有 `(new)`，`tests/command/log_test.rs` 内新增；覆盖 AC1–AC4；按「验证执行协议」第 1–4 项执行）
-- [ ] `source .env.test && cargo nextest run --test command_test -E 'test(=command::log_test::test_log_pickaxe_s_finds_commit_that_changes_string_count) | test(=command::log_test::test_log_pickaxe_g_matches_diff_line_regex)'`（共享回归组：既有 `-S`/`-G` pickaxe 用例；预期 N = 2；按「验证执行协议」第 5 项先以同一过滤 `cargo nextest list` 核对，要求 exit 0、通过 = N、失败 = 0、跳过 = 0；不计为卡特有 AC 证据）
-
-**Full-suite trigger:** `T-1: 版本面集合同步修改 install.sh / install.ps1（ER-08 / ER-13 T-1）` | **Dependencies:** `LS-32`, `DEP-LS-01`, `DEP-LS-03`
-
-**Implementation write set:** `src/command/log.rs`, `tests/command/log_test.rs`, `docs/commands/log.md`, `docs/commands/zh-CN/log.md`, `docs/development/commands/log.md`, `COMPATIBILITY.md`, `/Volumes/Data/gitmono/libra-backend/apps/tanstack-app/content/docs/commands/log.en.md`
-
-**Release write set:** `Inherited` | **Files likely touched:** `src/command/log.rs`, `tests/command/log_test.rs`, `COMPATIBILITY.md`
-
-**Docs and compatibility impact:** 必须同卡更新：`docs/commands/log.md`、`docs/commands/zh-CN/log.md` 与网站页 `/Volumes/Data/gitmono/libra-backend/apps/tanstack-app/content/docs/commands/log.en.md`（由 `--only log` 同步生成；网站 zh-CN 在渲染时镜像 EN，无独立文件）；文档关键字（用于 EN/zh 命令页）：`--find-object`。逐文件语义核对：`docs/development/commands/log.md` 与 `COMPATIBILITY.md` 的 `| log |` 行（基线第 196 行）——受本卡行为影响即同卡更新（兼容矩阵原地修改，不增删行），否则按第 1 步记录理由与未变 SHA-256。按「文档与网站验收命令」第 1–7 步逐文件交付并验收。`docs/error-codes.md`：N/A（复用既有稳定码）。
-
-**Rollback mode:** `immutable-release` | **Estimated scope:** `M` | **Version increment:** `patch` | **Release boundary:** `independent` | **C/D coverage from:** `self`
-
-**Granularity:** `type=implementation; axis=log_--find-object; recovery=immutable-release; complete=yes; self-contained=yes; AC=4/8; VER=4/8; landing=1; prod-files=1; scope=M; deps=LS-32,DEP-LS-01,DEP-LS-03; writeset=序列化于LS-32; release=independent; split-from=N/A; exception=N/A`
-
----
-
-### Task LS-19: 实现 `log --cc` 合并提交紧凑组合差异（#833）
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `in-progress` / `partially-accepted`（2026-11-21 第一段：修复 `-L` **无任何输出**的根因——`apply_follow_and_line_filters` 在未带 `--follow` 时 `path_to_check` 恒为 `None`，`-L` 提交全被丢弃；改为回退到 `ranges[0].file`。`commit_affects_line_range` 由「内容有变即纳入」改为**按 hunk 新侧范围与请求范围求交**（`patch_hunk_ranges`）；`-L` 隐含 `-p`（`resolved_diff_formats` 中强制 `patch=true`）；新增 `filter_patch_to_ranges` 只保留涉及请求范围的 hunk。实测：`-L 1,5:f.txt` 只选创建提交、`-L 18,22:f.txt` 选出改动提交+创建提交并打印 hunk（`-20`/`+twenty`）。回归：`command::log_test::line_history_emits_range_hunks`。**剩余（未验收 AC）**：① hunk 收窄已与 Git 对齐（`@@ -18,5 +18,5 @@` + 范围内行，逐字一致）；② `:<funcname>:<file>` **已解析**——`LineRange.func` 保留函数名，`resolve_line_ranges` 从文件定义行到下一个定义前解析范围（`is_function_definition`/`line_names_function`，支持 Rust `fn`、`def`/`function` 与列首 C 风格），未知函数名以 `LBR-CLI-002` + `cannot find function '<name>' in '<file>'` 拒绝；提交筛选改为**只按变更行**（`patch_changed_lines`）判定范围，`:alpha:` 正确排除只改 `:beta:` 的提交，`:beta:` 输出 `@@ -5,3 +5,3 @@` 与 `-    two();`/`+    three();`。回归：`command::log_test::line_history_function_name_ranges`。**仍差 Git**：ⓐ `@@` 头部缺少 Git 输出的尾随函数上下文（`@@ -5,3 +5,3 @@ fn alpha() {`）；ⓑ 文件创建时的 hunk 未按函数范围收窄（Git `@@ -1,0 +1,4 @@`，我们 `+1,7`）；ⓒ 行号范围尚未随历史映射到父提交。本卡保持 `in-progress`。`log_test` 272/272；严格 Clippy exit 0。）### Task LS-19: 实现 `log --cc` 合并提交紧凑组合差异（#833）
 
 **Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
 
