@@ -8372,6 +8372,10 @@ fn line_history_emits_range_hunks() {
     assert!(inside.contains("-20"), "old line shown: {inside}");
     assert!(inside.contains("+twenty"), "new line shown: {inside}");
     // Only the tracked range's hunk is printed for the edit commit.
-    // Hunks are selected by range but not narrowed to it yet (tracked as
-    // remaining work in the plan card).
+    // The hunk is narrowed to the tracked range with Git's header counts.
+    assert!(
+        inside.contains("@@ -18,5 +18,5 @@"),
+        "narrowed hunk header: {inside}"
+    );
+    assert!(inside.contains(" 22"), "range end line kept: {inside}");
 }

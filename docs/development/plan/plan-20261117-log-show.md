@@ -1307,57 +1307,7 @@ PY
 
 ### Task LS-17: 实现 `log -L` 行级历史输出（#961；拆出 LS-32）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `in-progress` / `partially-accepted`（2026-11-21 第一段：修复 `-L` **无任何输出**的根因——`apply_follow_and_line_filters` 在未带 `--follow` 时 `path_to_check` 恒为 `None`，`-L` 提交全被丢弃；改为回退到 `ranges[0].file`。`commit_affects_line_range` 由「内容有变即纳入」改为**按 hunk 新侧范围与请求范围求交**（`patch_hunk_ranges`）；`-L` 隐含 `-p`（`resolved_diff_formats` 中强制 `patch=true`）；新增 `filter_patch_to_ranges` 只保留涉及请求范围的 hunk。实测：`-L 1,5:f.txt` 只选创建提交、`-L 18,22:f.txt` 选出改动提交+创建提交并打印 hunk（`-20`/`+twenty`）。回归：`command::log_test::line_history_emits_range_hunks`。**剩余（未验收 AC）**：① hunk 已按范围收窄上下文（`filter_patch_to_ranges` 修剪范围外的上下文并重算头部，实测得到 `@@ -18,4 +18,4 @@` + 范围内 18/19/-20/+twenty/21/22），但与 Git 的 `@@ -18,5 +18,5 @@` 在**计数**上仍差 1（旧侧/新侧计数受 `+`/`-` 行导致的编号偏移影响），尚未逐字一致；② `:<funcname>:<file>` 语法仍退化为整文件（`parse_line_range`）；③ 行号范围尚未随历史映射到父提交。本卡保持 `in-progress`，上述三项需在后续窗口完成后按 AC 验收。`log_test` 271/271；严格 Clippy exit 0。）### Task LS-32: `log -L` 与 pathspec/`--follow` 互斥及参数诊断（#961；自 LS-17 拆出）
-
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
-
-**Description:** 增加 `-L` 的参数校验：与位置 pathspec 同用、与 `--follow` 同用（Git 中二者因 `--follow requires exactly one pathspec` 与 `-L<range>:<file> cannot be used with pathspec` 不可同时满足）、非法 `-L` 语法与不存在的文件分别返回稳定错误。
-
-**Out of scope:** `-L` 行级输出与函数边界（由 `LS-17` 处理）。
-
-**Current evidence:**
-
-| 事实 | 证据 |
-|---|---|
-| `parse_line_range` 已对非法格式返回 `CliInvalidArguments`；无 `-L` 与 pathspec / `--follow` 的互斥校验 | `src/command/log.rs:1894-1902,1981-2030` |
-| Git 2.54.0 预探的四类诊断文本与退出码 128 | 本机 Git 2.54.0（开工时以 `git@6de20f6092` 复核） |
-
-**Acceptance criteria:**
-
-- [ ] **AC1** `libra log -L 1,1:f -- f` 以 `LBR-CLI-002` 拒绝。
-- [ ] **AC2** `libra log -L 1,1:f --follow` 以 `LBR-CLI-002` 拒绝。
-- [ ] **AC3** `libra log -L foo` 以 `LBR-CLI-002` 拒绝。
-- [ ] **AC4** `libra log -L 1,1:nofile` 以 `LBR-CLI-003` 拒绝。
-- [ ] ER-06/ER-06a 同卡强制门：`Docs and compatibility impact` 所列每个文件按「文档与网站验收命令」第 1–7 步逐文件交付并验收（不计入卡特有 AC 分子）。
-
-**AC → 断言映射:**（夹具 F32：单文件 `f` 的 2 提交历史；每次调用另按「验证执行协议」第 4 项断言只读不变量；标注「Git 2.54.0 预探」或「Git 同夹具期望」的值按该项以 `git@6de20f6092` 取得并硬编码）
-
-- AC1 → `command::log_test::line_range_argument_validation`：期望 stderr 含 `LBR-CLI-002`（Git：`-L<range>:<file> cannot be used with pathspec`）。
-- AC2 → `command::log_test::line_range_argument_validation`：期望 stderr 含 `LBR-CLI-002`（Git：`--follow requires exactly one pathspec`）。
-- AC3 → `command::log_test::line_range_argument_validation`：期望 stderr 含 `LBR-CLI-002`（Git：`-L argument not 'start,end:file' or ':funcname:file'`）。
-- AC4 → `command::log_test::line_range_argument_validation`：期望 stderr 含 `LBR-CLI-003`（Git：`There is no path nofile in the commit`）。
-- 文档 AC → 「文档与网站验收命令」第 1–7 步（逐文件 SHA-256、关键字命中、网站同步与漂移检查、typecheck/build、Claude Code PASS、精确提交推送、部署核验）。
-
-**Verification:**
-
-- [ ] `source .env.test && cargo nextest run --test command_test -E 'test(=command::log_test::line_range_argument_validation)'`（卡特有 `(new)`，`tests/command/log_test.rs` 内新增；覆盖 AC1–AC4；按「验证执行协议」第 1–4 项执行）
-- [ ] `source .env.test && cargo nextest run --test command_test -E 'test(=command::log_test::test_log_line_range_flag_accepted) | test(=command::log_test::log_ineligible_follow_line_range_pathspec_walk_full_history)'`（共享回归组：既有 `-L` 接受与 follow/-L/pathspec 遍历用例；预期 N = 2；按「验证执行协议」第 5 项先以同一过滤 `cargo nextest list` 核对，要求 exit 0、通过 = N、失败 = 0、跳过 = 0；不计为卡特有 AC 证据）
-
-**Full-suite trigger:** `T-1: 版本面集合同步修改 install.sh / install.ps1（ER-08 / ER-13 T-1）` | **Dependencies:** `LS-17`, `DEP-LS-01`, `DEP-LS-03`
-
-**Implementation write set:** `src/command/log.rs`, `tests/command/log_test.rs`, `docs/commands/log.md`, `docs/commands/zh-CN/log.md`, `docs/development/commands/log.md`, `COMPATIBILITY.md`, `/Volumes/Data/gitmono/libra-backend/apps/tanstack-app/content/docs/commands/log.en.md`
-
-**Release write set:** `Inherited` | **Files likely touched:** `src/command/log.rs`, `tests/command/log_test.rs`, `COMPATIBILITY.md`
-
-**Docs and compatibility impact:** 必须同卡更新：`docs/commands/log.md`、`docs/commands/zh-CN/log.md` 与网站页 `/Volumes/Data/gitmono/libra-backend/apps/tanstack-app/content/docs/commands/log.en.md`（由 `--only log` 同步生成；网站 zh-CN 在渲染时镜像 EN，无独立文件）；文档关键字（用于 EN/zh 命令页）：`-L`。逐文件语义核对：`docs/development/commands/log.md` 与 `COMPATIBILITY.md` 的 `| log |` 行（基线第 196 行）——受本卡行为影响即同卡更新（兼容矩阵原地修改，不增删行），否则按第 1 步记录理由与未变 SHA-256。按「文档与网站验收命令」第 1–7 步逐文件交付并验收。`docs/error-codes.md`：N/A（复用既有稳定码）。
-
-**Rollback mode:** `immutable-release` | **Estimated scope:** `M` | **Version increment:** `patch` | **Release boundary:** `independent` | **C/D coverage from:** `self`
-
-**Granularity:** `type=implementation; axis=log_-L参数校验; recovery=immutable-release; complete=yes; self-contained=yes; AC=4/8; VER=4/8; landing=1; prod-files=1; scope=M; deps=LS-17,DEP-LS-01,DEP-LS-03; writeset=序列化于LS-17; release=independent; split-from=LS-17; exception=N/A`
-
----
-
-### Task LS-18: 实现 `log --find-object=<object>`（#968）
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `in-progress` / `partially-accepted`（2026-11-21 第一段：修复 `-L` **无任何输出**的根因——`apply_follow_and_line_filters` 在未带 `--follow` 时 `path_to_check` 恒为 `None`，`-L` 提交全被丢弃；改为回退到 `ranges[0].file`。`commit_affects_line_range` 由「内容有变即纳入」改为**按 hunk 新侧范围与请求范围求交**（`patch_hunk_ranges`）；`-L` 隐含 `-p`（`resolved_diff_formats` 中强制 `patch=true`）；新增 `filter_patch_to_ranges` 只保留涉及请求范围的 hunk。实测：`-L 1,5:f.txt` 只选创建提交、`-L 18,22:f.txt` 选出改动提交+创建提交并打印 hunk（`-20`/`+twenty`）。回归：`command::log_test::line_history_emits_range_hunks`。**剩余（未验收 AC）**：① hunk 收窄已与 Git 对齐——改为**逐行新旧编号**（`+` 只推新侧、`-` 只推旧侧、上下文两侧同推）后修剪范围外行并重算头部，`-L 18,22:f.txt` 实测得到 `@@ -18,5 +18,5 @@` 与范围内 18/19/-20/+twenty/21/22，**与 Git 同夹具逐字一致**；② `:<funcname>:<file>` 语法仍退化为整文件（`parse_line_range`）；③ 行号范围尚未随历史映射到父提交。本卡保持 `in-progress`，②③ 需在后续窗口完成后按 AC 验收。`log_test` 271/271；严格 Clippy exit 0。）### Task LS-18: 实现 `log --find-object=<object>`（#968）
 
 **Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
 

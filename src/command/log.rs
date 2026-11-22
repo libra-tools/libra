@@ -2282,65 +2282,69 @@ fn filter_patch_to_ranges(patch: &str, ranges: &[LineRange]) -> String {
     let mut kept_hunks: Vec<String> = Vec::new();
     let mut hunk: Option<(usize, usize, Vec<String>)> = None;
 
-    let bounded = |line: usize| -> bool {
-        ranges
-            .iter()
-            .any(|range| range.start <= line && line <= range.end)
+    // Per-line old/new numbering: `+` advances only the new side, `-` only
+    // the old one, context advances both.
+    let numbered = |start: usize, lines: &[String]| -> Vec<(usize, usize)> {
+        let mut old_no = start;
+        let mut new_no = start;
+        let mut numbers = Vec::with_capacity(lines.len());
+        for line in lines {
+            numbers.push((old_no, new_no));
+            if line.starts_with('+') {
+                new_no += 1;
+            } else if line.starts_with('-') {
+                old_no += 1;
+            } else {
+                old_no += 1;
+                new_no += 1;
+            }
+        }
+        numbers
+    };
+    let in_range = |old_no: usize, new_no: usize| -> bool {
+        ranges.iter().any(|range| {
+            (range.start <= old_no && old_no <= range.end)
+                || (range.start <= new_no && new_no <= range.end)
+        })
     };
 
     let flush = |hunk: &mut Option<(usize, usize, Vec<String>)>, kept: &mut Vec<String>| {
-        if let Some((start, end, lines)) = hunk.take() {
-            // Trim context that falls outside the tracked range on both ends.
+        if let Some((start, _end, lines)) = hunk.take() {
+            let numbers = numbered(start, &lines);
+            let relevant = |index: usize| -> bool {
+                let (old_no, new_no) = numbers[index];
+                lines[index].starts_with('+')
+                    || lines[index].starts_with('-')
+                    || in_range(old_no, new_no)
+            };
             let mut begin = 0;
-            let mut finish = lines.len();
-            while begin < finish {
-                let candidate = start + begin;
-                if bounded(candidate)
-                    || lines[begin].starts_with('+')
-                    || lines[begin].starts_with('-')
-                {
-                    break;
-                }
+            while begin < lines.len() && !relevant(begin) {
                 begin += 1;
             }
-            while finish > begin {
-                let candidate = start + finish - 1;
-                if bounded(candidate)
-                    || lines[finish - 1].starts_with('+')
-                    || lines[finish - 1].starts_with('-')
-                {
-                    break;
-                }
+            let mut finish = lines.len();
+            while finish > begin && !relevant(finish - 1) {
                 finish -= 1;
             }
             if begin < finish {
-                let old_len = lines[begin..finish]
+                // A hunk must contain at least one change line.
+                let has_change = lines[begin..finish]
                     .iter()
-                    .filter(|line| !line.starts_with('+'))
-                    .count();
-                let new_len = lines[begin..finish]
-                    .iter()
-                    .filter(|line| !line.starts_with('-'))
-                    .count();
-                // Hunk headers count only the lines each side actually has:
-                // `+` lines advance the new numbering, `-` lines the old one.
-                let old_skipped = lines[..begin]
-                    .iter()
-                    .filter(|line| !line.starts_with('+'))
-                    .count();
-                let new_skipped = lines[..begin]
-                    .iter()
-                    .filter(|line| !line.starts_with('-'))
-                    .count();
-                let _ = end;
-                kept.push(format!(
-                    "@@ -{},{} +{},{} @@\n",
-                    start + old_skipped,
-                    old_len,
-                    start + new_skipped,
-                    new_len
-                ));
-                kept.extend(lines[begin..finish].iter().cloned());
+                    .any(|line| line.starts_with('+') || line.starts_with('-'));
+                if has_change {
+                    let old_len = lines[begin..finish]
+                        .iter()
+                        .filter(|line| !line.starts_with('+'))
+                        .count();
+                    let new_len = lines[begin..finish]
+                        .iter()
+                        .filter(|line| !line.starts_with('-'))
+                        .count();
+                    let (old_start, new_start) = numbers[begin];
+                    kept.push(format!(
+                        "@@ -{old_start},{old_len} +{new_start},{new_len} @@\n"
+                    ));
+                    kept.extend(lines[begin..finish].iter().cloned());
+                }
             }
         }
     };
