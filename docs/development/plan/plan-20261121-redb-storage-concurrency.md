@@ -4860,7 +4860,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `done` / `remote-pending`
+**Lifecycle / Acceptance:** `done` / `remote-verified`
 
 **Description:** 100% 在独占目录 `src/storage/**` 内于 `writer.rs`、`highwater.rs` 与 `segment.rs` 实现并同卡验收消费端针对 `MAX_SEALED_SEGMENTS = 256` 高压队列的逐段即时回收降压策略：当消费者观测到 `LTM2.sealed.len() == 256` 时，每完成任意单个已封存段提交（推进 `highwater_seg` 越过 `min_live_seg`）即刻触发一次 `writer.lock → append.lock` 回收释放槽位（无须等待全部 256 段排空完毕），第一时间解除生产者常规 16 MiB 轮转 `LBR-AGENT-046` 背压，并支持对满表 Case C 恢复态完成全量 `LTM2` 校验及全部 256 封存段与活跃段 `S` 落库。
 
@@ -4919,7 +4919,7 @@
 
 **Task type:** `migration`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `remote-pending`
 
 **Description:** 100% 在独占目录 `src/storage/` 内实现正向迁移 Phase 1 的单连接 `DELETE` 模式排他静默前置门（`src/storage/migrate.rs`，`#[cfg(all(feature = "storage-sqlite", feature = "storage-redb"))]`）：以**唯一非池化单连接 `c_mig`** 配置 `busy_timeout = 0`、`PRAGMA synchronous = FULL` 与 `PRAGMA locking_mode = EXCLUSIVE`，经无写 `BEGIN EXCLUSIVE; ROLLBACK;` 在 OS 级校验零外部 SQLite 写者与零活跃 `DELETE` 模式读事务（`SHARED` 锁）。
 
@@ -4936,15 +4936,15 @@
 | 正向迁移前必须通过非池化单连接无写 `BEGIN EXCLUSIVE` 排斥活跃 SQLite 写者与 `DELETE` 活跃读者且保持源库逐字节不变 | `src/internal/db.rs:270`；`ADR-RB-07` #1 |
 
 **Acceptance criteria:**
-- [ ] **外部 SQLite 写者持写事务返回 `LBR-IO-001`：** 外部进程持有源库写事务时，静默门在 `BEGIN EXCLUSIVE` 处 fail-closed 返回 `LBR-IO-001`。
-- [ ] **外部写者拒收源库快照零改动：** 上述 AC1 拒收前后，源 `.db` 文件逐字节快照完全相等。
-- [ ] **`DELETE` 模式活跃读者持 `SHARED` 锁返回 `LBR-IO-001`：** 外部进程在 `DELETE` 模式下持有活跃读事务时，无写 `BEGIN EXCLUSIVE` fail-closed 返回 `LBR-IO-001`。
-- [ ] **`DELETE` 模式活跃读者拒收源库快照零改动：** 上述 AC3 拒收前后，源 `.db` 文件逐字节快照完全相等。
+- [x] **外部 SQLite 写者持写事务返回 `LBR-IO-001`：** 外部进程持有源库写事务时，静默门在 `BEGIN EXCLUSIVE` 处 fail-closed 返回 `LBR-IO-001`。
+- [x] **外部写者拒收源库快照零改动：** 上述 AC1 拒收前后，源 `.db` 文件逐字节快照完全相等。
+- [x] **`DELETE` 模式活跃读者持 `SHARED` 锁返回 `LBR-IO-001`：** 外部进程在 `DELETE` 模式下持有活跃读事务时，无写 `BEGIN EXCLUSIVE` fail-closed 返回 `LBR-IO-001`。
+- [x] **`DELETE` 模式活跃读者拒收源库快照零改动：** 上述 AC3 拒收前后，源 `.db` 文件逐字节快照完全相等。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::forward_phase1_rejects_writer_and_delete_active_reader)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::forward_phase1_rejects_writer_and_delete_active_reader)'`（new，覆盖 AC1–AC4）
-- [ ] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 2 文件实现白名单。
+- [x] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::forward_phase1_rejects_writer_and_delete_active_reader)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::forward_phase1_rejects_writer_and_delete_active_reader)'`（new，覆盖 AC1–AC4）
+- [x] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 2 文件实现白名单。
 
 **Full-suite trigger:** `none`
 
@@ -10082,8 +10082,9 @@
 | `RB-09j` | `done` / `remote-verified` | `8e768df`（`main`） | `0.30.377` | 2026-11-23 21:29 UTC：Stage 1 精确 5 文件写集内仅改动 `src/storage/queue/writer.rs`，新增严格 `#[cfg(test)]` 零发布开销故障注入点 `WriterCrashPoint::BeforeEmptyAdvanceCommit`（位于 `LTM2.sealed[S]` 认证之后、`append_capture_batch(&[], (S + 1, 0))` 提交之前），并新增两项双通道端到端验收测试：`--no-default-features --features storage-redb` `VER1` 2/2、`VER2`（`consumer_drained_rotated_empty_advance_crash_before_and_after_commit` 2.167s 覆盖 AC1 提交前崩溃 0 DB 写/高水位与镜像停留 `(0, sealed_len)`/重启幂等提交 `(1, 0)` 零冗余行，及 AC2 提交后镜像前崩溃的空 `S+1`（0 额外 DB 写并自愈镜像至 `(1, 0)`）与非空 `S+1`（直起 `(1, 0)` 无重复空批）双子场景）、`VER3`（`consumer_drained_rotated_s1_existing_and_appended_drain` 2.937s 覆盖 AC3–AC5 在 Case C Step C2 与真实 16 MiB 常规轮转双路径下跨段立即消费 `S+1` 全部 4 条既有帧 + 5 条后续新追加帧逐字段核验一致且高水位精确停于 `(1, committed_len(1))` 绝不跳 `(2, 0)`）、`writer::tests` 19/19（39.378s）、四构型 Clippy/check 矩阵 `src/storage/` 零告警、`compat_version_surface_sync` 2/2 全绿；Codex R1 唯一 P2（测试注入点严格 `#[cfg(test)]` 门控）闭环，R2 获 `VERDICT: PASS`（P0=0、P1=0、P2=0） |
 | `RB-09k` | `done` / `remote-verified` | `c156520`（`main`） | `0.30.378` | 2026-11-23 21:45 UTC：Stage 1 精确 5 文件写集内仅改动 `src/storage/queue/writer.rs`，新增双通道端到端有序回收验收测试 `consumer_drained_rotated_old_s_safe_reclaim_ordered_actions`：Part 1 经 `AfterReclaimMetaBeforeUnlink` 故障注入在原子零帧跨段提交 `(1, 0)` 后实证 `tail.meta` 与 `tail.meta.bak` 已原子落盘 `MIN_LIVE_SEG = 1`（AC1）并同步摘除 `sealed[0]`（AC2）且 `events-00000000.log` 尚未 `unlink`；Part 2 跨 Case C Step C2（含非零 `S = 0→1` 与 `S = 1→2`）及真实 16 MiB 常规轮转实证 `writer.lock → append.lock` 锁序、双副本 `LTM2` 先落盘再 `unlink`（AC3）且 `FsyncLaneDirAfterReclaim` 紧随 `ReclaimSegmentUnlink` 之后执行（`pos_fsync_reclaim == pos_unlink + 1`，AC4）；`--no-default-features --features storage-redb` `VER1` 1/1、`VER2` 2.264s、`writer::tests` 20/20（40.934s）、四构型 Clippy/check 矩阵 `src/storage/` 零告警、`compat_version_surface_sync` 2/2 全绿；Codex R1 唯一 P1（紧邻索引断言 `pos_fsync_reclaim == pos_unlink + 1`）闭环，R2 获 `VERDICT: PASS`（P0=0、P1=0、P2=0） |
 | `RB-09i` | `done` / `remote-verified` | `b2b2a81`（`main`） | `0.30.379` | 2026-11-23 22:17 UTC：Stage 1 精确 5 文件写集内仅改动 `src/storage/queue/segment.rs` 与 `src/storage/queue/writer.rs`，在 `writer.rs::step_lane_once` 中将 `max_live_seg > meta.active_seg` Case D / 嵌套 Case C→D 恢复委托前置于 Branch A（已封存段消费）与 Branch B（活跃段消费）之前（含先验活跃段已提交前缀只读验证），在 `normal/` 50ms 合批窗口刷新时同步核验 `next_seg_ids` 遇后继立即让出待恢复，并在 `segment.rs` Unix (`recover_under_root_fd_unix`) 与 Windows (`recover_at_root_windows`) 持 `append.lock` 释放前新增权威后验收敛校验并增补 `LaneRecoveryReport.orphan_successor_removed`、彻底移除易受 ABA 误伤的无锁 `last_recovery_signature`；`--no-default-features --features storage-redb` `VER1` 1/1、`VER2`（`consumer_delegates_nested_case_d_recovery_and_drains_all_frame_classes` 2.510s 覆盖 7 大场景：双通道洁净嵌套 Case C→D AC1–AC6 + 0 持锁写库/镜像不变 + 双损嵌套 `RB-08v`/`RB-08u` + 损坏前缀 fail-closed `LBR-IO-001` + 旧封存高水位前置委托 + 50ms 窗中后继让出 + 空孤儿后并发重建 + 外部 `recover_lane` ABA 竞态恢复）、`writer::tests` 21/21（41.969s）、四构型 Clippy/check 矩阵 `src/storage/` 零告警、`compat_version_surface_sync` 2/2 全绿；Codex R1（2×P1）、R2（1×P1）、R3（1×P1）全部闭环，R4 获 `VERDICT: PASS`（P0=0、P1=0、P2=0） |
-| `RB-09l` | `done` / `remote-pending` | 本提交（`main`） | `0.30.380` | 2026-11-23 22:38 UTC：Stage 1 精确 5 文件写集内仅改动 `src/storage/queue/writer.rs`，新增严格 `#[cfg(test)]` 零发布开销 `WriterObserver::with_after_reclaim_hook` 并落地两项双通道端到端高压验收测试关闭 Phase 2（全 43 卡 100% 闭环）：`--no-default-features --features storage-redb` `VER1` 2/2、`VER2`（`consumer_eager_reclaim_unblocks_256_rotation` 16.545s 覆盖 AC1–AC3：256 小封存段 + 活跃 `S=256` ~15 MiB 隔离字节上限，实证 16 MiB 轮转先报 `QueueFull` `LBR-AGENT-046`、消费跨过首个封存段 `seg 0` 即刻逐段回收将 `sealed.len()` 降至 `255 < 256`（其余 255 段仍在盘未消费）、受阻轮转即刻建出 `events-00000257.log` 并在双副本 `tail.meta`/`tail.meta.bak` 原子登记 `(256, old_committed_len, old_prefix_crc32c)`、随后同一消费循环无缝排空余下 256 封存段及 `seg 257`）、`VER3`（`consumer_drains_full_256_table_case_c_sealed_and_active` 15.908s 覆盖 AC4–AC6：满 256 表 Step C1 原地恢复 + 5 条段内追加后高压排空 0 错通过全量 `LTM2` 校验、`sealed.len()` 严格按 `255..=0` 逐段释放、全 256 封存段 512 帧与活跃 `S=256` 12 帧逐字段核验一致）、`writer::tests` 23/23（64.097s）、四构型 Clippy/check 矩阵 `src/storage/` 零告警、`compat_version_surface_sync` 2/2 全绿；Codex R1 静态审查确认 P0=0/P1=0/P2=0（仅因只读沙箱无法落盘跑测标 FAIL，已由本地全量测试闭环并依用户明确授权跳过复审推进） |
-| `RB-10`..`RB-34c`（剩余 83 卡） | `pending` | — | — | **Phase 2（43/43 卡）100% 闭环！** 进入 Phase 3 首卡 `RB-10`（正向迁移 Phase 1 `DELETE` 模式排他静默门） |
+| `RB-09l` | `done` / `remote-verified` | `c867b25`（`main`） | `0.30.380` | 2026-11-23 22:38 UTC：Stage 1 精确 5 文件写集内仅改动 `src/storage/queue/writer.rs`，新增严格 `#[cfg(test)]` 零发布开销 `WriterObserver::with_after_reclaim_hook` 并落地两项双通道端到端高压验收测试关闭 Phase 2（全 43 卡 100% 闭环）：`--no-default-features --features storage-redb` `VER1` 2/2、`VER2`（`consumer_eager_reclaim_unblocks_256_rotation` 16.545s 覆盖 AC1–AC3：256 小封存段 + 活跃 `S=256` ~15 MiB 隔离字节上限，实证 16 MiB 轮转先报 `QueueFull` `LBR-AGENT-046`、消费跨过首个封存段 `seg 0` 即刻逐段回收将 `sealed.len()` 降至 `255 < 256`（其余 255 段仍在盘未消费）、受阻轮转即刻建出 `events-00000257.log` 并在双副本 `tail.meta`/`tail.meta.bak` 原子登记 `(256, old_committed_len, old_prefix_crc32c)`、随后同一消费循环无缝排空余下 256 封存段及 `seg 257`）、`VER3`（`consumer_drains_full_256_table_case_c_sealed_and_active` 15.908s 覆盖 AC4–AC6：满 256 表 Step C1 原地恢复 + 5 条段内追加后高压排空 0 错通过全量 `LTM2` 校验、`sealed.len()` 严格按 `255..=0` 逐段释放、全 256 封存段 512 帧与活跃 `S=256` 12 帧逐字段核验一致）、`writer::tests` 23/23（64.097s）、四构型 Clippy/check 矩阵 `src/storage/` 零告警、`compat_version_surface_sync` 2/2 全绿；Codex R1 静态审查确认 P0=0/P1=0/P2=0（仅因只读沙箱无法落盘跑测标 FAIL，已由本地全量测试闭环并依用户明确授权跳过复审推进） |
+| `RB-10` | `done` / `remote-pending` | 本提交（`main`） | `0.30.381` | 2026-11-23 23:28 UTC：Phase 3 首卡，Stage 1 精确 2 文件写集（`src/storage/mod.rs`、`src/storage/migrate.rs`，`#[cfg(all(feature = "storage-sqlite", feature = "storage-redb"))]`）实现单非池化连接 `c_mig` `DELETE` 模式排他静默门（`quiesce_sqlite_source` / `quiesce_forward_repository_sqlite_sources`）：全程零活 `.db` 裸 `File::open`（依赖无 fd `lstat` + SQLite `unixClose` `pInode->pUnused` 延迟关句柄杜绝 POSIX 泄锁），前置 `PRAGMA locking_mode = EXCLUSIVE`（无 `NeedSchema` 不触盘、强制 `WAL_HEAPMEMORY_MODE` 零 `-shm`）+ 无写 `BEGIN EXCLUSIVE; ROLLBACK;` 持续保持 OS 级 `EXCLUSIVE` 锁 + 持锁态配置并校验 `PRAGMA synchronous = FULL` + `sqlite3_file_control("main", SQLITE_FCNTL_HAS_MOVED)` 句柄-inode 绑定校验 + `SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE` 保护离线 WAL 与即刻取消零改动，严格限定 `Repository`/`Capture` 角色零触碰配置库；`--features storage-sqlite,storage-redb,storage-queue` `VER1` 1/1、`VER2`（`forward_phase1_rejects_writer_and_delete_active_reader` 0.117s 覆盖真实跨 OS 进程 `writer_immediate`/`writer_exclusive`/`delete_reader` 双库 AC1–AC4 均精准报于 `BEGIN EXCLUSIVE` `SQLITE_BUSY` `LBR-IO-001` 且零字节改动、5 轮中位数 ≤ 50ms 性能预算、持锁后外部进程读写探针 100% 阻断、离线 WAL/TOCTOU WAL/洁净 WAL/即刻取消/硬链别名/路径持久替换与换回/异步 `Drop`/禁入角色全回归）、四构型 Clippy/check 矩阵 `src/storage/` 零告警、`compat_version_surface_sync` 2/2 全绿；Codex R1–R5 共 9 项真实发现全部逐轮闭环，R6 残余 2 项分别为 macOS 无法实测的 Windows VFS 场景与要求 `NO_CKPT_ON_CLOSE` 在 `BEGIN EXCLUSIVE` 前同时为 0 和 1 的物理矛盾，依用户明确授权跳过复审并如实记录推进 |
+| `RB-10m`..`RB-34c`（剩余 82 卡） | `pending` | — | — | Phase 3 首卡 `RB-10` 完成，进入 `RB-10m`（正向迁移 Phase 1 WAL 三类竞争直接切 `journal_mode=DELETE` 静默门） |
 
 ## Codex review log
 

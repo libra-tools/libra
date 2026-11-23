@@ -27,6 +27,8 @@ pub mod git_store;
 pub mod manifest;
 #[cfg(feature = "storage-redb")]
 pub mod meta;
+#[cfg(all(feature = "storage-sqlite", feature = "storage-redb"))]
+pub mod migrate;
 #[cfg(feature = "storage-redb")]
 pub mod opener;
 #[cfg(feature = "storage-queue")]
@@ -163,6 +165,12 @@ pub use meta::{
     MetaSchemaRecord, MetaSchemaRole, begin_checked_read, begin_checked_write,
     begin_checked_write_blocking, init_meta_schema, validate_meta_schema, verify_meta_schema_read,
     verify_meta_schema_write, write_migration_tombstone,
+};
+#[cfg(all(feature = "storage-sqlite", feature = "storage-redb"))]
+pub use migrate::{
+    LEGACY_CAPTURE_SQLITE_REL_PATH, MIGRATION_LOCK_FILE, QuiescedRepositorySqliteSources,
+    QuiescedSqliteConnection, SqliteQuiesceStage, capture_sqlite_db_path, git_sqlite_db_path,
+    quiesce_forward_repository_sqlite_sources, quiesce_sqlite_source,
 };
 #[cfg(feature = "storage-redb")]
 pub use opener::{
