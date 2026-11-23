@@ -1513,7 +1513,7 @@ PY
 **2026-11-21 全量门第二处回归修复：** `internal::log::formatter::tests::format_custom_all_placeholders` 因 `%d` 改用 `decoration_wrapped` 而失败（测试夹具只填了 `decoration`）；已把夹具补为 ` (tag: v1.0)`，该模块 5/5 通过。此前的卡内验证只跑 `command::log_test::`，漏掉了 lib 单测族——后续卡应同时跑 `internal::log::formatter::tests`。
 ### Task LS-20: `log` 支持 `--raw`、`--numstat` 与 `--dirstat` 差异格式选项（#964）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-23：新增 `log --raw`/`--numstat`——`commit_diff_output` 经 clap 构造 `DiffArgs` 调 `run_diff_for_service`，复用 `render::format_diff_raw`（提升为 `pub(crate)`）与 `format_numstat_output`；`DiffFormatPositions`/`ResolvedDiffFormats` 增加 `raw`/`numstat`，`-s`/`--no-patch` 按位置清除；`--dirstat` 既有实现与 Git 逐字一致（`32.7% sub/`）。AC1–AC6 由 `command::log_test::raw_numstat_dirstat_formats` 覆盖（`--raw` 行 `:100644 100644 422c2b7 de98044 M	a.txt`、`--numstat` 行 `1	0	a.txt`、`-s` 清除、`--no-patch` 清除 dirstat、目录占比一致）。`log_test` 279/279；严格 Clippy exit 0；EN/zh/开发文档与 `COMPATIBILITY.md` 同步。
 
 **Description:** 在 `LogArgs` 补齐 `--raw` 与 `--numstat`（`--dirstat` 在 `log.rs` 已有 `compute_commit_dirstat` (`log.rs:3416`) + `utils::diff_format::format_dirstat`，且 `format_diff_dirstat` (`diff/render.rs:412`) 已为 `pub(crate)`，仅核实对齐）。按 `ADR-LS-01` 与 `DEP-LS-02` 等待 `issues/529.md` `FP-05`/`FP-07` `done`/`complete` 后直接复用其公开的 `pub(crate) mod render` 与独立 `numstat` 渲染函数（当前 `numstat` 为 `diff/render.rs:278` `render_diff_output` 内分支，不重复实现），并将 `src/command/diff/render.rs:503` 的 `format_diff_raw`（当前为 `pub(super)`）提升为 `pub(crate)` 供 `LogDiffOptions` 复用，且均参与 `-s`/`--no-patch` 顺序清除。
 

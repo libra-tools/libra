@@ -8917,3 +8917,108 @@ fn log_cc_merge_combined_diff() {
     let plain = out(&["log", "-p", "-1", "HEAD~1"]);
     assert_eq!(non_merge, plain, "AC3 non-merge passthrough");
 }
+
+#[test]
+fn raw_numstat_dirstat_formats() {
+    use super::{assert_cli_success, run_libra_command};
+
+    // Fixture: c1 adds a.txt (a/b), c2 appends c.
+    let work = tempfile::tempdir().expect("work dir");
+    let repo = work.path().join("r");
+    std::fs::create_dir_all(&repo).expect("mkdir repo");
+    assert_cli_success(&run_libra_command(&["init"], &repo), "init");
+    run_libra_command(&["config", "set", "user.name", "t"], &repo);
+    run_libra_command(&["config", "set", "user.email", "t@t"], &repo);
+    std::fs::write(repo.join("a.txt"), "a\nb\n").expect("write a");
+    assert_cli_success(&run_libra_command(&["add", "a.txt"], &repo), "add a");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c1", "--no-verify"], &repo),
+        "commit c1",
+    );
+    std::fs::write(repo.join("a.txt"), "a\nb\nc\n").expect("write b");
+    assert_cli_success(&run_libra_command(&["add", "a.txt"], &repo), "add b");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c2", "--no-verify"], &repo),
+        "commit c2",
+    );
+
+    let out = |args: &[&str]| {
+        let result = run_libra_command(args, &repo);
+        assert_cli_success(&result, &format!("log {args:?}"));
+        String::from_utf8_lossy(&result.stdout).to_string()
+    };
+
+    // AC1: `--raw` prints Git's `:<oldmode> <newmode> <old> <new> <status>\t<path>`.
+    let raw = out(&["log", "--raw", "-1"]);
+    assert!(
+        raw.contains(":100644 100644 422c2b7 de98044 M\ta.txt"),
+        "AC1 raw line: {raw}"
+    );
+    // AC2: `--numstat` prints `<ins>\t<del>\t<path>`.
+    let numstat = out(&["log", "--numstat", "-1"]);
+    assert!(numstat.contains("1\t0\ta.txt"), "AC2 numstat: {numstat}");
+    // AC4/AC5: a later `-s` clears `--raw` / `--numstat`.
+    assert_eq!(
+        out(&["log", "-1", "--raw", "-s"]),
+        out(&["log", "-1", "-s"]),
+        "AC4"
+    );
+    assert_eq!(
+        out(&["log", "-1", "--numstat", "-s"]),
+        out(&["log", "-1", "-s"]),
+        "AC5"
+    );
+    // AC6: `--no-patch` clears `--dirstat`.
+    assert_eq!(
+        out(&["log", "-1", "--dirstat", "--no-patch"]),
+        out(&["log", "-1", "--no-patch"]),
+        "AC6"
+    );
+
+    // AC3: `--dirstat` matches Git's directory breakdown.
+    let wide = work.path().join("wide");
+    std::fs::create_dir_all(&wide).expect("mkdir wide");
+    assert_cli_success(&run_libra_command(&["init"], &wide), "init wide");
+    run_libra_command(&["config", "set", "user.name", "t"], &wide);
+    run_libra_command(&["config", "set", "user.email", "t@t"], &wide);
+    let numbers: String = (1..=100).map(|n| format!("{n}\n")).collect();
+    std::fs::write(wide.join("a.txt"), &numbers).expect("write wide a");
+    std::fs::create_dir_all(wide.join("sub")).expect("mkdir sub");
+    std::fs::write(wide.join("sub/b.txt"), &numbers).expect("write wide b");
+    assert_cli_success(&run_libra_command(&["add", "."], &wide), "add wide");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c1", "--no-verify"], &wide),
+        "commit wide c1",
+    );
+    let mut edited: String = (1..=100)
+        .map(|n| {
+            if n <= 10 {
+                "x\n".to_string()
+            } else {
+                format!("{n}\n")
+            }
+        })
+        .collect();
+    std::fs::write(wide.join("a.txt"), &edited).expect("edit wide a");
+    edited = (1..=100)
+        .map(|n| {
+            if n <= 5 {
+                "y\n".to_string()
+            } else {
+                format!("{n}\n")
+            }
+        })
+        .collect();
+    std::fs::write(wide.join("sub/b.txt"), &edited).expect("edit wide b");
+    assert_cli_success(&run_libra_command(&["add", "."], &wide), "add wide 2");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c2", "--no-verify"], &wide),
+        "commit wide c2",
+    );
+    let dirstat = {
+        let result = run_libra_command(&["log", "--dirstat", "-1"], &wide);
+        assert_cli_success(&result, "log --dirstat");
+        String::from_utf8_lossy(&result.stdout).to_string()
+    };
+    assert!(dirstat.contains("  32.7% sub/"), "AC3 dirstat: {dirstat}");
+}

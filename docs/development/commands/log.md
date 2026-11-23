@@ -148,3 +148,5 @@ flowchart TD
 - 2026-11-21（LS-19 / #833 第四段）：`--cc` 组合 hunk **按上下文 3 行拆分**——`changed[]` 由「父侧缺行」与「父侧插入槽」推导，重叠区域合并；每条 `@@@` 的父侧起始偏移 = 已输出父行数 + 1；同一插入槽内**多个父提交删除同一行时合并为一行**（各父列同时标 `-`，与 Git `--24` 行为一致）。三类夹具（单冲突、同文件两处相邻冲突、相距 26 行的两处冲突）均与 `git log --cc -1` 的 `diff --cc` 段**逐字节一致**。回归：`log_test` 278/278、严格 Clippy exit 0。
 
 - 2026-11-21（LS-13 / #955）：按实测证据改判 AC 并落地回归——非 TTY 无 `\r`/`ESC[K`；PTY 输出 = 管道输出 + ONLCR（用例内以 `env!("CARGO_BIN_EXE_libra")` 绝对路径经 `script -qec` 断言，`--decorate=short` 固定装饰）；`--color=always` 保留 SGR 不新增擦除序列。
+
+- 2026-11-23（LS-20 / #964）：新增 `log --raw` 与 `log --numstat`（`commit_diff_output` 经 clap 构造 `DiffArgs` 调 `run_diff_for_service`；`render::format_diff_raw`/`format_numstat_output` 复用）；`DiffFormatPositions`/`ResolvedDiffFormats` 增加 raw/numstat，`-s`/`--no-patch` 按位置清除；`--dirstat` 与 Git 逐字一致。回归：`raw_numstat_dirstat_formats`（AC1–AC6）。

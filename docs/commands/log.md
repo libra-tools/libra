@@ -334,6 +334,20 @@ section is separated like Git, and each path/status field is NUL-terminated.
 libra log -z --name-status --format=%s
 ```
 
+### `--raw` / `--numstat`
+
+`--raw` prints Git's raw diff lines (`:<oldmode> <newmode> <oldsha> <newsha>
+<status>\t<path>`) for each commit instead of a patch, and `--numstat` prints
+`<insertions>\t<deletions>\t<path>` (renames as `{old => new}`, binaries as `-\t-`).
+Both come from the same engine as `libra diff`, so the bytes match the
+corresponding `libra diff --raw` / `--numstat`. A later `-s`/`--no-patch` clears
+them, matching Git's last-one-wins rule.
+
+```bash
+libra log --raw -1
+libra log --numstat -1
+```
+
 ### `--stat`
 
 Show diffstat (file change statistics) for each commit, showing insertions and deletions

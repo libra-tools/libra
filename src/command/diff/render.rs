@@ -479,7 +479,7 @@ pub(super) fn diff_status_code(file: &DiffFileStat) -> char {
     'M'
 }
 
-pub(super) fn format_diff_raw(result: &DiffOutput, null: bool, full_ids: bool) -> String {
+pub(crate) fn format_diff_raw(result: &DiffOutput, null: bool, full_ids: bool) -> String {
     let mut output = String::new();
     for file in &result.files {
         let status = diff_status_code(file);

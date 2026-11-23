@@ -249,6 +249,15 @@ Git 规则分隔，每个路径/状态字段均以 NUL 终止。
 libra log -z --name-status --format=%s
 ```
 
+### `--raw` / `--numstat`
+
+`--raw` 输出 Git 的原始 diff 行（`:<oldmode> <newmode> <oldsha> <newsha> <status>\t<路径>`），`--numstat` 输出 `<插入>\t<删除>\t<路径>`（重命名显示为 `{old => new}`，二进制为 `-\t-`）。两者与 `libra diff --raw`/`--numstat` 同引擎、字节一致；后出现的 `-s`/`--no-patch` 会清除它们（与 Git 的后者胜出一致）。
+
+```bash
+libra log --raw -1
+libra log --numstat -1
+```
+
 ### `--stat`
 
 显示每个提交的 diffstat（文件变更统计），展示每个文件的插入和删除。变更列宽按本块最宽计数对齐，汇总行省略为零的插入/删除子句，因此字节与 `git log --stat` 一致。

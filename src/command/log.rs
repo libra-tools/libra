@@ -154,6 +154,8 @@ pub(crate) struct DiffFormatPositions {
     patch_with_stat: Option<usize>,
     name_only: Option<usize>,
     name_status: Option<usize>,
+    raw: Option<usize>,
+    numstat: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -165,6 +167,8 @@ struct ResolvedDiffFormats {
     patch_with_stat: bool,
     name_only: bool,
     name_status: bool,
+    raw: bool,
+    numstat: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -316,6 +320,12 @@ pub struct LogArgs {
     #[clap(long = "dirstat-by-file", value_name = "PARAM", num_args = 0..=1, default_missing_value = "", require_equals = true)]
     pub dirstat_by_file: Option<String>,
 
+    /// Show raw diff lines (`:<oldmode> <newmode> <oldsha> <newsha> <status>\t<path>`)
+    #[clap(long = "raw")]
+    pub raw: bool,
+    /// Show numstat lines (`<insertions>\t<deletions>\t<path>`)
+    #[clap(long = "numstat")]
+    pub numstat: bool,
     /// Show the diffstat block followed by the full patch for each commit
     /// (Git's synonym for `-p --stat`).
     #[clap(long = "patch-with-stat", overrides_with = "patch_with_stat")]
@@ -2920,6 +2930,8 @@ pub(crate) fn diff_format_positions(matches: &ArgMatches) -> DiffFormatPositions
         patch_with_stat: last_command_line_position(matches, "patch_with_stat"),
         name_only: last_command_line_position(matches, "name_only"),
         name_status: last_command_line_position(matches, "name_status"),
+        raw: last_command_line_position(matches, "raw"),
+        numstat: last_command_line_position(matches, "numstat"),
     }
 }
 
@@ -2938,7 +2950,10 @@ fn resolve_diff_formats(positions: DiffFormatPositions) -> ResolvedDiffFormats {
     let patch_with_stat = after_last_no_patch(positions.patch_with_stat, positions.no_patch);
     let name_only = after_last_no_patch(positions.name_only, positions.no_patch);
     let name_status = after_last_no_patch(positions.name_status, positions.no_patch);
-    let no_patch = positions.no_patch.is_some() && !(patch || stat || shortstat || patch_with_stat);
+    let raw = after_last_no_patch(positions.raw, positions.no_patch);
+    let numstat = after_last_no_patch(positions.numstat, positions.no_patch);
+    let no_patch = positions.no_patch.is_some()
+        && !(patch || stat || shortstat || patch_with_stat || raw || numstat);
 
     ResolvedDiffFormats {
         patch,
@@ -2948,6 +2963,8 @@ fn resolve_diff_formats(positions: DiffFormatPositions) -> ResolvedDiffFormats {
         patch_with_stat,
         name_only,
         name_status,
+        raw,
+        numstat,
     }
 }
 
@@ -2960,6 +2977,8 @@ fn legacy_diff_formats(args: &LogArgs) -> ResolvedDiffFormats {
         patch_with_stat: args.patch_with_stat,
         name_only: args.name_only,
         name_status: args.name_status,
+        raw: args.raw,
+        numstat: args.numstat,
     }
 }
 
@@ -3569,7 +3588,23 @@ async fn execute_safe_with_diff_formats(
             }
         }
 
-        if name_only || name_status {
+        if diff_formats.raw || diff_formats.numstat {
+            // `--raw`/`--numstat` print one record per commit, before any patch.
+            if let Some(output) = commit_diff_output(&commit).await? {
+                let block = if diff_formats.raw {
+                    crate::command::diff::render::format_diff_raw(&output, false, false)
+                } else {
+                    crate::command::diff::render::format_numstat_output(&output, false)
+                };
+                if !block.is_empty() {
+                    if !message.ends_with('\n') {
+                        message.push('\n');
+                    }
+                    message.push_str(block.trim_end_matches('\n'));
+                    message.push('\n');
+                }
+            }
+        } else if name_only || name_status {
             let changes = cached_changes.take().unwrap_or_default();
             append_changed_paths(&mut message, &changes, name_status, args.null);
         } else if let Some(param) = &args.dirstat {
@@ -5958,6 +5993,25 @@ async fn generate_cc_diff(commit: &Commit, paths: &[PathBuf]) -> CliResult<Strin
         output.push_str(&body);
     }
     Ok(output)
+}
+
+/// Build the diff-engine output for a commit against its first parent.
+async fn commit_diff_output(
+    commit: &Commit,
+) -> Result<Option<crate::command::diff::DiffOutput>, CliError> {
+    let Some(parent) = commit.parent_commit_ids.first() else {
+        return Ok(None);
+    };
+    let argv = vec![
+        "diff".to_string(),
+        parent.to_string(),
+        commit.id.to_string(),
+    ];
+    let args = crate::command::diff::DiffArgs::try_parse_from(&argv)
+        .map_err(|error| CliError::command_usage(error.to_string()))?;
+    Ok(Some(
+        crate::command::diff::run_diff_for_service(args).await?,
+    ))
 }
 
 pub(crate) async fn generate_diff(
