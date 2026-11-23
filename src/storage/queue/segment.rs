@@ -640,15 +640,19 @@ enum Phase1Plan<T> {
         stale_tmp_names: Vec<T>,
         reclaimed_orphans: Vec<u32>,
     },
-    /// Case C (clean synced tail): `max_live_seg == active_seg`,
+    /// Case C (same-segment uncommitted tail): `max_live_seg == active_seg`,
     /// `actual_len > committed_len`, `[0, committed_len)` prefix CRC32C
-    /// verified, and every byte in `[committed_len, actual_len)` decoded into
-    /// complete dual-CRC32C valid frames (`ADR-RB-05` #3, `RB-08` AC5–AC6).
-    CaseCRecoverCleanTail {
+    /// verified; `[committed_len, recovered_valid_end)` decodes `recovered_frames`
+    /// complete dual-CRC32C valid frames, and if `has_damaged_tail` is `true`,
+    /// `[recovered_valid_end, actual_len)` contains uncommitted damaged/truncated
+    /// tail bytes requiring Step C1 durable quarantine + truncate + `sync_data()`
+    /// before committing `LTM2` (`ADR-RB-05` #3 Case C Step C1, `RB-08`, `RB-08m`).
+    CaseCRecoverTail {
         meta: LaneTailMeta,
         recovered_valid_end: u64,
         recovered_crc32c: u32,
         recovered_frames: usize,
+        has_damaged_tail: bool,
         stale_tmp_names: Vec<T>,
         reclaimed_orphans: Vec<u32>,
     },
@@ -1304,18 +1308,22 @@ struct CaseCTailScan {
     valid_end: u64,
     recovered_crc32c: u32,
     frame_count: usize,
+    has_damaged_tail: bool,
 }
 
-/// Forward-scan `[committed_len, actual_len)` on `file` (already positioned at
-/// `committed_len` after [`verify_committed_prefix_crc`]) to verify all
-/// complete dual-CRC32C frames written after a crash (`ADR-RB-05` #3 Case C).
-fn scan_case_c_clean_uncommitted_tail(
+/// Read-only forward-scan `[committed_len, actual_len)` on `file` (after
+/// [`verify_committed_prefix_crc`]) to recover all complete dual-CRC32C frames
+/// written after a crash and detect any trailing damaged/truncated half-frame
+/// bytes `[valid_end, actual_len)` (`ADR-RB-05` #3 Case C, `RB-08`, `RB-08m`).
+fn scan_case_c_uncommitted_tail(
     file: &mut File,
     committed_len: u64,
     actual_len: u64,
     prefix_crc32c: u32,
 ) -> StorageResult<CaseCTailScan> {
     debug_assert!(actual_len > committed_len);
+    file.seek(SeekFrom::Start(committed_len))
+        .map_err(|e| StorageBackendError::io("seek active segment for Case C tail scan", e))?;
     let mut decoder = FrameStreamDecoder::with_known_len(&mut *file, committed_len, actual_len);
     let mut valid_end = committed_len;
     let mut frame_count = 0usize;
@@ -1359,14 +1367,7 @@ fn scan_case_c_clean_uncommitted_tail(
         }
     }
 
-    if damaged_tail || valid_end < actual_len {
-        return Err(StorageBackendError::BackendInternal {
-            detail:
-                "capture queue active segment has damaged uncommitted tail requiring durable quarantine recovery"
-                    .to_string(),
-        });
-    }
-
+    let has_damaged_tail = damaged_tail || valid_end < actual_len;
     let delta = valid_end.checked_sub(committed_len).ok_or_else(|| {
         StorageBackendError::BackendInternal {
             detail: "case C valid_end regressed below committed_len".to_string(),
@@ -1379,6 +1380,7 @@ fn scan_case_c_clean_uncommitted_tail(
         valid_end,
         recovered_crc32c,
         frame_count,
+        has_damaged_tail,
     })
 }
 
@@ -2733,17 +2735,18 @@ mod unix_seg {
                 reclaimed_orphans,
             })
         } else {
-            let tail = scan_case_c_clean_uncommitted_tail(
+            let tail = scan_case_c_uncommitted_tail(
                 &mut ro_seg,
                 meta.committed_len,
                 actual_len,
                 meta.prefix_crc32c,
             )?;
-            Ok(Phase1Plan::CaseCRecoverCleanTail {
+            Ok(Phase1Plan::CaseCRecoverTail {
                 meta,
                 recovered_valid_end: tail.valid_end,
                 recovered_crc32c: tail.recovered_crc32c,
                 recovered_frames: tail.frame_count,
+                has_damaged_tail: tail.has_damaged_tail,
                 stale_tmp_names: scan.stale_tmp_names,
                 reclaimed_orphans,
             })
@@ -3085,6 +3088,83 @@ mod unix_seg {
         append_lock: &'a AppendLockGuard,
     }
 
+    struct CaseCStepC1Outcome {
+        meta: LaneTailMeta,
+        recovered_bytes: u64,
+        quarantined_artifact: Option<QuarantinePublishReport>,
+    }
+
+    /// Shared `ADR-RB-05` #3 Case C Step C1 production routine (`RB-08m`):
+    /// - If `has_damaged_tail` is `true`, calls `RB-08t::quarantine_and_truncate_segment_at_fds`
+    ///   to durably publish `[recovered_valid_end, actual_len)` to `quarantine/`
+    ///   (`.tmp -> sync_data -> rename(.bin) -> fsync_dir(quarantine_dir)`,
+    ///   recording `LBR-AGENT-050`) strictly BEFORE truncating
+    ///   `events-<S>.log` to exact `recovered_valid_end` and calling `sync_data()`.
+    /// - Atomically commits dual-replica `LTM2` (`tail.meta` + `tail.meta.bak`)
+    ///   updating `COMMITTED_LEN = recovered_valid_end` and
+    ///   `PREFIX_CRC32C = recovered_crc32c` while preserving `ACTIVE_SEG == S`
+    ///   and `sealed[]` unchanged before any `S + 1` file is created.
+    fn case_c_step_c1_unix(
+        ctx: &UnixPhase2Context<'_>,
+        meta: LaneTailMeta,
+        recovered_valid_end: u64,
+        recovered_crc32c: u32,
+        recovered_frames: usize,
+        has_damaged_tail: bool,
+        observer: &mut SegmentObserver,
+    ) -> StorageResult<CaseCStepC1Outcome> {
+        let lane_fd = ctx.lane_fd;
+        let lane_label = lane_dir_name(ctx.lane);
+        let expected_uid = lane_expected_uid(ctx.owners, ctx.lane);
+
+        let recovered_bytes = recovered_valid_end
+            .checked_sub(meta.committed_len)
+            .ok_or_else(|| StorageBackendError::BackendInternal {
+                detail: "case C recovered length underflow".to_string(),
+            })?;
+
+        let quarantined_artifact = if has_damaged_tail {
+            let q_dirs = UnixQuarantineDirs {
+                quarantine_fd: ctx.quarantine_fd,
+                quarantine_dir: ctx.quarantine_dir,
+                lane_fd,
+                owners: ctx.owners,
+                append_lock: ctx.append_lock,
+            };
+            Some(quarantine_and_truncate_segment_at_fds(
+                &q_dirs,
+                ctx.lane,
+                meta.active_seg,
+                recovered_valid_end,
+                observer,
+            )?)
+        } else {
+            None
+        };
+
+        observer.record_case_c_recover(
+            lane_label,
+            meta.active_seg,
+            meta.committed_len,
+            recovered_valid_end,
+            recovered_frames,
+        );
+        let next_meta = LaneTailMeta {
+            min_live_seg: meta.min_live_seg,
+            active_seg: meta.active_seg,
+            committed_len: recovered_valid_end,
+            prefix_crc32c: recovered_crc32c,
+            sealed: meta.sealed,
+        };
+        commit_dual_tail_meta_unix(lane_fd, lane_label, &next_meta, expected_uid, observer)?;
+
+        Ok(CaseCStepC1Outcome {
+            meta: next_meta,
+            recovered_bytes,
+            quarantined_artifact,
+        })
+    }
+
     fn phase2_execute_plan_unix(
         ctx: &UnixPhase2Context<'_>,
         plan: Phase1Plan<OsString>,
@@ -3170,11 +3250,12 @@ mod unix_seg {
                         || reclaimed_orphans_removed > 0,
                 })
             }
-            Phase1Plan::CaseCRecoverCleanTail {
+            Phase1Plan::CaseCRecoverTail {
                 meta,
                 recovered_valid_end,
                 recovered_crc32c,
                 recovered_frames,
+                has_damaged_tail,
                 stale_tmp_names,
                 reclaimed_orphans,
             } => {
@@ -3182,41 +3263,25 @@ mod unix_seg {
                     clean_stale_tmp_files_unix(lane_fd, &stale_tmp_names, expected_uid)?;
                 let reclaimed_orphans_removed =
                     clean_reclaimed_orphans_unix(lane_fd, &reclaimed_orphans, expected_uid)?;
-                let recovered_bytes = recovered_valid_end
-                    .checked_sub(meta.committed_len)
-                    .ok_or_else(|| StorageBackendError::BackendInternal {
-                        detail: "case C recovered length underflow".to_string(),
-                    })?;
-                observer.record_case_c_recover(
-                    lane_label,
-                    meta.active_seg,
-                    meta.committed_len,
+                let step_c1 = case_c_step_c1_unix(
+                    ctx,
+                    meta,
                     recovered_valid_end,
+                    recovered_crc32c,
                     recovered_frames,
-                );
-                let next_meta = LaneTailMeta {
-                    min_live_seg: meta.min_live_seg,
-                    active_seg: meta.active_seg,
-                    committed_len: recovered_valid_end,
-                    prefix_crc32c: recovered_crc32c,
-                    sealed: meta.sealed,
-                };
-                commit_dual_tail_meta_unix(
-                    lane_fd,
-                    lane_label,
-                    &next_meta,
-                    expected_uid,
+                    has_damaged_tail,
                     observer,
                 )?;
+                let quarantined_artifacts = step_c1.quarantined_artifact.into_iter().collect();
                 Ok(Phase2ConvergedState {
-                    meta: next_meta,
+                    meta: step_c1.meta,
                     active_seg_exists: true,
                     recovered_frames,
-                    recovered_bytes,
+                    recovered_bytes: step_c1.recovered_bytes,
                     mirrored_replica: true,
                     cleaned_tmp_files,
                     reclaimed_orphans_removed,
-                    quarantined_artifacts: Vec::new(),
+                    quarantined_artifacts,
                     lane_dir_synced: true,
                 })
             }
@@ -4136,10 +4201,11 @@ mod unix_seg {
         seg_file
             .set_len(valid_end)
             .map_err(|e| StorageBackendError::io("truncate capture queue segment", e))?;
+        observer.record_segment_truncate_complete(lane_label, seg_id, valid_end);
         seg_file
             .sync_data()
             .map_err(|e| StorageBackendError::io("sync truncated capture queue segment", e))?;
-        observer.record_segment_truncate_complete(lane_label, seg_id, valid_end);
+        observer.record_segment_sync_data(lane_label, seg_id);
         drop(seg_file);
 
         Ok(report)
@@ -5612,18 +5678,19 @@ mod non_unix_seg {
                     }),
                 ))
             } else {
-                let tail = scan_case_c_clean_uncommitted_tail(
+                let tail = scan_case_c_uncommitted_tail(
                     &mut seg_file,
                     meta.committed_len,
                     actual_len,
                     meta.prefix_crc32c,
                 )?;
                 Ok((
-                    Phase1Plan::CaseCRecoverCleanTail {
+                    Phase1Plan::CaseCRecoverTail {
                         meta,
                         recovered_valid_end: tail.valid_end,
                         recovered_crc32c: tail.recovered_crc32c,
                         recovered_frames: tail.frame_count,
+                        has_damaged_tail: tail.has_damaged_tail,
                         stale_tmp_names,
                         reclaimed_orphans,
                     },
@@ -5841,6 +5908,67 @@ mod non_unix_seg {
             lane_dir_synced: bool,
         }
 
+        struct WindowsCaseCStepC1Outcome {
+            meta: LaneTailMeta,
+            recovered_bytes: u64,
+            quarantined_artifact: Option<QuarantinePublishReport>,
+        }
+
+        /// Shared Windows `ADR-RB-05` #3 Case C Step C1 production routine (`RB-08m`).
+        fn case_c_step_c1_windows(
+            ctx: &WindowsPhase2Context<'_>,
+            meta: LaneTailMeta,
+            recovered_valid_end: u64,
+            recovered_crc32c: u32,
+            recovered_frames: usize,
+            has_damaged_tail: bool,
+            observer: &mut SegmentObserver,
+        ) -> StorageResult<WindowsCaseCStepC1Outcome> {
+            let lane_dir = ctx.lane_dir;
+            let lane_label = lane_dir_name(ctx.lane);
+            let recovered_bytes = recovered_valid_end
+                .checked_sub(meta.committed_len)
+                .ok_or_else(|| StorageBackendError::BackendInternal {
+                    detail: "case C recovered length underflow".to_string(),
+                })?;
+
+            let quarantined_artifact = if has_damaged_tail {
+                Some(quarantine_and_truncate_segment_windows_locked(
+                    ctx.quarantine_dir,
+                    lane_dir,
+                    ctx.lane,
+                    meta.active_seg,
+                    recovered_valid_end,
+                    ctx.append_lock,
+                    observer,
+                )?)
+            } else {
+                None
+            };
+
+            observer.record_case_c_recover(
+                lane_label,
+                meta.active_seg,
+                meta.committed_len,
+                recovered_valid_end,
+                recovered_frames,
+            );
+            let next_meta = LaneTailMeta {
+                min_live_seg: meta.min_live_seg,
+                active_seg: meta.active_seg,
+                committed_len: recovered_valid_end,
+                prefix_crc32c: recovered_crc32c,
+                sealed: meta.sealed,
+            };
+            commit_dual_tail_meta_windows(lane_dir, lane_label, &next_meta, observer)?;
+
+            Ok(WindowsCaseCStepC1Outcome {
+                meta: next_meta,
+                recovered_bytes,
+                quarantined_artifact,
+            })
+        }
+
         fn phase2_execute_plan_windows(
             ctx: &WindowsPhase2Context<'_>,
             plan: Phase1Plan<String>,
@@ -5994,45 +6122,36 @@ mod non_unix_seg {
                         lane_dir_synced: mirrored || cleaned > 0 || orphans > 0,
                     })
                 }
-                Phase1Plan::CaseCRecoverCleanTail {
+                Phase1Plan::CaseCRecoverTail {
                     meta,
                     recovered_valid_end,
                     recovered_crc32c,
                     recovered_frames,
+                    has_damaged_tail,
                     stale_tmp_names,
                     reclaimed_orphans,
                 } => {
                     let cleaned = clean_tmp(&stale_tmp_names)?;
                     let orphans = clean_orphans(&reclaimed_orphans)?;
-                    let recovered_bytes = recovered_valid_end
-                        .checked_sub(meta.committed_len)
-                        .ok_or_else(|| StorageBackendError::BackendInternal {
-                            detail: "case C recovered length underflow".to_string(),
-                        })?;
-                    observer.record_case_c_recover(
-                        lane_label,
-                        meta.active_seg,
-                        meta.committed_len,
+                    let step_c1 = case_c_step_c1_windows(
+                        ctx,
+                        meta,
                         recovered_valid_end,
+                        recovered_crc32c,
                         recovered_frames,
-                    );
-                    let next_meta = LaneTailMeta {
-                        min_live_seg: meta.min_live_seg,
-                        active_seg: meta.active_seg,
-                        committed_len: recovered_valid_end,
-                        prefix_crc32c: recovered_crc32c,
-                        sealed: meta.sealed,
-                    };
-                    commit_dual_tail_meta_windows(lane_dir, lane_label, &next_meta, observer)?;
+                        has_damaged_tail,
+                        observer,
+                    )?;
+                    let quarantined_artifacts = step_c1.quarantined_artifact.into_iter().collect();
                     Ok(WindowsPhase2ConvergedState {
-                        meta: next_meta,
+                        meta: step_c1.meta,
                         active_seg_exists: true,
                         recovered_frames,
-                        recovered_bytes,
+                        recovered_bytes: step_c1.recovered_bytes,
                         mirrored_replica: true,
                         cleaned_tmp_files: cleaned,
                         reclaimed_orphans_removed: orphans,
-                        quarantined_artifacts: Vec::new(),
+                        quarantined_artifacts,
                         lane_dir_synced: true,
                     })
                 }
@@ -6390,10 +6509,11 @@ mod non_unix_seg {
             seg_file
                 .set_len(valid_end)
                 .map_err(|e| StorageBackendError::io("truncate capture queue segment", e))?;
+            observer.record_segment_truncate_complete(lane_label, seg_id, valid_end);
             seg_file
                 .sync_data()
                 .map_err(|e| StorageBackendError::io("sync truncated capture queue segment", e))?;
-            observer.record_segment_truncate_complete(lane_label, seg_id, valid_end);
+            observer.record_segment_sync_data(lane_label, seg_id);
             Ok(report)
         }
 
@@ -8710,8 +8830,6 @@ mod tests {
         )
         .expect_err("crash after fsync_dir before truncate must fail");
         assert_eq!(err_after_fsync_trunc.stable_code_str(), "LBR-IO-001");
-        #[cfg(unix)]
-        let trunc_bin_ino_before_reopen = inode_key(&trunc_bin_path);
         assert_eq!(
             fs::read(&trunc_bin_path).expect("AC8: read persisted truncate .bin"),
             damaged_tail
@@ -8748,18 +8866,26 @@ mod tests {
         );
 
         // Reopen BOTH lanes BEFORE any manual replay:
-        // - Normal (untrimmed Case C tail, prior to RB-08m) fails closed while keeping
-        //   both `ac8_direct_bin` and `trunc_bin_path` untouched (exact original inode + bytes).
+        // - Normal (`RB-08m` Case C Step C1) automatically completes idempotent
+        //   durable quarantine + truncate + `sync_data()` + dual-replica `LTM2`
+        //   commit to `valid_end` without duplicating `.bin` or touching `ac8_direct_bin`.
         // - Priority (`RB-08f` Case D half-frame orphan recovery) automatically completes
-        //   idempotent orphan quarantine + unlink + dual-replica sync to `out_p1.meta`!
-        let pre_replay_reopen_err = recover_lane(repo.path(), CaptureQueueLane::Normal)
-            .expect_err("AC8: pre-replay recover_lane on untrimmed half-frame fails closed");
-        assert!(
-            matches!(
-                pre_replay_reopen_err,
-                StorageBackendError::BackendInternal { .. }
-            ),
-            "expected BackendInternal before RB-08m, got {pre_replay_reopen_err:?}"
+        //   idempotent orphan quarantine + unlink + dual-replica sync to `out_p1.meta`.
+        let pre_replay_normal_rec = recover_lane(repo.path(), CaptureQueueLane::Normal)
+            .expect("AC8: reopening Normal lane completes RB-08m Step C1 recovery cleanly");
+        assert_eq!(pre_replay_normal_rec.meta.committed_len, valid_end);
+        assert_eq!(pre_replay_normal_rec.quarantined_artifacts.len(), 1);
+        assert_eq!(
+            pre_replay_normal_rec.quarantined_artifacts[0].id,
+            expected_trunc_id
+        );
+        assert_eq!(
+            pre_replay_normal_rec.quarantined_artifacts[0].diagnostic_code,
+            QUARANTINE_DIAGNOSTIC_CODE
+        );
+        assert_eq!(
+            fs::read(&seg0_path).expect("seg0 truncated during Normal lane reopen"),
+            expected_n1_n2
         );
         let pre_replay_priority_rec = recover_lane(repo.path(), CaptureQueueLane::Priority)
             .expect("AC8: reopening Priority lane completes RB-08f orphan recovery cleanly");
@@ -8774,22 +8900,15 @@ mod tests {
             "orphan seg1 unlinked during Priority lane reopen"
         );
 
-        // Verify `ac8_direct_bin` and `trunc_bin_path` kept their exact original
-        // inode and bytes across BOTH lane reopens, and `orphan_bin_path` holds
-        // exact `damaged_orphan` bytes.
+        // Verify `ac8_direct_bin` kept its exact original inode and bytes across
+        // BOTH lane reopens, and both `trunc_bin_path` and `orphan_bin_path`
+        // persist exact damaged bytes with zero duplicates.
         #[cfg(unix)]
-        {
-            assert_eq!(
-                inode_key(&ac8_direct_bin),
-                ac8_direct_ino_before_reopen,
-                "AC8: direct .bin inode must survive both pre-replay lane reopens unchanged"
-            );
-            assert_eq!(
-                inode_key(&trunc_bin_path),
-                trunc_bin_ino_before_reopen,
-                "AC8: truncate .bin inode must survive both pre-replay lane reopens unchanged"
-            );
-        }
+        assert_eq!(
+            inode_key(&ac8_direct_bin),
+            ac8_direct_ino_before_reopen,
+            "AC8: direct .bin inode must survive both pre-replay lane reopens unchanged"
+        );
         assert_eq!(
             fs::read(&ac8_direct_bin)
                 .expect("AC8: direct .bin bytes after both pre-replay reopens"),
@@ -8815,7 +8934,30 @@ mod tests {
             out_p1.meta.committed_len
         );
 
-        // Idempotent replay completes the interrupted Normal truncate without losing `.bin`.
+        // Direct idempotent replay of `quarantine_and_truncate_segment` after an
+        // `AfterQuarantineDirFsyncBeforeDestructive` crash on a fresh damaged tail.
+        let replay_tail_bytes = b"LCE1\x29\x00\x00\x00direct-replay-tail";
+        {
+            let mut f = fs::OpenOptions::new()
+                .append(true)
+                .open(&seg0_path)
+                .expect("append direct replay tail");
+            f.write_all(replay_tail_bytes)
+                .expect("write direct replay tail");
+            f.sync_data().expect("sync direct replay tail");
+        }
+        let mut crash_replay_trunc = SegmentObserver::with_crash(
+            SegmentCrashPoint::AfterQuarantineDirFsyncBeforeDestructive,
+        );
+        let _ = quarantine_and_truncate_segment_inner(
+            quarantine_dir,
+            normal_dir,
+            CaptureQueueLane::Normal,
+            0,
+            valid_end,
+            &mut crash_replay_trunc,
+        )
+        .expect_err("crash after fsync_dir before direct truncate replay must fail");
         let replay_trunc = quarantine_and_truncate_segment(
             quarantine_dir,
             normal_dir,
@@ -8824,10 +8966,13 @@ mod tests {
             valid_end,
         )
         .expect("idempotent replay of quarantine_and_truncate_segment must succeed");
-        assert_eq!(replay_trunc.id, expected_trunc_id);
         assert_eq!(
-            fs::read(&trunc_bin_path).expect("replayed truncate .bin"),
-            damaged_tail
+            replay_trunc.id,
+            quarantine_artifact_id(CaptureQueueLane::Normal, 0, valid_end, replay_tail_bytes)
+        );
+        assert_eq!(
+            fs::read(&replay_trunc.bin_path).expect("replayed truncate .bin"),
+            replay_tail_bytes
         );
         assert_eq!(
             fs::read(&seg0_path).expect("truncated seg0"),
@@ -12036,5 +12181,456 @@ mod tests {
             assert_eq!(rec3.meta.active_seg, 0);
             assert!(!seg1_path3.exists());
         }
+    }
+
+    /// `RB-08m` AC1–AC8:
+    /// - AC1: On valid `LTM2` with verified `[0, committed_len)` prefix and a
+    ///   trailing truncated half-frame, Step C1 invokes `RB-08t`
+    ///   `quarantine_and_truncate_segment` -> `publish_quarantine_durable` to
+    ///   durably persist `[recovered_valid_end, actual_len)` into `quarantine/`.
+    /// - AC2: Quarantined tail records exact diagnostic code `LBR-AGENT-050`.
+    /// - AC3: Strictly AFTER `fsync_dir(quarantine_dir)`, `events-<S>.log` is
+    ///   truncated in-place to exact `recovered_valid_end`.
+    /// - AC4: Immediately after truncation, `events-<S>.log` executes `sync_data()`.
+    /// - AC5: Strictly BEFORE creating any `S + 1` file (zero `S + 1` created
+    ///   in Step C1), dual-replica `LTM2` commits `COMMITTED_LEN = recovered_valid_end`.
+    /// - AC6: Same Step C1 dual-replica `LTM2` commit sets `PREFIX_CRC32C` equal
+    ///   to `crc32c(events-<S>.log[0..recovered_valid_end])`.
+    /// - AC7: All pre-crash committed prefix frames `[0, old_committed_len)`
+    ///   decode 100% losslessly from segment `S`.
+    /// - AC8: All recovered complete synced tail frames
+    ///   `[old_committed_len, recovered_valid_end)` decode 100% losslessly from `S`.
+    #[test]
+    fn case_c_step_c1_quarantines_truncates_syncs_commits_ltm2_and_preserves_s() {
+        // ------------------------------------------------------------------
+        // Part 1 — `recover_lane` Step C1 with prefix frames + synced tail
+        // frames (including >64 KiB streaming payload) + truncated half-frame
+        // ------------------------------------------------------------------
+        let repo = tempdir().expect("rb08m tempdir");
+        let init = init_capture_queue(repo.path()).expect("init capture queue");
+
+        let p1_payload = b"prefix-committed-frame-1".to_vec();
+        let p2_payload = b"prefix-committed-frame-2-longer-body".to_vec();
+        let out_p1 = append_frame(
+            repo.path(),
+            CaptureQueueLane::Normal,
+            FRAME_FLAG_NONE,
+            "rb08m-p1",
+            &p1_payload,
+        )
+        .expect("append prefix frame 1");
+        let out_p2 = append_frame(
+            repo.path(),
+            CaptureQueueLane::Normal,
+            FRAME_FLAG_NONE,
+            "rb08m-p2",
+            &p2_payload,
+        )
+        .expect("append prefix frame 2");
+        let old_committed_len = out_p2.meta.committed_len;
+        let old_prefix_crc = out_p2.meta.prefix_crc32c;
+        assert_eq!(
+            old_committed_len,
+            (out_p1.frame_len + out_p2.frame_len) as u64
+        );
+
+        // Append 2 complete synced uncommitted tail frames (T1 small, T2 >64 KiB
+        // to exercise multi-chunk streaming CRC32C) + genuine truncated
+        // `encode_frame` half-frame H (`TruncatedTail`) directly to seg 0.
+        let t1_payload = b"synced-uncommitted-tail-frame-1".to_vec();
+        let t2_payload = vec![b'T'; 80 * 1024];
+        let t1_bytes = encode_frame(FRAME_FLAG_NONE, "rb08m-t1", &t1_payload).unwrap();
+        let t2_bytes = encode_frame(FRAME_FLAG_NONE, "rb08m-t2-80k", &t2_payload).unwrap();
+        let full_h = encode_frame(FRAME_FLAG_NONE, "rb08m-half-frame", &vec![b'H'; 4096]).unwrap();
+        let half_frame_tail = full_h[..full_h.len() / 2].to_vec();
+
+        let seg0_path = init.paths.normal.join(segment_log_file_name(0));
+        {
+            let mut f = fs::OpenOptions::new()
+                .append(true)
+                .open(&seg0_path)
+                .expect("open seg0 for Case C injection");
+            f.write_all(&t1_bytes).unwrap();
+            f.write_all(&t2_bytes).unwrap();
+            f.write_all(&half_frame_tail).unwrap();
+            f.sync_data().unwrap();
+        }
+        let recovered_valid_end = old_committed_len + t1_bytes.len() as u64 + t2_bytes.len() as u64;
+        let expected_recovered_crc =
+            crc32c_append(crc32c_append(old_prefix_crc, &t1_bytes), &t2_bytes);
+        let expected_q_id = quarantine_artifact_id(
+            CaptureQueueLane::Normal,
+            0,
+            recovered_valid_end,
+            &half_frame_tail,
+        );
+        let expected_q_bin = init.paths.quarantine.join(format!("{expected_q_id}.bin"));
+
+        let mut obs = SegmentObserver::new();
+        let rec = recover_lane_in_storage_dir(repo.path(), CaptureQueueLane::Normal, &mut obs)
+            .expect("Step C1 recover_lane must succeed");
+
+        // AC1 + AC2: Durable quarantine artifact with exact bytes & `LBR-AGENT-050`.
+        assert_eq!(rec.quarantined_artifacts.len(), 1);
+        let q_rep = &rec.quarantined_artifacts[0];
+        assert_eq!(q_rep.id, expected_q_id);
+        assert_eq!(q_rep.bin_path, expected_q_bin);
+        assert_eq!(q_rep.quarantined_bytes, half_frame_tail.len() as u64);
+        assert_eq!(q_rep.crc32c, crc32c_checksum(&half_frame_tail));
+        assert_eq!(
+            q_rep.diagnostic_code, "LBR-AGENT-050",
+            "AC2 violated: Step C1 quarantine must record LBR-AGENT-050"
+        );
+        assert_eq!(
+            fs::read(&expected_q_bin).expect("AC1: read quarantine .bin"),
+            half_frame_tail
+        );
+        assert!(
+            !init
+                .paths
+                .quarantine
+                .join(format!("{expected_q_id}.tmp"))
+                .exists()
+        );
+
+        // AC3 + AC4 + AC5 strict barrier ordering proof via SegmentObserver:
+        //   QuarantineTmpSyncDataComplete
+        //   < QuarantineRenameStart < QuarantineRenameComplete
+        //   < QuarantineFsyncDirStart < QuarantineFsyncDirComplete
+        //   < SegmentTruncateStart < SegmentTruncateComplete
+        //   < SegmentSyncData(seg 0)
+        //   < MetaTmpWriteAndSync(tail.meta) < MetaRename(tail.meta) < FsyncLaneDirAfterMeta(tail.meta)
+        //   < MetaTmpWriteAndSync(tail.meta.bak) < MetaRename(tail.meta.bak) < FsyncLaneDirAfterMeta(tail.meta.bak)
+        //   < ReleaseAppendLock
+        let pos_q_sync = obs
+            .events
+            .iter()
+            .position(|e| {
+                matches!(e, SegmentOpEvent::QuarantineTmpSyncDataComplete { id } if id == &expected_q_id)
+            })
+            .expect("quarantine tmp sync complete");
+        let pos_q_rename_done = obs
+            .events
+            .iter()
+            .position(|e| {
+                matches!(e, SegmentOpEvent::QuarantineRenameComplete { id } if id == &expected_q_id)
+            })
+            .expect("quarantine rename complete");
+        let pos_q_fsync_done = obs
+            .events
+            .iter()
+            .position(|e| {
+                matches!(e, SegmentOpEvent::QuarantineFsyncDirComplete { id } if id == &expected_q_id)
+            })
+            .expect("quarantine fsync_dir complete");
+        let pos_trunc_start = obs
+            .events
+            .iter()
+            .position(|e| {
+                *e == SegmentOpEvent::SegmentTruncateStart {
+                    lane: QUEUE_LANE_NORMAL_DIR,
+                    seg_id: 0,
+                    to_len: recovered_valid_end,
+                }
+            })
+            .expect("segment truncate start");
+        let pos_trunc_done = obs
+            .events
+            .iter()
+            .position(|e| {
+                *e == SegmentOpEvent::SegmentTruncateComplete {
+                    lane: QUEUE_LANE_NORMAL_DIR,
+                    seg_id: 0,
+                    to_len: recovered_valid_end,
+                }
+            })
+            .expect("segment truncate complete");
+        let pos_seg_sync = obs
+            .events
+            .iter()
+            .position(|e| {
+                *e == SegmentOpEvent::SegmentSyncData {
+                    lane: QUEUE_LANE_NORMAL_DIR,
+                    seg_id: 0,
+                }
+            })
+            .expect("AC4: post-truncate seg.sync_data()");
+        let pos_meta_primary_tmp = obs
+            .events
+            .iter()
+            .position(|e| {
+                *e == SegmentOpEvent::MetaTmpWriteAndSync {
+                    lane: QUEUE_LANE_NORMAL_DIR,
+                    tmp_name: QUEUE_TAIL_META_TMP_FILE,
+                    target_name: QUEUE_TAIL_META_FILE,
+                }
+            })
+            .expect("AC5: primary tail.meta commit");
+        let pos_meta_bak_fsync = obs
+            .events
+            .iter()
+            .position(|e| {
+                *e == SegmentOpEvent::FsyncLaneDirAfterMeta {
+                    lane: QUEUE_LANE_NORMAL_DIR,
+                    target_name: QUEUE_TAIL_META_BAK_FILE,
+                }
+            })
+            .expect("AC5: backup tail.meta.bak fsync_dir");
+        let pos_unlock = obs
+            .events
+            .iter()
+            .position(|e| *e == SegmentOpEvent::ReleaseAppendLock)
+            .expect("release append.lock");
+
+        assert!(pos_q_sync < pos_q_rename_done);
+        assert!(pos_q_rename_done < pos_q_fsync_done);
+        assert!(
+            pos_q_fsync_done < pos_trunc_start,
+            "AC3 violated: fsync_dir(quarantine_dir) must complete before truncate"
+        );
+        assert!(pos_trunc_start < pos_trunc_done);
+        assert!(
+            pos_trunc_done < pos_seg_sync,
+            "AC4 violated: truncate must complete before seg.sync_data()"
+        );
+        assert!(
+            pos_seg_sync < pos_meta_primary_tmp,
+            "AC5 violated: seg.sync_data() must complete before LTM2 commit"
+        );
+        assert!(pos_meta_primary_tmp < pos_meta_bak_fsync && pos_meta_bak_fsync < pos_unlock);
+        // Step C1 MUST NOT create any `S + 1` file (Step C2 is deferred to `RB-08n`).
+        assert!(
+            !obs.events
+                .iter()
+                .any(|e| matches!(e, SegmentOpEvent::CreateSegment { .. })),
+            "AC5 violated: Step C1 must commit LTM2 before any S+1 segment creation"
+        );
+        assert!(!init.paths.normal.join(segment_log_file_name(1)).exists());
+
+        // AC3 on-disk truncated length.
+        let seg0_after = fs::read(&seg0_path).expect("read truncated seg0");
+        assert_eq!(
+            seg0_after.len() as u64,
+            recovered_valid_end,
+            "AC3 violated: seg0 length must equal exact recovered_valid_end"
+        );
+
+        // AC5 + AC6 on-disk dual `LTM2` replicas.
+        let raw_meta = fs::read(tail_meta_path(&init.paths.normal)).unwrap();
+        let raw_bak = fs::read(tail_meta_bak_path(&init.paths.normal)).unwrap();
+        assert_eq!(raw_meta, raw_bak);
+        let disk_meta = LaneTailMeta::decode(&raw_meta).unwrap();
+        assert_eq!(disk_meta, rec.meta);
+        assert_eq!(disk_meta.active_seg, 0);
+        assert!(disk_meta.sealed.is_empty());
+        assert_eq!(
+            disk_meta.committed_len, recovered_valid_end,
+            "AC5 violated: LTM2.COMMITTED_LEN must equal recovered_valid_end"
+        );
+        assert_eq!(
+            disk_meta.prefix_crc32c, expected_recovered_crc,
+            "AC6 violated: LTM2.PREFIX_CRC32C must match recovered_crc32c"
+        );
+        assert_eq!(
+            crc32c_checksum(&seg0_after),
+            disk_meta.prefix_crc32c,
+            "AC6 violated: on-disk seg0 CRC32C must match LTM2.PREFIX_CRC32C"
+        );
+        assert_eq!(rec.recovered_frames, 2);
+        assert_eq!(rec.recovered_bytes, recovered_valid_end - old_committed_len);
+
+        // AC7: All prefix old frames `[0, old_committed_len)` decode 100% losslessly.
+        let prefix_decoded = decode_all_segment_bytes(&seg0_after[..old_committed_len as usize]);
+        assert_eq!(prefix_decoded.len(), 2);
+        assert_eq!(prefix_decoded[0].dedup_key, "rb08m-p1");
+        assert_eq!(prefix_decoded[0].payload, p1_payload);
+        assert_eq!(prefix_decoded[1].dedup_key, "rb08m-p2");
+        assert_eq!(prefix_decoded[1].payload, p2_payload);
+
+        // AC8: All recovered complete synced tail frames `[old_committed_len, recovered_valid_end)`
+        // decode 100% losslessly.
+        let tail_decoded = decode_all_segment_bytes(&seg0_after[old_committed_len as usize..]);
+        assert_eq!(tail_decoded.len(), 2);
+        assert_eq!(tail_decoded[0].dedup_key, "rb08m-t1");
+        assert_eq!(tail_decoded[0].payload, t1_payload);
+        assert_eq!(tail_decoded[1].dedup_key, "rb08m-t2-80k");
+        assert_eq!(tail_decoded[1].payload, t2_payload);
+
+        // ------------------------------------------------------------------
+        // Part 2a — Producer path on zero-synced-tail Case C damaged tail
+        // (`recovered_valid_end == old_committed_len < actual_len`) with
+        // observer barrier ordering check.
+        // ------------------------------------------------------------------
+        let corrupt_hdr_tail = b"BAD!\xff\xff\xff\xfftruncated-corrupt-header".to_vec();
+        {
+            let mut f = fs::OpenOptions::new()
+                .append(true)
+                .open(&seg0_path)
+                .unwrap();
+            f.write_all(&corrupt_hdr_tail).unwrap();
+            f.sync_data().unwrap();
+        }
+        let n1_payload = b"new-frame-after-step-c1".to_vec();
+        let n1_bytes = encode_frame(FRAME_FLAG_NONE, "rb08m-n1", &n1_payload).unwrap();
+        let mut app_obs = SegmentObserver::new();
+        let app_out = append_validated_frame_in_storage_dir(
+            repo.path(),
+            CaptureQueueLane::Normal,
+            &n1_bytes,
+            &mut app_obs,
+        )
+        .expect("append_frame after zero-synced-tail Step C1 must succeed");
+        assert_eq!(app_out.seg_id, 0);
+        assert_eq!(app_out.frame_offset, recovered_valid_end);
+        assert_eq!(app_out.recovered_frames, 0);
+        let q2_id = quarantine_artifact_id(
+            CaptureQueueLane::Normal,
+            0,
+            recovered_valid_end,
+            &corrupt_hdr_tail,
+        );
+        assert_eq!(
+            fs::read(init.paths.quarantine.join(format!("{q2_id}.bin"))).unwrap(),
+            corrupt_hdr_tail
+        );
+        // Verify Step C1 completed dual LTM2 BEFORE incoming frame write_all.
+        let pos_c1_bak = app_obs
+            .events
+            .iter()
+            .position(|e| {
+                *e == SegmentOpEvent::FsyncLaneDirAfterMeta {
+                    lane: QUEUE_LANE_NORMAL_DIR,
+                    target_name: QUEUE_TAIL_META_BAK_FILE,
+                }
+            })
+            .expect("Step C1 LTM2 backup commit");
+        let pos_new_write = app_obs
+            .events
+            .iter()
+            .position(|e| {
+                *e == SegmentOpEvent::SegmentWriteAll {
+                    lane: QUEUE_LANE_NORMAL_DIR,
+                    seg_id: 0,
+                    offset: recovered_valid_end,
+                    len: n1_bytes.len(),
+                }
+            })
+            .expect("incoming frame write_all");
+        assert!(pos_c1_bak < pos_new_write);
+
+        // ------------------------------------------------------------------
+        // Part 2b — Public `append_frame` producer path with NON-ZERO
+        // complete synced uncommitted tail (`old_committed_len <
+        // recovered_valid_end < actual_len`) followed by a damaged half-frame.
+        // ------------------------------------------------------------------
+        let pre_pub_committed_len = app_out.meta.committed_len;
+        let u1_payload = b"uncommitted-complete-tail-u1".to_vec();
+        let u2_payload = vec![0x6bu8; 4096];
+        let u1_bytes = encode_frame(FRAME_FLAG_NONE, "rb08m-u1", &u1_payload).unwrap();
+        let u2_bytes = encode_frame(FRAME_FLAG_NONE, "rb08m-u2", &u2_payload).unwrap();
+        let pub_half_src = encode_frame(
+            FRAME_FLAG_NONE,
+            "rb08m-pub-half",
+            b"half-frame-before-public-append-frame",
+        )
+        .unwrap();
+        let pub_half_tail = pub_half_src[..pub_half_src.len() - 9].to_vec();
+        {
+            let mut f = fs::OpenOptions::new()
+                .append(true)
+                .open(&seg0_path)
+                .unwrap();
+            f.write_all(&u1_bytes).unwrap();
+            f.write_all(&u2_bytes).unwrap();
+            f.write_all(&pub_half_tail).unwrap();
+            f.sync_data().unwrap();
+        }
+        let expected_pub_recovered_end =
+            pre_pub_committed_len + (u1_bytes.len() + u2_bytes.len()) as u64;
+        let pub_payload = b"public-append-frame-after-nonzero-synced-tail-c1".to_vec();
+        let pub_encoded = encode_frame(FRAME_FLAG_NONE, "rb08m-pub-n2", &pub_payload).unwrap();
+        let pub_out = append_frame(
+            repo.path(),
+            CaptureQueueLane::Normal,
+            FRAME_FLAG_NONE,
+            "rb08m-pub-n2",
+            &pub_payload,
+        )
+        .expect("public append_frame after non-zero synced-tail Step C1 must succeed");
+        assert_eq!(pub_out.seg_id, 0);
+        assert_eq!(pub_out.frame_offset, expected_pub_recovered_end);
+        assert_eq!(pub_out.frame_len, pub_encoded.len());
+        assert_eq!(pub_out.recovered_frames, 2);
+        assert_eq!(pub_out.meta.active_seg, 0);
+        assert!(pub_out.meta.sealed.is_empty());
+        assert_eq!(
+            pub_out.meta.committed_len,
+            expected_pub_recovered_end + pub_encoded.len() as u64
+        );
+        assert!(
+            !init.paths.normal.join(segment_log_file_name(1)).exists(),
+            "public append_frame Step C1 must NOT create S+1"
+        );
+        let q3_id = quarantine_artifact_id(
+            CaptureQueueLane::Normal,
+            0,
+            expected_pub_recovered_end,
+            &pub_half_tail,
+        );
+        assert!(
+            !init.paths.quarantine.join(format!("{q3_id}.tmp")).exists(),
+            "quarantine temp file must be atomically renamed to .bin"
+        );
+        assert_eq!(
+            fs::read(init.paths.quarantine.join(format!("{q3_id}.bin"))).unwrap(),
+            pub_half_tail
+        );
+        let seg0_after_pub = fs::read(&seg0_path).unwrap();
+        assert_eq!(seg0_after_pub.len() as u64, pub_out.meta.committed_len);
+        assert_eq!(pub_out.meta.prefix_crc32c, crc32c::crc32c(&seg0_after_pub));
+        let meta_after_pub = read_converged_lane_tail_meta(&init.paths.normal)
+            .expect("converged LTM2 after public append_frame");
+        assert_eq!(meta_after_pub, pub_out.meta);
+
+        let all_frames = decode_all_segment_bytes(&seg0_after_pub);
+        assert_eq!(all_frames.len(), 8);
+        assert_eq!(
+            all_frames
+                .iter()
+                .map(|f| f.dedup_key.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "rb08m-p1",
+                "rb08m-p2",
+                "rb08m-t1",
+                "rb08m-t2-80k",
+                "rb08m-n1",
+                "rb08m-u1",
+                "rb08m-u2",
+                "rb08m-pub-n2",
+            ]
+        );
+        assert_eq!(all_frames[5].payload, u1_payload);
+        assert_eq!(all_frames[6].payload, u2_payload);
+        assert_eq!(all_frames[7].payload, pub_payload);
+
+        // ------------------------------------------------------------------
+        // Part 3 — Prior guard: corrupt committed prefix `[0, committed_len)`
+        // + damaged uncommitted tail MUST still fail closed with ZERO disk
+        // mutation (never quarantining or truncating!)
+        // ------------------------------------------------------------------
+        let mut bad_seg0 = fs::read(&seg0_path).unwrap();
+        bad_seg0[0] ^= 0x01; // corrupt committed prefix byte 0
+        bad_seg0.extend_from_slice(&half_frame_tail);
+        write_bytes_0600(&seg0_path, &bad_seg0);
+        let snap_corrupt = snapshot_tree(&init.paths.root);
+        let prefix_err = recover_lane(repo.path(), CaptureQueueLane::Normal)
+            .expect_err("corrupt committed prefix + damaged tail must fail closed");
+        assert!(matches!(
+            prefix_err,
+            StorageBackendError::CorruptCommittedFrame { .. }
+        ));
+        assert_eq!(prefix_err.stable_code_str(), "LBR-IO-001");
+        assert_eq!(snapshot_tree(&init.paths.root), snap_corrupt);
     }
 }
