@@ -57,11 +57,12 @@ use crate::storage::{
     manifest::PRIVATE_SUBDIR,
     queue::{
         CAPTURE_QUEUE_SUBDIR, FrameDecodeError, FrameEncodeError, FrameStreamDecoder,
-        FrameStreamItem, LTM2_MAX_LEN, LaneTailMeta, Ltm2CodecError, QUEUE_LANE_NORMAL_DIR,
-        QUEUE_LANE_PRIORITY_DIR, QUEUE_QUARANTINE_DIR, QUEUE_TAIL_META_BAK_FILE,
-        QUEUE_TAIL_META_FILE, crc32c_append, crc32c_checksum, decode_frame, encode_frame,
-        encode_postcard_frame, map_queue_owner_mismatch_err, map_queue_symlink_err,
-        matches_segment_log_glob_bytes, segment_log_file_name,
+        FrameStreamItem, LTM2_MAX_LEN, LaneTailMeta, Ltm2CodecError, MAX_SEALED_SEGMENTS,
+        QUEUE_LANE_NORMAL_DIR, QUEUE_LANE_PRIORITY_DIR, QUEUE_QUARANTINE_DIR,
+        QUEUE_TAIL_META_BAK_FILE, QUEUE_TAIL_META_FILE, SealedSegmentMeta, crc32c_append,
+        crc32c_checksum, decode_frame, encode_frame, encode_postcard_frame,
+        map_queue_owner_mismatch_err, map_queue_symlink_err, matches_segment_log_glob_bytes,
+        segment_log_file_name,
     },
 };
 
@@ -336,6 +337,22 @@ enum Phase1Plan<T> {
         stale_tmp_names: Vec<T>,
         reclaimed_orphans: Vec<u32>,
     },
+    /// Case D (clean old segment + clean valid successor `S + 1`):
+    /// `max_live_seg == active_seg + 1`, old segment `S` satisfies
+    /// `actual_len(S) == committed_len > 0` with `[0, committed_len)` prefix
+    /// CRC32C verified, `meta.sealed.len() < MAX_SEALED_SEGMENTS`, and
+    /// `events-<S+1>.log` decodes cleanly from offset `0` to `succ_valid_end`
+    /// with `>= 1` valid dual-CRC32C frame and zero damaged tail bytes
+    /// (`ADR-RB-05` #3 Case D, `RB-08d` AC3–AC7).
+    CaseDRecoverCleanSuccessor {
+        meta: LaneTailMeta,
+        succ_seg: u32,
+        succ_valid_end: u64,
+        succ_crc32c: u32,
+        succ_frames: usize,
+        stale_tmp_names: Vec<T>,
+        reclaimed_orphans: Vec<u32>,
+    },
 }
 
 // ============================================================================
@@ -383,6 +400,13 @@ enum SegmentOpEvent {
         seg_id: u32,
         from_offset: u64,
         to_offset: u64,
+        frame_count: usize,
+    },
+    CaseDRecoverCleanSuccessor {
+        lane: &'static str,
+        old_seg_id: u32,
+        succ_seg_id: u32,
+        succ_len: u64,
         frame_count: usize,
     },
     QuarantineTmpSyncDataStart {
@@ -579,6 +603,24 @@ impl SegmentObserver {
         });
     }
 
+    fn record_case_d_recover_successor(
+        &mut self,
+        lane: &'static str,
+        old_seg_id: u32,
+        succ_seg_id: u32,
+        succ_len: u64,
+        frame_count: usize,
+    ) {
+        self.events
+            .push(SegmentOpEvent::CaseDRecoverCleanSuccessor {
+                lane,
+                old_seg_id,
+                succ_seg_id,
+                succ_len,
+                frame_count,
+            });
+    }
+
     fn record_quarantine_tmp_sync_start(&mut self, id: &str) {
         self.events
             .push(SegmentOpEvent::QuarantineTmpSyncDataStart { id: id.to_string() });
@@ -726,6 +768,17 @@ impl SegmentObserver {
         _seg_id: u32,
         _from_offset: u64,
         _to_offset: u64,
+        _frame_count: usize,
+    ) {
+    }
+
+    #[inline]
+    fn record_case_d_recover_successor(
+        &mut self,
+        _lane: &'static str,
+        _old_seg_id: u32,
+        _succ_seg_id: u32,
+        _succ_len: u64,
         _frame_count: usize,
     ) {
     }
@@ -949,6 +1002,197 @@ fn scan_case_c_clean_uncommitted_tail(
         recovered_crc32c,
         frame_count,
     })
+}
+
+/// Read-only scan result over a Case D successor segment `events-<S+1>.log`
+/// starting from byte offset `0` (`ADR-RB-05` #3 Case D, `RB-08d`).
+struct SuccessorSegmentScan {
+    valid_end: u64,
+    valid_crc32c: u32,
+    frame_count: usize,
+    has_damaged_tail: bool,
+}
+
+/// Validate that `live_segs` contains strictly a single contiguous successor
+/// segment `active_seg + 1` beyond `active_seg` (zero gaps, zero multi-segment
+/// leaps, zero `u32` overflow).
+fn validate_single_case_d_successor_id(active_seg: u32, live_segs: &[u32]) -> StorageResult<u32> {
+    let succ_seg =
+        active_seg
+            .checked_add(1)
+            .ok_or_else(|| StorageBackendError::CorruptCommittedFrame {
+                detail: "Case D: active_seg overflow computing successor segment id".to_string(),
+            })?;
+    let mut successors = live_segs.iter().copied().filter(|&id| id > active_seg);
+    let first = successors.next();
+    let second = successors.next();
+    if first != Some(succ_seg) || second.is_some() {
+        return Err(StorageBackendError::CorruptCommittedFrame {
+            detail:
+                "Case D: unexpected non-contiguous or multiple successor segments beyond active_seg"
+                    .to_string(),
+        });
+    }
+    Ok(succ_seg)
+}
+
+/// Strictly read-only forward scan of a Case D successor segment `events-<S+1>.log`
+/// from offset `0` to `actual_len` (`ADR-RB-05` #3 Case D, `RB-08d`).
+fn scan_successor_segment_readonly(
+    file: &mut File,
+    actual_len: u64,
+) -> StorageResult<SuccessorSegmentScan> {
+    if actual_len == 0 {
+        return Ok(SuccessorSegmentScan {
+            valid_end: 0,
+            valid_crc32c: 0,
+            frame_count: 0,
+            has_damaged_tail: false,
+        });
+    }
+
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| StorageBackendError::io("seek successor segment for Case D scan", e))?;
+    let mut decoder = FrameStreamDecoder::with_known_len(&mut *file, 0, actual_len);
+    let mut valid_end = 0u64;
+    let mut frame_count = 0usize;
+    let mut damaged_tail = false;
+
+    loop {
+        match decoder.next_frame() {
+            Ok(FrameStreamItem::Frame {
+                offset, total_len, ..
+            }) => {
+                let len_u64 =
+                    u64::try_from(total_len).map_err(|_| StorageBackendError::BackendInternal {
+                        detail: "decoded successor frame length exceeds u64".to_string(),
+                    })?;
+                valid_end = offset.checked_add(len_u64).ok_or_else(|| {
+                    StorageBackendError::BackendInternal {
+                        detail: "Case D successor frame offset overflow".to_string(),
+                    }
+                })?;
+                frame_count += 1;
+            }
+            Ok(FrameStreamItem::CleanEof { offset }) => {
+                valid_end = offset;
+                break;
+            }
+            Err(
+                FrameDecodeError::TruncatedTail { .. }
+                | FrameDecodeError::CorruptHeader { .. }
+                | FrameDecodeError::CorruptPayload { .. },
+            ) => {
+                damaged_tail = true;
+                break;
+            }
+            Err(FrameDecodeError::Io { kind }) => {
+                return Err(StorageBackendError::Io {
+                    context: "scan Case D successor segment frames",
+                    kind,
+                    raw_os_error: None,
+                });
+            }
+        }
+    }
+
+    let valid_crc32c = if valid_end > 0 {
+        extend_crc32c_over_file_range(file, 0, valid_end, 0)?
+    } else {
+        0
+    };
+
+    Ok(SuccessorSegmentScan {
+        valid_end,
+        valid_crc32c,
+        frame_count,
+        has_damaged_tail: damaged_tail || valid_end < actual_len,
+    })
+}
+
+/// Apply Phase 1 read-only classification rules for base Case D (`RB-08d`):
+/// validates `MAX_SEALED_SEGMENTS` illegal full-table state first (before any
+/// mutation), forbids sealing a 0-byte old segment, and enforces scope guards
+/// for downstream `RB-08k` (nested Case C→D), `RB-08f` (empty/half-frame orphan),
+/// and `RB-08u` (valid successor with trailing half-frame).
+fn classify_case_d_base_readonly(
+    meta: &LaneTailMeta,
+    old_actual_len: u64,
+    succ_scan: &SuccessorSegmentScan,
+) -> StorageResult<()> {
+    if succ_scan.frame_count > 0 && meta.sealed.len() >= MAX_SEALED_SEGMENTS {
+        return Err(StorageBackendError::CorruptCommittedFrame {
+            detail:
+                "Case D: valid successor segment exists while LTM2 sealed table is already at MAX_SEALED_SEGMENTS (256)"
+                    .to_string(),
+        });
+    }
+    if old_actual_len > meta.committed_len {
+        return Err(StorageBackendError::BackendInternal {
+            detail:
+                "Case D: nested Case C->D old segment uncommitted tail requires RB-08k recovery"
+                    .to_string(),
+        });
+    }
+    if succ_scan.frame_count == 0 {
+        return Err(StorageBackendError::CorruptCommittedFrame {
+            detail:
+                "Case D: empty or half-frame orphan successor segment requires RB-08f orphan cleanup"
+                    .to_string(),
+        });
+    }
+    if meta.committed_len == 0 {
+        return Err(StorageBackendError::CorruptCommittedFrame {
+            detail:
+                "Case D: valid successor segment exists while old active segment is empty (0 bytes)"
+                    .to_string(),
+        });
+    }
+    if succ_scan.has_damaged_tail {
+        return Err(StorageBackendError::BackendInternal {
+            detail:
+                "Case D: valid successor segment has trailing uncommitted half-frame requiring RB-08u quarantine recovery"
+                    .to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Build and validate the converged `LTM2` metadata that seals clean old segment
+/// `(old_meta.active_seg, old_meta.committed_len, old_meta.prefix_crc32c)` into
+/// `sealed[]` and advances `(ACTIVE_SEG, COMMITTED_LEN, PREFIX_CRC32C)` to the
+/// recovered clean successor `succ_seg` (`ADR-RB-05` #3 Case D, `RB-08d` AC4–AC7).
+fn build_case_d_sealed_successor_meta(
+    old_meta: &LaneTailMeta,
+    succ_seg: u32,
+    succ_valid_end: u64,
+    succ_crc32c: u32,
+) -> StorageResult<LaneTailMeta> {
+    if old_meta.sealed.len() >= MAX_SEALED_SEGMENTS {
+        return Err(StorageBackendError::CorruptCommittedFrame {
+            detail:
+                "Case D: cannot seal old active segment when LTM2 sealed table is already at MAX_SEALED_SEGMENTS (256)"
+                    .to_string(),
+        });
+    }
+    let mut sealed = Vec::with_capacity(old_meta.sealed.len() + 1);
+    sealed.extend_from_slice(&old_meta.sealed);
+    sealed.push(SealedSegmentMeta {
+        seg_id: old_meta.active_seg,
+        sealed_len: old_meta.committed_len,
+        sealed_crc32c: old_meta.prefix_crc32c,
+    });
+    let next_meta = LaneTailMeta {
+        min_live_seg: old_meta.min_live_seg,
+        active_seg: succ_seg,
+        committed_len: succ_valid_end,
+        prefix_crc32c: succ_crc32c,
+        sealed,
+    };
+    next_meta
+        .validate()
+        .map_err(Ltm2CodecError::into_storage_error)?;
+    Ok(next_meta)
 }
 
 /// Validate a caller-supplied pre-encoded single frame buffer strictly outside
@@ -1849,10 +2093,19 @@ mod unix_seg {
         verify_committed_prefix_crc(&mut ro_seg, meta.committed_len, meta.prefix_crc32c)?;
 
         if max_live_seg > meta.active_seg {
-            return Err(StorageBackendError::CorruptCommittedFrame {
-                detail:
-                    "Case D: orphan successor segment present beyond active_seg (requires Case D recovery)"
-                        .to_string(),
+            let succ_seg = validate_single_case_d_successor_id(meta.active_seg, &live_segs)?;
+            let (mut succ_file, succ_actual_len) =
+                open_segment_readonly_nofollow(lane_fd, succ_seg, expected_uid)?;
+            let succ_scan = scan_successor_segment_readonly(&mut succ_file, succ_actual_len)?;
+            classify_case_d_base_readonly(&meta, actual_len, &succ_scan)?;
+            return Ok(Phase1Plan::CaseDRecoverCleanSuccessor {
+                meta,
+                succ_seg,
+                succ_valid_end: succ_scan.valid_end,
+                succ_crc32c: succ_scan.valid_crc32c,
+                succ_frames: succ_scan.frame_count,
+                stale_tmp_names: scan.stale_tmp_names,
+                reclaimed_orphans,
             });
         }
 
@@ -2324,6 +2577,49 @@ mod unix_seg {
                     active_seg_exists: true,
                     recovered_frames,
                     recovered_bytes,
+                    mirrored_replica: true,
+                    cleaned_tmp_files,
+                    reclaimed_orphans_removed,
+                })
+            }
+            Phase1Plan::CaseDRecoverCleanSuccessor {
+                meta,
+                succ_seg,
+                succ_valid_end,
+                succ_crc32c,
+                succ_frames,
+                stale_tmp_names,
+                reclaimed_orphans,
+            } => {
+                let cleaned_tmp_files =
+                    clean_stale_tmp_files_unix(lane_fd, &stale_tmp_names, expected_uid)?;
+                let reclaimed_orphans_removed =
+                    clean_reclaimed_orphans_unix(lane_fd, &reclaimed_orphans, expected_uid)?;
+                let next_meta = build_case_d_sealed_successor_meta(
+                    &meta,
+                    succ_seg,
+                    succ_valid_end,
+                    succ_crc32c,
+                )?;
+                observer.record_case_d_recover_successor(
+                    lane_label,
+                    meta.active_seg,
+                    succ_seg,
+                    succ_valid_end,
+                    succ_frames,
+                );
+                commit_dual_tail_meta_unix(
+                    lane_fd,
+                    lane_label,
+                    &next_meta,
+                    expected_uid,
+                    observer,
+                )?;
+                Ok(Phase2ConvergedState {
+                    meta: next_meta,
+                    active_seg_exists: true,
+                    recovered_frames: succ_frames,
+                    recovered_bytes: succ_valid_end,
                     mirrored_replica: true,
                     cleaned_tmp_files,
                     reclaimed_orphans_removed,
@@ -3923,14 +4219,14 @@ mod non_unix_seg {
             }
 
             let seg_path = lane_dir.join(segment_log_file_name(meta.active_seg));
-            let desired_access = if open_seg_writable {
+            let old_desired_access = if open_seg_writable && max_live_seg == meta.active_seg {
                 GENERIC_READ | GENERIC_WRITE
             } else {
                 GENERIC_READ
             };
             let (mut seg_file, actual_len, seg_identity) = match open_windows_file_nofollow(
                 &seg_path,
-                desired_access,
+                old_desired_access,
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 OPEN_EXISTING,
                 "capture queue segment file",
@@ -3957,11 +4253,38 @@ mod non_unix_seg {
             verify_committed_prefix_crc(&mut seg_file, meta.committed_len, meta.prefix_crc32c)?;
 
             if max_live_seg > meta.active_seg {
-                return Err(StorageBackendError::CorruptCommittedFrame {
-                    detail:
-                        "Case D: orphan successor segment present beyond active_seg (requires Case D recovery)"
-                            .to_string(),
-                });
+                let succ_seg = validate_single_case_d_successor_id(meta.active_seg, &live_segs)?;
+                let succ_path = lane_dir.join(segment_log_file_name(succ_seg));
+                let succ_desired_access = if open_seg_writable {
+                    GENERIC_READ | GENERIC_WRITE
+                } else {
+                    GENERIC_READ
+                };
+                let (mut succ_file, succ_actual_len, succ_identity) = open_windows_file_nofollow(
+                    &succ_path,
+                    succ_desired_access,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    OPEN_EXISTING,
+                    "capture queue successor segment file",
+                    "open Case D successor capture queue segment",
+                )?;
+                let succ_scan = scan_successor_segment_readonly(&mut succ_file, succ_actual_len)?;
+                classify_case_d_base_readonly(&meta, actual_len, &succ_scan)?;
+                return Ok((
+                    Phase1Plan::CaseDRecoverCleanSuccessor {
+                        meta,
+                        succ_seg,
+                        succ_valid_end: succ_scan.valid_end,
+                        succ_crc32c: succ_scan.valid_crc32c,
+                        succ_frames: succ_scan.frame_count,
+                        stale_tmp_names,
+                        reclaimed_orphans,
+                    },
+                    Some(PinnedWindowsSegment {
+                        file: succ_file,
+                        identity: succ_identity,
+                    }),
+                ));
             }
 
             if actual_len == meta.committed_len {
@@ -4315,6 +4638,41 @@ mod non_unix_seg {
                         true,
                         recovered_frames,
                         recovered_bytes,
+                        true,
+                        cleaned,
+                        orphans,
+                    ))
+                }
+                Phase1Plan::CaseDRecoverCleanSuccessor {
+                    meta,
+                    succ_seg,
+                    succ_valid_end,
+                    succ_crc32c,
+                    succ_frames,
+                    stale_tmp_names,
+                    reclaimed_orphans,
+                } => {
+                    let cleaned = clean_tmp(&stale_tmp_names)?;
+                    let orphans = clean_orphans(&reclaimed_orphans)?;
+                    let next_meta = build_case_d_sealed_successor_meta(
+                        &meta,
+                        succ_seg,
+                        succ_valid_end,
+                        succ_crc32c,
+                    )?;
+                    observer.record_case_d_recover_successor(
+                        lane_label,
+                        meta.active_seg,
+                        succ_seg,
+                        succ_valid_end,
+                        succ_frames,
+                    );
+                    commit_dual_tail_meta_windows(lane_dir, lane_label, &next_meta, observer)?;
+                    Ok((
+                        next_meta,
+                        true,
+                        succ_frames,
+                        succ_valid_end,
                         true,
                         cleaned,
                         orphans,
@@ -4913,7 +5271,7 @@ mod non_unix_seg {
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::HashSet,
+        collections::{BTreeMap, HashSet},
         fs,
         process::Command,
         time::{Duration, Instant},
@@ -4927,6 +5285,57 @@ mod tests {
         FRAME_HEADER_LEN, SealedSegmentMeta, crc32c_checksum, init_capture_queue,
         tail_meta_bak_path, tail_meta_path,
     };
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum SnapshotEntry {
+        Dir { mode: u32 },
+        File { mode: u32, bytes: Vec<u8> },
+        Symlink { target: PathBuf },
+    }
+
+    fn snapshot_tree(root: &Path) -> BTreeMap<PathBuf, SnapshotEntry> {
+        fn walk(base: &Path, dir: &Path, out: &mut BTreeMap<PathBuf, SnapshotEntry>) {
+            let mut entries: Vec<_> = fs::read_dir(dir)
+                .expect("read_dir for snapshot")
+                .map(|e| e.expect("dir entry for snapshot"))
+                .collect();
+            entries.sort_by_key(|e| e.file_name());
+            for entry in entries {
+                let p = entry.path();
+                let rel = p.strip_prefix(base).expect("strip base").to_path_buf();
+                let md = fs::symlink_metadata(&p).expect("symlink_metadata for snapshot");
+                #[cfg(unix)]
+                let mode = {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    md.permissions().mode() & 0o7777
+                };
+                #[cfg(not(unix))]
+                let mode = 0u32;
+                if md.file_type().is_symlink() {
+                    out.insert(
+                        rel,
+                        SnapshotEntry::Symlink {
+                            target: fs::read_link(&p).expect("read_link for snapshot"),
+                        },
+                    );
+                } else if md.is_dir() {
+                    out.insert(rel, SnapshotEntry::Dir { mode });
+                    walk(base, &p, out);
+                } else {
+                    out.insert(
+                        rel,
+                        SnapshotEntry::File {
+                            mode,
+                            bytes: fs::read(&p).expect("read file for snapshot"),
+                        },
+                    );
+                }
+            }
+        }
+        let mut out = BTreeMap::new();
+        walk(root, root, &mut out);
+        out
+    }
 
     const CHILD_DIR_ENV: &str = "LIBRA_RB08_PRODUCER_CHILD_DIR";
     const CHILD_ID_ENV: &str = "LIBRA_RB08_PRODUCER_ID";
@@ -6777,5 +7186,469 @@ mod tests {
         )
         .expect("AC8: Priority lane accepts new frames after reopen");
         assert!(post_p2.meta.committed_len > out_p1.meta.committed_len);
+    }
+
+    #[test]
+    fn case_d_old_seg_prefix_guard_and_valid_successor_recovery() {
+        #[cfg(unix)]
+        fn write_file_0600(path: &Path, bytes: &[u8]) {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            let mut f = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(path)
+                .expect("create 0600 queue test file");
+            f.write_all(bytes).expect("write queue test file");
+            f.sync_data().expect("sync queue test file");
+        }
+        #[cfg(not(unix))]
+        fn write_file_0600(path: &Path, bytes: &[u8]) {
+            let mut f = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(path)
+                .expect("create queue test file");
+            f.write_all(bytes).expect("write queue test file");
+            f.sync_data().expect("sync queue test file");
+        }
+
+        // ------------------------------------------------------------------
+        // AC1 & AC2: Case D old-segment prior guards (short-file AND prefix
+        // bitflip in `[0, committed_len)`) MUST fail closed with
+        // `CorruptCommittedFrame` (`LBR-IO-001`) BEFORE touching any successor
+        // segment and with ZERO disk mutation across the entire queue tree!
+        // ------------------------------------------------------------------
+        let guard_repo = tempdir().expect("create RB-08d prior-guard repo");
+        let guard_init = init_capture_queue(guard_repo.path()).expect("init prior-guard queue");
+        let guard_normal = &guard_init.paths.normal;
+        let guard_quarantine = &guard_init.paths.quarantine;
+
+        let old_f1 =
+            encode_frame(FRAME_FLAG_NONE, "rb08d:old:1", b"old-seg-committed-frame-1").unwrap();
+        let old_f2 =
+            encode_frame(FRAME_FLAG_NONE, "rb08d:old:2", b"old-seg-committed-frame-2").unwrap();
+        append_encoded_frame(guard_repo.path(), CaptureQueueLane::Normal, &old_f1)
+            .expect("commit old frame 1");
+        let old_out = append_encoded_frame(guard_repo.path(), CaptureQueueLane::Normal, &old_f2)
+            .expect("commit old frame 2");
+        let old_seg0_path = guard_normal.join(segment_log_file_name(0));
+        let old_seg0_orig = fs::read(&old_seg0_path).expect("read original seg0");
+        assert_eq!(old_seg0_orig.len() as u64, old_out.meta.committed_len);
+
+        let succ_f1 = encode_frame(
+            FRAME_FLAG_NONE,
+            "rb08d:succ:1",
+            b"valid-successor-frame-alpha",
+        )
+        .unwrap();
+        let succ_f2 = encode_frame(
+            FRAME_FLAG_NONE,
+            "rb08d:succ:2",
+            b"valid-successor-frame-beta",
+        )
+        .unwrap();
+        let mut succ_bytes = Vec::new();
+        succ_bytes.extend_from_slice(&succ_f1);
+        succ_bytes.extend_from_slice(&succ_f2);
+
+        let guard_succ_path = guard_normal.join(segment_log_file_name(1));
+        write_file_0600(&guard_succ_path, &succ_bytes);
+        // Also plant stale .tmp files to prove Phase 1 fail-closed leaves them untouched.
+        write_file_0600(&guard_normal.join(QUEUE_TAIL_META_TMP_FILE), b"stale-tmp");
+        write_file_0600(&guard_quarantine.join("normal-stale-q.tmp"), b"stale-q-tmp");
+
+        // AC1(a): Truncate old segment `events-00000000.log` to `committed_len - 1`.
+        {
+            let f = fs::OpenOptions::new()
+                .write(true)
+                .open(&old_seg0_path)
+                .expect("open old seg0 for truncation");
+            f.set_len(old_out.meta.committed_len - 1)
+                .expect("truncate old seg0 by 1 byte");
+            f.sync_data().expect("sync truncated old seg0");
+        }
+        let ac1_before = snapshot_tree(&guard_init.paths.root);
+        let ac1_rec_err = recover_lane(guard_repo.path(), CaptureQueueLane::Normal)
+            .expect_err("AC1: short old segment must fail closed");
+        assert!(
+            matches!(
+                ac1_rec_err,
+                StorageBackendError::CorruptCommittedFrame { .. }
+            ),
+            "AC1 expected CorruptCommittedFrame, got {ac1_rec_err:?}"
+        );
+        assert_eq!(ac1_rec_err.stable_code_str(), "LBR-IO-001");
+        let ac1_app_err = append_frame(
+            guard_repo.path(),
+            CaptureQueueLane::Normal,
+            FRAME_FLAG_NONE,
+            "rb08d:ac1:blocked",
+            b"must-not-write",
+        )
+        .expect_err("AC1: append on short old segment must fail closed");
+        assert!(matches!(
+            ac1_app_err,
+            StorageBackendError::CorruptCommittedFrame { .. }
+        ));
+        assert_eq!(ac1_app_err.stable_code_str(), "LBR-IO-001");
+        assert_eq!(
+            snapshot_tree(&guard_init.paths.root),
+            ac1_before,
+            "AC1 violated: short old segment failure mutated queue disk tree"
+        );
+
+        // AC1(b): Prove prior guard stops BEFORE touching successor `events-00000001.log`
+        // by replacing `events-00000001.log` with a symlink while seg0 is short ->
+        // MUST still return `CorruptCommittedFrame` (NOT symlink error)!
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            fs::remove_file(&guard_succ_path).expect("remove regular succ");
+            symlink(
+                guard_repo.path().join("nonexistent-target"),
+                &guard_succ_path,
+            )
+            .expect("plant symlink at succ");
+            let sym_prior_err = recover_lane(guard_repo.path(), CaptureQueueLane::Normal)
+                .expect_err("AC1: short old seg must fail before opening symlinked successor");
+            assert!(
+                matches!(
+                    sym_prior_err,
+                    StorageBackendError::CorruptCommittedFrame { .. }
+                ),
+                "AC1 must fail on old seg BEFORE touching successor, got {sym_prior_err:?}"
+            );
+            assert_eq!(sym_prior_err.stable_code_str(), "LBR-IO-001");
+            fs::remove_file(&guard_succ_path).expect("remove symlinked succ");
+            write_file_0600(&guard_succ_path, &succ_bytes);
+        }
+
+        // AC2(a): Restore old segment length `committed_len` and flip a single bit
+        // inside `[0, committed_len)` -> `prefix_crc32c` mismatch MUST fail closed
+        // with `CorruptCommittedFrame` (`LBR-IO-001`) and zero disk mutation.
+        let mut flipped_old = old_seg0_orig.clone();
+        let flip_idx = flipped_old.len() / 2;
+        flipped_old[flip_idx] ^= 0x01;
+        write_file_0600(&old_seg0_path, &flipped_old);
+
+        let ac2_before = snapshot_tree(&guard_init.paths.root);
+        let ac2_rec_err = recover_lane(guard_repo.path(), CaptureQueueLane::Normal)
+            .expect_err("AC2: old segment prefix bitflip must fail closed");
+        assert!(
+            matches!(
+                ac2_rec_err,
+                StorageBackendError::CorruptCommittedFrame { .. }
+            ),
+            "AC2 expected CorruptCommittedFrame, got {ac2_rec_err:?}"
+        );
+        assert_eq!(ac2_rec_err.stable_code_str(), "LBR-IO-001");
+        let ac2_app_err = append_frame(
+            guard_repo.path(),
+            CaptureQueueLane::Normal,
+            FRAME_FLAG_NONE,
+            "rb08d:ac2:blocked",
+            b"must-not-write",
+        )
+        .expect_err("AC2: append on prefix-bitflipped old segment must fail closed");
+        assert!(matches!(
+            ac2_app_err,
+            StorageBackendError::CorruptCommittedFrame { .. }
+        ));
+        assert_eq!(ac2_app_err.stable_code_str(), "LBR-IO-001");
+        assert_eq!(
+            snapshot_tree(&guard_init.paths.root),
+            ac2_before,
+            "AC2 violated: old segment prefix bitflip failure mutated queue disk tree"
+        );
+
+        // AC2(b): Prove prefix CRC prior guard also fires BEFORE opening `S+1`.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            fs::remove_file(&guard_succ_path).expect("remove regular succ");
+            symlink(
+                guard_repo.path().join("nonexistent-target"),
+                &guard_succ_path,
+            )
+            .expect("plant symlink at succ");
+            let sym_prior_err = recover_lane(guard_repo.path(), CaptureQueueLane::Normal)
+                .expect_err("AC2: prefix bitflip must fail before opening symlinked successor");
+            assert!(
+                matches!(
+                    sym_prior_err,
+                    StorageBackendError::CorruptCommittedFrame { .. }
+                ),
+                "AC2 must fail on old seg prefix CRC BEFORE touching successor, got {sym_prior_err:?}"
+            );
+            assert_eq!(sym_prior_err.stable_code_str(), "LBR-IO-001");
+        }
+
+        // ------------------------------------------------------------------
+        // AC3–AC7: Clean old segment (`actual_len(S) == committed_len`) +
+        // clean valid successor `events-<S+1>` -> 100% successor frame retention,
+        // old segment sealed into `LTM2.sealed[]`, dual replicas advanced to
+        // `(ACTIVE_SEG = S + 1, COMMITTED_LEN = succ_len, PREFIX_CRC32C = succ_crc)`!
+        // ------------------------------------------------------------------
+        let repo = tempdir().expect("create RB-08d clean Case D repo");
+        let init = init_capture_queue(repo.path()).expect("init clean Case D queue");
+        let normal_dir = &init.paths.normal;
+        let quarantine_dir = &init.paths.quarantine;
+
+        let s0_f1 = encode_frame(FRAME_FLAG_NONE, "rb08d:s0:1", b"seg0-frame-one").unwrap();
+        let s0_f2 = encode_frame(FRAME_FLAG_NONE, "rb08d:s0:2", b"seg0-frame-two").unwrap();
+        append_encoded_frame(repo.path(), CaptureQueueLane::Normal, &s0_f1).expect("s0 f1");
+        let s0_out =
+            append_encoded_frame(repo.path(), CaptureQueueLane::Normal, &s0_f2).expect("s0 f2");
+        let s0_len = s0_out.meta.committed_len;
+        let s0_crc = s0_out.meta.prefix_crc32c;
+        let s0_path = normal_dir.join(segment_log_file_name(0));
+        let s0_bytes_before = fs::read(&s0_path).expect("read seg0");
+        assert_eq!(s0_bytes_before.len() as u64, s0_len);
+        assert_eq!(crc32c_checksum(&s0_bytes_before), s0_crc);
+
+        // Simulate crash after rotation created `events-00000001.log`, synced 3
+        // complete valid frames + fsync_dir, BEFORE committing dual `LTM2`.
+        // Also corrupt `tail.meta.bak` (Subcase B1) + leave stale `.tmp` files
+        // to prove dual convergence and Phase 2 lane-scoped cleanup work together.
+        let s1_f1 = encode_frame(FRAME_FLAG_NONE, "rb08d:s1:1", b"succ-frame-1-payload").unwrap();
+        let s1_f2 = encode_frame(
+            FRAME_FLAG_NONE,
+            "rb08d:s1:2",
+            &vec![0x5Au8; 70 * 1024], // > 64 KiB chunk boundary
+        )
+        .unwrap();
+        let s1_f3 = encode_frame(FRAME_FLAG_NONE, "rb08d:s1:3", b"succ-frame-3-payload").unwrap();
+        let mut s1_bytes = Vec::new();
+        s1_bytes.extend_from_slice(&s1_f1);
+        s1_bytes.extend_from_slice(&s1_f2);
+        s1_bytes.extend_from_slice(&s1_f3);
+        let s1_len = s1_bytes.len() as u64;
+        let s1_crc = crc32c_checksum(&s1_bytes);
+
+        let s1_path = normal_dir.join(segment_log_file_name(1));
+        write_file_0600(&s1_path, &s1_bytes);
+        write_file_0600(&normal_dir.join(QUEUE_TAIL_META_BAK_FILE), b"corrupt-bak");
+        write_file_0600(&normal_dir.join(QUEUE_TAIL_META_TMP_FILE), b"stale-meta");
+        write_file_0600(&quarantine_dir.join("normal-case-d.tmp"), b"stale-normal-q");
+        write_file_0600(
+            &quarantine_dir.join("priority-other.tmp"),
+            b"must-preserve-other-lane",
+        );
+
+        let report = recover_lane(repo.path(), CaptureQueueLane::Normal)
+            .expect("AC3-AC7: clean Case D recovery must succeed");
+        assert_eq!(report.lane, CaptureQueueLane::Normal);
+        assert_eq!(report.recovered_frames, 3);
+        assert_eq!(report.recovered_bytes, s1_len);
+        assert_eq!(report.cleaned_tmp_files, 1);
+        assert_eq!(report.cleaned_quarantine_tmp_files, 1);
+        assert!(
+            quarantine_dir.join("priority-other.tmp").exists(),
+            "Normal Case D recovery must preserve Priority lane's quarantine .tmp"
+        );
+
+        // AC3: 100% of successor valid frame bytes retained untouched on disk
+        // (and old segment 0 untouched too).
+        assert_eq!(
+            fs::read(&s1_path).expect("read retained seg1"),
+            s1_bytes,
+            "AC3 violated: successor segment bytes altered during Case D recovery"
+        );
+        assert_eq!(
+            fs::read(&s0_path).expect("read sealed seg0"),
+            s0_bytes_before,
+            "old sealed segment bytes must remain untouched"
+        );
+
+        // Decode BOTH raw `tail.meta` and `tail.meta.bak` independently.
+        let primary_raw =
+            fs::read(normal_dir.join(QUEUE_TAIL_META_FILE)).expect("read primary tail.meta");
+        let backup_raw =
+            fs::read(normal_dir.join(QUEUE_TAIL_META_BAK_FILE)).expect("read backup tail.meta.bak");
+        assert_eq!(
+            primary_raw, backup_raw,
+            "dual LTM2 replicas must match byte-for-byte after Case D commit"
+        );
+        let primary_meta = LaneTailMeta::decode(&primary_raw).expect("decode primary LTM2");
+        let backup_meta = LaneTailMeta::decode(&backup_raw).expect("decode backup LTM2");
+        assert_eq!(primary_meta, backup_meta);
+        assert_eq!(report.meta, primary_meta);
+
+        // AC4: Clean old segment `(0, s0_len, s0_crc)` sealed into `LTM2.sealed[]`.
+        assert_eq!(primary_meta.min_live_seg, 0);
+        assert_eq!(
+            primary_meta.sealed,
+            vec![SealedSegmentMeta {
+                seg_id: 0,
+                sealed_len: s0_len,
+                sealed_crc32c: s0_crc,
+            }],
+            "AC4 violated: old segment 0 not accurately sealed into LTM2.sealed[]"
+        );
+        // AC5: `ACTIVE_SEG` advanced to `S + 1 == 1`.
+        assert_eq!(primary_meta.active_seg, 1, "AC5 violated: active_seg != 1");
+        // AC6: `COMMITTED_LEN` advanced to exact `s1_len`.
+        assert_eq!(
+            primary_meta.committed_len, s1_len,
+            "AC6 violated: committed_len != succ_len"
+        );
+        // AC7: `PREFIX_CRC32C` matches exact `crc32c(events-00000001.log)`.
+        assert_eq!(
+            primary_meta.prefix_crc32c, s1_crc,
+            "AC7 violated: prefix_crc32c != crc32c(succ_bytes)"
+        );
+
+        // Verify direct `append_frame` on a SECOND Case D transition (`S=1 -> S=2`)
+        // appends seamlessly after the recovered frames and accumulates `sealed[] = [0, 1]`.
+        let s2_f1 = encode_frame(FRAME_FLAG_NONE, "rb08d:s2:1", b"seg2-recovered-frame").unwrap();
+        let s2_path = normal_dir.join(segment_log_file_name(2));
+        write_file_0600(&s2_path, &s2_f1);
+
+        let s2_f2_payload = b"seg2-appended-after-case-d";
+        let app_out = append_frame(
+            repo.path(),
+            CaptureQueueLane::Normal,
+            FRAME_FLAG_NONE,
+            "rb08d:s2:2",
+            s2_f2_payload,
+        )
+        .expect("direct append_frame through Case D must recover seg2, seal seg1, and append");
+        assert_eq!(app_out.seg_id, 2);
+        assert_eq!(app_out.frame_offset, s2_f1.len() as u64);
+        assert_eq!(app_out.recovered_frames, 1);
+        assert_eq!(app_out.meta.active_seg, 2);
+        assert_eq!(
+            app_out.meta.sealed,
+            vec![
+                SealedSegmentMeta {
+                    seg_id: 0,
+                    sealed_len: s0_len,
+                    sealed_crc32c: s0_crc,
+                },
+                SealedSegmentMeta {
+                    seg_id: 1,
+                    sealed_len: s1_len,
+                    sealed_crc32c: s1_crc,
+                },
+            ]
+        );
+        let s2_disk = fs::read(&s2_path).expect("read seg2 after append");
+        assert_eq!(s2_disk.len() as u64, app_out.meta.committed_len);
+        assert_eq!(crc32c_checksum(&s2_disk), app_out.meta.prefix_crc32c);
+        let mut cursor = std::io::Cursor::new(&s2_disk);
+        let mut dec = FrameStreamDecoder::with_known_len(&mut cursor, 0, s2_disk.len() as u64);
+        let FrameStreamItem::Frame { frame: dec1, .. } = dec.next_frame().unwrap() else {
+            panic!("expected recovered frame 1");
+        };
+        let FrameStreamItem::Frame { frame: dec2, .. } = dec.next_frame().unwrap() else {
+            panic!("expected newly appended frame 2");
+        };
+        assert_eq!(dec1.dedup_key, "rb08d:s2:1");
+        assert_eq!(dec2.dedup_key, "rb08d:s2:2");
+        assert_eq!(dec2.payload, s2_f2_payload);
+        assert!(matches!(
+            dec.next_frame().unwrap(),
+            FrameStreamItem::CleanEof { .. }
+        ));
+
+        // ------------------------------------------------------------------
+        // Phase 1 fail-closed edge guards:
+        // (1) Non-contiguous successor gap (`active_seg=2`, `events-00000004.log`)
+        // (2) Multiple successors (`events-00000003.log` + `events-00000004.log`)
+        // (3) Illegal full-table state (`sealed.len() == 256` + valid successor)
+        // (4) Empty 0-byte old segment + valid successor
+        // All four MUST fail closed with `CorruptCommittedFrame` (`LBR-IO-001`)
+        // and ZERO disk mutation!
+        // ------------------------------------------------------------------
+        let gap_path = normal_dir.join(segment_log_file_name(4));
+        write_file_0600(&gap_path, &s2_f1);
+        let gap_before = snapshot_tree(&init.paths.root);
+        let gap_err = recover_lane(repo.path(), CaptureQueueLane::Normal)
+            .expect_err("non-contiguous Case D gap must fail closed");
+        assert!(matches!(
+            gap_err,
+            StorageBackendError::CorruptCommittedFrame { .. }
+        ));
+        assert_eq!(gap_err.stable_code_str(), "LBR-IO-001");
+        assert_eq!(snapshot_tree(&init.paths.root), gap_before);
+
+        let s3_path = normal_dir.join(segment_log_file_name(3));
+        write_file_0600(&s3_path, &s2_f1);
+        let multi_before = snapshot_tree(&init.paths.root);
+        let multi_err = recover_lane(repo.path(), CaptureQueueLane::Normal)
+            .expect_err("multiple Case D successors must fail closed");
+        assert!(matches!(
+            multi_err,
+            StorageBackendError::CorruptCommittedFrame { .. }
+        ));
+        assert_eq!(multi_err.stable_code_str(), "LBR-IO-001");
+        assert_eq!(snapshot_tree(&init.paths.root), multi_before);
+
+        // Full sealed table (`sealed.len() == 256`) + valid successor `257`
+        let full_repo = tempdir().expect("create full-table Case D repo");
+        let full_init = init_capture_queue(full_repo.path()).expect("init full-table queue");
+        let full_normal = &full_init.paths.normal;
+        let full_quarantine = &full_init.paths.quarantine;
+        let sealed_256: Vec<SealedSegmentMeta> = (0..MAX_SEALED_SEGMENTS as u32)
+            .map(|id| SealedSegmentMeta {
+                seg_id: id,
+                sealed_len: s0_f1.len() as u64,
+                sealed_crc32c: crc32c_checksum(&s0_f1),
+            })
+            .collect();
+        let active_256 = MAX_SEALED_SEGMENTS as u32;
+        let full_meta = LaneTailMeta {
+            min_live_seg: 0,
+            active_seg: active_256,
+            committed_len: s0_f1.len() as u64,
+            prefix_crc32c: crc32c_checksum(&s0_f1),
+            sealed: sealed_256,
+        };
+        let encoded_full_meta = full_meta.encode().expect("encode 256-sealed LTM2");
+        write_file_0600(&full_normal.join(QUEUE_TAIL_META_FILE), &encoded_full_meta);
+        write_file_0600(
+            &full_normal.join(QUEUE_TAIL_META_BAK_FILE),
+            &encoded_full_meta,
+        );
+        write_file_0600(&full_normal.join(segment_log_file_name(active_256)), &s0_f1);
+        write_file_0600(
+            &full_normal.join(segment_log_file_name(active_256 + 1)),
+            &s2_f1,
+        );
+        write_file_0600(&full_normal.join(QUEUE_TAIL_META_TMP_FILE), b"keep-tmp");
+        write_file_0600(&full_quarantine.join("normal-keep.tmp"), b"keep-q-tmp");
+
+        let full_before = snapshot_tree(&full_init.paths.root);
+        let full_err = recover_lane(full_repo.path(), CaptureQueueLane::Normal)
+            .expect_err("Case D valid successor at MAX_SEALED_SEGMENTS must fail closed");
+        assert!(matches!(
+            full_err,
+            StorageBackendError::CorruptCommittedFrame { .. }
+        ));
+        assert_eq!(full_err.stable_code_str(), "LBR-IO-001");
+        assert_eq!(
+            snapshot_tree(&full_init.paths.root),
+            full_before,
+            "Case D full-table fail-closed must leave disk tree 100% untouched"
+        );
+
+        // Empty 0-byte old segment `S=0` + valid successor `S=1`
+        let zero_repo = tempdir().expect("create 0-byte old seg Case D repo");
+        let zero_init = init_capture_queue(zero_repo.path()).expect("init 0-byte repo");
+        let zero_normal = &zero_init.paths.normal;
+        write_file_0600(&zero_normal.join(segment_log_file_name(0)), b"");
+        write_file_0600(&zero_normal.join(segment_log_file_name(1)), &s2_f1);
+        let zero_before = snapshot_tree(&zero_init.paths.root);
+        let zero_err = recover_lane(zero_repo.path(), CaptureQueueLane::Normal)
+            .expect_err("Case D with 0-byte old segment must fail closed");
+        assert!(matches!(
+            zero_err,
+            StorageBackendError::CorruptCommittedFrame { .. }
+        ));
+        assert_eq!(zero_err.stable_code_str(), "LBR-IO-001");
+        assert_eq!(snapshot_tree(&zero_init.paths.root), zero_before);
     }
 }
