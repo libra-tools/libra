@@ -29,6 +29,13 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(test)]
+use crate::storage::queue::segment::{
+    SegmentCrashPoint, SegmentObserver, SegmentOpEvent,
+    reclaim_sealed_segment_at_root_with_observer, recover_lane_at_root_with_observer,
+};
+#[cfg(not(test))]
+use crate::storage::queue::segment::{reclaim_sealed_segment_at_root, recover_lane_at_root};
 use crate::storage::{
     capture_store::{
         CaptureBatchItem, CaptureBatchPayload, CaptureQueueHighwater, CaptureQueueLane,
@@ -45,9 +52,7 @@ use crate::storage::{
             read_highwater_mirror, write_highwater_mirror,
         },
         matches_segment_log_glob_bytes,
-        segment::{
-            parse_segment_log_file_name, reclaim_sealed_segment_at_root, recover_lane_at_root,
-        },
+        segment::{LaneRecoveryReport, SegmentReclaimOutcome, parse_segment_log_file_name},
         segment_log_file_name,
     },
 };
@@ -292,15 +297,31 @@ enum WriterCrashPoint {
 }
 
 #[cfg(test)]
-#[derive(Default)]
 struct WriterObserver {
     crash_point: WriterCrashPoint,
+    reclaim_crash_point: SegmentCrashPoint,
+    segment_events: Vec<SegmentOpEvent>,
     on_window_poll: Option<Box<dyn FnMut(usize) + Send>>,
     on_sealed_pre_commit: Option<Box<dyn FnMut(u32) + Send>>,
     simulated_elapsed_ms: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
 }
 
 #[cfg(test)]
+impl Default for WriterObserver {
+    fn default() -> Self {
+        Self {
+            crash_point: WriterCrashPoint::None,
+            reclaim_crash_point: SegmentCrashPoint::None,
+            segment_events: Vec::new(),
+            on_window_poll: None,
+            on_sealed_pre_commit: None,
+            simulated_elapsed_ms: None,
+        }
+    }
+}
+
+#[cfg(test)]
+#[cfg_attr(not(feature = "storage-redb"), allow(dead_code))]
 impl WriterObserver {
     fn new() -> Self {
         Self::default()
@@ -309,9 +330,14 @@ impl WriterObserver {
     fn with_crash_point(crash_point: WriterCrashPoint) -> Self {
         Self {
             crash_point,
-            on_window_poll: None,
-            on_sealed_pre_commit: None,
-            simulated_elapsed_ms: None,
+            ..Self::default()
+        }
+    }
+
+    fn with_reclaim_crash_point(reclaim_crash_point: SegmentCrashPoint) -> Self {
+        Self {
+            reclaim_crash_point,
+            ..Self::default()
         }
     }
 
@@ -320,19 +346,16 @@ impl WriterObserver {
         simulated_elapsed_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
     ) -> Self {
         Self {
-            crash_point: WriterCrashPoint::None,
             on_window_poll: Some(Box::new(hook)),
-            on_sealed_pre_commit: None,
             simulated_elapsed_ms: Some(simulated_elapsed_ms),
+            ..Self::default()
         }
     }
 
     fn with_sealed_pre_commit_hook(hook: impl FnMut(u32) + Send + 'static) -> Self {
         Self {
-            crash_point: WriterCrashPoint::None,
-            on_window_poll: None,
             on_sealed_pre_commit: Some(Box::new(hook)),
-            simulated_elapsed_ms: None,
+            ..Self::default()
         }
     }
 
@@ -406,6 +429,52 @@ const fn crash_after_commit_before_mirror() -> CrashPointToken {
 #[cfg(not(test))]
 #[inline]
 const fn crash_after_commit_before_mirror() -> CrashPointToken {}
+
+fn call_reclaim_sealed_segment(
+    queue_root: &Path,
+    lane: CaptureQueueLane,
+    seg_id: u32,
+    highwater_seg: u32,
+    observer: &mut WriterObserver,
+) -> StorageResult<SegmentReclaimOutcome> {
+    #[cfg(test)]
+    {
+        let mut seg_obs = SegmentObserver::with_crash(observer.reclaim_crash_point);
+        let res = reclaim_sealed_segment_at_root_with_observer(
+            queue_root,
+            lane,
+            seg_id,
+            highwater_seg,
+            &mut seg_obs,
+        );
+        observer.segment_events.extend(seg_obs.events);
+        res
+    }
+    #[cfg(not(test))]
+    {
+        let _ = observer;
+        reclaim_sealed_segment_at_root(queue_root, lane, seg_id, highwater_seg)
+    }
+}
+
+fn call_recover_lane(
+    queue_root: &Path,
+    lane: CaptureQueueLane,
+    observer: &mut WriterObserver,
+) -> StorageResult<LaneRecoveryReport> {
+    #[cfg(test)]
+    {
+        let mut seg_obs = SegmentObserver::new();
+        let res = recover_lane_at_root_with_observer(queue_root, lane, &mut seg_obs);
+        observer.segment_events.extend(seg_obs.events);
+        res
+    }
+    #[cfg(not(test))]
+    {
+        let _ = observer;
+        recover_lane_at_root(queue_root, lane)
+    }
+}
 
 fn lane_subdir_name(lane: CaptureQueueLane) -> &'static str {
     match lane {
@@ -809,10 +878,17 @@ async fn step_lane_once(
 
     // Reclaim any already-consumed historical sealed segments (`min_live_seg <
     // hw.segment_id && min_live_seg < active_seg`) in `writer.lock -> append.lock`
-    // order (`ADR-RB-05` #4 ③).
+    // order (`ADR-RB-05` #4 ③), authenticating the sealed boundary against
+    // `LTM2.sealed[]` before touching disk (`RB-09d`).
     if meta.min_live_seg < hw.segment_id && meta.min_live_seg < meta.active_seg {
-        let _reclaim =
-            reclaim_sealed_segment_at_root(queue_root, lane, meta.min_live_seg, hw.segment_id)?;
+        let _ = open_and_verify_sealed_segment(queue_root, lane, &meta, meta.min_live_seg, None)?;
+        let _reclaim = call_reclaim_sealed_segment(
+            queue_root,
+            lane,
+            meta.min_live_seg,
+            hw.segment_id,
+            observer,
+        )?;
         report.reclaimed_segments += 1;
         return Ok(LaneStepOutcome::Progressed);
     }
@@ -877,11 +953,12 @@ async fn step_lane_once(
 
             // Eagerly reclaim `S` immediately after DB highwater crossed past it.
             if hw.segment_id == meta.min_live_seg {
-                let _reclaim = reclaim_sealed_segment_at_root(
+                let _reclaim = call_reclaim_sealed_segment(
                     queue_root,
                     lane,
                     hw.segment_id,
                     hw_snapshot.get(lane).segment_id,
+                    observer,
                 )?;
                 report.reclaimed_segments += 1;
             }
@@ -933,11 +1010,12 @@ async fn step_lane_once(
         // reclaim `S` right now (`ADR-RB-05` #4 ③, `RB-09` AC5, `RB-09l`).
         let committed_hw = hw_snapshot.get(lane);
         if committed_hw.segment_id > hw.segment_id && hw.segment_id == meta.min_live_seg {
-            let _reclaim = reclaim_sealed_segment_at_root(
+            let _reclaim = call_reclaim_sealed_segment(
                 queue_root,
                 lane,
                 hw.segment_id,
                 committed_hw.segment_id,
+                observer,
             )?;
             report.reclaimed_segments += 1;
         }
@@ -1149,7 +1227,7 @@ async fn step_lane_once(
         drop(active_file);
         // Delegates under `writer.lock -> capture-queue/append.lock` without
         // modifying DB `QUEUE_HIGHWATER_*` or the external `highwater` mirror.
-        let _rec = recover_lane_at_root(queue_root, lane)?;
+        let _rec = call_recover_lane(queue_root, lane, observer)?;
         report.recovery_delegations += 1;
         return Ok(LaneStepOutcome::Progressed);
     }
@@ -1159,9 +1237,10 @@ async fn step_lane_once(
 }
 
 /// Strictly read-only preflight validation of a lane's metadata, highwater
-/// monotonicity, unconsumed sealed segments, and active committed prefix
-/// BEFORE any DB write transaction or mirror update runs on either lane
-/// (`RB-09b` AC2–AC5).
+/// monotonicity, EVERY un-reclaimed rotated segment (`min_live_seg <= seg <
+/// active_seg`) against `LTM2.sealed[]`, and active committed prefix BEFORE
+/// any DB write transaction or mirror update runs on either lane
+/// (`RB-09b` AC2–AC5, `RB-09d` AC1–AC4).
 fn preflight_validate_lane(
     queue_root: &Path,
     lane: CaptureQueueLane,
@@ -1199,20 +1278,22 @@ fn preflight_validate_lane(
         });
     }
 
-    if hw.segment_id < meta.active_seg {
-        for seg_id in hw.segment_id..meta.active_seg {
-            let req = if seg_id == hw.segment_id {
-                Some(hw.byte_offset)
-            } else {
-                None
-            };
-            let (_f, sealed_len) =
-                open_and_verify_sealed_segment(queue_root, lane, &meta, seg_id, req)?;
-            if seg_id == hw.segment_id && hw.byte_offset > sealed_len {
-                return Err(StorageBackendError::CorruptCommittedFrame {
-                    detail: "capture queue DB highwater exceeds LTM2 sealed_len".to_string(),
-                });
-            }
+    // Authenticate EVERY un-reclaimed rotated segment `min_live_seg <= seg < active_seg`
+    // against `LTM2.sealed[]` (`ADR-RB-05` #4, `RB-09d` AC1–AC4). Post-reclaim
+    // crash orphans (`seg < min_live_seg`) are intentionally outside this range
+    // so recovery safely unlinks them without false alarms (`RB-09d` AC5).
+    for seg_id in meta.min_live_seg..meta.active_seg {
+        let req = if seg_id == hw.segment_id {
+            Some(hw.byte_offset)
+        } else {
+            None
+        };
+        let (_f, sealed_len) =
+            open_and_verify_sealed_segment(queue_root, lane, &meta, seg_id, req)?;
+        if seg_id == hw.segment_id && hw.byte_offset > sealed_len {
+            return Err(StorageBackendError::CorruptCommittedFrame {
+                detail: "capture queue DB highwater exceeds LTM2 sealed_len".to_string(),
+            });
         }
     }
 
@@ -2481,9 +2562,10 @@ mod tests {
             CaptureScopeState, CaptureSessionState, RedbCaptureStore,
         },
         queue::{
-            FRAME_FLAG_NONE, FRAME_FLAG_PRIORITY, SealedSegmentMeta, append_postcard_frame,
-            crc32c_checksum, encode_postcard_frame, highwater::read_highwater_mirror,
-            init_capture_queue, read_converged_lane_tail_meta, tail_meta_bak_path, tail_meta_path,
+            FRAME_FLAG_NONE, FRAME_FLAG_PRIORITY, QUEUE_TAIL_META_BAK_TMP_FILE,
+            QUEUE_TAIL_META_TMP_FILE, SealedSegmentMeta, append_postcard_frame, crc32c_checksum,
+            encode_postcard_frame, highwater::read_highwater_mirror, init_capture_queue,
+            read_converged_lane_tail_meta, tail_meta_bak_path, tail_meta_path,
         },
     };
 
@@ -5340,5 +5422,957 @@ mod tests {
             !is_writer_active(repo.path()).expect("probe after drain_capture_queue exit"),
             "writer.lock must be released after drain_capture_queue returns"
         );
+    }
+
+    /// Helper: enqueue 4 frames into `seg 0` via `append_postcard_frame`, then
+    /// seal `seg 0` into `LTM2.sealed[]` with rotated `seg 1` (1 frame), and
+    /// optionally rotate again into `seg 2` (1 frame).
+    /// Returns `(seg0_frame_end_offsets, seg0_len, seg1_len)` where `seg0_frame_end_offsets`
+    /// has 4 exact complete-frame boundary offsets (`[off1, off2, off3, off4 == seg0_len]`).
+    fn seed_rotated_lane_segments(
+        storage_dir: &Path,
+        lane: CaptureQueueLane,
+        prefix: &str,
+        also_rotate_to_seg2: bool,
+    ) -> (Vec<u64>, u64, u64) {
+        let flags = match lane {
+            CaptureQueueLane::Priority => FRAME_FLAG_PRIORITY,
+            CaptureQueueLane::Normal => FRAME_FLAG_NONE,
+        };
+        let payload_for = |tag: &str, seq: i64| match lane {
+            CaptureQueueLane::Priority => {
+                make_session_payload(tag, CaptureSessionState::Stopped, 1_700_010_000 + seq)
+            }
+            CaptureQueueLane::Normal => make_audit_payload(tag, "2026-11-24T03:00:00Z"),
+        };
+
+        let mut seg0_offsets = Vec::with_capacity(4);
+        for i in 0..4u32 {
+            let out = append_postcard_frame(
+                storage_dir,
+                lane,
+                flags,
+                &format!("{prefix}:s0:{i}"),
+                CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                &payload_for(&format!("{prefix}-s0-{i}"), i64::from(i)),
+            )
+            .expect("enqueue frame into seg 0");
+            assert_eq!(out.seg_id, 0);
+            seg0_offsets.push(out.meta.committed_len);
+        }
+        let seg0_len = *seg0_offsets.last().expect("non-empty seg0_offsets");
+        let lane_dir = storage_dir
+            .join(PRIVATE_SUBDIR)
+            .join(CAPTURE_QUEUE_SUBDIR)
+            .join(lane_subdir_name(lane));
+        let seg0_bytes = fs::read(lane_dir.join(segment_log_file_name(0))).expect("read seg 0");
+        assert_eq!(seg0_bytes.len() as u64, seg0_len);
+        let seg0_crc = crc32c_checksum(&seg0_bytes);
+
+        let seg1_bytes = encode_postcard_frame(
+            flags,
+            &format!("{prefix}:s1:0"),
+            CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+            &payload_for(&format!("{prefix}-s1-0"), 10),
+        )
+        .expect("encode seg 1 frame");
+        let seg1_len = seg1_bytes.len() as u64;
+        let seg1_crc = crc32c_checksum(&seg1_bytes);
+        write_bytes_0600(&lane_dir.join(segment_log_file_name(1)), &seg1_bytes);
+
+        let meta = if also_rotate_to_seg2 {
+            let seg2_bytes = encode_postcard_frame(
+                flags,
+                &format!("{prefix}:s2:0"),
+                CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                &payload_for(&format!("{prefix}-s2-0"), 20),
+            )
+            .expect("encode seg 2 frame");
+            let seg2_len = seg2_bytes.len() as u64;
+            let seg2_crc = crc32c_checksum(&seg2_bytes);
+            write_bytes_0600(&lane_dir.join(segment_log_file_name(2)), &seg2_bytes);
+            LaneTailMeta {
+                min_live_seg: 0,
+                active_seg: 2,
+                committed_len: seg2_len,
+                prefix_crc32c: seg2_crc,
+                sealed: vec![
+                    SealedSegmentMeta {
+                        seg_id: 0,
+                        sealed_len: seg0_len,
+                        sealed_crc32c: seg0_crc,
+                    },
+                    SealedSegmentMeta {
+                        seg_id: 1,
+                        sealed_len: seg1_len,
+                        sealed_crc32c: seg1_crc,
+                    },
+                ],
+            }
+        } else {
+            LaneTailMeta {
+                min_live_seg: 0,
+                active_seg: 1,
+                committed_len: seg1_len,
+                prefix_crc32c: seg1_crc,
+                sealed: vec![SealedSegmentMeta {
+                    seg_id: 0,
+                    sealed_len: seg0_len,
+                    sealed_crc32c: seg0_crc,
+                }],
+            }
+        };
+        let encoded_meta = meta.encode().expect("encode rotated LTM2");
+        write_bytes_0600(&tail_meta_path(&lane_dir), &encoded_meta);
+        write_bytes_0600(&tail_meta_bak_path(&lane_dir), &encoded_meta);
+
+        (seg0_offsets, seg0_len, seg1_len)
+    }
+
+    /// Helper: assert that every frame in `file_path` decodes cleanly via
+    /// `FrameStreamDecoder` and terminates with `CleanEof { offset: expected_len }`
+    /// after exactly `expected_frames` valid frames.
+    fn assert_segment_decodes_clean_eof(
+        file_path: &Path,
+        expected_frames: usize,
+        expected_len: u64,
+    ) {
+        let mut f = File::open(file_path).expect("open segment for FrameStreamDecoder check");
+        let len = f.metadata().expect("stat segment").len();
+        assert_eq!(len, expected_len);
+        let mut decoder = FrameStreamDecoder::with_known_len(&mut f, 0, len);
+        let mut count = 0usize;
+        loop {
+            match decoder
+                .next_frame()
+                .expect("truncated complete-frame segment must decode without stream error")
+            {
+                FrameStreamItem::Frame { frame, .. } => {
+                    let _: CaptureBatchPayload =
+                        decode_postcard_payload(&frame, CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION)
+                            .expect("frame inside truncated boundary must decode cleanly");
+                    count += 1;
+                }
+                FrameStreamItem::CleanEof { offset } => {
+                    assert_eq!(offset, expected_len);
+                    break;
+                }
+            }
+        }
+        assert_eq!(count, expected_frames);
+    }
+
+    #[tokio::test]
+    async fn consumer_rejects_rotated_seg_complete_frame_truncation_bitflip_and_missing() {
+        // `RB-09d` AC1–AC4 (`ADR-RB-05` #4):
+        // Authenticate EVERY un-reclaimed rotated segment (`min_live_seg <= seg < active_seg`)
+        // against `LTM2.sealed[]` before consuming frames or reclaiming segments:
+        // - AC1: Exact complete-frame boundary truncation (still 100% `CleanEof`!) rejected
+        //        via `actual_len != sealed_len` -> `CorruptCommittedFrame` (`LBR-IO-001`).
+        // - AC2: Single-byte bitflip in rotated segment rejected via `sealed_crc32c` mismatch
+        //        -> `CorruptCommittedFrame` (`LBR-IO-001`).
+        // - AC3: Missing un-reclaimed rotated segment registered in `LTM2.sealed[]` rejected
+        //        -> `CorruptCommittedFrame` (`LBR-IO-001`).
+        // - AC4: Trailing extra bytes (`actual_len > sealed_len`, both garbage and extra valid
+        //        frame!) rejected -> `CorruptCommittedFrame` (`LBR-IO-001`).
+        // Verified on BOTH `normal/` and `priority/` lanes, covering unconsumed (`hw == (0,0)`),
+        // partially-consumed (`hw == (0, off1)`), multi-rotated (`sealed[0..=1]`), and
+        // consumed-but-un-reclaimed (`min_live_seg = 0 < hw.segment_id = 1`) rotated segments,
+        // plus cross-lane fail-closed atomicity (0 DB tx, 0 highwater advance, 0 reclamation,
+        // full queue tree including `writer.lock` byte-identical).
+        for lane in [CaptureQueueLane::Normal, CaptureQueueLane::Priority] {
+            let other_lane = match lane {
+                CaptureQueueLane::Normal => CaptureQueueLane::Priority,
+                CaptureQueueLane::Priority => CaptureQueueLane::Normal,
+            };
+            let lane_label = lane_subdir_name(lane);
+
+            let repo = tempdir().expect("tempdir");
+            let init = init_capture_queue(repo.path()).expect("init capture queue");
+            bootstrap_writer_lock(&init.paths.root);
+            let lane_dir = match lane {
+                CaptureQueueLane::Normal => &init.paths.normal,
+                CaptureQueueLane::Priority => &init.paths.priority,
+            };
+            let store = RedbCaptureStore::create(
+                repo.path()
+                    .join(PRIVATE_SUBDIR)
+                    .join("capture.gen-0001.redb"),
+            )
+            .await
+            .expect("create RedbCaptureStore");
+            let spy = SpyCaptureStore::new(store.clone(), init.paths.root.clone());
+
+            // Seed a healthy frame on the OTHER lane too, proving preflight rejects
+            // rotated-segment corruption BEFORE committing ANY batch on either lane!
+            let other_flags = match other_lane {
+                CaptureQueueLane::Priority => FRAME_FLAG_PRIORITY,
+                CaptureQueueLane::Normal => FRAME_FLAG_NONE,
+            };
+            let other_payload = match other_lane {
+                CaptureQueueLane::Priority => make_session_payload(
+                    &format!("rb09d-other-prio-{lane_label}"),
+                    CaptureSessionState::Stopped,
+                    1_700_020_000,
+                ),
+                CaptureQueueLane::Normal => make_audit_payload(
+                    &format!("rb09d-other-norm-{lane_label}"),
+                    "2026-11-24T03:01:00Z",
+                ),
+            };
+            let _ = append_postcard_frame(
+                repo.path(),
+                other_lane,
+                other_flags,
+                &format!("rb09d:other:{lane_label}"),
+                CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                &other_payload,
+            )
+            .expect("enqueue healthy frame on sibling lane");
+
+            // Seed seg 0 (4 frames) -> seg 1 (1 frame) -> seg 2 (1 frame), so
+            // `min_live_seg = 0`, `active_seg = 2`, `sealed = [0, 1]`.
+            let (seg0_offsets, seg0_len, _seg1_len) =
+                seed_rotated_lane_segments(repo.path(), lane, &format!("rb09d-{lane_label}"), true);
+            let meta_init = read_converged_lane_tail_meta(lane_dir).expect("read LTM2");
+            assert_eq!(meta_init.min_live_seg, 0);
+            assert_eq!(meta_init.active_seg, 2);
+            assert_eq!(meta_init.sealed.len(), 2);
+            assert_eq!(meta_init.sealed[0].seg_id, 0);
+            assert_eq!(meta_init.sealed[0].sealed_len, seg0_len);
+            assert_eq!(meta_init.sealed[1].seg_id, 1);
+
+            let seg0_path = lane_dir.join(segment_log_file_name(0));
+            let seg1_path = lane_dir.join(segment_log_file_name(1));
+            let orig_seg0 = fs::read(&seg0_path).expect("read seg 0");
+            let orig_seg1 = fs::read(&seg1_path).expect("read seg 1");
+            assert_eq!(orig_seg0.len() as u64, seg0_len);
+
+            // Helper closure to assert fail-closed zero-mutation invariants.
+            let assert_fail_closed =
+                |err: StorageBackendError,
+                 label: &str,
+                 tx_before: u64,
+                 calls_before: usize,
+                 expected_hw: CaptureQueueHighwater,
+                 tree_before: &std::collections::BTreeMap<String, Vec<u8>>| {
+                    assert_corrupt_committed_frame(err, &format!("{lane_label} {label}"));
+                    assert_eq!(
+                        store.write_transaction_count(),
+                        tx_before,
+                        "{lane_label} {label}: must execute 0 DB write transactions"
+                    );
+                    assert_eq!(
+                        spy.recorded_calls().len(),
+                        calls_before,
+                        "{lane_label} {label}: must invoke 0 append_capture_batch calls"
+                    );
+                    assert_eq!(
+                        snapshot_queue_tree_full(&init.paths.root),
+                        *tree_before,
+                        "{lane_label} {label}: must leave entire queue tree (incl. writer.lock & LTM2) byte-identical"
+                    );
+                    let _ = expected_hw;
+                };
+
+            // -----------------------------------------------------------------
+            // AC1: Exact complete-frame boundary truncation (`CleanEof` stream!)
+            // Truncate `events-00000000.log` cleanly to frame #2 (`seg0_offsets[1]`).
+            // -----------------------------------------------------------------
+            let trunc_len = seg0_offsets[1];
+            assert!(trunc_len > 0 && trunc_len < seg0_len);
+            write_bytes_0600(&seg0_path, &orig_seg0[..trunc_len as usize]);
+            // Prove the truncated file STILL decodes 100% cleanly as 2 valid frames + `CleanEof`!
+            assert_segment_decodes_clean_eof(&seg0_path, 2, trunc_len);
+
+            let tree_before = snapshot_queue_tree_full(&init.paths.root);
+            let tx_before = store.write_transaction_count();
+            let calls_before = spy.recorded_calls().len();
+            let err = drain_capture_queue(repo.path(), &spy)
+                .await
+                .expect_err("AC1: exact complete-frame truncation on rotated seg must fail closed");
+            assert_fail_closed(
+                err,
+                "AC1 complete-frame CleanEof truncation (seg 0)",
+                tx_before,
+                calls_before,
+                CaptureQueueHighwater::default(),
+                &tree_before,
+            );
+            assert!(
+                seg0_path.exists(),
+                "AC1: truncated seg 0 must NOT be reclaimed"
+            );
+            assert_eq!(
+                store.get_queue_highwater(lane).await.unwrap(),
+                CaptureQueueHighwater::default()
+            );
+            assert_eq!(
+                store.get_queue_highwater(other_lane).await.unwrap(),
+                CaptureQueueHighwater::default(),
+                "AC1: sibling lane must not advance when preflight rejects rotated seg"
+            );
+            write_bytes_0600(&seg0_path, &orig_seg0);
+
+            // -----------------------------------------------------------------
+            // AC2: Single-byte bitflip on rotated segment (test BOTH seg 0 AND seg 1,
+            // where `hw == (0, 0)` has not even reached seg 1 yet!)
+            // -----------------------------------------------------------------
+            for (tag, target_path, orig_bytes) in [
+                ("seg 0 bitflip", &seg0_path, &orig_seg0),
+                ("seg 1 bitflip (ahead of hw)", &seg1_path, &orig_seg1),
+            ] {
+                let mut flipped = orig_bytes.clone();
+                let flip_idx = flipped.len() / 2;
+                flipped[flip_idx] ^= 0x01;
+                assert_eq!(flipped.len(), orig_bytes.len());
+                write_bytes_0600(target_path, &flipped);
+
+                let tree_before = snapshot_queue_tree_full(&init.paths.root);
+                let tx_before = store.write_transaction_count();
+                let calls_before = spy.recorded_calls().len();
+                let err = drain_capture_queue(repo.path(), &spy)
+                    .await
+                    .expect_err("AC2: single-byte bitflip on rotated seg must fail closed");
+                assert_fail_closed(
+                    err,
+                    &format!("AC2 {tag}"),
+                    tx_before,
+                    calls_before,
+                    CaptureQueueHighwater::default(),
+                    &tree_before,
+                );
+                assert_eq!(
+                    store.get_queue_highwater(lane).await.unwrap(),
+                    CaptureQueueHighwater::default()
+                );
+                assert_eq!(
+                    store.get_queue_highwater(other_lane).await.unwrap(),
+                    CaptureQueueHighwater::default()
+                );
+                write_bytes_0600(target_path, orig_bytes);
+            }
+
+            // -----------------------------------------------------------------
+            // AC3: Missing un-reclaimed rotated segment registered in `LTM2.sealed[]`
+            // (test BOTH seg 0 AND seg 1).
+            // -----------------------------------------------------------------
+            for (tag, target_path, orig_bytes) in [
+                ("seg 0 missing", &seg0_path, &orig_seg0),
+                ("seg 1 missing", &seg1_path, &orig_seg1),
+            ] {
+                fs::remove_file(target_path).expect("delete rotated seg");
+                let tree_before = snapshot_queue_tree_full(&init.paths.root);
+                let tx_before = store.write_transaction_count();
+                let calls_before = spy.recorded_calls().len();
+                let err = drain_capture_queue(repo.path(), &spy)
+                    .await
+                    .expect_err("AC3: missing rotated seg must fail closed");
+                assert_fail_closed(
+                    err,
+                    &format!("AC3 {tag}"),
+                    tx_before,
+                    calls_before,
+                    CaptureQueueHighwater::default(),
+                    &tree_before,
+                );
+                assert_eq!(
+                    store.get_queue_highwater(lane).await.unwrap(),
+                    CaptureQueueHighwater::default()
+                );
+                write_bytes_0600(target_path, orig_bytes);
+            }
+
+            // -----------------------------------------------------------------
+            // AC4: Trailing extra bytes (`actual_len > sealed_len`) — BOTH arbitrary
+            // garbage AND an extra 100%-valid postcard frame (`CleanEof` stream!).
+            // -----------------------------------------------------------------
+            let extra_valid_frame = encode_postcard_frame(
+                match lane {
+                    CaptureQueueLane::Priority => FRAME_FLAG_PRIORITY,
+                    CaptureQueueLane::Normal => FRAME_FLAG_NONE,
+                },
+                &format!("rb09d:{lane_label}:rogue-extra"),
+                CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                &make_audit_payload("rb09d-rogue-extra", "2026-11-24T03:02:00Z"),
+            )
+            .expect("encode extra valid frame");
+            for (tag, suffix) in [
+                (
+                    "trailing garbage bytes",
+                    b"TRAILING_GARBAGE_BYTES".as_slice(),
+                ),
+                ("trailing extra valid frame", extra_valid_frame.as_slice()),
+            ] {
+                let mut extended = orig_seg0.clone();
+                extended.extend_from_slice(suffix);
+                write_bytes_0600(&seg0_path, &extended);
+                if tag == "trailing extra valid frame" {
+                    assert_segment_decodes_clean_eof(&seg0_path, 5, extended.len() as u64);
+                }
+
+                let tree_before = snapshot_queue_tree_full(&init.paths.root);
+                let tx_before = store.write_transaction_count();
+                let calls_before = spy.recorded_calls().len();
+                let err = drain_capture_queue(repo.path(), &spy)
+                    .await
+                    .expect_err("AC4: trailing extra bytes on rotated seg must fail closed");
+                assert_fail_closed(
+                    err,
+                    &format!("AC4 {tag}"),
+                    tx_before,
+                    calls_before,
+                    CaptureQueueHighwater::default(),
+                    &tree_before,
+                );
+                assert!(
+                    seg0_path.exists(),
+                    "AC4: tampered seg 0 must NOT be reclaimed"
+                );
+                assert_eq!(
+                    store.get_queue_highwater(lane).await.unwrap(),
+                    CaptureQueueHighwater::default()
+                );
+                write_bytes_0600(&seg0_path, &orig_seg0);
+            }
+
+            // -----------------------------------------------------------------
+            // Additional boundary proof for ALL `min_live_seg <= seg < active_seg`:
+            // Even when DB highwater has ALREADY moved past `seg 0` (`hw = (1, 0)`)
+            // while `seg 0` is still un-reclaimed (`min_live_seg = 0`), mutating,
+            // truncating, deleting, or appending trailing bytes to `seg 0` MUST
+            // STILL fail closed with `CorruptCommittedFrame` before reclaiming!
+            // -----------------------------------------------------------------
+            let hw_seg1 = CaptureQueueHighwater {
+                segment_id: 1,
+                byte_offset: 0,
+            };
+            let _ = store
+                .append_capture_batch(&[], Some((lane, hw_seg1)))
+                .await
+                .expect("advance DB hw to (1, 0) while seg 0 remains un-reclaimed");
+            assert_eq!(store.get_queue_highwater(lane).await.unwrap(), hw_seg1);
+
+            // (a) Truncate already-consumed un-reclaimed `seg 0` to `CleanEof` boundary.
+            write_bytes_0600(&seg0_path, &orig_seg0[..trunc_len as usize]);
+            let tree_before = snapshot_queue_tree_full(&init.paths.root);
+            let tx_before = store.write_transaction_count();
+            let calls_before = spy.recorded_calls().len();
+            let err = drain_capture_queue(repo.path(), &spy)
+                .await
+                .expect_err("consumed-but-un-reclaimed seg 0 truncation must fail closed");
+            assert_fail_closed(
+                err,
+                "consumed-unreclaimed seg 0 truncation",
+                tx_before,
+                calls_before,
+                hw_seg1,
+                &tree_before,
+            );
+
+            // (b) Delete already-consumed un-reclaimed `seg 0`.
+            fs::remove_file(&seg0_path).unwrap();
+            let tree_before = snapshot_queue_tree_full(&init.paths.root);
+            let tx_before = store.write_transaction_count();
+            let calls_before = spy.recorded_calls().len();
+            let err = drain_capture_queue(repo.path(), &spy)
+                .await
+                .expect_err("consumed-but-un-reclaimed seg 0 missing must fail closed");
+            assert_fail_closed(
+                err,
+                "consumed-unreclaimed seg 0 missing",
+                tx_before,
+                calls_before,
+                hw_seg1,
+                &tree_before,
+            );
+
+            // (c) Append trailing bytes to already-consumed un-reclaimed `seg 0`.
+            let mut extended = orig_seg0.clone();
+            extended.extend_from_slice(&extra_valid_frame);
+            write_bytes_0600(&seg0_path, &extended);
+            let tree_before = snapshot_queue_tree_full(&init.paths.root);
+            let tx_before = store.write_transaction_count();
+            let calls_before = spy.recorded_calls().len();
+            let err = drain_capture_queue(repo.path(), &spy)
+                .await
+                .expect_err("consumed-but-un-reclaimed seg 0 trailing bytes must fail closed");
+            assert_fail_closed(
+                err,
+                "consumed-unreclaimed seg 0 trailing bytes",
+                tx_before,
+                calls_before,
+                hw_seg1,
+                &tree_before,
+            );
+
+            // Restore untouched `seg 0` -> consumer now drains cleanly and reclaims `seg 0` & `seg 1`!
+            write_bytes_0600(&seg0_path, &orig_seg0);
+            let ok_rep = drain_capture_queue(repo.path(), &spy)
+                .await
+                .expect("restored segments must drain and reclaim cleanly");
+            assert!(ok_rep.acquired_writer_lock);
+            assert_eq!(ok_rep.reclaimed_segments, 2);
+            assert!(!seg0_path.exists());
+            assert!(!seg1_path.exists());
+            let final_meta = read_converged_lane_tail_meta(lane_dir).unwrap();
+            assert_eq!(final_meta.min_live_seg, 2);
+            assert_eq!(final_meta.active_seg, 2);
+            assert!(final_meta.sealed.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn reclamation_updates_ltm2_before_unlink_and_cleans_crash_orphan() {
+        // `RB-09d` AC5 (`ADR-RB-05` #4 ③):
+        // Verify on BOTH `normal/` and `priority/`:
+        // 1. Crash injection via `AfterReclaimMetaBeforeUnlink` inside the real
+        //    consumer (`drain_locked_at_root`): consumer commits dual `LTM2`
+        //    (`MIN_LIVE_SEG = S + 1`, removing `sealed[S]`) strictly BEFORE
+        //    `unlink("events-<S>.log")` and crashes before unlinking.
+        //    Restart (Scenario A: with remaining unconsumed frames in `S + 1`)
+        //    ingests remaining frames with 0 duplicates, recognizes `S < MIN_LIVE_SEG`
+        //    as a reclaimed crash orphan, safely executes `unlink` + `fsync_dir`
+        //    without false alarms and without touching `quarantine/`.
+        // 2. Scenario B (0 remaining frames in `S + 1` on restart): crash right
+        //    after updating `LTM2` (`MIN_LIVE_SEG = S + 1`) and before `unlink(S)`
+        //    when `S + 1` is already completely drained -> restart runs 0 DB write
+        //    transactions and still cleans crash orphan `S` via `unlink` + `fsync_dir`
+        //    with 0 quarantine and 0 false alarms.
+        // 3. Healthy non-crashing reclaim strict durability order proof:
+        //    `AcquireAppendLock < MetaRename(tail.meta) < FsyncLaneDirAfterMeta(tail.meta)
+        //     < MetaRename(tail.meta.bak) < FsyncLaneDirAfterMeta(tail.meta.bak)
+        //     < ReclaimSegmentUnlink < FsyncLaneDirAfterReclaim < ReleaseAppendLock`.
+        for lane in [CaptureQueueLane::Normal, CaptureQueueLane::Priority] {
+            let lane_label = lane_subdir_name(lane);
+
+            // =================================================================
+            // Scenario A: Crash after LTM2 commit before unlink(seg 0), WITH
+            // remaining unconsumed frames in seg 1.
+            // =================================================================
+            {
+                let repo = tempdir().expect("tempdir");
+                let init = init_capture_queue(repo.path()).expect("init capture queue");
+                let lane_dir = match lane {
+                    CaptureQueueLane::Normal => &init.paths.normal,
+                    CaptureQueueLane::Priority => &init.paths.priority,
+                };
+                let store = RedbCaptureStore::create(
+                    repo.path()
+                        .join(PRIVATE_SUBDIR)
+                        .join("capture.gen-0001.redb"),
+                )
+                .await
+                .expect("create RedbCaptureStore");
+                let spy = SpyCaptureStore::new(store.clone(), init.paths.root.clone());
+
+                let (_seg0_offsets, _seg0_len, seg1_len) = seed_rotated_lane_segments(
+                    repo.path(),
+                    lane,
+                    &format!("rb09d-ac5a-{lane_label}"),
+                    false,
+                );
+                let seg0_path = lane_dir.join(segment_log_file_name(0));
+                let seg1_path = lane_dir.join(segment_log_file_name(1));
+                assert!(seg0_path.exists() && seg1_path.exists());
+
+                // Run real consumer with `AfterReclaimMetaBeforeUnlink` crash injection.
+                let lock = try_acquire_writer_lock_at_root(&init.paths.root)
+                    .expect("acquire writer.lock")
+                    .expect("writer.lock free");
+                let mut crash_obs = WriterObserver::with_reclaim_crash_point(
+                    SegmentCrashPoint::AfterReclaimMetaBeforeUnlink,
+                );
+                let crash_err = drain_locked_at_root(
+                    &init.paths.root,
+                    &spy,
+                    QueueWriterOptions::default(),
+                    &lock,
+                    &mut crash_obs,
+                )
+                .await
+                .expect_err("AC5: must crash after LTM2 reclaim commit and before unlink(seg 0)");
+                assert!(
+                    matches!(crash_err, StorageBackendError::Io { .. }),
+                    "expected injected Io crash, got {crash_err:?}"
+                );
+                drop(lock);
+
+                // Verify post-crash state: BOTH `tail.meta` and `tail.meta.bak`
+                // already advanced `MIN_LIVE_SEG = 1` & removed `sealed[0]`, while
+                // `events-00000000.log` STILL exists on disk (unlink never ran!).
+                assert!(
+                    seg0_path.exists(),
+                    "AC5 ({lane_label}): events-00000000.log must still exist right after pre-unlink crash"
+                );
+                let primary_bytes = fs::read(tail_meta_path(lane_dir)).unwrap();
+                let backup_bytes = fs::read(tail_meta_bak_path(lane_dir)).unwrap();
+                assert_eq!(primary_bytes, backup_bytes);
+                let crashed_meta = LaneTailMeta::decode(&primary_bytes).unwrap();
+                assert_eq!(crashed_meta.min_live_seg, 1);
+                assert_eq!(crashed_meta.active_seg, 1);
+                assert!(crashed_meta.sealed.is_empty());
+                assert_eq!(
+                    store.get_queue_highwater(lane).await.unwrap(),
+                    CaptureQueueHighwater {
+                        segment_id: 1,
+                        byte_offset: 0,
+                    }
+                );
+                assert!(
+                    crash_obs
+                        .segment_events
+                        .contains(&SegmentOpEvent::FsyncLaneDirAfterMeta {
+                            lane: lane_label,
+                            target_name: QUEUE_TAIL_META_BAK_FILE,
+                        }),
+                    "AC5 ({lane_label}): dual LTM2 commit must finish before pre-unlink crash"
+                );
+                assert!(
+                    !crash_obs.segment_events.iter().any(|e| matches!(
+                        e,
+                        SegmentOpEvent::ReclaimSegmentUnlink { .. }
+                            | SegmentOpEvent::FsyncLaneDirAfterReclaim { .. }
+                    )),
+                    "AC5 ({lane_label}): unlink must NOT have executed before injected crash"
+                );
+
+                // Restart consumer: drains seg 1 (1 frame, 0 dups), recognizes
+                // `0 < MIN_LIVE_SEG (1)` as reclaimed crash orphan, safely executes
+                // `unlink` + `fsync_dir` with 0 false alarms and 0 quarantine!
+                let lock = try_acquire_writer_lock_at_root(&init.paths.root)
+                    .expect("acquire writer.lock for restart")
+                    .expect("writer.lock free");
+                let mut restart_obs = WriterObserver::new();
+                let restart_rep = drain_locked_at_root(
+                    &init.paths.root,
+                    &spy,
+                    QueueWriterOptions::default(),
+                    &lock,
+                    &mut restart_obs,
+                )
+                .await
+                .expect("AC5: restart after pre-unlink crash must succeed with zero false alarms");
+                drop(lock);
+
+                assert!(restart_rep.acquired_writer_lock);
+                assert_eq!(restart_rep.applied_frames, 1);
+                assert_eq!(restart_rep.deduplicated_frames, 0);
+                assert_eq!(restart_rep.recovery_delegations, 1);
+                assert!(
+                    !seg0_path.exists(),
+                    "AC5 ({lane_label}): crash orphan events-00000000.log must be unlinked on restart"
+                );
+                assert!(seg1_path.exists());
+                assert_eq!(
+                    fs::read_dir(&init.paths.quarantine).unwrap().count(),
+                    0,
+                    "AC5 ({lane_label}): reclaimed crash orphan must NEVER be quarantined"
+                );
+                assert_eq!(
+                    store.get_queue_highwater(lane).await.unwrap(),
+                    CaptureQueueHighwater {
+                        segment_id: 1,
+                        byte_offset: seg1_len,
+                    }
+                );
+                let pos_lock = restart_obs
+                    .segment_events
+                    .iter()
+                    .position(|e| *e == SegmentOpEvent::AcquireAppendLock)
+                    .expect("restart orphan cleanup must acquire append.lock");
+                let pos_orphan_unlink = restart_obs
+                    .segment_events
+                    .iter()
+                    .position(|e| {
+                        *e == SegmentOpEvent::ReclaimedOrphanUnlink {
+                            lane: lane_label,
+                            seg_id: 0,
+                        }
+                    })
+                    .expect("restart must unlink reclaimed orphan seg 0");
+                let pos_orphan_fsync = restart_obs
+                    .segment_events
+                    .iter()
+                    .position(|e| {
+                        *e == SegmentOpEvent::FsyncLaneDirAfterReclaimedOrphan { lane: lane_label }
+                    })
+                    .expect("restart must fsync lane_dir after unlinking reclaimed orphan");
+                let pos_unlock = restart_obs
+                    .segment_events
+                    .iter()
+                    .position(|e| *e == SegmentOpEvent::ReleaseAppendLock)
+                    .expect("restart must release append.lock");
+                assert!(
+                    pos_lock < pos_orphan_unlink
+                        && pos_orphan_unlink < pos_orphan_fsync
+                        && pos_orphan_fsync < pos_unlock,
+                    "AC5 ({lane_label}): orphan cleanup must execute AcquireAppendLock < unlink < fsync_dir < ReleaseAppendLock; got {:?}",
+                    restart_obs.segment_events
+                );
+
+                // Verify all 5 frames (4 from seg 0 + 1 from seg 1) persisted cleanly with 0 dups.
+                match lane {
+                    CaptureQueueLane::Normal => {
+                        assert_eq!(
+                            store
+                                .list_audit_logs_by_checkpoint(TEST_AUDIT_CHECKPOINT_ID)
+                                .await
+                                .unwrap()
+                                .len(),
+                            5
+                        );
+                    }
+                    CaptureQueueLane::Priority => {
+                        assert_eq!(
+                            store.list_sessions_by_started_desc().await.unwrap().len(),
+                            5
+                        );
+                    }
+                }
+            }
+
+            // =================================================================
+            // Scenario B: Crash after LTM2 commit before unlink(seg 0), WITH 0
+            // remaining unconsumed frames in seg 1 -> restart runs 0 DB tx and
+            // cleanly unlinks + fsync_dir the reclaimed crash orphan.
+            // =================================================================
+            {
+                let repo = tempdir().expect("tempdir");
+                let init = init_capture_queue(repo.path()).expect("init capture queue");
+                let lane_dir = match lane {
+                    CaptureQueueLane::Normal => &init.paths.normal,
+                    CaptureQueueLane::Priority => &init.paths.priority,
+                };
+                let store = RedbCaptureStore::create(
+                    repo.path()
+                        .join(PRIVATE_SUBDIR)
+                        .join("capture.gen-0001.redb"),
+                )
+                .await
+                .expect("create RedbCaptureStore");
+                let spy = SpyCaptureStore::new(store.clone(), init.paths.root.clone());
+
+                let (_seg0_offsets, _seg0_len, seg1_len) = seed_rotated_lane_segments(
+                    repo.path(),
+                    lane,
+                    &format!("rb09d-ac5b-{lane_label}"),
+                    false,
+                );
+                let seg0_path = lane_dir.join(segment_log_file_name(0));
+
+                // Advance DB highwater to `(1, seg1_len)` (all frames already
+                // consumed while `seg 0` is still un-reclaimed `min_live_seg = 0`).
+                let drained_hw = CaptureQueueHighwater {
+                    segment_id: 1,
+                    byte_offset: seg1_len,
+                };
+                let _ = store
+                    .append_capture_batch(&[], Some((lane, drained_hw)))
+                    .await
+                    .unwrap();
+
+                // Crash consumer during reclamation of `seg 0` after dual LTM2 commit
+                // and strictly before `unlink("events-00000000.log")`.
+                let lock = try_acquire_writer_lock_at_root(&init.paths.root)
+                    .unwrap()
+                    .unwrap();
+                let mut crash_obs = WriterObserver::with_reclaim_crash_point(
+                    SegmentCrashPoint::AfterReclaimMetaBeforeUnlink,
+                );
+                let _ = drain_locked_at_root(
+                    &init.paths.root,
+                    &spy,
+                    QueueWriterOptions::default(),
+                    &lock,
+                    &mut crash_obs,
+                )
+                .await
+                .expect_err("AC5b: must crash after LTM2 reclaim commit before unlink(seg 0)");
+                drop(lock);
+                assert!(seg0_path.exists());
+                assert_eq!(
+                    read_converged_lane_tail_meta(lane_dir)
+                        .unwrap()
+                        .min_live_seg,
+                    1
+                );
+
+                // Restart with ZERO remaining frames to consume: 0 DB writes,
+                // orphan `seg 0` unlinked + `fsync_dir`, 0 quarantine, 0 false alarms!
+                let tx_before = store.write_transaction_count();
+                let lock = try_acquire_writer_lock_at_root(&init.paths.root)
+                    .unwrap()
+                    .unwrap();
+                let mut restart_obs = WriterObserver::new();
+                let restart_rep = drain_locked_at_root(
+                    &init.paths.root,
+                    &spy,
+                    QueueWriterOptions::default(),
+                    &lock,
+                    &mut restart_obs,
+                )
+                .await
+                .expect("AC5b: 0-frame restart must clean crash orphan without false alarms");
+                drop(lock);
+
+                assert_eq!(store.write_transaction_count(), tx_before);
+                assert_eq!(restart_rep.applied_frames, 0);
+                assert_eq!(restart_rep.recovery_delegations, 1);
+                assert!(!seg0_path.exists());
+                assert_eq!(fs::read_dir(&init.paths.quarantine).unwrap().count(), 0);
+                assert!(restart_obs.segment_events.contains(
+                    &SegmentOpEvent::ReclaimedOrphanUnlink {
+                        lane: lane_label,
+                        seg_id: 0,
+                    }
+                ));
+                assert!(restart_obs.segment_events.contains(
+                    &SegmentOpEvent::FsyncLaneDirAfterReclaimedOrphan { lane: lane_label }
+                ));
+
+                // Subsequent restart is a pure converged no-op.
+                let noop_rep = drain_capture_queue(repo.path(), &spy)
+                    .await
+                    .expect("converged no-op drain");
+                assert_eq!(noop_rep.recovery_delegations, 0);
+                assert_eq!(noop_rep.reclaimed_segments, 0);
+                assert_eq!(store.write_transaction_count(), tx_before);
+            }
+
+            // =================================================================
+            // Scenario C: Healthy non-crashing reclaim strict ordering proof
+            // through real `drain_locked_at_root`:
+            // `AcquireAppendLock < MetaRename(tail.meta) < FsyncLaneDirAfterMeta(tail.meta)
+            //  < MetaRename(tail.meta.bak) < FsyncLaneDirAfterMeta(tail.meta.bak)
+            //  < ReclaimSegmentUnlink < FsyncLaneDirAfterReclaim < ReleaseAppendLock`.
+            // =================================================================
+            {
+                let repo = tempdir().expect("tempdir");
+                let init = init_capture_queue(repo.path()).expect("init capture queue");
+                let lane_dir = match lane {
+                    CaptureQueueLane::Normal => &init.paths.normal,
+                    CaptureQueueLane::Priority => &init.paths.priority,
+                };
+                let store = RedbCaptureStore::create(
+                    repo.path()
+                        .join(PRIVATE_SUBDIR)
+                        .join("capture.gen-0001.redb"),
+                )
+                .await
+                .expect("create RedbCaptureStore");
+                let spy = SpyCaptureStore::new(store.clone(), init.paths.root.clone());
+
+                let _ = seed_rotated_lane_segments(
+                    repo.path(),
+                    lane,
+                    &format!("rb09d-ac5c-{lane_label}"),
+                    false,
+                );
+                let seg0_path = lane_dir.join(segment_log_file_name(0));
+
+                let lock = try_acquire_writer_lock_at_root(&init.paths.root)
+                    .unwrap()
+                    .unwrap();
+                let mut healthy_obs = WriterObserver::new();
+                let rep = drain_locked_at_root(
+                    &init.paths.root,
+                    &spy,
+                    QueueWriterOptions::default(),
+                    &lock,
+                    &mut healthy_obs,
+                )
+                .await
+                .expect("AC5c: healthy drain & reclaim must succeed");
+                drop(lock);
+
+                assert_eq!(rep.reclaimed_segments, 1);
+                assert_eq!(rep.applied_frames, 5);
+                assert!(!seg0_path.exists());
+                let primary_bytes = fs::read(tail_meta_path(lane_dir)).unwrap();
+                let backup_bytes = fs::read(tail_meta_bak_path(lane_dir)).unwrap();
+                assert_eq!(primary_bytes, backup_bytes);
+                let final_meta = LaneTailMeta::decode(&primary_bytes).unwrap();
+                assert_eq!(final_meta.min_live_seg, 1);
+                assert_eq!(final_meta.active_seg, 1);
+                assert!(final_meta.sealed.is_empty());
+
+                let evs = &healthy_obs.segment_events;
+                let p_lock = evs
+                    .iter()
+                    .position(|e| *e == SegmentOpEvent::AcquireAppendLock)
+                    .expect("AcquireAppendLock");
+                let p_pri_rename = evs
+                    .iter()
+                    .position(|e| {
+                        *e == SegmentOpEvent::MetaRename {
+                            lane: lane_label,
+                            tmp_name: QUEUE_TAIL_META_TMP_FILE,
+                            target_name: QUEUE_TAIL_META_FILE,
+                        }
+                    })
+                    .expect("MetaRename(tail.meta)");
+                let p_pri_fsync = evs
+                    .iter()
+                    .position(|e| {
+                        *e == SegmentOpEvent::FsyncLaneDirAfterMeta {
+                            lane: lane_label,
+                            target_name: QUEUE_TAIL_META_FILE,
+                        }
+                    })
+                    .expect("FsyncLaneDirAfterMeta(tail.meta)");
+                let p_bak_rename = evs
+                    .iter()
+                    .position(|e| {
+                        *e == SegmentOpEvent::MetaRename {
+                            lane: lane_label,
+                            tmp_name: QUEUE_TAIL_META_BAK_TMP_FILE,
+                            target_name: QUEUE_TAIL_META_BAK_FILE,
+                        }
+                    })
+                    .expect("MetaRename(tail.meta.bak)");
+                let p_bak_fsync = evs
+                    .iter()
+                    .position(|e| {
+                        *e == SegmentOpEvent::FsyncLaneDirAfterMeta {
+                            lane: lane_label,
+                            target_name: QUEUE_TAIL_META_BAK_FILE,
+                        }
+                    })
+                    .expect("FsyncLaneDirAfterMeta(tail.meta.bak)");
+                let p_unlink = evs
+                    .iter()
+                    .position(|e| {
+                        *e == SegmentOpEvent::ReclaimSegmentUnlink {
+                            lane: lane_label,
+                            seg_id: 0,
+                        }
+                    })
+                    .expect("ReclaimSegmentUnlink(seg 0)");
+                let p_reclaim_fsync = evs
+                    .iter()
+                    .position(|e| {
+                        *e == SegmentOpEvent::FsyncLaneDirAfterReclaim {
+                            lane: lane_label,
+                            seg_id: 0,
+                        }
+                    })
+                    .expect("FsyncLaneDirAfterReclaim(seg 0)");
+                let p_unlock = evs
+                    .iter()
+                    .position(|e| *e == SegmentOpEvent::ReleaseAppendLock)
+                    .expect("ReleaseAppendLock");
+                assert!(
+                    p_lock < p_pri_rename
+                        && p_pri_rename < p_pri_fsync
+                        && p_pri_fsync < p_bak_rename
+                        && p_bak_rename < p_bak_fsync
+                        && p_bak_fsync < p_unlink
+                        && p_unlink < p_reclaim_fsync
+                        && p_reclaim_fsync < p_unlock,
+                    "AC5c ({lane_label}): reclaim violated strict durability ordering! events = {evs:?}"
+                );
+            }
+        }
     }
 }

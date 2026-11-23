@@ -877,7 +877,7 @@ struct LaneTempCleanupCounts {
 
 #[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum SegmentOpEvent {
+pub(super) enum SegmentOpEvent {
     AcquireAppendLock,
     CreateSegment {
         lane: &'static str,
@@ -979,6 +979,13 @@ enum SegmentOpEvent {
         lane: &'static str,
         seg_id: u32,
     },
+    ReclaimedOrphanUnlink {
+        lane: &'static str,
+        seg_id: u32,
+    },
+    FsyncLaneDirAfterReclaimedOrphan {
+        lane: &'static str,
+    },
     CapacityChecked {
         priority_bytes: u64,
         normal_bytes: u64,
@@ -991,7 +998,7 @@ enum SegmentOpEvent {
 
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SegmentCrashPoint {
+pub(super) enum SegmentCrashPoint {
     None,
     /// Simulate process crash immediately after `seg.sync_data()` and before
     /// any `tail.meta` or `tail.meta.bak` update (Case C fault injection).
@@ -1044,8 +1051,8 @@ type BeforeCreateMissingLockHook = Box<dyn FnMut()>;
 type IncomingFrameWriteHook = Box<dyn FnMut(&'static str, u32, u64, usize)>;
 
 #[cfg(test)]
-struct SegmentObserver {
-    events: Vec<SegmentOpEvent>,
+pub(super) struct SegmentObserver {
+    pub(super) events: Vec<SegmentOpEvent>,
     crash_point: SegmentCrashPoint,
     before_create_missing_lock: Option<BeforeCreateMissingLockHook>,
     simulate_foreign_reclaim_owner: bool,
@@ -1055,7 +1062,7 @@ struct SegmentObserver {
 
 #[cfg(test)]
 impl SegmentObserver {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             events: Vec::new(),
             crash_point: SegmentCrashPoint::None,
@@ -1066,7 +1073,7 @@ impl SegmentObserver {
         }
     }
 
-    fn with_crash(crash_point: SegmentCrashPoint) -> Self {
+    pub(super) fn with_crash(crash_point: SegmentCrashPoint) -> Self {
         Self {
             events: Vec::new(),
             crash_point,
@@ -1316,6 +1323,16 @@ impl SegmentObserver {
             .push(SegmentOpEvent::FsyncLaneDirAfterReclaim { lane, seg_id });
     }
 
+    fn record_reclaimed_orphan_unlink(&mut self, lane: &'static str, seg_id: u32) {
+        self.events
+            .push(SegmentOpEvent::ReclaimedOrphanUnlink { lane, seg_id });
+    }
+
+    fn record_fsync_lane_after_reclaimed_orphan(&mut self, lane: &'static str) {
+        self.events
+            .push(SegmentOpEvent::FsyncLaneDirAfterReclaimedOrphan { lane });
+    }
+
     fn record_capacity_checked(
         &mut self,
         occupancy: CaptureQueueOccupancy,
@@ -1487,6 +1504,12 @@ impl SegmentObserver {
 
     #[inline]
     fn record_fsync_lane_after_reclaim(&mut self, _lane: &'static str, _seg_id: u32) {}
+
+    #[inline]
+    fn record_reclaimed_orphan_unlink(&mut self, _lane: &'static str, _seg_id: u32) {}
+
+    #[inline]
+    fn record_fsync_lane_after_reclaimed_orphan(&mut self, _lane: &'static str) {}
 
     #[inline]
     fn record_capacity_checked(
@@ -2345,6 +2368,17 @@ fn reclaim_sealed_segment_in_storage_dir(
     }
 }
 
+#[cfg(test)]
+pub(super) fn reclaim_sealed_segment_at_root_with_observer(
+    queue_root: &Path,
+    lane: CaptureQueueLane,
+    seg_id: u32,
+    highwater_seg: u32,
+    observer: &mut SegmentObserver,
+) -> StorageResult<SegmentReclaimOutcome> {
+    reclaim_sealed_segment_at_root_inner(queue_root, lane, seg_id, highwater_seg, observer)
+}
+
 #[allow(dead_code)] // Consumed by `storage::queue::writer` starting in RB-09.
 fn reclaim_sealed_segment_at_root_inner(
     queue_root: &Path,
@@ -2636,6 +2670,15 @@ fn recover_lane_in_storage_dir(
     {
         non_unix_seg::recover_in_storage_dir_non_unix(storage_dir, lane, observer)
     }
+}
+
+#[cfg(test)]
+pub(super) fn recover_lane_at_root_with_observer(
+    queue_root: &Path,
+    lane: CaptureQueueLane,
+    observer: &mut SegmentObserver,
+) -> StorageResult<LaneRecoveryReport> {
+    recover_lane_at_root_inner(queue_root, lane, observer)
 }
 
 fn recover_lane_at_root_inner(
@@ -3351,8 +3394,10 @@ mod unix_seg {
 
     fn clean_reclaimed_orphans_unix(
         lane_fd: &OwnedFd,
+        lane_label: &'static str,
         reclaimed_orphans: &[u32],
         expected_uid: u32,
+        observer: &mut SegmentObserver,
     ) -> StorageResult<usize> {
         let mut removed = 0usize;
         for &seg_id in reclaimed_orphans {
@@ -3405,6 +3450,7 @@ mod unix_seg {
                     ));
                 }
             } else {
+                observer.record_reclaimed_orphan_unlink(lane_label, seg_id);
                 removed += 1;
             }
         }
@@ -3413,6 +3459,7 @@ mod unix_seg {
                 lane_fd,
                 "fsync capture queue lane after unlinking reclaimed orphans",
             )?;
+            observer.record_fsync_lane_after_reclaimed_orphan(lane_label);
         }
         Ok(removed)
     }
@@ -3820,8 +3867,13 @@ mod unix_seg {
                 reclaimed_orphans,
                 ..
             } => {
-                let reclaimed_orphans_removed =
-                    clean_reclaimed_orphans_unix(lane_fd, &reclaimed_orphans, expected_uid)?;
+                let reclaimed_orphans_removed = clean_reclaimed_orphans_unix(
+                    lane_fd,
+                    lane_label,
+                    &reclaimed_orphans,
+                    expected_uid,
+                    observer,
+                )?;
                 let mirrored_replica = apply_mirror_sync_unix(
                     lane_fd,
                     lane_label,
@@ -3854,8 +3906,13 @@ mod unix_seg {
                 reclaimed_orphans,
                 ..
             } => {
-                let reclaimed_orphans_removed =
-                    clean_reclaimed_orphans_unix(lane_fd, &reclaimed_orphans, expected_uid)?;
+                let reclaimed_orphans_removed = clean_reclaimed_orphans_unix(
+                    lane_fd,
+                    lane_label,
+                    &reclaimed_orphans,
+                    expected_uid,
+                    observer,
+                )?;
                 let step_c1 = case_c_step_c1_unix(
                     ctx,
                     meta,
@@ -3900,8 +3957,13 @@ mod unix_seg {
                 reclaimed_orphans,
                 ..
             } => {
-                let reclaimed_orphans_removed =
-                    clean_reclaimed_orphans_unix(lane_fd, &reclaimed_orphans, expected_uid)?;
+                let reclaimed_orphans_removed = clean_reclaimed_orphans_unix(
+                    lane_fd,
+                    lane_label,
+                    &reclaimed_orphans,
+                    expected_uid,
+                    observer,
+                )?;
                 let mut quarantined_artifacts = Vec::new();
                 let (effective_old_meta, old_recovered_frames, old_recovered_bytes) =
                     if let Some(ot) = old_tail {
@@ -3985,8 +4047,13 @@ mod unix_seg {
                 reclaimed_orphans,
                 ..
             } => {
-                let reclaimed_orphans_removed =
-                    clean_reclaimed_orphans_unix(lane_fd, &reclaimed_orphans, expected_uid)?;
+                let reclaimed_orphans_removed = clean_reclaimed_orphans_unix(
+                    lane_fd,
+                    lane_label,
+                    &reclaimed_orphans,
+                    expected_uid,
+                    observer,
+                )?;
                 let mut quarantined_artifacts = Vec::new();
                 let (effective_old_meta, old_recovered_frames, old_recovered_bytes) =
                     if let Some(ot) = old_tail {
@@ -7159,6 +7226,30 @@ mod non_unix_seg {
             })
         }
 
+        fn clean_reclaimed_orphans_windows(
+            lane_dir: &Path,
+            lane_label: &'static str,
+            orphans: &[u32],
+            observer: &mut SegmentObserver,
+        ) -> StorageResult<usize> {
+            let mut removed = 0usize;
+            for &seg_id in orphans {
+                let p = lane_dir.join(segment_log_file_name(seg_id));
+                if ensure_not_reparse_or_dir_if_exists(&p, "capture queue reclaimed orphan")? {
+                    fs::remove_file(&p).map_err(|e| {
+                        StorageBackendError::io("remove reclaimed capture queue orphan", e)
+                    })?;
+                    observer.record_reclaimed_orphan_unlink(lane_label, seg_id);
+                    removed += 1;
+                }
+            }
+            if removed > 0 {
+                flush_windows_dir(lane_dir)?;
+                observer.record_fsync_lane_after_reclaimed_orphan(lane_label);
+            }
+            Ok(removed)
+        }
+
         fn phase2_execute_plan_windows(
             ctx: &WindowsPhase2Context<'_>,
             plan: Phase1Plan<std::ffi::OsString>,
@@ -7175,22 +7266,6 @@ mod non_unix_seg {
             )?;
             let cleaned = cleanup.lane_meta_tmp_files;
             let cleaned_quarantine_tmp_files = cleanup.quarantine_tmp_files;
-            let clean_orphans = |orphans: &[u32]| -> StorageResult<usize> {
-                let mut removed = 0usize;
-                for &seg_id in orphans {
-                    let p = lane_dir.join(segment_log_file_name(seg_id));
-                    if ensure_not_reparse_or_dir_if_exists(&p, "capture queue reclaimed orphan")? {
-                        fs::remove_file(&p).map_err(|e| {
-                            StorageBackendError::io("remove reclaimed capture queue orphan", e)
-                        })?;
-                        removed += 1;
-                    }
-                }
-                if removed > 0 {
-                    flush_windows_dir(lane_dir)?;
-                }
-                Ok(removed)
-            };
 
             match plan {
                 Phase1Plan::Case0aFreshEmpty { .. } => {
@@ -7262,7 +7337,12 @@ mod non_unix_seg {
                     reclaimed_orphans,
                     ..
                 } => {
-                    let orphans = clean_orphans(&reclaimed_orphans)?;
+                    let orphans = clean_reclaimed_orphans_windows(
+                        lane_dir,
+                        lane_label,
+                        &reclaimed_orphans,
+                        observer,
+                    )?;
                     let mirrored = match mirror_sync {
                         MirrorSync::None => false,
                         MirrorSync::SyncBackup => {
@@ -7315,7 +7395,12 @@ mod non_unix_seg {
                     reclaimed_orphans,
                     ..
                 } => {
-                    let orphans = clean_orphans(&reclaimed_orphans)?;
+                    let orphans = clean_reclaimed_orphans_windows(
+                        lane_dir,
+                        lane_label,
+                        &reclaimed_orphans,
+                        observer,
+                    )?;
                     let step_c1 = case_c_step_c1_windows(
                         ctx,
                         meta,
@@ -7366,7 +7451,12 @@ mod non_unix_seg {
                     reclaimed_orphans,
                     ..
                 } => {
-                    let orphans = clean_orphans(&reclaimed_orphans)?;
+                    let orphans = clean_reclaimed_orphans_windows(
+                        lane_dir,
+                        lane_label,
+                        &reclaimed_orphans,
+                        observer,
+                    )?;
                     let mut quarantined_artifacts = Vec::new();
                     let (effective_old_meta, old_recovered_frames, old_recovered_bytes) =
                         if let Some(ot) = old_tail {
@@ -7434,7 +7524,12 @@ mod non_unix_seg {
                     reclaimed_orphans,
                     ..
                 } => {
-                    let orphans = clean_orphans(&reclaimed_orphans)?;
+                    let orphans = clean_reclaimed_orphans_windows(
+                        lane_dir,
+                        lane_label,
+                        &reclaimed_orphans,
+                        observer,
+                    )?;
                     let mut quarantined_artifacts = Vec::new();
                     let (effective_old_meta, old_recovered_frames, old_recovered_bytes) =
                         if let Some(ot) = old_tail {
