@@ -19567,4 +19567,855 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn virgin_and_prebootstrapped_zero_segment_lane_init() {
+        // `RB-08e` AC1 & AC2 (`ADR-RB-05` #3 Case 0a / 0b):
+        // - AC1 (Case 0a — virgin empty lane): 0 `events-*.log` AND both
+        //   `tail.meta` and `tail.meta.bak` absent (`ENOENT`) -> atomically
+        //   commits 34-byte `LTM2` `(0, 0, 0, 0, [])` dual replicas (`0600`)
+        //   + `fsync_dir(lane_dir)` strictly BEFORE creating
+        //   `events-00000000.log`.
+        // - AC2 (Case 0b — pre-initialized empty lane): 0 `events-*.log` AND
+        //   valid `LTM2` strictly equal to `(0, 0, 0, 0, [])` (both replicas
+        //   present OR single-replica Subcase B1 mirror repair in either
+        //   direction across Deleted/CorruptCrc/Truncated/Oversized) -> repairs
+        //   lagging/missing replica BEFORE creating `events-00000000.log`, then
+        //   creates `events-00000000.log` and enqueues cleanly.
+
+        let expected_empty = LaneTailMeta::initial_empty();
+        let expected_empty_bytes = expected_empty.encode().expect("encode initial empty LTM2");
+        assert_eq!(expected_empty_bytes.len(), crate::storage::LTM2_MIN_LEN);
+        assert_eq!(crate::storage::LTM2_MIN_LEN, 34);
+
+        // Helper to strip pre-created `tail.meta` + `tail.meta.bak` from an
+        // initialized queue directory so the lane is genuinely virgin (Case 0a).
+        let make_virgin_lane = |lane_dir: &Path| {
+            let _ = fs::remove_file(tail_meta_path(lane_dir));
+            let _ = fs::remove_file(tail_meta_bak_path(lane_dir));
+            assert!(!tail_meta_path(lane_dir).exists());
+            assert!(!tail_meta_bak_path(lane_dir).exists());
+            assert!(!lane_dir.join(segment_log_file_name(0)).exists());
+        };
+
+        // =====================================================================
+        // Part 1 — AC1 (Case 0a): Genuine virgin empty lane.
+        // =====================================================================
+        // (1a) `recover_lane` on virgin lane writes 34B `0600` dual `LTM2`
+        // `(0,0,0,0,[])` + `fsync_dir` without creating `events-00000000.log`.
+        {
+            let repo = tempdir().expect("tempdir");
+            let init = init_capture_queue(repo.path()).expect("init capture queue");
+            let normal_dir = &init.paths.normal;
+            make_virgin_lane(normal_dir);
+            write_bytes_0600(
+                &normal_dir.join(QUEUE_TAIL_META_TMP_FILE),
+                b"stale-0a-meta-tmp",
+            );
+
+            let mut obs = SegmentObserver::new();
+            let rec = recover_lane_in_storage_dir(repo.path(), CaptureQueueLane::Normal, &mut obs)
+                .expect("AC1: Case 0a recover_lane must initialize 34B LTM2 dual replicas");
+            assert_eq!(rec.meta, expected_empty);
+            assert!(
+                !normal_dir.join(segment_log_file_name(0)).exists(),
+                "Case 0a recover_lane must not create events-00000000.log"
+            );
+            assert!(!normal_dir.join(QUEUE_TAIL_META_TMP_FILE).exists());
+
+            let raw_meta = fs::read(tail_meta_path(normal_dir)).unwrap();
+            let raw_bak = fs::read(tail_meta_bak_path(normal_dir)).unwrap();
+            assert_eq!(raw_meta, expected_empty_bytes);
+            assert_eq!(raw_bak, expected_empty_bytes);
+            assert_eq!(LaneTailMeta::decode(&raw_meta).unwrap(), expected_empty);
+            assert_eq!(LaneTailMeta::decode(&raw_bak).unwrap(), expected_empty);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                for p in [tail_meta_path(normal_dir), tail_meta_bak_path(normal_dir)] {
+                    let mode = fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+                    assert_eq!(mode, 0o600);
+                }
+            }
+
+            let p_sync = obs
+                .events
+                .iter()
+                .position(|e| {
+                    *e == SegmentOpEvent::MetaTmpWriteAndSync {
+                        lane: QUEUE_LANE_NORMAL_DIR,
+                        tmp_name: QUEUE_TAIL_META_TMP_FILE,
+                        target_name: QUEUE_TAIL_META_FILE,
+                    }
+                })
+                .expect("AC1: primary MetaTmpWriteAndSync");
+            let p_ren = obs
+                .events
+                .iter()
+                .position(|e| {
+                    *e == SegmentOpEvent::MetaRename {
+                        lane: QUEUE_LANE_NORMAL_DIR,
+                        tmp_name: QUEUE_TAIL_META_TMP_FILE,
+                        target_name: QUEUE_TAIL_META_FILE,
+                    }
+                })
+                .expect("AC1: primary MetaRename");
+            let p_fsync = obs
+                .events
+                .iter()
+                .position(|e| {
+                    *e == SegmentOpEvent::FsyncLaneDirAfterMeta {
+                        lane: QUEUE_LANE_NORMAL_DIR,
+                        target_name: QUEUE_TAIL_META_FILE,
+                    }
+                })
+                .expect("AC1: primary FsyncLaneDirAfterMeta");
+            let b_sync = obs
+                .events
+                .iter()
+                .position(|e| {
+                    *e == SegmentOpEvent::MetaTmpWriteAndSync {
+                        lane: QUEUE_LANE_NORMAL_DIR,
+                        tmp_name: QUEUE_TAIL_META_BAK_TMP_FILE,
+                        target_name: QUEUE_TAIL_META_BAK_FILE,
+                    }
+                })
+                .expect("AC1: backup MetaTmpWriteAndSync");
+            let b_ren = obs
+                .events
+                .iter()
+                .position(|e| {
+                    *e == SegmentOpEvent::MetaRename {
+                        lane: QUEUE_LANE_NORMAL_DIR,
+                        tmp_name: QUEUE_TAIL_META_BAK_TMP_FILE,
+                        target_name: QUEUE_TAIL_META_BAK_FILE,
+                    }
+                })
+                .expect("AC1: backup MetaRename");
+            let b_fsync = obs
+                .events
+                .iter()
+                .position(|e| {
+                    *e == SegmentOpEvent::FsyncLaneDirAfterMeta {
+                        lane: QUEUE_LANE_NORMAL_DIR,
+                        target_name: QUEUE_TAIL_META_BAK_FILE,
+                    }
+                })
+                .expect("AC1: backup FsyncLaneDirAfterMeta");
+            assert!(
+                p_sync < p_ren
+                    && p_ren < p_fsync
+                    && p_fsync < b_sync
+                    && b_sync < b_ren
+                    && b_ren < b_fsync
+            );
+        }
+
+        // (1b) Observed direct append on virgin Case 0a lane proves initial 34B
+        // dual `LTM2` + `fsync_dir` complete STRICTLY BEFORE `CreateSegment(0)`.
+        {
+            let repo = tempdir().expect("tempdir");
+            let init = init_capture_queue(repo.path()).expect("init capture queue");
+            let normal_dir = &init.paths.normal;
+            make_virgin_lane(normal_dir);
+
+            let frame_buf = encode_frame(FRAME_FLAG_NONE, "rb08e-0a-obs", b"virgin-first-frame")
+                .expect("encode frame");
+            let mut obs = SegmentObserver::new();
+            let out = append_validated_frame_in_storage_dir(
+                repo.path(),
+                CaptureQueueLane::Normal,
+                &frame_buf,
+                &mut obs,
+            )
+            .expect("AC1: direct append on virgin Case 0a lane must succeed");
+            assert_eq!(out.seg_id, 0);
+            assert_eq!(out.frame_offset, 0);
+
+            let create_seg = obs
+                .events
+                .iter()
+                .position(|e| {
+                    *e == SegmentOpEvent::CreateSegment {
+                        lane: QUEUE_LANE_NORMAL_DIR,
+                        seg_id: 0,
+                    }
+                })
+                .expect("AC1: CreateSegment(0) must be recorded");
+            let fsync_create = obs
+                .events
+                .iter()
+                .position(|e| {
+                    *e == SegmentOpEvent::FsyncLaneDirAfterCreateSegment {
+                        lane: QUEUE_LANE_NORMAL_DIR,
+                        seg_id: 0,
+                    }
+                })
+                .expect("AC1: FsyncLaneDirAfterCreateSegment(0) must be recorded");
+            let seg_write = obs
+                .events
+                .iter()
+                .position(|e| matches!(e, SegmentOpEvent::SegmentWriteAll { .. }))
+                .expect("AC1: SegmentWriteAll must be recorded");
+
+            let pre_create = &obs.events[..create_seg];
+            let p_fsync = pre_create
+                .iter()
+                .position(|e| {
+                    *e == SegmentOpEvent::FsyncLaneDirAfterMeta {
+                        lane: QUEUE_LANE_NORMAL_DIR,
+                        target_name: QUEUE_TAIL_META_FILE,
+                    }
+                })
+                .expect("AC1: initial primary FsyncLaneDirAfterMeta must precede CreateSegment(0)");
+            let b_fsync = pre_create
+                .iter()
+                .position(|e| {
+                    *e == SegmentOpEvent::FsyncLaneDirAfterMeta {
+                        lane: QUEUE_LANE_NORMAL_DIR,
+                        target_name: QUEUE_TAIL_META_BAK_FILE,
+                    }
+                })
+                .expect("AC1: initial backup FsyncLaneDirAfterMeta must precede CreateSegment(0)");
+            assert!(p_fsync < b_fsync && b_fsync < create_seg);
+            assert!(create_seg < fsync_create && fsync_create < seg_write);
+
+            let raw_meta = fs::read(tail_meta_path(normal_dir)).unwrap();
+            let raw_bak = fs::read(tail_meta_bak_path(normal_dir)).unwrap();
+            assert_eq!(raw_meta, raw_bak);
+            assert_eq!(LaneTailMeta::decode(&raw_meta).unwrap(), out.meta);
+            assert_eq!(LaneTailMeta::decode(&raw_bak).unwrap(), out.meta);
+        }
+
+        // (1c) Pre-create capacity boundary on Case 0a: tight `max_total_bytes = 1`
+        // rejects at Step ② AFTER Phase 2 commits 34B `(0,0,0,0,[])` dual replicas
+        // and BEFORE `events-00000000.log` is created.
+        {
+            let repo = tempdir().expect("tempdir");
+            let init = init_capture_queue(repo.path()).expect("init capture queue");
+            let normal_dir = &init.paths.normal;
+            make_virgin_lane(normal_dir);
+
+            let tight_opts = QueueAppendOptions {
+                max_total_bytes: 1,
+                lock_timeout: DEFAULT_QUEUE_APPEND_LOCK_TIMEOUT,
+            };
+            let err = append_frame_with_options(
+                repo.path(),
+                CaptureQueueLane::Normal,
+                FRAME_FLAG_NONE,
+                "rb08e-0a-cap",
+                b"too-big-for-1b",
+                tight_opts,
+            )
+            .expect_err("tight capacity cap must reject incoming frame after Case 0a init");
+            assert!(matches!(err, StorageBackendError::QueueFull { .. }));
+            assert_eq!(err.stable_code_str(), "LBR-AGENT-046");
+            assert!(
+                !normal_dir.join(segment_log_file_name(0)).exists(),
+                "events-00000000.log must not be created when Step ② rejects"
+            );
+            assert_eq!(
+                fs::read(tail_meta_path(normal_dir)).unwrap(),
+                expected_empty_bytes
+            );
+            assert_eq!(
+                fs::read(tail_meta_bak_path(normal_dir)).unwrap(),
+                expected_empty_bytes
+            );
+        }
+
+        // (1d) Public `append_frame` from genuinely virgin Case 0a lane creates
+        // `events-00000000.log`, writes dual replicas, and decodes frame cleanly.
+        {
+            let repo = tempdir().expect("tempdir");
+            let init = init_capture_queue(repo.path()).expect("init capture queue");
+            let normal_dir = &init.paths.normal;
+            make_virgin_lane(normal_dir);
+
+            let out = append_frame(
+                repo.path(),
+                CaptureQueueLane::Normal,
+                FRAME_FLAG_NONE,
+                "rb08e-0a-public",
+                b"virgin-public-payload",
+            )
+            .expect("AC1: public append_frame on virgin Case 0a lane must succeed");
+            assert_eq!(out.seg_id, 0);
+            assert_eq!(out.frame_offset, 0);
+            let (decoded, _) =
+                decode_frame(&fs::read(normal_dir.join(segment_log_file_name(0))).unwrap())
+                    .expect("decode seg0 frame");
+            assert_eq!(decoded.dedup_key, "rb08e-0a-public");
+            assert_eq!(decoded.payload, b"virgin-public-payload");
+        }
+
+        // =====================================================================
+        // Part 2 — AC2 (Case 0b): Pre-bootstrapped 0-segment lane with valid
+        // `LTM2` `(0, 0, 0, 0, [])` (dual intact + Subcase B1 single-replica
+        // missing/corrupt in BOTH primary and backup directions).
+        // =====================================================================
+        // (2a) Both replicas intact `(0,0,0,0,[])` (default `init_capture_queue`).
+        {
+            let repo = tempdir().expect("tempdir");
+            let init = init_capture_queue(repo.path()).expect("init capture queue");
+            let normal_dir = &init.paths.normal;
+            assert!(!normal_dir.join(segment_log_file_name(0)).exists());
+            assert_eq!(
+                fs::read(tail_meta_path(normal_dir)).unwrap(),
+                expected_empty_bytes
+            );
+            assert_eq!(
+                fs::read(tail_meta_bak_path(normal_dir)).unwrap(),
+                expected_empty_bytes
+            );
+
+            let f1 = append_frame(
+                repo.path(),
+                CaptureQueueLane::Normal,
+                FRAME_FLAG_NONE,
+                "rb08e-0b-both-valid",
+                b"prebootstrapped-payload",
+            )
+            .expect("AC2: Case 0b with valid dual (0,0,0,0,[]) must create seg0 and enqueue");
+            assert_eq!(f1.seg_id, 0);
+            assert_eq!(f1.frame_offset, 0);
+            assert!(normal_dir.join(segment_log_file_name(0)).exists());
+            let (decoded, _) =
+                decode_frame(&fs::read(normal_dir.join(segment_log_file_name(0))).unwrap())
+                    .expect("decode seg0 frame");
+            assert_eq!(decoded.dedup_key, "rb08e-0b-both-valid");
+            assert_eq!(decoded.payload, b"prebootstrapped-payload");
+        }
+
+        // (2b) Case 0b + Subcase B1 single-replica loss (both primary and backup
+        // directions × Deleted / CorruptCrc / Truncated / Oversized) repairs the
+        // missing/corrupt replica to exact 34B `(0,0,0,0,[])` BEFORE creating
+        // `events-00000000.log`, then creates seg0 and enqueues cleanly.
+        #[derive(Clone, Copy)]
+        enum ReplicaTarget {
+            Primary,
+            Backup,
+        }
+        #[derive(Clone, Copy)]
+        enum LossKind {
+            Deleted,
+            CorruptCrc,
+            Truncated,
+            Oversized,
+        }
+        let corrupt_replica = |lane_dir: &Path, target: ReplicaTarget, kind: LossKind| {
+            let p = match target {
+                ReplicaTarget::Primary => tail_meta_path(lane_dir),
+                ReplicaTarget::Backup => tail_meta_bak_path(lane_dir),
+            };
+            match kind {
+                LossKind::Deleted => fs::remove_file(&p).expect("delete replica"),
+                LossKind::CorruptCrc => {
+                    let mut raw = fs::read(&p).unwrap();
+                    let last = raw.len() - 1;
+                    raw[last] ^= 0xFF;
+                    write_bytes_0600(&p, &raw);
+                }
+                LossKind::Truncated => write_bytes_0600(&p, b"LTM2-short"),
+                LossKind::Oversized => write_bytes_0600(&p, &vec![0x5Au8; LTM2_MAX_LEN + 16]),
+            }
+        };
+
+        for (target_label, target) in [
+            ("primary", ReplicaTarget::Primary),
+            ("backup", ReplicaTarget::Backup),
+        ] {
+            for (kind_label, kind) in [
+                ("deleted", LossKind::Deleted),
+                ("corrupt-crc", LossKind::CorruptCrc),
+                ("truncated", LossKind::Truncated),
+                ("oversized", LossKind::Oversized),
+            ] {
+                let label = format!("case-0b-b1-{target_label}-{kind_label}");
+                let (expected_tmp, expected_target, untouched_target) = match target {
+                    ReplicaTarget::Primary => (
+                        QUEUE_TAIL_META_TMP_FILE,
+                        QUEUE_TAIL_META_FILE,
+                        QUEUE_TAIL_META_BAK_FILE,
+                    ),
+                    ReplicaTarget::Backup => (
+                        QUEUE_TAIL_META_BAK_TMP_FILE,
+                        QUEUE_TAIL_META_BAK_FILE,
+                        QUEUE_TAIL_META_FILE,
+                    ),
+                };
+
+                // Observed append verifies Subcase B1 mirror repair precedes CreateSegment(0).
+                {
+                    let repo = tempdir().expect("tempdir");
+                    let init = init_capture_queue(repo.path()).expect("init capture queue");
+                    let normal_dir = &init.paths.normal;
+                    corrupt_replica(normal_dir, target, kind);
+                    write_bytes_0600(&normal_dir.join(expected_tmp), b"stale-0b-tmp");
+
+                    let frame_buf =
+                        encode_frame(FRAME_FLAG_NONE, "rb08e-0b-b1", b"after-0b-mirror")
+                            .expect("encode frame");
+                    let mut obs = SegmentObserver::new();
+                    let out = append_validated_frame_in_storage_dir(
+                        repo.path(),
+                        CaptureQueueLane::Normal,
+                        &frame_buf,
+                        &mut obs,
+                    )
+                    .unwrap_or_else(|err| {
+                        panic!("{label}: Case 0b single-replica append must succeed: {err:?}")
+                    });
+                    assert_eq!(out.seg_id, 0);
+                    assert!(!normal_dir.join(expected_tmp).exists());
+
+                    let create_seg = obs
+                        .events
+                        .iter()
+                        .position(|e| {
+                            *e == SegmentOpEvent::CreateSegment {
+                                lane: QUEUE_LANE_NORMAL_DIR,
+                                seg_id: 0,
+                            }
+                        })
+                        .expect("CreateSegment(0)");
+                    let pre_create = &obs.events[..create_seg];
+                    let m_sync = pre_create
+                        .iter()
+                        .position(|e| {
+                            *e == SegmentOpEvent::MetaTmpWriteAndSync {
+                                lane: QUEUE_LANE_NORMAL_DIR,
+                                tmp_name: expected_tmp,
+                                target_name: expected_target,
+                            }
+                        })
+                        .unwrap_or_else(|| {
+                            panic!("{label}: expected MetaTmpWriteAndSync before CreateSegment(0)")
+                        });
+                    let m_ren = pre_create
+                        .iter()
+                        .position(|e| {
+                            *e == SegmentOpEvent::MetaRename {
+                                lane: QUEUE_LANE_NORMAL_DIR,
+                                tmp_name: expected_tmp,
+                                target_name: expected_target,
+                            }
+                        })
+                        .unwrap_or_else(|| {
+                            panic!("{label}: expected MetaRename before CreateSegment(0)")
+                        });
+                    let m_fsync = pre_create
+                        .iter()
+                        .position(|e| {
+                            *e == SegmentOpEvent::FsyncLaneDirAfterMeta {
+                                lane: QUEUE_LANE_NORMAL_DIR,
+                                target_name: expected_target,
+                            }
+                        })
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "{label}: expected FsyncLaneDirAfterMeta before CreateSegment(0)"
+                            )
+                        });
+                    assert!(m_sync < m_ren && m_ren < m_fsync && m_fsync < create_seg);
+                    assert!(
+                        !pre_create.iter().any(|e| matches!(
+                            e,
+                            SegmentOpEvent::MetaRename {
+                                target_name,
+                                ..
+                            } if *target_name == untouched_target
+                        )),
+                        "{label}: Case 0b mirror repair must not rewrite surviving replica before CreateSegment(0)"
+                    );
+
+                    let raw_meta = fs::read(tail_meta_path(normal_dir)).unwrap();
+                    let raw_bak = fs::read(tail_meta_bak_path(normal_dir)).unwrap();
+                    assert_eq!(raw_meta, raw_bak);
+                    assert_eq!(LaneTailMeta::decode(&raw_meta).unwrap(), out.meta);
+                    assert_eq!(LaneTailMeta::decode(&raw_bak).unwrap(), out.meta);
+                }
+
+                // `recover_lane` on Case 0b single-replica repairs to exact 34B `(0,0,0,0,[])`
+                // without creating `events-00000000.log`.
+                {
+                    let repo = tempdir().expect("tempdir");
+                    let init = init_capture_queue(repo.path()).expect("init capture queue");
+                    let normal_dir = &init.paths.normal;
+                    corrupt_replica(normal_dir, target, kind);
+                    let rec =
+                        recover_lane(repo.path(), CaptureQueueLane::Normal).unwrap_or_else(|err| {
+                            panic!("{label}: recover_lane must repair Case 0b replica: {err:?}")
+                        });
+                    assert!(rec.mirrored_replica);
+                    assert_eq!(rec.meta, expected_empty);
+                    assert!(!normal_dir.join(segment_log_file_name(0)).exists());
+                    assert_eq!(
+                        fs::read(tail_meta_path(normal_dir)).unwrap(),
+                        expected_empty_bytes
+                    );
+                    assert_eq!(
+                        fs::read(tail_meta_bak_path(normal_dir)).unwrap(),
+                        expected_empty_bytes
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn zero_segment_with_committed_or_corrupt_meta_fails_closed() {
+        // `RB-08e` AC3–AC6 (`ADR-RB-05` #3 Case 0c & Case 0d):
+        // - AC3 & AC5 (Case 0c): 0 `events-*.log` files present while valid
+        //   `LTM2` records non-empty committed state (`committed_len > 0` OR
+        //   `active_seg > 0` OR `!sealed.is_empty()` OR `prefix_crc32c != 0`,
+        //   including single-replica survival & missing `append.lock`) ->
+        //   fail-closed `CorruptCommittedFrame` (`LBR-IO-001`) with exact
+        //   whole-lane, `quarantine/`, and queue-root snapshot zero mutation.
+        // - AC4 & AC6 (Case 0d): 0 `events-*.log` files present while at least
+        //   one metadata file exists on disk and NEITHER replica is valid `LTM2`
+        //   (primary corrupt + backup absent, primary absent + backup corrupt,
+        //   both corrupt across CRC/truncated/0B/oversized/bad-magic/257-entry,
+        //   or divergent equal-ordering-key replicas) -> fail-closed
+        //   `CorruptCommittedFrame` (`LBR-IO-001`) with exact whole-lane,
+        //   `quarantine/`, and queue-root snapshot zero mutation.
+
+        let verify_fails_closed = |label: &str,
+                                   repo_path: &Path,
+                                   queue_root: &Path,
+                                   normal_dir: &Path,
+                                   quarantine_dir: &Path,
+                                   check_root: bool| {
+            let seg_count = fs::read_dir(normal_dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    matches_segment_log_glob_bytes(e.file_name().to_string_lossy().as_bytes())
+                })
+                .count();
+            assert_eq!(seg_count, 0, "{label}: fixture must have 0 segment files");
+
+            write_bytes_0600(
+                &normal_dir.join(QUEUE_TAIL_META_TMP_FILE),
+                b"rb08e-planted-meta-tmp",
+            );
+            write_bytes_0600(
+                &normal_dir.join(QUEUE_TAIL_META_BAK_TMP_FILE),
+                b"rb08e-planted-meta-bak-tmp",
+            );
+            write_bytes_0600(
+                &quarantine_dir.join("normal-orphan.tmp"),
+                b"rb08e-planted-normal-q-tmp",
+            );
+            write_bytes_0600(
+                &quarantine_dir.join("priority-orphan.tmp"),
+                b"rb08e-planted-priority-q-tmp",
+            );
+
+            let lane_before = snapshot_tree(normal_dir);
+            let q_before = snapshot_tree(quarantine_dir);
+            let root_before = check_root.then(|| snapshot_tree(queue_root));
+
+            let app_err = append_frame(
+                repo_path,
+                CaptureQueueLane::Normal,
+                FRAME_FLAG_NONE,
+                "rb08e-must-reject",
+                b"must-not-write",
+            )
+            .expect_err("RB-08e: append_frame must fail closed on Case 0c/0d");
+            assert!(
+                matches!(app_err, StorageBackendError::CorruptCommittedFrame { .. }),
+                "{label}: expected CorruptCommittedFrame on append_frame, got {app_err:?}"
+            );
+            assert_eq!(app_err.stable_code_str(), "LBR-IO-001");
+            assert_eq!(
+                snapshot_tree(normal_dir),
+                lane_before,
+                "{label}: lane directory mutated on append_frame rejection"
+            );
+            assert_eq!(
+                snapshot_tree(quarantine_dir),
+                q_before,
+                "{label}: quarantine/ mutated on append_frame rejection"
+            );
+            if let Some(ref rb) = root_before {
+                assert_eq!(
+                    snapshot_tree(queue_root),
+                    *rb,
+                    "{label}: queue root mutated (e.g. append.lock created) on append_frame rejection"
+                );
+            }
+
+            let rec_err = recover_lane(repo_path, CaptureQueueLane::Normal)
+                .expect_err("RB-08e: recover_lane must fail closed on Case 0c/0d");
+            assert!(
+                matches!(rec_err, StorageBackendError::CorruptCommittedFrame { .. }),
+                "{label}: expected CorruptCommittedFrame on recover_lane, got {rec_err:?}"
+            );
+            assert_eq!(rec_err.stable_code_str(), "LBR-IO-001");
+            assert_eq!(
+                snapshot_tree(normal_dir),
+                lane_before,
+                "{label}: lane directory mutated on recover_lane rejection"
+            );
+            assert_eq!(
+                snapshot_tree(quarantine_dir),
+                q_before,
+                "{label}: quarantine/ mutated on recover_lane rejection"
+            );
+            if let Some(ref rb) = root_before {
+                assert_eq!(
+                    snapshot_tree(queue_root),
+                    *rb,
+                    "{label}: queue root mutated on recover_lane rejection"
+                );
+            }
+        };
+
+        // =====================================================================
+        // Part 1 — AC3 & AC5 (Case 0c): 0 segment files + valid non-empty LTM2.
+        // =====================================================================
+        // (1a) Real committed frames written to seg 0, then `events-00000000.log`
+        // deleted (testing both replicas intact, primary-only, backup-only, and
+        // missing `append.lock`).
+        for (label, drop_primary, drop_backup, drop_lock) in [
+            ("case-0c-committed-both-replicas", false, false, false),
+            ("case-0c-committed-primary-only", false, true, false),
+            ("case-0c-committed-backup-only", true, false, false),
+            ("case-0c-committed-missing-append-lock", false, false, true),
+        ] {
+            let repo = tempdir().expect("tempdir");
+            let init = init_capture_queue(repo.path()).expect("init capture queue");
+            let normal_dir = &init.paths.normal;
+            let f1 = append_frame(
+                repo.path(),
+                CaptureQueueLane::Normal,
+                FRAME_FLAG_NONE,
+                "rb08e-0c-frame-1",
+                b"committed-payload-1",
+            )
+            .unwrap();
+            assert!(f1.meta.committed_len > 0);
+            fs::remove_file(normal_dir.join(segment_log_file_name(0)))
+                .expect("delete sole active segment 0");
+            if drop_primary {
+                fs::remove_file(tail_meta_path(normal_dir)).unwrap();
+            }
+            if drop_backup {
+                fs::remove_file(tail_meta_bak_path(normal_dir)).unwrap();
+            }
+            if drop_lock {
+                fs::remove_file(init.paths.root.join(QUEUE_APPEND_LOCK_FILE)).unwrap();
+            }
+            verify_fails_closed(
+                label,
+                repo.path(),
+                &init.paths.root,
+                normal_dir,
+                &init.paths.quarantine,
+                drop_lock,
+            );
+        }
+
+        // (1b) Rotated state (`active_seg == 1, min_live_seg == 0, sealed.len() == 1`)
+        // with all segment files deleted.
+        {
+            let repo = tempdir().expect("tempdir");
+            let init = init_capture_queue(repo.path()).expect("init capture queue");
+            let normal_dir = &init.paths.normal;
+            let sealed_meta = LaneTailMeta {
+                min_live_seg: 0,
+                active_seg: 1,
+                committed_len: 128,
+                prefix_crc32c: 0xABCD_1234,
+                sealed: vec![SealedSegmentMeta {
+                    seg_id: 0,
+                    sealed_len: 4096,
+                    sealed_crc32c: 0x1122_3344,
+                }],
+            };
+            let raw = sealed_meta.encode().unwrap();
+            write_bytes_0600(&tail_meta_path(normal_dir), &raw);
+            write_bytes_0600(&tail_meta_bak_path(normal_dir), &raw);
+            verify_fails_closed(
+                "case-0c-nonempty-sealed-and-active-seg-1",
+                repo.path(),
+                &init.paths.root,
+                normal_dir,
+                &init.paths.quarantine,
+                false,
+            );
+        }
+
+        // (1c) `active_seg > 0` even when `committed_len == 0` and `sealed == []`
+        // (e.g. seg 0 already reclaimed, seg 1 created empty and then deleted).
+        {
+            let repo = tempdir().expect("tempdir");
+            let init = init_capture_queue(repo.path()).expect("init capture queue");
+            let normal_dir = &init.paths.normal;
+            let meta = LaneTailMeta {
+                min_live_seg: 1,
+                active_seg: 1,
+                committed_len: 0,
+                prefix_crc32c: 0,
+                sealed: Vec::new(),
+            };
+            let raw = meta.encode().unwrap();
+            write_bytes_0600(&tail_meta_path(normal_dir), &raw);
+            write_bytes_0600(&tail_meta_bak_path(normal_dir), &raw);
+            verify_fails_closed(
+                "case-0c-active-seg-1-zero-committed",
+                repo.path(),
+                &init.paths.root,
+                normal_dir,
+                &init.paths.quarantine,
+                false,
+            );
+        }
+
+        // (1d) `active_seg == 0, committed_len == 0, sealed == []`, but non-zero
+        // `prefix_crc32c` (fails `is_initial_empty()`).
+        {
+            let repo = tempdir().expect("tempdir");
+            let init = init_capture_queue(repo.path()).expect("init capture queue");
+            let normal_dir = &init.paths.normal;
+            let meta = LaneTailMeta {
+                min_live_seg: 0,
+                active_seg: 0,
+                committed_len: 0,
+                prefix_crc32c: 0xDEAD_BEEF,
+                sealed: Vec::new(),
+            };
+            let raw = meta.encode().unwrap();
+            write_bytes_0600(&tail_meta_path(normal_dir), &raw);
+            write_bytes_0600(&tail_meta_bak_path(normal_dir), &raw);
+            verify_fails_closed(
+                "case-0c-nonzero-prefix-crc",
+                repo.path(),
+                &init.paths.root,
+                normal_dir,
+                &init.paths.quarantine,
+                false,
+            );
+        }
+
+        // =====================================================================
+        // Part 2 — AC4 & AC6 (Case 0d): 0 segment files + metadata present on
+        // disk where NEITHER replica is valid `LTM2` (or divergent equal-key).
+        // =====================================================================
+        let valid_empty_bytes = LaneTailMeta::initial_empty().encode().unwrap();
+        let mut bad_crc_bytes = valid_empty_bytes.clone();
+        let last = bad_crc_bytes.len() - 1;
+        bad_crc_bytes[last] ^= 0x01;
+        let bad_magic_bytes = {
+            let mut b = valid_empty_bytes.clone();
+            b[0..4].copy_from_slice(b"NOPE");
+            b
+        };
+        let oversized_bytes = vec![0xEEu8; LTM2_MAX_LEN + 64];
+
+        let case_0d_fixtures: [(&str, Option<&[u8]>, Option<&[u8]>, bool); 8] = [
+            (
+                "case-0d-primary-bad-crc-backup-absent",
+                Some(bad_crc_bytes.as_slice()),
+                None,
+                false,
+            ),
+            (
+                "case-0d-primary-absent-backup-bad-crc",
+                None,
+                Some(bad_crc_bytes.as_slice()),
+                false,
+            ),
+            (
+                "case-0d-both-bad-crc",
+                Some(bad_crc_bytes.as_slice()),
+                Some(bad_crc_bytes.as_slice()),
+                false,
+            ),
+            (
+                "case-0d-both-truncated-garbage",
+                Some(b"LTM2-trunc"),
+                Some(b"garbage"),
+                false,
+            ),
+            (
+                "case-0d-both-zero-byte-empty-files",
+                Some(b""),
+                Some(b""),
+                false,
+            ),
+            (
+                "case-0d-both-oversized",
+                Some(oversized_bytes.as_slice()),
+                Some(oversized_bytes.as_slice()),
+                false,
+            ),
+            (
+                "case-0d-both-bad-magic-missing-lock",
+                Some(bad_magic_bytes.as_slice()),
+                Some(bad_magic_bytes.as_slice()),
+                true,
+            ),
+            (
+                "case-0d-primary-zero-byte-backup-absent",
+                Some(b""),
+                None,
+                false,
+            ),
+        ];
+
+        for (label, primary_bytes, backup_bytes, drop_lock) in case_0d_fixtures {
+            let repo = tempdir().expect("tempdir");
+            let init = init_capture_queue(repo.path()).expect("init capture queue");
+            let normal_dir = &init.paths.normal;
+            let _ = fs::remove_file(tail_meta_path(normal_dir));
+            let _ = fs::remove_file(tail_meta_bak_path(normal_dir));
+            if let Some(bytes) = primary_bytes {
+                write_bytes_0600(&tail_meta_path(normal_dir), bytes);
+            }
+            if let Some(bytes) = backup_bytes {
+                write_bytes_0600(&tail_meta_bak_path(normal_dir), bytes);
+            }
+            if drop_lock {
+                fs::remove_file(init.paths.root.join(QUEUE_APPEND_LOCK_FILE)).unwrap();
+            }
+            verify_fails_closed(
+                label,
+                repo.path(),
+                &init.paths.root,
+                normal_dir,
+                &init.paths.quarantine,
+                drop_lock,
+            );
+        }
+
+        // Also verify 0-segment divergent equal-ordering-key `(0, 0, 0)` replicas
+        // (valid encoding, disagreeing `prefix_crc32c`) fail closed with zero mutation.
+        {
+            let repo = tempdir().expect("tempdir");
+            let init = init_capture_queue(repo.path()).expect("init capture queue");
+            let normal_dir = &init.paths.normal;
+            let meta_a = LaneTailMeta::initial_empty();
+            let meta_b = LaneTailMeta {
+                min_live_seg: 0,
+                active_seg: 0,
+                committed_len: 0,
+                prefix_crc32c: 0x4242_4242,
+                sealed: Vec::new(),
+            };
+            write_bytes_0600(&tail_meta_path(normal_dir), &meta_a.encode().unwrap());
+            write_bytes_0600(&tail_meta_bak_path(normal_dir), &meta_b.encode().unwrap());
+            verify_fails_closed(
+                "case-0d-divergent-equal-ordering-key",
+                repo.path(),
+                &init.paths.root,
+                normal_dir,
+                &init.paths.quarantine,
+                false,
+            );
+        }
+    }
 }
