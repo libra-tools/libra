@@ -372,6 +372,7 @@ pub async fn drain_capture_queue_at_root(
 enum WriterCrashPoint {
     #[default]
     None,
+    BeforeEmptyAdvanceCommit,
     AfterDbCommitBeforeMirror,
 }
 
@@ -1274,6 +1275,8 @@ async fn step_lane_once(
                 }
             }
             let next_hw = compute_next_highwater(hw, &meta, sealed_len)?;
+            #[cfg(test)]
+            observer.maybe_crash(WriterCrashPoint::BeforeEmptyAdvanceCommit)?;
             let outcome = store
                 .append_capture_batch(&[], Some((lane, next_hw)))
                 .await?;
@@ -10936,6 +10939,710 @@ mod tests {
                         oob_hw,
                         "AC6 ({lane_label}, +{delta}): DB highwater must NOT advance past OOB value"
                     );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn consumer_drained_rotated_empty_advance_crash_before_and_after_commit() {
+        // `RB-09j` AC1 & AC2 (`ADR-RB-05` #4 ② (c)):
+        // Verify on BOTH `normal/` and `priority/` lanes:
+        // - AC1 (Crash BEFORE empty-advance commit): Fault-inject consumer after
+        //   authenticating `LTM2.sealed[S]` and computing `(S + 1, 0)` but strictly
+        //   BEFORE `append_capture_batch(&[], (S + 1, 0))` commits (`BeforeEmptyAdvanceCommit`).
+        //   Verify 0 DB tx, DB highwater & mirror still at `(S, sealed_len(S))`,
+        //   and `seg S` untouched. Restart observes `(S, sealed_len(S))` and
+        //   idempotently commits `(S + 1, 0)` with 0 redundant rows.
+        // - AC2 (Crash AFTER empty-advance commit, BEFORE external mirror update):
+        //   Fault-inject `AfterDbCommitBeforeMirror` right after
+        //   `append_capture_batch(&[], (S + 1, 0))` succeeds. Verify DB highwater
+        //   is already `(S + 1, 0)` while external `highwater` mirror remains stale
+        //   at `(S, sealed_len(S))`. Cover BOTH:
+        //     (2a) empty `S + 1` (0 new frames on restart -> 0 extra DB tx, reclaims
+        //          `S`, and rewrites stale external mirror from authoritative DB `(S + 1, 0)`),
+        //     (2b) non-empty `S + 1` (restart starts immediately from authoritative DB
+        //          `(S + 1, 0)` with 0 duplicate empty-advance tx, ingests `S + 1`
+        //          frames, and updates external mirror to `(S + 1, committed_len(S + 1))`).
+        use std::io::Write as _;
+
+        let row_count_for = |store: RedbCaptureStore, lane: CaptureQueueLane| async move {
+            match lane {
+                CaptureQueueLane::Normal => store
+                    .list_audit_logs_by_checkpoint(TEST_AUDIT_CHECKPOINT_ID)
+                    .await
+                    .unwrap()
+                    .len(),
+                CaptureQueueLane::Priority => {
+                    store.list_sessions_by_started_desc().await.unwrap().len()
+                }
+            }
+        };
+
+        for lane in [CaptureQueueLane::Normal, CaptureQueueLane::Priority] {
+            let lane_label = lane_subdir_name(lane);
+            let flags = match lane {
+                CaptureQueueLane::Priority => FRAME_FLAG_PRIORITY,
+                CaptureQueueLane::Normal => FRAME_FLAG_NONE,
+            };
+            let payload_for = |tag: &str, seq: i64| match lane {
+                CaptureQueueLane::Priority => {
+                    make_session_payload(tag, CaptureSessionState::Stopped, 1_700_130_000 + seq)
+                }
+                CaptureQueueLane::Normal => {
+                    make_audit_payload(tag, &format!("2026-11-24T12:00:{:02}Z", seq % 60))
+                }
+            };
+
+            // =================================================================
+            // AC1: Crash AFTER `LTM2.sealed[0]` auth, BEFORE empty-advance commit.
+            // =================================================================
+            {
+                let repo = tempdir().expect("tempdir");
+                let init = init_capture_queue(repo.path()).expect("init capture queue");
+                let lane_dir = match lane {
+                    CaptureQueueLane::Normal => init.paths.normal.clone(),
+                    CaptureQueueLane::Priority => init.paths.priority.clone(),
+                };
+                let store = RedbCaptureStore::create(
+                    repo.path()
+                        .join(PRIVATE_SUBDIR)
+                        .join("capture.gen-0001.redb"),
+                )
+                .await
+                .expect("create RedbCaptureStore");
+                let setup_spy = SpyCaptureStore::new(store.clone(), init.paths.root.clone());
+
+                let mut sealed_len = 0u64;
+                for i in 0..3usize {
+                    let out = append_postcard_frame(
+                        repo.path(),
+                        lane,
+                        flags,
+                        &format!("rb09j:ac1:{lane_label}:s0:{i}"),
+                        CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                        &payload_for(&format!("rb09j-ac1-{lane_label}-s0-{i}"), i as i64),
+                    )
+                    .unwrap();
+                    sealed_len = out.meta.committed_len;
+                }
+                let _ = drain_capture_queue(repo.path(), &setup_spy).await.unwrap();
+                let hw_before = CaptureQueueHighwater {
+                    segment_id: 0,
+                    byte_offset: sealed_len,
+                };
+                assert_eq!(store.get_queue_highwater(lane).await.unwrap(), hw_before);
+                let mirror_before = read_highwater_mirror(&init.paths.root).unwrap().unwrap();
+                assert_eq!(mirror_before.get(lane), hw_before);
+
+                // Rotate `seg 0 -> empty seg 1` via Case C Step C2.
+                let half = encode_postcard_frame(
+                    flags,
+                    &format!("rb09j:ac1:{lane_label}:half"),
+                    CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                    &payload_for(&format!("rb09j-ac1-{lane_label}-half"), 99),
+                )
+                .unwrap();
+                let seg0_path = lane_dir.join(segment_log_file_name(0));
+                {
+                    let mut f = fs::OpenOptions::new()
+                        .append(true)
+                        .open(&seg0_path)
+                        .unwrap();
+                    f.write_all(&half[..half.len() / 2]).unwrap();
+                    f.sync_data().unwrap();
+                }
+                let rec = crate::storage::queue::recover_lane(repo.path(), lane).unwrap();
+                assert_eq!(rec.meta.active_seg, 1);
+                assert_eq!(rec.meta.sealed[0].sealed_len, sealed_len);
+
+                // Inject crash right BEFORE `append_capture_batch(&[], (1, 0))`!
+                let crash_spy = SpyCaptureStore::new(store.clone(), init.paths.root.clone());
+                let tx_before_crash = store.write_transaction_count();
+                let lock = try_acquire_writer_lock_at_root(&init.paths.root)
+                    .unwrap()
+                    .unwrap();
+                let mut crash_obs =
+                    WriterObserver::with_crash_point(WriterCrashPoint::BeforeEmptyAdvanceCommit);
+                let err = drain_locked_at_root(
+                    &init.paths.root,
+                    &crash_spy,
+                    QueueWriterOptions::default(),
+                    &lock,
+                    &mut crash_obs,
+                )
+                .await
+                .expect_err("AC1: injected BeforeEmptyAdvanceCommit crash must fail");
+                assert!(matches!(err, StorageBackendError::Io { .. }));
+                drop(lock);
+
+                // Verify post-crash state: 0 DB tx, DB hw & mirror STILL `(0, sealed_len)`, `seg 0` intact!
+                assert_eq!(store.write_transaction_count(), tx_before_crash);
+                assert!(crash_spy.recorded_calls().is_empty());
+                assert_eq!(store.get_queue_highwater(lane).await.unwrap(), hw_before);
+                assert_eq!(
+                    read_highwater_mirror(&init.paths.root)
+                        .unwrap()
+                        .unwrap()
+                        .get(lane),
+                    hw_before
+                );
+                assert!(seg0_path.exists());
+                assert_eq!(
+                    read_converged_lane_tail_meta(&lane_dir)
+                        .unwrap()
+                        .min_live_seg,
+                    0
+                );
+
+                // Restart consumer: observes `(0, sealed_len)` and idempotently commits `(1, 0)`!
+                let restart_spy = SpyCaptureStore::new(store.clone(), init.paths.root.clone());
+                let rep = drain_capture_queue(repo.path(), &restart_spy)
+                    .await
+                    .expect("AC1: restart after BeforeEmptyAdvanceCommit must converge to (1, 0)");
+                assert_eq!(rep.applied_frames, 0);
+                assert_eq!(rep.deduplicated_frames, 0);
+                assert_eq!(rep.reclaimed_segments, 1);
+
+                let calls = restart_spy.recorded_calls();
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].item_count, 0);
+                assert_eq!(calls[0].applied_count, 0);
+                assert_eq!(calls[0].tx_delta, 1);
+                assert_eq!(
+                    calls[0].db_highwater_after,
+                    CaptureQueueHighwater {
+                        segment_id: 1,
+                        byte_offset: 0,
+                    }
+                );
+                let expected_hw = CaptureQueueHighwater {
+                    segment_id: 1,
+                    byte_offset: 0,
+                };
+                assert_eq!(store.get_queue_highwater(lane).await.unwrap(), expected_hw);
+                assert_eq!(
+                    read_highwater_mirror(&init.paths.root)
+                        .unwrap()
+                        .unwrap()
+                        .get(lane),
+                    expected_hw
+                );
+                assert_eq!(row_count_for(store.clone(), lane).await, 3);
+                assert!(!seg0_path.exists());
+            }
+
+            // =================================================================
+            // AC2a: Crash AFTER empty-advance commit, BEFORE external mirror update
+            // (with empty `S + 1 = 1` -> restart rewrites stale mirror from DB `(1, 0)`
+            // with 0 extra DB write tx and reclaims `seg 0`).
+            // =================================================================
+            {
+                let repo = tempdir().expect("tempdir");
+                let init = init_capture_queue(repo.path()).expect("init capture queue");
+                let lane_dir = match lane {
+                    CaptureQueueLane::Normal => init.paths.normal.clone(),
+                    CaptureQueueLane::Priority => init.paths.priority.clone(),
+                };
+                let store = RedbCaptureStore::create(
+                    repo.path()
+                        .join(PRIVATE_SUBDIR)
+                        .join("capture.gen-0001.redb"),
+                )
+                .await
+                .expect("create RedbCaptureStore");
+                let setup_spy = SpyCaptureStore::new(store.clone(), init.paths.root.clone());
+
+                let mut sealed_len = 0u64;
+                for i in 0..2usize {
+                    let out = append_postcard_frame(
+                        repo.path(),
+                        lane,
+                        flags,
+                        &format!("rb09j:ac2a:{lane_label}:s0:{i}"),
+                        CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                        &payload_for(&format!("rb09j-ac2a-{lane_label}-s0-{i}"), i as i64),
+                    )
+                    .unwrap();
+                    sealed_len = out.meta.committed_len;
+                }
+                let _ = drain_capture_queue(repo.path(), &setup_spy).await.unwrap();
+                let hw_stale = CaptureQueueHighwater {
+                    segment_id: 0,
+                    byte_offset: sealed_len,
+                };
+
+                let half = encode_postcard_frame(
+                    flags,
+                    &format!("rb09j:ac2a:{lane_label}:half"),
+                    CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                    &payload_for(&format!("rb09j-ac2a-{lane_label}-half"), 99),
+                )
+                .unwrap();
+                let seg0_path = lane_dir.join(segment_log_file_name(0));
+                {
+                    let mut f = fs::OpenOptions::new()
+                        .append(true)
+                        .open(&seg0_path)
+                        .unwrap();
+                    f.write_all(&half[..half.len() / 2]).unwrap();
+                    f.sync_data().unwrap();
+                }
+                let _ = crate::storage::queue::recover_lane(repo.path(), lane).unwrap();
+
+                // Inject crash right AFTER DB commit of `(1, 0)` and BEFORE `write_highwater_mirror`!
+                let crash_spy = SpyCaptureStore::new(store.clone(), init.paths.root.clone());
+                let lock = try_acquire_writer_lock_at_root(&init.paths.root)
+                    .unwrap()
+                    .unwrap();
+                let mut crash_obs =
+                    WriterObserver::with_crash_point(WriterCrashPoint::AfterDbCommitBeforeMirror);
+                let err = drain_locked_at_root(
+                    &init.paths.root,
+                    &crash_spy,
+                    QueueWriterOptions::default(),
+                    &lock,
+                    &mut crash_obs,
+                )
+                .await
+                .expect_err("AC2a: injected AfterDbCommitBeforeMirror crash must fail");
+                assert!(matches!(err, StorageBackendError::Io { .. }));
+                drop(lock);
+
+                // Verify DB already committed `(1, 0)` while external mirror is STILL stale `(0, sealed_len)`!
+                let hw_committed = CaptureQueueHighwater {
+                    segment_id: 1,
+                    byte_offset: 0,
+                };
+                assert_eq!(store.get_queue_highwater(lane).await.unwrap(), hw_committed);
+                assert_eq!(
+                    read_highwater_mirror(&init.paths.root)
+                        .unwrap()
+                        .unwrap()
+                        .get(lane),
+                    hw_stale,
+                    "AC2a ({lane_label}): external mirror must still be stale before restart"
+                );
+                assert_eq!(crash_spy.recorded_calls().len(), 1);
+                assert_eq!(crash_spy.recorded_calls()[0].item_count, 0);
+
+                // Restart consumer: MUST NOT run another DB write tx; MUST rewrite
+                // external mirror to authoritative DB `(1, 0)` and reclaim `seg 0`!
+                let tx_before_restart = store.write_transaction_count();
+                let restart_spy = SpyCaptureStore::new(store.clone(), init.paths.root.clone());
+                let rep = drain_capture_queue(repo.path(), &restart_spy).await.expect(
+                    "AC2a: restart after AfterDbCommitBeforeMirror must heal external mirror",
+                );
+                assert_eq!(store.write_transaction_count(), tx_before_restart);
+                assert!(restart_spy.recorded_calls().is_empty());
+                assert_eq!(rep.applied_frames, 0);
+                assert_eq!(rep.reclaimed_segments, 1);
+                assert_eq!(store.get_queue_highwater(lane).await.unwrap(), hw_committed);
+                assert_eq!(
+                    read_highwater_mirror(&init.paths.root)
+                        .unwrap()
+                        .unwrap()
+                        .get(lane),
+                    hw_committed,
+                    "AC2a ({lane_label}): restart must rewrite external mirror from authoritative DB (1, 0)"
+                );
+                assert!(!seg0_path.exists());
+                assert_eq!(row_count_for(store.clone(), lane).await, 2);
+            }
+
+            // =================================================================
+            // AC2b: Crash AFTER empty-advance commit, BEFORE external mirror update
+            // when `S + 1 = 1` already carries 2 frames -> restart starts directly
+            // at DB `(1, 0)` (no duplicate empty advance!), ingests `S + 1`, and
+            // syncs external mirror to `(1, seg1_len)`.
+            // =================================================================
+            {
+                let repo = tempdir().expect("tempdir");
+                let init = init_capture_queue(repo.path()).expect("init capture queue");
+                let lane_dir = match lane {
+                    CaptureQueueLane::Normal => init.paths.normal.clone(),
+                    CaptureQueueLane::Priority => init.paths.priority.clone(),
+                };
+                let store = RedbCaptureStore::create(
+                    repo.path()
+                        .join(PRIVATE_SUBDIR)
+                        .join("capture.gen-0001.redb"),
+                )
+                .await
+                .expect("create RedbCaptureStore");
+                let setup_spy = SpyCaptureStore::new(store.clone(), init.paths.root.clone());
+
+                let out0 = append_postcard_frame(
+                    repo.path(),
+                    lane,
+                    flags,
+                    &format!("rb09j:ac2b:{lane_label}:s0:0"),
+                    CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                    &payload_for(&format!("rb09j-ac2b-{lane_label}-s0-0"), 0),
+                )
+                .unwrap();
+                let sealed_len = out0.meta.committed_len;
+                let _ = drain_capture_queue(repo.path(), &setup_spy).await.unwrap();
+
+                let half = encode_postcard_frame(
+                    flags,
+                    &format!("rb09j:ac2b:{lane_label}:half"),
+                    CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                    &payload_for(&format!("rb09j-ac2b-{lane_label}-half"), 99),
+                )
+                .unwrap();
+                {
+                    let mut f = fs::OpenOptions::new()
+                        .append(true)
+                        .open(lane_dir.join(segment_log_file_name(0)))
+                        .unwrap();
+                    f.write_all(&half[..half.len() / 2]).unwrap();
+                    f.sync_data().unwrap();
+                }
+                let mut seg1_len = 0u64;
+                for i in 0..2usize {
+                    let out = append_postcard_frame(
+                        repo.path(),
+                        lane,
+                        flags,
+                        &format!("rb09j:ac2b:{lane_label}:s1:{i}"),
+                        CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                        &payload_for(&format!("rb09j-ac2b-{lane_label}-s1-{i}"), 10 + i as i64),
+                    )
+                    .unwrap();
+                    assert_eq!(out.meta.active_seg, 1);
+                    seg1_len = out.meta.committed_len;
+                }
+
+                let lock = try_acquire_writer_lock_at_root(&init.paths.root)
+                    .unwrap()
+                    .unwrap();
+                let mut crash_obs =
+                    WriterObserver::with_crash_point(WriterCrashPoint::AfterDbCommitBeforeMirror);
+                let _ = drain_locked_at_root(
+                    &init.paths.root,
+                    &setup_spy,
+                    QueueWriterOptions::default(),
+                    &lock,
+                    &mut crash_obs,
+                )
+                .await
+                .expect_err("AC2b: must crash after empty-advance commit before mirror update");
+                drop(lock);
+
+                assert_eq!(
+                    store.get_queue_highwater(lane).await.unwrap(),
+                    CaptureQueueHighwater {
+                        segment_id: 1,
+                        byte_offset: 0,
+                    }
+                );
+                assert_eq!(
+                    read_highwater_mirror(&init.paths.root)
+                        .unwrap()
+                        .unwrap()
+                        .get(lane),
+                    CaptureQueueHighwater {
+                        segment_id: 0,
+                        byte_offset: sealed_len,
+                    }
+                );
+
+                let restart_spy = SpyCaptureStore::new(store.clone(), init.paths.root.clone());
+                let rep = drain_capture_queue(repo.path(), &restart_spy)
+                    .await
+                    .expect("AC2b: restart must drain seg 1 directly from DB (1, 0)");
+                assert_eq!(rep.applied_frames, 2);
+                assert_eq!(rep.deduplicated_frames, 0);
+                assert_eq!(rep.reclaimed_segments, 1);
+                let calls = restart_spy.recorded_calls();
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].item_count, 2);
+                let expected_final = CaptureQueueHighwater {
+                    segment_id: 1,
+                    byte_offset: seg1_len,
+                };
+                assert_eq!(
+                    store.get_queue_highwater(lane).await.unwrap(),
+                    expected_final
+                );
+                assert_eq!(
+                    read_highwater_mirror(&init.paths.root)
+                        .unwrap()
+                        .unwrap()
+                        .get(lane),
+                    expected_final
+                );
+                assert_eq!(row_count_for(store.clone(), lane).await, 3);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn consumer_drained_rotated_s1_existing_and_appended_drain() {
+        // `RB-09j` AC3, AC4 & AC5 (`ADR-RB-05` #4 ② (c)):
+        // Verify on BOTH `normal/` and `priority/` lanes AND across BOTH rotation
+        // paths (Case C Step C2 AND genuine 16 MiB regular rotation):
+        // - AC3: After empty-advance commits `(S + 1, 0)`, the consumer immediately
+        //   switches its read cursor to `(S + 1, 0)` and persists 100% of all frames
+        //   that ALREADY existed in `S + 1` at rotation time (verified field-for-field).
+        // - AC4: Subsequent newly appended frames written to active `S + 1` are
+        //   100% persisted into `capture.redb` (verified field-for-field, 0 dups).
+        // - AC5: Final DB `QUEUE_HIGHWATER_*` and external `highwater` mirror stop
+        //   at exact `(S + 1, committed_len(S + 1))` — NEVER jumping to `(S + 2, 0)`
+        //   and never creating `events-<S + 2>.log`.
+        use std::io::Write as _;
+
+        for lane in [CaptureQueueLane::Normal, CaptureQueueLane::Priority] {
+            let lane_label = lane_subdir_name(lane);
+            let flags = match lane {
+                CaptureQueueLane::Priority => FRAME_FLAG_PRIORITY,
+                CaptureQueueLane::Normal => FRAME_FLAG_NONE,
+            };
+            let sized_payload_for = |tag: &str, seq: i64, pad_bytes: usize| match lane {
+                CaptureQueueLane::Priority => {
+                    let mut rec = match make_session_payload(
+                        tag,
+                        CaptureSessionState::Stopped,
+                        1_700_140_000 + seq,
+                    ) {
+                        CaptureBatchPayload::UpsertSession(r) => r,
+                        _ => unreachable!(),
+                    };
+                    if pad_bytes > 0 {
+                        rec.metadata_json = format!(r#"{{"pad":"{}"}}"#, "q".repeat(pad_bytes));
+                    }
+                    CaptureBatchPayload::UpsertSession(rec)
+                }
+                CaptureQueueLane::Normal => {
+                    let mut rec = match make_audit_payload(
+                        tag,
+                        &format!("2026-11-24T13:00:{:02}Z", seq % 60),
+                    ) {
+                        CaptureBatchPayload::AppendAuditLog(r) => r,
+                        _ => unreachable!(),
+                    };
+                    if pad_bytes > 0 {
+                        rec.justification = Some("r".repeat(pad_bytes));
+                    }
+                    CaptureBatchPayload::AppendAuditLog(rec)
+                }
+            };
+
+            for use_16mib_rotation in [false, true] {
+                let path_tag = if use_16mib_rotation {
+                    "16mib"
+                } else {
+                    "stepc2"
+                };
+                let repo = tempdir().expect("tempdir");
+                let init = init_capture_queue(repo.path()).expect("init capture queue");
+                let lane_dir = match lane {
+                    CaptureQueueLane::Normal => init.paths.normal.clone(),
+                    CaptureQueueLane::Priority => init.paths.priority.clone(),
+                };
+                let store = RedbCaptureStore::create(
+                    repo.path()
+                        .join(PRIVATE_SUBDIR)
+                        .join("capture.gen-0001.redb"),
+                )
+                .await
+                .expect("create RedbCaptureStore");
+                let setup_spy = SpyCaptureStore::new(store.clone(), init.paths.root.clone());
+
+                // 1. Fill & drain active `S = 0` so DB `hw` sits at `(0, seg0_len)`.
+                let pre_count = if use_16mib_rotation { 5usize } else { 3usize };
+                let pad_len = if use_16mib_rotation {
+                    3 * 1024 * 1024
+                } else {
+                    0
+                };
+                let mut seg0_len = 0u64;
+                for i in 0..pre_count {
+                    let out = append_postcard_frame(
+                        repo.path(),
+                        lane,
+                        flags,
+                        &format!("rb09j:s1:{path_tag}:{lane_label}:s0:{i}"),
+                        CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                        &sized_payload_for(
+                            &format!("rb09j-s1-{path_tag}-{lane_label}-s0-{i}"),
+                            i as i64,
+                            pad_len,
+                        ),
+                    )
+                    .unwrap();
+                    assert_eq!(out.meta.active_seg, 0);
+                    seg0_len = out.meta.committed_len;
+                }
+                let pre_rep = drain_capture_queue(repo.path(), &setup_spy).await.unwrap();
+                assert_eq!(pre_rep.applied_frames, pre_count);
+                assert_eq!(
+                    store.get_queue_highwater(lane).await.unwrap(),
+                    CaptureQueueHighwater {
+                        segment_id: 0,
+                        byte_offset: seg0_len,
+                    }
+                );
+
+                // 2. Rotate `S = 0 -> S + 1 = 1` AND write 4 existing frames into `S + 1`.
+                let mut existing_s1_payloads = Vec::with_capacity(4);
+                let mut existing_s1_dedups = Vec::with_capacity(4);
+                let mut existing_s1_end = 0u64;
+
+                if !use_16mib_rotation {
+                    let half = encode_postcard_frame(
+                        flags,
+                        &format!("rb09j:s1:{path_tag}:{lane_label}:half"),
+                        CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                        &sized_payload_for(
+                            &format!("rb09j-s1-{path_tag}-{lane_label}-half"),
+                            999,
+                            0,
+                        ),
+                    )
+                    .unwrap();
+                    let mut f = fs::OpenOptions::new()
+                        .append(true)
+                        .open(lane_dir.join(segment_log_file_name(0)))
+                        .unwrap();
+                    f.write_all(&half[..half.len() / 2]).unwrap();
+                    f.sync_data().unwrap();
+                }
+
+                for i in 0..4usize {
+                    let dedup = format!("rb09j:s1:{path_tag}:{lane_label}:exist:{i}");
+                    let first_rot_pad = if use_16mib_rotation && i == 0 {
+                        2 * 1024 * 1024
+                    } else {
+                        0
+                    };
+                    let payload = sized_payload_for(
+                        &format!("rb09j-s1-{path_tag}-{lane_label}-exist-{i}"),
+                        100 + i as i64,
+                        first_rot_pad,
+                    );
+                    let out = append_postcard_frame(
+                        repo.path(),
+                        lane,
+                        flags,
+                        &dedup,
+                        CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                        &payload,
+                    )
+                    .expect("rotate into seg 1 and populate existing S+1 frames");
+                    assert_eq!(out.meta.active_seg, 1);
+                    existing_s1_end = out.meta.committed_len;
+                    existing_s1_dedups.push(dedup);
+                    existing_s1_payloads.push(payload);
+                }
+
+                // 3. AC3: Consumer runs empty-advance `(1, 0)` then IMMEDIATELY switches
+                //    read cursor to `(1, 0)` and drains all 4 existing frames of `S + 1`!
+                let drain1_spy = SpyCaptureStore::new(store.clone(), init.paths.root.clone());
+                let rep1 = drain_capture_queue(repo.path(), &drain1_spy)
+                    .await
+                    .expect("AC3: empty-advance + existing S+1 frames drain must succeed");
+                assert_eq!(rep1.applied_frames, 4);
+                assert_eq!(rep1.deduplicated_frames, 0);
+                assert_eq!(rep1.reclaimed_segments, 1);
+                let calls1 = drain1_spy.recorded_calls();
+                assert_eq!(calls1.len(), 2);
+                assert_eq!(calls1[0].item_count, 0);
+                assert_eq!(
+                    calls1[0].db_highwater_after,
+                    CaptureQueueHighwater {
+                        segment_id: 1,
+                        byte_offset: 0,
+                    }
+                );
+                assert_eq!(calls1[1].item_count, 4);
+                assert_eq!(calls1[1].dedup_keys, existing_s1_dedups);
+                assert_eq!(
+                    calls1[1].db_highwater_after,
+                    CaptureQueueHighwater {
+                        segment_id: 1,
+                        byte_offset: existing_s1_end,
+                    }
+                );
+
+                // 4. AC4: Append 5 subsequent new frames into active `S + 1 = 1` and
+                //    verify 100% seamless ingestion from `(1, existing_s1_end)`!
+                let mut appended_s1_payloads = Vec::with_capacity(5);
+                let mut appended_s1_dedups = Vec::with_capacity(5);
+                let mut cursor = existing_s1_end;
+                for i in 0..5usize {
+                    let dedup = format!("rb09j:s1:{path_tag}:{lane_label}:append:{i}");
+                    let payload = sized_payload_for(
+                        &format!("rb09j-s1-{path_tag}-{lane_label}-append-{i}"),
+                        200 + i as i64,
+                        0,
+                    );
+                    let out = append_postcard_frame(
+                        repo.path(),
+                        lane,
+                        flags,
+                        &dedup,
+                        CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                        &payload,
+                    )
+                    .expect("AC4: subsequent append into active S+1 must succeed");
+                    assert_eq!(out.meta.active_seg, 1);
+                    assert_eq!(out.frame_offset, cursor);
+                    cursor = out.meta.committed_len;
+                    appended_s1_dedups.push(dedup);
+                    appended_s1_payloads.push(payload);
+                }
+                let final_s1_committed_len = cursor;
+
+                let drain2_spy = SpyCaptureStore::new(store.clone(), init.paths.root.clone());
+                let rep2 = drain_capture_queue(repo.path(), &drain2_spy)
+                    .await
+                    .expect("AC4: drain of subsequently appended S+1 frames must succeed");
+                assert_eq!(rep2.applied_frames, 5);
+                assert_eq!(rep2.deduplicated_frames, 0);
+                let calls2 = drain2_spy.recorded_calls();
+                assert_eq!(calls2.len(), 1);
+                assert_eq!(calls2[0].dedup_keys, appended_s1_dedups);
+
+                // 5. AC5: Final DB `QUEUE_HIGHWATER_*` and external mirror stop at EXACT
+                //    `(1, final_s1_committed_len)` — NEVER jumping to `(2, 0)`!
+                let expected_final_hw = CaptureQueueHighwater {
+                    segment_id: 1,
+                    byte_offset: final_s1_committed_len,
+                };
+                assert_eq!(
+                    store.get_queue_highwater(lane).await.unwrap(),
+                    expected_final_hw,
+                    "AC5 ({path_tag}, {lane_label}): DB highwater must stop at (1, committed_len(1)), NEVER (2, 0)"
+                );
+                assert_eq!(
+                    read_highwater_mirror(&init.paths.root)
+                        .unwrap()
+                        .unwrap()
+                        .get(lane),
+                    expected_final_hw
+                );
+                assert!(!lane_dir.join(segment_log_file_name(0)).exists());
+                assert!(lane_dir.join(segment_log_file_name(1)).exists());
+                assert!(!lane_dir.join(segment_log_file_name(2)).exists());
+
+                // Verify 100% payload equality for all existing + appended `S + 1` frames.
+                for expected in existing_s1_payloads
+                    .iter()
+                    .chain(appended_s1_payloads.iter())
+                {
+                    match expected {
+                        CaptureBatchPayload::AppendAuditLog(rec) => {
+                            let got = store.get_audit_log(&rec.audit_id).await.unwrap().unwrap();
+                            assert_eq!(&got, rec);
+                        }
+                        CaptureBatchPayload::UpsertSession(rec) => {
+                            let got = store.get_session(&rec.session_id).await.unwrap().unwrap();
+                            assert_eq!(&got, rec);
+                        }
+                        other => panic!("unexpected payload: {other:?}"),
+                    }
                 }
             }
         }
