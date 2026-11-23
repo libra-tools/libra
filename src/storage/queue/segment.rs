@@ -621,6 +621,16 @@ fn resolve_dual_replicas(
 }
 
 /// Action plan computed during strictly read-only Phase 1 classification.
+/// Read-only Phase 1 plan for a nested Case C→D old active segment `S` whose
+/// on-disk size exceeds `LTM2.committed_len` (`ADR-RB-05` #3 Case D, `RB-08k`, `RB-08v`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NestedOldTailPlan {
+    valid_end: u64,
+    recovered_crc32c: u32,
+    frame_count: usize,
+    has_damaged_tail: bool,
+}
+
 #[derive(Debug)]
 enum Phase1Plan<T> {
     /// Case 0a: 0 segment files and both replicas absent; initialize 34B `LTM2`
@@ -656,15 +666,17 @@ enum Phase1Plan<T> {
         stale_tmp_names: Vec<T>,
         reclaimed_orphans: Vec<u32>,
     },
-    /// Case D (clean old segment + valid successor `S + 1`, optionally
-    /// followed by an uncommitted trailing half-frame `[succ_valid_end, actual_len)`):
-    /// `max_live_seg == active_seg + 1`, old segment `S` satisfies
-    /// `actual_len(S) == committed_len > 0` with `[0, committed_len)` prefix
-    /// CRC32C verified, `meta.sealed.len() < MAX_SEALED_SEGMENTS`, and
-    /// `events-<S+1>.log` decodes `>= 1` valid dual-CRC32C frame from offset `0`
-    /// to `succ_valid_end` (`ADR-RB-05` #3 Case D, `RB-08d` AC3–AC7, `RB-08u` AC1–AC7).
+    /// Case D (valid successor `S + 1`, optionally preceded by a nested Case C
+    /// old-segment tail `old_tail` on `S` and/or followed by an uncommitted
+    /// trailing half-frame `[succ_valid_end, actual_len)` on `S + 1`):
+    /// `max_live_seg == active_seg + 1`, old segment `S` `[0, committed_len)`
+    /// prefix CRC32C verified, `meta.sealed.len() < MAX_SEALED_SEGMENTS`,
+    /// effective old length `> 0`, and `events-<S+1>.log` decodes `>= 1` valid
+    /// dual-CRC32C frame from offset `0` to `succ_valid_end` (`ADR-RB-05` #3
+    /// Case D, `RB-08d`, `RB-08u`, `RB-08k`, `RB-08v`).
     CaseDRecoverValidSuccessor {
         meta: LaneTailMeta,
+        old_tail: Option<NestedOldTailPlan>,
         succ_seg: u32,
         succ_valid_end: u64,
         succ_crc32c: u32,
@@ -673,16 +685,20 @@ enum Phase1Plan<T> {
         stale_tmp_names: Vec<T>,
         reclaimed_orphans: Vec<u32>,
     },
-    /// Case D (clean old segment + empty or half-frame-only orphan successor `S + 1`):
-    /// `max_live_seg == active_seg + 1`, old segment `S` satisfies
-    /// `actual_len(S) == committed_len` with `[0, committed_len)` prefix CRC32C
-    /// verified, and `events-<S+1>.log` has `0` complete valid frames (`orphan_non_empty == false`
-    /// for 0-byte empty orphan, `orphan_non_empty == true` for half-frame/damaged-only orphan).
-    /// Phase 2 quarantines non-empty orphan via `RB-08t::quarantine_and_unlink_orphan`,
-    /// unlinks the orphan, `fsync_dir(lane_dir)`, and syncs dual `LTM2` replicas to the
-    /// intact `active_seg` without sealing `S` (`ADR-RB-05` #3 Case D, `RB-08f` AC1–AC8).
+    /// Case D (empty or half-frame-only orphan successor `S + 1`, optionally
+    /// accompanied by a nested Case C old-segment tail `old_tail` on `S`):
+    /// `max_live_seg == active_seg + 1`, old segment `S` `[0, committed_len)`
+    /// prefix CRC32C verified, and `events-<S+1>.log` has `0` complete valid
+    /// frames (`orphan_non_empty == false` for 0-byte empty orphan,
+    /// `orphan_non_empty == true` for half-frame/damaged-only orphan).
+    /// Phase 2 recovers any nested old tail via `case_c_step_c1`, quarantines
+    /// non-empty orphan via `RB-08t::quarantine_and_unlink_orphan`, unlinks the
+    /// orphan, `fsync_dir(lane_dir)`, and syncs dual `LTM2` replicas to the
+    /// intact `active_seg` without sealing `S` (`ADR-RB-05` #3 Case D, `RB-08f`,
+    /// `RB-08k`).
     CaseDCleanOrphanSuccessor {
         meta: LaneTailMeta,
+        old_tail: Option<NestedOldTailPlan>,
         orphan_seg: u32,
         orphan_non_empty: bool,
         stale_tmp_names: Vec<T>,
@@ -1515,14 +1531,15 @@ enum CaseDPhase1Kind {
 
 /// Apply Phase 1 read-only classification rules for Case D (`RB-08d` clean
 /// valid successor, `RB-08u` valid successor with trailing uncommitted
-/// half-frame, and `RB-08f` empty or half-frame-only orphan successor).
+/// half-frame, `RB-08f` empty or half-frame-only orphan successor, and `RB-08k`
+/// nested Case C→D clean synced old-segment tail recovery).
 ///
 /// Validates `MAX_SEALED_SEGMENTS` illegal full-table state first (before any
-/// mutation), forbids sealing a 0-byte old segment, and enforces the scope
-/// guard for downstream `RB-08k` (nested Case C→D).
+/// mutation), enforces the scope guard for downstream `RB-08v` (nested Case
+/// C→D damaged old-segment tail), and forbids sealing a 0-byte old segment.
 fn classify_case_d_readonly(
     meta: &LaneTailMeta,
-    old_actual_len: u64,
+    old_tail: Option<&NestedOldTailPlan>,
     succ_actual_len: u64,
     succ_scan: &SuccessorSegmentScan,
 ) -> StorageResult<CaseDPhase1Kind> {
@@ -1533,11 +1550,12 @@ fn classify_case_d_readonly(
                     .to_string(),
         });
     }
-    if old_actual_len > meta.committed_len {
+    if let Some(ot) = old_tail
+        && ot.has_damaged_tail
+    {
         return Err(StorageBackendError::BackendInternal {
-            detail:
-                "Case D: nested Case C->D old segment uncommitted tail requires RB-08k recovery"
-                    .to_string(),
+            detail: "Case D: nested Case C->D damaged old segment tail requires RB-08v recovery"
+                .to_string(),
         });
     }
     if succ_scan.frame_count == 0 {
@@ -1545,7 +1563,8 @@ fn classify_case_d_readonly(
             non_empty: succ_actual_len > 0,
         });
     }
-    if meta.committed_len == 0 {
+    let effective_old_len = old_tail.map_or(meta.committed_len, |ot| ot.valid_end);
+    if effective_old_len == 0 {
         return Err(StorageBackendError::CorruptCommittedFrame {
             detail:
                 "Case D: valid successor segment exists while old active segment is empty (0 bytes)"
@@ -2755,10 +2774,32 @@ mod unix_seg {
             let (mut succ_file, succ_actual_len) =
                 open_segment_readonly_nofollow(lane_fd, succ_seg, expected_uid)?;
             let succ_scan = scan_successor_segment_readonly(&mut succ_file, succ_actual_len)?;
-            return match classify_case_d_readonly(&meta, actual_len, succ_actual_len, &succ_scan)? {
+            let old_tail = if actual_len > meta.committed_len {
+                let tail = scan_case_c_uncommitted_tail(
+                    &mut ro_seg,
+                    meta.committed_len,
+                    actual_len,
+                    meta.prefix_crc32c,
+                )?;
+                Some(NestedOldTailPlan {
+                    valid_end: tail.valid_end,
+                    recovered_crc32c: tail.recovered_crc32c,
+                    frame_count: tail.frame_count,
+                    has_damaged_tail: tail.has_damaged_tail,
+                })
+            } else {
+                None
+            };
+            return match classify_case_d_readonly(
+                &meta,
+                old_tail.as_ref(),
+                succ_actual_len,
+                &succ_scan,
+            )? {
                 CaseDPhase1Kind::ValidSuccessor { has_damaged_tail } => {
                     Ok(Phase1Plan::CaseDRecoverValidSuccessor {
                         meta,
+                        old_tail,
                         succ_seg,
                         succ_valid_end: succ_scan.valid_end,
                         succ_crc32c: succ_scan.valid_crc32c,
@@ -2771,6 +2812,7 @@ mod unix_seg {
                 CaseDPhase1Kind::OrphanSuccessor { non_empty } => {
                     Ok(Phase1Plan::CaseDCleanOrphanSuccessor {
                         meta,
+                        old_tail,
                         orphan_seg: succ_seg,
                         orphan_non_empty: non_empty,
                         stale_tmp_names: scan.stale_tmp_names,
@@ -3381,6 +3423,7 @@ mod unix_seg {
             }
             Phase1Plan::CaseDRecoverValidSuccessor {
                 meta,
+                old_tail,
                 succ_seg,
                 succ_valid_end,
                 succ_crc32c,
@@ -3394,6 +3437,27 @@ mod unix_seg {
                 let reclaimed_orphans_removed =
                     clean_reclaimed_orphans_unix(lane_fd, &reclaimed_orphans, expected_uid)?;
                 let mut quarantined_artifacts = Vec::new();
+                let (effective_old_meta, old_recovered_frames, old_recovered_bytes) =
+                    if let Some(ot) = old_tail {
+                        // `RB-08k` / `RB-08v` (`ADR-RB-05` #3 Case D): recover
+                        // nested old-segment uncommitted tail via Step C1 BEFORE
+                        // sealing `(S, old_valid_end, old_sealed_crc)` into `LTM2.sealed[]`.
+                        let step_c1 = case_c_step_c1_unix(
+                            ctx,
+                            meta,
+                            ot.valid_end,
+                            ot.recovered_crc32c,
+                            ot.frame_count,
+                            ot.has_damaged_tail,
+                            observer,
+                        )?;
+                        if let Some(q_rep) = step_c1.quarantined_artifact {
+                            quarantined_artifacts.push(q_rep);
+                        }
+                        (step_c1.meta, ot.frame_count, step_c1.recovered_bytes)
+                    } else {
+                        (meta, 0, 0)
+                    };
                 if succ_has_damaged_tail {
                     // `RB-08u` AC1–AC7: mandatory durable quarantine barrier via
                     // `RB-08t::quarantine_and_truncate_segment_at_fds` BEFORE
@@ -3415,14 +3479,14 @@ mod unix_seg {
                     quarantined_artifacts.push(q_report);
                 }
                 let next_meta = build_case_d_sealed_successor_meta(
-                    &meta,
+                    &effective_old_meta,
                     succ_seg,
                     succ_valid_end,
                     succ_crc32c,
                 )?;
                 observer.record_case_d_recover_successor(
                     lane_label,
-                    meta.active_seg,
+                    effective_old_meta.active_seg,
                     succ_seg,
                     succ_valid_end,
                     succ_frames,
@@ -3437,8 +3501,8 @@ mod unix_seg {
                 Ok(Phase2ConvergedState {
                     meta: next_meta,
                     active_seg_exists: true,
-                    recovered_frames: succ_frames,
-                    recovered_bytes: succ_valid_end,
+                    recovered_frames: old_recovered_frames + succ_frames,
+                    recovered_bytes: old_recovered_bytes + succ_valid_end,
                     mirrored_replica: true,
                     cleaned_tmp_files,
                     reclaimed_orphans_removed,
@@ -3448,6 +3512,7 @@ mod unix_seg {
             }
             Phase1Plan::CaseDCleanOrphanSuccessor {
                 meta,
+                old_tail,
                 orphan_seg,
                 orphan_non_empty,
                 stale_tmp_names,
@@ -3458,6 +3523,24 @@ mod unix_seg {
                 let reclaimed_orphans_removed =
                     clean_reclaimed_orphans_unix(lane_fd, &reclaimed_orphans, expected_uid)?;
                 let mut quarantined_artifacts = Vec::new();
+                let (effective_old_meta, old_recovered_frames, old_recovered_bytes) =
+                    if let Some(ot) = old_tail {
+                        let step_c1 = case_c_step_c1_unix(
+                            ctx,
+                            meta,
+                            ot.valid_end,
+                            ot.recovered_crc32c,
+                            ot.frame_count,
+                            ot.has_damaged_tail,
+                            observer,
+                        )?;
+                        if let Some(q_rep) = step_c1.quarantined_artifact {
+                            quarantined_artifacts.push(q_rep);
+                        }
+                        (step_c1.meta, ot.frame_count, step_c1.recovered_bytes)
+                    } else {
+                        (meta, 0, 0)
+                    };
                 if orphan_non_empty {
                     // `RB-08f` AC3–AC5, AC7–AC8: non-empty half-frame orphan MUST
                     // go through `RB-08t::quarantine_and_unlink_orphan_at_fds` so
@@ -3487,12 +3570,18 @@ mod unix_seg {
                 }
                 // `RB-08f` AC6: sync both `tail.meta` and `tail.meta.bak` to intact
                 // `active_seg` without sealing `active_seg`.
-                commit_dual_tail_meta_unix(lane_fd, lane_label, &meta, expected_uid, observer)?;
+                commit_dual_tail_meta_unix(
+                    lane_fd,
+                    lane_label,
+                    &effective_old_meta,
+                    expected_uid,
+                    observer,
+                )?;
                 Ok(Phase2ConvergedState {
-                    meta,
+                    meta: effective_old_meta,
                     active_seg_exists: true,
-                    recovered_frames: 0,
-                    recovered_bytes: 0,
+                    recovered_frames: old_recovered_frames,
+                    recovered_bytes: old_recovered_bytes,
                     mirrored_replica: true,
                     cleaned_tmp_files,
                     reclaimed_orphans_removed,
@@ -5714,15 +5803,32 @@ mod non_unix_seg {
                     "open Case D successor capture queue segment",
                 )?;
                 let succ_scan = scan_successor_segment_readonly(&mut succ_file, succ_actual_len)?;
+                let old_tail = if actual_len > meta.committed_len {
+                    let tail = scan_case_c_uncommitted_tail(
+                        &mut seg_file,
+                        meta.committed_len,
+                        actual_len,
+                        meta.prefix_crc32c,
+                    )?;
+                    Some(NestedOldTailPlan {
+                        valid_end: tail.valid_end,
+                        recovered_crc32c: tail.recovered_crc32c,
+                        frame_count: tail.frame_count,
+                        has_damaged_tail: tail.has_damaged_tail,
+                    })
+                } else {
+                    None
+                };
                 return match classify_case_d_readonly(
                     &meta,
-                    actual_len,
+                    old_tail.as_ref(),
                     succ_actual_len,
                     &succ_scan,
                 )? {
                     CaseDPhase1Kind::ValidSuccessor { has_damaged_tail } => Ok((
                         Phase1Plan::CaseDRecoverValidSuccessor {
                             meta,
+                            old_tail,
                             succ_seg,
                             succ_valid_end: succ_scan.valid_end,
                             succ_crc32c: succ_scan.valid_crc32c,
@@ -5744,6 +5850,7 @@ mod non_unix_seg {
                         Ok((
                             Phase1Plan::CaseDCleanOrphanSuccessor {
                                 meta,
+                                old_tail,
                                 orphan_seg: succ_seg,
                                 orphan_non_empty: non_empty,
                                 stale_tmp_names,
@@ -6304,6 +6411,7 @@ mod non_unix_seg {
                 }
                 Phase1Plan::CaseDRecoverValidSuccessor {
                     meta,
+                    old_tail,
                     succ_seg,
                     succ_valid_end,
                     succ_crc32c,
@@ -6315,6 +6423,24 @@ mod non_unix_seg {
                     let cleaned = clean_tmp(&stale_tmp_names)?;
                     let orphans = clean_orphans(&reclaimed_orphans)?;
                     let mut quarantined_artifacts = Vec::new();
+                    let (effective_old_meta, old_recovered_frames, old_recovered_bytes) =
+                        if let Some(ot) = old_tail {
+                            let step_c1 = case_c_step_c1_windows(
+                                ctx,
+                                meta,
+                                ot.valid_end,
+                                ot.recovered_crc32c,
+                                ot.frame_count,
+                                ot.has_damaged_tail,
+                                observer,
+                            )?;
+                            if let Some(q_rep) = step_c1.quarantined_artifact {
+                                quarantined_artifacts.push(q_rep);
+                            }
+                            (step_c1.meta, ot.frame_count, step_c1.recovered_bytes)
+                        } else {
+                            (meta, 0, 0)
+                        };
                     if succ_has_damaged_tail {
                         let q_report = quarantine_and_truncate_segment_windows_locked(
                             ctx.quarantine_dir,
@@ -6328,14 +6454,14 @@ mod non_unix_seg {
                         quarantined_artifacts.push(q_report);
                     }
                     let next_meta = build_case_d_sealed_successor_meta(
-                        &meta,
+                        &effective_old_meta,
                         succ_seg,
                         succ_valid_end,
                         succ_crc32c,
                     )?;
                     observer.record_case_d_recover_successor(
                         lane_label,
-                        meta.active_seg,
+                        effective_old_meta.active_seg,
                         succ_seg,
                         succ_valid_end,
                         succ_frames,
@@ -6344,8 +6470,8 @@ mod non_unix_seg {
                     Ok(WindowsPhase2ConvergedState {
                         meta: next_meta,
                         active_seg_exists: true,
-                        recovered_frames: succ_frames,
-                        recovered_bytes: succ_valid_end,
+                        recovered_frames: old_recovered_frames + succ_frames,
+                        recovered_bytes: old_recovered_bytes + succ_valid_end,
                         mirrored_replica: true,
                         cleaned_tmp_files: cleaned,
                         reclaimed_orphans_removed: orphans,
@@ -6356,6 +6482,7 @@ mod non_unix_seg {
                 }
                 Phase1Plan::CaseDCleanOrphanSuccessor {
                     meta,
+                    old_tail,
                     orphan_seg,
                     orphan_non_empty,
                     stale_tmp_names,
@@ -6364,6 +6491,24 @@ mod non_unix_seg {
                     let cleaned = clean_tmp(&stale_tmp_names)?;
                     let orphans = clean_orphans(&reclaimed_orphans)?;
                     let mut quarantined_artifacts = Vec::new();
+                    let (effective_old_meta, old_recovered_frames, old_recovered_bytes) =
+                        if let Some(ot) = old_tail {
+                            let step_c1 = case_c_step_c1_windows(
+                                ctx,
+                                meta,
+                                ot.valid_end,
+                                ot.recovered_crc32c,
+                                ot.frame_count,
+                                ot.has_damaged_tail,
+                                observer,
+                            )?;
+                            if let Some(q_rep) = step_c1.quarantined_artifact {
+                                quarantined_artifacts.push(q_rep);
+                            }
+                            (step_c1.meta, ot.frame_count, step_c1.recovered_bytes)
+                        } else {
+                            (meta, 0, 0)
+                        };
                     if orphan_non_empty {
                         let q_report = quarantine_and_unlink_orphan_windows_locked(
                             ctx.quarantine_dir,
@@ -6377,12 +6522,17 @@ mod non_unix_seg {
                     } else {
                         unlink_empty_orphan_windows(lane_dir, ctx.lane, orphan_seg, observer)?;
                     }
-                    commit_dual_tail_meta_windows(lane_dir, lane_label, &meta, observer)?;
+                    commit_dual_tail_meta_windows(
+                        lane_dir,
+                        lane_label,
+                        &effective_old_meta,
+                        observer,
+                    )?;
                     Ok(WindowsPhase2ConvergedState {
-                        meta,
+                        meta: effective_old_meta,
                         active_seg_exists: true,
-                        recovered_frames: 0,
-                        recovered_bytes: 0,
+                        recovered_frames: old_recovered_frames,
+                        recovered_bytes: old_recovered_bytes,
                         mirrored_replica: true,
                         cleaned_tmp_files: cleaned,
                         reclaimed_orphans_removed: orphans,
@@ -14110,5 +14260,428 @@ mod tests {
         assert_eq!(s1_decoded[0].payload, app_payload);
         // Defense-in-depth: `build_case_c_step_c2_meta` itself rejects a 0-byte segment.
         assert!(build_case_c_step_c2_meta(&rec_s1.meta).is_err());
+    }
+
+    /// `RB-08k` AC1–AC6: Nested Case C→D old-segment clean synced tail recovery
+    /// (`max_seg > active_seg && old_valid_end == actual_len(S) > committed_len`):
+    /// - AC1: Flipping 1 byte inside old segment `S` `[0, committed_len)` fails
+    ///   closed with `CorruptCommittedFrame` (`LBR-IO-001`) strictly BEFORE
+    ///   touching successor `S + 1` (zero disk mutation).
+    /// - AC2: Seals old segment `S` into dual `LTM2.sealed[]` with exact grown
+    ///   boundary `(S, old_valid_end, old_sealed_crc)` (NEVER stale `committed_len`).
+    /// - AC3: Advances dual `LTM2.ACTIVE_SEG` to `S + 1`.
+    /// - AC4: Sets dual `LTM2.COMMITTED_LEN` to exact valid frame bytes in `S + 1`.
+    /// - AC5: Sets dual `LTM2.PREFIX_CRC32C` to exact `crc32c(events-<S+1>[0..committed_len])`.
+    /// - AC6: Preserves `events-<S+1>` bytes verbatim (`actual_s1_bytes == expected_s1_bytes`),
+    ///   verified across `recover_lane`, direct public `append_frame`, nested
+    ///   `committed_len == 0 < old_valid_end`, and nested clean old tail + orphan `S + 1`.
+    #[test]
+    fn nested_case_c_to_case_d_recovers_old_tail_and_seals_accurate_boundary() {
+        // =====================================================================
+        // Part 1 — AC1: Nested state old-segment `[0, committed_len)` prefix
+        // single-byte bitflip MUST fail closed BEFORE touching `S + 1` (verified
+        // both with a valid `S + 1` and with an unreadable/symlink `S + 1` so
+        // `CorruptCommittedFrame` fires before `S + 1` is ever opened!).
+        // =====================================================================
+        {
+            let repo = tempdir().expect("tempdir");
+            let init = init_capture_queue(repo.path()).expect("init capture queue");
+            let p1 = append_frame(
+                repo.path(),
+                CaptureQueueLane::Normal,
+                FRAME_FLAG_NONE,
+                "rb08k-ac1-p1",
+                b"committed-prefix-body",
+            )
+            .unwrap();
+            let old_tail_frame = encode_frame(
+                FRAME_FLAG_NONE,
+                "rb08k-ac1-old-tail",
+                b"synced-old-tail-frame",
+            )
+            .unwrap();
+            let s1_frame =
+                encode_frame(FRAME_FLAG_NONE, "rb08k-ac1-s1", b"valid-successor-frame").unwrap();
+            let seg0_path = init.paths.normal.join(segment_log_file_name(0));
+            let seg1_path = init.paths.normal.join(segment_log_file_name(1));
+
+            let mut corrupted_seg0 = fs::read(&seg0_path).unwrap();
+            assert_eq!(corrupted_seg0.len() as u64, p1.meta.committed_len);
+            let flip_idx = corrupted_seg0.len() / 2;
+            corrupted_seg0[flip_idx] ^= 0x80; // flip 1 byte in [0, committed_len)
+            corrupted_seg0.extend_from_slice(&old_tail_frame);
+            write_bytes_0600(&seg0_path, &corrupted_seg0);
+            write_bytes_0600(&seg1_path, &s1_frame);
+
+            let snap_before = snapshot_tree(&init.paths.root);
+            let err = recover_lane(repo.path(), CaptureQueueLane::Normal)
+                .expect_err("AC1: nested old-segment prefix bitflip must fail closed");
+            assert!(matches!(
+                err,
+                StorageBackendError::CorruptCommittedFrame { .. }
+            ));
+            assert_eq!(err.stable_code_str(), "LBR-IO-001");
+            assert_eq!(snapshot_tree(&init.paths.root), snap_before);
+
+            // Strengthen AC1 ordering proof on Unix: replace `S + 1` with a
+            // symlink; old-segment prefix check STILL fires `CorruptCommittedFrame`
+            // (not symlink `BackendInternal`) proving `S + 1` is never opened first.
+            #[cfg(unix)]
+            {
+                fs::remove_file(&seg1_path).unwrap();
+                std::os::unix::fs::symlink(&seg0_path, &seg1_path).unwrap();
+                let err_sym = recover_lane(repo.path(), CaptureQueueLane::Normal)
+                    .expect_err("AC1: old-segment prefix check must precede opening S+1");
+                assert!(matches!(
+                    err_sym,
+                    StorageBackendError::CorruptCommittedFrame { .. }
+                ));
+                assert_eq!(err_sym.stable_code_str(), "LBR-IO-001");
+            }
+        }
+
+        // =====================================================================
+        // Part 2 — AC2–AC6 (`recover_lane` path): old segment `S = 0` has
+        // committed prefix + 2 complete synced uncommitted tail frames (incl.
+        // >64 KiB frame), and successor `S = 1` has 2 complete synced valid frames.
+        // =====================================================================
+        {
+            let repo = tempdir().expect("tempdir");
+            let init = init_capture_queue(repo.path()).expect("init capture queue");
+            let p1_payload = b"rb08k-s0-prefix-1".to_vec();
+            let p2_payload = b"rb08k-s0-prefix-2".to_vec();
+            let _out_p1 = append_frame(
+                repo.path(),
+                CaptureQueueLane::Normal,
+                FRAME_FLAG_NONE,
+                "rb08k-p1",
+                &p1_payload,
+            )
+            .unwrap();
+            let out_p2 = append_frame(
+                repo.path(),
+                CaptureQueueLane::Normal,
+                FRAME_FLAG_NONE,
+                "rb08k-p2",
+                &p2_payload,
+            )
+            .unwrap();
+            let stale_committed_len = out_p2.meta.committed_len;
+            let stale_prefix_crc = out_p2.meta.prefix_crc32c;
+
+            // Append 2 complete synced uncommitted tail frames to old seg 0.
+            let ot1_payload = b"rb08k-old-synced-tail-1".to_vec();
+            let ot2_payload = vec![0x3cu8; 70 * 1024];
+            let ot1_bytes = encode_frame(FRAME_FLAG_NONE, "rb08k-ot1", &ot1_payload).unwrap();
+            let ot2_bytes = encode_frame(FRAME_FLAG_NONE, "rb08k-ot2-70k", &ot2_payload).unwrap();
+            let seg0_path = init.paths.normal.join(segment_log_file_name(0));
+            {
+                let mut f = fs::OpenOptions::new()
+                    .append(true)
+                    .open(&seg0_path)
+                    .unwrap();
+                f.write_all(&ot1_bytes).unwrap();
+                f.write_all(&ot2_bytes).unwrap();
+                f.sync_data().unwrap();
+            }
+            let old_valid_end =
+                stale_committed_len + ot1_bytes.len() as u64 + ot2_bytes.len() as u64;
+            assert!(old_valid_end > stale_committed_len);
+            let old_sealed_crc =
+                crc32c_append(crc32c_append(stale_prefix_crc, &ot1_bytes), &ot2_bytes);
+            assert_eq!(
+                crc32c_checksum(&fs::read(&seg0_path).unwrap()),
+                old_sealed_crc
+            );
+
+            // Create valid successor `events-00000001.log` with 2 complete frames.
+            let s1_f1_payload = b"rb08k-s1-frame-1".to_vec();
+            let s1_f2_payload = vec![0x91u8; 68 * 1024];
+            let s1_f1_bytes = encode_frame(FRAME_FLAG_NONE, "rb08k-s1-f1", &s1_f1_payload).unwrap();
+            let s1_f2_bytes =
+                encode_frame(FRAME_FLAG_NONE, "rb08k-s1-f2-68k", &s1_f2_payload).unwrap();
+            let mut expected_s1_bytes = Vec::with_capacity(s1_f1_bytes.len() + s1_f2_bytes.len());
+            expected_s1_bytes.extend_from_slice(&s1_f1_bytes);
+            expected_s1_bytes.extend_from_slice(&s1_f2_bytes);
+            let expected_s1_len = expected_s1_bytes.len() as u64;
+            let expected_s1_crc = crc32c_checksum(&expected_s1_bytes);
+            let seg1_path = init.paths.normal.join(segment_log_file_name(1));
+            write_bytes_0600(&seg1_path, &expected_s1_bytes);
+
+            let rec = recover_lane(repo.path(), CaptureQueueLane::Normal)
+                .expect("RB-08k: nested Case C->D clean old tail recovery must succeed");
+            assert!(rec.quarantined_artifacts.is_empty());
+            assert_eq!(rec.recovered_frames, 4); // 2 old-tail + 2 successor frames
+            assert_eq!(
+                rec.recovered_bytes,
+                (old_valid_end - stale_committed_len) + expected_s1_len
+            );
+
+            // Dual on-disk `LTM2` replicas agree byte-for-byte.
+            let raw_meta = fs::read(tail_meta_path(&init.paths.normal)).unwrap();
+            let raw_bak = fs::read(tail_meta_bak_path(&init.paths.normal)).unwrap();
+            assert_eq!(raw_meta, raw_bak);
+            let disk_meta = LaneTailMeta::decode(&raw_meta).unwrap();
+            assert_eq!(disk_meta, rec.meta);
+
+            // AC2: Old segment `S = 0` sealed with exact grown boundary
+            // `(0, old_valid_end, old_sealed_crc)`, NEVER stale `committed_len`.
+            assert_eq!(
+                disk_meta.sealed,
+                vec![SealedSegmentMeta {
+                    seg_id: 0,
+                    sealed_len: old_valid_end,
+                    sealed_crc32c: old_sealed_crc,
+                }],
+                "AC2 violated: LTM2.sealed[0] must record exact grown (old_valid_end, old_sealed_crc)"
+            );
+            assert_ne!(disk_meta.sealed[0].sealed_len, stale_committed_len);
+
+            // AC3: `ACTIVE_SEG == 1` (`S + 1`).
+            assert_eq!(
+                disk_meta.active_seg, 1,
+                "AC3 violated: LTM2.ACTIVE_SEG must advance to S + 1"
+            );
+            // AC4: `COMMITTED_LEN == expected_s1_len`.
+            assert_eq!(
+                disk_meta.committed_len, expected_s1_len,
+                "AC4 violated: LTM2.COMMITTED_LEN must equal successor valid bytes"
+            );
+            // AC5: `PREFIX_CRC32C == crc32c(events-00000001.log[0..committed_len])`.
+            assert_eq!(
+                disk_meta.prefix_crc32c, expected_s1_crc,
+                "AC5 violated: LTM2.PREFIX_CRC32C must match successor CRC32C"
+            );
+            // AC6: `events-00000001.log` full bytes preserved verbatim + lossless decode.
+            let actual_s1_bytes = fs::read(&seg1_path).expect("read recovered seg1");
+            assert_eq!(
+                actual_s1_bytes, expected_s1_bytes,
+                "AC6 violated: successor events-<S+1> bytes must be preserved verbatim"
+            );
+            let s0_decoded = decode_all_segment_bytes(&fs::read(&seg0_path).unwrap());
+            assert_eq!(
+                s0_decoded
+                    .iter()
+                    .map(|f| f.dedup_key.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["rb08k-p1", "rb08k-p2", "rb08k-ot1", "rb08k-ot2-70k"]
+            );
+            assert_eq!(s0_decoded[0].flags, FRAME_FLAG_NONE);
+            assert_eq!(s0_decoded[0].payload, p1_payload);
+            assert_eq!(s0_decoded[1].flags, FRAME_FLAG_NONE);
+            assert_eq!(s0_decoded[1].payload, p2_payload);
+            assert_eq!(s0_decoded[2].flags, FRAME_FLAG_NONE);
+            assert_eq!(s0_decoded[2].payload, ot1_payload);
+            assert_eq!(s0_decoded[3].flags, FRAME_FLAG_NONE);
+            assert_eq!(s0_decoded[3].payload, ot2_payload);
+            let s1_decoded = decode_all_segment_bytes(&actual_s1_bytes);
+            assert_eq!(
+                s1_decoded
+                    .iter()
+                    .map(|f| f.dedup_key.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["rb08k-s1-f1", "rb08k-s1-f2-68k"]
+            );
+            assert_eq!(s1_decoded[0].payload, s1_f1_payload);
+            assert_eq!(s1_decoded[1].payload, s1_f2_payload);
+
+            // =================================================================
+            // Part 3 — Direct public `append_frame` producer path on nested
+            // clean old tail on `S = 1` + valid `S = 2` (verifies multi-generation
+            // sealing and seamless append at `S = 2` offset `expected_s2_len`).
+            // =================================================================
+            let ot_s1_bytes =
+                encode_frame(FRAME_FLAG_NONE, "rb08k-s1-ot", b"old-tail-on-seg1").unwrap();
+            {
+                let mut f = fs::OpenOptions::new()
+                    .append(true)
+                    .open(&seg1_path)
+                    .unwrap();
+                f.write_all(&ot_s1_bytes).unwrap();
+                f.sync_data().unwrap();
+            }
+            let expected_s1_sealed_bytes = fs::read(&seg1_path).unwrap();
+            let s2_init_bytes =
+                encode_frame(FRAME_FLAG_NONE, "rb08k-s2-init", b"successor-s2-frame").unwrap();
+            let seg2_path = init.paths.normal.join(segment_log_file_name(2));
+            write_bytes_0600(&seg2_path, &s2_init_bytes);
+
+            let s2_new_payload = b"producer-appended-onto-s2-after-nested-cd".to_vec();
+            let out_s2 = append_frame(
+                repo.path(),
+                CaptureQueueLane::Normal,
+                FRAME_FLAG_NONE,
+                "rb08k-s2-new",
+                &s2_new_payload,
+            )
+            .expect("public append_frame after nested Case C->D must succeed");
+            assert_eq!(out_s2.seg_id, 2);
+            assert_eq!(out_s2.frame_offset, s2_init_bytes.len() as u64);
+            assert_eq!(out_s2.recovered_frames, 2);
+            assert_eq!(out_s2.meta.active_seg, 2);
+            assert_eq!(out_s2.meta.sealed.len(), 2);
+            assert_eq!(
+                out_s2.meta.sealed[1],
+                SealedSegmentMeta {
+                    seg_id: 1,
+                    sealed_len: expected_s1_sealed_bytes.len() as u64,
+                    sealed_crc32c: crc32c_checksum(&expected_s1_sealed_bytes),
+                }
+            );
+            let s2_decoded = decode_all_segment_bytes(&fs::read(&seg2_path).unwrap());
+            assert_eq!(s2_decoded.len(), 2);
+            assert_eq!(s2_decoded[0].dedup_key, "rb08k-s2-init");
+            assert_eq!(s2_decoded[1].dedup_key, "rb08k-s2-new");
+            assert_eq!(s2_decoded[1].payload, s2_new_payload);
+        }
+
+        // =====================================================================
+        // Part 4 — Edge cases:
+        // (a) `committed_len == 0 < old_valid_end` (fresh seg 0 gained complete
+        //     synced frame before valid `S = 1` appeared -> sealed accurately);
+        // (b) Nested clean old tail + empty orphan `S + 1` -> unlinks orphan
+        //     and advances `LTM2` on `S` to `(S, old_valid_end, old_sealed_crc)`.
+        // =====================================================================
+        {
+            let repo = tempdir().unwrap();
+            let init = init_capture_queue(repo.path()).unwrap();
+            let seg0_path = init.paths.normal.join(segment_log_file_name(0));
+            let seg1_path = init.paths.normal.join(segment_log_file_name(1));
+            let s0_frame = encode_frame(FRAME_FLAG_NONE, "rb08k-z-s0", b"zero-base-s0").unwrap();
+            let s1_frame = encode_frame(FRAME_FLAG_NONE, "rb08k-z-s1", b"zero-base-s1").unwrap();
+            write_bytes_0600(&seg0_path, &s0_frame);
+            write_bytes_0600(&seg1_path, &s1_frame);
+
+            let rec = recover_lane(repo.path(), CaptureQueueLane::Normal)
+                .expect("nested committed_len == 0 < old_valid_end must seal accurately");
+            assert_eq!(rec.meta.active_seg, 1);
+            assert_eq!(
+                rec.meta.sealed,
+                vec![SealedSegmentMeta {
+                    seg_id: 0,
+                    sealed_len: s0_frame.len() as u64,
+                    sealed_crc32c: crc32c_checksum(&s0_frame),
+                }]
+            );
+            assert_eq!(rec.meta.committed_len, s1_frame.len() as u64);
+            assert_eq!(fs::read(&seg1_path).unwrap(), s1_frame);
+
+            // (b) Nested clean old tail on `S = 1` + empty orphan `S = 2`.
+            let s1_ot = encode_frame(FRAME_FLAG_NONE, "rb08k-z-s1-ot", b"s1-tail-orphan").unwrap();
+            {
+                let mut f = fs::OpenOptions::new()
+                    .append(true)
+                    .open(&seg1_path)
+                    .unwrap();
+                f.write_all(&s1_ot).unwrap();
+                f.sync_data().unwrap();
+            }
+            let seg2_path = init.paths.normal.join(segment_log_file_name(2));
+            write_bytes_0600(&seg2_path, b"");
+            let expected_s1_full = fs::read(&seg1_path).unwrap();
+
+            let rec_orp = recover_lane(repo.path(), CaptureQueueLane::Normal)
+                .expect("nested clean old tail + empty orphan S+1 must converge cleanly");
+            assert!(!seg2_path.exists());
+            assert_eq!(rec_orp.meta.active_seg, 1);
+            assert_eq!(rec_orp.meta.sealed.len(), 1);
+            assert_eq!(rec_orp.meta.committed_len, expected_s1_full.len() as u64);
+            assert_eq!(
+                rec_orp.meta.prefix_crc32c,
+                crc32c_checksum(&expected_s1_full)
+            );
+            assert_eq!(rec_orp.recovered_frames, 1);
+        }
+
+        // =====================================================================
+        // Part 5 — Scope guard & precedence:
+        // (a) Damaged nested old tail + valid `S + 1` rejects in Phase 1
+        //     (`BackendInternal` pending `RB-08v`) with zero whole-tree mutation;
+        // (b) Full 256-entry `sealed[]` + damaged nested old tail + valid `S + 1`
+        //     still hits `CorruptCommittedFrame` (`LBR-IO-001`) strictly BEFORE
+        //     the damaged-tail guard with zero whole-tree mutation.
+        // =====================================================================
+        {
+            let repo = tempdir().unwrap();
+            let init = init_capture_queue(repo.path()).unwrap();
+            let _p1 = append_frame(
+                repo.path(),
+                CaptureQueueLane::Normal,
+                FRAME_FLAG_NONE,
+                "rb08k-guard-p1",
+                b"guard-prefix",
+            )
+            .unwrap();
+            let seg0_path = init.paths.normal.join(segment_log_file_name(0));
+            let seg1_path = init.paths.normal.join(segment_log_file_name(1));
+            let bad_src =
+                encode_frame(FRAME_FLAG_NONE, "rb08k-bad", b"truncated-old-tail").unwrap();
+            {
+                let mut f = fs::OpenOptions::new()
+                    .append(true)
+                    .open(&seg0_path)
+                    .unwrap();
+                f.write_all(&bad_src[..bad_src.len() / 2]).unwrap();
+                f.sync_data().unwrap();
+            }
+            let s1_valid = encode_frame(FRAME_FLAG_NONE, "rb08k-guard-s1", b"valid-s1").unwrap();
+            write_bytes_0600(&seg1_path, &s1_valid);
+
+            let snap_before_guard = snapshot_tree(&init.paths.root);
+            let err_guard = recover_lane(repo.path(), CaptureQueueLane::Normal)
+                .expect_err("RB-08k must reject damaged nested old tail in Phase 1 pending RB-08v");
+            assert!(matches!(
+                err_guard,
+                StorageBackendError::BackendInternal { .. }
+            ));
+            assert_eq!(snapshot_tree(&init.paths.root), snap_before_guard);
+
+            // (b) Full 256-entry `sealed[]` takes precedence over damaged nested old tail.
+            let full_repo = tempdir().unwrap();
+            let full_init = init_capture_queue(full_repo.path()).unwrap();
+            let active_seg_id: u32 = MAX_SEALED_SEGMENTS as u32;
+            let active_seg_path = full_init
+                .paths
+                .normal
+                .join(segment_log_file_name(active_seg_id));
+            let succ_seg_path = full_init
+                .paths
+                .normal
+                .join(segment_log_file_name(active_seg_id + 1));
+            let prefix_frame =
+                encode_frame(FRAME_FLAG_NONE, "rb08k-full-p", b"full-table-prefix").unwrap();
+            let mut active_bytes = prefix_frame.clone();
+            active_bytes.extend_from_slice(&bad_src[..bad_src.len() / 2]);
+            write_bytes_0600(&active_seg_path, &active_bytes);
+            write_bytes_0600(&succ_seg_path, &s1_valid);
+
+            let sealed: Vec<SealedSegmentMeta> = (0..active_seg_id)
+                .map(|seg_id| SealedSegmentMeta {
+                    seg_id,
+                    sealed_len: 32,
+                    sealed_crc32c: 0x1234_5678,
+                })
+                .collect();
+            let full_meta = LaneTailMeta {
+                min_live_seg: 0,
+                active_seg: active_seg_id,
+                committed_len: prefix_frame.len() as u64,
+                prefix_crc32c: crc32c_checksum(&prefix_frame),
+                sealed,
+            };
+            let encoded_full = full_meta.encode().unwrap();
+            write_bytes_0600(&tail_meta_path(&full_init.paths.normal), &encoded_full);
+            write_bytes_0600(&tail_meta_bak_path(&full_init.paths.normal), &encoded_full);
+
+            let snap_full = snapshot_tree(&full_init.paths.root);
+            let err_full = recover_lane(full_repo.path(), CaptureQueueLane::Normal)
+                .expect_err("full 256-entry table must take precedence over damaged nested tail");
+            assert!(matches!(
+                err_full,
+                StorageBackendError::CorruptCommittedFrame { .. }
+            ));
+            assert_eq!(err_full.stable_code_str(), "LBR-IO-001");
+            assert_eq!(snapshot_tree(&full_init.paths.root), snap_full);
+        }
     }
 }
