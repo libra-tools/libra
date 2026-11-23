@@ -501,6 +501,11 @@ fn verify_and_decode_body(
     body: &[u8],
     stored_frame_crc: u32,
 ) -> Result<DecodedFrame, FrameDecodeError> {
+    if body.len() < FRAME_BODY_FIXED_OVERHEAD {
+        return Err(FrameDecodeError::CorruptPayload {
+            detail: "frame body shorter than fixed overhead",
+        });
+    }
     let computed_frame_crc = crc32c_append(crc32c_checksum(&header[0..12]), body);
     if stored_frame_crc != computed_frame_crc {
         return Err(FrameDecodeError::CorruptPayload {
@@ -2319,5 +2324,221 @@ mod tests {
                 assert_eq!(dec_mid.offset(), valid_prefix_end);
             }
         }
+    }
+
+    /// `RB-07d` AC1–AC5:
+    /// Exercises full-frame validation *after* header verification succeeds across
+    /// every single byte of all 5 non-header / body / `FRAME_CRC32C` fields:
+    /// - AC1: Any single-byte flip in `FRAME_CRC32C` (`12..16`) rejected with
+    ///   `FrameDecodeError::CorruptPayload`.
+    /// - AC2: Any single-byte flip in `FLAGS` (`16`) rejected by `FRAME_CRC32C`
+    ///   with `FrameDecodeError::CorruptPayload`.
+    /// - AC3: Any single-byte flip in `DEDUP_KEY_LEN` (`17..19`) rejected by
+    ///   `FRAME_CRC32C` with `FrameDecodeError::CorruptPayload`.
+    /// - AC4: Any single-byte flip in `DEDUP_KEY_UTF8` (`19..19+K`) rejected by
+    ///   `FRAME_CRC32C` with `FrameDecodeError::CorruptPayload`.
+    /// - AC5: Any single-byte flip in `POSTCARD_ENVELOPE` (`19+K..total_len`)
+    ///   rejected by `FRAME_CRC32C` with `FrameDecodeError::CorruptPayload`.
+    ///
+    /// Verified through `parse_and_verify_header` (still succeeds), `decode_frame`,
+    /// and `FrameStreamDecoder` (both standalone and mid-stream with trailing frames
+    /// + sticky error poisoning + sanitized `LBR-IO-001` conversion).
+    #[test]
+    fn acknowledged_frame_each_body_and_crc_field_bitflip_rejected() {
+        let secret_dedup_key = "rb07d:secret-provider-session-id-xyz:中文去重键";
+        let env = SampleCaptureEnvelope {
+            session_id: "secret-session-rb07d".to_string(),
+            seq: 99,
+            event_kind: "SessionEnd".to_string(),
+            body: b"secret-payload-content-for-rb07d-verification".to_vec(),
+        };
+        let frame = encode_postcard_frame(FRAME_FLAG_PRIORITY, secret_dedup_key, 1, &env)
+            .expect("encode acknowledged frame");
+        let prefix_frame =
+            encode_frame(FRAME_FLAG_NONE, "rb07d:prefix", b"prefix-body").expect("encode prefix");
+        let suffix_frame =
+            encode_frame(FRAME_FLAG_NONE, "rb07d:suffix", b"suffix-body").expect("encode suffix");
+
+        let dedup_len = secret_dedup_key.len();
+        let flags_offset = FRAME_HEADER_LEN; // 16
+        let dedup_len_start = flags_offset + 1; // 17
+        let dedup_len_end = dedup_len_start + 2; // 19
+        let dedup_utf8_start = dedup_len_end; // 19
+        let dedup_utf8_end = dedup_utf8_start + dedup_len;
+        let payload_start = dedup_utf8_end;
+        let payload_end = frame.len();
+        assert!(
+            payload_end > payload_start,
+            "envelope payload must be non-empty"
+        );
+
+        let expected_err = FrameDecodeError::CorruptPayload {
+            detail: "frame crc32c mismatch",
+        };
+
+        let assert_single_byte_flip_rejected = |byte_idx: usize, mask: u8, field_label: &str| {
+            let mut mutated = frame.clone();
+            mutated[byte_idx] ^= mask;
+
+            // Header verification (`MAGIC` + `FRAME_BODY_LEN` + `HEADER_CRC32C`) MUST still pass,
+            // proving rejection happens specifically in the post-header full-frame CRC path.
+            let mut hdr = [0u8; FRAME_HEADER_LEN];
+            hdr.copy_from_slice(&mutated[..FRAME_HEADER_LEN]);
+            assert!(
+                parse_and_verify_header(&hdr).is_ok(),
+                "{field_label} byte {byte_idx}: header CRC must remain valid on non-header flip"
+            );
+
+            // Single-frame slice decoder rejects with `CorruptPayload`.
+            assert_eq!(
+                decode_frame(&mutated),
+                Err(expected_err.clone()),
+                "{field_label} byte {byte_idx} (mask {mask:#04x}): decode_frame must return CorruptPayload"
+            );
+
+            // Standalone sequential decoder (`from_seekable`) rejects with `CorruptPayload`
+            // and remains sticky-poisoned on retry (never `CleanEof`, never `CorruptHeader`).
+            let mut dec = FrameStreamDecoder::from_seekable(io::Cursor::new(mutated.as_slice()))
+                .expect("from_seekable");
+            assert_eq!(
+                dec.next_frame(),
+                Err(expected_err.clone()),
+                "{field_label} byte {byte_idx}: FrameStreamDecoder must return CorruptPayload"
+            );
+            assert_eq!(
+                dec.offset(),
+                0,
+                "{field_label} byte {byte_idx}: offset must not advance on CorruptPayload"
+            );
+            assert_eq!(dec.terminal_error(), Some(&expected_err));
+            assert_eq!(
+                dec.next_frame(),
+                Err(expected_err.clone()),
+                "{field_label} byte {byte_idx}: retry must remain CorruptPayload, never CleanEof"
+            );
+            assert_eq!(dec.offset(), 0);
+        };
+
+        // AC1: Every single byte of `FRAME_CRC32C` (`12..16`) flipped (multiple bitmasks).
+        for idx in 12..FRAME_HEADER_LEN {
+            for mask in [0x01u8, 0x80u8] {
+                assert_single_byte_flip_rejected(idx, mask, "AC1 FRAME_CRC32C");
+            }
+        }
+
+        // AC2: `FLAGS` (`16`) flipped (both flipping priority bit and setting unused bits).
+        for mask in [0x01u8, 0x02u8, 0x80u8, 0xffu8] {
+            assert_single_byte_flip_rejected(flags_offset, mask, "AC2 FLAGS");
+        }
+
+        // AC3: Every single byte of `DEDUP_KEY_LEN` (`17..19`) flipped (both low and high bytes).
+        for idx in dedup_len_start..dedup_len_end {
+            for mask in [0x01u8, 0x80u8] {
+                assert_single_byte_flip_rejected(idx, mask, "AC3 DEDUP_KEY_LEN");
+            }
+        }
+
+        // AC4: Every single byte of `DEDUP_KEY_UTF8` (`19..19+K`) flipped.
+        for idx in dedup_utf8_start..dedup_utf8_end {
+            assert_single_byte_flip_rejected(idx, 0x01, "AC4 DEDUP_KEY_UTF8");
+        }
+
+        // AC5: Every single byte of `POSTCARD_ENVELOPE` (`19+K..total_len`) flipped.
+        for idx in payload_start..payload_end {
+            assert_single_byte_flip_rejected(idx, 0x01, "AC5 POSTCARD_ENVELOPE");
+        }
+
+        // Mid-stream verification across all 5 fields with a valid prefix frame AND a valid
+        // trailing frame: prefix frame decodes cleanly, corrupted middle frame fails with
+        // `CorruptPayload`, stream offset freezes at `prefix_frame.len()`, and retry never
+        // skips ahead to the trailing frame or returns `CleanEof`.
+        let field_representatives = [
+            ("AC1 FRAME_CRC32C", 12usize),
+            ("AC2 FLAGS", flags_offset),
+            ("AC3 DEDUP_KEY_LEN", dedup_len_start),
+            ("AC4 DEDUP_KEY_UTF8", dedup_utf8_start + dedup_len / 2),
+            (
+                "AC5 POSTCARD_ENVELOPE",
+                payload_start + (payload_end - payload_start) / 2,
+            ),
+        ];
+        for (label, rel_idx) in field_representatives {
+            let mut mutated_mid = frame.clone();
+            mutated_mid[rel_idx] ^= 0x40;
+
+            let mut stream = prefix_frame.clone();
+            let prefix_end = stream.len() as u64;
+            stream.extend_from_slice(&mutated_mid);
+            stream.extend_from_slice(&suffix_frame);
+
+            let mut dec =
+                FrameStreamDecoder::new(io::Cursor::new(stream.as_slice()), stream.len() as u64);
+            assert!(matches!(
+                dec.next_frame(),
+                Ok(FrameStreamItem::Frame { offset: 0, total_len, ref frame })
+                    if total_len == prefix_frame.len() && frame.dedup_key == "rb07d:prefix"
+            ));
+            assert_eq!(dec.offset(), prefix_end);
+            assert_eq!(
+                dec.next_frame(),
+                Err(expected_err.clone()),
+                "{label}: mid-stream frame 2 bitflip must return CorruptPayload"
+            );
+            assert_eq!(
+                dec.offset(),
+                prefix_end,
+                "{label}: offset must stay at frame 1 end"
+            );
+            // Retry MUST stay poisoned as `CorruptPayload` rather than advancing into `suffix_frame`.
+            assert_eq!(
+                dec.next_frame(),
+                Err(expected_err.clone()),
+                "{label}: poisoned mid-stream decoder must not skip to trailing frame"
+            );
+            assert_eq!(dec.offset(), prefix_end);
+        }
+
+        // Large multi-chunk (>16 KiB) payload boundary flips (first, middle, final byte of payload)
+        // prove incremental chunked body reads feed the full body into `FRAME_CRC32C`.
+        {
+            let big_env = SampleCaptureEnvelope {
+                session_id: "sess-rb07d-large".to_string(),
+                seq: 100,
+                event_kind: "ToolOutput".to_string(),
+                body: vec![0x3cu8; 24 * 1024],
+            };
+            let big_frame = encode_postcard_frame(FRAME_FLAG_NONE, "rb07d:large-key", 1, &big_env)
+                .expect("encode large frame");
+            let big_payload_start =
+                FRAME_HEADER_LEN + FRAME_BODY_FIXED_OVERHEAD + "rb07d:large-key".len();
+            for flip_idx in [
+                big_payload_start,
+                (big_payload_start + big_frame.len()) / 2,
+                big_frame.len() - 1,
+            ] {
+                let mut mutated = big_frame.clone();
+                mutated[flip_idx] ^= 0x01;
+                let mut dec =
+                    FrameStreamDecoder::from_seekable(io::Cursor::new(mutated.as_slice()))
+                        .expect("from_seekable large");
+                assert_eq!(dec.next_frame(), Err(expected_err.clone()));
+                assert_eq!(dec.next_frame(), Err(expected_err.clone()));
+            }
+        }
+
+        // Sanitized `into_storage_error()` check: stable code `LBR-IO-001`, zero key/payload leakage.
+        let mut flipped_for_err = frame.clone();
+        flipped_for_err[payload_start] ^= 0x01;
+        let storage_err = decode_frame(&flipped_for_err)
+            .expect_err("payload flip must fail")
+            .into_storage_error();
+        assert_eq!(storage_err.stable_code_str(), "LBR-IO-001");
+        let msg = storage_err.to_string();
+        assert!(
+            !msg.contains("secret-provider-session-id-xyz")
+                && !msg.contains("secret-session-rb07d")
+                && !msg.contains("secret-payload-content"),
+            "CorruptPayload storage error must not leak raw dedup_key or payload: {msg}"
+        );
     }
 }
