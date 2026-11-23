@@ -42,7 +42,9 @@ use crate::storage::{
 };
 
 pub mod frame;
+pub mod highwater;
 pub mod segment;
+pub mod writer;
 
 pub use frame::{
     DecodedFrame, FRAME_BODY_FIXED_OVERHEAD, FRAME_FLAG_NONE, FRAME_FLAG_PRIORITY,
@@ -51,6 +53,12 @@ pub use frame::{
     MIN_FRAME_BODY_LEN, ParsedFrameHeader, crc32c_append, crc32c_checksum, decode_frame,
     decode_postcard_payload, encode_frame, encode_postcard_frame, parse_and_verify_header,
     validate_frame_body_len,
+};
+pub use highwater::{
+    HIGHWATER_MIRROR_LEN, HIGHWATER_MIRROR_MAGIC, HIGHWATER_MIRROR_VERSION,
+    QUEUE_HIGHWATER_MIRROR_FILE, QueueHighwaterSnapshot, compute_next_highwater,
+    highwater_mirror_path, load_authoritative_highwater, read_highwater_mirror,
+    sync_highwater_mirror_from_store, write_highwater_mirror,
 };
 pub use segment::{
     CAPTURE_QUEUE_MAX_TOTAL_BYTES, CAPTURE_QUEUE_SEGMENT_ROTATION_BYTES, CaptureQueueOccupancy,
@@ -64,6 +72,13 @@ pub use segment::{
     measure_capture_queue_occupancy_at_root, parse_segment_log_file_name,
     publish_quarantine_durable, quarantine_and_truncate_segment, quarantine_and_unlink_orphan,
     quarantine_artifact_id, read_converged_lane_tail_meta, recover_lane, recover_lane_at_root,
+};
+pub use writer::{
+    CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION, CaptureDrainReport, CaptureQueueWriter,
+    DEFAULT_WRITER_MAX_BATCH_SIZE, DEFAULT_WRITER_MAX_BATCH_WINDOW, QUEUE_WRITER_LOCK_FILE,
+    QueueWriterOptions, WriterLockGuard, drain_capture_queue, drain_capture_queue_at_root,
+    is_writer_active, is_writer_active_at_root, try_acquire_writer_lock,
+    try_acquire_writer_lock_at_root, writer_lock_path,
 };
 
 /// Subdirectory under `.libra/private/` housing the dual-lane CRC32C capture queue.
