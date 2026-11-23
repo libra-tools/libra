@@ -343,11 +343,6 @@ impl LaneTailMeta {
                 detail: "buffer shorter than 34-byte minimum LTM2 record",
             });
         }
-        if bytes.len() > LTM2_MAX_LEN {
-            return Err(Ltm2CodecError::InvalidLength {
-                detail: "buffer exceeds 4130-byte maximum LTM2 record",
-            });
-        }
         if bytes[0..4] != LTM2_MAGIC {
             return Err(Ltm2CodecError::MagicMismatch);
         }
@@ -369,6 +364,11 @@ impl LaneTailMeta {
         if sealed_count > MAX_SEALED_SEGMENTS {
             return Err(Ltm2CodecError::InvalidInvariant {
                 detail: "sealed segment count exceeds MAX_SEALED_SEGMENTS (256)",
+            });
+        }
+        if bytes.len() > LTM2_MAX_LEN {
+            return Err(Ltm2CodecError::InvalidLength {
+                detail: "buffer exceeds 4130-byte maximum LTM2 record",
             });
         }
         let expected_len = LTM2_MIN_LEN + sealed_count * LTM2_SEALED_ENTRY_LEN;

@@ -1678,11 +1678,30 @@ enum CaseDPhase1Kind {
     OrphanSuccessor { non_empty: bool },
 }
 
+/// Early Phase 1 read-only guard for `RB-08r`: whenever a Case D successor
+/// segment `S + 1` decodes `>= 1` valid frame while `LTM2.sealed[]` is already
+/// at `MAX_SEALED_SEGMENTS` (`256`), immediately fail closed with
+/// `CorruptCommittedFrame` (`LBR-IO-001`) before scanning any nested old tail
+/// or performing any Phase 2 mutation.
+fn ensure_case_d_sealed_capacity(
+    meta: &LaneTailMeta,
+    succ_scan: &SuccessorSegmentScan,
+) -> StorageResult<()> {
+    if succ_scan.frame_count > 0 && meta.sealed.len() >= MAX_SEALED_SEGMENTS {
+        return Err(StorageBackendError::CorruptCommittedFrame {
+            detail:
+                "Case D: valid successor segment exists while LTM2 sealed table is already at MAX_SEALED_SEGMENTS (256)"
+                    .to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// Apply Phase 1 read-only classification rules for Case D (`RB-08d` clean
 /// valid successor, `RB-08u` valid successor with trailing uncommitted
 /// half-frame, `RB-08f` empty or half-frame-only orphan successor, `RB-08k`
-/// nested Case C→D clean synced old-segment tail, and `RB-08v` nested Case
-/// C→D damaged old-segment tail).
+/// nested Case C→D clean synced old-segment tail, `RB-08v` nested Case C→D
+/// damaged old-segment tail, and `RB-08r` full 256-entry table fail-closed guard).
 ///
 /// Validates `MAX_SEALED_SEGMENTS` illegal full-table state strictly first
 /// (before any mutation) and forbids sealing a 0-byte old segment.
@@ -1692,13 +1711,7 @@ fn classify_case_d_readonly(
     succ_actual_len: u64,
     succ_scan: &SuccessorSegmentScan,
 ) -> StorageResult<CaseDPhase1Kind> {
-    if succ_scan.frame_count > 0 && meta.sealed.len() >= MAX_SEALED_SEGMENTS {
-        return Err(StorageBackendError::CorruptCommittedFrame {
-            detail:
-                "Case D: valid successor segment exists while LTM2 sealed table is already at MAX_SEALED_SEGMENTS (256)"
-                    .to_string(),
-        });
-    }
+    ensure_case_d_sealed_capacity(meta, succ_scan)?;
     if succ_scan.frame_count == 0 {
         return Ok(CaseDPhase1Kind::OrphanSuccessor {
             non_empty: succ_actual_len > 0,
@@ -3022,6 +3035,7 @@ mod unix_seg {
             let (mut succ_file, succ_actual_len) =
                 open_segment_readonly_nofollow(lane_fd, succ_seg, expected_uid)?;
             let succ_scan = scan_successor_segment_readonly(&mut succ_file, succ_actual_len)?;
+            ensure_case_d_sealed_capacity(&meta, &succ_scan)?;
             let old_tail = if actual_len > meta.committed_len {
                 let tail = scan_case_c_uncommitted_tail(
                     &mut ro_seg,
@@ -6488,6 +6502,7 @@ mod non_unix_seg {
                     "open Case D successor capture queue segment",
                 )?;
                 let succ_scan = scan_successor_segment_readonly(&mut succ_file, succ_actual_len)?;
+                ensure_case_d_sealed_capacity(&meta, &succ_scan)?;
                 let old_tail = if actual_len > meta.committed_len {
                     let tail = scan_case_c_uncommitted_tail(
                         &mut seg_file,
@@ -16522,5 +16537,428 @@ mod tests {
         assert_eq!(seg257_decoded.len(), 1);
         assert_eq!(seg257_decoded[0].dedup_key, "rb08j-rotate-257");
         assert_eq!(seg257_decoded[0].payload, rot_payload);
+    }
+
+    /// `RB-08r` AC1–AC6: Case D full 256-entry `LTM2.sealed[]` valid successor
+    /// fail-closed rejection (including nested damaged old-segment tail +
+    /// planted `.tmp` whole-disk zero mutation) and `LTM2` decoder structural
+    /// upper-bound guards (`SEALED_COUNT > 256` and
+    /// `SEALED_COUNT != ACTIVE_SEG - MIN_LIVE_SEG`).
+    #[test]
+    fn sealed_cap_256_case_d_and_ltm2_decoder_bounds_rejected() {
+        use crate::storage::queue::{LTM2_MAGIC, LTM2_VERSION, Ltm2CodecError};
+
+        fn build_raw_ltm2_with_valid_crc(
+            min_live_seg: u32,
+            active_seg: u32,
+            committed_len: u64,
+            prefix_crc32c: u32,
+            declared_sealed_count: u32,
+            entries: &[SealedSegmentMeta],
+        ) -> Vec<u8> {
+            let mut buf = Vec::with_capacity(
+                crate::storage::queue::LTM2_MIN_LEN
+                    + entries.len() * crate::storage::queue::LTM2_SEALED_ENTRY_LEN,
+            );
+            buf.extend_from_slice(&LTM2_MAGIC);
+            buf.extend_from_slice(&LTM2_VERSION.to_le_bytes());
+            buf.extend_from_slice(&min_live_seg.to_le_bytes());
+            buf.extend_from_slice(&active_seg.to_le_bytes());
+            buf.extend_from_slice(&committed_len.to_le_bytes());
+            buf.extend_from_slice(&prefix_crc32c.to_le_bytes());
+            buf.extend_from_slice(&declared_sealed_count.to_le_bytes());
+            for entry in entries {
+                buf.extend_from_slice(&entry.seg_id.to_le_bytes());
+                buf.extend_from_slice(&entry.sealed_len.to_le_bytes());
+                buf.extend_from_slice(&entry.sealed_crc32c.to_le_bytes());
+            }
+            let crc = crc32c_checksum(&buf);
+            buf.extend_from_slice(&crc.to_le_bytes());
+            buf
+        }
+
+        // =====================================================================
+        // Part 1 — AC3 & AC4: `LTM2` decoder structural bounds (with valid CRC)
+        // =====================================================================
+        {
+            // AC3a: Genuine 257-entry wire buffer (4146B) with valid META_CRC32C.
+            let entries_257: Vec<SealedSegmentMeta> = (0..257u32)
+                .map(|seg_id| SealedSegmentMeta {
+                    seg_id,
+                    sealed_len: 128,
+                    sealed_crc32c: seg_id.wrapping_mul(31).wrapping_add(7),
+                })
+                .collect();
+            let raw_257_full =
+                build_raw_ltm2_with_valid_crc(0, 257, 64, 0x1122_3344, 257, &entries_257);
+            assert_eq!(raw_257_full.len(), 34 + 16 * 257);
+            let err_257_full = LaneTailMeta::decode(&raw_257_full)
+                .expect_err("AC3: 257-entry LTM2 buffer must be rejected");
+            assert!(
+                matches!(err_257_full, Ltm2CodecError::InvalidInvariant { .. }),
+                "AC3: expected InvalidInvariant for 257-entry LTM2, got {err_257_full:?}"
+            );
+            assert_eq!(
+                err_257_full.into_storage_error().stable_code_str(),
+                "LBR-IO-001"
+            );
+
+            // AC3b: Compact 34-byte header declaring SEALED_COUNT = 257 with valid CRC.
+            let raw_257_hdr = build_raw_ltm2_with_valid_crc(0, 257, 0, 0, 257, &[]);
+            let err_257_hdr = LaneTailMeta::decode(&raw_257_hdr)
+                .expect_err("AC3: header SEALED_COUNT=257 must be rejected");
+            assert!(matches!(
+                err_257_hdr,
+                Ltm2CodecError::InvalidInvariant { .. }
+            ));
+
+            // AC3c: SEALED_COUNT = u32::MAX with valid CRC.
+            let raw_max_u32 = build_raw_ltm2_with_valid_crc(0, 0, 0, 0, u32::MAX, &[]);
+            let err_max_u32 = LaneTailMeta::decode(&raw_max_u32)
+                .expect_err("AC3: SEALED_COUNT=u32::MAX must be rejected");
+            assert!(matches!(
+                err_max_u32,
+                Ltm2CodecError::InvalidInvariant { .. }
+            ));
+
+            // AC4a: SEALED_COUNT < ACTIVE_SEG - MIN_LIVE_SEG (2 entries vs 3 expected).
+            let entries_2 = vec![
+                SealedSegmentMeta {
+                    seg_id: 0,
+                    sealed_len: 100,
+                    sealed_crc32c: 1,
+                },
+                SealedSegmentMeta {
+                    seg_id: 1,
+                    sealed_len: 200,
+                    sealed_crc32c: 2,
+                },
+            ];
+            let raw_too_few = build_raw_ltm2_with_valid_crc(0, 3, 50, 0xabcd, 2, &entries_2);
+            let err_too_few = LaneTailMeta::decode(&raw_too_few)
+                .expect_err("AC4: SEALED_COUNT < ACTIVE_SEG - MIN_LIVE_SEG must be rejected");
+            assert!(matches!(
+                err_too_few,
+                Ltm2CodecError::InvalidInvariant { .. }
+            ));
+            assert_eq!(
+                err_too_few.into_storage_error().stable_code_str(),
+                "LBR-IO-001"
+            );
+
+            // AC4b: SEALED_COUNT > ACTIVE_SEG - MIN_LIVE_SEG (2 entries vs 1 expected).
+            let raw_too_many = build_raw_ltm2_with_valid_crc(0, 1, 50, 0xabcd, 2, &entries_2);
+            let err_too_many = LaneTailMeta::decode(&raw_too_many)
+                .expect_err("AC4: SEALED_COUNT > ACTIVE_SEG - MIN_LIVE_SEG must be rejected");
+            assert!(matches!(
+                err_too_many,
+                Ltm2CodecError::InvalidInvariant { .. }
+            ));
+
+            // AC4c: MIN_LIVE_SEG > ACTIVE_SEG with SEALED_COUNT = 0.
+            let raw_inverted = build_raw_ltm2_with_valid_crc(5, 4, 0, 0, 0, &[]);
+            let err_inverted = LaneTailMeta::decode(&raw_inverted)
+                .expect_err("AC4: MIN_LIVE_SEG > ACTIVE_SEG must be rejected");
+            assert!(matches!(
+                err_inverted,
+                Ltm2CodecError::InvalidInvariant { .. }
+            ));
+
+            // AC4d: ACTIVE_SEG - MIN_LIVE_SEG = 257 while SEALED_COUNT = 256.
+            let raw_span_257 =
+                build_raw_ltm2_with_valid_crc(0, 257, 64, 0x1122_3344, 256, &entries_257[..256]);
+            let err_span_257 = LaneTailMeta::decode(&raw_span_257)
+                .expect_err("AC4: active-min_live=257 with sealed_count=256 must be rejected");
+            assert!(matches!(
+                err_span_257,
+                Ltm2CodecError::InvalidInvariant { .. }
+            ));
+
+            // AC4e: Non-contiguous seg_id inside sealed[] even when count matches span.
+            let non_contig = vec![
+                SealedSegmentMeta {
+                    seg_id: 0,
+                    sealed_len: 100,
+                    sealed_crc32c: 1,
+                },
+                SealedSegmentMeta {
+                    seg_id: 2,
+                    sealed_len: 200,
+                    sealed_crc32c: 2,
+                },
+            ];
+            let raw_non_contig = build_raw_ltm2_with_valid_crc(0, 2, 0, 0, 2, &non_contig);
+            assert!(matches!(
+                LaneTailMeta::decode(&raw_non_contig),
+                Err(Ltm2CodecError::InvalidInvariant { .. })
+            ));
+
+            // Disk-level proof that corrupt 257-entry & count-mismatch replicas
+            // cause lane recovery/append to fail closed (`LBR-IO-001`) with zero mutation.
+            for (label, corrupt_meta_bytes) in [
+                ("disk-257-entries", &raw_257_full),
+                ("disk-count-mismatch", &raw_too_few),
+            ] {
+                let repo = tempdir().expect("tempdir");
+                let init = init_capture_queue(repo.path()).expect("init capture queue");
+                let frame = encode_frame(FRAME_FLAG_NONE, "rb08r-disk-meta", b"seed").unwrap();
+                write_bytes_0600(&init.paths.normal.join(segment_log_file_name(0)), &frame);
+                write_bytes_0600(&tail_meta_path(&init.paths.normal), corrupt_meta_bytes);
+                write_bytes_0600(&tail_meta_bak_path(&init.paths.normal), corrupt_meta_bytes);
+                let lane_before = snapshot_tree(&init.paths.normal);
+                let q_before = snapshot_tree(&init.paths.quarantine);
+
+                let err = recover_lane(repo.path(), CaptureQueueLane::Normal)
+                    .expect_err("disk-level invalid LTM2 must fail closed");
+                assert!(
+                    matches!(err, StorageBackendError::CorruptCommittedFrame { .. }),
+                    "{label}: expected CorruptCommittedFrame, got {err:?}"
+                );
+                assert_eq!(err.stable_code_str(), "LBR-IO-001");
+                assert_eq!(snapshot_tree(&init.paths.normal), lane_before);
+                assert_eq!(snapshot_tree(&init.paths.quarantine), q_before);
+            }
+        }
+
+        // Helper: populate a 256-sealed lane (`seg 0..256` sealed + clean `seg 256` active).
+        let build_full_256_lane = || {
+            let repo = tempdir().expect("tempdir");
+            let init = init_capture_queue(repo.path()).expect("init capture queue");
+            let normal_dir = init.paths.normal.clone();
+
+            let small_frame =
+                encode_frame(FRAME_FLAG_NONE, "rb08r-sealed-seg", &[0x55u8; 512]).unwrap();
+            let small_len = small_frame.len() as u64;
+            let small_crc = crc32c_checksum(&small_frame);
+            let mut sealed = Vec::with_capacity(MAX_SEALED_SEGMENTS);
+            for seg_id in 0..MAX_SEALED_SEGMENTS as u32 {
+                write_bytes_0600(
+                    &normal_dir.join(segment_log_file_name(seg_id)),
+                    &small_frame,
+                );
+                sealed.push(SealedSegmentMeta {
+                    seg_id,
+                    sealed_len: small_len,
+                    sealed_crc32c: small_crc,
+                });
+            }
+
+            let active_seg = MAX_SEALED_SEGMENTS as u32; // 256
+            let active_frame =
+                encode_frame(FRAME_FLAG_NONE, "rb08r-active-256", b"active-256-committed").unwrap();
+            write_bytes_0600(
+                &normal_dir.join(segment_log_file_name(active_seg)),
+                &active_frame,
+            );
+            let full_meta = LaneTailMeta {
+                min_live_seg: 0,
+                active_seg,
+                committed_len: active_frame.len() as u64,
+                prefix_crc32c: crc32c_checksum(&active_frame),
+                sealed,
+            };
+            let encoded_meta = full_meta.encode().expect("encode 256-entry LTM2");
+            write_bytes_0600(&tail_meta_path(&normal_dir), &encoded_meta);
+            write_bytes_0600(&tail_meta_bak_path(&normal_dir), &encoded_meta);
+            (repo, init, full_meta, encoded_meta)
+        };
+
+        // =====================================================================
+        // Part 2 — AC1 & AC2: Clean full 256-entry table + valid successor S+1
+        // =====================================================================
+        {
+            let (repo, init, _full_meta, encoded_meta) = build_full_256_lane();
+            let normal_dir = &init.paths.normal;
+            let succ_frame = encode_frame(
+                FRAME_FLAG_NONE,
+                "rb08r-illegal-s257",
+                b"valid-successor-frame",
+            )
+            .unwrap();
+            write_bytes_0600(&normal_dir.join(segment_log_file_name(257)), &succ_frame);
+
+            let lane_before = snapshot_tree(normal_dir);
+            let q_before = snapshot_tree(&init.paths.quarantine);
+
+            // Both `recover_lane` and producer `append_frame` reject with LBR-IO-001.
+            let rec_err = recover_lane(repo.path(), CaptureQueueLane::Normal)
+                .expect_err("AC1: Case D full 256 table + valid S+1 must fail closed");
+            assert!(
+                matches!(rec_err, StorageBackendError::CorruptCommittedFrame { .. }),
+                "AC1 violated: expected CorruptCommittedFrame, got {rec_err:?}"
+            );
+            assert_eq!(rec_err.stable_code_str(), "LBR-IO-001");
+
+            let app_err = append_frame(
+                repo.path(),
+                CaptureQueueLane::Normal,
+                FRAME_FLAG_NONE,
+                "rb08r-new-incoming",
+                b"must-not-write",
+            )
+            .expect_err("AC1 (append_frame): Case D full 256 table + valid S+1 must fail closed");
+            assert!(matches!(
+                app_err,
+                StorageBackendError::CorruptCommittedFrame { .. }
+            ));
+            assert_eq!(app_err.stable_code_str(), "LBR-IO-001");
+
+            // AC2: Disk `LTM2.sealed.len()` remains strictly 256 (zero 257th entry).
+            let raw_meta = fs::read(tail_meta_path(normal_dir)).unwrap();
+            let raw_bak = fs::read(tail_meta_bak_path(normal_dir)).unwrap();
+            assert_eq!(raw_meta, encoded_meta);
+            assert_eq!(raw_bak, encoded_meta);
+            assert_eq!(LaneTailMeta::decode(&raw_meta).unwrap().sealed.len(), 256);
+            assert_eq!(LaneTailMeta::decode(&raw_bak).unwrap().sealed.len(), 256);
+            assert_eq!(snapshot_tree(normal_dir), lane_before);
+            assert_eq!(snapshot_tree(&init.paths.quarantine), q_before);
+        }
+
+        // =====================================================================
+        // Part 3 — AC5 & AC6: Full 256 table + nested damaged old-segment tail
+        // (`actual_len(S) > committed_len`) + valid successor `S + 1` + planted
+        // `tail.meta.tmp`, `tail.meta.bak.tmp`, `quarantine/<lane>-*.tmp`
+        // (and lagging backup replica!) -> Phase 1 read-only `LBR-IO-001` &
+        // exact whole-directory zero mutation.
+        // =====================================================================
+        for (case_label, include_synced_tail, succ_has_half_tail, lag_backup_replica) in [
+            ("nested-synced-plus-bad-tail-clean-s257", true, false, false),
+            (
+                "nested-bad-at-committed-plus-bad-s257-and-lag-bak",
+                false,
+                true,
+                true,
+            ),
+        ] {
+            let (repo, init, full_meta, _encoded_meta) = build_full_256_lane();
+            let normal_dir = &init.paths.normal;
+            let seg256_path = normal_dir.join(segment_log_file_name(256));
+            let seg257_path = normal_dir.join(segment_log_file_name(257));
+
+            // Append uncommitted tail to old active segment `seg 256`.
+            let extra_valid =
+                encode_frame(FRAME_FLAG_NONE, "rb08r-nested-synced", b"synced-tail-frame").unwrap();
+            let half_src = encode_frame(
+                FRAME_FLAG_NONE,
+                "rb08r-nested-half",
+                b"truncated-old-tail-bytes",
+            )
+            .unwrap();
+            let half_bytes = &half_src[..half_src.len() / 2];
+            {
+                let mut f = fs::OpenOptions::new()
+                    .append(true)
+                    .open(&seg256_path)
+                    .unwrap();
+                if include_synced_tail {
+                    f.write_all(&extra_valid).unwrap();
+                }
+                f.write_all(half_bytes).unwrap();
+                f.sync_data().unwrap();
+            }
+            assert!(fs::metadata(&seg256_path).unwrap().len() > full_meta.committed_len);
+
+            // Create valid successor `events-00000257.log` (optionally with trailing half-frame).
+            let mut succ_bytes =
+                encode_frame(FRAME_FLAG_NONE, "rb08r-nested-s257", b"valid-s257-payload").unwrap();
+            if succ_has_half_tail {
+                let succ_half =
+                    encode_frame(FRAME_FLAG_NONE, "rb08r-s257-half", b"s257-trailing-half")
+                        .unwrap();
+                succ_bytes.extend_from_slice(&succ_half[..succ_half.len() / 2]);
+            }
+            write_bytes_0600(&seg257_path, &succ_bytes);
+
+            // Optionally diverge `tail.meta.bak` to prove Phase 1 rejects before
+            // ANY Subcase B1 / mirror repair runs!
+            if lag_backup_replica {
+                let lagging_bak = LaneTailMeta {
+                    min_live_seg: 0,
+                    active_seg: 256,
+                    committed_len: 0,
+                    prefix_crc32c: 0,
+                    sealed: full_meta.sealed.clone(),
+                };
+                write_bytes_0600(
+                    &tail_meta_bak_path(normal_dir),
+                    &lagging_bak.encode().unwrap(),
+                );
+            }
+
+            // Plant lane `.tmp` files and shared `quarantine/` `.tmp` files.
+            write_bytes_0600(
+                &normal_dir.join(QUEUE_TAIL_META_TMP_FILE),
+                b"planted-meta-tmp",
+            );
+            write_bytes_0600(
+                &normal_dir.join(QUEUE_TAIL_META_BAK_TMP_FILE),
+                b"planted-meta-bak-tmp",
+            );
+            write_bytes_0600(
+                &init
+                    .paths
+                    .quarantine
+                    .join("normal-seg256-off0-deadbeef.tmp"),
+                b"planted-normal-quarantine-tmp",
+            );
+            write_bytes_0600(
+                &init
+                    .paths
+                    .quarantine
+                    .join("priority-seg0-off0-cafebabe.tmp"),
+                b"planted-priority-quarantine-tmp",
+            );
+
+            let full_lane_snapshot_before = snapshot_tree(normal_dir);
+            let full_quarantine_snapshot_before = snapshot_tree(&init.paths.quarantine);
+
+            // AC5: Phase 1 read-only scan immediately returns `CorruptCommittedFrame` (`LBR-IO-001`).
+            let rec_err = recover_lane(repo.path(), CaptureQueueLane::Normal)
+                .expect_err("AC5: full 256 + nested damaged old tail + valid S+1 must fail closed");
+            assert!(
+                matches!(rec_err, StorageBackendError::CorruptCommittedFrame { .. }),
+                "{case_label}: expected CorruptCommittedFrame from recover_lane, got {rec_err:?}"
+            );
+            assert_eq!(rec_err.stable_code_str(), "LBR-IO-001");
+
+            // AC6: Exact full-disk snapshot equality across both `normal/` and `quarantine/`.
+            assert_eq!(
+                snapshot_tree(normal_dir),
+                full_lane_snapshot_before,
+                "{case_label}: AC6 violated after recover_lane — normal/ mutated"
+            );
+            assert_eq!(
+                snapshot_tree(&init.paths.quarantine),
+                full_quarantine_snapshot_before,
+                "{case_label}: AC6 violated after recover_lane — quarantine/ mutated"
+            );
+
+            // Same check on producer `append_frame` entry point.
+            let app_err = append_frame(
+                repo.path(),
+                CaptureQueueLane::Normal,
+                FRAME_FLAG_NONE,
+                "rb08r-nested-incoming",
+                b"incoming-rejected",
+            )
+            .expect_err(
+                "AC5 (append_frame): full 256 + nested damaged old tail + valid S+1 must fail",
+            );
+            assert!(
+                matches!(app_err, StorageBackendError::CorruptCommittedFrame { .. }),
+                "{case_label}: expected CorruptCommittedFrame from append_frame, got {app_err:?}"
+            );
+            assert_eq!(app_err.stable_code_str(), "LBR-IO-001");
+            assert_eq!(
+                snapshot_tree(normal_dir),
+                full_lane_snapshot_before,
+                "{case_label}: AC6 violated after append_frame — normal/ mutated"
+            );
+            assert_eq!(
+                snapshot_tree(&init.paths.quarantine),
+                full_quarantine_snapshot_before,
+                "{case_label}: AC6 violated after append_frame — quarantine/ mutated"
+            );
+        }
     }
 }
