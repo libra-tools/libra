@@ -1602,6 +1602,11 @@ fn build_case_d_sealed_successor_meta(
 /// reset `COMMITTED_LEN = 0` and `PREFIX_CRC32C = 0` for the newly created
 /// empty segment `S + 1`.
 fn build_case_c_step_c2_meta(step_c1_meta: &LaneTailMeta) -> StorageResult<LaneTailMeta> {
+    if step_c1_meta.committed_len == 0 {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "Case C Step C2 must not seal a 0-byte active segment".to_string(),
+        });
+    }
     let next_seg = step_c1_meta.active_seg.checked_add(1).ok_or_else(|| {
         StorageBackendError::BackendInternal {
             detail: "capture queue segment id overflow during Case C Step C2".to_string(),
@@ -3352,7 +3357,10 @@ mod unix_seg {
                     has_damaged_tail,
                     observer,
                 )?;
-                let final_meta = if has_damaged_tail {
+                // `RB-08q`: Skip Step C2 when `recovered_valid_end == 0` (fresh
+                // segment first-frame crash) so we keep `ACTIVE_SEG == S` and
+                // never write a 0-byte sealed entry into `LTM2.sealed[]`.
+                let final_meta = if has_damaged_tail && step_c1.meta.committed_len > 0 {
                     observer.maybe_crash(SegmentCrashPoint::AfterCaseCStepC1MetaBeforeStepC2)?;
                     seal_recovered_segment_to_next_unix(ctx, &step_c1.meta, observer)?
                 } else {
@@ -6267,7 +6275,11 @@ mod non_unix_seg {
                         has_damaged_tail,
                         observer,
                     )?;
-                    let (final_meta, replacement_active_seg) = if has_damaged_tail {
+                    // `RB-08q`: Skip Step C2 when `recovered_valid_end == 0`
+                    // (fresh segment first-frame crash) to avoid sealing 0-byte segments.
+                    let (final_meta, replacement_active_seg) = if has_damaged_tail
+                        && step_c1.meta.committed_len > 0
+                    {
                         observer
                             .maybe_crash(SegmentCrashPoint::AfterCaseCStepC1MetaBeforeStepC2)?;
                         let (c2_meta, pinned_next) =
@@ -13862,5 +13874,241 @@ mod tests {
                 assert_eq!(follow_up.frame_offset, post.meta.committed_len);
             }
         }
+    }
+
+    /// `RB-08q` AC1–AC4: Fresh-segment first-frame 0-byte crash
+    /// (`recovered_valid_end == 0`) guard before Step C2:
+    /// - AC1: Step C1 durably quarantines `[0, actual_len)` into `quarantine/`
+    ///   with diagnostic code `LBR-AGENT-050`.
+    /// - AC2: Step C1 truncates `events-<S>.log` to exact `0` bytes.
+    /// - AC3: Recovery skips Step C2 (`seal_recovered_segment_to_next`), keeping
+    ///   `LTM2.ACTIVE_SEG == S` (no `events-<S+1>.log` created).
+    /// - AC4: `LTM2.sealed.len()` strictly retains its original count (never
+    ///   inserting a 0-byte sealed entry), verified on both `S = 0` (`sealed == []`),
+    ///   `S = 1` (`sealed.len() == 1`), and direct public `append_frame` producer path.
+    #[test]
+    fn case_c_zero_byte_first_frame_crash_truncates_without_sealing() {
+        let repo = tempdir().expect("tempdir");
+        let init = init_capture_queue(repo.path()).expect("init capture queue");
+
+        // ------------------------------------------------------------------
+        // Scenario 1: Fresh empty lane (`S = 0`, `sealed.len() == 0`) with a
+        // truncated half-written first frame -> `recover_lane`.
+        // ------------------------------------------------------------------
+        let half_s0_src = encode_frame(
+            FRAME_FLAG_NONE,
+            "rb08q-s0-first-half",
+            b"half-written-first-frame-on-fresh-seg0",
+        )
+        .unwrap();
+        let half_s0_tail = half_s0_src[..half_s0_src.len() / 2].to_vec();
+        let seg0_path = init.paths.normal.join(segment_log_file_name(0));
+        let seg1_path = init.paths.normal.join(segment_log_file_name(1));
+        write_bytes_0600(&seg0_path, &half_s0_tail);
+
+        let q0_id = quarantine_artifact_id(CaptureQueueLane::Normal, 0, 0, &half_s0_tail);
+        let q0_bin = init.paths.quarantine.join(format!("{q0_id}.bin"));
+
+        let mut obs_s0 = SegmentObserver::new();
+        let rec_s0 =
+            recover_lane_in_storage_dir(repo.path(), CaptureQueueLane::Normal, &mut obs_s0)
+                .expect("RB-08q Scenario 1: recover_lane on 0-byte first-frame crash must succeed");
+
+        // AC1: `[0, actual_len)` durably quarantined to `quarantine/` with `LBR-AGENT-050`.
+        assert_eq!(rec_s0.quarantined_artifacts.len(), 1);
+        assert_eq!(rec_s0.quarantined_artifacts[0].id, q0_id);
+        assert_eq!(
+            rec_s0.quarantined_artifacts[0].diagnostic_code,
+            QUARANTINE_DIAGNOSTIC_CODE
+        );
+        assert_eq!(
+            rec_s0.quarantined_artifacts[0].quarantined_bytes,
+            half_s0_tail.len() as u64
+        );
+        assert_eq!(
+            fs::read(&q0_bin).expect("AC1: read quarantined first-frame bytes"),
+            half_s0_tail
+        );
+        assert!(!init.paths.quarantine.join(format!("{q0_id}.tmp")).exists());
+
+        // Strict ordering: `fsync_dir(quarantine_dir) < truncate(0) < seg.sync_data() < dual LTM2`
+        // and ZERO `CreateSegment` event.
+        let pos_q0_fsync = obs_s0
+            .events
+            .iter()
+            .position(
+                |e| matches!(e, SegmentOpEvent::QuarantineFsyncDirComplete { id } if id == &q0_id),
+            )
+            .expect("quarantine fsync_dir complete");
+        let pos_trunc0 = obs_s0
+            .events
+            .iter()
+            .position(|e| {
+                *e == SegmentOpEvent::SegmentTruncateStart {
+                    lane: QUEUE_LANE_NORMAL_DIR,
+                    seg_id: 0,
+                    to_len: 0,
+                }
+            })
+            .expect("truncate seg 0 to 0");
+        let pos_sync0 = obs_s0
+            .events
+            .iter()
+            .position(|e| {
+                *e == SegmentOpEvent::SegmentSyncData {
+                    lane: QUEUE_LANE_NORMAL_DIR,
+                    seg_id: 0,
+                }
+            })
+            .expect("sync seg 0 after truncate");
+        let pos_bak0 = obs_s0
+            .events
+            .iter()
+            .position(|e| {
+                *e == SegmentOpEvent::FsyncLaneDirAfterMeta {
+                    lane: QUEUE_LANE_NORMAL_DIR,
+                    target_name: QUEUE_TAIL_META_BAK_FILE,
+                }
+            })
+            .expect("Step C1 dual LTM2 commit");
+        assert!(pos_q0_fsync < pos_trunc0 && pos_trunc0 < pos_sync0 && pos_sync0 < pos_bak0);
+        assert!(
+            !obs_s0
+                .events
+                .iter()
+                .any(|e| matches!(e, SegmentOpEvent::CreateSegment { .. })),
+            "AC3 violated: recovered_valid_end == 0 must skip Step C2 and never create S+1"
+        );
+
+        // AC2: `events-00000000.log` truncated to exact 0 bytes.
+        assert_eq!(
+            fs::metadata(&seg0_path).unwrap().len(),
+            0,
+            "AC2 violated: seg 0 must be truncated to exact 0 bytes"
+        );
+        // AC3 + AC4: Dual `LTM2` keeps `ACTIVE_SEG == 0`, `COMMITTED_LEN == 0`,
+        // `PREFIX_CRC32C == 0`, `sealed.len() == 0`, and no `events-00000001.log`.
+        assert!(!seg1_path.exists());
+        let raw_meta = fs::read(tail_meta_path(&init.paths.normal)).unwrap();
+        let raw_bak = fs::read(tail_meta_bak_path(&init.paths.normal)).unwrap();
+        assert_eq!(raw_meta, raw_bak);
+        let meta_s0 = LaneTailMeta::decode(&raw_meta).unwrap();
+        assert_eq!(meta_s0, rec_s0.meta);
+        assert_eq!(
+            meta_s0.active_seg, 0,
+            "AC3 violated: ACTIVE_SEG must stay 0"
+        );
+        assert_eq!(meta_s0.committed_len, 0);
+        assert_eq!(meta_s0.prefix_crc32c, 0);
+        assert_eq!(
+            meta_s0.sealed.len(),
+            0,
+            "AC4 violated: sealed.len() must remain 0"
+        );
+
+        // Follow-up append writes cleanly onto seg 0 at offset 0.
+        let s0_payload = b"valid-frame-on-seg0-after-zero-byte-recovery".to_vec();
+        let out_s0 = append_frame(
+            repo.path(),
+            CaptureQueueLane::Normal,
+            FRAME_FLAG_NONE,
+            "rb08q-s0-ok",
+            &s0_payload,
+        )
+        .expect("append on seg 0 after 0-byte recovery must succeed");
+        assert_eq!(out_s0.seg_id, 0);
+        assert_eq!(out_s0.frame_offset, 0);
+
+        // ------------------------------------------------------------------
+        // Scenario 2: Non-zero active segment `S = 1` with existing
+        // `sealed.len() == 1` (after a prior non-empty Step C2 rotation left
+        // `events-00000001.log` empty), first frame on `S = 1` crashes
+        // half-written -> `recover_lane` preserves `ACTIVE_SEG == 1` and
+        // `sealed.len() == 1` (zero new sealed entry!).
+        // ------------------------------------------------------------------
+        {
+            let mut f = fs::OpenOptions::new()
+                .append(true)
+                .open(&seg0_path)
+                .unwrap();
+            f.write_all(b"LCE1\x20\x00\x00\x00trigger-nonempty-c2")
+                .unwrap();
+            f.sync_data().unwrap();
+        }
+        let rot = recover_lane(repo.path(), CaptureQueueLane::Normal)
+            .expect("rotate non-empty seg 0 via Step C2 to produce empty seg 1");
+        assert_eq!(rot.meta.active_seg, 1);
+        assert_eq!(rot.meta.committed_len, 0);
+        assert_eq!(rot.meta.sealed.len(), 1);
+        let original_sealed = rot.meta.sealed.clone();
+        assert_eq!(fs::metadata(&seg1_path).unwrap().len(), 0);
+
+        let half_s1_src = encode_frame(
+            FRAME_FLAG_NONE,
+            "rb08q-s1-first-half",
+            b"half-written-first-frame-on-seg1",
+        )
+        .unwrap();
+        let half_s1_tail = half_s1_src[..half_s1_src.len() - 7].to_vec();
+        write_bytes_0600(&seg1_path, &half_s1_tail);
+        let q1_id = quarantine_artifact_id(CaptureQueueLane::Normal, 1, 0, &half_s1_tail);
+        let seg2_path = init.paths.normal.join(segment_log_file_name(2));
+
+        let rec_s1 = recover_lane(repo.path(), CaptureQueueLane::Normal)
+            .expect("RB-08q Scenario 2: recover_lane on seg 1 0-byte crash must succeed");
+        assert_eq!(rec_s1.quarantined_artifacts.len(), 1);
+        assert_eq!(rec_s1.quarantined_artifacts[0].id, q1_id);
+        assert_eq!(
+            fs::read(init.paths.quarantine.join(format!("{q1_id}.bin"))).unwrap(),
+            half_s1_tail
+        );
+        assert_eq!(fs::metadata(&seg1_path).unwrap().len(), 0);
+        assert!(
+            !seg2_path.exists(),
+            "AC3 violated on S=1: must not create seg 2"
+        );
+        assert_eq!(rec_s1.meta.active_seg, 1);
+        assert_eq!(rec_s1.meta.committed_len, 0);
+        assert_eq!(rec_s1.meta.prefix_crc32c, 0);
+        assert_eq!(
+            rec_s1.meta.sealed, original_sealed,
+            "AC4 violated on S=1: sealed[] must stay strictly unchanged at len 1"
+        );
+
+        // ------------------------------------------------------------------
+        // Scenario 3: Direct public `append_frame` producer path when empty
+        // `S = 1` (`sealed.len() == 1`) has a corrupt first half-frame:
+        // Step C1 quarantines & truncates `S = 1` to 0, skips Step C2, and
+        // appends the incoming frame cleanly onto `S = 1` at offset 0.
+        // ------------------------------------------------------------------
+        let corrupt_s1_first = b"BAD!\xff\xff\xff\xffcorrupt-first-frame-s1".to_vec();
+        write_bytes_0600(&seg1_path, &corrupt_s1_first);
+        let q2_id = quarantine_artifact_id(CaptureQueueLane::Normal, 1, 0, &corrupt_s1_first);
+
+        let app_payload = b"public-append-after-zero-byte-guard-on-s1".to_vec();
+        let app_out = append_frame(
+            repo.path(),
+            CaptureQueueLane::Normal,
+            FRAME_FLAG_NONE,
+            "rb08q-s1-app",
+            &app_payload,
+        )
+        .expect("RB-08q Scenario 3: public append_frame after 0-byte guard must succeed");
+        assert_eq!(
+            fs::read(init.paths.quarantine.join(format!("{q2_id}.bin"))).unwrap(),
+            corrupt_s1_first
+        );
+        assert!(!seg2_path.exists());
+        assert_eq!(app_out.seg_id, 1);
+        assert_eq!(app_out.frame_offset, 0);
+        assert_eq!(app_out.meta.active_seg, 1);
+        assert_eq!(app_out.meta.sealed, original_sealed);
+        assert_eq!(app_out.meta.committed_len, app_out.frame_len as u64);
+        let s1_decoded = decode_all_segment_bytes(&fs::read(&seg1_path).unwrap());
+        assert_eq!(s1_decoded.len(), 1);
+        assert_eq!(s1_decoded[0].dedup_key, "rb08q-s1-app");
+        assert_eq!(s1_decoded[0].payload, app_payload);
+        // Defense-in-depth: `build_case_c_step_c2_meta` itself rejects a 0-byte segment.
+        assert!(build_case_c_step_c2_meta(&rec_s1.meta).is_err());
     }
 }
