@@ -35,8 +35,6 @@ use std::{
 
 use thiserror::Error;
 
-#[cfg(not(unix))]
-use crate::storage::manifest::fsync_dir;
 use crate::storage::{
     capture_store::CaptureQueueLane,
     error::{StorageBackendError, StorageResult},
@@ -75,6 +73,22 @@ pub const QUEUE_TAIL_META_BAK_FILE: &str = "tail.meta.bak";
 /// Shared cross-lane append/capacity lock filename under `.libra/private/capture-queue/`.
 pub const QUEUE_APPEND_LOCK_FILE: &str = "append.lock";
 
+/// Subdirectory under `.libra/private/` housing the legacy SQLite capture spool
+/// (tombstoned on fresh Redb repositories by `init_redb_capture_spool_tombstones`, `RB-07e`).
+pub const CAPTURE_SPOOL_SUBDIR: &str = "capture-spool";
+
+/// Capacity lock filename inside `.libra/private/capture-spool/` (`RB-07e`).
+pub const CAPTURE_SPOOL_CAPACITY_LOCK_FILE: &str = "capacity.lock";
+
+/// Legacy spool subdirectory names replaced by `0400` regular-file tombstones
+/// on fresh Redb repositories (`ADR-RB-02` #1, `RB-07e`).
+pub const CAPTURE_SPOOL_TOMBSTONE_NAMES: [&str; 3] = ["tmp", "ready", "quarantine"];
+
+/// Fixed non-empty sentinel written into `capture-spool/{tmp,ready,quarantine}`
+/// `0400` regular-file tombstones so legacy `spool.rs:330` `ensure_spool` fails
+/// closed (`!is_dir()`) from day one (`ADR-RB-02` #1, `RB-07e`).
+pub const CAPTURE_SPOOL_TOMBSTONE_SENTINEL: &[u8] = b"LIBRA_CAPTURE_SPOOL_FENCED_REDB\n";
+
 /// Exact Unix permission bits required for capture queue directories (`0700`, `RB-07b`).
 #[cfg(unix)]
 pub const QUEUE_DIR_MODE: u32 = 0o700;
@@ -82,6 +96,11 @@ pub const QUEUE_DIR_MODE: u32 = 0o700;
 /// Exact Unix permission bits required for capture queue metadata and segment files (`0600`, `RB-07b`).
 #[cfg(unix)]
 pub const QUEUE_FILE_MODE: u32 = 0o600;
+
+/// Exact Unix permission bits required for fresh-Redb `capture-spool` regular-file
+/// tombstones (`0400`, `ADR-RB-02` #1, `RB-07e`).
+#[cfg(unix)]
+pub const CAPTURE_SPOOL_TOMBSTONE_MODE: u32 = 0o400;
 
 /// Stable sanitized error prefix surfaced when `O_NOFOLLOW` rejects a symlink
 /// in the capture queue directory tree or metadata files (`RB-07b`).
@@ -522,10 +541,14 @@ enum QueueInitEvent {
 }
 
 #[cfg(test)]
+type AfterPublishSlotHook = Box<dyn FnMut(&'static str, &'static str)>;
+
+#[cfg(test)]
 struct QueueInitObserver {
     events: Vec<QueueInitEvent>,
     fail_fsync_on_call: Option<usize>,
     fsync_calls: usize,
+    after_publish_slot: Option<AfterPublishSlotHook>,
 }
 
 #[cfg(test)]
@@ -535,6 +558,7 @@ impl QueueInitObserver {
             events: Vec::new(),
             fail_fsync_on_call: None,
             fsync_calls: 0,
+            after_publish_slot: None,
         }
     }
 
@@ -543,12 +567,25 @@ impl QueueInitObserver {
             events: Vec::new(),
             fail_fsync_on_call: Some(call_index),
             fsync_calls: 0,
+            after_publish_slot: None,
+        }
+    }
+
+    fn with_after_publish_hook(hook: impl FnMut(&'static str, &'static str) + 'static) -> Self {
+        Self {
+            events: Vec::new(),
+            fail_fsync_on_call: None,
+            fsync_calls: 0,
+            after_publish_slot: Some(Box::new(hook)),
         }
     }
 
     fn record_publish(&mut self, lane: &'static str, file_name: &'static str) {
         self.events
             .push(QueueInitEvent::PublishInitialMeta { lane, file_name });
+        if let Some(hook) = self.after_publish_slot.as_mut() {
+            hook(lane, file_name);
+        }
     }
 
     fn before_fsync_lane(&mut self, lane: &'static str) -> StorageResult<()> {
@@ -611,6 +648,101 @@ impl UnixExpectedQueueOwners {
             normal_uid: uid,
             quarantine_uid: uid,
         }
+    }
+}
+
+/// Resolved paths created/verified by [`init_redb_capture_spool_tombstones`]
+/// (`ADR-RB-02` #1, `RB-07e`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaptureSpoolTombstonePaths {
+    pub root: PathBuf,
+    pub capacity_lock: PathBuf,
+    pub tmp: PathBuf,
+    pub ready: PathBuf,
+    pub quarantine: PathBuf,
+}
+
+impl CaptureSpoolTombstonePaths {
+    /// Resolve `.libra/private/capture-spool/{capacity.lock,tmp,ready,quarantine}`
+    /// from a repository storage directory (`.libra/`).
+    #[must_use]
+    pub fn from_storage_dir(storage_dir: &Path) -> Self {
+        let root = storage_dir.join(PRIVATE_SUBDIR).join(CAPTURE_SPOOL_SUBDIR);
+        Self {
+            capacity_lock: root.join(CAPTURE_SPOOL_CAPACITY_LOCK_FILE),
+            tmp: root.join("tmp"),
+            ready: root.join("ready"),
+            quarantine: root.join("quarantine"),
+            root,
+        }
+    }
+}
+
+/// Outcome of initializing fresh-Redb `capture-spool` `0400` tombstones (`RB-07e`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpoolTombstoneOutcome {
+    /// One or more `0400` regular-file tombstones were newly installed and
+    /// `fsync_dir` completed durably.
+    InstalledFresh,
+    /// All three `0400` tombstones were already installed and verified intact.
+    AlreadyFenced,
+}
+
+/// Result returned by [`init_redb_capture_spool_tombstones`] (`RB-07e`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaptureSpoolTombstoneReport {
+    pub paths: CaptureSpoolTombstonePaths,
+    pub outcome: SpoolTombstoneOutcome,
+}
+
+/// Expected effective Unix UIDs checked during [`init_redb_capture_spool_tombstones`]
+/// (`RB-07e`). Production always uses `libc::geteuid()`.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UnixExpectedSpoolOwners {
+    private_uid: u32,
+    spool_uid: u32,
+    lock_uid: u32,
+    tombstone_uid: u32,
+}
+
+#[cfg(unix)]
+impl UnixExpectedSpoolOwners {
+    fn current_effective() -> Self {
+        // SAFETY: `geteuid(2)` has no preconditions and never fails.
+        let uid = unsafe { libc::geteuid() };
+        Self {
+            private_uid: uid,
+            spool_uid: uid,
+            lock_uid: uid,
+            tombstone_uid: uid,
+        }
+    }
+}
+
+/// Initialize `.libra/private/capture-spool/` (`0700`), `capacity.lock` (`0600`),
+/// and `{tmp,ready,quarantine}` `0400` regular-file tombstones + `fsync_dir` on
+/// a fresh Redb repository (`ADR-RB-02` #1, `RB-07e`).
+///
+/// Legacy SQLite hooks calling `spool.rs:330` `ensure_spool` immediately fail
+/// closed because `{tmp,ready,quarantine}` are `0400` regular files rather than
+/// directories. Refuses to overwrite any existing live legacy spool directory,
+/// symlink, foreign-owned entry, or unexpected regular file.
+pub fn init_redb_capture_spool_tombstones(
+    storage_dir: &Path,
+) -> StorageResult<CaptureSpoolTombstoneReport> {
+    let mut observer = QueueInitObserver::new();
+    #[cfg(unix)]
+    {
+        init_redb_capture_spool_tombstones_unix(
+            storage_dir,
+            UnixExpectedSpoolOwners::current_effective(),
+            &mut observer,
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        init_redb_capture_spool_tombstones_non_unix(storage_dir, &mut observer)
     }
 }
 
@@ -1592,10 +1724,794 @@ mod unix_impl {
             observer,
         )
     }
+
+    /// Acquire an exclusive `0600` `O_NOFOLLOW` lock file inside `dir_fd`
+    /// using the macOS-safe two-step `openat(O_NOFOLLOW)` /
+    /// `openat(O_CREAT|O_EXCL|O_NOFOLLOW)` protocol + `flock(LOCK_EX)`.
+    fn acquire_named_lock_at(
+        dir_fd: &OwnedFd,
+        file_name: &str,
+        expected_uid: u32,
+        subject: &'static str,
+    ) -> StorageResult<AppendLockGuard> {
+        let cname = osstr_to_cstring(OsStr::new(file_name), "open capture lock file")?;
+        let open_existing_flags = libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        let create_excl_flags =
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        let (lock_fd, created_now) = {
+            let mut acquired = None;
+            for _ in 0..32 {
+                // SAFETY: `dir_fd` is valid and `cname` is NUL-terminated.
+                let raw_existing = unsafe {
+                    libc::openat(dir_fd.as_raw_fd(), cname.as_ptr(), open_existing_flags)
+                };
+                if raw_existing >= 0 {
+                    // SAFETY: `raw_existing >= 0` is exclusively owned here.
+                    acquired = Some((unsafe { OwnedFd::from_raw_fd(raw_existing) }, false));
+                    break;
+                }
+                let err = io::Error::last_os_error();
+                if is_symlink_errno_at(&err, dir_fd, &cname) {
+                    return Err(map_queue_symlink_err(subject));
+                }
+                if err.kind() != io::ErrorKind::NotFound {
+                    return Err(StorageBackendError::io("open capture lock file", err));
+                }
+
+                // SAFETY: `dir_fd` is valid and `cname` is NUL-terminated.
+                let raw_created = unsafe {
+                    libc::openat(
+                        dir_fd.as_raw_fd(),
+                        cname.as_ptr(),
+                        create_excl_flags,
+                        QUEUE_FILE_MODE as libc::c_uint,
+                    )
+                };
+                if raw_created >= 0 {
+                    // SAFETY: `raw_created >= 0` is exclusively owned here.
+                    acquired = Some((unsafe { OwnedFd::from_raw_fd(raw_created) }, true));
+                    break;
+                }
+                let err2 = io::Error::last_os_error();
+                if is_symlink_errno_at(&err2, dir_fd, &cname) {
+                    return Err(map_queue_symlink_err(subject));
+                }
+                if err2.kind() == io::ErrorKind::AlreadyExists
+                    || err2.kind() == io::ErrorKind::NotFound
+                {
+                    continue;
+                }
+                return Err(StorageBackendError::io("create capture lock file", err2));
+            }
+            acquired.ok_or_else(|| StorageBackendError::BackendInternal {
+                detail: format!("{subject} open/create contended past retry bound"),
+            })?
+        };
+
+        let st = fstat_fd(&lock_fd, "stat capture lock file")?;
+        if (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!("{subject} is not a regular file"),
+            });
+        }
+        if st.st_uid != expected_uid {
+            return Err(map_queue_owner_mismatch_err(subject));
+        }
+        if unix_perm_bits(st.st_mode) != QUEUE_FILE_MODE {
+            fchmod_fd(
+                &lock_fd,
+                QUEUE_FILE_MODE,
+                "enforce 0600 mode on capture lock file",
+            )?;
+            let verified = fstat_fd(&lock_fd, "verify capture lock file mode")?;
+            if unix_perm_bits(verified.st_mode) != QUEUE_FILE_MODE {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: format!("{subject} permissions failed to settle at 0600"),
+                });
+            }
+        }
+
+        loop {
+            // SAFETY: `lock_fd` is a valid open regular file descriptor.
+            let rc = unsafe { libc::flock(lock_fd.as_raw_fd(), libc::LOCK_EX) };
+            if rc == 0 {
+                break;
+            }
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(StorageBackendError::io("lock capture lock file", err));
+        }
+
+        if created_now {
+            fsync_fd(dir_fd, "fsync capture directory after creating lock file")?;
+        }
+
+        Ok(AppendLockGuard { _fd: lock_fd })
+    }
+
+    enum SpoolTombstoneSlotState {
+        Absent,
+        ValidExactMode,
+        ValidNeedsTighten(OwnedFd),
+    }
+
+    fn read_bounded_fd(fd: &OwnedFd, max_bytes: usize) -> StorageResult<Vec<u8>> {
+        let mut out = Vec::with_capacity(max_bytes);
+        let mut buf = [0u8; 64];
+        while out.len() < max_bytes {
+            let want = (max_bytes - out.len()).min(buf.len());
+            // SAFETY: `fd` is valid and `buf[..want]` is writable.
+            let rc = unsafe {
+                libc::read(
+                    fd.as_raw_fd(),
+                    buf.as_mut_ptr().cast::<libc::c_void>(),
+                    want,
+                )
+            };
+            if rc < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(StorageBackendError::io(
+                    "read capture spool tombstone file",
+                    err,
+                ));
+            }
+            if rc == 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..rc as usize]);
+        }
+        Ok(out)
+    }
+
+    fn inspect_spool_tombstone_slot_at(
+        spool_fd: &OwnedFd,
+        slot_name: &'static str,
+        expected_uid: u32,
+    ) -> StorageResult<SpoolTombstoneSlotState> {
+        let cname = osstr_to_cstring(OsStr::new(slot_name), "inspect capture spool tombstone")?;
+        // Pre-probe via `fstatat(AT_SYMLINK_NOFOLLOW)` to accurately distinguish
+        // absent / symlink / directory / foreign-owned even on mode `0000` files,
+        // then pin the file via `openat(O_RDONLY | O_NOFOLLOW)` and re-verify
+        // `fstat(fd)` before reading or mutating permissions (zero TOCTOU).
+        let mut pre_st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+        // SAFETY: `spool_fd` is valid and `cname` is NUL-terminated.
+        let rc = unsafe {
+            libc::fstatat(
+                spool_fd.as_raw_fd(),
+                cname.as_ptr(),
+                pre_st.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if rc != 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::NotFound {
+                return Ok(SpoolTombstoneSlotState::Absent);
+            }
+            return Err(StorageBackendError::io(
+                "inspect capture spool tombstone",
+                err,
+            ));
+        }
+        // SAFETY: `fstatat` succeeded.
+        let pre_st = unsafe { pre_st.assume_init() };
+        match pre_st.st_mode & libc::S_IFMT {
+            libc::S_IFLNK => return Err(map_queue_symlink_err("capture spool tombstone")),
+            libc::S_IFDIR => {
+                return Err(StorageBackendError::BackendInternal {
+                    detail:
+                        "live capture-spool subdirectory already exists; refusing to overwrite with tombstone"
+                            .to_string(),
+                });
+            }
+            libc::S_IFREG => {}
+            _ => {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: "capture spool tombstone path is not a regular file".to_string(),
+                });
+            }
+        }
+        if pre_st.st_uid != expected_uid {
+            return Err(map_queue_owner_mismatch_err("capture spool tombstone"));
+        }
+
+        let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
+        // SAFETY: `spool_fd` is valid and `cname` is NUL-terminated.
+        let raw_fd = unsafe { libc::openat(spool_fd.as_raw_fd(), cname.as_ptr(), flags) };
+        if raw_fd < 0 {
+            let err = io::Error::last_os_error();
+            if is_symlink_errno_at(&err, spool_fd, &cname) {
+                return Err(map_queue_symlink_err("capture spool tombstone"));
+            }
+            return Err(StorageBackendError::io(
+                "open existing capture spool tombstone",
+                err,
+            ));
+        }
+        // SAFETY: `raw_fd >= 0` is exclusively owned here.
+        let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+        let st = fstat_fd(&fd, "stat existing capture spool tombstone")?;
+        if (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
+            return Err(StorageBackendError::BackendInternal {
+                detail: "capture spool tombstone path is not a regular file".to_string(),
+            });
+        }
+        if st.st_uid != expected_uid {
+            return Err(map_queue_owner_mismatch_err("capture spool tombstone"));
+        }
+        let content = read_bounded_fd(&fd, CAPTURE_SPOOL_TOMBSTONE_SENTINEL.len() + 1)?;
+        if content.as_slice() != CAPTURE_SPOOL_TOMBSTONE_SENTINEL {
+            return Err(StorageBackendError::BackendInternal {
+                detail: "unexpected non-tombstone regular file at capture-spool path".to_string(),
+            });
+        }
+        if unix_perm_bits(st.st_mode) == CAPTURE_SPOOL_TOMBSTONE_MODE {
+            Ok(SpoolTombstoneSlotState::ValidExactMode)
+        } else {
+            Ok(SpoolTombstoneSlotState::ValidNeedsTighten(fd))
+        }
+    }
+
+    /// Inode-pinned identity of a freshly published `0400` tombstone so
+    /// mid-init failure rollback only ever unlinks the exact inode created by
+    /// this call.
+    struct PublishedTombstone {
+        cname: CString,
+        dev: libc::dev_t,
+        ino: libc::ino_t,
+    }
+
+    fn unlink_if_same_inode(
+        dir_fd: &OwnedFd,
+        cname: &CString,
+        expected_dev: libc::dev_t,
+        expected_ino: libc::ino_t,
+    ) {
+        let mut st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+        // SAFETY: `dir_fd` is valid and `cname` is NUL-terminated.
+        let rc = unsafe {
+            libc::fstatat(
+                dir_fd.as_raw_fd(),
+                cname.as_ptr(),
+                st.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if rc == 0 {
+            // SAFETY: `fstatat` succeeded.
+            let st = unsafe { st.assume_init() };
+            if st.st_dev == expected_dev && st.st_ino == expected_ino {
+                // SAFETY: `dir_fd` is valid and `cname` is NUL-terminated.
+                unsafe {
+                    libc::unlinkat(dir_fd.as_raw_fd(), cname.as_ptr(), 0);
+                }
+            }
+        }
+    }
+
+    fn rollback_published_tombstones(spool_fd: &OwnedFd, published: &[PublishedTombstone]) {
+        for item in published.iter().rev() {
+            unlink_if_same_inode(spool_fd, &item.cname, item.dev, item.ino);
+        }
+        if !published.is_empty() {
+            let _ = fsync_fd(spool_fd, "fsync capture spool directory after rollback");
+        }
+    }
+
+    /// Best-effort cleanup guard for a private staging directory
+    /// `.capture-spool.<pid>.<seq>.tmp` created under `private_fd` on fresh
+    /// Redb initialization.
+    struct StagingSpoolDirGuard<'a> {
+        private_fd: &'a OwnedFd,
+        dir_cname: CString,
+        staging_fd: Option<OwnedFd>,
+        active: bool,
+    }
+
+    impl<'a> StagingSpoolDirGuard<'a> {
+        fn new(private_fd: &'a OwnedFd, dir_cname: CString, staging_fd: OwnedFd) -> Self {
+            Self {
+                private_fd,
+                dir_cname,
+                staging_fd: Some(staging_fd),
+                active: true,
+            }
+        }
+
+        fn staging_fd(&self) -> Option<&OwnedFd> {
+            self.staging_fd.as_ref()
+        }
+
+        fn disarm(&mut self) -> Option<OwnedFd> {
+            self.active = false;
+            self.staging_fd.take()
+        }
+    }
+
+    impl Drop for StagingSpoolDirGuard<'_> {
+        fn drop(&mut self) {
+            if !self.active {
+                return;
+            }
+            if let Some(sfd) = self.staging_fd.take() {
+                // Unlink every regular staging entry inside our private dir via
+                // pinned `sfd` before `unlinkat(AT_REMOVEDIR)`.
+                for entry_name in [
+                    CAPTURE_SPOOL_CAPACITY_LOCK_FILE,
+                    "tmp",
+                    "ready",
+                    "quarantine",
+                ] {
+                    if let Ok(c) = CString::new(entry_name) {
+                        // SAFETY: `sfd` is valid and `c` is NUL-terminated.
+                        unsafe {
+                            libc::unlinkat(sfd.as_raw_fd(), c.as_ptr(), 0);
+                        }
+                    }
+                }
+                drop(sfd);
+            }
+            // SAFETY: `private_fd` is valid and `dir_cname` is NUL-terminated.
+            unsafe {
+                libc::unlinkat(
+                    self.private_fd.as_raw_fd(),
+                    self.dir_cname.as_ptr(),
+                    libc::AT_REMOVEDIR,
+                );
+            }
+        }
+    }
+
+    /// Descriptor-pinned `0400` tombstone publication (`RB-07e` AC3):
+    /// Keeps `tmp_fd` OPEN across `linkat` (preventing inode recycling) and
+    /// re-opens the published target with `O_NOFOLLOW` to verify its
+    /// `(st_dev, st_ino)`, `S_IFREG`, `0400` mode, and `st_uid == expected_uid`
+    /// match our pinned `tmp_fd` exactly before unlinking the staging name.
+    fn publish_spool_tombstone_at(
+        spool_fd: &OwnedFd,
+        slot_name: &'static str,
+        expected_uid: u32,
+        observer: &mut QueueInitObserver,
+    ) -> StorageResult<PublishedTombstone> {
+        let tmp_name = next_meta_temp_name(&format!(".{slot_name}.tombstone"));
+        let ctmp = osstr_to_cstring(OsStr::new(&tmp_name), "create capture spool tombstone temp")?;
+        let ctarget = osstr_to_cstring(OsStr::new(slot_name), "publish capture spool tombstone")?;
+
+        let flags =
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        // SAFETY: `spool_fd` is valid and `ctmp` is NUL-terminated.
+        let raw_fd = unsafe {
+            libc::openat(
+                spool_fd.as_raw_fd(),
+                ctmp.as_ptr(),
+                flags,
+                QUEUE_FILE_MODE as libc::c_uint,
+            )
+        };
+        if raw_fd < 0 {
+            let err = io::Error::last_os_error();
+            if is_symlink_errno_at(&err, spool_fd, &ctmp) {
+                return Err(map_queue_symlink_err("capture spool tombstone temp"));
+            }
+            return Err(StorageBackendError::io(
+                "create capture spool tombstone temp",
+                err,
+            ));
+        }
+        // SAFETY: `raw_fd >= 0` is exclusively owned here and stays OPEN across
+        // `linkat` + post-publish `(st_dev, st_ino)` verification.
+        let tmp_fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+        let mut unlink_guard = TempUnlinkGuard::new(spool_fd, ctmp.clone());
+
+        write_all_fd(
+            &tmp_fd,
+            CAPTURE_SPOOL_TOMBSTONE_SENTINEL,
+            "write capture spool tombstone sentinel",
+        )?;
+        fchmod_fd(
+            &tmp_fd,
+            CAPTURE_SPOOL_TOMBSTONE_MODE,
+            "enforce 0400 mode on capture spool tombstone",
+        )?;
+        let st = fstat_fd(&tmp_fd, "verify capture spool tombstone mode")?;
+        if (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
+            return Err(StorageBackendError::BackendInternal {
+                detail: "capture spool tombstone temp is not a regular file".to_string(),
+            });
+        }
+        if st.st_uid != expected_uid {
+            return Err(map_queue_owner_mismatch_err("capture spool tombstone"));
+        }
+        if unix_perm_bits(st.st_mode) != CAPTURE_SPOOL_TOMBSTONE_MODE {
+            return Err(StorageBackendError::BackendInternal {
+                detail: "capture spool tombstone permissions failed to settle at 0400".to_string(),
+            });
+        }
+        let expected_dev = st.st_dev;
+        let expected_ino = st.st_ino;
+        fsync_fd(&tmp_fd, "sync capture spool tombstone")?;
+
+        // Atomic no-clobber link into `spool_fd` while `tmp_fd` remains open so
+        // `(expected_dev, expected_ino)` cannot be recycled by the kernel.
+        // SAFETY: `spool_fd` is valid and both `ctmp` and `ctarget` are NUL-terminated.
+        let link_rc = unsafe {
+            libc::linkat(
+                spool_fd.as_raw_fd(),
+                ctmp.as_ptr(),
+                spool_fd.as_raw_fd(),
+                ctarget.as_ptr(),
+                0,
+            )
+        };
+        if link_rc != 0 {
+            return Err(StorageBackendError::io(
+                "link capture spool tombstone into capture-spool directory",
+                io::Error::last_os_error(),
+            ));
+        }
+
+        // Verify the published target via `O_NOFOLLOW` matches the exact pinned
+        // `(st_dev, st_ino)` of our still-open `tmp_fd` (defeats staging-name
+        // swap TOCTOU before `linkat`).
+        let verify_flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
+        // SAFETY: `spool_fd` is valid and `ctarget` is NUL-terminated.
+        let pub_raw = unsafe { libc::openat(spool_fd.as_raw_fd(), ctarget.as_ptr(), verify_flags) };
+        if pub_raw < 0 {
+            let err = io::Error::last_os_error();
+            unlink_if_same_inode(spool_fd, &ctarget, expected_dev, expected_ino);
+            return Err(StorageBackendError::io(
+                "verify published capture spool tombstone",
+                err,
+            ));
+        }
+        // SAFETY: `pub_raw >= 0` is exclusively owned here.
+        let pub_fd = unsafe { OwnedFd::from_raw_fd(pub_raw) };
+        let pub_st = fstat_fd(&pub_fd, "stat published capture spool tombstone")?;
+        if pub_st.st_dev != expected_dev
+            || pub_st.st_ino != expected_ino
+            || (pub_st.st_mode & libc::S_IFMT) != libc::S_IFREG
+            || pub_st.st_uid != expected_uid
+            || unix_perm_bits(pub_st.st_mode) != CAPTURE_SPOOL_TOMBSTONE_MODE
+        {
+            return Err(StorageBackendError::BackendInternal {
+                detail: "capture spool tombstone inode identity mismatch after publish".to_string(),
+            });
+        }
+        drop(pub_fd);
+
+        // Unlink ONLY our exact staging inode and disarm guard while `tmp_fd` is still open.
+        unlink_if_same_inode(spool_fd, &ctmp, expected_dev, expected_ino);
+        unlink_guard.disarm();
+        drop(tmp_fd);
+
+        observer.record_publish(CAPTURE_SPOOL_SUBDIR, slot_name);
+        Ok(PublishedTombstone {
+            cname: ctarget,
+            dev: expected_dev,
+            ino: expected_ino,
+        })
+    }
+
+    /// Stage a complete fresh `capture-spool/` directory (`0700`, `capacity.lock`
+    /// `0600`, `{tmp,ready,quarantine}` `0400` tombstones, all synced) inside a
+    /// hidden sibling `.capture-spool.<pid>.<seq>.tmp` and atomically publish it
+    /// via `renameat` so a racing legacy `spool.rs:330` `ensure_spool` can never
+    /// observe a half-initialized `capture-spool/` directory.
+    ///
+    /// Returns `Ok(Some(staging_fd))` if atomic publication succeeded, or
+    /// `Ok(None)` if `capture-spool` already became non-empty concurrently
+    /// (caller falls through to the locked existing-directory path).
+    fn try_stage_fresh_spool_dir_atomic(
+        private_fd: &OwnedFd,
+        owners: UnixExpectedSpoolOwners,
+        observer: &mut QueueInitObserver,
+    ) -> StorageResult<Option<OwnedFd>> {
+        let staging_name = next_meta_temp_name(".capture-spool");
+        let cstaging = osstr_to_cstring(
+            OsStr::new(&staging_name),
+            "create capture spool staging directory",
+        )?;
+        let cfinal = osstr_to_cstring(
+            OsStr::new(CAPTURE_SPOOL_SUBDIR),
+            "publish capture spool directory",
+        )?;
+
+        // SAFETY: `private_fd` is valid and `cstaging` is NUL-terminated.
+        let mkdir_rc = unsafe {
+            libc::mkdirat(
+                private_fd.as_raw_fd(),
+                cstaging.as_ptr(),
+                QUEUE_DIR_MODE as libc::mode_t,
+            )
+        };
+        if mkdir_rc != 0 {
+            return Err(StorageBackendError::io(
+                "create capture spool staging directory",
+                io::Error::last_os_error(),
+            ));
+        }
+
+        let (staging_fd, st) = match openat_dir_nofollow(
+            private_fd,
+            OsStr::new(&staging_name),
+            owners.spool_uid,
+            "capture spool staging directory",
+        ) {
+            Ok(pair) => pair,
+            #[cfg(target_os = "linux")]
+            Err(StorageBackendError::Io {
+                kind: io::ErrorKind::PermissionDenied,
+                ..
+            }) => {
+                fix_newly_created_unreadable_dir_linux(
+                    private_fd,
+                    OsStr::new(&staging_name),
+                    owners.spool_uid,
+                    "capture spool staging directory",
+                )?;
+                openat_dir_nofollow(
+                    private_fd,
+                    OsStr::new(&staging_name),
+                    owners.spool_uid,
+                    "capture spool staging directory",
+                )?
+            }
+            Err(err) => {
+                // SAFETY: best-effort remove empty staging dir on early failure.
+                unsafe {
+                    libc::unlinkat(
+                        private_fd.as_raw_fd(),
+                        cstaging.as_ptr(),
+                        libc::AT_REMOVEDIR,
+                    );
+                }
+                return Err(err);
+            }
+        };
+
+        let mut staging_guard = StagingSpoolDirGuard::new(private_fd, cstaging.clone(), staging_fd);
+        let Some(sfd) = staging_guard.staging_fd() else {
+            return Err(StorageBackendError::BackendInternal {
+                detail: "capture spool staging descriptor missing".to_string(),
+            });
+        };
+
+        if unix_perm_bits(st.st_mode) != QUEUE_DIR_MODE {
+            fchmod_fd(
+                sfd,
+                QUEUE_DIR_MODE,
+                "enforce 0700 mode on capture spool staging directory",
+            )?;
+            let verified = fstat_fd(sfd, "verify capture spool staging directory mode")?;
+            if unix_perm_bits(verified.st_mode) != QUEUE_DIR_MODE {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: "capture spool staging directory permissions failed to settle at 0700"
+                        .to_string(),
+                });
+            }
+        }
+
+        // Create `capacity.lock` (`0600`) inside staging dir before publication.
+        let _lock = acquire_named_lock_at(
+            sfd,
+            CAPTURE_SPOOL_CAPACITY_LOCK_FILE,
+            owners.lock_uid,
+            "capture spool capacity.lock",
+        )?;
+
+        // Populate all 3 `0400` tombstones inside the private staging directory.
+        for &slot_name in &CAPTURE_SPOOL_TOMBSTONE_NAMES {
+            let _ = publish_spool_tombstone_at(sfd, slot_name, owners.tombstone_uid, observer)?;
+        }
+        fsync_fd(sfd, "fsync capture spool staging directory")?;
+        drop(_lock);
+
+        // Atomically publish `.capture-spool.<pid>.<seq>.tmp` -> `capture-spool`.
+        // POSIX guarantees `renameat(dirA, dirB)` fails with ENOTEMPTY/EEXIST if
+        // `capture-spool` already exists and is non-empty (either another racer's
+        // published tombstones or a live legacy spool with subdirs).
+        // SAFETY: `private_fd` is valid and both CStrings are NUL-terminated.
+        let rename_rc = unsafe {
+            libc::renameat(
+                private_fd.as_raw_fd(),
+                cstaging.as_ptr(),
+                private_fd.as_raw_fd(),
+                cfinal.as_ptr(),
+            )
+        };
+        if rename_rc != 0 {
+            let err = io::Error::last_os_error();
+            let raw = err.raw_os_error();
+            if err.kind() == io::ErrorKind::AlreadyExists
+                || raw == Some(libc::ENOTEMPTY)
+                || raw == Some(libc::EEXIST)
+            {
+                // Lost the fresh-creation race: `staging_guard` cleans up our
+                // staging dir cleanly and caller proceeds to the existing-dir path.
+                return Ok(None);
+            }
+            return Err(StorageBackendError::io(
+                "atomically publish capture-spool directory",
+                err,
+            ));
+        }
+
+        let published_fd = staging_guard.disarm();
+        Ok(published_fd)
+    }
+
+    pub(super) fn init_redb_capture_spool_tombstones_unix(
+        storage_dir: &Path,
+        owners: UnixExpectedSpoolOwners,
+        observer: &mut QueueInitObserver,
+    ) -> StorageResult<CaptureSpoolTombstoneReport> {
+        let storage_fd = open_ancestor_dir(storage_dir, "open repository storage directory")?;
+        let private_fd = ensure_subdir_nofollow(
+            &storage_fd,
+            OsStr::new(PRIVATE_SUBDIR),
+            owners.private_uid,
+            "capture private directory",
+        )?;
+
+        // Fast-path fresh Redb repository: if `capture-spool` does not yet exist,
+        // stage the entire `0700` directory + `0600` `capacity.lock` + all three
+        // `0400` tombstones privately and publish atomically via `renameat` so
+        // legacy `spool.rs:330` `ensure_spool` never sees a partial window.
+        let spool_fd = match openat_dir_nofollow(
+            &private_fd,
+            OsStr::new(CAPTURE_SPOOL_SUBDIR),
+            owners.spool_uid,
+            "capture spool directory",
+        ) {
+            Ok((fd, st)) => {
+                if unix_perm_bits(st.st_mode) != QUEUE_DIR_MODE {
+                    fchmod_fd(
+                        &fd,
+                        QUEUE_DIR_MODE,
+                        "enforce 0700 mode on capture spool directory",
+                    )?;
+                    let verified = fstat_fd(&fd, "verify capture spool directory mode")?;
+                    if unix_perm_bits(verified.st_mode) != QUEUE_DIR_MODE {
+                        return Err(StorageBackendError::BackendInternal {
+                            detail: "capture spool directory permissions failed to settle at 0700"
+                                .to_string(),
+                        });
+                    }
+                }
+                fd
+            }
+            Err(StorageBackendError::Io {
+                kind: io::ErrorKind::NotFound,
+                ..
+            }) => {
+                if let Some(published_fd) =
+                    try_stage_fresh_spool_dir_atomic(&private_fd, owners, observer)?
+                {
+                    observer.before_fsync_lane(PRIVATE_SUBDIR)?;
+                    fsync_fd(&private_fd, "fsync capture private directory")?;
+                    observer.before_fsync_lane(CAPTURE_SPOOL_SUBDIR)?;
+                    fsync_fd(&published_fd, "fsync capture spool directory")?;
+                    return Ok(CaptureSpoolTombstoneReport {
+                        paths: CaptureSpoolTombstonePaths::from_storage_dir(storage_dir),
+                        outcome: SpoolTombstoneOutcome::InstalledFresh,
+                    });
+                }
+                // Another initializer or legacy hook populated `capture-spool/`
+                // concurrently; validate and handle under `capacity.lock`.
+                ensure_subdir_nofollow(
+                    &private_fd,
+                    OsStr::new(CAPTURE_SPOOL_SUBDIR),
+                    owners.spool_uid,
+                    "capture spool directory",
+                )?
+            }
+            Err(err) => return Err(err),
+        };
+
+        // Existing `capture-spool/` path: serialize with concurrent initializers
+        // and legacy `spool.rs` via `capture-spool/capacity.lock` (`0600`,
+        // `O_NOFOLLOW`, `flock(LOCK_EX)`).
+        let _capacity_lock = acquire_named_lock_at(
+            &spool_fd,
+            CAPTURE_SPOOL_CAPACITY_LOCK_FILE,
+            owners.lock_uid,
+            "capture spool capacity.lock",
+        )?;
+
+        // Pre-validate ALL 3 slots read-only BEFORE installing any tombstone so
+        // an existing live legacy directory or symlink fails closed with zero
+        // partial tombstone installation.
+        let mut slots = Vec::with_capacity(CAPTURE_SPOOL_TOMBSTONE_NAMES.len());
+        for &slot_name in &CAPTURE_SPOOL_TOMBSTONE_NAMES {
+            let state =
+                inspect_spool_tombstone_slot_at(&spool_fd, slot_name, owners.tombstone_uid)?;
+            slots.push((slot_name, state));
+        }
+
+        let mut installed_any = false;
+        let mut published_this_call: Vec<PublishedTombstone> = Vec::new();
+        for (slot_name, state) in slots {
+            match state {
+                SpoolTombstoneSlotState::Absent => {
+                    match publish_spool_tombstone_at(
+                        &spool_fd,
+                        slot_name,
+                        owners.tombstone_uid,
+                        observer,
+                    ) {
+                        Ok(pub_item) => {
+                            published_this_call.push(pub_item);
+                            installed_any = true;
+                        }
+                        Err(err) => {
+                            // If an uncoordinated legacy `ensure_spool` raced in
+                            // between slot publications and created a live subdir,
+                            // roll back ONLY the exact tombstone inodes published
+                            // by this call so no partial tombstones remain beside
+                            // a live legacy spool directory.
+                            rollback_published_tombstones(&spool_fd, &published_this_call);
+                            return Err(err);
+                        }
+                    }
+                }
+                SpoolTombstoneSlotState::ValidNeedsTighten(fd) => {
+                    if let Err(err) = (|| -> StorageResult<()> {
+                        fchmod_fd(
+                            &fd,
+                            CAPTURE_SPOOL_TOMBSTONE_MODE,
+                            "tighten capture spool tombstone mode to 0400",
+                        )?;
+                        let verified =
+                            fstat_fd(&fd, "verify tightened capture spool tombstone mode")?;
+                        if unix_perm_bits(verified.st_mode) != CAPTURE_SPOOL_TOMBSTONE_MODE {
+                            return Err(StorageBackendError::BackendInternal {
+                                detail:
+                                    "capture spool tombstone permissions failed to settle at 0400"
+                                        .to_string(),
+                            });
+                        }
+                        fsync_fd(&fd, "sync tightened capture spool tombstone")?;
+                        Ok(())
+                    })() {
+                        rollback_published_tombstones(&spool_fd, &published_this_call);
+                        return Err(err);
+                    }
+                }
+                SpoolTombstoneSlotState::ValidExactMode => {}
+            }
+        }
+
+        // Unconditionally fsync BOTH parent (`private/`) and `capture-spool/`
+        // before EVERY successful return (including `AlreadyFenced` retries
+        // after a prior failed sync and concurrent initializers racing behind
+        // an atomic directory publish) so success always guarantees durable
+        // parent and child directory entries (`RB-07e` AC4).
+        observer.before_fsync_lane(PRIVATE_SUBDIR)?;
+        fsync_fd(&private_fd, "fsync capture private directory")?;
+        observer.before_fsync_lane(CAPTURE_SPOOL_SUBDIR)?;
+        fsync_fd(&spool_fd, "fsync capture spool directory")?;
+
+        Ok(CaptureSpoolTombstoneReport {
+            paths: CaptureSpoolTombstonePaths::from_storage_dir(storage_dir),
+            outcome: if installed_any {
+                SpoolTombstoneOutcome::InstalledFresh
+            } else {
+                SpoolTombstoneOutcome::AlreadyFenced
+            },
+        })
+    }
 }
 
 #[cfg(unix)]
-use unix_impl::{init_capture_queue_at_root_unix, init_capture_queue_unix};
+use unix_impl::{
+    init_capture_queue_at_root_unix, init_capture_queue_unix,
+    init_redb_capture_spool_tombstones_unix,
+};
 
 // ============================================================================
 // Non-Unix Fallback Implementation
@@ -1625,6 +2541,87 @@ fn ensure_non_unix_dir(path: &Path, subject: &'static str) -> StorageResult<()> 
             err,
         )),
     }
+}
+
+/// Flush a Windows directory handle durably via `CreateFileW`
+/// (`FILE_FLAG_BACKUP_SEMANTICS`) + `FlushFileBuffers`, failing closed if the
+/// OS refuses or fails to flush directory metadata.
+#[cfg(windows)]
+fn flush_windows_dir(dir: &Path) -> StorageResult<()> {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE},
+        Storage::FileSystem::{
+            CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE, FILE_SHARE_READ,
+            FILE_SHARE_WRITE, FlushFileBuffers, OPEN_EXISTING,
+        },
+    };
+
+    struct WinHandleGuard(HANDLE);
+    impl Drop for WinHandleGuard {
+        fn drop(&mut self) {
+            // SAFETY: `self.0` is a valid Win32 handle opened by `CreateFileW`.
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+
+    let wide: Vec<u16> = dir
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: `wide` is a valid NUL-terminated UTF-16 path alive for `CreateFileW`.
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(StorageBackendError::io(
+            "open Windows directory handle for durable flush",
+            std::io::Error::last_os_error(),
+        ));
+    }
+    let guard = WinHandleGuard(handle);
+    // SAFETY: `guard.0` is a valid open directory handle.
+    let ok = unsafe { FlushFileBuffers(guard.0) };
+    if ok == 0 {
+        return Err(StorageBackendError::io(
+            "flush Windows directory buffers durably",
+            std::io::Error::last_os_error(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn enforce_windows_readonly(path: &Path, context: &'static str) -> StorageResult<()> {
+    let mut perms = fs::metadata(path)
+        .map_err(|e| StorageBackendError::io(context, e))?
+        .permissions();
+    if !perms.readonly() {
+        perms.set_readonly(true);
+        fs::set_permissions(path, perms).map_err(|e| StorageBackendError::io(context, e))?;
+    }
+    let verified = fs::metadata(path)
+        .map_err(|e| StorageBackendError::io(context, e))?
+        .permissions()
+        .readonly();
+    if !verified {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "capture spool tombstone readonly attribute failed to settle".to_string(),
+        });
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -1700,7 +2697,7 @@ fn publish_initial_meta_non_unix(
         }
         observer.record_publish(lane_label, target_name);
         observer.before_fsync_lane(lane_label)?;
-        fsync_dir(lane_dir)?;
+        flush_windows_dir(lane_dir)?;
         Ok(())
     }
 }
@@ -1846,6 +2843,325 @@ fn init_capture_queue_at_root_non_unix(
             paths,
             priority_outcome,
             normal_outcome,
+        })
+    }
+}
+
+#[cfg(windows)]
+fn cleanup_windows_staging_spool_dir(staging_dir: &Path) {
+    for name in [
+        CAPTURE_SPOOL_CAPACITY_LOCK_FILE,
+        "tmp",
+        "ready",
+        "quarantine",
+    ] {
+        let p = staging_dir.join(name);
+        if let Ok(mut perms) = fs::metadata(&p).map(|m| m.permissions()) {
+            perms.set_readonly(false);
+            let _ = fs::set_permissions(&p, perms);
+        }
+        let _ = fs::remove_file(&p);
+    }
+    let _ = fs::remove_dir(staging_dir);
+}
+
+#[cfg(windows)]
+fn try_stage_fresh_spool_dir_windows(
+    private_dir: &Path,
+    final_dir: &Path,
+    observer: &mut QueueInitObserver,
+) -> StorageResult<bool> {
+    let staging_dir = private_dir.join(next_meta_temp_name(".capture-spool"));
+    fs::create_dir(&staging_dir)
+        .map_err(|e| StorageBackendError::io("create capture spool staging directory", e))?;
+
+    let populate_res: StorageResult<()> = (|| {
+        let lock_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(staging_dir.join(CAPTURE_SPOOL_CAPACITY_LOCK_FILE))
+            .map_err(|e| StorageBackendError::io("create capture spool capacity.lock", e))?;
+        lock_file
+            .sync_all()
+            .map_err(|e| StorageBackendError::io("sync capture spool capacity.lock", e))?;
+        drop(lock_file);
+
+        for &slot_name in &CAPTURE_SPOOL_TOMBSTONE_NAMES {
+            let slot_path = staging_dir.join(slot_name);
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&slot_path)
+                .map_err(|e| StorageBackendError::io("create capture spool tombstone", e))?;
+            file.write_all(CAPTURE_SPOOL_TOMBSTONE_SENTINEL)
+                .and_then(|()| file.sync_all())
+                .map_err(|e| {
+                    StorageBackendError::io("write capture spool tombstone sentinel", e)
+                })?;
+            drop(file);
+            enforce_windows_readonly(&slot_path, "mark capture spool tombstone readonly")?;
+            observer.record_publish(CAPTURE_SPOOL_SUBDIR, slot_name);
+        }
+        Ok(())
+    })();
+
+    if let Err(err) = populate_res {
+        cleanup_windows_staging_spool_dir(&staging_dir);
+        return Err(err);
+    }
+
+    // Atomically publish the completely populated staging directory to
+    // `capture-spool` via `MoveFileExW(MOVEFILE_WRITE_THROUGH)` without
+    // `MOVEFILE_REPLACE_EXISTING`, preventing any legacy `ensure_spool` race
+    // window on fresh Redb repositories.
+    match durable_no_clobber_publish_windows(&staging_dir, final_dir) {
+        Ok(()) => Ok(true),
+        Err(StorageBackendError::Io {
+            kind: std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied,
+            ..
+        }) if fs::symlink_metadata(final_dir).is_ok() => {
+            cleanup_windows_staging_spool_dir(&staging_dir);
+            Ok(false)
+        }
+        Err(err) => {
+            cleanup_windows_staging_spool_dir(&staging_dir);
+            Err(err)
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn init_redb_capture_spool_tombstones_non_unix(
+    storage_dir: &Path,
+    observer: &mut QueueInitObserver,
+) -> StorageResult<CaptureSpoolTombstoneReport> {
+    #[cfg(not(windows))]
+    {
+        let _ = (storage_dir, observer);
+        return Err(StorageBackendError::BackendInternal {
+            detail:
+                "durable capture-spool tombstone initialization is unsupported on this platform"
+                    .to_string(),
+        });
+    }
+    #[cfg(windows)]
+    {
+        let paths = CaptureSpoolTombstonePaths::from_storage_dir(storage_dir);
+        let private_dir = storage_dir.join(PRIVATE_SUBDIR);
+        ensure_non_unix_dir(&private_dir, "capture private directory")?;
+
+        // Fast-path fresh Redb repository on Windows: atomically stage the
+        // entire populated `capture-spool/` directory and publish with
+        // `MOVEFILE_WRITE_THROUGH` so legacy hooks never see a partial window.
+        match fs::symlink_metadata(&paths.root) {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                if try_stage_fresh_spool_dir_windows(&private_dir, &paths.root, observer)? {
+                    observer.before_fsync_lane(PRIVATE_SUBDIR)?;
+                    flush_windows_dir(&private_dir)?;
+                    observer.before_fsync_lane(CAPTURE_SPOOL_SUBDIR)?;
+                    flush_windows_dir(&paths.root)?;
+                    return Ok(CaptureSpoolTombstoneReport {
+                        paths,
+                        outcome: SpoolTombstoneOutcome::InstalledFresh,
+                    });
+                }
+            }
+            Ok(_) => {}
+            Err(err) => {
+                return Err(StorageBackendError::io(
+                    "inspect capture spool directory",
+                    err,
+                ));
+            }
+        }
+
+        ensure_non_unix_dir(&paths.root, "capture spool directory")?;
+
+        if let Ok(meta) = fs::symlink_metadata(&paths.capacity_lock) {
+            if meta.file_type().is_symlink() {
+                return Err(map_queue_symlink_err("capture spool capacity.lock"));
+            }
+            if !meta.is_file() {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: "capture spool capacity.lock is not a regular file".to_string(),
+                });
+            }
+        }
+        let lock_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&paths.capacity_lock)
+            .map_err(|e| StorageBackendError::io("open capture spool capacity.lock", e))?;
+        lock_file
+            .lock()
+            .map_err(|e| StorageBackendError::io("lock capture spool capacity.lock", e))?;
+
+        let mut missing_slots = Vec::new();
+        let mut needs_readonly_repair = Vec::new();
+        for &slot_name in &CAPTURE_SPOOL_TOMBSTONE_NAMES {
+            let slot_path = paths.root.join(slot_name);
+            match fs::symlink_metadata(&slot_path) {
+                Ok(meta) => {
+                    if meta.file_type().is_symlink() {
+                        return Err(map_queue_symlink_err("capture spool tombstone"));
+                    }
+                    if meta.is_dir() {
+                        return Err(StorageBackendError::BackendInternal {
+                            detail: "live capture-spool subdirectory already exists; refusing to overwrite with tombstone"
+                                .to_string(),
+                        });
+                    }
+                    if !meta.is_file() {
+                        return Err(StorageBackendError::BackendInternal {
+                            detail: "capture spool tombstone path is not a regular file"
+                                .to_string(),
+                        });
+                    }
+                    if meta.len() != CAPTURE_SPOOL_TOMBSTONE_SENTINEL.len() as u64 {
+                        return Err(StorageBackendError::BackendInternal {
+                            detail: "unexpected non-tombstone regular file at capture-spool path"
+                                .to_string(),
+                        });
+                    }
+                    use std::io::Read as _;
+                    let mut existing =
+                        Vec::with_capacity(CAPTURE_SPOOL_TOMBSTONE_SENTINEL.len() + 1);
+                    OpenOptions::new()
+                        .read(true)
+                        .open(&slot_path)
+                        .map_err(|e| {
+                            StorageBackendError::io("open capture spool tombstone file", e)
+                        })?
+                        .take((CAPTURE_SPOOL_TOMBSTONE_SENTINEL.len() + 1) as u64)
+                        .read_to_end(&mut existing)
+                        .map_err(|e| {
+                            StorageBackendError::io("read capture spool tombstone file", e)
+                        })?;
+                    if existing.as_slice() != CAPTURE_SPOOL_TOMBSTONE_SENTINEL {
+                        return Err(StorageBackendError::BackendInternal {
+                            detail: "unexpected non-tombstone regular file at capture-spool path"
+                                .to_string(),
+                        });
+                    }
+                    if !meta.permissions().readonly() {
+                        needs_readonly_repair.push(slot_path);
+                    }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    missing_slots.push((slot_name, slot_path));
+                }
+                Err(err) => {
+                    return Err(StorageBackendError::io(
+                        "inspect capture spool tombstone",
+                        err,
+                    ));
+                }
+            }
+        }
+
+        for slot_path in needs_readonly_repair {
+            enforce_windows_readonly(&slot_path, "repair capture spool tombstone readonly")?;
+        }
+
+        let installed_any = !missing_slots.is_empty();
+        let mut published_this_call: Vec<PathBuf> = Vec::new();
+        for (slot_name, slot_path) in missing_slots {
+            let tmp_path = paths
+                .root
+                .join(next_meta_temp_name(&format!(".{slot_name}.tombstone")));
+            let mut file = match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp_path)
+            {
+                Ok(f) => f,
+                Err(e) => {
+                    for p in published_this_call.iter().rev() {
+                        if let Ok(mut perms) = fs::metadata(p).map(|m| m.permissions()) {
+                            perms.set_readonly(false);
+                            let _ = fs::set_permissions(p, perms);
+                        }
+                        let _ = fs::remove_file(p);
+                    }
+                    return Err(StorageBackendError::io(
+                        "create capture spool tombstone temp",
+                        e,
+                    ));
+                }
+            };
+            if let Err(err) = file
+                .write_all(CAPTURE_SPOOL_TOMBSTONE_SENTINEL)
+                .and_then(|()| file.sync_all())
+            {
+                drop(file);
+                let _ = fs::remove_file(&tmp_path);
+                for p in published_this_call.iter().rev() {
+                    if let Ok(mut perms) = fs::metadata(p).map(|m| m.permissions()) {
+                        perms.set_readonly(false);
+                        let _ = fs::set_permissions(p, perms);
+                    }
+                    let _ = fs::remove_file(p);
+                }
+                return Err(StorageBackendError::io(
+                    "write capture spool tombstone sentinel",
+                    err,
+                ));
+            }
+            drop(file);
+            if let Err(err) =
+                enforce_windows_readonly(&tmp_path, "mark capture spool tombstone readonly")
+            {
+                if let Ok(mut perms) = fs::metadata(&tmp_path).map(|m| m.permissions()) {
+                    perms.set_readonly(false);
+                    let _ = fs::set_permissions(&tmp_path, perms);
+                }
+                let _ = fs::remove_file(&tmp_path);
+                for p in published_this_call.iter().rev() {
+                    if let Ok(mut perms) = fs::metadata(p).map(|m| m.permissions()) {
+                        perms.set_readonly(false);
+                        let _ = fs::set_permissions(p, perms);
+                    }
+                    let _ = fs::remove_file(p);
+                }
+                return Err(err);
+            }
+            if let Err(err) = durable_no_clobber_publish_windows(&tmp_path, &slot_path) {
+                if let Ok(mut perms) = fs::metadata(&tmp_path).map(|m| m.permissions()) {
+                    perms.set_readonly(false);
+                    let _ = fs::set_permissions(&tmp_path, perms);
+                }
+                let _ = fs::remove_file(&tmp_path);
+                for p in published_this_call.iter().rev() {
+                    if let Ok(mut perms) = fs::metadata(p).map(|m| m.permissions()) {
+                        perms.set_readonly(false);
+                        let _ = fs::set_permissions(p, perms);
+                    }
+                    let _ = fs::remove_file(p);
+                }
+                return Err(err);
+            }
+            published_this_call.push(slot_path);
+            observer.record_publish(CAPTURE_SPOOL_SUBDIR, slot_name);
+        }
+
+        // Unconditionally flush BOTH parent (`private/`) and `capture-spool/`
+        // durably via `FlushFileBuffers` before every `Ok` return (including
+        // `AlreadyFenced` retries).
+        observer.before_fsync_lane(PRIVATE_SUBDIR)?;
+        flush_windows_dir(&private_dir)?;
+        observer.before_fsync_lane(CAPTURE_SPOOL_SUBDIR)?;
+        flush_windows_dir(&paths.root)?;
+        drop(lock_file);
+
+        Ok(CaptureSpoolTombstoneReport {
+            paths,
+            outcome: if installed_any {
+                SpoolTombstoneOutcome::InstalledFresh
+            } else {
+                SpoolTombstoneOutcome::AlreadyFenced
+            },
         })
     }
 }
@@ -2705,6 +4021,500 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// `RB-07e` AC1–AC5:
+    /// - AC1: `init_redb_capture_spool_tombstones` creates `.libra/private/capture-spool/`
+    ///   with exact Unix `0700` permissions.
+    /// - AC2: Creates `.libra/private/capture-spool/capacity.lock` with exact Unix `0600`
+    ///   permissions.
+    /// - AC3: Atomically creates `0400` regular-file tombstones at
+    ///   `capture-spool/{tmp,ready,quarantine}`.
+    /// - AC4: Executes `fsync_dir(capture-spool)` immediately after creating the tombstones
+    ///   (and fails closed on injected `fsync_dir` failure).
+    /// - AC5: Legacy SQLite hook `crate::internal::ai::capture::spool::publish` (which invokes
+    ///   `spool.rs:330` `ensure_spool`) immediately fails closed on the tombstoned fresh Redb
+    ///   repo without mutating or removing any tombstone.
+    #[test]
+    fn fresh_redb_init_spool_tombstones_blocks_legacy_ensure_spool() {
+        // ------------------------------------------------------------------
+        // AC1 + AC2 + AC3 + AC4: Fresh Redb repo tombstone initialization
+        // ------------------------------------------------------------------
+        let repo = tempdir().expect("create fresh redb repo dir");
+        let mut observer = QueueInitObserver::new();
+        #[cfg(unix)]
+        let report = init_redb_capture_spool_tombstones_unix(
+            repo.path(),
+            UnixExpectedSpoolOwners::current_effective(),
+            &mut observer,
+        )
+        .expect("fresh Redb capture-spool tombstone init must succeed");
+        #[cfg(not(unix))]
+        let report = init_redb_capture_spool_tombstones_non_unix(repo.path(), &mut observer)
+            .expect("fresh Redb capture-spool tombstone init must succeed");
+
+        assert_eq!(report.outcome, SpoolTombstoneOutcome::InstalledFresh);
+        assert_eq!(
+            report.paths.root,
+            repo.path().join("private").join("capture-spool")
+        );
+        assert_eq!(
+            report.paths.capacity_lock,
+            report.paths.root.join("capacity.lock")
+        );
+
+        // AC1: `.libra/private/` and `.libra/private/capture-spool/` have exact `0700` mode.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            for dir in [repo.path().join("private"), report.paths.root.clone()] {
+                let meta = fs::symlink_metadata(&dir).expect("stat spool directory");
+                assert!(meta.is_dir() && !meta.file_type().is_symlink());
+                assert_eq!(
+                    meta.permissions().mode() & 0o7777,
+                    0o700,
+                    "AC1: capture-spool directory must have exact 0700 mode"
+                );
+            }
+        }
+
+        // AC2: `.libra/private/capture-spool/capacity.lock` is a regular file with exact `0600`.
+        {
+            let lock_meta =
+                fs::symlink_metadata(&report.paths.capacity_lock).expect("stat capacity.lock");
+            assert!(lock_meta.is_file() && !lock_meta.file_type().is_symlink());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                assert_eq!(
+                    lock_meta.permissions().mode() & 0o7777,
+                    0o600,
+                    "AC2: capacity.lock must have exact 0600 mode"
+                );
+            }
+        }
+
+        // AC3: `capture-spool/{tmp,ready,quarantine}` are `0400` regular-file tombstones,
+        // and NO temporary staging files remain in `capture-spool/`.
+        {
+            let mut entries: Vec<String> = fs::read_dir(&report.paths.root)
+                .expect("read capture-spool dir")
+                .map(|e| {
+                    e.expect("dir entry")
+                        .file_name()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect();
+            entries.sort();
+            assert_eq!(
+                entries,
+                vec![
+                    "capacity.lock".to_string(),
+                    "quarantine".to_string(),
+                    "ready".to_string(),
+                    "tmp".to_string(),
+                ],
+                "AC3: capture-spool must contain ONLY capacity.lock and {{tmp,ready,quarantine}} tombstones"
+            );
+
+            for tomb in [
+                &report.paths.tmp,
+                &report.paths.ready,
+                &report.paths.quarantine,
+            ] {
+                let meta = fs::symlink_metadata(tomb).expect("stat tombstone");
+                assert!(
+                    meta.is_file() && !meta.is_dir() && !meta.file_type().is_symlink(),
+                    "AC3: tombstone must be a real regular file (not dir or symlink)"
+                );
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    assert_eq!(
+                        meta.permissions().mode() & 0o7777,
+                        0o400,
+                        "AC3: tombstone must have exact 0400 mode"
+                    );
+                }
+                assert_eq!(
+                    fs::read(tomb).expect("read tombstone sentinel"),
+                    CAPTURE_SPOOL_TOMBSTONE_SENTINEL
+                );
+            }
+        }
+
+        // AC4: Exact `publish(tmp, ready, quarantine) -> fsync_dir(private) -> fsync_dir(capture-spool)`
+        // durability trace, PLUS injected parent & child `fsync_dir` failure and retry coverage!
+        assert_eq!(
+            observer.events,
+            vec![
+                QueueInitEvent::PublishInitialMeta {
+                    lane: "capture-spool",
+                    file_name: "tmp",
+                },
+                QueueInitEvent::PublishInitialMeta {
+                    lane: "capture-spool",
+                    file_name: "ready",
+                },
+                QueueInitEvent::PublishInitialMeta {
+                    lane: "capture-spool",
+                    file_name: "quarantine",
+                },
+                QueueInitEvent::FsyncLaneDir { lane: "private" },
+                QueueInitEvent::FsyncLaneDir {
+                    lane: "capture-spool",
+                },
+            ],
+            "AC4: fsync_dir(private) and fsync_dir(capture-spool) must run immediately after all 3 tombstones are created"
+        );
+        {
+            // (4a) Inject parent (`private/`) fsync failure on fresh atomic publish (call 0):
+            let fail_repo = tempdir().expect("create fsync fail repo");
+            let mut fail_obs = QueueInitObserver::failing_fsync_at(0);
+            #[cfg(unix)]
+            let err = init_redb_capture_spool_tombstones_unix(
+                fail_repo.path(),
+                UnixExpectedSpoolOwners::current_effective(),
+                &mut fail_obs,
+            )
+            .expect_err("AC4: injected private fsync_dir failure must fail closed");
+            #[cfg(not(unix))]
+            let err = init_redb_capture_spool_tombstones_non_unix(fail_repo.path(), &mut fail_obs)
+                .expect_err("AC4: injected private fsync_dir failure must fail closed");
+            assert_eq!(err.stable_code_str(), "LBR-IO-001");
+
+            // Codex R1 P1 #1 + R2 P1 #1: Retrying on `AlreadyFenced` MUST STILL sync BOTH
+            // parent (`private/`) AND child (`capture-spool/`) — failing if EITHER sync fails!
+            let mut retry_fail_parent = QueueInitObserver::failing_fsync_at(0);
+            #[cfg(unix)]
+            let retry_err_parent = init_redb_capture_spool_tombstones_unix(
+                fail_repo.path(),
+                UnixExpectedSpoolOwners::current_effective(),
+                &mut retry_fail_parent,
+            )
+            .expect_err("AC4 retry: failing parent fsync_dir on AlreadyFenced must fail closed");
+            #[cfg(not(unix))]
+            let retry_err_parent = init_redb_capture_spool_tombstones_non_unix(
+                fail_repo.path(),
+                &mut retry_fail_parent,
+            )
+            .expect_err("AC4 retry: failing parent fsync_dir on AlreadyFenced must fail closed");
+            assert_eq!(retry_err_parent.stable_code_str(), "LBR-IO-001");
+            assert_eq!(
+                retry_fail_parent.events,
+                vec![QueueInitEvent::FsyncLaneDir { lane: "private" }]
+            );
+
+            let mut retry_fail_child = QueueInitObserver::failing_fsync_at(1);
+            #[cfg(unix)]
+            let retry_err_child = init_redb_capture_spool_tombstones_unix(
+                fail_repo.path(),
+                UnixExpectedSpoolOwners::current_effective(),
+                &mut retry_fail_child,
+            )
+            .expect_err("AC4 retry: failing child fsync_dir on AlreadyFenced must fail closed");
+            #[cfg(not(unix))]
+            let retry_err_child = init_redb_capture_spool_tombstones_non_unix(
+                fail_repo.path(),
+                &mut retry_fail_child,
+            )
+            .expect_err("AC4 retry: failing child fsync_dir on AlreadyFenced must fail closed");
+            assert_eq!(retry_err_child.stable_code_str(), "LBR-IO-001");
+            assert_eq!(
+                retry_fail_child.events,
+                vec![
+                    QueueInitEvent::FsyncLaneDir { lane: "private" },
+                    QueueInitEvent::FsyncLaneDir {
+                        lane: "capture-spool",
+                    },
+                ]
+            );
+
+            // Succeeding retry executes BOTH parent (`private`) and child (`capture-spool`) fsync!
+            let mut retry_ok_obs = QueueInitObserver::new();
+            #[cfg(unix)]
+            let retry_rep = init_redb_capture_spool_tombstones_unix(
+                fail_repo.path(),
+                UnixExpectedSpoolOwners::current_effective(),
+                &mut retry_ok_obs,
+            )
+            .expect("AC4 retry: succeeding parent + child fsync_dir must succeed");
+            #[cfg(not(unix))]
+            let retry_rep =
+                init_redb_capture_spool_tombstones_non_unix(fail_repo.path(), &mut retry_ok_obs)
+                    .expect("AC4 retry: succeeding parent + child fsync_dir must succeed");
+            assert_eq!(retry_rep.outcome, SpoolTombstoneOutcome::AlreadyFenced);
+            assert_eq!(
+                retry_ok_obs.events,
+                vec![
+                    QueueInitEvent::FsyncLaneDir { lane: "private" },
+                    QueueInitEvent::FsyncLaneDir {
+                        lane: "capture-spool",
+                    },
+                ],
+                "AC4 retry: AlreadyFenced path must fsync BOTH parent private/ and capture-spool/"
+            );
+        }
+
+        // Codex R1 P1 #2: Deterministic mid-publish interleaving with an uncoordinated
+        // legacy `ensure_spool` that creates `ready/` directory AFTER our precheck and
+        // AFTER `"tmp"` tombstone was published — must fail closed AND roll back `"tmp"`
+        // cleanly so ZERO partial tombstones remain alongside the live `ready/` dir!
+        {
+            let ilv_repo = tempdir().expect("create legacy interleaving repo");
+            let spool_root = ilv_repo.path().join("private").join("capture-spool");
+            fs::create_dir_all(&spool_root).expect("pre-create empty capture-spool");
+            let hook_spool_root = spool_root.clone();
+            let mut hook_obs = QueueInitObserver::with_after_publish_hook(move |_lane, slot| {
+                if slot == "tmp" {
+                    // Simulate racing legacy `ensure_spool` creating live `ready/` dir!
+                    fs::create_dir(hook_spool_root.join("ready"))
+                        .expect("simulate legacy ensure_spool creating ready/");
+                    fs::write(hook_spool_root.join("ready").join("0-live.json"), b"event")
+                        .expect("simulate legacy event");
+                }
+            });
+            #[cfg(unix)]
+            let err = init_redb_capture_spool_tombstones_unix(
+                ilv_repo.path(),
+                UnixExpectedSpoolOwners::current_effective(),
+                &mut hook_obs,
+            )
+            .expect_err("mid-publish legacy ready/ creation must fail closed");
+            #[cfg(not(unix))]
+            let err = init_redb_capture_spool_tombstones_non_unix(ilv_repo.path(), &mut hook_obs)
+                .expect_err("mid-publish legacy ready/ creation must fail closed");
+            assert_eq!(err.stable_code_str(), "LBR-IO-001");
+            assert!(
+                !spool_root.join("tmp").exists(),
+                "mid-publish rollback must remove newly published tmp tombstone"
+            );
+            assert!(
+                !spool_root.join("quarantine").exists(),
+                "quarantine tombstone must not be installed after failure"
+            );
+            assert!(
+                spool_root.join("ready").is_dir(),
+                "live legacy ready/ directory must remain completely intact"
+            );
+            assert_eq!(
+                fs::read(spool_root.join("ready").join("0-live.json")).expect("live event intact"),
+                b"event"
+            );
+        }
+
+        // ------------------------------------------------------------------
+        // AC5: Legacy SQLite Hook `spool.rs:330` `ensure_spool` immediately fails closed!
+        // ------------------------------------------------------------------
+        {
+            let legacy_err = crate::internal::ai::capture::spool::publish(
+                repo.path(),
+                false,
+                "legacy-sqlite-hook-key",
+                b"{\"event\":\"SessionEnd\"}",
+                None,
+            )
+            .expect_err(
+                "AC5: legacy spool.rs ensure_spool must fail closed against 0400 tombstones",
+            );
+            assert!(
+                legacy_err
+                    .to_string()
+                    .contains("capture queue directory is not a private directory"),
+                "AC5: unexpected legacy ensure_spool error: {legacy_err:#}"
+            );
+
+            // Verify all 3 tombstones and `capacity.lock` remain 100% intact after blocked legacy call.
+            for tomb in [
+                &report.paths.tmp,
+                &report.paths.ready,
+                &report.paths.quarantine,
+            ] {
+                let meta = fs::symlink_metadata(tomb).expect("tombstone still present");
+                assert!(meta.is_file() && !meta.is_dir());
+                assert_eq!(
+                    fs::read(tomb).expect("tombstone bytes preserved"),
+                    CAPTURE_SPOOL_TOMBSTONE_SENTINEL
+                );
+            }
+        }
+
+        // Idempotent re-initialization returns `AlreadyFenced` without breaking tombstones,
+        // and 8 concurrent threads racing on a fresh repo serialize cleanly behind `capacity.lock`.
+        {
+            let second =
+                init_redb_capture_spool_tombstones(repo.path()).expect("idempotent re-init");
+            assert_eq!(second.outcome, SpoolTombstoneOutcome::AlreadyFenced);
+
+            use std::sync::{Arc, Barrier};
+            let race_repo = tempdir().expect("create concurrent spool tombstone race repo");
+            let race_path = Arc::new(race_repo.path().to_path_buf());
+            let barrier = Arc::new(Barrier::new(8));
+            let mut handles = Vec::with_capacity(8);
+            for _ in 0..8 {
+                let p = Arc::clone(&race_path);
+                let b = Arc::clone(&barrier);
+                handles.push(std::thread::spawn(move || {
+                    b.wait();
+                    let mut thread_obs = QueueInitObserver::new();
+                    #[cfg(unix)]
+                    let rep = init_redb_capture_spool_tombstones_unix(
+                        &p,
+                        UnixExpectedSpoolOwners::current_effective(),
+                        &mut thread_obs,
+                    )
+                    .expect("concurrent tombstone init must succeed");
+                    #[cfg(not(unix))]
+                    let rep = init_redb_capture_spool_tombstones_non_unix(&p, &mut thread_obs)
+                        .expect("concurrent tombstone init must succeed");
+                    // Every returning thread (both InstalledFresh and concurrent AlreadyFenced)
+                    // must have durably synced BOTH parent `private/` and `capture-spool/`.
+                    assert!(
+                        thread_obs
+                            .events
+                            .contains(&QueueInitEvent::FsyncLaneDir { lane: "private" }),
+                        "concurrent returning initializer must fsync parent private/"
+                    );
+                    assert!(
+                        thread_obs.events.contains(&QueueInitEvent::FsyncLaneDir {
+                            lane: "capture-spool",
+                        }),
+                        "concurrent returning initializer must fsync capture-spool/"
+                    );
+                    for tomb in [&rep.paths.tmp, &rep.paths.ready, &rep.paths.quarantine] {
+                        assert_eq!(
+                            fs::read(tomb).expect("read tombstone after concurrent init"),
+                            CAPTURE_SPOOL_TOMBSTONE_SENTINEL
+                        );
+                    }
+                    rep.outcome
+                }));
+            }
+            let outcomes: Vec<SpoolTombstoneOutcome> = handles
+                .into_iter()
+                .map(|h| h.join().expect("race worker thread must not panic"))
+                .collect();
+            assert_eq!(
+                outcomes
+                    .iter()
+                    .filter(|&&o| o == SpoolTombstoneOutcome::InstalledFresh)
+                    .count(),
+                1,
+                "exactly 1 racing initializer must install fresh tombstones: {outcomes:?}"
+            );
+            assert_eq!(
+                outcomes
+                    .iter()
+                    .filter(|&&o| o == SpoolTombstoneOutcome::AlreadyFenced)
+                    .count(),
+                7,
+                "all other racing initializers must observe AlreadyFenced: {outcomes:?}"
+            );
+            assert!(
+                crate::internal::ai::capture::spool::publish(
+                    race_repo.path(),
+                    true,
+                    "concurrent-legacy-check",
+                    b"{}",
+                    None,
+                )
+                .is_err(),
+                "legacy spool::publish must fail closed after concurrent tombstone init"
+            );
+        }
+
+        // Pre-existing live legacy spool directory (`ready/`) fails closed with ZERO partial tombstones!
+        {
+            let live_repo = tempdir().expect("create live legacy spool repo");
+            let spool_root = live_repo.path().join("private").join("capture-spool");
+            fs::create_dir_all(spool_root.join("ready")).expect("mkdir live ready/");
+            fs::write(spool_root.join("ready").join("0-event.json"), b"live-event")
+                .expect("write live event");
+            let err = init_redb_capture_spool_tombstones(live_repo.path())
+                .expect_err("must fail closed when live capture-spool/ready/ directory exists");
+            assert_eq!(err.stable_code_str(), "LBR-IO-001");
+            assert!(
+                !spool_root.join("tmp").exists() && !spool_root.join("quarantine").exists(),
+                "pre-check must prevent partial tombstone installation when any slot is a live dir"
+            );
+            assert_eq!(
+                fs::read(spool_root.join("ready").join("0-event.json"))
+                    .expect("live event untouched"),
+                b"live-event"
+            );
+        }
+
+        // Symlink and foreign-owner security rejections (Unix).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+            let decoy = tempdir().expect("decoy dir");
+            fs::set_permissions(decoy.path(), fs::Permissions::from_mode(0o700))
+                .expect("chmod decoy");
+
+            // Symlink at `capture-spool`, `capacity.lock`, and each tombstone slot fails closed.
+            {
+                let sym_repo = tempdir().expect("symlink capture-spool repo");
+                fs::create_dir(sym_repo.path().join("private")).expect("mkdir private");
+                symlink(
+                    decoy.path(),
+                    sym_repo.path().join("private").join("capture-spool"),
+                )
+                .expect("symlink capture-spool");
+                let err = init_redb_capture_spool_tombstones(sym_repo.path())
+                    .expect_err("symlinked capture-spool must fail closed");
+                assert!(is_capture_queue_symlink_rejected_error(&err), "{err:?}");
+                assert_eq!(err.stable_code_str(), "LBR-IO-001");
+            }
+            for target_name in ["capacity.lock", "tmp", "ready", "quarantine"] {
+                let sym_repo = tempdir().expect("symlink slot repo");
+                let spool_root = sym_repo.path().join("private").join("capture-spool");
+                fs::create_dir_all(&spool_root).expect("mkdir spool_root");
+                symlink(decoy.path().join("evil"), spool_root.join(target_name))
+                    .expect("symlink slot");
+                let err = init_redb_capture_spool_tombstones(sym_repo.path())
+                    .expect_err(&format!("symlinked {target_name} must fail closed"));
+                assert!(
+                    is_capture_queue_symlink_rejected_error(&err),
+                    "{target_name}: {err:?}"
+                );
+                assert_eq!(err.stable_code_str(), "LBR-IO-001");
+                assert!(!decoy.path().join("evil").exists());
+            }
+
+            // Foreign owner UID on `capture-spool` fails closed without mutating permissions.
+            let real_owners = UnixExpectedSpoolOwners::current_effective();
+            let foreign_uid = real_owners.spool_uid.wrapping_add(1);
+            let owner_repo = tempdir().expect("owner mismatch spool repo");
+            let spool_root = owner_repo.path().join("private").join("capture-spool");
+            fs::create_dir_all(&spool_root).expect("mkdir spool_root");
+            fs::set_permissions(&spool_root, fs::Permissions::from_mode(0o755))
+                .expect("set 0755 on foreign-owned spool dir");
+            let mut obs = QueueInitObserver::new();
+            let err = init_redb_capture_spool_tombstones_unix(
+                owner_repo.path(),
+                UnixExpectedSpoolOwners {
+                    spool_uid: foreign_uid,
+                    ..real_owners
+                },
+                &mut obs,
+            )
+            .expect_err("foreign-owned capture-spool must fail closed");
+            assert!(is_capture_queue_owner_mismatch_error(&err), "{err:?}");
+            assert_eq!(err.stable_code_str(), "LBR-IO-001");
+            assert_eq!(
+                fs::symlink_metadata(&spool_root)
+                    .expect("stat spool_root")
+                    .permissions()
+                    .mode()
+                    & 0o7777,
+                0o755,
+                "foreign-owned capture-spool permissions must never be mutated"
+            );
+            assert!(!spool_root.join("capacity.lock").exists());
         }
     }
 }
