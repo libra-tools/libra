@@ -2616,3 +2616,141 @@ fn fp03_cancelled_rfc_with_k() {
         .collect();
     assert_eq!(subjects, ["Subject: rename"]);
 }
+
+// ---------------------------------------------------------------------------
+// FP-05: patch body/stat come from the diff engine (rename detection by default)
+// ---------------------------------------------------------------------------
+
+fn repo_with_pure_rename() -> tempfile::TempDir {
+    let repo = create_committed_repo_via_cli();
+    fs::write(
+        repo.path().join("lorem"),
+        "lorem\nipsum\ndolor\nsit\namet\n",
+    )
+    .unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "lorem"], repo.path()),
+        "add lorem",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], repo.path()),
+        "commit base",
+    );
+    assert_cli_success(
+        &run_libra_command(&["mv", "lorem", "ipsum"], repo.path()),
+        "mv lorem ipsum",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "rename", "--no-verify"], repo.path()),
+        "commit rename",
+    );
+    repo
+}
+
+fn patch_body(stdout: &str) -> String {
+    match stdout.split_once("diff --git ") {
+        Some((_, rest)) => format!("diff --git {rest}"),
+        None => String::new(),
+    }
+}
+
+#[test]
+fn pure_rename_is_detected_by_default() {
+    let repo = repo_with_pure_rename();
+    let output = run_libra_command(&["format-patch", "-1", "--stdout"], repo.path());
+    assert_cli_success(&output, "format-patch -1 --stdout");
+    let stdout_text = String::from_utf8_lossy(&output.stdout);
+    let body = patch_body(&stdout_text);
+    // The patch body ends before the mail signature trailer.
+    let body = body.split("\n-- \n").next().unwrap_or(&body);
+    assert_eq!(
+        format!("{body}\n"),
+        "diff --git a/lorem b/ipsum\n\
+         similarity index 100%\n\
+         rename from lorem\n\
+         rename to ipsum\n",
+        "pure rename body"
+    );
+}
+
+#[test]
+fn stat_block_matches_libra_diff_stat() {
+    let repo = repo_with_pure_rename();
+    let output = run_libra_command(&["format-patch", "-1", "--stdout"], repo.path());
+    assert_cli_success(&output, "format-patch -1 --stdout");
+    let stdout_text = String::from_utf8_lossy(&output.stdout);
+    let after_separator = stdout_text
+        .split_once("\n---\n")
+        .map(|(_, rest)| rest.to_string())
+        .expect("patch separator");
+    let stat_block = after_separator
+        .split_once("diff --git ")
+        .map(|(stat, _)| stat.trim_end_matches('\n').to_string())
+        .expect("stat block");
+
+    let head = run_libra_command(&["rev-parse", "HEAD"], repo.path());
+    let parent = run_libra_command(&["rev-parse", "HEAD~1"], repo.path());
+    let head_id = String::from_utf8_lossy(&head.stdout).trim().to_string();
+    let parent_id = String::from_utf8_lossy(&parent.stdout).trim().to_string();
+    let diff_stat = run_libra_command(&["diff", "--stat", &parent_id, &head_id], repo.path());
+    assert_cli_success(&diff_stat, "diff --stat");
+    let expected = String::from_utf8_lossy(&diff_stat.stdout)
+        .trim_end_matches('\n')
+        .to_string();
+    assert_eq!(stat_block, expected, "stat block vs libra diff --stat");
+}
+
+#[test]
+fn partial_rename_is_detected_by_default() {
+    let repo = create_committed_repo_via_cli();
+    let original: String = (1..=10).map(|n| format!("line{n}\n")).collect();
+    fs::write(repo.path().join("alpha"), &original).unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "alpha"], repo.path()),
+        "add alpha",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], repo.path()),
+        "commit base",
+    );
+    assert_cli_success(
+        &run_libra_command(&["mv", "alpha", "beta"], repo.path()),
+        "mv alpha beta",
+    );
+    let edited = original.replace("line10\n", "line10 changed\n");
+    fs::write(repo.path().join("beta"), edited).unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "beta"], repo.path()),
+        "add beta",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "partial", "--no-verify"], repo.path()),
+        "commit partial",
+    );
+    let output = run_libra_command(&["format-patch", "-1", "--stdout"], repo.path());
+    assert_cli_success(&output, "format-patch -1 --stdout");
+    let stdout_text = String::from_utf8_lossy(&output.stdout);
+    let body = patch_body(&stdout_text);
+    assert!(
+        body.contains("similarity index ") && !body.contains("similarity index 100%"),
+        "partial similarity line: {body}"
+    );
+    assert!(body.contains("rename from alpha"), "rename from: {body}");
+    assert!(body.contains("@@"), "content hunk: {body}");
+}
+
+#[test]
+fn diff_renames_false_disables_detection() {
+    let repo = repo_with_pure_rename();
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "diff.renames", "false"], repo.path()),
+        "config diff.renames",
+    );
+    let output = run_libra_command(&["format-patch", "-1", "--stdout"], repo.path());
+    assert_cli_success(&output, "format-patch -1 --stdout");
+    let stdout_text = String::from_utf8_lossy(&output.stdout);
+    let body = patch_body(&stdout_text);
+    assert!(!body.contains("similarity index"), "no similarity: {body}");
+    assert!(body.contains("deleted file mode"), "deletion side: {body}");
+    assert!(body.contains("new file mode"), "addition side: {body}");
+}

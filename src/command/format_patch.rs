@@ -936,18 +936,13 @@ async fn format_patch_body(
     if let Some(block) = render_notes_block(&args.notes, &commit.id.to_string()).await? {
         message_section.push_str(&block);
     }
-    if !args.no_stat
-        && let Ok(stats) = log::compute_commit_stat(commit, vec![]).await
-    {
-        let stat_text = format_diffstat_plain(&stats);
-        if !stat_text.is_empty() {
-            message_section.push_str(&stat_text);
-            message_section.push('\n');
-        }
+    // The body and diffstat come from the shared `libra diff` engine so rename
+    // detection (and `diff.renames`) applies by default (ADR-FP-03).
+    let (stat_text, diff) = diff_engine_patch_parts(commit, args).await?;
+    if !args.no_stat && !stat_text.is_empty() {
+        message_section.push_str(&stat_text);
+        message_section.push('\n');
     }
-
-    // ---- Unified diff ----
-    let diff = log::generate_diff_with_options(commit, vec![], &commit_diff_options(args)).await?;
 
     if let Some(disposition) = attach_disposition {
         // MIME multipart assembly (byte-compatible with `git format-patch --attach`).
@@ -1847,6 +1842,50 @@ fn subject_prefix(args: &FormatPatchArgs) -> &str {
 
 fn suffix(args: &FormatPatchArgs) -> &str {
     args.suffix.as_deref().unwrap_or(DEFAULT_SUFFIX)
+}
+
+/// Render a commit's diffstat and patch body through the `libra diff` engine.
+///
+/// Renames are detected by default and follow `diff.renames`; root commits keep
+/// the previous generator because the engine has no empty-tree side.
+async fn diff_engine_patch_parts(
+    commit: &Commit,
+    args: &FormatPatchArgs,
+) -> Result<(String, String), CliError> {
+    if let Some(parent) = commit.parent_commit_ids.first() {
+        // `DiffArgs` keeps private bookkeeping fields, so build it through its
+        // clap definition like the CLI does.
+        let mut argv: Vec<String> = vec!["diff".to_string()];
+        if args.histogram {
+            argv.push("--histogram".to_string());
+        }
+        if args.full_index {
+            argv.push("--full-index".to_string());
+        }
+        if let Some(prefix) = &args.src_prefix {
+            argv.push(format!("--src-prefix={prefix}"));
+        }
+        if let Some(prefix) = &args.dst_prefix {
+            argv.push(format!("--dst-prefix={prefix}"));
+        }
+        argv.push(parent.to_string());
+        argv.push(commit.id.to_string());
+        let diff_args = crate::command::diff::DiffArgs::try_parse_from(&argv)
+            .map_err(|error| CliError::command_usage(error.to_string()))?;
+        let output = crate::command::diff::run_diff_for_service(diff_args).await?;
+        let stat = crate::command::diff::render::format_diff_stat_output(&output);
+        let mut patch = crate::command::diff::render::format_unified_diff(&output);
+        if !patch.is_empty() && !patch.ends_with('\n') {
+            patch.push('\n');
+        }
+        return Ok((stat, patch));
+    }
+    let mut stat = String::new();
+    if let Ok(stats) = log::compute_commit_stat(commit, vec![]).await {
+        stat = format_diffstat_plain(&stats);
+    }
+    let patch = log::generate_diff_with_options(commit, vec![], &commit_diff_options(args)).await?;
+    Ok((stat, patch))
 }
 
 fn commit_diff_options(args: &FormatPatchArgs) -> log::CommitDiffOptions {

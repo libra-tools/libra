@@ -626,7 +626,7 @@ pub(super) fn patch_has_no_content_change(file: &DiffFileStat) -> bool {
     !new_id.is_empty() && new_id.chars().all(|c| c == '0')
 }
 
-pub(super) fn format_unified_diff(result: &DiffOutput) -> String {
+pub(crate) fn format_unified_diff(result: &DiffOutput) -> String {
     result
         .files
         .iter()
@@ -678,7 +678,7 @@ pub(super) fn format_diff_shortstat_output(result: &DiffOutput) -> String {
     line
 }
 
-pub(super) fn format_diff_stat_output(result: &DiffOutput) -> String {
+pub(crate) fn format_diff_stat_output(result: &DiffOutput) -> String {
     format_diff_stat_output_with_compact(result, false)
 }
 

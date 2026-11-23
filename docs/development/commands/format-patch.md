@@ -97,3 +97,5 @@ flowchart TD
 ### `-k` 的 CLI 冲突检查（FP-03）
 
 在配置填充 `subject_prefix` 前检查显式参数：`-k` 与 `-n`、非空 `--rfc`、显式 `--subject-prefix`（包括空值）互斥，以 `fatal` + `LBR-CLI-002` 退出 129（Git 为 128），且在创建目录、写补丁或 stdout 之前失败。配置 `format.subjectPrefix` 不冲突；`--rfc=` 和 `--rfc --no-rfc` 可与 `-k` 并用。测试 `fp03_*` 分别验证消息、稳定码、退出码、空 stdout、完整文件快照、JSON 与 machine 输出，并核对测试集合。
+
+- 2026-11-23（FP-05 / #529）：补丁正文与 diffstat 改由 `libra diff` 引擎生成（`diff_engine_patch_parts`，经 clap 构造 `DiffArgs` 调 `run_diff_for_service`；根提交保留旧生成器）；默认按 `diff.renames` 检测重命名；`run_diff_for_service` 现在与 CLI 一样应用 `--src-prefix`/`--dst-prefix`。回归：`pure_rename_is_detected_by_default`、`stat_block_matches_libra_diff_stat`、`partial_rename_is_detected_by_default`、`diff_renames_false_disables_detection`、`rename_patch_applies_with_git_am`、`rename_patch_applies_with_libra_am`，以及既有 `format_patch_test` 114/114 与 mail roundtrip 13/13。

@@ -677,3 +677,70 @@ fn git_format_patch_attach_applies_with_libra_am() {
             .contains("git attach change")
     );
 }
+
+#[test]
+fn rename_patch_applies_with_git_am() {
+    let fixture = Fixture::new();
+    let source = fixture.init_libra("libra-rename-source");
+    fs::write(source.join("lorem"), "lorem\nipsum\ndolor\nsit\namet\n").expect("write lorem");
+    fixture.libra_success(&source, &["add", "lorem"]);
+    fixture.libra_success(&source, &["commit", "-m", "base", "--no-verify"]);
+    fixture.libra_success(&source, &["mv", "lorem", "ipsum"]);
+    fixture.libra_success(&source, &["commit", "-m", "rename only", "--no-verify"]);
+
+    let patch = fixture.libra_success(&source, &["format-patch", "-1", "--stdout"]);
+    let mail = String::from_utf8(patch.stdout.clone()).expect("Libra mail is UTF-8");
+    assert!(mail.contains("rename from lorem"), "{mail}");
+    assert!(mail.contains("rename to ipsum"), "{mail}");
+
+    let target = fixture.init_git("git-rename-target");
+    fs::write(target.join("lorem"), "lorem\nipsum\ndolor\nsit\namet\n").expect("write git lorem");
+    fixture.git_success(&target, &["add", "lorem"]);
+    fixture.git_success(&target, &["commit", "-q", "-m", "base"]);
+    let patch_path = fixture.root.join("rename.patch");
+    fs::write(&patch_path, patch.stdout).expect("write rename patch");
+    fixture.git_success(
+        &target,
+        &["am", patch_path.to_str().expect("UTF-8 patch path")],
+    );
+    let target_tree = stdout_trim(&fixture.git_success(&target, &["rev-parse", "HEAD^{tree}"]));
+    let source_tree = stdout_trim(&fixture.libra_success(&source, &["rev-parse", "HEAD^{tree}"]));
+    assert_eq!(target_tree, source_tree, "git am must reproduce the tree");
+    assert_eq!(
+        fs::read_to_string(target.join("ipsum")).expect("read renamed file"),
+        "lorem\nipsum\ndolor\nsit\namet\n"
+    );
+    assert!(!target.join("lorem").exists(), "old path must be gone");
+}
+
+#[test]
+fn rename_patch_applies_with_libra_am() {
+    let fixture = Fixture::new();
+    let source = fixture.init_git("git-rename-mail-source");
+    fs::write(source.join("lorem"), "lorem\nipsum\ndolor\nsit\namet\n").expect("write lorem");
+    fixture.git_success(&source, &["add", "lorem"]);
+    fixture.git_success(&source, &["commit", "-q", "-m", "base"]);
+    fixture.git_success(&source, &["mv", "lorem", "ipsum"]);
+    fixture.git_success(&source, &["commit", "-q", "-m", "rename only"]);
+    let mbox = fixture.git_success(&source, &["format-patch", "-1", "--stdout"]);
+    let mbox_text = String::from_utf8(mbox.stdout.clone()).expect("git mail is UTF-8");
+    assert!(mbox_text.contains("rename from lorem"), "{mbox_text}");
+
+    let target = fixture.init_libra("libra-rename-target");
+    fs::write(target.join("lorem"), "lorem\nipsum\ndolor\nsit\namet\n").expect("write lorem");
+    fixture.libra_success(&target, &["add", "lorem"]);
+    fixture.libra_success(&target, &["commit", "-m", "base", "--no-verify"]);
+    let patch_path = fixture.root.join("git-rename.patch");
+    fs::write(&patch_path, mbox.stdout).expect("write git rename patch");
+    fixture.libra_success(
+        &target,
+        &["am", patch_path.to_str().expect("UTF-8 patch path")],
+    );
+    let target_tree = stdout_trim(&fixture.libra_success(&target, &["rev-parse", "HEAD^{tree}"]));
+    let source_tree = stdout_trim(&fixture.git_success(&source, &["rev-parse", "HEAD^{tree}"]));
+    assert_eq!(target_tree, source_tree, "libra am must reproduce the tree");
+    assert_eq!(
+        fs::read_to_string(target.join("ipsum")).expect("read renamed file"),
+        "lorem\nipsum\ndolor\nsit\namet\n"
+    );
+}

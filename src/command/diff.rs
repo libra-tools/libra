@@ -2,7 +2,7 @@
 
 pub(crate) mod compare;
 pub(crate) mod options;
-mod render;
+pub(crate) mod render;
 
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
@@ -1160,6 +1160,11 @@ pub(crate) async fn run_diff_for_service(mut args: DiffArgs) -> Result<DiffOutpu
         progress_preference: crate::utils::output::ProgressPreference::None,
     };
     let mut result = run_diff(&args, &output, &config, pickaxe.as_ref(), &diff_algorithm).await?;
+    // The CLI applies these after `run_diff`; service callers need the same
+    // rewriting so `--src-prefix`/`--dst-prefix` reach the rendered patch.
+    if !result.external_diff_applied {
+        apply_diff_prefixes(&mut result, &config.prefixes);
+    }
     // Same read-only sparse-view scoping as the CLI: only the pure-browsing
     // working-tree diff is filtered, never `--staged` or rev-vs-rev.
     if !result.external_diff_applied && !args.staged && args.new.is_none() {

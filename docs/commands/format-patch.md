@@ -89,6 +89,14 @@ fallback.
 
 ## Examples
 
+### Rename detection in the patch body
+
+The patch body and diffstat are produced by the same engine as `libra diff`, so
+renames are detected by default (Git's 50% threshold) and follow `diff.renames`:
+a pure rename yields `similarity index 100%` with `rename from`/`rename to` and no
+content hunk, while `diff.renames=false` emits a deletion plus an addition. The
+setting changes only the body; the commit selection is unaffected.
+
 ### Basic range
 ```bash
 # Generate patches for the last three commits

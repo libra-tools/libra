@@ -73,6 +73,10 @@ Merge commits 默认跳过。当 revision range 解析为零个提交时，命�
 
 ## 示例
 
+### 补丁正文中的重命名检测
+
+补丁正文与 diffstat 由与 `libra diff` 相同的引擎生成，默认检测重命名（Git 的 50% 阈值）并遵循 `diff.renames`：纯重命名输出 `similarity index 100%` 与 `rename from`/`rename to`，不含内容 hunk；`diff.renames=false` 则输出删除 + 新增两段。该设置只影响正文，不改变提交选择。
+
 ### 基本 range
 
 ```bash
