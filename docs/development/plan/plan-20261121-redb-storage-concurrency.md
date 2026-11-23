@@ -2580,7 +2580,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `done` / `remote-pending`
+**Lifecycle / Acceptance:** `done` / `remote-verified`
 
 **Description:** 100% 在独占目录 `src/storage/**` 内于 `src/storage/queue/frame.rs` 对头校验通过后的全帧校验路径逐字段落实并实测：`FRAME_CRC32C`、`FLAGS`、`DEDUP_KEY_LEN`、`DEDUP_KEY_UTF8` 与 `POSTCARD_ENVELOPE` 各自任一单字节翻转均精确返回 `FrameDecodeError::CorruptPayload`。
 
@@ -2637,7 +2637,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `remote-pending`
 
 **Description:** 100% 在独占目录 `src/storage/**` 内实现 `src/storage/queue/mod.rs` 的双通道安全目录初始化（`0700` 权限、`O_NOFOLLOW` 符号链接拒收、Unix 属主校验），并在全新空通道初始化（`events-*.log` 数为 `0` 且 `tail.meta`/`tail.meta.bak` 均不存在）时先原子落盘并 `fsync_dir` 初始 34 字节 `LTM2` `(min_live_seg=0, active_seg=0, committed_len=0, prefix_crc32c=0, sealed=[])` 双副本 `tail.meta` 与 `tail.meta.bak`（确保首次入队崩溃归入 Case C 而永不产生合法双缺态）。
 
@@ -2652,16 +2652,16 @@
 | 全新空通道须先预建初始 34B `LTM2` `(0,0,0,0,[])` 双副本并 `fsync_dir`，确保一切正常崩溃均至少保留 1 份有效元数据边界，从而使 0 段缺失与非空 Subcase B2 均可无条件 fail-closed | `ADR-RB-05` #3；`GC-RB-03` |
 
 **Acceptance criteria:**
-- [ ] 双通道初始化在 Unix 上以精确 `0700` 权限创建 `priority/`、`normal/`、`quarantine/` 目录。
-- [ ] 双通道初始化对符号链接队列或通道目录按 `O_NOFOLLOW` fail-closed 拒绝。
-- [ ] 双通道初始化在 Unix 上对非当前有效 UID 属主目录 fail-closed 拒绝。
-- [ ] 全新空通道初始化（`0` 个 `events-*.log` 且双副本均不存在）在创建任何段文件之前，先原子创建 `0600` 初始 34B `LTM2` `(0, 0, 0, 0, [])` `tail.meta` 与 `tail.meta.bak`。
-- [ ] 上述初始双副本创建完成后立即执行 `fsync_dir(lane_dir)` 确保持久落盘。
+- [x] 双通道初始化在 Unix 上以精确 `0700` 权限创建 `priority/`、`normal/`、`quarantine/` 目录。
+- [x] 双通道初始化对符号链接队列或通道目录按 `O_NOFOLLOW` fail-closed 拒绝。
+- [x] 双通道初始化在 Unix 上对非当前有效 UID 属主目录 fail-closed 拒绝。
+- [x] 全新空通道初始化（`0` 个 `events-*.log` 且双副本均不存在）在创建任何段文件之前，先原子创建 `0600` 初始 34B `LTM2` `(0, 0, 0, 0, [])` `tail.meta` 与 `tail.meta.bak`。
+- [x] 上述初始双副本创建完成后立即执行 `fsync_dir(lane_dir)` 确保持久落盘。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --no-default-features --features storage-redb,storage-queue --lib -E 'test(=storage::queue::tests::dual_lane_directory_permissions_nofollow_owner_and_initial_meta)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=storage::queue::tests::dual_lane_directory_permissions_nofollow_owner_and_initial_meta)'`（new，覆盖 AC1–AC5）
-- [ ] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 3 文件实现白名单。
+- [x] `source .env.test && cargo nextest list --no-default-features --features storage-redb,storage-queue --lib -E 'test(=storage::queue::tests::dual_lane_directory_permissions_nofollow_owner_and_initial_meta)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=storage::queue::tests::dual_lane_directory_permissions_nofollow_owner_and_initial_meta)'`（new，覆盖 AC1–AC5）
+- [x] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 3 文件实现白名单。
 
 **Full-suite trigger:** `none`
 
@@ -10044,8 +10044,9 @@
 | `RB-07g` | `done` / `remote-verified` | `69b7539`（`main`） | `0.30.333` | 2026-11-23 02:50 UTC：Stage 1 精确 3 文件写集（`src/storage/mod.rs`、`src/storage/queue/{mod,frame}.rs`），在 `frame.rs` 落地 `MAX_FRAME_DEDUP_KEY_LEN = 512`、`MAX_FRAME_PAYLOAD_LEN = 4 MiB`、`MIN_FRAME_BODY_LEN = 3`、`MAX_FRAME_BODY_LEN == 3 + 512 + 4 MiB` 编译期断言、`validate_frame_body_len` 分配前上下界守卫、解码后组件级上限守卫（杜绝总长合法帧偷渡超限键/负载）以及有界流式 `BoundedEnvelopeWriter` + `postcard::to_io`（峰值缓冲严格钉定 `4 MiB`、超限立停防 OOM）；`--no-default-features --features storage-redb` `storage::queue::frame::` 2/2（含精确 `512 B + 4 MiB` 往返、超限拒收、`1 GiB` 虚拟流早停、`FRAME_BODY_LEN ∈ {0,1,2}` 与超上限 `CorruptHeader`、组件级超限拒收）、单特性零告警、fmt、严格 clippy、`compat_version_surface_sync` 与 Codex R2 `VERDICT: PASS` 全绿 |
 | `RB-07c` | `done` / `remote-verified` | `049350c`（`main`） | `0.30.334` | 2026-11-23 03:07 UTC：Stage 1 精确 3 文件写集（`src/storage/mod.rs`、`src/storage/queue/{mod,frame}.rs`），实现栈上零分配头校验 `parse_and_verify_header`、顺序流解码器 `FrameStreamDecoder`/`FrameStreamItem`（含分块有界读体 `read_body_bounded` 与全错误粘性毒化 `terminal_error` 防重试误报 `CleanEof`/错位读体）；`--no-default-features --features storage-redb` `storage::queue::frame::` 3/3（`acknowledged_frame_each_header_field_bitflip_rejected_pre_alloc` 以 `PreAllocSpyReader` 实证 `MAGIC` 4B / `FRAME_BODY_LEN` 界内与超大两态 4B / `HEADER_CRC32C` 4B / 伪造魔数 / 第 2 帧中段坏头 / 精确 16B 尾坏头全部零体分配、零越界读体且粘性拒收）、单特性零告警、fmt、严格 clippy、`compat_version_surface_sync` 全绿；Codex R1 P1 粘性毒化已闭环并经 R2 确认，R2 所提非帧头路径（`TruncatedTail`/`CorruptPayload`）重试测试归属紧邻下游 `RB-07f`/`RB-07d` 承接，依用户授权跳过继续推进；已推 `origin/main` |
 | `RB-07f` | `done` / `remote-verified` | `9c74dfa`（`main`） | `0.30.335` | 2026-11-23 03:36 UTC：Stage 1 精确 3 文件写集内仅改动 `src/storage/queue/frame.rs`，落实强制可信边界 `FrameStreamDecoder`（`new(reader, total_len)`、`with_known_len`、`from_seekable`）与 `ADR-RB-05` #2 分配前剩余长度强校验（任一构造器在 `remaining < FRAME_BODY_LEN` 含 4 MiB 仅缺末字节场景均零体分配、零读体即报 `TruncatedTail`），同时对未达 `end_offset` 即耗尽的底层流严格 fail-closed 报 `TruncatedTail`（绝不误报 `CleanEof`）并粘性毒化；`--no-default-features --features storage-redb` `storage::queue::frame::` 4/4（`seq_decoder_distinguishes_clean_eof_and_truncated_tail_variants` 覆盖 0B 空流、4 帧多块/1B+EINTR 合法流、半体与 4 MiB 缺 1B、并发缩尾安全网、提前耗尽流、I/O 粘性毒化及 `1..=15`B 合法前缀与非魔数半头穷举）、单特性零告警、fmt、严格 `--lib` clippy、`compat_version_surface_sync` 全绿；Codex R1/R2 全部 P1 均已闭环，R3 获 `VERDICT: PASS`；已推 `origin/main` |
-| `RB-07d` | `done` / `remote-pending` | 本提交（`main`） | `0.30.336` | 2026-11-23 03:46 UTC：Stage 1 精确 3 文件写集内仅改动 `src/storage/queue/frame.rs`，在 `verify_and_decode_body` 补齐定长头下限零 panic 防护，并新增 `acknowledged_frame_each_body_and_crc_field_bitflip_rejected` 穷举覆盖 `FRAME_CRC32C`（12..16）、`FLAGS`（16）、`DEDUP_KEY_LEN`（17..19）、`DEDUP_KEY_UTF8`（19..19+K）与 `POSTCARD_ENVELOPE`（19+K..end，含 24 KiB 多块负载首/中/末字节）全部 5 字段逐字节翻转（头校验均合法通过、`decode_frame` 与 `FrameStreamDecoder` 独立/中段含后续帧均报 `CorruptPayload` 并粘性毒化、脱敏 `LBR-IO-001` 零密钥/负载泄露）；`--no-default-features --features storage-redb` `storage::queue::frame::` 5/5、fmt、严格 `--lib` clippy、`compat_version_surface_sync` 全绿；Codex R1 首轮 `VERDICT: PASS`（P0=0、P1=0） |
-| `RB-07b`..`RB-34c`（剩余 121 卡） | `pending` | — | — | Phase 2 推进中，按实施顺序于 `main` 逐卡推进 |
+| `RB-07d` | `done` / `remote-verified` | `8315d51`（`main`） | `0.30.336` | 2026-11-23 03:46 UTC：Stage 1 精确 3 文件写集内仅改动 `src/storage/queue/frame.rs`，在 `verify_and_decode_body` 补齐定长头下限零 panic 防护，并新增 `acknowledged_frame_each_body_and_crc_field_bitflip_rejected` 穷举覆盖 `FRAME_CRC32C`（12..16）、`FLAGS`（16）、`DEDUP_KEY_LEN`（17..19）、`DEDUP_KEY_UTF8`（19..19+K）与 `POSTCARD_ENVELOPE`（19+K..end，含 24 KiB 多块负载首/中/末字节）全部 5 字段逐字节翻转（头校验均合法通过、`decode_frame` 与 `FrameStreamDecoder` 独立/中段含后续帧均报 `CorruptPayload` 并粘性毒化、脱敏 `LBR-IO-001` 零密钥/负载泄露）；`--no-default-features --features storage-redb` `storage::queue::frame::` 5/5、fmt、严格 `--lib` clippy、`compat_version_surface_sync` 全绿；Codex R1 首轮 `VERDICT: PASS`（P0=0、P1=0）；已推 `origin/main` |
+| `RB-07b` | `done` / `remote-pending` | 本提交（`main`） | `0.30.337` | 2026-11-23 04:18 UTC：Stage 1 精确 3 文件写集内仅改动 `src/storage/{mod.rs,queue/mod.rs}`，实现 `LTM2` 34B–4130B 双副本线协议编解码（`LaneTailMeta`/`SealedSegmentMeta`/`Ltm2CodecError`）与句柄级零 TOCTOU 双通道初始化（`private/`/`capture-queue/`/`priority/`/`normal/`/`quarantine/` 精确 `0700` + `O_NOFOLLOW` + 有效 UID 属主校验，零按名 `fchmodat`）；经两步 `O_NOFOLLOW`/`O_CREAT\|O_EXCL\|O_NOFOLLOW` 共享 `append.lock`（消除 macOS XNU 并发 `O_CREAT\|O_NOFOLLOW` `ENOENT` 竞态）串行化空通道判新（原始字节匹配 `events-*.log` 含 `events-.log`/`events-\xff.log`）与 34B `0600` `LTM2` `(0,0,0,0,[])` `tail.meta`/`tail.meta.bak` 原子无覆写发布 + 立即 `fsync_dir(lane_dir)`（Windows 走 `MoveFileExW(MOVEFILE_WRITE_THROUGH)`，其它平台 fail-closed）；`--no-default-features --features storage-redb,storage-queue` `storage::queue::` 6/6（`dual_lane_directory_permissions_nofollow_owner_and_initial_meta` 覆盖 AC1–AC5、8 线程并发竞争、持锁写者交错、`fsync_dir` 注入失败、非空通道保留与 `LTM2` 0..=256 边界）、三构型特性矩阵、fmt、严格 `--lib` clippy、`compat_version_surface_sync` 全绿；Codex R1（4×P1）与 R2（1×P1）全部闭环，R3 获 `VERDICT: PASS` |
+| `RB-07e`..`RB-34c`（剩余 120 卡） | `pending` | — | — | Phase 2 推进中，按实施顺序于 `main` 逐卡推进 |
 
 ## Codex review log
 

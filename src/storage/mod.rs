@@ -173,13 +173,23 @@ pub use opener::{
 };
 #[cfg(feature = "storage-queue")]
 pub use queue::{
-    DecodedFrame, FRAME_BODY_FIXED_OVERHEAD, FRAME_FLAG_NONE, FRAME_FLAG_PRIORITY,
-    FRAME_HEADER_LEN, FRAME_MAGIC, FrameDecodeError, FrameEncodeError, FrameStreamDecoder,
-    FrameStreamItem, MAX_FRAME_BODY_LEN, MAX_FRAME_DEDUP_KEY_LEN, MAX_FRAME_PAYLOAD_LEN,
-    MIN_FRAME_BODY_LEN, ParsedFrameHeader, crc32c_append, crc32c_checksum, decode_frame,
-    decode_postcard_payload, encode_frame, encode_postcard_frame, parse_and_verify_header,
-    validate_frame_body_len,
+    CAPTURE_QUEUE_OWNER_ERROR_PREFIX, CAPTURE_QUEUE_SUBDIR, CAPTURE_QUEUE_SYMLINK_ERROR_PREFIX,
+    CaptureQueueInitReport, CaptureQueuePaths, DecodedFrame, FRAME_BODY_FIXED_OVERHEAD,
+    FRAME_FLAG_NONE, FRAME_FLAG_PRIORITY, FRAME_HEADER_LEN, FRAME_MAGIC, FrameDecodeError,
+    FrameEncodeError, FrameStreamDecoder, FrameStreamItem, LTM2_HEADER_LEN, LTM2_MAGIC,
+    LTM2_MAX_LEN, LTM2_MIN_LEN, LTM2_SEALED_ENTRY_LEN, LTM2_TRAILER_LEN, LTM2_VERSION,
+    LaneInitOutcome, LaneTailMeta, Ltm2CodecError, MAX_FRAME_BODY_LEN, MAX_FRAME_DEDUP_KEY_LEN,
+    MAX_FRAME_PAYLOAD_LEN, MAX_SEALED_SEGMENTS, MIN_FRAME_BODY_LEN, ParsedFrameHeader,
+    QUEUE_APPEND_LOCK_FILE, QUEUE_LANE_NORMAL_DIR, QUEUE_LANE_PRIORITY_DIR, QUEUE_QUARANTINE_DIR,
+    QUEUE_TAIL_META_BAK_FILE, QUEUE_TAIL_META_FILE, SealedSegmentMeta, crc32c_append,
+    crc32c_checksum, decode_frame, decode_postcard_payload, encode_frame, encode_postcard_frame,
+    init_capture_queue, init_capture_queue_at_root, is_capture_queue_owner_mismatch_error,
+    is_capture_queue_symlink_rejected_error, matches_segment_log_glob,
+    matches_segment_log_glob_bytes, parse_and_verify_header, segment_log_file_name,
+    tail_meta_bak_path, tail_meta_path, validate_frame_body_len,
 };
+#[cfg(all(feature = "storage-queue", unix))]
+pub use queue::{QUEUE_DIR_MODE, QUEUE_FILE_MODE};
 #[cfg(feature = "storage-redb")]
 pub use redb::RedbConfigStore;
 #[cfg(feature = "storage-sqlite")]
