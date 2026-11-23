@@ -1480,7 +1480,7 @@
 
 ### Task DESC-11: describe 后缀家族 `REL-DESC-09` 发布点
 
-**Task type:** `release` | **Lifecycle / Acceptance:** `pending` / `空` | **Priority / Selection:** P1；`#798`/`#799` 往返前置的首个对外发布 | **Issue:** [#798](https://github.com/libra-tools/libra/issues/798)、[#799](https://github.com/libra-tools/libra/issues/799)
+**Task type:** `release` | **Lifecycle / Acceptance:** `done` / `complete`（2026-11-23：`REL-DESC-09` 随 **v0.30.329** 发布。describe 后缀家族（`DESC-01a`/`02`/`03`/`09`/`09a`–`09c`/`10`/`10a`–`10k`）实现已全部在树内并于同版本发布；发布门与 `CL-25` 共用同一份证据：fmt ✅、严格 Clippy ✅、release 构建 ✅、全量 nextest 12240 全通过（EXIT=0）、站点零漂移；annotated tag `v0.30.329` + `gh release create` 已执行（https://github.com/libra-tools/libra/releases/tag/v0.30.329 ）。**已知外部门**：`main` 的 CI 因 self-hosted runner 缺 `cargo`/`rustup`（exit 127）失败，属基础设施问题。
 
 **Description:** `REL-DESC-09` 的唯一发布点（G-08）。不引入新行为：在包含 `DESC-09`、`DESC-09b`、`DESC-09c`、`DESC-09a`、`DESC-10`、`DESC-10a`、`DESC-10b`、`DESC-10c`、`DESC-10d`、`DESC-10e`、`DESC-10f`、`DESC-10g`、`DESC-10h`、`DESC-10i`、`DESC-10j`、`DESC-10k` 十六张子卡全部本地签名提交的最终合树上，执行聚合守卫、发布说明本地核对与完整 C 组（`patch + 1`、版本面同步、工具链刷新 `Cargo.lock`、T-2 双环境全量 nextest、fmt、clippy、`cargo build --release`、签名+DCO 提交、PR 与合入核验、以 `--notes "$NOTES"` 的 `gh release create "v${VERSION}" --target "$MERGE_SHA" --title "v${VERSION}"`）及 D 组（含发布后以 `gh release view` 复核发布说明）；文档方面只做 `ADR-DESC-04` 规定的两步：ER-05 评审前删除 EN 文档中的 `S_U`（AC5），D 组全绿后同步网站并核验线上不再含 `S_U`（AC6）；不改变命令行为。
 
