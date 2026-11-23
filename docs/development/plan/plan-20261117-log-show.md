@@ -1760,7 +1760,7 @@ PY
 
 ### Task LS-31: `diff` 新增 `--color-moved-ws` 空白模式（#970；自 LS-22 拆出；拆出 LS-35）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `in-progress` / `partially-accepted`（2026-11-23 第一段：`DiffArgs` 新增 `--color-moved-ws`（逗号分隔、可重复），`options::ColorMovedWs` + `parse_color_moved_ws` 实现 `no`（清空此前模式）/`ignore-space-at-eol`/`ignore-space-change`/`ignore-all-space`，解析结果进入 `ResolvedDiffConfig` 供后续复用；未知模式 `LBR-CLI-002`。AC1（无该选项时保持普通着色）、AC5（`=no` 与无选项逐字相同）、AC6（`ignore-all-space,no` 与无选项逐字相同）由 `command::log_test::color_moved_ws_modes_parse_and_clear` 覆盖。**剩余**：AC2/AC3/AC4/AC7 需要在 `render.rs` 的移动行匹配时按模式归一化空白（`color_moved_active`/`colorize_diff` 路径），随后 AC2 的 Veol、AC3/AC7 的 Vchg、AC4 的 Vall 才可能被识别为移动；同时 `LS-35` 的 `allow-indentation-change` 复用同一能力。`log_test` 284/284。
 
 **Description:** 在 `src/command/diff.rs` 与 `src/command/diff/render.rs:782` 新增 `--color-moved-ws=<modes>` 解析（`no`、`ignore-space-at-eol`、`ignore-space-change`、`ignore-all-space`，逗号组合；`no` 清除此前模式，与 Git `diff.c` 一致）与移动行空白归一化，供 `libra diff` 直接使用并作为 `pub(crate)` 能力留待 `LS-22` 在 `log` 复用。拆出 `LS-35`（`allow-indentation-change`）。
 

@@ -9311,3 +9311,57 @@ fn diff_unified_context_passthrough() {
     let stderr = String::from_utf8_lossy(&bad.stderr);
     assert!(stderr.contains("LBR-CLI-002"), "AC3 code: {stderr}");
 }
+
+#[test]
+fn color_moved_ws_modes_parse_and_clear() {
+    use super::{assert_cli_success, run_libra_command};
+
+    // Fixture: a move candidate (a line deleted above, re-added below).
+    let work = tempfile::tempdir().expect("work dir");
+    let repo = work.path().join("r");
+    std::fs::create_dir_all(&repo).expect("mkdir repo");
+    assert_cli_success(&run_libra_command(&["init"], &repo), "init");
+    run_libra_command(&["config", "set", "user.name", "t"], &repo);
+    run_libra_command(&["config", "set", "user.email", "t@t"], &repo);
+    std::fs::write(repo.join("f.txt"), "keep\nmoved\nkeep2\nkeep3\nkeep4\n").expect("write base");
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], &repo), "add base");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c1", "--no-verify"], &repo),
+        "commit c1",
+    );
+    std::fs::write(repo.join("f.txt"), "keep\nkeep2\nkeep3\nkeep4\nmoved\n").expect("write move");
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], &repo), "add move");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c2", "--no-verify"], &repo),
+        "commit c2",
+    );
+
+    let out = |args: &[&str]| {
+        let mut argv = vec!["diff", "--color=always", "--color-moved"];
+        argv.extend_from_slice(args);
+        argv.push("HEAD~1");
+        argv.push("HEAD");
+        let result = run_libra_command(&argv, &repo);
+        assert_cli_success(&result, &format!("diff {argv:?}"));
+        result.stdout
+    };
+
+    // AC1: without the option the output stays the plain coloured diff.
+    let plain = out(&[]);
+    assert!(!plain.is_empty(), "AC1 coloured diff");
+    // AC5: `=no` equals the option-less output byte for byte.
+    assert_eq!(out(&["--color-moved-ws=no"]), plain, "AC5 =no");
+    // AC6: a later `no` clears earlier modes.
+    assert_eq!(
+        out(&["--color-moved-ws=ignore-all-space,no"]),
+        plain,
+        "AC6 trailing no"
+    );
+    // Unknown mode is a usage error.
+    let bad = run_libra_command(&["diff", "--color-moved-ws=bogus", "HEAD~1", "HEAD"], &repo);
+    assert!(!bad.status.success(), "unknown mode must fail");
+    assert!(
+        String::from_utf8_lossy(&bad.stderr).contains("LBR-CLI-002"),
+        "unknown mode code"
+    );
+}

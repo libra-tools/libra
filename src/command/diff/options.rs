@@ -3,7 +3,15 @@ use super::{DiffArgs, DiffError};
 const DEFAULT_CONTEXT: usize = 3;
 const DEFAULT_RENAME_SCORE: u32 = 30000;
 
-#[derive(Clone)]
+/// Whitespace rules applied while matching moved lines
+/// (`--color-moved-ws`, ADR shared with `LS-35`).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ColorMovedWs {
+    pub(crate) at_eol: bool,
+    pub(crate) space_change: bool,
+    pub(crate) all_space: bool,
+}
+
 pub(crate) struct ResolvedDiffConfig {
     pub(super) context: usize,
     pub(super) rename_threshold: Option<u32>,
@@ -13,6 +21,8 @@ pub(crate) struct ResolvedDiffConfig {
     /// `diff.renameComparisonBudget`: total inexact similarity comparisons;
     /// `None` (unset or `0`) keeps diff unlimited (plan-20260714 §B.7).
     pub(super) rename_comparison_budget: Option<u64>,
+    /// Whitespace modes for moved-line detection.
+    pub(super) color_moved_ws: ColorMovedWs,
     pub(super) prefixes: DiffPrefixes,
 }
 
@@ -20,6 +30,26 @@ pub(crate) struct ResolvedDiffConfig {
 pub(super) struct DiffPrefixes {
     pub(super) source: String,
     pub(super) destination: String,
+}
+
+/// Parse `--color-moved-ws` values; `no` clears every earlier mode.
+pub(crate) fn parse_color_moved_ws(values: &[String]) -> Result<ColorMovedWs, DiffError> {
+    let mut modes = ColorMovedWs::default();
+    for value in values {
+        match value.as_str() {
+            "no" => modes = ColorMovedWs::default(),
+            "ignore-space-at-eol" => modes.at_eol = true,
+            "ignore-space-change" => modes.space_change = true,
+            "ignore-all-space" => modes.all_space = true,
+            other => {
+                return Err(DiffError::InvalidDiffConfig {
+                    key: "color-moved-ws",
+                    value: other.to_string(),
+                });
+            }
+        }
+    }
+    Ok(modes)
 }
 
 /// Resolve every supported `diff.*` default before progress or diff scanning.
@@ -43,11 +73,13 @@ pub(super) async fn resolve_diff_config(args: &DiffArgs) -> Result<ResolvedDiffC
         .await?
         .unwrap_or(super::DEFAULT_RENAME_LIMIT);
     let rename_comparison_budget = configured_diff_rename_comparison_budget().await?;
+    let color_moved_ws = parse_color_moved_ws(&args.color_moved_ws)?;
     Ok(ResolvedDiffConfig {
         context,
         rename_threshold,
         rename_limit,
         rename_comparison_budget,
+        color_moved_ws,
         prefixes,
     })
 }

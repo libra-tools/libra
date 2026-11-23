@@ -439,6 +439,12 @@ pub struct DiffArgs {
     )]
     pub color_moved: Option<String>,
 
+    /// Whitespace rules for moved-line detection (`--color-moved-ws=<modes>`):
+    /// `no`, `ignore-space-at-eol`, `ignore-space-change`, `ignore-all-space`,
+    /// comma-separated; `no` clears every earlier mode.
+    #[clap(long = "color-moved-ws", value_name = "modes", value_delimiter = ',')]
+    pub color_moved_ws: Vec<String>,
+
     /// Do not color moved lines differently from added/removed lines (the default;
     /// countermands an earlier `--color-moved`).
     #[clap(long = "no-color-moved", overrides_with = "color_moved")]
@@ -5433,6 +5439,7 @@ pub(crate) async fn staged_diff_text() -> Result<String, DiffError> {
         no_color_moved: false,
         find_renames: None,
         no_renames: false,
+        color_moved_ws: Vec::new(),
         no_relative: false,
         relative: None,
         no_indent_heuristic: false,
