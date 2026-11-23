@@ -221,6 +221,7 @@ pub struct LaneRecoveryReport {
     pub cleaned_tmp_files: usize,
     pub cleaned_quarantine_tmp_files: usize,
     pub reclaimed_orphans_removed: usize,
+    pub quarantined_artifacts: Vec<QuarantinePublishReport>,
 }
 
 // ============================================================================
@@ -337,19 +338,20 @@ enum Phase1Plan<T> {
         stale_tmp_names: Vec<T>,
         reclaimed_orphans: Vec<u32>,
     },
-    /// Case D (clean old segment + clean valid successor `S + 1`):
+    /// Case D (clean old segment + valid successor `S + 1`, optionally
+    /// followed by an uncommitted trailing half-frame `[succ_valid_end, actual_len)`):
     /// `max_live_seg == active_seg + 1`, old segment `S` satisfies
     /// `actual_len(S) == committed_len > 0` with `[0, committed_len)` prefix
     /// CRC32C verified, `meta.sealed.len() < MAX_SEALED_SEGMENTS`, and
-    /// `events-<S+1>.log` decodes cleanly from offset `0` to `succ_valid_end`
-    /// with `>= 1` valid dual-CRC32C frame and zero damaged tail bytes
-    /// (`ADR-RB-05` #3 Case D, `RB-08d` AC3–AC7).
-    CaseDRecoverCleanSuccessor {
+    /// `events-<S+1>.log` decodes `>= 1` valid dual-CRC32C frame from offset `0`
+    /// to `succ_valid_end` (`ADR-RB-05` #3 Case D, `RB-08d` AC3–AC7, `RB-08u` AC1–AC7).
+    CaseDRecoverValidSuccessor {
         meta: LaneTailMeta,
         succ_seg: u32,
         succ_valid_end: u64,
         succ_crc32c: u32,
         succ_frames: usize,
+        succ_has_damaged_tail: bool,
         stale_tmp_names: Vec<T>,
         reclaimed_orphans: Vec<u32>,
     },
@@ -1110,11 +1112,12 @@ fn scan_successor_segment_readonly(
     })
 }
 
-/// Apply Phase 1 read-only classification rules for base Case D (`RB-08d`):
-/// validates `MAX_SEALED_SEGMENTS` illegal full-table state first (before any
-/// mutation), forbids sealing a 0-byte old segment, and enforces scope guards
-/// for downstream `RB-08k` (nested Case C→D), `RB-08f` (empty/half-frame orphan),
-/// and `RB-08u` (valid successor with trailing half-frame).
+/// Apply Phase 1 read-only classification rules for Case D valid successor
+/// recovery (`RB-08d` clean successor + `RB-08u` valid successor with trailing
+/// uncommitted half-frame): validates `MAX_SEALED_SEGMENTS` illegal full-table
+/// state first (before any mutation), forbids sealing a 0-byte old segment, and
+/// enforces scope guards for downstream `RB-08k` (nested Case C→D) and `RB-08f`
+/// (empty/half-frame orphan).
 fn classify_case_d_base_readonly(
     meta: &LaneTailMeta,
     old_actual_len: u64,
@@ -1145,13 +1148,6 @@ fn classify_case_d_base_readonly(
         return Err(StorageBackendError::CorruptCommittedFrame {
             detail:
                 "Case D: valid successor segment exists while old active segment is empty (0 bytes)"
-                    .to_string(),
-        });
-    }
-    if succ_scan.has_damaged_tail {
-        return Err(StorageBackendError::BackendInternal {
-            detail:
-                "Case D: valid successor segment has trailing uncommitted half-frame requiring RB-08u quarantine recovery"
                     .to_string(),
         });
     }
@@ -2098,12 +2094,13 @@ mod unix_seg {
                 open_segment_readonly_nofollow(lane_fd, succ_seg, expected_uid)?;
             let succ_scan = scan_successor_segment_readonly(&mut succ_file, succ_actual_len)?;
             classify_case_d_base_readonly(&meta, actual_len, &succ_scan)?;
-            return Ok(Phase1Plan::CaseDRecoverCleanSuccessor {
+            return Ok(Phase1Plan::CaseDRecoverValidSuccessor {
                 meta,
                 succ_seg,
                 succ_valid_end: succ_scan.valid_end,
                 succ_crc32c: succ_scan.valid_crc32c,
                 succ_frames: succ_scan.frame_count,
+                succ_has_damaged_tail: succ_scan.has_damaged_tail,
                 stale_tmp_names: scan.stale_tmp_names,
                 reclaimed_orphans,
             });
@@ -2456,15 +2453,26 @@ mod unix_seg {
         mirrored_replica: bool,
         cleaned_tmp_files: usize,
         reclaimed_orphans_removed: usize,
+        quarantined_artifacts: Vec<QuarantinePublishReport>,
+    }
+
+    struct UnixPhase2Context<'a> {
+        lane: CaptureQueueLane,
+        lane_fd: &'a OwnedFd,
+        quarantine_fd: &'a OwnedFd,
+        quarantine_dir: &'a Path,
+        owners: UnixExpectedQueueOwners,
+        append_lock: &'a AppendLockGuard,
     }
 
     fn phase2_execute_plan_unix(
-        lane_fd: &OwnedFd,
-        lane_label: &'static str,
+        ctx: &UnixPhase2Context<'_>,
         plan: Phase1Plan<OsString>,
-        expected_uid: u32,
         observer: &mut SegmentObserver,
     ) -> StorageResult<Phase2ConvergedState> {
+        let lane_fd = ctx.lane_fd;
+        let lane_label = lane_dir_name(ctx.lane);
+        let expected_uid = lane_expected_uid(ctx.owners, ctx.lane);
         match plan {
             Phase1Plan::Case0aFreshEmpty { stale_tmp_names } => {
                 let cleaned_tmp_files =
@@ -2479,6 +2487,7 @@ mod unix_seg {
                     mirrored_replica: false,
                     cleaned_tmp_files,
                     reclaimed_orphans_removed: 0,
+                    quarantined_artifacts: Vec::new(),
                 })
             }
             Phase1Plan::Case0bPreInitializedEmpty {
@@ -2504,6 +2513,7 @@ mod unix_seg {
                     mirrored_replica,
                     cleaned_tmp_files,
                     reclaimed_orphans_removed: 0,
+                    quarantined_artifacts: Vec::new(),
                 })
             }
             Phase1Plan::CaseAClean {
@@ -2532,6 +2542,7 @@ mod unix_seg {
                     mirrored_replica,
                     cleaned_tmp_files,
                     reclaimed_orphans_removed,
+                    quarantined_artifacts: Vec::new(),
                 })
             }
             Phase1Plan::CaseCRecoverCleanTail {
@@ -2580,14 +2591,16 @@ mod unix_seg {
                     mirrored_replica: true,
                     cleaned_tmp_files,
                     reclaimed_orphans_removed,
+                    quarantined_artifacts: Vec::new(),
                 })
             }
-            Phase1Plan::CaseDRecoverCleanSuccessor {
+            Phase1Plan::CaseDRecoverValidSuccessor {
                 meta,
                 succ_seg,
                 succ_valid_end,
                 succ_crc32c,
                 succ_frames,
+                succ_has_damaged_tail,
                 stale_tmp_names,
                 reclaimed_orphans,
             } => {
@@ -2595,6 +2608,27 @@ mod unix_seg {
                     clean_stale_tmp_files_unix(lane_fd, &stale_tmp_names, expected_uid)?;
                 let reclaimed_orphans_removed =
                     clean_reclaimed_orphans_unix(lane_fd, &reclaimed_orphans, expected_uid)?;
+                let mut quarantined_artifacts = Vec::new();
+                if succ_has_damaged_tail {
+                    // `RB-08u` AC1–AC7: mandatory durable quarantine barrier via
+                    // `RB-08t::quarantine_and_truncate_segment_at_fds` BEFORE
+                    // truncating `events-<S+1>.log` to `succ_valid_end` + `sync_data()`.
+                    let q_dirs = UnixQuarantineDirs {
+                        quarantine_fd: ctx.quarantine_fd,
+                        quarantine_dir: ctx.quarantine_dir,
+                        lane_fd,
+                        owners: ctx.owners,
+                        append_lock: ctx.append_lock,
+                    };
+                    let q_report = quarantine_and_truncate_segment_at_fds(
+                        &q_dirs,
+                        ctx.lane,
+                        succ_seg,
+                        succ_valid_end,
+                        observer,
+                    )?;
+                    quarantined_artifacts.push(q_report);
+                }
                 let next_meta = build_case_d_sealed_successor_meta(
                     &meta,
                     succ_seg,
@@ -2623,6 +2657,7 @@ mod unix_seg {
                     mirrored_replica: true,
                     cleaned_tmp_files,
                     reclaimed_orphans_removed,
+                    quarantined_artifacts,
                 })
             }
         }
@@ -3504,6 +3539,7 @@ mod unix_seg {
 
     fn append_under_root_fd_unix(
         root_fd: &OwnedFd,
+        quarantine_dir: &Path,
         lane: CaptureQueueLane,
         frame_buf: &[u8],
         owners: UnixExpectedQueueOwners,
@@ -3521,10 +3557,18 @@ mod unix_seg {
 
         // Phase 2: clean lane-scoped quarantine `.tmp` (NEVER touching the
         // opposite lane's `.tmp`), clean lane `tail.meta*.tmp`, mirror lagging
-        // replica, recover Case C.
+        // replica, recover Case C / Case D.
         let _cleaned_q_tmp =
             clean_lane_quarantine_tmp_files_unix(&quarantine_fd, lane, owners.quarantine_uid)?;
-        let converged = phase2_execute_plan_unix(&lane_fd, lane_label, plan, lane_uid, observer)?;
+        let phase2_ctx = UnixPhase2Context {
+            lane,
+            lane_fd: &lane_fd,
+            quarantine_fd: &quarantine_fd,
+            quarantine_dir,
+            owners,
+            append_lock: &append_lock,
+        };
+        let converged = phase2_execute_plan_unix(&phase2_ctx, plan, observer)?;
 
         let seg_id = converged.meta.active_seg;
         let frame_offset = converged.meta.committed_len;
@@ -3592,11 +3636,11 @@ mod unix_seg {
 
     fn recover_under_root_fd_unix(
         root_fd: &OwnedFd,
+        quarantine_dir: &Path,
         lane: CaptureQueueLane,
         owners: UnixExpectedQueueOwners,
         observer: &mut SegmentObserver,
     ) -> StorageResult<LaneRecoveryReport> {
-        let lane_label = lane_dir_name(lane);
         let lane_uid = lane_expected_uid(owners, lane);
         let lane_fd = open_lane_dir_fd(root_fd, lane, owners)?;
         let quarantine_fd = open_quarantine_dir_fd(root_fd, owners)?;
@@ -3605,7 +3649,15 @@ mod unix_seg {
             acquire_lock_and_phase1_unix(root_fd, &lane_fd, owners, lane_uid, observer)?;
         let cleaned_quarantine_tmp_files =
             clean_lane_quarantine_tmp_files_unix(&quarantine_fd, lane, owners.quarantine_uid)?;
-        let converged = phase2_execute_plan_unix(&lane_fd, lane_label, plan, lane_uid, observer)?;
+        let phase2_ctx = UnixPhase2Context {
+            lane,
+            lane_fd: &lane_fd,
+            quarantine_fd: &quarantine_fd,
+            quarantine_dir,
+            owners,
+            append_lock: &append_lock,
+        };
+        let converged = phase2_execute_plan_unix(&phase2_ctx, plan, observer)?;
 
         drop(append_lock);
         observer.record_release_lock();
@@ -3619,6 +3671,7 @@ mod unix_seg {
             cleaned_tmp_files: converged.cleaned_tmp_files,
             cleaned_quarantine_tmp_files,
             reclaimed_orphans_removed: converged.reclaimed_orphans_removed,
+            quarantined_artifacts: converged.quarantined_artifacts,
         })
     }
 
@@ -3630,7 +3683,11 @@ mod unix_seg {
         observer: &mut SegmentObserver,
     ) -> StorageResult<SegmentAppendOutcome> {
         let root_fd = open_root_from_storage_dir(storage_dir, owners)?;
-        append_under_root_fd_unix(&root_fd, lane, frame_buf, owners, observer)
+        let quarantine_dir = storage_dir
+            .join(PRIVATE_SUBDIR)
+            .join(CAPTURE_QUEUE_SUBDIR)
+            .join(QUEUE_QUARANTINE_DIR);
+        append_under_root_fd_unix(&root_fd, &quarantine_dir, lane, frame_buf, owners, observer)
     }
 
     pub(super) fn append_at_root_unix(
@@ -3643,7 +3700,8 @@ mod unix_seg {
         let (root_fd, root_st) =
             open_dir_nofollow(queue_root, owners.root_uid, "capture queue root directory")?;
         verify_dir_mode_0700(&root_st, "capture queue root directory")?;
-        append_under_root_fd_unix(&root_fd, lane, frame_buf, owners, observer)
+        let quarantine_dir = queue_root.join(QUEUE_QUARANTINE_DIR);
+        append_under_root_fd_unix(&root_fd, &quarantine_dir, lane, frame_buf, owners, observer)
     }
 
     pub(super) fn recover_in_storage_dir_unix(
@@ -3653,7 +3711,11 @@ mod unix_seg {
         observer: &mut SegmentObserver,
     ) -> StorageResult<LaneRecoveryReport> {
         let root_fd = open_root_from_storage_dir(storage_dir, owners)?;
-        recover_under_root_fd_unix(&root_fd, lane, owners, observer)
+        let quarantine_dir = storage_dir
+            .join(PRIVATE_SUBDIR)
+            .join(CAPTURE_QUEUE_SUBDIR)
+            .join(QUEUE_QUARANTINE_DIR);
+        recover_under_root_fd_unix(&root_fd, &quarantine_dir, lane, owners, observer)
     }
 
     pub(super) fn recover_at_root_unix(
@@ -3665,7 +3727,8 @@ mod unix_seg {
         let (root_fd, root_st) =
             open_dir_nofollow(queue_root, owners.root_uid, "capture queue root directory")?;
         verify_dir_mode_0700(&root_st, "capture queue root directory")?;
-        recover_under_root_fd_unix(&root_fd, lane, owners, observer)
+        let quarantine_dir = queue_root.join(QUEUE_QUARANTINE_DIR);
+        recover_under_root_fd_unix(&root_fd, &quarantine_dir, lane, owners, observer)
     }
 
     pub(super) fn read_converged_lane_tail_meta_unix(
@@ -4271,12 +4334,13 @@ mod non_unix_seg {
                 let succ_scan = scan_successor_segment_readonly(&mut succ_file, succ_actual_len)?;
                 classify_case_d_base_readonly(&meta, actual_len, &succ_scan)?;
                 return Ok((
-                    Phase1Plan::CaseDRecoverCleanSuccessor {
+                    Phase1Plan::CaseDRecoverValidSuccessor {
                         meta,
                         succ_seg,
                         succ_valid_end: succ_scan.valid_end,
                         succ_crc32c: succ_scan.valid_crc32c,
                         succ_frames: succ_scan.frame_count,
+                        succ_has_damaged_tail: succ_scan.has_damaged_tail,
                         stale_tmp_names,
                         reclaimed_orphans,
                     },
@@ -4481,12 +4545,31 @@ mod non_unix_seg {
             Ok(())
         }
 
+        struct WindowsPhase2Context<'a> {
+            lane: CaptureQueueLane,
+            lane_dir: &'a Path,
+            quarantine_dir: &'a Path,
+            append_lock: &'a File,
+        }
+
+        struct WindowsPhase2ConvergedState {
+            meta: LaneTailMeta,
+            active_seg_exists: bool,
+            recovered_frames: usize,
+            recovered_bytes: u64,
+            mirrored_replica: bool,
+            cleaned_tmp_files: usize,
+            reclaimed_orphans_removed: usize,
+            quarantined_artifacts: Vec<QuarantinePublishReport>,
+        }
+
         fn phase2_execute_plan_windows(
-            lane_dir: &Path,
-            lane_label: &'static str,
+            ctx: &WindowsPhase2Context<'_>,
             plan: Phase1Plan<String>,
             observer: &mut SegmentObserver,
-        ) -> StorageResult<(LaneTailMeta, bool, usize, u64, bool, usize, usize)> {
+        ) -> StorageResult<WindowsPhase2ConvergedState> {
+            let lane_dir = ctx.lane_dir;
+            let lane_label = lane_dir_name(ctx.lane);
             let clean_tmp = |names: &[String]| -> StorageResult<usize> {
                 let mut removed = 0usize;
                 for name in names {
@@ -4525,7 +4608,16 @@ mod non_unix_seg {
                     let cleaned = clean_tmp(&stale_tmp_names)?;
                     let meta = LaneTailMeta::initial_empty();
                     commit_dual_tail_meta_windows(lane_dir, lane_label, &meta, observer)?;
-                    Ok((meta, false, 0, 0, false, cleaned, 0))
+                    Ok(WindowsPhase2ConvergedState {
+                        meta,
+                        active_seg_exists: false,
+                        recovered_frames: 0,
+                        recovered_bytes: 0,
+                        mirrored_replica: false,
+                        cleaned_tmp_files: cleaned,
+                        reclaimed_orphans_removed: 0,
+                        quarantined_artifacts: Vec::new(),
+                    })
                 }
                 Phase1Plan::Case0bPreInitializedEmpty {
                     meta,
@@ -4562,7 +4654,16 @@ mod non_unix_seg {
                             true
                         }
                     };
-                    Ok((meta, false, 0, 0, mirrored, cleaned, 0))
+                    Ok(WindowsPhase2ConvergedState {
+                        meta,
+                        active_seg_exists: false,
+                        recovered_frames: 0,
+                        recovered_bytes: 0,
+                        mirrored_replica: mirrored,
+                        cleaned_tmp_files: cleaned,
+                        reclaimed_orphans_removed: 0,
+                        quarantined_artifacts: Vec::new(),
+                    })
                 }
                 Phase1Plan::CaseAClean {
                     meta,
@@ -4601,7 +4702,16 @@ mod non_unix_seg {
                             true
                         }
                     };
-                    Ok((meta, true, 0, 0, mirrored, cleaned, orphans))
+                    Ok(WindowsPhase2ConvergedState {
+                        meta,
+                        active_seg_exists: true,
+                        recovered_frames: 0,
+                        recovered_bytes: 0,
+                        mirrored_replica: mirrored,
+                        cleaned_tmp_files: cleaned,
+                        reclaimed_orphans_removed: orphans,
+                        quarantined_artifacts: Vec::new(),
+                    })
                 }
                 Phase1Plan::CaseCRecoverCleanTail {
                     meta,
@@ -4633,27 +4743,42 @@ mod non_unix_seg {
                         sealed: meta.sealed,
                     };
                     commit_dual_tail_meta_windows(lane_dir, lane_label, &next_meta, observer)?;
-                    Ok((
-                        next_meta,
-                        true,
+                    Ok(WindowsPhase2ConvergedState {
+                        meta: next_meta,
+                        active_seg_exists: true,
                         recovered_frames,
                         recovered_bytes,
-                        true,
-                        cleaned,
-                        orphans,
-                    ))
+                        mirrored_replica: true,
+                        cleaned_tmp_files: cleaned,
+                        reclaimed_orphans_removed: orphans,
+                        quarantined_artifacts: Vec::new(),
+                    })
                 }
-                Phase1Plan::CaseDRecoverCleanSuccessor {
+                Phase1Plan::CaseDRecoverValidSuccessor {
                     meta,
                     succ_seg,
                     succ_valid_end,
                     succ_crc32c,
                     succ_frames,
+                    succ_has_damaged_tail,
                     stale_tmp_names,
                     reclaimed_orphans,
                 } => {
                     let cleaned = clean_tmp(&stale_tmp_names)?;
                     let orphans = clean_orphans(&reclaimed_orphans)?;
+                    let mut quarantined_artifacts = Vec::new();
+                    if succ_has_damaged_tail {
+                        let q_report = quarantine_and_truncate_segment_windows_locked(
+                            ctx.quarantine_dir,
+                            lane_dir,
+                            ctx.lane,
+                            succ_seg,
+                            succ_valid_end,
+                            ctx.append_lock,
+                            observer,
+                        )?;
+                        quarantined_artifacts.push(q_report);
+                    }
                     let next_meta = build_case_d_sealed_successor_meta(
                         &meta,
                         succ_seg,
@@ -4668,15 +4793,16 @@ mod non_unix_seg {
                         succ_frames,
                     );
                     commit_dual_tail_meta_windows(lane_dir, lane_label, &next_meta, observer)?;
-                    Ok((
-                        next_meta,
-                        true,
-                        succ_frames,
-                        succ_valid_end,
-                        true,
-                        cleaned,
-                        orphans,
-                    ))
+                    Ok(WindowsPhase2ConvergedState {
+                        meta: next_meta,
+                        active_seg_exists: true,
+                        recovered_frames: succ_frames,
+                        recovered_bytes: succ_valid_end,
+                        mirrored_replica: true,
+                        cleaned_tmp_files: cleaned,
+                        reclaimed_orphans_removed: orphans,
+                        quarantined_artifacts,
+                    })
                 }
             }
         }
@@ -4851,23 +4977,15 @@ mod non_unix_seg {
             })
         }
 
-        pub(super) fn quarantine_and_truncate_segment_windows(
+        fn quarantine_and_truncate_segment_windows_locked(
             quarantine_dir: &Path,
             lane_dir: &Path,
             lane: CaptureQueueLane,
             seg_id: u32,
             valid_end: u64,
+            append_lock: &File,
             observer: &mut SegmentObserver,
         ) -> StorageResult<QuarantinePublishReport> {
-            if quarantine_dir.parent() != lane_dir.parent() {
-                return Err(StorageBackendError::BackendInternal {
-                    detail:
-                        "quarantine and lane directories must share the same capture queue root"
-                            .to_string(),
-                });
-            }
-            let (_q_guards, append_lock) = acquire_quarantine_lock_windows(quarantine_dir)?;
-            let _l_guard = pin_windows_dir_nofollow(lane_dir, "capture queue lane directory")?;
             let seg_path = lane_dir.join(segment_log_file_name(seg_id));
             let (mut seg_file, actual_len, _) = open_windows_file_nofollow(
                 &seg_path,
@@ -4894,7 +5012,7 @@ mod non_unix_seg {
             let report = publish_quarantine_durable_writer_windows_pinned(
                 quarantine_dir,
                 &id,
-                &append_lock,
+                append_lock,
                 observer,
                 |tmp_file| {
                     let copied_crc = stream_copy_file_range_with_crc(
@@ -4923,6 +5041,34 @@ mod non_unix_seg {
                 .map_err(|e| StorageBackendError::io("sync truncated capture queue segment", e))?;
             observer.record_segment_truncate_complete(lane_label, seg_id, valid_end);
             Ok(report)
+        }
+
+        pub(super) fn quarantine_and_truncate_segment_windows(
+            quarantine_dir: &Path,
+            lane_dir: &Path,
+            lane: CaptureQueueLane,
+            seg_id: u32,
+            valid_end: u64,
+            observer: &mut SegmentObserver,
+        ) -> StorageResult<QuarantinePublishReport> {
+            if quarantine_dir.parent() != lane_dir.parent() {
+                return Err(StorageBackendError::BackendInternal {
+                    detail:
+                        "quarantine and lane directories must share the same capture queue root"
+                            .to_string(),
+                });
+            }
+            let (_q_guards, append_lock) = acquire_quarantine_lock_windows(quarantine_dir)?;
+            let _l_guard = pin_windows_dir_nofollow(lane_dir, "capture queue lane directory")?;
+            quarantine_and_truncate_segment_windows_locked(
+                quarantine_dir,
+                lane_dir,
+                lane,
+                seg_id,
+                valid_end,
+                &append_lock,
+                observer,
+            )
         }
 
         pub(super) fn quarantine_and_unlink_orphan_windows(
@@ -5022,8 +5168,16 @@ mod non_unix_seg {
             let (append_lock, plan, pinned_seg) =
                 acquire_lock_and_phase1_windows(queue_root, &lane_dir, true, observer)?;
             let _cleaned_q_tmp = clean_lane_quarantine_tmp_files_windows(&quarantine_dir, lane)?;
-            let (meta, active_seg_exists, recovered_frames, _, _, _, _) =
-                phase2_execute_plan_windows(&lane_dir, lane_label, plan, observer)?;
+            let phase2_ctx = WindowsPhase2Context {
+                lane,
+                lane_dir: &lane_dir,
+                quarantine_dir: &quarantine_dir,
+                append_lock: &append_lock,
+            };
+            let converged = phase2_execute_plan_windows(&phase2_ctx, plan, observer)?;
+            let meta = converged.meta;
+            let active_seg_exists = converged.active_seg_exists;
+            let recovered_frames = converged.recovered_frames;
 
             let seg_id = meta.active_seg;
             let frame_offset = meta.committed_len;
@@ -5142,32 +5296,32 @@ mod non_unix_seg {
             let _q_guard =
                 pin_windows_dir_nofollow(&quarantine_dir, "capture queue quarantine directory")?;
 
-            let (append_lock, plan, _pinned) =
+            let (append_lock, plan, pinned) =
                 acquire_lock_and_phase1_windows(queue_root, &lane_dir, false, observer)?;
+            drop(pinned);
             let cleaned_quarantine_tmp_files =
                 clean_lane_quarantine_tmp_files_windows(&quarantine_dir, lane)?;
-            let (
-                meta,
-                _,
-                recovered_frames,
-                recovered_bytes,
-                mirrored_replica,
-                cleaned_tmp_files,
-                reclaimed_orphans_removed,
-            ) = phase2_execute_plan_windows(&lane_dir, lane_label, plan, observer)?;
+            let phase2_ctx = WindowsPhase2Context {
+                lane,
+                lane_dir: &lane_dir,
+                quarantine_dir: &quarantine_dir,
+                append_lock: &append_lock,
+            };
+            let converged = phase2_execute_plan_windows(&phase2_ctx, plan, observer)?;
 
             drop(append_lock);
             observer.record_release_lock();
 
             Ok(LaneRecoveryReport {
                 lane,
-                meta,
-                recovered_frames,
-                recovered_bytes,
-                mirrored_replica,
-                cleaned_tmp_files,
+                meta: converged.meta,
+                recovered_frames: converged.recovered_frames,
+                recovered_bytes: converged.recovered_bytes,
+                mirrored_replica: converged.mirrored_replica,
+                cleaned_tmp_files: converged.cleaned_tmp_files,
                 cleaned_quarantine_tmp_files,
-                reclaimed_orphans_removed,
+                reclaimed_orphans_removed: converged.reclaimed_orphans_removed,
+                quarantined_artifacts: converged.quarantined_artifacts,
             })
         }
     }
@@ -7650,5 +7804,583 @@ mod tests {
         ));
         assert_eq!(zero_err.stable_code_str(), "LBR-IO-001");
         assert_eq!(snapshot_tree(&zero_init.paths.root), zero_before);
+    }
+
+    #[test]
+    fn case_d_valid_successor_trailing_half_frame_durable_quarantine_ordering() {
+        #[cfg(unix)]
+        fn write_file_0600(path: &Path, bytes: &[u8]) {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            let mut f = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(path)
+                .expect("create 0600 queue test file");
+            f.write_all(bytes).expect("write queue test file");
+            f.sync_data().expect("sync queue test file");
+        }
+        #[cfg(not(unix))]
+        fn write_file_0600(path: &Path, bytes: &[u8]) {
+            let mut f = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(path)
+                .expect("create queue test file");
+            f.write_all(bytes).expect("write queue test file");
+            f.sync_data().expect("sync queue test file");
+        }
+
+        let repo = tempdir().expect("create RB-08u ordering repo");
+        let init = init_capture_queue(repo.path()).expect("init RB-08u queue");
+        let normal_dir = &init.paths.normal;
+        let quarantine_dir = &init.paths.quarantine;
+
+        // Commit clean old segment S = 0.
+        let s0_f1 = encode_frame(FRAME_FLAG_NONE, "rb08u:s0:1", b"old-seg-committed-1").unwrap();
+        let s0_out =
+            append_encoded_frame(repo.path(), CaptureQueueLane::Normal, &s0_f1).expect("commit s0");
+        let s0_len = s0_out.meta.committed_len;
+        let s0_crc = s0_out.meta.prefix_crc32c;
+
+        // Build successor S + 1 = 1 containing 2 valid complete frames (including
+        // a > 64 KiB payload) followed by an uncommitted truncated half-frame tail.
+        let s1_f1 = encode_frame(FRAME_FLAG_NONE, "rb08u:s1:1", b"succ-valid-frame-1").unwrap();
+        let s1_f2 = encode_frame(FRAME_FLAG_NONE, "rb08u:s1:2", &vec![0xA5u8; 72 * 1024]).unwrap();
+        let mut s1_valid_prefix = Vec::new();
+        s1_valid_prefix.extend_from_slice(&s1_f1);
+        s1_valid_prefix.extend_from_slice(&s1_f2);
+        let succ_valid_end = s1_valid_prefix.len() as u64;
+        let succ_valid_crc = crc32c_checksum(&s1_valid_prefix);
+
+        // Partial uncommitted 3rd frame (header valid, body cut off halfway).
+        let s1_f3_full = encode_frame(
+            FRAME_FLAG_NONE,
+            "rb08u:s1:3-half",
+            b"uncommitted-tail-payload-xyz",
+        )
+        .unwrap();
+        let s1_half_tail = s1_f3_full[..s1_f3_full.len() / 2].to_vec();
+        assert!(!s1_half_tail.is_empty());
+
+        let mut s1_on_disk = s1_valid_prefix.clone();
+        s1_on_disk.extend_from_slice(&s1_half_tail);
+        let s1_path = normal_dir.join(segment_log_file_name(1));
+        write_file_0600(&s1_path, &s1_on_disk);
+
+        // Execute REAL Case D recovery caller path with ordering instrumentation.
+        let mut obs = SegmentObserver::new();
+        let report = recover_lane_in_storage_dir(repo.path(), CaptureQueueLane::Normal, &mut obs)
+            .expect("AC1-AC3: Case D valid successor with half-frame tail must recover cleanly");
+
+        // AC1: `events-<S+1>` on disk equals exact valid prefix `[0..succ_valid_end)`.
+        assert_eq!(
+            fs::read(&s1_path).expect("read truncated events-00000001.log"),
+            s1_valid_prefix,
+            "AC1 violated: events-<S+1> bytes do not equal [0..succ_valid_end)"
+        );
+        assert_eq!(report.recovered_frames, 2);
+        assert_eq!(report.recovered_bytes, succ_valid_end);
+
+        // AC2: `quarantine/<id>.bin` equals exact `[succ_valid_end, actual_len(S+1))`.
+        assert_eq!(report.quarantined_artifacts.len(), 1);
+        let q_art = &report.quarantined_artifacts[0];
+        let expected_id =
+            quarantine_artifact_id(CaptureQueueLane::Normal, 1, succ_valid_end, &s1_half_tail);
+        assert_eq!(q_art.id, expected_id);
+        assert_eq!(
+            q_art.bin_path,
+            quarantine_dir.join(format!("{expected_id}.bin"))
+        );
+        assert_eq!(q_art.quarantined_bytes, s1_half_tail.len() as u64);
+        assert_eq!(q_art.crc32c, crc32c_checksum(&s1_half_tail));
+        assert_eq!(q_art.diagnostic_code, QUARANTINE_DIAGNOSTIC_CODE);
+        assert_eq!(
+            fs::read(&q_art.bin_path).expect("AC2: read quarantine .bin"),
+            s1_half_tail,
+            "AC2 violated: quarantine .bin bytes do not equal damaged successor tail"
+        );
+        assert!(
+            !quarantine_dir.join(format!("{expected_id}.tmp")).exists(),
+            "no leftover quarantine .tmp after successful publish"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = fs::symlink_metadata(&q_art.bin_path)
+                .expect("stat quarantine .bin")
+                .permissions()
+                .mode()
+                & 0o7777;
+            assert_eq!(mode, QUEUE_FILE_MODE, "quarantine .bin must be 0600");
+        }
+
+        // AC3: Caller-path sequence instrumentation proves:
+        //   tmp.sync_data() complete < rename start
+        //   rename complete < fsync_dir(quarantine_dir) start
+        //   fsync_dir(quarantine_dir) complete < truncate(events-<S+1>) start
+        //   truncate(events-<S+1>) complete < tail.meta tmp sync
+        let sync_done = obs
+            .events
+            .iter()
+            .position(|e| {
+                *e == SegmentOpEvent::QuarantineTmpSyncDataComplete {
+                    id: expected_id.clone(),
+                }
+            })
+            .expect("quarantine tmp sync complete event");
+        let rename_start = obs
+            .events
+            .iter()
+            .position(|e| {
+                *e == SegmentOpEvent::QuarantineRenameStart {
+                    id: expected_id.clone(),
+                }
+            })
+            .expect("quarantine rename start event");
+        let rename_done = obs
+            .events
+            .iter()
+            .position(|e| {
+                *e == SegmentOpEvent::QuarantineRenameComplete {
+                    id: expected_id.clone(),
+                }
+            })
+            .expect("quarantine rename complete event");
+        let fsync_q_start = obs
+            .events
+            .iter()
+            .position(|e| {
+                *e == SegmentOpEvent::QuarantineFsyncDirStart {
+                    id: expected_id.clone(),
+                }
+            })
+            .expect("quarantine fsync_dir start event");
+        let fsync_q_done = obs
+            .events
+            .iter()
+            .position(|e| {
+                *e == SegmentOpEvent::QuarantineFsyncDirComplete {
+                    id: expected_id.clone(),
+                }
+            })
+            .expect("quarantine fsync_dir complete event");
+        let trunc_start = obs
+            .events
+            .iter()
+            .position(|e| {
+                *e == SegmentOpEvent::SegmentTruncateStart {
+                    lane: QUEUE_LANE_NORMAL_DIR,
+                    seg_id: 1,
+                    to_len: succ_valid_end,
+                }
+            })
+            .expect("segment truncate start event");
+        let trunc_done = obs
+            .events
+            .iter()
+            .position(|e| {
+                *e == SegmentOpEvent::SegmentTruncateComplete {
+                    lane: QUEUE_LANE_NORMAL_DIR,
+                    seg_id: 1,
+                    to_len: succ_valid_end,
+                }
+            })
+            .expect("segment truncate complete event");
+        let primary_meta_sync = obs
+            .events
+            .iter()
+            .position(|e| {
+                *e == SegmentOpEvent::MetaTmpWriteAndSync {
+                    lane: QUEUE_LANE_NORMAL_DIR,
+                    tmp_name: QUEUE_TAIL_META_TMP_FILE,
+                    target_name: QUEUE_TAIL_META_FILE,
+                }
+            })
+            .expect("primary tail.meta commit event");
+
+        assert!(sync_done < rename_start);
+        assert!(rename_done < fsync_q_start);
+        assert!(
+            fsync_q_done < trunc_start,
+            "AC3 violated: fsync_dir(quarantine_dir) complete={fsync_q_done} must be < truncate(S+1) start={trunc_start}"
+        );
+        assert!(trunc_start < trunc_done);
+        assert!(trunc_done < primary_meta_sync);
+
+        // Verify converged dual LTM2 metadata sealed seg 0 and advanced to seg 1.
+        let primary_meta = LaneTailMeta::decode(
+            &fs::read(normal_dir.join(QUEUE_TAIL_META_FILE)).expect("read primary tail.meta"),
+        )
+        .expect("decode primary");
+        let backup_meta = LaneTailMeta::decode(
+            &fs::read(normal_dir.join(QUEUE_TAIL_META_BAK_FILE))
+                .expect("read backup tail.meta.bak"),
+        )
+        .expect("decode backup");
+        assert_eq!(primary_meta, backup_meta);
+        assert_eq!(primary_meta.active_seg, 1);
+        assert_eq!(primary_meta.committed_len, succ_valid_end);
+        assert_eq!(primary_meta.prefix_crc32c, succ_valid_crc);
+        assert_eq!(
+            primary_meta.sealed,
+            vec![SealedSegmentMeta {
+                seg_id: 0,
+                sealed_len: s0_len,
+                sealed_crc32c: s0_crc,
+            }]
+        );
+
+        // Also verify REAL `append_validated_frame_in_storage_dir` caller path on
+        // a second transition `S=1 -> S=2` with a valid frame + corrupt-header tail!
+        let s2_f1 = encode_frame(FRAME_FLAG_NONE, "rb08u:s2:1", b"seg2-valid-frame").unwrap();
+        let s2_corrupt_tail = b"BAD!\xff\xff\xff\xffgarbled-uncommitted-tail-bytes".to_vec();
+        let mut s2_disk_before = s2_f1.clone();
+        s2_disk_before.extend_from_slice(&s2_corrupt_tail);
+        let s2_path = normal_dir.join(segment_log_file_name(2));
+        write_file_0600(&s2_path, &s2_disk_before);
+
+        let new_f = encode_frame(
+            FRAME_FLAG_NONE,
+            "rb08u:s2:2",
+            b"new-frame-after-case-d-trim",
+        )
+        .unwrap();
+        let mut app_obs = SegmentObserver::new();
+        let app_out = append_validated_frame_in_storage_dir(
+            repo.path(),
+            CaptureQueueLane::Normal,
+            &new_f,
+            &mut app_obs,
+        )
+        .expect("append caller path must durably quarantine+truncate S+1 before appending");
+
+        let s2_q_id = quarantine_artifact_id(
+            CaptureQueueLane::Normal,
+            2,
+            s2_f1.len() as u64,
+            &s2_corrupt_tail,
+        );
+        assert_eq!(
+            fs::read(quarantine_dir.join(format!("{s2_q_id}.bin"))).expect("read s2 .bin"),
+            s2_corrupt_tail
+        );
+        let app_fsync_q_done = app_obs
+            .events
+            .iter()
+            .position(|e| {
+                *e == SegmentOpEvent::QuarantineFsyncDirComplete {
+                    id: s2_q_id.clone(),
+                }
+            })
+            .expect("append caller quarantine fsync_dir complete");
+        let app_trunc_start = app_obs
+            .events
+            .iter()
+            .position(|e| {
+                *e == SegmentOpEvent::SegmentTruncateStart {
+                    lane: QUEUE_LANE_NORMAL_DIR,
+                    seg_id: 2,
+                    to_len: s2_f1.len() as u64,
+                }
+            })
+            .expect("append caller truncate start");
+        let app_write_new = app_obs
+            .events
+            .iter()
+            .position(|e| {
+                *e == SegmentOpEvent::SegmentWriteAll {
+                    lane: QUEUE_LANE_NORMAL_DIR,
+                    seg_id: 2,
+                    offset: s2_f1.len() as u64,
+                    len: new_f.len(),
+                }
+            })
+            .expect("append caller write new frame");
+        assert!(app_fsync_q_done < app_trunc_start);
+        assert!(app_trunc_start < app_write_new);
+
+        let mut expected_s2_after = s2_f1.clone();
+        expected_s2_after.extend_from_slice(&new_f);
+        assert_eq!(
+            fs::read(&s2_path).expect("read final s2"),
+            expected_s2_after
+        );
+        assert_eq!(app_out.meta.active_seg, 2);
+        assert_eq!(app_out.meta.committed_len, expected_s2_after.len() as u64);
+        assert_eq!(
+            app_out.meta.prefix_crc32c,
+            crc32c_checksum(&expected_s2_after)
+        );
+        assert_eq!(app_out.meta.sealed.len(), 2);
+    }
+
+    #[test]
+    fn case_d_valid_successor_trailing_half_frame_crash_boundaries() {
+        #[cfg(unix)]
+        fn write_file_0600(path: &Path, bytes: &[u8]) {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            let mut f = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(path)
+                .expect("create 0600 queue test file");
+            f.write_all(bytes).expect("write queue test file");
+            f.sync_data().expect("sync queue test file");
+        }
+        #[cfg(not(unix))]
+        fn write_file_0600(path: &Path, bytes: &[u8]) {
+            let mut f = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(path)
+                .expect("create queue test file");
+            f.write_all(bytes).expect("write queue test file");
+            f.sync_data().expect("sync queue test file");
+        }
+
+        let repo = tempdir().expect("create RB-08u crash boundary repo");
+        let init = init_capture_queue(repo.path()).expect("init RB-08u crash queue");
+        let normal_dir = &init.paths.normal;
+        let quarantine_dir = &init.paths.quarantine;
+
+        // Commit clean old segment S = 0.
+        let s0_f1 = encode_frame(FRAME_FLAG_NONE, "rb08u:cb:s0:1", b"old-seg0-payload").unwrap();
+        let s0_out =
+            append_encoded_frame(repo.path(), CaptureQueueLane::Normal, &s0_f1).expect("commit s0");
+        let s0_len = s0_out.meta.committed_len;
+        let s0_crc = s0_out.meta.prefix_crc32c;
+
+        // Build successor S + 1 = 1 with 2 valid frames + uncommitted half-frame tail.
+        let s1_f1 = encode_frame(FRAME_FLAG_NONE, "rb08u:cb:s1:1", b"succ-valid-alpha").unwrap();
+        let s1_f2 = encode_frame(FRAME_FLAG_NONE, "rb08u:cb:s1:2", b"succ-valid-beta").unwrap();
+        let mut s1_valid_prefix = Vec::new();
+        s1_valid_prefix.extend_from_slice(&s1_f1);
+        s1_valid_prefix.extend_from_slice(&s1_f2);
+        let succ_valid_end = s1_valid_prefix.len() as u64;
+        let succ_valid_crc = crc32c_checksum(&s1_valid_prefix);
+
+        // Truncate a genuinely encoded frame halfway through its body so the
+        // decoder exercises the true `FrameDecodeError::TruncatedTail` half-frame path.
+        let s1_f3_full = encode_frame(
+            FRAME_FLAG_NONE,
+            "rb08u:cb:s1:3-half",
+            b"uncommitted-case-d-half-frame-body-payload",
+        )
+        .unwrap();
+        let s1_half_tail = s1_f3_full[..s1_f3_full.len() / 2].to_vec();
+        let mut s1_pre_crash = s1_valid_prefix.clone();
+        s1_pre_crash.extend_from_slice(&s1_half_tail);
+        let s1_path = normal_dir.join(segment_log_file_name(1));
+        write_file_0600(&s1_path, &s1_pre_crash);
+
+        // Plant an unrelated priority-lane quarantine .tmp to assert cross-lane
+        // isolation across crash restarts.
+        let priority_other_tmp = quarantine_dir.join("priority-other-lane.tmp");
+        write_file_0600(&priority_other_tmp, b"priority-tmp-must-stay");
+
+        let expected_id =
+            quarantine_artifact_id(CaptureQueueLane::Normal, 1, succ_valid_end, &s1_half_tail);
+        let expected_tmp = quarantine_dir.join(format!("{expected_id}.tmp"));
+        let expected_bin = quarantine_dir.join(format!("{expected_id}.bin"));
+
+        // ------------------------------------------------------------------
+        // AC4: Crash strictly BEFORE `rename(.tmp -> .bin)` inside real Case D
+        // recovery -> `events-<S+1>` MUST remain 100% byte-for-byte identical
+        // (zero premature truncate!), `.tmp` remains, `.bin` absent, `LTM2` at S=0.
+        // ------------------------------------------------------------------
+        let mut crash_before_rename =
+            SegmentObserver::with_crash(SegmentCrashPoint::BeforeQuarantineRename);
+        let err_ac4 = recover_lane_in_storage_dir(
+            repo.path(),
+            CaptureQueueLane::Normal,
+            &mut crash_before_rename,
+        )
+        .expect_err("AC4: crash before quarantine rename must fail");
+        assert_eq!(err_ac4.stable_code_str(), "LBR-IO-001");
+        assert_eq!(
+            fs::read(&s1_path).expect("AC4: read events-00000001.log after pre-rename crash"),
+            s1_pre_crash,
+            "AC4 violated: events-<S+1> was prematurely modified or truncated before rename"
+        );
+        assert!(
+            expected_tmp.exists(),
+            "AC4: .tmp must remain after pre-rename crash"
+        );
+        assert!(
+            !expected_bin.exists(),
+            "AC4: .bin must not exist before rename"
+        );
+        assert_eq!(
+            read_converged_lane_tail_meta(normal_dir).expect("AC4: tail.meta still at S=0"),
+            s0_out.meta
+        );
+        assert!(priority_other_tmp.exists());
+
+        // ------------------------------------------------------------------
+        // AC5: Crash strictly AFTER `fsync_dir(quarantine_dir)` and BEFORE
+        // `truncate(events-<S+1>)` inside real Case D recovery -> `.bin`
+        // persists durably with exact `[succ_valid_end, actual_len(S+1))`,
+        // `events-<S+1>` still untrimmed, `LTM2` still at S=0.
+        // ------------------------------------------------------------------
+        let mut crash_after_fsync = SegmentObserver::with_crash(
+            SegmentCrashPoint::AfterQuarantineDirFsyncBeforeDestructive,
+        );
+        let err_ac5 = recover_lane_in_storage_dir(
+            repo.path(),
+            CaptureQueueLane::Normal,
+            &mut crash_after_fsync,
+        )
+        .expect_err("AC5: crash after quarantine fsync_dir before truncate must fail");
+        assert_eq!(err_ac5.stable_code_str(), "LBR-IO-001");
+        assert_eq!(
+            fs::read(&expected_bin).expect("AC5: persisted quarantine .bin after dir fsync crash"),
+            s1_half_tail,
+            "AC5 violated: persisted .bin bytes do not equal original damaged half-frame tail"
+        );
+        assert!(
+            !expected_tmp.exists(),
+            "AC5: .tmp renamed away before dir fsync"
+        );
+        assert_eq!(
+            fs::read(&s1_path).expect("AC5: events-<S+1> still untrimmed before truncate"),
+            s1_pre_crash
+        );
+        assert_eq!(
+            read_converged_lane_tail_meta(normal_dir).expect("AC5: tail.meta still at S=0"),
+            s0_out.meta
+        );
+
+        // ------------------------------------------------------------------
+        // AC5 (reopen) + AC6 + AC7: Reopen the EXACT SAME lane after the crash
+        // -> converges cleanly without duplicating `.bin`, trims `events-<S+1>`
+        // to exact `succ_valid_end`, seals S=0, and advances dual replicas to
+        // `COMMITTED_LEN == succ_valid_end` and `PREFIX_CRC32C == crc32c(valid_prefix)`!
+        // ------------------------------------------------------------------
+        let report = recover_lane(repo.path(), CaptureQueueLane::Normal)
+            .expect("AC5-AC7: reopening lane after dir-fsync crash must converge cleanly");
+        assert_eq!(report.recovered_frames, 2);
+        assert_eq!(report.recovered_bytes, succ_valid_end);
+        assert_eq!(report.quarantined_artifacts.len(), 1);
+        assert_eq!(report.quarantined_artifacts[0].id, expected_id);
+        assert_eq!(
+            fs::read(&expected_bin).expect("AC5: quarantine .bin after reopen convergence"),
+            s1_half_tail
+        );
+        assert_eq!(
+            fs::read(&s1_path).expect("reopened truncated events-<S+1>"),
+            s1_valid_prefix
+        );
+        assert!(
+            priority_other_tmp.exists(),
+            "Normal Case D restart must preserve priority-other-lane.tmp"
+        );
+
+        // Confirm zero duplicate `.bin` artifacts were created in `quarantine/`.
+        let normal_bins: Vec<_> = fs::read_dir(quarantine_dir)
+            .expect("read quarantine dir")
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let n = e.file_name();
+                let s = n.to_string_lossy();
+                s.starts_with("normal-") && s.ends_with(".bin")
+            })
+            .collect();
+        assert_eq!(
+            normal_bins.len(),
+            1,
+            "deterministic id must prevent duplicate quarantine .bin files on crash replay"
+        );
+
+        // AC6 & AC7: Decode BOTH raw `tail.meta` and `tail.meta.bak`.
+        let primary_raw =
+            fs::read(normal_dir.join(QUEUE_TAIL_META_FILE)).expect("read converged tail.meta");
+        let backup_raw = fs::read(normal_dir.join(QUEUE_TAIL_META_BAK_FILE))
+            .expect("read converged tail.meta.bak");
+        assert_eq!(primary_raw, backup_raw);
+        let primary_meta = LaneTailMeta::decode(&primary_raw).expect("decode converged primary");
+        let backup_meta = LaneTailMeta::decode(&backup_raw).expect("decode converged backup");
+        assert_eq!(primary_meta, backup_meta);
+        assert_eq!(primary_meta.active_seg, 1);
+        assert_eq!(
+            primary_meta.sealed,
+            vec![SealedSegmentMeta {
+                seg_id: 0,
+                sealed_len: s0_len,
+                sealed_crc32c: s0_crc,
+            }]
+        );
+        assert_eq!(
+            primary_meta.committed_len, succ_valid_end,
+            "AC6 violated: converged LTM2.COMMITTED_LEN != succ_valid_end"
+        );
+        assert_eq!(
+            primary_meta.prefix_crc32c, succ_valid_crc,
+            "AC7 violated: converged LTM2.PREFIX_CRC32C != crc32c(events-<S+1>[0..succ_valid_end])"
+        );
+
+        // Also verify direct restart directly from AC4 (`BeforeQuarantineRename`)
+        // cleans the leftover `normal-*.tmp` (`cleaned_quarantine_tmp_files == 1`)
+        // and converges cleanly on `S=1 -> S=2`!
+        let s2_f1 = encode_frame(FRAME_FLAG_NONE, "rb08u:cb:s2:1", b"seg2-valid-frame").unwrap();
+        let s2_f2_full = encode_frame(
+            FRAME_FLAG_NONE,
+            "rb08u:cb:s2:2-half",
+            b"seg2-uncommitted-half-frame-payload",
+        )
+        .unwrap();
+        let s2_half_tail = s2_f2_full[..s2_f2_full.len() / 2].to_vec();
+        let mut s2_pre_crash = s2_f1.clone();
+        s2_pre_crash.extend_from_slice(&s2_half_tail);
+        let s2_path = normal_dir.join(segment_log_file_name(2));
+        write_file_0600(&s2_path, &s2_pre_crash);
+
+        let mut crash_s2_before_rename =
+            SegmentObserver::with_crash(SegmentCrashPoint::BeforeQuarantineRename);
+        let _ = recover_lane_in_storage_dir(
+            repo.path(),
+            CaptureQueueLane::Normal,
+            &mut crash_s2_before_rename,
+        )
+        .expect_err("AC4 on S=2 before rename must fail");
+        assert_eq!(fs::read(&s2_path).expect("read s2"), s2_pre_crash);
+
+        let s2_recover = recover_lane(repo.path(), CaptureQueueLane::Normal)
+            .expect("direct restart after AC4 pre-rename crash must converge cleanly");
+        assert_eq!(s2_recover.cleaned_quarantine_tmp_files, 1);
+        assert_eq!(s2_recover.meta.active_seg, 2);
+        assert_eq!(s2_recover.meta.committed_len, s2_f1.len() as u64);
+        assert_eq!(s2_recover.meta.prefix_crc32c, crc32c_checksum(&s2_f1));
+        assert_eq!(fs::read(&s2_path).expect("truncated s2"), s2_f1);
+        let s2_primary_raw =
+            fs::read(normal_dir.join(QUEUE_TAIL_META_FILE)).expect("read s2 primary tail.meta");
+        let s2_backup_raw = fs::read(normal_dir.join(QUEUE_TAIL_META_BAK_FILE))
+            .expect("read s2 backup tail.meta.bak");
+        assert_eq!(s2_primary_raw, s2_backup_raw);
+        let s2_primary = LaneTailMeta::decode(&s2_primary_raw).expect("decode s2 primary");
+        let s2_backup = LaneTailMeta::decode(&s2_backup_raw).expect("decode s2 backup");
+        assert_eq!(s2_primary, s2_backup);
+        assert_eq!(s2_primary.active_seg, 2);
+        assert_eq!(s2_primary.committed_len, s2_f1.len() as u64);
+        assert_eq!(s2_primary.prefix_crc32c, crc32c_checksum(&s2_f1));
+        assert_eq!(s2_primary.sealed.len(), 2);
+        assert!(priority_other_tmp.exists());
+
+        // Live append on reopened lane works seamlessly.
+        let post = append_frame(
+            repo.path(),
+            CaptureQueueLane::Normal,
+            FRAME_FLAG_NONE,
+            "rb08u:cb:post",
+            b"post-recovery-frame",
+        )
+        .expect("live append after Case D half-frame recovery must succeed");
+        assert_eq!(post.seg_id, 2);
+        assert!(post.meta.committed_len > s2_f1.len() as u64);
     }
 }
