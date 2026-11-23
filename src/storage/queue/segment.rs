@@ -855,6 +855,9 @@ enum SegmentOpEvent {
         to_offset: u64,
         frame_count: usize,
     },
+    CaseCTailScanStart {
+        seg_id: u32,
+    },
     CaseDRecoverCleanSuccessor {
         lane: &'static str,
         old_seg_id: u32,
@@ -1151,6 +1154,11 @@ impl SegmentObserver {
         });
     }
 
+    fn record_case_c_tail_scan_start(&mut self, seg_id: u32) {
+        self.events
+            .push(SegmentOpEvent::CaseCTailScanStart { seg_id });
+    }
+
     fn record_case_d_recover_successor(
         &mut self,
         lane: &'static str,
@@ -1354,6 +1362,9 @@ impl SegmentObserver {
         _frame_count: usize,
     ) {
     }
+
+    #[inline]
+    fn record_case_c_tail_scan_start(&mut self, _seg_id: u32) {}
 
     #[inline]
     fn record_case_d_recover_successor(
@@ -2851,18 +2862,18 @@ mod unix_seg {
             try_acquire_existing_strict_append_lock_unix(root_fd, owners.root_uid, deadline)?
         {
             observer.record_acquire_lock();
-            let plan = phase1_classify_lane_unix(lane_fd, lane_uid)?;
+            let plan = phase1_classify_lane_unix(lane_fd, lane_uid, observer)?;
             return Ok((lock, plan));
         }
 
         // `append.lock` is absent: pre-classify strictly read-only so any
         // fail-closed state exits with zero filesystem mutation.
-        let _ = phase1_classify_lane_unix(lane_fd, lane_uid)?;
+        let _ = phase1_classify_lane_unix(lane_fd, lane_uid, observer)?;
         observer.on_before_create_missing_lock();
 
         let lock = create_or_acquire_strict_append_lock_unix(root_fd, owners.root_uid, deadline)?;
         observer.record_acquire_lock();
-        let plan = phase1_classify_lane_unix(lane_fd, lane_uid)?;
+        let plan = phase1_classify_lane_unix(lane_fd, lane_uid, observer)?;
         Ok((lock, plan))
     }
 
@@ -3037,6 +3048,7 @@ mod unix_seg {
     fn phase1_classify_lane_unix(
         lane_fd: &OwnedFd,
         expected_uid: u32,
+        observer: &mut SegmentObserver,
     ) -> StorageResult<Phase1Plan<OsString>> {
         let scan = scan_lane_dir_readonly(lane_fd)?;
         let primary = read_meta_replica_nofollow(
@@ -3135,6 +3147,7 @@ mod unix_seg {
             let succ_scan = scan_successor_segment_readonly(&mut succ_file, succ_actual_len)?;
             ensure_case_d_sealed_capacity(&meta, &succ_scan)?;
             let old_tail = if actual_len > meta.committed_len {
+                observer.record_case_c_tail_scan_start(meta.active_seg);
                 let tail = scan_case_c_uncommitted_tail(
                     &mut ro_seg,
                     meta.committed_len,
@@ -3190,6 +3203,7 @@ mod unix_seg {
                 reclaimed_orphans,
             })
         } else {
+            observer.record_case_c_tail_scan_start(meta.active_seg);
             let tail = scan_case_c_uncommitted_tail(
                 &mut ro_seg,
                 meta.committed_len,
@@ -6471,6 +6485,7 @@ mod non_unix_seg {
         fn phase1_classify_lane_windows(
             lane_dir: &Path,
             open_seg_writable: bool,
+            observer: &mut SegmentObserver,
         ) -> StorageResult<(Phase1Plan<String>, Option<PinnedWindowsSegment>)> {
             let (seg_ids, stale_tmp_names) = scan_lane_dir_windows(lane_dir)?;
             let primary = read_meta_replica_windows(
@@ -6600,6 +6615,7 @@ mod non_unix_seg {
                 let succ_scan = scan_successor_segment_readonly(&mut succ_file, succ_actual_len)?;
                 ensure_case_d_sealed_capacity(&meta, &succ_scan)?;
                 let old_tail = if actual_len > meta.committed_len {
+                    observer.record_case_c_tail_scan_start(meta.active_seg);
                     let tail = scan_case_c_uncommitted_tail(
                         &mut seg_file,
                         meta.committed_len,
@@ -6675,6 +6691,7 @@ mod non_unix_seg {
                     }),
                 ))
             } else {
+                observer.record_case_c_tail_scan_start(meta.active_seg);
                 let tail = scan_case_c_uncommitted_tail(
                     &mut seg_file,
                     meta.committed_len,
@@ -6795,15 +6812,17 @@ mod non_unix_seg {
             let deadline = lock_deadline_for_timeout(lock_timeout);
             if let Some(lock) = acquire_existing_lock_windows(queue_root, deadline)? {
                 observer.record_acquire_lock();
-                let (plan, pinned) = phase1_classify_lane_windows(lane_dir, open_seg_writable)?;
+                let (plan, pinned) =
+                    phase1_classify_lane_windows(lane_dir, open_seg_writable, observer)?;
                 return Ok((lock, plan, pinned));
             }
             // `append.lock` is absent: pre-classify read-only first so corrupt
             // lanes exit without creating `append.lock`.
-            let _ = phase1_classify_lane_windows(lane_dir, false)?;
+            let _ = phase1_classify_lane_windows(lane_dir, false, observer)?;
             let lock = create_or_open_lock_windows(queue_root, deadline)?;
             observer.record_acquire_lock();
-            let (plan, pinned) = phase1_classify_lane_windows(lane_dir, open_seg_writable)?;
+            let (plan, pinned) =
+                phase1_classify_lane_windows(lane_dir, open_seg_writable, observer)?;
             Ok((lock, plan, pinned))
         }
 
@@ -18025,6 +18044,409 @@ mod tests {
             );
             assert_eq!(reopened.sealed.len(), MAX_SEALED_SEGMENTS);
             assert_eq!(reopened.sealed, initial_meta.sealed);
+        }
+    }
+
+    /// `RB-08c` AC1–AC4: Valid dual-replica `tail.meta`/`tail.meta.bak`
+    /// Phase 1 pre-enqueue read-only fail-closed guards for:
+    /// - AC1 & AC2: Case A (`actual_len == committed_len`) single-byte bitflip
+    ///   inside `[0, committed_len)` -> `CorruptCommittedFrame` (`LBR-IO-001`)
+    ///   with exact whole-lane & `quarantine/` byte-for-byte snapshot zero
+    ///   mutation (preserving planted `tail.meta.tmp`, `tail.meta.bak.tmp`,
+    ///   and `quarantine/<lane>-orphan.tmp`).
+    /// - AC3 & AC4: Case E (`actual_len < committed_len`) external truncation
+    ///   (to exact prior complete-frame `CleanEof` boundary, mid-frame, and 0B)
+    ///   -> `CorruptCommittedFrame` (`LBR-IO-001`) with exact whole-lane &
+    ///   `quarantine/` byte-for-byte snapshot zero mutation.
+    #[test]
+    fn unchanged_meta_case_a_bitflip_and_case_e_short_segment_rejected() {
+        // =====================================================================
+        // Part 1 — AC1 & AC2: Case A bitflips at start, middle (>64 KiB
+        // streaming chunk boundary), and last byte of `[0, committed_len)` with
+        // valid unchanged dual replicas and planted `.tmp` files.
+        // =====================================================================
+        let large_payload = vec![0x5au8; 80 * 1024]; // spans multiple 64 KiB CRC chunks
+        for (flip_label, choose_offset, remove_append_lock) in [
+            ("case-a-first-byte", 0usize, false),
+            ("case-a-mid-stream-past-64k", 70 * 1024, false),
+            ("case-a-last-committed-byte-no-lock", usize::MAX, true),
+        ] {
+            let repo = tempdir().expect("tempdir");
+            let init = init_capture_queue(repo.path()).expect("init capture queue");
+            let normal_dir = &init.paths.normal;
+            let _f1 = append_frame(
+                repo.path(),
+                CaptureQueueLane::Normal,
+                FRAME_FLAG_NONE,
+                "rb08c-case-a-1",
+                &large_payload,
+            )
+            .unwrap();
+            let f2 = append_frame(
+                repo.path(),
+                CaptureQueueLane::Normal,
+                FRAME_FLAG_NONE,
+                "rb08c-case-a-2",
+                b"second-committed-frame",
+            )
+            .unwrap();
+            let seg0_path = normal_dir.join(segment_log_file_name(0));
+            let mut seg_bytes = fs::read(&seg0_path).unwrap();
+            assert_eq!(seg_bytes.len() as u64, f2.meta.committed_len);
+            let flip_idx = if choose_offset == usize::MAX {
+                seg_bytes.len() - 1
+            } else {
+                choose_offset
+            };
+            seg_bytes[flip_idx] ^= 0x01;
+            write_bytes_0600(&seg0_path, &seg_bytes);
+
+            // Plant stale `.tmp` files in both lane and shared `quarantine/`.
+            write_bytes_0600(
+                &normal_dir.join(QUEUE_TAIL_META_TMP_FILE),
+                b"case-a-meta-tmp",
+            );
+            write_bytes_0600(
+                &normal_dir.join(QUEUE_TAIL_META_BAK_TMP_FILE),
+                b"case-a-bak-tmp",
+            );
+            write_bytes_0600(
+                &init.paths.quarantine.join("normal-orphan.tmp"),
+                b"case-a-q-normal-tmp",
+            );
+            write_bytes_0600(
+                &init.paths.quarantine.join("priority-orphan.tmp"),
+                b"case-a-q-priority-tmp",
+            );
+            if remove_append_lock {
+                let lock_path = init.paths.root.join(QUEUE_APPEND_LOCK_FILE);
+                if lock_path.exists() {
+                    fs::remove_file(&lock_path).unwrap();
+                }
+            }
+
+            let root_before = snapshot_tree(&init.paths.root);
+            let lane_before = snapshot_tree(normal_dir);
+            let q_before = snapshot_tree(&init.paths.quarantine);
+
+            // AC1: Enqueue returns `CorruptCommittedFrame` (`LBR-IO-001`).
+            let err = append_frame(
+                repo.path(),
+                CaptureQueueLane::Normal,
+                FRAME_FLAG_NONE,
+                "rb08c-case-a-incoming",
+                b"must-not-write",
+            )
+            .expect_err("AC1: Case A committed prefix bitflip must fail closed");
+            assert!(
+                matches!(err, StorageBackendError::CorruptCommittedFrame { .. }),
+                "{flip_label}: AC1 violated: expected CorruptCommittedFrame, got {err:?}"
+            );
+            assert_eq!(err.stable_code_str(), "LBR-IO-001");
+
+            // AC2: Whole lane directory, `quarantine/`, and queue root snapshots unchanged.
+            assert_eq!(
+                snapshot_tree(normal_dir),
+                lane_before,
+                "{flip_label}: AC2 violated — normal/ mutated on Case A bitflip"
+            );
+            assert_eq!(
+                snapshot_tree(&init.paths.quarantine),
+                q_before,
+                "{flip_label}: AC2 violated — quarantine/ mutated on Case A bitflip"
+            );
+            assert_eq!(
+                snapshot_tree(&init.paths.root),
+                root_before,
+                "{flip_label}: AC2 violated — queue root mutated on Case A bitflip"
+            );
+
+            // `recover_lane` also rejects identically with zero mutation.
+            let rec_err = recover_lane(repo.path(), CaptureQueueLane::Normal)
+                .expect_err("AC1 (recover_lane): Case A bitflip must fail closed");
+            assert!(matches!(
+                rec_err,
+                StorageBackendError::CorruptCommittedFrame { .. }
+            ));
+            assert_eq!(rec_err.stable_code_str(), "LBR-IO-001");
+            assert_eq!(snapshot_tree(normal_dir), lane_before);
+            assert_eq!(snapshot_tree(&init.paths.quarantine), q_before);
+        }
+
+        // =====================================================================
+        // Part 2 — AC3 & AC4: Case E short active segment (`actual_len < committed_len`)
+        // across exact prior complete-frame (`CleanEof`) truncation, mid-frame
+        // truncation, and 0-byte truncation, with valid dual replicas and
+        // planted `.tmp` files.
+        // =====================================================================
+        enum TruncMode {
+            ExactPriorCompleteFrame,
+            MidFrame,
+            ZeroBytes,
+        }
+        for (trunc_label, mode) in [
+            (
+                "case-e-clean-eof-frame-boundary",
+                TruncMode::ExactPriorCompleteFrame,
+            ),
+            ("case-e-mid-frame", TruncMode::MidFrame),
+            ("case-e-zero-bytes", TruncMode::ZeroBytes),
+        ] {
+            let repo = tempdir().expect("tempdir");
+            let init = init_capture_queue(repo.path()).expect("init capture queue");
+            let normal_dir = &init.paths.normal;
+            let f1 = append_frame(
+                repo.path(),
+                CaptureQueueLane::Normal,
+                FRAME_FLAG_NONE,
+                "rb08c-case-e-1",
+                b"frame-one-clean-boundary",
+            )
+            .unwrap();
+            let f2 = append_frame(
+                repo.path(),
+                CaptureQueueLane::Normal,
+                FRAME_FLAG_NONE,
+                "rb08c-case-e-2",
+                b"frame-two-truncated-away",
+            )
+            .unwrap();
+            let seg0_path = normal_dir.join(segment_log_file_name(0));
+            let target_len = match mode {
+                TruncMode::ExactPriorCompleteFrame => f1.meta.committed_len,
+                TruncMode::MidFrame => f1.meta.committed_len + (f2.frame_len as u64 / 2),
+                TruncMode::ZeroBytes => 0,
+            };
+            assert!(target_len < f2.meta.committed_len);
+            {
+                let f = fs::OpenOptions::new().write(true).open(&seg0_path).unwrap();
+                f.set_len(target_len).unwrap();
+                f.sync_data().unwrap();
+            }
+
+            // Verify clean-boundary truncation indeed decodes 100% CleanEof on its own!
+            if matches!(mode, TruncMode::ExactPriorCompleteFrame) {
+                let truncated_bytes = fs::read(&seg0_path).unwrap();
+                let decoded = decode_all_segment_bytes(&truncated_bytes);
+                assert_eq!(decoded.len(), 1);
+                assert_eq!(decoded[0].dedup_key, "rb08c-case-e-1");
+            }
+
+            // Plant `.tmp` files in lane & shared `quarantine/`.
+            write_bytes_0600(
+                &normal_dir.join(QUEUE_TAIL_META_TMP_FILE),
+                b"case-e-meta-tmp",
+            );
+            write_bytes_0600(
+                &normal_dir.join(QUEUE_TAIL_META_BAK_TMP_FILE),
+                b"case-e-bak-tmp",
+            );
+            write_bytes_0600(
+                &init.paths.quarantine.join("normal-orphan.tmp"),
+                b"case-e-q-normal-tmp",
+            );
+            write_bytes_0600(
+                &init.paths.quarantine.join("priority-orphan.tmp"),
+                b"case-e-q-priority-tmp",
+            );
+
+            let lane_before = snapshot_tree(normal_dir);
+            let q_before = snapshot_tree(&init.paths.quarantine);
+
+            // AC3: Enqueue returns `CorruptCommittedFrame` (`LBR-IO-001`).
+            let err = append_frame(
+                repo.path(),
+                CaptureQueueLane::Normal,
+                FRAME_FLAG_NONE,
+                "rb08c-case-e-incoming",
+                b"must-not-write",
+            )
+            .expect_err("AC3: Case E short active segment must fail closed");
+            assert!(
+                matches!(err, StorageBackendError::CorruptCommittedFrame { .. }),
+                "{trunc_label}: AC3 violated: expected CorruptCommittedFrame, got {err:?}"
+            );
+            assert_eq!(err.stable_code_str(), "LBR-IO-001");
+
+            // AC4: Exact whole-lane and `quarantine/` byte-for-byte snapshot zero mutation.
+            assert_eq!(
+                snapshot_tree(normal_dir),
+                lane_before,
+                "{trunc_label}: AC4 violated — normal/ mutated on Case E short segment"
+            );
+            assert_eq!(
+                snapshot_tree(&init.paths.quarantine),
+                q_before,
+                "{trunc_label}: AC4 violated — quarantine/ mutated on Case E short segment"
+            );
+
+            let rec_err = recover_lane(repo.path(), CaptureQueueLane::Normal)
+                .expect_err("AC3 (recover_lane): Case E short segment must fail closed");
+            assert!(matches!(
+                rec_err,
+                StorageBackendError::CorruptCommittedFrame { .. }
+            ));
+            assert_eq!(rec_err.stable_code_str(), "LBR-IO-001");
+            assert_eq!(snapshot_tree(normal_dir), lane_before);
+            assert_eq!(snapshot_tree(&init.paths.quarantine), q_before);
+        }
+    }
+
+    /// `RB-08c` AC5–AC6: Case C (`actual_len > committed_len` uncommitted tail)
+    /// with a single-byte bitflip inside `[0, committed_len)` is rejected in
+    /// Phase 1 with `CorruptCommittedFrame` (`LBR-IO-001`) strictly BEFORE
+    /// scanning the uncommitted tail (0 `CaseCTailScanStart` observer events)
+    /// and with exact whole-lane & `quarantine/` byte-for-byte zero mutation
+    /// (plus positive control restoring the flipped bit).
+    #[test]
+    fn case_c_prefix_bitflip_rejected_zero_mutation_before_tail_scan() {
+        for (case_label, append_damaged_half_tail) in [
+            ("case-c-prefix-bitflip-with-clean-tail", false),
+            ("case-c-prefix-bitflip-with-synced-plus-damaged-half", true),
+        ] {
+            let repo = tempdir().expect("tempdir");
+            let init = init_capture_queue(repo.path()).expect("init capture queue");
+            let normal_dir = &init.paths.normal;
+            let f1 = append_frame(
+                repo.path(),
+                CaptureQueueLane::Normal,
+                FRAME_FLAG_NONE,
+                "rb08c-case-c-prefix",
+                b"committed-prefix-before-uncommitted-tail",
+            )
+            .unwrap();
+            let seg0_path = normal_dir.join(segment_log_file_name(0));
+
+            // Append uncommitted tail (`actual_len > committed_len`).
+            let synced_tail = encode_frame(
+                FRAME_FLAG_NONE,
+                "rb08c-case-c-tail",
+                b"uncommitted-complete-synced-tail",
+            )
+            .unwrap();
+            let half_src = encode_frame(
+                FRAME_FLAG_NONE,
+                "rb08c-case-c-half",
+                b"uncommitted-damaged-half-frame",
+            )
+            .unwrap();
+            let half_tail = &half_src[..half_src.len() / 2];
+            {
+                let mut f = fs::OpenOptions::new()
+                    .append(true)
+                    .open(&seg0_path)
+                    .unwrap();
+                f.write_all(&synced_tail).unwrap();
+                if append_damaged_half_tail {
+                    f.write_all(half_tail).unwrap();
+                }
+                f.sync_data().unwrap();
+            }
+
+            // Flip 1 byte inside `[0, committed_len)`.
+            let mut seg_bytes = fs::read(&seg0_path).unwrap();
+            assert!(seg_bytes.len() as u64 > f1.meta.committed_len);
+            let flip_idx = (f1.meta.committed_len as usize) / 2;
+            seg_bytes[flip_idx] ^= 0x80;
+            write_bytes_0600(&seg0_path, &seg_bytes);
+
+            // Plant `.tmp` files in lane and shared `quarantine/`.
+            write_bytes_0600(
+                &normal_dir.join(QUEUE_TAIL_META_TMP_FILE),
+                b"case-c-meta-tmp",
+            );
+            write_bytes_0600(
+                &normal_dir.join(QUEUE_TAIL_META_BAK_TMP_FILE),
+                b"case-c-bak-tmp",
+            );
+            write_bytes_0600(
+                &init.paths.quarantine.join("normal-orphan.tmp"),
+                b"case-c-q-normal-tmp",
+            );
+            write_bytes_0600(
+                &init.paths.quarantine.join("priority-orphan.tmp"),
+                b"case-c-q-priority-tmp",
+            );
+
+            let lane_before = snapshot_tree(normal_dir);
+            let q_before = snapshot_tree(&init.paths.quarantine);
+
+            // AC5 (producer append path): Phase 1 rejects with `LBR-IO-001`
+            // strictly BEFORE `scan_case_c_uncommitted_tail` (0 `CaseCTailScanStart`).
+            let incoming =
+                encode_frame(FRAME_FLAG_NONE, "rb08c-case-c-new", b"must-not-write").unwrap();
+            let mut app_obs = SegmentObserver::new();
+            let app_err = append_validated_frame_in_storage_dir(
+                repo.path(),
+                CaptureQueueLane::Normal,
+                &incoming,
+                &mut app_obs,
+            )
+            .expect_err("AC5: Case C prefix bitflip must fail closed before tail scan");
+            assert!(
+                matches!(app_err, StorageBackendError::CorruptCommittedFrame { .. }),
+                "{case_label}: AC5 violated: expected CorruptCommittedFrame, got {app_err:?}"
+            );
+            assert_eq!(app_err.stable_code_str(), "LBR-IO-001");
+            assert!(
+                !app_obs
+                    .events
+                    .iter()
+                    .any(|e| matches!(e, SegmentOpEvent::CaseCTailScanStart { .. })),
+                "{case_label}: AC5 violated — Phase 1 must reject prefix bitflip BEFORE scanning tail"
+            );
+
+            // AC6: Exact whole-lane and `quarantine/` byte-for-byte snapshot zero mutation.
+            assert_eq!(
+                snapshot_tree(normal_dir),
+                lane_before,
+                "{case_label}: AC6 violated after append — normal/ mutated"
+            );
+            assert_eq!(
+                snapshot_tree(&init.paths.quarantine),
+                q_before,
+                "{case_label}: AC6 violated after append — quarantine/ mutated"
+            );
+
+            // Same verification on `recover_lane` path.
+            let mut rec_obs = SegmentObserver::new();
+            let rec_err =
+                recover_lane_in_storage_dir(repo.path(), CaptureQueueLane::Normal, &mut rec_obs)
+                    .expect_err("AC5 (recover_lane): Case C prefix bitflip must fail closed");
+            assert!(matches!(
+                rec_err,
+                StorageBackendError::CorruptCommittedFrame { .. }
+            ));
+            assert_eq!(rec_err.stable_code_str(), "LBR-IO-001");
+            assert!(
+                !rec_obs
+                    .events
+                    .iter()
+                    .any(|e| matches!(e, SegmentOpEvent::CaseCTailScanStart { .. })),
+                "{case_label}: AC5 violated on recover_lane — scanned tail despite corrupt prefix"
+            );
+            assert_eq!(snapshot_tree(normal_dir), lane_before);
+            assert_eq!(snapshot_tree(&init.paths.quarantine), q_before);
+
+            // Positive control: flip that single byte back so `[0, committed_len)`
+            // matches `prefix_crc32c` -> Phase 1 DOES reach `CaseCTailScanStart`
+            // (count == 1) and recovers cleanly!
+            seg_bytes[flip_idx] ^= 0x80;
+            write_bytes_0600(&seg0_path, &seg_bytes);
+            let mut ok_obs = SegmentObserver::new();
+            let ok_rec =
+                recover_lane_in_storage_dir(repo.path(), CaptureQueueLane::Normal, &mut ok_obs)
+                    .expect("positive control with restored prefix must recover cleanly");
+            assert_eq!(ok_rec.recovered_frames, 1);
+            assert_eq!(
+                ok_obs
+                    .events
+                    .iter()
+                    .filter(|e| matches!(e, SegmentOpEvent::CaseCTailScanStart { seg_id: 0 }))
+                    .count(),
+                1,
+                "{case_label}: positive control must reach CaseCTailScanStart once"
+            );
         }
     }
 }
