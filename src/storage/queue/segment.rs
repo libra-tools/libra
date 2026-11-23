@@ -33,7 +33,7 @@ use std::{
 use std::{
     fs::File,
     io::{self, Read as _, Seek as _, SeekFrom, Write as _},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use serde::Serialize;
@@ -58,9 +58,10 @@ use crate::storage::{
     queue::{
         CAPTURE_QUEUE_SUBDIR, FrameDecodeError, FrameEncodeError, FrameStreamDecoder,
         FrameStreamItem, LTM2_MAX_LEN, LaneTailMeta, Ltm2CodecError, QUEUE_LANE_NORMAL_DIR,
-        QUEUE_LANE_PRIORITY_DIR, QUEUE_TAIL_META_BAK_FILE, QUEUE_TAIL_META_FILE, crc32c_append,
-        decode_frame, encode_frame, encode_postcard_frame, map_queue_owner_mismatch_err,
-        map_queue_symlink_err, matches_segment_log_glob_bytes, segment_log_file_name,
+        QUEUE_LANE_PRIORITY_DIR, QUEUE_QUARANTINE_DIR, QUEUE_TAIL_META_BAK_FILE,
+        QUEUE_TAIL_META_FILE, crc32c_append, crc32c_checksum, decode_frame, encode_frame,
+        encode_postcard_frame, map_queue_owner_mismatch_err, map_queue_symlink_err,
+        matches_segment_log_glob_bytes, segment_log_file_name,
     },
 };
 
@@ -69,6 +70,13 @@ pub const QUEUE_TAIL_META_TMP_FILE: &str = "tail.meta.tmp";
 
 /// Staging filename used during atomic replacement of `tail.meta.bak` (`ADR-RB-05` #3, `RB-08`).
 pub const QUEUE_TAIL_META_BAK_TMP_FILE: &str = "tail.meta.bak.tmp";
+
+/// Stable diagnostic code recorded whenever uncommitted damaged tail or orphan
+/// bytes are durably published into `quarantine/` (`ADR-RB-05` #3, `RB-08t`).
+pub const QUARANTINE_DIAGNOSTIC_CODE: &str = "LBR-AGENT-050";
+
+/// Maximum legal byte length of a quarantine artifact identifier (`<lane>-seg<S>-off<offset>-<crc32c>`).
+const MAX_QUARANTINE_ID_LEN: usize = 160;
 
 /// Streaming I/O chunk size used for hardware-accelerated prefix CRC32C
 /// verification and Case C incremental CRC extension (64 KiB, zero heap).
@@ -117,6 +125,79 @@ pub fn is_lane_meta_temp_name(name: &[u8]) -> bool {
         || (name.starts_with(b"tail.meta") && name.ends_with(b".tmp"))
 }
 
+/// Construct the canonical deterministic quarantine artifact identifier from a
+/// precomputed Castagnoli CRC32C checksum (used by bounded streaming recovery
+/// paths without buffering the entire tail in memory).
+#[must_use]
+fn quarantine_artifact_id_from_crc(
+    lane: CaptureQueueLane,
+    seg_id: u32,
+    offset: u64,
+    crc32c: u32,
+) -> String {
+    format!(
+        "{}-seg{seg_id:08}-off{offset}-{crc32c:08x}",
+        lane_dir_name(lane)
+    )
+}
+
+/// Construct the canonical deterministic quarantine artifact identifier
+/// `<lane>-seg<S:08>-off<offset>-<crc32c:08x>` (`ADR-RB-05` #3, `RB-08t`).
+///
+/// The `<lane>-` prefix ensures Phase 2 lane-scoped cleanup ONLY ever removes
+/// leftover `quarantine/<lane>-*.tmp` files owned by the lane being recovered,
+/// never touching the opposite lane's temporary files.
+#[must_use]
+pub fn quarantine_artifact_id(
+    lane: CaptureQueueLane,
+    seg_id: u32,
+    offset: u64,
+    damaged_bytes: &[u8],
+) -> String {
+    quarantine_artifact_id_from_crc(lane, seg_id, offset, crc32c_checksum(damaged_bytes))
+}
+
+/// Returns `true` iff `name` is a lane-scoped quarantine temporary file
+/// `quarantine/<lane>-*.tmp` eligible for Phase 2 cleanup ONLY when `lane` has
+/// passed Phase 1 read-only classification (`ADR-RB-05` #3, `RB-08t`).
+#[must_use]
+pub fn is_lane_quarantine_temp_name(lane: CaptureQueueLane, name: &[u8]) -> bool {
+    let prefix = match lane {
+        CaptureQueueLane::Priority => b"priority-".as_slice(),
+        CaptureQueueLane::Normal => b"normal-".as_slice(),
+    };
+    name.starts_with(prefix) && name.ends_with(b".tmp") && name.len() > prefix.len() + b".tmp".len()
+}
+
+fn validate_quarantine_artifact_id(id: &str) -> StorageResult<()> {
+    if id.is_empty() || id.len() > MAX_QUARANTINE_ID_LEN {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "quarantine artifact id length is invalid".to_string(),
+        });
+    }
+    if !id
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "quarantine artifact id contains invalid characters".to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Result returned after durably publishing damaged uncommitted bytes into
+/// `quarantine/<id>.bin` via `.tmp -> sync_data -> rename(.bin) -> fsync_dir`
+/// (`ADR-RB-05` #3, `RB-08t`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuarantinePublishReport {
+    pub id: String,
+    pub bin_path: PathBuf,
+    pub quarantined_bytes: u64,
+    pub crc32c: u32,
+    pub diagnostic_code: &'static str,
+}
+
 /// Outcome returned after a durable frame append to a capture queue lane (`RB-08`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SegmentAppendOutcome {
@@ -137,6 +218,7 @@ pub struct LaneRecoveryReport {
     pub recovered_bytes: u64,
     pub mirrored_replica: bool,
     pub cleaned_tmp_files: usize,
+    pub cleaned_quarantine_tmp_files: usize,
     pub reclaimed_orphans_removed: usize,
 }
 
@@ -303,6 +385,46 @@ enum SegmentOpEvent {
         to_offset: u64,
         frame_count: usize,
     },
+    QuarantineTmpSyncDataStart {
+        id: String,
+    },
+    QuarantineTmpSyncDataComplete {
+        id: String,
+    },
+    QuarantineRenameStart {
+        id: String,
+    },
+    QuarantineRenameComplete {
+        id: String,
+    },
+    QuarantineFsyncDirStart {
+        id: String,
+    },
+    QuarantineFsyncDirComplete {
+        id: String,
+    },
+    SegmentTruncateStart {
+        lane: &'static str,
+        seg_id: u32,
+        to_len: u64,
+    },
+    SegmentTruncateComplete {
+        lane: &'static str,
+        seg_id: u32,
+        to_len: u64,
+    },
+    OrphanUnlinkStart {
+        lane: &'static str,
+        seg_id: u32,
+    },
+    OrphanUnlinkComplete {
+        lane: &'static str,
+        seg_id: u32,
+    },
+    FsyncLaneDirAfterOrphanUnlink {
+        lane: &'static str,
+        seg_id: u32,
+    },
     ReleaseAppendLock,
 }
 
@@ -323,6 +445,14 @@ enum SegmentCrashPoint {
     /// before `rename("tail.meta.bak.tmp", "tail.meta.bak")`, leaving
     /// `tail.meta.bak.tmp` on disk.
     BeforeBackupMetaRename,
+    /// Simulate process crash after `quarantine/<id>.tmp` `sync_data()` and
+    /// strictly before `rename(.tmp -> .bin)`, leaving `<id>.tmp` on disk and
+    /// leaving the source segment completely unmodified (`RB-08t` AC6–AC7).
+    BeforeQuarantineRename,
+    /// Simulate process crash immediately after `fsync_dir(quarantine_dir)`
+    /// and strictly before destructive `truncate` or `unlink`, leaving
+    /// `quarantine/<id>.bin` durably persisted (`RB-08t` AC8).
+    AfterQuarantineDirFsyncBeforeDestructive,
 }
 
 #[cfg(test)]
@@ -449,6 +579,67 @@ impl SegmentObserver {
         });
     }
 
+    fn record_quarantine_tmp_sync_start(&mut self, id: &str) {
+        self.events
+            .push(SegmentOpEvent::QuarantineTmpSyncDataStart { id: id.to_string() });
+    }
+
+    fn record_quarantine_tmp_sync_complete(&mut self, id: &str) {
+        self.events
+            .push(SegmentOpEvent::QuarantineTmpSyncDataComplete { id: id.to_string() });
+    }
+
+    fn record_quarantine_rename_start(&mut self, id: &str) {
+        self.events
+            .push(SegmentOpEvent::QuarantineRenameStart { id: id.to_string() });
+    }
+
+    fn record_quarantine_rename_complete(&mut self, id: &str) {
+        self.events
+            .push(SegmentOpEvent::QuarantineRenameComplete { id: id.to_string() });
+    }
+
+    fn record_quarantine_fsync_dir_start(&mut self, id: &str) {
+        self.events
+            .push(SegmentOpEvent::QuarantineFsyncDirStart { id: id.to_string() });
+    }
+
+    fn record_quarantine_fsync_dir_complete(&mut self, id: &str) {
+        self.events
+            .push(SegmentOpEvent::QuarantineFsyncDirComplete { id: id.to_string() });
+    }
+
+    fn record_segment_truncate_start(&mut self, lane: &'static str, seg_id: u32, to_len: u64) {
+        self.events.push(SegmentOpEvent::SegmentTruncateStart {
+            lane,
+            seg_id,
+            to_len,
+        });
+    }
+
+    fn record_segment_truncate_complete(&mut self, lane: &'static str, seg_id: u32, to_len: u64) {
+        self.events.push(SegmentOpEvent::SegmentTruncateComplete {
+            lane,
+            seg_id,
+            to_len,
+        });
+    }
+
+    fn record_orphan_unlink_start(&mut self, lane: &'static str, seg_id: u32) {
+        self.events
+            .push(SegmentOpEvent::OrphanUnlinkStart { lane, seg_id });
+    }
+
+    fn record_orphan_unlink_complete(&mut self, lane: &'static str, seg_id: u32) {
+        self.events
+            .push(SegmentOpEvent::OrphanUnlinkComplete { lane, seg_id });
+    }
+
+    fn record_fsync_lane_after_orphan_unlink(&mut self, lane: &'static str, seg_id: u32) {
+        self.events
+            .push(SegmentOpEvent::FsyncLaneDirAfterOrphanUnlink { lane, seg_id });
+    }
+
     fn record_release_lock(&mut self) {
         self.events.push(SegmentOpEvent::ReleaseAppendLock);
     }
@@ -472,6 +663,8 @@ enum SegmentCrashPoint {
     BeforePrimaryMetaRename,
     AfterPrimaryMetaCommit,
     BeforeBackupMetaRename,
+    BeforeQuarantineRename,
+    AfterQuarantineDirFsyncBeforeDestructive,
 }
 
 #[cfg(not(test))]
@@ -536,6 +729,45 @@ impl SegmentObserver {
         _frame_count: usize,
     ) {
     }
+
+    #[inline]
+    fn record_quarantine_tmp_sync_start(&mut self, _id: &str) {}
+
+    #[inline]
+    fn record_quarantine_tmp_sync_complete(&mut self, _id: &str) {}
+
+    #[inline]
+    fn record_quarantine_rename_start(&mut self, _id: &str) {}
+
+    #[inline]
+    fn record_quarantine_rename_complete(&mut self, _id: &str) {}
+
+    #[inline]
+    fn record_quarantine_fsync_dir_start(&mut self, _id: &str) {}
+
+    #[inline]
+    fn record_quarantine_fsync_dir_complete(&mut self, _id: &str) {}
+
+    #[inline]
+    fn record_segment_truncate_start(&mut self, _lane: &'static str, _seg_id: u32, _to_len: u64) {}
+
+    #[inline]
+    fn record_segment_truncate_complete(
+        &mut self,
+        _lane: &'static str,
+        _seg_id: u32,
+        _to_len: u64,
+    ) {
+    }
+
+    #[inline]
+    fn record_orphan_unlink_start(&mut self, _lane: &'static str, _seg_id: u32) {}
+
+    #[inline]
+    fn record_orphan_unlink_complete(&mut self, _lane: &'static str, _seg_id: u32) {}
+
+    #[inline]
+    fn record_fsync_lane_after_orphan_unlink(&mut self, _lane: &'static str, _seg_id: u32) {}
 
     #[inline]
     fn record_release_lock(&mut self) {}
@@ -843,6 +1075,184 @@ pub fn read_converged_lane_tail_meta(lane_dir: &Path) -> StorageResult<LaneTailM
     {
         non_unix_seg::read_converged_lane_tail_meta_non_unix(lane_dir)
     }
+}
+
+/// Durably publish damaged uncommitted bytes into `quarantine/<id>.bin` via the
+/// crash-safe 4-step barrier (`ADR-RB-05` #3, `RB-08t`):
+/// 1. Create `quarantine/<id>.tmp` (`0600`, `O_NOFOLLOW`) and write `bytes`.
+/// 2. `tmp_file.sync_data()`.
+/// 3. Atomic `rename(<id>.tmp -> <id>.bin)`.
+/// 4. `fsync_dir(quarantine_dir)`.
+pub fn publish_quarantine_durable(
+    quarantine_dir: &Path,
+    id: &str,
+    bytes: &[u8],
+) -> StorageResult<QuarantinePublishReport> {
+    let mut observer = SegmentObserver::new();
+    publish_quarantine_durable_inner(quarantine_dir, id, bytes, &mut observer)
+}
+
+/// Crash-safe structural barrier for damaged segment tails (`ADR-RB-05` #3,
+/// `RB-08t`): durably publishes `[valid_end, actual_len)` of
+/// `<lane_dir>/events-<seg_id:08>.log` into `<quarantine_dir>/<id>.bin`
+/// (`.tmp -> sync_data -> rename(.bin) -> fsync_dir(quarantine_dir)`) strictly
+/// **before** truncating the segment to `valid_end` and calling `sync_data()`.
+pub fn quarantine_and_truncate_segment(
+    quarantine_dir: &Path,
+    lane_dir: &Path,
+    lane: CaptureQueueLane,
+    seg_id: u32,
+    valid_end: u64,
+) -> StorageResult<QuarantinePublishReport> {
+    let mut observer = SegmentObserver::new();
+    quarantine_and_truncate_segment_inner(
+        quarantine_dir,
+        lane_dir,
+        lane,
+        seg_id,
+        valid_end,
+        &mut observer,
+    )
+}
+
+/// Crash-safe structural barrier for non-empty damaged orphan successor
+/// segments (`ADR-RB-05` #3, `RB-08t`): durably publishes the full bytes of
+/// `<lane_dir>/events-<orphan_seg_id:08>.log` into `<quarantine_dir>/<id>.bin`
+/// (`.tmp -> sync_data -> rename(.bin) -> fsync_dir(quarantine_dir)`) strictly
+/// **before** executing `unlink` + `fsync_dir(lane_dir)`.
+pub fn quarantine_and_unlink_orphan(
+    quarantine_dir: &Path,
+    lane_dir: &Path,
+    lane: CaptureQueueLane,
+    orphan_seg_id: u32,
+) -> StorageResult<QuarantinePublishReport> {
+    let mut observer = SegmentObserver::new();
+    quarantine_and_unlink_orphan_inner(quarantine_dir, lane_dir, lane, orphan_seg_id, &mut observer)
+}
+
+fn publish_quarantine_durable_inner(
+    quarantine_dir: &Path,
+    id: &str,
+    bytes: &[u8],
+    observer: &mut SegmentObserver,
+) -> StorageResult<QuarantinePublishReport> {
+    validate_quarantine_artifact_id(id)?;
+    #[cfg(unix)]
+    {
+        let owners = UnixExpectedQueueOwners::current_effective();
+        unix_seg::publish_quarantine_durable_unix(quarantine_dir, id, bytes, owners, observer)
+    }
+    #[cfg(not(unix))]
+    {
+        non_unix_seg::publish_quarantine_durable_non_unix(quarantine_dir, id, bytes, observer)
+    }
+}
+
+fn quarantine_and_truncate_segment_inner(
+    quarantine_dir: &Path,
+    lane_dir: &Path,
+    lane: CaptureQueueLane,
+    seg_id: u32,
+    valid_end: u64,
+    observer: &mut SegmentObserver,
+) -> StorageResult<QuarantinePublishReport> {
+    #[cfg(unix)]
+    {
+        let owners = UnixExpectedQueueOwners::current_effective();
+        unix_seg::quarantine_and_truncate_segment_unix(
+            quarantine_dir,
+            lane_dir,
+            lane,
+            seg_id,
+            valid_end,
+            owners,
+            observer,
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        non_unix_seg::quarantine_and_truncate_segment_non_unix(
+            quarantine_dir,
+            lane_dir,
+            lane,
+            seg_id,
+            valid_end,
+            observer,
+        )
+    }
+}
+
+fn quarantine_and_unlink_orphan_inner(
+    quarantine_dir: &Path,
+    lane_dir: &Path,
+    lane: CaptureQueueLane,
+    orphan_seg_id: u32,
+    observer: &mut SegmentObserver,
+) -> StorageResult<QuarantinePublishReport> {
+    #[cfg(unix)]
+    {
+        let owners = UnixExpectedQueueOwners::current_effective();
+        unix_seg::quarantine_and_unlink_orphan_unix(
+            quarantine_dir,
+            lane_dir,
+            lane,
+            orphan_seg_id,
+            owners,
+            observer,
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        non_unix_seg::quarantine_and_unlink_orphan_non_unix(
+            quarantine_dir,
+            lane_dir,
+            lane,
+            orphan_seg_id,
+            observer,
+        )
+    }
+}
+
+/// Stream-compute the Castagnoli CRC32C of `file[start..start + len]` using a
+/// fixed 64 KiB stack buffer (zero heap allocation, safe for arbitrarily large
+/// damaged segments).
+fn stream_crc32c_file_range(file: &mut File, start: u64, len: u64) -> StorageResult<u32> {
+    extend_crc32c_over_file_range(file, start, len, 0)
+}
+
+/// Stream-copy exact `len` bytes from `src[start..start + len]` into `dst`
+/// using a fixed 64 KiB stack buffer (zero heap allocation) while returning the
+/// Castagnoli CRC32C of the exact bytes written.
+fn stream_copy_file_range_with_crc(
+    src: &mut File,
+    start: u64,
+    len: u64,
+    dst: &mut File,
+) -> StorageResult<u32> {
+    src.seek(SeekFrom::Start(start))
+        .map_err(|e| StorageBackendError::io("seek segment for streaming quarantine copy", e))?;
+
+    let mut remaining = len;
+    let mut running_crc = 0u32;
+    let mut buf = [0u8; PREFIX_CRC_CHUNK_BYTES];
+
+    while remaining > 0 {
+        let want = usize::try_from(remaining.min(buf.len() as u64)).unwrap_or(buf.len());
+        let read_n = read_exact_chunk(src, &mut buf[..want])
+            .map_err(|e| StorageBackendError::io("read segment bytes for quarantine", e))?;
+        if read_n < want {
+            return Err(StorageBackendError::io(
+                "short read streaming segment bytes for quarantine",
+                io::Error::new(io::ErrorKind::UnexpectedEof, "unexpected eof"),
+            ));
+        }
+        dst.write_all(&buf[..read_n])
+            .map_err(|e| StorageBackendError::io("write quarantine temp bytes", e))?;
+        running_crc = crc32c_append(running_crc, &buf[..read_n]);
+        remaining -= read_n as u64;
+    }
+
+    Ok(running_crc)
 }
 
 fn append_validated_frame_in_storage_dir(
@@ -2047,6 +2457,755 @@ mod unix_seg {
         Ok(File::from(fd))
     }
 
+    fn open_quarantine_dir_fd(
+        root_fd: &OwnedFd,
+        owners: UnixExpectedQueueOwners,
+    ) -> StorageResult<OwnedFd> {
+        let (q_fd, q_st) = openat_dir_nofollow(
+            root_fd,
+            OsStr::new(QUEUE_QUARANTINE_DIR),
+            owners.quarantine_uid,
+            "capture queue quarantine directory",
+        )?;
+        verify_dir_mode_0700(&q_st, "capture queue quarantine directory")?;
+        Ok(q_fd)
+    }
+
+    /// Scan `quarantine_fd` strictly for lane-scoped temporary files
+    /// `quarantine/<lane>-*.tmp` and clean ONLY those owned by `lane`, NEVER
+    /// touching the opposite lane's `.tmp` files, unowned `.tmp`, or `.bin`
+    /// artifacts (`ADR-RB-05` #3, `RB-08t` AC6). Must ONLY be called in Phase 2
+    /// after Phase 1 read-only classification confirms `lane` is valid/recoverable.
+    fn clean_lane_quarantine_tmp_files_unix(
+        quarantine_fd: &OwnedFd,
+        lane: CaptureQueueLane,
+        expected_uid: u32,
+    ) -> StorageResult<usize> {
+        // SAFETY: `quarantine_fd` is a valid open directory descriptor.
+        let dup_raw = unsafe { libc::fcntl(quarantine_fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+        if dup_raw < 0 {
+            return Err(StorageBackendError::io(
+                "duplicate capture queue quarantine descriptor",
+                io::Error::last_os_error(),
+            ));
+        }
+        // SAFETY: `dup_raw` is valid; `fdopendir` takes ownership on success.
+        let dir_ptr = unsafe { libc::fdopendir(dup_raw) };
+        if dir_ptr.is_null() {
+            let err = io::Error::last_os_error();
+            // SAFETY: `fdopendir` failed so we still own `dup_raw`.
+            unsafe {
+                libc::close(dup_raw);
+            }
+            return Err(StorageBackendError::io(
+                "open capture queue quarantine directory stream",
+                err,
+            ));
+        }
+        let guard = DirStreamGuard { ptr: dir_ptr };
+        let mut stale_names = Vec::new();
+        loop {
+            clear_errno();
+            // SAFETY: `guard.ptr` is a valid open `DIR*`.
+            let entry = unsafe { libc::readdir(guard.ptr) };
+            if entry.is_null() {
+                let err = io::Error::last_os_error();
+                if err.raw_os_error().unwrap_or(0) != 0 {
+                    return Err(StorageBackendError::io(
+                        "read capture queue quarantine directory entry",
+                        err,
+                    ));
+                }
+                break;
+            }
+            // SAFETY: `entry` is non-null and `d_name` is NUL-terminated.
+            let name_bytes = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+            if is_lane_quarantine_temp_name(lane, name_bytes) {
+                stale_names.push(OsStr::from_bytes(name_bytes).to_os_string());
+            }
+        }
+        drop(guard);
+        clean_stale_tmp_files_unix(quarantine_fd, &stale_names, expected_uid)
+    }
+
+    /// Descriptor-pinned Unix implementation of `publish_quarantine_durable`
+    /// (`ADR-RB-05` #3, `RB-08t` AC1–AC3, AC6–AC8):
+    /// serialized under held `append.lock` (`_append_lock`), executes
+    /// `openat(<id>.tmp, O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC, 0600)`
+    /// -> `fchmod(0600)` + verify -> bounded streaming `write_fn` ->
+    /// `tmp_file.sync_data()` -> verify `(st_dev, st_ino)` pre-rename ->
+    /// `renameat(<id>.tmp -> <id>.bin)` while `tmp_file` stays open ->
+    /// verify `(st_dev, st_ino)` post-rename -> `fsync_dir(quarantine_fd)`.
+    fn publish_quarantine_durable_writer_at_fd<F>(
+        quarantine_fd: &OwnedFd,
+        quarantine_dir: &Path,
+        id: &str,
+        expected_uid: u32,
+        _append_lock: &AppendLockGuard,
+        observer: &mut SegmentObserver,
+        write_fn: F,
+    ) -> StorageResult<QuarantinePublishReport>
+    where
+        F: FnOnce(&mut File) -> StorageResult<(u64, u32)>,
+    {
+        validate_quarantine_artifact_id(id)?;
+        let tmp_name = format!("{id}.tmp");
+        let bin_name = format!("{id}.bin");
+        let ctmp = osstr_to_cstring(OsStr::new(&tmp_name), "create quarantine temp file")?;
+        let cbin = osstr_to_cstring(OsStr::new(&bin_name), "publish quarantine bin file")?;
+
+        // Verify any pre-existing `<id>.bin` (idempotent replay) is an owned
+        // regular file and never a symlink/directory.
+        let mut bin_st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+        // SAFETY: `quarantine_fd` is valid and `cbin` is NUL-terminated.
+        let bin_rc = unsafe {
+            libc::fstatat(
+                quarantine_fd.as_raw_fd(),
+                cbin.as_ptr(),
+                bin_st.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if bin_rc == 0 {
+            // SAFETY: `fstatat` succeeded.
+            let bin_st = unsafe { bin_st.assume_init() };
+            if (bin_st.st_mode & libc::S_IFMT) == libc::S_IFLNK {
+                return Err(map_queue_symlink_err("capture queue quarantine artifact"));
+            }
+            if (bin_st.st_mode & libc::S_IFMT) != libc::S_IFREG {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: "capture queue quarantine target is not a regular file".to_string(),
+                });
+            }
+            if bin_st.st_uid != expected_uid {
+                return Err(map_queue_owner_mismatch_err(
+                    "capture queue quarantine artifact",
+                ));
+            }
+        } else {
+            let err = io::Error::last_os_error();
+            if err.kind() != io::ErrorKind::NotFound {
+                return Err(StorageBackendError::io(
+                    "inspect capture queue quarantine artifact",
+                    err,
+                ));
+            }
+        }
+
+        // Open `<id>.tmp` exclusively with `0600` / `O_NOFOLLOW`. Because
+        // `append.lock` is held across all publishers and lane recovery, any
+        // pre-existing `<id>.tmp` is guaranteed stale from a prior crashed
+        // publisher; verify it is an owned regular file before unlinking.
+        let create_flags =
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        let tmp_fd = {
+            let mut created = None;
+            for attempt in 0..2 {
+                // SAFETY: `quarantine_fd` is valid and `ctmp` is NUL-terminated.
+                let raw_fd = unsafe {
+                    libc::openat(
+                        quarantine_fd.as_raw_fd(),
+                        ctmp.as_ptr(),
+                        create_flags,
+                        QUEUE_FILE_MODE as libc::c_uint,
+                    )
+                };
+                if raw_fd >= 0 {
+                    // SAFETY: `raw_fd >= 0` is exclusively owned here.
+                    created = Some(unsafe { OwnedFd::from_raw_fd(raw_fd) });
+                    break;
+                }
+                let err = io::Error::last_os_error();
+                if is_symlink_errno_at(&err, quarantine_fd, &ctmp) {
+                    return Err(map_queue_symlink_err("capture queue quarantine temp"));
+                }
+                if err.kind() == io::ErrorKind::AlreadyExists && attempt == 0 {
+                    let mut stale_st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+                    // SAFETY: `quarantine_fd` is valid and `ctmp` is NUL-terminated.
+                    let st_rc = unsafe {
+                        libc::fstatat(
+                            quarantine_fd.as_raw_fd(),
+                            ctmp.as_ptr(),
+                            stale_st.as_mut_ptr(),
+                            libc::AT_SYMLINK_NOFOLLOW,
+                        )
+                    };
+                    if st_rc != 0 {
+                        let st_err = io::Error::last_os_error();
+                        if st_err.kind() == io::ErrorKind::NotFound {
+                            continue;
+                        }
+                        return Err(StorageBackendError::io(
+                            "inspect stale quarantine temp file",
+                            st_err,
+                        ));
+                    }
+                    // SAFETY: `fstatat` succeeded.
+                    let stale_st = unsafe { stale_st.assume_init() };
+                    if (stale_st.st_mode & libc::S_IFMT) == libc::S_IFLNK {
+                        return Err(map_queue_symlink_err("capture queue quarantine temp"));
+                    }
+                    if (stale_st.st_mode & libc::S_IFMT) != libc::S_IFREG {
+                        return Err(StorageBackendError::BackendInternal {
+                            detail: "capture queue quarantine temp entry is not a regular file"
+                                .to_string(),
+                        });
+                    }
+                    if stale_st.st_uid != expected_uid {
+                        return Err(map_queue_owner_mismatch_err(
+                            "capture queue quarantine temp",
+                        ));
+                    }
+                    // SAFETY: `quarantine_fd` is valid and `ctmp` is NUL-terminated.
+                    let unlink_rc =
+                        unsafe { libc::unlinkat(quarantine_fd.as_raw_fd(), ctmp.as_ptr(), 0) };
+                    if unlink_rc != 0 {
+                        let uerr = io::Error::last_os_error();
+                        if uerr.kind() != io::ErrorKind::NotFound {
+                            return Err(StorageBackendError::io(
+                                "unlink stale quarantine temp file",
+                                uerr,
+                            ));
+                        }
+                    }
+                    continue;
+                }
+                return Err(StorageBackendError::io("create quarantine temp file", err));
+            }
+            created.ok_or_else(|| StorageBackendError::BackendInternal {
+                detail: "failed to create quarantine temp file after stale cleanup".to_string(),
+            })?
+        };
+        let mut unlink_guard = TempUnlinkGuard::new(quarantine_fd, ctmp.clone());
+
+        fchmod_fd(
+            &tmp_fd,
+            QUEUE_FILE_MODE,
+            "enforce 0600 mode on quarantine temp file",
+        )?;
+        let st = fstat_fd(&tmp_fd, "verify quarantine temp file mode")?;
+        if (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
+            return Err(StorageBackendError::BackendInternal {
+                detail: "capture queue quarantine temp is not a regular file".to_string(),
+            });
+        }
+        if st.st_uid != expected_uid {
+            return Err(map_queue_owner_mismatch_err(
+                "capture queue quarantine temp",
+            ));
+        }
+        if unix_perm_bits(st.st_mode) != QUEUE_FILE_MODE {
+            return Err(StorageBackendError::BackendInternal {
+                detail: "capture queue quarantine temp permissions failed to settle at 0600"
+                    .to_string(),
+            });
+        }
+        let tmp_dev = st.st_dev;
+        let tmp_ino = st.st_ino;
+
+        let mut tmp_file = File::from(tmp_fd);
+        let (quarantined_bytes, crc32c) = write_fn(&mut tmp_file)?;
+
+        // Step 1/2: `tmp_file.sync_data()` strictly BEFORE `rename(.tmp -> .bin)`.
+        observer.record_quarantine_tmp_sync_start(id);
+        tmp_file
+            .sync_data()
+            .map_err(|e| StorageBackendError::io("sync quarantine temp data", e))?;
+        observer.record_quarantine_tmp_sync_complete(id);
+
+        if let Err(err) = observer.maybe_crash(SegmentCrashPoint::BeforeQuarantineRename) {
+            // Preserve `<id>.tmp` on disk to faithfully simulate `SIGKILL` before rename.
+            unlink_guard.disarm();
+            drop(tmp_file);
+            return Err(err);
+        }
+
+        // Verify `<id>.tmp` still resolves to the exact synced `(st_dev, st_ino)`
+        // before calling `renameat` (defense-in-depth against external tampering).
+        let mut pre_st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+        // SAFETY: `quarantine_fd` is valid and `ctmp` is NUL-terminated.
+        let pre_rc = unsafe {
+            libc::fstatat(
+                quarantine_fd.as_raw_fd(),
+                ctmp.as_ptr(),
+                pre_st.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if pre_rc != 0 {
+            return Err(StorageBackendError::io(
+                "verify quarantine temp inode before rename",
+                io::Error::last_os_error(),
+            ));
+        }
+        // SAFETY: `fstatat` succeeded.
+        let pre_st = unsafe { pre_st.assume_init() };
+        if pre_st.st_dev != tmp_dev || pre_st.st_ino != tmp_ino {
+            return Err(StorageBackendError::BackendInternal {
+                detail: "capture queue quarantine temp inode changed before rename".to_string(),
+            });
+        }
+
+        // Step 3: Atomic `renameat(.tmp -> .bin)` while keeping `tmp_file` open.
+        observer.record_quarantine_rename_start(id);
+        // SAFETY: `quarantine_fd` is valid and both CStrings are NUL-terminated.
+        let rename_rc = unsafe {
+            libc::renameat(
+                quarantine_fd.as_raw_fd(),
+                ctmp.as_ptr(),
+                quarantine_fd.as_raw_fd(),
+                cbin.as_ptr(),
+            )
+        };
+        if rename_rc != 0 {
+            return Err(StorageBackendError::io(
+                "atomically publish quarantine artifact",
+                io::Error::last_os_error(),
+            ));
+        }
+        unlink_guard.disarm();
+
+        // Confirm `<id>.bin` now refers to the exact synced `(st_dev, st_ino)`
+        // while `tmp_file` keeps that inode pinned.
+        let mut post_st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+        // SAFETY: `quarantine_fd` is valid and `cbin` is NUL-terminated.
+        let post_rc = unsafe {
+            libc::fstatat(
+                quarantine_fd.as_raw_fd(),
+                cbin.as_ptr(),
+                post_st.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if post_rc != 0 {
+            return Err(StorageBackendError::io(
+                "verify quarantine bin inode after rename",
+                io::Error::last_os_error(),
+            ));
+        }
+        // SAFETY: `fstatat` succeeded.
+        let post_st = unsafe { post_st.assume_init() };
+        if post_st.st_dev != tmp_dev || post_st.st_ino != tmp_ino {
+            return Err(StorageBackendError::BackendInternal {
+                detail: "capture queue quarantine bin inode mismatch after rename".to_string(),
+            });
+        }
+        drop(tmp_file);
+        observer.record_quarantine_rename_complete(id);
+
+        // Step 4: `fsync_dir(quarantine_dir)` strictly AFTER `rename` and BEFORE
+        // any destructive `truncate` or `unlink`.
+        observer.record_quarantine_fsync_dir_start(id);
+        fsync_fd(
+            quarantine_fd,
+            "fsync capture queue quarantine directory after publish",
+        )?;
+        observer.record_quarantine_fsync_dir_complete(id);
+
+        observer.maybe_crash(SegmentCrashPoint::AfterQuarantineDirFsyncBeforeDestructive)?;
+
+        Ok(QuarantinePublishReport {
+            id: id.to_string(),
+            bin_path: quarantine_dir.join(bin_name),
+            quarantined_bytes,
+            crc32c,
+            diagnostic_code: QUARANTINE_DIAGNOSTIC_CODE,
+        })
+    }
+
+    pub(super) fn publish_quarantine_durable_at_fd(
+        quarantine_fd: &OwnedFd,
+        quarantine_dir: &Path,
+        id: &str,
+        bytes: &[u8],
+        expected_uid: u32,
+        append_lock: &AppendLockGuard,
+        observer: &mut SegmentObserver,
+    ) -> StorageResult<QuarantinePublishReport> {
+        let len_u64 =
+            u64::try_from(bytes.len()).map_err(|_| StorageBackendError::BackendInternal {
+                detail: "quarantine payload length exceeds u64".to_string(),
+            })?;
+        let crc = crc32c_checksum(bytes);
+        publish_quarantine_durable_writer_at_fd(
+            quarantine_fd,
+            quarantine_dir,
+            id,
+            expected_uid,
+            append_lock,
+            observer,
+            |tmp_file| {
+                tmp_file
+                    .write_all(bytes)
+                    .map_err(|e| StorageBackendError::io("write quarantine temp bytes", e))?;
+                Ok((len_u64, crc))
+            },
+        )
+    }
+
+    /// Pin `queue_root = quarantine_dir.parent()` (`0700`, `O_NOFOLLOW`),
+    /// acquire `<queue_root>/append.lock` strictly (`0600`), and open
+    /// `quarantine_fd` (`0700`, `O_NOFOLLOW`) relative to `root_fd`.
+    fn acquire_quarantine_root_lock_unix(
+        quarantine_dir: &Path,
+        owners: UnixExpectedQueueOwners,
+    ) -> StorageResult<(OwnedFd, OwnedFd, AppendLockGuard)> {
+        let queue_root = quarantine_dir
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .ok_or_else(|| StorageBackendError::BackendInternal {
+                detail: "capture queue quarantine directory has no parent queue root".to_string(),
+            })?;
+        let q_name =
+            quarantine_dir
+                .file_name()
+                .ok_or_else(|| StorageBackendError::BackendInternal {
+                    detail: "capture queue quarantine directory has no basename".to_string(),
+                })?;
+        let (root_fd, root_st) =
+            open_dir_nofollow(queue_root, owners.root_uid, "capture queue root directory")?;
+        verify_dir_mode_0700(&root_st, "capture queue root directory")?;
+        let append_lock =
+            match try_acquire_existing_strict_append_lock_unix(&root_fd, owners.root_uid)? {
+                Some(lock) => lock,
+                None => create_or_acquire_strict_append_lock_unix(&root_fd, owners.root_uid)?,
+            };
+        let (quarantine_fd, q_st) = openat_dir_nofollow(
+            &root_fd,
+            q_name,
+            owners.quarantine_uid,
+            "capture queue quarantine directory",
+        )?;
+        verify_dir_mode_0700(&q_st, "capture queue quarantine directory")?;
+        Ok((root_fd, quarantine_fd, append_lock))
+    }
+
+    pub(super) struct UnixQuarantineDirs<'a> {
+        pub(super) quarantine_fd: &'a OwnedFd,
+        pub(super) quarantine_dir: &'a Path,
+        pub(super) lane_fd: &'a OwnedFd,
+        pub(super) owners: UnixExpectedQueueOwners,
+        pub(super) append_lock: &'a AppendLockGuard,
+    }
+
+    pub(super) fn quarantine_and_truncate_segment_at_fds(
+        dirs: &UnixQuarantineDirs<'_>,
+        lane: CaptureQueueLane,
+        seg_id: u32,
+        valid_end: u64,
+        observer: &mut SegmentObserver,
+    ) -> StorageResult<QuarantinePublishReport> {
+        let lane_uid = lane_expected_uid(dirs.owners, lane);
+        let seg_name = segment_log_file_name(seg_id);
+        let cname = osstr_to_cstring(
+            OsStr::new(&seg_name),
+            "open segment for quarantine truncate",
+        )?;
+        let flags = libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
+        // SAFETY: `dirs.lane_fd` is valid and `cname` is NUL-terminated.
+        let raw_fd = unsafe { libc::openat(dirs.lane_fd.as_raw_fd(), cname.as_ptr(), flags) };
+        if raw_fd < 0 {
+            let err = io::Error::last_os_error();
+            if is_symlink_errno_at(&err, dirs.lane_fd, &cname) {
+                return Err(map_queue_symlink_err("capture queue segment file"));
+            }
+            return Err(StorageBackendError::io(
+                "open segment for quarantine truncate",
+                err,
+            ));
+        }
+        // SAFETY: `raw_fd >= 0` is exclusively owned here.
+        let seg_fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+        let st = fstat_fd(&seg_fd, "stat segment for quarantine truncate")?;
+        if (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
+            return Err(StorageBackendError::CorruptCommittedFrame {
+                detail: "capture queue segment path is not a regular file".to_string(),
+            });
+        }
+        if st.st_uid != lane_uid {
+            return Err(map_queue_owner_mismatch_err("capture queue segment file"));
+        }
+        let actual_len =
+            u64::try_from(st.st_size).map_err(|_| StorageBackendError::CorruptCommittedFrame {
+                detail: "capture queue segment has negative size".to_string(),
+            })?;
+        if valid_end > actual_len {
+            return Err(StorageBackendError::CorruptCommittedFrame {
+                detail: "truncate valid_end exceeds segment actual length".to_string(),
+            });
+        }
+        let tail_len = actual_len - valid_end;
+        if tail_len == 0 {
+            return Err(StorageBackendError::BackendInternal {
+                detail: "quarantine_and_truncate_segment requires non-empty damaged tail"
+                    .to_string(),
+            });
+        }
+
+        let mut seg_file = File::from(seg_fd);
+        // Stream-hash with a fixed 64 KiB stack buffer (zero unbounded heap allocation).
+        let expected_crc = stream_crc32c_file_range(&mut seg_file, valid_end, tail_len)?;
+        let id = quarantine_artifact_id_from_crc(lane, seg_id, valid_end, expected_crc);
+
+        // Mandatory durable quarantine barrier BEFORE destructive `set_len`.
+        let report = publish_quarantine_durable_writer_at_fd(
+            dirs.quarantine_fd,
+            dirs.quarantine_dir,
+            &id,
+            dirs.owners.quarantine_uid,
+            dirs.append_lock,
+            observer,
+            |tmp_file| {
+                let copied_crc =
+                    stream_copy_file_range_with_crc(&mut seg_file, valid_end, tail_len, tmp_file)?;
+                if copied_crc != expected_crc {
+                    return Err(StorageBackendError::CorruptCommittedFrame {
+                        detail: "capture queue segment tail changed while streaming to quarantine"
+                            .to_string(),
+                    });
+                }
+                Ok((tail_len, copied_crc))
+            },
+        )?;
+
+        let lane_label = lane_dir_name(lane);
+        observer.record_segment_truncate_start(lane_label, seg_id, valid_end);
+        seg_file
+            .set_len(valid_end)
+            .map_err(|e| StorageBackendError::io("truncate capture queue segment", e))?;
+        seg_file
+            .sync_data()
+            .map_err(|e| StorageBackendError::io("sync truncated capture queue segment", e))?;
+        observer.record_segment_truncate_complete(lane_label, seg_id, valid_end);
+        drop(seg_file);
+
+        Ok(report)
+    }
+
+    pub(super) fn quarantine_and_unlink_orphan_at_fds(
+        dirs: &UnixQuarantineDirs<'_>,
+        lane: CaptureQueueLane,
+        orphan_seg_id: u32,
+        observer: &mut SegmentObserver,
+    ) -> StorageResult<QuarantinePublishReport> {
+        let lane_uid = lane_expected_uid(dirs.owners, lane);
+        let seg_name = segment_log_file_name(orphan_seg_id);
+        let cname = osstr_to_cstring(OsStr::new(&seg_name), "open orphan segment for quarantine")?;
+        let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
+        // SAFETY: `dirs.lane_fd` is valid and `cname` is NUL-terminated.
+        let raw_fd = unsafe { libc::openat(dirs.lane_fd.as_raw_fd(), cname.as_ptr(), flags) };
+        if raw_fd < 0 {
+            let err = io::Error::last_os_error();
+            if is_symlink_errno_at(&err, dirs.lane_fd, &cname) {
+                return Err(map_queue_symlink_err("capture queue orphan segment file"));
+            }
+            return Err(StorageBackendError::io(
+                "open orphan segment for quarantine",
+                err,
+            ));
+        }
+        // SAFETY: `raw_fd >= 0` is exclusively owned here and stays open until
+        // after inode-pinned `unlinkat`.
+        let orphan_fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+        let st = fstat_fd(&orphan_fd, "stat orphan segment for quarantine")?;
+        if (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
+            return Err(StorageBackendError::CorruptCommittedFrame {
+                detail: "capture queue orphan segment path is not a regular file".to_string(),
+            });
+        }
+        if st.st_uid != lane_uid {
+            return Err(map_queue_owner_mismatch_err(
+                "capture queue orphan segment file",
+            ));
+        }
+        let expected_dev = st.st_dev;
+        let expected_ino = st.st_ino;
+        let actual_len =
+            u64::try_from(st.st_size).map_err(|_| StorageBackendError::CorruptCommittedFrame {
+                detail: "capture queue orphan segment has negative size".to_string(),
+            })?;
+        if actual_len == 0 {
+            return Err(StorageBackendError::BackendInternal {
+                detail: "quarantine_and_unlink_orphan requires non-empty orphan segment"
+                    .to_string(),
+            });
+        }
+
+        let mut orphan_file = File::from(orphan_fd);
+        // Stream-hash with a fixed 64 KiB stack buffer (zero unbounded heap allocation).
+        let expected_crc = stream_crc32c_file_range(&mut orphan_file, 0, actual_len)?;
+        let id = quarantine_artifact_id_from_crc(lane, orphan_seg_id, 0, expected_crc);
+
+        // Mandatory durable quarantine barrier BEFORE destructive `unlinkat`.
+        let report = publish_quarantine_durable_writer_at_fd(
+            dirs.quarantine_fd,
+            dirs.quarantine_dir,
+            &id,
+            dirs.owners.quarantine_uid,
+            dirs.append_lock,
+            observer,
+            |tmp_file| {
+                let copied_crc =
+                    stream_copy_file_range_with_crc(&mut orphan_file, 0, actual_len, tmp_file)?;
+                if copied_crc != expected_crc {
+                    return Err(StorageBackendError::CorruptCommittedFrame {
+                        detail:
+                            "capture queue orphan segment changed while streaming to quarantine"
+                                .to_string(),
+                    });
+                }
+                Ok((actual_len, copied_crc))
+            },
+        )?;
+
+        // Verify directory entry still points to the exact pinned `(st_dev, st_ino)`.
+        let mut cur_st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+        // SAFETY: `dirs.lane_fd` is valid and `cname` is NUL-terminated.
+        let stat_rc = unsafe {
+            libc::fstatat(
+                dirs.lane_fd.as_raw_fd(),
+                cname.as_ptr(),
+                cur_st.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if stat_rc != 0 {
+            return Err(StorageBackendError::io(
+                "verify orphan segment inode before unlink",
+                io::Error::last_os_error(),
+            ));
+        }
+        // SAFETY: `fstatat` succeeded.
+        let cur_st = unsafe { cur_st.assume_init() };
+        if cur_st.st_dev != expected_dev || cur_st.st_ino != expected_ino {
+            return Err(StorageBackendError::CorruptCommittedFrame {
+                detail: "orphan segment inode changed before unlink".to_string(),
+            });
+        }
+
+        let lane_label = lane_dir_name(lane);
+        observer.record_orphan_unlink_start(lane_label, orphan_seg_id);
+        // SAFETY: `dirs.lane_fd` is valid and `cname` is NUL-terminated.
+        let unlink_rc = unsafe { libc::unlinkat(dirs.lane_fd.as_raw_fd(), cname.as_ptr(), 0) };
+        if unlink_rc != 0 {
+            return Err(StorageBackendError::io(
+                "unlink quarantined capture queue orphan segment",
+                io::Error::last_os_error(),
+            ));
+        }
+        drop(orphan_file);
+        observer.record_orphan_unlink_complete(lane_label, orphan_seg_id);
+
+        fsync_fd(
+            dirs.lane_fd,
+            "fsync capture queue lane directory after unlinking quarantined orphan",
+        )?;
+        observer.record_fsync_lane_after_orphan_unlink(lane_label, orphan_seg_id);
+
+        Ok(report)
+    }
+
+    pub(super) fn publish_quarantine_durable_unix(
+        quarantine_dir: &Path,
+        id: &str,
+        bytes: &[u8],
+        owners: UnixExpectedQueueOwners,
+        observer: &mut SegmentObserver,
+    ) -> StorageResult<QuarantinePublishReport> {
+        let (_root_fd, quarantine_fd, append_lock) =
+            acquire_quarantine_root_lock_unix(quarantine_dir, owners)?;
+        publish_quarantine_durable_at_fd(
+            &quarantine_fd,
+            quarantine_dir,
+            id,
+            bytes,
+            owners.quarantine_uid,
+            &append_lock,
+            observer,
+        )
+    }
+
+    pub(super) fn quarantine_and_truncate_segment_unix(
+        quarantine_dir: &Path,
+        lane_dir: &Path,
+        lane: CaptureQueueLane,
+        seg_id: u32,
+        valid_end: u64,
+        owners: UnixExpectedQueueOwners,
+        observer: &mut SegmentObserver,
+    ) -> StorageResult<QuarantinePublishReport> {
+        if quarantine_dir.parent() != lane_dir.parent() {
+            return Err(StorageBackendError::BackendInternal {
+                detail: "quarantine and lane directories must share the same capture queue root"
+                    .to_string(),
+            });
+        }
+        let (root_fd, quarantine_fd, append_lock) =
+            acquire_quarantine_root_lock_unix(quarantine_dir, owners)?;
+        let lane_name =
+            lane_dir
+                .file_name()
+                .ok_or_else(|| StorageBackendError::BackendInternal {
+                    detail: "capture queue lane directory has no basename".to_string(),
+                })?;
+        let lane_uid = lane_expected_uid(owners, lane);
+        let (lane_fd, lane_st) = openat_dir_nofollow(
+            &root_fd,
+            lane_name,
+            lane_uid,
+            "capture queue lane directory",
+        )?;
+        verify_dir_mode_0700(&lane_st, "capture queue lane directory")?;
+        let dirs = UnixQuarantineDirs {
+            quarantine_fd: &quarantine_fd,
+            quarantine_dir,
+            lane_fd: &lane_fd,
+            owners,
+            append_lock: &append_lock,
+        };
+        quarantine_and_truncate_segment_at_fds(&dirs, lane, seg_id, valid_end, observer)
+    }
+
+    pub(super) fn quarantine_and_unlink_orphan_unix(
+        quarantine_dir: &Path,
+        lane_dir: &Path,
+        lane: CaptureQueueLane,
+        orphan_seg_id: u32,
+        owners: UnixExpectedQueueOwners,
+        observer: &mut SegmentObserver,
+    ) -> StorageResult<QuarantinePublishReport> {
+        if quarantine_dir.parent() != lane_dir.parent() {
+            return Err(StorageBackendError::BackendInternal {
+                detail: "quarantine and lane directories must share the same capture queue root"
+                    .to_string(),
+            });
+        }
+        let (root_fd, quarantine_fd, append_lock) =
+            acquire_quarantine_root_lock_unix(quarantine_dir, owners)?;
+        let lane_name =
+            lane_dir
+                .file_name()
+                .ok_or_else(|| StorageBackendError::BackendInternal {
+                    detail: "capture queue lane directory has no basename".to_string(),
+                })?;
+        let lane_uid = lane_expected_uid(owners, lane);
+        let (lane_fd, lane_st) = openat_dir_nofollow(
+            &root_fd,
+            lane_name,
+            lane_uid,
+            "capture queue lane directory",
+        )?;
+        verify_dir_mode_0700(&lane_st, "capture queue lane directory")?;
+        let dirs = UnixQuarantineDirs {
+            quarantine_fd: &quarantine_fd,
+            quarantine_dir,
+            lane_fd: &lane_fd,
+            owners,
+            append_lock: &append_lock,
+        };
+        quarantine_and_unlink_orphan_at_fds(&dirs, lane, orphan_seg_id, observer)
+    }
+
     fn append_under_root_fd_unix(
         root_fd: &OwnedFd,
         lane: CaptureQueueLane,
@@ -2057,13 +3216,18 @@ mod unix_seg {
         let lane_label = lane_dir_name(lane);
         let lane_uid = lane_expected_uid(owners, lane);
         let lane_fd = open_lane_dir_fd(root_fd, lane, owners)?;
+        let quarantine_fd = open_quarantine_dir_fd(root_fd, owners)?;
 
         // Phase 1: acquire lock without pre-classification disk mutation and
         // execute strictly 100% read-only classification.
         let (append_lock, plan) =
             acquire_lock_and_phase1_unix(root_fd, &lane_fd, owners, lane_uid, observer)?;
 
-        // Phase 2: clean stale `.tmp`, mirror lagging replica, recover Case C.
+        // Phase 2: clean lane-scoped quarantine `.tmp` (NEVER touching the
+        // opposite lane's `.tmp`), clean lane `tail.meta*.tmp`, mirror lagging
+        // replica, recover Case C.
+        let _cleaned_q_tmp =
+            clean_lane_quarantine_tmp_files_unix(&quarantine_fd, lane, owners.quarantine_uid)?;
         let converged = phase2_execute_plan_unix(&lane_fd, lane_label, plan, lane_uid, observer)?;
 
         let seg_id = converged.meta.active_seg;
@@ -2139,9 +3303,12 @@ mod unix_seg {
         let lane_label = lane_dir_name(lane);
         let lane_uid = lane_expected_uid(owners, lane);
         let lane_fd = open_lane_dir_fd(root_fd, lane, owners)?;
+        let quarantine_fd = open_quarantine_dir_fd(root_fd, owners)?;
 
         let (append_lock, plan) =
             acquire_lock_and_phase1_unix(root_fd, &lane_fd, owners, lane_uid, observer)?;
+        let cleaned_quarantine_tmp_files =
+            clean_lane_quarantine_tmp_files_unix(&quarantine_fd, lane, owners.quarantine_uid)?;
         let converged = phase2_execute_plan_unix(&lane_fd, lane_label, plan, lane_uid, observer)?;
 
         drop(append_lock);
@@ -2154,6 +3321,7 @@ mod unix_seg {
             recovered_bytes: converged.recovered_bytes,
             mirrored_replica: converged.mirrored_replica,
             cleaned_tmp_files: converged.cleaned_tmp_files,
+            cleaned_quarantine_tmp_files,
             reclaimed_orphans_removed: converged.reclaimed_orphans_removed,
         })
     }
@@ -2258,6 +3426,48 @@ mod non_unix_seg {
     ) -> StorageResult<LaneTailMeta> {
         Err(StorageBackendError::BackendInternal {
             detail: "durable capture queue metadata read is unsupported on this platform"
+                .to_string(),
+        })
+    }
+
+    #[cfg(not(windows))]
+    pub(super) fn publish_quarantine_durable_non_unix(
+        _quarantine_dir: &Path,
+        _id: &str,
+        _bytes: &[u8],
+        _observer: &mut SegmentObserver,
+    ) -> StorageResult<QuarantinePublishReport> {
+        Err(StorageBackendError::BackendInternal {
+            detail: "durable capture queue quarantine publish is unsupported on this platform"
+                .to_string(),
+        })
+    }
+
+    #[cfg(not(windows))]
+    pub(super) fn quarantine_and_truncate_segment_non_unix(
+        _quarantine_dir: &Path,
+        _lane_dir: &Path,
+        _lane: CaptureQueueLane,
+        _seg_id: u32,
+        _valid_end: u64,
+        _observer: &mut SegmentObserver,
+    ) -> StorageResult<QuarantinePublishReport> {
+        Err(StorageBackendError::BackendInternal {
+            detail: "durable capture queue quarantine truncate is unsupported on this platform"
+                .to_string(),
+        })
+    }
+
+    #[cfg(not(windows))]
+    pub(super) fn quarantine_and_unlink_orphan_non_unix(
+        _quarantine_dir: &Path,
+        _lane_dir: &Path,
+        _lane: CaptureQueueLane,
+        _orphan_seg_id: u32,
+        _observer: &mut SegmentObserver,
+    ) -> StorageResult<QuarantinePublishReport> {
+        Err(StorageBackendError::BackendInternal {
+            detail: "durable capture queue quarantine unlink is unsupported on this platform"
                 .to_string(),
         })
     }
@@ -3113,6 +4323,317 @@ mod non_unix_seg {
             }
         }
 
+        fn clean_lane_quarantine_tmp_files_windows(
+            quarantine_dir: &Path,
+            lane: CaptureQueueLane,
+        ) -> StorageResult<usize> {
+            let mut removed = 0usize;
+            for entry in fs::read_dir(quarantine_dir).map_err(|e| {
+                StorageBackendError::io("read capture queue quarantine directory", e)
+            })? {
+                let entry = entry.map_err(|e| {
+                    StorageBackendError::io("read capture queue quarantine entry", e)
+                })?;
+                let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                    continue;
+                };
+                if is_lane_quarantine_temp_name(lane, name.as_bytes()) {
+                    let p = quarantine_dir.join(&name);
+                    if ensure_not_reparse_or_dir_if_exists(&p, "capture queue quarantine temp")? {
+                        fs::remove_file(&p).map_err(|e| {
+                            StorageBackendError::io("remove stale quarantine temp file", e)
+                        })?;
+                        removed += 1;
+                    }
+                }
+            }
+            if removed > 0 {
+                flush_windows_dir(quarantine_dir)?;
+            }
+            Ok(removed)
+        }
+
+        fn pin_windows_dir_and_ancestors(
+            dir: &Path,
+            subject: &'static str,
+        ) -> StorageResult<Vec<RawWinHandleGuard>> {
+            let mut guards = Vec::with_capacity(3);
+            if let Some(gp) = dir
+                .parent()
+                .and_then(Path::parent)
+                .filter(|p| !p.as_os_str().is_empty())
+                && gp.file_name().and_then(|n| n.to_str()) == Some(PRIVATE_SUBDIR)
+            {
+                guards.push(pin_windows_dir_nofollow(gp, "capture private directory")?);
+            }
+            if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
+                guards.push(pin_windows_dir_nofollow(
+                    parent,
+                    "capture queue root directory",
+                )?);
+            }
+            guards.push(pin_windows_dir_nofollow(dir, subject)?);
+            Ok(guards)
+        }
+
+        fn acquire_quarantine_lock_windows(
+            quarantine_dir: &Path,
+        ) -> StorageResult<(Vec<RawWinHandleGuard>, File)> {
+            let queue_root = quarantine_dir
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .ok_or_else(|| StorageBackendError::BackendInternal {
+                    detail: "capture queue quarantine directory has no parent queue root"
+                        .to_string(),
+                })?;
+            let guards = pin_windows_dir_and_ancestors(
+                quarantine_dir,
+                "capture queue quarantine directory",
+            )?;
+            let append_lock = match acquire_existing_lock_windows(queue_root)? {
+                Some(lock) => lock,
+                None => create_or_open_lock_windows(queue_root)?,
+            };
+            Ok((guards, append_lock))
+        }
+
+        pub(super) fn publish_quarantine_durable_windows(
+            quarantine_dir: &Path,
+            id: &str,
+            bytes: &[u8],
+            observer: &mut SegmentObserver,
+        ) -> StorageResult<QuarantinePublishReport> {
+            validate_quarantine_artifact_id(id)?;
+            let (_q_guards, append_lock) = acquire_quarantine_lock_windows(quarantine_dir)?;
+            let len_u64 =
+                u64::try_from(bytes.len()).map_err(|_| StorageBackendError::BackendInternal {
+                    detail: "quarantine payload length exceeds u64".to_string(),
+                })?;
+            let crc = crc32c_checksum(bytes);
+            publish_quarantine_durable_writer_windows_pinned(
+                quarantine_dir,
+                id,
+                &append_lock,
+                observer,
+                |tmp_file| {
+                    tmp_file
+                        .write_all(bytes)
+                        .map_err(|e| StorageBackendError::io("write quarantine temp bytes", e))?;
+                    Ok((len_u64, crc))
+                },
+            )
+        }
+
+        fn publish_quarantine_durable_writer_windows_pinned<F>(
+            quarantine_dir: &Path,
+            id: &str,
+            _append_lock: &File,
+            observer: &mut SegmentObserver,
+            write_fn: F,
+        ) -> StorageResult<QuarantinePublishReport>
+        where
+            F: FnOnce(&mut File) -> StorageResult<(u64, u32)>,
+        {
+            let tmp_path = quarantine_dir.join(format!("{id}.tmp"));
+            let bin_path = quarantine_dir.join(format!("{id}.bin"));
+            let _ = ensure_not_reparse_or_dir_if_exists(
+                &bin_path,
+                "capture queue quarantine artifact",
+            )?;
+            if ensure_not_reparse_or_dir_if_exists(&tmp_path, "capture queue quarantine temp")? {
+                fs::remove_file(&tmp_path)
+                    .map_err(|e| StorageBackendError::io("remove stale quarantine temp file", e))?;
+            }
+            let (mut tmp_file, _, _) = open_windows_file_nofollow(
+                &tmp_path,
+                GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                CREATE_NEW,
+                "capture queue quarantine temp",
+                "create quarantine temp file",
+            )?;
+            let (quarantined_bytes, crc32c) = match write_fn(&mut tmp_file) {
+                Ok(res) => res,
+                Err(err) => {
+                    drop(tmp_file);
+                    let _ = fs::remove_file(&tmp_path);
+                    return Err(err);
+                }
+            };
+            observer.record_quarantine_tmp_sync_start(id);
+            if let Err(err) = tmp_file.sync_data() {
+                drop(tmp_file);
+                let _ = fs::remove_file(&tmp_path);
+                return Err(StorageBackendError::io("sync quarantine temp data", err));
+            }
+            drop(tmp_file);
+            observer.record_quarantine_tmp_sync_complete(id);
+
+            observer.maybe_crash(SegmentCrashPoint::BeforeQuarantineRename)?;
+
+            observer.record_quarantine_rename_start(id);
+            if let Err(err) = durable_replace_publish_windows(&tmp_path, &bin_path) {
+                let _ = fs::remove_file(&tmp_path);
+                return Err(err);
+            }
+            observer.record_quarantine_rename_complete(id);
+
+            observer.record_quarantine_fsync_dir_start(id);
+            flush_windows_dir(quarantine_dir)?;
+            observer.record_quarantine_fsync_dir_complete(id);
+
+            observer.maybe_crash(SegmentCrashPoint::AfterQuarantineDirFsyncBeforeDestructive)?;
+
+            Ok(QuarantinePublishReport {
+                id: id.to_string(),
+                bin_path,
+                quarantined_bytes,
+                crc32c,
+                diagnostic_code: QUARANTINE_DIAGNOSTIC_CODE,
+            })
+        }
+
+        pub(super) fn quarantine_and_truncate_segment_windows(
+            quarantine_dir: &Path,
+            lane_dir: &Path,
+            lane: CaptureQueueLane,
+            seg_id: u32,
+            valid_end: u64,
+            observer: &mut SegmentObserver,
+        ) -> StorageResult<QuarantinePublishReport> {
+            if quarantine_dir.parent() != lane_dir.parent() {
+                return Err(StorageBackendError::BackendInternal {
+                    detail:
+                        "quarantine and lane directories must share the same capture queue root"
+                            .to_string(),
+                });
+            }
+            let (_q_guards, append_lock) = acquire_quarantine_lock_windows(quarantine_dir)?;
+            let _l_guard = pin_windows_dir_nofollow(lane_dir, "capture queue lane directory")?;
+            let seg_path = lane_dir.join(segment_log_file_name(seg_id));
+            let (mut seg_file, actual_len, _) = open_windows_file_nofollow(
+                &seg_path,
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                OPEN_EXISTING,
+                "capture queue segment file",
+                "open segment for quarantine truncate",
+            )?;
+            if valid_end > actual_len {
+                return Err(StorageBackendError::CorruptCommittedFrame {
+                    detail: "truncate valid_end exceeds segment actual length".to_string(),
+                });
+            }
+            let tail_len = actual_len - valid_end;
+            if tail_len == 0 {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: "quarantine_and_truncate_segment requires non-empty damaged tail"
+                        .to_string(),
+                });
+            }
+            let expected_crc = stream_crc32c_file_range(&mut seg_file, valid_end, tail_len)?;
+            let id = quarantine_artifact_id_from_crc(lane, seg_id, valid_end, expected_crc);
+            let report = publish_quarantine_durable_writer_windows_pinned(
+                quarantine_dir,
+                &id,
+                &append_lock,
+                observer,
+                |tmp_file| {
+                    let copied_crc = stream_copy_file_range_with_crc(
+                        &mut seg_file,
+                        valid_end,
+                        tail_len,
+                        tmp_file,
+                    )?;
+                    if copied_crc != expected_crc {
+                        return Err(StorageBackendError::CorruptCommittedFrame {
+                            detail:
+                                "capture queue segment tail changed while streaming to quarantine"
+                                    .to_string(),
+                        });
+                    }
+                    Ok((tail_len, copied_crc))
+                },
+            )?;
+            let lane_label = lane_dir_name(lane);
+            observer.record_segment_truncate_start(lane_label, seg_id, valid_end);
+            seg_file
+                .set_len(valid_end)
+                .map_err(|e| StorageBackendError::io("truncate capture queue segment", e))?;
+            seg_file
+                .sync_data()
+                .map_err(|e| StorageBackendError::io("sync truncated capture queue segment", e))?;
+            observer.record_segment_truncate_complete(lane_label, seg_id, valid_end);
+            Ok(report)
+        }
+
+        pub(super) fn quarantine_and_unlink_orphan_windows(
+            quarantine_dir: &Path,
+            lane_dir: &Path,
+            lane: CaptureQueueLane,
+            orphan_seg_id: u32,
+            observer: &mut SegmentObserver,
+        ) -> StorageResult<QuarantinePublishReport> {
+            if quarantine_dir.parent() != lane_dir.parent() {
+                return Err(StorageBackendError::BackendInternal {
+                    detail:
+                        "quarantine and lane directories must share the same capture queue root"
+                            .to_string(),
+                });
+            }
+            let (_q_guards, append_lock) = acquire_quarantine_lock_windows(quarantine_dir)?;
+            let _l_guard = pin_windows_dir_nofollow(lane_dir, "capture queue lane directory")?;
+            let orphan_path = lane_dir.join(segment_log_file_name(orphan_seg_id));
+            let (mut orphan_file, actual_len, _) = open_windows_file_nofollow(
+                &orphan_path,
+                GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                OPEN_EXISTING,
+                "capture queue orphan segment file",
+                "open orphan segment for quarantine",
+            )?;
+            if actual_len == 0 {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: "quarantine_and_unlink_orphan requires non-empty orphan segment"
+                        .to_string(),
+                });
+            }
+            let expected_crc = stream_crc32c_file_range(&mut orphan_file, 0, actual_len)?;
+            let id = quarantine_artifact_id_from_crc(lane, orphan_seg_id, 0, expected_crc);
+            let report = publish_quarantine_durable_writer_windows_pinned(
+                quarantine_dir,
+                &id,
+                &append_lock,
+                observer,
+                |tmp_file| {
+                    let copied_crc =
+                        stream_copy_file_range_with_crc(&mut orphan_file, 0, actual_len, tmp_file)?;
+                    if copied_crc != expected_crc {
+                        return Err(StorageBackendError::CorruptCommittedFrame {
+                            detail:
+                                "capture queue orphan segment changed while streaming to quarantine"
+                                    .to_string(),
+                        });
+                    }
+                    Ok((actual_len, copied_crc))
+                },
+            )?;
+            drop(orphan_file);
+            let _ = ensure_not_reparse_or_dir_if_exists(
+                &orphan_path,
+                "capture queue orphan segment file",
+            )?;
+            let lane_label = lane_dir_name(lane);
+            observer.record_orphan_unlink_start(lane_label, orphan_seg_id);
+            fs::remove_file(&orphan_path).map_err(|e| {
+                StorageBackendError::io("unlink quarantined capture queue orphan segment", e)
+            })?;
+            observer.record_orphan_unlink_complete(lane_label, orphan_seg_id);
+            flush_windows_dir(lane_dir)?;
+            observer.record_fsync_lane_after_orphan_unlink(lane_label, orphan_seg_id);
+            Ok(report)
+        }
+
         pub(super) fn append_in_storage_dir_windows(
             storage_dir: &Path,
             lane: CaptureQueueLane,
@@ -3136,9 +4657,13 @@ mod non_unix_seg {
             let lane_label = lane_dir_name(lane);
             let lane_dir = queue_root.join(lane_label);
             let _lane_guard = pin_windows_dir_nofollow(&lane_dir, "capture queue lane directory")?;
+            let quarantine_dir = queue_root.join(QUEUE_QUARANTINE_DIR);
+            let _q_guard =
+                pin_windows_dir_nofollow(&quarantine_dir, "capture queue quarantine directory")?;
 
             let (append_lock, plan, pinned_seg) =
                 acquire_lock_and_phase1_windows(queue_root, &lane_dir, true, observer)?;
+            let _cleaned_q_tmp = clean_lane_quarantine_tmp_files_windows(&quarantine_dir, lane)?;
             let (meta, active_seg_exists, recovered_frames, _, _, _, _) =
                 phase2_execute_plan_windows(&lane_dir, lane_label, plan, observer)?;
 
@@ -3255,9 +4780,14 @@ mod non_unix_seg {
             let lane_label = lane_dir_name(lane);
             let lane_dir = queue_root.join(lane_label);
             let _lane_guard = pin_windows_dir_nofollow(&lane_dir, "capture queue lane directory")?;
+            let quarantine_dir = queue_root.join(QUEUE_QUARANTINE_DIR);
+            let _q_guard =
+                pin_windows_dir_nofollow(&quarantine_dir, "capture queue quarantine directory")?;
 
             let (append_lock, plan, _pinned) =
                 acquire_lock_and_phase1_windows(queue_root, &lane_dir, false, observer)?;
+            let cleaned_quarantine_tmp_files =
+                clean_lane_quarantine_tmp_files_windows(&quarantine_dir, lane)?;
             let (
                 meta,
                 _,
@@ -3278,6 +4808,7 @@ mod non_unix_seg {
                 recovered_bytes,
                 mirrored_replica,
                 cleaned_tmp_files,
+                cleaned_quarantine_tmp_files,
                 reclaimed_orphans_removed,
             })
         }
@@ -3288,6 +4819,52 @@ mod non_unix_seg {
         lane_dir: &Path,
     ) -> StorageResult<LaneTailMeta> {
         win_impl::read_converged_lane_tail_meta_windows(lane_dir)
+    }
+
+    #[cfg(windows)]
+    pub(super) fn publish_quarantine_durable_non_unix(
+        quarantine_dir: &Path,
+        id: &str,
+        bytes: &[u8],
+        observer: &mut SegmentObserver,
+    ) -> StorageResult<QuarantinePublishReport> {
+        win_impl::publish_quarantine_durable_windows(quarantine_dir, id, bytes, observer)
+    }
+
+    #[cfg(windows)]
+    pub(super) fn quarantine_and_truncate_segment_non_unix(
+        quarantine_dir: &Path,
+        lane_dir: &Path,
+        lane: CaptureQueueLane,
+        seg_id: u32,
+        valid_end: u64,
+        observer: &mut SegmentObserver,
+    ) -> StorageResult<QuarantinePublishReport> {
+        win_impl::quarantine_and_truncate_segment_windows(
+            quarantine_dir,
+            lane_dir,
+            lane,
+            seg_id,
+            valid_end,
+            observer,
+        )
+    }
+
+    #[cfg(windows)]
+    pub(super) fn quarantine_and_unlink_orphan_non_unix(
+        quarantine_dir: &Path,
+        lane_dir: &Path,
+        lane: CaptureQueueLane,
+        orphan_seg_id: u32,
+        observer: &mut SegmentObserver,
+    ) -> StorageResult<QuarantinePublishReport> {
+        win_impl::quarantine_and_unlink_orphan_windows(
+            quarantine_dir,
+            lane_dir,
+            lane,
+            orphan_seg_id,
+            observer,
+        )
     }
 
     #[cfg(windows)]
@@ -4293,5 +5870,912 @@ mod tests {
                 "lost exclusive lock creation race must never fchmod the racer's permissive lock"
             );
         }
+    }
+
+    #[test]
+    fn publish_quarantine_durable_syncs_renames_fsyncs_before_destructive_ops() {
+        let repo = tempdir().expect("create RB-08t ordering repo");
+        let init = init_capture_queue(repo.path()).expect("init capture queue");
+        let quarantine_dir = &init.paths.quarantine;
+        let normal_dir = &init.paths.normal;
+        let priority_dir = &init.paths.priority;
+
+        // ------------------------------------------------------------------
+        // AC1, AC2, AC3: Direct `publish_quarantine_durable` ordering & exact bytes
+        // ------------------------------------------------------------------
+        let damaged_direct = b"\xDE\xAD\xBE\xEFhalf-frame-uncommitted-tail-bytes-0123456789";
+        let direct_id = quarantine_artifact_id(CaptureQueueLane::Normal, 0, 128, damaged_direct);
+        assert!(direct_id.starts_with("normal-seg00000000-off128-"));
+
+        let mut direct_obs = SegmentObserver::new();
+        let direct_report = publish_quarantine_durable_inner(
+            quarantine_dir,
+            &direct_id,
+            damaged_direct,
+            &mut direct_obs,
+        )
+        .expect("publish_quarantine_durable must succeed");
+        assert_eq!(direct_report.id, direct_id);
+        assert_eq!(direct_report.quarantined_bytes, damaged_direct.len() as u64);
+        assert_eq!(direct_report.crc32c, crc32c_checksum(damaged_direct));
+        assert_eq!(direct_report.diagnostic_code, QUARANTINE_DIAGNOSTIC_CODE);
+
+        let sync_complete_seq = direct_obs
+            .events
+            .iter()
+            .position(|e| {
+                *e == SegmentOpEvent::QuarantineTmpSyncDataComplete {
+                    id: direct_id.clone(),
+                }
+            })
+            .expect("tmp sync_data complete seq");
+        let rename_start_seq = direct_obs
+            .events
+            .iter()
+            .position(|e| {
+                *e == SegmentOpEvent::QuarantineRenameStart {
+                    id: direct_id.clone(),
+                }
+            })
+            .expect("rename start seq");
+        let rename_complete_seq = direct_obs
+            .events
+            .iter()
+            .position(|e| {
+                *e == SegmentOpEvent::QuarantineRenameComplete {
+                    id: direct_id.clone(),
+                }
+            })
+            .expect("rename complete seq");
+        let fsync_dir_start_seq = direct_obs
+            .events
+            .iter()
+            .position(|e| {
+                *e == SegmentOpEvent::QuarantineFsyncDirStart {
+                    id: direct_id.clone(),
+                }
+            })
+            .expect("fsync_dir start seq");
+        let fsync_dir_complete_seq = direct_obs
+            .events
+            .iter()
+            .position(|e| {
+                *e == SegmentOpEvent::QuarantineFsyncDirComplete {
+                    id: direct_id.clone(),
+                }
+            })
+            .expect("fsync_dir complete seq");
+
+        // AC1: tmp_file.sync_data() completion seq < rename(.tmp -> .bin) start seq
+        assert!(
+            sync_complete_seq < rename_start_seq,
+            "AC1 violated: sync_complete={sync_complete_seq} must be < rename_start={rename_start_seq}"
+        );
+        // AC2: rename(.tmp -> .bin) completion seq < fsync_dir(quarantine_dir) start seq
+        assert!(
+            rename_complete_seq < fsync_dir_start_seq,
+            "AC2 violated: rename_complete={rename_complete_seq} must be < fsync_dir_start={fsync_dir_start_seq}"
+        );
+        assert!(fsync_dir_start_seq < fsync_dir_complete_seq);
+
+        // AC3: exact byte equality on quarantine/<id>.bin + no leftover .tmp + 0600 mode
+        let actual_quar_bytes =
+            fs::read(&direct_report.bin_path).expect("read published quarantine .bin");
+        assert_eq!(actual_quar_bytes.as_slice(), damaged_direct);
+        assert!(
+            !quarantine_dir.join(format!("{direct_id}.tmp")).exists(),
+            ".tmp must be atomically renamed away"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = fs::symlink_metadata(&direct_report.bin_path)
+                .expect("stat quarantine .bin")
+                .permissions()
+                .mode()
+                & 0o7777;
+            assert_eq!(mode, QUEUE_FILE_MODE, "quarantine .bin must be 0600");
+        }
+
+        // ------------------------------------------------------------------
+        // AC4: `quarantine_and_truncate_segment` ordered barrier
+        //      fsync_dir(quarantine_dir) completion seq < truncate(events-<S>) start seq
+        // ------------------------------------------------------------------
+        let valid_frame = encode_frame(FRAME_FLAG_NONE, "rb08t:valid:1", b"committed-valid-frame")
+            .expect("encode valid frame");
+        let out = append_encoded_frame(repo.path(), CaptureQueueLane::Normal, &valid_frame)
+            .expect("append valid frame");
+        let valid_end = out.meta.committed_len;
+        let tail_garbage = b"LCE1\x99\x00\x00\x00partial-half-frame-tail";
+        let seg0_path = normal_dir.join(segment_log_file_name(0));
+        {
+            let mut f = fs::OpenOptions::new()
+                .append(true)
+                .open(&seg0_path)
+                .expect("open seg0");
+            f.write_all(tail_garbage).expect("append tail garbage");
+            f.sync_data().expect("sync tail garbage");
+        }
+
+        let mut trunc_obs = SegmentObserver::new();
+        let trunc_report = quarantine_and_truncate_segment_inner(
+            quarantine_dir,
+            normal_dir,
+            CaptureQueueLane::Normal,
+            0,
+            valid_end,
+            &mut trunc_obs,
+        )
+        .expect("quarantine_and_truncate_segment must succeed");
+        assert_eq!(
+            fs::read(&trunc_report.bin_path).expect("read truncated tail .bin"),
+            tail_garbage
+        );
+        assert_eq!(
+            fs::read(&seg0_path).expect("read truncated seg0"),
+            valid_frame
+        );
+
+        let trunc_sync_done = trunc_obs
+            .events
+            .iter()
+            .position(|e| {
+                *e == SegmentOpEvent::QuarantineTmpSyncDataComplete {
+                    id: trunc_report.id.clone(),
+                }
+            })
+            .expect("trunc sync_data complete");
+        let trunc_rename_start = trunc_obs
+            .events
+            .iter()
+            .position(|e| {
+                *e == SegmentOpEvent::QuarantineRenameStart {
+                    id: trunc_report.id.clone(),
+                }
+            })
+            .expect("trunc rename start");
+        let trunc_rename_done = trunc_obs
+            .events
+            .iter()
+            .position(|e| {
+                *e == SegmentOpEvent::QuarantineRenameComplete {
+                    id: trunc_report.id.clone(),
+                }
+            })
+            .expect("trunc rename complete");
+        let trunc_fsync_start = trunc_obs
+            .events
+            .iter()
+            .position(|e| {
+                *e == SegmentOpEvent::QuarantineFsyncDirStart {
+                    id: trunc_report.id.clone(),
+                }
+            })
+            .expect("trunc fsync_dir start");
+        let trunc_fsync_done = trunc_obs
+            .events
+            .iter()
+            .position(|e| {
+                *e == SegmentOpEvent::QuarantineFsyncDirComplete {
+                    id: trunc_report.id.clone(),
+                }
+            })
+            .expect("trunc fsync_dir complete");
+        let truncate_start_seq = trunc_obs
+            .events
+            .iter()
+            .position(|e| {
+                *e == SegmentOpEvent::SegmentTruncateStart {
+                    lane: QUEUE_LANE_NORMAL_DIR,
+                    seg_id: 0,
+                    to_len: valid_end,
+                }
+            })
+            .expect("truncate start seq");
+
+        assert!(trunc_sync_done < trunc_rename_start);
+        assert!(trunc_rename_done < trunc_fsync_start);
+        assert!(
+            trunc_fsync_done < truncate_start_seq,
+            "AC4 violated: fsync_dir_complete={trunc_fsync_done} must be < truncate_start={truncate_start_seq}"
+        );
+
+        // ------------------------------------------------------------------
+        // AC5: `quarantine_and_unlink_orphan` ordered barrier
+        //      fsync_dir(quarantine_dir) completion seq < unlink(orphan_seg) start seq
+        // ------------------------------------------------------------------
+        let orphan_bytes = b"LCE1\x10\x00\x00\x00orphan-half-frame-bytes";
+        let orphan_path = priority_dir.join(segment_log_file_name(1));
+        fs::write(&orphan_path, orphan_bytes).expect("create damaged orphan seg1");
+
+        let mut unlink_obs = SegmentObserver::new();
+        let unlink_report = quarantine_and_unlink_orphan_inner(
+            quarantine_dir,
+            priority_dir,
+            CaptureQueueLane::Priority,
+            1,
+            &mut unlink_obs,
+        )
+        .expect("quarantine_and_unlink_orphan must succeed");
+        assert_eq!(
+            fs::read(&unlink_report.bin_path).expect("read orphan .bin"),
+            orphan_bytes
+        );
+        assert!(
+            !orphan_path.exists(),
+            "orphan segment must be unlinked after durable quarantine"
+        );
+
+        let unlink_sync_done = unlink_obs
+            .events
+            .iter()
+            .position(|e| {
+                *e == SegmentOpEvent::QuarantineTmpSyncDataComplete {
+                    id: unlink_report.id.clone(),
+                }
+            })
+            .expect("unlink sync_data complete");
+        let unlink_rename_start = unlink_obs
+            .events
+            .iter()
+            .position(|e| {
+                *e == SegmentOpEvent::QuarantineRenameStart {
+                    id: unlink_report.id.clone(),
+                }
+            })
+            .expect("unlink rename start");
+        let unlink_rename_done = unlink_obs
+            .events
+            .iter()
+            .position(|e| {
+                *e == SegmentOpEvent::QuarantineRenameComplete {
+                    id: unlink_report.id.clone(),
+                }
+            })
+            .expect("unlink rename complete");
+        let unlink_fsync_start = unlink_obs
+            .events
+            .iter()
+            .position(|e| {
+                *e == SegmentOpEvent::QuarantineFsyncDirStart {
+                    id: unlink_report.id.clone(),
+                }
+            })
+            .expect("unlink fsync_dir start");
+        let unlink_fsync_done = unlink_obs
+            .events
+            .iter()
+            .position(|e| {
+                *e == SegmentOpEvent::QuarantineFsyncDirComplete {
+                    id: unlink_report.id.clone(),
+                }
+            })
+            .expect("unlink fsync_dir complete");
+        let orphan_unlink_start_seq = unlink_obs
+            .events
+            .iter()
+            .position(|e| {
+                *e == SegmentOpEvent::OrphanUnlinkStart {
+                    lane: QUEUE_LANE_PRIORITY_DIR,
+                    seg_id: 1,
+                }
+            })
+            .expect("orphan unlink start seq");
+        let orphan_unlink_done_seq = unlink_obs
+            .events
+            .iter()
+            .position(|e| {
+                *e == SegmentOpEvent::OrphanUnlinkComplete {
+                    lane: QUEUE_LANE_PRIORITY_DIR,
+                    seg_id: 1,
+                }
+            })
+            .expect("orphan unlink complete seq");
+        let lane_fsync_after_unlink = unlink_obs
+            .events
+            .iter()
+            .position(|e| {
+                *e == SegmentOpEvent::FsyncLaneDirAfterOrphanUnlink {
+                    lane: QUEUE_LANE_PRIORITY_DIR,
+                    seg_id: 1,
+                }
+            })
+            .expect("lane fsync after orphan unlink");
+
+        assert!(unlink_sync_done < unlink_rename_start);
+        assert!(unlink_rename_done < unlink_fsync_start);
+        assert!(
+            unlink_fsync_done < orphan_unlink_start_seq,
+            "AC5 violated: fsync_dir_complete={unlink_fsync_done} must be < unlink_start={orphan_unlink_start_seq}"
+        );
+        assert!(orphan_unlink_done_seq < lane_fsync_after_unlink);
+
+        // Multi-chunk streaming verification (> 2× 64 KiB chunk size) proves
+        // `quarantine_and_truncate_segment` and `quarantine_and_unlink_orphan`
+        // stream arbitrary damaged byte spans without unbounded heap allocation.
+        let large_tail: Vec<u8> = (0..(140 * 1024usize))
+            .map(|i| ((i * 31 + 17) & 0xff) as u8)
+            .collect();
+        {
+            let mut f = fs::OpenOptions::new()
+                .append(true)
+                .open(&seg0_path)
+                .expect("open seg0 for large tail");
+            f.write_all(&large_tail)
+                .expect("append 140 KiB damaged tail");
+            f.sync_data().expect("sync 140 KiB damaged tail");
+        }
+        let large_trunc_report = quarantine_and_truncate_segment(
+            quarantine_dir,
+            normal_dir,
+            CaptureQueueLane::Normal,
+            0,
+            valid_end,
+        )
+        .expect("streaming 140 KiB quarantine_and_truncate_segment must succeed");
+        assert_eq!(
+            large_trunc_report.quarantined_bytes,
+            large_tail.len() as u64
+        );
+        assert_eq!(large_trunc_report.crc32c, crc32c_checksum(&large_tail));
+        assert_eq!(
+            fs::read(&large_trunc_report.bin_path).expect("read 140 KiB quarantined tail"),
+            large_tail
+        );
+        assert_eq!(
+            fs::read(&seg0_path).expect("read truncated seg0"),
+            valid_frame
+        );
+
+        let large_orphan: Vec<u8> = (0..(140 * 1024usize))
+            .map(|i| ((i * 19 + 7) & 0xff) as u8)
+            .collect();
+        let large_orphan_path = priority_dir.join(segment_log_file_name(2));
+        fs::write(&large_orphan_path, &large_orphan).expect("write 140 KiB damaged orphan");
+        let large_orphan_report = quarantine_and_unlink_orphan(
+            quarantine_dir,
+            priority_dir,
+            CaptureQueueLane::Priority,
+            2,
+        )
+        .expect("streaming 140 KiB quarantine_and_unlink_orphan must succeed");
+        assert_eq!(
+            large_orphan_report.quarantined_bytes,
+            large_orphan.len() as u64
+        );
+        assert_eq!(large_orphan_report.crc32c, crc32c_checksum(&large_orphan));
+        assert_eq!(
+            fs::read(&large_orphan_report.bin_path).expect("read 140 KiB quarantined orphan"),
+            large_orphan
+        );
+        assert!(!large_orphan_path.exists());
+
+        // Concurrent contention regression test: 8 concurrent workers racing on
+        // the SAME quarantine artifact id, distinct artifact ids, AND concurrent
+        // `recover_lane(Normal)` / `recover_lane(Priority)` cleanup must serialize
+        // cleanly under `append.lock` with zero lost `.bin` artifacts or errors.
+        let shared_payload = b"concurrent-shared-quarantine-payload-exact-bytes".to_vec();
+        let shared_id = quarantine_artifact_id(CaptureQueueLane::Normal, 9, 4096, &shared_payload);
+        let qdir_arc = std::sync::Arc::new(quarantine_dir.to_path_buf());
+        let repo_arc = std::sync::Arc::new(repo.path().to_path_buf());
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let mut handles = Vec::with_capacity(8);
+        for worker in 0..8usize {
+            let qdir_c = std::sync::Arc::clone(&qdir_arc);
+            let repo_c = std::sync::Arc::clone(&repo_arc);
+            let bar_c = std::sync::Arc::clone(&barrier);
+            let shared_id_c = shared_id.clone();
+            let shared_payload_c = shared_payload.clone();
+            handles.push(std::thread::spawn(move || {
+                bar_c.wait();
+                for iter in 0..4usize {
+                    let r1 = publish_quarantine_durable(&qdir_c, &shared_id_c, &shared_payload_c)
+                        .expect("concurrent shared-id publish must succeed");
+                    assert_eq!(r1.quarantined_bytes, shared_payload_c.len() as u64);
+
+                    let unique_payload = format!("worker-{worker}-iter-{iter}-bytes").into_bytes();
+                    let lane = if worker % 2 == 0 {
+                        CaptureQueueLane::Normal
+                    } else {
+                        CaptureQueueLane::Priority
+                    };
+                    let uid = quarantine_artifact_id(
+                        lane,
+                        100 + worker as u32,
+                        iter as u64,
+                        &unique_payload,
+                    );
+                    let r2 = publish_quarantine_durable(&qdir_c, &uid, &unique_payload)
+                        .expect("concurrent unique-id publish must succeed");
+                    assert_eq!(
+                        fs::read(&r2.bin_path).expect("read concurrent unique .bin"),
+                        unique_payload
+                    );
+
+                    let _ = recover_lane(&repo_c, lane).expect(
+                        "concurrent recover_lane alongside quarantine publish must succeed",
+                    );
+                }
+            }));
+        }
+        for handle in handles {
+            handle
+                .join()
+                .expect("concurrent quarantine worker panicked");
+        }
+        assert_eq!(
+            fs::read(quarantine_dir.join(format!("{shared_id}.bin")))
+                .expect("shared concurrent .bin must persist intact"),
+            shared_payload
+        );
+        assert!(
+            !quarantine_dir.join(format!("{shared_id}.tmp")).exists(),
+            "no leftover .tmp after concurrent publish + recover"
+        );
+
+        // Security checks: invalid artifact id and symlinked target/tmp fail closed.
+        assert!(
+            publish_quarantine_durable(quarantine_dir, "../escape", b"bad").is_err(),
+            "path-traversal id must fail closed"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let decoy = tempdir().expect("create decoy dir");
+            let evil_target = decoy.path().join("evil");
+            symlink(&evil_target, quarantine_dir.join("normal-sym.tmp"))
+                .expect("plant symlink at .tmp");
+            let sym_err = publish_quarantine_durable(quarantine_dir, "normal-sym", b"bytes")
+                .expect_err("symlinked quarantine .tmp must fail closed");
+            assert!(
+                crate::storage::queue::is_capture_queue_symlink_rejected_error(&sym_err),
+                "expected symlink rejected error, got {sym_err:?}"
+            );
+            assert!(!evil_target.exists());
+            fs::remove_file(quarantine_dir.join("normal-sym.tmp")).expect("clean symlink");
+        }
+    }
+
+    #[test]
+    fn publish_quarantine_durable_crash_before_rename_and_after_dir_fsync() {
+        let repo = tempdir().expect("create RB-08t crash boundary repo");
+        let init = init_capture_queue(repo.path()).expect("init capture queue");
+        let quarantine_dir = &init.paths.quarantine;
+        let normal_dir = &init.paths.normal;
+        let priority_dir = &init.paths.priority;
+
+        // ------------------------------------------------------------------
+        // Part 1 — AC6 (Same-lane restart cleanup + cross-lane `.tmp` isolation):
+        // Commit F1 on Normal and P1 on Priority; write a valid Case C synced
+        // frame F2 on Normal without updating tail.meta; inject crashes strictly
+        // BEFORE `rename` for BOTH lanes on the exact same repo. Restarting
+        // Normal via `recover_lane(repo, Normal)` must:
+        //   (1) recover Case C frame F2 on Normal,
+        //   (2) clean ONLY `quarantine/normal-*.tmp` (cleaned == 1),
+        //   (3) preserve `quarantine/priority-*.tmp` untouched!
+        // Restarting Priority via `recover_lane(repo, Priority)` then cleans
+        // `quarantine/priority-*.tmp`.
+        // ------------------------------------------------------------------
+        let frame_n1 =
+            encode_frame(FRAME_FLAG_NONE, "rb08t:ac6:n1", b"normal-base-frame").expect("encode N1");
+        let frame_n2 = encode_frame(FRAME_FLAG_NONE, "rb08t:ac6:n2", b"normal-case-c-synced")
+            .expect("encode N2");
+        let frame_p1 = encode_frame(FRAME_FLAG_NONE, "rb08t:ac6:p1", b"priority-base-frame")
+            .expect("encode P1");
+
+        let _out_n1 = append_encoded_frame(repo.path(), CaptureQueueLane::Normal, &frame_n1)
+            .expect("commit N1");
+        let out_p1 = append_encoded_frame(repo.path(), CaptureQueueLane::Priority, &frame_p1)
+            .expect("commit P1");
+
+        let seg0_path = normal_dir.join(segment_log_file_name(0));
+        let mut expected_n1_n2 = frame_n1.clone();
+        expected_n1_n2.extend_from_slice(&frame_n2);
+        {
+            let mut f = fs::OpenOptions::new()
+                .append(true)
+                .open(&seg0_path)
+                .expect("open normal seg0");
+            f.write_all(&frame_n2).expect("write Case C synced N2");
+            f.sync_data().expect("sync Case C N2");
+        }
+
+        let ac6_normal_bytes = b"LCE1\x11normal-pre-rename-crash-sample";
+        let ac6_priority_bytes = b"LCE1\x22priority-pre-rename-crash-sample";
+        let ac6_normal_id = quarantine_artifact_id(
+            CaptureQueueLane::Normal,
+            0,
+            frame_n1.len() as u64,
+            ac6_normal_bytes,
+        );
+        let ac6_priority_id = quarantine_artifact_id(
+            CaptureQueueLane::Priority,
+            0,
+            out_p1.meta.committed_len,
+            ac6_priority_bytes,
+        );
+        let ac6_normal_tmp = quarantine_dir.join(format!("{ac6_normal_id}.tmp"));
+        let ac6_normal_bin = quarantine_dir.join(format!("{ac6_normal_id}.bin"));
+        let ac6_priority_tmp = quarantine_dir.join(format!("{ac6_priority_id}.tmp"));
+        let ac6_priority_bin = quarantine_dir.join(format!("{ac6_priority_id}.bin"));
+
+        let mut crash_ac6_n =
+            SegmentObserver::with_crash(SegmentCrashPoint::BeforeQuarantineRename);
+        let err_ac6_n = publish_quarantine_durable_inner(
+            quarantine_dir,
+            &ac6_normal_id,
+            ac6_normal_bytes,
+            &mut crash_ac6_n,
+        )
+        .expect_err("AC6 normal before-rename crash must fail");
+        assert_eq!(err_ac6_n.stable_code_str(), "LBR-IO-001");
+
+        let mut crash_ac6_p =
+            SegmentObserver::with_crash(SegmentCrashPoint::BeforeQuarantineRename);
+        let err_ac6_p = publish_quarantine_durable_inner(
+            quarantine_dir,
+            &ac6_priority_id,
+            ac6_priority_bytes,
+            &mut crash_ac6_p,
+        )
+        .expect_err("AC6 priority before-rename crash must fail");
+        assert_eq!(err_ac6_p.stable_code_str(), "LBR-IO-001");
+
+        assert!(ac6_normal_tmp.exists());
+        assert!(!ac6_normal_bin.exists());
+        assert!(ac6_priority_tmp.exists());
+        assert!(!ac6_priority_bin.exists());
+        assert_eq!(
+            fs::read(&seg0_path).expect("read normal seg0"),
+            expected_n1_n2
+        );
+
+        // Restart the exact same Normal lane on the exact same repo.
+        let normal_rec = recover_lane(repo.path(), CaptureQueueLane::Normal)
+            .expect("AC6: same-lane Normal restart must succeed");
+        assert_eq!(
+            normal_rec.recovered_frames, 1,
+            "Case C synced frame N2 recovered"
+        );
+        assert_eq!(normal_rec.meta.committed_len, expected_n1_n2.len() as u64);
+        assert_eq!(
+            normal_rec.cleaned_quarantine_tmp_files, 1,
+            "AC6: same-lane Normal restart must clean normal-*.tmp"
+        );
+        assert!(
+            !ac6_normal_tmp.exists(),
+            "AC6: normal-*.tmp must be removed"
+        );
+        assert!(
+            ac6_priority_tmp.exists(),
+            "AC6: Normal restart must NEVER remove priority-*.tmp"
+        );
+
+        // Restart the exact same Priority lane on the exact same repo.
+        let priority_rec = recover_lane(repo.path(), CaptureQueueLane::Priority)
+            .expect("AC6: same-lane Priority restart must succeed");
+        assert_eq!(priority_rec.meta.committed_len, out_p1.meta.committed_len);
+        assert_eq!(priority_rec.cleaned_quarantine_tmp_files, 1);
+        assert!(
+            !ac6_priority_tmp.exists(),
+            "AC6: priority-*.tmp must be removed"
+        );
+
+        // ------------------------------------------------------------------
+        // Part 2 — AC7 (Before-rename crash on truncate AND orphan unlink paths
+        // leaves original segments 100% byte-for-byte untouched on the same repo):
+        // ------------------------------------------------------------------
+        let valid_end = normal_rec.meta.committed_len;
+        let damaged_tail = b"LCE1\x20\x00\x00\x00truncated-uncommitted-tail";
+        let mut expected_pre_crash_seg0 = expected_n1_n2.clone();
+        expected_pre_crash_seg0.extend_from_slice(damaged_tail);
+        {
+            let mut f = fs::OpenOptions::new()
+                .append(true)
+                .open(&seg0_path)
+                .expect("open seg0");
+            f.write_all(damaged_tail).expect("append damaged tail");
+            f.sync_data().expect("sync damaged tail");
+        }
+
+        let expected_trunc_id =
+            quarantine_artifact_id(CaptureQueueLane::Normal, 0, valid_end, damaged_tail);
+        let trunc_tmp_path = quarantine_dir.join(format!("{expected_trunc_id}.tmp"));
+        let trunc_bin_path = quarantine_dir.join(format!("{expected_trunc_id}.bin"));
+
+        let mut crash_before_rename_trunc =
+            SegmentObserver::with_crash(SegmentCrashPoint::BeforeQuarantineRename);
+        let err = quarantine_and_truncate_segment_inner(
+            quarantine_dir,
+            normal_dir,
+            CaptureQueueLane::Normal,
+            0,
+            valid_end,
+            &mut crash_before_rename_trunc,
+        )
+        .expect_err("crash before rename must fail");
+        assert_eq!(err.stable_code_str(), "LBR-IO-001");
+
+        // AC7: original segment is 100% byte-for-byte untouched (zero premature truncate)
+        assert_eq!(
+            fs::read(&seg0_path).expect("read seg0 after crash before rename"),
+            expected_pre_crash_seg0,
+            "AC7 violated: segment bytes changed despite crash before rename"
+        );
+        assert!(
+            trunc_tmp_path.exists(),
+            "crash before rename must leave .tmp"
+        );
+        assert!(
+            !trunc_bin_path.exists(),
+            "crash before rename must not publish .bin"
+        );
+
+        let damaged_orphan = b"LCE1\x30\x00\x00\x00half-frame-orphan-bytes";
+        let orphan_path = priority_dir.join(segment_log_file_name(1));
+        fs::write(&orphan_path, damaged_orphan).expect("write damaged orphan");
+        let expected_orphan_id =
+            quarantine_artifact_id(CaptureQueueLane::Priority, 1, 0, damaged_orphan);
+        let orphan_tmp_path = quarantine_dir.join(format!("{expected_orphan_id}.tmp"));
+        let orphan_bin_path = quarantine_dir.join(format!("{expected_orphan_id}.bin"));
+
+        let mut crash_before_rename_orphan =
+            SegmentObserver::with_crash(SegmentCrashPoint::BeforeQuarantineRename);
+        let orphan_err = quarantine_and_unlink_orphan_inner(
+            quarantine_dir,
+            priority_dir,
+            CaptureQueueLane::Priority,
+            1,
+            &mut crash_before_rename_orphan,
+        )
+        .expect_err("crash before orphan quarantine rename must fail");
+        assert_eq!(orphan_err.stable_code_str(), "LBR-IO-001");
+
+        // AC7: orphan segment is 100% byte-for-byte untouched (zero premature unlink)
+        assert_eq!(
+            fs::read(&orphan_path).expect("read orphan after crash before rename"),
+            damaged_orphan,
+            "AC7 violated: orphan segment altered or unlinked despite crash before rename"
+        );
+        assert!(orphan_tmp_path.exists(), "orphan .tmp must exist on disk");
+        assert!(
+            !orphan_bin_path.exists(),
+            "orphan .bin must not exist before rename"
+        );
+
+        // ------------------------------------------------------------------
+        // Part 3 — AC8 (Crash strictly AFTER `fsync_dir(quarantine_dir)` and
+        // BEFORE destructive `truncate`/`unlink` -> reopen the EXACT SAME lane
+        // BEFORE any replay and assert the original `.bin` inode + exact
+        // `damaged_bytes` survive untouched, then verify idempotent replay +
+        // post-reopen live `append_frame`!):
+        // ------------------------------------------------------------------
+        #[cfg(unix)]
+        fn inode_key(path: &Path) -> (u64, u64) {
+            use std::os::unix::fs::MetadataExt as _;
+            let md = fs::symlink_metadata(path).expect("stat quarantine .bin");
+            (md.dev(), md.ino())
+        }
+
+        // 1) Direct publish crash strictly after `fsync_dir(quarantine_dir)`.
+        let ac8_direct_bytes = b"LCE1\x44ac8-direct-survives-clean-lane-reopen";
+        let ac8_direct_id =
+            quarantine_artifact_id(CaptureQueueLane::Normal, 0, valid_end, ac8_direct_bytes);
+        let ac8_direct_bin = quarantine_dir.join(format!("{ac8_direct_id}.bin"));
+        let mut crash_after_fsync_direct = SegmentObserver::with_crash(
+            SegmentCrashPoint::AfterQuarantineDirFsyncBeforeDestructive,
+        );
+        let err_after_fsync_direct = publish_quarantine_durable_inner(
+            quarantine_dir,
+            &ac8_direct_id,
+            ac8_direct_bytes,
+            &mut crash_after_fsync_direct,
+        )
+        .expect_err("AC8 direct crash after fsync_dir must fail");
+        assert_eq!(err_after_fsync_direct.stable_code_str(), "LBR-IO-001");
+        #[cfg(unix)]
+        let ac8_direct_ino_before_reopen = inode_key(&ac8_direct_bin);
+
+        // 2) Truncate path crash strictly after `fsync_dir(quarantine_dir)` and
+        // before `truncate(events-00000000.log)`.
+        let mut crash_after_fsync_trunc = SegmentObserver::with_crash(
+            SegmentCrashPoint::AfterQuarantineDirFsyncBeforeDestructive,
+        );
+        let err_after_fsync_trunc = quarantine_and_truncate_segment_inner(
+            quarantine_dir,
+            normal_dir,
+            CaptureQueueLane::Normal,
+            0,
+            valid_end,
+            &mut crash_after_fsync_trunc,
+        )
+        .expect_err("crash after fsync_dir before truncate must fail");
+        assert_eq!(err_after_fsync_trunc.stable_code_str(), "LBR-IO-001");
+        #[cfg(unix)]
+        let trunc_bin_ino_before_reopen = inode_key(&trunc_bin_path);
+        assert_eq!(
+            fs::read(&trunc_bin_path).expect("AC8: read persisted truncate .bin"),
+            damaged_tail
+        );
+        assert!(!trunc_tmp_path.exists());
+        assert_eq!(
+            fs::read(&seg0_path).expect("seg0 untouched before truncate"),
+            expected_pre_crash_seg0
+        );
+
+        // 3) Orphan unlink path crash strictly after `fsync_dir(quarantine_dir)`
+        // and before `unlink(events-00000001.log)` so ALL THREE original `.bin`
+        // artifacts coexist simultaneously BEFORE any lane reopen or replay.
+        let mut crash_after_fsync_orphan = SegmentObserver::with_crash(
+            SegmentCrashPoint::AfterQuarantineDirFsyncBeforeDestructive,
+        );
+        let err_after_fsync_orphan = quarantine_and_unlink_orphan_inner(
+            quarantine_dir,
+            priority_dir,
+            CaptureQueueLane::Priority,
+            1,
+            &mut crash_after_fsync_orphan,
+        )
+        .expect_err("crash after fsync_dir before unlink must fail");
+        assert_eq!(err_after_fsync_orphan.stable_code_str(), "LBR-IO-001");
+        #[cfg(unix)]
+        let orphan_bin_ino_before_reopen = inode_key(&orphan_bin_path);
+        assert_eq!(
+            fs::read(&orphan_bin_path).expect("AC8: read persisted orphan .bin"),
+            damaged_orphan
+        );
+        assert!(!orphan_tmp_path.exists());
+        assert_eq!(
+            fs::read(&orphan_path).expect("orphan untouched before unlink"),
+            damaged_orphan
+        );
+
+        // Reopen BOTH lanes BEFORE ANY replay can republish any `.bin` artifact.
+        let pre_replay_reopen_err = recover_lane(repo.path(), CaptureQueueLane::Normal)
+            .expect_err("AC8: pre-replay recover_lane on untrimmed half-frame fails closed");
+        assert!(
+            matches!(
+                pre_replay_reopen_err,
+                StorageBackendError::BackendInternal { .. }
+            ),
+            "expected BackendInternal before RB-08m, got {pre_replay_reopen_err:?}"
+        );
+        let pre_replay_priority_err = recover_lane(repo.path(), CaptureQueueLane::Priority)
+            .expect_err("AC8: pre-replay recover_lane on orphan seg1 fails closed prior to RB-08f");
+        assert!(matches!(
+            pre_replay_priority_err,
+            StorageBackendError::CorruptCommittedFrame { .. }
+        ));
+
+        // Verify ALL THREE original `.bin` artifacts keep their exact original
+        // inode and exact bytes across BOTH lane reopens before any replay.
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                inode_key(&ac8_direct_bin),
+                ac8_direct_ino_before_reopen,
+                "AC8: direct .bin inode must survive both pre-replay lane reopens unchanged"
+            );
+            assert_eq!(
+                inode_key(&trunc_bin_path),
+                trunc_bin_ino_before_reopen,
+                "AC8: truncate .bin inode must survive both pre-replay lane reopens unchanged"
+            );
+            assert_eq!(
+                inode_key(&orphan_bin_path),
+                orphan_bin_ino_before_reopen,
+                "AC8: orphan .bin inode must survive both pre-replay lane reopens unchanged"
+            );
+        }
+        assert_eq!(
+            fs::read(&ac8_direct_bin)
+                .expect("AC8: direct .bin bytes after both pre-replay reopens"),
+            ac8_direct_bytes
+        );
+        assert_eq!(
+            fs::read(&trunc_bin_path)
+                .expect("AC8: truncate .bin bytes after both pre-replay reopens"),
+            damaged_tail
+        );
+        assert_eq!(
+            fs::read(&orphan_bin_path)
+                .expect("AC8: orphan .bin bytes after both pre-replay reopens"),
+            damaged_orphan
+        );
+        let pre_replay_normal_meta = read_converged_lane_tail_meta(normal_dir)
+            .expect("AC8: normal tail.meta remains converged after pre-replay reopens");
+        assert_eq!(pre_replay_normal_meta.committed_len, valid_end);
+        let pre_replay_priority_meta = read_converged_lane_tail_meta(priority_dir)
+            .expect("AC8: priority tail.meta remains converged after pre-replay reopens");
+        assert_eq!(
+            pre_replay_priority_meta.committed_len,
+            out_p1.meta.committed_len
+        );
+
+        // Idempotent replays complete both interrupted destructive operations
+        // without losing any `.bin` artifact.
+        let replay_trunc = quarantine_and_truncate_segment(
+            quarantine_dir,
+            normal_dir,
+            CaptureQueueLane::Normal,
+            0,
+            valid_end,
+        )
+        .expect("idempotent replay of quarantine_and_truncate_segment must succeed");
+        assert_eq!(replay_trunc.id, expected_trunc_id);
+        assert_eq!(
+            fs::read(&trunc_bin_path).expect("replayed truncate .bin"),
+            damaged_tail
+        );
+        assert_eq!(
+            fs::read(&seg0_path).expect("truncated seg0"),
+            expected_n1_n2
+        );
+
+        let replay_orphan = quarantine_and_unlink_orphan(
+            quarantine_dir,
+            priority_dir,
+            CaptureQueueLane::Priority,
+            1,
+        )
+        .expect("idempotent replay of quarantine_and_unlink_orphan must succeed");
+        assert_eq!(replay_orphan.id, expected_orphan_id);
+        assert_eq!(
+            fs::read(&orphan_bin_path).expect("replayed orphan .bin"),
+            damaged_orphan
+        );
+        assert!(!orphan_path.exists(), "orphan unlinked after replay");
+
+        // Reopen BOTH lanes cleanly (succeeds!) and verify the un-replayed
+        // original `ac8_direct_bin` (same original inode!), `trunc_bin_path`,
+        // and `orphan_bin_path` all persist intact, plus live appends work.
+        let reopened_normal = recover_lane(repo.path(), CaptureQueueLane::Normal)
+            .expect("AC8: reopen Normal lane after quarantine+truncate must succeed");
+        assert_eq!(reopened_normal.meta.committed_len, valid_end);
+        assert_eq!(reopened_normal.cleaned_quarantine_tmp_files, 0);
+        let reopened_priority = recover_lane(repo.path(), CaptureQueueLane::Priority)
+            .expect("AC8: reopen Priority lane after quarantine+unlink must succeed");
+        assert_eq!(
+            reopened_priority.meta.committed_len,
+            out_p1.meta.committed_len
+        );
+        assert_eq!(reopened_priority.cleaned_quarantine_tmp_files, 0);
+        #[cfg(unix)]
+        assert_eq!(
+            inode_key(&ac8_direct_bin),
+            ac8_direct_ino_before_reopen,
+            "AC8: un-replayed .bin inode must persist across both clean lane reopens"
+        );
+        assert_eq!(
+            fs::read(&ac8_direct_bin)
+                .expect("AC8: un-replayed .bin bytes after clean lane reopens"),
+            ac8_direct_bytes
+        );
+        assert_eq!(
+            fs::read(&trunc_bin_path).expect("AC8: truncate .bin persists after lane reopens"),
+            damaged_tail
+        );
+        assert_eq!(
+            fs::read(&orphan_bin_path).expect("AC8: orphan .bin persists after lane reopens"),
+            damaged_orphan
+        );
+        let post_n3 = append_frame(
+            repo.path(),
+            CaptureQueueLane::Normal,
+            FRAME_FLAG_NONE,
+            "rb08t:ac8:post-normal",
+            b"post-reopen-normal",
+        )
+        .expect("AC8: Normal lane accepts new frames after reopen");
+        assert!(post_n3.meta.committed_len > valid_end);
+        let post_p2 = append_frame(
+            repo.path(),
+            CaptureQueueLane::Priority,
+            FRAME_FLAG_NONE,
+            "rb08t:ac8:post-priority",
+            b"post-reopen-priority",
+        )
+        .expect("AC8: Priority lane accepts new frames after reopen");
+        assert!(post_p2.meta.committed_len > out_p1.meta.committed_len);
     }
 }

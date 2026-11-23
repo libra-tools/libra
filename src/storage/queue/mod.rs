@@ -53,10 +53,12 @@ pub use frame::{
     validate_frame_body_len,
 };
 pub use segment::{
-    LaneRecoveryReport, QUEUE_TAIL_META_BAK_TMP_FILE, QUEUE_TAIL_META_TMP_FILE,
-    SegmentAppendOutcome, append_encoded_frame, append_encoded_frame_at_root, append_frame,
-    append_frame_at_root, append_postcard_frame, is_lane_meta_temp_name,
-    parse_segment_log_file_name, read_converged_lane_tail_meta, recover_lane, recover_lane_at_root,
+    LaneRecoveryReport, QUARANTINE_DIAGNOSTIC_CODE, QUEUE_TAIL_META_BAK_TMP_FILE,
+    QUEUE_TAIL_META_TMP_FILE, QuarantinePublishReport, SegmentAppendOutcome, append_encoded_frame,
+    append_encoded_frame_at_root, append_frame, append_frame_at_root, append_postcard_frame,
+    is_lane_meta_temp_name, is_lane_quarantine_temp_name, parse_segment_log_file_name,
+    publish_quarantine_durable, quarantine_and_truncate_segment, quarantine_and_unlink_orphan,
+    quarantine_artifact_id, read_converged_lane_tail_meta, recover_lane, recover_lane_at_root,
 };
 
 /// Subdirectory under `.libra/private/` housing the dual-lane CRC32C capture queue.
