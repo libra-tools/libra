@@ -1767,6 +1767,18 @@ fn build_case_d_sealed_successor_meta(
     Ok(next_meta)
 }
 
+/// Decide whether `ADR-RB-05` #3 Case C should proceed from Step C1 to Step C2
+/// (seal `S` and create empty `S + 1`):
+/// - Requires `has_damaged_tail == true` (pure synced tails stay on `S`, `RB-08n`).
+/// - Requires `step_c1_meta.committed_len > 0` (never seal a 0-byte segment, `RB-08q`).
+/// - Requires `step_c1_meta.sealed.len() < MAX_SEALED_SEGMENTS` (full 256-entry
+///   table stays in-place on `S` and skips Step C2, `RB-08l`).
+fn should_run_case_c_step_c2(has_damaged_tail: bool, step_c1_meta: &LaneTailMeta) -> bool {
+    has_damaged_tail
+        && step_c1_meta.committed_len > 0
+        && step_c1_meta.sealed.len() < MAX_SEALED_SEGMENTS
+}
+
 /// Build and validate the `ADR-RB-05` #3 Case C **Step C2** `LTM2` metadata
 /// (`RB-08n` AC2–AC5): given the committed Step C1 `LTM2` metadata for segment
 /// `S` (`active_seg == S`, `committed_len == recovered_valid_end`,
@@ -1778,6 +1790,12 @@ fn build_case_c_step_c2_meta(step_c1_meta: &LaneTailMeta) -> StorageResult<LaneT
     if step_c1_meta.committed_len == 0 {
         return Err(StorageBackendError::BackendInternal {
             detail: "Case C Step C2 must not seal a 0-byte active segment".to_string(),
+        });
+    }
+    if step_c1_meta.sealed.len() >= MAX_SEALED_SEGMENTS {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "Case C Step C2 must be skipped when LTM2 sealed table is at MAX_SEALED_SEGMENTS (256)"
+                .to_string(),
         });
     }
     let next_seg = step_c1_meta.active_seg.checked_add(1).ok_or_else(|| {
@@ -3661,10 +3679,11 @@ mod unix_seg {
                     has_damaged_tail,
                     observer,
                 )?;
-                // `RB-08q`: Skip Step C2 when `recovered_valid_end == 0` (fresh
-                // segment first-frame crash) so we keep `ACTIVE_SEG == S` and
-                // never write a 0-byte sealed entry into `LTM2.sealed[]`.
-                let final_meta = if has_damaged_tail && step_c1.meta.committed_len > 0 {
+                // `RB-08q` / `RB-08l`: Skip Step C2 when `recovered_valid_end == 0`
+                // (fresh segment first-frame crash) OR `sealed.len() >= MAX_SEALED_SEGMENTS`
+                // (full 256-entry table), keeping `ACTIVE_SEG == S` and `sealed[]`
+                // intact without creating `events-<S+1>.log`.
+                let final_meta = if should_run_case_c_step_c2(has_damaged_tail, &step_c1.meta) {
                     observer.maybe_crash(SegmentCrashPoint::AfterCaseCStepC1MetaBeforeStepC2)?;
                     seal_recovered_segment_to_next_unix(ctx, &step_c1.meta, observer)?
                 } else {
@@ -7082,19 +7101,21 @@ mod non_unix_seg {
                         has_damaged_tail,
                         observer,
                     )?;
-                    // `RB-08q`: Skip Step C2 when `recovered_valid_end == 0`
-                    // (fresh segment first-frame crash) to avoid sealing 0-byte segments.
-                    let (final_meta, replacement_active_seg) = if has_damaged_tail
-                        && step_c1.meta.committed_len > 0
-                    {
-                        observer
-                            .maybe_crash(SegmentCrashPoint::AfterCaseCStepC1MetaBeforeStepC2)?;
-                        let (c2_meta, pinned_next) =
-                            seal_recovered_segment_to_next_windows(ctx, &step_c1.meta, observer)?;
-                        (c2_meta, Some(pinned_next))
-                    } else {
-                        (step_c1.meta, None)
-                    };
+                    // `RB-08q` / `RB-08l`: Skip Step C2 when `recovered_valid_end == 0`
+                    // OR `sealed.len() >= MAX_SEALED_SEGMENTS` (full 256-entry table).
+                    let (final_meta, replacement_active_seg) =
+                        if should_run_case_c_step_c2(has_damaged_tail, &step_c1.meta) {
+                            observer
+                                .maybe_crash(SegmentCrashPoint::AfterCaseCStepC1MetaBeforeStepC2)?;
+                            let (c2_meta, pinned_next) = seal_recovered_segment_to_next_windows(
+                                ctx,
+                                &step_c1.meta,
+                                observer,
+                            )?;
+                            (c2_meta, Some(pinned_next))
+                        } else {
+                            (step_c1.meta, None)
+                        };
                     let quarantined_artifacts = step_c1.quarantined_artifact.into_iter().collect();
                     Ok(WindowsPhase2ConvergedState {
                         meta: final_meta,
@@ -16959,6 +16980,276 @@ mod tests {
                 full_quarantine_snapshot_before,
                 "{case_label}: AC6 violated after append_frame — quarantine/ mutated"
             );
+        }
+    }
+
+    /// `RB-08l` AC1–AC7: Full 256-entry `LTM2.sealed[]` table Case C damaged
+    /// half-frame recovery executes shared Step C1 (quarantine, truncate,
+    /// `sync_data()`, dual `LTM2` boundary commit) and SKIPS Step C2 so
+    /// `ACTIVE_SEG == S`, `sealed.len() == 256`, and zero `events-<S+1>.log`
+    /// file is created.
+    #[test]
+    fn sealed_cap_256_case_c_skips_step_c2_and_commits_inplace_boundary() {
+        let build_full_256_lane_with_active = |active_payload: &[u8]| {
+            let repo = tempdir().expect("tempdir");
+            let init = init_capture_queue(repo.path()).expect("init capture queue");
+            let normal_dir = init.paths.normal.clone();
+
+            let small_frame =
+                encode_frame(FRAME_FLAG_NONE, "rb08l-sealed-4k", &[0x33u8; 4096]).unwrap();
+            let small_len = small_frame.len() as u64;
+            let small_crc = crc32c_checksum(&small_frame);
+            let mut sealed = Vec::with_capacity(MAX_SEALED_SEGMENTS);
+            for seg_id in 0..MAX_SEALED_SEGMENTS as u32 {
+                write_bytes_0600(
+                    &normal_dir.join(segment_log_file_name(seg_id)),
+                    &small_frame,
+                );
+                sealed.push(SealedSegmentMeta {
+                    seg_id,
+                    sealed_len: small_len,
+                    sealed_crc32c: small_crc,
+                });
+            }
+
+            let active_seg = MAX_SEALED_SEGMENTS as u32; // 256
+            let committed_frame =
+                encode_frame(FRAME_FLAG_NONE, "rb08l-active-prefix", active_payload).unwrap();
+            write_bytes_0600(
+                &normal_dir.join(segment_log_file_name(active_seg)),
+                &committed_frame,
+            );
+            let full_meta = LaneTailMeta {
+                min_live_seg: 0,
+                active_seg,
+                committed_len: committed_frame.len() as u64,
+                prefix_crc32c: crc32c_checksum(&committed_frame),
+                sealed,
+            };
+            let encoded = full_meta.encode().expect("encode full 256-entry LTM2");
+            write_bytes_0600(&tail_meta_path(&normal_dir), &encoded);
+            write_bytes_0600(&tail_meta_bak_path(&normal_dir), &encoded);
+            (repo, init, full_meta, committed_frame)
+        };
+
+        // =====================================================================
+        // Part 1 — Full 256-entry table + committed prefix + >64 KiB synced tail
+        // frame + truncated half-frame (`committed_len < recovered_valid_end < actual_len`)
+        // =====================================================================
+        {
+            let (repo, init, initial_meta, committed_frame) =
+                build_full_256_lane_with_active(b"rb08l-committed-prefix");
+            let normal_dir = &init.paths.normal;
+            let seg256_path = normal_dir.join(segment_log_file_name(256));
+            let seg257_path = normal_dir.join(segment_log_file_name(257));
+
+            // Append a complete >64 KiB synced frame plus a truncated half-frame.
+            let synced_tail_payload = vec![0x7au8; 80 * 1024];
+            let synced_tail_frame = encode_frame(
+                FRAME_FLAG_NONE,
+                "rb08l-synced-tail-80k",
+                &synced_tail_payload,
+            )
+            .unwrap();
+            let half_src = encode_frame(
+                FRAME_FLAG_NONE,
+                "rb08l-damaged-half",
+                b"truncated-half-frame-on-full-256-table",
+            )
+            .unwrap();
+            let damaged_tail = half_src[..half_src.len() / 2].to_vec();
+
+            {
+                let mut f = fs::OpenOptions::new()
+                    .append(true)
+                    .open(&seg256_path)
+                    .unwrap();
+                f.write_all(&synced_tail_frame).unwrap();
+                f.write_all(&damaged_tail).unwrap();
+                f.sync_data().unwrap();
+            }
+
+            let mut expected_recovered_bytes = Vec::new();
+            expected_recovered_bytes.extend_from_slice(&committed_frame);
+            expected_recovered_bytes.extend_from_slice(&synced_tail_frame);
+            let expected_valid_end = expected_recovered_bytes.len() as u64;
+            let expected_crc = crc32c_checksum(&expected_recovered_bytes);
+            let expected_q_id = quarantine_artifact_id(
+                CaptureQueueLane::Normal,
+                256,
+                expected_valid_end,
+                &damaged_tail,
+            );
+            let q_bin_path = init.paths.quarantine.join(format!("{expected_q_id}.bin"));
+
+            let mut obs = SegmentObserver::new();
+            let report =
+                recover_lane_in_storage_dir(repo.path(), CaptureQueueLane::Normal, &mut obs)
+                    .expect(
+                        "RB-08l full 256-table Case C recovery must succeed via Step C1 in-place",
+                    );
+
+            // AC1: Exact damaged tail quarantined with `LBR-AGENT-050`, strictly
+            // ordered `QuarantineFsyncDirComplete < SegmentTruncateStart < SegmentSyncData < dual LTM2`.
+            assert_eq!(report.quarantined_artifacts.len(), 1);
+            assert_eq!(report.quarantined_artifacts[0].id, expected_q_id);
+            assert_eq!(
+                report.quarantined_artifacts[0].diagnostic_code,
+                QUARANTINE_DIAGNOSTIC_CODE
+            );
+            assert_eq!(
+                fs::read(&q_bin_path).expect("AC1: read quarantined bytes"),
+                damaged_tail
+            );
+            let pos_q = obs
+                .events
+                .iter()
+                .position(|e| {
+                    matches!(e, SegmentOpEvent::QuarantineFsyncDirComplete { id } if id == &expected_q_id)
+                })
+                .expect("AC1: QuarantineFsyncDirComplete");
+            let pos_trunc = obs
+                .events
+                .iter()
+                .position(|e| {
+                    *e == SegmentOpEvent::SegmentTruncateStart {
+                        lane: QUEUE_LANE_NORMAL_DIR,
+                        seg_id: 256,
+                        to_len: expected_valid_end,
+                    }
+                })
+                .expect("AC2: SegmentTruncateStart(256, expected_valid_end)");
+            let pos_sync = obs
+                .events
+                .iter()
+                .position(|e| {
+                    *e == SegmentOpEvent::SegmentSyncData {
+                        lane: QUEUE_LANE_NORMAL_DIR,
+                        seg_id: 256,
+                    }
+                })
+                .expect("AC2: SegmentSyncData(256)");
+            let pos_bak_fsync = obs
+                .events
+                .iter()
+                .position(|e| {
+                    *e == SegmentOpEvent::FsyncLaneDirAfterMeta {
+                        lane: QUEUE_LANE_NORMAL_DIR,
+                        target_name: QUEUE_TAIL_META_BAK_FILE,
+                    }
+                })
+                .expect("AC3: Step C1 dual LTM2 commit");
+            assert!(pos_q < pos_trunc && pos_trunc < pos_sync && pos_sync < pos_bak_fsync);
+
+            // AC2: `events-00000256.log` truncated to exact `recovered_valid_end`.
+            let disk_seg256 = fs::read(&seg256_path).unwrap();
+            assert_eq!(disk_seg256.len() as u64, expected_valid_end);
+            assert_eq!(disk_seg256, expected_recovered_bytes);
+            let decoded = decode_all_segment_bytes(&disk_seg256);
+            assert_eq!(decoded.len(), 2);
+            assert_eq!(decoded[0].dedup_key, "rb08l-active-prefix");
+            assert_eq!(decoded[1].dedup_key, "rb08l-synced-tail-80k");
+            assert_eq!(decoded[1].payload, synced_tail_payload);
+
+            // AC3 & AC4: Dual `LTM2` updates `COMMITTED_LEN` and `PREFIX_CRC32C`.
+            let raw_meta = fs::read(tail_meta_path(normal_dir)).unwrap();
+            let raw_bak = fs::read(tail_meta_bak_path(normal_dir)).unwrap();
+            assert_eq!(raw_meta, raw_bak);
+            let disk_meta = LaneTailMeta::decode(&raw_meta).unwrap();
+            assert_eq!(disk_meta, report.meta);
+            assert_eq!(
+                disk_meta.committed_len, expected_valid_end,
+                "AC3 violated: LTM2.COMMITTED_LEN must equal recovered_valid_end"
+            );
+            assert_eq!(
+                disk_meta.prefix_crc32c, expected_crc,
+                "AC4 violated: LTM2.PREFIX_CRC32C must match events-00000256.log[0..recovered_valid_end]"
+            );
+
+            // AC5: Step C2 skipped -> `ACTIVE_SEG` stays 256.
+            assert_eq!(
+                disk_meta.active_seg, 256,
+                "AC5 violated: full 256 table must skip Step C2 and keep ACTIVE_SEG == 256"
+            );
+            // AC6: `sealed.len()` stays strictly 256 (zero 257th entry).
+            assert_eq!(
+                disk_meta.sealed.len(),
+                MAX_SEALED_SEGMENTS,
+                "AC6 violated: LTM2.sealed.len() must stay 256"
+            );
+            assert_eq!(disk_meta.sealed, initial_meta.sealed);
+            // AC7: Zero `events-00000257.log` created on disk and zero CreateSegment events.
+            assert!(
+                !seg257_path.exists(),
+                "AC7 violated: full 256 table must not create events-00000257.log"
+            );
+            assert!(
+                !obs.events
+                    .iter()
+                    .any(|e| matches!(e, SegmentOpEvent::CreateSegment { .. })),
+                "AC7 violated: observer recorded unexpected CreateSegment during Step C2 skip"
+            );
+        }
+
+        // =====================================================================
+        // Part 2 — Full 256-entry table equality boundary
+        // (`recovered_valid_end == committed_len < actual_len`, zero extra frames)
+        // =====================================================================
+        {
+            let (repo, init, initial_meta, committed_frame) =
+                build_full_256_lane_with_active(b"rb08l-eq-boundary-prefix");
+            let normal_dir = &init.paths.normal;
+            let seg256_path = normal_dir.join(segment_log_file_name(256));
+            let seg257_path = normal_dir.join(segment_log_file_name(257));
+
+            let bad_tail = b"LCE1\x00\x00\x00\xffbad-half-immediately-after-committed".to_vec();
+            {
+                let mut f = fs::OpenOptions::new()
+                    .append(true)
+                    .open(&seg256_path)
+                    .unwrap();
+                f.write_all(&bad_tail).unwrap();
+                f.sync_data().unwrap();
+            }
+            let expected_q_id = quarantine_artifact_id(
+                CaptureQueueLane::Normal,
+                256,
+                initial_meta.committed_len,
+                &bad_tail,
+            );
+            let report = recover_lane(repo.path(), CaptureQueueLane::Normal)
+                .expect("RB-08l equality boundary recovery must succeed");
+            assert_eq!(
+                fs::read(init.paths.quarantine.join(format!("{expected_q_id}.bin"))).unwrap(),
+                bad_tail
+            );
+            assert_eq!(fs::read(&seg256_path).unwrap(), committed_frame);
+            assert_eq!(report.meta.active_seg, 256);
+            assert_eq!(report.meta.committed_len, initial_meta.committed_len);
+            assert_eq!(report.meta.prefix_crc32c, initial_meta.prefix_crc32c);
+            assert_eq!(report.meta.sealed.len(), MAX_SEALED_SEGMENTS);
+            assert!(!seg257_path.exists());
+            assert_eq!(
+                fs::read(tail_meta_path(normal_dir)).unwrap(),
+                fs::read(tail_meta_bak_path(normal_dir)).unwrap()
+            );
+
+            // Defense-in-depth unit check on `should_run_case_c_step_c2` and
+            // `build_case_c_step_c2_meta`.
+            assert!(!should_run_case_c_step_c2(true, &report.meta));
+            assert!(!should_run_case_c_step_c2(false, &report.meta));
+            assert!(
+                build_case_c_step_c2_meta(&report.meta).is_err(),
+                "build_case_c_step_c2_meta defense-in-depth must refuse 256-entry table"
+            );
+            let mut non_full = report.meta.clone();
+            non_full.min_live_seg = 1;
+            non_full.sealed.remove(0);
+            assert_eq!(non_full.sealed.len(), 255);
+            assert!(should_run_case_c_step_c2(true, &non_full));
+            assert!(!should_run_case_c_step_c2(false, &non_full));
+            non_full.committed_len = 0;
+            assert!(!should_run_case_c_step_c2(true, &non_full));
         }
     }
 }
