@@ -9159,4 +9159,1046 @@ mod tests {
             assert!(!is_writer_active(repo.path()).unwrap());
         }
     }
+
+    #[tokio::test]
+    async fn consumer_clean_tail_recovery_multibatch_keeps_active_hw_and_subsequent_append() {
+        // `RB-09g` AC1 & AC2 (`ADR-RB-05` #4 ② (a)):
+        // Verify on BOTH `normal/` and `priority/` lanes:
+        // - AC1: Construct a pure synced uncommitted tail (`recovered_valid_end == actual_len`,
+        //   zero damaged bytes, retaining `ACTIVE_SEG == S`) with `> 128` unconsumed
+        //   frames in active segment `S`. Cover BOTH:
+        //     (a) `RB-09e` `recover_lane_uncommitted_tail` + multi-batch drain across
+        //         `50` committed backlog + `140` synced tail (`190 > 128` frames), and
+        //     (b) direct `drain_locked_at_root` self-delegated recovery across `140`
+        //         pure synced tail frames (`> 128` frames) after `AfterSegmentSyncData`.
+        //   Verify every batch advances DB `QUEUE_HIGHWATER_*` strictly to
+        //   `(S, batch_end_offset)` and stops at `(S, committed_len)` — NEVER jumping
+        //   to `(S + 1, 0)`, ZERO quarantine artifacts, ZERO `events-00000001.log`.
+        // - AC2: Immediately append `10` new frames into active segment `S` via public
+        //   `append_postcard_frame`; verify the consumer drains seamlessly from
+        //   `(S, old_committed_len)` with zero skipped frames, zero duplicates,
+        //   zero highwater-regression errors, and 100% payload equality.
+        use std::io::Write as _;
+
+        const PRE_COUNT: usize = 3;
+        const BACKLOG_COUNT: usize = 50;
+        const TAIL_COUNT: usize = 140;
+        const POST_APPEND_COUNT: usize = 10;
+
+        for lane in [CaptureQueueLane::Normal, CaptureQueueLane::Priority] {
+            let lane_label = lane_subdir_name(lane);
+            let flags = match lane {
+                CaptureQueueLane::Priority => FRAME_FLAG_PRIORITY,
+                CaptureQueueLane::Normal => FRAME_FLAG_NONE,
+            };
+            let payload_for = |tag: &str, seq: i64| match lane {
+                CaptureQueueLane::Priority => {
+                    make_session_payload(tag, CaptureSessionState::Stopped, 1_700_080_000 + seq)
+                }
+                CaptureQueueLane::Normal => make_audit_payload(
+                    tag,
+                    &format!("2026-11-24T07:{:02}:{:02}Z", (seq / 60) % 60, seq % 60),
+                ),
+            };
+
+            // =================================================================
+            // Sub-case (a): Pre-consumed + backlog + real `AfterSegmentSyncData`
+            // pure synced tail (> 128 total), recovered via `recover_lane_uncommitted_tail`,
+            // multi-batch drained on active `S = 0`, then subsequent append.
+            // =================================================================
+            {
+                let repo = tempdir().expect("tempdir");
+                let init = init_capture_queue(repo.path()).expect("init capture queue");
+                let lane_dir = match lane {
+                    CaptureQueueLane::Normal => init.paths.normal.clone(),
+                    CaptureQueueLane::Priority => init.paths.priority.clone(),
+                };
+                let store = RedbCaptureStore::create(
+                    repo.path()
+                        .join(PRIVATE_SUBDIR)
+                        .join("capture.gen-0001.redb"),
+                )
+                .await
+                .expect("create RedbCaptureStore");
+                let setup_spy = SpyCaptureStore::new(store.clone(), init.paths.root.clone());
+
+                let mut hw_offset = 0u64;
+                for i in 0..PRE_COUNT {
+                    let out = append_postcard_frame(
+                        repo.path(),
+                        lane,
+                        flags,
+                        &format!("rb09g:ac1a:{lane_label}:pre:{i:03}"),
+                        CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                        &payload_for(&format!("rb09g-ac1a-{lane_label}-pre-{i:03}"), i as i64),
+                    )
+                    .unwrap();
+                    hw_offset = out.meta.committed_len;
+                }
+                let _ = drain_capture_queue(repo.path(), &setup_spy).await.unwrap();
+                assert_eq!(
+                    store.get_queue_highwater(lane).await.unwrap(),
+                    CaptureQueueHighwater {
+                        segment_id: 0,
+                        byte_offset: hw_offset,
+                    }
+                );
+
+                let mut expected_dedups = Vec::with_capacity(BACKLOG_COUNT + TAIL_COUNT);
+                let mut expected_payloads = Vec::with_capacity(BACKLOG_COUNT + TAIL_COUNT);
+                let mut frame_end_offsets = Vec::with_capacity(BACKLOG_COUNT + TAIL_COUNT);
+                let mut cursor = hw_offset;
+                for i in 0..BACKLOG_COUNT {
+                    let dedup = format!("rb09g:ac1a:{lane_label}:backlog:{i:03}");
+                    let payload = payload_for(
+                        &format!("rb09g-ac1a-{lane_label}-backlog-{i:03}"),
+                        (PRE_COUNT + i) as i64,
+                    );
+                    let out = append_postcard_frame(
+                        repo.path(),
+                        lane,
+                        flags,
+                        &dedup,
+                        CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                        &payload,
+                    )
+                    .unwrap();
+                    assert_eq!(out.frame_offset, cursor);
+                    cursor = out.meta.committed_len;
+                    expected_dedups.push(dedup);
+                    expected_payloads.push(payload);
+                    frame_end_offsets.push(cursor);
+                }
+                let committed_before_crash = cursor;
+
+                // First tail frame via genuine `AfterSegmentSyncData` producer crash,
+                // followed by `TAIL_COUNT - 1` more complete valid synced frames.
+                let t0_dedup = format!("rb09g:ac1a:{lane_label}:tail:000");
+                let t0_payload = payload_for(
+                    &format!("rb09g-ac1a-{lane_label}-tail-000"),
+                    (PRE_COUNT + BACKLOG_COUNT) as i64,
+                );
+                let t0_bytes = encode_postcard_frame(
+                    flags,
+                    &t0_dedup,
+                    CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                    &t0_payload,
+                )
+                .unwrap();
+                let mut prod_crash_obs =
+                    SegmentObserver::with_crash(SegmentCrashPoint::AfterSegmentSyncData);
+                let _ = append_encoded_frame_in_storage_dir_with_observer(
+                    repo.path(),
+                    lane,
+                    &t0_bytes,
+                    QueueAppendOptions::default(),
+                    &mut prod_crash_obs,
+                )
+                .expect_err("injected AfterSegmentSyncData must fail");
+                cursor += t0_bytes.len() as u64;
+                expected_dedups.push(t0_dedup);
+                expected_payloads.push(t0_payload);
+                frame_end_offsets.push(cursor);
+
+                let mut extra_tail = Vec::new();
+                for i in 1..TAIL_COUNT {
+                    let dedup = format!("rb09g:ac1a:{lane_label}:tail:{i:03}");
+                    let payload = payload_for(
+                        &format!("rb09g-ac1a-{lane_label}-tail-{i:03}"),
+                        (PRE_COUNT + BACKLOG_COUNT + i) as i64,
+                    );
+                    let raw = encode_postcard_frame(
+                        flags,
+                        &dedup,
+                        CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                        &payload,
+                    )
+                    .unwrap();
+                    cursor += raw.len() as u64;
+                    extra_tail.extend_from_slice(&raw);
+                    expected_dedups.push(dedup);
+                    expected_payloads.push(payload);
+                    frame_end_offsets.push(cursor);
+                }
+                let recovered_committed_len = cursor;
+                let seg0_path = lane_dir.join(segment_log_file_name(0));
+                {
+                    let mut f = fs::OpenOptions::new()
+                        .append(true)
+                        .open(&seg0_path)
+                        .unwrap();
+                    f.write_all(&extra_tail).unwrap();
+                    f.sync_data().unwrap();
+                }
+                assert_eq!(
+                    fs::metadata(&seg0_path).unwrap().len(),
+                    recovered_committed_len
+                );
+                assert_eq!(
+                    read_converged_lane_tail_meta(&lane_dir)
+                        .unwrap()
+                        .committed_len,
+                    committed_before_crash
+                );
+
+                // Recover pure synced tail in place: keeps `active_seg == 0`, zero quarantine.
+                let rec = CaptureQueueWriter::in_storage_dir(repo.path())
+                    .recover_lane_uncommitted_tail(lane, &setup_spy)
+                    .await
+                    .unwrap()
+                    .expect("pure synced tail must be recovered");
+                assert_eq!(rec.recovered_frames, TAIL_COUNT);
+                assert_eq!(rec.meta.active_seg, 0);
+                assert_eq!(rec.meta.committed_len, recovered_committed_len);
+                assert!(rec.meta.sealed.is_empty());
+                assert!(rec.quarantined_artifacts.is_empty());
+                assert_eq!(fs::read_dir(&init.paths.quarantine).unwrap().count(), 0);
+                assert!(!lane_dir.join(segment_log_file_name(1)).exists());
+
+                // AC1: Multi-batch drain (> 128 frames) keeps `segment_id == 0` on EVERY batch
+                // and stops strictly at `(0, recovered_committed_len)`.
+                let spy = SpyCaptureStore::new(store.clone(), init.paths.root.clone());
+                let rep = drain_capture_queue(repo.path(), &spy)
+                    .await
+                    .expect("AC1: multi-batch active drain after clean tail recovery must succeed");
+                assert_eq!(rep.applied_frames, BACKLOG_COUNT + TAIL_COUNT);
+                assert_eq!(rep.deduplicated_frames, 0);
+                assert_eq!(rep.reclaimed_segments, 0);
+
+                let calls = spy.recorded_calls();
+                assert!(
+                    calls.len() >= 2,
+                    "AC1 ({lane_label}): 190 frames at max_batch_size=128 must span >= 2 batches"
+                );
+                let mut cum = 0usize;
+                let mut seen_dedups = Vec::with_capacity(BACKLOG_COUNT + TAIL_COUNT);
+                for (idx, call) in calls.iter().enumerate() {
+                    assert_eq!(call.lane, lane);
+                    assert_eq!(call.tx_delta, 1);
+                    assert!(call.append_lock_was_free);
+                    assert!((1..=DEFAULT_WRITER_MAX_BATCH_SIZE).contains(&call.item_count));
+                    cum += call.item_count;
+                    seen_dedups.extend(call.dedup_keys.iter().cloned());
+                    let expected_end = frame_end_offsets[cum - 1];
+                    assert_eq!(
+                        call.db_highwater_after,
+                        CaptureQueueHighwater {
+                            segment_id: 0,
+                            byte_offset: expected_end,
+                        },
+                        "AC1 ({lane_label}): batch {idx} on active seg 0 must stay at (0, batch_end_offset), NEVER (1, 0)"
+                    );
+                }
+                assert_eq!(cum, BACKLOG_COUNT + TAIL_COUNT);
+                assert_eq!(seen_dedups, expected_dedups);
+                let expected_hw_after_ac1 = CaptureQueueHighwater {
+                    segment_id: 0,
+                    byte_offset: recovered_committed_len,
+                };
+                assert_eq!(
+                    store.get_queue_highwater(lane).await.unwrap(),
+                    expected_hw_after_ac1
+                );
+                assert_eq!(
+                    read_highwater_mirror(&init.paths.root)
+                        .unwrap()
+                        .unwrap()
+                        .get(lane),
+                    expected_hw_after_ac1
+                );
+                assert!(!lane_dir.join(segment_log_file_name(1)).exists());
+
+                // AC2: Immediately append `POST_APPEND_COUNT` new frames to active seg 0
+                // and verify seamless drain starting from `(0, recovered_committed_len)`.
+                let mut post_dedups = Vec::with_capacity(POST_APPEND_COUNT);
+                let mut post_payloads = Vec::with_capacity(POST_APPEND_COUNT);
+                let mut post_cursor = recovered_committed_len;
+                for i in 0..POST_APPEND_COUNT {
+                    let dedup = format!("rb09g:ac2a:{lane_label}:post:{i:03}");
+                    let payload = payload_for(
+                        &format!("rb09g-ac2a-{lane_label}-post-{i:03}"),
+                        (PRE_COUNT + BACKLOG_COUNT + TAIL_COUNT + i) as i64,
+                    );
+                    let out = append_postcard_frame(
+                        repo.path(),
+                        lane,
+                        flags,
+                        &dedup,
+                        CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                        &payload,
+                    )
+                    .expect("AC2: subsequent append into active seg 0 must succeed");
+                    assert_eq!(out.meta.active_seg, 0);
+                    assert_eq!(out.frame_offset, post_cursor);
+                    post_cursor = out.meta.committed_len;
+                    post_dedups.push(dedup);
+                    post_payloads.push(payload);
+                }
+                let final_committed_len = post_cursor;
+
+                let post_spy = SpyCaptureStore::new(store.clone(), init.paths.root.clone());
+                let post_rep = drain_capture_queue(repo.path(), &post_spy)
+                    .await
+                    .expect("AC2: drain after subsequent append to active seg 0 must succeed without regression");
+                assert_eq!(post_rep.applied_frames, POST_APPEND_COUNT);
+                assert_eq!(post_rep.deduplicated_frames, 0);
+                let post_seen: Vec<String> = post_spy
+                    .recorded_calls()
+                    .into_iter()
+                    .flat_map(|c| c.dedup_keys)
+                    .collect();
+                assert_eq!(post_seen, post_dedups);
+                let expected_hw_final = CaptureQueueHighwater {
+                    segment_id: 0,
+                    byte_offset: final_committed_len,
+                };
+                assert_eq!(
+                    store.get_queue_highwater(lane).await.unwrap(),
+                    expected_hw_final
+                );
+                assert_eq!(
+                    read_highwater_mirror(&init.paths.root)
+                        .unwrap()
+                        .unwrap()
+                        .get(lane),
+                    expected_hw_final
+                );
+
+                // Verify 100% payload equality across all recovered + post-append frames.
+                for expected in expected_payloads.iter().chain(post_payloads.iter()) {
+                    match expected {
+                        CaptureBatchPayload::AppendAuditLog(rec) => {
+                            let got = store.get_audit_log(&rec.audit_id).await.unwrap().unwrap();
+                            assert_eq!(&got, rec);
+                        }
+                        CaptureBatchPayload::UpsertSession(rec) => {
+                            let got = store.get_session(&rec.session_id).await.unwrap().unwrap();
+                            assert_eq!(&got, rec);
+                        }
+                        other => panic!("unexpected payload: {other:?}"),
+                    }
+                }
+            }
+
+            // =================================================================
+            // Sub-case (b): Direct `drain_capture_queue` self-delegating pure
+            // synced tail recovery (`140 > 128` synced frames after drained prefix)
+            // + immediate subsequent append.
+            // =================================================================
+            {
+                let repo = tempdir().expect("tempdir");
+                let init = init_capture_queue(repo.path()).expect("init capture queue");
+                let lane_dir = match lane {
+                    CaptureQueueLane::Normal => init.paths.normal.clone(),
+                    CaptureQueueLane::Priority => init.paths.priority.clone(),
+                };
+                let store = RedbCaptureStore::create(
+                    repo.path()
+                        .join(PRIVATE_SUBDIR)
+                        .join("capture.gen-0001.redb"),
+                )
+                .await
+                .expect("create RedbCaptureStore");
+                let init_spy = SpyCaptureStore::new(store.clone(), init.paths.root.clone());
+
+                let f0_out = append_postcard_frame(
+                    repo.path(),
+                    lane,
+                    flags,
+                    &format!("rb09g:ac1b:{lane_label}:pre:0"),
+                    CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                    &payload_for(&format!("rb09g-ac1b-{lane_label}-pre-0"), 0),
+                )
+                .unwrap();
+                let mut cursor = f0_out.meta.committed_len;
+                let _ = drain_capture_queue(repo.path(), &init_spy).await.unwrap();
+
+                let mut raw_tail = Vec::new();
+                let mut end_offsets = Vec::with_capacity(TAIL_COUNT);
+                for i in 0..TAIL_COUNT {
+                    let raw = encode_postcard_frame(
+                        flags,
+                        &format!("rb09g:ac1b:{lane_label}:tail:{i:03}"),
+                        CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                        &payload_for(
+                            &format!("rb09g-ac1b-{lane_label}-tail-{i:03}"),
+                            (1 + i) as i64,
+                        ),
+                    )
+                    .unwrap();
+                    cursor += raw.len() as u64;
+                    raw_tail.extend_from_slice(&raw);
+                    end_offsets.push(cursor);
+                }
+                let expected_end = cursor;
+                {
+                    let mut f = fs::OpenOptions::new()
+                        .append(true)
+                        .open(lane_dir.join(segment_log_file_name(0)))
+                        .unwrap();
+                    f.write_all(&raw_tail).unwrap();
+                    f.sync_data().unwrap();
+                }
+
+                let spy = SpyCaptureStore::new(store.clone(), init.paths.root.clone());
+                let rep = drain_capture_queue(repo.path(), &spy)
+                    .await
+                    .expect("direct drain with >128 pure synced tail must succeed");
+                assert_eq!(rep.recovery_delegations, 1);
+                assert_eq!(rep.applied_frames, TAIL_COUNT);
+                assert_eq!(fs::read_dir(&init.paths.quarantine).unwrap().count(), 0);
+                let calls = spy.recorded_calls();
+                assert!(calls.len() >= 2);
+                let mut cum = 0usize;
+                for call in &calls {
+                    cum += call.item_count;
+                    assert_eq!(
+                        call.db_highwater_after,
+                        CaptureQueueHighwater {
+                            segment_id: 0,
+                            byte_offset: end_offsets[cum - 1],
+                        }
+                    );
+                }
+                assert_eq!(
+                    store.get_queue_highwater(lane).await.unwrap(),
+                    CaptureQueueHighwater {
+                        segment_id: 0,
+                        byte_offset: expected_end,
+                    }
+                );
+
+                // Subsequent append seamlessly drains from `(0, expected_end)`.
+                let post_out = append_postcard_frame(
+                    repo.path(),
+                    lane,
+                    flags,
+                    &format!("rb09g:ac2b:{lane_label}:post"),
+                    CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                    &payload_for(&format!("rb09g-ac2b-{lane_label}-post"), 999),
+                )
+                .unwrap();
+                assert_eq!(post_out.meta.active_seg, 0);
+                assert_eq!(post_out.frame_offset, expected_end);
+                let post_rep = drain_capture_queue(repo.path(), &spy).await.unwrap();
+                assert_eq!(post_rep.applied_frames, 1);
+                assert_eq!(post_rep.deduplicated_frames, 0);
+                assert_eq!(
+                    store.get_queue_highwater(lane).await.unwrap(),
+                    CaptureQueueHighwater {
+                        segment_id: 0,
+                        byte_offset: post_out.meta.committed_len,
+                    }
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn consumer_full_256_table_recovery_multibatch_keeps_active_hw_and_subsequent_append() {
+        // `RB-09g` AC3 & AC4 (`ADR-RB-05` #4 ② (a), (b)):
+        // Verify on BOTH `normal/` and `priority/` lanes:
+        // - AC3: Construct `LTM2.sealed.len() == 256` (`seg 0..=255`, with `seg 0..=254`
+        //   carrying 2 frames each and `seg 255` carrying `130 > 128` frames to prove
+        //   multi-batch sealed crossing as well) plus active segment `S = 256`
+        //   containing `50` committed frames + `110` complete `sync_data` tail frames
+        //   + damaged half-frame. Run Step C1 in-place recovery (`RB-09e`
+        //   `recover_lane_uncommitted_tail` -> skips Step C2 because `sealed.len() == 256`,
+        //   quarantines half-frame with `LBR-AGENT-050`, leaves `active_seg == 256`
+        //   with `160 > 128` unconsumed frames). Consumer drains all 256 sealed
+        //   segments in order (only advancing `(s+1, 0)` on the final batch exhausting
+        //   `sealed_len(s)`), then drains active `S = 256` across `>= 2` batches
+        //   keeping `QUEUE_HIGHWATER_*` strictly on `S = 256` and stopping at
+        //   `(256, committed_len(256))` (NEVER `(257, 0)`).
+        // - AC4: Immediately append `5` new frames to active `S = 256`; consumer
+        //   drains all 5 frames seamlessly from `(256, old_committed_len)` with zero
+        //   skipped frames, zero duplicates, zero highwater-regression errors, and
+        //   100% payload equality across all 805 records.
+        const SEALED_CAP: u32 = crate::storage::queue::MAX_SEALED_SEGMENTS as u32;
+        const SMALL_SEALED_FRAMES: usize = 2;
+        const LAST_SEALED_FRAMES: usize = 130;
+        const ACTIVE_COMMITTED_FRAMES: usize = 50;
+        const ACTIVE_TAIL_FRAMES: usize = 110;
+        const ACTIVE_TOTAL_FRAMES: usize = ACTIVE_COMMITTED_FRAMES + ACTIVE_TAIL_FRAMES;
+        const POST_APPEND_FRAMES: usize = 5;
+
+        for lane in [CaptureQueueLane::Normal, CaptureQueueLane::Priority] {
+            let lane_label = lane_subdir_name(lane);
+            let flags = match lane {
+                CaptureQueueLane::Priority => FRAME_FLAG_PRIORITY,
+                CaptureQueueLane::Normal => FRAME_FLAG_NONE,
+            };
+            let payload_for = |tag: &str, seq: i64| match lane {
+                CaptureQueueLane::Priority => {
+                    make_session_payload(tag, CaptureSessionState::Stopped, 1_700_090_000 + seq)
+                }
+                CaptureQueueLane::Normal => make_audit_payload(
+                    tag,
+                    &format!("2026-11-24T08:{:02}:{:02}Z", (seq / 60) % 60, seq % 60),
+                ),
+            };
+
+            let repo = tempdir().expect("tempdir");
+            let init = init_capture_queue(repo.path()).expect("init capture queue");
+            let lane_dir = match lane {
+                CaptureQueueLane::Normal => init.paths.normal.clone(),
+                CaptureQueueLane::Priority => init.paths.priority.clone(),
+            };
+            let store = RedbCaptureStore::create(
+                repo.path()
+                    .join(PRIVATE_SUBDIR)
+                    .join("capture.gen-0001.redb"),
+            )
+            .await
+            .expect("create RedbCaptureStore");
+
+            // 1. Seed 256 sealed segments `0..=255` with authenticated `LTM2.sealed[]`
+            //    entries (`seg 0..=254` have 2 frames each; `seg 255` has 130 > 128 frames).
+            let mut sealed_entries = Vec::with_capacity(SEALED_CAP as usize);
+            let mut expected_payloads: Vec<CaptureBatchPayload> = Vec::new();
+            let mut seg255_end_offsets: Vec<u64> = Vec::with_capacity(LAST_SEALED_FRAMES);
+            let mut seq_counter = 0i64;
+
+            for seg_id in 0..SEALED_CAP {
+                let frame_count = if seg_id + 1 == SEALED_CAP {
+                    LAST_SEALED_FRAMES
+                } else {
+                    SMALL_SEALED_FRAMES
+                };
+                let mut seg_bytes = Vec::new();
+                for f_idx in 0..frame_count {
+                    let dedup = format!("rb09g:ac3:{lane_label}:s{seg_id:03}:f{f_idx:03}");
+                    let payload = payload_for(
+                        &format!("rb09g-ac3-{lane_label}-s{seg_id:03}-f{f_idx:03}"),
+                        seq_counter,
+                    );
+                    seq_counter += 1;
+                    let raw = encode_postcard_frame(
+                        flags,
+                        &dedup,
+                        CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                        &payload,
+                    )
+                    .unwrap();
+                    seg_bytes.extend_from_slice(&raw);
+                    if seg_id + 1 == SEALED_CAP {
+                        seg255_end_offsets.push(seg_bytes.len() as u64);
+                    }
+                    expected_payloads.push(payload);
+                }
+                write_bytes_0600(&lane_dir.join(segment_log_file_name(seg_id)), &seg_bytes);
+                sealed_entries.push(SealedSegmentMeta {
+                    seg_id,
+                    sealed_len: seg_bytes.len() as u64,
+                    sealed_crc32c: crc32c_checksum(&seg_bytes),
+                });
+            }
+            assert_eq!(sealed_entries.len(), SEALED_CAP as usize);
+
+            // 2. Seed active segment `S = 256` with `50` committed frames (`LTM2`) +
+            //    `110` synced uncommitted tail frames + 1 damaged half-frame.
+            let mut active_committed_bytes = Vec::new();
+            let mut active_end_offsets: Vec<u64> = Vec::with_capacity(ACTIVE_TOTAL_FRAMES);
+            for i in 0..ACTIVE_COMMITTED_FRAMES {
+                let dedup = format!("rb09g:ac3:{lane_label}:s256:c{i:03}");
+                let payload =
+                    payload_for(&format!("rb09g-ac3-{lane_label}-s256-c{i:03}"), seq_counter);
+                seq_counter += 1;
+                let raw = encode_postcard_frame(
+                    flags,
+                    &dedup,
+                    CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                    &payload,
+                )
+                .unwrap();
+                active_committed_bytes.extend_from_slice(&raw);
+                active_end_offsets.push(active_committed_bytes.len() as u64);
+                expected_payloads.push(payload);
+            }
+            let committed_len_before = active_committed_bytes.len() as u64;
+            let prefix_crc_before = crc32c_checksum(&active_committed_bytes);
+
+            let mut active_all_bytes = active_committed_bytes;
+            for i in 0..ACTIVE_TAIL_FRAMES {
+                let dedup = format!("rb09g:ac3:{lane_label}:s256:t{i:03}");
+                let payload =
+                    payload_for(&format!("rb09g-ac3-{lane_label}-s256-t{i:03}"), seq_counter);
+                seq_counter += 1;
+                let raw = encode_postcard_frame(
+                    flags,
+                    &dedup,
+                    CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                    &payload,
+                )
+                .unwrap();
+                active_all_bytes.extend_from_slice(&raw);
+                active_end_offsets.push(active_all_bytes.len() as u64);
+                expected_payloads.push(payload);
+            }
+            let recovered_active_len = active_all_bytes.len() as u64;
+            let half_full = encode_postcard_frame(
+                flags,
+                &format!("rb09g:ac3:{lane_label}:s256:half"),
+                CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                &payload_for(&format!("rb09g-ac3-{lane_label}-s256-half"), 99_999),
+            )
+            .unwrap();
+            let damaged_half = half_full[..half_full.len() / 2].to_vec();
+            active_all_bytes.extend_from_slice(&damaged_half);
+
+            let seg256_path = lane_dir.join(segment_log_file_name(SEALED_CAP));
+            let seg257_path = lane_dir.join(segment_log_file_name(SEALED_CAP + 1));
+            write_bytes_0600(&seg256_path, &active_all_bytes);
+            {
+                let f = fs::OpenOptions::new()
+                    .write(true)
+                    .open(&seg256_path)
+                    .unwrap();
+                f.sync_data().unwrap();
+            }
+
+            let initial_meta = LaneTailMeta {
+                min_live_seg: 0,
+                active_seg: SEALED_CAP,
+                committed_len: committed_len_before,
+                prefix_crc32c: prefix_crc_before,
+                sealed: sealed_entries.clone(),
+            };
+            let raw_meta = initial_meta.encode().expect("encode full 256-entry LTM2");
+            write_bytes_0600(&tail_meta_path(&lane_dir), &raw_meta);
+            write_bytes_0600(&tail_meta_bak_path(&lane_dir), &raw_meta);
+
+            // 3. Step C1 in-place recovery under `sealed.len() == 256`: MUST keep
+            //    `active_seg == 256`, `sealed.len() == 256`, quarantine ONLY damaged half,
+            //    and NOT create `seg 257`!
+            let setup_spy = SpyCaptureStore::new(store.clone(), init.paths.root.clone());
+            let rec = CaptureQueueWriter::in_storage_dir(repo.path())
+                .recover_lane_uncommitted_tail(lane, &setup_spy)
+                .await
+                .expect("Step C1 recovery on full 256 table must succeed")
+                .expect("must recover active seg 256 in place");
+            assert_eq!(rec.recovered_frames, ACTIVE_TAIL_FRAMES);
+            assert_eq!(rec.meta.min_live_seg, 0);
+            assert_eq!(rec.meta.active_seg, SEALED_CAP);
+            assert_eq!(rec.meta.committed_len, recovered_active_len);
+            assert_eq!(rec.meta.sealed.len(), SEALED_CAP as usize);
+            assert_eq!(rec.quarantined_artifacts.len(), 1);
+            assert_eq!(
+                rec.quarantined_artifacts[0].diagnostic_code,
+                QUARANTINE_DIAGNOSTIC_CODE
+            );
+            assert_eq!(
+                fs::read(&rec.quarantined_artifacts[0].bin_path).unwrap(),
+                damaged_half
+            );
+            assert!(!seg257_path.exists());
+            assert_eq!(
+                store.get_queue_highwater(lane).await.unwrap(),
+                CaptureQueueHighwater::default()
+            );
+
+            // 4. AC3: Drain all 256 sealed segments + active `seg 256` (> 128 frames).
+            let spy = SpyCaptureStore::new(store.clone(), init.paths.root.clone());
+            let rep = drain_capture_queue(repo.path(), &spy).await.expect(
+                "AC3: drain across 256 sealed segments + recovered active S=256 must succeed",
+            );
+            let total_before_post = (SEALED_CAP as usize - 1) * SMALL_SEALED_FRAMES
+                + LAST_SEALED_FRAMES
+                + ACTIVE_TOTAL_FRAMES;
+            assert_eq!(rep.applied_frames, total_before_post);
+            assert_eq!(rep.deduplicated_frames, 0);
+            assert_eq!(rep.reclaimed_segments, SEALED_CAP as usize);
+
+            // Verify every single batch transition across `seg 0..=255` and active `seg 256`:
+            let calls = spy.recorded_calls();
+            let mut call_idx = 0usize;
+            for seg_id in 0..(SEALED_CAP - 1) {
+                let mut seg_frames = 0usize;
+                while seg_frames < SMALL_SEALED_FRAMES {
+                    let c = &calls[call_idx];
+                    call_idx += 1;
+                    assert_eq!(c.lane, lane);
+                    assert_eq!(c.tx_delta, 1);
+                    assert!(c.append_lock_was_free);
+                    seg_frames += c.item_count;
+                    if seg_frames < SMALL_SEALED_FRAMES {
+                        assert_eq!(c.db_highwater_after.segment_id, seg_id);
+                        assert!(
+                            c.db_highwater_after.byte_offset
+                                < sealed_entries[seg_id as usize].sealed_len
+                        );
+                    } else {
+                        assert_eq!(
+                            c.db_highwater_after,
+                            CaptureQueueHighwater {
+                                segment_id: seg_id + 1,
+                                byte_offset: 0,
+                            },
+                            "AC3 ({lane_label}): final batch of sealed seg {seg_id} must cross to ({}, 0)",
+                            seg_id + 1
+                        );
+                    }
+                }
+            }
+
+            // Verify multi-batch sealed `seg 255` (130 frames => >= 2 batches):
+            let mut seg255_batches = 0usize;
+            let mut seg255_frames = 0usize;
+            while seg255_frames < LAST_SEALED_FRAMES {
+                let c = &calls[call_idx];
+                call_idx += 1;
+                seg255_batches += 1;
+                seg255_frames += c.item_count;
+                if seg255_frames < LAST_SEALED_FRAMES {
+                    assert_eq!(
+                        c.db_highwater_after,
+                        CaptureQueueHighwater {
+                            segment_id: SEALED_CAP - 1,
+                            byte_offset: seg255_end_offsets[seg255_frames - 1],
+                        },
+                        "AC3 ({lane_label}): intermediate batch of sealed seg 255 must NOT jump to (256, 0)"
+                    );
+                } else {
+                    assert_eq!(
+                        c.db_highwater_after,
+                        CaptureQueueHighwater {
+                            segment_id: SEALED_CAP,
+                            byte_offset: 0,
+                        },
+                        "AC3 ({lane_label}): final batch of sealed seg 255 must advance atomically to (256, 0)"
+                    );
+                }
+            }
+            assert!(seg255_batches >= 2);
+
+            // Verify multi-batch active `seg 256` (160 frames => >= 2 batches):
+            // EVERY batch must remain on `segment_id == 256` and stop at `(256, recovered_active_len)`!
+            let active_calls = &calls[call_idx..];
+            assert!(
+                active_calls.len() >= 2,
+                "AC3 ({lane_label}): 160 active frames in seg 256 must require >= 2 batches"
+            );
+            let mut active_cum = 0usize;
+            for (i, c) in active_calls.iter().enumerate() {
+                assert_eq!(c.lane, lane);
+                assert_eq!(c.tx_delta, 1);
+                assert!(c.append_lock_was_free);
+                active_cum += c.item_count;
+                assert_eq!(
+                    c.db_highwater_after,
+                    CaptureQueueHighwater {
+                        segment_id: SEALED_CAP,
+                        byte_offset: active_end_offsets[active_cum - 1],
+                    },
+                    "AC3 ({lane_label}): active seg 256 batch {i} must stay on seg 256, NEVER jump to (257, 0)"
+                );
+            }
+            assert_eq!(active_cum, ACTIVE_TOTAL_FRAMES);
+            let expected_hw_after_ac3 = CaptureQueueHighwater {
+                segment_id: SEALED_CAP,
+                byte_offset: recovered_active_len,
+            };
+            assert_eq!(
+                store.get_queue_highwater(lane).await.unwrap(),
+                expected_hw_after_ac3
+            );
+            assert_eq!(
+                read_highwater_mirror(&init.paths.root)
+                    .unwrap()
+                    .unwrap()
+                    .get(lane),
+                expected_hw_after_ac3
+            );
+            assert!(!seg257_path.exists());
+            let meta_after_ac3 = read_converged_lane_tail_meta(&lane_dir).unwrap();
+            assert_eq!(meta_after_ac3.min_live_seg, SEALED_CAP);
+            assert_eq!(meta_after_ac3.active_seg, SEALED_CAP);
+            assert_eq!(meta_after_ac3.committed_len, recovered_active_len);
+            assert!(meta_after_ac3.sealed.is_empty());
+
+            // 5. AC4: Immediately append `POST_APPEND_FRAMES` new frames to active `S = 256`
+            //    and confirm seamless drain with 0 skipped frames, 0 dups, 0 regression error.
+            let mut post_cursor = recovered_active_len;
+            for i in 0..POST_APPEND_FRAMES {
+                let dedup = format!("rb09g:ac4:{lane_label}:s256:post:{i:03}");
+                let payload = payload_for(
+                    &format!("rb09g-ac4-{lane_label}-s256-post-{i:03}"),
+                    seq_counter,
+                );
+                seq_counter += 1;
+                let out = append_postcard_frame(
+                    repo.path(),
+                    lane,
+                    flags,
+                    &dedup,
+                    CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                    &payload,
+                )
+                .expect("AC4: subsequent append into active seg 256 must succeed");
+                assert_eq!(out.meta.active_seg, SEALED_CAP);
+                assert_eq!(out.frame_offset, post_cursor);
+                post_cursor = out.meta.committed_len;
+                expected_payloads.push(payload);
+            }
+            let final_len = post_cursor;
+
+            let post_spy = SpyCaptureStore::new(store.clone(), init.paths.root.clone());
+            let post_rep = drain_capture_queue(repo.path(), &post_spy)
+                .await
+                .expect("AC4: drain of post-recovery appends on active seg 256 must succeed");
+            assert_eq!(post_rep.applied_frames, POST_APPEND_FRAMES);
+            assert_eq!(post_rep.deduplicated_frames, 0);
+            assert_eq!(
+                store.get_queue_highwater(lane).await.unwrap(),
+                CaptureQueueHighwater {
+                    segment_id: SEALED_CAP,
+                    byte_offset: final_len,
+                }
+            );
+            assert!(!seg257_path.exists());
+
+            // Verify 100% payload equality for all 805 persisted records.
+            assert_eq!(
+                expected_payloads.len(),
+                total_before_post + POST_APPEND_FRAMES
+            );
+            for expected in &expected_payloads {
+                match expected {
+                    CaptureBatchPayload::AppendAuditLog(rec) => {
+                        let got = store.get_audit_log(&rec.audit_id).await.unwrap().unwrap();
+                        assert_eq!(&got, rec);
+                    }
+                    CaptureBatchPayload::UpsertSession(rec) => {
+                        let got = store.get_session(&rec.session_id).await.unwrap().unwrap();
+                        assert_eq!(&got, rec);
+                    }
+                    other => panic!("unexpected payload: {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn consumer_zero_byte_recovery_keeps_active_hw_and_subsequent_append() {
+        // `RB-09g` AC5 & AC6 (`ADR-RB-05` #4 ② (a)):
+        // Verify on BOTH `normal/` and `priority/` lanes AND BOTH `S = 0` (virgin
+        // first-frame crash) and `S = 1` (post-rotation first-frame crash):
+        // - AC5: Construct a first-frame partial crash truncated to exact 0 bytes by
+        //   Step C1 (`recovered_valid_end == 0`, `ACTIVE_SEG == S`, quarantined with
+        //   `LBR-AGENT-050`, no `events-<S+1>.log` created). Consumer run leaves DB
+        //   `QUEUE_HIGHWATER_*` strictly at `(S, 0)` (NEVER jumping to `(S + 1, 0)`).
+        // - AC6: Immediately append valid new frames into active segment `S`; consumer
+        //   drains 100% of them seamlessly from `(S, 0)` with zero skipped frames,
+        //   zero duplicates, zero highwater-regression errors, and full payload equality.
+        for lane in [CaptureQueueLane::Normal, CaptureQueueLane::Priority] {
+            let lane_label = lane_subdir_name(lane);
+            let flags = match lane {
+                CaptureQueueLane::Priority => FRAME_FLAG_PRIORITY,
+                CaptureQueueLane::Normal => FRAME_FLAG_NONE,
+            };
+            let payload_for = |tag: &str, seq: i64| match lane {
+                CaptureQueueLane::Priority => {
+                    make_session_payload(tag, CaptureSessionState::Stopped, 1_700_100_000 + seq)
+                }
+                CaptureQueueLane::Normal => {
+                    make_audit_payload(tag, &format!("2026-11-24T09:00:{:02}Z", seq % 60))
+                }
+            };
+
+            for start_seg in [0u32, 1u32] {
+                let repo = tempdir().expect("tempdir");
+                let init = init_capture_queue(repo.path()).expect("init capture queue");
+                let lane_dir = match lane {
+                    CaptureQueueLane::Normal => init.paths.normal.clone(),
+                    CaptureQueueLane::Priority => init.paths.priority.clone(),
+                };
+                let store = RedbCaptureStore::create(
+                    repo.path()
+                        .join(PRIVATE_SUBDIR)
+                        .join("capture.gen-0001.redb"),
+                )
+                .await
+                .expect("create RedbCaptureStore");
+                let setup_spy = SpyCaptureStore::new(store.clone(), init.paths.root.clone());
+
+                if start_seg == 1 {
+                    // Advance naturally to `(1, 0)` with `min_live_seg = 1, active_seg = 1,
+                    // committed_len = 0` by sealing & draining `seg 0` first.
+                    let s0_bytes = encode_postcard_frame(
+                        flags,
+                        &format!("rb09g:ac5:{lane_label}:s0:pre"),
+                        CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                        &payload_for(&format!("rb09g-ac5-{lane_label}-s0-pre"), 0),
+                    )
+                    .unwrap();
+                    write_bytes_0600(&lane_dir.join(segment_log_file_name(0)), &s0_bytes);
+                    write_bytes_0600(&lane_dir.join(segment_log_file_name(1)), &[]);
+                    let meta = LaneTailMeta {
+                        min_live_seg: 0,
+                        active_seg: 1,
+                        committed_len: 0,
+                        prefix_crc32c: 0,
+                        sealed: vec![SealedSegmentMeta {
+                            seg_id: 0,
+                            sealed_len: s0_bytes.len() as u64,
+                            sealed_crc32c: crc32c_checksum(&s0_bytes),
+                        }],
+                    };
+                    let raw = meta.encode().unwrap();
+                    write_bytes_0600(&tail_meta_path(&lane_dir), &raw);
+                    write_bytes_0600(&tail_meta_bak_path(&lane_dir), &raw);
+
+                    let pre_rep = drain_capture_queue(repo.path(), &setup_spy).await.unwrap();
+                    assert_eq!(pre_rep.applied_frames, 1);
+                    assert_eq!(pre_rep.reclaimed_segments, 1);
+                    assert_eq!(
+                        store.get_queue_highwater(lane).await.unwrap(),
+                        CaptureQueueHighwater {
+                            segment_id: 1,
+                            byte_offset: 0,
+                        }
+                    );
+                } else {
+                    // Virgin `S = 0` pre-bootstrapped `(0, 0, 0, 0, [])` with empty `seg 0`.
+                    let init_meta = LaneTailMeta::initial_empty();
+                    let raw = init_meta.encode().unwrap();
+                    write_bytes_0600(&tail_meta_path(&lane_dir), &raw);
+                    write_bytes_0600(&tail_meta_bak_path(&lane_dir), &raw);
+                }
+
+                // Inject first-frame partial crash bytes into `events-<start_seg>.log`
+                // (`actual_len > 0`, `committed_len == 0`, `recovered_valid_end == 0`).
+                let half_full = encode_postcard_frame(
+                    flags,
+                    &format!("rb09g:ac5:{lane_label}:s{start_seg}:first-half"),
+                    CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                    &payload_for(&format!("rb09g-ac5-{lane_label}-s{start_seg}-half"), 1),
+                )
+                .unwrap();
+                let damaged_first = half_full[..half_full.len() / 2].to_vec();
+                let seg_path = lane_dir.join(segment_log_file_name(start_seg));
+                let next_seg_path = lane_dir.join(segment_log_file_name(start_seg + 1));
+                write_bytes_0600(&seg_path, &damaged_first);
+
+                // AC5: Consumer delegates Step C1 0-byte recovery; DB `QUEUE_HIGHWATER_*`
+                // strictly remains `(start_seg, 0)` (NEVER jumps to `(start_seg + 1, 0)`!).
+                let tx_before = store.write_transaction_count();
+                let spy = SpyCaptureStore::new(store.clone(), init.paths.root.clone());
+                let rep = drain_capture_queue(repo.path(), &spy)
+                    .await
+                    .expect("AC5: consumer drain over 0-byte first-frame crash must succeed");
+                assert_eq!(rep.recovery_delegations, 1);
+                assert_eq!(rep.applied_frames, 0);
+                assert_eq!(rep.deduplicated_frames, 0);
+                assert_eq!(
+                    store.write_transaction_count(),
+                    tx_before,
+                    "AC5 ({lane_label}, S={start_seg}): 0-byte recovery must not write any DB tx"
+                );
+                assert!(spy.recorded_calls().is_empty());
+
+                let expected_zero_hw = CaptureQueueHighwater {
+                    segment_id: start_seg,
+                    byte_offset: 0,
+                };
+                assert_eq!(
+                    store.get_queue_highwater(lane).await.unwrap(),
+                    expected_zero_hw,
+                    "AC5 ({lane_label}, S={start_seg}): DB highwater must stay strictly at (S, 0), NEVER (S+1, 0)"
+                );
+                assert_eq!(
+                    read_highwater_mirror(&init.paths.root)
+                        .unwrap()
+                        .unwrap()
+                        .get(lane),
+                    expected_zero_hw
+                );
+                assert_eq!(fs::metadata(&seg_path).unwrap().len(), 0);
+                assert!(!next_seg_path.exists());
+                let meta_zero = read_converged_lane_tail_meta(&lane_dir).unwrap();
+                assert_eq!(meta_zero.min_live_seg, start_seg);
+                assert_eq!(meta_zero.active_seg, start_seg);
+                assert_eq!(meta_zero.committed_len, 0);
+                assert_eq!(meta_zero.prefix_crc32c, 0);
+                assert!(meta_zero.sealed.is_empty());
+                // Quarantine holds the exact damaged first-frame artifact.
+                let q_entries: Vec<_> = fs::read_dir(&init.paths.quarantine)
+                    .unwrap()
+                    .map(|e| e.unwrap().path())
+                    .collect();
+                assert_eq!(q_entries.len(), 1);
+                assert_eq!(fs::read(&q_entries[0]).unwrap(), damaged_first);
+
+                // AC6: Immediately append 5 valid frames into active `start_seg` and
+                // confirm 100% seamless ingestion from `(start_seg, 0)`.
+                let mut post_payloads = Vec::with_capacity(5);
+                let mut post_dedups = Vec::with_capacity(5);
+                let mut cursor = 0u64;
+                for i in 0..5usize {
+                    let dedup = format!("rb09g:ac6:{lane_label}:s{start_seg}:post:{i:02}");
+                    let payload = payload_for(
+                        &format!("rb09g-ac6-{lane_label}-s{start_seg}-post-{i:02}"),
+                        10 + i as i64,
+                    );
+                    let out = append_postcard_frame(
+                        repo.path(),
+                        lane,
+                        flags,
+                        &dedup,
+                        CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                        &payload,
+                    )
+                    .expect("AC6: append after 0-byte recovery must succeed on active seg S");
+                    assert_eq!(out.meta.active_seg, start_seg);
+                    assert_eq!(out.frame_offset, cursor);
+                    cursor = out.meta.committed_len;
+                    post_dedups.push(dedup);
+                    post_payloads.push(payload);
+                }
+                let final_len = cursor;
+
+                let post_spy = SpyCaptureStore::new(store.clone(), init.paths.root.clone());
+                let post_rep = drain_capture_queue(repo.path(), &post_spy)
+                    .await
+                    .expect("AC6: consumer drain after 0-byte recovery + append must succeed");
+                assert_eq!(post_rep.applied_frames, 5);
+                assert_eq!(post_rep.deduplicated_frames, 0);
+                let seen: Vec<String> = post_spy
+                    .recorded_calls()
+                    .into_iter()
+                    .flat_map(|c| c.dedup_keys)
+                    .collect();
+                assert_eq!(seen, post_dedups);
+                let expected_final_hw = CaptureQueueHighwater {
+                    segment_id: start_seg,
+                    byte_offset: final_len,
+                };
+                assert_eq!(
+                    store.get_queue_highwater(lane).await.unwrap(),
+                    expected_final_hw
+                );
+                assert_eq!(
+                    read_highwater_mirror(&init.paths.root)
+                        .unwrap()
+                        .unwrap()
+                        .get(lane),
+                    expected_final_hw
+                );
+                assert!(!next_seg_path.exists());
+                for expected in &post_payloads {
+                    match expected {
+                        CaptureBatchPayload::AppendAuditLog(rec) => {
+                            let got = store.get_audit_log(&rec.audit_id).await.unwrap().unwrap();
+                            assert_eq!(&got, rec);
+                        }
+                        CaptureBatchPayload::UpsertSession(rec) => {
+                            let got = store.get_session(&rec.session_id).await.unwrap().unwrap();
+                            assert_eq!(&got, rec);
+                        }
+                        other => panic!("unexpected payload: {other:?}"),
+                    }
+                }
+            }
+        }
+    }
 }
