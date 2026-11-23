@@ -152,12 +152,17 @@ fn should_rotate_active_segment(
     Ok(projected > rotation_threshold_bytes)
 }
 
-/// Enforce `ADR-RB-05` #3 Step ② (b) (`RB-08j`): when an incoming frame
-/// requires normal 16 MiB segment rotation (`rotating == true`) and
-/// `LTM2.sealed.len() >= MAX_SEALED_SEGMENTS` (`256`), reject fail-closed with
-/// recoverable backpressure `StorageBackendError::QueueFull` (`LBR-AGENT-046`)
-/// strictly BEFORE creating `events-<S+1:08>.log` or modifying any segment or
-/// metadata file for the incoming frame.
+/// Enforce `ADR-RB-05` #3 Step ② (b) (`RB-08j`, `RB-08o`):
+/// - When an incoming frame requires normal 16 MiB segment rotation
+///   (`rotating == true`, i.e., `committed_len > 0 && committed_len + frame_len > 16 MiB`)
+///   and `LTM2.sealed.len() >= MAX_SEALED_SEGMENTS` (`256`), reject fail-closed
+///   with recoverable backpressure `StorageBackendError::QueueFull`
+///   (`LBR-AGENT-046`) strictly BEFORE creating `events-<S+1:08>.log` or
+///   modifying any segment or metadata file for the incoming frame.
+/// - When `rotating == false` (`committed_len + frame_len <= 16 MiB` or
+///   `committed_len == 0`), in-segment append on `ACTIVE_SEG == S` is ADMITTED
+///   even when `sealed.len() == 256` (`RB-08o`), advancing `COMMITTED_LEN`
+///   in place without adding a sealed entry.
 fn enforce_rotation_sealed_cap_limit(sealed_len: usize, rotating: bool) -> StorageResult<()> {
     if rotating && sealed_len >= MAX_SEALED_SEGMENTS {
         return Err(StorageBackendError::QueueFull {
@@ -17250,6 +17255,341 @@ mod tests {
             assert!(!should_run_case_c_step_c2(false, &non_full));
             non_full.committed_len = 0;
             assert!(!should_run_case_c_step_c2(true, &non_full));
+        }
+    }
+
+    /// `RB-08o` AC1–AC5: Full 256-entry `LTM2.sealed[]` table (`256 × 4 KiB`
+    /// small sealed segments, combined occupancy far below `256 MiB`) admits
+    /// post-recovery in-segment enqueue when `committed_len + frame_len <= 16 MiB`:
+    /// - AC1: Returns `Ok(...)` without spuriously triggering `LBR-AGENT-046`.
+    /// - AC2: Newly appended frame decodes 100% losslessly from `events-<S>.log`.
+    /// - AC3: Dual `LTM2` advances `COMMITTED_LEN` (and `PREFIX_CRC32C`) to new length.
+    /// - AC4: `LTM2.ACTIVE_SEG` stays `S` (zero `events-<S+1>.log` created).
+    /// - AC5: `LTM2.sealed.len()` stays `256` (zero new sealed entries).
+    #[test]
+    fn sealed_cap_256_post_recovery_insegment_enqueue_admitted() {
+        let build_full_256_small_sealed = |active_bytes: &[u8]| {
+            let repo = tempdir().expect("tempdir");
+            let init = init_capture_queue(repo.path()).expect("init capture queue");
+            let normal_dir = init.paths.normal.clone();
+
+            let small_frame =
+                encode_frame(FRAME_FLAG_NONE, "rb08o-sealed-4k", &[0x24u8; 4096]).unwrap();
+            let small_len = small_frame.len() as u64;
+            let small_crc = crc32c_checksum(&small_frame);
+            let mut sealed = Vec::with_capacity(MAX_SEALED_SEGMENTS);
+            for seg_id in 0..MAX_SEALED_SEGMENTS as u32 {
+                write_bytes_0600(
+                    &normal_dir.join(segment_log_file_name(seg_id)),
+                    &small_frame,
+                );
+                sealed.push(SealedSegmentMeta {
+                    seg_id,
+                    sealed_len: small_len,
+                    sealed_crc32c: small_crc,
+                });
+            }
+
+            let active_seg = MAX_SEALED_SEGMENTS as u32; // 256
+            write_bytes_0600(
+                &normal_dir.join(segment_log_file_name(active_seg)),
+                active_bytes,
+            );
+            let full_meta = LaneTailMeta {
+                min_live_seg: 0,
+                active_seg,
+                committed_len: active_bytes.len() as u64,
+                prefix_crc32c: crc32c_checksum(active_bytes),
+                sealed,
+            };
+            let encoded = full_meta.encode().expect("encode 256-entry LTM2");
+            write_bytes_0600(&tail_meta_path(&normal_dir), &encoded);
+            write_bytes_0600(&tail_meta_bak_path(&normal_dir), &encoded);
+            (repo, init, full_meta)
+        };
+
+        // =====================================================================
+        // Part 1 — Post-recovery (`recover_lane` -> `append_frame`) in-segment
+        // admission strictly below 16 MiB (AC1–AC5).
+        // =====================================================================
+        {
+            let prefix_payload = b"rb08o-committed-prefix".to_vec();
+            let prefix_frame =
+                encode_frame(FRAME_FLAG_NONE, "rb08o-prefix", &prefix_payload).unwrap();
+            let (repo, init, initial_meta) = build_full_256_small_sealed(&prefix_frame);
+            let normal_dir = &init.paths.normal;
+            let seg256_path = normal_dir.join(segment_log_file_name(256));
+            let seg257_path = normal_dir.join(segment_log_file_name(257));
+
+            // Inject Case C synced tail + damaged half-frame on full-256 seg 256,
+            // then recover in-place via `RB-08l`.
+            let synced_payload = b"rb08o-synced-tail-payload".to_vec();
+            let synced_frame =
+                encode_frame(FRAME_FLAG_NONE, "rb08o-synced-tail", &synced_payload).unwrap();
+            let half_src =
+                encode_frame(FRAME_FLAG_NONE, "rb08o-half", b"half-crash-bytes").unwrap();
+            let bad_tail = &half_src[..half_src.len() / 2];
+            {
+                let mut f = fs::OpenOptions::new()
+                    .append(true)
+                    .open(&seg256_path)
+                    .unwrap();
+                f.write_all(&synced_frame).unwrap();
+                f.write_all(bad_tail).unwrap();
+                f.sync_data().unwrap();
+            }
+
+            let rec = recover_lane(repo.path(), CaptureQueueLane::Normal)
+                .expect("RB-08l full-256 Case C recovery must succeed");
+            assert_eq!(rec.meta.active_seg, 256);
+            assert_eq!(rec.meta.sealed.len(), MAX_SEALED_SEGMENTS);
+            assert!(!seg257_path.exists());
+
+            // Enqueue a new frame with `committed_len + frame_len <= 16 MiB` and
+            // total occupancy far <= 256 MiB.
+            let admitted_payload = vec![0x9bu8; 8192];
+            let admitted_encoded = encode_frame(
+                FRAME_FLAG_PRIORITY,
+                "rb08o-admitted-inseg",
+                &admitted_payload,
+            )
+            .unwrap();
+            let occ = measure_capture_queue_occupancy(repo.path()).expect("measure occupancy");
+            assert!(
+                occ.total_bytes + admitted_encoded.len() as u64 <= CAPTURE_QUEUE_MAX_TOTAL_BYTES
+            );
+            assert!(
+                rec.meta.committed_len + admitted_encoded.len() as u64
+                    <= CAPTURE_QUEUE_SEGMENT_ROTATION_BYTES
+            );
+
+            // AC1: Admitted with `Ok(...)` (not `LBR-AGENT-046`).
+            let out = append_frame(
+                repo.path(),
+                CaptureQueueLane::Normal,
+                FRAME_FLAG_PRIORITY,
+                "rb08o-admitted-inseg",
+                &admitted_payload,
+            )
+            .expect("AC1: post-recovery in-segment enqueue on full 256 table must return Ok");
+            assert_eq!(out.seg_id, 256);
+            assert_eq!(out.frame_offset, rec.meta.committed_len);
+            assert_eq!(out.frame_len, admitted_encoded.len());
+
+            // AC2: 100% lossless decode from `events-00000256.log`.
+            let disk_seg256 = fs::read(&seg256_path).unwrap();
+            let expected_len = rec.meta.committed_len + admitted_encoded.len() as u64;
+            assert_eq!(disk_seg256.len() as u64, expected_len);
+            let decoded = decode_all_segment_bytes(&disk_seg256);
+            assert_eq!(decoded.len(), 3);
+            assert_eq!(decoded[0].dedup_key, "rb08o-prefix");
+            assert_eq!(decoded[0].payload, prefix_payload);
+            assert_eq!(decoded[1].dedup_key, "rb08o-synced-tail");
+            assert_eq!(decoded[1].payload, synced_payload);
+            assert_eq!(decoded[2].dedup_key, "rb08o-admitted-inseg");
+            assert_eq!(decoded[2].flags, FRAME_FLAG_PRIORITY);
+            assert_eq!(decoded[2].payload, admitted_payload);
+
+            // AC3, AC4, AC5: Dual `LTM2` advances `COMMITTED_LEN` & `PREFIX_CRC32C`,
+            // keeps `ACTIVE_SEG == 256` (zero `seg 257`), and keeps `sealed.len() == 256`.
+            let raw_meta = fs::read(tail_meta_path(normal_dir)).unwrap();
+            let raw_bak = fs::read(tail_meta_bak_path(normal_dir)).unwrap();
+            assert_eq!(raw_meta, raw_bak);
+            let disk_meta = LaneTailMeta::decode(&raw_meta).unwrap();
+            assert_eq!(disk_meta, out.meta);
+            assert_eq!(disk_meta.committed_len, expected_len);
+            assert_eq!(disk_meta.prefix_crc32c, crc32c_checksum(&disk_seg256));
+            assert_eq!(disk_meta.active_seg, 256);
+            assert_eq!(disk_meta.sealed.len(), MAX_SEALED_SEGMENTS);
+            assert_eq!(disk_meta.sealed, initial_meta.sealed);
+            assert!(!seg257_path.exists());
+        }
+
+        // =====================================================================
+        // Part 2 — Exact `16 MiB` equality boundary (`committed_len + frame_len == 16 MiB`)
+        // on full 256-entry table is ALSO admitted in-segment (no false rotation).
+        // =====================================================================
+        {
+            let exact_payload = vec![0x5cu8; 4096];
+            let exact_frame =
+                encode_frame(FRAME_FLAG_NONE, "rb08o-exact-16mib", &exact_payload).unwrap();
+            let target_prefix_len = CAPTURE_QUEUE_SEGMENT_ROTATION_BYTES - exact_frame.len() as u64;
+
+            let chunk_frame = encode_frame(
+                FRAME_FLAG_NONE,
+                "rb08o-2m-chunk",
+                &vec![0x41u8; 2 * 1024 * 1024],
+            )
+            .unwrap();
+            let mut committed_prefix = Vec::with_capacity(target_prefix_len as usize);
+            while committed_prefix.len() + chunk_frame.len() <= target_prefix_len as usize {
+                committed_prefix.extend_from_slice(&chunk_frame);
+            }
+            // Place the final padding frame into the uncommitted synced tail +
+            // append a damaged half-frame so Case C full-table recovery (`RB-08l`)
+            // genuinely converges `recovered_valid_end` to exact `16 MiB - exact_frame.len()`!
+            let remaining = target_prefix_len as usize - committed_prefix.len();
+            let pad_key = "rb08o-exact-pad-tail";
+            let pad_overhead = FRAME_HEADER_LEN + FRAME_BODY_FIXED_OVERHEAD + pad_key.len();
+            assert!(remaining > pad_overhead);
+            let pad_payload = vec![0x42u8; remaining - pad_overhead];
+            let pad_tail_frame = encode_frame(FRAME_FLAG_NONE, pad_key, &pad_payload).unwrap();
+            assert_eq!(
+                (committed_prefix.len() + pad_tail_frame.len()) as u64,
+                target_prefix_len
+            );
+
+            let (repo, init, initial_meta) = build_full_256_small_sealed(&committed_prefix);
+            let normal_dir = &init.paths.normal;
+            let seg256_path = normal_dir.join(segment_log_file_name(256));
+            let seg257_path = normal_dir.join(segment_log_file_name(257));
+
+            let half_src =
+                encode_frame(FRAME_FLAG_NONE, "rb08o-exact-half", b"exact-half").unwrap();
+            let half_tail = &half_src[..half_src.len() / 2];
+            {
+                let mut f = fs::OpenOptions::new()
+                    .append(true)
+                    .open(&seg256_path)
+                    .unwrap();
+                f.write_all(&pad_tail_frame).unwrap();
+                f.write_all(half_tail).unwrap();
+                f.sync_data().unwrap();
+            }
+
+            let rec = recover_lane(repo.path(), CaptureQueueLane::Normal)
+                .expect("Part 2 full-256 Case C recovery must converge in-place");
+            assert_eq!(rec.meta.active_seg, 256);
+            assert_eq!(rec.meta.committed_len, target_prefix_len);
+            assert_eq!(rec.meta.sealed.len(), MAX_SEALED_SEGMENTS);
+            assert!(!seg257_path.exists());
+
+            let occ = measure_capture_queue_occupancy(repo.path()).expect("measure occupancy");
+            assert!(occ.total_bytes + exact_frame.len() as u64 <= CAPTURE_QUEUE_MAX_TOTAL_BYTES);
+            assert_eq!(
+                rec.meta.committed_len + exact_frame.len() as u64,
+                CAPTURE_QUEUE_SEGMENT_ROTATION_BYTES
+            );
+
+            let out = append_encoded_frame(repo.path(), CaptureQueueLane::Normal, &exact_frame)
+                .expect("exact 16 MiB boundary after full-256 Case C recovery must be admitted");
+            assert_eq!(out.seg_id, 256);
+            assert_eq!(out.frame_offset, target_prefix_len);
+            assert_eq!(out.meta.active_seg, 256);
+            assert_eq!(out.meta.committed_len, CAPTURE_QUEUE_SEGMENT_ROTATION_BYTES);
+            assert_eq!(out.meta.sealed.len(), MAX_SEALED_SEGMENTS);
+            assert_eq!(out.meta.sealed, initial_meta.sealed);
+            assert!(!seg257_path.exists());
+
+            let disk_seg256 = fs::read(&seg256_path).unwrap();
+            assert_eq!(
+                disk_seg256.len() as u64,
+                CAPTURE_QUEUE_SEGMENT_ROTATION_BYTES
+            );
+            let expected_crc = crc32c_checksum(&disk_seg256);
+            let raw_meta = fs::read(tail_meta_path(normal_dir)).unwrap();
+            let raw_bak = fs::read(tail_meta_bak_path(normal_dir)).unwrap();
+            assert_eq!(raw_meta, raw_bak);
+            let disk_meta = LaneTailMeta::decode(&raw_meta).unwrap();
+            assert_eq!(disk_meta, out.meta);
+            assert_eq!(
+                disk_meta.committed_len,
+                CAPTURE_QUEUE_SEGMENT_ROTATION_BYTES
+            );
+            assert_eq!(disk_meta.prefix_crc32c, expected_crc);
+            assert_eq!(disk_meta.active_seg, 256);
+            assert_eq!(disk_meta.sealed.len(), MAX_SEALED_SEGMENTS);
+            let decoded = decode_all_segment_bytes(&disk_seg256);
+            let n = decoded.len();
+            assert!(n >= 2);
+            assert_eq!(decoded[n - 2].dedup_key, pad_key);
+            assert_eq!(decoded[n - 2].payload, pad_payload);
+            assert_eq!(decoded[n - 1].dedup_key, "rb08o-exact-16mib");
+            assert_eq!(decoded[n - 1].payload, exact_payload);
+        }
+
+        // =====================================================================
+        // Part 3 — Single-call `append_frame` directly on an unrecovered full-256
+        // Case C damaged half-frame segment (`recovered_valid_end + frame_len <= 16 MiB`):
+        // Step ① recovers in-place (skipping Step C2) -> Step ② admits in-segment!
+        // =====================================================================
+        {
+            let prefix_payload = b"single-prefix".to_vec();
+            let prefix_frame =
+                encode_frame(FRAME_FLAG_NONE, "rb08o-single-prefix", &prefix_payload).unwrap();
+            let (repo, init, initial_meta) = build_full_256_small_sealed(&prefix_frame);
+            let normal_dir = &init.paths.normal;
+            let seg256_path = normal_dir.join(segment_log_file_name(256));
+            let seg257_path = normal_dir.join(segment_log_file_name(257));
+
+            let tail_payload = b"single-synced-tail".to_vec();
+            let tail_frame =
+                encode_frame(FRAME_FLAG_PRIORITY, "rb08o-single-tail", &tail_payload).unwrap();
+            let bad_half = b"LCE1\x01\x00\x00\x00broken-half";
+            {
+                let mut f = fs::OpenOptions::new()
+                    .append(true)
+                    .open(&seg256_path)
+                    .unwrap();
+                f.write_all(&tail_frame).unwrap();
+                f.write_all(bad_half).unwrap();
+                f.sync_data().unwrap();
+            }
+            let recovered_valid_end = (prefix_frame.len() + tail_frame.len()) as u64;
+            let expected_q_id = quarantine_artifact_id(
+                CaptureQueueLane::Normal,
+                256,
+                recovered_valid_end,
+                bad_half,
+            );
+
+            let new_payload = b"single-call-admitted-after-recovery".to_vec();
+            let out = append_frame(
+                repo.path(),
+                CaptureQueueLane::Normal,
+                FRAME_FLAG_NONE,
+                "rb08o-single-new",
+                &new_payload,
+            )
+            .expect("single-call full-256 Case C recovery + in-segment append must return Ok");
+            assert_eq!(out.recovered_frames, 1);
+            assert_eq!(out.seg_id, 256);
+            assert_eq!(out.frame_offset, recovered_valid_end);
+            assert_eq!(out.meta.active_seg, 256);
+            assert_eq!(out.meta.sealed.len(), MAX_SEALED_SEGMENTS);
+            assert_eq!(out.meta.sealed, initial_meta.sealed);
+            assert!(!seg257_path.exists());
+            assert_eq!(
+                fs::read(init.paths.quarantine.join(format!("{expected_q_id}.bin"))).unwrap(),
+                bad_half
+            );
+
+            let disk_seg256 = fs::read(&seg256_path).unwrap();
+            let expected_crc = crc32c_checksum(&disk_seg256);
+            let raw_meta = fs::read(tail_meta_path(normal_dir)).unwrap();
+            let raw_bak = fs::read(tail_meta_bak_path(normal_dir)).unwrap();
+            assert_eq!(raw_meta, raw_bak);
+            let disk_meta = LaneTailMeta::decode(&raw_meta).unwrap();
+            let disk_bak = LaneTailMeta::decode(&raw_bak).unwrap();
+            assert_eq!(disk_bak, disk_meta);
+            assert_eq!(disk_meta, out.meta);
+            assert_eq!(disk_meta.active_seg, 256);
+            assert_eq!(disk_meta.committed_len, disk_seg256.len() as u64);
+            assert_eq!(disk_meta.prefix_crc32c, expected_crc);
+            assert_eq!(disk_meta.sealed.len(), MAX_SEALED_SEGMENTS);
+            assert_eq!(disk_meta.sealed, initial_meta.sealed);
+
+            let decoded = decode_all_segment_bytes(&disk_seg256);
+            assert_eq!(decoded.len(), 3);
+            assert_eq!(decoded[0].dedup_key, "rb08o-single-prefix");
+            assert_eq!(decoded[0].flags, FRAME_FLAG_NONE);
+            assert_eq!(decoded[0].payload, prefix_payload);
+            assert_eq!(decoded[1].dedup_key, "rb08o-single-tail");
+            assert_eq!(decoded[1].flags, FRAME_FLAG_PRIORITY);
+            assert_eq!(decoded[1].payload, tail_payload);
+            assert_eq!(decoded[2].dedup_key, "rb08o-single-new");
+            assert_eq!(decoded[2].flags, FRAME_FLAG_NONE);
+            assert_eq!(decoded[2].payload, new_payload);
         }
     }
 }
