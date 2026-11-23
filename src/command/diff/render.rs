@@ -617,7 +617,7 @@ pub(crate) fn format_unified_diff(result: &DiffOutput) -> String {
         .join("\n")
 }
 
-pub(super) fn maybe_colorize_diff(
+pub(crate) fn maybe_colorize_diff(
     diff_text: &str,
     should_colorize: bool,
     color_moved: bool,

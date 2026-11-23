@@ -334,6 +334,21 @@ section is separated like Git, and each path/status field is NUL-terminated.
 libra log -z --name-status --format=%s
 ```
 
+### `--color-moved[=<mode>]` / `--color-moved-ws=<modes>`
+
+`--color-moved` colours moved lines (removed side bold magenta, added side bold
+cyan) in the `-p` output; `--no-color-moved` turns it off and the later flag wins.
+`--color-moved-ws` selects the whitespace rules used while matching moved lines
+(`no`, `ignore-space-at-eol`, `ignore-space-change`, `ignore-all-space`,
+`allow-indentation-change`; comma-separated). Both reuse the shared `libra diff`
+renderer, so the moved-line colouring matches `libra diff` for the same change.
+Unknown mode values are `LBR-CLI-002`.
+
+```bash
+libra log -p -1 --color=always --color-moved
+libra log -p -1 --color=always --color-moved --color-moved-ws=ignore-all-space
+```
+
 ### `-U<n>` / `--unified=<n>`
 
 `-U<n>` sets how many lines of hunk context `-p` prints (`-U0` shows only the

@@ -1869,7 +1869,7 @@ PY
 
 ### Task LS-22: `log` 支持 `--color-moved` 与 `--color-moved-ws`（#970；拆出 LS-31）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-23：`LogArgs` 新增 `--color-moved[=<mode>]`/`--no-color-moved`/`--color-moved-ws=<modes>`；`-p` 在颜色启用时经 `render::maybe_colorize_diff`（提升为 `pub(crate)`）复用 diff 引擎渲染；`--color-moved=bogus`/`--color-moved-ws=bogus` 以 `LBR-CLI-002` 拒绝。AC1–AC5 由 `command::log_test::log_color_moved_reuses_diff_engine` 覆盖（移动行着色与 `libra diff` 同选项逐字一致、`--no-color-moved` 后者胜出、ws 模式透传一致、两种非法取值拒绝）。`diff_test`+`log_test` 全绿；EN/zh 文档与 `COMPATIBILITY.md` 同步。
 
 **Description:** 在 `LogArgs` 新增 `--color-moved[=<mode>]`、`--no-color-moved` 与 `--color-moved-ws=<modes>`，经 `LogDiffOptions` 复用 `LS-31` 已交付的 `src/command/diff.rs` 与 `src/command/diff/render.rs:782` 移动块着色与空白忽略引擎。
 

@@ -9442,3 +9442,102 @@ fn color_moved_ws_allow_indentation_change() {
         "AC4 trailing no"
     );
 }
+
+#[test]
+fn log_color_moved_reuses_diff_engine() {
+    use super::{assert_cli_success, run_libra_command};
+
+    // Fixture: `aaa` moves from the top to the bottom unchanged.
+    let work = tempfile::tempdir().expect("work dir");
+    let repo = work.path().join("r");
+    std::fs::create_dir_all(&repo).expect("mkdir repo");
+    assert_cli_success(&run_libra_command(&["init"], &repo), "init");
+    run_libra_command(&["config", "set", "user.name", "t"], &repo);
+    run_libra_command(&["config", "set", "user.email", "t@t"], &repo);
+    std::fs::write(repo.join("f.txt"), "aaa\nkeep\nkeep2\nkeep3\nkeep4\n").expect("write base");
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], &repo), "add base");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c1", "--no-verify"], &repo),
+        "commit c1",
+    );
+    std::fs::write(repo.join("f.txt"), "keep\nkeep2\nkeep3\nkeep4\naaa\n").expect("write move");
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], &repo), "add move");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c2", "--no-verify"], &repo),
+        "commit c2",
+    );
+
+    let moved_lines = |text: &str| -> Vec<String> {
+        text.lines()
+            .filter(|line| line.contains("\u{1b}[1;35m") || line.contains("\u{1b}[1;36m"))
+            .map(str::to_string)
+            .collect()
+    };
+    let log_out = |args: &[&str]| {
+        let result = run_libra_command(args, &repo);
+        assert_cli_success(&result, &format!("log {args:?}"));
+        String::from_utf8_lossy(&result.stdout).to_string()
+    };
+    let diff_out = |args: &[&str]| {
+        let result = run_libra_command(args, &repo);
+        assert_cli_success(&result, &format!("diff {args:?}"));
+        String::from_utf8_lossy(&result.stdout).to_string()
+    };
+
+    // AC1: the moved-line colouring matches `libra diff` for the same change.
+    let logged = log_out(&["log", "-p", "-1", "--color=always", "--color-moved"]);
+    let engine = diff_out(&["diff", "--color=always", "--color-moved", "HEAD~1", "HEAD"]);
+    assert!(!moved_lines(&logged).is_empty(), "AC1 moved lines colored");
+    assert_eq!(
+        moved_lines(&logged),
+        moved_lines(&engine),
+        "AC1 colouring parity with diff"
+    );
+    // AC2: a later `--no-color-moved` wins.
+    assert_eq!(
+        log_out(&[
+            "log",
+            "-p",
+            "-1",
+            "--color=always",
+            "--color-moved",
+            "--no-color-moved"
+        ]),
+        log_out(&["log", "-p", "-1", "--color=always"]),
+        "AC2 last one wins"
+    );
+    // AC3: the whitespace mode also reaches the engine.
+    let logged_ws = log_out(&[
+        "log",
+        "-p",
+        "-1",
+        "--color=always",
+        "--color-moved",
+        "--color-moved-ws=ignore-all-space",
+    ]);
+    let engine_ws = diff_out(&[
+        "diff",
+        "--color=always",
+        "--color-moved",
+        "--color-moved-ws=ignore-all-space",
+        "HEAD~1",
+        "HEAD",
+    ]);
+    assert_eq!(
+        moved_lines(&logged_ws),
+        moved_lines(&engine_ws),
+        "AC3 whitespace-mode parity"
+    );
+    // AC4/AC5: invalid mode values are usage errors.
+    for args in [
+        ["log", "-p", "-1", "--color-moved=bogus"],
+        ["log", "-p", "-1", "--color-moved-ws=bogus"],
+    ] {
+        let bad = run_libra_command(&args, &repo);
+        assert!(!bad.status.success(), "{args:?} must fail");
+        assert!(
+            String::from_utf8_lossy(&bad.stderr).contains("LBR-CLI-002"),
+            "{args:?} code"
+        );
+    }
+}

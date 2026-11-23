@@ -249,6 +249,15 @@ Git 规则分隔，每个路径/状态字段均以 NUL 终止。
 libra log -z --name-status --format=%s
 ```
 
+### `--color-moved[=<mode>]` / `--color-moved-ws=<modes>`
+
+`--color-moved` 在 `-p` 输出中给移动行着色（删除侧粗体洋红、新增侧粗体青）；`--no-color-moved` 关闭，后写者胜出。`--color-moved-ws` 选择匹配移动行时的空白规则（`no`、`ignore-space-at-eol`、`ignore-space-change`、`ignore-all-space`、`allow-indentation-change`，逗号分隔）。两者复用共享 `libra diff` 渲染器，移动行着色与同一变更的 `libra diff` 一致；未知取值以 `LBR-CLI-002` 拒绝。
+
+```bash
+libra log -p -1 --color=always --color-moved
+libra log -p -1 --color=always --color-moved --color-moved-ws=ignore-all-space
+```
+
 ### `-U<n>` / `--unified=<n>`
 
 `-U<n>` 设置 `-p` 的 hunk 上下文行数（`-U0` 只显示变更行，`-U1` 每侧一行）。数值转发到共享 diff 引擎；非数值以 `LBR-CLI-002`/129 拒绝。

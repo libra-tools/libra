@@ -320,6 +320,22 @@ pub struct LogArgs {
     #[clap(long = "dirstat-by-file", value_name = "PARAM", num_args = 0..=1, default_missing_value = "", require_equals = true)]
     pub dirstat_by_file: Option<String>,
 
+    /// Colour moved lines differently (Git's `--color-moved[=<mode>]`)
+    #[clap(
+        long = "color-moved",
+        value_name = "mode",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "default",
+        overrides_with = "no_color_moved"
+    )]
+    pub color_moved: Option<String>,
+    /// Do not colour moved lines (last of `--color-moved`/`--no-color-moved` wins)
+    #[clap(long = "no-color-moved", overrides_with = "color_moved")]
+    pub no_color_moved: bool,
+    /// Whitespace rules for moved-line matching (`--color-moved-ws=<modes>`)
+    #[clap(long = "color-moved-ws", value_name = "modes", value_delimiter = ',')]
+    pub color_moved_ws: Vec<String>,
     /// Show N lines of hunk context (Git's `-U<n>` / `--unified=<n>`)
     #[clap(short = 'U', long = "unified", value_name = "N")]
     pub unified: Option<usize>,
@@ -3096,6 +3112,7 @@ async fn execute_safe_with_diff_formats(
         return emit_json_data("log", &result, output);
     }
 
+    validate_color_moved_args(&args)?;
     let name_status = diff_formats.name_status;
     // Check parameter mutual exclusion: if both name flags and --patch are specified, prioritize the name display flags
     let name_only = diff_formats.name_only && !name_status;
@@ -3725,6 +3742,18 @@ async fn execute_safe_with_diff_formats(
             };
             if args.diff_reverse {
                 patch_output = reverse_patch(&patch_output);
+            }
+            // Moved-line colouring reuses the diff engine's renderer.
+            let moved_active = args.color_moved.as_deref().is_some_and(|mode| mode != "no");
+            if moved_active && color_enabled && !patch_output.is_empty() {
+                let ws = crate::command::diff::options::parse_color_moved_ws(&args.color_moved_ws)
+                    .unwrap_or_default();
+                patch_output = crate::command::diff::render::maybe_colorize_diff(
+                    &patch_output,
+                    true,
+                    true,
+                    ws,
+                );
             }
             block.push_str(&patch_output);
             if !block.is_empty() {
@@ -6072,6 +6101,25 @@ async fn generate_cc_diff(commit: &Commit, paths: &[PathBuf]) -> CliResult<Strin
         output.push_str(&body);
     }
     Ok(output)
+}
+
+/// Validate `--color-moved` / `--color-moved-ws` values before rendering.
+fn validate_color_moved_args(args: &LogArgs) -> CliResult<()> {
+    if let Some(mode) = args.color_moved.as_deref()
+        && !matches!(
+            mode,
+            "default" | "plain" | "zebra" | "blocks" | "dimmed-zebra" | "no"
+        )
+    {
+        return Err(
+            CliError::fatal(format!("invalid --color-moved mode '{mode}'"))
+                .with_stable_code(StableErrorCode::CliInvalidArguments),
+        );
+    }
+    crate::command::diff::options::parse_color_moved_ws(&args.color_moved_ws).map_err(|error| {
+        CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::CliInvalidArguments)
+    })?;
+    Ok(())
 }
 
 /// Build the diff-engine output for a commit against its first parent.
