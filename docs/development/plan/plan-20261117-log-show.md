@@ -1566,7 +1566,7 @@ PY
 
 ### Task LS-21: `log` 透传 diff 空白忽略选项（`-w` / `-b`）（#967；拆出 LS-28、LS-29、LS-30）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-23：`LogArgs` 新增 `-w`/`--ignore-all-space` 与 `-b`/`--ignore-space-change`；置位时 `-p` 的补丁经 `commit_diff_output(commit, &flags)` 用共享 diff 引擎重算（其余路径不变，`LogDiffOptions` 默认值保持向后兼容）。AC1–AC3 由 `command::log_test::diff_ignore_whitespace_passthrough` 覆盖（`-w`/`--ignore-all-space` 两种拼写均不输出纯空白补丁；`-b`/`--ignore-space-change` 与 `libra diff -b` 渲染逐字一致且保留缩进 hunk；默认 `-p` 与 diff 引擎一致）。`log_test` 280/280；严格 Clippy exit 0；EN/zh/开发文档与 `COMPATIBILITY.md` 同步。
 
 **Description:** 在 `LogArgs` 新增 `-w`/`--ignore-all-space` 与 `-b`/`--ignore-space-change` 并经 `LogDiffOptions` 复用 `src/command/diff/compare.rs:405-417` 与 `src/command/diff.rs:4728` 空白归一化对比逻辑。
 

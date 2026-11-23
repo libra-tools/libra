@@ -9022,3 +9022,90 @@ fn raw_numstat_dirstat_formats() {
     };
     assert!(dirstat.contains("  32.7% sub/"), "AC3 dirstat: {dirstat}");
 }
+
+#[test]
+fn diff_ignore_whitespace_passthrough() {
+    use super::{assert_cli_success, run_libra_command};
+
+    // Fixture: c1 adds f.txt, c2 only changes indentation, c3 makes a real edit.
+    let work = tempfile::tempdir().expect("work dir");
+    let repo = work.path().join("r");
+    std::fs::create_dir_all(&repo).expect("mkdir repo");
+    assert_cli_success(&run_libra_command(&["init"], &repo), "init");
+    run_libra_command(&["config", "set", "user.name", "t"], &repo);
+    run_libra_command(&["config", "set", "user.email", "t@t"], &repo);
+    std::fs::write(repo.join("f.txt"), "a\nb\nc\n").expect("write base");
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], &repo), "add base");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c1", "--no-verify"], &repo),
+        "commit c1",
+    );
+    std::fs::write(repo.join("f.txt"), "a\n  b\nc\n").expect("write indent");
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], &repo), "add indent");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c2", "--no-verify"], &repo),
+        "commit c2",
+    );
+    std::fs::write(repo.join("f.txt"), "a\n  b\nc\nd\n").expect("write edit");
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], &repo), "add edit");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c3", "--no-verify"], &repo),
+        "commit c3",
+    );
+
+    let out = |args: &[&str]| {
+        let result = run_libra_command(args, &repo);
+        assert_cli_success(&result, &format!("log {args:?}"));
+        String::from_utf8_lossy(&result.stdout).to_string()
+    };
+    let patch_body = |text: &str| match text.split_once("diff --git ") {
+        Some((_, rest)) => format!("diff --git {rest}"),
+        None => String::new(),
+    };
+
+    // AC1: `-w` and `--ignore-all-space` both drop the whitespace-only commit.
+    for flag in ["-w", "--ignore-all-space"] {
+        let text = out(&["log", "-p", flag, "-1", "HEAD~1"]);
+        assert!(
+            patch_body(&text).is_empty(),
+            "{flag} must omit a whitespace-only diff: {text}"
+        );
+    }
+    // AC2: `-b` and `--ignore-space-change` keep Git's indentation hunk and match
+    // the diff engine's own rendering for the same commit.
+    let parent = {
+        let resolved = run_libra_command(&["rev-parse", "HEAD~2"], &repo);
+        assert_cli_success(&resolved, "rev-parse parent");
+        String::from_utf8_lossy(&resolved.stdout).trim().to_string()
+    };
+    let target = {
+        let resolved = run_libra_command(&["rev-parse", "HEAD~1"], &repo);
+        assert_cli_success(&resolved, "rev-parse target");
+        String::from_utf8_lossy(&resolved.stdout).trim().to_string()
+    };
+    for flag in ["-b", "--ignore-space-change"] {
+        let logged = out(&["log", "-p", flag, "-1", "HEAD~1"]);
+        let engine = run_libra_command(&["diff", flag, &parent, &target], &repo);
+        assert_cli_success(&engine, "diff engine");
+        let engine_body = patch_body(&String::from_utf8_lossy(&engine.stdout));
+        assert_eq!(
+            patch_body(&logged),
+            engine_body,
+            "{flag} must reuse the diff engine rendering"
+        );
+        assert!(
+            engine_body.contains("@@"),
+            "{flag} keeps the indentation hunk"
+        );
+    }
+
+    // AC3: without the new flags `log -p` output is unchanged (default engine path).
+    let default_patch = out(&["log", "-p", "-1", "HEAD~1"]);
+    let default_engine = run_libra_command(&["diff", &parent, &target], &repo);
+    assert_cli_success(&default_engine, "default diff engine");
+    assert_eq!(
+        patch_body(&default_patch),
+        patch_body(&String::from_utf8_lossy(&default_engine.stdout)),
+        "AC3 default rendering unchanged"
+    );
+}

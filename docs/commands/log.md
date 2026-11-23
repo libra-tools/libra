@@ -334,6 +334,19 @@ section is separated like Git, and each path/status field is NUL-terminated.
 libra log -z --name-status --format=%s
 ```
 
+### `-w` / `-b`
+
+`-w` (`--ignore-all-space`) ignores whitespace entirely when comparing lines, so
+a commit that only re-indents a file shows no patch at all; `-b`
+(`--ignore-space-change`) ignores changes in the amount of whitespace while still
+printing Git's indentation hunk. Both re-diff through the shared `libra diff`
+engine, so the bytes match `libra diff -w` / `-b` for the same commit.
+
+```bash
+libra log -p -w -1
+libra log -p -b -1
+```
+
 ### `--raw` / `--numstat`
 
 `--raw` prints Git's raw diff lines (`:<oldmode> <newmode> <oldsha> <newsha>

@@ -320,6 +320,12 @@ pub struct LogArgs {
     #[clap(long = "dirstat-by-file", value_name = "PARAM", num_args = 0..=1, default_missing_value = "", require_equals = true)]
     pub dirstat_by_file: Option<String>,
 
+    /// Ignore whitespace entirely when comparing lines (Git's `-w`)
+    #[clap(short = 'w', long = "ignore-all-space")]
+    pub ignore_all_space: bool,
+    /// Ignore changes in the amount of whitespace (Git's `-b`)
+    #[clap(short = 'b', long = "ignore-space-change")]
+    pub ignore_space_change: bool,
     /// Show raw diff lines (`:<oldmode> <newmode> <oldsha> <newsha> <status>\t<path>`)
     #[clap(long = "raw")]
     pub raw: bool,
@@ -3590,7 +3596,7 @@ async fn execute_safe_with_diff_formats(
 
         if diff_formats.raw || diff_formats.numstat {
             // `--raw`/`--numstat` print one record per commit, before any patch.
-            if let Some(output) = commit_diff_output(&commit).await? {
+            if let Some(output) = commit_diff_output(&commit, &[]).await? {
                 let block = if diff_formats.raw {
                     crate::command::diff::render::format_diff_raw(&output, false, false)
                 } else {
@@ -3633,7 +3639,26 @@ async fn execute_safe_with_diff_formats(
                     block.push_str("\n\n");
                 }
             }
-            let mut patch_output = if args.cc {
+            let mut patch_output = if args.ignore_all_space || args.ignore_space_change {
+                // Re-diff through the shared engine so the whitespace rules apply.
+                let mut flags: Vec<&str> = Vec::new();
+                if args.ignore_all_space {
+                    flags.push("-w");
+                }
+                if args.ignore_space_change {
+                    flags.push("-b");
+                }
+                match commit_diff_output(&commit, &flags).await? {
+                    Some(output) => {
+                        let mut text = crate::command::diff::render::format_unified_diff(&output);
+                        if !text.is_empty() && !text.ends_with('\n') {
+                            text.push('\n');
+                        }
+                        text
+                    }
+                    None => String::new(),
+                }
+            } else if args.cc {
                 generate_cc_diff(&commit, &commit_path_filters).await?
             } else if args.line_range.is_empty() {
                 generate_diff(&commit, commit_path_filters.clone()).await?
@@ -5998,15 +6023,15 @@ async fn generate_cc_diff(commit: &Commit, paths: &[PathBuf]) -> CliResult<Strin
 /// Build the diff-engine output for a commit against its first parent.
 async fn commit_diff_output(
     commit: &Commit,
+    extra_flags: &[&str],
 ) -> Result<Option<crate::command::diff::DiffOutput>, CliError> {
     let Some(parent) = commit.parent_commit_ids.first() else {
         return Ok(None);
     };
-    let argv = vec![
-        "diff".to_string(),
-        parent.to_string(),
-        commit.id.to_string(),
-    ];
+    let mut argv = vec!["diff".to_string()];
+    argv.extend(extra_flags.iter().map(|flag| (*flag).to_string()));
+    argv.push(parent.to_string());
+    argv.push(commit.id.to_string());
     let args = crate::command::diff::DiffArgs::try_parse_from(&argv)
         .map_err(|error| CliError::command_usage(error.to_string()))?;
     Ok(Some(

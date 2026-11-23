@@ -150,3 +150,5 @@ flowchart TD
 - 2026-11-21（LS-13 / #955）：按实测证据改判 AC 并落地回归——非 TTY 无 `\r`/`ESC[K`；PTY 输出 = 管道输出 + ONLCR（用例内以 `env!("CARGO_BIN_EXE_libra")` 绝对路径经 `script -qec` 断言，`--decorate=short` 固定装饰）；`--color=always` 保留 SGR 不新增擦除序列。
 
 - 2026-11-23（LS-20 / #964）：新增 `log --raw` 与 `log --numstat`（`commit_diff_output` 经 clap 构造 `DiffArgs` 调 `run_diff_for_service`；`render::format_diff_raw`/`format_numstat_output` 复用）；`DiffFormatPositions`/`ResolvedDiffFormats` 增加 raw/numstat，`-s`/`--no-patch` 按位置清除；`--dirstat` 与 Git 逐字一致。回归：`raw_numstat_dirstat_formats`（AC1–AC6）。
+
+- 2026-11-23（LS-21 / #967）：新增 `-w`/`--ignore-all-space` 与 `-b`/`--ignore-space-change`：置位时 `-p` 的补丁经 `commit_diff_output(commit, flags)`（clap 构造 `DiffArgs` + `run_diff_for_service`）重算，其余路径不变。回归：`diff_ignore_whitespace_passthrough`（AC1–AC3，两种拼写表驱动 + 与 `libra diff` 引擎逐字一致）。
