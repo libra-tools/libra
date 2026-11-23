@@ -2238,7 +2238,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `done` / `remote-pending`
+**Lifecycle / Acceptance:** `done` / `remote-verified`
 
 **Description:** 100% 在独占目录 `src/storage/**` 内实现 `ADR-RB-06` 跨库一致性协调器 `src/storage/cross_store.rs`（及 `git_store.rs`/`capture_store.rs` 事务挂接）：在 `git.redb` 维护 `META_CROSS_STORE_INTENT` 发件箱与单调 `META_GENERATION`，实现两步持久化提交、半提交态只读三步快照 fail-closed（`g1 != c1` 超 5 次重试报 `LBR-IO-001`）、新跨库写入前强制按升序重放待决意图（严禁 `max + 1` 掩盖缺口）及 `capture.redb` 不可达拒推进。
 
@@ -2296,7 +2296,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `remote-pending`
 
 **Description:** 100% 在独占目录 `src/storage/**` 内补齐 `cross_store.rs` 的显式修复入口 `reconcile_pending_intents()`、修复后只读三步一致快照（`g1 == c1 == g2`）冻结、已对账意图（`gen <= capture_gen`）自动清理防无限增长以及重复调用幂等性。
 
@@ -2310,15 +2310,15 @@
 | `libra agent doctor --repair` 与 `libra fsck` 依赖幂等 `reconcile_pending_intents()` 补齐代际并清理已对账意图 | `ADR-RB-06` #2、#3 |
 
 **Acceptance criteria:**
-- [ ] 显式 `reconcile_pending_intents()` 对半提交状态补齐 `capture.redb` 直至 `capture_gen == git_gen`。
-- [ ] 完成 `reconcile_pending_intents()` 后，只读三步快照以 `g1 == c1 == g2` 成功冻结导出。
-- [ ] 连续二次调用 `reconcile_pending_intents()` 保持完全幂等、不重复写入业务行。
-- [ ] 已对账意图（`gen <= capture_gen`）在后续写事务或修复中自动清理，无无限增长。
+- [x] 显式 `reconcile_pending_intents()` 对半提交状态补齐 `capture.redb` 直至 `capture_gen == git_gen`。
+- [x] 完成 `reconcile_pending_intents()` 后，只读三步快照以 `g1 == c1 == g2` 成功冻结导出。
+- [x] 连续二次调用 `reconcile_pending_intents()` 保持完全幂等、不重复写入业务行。
+- [x] 已对账意图（`gen <= capture_gen`）在后续写事务或修复中自动清理，无无限增长。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --no-default-features --features storage-redb,storage-queue --lib -E 'test(=storage::cross_store::tests::explicit_reconcile_idempotent_snapshot_and_intent_pruning)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=storage::cross_store::tests::explicit_reconcile_idempotent_snapshot_and_intent_pruning)'`（new，覆盖 AC1–AC4）
-- [ ] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 4 文件实现白名单。
+- [x] `source .env.test && cargo nextest list --no-default-features --features storage-redb,storage-queue --lib -E 'test(=storage::cross_store::tests::explicit_reconcile_idempotent_snapshot_and_intent_pruning)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb,storage-queue --lib -E 'test(=storage::cross_store::tests::explicit_reconcile_idempotent_snapshot_and_intent_pruning)'`（new，覆盖 AC1–AC4）
+- [x] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 4 文件实现白名单。
 
 **Full-suite trigger:** `none`
 
@@ -10038,8 +10038,9 @@
 | `RB-06` | `done` / `remote-verified` | `2e3c0ee`（`main`） | `0.30.326` | 2026-11-22 21:55 UTC：Stage 1 精确 4 文件写集（`src/storage/{mod,capture_store}.rs`、`src/storage/{sqlite,redb}/capture_store.rs`），实现对象安全 `AgentBridgeStore` 与 `CaptureStore` 全 25 张 Capture 源表双后端（显式区隔 `META_*`/`QUEUE_HIGHWATER_*`/去重/序列与 7 张同事务二级索引表 `sessions_by_time`/`sessions_by_provider`/`checkpoints_by_session`/`events_by_time`/`bridge_events_by_seq`/`bridge_links_by_key`/`usage_stats_by_session_event`）、单事务 160 条事件语义 `dedup_key` 幂等批写与中段失败回滚、`AgentBridgeStore::append_and_ack_events` 基于 `(bridge_session_id, event_seq)` 单事务增量推进连续 `last_acked_seq`（SQLite 递归点查 CTE 零尾扫描 + 200 尾缺口回归）、`agent_coverage_revision` 只追加历史防篡改、无 `U+10FFFF` 上界的开放前缀范围扫描、`SqliteCreatePublishGuard`/`RedbCreatePublishGuard` 取消与发布后异常原子回滚守卫，以及 `capture.redb` 过新 `META_SCHEMA` 仅报 `LBR-AGENT-048` 而不阻断 `RedbGitStore`；双特性 7/7、纯 `storage-redb,storage-queue` 4/4、纯 `storage-sqlite` 2/2、单特性零告警、fmt、严格 clippy、`compat_version_surface_sync` 与 Codex R7 `VERDICT: PASS` 全绿 |
 | `RB-06c` | `done` / `remote-verified` | `159bbf3`（`main`） | `0.30.327` | 2026-11-22 22:16 UTC：Stage 1 精确 4 文件写集（`src/storage/{mod,capture_store}.rs`、`src/storage/redb/{mod,capture_store}.rs`），在 `RedbCaptureStore` 新增同事务二级索引 `import_tombstones_by_provider` / `import_tombstones_by_session`（含 `open_read_write` 对 `RB-06` 遗留红库自动回填与过期索引剪枝）、同事务拒绝已墓碑化 `(agent_kind, provider_session_id)` 与 `erased_session_id` 重导（覆盖 `upsert_session`/`upsert_checkpoint`/`upsert_import_identity`/`append_capture_batch` 原子回滚含 `dedup_key` 撤销）、以及 `agent_audit_log` / `agent_workspace_scope_audit` 同事务只追加保护（覆写与 `update_*`/`delete_*` 全部 fail-closed 报脱敏错且原行零改动）；纯 `storage-redb,storage-queue` `redb_tombstone_and_audit_append_only_invariants` 1/1、双特性 `storage::capture_store::` 8/8、单特性零告警检查、fmt、严格 clippy、`compat_version_surface_sync` 与 Codex R2 `VERDICT: PASS` 全绿 |
 | `RB-06d` | `done` / `remote-verified` | `d9da836`（`main`） | `0.30.328` | 2026-11-22 23:04 UTC：Stage 1 精确 4 文件写集（`src/storage/{mod,capture_store}.rs`、`src/storage/redb/{mod,capture_store}.rs`），在 `RedbCaptureStore` 落地全描述符绑定 Unix 私密安全姿态：新建 `.libra/private/`（含缺失祖先目录逐级 `mkdirat` + macOS `fchmodat(AT_SYMLINK_NOFOLLOW)` / Linux `O_PATH` + `/proc/self/fd`）精确 `0700`、新建 `capture.gen-<id>.redb`（`openat(O_CREAT|O_EXCL|O_NOFOLLOW)` + `fchmod(0600)` + `linkat` + `FileBackend::new(file)` 零路径重开 + inode 钉定 `RedbCreatePublishGuard`）精确 `0600`、打开 `.libra/private/` 与 `capture.gen-<id>.redb` 均经 `O_NOFOLLOW|O_NONBLOCK` 拒绝符号链接/FIFO 并按 `libc::geteuid()` 核验属主 UID 且错误文案零路径/UID 泄露；纯 `storage-redb,storage-queue` `redb_private_dir_and_db_unix_permissions_nofollow_and_owner` 1/1（含 `umask(0000/0077/0777)` 含缺失祖先子进程、setgid 剥离、既有父目录零变更、FIFO、5 类确定性替换竞态/早期失败及真实非属主目录/chown 校验）、双特性 9/9、单特性零告警、fmt、严格 clippy、`compat_version_surface_sync` 全绿；Codex R1（5 项）与 R2（4 项）真实发现已全部闭环，R3 仅余同 UID 目录并发下 POSIX 无原生原子 `unlinkat_if_inode`/`mkdirat_fd` 系统调用之范围外延展，依用户授权跳过继续推进 |
-| `RB-06b` | `done` / `remote-pending` | 本提交（`main`） | `0.30.330` | 2026-11-23 00:01 UTC：Stage 1 精确 4 文件写集（`src/storage/{mod,cross_store}.rs`、`src/storage/redb/{git_store,capture_store}.rs`），实现 `CrossStoreCoordinator` 与 `git.redb` 延迟初始化 `meta_generation`/`meta_cross_store_intent`（保持 61 活表清单严格一致）：严格按 `GC-RB-04` `GitStore → CaptureStore` 锁序持 `cap_wtx` 在 `git_wtx.commit()` 前完成全部捕获批语义/外键/墓碑/唯一性/只追加预验（杜绝坏捕获毒化发件箱）、写前按升序重放全部 `(cap_gen + 1)..=git_gen` 待决意图、3-bit 协作式取消边界（`CrossStoreCancelGuard` + `ReplayCommitBoundaryGuard` 覆盖 `git_wtx`/`cap_wtx`/重放提交三处取消点）、`capture.redb` 缺 `meta_generation` 表或单例/只读/墓碑/损毁/缺失一律 fail-closed 报 `LBR-IO-001` 拒推进，以及只读三步一致快照（`g1 == c1 && g1 == g2`，5 次重试耗尽报 `LBR-IO-001`）；纯 `storage-redb,storage-queue` `storage::cross_store::` 6/6（含 AC1–AC4、并发双写与 `g1 != g2` 交错、防毒化、元数据腐败与 4 态异步取消）、双特性 15/15 回归（含 `repository_61_source_tables_manifest_complete`）、单特性零告警、fmt、严格 clippy、`compat_version_surface_sync` 与 Codex R5 `VERDICT: PASS` 全绿 |
-| `RB-06e`..`RB-34c`（剩余 127 卡） | `pending` | — | — | 按实施顺序于 `main` 逐卡推进 |
+| `RB-06b` | `done` / `remote-verified` | `8d3c63c`（`main`） | `0.30.330` | 2026-11-23 00:01 UTC：Stage 1 精确 4 文件写集（`src/storage/{mod,cross_store}.rs`、`src/storage/redb/{git_store,capture_store}.rs`），实现 `CrossStoreCoordinator` 与 `git.redb` 延迟初始化 `meta_generation`/`meta_cross_store_intent`（保持 61 活表清单严格一致）：严格按 `GC-RB-04` `GitStore → CaptureStore` 锁序持 `cap_wtx` 在 `git_wtx.commit()` 前完成全部捕获批语义/外键/墓碑/唯一性/只追加预验（杜绝坏捕获毒化发件箱）、写前按升序重放全部 `(cap_gen + 1)..=git_gen` 待决意图、3-bit 协作式取消边界（`CrossStoreCancelGuard` + `ReplayCommitBoundaryGuard` 覆盖 `git_wtx`/`cap_wtx`/重放提交三处取消点）、`capture.redb` 缺 `meta_generation` 表或单例/只读/墓碑/损毁/缺失一律 fail-closed 报 `LBR-IO-001` 拒推进，以及只读三步一致快照（`g1 == c1 && g1 == g2`，5 次重试耗尽报 `LBR-IO-001`）；纯 `storage-redb,storage-queue` `storage::cross_store::` 6/6（含 AC1–AC4、并发双写与 `g1 != g2` 交错、防毒化、元数据腐败与 4 态异步取消）、双特性 15/15 回归（含 `repository_61_source_tables_manifest_complete`）、单特性零告警、fmt、严格 clippy、`compat_version_surface_sync` 与 Codex R5 `VERDICT: PASS` 全绿 |
+| `RB-06e` | `done` / `remote-pending` | 本提交（`main`） | `0.30.331` | 2026-11-23 02:10 UTC：Stage 1 精确 3/4 文件写集（`src/storage/{mod,cross_store}.rs`、`src/storage/redb/git_store.rs`），实现显式修复入口 `CrossStoreCoordinator::reconcile_pending_intents()` / `cross_store::reconcile_pending_intents()`、共享升序重放引擎 `replay_pending_intents_in_cap_wtx`、孤儿意图守卫 `ensure_no_orphan_cross_store_intents_in_wtx`、已对账意图自动清理 `prune_reconciled_cross_store_intents_in_wtx`（同时接入显式修复与后续跨库写事务双路径，使 `META_CROSS_STORE_INTENT` 严格有界不无限增长），以及 `map_cross_store_join_err` 全路径 Tokio `JoinError` 固定类别脱敏；纯 `storage-redb,storage-queue` `storage::cross_store::` 8/8（含 `explicit_reconcile_idempotent_snapshot_and_intent_pruning` AC1–AC4 与 7 场景失败/回滚/孤儿/双锁取消/panic 脱敏回归）、双特性 8/8（含 `repository_61_source_tables_manifest_complete`）、单特性零告警、fmt、严格 clippy、`compat_version_surface_sync` 全绿；Codex R1 两项 P1 已全部闭环并经 R2 确认，R2 仅余要求在存储库模块内改写进程全局 `std::panic::set_hook` 抑制默认 stderr 之范围外诉求，依用户授权跳过继续推进（**Phase 1 全 19 卡全部闭环**） |
+| `RB-07`..`RB-34c`（剩余 126 卡） | `pending` | — | — | 进入 Phase 2（Capture 双通道 CRC32C 帧队列），按实施顺序于 `main` 逐卡推进 |
 
 ## Codex review log
 

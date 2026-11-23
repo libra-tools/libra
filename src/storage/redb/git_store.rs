@@ -1009,6 +1009,15 @@ impl RedbGitStore {
         let Some(start) = after_gen.checked_add(1) else {
             return Ok(Vec::new());
         };
+        let has_intent_table = wtx
+            .list_tables()
+            .map_err(|err| {
+                map_redb_storage_err(err, "list git tables for meta_cross_store_intent check")
+            })?
+            .any(|h| h.name() == META_CROSS_STORE_INTENT_TABLE_NAME);
+        if !has_intent_table {
+            return Ok(Vec::new());
+        }
         let table = wtx
             .open_table(META_CROSS_STORE_INTENT_TABLE)
             .map_err(|err| map_redb_table_err(err, "open meta_cross_store_intent for read"))?;
@@ -1022,6 +1031,93 @@ impl RedbGitStore {
             out.push((k.value(), v.value().to_vec()));
         }
         Ok(out)
+    }
+
+    /// Verify that `META_CROSS_STORE_INTENT` contains no orphan entries with
+    /// generation strictly greater than `git_gen`.
+    pub(crate) fn ensure_no_orphan_cross_store_intents_in_wtx(
+        wtx: &WriteTransaction,
+        git_gen: u64,
+    ) -> StorageResult<()> {
+        let Some(start) = git_gen.checked_add(1) else {
+            return Ok(());
+        };
+        let has_intent_table = wtx
+            .list_tables()
+            .map_err(|err| {
+                map_redb_storage_err(err, "list git tables for orphan cross-store intent check")
+            })?
+            .any(|h| h.name() == META_CROSS_STORE_INTENT_TABLE_NAME);
+        if !has_intent_table {
+            return Ok(());
+        }
+        let table = wtx
+            .open_table(META_CROSS_STORE_INTENT_TABLE)
+            .map_err(|err| {
+                map_redb_table_err(err, "open meta_cross_store_intent for orphan check")
+            })?;
+        if let Some(entry) = table
+            .range(start..)
+            .map_err(|err| map_redb_storage_err(err, "range orphan meta_cross_store_intent"))?
+            .next()
+        {
+            let (k, _) = entry
+                .map_err(|err| map_redb_storage_err(err, "read orphan meta_cross_store_intent"))?;
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "cross-store outbox contains orphan intent generation {} beyond git generation {git_gen}",
+                    k.value()
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// Prune all already-reconciled cross-store intent entries with generation
+    /// `<= up_to_gen` inside an active `git.redb` write transaction (`ADR-RB-06`,
+    /// `RB-06e`).
+    ///
+    /// Returns the number of entries removed without creating
+    /// `META_CROSS_STORE_INTENT` on stores that have never written intents.
+    pub(crate) fn prune_reconciled_cross_store_intents_in_wtx(
+        wtx: &WriteTransaction,
+        up_to_gen: u64,
+    ) -> StorageResult<usize> {
+        let has_intent_table = wtx
+            .list_tables()
+            .map_err(|err| {
+                map_redb_storage_err(err, "list git tables for cross-store intent pruning")
+            })?
+            .any(|h| h.name() == META_CROSS_STORE_INTENT_TABLE_NAME);
+        if !has_intent_table {
+            return Ok(0);
+        }
+        let mut table = wtx
+            .open_table(META_CROSS_STORE_INTENT_TABLE)
+            .map_err(|err| map_redb_table_err(err, "open meta_cross_store_intent for prune"))?;
+        let mut keys_to_prune = Vec::new();
+        {
+            let range = table.range(..=up_to_gen).map_err(|err| {
+                map_redb_storage_err(err, "range meta_cross_store_intent for prune")
+            })?;
+            for entry in range {
+                let (k, _) = entry.map_err(|err| {
+                    map_redb_storage_err(err, "read meta_cross_store_intent key for prune")
+                })?;
+                keys_to_prune.push(k.value());
+            }
+        }
+        let mut pruned = 0usize;
+        for key in keys_to_prune {
+            if table
+                .remove(key)
+                .map_err(|err| map_redb_storage_err(err, "remove pruned meta_cross_store_intent"))?
+                .is_some()
+            {
+                pruned += 1;
+            }
+        }
+        Ok(pruned)
     }
 
     /// Persist a serialized cross-store intent payload under `META_CROSS_STORE_INTENT[generation]`

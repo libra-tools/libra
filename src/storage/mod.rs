@@ -99,8 +99,9 @@ pub use cross_store::{
     CROSS_STORE_CAPTURE_UNREACHABLE_PREFIX, CROSS_STORE_INCONSISTENT_SNAPSHOT_PREFIX,
     CROSS_STORE_INTENT_CODEC_VERSION, CROSS_STORE_SNAPSHOT_MAX_RETRIES, CrossStoreCommitOutcome,
     CrossStoreConsistentSnapshot, CrossStoreCoordinator, CrossStoreIntentRecord,
-    CrossStoreRefCasOp, DEFAULT_SNAPSHOT_RETRY_BACKOFF, is_cross_store_capture_unavailable_error,
-    is_cross_store_inconsistent_snapshot_error, snapshot_consistent_read_only_blocking,
+    CrossStoreReconcileOutcome, CrossStoreRefCasOp, DEFAULT_SNAPSHOT_RETRY_BACKOFF,
+    is_cross_store_capture_unavailable_error, is_cross_store_inconsistent_snapshot_error,
+    reconcile_pending_intents, snapshot_consistent_read_only_blocking,
 };
 pub use error::{StorageBackendError, StorageResult};
 #[cfg(feature = "storage-redb")]

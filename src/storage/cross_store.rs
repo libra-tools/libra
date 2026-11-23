@@ -131,6 +131,27 @@ pub struct CrossStoreCommitOutcome {
     pub capture_applied: usize,
     /// Number of capture batch items already deduplicated in Step 2.
     pub capture_deduplicated: usize,
+    /// Number of already-reconciled outbox intents (`gen <= prev_git_gen`)
+    /// automatically pruned inside Step 1 (`ADR-RB-06` #1, `RB-06e`).
+    pub pruned_intents: usize,
+}
+
+/// Result of explicit cross-store outbox reconciliation and reconciled-intent
+/// pruning (`ADR-RB-06` #2, `RB-06e`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrossStoreReconcileOutcome {
+    /// Synchronized cross-store generation after reconciliation (`capture_gen == git_gen`).
+    pub generation: u64,
+    /// Pending outbox generations replayed into `capture.redb` in strictly
+    /// ascending order (`[]` when already reconciled).
+    pub replayed_generations: Vec<u64>,
+    /// Number of newly applied capture batch items during replay (`0` on idempotent no-op).
+    pub capture_applied: usize,
+    /// Number of capture batch items deduplicated during replay (`0` on idempotent no-op).
+    pub capture_deduplicated: usize,
+    /// Number of already-reconciled outbox entries (`gen <= capture_gen`) pruned
+    /// from `git.redb`'s `META_CROSS_STORE_INTENT` table.
+    pub pruned_intents: usize,
 }
 
 /// Frozen read-only MVCC snapshot spanning both `git.redb` and `capture.redb`
@@ -535,9 +556,7 @@ impl CrossStoreCoordinator {
             outcome
         })
         .await
-        .map_err(|err| StorageBackendError::BackendInternal {
-            detail: format!("cross-store commit task failed: {err}"),
-        })?;
+        .map_err(|err| map_cross_store_join_err("commit", &err))?;
         cancel_guard.disarm();
         res
     }
@@ -562,9 +581,71 @@ impl CrossStoreCoordinator {
             commit_cross_store_blocking(&git, &capture, &git_op, &items, cancel_state.as_ref())
         })
         .await
-        .map_err(|err| StorageBackendError::BackendInternal {
-            detail: format!("cross-store commit task failed: {err}"),
-        })?;
+        .map_err(|err| map_cross_store_join_err("commit", &err))?;
+        cancel_guard.disarm();
+        res
+    }
+
+    /// Explicitly reconcile any pending cross-store intents committed in
+    /// `git.redb` but not yet applied to `capture.redb` (`ADR-RB-06` #2, `RB-06e`):
+    ///
+    /// 1. Acquires `git.redb` write lock FIRST, then `capture.redb` write lock
+    ///    SECOND (`GC-RB-04` lock order).
+    /// 2. Verifies `capture.META_GENERATION` integrity and rejects `cap_gen > git_gen`
+    ///    or orphan outbox entries `> git_gen` fail-closed (`LBR-IO-001`).
+    /// 3. If `cap_gen < git_gen`, replays all pending intents in
+    ///    `(cap_gen + 1)..=git_gen` in strictly ascending order into `capture.redb`
+    ///    and advances `capture.META_GENERATION = git_gen`.
+    /// 4. Prunes all already-reconciled outbox entries (`gen <= git_gen`) from
+    ///    `git.redb`'s `META_CROSS_STORE_INTENT` table to prevent unbounded growth.
+    /// 5. Fully idempotent on repeated calls: once synchronized and pruned,
+    ///    subsequent invocations perform zero capture or git write commits.
+    pub async fn reconcile_pending_intents(&self) -> StorageResult<CrossStoreReconcileOutcome> {
+        #[cfg(test)]
+        {
+            self.reconcile_pending_intents_inner(CrossStoreCommitHook::none())
+                .await
+        }
+        #[cfg(not(test))]
+        {
+            self.reconcile_pending_intents_impl().await
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn reconcile_pending_intents_inner(
+        &self,
+        hook: CrossStoreCommitHook,
+    ) -> StorageResult<CrossStoreReconcileOutcome> {
+        let capture = self.resolve_capture_for_write().await?;
+        let git = self.git.clone();
+        let cancel_state = Arc::new(AtomicU8::new(CANCEL_STATE_ACTIVE));
+        let mut cancel_guard = CrossStoreCancelGuard::new(Arc::clone(&cancel_state));
+
+        let res = tokio::task::spawn_blocking(move || {
+            let outcome =
+                reconcile_pending_intents_blocking(&git, &capture, cancel_state.as_ref(), &hook);
+            hook.fire_blocking_exit();
+            outcome
+        })
+        .await
+        .map_err(|err| map_cross_store_join_err("reconcile", &err))?;
+        cancel_guard.disarm();
+        res
+    }
+
+    #[cfg(not(test))]
+    async fn reconcile_pending_intents_impl(&self) -> StorageResult<CrossStoreReconcileOutcome> {
+        let capture = self.resolve_capture_for_write().await?;
+        let git = self.git.clone();
+        let cancel_state = Arc::new(AtomicU8::new(CANCEL_STATE_ACTIVE));
+        let mut cancel_guard = CrossStoreCancelGuard::new(Arc::clone(&cancel_state));
+
+        let res = tokio::task::spawn_blocking(move || {
+            reconcile_pending_intents_blocking(&git, &capture, cancel_state.as_ref())
+        })
+        .await
+        .map_err(|err| map_cross_store_join_err("reconcile", &err))?;
         cancel_guard.disarm();
         res
     }
@@ -589,9 +670,7 @@ impl CrossStoreCoordinator {
             snapshot_consistent_read_only_blocking(&git, &capture, max_retries, backoff)
         })
         .await
-        .map_err(|err| StorageBackendError::BackendInternal {
-            detail: format!("cross-store snapshot task failed: {err}"),
-        })?
+        .map_err(|err| map_cross_store_join_err("snapshot", &err))?
     }
 
     #[cfg(test)]
@@ -614,9 +693,23 @@ impl CrossStoreCoordinator {
             )
         })
         .await
-        .map_err(|err| StorageBackendError::BackendInternal {
-            detail: format!("cross-store snapshot task failed: {err}"),
-        })?
+        .map_err(|err| map_cross_store_join_err("snapshot", &err))?
+    }
+}
+
+/// Sanitize Tokio [`tokio::task::JoinError`] into a fixed-category storage
+/// error without ever exposing arbitrary panic payload text (which may contain
+/// private paths, UIDs, or capture identifiers, `GC-RB-03` / `ER-11`).
+fn map_cross_store_join_err(op: &'static str, err: &tokio::task::JoinError) -> StorageBackendError {
+    let reason = if err.is_cancelled() {
+        "cancelled"
+    } else if err.is_panic() {
+        "panicked"
+    } else {
+        "failed"
+    };
+    StorageBackendError::BackendInternal {
+        detail: format!("cross-store {op} task {reason}"),
     }
 }
 
@@ -692,6 +785,108 @@ fn snapshot_consistent_read_only_blocking_inner(
     })
 }
 
+/// Convenience entry point (`ADR-RB-06` #2, `RB-06e`) invoked by repair tools
+/// such as `libra agent doctor --repair` and `libra fsck` to idempotently replay
+/// any pending `git.redb` outbox intents into `capture.redb` until
+/// `capture_gen == git_gen` and prune reconciled entries (`gen <= capture_gen`).
+pub async fn reconcile_pending_intents(
+    git: &RedbGitStore,
+    capture: &RedbCaptureStore,
+) -> StorageResult<CrossStoreReconcileOutcome> {
+    CrossStoreCoordinator::new(git.clone(), capture.clone())
+        .reconcile_pending_intents()
+        .await
+}
+
+struct ReplayPendingSummary {
+    replayed_generations: Vec<u64>,
+    capture_applied: usize,
+    capture_deduplicated: usize,
+}
+
+fn replay_pending_intents_in_cap_wtx(
+    git_wtx: &redb::WriteTransaction,
+    cap_wtx: &redb::WriteTransaction,
+    cap_gen: u64,
+    git_gen: u64,
+) -> StorageResult<ReplayPendingSummary> {
+    let pending_raw = RedbGitStore::read_pending_cross_store_intents_in_wtx(git_wtx, cap_gen)?;
+    let expected_count =
+        usize::try_from(git_gen - cap_gen).map_err(|_| StorageBackendError::BackendInternal {
+            detail: "cross-store pending generation gap exceeds platform bounds".to_string(),
+        })?;
+    if pending_raw.len() < expected_count {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "cross-store outbox is missing pending intent(s) between generation {} and {git_gen}; refusing to skip gap",
+                cap_gen + 1
+            ),
+        });
+    }
+
+    let mut replayed_generations = Vec::with_capacity(expected_count);
+    let mut capture_applied = 0usize;
+    let mut capture_deduplicated = 0usize;
+    let mut expected_gen =
+        cap_gen
+            .checked_add(1)
+            .ok_or_else(|| StorageBackendError::BackendInternal {
+                detail: "cross-store generation overflow during pending intent replay".to_string(),
+            })?;
+
+    for (key_gen, raw_bytes) in pending_raw {
+        if key_gen > git_gen {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "cross-store outbox contains orphan intent generation {key_gen} beyond git generation {git_gen}"
+                ),
+            });
+        }
+        if key_gen != expected_gen {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "cross-store outbox generation gap: expected intent {expected_gen}, found {key_gen}; refusing to skip gap"
+                ),
+            });
+        }
+        let intent: CrossStoreIntentRecord =
+            decode_versioned(&raw_bytes, CROSS_STORE_INTENT_CODEC_VERSION)?;
+        if intent.generation != key_gen {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "cross-store intent payload generation ({}) does not match outbox key ({key_gen})",
+                    intent.generation
+                ),
+            });
+        }
+        for item in &intent.items {
+            validate_capture_batch_item(item)?;
+        }
+        let (applied, deduplicated) =
+            RedbCaptureStore::apply_capture_batch_items_in_wtx(cap_wtx, &intent.items)?;
+        capture_applied = capture_applied.saturating_add(applied);
+        capture_deduplicated = capture_deduplicated.saturating_add(deduplicated);
+        RedbCaptureStore::write_cross_store_generation_in_wtx(cap_wtx, key_gen)?;
+        replayed_generations.push(key_gen);
+        expected_gen = expected_gen.saturating_add(1);
+    }
+
+    if replayed_generations.len() != expected_count {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "cross-store outbox replay incomplete: replayed {} of {expected_count} pending intent(s)",
+                replayed_generations.len()
+            ),
+        });
+    }
+
+    Ok(ReplayPendingSummary {
+        replayed_generations,
+        capture_applied,
+        capture_deduplicated,
+    })
+}
+
 /// Acquire `capture.redb` write lock SECOND (under an already-held `git_wtx`,
 /// preserving `GC-RB-04` `GitStore -> CaptureStore` lock order), validate
 /// `capture.META_GENERATION`, replay any pending `(cap_gen + 1)..=git_gen`
@@ -732,80 +927,13 @@ fn reconcile_and_hold_capture_wtx(
         });
     }
     if cap_gen == git_gen {
+        RedbGitStore::ensure_no_orphan_cross_store_intents_in_wtx(git_wtx, git_gen)?;
         return Ok((Vec::new(), cap_wtx));
     }
 
     // `cap_gen < git_gen`: mandatory ascending replay of every missing intent in
     // `(cap_gen + 1)..=git_gen` before any new generation may be allocated.
-    let pending_raw = RedbGitStore::read_pending_cross_store_intents_in_wtx(git_wtx, cap_gen)?;
-    let expected_count =
-        usize::try_from(git_gen - cap_gen).map_err(|_| StorageBackendError::BackendInternal {
-            detail: "cross-store pending generation gap exceeds platform bounds".to_string(),
-        })?;
-    if pending_raw.len() < expected_count {
-        drop(cap_wtx);
-        return Err(StorageBackendError::BackendInternal {
-            detail: format!(
-                "cross-store outbox is missing pending intent(s) between generation {} and {git_gen}; refusing to skip gap",
-                cap_gen + 1
-            ),
-        });
-    }
-
-    let mut replayed = Vec::with_capacity(expected_count);
-    let mut expected_gen =
-        cap_gen
-            .checked_add(1)
-            .ok_or_else(|| StorageBackendError::BackendInternal {
-                detail: "cross-store generation overflow during pending intent replay".to_string(),
-            })?;
-
-    for (key_gen, raw_bytes) in pending_raw {
-        if key_gen > git_gen {
-            drop(cap_wtx);
-            return Err(StorageBackendError::BackendInternal {
-                detail: format!(
-                    "cross-store outbox contains orphan intent generation {key_gen} beyond git generation {git_gen}"
-                ),
-            });
-        }
-        if key_gen != expected_gen {
-            drop(cap_wtx);
-            return Err(StorageBackendError::BackendInternal {
-                detail: format!(
-                    "cross-store outbox generation gap: expected intent {expected_gen}, found {key_gen}; refusing to skip gap"
-                ),
-            });
-        }
-        let intent: CrossStoreIntentRecord =
-            decode_versioned(&raw_bytes, CROSS_STORE_INTENT_CODEC_VERSION)?;
-        if intent.generation != key_gen {
-            drop(cap_wtx);
-            return Err(StorageBackendError::BackendInternal {
-                detail: format!(
-                    "cross-store intent payload generation ({}) does not match outbox key ({key_gen})",
-                    intent.generation
-                ),
-            });
-        }
-        for item in &intent.items {
-            validate_capture_batch_item(item)?;
-        }
-        let _ = RedbCaptureStore::apply_capture_batch_items_in_wtx(&cap_wtx, &intent.items)?;
-        RedbCaptureStore::write_cross_store_generation_in_wtx(&cap_wtx, key_gen)?;
-        replayed.push(key_gen);
-        expected_gen = expected_gen.saturating_add(1);
-    }
-
-    if replayed.len() != expected_count {
-        drop(cap_wtx);
-        return Err(StorageBackendError::BackendInternal {
-            detail: format!(
-                "cross-store outbox replay incomplete: replayed {} of {expected_count} pending intent(s)",
-                replayed.len()
-            ),
-        });
-    }
+    let summary = replay_pending_intents_in_cap_wtx(git_wtx, &cap_wtx, cap_gen, git_gen)?;
 
     // Atomic pre-commit cancellation boundary before persisting pending-intent replay:
     // if the async caller dropped/aborted while waiting on `cap_wtx`, drop `cap_wtx`
@@ -848,7 +976,102 @@ fn reconcile_and_hold_capture_wtx(
         });
     }
 
-    Ok((replayed, next_cap_wtx))
+    Ok((summary.replayed_generations, next_cap_wtx))
+}
+
+fn reconcile_pending_intents_blocking(
+    git: &RedbGitStore,
+    capture: &RedbCaptureStore,
+    cancel_state: &AtomicU8,
+    #[cfg(test)] hook: &CrossStoreCommitHook,
+) -> StorageResult<CrossStoreReconcileOutcome> {
+    #[cfg(test)]
+    hook.fire_blocking_enter();
+    check_not_cancelled(cancel_state)?;
+
+    // Acquire `git.redb` write lock FIRST (`GC-RB-04`).
+    let git_wtx = git.begin_checked_write_tx()?;
+    check_not_cancelled(cancel_state)?;
+    let git_gen = RedbGitStore::read_cross_store_generation_in_wtx(&git_wtx)?;
+
+    #[cfg(test)]
+    hook.on_after_git_wtx_acquired(git_gen);
+
+    // Acquire `capture.redb` write lock SECOND (`GC-RB-04`).
+    let cap_wtx = capture.begin_checked_write_tx().map_err(|err| {
+        StorageBackendError::BackendInternal {
+            detail: format!(
+                "{CROSS_STORE_CAPTURE_UNREACHABLE_PREFIX}: cannot begin capture write transaction ({}): refusing to reconcile",
+                err.stable_code_str()
+            ),
+        }
+    })?;
+    check_not_cancelled(cancel_state)?;
+
+    let cap_gen = RedbCaptureStore::read_cross_store_generation_in_wtx(&cap_wtx).map_err(|err| {
+        StorageBackendError::BackendInternal {
+            detail: format!(
+                "{CROSS_STORE_CAPTURE_UNREACHABLE_PREFIX}: cannot read capture generation ({}): refusing to reconcile",
+                err.stable_code_str()
+            ),
+        }
+    })?;
+    if cap_gen > git_gen {
+        drop(cap_wtx);
+        drop(git_wtx);
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "{CROSS_STORE_CAPTURE_UNREACHABLE_PREFIX}: capture generation ({cap_gen}) exceeds git generation ({git_gen}); refusing to mask divergence"
+            ),
+        });
+    }
+
+    RedbGitStore::ensure_no_orphan_cross_store_intents_in_wtx(&git_wtx, git_gen)?;
+
+    let summary = if cap_gen < git_gen {
+        let summary = replay_pending_intents_in_cap_wtx(&git_wtx, &cap_wtx, cap_gen, git_gen)?;
+        {
+            let _replay_boundary = ReplayCommitBoundaryGuard::enter(cancel_state)?;
+            #[cfg(test)]
+            hook.fire_inside_replay_commit_boundary();
+            cap_wtx
+                .commit()
+                .map_err(|err| map_redb_commit_err(err, "commit reconciled cross-store intents"))?;
+            capture.record_write_tx_commit();
+        }
+        summary
+    } else {
+        // Already synchronized (`cap_gen == git_gen`): drop `cap_wtx` uncommitted so
+        // repeated reconcile calls remain strictly zero-write on `capture.redb`.
+        drop(cap_wtx);
+        ReplayPendingSummary {
+            replayed_generations: Vec::new(),
+            capture_applied: 0,
+            capture_deduplicated: 0,
+        }
+    };
+    check_not_cancelled(cancel_state)?;
+
+    // `capture.META_GENERATION == git_gen` is now durably committed: prune all
+    // already-reconciled outbox entries (`gen <= git_gen`) to prevent unbounded growth.
+    let pruned_intents =
+        RedbGitStore::prune_reconciled_cross_store_intents_in_wtx(&git_wtx, git_gen)?;
+    if pruned_intents > 0 {
+        enter_commit_boundary(cancel_state)?;
+        git_wtx
+            .commit()
+            .map_err(|err| map_redb_commit_err(err, "commit pruned cross-store intents"))?;
+    } else {
+        drop(git_wtx);
+    }
+
+    Ok(CrossStoreReconcileOutcome {
+        generation: git_gen,
+        replayed_generations: summary.replayed_generations,
+        capture_applied: summary.capture_applied,
+        capture_deduplicated: summary.capture_deduplicated,
+        pruned_intents,
+    })
 }
 
 fn commit_cross_store_blocking(
@@ -903,6 +1126,7 @@ fn commit_cross_store_blocking(
             replayed_generations,
             capture_applied: 0,
             capture_deduplicated: 0,
+            pruned_intents: 0,
         });
     }
 
@@ -926,6 +1150,11 @@ fn commit_cross_store_blocking(
     };
     let encoded_intent = encode_versioned(CROSS_STORE_INTENT_CODEC_VERSION, &intent)?;
 
+    // Automatically prune all already-reconciled outbox entries (`gen <= git_gen`,
+    // verified committed in `capture.redb` above) inside this write transaction
+    // so `META_CROSS_STORE_INTENT` never grows unboundedly (`ADR-RB-06` #1, `RB-06e`).
+    let pruned_intents =
+        RedbGitStore::prune_reconciled_cross_store_intents_in_wtx(&git_wtx, git_gen)?;
     RedbGitStore::write_cross_store_generation_in_wtx(&git_wtx, next_gen)?;
     RedbGitStore::write_cross_store_intent_in_wtx(&git_wtx, next_gen, &encoded_intent)?;
 
@@ -959,6 +1188,7 @@ fn commit_cross_store_blocking(
         replayed_generations,
         capture_applied,
         capture_deduplicated,
+        pruned_intents,
     })
 }
 
@@ -1143,13 +1373,15 @@ mod tests {
             .expect_err("AC2: injected crash after git commit must return error");
         assert!(fault_err.to_string().contains("generation 2"));
 
-        // git.redb has gen=2 + ref=oid2 + intent[2], while capture.redb is still at gen=1 without sess-gen-2.
+        // git.redb has gen=2 + ref=oid2 + intent[2] (already-reconciled intent[1]
+        // was automatically pruned during gen=2's Step 1 write tx), while
+        // capture.redb is still at gen=1 without sess-gen-2.
         assert_eq!(git.read_cross_store_generation().expect("git gen 2"), 2);
         assert_eq!(capture.read_cross_store_generation().expect("cap gen 1"), 1);
         assert_eq!(
             git.list_cross_store_intent_generations()
                 .expect("intent keys after crash"),
-            vec![1, 2]
+            vec![2]
         );
         assert!(
             capture
@@ -2705,5 +2937,1032 @@ mod tests {
                     .is_none()
             );
         }
+    }
+
+    /// `RB-06e` AC1–AC4:
+    /// - AC1: Explicit `reconcile_pending_intents()` replays pending outbox
+    ///   intents to `capture.redb` until `capture_gen == git_gen` (single-gen
+    ///   and multi-gen gaps).
+    /// - AC2: After `reconcile_pending_intents()`, read-only three-step snapshot
+    ///   succeeds with `g1 == c1 == g2` freezing both Git refs and repaired Capture rows.
+    /// - AC3: Calling `reconcile_pending_intents()` a second time is completely
+    ///   idempotent — zero duplicate business rows and zero extra capture writes.
+    /// - AC4: Already-reconciled intents (`gen <= capture_gen`) are automatically
+    ///   pruned both by explicit `reconcile_pending_intents()` AND by subsequent
+    ///   cross-store write transactions, preventing unbounded outbox growth.
+    #[tokio::test]
+    async fn explicit_reconcile_idempotent_snapshot_and_intent_pruning() {
+        use std::sync::mpsc;
+
+        use crate::storage::capture_store::AgentAuditLogRecord;
+
+        let dir = tempdir().expect("tempdir");
+        let git_path = dir.path().join("redb").join("git.gen-00000001.redb");
+        let cap_path = dir.path().join("private").join("capture.gen-00000001.redb");
+        fs::create_dir_all(git_path.parent().expect("git parent")).expect("create redb dir");
+
+        let git = RedbGitStore::create(&git_path).expect("create git.redb");
+        let capture = RedbCaptureStore::create(&cap_path)
+            .await
+            .expect("create capture.redb");
+        let coord = CrossStoreCoordinator::new(git.clone(), capture.clone())
+            .with_snapshot_retry_backoff(Duration::ZERO);
+        let git_ro = RedbGitStore::open_read_only(&git_path).expect("open git ro");
+        let cap_ro = RedbCaptureStore::open_read_only(&cap_path)
+            .await
+            .expect("open cap ro");
+        let ro_coord =
+            CrossStoreCoordinator::new(git_ro, cap_ro).with_snapshot_retry_backoff(Duration::ZERO);
+
+        // Fresh empty store: reconcile is a clean zero-write no-op and does not
+        // lazily create `meta_cross_store_intent` or mutate capture.redb.
+        let cap_tx_initial = capture.write_transaction_count();
+        let fresh_rec = reconcile_pending_intents(&git, &capture)
+            .await
+            .expect("reconcile on fresh empty store");
+        assert_eq!(fresh_rec.generation, 0);
+        assert!(fresh_rec.replayed_generations.is_empty());
+        assert_eq!(fresh_rec.capture_applied, 0);
+        assert_eq!(fresh_rec.capture_deduplicated, 0);
+        assert_eq!(fresh_rec.pruned_intents, 0);
+        assert_eq!(capture.write_transaction_count(), cap_tx_initial);
+
+        // Seed gen=1 normally (1 session + 1 append-only audit row).
+        let oid1 = sample_oid('1');
+        let audit1 = AgentAuditLogRecord {
+            audit_id: "audit-rb06e-1".to_string(),
+            timestamp: "2026-11-23T01:00:00Z".to_string(),
+            user_id: None,
+            user_name: None,
+            action: "export".to_string(),
+            checkpoint_id: "cp-rb06e-1".to_string(),
+            scope: "session".to_string(),
+            export_path: None,
+            justification: None,
+            granted: true,
+        };
+        let out1 = coord
+            .commit_ref_cas_with_capture(
+                &branch_cas_op("main", None, oid1.clone()),
+                &[
+                    sample_session_item("rb06e:g1:sess", "sess-rb06e-1", "prov-rb06e-1", 1000),
+                    CaptureBatchItem {
+                        dedup_key: "rb06e:g1:audit".to_string(),
+                        payload: CaptureBatchPayload::AppendAuditLog(audit1),
+                    },
+                ],
+            )
+            .await
+            .expect("commit gen=1");
+        assert_eq!(out1.generation, 1);
+        assert_eq!(out1.pruned_intents, 0);
+        assert_eq!(
+            git.list_cross_store_intent_generations().expect("intents"),
+            vec![1]
+        );
+
+        // --- AC1 + AC2: Partial-commit fault at gen=2 -> snapshot fails -> explicit reconcile heals ---
+        let oid2 = sample_oid('2');
+        let audit2 = AgentAuditLogRecord {
+            audit_id: "audit-rb06e-2".to_string(),
+            timestamp: "2026-11-23T01:05:00Z".to_string(),
+            user_id: None,
+            user_name: None,
+            action: "export".to_string(),
+            checkpoint_id: "cp-rb06e-2".to_string(),
+            scope: "session".to_string(),
+            export_path: None,
+            justification: None,
+            granted: true,
+        };
+        let _ = coord
+            .commit_ref_cas_with_capture_inner(
+                &branch_cas_op("main", Some(oid1.clone()), oid2.clone()),
+                &[
+                    sample_session_item("rb06e:g2:sess", "sess-rb06e-2", "prov-rb06e-2", 2000),
+                    CaptureBatchItem {
+                        dedup_key: "rb06e:g2:audit".to_string(),
+                        payload: CaptureBatchPayload::AppendAuditLog(audit2),
+                    },
+                ],
+                CrossStoreCommitHook::fail_after_git_commit(),
+            )
+            .await
+            .expect_err("fault after git commit at gen=2");
+        assert_eq!(git.read_cross_store_generation().expect("git gen 2"), 2);
+        assert_eq!(capture.read_cross_store_generation().expect("cap gen 1"), 1);
+        assert_eq!(
+            git.list_cross_store_intent_generations().expect("intents"),
+            vec![2],
+            "gen=1 was already pruned automatically during gen=2 Step 1"
+        );
+
+        // Before explicit repair, read-only three-step snapshot MUST fail closed with LBR-IO-001.
+        let pre_snap_err = ro_coord
+            .snapshot_consistent_read_only()
+            .await
+            .expect_err("snapshot must fail closed while git_gen(2) != cap_gen(1)");
+        assert_eq!(pre_snap_err.stable_code_str(), "LBR-IO-001");
+        assert!(is_cross_store_inconsistent_snapshot_error(&pre_snap_err));
+
+        // AC1: Explicit `reconcile_pending_intents()` replays gen=2 to capture.redb
+        // AND prunes reconciled intent[2] from git.redb.
+        let rec1 = reconcile_pending_intents(&git, &capture)
+            .await
+            .expect("AC1: explicit reconcile must repair partial commit");
+        assert_eq!(rec1.generation, 2);
+        assert_eq!(rec1.replayed_generations, vec![2]);
+        assert_eq!(rec1.capture_applied, 2);
+        assert_eq!(rec1.capture_deduplicated, 0);
+        assert_eq!(rec1.pruned_intents, 1);
+        assert_eq!(git.read_cross_store_generation().expect("git gen 2"), 2);
+        assert_eq!(capture.read_cross_store_generation().expect("cap gen 2"), 2);
+        assert!(
+            git.list_cross_store_intent_generations()
+                .expect("outbox pruned after reconcile")
+                .is_empty(),
+            "AC4: explicit reconcile must prune all reconciled intents <= capture_gen"
+        );
+
+        // AC2: After explicit reconcile, read-only three-step snapshot succeeds on attempt 1
+        // with g1 == c1 == g2 == 2 and freezes both Git ref and repaired Capture rows.
+        let snap2 = ro_coord
+            .snapshot_consistent_read_only()
+            .await
+            .expect("AC2: read-only snapshot must succeed after reconcile");
+        assert_eq!(snap2.generation(), 2);
+        assert_eq!(snap2.attempts(), 1);
+        assert_eq!(
+            snap2
+                .get_git_ref(&RefKey::LocalBranch {
+                    name: "main".to_string()
+                })
+                .expect("read main ref from snap2"),
+            Some(RefTarget::Direct(oid2.clone()))
+        );
+        assert!(
+            snap2
+                .get_capture_session("sess-rb06e-2")
+                .expect("read repaired sess-rb06e-2 from snap2")
+                .is_some()
+        );
+        drop(snap2);
+
+        // AC3: Calling `reconcile_pending_intents()` a second time is 100% idempotent
+        // with zero capture writes and zero duplicate business rows.
+        let cap_tx_before_second = capture.write_transaction_count();
+        let sessions_before = capture
+            .list_sessions_by_started_desc()
+            .await
+            .expect("list sessions before 2nd reconcile");
+        let audits_before = capture
+            .list_audit_logs_by_checkpoint("cp-rb06e-2")
+            .await
+            .expect("list audits before 2nd reconcile");
+        assert_eq!(sessions_before.len(), 2);
+        assert_eq!(audits_before.len(), 1);
+
+        let rec2 = coord
+            .reconcile_pending_intents()
+            .await
+            .expect("AC3: second reconcile must succeed idempotently");
+        assert_eq!(rec2.generation, 2);
+        assert!(rec2.replayed_generations.is_empty());
+        assert_eq!(rec2.capture_applied, 0);
+        assert_eq!(rec2.capture_deduplicated, 0);
+        assert_eq!(rec2.pruned_intents, 0);
+        assert_eq!(
+            capture.write_transaction_count(),
+            cap_tx_before_second,
+            "AC3: second reconcile must not issue any capture write transaction"
+        );
+        let sessions_after = capture
+            .list_sessions_by_started_desc()
+            .await
+            .expect("list sessions after 2nd reconcile");
+        let audits_after = capture
+            .list_audit_logs_by_checkpoint("cp-rb06e-2")
+            .await
+            .expect("list audits after 2nd reconcile");
+        assert_eq!(sessions_after, sessions_before);
+        assert_eq!(audits_after, audits_before);
+
+        // --- AC1 + AC4 (multi-gen gap): seed 2 pending intents (gen 3 and 4) in git.redb
+        // without applying to capture.redb, then reconcile heals both ascending and prunes both ---
+        let oid3 = sample_oid('3');
+        let oid4 = sample_oid('4');
+        {
+            let wtx = git.begin_checked_write_tx().expect("seed multi-gen gap");
+            for (g, prev, next, sid, prov, dkey) in [
+                (
+                    3u64,
+                    oid2.clone(),
+                    oid3.clone(),
+                    "sess-rb06e-3",
+                    "prov-rb06e-3",
+                    "rb06e:g3:sess",
+                ),
+                (
+                    4u64,
+                    oid3.clone(),
+                    oid4.clone(),
+                    "sess-rb06e-4",
+                    "prov-rb06e-4",
+                    "rb06e:g4:sess",
+                ),
+            ] {
+                let (applied, _) = RedbGitStore::apply_ref_cas_in_wtx(
+                    &wtx,
+                    &RefKey::LocalBranch {
+                        name: "main".to_string(),
+                    },
+                    Some(&RefTarget::Direct(prev)),
+                    Some(&RefTarget::Direct(next)),
+                    &[],
+                    None,
+                )
+                .expect("apply cas");
+                assert!(applied);
+                let rec = CrossStoreIntentRecord {
+                    generation: g,
+                    items: vec![sample_session_item(dkey, sid, prov, 3000 + g as i64)],
+                };
+                let bytes = encode_versioned(CROSS_STORE_INTENT_CODEC_VERSION, &rec)
+                    .expect("encode multi-gen intent");
+                RedbGitStore::write_cross_store_generation_in_wtx(&wtx, g).expect("write gen");
+                RedbGitStore::write_cross_store_intent_in_wtx(&wtx, g, &bytes)
+                    .expect("write intent");
+            }
+            wtx.commit().expect("commit multi-gen gap");
+        }
+        assert_eq!(
+            git.list_cross_store_intent_generations().expect("pending"),
+            vec![3, 4]
+        );
+
+        let rec_multi = reconcile_pending_intents(&git, &capture)
+            .await
+            .expect("reconcile multi-gen gap [3, 4]");
+        assert_eq!(rec_multi.generation, 4);
+        assert_eq!(rec_multi.replayed_generations, vec![3, 4]);
+        assert_eq!(rec_multi.capture_applied, 2);
+        assert_eq!(rec_multi.pruned_intents, 2);
+        assert!(
+            git.list_cross_store_intent_generations()
+                .expect("outbox empty after multi-gen reconcile")
+                .is_empty()
+        );
+        let snap4 = ro_coord
+            .snapshot_consistent_read_only()
+            .await
+            .expect("snapshot after multi-gen reconcile");
+        assert_eq!(snap4.generation(), 4);
+        assert_eq!(snap4.attempts(), 1);
+        assert!(
+            snap4
+                .get_capture_session("sess-rb06e-3")
+                .expect("s3")
+                .is_some()
+        );
+        assert!(
+            snap4
+                .get_capture_session("sess-rb06e-4")
+                .expect("s4")
+                .is_some()
+        );
+        drop(snap4);
+
+        // --- AC4: Subsequent cross-store writes automatically prune reconciled intents
+        // (`gen <= capture_gen`) so `META_CROSS_STORE_INTENT` never grows unboundedly ---
+        let mut prev_oid = oid4;
+        for step in 5u64..=16u64 {
+            let next_oid = format!("{step:040x}");
+            let out = coord
+                .commit_ref_cas_with_capture(
+                    &branch_cas_op("main", Some(prev_oid), next_oid.clone()),
+                    &[sample_session_item(
+                        &format!("rb06e:g{step}:sess"),
+                        &format!("sess-rb06e-{step}"),
+                        &format!("prov-rb06e-{step}"),
+                        5000 + step as i64,
+                    )],
+                )
+                .await
+                .expect("subsequent write succeeds");
+            assert_eq!(out.generation, step);
+            assert!(out.replayed_generations.is_empty());
+            // Step 5 starts from an empty outbox (0 pruned); steps 6..=16 each prune
+            // the immediately preceding reconciled generation, keeping outbox len == 1!
+            let expected_pruned = usize::from(step > 5);
+            assert_eq!(
+                out.pruned_intents, expected_pruned,
+                "AC4: step {step} must automatically prune previous reconciled intent"
+            );
+            assert_eq!(
+                git.list_cross_store_intent_generations()
+                    .expect("bounded outbox"),
+                vec![step],
+                "AC4: META_CROSS_STORE_INTENT must stay strictly bounded at 1 entry"
+            );
+            prev_oid = next_oid;
+        }
+        // Final explicit reconcile prunes the trailing reconciled intent [16] with zero capture writes.
+        let cap_tx_before_final_prune = capture.write_transaction_count();
+        let final_rec = reconcile_pending_intents(&git, &capture)
+            .await
+            .expect("final reconcile prunes trailing intent 16");
+        assert_eq!(final_rec.generation, 16);
+        assert!(final_rec.replayed_generations.is_empty());
+        assert_eq!(final_rec.pruned_intents, 1);
+        assert_eq!(capture.write_transaction_count(), cap_tx_before_final_prune);
+        assert!(
+            git.list_cross_store_intent_generations()
+                .expect("outbox empty after final reconcile")
+                .is_empty()
+        );
+
+        // --- Hardening: cancellation during reconcile replay boundary leaves unpruned intent
+        // that a follow-up reconcile idempotently prunes with zero duplicate rows ---
+        let oid17 = format!("{:040x}", 17u64);
+        let _ = coord
+            .commit_ref_cas_with_capture_inner(
+                &branch_cas_op("main", Some(prev_oid), oid17),
+                &[sample_session_item(
+                    "rb06e:g17:sess",
+                    "sess-rb06e-17",
+                    "prov-rb06e-17",
+                    7000,
+                )],
+                CrossStoreCommitHook::fail_after_git_commit(),
+            )
+            .await
+            .expect_err("seed partial commit at gen=17");
+
+        let (in_boundary_tx, in_boundary_rx) = mpsc::channel::<()>();
+        let (resume_tx, resume_rx) = mpsc::channel::<()>();
+        let (exited_tx, exited_rx) = mpsc::channel::<()>();
+        let in_boundary_tx = Arc::new(std::sync::Mutex::new(Some(in_boundary_tx)));
+        let resume_rx = Arc::new(std::sync::Mutex::new(resume_rx));
+        let exited_tx = Arc::new(std::sync::Mutex::new(Some(exited_tx)));
+
+        let cancel_hook = CrossStoreCommitHook {
+            on_inside_replay_commit_boundary: Some(Arc::new(move || {
+                if let Some(tx) = in_boundary_tx.lock().expect("lock").take() {
+                    tx.send(()).expect("signal replay boundary");
+                }
+                resume_rx
+                    .lock()
+                    .expect("lock")
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("resume replay commit");
+            })),
+            on_blocking_exit: Some(Arc::new(move || {
+                if let Some(tx) = exited_tx.lock().expect("lock").take() {
+                    tx.send(()).expect("signal exit");
+                }
+            })),
+            ..CrossStoreCommitHook::none()
+        };
+
+        let coord_cancel = coord.clone();
+        let h_cancel = tokio::spawn(async move {
+            coord_cancel
+                .reconcile_pending_intents_inner(cancel_hook)
+                .await
+        });
+        tokio::task::spawn_blocking(move || {
+            in_boundary_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("entered reconcile replay boundary")
+        })
+        .await
+        .expect("join boundary");
+        h_cancel.abort();
+        let _ = h_cancel.await;
+        resume_tx.send(()).expect("release replay");
+        tokio::task::spawn_blocking(move || {
+            exited_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("cancelled reconcile exited cleanly")
+        })
+        .await
+        .expect("join exit");
+
+        // Replay healed capture.redb to gen=17, while cancellation prevented git prune commit!
+        assert_eq!(capture.read_cross_store_generation().expect("cap 17"), 17);
+        assert_eq!(
+            git.list_cross_store_intent_generations()
+                .expect("intent 17 still unpruned after abort"),
+            vec![17]
+        );
+        // Follow-up reconcile prunes [17] with zero capture writes and zero duplicate sessions.
+        let cap_tx_post_abort = capture.write_transaction_count();
+        let rec_prune_only = reconcile_pending_intents(&git, &capture)
+            .await
+            .expect("follow-up reconcile prunes remaining reconciled intent");
+        assert_eq!(rec_prune_only.generation, 17);
+        assert!(rec_prune_only.replayed_generations.is_empty());
+        assert_eq!(rec_prune_only.pruned_intents, 1);
+        assert_eq!(capture.write_transaction_count(), cap_tx_post_abort);
+        assert!(
+            git.list_cross_store_intent_generations()
+                .expect("outbox empty")
+                .is_empty()
+        );
+        assert_eq!(
+            capture
+                .list_sessions_by_started_desc()
+                .await
+                .expect("sessions")
+                .len(),
+            17
+        );
+
+        // --- Hardening: orphan intent beyond git_gen fails closed without pruning ---
+        {
+            let wtx = git.begin_checked_write_tx().expect("inject orphan intent");
+            let orphan = CrossStoreIntentRecord {
+                generation: 18,
+                items: Vec::new(),
+            };
+            let encoded =
+                encode_versioned(CROSS_STORE_INTENT_CODEC_VERSION, &orphan).expect("encode");
+            RedbGitStore::write_cross_store_intent_in_wtx(&wtx, 18, &encoded)
+                .expect("write orphan 18");
+            wtx.commit().expect("commit orphan");
+        }
+        let orphan_err = reconcile_pending_intents(&git, &capture)
+            .await
+            .expect_err("orphan intent beyond git_gen must fail closed");
+        assert_eq!(orphan_err.stable_code_str(), "LBR-IO-001");
+        assert!(
+            orphan_err
+                .to_string()
+                .contains("orphan intent generation 18")
+        );
+        assert_eq!(
+            git.list_cross_store_intent_generations()
+                .expect("orphan preserved on fail-closed"),
+            vec![18]
+        );
+    }
+
+    /// Codex R1 P1 regression for `RB-06e`: exercises every failure, rollback,
+    /// orphan-rejection, cancellation, and panic-sanitization path on
+    /// `reconcile_pending_intents()` (plus orphan rejection on subsequent
+    /// writers), proving both stores and the outbox remain untouched on each
+    /// failure and recover cleanly on retry.
+    #[tokio::test]
+    async fn reconcile_failure_paths_preserve_outbox_and_rollback_cleanly() {
+        use std::sync::mpsc;
+
+        use redb::TableDefinition;
+
+        const CAP_META_GEN_TABLE: TableDefinition<'static, &str, &[u8]> =
+            TableDefinition::new("meta_generation");
+        const GIT_INTENT_TABLE: TableDefinition<'static, u64, &[u8]> =
+            TableDefinition::new("meta_cross_store_intent");
+
+        let dir = tempdir().expect("tempdir");
+        let git_path = dir.path().join("redb").join("git.gen-00000001.redb");
+        let cap_path = dir.path().join("private").join("capture.gen-00000001.redb");
+        fs::create_dir_all(git_path.parent().expect("git parent")).expect("create redb dir");
+
+        let git = RedbGitStore::create(&git_path).expect("create git.redb");
+        let capture = RedbCaptureStore::create(&cap_path)
+            .await
+            .expect("create capture.redb");
+        let coord = CrossStoreCoordinator::new(git.clone(), capture.clone())
+            .with_snapshot_retry_backoff(Duration::ZERO);
+
+        // --- Case 1: Missing/corrupt capture `meta_generation` singleton during reconcile ---
+        let oid1 = sample_oid('1');
+        let _ = coord
+            .commit_ref_cas_with_capture_inner(
+                &branch_cas_op("main", None, oid1.clone()),
+                &[sample_session_item("fail:1", "sess-f1", "prov-f1", 1000)],
+                CrossStoreCommitHook::fail_after_git_commit(),
+            )
+            .await
+            .expect_err("seed partial gen=1");
+        assert_eq!(git.read_cross_store_generation().expect("git 1"), 1);
+        assert_eq!(capture.read_cross_store_generation().expect("cap 0"), 0);
+
+        let saved_cap_meta_bytes: Vec<u8> = {
+            let raw =
+                open_redb_writable(&cap_path, DatabaseRole::Capture, RedbRepairContext::Migrate)
+                    .expect("open raw cap");
+            let wtx = raw.begin_write().expect("wtx");
+            let saved = {
+                let mut tbl = wtx.open_table(CAP_META_GEN_TABLE).expect("open");
+                tbl.remove("singleton")
+                    .expect("remove singleton")
+                    .expect("singleton existed")
+                    .value()
+                    .to_vec()
+            };
+            wtx.commit().expect("commit removal");
+            saved
+        };
+
+        let err_missing_meta = reconcile_pending_intents(&git, &capture)
+            .await
+            .expect_err("missing capture meta_generation singleton must fail closed");
+        assert_eq!(err_missing_meta.stable_code_str(), "LBR-IO-001");
+        assert!(is_cross_store_capture_unavailable_error(&err_missing_meta));
+        assert_eq!(
+            git.list_cross_store_intent_generations().expect("outbox"),
+            vec![1],
+            "failed reconcile must preserve outbox intent [1]"
+        );
+        assert!(capture.get_session("sess-f1").await.expect("get").is_none());
+
+        // Restore capture meta_generation singleton and verify retry heals cleanly!
+        {
+            let raw =
+                open_redb_writable(&cap_path, DatabaseRole::Capture, RedbRepairContext::Migrate)
+                    .expect("open raw cap");
+            let wtx = raw.begin_write().expect("wtx");
+            {
+                let mut tbl = wtx.open_table(CAP_META_GEN_TABLE).expect("open");
+                tbl.insert("singleton", saved_cap_meta_bytes.as_slice())
+                    .expect("restore singleton");
+            }
+            wtx.commit().expect("commit restore");
+        }
+        let healed1 = reconcile_pending_intents(&git, &capture)
+            .await
+            .expect("retry after restoring capture metadata must heal gen=1");
+        assert_eq!(healed1.generation, 1);
+        assert_eq!(healed1.replayed_generations, vec![1]);
+        assert_eq!(healed1.pruned_intents, 1);
+        assert!(capture.get_session("sess-f1").await.expect("get").is_some());
+        assert!(
+            git.list_cross_store_intent_generations()
+                .expect("empty")
+                .is_empty()
+        );
+
+        // --- Case 2: Missing pending intent gap (git_gen=3, cap_gen=1, outbox only has [3]) ---
+        let oid2 = sample_oid('2');
+        let oid3 = sample_oid('3');
+        let intent2_bytes = encode_versioned(
+            CROSS_STORE_INTENT_CODEC_VERSION,
+            &CrossStoreIntentRecord {
+                generation: 2,
+                items: vec![sample_session_item("fail:2", "sess-f2", "prov-f2", 2000)],
+            },
+        )
+        .expect("encode 2");
+        let intent3_bytes = encode_versioned(
+            CROSS_STORE_INTENT_CODEC_VERSION,
+            &CrossStoreIntentRecord {
+                generation: 3,
+                items: vec![sample_session_item("fail:3", "sess-f3", "prov-f3", 3000)],
+            },
+        )
+        .expect("encode 3");
+        {
+            let wtx = git.begin_checked_write_tx().expect("seed gap");
+            let (applied, _) = RedbGitStore::apply_ref_cas_in_wtx(
+                &wtx,
+                &RefKey::LocalBranch {
+                    name: "main".to_string(),
+                },
+                Some(&RefTarget::Direct(oid1)),
+                Some(&RefTarget::Direct(oid3.clone())),
+                &[],
+                None,
+            )
+            .expect("cas");
+            assert!(applied);
+            RedbGitStore::write_cross_store_generation_in_wtx(&wtx, 3).expect("gen 3");
+            // Deliberately omit intent 2, inserting only intent 3.
+            RedbGitStore::write_cross_store_intent_in_wtx(&wtx, 3, &intent3_bytes)
+                .expect("intent 3");
+            wtx.commit().expect("commit gap");
+        }
+        let err_gap = reconcile_pending_intents(&git, &capture)
+            .await
+            .expect_err("missing intent 2 gap must fail closed");
+        assert_eq!(err_gap.stable_code_str(), "LBR-IO-001");
+        assert_eq!(capture.read_cross_store_generation().expect("cap 1"), 1);
+        assert!(capture.get_session("sess-f3").await.expect("get").is_none());
+        assert_eq!(
+            git.list_cross_store_intent_generations().expect("outbox"),
+            vec![3]
+        );
+
+        // Restore missing intent 2 and verify retry replays [2, 3] ascending and prunes both.
+        {
+            let wtx = git.begin_checked_write_tx().expect("restore 2");
+            RedbGitStore::write_cross_store_intent_in_wtx(&wtx, 2, &intent2_bytes)
+                .expect("intent 2");
+            wtx.commit().expect("commit");
+        }
+        let healed_gap = reconcile_pending_intents(&git, &capture)
+            .await
+            .expect("retry after restoring intent 2 succeeds");
+        assert_eq!(healed_gap.generation, 3);
+        assert_eq!(healed_gap.replayed_generations, vec![2, 3]);
+        assert_eq!(healed_gap.pruned_intents, 2);
+        assert!(capture.get_session("sess-f2").await.expect("s2").is_some());
+        assert!(capture.get_session("sess-f3").await.expect("s3").is_some());
+        assert!(
+            git.list_cross_store_intent_generations()
+                .expect("empty")
+                .is_empty()
+        );
+        let _ = oid2;
+
+        // --- Case 3: Corrupt bytes in 2nd pending intent [5] rolls back staged capture rows from [4] ---
+        let oid4 = sample_oid('4');
+        let oid5 = sample_oid('5');
+        let intent4_bytes = encode_versioned(
+            CROSS_STORE_INTENT_CODEC_VERSION,
+            &CrossStoreIntentRecord {
+                generation: 4,
+                items: vec![sample_session_item("fail:4", "sess-f4", "prov-f4", 4000)],
+            },
+        )
+        .expect("encode 4");
+        let intent5_valid_bytes = encode_versioned(
+            CROSS_STORE_INTENT_CODEC_VERSION,
+            &CrossStoreIntentRecord {
+                generation: 5,
+                items: vec![sample_session_item("fail:5", "sess-f5", "prov-f5", 5000)],
+            },
+        )
+        .expect("encode 5");
+        {
+            let wtx = git.begin_checked_write_tx().expect("seed corrupt 5");
+            let (applied, _) = RedbGitStore::apply_ref_cas_in_wtx(
+                &wtx,
+                &RefKey::LocalBranch {
+                    name: "main".to_string(),
+                },
+                Some(&RefTarget::Direct(oid3)),
+                Some(&RefTarget::Direct(oid5.clone())),
+                &[],
+                None,
+            )
+            .expect("cas");
+            assert!(applied);
+            RedbGitStore::write_cross_store_generation_in_wtx(&wtx, 5).expect("gen 5");
+            RedbGitStore::write_cross_store_intent_in_wtx(&wtx, 4, &intent4_bytes)
+                .expect("intent 4");
+            RedbGitStore::write_cross_store_intent_in_wtx(&wtx, 5, b"\xff\xffcorrupt-payload")
+                .expect("corrupt intent 5");
+            wtx.commit().expect("commit corrupt 5");
+        }
+        let err_corrupt = reconcile_pending_intents(&git, &capture)
+            .await
+            .expect_err("corrupt intent 5 must fail closed and roll back intent 4");
+        assert_eq!(err_corrupt.stable_code_str(), "LBR-IO-001");
+        assert_eq!(capture.read_cross_store_generation().expect("cap 3"), 3);
+        assert!(
+            capture
+                .get_session("sess-f4")
+                .await
+                .expect("s4 rolled back")
+                .is_none(),
+            "partially staged intent 4 rows must roll back atomically on intent 5 failure"
+        );
+        assert_eq!(
+            git.list_cross_store_intent_generations().expect("outbox"),
+            vec![4, 5],
+            "outbox [4, 5] must remain untouched after failed reconcile"
+        );
+
+        // Replace corrupt intent 5 with valid bytes and retry -> both [4, 5] heal & prune cleanly!
+        {
+            let raw = open_redb_writable(
+                &git_path,
+                DatabaseRole::Repository,
+                RedbRepairContext::Migrate,
+            )
+            .expect("open raw git");
+            let wtx = raw.begin_write().expect("wtx");
+            {
+                let mut tbl = wtx.open_table(GIT_INTENT_TABLE).expect("open");
+                tbl.insert(5u64, intent5_valid_bytes.as_slice())
+                    .expect("fix intent 5");
+            }
+            wtx.commit().expect("commit fix");
+        }
+        let healed_corrupt = reconcile_pending_intents(&git, &capture)
+            .await
+            .expect("retry after repairing intent 5 succeeds");
+        assert_eq!(healed_corrupt.generation, 5);
+        assert_eq!(healed_corrupt.replayed_generations, vec![4, 5]);
+        assert_eq!(healed_corrupt.pruned_intents, 2);
+        assert!(capture.get_session("sess-f4").await.expect("s4").is_some());
+        assert!(capture.get_session("sess-f5").await.expect("s5").is_some());
+        let _ = oid4;
+
+        // --- Case 4: Capture ahead of Git (`cap_gen > git_gen`) fails closed without pruning ---
+        {
+            let git_wtx = git.begin_checked_write_tx().expect("reseed 5");
+            RedbGitStore::write_cross_store_intent_in_wtx(&git_wtx, 5, &intent5_valid_bytes)
+                .expect("seed 5");
+            git_wtx.commit().expect("commit");
+            let cap_wtx = capture.begin_checked_write_tx().expect("cap ahead");
+            RedbCaptureStore::write_cross_store_generation_in_wtx(&cap_wtx, 6)
+                .expect("write cap_gen=6");
+            cap_wtx.commit().expect("commit cap_gen=6");
+        }
+        let err_ahead = reconcile_pending_intents(&git, &capture)
+            .await
+            .expect_err("capture ahead of git must fail closed");
+        assert_eq!(err_ahead.stable_code_str(), "LBR-IO-001");
+        assert!(is_cross_store_capture_unavailable_error(&err_ahead));
+        assert_eq!(
+            git.list_cross_store_intent_generations().expect("outbox"),
+            vec![5],
+            "failed reconcile must not prune intent 5 when capture is ahead of git"
+        );
+        // Restore cap_gen=5 and retry -> prunes [5] cleanly.
+        {
+            let cap_wtx = capture.begin_checked_write_tx().expect("cap restore 5");
+            RedbCaptureStore::write_cross_store_generation_in_wtx(&cap_wtx, 5)
+                .expect("write cap_gen=5");
+            cap_wtx.commit().expect("commit cap_gen=5");
+        }
+        let healed_ahead = reconcile_pending_intents(&git, &capture)
+            .await
+            .expect("retry after fixing cap_gen=5 succeeds");
+        assert_eq!(healed_ahead.pruned_intents, 1);
+
+        // --- Case 5: Orphan intent > git_gen both while capture is behind AND on subsequent writer ---
+        let oid6 = sample_oid('6');
+        let _ = coord
+            .commit_ref_cas_with_capture_inner(
+                &branch_cas_op("main", Some(oid5.clone()), oid6.clone()),
+                &[sample_session_item("fail:6", "sess-f6", "prov-f6", 6000)],
+                CrossStoreCommitHook::fail_after_git_commit(),
+            )
+            .await
+            .expect_err("seed partial gen=6");
+        {
+            let wtx = git.begin_checked_write_tx().expect("inject orphan 7");
+            let orphan7 = encode_versioned(
+                CROSS_STORE_INTENT_CODEC_VERSION,
+                &CrossStoreIntentRecord {
+                    generation: 7,
+                    items: Vec::new(),
+                },
+            )
+            .expect("encode orphan");
+            RedbGitStore::write_cross_store_intent_in_wtx(&wtx, 7, &orphan7)
+                .expect("insert orphan 7");
+            wtx.commit().expect("commit orphan 7");
+        }
+        // 5a: capture is behind (5 < 6) AND orphan 7 exists -> fail closed, roll back sess-f6, preserve [6, 7].
+        let err_orphan_behind = reconcile_pending_intents(&git, &capture)
+            .await
+            .expect_err("orphan intent while capture is behind must fail closed");
+        assert_eq!(err_orphan_behind.stable_code_str(), "LBR-IO-001");
+        assert!(
+            err_orphan_behind
+                .to_string()
+                .contains("orphan intent generation 7")
+        );
+        assert_eq!(capture.read_cross_store_generation().expect("cap 5"), 5);
+        assert!(capture.get_session("sess-f6").await.expect("s6").is_none());
+        assert_eq!(
+            git.list_cross_store_intent_generations().expect("outbox"),
+            vec![6, 7]
+        );
+
+        // Remove orphan 7 and reconcile -> heals gen=6 cleanly.
+        {
+            let raw = open_redb_writable(
+                &git_path,
+                DatabaseRole::Repository,
+                RedbRepairContext::Migrate,
+            )
+            .expect("open raw git");
+            let wtx = raw.begin_write().expect("wtx");
+            {
+                let mut tbl = wtx.open_table(GIT_INTENT_TABLE).expect("open");
+                assert!(tbl.remove(7u64).expect("remove orphan").is_some());
+            }
+            wtx.commit().expect("commit");
+        }
+        let healed6 = reconcile_pending_intents(&git, &capture)
+            .await
+            .expect("reconcile gen=6 after removing orphan");
+        assert_eq!(healed6.generation, 6);
+        assert_eq!(healed6.replayed_generations, vec![6]);
+        assert!(capture.get_session("sess-f6").await.expect("s6").is_some());
+
+        // 5b: Synchronized (git_gen == cap_gen == 6) with orphan 7 -> subsequent writer rejects fail-closed!
+        {
+            let wtx = git.begin_checked_write_tx().expect("inject orphan 7 again");
+            let orphan7 = encode_versioned(
+                CROSS_STORE_INTENT_CODEC_VERSION,
+                &CrossStoreIntentRecord {
+                    generation: 7,
+                    items: Vec::new(),
+                },
+            )
+            .expect("encode orphan");
+            RedbGitStore::write_cross_store_intent_in_wtx(&wtx, 7, &orphan7)
+                .expect("insert orphan 7");
+            wtx.commit().expect("commit orphan 7");
+        }
+        let err_writer_orphan = coord
+            .commit_ref_cas_with_capture(
+                &branch_cas_op("main", Some(oid6.clone()), sample_oid('7')),
+                &[sample_session_item("fail:7", "sess-f7", "prov-f7", 7000)],
+            )
+            .await
+            .expect_err("subsequent writer must reject orphan intent beyond git_gen");
+        assert_eq!(err_writer_orphan.stable_code_str(), "LBR-IO-001");
+        assert!(
+            err_writer_orphan
+                .to_string()
+                .contains("orphan intent generation 7")
+        );
+        assert_eq!(git.read_cross_store_generation().expect("git 6"), 6);
+        assert_eq!(capture.read_cross_store_generation().expect("cap 6"), 6);
+        assert_eq!(
+            git.list_cross_store_intent_generations().expect("outbox"),
+            vec![7]
+        );
+        // Clean up orphan 7 for Case 6.
+        {
+            let raw = open_redb_writable(
+                &git_path,
+                DatabaseRole::Repository,
+                RedbRepairContext::Migrate,
+            )
+            .expect("open raw git");
+            let wtx = raw.begin_write().expect("wtx");
+            {
+                let mut tbl = wtx.open_table(GIT_INTENT_TABLE).expect("open");
+                assert!(tbl.remove(7u64).expect("remove orphan").is_some());
+            }
+            wtx.commit().expect("commit");
+        }
+
+        // --- Case 6: Cancellation of `reconcile_pending_intents()` while waiting on git_wtx OR cap_wtx ---
+        let oid7 = sample_oid('7');
+        let _ = coord
+            .commit_ref_cas_with_capture_inner(
+                &branch_cas_op("main", Some(oid6), oid7),
+                &[sample_session_item("fail:7c", "sess-f7c", "prov-f7c", 7100)],
+                CrossStoreCommitHook::fail_after_git_commit(),
+            )
+            .await
+            .expect_err("seed partial gen=7");
+
+        // 6a: Cancelled while blocked on git_wtx
+        {
+            let holder_git = git.begin_checked_write_tx().expect("hold git_wtx");
+            let (entered_tx, entered_rx) = mpsc::channel::<()>();
+            let (exited_tx, exited_rx) = mpsc::channel::<()>();
+            let entered_tx = Arc::new(std::sync::Mutex::new(Some(entered_tx)));
+            let exited_tx = Arc::new(std::sync::Mutex::new(Some(exited_tx)));
+            let hook = CrossStoreCommitHook {
+                on_blocking_enter: Some(Arc::new(move || {
+                    if let Some(tx) = entered_tx.lock().expect("lock").take() {
+                        tx.send(()).expect("signal entered");
+                    }
+                })),
+                on_blocking_exit: Some(Arc::new(move || {
+                    if let Some(tx) = exited_tx.lock().expect("lock").take() {
+                        tx.send(()).expect("signal exited");
+                    }
+                })),
+                ..CrossStoreCommitHook::none()
+            };
+            let c = coord.clone();
+            let h = tokio::spawn(async move { c.reconcile_pending_intents_inner(hook).await });
+            tokio::task::spawn_blocking(move || {
+                entered_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("entered")
+            })
+            .await
+            .expect("join");
+            h.abort();
+            let _ = h.await;
+            drop(holder_git);
+            tokio::task::spawn_blocking(move || {
+                exited_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("exited")
+            })
+            .await
+            .expect("join");
+            assert_eq!(capture.read_cross_store_generation().expect("cap 6"), 6);
+            assert!(
+                capture
+                    .get_session("sess-f7c")
+                    .await
+                    .expect("s7c")
+                    .is_none()
+            );
+            assert_eq!(
+                git.list_cross_store_intent_generations().expect("outbox"),
+                vec![7]
+            );
+        }
+
+        // 6b: Cancelled while blocked on cap_wtx
+        {
+            let holder_cap = capture.begin_checked_write_tx().expect("hold cap_wtx");
+            let (got_git_tx, got_git_rx) = mpsc::channel::<u64>();
+            let (exited_tx, exited_rx) = mpsc::channel::<()>();
+            let got_git_tx = Arc::new(std::sync::Mutex::new(Some(got_git_tx)));
+            let exited_tx = Arc::new(std::sync::Mutex::new(Some(exited_tx)));
+            let hook = CrossStoreCommitHook {
+                after_git_wtx_acquired: Some(Arc::new(move |g| {
+                    if let Some(tx) = got_git_tx.lock().expect("lock").take() {
+                        tx.send(g).expect("signal git_wtx");
+                    }
+                })),
+                on_blocking_exit: Some(Arc::new(move || {
+                    if let Some(tx) = exited_tx.lock().expect("lock").take() {
+                        tx.send(()).expect("signal exited");
+                    }
+                })),
+                ..CrossStoreCommitHook::none()
+            };
+            let c = coord.clone();
+            let h = tokio::spawn(async move { c.reconcile_pending_intents_inner(hook).await });
+            let seen = tokio::task::spawn_blocking(move || {
+                got_git_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("got git")
+            })
+            .await
+            .expect("join");
+            assert_eq!(seen, 7);
+            h.abort();
+            let _ = h.await;
+            drop(holder_cap);
+            tokio::task::spawn_blocking(move || {
+                exited_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("exited")
+            })
+            .await
+            .expect("join");
+            assert_eq!(capture.read_cross_store_generation().expect("cap 6"), 6);
+            assert!(
+                capture
+                    .get_session("sess-f7c")
+                    .await
+                    .expect("s7c")
+                    .is_none()
+            );
+            assert_eq!(
+                git.list_cross_store_intent_generations().expect("outbox"),
+                vec![7]
+            );
+        }
+
+        // Retry after both cancellations heals gen=7 cleanly!
+        let healed7 = reconcile_pending_intents(&git, &capture)
+            .await
+            .expect("retry after lock-wait cancellations heals gen=7");
+        assert_eq!(healed7.generation, 7);
+        assert_eq!(healed7.replayed_generations, vec![7]);
+        assert_eq!(healed7.pruned_intents, 1);
+        assert!(
+            capture
+                .get_session("sess-f7c")
+                .await
+                .expect("s7c")
+                .is_some()
+        );
+
+        // --- Case 7 (Codex R1 P1): Worker panic payload MUST be sanitized (no private path/secret leak) ---
+        let panic_hook = CrossStoreCommitHook {
+            on_blocking_enter: Some(Arc::new(|| {
+                panic!(
+                    "simulated panic leaking /Users/secret/.libra/private/capture.redb provider-secret-token-999"
+                );
+            })),
+            ..CrossStoreCommitHook::none()
+        };
+        let panic_err = coord
+            .reconcile_pending_intents_inner(panic_hook)
+            .await
+            .expect_err("panicking worker must return sanitized error");
+        assert_eq!(panic_err.stable_code_str(), "LBR-IO-001");
+        let msg = panic_err.to_string();
+        assert!(
+            msg.contains("cross-store reconcile task panicked"),
+            "unexpected sanitized message: {msg}"
+        );
+        assert!(
+            !msg.contains("/Users/secret")
+                && !msg.contains("capture.redb")
+                && !msg.contains("provider-secret-token-999"),
+            "panic payload leaked sensitive sentinel into error: {msg}"
+        );
     }
 }
