@@ -10,6 +10,9 @@ pub(crate) struct ColorMovedWs {
     pub(crate) at_eol: bool,
     pub(crate) space_change: bool,
     pub(crate) all_space: bool,
+    /// Ignore a uniform indentation change of a moved block
+    /// (`allow-indentation-change`; mutually exclusive with the `ignore-*` modes).
+    pub(crate) allow_indentation_change: bool,
 }
 
 pub(crate) struct ResolvedDiffConfig {
@@ -41,6 +44,7 @@ pub(crate) fn parse_color_moved_ws(values: &[String]) -> Result<ColorMovedWs, Di
             "ignore-space-at-eol" => modes.at_eol = true,
             "ignore-space-change" => modes.space_change = true,
             "ignore-all-space" => modes.all_space = true,
+            "allow-indentation-change" => modes.allow_indentation_change = true,
             other => {
                 return Err(DiffError::InvalidDiffConfig {
                     key: "color-moved-ws",
@@ -48,6 +52,13 @@ pub(crate) fn parse_color_moved_ws(values: &[String]) -> Result<ColorMovedWs, Di
                 });
             }
         }
+    }
+    if modes.allow_indentation_change && (modes.at_eol || modes.space_change || modes.all_space) {
+        return Err(DiffError::InvalidDiffConfig {
+            key: "color-moved-ws",
+            value: "allow-indentation-change cannot be combined with the ignore-* modes"
+                .to_string(),
+        });
     }
     Ok(modes)
 }

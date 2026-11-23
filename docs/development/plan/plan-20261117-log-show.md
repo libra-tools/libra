@@ -1819,7 +1819,7 @@ PY
 
 ### Task LS-35: `diff` 支持 `--color-moved-ws=allow-indentation-change`（#970；自 LS-31 拆出）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-23：`ColorMovedWs.allow_indentation_change` 落地——解析接受 `allow-indentation-change`，`no` 清空其前全部模式，解析结束后与任一 `ignore-*` 同时存在则 `LBR-CLI-002`；移动行匹配在 `moved_line_bodies`/`normalize_moved_body` 中按 `trim_start()` 归一整段缩进变化。AC1–AC4 由 `command::log_test::color_moved_ws_allow_indentation_change` 覆盖（默认不着色 → `allow-indentation-change` 后出现 `1;3x` 移动色；`allow…,ignore-all-space` 拒绝；`ignore-all-space,no,allow-indentation-change` 与单用该模式逐字相同；`allow-indentation-change,no` 与不带选项逐字相同）。`diff_test`+`log_test` 全绿；EN/zh 文档与 `COMPATIBILITY.md` 同步。
 
 **Description:** 在 `LS-31` 的 `--color-moved-ws` 解析之上新增 `allow-indentation-change`：整块统一增减缩进的移动块仍识别为移动；与其它空白模式的组合按 Git 的有序解析判定——逐项解析时 `no` 清除其前全部模式，解析结束后同时含 `allow-indentation-change` 与任一 `ignore-*` 模式才报错（因此 `ignore-all-space,no,allow-indentation-change`、`allow-indentation-change,no` 均合法）。
 

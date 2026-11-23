@@ -5480,6 +5480,10 @@ fn moved_line_bodies(
         if ws.all_space {
             text = normalize_ignore_all_space(&text);
         }
+        if ws.allow_indentation_change {
+            // Only the leading indentation may differ inside a moved block.
+            text = text.trim_start().to_string();
+        }
         text
     };
     let mut removed: std::collections::HashSet<String> = std::collections::HashSet::new();

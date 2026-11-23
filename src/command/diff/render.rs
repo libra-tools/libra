@@ -800,6 +800,9 @@ fn normalize_moved_body(body: &str, ws: super::options::ColorMovedWs) -> String 
     if ws.all_space {
         text = crate::command::diff::normalize_ignore_all_space(&text);
     }
+    if ws.allow_indentation_change {
+        text = text.trim_start().to_string();
+    }
     text
 }
 

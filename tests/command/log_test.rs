@@ -9365,3 +9365,80 @@ fn color_moved_ws_modes_parse_and_clear() {
         "unknown mode code"
     );
 }
+
+#[test]
+fn color_moved_ws_allow_indentation_change() {
+    use super::{assert_cli_success, run_libra_command};
+
+    // Fixture: `aaa` moves down and gains four spaces of indentation.
+    let work = tempfile::tempdir().expect("work dir");
+    let repo = work.path().join("r");
+    std::fs::create_dir_all(&repo).expect("mkdir repo");
+    assert_cli_success(&run_libra_command(&["init"], &repo), "init");
+    run_libra_command(&["config", "set", "user.name", "t"], &repo);
+    run_libra_command(&["config", "set", "user.email", "t@t"], &repo);
+    std::fs::write(repo.join("f.txt"), "keep\naaa\nkeep2\nkeep3\n").expect("write base");
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], &repo), "add base");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c1", "--no-verify"], &repo),
+        "commit c1",
+    );
+    std::fs::write(repo.join("f.txt"), "keep\nkeep2\nkeep3\n    aaa\n").expect("write move");
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], &repo), "add move");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c2", "--no-verify"], &repo),
+        "commit c2",
+    );
+
+    let out = |args: &[&str]| {
+        let mut argv = vec!["diff", "--color=always", "--color-moved"];
+        argv.extend_from_slice(args);
+        argv.push("HEAD~1");
+        argv.push("HEAD");
+        let result = run_libra_command(&argv, &repo);
+        assert_cli_success(&result, &format!("diff {argv:?}"));
+        result.stdout
+    };
+
+    // AC1: the re-indented block is recognised as a move (bold magenta).
+    let plain = out(&[]);
+    assert!(
+        !plain.windows(5).any(|window| window == b"\x1b[1;3"),
+        "AC1 default must not mark the block moved"
+    );
+    let indented = out(&["--color-moved-ws=allow-indentation-change"]);
+    assert!(
+        indented.windows(5).any(|window| window == b"\x1b[1;3"),
+        "AC1 allow-indentation-change marks the move"
+    );
+
+    // AC2: combining with an `ignore-*` mode is rejected.
+    let bad = run_libra_command(
+        &[
+            "diff",
+            "--color-moved-ws=allow-indentation-change,ignore-all-space",
+            "HEAD~1",
+            "HEAD",
+        ],
+        &repo,
+    );
+    assert!(!bad.status.success(), "AC2 must fail");
+    assert!(
+        String::from_utf8_lossy(&bad.stderr).contains("LBR-CLI-002"),
+        "AC2 code"
+    );
+
+    // AC3: an earlier `no` clears the ignore mode, so the trailing
+    // allow-indentation-change applies alone.
+    assert_eq!(
+        out(&["--color-moved-ws=ignore-all-space,no,allow-indentation-change"]),
+        indented,
+        "AC3 no clears earlier modes"
+    );
+    // AC4: a trailing `no` clears allow-indentation-change.
+    assert_eq!(
+        out(&["--color-moved-ws=allow-indentation-change,no"]),
+        plain,
+        "AC4 trailing no"
+    );
+}
