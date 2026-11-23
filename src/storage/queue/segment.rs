@@ -841,6 +841,17 @@ enum Phase1Plan<T> {
 }
 
 impl<T> Phase1Plan<T> {
+    fn kind_label(&self) -> &'static str {
+        match self {
+            Self::Case0aFreshEmpty { .. } => "Case0aFreshEmpty",
+            Self::Case0bPreInitializedEmpty { .. } => "Case0bPreInitializedEmpty",
+            Self::CaseAClean { .. } => "CaseAClean",
+            Self::CaseCRecoverTail { .. } => "CaseCRecoverTail",
+            Self::CaseDRecoverValidSuccessor { .. } => "CaseDRecoverValidSuccessor",
+            Self::CaseDCleanOrphanSuccessor { .. } => "CaseDCleanOrphanSuccessor",
+        }
+    }
+
     fn stale_tmp_names(&self) -> &[T] {
         match self {
             Self::Case0aFreshEmpty { stale_tmp_names }
@@ -879,6 +890,10 @@ struct LaneTempCleanupCounts {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum SegmentOpEvent {
     AcquireAppendLock,
+    Phase1Classified {
+        lane: &'static str,
+        kind: &'static str,
+    },
     CreateSegment {
         lane: &'static str,
         seg_id: u32,
@@ -1051,13 +1066,23 @@ type BeforeCreateMissingLockHook = Box<dyn FnMut()>;
 type IncomingFrameWriteHook = Box<dyn FnMut(&'static str, u32, u64, usize)>;
 
 #[cfg(test)]
+type ProducerPauseHook = Box<dyn FnMut(&'static str, u32)>;
+
+#[cfg(test)]
+type CapacityCheckedHook = Box<dyn FnMut(CaptureQueueOccupancy)>;
+
+#[cfg(test)]
 pub(super) struct SegmentObserver {
     pub(super) events: Vec<SegmentOpEvent>,
     crash_point: SegmentCrashPoint,
+    append_lock_timeout_override: Option<Duration>,
     before_create_missing_lock: Option<BeforeCreateMissingLockHook>,
     simulate_foreign_reclaim_owner: bool,
     incoming_frame_write_calls: usize,
     on_incoming_frame_write: Option<IncomingFrameWriteHook>,
+    on_after_partial_frame_write: Option<ProducerPauseHook>,
+    on_after_segment_sync_before_meta: Option<ProducerPauseHook>,
+    on_after_capacity_checked: Option<CapacityCheckedHook>,
 }
 
 #[cfg(test)]
@@ -1066,43 +1091,50 @@ impl SegmentObserver {
         Self {
             events: Vec::new(),
             crash_point: SegmentCrashPoint::None,
+            append_lock_timeout_override: None,
             before_create_missing_lock: None,
             simulate_foreign_reclaim_owner: false,
             incoming_frame_write_calls: 0,
             on_incoming_frame_write: None,
+            on_after_partial_frame_write: None,
+            on_after_segment_sync_before_meta: None,
+            on_after_capacity_checked: None,
         }
     }
 
     pub(super) fn with_crash(crash_point: SegmentCrashPoint) -> Self {
         Self {
-            events: Vec::new(),
             crash_point,
-            before_create_missing_lock: None,
-            simulate_foreign_reclaim_owner: false,
-            incoming_frame_write_calls: 0,
-            on_incoming_frame_write: None,
+            ..Self::new()
         }
+    }
+
+    #[cfg_attr(not(feature = "storage-redb"), allow(dead_code))]
+    pub(super) fn with_append_lock_timeout(mut self, timeout: Duration) -> Self {
+        self.append_lock_timeout_override = Some(timeout);
+        self
+    }
+
+    fn effective_lock_timeout(&self, default: Duration) -> Duration {
+        self.append_lock_timeout_override.unwrap_or(default)
+    }
+
+    fn record_phase1_classified(&mut self, lane: &'static str, kind: &'static str) {
+        self.events
+            .push(SegmentOpEvent::Phase1Classified { lane, kind });
     }
 
     fn with_before_create_missing_lock(hook: impl FnMut() + 'static) -> Self {
         Self {
-            events: Vec::new(),
-            crash_point: SegmentCrashPoint::None,
             before_create_missing_lock: Some(Box::new(hook)),
-            simulate_foreign_reclaim_owner: false,
-            incoming_frame_write_calls: 0,
-            on_incoming_frame_write: None,
+            ..Self::new()
         }
     }
 
     fn with_foreign_reclaim_owner() -> Self {
         Self {
-            events: Vec::new(),
-            crash_point: SegmentCrashPoint::None,
-            before_create_missing_lock: None,
             simulate_foreign_reclaim_owner: true,
-            incoming_frame_write_calls: 0,
-            on_incoming_frame_write: None,
+            ..Self::new()
         }
     }
 
@@ -1110,12 +1142,60 @@ impl SegmentObserver {
         hook: impl FnMut(&'static str, u32, u64, usize) + 'static,
     ) -> Self {
         Self {
-            events: Vec::new(),
-            crash_point: SegmentCrashPoint::None,
-            before_create_missing_lock: None,
-            simulate_foreign_reclaim_owner: false,
-            incoming_frame_write_calls: 0,
             on_incoming_frame_write: Some(Box::new(hook)),
+            ..Self::new()
+        }
+    }
+
+    #[cfg_attr(not(feature = "storage-redb"), allow(dead_code))]
+    pub(super) fn with_after_partial_frame_write_hook(
+        hook: impl FnMut(&'static str, u32) + 'static,
+    ) -> Self {
+        Self {
+            on_after_partial_frame_write: Some(Box::new(hook)),
+            ..Self::new()
+        }
+    }
+
+    #[cfg_attr(not(feature = "storage-redb"), allow(dead_code))]
+    pub(super) fn with_after_segment_sync_before_meta_hook(
+        hook: impl FnMut(&'static str, u32) + 'static,
+    ) -> Self {
+        Self {
+            on_after_segment_sync_before_meta: Some(Box::new(hook)),
+            ..Self::new()
+        }
+    }
+
+    #[cfg_attr(not(feature = "storage-redb"), allow(dead_code))]
+    pub(super) fn with_after_capacity_checked_hook(
+        hook: impl FnMut(CaptureQueueOccupancy) + 'static,
+    ) -> Self {
+        Self {
+            on_after_capacity_checked: Some(Box::new(hook)),
+            ..Self::new()
+        }
+    }
+
+    fn has_after_partial_frame_write_hook(&self) -> bool {
+        self.on_after_partial_frame_write.is_some()
+    }
+
+    fn on_after_partial_frame_write(&mut self, lane: &'static str, seg_id: u32) {
+        if let Some(hook) = self.on_after_partial_frame_write.as_mut() {
+            hook(lane, seg_id);
+        }
+    }
+
+    fn on_after_segment_sync_before_meta(&mut self, lane: &'static str, seg_id: u32) {
+        if let Some(hook) = self.on_after_segment_sync_before_meta.as_mut() {
+            hook(lane, seg_id);
+        }
+    }
+
+    fn on_after_capacity_checked(&mut self, occupancy: CaptureQueueOccupancy) {
+        if let Some(hook) = self.on_after_capacity_checked.as_mut() {
+            hook(occupancy);
         }
     }
 
@@ -1381,12 +1461,22 @@ enum SegmentCrashPoint {
 }
 
 #[cfg(not(test))]
-struct SegmentObserver;
+struct SegmentObserver {
+    append_lock_timeout_override: Option<Duration>,
+}
 
 #[cfg(not(test))]
 impl SegmentObserver {
     const fn new() -> Self {
-        Self
+        Self {
+            append_lock_timeout_override: None,
+        }
+    }
+
+    const fn with_append_lock_timeout(timeout: Duration) -> Self {
+        Self {
+            append_lock_timeout_override: Some(timeout),
+        }
     }
 
     #[inline]
@@ -1545,6 +1635,20 @@ impl SegmentObserver {
         _len: usize,
     ) {
     }
+
+    #[inline]
+    fn on_after_segment_sync_before_meta(&mut self, _lane: &'static str, _seg_id: u32) {}
+
+    #[inline]
+    fn on_after_capacity_checked(&mut self, _occupancy: CaptureQueueOccupancy) {}
+
+    #[inline]
+    fn effective_lock_timeout(&self, default: Duration) -> Duration {
+        self.append_lock_timeout_override.unwrap_or(default)
+    }
+
+    #[inline]
+    fn record_phase1_classified(&mut self, _lane: &'static str, _kind: &'static str) {}
 }
 
 /// Shared incoming-frame disk write routine invoked strictly AFTER Step ①
@@ -1562,6 +1666,22 @@ fn write_incoming_frame_to_segment(
     seg_file
         .seek(SeekFrom::Start(frame_offset))
         .map_err(|e| StorageBackendError::io("seek active capture queue segment", e))?;
+    #[cfg(test)]
+    if observer.has_after_partial_frame_write_hook() && frame_buf.len() >= 2 {
+        let mid = frame_buf.len() / 2;
+        seg_file
+            .write_all(&frame_buf[..mid])
+            .map_err(|e| StorageBackendError::io("write capture queue frame", e))?;
+        observer.on_after_partial_frame_write(lane_label, seg_id);
+        seg_file
+            .write_all(&frame_buf[mid..])
+            .map_err(|e| StorageBackendError::io("write capture queue frame", e))?;
+    } else {
+        seg_file
+            .write_all(frame_buf)
+            .map_err(|e| StorageBackendError::io("write capture queue frame", e))?;
+    }
+    #[cfg(not(test))]
     seg_file
         .write_all(frame_buf)
         .map_err(|e| StorageBackendError::io("write capture queue frame", e))?;
@@ -2293,6 +2413,16 @@ pub fn recover_lane_at_root(
     recover_lane_at_root_inner(queue_root, lane, &mut observer)
 }
 
+#[cfg(not(test))]
+pub(super) fn recover_lane_at_root_with_timeout(
+    queue_root: &Path,
+    lane: CaptureQueueLane,
+    lock_timeout: Duration,
+) -> StorageResult<LaneRecoveryReport> {
+    let mut observer = SegmentObserver::with_append_lock_timeout(lock_timeout);
+    recover_lane_at_root_inner(queue_root, lane, &mut observer)
+}
+
 /// Queue-internal consumer primitive: crash-safely reclaim the oldest consumed
 /// sealed segment `seg_id` (`seg_id == min_live_seg && seg_id < active_seg &&
 /// seg_id < highwater_seg`) under shared `append.lock` (`ADR-RB-05` #4 ③,
@@ -2333,6 +2463,18 @@ pub(super) fn reclaim_sealed_segment_at_root(
     highwater_seg: u32,
 ) -> StorageResult<SegmentReclaimOutcome> {
     let mut observer = SegmentObserver::new();
+    reclaim_sealed_segment_at_root_inner(queue_root, lane, seg_id, highwater_seg, &mut observer)
+}
+
+#[cfg(not(test))]
+pub(super) fn reclaim_sealed_segment_at_root_with_timeout(
+    queue_root: &Path,
+    lane: CaptureQueueLane,
+    seg_id: u32,
+    highwater_seg: u32,
+    lock_timeout: Duration,
+) -> StorageResult<SegmentReclaimOutcome> {
+    let mut observer = SegmentObserver::with_append_lock_timeout(lock_timeout);
     reclaim_sealed_segment_at_root_inner(queue_root, lane, seg_id, highwater_seg, &mut observer)
 }
 
@@ -2589,6 +2731,27 @@ fn stream_copy_file_range_with_crc(
     }
 
     Ok(running_crc)
+}
+
+#[cfg(test)]
+#[cfg_attr(not(feature = "storage-redb"), allow(dead_code))]
+pub(super) fn append_encoded_frame_in_storage_dir_with_observer(
+    storage_dir: &Path,
+    lane: CaptureQueueLane,
+    frame_buf: &[u8],
+    options: QueueAppendOptions,
+    observer: &mut SegmentObserver,
+) -> StorageResult<SegmentAppendOutcome> {
+    let _ = decode_frame(frame_buf).map_err(|_| StorageBackendError::CorruptCommittedFrame {
+        detail: "capture queue encoded frame failed validation before append".to_string(),
+    })?;
+    append_validated_frame_in_storage_dir_with_options(
+        storage_dir,
+        lane,
+        frame_buf,
+        options,
+        observer,
+    )
 }
 
 #[cfg(test)]
@@ -3810,6 +3973,7 @@ mod unix_seg {
         let lane_fd = ctx.lane_fd;
         let lane_label = lane_dir_name(ctx.lane);
         let expected_uid = lane_expected_uid(ctx.owners, ctx.lane);
+        observer.record_phase1_classified(lane_label, plan.kind_label());
         let cleanup = clean_lane_temp_files_unix(
             ctx.lane,
             lane_fd,
@@ -5497,6 +5661,7 @@ mod unix_seg {
             owners,
         )?;
         observer.record_capacity_checked(occupancy, frame_buf.len(), max_total_bytes);
+        observer.on_after_capacity_checked(occupancy);
         let _ = enforce_queue_capacity_limit(occupancy, frame_buf.len(), max_total_bytes)?;
 
         // Step ② (b) (`ADR-RB-05` #3, `RB-08j`) + Step ③ (`RB-08g`): check
@@ -5543,6 +5708,7 @@ mod unix_seg {
         drop(seg_file);
 
         observer.maybe_crash(SegmentCrashPoint::AfterSegmentSyncData)?;
+        observer.on_after_segment_sync_before_meta(lane_label, seg_id);
 
         // AC3 + AC4: Commit `tail.meta` and `tail.meta.bak` sequentially with
         // `sync_data -> rename -> fsync_dir(lane_dir)` BEFORE releasing `append.lock`.
@@ -5577,7 +5743,7 @@ mod unix_seg {
             &lane_fd,
             owners,
             lane_uid,
-            DEFAULT_QUEUE_APPEND_LOCK_TIMEOUT,
+            observer.effective_lock_timeout(DEFAULT_QUEUE_APPEND_LOCK_TIMEOUT),
             observer,
         )?;
         let phase2_ctx = UnixPhase2Context {
@@ -5777,7 +5943,7 @@ mod unix_seg {
             &lane_fd,
             owners,
             lane_uid,
-            DEFAULT_QUEUE_APPEND_LOCK_TIMEOUT,
+            observer.effective_lock_timeout(DEFAULT_QUEUE_APPEND_LOCK_TIMEOUT),
             observer,
         )?;
 
@@ -7257,6 +7423,7 @@ mod non_unix_seg {
         ) -> StorageResult<WindowsPhase2ConvergedState> {
             let lane_dir = ctx.lane_dir;
             let lane_label = lane_dir_name(ctx.lane);
+            observer.record_phase1_classified(lane_label, plan.kind_label());
             let cleanup = clean_lane_temp_files_windows(
                 ctx.lane,
                 lane_dir,
@@ -8182,6 +8349,7 @@ mod non_unix_seg {
             let occupancy =
                 CaptureQueueOccupancy::from_parts(priority_bytes, normal_bytes, quarantine_bytes)?;
             observer.record_capacity_checked(occupancy, frame_buf.len(), max_total_bytes);
+            observer.on_after_capacity_checked(occupancy);
             let _ = enforce_queue_capacity_limit(occupancy, frame_buf.len(), max_total_bytes)?;
 
             // Step ② (b) (`ADR-RB-05` #3, `RB-08j`) + Step ③ (`RB-08g`): check
@@ -8239,6 +8407,7 @@ mod non_unix_seg {
             drop(seg_file);
 
             observer.maybe_crash(SegmentCrashPoint::AfterSegmentSyncData)?;
+            observer.on_after_segment_sync_before_meta(lane_label, seg_id);
 
             commit_dual_tail_meta_windows(&lane_dir, lane_label, &next_meta, observer)?;
 
@@ -8284,7 +8453,7 @@ mod non_unix_seg {
                 queue_root,
                 &lane_dir,
                 false,
-                DEFAULT_QUEUE_APPEND_LOCK_TIMEOUT,
+                observer.effective_lock_timeout(DEFAULT_QUEUE_APPEND_LOCK_TIMEOUT),
                 observer,
             )?;
             drop(pinned);
@@ -8351,7 +8520,7 @@ mod non_unix_seg {
                 queue_root,
                 &lane_dir,
                 false,
-                DEFAULT_QUEUE_APPEND_LOCK_TIMEOUT,
+                observer.effective_lock_timeout(DEFAULT_QUEUE_APPEND_LOCK_TIMEOUT),
                 observer,
             )?;
             drop(pinned);

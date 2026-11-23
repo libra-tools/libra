@@ -35,7 +35,9 @@ use crate::storage::queue::segment::{
     reclaim_sealed_segment_at_root_with_observer, recover_lane_at_root_with_observer,
 };
 #[cfg(not(test))]
-use crate::storage::queue::segment::{reclaim_sealed_segment_at_root, recover_lane_at_root};
+use crate::storage::queue::segment::{
+    reclaim_sealed_segment_at_root_with_timeout, recover_lane_at_root_with_timeout,
+};
 use crate::storage::{
     capture_store::{
         CaptureBatchItem, CaptureBatchPayload, CaptureQueueHighwater, CaptureQueueLane,
@@ -149,10 +151,20 @@ impl CaptureDrainReport {
 /// Exclusive non-blocking OS lock guard on `.libra/private/capture-queue/writer.lock`.
 ///
 /// Holding this guard designates the process/task as the sole active capture
-/// queue consumer. The lock is released automatically on drop.
+/// queue consumer. The underlying OS lock handle is reference-counted so any
+/// in-flight `spawn_blocking` recovery/reclamation slice retains `writer.lock`
+/// until completion even if the outer async drain future is cancelled/dropped.
 #[derive(Debug)]
 pub struct WriterLockGuard {
-    _file: File,
+    _file: std::sync::Arc<File>,
+}
+
+impl WriterLockGuard {
+    /// Clone the underlying lock handle to pin `writer.lock` for the lifetime
+    /// of an offloaded `spawn_blocking` recovery or reclamation slice (`RB-09c`).
+    fn share_lock_token(&self) -> std::sync::Arc<File> {
+        std::sync::Arc::clone(&self._file)
+    }
 }
 
 /// Attempt a non-blocking acquisition of `.libra/private/capture-queue/writer.lock`
@@ -297,13 +309,47 @@ enum WriterCrashPoint {
 }
 
 #[cfg(test)]
+type BeforeAppendLockRecoveryHook = Box<dyn FnMut(CaptureQueueLane) + Send>;
+
+#[cfg(test)]
+type AfterAppendLockRecoveryHook = Box<dyn FnMut(&LaneRecoveryReport) + Send>;
+
+#[cfg(test)]
+type BeforeAppendLockReclaimHook = Box<dyn FnMut(CaptureQueueLane, u32) + Send>;
+
+#[cfg(test)]
+type QueueBusyRetryHook = Box<dyn FnMut(usize) + Send>;
+
+#[cfg(test)]
+type BlockingSliceStartHook = std::sync::Arc<dyn Fn() + Send + Sync>;
+
+/// Per-attempt `append.lock` blocking slice offloaded to Tokio's blocking pool
+/// when the consumer coordinates recovery or segment reclamation under
+/// `writer.lock -> capture-queue/append.lock` (`RB-09c`). Keeping each slice
+/// short guarantees async runtimes (including `current_thread`) remain
+/// responsive to timers, sibling tasks, and cancellation while waiting on a
+/// long-paused producer.
+const CONSUMER_APPEND_LOCK_POLL_SLICE: Duration = Duration::from_millis(25);
+
+/// Non-blocking async backoff between `QueueBusy` retry slices.
+const CONSUMER_APPEND_LOCK_RETRY_BACKOFF: Duration = Duration::from_millis(5);
+
+#[cfg(test)]
 struct WriterObserver {
     crash_point: WriterCrashPoint,
     reclaim_crash_point: SegmentCrashPoint,
+    append_lock_slice: Option<Duration>,
+    queue_busy_retries: usize,
+    consumer_holds_append_lock: std::sync::Arc<std::sync::atomic::AtomicBool>,
     segment_events: Vec<SegmentOpEvent>,
     on_window_poll: Option<Box<dyn FnMut(usize) + Send>>,
     on_sealed_pre_commit: Option<Box<dyn FnMut(u32) + Send>>,
     simulated_elapsed_ms: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    on_before_append_lock_recovery: Option<BeforeAppendLockRecoveryHook>,
+    on_after_append_lock_recovery: Option<AfterAppendLockRecoveryHook>,
+    on_before_append_lock_reclaim: Option<BeforeAppendLockReclaimHook>,
+    on_queue_busy_retry: Option<QueueBusyRetryHook>,
+    on_recovery_blocking_slice_started: Option<BlockingSliceStartHook>,
 }
 
 #[cfg(test)]
@@ -312,10 +358,20 @@ impl Default for WriterObserver {
         Self {
             crash_point: WriterCrashPoint::None,
             reclaim_crash_point: SegmentCrashPoint::None,
+            append_lock_slice: None,
+            queue_busy_retries: 0,
+            consumer_holds_append_lock: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            )),
             segment_events: Vec::new(),
             on_window_poll: None,
             on_sealed_pre_commit: None,
             simulated_elapsed_ms: None,
+            on_before_append_lock_recovery: None,
+            on_after_append_lock_recovery: None,
+            on_before_append_lock_reclaim: None,
+            on_queue_busy_retry: None,
+            on_recovery_blocking_slice_started: None,
         }
     }
 }
@@ -325,6 +381,34 @@ impl Default for WriterObserver {
 impl WriterObserver {
     fn new() -> Self {
         Self::default()
+    }
+
+    fn with_append_lock_slice(mut self, slice: Duration) -> Self {
+        self.append_lock_slice = Some(slice);
+        self
+    }
+
+    fn with_queue_busy_retry_hook(mut self, hook: impl FnMut(usize) + Send + 'static) -> Self {
+        self.on_queue_busy_retry = Some(Box::new(hook));
+        self
+    }
+
+    fn with_recovery_blocking_slice_started_hook(
+        mut self,
+        hook: impl Fn() + Send + Sync + 'static,
+    ) -> Self {
+        self.on_recovery_blocking_slice_started = Some(std::sync::Arc::new(hook));
+        self
+    }
+
+    fn notify_queue_busy_retry(&mut self, retry_count: usize) {
+        if let Some(hook) = self.on_queue_busy_retry.as_mut() {
+            hook(retry_count);
+        }
+    }
+
+    fn consumer_holds_append_lock_handle(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        std::sync::Arc::clone(&self.consumer_holds_append_lock)
     }
 
     fn with_crash_point(crash_point: WriterCrashPoint) -> Self {
@@ -359,6 +443,26 @@ impl WriterObserver {
         }
     }
 
+    fn with_recovery_hooks(
+        before: impl FnMut(CaptureQueueLane) + Send + 'static,
+        after: impl FnMut(&LaneRecoveryReport) + Send + 'static,
+    ) -> Self {
+        Self {
+            on_before_append_lock_recovery: Some(Box::new(before)),
+            on_after_append_lock_recovery: Some(Box::new(after)),
+            ..Self::default()
+        }
+    }
+
+    fn with_before_reclaim_hook(
+        before: impl FnMut(CaptureQueueLane, u32) + Send + 'static,
+    ) -> Self {
+        Self {
+            on_before_append_lock_reclaim: Some(Box::new(before)),
+            ..Self::default()
+        }
+    }
+
     fn maybe_crash(&self, point: WriterCrashPoint) -> StorageResult<()> {
         if self.crash_point == point {
             return Err(StorageBackendError::io(
@@ -378,6 +482,24 @@ impl WriterObserver {
     fn notify_sealed_pre_commit(&mut self, seg_id: u32) {
         if let Some(hook) = self.on_sealed_pre_commit.as_mut() {
             hook(seg_id);
+        }
+    }
+
+    fn notify_before_append_lock_recovery(&mut self, lane: CaptureQueueLane) {
+        if let Some(hook) = self.on_before_append_lock_recovery.as_mut() {
+            hook(lane);
+        }
+    }
+
+    fn notify_after_append_lock_recovery(&mut self, report: &LaneRecoveryReport) {
+        if let Some(hook) = self.on_after_append_lock_recovery.as_mut() {
+            hook(report);
+        }
+    }
+
+    fn notify_before_append_lock_reclaim(&mut self, lane: CaptureQueueLane, seg_id: u32) {
+        if let Some(hook) = self.on_before_append_lock_reclaim.as_mut() {
+            hook(lane, seg_id);
         }
     }
 
@@ -430,49 +552,186 @@ const fn crash_after_commit_before_mirror() -> CrashPointToken {
 #[inline]
 const fn crash_after_commit_before_mirror() -> CrashPointToken {}
 
-fn call_reclaim_sealed_segment(
+#[cfg(test)]
+struct ConsumerAppendLockScopeGuard<'a>(&'a std::sync::atomic::AtomicBool);
+
+#[cfg(test)]
+impl<'a> ConsumerAppendLockScopeGuard<'a> {
+    fn enter(flag: &'a std::sync::atomic::AtomicBool) -> Self {
+        flag.store(true, std::sync::atomic::Ordering::Release);
+        Self(flag)
+    }
+}
+
+#[cfg(test)]
+impl Drop for ConsumerAppendLockScopeGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Delegate sealed-segment reclamation under `writer.lock -> capture-queue/append.lock`,
+/// offloading each bounded lock-wait slice onto Tokio's blocking pool so async
+/// runtimes (including `current_thread`) never stall while waiting on a paused
+/// producer (`RB-09c` AC1–AC4).
+async fn call_reclaim_sealed_segment(
     queue_root: &Path,
     lane: CaptureQueueLane,
     seg_id: u32,
     highwater_seg: u32,
+    writer_lock: &WriterLockGuard,
     observer: &mut WriterObserver,
 ) -> StorageResult<SegmentReclaimOutcome> {
     #[cfg(test)]
     {
-        let mut seg_obs = SegmentObserver::with_crash(observer.reclaim_crash_point);
-        let res = reclaim_sealed_segment_at_root_with_observer(
-            queue_root,
-            lane,
-            seg_id,
-            highwater_seg,
-            &mut seg_obs,
-        );
-        observer.segment_events.extend(seg_obs.events);
-        res
+        observer.notify_before_append_lock_reclaim(lane, seg_id);
+        let slice = observer
+            .append_lock_slice
+            .unwrap_or(CONSUMER_APPEND_LOCK_POLL_SLICE);
+        let crash_point = observer.reclaim_crash_point;
+        loop {
+            let root = queue_root.to_path_buf();
+            let writer_lock_hold = writer_lock.share_lock_token();
+            let holds_flag = std::sync::Arc::clone(&observer.consumer_holds_append_lock);
+            let (res, events) = tokio::task::spawn_blocking(move || {
+                let _writer_lock_hold = writer_lock_hold;
+                let mut seg_obs =
+                    SegmentObserver::with_crash(crash_point).with_append_lock_timeout(slice);
+                let res = {
+                    let _guard = ConsumerAppendLockScopeGuard::enter(&holds_flag);
+                    reclaim_sealed_segment_at_root_with_observer(
+                        &root,
+                        lane,
+                        seg_id,
+                        highwater_seg,
+                        &mut seg_obs,
+                    )
+                };
+                (res, seg_obs.events)
+            })
+            .await
+            .map_err(|_| StorageBackendError::BackendInternal {
+                detail: "capture queue segment reclamation blocking task aborted".to_string(),
+            })?;
+            observer.segment_events.extend(events);
+            match res {
+                Err(StorageBackendError::QueueBusy { .. }) => {
+                    observer.queue_busy_retries += 1;
+                    observer.notify_queue_busy_retry(observer.queue_busy_retries);
+                    tokio::time::sleep(CONSUMER_APPEND_LOCK_RETRY_BACKOFF).await;
+                    continue;
+                }
+                other => return other,
+            }
+        }
     }
     #[cfg(not(test))]
     {
         let _ = observer;
-        reclaim_sealed_segment_at_root(queue_root, lane, seg_id, highwater_seg)
+        loop {
+            let root = queue_root.to_path_buf();
+            let writer_lock_hold = writer_lock.share_lock_token();
+            let res = tokio::task::spawn_blocking(move || {
+                let _writer_lock_hold = writer_lock_hold;
+                reclaim_sealed_segment_at_root_with_timeout(
+                    &root,
+                    lane,
+                    seg_id,
+                    highwater_seg,
+                    CONSUMER_APPEND_LOCK_POLL_SLICE,
+                )
+            })
+            .await
+            .map_err(|_| StorageBackendError::BackendInternal {
+                detail: "capture queue segment reclamation blocking task aborted".to_string(),
+            })?;
+            match res {
+                Err(StorageBackendError::QueueBusy { .. }) => {
+                    tokio::time::sleep(CONSUMER_APPEND_LOCK_RETRY_BACKOFF).await;
+                    continue;
+                }
+                other => return other,
+            }
+        }
     }
 }
 
-fn call_recover_lane(
+/// Delegate lane tail/orphan re-verification and recovery under
+/// `writer.lock -> capture-queue/append.lock`, offloading each bounded lock-wait
+/// slice onto Tokio's blocking pool so async runtimes (including `current_thread`)
+/// remain responsive while waiting on a paused producer (`RB-09c` AC1–AC3).
+async fn call_recover_lane(
     queue_root: &Path,
     lane: CaptureQueueLane,
+    writer_lock: &WriterLockGuard,
     observer: &mut WriterObserver,
 ) -> StorageResult<LaneRecoveryReport> {
     #[cfg(test)]
     {
-        let mut seg_obs = SegmentObserver::new();
-        let res = recover_lane_at_root_with_observer(queue_root, lane, &mut seg_obs);
-        observer.segment_events.extend(seg_obs.events);
-        res
+        observer.notify_before_append_lock_recovery(lane);
+        let slice = observer
+            .append_lock_slice
+            .unwrap_or(CONSUMER_APPEND_LOCK_POLL_SLICE);
+        let on_started = observer.on_recovery_blocking_slice_started.clone();
+        loop {
+            let root = queue_root.to_path_buf();
+            let writer_lock_hold = writer_lock.share_lock_token();
+            let holds_flag = std::sync::Arc::clone(&observer.consumer_holds_append_lock);
+            let on_started_clone = on_started.clone();
+            let (res, events) = tokio::task::spawn_blocking(move || {
+                let _writer_lock_hold = writer_lock_hold;
+                if let Some(hook) = on_started_clone {
+                    hook();
+                }
+                let mut seg_obs = SegmentObserver::new().with_append_lock_timeout(slice);
+                let res = {
+                    let _guard = ConsumerAppendLockScopeGuard::enter(&holds_flag);
+                    recover_lane_at_root_with_observer(&root, lane, &mut seg_obs)
+                };
+                (res, seg_obs.events)
+            })
+            .await
+            .map_err(|_| StorageBackendError::BackendInternal {
+                detail: "capture queue lane recovery blocking task aborted".to_string(),
+            })?;
+            observer.segment_events.extend(events);
+            match res {
+                Err(StorageBackendError::QueueBusy { .. }) => {
+                    observer.queue_busy_retries += 1;
+                    observer.notify_queue_busy_retry(observer.queue_busy_retries);
+                    tokio::time::sleep(CONSUMER_APPEND_LOCK_RETRY_BACKOFF).await;
+                    continue;
+                }
+                Ok(rep) => {
+                    observer.notify_after_append_lock_recovery(&rep);
+                    return Ok(rep);
+                }
+                Err(err) => return Err(err),
+            }
+        }
     }
     #[cfg(not(test))]
     {
         let _ = observer;
-        recover_lane_at_root(queue_root, lane)
+        loop {
+            let root = queue_root.to_path_buf();
+            let writer_lock_hold = writer_lock.share_lock_token();
+            let res = tokio::task::spawn_blocking(move || {
+                let _writer_lock_hold = writer_lock_hold;
+                recover_lane_at_root_with_timeout(&root, lane, CONSUMER_APPEND_LOCK_POLL_SLICE)
+            })
+            .await
+            .map_err(|_| StorageBackendError::BackendInternal {
+                detail: "capture queue lane recovery blocking task aborted".to_string(),
+            })?;
+            match res {
+                Err(StorageBackendError::QueueBusy { .. }) => {
+                    tokio::time::sleep(CONSUMER_APPEND_LOCK_RETRY_BACKOFF).await;
+                    continue;
+                }
+                other => return other,
+            }
+        }
     }
 }
 
@@ -841,7 +1100,7 @@ async fn step_lane_once(
     options: QueueWriterOptions,
     hw_snapshot: &mut QueueHighwaterSnapshot,
     report: &mut CaptureDrainReport,
-    _writer_lock: &WriterLockGuard,
+    writer_lock: &WriterLockGuard,
     observer: &mut WriterObserver,
     last_recovery_signature: &mut Option<(u32, u64, u64, u32, u32)>,
 ) -> StorageResult<LaneStepOutcome> {
@@ -887,9 +1146,12 @@ async fn step_lane_once(
             lane,
             meta.min_live_seg,
             hw.segment_id,
+            writer_lock,
             observer,
-        )?;
+        )
+        .await?;
         report.reclaimed_segments += 1;
+        *last_recovery_signature = None;
         return Ok(LaneStepOutcome::Progressed);
     }
 
@@ -958,10 +1220,13 @@ async fn step_lane_once(
                     lane,
                     hw.segment_id,
                     hw_snapshot.get(lane).segment_id,
+                    writer_lock,
                     observer,
-                )?;
+                )
+                .await?;
                 report.reclaimed_segments += 1;
             }
+            *last_recovery_signature = None;
             return Ok(LaneStepOutcome::Progressed);
         }
 
@@ -1015,10 +1280,13 @@ async fn step_lane_once(
                 lane,
                 hw.segment_id,
                 committed_hw.segment_id,
+                writer_lock,
                 observer,
-            )?;
+            )
+            .await?;
             report.reclaimed_segments += 1;
         }
+        *last_recovery_signature = None;
         return Ok(LaneStepOutcome::Progressed);
     }
 
@@ -1201,6 +1469,7 @@ async fn step_lane_once(
         }
         observer.maybe_crash(crash_after_commit_before_mirror())?;
         write_highwater_mirror(queue_root, hw_snapshot)?;
+        *last_recovery_signature = None;
         return Ok(LaneStepOutcome::Progressed);
     }
 
@@ -1227,7 +1496,7 @@ async fn step_lane_once(
         drop(active_file);
         // Delegates under `writer.lock -> capture-queue/append.lock` without
         // modifying DB `QUEUE_HIGHWATER_*` or the external `highwater` mirror.
-        let _rec = call_recover_lane(queue_root, lane, observer)?;
+        let _rec = call_recover_lane(queue_root, lane, writer_lock, observer).await?;
         report.recovery_delegations += 1;
         return Ok(LaneStepOutcome::Progressed);
     }
@@ -1713,7 +1982,7 @@ mod unix_writer {
             let rc = unsafe { libc::flock(lock_fd.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
             if rc == 0 {
                 return Ok(Some(WriterLockGuard {
-                    _file: File::from(lock_fd),
+                    _file: std::sync::Arc::new(File::from(lock_fd)),
                 }));
             }
             let err = io::Error::last_os_error();
@@ -2229,7 +2498,9 @@ mod non_unix_writer {
                 )
             };
             if rc != 0 {
-                return Ok(Some(WriterLockGuard { _file: file }));
+                return Ok(Some(WriterLockGuard {
+                    _file: std::sync::Arc::new(file),
+                }));
             }
             let err = io::Error::last_os_error();
             if err.raw_os_error() == Some(ERROR_LOCK_VIOLATION as i32) {
@@ -2562,10 +2833,15 @@ mod tests {
             CaptureScopeState, CaptureSessionState, RedbCaptureStore,
         },
         queue::{
-            FRAME_FLAG_NONE, FRAME_FLAG_PRIORITY, QUEUE_TAIL_META_BAK_TMP_FILE,
-            QUEUE_TAIL_META_TMP_FILE, SealedSegmentMeta, append_postcard_frame, crc32c_checksum,
-            encode_postcard_frame, highwater::read_highwater_mirror, init_capture_queue,
-            read_converged_lane_tail_meta, tail_meta_bak_path, tail_meta_path,
+            CaptureQueueOccupancy, FRAME_FLAG_NONE, FRAME_FLAG_PRIORITY,
+            QUEUE_TAIL_META_BAK_TMP_FILE, QUEUE_TAIL_META_TMP_FILE, QueueAppendOptions,
+            SealedSegmentMeta, append_postcard_frame, crc32c_checksum, encode_postcard_frame,
+            highwater::read_highwater_mirror,
+            init_capture_queue, read_converged_lane_tail_meta,
+            segment::{
+                append_encoded_frame_in_storage_dir_with_observer, reclaim_sealed_segment_at_root,
+            },
+            tail_meta_bak_path, tail_meta_path,
         },
     };
 
@@ -2577,16 +2853,84 @@ mod tests {
         item_count: usize,
         dedup_keys: Vec<String>,
         highwater: CaptureQueueHighwater,
+        append_lock_was_free: bool,
+    }
+
+    /// Non-blocking OS-level probe returning `true` iff `capture-queue/append.lock`
+    /// is currently uncontended (or absent), supported on BOTH Unix (`flock`) and
+    /// Windows (`LockFileEx`).
+    fn probe_append_lock_is_free(queue_root: &Path) -> bool {
+        let lock_path = queue_root.join(crate::storage::queue::QUEUE_APPEND_LOCK_FILE);
+        if !lock_path.exists() {
+            return true;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd as _;
+            let file = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&lock_path)
+                .expect("open append.lock for non-blocking probe");
+            // SAFETY: `file` is valid.
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            rc == 0
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle as _;
+            use windows_sys::Win32::{
+                Foundation::{ERROR_LOCK_VIOLATION, HANDLE},
+                Storage::FileSystem::{
+                    LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
+                },
+                System::IO::OVERLAPPED,
+            };
+            let file = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&lock_path)
+                .expect("open append.lock for Windows non-blocking probe");
+            let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+            // SAFETY: `file` is valid and `overlapped` is zero-initialized.
+            let rc = unsafe {
+                LockFileEx(
+                    file.as_raw_handle() as HANDLE,
+                    LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                    0,
+                    u32::MAX,
+                    u32::MAX,
+                    &mut overlapped,
+                )
+            };
+            if rc != 0 {
+                true
+            } else {
+                let err = io::Error::last_os_error();
+                assert_eq!(
+                    err.raw_os_error(),
+                    Some(ERROR_LOCK_VIOLATION as i32),
+                    "unexpected Windows LockFileEx probe error: {err:?}"
+                );
+                false
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            true
+        }
     }
 
     /// Spy wrapper delegating every `CaptureStore` / `AgentBridgeStore` call to
     /// a real `RedbCaptureStore` while recording exact `append_capture_batch`
     /// call order and asserting `writer.lock` IS held while `append.lock` is
-    /// NEVER held across DB writes (`GC-RB-04`).
+    /// NEVER held by the consumer across DB writes (`GC-RB-04`).
     struct SpyCaptureStore {
         inner: RedbCaptureStore,
         queue_root: PathBuf,
         calls: Arc<Mutex<Vec<RecordedBatchCall>>>,
+        consumer_holds_append_lock: Option<Arc<std::sync::atomic::AtomicBool>>,
+        external_append_lock_held: Option<Arc<std::sync::atomic::AtomicBool>>,
     }
 
     impl SpyCaptureStore {
@@ -2595,6 +2939,21 @@ mod tests {
                 inner,
                 queue_root,
                 calls: Arc::new(Mutex::new(Vec::new())),
+                consumer_holds_append_lock: None,
+                external_append_lock_held: None,
+            }
+        }
+
+        fn new_with_lock_tracking(
+            inner: RedbCaptureStore,
+            queue_root: PathBuf,
+            consumer_holds_append_lock: Arc<std::sync::atomic::AtomicBool>,
+            external_append_lock_held: Arc<std::sync::atomic::AtomicBool>,
+        ) -> Self {
+            Self {
+                consumer_holds_append_lock: Some(consumer_holds_append_lock),
+                external_append_lock_held: Some(external_append_lock_held),
+                ..Self::new(inner, queue_root)
             }
         }
 
@@ -2604,33 +2963,31 @@ mod tests {
 
         /// Assert `writer.lock` IS held and `capture-queue/append.lock` is NOT
         /// held by the consumer while executing `CaptureStore::append_capture_batch`.
-        fn assert_lock_invariants_during_db_write(&self) {
+        /// Returns whether the OS `append.lock` file was uncontended during the DB write.
+        fn assert_lock_invariants_during_db_write(&self) -> bool {
             assert!(
                 is_writer_active_at_root(&self.queue_root)
                     .expect("probe writer.lock during DB write"),
                 "consumer must hold capture-queue/writer.lock during CaptureStore::append_capture_batch"
             );
-            #[cfg(unix)]
-            {
-                use std::os::unix::io::AsRawFd as _;
-                let lock_path = self
-                    .queue_root
-                    .join(crate::storage::queue::QUEUE_APPEND_LOCK_FILE);
-                if lock_path.exists() {
-                    let file = fs::OpenOptions::new()
-                        .read(true)
-                        .write(true)
-                        .open(&lock_path)
-                        .expect("open append.lock for non-blocking probe");
-                    // SAFETY: `file` is valid.
-                    let rc =
-                        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-                    assert_eq!(
-                        rc, 0,
-                        "consumer must NEVER hold capture-queue/append.lock during CaptureStore::append_capture_batch"
-                    );
-                }
+            if let Some(ref consumer_held) = self.consumer_holds_append_lock {
+                assert!(
+                    !consumer_held.load(std::sync::atomic::Ordering::Acquire),
+                    "consumer must NEVER hold capture-queue/append.lock during CaptureStore::append_capture_batch"
+                );
             }
+            let append_lock_free = probe_append_lock_is_free(&self.queue_root);
+            if !append_lock_free {
+                let external_allowed = self
+                    .external_append_lock_held
+                    .as_ref()
+                    .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire));
+                assert!(
+                    external_allowed,
+                    "consumer must NEVER hold capture-queue/append.lock during CaptureStore::append_capture_batch (no active external producer lock holder)"
+                );
+            }
+            append_lock_free
         }
     }
 
@@ -2754,7 +3111,7 @@ mod tests {
             items: &[CaptureBatchItem],
             highwater_advance: Option<(CaptureQueueLane, CaptureQueueHighwater)>,
         ) -> StorageResult<CaptureBatchOutcome> {
-            self.assert_lock_invariants_during_db_write();
+            let append_lock_was_free = self.assert_lock_invariants_during_db_write();
             let outcome = self
                 .inner
                 .append_capture_batch(items, highwater_advance)
@@ -2768,6 +3125,7 @@ mod tests {
                         item_count: items.len(),
                         dedup_keys: items.iter().map(|i| i.dedup_key.clone()).collect(),
                         highwater: outcome.highwater.unwrap_or(hw),
+                        append_lock_was_free,
                     });
             }
             Ok(outcome)
@@ -6373,6 +6731,1164 @@ mod tests {
                     "AC5c ({lane_label}): reclaim violated strict durability ordering! events = {evs:?}"
                 );
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn consumer_waits_for_append_lock_and_does_not_quarantine_paused_producer() {
+        // `RB-09c` AC1, AC2 & AC3 (`ADR-RB-05` #4, `GC-RB-04`):
+        // - AC1: Consumer acquires `writer.lock` BEFORE `capture-queue/append.lock`,
+        //   never holds `append.lock` across `CaptureStore::append_capture_batch`,
+        //   and producers NEVER acquire `writer.lock`.
+        // - AC2: While a concurrent producer holds `append.lock`, writes uncommitted
+        //   bytes to `offset >= committed_len`, and pauses BEFORE `LTM2` commit
+        //   (tested at BOTH mid-write partial bytes before `sync_data` AND full
+        //   post-`sync_data` pre-`LTM2`), the concurrent consumer consumes ONLY
+        //   `< committed_len` into DB and blocks on `append.lock`, NEVER
+        //   quarantining in-flight bytes (`0` `LBR-AGENT-050`) and NEVER skipping
+        //   or rotating the active segment.
+        // - AC3: Once the paused producer resumes, finishes `sync_data` + dual
+        //   `LTM2` commit, and releases `append.lock`, the consumer re-reads the
+        //   advanced `LTM2` inside `append.lock`, sees `CaseAClean`, and ingests
+        //   the newly committed frame 100% losslessly with `quarantine/` empty.
+        for lane in [CaptureQueueLane::Normal, CaptureQueueLane::Priority] {
+            let lane_label = lane_subdir_name(lane);
+            let flags = match lane {
+                CaptureQueueLane::Priority => FRAME_FLAG_PRIORITY,
+                CaptureQueueLane::Normal => FRAME_FLAG_NONE,
+            };
+            let payload_for = |tag: &str, seq: i64| match lane {
+                CaptureQueueLane::Priority => {
+                    make_session_payload(tag, CaptureSessionState::Stopped, 1_700_030_000 + seq)
+                }
+                CaptureQueueLane::Normal => make_audit_payload(tag, "2026-11-24T04:00:00Z"),
+            };
+
+            let repo = tempdir().expect("tempdir");
+            let init = init_capture_queue(repo.path()).expect("init capture queue");
+            let lane_dir = match lane {
+                CaptureQueueLane::Normal => init.paths.normal.clone(),
+                CaptureQueueLane::Priority => init.paths.priority.clone(),
+            };
+            let store = RedbCaptureStore::create(
+                repo.path()
+                    .join(PRIVATE_SUBDIR)
+                    .join("capture.gen-0001.redb"),
+            )
+            .await
+            .expect("create RedbCaptureStore");
+
+            // Seed 3 already-committed frames (`f0..f2`, `committed_len = l3`).
+            let mut l3 = 0u64;
+            let mut expected_payloads = Vec::new();
+            let mut expected_dedups = Vec::new();
+            for i in 0..3u32 {
+                let dk = format!("rb09c:{lane_label}:committed:{i}");
+                let pl = payload_for(&format!("rb09c-{lane_label}-c-{i}"), i64::from(i));
+                let out = append_postcard_frame(
+                    repo.path(),
+                    lane,
+                    flags,
+                    &dk,
+                    CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                    &pl,
+                )
+                .expect("enqueue committed prefix frame");
+                assert_eq!(out.seg_id, 0);
+                l3 = out.meta.committed_len;
+                expected_dedups.push(dk);
+                expected_payloads.push(pl);
+            }
+            let seg0_path = lane_dir.join(segment_log_file_name(0));
+            let seg1_path = lane_dir.join(segment_log_file_name(1));
+
+            // =================================================================
+            // Phase A: Producer pauses AFTER writing PARTIAL half-frame bytes
+            // at `offset == l3` (before `sync_data` and before `LTM2` commit)
+            // for LONGER than a single `append.lock` timeout slice (160ms > 40ms),
+            // proving the consumer retries across `QueueBusy`, never exits or
+            // quarantines, explicitly classifies `CaseAClean`, and persists the
+            // exact payload & dedup key losslessly.
+            // =================================================================
+            let f3_dedup = format!("rb09c:{lane_label}:paused-partial");
+            let f3_payload = payload_for(&format!("rb09c-{lane_label}-partial-3"), 3);
+            let f3_bytes = encode_postcard_frame(
+                flags,
+                &f3_dedup,
+                CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                &f3_payload,
+            )
+            .expect("encode f3");
+            let f3_mid = f3_bytes.len() / 2;
+            let expected_l4 = l3 + f3_bytes.len() as u64;
+
+            let external_lock_held_a = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let external_lock_prod_a = Arc::clone(&external_lock_held_a);
+            let (prod_paused_tx, prod_paused_rx) = std::sync::mpsc::channel::<()>();
+            let (prod_release_tx, prod_release_rx) = std::sync::mpsc::channel::<()>();
+            let prod_repo = repo.path().to_path_buf();
+            let prod_f3 = f3_bytes.clone();
+            let prod_handle = std::thread::spawn(move || {
+                let mut obs = SegmentObserver::with_after_partial_frame_write_hook(
+                    move |_lane_name, seg_id| {
+                        assert_eq!(seg_id, 0);
+                        external_lock_prod_a.store(true, std::sync::atomic::Ordering::Release);
+                        prod_paused_tx.send(()).expect("signal producer paused");
+                        prod_release_rx
+                            .recv()
+                            .expect("wait for producer release signal");
+                    },
+                );
+                append_encoded_frame_in_storage_dir_with_observer(
+                    &prod_repo,
+                    lane,
+                    &prod_f3,
+                    QueueAppendOptions::default(),
+                    &mut obs,
+                )
+            });
+
+            // Wait until producer holds `append.lock` and has written partial bytes.
+            prod_paused_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("producer must reach partial-write pause point");
+            assert!(
+                external_lock_held_a.load(std::sync::atomic::Ordering::Acquire),
+                "producer pause-barrier handshake must be active while paused"
+            );
+            assert!(
+                !is_writer_active(repo.path()).expect("probe writer.lock while producer paused"),
+                "AC1 violated: producer must NEVER acquire writer.lock"
+            );
+            assert_eq!(
+                fs::metadata(&seg0_path).unwrap().len(),
+                l3 + f3_mid as u64,
+                "in-flight partial frame bytes must be visible on disk at offset >= committed_len"
+            );
+            assert_eq!(
+                read_converged_lane_tail_meta(&lane_dir)
+                    .unwrap()
+                    .committed_len,
+                l3
+            );
+
+            // Launch concurrent consumer on a `current_thread` Tokio runtime
+            // alongside a non-catching-up (`MissedTickBehavior::Skip`) 10ms timer.
+            // Because `append_lock_slice = 80ms`, `ticks_before_first_busy` is
+            // sampled strictly BEFORE any async retry backoff runs (`retry_n == 1`):
+            // a synchronous blocking lock wait would yield 0 ticks, whereas
+            // `spawn_blocking` allows >= 4 real timer ticks during the very first slice.
+            let (entering_lock_tx, entering_lock_rx) = std::sync::mpsc::channel::<()>();
+            let (busy_observed_tx, busy_observed_rx) = std::sync::mpsc::channel::<usize>();
+            let recovery_reports = Arc::new(Mutex::new(Vec::<LaneRecoveryReport>::new()));
+            let recovery_reports_hook = Arc::clone(&recovery_reports);
+            let consumer_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let consumer_done_flag = Arc::clone(&consumer_done);
+            let async_ticks_during_wait = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let async_ticks_task = Arc::clone(&async_ticks_during_wait);
+            let async_ticks_on_retry1 = Arc::clone(&async_ticks_during_wait);
+            let ticks_before_first_busy = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let ticks_before_first_busy_hook = Arc::clone(&ticks_before_first_busy);
+            let consumer_root = init.paths.root.clone();
+            let consumer_root_hook = init.paths.root.clone();
+            let consumer_store = store.clone();
+            let consumer_ext_flag_a = Arc::clone(&external_lock_held_a);
+
+            let consumer_handle = std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build current_thread consumer runtime");
+                rt.block_on(async move {
+                    let lock = try_acquire_writer_lock_at_root(&consumer_root)
+                        .expect("consumer acquire writer.lock")
+                        .expect("writer.lock must be uncontended by producer");
+                    let wait_active = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let wait_active_enter = Arc::clone(&wait_active);
+                    let wait_active_exit = Arc::clone(&wait_active);
+                    let wait_active_ticker = Arc::clone(&wait_active);
+                    let mut obs = WriterObserver::with_recovery_hooks(
+                        move |rec_lane| {
+                            assert_eq!(rec_lane, lane);
+                            assert!(
+                                is_writer_active_at_root(&consumer_root_hook)
+                                    .expect("probe writer.lock before append.lock"),
+                                "AC1 violated: consumer must hold writer.lock before requesting append.lock"
+                            );
+                            wait_active_enter.store(true, std::sync::atomic::Ordering::Release);
+                            entering_lock_tx
+                                .send(())
+                                .expect("signal consumer entering append.lock");
+                        },
+                        move |rep| {
+                            wait_active_exit.store(false, std::sync::atomic::Ordering::Release);
+                            recovery_reports_hook
+                                .lock()
+                                .expect("lock recovery reports")
+                                .push(rep.clone());
+                        },
+                    )
+                    .with_append_lock_slice(Duration::from_millis(80))
+                    .with_queue_busy_retry_hook(move |retry_n| {
+                        if retry_n == 1 {
+                            ticks_before_first_busy_hook.store(
+                                async_ticks_on_retry1.load(std::sync::atomic::Ordering::Acquire),
+                                std::sync::atomic::Ordering::Release,
+                            );
+                        }
+                        if retry_n == 2 {
+                            let _ = busy_observed_tx.send(retry_n);
+                        }
+                    });
+                    let spy = SpyCaptureStore::new_with_lock_tracking(
+                        consumer_store.clone(),
+                        consumer_root.clone(),
+                        obs.consumer_holds_append_lock_handle(),
+                        consumer_ext_flag_a,
+                    );
+                    let drain_finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let drain_finished_ticker = Arc::clone(&drain_finished);
+                    let drain_fut = async {
+                        let rep = drain_locked_at_root(
+                            &consumer_root,
+                            &spy,
+                            QueueWriterOptions::default(),
+                            &lock,
+                            &mut obs,
+                        )
+                        .await
+                        .expect("consumer drain must survive QueueBusy slices and succeed after paused producer commits");
+                        drain_finished.store(true, std::sync::atomic::Ordering::Release);
+                        rep
+                    };
+                    let ticker_fut = async move {
+                        let mut interval = tokio::time::interval(Duration::from_millis(10));
+                        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                        // Consume the immediate t=0 first tick so every counted tick
+                        // reflects genuine elapsed runtime scheduling progress.
+                        interval.tick().await;
+                        while !drain_finished_ticker.load(std::sync::atomic::Ordering::Acquire) {
+                            interval.tick().await;
+                            if wait_active_ticker.load(std::sync::atomic::Ordering::Acquire) {
+                                async_ticks_task
+                                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                            }
+                        }
+                    };
+                    let (rep, ()) = tokio::join!(drain_fut, ticker_fut);
+                    drop(lock);
+                    consumer_done_flag.store(true, std::sync::atomic::Ordering::Release);
+                    (
+                        rep,
+                        spy.recorded_calls(),
+                        obs.segment_events,
+                        obs.queue_busy_retries,
+                    )
+                })
+            });
+
+            // Deterministically wait until consumer drained `< committed_len` (f0..f2),
+            // entered `recover_lane`, AND observed >= 2 `QueueBusy` retry slices!
+            entering_lock_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("consumer must drain committed prefix and enter append.lock wait");
+            let observed_retry = busy_observed_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("consumer must deterministically observe >= 2 QueueBusy retry slices");
+            assert!(observed_retry >= 2);
+
+            // AC2 assertions while producer is STILL paused holding `append.lock`:
+            assert!(
+                !consumer_done.load(std::sync::atomic::Ordering::Acquire),
+                "AC2 ({lane_label}): consumer must keep waiting on append.lock past single-slice deadline while producer is paused"
+            );
+            let first_slice_ticks =
+                ticks_before_first_busy.load(std::sync::atomic::Ordering::Acquire);
+            assert!(
+                first_slice_ticks >= 4,
+                "AC1/AC2 ({lane_label}): MissedTickBehavior::Skip 10ms timer must tick >= 4 times INSIDE the very first 80ms spawn_blocking wait before any async backoff runs (got {first_slice_ticks})"
+            );
+            assert!(
+                is_writer_active(repo.path()).unwrap(),
+                "AC1 ({lane_label}): consumer must hold writer.lock while waiting on append.lock"
+            );
+            assert_eq!(
+                store.get_queue_highwater(lane).await.unwrap(),
+                CaptureQueueHighwater {
+                    segment_id: 0,
+                    byte_offset: l3,
+                },
+                "AC2 ({lane_label}): consumer must commit strictly < committed_len before blocking"
+            );
+            assert_eq!(
+                fs::read_dir(&init.paths.quarantine).unwrap().count(),
+                0,
+                "AC2 ({lane_label}): paused producer in-flight bytes must NEVER be quarantined"
+            );
+            assert_eq!(
+                fs::metadata(&seg0_path).unwrap().len(),
+                l3 + f3_mid as u64,
+                "AC2 ({lane_label}): consumer must NOT truncate paused producer's in-flight bytes"
+            );
+            assert!(
+                !seg1_path.exists(),
+                "AC2 ({lane_label}): consumer must NOT skip or rotate active segment 0"
+            );
+
+            // AC3: Clear the pause-barrier flag BEFORE releasing producer (consumer is
+            // blocked inside append.lock retries, NOT in any DB write), so Batch 2 is
+            // guaranteed to run with `external_lock_held_a == false` and zero gap!
+            external_lock_held_a.store(false, std::sync::atomic::Ordering::Release);
+            prod_release_tx.send(()).expect("release paused producer");
+            let prod_out = prod_handle
+                .join()
+                .expect("join producer thread")
+                .expect("paused producer append must succeed");
+            assert_eq!(prod_out.seg_id, 0);
+            assert_eq!(prod_out.meta.committed_len, expected_l4);
+
+            let (rep, calls, seg_events_a, busy_retries_a) =
+                consumer_handle.join().expect("join consumer thread");
+            assert!(
+                busy_retries_a >= 1,
+                "AC2/AC3 ({lane_label}): consumer must have retried across >= 1 QueueBusy deadline slice without aborting (got {busy_retries_a})"
+            );
+            assert!(rep.acquired_writer_lock);
+            assert_eq!(rep.applied_frames, 4);
+            assert_eq!(rep.deduplicated_frames, 0);
+            assert_eq!(rep.recovery_delegations, 1);
+            assert_eq!(calls.len(), 2, "batch 1 = f0..f2 (< l3), batch 2 = f3");
+            assert_eq!(calls[0].item_count, 3);
+            assert_eq!(calls[0].dedup_keys, expected_dedups);
+            assert!(
+                !calls[0].append_lock_was_free,
+                "AC1 ({lane_label}): batch 1 must have committed while producer held append.lock"
+            );
+            assert_eq!(calls[1].item_count, 1);
+            assert_eq!(calls[1].dedup_keys, vec![f3_dedup.clone()]);
+            assert!(
+                calls[1].append_lock_was_free,
+                "AC1 ({lane_label}): OS kernel must prove append.lock is FREE during batch 2 DB write (no consumer lock leak)"
+            );
+
+            // Explicit `Phase1Classified { kind: "CaseAClean" }` observation!
+            assert!(
+                seg_events_a.contains(&SegmentOpEvent::Phase1Classified {
+                    lane: lane_label,
+                    kind: "CaseAClean",
+                }),
+                "AC3 ({lane_label}): Phase A recovery must explicitly classify CaseAClean; events = {seg_events_a:?}"
+            );
+            let recs = recovery_reports.lock().unwrap().clone();
+            assert_eq!(recs.len(), 1);
+            assert_eq!(recs[0].recovered_frames, 0);
+            assert!(
+                recs[0].quarantined_artifacts.is_empty(),
+                "AC2/AC3 ({lane_label}): zero LBR-AGENT-050 quarantine artifacts expected"
+            );
+            assert_eq!(recs[0].meta.active_seg, 0);
+            assert_eq!(recs[0].meta.committed_len, expected_l4);
+
+            // All 4 frames (incl. paused f3) persisted with EXACT payload equality!
+            assert_eq!(fs::read_dir(&init.paths.quarantine).unwrap().count(), 0);
+            assert!(!seg1_path.exists());
+            let hw_after_a = CaptureQueueHighwater {
+                segment_id: 0,
+                byte_offset: expected_l4,
+            };
+            assert_eq!(store.get_queue_highwater(lane).await.unwrap(), hw_after_a);
+            assert_eq!(
+                read_highwater_mirror(&init.paths.root)
+                    .unwrap()
+                    .unwrap()
+                    .get(lane),
+                hw_after_a
+            );
+            expected_payloads.push(f3_payload.clone());
+            for expected in &expected_payloads {
+                match expected {
+                    CaptureBatchPayload::AppendAuditLog(rec) => {
+                        let got = store
+                            .get_audit_log(&rec.audit_id)
+                            .await
+                            .unwrap()
+                            .expect("persisted audit log must exist by exact id");
+                        assert_eq!(
+                            &got, rec,
+                            "AC3 ({lane_label}): persisted audit payload mismatch"
+                        );
+                    }
+                    CaptureBatchPayload::UpsertSession(rec) => {
+                        let got = store
+                            .get_session(&rec.session_id)
+                            .await
+                            .unwrap()
+                            .expect("persisted session must exist by exact id");
+                        assert_eq!(
+                            &got, rec,
+                            "AC3 ({lane_label}): persisted session payload mismatch"
+                        );
+                    }
+                    other => panic!("unexpected test payload variant: {other:?}"),
+                }
+            }
+
+            // =================================================================
+            // Phase B: Producer pauses AFTER full `write_all` + `sync_data()`
+            // and strictly BEFORE `commit_dual_tail_meta` (f4), again beyond
+            // a single `append.lock` timeout slice (160ms > 40ms).
+            // =================================================================
+            let f4_dedup = format!("rb09c:{lane_label}:paused-post-sync");
+            let f4_payload = payload_for(&format!("rb09c-{lane_label}-sync-4"), 4);
+            let f4_bytes = encode_postcard_frame(
+                flags,
+                &f4_dedup,
+                CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                &f4_payload,
+            )
+            .expect("encode f4");
+            let expected_l5 = expected_l4 + f4_bytes.len() as u64;
+
+            let external_lock_held_b = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let external_lock_prod_b = Arc::clone(&external_lock_held_b);
+            let (prod_paused_tx2, prod_paused_rx2) = std::sync::mpsc::channel::<()>();
+            let (prod_release_tx2, prod_release_rx2) = std::sync::mpsc::channel::<()>();
+            let prod_repo2 = repo.path().to_path_buf();
+            let prod_f4 = f4_bytes.clone();
+            let prod_handle2 = std::thread::spawn(move || {
+                let mut obs = SegmentObserver::with_after_segment_sync_before_meta_hook(
+                    move |_lane_name, seg_id| {
+                        assert_eq!(seg_id, 0);
+                        external_lock_prod_b.store(true, std::sync::atomic::Ordering::Release);
+                        prod_paused_tx2
+                            .send(())
+                            .expect("signal producer paused post-sync");
+                        prod_release_rx2
+                            .recv()
+                            .expect("wait for producer release 2");
+                    },
+                );
+                append_encoded_frame_in_storage_dir_with_observer(
+                    &prod_repo2,
+                    lane,
+                    &prod_f4,
+                    QueueAppendOptions::default(),
+                    &mut obs,
+                )
+            });
+
+            prod_paused_rx2
+                .recv_timeout(Duration::from_secs(5))
+                .expect("producer must reach post-sync pre-LTM2 pause point");
+            assert!(external_lock_held_b.load(std::sync::atomic::Ordering::Acquire));
+            assert_eq!(fs::metadata(&seg0_path).unwrap().len(), expected_l5);
+            assert_eq!(
+                read_converged_lane_tail_meta(&lane_dir)
+                    .unwrap()
+                    .committed_len,
+                expected_l4
+            );
+
+            let (entering_lock_tx2, entering_lock_rx2) = std::sync::mpsc::channel::<()>();
+            let (busy_observed_tx2, busy_observed_rx2) = std::sync::mpsc::channel::<usize>();
+            let consumer_done2 = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let consumer_done_flag2 = Arc::clone(&consumer_done2);
+            let consumer_root2 = init.paths.root.clone();
+            let consumer_store2 = store.clone();
+            let consumer_ext_flag_b = Arc::clone(&external_lock_held_b);
+            let consumer_handle2 = std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build consumer runtime 2");
+                rt.block_on(async move {
+                    let lock = try_acquire_writer_lock_at_root(&consumer_root2)
+                        .unwrap()
+                        .unwrap();
+                    let mut obs = WriterObserver::with_recovery_hooks(
+                        move |_lane| {
+                            entering_lock_tx2
+                                .send(())
+                                .expect("signal consumer entering append.lock 2");
+                        },
+                        move |rep| {
+                            assert_eq!(rep.recovered_frames, 0);
+                            assert!(rep.quarantined_artifacts.is_empty());
+                        },
+                    )
+                    .with_append_lock_slice(Duration::from_millis(25))
+                    .with_queue_busy_retry_hook(move |retry_n| {
+                        if retry_n == 2 {
+                            let _ = busy_observed_tx2.send(retry_n);
+                        }
+                    });
+                    let spy = SpyCaptureStore::new_with_lock_tracking(
+                        consumer_store2,
+                        consumer_root2.clone(),
+                        obs.consumer_holds_append_lock_handle(),
+                        consumer_ext_flag_b,
+                    );
+                    let rep = drain_locked_at_root(
+                        &consumer_root2,
+                        &spy,
+                        QueueWriterOptions::default(),
+                        &lock,
+                        &mut obs,
+                    )
+                    .await
+                    .expect("phase B consumer drain must succeed across QueueBusy slices");
+                    drop(lock);
+                    consumer_done_flag2.store(true, std::sync::atomic::Ordering::Release);
+                    (
+                        rep,
+                        spy.recorded_calls(),
+                        obs.segment_events,
+                        obs.queue_busy_retries,
+                    )
+                })
+            });
+
+            entering_lock_rx2
+                .recv_timeout(Duration::from_secs(5))
+                .expect("consumer must block on append.lock in Phase B");
+            let observed_retry2 = busy_observed_rx2
+                .recv_timeout(Duration::from_secs(5))
+                .expect("Phase B consumer must deterministically observe >= 2 QueueBusy retries");
+            assert!(observed_retry2 >= 2);
+            assert!(!consumer_done2.load(std::sync::atomic::Ordering::Acquire));
+            assert_eq!(fs::read_dir(&init.paths.quarantine).unwrap().count(), 0);
+            assert!(!seg1_path.exists());
+
+            external_lock_held_b.store(false, std::sync::atomic::Ordering::Release);
+            prod_release_tx2
+                .send(())
+                .expect("release paused producer 2");
+            let prod_out2 = prod_handle2.join().unwrap().unwrap();
+            assert_eq!(prod_out2.meta.committed_len, expected_l5);
+
+            let (rep2, calls_b, seg_events_b, busy_retries_b) = consumer_handle2.join().unwrap();
+            assert!(
+                busy_retries_b >= 1,
+                "AC2/AC3 Phase B ({lane_label}): consumer must retry across QueueBusy slices (got {busy_retries_b})"
+            );
+            assert_eq!(rep2.applied_frames, 1);
+            assert_eq!(rep2.deduplicated_frames, 0);
+            assert_eq!(rep2.recovery_delegations, 1);
+            assert_eq!(calls_b.len(), 1);
+            assert_eq!(calls_b[0].dedup_keys, vec![f4_dedup]);
+            assert!(
+                calls_b[0].append_lock_was_free,
+                "AC1 Phase B ({lane_label}): OS kernel must prove append.lock is FREE during DB write"
+            );
+            assert!(
+                seg_events_b.contains(&SegmentOpEvent::Phase1Classified {
+                    lane: lane_label,
+                    kind: "CaseAClean",
+                }),
+                "AC3 Phase B ({lane_label}): recovery must explicitly classify CaseAClean; events = {seg_events_b:?}"
+            );
+            assert_eq!(fs::read_dir(&init.paths.quarantine).unwrap().count(), 0);
+            assert!(!seg1_path.exists());
+            assert_eq!(
+                store.get_queue_highwater(lane).await.unwrap(),
+                CaptureQueueHighwater {
+                    segment_id: 0,
+                    byte_offset: expected_l5,
+                }
+            );
+            match &f4_payload {
+                CaptureBatchPayload::AppendAuditLog(rec) => {
+                    let got = store
+                        .get_audit_log(&rec.audit_id)
+                        .await
+                        .unwrap()
+                        .expect("Phase B persisted audit log must exist by exact id");
+                    assert_eq!(&got, rec);
+                }
+                CaptureBatchPayload::UpsertSession(rec) => {
+                    let got = store
+                        .get_session(&rec.session_id)
+                        .await
+                        .unwrap()
+                        .expect("Phase B persisted session must exist by exact id");
+                    assert_eq!(&got, rec);
+                }
+                other => panic!("unexpected test payload variant: {other:?}"),
+            }
+            assert!(!is_writer_active(repo.path()).unwrap());
+
+            // =================================================================
+            // Phase C: Cancellation safety (`writer.lock` ownership pinned across
+            // in-flight `spawn_blocking` slices!). Cancelling/dropping the outer
+            // drain future AND its `WriterLockGuard` while `spawn_blocking` is
+            // waiting on `append.lock` MUST keep `writer.lock` held so no second
+            // consumer can concurrently acquire `writer.lock` until the blocking
+            // slice exits.
+            // =================================================================
+            let f5_dedup = format!("rb09c:{lane_label}:cancel-safety");
+            let f5_payload = payload_for(&format!("rb09c-{lane_label}-cancel-5"), 5);
+            let f5_bytes = encode_postcard_frame(
+                flags,
+                &f5_dedup,
+                CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                &f5_payload,
+            )
+            .expect("encode f5");
+            let expected_l6 = expected_l5 + f5_bytes.len() as u64;
+
+            let (cancel_prod_paused_tx, cancel_prod_paused_rx) = std::sync::mpsc::channel::<()>();
+            let (cancel_prod_release_tx, cancel_prod_release_rx) = std::sync::mpsc::channel::<()>();
+            let cancel_prod_repo = repo.path().to_path_buf();
+            let cancel_prod_f5 = f5_bytes.clone();
+            let cancel_prod_handle = std::thread::spawn(move || {
+                let mut obs = SegmentObserver::with_after_partial_frame_write_hook(
+                    move |_lane_name, seg_id| {
+                        assert_eq!(seg_id, 0);
+                        cancel_prod_paused_tx
+                            .send(())
+                            .expect("signal Phase C producer paused");
+                        cancel_prod_release_rx
+                            .recv()
+                            .expect("wait for Phase C producer release");
+                    },
+                );
+                append_encoded_frame_in_storage_dir_with_observer(
+                    &cancel_prod_repo,
+                    lane,
+                    &cancel_prod_f5,
+                    QueueAppendOptions::default(),
+                    &mut obs,
+                )
+            });
+            cancel_prod_paused_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("Phase C producer must pause holding append.lock");
+
+            // Start Consumer 1 on a `current_thread` runtime with a deterministic
+            // barrier INSIDE the `spawn_blocking` closure: once the blocking thread
+            // is actively executing, cancel and drop BOTH the drain future AND
+            // `WriterLockGuard`, then hold the blocking slice at the barrier until
+            // after Consumer 2's contention checks complete (zero timing reliance!).
+            let (c1_cancelled_tx, c1_cancelled_rx) = std::sync::mpsc::channel::<()>();
+            let (c1_release_slice_tx, c1_release_slice_rx) = std::sync::mpsc::channel::<()>();
+            let c1_release_slice_rx = Arc::new(Mutex::new(c1_release_slice_rx));
+            let (c1_drop_rt_tx, c1_drop_rt_rx) = std::sync::mpsc::channel::<()>();
+            let c1_root = init.paths.root.clone();
+            let c1_store = store.clone();
+            let c1_handle = std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build Phase C consumer runtime");
+                rt.block_on(async move {
+                    let lock = try_acquire_writer_lock_at_root(&c1_root)
+                        .expect("c1 acquire writer.lock")
+                        .expect("writer.lock free");
+                    let (slice_running_tx, slice_running_rx) = tokio::sync::oneshot::channel::<()>();
+                    let slice_running_tx = Mutex::new(Some(slice_running_tx));
+                    let slice_barrier_rx = Arc::clone(&c1_release_slice_rx);
+                    let mut obs = WriterObserver::new()
+                        .with_append_lock_slice(Duration::from_millis(50))
+                        .with_recovery_blocking_slice_started_hook(move || {
+                            if let Some(tx) = slice_running_tx.lock().unwrap().take() {
+                                let _ = tx.send(());
+                            }
+                            let _ = slice_barrier_rx.lock().unwrap().recv();
+                        });
+                    let spy = SpyCaptureStore::new(c1_store, c1_root.clone());
+                    {
+                        let drain_fut = drain_locked_at_root(
+                            &c1_root,
+                            &spy,
+                            QueueWriterOptions::default(),
+                            &lock,
+                            &mut obs,
+                        );
+                        tokio::pin!(drain_fut);
+                        tokio::select! {
+                            _ = &mut drain_fut => {
+                                panic!("Phase C: drain must not finish while blocking slice is pinned at barrier");
+                            }
+                            _ = slice_running_rx => {}
+                        }
+                        // `drain_fut` is dropped right here while the `spawn_blocking`
+                        // closure is deterministically running and pinned at its barrier!
+                    }
+                    drop(lock);
+                    c1_cancelled_tx
+                        .send(())
+                        .expect("signal c1 future & lock dropped");
+                });
+                // Wait to tear down runtime until main finishes probing contention.
+                let _ = c1_drop_rt_rx.recv();
+            });
+
+            c1_cancelled_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("Phase C consumer 1 must cancel and drop outer WriterLockGuard");
+
+            // IMMEDIATELY after Consumer 1 cancelled & dropped its `WriterLockGuard`,
+            // its running `spawn_blocking` slice MUST still hold `writer.lock`,
+            // blocking any contending Consumer 2!
+            assert!(
+                is_writer_active(repo.path()).unwrap(),
+                "AC1 Phase C ({lane_label}): writer.lock must remain held while cancelled spawn_blocking slice is still running"
+            );
+            assert!(
+                try_acquire_writer_lock(repo.path()).unwrap().is_none(),
+                "AC1 Phase C ({lane_label}): contending Consumer 2 must NOT acquire writer.lock while cancelled blocking slice is running"
+            );
+            let contended_c2 = drain_capture_queue(repo.path(), &store)
+                .await
+                .expect("contended Consumer 2 must return Ok(no-op)");
+            assert!(
+                !contended_c2.acquired_writer_lock,
+                "AC1 Phase C ({lane_label}): contending Consumer 2 must exit without acquiring writer.lock"
+            );
+
+            // Release both the pinned blocking slice and the paused producer ->
+            // cancelled `spawn_blocking` finishes and drops its `Arc<File>` token
+            // -> `writer.lock` releases cleanly!
+            c1_release_slice_tx
+                .send(())
+                .expect("release Phase C blocking slice barrier");
+            cancel_prod_release_tx
+                .send(())
+                .expect("release Phase C producer");
+            let prod_out5 = cancel_prod_handle.join().unwrap().unwrap();
+            assert_eq!(prod_out5.meta.committed_len, expected_l6);
+            c1_drop_rt_tx.send(()).expect("allow c1 runtime drop");
+            c1_handle.join().expect("join c1 thread");
+
+            assert!(
+                !is_writer_active(repo.path()).unwrap(),
+                "AC1 Phase C ({lane_label}): writer.lock must release cleanly once cancelled blocking slice exits"
+            );
+            let c2_rep = drain_capture_queue(repo.path(), &store)
+                .await
+                .expect("Consumer 2 must drain f5 cleanly after cancelled slice exits");
+            assert!(c2_rep.acquired_writer_lock);
+            assert_eq!(c2_rep.applied_frames, 1);
+            assert_eq!(
+                store.get_queue_highwater(lane).await.unwrap(),
+                CaptureQueueHighwater {
+                    segment_id: 0,
+                    byte_offset: expected_l6,
+                }
+            );
+            match &f5_payload {
+                CaptureBatchPayload::AppendAuditLog(rec) => {
+                    let got = store.get_audit_log(&rec.audit_id).await.unwrap().unwrap();
+                    assert_eq!(&got, rec);
+                }
+                CaptureBatchPayload::UpsertSession(rec) => {
+                    let got = store.get_session(&rec.session_id).await.unwrap().unwrap();
+                    assert_eq!(&got, rec);
+                }
+                other => panic!("unexpected test payload variant: {other:?}"),
+            }
+            assert!(!is_writer_active(repo.path()).unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn consumer_segment_reclamation_coordinates_with_append_lock() {
+        // `RB-09c` AC4 & AC1 (`ADR-RB-05` #4 ③, `GC-RB-04`):
+        // - While a concurrent producer holds `append.lock`, measures cross-lane
+        //   capacity occupancy, and pauses before committing its append to `active_seg = 1`,
+        //   the concurrent consumer drains sealed `seg 0` (lock-free wrt `append.lock`),
+        //   commits DB `hw = (1, 0)` (NEVER holding `append.lock` across DB writes),
+        //   and blocks on `append.lock` before reclaiming `seg 0`.
+        // - While the producer is paused: neither `seg 0` nor `active_seg = 1` is deleted,
+        //   `LTM2` is untouched, and producer capacity accounting sees exact undisturbed bytes.
+        // - Once producer finishes committing to `seg 1` and releases `append.lock`,
+        //   consumer re-reads updated `LTM2` inside `append.lock`, verifies
+        //   `seg == min_live_seg && seg < active_seg && seg < highwater_seg`, updates
+        //   dual `LTM2` (preserving producer's newly committed `seg 1` length!) strictly
+        //   BEFORE `unlink(seg 0)` + `fsync_dir`, then drains all of `seg 1` (incl. the
+        //   producer's newly appended frame).
+        // - Subsequent producer capacity check reflects exact reduction by `seg0_len`.
+        // - Negative guard inside `append.lock`: attempting to reclaim `active_seg` or
+        //   unconsumed `seg >= highwater_seg` fails closed without deleting `active_seg`.
+        for lane in [CaptureQueueLane::Normal, CaptureQueueLane::Priority] {
+            let lane_label = lane_subdir_name(lane);
+            let flags = match lane {
+                CaptureQueueLane::Priority => FRAME_FLAG_PRIORITY,
+                CaptureQueueLane::Normal => FRAME_FLAG_NONE,
+            };
+            let payload_for = |tag: &str, seq: i64| match lane {
+                CaptureQueueLane::Priority => {
+                    make_session_payload(tag, CaptureSessionState::Stopped, 1_700_040_000 + seq)
+                }
+                CaptureQueueLane::Normal => make_audit_payload(tag, "2026-11-24T04:10:00Z"),
+            };
+
+            let repo = tempdir().expect("tempdir");
+            let init = init_capture_queue(repo.path()).expect("init capture queue");
+            let lane_dir = match lane {
+                CaptureQueueLane::Normal => init.paths.normal.clone(),
+                CaptureQueueLane::Priority => init.paths.priority.clone(),
+            };
+            let store = RedbCaptureStore::create(
+                repo.path()
+                    .join(PRIVATE_SUBDIR)
+                    .join("capture.gen-0001.redb"),
+            )
+            .await
+            .expect("create RedbCaptureStore");
+
+            // Seed sealed `seg 0` (4 frames) + active `seg 1` (1 frame).
+            let (_seg0_offsets, seg0_len, seg1_len) = seed_rotated_lane_segments(
+                repo.path(),
+                lane,
+                &format!("rb09c-ac4-{lane_label}"),
+                false,
+            );
+            let seg0_path = lane_dir.join(segment_log_file_name(0));
+            let seg1_path = lane_dir.join(segment_log_file_name(1));
+            assert!(seg0_path.exists() && seg1_path.exists());
+
+            let s1_conc_dedup = format!("rb09c-ac4:{lane_label}:s1:concurrent");
+            let s1_conc_payload = payload_for(&format!("rb09c-ac4-{lane_label}-s1-conc"), 100);
+            let s1_concurrent_frame = encode_postcard_frame(
+                flags,
+                &s1_conc_dedup,
+                CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                &s1_conc_payload,
+            )
+            .expect("encode concurrent s1 frame");
+            let expected_seg1_after_prod = seg1_len + s1_concurrent_frame.len() as u64;
+
+            // Spawn producer holding `append.lock`, pausing right after capacity check
+            // (before writing/committing `s1_concurrent_frame` to `active_seg = 1`)
+            // until the consumer deterministically observes >= 2 `QueueBusy` retry slices.
+            let external_lock_held = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let external_lock_prod = Arc::clone(&external_lock_held);
+            let (prod_occ_tx, prod_occ_rx) = std::sync::mpsc::channel::<CaptureQueueOccupancy>();
+            let (prod_release_tx, prod_release_rx) = std::sync::mpsc::channel::<()>();
+            let prod_repo = repo.path().to_path_buf();
+            let prod_frame = s1_concurrent_frame.clone();
+            let prod_handle = std::thread::spawn(move || {
+                let mut obs = SegmentObserver::with_after_capacity_checked_hook(move |occ| {
+                    external_lock_prod.store(true, std::sync::atomic::Ordering::Release);
+                    prod_occ_tx
+                        .send(occ)
+                        .expect("send pre-reclaim capacity occupancy");
+                    prod_release_rx.recv().expect("wait for producer release");
+                });
+                append_encoded_frame_in_storage_dir_with_observer(
+                    &prod_repo,
+                    lane,
+                    &prod_frame,
+                    QueueAppendOptions::default(),
+                    &mut obs,
+                )
+            });
+
+            let occ_before = prod_occ_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("producer must pause right after capacity check");
+            assert!(external_lock_held.load(std::sync::atomic::Ordering::Acquire));
+            let lane_occ_before = match lane {
+                CaptureQueueLane::Priority => occ_before.priority_bytes,
+                CaptureQueueLane::Normal => occ_before.normal_bytes,
+            };
+            assert_eq!(
+                lane_occ_before,
+                seg0_len + seg1_len,
+                "AC4 ({lane_label}): producer capacity check must observe undisturbed seg 0 + seg 1 bytes"
+            );
+
+            // Run consumer concurrently on its own `current_thread` runtime:
+            // - Acquires `writer.lock`
+            // - Drains sealed `seg 0` and commits DB `hw = (1, 0)` while producer holds `append.lock`
+            // - Reaches `call_reclaim_sealed_segment(seg 0)` and waits across QueueBusy slices!
+            let (waiting_reclaim_tx, waiting_reclaim_rx) = std::sync::mpsc::channel::<u32>();
+            let (reclaim_busy_tx, reclaim_busy_rx) = std::sync::mpsc::channel::<usize>();
+            let consumer_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let consumer_done_flag = Arc::clone(&consumer_done);
+            let consumer_root = init.paths.root.clone();
+            let consumer_root_hook = init.paths.root.clone();
+            let consumer_store = store.clone();
+            let consumer_ext_flag = Arc::clone(&external_lock_held);
+
+            let consumer_handle = std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build consumer runtime");
+                rt.block_on(async move {
+                    let lock = try_acquire_writer_lock_at_root(&consumer_root)
+                        .expect("acquire writer.lock")
+                        .expect("writer.lock uncontended");
+                    let mut obs = WriterObserver::with_before_reclaim_hook(
+                        move |reclaim_lane, seg_id| {
+                            assert_eq!(reclaim_lane, lane);
+                            assert!(
+                                is_writer_active_at_root(&consumer_root_hook)
+                                    .expect("probe writer.lock before reclaim append.lock"),
+                                "AC1/AC4: consumer must hold writer.lock before requesting append.lock for reclaim"
+                            );
+                            waiting_reclaim_tx
+                                .send(seg_id)
+                                .expect("signal consumer waiting on append.lock for reclaim");
+                        },
+                    )
+                    .with_append_lock_slice(Duration::from_millis(25))
+                    .with_queue_busy_retry_hook(move |retry_n| {
+                        if retry_n == 2 {
+                            let _ = reclaim_busy_tx.send(retry_n);
+                        }
+                    });
+                    let spy = SpyCaptureStore::new_with_lock_tracking(
+                        consumer_store,
+                        consumer_root.clone(),
+                        obs.consumer_holds_append_lock_handle(),
+                        consumer_ext_flag,
+                    );
+                    let rep = drain_locked_at_root(
+                        &consumer_root,
+                        &spy,
+                        QueueWriterOptions::default(),
+                        &lock,
+                        &mut obs,
+                    )
+                    .await
+                    .expect(
+                        "consumer drain + coordinated reclaim must succeed across QueueBusy slices",
+                    );
+                    drop(lock);
+                    consumer_done_flag.store(true, std::sync::atomic::Ordering::Release);
+                    (
+                        rep,
+                        obs.segment_events,
+                        spy.recorded_calls(),
+                        obs.queue_busy_retries,
+                    )
+                })
+            });
+
+            let reclaim_target_seg = waiting_reclaim_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("consumer must drain seg 0 and reach reclaim append.lock");
+            assert_eq!(reclaim_target_seg, 0);
+            let reclaim_retry_seen = reclaim_busy_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("consumer reclaim must deterministically observe >= 2 QueueBusy retries");
+            assert!(reclaim_retry_seen >= 2);
+
+            // While producer is STILL paused holding `append.lock`:
+            assert!(
+                !consumer_done.load(std::sync::atomic::Ordering::Acquire),
+                "AC4 ({lane_label}): consumer reclaim must block on append.lock while producer holds it"
+            );
+            assert!(
+                seg0_path.exists() && seg1_path.exists(),
+                "AC4 ({lane_label}): neither seg 0 nor active seg 1 may be unlinked while producer holds append.lock"
+            );
+            let meta_while_paused = read_converged_lane_tail_meta(&lane_dir).unwrap();
+            assert_eq!(meta_while_paused.min_live_seg, 0);
+            assert_eq!(meta_while_paused.active_seg, 1);
+            assert_eq!(meta_while_paused.sealed.len(), 1);
+            assert_eq!(
+                store.get_queue_highwater(lane).await.unwrap(),
+                CaptureQueueHighwater {
+                    segment_id: 1,
+                    byte_offset: 0,
+                },
+                "AC1/AC4: seg 0 batch must already be committed to DB while producer holds append.lock"
+            );
+
+            // Clear pause-barrier flag BEFORE releasing producer (consumer is
+            // blocked inside reclaim append.lock retries, NOT in any DB write),
+            // so seg 1 DB commit is guaranteed to run with `external_lock_held == false`.
+            external_lock_held.store(false, std::sync::atomic::Ordering::Release);
+            prod_release_tx.send(()).expect("release producer");
+            let prod_out = prod_handle
+                .join()
+                .expect("join producer")
+                .expect("producer append to active seg 1 must succeed");
+            assert_eq!(prod_out.seg_id, 1);
+            assert_eq!(prod_out.meta.committed_len, expected_seg1_after_prod);
+
+            // Consumer unblocks, re-reads updated LTM2 under `append.lock`, commits dual LTM2
+            // (`min_live_seg = 1`, preserving `committed_len = expected_seg1_after_prod`!)
+            // BEFORE `unlink(seg 0)` + `fsync_dir`, then drains ALL frames in `seg 1`!
+            let (rep, seg_events, calls, busy_retries) =
+                consumer_handle.join().expect("join consumer thread");
+            assert!(
+                busy_retries >= 1,
+                "AC4 ({lane_label}): reclaim must retry cleanly across QueueBusy slices (got {busy_retries})"
+            );
+            assert_eq!(calls.len(), 2, "batch 0 = seg 0, batch 1 = seg 1");
+            assert!(
+                !calls[0].append_lock_was_free,
+                "AC1/AC4 ({lane_label}): seg 0 DB batch must commit while producer holds append.lock"
+            );
+            assert!(
+                calls[1].append_lock_was_free,
+                "AC1/AC4 ({lane_label}): seg 1 DB batch must run with OS append.lock FREE"
+            );
+            assert!(
+                calls[1].dedup_keys.contains(&s1_conc_dedup),
+                "AC4 ({lane_label}): seg 1 batch must include concurrently appended frame dedup key"
+            );
+            assert!(rep.acquired_writer_lock);
+            assert_eq!(rep.reclaimed_segments, 1);
+            assert_eq!(rep.applied_frames, 6, "4 in seg 0 + 2 in seg 1");
+            assert_eq!(rep.deduplicated_frames, 0);
+            assert!(!seg0_path.exists(), "sealed seg 0 must be reclaimed");
+            assert!(seg1_path.exists(), "active seg 1 must remain intact");
+            match &s1_conc_payload {
+                CaptureBatchPayload::AppendAuditLog(rec) => {
+                    let got = store
+                        .get_audit_log(&rec.audit_id)
+                        .await
+                        .unwrap()
+                        .expect("concurrently appended audit record must be persisted");
+                    assert_eq!(&got, rec);
+                }
+                CaptureBatchPayload::UpsertSession(rec) => {
+                    let got = store
+                        .get_session(&rec.session_id)
+                        .await
+                        .unwrap()
+                        .expect("concurrently appended session record must be persisted");
+                    assert_eq!(&got, rec);
+                }
+                other => panic!("unexpected test payload variant: {other:?}"),
+            }
+
+            // Verify LTM2 preserved producer's concurrent `seg 1` committed_len & updated cleanly.
+            let final_meta = read_converged_lane_tail_meta(&lane_dir).unwrap();
+            assert_eq!(final_meta.min_live_seg, 1);
+            assert_eq!(final_meta.active_seg, 1);
+            assert_eq!(final_meta.committed_len, expected_seg1_after_prod);
+            assert!(final_meta.sealed.is_empty());
+            assert_eq!(
+                store.get_queue_highwater(lane).await.unwrap(),
+                CaptureQueueHighwater {
+                    segment_id: 1,
+                    byte_offset: expected_seg1_after_prod,
+                }
+            );
+
+            // Verify strict durability order `AcquireAppendLock < dual LTM2 < ReclaimSegmentUnlink < FsyncLaneDirAfterReclaim < ReleaseAppendLock`.
+            let p_lock = seg_events
+                .iter()
+                .position(|e| *e == SegmentOpEvent::AcquireAppendLock)
+                .expect("AcquireAppendLock");
+            let p_bak_fsync = seg_events
+                .iter()
+                .position(|e| {
+                    *e == SegmentOpEvent::FsyncLaneDirAfterMeta {
+                        lane: lane_label,
+                        target_name: QUEUE_TAIL_META_BAK_FILE,
+                    }
+                })
+                .expect("FsyncLaneDirAfterMeta(tail.meta.bak)");
+            let p_unlink = seg_events
+                .iter()
+                .position(|e| {
+                    *e == SegmentOpEvent::ReclaimSegmentUnlink {
+                        lane: lane_label,
+                        seg_id: 0,
+                    }
+                })
+                .expect("ReclaimSegmentUnlink(0)");
+            let p_fsync = seg_events
+                .iter()
+                .position(|e| {
+                    *e == SegmentOpEvent::FsyncLaneDirAfterReclaim {
+                        lane: lane_label,
+                        seg_id: 0,
+                    }
+                })
+                .expect("FsyncLaneDirAfterReclaim(0)");
+            let p_unlock = seg_events
+                .iter()
+                .position(|e| *e == SegmentOpEvent::ReleaseAppendLock)
+                .expect("ReleaseAppendLock");
+            assert!(
+                p_lock < p_bak_fsync
+                    && p_bak_fsync < p_unlink
+                    && p_unlink < p_fsync
+                    && p_fsync < p_unlock,
+                "AC4 ({lane_label}): strict reclaim order violated: {seg_events:?}"
+            );
+
+            // Subsequent producer capacity measurement reflects exact reclamation of `seg 0`
+            // (`expected_seg1_after_prod`, strictly reduced by `seg0_len` relative to pre-reclaim + appended frame).
+            let post_frame = encode_postcard_frame(
+                flags,
+                &format!("rb09c-ac4:{lane_label}:s1:post-reclaim"),
+                CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                &payload_for(&format!("rb09c-ac4-{lane_label}-s1-post"), 101),
+            )
+            .expect("encode post-reclaim frame");
+            let observed_occ_after = Arc::new(Mutex::new(None::<CaptureQueueOccupancy>));
+            let occ_after_slot = Arc::clone(&observed_occ_after);
+            let mut post_obs = SegmentObserver::with_after_capacity_checked_hook(move |occ| {
+                *occ_after_slot.lock().unwrap() = Some(occ);
+            });
+            let post_out = append_encoded_frame_in_storage_dir_with_observer(
+                repo.path(),
+                lane,
+                &post_frame,
+                QueueAppendOptions::default(),
+                &mut post_obs,
+            )
+            .expect("post-reclaim producer append must succeed");
+            assert_eq!(post_out.seg_id, 1);
+            let occ_after = observed_occ_after
+                .lock()
+                .unwrap()
+                .expect("capacity hook must fire");
+            let lane_occ_after = match lane {
+                CaptureQueueLane::Priority => occ_after.priority_bytes,
+                CaptureQueueLane::Normal => occ_after.normal_bytes,
+            };
+            assert_eq!(
+                lane_occ_after, expected_seg1_after_prod,
+                "AC4 ({lane_label}): capacity occupancy after reclaim must exclude reclaimed seg 0"
+            );
+
+            // Negative fail-closed guards under `append.lock`:
+            // (a) Reclaiming `active_seg = 1` (even with `highwater_seg = 2`) MUST fail
+            //     closed (`BackendInternal`) and NEVER delete `active_seg = 1`!
+            let tree_before_bad_reclaim = snapshot_queue_tree_full(&init.paths.root);
+            let bad_reclaim_err = reclaim_sealed_segment_at_root(&init.paths.root, lane, 1, 2)
+                .expect_err("AC4: reclaiming active_seg under append.lock must fail closed");
+            assert!(
+                matches!(
+                    bad_reclaim_err,
+                    StorageBackendError::BackendInternal { ref detail }
+                        if detail.contains("active or future")
+                ),
+                "AC4 ({lane_label}): expected active-segment rejection, got {bad_reclaim_err:?}"
+            );
+            assert!(
+                seg1_path.exists(),
+                "AC4 ({lane_label}): active_seg 1 must NEVER be deleted"
+            );
+            assert_eq!(
+                snapshot_queue_tree_full(&init.paths.root),
+                tree_before_bad_reclaim
+            );
+
+            // (b) Reclaiming an unconsumed segment (`seg_id == highwater_seg`) MUST also
+            //     fail closed with zero disk mutation!
+            let bad_hw_err = reclaim_sealed_segment_at_root(&init.paths.root, lane, 1, 1)
+                .expect_err("AC4: reclaiming seg >= highwater_seg must fail closed");
+            assert!(
+                matches!(bad_hw_err, StorageBackendError::BackendInternal { .. }),
+                "AC4 ({lane_label}): expected unconsumed-highwater rejection, got {bad_hw_err:?}"
+            );
+            assert!(seg1_path.exists());
+            assert_eq!(
+                snapshot_queue_tree_full(&init.paths.root),
+                tree_before_bad_reclaim
+            );
         }
     }
 }
