@@ -3907,7 +3907,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `done` / `remote-pending`
+**Lifecycle / Acceptance:** `done` / `remote-verified`
 
 **Description:** 100% 在独占目录 `src/storage/**` 内于 `segment.rs` 落实并实证 `ADR-RB-05` #3 Subcase B1 **主副本缺失或损坏方向**（`tail.meta` 缺失或损坏而 `tail.meta.bak` 完整有效）的两阶段恢复不变量（反向副副本 `tail.meta.bak` 缺失或损坏的对称分支拆出由 `RB-08z` 独占承接）：Phase 1 仅只读自幸存有效副本确立权威 `LTM2` 边界并先检验活跃段前缀与长度，若前缀位翻转或短于 `committed_len` 则立即 fail-closed 返回 `CorruptCommittedFrame`（`LBR-IO-001`）且整盘零改动（**绝不提前镜像修复缺失/损坏副本**）；仅当 Phase 1 确认段完好后方在 Phase 2 原子镜像修复损坏副本。
 
@@ -3966,7 +3966,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `remote-pending`
 
 **Description:** 100% 在独占目录 `src/storage/**` 内于 `segment.rs` 落实并实证 `ADR-RB-05` #3 Subcase B1 **副副本缺失或损坏对称方向**（`tail.meta.bak` 缺失或损坏而主副本 `tail.meta` 完整有效）：Phase 1 仅只读自主副本 `tail.meta` 确立权威 `LTM2` 边界并先检验活跃段前缀与长度，若前缀位翻转或短于 `committed_len` 则立即 fail-closed 返回 `CorruptCommittedFrame`（`LBR-IO-001`）且整盘零改动（**绝不提前镜像修复 `tail.meta.bak`**）；仅当 Phase 1 确认段完好后方在 Phase 2 原子镜像修复 `tail.meta.bak`。
 
@@ -3981,16 +3981,16 @@
 | 双副本恢复必须对称支持主副本与副副本任一缺失/损坏；若仅实现主副本缺失回退分支而未实现副副本缺失镜像分支，备副本损坏场景将无法正确校验或修复 | `ADR-RB-05` #3 Step ①、Subcase B1 |
 
 **Acceptance criteria:**
-- [ ] **副副本缺失/损坏 + 前缀位翻转返回 `CorruptCommittedFrame`：** 删除或损坏 `tail.meta.bak`（保留完整 `tail.meta`）并翻转 `[0, committed_len)` 内单字节，Phase 1 返回 `CorruptCommittedFrame`（`LBR-IO-001`）。
-- [ ] **副副本缺失/损坏 + 前缀位翻转整盘快照零改动：** 上述 AC1 夹具（预置 `tail.meta.bak.tmp` 与 `quarantine/<lane>-orphan.tmp`）拒收前后，整个通道目录与 `quarantine/` 全文件逐字节快照完全相等（零提前镜像修复 `tail.meta.bak`）。
-- [ ] **副副本缺失/损坏 + 短段返回 `CorruptCommittedFrame`：** 删除或损坏 `tail.meta.bak`（保留完整 `tail.meta`）并将活跃段截短至 `actual_len < committed_len`，Phase 1 返回 `CorruptCommittedFrame`（`LBR-IO-001`）。
-- [ ] **副副本缺失/损坏 + 短段整盘快照零改动：** 上述 AC3 夹具拒收前后，整个通道目录与 `quarantine/` 全文件逐字节快照完全相等（零提前镜像修复 `tail.meta.bak`）。
-- [ ] **副副本缺失/损坏 + 健康段 Phase 2 原子镜像修复：** 删除或损坏 `tail.meta.bak`（保留完整 `tail.meta`）而活跃段前缀完好时，Phase 2 原子重建的 `tail.meta.bak` 字节与权威 `tail.meta` 逐字节相等。
+- [x] **副副本缺失/损坏 + 前缀位翻转返回 `CorruptCommittedFrame`：** 删除或损坏 `tail.meta.bak`（保留完整 `tail.meta`）并翻转 `[0, committed_len)` 内单字节，Phase 1 返回 `CorruptCommittedFrame`（`LBR-IO-001`）。
+- [x] **副副本缺失/损坏 + 前缀位翻转整盘快照零改动：** 上述 AC1 夹具（预置 `tail.meta.bak.tmp` 与 `quarantine/<lane>-orphan.tmp`）拒收前后，整个通道目录与 `quarantine/` 全文件逐字节快照完全相等（零提前镜像修复 `tail.meta.bak`）。
+- [x] **副副本缺失/损坏 + 短段返回 `CorruptCommittedFrame`：** 删除或损坏 `tail.meta.bak`（保留完整 `tail.meta`）并将活跃段截短至 `actual_len < committed_len`，Phase 1 返回 `CorruptCommittedFrame`（`LBR-IO-001`）。
+- [x] **副副本缺失/损坏 + 短段整盘快照零改动：** 上述 AC3 夹具拒收前后，整个通道目录与 `quarantine/` 全文件逐字节快照完全相等（零提前镜像修复 `tail.meta.bak`）。
+- [x] **副副本缺失/损坏 + 健康段 Phase 2 原子镜像修复：** 删除或损坏 `tail.meta.bak`（保留完整 `tail.meta`）而活跃段前缀完好时，Phase 2 原子重建的 `tail.meta.bak` 字节与权威 `tail.meta` 逐字节相等。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --no-default-features --features storage-redb --lib -E 'test(=storage::queue::segment::tests::subcase_b1_backup_replica_loss_phase1_reject_and_phase2_mirror_repair)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb --lib -E 'test(=storage::queue::segment::tests::subcase_b1_backup_replica_loss_phase1_reject_and_phase2_mirror_repair)'`（new，覆盖 AC1–AC5）
-- [ ] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 3 文件实现白名单。
+- [x] `source .env.test && cargo nextest list --no-default-features --features storage-redb --lib -E 'test(=storage::queue::segment::tests::subcase_b1_backup_replica_loss_phase1_reject_and_phase2_mirror_repair)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb --lib -E 'test(=storage::queue::segment::tests::subcase_b1_backup_replica_loss_phase1_reject_and_phase2_mirror_repair)'`（new，覆盖 AC1–AC5）
+- [x] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 3 文件实现白名单。
 
 **Full-suite trigger:** `none`
 
@@ -10066,8 +10066,9 @@
 | `RB-08o` | `done` / `remote-verified` | `df4b8c0`（`main`） | `0.30.359` | 2026-11-23 11:39 UTC：Stage 1 精确 3 文件写集内仅改动 `src/storage/queue/segment.rs`，完善并实证满 256 封存表（`256×4 KiB` 小封存段，总容量远低于 `256 MiB`）Case C 恢复后 `committed_len + frame_len <= 16 MiB` 段内入队准入路径（Unix/Windows 共用 `should_rotate_active_segment` + `enforce_rotation_sealed_cap_limit`，不误报 `LBR-AGENT-046`，原位追加并推进双副本 `LTM2.COMMITTED_LEN`/`PREFIX_CRC32C`，维持 `ACTIVE_SEG == S`、`sealed.len() == 256` 与零新建 `S+1`）；`--no-default-features --features storage-redb` `VER1` 1/1、`VER2`（`sealed_cap_256_post_recovery_insegment_enqueue_admitted` 覆盖 AC1–AC5：恢复后常规段内入队、真实满表 Case C 恢复后精确 `== 16 MiB` 等号边界准入、以及未恢复满表 Case C 单次 `append_frame` 恢复+段内准入并逐帧核验 `dedup_key`/`flags`/`payload` 及磁盘双副本 `tail.meta`/`tail.meta.bak` 显式解码相等）、`segment.rs` 19/19 快速回归、`storage-redb` `--lib` 零警告、三构型矩阵、fmt、`--lib` clippy（`src/storage/` 零警告）、`compat_version_surface_sync` 全绿；Codex R1 两项测试加强建议闭环并经 R2 确认 P0=0/P1=0（R2 唯一 P2 显式解码 `raw_bak` 亦已一并补齐并重跑 `VER2` 绿灯）；已推 `origin/main` |
 | `RB-08s` | `done` / `remote-verified` | `edb4228`（`main`） | `0.30.362` | 2026-11-23 15:01 UTC：Stage 1 精确 3 文件写集内仅改动 `src/storage/queue/segment.rs`，抽提 Unix/Windows 共用新帧落盘例程 `write_incoming_frame_to_segment` 并接入零发布期开销可注入写盘插桩钩子 `SegmentObserver::with_incoming_frame_write_hook` / `on_incoming_frame_write_attempt`（严格位于 Step ① 恢复与 Step ② (a)/(b) 背压守卫之后）；`--no-default-features --features storage-redb` `VER1` 1/1、`VER2`（`sealed_cap_256_single_call_recovery_then_prewrite_reject_and_reopen` 覆盖 AC1–AC8：256×4KiB 容量隔离含恢复前后 `<= 256 MiB` 双断言、含同步尾与等号边界双态单调用先持久 Step ① 恢复再 Step ② 返回 `LBR-AGENT-046`、可注入钩子精确断言 `0` 次新帧写盘调用且同钩子正向对照入队计 `1` 次、磁盘 `events-00000256.log` 逐字节等于 `expected_recovered_bytes`、零 `events-00000257.log`、重开显式解码 `tail.meta`/`tail.meta.bak` 双副本验证持久化 `COMMITTED_LEN`/`PREFIX_CRC32C`/`sealed.len() == 256` 与公开 `append_encoded_frame` 入口）、`segment.rs` 20/20 快速回归、`storage-redb` `--lib` 零警告、三构型矩阵、fmt、`--lib` clippy（`src/storage/` 零警告）、`compat_version_surface_sync` 全绿；Codex R1 首轮 `VERDICT: PASS`（P0=0、P1=0、P2=0）；已推 `origin/main` |
 | `RB-08c` | `done` / `remote-verified` | `425c8d6`（`main`） | `0.30.363` | 2026-11-23 15:18 UTC：Stage 1 精确 3 文件写集内仅改动 `src/storage/queue/segment.rs`，为 Unix/Windows Phase 1 分类器补齐零发布开销 `SegmentOpEvent::CaseCTailScanStart` 插桩并同卡实证有效双副本下 Case A/E/C 已确认前缀入队前校验与整盘零改动守卫；`--no-default-features --features storage-redb` `VER1` 2/2、`VER2`（`unchanged_meta_case_a_bitflip_and_case_e_short_segment_rejected` 覆盖 AC1–AC4：Case A 首/超 64KiB 中段/末字节含缺 `append.lock` 位翻转与 Case E 完整帧 `CleanEof`/半帧/0B 截短均返 `LBR-IO-001` 且通道/`quarantine/`/根树全字节快照零改动）、`VER3`（`case_c_prefix_bitflip_rejected_zero_mutation_before_tail_scan` 覆盖 AC5–AC6：纯同步尾与同步尾+坏半帧双态前缀翻转在 `append`/`recover_lane` 双路径均于 0 次 `CaseCTailScanStart` 前返 `LBR-IO-001` 且整盘零改动，还原 1 比特正向对照触发 1 次扫尾恢复）、`segment.rs` 21/21 快速回归、三构型矩阵与 `src/storage/` 全零告警 Clippy、`compat_version_surface_sync` 全绿；Codex R1 首轮 `VERDICT: PASS`（P0=0、P1=0、P2=0）；已推 `origin/main` |
-| `RB-08y` | `done` / `remote-pending` | 本提交（`main`） | `0.30.364` | 2026-11-23 15:36 UTC：Stage 1 精确 3 文件写集内仅改动 `src/storage/queue/segment.rs`，实证 Subcase B1 主副本 `tail.meta` 缺失/损坏（`Deleted`/`CorruptCrc`/`TruncatedGarbage`/`Oversized` 4 态，幸存有效 `tail.meta.bak`）在 Unix/Windows Phase 1 先验前缀与长度守卫及 Phase 2 原子镜像修复；`--no-default-features --features storage-redb` `VER1` 1/1、`VER2`（`subcase_b1_single_replica_loss_phase1_reject_and_phase2_mirror_repair` 覆盖 AC1–AC5：4 态主损+前缀位翻转与 4×2 态主损+`CleanEof`/半帧短段在 `append_frame`/`recover_lane` 双路径均返 `CorruptCommittedFrame` `LBR-IO-001` 且通道/`quarantine/` 全字节快照零改动含预置 `tail.meta*.tmp`/`quarantine/<lane>-*.tmp`、零提前镜像修复；4 态主损+健康段含预置陈旧 `tail.meta.tmp` 在 `recover_lane` 与直接 `append_frame` 均原子重建 `0600` `tail.meta` 逐字节等于权威 `tail.meta.bak`、按 `MetaTmpWriteAndSync < MetaRename < FsyncLaneDirAfterMeta` 仅写主副本且后续追加正常）、`segment.rs` 23/23 快速回归、三构型矩阵与 `src/storage/` 全零告警 Clippy、`compat_version_surface_sync` 全绿；Codex R1 零生产代码缺陷且所提 1 项测试矩阵扩展 P1 已闭环，R2 获 `VERDICT: PASS`（P0=0、P1=0、P2=0） |
-| `RB-08z`..`RB-34c`（剩余 99 卡） | `pending` | — | — | Phase 2 推进中，按实施顺序于 `main` 逐卡推进 |
+| `RB-08y` | `done` / `remote-verified` | `501938b`（`main`） | `0.30.364` | 2026-11-23 15:36 UTC：Stage 1 精确 3 文件写集内仅改动 `src/storage/queue/segment.rs`，实证 Subcase B1 主副本 `tail.meta` 缺失/损坏（`Deleted`/`CorruptCrc`/`TruncatedGarbage`/`Oversized` 4 态，幸存有效 `tail.meta.bak`）在 Unix/Windows Phase 1 先验前缀与长度守卫及 Phase 2 原子镜像修复；`--no-default-features --features storage-redb` `VER1` 1/1、`VER2`（`subcase_b1_single_replica_loss_phase1_reject_and_phase2_mirror_repair` 覆盖 AC1–AC5：4 态主损+前缀位翻转与 4×2 态主损+`CleanEof`/半帧短段在 `append_frame`/`recover_lane` 双路径均返 `CorruptCommittedFrame` `LBR-IO-001` 且通道/`quarantine/` 全字节快照零改动含预置 `tail.meta*.tmp`/`quarantine/<lane>-*.tmp`、零提前镜像修复；4 态主损+健康段含预置陈旧 `tail.meta.tmp` 在 `recover_lane` 与直接 `append_frame` 均原子重建 `0600` `tail.meta` 逐字节等于权威 `tail.meta.bak`、按 `MetaTmpWriteAndSync < MetaRename < FsyncLaneDirAfterMeta` 仅写主副本且后续追加正常）、`segment.rs` 23/23 快速回归、三构型矩阵与 `src/storage/` 全零告警 Clippy、`compat_version_surface_sync` 全绿；Codex R1 零生产代码缺陷且所提 1 项测试矩阵扩展 P1 已闭环，R2 获 `VERDICT: PASS`（P0=0、P1=0、P2=0）；已推 `origin/main` |
+| `RB-08z` | `done` / `remote-pending` | 本提交（`main`） | `0.30.365` | 2026-11-23 15:53 UTC：Stage 1 精确 3 文件写集内仅改动 `src/storage/queue/segment.rs`，实证 Subcase B1 副副本 `tail.meta.bak` 缺失/损坏（`Deleted`/`CorruptCrc`/`TruncatedGarbage`/`Oversized` 4 态，幸存有效 `tail.meta`）在 Unix/Windows Phase 1 先验前缀与长度守卫及 Phase 2 对称原子镜像修复；`--no-default-features --features storage-redb` `VER1` 1/1、`VER2`（`subcase_b1_backup_replica_loss_phase1_reject_and_phase2_mirror_repair` 覆盖 AC1–AC5：4 态副损+前缀位翻转含 >64KiB 负载与 4×2 态副损+`CleanEof`/半帧短段在 `append_frame`/`recover_lane` 双路径均返 `CorruptCommittedFrame` `LBR-IO-001` 且通道/`quarantine/` 全字节快照零改动含预置 `tail.meta*.tmp`/`quarantine/<lane>-*.tmp`、零提前镜像修复；4 态副损+健康段含预置陈旧 `tail.meta.bak.tmp` 在 `recover_lane`、带 `with_incoming_frame_write_hook` 的观测直接追加（实证 `MetaTmpWriteAndSync(bak) < MetaRename(bak) < FsyncLaneDirAfterMeta(bak) < SegmentWriteAll` 且写新帧前 `tail.meta.bak` 已重建为原权威 `f1` 字节且零写主副本）、Step ② 紧容量 `LBR-AGENT-046` 预写拒收边界及公开 `append_frame` 均原子重建 `0600` `tail.meta.bak`）、`segment.rs` 24/24 快速回归、三构型矩阵与 `src/storage/` 全零告警 Clippy、`compat_version_surface_sync` 全绿；Codex R1 零生产代码缺陷且所提 1 项直接追加观测/边界验证 P1 已闭环，R2 获 `VERDICT: PASS`（P0=0、P1=0、P2=0） |
+| `RB-08e`..`RB-34c`（剩余 98 卡） | `pending` | — | — | Phase 2 推进中，按实施顺序于 `main` 逐卡推进 |
 
 ## Codex review log
 

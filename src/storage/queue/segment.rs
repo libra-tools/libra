@@ -18879,4 +18879,692 @@ mod tests {
             assert_eq!(LaneTailMeta::decode(&raw_bak).unwrap(), f2.meta);
         }
     }
+
+    #[test]
+    fn subcase_b1_backup_replica_loss_phase1_reject_and_phase2_mirror_repair() {
+        // `RB-08z` AC1–AC5 (`ADR-RB-05` #3 Step ①, Subcase B1 backup-replica
+        // loss direction): when backup `tail.meta.bak` is deleted or corrupt
+        // while primary `tail.meta` is intact and authoritative:
+        // - AC1 & AC2: single-byte bitflip inside `[0, committed_len)` ->
+        //   Phase 1 fail-closed `CorruptCommittedFrame` (`LBR-IO-001`) with
+        //   whole-lane & `quarantine/` byte-for-byte snapshot equality (ZERO
+        //   premature mirror repair of `tail.meta.bak`, ZERO `.tmp` deletion).
+        // - AC3 & AC4: active segment truncated (`actual_len < committed_len`,
+        //   full 4×2 matrix of backup loss modes × CleanEof / mid-frame) ->
+        //   Phase 1 fail-closed `CorruptCommittedFrame` (`LBR-IO-001`) with
+        //   exact snapshot equality (ZERO premature mirror repair).
+        // - AC5: healthy active segment -> Phase 2 atomically rebuilds
+        //   `tail.meta.bak` (`tail.meta.bak.tmp -> sync_data -> rename ->
+        //   fsync_dir`, `0600`) byte-for-byte equal to authoritative
+        //   `tail.meta` without touching `tail.meta`, across both
+        //   `recover_lane` and direct `append_frame` (all 4 loss modes + stale
+        //   `tail.meta.bak.tmp`).
+
+        #[derive(Clone, Copy)]
+        enum BackupLossMode {
+            Deleted,
+            CorruptCrc,
+            TruncatedGarbage,
+            Oversized,
+        }
+
+        let apply_backup_loss = |lane_dir: &Path, mode: BackupLossMode| {
+            let bak_path = tail_meta_bak_path(lane_dir);
+            match mode {
+                BackupLossMode::Deleted => {
+                    fs::remove_file(&bak_path).expect("delete backup tail.meta.bak");
+                }
+                BackupLossMode::CorruptCrc => {
+                    let mut raw = fs::read(&bak_path).expect("read backup tail.meta.bak");
+                    let last = raw.len() - 1;
+                    raw[last] ^= 0x55;
+                    write_bytes_0600(&bak_path, &raw);
+                }
+                BackupLossMode::TruncatedGarbage => {
+                    write_bytes_0600(&bak_path, b"LTM2-corrupt-bak");
+                }
+                BackupLossMode::Oversized => {
+                    write_bytes_0600(&bak_path, &vec![0xCDu8; LTM2_MAX_LEN + 32]);
+                }
+            }
+        };
+
+        // =====================================================================
+        // Part 1 — AC1 & AC2: Backup `tail.meta.bak` deleted/corrupt + committed
+        // prefix bitflip -> Phase 1 `LBR-IO-001` & zero premature mirror repair.
+        // =====================================================================
+        for (label, loss_mode, payload_len, flip_offset) in [
+            (
+                "b1-backup-deleted-prefix-bitflip",
+                BackupLossMode::Deleted,
+                64 * 1024 + 256,
+                64 * 1024 + 17,
+            ),
+            (
+                "b1-backup-corrupt-crc-prefix-bitflip",
+                BackupLossMode::CorruptCrc,
+                512,
+                24,
+            ),
+            (
+                "b1-backup-truncated-prefix-bitflip",
+                BackupLossMode::TruncatedGarbage,
+                256,
+                0,
+            ),
+            (
+                "b1-backup-oversized-prefix-bitflip",
+                BackupLossMode::Oversized,
+                256,
+                16,
+            ),
+        ] {
+            let repo = tempdir().expect("tempdir");
+            let init = init_capture_queue(repo.path()).expect("init capture queue");
+            let normal_dir = &init.paths.normal;
+            let payload = vec![0x6Au8; payload_len];
+            let f1 = append_frame(
+                repo.path(),
+                CaptureQueueLane::Normal,
+                FRAME_FLAG_NONE,
+                "rb08z-bitflip-1",
+                &payload,
+            )
+            .expect("append committed frame");
+            let authoritative_primary = fs::read(tail_meta_path(normal_dir)).unwrap();
+            assert_eq!(
+                LaneTailMeta::decode(&authoritative_primary).unwrap(),
+                f1.meta
+            );
+
+            apply_backup_loss(normal_dir, loss_mode);
+
+            // Flip one byte strictly inside `[0, committed_len)`.
+            let seg0_path = normal_dir.join(segment_log_file_name(0));
+            let mut seg0 = fs::read(&seg0_path).unwrap();
+            assert!((flip_offset as u64) < f1.meta.committed_len);
+            seg0[flip_offset] ^= 0x01;
+            write_bytes_0600(&seg0_path, &seg0);
+
+            // Plant `.tmp` files in lane & quarantine to prove Phase 1 rejects
+            // before ANY Phase 2 mirror repair or `.tmp` cleanup.
+            write_bytes_0600(
+                &normal_dir.join(QUEUE_TAIL_META_BAK_TMP_FILE),
+                b"b1-bak-bitflip-meta-bak-tmp",
+            );
+            write_bytes_0600(
+                &normal_dir.join(QUEUE_TAIL_META_TMP_FILE),
+                b"b1-bak-bitflip-meta-tmp",
+            );
+            write_bytes_0600(
+                &init.paths.quarantine.join("normal-orphan.tmp"),
+                b"b1-bak-bitflip-normal-q-tmp",
+            );
+            write_bytes_0600(
+                &init.paths.quarantine.join("priority-orphan.tmp"),
+                b"b1-bak-bitflip-priority-q-tmp",
+            );
+
+            let lane_before = snapshot_tree(normal_dir);
+            let q_before = snapshot_tree(&init.paths.quarantine);
+
+            let app_err = append_frame(
+                repo.path(),
+                CaptureQueueLane::Normal,
+                FRAME_FLAG_NONE,
+                "rb08z-incoming-reject",
+                b"must-not-write",
+            )
+            .expect_err("AC1: Subcase B1 backup loss + prefix bitflip must fail closed");
+            assert!(
+                matches!(app_err, StorageBackendError::CorruptCommittedFrame { .. }),
+                "{label}: AC1 violated: expected CorruptCommittedFrame, got {app_err:?}"
+            );
+            assert_eq!(app_err.stable_code_str(), "LBR-IO-001");
+            assert_eq!(
+                snapshot_tree(normal_dir),
+                lane_before,
+                "{label}: AC2 violated — premature mirror repair or .tmp mutation in normal/"
+            );
+            assert_eq!(
+                snapshot_tree(&init.paths.quarantine),
+                q_before,
+                "{label}: AC2 violated — quarantine/ mutated"
+            );
+
+            let rec_err = recover_lane(repo.path(), CaptureQueueLane::Normal).expect_err(
+                "AC1 (recover_lane): Subcase B1 backup loss + bitflip must fail closed",
+            );
+            assert!(matches!(
+                rec_err,
+                StorageBackendError::CorruptCommittedFrame { .. }
+            ));
+            assert_eq!(rec_err.stable_code_str(), "LBR-IO-001");
+            assert_eq!(snapshot_tree(normal_dir), lane_before);
+            assert_eq!(snapshot_tree(&init.paths.quarantine), q_before);
+        }
+
+        // =====================================================================
+        // Part 2 — AC3 & AC4: Backup `tail.meta.bak` missing/corrupt + short
+        // active segment (`actual_len < committed_len`, full 4×2 matrix of
+        // backup loss modes × CleanEof / mid-frame truncation) -> Phase 1
+        // `LBR-IO-001` & zero premature mirror repair.
+        // =====================================================================
+        for (loss_label, loss_mode) in [
+            ("deleted", BackupLossMode::Deleted),
+            ("corrupt-crc", BackupLossMode::CorruptCrc),
+            ("truncated", BackupLossMode::TruncatedGarbage),
+            ("oversized", BackupLossMode::Oversized),
+        ] {
+            for (trunc_label, clean_frame_boundary) in [("clean-eof", true), ("mid-frame", false)] {
+                let label = format!("b1-backup-{loss_label}-short-{trunc_label}");
+                let repo = tempdir().expect("tempdir");
+                let init = init_capture_queue(repo.path()).expect("init capture queue");
+                let normal_dir = &init.paths.normal;
+                let f1 = append_frame(
+                    repo.path(),
+                    CaptureQueueLane::Normal,
+                    FRAME_FLAG_NONE,
+                    "rb08z-short-1",
+                    b"frame-1-survives-trunc",
+                )
+                .unwrap();
+                let f2 = append_frame(
+                    repo.path(),
+                    CaptureQueueLane::Normal,
+                    FRAME_FLAG_NONE,
+                    "rb08z-short-2",
+                    b"frame-2-truncated",
+                )
+                .unwrap();
+
+                apply_backup_loss(normal_dir, loss_mode);
+
+                let seg0_path = normal_dir.join(segment_log_file_name(0));
+                let target_len = if clean_frame_boundary {
+                    f1.meta.committed_len
+                } else {
+                    f1.meta.committed_len + (f2.frame_len as u64 / 2)
+                };
+                {
+                    let f = fs::OpenOptions::new().write(true).open(&seg0_path).unwrap();
+                    f.set_len(target_len).unwrap();
+                    f.sync_data().unwrap();
+                }
+
+                write_bytes_0600(
+                    &normal_dir.join(QUEUE_TAIL_META_BAK_TMP_FILE),
+                    b"b1-bak-short-meta-bak-tmp",
+                );
+                write_bytes_0600(
+                    &init.paths.quarantine.join("normal-orphan.tmp"),
+                    b"b1-bak-short-q-tmp",
+                );
+
+                let lane_before = snapshot_tree(normal_dir);
+                let q_before = snapshot_tree(&init.paths.quarantine);
+
+                let app_err = append_frame(
+                    repo.path(),
+                    CaptureQueueLane::Normal,
+                    FRAME_FLAG_NONE,
+                    "rb08z-short-incoming",
+                    b"rejected",
+                )
+                .expect_err("AC3: Subcase B1 backup loss + short segment must fail closed");
+                assert!(
+                    matches!(app_err, StorageBackendError::CorruptCommittedFrame { .. }),
+                    "{label}: AC3 violated: expected CorruptCommittedFrame, got {app_err:?}"
+                );
+                assert_eq!(app_err.stable_code_str(), "LBR-IO-001");
+                assert_eq!(
+                    snapshot_tree(normal_dir),
+                    lane_before,
+                    "{label}: AC4 violated — premature mirror repair or .tmp mutation in normal/"
+                );
+                assert_eq!(
+                    snapshot_tree(&init.paths.quarantine),
+                    q_before,
+                    "{label}: AC4 violated — quarantine/ mutated"
+                );
+
+                let rec_err = recover_lane(repo.path(), CaptureQueueLane::Normal).expect_err(
+                    "AC3 (recover_lane): Subcase B1 backup loss + short must fail closed",
+                );
+                assert!(matches!(
+                    rec_err,
+                    StorageBackendError::CorruptCommittedFrame { .. }
+                ));
+                assert_eq!(rec_err.stable_code_str(), "LBR-IO-001");
+                assert_eq!(snapshot_tree(normal_dir), lane_before);
+                assert_eq!(snapshot_tree(&init.paths.quarantine), q_before);
+            }
+        }
+
+        // =====================================================================
+        // Part 3 — AC5: Backup `tail.meta.bak` missing OR corrupt (all 4 modes)
+        // + healthy intact segment -> Phase 2 atomically rebuilds `tail.meta.bak`
+        // byte-for-byte equal to authoritative `tail.meta` (both `recover_lane`
+        // and direct `append_frame` paths, even with stale `tail.meta.bak.tmp`).
+        // =====================================================================
+        for (label, loss_mode) in [
+            ("b1-backup-deleted-healthy-repair", BackupLossMode::Deleted),
+            (
+                "b1-backup-corrupt-crc-healthy-repair",
+                BackupLossMode::CorruptCrc,
+            ),
+            (
+                "b1-backup-truncated-healthy-repair",
+                BackupLossMode::TruncatedGarbage,
+            ),
+            (
+                "b1-backup-oversized-healthy-repair",
+                BackupLossMode::Oversized,
+            ),
+        ] {
+            let repo = tempdir().expect("tempdir");
+            let init = init_capture_queue(repo.path()).expect("init capture queue");
+            let normal_dir = &init.paths.normal;
+            let f1 = append_frame(
+                repo.path(),
+                CaptureQueueLane::Normal,
+                FRAME_FLAG_NONE,
+                "rb08z-healthy-1",
+                b"healthy-committed-payload",
+            )
+            .unwrap();
+            let authoritative_primary = fs::read(tail_meta_path(normal_dir)).unwrap();
+            assert_eq!(
+                LaneTailMeta::decode(&authoritative_primary).unwrap(),
+                f1.meta
+            );
+
+            apply_backup_loss(normal_dir, loss_mode);
+            // Plant stale `tail.meta.bak.tmp` to verify Phase 2 cleans it
+            // before `O_CREAT|O_EXCL` atomic mirror staging.
+            write_bytes_0600(
+                &normal_dir.join(QUEUE_TAIL_META_BAK_TMP_FILE),
+                b"stale-bak-tmp-from-prior-crash",
+            );
+
+            let mut obs = SegmentObserver::new();
+            let rec = recover_lane_in_storage_dir(repo.path(), CaptureQueueLane::Normal, &mut obs)
+                .expect("AC5: Subcase B1 healthy backup repair must succeed");
+            assert!(
+                rec.mirrored_replica,
+                "{label}: expected mirrored_replica == true"
+            );
+            assert_eq!(rec.meta, f1.meta);
+
+            let post_primary = fs::read(tail_meta_path(normal_dir)).unwrap();
+            let rebuilt_bak = fs::read(tail_meta_bak_path(normal_dir)).unwrap();
+            assert_eq!(
+                rebuilt_bak, authoritative_primary,
+                "{label}: AC5 violated — rebuilt tail.meta.bak bytes must equal authoritative tail.meta"
+            );
+            assert_eq!(post_primary, authoritative_primary);
+            assert_eq!(LaneTailMeta::decode(&post_primary).unwrap(), f1.meta);
+            assert_eq!(LaneTailMeta::decode(&rebuilt_bak).unwrap(), f1.meta);
+            assert!(!normal_dir.join(QUEUE_TAIL_META_BAK_TMP_FILE).exists());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let mode = fs::metadata(tail_meta_bak_path(normal_dir))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777;
+                assert_eq!(mode, 0o600);
+            }
+
+            // Observer verifies atomic mirror sequence strictly targeting backup
+            // `tail.meta.bak` without touching authoritative `tail.meta`.
+            let b_sync = obs
+                .events
+                .iter()
+                .position(|e| {
+                    *e == SegmentOpEvent::MetaTmpWriteAndSync {
+                        lane: QUEUE_LANE_NORMAL_DIR,
+                        tmp_name: QUEUE_TAIL_META_BAK_TMP_FILE,
+                        target_name: QUEUE_TAIL_META_BAK_FILE,
+                    }
+                })
+                .expect("AC5: backup MetaTmpWriteAndSync");
+            let b_ren = obs
+                .events
+                .iter()
+                .position(|e| {
+                    *e == SegmentOpEvent::MetaRename {
+                        lane: QUEUE_LANE_NORMAL_DIR,
+                        tmp_name: QUEUE_TAIL_META_BAK_TMP_FILE,
+                        target_name: QUEUE_TAIL_META_BAK_FILE,
+                    }
+                })
+                .expect("AC5: backup MetaRename");
+            let b_fsync = obs
+                .events
+                .iter()
+                .position(|e| {
+                    *e == SegmentOpEvent::FsyncLaneDirAfterMeta {
+                        lane: QUEUE_LANE_NORMAL_DIR,
+                        target_name: QUEUE_TAIL_META_BAK_FILE,
+                    }
+                })
+                .expect("AC5: backup FsyncLaneDirAfterMeta");
+            assert!(b_sync < b_ren && b_ren < b_fsync);
+            assert!(
+                !obs.events.iter().any(|e| matches!(
+                    e,
+                    SegmentOpEvent::MetaRename {
+                        target_name: QUEUE_TAIL_META_FILE,
+                        ..
+                    }
+                )),
+                "{label}: backup mirror repair must not rewrite authoritative tail.meta"
+            );
+
+            // Subsequent append works cleanly and keeps both replicas synced.
+            let f2 = append_frame(
+                repo.path(),
+                CaptureQueueLane::Normal,
+                FRAME_FLAG_NONE,
+                "rb08z-healthy-2",
+                b"post-backup-repair-append",
+            )
+            .expect("append after Subcase B1 backup mirror repair must succeed");
+            assert_eq!(
+                fs::read(tail_meta_path(normal_dir)).unwrap(),
+                fs::read(tail_meta_bak_path(normal_dir)).unwrap()
+            );
+            assert_eq!(read_converged_lane_tail_meta(normal_dir).unwrap(), f2.meta);
+        }
+
+        // Direct append on healthy Subcase B1 backup loss (all 4 modes with
+        // pre-planted stale `tail.meta.bak.tmp`):
+        // 1. Observed `append_validated_frame_in_storage_dir` proves Phase 2
+        //    rebuilds `tail.meta.bak` from the original authoritative `tail.meta`
+        //    (`MetaTmpWriteAndSync < MetaRename < FsyncLaneDirAfterMeta` strictly
+        //    before `SegmentWriteAll`, with zero primary `MetaRename` before
+        //    `SegmentWriteAll`, and pre-write hook verifies `tail.meta.bak ==
+        //    authoritative_primary` and stale `.tmp` removed before new frame I/O).
+        // 2. Step ② pre-write reject boundary (`append_frame_with_options` with
+        //    tight `max_total_bytes`) proves durable backup mirror repair commits
+        //    even if the incoming append fails before writing any frame bytes.
+        // 3. Public `append_frame` end-to-end repairs and appends cleanly.
+        for (label, loss_mode) in [
+            ("b1-bak-direct-deleted", BackupLossMode::Deleted),
+            ("b1-bak-direct-corrupt-crc", BackupLossMode::CorruptCrc),
+            ("b1-bak-direct-truncated", BackupLossMode::TruncatedGarbage),
+            ("b1-bak-direct-oversized", BackupLossMode::Oversized),
+        ] {
+            // (1) Observed direct append verifying Phase 2 backup mirror repair
+            // strictly before incoming frame write & post-append dual commit.
+            {
+                let repo = tempdir().expect("tempdir");
+                let init = init_capture_queue(repo.path()).expect("init capture queue");
+                let normal_dir = init.paths.normal.clone();
+                let f1 = append_frame(
+                    repo.path(),
+                    CaptureQueueLane::Normal,
+                    FRAME_FLAG_NONE,
+                    "rb08z-direct-obs-1",
+                    b"direct-obs-1",
+                )
+                .unwrap();
+                let authoritative_primary = fs::read(tail_meta_path(&normal_dir)).unwrap();
+                assert_eq!(
+                    LaneTailMeta::decode(&authoritative_primary).unwrap(),
+                    f1.meta
+                );
+
+                apply_backup_loss(&normal_dir, loss_mode);
+                write_bytes_0600(
+                    &normal_dir.join(QUEUE_TAIL_META_BAK_TMP_FILE),
+                    b"stale-direct-obs-meta-bak-tmp",
+                );
+
+                let frame2_buf =
+                    encode_frame(FRAME_FLAG_NONE, "rb08z-direct-obs-2", b"direct-obs-2")
+                        .expect("encode frame2");
+                let hook_dir = normal_dir.clone();
+                let expected_bak_pre_write = authoritative_primary.clone();
+                let expected_seg0_len = f1.meta.committed_len;
+                let hook_ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let hook_ran_clone = std::sync::Arc::clone(&hook_ran);
+                let mut obs = SegmentObserver::with_incoming_frame_write_hook(
+                    move |_lane, seg_id, offset, _len| {
+                        assert_eq!(seg_id, 0);
+                        assert_eq!(offset, expected_seg0_len);
+                        assert!(
+                            !hook_dir.join(QUEUE_TAIL_META_BAK_TMP_FILE).exists(),
+                            "stale tail.meta.bak.tmp must be cleaned before incoming frame write"
+                        );
+                        assert_eq!(
+                            fs::read(tail_meta_bak_path(&hook_dir)).unwrap(),
+                            expected_bak_pre_write,
+                            "tail.meta.bak must already be rebuilt to authoritative f1 meta before incoming frame write"
+                        );
+                        assert_eq!(
+                            fs::read(tail_meta_path(&hook_dir)).unwrap(),
+                            expected_bak_pre_write,
+                            "authoritative tail.meta must remain unchanged before incoming frame write"
+                        );
+                        assert_eq!(
+                            fs::metadata(hook_dir.join(segment_log_file_name(0)))
+                                .unwrap()
+                                .len(),
+                            expected_seg0_len,
+                            "no incoming frame bytes may exist on disk yet when pre-write hook fires"
+                        );
+                        hook_ran_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+                    },
+                );
+
+                let f2 = append_validated_frame_in_storage_dir(
+                    repo.path(),
+                    CaptureQueueLane::Normal,
+                    &frame2_buf,
+                    &mut obs,
+                )
+                .unwrap_or_else(|err| {
+                    panic!(
+                        "{label}: observed direct append on healthy Subcase B1 backup loss must succeed: {err:?}"
+                    )
+                });
+                assert!(
+                    hook_ran.load(std::sync::atomic::Ordering::SeqCst),
+                    "{label}: incoming-frame pre-write hook must execute"
+                );
+                assert_eq!(obs.incoming_frame_write_calls, 1);
+
+                let seg_write = obs
+                    .events
+                    .iter()
+                    .position(|e| matches!(e, SegmentOpEvent::SegmentWriteAll { .. }))
+                    .expect("direct append must emit SegmentWriteAll");
+                let pre_write_events = &obs.events[..seg_write];
+                let b_sync = pre_write_events
+                    .iter()
+                    .position(|e| {
+                        *e == SegmentOpEvent::MetaTmpWriteAndSync {
+                            lane: QUEUE_LANE_NORMAL_DIR,
+                            tmp_name: QUEUE_TAIL_META_BAK_TMP_FILE,
+                            target_name: QUEUE_TAIL_META_BAK_FILE,
+                        }
+                    })
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "{label}: expected backup MetaTmpWriteAndSync before SegmentWriteAll"
+                        )
+                    });
+                let b_ren = pre_write_events
+                    .iter()
+                    .position(|e| {
+                        *e == SegmentOpEvent::MetaRename {
+                            lane: QUEUE_LANE_NORMAL_DIR,
+                            tmp_name: QUEUE_TAIL_META_BAK_TMP_FILE,
+                            target_name: QUEUE_TAIL_META_BAK_FILE,
+                        }
+                    })
+                    .unwrap_or_else(|| {
+                        panic!("{label}: expected backup MetaRename before SegmentWriteAll")
+                    });
+                let b_fsync = pre_write_events
+                    .iter()
+                    .position(|e| {
+                        *e == SegmentOpEvent::FsyncLaneDirAfterMeta {
+                            lane: QUEUE_LANE_NORMAL_DIR,
+                            target_name: QUEUE_TAIL_META_BAK_FILE,
+                        }
+                    })
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "{label}: expected backup FsyncLaneDirAfterMeta before SegmentWriteAll"
+                        )
+                    });
+                assert!(
+                    b_sync < b_ren && b_ren < b_fsync && b_fsync < seg_write,
+                    "{label}: Phase 2 backup mirror repair order violated ({b_sync}, {b_ren}, {b_fsync}, {seg_write})"
+                );
+                assert!(
+                    !pre_write_events.iter().any(|e| matches!(
+                        e,
+                        SegmentOpEvent::MetaRename {
+                            target_name: QUEUE_TAIL_META_FILE,
+                            ..
+                        }
+                    )),
+                    "{label}: Phase 2 backup mirror repair must not rewrite authoritative tail.meta before SegmentWriteAll"
+                );
+
+                let post_write_events = &obs.events[seg_write + 1..];
+                let final_p_ren = post_write_events
+                    .iter()
+                    .position(|e| {
+                        *e == SegmentOpEvent::MetaRename {
+                            lane: QUEUE_LANE_NORMAL_DIR,
+                            tmp_name: QUEUE_TAIL_META_TMP_FILE,
+                            target_name: QUEUE_TAIL_META_FILE,
+                        }
+                    })
+                    .expect("post-append primary MetaRename");
+                let final_b_ren = post_write_events
+                    .iter()
+                    .position(|e| {
+                        *e == SegmentOpEvent::MetaRename {
+                            lane: QUEUE_LANE_NORMAL_DIR,
+                            tmp_name: QUEUE_TAIL_META_BAK_TMP_FILE,
+                            target_name: QUEUE_TAIL_META_BAK_FILE,
+                        }
+                    })
+                    .expect("post-append backup MetaRename");
+                assert!(final_p_ren < final_b_ren);
+
+                let raw_meta = fs::read(tail_meta_path(&normal_dir)).unwrap();
+                let raw_bak = fs::read(tail_meta_bak_path(&normal_dir)).unwrap();
+                assert_eq!(raw_meta, raw_bak);
+                assert_eq!(LaneTailMeta::decode(&raw_meta).unwrap(), f2.meta);
+                assert_eq!(LaneTailMeta::decode(&raw_bak).unwrap(), f2.meta);
+            }
+
+            // (2) Pre-write rejection boundary after Phase 2 backup repair:
+            // incoming append hits Step ② capacity cap (`LBR-AGENT-046`), yet
+            // `tail.meta.bak` is durably rebuilt to authoritative `f1.meta` on disk.
+            {
+                let repo = tempdir().expect("tempdir");
+                let init = init_capture_queue(repo.path()).expect("init capture queue");
+                let normal_dir = &init.paths.normal;
+                let f1 = append_frame(
+                    repo.path(),
+                    CaptureQueueLane::Normal,
+                    FRAME_FLAG_NONE,
+                    "rb08z-boundary-1",
+                    b"boundary-1",
+                )
+                .unwrap();
+                let authoritative_primary = fs::read(tail_meta_path(normal_dir)).unwrap();
+                apply_backup_loss(normal_dir, loss_mode);
+                write_bytes_0600(
+                    &normal_dir.join(QUEUE_TAIL_META_BAK_TMP_FILE),
+                    b"stale-boundary-meta-bak-tmp",
+                );
+
+                let tight_opts = QueueAppendOptions {
+                    max_total_bytes: f1.meta.committed_len,
+                    lock_timeout: DEFAULT_QUEUE_APPEND_LOCK_TIMEOUT,
+                };
+                let cap_err = append_frame_with_options(
+                    repo.path(),
+                    CaptureQueueLane::Normal,
+                    FRAME_FLAG_NONE,
+                    "rb08z-boundary-2",
+                    b"rejected-by-cap",
+                    tight_opts,
+                )
+                .expect_err("tight capacity cap must reject incoming frame after Phase 2 repair");
+                assert!(matches!(cap_err, StorageBackendError::QueueFull { .. }));
+                assert_eq!(cap_err.stable_code_str(), "LBR-AGENT-046");
+                assert!(!normal_dir.join(QUEUE_TAIL_META_BAK_TMP_FILE).exists());
+                assert_eq!(
+                    fs::read(tail_meta_bak_path(normal_dir)).unwrap(),
+                    authoritative_primary,
+                    "{label}: backup mirror repair must persist even when incoming append is rejected at Step ②"
+                );
+                assert_eq!(
+                    fs::read(tail_meta_path(normal_dir)).unwrap(),
+                    authoritative_primary
+                );
+                assert_eq!(
+                    fs::metadata(normal_dir.join(segment_log_file_name(0)))
+                        .unwrap()
+                        .len(),
+                    f1.meta.committed_len
+                );
+            }
+
+            // (3) Public `append_frame` end-to-end with stale `tail.meta.bak.tmp`.
+            {
+                let repo = tempdir().expect("tempdir");
+                let init = init_capture_queue(repo.path()).expect("init capture queue");
+                let normal_dir = &init.paths.normal;
+                let _f1 = append_frame(
+                    repo.path(),
+                    CaptureQueueLane::Normal,
+                    FRAME_FLAG_NONE,
+                    "rb08z-direct-1",
+                    b"direct-1",
+                )
+                .unwrap();
+                apply_backup_loss(normal_dir, loss_mode);
+                write_bytes_0600(
+                    &normal_dir.join(QUEUE_TAIL_META_BAK_TMP_FILE),
+                    b"stale-direct-append-meta-bak-tmp",
+                );
+                let f2 = append_frame(
+                    repo.path(),
+                    CaptureQueueLane::Normal,
+                    FRAME_FLAG_NONE,
+                    "rb08z-direct-2",
+                    b"direct-2",
+                )
+                .unwrap_or_else(|err| {
+                    panic!(
+                        "{label}: direct append_frame on healthy Subcase B1 backup loss must succeed: {err:?}"
+                    )
+                });
+                assert!(
+                    !normal_dir.join(QUEUE_TAIL_META_BAK_TMP_FILE).exists(),
+                    "{label}: stale tail.meta.bak.tmp must be cleaned on direct append"
+                );
+                let raw_meta = fs::read(tail_meta_path(normal_dir)).unwrap();
+                let raw_bak = fs::read(tail_meta_bak_path(normal_dir)).unwrap();
+                assert_eq!(
+                    raw_meta, raw_bak,
+                    "{label}: replicas must match byte-for-byte"
+                );
+                assert_eq!(LaneTailMeta::decode(&raw_meta).unwrap(), f2.meta);
+                assert_eq!(LaneTailMeta::decode(&raw_bak).unwrap(), f2.meta);
+            }
+        }
+    }
 }
