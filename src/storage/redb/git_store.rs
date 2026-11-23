@@ -84,6 +84,8 @@ pub const GIT_REVISION_ORDINAL_CODEC_VERSION: u16 = 1;
 pub const GIT_REVISION_ORDINAL_BY_OID_CODEC_VERSION: u16 = 1;
 /// Current postcard codec version for `revision_ordinal_meta` rows.
 pub const GIT_REVISION_ORDINAL_META_CODEC_VERSION: u16 = 1;
+/// Current postcard codec version for cross-store `meta_generation` ledger (`RB-06b`).
+pub const GIT_META_GENERATION_CODEC_VERSION: u16 = 1;
 
 /// Default bounded write-lock timeout for [`RedbGitStore`] (`30s`).
 pub const DEFAULT_GIT_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -100,8 +102,11 @@ const NOTES_TABLE_NAME: &str = "notes";
 const REVISION_ORDINAL_TABLE_NAME: &str = "revision_ordinal";
 const REVISION_ORDINAL_BY_OID_INDEX_NAME: &str = "revision_ordinal_by_oid";
 const REVISION_ORDINAL_META_TABLE_NAME: &str = "revision_ordinal_meta";
+const META_GENERATION_TABLE_NAME: &str = "meta_generation";
+const META_CROSS_STORE_INTENT_TABLE_NAME: &str = "meta_cross_store_intent";
 
 const SEQ_KEY_REFLOG: &str = "reflog";
+const META_GENERATION_SINGLETON_KEY: &str = "singleton";
 
 const REF_TAG_LOCAL_HEAD_MAIN: u8 = 0;
 const REF_TAG_LOCAL_HEAD_LINKED: u8 = 1;
@@ -163,7 +168,25 @@ pub const REVISION_ORDINAL_BY_OID_TABLE: TableDefinition<'static, (&str, &str), 
 pub const REVISION_ORDINAL_META_TABLE: TableDefinition<'static, &str, &[u8]> =
     TableDefinition::new(REVISION_ORDINAL_META_TABLE_NAME);
 
+/// Cross-store monotonic generation ledger (`ADR-RB-06`, `RB-06b`).
+///
+/// Created lazily inside the first cross-store write transaction so freshly
+/// created `git.redb` files keep exact 61-table repository manifest parity and
+/// pre-`RB-06b` stores open read-only with generation `0`.
+pub const META_GENERATION_TABLE: TableDefinition<'static, &str, &[u8]> =
+    TableDefinition::new(META_GENERATION_TABLE_NAME);
+
+/// Cross-store durable intent outbox keyed by monotonic `generation: u64`
+/// (`ADR-RB-06`, `RB-06b`).
+pub const META_CROSS_STORE_INTENT_TABLE: TableDefinition<'static, u64, &[u8]> =
+    TableDefinition::new(META_CROSS_STORE_INTENT_TABLE_NAME);
+
 static GIT_STORE_TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct GitMetaGenerationValue {
+    cross_store_gen: u64,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct RefTargetStored {
@@ -829,6 +852,495 @@ impl RedbGitStore {
         }
     }
 
+    /// Begin a `META_SCHEMA`-verified read transaction on this `git.redb` handle
+    /// without upgrading read-only handles (`RB-06b` cross-store snapshots).
+    pub(crate) fn begin_checked_read_tx(&self) -> StorageResult<ReadTransaction> {
+        let rtx = match &self.handle {
+            RedbGitHandle::ReadWrite(db) => {
+                begin_checked_read(db.as_ref(), DatabaseRole::Repository)?
+            }
+            RedbGitHandle::ReadOnly(db) => {
+                begin_checked_read(db.as_ref(), DatabaseRole::Repository)?
+            }
+        };
+        let _ = verify_required_tables_read(&rtx)?;
+        Ok(rtx)
+    }
+
+    /// Begin a `META_SCHEMA`-verified bounded write transaction on this
+    /// `git.redb` handle (`RB-06b` cross-store coordinator).
+    pub(crate) fn begin_checked_write_tx(&self) -> StorageResult<WriteTransaction> {
+        let db = self.writable_db()?;
+        let wtx = begin_checked_write_blocking(&db, DatabaseRole::Repository, self.write_timeout)?;
+        verify_required_tables_write(&wtx)?;
+        Ok(wtx)
+    }
+
+    /// Read a reference inside an existing read transaction (used by frozen
+    /// cross-store consistent snapshots).
+    pub(crate) fn read_ref_in_rtx(
+        rtx: &ReadTransaction,
+        key: &RefKey,
+    ) -> StorageResult<Option<RefTarget>> {
+        validate_ref_key(key)?;
+        let ref_table = rtx
+            .open_table(REFERENCE_TABLE)
+            .map_err(|err| map_redb_table_err(err, "open reference table for snapshot read"))?;
+        match ref_table
+            .get(encode_ref_key(key))
+            .map_err(|err| map_redb_storage_err(err, "read reference in snapshot"))?
+        {
+            Some(guard) => Ok(Some(decode_ref_target(guard.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Read the persisted cross-store `META_GENERATION` inside a read transaction.
+    ///
+    /// Returns `0` only when neither `meta_generation` nor `meta_cross_store_intent`
+    /// has been initialized yet (preserving fresh 61-table repository parity and
+    /// pre-`RB-06b` read-only compatibility). Fails closed if `meta_generation`
+    /// exists without its singleton entry or if `meta_cross_store_intent` exists
+    /// without `meta_generation`.
+    pub(crate) fn read_cross_store_generation_in_rtx(rtx: &ReadTransaction) -> StorageResult<u64> {
+        let Some(table) =
+            open_optional_read_table(rtx, META_GENERATION_TABLE, "open git meta_generation table")?
+        else {
+            if open_optional_read_table(
+                rtx,
+                META_CROSS_STORE_INTENT_TABLE,
+                "check git meta_cross_store_intent consistency",
+            )?
+            .is_some()
+            {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: "git redb database has meta_cross_store_intent without meta_generation"
+                        .to_string(),
+                });
+            }
+            return Ok(0);
+        };
+        match table
+            .get(META_GENERATION_SINGLETON_KEY)
+            .map_err(|err| map_redb_storage_err(err, "read git meta_generation"))?
+        {
+            Some(guard) => {
+                let decoded: GitMetaGenerationValue =
+                    decode_versioned(guard.value(), GIT_META_GENERATION_CODEC_VERSION)?;
+                Ok(decoded.cross_store_gen)
+            }
+            None => Err(StorageBackendError::BackendInternal {
+                detail: "git redb database is missing required meta_generation singleton"
+                    .to_string(),
+            }),
+        }
+    }
+
+    /// Read the persisted cross-store `META_GENERATION` inside a write transaction
+    /// without eagerly creating `meta_generation` on an uninitialized store.
+    pub(crate) fn read_cross_store_generation_in_wtx(wtx: &WriteTransaction) -> StorageResult<u64> {
+        let mut has_meta_gen = false;
+        let mut has_intent_table = false;
+        for handle in wtx
+            .list_tables()
+            .map_err(|err| map_redb_storage_err(err, "list git tables for meta_generation check"))?
+        {
+            let name = handle.name();
+            if name == META_GENERATION_TABLE_NAME {
+                has_meta_gen = true;
+            } else if name == META_CROSS_STORE_INTENT_TABLE_NAME {
+                has_intent_table = true;
+            }
+        }
+        if !has_meta_gen {
+            if has_intent_table {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: "git redb database has meta_cross_store_intent without meta_generation"
+                        .to_string(),
+                });
+            }
+            return Ok(0);
+        }
+        let table = wtx
+            .open_table(META_GENERATION_TABLE)
+            .map_err(|err| map_redb_table_err(err, "open git meta_generation for write"))?;
+        match table
+            .get(META_GENERATION_SINGLETON_KEY)
+            .map_err(|err| map_redb_storage_err(err, "read git meta_generation in write tx"))?
+        {
+            Some(guard) => {
+                let decoded: GitMetaGenerationValue =
+                    decode_versioned(guard.value(), GIT_META_GENERATION_CODEC_VERSION)?;
+                Ok(decoded.cross_store_gen)
+            }
+            None => Err(StorageBackendError::BackendInternal {
+                detail: "git redb database is missing required meta_generation singleton"
+                    .to_string(),
+            }),
+        }
+    }
+
+    /// Persist `META_GENERATION = generation` inside an active `git.redb` write transaction.
+    pub(crate) fn write_cross_store_generation_in_wtx(
+        wtx: &WriteTransaction,
+        generation: u64,
+    ) -> StorageResult<()> {
+        let mut table = wtx
+            .open_table(META_GENERATION_TABLE)
+            .map_err(|err| map_redb_table_err(err, "open git meta_generation for write"))?;
+        let encoded = encode_versioned(
+            GIT_META_GENERATION_CODEC_VERSION,
+            &GitMetaGenerationValue {
+                cross_store_gen: generation,
+            },
+        )?;
+        table
+            .insert(META_GENERATION_SINGLETON_KEY, encoded.as_slice())
+            .map_err(|err| map_redb_storage_err(err, "write git meta_generation"))?;
+        Ok(())
+    }
+
+    /// Read all pending cross-store intent entries strictly greater than
+    /// `after_gen` in strictly ascending generation order inside a write transaction.
+    pub(crate) fn read_pending_cross_store_intents_in_wtx(
+        wtx: &WriteTransaction,
+        after_gen: u64,
+    ) -> StorageResult<Vec<(u64, Vec<u8>)>> {
+        let Some(start) = after_gen.checked_add(1) else {
+            return Ok(Vec::new());
+        };
+        let table = wtx
+            .open_table(META_CROSS_STORE_INTENT_TABLE)
+            .map_err(|err| map_redb_table_err(err, "open meta_cross_store_intent for read"))?;
+        let mut out = Vec::new();
+        for entry in table
+            .range(start..)
+            .map_err(|err| map_redb_storage_err(err, "range meta_cross_store_intent"))?
+        {
+            let (k, v) =
+                entry.map_err(|err| map_redb_storage_err(err, "iter meta_cross_store_intent"))?;
+            out.push((k.value(), v.value().to_vec()));
+        }
+        Ok(out)
+    }
+
+    /// Persist a serialized cross-store intent payload under `META_CROSS_STORE_INTENT[generation]`
+    /// inside an active `git.redb` write transaction.
+    pub(crate) fn write_cross_store_intent_in_wtx(
+        wtx: &WriteTransaction,
+        generation: u64,
+        encoded_intent: &[u8],
+    ) -> StorageResult<()> {
+        let mut table = wtx
+            .open_table(META_CROSS_STORE_INTENT_TABLE)
+            .map_err(|err| map_redb_table_err(err, "open meta_cross_store_intent for write"))?;
+        if table
+            .get(generation)
+            .map_err(|err| map_redb_storage_err(err, "check existing meta_cross_store_intent"))?
+            .is_some()
+        {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "cross-store intent generation {generation} already exists; refusing to overwrite outbox entry"
+                ),
+            });
+        }
+        table
+            .insert(generation, encoded_intent)
+            .map_err(|err| map_redb_storage_err(err, "insert meta_cross_store_intent"))?;
+        Ok(())
+    }
+
+    /// Read the current `git.redb` cross-store generation synchronously.
+    pub fn read_cross_store_generation(&self) -> StorageResult<u64> {
+        let rtx = self.begin_checked_read_tx()?;
+        Self::read_cross_store_generation_in_rtx(&rtx)
+    }
+
+    /// List all generation keys currently stored in `META_CROSS_STORE_INTENT`
+    /// in ascending order.
+    pub fn list_cross_store_intent_generations(&self) -> StorageResult<Vec<u64>> {
+        let rtx = self.begin_checked_read_tx()?;
+        let Some(table) = open_optional_read_table(
+            &rtx,
+            META_CROSS_STORE_INTENT_TABLE,
+            "open meta_cross_store_intent for listing",
+        )?
+        else {
+            return Ok(Vec::new());
+        };
+        let mut gens = Vec::new();
+        for entry in table
+            .iter()
+            .map_err(|err| map_redb_storage_err(err, "iter meta_cross_store_intent"))?
+        {
+            let (k, _) = entry
+                .map_err(|err| map_redb_storage_err(err, "read meta_cross_store_intent key"))?;
+            gens.push(k.value());
+        }
+        Ok(gens)
+    }
+
+    /// Execute a reference CAS + optional reflog + optional `agent_bridge_publication`
+    /// binding inside an existing `git.redb` [`WriteTransaction`].
+    pub(crate) fn apply_ref_cas_in_wtx(
+        wtx: &WriteTransaction,
+        key: &RefKey,
+        expected: Option<&RefTarget>,
+        new_target: Option<&RefTarget>,
+        reflogs: &[ReflogWrite],
+        publication: Option<&BridgePublicationRecord>,
+    ) -> StorageResult<(bool, RefCasOutcome)> {
+        validate_ref_key(key)?;
+        if let Some(exp) = expected {
+            validate_ref_target(key, exp)?;
+        }
+        if let Some(new_t) = new_target {
+            validate_ref_target(key, new_t)?;
+        }
+        validate_reflog_writes_for_key(key, reflogs)?;
+        if let Some(pub_rec) = publication {
+            validate_bridge_publication_binding(key, expected, new_target, pub_rec)?;
+        }
+
+        let mut ref_table = wtx
+            .open_table(REFERENCE_TABLE)
+            .map_err(|err| map_redb_table_err(err, "open reference table for write"))?;
+        let encoded_key = encode_ref_key(key);
+        let actual = match ref_table
+            .get(encoded_key)
+            .map_err(|err| map_redb_storage_err(err, "read reference for CAS"))?
+        {
+            Some(guard) => Some(decode_ref_target(guard.value())?),
+            None => None,
+        };
+
+        if actual.as_ref() != expected {
+            return Ok((false, RefCasOutcome::CasConflict { actual }));
+        }
+
+        // Resolve symbolic `HEAD` when binding a bridge publication so switching
+        // `Symbolic(branch -> X)` to `Direct(X)` cannot publish a record without
+        // actually moving `HEAD` to a new commit OID.
+        if let (Some(pub_rec), Some(RefTarget::Symbolic(sym_branch))) = (publication, &actual) {
+            let branch_key = RefKey::LocalBranch {
+                name: sym_branch.clone(),
+            };
+            if let Some(branch_guard) =
+                ref_table.get(encode_ref_key(&branch_key)).map_err(|err| {
+                    map_redb_storage_err(err, "resolve symbolic HEAD target for bridge publication")
+                })?
+                && let RefTarget::Direct(resolved_oid) = decode_ref_target(branch_guard.value())?
+                && resolved_oid == pub_rec.commit_oid
+            {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: "bridge publication requires HEAD to move to a new commit OID"
+                        .to_string(),
+                });
+            }
+        }
+
+        // When updating a `LocalBranch`, verify any accompanying `"HEAD"`
+        // reflog entries belong to a worktree whose `LocalHead` points
+        // symbolically to this branch, and when binding a bridge publication
+        // verify the branch is checked out symbolically by a worktree HEAD.
+        if let RefKey::LocalBranch { name: branch_name } = key {
+            for entry in reflogs {
+                if entry.ref_name == REFLOG_HEAD_REF_NAME {
+                    let head_key = RefKey::LocalHead {
+                        worktree_id: entry.worktree_id.clone(),
+                    };
+                    let head_target =
+                        match ref_table.get(encode_ref_key(&head_key)).map_err(|err| {
+                            map_redb_storage_err(err, "verify LocalHead for branch HEAD reflog")
+                        })? {
+                            Some(g) => Some(decode_ref_target(g.value())?),
+                            None => None,
+                        };
+                    if head_target.as_ref() != Some(&RefTarget::Symbolic(branch_name.clone())) {
+                        return Err(StorageBackendError::BackendInternal {
+                            detail: "HEAD reflog worktree_id does not point symbolically to the LocalBranch being updated"
+                                .to_string(),
+                        });
+                    }
+                }
+            }
+            if publication.is_some() {
+                let mut checked_out = false;
+                let range = ref_table
+                    .range((REF_TAG_LOCAL_HEAD_MAIN, "", "")..(REF_TAG_REMOTE_HEAD, "", ""))
+                    .map_err(|err| {
+                        map_redb_storage_err(
+                            err,
+                            "scan local HEAD rows for bridge publication verification",
+                        )
+                    })?;
+                for entry in range {
+                    let (_, v) = entry.map_err(|err| {
+                        map_redb_storage_err(
+                            err,
+                            "read local HEAD row during bridge publication verification",
+                        )
+                    })?;
+                    let target = decode_ref_target(v.value())?;
+                    if matches!(target, RefTarget::Symbolic(ref b) if b == branch_name) {
+                        checked_out = true;
+                        break;
+                    }
+                }
+                if !checked_out {
+                    return Err(StorageBackendError::BackendInternal {
+                        detail: "bridge publication requires the updated LocalBranch to be checked out by HEAD"
+                            .to_string(),
+                    });
+                }
+            }
+        }
+
+        // Enforce duplicate symbolic HEAD exclusivity across worktrees,
+        // matching SQLite's `idx_name_kind`.
+        if let (
+            RefKey::LocalHead {
+                worktree_id: target_wt,
+            },
+            Some(RefTarget::Symbolic(branch_name)),
+        ) = (key, new_target)
+        {
+            let mut conflict = false;
+            let range = ref_table
+                .range((REF_TAG_LOCAL_HEAD_MAIN, "", "")..(REF_TAG_REMOTE_HEAD, "", ""))
+                .map_err(|err| {
+                    map_redb_storage_err(err, "scan local HEAD rows for symbolic exclusivity")
+                })?;
+            for entry in range {
+                let (k, v) = entry.map_err(|err| {
+                    map_redb_storage_err(err, "read local HEAD row during exclusivity check")
+                })?;
+                let other_key = decode_ref_key(k.value())?;
+                if other_key.worktree_id() == target_wt.as_deref() {
+                    continue;
+                }
+                let other_target = decode_ref_target(v.value())?;
+                if matches!(other_target, RefTarget::Symbolic(ref b) if b == branch_name) {
+                    conflict = true;
+                    break;
+                }
+            }
+            if conflict {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: "branch is already checked out as symbolic HEAD in another worktree"
+                        .to_string(),
+                });
+            }
+        }
+
+        // Apply reference mutation.
+        match new_target {
+            Some(target) => {
+                let encoded_val = encode_versioned(
+                    GIT_REF_CODEC_VERSION,
+                    &RefTargetStored {
+                        target: target.clone(),
+                    },
+                )?;
+                ref_table
+                    .insert(encoded_key, encoded_val.as_slice())
+                    .map_err(|err| map_redb_storage_err(err, "write reference entry"))?;
+            }
+            None => {
+                let _ = ref_table
+                    .remove(encoded_key)
+                    .map_err(|err| map_redb_storage_err(err, "delete reference entry"))?;
+            }
+        }
+        drop(ref_table);
+
+        // Append reflog entries atomically inside the same WriteTransaction.
+        if !reflogs.is_empty() {
+            let marker = encode_versioned(GIT_REFLOG_INDEX_CODEC_VERSION, &ReflogIndexMarker)?;
+            let mut reflog_table = wtx
+                .open_table(REFLOG_TABLE)
+                .map_err(|err| map_redb_table_err(err, "open reflog table for write"))?;
+            let mut idx_table = wtx
+                .open_table(REFLOG_BY_REF_INDEX)
+                .map_err(|err| map_redb_table_err(err, "open reflog_by_ref index"))?;
+            for entry in reflogs {
+                let id = next_reflog_id(wtx)?;
+                let wt_scope = entry.worktree_id.clone().unwrap_or_default();
+                let ref_name_idx = entry.ref_name.clone();
+                let encoded = encode_versioned(
+                    GIT_REFLOG_CODEC_VERSION,
+                    &ReflogStoredRow {
+                        ref_name: entry.ref_name.clone(),
+                        old_oid: entry.old_oid.clone(),
+                        new_oid: entry.new_oid.clone(),
+                        timestamp: entry.timestamp,
+                        committer_name: entry.committer_name.clone(),
+                        committer_email: entry.committer_email.clone(),
+                        action: entry.action.clone(),
+                        message: entry.message.clone(),
+                        worktree_id: entry.worktree_id.clone(),
+                    },
+                )?;
+                reflog_table
+                    .insert(id, encoded.as_slice())
+                    .map_err(|err| map_redb_storage_err(err, "insert reflog entry"))?;
+                idx_table
+                    .insert(
+                        (ref_name_idx.as_str(), wt_scope.as_str(), id),
+                        marker.as_slice(),
+                    )
+                    .map_err(|err| map_redb_storage_err(err, "insert reflog_by_ref index"))?;
+            }
+        }
+
+        // Atomically bind `agent_bridge_publication` inside the same WriteTransaction.
+        if let Some(pub_rec) = publication {
+            let mut pub_table = wtx.open_table(BRIDGE_PUBLICATION_TABLE).map_err(|err| {
+                map_redb_table_err(err, "open agent_bridge_publication table for write")
+            })?;
+            let existing = match pub_table
+                .get(pub_rec.operation_id.as_str())
+                .map_err(|err| map_redb_storage_err(err, "read agent_bridge_publication"))?
+            {
+                Some(guard) => Some(decode_bridge_pub_row(
+                    pub_rec.operation_id.clone(),
+                    guard.value(),
+                )?),
+                None => None,
+            };
+            if let Some(prev) = existing
+                && prev.commit_oid != pub_rec.commit_oid
+            {
+                return Err(StorageBackendError::BackendInternal {
+                    detail:
+                        "bridge operation is already bound to a different commit; refusing to publish"
+                            .to_string(),
+                });
+            }
+            let encoded = encode_versioned(
+                GIT_BRIDGE_PUB_CODEC_VERSION,
+                &BridgePublicationStoredRow {
+                    commit_oid: pub_rec.commit_oid.clone(),
+                    phase: pub_rec.phase,
+                },
+            )?;
+            pub_table
+                .insert(pub_rec.operation_id.as_str(), encoded.as_slice())
+                .map_err(|err| {
+                    map_redb_storage_err(err, "insert agent_bridge_publication entry")
+                })?;
+        }
+
+        Ok((
+            true,
+            RefCasOutcome::Applied {
+                previous: actual,
+                current: new_target.cloned(),
+            },
+        ))
+    }
+
     async fn run_read<T, F>(&self, op: F) -> StorageResult<T>
     where
         T: Send + 'static,
@@ -971,257 +1483,23 @@ impl RedbGitStore {
         let publication_owned = publication.cloned();
 
         self.run_write_conditional(move |wtx| {
-            let mut ref_table = wtx
-                .open_table(REFERENCE_TABLE)
-                .map_err(|err| map_redb_table_err(err, "open reference table for write"))?;
-            let encoded_key = encode_ref_key(&key_owned);
-            let actual = match ref_table
-                .get(encoded_key)
-                .map_err(|err| map_redb_storage_err(err, "read reference for CAS"))?
-            {
-                Some(guard) => Some(decode_ref_target(guard.value())?),
-                None => None,
-            };
-
-            if actual != expected_owned {
-                return Ok((false, RefCasOutcome::CasConflict { actual }));
+            let (applied, outcome) = Self::apply_ref_cas_in_wtx(
+                wtx,
+                &key_owned,
+                expected_owned.as_ref(),
+                new_target_owned.as_ref(),
+                &reflogs_owned,
+                publication_owned.as_ref(),
+            )?;
+            if !applied {
+                return Ok((false, outcome));
             }
-
-            // Resolve symbolic `HEAD` when binding a bridge publication so switching
-            // `Symbolic(branch -> X)` to `Direct(X)` cannot publish a record without
-            // actually moving `HEAD` to a new commit OID.
-            if let (Some(pub_rec), Some(RefTarget::Symbolic(sym_branch))) =
-                (&publication_owned, &actual)
-            {
-                let branch_key = RefKey::LocalBranch {
-                    name: sym_branch.clone(),
-                };
-                if let Some(branch_guard) = ref_table
-                    .get(encode_ref_key(&branch_key))
-                    .map_err(|err| {
-                        map_redb_storage_err(
-                            err,
-                            "resolve symbolic HEAD target for bridge publication",
-                        )
-                    })?
-                    && let RefTarget::Direct(resolved_oid) =
-                        decode_ref_target(branch_guard.value())?
-                    && resolved_oid == pub_rec.commit_oid
-                {
-                    return Err(StorageBackendError::BackendInternal {
-                        detail: "bridge publication requires HEAD to move to a new commit OID"
-                            .to_string(),
-                    });
-                }
-            }
-
-            // When updating a `LocalBranch`, verify any accompanying `"HEAD"`
-            // reflog entries belong to a worktree whose `LocalHead` points
-            // symbolically to this branch, and when binding a bridge publication
-            // verify the branch is checked out symbolically by a worktree HEAD.
-            if let RefKey::LocalBranch { name: branch_name } = &key_owned {
-                for entry in &reflogs_owned {
-                    if entry.ref_name == REFLOG_HEAD_REF_NAME {
-                        let head_key = RefKey::LocalHead {
-                            worktree_id: entry.worktree_id.clone(),
-                        };
-                        let head_target = match ref_table
-                            .get(encode_ref_key(&head_key))
-                            .map_err(|err| {
-                                map_redb_storage_err(
-                                    err,
-                                    "verify LocalHead for branch HEAD reflog",
-                                )
-                            })? {
-                            Some(g) => Some(decode_ref_target(g.value())?),
-                            None => None,
-                        };
-                        if head_target.as_ref() != Some(&RefTarget::Symbolic(branch_name.clone())) {
-                            return Err(StorageBackendError::BackendInternal {
-                                detail: "HEAD reflog worktree_id does not point symbolically to the LocalBranch being updated"
-                                    .to_string(),
-                            });
-                        }
-                    }
-                }
-                if publication_owned.is_some() {
-                    let mut checked_out = false;
-                    let range = ref_table
-                        .range((REF_TAG_LOCAL_HEAD_MAIN, "", "")..(REF_TAG_REMOTE_HEAD, "", ""))
-                        .map_err(|err| {
-                            map_redb_storage_err(
-                                err,
-                                "scan local HEAD rows for bridge publication verification",
-                            )
-                        })?;
-                    for entry in range {
-                        let (_, v) = entry.map_err(|err| {
-                            map_redb_storage_err(
-                                err,
-                                "read local HEAD row during bridge publication verification",
-                            )
-                        })?;
-                        let target = decode_ref_target(v.value())?;
-                        if matches!(target, RefTarget::Symbolic(ref b) if b == branch_name) {
-                            checked_out = true;
-                            break;
-                        }
-                    }
-                    if !checked_out {
-                        return Err(StorageBackendError::BackendInternal {
-                            detail: "bridge publication requires the updated LocalBranch to be checked out by HEAD"
-                                .to_string(),
-                        });
-                    }
-                }
-            }
-
-            // Enforce duplicate symbolic HEAD exclusivity across worktrees,
-            // matching SQLite's `idx_name_kind`.
-            if let (
-                RefKey::LocalHead {
-                    worktree_id: target_wt,
-                },
-                Some(RefTarget::Symbolic(branch_name)),
-            ) = (&key_owned, &new_target_owned)
-            {
-                let mut conflict = false;
-                let range = ref_table
-                    .range((REF_TAG_LOCAL_HEAD_MAIN, "", "")..(REF_TAG_REMOTE_HEAD, "", ""))
-                    .map_err(|err| {
-                        map_redb_storage_err(err, "scan local HEAD rows for symbolic exclusivity")
-                    })?;
-                for entry in range {
-                    let (k, v) = entry.map_err(|err| {
-                        map_redb_storage_err(err, "read local HEAD row during exclusivity check")
-                    })?;
-                    let other_key = decode_ref_key(k.value())?;
-                    if other_key.worktree_id() == target_wt.as_deref() {
-                        continue;
-                    }
-                    let other_target = decode_ref_target(v.value())?;
-                    if matches!(other_target, RefTarget::Symbolic(ref b) if b == branch_name) {
-                        conflict = true;
-                        break;
-                    }
-                }
-                if conflict {
-                    return Err(StorageBackendError::BackendInternal {
-                        detail:
-                            "branch is already checked out as symbolic HEAD in another worktree"
-                                .to_string(),
-                    });
-                }
-            }
-
-            // Apply reference mutation.
-            match &new_target_owned {
-                Some(target) => {
-                    let encoded_val = encode_versioned(
-                        GIT_REF_CODEC_VERSION,
-                        &RefTargetStored {
-                            target: target.clone(),
-                        },
-                    )?;
-                    ref_table
-                        .insert(encoded_key, encoded_val.as_slice())
-                        .map_err(|err| map_redb_storage_err(err, "write reference entry"))?;
-                }
-                None => {
-                    let _ = ref_table
-                        .remove(encoded_key)
-                        .map_err(|err| map_redb_storage_err(err, "delete reference entry"))?;
-                }
-            }
-            drop(ref_table);
-
-            // Append reflog entries atomically inside the same WriteTransaction.
-            if !reflogs_owned.is_empty() {
-                let marker = encode_versioned(GIT_REFLOG_INDEX_CODEC_VERSION, &ReflogIndexMarker)?;
-                let mut reflog_table = wtx
-                    .open_table(REFLOG_TABLE)
-                    .map_err(|err| map_redb_table_err(err, "open reflog table for write"))?;
-                let mut idx_table = wtx
-                    .open_table(REFLOG_BY_REF_INDEX)
-                    .map_err(|err| map_redb_table_err(err, "open reflog_by_ref index"))?;
-                for entry in reflogs_owned {
-                    let id = next_reflog_id(wtx)?;
-                    let wt_scope = entry.worktree_id.clone().unwrap_or_default();
-                    let ref_name_idx = entry.ref_name.clone();
-                    let encoded = encode_versioned(
-                        GIT_REFLOG_CODEC_VERSION,
-                        &ReflogStoredRow {
-                            ref_name: entry.ref_name,
-                            old_oid: entry.old_oid,
-                            new_oid: entry.new_oid,
-                            timestamp: entry.timestamp,
-                            committer_name: entry.committer_name,
-                            committer_email: entry.committer_email,
-                            action: entry.action,
-                            message: entry.message,
-                            worktree_id: entry.worktree_id,
-                        },
-                    )?;
-                    reflog_table
-                        .insert(id, encoded.as_slice())
-                        .map_err(|err| map_redb_storage_err(err, "insert reflog entry"))?;
-                    idx_table
-                        .insert((ref_name_idx.as_str(), wt_scope.as_str(), id), marker.as_slice())
-                        .map_err(|err| map_redb_storage_err(err, "insert reflog_by_ref index"))?;
-                }
-            }
-
-            // Atomically bind `agent_bridge_publication` inside the same WriteTransaction.
-            if let Some(pub_rec) = publication_owned {
-                let mut pub_table = wtx.open_table(BRIDGE_PUBLICATION_TABLE).map_err(|err| {
-                    map_redb_table_err(err, "open agent_bridge_publication table for write")
-                })?;
-                let existing = match pub_table
-                    .get(pub_rec.operation_id.as_str())
-                    .map_err(|err| map_redb_storage_err(err, "read agent_bridge_publication"))?
-                {
-                    Some(guard) => Some(decode_bridge_pub_row(
-                        pub_rec.operation_id.clone(),
-                        guard.value(),
-                    )?),
-                    None => None,
-                };
-                if let Some(prev) = existing
-                    && prev.commit_oid != pub_rec.commit_oid
-                {
-                    return Err(StorageBackendError::BackendInternal {
-                        detail:
-                            "bridge operation is already bound to a different commit; refusing to publish"
-                                .to_string(),
-                    });
-                }
-                let encoded = encode_versioned(
-                    GIT_BRIDGE_PUB_CODEC_VERSION,
-                    &BridgePublicationStoredRow {
-                        commit_oid: pub_rec.commit_oid,
-                        phase: pub_rec.phase,
-                    },
-                )?;
-                pub_table
-                    .insert(pub_rec.operation_id.as_str(), encoded.as_slice())
-                    .map_err(|err| {
-                        map_redb_storage_err(err, "insert agent_bridge_publication entry")
-                    })?;
-            }
-
             if abort_before_commit_for_test {
                 return Err(StorageBackendError::BackendInternal {
                     detail: "injected pre-commit abort for rollback verification".to_string(),
                 });
             }
-
-            Ok((
-                true,
-                RefCasOutcome::Applied {
-                    previous: actual,
-                    current: new_target_owned,
-                },
-            ))
+            Ok((true, outcome))
         })
         .await
     }

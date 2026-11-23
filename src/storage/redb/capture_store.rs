@@ -2660,20 +2660,212 @@ impl RedbCaptureStore {
 
     /// Return all live table names currently registered inside this `.redb` file.
     pub fn list_live_table_names(&self) -> StorageResult<BTreeSet<String>> {
-        let rtx = match self.handle.as_ref() {
-            RedbCaptureHandle::ReadWrite(db) => {
-                begin_checked_read(db.as_ref(), DatabaseRole::Capture)?
-            }
-            RedbCaptureHandle::ReadOnly(db) => {
-                begin_checked_read(db.as_ref(), DatabaseRole::Capture)?
-            }
-        };
+        let rtx = self.begin_checked_read_tx()?;
         let names = rtx
             .list_tables()
             .map_err(|e| map_redb_storage_err(e, "list live redb capture tables"))?
             .map(|h| h.name().to_string())
             .collect();
         Ok(names)
+    }
+
+    /// Begin a `META_SCHEMA`-verified read transaction on this `capture.redb`
+    /// handle without upgrading read-only handles (`RB-06b` cross-store snapshots).
+    pub(crate) fn begin_checked_read_tx(&self) -> StorageResult<ReadTransaction> {
+        match self.handle.as_ref() {
+            RedbCaptureHandle::ReadWrite(db) => {
+                begin_checked_read(db.as_ref(), DatabaseRole::Capture)
+            }
+            RedbCaptureHandle::ReadOnly(db) => {
+                begin_checked_read(db.as_ref(), DatabaseRole::Capture)
+            }
+        }
+    }
+
+    /// Begin a `META_SCHEMA`-verified bounded write transaction on this
+    /// `capture.redb` handle (`RB-06b` cross-store coordinator).
+    pub(crate) fn begin_checked_write_tx(&self) -> StorageResult<WriteTransaction> {
+        let db = match self.handle.as_ref() {
+            RedbCaptureHandle::ReadWrite(db) => Arc::clone(db),
+            RedbCaptureHandle::ReadOnly(_) => {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: "cannot mutate read-only redb capture store (cross-store write)"
+                        .to_string(),
+                });
+            }
+        };
+        begin_checked_write_blocking(db.as_ref(), DatabaseRole::Capture, self.write_timeout)
+    }
+
+    /// Record a committed cross-store write transaction against this handle's counter.
+    pub(crate) fn record_write_tx_commit(&self) {
+        self.write_tx_count.fetch_add(1, Ordering::Release);
+    }
+
+    /// Read an `agent_session` inside an existing read transaction (used by
+    /// frozen cross-store consistent snapshots).
+    pub(crate) fn read_session_in_rtx(
+        rtx: &ReadTransaction,
+        session_id: &str,
+    ) -> StorageResult<Option<AgentSessionRecord>> {
+        validate_non_empty_no_nul(session_id, "session_id")?;
+        let tbl = rtx
+            .open_table(AGENT_SESSION_TABLE)
+            .map_err(|e| map_redb_table_err(e, "open agent_session for snapshot read"))?;
+        tbl.get(session_id)
+            .map_err(|e| map_redb_storage_err(e, "get agent_session in snapshot"))?
+            .map(|g| dec(g.value()))
+            .transpose()
+    }
+
+    /// Read the persisted cross-store `META_GENERATION` inside a read transaction.
+    ///
+    /// Fails closed with `LBR-IO-001` if either the required `meta_generation`
+    /// table or its singleton entry is missing (treating missing required
+    /// metadata as corruption rather than silently returning generation `0`).
+    pub(crate) fn read_cross_store_generation_in_rtx(rtx: &ReadTransaction) -> StorageResult<u64> {
+        let tbl = match rtx.open_table(META_GENERATION_TABLE) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: "capture redb database is missing required meta_generation table"
+                        .to_string(),
+                });
+            }
+            Err(e) => return Err(map_redb_table_err(e, "open capture meta_generation")),
+        };
+        match tbl
+            .get(SINGLETON_KEY)
+            .map_err(|e| map_redb_storage_err(e, "read capture meta_generation"))?
+        {
+            Some(g) => Ok(dec::<MetaGenerationValue>(g.value())?.cross_store_gen),
+            None => Err(StorageBackendError::BackendInternal {
+                detail: "capture redb database is missing required meta_generation singleton"
+                    .to_string(),
+            }),
+        }
+    }
+
+    /// Read the persisted cross-store `META_GENERATION` inside a write transaction.
+    ///
+    /// Verifies that `meta_generation` already exists before opening it so a
+    /// damaged capture database is never silently repaired or reset to `0`.
+    pub(crate) fn read_cross_store_generation_in_wtx(wtx: &WriteTransaction) -> StorageResult<u64> {
+        let has_meta_generation = wtx
+            .list_tables()
+            .map_err(|e| map_redb_storage_err(e, "list capture tables for meta_generation check"))?
+            .any(|h| h.name() == META_GENERATION_TABLE.name());
+        if !has_meta_generation {
+            return Err(StorageBackendError::BackendInternal {
+                detail: "capture redb database is missing required meta_generation table"
+                    .to_string(),
+            });
+        }
+        let tbl = wtx
+            .open_table(META_GENERATION_TABLE)
+            .map_err(|e| map_redb_table_err(e, "open capture meta_generation in write tx"))?;
+        match tbl
+            .get(SINGLETON_KEY)
+            .map_err(|e| map_redb_storage_err(e, "read capture meta_generation in write tx"))?
+        {
+            Some(g) => Ok(dec::<MetaGenerationValue>(g.value())?.cross_store_gen),
+            None => Err(StorageBackendError::BackendInternal {
+                detail: "capture redb database is missing required meta_generation singleton"
+                    .to_string(),
+            }),
+        }
+    }
+
+    /// Persist `META_GENERATION = generation` inside an active `capture.redb` write transaction.
+    pub(crate) fn write_cross_store_generation_in_wtx(
+        wtx: &WriteTransaction,
+        generation: u64,
+    ) -> StorageResult<()> {
+        let has_meta_generation = wtx
+            .list_tables()
+            .map_err(|e| map_redb_storage_err(e, "list capture tables for meta_generation write"))?
+            .any(|h| h.name() == META_GENERATION_TABLE.name());
+        if !has_meta_generation {
+            return Err(StorageBackendError::BackendInternal {
+                detail: "capture redb database is missing required meta_generation table"
+                    .to_string(),
+            });
+        }
+        let mut tbl = wtx
+            .open_table(META_GENERATION_TABLE)
+            .map_err(|e| map_redb_table_err(e, "open capture meta_generation for write"))?;
+        let bytes = enc(&MetaGenerationValue {
+            cross_store_gen: generation,
+        })?;
+        tbl.insert(SINGLETON_KEY, bytes.as_slice())
+            .map_err(|e| map_redb_storage_err(e, "write capture meta_generation"))?;
+        Ok(())
+    }
+
+    /// Read the current `capture.redb` cross-store generation synchronously.
+    pub fn read_cross_store_generation(&self) -> StorageResult<u64> {
+        let rtx = self.begin_checked_read_tx()?;
+        Self::read_cross_store_generation_in_rtx(&rtx)
+    }
+
+    /// Idempotently apply a slice of [`CaptureBatchItem`]s keyed by full UTF-8
+    /// semantic `dedup_key` inside an active `capture.redb` [`WriteTransaction`].
+    ///
+    /// Shared single source of truth for [`CaptureStore::append_capture_batch`]
+    /// and `ADR-RB-06` cross-store intent application / replay (`RB-06b`).
+    pub(crate) fn apply_capture_batch_items_in_wtx(
+        wtx: &WriteTransaction,
+        items: &[CaptureBatchItem],
+    ) -> StorageResult<(usize, usize)> {
+        let marker = enc(&MarkerValue)?;
+        let mut applied_count = 0usize;
+        let mut deduplicated_count = 0usize;
+
+        for item in items {
+            let already_present = {
+                let mut dedup = wtx
+                    .open_table(CAPTURE_DEDUP_KEYS_TABLE)
+                    .map_err(|e| map_redb_table_err(e, "open capture_dedup_keys"))?;
+                if dedup
+                    .get(item.dedup_key.as_str())
+                    .map_err(|e| map_redb_storage_err(e, "lookup capture_dedup_keys"))?
+                    .is_some()
+                {
+                    true
+                } else {
+                    dedup
+                        .insert(item.dedup_key.as_str(), marker.as_slice())
+                        .map_err(|e| map_redb_storage_err(e, "insert capture_dedup_keys"))?;
+                    false
+                }
+            };
+            if already_present {
+                deduplicated_count += 1;
+                continue;
+            }
+
+            match &item.payload {
+                CaptureBatchPayload::UpsertSession(rec) => upsert_session_in_wtx(wtx, rec)?,
+                CaptureBatchPayload::UpsertCheckpoint(rec) => {
+                    upsert_checkpoint_in_wtx(wtx, rec)?;
+                }
+                CaptureBatchPayload::UpsertSessionCommit(rec) => {
+                    put_session_commit_in_wtx(wtx, rec)?;
+                }
+                CaptureBatchPayload::InsertUsageStats(rec) => {
+                    put_usage_stats_in_wtx(wtx, rec)?;
+                }
+                CaptureBatchPayload::AppendAuditLog(rec) => {
+                    append_audit_log_in_wtx(wtx, rec)?;
+                }
+                CaptureBatchPayload::AppendWorkspaceScopeAudit(rec) => {
+                    append_workspace_scope_audit_in_wtx(wtx, rec)?;
+                }
+            }
+            applied_count += 1;
+        }
+
+        Ok((applied_count, deduplicated_count))
     }
 
     async fn read_tx<T, F>(&self, op: F) -> StorageResult<T>
@@ -3524,53 +3716,8 @@ impl CaptureStore for RedbCaptureStore {
                 }
             }
 
-            let marker = enc(&MarkerValue)?;
-            let mut applied_count = 0usize;
-            let mut deduplicated_count = 0usize;
-
-            for item in &items {
-                let already_present = {
-                    let mut dedup = wtx
-                        .open_table(CAPTURE_DEDUP_KEYS_TABLE)
-                        .map_err(|e| map_redb_table_err(e, "open capture_dedup_keys"))?;
-                    if dedup
-                        .get(item.dedup_key.as_str())
-                        .map_err(|e| map_redb_storage_err(e, "lookup capture_dedup_keys"))?
-                        .is_some()
-                    {
-                        true
-                    } else {
-                        dedup
-                            .insert(item.dedup_key.as_str(), marker.as_slice())
-                            .map_err(|e| map_redb_storage_err(e, "insert capture_dedup_keys"))?;
-                        false
-                    }
-                };
-                if already_present {
-                    deduplicated_count += 1;
-                    continue;
-                }
-
-                match &item.payload {
-                    CaptureBatchPayload::UpsertSession(rec) => upsert_session_in_wtx(wtx, rec)?,
-                    CaptureBatchPayload::UpsertCheckpoint(rec) => {
-                        upsert_checkpoint_in_wtx(wtx, rec)?;
-                    }
-                    CaptureBatchPayload::UpsertSessionCommit(rec) => {
-                        put_session_commit_in_wtx(wtx, rec)?;
-                    }
-                    CaptureBatchPayload::InsertUsageStats(rec) => {
-                        put_usage_stats_in_wtx(wtx, rec)?;
-                    }
-                    CaptureBatchPayload::AppendAuditLog(rec) => {
-                        append_audit_log_in_wtx(wtx, rec)?;
-                    }
-                    CaptureBatchPayload::AppendWorkspaceScopeAudit(rec) => {
-                        append_workspace_scope_audit_in_wtx(wtx, rec)?;
-                    }
-                }
-                applied_count += 1;
-            }
+            let (applied_count, deduplicated_count) =
+                Self::apply_capture_batch_items_in_wtx(wtx, &items)?;
 
             let highwater = if let Some((lane, next_hw)) = highwater_advance {
                 write_highwater_in_wtx(wtx, lane, next_hw)?;

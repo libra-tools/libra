@@ -19,6 +19,8 @@ pub mod capture_store;
 #[cfg(any(feature = "storage-redb", feature = "storage-queue"))]
 pub mod codec;
 pub mod config_store;
+#[cfg(feature = "storage-redb")]
+pub mod cross_store;
 pub mod error;
 pub mod git_state_store;
 pub mod git_store;
@@ -91,6 +93,14 @@ pub use config_store::{
     GLOBAL_CONFIG_FILE_MODE, GLOBAL_CONFIG_TOMBSTONE_MODE, REPOSITORY_CONFIG_FILE_MODE,
     SYSTEM_CONFIG_FILE_MODE, SYSTEM_CONFIG_TOMBSTONE_MODE, expected_config_file_mode,
     expected_config_tombstone_mode,
+};
+#[cfg(feature = "storage-redb")]
+pub use cross_store::{
+    CROSS_STORE_CAPTURE_UNREACHABLE_PREFIX, CROSS_STORE_INCONSISTENT_SNAPSHOT_PREFIX,
+    CROSS_STORE_INTENT_CODEC_VERSION, CROSS_STORE_SNAPSHOT_MAX_RETRIES, CrossStoreCommitOutcome,
+    CrossStoreConsistentSnapshot, CrossStoreCoordinator, CrossStoreIntentRecord,
+    CrossStoreRefCasOp, DEFAULT_SNAPSHOT_RETRY_BACKOFF, is_cross_store_capture_unavailable_error,
+    is_cross_store_inconsistent_snapshot_error, snapshot_consistent_read_only_blocking,
 };
 pub use error::{StorageBackendError, StorageResult};
 #[cfg(feature = "storage-redb")]
