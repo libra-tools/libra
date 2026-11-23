@@ -152,9 +152,105 @@ fn should_rotate_active_segment(
     Ok(projected > rotation_threshold_bytes)
 }
 
+/// Enforce `ADR-RB-05` #3 Step ② (b) (`RB-08j`): when an incoming frame
+/// requires normal 16 MiB segment rotation (`rotating == true`) and
+/// `LTM2.sealed.len() >= MAX_SEALED_SEGMENTS` (`256`), reject fail-closed with
+/// recoverable backpressure `StorageBackendError::QueueFull` (`LBR-AGENT-046`)
+/// strictly BEFORE creating `events-<S+1:08>.log` or modifying any segment or
+/// metadata file for the incoming frame.
+fn enforce_rotation_sealed_cap_limit(sealed_len: usize, rotating: bool) -> StorageResult<()> {
+    if rotating && sealed_len >= MAX_SEALED_SEGMENTS {
+        return Err(StorageBackendError::QueueFull {
+            detail: format!(
+                "capture queue sealed segment table is full ({sealed_len}/{MAX_SEALED_SEGMENTS}); reclaim sealed segments before rotating"
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Build and validate the `LTM2` metadata after reclaiming the oldest sealed
+/// segment `seg_id` (`seg_id == min_live_seg && seg_id < active_seg && seg_id < highwater_seg`)
+/// per `ADR-RB-05` #4 ③ (`RB-08j`, `RB-09d`).
+#[allow(dead_code)] // Consumed by `storage::queue::writer` starting in RB-09.
+fn build_reclaimed_tail_meta(
+    meta: &LaneTailMeta,
+    seg_id: u32,
+    highwater_seg: u32,
+) -> StorageResult<LaneTailMeta> {
+    if seg_id >= highwater_seg {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "cannot reclaim capture queue segment at or beyond consumer highwater"
+                .to_string(),
+        });
+    }
+    if seg_id >= meta.active_seg {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "cannot reclaim active or future capture queue segment".to_string(),
+        });
+    }
+    if seg_id != meta.min_live_seg {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "capture queue segment reclamation must advance min_live_seg strictly in order"
+                .to_string(),
+        });
+    }
+    let Some(oldest) = meta.sealed.first() else {
+        return Err(StorageBackendError::CorruptCommittedFrame {
+            detail: "LTM2 sealed table is empty while seg_id < active_seg".to_string(),
+        });
+    };
+    if oldest.seg_id != seg_id {
+        return Err(StorageBackendError::CorruptCommittedFrame {
+            detail: "LTM2 oldest sealed entry seg_id does not match min_live_seg".to_string(),
+        });
+    }
+    let next_min_live =
+        seg_id
+            .checked_add(1)
+            .ok_or_else(|| StorageBackendError::BackendInternal {
+                detail: "capture queue min_live_seg u32 overflow during reclaim".to_string(),
+            })?;
+    let next_meta = LaneTailMeta {
+        min_live_seg: next_min_live,
+        active_seg: meta.active_seg,
+        committed_len: meta.committed_len,
+        prefix_crc32c: meta.prefix_crc32c,
+        sealed: meta.sealed[1..].to_vec(),
+    };
+    next_meta
+        .validate()
+        .map_err(Ltm2CodecError::into_storage_error)?;
+    Ok(next_meta)
+}
+
+/// Validate `ADR-RB-05` #4 ③ reclamation preconditions strictly against the
+/// read-only Phase 1 authoritative `LTM2` BEFORE any Phase 2 metadata repair,
+/// `.tmp` cleanup, or segment recovery mutates disk state.
+#[allow(dead_code)] // Consumed by `storage::queue::writer` starting in RB-09.
+fn validate_reclaim_plan_readonly<T>(
+    plan: &Phase1Plan<T>,
+    seg_id: u32,
+    highwater_seg: u32,
+) -> StorageResult<()> {
+    let meta = match plan {
+        Phase1Plan::Case0aFreshEmpty { .. } | Phase1Plan::Case0bPreInitializedEmpty { .. } => {
+            return Err(StorageBackendError::BackendInternal {
+                detail: "cannot reclaim sealed segment from empty capture queue lane".to_string(),
+            });
+        }
+        Phase1Plan::CaseAClean { meta, .. }
+        | Phase1Plan::CaseCRecoverTail { meta, .. }
+        | Phase1Plan::CaseDRecoverValidSuccessor { meta, .. }
+        | Phase1Plan::CaseDCleanOrphanSuccessor { meta, .. } => meta,
+    };
+    let _ = build_reclaimed_tail_meta(meta, seg_id, highwater_seg)?;
+    Ok(())
+}
+
 /// Build the post-append `LTM2` metadata for either in-place append on
 /// `meta.active_seg` or 16 MiB normal rotation to `meta.active_seg + 1`
-/// (`ADR-RB-05` #3 Step ③–④, `RB-08g`).
+/// (`ADR-RB-05` #3 Step ③–④, `RB-08g`, `RB-08j`).
 fn build_next_append_meta(
     prev_meta: LaneTailMeta,
     frame_buf: &[u8],
@@ -165,6 +261,7 @@ fn build_next_append_meta(
             detail: "frame length exceeds u64".to_string(),
         })?;
     if rotating {
+        enforce_rotation_sealed_cap_limit(prev_meta.sealed.len(), true)?;
         if prev_meta.committed_len == 0 {
             return Err(StorageBackendError::BackendInternal {
                 detail: "cannot seal a 0-byte capture queue segment during rotation".to_string(),
@@ -803,6 +900,14 @@ enum SegmentOpEvent {
     FsyncLaneDirOnRecovery {
         lane: &'static str,
     },
+    ReclaimSegmentUnlink {
+        lane: &'static str,
+        seg_id: u32,
+    },
+    FsyncLaneDirAfterReclaim {
+        lane: &'static str,
+        seg_id: u32,
+    },
     CapacityChecked {
         priority_bytes: u64,
         normal_bytes: u64,
@@ -854,6 +959,11 @@ enum SegmentCrashPoint {
     /// `events-<S+1>.log` + `fsync_dir(lane_dir)` and strictly before Step C2
     /// dual-replica `LTM2` commit (`RB-08i` Boundary 3).
     AfterStepC2CreateSegmentBeforeMeta,
+    /// Simulate process crash immediately after `reclaim_sealed_segment`
+    /// commits dual-replica `LTM2` (advancing `MIN_LIVE_SEG` and removing
+    /// `seg_id` from `sealed[]`) and strictly before `unlink(events-<seg_id>)`
+    /// (`ADR-RB-05` #4 ③, `RB-08j`).
+    AfterReclaimMetaBeforeUnlink,
 }
 
 #[cfg(test)]
@@ -864,6 +974,7 @@ struct SegmentObserver {
     events: Vec<SegmentOpEvent>,
     crash_point: SegmentCrashPoint,
     before_create_missing_lock: Option<BeforeCreateMissingLockHook>,
+    simulate_foreign_reclaim_owner: bool,
 }
 
 #[cfg(test)]
@@ -873,6 +984,7 @@ impl SegmentObserver {
             events: Vec::new(),
             crash_point: SegmentCrashPoint::None,
             before_create_missing_lock: None,
+            simulate_foreign_reclaim_owner: false,
         }
     }
 
@@ -881,6 +993,7 @@ impl SegmentObserver {
             events: Vec::new(),
             crash_point,
             before_create_missing_lock: None,
+            simulate_foreign_reclaim_owner: false,
         }
     }
 
@@ -889,7 +1002,21 @@ impl SegmentObserver {
             events: Vec::new(),
             crash_point: SegmentCrashPoint::None,
             before_create_missing_lock: Some(Box::new(hook)),
+            simulate_foreign_reclaim_owner: false,
         }
+    }
+
+    fn with_foreign_reclaim_owner() -> Self {
+        Self {
+            events: Vec::new(),
+            crash_point: SegmentCrashPoint::None,
+            before_create_missing_lock: None,
+            simulate_foreign_reclaim_owner: true,
+        }
+    }
+
+    fn simulate_foreign_reclaim_owner(&self) -> bool {
+        self.simulate_foreign_reclaim_owner
     }
 
     fn on_before_create_missing_lock(&mut self) {
@@ -1064,6 +1191,16 @@ impl SegmentObserver {
             .push(SegmentOpEvent::FsyncLaneDirOnRecovery { lane });
     }
 
+    fn record_reclaim_segment_unlink(&mut self, lane: &'static str, seg_id: u32) {
+        self.events
+            .push(SegmentOpEvent::ReclaimSegmentUnlink { lane, seg_id });
+    }
+
+    fn record_fsync_lane_after_reclaim(&mut self, lane: &'static str, seg_id: u32) {
+        self.events
+            .push(SegmentOpEvent::FsyncLaneDirAfterReclaim { lane, seg_id });
+    }
+
     fn record_capacity_checked(
         &mut self,
         occupancy: CaptureQueueOccupancy,
@@ -1108,6 +1245,7 @@ enum SegmentCrashPoint {
     AfterCaseCStepC1TruncateSyncBeforeMeta,
     AfterCaseCStepC1MetaBeforeStepC2,
     AfterStepC2CreateSegmentBeforeMeta,
+    AfterReclaimMetaBeforeUnlink,
 }
 
 #[cfg(not(test))]
@@ -1227,6 +1365,12 @@ impl SegmentObserver {
     fn record_fsync_lane_on_recovery(&mut self, _lane: &'static str) {}
 
     #[inline]
+    fn record_reclaim_segment_unlink(&mut self, _lane: &'static str, _seg_id: u32) {}
+
+    #[inline]
+    fn record_fsync_lane_after_reclaim(&mut self, _lane: &'static str, _seg_id: u32) {}
+
+    #[inline]
     fn record_capacity_checked(
         &mut self,
         _occupancy: CaptureQueueOccupancy,
@@ -1245,6 +1389,11 @@ impl SegmentObserver {
 
     #[inline]
     fn on_before_create_missing_lock(&mut self) {}
+
+    #[inline]
+    fn simulate_foreign_reclaim_owner(&self) -> bool {
+        false
+    }
 }
 
 // ============================================================================
@@ -1901,6 +2050,19 @@ pub fn measure_capture_queue_occupancy_at_root(
     }
 }
 
+/// Outcome of crash-safely reclaiming the oldest consumed sealed segment
+/// (`seg_id == min_live_seg && seg_id < active_seg && seg_id < highwater_seg`)
+/// under the `writer.lock -> capture-queue/append.lock` protocol
+/// (`ADR-RB-05` #4 ③, `RB-08j`, `RB-09d`, `RB-09k`, `RB-09l`).
+#[allow(dead_code)] // Consumed by `storage::queue::writer` starting in RB-09.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SegmentReclaimOutcome {
+    pub(super) lane: CaptureQueueLane,
+    pub(super) reclaimed_seg_id: u32,
+    pub(super) meta: LaneTailMeta,
+    pub(super) file_removed: bool,
+}
+
 /// Execute read-only Phase 1 classification and Phase 2 convergence / Case C
 /// same-segment recovery on `<storage_dir>/private/capture-queue/<lane>/` under
 /// shared `append.lock` without appending a new frame (`RB-08`).
@@ -1921,6 +2083,100 @@ pub fn recover_lane_at_root(
 ) -> StorageResult<LaneRecoveryReport> {
     let mut observer = SegmentObserver::new();
     recover_lane_at_root_inner(queue_root, lane, &mut observer)
+}
+
+/// Queue-internal consumer primitive: crash-safely reclaim the oldest consumed
+/// sealed segment `seg_id` (`seg_id == min_live_seg && seg_id < active_seg &&
+/// seg_id < highwater_seg`) under shared `append.lock` (`ADR-RB-05` #4 ③,
+/// `RB-08j` AC7–AC8, `RB-09d`/`RB-09k`/`RB-09l`).
+///
+/// Restricted to `pub(super)` (`crate::storage::queue`) so only the single-writer
+/// consumer (which holds `writer.lock` in global lock order
+/// `writer.lock -> capture-queue/append.lock` and supplies the DB-authoritative
+/// `QUEUE_HIGHWATER_*` segment id) and queue unit tests may invoke reclamation:
+/// 1. Validates `seg_id < highwater_seg`, `seg_id == min_live_seg`,
+///    `seg_id < active_seg`, `sealed[0].seg_id == seg_id`, and that
+///    `events-<seg_id:08>.log` exists on disk as an owned non-symlink regular
+///    file strictly BEFORE any Phase 2 metadata repair or `.tmp` cleanup.
+/// 2. Atomically commits dual-replica `LTM2` (`tail.meta` + `tail.meta.bak`)
+///    advancing `MIN_LIVE_SEG = seg_id + 1` and removing `seg_id` from `sealed[]`.
+/// 3. Strictly after both `LTM2` replicas are persisted, re-verifies and unlinks
+///    `events-<seg_id:08>.log` followed by `fsync_dir(lane_dir)`.
+#[allow(dead_code)] // Consumed by `storage::queue::writer` starting in RB-09.
+pub(super) fn reclaim_sealed_segment(
+    storage_dir: &Path,
+    lane: CaptureQueueLane,
+    seg_id: u32,
+    highwater_seg: u32,
+) -> StorageResult<SegmentReclaimOutcome> {
+    let mut observer = SegmentObserver::new();
+    reclaim_sealed_segment_in_storage_dir(storage_dir, lane, seg_id, highwater_seg, &mut observer)
+}
+
+/// Queue-internal consumer primitive: crash-safely reclaim the oldest consumed
+/// sealed segment `seg_id` under `<queue_root>/<lane>/` (`ADR-RB-05` #4 ③,
+/// `RB-08j`). Callers must hold `writer.lock` and pass DB-authoritative
+/// `highwater_seg`.
+#[allow(dead_code)] // Consumed by `storage::queue::writer` starting in RB-09.
+pub(super) fn reclaim_sealed_segment_at_root(
+    queue_root: &Path,
+    lane: CaptureQueueLane,
+    seg_id: u32,
+    highwater_seg: u32,
+) -> StorageResult<SegmentReclaimOutcome> {
+    let mut observer = SegmentObserver::new();
+    reclaim_sealed_segment_at_root_inner(queue_root, lane, seg_id, highwater_seg, &mut observer)
+}
+
+#[allow(dead_code)] // Consumed by `storage::queue::writer` starting in RB-09.
+fn reclaim_sealed_segment_in_storage_dir(
+    storage_dir: &Path,
+    lane: CaptureQueueLane,
+    seg_id: u32,
+    highwater_seg: u32,
+    observer: &mut SegmentObserver,
+) -> StorageResult<SegmentReclaimOutcome> {
+    #[cfg(unix)]
+    {
+        let owners = UnixExpectedQueueOwners::current_effective();
+        unix_seg::reclaim_in_storage_dir_unix(
+            storage_dir,
+            lane,
+            seg_id,
+            highwater_seg,
+            owners,
+            observer,
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        non_unix_seg::reclaim_in_storage_dir_non_unix(
+            storage_dir,
+            lane,
+            seg_id,
+            highwater_seg,
+            observer,
+        )
+    }
+}
+
+#[allow(dead_code)] // Consumed by `storage::queue::writer` starting in RB-09.
+fn reclaim_sealed_segment_at_root_inner(
+    queue_root: &Path,
+    lane: CaptureQueueLane,
+    seg_id: u32,
+    highwater_seg: u32,
+    observer: &mut SegmentObserver,
+) -> StorageResult<SegmentReclaimOutcome> {
+    #[cfg(unix)]
+    {
+        let owners = UnixExpectedQueueOwners::current_effective();
+        unix_seg::reclaim_at_root_unix(queue_root, lane, seg_id, highwater_seg, owners, observer)
+    }
+    #[cfg(not(unix))]
+    {
+        non_unix_seg::reclaim_at_root_non_unix(queue_root, lane, seg_id, highwater_seg, observer)
+    }
 }
 
 /// Read-only inspect `tail.meta` and `tail.meta.bak` inside `lane_dir` with
@@ -4961,15 +5217,16 @@ mod unix_seg {
         observer.record_capacity_checked(occupancy, frame_buf.len(), max_total_bytes);
         let _ = enforce_queue_capacity_limit(occupancy, frame_buf.len(), max_total_bytes)?;
 
-        // Step ③ (`ADR-RB-05` #3, `RB-08g`): normal 16 MiB rotation via shared
-        // `create_segment_file` (`0600` + `fsync_dir(lane_dir)`), sealing old
-        // segment `(S, old_committed_len, old_prefix_crc32c)` into `LTM2.sealed[]`
-        // and resetting `PREFIX_CRC32C` from `0` for `S + 1`.
+        // Step ② (b) (`ADR-RB-05` #3, `RB-08j`) + Step ③ (`RB-08g`): check
+        // whether this frame requires 16 MiB rotation, enforce `sealed.len() <
+        // MAX_SEALED_SEGMENTS` (`256`) BEFORE creating `S + 1` or modifying
+        // any file for the incoming frame, then build metadata and create/open.
         let rotating = should_rotate_active_segment(
             converged.meta.committed_len,
             frame_buf.len(),
             CAPTURE_QUEUE_SEGMENT_ROTATION_BYTES,
         )?;
+        enforce_rotation_sealed_cap_limit(converged.meta.sealed.len(), rotating)?;
         let (seg_id, frame_offset, next_meta) =
             build_next_append_meta(converged.meta, frame_buf, rotating)?;
         let mut seg_file = if rotating || !converged.active_seg_exists {
@@ -5174,6 +5431,235 @@ mod unix_seg {
         recover_under_root_fd_unix(&root_fd, &quarantine_dir, lane, owners, observer)
     }
 
+    /// Pre-verify that `cname` inside `lane_fd` exists on disk as a regular
+    /// non-symlink file owned by `expected_uid` strictly BEFORE any Phase 2
+    /// metadata mutation or `.tmp` cleanup.
+    #[allow(dead_code)] // Consumed by `storage::queue::writer` starting in RB-09.
+    fn preverify_reclaim_target_unix(
+        lane_fd: &OwnedFd,
+        cname: &std::ffi::CStr,
+        expected_uid: u32,
+    ) -> StorageResult<()> {
+        let mut pre_st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+        // SAFETY: `lane_fd` is valid and `cname` is NUL-terminated.
+        let pre_rc = unsafe {
+            libc::fstatat(
+                lane_fd.as_raw_fd(),
+                cname.as_ptr(),
+                pre_st.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if pre_rc != 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::NotFound {
+                return Err(StorageBackendError::CorruptCommittedFrame {
+                    detail: "reclaimed capture queue sealed segment is missing on disk".to_string(),
+                });
+            }
+            return Err(StorageBackendError::io(
+                "stat reclaimed capture queue segment",
+                err,
+            ));
+        }
+        // SAFETY: `fstatat` succeeded.
+        let pre_st = unsafe { pre_st.assume_init() };
+        if (pre_st.st_mode & libc::S_IFMT) == libc::S_IFLNK {
+            return Err(map_queue_symlink_err("reclaimed capture queue segment"));
+        }
+        if (pre_st.st_mode & libc::S_IFMT) != libc::S_IFREG {
+            return Err(StorageBackendError::CorruptCommittedFrame {
+                detail: "reclaimed capture queue segment is not a regular file".to_string(),
+            });
+        }
+        if pre_st.st_uid != expected_uid {
+            return Err(map_queue_owner_mismatch_err(
+                "reclaimed capture queue segment",
+            ));
+        }
+        Ok(())
+    }
+
+    #[allow(dead_code)] // Consumed by `storage::queue::writer` starting in RB-09.
+    fn reclaim_under_root_fd_unix(
+        root_fd: &OwnedFd,
+        quarantine_dir: &Path,
+        lane: CaptureQueueLane,
+        seg_id: u32,
+        highwater_seg: u32,
+        owners: UnixExpectedQueueOwners,
+        observer: &mut SegmentObserver,
+    ) -> StorageResult<SegmentReclaimOutcome> {
+        let lane_label = lane_dir_name(lane);
+        let lane_uid = lane_expected_uid(owners, lane);
+        let lane_fd = open_lane_dir_fd(root_fd, lane, owners)?;
+        let quarantine_fd = open_quarantine_dir_fd(root_fd, owners)?;
+
+        let (append_lock, plan) = acquire_lock_and_phase1_unix(
+            root_fd,
+            &lane_fd,
+            owners,
+            lane_uid,
+            DEFAULT_QUEUE_APPEND_LOCK_TIMEOUT,
+            observer,
+        )?;
+
+        // Strictly read-only pre-validation BEFORE any Phase 2 metadata repair
+        // or `.tmp` cleanup: reject unconsumed/non-oldest/active segments and
+        // reject missing/symlink/non-regular/foreign-owned target files with
+        // zero disk mutation (even when `tail.meta` and `tail.meta.bak` diverge).
+        validate_reclaim_plan_readonly(&plan, seg_id, highwater_seg)?;
+        let seg_name = segment_log_file_name(seg_id);
+        let cname = osstr_to_cstring(
+            OsStr::new(&seg_name),
+            "reclaim sealed capture queue segment",
+        )?;
+        let target_expected_uid = if observer.simulate_foreign_reclaim_owner() {
+            lane_uid.wrapping_add(1)
+        } else {
+            lane_uid
+        };
+        preverify_reclaim_target_unix(&lane_fd, &cname, target_expected_uid)?;
+
+        let _cleaned_q_tmp =
+            clean_lane_quarantine_tmp_files_unix(&quarantine_fd, lane, owners.quarantine_uid)?;
+        let phase2_ctx = UnixPhase2Context {
+            lane,
+            lane_fd: &lane_fd,
+            quarantine_fd: &quarantine_fd,
+            quarantine_dir,
+            owners,
+            append_lock: &append_lock,
+        };
+        let converged = phase2_execute_plan_unix(&phase2_ctx, plan, observer)?;
+        let next_meta = build_reclaimed_tail_meta(&converged.meta, seg_id, highwater_seg)?;
+
+        // Step ① (`ADR-RB-05` #4 ③): atomically advance `MIN_LIVE_SEG` and
+        // remove `seg_id` from `LTM2.sealed[]` across BOTH `tail.meta` and
+        // `tail.meta.bak` strictly BEFORE unlinking `events-<seg_id:08>.log`.
+        commit_dual_tail_meta_unix(&lane_fd, lane_label, &next_meta, lane_uid, observer)?;
+
+        observer.maybe_crash(SegmentCrashPoint::AfterReclaimMetaBeforeUnlink)?;
+
+        // Step ②: re-verify `events-<seg_id:08>.log` is an owned regular file
+        // (never a symlink/dir), unlink it, and `fsync_dir(lane_dir)`.
+        let mut st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+        // SAFETY: `lane_fd` is valid and `cname` is NUL-terminated.
+        let stat_rc = unsafe {
+            libc::fstatat(
+                lane_fd.as_raw_fd(),
+                cname.as_ptr(),
+                st.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        let file_removed = if stat_rc == 0 {
+            // SAFETY: `fstatat` succeeded.
+            let st = unsafe { st.assume_init() };
+            if (st.st_mode & libc::S_IFMT) == libc::S_IFLNK {
+                return Err(map_queue_symlink_err("reclaimed capture queue segment"));
+            }
+            if (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
+                return Err(StorageBackendError::CorruptCommittedFrame {
+                    detail: "reclaimed capture queue segment is not a regular file".to_string(),
+                });
+            }
+            if st.st_uid != target_expected_uid {
+                return Err(map_queue_owner_mismatch_err(
+                    "reclaimed capture queue segment",
+                ));
+            }
+            // SAFETY: `lane_fd` is valid and `cname` is NUL-terminated.
+            let unlink_rc = unsafe { libc::unlinkat(lane_fd.as_raw_fd(), cname.as_ptr(), 0) };
+            if unlink_rc != 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() != io::ErrorKind::NotFound {
+                    return Err(StorageBackendError::io(
+                        "unlink reclaimed capture queue segment",
+                        err,
+                    ));
+                }
+                false
+            } else {
+                observer.record_reclaim_segment_unlink(lane_label, seg_id);
+                fsync_fd(
+                    &lane_fd,
+                    "fsync capture queue lane directory after reclaiming sealed segment",
+                )?;
+                observer.record_fsync_lane_after_reclaim(lane_label, seg_id);
+                true
+            }
+        } else {
+            let err = io::Error::last_os_error();
+            if err.kind() != io::ErrorKind::NotFound {
+                return Err(StorageBackendError::io(
+                    "stat reclaimed capture queue segment",
+                    err,
+                ));
+            }
+            false
+        };
+
+        drop(append_lock);
+        observer.record_release_lock();
+
+        Ok(SegmentReclaimOutcome {
+            lane,
+            reclaimed_seg_id: seg_id,
+            meta: next_meta,
+            file_removed,
+        })
+    }
+
+    #[allow(dead_code)] // Consumed by `storage::queue::writer` starting in RB-09.
+    pub(super) fn reclaim_in_storage_dir_unix(
+        storage_dir: &Path,
+        lane: CaptureQueueLane,
+        seg_id: u32,
+        highwater_seg: u32,
+        owners: UnixExpectedQueueOwners,
+        observer: &mut SegmentObserver,
+    ) -> StorageResult<SegmentReclaimOutcome> {
+        let root_fd = open_root_from_storage_dir(storage_dir, owners)?;
+        let quarantine_dir = storage_dir
+            .join(PRIVATE_SUBDIR)
+            .join(CAPTURE_QUEUE_SUBDIR)
+            .join(QUEUE_QUARANTINE_DIR);
+        reclaim_under_root_fd_unix(
+            &root_fd,
+            &quarantine_dir,
+            lane,
+            seg_id,
+            highwater_seg,
+            owners,
+            observer,
+        )
+    }
+
+    #[allow(dead_code)] // Consumed by `storage::queue::writer` starting in RB-09.
+    pub(super) fn reclaim_at_root_unix(
+        queue_root: &Path,
+        lane: CaptureQueueLane,
+        seg_id: u32,
+        highwater_seg: u32,
+        owners: UnixExpectedQueueOwners,
+        observer: &mut SegmentObserver,
+    ) -> StorageResult<SegmentReclaimOutcome> {
+        let (root_fd, root_st) =
+            open_dir_nofollow(queue_root, owners.root_uid, "capture queue root directory")?;
+        verify_dir_mode_0700(&root_st, "capture queue root directory")?;
+        let quarantine_dir = queue_root.join(QUEUE_QUARANTINE_DIR);
+        reclaim_under_root_fd_unix(
+            &root_fd,
+            &quarantine_dir,
+            lane,
+            seg_id,
+            highwater_seg,
+            owners,
+            observer,
+        )
+    }
+
     pub(super) fn read_converged_lane_tail_meta_unix(
         lane_dir: &Path,
         expected_uid: u32,
@@ -5324,10 +5810,51 @@ mod non_unix_seg {
         })
     }
 
+    #[cfg(not(windows))]
+    #[allow(dead_code)] // Consumed by `storage::queue::writer` starting in RB-09.
+    pub(super) fn reclaim_in_storage_dir_non_unix(
+        _storage_dir: &Path,
+        _lane: CaptureQueueLane,
+        _seg_id: u32,
+        _highwater_seg: u32,
+        _observer: &mut SegmentObserver,
+    ) -> StorageResult<SegmentReclaimOutcome> {
+        Err(StorageBackendError::BackendInternal {
+            detail: "durable capture queue segment reclamation is unsupported on this platform"
+                .to_string(),
+        })
+    }
+
+    #[cfg(not(windows))]
+    #[allow(dead_code)] // Consumed by `storage::queue::writer` starting in RB-09.
+    pub(super) fn reclaim_at_root_non_unix(
+        _queue_root: &Path,
+        _lane: CaptureQueueLane,
+        _seg_id: u32,
+        _highwater_seg: u32,
+        _observer: &mut SegmentObserver,
+    ) -> StorageResult<SegmentReclaimOutcome> {
+        Err(StorageBackendError::BackendInternal {
+            detail: "durable capture queue segment reclamation is unsupported on this platform"
+                .to_string(),
+        })
+    }
+
     #[cfg(windows)]
     mod win_impl {
+        #[cfg(test)]
+        use windows_sys::Win32::Security::{
+            CreateWellKnownSid, SECURITY_MAX_SID_SIZE, WinWorldSid,
+        };
         use windows_sys::Win32::{
-            Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE},
+            Foundation::{
+                CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
+            },
+            Security::{
+                Authorization::{GetSecurityInfo, SE_FILE_OBJECT},
+                EqualSid, GetTokenInformation, OWNER_SECURITY_INFORMATION, TOKEN_INFORMATION_CLASS,
+                TOKEN_OWNER, TOKEN_QUERY, TOKEN_USER, TokenOwner, TokenUser,
+            },
             Storage::FileSystem::{
                 BY_HANDLE_FILE_INFORMATION, CREATE_NEW, CreateFileW, DELETE,
                 FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_INFO,
@@ -5335,6 +5862,7 @@ mod non_unix_seg {
                 FILE_SHARE_READ, FILE_SHARE_WRITE, FileDispositionInfo, GetFileInformationByHandle,
                 OPEN_EXISTING, SetFileInformationByHandle,
             },
+            System::Threading::{GetCurrentProcess, OpenProcessToken},
         };
 
         use super::*;
@@ -5355,6 +5883,171 @@ mod non_unix_seg {
                     CloseHandle(self.0);
                 }
             }
+        }
+
+        #[allow(dead_code)] // Consumed by `storage::queue::writer` starting in RB-09.
+        struct WinLocalAllocation(*mut std::ffi::c_void);
+
+        impl Drop for WinLocalAllocation {
+            fn drop(&mut self) {
+                // SAFETY: `self.0` was allocated by a Win32 security API (`GetSecurityInfo`).
+                unsafe {
+                    LocalFree(self.0);
+                }
+            }
+        }
+
+        #[allow(dead_code)] // Consumed by `storage::queue::writer` starting in RB-09.
+        fn query_current_windows_token_info(
+            class: TOKEN_INFORMATION_CLASS,
+            context: &'static str,
+        ) -> StorageResult<Vec<usize>> {
+            // SAFETY: Win32 process token query with properly sized aligned buffer.
+            unsafe {
+                let mut token: HANDLE = std::ptr::null_mut();
+                if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+                    return Err(StorageBackendError::io(
+                        "open current Windows process token for capture queue owner check",
+                        io::Error::last_os_error(),
+                    ));
+                }
+                let _token_guard = RawWinHandleGuard(token);
+                let mut size: u32 = 0;
+                let _ = GetTokenInformation(token, class, std::ptr::null_mut(), 0, &mut size);
+                if size == 0 {
+                    return Err(StorageBackendError::io(context, io::Error::last_os_error()));
+                }
+                let mut buf = vec![0usize; (size as usize).div_ceil(std::mem::size_of::<usize>())];
+                if GetTokenInformation(token, class, buf.as_mut_ptr().cast(), size, &mut size) == 0
+                {
+                    return Err(StorageBackendError::io(context, io::Error::last_os_error()));
+                }
+                Ok(buf)
+            }
+        }
+
+        #[allow(dead_code)] // Consumed by `storage::queue::writer` starting in RB-09.
+        fn verify_windows_handle_owner_against_sids(
+            file: &File,
+            allowed_sids: &[*mut std::ffi::c_void],
+            subject: &'static str,
+        ) -> StorageResult<()> {
+            // SAFETY: `file` is a valid open Win32 handle opened with `GENERIC_READ`
+            // (which includes `READ_CONTROL`); `descriptor` is freed via `WinLocalAllocation`.
+            unsafe {
+                let mut owner: *mut std::ffi::c_void = std::ptr::null_mut();
+                let mut descriptor: *mut std::ffi::c_void = std::ptr::null_mut();
+                let status = GetSecurityInfo(
+                    file.as_raw_handle() as HANDLE,
+                    SE_FILE_OBJECT,
+                    OWNER_SECURITY_INFORMATION,
+                    &mut owner,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &mut descriptor,
+                );
+                if status != 0 {
+                    return Err(StorageBackendError::io(
+                        "query Windows owner SID for capture queue file",
+                        io::Error::from_raw_os_error(status as i32),
+                    ));
+                }
+                let _descriptor = WinLocalAllocation(descriptor);
+                let matched = !owner.is_null()
+                    && allowed_sids
+                        .iter()
+                        .any(|&sid| !sid.is_null() && EqualSid(owner, sid) != 0);
+                if !matched {
+                    return Err(map_queue_owner_mismatch_err(subject));
+                }
+            }
+            Ok(())
+        }
+
+        #[allow(dead_code)] // Consumed by `storage::queue::writer` starting in RB-09.
+        fn verify_windows_reclaim_target_owner(
+            file: &File,
+            observer: &SegmentObserver,
+        ) -> StorageResult<()> {
+            #[cfg(test)]
+            if observer.simulate_foreign_reclaim_owner() {
+                let mut sid_buf = [0u8; SECURITY_MAX_SID_SIZE as usize];
+                let mut sid_len = SECURITY_MAX_SID_SIZE;
+                // SAFETY: `sid_buf` holds `SECURITY_MAX_SID_SIZE` bytes for `WinWorldSid`.
+                let ok = unsafe {
+                    CreateWellKnownSid(
+                        WinWorldSid,
+                        std::ptr::null_mut(),
+                        sid_buf.as_mut_ptr().cast(),
+                        &mut sid_len,
+                    )
+                };
+                if ok == 0 {
+                    return Err(StorageBackendError::io(
+                        "construct Windows well-known SID for foreign owner test",
+                        io::Error::last_os_error(),
+                    ));
+                }
+                return verify_windows_handle_owner_against_sids(
+                    file,
+                    &[sid_buf.as_mut_ptr().cast()],
+                    "reclaimed capture queue segment",
+                );
+            }
+            #[cfg(not(test))]
+            let _ = observer;
+
+            // Accept either the process token's `TokenUser` SID or its default
+            // `TokenOwner` SID (e.g., `BUILTIN\Administrators` in elevated tokens,
+            // which Windows assigns to files created via `CreateFileW` with a
+            // default security descriptor).
+            let user_buf = query_current_windows_token_info(
+                TokenUser,
+                "query current Windows process token user for capture queue owner check",
+            )?;
+            let owner_buf = query_current_windows_token_info(
+                TokenOwner,
+                "query current Windows process token default owner for capture queue owner check",
+            )?;
+            // SAFETY: `user_buf` and `owner_buf` are aligned `TOKEN_USER`/`TOKEN_OWNER`
+            // buffers from `GetTokenInformation` that stay alive through the check.
+            let user_sid = unsafe { (&*user_buf.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+            let default_owner_sid = unsafe { (&*owner_buf.as_ptr().cast::<TOKEN_OWNER>()).Owner };
+            verify_windows_handle_owner_against_sids(
+                file,
+                &[user_sid, default_owner_sid],
+                "reclaimed capture queue segment",
+            )
+        }
+
+        #[allow(dead_code)] // Consumed by `storage::queue::writer` starting in RB-09.
+        fn preverify_reclaim_target_windows(
+            seg_path: &Path,
+            observer: &SegmentObserver,
+        ) -> StorageResult<()> {
+            let (file, _, _) = match open_windows_file_nofollow(
+                seg_path,
+                GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                OPEN_EXISTING,
+                "reclaimed capture queue segment",
+                "open reclaimed capture queue segment",
+            ) {
+                Ok(opened) => opened,
+                Err(StorageBackendError::Io {
+                    kind: io::ErrorKind::NotFound,
+                    ..
+                }) => {
+                    return Err(StorageBackendError::CorruptCommittedFrame {
+                        detail: "reclaimed capture queue sealed segment is missing on disk"
+                            .to_string(),
+                    });
+                }
+                Err(err) => return Err(err),
+            };
+            verify_windows_reclaim_target_owner(&file, observer)?;
+            Ok(())
         }
 
         /// Atomically mark an already-verified, handle-pinned Windows file
@@ -7136,15 +7829,16 @@ mod non_unix_seg {
             observer.record_capacity_checked(occupancy, frame_buf.len(), max_total_bytes);
             let _ = enforce_queue_capacity_limit(occupancy, frame_buf.len(), max_total_bytes)?;
 
-            // Step ③ (`ADR-RB-05` #3, `RB-08g`): normal 16 MiB rotation via
-            // shared `create_segment_file` (`CREATE_NEW` + `flush_windows_dir`),
-            // sealing old segment `(S, old_committed_len, old_prefix_crc32c)` into
-            // `LTM2.sealed[]` and resetting `PREFIX_CRC32C` from `0` for `S + 1`.
+            // Step ② (b) (`ADR-RB-05` #3, `RB-08j`) + Step ③ (`RB-08g`): check
+            // whether 16 MiB rotation is needed and enforce `sealed.len() <
+            // MAX_SEALED_SEGMENTS` (`256`) strictly BEFORE creating `S + 1` or
+            // mutating any file for the incoming frame.
             let rotating = should_rotate_active_segment(
                 meta.committed_len,
                 frame_buf.len(),
                 CAPTURE_QUEUE_SEGMENT_ROTATION_BYTES,
             )?;
+            enforce_rotation_sealed_cap_limit(meta.sealed.len(), rotating)?;
             let (seg_id, frame_offset, next_meta) =
                 build_next_append_meta(meta, frame_buf, rotating)?;
             let mut seg_file = if rotating || !active_seg_exists {
@@ -7271,6 +7965,104 @@ mod non_unix_seg {
                 quarantined_artifacts: converged.quarantined_artifacts,
             })
         }
+
+        #[allow(dead_code)] // Consumed by `storage::queue::writer` starting in RB-09.
+        pub(super) fn reclaim_in_storage_dir_windows(
+            storage_dir: &Path,
+            lane: CaptureQueueLane,
+            seg_id: u32,
+            highwater_seg: u32,
+            observer: &mut SegmentObserver,
+        ) -> StorageResult<SegmentReclaimOutcome> {
+            let private_dir = storage_dir.join(PRIVATE_SUBDIR);
+            let _private_guard =
+                pin_windows_dir_nofollow(&private_dir, "capture private directory")?;
+            let queue_root = private_dir.join(CAPTURE_QUEUE_SUBDIR);
+            reclaim_at_root_windows(&queue_root, lane, seg_id, highwater_seg, observer)
+        }
+
+        #[allow(dead_code)] // Consumed by `storage::queue::writer` starting in RB-09.
+        pub(super) fn reclaim_at_root_windows(
+            queue_root: &Path,
+            lane: CaptureQueueLane,
+            seg_id: u32,
+            highwater_seg: u32,
+            observer: &mut SegmentObserver,
+        ) -> StorageResult<SegmentReclaimOutcome> {
+            let _root_guard = pin_windows_dir_nofollow(queue_root, "capture queue root directory")?;
+            let lane_label = lane_dir_name(lane);
+            let lane_dir = queue_root.join(lane_label);
+            let _lane_guard = pin_windows_dir_nofollow(&lane_dir, "capture queue lane directory")?;
+            let quarantine_dir = queue_root.join(QUEUE_QUARANTINE_DIR);
+            let _q_guard =
+                pin_windows_dir_nofollow(&quarantine_dir, "capture queue quarantine directory")?;
+
+            let (append_lock, plan, pinned) = acquire_lock_and_phase1_windows(
+                queue_root,
+                &lane_dir,
+                false,
+                DEFAULT_QUEUE_APPEND_LOCK_TIMEOUT,
+                observer,
+            )?;
+            drop(pinned);
+
+            // Strictly read-only pre-validation BEFORE any Phase 2 metadata
+            // repair or `.tmp` cleanup: reject unconsumed/non-oldest/active
+            // segments and reject missing/reparse/dir/foreign-owned target
+            // files with zero disk mutation.
+            validate_reclaim_plan_readonly(&plan, seg_id, highwater_seg)?;
+            let seg_path = lane_dir.join(segment_log_file_name(seg_id));
+            preverify_reclaim_target_windows(&seg_path, observer)?;
+
+            let _cleaned_q_tmp = clean_lane_quarantine_tmp_files_windows(&quarantine_dir, lane)?;
+            let phase2_ctx = WindowsPhase2Context {
+                lane,
+                lane_dir: &lane_dir,
+                quarantine_dir: &quarantine_dir,
+                append_lock: &append_lock,
+            };
+            let converged = phase2_execute_plan_windows(&phase2_ctx, plan, observer)?;
+            let next_meta = build_reclaimed_tail_meta(&converged.meta, seg_id, highwater_seg)?;
+
+            // Step ①: atomically commit dual-replica `LTM2` BEFORE deleting file.
+            commit_dual_tail_meta_windows(&lane_dir, lane_label, &next_meta, observer)?;
+
+            observer.maybe_crash(SegmentCrashPoint::AfterReclaimMetaBeforeUnlink)?;
+
+            // Step ②: handle-pinned non-reparse, owner-verified deletion + flush lane directory.
+            let file_removed = match open_windows_file_nofollow(
+                &seg_path,
+                GENERIC_READ | DELETE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                OPEN_EXISTING,
+                "reclaimed capture queue segment",
+                "open reclaimed capture queue segment",
+            ) {
+                Ok((file, _, _)) => {
+                    verify_windows_reclaim_target_owner(&file, observer)?;
+                    delete_windows_file_by_handle(file, "delete reclaimed capture queue segment")?;
+                    observer.record_reclaim_segment_unlink(lane_label, seg_id);
+                    flush_windows_dir(&lane_dir)?;
+                    observer.record_fsync_lane_after_reclaim(lane_label, seg_id);
+                    true
+                }
+                Err(StorageBackendError::Io {
+                    kind: io::ErrorKind::NotFound,
+                    ..
+                }) => false,
+                Err(err) => return Err(err),
+            };
+
+            drop(append_lock);
+            observer.record_release_lock();
+
+            Ok(SegmentReclaimOutcome {
+                lane,
+                reclaimed_seg_id: seg_id,
+                meta: next_meta,
+                file_removed,
+            })
+        }
     }
 
     #[cfg(windows)]
@@ -7378,6 +8170,30 @@ mod non_unix_seg {
         observer: &mut SegmentObserver,
     ) -> StorageResult<LaneRecoveryReport> {
         win_impl::recover_at_root_windows(queue_root, lane, observer)
+    }
+
+    #[cfg(windows)]
+    #[allow(dead_code)] // Consumed by `storage::queue::writer` starting in RB-09.
+    pub(super) fn reclaim_in_storage_dir_non_unix(
+        storage_dir: &Path,
+        lane: CaptureQueueLane,
+        seg_id: u32,
+        highwater_seg: u32,
+        observer: &mut SegmentObserver,
+    ) -> StorageResult<SegmentReclaimOutcome> {
+        win_impl::reclaim_in_storage_dir_windows(storage_dir, lane, seg_id, highwater_seg, observer)
+    }
+
+    #[cfg(windows)]
+    #[allow(dead_code)] // Consumed by `storage::queue::writer` starting in RB-09.
+    pub(super) fn reclaim_at_root_non_unix(
+        queue_root: &Path,
+        lane: CaptureQueueLane,
+        seg_id: u32,
+        highwater_seg: u32,
+        observer: &mut SegmentObserver,
+    ) -> StorageResult<SegmentReclaimOutcome> {
+        win_impl::reclaim_at_root_windows(queue_root, lane, seg_id, highwater_seg, observer)
     }
 }
 
@@ -15298,5 +16114,413 @@ mod tests {
                 s1_bad
             );
         }
+    }
+
+    /// `RB-08j` AC1–AC8: `MAX_SEALED_SEGMENTS = 256` normal 16 MiB rotation
+    /// pre-mutation backpressure (`LBR-AGENT-046`) and `reclaim_sealed_segment`
+    /// slot release recovery:
+    /// - AC1: 256 × 4 KiB small sealed segments + near-16 MiB active segment
+    ///   (sibling lane 0B, quarantine 0B) satisfies
+    ///   `unconsumed_priority + unconsumed_normal + quarantine + frame_buf.len() <= 256 MiB`
+    ///   (strictly isolating Step ② (b) from Step ② (a) global byte cap).
+    /// - AC2: Normal 16 MiB rotation on clean Case A full table (`256 -> 257`)
+    ///   returns recoverable backpressure `StorageBackendError::QueueFull`
+    ///   (`LBR-AGENT-046`).
+    /// - AC3–AC6: Strictly zero disk mutation on rejection — no `events-00000257.log`,
+    ///   byte-for-byte unchanged `events-00000256.log`, `tail.meta`, `tail.meta.bak`.
+    /// - AC7: `reclaim_sealed_segment` atomically commits `LTM2` (`MIN_LIVE_SEG = 1`,
+    ///   `sealed.len() = 255`) strictly BEFORE `unlink(events-00000000.log)` +
+    ///   `fsync_dir(lane_dir)` (also verifies non-oldest/active rejection and
+    ///   crash-before-unlink idempotence); retrying the same rotation frame now
+    ///   succeeds and creates `events-00000257.log` (`0600`).
+    /// - AC8: Dual `LTM2` records `(256, old_committed_len, old_prefix_crc32c)` in
+    ///   `LTM2.sealed[]`, advances `ACTIVE_SEG = 257`, and new frame decodes
+    ///   100% losslessly from `events-00000257.log`.
+    #[test]
+    fn sealed_cap_256_to_257_normal_rotation_backpressure_and_slot_release() {
+        assert_eq!(MAX_SEALED_SEGMENTS, 256);
+
+        let repo = tempdir().expect("tempdir");
+        let init = init_capture_queue(repo.path()).expect("init capture queue");
+        let normal_dir = &init.paths.normal;
+
+        // 1) Construct 256 × ~4 KiB small sealed segments (`seg 0..256`, ~1 MiB total).
+        let small_payload = vec![0x42u8; 4096];
+        let small_frame =
+            encode_frame(FRAME_FLAG_NONE, "rb08j-sealed-4k", &small_payload).expect("encode 4k");
+        let small_len = small_frame.len() as u64;
+        let small_crc = crc32c_checksum(&small_frame);
+        let mut sealed = Vec::with_capacity(MAX_SEALED_SEGMENTS);
+        for seg_id in 0..MAX_SEALED_SEGMENTS as u32 {
+            let p = normal_dir.join(segment_log_file_name(seg_id));
+            write_bytes_0600(&p, &small_frame);
+            sealed.push(SealedSegmentMeta {
+                seg_id,
+                sealed_len: small_len,
+                sealed_crc32c: small_crc,
+            });
+        }
+
+        // 2) Construct clean Case A active segment `seg 256` near 16 MiB
+        //    (`16 MiB - 1024` bytes) composed of valid LCE1 frames.
+        let active_seg_id: u32 = MAX_SEALED_SEGMENTS as u32; // 256
+        let chunk_payload = vec![0x61u8; 2 * 1024 * 1024]; // 2 MiB payload per frame
+        let chunk_frame =
+            encode_frame(FRAME_FLAG_NONE, "rb08j-active-2m", &chunk_payload).expect("encode 2m");
+        let target_active_len = CAPTURE_QUEUE_SEGMENT_ROTATION_BYTES - 1024;
+        let mut active_bytes = Vec::with_capacity(target_active_len as usize);
+        while active_bytes.len() + chunk_frame.len() <= target_active_len as usize {
+            active_bytes.extend_from_slice(&chunk_frame);
+        }
+        // Pad with one exact-sized valid frame so `active_bytes.len() == target_active_len`.
+        let remaining = target_active_len as usize - active_bytes.len();
+        let pad_key = "rb08j-active-pad";
+        let frame_overhead = crate::storage::queue::FRAME_HEADER_LEN
+            + crate::storage::queue::FRAME_BODY_FIXED_OVERHEAD
+            + pad_key.len();
+        assert!(remaining > frame_overhead);
+        let pad_payload = vec![0x62u8; remaining - frame_overhead];
+        let pad_frame = encode_frame(FRAME_FLAG_NONE, pad_key, &pad_payload).expect("encode pad");
+        active_bytes.extend_from_slice(&pad_frame);
+        assert_eq!(active_bytes.len() as u64, target_active_len);
+
+        let seg256_path = normal_dir.join(segment_log_file_name(active_seg_id));
+        let seg257_path = normal_dir.join(segment_log_file_name(active_seg_id + 1));
+        write_bytes_0600(&seg256_path, &active_bytes);
+
+        let old_committed_len = active_bytes.len() as u64;
+        let old_prefix_crc = crc32c_checksum(&active_bytes);
+        let full_meta = LaneTailMeta {
+            min_live_seg: 0,
+            active_seg: active_seg_id,
+            committed_len: old_committed_len,
+            prefix_crc32c: old_prefix_crc,
+            sealed,
+        };
+        let encoded_meta = full_meta.encode().expect("encode 256-sealed LTM2");
+        write_bytes_0600(&tail_meta_path(normal_dir), &encoded_meta);
+        write_bytes_0600(&tail_meta_bak_path(normal_dir), &encoded_meta);
+
+        // Incoming frame (~2 KiB) crosses 16 MiB on seg 256 (`16 MiB - 1024 + ~2048 > 16 MiB`).
+        let rot_payload = vec![0x77u8; 2048];
+        let rot_frame =
+            encode_frame(FRAME_FLAG_NONE, "rb08j-rotate-257", &rot_payload).expect("encode rot");
+        assert!(old_committed_len + rot_frame.len() as u64 > CAPTURE_QUEUE_SEGMENT_ROTATION_BYTES);
+
+        // AC1: Total combined occupancy including incoming frame is far <= 256 MiB
+        // (~17 MiB << 256 MiB), strictly isolating Step ② (b) from Step ② (a).
+        let occ = measure_capture_queue_occupancy(repo.path()).expect("measure occupancy");
+        assert_eq!(occ.priority_bytes, 0);
+        assert_eq!(occ.quarantine_bytes, 0);
+        assert!(
+            occ.total_bytes + rot_frame.len() as u64 <= CAPTURE_QUEUE_MAX_TOTAL_BYTES,
+            "AC1 violated: fixture total ({}) + incoming ({}) must be <= 256 MiB",
+            occ.total_bytes,
+            rot_frame.len()
+        );
+
+        let seg256_bytes_before = fs::read(&seg256_path).unwrap();
+        let meta_bytes_before = fs::read(tail_meta_path(normal_dir)).unwrap();
+        let bak_bytes_before = fs::read(tail_meta_bak_path(normal_dir)).unwrap();
+
+        // AC2: Clean Case A normal rotation `256 -> 257` fails closed with `LBR-AGENT-046`.
+        let err = append_encoded_frame(repo.path(), CaptureQueueLane::Normal, &rot_frame)
+            .expect_err("AC2: normal rotation at 256/256 sealed table must return LBR-AGENT-046");
+        assert!(
+            matches!(err, StorageBackendError::QueueFull { .. }),
+            "AC2 violated: expected QueueFull, got {err:?}"
+        );
+        assert_eq!(err.stable_code_str(), "LBR-AGENT-046");
+
+        // AC3: Zero `events-00000257.log` created on disk.
+        assert!(
+            !seg257_path.exists(),
+            "AC3 violated: rejected rotation must not create events-00000257.log"
+        );
+        // AC4: Existing `events-00000256.log` byte-for-byte unchanged.
+        assert_eq!(
+            fs::read(&seg256_path).unwrap(),
+            seg256_bytes_before,
+            "AC4 violated: rejected rotation must not modify events-00000256.log"
+        );
+        // AC5: Primary `tail.meta` byte-for-byte unchanged.
+        assert_eq!(
+            fs::read(tail_meta_path(normal_dir)).unwrap(),
+            meta_bytes_before,
+            "AC5 violated: rejected rotation must not modify tail.meta"
+        );
+        // AC6: Backup `tail.meta.bak` byte-for-byte unchanged.
+        assert_eq!(
+            fs::read(tail_meta_bak_path(normal_dir)).unwrap(),
+            bak_bytes_before,
+            "AC6 violated: rejected rotation must not modify tail.meta.bak"
+        );
+
+        // Guard checks on `reclaim_sealed_segment`:
+        // 1) Reject unconsumed (`seg_id >= highwater_seg`), non-oldest (`seg 1`),
+        //    and active (`seg 256`) segments with zero disk mutation.
+        assert!(
+            reclaim_sealed_segment(repo.path(), CaptureQueueLane::Normal, 0, 0).is_err(),
+            "reclaim must reject unconsumed segment at or beyond consumer highwater"
+        );
+        assert!(
+            reclaim_sealed_segment(repo.path(), CaptureQueueLane::Normal, 1, 2).is_err(),
+            "reclaim must reject non-oldest sealed segment"
+        );
+        assert!(
+            reclaim_sealed_segment(
+                repo.path(),
+                CaptureQueueLane::Normal,
+                active_seg_id,
+                active_seg_id + 1,
+            )
+            .is_err(),
+            "reclaim must reject active segment"
+        );
+        assert_eq!(
+            fs::read(tail_meta_path(normal_dir)).unwrap(),
+            meta_bytes_before
+        );
+        assert_eq!(
+            fs::read(tail_meta_bak_path(normal_dir)).unwrap(),
+            bak_bytes_before
+        );
+
+        // 2) Pre-Phase-2 target validation with divergent replicas (`tail.meta.bak`
+        //    lagging behind `tail.meta`, plus planted `tail.meta.tmp` and
+        //    `quarantine/normal-stale.tmp`): missing, symlink, and foreign-owned
+        //    targets MUST fail closed strictly BEFORE any Phase 2 mirror repair
+        //    or `.tmp` cleanup (exact byte-for-byte zero mutation).
+        let seg0_path = normal_dir.join(segment_log_file_name(0));
+        let seg1_path = normal_dir.join(segment_log_file_name(1));
+        {
+            let lagging_bak = LaneTailMeta {
+                min_live_seg: 0,
+                active_seg: active_seg_id,
+                committed_len: 0,
+                prefix_crc32c: 0,
+                sealed: full_meta.sealed.clone(),
+            };
+            let lagging_bak_bytes = lagging_bak.encode().expect("encode lagging bak");
+            write_bytes_0600(&tail_meta_bak_path(normal_dir), &lagging_bak_bytes);
+            let lane_tmp_path = normal_dir.join(QUEUE_TAIL_META_TMP_FILE);
+            let q_tmp_path = init.paths.quarantine.join("normal-seg0-off0-stale.tmp");
+            write_bytes_0600(&lane_tmp_path, b"stale-lane-tmp");
+            write_bytes_0600(&q_tmp_path, b"stale-quarantine-tmp");
+
+            let assert_divergent_zero_mutation = |case: &str| {
+                assert_eq!(
+                    fs::read(tail_meta_path(normal_dir)).unwrap(),
+                    meta_bytes_before,
+                    "{case}: primary tail.meta must remain unchanged"
+                );
+                assert_eq!(
+                    fs::read(tail_meta_bak_path(normal_dir)).unwrap(),
+                    lagging_bak_bytes,
+                    "{case}: lagging tail.meta.bak must NOT be repaired on rejected reclaim"
+                );
+                assert_eq!(
+                    fs::read(&lane_tmp_path).unwrap(),
+                    b"stale-lane-tmp",
+                    "{case}: lane .tmp must NOT be cleaned on rejected reclaim"
+                );
+                assert_eq!(
+                    fs::read(&q_tmp_path).unwrap(),
+                    b"stale-quarantine-tmp",
+                    "{case}: quarantine .tmp must NOT be cleaned on rejected reclaim"
+                );
+            };
+
+            // 2a) Unconsumed segment with divergent replicas -> zero mutation.
+            let unconsumed_err =
+                reclaim_sealed_segment(repo.path(), CaptureQueueLane::Normal, 0, 0)
+                    .expect_err("unconsumed seg with divergent replicas must fail");
+            assert!(matches!(
+                unconsumed_err,
+                StorageBackendError::BackendInternal { .. }
+            ));
+            assert_divergent_zero_mutation("unconsumed-divergent");
+
+            // 2b) Foreign-owned target (cross-platform: Unix UID + Windows SID)
+            //     with divergent replicas -> owner mismatch + zero mutation.
+            let mut foreign_obs = SegmentObserver::with_foreign_reclaim_owner();
+            let foreign_err = reclaim_sealed_segment_in_storage_dir(
+                repo.path(),
+                CaptureQueueLane::Normal,
+                0,
+                1,
+                &mut foreign_obs,
+            )
+            .expect_err("foreign-owned target must be rejected before Phase 2");
+            assert!(
+                crate::storage::queue::is_capture_queue_owner_mismatch_error(&foreign_err),
+                "expected owner mismatch error, got {foreign_err:?}"
+            );
+            assert_divergent_zero_mutation("foreign-owner-divergent");
+
+            // 2c) Missing live sealed segment (`events-00000000.log` deleted while
+            //     still listed in `LTM2.sealed[0]`) -> `CorruptCommittedFrame`
+            //     (`LBR-IO-001`) + zero mutation (NEVER silently retire missing seg!).
+            let saved_seg0 = fs::read(&seg0_path).unwrap();
+            fs::remove_file(&seg0_path).unwrap();
+            let missing_err = reclaim_sealed_segment(repo.path(), CaptureQueueLane::Normal, 0, 1)
+                .expect_err("missing live sealed segment must fail closed before Phase 2");
+            assert!(
+                matches!(
+                    missing_err,
+                    StorageBackendError::CorruptCommittedFrame { .. }
+                ),
+                "expected CorruptCommittedFrame on missing sealed seg, got {missing_err:?}"
+            );
+            assert_eq!(missing_err.stable_code_str(), "LBR-IO-001");
+            assert_divergent_zero_mutation("missing-target-divergent");
+
+            // 2d) Symlink target (`events-00000000.log` -> decoy) with divergent
+            //     replicas -> symlink error + zero mutation.
+            #[cfg(unix)]
+            {
+                let decoy_path = repo.path().join("decoy-seg0.log");
+                write_bytes_0600(&decoy_path, &saved_seg0);
+                std::os::unix::fs::symlink(&decoy_path, &seg0_path).unwrap();
+                let sym_err = reclaim_sealed_segment(repo.path(), CaptureQueueLane::Normal, 0, 1)
+                    .expect_err("symlink sealed target must fail closed before Phase 2");
+                assert!(
+                    crate::storage::queue::is_capture_queue_symlink_rejected_error(&sym_err),
+                    "expected symlink rejection, got {sym_err:?}"
+                );
+                assert_divergent_zero_mutation("symlink-target-divergent");
+                fs::remove_file(&seg0_path).unwrap();
+                fs::remove_file(&decoy_path).unwrap();
+            }
+
+            // Restore clean `events-00000000.log`, synced `tail.meta.bak`, and clean `.tmp`.
+            write_bytes_0600(&seg0_path, &saved_seg0);
+            write_bytes_0600(&tail_meta_bak_path(normal_dir), &bak_bytes_before);
+            fs::remove_file(&lane_tmp_path).unwrap();
+            fs::remove_file(&q_tmp_path).unwrap();
+        }
+
+        // Verify `ADR-RB-05` #4 ③ crash boundary: crash after dual `LTM2` commit
+        // and BEFORE `unlink(seg 0)` leaves `seg 0` as reclaimed orphan (`< min_live_seg`),
+        // cleanly unlinked on subsequent `recover_lane`, AND verify normal reclaim
+        // ordering (`dual LTM2 < ReclaimSegmentUnlink < FsyncLaneDirAfterReclaim`) on seg 1!
+        let mut crash_reclaim =
+            SegmentObserver::with_crash(SegmentCrashPoint::AfterReclaimMetaBeforeUnlink);
+        let _ = reclaim_sealed_segment_in_storage_dir(
+            repo.path(),
+            CaptureQueueLane::Normal,
+            0,
+            1,
+            &mut crash_reclaim,
+        )
+        .expect_err("simulated crash before unlink must fail");
+        assert!(
+            seg0_path.exists(),
+            "seg 0 still on disk right after pre-unlink crash"
+        );
+        let meta_after_crash = read_converged_lane_tail_meta(normal_dir).unwrap();
+        assert_eq!(meta_after_crash.min_live_seg, 1);
+        assert_eq!(meta_after_crash.sealed.len(), 255);
+        let rec_orphan = recover_lane(repo.path(), CaptureQueueLane::Normal)
+            .expect("recover_lane must clean reclaimed orphan seg 0");
+        assert!(
+            !seg0_path.exists(),
+            "reclaimed orphan seg 0 cleaned by recovery"
+        );
+        assert_eq!(rec_orphan.reclaimed_orphans_removed, 1);
+
+        // Normal `reclaim_sealed_segment` on seg 1 verifies strict `LTM2 < unlink < fsync_dir`.
+        let mut reclaim_obs = SegmentObserver::new();
+        let reclaim_out = reclaim_sealed_segment_in_storage_dir(
+            repo.path(),
+            CaptureQueueLane::Normal,
+            1,
+            2,
+            &mut reclaim_obs,
+        )
+        .expect("reclaim_sealed_segment(1, 2) must succeed");
+        assert_eq!(reclaim_out.reclaimed_seg_id, 1);
+        assert!(reclaim_out.file_removed);
+        assert!(!seg1_path.exists());
+        assert_eq!(reclaim_out.meta.min_live_seg, 2);
+        assert_eq!(reclaim_out.meta.sealed.len(), 254);
+        let pos_meta_bak = reclaim_obs
+            .events
+            .iter()
+            .position(|e| {
+                *e == SegmentOpEvent::FsyncLaneDirAfterMeta {
+                    lane: QUEUE_LANE_NORMAL_DIR,
+                    target_name: QUEUE_TAIL_META_BAK_FILE,
+                }
+            })
+            .expect("reclaim dual LTM2 commit");
+        let pos_unlink = reclaim_obs
+            .events
+            .iter()
+            .position(|e| {
+                *e == SegmentOpEvent::ReclaimSegmentUnlink {
+                    lane: QUEUE_LANE_NORMAL_DIR,
+                    seg_id: 1,
+                }
+            })
+            .expect("reclaim unlink(1)");
+        let pos_fsync = reclaim_obs
+            .events
+            .iter()
+            .position(|e| {
+                *e == SegmentOpEvent::FsyncLaneDirAfterReclaim {
+                    lane: QUEUE_LANE_NORMAL_DIR,
+                    seg_id: 1,
+                }
+            })
+            .expect("reclaim fsync_dir after unlink(1)");
+        assert!(
+            pos_meta_bak < pos_unlink && pos_unlink < pos_fsync,
+            "ADR-RB-05 #4 ③ violated: dual LTM2 must commit strictly before unlink and fsync_dir"
+        );
+
+        // AC7: After freeing slots (`sealed.len() < 256`), retrying the exact same
+        // rotation-triggering frame succeeds and creates `events-00000257.log` (`0600`).
+        let rot_out = append_encoded_frame(repo.path(), CaptureQueueLane::Normal, &rot_frame)
+            .expect("AC7: rotation must recover and succeed after reclaim_sealed_segment");
+        assert_eq!(rot_out.seg_id, active_seg_id + 1);
+        assert_eq!(rot_out.frame_offset, 0);
+        assert!(
+            seg257_path.exists(),
+            "AC7 violated: events-00000257.log must be created after slot release"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = fs::metadata(&seg257_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        // AC8: Dual `LTM2` seals `(256, old_committed_len, old_prefix_crc)` into
+        // `LTM2.sealed[]`, advances `ACTIVE_SEG = 257`, and `events-00000257.log`
+        // decodes `rot_frame` 100% losslessly.
+        let raw_meta = fs::read(tail_meta_path(normal_dir)).unwrap();
+        let raw_bak = fs::read(tail_meta_bak_path(normal_dir)).unwrap();
+        assert_eq!(raw_meta, raw_bak);
+        let final_meta = LaneTailMeta::decode(&raw_meta).unwrap();
+        assert_eq!(final_meta, rot_out.meta);
+        assert_eq!(final_meta.min_live_seg, 2);
+        assert_eq!(final_meta.active_seg, active_seg_id + 1);
+        assert_eq!(final_meta.sealed.len(), 255);
+        assert_eq!(
+            final_meta.sealed.last(),
+            Some(&SealedSegmentMeta {
+                seg_id: active_seg_id,
+                sealed_len: old_committed_len,
+                sealed_crc32c: old_prefix_crc,
+            }),
+            "AC8 violated: LTM2.sealed[] must record (256, old_committed_len, old_prefix_crc)"
+        );
+        assert_eq!(final_meta.committed_len, rot_frame.len() as u64);
+        assert_eq!(final_meta.prefix_crc32c, crc32c_checksum(&rot_frame));
+        let seg257_decoded = decode_all_segment_bytes(&fs::read(&seg257_path).unwrap());
+        assert_eq!(seg257_decoded.len(), 1);
+        assert_eq!(seg257_decoded[0].dedup_key, "rb08j-rotate-257");
+        assert_eq!(seg257_decoded[0].payload, rot_payload);
     }
 }

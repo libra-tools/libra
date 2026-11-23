@@ -3482,7 +3482,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `done` / `remote-pending`
+**Lifecycle / Acceptance:** `done` / `remote-verified`
 
 **Description:** 100% 在独占目录 `src/storage/**` 内于 `segment.rs`（纯生产者/段层，零依赖消费者）扩展 `RB-08k` 的嵌套 Case C→D 旧段尾恢复路径，完整覆盖**旧段 `S` 含未提交坏尾的全部区间 `committed_len <= old_valid_end < actual_len(S)`**——同时包含（a）前接完整未提交同步尾帧的坏尾（`committed_len < old_valid_end < actual_len(S)`）与（b）紧接已确认边界即出现坏尾、零完整未提交帧的等号边界（`old_valid_end == committed_len < actual_len(S)`）：经 `RB-08m::case_c_step_c1` 调用 `RB-08t::quarantine_and_truncate_segment` 先完成 `publish_quarantine_durable`（含 `fsync_dir(quarantine_dir)`）再将 `events-<S>.log` 原地截断至精确 `old_valid_end` 并 `sync_data()`，随后以真实边界 `(S, old_valid_end, old_sealed_crc)` 封存旧段至 `LTM2.sealed[]`；同卡逐项完成 8 条独立单谓词验收。
 
@@ -3545,7 +3545,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `remote-pending`
 
 **Description:** 100% 在独占目录 `src/storage/**` 内于 `segment.rs`（纯生产者/段层，零依赖尚未实现的消费端 `writer.rs`）**首次引入 `MAX_SEALED_SEGMENTS = 256` 常量**、常规 16 MiB 轮转新帧预写背压守卫（`ADR-RB-05` #3 Step ② (b)）与段层 `reclaim_sealed_segment` 原语：在**本已洁净的 Case A 满表通道**（`actual_len == committed_len`、`sealed.len() == 256`）上，触发 16 MiB 轮转的新帧于修改任何磁盘文件前返回 `LBR-AGENT-046`（逐文件验证零新建 `S+1`、`events-<S>`/`tail.meta`/`tail.meta.bak` 全调用零改动），调用 `reclaim_sealed_segment` 释放槽位后立即恢复建段与登记 `LTM2.sealed[]`。
 
@@ -3561,19 +3561,19 @@
 | 常规 16 MiB 轮转必须在建 `S+1` 或修改任何段/元数据前强制 `sealed.len() < 256` 背压并在释放槽位后自动恢复 | `ADR-RB-05` #3 Step ② |
 
 **Acceptance criteria:**
-- [ ] **总容量 ≤ `256 MiB` 条件隔离断言：** 以 256×4 KiB 小封存段（约 1 MiB）加近 16 MiB 活跃段（另一通道为 0）构造洁净 Case A 夹具，断言 `unconsumed_priority + unconsumed_normal + quarantine + frame_buf.len() <= 256 MiB`（严格排除全局字节上限 Step ② (a) 抢先触发）。
-- [ ] **洁净 Case A 常规轮转 `256 → 257` 返回 `LBR-AGENT-046`：** 在上述洁净 Case A 满表通道（`sealed.len() == 256`）上，下一入队触发 16 MiB 轮转时返回可恢复背压错误 `LBR-AGENT-046`。
-- [ ] **预变更背压零新建 `S+1` 文件：** 上述 AC2 拒收后，磁盘目录中未创建任何 `events-<S+1:08>.log` 文件。
-- [ ] **预变更背压既有活跃段零改动：** 上述 AC2 拒收后，既有 `events-<S>.log` 字节内容与拒收前逐字节一致。
-- [ ] **预变更背压主副本 `tail.meta` 零改动：** 上述 AC2 拒收后，既有 `tail.meta` 字节内容与拒收前逐字节一致。
-- [ ] **预变更背压副副本 `tail.meta.bak` 零改动：** 上述 AC2 拒收后，既有 `tail.meta.bak` 字节内容与拒收前逐字节一致。
-- [ ] **槽位释放后恢复创建 `S+1`：** 调用 `segment::reclaim_sealed_segment` 释放 ≥ 1 个已封存段使 `sealed.len() < 256` 后，同一触发轮转的新入队成功创建 `events-<S+1:08>.log`。
-- [ ] **恢复轮转登记 `LTM2.sealed[]`：** 上述 AC7 轮转提交双副本 `LTM2` 将旧段 `(S, old_committed_len, old_prefix_crc32c)` 原子登记至 `LTM2.sealed[]`。
+- [x] **总容量 ≤ `256 MiB` 条件隔离断言：** 以 256×4 KiB 小封存段（约 1 MiB）加近 16 MiB 活跃段（另一通道为 0）构造洁净 Case A 夹具，断言 `unconsumed_priority + unconsumed_normal + quarantine + frame_buf.len() <= 256 MiB`（严格排除全局字节上限 Step ② (a) 抢先触发）。
+- [x] **洁净 Case A 常规轮转 `256 → 257` 返回 `LBR-AGENT-046`：** 在上述洁净 Case A 满表通道（`sealed.len() == 256`）上，下一入队触发 16 MiB 轮转时返回可恢复背压错误 `LBR-AGENT-046`。
+- [x] **预变更背压零新建 `S+1` 文件：** 上述 AC2 拒收后，磁盘目录中未创建任何 `events-<S+1:08>.log` 文件。
+- [x] **预变更背压既有活跃段零改动：** 上述 AC2 拒收后，既有 `events-<S>.log` 字节内容与拒收前逐字节一致。
+- [x] **预变更背压主副本 `tail.meta` 零改动：** 上述 AC2 拒收后，既有 `tail.meta` 字节内容与拒收前逐字节一致。
+- [x] **预变更背压副副本 `tail.meta.bak` 零改动：** 上述 AC2 拒收后，既有 `tail.meta.bak` 字节内容与拒收前逐字节一致。
+- [x] **槽位释放后恢复创建 `S+1`：** 调用 `segment::reclaim_sealed_segment` 释放 ≥ 1 个已封存段使 `sealed.len() < 256` 后，同一触发轮转的新入队成功创建 `events-<S+1:08>.log`。
+- [x] **恢复轮转登记 `LTM2.sealed[]`：** 上述 AC7 轮转提交双副本 `LTM2` 将旧段 `(S, old_committed_len, old_prefix_crc32c)` 原子登记至 `LTM2.sealed[]`。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --no-default-features --features storage-redb --lib -E 'test(=storage::queue::segment::tests::sealed_cap_256_to_257_normal_rotation_backpressure_and_slot_release)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb --lib -E 'test(=storage::queue::segment::tests::sealed_cap_256_to_257_normal_rotation_backpressure_and_slot_release)'`（new，覆盖 AC1–AC8）
-- [ ] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 3 文件实现白名单。
+- [x] `source .env.test && cargo nextest list --no-default-features --features storage-redb --lib -E 'test(=storage::queue::segment::tests::sealed_cap_256_to_257_normal_rotation_backpressure_and_slot_release)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb --lib -E 'test(=storage::queue::segment::tests::sealed_cap_256_to_257_normal_rotation_backpressure_and_slot_release)'`（new，覆盖 AC1–AC8）
+- [x] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 3 文件实现白名单。
 
 **Full-suite trigger:** `none`
 
@@ -10059,8 +10059,9 @@
 | `RB-08i` | `done` / `remote-verified` | `87618ff`（`main`） | `0.30.351` | 2026-11-23 09:26 UTC：Stage 1 精确 3 文件写集内仅改动 `src/storage/queue/segment.rs`，补齐 Unix/Windows 对称确定性崩溃注入点（`AfterCaseCStepC1TruncateSyncBeforeMeta` 与 `AfterStepC2CreateSegmentBeforeMeta`，非测试构建零开销内联空操作）并同卡通过 `case_c_recovery_crash_boundaries_1_2_3_converge` 验收两步 Case C 恢复全部 8 项 AC（覆盖 `recover_lane` 与生产者 `append_frame` 双真实路径）：AC8 重命名前崩溃原段逐字节零提前截断 + 跨通道 `.tmp` 隔离 + 幂等重启收敛；AC1+AC7 边界 1（隔离 `fsync_dir` 后、截断前崩溃）重启零重复 `.bin` 文件且双路径断言 `QuarantineFsyncDirComplete < SegmentTruncateStart`、100% 保留全部前缀与完整已同步尾帧；AC2+AC3 边界 2（截断+`sync_data()` 后、Step C1 `LTM2` 前崩溃，含非零与零已同步尾两子态）重启走纯已同步尾/洁净分支零新隔离推进 `LTM2.COMMITTED_LEN = recovered_valid_end` 并严格保持 `ACTIVE_SEG == S`；AC4–AC6 边界 3（Step C1 后建空 `S+1`、Step C2 `LTM2` 前崩溃）重启经 Case D 断言 `OrphanUnlinkStart(1) < FsyncLaneDirAfterOrphanUnlink(1)`（生产者路径先于写新帧）删除空后继 `events-<S+1>.log`、保持 `ACTIVE_SEG == S` 与认证 `COMMITTED_LEN = recovered_valid_end` 并支持后续无缝续写；`--no-default-features --features storage-redb` `VER1` 1/1、`VER2` 1/1、`segment.rs` 11/11 回归（零 rustc 警告）、三构型矩阵、fmt、严格 `--lib` clippy、`compat_version_surface_sync` 全绿；Codex R1 两项生产者路径测试建议闭环，R2 获 `VERDICT: PASS`（P0=0、P1=0）；已推 `origin/main` |
 | `RB-08q` | `done` / `remote-verified` | `6071884`（`main`） | `0.30.352` | 2026-11-23 09:42 UTC：Stage 1 精确 3 文件写集内仅改动 `src/storage/queue/segment.rs`，在 Unix（`phase2_execute_plan_unix`）与 Windows（`phase2_execute_plan_windows`）的 `CaseCRecoverTail` 路径中于 `seal_recovered_segment_to_next_*` 前新增 `step_c1.meta.committed_len > 0` 跳过守卫，并在 `build_case_c_step_c2_meta` 中增加 `committed_len == 0` 防御性拒收：当全新段首帧半截崩溃致 `recovered_valid_end == 0` 时，Step C1 持久隔离 `[0, actual_len)`（`LBR-AGENT-050`）并将 `events-<S>.log` 截断回精确 0 字节后直接停在 Step C1，严格保持 `LTM2.ACTIVE_SEG == S` 与原 `LTM2.sealed.len()` 不变（绝不写入 0 字节封存段）；`--no-default-features --features storage-redb` `VER1` 1/1、`VER2`（`case_c_zero_byte_first_frame_crash_truncates_without_sealing` 覆盖 `S = 0` 空表、`S = 1` 既有 `sealed.len() == 1` 与直接公开 `append_frame` 生产路径 AC1–AC4 及顺序插桩）、`segment.rs` 12/12 回归、三构型矩阵、fmt、`--lib` clippy（`src/storage/` 零警告；上游 `69c5a87` `src/command/diff/options.rs:25` 存在与本卡无关的 `dead_code` 警告）、`compat_version_surface_sync` 全绿；Codex R1 首轮 `VERDICT: PASS`（P0=0、P1=0、P2=0）；已推 `origin/main` |
 | `RB-08k` | `done` / `remote-verified` | `5f2ccae`（`main`） | `0.30.353` | 2026-11-23 10:02 UTC：Stage 1 精确 3 文件写集内仅改动 `src/storage/queue/segment.rs`，首次独占实现嵌套 Case C→D 旧段洁净已同步尾恢复与真实边界封存（Unix/Windows 双路径对齐）：引入 `NestedOldTailPlan` 扩展 `Phase1Plan::{CaseDRecoverValidSuccessor, CaseDCleanOrphanSuccessor}`，Phase 1 先验旧段 `[0, committed_len)` 前缀（早于打开后继 `S+1`）、预扫后继并在 `classify_case_d_readonly` 中保持 `MAX_SEALED_SEGMENTS = 256` 满表优先于下游 `RB-08v` 损坏旧尾守卫、再以 `effective_old_len` 守卫禁封 0 字节旧段；Phase 2 先经 `case_c_step_c1_*` 提交旧段真实增长边界 `(S, old_valid_end, old_sealed_crc)`，再以精确 `(S, old_valid_end, old_sealed_crc)` 封存旧段至双副本 `LTM2.sealed[]` 并推进至 `S+1`（或清理孤儿后继保持 `S` 的增长边界）；`--no-default-features --features storage-redb` `VER1` 1/1、`VER2`（`nested_case_c_to_case_d_recovers_old_tail_and_seals_accurate_boundary` 覆盖 AC1 前缀翻转+符号链接先后序、AC2–AC6 >64KiB 双段全帧 key/flags/payload 无损解码、`append_frame` 公开多代封存、`committed_len == 0 < old_valid_end`、嵌套+空孤儿、及 Part 5 损坏旧尾 `RB-08v` 守卫与 256 满表优先整盘零改动）、`segment.rs` 13/13 回归、三构型矩阵、fmt、`--lib` clippy（`src/storage/` 零警告）、`compat_version_surface_sync` 全绿；Codex R1 两项测试增强闭环，R2 获 `VERDICT: PASS`（P0=0、P1=0）；已推 `origin/main` |
-| `RB-08v` | `done` / `remote-pending` | 本提交（`main`） | `0.30.354` | 2026-11-23 10:18 UTC：Stage 1 精确 3 文件写集内仅改动 `src/storage/queue/segment.rs`，在 `classify_case_d_readonly` 中解除临时 `RB-08v` 守卫并保留 Phase 1 `MAX_SEALED_SEGMENTS = 256` 满表与 `effective_old_len == 0` 零字节旧段先验 fail-closed 拒收，完整贯通 Unix/Windows 嵌套 Case C→D 旧段损坏半帧尾全区间 `committed_len <= old_valid_end < actual_len(S)` 恢复路径（Phase 2 统一经 `case_c_step_c1_*` → `RB-08t::quarantine_and_truncate_segment_*` 先完成 `publish_quarantine_durable` 含 `fsync_dir(quarantine_dir)` 并记 `LBR-AGENT-050`，再原地截断旧段至精确 `old_valid_end` + `sync_data()` 并提交 Step C1 `LTM2`，最后以精确 `(S, old_valid_end, old_sealed_crc)` 封存旧段至双副本 `LTM2.sealed[]` 并推进至 `S+1` 或清理孤儿后继）；`--no-default-features --features storage-redb` `VER1` 2/2、`VER2`（`nested_case_c_to_case_d_old_seg_damaged_tail_durable_quarantine_and_seal` 覆盖 `committed_len < old_valid_end < actual_len(S)` AC1–AC3/AC7/AC8、`recover_lane` 与双损 `S`+`S+1` 生产者路径双顺序插桩）、`VER3`（`nested_case_c_to_case_d_old_seg_bad_tail_at_committed_boundary_quarantine_and_seal` 覆盖等号边界 `old_valid_end == committed_len < actual_len(S)` AC4–AC7/AC8、`recover_lane` 与坏头生产者路径及嵌套坏尾+空孤儿）、`segment.rs` 14/14 回归、三构型矩阵、fmt、`--lib` clippy（`src/storage/` 零警告）、`compat_version_surface_sync` 全绿；Codex R1 首轮 `VERDICT: PASS`（P0=0、P1=0、P2=0） |
-| `RB-08j`..`RB-34c`（剩余 106 卡） | `pending` | — | — | Phase 2 推进中，按实施顺序于 `main` 逐卡推进 |
+| `RB-08v` | `done` / `remote-verified` | `08804be`（`main`） | `0.30.354` | 2026-11-23 10:18 UTC：Stage 1 精确 3 文件写集内仅改动 `src/storage/queue/segment.rs`，在 `classify_case_d_readonly` 中解除临时 `RB-08v` 守卫并保留 Phase 1 `MAX_SEALED_SEGMENTS = 256` 满表与 `effective_old_len == 0` 零字节旧段先验 fail-closed 拒收，完整贯通 Unix/Windows 嵌套 Case C→D 旧段损坏半帧尾全区间 `committed_len <= old_valid_end < actual_len(S)` 恢复路径（Phase 2 统一经 `case_c_step_c1_*` → `RB-08t::quarantine_and_truncate_segment_*` 先完成 `publish_quarantine_durable` 含 `fsync_dir(quarantine_dir)` 并记 `LBR-AGENT-050`，再原地截断旧段至精确 `old_valid_end` + `sync_data()` 并提交 Step C1 `LTM2`，最后以精确 `(S, old_valid_end, old_sealed_crc)` 封存旧段至双副本 `LTM2.sealed[]` 并推进至 `S+1` 或清理孤儿后继）；`--no-default-features --features storage-redb` `VER1` 2/2、`VER2`（`nested_case_c_to_case_d_old_seg_damaged_tail_durable_quarantine_and_seal` 覆盖 `committed_len < old_valid_end < actual_len(S)` AC1–AC3/AC7/AC8、`recover_lane` 与双损 `S`+`S+1` 生产者路径双顺序插桩）、`VER3`（`nested_case_c_to_case_d_old_seg_bad_tail_at_committed_boundary_quarantine_and_seal` 覆盖等号边界 `old_valid_end == committed_len < actual_len(S)` AC4–AC7/AC8、`recover_lane` 与坏头生产者路径及嵌套坏尾+空孤儿）、`segment.rs` 14/14 回归、三构型矩阵、fmt、`--lib` clippy（`src/storage/` 零警告）、`compat_version_surface_sync` 全绿；Codex R1 首轮 `VERDICT: PASS`（P0=0、P1=0、P2=0）；已推 `origin/main` |
+| `RB-08j` | `done` / `remote-pending` | 本提交（`main`） | `0.30.355` | 2026-11-23 10:49 UTC：Stage 1 精确 3 文件写集内仅改动 `src/storage/queue/segment.rs`，实现 `ADR-RB-05` #3 Step ② (b) 常规 16 MiB 轮转预写 `MAX_SEALED_SEGMENTS = 256` 背压守卫（`enforce_rotation_sealed_cap_limit`，Unix/Windows 及 `build_next_append_meta` 纵深防御，于建 `S+1` 或改任何段/元数据前返回 `StorageBackendError::QueueFull` `LBR-AGENT-046`）与队列内部消费原语 `pub(super) reclaim_sealed_segment` / `reclaim_sealed_segment_at_root`（`ADR-RB-05` #4 ③：要求 `seg_id < highwater_seg && seg_id == min_live_seg && seg_id < active_seg && sealed[0].seg_id == seg_id`，严格在 Phase 2 任何元数据修复或 `.tmp` 清理前只读预检高水位/顺序/目标存在性（缺文件报 `CorruptCommittedFrame` `LBR-IO-001` 绝不静默退役）/非软链非目录/属主身份（Unix UID + Windows `GetSecurityInfo` 核 `TokenUser \|\| TokenOwner`），随后先提交双副本 `LTM2` 再 `unlink` + `fsync_dir(lane_dir)`）；`--no-default-features --features storage-redb` `VER1` 1/1、`VER2`（`sealed_cap_256_to_257_normal_rotation_backpressure_and_slot_release` 覆盖 AC1–AC8、256×4KiB 容量隔离、分叉副本零改动拒收未消费/缺段/软链/异属主、`AfterReclaimMetaBeforeUnlink` 崩溃+恢复清理孤儿、`dual LTM2 < ReclaimSegmentUnlink < FsyncLaneDirAfterReclaim` 顺序插桩与释放槽位后 `256→257` 轮转无损解码）、`segment.rs` 16/16 快速回归、`storage-redb` `--lib` 全零警告（含 `dead_code`）、三构型矩阵、fmt、`--lib` clippy（`src/storage/` 零警告）、`compat_version_surface_sync` 全绿；Codex R1 全部 4 项 P1 闭环并经 R2 确认，R2 追加的 Windows 提权令牌 `TokenOwner` 属主兼容已落地，R2 要求的仅 Windows 可跑回归用例因 macOS 宿主限制依用户授权跳过推进 |
+| `RB-08r`..`RB-34c`（剩余 105 卡） | `pending` | — | — | Phase 2 推进中，按实施顺序于 `main` 逐卡推进 |
 
 ## Codex review log
 
