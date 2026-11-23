@@ -576,14 +576,46 @@ pub fn quarantine_artifact_id(
 
 /// Returns `true` iff `name` is a lane-scoped quarantine temporary file
 /// `quarantine/<lane>-*.tmp` eligible for Phase 2 cleanup ONLY when `lane` has
-/// passed Phase 1 read-only classification (`ADR-RB-05` #3, `RB-08t`).
+/// passed Phase 1 read-only classification (`ADR-RB-05` #3, `RB-08t`, `RB-08x`).
 #[must_use]
 pub fn is_lane_quarantine_temp_name(lane: CaptureQueueLane, name: &[u8]) -> bool {
     let prefix = match lane {
         CaptureQueueLane::Priority => b"priority-".as_slice(),
         CaptureQueueLane::Normal => b"normal-".as_slice(),
     };
-    name.starts_with(prefix) && name.ends_with(b".tmp") && name.len() > prefix.len() + b".tmp".len()
+    name.starts_with(prefix)
+        && name.ends_with(b".tmp")
+        && name.len() >= prefix.len() + b".tmp".len()
+}
+
+/// Match an ASCII prefix and suffix directly over UTF-16/WTF-16 Windows
+/// filename code units so filenames containing unpaired UTF-16 surrogates are
+/// never silently skipped by `.to_str()` (`RB-08x`).
+#[cfg(any(windows, test))]
+fn wide_matches_ascii_prefix_suffix(units: &[u16], prefix: &[u8], suffix: &[u8]) -> bool {
+    units.len() >= prefix.len() + suffix.len()
+        && prefix
+            .iter()
+            .enumerate()
+            .all(|(i, &b)| units[i] == u16::from(b))
+        && suffix
+            .iter()
+            .enumerate()
+            .all(|(i, &b)| units[units.len() - suffix.len() + i] == u16::from(b))
+}
+
+#[cfg(any(windows, test))]
+fn wide_is_lane_meta_temp_name(units: &[u16]) -> bool {
+    wide_matches_ascii_prefix_suffix(units, b"tail.meta", b".tmp")
+}
+
+#[cfg(any(windows, test))]
+fn wide_is_lane_quarantine_temp_name(lane: CaptureQueueLane, units: &[u16]) -> bool {
+    let prefix = match lane {
+        CaptureQueueLane::Priority => b"priority-".as_slice(),
+        CaptureQueueLane::Normal => b"normal-".as_slice(),
+    };
+    wide_matches_ascii_prefix_suffix(units, prefix, b".tmp")
 }
 
 fn validate_quarantine_artifact_id(id: &str) -> StorageResult<()> {
@@ -806,6 +838,37 @@ enum Phase1Plan<T> {
         stale_tmp_names: Vec<T>,
         reclaimed_orphans: Vec<u32>,
     },
+}
+
+impl<T> Phase1Plan<T> {
+    fn stale_tmp_names(&self) -> &[T] {
+        match self {
+            Self::Case0aFreshEmpty { stale_tmp_names }
+            | Self::Case0bPreInitializedEmpty {
+                stale_tmp_names, ..
+            }
+            | Self::CaseAClean {
+                stale_tmp_names, ..
+            }
+            | Self::CaseCRecoverTail {
+                stale_tmp_names, ..
+            }
+            | Self::CaseDRecoverValidSuccessor {
+                stale_tmp_names, ..
+            }
+            | Self::CaseDCleanOrphanSuccessor {
+                stale_tmp_names, ..
+            } => stale_tmp_names,
+        }
+    }
+}
+
+/// Counts of lane-scoped temporary files removed during Phase 2 cleanup
+/// (`ADR-RB-05` #3 Step ① Phase 2, `RB-08x`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct LaneTempCleanupCounts {
+    lane_meta_tmp_files: usize,
+    quarantine_tmp_files: usize,
 }
 
 // ============================================================================
@@ -3543,6 +3606,7 @@ mod unix_seg {
         recovered_bytes: u64,
         mirrored_replica: bool,
         cleaned_tmp_files: usize,
+        cleaned_quarantine_tmp_files: usize,
         reclaimed_orphans_removed: usize,
         quarantined_artifacts: Vec<QuarantinePublishReport>,
         lane_dir_synced: bool,
@@ -3666,6 +3730,31 @@ mod unix_seg {
         Ok(next_meta)
     }
 
+    /// Phase 2 Unix lane-scoped temporary-file cleanup filter (`ADR-RB-05` #3
+    /// Step ① Phase 2, `RB-08x`): strictly under held `append.lock`, removes
+    /// ONLY the classified lane's `tail.meta*.tmp` files in `lane_fd` and its
+    /// `<lane>-*.tmp` files in shared `quarantine_fd` — never touching the
+    /// sibling lane's directory, sibling lane's `quarantine/<other>-*.tmp`, or
+    /// any durable `quarantine/*.bin` artifacts.
+    fn clean_lane_temp_files_unix(
+        lane: CaptureQueueLane,
+        lane_fd: &OwnedFd,
+        quarantine_fd: &OwnedFd,
+        stale_meta_tmp_names: &[OsString],
+        owners: UnixExpectedQueueOwners,
+        _append_lock: &AppendLockGuard,
+    ) -> StorageResult<LaneTempCleanupCounts> {
+        let lane_uid = lane_expected_uid(owners, lane);
+        let lane_meta_tmp_files =
+            clean_stale_tmp_files_unix(lane_fd, stale_meta_tmp_names, lane_uid)?;
+        let quarantine_tmp_files =
+            clean_lane_quarantine_tmp_files_unix(quarantine_fd, lane, owners.quarantine_uid)?;
+        Ok(LaneTempCleanupCounts {
+            lane_meta_tmp_files,
+            quarantine_tmp_files,
+        })
+    }
+
     fn phase2_execute_plan_unix(
         ctx: &UnixPhase2Context<'_>,
         plan: Phase1Plan<OsString>,
@@ -3674,10 +3763,18 @@ mod unix_seg {
         let lane_fd = ctx.lane_fd;
         let lane_label = lane_dir_name(ctx.lane);
         let expected_uid = lane_expected_uid(ctx.owners, ctx.lane);
+        let cleanup = clean_lane_temp_files_unix(
+            ctx.lane,
+            lane_fd,
+            ctx.quarantine_fd,
+            plan.stale_tmp_names(),
+            ctx.owners,
+            ctx.append_lock,
+        )?;
+        let cleaned_tmp_files = cleanup.lane_meta_tmp_files;
+        let cleaned_quarantine_tmp_files = cleanup.quarantine_tmp_files;
         match plan {
-            Phase1Plan::Case0aFreshEmpty { stale_tmp_names } => {
-                let cleaned_tmp_files =
-                    clean_stale_tmp_files_unix(lane_fd, &stale_tmp_names, expected_uid)?;
+            Phase1Plan::Case0aFreshEmpty { .. } => {
                 let meta = LaneTailMeta::initial_empty();
                 commit_dual_tail_meta_unix(lane_fd, lane_label, &meta, expected_uid, observer)?;
                 Ok(Phase2ConvergedState {
@@ -3687,18 +3784,15 @@ mod unix_seg {
                     recovered_bytes: 0,
                     mirrored_replica: false,
                     cleaned_tmp_files,
+                    cleaned_quarantine_tmp_files,
                     reclaimed_orphans_removed: 0,
                     quarantined_artifacts: Vec::new(),
                     lane_dir_synced: true,
                 })
             }
             Phase1Plan::Case0bPreInitializedEmpty {
-                meta,
-                mirror_sync,
-                stale_tmp_names,
+                meta, mirror_sync, ..
             } => {
-                let cleaned_tmp_files =
-                    clean_stale_tmp_files_unix(lane_fd, &stale_tmp_names, expected_uid)?;
                 let mirrored_replica = apply_mirror_sync_unix(
                     lane_fd,
                     lane_label,
@@ -3714,6 +3808,7 @@ mod unix_seg {
                     recovered_bytes: 0,
                     mirrored_replica,
                     cleaned_tmp_files,
+                    cleaned_quarantine_tmp_files,
                     reclaimed_orphans_removed: 0,
                     quarantined_artifacts: Vec::new(),
                     lane_dir_synced: mirrored_replica || cleaned_tmp_files > 0,
@@ -3722,11 +3817,9 @@ mod unix_seg {
             Phase1Plan::CaseAClean {
                 meta,
                 mirror_sync,
-                stale_tmp_names,
                 reclaimed_orphans,
+                ..
             } => {
-                let cleaned_tmp_files =
-                    clean_stale_tmp_files_unix(lane_fd, &stale_tmp_names, expected_uid)?;
                 let reclaimed_orphans_removed =
                     clean_reclaimed_orphans_unix(lane_fd, &reclaimed_orphans, expected_uid)?;
                 let mirrored_replica = apply_mirror_sync_unix(
@@ -3744,6 +3837,7 @@ mod unix_seg {
                     recovered_bytes: 0,
                     mirrored_replica,
                     cleaned_tmp_files,
+                    cleaned_quarantine_tmp_files,
                     reclaimed_orphans_removed,
                     quarantined_artifacts: Vec::new(),
                     lane_dir_synced: mirrored_replica
@@ -3757,11 +3851,9 @@ mod unix_seg {
                 recovered_crc32c,
                 recovered_frames,
                 has_damaged_tail,
-                stale_tmp_names,
                 reclaimed_orphans,
+                ..
             } => {
-                let cleaned_tmp_files =
-                    clean_stale_tmp_files_unix(lane_fd, &stale_tmp_names, expected_uid)?;
                 let reclaimed_orphans_removed =
                     clean_reclaimed_orphans_unix(lane_fd, &reclaimed_orphans, expected_uid)?;
                 let step_c1 = case_c_step_c1_unix(
@@ -3791,6 +3883,7 @@ mod unix_seg {
                     recovered_bytes: step_c1.recovered_bytes,
                     mirrored_replica: true,
                     cleaned_tmp_files,
+                    cleaned_quarantine_tmp_files,
                     reclaimed_orphans_removed,
                     quarantined_artifacts,
                     lane_dir_synced: true,
@@ -3804,11 +3897,9 @@ mod unix_seg {
                 succ_crc32c,
                 succ_frames,
                 succ_has_damaged_tail,
-                stale_tmp_names,
                 reclaimed_orphans,
+                ..
             } => {
-                let cleaned_tmp_files =
-                    clean_stale_tmp_files_unix(lane_fd, &stale_tmp_names, expected_uid)?;
                 let reclaimed_orphans_removed =
                     clean_reclaimed_orphans_unix(lane_fd, &reclaimed_orphans, expected_uid)?;
                 let mut quarantined_artifacts = Vec::new();
@@ -3880,6 +3971,7 @@ mod unix_seg {
                     recovered_bytes: old_recovered_bytes + succ_valid_end,
                     mirrored_replica: true,
                     cleaned_tmp_files,
+                    cleaned_quarantine_tmp_files,
                     reclaimed_orphans_removed,
                     quarantined_artifacts,
                     lane_dir_synced: true,
@@ -3890,11 +3982,9 @@ mod unix_seg {
                 old_tail,
                 orphan_seg,
                 orphan_non_empty,
-                stale_tmp_names,
                 reclaimed_orphans,
+                ..
             } => {
-                let cleaned_tmp_files =
-                    clean_stale_tmp_files_unix(lane_fd, &stale_tmp_names, expected_uid)?;
                 let reclaimed_orphans_removed =
                     clean_reclaimed_orphans_unix(lane_fd, &reclaimed_orphans, expected_uid)?;
                 let mut quarantined_artifacts = Vec::new();
@@ -3959,6 +4049,7 @@ mod unix_seg {
                     recovered_bytes: old_recovered_bytes,
                     mirrored_replica: true,
                     cleaned_tmp_files,
+                    cleaned_quarantine_tmp_files,
                     reclaimed_orphans_removed,
                     quarantined_artifacts,
                     lane_dir_synced: true,
@@ -5314,11 +5405,8 @@ mod unix_seg {
             observer,
         )?;
 
-        // Phase 2: clean lane-scoped quarantine `.tmp` (NEVER touching the
-        // opposite lane's `.tmp`), clean lane `tail.meta*.tmp`, mirror lagging
-        // replica, recover Case C / Case D.
-        let _cleaned_q_tmp =
-            clean_lane_quarantine_tmp_files_unix(&quarantine_fd, lane, owners.quarantine_uid)?;
+        // Phase 2: execute lane-scoped temporary-file cleanup (`clean_lane_temp_files_unix`),
+        // mirror lagging replica, and recover Case C / Case D.
         let phase2_ctx = UnixPhase2Context {
             lane,
             lane_fd: &lane_fd,
@@ -5425,8 +5513,6 @@ mod unix_seg {
             DEFAULT_QUEUE_APPEND_LOCK_TIMEOUT,
             observer,
         )?;
-        let cleaned_quarantine_tmp_files =
-            clean_lane_quarantine_tmp_files_unix(&quarantine_fd, lane, owners.quarantine_uid)?;
         let phase2_ctx = UnixPhase2Context {
             lane,
             lane_fd: &lane_fd,
@@ -5457,7 +5543,7 @@ mod unix_seg {
             recovered_bytes: converged.recovered_bytes,
             mirrored_replica: converged.mirrored_replica,
             cleaned_tmp_files: converged.cleaned_tmp_files,
-            cleaned_quarantine_tmp_files,
+            cleaned_quarantine_tmp_files: converged.cleaned_quarantine_tmp_files,
             reclaimed_orphans_removed: converged.reclaimed_orphans_removed,
             quarantined_artifacts: converged.quarantined_artifacts,
         })
@@ -5645,8 +5731,6 @@ mod unix_seg {
         };
         preverify_reclaim_target_unix(&lane_fd, &cname, target_expected_uid)?;
 
-        let _cleaned_q_tmp =
-            clean_lane_quarantine_tmp_files_unix(&quarantine_fd, lane, owners.quarantine_uid)?;
         let phase2_ctx = UnixPhase2Context {
             lane,
             lane_fd: &lane_fd,
@@ -6442,7 +6526,10 @@ mod non_unix_seg {
             }
         }
 
-        fn scan_lane_dir_windows(lane_dir: &Path) -> StorageResult<(Vec<u32>, Vec<String>)> {
+        fn scan_lane_dir_windows(
+            lane_dir: &Path,
+        ) -> StorageResult<(Vec<u32>, Vec<std::ffi::OsString>)> {
+            use std::os::windows::ffi::OsStrExt as _;
             let mut seg_ids = Vec::new();
             let mut stale_tmp_names = Vec::new();
             for entry in fs::read_dir(lane_dir)
@@ -6450,24 +6537,36 @@ mod non_unix_seg {
             {
                 let entry = entry
                     .map_err(|e| StorageBackendError::io("read capture queue lane entry", e))?;
-                let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-                    return Err(StorageBackendError::CorruptCommittedFrame {
-                        detail: "non-UTF-8 entry name in capture queue lane".to_string(),
-                    });
-                };
-                if matches_segment_log_glob_bytes(name.as_bytes()) {
-                    match parse_segment_log_file_name(name.as_bytes()) {
-                        Some(seg_id) => seg_ids.push(seg_id),
-                        None => {
-                            return Err(StorageBackendError::CorruptCommittedFrame {
-                                detail:
-                                    "malformed events-*.log segment filename in capture queue lane"
-                                        .to_string(),
-                            });
+                let raw_name = entry.file_name();
+                if let Some(name) = raw_name.to_str() {
+                    if matches_segment_log_glob_bytes(name.as_bytes()) {
+                        match parse_segment_log_file_name(name.as_bytes()) {
+                            Some(seg_id) => seg_ids.push(seg_id),
+                            None => {
+                                return Err(StorageBackendError::CorruptCommittedFrame {
+                                    detail:
+                                        "malformed events-*.log segment filename in capture queue lane"
+                                            .to_string(),
+                                });
+                            }
                         }
+                    } else if is_lane_meta_temp_name(name.as_bytes()) {
+                        stale_tmp_names.push(raw_name);
                     }
-                } else if is_lane_meta_temp_name(name.as_bytes()) {
-                    stale_tmp_names.push(name);
+                } else {
+                    let wide: Vec<u16> = raw_name.encode_wide().collect();
+                    if wide_matches_ascii_prefix_suffix(&wide, b"events-", b".log") {
+                        return Err(StorageBackendError::CorruptCommittedFrame {
+                            detail: "malformed events-*.log segment filename in capture queue lane"
+                                .to_string(),
+                        });
+                    } else if wide_is_lane_meta_temp_name(&wide) {
+                        stale_tmp_names.push(raw_name);
+                    } else {
+                        return Err(StorageBackendError::CorruptCommittedFrame {
+                            detail: "non-UTF-8 entry name in capture queue lane".to_string(),
+                        });
+                    }
                 }
             }
             seg_ids.sort_unstable();
@@ -6486,7 +6585,7 @@ mod non_unix_seg {
             lane_dir: &Path,
             open_seg_writable: bool,
             observer: &mut SegmentObserver,
-        ) -> StorageResult<(Phase1Plan<String>, Option<PinnedWindowsSegment>)> {
+        ) -> StorageResult<(Phase1Plan<std::ffi::OsString>, Option<PinnedWindowsSegment>)> {
             let (seg_ids, stale_tmp_names) = scan_lane_dir_windows(lane_dir)?;
             let primary = read_meta_replica_windows(
                 lane_dir,
@@ -6808,7 +6907,11 @@ mod non_unix_seg {
             open_seg_writable: bool,
             lock_timeout: Duration,
             observer: &mut SegmentObserver,
-        ) -> StorageResult<(File, Phase1Plan<String>, Option<PinnedWindowsSegment>)> {
+        ) -> StorageResult<(
+            File,
+            Phase1Plan<std::ffi::OsString>,
+            Option<PinnedWindowsSegment>,
+        )> {
             let deadline = lock_deadline_for_timeout(lock_timeout);
             if let Some(lock) = acquire_existing_lock_windows(queue_root, deadline)? {
                 observer.record_acquire_lock();
@@ -6919,6 +7022,7 @@ mod non_unix_seg {
             recovered_bytes: u64,
             mirrored_replica: bool,
             cleaned_tmp_files: usize,
+            cleaned_quarantine_tmp_files: usize,
             reclaimed_orphans_removed: usize,
             quarantined_artifacts: Vec<QuarantinePublishReport>,
             lane_dir_synced: bool,
@@ -7021,29 +7125,56 @@ mod non_unix_seg {
             ))
         }
 
+        /// Phase 2 Windows lane-scoped temporary-file cleanup filter (`ADR-RB-05` #3
+        /// Step ① Phase 2, `RB-08x`): strictly under held `append.lock`, removes
+        /// ONLY the classified lane's `tail.meta*.tmp` files in `lane_dir` and its
+        /// `<lane>-*.tmp` files in shared `quarantine_dir` — never touching the
+        /// sibling lane's directory, sibling lane's `quarantine/<other>-*.tmp`, or
+        /// any durable `quarantine/*.bin` artifacts.
+        fn clean_lane_temp_files_windows(
+            lane: CaptureQueueLane,
+            lane_dir: &Path,
+            quarantine_dir: &Path,
+            stale_meta_tmp_names: &[std::ffi::OsString],
+            _append_lock: &File,
+        ) -> StorageResult<LaneTempCleanupCounts> {
+            let mut lane_meta_tmp_files = 0usize;
+            for name in stale_meta_tmp_names {
+                let p = lane_dir.join(name);
+                if ensure_not_reparse_or_dir_if_exists(&p, "capture queue temp metadata")? {
+                    fs::remove_file(&p).map_err(|e| {
+                        StorageBackendError::io("remove stale capture queue temp metadata", e)
+                    })?;
+                    lane_meta_tmp_files += 1;
+                }
+            }
+            if lane_meta_tmp_files > 0 {
+                flush_windows_dir(lane_dir)?;
+            }
+            let quarantine_tmp_files =
+                clean_lane_quarantine_tmp_files_windows(quarantine_dir, lane)?;
+            Ok(LaneTempCleanupCounts {
+                lane_meta_tmp_files,
+                quarantine_tmp_files,
+            })
+        }
+
         fn phase2_execute_plan_windows(
             ctx: &WindowsPhase2Context<'_>,
-            plan: Phase1Plan<String>,
+            plan: Phase1Plan<std::ffi::OsString>,
             observer: &mut SegmentObserver,
         ) -> StorageResult<WindowsPhase2ConvergedState> {
             let lane_dir = ctx.lane_dir;
             let lane_label = lane_dir_name(ctx.lane);
-            let clean_tmp = |names: &[String]| -> StorageResult<usize> {
-                let mut removed = 0usize;
-                for name in names {
-                    let p = lane_dir.join(name);
-                    if ensure_not_reparse_or_dir_if_exists(&p, "capture queue temp metadata")? {
-                        fs::remove_file(&p).map_err(|e| {
-                            StorageBackendError::io("remove stale capture queue temp metadata", e)
-                        })?;
-                        removed += 1;
-                    }
-                }
-                if removed > 0 {
-                    flush_windows_dir(lane_dir)?;
-                }
-                Ok(removed)
-            };
+            let cleanup = clean_lane_temp_files_windows(
+                ctx.lane,
+                lane_dir,
+                ctx.quarantine_dir,
+                plan.stale_tmp_names(),
+                ctx.append_lock,
+            )?;
+            let cleaned = cleanup.lane_meta_tmp_files;
+            let cleaned_quarantine_tmp_files = cleanup.quarantine_tmp_files;
             let clean_orphans = |orphans: &[u32]| -> StorageResult<usize> {
                 let mut removed = 0usize;
                 for &seg_id in orphans {
@@ -7062,8 +7193,7 @@ mod non_unix_seg {
             };
 
             match plan {
-                Phase1Plan::Case0aFreshEmpty { stale_tmp_names } => {
-                    let cleaned = clean_tmp(&stale_tmp_names)?;
+                Phase1Plan::Case0aFreshEmpty { .. } => {
                     let meta = LaneTailMeta::initial_empty();
                     commit_dual_tail_meta_windows(lane_dir, lane_label, &meta, observer)?;
                     Ok(WindowsPhase2ConvergedState {
@@ -7073,6 +7203,7 @@ mod non_unix_seg {
                         recovered_bytes: 0,
                         mirrored_replica: false,
                         cleaned_tmp_files: cleaned,
+                        cleaned_quarantine_tmp_files,
                         reclaimed_orphans_removed: 0,
                         quarantined_artifacts: Vec::new(),
                         lane_dir_synced: true,
@@ -7080,11 +7211,8 @@ mod non_unix_seg {
                     })
                 }
                 Phase1Plan::Case0bPreInitializedEmpty {
-                    meta,
-                    mirror_sync,
-                    stale_tmp_names,
+                    meta, mirror_sync, ..
                 } => {
-                    let cleaned = clean_tmp(&stale_tmp_names)?;
                     let mirrored = match mirror_sync {
                         MirrorSync::None => false,
                         MirrorSync::SyncBackup => {
@@ -7121,6 +7249,7 @@ mod non_unix_seg {
                         recovered_bytes: 0,
                         mirrored_replica: mirrored,
                         cleaned_tmp_files: cleaned,
+                        cleaned_quarantine_tmp_files,
                         reclaimed_orphans_removed: 0,
                         quarantined_artifacts: Vec::new(),
                         lane_dir_synced: mirrored || cleaned > 0,
@@ -7130,10 +7259,9 @@ mod non_unix_seg {
                 Phase1Plan::CaseAClean {
                     meta,
                     mirror_sync,
-                    stale_tmp_names,
                     reclaimed_orphans,
+                    ..
                 } => {
-                    let cleaned = clean_tmp(&stale_tmp_names)?;
                     let orphans = clean_orphans(&reclaimed_orphans)?;
                     let mirrored = match mirror_sync {
                         MirrorSync::None => false,
@@ -7171,6 +7299,7 @@ mod non_unix_seg {
                         recovered_bytes: 0,
                         mirrored_replica: mirrored,
                         cleaned_tmp_files: cleaned,
+                        cleaned_quarantine_tmp_files,
                         reclaimed_orphans_removed: orphans,
                         quarantined_artifacts: Vec::new(),
                         lane_dir_synced: mirrored || cleaned > 0 || orphans > 0,
@@ -7183,10 +7312,9 @@ mod non_unix_seg {
                     recovered_crc32c,
                     recovered_frames,
                     has_damaged_tail,
-                    stale_tmp_names,
                     reclaimed_orphans,
+                    ..
                 } => {
-                    let cleaned = clean_tmp(&stale_tmp_names)?;
                     let orphans = clean_orphans(&reclaimed_orphans)?;
                     let step_c1 = case_c_step_c1_windows(
                         ctx,
@@ -7220,6 +7348,7 @@ mod non_unix_seg {
                         recovered_bytes: step_c1.recovered_bytes,
                         mirrored_replica: true,
                         cleaned_tmp_files: cleaned,
+                        cleaned_quarantine_tmp_files,
                         reclaimed_orphans_removed: orphans,
                         quarantined_artifacts,
                         lane_dir_synced: true,
@@ -7234,10 +7363,9 @@ mod non_unix_seg {
                     succ_crc32c,
                     succ_frames,
                     succ_has_damaged_tail,
-                    stale_tmp_names,
                     reclaimed_orphans,
+                    ..
                 } => {
-                    let cleaned = clean_tmp(&stale_tmp_names)?;
                     let orphans = clean_orphans(&reclaimed_orphans)?;
                     let mut quarantined_artifacts = Vec::new();
                     let (effective_old_meta, old_recovered_frames, old_recovered_bytes) =
@@ -7291,6 +7419,7 @@ mod non_unix_seg {
                         recovered_bytes: old_recovered_bytes + succ_valid_end,
                         mirrored_replica: true,
                         cleaned_tmp_files: cleaned,
+                        cleaned_quarantine_tmp_files,
                         reclaimed_orphans_removed: orphans,
                         quarantined_artifacts,
                         lane_dir_synced: true,
@@ -7302,10 +7431,9 @@ mod non_unix_seg {
                     old_tail,
                     orphan_seg,
                     orphan_non_empty,
-                    stale_tmp_names,
                     reclaimed_orphans,
+                    ..
                 } => {
-                    let cleaned = clean_tmp(&stale_tmp_names)?;
                     let orphans = clean_orphans(&reclaimed_orphans)?;
                     let mut quarantined_artifacts = Vec::new();
                     let (effective_old_meta, old_recovered_frames, old_recovered_bytes) =
@@ -7352,6 +7480,7 @@ mod non_unix_seg {
                         recovered_bytes: old_recovered_bytes,
                         mirrored_replica: true,
                         cleaned_tmp_files: cleaned,
+                        cleaned_quarantine_tmp_files,
                         reclaimed_orphans_removed: orphans,
                         quarantined_artifacts,
                         lane_dir_synced: true,
@@ -7399,6 +7528,7 @@ mod non_unix_seg {
             quarantine_dir: &Path,
             lane: CaptureQueueLane,
         ) -> StorageResult<usize> {
+            use std::os::windows::ffi::OsStrExt as _;
             let mut removed = 0usize;
             for entry in fs::read_dir(quarantine_dir).map_err(|e| {
                 StorageBackendError::io("read capture queue quarantine directory", e)
@@ -7406,11 +7536,10 @@ mod non_unix_seg {
                 let entry = entry.map_err(|e| {
                     StorageBackendError::io("read capture queue quarantine entry", e)
                 })?;
-                let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-                    continue;
-                };
-                if is_lane_quarantine_temp_name(lane, name.as_bytes()) {
-                    let p = quarantine_dir.join(&name);
+                let raw_name = entry.file_name();
+                let wide: Vec<u16> = raw_name.encode_wide().collect();
+                if wide_is_lane_quarantine_temp_name(lane, &wide) {
+                    let p = quarantine_dir.join(&raw_name);
                     if ensure_not_reparse_or_dir_if_exists(&p, "capture queue quarantine temp")? {
                         fs::remove_file(&p).map_err(|e| {
                             StorageBackendError::io("remove stale quarantine temp file", e)
@@ -7927,7 +8056,6 @@ mod non_unix_seg {
                 options.effective_lock_timeout(),
                 observer,
             )?;
-            let _cleaned_q_tmp = clean_lane_quarantine_tmp_files_windows(&quarantine_dir, lane)?;
             let phase2_ctx = WindowsPhase2Context {
                 lane,
                 lane_dir: &lane_dir,
@@ -8065,8 +8193,6 @@ mod non_unix_seg {
                 observer,
             )?;
             drop(pinned);
-            let cleaned_quarantine_tmp_files =
-                clean_lane_quarantine_tmp_files_windows(&quarantine_dir, lane)?;
             let phase2_ctx = WindowsPhase2Context {
                 lane,
                 lane_dir: &lane_dir,
@@ -8089,7 +8215,7 @@ mod non_unix_seg {
                 recovered_bytes: converged.recovered_bytes,
                 mirrored_replica: converged.mirrored_replica,
                 cleaned_tmp_files: converged.cleaned_tmp_files,
-                cleaned_quarantine_tmp_files,
+                cleaned_quarantine_tmp_files: converged.cleaned_quarantine_tmp_files,
                 reclaimed_orphans_removed: converged.reclaimed_orphans_removed,
                 quarantined_artifacts: converged.quarantined_artifacts,
             })
@@ -8143,7 +8269,6 @@ mod non_unix_seg {
             let seg_path = lane_dir.join(segment_log_file_name(seg_id));
             preverify_reclaim_target_windows(&seg_path, observer)?;
 
-            let _cleaned_q_tmp = clean_lane_quarantine_tmp_files_windows(&quarantine_dir, lane)?;
             let phase2_ctx = WindowsPhase2Context {
                 lane,
                 lane_dir: &lane_dir,
@@ -21091,6 +21216,658 @@ mod tests {
                     drop_lock,
                 );
             }
+        }
+    }
+
+    #[test]
+    fn cross_lane_quarantine_tmp_cleanup_scoped_to_classified_lane_only() {
+        // `RB-08x` AC1–AC8 (`ADR-RB-05` #1, #3 Step ① Phase 2):
+        // Shared `quarantine/` temporary-file cleanup filter (`clean_lane_temp_files_*`
+        // + `is_lane_meta_temp_name` + `is_lane_quarantine_temp_name`) MUST strictly
+        // clean ONLY the classified lane's own `tail.meta*.tmp` and
+        // `quarantine/<lane>-*.tmp`, leaving the sibling lane's directory, sibling
+        // `tail.meta*.tmp`, sibling `quarantine/<other_lane>-*.tmp`, durable `.bin`
+        // quarantine artifacts, and unrelated files byte-for-byte untouched in BOTH
+        // symmetric directions (`priority/` healthy vs `normal/` Subcase B2 damaged,
+        // and `normal/` healthy vs `priority/` Subcase B2 damaged).
+
+        // Unit filter boundary checks (including zero-character `*` wildcard
+        // `<lane>-.tmp` and UTF-16 unpaired surrogate WTF-16 Windows filenames).
+        assert!(is_lane_meta_temp_name(b"tail.meta.tmp"));
+        assert!(is_lane_meta_temp_name(b"tail.meta.bak.tmp"));
+        assert!(is_lane_meta_temp_name(b"tail.meta.custom.tmp"));
+        assert!(!is_lane_meta_temp_name(b"tail.meta"));
+        assert!(!is_lane_meta_temp_name(b"tail.meta.bak"));
+        assert!(!is_lane_meta_temp_name(b"events-00000000.log"));
+        assert!(!is_lane_meta_temp_name(b"other.tmp"));
+
+        assert!(is_lane_quarantine_temp_name(
+            CaptureQueueLane::Priority,
+            b"priority-seg0-off128-cafebabe.tmp"
+        ));
+        assert!(is_lane_quarantine_temp_name(
+            CaptureQueueLane::Priority,
+            b"priority-.tmp"
+        ));
+        assert!(!is_lane_quarantine_temp_name(
+            CaptureQueueLane::Priority,
+            b"normal-seg0-off128-deadbeef.tmp"
+        ));
+        assert!(!is_lane_quarantine_temp_name(
+            CaptureQueueLane::Priority,
+            b"priority-seg0-off128-cafebabe.bin"
+        ));
+        assert!(!is_lane_quarantine_temp_name(
+            CaptureQueueLane::Priority,
+            b"priority_underscore.tmp"
+        ));
+        assert!(is_lane_quarantine_temp_name(
+            CaptureQueueLane::Normal,
+            b"normal-seg0-off128-deadbeef.tmp"
+        ));
+        assert!(is_lane_quarantine_temp_name(
+            CaptureQueueLane::Normal,
+            b"normal-.tmp"
+        ));
+        assert!(!is_lane_quarantine_temp_name(
+            CaptureQueueLane::Normal,
+            b"priority-seg0-off128-cafebabe.tmp"
+        ));
+        assert!(!is_lane_quarantine_temp_name(
+            CaptureQueueLane::Normal,
+            b"normal-seg0-off128-deadbeef.bin"
+        ));
+        assert!(!is_lane_quarantine_temp_name(
+            CaptureQueueLane::Normal,
+            b"unrelated-other.tmp"
+        ));
+
+        // Cross-platform UTF-16/WTF-16 matcher verification (including unpaired
+        // surrogates 0xD800 / 0xDC00 that `.to_str()` rejects on Windows).
+        let to_wide_with_surrogate = |prefix: &str, surrogate: u16, suffix: &str| -> Vec<u16> {
+            let mut v: Vec<u16> = prefix.encode_utf16().collect();
+            v.push(surrogate);
+            v.extend(suffix.encode_utf16());
+            v
+        };
+        let wide_p_surr = to_wide_with_surrogate("priority-", 0xD800, ".tmp");
+        let wide_n_surr = to_wide_with_surrogate("normal-", 0xDC00, ".tmp");
+        let wide_p_empty: Vec<u16> = "priority-.tmp".encode_utf16().collect();
+        let wide_n_empty: Vec<u16> = "normal-.tmp".encode_utf16().collect();
+        let wide_p_bin = to_wide_with_surrogate("priority-", 0xD800, ".bin");
+        let wide_meta_surr = to_wide_with_surrogate("tail.meta.", 0xD800, ".tmp");
+        assert!(wide_is_lane_quarantine_temp_name(
+            CaptureQueueLane::Priority,
+            &wide_p_surr
+        ));
+        assert!(!wide_is_lane_quarantine_temp_name(
+            CaptureQueueLane::Normal,
+            &wide_p_surr
+        ));
+        assert!(wide_is_lane_quarantine_temp_name(
+            CaptureQueueLane::Normal,
+            &wide_n_surr
+        ));
+        assert!(!wide_is_lane_quarantine_temp_name(
+            CaptureQueueLane::Priority,
+            &wide_n_surr
+        ));
+        assert!(wide_is_lane_quarantine_temp_name(
+            CaptureQueueLane::Priority,
+            &wide_p_empty
+        ));
+        assert!(wide_is_lane_quarantine_temp_name(
+            CaptureQueueLane::Normal,
+            &wide_n_empty
+        ));
+        assert!(!wide_is_lane_quarantine_temp_name(
+            CaptureQueueLane::Priority,
+            &wide_p_bin
+        ));
+        assert!(wide_is_lane_meta_temp_name(&wide_meta_surr));
+        assert!(!wide_is_lane_meta_temp_name(
+            &"tail.meta".encode_utf16().collect::<Vec<u16>>()
+        ));
+
+        // Independent directory assertions (do NOT call production `is_lane_*`
+        // predicates so filter bugs cannot mask missed files).
+        let matches_independent_glob =
+            |file_name: &std::ffi::OsStr, prefix: &[u8], suffix: &[u8]| -> bool {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::ffi::OsStrExt as _;
+                    let raw = file_name.as_bytes();
+                    raw.len() >= prefix.len() + suffix.len()
+                        && raw.starts_with(prefix)
+                        && raw.ends_with(suffix)
+                }
+                #[cfg(windows)]
+                {
+                    use std::os::windows::ffi::OsStrExt as _;
+                    let units: Vec<u16> = file_name.encode_wide().collect();
+                    units.len() >= prefix.len() + suffix.len()
+                        && prefix
+                            .iter()
+                            .enumerate()
+                            .all(|(i, &b)| units[i] == u16::from(b))
+                        && suffix
+                            .iter()
+                            .enumerate()
+                            .all(|(i, &b)| units[units.len() - suffix.len() + i] == u16::from(b))
+                }
+                #[cfg(not(any(unix, windows)))]
+                {
+                    let s = file_name.to_string_lossy();
+                    let raw = s.as_bytes();
+                    raw.len() >= prefix.len() + suffix.len()
+                        && raw.starts_with(prefix)
+                        && raw.ends_with(suffix)
+                }
+            };
+        let count_lane_meta_tmps_independent = |dir: &Path| -> usize {
+            fs::read_dir(dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| matches_independent_glob(&e.file_name(), b"tail.meta", b".tmp"))
+                .count()
+        };
+        let count_quarantine_lane_tmps_independent =
+            |q_dir: &Path, lane: CaptureQueueLane| -> usize {
+                let prefix = match lane {
+                    CaptureQueueLane::Priority => b"priority-".as_slice(),
+                    CaptureQueueLane::Normal => b"normal-".as_slice(),
+                };
+                fs::read_dir(q_dir)
+                    .unwrap()
+                    .filter_map(|e| e.ok())
+                    .filter(|e| matches_independent_glob(&e.file_name(), prefix, b".tmp"))
+                    .count()
+            };
+
+        // =====================================================================
+        // Direction 1 — AC1, AC2, AC3, AC4:
+        // Healthy `priority/` enqueue/recover while `normal/` is in non-empty
+        // Subcase B2 damaged state.
+        // =====================================================================
+        {
+            let repo = tempdir().expect("tempdir");
+            let init = init_capture_queue(repo.path()).expect("init capture queue");
+            let priority_dir = &init.paths.priority;
+            let normal_dir = &init.paths.normal;
+            let q_dir = &init.paths.quarantine;
+
+            // Populate both lanes with committed frames.
+            let _p1 = append_frame(
+                repo.path(),
+                CaptureQueueLane::Priority,
+                FRAME_FLAG_PRIORITY,
+                "rb08x-d1-p1",
+                b"priority-healthy-1",
+            )
+            .unwrap();
+            let _n1 = append_frame(
+                repo.path(),
+                CaptureQueueLane::Normal,
+                FRAME_FLAG_NONE,
+                "rb08x-d1-n1",
+                b"normal-damaged-1",
+            )
+            .unwrap();
+
+            // Put `normal/` into non-empty Subcase B2 damaged state (both replicas
+            // missing while `normal/events-00000000.log` exists).
+            fs::remove_file(tail_meta_path(normal_dir)).unwrap();
+            fs::remove_file(tail_meta_bak_path(normal_dir)).unwrap();
+
+            // Plant forensic `.tmp` (including zero-char wildcard `normal-.tmp`)
+            // and durable `.bin` artifacts for damaged `normal/`.
+            let normal_meta_tmp = normal_dir.join(QUEUE_TAIL_META_TMP_FILE);
+            let normal_bak_tmp = normal_dir.join(QUEUE_TAIL_META_BAK_TMP_FILE);
+            let normal_q_tmp = q_dir.join("normal-seg0-off128-deadbeef.tmp");
+            let normal_q_zero_tmp = q_dir.join("normal-.tmp");
+            let normal_q_bin = q_dir.join("normal-seg0-off128-deadbeef.bin");
+            let priority_q_bin = q_dir.join("priority-seg0-off064-33333333.bin");
+            let unrelated_q_tmp = q_dir.join("unrelated-other.tmp");
+
+            let normal_meta_tmp_bytes = b"forensic-normal-tail-meta-tmp-payload".to_vec();
+            let normal_bak_tmp_bytes = b"forensic-normal-tail-meta-bak-tmp-payload".to_vec();
+            let normal_q_tmp_bytes = b"forensic-normal-quarantine-deadbeef-bytes".to_vec();
+            let normal_q_zero_tmp_bytes = b"forensic-normal-zero-wildcard-tmp".to_vec();
+            let normal_q_bin_bytes = b"durable-normal-quarantine-bin-bytes".to_vec();
+            let priority_q_bin_bytes = b"durable-priority-quarantine-bin-bytes".to_vec();
+            let unrelated_q_tmp_bytes = b"unrelated-non-lane-tmp-bytes".to_vec();
+
+            write_bytes_0600(&normal_meta_tmp, &normal_meta_tmp_bytes);
+            write_bytes_0600(&normal_bak_tmp, &normal_bak_tmp_bytes);
+            write_bytes_0600(&normal_q_tmp, &normal_q_tmp_bytes);
+            write_bytes_0600(&normal_q_zero_tmp, &normal_q_zero_tmp_bytes);
+            write_bytes_0600(&normal_q_bin, &normal_q_bin_bytes);
+            write_bytes_0600(&priority_q_bin, &priority_q_bin_bytes);
+            write_bytes_0600(&unrelated_q_tmp, &unrelated_q_tmp_bytes);
+
+            // Plant stale `.tmp` files for healthy `priority/` (including
+            // zero-character wildcard `priority-.tmp` matching `priority-*.tmp`).
+            write_bytes_0600(
+                &priority_dir.join(QUEUE_TAIL_META_TMP_FILE),
+                b"stale-priority-meta-tmp",
+            );
+            write_bytes_0600(
+                &priority_dir.join(QUEUE_TAIL_META_BAK_TMP_FILE),
+                b"stale-priority-meta-bak-tmp",
+            );
+            write_bytes_0600(
+                &priority_dir.join("tail.meta.extra.tmp"),
+                b"stale-priority-meta-extra-tmp",
+            );
+            write_bytes_0600(
+                &q_dir.join("priority-seg0-off064-11111111.tmp"),
+                b"stale-priority-q-tmp-1",
+            );
+            write_bytes_0600(
+                &q_dir.join("priority-seg0-off128-22222222.tmp"),
+                b"stale-priority-q-tmp-2",
+            );
+            write_bytes_0600(&q_dir.join("priority-.tmp"), b"stale-priority-q-zero-tmp");
+
+            #[cfg(windows)]
+            let (
+                win_p_surr_path,
+                win_n_surr_path,
+                win_n_surr_bytes,
+                win_p_meta_surr_path,
+                win_n_meta_surr_path,
+                win_n_meta_surr_bytes,
+            ) = {
+                use std::os::windows::ffi::OsStringExt as _;
+                let p_name = std::ffi::OsString::from_wide(&wide_p_surr);
+                let n_name = std::ffi::OsString::from_wide(&wide_n_surr);
+                let meta_name = std::ffi::OsString::from_wide(&wide_meta_surr);
+                let p_path = q_dir.join(&p_name);
+                let n_path = q_dir.join(&n_name);
+                let p_meta_path = priority_dir.join(&meta_name);
+                let n_meta_path = normal_dir.join(&meta_name);
+                let n_bytes = b"forensic-windows-normal-surrogate-tmp".to_vec();
+                let n_meta_bytes = b"forensic-windows-normal-meta-surrogate-tmp".to_vec();
+                write_bytes_0600(&p_path, b"stale-windows-priority-surrogate-tmp");
+                write_bytes_0600(&n_path, &n_bytes);
+                write_bytes_0600(&p_meta_path, b"stale-windows-priority-meta-surrogate-tmp");
+                write_bytes_0600(&n_meta_path, &n_meta_bytes);
+                (
+                    p_path,
+                    n_path,
+                    n_bytes,
+                    p_meta_path,
+                    n_meta_path,
+                    n_meta_bytes,
+                )
+            };
+
+            let normal_tree_before = snapshot_tree(normal_dir);
+
+            // Enqueue onto healthy `priority/`.
+            let _p2 = append_frame(
+                repo.path(),
+                CaptureQueueLane::Priority,
+                FRAME_FLAG_PRIORITY,
+                "rb08x-d1-p2",
+                b"priority-healthy-2",
+            )
+            .expect("healthy priority/ enqueue must succeed despite damaged normal/");
+
+            // AC1: `priority/` has ZERO `tail.meta*.tmp` remaining.
+            assert_eq!(
+                count_lane_meta_tmps_independent(priority_dir),
+                0,
+                "AC1 violated: priority/ still contains tail.meta*.tmp"
+            );
+            // AC2: damaged `normal/tail.meta.tmp` & entire `normal/` directory byte-for-byte intact.
+            assert_eq!(
+                fs::read(&normal_meta_tmp).expect("normal/tail.meta.tmp must survive"),
+                normal_meta_tmp_bytes,
+                "AC2 violated: normal/tail.meta.tmp altered or deleted"
+            );
+            assert_eq!(
+                fs::read(&normal_bak_tmp).expect("normal/tail.meta.bak.tmp must survive"),
+                normal_bak_tmp_bytes
+            );
+            assert_eq!(
+                snapshot_tree(normal_dir),
+                normal_tree_before,
+                "AC2 violated: damaged normal/ tree mutated during priority/ enqueue"
+            );
+            // AC3: `quarantine/` has ZERO `priority-*.tmp` remaining (including `priority-.tmp`).
+            assert!(!q_dir.join("priority-.tmp").exists());
+            assert_eq!(
+                count_quarantine_lane_tmps_independent(q_dir, CaptureQueueLane::Priority),
+                0,
+                "AC3 violated: quarantine/ still contains priority-*.tmp"
+            );
+            // AC4: `quarantine/normal-seg0-off128-deadbeef.tmp` (+ `normal-.tmp` + `.bin` + unrelated) byte-for-byte intact.
+            assert_eq!(
+                fs::read(&normal_q_tmp)
+                    .expect("quarantine/normal-seg0-off128-deadbeef.tmp must survive"),
+                normal_q_tmp_bytes,
+                "AC4 violated: quarantine/normal-seg0-off128-deadbeef.tmp altered or deleted"
+            );
+            assert_eq!(
+                fs::read(&normal_q_zero_tmp).expect("quarantine/normal-.tmp must survive"),
+                normal_q_zero_tmp_bytes
+            );
+            assert_eq!(fs::read(&normal_q_bin).unwrap(), normal_q_bin_bytes);
+            assert_eq!(fs::read(&priority_q_bin).unwrap(), priority_q_bin_bytes);
+            assert_eq!(fs::read(&unrelated_q_tmp).unwrap(), unrelated_q_tmp_bytes);
+            #[cfg(windows)]
+            {
+                assert!(
+                    !win_p_surr_path.exists(),
+                    "Windows unpaired-surrogate priority-*.tmp must be removed"
+                );
+                assert!(
+                    !win_p_meta_surr_path.exists(),
+                    "Windows unpaired-surrogate priority/tail.meta*.tmp must be removed"
+                );
+                assert_eq!(
+                    fs::read(&win_n_surr_path).expect("sibling surrogate tmp must survive"),
+                    win_n_surr_bytes
+                );
+                assert_eq!(
+                    fs::read(&win_n_meta_surr_path)
+                        .expect("sibling surrogate lane meta tmp must survive"),
+                    win_n_meta_surr_bytes
+                );
+            }
+
+            // Also verify `recover_lane(Priority)` cleans freshly planted priority `.tmp`
+            // (including `priority-.tmp`) and reports exact counts while preserving damaged `normal/`.
+            write_bytes_0600(
+                &priority_dir.join(QUEUE_TAIL_META_TMP_FILE),
+                b"stale-priority-rec-1",
+            );
+            write_bytes_0600(
+                &priority_dir.join(QUEUE_TAIL_META_BAK_TMP_FILE),
+                b"stale-priority-rec-2",
+            );
+            write_bytes_0600(
+                &q_dir.join("priority-seg0-off256-44444444.tmp"),
+                b"stale-priority-rec-q",
+            );
+            write_bytes_0600(&q_dir.join("priority-.tmp"), b"stale-priority-rec-zero");
+            let rec = recover_lane(repo.path(), CaptureQueueLane::Priority)
+                .expect("recover_lane on healthy priority/ must succeed");
+            assert_eq!(rec.cleaned_tmp_files, 2);
+            assert_eq!(rec.cleaned_quarantine_tmp_files, 2);
+            assert_eq!(count_lane_meta_tmps_independent(priority_dir), 0);
+            assert_eq!(
+                count_quarantine_lane_tmps_independent(q_dir, CaptureQueueLane::Priority),
+                0
+            );
+            assert_eq!(snapshot_tree(normal_dir), normal_tree_before);
+            assert_eq!(fs::read(&normal_q_tmp).unwrap(), normal_q_tmp_bytes);
+            assert_eq!(
+                fs::read(&normal_q_zero_tmp).unwrap(),
+                normal_q_zero_tmp_bytes
+            );
+
+            // Damaged `normal/` still fails closed with zero mutation across normal/ and quarantine/.
+            let q_before_damaged = snapshot_tree(q_dir);
+            let err = append_frame(
+                repo.path(),
+                CaptureQueueLane::Normal,
+                FRAME_FLAG_NONE,
+                "rb08x-d1-n-reject",
+                b"must-reject",
+            )
+            .expect_err("damaged normal/ must still fail closed");
+            assert!(matches!(
+                err,
+                StorageBackendError::CorruptCommittedFrame { .. }
+            ));
+            assert_eq!(err.stable_code_str(), "LBR-IO-001");
+            assert_eq!(snapshot_tree(normal_dir), normal_tree_before);
+            assert_eq!(snapshot_tree(q_dir), q_before_damaged);
+        }
+
+        // =====================================================================
+        // Direction 2 — AC5, AC6, AC7, AC8:
+        // Symmetric reverse: healthy `normal/` enqueue/recover while `priority/`
+        // is in non-empty Subcase B2 damaged state.
+        // =====================================================================
+        {
+            let repo = tempdir().expect("tempdir");
+            let init = init_capture_queue(repo.path()).expect("init capture queue");
+            let priority_dir = &init.paths.priority;
+            let normal_dir = &init.paths.normal;
+            let q_dir = &init.paths.quarantine;
+
+            // Populate both lanes with committed frames.
+            let _p1 = append_frame(
+                repo.path(),
+                CaptureQueueLane::Priority,
+                FRAME_FLAG_PRIORITY,
+                "rb08x-d2-p1",
+                b"priority-damaged-1",
+            )
+            .unwrap();
+            let _n1 = append_frame(
+                repo.path(),
+                CaptureQueueLane::Normal,
+                FRAME_FLAG_NONE,
+                "rb08x-d2-n1",
+                b"normal-healthy-1",
+            )
+            .unwrap();
+
+            // Put `priority/` into non-empty Subcase B2 damaged state (both replicas
+            // corrupt while `priority/events-00000000.log` exists).
+            write_bytes_0600(&tail_meta_path(priority_dir), b"corrupt-priority-meta");
+            write_bytes_0600(&tail_meta_bak_path(priority_dir), b"corrupt-priority-bak");
+
+            // Plant forensic `.tmp` (including `priority-.tmp`) and durable `.bin`
+            // artifacts for damaged `priority/`.
+            let priority_meta_tmp = priority_dir.join(QUEUE_TAIL_META_TMP_FILE);
+            let priority_bak_tmp = priority_dir.join(QUEUE_TAIL_META_BAK_TMP_FILE);
+            let priority_q_tmp = q_dir.join("priority-seg0-off128-cafebabe.tmp");
+            let priority_q_zero_tmp = q_dir.join("priority-.tmp");
+            let priority_q_bin = q_dir.join("priority-seg0-off128-cafebabe.bin");
+            let normal_q_bin = q_dir.join("normal-seg0-off064-cccccccc.bin");
+            let unrelated_q_tmp = q_dir.join("unrelated-other.tmp");
+
+            let priority_meta_tmp_bytes = b"forensic-priority-tail-meta-tmp-payload".to_vec();
+            let priority_bak_tmp_bytes = b"forensic-priority-tail-meta-bak-tmp-payload".to_vec();
+            let priority_q_tmp_bytes = b"forensic-priority-quarantine-cafebabe-bytes".to_vec();
+            let priority_q_zero_tmp_bytes = b"forensic-priority-zero-wildcard-tmp".to_vec();
+            let priority_q_bin_bytes = b"durable-priority-quarantine-bin-bytes".to_vec();
+            let normal_q_bin_bytes = b"durable-normal-quarantine-bin-bytes".to_vec();
+            let unrelated_q_tmp_bytes = b"unrelated-non-lane-tmp-bytes".to_vec();
+
+            write_bytes_0600(&priority_meta_tmp, &priority_meta_tmp_bytes);
+            write_bytes_0600(&priority_bak_tmp, &priority_bak_tmp_bytes);
+            write_bytes_0600(&priority_q_tmp, &priority_q_tmp_bytes);
+            write_bytes_0600(&priority_q_zero_tmp, &priority_q_zero_tmp_bytes);
+            write_bytes_0600(&priority_q_bin, &priority_q_bin_bytes);
+            write_bytes_0600(&normal_q_bin, &normal_q_bin_bytes);
+            write_bytes_0600(&unrelated_q_tmp, &unrelated_q_tmp_bytes);
+
+            // Plant stale `.tmp` files for healthy `normal/` (including
+            // zero-character wildcard `normal-.tmp` matching `normal-*.tmp`).
+            write_bytes_0600(
+                &normal_dir.join(QUEUE_TAIL_META_TMP_FILE),
+                b"stale-normal-meta-tmp",
+            );
+            write_bytes_0600(
+                &normal_dir.join(QUEUE_TAIL_META_BAK_TMP_FILE),
+                b"stale-normal-meta-bak-tmp",
+            );
+            write_bytes_0600(
+                &normal_dir.join("tail.meta.extra.tmp"),
+                b"stale-normal-meta-extra-tmp",
+            );
+            write_bytes_0600(
+                &q_dir.join("normal-seg0-off064-aaaaaaaa.tmp"),
+                b"stale-normal-q-tmp-1",
+            );
+            write_bytes_0600(
+                &q_dir.join("normal-seg0-off128-bbbbbbbb.tmp"),
+                b"stale-normal-q-tmp-2",
+            );
+            write_bytes_0600(&q_dir.join("normal-.tmp"), b"stale-normal-q-zero-tmp");
+
+            #[cfg(windows)]
+            let (
+                win_n_surr_path,
+                win_p_surr_path,
+                win_p_surr_bytes,
+                win_n_meta_surr_path,
+                win_p_meta_surr_path,
+                win_p_meta_surr_bytes,
+            ) = {
+                use std::os::windows::ffi::OsStringExt as _;
+                let n_name = std::ffi::OsString::from_wide(&wide_n_surr);
+                let p_name = std::ffi::OsString::from_wide(&wide_p_surr);
+                let meta_name = std::ffi::OsString::from_wide(&wide_meta_surr);
+                let n_path = q_dir.join(&n_name);
+                let p_path = q_dir.join(&p_name);
+                let n_meta_path = normal_dir.join(&meta_name);
+                let p_meta_path = priority_dir.join(&meta_name);
+                let p_bytes = b"forensic-windows-priority-surrogate-tmp".to_vec();
+                let p_meta_bytes = b"forensic-windows-priority-meta-surrogate-tmp".to_vec();
+                write_bytes_0600(&n_path, b"stale-windows-normal-surrogate-tmp");
+                write_bytes_0600(&p_path, &p_bytes);
+                write_bytes_0600(&n_meta_path, b"stale-windows-normal-meta-surrogate-tmp");
+                write_bytes_0600(&p_meta_path, &p_meta_bytes);
+                (
+                    n_path,
+                    p_path,
+                    p_bytes,
+                    n_meta_path,
+                    p_meta_path,
+                    p_meta_bytes,
+                )
+            };
+
+            let priority_tree_before = snapshot_tree(priority_dir);
+
+            // Enqueue onto healthy `normal/`.
+            let _n2 = append_frame(
+                repo.path(),
+                CaptureQueueLane::Normal,
+                FRAME_FLAG_NONE,
+                "rb08x-d2-n2",
+                b"normal-healthy-2",
+            )
+            .expect("healthy normal/ enqueue must succeed despite damaged priority/");
+
+            // AC5: `normal/` has ZERO `tail.meta*.tmp` remaining.
+            assert_eq!(
+                count_lane_meta_tmps_independent(normal_dir),
+                0,
+                "AC5 violated: normal/ still contains tail.meta*.tmp"
+            );
+            // AC6: damaged `priority/tail.meta.tmp` & entire `priority/` directory byte-for-byte intact.
+            assert_eq!(
+                fs::read(&priority_meta_tmp).expect("priority/tail.meta.tmp must survive"),
+                priority_meta_tmp_bytes,
+                "AC6 violated: priority/tail.meta.tmp altered or deleted"
+            );
+            assert_eq!(
+                fs::read(&priority_bak_tmp).expect("priority/tail.meta.bak.tmp must survive"),
+                priority_bak_tmp_bytes
+            );
+            assert_eq!(
+                snapshot_tree(priority_dir),
+                priority_tree_before,
+                "AC6 violated: damaged priority/ tree mutated during normal/ enqueue"
+            );
+            // AC7: `quarantine/` has ZERO `normal-*.tmp` remaining (including `normal-.tmp`).
+            assert!(!q_dir.join("normal-.tmp").exists());
+            assert_eq!(
+                count_quarantine_lane_tmps_independent(q_dir, CaptureQueueLane::Normal),
+                0,
+                "AC7 violated: quarantine/ still contains normal-*.tmp"
+            );
+            // AC8: `quarantine/priority-seg0-off128-cafebabe.tmp` (+ `priority-.tmp` + `.bin` + unrelated) byte-for-byte intact.
+            assert_eq!(
+                fs::read(&priority_q_tmp)
+                    .expect("quarantine/priority-seg0-off128-cafebabe.tmp must survive"),
+                priority_q_tmp_bytes,
+                "AC8 violated: quarantine/priority-seg0-off128-cafebabe.tmp altered or deleted"
+            );
+            assert_eq!(
+                fs::read(&priority_q_zero_tmp).expect("quarantine/priority-.tmp must survive"),
+                priority_q_zero_tmp_bytes
+            );
+            assert_eq!(fs::read(&priority_q_bin).unwrap(), priority_q_bin_bytes);
+            assert_eq!(fs::read(&normal_q_bin).unwrap(), normal_q_bin_bytes);
+            assert_eq!(fs::read(&unrelated_q_tmp).unwrap(), unrelated_q_tmp_bytes);
+            #[cfg(windows)]
+            {
+                assert!(
+                    !win_n_surr_path.exists(),
+                    "Windows unpaired-surrogate normal-*.tmp must be removed"
+                );
+                assert!(
+                    !win_n_meta_surr_path.exists(),
+                    "Windows unpaired-surrogate normal/tail.meta*.tmp must be removed"
+                );
+                assert_eq!(
+                    fs::read(&win_p_surr_path).expect("sibling surrogate tmp must survive"),
+                    win_p_surr_bytes
+                );
+                assert_eq!(
+                    fs::read(&win_p_meta_surr_path)
+                        .expect("sibling surrogate lane meta tmp must survive"),
+                    win_p_meta_surr_bytes
+                );
+            }
+
+            // Also verify `recover_lane(Normal)` cleans freshly planted normal `.tmp`
+            // (including `normal-.tmp`) and reports exact counts while preserving damaged `priority/`.
+            write_bytes_0600(
+                &normal_dir.join(QUEUE_TAIL_META_TMP_FILE),
+                b"stale-normal-rec-1",
+            );
+            write_bytes_0600(
+                &normal_dir.join(QUEUE_TAIL_META_BAK_TMP_FILE),
+                b"stale-normal-rec-2",
+            );
+            write_bytes_0600(
+                &q_dir.join("normal-seg0-off256-dddddddd.tmp"),
+                b"stale-normal-rec-q",
+            );
+            write_bytes_0600(&q_dir.join("normal-.tmp"), b"stale-normal-rec-zero");
+            let rec = recover_lane(repo.path(), CaptureQueueLane::Normal)
+                .expect("recover_lane on healthy normal/ must succeed");
+            assert_eq!(rec.cleaned_tmp_files, 2);
+            assert_eq!(rec.cleaned_quarantine_tmp_files, 2);
+            assert_eq!(count_lane_meta_tmps_independent(normal_dir), 0);
+            assert_eq!(
+                count_quarantine_lane_tmps_independent(q_dir, CaptureQueueLane::Normal),
+                0
+            );
+            assert_eq!(snapshot_tree(priority_dir), priority_tree_before);
+            assert_eq!(fs::read(&priority_q_tmp).unwrap(), priority_q_tmp_bytes);
+            assert_eq!(
+                fs::read(&priority_q_zero_tmp).unwrap(),
+                priority_q_zero_tmp_bytes
+            );
+
+            // Damaged `priority/` still fails closed with zero mutation across priority/ and quarantine/.
+            let q_before_damaged = snapshot_tree(q_dir);
+            let err = append_frame(
+                repo.path(),
+                CaptureQueueLane::Priority,
+                FRAME_FLAG_PRIORITY,
+                "rb08x-d2-p-reject",
+                b"must-reject",
+            )
+            .expect_err("damaged priority/ must still fail closed");
+            assert!(matches!(
+                err,
+                StorageBackendError::CorruptCommittedFrame { .. }
+            ));
+            assert_eq!(err.stable_code_str(), "LBR-IO-001");
+            assert_eq!(snapshot_tree(priority_dir), priority_tree_before);
+            assert_eq!(snapshot_tree(q_dir), q_before_damaged);
         }
     }
 }

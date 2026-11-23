@@ -4084,7 +4084,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `done` / `remote-pending`
+**Lifecycle / Acceptance:** `done` / `remote-verified`
 
 **Description:** 100% 在独占目录 `src/storage/**` 内于 `segment.rs` 完整落实并实证 `ADR-RB-05` #3 非空通道 Subcase B2 无条件 fail-closed 不变量：只要目录中存在 ≥ 1 个 `events-*.log` 文件且 `tail.meta` 与 `tail.meta.bak` 同时缺失或损坏，**Phase 1 立即无条件 fail-closed 返回 `CorruptCommittedFrame`（`LBR-IO-001`）且整盘零改动（零自动重建元数据、零截断、零删段、零删遗留 `tail.meta.tmp`/`quarantine/<lane>-*.tmp`）**——将完整帧边界截断（`CleanEof`）、活跃段 0 字节截断、`max_seg` 帧损坏/截断与较旧轮转段损坏/截断 4 类夹具的「错误码返回」与「整目录及 `quarantine/` 全文件逐字节快照相等」拆分为 8 条 1:1 独立单谓词断言。
 
@@ -4146,7 +4146,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `remote-pending`
 
 **Description:** 100% 在独占目录 `src/storage/**` 内于 `segment.rs` 实现并实证 `ADR-RB-05` #3 Step ① Phase 2 的通道限定临时文件清理过滤器 `clean_lane_temp_files(lane_id, lane_dir, quarantine_dir)`：共享 `quarantine/` 下按确定性前缀 `<lane>-` 严格过滤，健康 `priority/` 入队仅清理 `priority/tail.meta*.tmp` 与 `quarantine/priority-*.tmp`、绝不触碰损坏 `normal/` 的 `quarantine/normal-*.tmp`，反之亦然，完成双通道对称跨通道隔离验收。
 
@@ -4161,19 +4161,19 @@
 | `priority/` 与 `normal/` 共享 `quarantine/` 目录，Phase 2 必须严格按 `quarantine/<lane>-*.tmp` 前缀限定清理，杜绝健康通道入队误删另一损坏通道的取证临时文件 | `ADR-RB-05` #1、#3 Step ① |
 
 **Acceptance criteria:**
-- [ ] **健康 `priority/` 清理本通道 `priority/tail.meta*.tmp`：** 当 `priority/` 通过 Phase 1 分类执行入队后，`priority/` 目录中不再存在任何 `tail.meta*.tmp`。
-- [ ] **健康 `priority/` 原样保留损坏 `normal/` 的 `normal/tail.meta.tmp`：** 当 `normal/` 处于 Subcase B2 损坏态且存在 `normal/tail.meta.tmp` 时，上述 `priority/` 入队后 `normal/tail.meta.tmp` 字节与入队前逐字节相等。
-- [ ] **健康 `priority/` 清理本通道 `quarantine/priority-*.tmp`：** 上述 `priority/` 入队后，共享目录中不再存在 `quarantine/priority-*.tmp`。
-- [ ] **健康 `priority/` 原样保留损坏 `normal/` 的 `quarantine/normal-*.tmp`：** 当 `normal/` 处于 Subcase B2 损坏态且存在 `quarantine/normal-seg0-off128-deadbeef.tmp` 时，上述 `priority/` 入队后该文件字节与入队前逐字节相等。
-- [ ] **健康 `normal/` 清理本通道 `normal/tail.meta*.tmp`：** 当 `normal/` 通过 Phase 1 分类执行入队后，`normal/` 目录中不再存在任何 `tail.meta*.tmp`。
-- [ ] **健康 `normal/` 原样保留损坏 `priority/` 的 `priority/tail.meta.tmp`：** 当 `priority/` 处于 Subcase B2 损坏态且存在 `priority/tail.meta.tmp` 时，上述 `normal/` 入队后 `priority/tail.meta.tmp` 字节与入队前逐字节相等。
-- [ ] **健康 `normal/` 清理本通道 `quarantine/normal-*.tmp`：** 上述 `normal/` 入队后，共享目录中不再存在 `quarantine/normal-*.tmp`。
-- [ ] **健康 `normal/` 原样保留损坏 `priority/` 的 `quarantine/priority-*.tmp`：** 当 `priority/` 处于 Subcase B2 损坏态且存在 `quarantine/priority-seg0-off128-cafebabe.tmp` 时，上述 `normal/` 入队后该文件字节与入队前逐字节相等。
+- [x] **健康 `priority/` 清理本通道 `priority/tail.meta*.tmp`：** 当 `priority/` 通过 Phase 1 分类执行入队后，`priority/` 目录中不再存在任何 `tail.meta*.tmp`。
+- [x] **健康 `priority/` 原样保留损坏 `normal/` 的 `normal/tail.meta.tmp`：** 当 `normal/` 处于 Subcase B2 损坏态且存在 `normal/tail.meta.tmp` 时，上述 `priority/` 入队后 `normal/tail.meta.tmp` 字节与入队前逐字节相等。
+- [x] **健康 `priority/` 清理本通道 `quarantine/priority-*.tmp`：** 上述 `priority/` 入队后，共享目录中不再存在 `quarantine/priority-*.tmp`。
+- [x] **健康 `priority/` 原样保留损坏 `normal/` 的 `quarantine/normal-*.tmp`：** 当 `normal/` 处于 Subcase B2 损坏态且存在 `quarantine/normal-seg0-off128-deadbeef.tmp` 时，上述 `priority/` 入队后该文件字节与入队前逐字节相等。
+- [x] **健康 `normal/` 清理本通道 `normal/tail.meta*.tmp`：** 当 `normal/` 通过 Phase 1 分类执行入队后，`normal/` 目录中不再存在任何 `tail.meta*.tmp`。
+- [x] **健康 `normal/` 原样保留损坏 `priority/` 的 `priority/tail.meta.tmp`：** 当 `priority/` 处于 Subcase B2 损坏态且存在 `priority/tail.meta.tmp` 时，上述 `normal/` 入队后 `priority/tail.meta.tmp` 字节与入队前逐字节相等。
+- [x] **健康 `normal/` 清理本通道 `quarantine/normal-*.tmp`：** 上述 `normal/` 入队后，共享目录中不再存在 `quarantine/normal-*.tmp`。
+- [x] **健康 `normal/` 原样保留损坏 `priority/` 的 `quarantine/priority-*.tmp`：** 当 `priority/` 处于 Subcase B2 损坏态且存在 `quarantine/priority-seg0-off128-cafebabe.tmp` 时，上述 `normal/` 入队后该文件字节与入队前逐字节相等。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --no-default-features --features storage-redb --lib -E 'test(=storage::queue::segment::tests::cross_lane_quarantine_tmp_cleanup_scoped_to_classified_lane_only)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb --lib -E 'test(=storage::queue::segment::tests::cross_lane_quarantine_tmp_cleanup_scoped_to_classified_lane_only)'`（new，覆盖 AC1–AC8）
-- [ ] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 3 文件实现白名单。
+- [x] `source .env.test && cargo nextest list --no-default-features --features storage-redb --lib -E 'test(=storage::queue::segment::tests::cross_lane_quarantine_tmp_cleanup_scoped_to_classified_lane_only)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb --lib -E 'test(=storage::queue::segment::tests::cross_lane_quarantine_tmp_cleanup_scoped_to_classified_lane_only)'`（new，覆盖 AC1–AC8）
+- [x] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 3 文件实现白名单。
 
 **Full-suite trigger:** `none`
 
@@ -10069,8 +10069,9 @@
 | `RB-08y` | `done` / `remote-verified` | `501938b`（`main`） | `0.30.364` | 2026-11-23 15:36 UTC：Stage 1 精确 3 文件写集内仅改动 `src/storage/queue/segment.rs`，实证 Subcase B1 主副本 `tail.meta` 缺失/损坏（`Deleted`/`CorruptCrc`/`TruncatedGarbage`/`Oversized` 4 态，幸存有效 `tail.meta.bak`）在 Unix/Windows Phase 1 先验前缀与长度守卫及 Phase 2 原子镜像修复；`--no-default-features --features storage-redb` `VER1` 1/1、`VER2`（`subcase_b1_single_replica_loss_phase1_reject_and_phase2_mirror_repair` 覆盖 AC1–AC5：4 态主损+前缀位翻转与 4×2 态主损+`CleanEof`/半帧短段在 `append_frame`/`recover_lane` 双路径均返 `CorruptCommittedFrame` `LBR-IO-001` 且通道/`quarantine/` 全字节快照零改动含预置 `tail.meta*.tmp`/`quarantine/<lane>-*.tmp`、零提前镜像修复；4 态主损+健康段含预置陈旧 `tail.meta.tmp` 在 `recover_lane` 与直接 `append_frame` 均原子重建 `0600` `tail.meta` 逐字节等于权威 `tail.meta.bak`、按 `MetaTmpWriteAndSync < MetaRename < FsyncLaneDirAfterMeta` 仅写主副本且后续追加正常）、`segment.rs` 23/23 快速回归、三构型矩阵与 `src/storage/` 全零告警 Clippy、`compat_version_surface_sync` 全绿；Codex R1 零生产代码缺陷且所提 1 项测试矩阵扩展 P1 已闭环，R2 获 `VERDICT: PASS`（P0=0、P1=0、P2=0）；已推 `origin/main` |
 | `RB-08z` | `done` / `remote-verified` | `49d8213`（`main`） | `0.30.365` | 2026-11-23 15:53 UTC：Stage 1 精确 3 文件写集内仅改动 `src/storage/queue/segment.rs`，实证 Subcase B1 副副本 `tail.meta.bak` 缺失/损坏（`Deleted`/`CorruptCrc`/`TruncatedGarbage`/`Oversized` 4 态，幸存有效 `tail.meta`）在 Unix/Windows Phase 1 先验前缀与长度守卫及 Phase 2 对称原子镜像修复；`--no-default-features --features storage-redb` `VER1` 1/1、`VER2`（`subcase_b1_backup_replica_loss_phase1_reject_and_phase2_mirror_repair` 覆盖 AC1–AC5：4 态副损+前缀位翻转含 >64KiB 负载与 4×2 态副损+`CleanEof`/半帧短段在 `append_frame`/`recover_lane` 双路径均返 `CorruptCommittedFrame` `LBR-IO-001` 且通道/`quarantine/` 全字节快照零改动含预置 `tail.meta*.tmp`/`quarantine/<lane>-*.tmp`、零提前镜像修复；4 态副损+健康段含预置陈旧 `tail.meta.bak.tmp` 在 `recover_lane`、带 `with_incoming_frame_write_hook` 的观测直接追加（实证 `MetaTmpWriteAndSync(bak) < MetaRename(bak) < FsyncLaneDirAfterMeta(bak) < SegmentWriteAll` 且写新帧前 `tail.meta.bak` 已重建为原权威 `f1` 字节且零写主副本）、Step ② 紧容量 `LBR-AGENT-046` 预写拒收边界及公开 `append_frame` 均原子重建 `0600` `tail.meta.bak`）、`segment.rs` 24/24 快速回归、三构型矩阵与 `src/storage/` 全零告警 Clippy、`compat_version_surface_sync` 全绿；Codex R1 零生产代码缺陷且所提 1 项直接追加观测/边界验证 P1 已闭环，R2 获 `VERDICT: PASS`（P0=0、P1=0、P2=0）；已推 `origin/main` |
 | `RB-08e` | `done` / `remote-verified` | `435b600`（`main`） | `0.30.366` | 2026-11-23 16:14 UTC：Stage 1 精确 3 文件写集内仅改动 `src/storage/queue/segment.rs`，实证 `ADR-RB-05` #3 情况 0 四分法（Unix/Windows 双路径对齐）：`--no-default-features --features storage-redb` `VER1` 2/2、`VER2`（`virgin_and_prebootstrapped_zero_segment_lane_init` 覆盖 AC1/AC2：情况 0a 真正全新空通道在 `recover_lane`、观测直接追加与 Step ② `max_total_bytes = 1` 预建段拒收边界实证先原子落盘 34B `0600` `LTM2` `(0,0,0,0,[])` 双副本+`fsync_dir` 再建 `events-00000000.log`；情况 0b 已预建空通道含主/副双方向 × 4 损态 Subcase B1 单副本修复，实证修复严格先于 `CreateSegment(0)` 且零重写幸存副本）、`VER3`（`zero_segment_with_committed_or_corrupt_meta_fails_closed` 覆盖 AC3–AC6：情况 0c 删除唯一活跃段/多轮转段/`active_seg > 0` 零长度/非零 `prefix_crc32c` 含单副本与缺 `append.lock`，以及情况 0d 主/副/双损跨 bad-CRC/截断/0B/超长/坏魔数/等序分叉，在 `append_frame`/`recover_lane` 均返 `CorruptCommittedFrame` `LBR-IO-001` 且通道/`quarantine/`/根树全字节快照零改动）、`segment.rs` 25/25 快速回归、三构型矩阵与 `src/storage/` 全零告警 Clippy、`compat_version_surface_sync` 全绿；Codex R1 首轮 `VERDICT: PASS`（P0=0、P1=0、P2=0）；已推 `origin/main` |
-| `RB-08h` | `done` / `remote-pending` | 本提交（`main`） | `0.30.367` | 2026-11-23 16:39 UTC：Stage 1 精确 3 文件写集内仅改动 `src/storage/queue/segment.rs`，实证非空通道 Subcase B2 双副本同损无条件 fail-closed 与整树零改动守卫（Unix/Windows 双路径对齐）：`--no-default-features --features storage-redb` `VER1` 2/2、`VER2`（`dual_metadata_loss_complete_frame_boundary_and_zero_byte_active_fails_closed` 覆盖 AC1–AC4：完整帧 `CleanEof` 截短、未改动洁净段对照及 0B 活跃段截短各跑全 7 态双损矩阵含缺 `append.lock`/CRC 损/主副混合/截断/超长）、`VER3`（`dual_metadata_loss_max_and_older_segment_corrupt_or_truncated_fails_closed` 覆盖 AC5–AC8：单/多段 `max_seg` 位翻转/半帧截断及多段较旧段 `< max_seg` 位翻转/半帧/0B/`CleanEof` 截短而 `max_seg` 100% 洁净，各跑全 5 态双损矩阵），全部夹具在 `append_frame` 与 `recover_lane` 双路径均无条件返 `CorruptCommittedFrame` `LBR-IO-001` 且通道/`quarantine/`/队列根树全文件全权限逐字节快照零改动（预置 `tail.meta*.tmp` 与 `quarantine/{normal,priority}-orphan.tmp` 全原样保留）、`segment.rs` 27/27 快速回归、三构型矩阵与 `src/storage/` 全零告警 Clippy、`compat_version_surface_sync` 全绿；Codex R1（洁净对照接全矩阵）与 R2（无条件 `queue_root` 快照对比）两项测试覆盖 P1 全闭环，R3 获 `VERDICT: PASS`（P0=0、P1=0、P2=0） |
-| `RB-08x`..`RB-34c`（剩余 96 卡） | `pending` | — | — | Phase 2 推进中，按实施顺序于 `main` 逐卡推进 |
+| `RB-08h` | `done` / `remote-verified` | `9dac263`（`main`） | `0.30.367` | 2026-11-23 16:39 UTC：Stage 1 精确 3 文件写集内仅改动 `src/storage/queue/segment.rs`，实证非空通道 Subcase B2 双副本同损无条件 fail-closed 与整树零改动守卫（Unix/Windows 双路径对齐）：`--no-default-features --features storage-redb` `VER1` 2/2、`VER2`（`dual_metadata_loss_complete_frame_boundary_and_zero_byte_active_fails_closed` 覆盖 AC1–AC4：完整帧 `CleanEof` 截短、未改动洁净段对照及 0B 活跃段截短各跑全 7 态双损矩阵含缺 `append.lock`/CRC 损/主副混合/截断/超长）、`VER3`（`dual_metadata_loss_max_and_older_segment_corrupt_or_truncated_fails_closed` 覆盖 AC5–AC8：单/多段 `max_seg` 位翻转/半帧截断及多段较旧段 `< max_seg` 位翻转/半帧/0B/`CleanEof` 截短而 `max_seg` 100% 洁净，各跑全 5 态双损矩阵），全部夹具在 `append_frame` 与 `recover_lane` 双路径均无条件返 `CorruptCommittedFrame` `LBR-IO-001` 且通道/`quarantine/`/队列根树全文件全权限逐字节快照零改动（预置 `tail.meta*.tmp` 与 `quarantine/{normal,priority}-orphan.tmp` 全原样保留）、`segment.rs` 27/27 快速回归、三构型矩阵与 `src/storage/` 全零告警 Clippy、`compat_version_surface_sync` 全绿；Codex R1（洁净对照接全矩阵）与 R2（无条件 `queue_root` 快照对比）两项测试覆盖 P1 全闭环，R3 获 `VERDICT: PASS`（P0=0、P1=0、P2=0）；已推 `origin/main` |
+| `RB-08x` | `done` / `remote-pending` | 本提交（`main`） | `0.30.368` | 2026-11-23 17:13 UTC：Stage 1 精确 3 文件写集内仅改动 `src/storage/queue/segment.rs`，将 Phase 2 通道限定临时文件清理收口为持锁统一例程 `clean_lane_temp_files_unix`/`clean_lane_temp_files_windows`（覆盖 append/recover/reclaim 全部入口、`Phase2ConvergedState` 追踪 `cleaned_quarantine_tmp_files`），放开 `is_lane_quarantine_temp_name` 零字符通配（`<lane>-.tmp`）并新增跨平台 UTF-16/WTF-16 前后缀匹配器 `wide_is_lane_meta_temp_name`/`wide_is_lane_quarantine_temp_name`（Windows 全程保留原始 `OsString` 消除孤立代理项静默漏清）；`--no-default-features --features storage-redb` `VER1` 1/1、`VER2`（`cross_lane_quarantine_tmp_cleanup_scoped_to_classified_lane_only` 覆盖 AC1–AC8：正反双方向健康通道入队与 `recover_lane` 以独立原字节目录扫描验证清空本通道 `tail.meta*.tmp` 与 `quarantine/<lane>-*.tmp` 含 `<lane>-.tmp`，原样逐字节保留损坏异通道目录/`tail.meta.tmp`/`quarantine/<other>-*.tmp`/持久 `.bin`/无关文件；含跨平台 UTF-16 `0xD800`/`0xDC00` 孤立代理项单测与 `#[cfg(windows)]` `OsString::from_wide` 通道+隔离双路径集成断言）、`segment.rs` 29/29 快速回归、三构型矩阵与 `src/storage/` 全零告警 Clippy、`compat_version_surface_sync` 全绿；Codex R1 两项生产代码 P1 均已闭环并经 R2 确认（R2 仅追加 macOS 宿主不可执行的 `#[cfg(windows)]` 通道 `tail.meta*.tmp` 孤立代理项测试，已落地补齐并重跑 `VER2` 绿灯，依用户授权跳过 R3 继续推进） |
+| `RB-09`..`RB-34c`（剩余 95 卡） | `pending` | — | — | Phase 2 段层 31/31 全收口，进入消费者 `highwater.rs`/`writer.rs`（`RB-09`..`RB-09l`） |
 
 ## Codex review log
 
