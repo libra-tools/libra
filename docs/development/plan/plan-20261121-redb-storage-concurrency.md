@@ -2411,7 +2411,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `done` / `remote-pending`
+**Lifecycle / Acceptance:** `done` / `remote-verified`
 
 **Description:** 100% 在独占目录 `src/storage/**` 内于 `src/storage/queue/frame.rs` 落实帧编码前后上下界守卫：`4 MiB` 单负载上限、`512 B` 去重键上限、`MAX_FRAME_BODY_LEN == 3 + 512 + 4 MiB` 常量不变量以及 `FRAME_BODY_LEN < 3` 非法体长下界拒收。
 
@@ -2467,7 +2467,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `remote-pending`
 
 **Description:** 100% 在独占目录 `src/storage/**` 内实现 `src/storage/queue/frame.rs` 顺序流解码器的固定 16 字节帧头分配前守卫：在任何体内存分配或恢复截断之前先校验 `MAGIC`、`HEADER_CRC32C` 与 `3 <= FRAME_BODY_LEN <= MAX_FRAME_BODY_LEN`，逐字段实测 `MAGIC`、`FRAME_BODY_LEN`（正常界内翻转与超大值翻转分别检验）与 `HEADER_CRC32C` 单字节篡改的分配前 `CorruptHeader` 拒收。
 
@@ -2482,15 +2482,15 @@
 | 若 `MAGIC`/`FRAME_BODY_LEN` 未受 CRC32C 保护或未在分配前核验界限，单字节篡改帧长可能被误判为段尾半帧截断或引起超大堆分配 | `ADR-RB-05` #2 |
 
 **Acceptance criteria:**
-- [ ] 已确认帧中 `MAGIC` 任一单字节翻转在分配体缓冲前即被 `HEADER_CRC32C` 拒绝并返回 `FrameDecodeError::CorruptHeader`。
-- [ ] 已确认帧中 `FRAME_BODY_LEN` 单字节翻转（仍在文件剩余长度内）在分配体缓冲前即被 `HEADER_CRC32C` 拒绝并返回 `FrameDecodeError::CorruptHeader`。
-- [ ] 已确认帧中 `FRAME_BODY_LEN` 单字节翻转至超大值（超过剩余文件长度或超过 `MAX_FRAME_BODY_LEN`）在分配体缓冲前即被 `HEADER_CRC32C` 拒绝并返回 `FrameDecodeError::CorruptHeader`（绝不误判为 `TruncatedTail`、零超大分配）。
-- [ ] 已确认帧中 `HEADER_CRC32C` 任一单字节翻转在分配体缓冲前即被拒绝并返回 `FrameDecodeError::CorruptHeader`。
+- [x] 已确认帧中 `MAGIC` 任一单字节翻转在分配体缓冲前即被 `HEADER_CRC32C` 拒绝并返回 `FrameDecodeError::CorruptHeader`。
+- [x] 已确认帧中 `FRAME_BODY_LEN` 单字节翻转（仍在文件剩余长度内）在分配体缓冲前即被 `HEADER_CRC32C` 拒绝并返回 `FrameDecodeError::CorruptHeader`。
+- [x] 已确认帧中 `FRAME_BODY_LEN` 单字节翻转至超大值（超过剩余文件长度或超过 `MAX_FRAME_BODY_LEN`）在分配体缓冲前即被 `HEADER_CRC32C` 拒绝并返回 `FrameDecodeError::CorruptHeader`（绝不误判为 `TruncatedTail`、零超大分配）。
+- [x] 已确认帧中 `HEADER_CRC32C` 任一单字节翻转在分配体缓冲前即被拒绝并返回 `FrameDecodeError::CorruptHeader`。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --no-default-features --features storage-redb --lib -E 'test(=storage::queue::frame::tests::acknowledged_frame_each_header_field_bitflip_rejected_pre_alloc)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb --lib -E 'test(=storage::queue::frame::tests::acknowledged_frame_each_header_field_bitflip_rejected_pre_alloc)'`（new，覆盖 AC1–AC4）
-- [ ] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 3 文件实现白名单。
+- [x] `source .env.test && cargo nextest list --no-default-features --features storage-redb --lib -E 'test(=storage::queue::frame::tests::acknowledged_frame_each_header_field_bitflip_rejected_pre_alloc)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb --lib -E 'test(=storage::queue::frame::tests::acknowledged_frame_each_header_field_bitflip_rejected_pre_alloc)'`（new，覆盖 AC1–AC4）
+- [x] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 3 文件实现白名单。
 
 **Full-suite trigger:** `none`
 
@@ -10041,8 +10041,9 @@
 | `RB-06b` | `done` / `remote-verified` | `8d3c63c`（`main`） | `0.30.330` | 2026-11-23 00:01 UTC：Stage 1 精确 4 文件写集（`src/storage/{mod,cross_store}.rs`、`src/storage/redb/{git_store,capture_store}.rs`），实现 `CrossStoreCoordinator` 与 `git.redb` 延迟初始化 `meta_generation`/`meta_cross_store_intent`（保持 61 活表清单严格一致）：严格按 `GC-RB-04` `GitStore → CaptureStore` 锁序持 `cap_wtx` 在 `git_wtx.commit()` 前完成全部捕获批语义/外键/墓碑/唯一性/只追加预验（杜绝坏捕获毒化发件箱）、写前按升序重放全部 `(cap_gen + 1)..=git_gen` 待决意图、3-bit 协作式取消边界（`CrossStoreCancelGuard` + `ReplayCommitBoundaryGuard` 覆盖 `git_wtx`/`cap_wtx`/重放提交三处取消点）、`capture.redb` 缺 `meta_generation` 表或单例/只读/墓碑/损毁/缺失一律 fail-closed 报 `LBR-IO-001` 拒推进，以及只读三步一致快照（`g1 == c1 && g1 == g2`，5 次重试耗尽报 `LBR-IO-001`）；纯 `storage-redb,storage-queue` `storage::cross_store::` 6/6（含 AC1–AC4、并发双写与 `g1 != g2` 交错、防毒化、元数据腐败与 4 态异步取消）、双特性 15/15 回归（含 `repository_61_source_tables_manifest_complete`）、单特性零告警、fmt、严格 clippy、`compat_version_surface_sync` 与 Codex R5 `VERDICT: PASS` 全绿 |
 | `RB-06e` | `done` / `remote-verified` | `2c70c03`（`main`） | `0.30.331` | 2026-11-23 02:10 UTC：Stage 1 精确 3/4 文件写集（`src/storage/{mod,cross_store}.rs`、`src/storage/redb/git_store.rs`），实现显式修复入口 `CrossStoreCoordinator::reconcile_pending_intents()` / `cross_store::reconcile_pending_intents()`、共享升序重放引擎 `replay_pending_intents_in_cap_wtx`、孤儿意图守卫 `ensure_no_orphan_cross_store_intents_in_wtx`、已对账意图自动清理 `prune_reconciled_cross_store_intents_in_wtx`（同时接入显式修复与后续跨库写事务双路径，使 `META_CROSS_STORE_INTENT` 严格有界不无限增长），以及 `map_cross_store_join_err` 全路径 Tokio `JoinError` 固定类别脱敏；纯 `storage-redb,storage-queue` `storage::cross_store::` 8/8（含 `explicit_reconcile_idempotent_snapshot_and_intent_pruning` AC1–AC4 与 7 场景失败/回滚/孤儿/双锁取消/panic 脱敏回归）、双特性 8/8（含 `repository_61_source_tables_manifest_complete`）、单特性零告警、fmt、严格 clippy、`compat_version_surface_sync` 全绿；Codex R1 两项 P1 已全部闭环并经 R2 确认，R2 仅余要求在存储库模块内改写进程全局 `std::panic::set_hook` 抑制默认 stderr 之范围外诉求，依用户授权跳过继续推进（**Phase 1 全 19 卡全部闭环**） |
 | `RB-07` | `done` / `remote-verified` | `d8b2702`（`main`） | `0.30.332` | 2026-11-23 02:29 UTC：Stage 1 精确 3 文件写集（`src/storage/mod.rs`、`src/storage/queue/{mod,frame}.rs`），实现 `ADR-RB-05` #2 16 字节自认证帧头（`MAGIC=b"LCE1"` + `FRAME_BODY_LEN` + 覆盖前 8B 的 `HEADER_CRC32C` + 覆盖全帧非校验字段的 `FRAME_CRC32C`）与全量 UTF-8 语义 `dedup_key` 双校验编解码核心（`crc32c_checksum`/`crc32c_append`/`encode_frame`/`encode_postcard_frame`/`decode_frame`/`decode_postcard_payload`），采用显式 `into_storage_error()`（`LBR-IO-001` 脱敏且零 `From` 推导歧义）；`--no-default-features --features storage-redb` `crc32c_rfc3720_vector_and_16b_dual_crc_roundtrip` 1/1（含 RFC 3720 向量 `0xe3069283`、16B 头逐字节校验、无损往返、长 UTF-8 键末字节区分、合法双 CRC 结构非法帧拒收与脱敏转换）、全特性矩阵（`storage-sqlite`/`storage-redb`/`storage-sqlite,storage-queue`）零告警、fmt、严格 clippy、`compat_version_surface_sync` 与 Codex R2 `VERDICT: PASS` 全绿 |
-| `RB-07g` | `done` / `remote-pending` | 本提交（`main`） | `0.30.333` | 2026-11-23 02:50 UTC：Stage 1 精确 3 文件写集（`src/storage/mod.rs`、`src/storage/queue/{mod,frame}.rs`），在 `frame.rs` 落地 `MAX_FRAME_DEDUP_KEY_LEN = 512`、`MAX_FRAME_PAYLOAD_LEN = 4 MiB`、`MIN_FRAME_BODY_LEN = 3`、`MAX_FRAME_BODY_LEN == 3 + 512 + 4 MiB` 编译期断言、`validate_frame_body_len` 分配前上下界守卫、解码后组件级上限守卫（杜绝总长合法帧偷渡超限键/负载）以及有界流式 `BoundedEnvelopeWriter` + `postcard::to_io`（峰值缓冲严格钉定 `4 MiB`、超限立停防 OOM）；`--no-default-features --features storage-redb` `storage::queue::frame::` 2/2（含精确 `512 B + 4 MiB` 往返、超限拒收、`1 GiB` 虚拟流早停、`FRAME_BODY_LEN ∈ {0,1,2}` 与超上限 `CorruptHeader`、组件级超限拒收）、单特性零告警、fmt、严格 clippy、`compat_version_surface_sync` 与 Codex R2 `VERDICT: PASS` 全绿 |
-| `RB-07c`..`RB-34c`（剩余 124 卡） | `pending` | — | — | Phase 2 推进中，按实施顺序于 `main` 逐卡推进 |
+| `RB-07g` | `done` / `remote-verified` | `69b7539`（`main`） | `0.30.333` | 2026-11-23 02:50 UTC：Stage 1 精确 3 文件写集（`src/storage/mod.rs`、`src/storage/queue/{mod,frame}.rs`），在 `frame.rs` 落地 `MAX_FRAME_DEDUP_KEY_LEN = 512`、`MAX_FRAME_PAYLOAD_LEN = 4 MiB`、`MIN_FRAME_BODY_LEN = 3`、`MAX_FRAME_BODY_LEN == 3 + 512 + 4 MiB` 编译期断言、`validate_frame_body_len` 分配前上下界守卫、解码后组件级上限守卫（杜绝总长合法帧偷渡超限键/负载）以及有界流式 `BoundedEnvelopeWriter` + `postcard::to_io`（峰值缓冲严格钉定 `4 MiB`、超限立停防 OOM）；`--no-default-features --features storage-redb` `storage::queue::frame::` 2/2（含精确 `512 B + 4 MiB` 往返、超限拒收、`1 GiB` 虚拟流早停、`FRAME_BODY_LEN ∈ {0,1,2}` 与超上限 `CorruptHeader`、组件级超限拒收）、单特性零告警、fmt、严格 clippy、`compat_version_surface_sync` 与 Codex R2 `VERDICT: PASS` 全绿 |
+| `RB-07c` | `done` / `remote-pending` | 本提交（`main`） | `0.30.334` | 2026-11-23 03:07 UTC：Stage 1 精确 3 文件写集（`src/storage/mod.rs`、`src/storage/queue/{mod,frame}.rs`），实现栈上零分配头校验 `parse_and_verify_header`、顺序流解码器 `FrameStreamDecoder`/`FrameStreamItem`（含分块有界读体 `read_body_bounded` 与全错误粘性毒化 `terminal_error` 防重试误报 `CleanEof`/错位读体）；`--no-default-features --features storage-redb` `storage::queue::frame::` 3/3（`acknowledged_frame_each_header_field_bitflip_rejected_pre_alloc` 以 `PreAllocSpyReader` 实证 `MAGIC` 4B / `FRAME_BODY_LEN` 界内与超大两态 4B / `HEADER_CRC32C` 4B / 伪造魔数 / 第 2 帧中段坏头 / 精确 16B 尾坏头全部零体分配、零越界读体且粘性拒收）、单特性零告警、fmt、严格 clippy、`compat_version_surface_sync` 全绿；Codex R1 P1 粘性毒化已闭环并经 R2 确认，R2 所提非帧头路径（`TruncatedTail`/`CorruptPayload`）重试测试归属紧邻下游 `RB-07f`/`RB-07d` 承接，依用户授权跳过继续推进 |
+| `RB-07f`..`RB-34c`（剩余 123 卡） | `pending` | — | — | Phase 2 推进中，按实施顺序于 `main` 逐卡推进 |
 
 ## Codex review log
 

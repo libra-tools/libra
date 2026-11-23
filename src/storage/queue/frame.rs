@@ -122,6 +122,314 @@ pub enum FrameDecodeError {
     CorruptPayload { detail: &'static str },
     #[error("truncated capture queue frame tail (available={available} B, needed={needed} B)")]
     TruncatedTail { available: usize, needed: usize },
+    #[error("I/O error reading capture queue frame stream ({kind:?})")]
+    Io { kind: io::ErrorKind },
+}
+
+/// Verified 16-byte capture queue frame header parsed strictly on the stack
+/// before any body bytes are read or allocated (`ADR-RB-05` #2, `RB-07c`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParsedFrameHeader {
+    pub body_len: usize,
+    pub header_crc: u32,
+    pub frame_crc: u32,
+}
+
+/// Parse and cryptographically/structurally authenticate a fixed 16-byte frame
+/// header *before* allocating any body buffer or reading body bytes (`RB-07c`):
+///
+/// 1. Verifies `HEADER_CRC32C` over bytes `0..8` (`[MAGIC || FRAME_BODY_LEN]`).
+/// 2. Verifies `MAGIC == b"LCE1"`.
+/// 3. Verifies `MIN_FRAME_BODY_LEN (3) <= FRAME_BODY_LEN <= MAX_FRAME_BODY_LEN`.
+///
+/// Any single-byte flip in `MAGIC`, `FRAME_BODY_LEN` (whether in-range or
+/// oversized), or `HEADER_CRC32C` fails closed immediately with
+/// [`FrameDecodeError::CorruptHeader`] and zero heap allocations.
+pub fn parse_and_verify_header(
+    header: &[u8; FRAME_HEADER_LEN],
+) -> Result<ParsedFrameHeader, FrameDecodeError> {
+    let stored_header_crc = u32::from_le_bytes([header[8], header[9], header[10], header[11]]);
+    let computed_header_crc = crc32c_checksum(&header[0..8]);
+    if stored_header_crc != computed_header_crc {
+        return Err(FrameDecodeError::CorruptHeader {
+            detail: "header crc32c mismatch",
+        });
+    }
+
+    if header[0..4] != FRAME_MAGIC {
+        return Err(FrameDecodeError::CorruptHeader {
+            detail: "magic mismatch",
+        });
+    }
+
+    let body_len_u32 = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
+    let body_len = validate_frame_body_len(body_len_u32)?;
+    let frame_crc = u32::from_le_bytes([header[12], header[13], header[14], header[15]]);
+
+    Ok(ParsedFrameHeader {
+        body_len,
+        header_crc: stored_header_crc,
+        frame_crc,
+    })
+}
+
+/// Item returned by [`FrameStreamDecoder::next_frame`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FrameStreamItem {
+    /// A complete, dual-CRC32C verified frame starting at byte `offset`.
+    Frame {
+        offset: u64,
+        total_len: usize,
+        frame: DecodedFrame,
+    },
+    /// Stream reached exact clean EOF at byte `offset` with zero leftover bytes.
+    CleanEof { offset: u64 },
+}
+
+/// Sequential capture queue frame stream decoder over any [`io::Read`] source
+/// (`ADR-RB-05` #2, `RB-07c`).
+///
+/// Strictly authenticates the fixed 16-byte header via
+/// [`parse_and_verify_header`] on the stack *before* reading or allocating any
+/// body buffer, preventing forged or bit-flipped `FRAME_BODY_LEN` headers from
+/// causing OOM allocations or being misclassified as `TruncatedTail`.
+pub struct FrameStreamDecoder<R> {
+    reader: R,
+    offset: u64,
+    terminal_error: Option<FrameDecodeError>,
+    #[cfg(test)]
+    body_allocations: usize,
+}
+
+impl<R: io::Read> FrameStreamDecoder<R> {
+    /// Create a new sequential decoder starting at byte offset `0`.
+    #[must_use]
+    pub const fn new(reader: R) -> Self {
+        Self {
+            reader,
+            offset: 0,
+            terminal_error: None,
+            #[cfg(test)]
+            body_allocations: 0,
+        }
+    }
+
+    /// Create a new sequential decoder starting at an explicit stream byte `offset`
+    /// (for resuming from a committed highwater or boundary offset).
+    #[must_use]
+    pub const fn with_offset(reader: R, offset: u64) -> Self {
+        Self {
+            reader,
+            offset,
+            terminal_error: None,
+            #[cfg(test)]
+            body_allocations: 0,
+        }
+    }
+
+    /// Current verified byte offset within the underlying stream.
+    #[must_use]
+    pub const fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    /// Borrow the underlying reader.
+    #[must_use]
+    pub const fn get_ref(&self) -> &R {
+        &self.reader
+    }
+
+    /// Consume the decoder and return the underlying reader.
+    #[must_use]
+    pub fn into_inner(self) -> R {
+        self.reader
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn body_allocations(&self) -> usize {
+        self.body_allocations
+    }
+
+    /// Read and decode the next frame from the stream.
+    ///
+    /// Fail-closed sticky error invariant: once any decode or I/O error occurs
+    /// (which may have partially consumed stream bytes), the decoder is
+    /// permanently poisoned with that error so subsequent `next_frame()` calls
+    /// return the same error without reading further bytes or misclassifying
+    /// leftover bytes as `CleanEof` or a misaligned frame.
+    pub fn next_frame(&mut self) -> Result<FrameStreamItem, FrameDecodeError> {
+        if let Some(err) = &self.terminal_error {
+            return Err(err.clone());
+        }
+        match self.next_frame_inner() {
+            Ok(item) => Ok(item),
+            Err(err) => {
+                self.terminal_error = Some(err.clone());
+                Err(err)
+            }
+        }
+    }
+
+    fn next_frame_inner(&mut self) -> Result<FrameStreamItem, FrameDecodeError> {
+        let frame_start = self.offset;
+        let mut header = [0u8; FRAME_HEADER_LEN];
+        let hdr_read = read_up_to(&mut self.reader, &mut header)?;
+        if hdr_read == 0 {
+            return Ok(FrameStreamItem::CleanEof {
+                offset: frame_start,
+            });
+        }
+        if hdr_read < FRAME_HEADER_LEN {
+            return Err(FrameDecodeError::TruncatedTail {
+                available: hdr_read,
+                needed: FRAME_HEADER_LEN,
+            });
+        }
+
+        // Authenticate header completely on stack BEFORE allocating or reading any body bytes.
+        let parsed = parse_and_verify_header(&header)?;
+        let total_len = FRAME_HEADER_LEN.checked_add(parsed.body_len).ok_or(
+            FrameDecodeError::CorruptHeader {
+                detail: "frame total length overflow",
+            },
+        )?;
+
+        // Read body in bounded chunks (<= 64 KiB at a time), growing the body
+        // buffer only up to bytes actually delivered by the reader so even a
+        // truncated tail with a valid 4 MiB header never blindly pre-allocates 4 MiB.
+        #[cfg(test)]
+        {
+            self.body_allocations += 1;
+        }
+        let body = read_body_bounded(&mut self.reader, parsed.body_len, total_len)?;
+        let frame = verify_and_decode_body(&header, &body, parsed.frame_crc)?;
+
+        let total_u64 = u64::try_from(total_len).map_err(|_| FrameDecodeError::CorruptHeader {
+            detail: "frame total length exceeds u64",
+        })?;
+        self.offset =
+            self.offset
+                .checked_add(total_u64)
+                .ok_or(FrameDecodeError::CorruptHeader {
+                    detail: "stream offset overflow",
+                })?;
+
+        Ok(FrameStreamItem::Frame {
+            offset: frame_start,
+            total_len,
+            frame,
+        })
+    }
+}
+
+fn read_up_to<R: io::Read>(reader: &mut R, buf: &mut [u8]) -> Result<usize, FrameDecodeError> {
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        match reader.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(FrameDecodeError::Io { kind: err.kind() }),
+        }
+    }
+    Ok(filled)
+}
+
+fn read_body_bounded<R: io::Read>(
+    reader: &mut R,
+    body_len: usize,
+    total_len: usize,
+) -> Result<Vec<u8>, FrameDecodeError> {
+    const CHUNK_SIZE: usize = 64 * 1024;
+    let mut body = Vec::with_capacity(body_len.min(CHUNK_SIZE));
+    let mut scratch = [0u8; 8192];
+    while body.len() < body_len {
+        let want = (body_len - body.len()).min(scratch.len());
+        match reader.read(&mut scratch[..want]) {
+            Ok(0) => {
+                return Err(FrameDecodeError::TruncatedTail {
+                    available: FRAME_HEADER_LEN.saturating_add(body.len()),
+                    needed: total_len,
+                });
+            }
+            Ok(n) => {
+                let next_len = body.len() + n;
+                if next_len > body.capacity() {
+                    let target_cap = body
+                        .capacity()
+                        .saturating_mul(2)
+                        .max(next_len)
+                        .min(body_len);
+                    body.reserve_exact(target_cap - body.len());
+                }
+                body.extend_from_slice(&scratch[..n]);
+            }
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(FrameDecodeError::Io { kind: err.kind() }),
+        }
+    }
+    Ok(body)
+}
+
+fn verify_and_decode_body(
+    header: &[u8; FRAME_HEADER_LEN],
+    body: &[u8],
+    stored_frame_crc: u32,
+) -> Result<DecodedFrame, FrameDecodeError> {
+    let computed_frame_crc = crc32c_append(crc32c_checksum(&header[0..12]), body);
+    if stored_frame_crc != computed_frame_crc {
+        return Err(FrameDecodeError::CorruptPayload {
+            detail: "frame crc32c mismatch",
+        });
+    }
+
+    let flags = body[0];
+    let dedup_len = usize::from(u16::from_le_bytes([body[1], body[2]]));
+    if dedup_len == 0 {
+        return Err(FrameDecodeError::CorruptPayload {
+            detail: "empty dedup_key in frame body",
+        });
+    }
+    if dedup_len > MAX_FRAME_DEDUP_KEY_LEN {
+        return Err(FrameDecodeError::CorruptPayload {
+            detail: "dedup_key length exceeds MAX_FRAME_DEDUP_KEY_LEN",
+        });
+    }
+    let dedup_end = FRAME_BODY_FIXED_OVERHEAD.checked_add(dedup_len).ok_or(
+        FrameDecodeError::CorruptPayload {
+            detail: "dedup_key length overflow",
+        },
+    )?;
+    if dedup_end > body.len() {
+        return Err(FrameDecodeError::CorruptPayload {
+            detail: "dedup_key length exceeds frame body length",
+        });
+    }
+    let payload_len = body.len() - dedup_end;
+    if payload_len > MAX_FRAME_PAYLOAD_LEN {
+        return Err(FrameDecodeError::CorruptPayload {
+            detail: "payload length exceeds MAX_FRAME_PAYLOAD_LEN",
+        });
+    }
+
+    let dedup_raw = &body[FRAME_BODY_FIXED_OVERHEAD..dedup_end];
+    if dedup_raw.contains(&0) {
+        return Err(FrameDecodeError::CorruptPayload {
+            detail: "dedup_key contains NUL byte",
+        });
+    }
+    let dedup_key = std::str::from_utf8(dedup_raw)
+        .map_err(|_| FrameDecodeError::CorruptPayload {
+            detail: "dedup_key is not valid UTF-8",
+        })?
+        .to_string();
+
+    let payload = body[dedup_end..].to_vec();
+    Ok(DecodedFrame {
+        flags,
+        dedup_key,
+        payload,
+    })
 }
 
 impl FrameDecodeError {
@@ -313,28 +621,15 @@ pub fn decode_frame(bytes: &[u8]) -> Result<(DecodedFrame, usize), FrameDecodeEr
         });
     }
 
-    if bytes[0..4] != FRAME_MAGIC {
-        return Err(FrameDecodeError::CorruptHeader {
-            detail: "magic mismatch",
-        });
-    }
+    let mut header = [0u8; FRAME_HEADER_LEN];
+    header.copy_from_slice(&bytes[0..FRAME_HEADER_LEN]);
 
-    let body_len_u32 = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
-    let stored_header_crc = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
-    let computed_header_crc = crc32c_checksum(&bytes[0..8]);
-    if stored_header_crc != computed_header_crc {
-        return Err(FrameDecodeError::CorruptHeader {
-            detail: "header crc32c mismatch",
-        });
-    }
-
-    // Enforce `3 <= FRAME_BODY_LEN <= MAX_FRAME_BODY_LEN` BEFORE checking remaining
-    // slice length or allocating any body buffer so illegal lengths fail closed as
-    // `CorruptHeader` rather than `TruncatedTail` or OOM.
-    let body_len = validate_frame_body_len(body_len_u32)?;
+    // Authenticate 16-byte header strictly on stack BEFORE checking remaining
+    // slice length or allocating any body buffer (`RB-07c`).
+    let parsed = parse_and_verify_header(&header)?;
     let total_len =
         FRAME_HEADER_LEN
-            .checked_add(body_len)
+            .checked_add(parsed.body_len)
             .ok_or(FrameDecodeError::CorruptHeader {
                 detail: "frame total length overflow",
             })?;
@@ -345,68 +640,9 @@ pub fn decode_frame(bytes: &[u8]) -> Result<(DecodedFrame, usize), FrameDecodeEr
         });
     }
 
-    let stored_frame_crc = u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
-    let computed_frame_crc = crc32c_append(
-        crc32c_checksum(&bytes[0..12]),
-        &bytes[FRAME_HEADER_LEN..total_len],
-    );
-    if stored_frame_crc != computed_frame_crc {
-        return Err(FrameDecodeError::CorruptPayload {
-            detail: "frame crc32c mismatch",
-        });
-    }
-
     let body = &bytes[FRAME_HEADER_LEN..total_len];
-    let flags = body[0];
-    let dedup_len = usize::from(u16::from_le_bytes([body[1], body[2]]));
-    if dedup_len == 0 {
-        return Err(FrameDecodeError::CorruptPayload {
-            detail: "empty dedup_key in frame body",
-        });
-    }
-    if dedup_len > MAX_FRAME_DEDUP_KEY_LEN {
-        return Err(FrameDecodeError::CorruptPayload {
-            detail: "dedup_key length exceeds MAX_FRAME_DEDUP_KEY_LEN",
-        });
-    }
-    let dedup_end = FRAME_BODY_FIXED_OVERHEAD.checked_add(dedup_len).ok_or(
-        FrameDecodeError::CorruptPayload {
-            detail: "dedup_key length overflow",
-        },
-    )?;
-    if dedup_end > body.len() {
-        return Err(FrameDecodeError::CorruptPayload {
-            detail: "dedup_key length exceeds frame body length",
-        });
-    }
-    let payload_len = body.len() - dedup_end;
-    if payload_len > MAX_FRAME_PAYLOAD_LEN {
-        return Err(FrameDecodeError::CorruptPayload {
-            detail: "payload length exceeds MAX_FRAME_PAYLOAD_LEN",
-        });
-    }
-
-    let dedup_raw = &body[FRAME_BODY_FIXED_OVERHEAD..dedup_end];
-    if dedup_raw.contains(&0) {
-        return Err(FrameDecodeError::CorruptPayload {
-            detail: "dedup_key contains NUL byte",
-        });
-    }
-    let dedup_key = std::str::from_utf8(dedup_raw)
-        .map_err(|_| FrameDecodeError::CorruptPayload {
-            detail: "dedup_key is not valid UTF-8",
-        })?
-        .to_string();
-
-    let payload = body[dedup_end..].to_vec();
-    Ok((
-        DecodedFrame {
-            flags,
-            dedup_key,
-            payload,
-        },
-        total_len,
-    ))
+    let frame = verify_and_decode_body(&header, body, parsed.frame_crc)?;
+    Ok((frame, total_len))
 }
 
 /// Decode the versioned `postcard` payload carried inside a [`DecodedFrame`].
@@ -924,5 +1160,277 @@ mod tests {
             (64..=66).contains(&emitted),
             "expected bounded serializer to abort right at 4 MiB (~64-65 chunks), emitted {emitted}"
         );
+    }
+
+    /// `RB-07c` AC1–AC4:
+    /// Exercises sequential stream decoder (`FrameStreamDecoder`) and single-frame
+    /// decoder (`decode_frame`) pre-allocation header authentication:
+    /// - AC1: Single-byte flip in any byte of `MAGIC` (`0..4`) rejected by
+    ///   `HEADER_CRC32C` with `FrameDecodeError::CorruptHeader` before body allocation.
+    /// - AC2: Single-byte flip in `FRAME_BODY_LEN` (`4..8`) remaining within
+    ///   remaining stream length rejected by `HEADER_CRC32C` with `CorruptHeader`
+    ///   before body allocation.
+    /// - AC3: Single-byte flip in `FRAME_BODY_LEN` (`4..8`) producing a huge value
+    ///   (both `> remaining_bytes` and `> MAX_FRAME_BODY_LEN`) rejected by
+    ///   `HEADER_CRC32C` with `CorruptHeader` (never `TruncatedTail`, zero huge alloc).
+    /// - AC4: Single-byte flip in any byte of `HEADER_CRC32C` (`8..12`) rejected
+    ///   with `CorruptHeader` before body allocation.
+    #[test]
+    fn acknowledged_frame_each_header_field_bitflip_rejected_pre_alloc() {
+        /// Spy reader that records total bytes read and panics if the decoder
+        /// attempts to read past `max_allowed_bytes` (proving zero body reads
+        /// after a corrupt 16-byte header).
+        struct PreAllocSpyReader<'a> {
+            data: &'a [u8],
+            pos: usize,
+            max_allowed_bytes: usize,
+        }
+        impl<'a> PreAllocSpyReader<'a> {
+            fn new(data: &'a [u8], max_allowed_bytes: usize) -> Self {
+                Self {
+                    data,
+                    pos: 0,
+                    max_allowed_bytes,
+                }
+            }
+        }
+        impl io::Read for PreAllocSpyReader<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                let avail = self.data.len().saturating_sub(self.pos);
+                let n = buf.len().min(avail);
+                assert!(
+                    self.pos + n <= self.max_allowed_bytes,
+                    "decoder read past header boundary ({} > {}) on corrupt header!",
+                    self.pos + n,
+                    self.max_allowed_bytes
+                );
+                buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+                self.pos += n;
+                Ok(n)
+            }
+        }
+
+        let env = SampleCaptureEnvelope {
+            session_id: "sess-rb07c".to_string(),
+            seq: 7,
+            event_kind: "TurnComplete".to_string(),
+            body: vec![0xab; 128],
+        };
+        let frame1 = encode_postcard_frame(FRAME_FLAG_NONE, "rb07c:frame-1", 1, &env)
+            .expect("encode frame1");
+        let frame2 = encode_postcard_frame(FRAME_FLAG_PRIORITY, "rb07c:frame-2", 1, &env)
+            .expect("encode frame2");
+        // Build a stream with generous trailing bytes (> frame1 length) so we can
+        // test in-range `FRAME_BODY_LEN` flips cleanly.
+        let mut two_frames = frame1.clone();
+        two_frames.extend_from_slice(&frame2);
+
+        let assert_corrupt_header_pre_alloc =
+            |corrupted: &[u8], expected_detail: &'static str, label: &str| {
+                // Single-frame slice decoder
+                assert_eq!(
+                    decode_frame(corrupted),
+                    Err(FrameDecodeError::CorruptHeader {
+                        detail: expected_detail,
+                    }),
+                    "{label}: decode_frame must return CorruptHeader"
+                );
+                // Sequential stream decoder with strict 16-byte read ceiling + zero body allocation proof
+                let spy = PreAllocSpyReader::new(corrupted, FRAME_HEADER_LEN);
+                let mut dec = FrameStreamDecoder::new(spy);
+                assert_eq!(
+                    dec.next_frame(),
+                    Err(FrameDecodeError::CorruptHeader {
+                        detail: expected_detail,
+                    }),
+                    "{label}: FrameStreamDecoder must return CorruptHeader"
+                );
+                assert_eq!(
+                    dec.body_allocations(),
+                    0,
+                    "{label}: zero body buffer allocations permitted on corrupt header"
+                );
+                assert_eq!(
+                    dec.get_ref().pos,
+                    FRAME_HEADER_LEN,
+                    "{label}: decoder must stop strictly after reading the 16-byte header"
+                );
+                assert_eq!(
+                    dec.offset(),
+                    0,
+                    "{label}: stream offset must not advance on corrupt header"
+                );
+                // Codex R1 P1: Sticky poison invariant — retrying `next_frame()` after a
+                // corrupt header MUST keep returning the same `CorruptHeader` without
+                // reading further bytes or returning `CleanEof`/misaligned frames.
+                assert_eq!(
+                    dec.next_frame(),
+                    Err(FrameDecodeError::CorruptHeader {
+                        detail: expected_detail,
+                    }),
+                    "{label}: poisoned decoder must keep returning CorruptHeader on retry"
+                );
+                assert_eq!(dec.body_allocations(), 0);
+                assert_eq!(dec.get_ref().pos, FRAME_HEADER_LEN);
+                assert_eq!(dec.offset(), 0);
+            };
+
+        // AC1: Every single byte of MAGIC (`0..4`) flipped -> rejected by HEADER_CRC32C pre-alloc.
+        for idx in 0..4usize {
+            let mut mutated = two_frames.clone();
+            mutated[idx] ^= 0x01;
+            assert_corrupt_header_pre_alloc(
+                &mutated,
+                "header crc32c mismatch",
+                &format!("AC1 MAGIC byte {idx}"),
+            );
+        }
+        // Also verify forged wrong MAGIC with recomputed valid HEADER_CRC32C fails pre-alloc.
+        {
+            let mut forged_magic = two_frames.clone();
+            forged_magic[3] = b'2'; // "LCE2"
+            let recomputed_hdr_crc = crc32c_checksum(&forged_magic[0..8]);
+            forged_magic[8..12].copy_from_slice(&recomputed_hdr_crc.to_le_bytes());
+            assert_corrupt_header_pre_alloc(
+                &forged_magic,
+                "magic mismatch",
+                "AC1 forged MAGIC with valid header CRC",
+            );
+        }
+
+        // AC2: Single-byte flip in FRAME_BODY_LEN that stays strictly WITHIN remaining stream bytes.
+        {
+            let mut mutated = two_frames.clone();
+            let orig_len = u32::from_le_bytes([mutated[4], mutated[5], mutated[6], mutated[7]]);
+            mutated[4] ^= 0x08; // +/- 8 bytes, still >= 3 and <= two_frames.len() - 16
+            let flipped_len = u32::from_le_bytes([mutated[4], mutated[5], mutated[6], mutated[7]]);
+            assert_ne!(flipped_len, orig_len);
+            assert!(
+                flipped_len >= MIN_FRAME_BODY_LEN
+                    && (flipped_len as usize) <= two_frames.len() - FRAME_HEADER_LEN,
+                "AC2 setup: flipped_len ({flipped_len}) must remain within remaining stream bytes"
+            );
+            assert_corrupt_header_pre_alloc(
+                &mutated,
+                "header crc32c mismatch",
+                "AC2 in-range FRAME_BODY_LEN byte 4 bitflip",
+            );
+        }
+
+        // AC3: Single-byte flip in FRAME_BODY_LEN producing huge values:
+        // (3a) > remaining stream bytes while still <= MAX_FRAME_BODY_LEN (never TruncatedTail!)
+        {
+            let mut mutated = frame1.clone();
+            mutated[6] ^= 0x10; // adds +1 MiB (exceeds remaining bytes, <= 4 MiB)
+            let flipped_len = u32::from_le_bytes([mutated[4], mutated[5], mutated[6], mutated[7]]);
+            assert!((flipped_len as usize) > frame1.len() - FRAME_HEADER_LEN);
+            assert!(flipped_len <= MAX_FRAME_BODY_LEN);
+            assert_corrupt_header_pre_alloc(
+                &mutated,
+                "header crc32c mismatch",
+                "AC3a >remaining-bytes <=MAX FRAME_BODY_LEN bitflip",
+            );
+        }
+        // (3b) > MAX_FRAME_BODY_LEN (byte 7 MSB flip -> > 2 GiB, zero huge allocation!)
+        {
+            let mut mutated = frame1.clone();
+            mutated[7] ^= 0x80; // > 2 GiB!
+            let flipped_len = u32::from_le_bytes([mutated[4], mutated[5], mutated[6], mutated[7]]);
+            assert!(flipped_len > MAX_FRAME_BODY_LEN);
+            assert_corrupt_header_pre_alloc(
+                &mutated,
+                "header crc32c mismatch",
+                "AC3b >2GiB MSB FRAME_BODY_LEN bitflip",
+            );
+        }
+        // Exhaustively verify all 4 byte positions of FRAME_BODY_LEN (`4..8`).
+        for idx in 4..8usize {
+            let mut mutated = frame1.clone();
+            mutated[idx] ^= 0x40;
+            assert_corrupt_header_pre_alloc(
+                &mutated,
+                "header crc32c mismatch",
+                &format!("AC2/AC3 FRAME_BODY_LEN byte {idx}"),
+            );
+        }
+
+        // AC4: Every single byte of HEADER_CRC32C (`8..12`) flipped -> rejected pre-alloc.
+        for idx in 8..12usize {
+            let mut mutated = two_frames.clone();
+            mutated[idx] ^= 0x01;
+            assert_corrupt_header_pre_alloc(
+                &mutated,
+                "header crc32c mismatch",
+                &format!("AC4 HEADER_CRC32C byte {idx}"),
+            );
+        }
+
+        // Verify mid-stream corruption at frame 2 after frame 1 succeeded cleanly:
+        // frame 1 allocates 1 body buffer, frame 2 corrupt header triggers 0 additional allocations
+        // and stops strictly at `frame1.len() + 16`.
+        {
+            let mut second_corrupt = two_frames.clone();
+            second_corrupt[frame1.len() + 7] ^= 0x80; // huge FRAME_BODY_LEN on frame 2
+            let spy = PreAllocSpyReader::new(&second_corrupt, frame1.len() + FRAME_HEADER_LEN);
+            let mut dec = FrameStreamDecoder::new(spy);
+            let item1 = dec.next_frame().expect("frame 1 decodes cleanly");
+            assert!(matches!(
+                item1,
+                FrameStreamItem::Frame { offset: 0, total_len, ref frame }
+                    if total_len == frame1.len() && frame.dedup_key == "rb07c:frame-1"
+            ));
+            assert_eq!(dec.body_allocations(), 1);
+            assert_eq!(dec.offset(), frame1.len() as u64);
+
+            let err2 = dec
+                .next_frame()
+                .expect_err("corrupt frame 2 header must fail closed pre-alloc");
+            assert_eq!(
+                err2,
+                FrameDecodeError::CorruptHeader {
+                    detail: "header crc32c mismatch",
+                }
+            );
+            assert_eq!(
+                dec.body_allocations(),
+                1,
+                "corrupt frame 2 must perform zero body allocations"
+            );
+            assert_eq!(dec.get_ref().pos, frame1.len() + FRAME_HEADER_LEN);
+            assert_eq!(dec.offset(), frame1.len() as u64);
+            // Retry on poisoned mid-stream decoder also stays fail-closed.
+            assert_eq!(
+                dec.next_frame(),
+                Err(FrameDecodeError::CorruptHeader {
+                    detail: "header crc32c mismatch",
+                })
+            );
+            assert_eq!(dec.body_allocations(), 1);
+            assert_eq!(dec.get_ref().pos, frame1.len() + FRAME_HEADER_LEN);
+        }
+
+        // Exact 16-byte trailing corrupt header (no following body bytes): retry MUST
+        // NOT report `CleanEof` even though the underlying reader is now at EOF!
+        {
+            let mut trailing_bad_hdr = frame1[..FRAME_HEADER_LEN].to_vec();
+            trailing_bad_hdr[8] ^= 0x01; // flip HEADER_CRC32C
+            let spy = PreAllocSpyReader::new(&trailing_bad_hdr, FRAME_HEADER_LEN);
+            let mut dec = FrameStreamDecoder::new(spy);
+            assert_eq!(
+                dec.next_frame(),
+                Err(FrameDecodeError::CorruptHeader {
+                    detail: "header crc32c mismatch",
+                })
+            );
+            assert_eq!(
+                dec.next_frame(),
+                Err(FrameDecodeError::CorruptHeader {
+                    detail: "header crc32c mismatch",
+                }),
+                "retrying after exact-16B trailing corrupt header must never return CleanEof"
+            );
+            assert_eq!(dec.body_allocations(), 0);
+            assert_eq!(dec.offset(), 0);
+        }
     }
 }

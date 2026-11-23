@@ -10,8 +10,9 @@ pub mod frame;
 
 pub use frame::{
     DecodedFrame, FRAME_BODY_FIXED_OVERHEAD, FRAME_FLAG_NONE, FRAME_FLAG_PRIORITY,
-    FRAME_HEADER_LEN, FRAME_MAGIC, FrameDecodeError, FrameEncodeError, MAX_FRAME_BODY_LEN,
-    MAX_FRAME_DEDUP_KEY_LEN, MAX_FRAME_PAYLOAD_LEN, MIN_FRAME_BODY_LEN, crc32c_append,
-    crc32c_checksum, decode_frame, decode_postcard_payload, encode_frame, encode_postcard_frame,
+    FRAME_HEADER_LEN, FRAME_MAGIC, FrameDecodeError, FrameEncodeError, FrameStreamDecoder,
+    FrameStreamItem, MAX_FRAME_BODY_LEN, MAX_FRAME_DEDUP_KEY_LEN, MAX_FRAME_PAYLOAD_LEN,
+    MIN_FRAME_BODY_LEN, ParsedFrameHeader, crc32c_append, crc32c_checksum, decode_frame,
+    decode_postcard_payload, encode_frame, encode_postcard_frame, parse_and_verify_header,
     validate_frame_body_len,
 };
