@@ -334,6 +334,16 @@ section is separated like Git, and each path/status field is NUL-terminated.
 libra log -z --name-status --format=%s
 ```
 
+### `--full-index`
+
+`--full-index` prints the complete object ids on every `index` header line
+(`index <old>..<new> 100644`) — 40 hex characters in a SHA-1 repository, 64 in a
+SHA-256 one. The flag is forwarded to the shared diff engine.
+
+```bash
+libra log -p -1 --full-index
+```
+
 ### `--no-prefix` / `--src-prefix` / `--dst-prefix`
 
 `--no-prefix` drops the `a/`/`b/` labels (`diff --git a.txt a.txt`, `--- a.txt`,

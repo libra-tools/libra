@@ -320,6 +320,9 @@ pub struct LogArgs {
     #[clap(long = "dirstat-by-file", value_name = "PARAM", num_args = 0..=1, default_missing_value = "", require_equals = true)]
     pub dirstat_by_file: Option<String>,
 
+    /// Show full object IDs on `index` header lines (Git's `--full-index`)
+    #[clap(long = "full-index")]
+    pub full_index: bool,
     /// Show paths without the `a/`/`b/` prefix (Git's `--no-prefix`)
     #[clap(long = "no-prefix")]
     pub no_prefix: bool,
@@ -3656,7 +3659,8 @@ async fn execute_safe_with_diff_formats(
                     block.push_str("\n\n");
                 }
             }
-            let mut patch_output = if args.no_prefix
+            let mut patch_output = if args.full_index
+                || args.no_prefix
                 || args.src_prefix.is_some()
                 || args.dst_prefix.is_some()
                 || args.ignore_all_space
@@ -3664,6 +3668,9 @@ async fn execute_safe_with_diff_formats(
             {
                 // Re-diff through the shared engine so the whitespace rules apply.
                 let mut flags: Vec<&str> = Vec::new();
+                if args.full_index {
+                    flags.push("--full-index");
+                }
                 if args.no_prefix {
                     // The engine has no `--no-prefix` switch; empty prefixes are
                     // exactly Git's `--no-prefix` (`diff --git a.txt a.txt`).

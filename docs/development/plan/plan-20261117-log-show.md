@@ -1666,7 +1666,7 @@ PY
 
 ### Task LS-29: `log` 透传 `--full-index` 输出完整对象哈希（#967；自 LS-21 拆出）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-23：`LogArgs` 新增 `--full-index`，置位时 `-p` 经 `commit_diff_output` 转发到共享 diff 引擎。AC1/AC2 由 `command::log_test::diff_full_index_passthrough` 覆盖：SHA-1 仓库 `index <40 位>..<40 位> 100644`、SHA-256 仓库 `index <64 位>..<64 位> 100644`，对象 ID 由 `rev-parse HEAD~1:a.txt`/`HEAD:a.txt` 取得。`log_test` 282/282；EN/zh/开发文档与 `COMPATIBILITY.md` 同步。
 
 **Description:** 在 `LogArgs` 新增 `--full-index`，经 `LogDiffOptions` 复用 `src/command/diff/compare.rs:591` 在 `index` 头行输出完整 40/64 位对象哈希。
 

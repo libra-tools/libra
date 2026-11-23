@@ -9163,3 +9163,76 @@ fn diff_prefix_options_passthrough() {
         "AC5 old side unchanged: {dst}"
     );
 }
+
+#[test]
+fn diff_full_index_passthrough() {
+    use super::{assert_cli_success, run_libra_command};
+
+    let build = |object_format: Option<&str>| {
+        let work = tempfile::tempdir().expect("work dir");
+        let repo = work.path().join("r");
+        std::fs::create_dir_all(&repo).expect("mkdir repo");
+        let mut init = vec!["init"];
+        if let Some(format) = object_format {
+            init.push("--object-format");
+            init.push(format);
+        }
+        assert_cli_success(&run_libra_command(&init, &repo), "init");
+        run_libra_command(&["config", "set", "user.name", "t"], &repo);
+        run_libra_command(&["config", "set", "user.email", "t@t"], &repo);
+        std::fs::write(repo.join("a.txt"), "a\nb\n").expect("write a");
+        assert_cli_success(&run_libra_command(&["add", "a.txt"], &repo), "add a");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "c1", "--no-verify"], &repo),
+            "commit c1",
+        );
+        std::fs::write(repo.join("a.txt"), "a\nb\nc\n").expect("write b");
+        assert_cli_success(&run_libra_command(&["add", "a.txt"], &repo), "add b");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "c2", "--no-verify"], &repo),
+            "commit c2",
+        );
+        (work, repo)
+    };
+    let resolve = |repo: &std::path::Path, spec: &str| {
+        let result = run_libra_command(&["rev-parse", spec], repo);
+        assert_cli_success(&result, spec);
+        String::from_utf8_lossy(&result.stdout).trim().to_string()
+    };
+
+    // AC1: SHA-1 full 40-character ids on the index line.
+    let (_w1, sha1) = build(None);
+    let old = resolve(&sha1, "HEAD~1:a.txt");
+    let new = resolve(&sha1, "HEAD:a.txt");
+    assert_eq!(old.len(), 40, "SHA-1 old id: {old}");
+    let logged = run_libra_command(&["log", "-p", "-1", "--full-index"], &sha1);
+    assert_cli_success(&logged, "log --full-index");
+    let text = String::from_utf8_lossy(&logged.stdout).to_string();
+    let index_lines: Vec<&str> = text
+        .lines()
+        .filter(|line| line.starts_with("index "))
+        .collect();
+    assert_eq!(
+        index_lines,
+        vec![format!("index {old}..{new} 100644").as_str()],
+        "AC1 index line: {text}"
+    );
+
+    // AC2: SHA-256 repositories use the full 64-character ids.
+    let (_w2, sha256) = build(Some("sha256"));
+    let old = resolve(&sha256, "HEAD~1:a.txt");
+    let new = resolve(&sha256, "HEAD:a.txt");
+    assert_eq!(old.len(), 64, "SHA-256 old id: {old}");
+    let logged = run_libra_command(&["log", "-p", "-1", "--full-index"], &sha256);
+    assert_cli_success(&logged, "log --full-index sha256");
+    let text = String::from_utf8_lossy(&logged.stdout).to_string();
+    let index_lines: Vec<&str> = text
+        .lines()
+        .filter(|line| line.starts_with("index "))
+        .collect();
+    assert_eq!(
+        index_lines,
+        vec![format!("index {old}..{new} 100644").as_str()],
+        "AC2 index line: {text}"
+    );
+}

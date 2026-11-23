@@ -154,3 +154,5 @@ flowchart TD
 - 2026-11-23（LS-21 / #967）：新增 `-w`/`--ignore-all-space` 与 `-b`/`--ignore-space-change`：置位时 `-p` 的补丁经 `commit_diff_output(commit, flags)`（clap 构造 `DiffArgs` + `run_diff_for_service`）重算，其余路径不变。回归：`diff_ignore_whitespace_passthrough`（AC1–AC3，两种拼写表驱动 + 与 `libra diff` 引擎逐字一致）。
 
 - 2026-11-23（LS-28 / #967）：新增 `--no-prefix`/`--src-prefix`/`--dst-prefix`（与 `--no-prefix` 互斥），转发到 diff 引擎（`--no-prefix` 以空前缀实现，引擎无同名开关）。回归：`diff_prefix_options_passthrough`（AC1–AC5）。
+
+- 2026-11-23（LS-29 / #967）：新增 `--full-index`，转发到 diff 引擎（`index <old>..<new>` 输出完整 40/64 位 ID）。回归：`diff_full_index_passthrough`（AC1 SHA-1、AC2 SHA-256）。

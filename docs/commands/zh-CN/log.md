@@ -249,6 +249,14 @@ Git 规则分隔，每个路径/状态字段均以 NUL 终止。
 libra log -z --name-status --format=%s
 ```
 
+### `--full-index`
+
+`--full-index` 在每条 `index` 头行输出完整对象 ID（`index <old>..<new> 100644`）：SHA-1 仓库为 40 位十六进制，SHA-256 仓库为 64 位。该标志转发到共享 diff 引擎。
+
+```bash
+libra log -p -1 --full-index
+```
+
 ### `--no-prefix` / `--src-prefix` / `--dst-prefix`
 
 `--no-prefix` 去掉 `a/`/`b/` 前缀（`diff --git a.txt a.txt`、`--- a.txt`、`+++ a.txt`）；`--src-prefix=<p>`/`--dst-prefix=<p>` 分侧替换前缀。参数转发到共享 `libra diff` 引擎，字节与同一提交的 `libra diff` 对应选项一致。
