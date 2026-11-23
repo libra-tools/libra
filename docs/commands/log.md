@@ -334,6 +334,18 @@ section is separated like Git, and each path/status field is NUL-terminated.
 libra log -z --name-status --format=%s
 ```
 
+### `--no-prefix` / `--src-prefix` / `--dst-prefix`
+
+`--no-prefix` drops the `a/`/`b/` labels (`diff --git a.txt a.txt`, `--- a.txt`,
+`+++ a.txt`); `--src-prefix=<p>` and `--dst-prefix=<p>` replace them per side. The
+flags are forwarded to the shared `libra diff` engine, so the bytes match
+`libra diff --src-prefix`/`--dst-prefix` for the same commit.
+
+```bash
+libra log -p -1 --no-prefix
+libra log -p -1 --src-prefix=x/ --dst-prefix=y/
+```
+
 ### `-w` / `-b`
 
 `-w` (`--ignore-all-space`) ignores whitespace entirely when comparing lines, so

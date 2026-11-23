@@ -9109,3 +9109,57 @@ fn diff_ignore_whitespace_passthrough() {
         "AC3 default rendering unchanged"
     );
 }
+
+#[test]
+fn diff_prefix_options_passthrough() {
+    use super::{assert_cli_success, run_libra_command};
+
+    // Fixture: c1 adds a.txt, c2 appends a line.
+    let work = tempfile::tempdir().expect("work dir");
+    let repo = work.path().join("r");
+    std::fs::create_dir_all(&repo).expect("mkdir repo");
+    assert_cli_success(&run_libra_command(&["init"], &repo), "init");
+    run_libra_command(&["config", "set", "user.name", "t"], &repo);
+    run_libra_command(&["config", "set", "user.email", "t@t"], &repo);
+    std::fs::write(repo.join("a.txt"), "a\nb\n").expect("write a");
+    assert_cli_success(&run_libra_command(&["add", "a.txt"], &repo), "add a");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c1", "--no-verify"], &repo),
+        "commit c1",
+    );
+    std::fs::write(repo.join("a.txt"), "a\nb\nc\n").expect("write b");
+    assert_cli_success(&run_libra_command(&["add", "a.txt"], &repo), "add b");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c2", "--no-verify"], &repo),
+        "commit c2",
+    );
+
+    let out = |args: &[&str]| {
+        let result = run_libra_command(args, &repo);
+        assert_cli_success(&result, &format!("log {args:?}"));
+        String::from_utf8_lossy(&result.stdout).to_string()
+    };
+
+    // AC1/AC2/AC3: `--no-prefix` drops both sides of the path labels.
+    let plain = out(&["log", "-p", "-1", "--no-prefix"]);
+    assert!(
+        plain.contains("diff --git a.txt a.txt"),
+        "AC1 no-prefix header: {plain}"
+    );
+    assert!(plain.contains("\n--- a.txt\n"), "AC2 old path: {plain}");
+    assert!(plain.contains("\n+++ a.txt\n"), "AC3 new path: {plain}");
+    // AC4: `--src-prefix=x/` only rewrites the old side.
+    let src = out(&["log", "-p", "-1", "--src-prefix=x/"]);
+    assert!(src.contains("\n--- x/a.txt\n"), "AC4 src prefix: {src}");
+    assert!(
+        src.contains("\n+++ b/a.txt\n"),
+        "AC4 new side unchanged: {src}"
+    );
+    // AC5: `--dst-prefix=y/` only rewrites the new side.
+    let dst = out(&["log", "-p", "-1", "--dst-prefix=y/"]);
+    assert!(dst.contains("\n+++ y/a.txt\n"), "AC5 dst prefix: {dst}");
+    assert!(
+        dst.contains("\n--- a/a.txt\n"),
+        "AC5 old side unchanged: {dst}"
+    );
+}

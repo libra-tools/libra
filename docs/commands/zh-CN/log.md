@@ -249,6 +249,15 @@ Git 规则分隔，每个路径/状态字段均以 NUL 终止。
 libra log -z --name-status --format=%s
 ```
 
+### `--no-prefix` / `--src-prefix` / `--dst-prefix`
+
+`--no-prefix` 去掉 `a/`/`b/` 前缀（`diff --git a.txt a.txt`、`--- a.txt`、`+++ a.txt`）；`--src-prefix=<p>`/`--dst-prefix=<p>` 分侧替换前缀。参数转发到共享 `libra diff` 引擎，字节与同一提交的 `libra diff` 对应选项一致。
+
+```bash
+libra log -p -1 --no-prefix
+libra log -p -1 --src-prefix=x/ --dst-prefix=y/
+```
+
 ### `-w` / `-b`
 
 `-w`（`--ignore-all-space`）完全忽略空白差异：仅缩进变化的提交不输出补丁；`-b`（`--ignore-space-change`）忽略空白数量变化，但仍输出 Git 的缩进 hunk。两者都经共享 `libra diff` 引擎重新对比，字节与同一提交的 `libra diff -w`/`-b` 一致。

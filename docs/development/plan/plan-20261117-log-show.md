@@ -1614,7 +1614,7 @@ PY
 
 ### Task LS-28: `log` 透传 diff 路径前缀选项（`--no-prefix`, `--src-prefix`, `--dst-prefix`）（#967；自 LS-21 拆出）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-23：`LogArgs` 新增 `--no-prefix`（与两个前缀选项互斥）与 `--src-prefix`/`--dst-prefix`；置位时 `-p` 经 `commit_diff_output(commit, &flags)` 转发到共享 diff 引擎（`--no-prefix` 以 `--src-prefix=`/`--dst-prefix=` 空前缀实现，引擎无同名开关）。AC1–AC5 由 `command::log_test::diff_prefix_options_passthrough` 覆盖（`diff --git a.txt a.txt`、`--- a.txt`、`+++ a.txt`、`--- x/a.txt`、`+++ y/a.txt`）。`log_test` 281/281；EN/zh/开发文档与 `COMPATIBILITY.md` 同步。
 
 **Description:** 在 `LogArgs` 新增 `--no-prefix`、`--src-prefix=<p>` 与 `--dst-prefix=<p>`，经 `LogDiffOptions` 复用 `src/command/diff/options.rs:28,124-160` 路径前缀解析与渲染逻辑。
 

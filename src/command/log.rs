@@ -320,6 +320,23 @@ pub struct LogArgs {
     #[clap(long = "dirstat-by-file", value_name = "PARAM", num_args = 0..=1, default_missing_value = "", require_equals = true)]
     pub dirstat_by_file: Option<String>,
 
+    /// Show paths without the `a/`/`b/` prefix (Git's `--no-prefix`)
+    #[clap(long = "no-prefix")]
+    pub no_prefix: bool,
+    /// Use PREFIX instead of `a/` for old-side paths (Git's `--src-prefix`)
+    #[clap(
+        long = "src-prefix",
+        value_name = "PREFIX",
+        conflicts_with = "no_prefix"
+    )]
+    pub src_prefix: Option<String>,
+    /// Use PREFIX instead of `b/` for new-side paths (Git's `--dst-prefix`)
+    #[clap(
+        long = "dst-prefix",
+        value_name = "PREFIX",
+        conflicts_with = "no_prefix"
+    )]
+    pub dst_prefix: Option<String>,
     /// Ignore whitespace entirely when comparing lines (Git's `-w`)
     #[clap(short = 'w', long = "ignore-all-space")]
     pub ignore_all_space: bool,
@@ -3639,14 +3656,35 @@ async fn execute_safe_with_diff_formats(
                     block.push_str("\n\n");
                 }
             }
-            let mut patch_output = if args.ignore_all_space || args.ignore_space_change {
+            let mut patch_output = if args.no_prefix
+                || args.src_prefix.is_some()
+                || args.dst_prefix.is_some()
+                || args.ignore_all_space
+                || args.ignore_space_change
+            {
                 // Re-diff through the shared engine so the whitespace rules apply.
                 let mut flags: Vec<&str> = Vec::new();
+                if args.no_prefix {
+                    // The engine has no `--no-prefix` switch; empty prefixes are
+                    // exactly Git's `--no-prefix` (`diff --git a.txt a.txt`).
+                    flags.push("--src-prefix=");
+                    flags.push("--dst-prefix=");
+                }
                 if args.ignore_all_space {
                     flags.push("-w");
                 }
                 if args.ignore_space_change {
                     flags.push("-b");
+                }
+                let src_prefix_flag;
+                if let Some(prefix) = &args.src_prefix {
+                    src_prefix_flag = format!("--src-prefix={prefix}");
+                    flags.push(&src_prefix_flag);
+                }
+                let dst_prefix_flag;
+                if let Some(prefix) = &args.dst_prefix {
+                    dst_prefix_flag = format!("--dst-prefix={prefix}");
+                    flags.push(&dst_prefix_flag);
                 }
                 match commit_diff_output(&commit, &flags).await? {
                     Some(output) => {
