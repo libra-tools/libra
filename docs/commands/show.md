@@ -2,6 +2,18 @@
 
 Show a commit, tag, tree, blob, or the blob referenced by `REV:path`.
 
+### `--patience` / `--anchored=<text>`
+
+`--patience` renders the patch with the patience diff algorithm and
+`--anchored=<text>` anchors hunks on lines containing TEXT. Both are forwarded to
+the shared `libra diff` engine, so the patch body matches
+`libra diff --patience` / `--anchored=<text>` for the same commit.
+
+```bash
+libra show --patience HEAD
+libra show --anchored=keep HEAD
+```
+
 ## Synopsis
 
 ```

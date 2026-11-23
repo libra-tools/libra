@@ -71,6 +71,12 @@ pub(crate) const SHOW_PATHSPEC_SEPARATOR_FLAG: &str = "__libra-show-pathspec-sep
 #[derive(Parser, Debug)]
 #[command(after_help = SHOW_EXAMPLES)]
 pub struct ShowArgs {
+    /// Generate patch hunks with the patience diff algorithm
+    #[clap(long = "patience")]
+    pub patience: bool,
+    /// Anchor diff hunks on lines containing TEXT (`--anchored=<text>`)
+    #[clap(long = "anchored", value_name = "TEXT")]
+    pub anchored: Option<String>,
     /// Object name (commit, tag, etc.) or `<object>:<path>`. Defaults to `HEAD`.
     #[clap(value_name = "OBJECT")]
     pub object: Option<String>,
@@ -635,7 +641,7 @@ async fn show_commit(
             if !diffstat.is_empty() {
                 output.push_str(&diffstat);
             }
-            let diff_output = generate_diff(&commit, paths).await?;
+            let diff_output = show_patch(&commit, paths, args).await?;
             if !diff_output.is_empty() {
                 output.push('\n');
                 output.push_str(&diff_output);
@@ -649,7 +655,7 @@ async fn show_commit(
         } else if args.summary {
             // Show only the created/deleted-file summary, parsed out of the
             // commit's unified diff (the same text the patch view renders).
-            let diff_output = generate_diff(&commit, paths).await?;
+            let diff_output = show_patch(&commit, paths, args).await?;
             let summary = format_show_summary(&diff_output);
             if !summary.is_empty() {
                 output.push('\n');
@@ -690,7 +696,7 @@ async fn show_commit(
             }
         } else {
             // Show the full patch.
-            let diff_output = generate_diff(&commit, paths).await?;
+            let diff_output = show_patch(&commit, paths, args).await?;
             if !diff_output.is_empty() {
                 output.push('\n');
                 output.push_str(&diff_output);
@@ -1210,6 +1216,37 @@ fn display_commit_info(
 }
 
 /// Renders a simple diffstat summary.
+/// Render a commit's patch, honouring `--patience`/`--anchored` through the
+/// shared diff engine (path-limited patches keep the log renderer).
+async fn show_patch(
+    commit: &Commit,
+    paths: Vec<PathBuf>,
+    args: &ShowArgs,
+) -> Result<String, CliError> {
+    if (args.patience || args.anchored.is_some()) && paths.is_empty() {
+        if let Some(parent) = commit.parent_commit_ids.first() {
+            let mut argv = vec!["diff".to_string()];
+            if args.patience {
+                argv.push("--patience".to_string());
+            }
+            if let Some(text) = &args.anchored {
+                argv.push(format!("--anchored={text}"));
+            }
+            argv.push(parent.to_string());
+            argv.push(commit.id.to_string());
+            let diff_args = crate::command::diff::DiffArgs::try_parse_from(&argv)
+                .map_err(|error| CliError::command_usage(error.to_string()))?;
+            let output = crate::command::diff::run_diff_for_service(diff_args).await?;
+            let mut patch = crate::command::diff::render::format_unified_diff(&output);
+            if !patch.is_empty() && !patch.ends_with('\n') {
+                patch.push('\n');
+            }
+            return Ok(patch);
+        }
+    }
+    generate_diff(commit, paths).await
+}
+
 async fn show_diffstat(commit: &Commit, paths: Vec<PathBuf>) -> CliResult<String> {
     // ADR-LG-04 item 4: `show --stat` shares the diffstat renderer and counts
     // with `log --stat` / `diff --stat` (bars, path column, and the

@@ -70,3 +70,5 @@ flowchart TD
 - 改进本命令前，必须先阅读并遵循 [docs/development/commands/_general.md](_general.md)；这是命令设计、实现、测试和文档同步的强制要求。
 - 任何行为变更都要先核对实现源码，再同步 `COMPATIBILITY.md`、`docs/commands/<cmd>.md` 和相关测试。
 - 新增 Git 兼容参数时必须明确 tier、错误码、JSON/机器输出契约和回归测试。
+
+- 2026-11-23（LS-23 / #857）：新增 `show --patience`/`--anchored=<text>`，`show_patch` 在置位且无路径过滤时经 clap 构造 `DiffArgs` 调 `run_diff_for_service`，与 `libra diff` 同选项逐字一致。回归：`show_patience_and_anchored_reuse_diff_engine`（AC1/AC2）。

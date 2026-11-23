@@ -2,6 +2,15 @@
 
 显示提交、标签、树、blob，或 `REV:path` 引用的 blob。
 
+### `--patience` / `--anchored=<text>`
+
+`--patience` 用 patience 算法渲染补丁；`--anchored=<text>` 以包含 TEXT 的行为锚点。两者转发到共享 `libra diff` 引擎，补丁主体与同一提交的 `libra diff --patience`/`--anchored=<text>` 一致。
+
+```bash
+libra show --patience HEAD
+libra show --anchored=keep HEAD
+```
+
 ## 概要
 
 ```

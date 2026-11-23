@@ -9541,3 +9541,59 @@ fn log_color_moved_reuses_diff_engine() {
         );
     }
 }
+
+#[test]
+fn show_patience_and_anchored_reuse_diff_engine() {
+    use super::{assert_cli_success, run_libra_command};
+
+    let work = tempfile::tempdir().expect("work dir");
+    let repo = work.path().join("r");
+    std::fs::create_dir_all(&repo).expect("mkdir repo");
+    assert_cli_success(&run_libra_command(&["init"], &repo), "init");
+    run_libra_command(&["config", "set", "user.name", "t"], &repo);
+    run_libra_command(&["config", "set", "user.email", "t@t"], &repo);
+    std::fs::write(repo.join("f.txt"), "aaa\nkeep\nkeep2\nkeep3\n").expect("write base");
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], &repo), "add base");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c1", "--no-verify"], &repo),
+        "commit c1",
+    );
+    std::fs::write(repo.join("f.txt"), "keep\nkeep2\nkeep3\naaa\n").expect("write move");
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], &repo), "add move");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c2", "--no-verify"], &repo),
+        "commit c2",
+    );
+
+    let patch_body = |text: &str| match text.split_once("diff --git ") {
+        Some((_, rest)) => format!("diff --git {rest}"),
+        None => String::new(),
+    };
+    let show_out = |args: &[&str]| {
+        let result = run_libra_command(args, &repo);
+        assert_cli_success(&result, &format!("show {args:?}"));
+        String::from_utf8_lossy(&result.stdout).to_string()
+    };
+    let diff_out = |args: &[&str]| {
+        let result = run_libra_command(args, &repo);
+        assert_cli_success(&result, &format!("diff {args:?}"));
+        String::from_utf8_lossy(&result.stdout).to_string()
+    };
+
+    // AC1: `show --patience` patch body equals `diff --patience`.
+    let shown = show_out(&["show", "--patience"]);
+    let engine = diff_out(&["diff", "--patience", "HEAD~1", "HEAD"]);
+    assert_eq!(
+        patch_body(&shown),
+        patch_body(&engine),
+        "AC1 patience parity"
+    );
+    // AC2: `show --anchored=<text>` patch body equals `diff --anchored=<text>`.
+    let shown = show_out(&["show", "--anchored=keep"]);
+    let engine = diff_out(&["diff", "--anchored=keep", "HEAD~1", "HEAD"]);
+    assert_eq!(
+        patch_body(&shown),
+        patch_body(&engine),
+        "AC2 anchored parity"
+    );
+}

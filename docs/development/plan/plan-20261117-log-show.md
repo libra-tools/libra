@@ -1921,7 +1921,7 @@ PY
 
 ### Task LS-23: `show` 支持 `--patience` 与 `--anchored`（#857）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-23：`ShowArgs` 新增 `--patience` 与 `--anchored=<text>`；新增 `show_patch` —— 置位且无路径过滤时经 clap 构造 `DiffArgs` 调 `run_diff_for_service` 渲染，其余路径沿用 log 生成器。AC1/AC2 由 `command::log_test::show_patience_and_anchored_reuse_diff_engine` 覆盖（patch 主体与 `libra diff --patience` / `--anchored=<text>` 逐字一致）；`show_test` 43/43；EN/zh 文档与 `COMPATIBILITY.md` 同步。
 
 **Description:** 在 `ShowArgs` 新增 `--patience` 与 `--anchored=<text>`，经 `LogDiffOptions`（`ADR-LS-01`）透传至 `src/command/diff.rs` 比较引擎（复用 `diff.rs` 既有 `patience` / `anchored`）。
 
