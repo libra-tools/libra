@@ -1712,7 +1712,7 @@ PY
 
 ### Task LS-30: `log` 透传 `-U` / `--unified=<n>` 控制 hunk 上下文行数（#967；自 LS-21 拆出）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-23：`LogArgs` 新增 `-U<n>`/`--unified=<n>`，置位时 `-p` 经 `commit_diff_output` 以 `-U<n>` 转发到 diff 引擎。AC1–AC3 由 `command::log_test::diff_unified_context_passthrough` 覆盖（`-U1` 与引擎逐字一致且恰一行上下文、`--unified=0` 无上下文、`-Ux` → `LBR-CLI-002`）。`log_test` 283/283；EN/zh/开发文档与 `COMPATIBILITY.md` 同步。
 
 **Description:** 在 `LogArgs` 新增 `-U<n>` / `--unified=<n>`，经 `LogDiffOptions` 复用 `src/command/diff/options.rs:29`（`args.unified`）与 `src/command/diff/compare.rs:405-417` 控制 `log -p` 的 hunk 上下文行数。
 

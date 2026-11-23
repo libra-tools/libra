@@ -334,6 +334,17 @@ section is separated like Git, and each path/status field is NUL-terminated.
 libra log -z --name-status --format=%s
 ```
 
+### `-U<n>` / `--unified=<n>`
+
+`-U<n>` sets how many lines of hunk context `-p` prints (`-U0` shows only the
+changed lines, `-U1` one line on each side). The value is forwarded to the shared
+diff engine; a non-numeric value is `LBR-CLI-002`/129.
+
+```bash
+libra log -p -1 -U1
+libra log -p -1 --unified=0
+```
+
 ### `--full-index`
 
 `--full-index` prints the complete object ids on every `index` header line

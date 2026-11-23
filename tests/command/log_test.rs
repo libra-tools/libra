@@ -9236,3 +9236,78 @@ fn diff_full_index_passthrough() {
         "AC2 index line: {text}"
     );
 }
+
+#[test]
+fn diff_unified_context_passthrough() {
+    use super::{assert_cli_success, run_libra_command};
+
+    // Fixture: c1 adds five lines, c2 appends one.
+    let work = tempfile::tempdir().expect("work dir");
+    let repo = work.path().join("r");
+    std::fs::create_dir_all(&repo).expect("mkdir repo");
+    assert_cli_success(&run_libra_command(&["init"], &repo), "init");
+    run_libra_command(&["config", "set", "user.name", "t"], &repo);
+    run_libra_command(&["config", "set", "user.email", "t@t"], &repo);
+    std::fs::write(repo.join("f.txt"), "1\n2\n3\n4\n5\n").expect("write base");
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], &repo), "add base");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c1", "--no-verify"], &repo),
+        "commit c1",
+    );
+    std::fs::write(repo.join("f.txt"), "1\n2\n3\n4\n5\n6\n").expect("write edit");
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], &repo), "add edit");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c2", "--no-verify"], &repo),
+        "commit c2",
+    );
+
+    let out = |args: &[&str]| {
+        let result = run_libra_command(args, &repo);
+        assert_cli_success(&result, &format!("log {args:?}"));
+        String::from_utf8_lossy(&result.stdout).to_string()
+    };
+    let engine = |args: &[&str]| {
+        let mut argv = vec!["diff"];
+        argv.extend_from_slice(args);
+        let result = run_libra_command(&argv, &repo);
+        assert_cli_success(&result, &format!("diff {argv:?}"));
+        String::from_utf8_lossy(&result.stdout).to_string()
+    };
+    let patch_body = |text: &str| match text.split_once("diff --git ") {
+        Some((_, rest)) => format!("diff --git {rest}"),
+        None => String::new(),
+    };
+
+    // AC1: one line of context matches the engine (and Git's `-U1` fixture).
+    let logged = out(&["log", "-p", "-1", "-U1"]);
+    let engine_u1 = engine(&["-U1", "HEAD~1", "HEAD"]);
+    assert_eq!(patch_body(&logged), patch_body(&engine_u1), "AC1 body");
+    // `-U1` keeps exactly one context line around the appended line.
+    let body = patch_body(&logged);
+    let context_lines = body
+        .lines()
+        .skip_while(|line| !line.starts_with("@@"))
+        .skip(1)
+        .take_while(|line| !line.starts_with("+") && !line.starts_with("-"))
+        .filter(|line| line.starts_with(' '))
+        .count();
+    assert_eq!(context_lines, 1, "AC1 exactly one context line: {body}");
+
+    // AC2: `--unified=0` drops all context.
+    let logged = out(&["log", "-p", "-1", "--unified=0"]);
+    let engine_u0 = engine(&["--unified=0", "HEAD~1", "HEAD"]);
+    assert_eq!(patch_body(&logged), patch_body(&engine_u0), "AC2 body");
+    let body = patch_body(&logged);
+    let has_context = body
+        .lines()
+        .skip_while(|line| !line.starts_with("@@"))
+        .skip(1)
+        .any(|line| line.starts_with(' '));
+    assert!(!has_context, "AC2 no context lines: {body}");
+
+    // AC3: a non-numeric value is a usage error.
+    let bad = run_libra_command(&["log", "-p", "-1", "-Ux"], &repo);
+    assert!(!bad.status.success(), "AC3 must fail");
+    let stderr = String::from_utf8_lossy(&bad.stderr);
+    assert!(stderr.contains("LBR-CLI-002"), "AC3 code: {stderr}");
+}

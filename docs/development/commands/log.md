@@ -156,3 +156,5 @@ flowchart TD
 - 2026-11-23（LS-28 / #967）：新增 `--no-prefix`/`--src-prefix`/`--dst-prefix`（与 `--no-prefix` 互斥），转发到 diff 引擎（`--no-prefix` 以空前缀实现，引擎无同名开关）。回归：`diff_prefix_options_passthrough`（AC1–AC5）。
 
 - 2026-11-23（LS-29 / #967）：新增 `--full-index`，转发到 diff 引擎（`index <old>..<new>` 输出完整 40/64 位 ID）。回归：`diff_full_index_passthrough`（AC1 SHA-1、AC2 SHA-256）。
+
+- 2026-11-23（LS-30 / #967）：新增 `-U<n>`/`--unified=<n>`，转发到 diff 引擎控制 hunk 上下文；非数值 `LBR-CLI-002`。回归：`diff_unified_context_passthrough`（AC1–AC3）。

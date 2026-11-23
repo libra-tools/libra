@@ -320,6 +320,9 @@ pub struct LogArgs {
     #[clap(long = "dirstat-by-file", value_name = "PARAM", num_args = 0..=1, default_missing_value = "", require_equals = true)]
     pub dirstat_by_file: Option<String>,
 
+    /// Show N lines of hunk context (Git's `-U<n>` / `--unified=<n>`)
+    #[clap(short = 'U', long = "unified", value_name = "N")]
+    pub unified: Option<usize>,
     /// Show full object IDs on `index` header lines (Git's `--full-index`)
     #[clap(long = "full-index")]
     pub full_index: bool,
@@ -3659,7 +3662,8 @@ async fn execute_safe_with_diff_formats(
                     block.push_str("\n\n");
                 }
             }
-            let mut patch_output = if args.full_index
+            let mut patch_output = if args.unified.is_some()
+                || args.full_index
                 || args.no_prefix
                 || args.src_prefix.is_some()
                 || args.dst_prefix.is_some()
@@ -3668,6 +3672,11 @@ async fn execute_safe_with_diff_formats(
             {
                 // Re-diff through the shared engine so the whitespace rules apply.
                 let mut flags: Vec<&str> = Vec::new();
+                let unified_flag;
+                if let Some(context) = args.unified {
+                    unified_flag = format!("-U{context}");
+                    flags.push(&unified_flag);
+                }
                 if args.full_index {
                     flags.push("--full-index");
                 }

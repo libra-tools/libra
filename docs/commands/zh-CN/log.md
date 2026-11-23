@@ -249,6 +249,15 @@ Git 规则分隔，每个路径/状态字段均以 NUL 终止。
 libra log -z --name-status --format=%s
 ```
 
+### `-U<n>` / `--unified=<n>`
+
+`-U<n>` 设置 `-p` 的 hunk 上下文行数（`-U0` 只显示变更行，`-U1` 每侧一行）。数值转发到共享 diff 引擎；非数值以 `LBR-CLI-002`/129 拒绝。
+
+```bash
+libra log -p -1 -U1
+libra log -p -1 --unified=0
+```
+
 ### `--full-index`
 
 `--full-index` 在每条 `index` 头行输出完整对象 ID（`index <old>..<new> 100644`）：SHA-1 仓库为 40 位十六进制，SHA-256 仓库为 64 位。该标志转发到共享 diff 引擎。
