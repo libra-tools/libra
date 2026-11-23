@@ -4207,7 +4207,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `done` / `remote-pending`
+**Lifecycle / Acceptance:** `done` / `remote-verified`
 
 **Description:** 100% 在独占目录 `src/storage/**` 内实现 `highwater.rs` 与 `writer.rs` 核心消费循环：严格优先排空 `priority/` 通道（`SessionEnd`）后再批量消费 `normal/` 通道（≤ 128 条 / ≤ 50ms 合并进 1 次 `CaptureStore::append_capture_batch` 写事务）、同事务原子推进库内双通道高水位、语义 `dedup_key` 幂等去重，以及遵循 `writer.lock → capture-queue/append.lock` 锁序（不跨红库写事务持 `append.lock`）复核 `seg == min_live_seg && seg < active_seg && seg < highwater_seg` 后先原子推进 `LTM2` `MIN_LIVE_SEG` 摘除 `sealed[]` 再 `unlink` + `fsync_dir` 回收历史段。
 
@@ -4267,7 +4267,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `remote-pending`
 
 **Description:** 100% 在独占目录 `src/storage/**` 内于 `highwater.rs` 与 `writer.rs` 补齐高水位镜像崩溃恢复、活跃段已确认数据保护与单写者选举：`CaptureStore` 提交后外部 `highwater` 镜像更新前崩溃的零重复恢复，消费者遇活跃段已确认前缀（`offset < committed_len`）损坏、双副本元数据同损或通道元数据倒退落后于库内 `QUEUE_HIGHWATER_*` 均严格 fail-closed 返回 `CorruptCommittedFrame`（`LBR-IO-001`，绝不隔离或推进高水位），以及 `writer.lock` 竞争无副作用退出与 `is_writer_active()` 锁探测。
 
@@ -4283,20 +4283,20 @@
 | 外部 `highwater` 仅作镜像、库内 `QUEUE_HIGHWATER_*` 为权威；消费者在活跃前缀损坏、双副本同损或元数据倒退下均须无条件 fail-closed | `ADR-RB-05` #2、#4 |
 
 **Acceptance criteria:**
-- [ ] 故障注入：事务提交成功、外部 `highwater` 镜像更新前崩溃，重启后从库内 `QUEUE_HIGHWATER_*` 恢复零重复记录。
-- [ ] 故障注入：消费者在活跃段已确认前缀（`offset < committed_len`）检出损坏/截断帧时，立即 fail-closed 返回 `CorruptCommittedFrame`（`LBR-IO-001`），严禁隔离丢弃或推进高水位。
-- [ ] 故障注入：存在 ≥ 1 个段文件且 `tail.meta`/`tail.meta.bak` 双副本同损时，消费者立即 fail-closed 返回 `CorruptCommittedFrame`（`LBR-IO-001`），严禁推进高水位。
-- [ ] 故障注入：目录含 0 个段文件但存在非零已提交边界或损坏元数据时，消费者立即 fail-closed 返回 `CorruptCommittedFrame`（`LBR-IO-001`），严禁推进高水位。
-- [ ] 故障注入：通道 `LTM2` 元数据倒退落后于库内 `QUEUE_HIGHWATER_*` 时，消费者立即 fail-closed 返回 `CorruptCommittedFrame`（`LBR-IO-001`），严禁推进高水位。
-- [ ] 第二个消费者争抢 `writer.lock` 失败立即无副作用返回 `Ok(())`。
-- [ ] `is_writer_active()` 复用同一 `writer.lock` 准确探测当前存在活跃持锁者。
+- [x] 故障注入：事务提交成功、外部 `highwater` 镜像更新前崩溃，重启后从库内 `QUEUE_HIGHWATER_*` 恢复零重复记录。
+- [x] 故障注入：消费者在活跃段已确认前缀（`offset < committed_len`）检出损坏/截断帧时，立即 fail-closed 返回 `CorruptCommittedFrame`（`LBR-IO-001`），严禁隔离丢弃或推进高水位。
+- [x] 故障注入：存在 ≥ 1 个段文件且 `tail.meta`/`tail.meta.bak` 双副本同损时，消费者立即 fail-closed 返回 `CorruptCommittedFrame`（`LBR-IO-001`），严禁推进高水位。
+- [x] 故障注入：目录含 0 个段文件但存在非零已提交边界或损坏元数据时，消费者立即 fail-closed 返回 `CorruptCommittedFrame`（`LBR-IO-001`），严禁推进高水位。
+- [x] 故障注入：通道 `LTM2` 元数据倒退落后于库内 `QUEUE_HIGHWATER_*` 时，消费者立即 fail-closed 返回 `CorruptCommittedFrame`（`LBR-IO-001`），严禁推进高水位。
+- [x] 第二个消费者争抢 `writer.lock` 失败立即无副作用返回 `Ok(())`。
+- [x] `is_writer_active()` 复用同一 `writer.lock` 准确探测当前存在活跃持锁者。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --no-default-features --features storage-redb --lib -E 'test(=storage::queue::writer::tests::crash_after_commit_before_mirror_zero_dup) | test(=storage::queue::writer::tests::consumer_rejects_committed_prefix_dual_meta_loss_and_hw_regression) | test(=storage::queue::writer::tests::single_writer_lock_contention_and_active_probe)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb --lib -E 'test(=storage::queue::writer::tests::crash_after_commit_before_mirror_zero_dup)'`（new，覆盖 AC1）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb --lib -E 'test(=storage::queue::writer::tests::consumer_rejects_committed_prefix_dual_meta_loss_and_hw_regression)'`（new，覆盖 AC2–AC5）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb --lib -E 'test(=storage::queue::writer::tests::single_writer_lock_contention_and_active_probe)'`（new，覆盖 AC6、AC7）
-- [ ] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 4 文件实现白名单。
+- [x] `source .env.test && cargo nextest list --no-default-features --features storage-redb --lib -E 'test(=storage::queue::writer::tests::crash_after_commit_before_mirror_zero_dup) | test(=storage::queue::writer::tests::consumer_rejects_committed_prefix_dual_meta_loss_and_hw_regression) | test(=storage::queue::writer::tests::single_writer_lock_contention_and_active_probe)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb --lib -E 'test(=storage::queue::writer::tests::crash_after_commit_before_mirror_zero_dup)'`（new，覆盖 AC1）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb --lib -E 'test(=storage::queue::writer::tests::consumer_rejects_committed_prefix_dual_meta_loss_and_hw_regression)'`（new，覆盖 AC2–AC5）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb --lib -E 'test(=storage::queue::writer::tests::single_writer_lock_contention_and_active_probe)'`（new，覆盖 AC6、AC7）
+- [x] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 4 文件实现白名单。
 
 **Full-suite trigger:** `none`
 
@@ -10071,8 +10071,9 @@
 | `RB-08e` | `done` / `remote-verified` | `435b600`（`main`） | `0.30.366` | 2026-11-23 16:14 UTC：Stage 1 精确 3 文件写集内仅改动 `src/storage/queue/segment.rs`，实证 `ADR-RB-05` #3 情况 0 四分法（Unix/Windows 双路径对齐）：`--no-default-features --features storage-redb` `VER1` 2/2、`VER2`（`virgin_and_prebootstrapped_zero_segment_lane_init` 覆盖 AC1/AC2：情况 0a 真正全新空通道在 `recover_lane`、观测直接追加与 Step ② `max_total_bytes = 1` 预建段拒收边界实证先原子落盘 34B `0600` `LTM2` `(0,0,0,0,[])` 双副本+`fsync_dir` 再建 `events-00000000.log`；情况 0b 已预建空通道含主/副双方向 × 4 损态 Subcase B1 单副本修复，实证修复严格先于 `CreateSegment(0)` 且零重写幸存副本）、`VER3`（`zero_segment_with_committed_or_corrupt_meta_fails_closed` 覆盖 AC3–AC6：情况 0c 删除唯一活跃段/多轮转段/`active_seg > 0` 零长度/非零 `prefix_crc32c` 含单副本与缺 `append.lock`，以及情况 0d 主/副/双损跨 bad-CRC/截断/0B/超长/坏魔数/等序分叉，在 `append_frame`/`recover_lane` 均返 `CorruptCommittedFrame` `LBR-IO-001` 且通道/`quarantine/`/根树全字节快照零改动）、`segment.rs` 25/25 快速回归、三构型矩阵与 `src/storage/` 全零告警 Clippy、`compat_version_surface_sync` 全绿；Codex R1 首轮 `VERDICT: PASS`（P0=0、P1=0、P2=0）；已推 `origin/main` |
 | `RB-08h` | `done` / `remote-verified` | `9dac263`（`main`） | `0.30.367` | 2026-11-23 16:39 UTC：Stage 1 精确 3 文件写集内仅改动 `src/storage/queue/segment.rs`，实证非空通道 Subcase B2 双副本同损无条件 fail-closed 与整树零改动守卫（Unix/Windows 双路径对齐）：`--no-default-features --features storage-redb` `VER1` 2/2、`VER2`（`dual_metadata_loss_complete_frame_boundary_and_zero_byte_active_fails_closed` 覆盖 AC1–AC4：完整帧 `CleanEof` 截短、未改动洁净段对照及 0B 活跃段截短各跑全 7 态双损矩阵含缺 `append.lock`/CRC 损/主副混合/截断/超长）、`VER3`（`dual_metadata_loss_max_and_older_segment_corrupt_or_truncated_fails_closed` 覆盖 AC5–AC8：单/多段 `max_seg` 位翻转/半帧截断及多段较旧段 `< max_seg` 位翻转/半帧/0B/`CleanEof` 截短而 `max_seg` 100% 洁净，各跑全 5 态双损矩阵），全部夹具在 `append_frame` 与 `recover_lane` 双路径均无条件返 `CorruptCommittedFrame` `LBR-IO-001` 且通道/`quarantine/`/队列根树全文件全权限逐字节快照零改动（预置 `tail.meta*.tmp` 与 `quarantine/{normal,priority}-orphan.tmp` 全原样保留）、`segment.rs` 27/27 快速回归、三构型矩阵与 `src/storage/` 全零告警 Clippy、`compat_version_surface_sync` 全绿；Codex R1（洁净对照接全矩阵）与 R2（无条件 `queue_root` 快照对比）两项测试覆盖 P1 全闭环，R3 获 `VERDICT: PASS`（P0=0、P1=0、P2=0）；已推 `origin/main` |
 | `RB-08x` | `done` / `remote-verified` | `86b47f5`（`main`） | `0.30.368` | 2026-11-23 17:13 UTC：Stage 1 精确 3 文件写集内仅改动 `src/storage/queue/segment.rs`，将 Phase 2 通道限定临时文件清理收口为持锁统一例程 `clean_lane_temp_files_unix`/`clean_lane_temp_files_windows`（覆盖 append/recover/reclaim 全部入口、`Phase2ConvergedState` 追踪 `cleaned_quarantine_tmp_files`），放开 `is_lane_quarantine_temp_name` 零字符通配（`<lane>-.tmp`）并新增跨平台 UTF-16/WTF-16 前后缀匹配器 `wide_is_lane_meta_temp_name`/`wide_is_lane_quarantine_temp_name`（Windows 全程保留原始 `OsString` 消除孤立代理项静默漏清）；`--no-default-features --features storage-redb` `VER1` 1/1、`VER2`（`cross_lane_quarantine_tmp_cleanup_scoped_to_classified_lane_only` 覆盖 AC1–AC8：正反双方向健康通道入队与 `recover_lane` 以独立原字节目录扫描验证清空本通道 `tail.meta*.tmp` 与 `quarantine/<lane>-*.tmp` 含 `<lane>-.tmp`，原样逐字节保留损坏异通道目录/`tail.meta.tmp`/`quarantine/<other>-*.tmp`/持久 `.bin`/无关文件；含跨平台 UTF-16 `0xD800`/`0xDC00` 孤立代理项单测与 `#[cfg(windows)]` `OsString::from_wide` 通道+隔离双路径集成断言）、`segment.rs` 29/29 快速回归、三构型矩阵与 `src/storage/` 全零告警 Clippy、`compat_version_surface_sync` 全绿；Codex R1 两项生产代码 P1 均已闭环并经 R2 确认（R2 仅追加 macOS 宿主不可执行的 `#[cfg(windows)]` 通道 `tail.meta*.tmp` 孤立代理项测试，已落地补齐并重跑 `VER2` 绿灯，依用户授权跳过 R3 继续推进）；已推 `origin/main` |
-| `RB-09` | `done` / `remote-pending` | 本提交（`main`） | `0.30.369` | 2026-11-23 18:17 UTC：Stage 1 精确 4 文件写集（`src/storage/mod.rs`、`src/storage/queue/{mod,highwater,writer}.rs`），新增 `HWM1` 34B CRC32C 双通道高水位镜像模块 `highwater.rs`（库内 `QUEUE_HIGHWATER_{PRIORITY,NORMAL}` 唯一权威；Unix `private_fd` 锚定 `openat(O_NOFOLLOW)` + `0600` + `fsync_dir`；Windows 无 `FILE_SHARE_DELETE` 目录钉扎 + `GetFileInformationByHandle` 句柄重解析校验 + `MoveFileExW(MOVEFILE_WRITE_THROUGH)` + 严格传播 `FlushFileBuffers` 错误）与单写入者双通道优先排空批量消费者 `writer.rs`（`writer.lock → append.lock` 全局无死锁锁序且绝不跨红库写事务持 `append.lock`；`normal/` 50ms 抵达帧合批窗口 + 活跃段与已轮转封存段提交前 `priority/` 即时抢占；`LTM2.sealed[]` 长度与 CRC32C 认证及 `LTM2` 先行推进 `MIN_LIVE_SEG` 再 `unlink`+`fsync_dir` 即时回收）；`--no-default-features --features storage-redb,storage-queue` `VER1` 2/2、`VER2`（`priority_lane_drains_before_normal_with_contiguous_highwater` 5.418s 覆盖 AC1/AC2）、`VER3`（`batch_128_single_tx_dedup_and_segment_gc` 4.722s 覆盖 AC3 预装 128 帧 + 确定性模拟时钟 50ms 窗口抵达 1+127 帧单写事务与 `priority/` 抢占、AC4 完整语义 `dedup_key` 幂等、AC5 轮转段优先抢占与先 `LTM2` 后 `unlink` 回收）、四构型编译与 `src/storage/` 全零告警 Clippy、`compat_version_surface_sync` 全绿；Codex R1（3×P1+1×P2）、R2（2×P1+1×P2）、R3（2×P1）全部生产代码缺陷均已彻底闭环并经 R4 确认零生产缺陷（R4 仅剩 2 条测试项：`RB-09h` 零帧边界抢占与即刻回收边界顺序，依用户授权推进后续卡） |
-| `RB-09b`..`RB-34c`（剩余 94 卡） | `pending` | — | — | Phase 2 消费者核心 `RB-09` 已落盘，进入 `RB-09b`（高水位镜像恢复、活跃前缀/双损/高水位倒退拒收与单写者锁探测） |
+| `RB-09` | `done` / `remote-verified` | `4c18db7`（`main`） | `0.30.369` | 2026-11-23 18:17 UTC：Stage 1 精确 4 文件写集（`src/storage/mod.rs`、`src/storage/queue/{mod,highwater,writer}.rs`），新增 `HWM1` 34B CRC32C 双通道高水位镜像模块 `highwater.rs`（库内 `QUEUE_HIGHWATER_{PRIORITY,NORMAL}` 唯一权威；Unix `private_fd` 锚定 `openat(O_NOFOLLOW)` + `0600` + `fsync_dir`；Windows 无 `FILE_SHARE_DELETE` 目录钉扎 + `GetFileInformationByHandle` 句柄重解析校验 + `MoveFileExW(MOVEFILE_WRITE_THROUGH)` + 严格传播 `FlushFileBuffers` 错误）与单写入者双通道优先排空批量消费者 `writer.rs`（`writer.lock → append.lock` 全局无死锁锁序且绝不跨红库写事务持 `append.lock`；`normal/` 50ms 抵达帧合批窗口 + 活跃段与已轮转封存段提交前 `priority/` 即时抢占；`LTM2.sealed[]` 长度与 CRC32C 认证及 `LTM2` 先行推进 `MIN_LIVE_SEG` 再 `unlink`+`fsync_dir` 即时回收）；`--no-default-features --features storage-redb,storage-queue` `VER1` 2/2、`VER2`（`priority_lane_drains_before_normal_with_contiguous_highwater` 5.418s 覆盖 AC1/AC2）、`VER3`（`batch_128_single_tx_dedup_and_segment_gc` 4.722s 覆盖 AC3 预装 128 帧 + 确定性模拟时钟 50ms 窗口抵达 1+127 帧单写事务与 `priority/` 抢占、AC4 完整语义 `dedup_key` 幂等、AC5 轮转段优先抢占与先 `LTM2` 后 `unlink` 回收）、四构型编译与 `src/storage/` 全零告警 Clippy、`compat_version_surface_sync` 全绿；Codex R1（3×P1+1×P2）、R2（2×P1+1×P2）、R3（2×P1）全部生产代码缺陷均已彻底闭环并经 R4 确认零生产缺陷（R4 仅剩 2 条测试项：`RB-09h` 零帧边界抢占与即刻回收边界顺序，依用户授权推进后续卡）；已推 `origin/main` |
+| `RB-09b` | `done` / `remote-pending` | 本提交（`main`） | `0.30.370` | 2026-11-23 18:43 UTC：Stage 1 精确 4 文件写集内仅改动 `src/storage/queue/writer.rs`，补齐双通道只读先验校验 `preflight_validate_lane`（在任一通道执行 DB 写事务或镜像写入前先对双通道元数据/高水位单调性/全量未消费封存段与活跃已确认前缀完成零写校验）、全前缀结构校验 `verify_committed_frame_structure`（覆盖超 128 批上限与 `< hw` 已消费段内帧边界与 postcard 封装）、收敛后镜像自愈及 Windows 缺席根目录 `is_writer_active_windows` 对称返回 `Ok(false)`；`--no-default-features --features storage-redb` `VER1` 3/3、`VER2`（`crash_after_commit_before_mirror_zero_dup` 9.208s 覆盖 AC1 双通道 × 4 镜像故障态 `Absent`/`StaleBehind`/`Corrupt`/`StaleAhead` × 0新帧/新帧重启 2×4×2 矩阵零重复与镜像自愈）、`VER3`（`consumer_rejects_committed_prefix_dual_meta_loss_and_hw_regression` 9.121s 覆盖 AC2–AC5 含超 128 帧尾损、`< hw` 帧损、跨通道先验原子拒收、6 态双损、8 态 0 段 Case 0c/0d、5 态 `LTM2` 倒退，全部返回 `CorruptCommittedFrame` `LBR-IO-001`、零 DB 写事务且含 `writer.lock` 的整树全字节快照零改动）、`VER4`（`single_writer_lock_contention_and_active_probe` 0.552s 覆盖 AC6/AC7 跨线程 `writer.lock` 竞争零副作用返回 `Ok` 与 `is_writer_active()` 缺席不建文件/持锁/释放准确探测）、`writer::tests` 5/5 回归、四构型矩阵与 `src/storage/` 全零告警 Clippy、`compat_version_surface_sync` 全绿；Codex R1 四项有效发现全闭环，R2 获 `VERDICT: PASS`（P0=0、P1=0、P2=0） |
+| `RB-09d`..`RB-34c`（剩余 93 卡） | `pending` | — | — | Phase 2 消费者镜像恢复与 fail-closed 守卫 `RB-09b` 已落盘，进入 `RB-09d`（未回收轮转段 `LTM2.sealed[]` 认证边界校验与崩溃安全回收序） |
 
 ## Codex review log
 
