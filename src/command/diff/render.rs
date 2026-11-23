@@ -364,7 +364,9 @@ pub(super) fn render_diff_output(
             ColorChoice::Never => false,
             ColorChoice::Auto => io::stdout().is_terminal(),
         };
-        maybe_colorize_diff(&rendered, should_colorize, color_moved)
+        let moved_ws = crate::command::diff::options::parse_color_moved_ws(&args.color_moved_ws)
+            .unwrap_or_default();
+        maybe_colorize_diff(&rendered, should_colorize, color_moved, moved_ws)
     };
     // `-z` records carry their own NUL terminators, and external-driver output is
     // emitted byte-for-byte, so neither gets an appended trailing newline.
@@ -619,9 +621,10 @@ pub(super) fn maybe_colorize_diff(
     diff_text: &str,
     should_colorize: bool,
     color_moved: bool,
+    moved_ws: super::options::ColorMovedWs,
 ) -> String {
     if should_colorize {
-        colorize_diff(diff_text, color_moved)
+        colorize_diff(diff_text, color_moved, moved_ws)
     } else {
         diff_text.to_string()
     }
@@ -785,12 +788,31 @@ pub(super) fn compact_summary_label(file: &DiffFileStat) -> Option<String> {
     }
 }
 
-pub(super) fn colorize_diff(diff_text: &str, color_moved: bool) -> String {
+/// Normalize a line body for moved-line matching under `--color-moved-ws`.
+fn normalize_moved_body(body: &str, ws: super::options::ColorMovedWs) -> String {
+    let mut text = body.to_string();
+    if ws.at_eol {
+        text = text.trim_end().to_string();
+    }
+    if ws.space_change {
+        text = crate::command::diff::normalize_ignore_space_change(&text);
+    }
+    if ws.all_space {
+        text = crate::command::diff::normalize_ignore_all_space(&text);
+    }
+    text
+}
+
+pub(super) fn colorize_diff(
+    diff_text: &str,
+    color_moved: bool,
+    moved_ws: super::options::ColorMovedWs,
+) -> String {
     let mut output = String::with_capacity(diff_text.len() + 500);
     // For `--color-moved`, precompute which line bodies are moved (appear as both
     // a removed and an added line). Moved lines get a distinct color.
-    let moved = if color_moved {
-        moved_line_bodies(diff_text)
+    let moved: std::collections::HashSet<String> = if color_moved {
+        super::moved_line_bodies(diff_text, moved_ws)
     } else {
         std::collections::HashSet::new()
     };
@@ -808,14 +830,14 @@ pub(super) fn colorize_diff(diff_text: &str, color_moved: bool) -> String {
             line.cyan().to_string()
         } else if in_hunk && line.starts_with('-') {
             // A moved removed line → bold magenta (Git's `oldMoved`); else red.
-            if color_moved && moved.contains(&line[1..]) {
+            if color_moved && moved.contains(&normalize_moved_body(&line[1..], moved_ws)) {
                 line.magenta().bold().to_string()
             } else {
                 line.red().to_string()
             }
         } else if in_hunk && line.starts_with('+') {
             // A moved added line → bold cyan (Git's `newMoved`); else green.
-            if color_moved && moved.contains(&line[1..]) {
+            if color_moved && moved.contains(&normalize_moved_body(&line[1..], moved_ws)) {
                 line.cyan().bold().to_string()
             } else {
                 line.green().to_string()

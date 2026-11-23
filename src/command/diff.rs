@@ -5465,9 +5465,25 @@ pub(crate) async fn staged_diff_text() -> Result<String, DiffError> {
 /// as BOTH a removed (`-`) and an added (`+`) line somewhere in the patch is
 /// "moved". (Git's `plain` semantics — Libra approximates the block modes with
 /// this.) File-header lines (`---`/`+++`) are excluded.
-fn moved_line_bodies(diff_text: &str) -> std::collections::HashSet<&str> {
-    let mut removed: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    let mut added: std::collections::HashSet<&str> = std::collections::HashSet::new();
+fn moved_line_bodies(
+    diff_text: &str,
+    ws: options::ColorMovedWs,
+) -> std::collections::HashSet<String> {
+    let normalize = |body: &str| -> String {
+        let mut text = body.to_string();
+        if ws.at_eol {
+            text = text.trim_end().to_string();
+        }
+        if ws.space_change {
+            text = normalize_ignore_space_change(&text);
+        }
+        if ws.all_space {
+            text = normalize_ignore_all_space(&text);
+        }
+        text
+    };
+    let mut removed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut added: std::collections::HashSet<String> = std::collections::HashSet::new();
     // Only `-`/`+` lines INSIDE a hunk are real removals/additions. Tracking hunk
     // state avoids mistaking a body line like `---foo` (a removed `--foo`) for the
     // `--- a/<path>` file header, which precedes the first `@@`.
@@ -5479,13 +5495,13 @@ fn moved_line_bodies(diff_text: &str) -> std::collections::HashSet<&str> {
             in_hunk = true;
         } else if in_hunk {
             if let Some(body) = line.strip_prefix('-') {
-                removed.insert(body);
+                removed.insert(normalize(body));
             } else if let Some(body) = line.strip_prefix('+') {
-                added.insert(body);
+                added.insert(normalize(body));
             }
         }
     }
-    removed.intersection(&added).copied().collect()
+    removed.intersection(&added).cloned().collect()
 }
 
 /// Render `--shortstat`: just the trailing summary line of `--stat`, omitting
@@ -6698,13 +6714,75 @@ mod test {
 
     #[test]
     #[serial(cwd, env)]
+    #[test]
+    fn test_moved_line_bodies_whitespace_modes() {
+        use self::options::ColorMovedWs;
+        let wrap = |removed: &str, added: &str| {
+            format!("diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-{removed}\n+{added}\n")
+        };
+        // Veol: only trailing whitespace differs.
+        let veol = wrap("moved line", "moved line   ");
+        assert!(
+            moved_line_bodies(&veol, ColorMovedWs::default()).is_empty(),
+            "no mode must not match trailing whitespace"
+        );
+        assert!(
+            !moved_line_bodies(
+                &veol,
+                ColorMovedWs {
+                    at_eol: true,
+                    ..Default::default()
+                },
+            )
+            .is_empty(),
+            "ignore-space-at-eol matches trailing whitespace"
+        );
+        // Vchg: only the amount of whitespace differs.
+        let vchg = wrap("moved  line", "moved line");
+        assert!(
+            !moved_line_bodies(
+                &vchg,
+                ColorMovedWs {
+                    space_change: true,
+                    ..Default::default()
+                },
+            )
+            .is_empty(),
+            "ignore-space-change collapses runs"
+        );
+        // Vall: leading indentation differs too.
+        let vall = wrap("moved line", "  moved   line");
+        assert!(
+            moved_line_bodies(
+                &vall,
+                ColorMovedWs {
+                    space_change: true,
+                    ..Default::default()
+                },
+            )
+            .is_empty(),
+            "ignore-space-change keeps indentation"
+        );
+        assert!(
+            !moved_line_bodies(
+                &vall,
+                ColorMovedWs {
+                    all_space: true,
+                    ..Default::default()
+                },
+            )
+            .is_empty(),
+            "ignore-all-space ignores indentation"
+        );
+    }
+
     fn test_maybe_colorize_diff_respects_flag() {
         let diff = "diff --git a/file.txt b/file.txt\n--- /dev/null\n+++ b/file.txt\n+line\n";
         let _guard = ColorOverrideReset;
         colored::control::set_override(true);
 
-        let plain = maybe_colorize_diff(diff, false, false);
-        let colored = maybe_colorize_diff(diff, true, false);
+        let plain = maybe_colorize_diff(diff, false, false, options::ColorMovedWs::default());
+        let colored = maybe_colorize_diff(diff, true, false, options::ColorMovedWs::default());
 
         assert!(
             !plain.contains("\u{1b}["),
@@ -6724,8 +6802,8 @@ mod test {
         // `keepA` is removed in one place and added in another → moved.
         let diff =
             "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1,3 +1,3 @@\n+keepA\n block\n-keepA\n";
-        let with_moved = colorize_diff(diff, true);
-        let without = colorize_diff(diff, false);
+        let with_moved = colorize_diff(diff, true, options::ColorMovedWs::default());
+        let without = colorize_diff(diff, false, options::ColorMovedWs::default());
         // Without --color-moved, the moved lines use the normal red/green (31/32).
         assert!(without.contains("\u{1b}[32m") && without.contains("\u{1b}[31m"));
         // With it, the moved added line is bold cyan (1;36) and removed bold
