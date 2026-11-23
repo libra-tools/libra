@@ -20418,4 +20418,679 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn dual_metadata_loss_complete_frame_boundary_and_zero_byte_active_fails_closed() {
+        // `RB-08h` AC1–AC4 (`ADR-RB-05` #3 non-empty Subcase B2):
+        // Whenever >= 1 `events-*.log` exists and BOTH `tail.meta` and
+        // `tail.meta.bak` are missing or corrupt, Phase 1 MUST unconditionally
+        // fail closed with `CorruptCommittedFrame` (`LBR-IO-001`) and ZERO disk
+        // mutation (no metadata rebuild, no truncation, no segment deletion, no
+        // `.tmp` deletion in lane or `quarantine/`, no `append.lock` creation).
+        // - AC1 & AC2: multi-frame active segment truncated to an exact prior
+        //   complete-frame boundary (still 100% `CleanEof`!) + dual loss.
+        // - AC3 & AC4: existing active segment truncated to 0 bytes + dual loss.
+
+        #[derive(Clone, Copy)]
+        enum DualLossMode {
+            BothDeleted,
+            BothCorruptCrc,
+            PrimaryDeletedBackupCorrupt,
+            PrimaryCorruptBackupDeleted,
+            BothTruncatedGarbage,
+            BothOversized,
+        }
+
+        let apply_dual_loss = |lane_dir: &Path, mode: DualLossMode| {
+            let p = tail_meta_path(lane_dir);
+            let b = tail_meta_bak_path(lane_dir);
+            let corrupt_crc = |path: &Path| {
+                let mut raw = fs::read(path).expect("read meta");
+                let last = raw.len() - 1;
+                raw[last] ^= 0xA5;
+                write_bytes_0600(path, &raw);
+            };
+            match mode {
+                DualLossMode::BothDeleted => {
+                    fs::remove_file(&p).expect("remove tail.meta");
+                    fs::remove_file(&b).expect("remove tail.meta.bak");
+                }
+                DualLossMode::BothCorruptCrc => {
+                    corrupt_crc(&p);
+                    corrupt_crc(&b);
+                }
+                DualLossMode::PrimaryDeletedBackupCorrupt => {
+                    fs::remove_file(&p).expect("remove tail.meta");
+                    corrupt_crc(&b);
+                }
+                DualLossMode::PrimaryCorruptBackupDeleted => {
+                    corrupt_crc(&p);
+                    fs::remove_file(&b).expect("remove tail.meta.bak");
+                }
+                DualLossMode::BothTruncatedGarbage => {
+                    write_bytes_0600(&p, b"LTM2-trunc-p");
+                    write_bytes_0600(&b, b"LTM2-trunc-b");
+                }
+                DualLossMode::BothOversized => {
+                    let big = vec![0x77u8; LTM2_MAX_LEN + 32];
+                    write_bytes_0600(&p, &big);
+                    write_bytes_0600(&b, &big);
+                }
+            }
+        };
+
+        let verify_subcase_b2_rejected =
+            |label: &str,
+             repo_path: &Path,
+             queue_root: &Path,
+             normal_dir: &Path,
+             quarantine_dir: &Path,
+             drop_lock: bool| {
+                write_bytes_0600(
+                    &normal_dir.join(QUEUE_TAIL_META_TMP_FILE),
+                    b"rb08h-planted-meta-tmp",
+                );
+                write_bytes_0600(
+                    &normal_dir.join(QUEUE_TAIL_META_BAK_TMP_FILE),
+                    b"rb08h-planted-meta-bak-tmp",
+                );
+                write_bytes_0600(
+                    &quarantine_dir.join("normal-orphan.tmp"),
+                    b"rb08h-planted-normal-q-tmp",
+                );
+                write_bytes_0600(
+                    &quarantine_dir.join("priority-orphan.tmp"),
+                    b"rb08h-planted-priority-q-tmp",
+                );
+                if drop_lock {
+                    fs::remove_file(queue_root.join(QUEUE_APPEND_LOCK_FILE))
+                        .expect("remove append.lock");
+                }
+
+                let lane_before = snapshot_tree(normal_dir);
+                let q_before = snapshot_tree(quarantine_dir);
+                let root_before = snapshot_tree(queue_root);
+
+                let app_err = append_frame(
+                    repo_path,
+                    CaptureQueueLane::Normal,
+                    FRAME_FLAG_NONE,
+                    "rb08h-incoming-must-reject",
+                    b"must-not-write",
+                )
+                .expect_err("RB-08h: Subcase B2 append_frame must fail closed");
+                assert!(
+                    matches!(app_err, StorageBackendError::CorruptCommittedFrame { .. }),
+                    "{label}: expected CorruptCommittedFrame on append_frame, got {app_err:?}"
+                );
+                assert_eq!(app_err.stable_code_str(), "LBR-IO-001");
+                assert_eq!(
+                    snapshot_tree(normal_dir),
+                    lane_before,
+                    "{label}: lane directory mutated on append_frame rejection"
+                );
+                assert_eq!(
+                    snapshot_tree(quarantine_dir),
+                    q_before,
+                    "{label}: quarantine/ mutated on append_frame rejection"
+                );
+                assert_eq!(
+                    snapshot_tree(queue_root),
+                    root_before,
+                    "{label}: queue root mutated on append_frame rejection"
+                );
+
+                let rec_err = recover_lane(repo_path, CaptureQueueLane::Normal)
+                    .expect_err("RB-08h: Subcase B2 recover_lane must fail closed");
+                assert!(
+                    matches!(rec_err, StorageBackendError::CorruptCommittedFrame { .. }),
+                    "{label}: expected CorruptCommittedFrame on recover_lane, got {rec_err:?}"
+                );
+                assert_eq!(rec_err.stable_code_str(), "LBR-IO-001");
+                assert_eq!(
+                    snapshot_tree(normal_dir),
+                    lane_before,
+                    "{label}: lane directory mutated on recover_lane rejection"
+                );
+                assert_eq!(
+                    snapshot_tree(quarantine_dir),
+                    q_before,
+                    "{label}: quarantine/ mutated on recover_lane rejection"
+                );
+                assert_eq!(
+                    snapshot_tree(queue_root),
+                    root_before,
+                    "{label}: queue root mutated on recover_lane rejection"
+                );
+            };
+
+        let dual_modes = [
+            ("both-deleted", DualLossMode::BothDeleted, false),
+            ("both-deleted-no-lock", DualLossMode::BothDeleted, true),
+            ("both-corrupt-crc", DualLossMode::BothCorruptCrc, false),
+            (
+                "primary-deleted-backup-corrupt",
+                DualLossMode::PrimaryDeletedBackupCorrupt,
+                false,
+            ),
+            (
+                "primary-corrupt-backup-deleted",
+                DualLossMode::PrimaryCorruptBackupDeleted,
+                false,
+            ),
+            (
+                "both-truncated-garbage",
+                DualLossMode::BothTruncatedGarbage,
+                false,
+            ),
+            ("both-oversized", DualLossMode::BothOversized, false),
+        ];
+
+        // =====================================================================
+        // Part 1 — AC1 & AC2: Complete-frame boundary truncation (`CleanEof`)
+        // + dual metadata loss -> unconditional `LBR-IO-001` & zero mutation.
+        // =====================================================================
+        for (mode_label, mode, drop_lock) in dual_modes {
+            let label = format!("b2-clean-eof-trunc-{mode_label}");
+            let repo = tempdir().expect("tempdir");
+            let init = init_capture_queue(repo.path()).expect("init capture queue");
+            let normal_dir = &init.paths.normal;
+
+            let f1 = append_frame(
+                repo.path(),
+                CaptureQueueLane::Normal,
+                FRAME_FLAG_NONE,
+                "rb08h-clean-1",
+                b"frame-1-survives-clean-eof-trunc",
+            )
+            .unwrap();
+            let _f2 = append_frame(
+                repo.path(),
+                CaptureQueueLane::Normal,
+                FRAME_FLAG_NONE,
+                "rb08h-clean-2",
+                b"frame-2-silently-dropped-by-trunc",
+            )
+            .unwrap();
+            let _f3 = append_frame(
+                repo.path(),
+                CaptureQueueLane::Normal,
+                FRAME_FLAG_NONE,
+                "rb08h-clean-3",
+                b"frame-3-silently-dropped-by-trunc",
+            )
+            .unwrap();
+
+            // Truncate active segment to exact complete-frame boundary after f1.
+            let seg0_path = normal_dir.join(segment_log_file_name(0));
+            {
+                let f = fs::OpenOptions::new().write(true).open(&seg0_path).unwrap();
+                f.set_len(f1.meta.committed_len).unwrap();
+                f.sync_data().unwrap();
+            }
+
+            // Confirm truncated segment is genuinely 100% `CleanEof` if decoded alone.
+            {
+                let mut f = File::open(&seg0_path).unwrap();
+                let mut dec = FrameStreamDecoder::new(&mut f, f1.meta.committed_len);
+                let item1 = dec.next_frame().expect("decode f1");
+                assert!(matches!(item1, FrameStreamItem::Frame { .. }));
+                let item2 = dec.next_frame().expect("decode eof");
+                assert!(matches!(item2, FrameStreamItem::CleanEof { .. }));
+            }
+
+            apply_dual_loss(normal_dir, mode);
+            verify_subcase_b2_rejected(
+                &label,
+                repo.path(),
+                &init.paths.root,
+                normal_dir,
+                &init.paths.quarantine,
+                drop_lock,
+            );
+        }
+
+        // Also confirm untouched clean segment + full dual-loss matrix fails
+        // closed unconditionally across all 7 dual-loss / no-lock variants.
+        for (mode_label, mode, drop_lock) in dual_modes {
+            let label = format!("b2-untouched-clean-{mode_label}");
+            let repo = tempdir().expect("tempdir");
+            let init = init_capture_queue(repo.path()).expect("init capture queue");
+            let normal_dir = &init.paths.normal;
+            let _ = append_frame(
+                repo.path(),
+                CaptureQueueLane::Normal,
+                FRAME_FLAG_NONE,
+                "rb08h-untouched-clean",
+                b"clean-segment-dual-loss",
+            )
+            .unwrap();
+            apply_dual_loss(normal_dir, mode);
+            verify_subcase_b2_rejected(
+                &label,
+                repo.path(),
+                &init.paths.root,
+                normal_dir,
+                &init.paths.quarantine,
+                drop_lock,
+            );
+        }
+
+        // =====================================================================
+        // Part 2 — AC3 & AC4: Active segment truncated to 0 bytes + dual loss
+        // -> unconditional `LBR-IO-001` & exact zero-mutation snapshot.
+        // =====================================================================
+        for (mode_label, mode, drop_lock) in dual_modes {
+            let label = format!("b2-zero-byte-active-{mode_label}");
+            let repo = tempdir().expect("tempdir");
+            let init = init_capture_queue(repo.path()).expect("init capture queue");
+            let normal_dir = &init.paths.normal;
+
+            let _f1 = append_frame(
+                repo.path(),
+                CaptureQueueLane::Normal,
+                FRAME_FLAG_NONE,
+                "rb08h-zero-1",
+                b"erased-to-zero-bytes",
+            )
+            .unwrap();
+
+            let seg0_path = normal_dir.join(segment_log_file_name(0));
+            {
+                let f = fs::OpenOptions::new().write(true).open(&seg0_path).unwrap();
+                f.set_len(0).unwrap();
+                f.sync_data().unwrap();
+            }
+            assert_eq!(fs::metadata(&seg0_path).unwrap().len(), 0);
+
+            apply_dual_loss(normal_dir, mode);
+            verify_subcase_b2_rejected(
+                &label,
+                repo.path(),
+                &init.paths.root,
+                normal_dir,
+                &init.paths.quarantine,
+                drop_lock,
+            );
+        }
+    }
+
+    #[test]
+    fn dual_metadata_loss_max_and_older_segment_corrupt_or_truncated_fails_closed() {
+        // `RB-08h` AC5–AC8 (`ADR-RB-05` #3 non-empty Subcase B2):
+        // - AC5 & AC6: dual metadata loss + `max_seg` bitflip or trailing
+        //   half-frame truncation (both single-segment `max_seg = 0` and
+        //   multi-segment `max_seg = 1`) -> `CorruptCommittedFrame`
+        //   (`LBR-IO-001`) + exact whole-lane & `quarantine/` zero mutation.
+        // - AC7 & AC8: multi-segment rotated lane where older segment
+        //   (`seg = 0 < max_seg = 1`) is bitflipped, half-frame truncated,
+        //   0-byte truncated, or CleanEof-truncated while `max_seg = 1` is
+        //   100% clean + dual metadata loss -> `CorruptCommittedFrame`
+        //   (`LBR-IO-001`) + exact whole-lane & `quarantine/` zero mutation.
+
+        #[derive(Clone, Copy)]
+        enum DualLossMode {
+            BothDeleted,
+            BothCorruptCrc,
+            PrimaryDeletedBackupCorrupt,
+            PrimaryCorruptBackupDeleted,
+        }
+
+        let apply_dual_loss = |lane_dir: &Path, mode: DualLossMode| {
+            let p = tail_meta_path(lane_dir);
+            let b = tail_meta_bak_path(lane_dir);
+            let corrupt_crc = |path: &Path| {
+                let mut raw = fs::read(path).expect("read meta");
+                let last = raw.len() - 1;
+                raw[last] ^= 0x3C;
+                write_bytes_0600(path, &raw);
+            };
+            match mode {
+                DualLossMode::BothDeleted => {
+                    fs::remove_file(&p).expect("remove tail.meta");
+                    fs::remove_file(&b).expect("remove tail.meta.bak");
+                }
+                DualLossMode::BothCorruptCrc => {
+                    corrupt_crc(&p);
+                    corrupt_crc(&b);
+                }
+                DualLossMode::PrimaryDeletedBackupCorrupt => {
+                    fs::remove_file(&p).expect("remove tail.meta");
+                    corrupt_crc(&b);
+                }
+                DualLossMode::PrimaryCorruptBackupDeleted => {
+                    corrupt_crc(&p);
+                    fs::remove_file(&b).expect("remove tail.meta.bak");
+                }
+            }
+        };
+
+        let verify_subcase_b2_rejected =
+            |label: &str,
+             repo_path: &Path,
+             queue_root: &Path,
+             normal_dir: &Path,
+             quarantine_dir: &Path,
+             drop_lock: bool| {
+                write_bytes_0600(
+                    &normal_dir.join(QUEUE_TAIL_META_TMP_FILE),
+                    b"rb08h-seg-planted-meta-tmp",
+                );
+                write_bytes_0600(
+                    &normal_dir.join(QUEUE_TAIL_META_BAK_TMP_FILE),
+                    b"rb08h-seg-planted-meta-bak-tmp",
+                );
+                write_bytes_0600(
+                    &quarantine_dir.join("normal-orphan.tmp"),
+                    b"rb08h-seg-planted-normal-q-tmp",
+                );
+                write_bytes_0600(
+                    &quarantine_dir.join("priority-orphan.tmp"),
+                    b"rb08h-seg-planted-priority-q-tmp",
+                );
+                if drop_lock {
+                    fs::remove_file(queue_root.join(QUEUE_APPEND_LOCK_FILE))
+                        .expect("remove append.lock");
+                }
+
+                let lane_before = snapshot_tree(normal_dir);
+                let q_before = snapshot_tree(quarantine_dir);
+                let root_before = snapshot_tree(queue_root);
+
+                let app_err = append_frame(
+                    repo_path,
+                    CaptureQueueLane::Normal,
+                    FRAME_FLAG_NONE,
+                    "rb08h-seg-incoming-reject",
+                    b"must-not-write",
+                )
+                .expect_err("RB-08h: Subcase B2 append_frame must fail closed");
+                assert!(
+                    matches!(app_err, StorageBackendError::CorruptCommittedFrame { .. }),
+                    "{label}: expected CorruptCommittedFrame on append_frame, got {app_err:?}"
+                );
+                assert_eq!(app_err.stable_code_str(), "LBR-IO-001");
+                assert_eq!(
+                    snapshot_tree(normal_dir),
+                    lane_before,
+                    "{label}: lane directory mutated on append_frame rejection"
+                );
+                assert_eq!(
+                    snapshot_tree(quarantine_dir),
+                    q_before,
+                    "{label}: quarantine/ mutated on append_frame rejection"
+                );
+                assert_eq!(
+                    snapshot_tree(queue_root),
+                    root_before,
+                    "{label}: queue root mutated on append_frame rejection"
+                );
+
+                let rec_err = recover_lane(repo_path, CaptureQueueLane::Normal)
+                    .expect_err("RB-08h: Subcase B2 recover_lane must fail closed");
+                assert!(
+                    matches!(rec_err, StorageBackendError::CorruptCommittedFrame { .. }),
+                    "{label}: expected CorruptCommittedFrame on recover_lane, got {rec_err:?}"
+                );
+                assert_eq!(rec_err.stable_code_str(), "LBR-IO-001");
+                assert_eq!(
+                    snapshot_tree(normal_dir),
+                    lane_before,
+                    "{label}: lane directory mutated on recover_lane rejection"
+                );
+                assert_eq!(
+                    snapshot_tree(quarantine_dir),
+                    q_before,
+                    "{label}: quarantine/ mutated on recover_lane rejection"
+                );
+                assert_eq!(
+                    snapshot_tree(queue_root),
+                    root_before,
+                    "{label}: queue root mutated on recover_lane rejection"
+                );
+            };
+
+        // Helper creating a valid 2-segment rotated lane (`seg 0` sealed with 2
+        // frames, `seg 1` active `max_seg = 1` with 2 clean frames, dual `LTM2`).
+        let build_two_segment_lane = |normal_dir: &Path| -> (u64, u64, u64) {
+            let s0_f1 = encode_frame(FRAME_FLAG_NONE, "rb08h-s0-1", b"seg0-frame-1-payload")
+                .expect("encode s0 f1");
+            let s0_f2 = encode_frame(FRAME_FLAG_NONE, "rb08h-s0-2", b"seg0-frame-2-payload")
+                .expect("encode s0 f2");
+            let mut s0_bytes = Vec::with_capacity(s0_f1.len() + s0_f2.len());
+            s0_bytes.extend_from_slice(&s0_f1);
+            s0_bytes.extend_from_slice(&s0_f2);
+            let s0_crc = crc32c_checksum(&s0_bytes);
+            write_bytes_0600(&normal_dir.join(segment_log_file_name(0)), &s0_bytes);
+
+            let s1_f1 = encode_frame(FRAME_FLAG_NONE, "rb08h-s1-1", b"seg1-frame-1-payload")
+                .expect("encode s1 f1");
+            let s1_f2 = encode_frame(FRAME_FLAG_NONE, "rb08h-s1-2", b"seg1-frame-2-payload")
+                .expect("encode s1 f2");
+            let mut s1_bytes = Vec::with_capacity(s1_f1.len() + s1_f2.len());
+            s1_bytes.extend_from_slice(&s1_f1);
+            s1_bytes.extend_from_slice(&s1_f2);
+            let s1_crc = crc32c_checksum(&s1_bytes);
+            write_bytes_0600(&normal_dir.join(segment_log_file_name(1)), &s1_bytes);
+
+            let meta = LaneTailMeta {
+                min_live_seg: 0,
+                active_seg: 1,
+                committed_len: s1_bytes.len() as u64,
+                prefix_crc32c: s1_crc,
+                sealed: vec![SealedSegmentMeta {
+                    seg_id: 0,
+                    sealed_len: s0_bytes.len() as u64,
+                    sealed_crc32c: s0_crc,
+                }],
+            };
+            let raw_meta = meta.encode().expect("encode two-segment LTM2");
+            write_bytes_0600(&tail_meta_path(normal_dir), &raw_meta);
+            write_bytes_0600(&tail_meta_bak_path(normal_dir), &raw_meta);
+
+            (
+                s0_f1.len() as u64,
+                s0_bytes.len() as u64,
+                s1_f1.len() as u64,
+            )
+        };
+
+        let dual_modes = [
+            ("both-deleted", DualLossMode::BothDeleted, false),
+            ("both-deleted-no-lock", DualLossMode::BothDeleted, true),
+            ("both-corrupt-crc", DualLossMode::BothCorruptCrc, false),
+            (
+                "primary-deleted-backup-corrupt",
+                DualLossMode::PrimaryDeletedBackupCorrupt,
+                false,
+            ),
+            (
+                "primary-corrupt-backup-deleted",
+                DualLossMode::PrimaryCorruptBackupDeleted,
+                false,
+            ),
+        ];
+
+        // =====================================================================
+        // Part 1 — AC5 & AC6: `max_seg` frame bitflip or half-frame truncation
+        // + dual metadata loss (both single-segment `seg 0` & rotated `seg 1`).
+        // =====================================================================
+        #[derive(Clone, Copy)]
+        enum MaxSegDamage {
+            Bitflip,
+            HalfFrameTrunc,
+        }
+        for (damage_label, damage) in [
+            ("bitflip", MaxSegDamage::Bitflip),
+            ("half-frame-trunc", MaxSegDamage::HalfFrameTrunc),
+        ] {
+            for (mode_label, mode, drop_lock) in dual_modes {
+                // Single-segment (`max_seg = 0`).
+                {
+                    let label = format!("b2-max-seg0-{damage_label}-{mode_label}");
+                    let repo = tempdir().expect("tempdir");
+                    let init = init_capture_queue(repo.path()).expect("init capture queue");
+                    let normal_dir = &init.paths.normal;
+                    let f1 = append_frame(
+                        repo.path(),
+                        CaptureQueueLane::Normal,
+                        FRAME_FLAG_NONE,
+                        "rb08h-max0-1",
+                        b"max0-frame-1",
+                    )
+                    .unwrap();
+                    let f2 = append_frame(
+                        repo.path(),
+                        CaptureQueueLane::Normal,
+                        FRAME_FLAG_NONE,
+                        "rb08h-max0-2",
+                        b"max0-frame-2-damaged",
+                    )
+                    .unwrap();
+
+                    let seg0_path = normal_dir.join(segment_log_file_name(0));
+                    match damage {
+                        MaxSegDamage::Bitflip => {
+                            let mut raw = fs::read(&seg0_path).unwrap();
+                            let idx = (f1.meta.committed_len as usize) + 12;
+                            raw[idx] ^= 0x80;
+                            write_bytes_0600(&seg0_path, &raw);
+                        }
+                        MaxSegDamage::HalfFrameTrunc => {
+                            let half_len = f1.meta.committed_len + (f2.frame_len as u64 / 2);
+                            let f = fs::OpenOptions::new().write(true).open(&seg0_path).unwrap();
+                            f.set_len(half_len).unwrap();
+                            f.sync_data().unwrap();
+                        }
+                    }
+
+                    apply_dual_loss(normal_dir, mode);
+                    verify_subcase_b2_rejected(
+                        &label,
+                        repo.path(),
+                        &init.paths.root,
+                        normal_dir,
+                        &init.paths.quarantine,
+                        drop_lock,
+                    );
+                }
+
+                // Multi-segment (`max_seg = 1` damaged while older `seg 0` is clean).
+                {
+                    let label = format!("b2-max-seg1-{damage_label}-{mode_label}");
+                    let repo = tempdir().expect("tempdir");
+                    let init = init_capture_queue(repo.path()).expect("init capture queue");
+                    let normal_dir = &init.paths.normal;
+                    let (_s0_f1_len, _s0_total, s1_f1_len) = build_two_segment_lane(normal_dir);
+
+                    let seg1_path = normal_dir.join(segment_log_file_name(1));
+                    match damage {
+                        MaxSegDamage::Bitflip => {
+                            let mut raw = fs::read(&seg1_path).unwrap();
+                            raw[(s1_f1_len as usize) + 8] ^= 0x40;
+                            write_bytes_0600(&seg1_path, &raw);
+                        }
+                        MaxSegDamage::HalfFrameTrunc => {
+                            let total = fs::metadata(&seg1_path).unwrap().len();
+                            let half_len = s1_f1_len + (total - s1_f1_len) / 2;
+                            let f = fs::OpenOptions::new().write(true).open(&seg1_path).unwrap();
+                            f.set_len(half_len).unwrap();
+                            f.sync_data().unwrap();
+                        }
+                    }
+
+                    apply_dual_loss(normal_dir, mode);
+                    verify_subcase_b2_rejected(
+                        &label,
+                        repo.path(),
+                        &init.paths.root,
+                        normal_dir,
+                        &init.paths.quarantine,
+                        drop_lock,
+                    );
+                }
+            }
+        }
+
+        // =====================================================================
+        // Part 2 — AC7 & AC8: Older rotated segment (`seg 0 < max_seg = 1`)
+        // corrupted or truncated while `max_seg = 1` is 100% clean + dual loss.
+        // =====================================================================
+        #[derive(Clone, Copy)]
+        enum OlderSegDamage {
+            Bitflip,
+            HalfFrameTrunc,
+            ZeroByteTrunc,
+            CleanEofTrunc,
+        }
+        for (damage_label, damage) in [
+            ("bitflip", OlderSegDamage::Bitflip),
+            ("half-frame-trunc", OlderSegDamage::HalfFrameTrunc),
+            ("zero-byte-trunc", OlderSegDamage::ZeroByteTrunc),
+            ("clean-eof-trunc", OlderSegDamage::CleanEofTrunc),
+        ] {
+            for (mode_label, mode, drop_lock) in dual_modes {
+                let label = format!("b2-older-seg0-{damage_label}-{mode_label}");
+                let repo = tempdir().expect("tempdir");
+                let init = init_capture_queue(repo.path()).expect("init capture queue");
+                let normal_dir = &init.paths.normal;
+                let (s0_f1_len, s0_total, _s1_f1_len) = build_two_segment_lane(normal_dir);
+
+                let seg0_path = normal_dir.join(segment_log_file_name(0));
+                match damage {
+                    OlderSegDamage::Bitflip => {
+                        let mut raw = fs::read(&seg0_path).unwrap();
+                        raw[10] ^= 0x04;
+                        write_bytes_0600(&seg0_path, &raw);
+                    }
+                    OlderSegDamage::HalfFrameTrunc => {
+                        let half_len = s0_f1_len + (s0_total - s0_f1_len) / 2;
+                        let f = fs::OpenOptions::new().write(true).open(&seg0_path).unwrap();
+                        f.set_len(half_len).unwrap();
+                        f.sync_data().unwrap();
+                    }
+                    OlderSegDamage::ZeroByteTrunc => {
+                        let f = fs::OpenOptions::new().write(true).open(&seg0_path).unwrap();
+                        f.set_len(0).unwrap();
+                        f.sync_data().unwrap();
+                    }
+                    OlderSegDamage::CleanEofTrunc => {
+                        let f = fs::OpenOptions::new().write(true).open(&seg0_path).unwrap();
+                        f.set_len(s0_f1_len).unwrap();
+                        f.sync_data().unwrap();
+                    }
+                }
+
+                // Confirm `max_seg = 1` remains 100% clean `CleanEof`.
+                let seg1_path = normal_dir.join(segment_log_file_name(1));
+                let seg1_len = fs::metadata(&seg1_path).unwrap().len();
+                {
+                    let mut f = File::open(&seg1_path).unwrap();
+                    let mut dec = FrameStreamDecoder::new(&mut f, seg1_len);
+                    assert!(matches!(
+                        dec.next_frame().unwrap(),
+                        FrameStreamItem::Frame { .. }
+                    ));
+                    assert!(matches!(
+                        dec.next_frame().unwrap(),
+                        FrameStreamItem::Frame { .. }
+                    ));
+                    assert!(matches!(
+                        dec.next_frame().unwrap(),
+                        FrameStreamItem::CleanEof { .. }
+                    ));
+                }
+
+                apply_dual_loss(normal_dir, mode);
+                verify_subcase_b2_rejected(
+                    &label,
+                    repo.path(),
+                    &init.paths.root,
+                    normal_dir,
+                    &init.paths.quarantine,
+                    drop_lock,
+                );
+            }
+        }
+    }
 }
