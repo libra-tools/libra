@@ -2695,7 +2695,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `done` / `remote-pending`
+**Lifecycle / Acceptance:** `done` / `remote-verified`
 
 **Description:** 100% 在独占目录 `src/storage/**` 内于 `src/storage/queue/mod.rs` 实现 `init_redb_capture_spool_tombstones`：在全新 Redb 仓建立 `.libra/private/capture-spool/`（`0700`）、`capacity.lock`（`0600`）与 `{tmp,ready,quarantine}` `0400` 普通文件墓碑并 `fsync_dir`，从首日起阻断旧版 SQLite Hook `spool.rs:330` `ensure_spool`。
 
@@ -2752,7 +2752,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `remote-pending`
 
 **Description:** 100% 在独占目录 `src/storage/**` 内实现 `segment.rs` 崩溃安全追加核心：在双通道共享 `.libra/private/capture-queue/append.lock` 内执行单次 `write_all` + `seg.sync_data()`，随后以 `LTM2` 校验结构（30B 头 + `16B × SEALED_COUNT` 轮转封存表 + 4B `META_CRC32C`，双副本按 `(active_seg, committed_len, min_live_seg)` 严格全序收敛）依次经原子替换协议提交 **`tail.meta` 与 `tail.meta.bak` 双副本**后才释锁返回 `Ok`；并实现 Case C 同段未提交有效帧保留与双副本更新（含首帧写入崩溃，因 `RB-07b` 已预建初始 34B `LTM2` 双副本）。
 
@@ -2769,18 +2769,18 @@
 | `LTM2` 双副本 `tail.meta` + `tail.meta.bak`（含 `MIN_LIVE_SEG`/`PREFIX_CRC32C`/`sealed[]`）于释锁返回 `Ok` 前双双落盘，且全新空通道已预建初始 34B `LTM2` 双副本 | `src/internal/ai/capture/spool.rs:111-157`；`ADR-RB-05` #3 |
 
 **Acceptance criteria:**
-- [ ] 32 并发进程各写入 100 条变长帧（64 B – 64 KiB），全部 3,200 帧 CRC32C 100% 通过且零交错损坏。
-- [ ] 每次入队在共享 `append.lock` 内执行单次 `write_all` 并完成 `seg.sync_data()` 刷盘。
-- [ ] 每次入队通过 `tail.meta.tmp` 原子替换并 `fsync_dir(lane_dir)` 提交主副本 `LTM2` `tail.meta`。
-- [ ] 每次入队在释放 `append.lock` 前通过 `tail.meta.bak.tmp` 原子替换并 `fsync_dir(lane_dir)` 提交镜像副本 `tail.meta.bak`（双副本均有效时按 `(active_seg, committed_len, min_live_seg)` 全序收敛）。
-- [ ] 故障注入（Case C 同段内于 `seg.sync_data()` 后、元数据提交前崩溃，含全新空通道首帧崩溃且 `[0, committed_len)` 前缀完好）：恢复前向扫描 100% 保留已 `sync_data` 合法帧。
-- [ ] 上述 Case C 恢复保留已同步合法帧后，原子推进 `tail.meta` 与 `tail.meta.bak` 双副本至新提交边界。
+- [x] 32 并发进程各写入 100 条变长帧（64 B – 64 KiB），全部 3,200 帧 CRC32C 100% 通过且零交错损坏。
+- [x] 每次入队在共享 `append.lock` 内执行单次 `write_all` 并完成 `seg.sync_data()` 刷盘。
+- [x] 每次入队通过 `tail.meta.tmp` 原子替换并 `fsync_dir(lane_dir)` 提交主副本 `LTM2` `tail.meta`。
+- [x] 每次入队在释放 `append.lock` 前通过 `tail.meta.bak.tmp` 原子替换并 `fsync_dir(lane_dir)` 提交镜像副本 `tail.meta.bak`（双副本均有效时按 `(active_seg, committed_len, min_live_seg)` 全序收敛）。
+- [x] 故障注入（Case C 同段内于 `seg.sync_data()` 后、元数据提交前崩溃，含全新空通道首帧崩溃且 `[0, committed_len)` 前缀完好）：恢复前向扫描 100% 保留已 `sync_data` 合法帧。
+- [x] 上述 Case C 恢复保留已同步合法帧后，原子推进 `tail.meta` 与 `tail.meta.bak` 双副本至新提交边界。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --no-default-features --features storage-redb --lib -E 'test(=storage::queue::segment::tests::multiprocess_32_producers_zero_interleave_and_dual_tail_meta) | test(=storage::queue::segment::tests::case_c_same_segment_crash_retains_synced_frames)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb --lib -E 'test(=storage::queue::segment::tests::multiprocess_32_producers_zero_interleave_and_dual_tail_meta)'`（new，覆盖 AC1–AC4）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb --lib -E 'test(=storage::queue::segment::tests::case_c_same_segment_crash_retains_synced_frames)'`（new，覆盖 AC5、AC6）
-- [ ] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 3 文件实现白名单。
+- [x] `source .env.test && cargo nextest list --no-default-features --features storage-redb --lib -E 'test(=storage::queue::segment::tests::multiprocess_32_producers_zero_interleave_and_dual_tail_meta) | test(=storage::queue::segment::tests::case_c_same_segment_crash_retains_synced_frames)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb --lib -E 'test(=storage::queue::segment::tests::multiprocess_32_producers_zero_interleave_and_dual_tail_meta)'`（new，覆盖 AC1–AC4）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb --lib -E 'test(=storage::queue::segment::tests::case_c_same_segment_crash_retains_synced_frames)'`（new，覆盖 AC5、AC6）
+- [x] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 3 文件实现白名单。
 
 **Full-suite trigger:** `none`
 
@@ -10046,8 +10046,9 @@
 | `RB-07f` | `done` / `remote-verified` | `9c74dfa`（`main`） | `0.30.335` | 2026-11-23 03:36 UTC：Stage 1 精确 3 文件写集内仅改动 `src/storage/queue/frame.rs`，落实强制可信边界 `FrameStreamDecoder`（`new(reader, total_len)`、`with_known_len`、`from_seekable`）与 `ADR-RB-05` #2 分配前剩余长度强校验（任一构造器在 `remaining < FRAME_BODY_LEN` 含 4 MiB 仅缺末字节场景均零体分配、零读体即报 `TruncatedTail`），同时对未达 `end_offset` 即耗尽的底层流严格 fail-closed 报 `TruncatedTail`（绝不误报 `CleanEof`）并粘性毒化；`--no-default-features --features storage-redb` `storage::queue::frame::` 4/4（`seq_decoder_distinguishes_clean_eof_and_truncated_tail_variants` 覆盖 0B 空流、4 帧多块/1B+EINTR 合法流、半体与 4 MiB 缺 1B、并发缩尾安全网、提前耗尽流、I/O 粘性毒化及 `1..=15`B 合法前缀与非魔数半头穷举）、单特性零告警、fmt、严格 `--lib` clippy、`compat_version_surface_sync` 全绿；Codex R1/R2 全部 P1 均已闭环，R3 获 `VERDICT: PASS`；已推 `origin/main` |
 | `RB-07d` | `done` / `remote-verified` | `8315d51`（`main`） | `0.30.336` | 2026-11-23 03:46 UTC：Stage 1 精确 3 文件写集内仅改动 `src/storage/queue/frame.rs`，在 `verify_and_decode_body` 补齐定长头下限零 panic 防护，并新增 `acknowledged_frame_each_body_and_crc_field_bitflip_rejected` 穷举覆盖 `FRAME_CRC32C`（12..16）、`FLAGS`（16）、`DEDUP_KEY_LEN`（17..19）、`DEDUP_KEY_UTF8`（19..19+K）与 `POSTCARD_ENVELOPE`（19+K..end，含 24 KiB 多块负载首/中/末字节）全部 5 字段逐字节翻转（头校验均合法通过、`decode_frame` 与 `FrameStreamDecoder` 独立/中段含后续帧均报 `CorruptPayload` 并粘性毒化、脱敏 `LBR-IO-001` 零密钥/负载泄露）；`--no-default-features --features storage-redb` `storage::queue::frame::` 5/5、fmt、严格 `--lib` clippy、`compat_version_surface_sync` 全绿；Codex R1 首轮 `VERDICT: PASS`（P0=0、P1=0）；已推 `origin/main` |
 | `RB-07b` | `done` / `remote-verified` | `28ee6b5`（`main`） | `0.30.337` | 2026-11-23 04:18 UTC：Stage 1 精确 3 文件写集内仅改动 `src/storage/{mod.rs,queue/mod.rs}`，实现 `LTM2` 34B–4130B 双副本线协议编解码（`LaneTailMeta`/`SealedSegmentMeta`/`Ltm2CodecError`）与句柄级零 TOCTOU 双通道初始化（`private/`/`capture-queue/`/`priority/`/`normal/`/`quarantine/` 精确 `0700` + `O_NOFOLLOW` + 有效 UID 属主校验，零按名 `fchmodat`）；经两步 `O_NOFOLLOW`/`O_CREAT\|O_EXCL\|O_NOFOLLOW` 共享 `append.lock`（消除 macOS XNU 并发 `O_CREAT\|O_NOFOLLOW` `ENOENT` 竞态）串行化空通道判新（原始字节匹配 `events-*.log` 含 `events-.log`/`events-\xff.log`）与 34B `0600` `LTM2` `(0,0,0,0,[])` `tail.meta`/`tail.meta.bak` 原子无覆写发布 + 立即 `fsync_dir(lane_dir)`（Windows 走 `MoveFileExW(MOVEFILE_WRITE_THROUGH)`，其它平台 fail-closed）；`--no-default-features --features storage-redb,storage-queue` `storage::queue::` 6/6（`dual_lane_directory_permissions_nofollow_owner_and_initial_meta` 覆盖 AC1–AC5、8 线程并发竞争、持锁写者交错、`fsync_dir` 注入失败、非空通道保留与 `LTM2` 0..=256 边界）、三构型特性矩阵、fmt、严格 `--lib` clippy、`compat_version_surface_sync` 全绿；Codex R1（4×P1）与 R2（1×P1）全部闭环，R3 获 `VERDICT: PASS`；已推 `origin/main` |
-| `RB-07e` | `done` / `remote-pending` | 本提交（`main`） | `0.30.338` | 2026-11-23 04:51 UTC：Stage 1 精确 3 文件写集内仅改动 `src/storage/{mod.rs,queue/mod.rs}`，实现 `init_redb_capture_spool_tombstones`：在全新 Redb 仓经私密暂存目录原子 `renameat` 整目录发布 `.libra/private/capture-spool/`（`0700`）+ `capacity.lock`（`0600`）+ `{tmp,ready,quarantine}` `0400` 普通文件墓碑（持 `tmp_fd` 跨 `linkat` 并校验 `(st_dev, st_ino)` 消除 TOCTOU；既有目录路径在 `capacity.lock` 排他锁下预检全部 3 槽并附中途竞态 inode 级回滚；全部成功路径含 `AlreadyFenced` 重试与并发返回均无条件同步父目录 `private/` 与 `capture-spool/`；Windows 同步补齐整目录 `MoveFileExW(MOVEFILE_WRITE_THROUGH)`、`CreateFileW+FlushFileBuffers`、只读属性校验修复与有界读）；`--no-default-features --features storage-redb,storage-queue` `storage::queue::` 7/7（`fresh_redb_init_spool_tombstones_blocks_legacy_ensure_spool` 覆盖 AC1–AC5、真实旧 Hook `spool::publish` 立即 fail-closed 阻断、父/子 `fsync_dir` 失败与重试、8 线程并发、中途竞态回滚、活目录拒覆盖、符号链接/异属主拒收）、三构型矩阵、fmt、严格 `--lib` clippy、`compat_version_surface_sync` 全绿；Codex R1/R2/R3 全部 P1 已闭环并经 R4 确认（R4 仅追加 macOS 本机无法编测的 Windows 专属测试与按句柄回滚建议，已顺手收紧 Windows 有界读并依用户授权跳过继续推进） |
-| `RB-08`..`RB-34c`（剩余 119 卡） | `pending` | — | — | Phase 2 推进中，按实施顺序于 `main` 逐卡推进 |
+| `RB-07e` | `done` / `remote-verified` | `7904eda`（`main`） | `0.30.338` | 2026-11-23 04:51 UTC：Stage 1 精确 3 文件写集内仅改动 `src/storage/{mod.rs,queue/mod.rs}`，实现 `init_redb_capture_spool_tombstones`：在全新 Redb 仓经私密暂存目录原子 `renameat` 整目录发布 `.libra/private/capture-spool/`（`0700`）+ `capacity.lock`（`0600`）+ `{tmp,ready,quarantine}` `0400` 普通文件墓碑（持 `tmp_fd` 跨 `linkat` 并校验 `(st_dev, st_ino)` 消除 TOCTOU；既有目录路径在 `capacity.lock` 排他锁下预检全部 3 槽并附中途竞态 inode 级回滚；全部成功路径含 `AlreadyFenced` 重试与并发返回均无条件同步父目录 `private/` 与 `capture-spool/`；Windows 同步补齐整目录 `MoveFileExW(MOVEFILE_WRITE_THROUGH)`、`CreateFileW+FlushFileBuffers`、只读属性校验修复与有界读）；`--no-default-features --features storage-redb,storage-queue` `storage::queue::` 7/7（`fresh_redb_init_spool_tombstones_blocks_legacy_ensure_spool` 覆盖 AC1–AC5、真实旧 Hook `spool::publish` 立即 fail-closed 阻断、父/子 `fsync_dir` 失败与重试、8 线程并发、中途竞态回滚、活目录拒覆盖、符号链接/异属主拒收）、三构型矩阵、fmt、严格 `--lib` clippy、`compat_version_surface_sync` 全绿；Codex R1/R2/R3 全部 P1 已闭环并经 R4 确认（R4 仅追加 macOS 本机无法编测的 Windows 专属测试与按句柄回滚建议，已顺手收紧 Windows 有界读并依用户授权跳过继续推进）；已推 `origin/main` |
+| `RB-08` | `done` / `remote-pending` | 本提交（`main`） | `0.30.339` | 2026-11-23 05:35 UTC：Stage 1 精确 3 文件写集（`src/storage/mod.rs`、`src/storage/queue/{mod,segment}.rs`），实现 `segment.rs` 并发崩溃安全追加核心：`append_frame`/`append_encoded_frame`/`append_postcard_frame`/`recover_lane`/`read_converged_lane_tail_meta` 在锁外编校验单帧，锁内执行 100% 只读 Phase 1 分类（严格校验 `private/`/`capture-queue/`/`<lane>/` 精确 `0700` 权限、缺失 `append.lock` 先只读分类再独占建锁且失竞态绝不对竞态者宽松锁做 `fchmod`、流式校验 `[0, committed_len)` `prefix_crc32c`、按 `(active_seg, committed_len, min_live_seg)` 严格全序收敛双副本并拒同序不同校验和），Phase 2 清理本通道 `tail.meta*.tmp`、收敛副本与 Case C 同段前向扫描保留 100% 已 `sync_data` 完整帧，随后在 `append.lock` 内单次 `write_all` + `seg.sync_data()` 并依次经 `tail.meta.tmp -> sync_data -> rename -> fsync_dir` 与 `tail.meta.bak.tmp -> sync_data -> rename -> fsync_dir` 落盘双副本后方释锁返回；Windows 同步补齐 `CreateFileW(FILE_FLAG_OPEN_REPARSE_POINT)` 句柄固定（禁 `FILE_SHARE_DELETE` 防锁与活跃段/目录替换）；`--no-default-features --features storage-redb` `storage::queue::` 9/9（`multiprocess_32_producers_zero_interleave_and_dual_tail_meta` 32 真实子进程 × 100 变长帧 64B–64KiB = 3,200 帧 100% CRC32C 通过零交错 + 严格操作序插桩 + 全序收敛，`case_c_same_segment_crash_retains_synced_frames` 覆盖首帧崩溃、多帧已同步尾、备副本滞后、前缀翻转零改动、0755 目录/0644 锁/缺锁竞态整树快照）、三构型矩阵、fmt、严格 `--lib` clippy、`compat_version_surface_sync` 全绿；Codex R1/R2 全部 Unix P1/P2 已闭环并经 R3 确认（R3 仅余 macOS 本机无法编测的 Windows 祖先句柄固定与去 `FILE_SHARE_DELETE` 及 Windows 竞态测试要求，已落地两处 Windows 句柄加固并依用户授权跳过继续推进） |
+| `RB-08t`..`RB-34c`（剩余 118 卡） | `pending` | — | — | Phase 2 推进中，按实施顺序于 `main` 逐卡推进 |
 
 ## Codex review log
 

@@ -42,6 +42,7 @@ use crate::storage::{
 };
 
 pub mod frame;
+pub mod segment;
 
 pub use frame::{
     DecodedFrame, FRAME_BODY_FIXED_OVERHEAD, FRAME_FLAG_NONE, FRAME_FLAG_PRIORITY,
@@ -50,6 +51,12 @@ pub use frame::{
     MIN_FRAME_BODY_LEN, ParsedFrameHeader, crc32c_append, crc32c_checksum, decode_frame,
     decode_postcard_payload, encode_frame, encode_postcard_frame, parse_and_verify_header,
     validate_frame_body_len,
+};
+pub use segment::{
+    LaneRecoveryReport, QUEUE_TAIL_META_BAK_TMP_FILE, QUEUE_TAIL_META_TMP_FILE,
+    SegmentAppendOutcome, append_encoded_frame, append_encoded_frame_at_root, append_frame,
+    append_frame_at_root, append_postcard_frame, is_lane_meta_temp_name,
+    parse_segment_log_file_name, read_converged_lane_tail_meta, recover_lane, recover_lane_at_root,
 };
 
 /// Subdirectory under `.libra/private/` housing the dual-lane CRC32C capture queue.
@@ -132,13 +139,13 @@ pub fn is_capture_queue_owner_mismatch_error(err: &StorageBackendError) -> bool 
     )
 }
 
-fn map_queue_symlink_err(subject: &'static str) -> StorageBackendError {
+pub(super) fn map_queue_symlink_err(subject: &'static str) -> StorageBackendError {
     StorageBackendError::BackendInternal {
         detail: format!("{CAPTURE_QUEUE_SYMLINK_ERROR_PREFIX}: {subject}"),
     }
 }
 
-fn map_queue_owner_mismatch_err(subject: &'static str) -> StorageBackendError {
+pub(super) fn map_queue_owner_mismatch_err(subject: &'static str) -> StorageBackendError {
     StorageBackendError::BackendInternal {
         detail: format!("{CAPTURE_QUEUE_OWNER_ERROR_PREFIX}: {subject}"),
     }
@@ -628,17 +635,17 @@ impl QueueInitObserver {
 /// ownership-mismatch fail-closed paths without requiring `CAP_CHOWN`.
 #[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct UnixExpectedQueueOwners {
-    private_uid: u32,
-    root_uid: u32,
-    priority_uid: u32,
-    normal_uid: u32,
-    quarantine_uid: u32,
+pub(super) struct UnixExpectedQueueOwners {
+    pub(super) private_uid: u32,
+    pub(super) root_uid: u32,
+    pub(super) priority_uid: u32,
+    pub(super) normal_uid: u32,
+    pub(super) quarantine_uid: u32,
 }
 
 #[cfg(unix)]
 impl UnixExpectedQueueOwners {
-    fn current_effective() -> Self {
+    pub(super) fn current_effective() -> Self {
         // SAFETY: `geteuid(2)` has no preconditions and never fails.
         let uid = unsafe { libc::geteuid() };
         Self {
@@ -797,11 +804,11 @@ pub fn init_capture_queue_at_root(queue_root: &Path) -> StorageResult<CaptureQue
 // ============================================================================
 
 #[cfg(unix)]
-mod unix_impl {
+pub(super) mod unix_impl {
     use super::*;
 
-    struct DirStreamGuard {
-        ptr: *mut libc::DIR,
+    pub(super) struct DirStreamGuard {
+        pub(super) ptr: *mut libc::DIR,
     }
 
     impl Drop for DirStreamGuard {
@@ -815,14 +822,14 @@ mod unix_impl {
         }
     }
 
-    struct TempUnlinkGuard<'a> {
+    pub(super) struct TempUnlinkGuard<'a> {
         dir_fd: &'a OwnedFd,
         cname: CString,
         active: bool,
     }
 
     impl<'a> TempUnlinkGuard<'a> {
-        fn new(dir_fd: &'a OwnedFd, cname: CString) -> Self {
+        pub(super) fn new(dir_fd: &'a OwnedFd, cname: CString) -> Self {
             Self {
                 dir_fd,
                 cname,
@@ -830,7 +837,7 @@ mod unix_impl {
             }
         }
 
-        fn disarm(&mut self) {
+        pub(super) fn disarm(&mut self) {
             self.active = false;
         }
     }
@@ -846,7 +853,7 @@ mod unix_impl {
         }
     }
 
-    fn clear_errno() {
+    pub(super) fn clear_errno() {
         #[cfg(any(
             target_os = "macos",
             target_os = "ios",
@@ -866,23 +873,23 @@ mod unix_impl {
         }
     }
 
-    fn osstr_to_cstring(s: &OsStr, context: &'static str) -> StorageResult<CString> {
+    pub(super) fn osstr_to_cstring(s: &OsStr, context: &'static str) -> StorageResult<CString> {
         CString::new(s.as_bytes()).map_err(|_| StorageBackendError::BackendInternal {
             detail: format!("{context}: path component contains interior NUL byte"),
         })
     }
 
-    fn path_to_cstring(path: &Path, context: &'static str) -> StorageResult<CString> {
+    pub(super) fn path_to_cstring(path: &Path, context: &'static str) -> StorageResult<CString> {
         osstr_to_cstring(path.as_os_str(), context)
     }
 
-    fn unix_perm_bits(mode: libc::mode_t) -> u32 {
+    pub(super) fn unix_perm_bits(mode: libc::mode_t) -> u32 {
         #[allow(clippy::useless_conversion)]
         let raw = u32::from(mode);
         raw & 0o7777
     }
 
-    fn fstat_fd(fd: &OwnedFd, context: &'static str) -> StorageResult<libc::stat> {
+    pub(super) fn fstat_fd(fd: &OwnedFd, context: &'static str) -> StorageResult<libc::stat> {
         let mut st = std::mem::MaybeUninit::<libc::stat>::zeroed();
         // SAFETY: `fd` is a valid open descriptor and `st` is writable.
         let rc = unsafe { libc::fstat(fd.as_raw_fd(), st.as_mut_ptr()) };
@@ -893,7 +900,7 @@ mod unix_impl {
         Ok(unsafe { st.assume_init() })
     }
 
-    fn fchmod_fd(fd: &OwnedFd, mode: u32, context: &'static str) -> StorageResult<()> {
+    pub(super) fn fchmod_fd(fd: &OwnedFd, mode: u32, context: &'static str) -> StorageResult<()> {
         // SAFETY: `fd` is a valid open descriptor.
         let rc = unsafe { libc::fchmod(fd.as_raw_fd(), mode as libc::mode_t) };
         if rc != 0 {
@@ -902,7 +909,7 @@ mod unix_impl {
         Ok(())
     }
 
-    fn fsync_fd(fd: &OwnedFd, context: &'static str) -> StorageResult<()> {
+    pub(super) fn fsync_fd(fd: &OwnedFd, context: &'static str) -> StorageResult<()> {
         // SAFETY: `fd` is a valid open descriptor.
         let rc = unsafe { libc::fsync(fd.as_raw_fd()) };
         if rc != 0 {
@@ -911,7 +918,7 @@ mod unix_impl {
         Ok(())
     }
 
-    fn is_symlink_errno_at(err: &io::Error, dir_fd: &OwnedFd, cname: &CString) -> bool {
+    pub(super) fn is_symlink_errno_at(err: &io::Error, dir_fd: &OwnedFd, cname: &CString) -> bool {
         match err.raw_os_error() {
             Some(libc::ELOOP) => true,
             // Some Unix kernels return ENOTDIR when `O_DIRECTORY | O_NOFOLLOW` hits a symlink.
@@ -938,7 +945,7 @@ mod unix_impl {
         }
     }
 
-    fn is_symlink_errno_path(err: &io::Error, path: &Path) -> bool {
+    pub(super) fn is_symlink_errno_path(err: &io::Error, path: &Path) -> bool {
         match err.raw_os_error() {
             Some(libc::ELOOP) => true,
             Some(libc::ENOTDIR) => {
@@ -948,7 +955,7 @@ mod unix_impl {
         }
     }
 
-    fn open_ancestor_dir(dir: &Path, context: &'static str) -> StorageResult<OwnedFd> {
+    pub(super) fn open_ancestor_dir(dir: &Path, context: &'static str) -> StorageResult<OwnedFd> {
         let cdir = path_to_cstring(dir, context)?;
         // SAFETY: `cdir` is NUL-terminated. Ancestor directories (e.g. macOS `/var -> /private/var`)
         // may traverse system symlinks while every queue component below is pinned with `O_NOFOLLOW`.
@@ -965,7 +972,7 @@ mod unix_impl {
         Ok(unsafe { OwnedFd::from_raw_fd(raw_fd) })
     }
 
-    fn open_dir_nofollow(
+    pub(super) fn open_dir_nofollow(
         dir: &Path,
         expected_uid: u32,
         subject: &'static str,
@@ -995,7 +1002,7 @@ mod unix_impl {
         Ok((dir_fd, st))
     }
 
-    fn openat_dir_nofollow(
+    pub(super) fn openat_dir_nofollow(
         parent_fd: &OwnedFd,
         dir_name: &OsStr,
         expected_uid: u32,
@@ -1169,129 +1176,29 @@ mod unix_impl {
     }
 
     /// Exclusive advisory lock on `<queue_root>/append.lock` held across
-    /// empty-lane classification and initial dual-replica publication so
-    /// concurrent initializers or writers never interleave (`ADR-RB-05` #1 & #3).
-    struct AppendLockGuard {
+    /// empty-lane classification, recovery, segment append, and dual-replica
+    /// publication so concurrent initializers or writers never interleave
+    /// (`ADR-RB-05` #1 & #3).
+    pub(super) struct AppendLockGuard {
         _fd: OwnedFd,
     }
 
-    fn acquire_append_lock_at(
+    impl AppendLockGuard {
+        pub(super) fn from_fd(fd: OwnedFd) -> Self {
+            Self { _fd: fd }
+        }
+    }
+
+    pub(super) fn acquire_append_lock_at(
         root_fd: &OwnedFd,
         expected_uid: u32,
     ) -> StorageResult<AppendLockGuard> {
-        let cname = osstr_to_cstring(
-            OsStr::new(QUEUE_APPEND_LOCK_FILE),
-            "open capture queue append.lock",
-        )?;
-
-        // Two-step `O_NOFOLLOW` open / `O_CREAT | O_EXCL | O_NOFOLLOW` create
-        // loop: avoids macOS XNU/APFS spurious `ENOENT` races on concurrent
-        // `O_CREAT | O_NOFOLLOW` without `O_EXCL`, rejects both live and
-        // dangling symlinks deterministically, and identifies the exact
-        // creator (`created_now`) without a separate `fstatat` TOCTOU window.
-        let open_existing_flags = libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-        let create_excl_flags =
-            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-        let (lock_fd, created_now) = {
-            let mut acquired = None;
-            for _ in 0..32 {
-                // SAFETY: `root_fd` is valid and `cname` is NUL-terminated.
-                let raw_existing = unsafe {
-                    libc::openat(root_fd.as_raw_fd(), cname.as_ptr(), open_existing_flags)
-                };
-                if raw_existing >= 0 {
-                    // SAFETY: `raw_existing >= 0` is exclusively owned here.
-                    acquired = Some((unsafe { OwnedFd::from_raw_fd(raw_existing) }, false));
-                    break;
-                }
-                let err = io::Error::last_os_error();
-                if is_symlink_errno_at(&err, root_fd, &cname) {
-                    return Err(map_queue_symlink_err("capture queue append.lock"));
-                }
-                if err.kind() != io::ErrorKind::NotFound {
-                    return Err(StorageBackendError::io(
-                        "open capture queue append.lock",
-                        err,
-                    ));
-                }
-
-                // SAFETY: `root_fd` is valid and `cname` is NUL-terminated.
-                let raw_created = unsafe {
-                    libc::openat(
-                        root_fd.as_raw_fd(),
-                        cname.as_ptr(),
-                        create_excl_flags,
-                        QUEUE_FILE_MODE as libc::c_uint,
-                    )
-                };
-                if raw_created >= 0 {
-                    // SAFETY: `raw_created >= 0` is exclusively owned here.
-                    acquired = Some((unsafe { OwnedFd::from_raw_fd(raw_created) }, true));
-                    break;
-                }
-                let err2 = io::Error::last_os_error();
-                if is_symlink_errno_at(&err2, root_fd, &cname) {
-                    return Err(map_queue_symlink_err("capture queue append.lock"));
-                }
-                if err2.kind() == io::ErrorKind::AlreadyExists
-                    || err2.kind() == io::ErrorKind::NotFound
-                {
-                    // Another concurrent initializer/writer won creation; loop back
-                    // to `openat` (which also catches a newly planted symlink).
-                    continue;
-                }
-                return Err(StorageBackendError::io(
-                    "create capture queue append.lock",
-                    err2,
-                ));
-            }
-            acquired.ok_or_else(|| StorageBackendError::BackendInternal {
-                detail: "capture queue append.lock open/create contended past retry bound"
-                    .to_string(),
-            })?
-        };
-
-        let st = fstat_fd(&lock_fd, "stat capture queue append.lock")?;
-        if (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
-            return Err(StorageBackendError::BackendInternal {
-                detail: "capture queue append.lock is not a regular file".to_string(),
-            });
-        }
-        if st.st_uid != expected_uid {
-            return Err(map_queue_owner_mismatch_err("capture queue append.lock"));
-        }
-        if unix_perm_bits(st.st_mode) != QUEUE_FILE_MODE {
-            fchmod_fd(
-                &lock_fd,
-                QUEUE_FILE_MODE,
-                "enforce 0600 mode on capture queue append.lock",
-            )?;
-        }
-
-        loop {
-            // SAFETY: `lock_fd` is a valid open regular file descriptor.
-            let rc = unsafe { libc::flock(lock_fd.as_raw_fd(), libc::LOCK_EX) };
-            if rc == 0 {
-                break;
-            }
-            let err = io::Error::last_os_error();
-            if err.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(StorageBackendError::io(
-                "lock capture queue append.lock",
-                err,
-            ));
-        }
-
-        if created_now {
-            fsync_fd(
-                root_fd,
-                "fsync capture queue root after creating append.lock",
-            )?;
-        }
-
-        Ok(AppendLockGuard { _fd: lock_fd })
+        acquire_named_lock_at(
+            root_fd,
+            QUEUE_APPEND_LOCK_FILE,
+            expected_uid,
+            "capture queue append.lock",
+        )
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1837,9 +1744,13 @@ mod unix_impl {
         ValidNeedsTighten(OwnedFd),
     }
 
-    fn read_bounded_fd(fd: &OwnedFd, max_bytes: usize) -> StorageResult<Vec<u8>> {
-        let mut out = Vec::with_capacity(max_bytes);
-        let mut buf = [0u8; 64];
+    pub(super) fn read_bounded_fd_with_context(
+        fd: &OwnedFd,
+        max_bytes: usize,
+        context: &'static str,
+    ) -> StorageResult<Vec<u8>> {
+        let mut out = Vec::with_capacity(max_bytes.min(4096));
+        let mut buf = [0u8; 4096];
         while out.len() < max_bytes {
             let want = (max_bytes - out.len()).min(buf.len());
             // SAFETY: `fd` is valid and `buf[..want]` is writable.
@@ -1855,10 +1766,7 @@ mod unix_impl {
                 if err.kind() == io::ErrorKind::Interrupted {
                     continue;
                 }
-                return Err(StorageBackendError::io(
-                    "read capture spool tombstone file",
-                    err,
-                ));
+                return Err(StorageBackendError::io(context, err));
             }
             if rc == 0 {
                 break;
@@ -1866,6 +1774,10 @@ mod unix_impl {
             out.extend_from_slice(&buf[..rc as usize]);
         }
         Ok(out)
+    }
+
+    fn read_bounded_fd(fd: &OwnedFd, max_bytes: usize) -> StorageResult<Vec<u8>> {
+        read_bounded_fd_with_context(fd, max_bytes, "read capture spool tombstone file")
     }
 
     fn inspect_spool_tombstone_slot_at(
@@ -2547,7 +2459,7 @@ fn ensure_non_unix_dir(path: &Path, subject: &'static str) -> StorageResult<()> 
 /// (`FILE_FLAG_BACKUP_SEMANTICS`) + `FlushFileBuffers`, failing closed if the
 /// OS refuses or fails to flush directory metadata.
 #[cfg(windows)]
-fn flush_windows_dir(dir: &Path) -> StorageResult<()> {
+pub(super) fn flush_windows_dir(dir: &Path) -> StorageResult<()> {
     use std::os::windows::ffi::OsStrExt as _;
 
     use windows_sys::Win32::{
@@ -2702,8 +2614,47 @@ fn publish_initial_meta_non_unix(
     }
 }
 
+#[cfg(windows)]
+pub(super) fn durable_replace_publish_windows(
+    tmp_path: &Path,
+    target_path: &Path,
+) -> StorageResult<()> {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    let source: Vec<u16> = tmp_path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let destination: Vec<u16> = target_path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: Both `source` and `destination` are valid NUL-terminated UTF-16
+    // buffers alive for the synchronous `MoveFileExW` call.
+    let moved = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        return Err(StorageBackendError::io(
+            "durably replace capture queue metadata with write-through rename",
+            std::io::Error::last_os_error(),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(not(unix))]
-fn acquire_append_lock_non_unix(queue_root: &Path) -> StorageResult<std::fs::File> {
+pub(super) fn acquire_append_lock_non_unix(queue_root: &Path) -> StorageResult<std::fs::File> {
     let lock_path = queue_root.join(QUEUE_APPEND_LOCK_FILE);
     if let Ok(meta) = fs::symlink_metadata(&lock_path) {
         if meta.file_type().is_symlink() {
