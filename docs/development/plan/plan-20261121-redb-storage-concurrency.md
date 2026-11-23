@@ -3725,7 +3725,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `done` / `remote-pending`
+**Lifecycle / Acceptance:** `done` / `remote-verified`
 
 **Description:** 100% 在独占目录 `src/storage/**` 内于 `segment.rs`（纯生产者/段层，零依赖消费者）实现并同卡验收 `append_frame` 在 `sealed.len() == 256`（256×4 KiB 小封存段，合并占用远低于 `256 MiB`）满表恢复后的段内准入路径：当新帧满足 `committed_len + frame_len <= 16 MiB`（不触发轮转）时，放行直接追加至活跃段 `S`、同步推进双副本 `LTM2.COMMITTED_LEN` 并保持 `ACTIVE_SEG == S` 与 `sealed.len() == 256`（不误触发 `LBR-AGENT-046` 轮转背压）。
 
@@ -3784,7 +3784,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `remote-pending`
 
 **Description:** 100% 在独占目录 `src/storage/**` 内于 `segment.rs`（纯生产者/段层，零依赖消费者）实现并同卡验收 `ADR-RB-05` #3 Step ① → Step ② 的严格先后屏障与可注入新帧写路径钩子：在以 256×4 KiB 小封存段（约 1 MiB）加近 16 MiB 活跃段（另一通道为 0）构造、严格满足恢复后合并总容量（含待入队新帧与隔离残尾）`<= 256 MiB`（从而完全排除全局字节上限 Step ② (a) 抢先触发）的满表通道上，当存在未恢复崩溃半帧尾且单次 `enqueue_frame` 待入队新帧满足 `recovered_valid_end + frame_len > 16 MiB` 时，Step ① 先调用 `RB-08t`/`RB-08l` 持久化断电安全隔离与 Case C Step C1 尾损恢复，随后 Step ② 在调用新帧写盘例程**之前**即因 256 封存表上限短路返回 `LBR-AGENT-046`；同卡通过容量隔离断言、写路径零调用插桩、`events-<S>.log` 完整字节逐字节比对与重开校验持久化 `LTM2` 彻底闭环验收。
 
@@ -3800,19 +3800,19 @@
 | 必须显式隔离 `<= 256 MiB` 全局容量上限以证明唯有 256 封存表上限触发 `LBR-AGENT-046`，并以写路径零调用插桩、前缀逐字节比对与重开校验持久化 `LTM2` 严格证明 Step ① 恢复与 Step ② 预写拒收 | `ADR-RB-05` #3 Step ①、Step ② |
 
 **Acceptance criteria:**
-- [ ] **总容量 ≤ `256 MiB` 条件隔离断言：** 以 256×4 KiB 小封存段构造满表夹具，断言恢复后合并总容量 `unconsumed_priority + unconsumed_normal + quarantine + frame_buf.len() <= 256 MiB`（约 17 MiB，确保 Step ② (a) 全局字节上限绝不触发，唯有 Step ② (b) 256 封存表上限可拒收）。
-- [ ] **单次调用返回 `LBR-AGENT-046`：** 在上述含未恢复半帧尾且 `sealed.len() == 256` 的通道上，发起单次 `enqueue_frame`（`recovered_valid_end + frame_len > 16 MiB`）返回 `LBR-AGENT-046`。
-- [ ] **新帧写路径零调用插桩证明：** 通过 `segment.rs` 写入路径可注入插桩钩子断言，上述 AC2 调用期间新帧写盘例程调用次数精确为 `0`（绝未先写入被拒新帧再截断）。
-- [ ] **已恢复段文件逐字节原样留存：** 上述 AC2 调用返回后，磁盘 `events-<S>.log` 完整字节切片与预期已恢复数据（`[0..recovered_valid_end)`）逐字节相等（`actual_bytes == expected_recovered_bytes`）。
-- [ ] **零新建 `S+1` 文件：** 上述 AC2 调用返回后，磁盘目录中不存在 `events-<S+1:08>.log`。
-- [ ] **重开通道校验持久化 `COMMITTED_LEN`：** 关闭句柄并从磁盘重新打开通道加载双副本 `LTM2`，断言持久化 `COMMITTED_LEN == recovered_valid_end`。
-- [ ] **重开通道校验持久化 `PREFIX_CRC32C`：** 上述重开加载的持久化 `LTM2.PREFIX_CRC32C` 精确等于 `crc32c(&expected_recovered_bytes)`。
-- [ ] **重开通道校验持久化 `sealed.len() == 256`：** 上述重开加载的持久化 `LTM2.sealed.len()` 严格等于 `256`。
+- [x] **总容量 ≤ `256 MiB` 条件隔离断言：** 以 256×4 KiB 小封存段构造满表夹具，断言恢复后合并总容量 `unconsumed_priority + unconsumed_normal + quarantine + frame_buf.len() <= 256 MiB`（约 17 MiB，确保 Step ② (a) 全局字节上限绝不触发，唯有 Step ② (b) 256 封存表上限可拒收）。
+- [x] **单次调用返回 `LBR-AGENT-046`：** 在上述含未恢复半帧尾且 `sealed.len() == 256` 的通道上，发起单次 `enqueue_frame`（`recovered_valid_end + frame_len > 16 MiB`）返回 `LBR-AGENT-046`。
+- [x] **新帧写路径零调用插桩证明：** 通过 `segment.rs` 写入路径可注入插桩钩子断言，上述 AC2 调用期间新帧写盘例程调用次数精确为 `0`（绝未先写入被拒新帧再截断）。
+- [x] **已恢复段文件逐字节原样留存：** 上述 AC2 调用返回后，磁盘 `events-<S>.log` 完整字节切片与预期已恢复数据（`[0..recovered_valid_end)`）逐字节相等（`actual_bytes == expected_recovered_bytes`）。
+- [x] **零新建 `S+1` 文件：** 上述 AC2 调用返回后，磁盘目录中不存在 `events-<S+1:08>.log`。
+- [x] **重开通道校验持久化 `COMMITTED_LEN`：** 关闭句柄并从磁盘重新打开通道加载双副本 `LTM2`，断言持久化 `COMMITTED_LEN == recovered_valid_end`。
+- [x] **重开通道校验持久化 `PREFIX_CRC32C`：** 上述重开加载的持久化 `LTM2.PREFIX_CRC32C` 精确等于 `crc32c(&expected_recovered_bytes)`。
+- [x] **重开通道校验持久化 `sealed.len() == 256`：** 上述重开加载的持久化 `LTM2.sealed.len()` 严格等于 `256`。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --no-default-features --features storage-redb --lib -E 'test(=storage::queue::segment::tests::sealed_cap_256_single_call_recovery_then_prewrite_reject_and_reopen)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb --lib -E 'test(=storage::queue::segment::tests::sealed_cap_256_single_call_recovery_then_prewrite_reject_and_reopen)'`（new，覆盖 AC1–AC8）
-- [ ] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 3 文件实现白名单。
+- [x] `source .env.test && cargo nextest list --no-default-features --features storage-redb --lib -E 'test(=storage::queue::segment::tests::sealed_cap_256_single_call_recovery_then_prewrite_reject_and_reopen)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb --lib -E 'test(=storage::queue::segment::tests::sealed_cap_256_single_call_recovery_then_prewrite_reject_and_reopen)'`（new，覆盖 AC1–AC8）
+- [x] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 3 文件实现白名单。
 
 **Full-suite trigger:** `none`
 
@@ -10063,8 +10063,9 @@
 | `RB-08j` | `done` / `remote-verified` | `9bd463e`（`main`） | `0.30.355` | 2026-11-23 10:49 UTC：Stage 1 精确 3 文件写集内仅改动 `src/storage/queue/segment.rs`，实现 `ADR-RB-05` #3 Step ② (b) 常规 16 MiB 轮转预写 `MAX_SEALED_SEGMENTS = 256` 背压守卫（`enforce_rotation_sealed_cap_limit`，Unix/Windows 及 `build_next_append_meta` 纵深防御，于建 `S+1` 或改任何段/元数据前返回 `StorageBackendError::QueueFull` `LBR-AGENT-046`）与队列内部消费原语 `pub(super) reclaim_sealed_segment` / `reclaim_sealed_segment_at_root`（`ADR-RB-05` #4 ③：要求 `seg_id < highwater_seg && seg_id == min_live_seg && seg_id < active_seg && sealed[0].seg_id == seg_id`，严格在 Phase 2 任何元数据修复或 `.tmp` 清理前只读预检高水位/顺序/目标存在性（缺文件报 `CorruptCommittedFrame` `LBR-IO-001` 绝不静默退役）/非软链非目录/属主身份（Unix UID + Windows `GetSecurityInfo` 核 `TokenUser \|\| TokenOwner`），随后先提交双副本 `LTM2` 再 `unlink` + `fsync_dir(lane_dir)`）；`--no-default-features --features storage-redb` `VER1` 1/1、`VER2`（`sealed_cap_256_to_257_normal_rotation_backpressure_and_slot_release` 覆盖 AC1–AC8、256×4KiB 容量隔离、分叉副本零改动拒收未消费/缺段/软链/异属主、`AfterReclaimMetaBeforeUnlink` 崩溃+恢复清理孤儿、`dual LTM2 < ReclaimSegmentUnlink < FsyncLaneDirAfterReclaim` 顺序插桩与释放槽位后 `256→257` 轮转无损解码）、`segment.rs` 16/16 快速回归、`storage-redb` `--lib` 全零警告（含 `dead_code`）、三构型矩阵、fmt、`--lib` clippy（`src/storage/` 零警告）、`compat_version_surface_sync` 全绿；Codex R1 全部 4 项 P1 闭环并经 R2 确认，R2 追加的 Windows 提权令牌 `TokenOwner` 属主兼容已落地，R2 要求的仅 Windows 可跑回归用例因 macOS 宿主限制依用户授权跳过推进；已推 `origin/main` |
 | `RB-08r` | `done` / `remote-verified` | `4326c8a`（`main`） | `0.30.356` | 2026-11-23 11:04 UTC：Stage 1 精确 3 文件写集内仅改动 `src/storage/queue/{mod,segment}.rs`，在 `LaneTailMeta::decode` 中将 O(1) `sealed_count > MAX_SEALED_SEGMENTS (256)` 校验前置于 `LTM2_MAX_LEN` 长度检查（精准返回 `InvalidInvariant` → `LBR-IO-001`），并在 Unix/Windows Phase 1 `phase1_classify_lane_*` 及 `classify_case_d_readonly` 中新增 `ensure_case_d_sealed_capacity` 在扫完有效后继段后、任何旧段尾扫描或 Phase 2 变更前即刻 fail-closed 拒收满 256 封存表的异常有效后继 `S+1`；`--no-default-features --features storage-redb` `VER1` 1/1、`VER2`（`sealed_cap_256_case_d_and_ltm2_decoder_bounds_rejected` 覆盖 AC1–AC6：洁净满表+有效 `S+1` 返回 `LBR-IO-001` 且零写入第 257 项、带有效 `META_CRC32C` 的 257 项 4146B/头超限/`u32::MAX`/`SEALED_COUNT != ACTIVE_SEG - MIN_LIVE_SEG`/`MIN_LIVE_SEG > ACTIVE_SEG`/跨度超 256/非连续 `seg_id` 解码及盘面双副本拒收、以及满表+嵌套损坏旧段尾+有效/半尾 `S+1`+滞后 `tail.meta.bak`+预置 `tail.meta*.tmp` 与 `quarantine/<lane>-*.tmp` 全树零改动快照相等）、`storage::queue::` 24/24 快速回归、`storage-redb` `--lib` 零警告、三构型矩阵、fmt、`--lib` clippy（`src/storage/` 零警告）、`compat_version_surface_sync` 全绿；Codex R1 首轮 `VERDICT: PASS`（P0=0、P1=0、P2=0）；已推 `origin/main` |
 | `RB-08l` | `done` / `remote-verified` | `e82e8b5`（`main`） | `0.30.358` | 2026-11-23 11:17 UTC：Stage 1 精确 3 文件写集内仅改动 `src/storage/queue/segment.rs`，新增共用判定 `should_run_case_c_step_c2`（强制 `has_damaged_tail && committed_len > 0 && sealed.len() < MAX_SEALED_SEGMENTS`）并接入 Unix/Windows `CaseCRecoverTail` 路径（同时在 `build_case_c_step_c2_meta` 补齐 `sealed.len() >= MAX_SEALED_SEGMENTS` 纵深拒收）：满 256 封存表遇半帧尾损崩溃时复用 `case_c_step_c1_*` 完成隔离（`LBR-AGENT-050`）、截断、`sync_data()` 与双副本 `LTM2` 边界提交后严格跳过 Step C2，保持 `ACTIVE_SEG == S`、`sealed.len() == 256` 且零新建 `S+1`；`--no-default-features --features storage-redb` `VER1` 1/1、`VER2`（`sealed_cap_256_case_c_skips_step_c2_and_commits_inplace_boundary` 覆盖 AC1–AC7、>64KiB 同步尾 + 等号边界、严格操作序 `QuarantineFsyncDirComplete < SegmentTruncateStart < SegmentSyncData < dual LTM2`、零 `CreateSegment` 事件与 `should_run_case_c_step_c2`/`build_case_c_step_c2_meta` 真值守卫）、`segment.rs` 18/18 快速回归、`storage-redb` `--lib` 零警告、三构型矩阵、fmt、`--lib` clippy（`src/storage/` 零警告）、`compat_version_surface_sync` 全绿；Codex R1 首轮 `VERDICT: PASS`（P0=0、P1=0、P2=0）；已推 `origin/main` |
-| `RB-08o` | `done` / `remote-pending` | 本提交（`main`） | `0.30.359` | 2026-11-23 11:39 UTC：Stage 1 精确 3 文件写集内仅改动 `src/storage/queue/segment.rs`，完善并实证满 256 封存表（`256×4 KiB` 小封存段，总容量远低于 `256 MiB`）Case C 恢复后 `committed_len + frame_len <= 16 MiB` 段内入队准入路径（Unix/Windows 共用 `should_rotate_active_segment` + `enforce_rotation_sealed_cap_limit`，不误报 `LBR-AGENT-046`，原位追加并推进双副本 `LTM2.COMMITTED_LEN`/`PREFIX_CRC32C`，维持 `ACTIVE_SEG == S`、`sealed.len() == 256` 与零新建 `S+1`）；`--no-default-features --features storage-redb` `VER1` 1/1、`VER2`（`sealed_cap_256_post_recovery_insegment_enqueue_admitted` 覆盖 AC1–AC5：恢复后常规段内入队、真实满表 Case C 恢复后精确 `== 16 MiB` 等号边界准入、以及未恢复满表 Case C 单次 `append_frame` 恢复+段内准入并逐帧核验 `dedup_key`/`flags`/`payload` 及磁盘双副本 `tail.meta`/`tail.meta.bak` 显式解码相等）、`segment.rs` 19/19 快速回归、`storage-redb` `--lib` 零警告、三构型矩阵、fmt、`--lib` clippy（`src/storage/` 零警告）、`compat_version_surface_sync` 全绿；Codex R1 两项测试加强建议闭环并经 R2 确认 P0=0/P1=0（R2 唯一 P2 显式解码 `raw_bak` 亦已一并补齐并重跑 `VER2` 绿灯） |
-| `RB-08s`..`RB-34c`（剩余 102 卡） | `pending` | — | — | Phase 2 推进中，按实施顺序于 `main` 逐卡推进 |
+| `RB-08o` | `done` / `remote-verified` | `df4b8c0`（`main`） | `0.30.359` | 2026-11-23 11:39 UTC：Stage 1 精确 3 文件写集内仅改动 `src/storage/queue/segment.rs`，完善并实证满 256 封存表（`256×4 KiB` 小封存段，总容量远低于 `256 MiB`）Case C 恢复后 `committed_len + frame_len <= 16 MiB` 段内入队准入路径（Unix/Windows 共用 `should_rotate_active_segment` + `enforce_rotation_sealed_cap_limit`，不误报 `LBR-AGENT-046`，原位追加并推进双副本 `LTM2.COMMITTED_LEN`/`PREFIX_CRC32C`，维持 `ACTIVE_SEG == S`、`sealed.len() == 256` 与零新建 `S+1`）；`--no-default-features --features storage-redb` `VER1` 1/1、`VER2`（`sealed_cap_256_post_recovery_insegment_enqueue_admitted` 覆盖 AC1–AC5：恢复后常规段内入队、真实满表 Case C 恢复后精确 `== 16 MiB` 等号边界准入、以及未恢复满表 Case C 单次 `append_frame` 恢复+段内准入并逐帧核验 `dedup_key`/`flags`/`payload` 及磁盘双副本 `tail.meta`/`tail.meta.bak` 显式解码相等）、`segment.rs` 19/19 快速回归、`storage-redb` `--lib` 零警告、三构型矩阵、fmt、`--lib` clippy（`src/storage/` 零警告）、`compat_version_surface_sync` 全绿；Codex R1 两项测试加强建议闭环并经 R2 确认 P0=0/P1=0（R2 唯一 P2 显式解码 `raw_bak` 亦已一并补齐并重跑 `VER2` 绿灯）；已推 `origin/main` |
+| `RB-08s` | `done` / `remote-pending` | 本提交（`main`） | `0.30.362` | 2026-11-23 15:01 UTC：Stage 1 精确 3 文件写集内仅改动 `src/storage/queue/segment.rs`，抽提 Unix/Windows 共用新帧落盘例程 `write_incoming_frame_to_segment` 并接入零发布期开销可注入写盘插桩钩子 `SegmentObserver::with_incoming_frame_write_hook` / `on_incoming_frame_write_attempt`（严格位于 Step ① 恢复与 Step ② (a)/(b) 背压守卫之后）；`--no-default-features --features storage-redb` `VER1` 1/1、`VER2`（`sealed_cap_256_single_call_recovery_then_prewrite_reject_and_reopen` 覆盖 AC1–AC8：256×4KiB 容量隔离含恢复前后 `<= 256 MiB` 双断言、含同步尾与等号边界双态单调用先持久 Step ① 恢复再 Step ② 返回 `LBR-AGENT-046`、可注入钩子精确断言 `0` 次新帧写盘调用且同钩子正向对照入队计 `1` 次、磁盘 `events-00000256.log` 逐字节等于 `expected_recovered_bytes`、零 `events-00000257.log`、重开显式解码 `tail.meta`/`tail.meta.bak` 双副本验证持久化 `COMMITTED_LEN`/`PREFIX_CRC32C`/`sealed.len() == 256` 与公开 `append_encoded_frame` 入口）、`segment.rs` 20/20 快速回归、`storage-redb` `--lib` 零警告、三构型矩阵、fmt、`--lib` clippy（`src/storage/` 零警告）、`compat_version_surface_sync` 全绿；Codex R1 首轮 `VERDICT: PASS`（P0=0、P1=0、P2=0） |
+| `RB-08c`..`RB-34c`（剩余 101 卡） | `pending` | — | — | Phase 2 推进中，按实施顺序于 `main` 逐卡推进 |
 
 ## Codex review log
 

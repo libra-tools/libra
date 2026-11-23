@@ -975,11 +975,16 @@ enum SegmentCrashPoint {
 type BeforeCreateMissingLockHook = Box<dyn FnMut()>;
 
 #[cfg(test)]
+type IncomingFrameWriteHook = Box<dyn FnMut(&'static str, u32, u64, usize)>;
+
+#[cfg(test)]
 struct SegmentObserver {
     events: Vec<SegmentOpEvent>,
     crash_point: SegmentCrashPoint,
     before_create_missing_lock: Option<BeforeCreateMissingLockHook>,
     simulate_foreign_reclaim_owner: bool,
+    incoming_frame_write_calls: usize,
+    on_incoming_frame_write: Option<IncomingFrameWriteHook>,
 }
 
 #[cfg(test)]
@@ -990,6 +995,8 @@ impl SegmentObserver {
             crash_point: SegmentCrashPoint::None,
             before_create_missing_lock: None,
             simulate_foreign_reclaim_owner: false,
+            incoming_frame_write_calls: 0,
+            on_incoming_frame_write: None,
         }
     }
 
@@ -999,6 +1006,8 @@ impl SegmentObserver {
             crash_point,
             before_create_missing_lock: None,
             simulate_foreign_reclaim_owner: false,
+            incoming_frame_write_calls: 0,
+            on_incoming_frame_write: None,
         }
     }
 
@@ -1008,6 +1017,8 @@ impl SegmentObserver {
             crash_point: SegmentCrashPoint::None,
             before_create_missing_lock: Some(Box::new(hook)),
             simulate_foreign_reclaim_owner: false,
+            incoming_frame_write_calls: 0,
+            on_incoming_frame_write: None,
         }
     }
 
@@ -1017,11 +1028,39 @@ impl SegmentObserver {
             crash_point: SegmentCrashPoint::None,
             before_create_missing_lock: None,
             simulate_foreign_reclaim_owner: true,
+            incoming_frame_write_calls: 0,
+            on_incoming_frame_write: None,
+        }
+    }
+
+    fn with_incoming_frame_write_hook(
+        hook: impl FnMut(&'static str, u32, u64, usize) + 'static,
+    ) -> Self {
+        Self {
+            events: Vec::new(),
+            crash_point: SegmentCrashPoint::None,
+            before_create_missing_lock: None,
+            simulate_foreign_reclaim_owner: false,
+            incoming_frame_write_calls: 0,
+            on_incoming_frame_write: Some(Box::new(hook)),
         }
     }
 
     fn simulate_foreign_reclaim_owner(&self) -> bool {
         self.simulate_foreign_reclaim_owner
+    }
+
+    fn on_incoming_frame_write_attempt(
+        &mut self,
+        lane: &'static str,
+        seg_id: u32,
+        offset: u64,
+        len: usize,
+    ) {
+        self.incoming_frame_write_calls += 1;
+        if let Some(hook) = self.on_incoming_frame_write.as_mut() {
+            hook(lane, seg_id, offset, len);
+        }
     }
 
     fn on_before_create_missing_lock(&mut self) {
@@ -1399,6 +1438,42 @@ impl SegmentObserver {
     fn simulate_foreign_reclaim_owner(&self) -> bool {
         false
     }
+
+    #[inline]
+    fn on_incoming_frame_write_attempt(
+        &mut self,
+        _lane: &'static str,
+        _seg_id: u32,
+        _offset: u64,
+        _len: usize,
+    ) {
+    }
+}
+
+/// Shared incoming-frame disk write routine invoked strictly AFTER Step ①
+/// recovery, Step ② (a) global capacity check, and Step ② (b) 256-sealed
+/// rotation backpressure guard (`ADR-RB-05` #3 Step ③–④, `RB-08s` AC3).
+fn write_incoming_frame_to_segment(
+    seg_file: &mut File,
+    lane_label: &'static str,
+    seg_id: u32,
+    frame_offset: u64,
+    frame_buf: &[u8],
+    observer: &mut SegmentObserver,
+) -> StorageResult<()> {
+    observer.on_incoming_frame_write_attempt(lane_label, seg_id, frame_offset, frame_buf.len());
+    seg_file
+        .seek(SeekFrom::Start(frame_offset))
+        .map_err(|e| StorageBackendError::io("seek active capture queue segment", e))?;
+    seg_file
+        .write_all(frame_buf)
+        .map_err(|e| StorageBackendError::io("write capture queue frame", e))?;
+    observer.record_segment_write_all(lane_label, seg_id, frame_offset, frame_buf.len());
+    seg_file
+        .sync_data()
+        .map_err(|e| StorageBackendError::io("sync capture queue segment data", e))?;
+    observer.record_segment_sync_data(lane_label, seg_id);
+    Ok(())
 }
 
 // ============================================================================
@@ -5286,19 +5361,16 @@ mod unix_seg {
             open_existing_active_segment_unix(&lane_fd, seg_id, frame_offset, lane_uid)?
         };
 
-        seg_file
-            .seek(SeekFrom::Start(frame_offset))
-            .map_err(|e| StorageBackendError::io("seek active capture queue segment", e))?;
-
-        // AC2: Single contiguous `write_all` + `seg.sync_data()` inside `append.lock`.
-        seg_file
-            .write_all(frame_buf)
-            .map_err(|e| StorageBackendError::io("write capture queue frame", e))?;
-        observer.record_segment_write_all(lane_label, seg_id, frame_offset, frame_buf.len());
-        seg_file
-            .sync_data()
-            .map_err(|e| StorageBackendError::io("sync capture queue segment data", e))?;
-        observer.record_segment_sync_data(lane_label, seg_id);
+        // AC2: Single contiguous `write_all` + `seg.sync_data()` inside `append.lock`,
+        // reachable strictly AFTER Step ① recovery and Step ② (a)/(b) guards (`RB-08s`).
+        write_incoming_frame_to_segment(
+            &mut seg_file,
+            lane_label,
+            seg_id,
+            frame_offset,
+            frame_buf,
+            observer,
+        )?;
         drop(seg_file);
 
         observer.maybe_crash(SegmentCrashPoint::AfterSegmentSyncData)?;
@@ -7914,17 +7986,14 @@ mod non_unix_seg {
                 }
                 pinned.file
             };
-            seg_file
-                .seek(SeekFrom::Start(frame_offset))
-                .map_err(|e| StorageBackendError::io("seek active capture queue segment", e))?;
-            seg_file
-                .write_all(frame_buf)
-                .map_err(|e| StorageBackendError::io("write capture queue frame", e))?;
-            observer.record_segment_write_all(lane_label, seg_id, frame_offset, frame_buf.len());
-            seg_file
-                .sync_data()
-                .map_err(|e| StorageBackendError::io("sync capture queue segment data", e))?;
-            observer.record_segment_sync_data(lane_label, seg_id);
+            write_incoming_frame_to_segment(
+                &mut seg_file,
+                lane_label,
+                seg_id,
+                frame_offset,
+                frame_buf,
+                observer,
+            )?;
             drop(seg_file);
 
             observer.maybe_crash(SegmentCrashPoint::AfterSegmentSyncData)?;
@@ -17590,6 +17659,372 @@ mod tests {
             assert_eq!(decoded[2].dedup_key, "rb08o-single-new");
             assert_eq!(decoded[2].flags, FRAME_FLAG_NONE);
             assert_eq!(decoded[2].payload, new_payload);
+        }
+    }
+
+    /// `RB-08s` AC1–AC8: Single-call `ADR-RB-05` #3 Step ① -> Step ② barrier
+    /// on a full 256-entry `LTM2.sealed[]` table (`256 × 4 KiB` small sealed
+    /// segments + near-16 MiB active segment with unrecovered damaged half-frame
+    /// tail, total occupancy `<= 256 MiB` strictly isolating Step ② (b)):
+    /// - AC1: Post-recovery combined total (`priority + normal + quarantine +
+    ///   incoming_frame`) `<= 256 MiB` (~17 MiB << 256 MiB).
+    /// - AC2: Single `enqueue`/`append` call where `recovered_valid_end +
+    ///   frame_len > 16 MiB` returns `LBR-AGENT-046` (`QueueFull`).
+    /// - AC3: Injectable write-path hook proves incoming-frame disk write
+    ///   routine call count is EXACTLY `0` (plus positive control proving the
+    ///   exact same hook fires `1` time on an admitted write).
+    /// - AC4: On-disk `events-<S>.log` full bytes equal exact
+    ///   `expected_recovered_bytes` (`[0..recovered_valid_end)`).
+    /// - AC5: Zero `events-<S+1:08>.log` created on disk.
+    /// - AC6–AC8: Closing handles and reopening from disk proves dual `LTM2`
+    ///   persisted `COMMITTED_LEN == recovered_valid_end`,
+    ///   `PREFIX_CRC32C == crc32c(&expected_recovered_bytes)`, and
+    ///   `sealed.len() == 256` (`ACTIVE_SEG == S`).
+    #[test]
+    fn sealed_cap_256_single_call_recovery_then_prewrite_reject_and_reopen() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let build_near_16mib_full_256_unrecovered = |include_synced_tail: bool| {
+            let repo = tempdir().expect("tempdir");
+            let init = init_capture_queue(repo.path()).expect("init capture queue");
+            let normal_dir = init.paths.normal.clone();
+
+            // 256 × 4 KiB small sealed segments (~1 MiB total; sibling lane 0B).
+            let small_frame =
+                encode_frame(FRAME_FLAG_NONE, "rb08s-sealed-4k", &[0x31u8; 4096]).unwrap();
+            let small_len = small_frame.len() as u64;
+            let small_crc = crc32c_checksum(&small_frame);
+            let mut sealed = Vec::with_capacity(MAX_SEALED_SEGMENTS);
+            for seg_id in 0..MAX_SEALED_SEGMENTS as u32 {
+                write_bytes_0600(
+                    &normal_dir.join(segment_log_file_name(seg_id)),
+                    &small_frame,
+                );
+                sealed.push(SealedSegmentMeta {
+                    seg_id,
+                    sealed_len: small_len,
+                    sealed_crc32c: small_crc,
+                });
+            }
+
+            // Fill active `seg 256` so `recovered_valid_end == 16 MiB - 1024`.
+            let active_seg = MAX_SEALED_SEGMENTS as u32; // 256
+            let target_recovered_end = CAPTURE_QUEUE_SEGMENT_ROTATION_BYTES - 1024;
+            let chunk_frame = encode_frame(
+                FRAME_FLAG_NONE,
+                "rb08s-2m-chunk",
+                &vec![0x44u8; 2 * 1024 * 1024],
+            )
+            .unwrap();
+            let mut committed_prefix = Vec::with_capacity(target_recovered_end as usize);
+            while committed_prefix.len() + chunk_frame.len() <= target_recovered_end as usize {
+                committed_prefix.extend_from_slice(&chunk_frame);
+            }
+            let remaining = target_recovered_end as usize - committed_prefix.len();
+            let pad_key = "rb08s-tail-pad";
+            let pad_overhead = FRAME_HEADER_LEN + FRAME_BODY_FIXED_OVERHEAD + pad_key.len();
+            assert!(remaining > pad_overhead);
+            let pad_payload = vec![0x45u8; remaining - pad_overhead];
+            let pad_frame = encode_frame(FRAME_FLAG_NONE, pad_key, &pad_payload).unwrap();
+
+            let expected_recovered_bytes = if include_synced_tail {
+                let mut combined = committed_prefix.clone();
+                combined.extend_from_slice(&pad_frame);
+                combined
+            } else {
+                committed_prefix.extend_from_slice(&pad_frame);
+                committed_prefix.clone()
+            };
+            assert_eq!(expected_recovered_bytes.len() as u64, target_recovered_end);
+
+            let seg256_path = normal_dir.join(segment_log_file_name(active_seg));
+            write_bytes_0600(&seg256_path, &committed_prefix);
+
+            let initial_meta = LaneTailMeta {
+                min_live_seg: 0,
+                active_seg,
+                committed_len: committed_prefix.len() as u64,
+                prefix_crc32c: crc32c_checksum(&committed_prefix),
+                sealed,
+            };
+            let encoded_initial = initial_meta.encode().expect("encode full 256 LTM2");
+            write_bytes_0600(&tail_meta_path(&normal_dir), &encoded_initial);
+            write_bytes_0600(&tail_meta_bak_path(&normal_dir), &encoded_initial);
+
+            // Append uncommitted tail (optional synced frame + damaged half-frame).
+            let half_src = encode_frame(
+                FRAME_FLAG_NONE,
+                "rb08s-crash-half",
+                b"unrecovered-damaged-half-frame-bytes",
+            )
+            .unwrap();
+            let damaged_tail = half_src[..half_src.len() / 2].to_vec();
+            {
+                let mut f = fs::OpenOptions::new()
+                    .append(true)
+                    .open(&seg256_path)
+                    .unwrap();
+                if include_synced_tail {
+                    f.write_all(&pad_frame).unwrap();
+                }
+                f.write_all(&damaged_tail).unwrap();
+                f.sync_data().unwrap();
+            }
+
+            (
+                repo,
+                init,
+                initial_meta,
+                expected_recovered_bytes,
+                damaged_tail,
+            )
+        };
+
+        // Incoming frame (~2 KiB) forces `recovered_valid_end + frame_len > 16 MiB`
+        // (`16 MiB - 1024 + ~2080 > 16 MiB`).
+        let rejected_payload = vec![0x88u8; 2048];
+        let rejected_frame =
+            encode_frame(FRAME_FLAG_NONE, "rb08s-trigger-rotation", &rejected_payload).unwrap();
+
+        // =====================================================================
+        // Part 1 — Both `committed_len < recovered_valid_end < actual_len` AND
+        // equality boundary `committed_len == recovered_valid_end < actual_len`,
+        // with injectable write-path hook verifying 0 incoming-frame writes.
+        // =====================================================================
+        for (case_label, include_synced_tail) in [
+            ("synced-tail-plus-damaged-half", true),
+            ("damaged-half-at-committed-boundary", false),
+        ] {
+            let (repo, init, initial_meta, expected_recovered_bytes, damaged_tail) =
+                build_near_16mib_full_256_unrecovered(include_synced_tail);
+            let normal_dir = &init.paths.normal;
+            let seg256_path = normal_dir.join(segment_log_file_name(256));
+            let seg257_path = normal_dir.join(segment_log_file_name(257));
+            let recovered_valid_end = expected_recovered_bytes.len() as u64;
+            let expected_crc = crc32c_checksum(&expected_recovered_bytes);
+            assert!(
+                recovered_valid_end + rejected_frame.len() as u64
+                    > CAPTURE_QUEUE_SEGMENT_ROTATION_BYTES
+            );
+
+            // AC1 (pre-call): Combined occupancy including incoming frame is far <= 256 MiB.
+            let occ_before = measure_capture_queue_occupancy(repo.path()).expect("occ before");
+            assert_eq!(occ_before.priority_bytes, 0);
+            assert!(
+                occ_before.total_bytes + rejected_frame.len() as u64
+                    <= CAPTURE_QUEUE_MAX_TOTAL_BYTES,
+                "{case_label}: AC1 pre-call occupancy must be <= 256 MiB"
+            );
+
+            // AC2 + AC3: Single call with injectable write-path hook -> Step ①
+            // persists full-256 Case C recovery, then Step ② (b) rejects with
+            // `LBR-AGENT-046` with EXACTLY 0 incoming-frame write calls!
+            let hook_calls = Arc::new(AtomicUsize::new(0));
+            let hook_calls_clone = Arc::clone(&hook_calls);
+            let mut obs = SegmentObserver::with_incoming_frame_write_hook(move |_, _, _, _| {
+                hook_calls_clone.fetch_add(1, Ordering::SeqCst);
+            });
+            let err = append_validated_frame_in_storage_dir(
+                repo.path(),
+                CaptureQueueLane::Normal,
+                &rejected_frame,
+                &mut obs,
+            )
+            .expect_err("AC2: single-call recovery + over-16MiB on full 256 table must return LBR-AGENT-046");
+            assert!(
+                matches!(err, StorageBackendError::QueueFull { .. }),
+                "{case_label}: AC2 violated: expected QueueFull, got {err:?}"
+            );
+            assert_eq!(err.stable_code_str(), "LBR-AGENT-046");
+
+            // AC1 (post-recovery): Combined total (including persisted quarantine
+            // artifact + incoming frame) is STILL strictly <= 256 MiB (~17 MiB).
+            let occ_after = measure_capture_queue_occupancy(repo.path()).expect("occ after");
+            assert_eq!(occ_after.priority_bytes, 0);
+            assert_eq!(occ_after.quarantine_bytes, damaged_tail.len() as u64);
+            assert!(
+                occ_after.total_bytes + rejected_frame.len() as u64
+                    <= CAPTURE_QUEUE_MAX_TOTAL_BYTES,
+                "{case_label}: AC1 violated: post-recovery total ({}) + incoming ({}) must be <= 256 MiB",
+                occ_after.total_bytes,
+                rejected_frame.len()
+            );
+
+            // AC3: Injectable write-path hook & observer confirm 0 incoming writes
+            // and 0 segment creations, while Step ① recovery ran before Step ②!
+            assert_eq!(
+                hook_calls.load(Ordering::SeqCst),
+                0,
+                "{case_label}: AC3 violated — injectable write hook must record 0 calls"
+            );
+            assert_eq!(
+                obs.incoming_frame_write_calls, 0,
+                "{case_label}: AC3 violated — incoming_frame_write_calls must be 0"
+            );
+            assert!(
+                !obs.events
+                    .iter()
+                    .any(|e| matches!(e, SegmentOpEvent::SegmentWriteAll { .. })),
+                "{case_label}: AC3 violated — zero SegmentWriteAll events allowed"
+            );
+            assert!(
+                !obs.events
+                    .iter()
+                    .any(|e| matches!(e, SegmentOpEvent::CreateSegment { .. })),
+                "{case_label}: AC5 violated — zero CreateSegment events allowed"
+            );
+            let q_id = quarantine_artifact_id(
+                CaptureQueueLane::Normal,
+                256,
+                recovered_valid_end,
+                &damaged_tail,
+            );
+            let pos_q = obs
+                .events
+                .iter()
+                .position(|e| {
+                    matches!(e, SegmentOpEvent::QuarantineFsyncDirComplete { id } if id == &q_id)
+                })
+                .expect("Step ① QuarantineFsyncDirComplete");
+            let pos_trunc = obs
+                .events
+                .iter()
+                .position(|e| {
+                    *e == SegmentOpEvent::SegmentTruncateStart {
+                        lane: QUEUE_LANE_NORMAL_DIR,
+                        seg_id: 256,
+                        to_len: recovered_valid_end,
+                    }
+                })
+                .expect("Step ① SegmentTruncateStart");
+            let pos_step_c1_bak = obs
+                .events
+                .iter()
+                .position(|e| {
+                    *e == SegmentOpEvent::FsyncLaneDirAfterMeta {
+                        lane: QUEUE_LANE_NORMAL_DIR,
+                        target_name: QUEUE_TAIL_META_BAK_FILE,
+                    }
+                })
+                .expect("Step ① dual LTM2 commit");
+            let pos_cap = obs
+                .events
+                .iter()
+                .position(|e| matches!(e, SegmentOpEvent::CapacityChecked { .. }))
+                .expect("Step ② CapacityChecked");
+            assert!(pos_q < pos_trunc && pos_trunc < pos_step_c1_bak && pos_step_c1_bak < pos_cap);
+
+            // AC4: Disk `events-00000256.log` byte-for-byte equals `expected_recovered_bytes`,
+            // and damaged tail was durably persisted to `quarantine/<q_id>.bin`.
+            assert_eq!(
+                fs::read(init.paths.quarantine.join(format!("{q_id}.bin"))).unwrap(),
+                damaged_tail
+            );
+            let actual_seg256 = fs::read(&seg256_path).unwrap();
+            assert_eq!(
+                actual_seg256, expected_recovered_bytes,
+                "{case_label}: AC4 violated — events-00000256.log must equal expected_recovered_bytes"
+            );
+
+            // AC5: Zero `events-00000257.log` created on disk.
+            assert!(
+                !seg257_path.exists(),
+                "{case_label}: AC5 violated — events-00000257.log must not exist"
+            );
+
+            // AC6, AC7, AC8: Reopen channel fresh from disk and verify dual `LTM2`
+            // persisted `COMMITTED_LEN`, `PREFIX_CRC32C`, and `sealed.len() == 256`.
+            drop(obs);
+            let reopened_converged = read_converged_lane_tail_meta(normal_dir)
+                .expect("reopen read_converged_lane_tail_meta must succeed");
+            let raw_meta = fs::read(tail_meta_path(normal_dir)).unwrap();
+            let raw_bak = fs::read(tail_meta_bak_path(normal_dir)).unwrap();
+            assert_eq!(raw_meta, raw_bak);
+            let disk_meta = LaneTailMeta::decode(&raw_meta).unwrap();
+            let disk_bak = LaneTailMeta::decode(&raw_bak).unwrap();
+            assert_eq!(disk_meta, disk_bak);
+            assert_eq!(disk_meta, reopened_converged);
+            assert_eq!(
+                disk_meta.committed_len, recovered_valid_end,
+                "{case_label}: AC6 violated — persisted COMMITTED_LEN mismatch"
+            );
+            assert_eq!(
+                disk_meta.prefix_crc32c, expected_crc,
+                "{case_label}: AC7 violated — persisted PREFIX_CRC32C mismatch"
+            );
+            assert_eq!(
+                disk_meta.sealed.len(),
+                MAX_SEALED_SEGMENTS,
+                "{case_label}: AC8 violated — persisted sealed.len() must equal 256"
+            );
+            assert_eq!(disk_meta.sealed, initial_meta.sealed);
+            assert_eq!(disk_meta.active_seg, 256);
+
+            // Reopen `recover_lane` is a clean Case A no-op (zero additional recovery).
+            let clean_reopen = recover_lane(repo.path(), CaptureQueueLane::Normal)
+                .expect("clean reopen after Step ① persistence must succeed");
+            assert_eq!(clean_reopen.recovered_frames, 0);
+            assert!(clean_reopen.quarantined_artifacts.is_empty());
+            assert_eq!(clean_reopen.meta, disk_meta);
+
+            // Positive control for AC3 hook: an admitted in-segment small frame
+            // (`16 MiB - 1024 + ~128 <= 16 MiB`) using the EXACT same injectable
+            // write-path hook increments the hook counter from 0 -> 1!
+            let small_admit =
+                encode_frame(FRAME_FLAG_NONE, "rb08s-hook-positive", b"tiny-admit").unwrap();
+            assert!(
+                recovered_valid_end + small_admit.len() as u64
+                    <= CAPTURE_QUEUE_SEGMENT_ROTATION_BYTES
+            );
+            let pos_hook_calls = Arc::new(AtomicUsize::new(0));
+            let pos_hook_clone = Arc::clone(&pos_hook_calls);
+            let mut pos_obs = SegmentObserver::with_incoming_frame_write_hook(move |_, _, _, _| {
+                pos_hook_clone.fetch_add(1, Ordering::SeqCst);
+            });
+            let pos_out = append_validated_frame_in_storage_dir(
+                repo.path(),
+                CaptureQueueLane::Normal,
+                &small_admit,
+                &mut pos_obs,
+            )
+            .expect("positive control in-segment append must succeed");
+            assert_eq!(pos_hook_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(pos_obs.incoming_frame_write_calls, 1);
+            assert_eq!(pos_out.seg_id, 256);
+            assert_eq!(pos_out.frame_offset, recovered_valid_end);
+        }
+
+        // =====================================================================
+        // Part 2 — Public `append_encoded_frame` entry point confirms identical
+        // Step ① persistence + Step ② `LBR-AGENT-046` rejection + reopen checks.
+        // =====================================================================
+        {
+            let (repo, init, initial_meta, expected_recovered_bytes, _damaged_tail) =
+                build_near_16mib_full_256_unrecovered(true);
+            let normal_dir = &init.paths.normal;
+            let seg256_path = normal_dir.join(segment_log_file_name(256));
+            let seg257_path = normal_dir.join(segment_log_file_name(257));
+
+            let err = append_encoded_frame(repo.path(), CaptureQueueLane::Normal, &rejected_frame)
+                .expect_err("public append_encoded_frame must return LBR-AGENT-046");
+            assert!(matches!(err, StorageBackendError::QueueFull { .. }));
+            assert_eq!(err.stable_code_str(), "LBR-AGENT-046");
+            assert_eq!(fs::read(&seg256_path).unwrap(), expected_recovered_bytes);
+            assert!(!seg257_path.exists());
+            let reopened = read_converged_lane_tail_meta(normal_dir).unwrap();
+            assert_eq!(
+                reopened.committed_len,
+                expected_recovered_bytes.len() as u64
+            );
+            assert_eq!(
+                reopened.prefix_crc32c,
+                crc32c_checksum(&expected_recovered_bytes)
+            );
+            assert_eq!(reopened.sealed.len(), MAX_SEALED_SEGMENTS);
+            assert_eq!(reopened.sealed, initial_meta.sealed);
         }
     }
 }
