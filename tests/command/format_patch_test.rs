@@ -2411,6 +2411,17 @@ fn format_patch_snapshot(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec
                 .strip_prefix(root)
                 .expect("snapshot is within root")
                 .to_path_buf();
+            // Volatile bookkeeping (SQLite, oplog, logs, repair locks) changes
+            // asynchronously and is not a refusal side effect.
+            let volatile = relative.to_string_lossy().to_string();
+            if volatile.contains("libra.db")
+                || volatile.contains("oplog")
+                || volatile.contains("logs")
+                || volatile.contains("object-index-repair-locks")
+                || volatile.ends_with(".lock")
+            {
+                continue;
+            }
             let value = if metadata.is_symlink() {
                 fs::read_link(&path)
                     .expect("read snapshot symlink")
@@ -2753,4 +2764,282 @@ fn diff_renames_false_disables_detection() {
     assert!(!body.contains("similarity index"), "no similarity: {body}");
     assert!(body.contains("deleted file mode"), "deletion side: {body}");
     assert!(body.contains("new file mode"), "addition side: {body}");
+}
+
+// ---------------------------------------------------------------------------
+// FP-06: rename-detection parameters (-M / --find-renames / --no-renames)
+// ---------------------------------------------------------------------------
+
+fn repo_with_renamed_file(partial: bool) -> tempfile::TempDir {
+    let repo = create_committed_repo_via_cli();
+    let body: String = (1..=20).map(|n| format!("line{n}\n")).collect();
+    fs::write(repo.path().join("file"), &body).unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "file"], repo.path()),
+        "add file",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], repo.path()),
+        "commit base",
+    );
+    assert_cli_success(
+        &run_libra_command(&["mv", "file", "renamed"], repo.path()),
+        "mv file renamed",
+    );
+    if partial {
+        let edited = body
+            .replace("line1\n", "one\n")
+            .replace("line2\n", "two\n")
+            .replace("line3\n", "three\n");
+        fs::write(repo.path().join("renamed"), edited).unwrap();
+        assert_cli_success(
+            &run_libra_command(&["add", "renamed"], repo.path()),
+            "add renamed",
+        );
+    }
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "rename", "--no-verify"], repo.path()),
+        "commit rename",
+    );
+    repo
+}
+
+fn rename_detected(repo: &tempfile::TempDir, args: &[&str]) -> bool {
+    let output = run_libra_command(args, repo.path());
+    assert_cli_success(&output, &format!("{args:?}"));
+    String::from_utf8_lossy(&output.stdout).contains("rename from")
+}
+
+#[test]
+fn fp06_threshold_above_similarity() {
+    let repo = repo_with_renamed_file(true);
+    assert!(
+        !rename_detected(&repo, &["format-patch", "-M90%", "-1", "--stdout"]),
+        "-M90% must not detect a ~78% rename"
+    );
+}
+
+#[test]
+fn fp06_no_renames() {
+    let repo = repo_with_renamed_file(false);
+    assert!(!rename_detected(
+        &repo,
+        &["format-patch", "--no-renames", "-1", "--stdout"]
+    ));
+}
+
+#[test]
+fn fp06_find_renames_beats_config() {
+    let repo = repo_with_renamed_file(false);
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "diff.renames", "false"], repo.path()),
+        "config diff.renames",
+    );
+    assert!(rename_detected(
+        &repo,
+        &["format-patch", "--find-renames", "-1", "--stdout"]
+    ));
+}
+
+#[test]
+fn fp06_no_renames_last_wins() {
+    let repo = repo_with_renamed_file(false);
+    assert!(!rename_detected(
+        &repo,
+        &["format-patch", "-M", "--no-renames", "-1", "--stdout"]
+    ));
+}
+
+#[test]
+fn fp06_find_renames_last_wins() {
+    let repo = repo_with_renamed_file(false);
+    assert!(rename_detected(
+        &repo,
+        &["format-patch", "--no-renames", "-M", "-1", "--stdout"]
+    ));
+}
+
+#[test]
+fn fp06_bare_m_before_stdout() {
+    let repo = repo_with_rename_branch();
+    assert!(rename_detected(
+        &repo,
+        &["format-patch", "-M", "--stdout", "lorem"]
+    ));
+}
+
+#[test]
+fn fp06_bare_m_before_revision() {
+    let repo = repo_with_rename_branch();
+    let first = run_libra_command(&["format-patch", "-M", "--stdout", "lorem"], repo.path());
+    let second = run_libra_command(&["format-patch", "-M", "lorem", "--stdout"], repo.path());
+    assert_cli_success(&first, "first ordering");
+    assert_cli_success(&second, "second ordering");
+    assert_eq!(
+        first.stdout, second.stdout,
+        "bare -M must not swallow the revision"
+    );
+}
+
+fn repo_with_rename_branch() -> tempfile::TempDir {
+    let repo = repo_with_renamed_file(false);
+    assert_cli_success(
+        &run_libra_command(&["branch", "lorem", "HEAD~1"], repo.path()),
+        "branch lorem",
+    );
+    repo
+}
+
+refusal_gates!(
+    &["format-patch", "-Mfoo", "-1", "--stdout"],
+    "invalid argument to find-renames: 'foo'";
+    fp06_bad_threshold__msg => Message,
+    fp06_bad_threshold__code => Code,
+    fp06_bad_threshold__exit => Exit,
+    fp06_bad_threshold__stdout => Stdout,
+    fp06_bad_threshold__fs => Files,
+    fp06_bad_threshold__json => Json,
+    fp06_bad_threshold__machine => Machine,
+);
+
+// ---------------------------------------------------------------------------
+// FP-07: `format-patch --numstat`
+// ---------------------------------------------------------------------------
+
+fn repo_with_body_and_change() -> tempfile::TempDir {
+    let repo = create_committed_repo_via_cli();
+    fs::write(repo.path().join("file.txt"), "one\ntwo\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "file.txt"], repo.path()),
+        "add one",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &["commit", "-m", "numstat base", "--no-verify"],
+            repo.path(),
+        ),
+        "commit base",
+    );
+    fs::write(repo.path().join("file.txt"), "one\ntwo\nthree\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "file.txt"], repo.path()),
+        "add two",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &["commit", "-m", "numstat change\n\nbody line", "--no-verify"],
+            repo.path(),
+        ),
+        "commit change",
+    );
+    repo
+}
+
+fn body_section(stdout: &str) -> String {
+    let after_headers = stdout
+        .split_once("\n\n")
+        .map(|(_, rest)| rest.to_string())
+        .expect("header/body separator");
+    match after_headers.split_once("diff --git ") {
+        Some((body, _)) => body.to_string(),
+        None => after_headers,
+    }
+}
+
+#[test]
+fn numstat_replaces_the_stat_block() {
+    let repo = repo_with_body_and_change();
+    let output = run_libra_command(
+        &["format-patch", "--numstat", "-1", "--stdout"],
+        repo.path(),
+    );
+    assert_cli_success(&output, "--numstat");
+    let stdout_text = String::from_utf8_lossy(&output.stdout);
+    let body = body_section(&stdout_text);
+    assert!(!body.contains("---\n"), "no `---` separator: {body}");
+    assert!(body.contains("1\t0\tfile.txt"), "numstat line: {body}");
+    assert!(
+        !body.contains("file changed"),
+        "no diffstat summary: {body}"
+    );
+}
+
+#[test]
+fn numstat_matches_libra_diff_numstat() {
+    let repo = repo_with_body_and_change();
+    let output = run_libra_command(
+        &["format-patch", "--numstat", "-1", "--stdout"],
+        repo.path(),
+    );
+    assert_cli_success(&output, "--numstat");
+    let stdout_text = String::from_utf8_lossy(&output.stdout);
+    let body = body_section(&stdout_text);
+    let numstat_line = body
+        .lines()
+        .find(|line| line.contains("\tfile.txt"))
+        .expect("numstat row");
+    let head = run_libra_command(&["rev-parse", "HEAD"], repo.path());
+    let parent = run_libra_command(&["rev-parse", "HEAD~1"], repo.path());
+    let head_id = String::from_utf8_lossy(&head.stdout).trim().to_string();
+    let parent_id = String::from_utf8_lossy(&parent.stdout).trim().to_string();
+    let diff = run_libra_command(&["diff", "--numstat", &parent_id, &head_id], repo.path());
+    assert_cli_success(&diff, "diff --numstat");
+    let expected = String::from_utf8_lossy(&diff.stdout)
+        .trim_end_matches('\n')
+        .to_string();
+    assert_eq!(numstat_line, expected, "numstat vs libra diff --numstat");
+}
+
+#[test]
+fn numstat_still_emits_every_patch() {
+    let repo = repo_with_commits(5);
+    let output = run_libra_command(
+        &["format-patch", "--numstat", "--stdout", "HEAD~2..HEAD"],
+        repo.path(),
+    );
+    assert_cli_success(&output, "--numstat range");
+    let stdout_text = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        stdout_text.matches("diff --git a/").count(),
+        2,
+        "two patches in range: {stdout_text}"
+    );
+}
+
+#[test]
+fn no_stat_with_numstat_keeps_numstat() {
+    let repo = repo_with_body_and_change();
+    let plain = run_libra_command(
+        &["format-patch", "--numstat", "-1", "--stdout"],
+        repo.path(),
+    );
+    let with_p = run_libra_command(
+        &["format-patch", "-p", "--numstat", "-1", "--stdout"],
+        repo.path(),
+    );
+    assert_cli_success(&plain, "--numstat");
+    assert_cli_success(&with_p, "-p --numstat");
+    assert_eq!(plain.stdout, with_p.stdout, "`-p` must not drop numstat");
+}
+
+#[test]
+fn numstat_lives_in_the_attach_text_part() {
+    let repo = repo_with_body_and_change();
+    let output = run_libra_command(
+        &["format-patch", "--numstat", "--attach", "-1", "--stdout"],
+        repo.path(),
+    );
+    assert_cli_success(&output, "--numstat --attach");
+    let stdout_text = String::from_utf8_lossy(&output.stdout);
+    let text_part_start = stdout_text
+        .find("Content-Type: text/plain")
+        .expect("text part header");
+    let patch_part_start = stdout_text
+        .find("Content-Type: text/x-patch")
+        .expect("patch part header");
+    let numstat_pos = stdout_text.find("1\t0\tfile.txt").expect("numstat line");
+    assert!(
+        numstat_pos > text_part_start && numstat_pos < patch_part_start,
+        "numstat must stay in the text/plain part"
+    );
 }

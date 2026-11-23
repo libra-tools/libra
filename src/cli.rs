@@ -1057,6 +1057,42 @@ fn canonical_command_name(args: Option<&[&str]>) -> Option<String> {
 /// See: [`tests::clap_alias_br_resolves_to_branch`] and friends for related parser
 /// behaviour. The exact rewrite is exercised end-to-end by the integration tests in
 /// `tests/command/log_test.rs`.
+/// Rewrite Git's attached `-M<n>`/`-M<n>%` shorthand into the long
+/// `--find-renames=<n>` form before clap sees it. A bare `-M` is untouched so it
+/// never swallows the revision argument.
+fn rewrite_format_patch_rename_args(args: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
+    let Some((command_index, _)) = find_subcommand_index(&args) else {
+        return args;
+    };
+    if !matches!(args.get(command_index), Some(name) if name == "format-patch") {
+        return args;
+    }
+    let mut out: Vec<std::ffi::OsString> = Vec::with_capacity(args.len());
+    out.extend(args.iter().take(command_index + 1).cloned());
+    let mut after_double_dash = false;
+    for arg in args.into_iter().skip(command_index + 1) {
+        if after_double_dash {
+            out.push(arg);
+            continue;
+        }
+        if arg == "--" {
+            after_double_dash = true;
+            out.push(arg);
+            continue;
+        }
+        let text = arg.to_string_lossy().to_string();
+        if let Some(rest) = text.strip_prefix("-M")
+            && !rest.is_empty()
+            && !rest.starts_with('-')
+        {
+            out.push(std::ffi::OsString::from(format!("--find-renames={rest}")));
+            continue;
+        }
+        out.push(arg);
+    }
+    out
+}
+
 fn rewrite_short_number_args(
     args: Vec<std::ffi::OsString>,
     command: &str,
@@ -3712,6 +3748,7 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
     // `format-patch -<n>` is Git's "last n commits" shorthand (the same numeric
     // form `log -<n>` uses); it rewrites to the hidden `--last-n <n>`.
     let argv = rewrite_short_number_args_to(argv, "format-patch", "--last-n");
+    let argv = rewrite_format_patch_rename_args(argv);
     let argv = rewrite_index_pack_progress_args(argv);
     let argv = rewrite_clone_progress_args(argv);
     let argv = rewrite_reset_pathspec_separator_args(argv);

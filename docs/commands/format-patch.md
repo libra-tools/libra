@@ -89,6 +89,18 @@ fallback.
 
 ## Examples
 
+### `--numstat`
+
+`--numstat` replaces the diffstat with a numstat block
+(`<insertions>\t<deletions>\t<path>`, renames shown as `{old => new}`, binaries as
+`-\t-`) and omits the `---` separator line; the patches are still emitted. The
+lines are byte-identical to `libra diff --numstat`. `-p` (`--no-stat`) does not
+suppress numstat.
+
+```bash
+libra format-patch --numstat -1 --stdout
+```
+
 ### Rename detection in the patch body
 
 The patch body and diffstat are produced by the same engine as `libra diff`, so

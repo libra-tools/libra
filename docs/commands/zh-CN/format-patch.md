@@ -73,6 +73,14 @@ Merge commits 默认跳过。当 revision range 解析为零个提交时，命�
 
 ## 示例
 
+### `--numstat`
+
+`--numstat` 用 numstat 块替换 diffstat（`<插入>\t<删除>\t<路径>`，重命名显示为 `{old => new}`，二进制为 `-\t-`），并省略 `---` 分隔行；补丁照常输出。各行与 `libra diff --numstat` 逐字节相同。`-p`（`--no-stat`）不会抑制 numstat。
+
+```bash
+libra format-patch --numstat -1 --stdout
+```
+
 ### 补丁正文中的重命名检测
 
 补丁正文与 diffstat 由与 `libra diff` 相同的引擎生成，默认检测重命名（Git 的 50% 阈值）并遵循 `diff.renames`：纯重命名输出 `similarity index 100%` 与 `rename from`/`rename to`，不含内容 hunk；`diff.renames=false` 则输出删除 + 新增两段。该设置只影响正文，不改变提交选择。

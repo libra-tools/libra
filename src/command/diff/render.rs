@@ -276,28 +276,7 @@ pub(super) fn render_diff_output(
             args.null,
         )
     } else if args.numstat {
-        join_diff_records(
-            result.files.iter().map(|file| {
-                // Binary files report `-` for both counts (matching Git).
-                let (ins, del) = if file.binary.is_some() {
-                    ("-".to_string(), "-".to_string())
-                } else {
-                    (file.insertions.to_string(), file.deletions.to_string())
-                };
-                if file.status == "renamed" {
-                    let from = file.rename_from.as_deref().unwrap_or("");
-                    if args.null {
-                        // `<ins>\t<del>\t\0<old>\0<new>` (empty path column, then NUL-separated).
-                        format!("{ins}\t{del}\t\0{from}\0{}", file.path)
-                    } else {
-                        format!("{ins}\t{del}\t{}", rename_display(from, &file.path))
-                    }
-                } else {
-                    format!("{ins}\t{del}\t{}", file.path)
-                }
-            }),
-            args.null,
-        )
+        format_numstat_output(result, args.null)
     } else if args.stat || args.compact_summary {
         format_diff_stat_output_with_compact(result, args.compact_summary)
     } else if args.shortstat {
@@ -676,6 +655,33 @@ pub(super) fn format_diff_shortstat_output(result: &DiffOutput) -> String {
         ));
     }
     line
+}
+
+/// The numstat block (`<ins>\t<del>\t<path>`, renames as `{old => new}`, binary
+/// files as `-\t-`), shared by `libra diff` and `format-patch --numstat`.
+pub(crate) fn format_numstat_output(result: &DiffOutput, null: bool) -> String {
+    join_diff_records(
+        result.files.iter().map(|file| {
+            // Binary files report `-` for both counts (matching Git).
+            let (ins, del) = if file.binary.is_some() {
+                ("-".to_string(), "-".to_string())
+            } else {
+                (file.insertions.to_string(), file.deletions.to_string())
+            };
+            if file.status == "renamed" {
+                let from = file.rename_from.as_deref().unwrap_or("");
+                if null {
+                    // `<ins>\t<del>\t\0<old>\0<new>` (empty path column, then NUL-separated).
+                    format!("{ins}\t{del}\t\0{from}\0{}", file.path)
+                } else {
+                    format!("{ins}\t{del}\t{}", rename_display(from, &file.path))
+                }
+            } else {
+                format!("{ins}\t{del}\t{}", file.path)
+            }
+        }),
+        null,
+    )
 }
 
 pub(crate) fn format_diff_stat_output(result: &DiffOutput) -> String {

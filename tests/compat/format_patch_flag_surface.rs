@@ -54,6 +54,7 @@ fn format_patch_help_lists_expected_flags() {
         "--full-index",
         "--minimal",
         "--histogram",
+        "--numstat",
         "--ignore-if-in-upstream",
         "--src-prefix",
         "--dst-prefix",

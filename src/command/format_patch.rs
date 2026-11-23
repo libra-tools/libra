@@ -269,6 +269,28 @@ pub struct FormatPatchArgs {
     #[arg(long = "histogram")]
     pub histogram: bool,
 
+    /// Detect renames at or above the given similarity (Git's `-M`); a bare
+    /// `-M` keeps the 50% default and never swallows the revision
+    #[arg(
+        short = 'M',
+        long = "find-renames",
+        value_name = "N",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "50%",
+        overrides_with = "no_renames"
+    )]
+    pub find_renames: Option<String>,
+
+    /// Disable rename detection entirely (last of `-M`/`--no-renames` wins)
+    #[arg(long = "no-renames", overrides_with = "find_renames")]
+    pub no_renames: bool,
+
+    /// Show a numstat block instead of the default diffstat and omit the `---`
+    /// separator line
+    #[arg(long = "numstat")]
+    pub numstat: bool,
+
     /// Omit commits whose stable patch-id already exists on the excluded side
     /// of the revision range.
     #[arg(long = "ignore-if-in-upstream")]
@@ -478,6 +500,15 @@ pub async fn execute_safe(mut args: FormatPatchArgs, output: &OutputConfig) -> C
     }
 
     validate_cli_args(&args)?;
+    // A malformed `-M` threshold is a usage error before any patch is written.
+    if let Some(raw) = args.find_renames.as_deref()
+        && crate::command::diff::options::parse_rename_score(raw).is_err()
+    {
+        return Err(
+            CliError::fatal(format!("invalid argument to find-renames: '{raw}'"))
+                .with_stable_code(StableErrorCode::CliInvalidArguments),
+        );
+    }
 
     resolve_format_config(&mut args).await?;
 
@@ -938,8 +969,14 @@ async fn format_patch_body(
     }
     // The body and diffstat come from the shared `libra diff` engine so rename
     // detection (and `diff.renames`) applies by default (ADR-FP-03).
-    let (stat_text, diff) = diff_engine_patch_parts(commit, args).await?;
-    if !args.no_stat && !stat_text.is_empty() {
+    let (stat_text, numstat_text, diff) = diff_engine_patch_parts(commit, args).await?;
+    if args.numstat && !numstat_text.is_empty() {
+        // `--numstat` replaces the stat block, drops the `---` separator, and is
+        // not suppressed by `-p`/`--no-stat` (its own flag is the only switch).
+        message_section = message_section.trim_end_matches("---\n").to_string();
+        message_section.push_str(&numstat_text);
+        message_section.push('\n');
+    } else if !args.no_stat && !stat_text.is_empty() {
         message_section.push_str(&stat_text);
         message_section.push('\n');
     }
@@ -1851,7 +1888,7 @@ fn suffix(args: &FormatPatchArgs) -> &str {
 async fn diff_engine_patch_parts(
     commit: &Commit,
     args: &FormatPatchArgs,
-) -> Result<(String, String), CliError> {
+) -> Result<(String, String, String), CliError> {
     if let Some(parent) = commit.parent_commit_ids.first() {
         // `DiffArgs` keeps private bookkeeping fields, so build it through its
         // clap definition like the CLI does.
@@ -1861,6 +1898,11 @@ async fn diff_engine_patch_parts(
         }
         if args.full_index {
             argv.push("--full-index".to_string());
+        }
+        if args.no_renames {
+            argv.push("--no-renames".to_string());
+        } else if let Some(score) = &args.find_renames {
+            argv.push(format!("--find-renames={score}"));
         }
         if let Some(prefix) = &args.src_prefix {
             argv.push(format!("--src-prefix={prefix}"));
@@ -1874,18 +1916,19 @@ async fn diff_engine_patch_parts(
             .map_err(|error| CliError::command_usage(error.to_string()))?;
         let output = crate::command::diff::run_diff_for_service(diff_args).await?;
         let stat = crate::command::diff::render::format_diff_stat_output(&output);
+        let numstat = crate::command::diff::render::format_numstat_output(&output, false);
         let mut patch = crate::command::diff::render::format_unified_diff(&output);
         if !patch.is_empty() && !patch.ends_with('\n') {
             patch.push('\n');
         }
-        return Ok((stat, patch));
+        return Ok((stat, numstat, patch));
     }
     let mut stat = String::new();
     if let Ok(stats) = log::compute_commit_stat(commit, vec![]).await {
         stat = format_diffstat_plain(&stats);
     }
     let patch = log::generate_diff_with_options(commit, vec![], &commit_diff_options(args)).await?;
-    Ok((stat, patch))
+    Ok((stat, String::new(), patch))
 }
 
 fn commit_diff_options(args: &FormatPatchArgs) -> log::CommitDiffOptions {
