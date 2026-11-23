@@ -29,6 +29,8 @@ pub mod manifest;
 pub mod meta;
 #[cfg(feature = "storage-redb")]
 pub mod opener;
+#[cfg(feature = "storage-queue")]
+pub mod queue;
 #[cfg(feature = "storage-redb")]
 pub mod redb;
 #[cfg(feature = "storage-sqlite")]
@@ -168,6 +170,12 @@ pub use opener::{
     RedbRepairContext, RedbRepairReport, RedbWriteProfile, begin_write_bounded,
     begin_write_bounded_blocking, commit_write_bounded, create_redb_writable, open_redb_read_only,
     open_redb_writable, open_redb_writable_for_repair, repair_redb_explicit,
+};
+#[cfg(feature = "storage-queue")]
+pub use queue::{
+    DecodedFrame, FRAME_BODY_FIXED_OVERHEAD, FRAME_FLAG_NONE, FRAME_FLAG_PRIORITY,
+    FRAME_HEADER_LEN, FRAME_MAGIC, FrameDecodeError, FrameEncodeError, crc32c_append,
+    crc32c_checksum, decode_frame, decode_postcard_payload, encode_frame, encode_postcard_frame,
 };
 #[cfg(feature = "storage-redb")]
 pub use redb::RedbConfigStore;

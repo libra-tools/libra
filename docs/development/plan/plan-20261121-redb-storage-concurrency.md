@@ -2296,7 +2296,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `done` / `remote-pending`
+**Lifecycle / Acceptance:** `done` / `remote-verified`
 
 **Description:** 100% 在独占目录 `src/storage/**` 内补齐 `cross_store.rs` 的显式修复入口 `reconcile_pending_intents()`、修复后只读三步一致快照（`g1 == c1 == g2`）冻结、已对账意图（`gen <= capture_gen`）自动清理防无限增长以及重复调用幂等性。
 
@@ -2352,7 +2352,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `remote-pending`
 
 **Description:** 100% 在独占目录 `src/storage/**` 内实现 `ADR-RB-05` #2 双校验帧线协议编码与无损往返解码核心（`src/storage/queue/frame.rs`）：采用 `crc32c 0.6.9` Castagnoli 多项式实现固定 16 字节自认证帧头 `[MAGIC: 4B = b"LCE1"][FRAME_BODY_LEN: u32_le][HEADER_CRC32C: u32_le][FRAME_CRC32C: u32_le]` + `[FLAGS][DEDUP_KEY_LEN][DEDUP_KEY_UTF8][POSTCARD_ENVELOPE]`（`HEADER_CRC32C` 覆盖前 8 字节，`FRAME_CRC32C` 覆盖全帧非校验字段），并携带完整 UTF-8 语义 `dedup_key`。
 
@@ -2369,15 +2369,15 @@
 | `Cargo.toml:103` 基线仅含 IEEE `crc32fast`（非 CRC32C），须以 `crc32c 0.6.9` 落实 RFC 3720 双校验 16B 自认证帧头与全量去重键帧格式 | `Cargo.toml:103`；`ADR-RB-05` #2 |
 
 **Acceptance criteria:**
-- [ ] `frame::crc32c_checksum` 通过 RFC 3720 标准测试向量 `b"123456789" -> 0xe3069283`。
-- [ ] 帧编码产出固定 16 字节头（含 `MAGIC=b"LCE1"`、`FRAME_BODY_LEN`、覆盖前 8 字节的 `HEADER_CRC32C` 与覆盖全帧的 `FRAME_CRC32C`）。
-- [ ] 合法编码帧经单帧解码器可 100% 无损往返恢复原始 `flags`、`dedup_key` 与 `postcard` 负载。
-- [ ] 帧编码携带完整语义 UTF-8 `dedup_key`，两个仅末尾 1 字节不同的长键解码后完整区分无碰撞。
+- [x] `frame::crc32c_checksum` 通过 RFC 3720 标准测试向量 `b"123456789" -> 0xe3069283`。
+- [x] 帧编码产出固定 16 字节头（含 `MAGIC=b"LCE1"`、`FRAME_BODY_LEN`、覆盖前 8 字节的 `HEADER_CRC32C` 与覆盖全帧的 `FRAME_CRC32C`）。
+- [x] 合法编码帧经单帧解码器可 100% 无损往返恢复原始 `flags`、`dedup_key` 与 `postcard` 负载。
+- [x] 帧编码携带完整语义 UTF-8 `dedup_key`，两个仅末尾 1 字节不同的长键解码后完整区分无碰撞。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --no-default-features --features storage-redb --lib -E 'test(=storage::queue::frame::tests::crc32c_rfc3720_vector_and_16b_dual_crc_roundtrip)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb --lib -E 'test(=storage::queue::frame::tests::crc32c_rfc3720_vector_and_16b_dual_crc_roundtrip)'`（new，覆盖 AC1–AC4）
-- [ ] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 3 文件实现白名单。
+- [x] `source .env.test && cargo nextest list --no-default-features --features storage-redb --lib -E 'test(=storage::queue::frame::tests::crc32c_rfc3720_vector_and_16b_dual_crc_roundtrip)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb --lib -E 'test(=storage::queue::frame::tests::crc32c_rfc3720_vector_and_16b_dual_crc_roundtrip)'`（new，覆盖 AC1–AC4）
+- [x] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 3 文件实现白名单。
 
 **Full-suite trigger:** `none`
 
@@ -10039,8 +10039,9 @@
 | `RB-06c` | `done` / `remote-verified` | `159bbf3`（`main`） | `0.30.327` | 2026-11-22 22:16 UTC：Stage 1 精确 4 文件写集（`src/storage/{mod,capture_store}.rs`、`src/storage/redb/{mod,capture_store}.rs`），在 `RedbCaptureStore` 新增同事务二级索引 `import_tombstones_by_provider` / `import_tombstones_by_session`（含 `open_read_write` 对 `RB-06` 遗留红库自动回填与过期索引剪枝）、同事务拒绝已墓碑化 `(agent_kind, provider_session_id)` 与 `erased_session_id` 重导（覆盖 `upsert_session`/`upsert_checkpoint`/`upsert_import_identity`/`append_capture_batch` 原子回滚含 `dedup_key` 撤销）、以及 `agent_audit_log` / `agent_workspace_scope_audit` 同事务只追加保护（覆写与 `update_*`/`delete_*` 全部 fail-closed 报脱敏错且原行零改动）；纯 `storage-redb,storage-queue` `redb_tombstone_and_audit_append_only_invariants` 1/1、双特性 `storage::capture_store::` 8/8、单特性零告警检查、fmt、严格 clippy、`compat_version_surface_sync` 与 Codex R2 `VERDICT: PASS` 全绿 |
 | `RB-06d` | `done` / `remote-verified` | `d9da836`（`main`） | `0.30.328` | 2026-11-22 23:04 UTC：Stage 1 精确 4 文件写集（`src/storage/{mod,capture_store}.rs`、`src/storage/redb/{mod,capture_store}.rs`），在 `RedbCaptureStore` 落地全描述符绑定 Unix 私密安全姿态：新建 `.libra/private/`（含缺失祖先目录逐级 `mkdirat` + macOS `fchmodat(AT_SYMLINK_NOFOLLOW)` / Linux `O_PATH` + `/proc/self/fd`）精确 `0700`、新建 `capture.gen-<id>.redb`（`openat(O_CREAT|O_EXCL|O_NOFOLLOW)` + `fchmod(0600)` + `linkat` + `FileBackend::new(file)` 零路径重开 + inode 钉定 `RedbCreatePublishGuard`）精确 `0600`、打开 `.libra/private/` 与 `capture.gen-<id>.redb` 均经 `O_NOFOLLOW|O_NONBLOCK` 拒绝符号链接/FIFO 并按 `libc::geteuid()` 核验属主 UID 且错误文案零路径/UID 泄露；纯 `storage-redb,storage-queue` `redb_private_dir_and_db_unix_permissions_nofollow_and_owner` 1/1（含 `umask(0000/0077/0777)` 含缺失祖先子进程、setgid 剥离、既有父目录零变更、FIFO、5 类确定性替换竞态/早期失败及真实非属主目录/chown 校验）、双特性 9/9、单特性零告警、fmt、严格 clippy、`compat_version_surface_sync` 全绿；Codex R1（5 项）与 R2（4 项）真实发现已全部闭环，R3 仅余同 UID 目录并发下 POSIX 无原生原子 `unlinkat_if_inode`/`mkdirat_fd` 系统调用之范围外延展，依用户授权跳过继续推进 |
 | `RB-06b` | `done` / `remote-verified` | `8d3c63c`（`main`） | `0.30.330` | 2026-11-23 00:01 UTC：Stage 1 精确 4 文件写集（`src/storage/{mod,cross_store}.rs`、`src/storage/redb/{git_store,capture_store}.rs`），实现 `CrossStoreCoordinator` 与 `git.redb` 延迟初始化 `meta_generation`/`meta_cross_store_intent`（保持 61 活表清单严格一致）：严格按 `GC-RB-04` `GitStore → CaptureStore` 锁序持 `cap_wtx` 在 `git_wtx.commit()` 前完成全部捕获批语义/外键/墓碑/唯一性/只追加预验（杜绝坏捕获毒化发件箱）、写前按升序重放全部 `(cap_gen + 1)..=git_gen` 待决意图、3-bit 协作式取消边界（`CrossStoreCancelGuard` + `ReplayCommitBoundaryGuard` 覆盖 `git_wtx`/`cap_wtx`/重放提交三处取消点）、`capture.redb` 缺 `meta_generation` 表或单例/只读/墓碑/损毁/缺失一律 fail-closed 报 `LBR-IO-001` 拒推进，以及只读三步一致快照（`g1 == c1 && g1 == g2`，5 次重试耗尽报 `LBR-IO-001`）；纯 `storage-redb,storage-queue` `storage::cross_store::` 6/6（含 AC1–AC4、并发双写与 `g1 != g2` 交错、防毒化、元数据腐败与 4 态异步取消）、双特性 15/15 回归（含 `repository_61_source_tables_manifest_complete`）、单特性零告警、fmt、严格 clippy、`compat_version_surface_sync` 与 Codex R5 `VERDICT: PASS` 全绿 |
-| `RB-06e` | `done` / `remote-pending` | 本提交（`main`） | `0.30.331` | 2026-11-23 02:10 UTC：Stage 1 精确 3/4 文件写集（`src/storage/{mod,cross_store}.rs`、`src/storage/redb/git_store.rs`），实现显式修复入口 `CrossStoreCoordinator::reconcile_pending_intents()` / `cross_store::reconcile_pending_intents()`、共享升序重放引擎 `replay_pending_intents_in_cap_wtx`、孤儿意图守卫 `ensure_no_orphan_cross_store_intents_in_wtx`、已对账意图自动清理 `prune_reconciled_cross_store_intents_in_wtx`（同时接入显式修复与后续跨库写事务双路径，使 `META_CROSS_STORE_INTENT` 严格有界不无限增长），以及 `map_cross_store_join_err` 全路径 Tokio `JoinError` 固定类别脱敏；纯 `storage-redb,storage-queue` `storage::cross_store::` 8/8（含 `explicit_reconcile_idempotent_snapshot_and_intent_pruning` AC1–AC4 与 7 场景失败/回滚/孤儿/双锁取消/panic 脱敏回归）、双特性 8/8（含 `repository_61_source_tables_manifest_complete`）、单特性零告警、fmt、严格 clippy、`compat_version_surface_sync` 全绿；Codex R1 两项 P1 已全部闭环并经 R2 确认，R2 仅余要求在存储库模块内改写进程全局 `std::panic::set_hook` 抑制默认 stderr 之范围外诉求，依用户授权跳过继续推进（**Phase 1 全 19 卡全部闭环**） |
-| `RB-07`..`RB-34c`（剩余 126 卡） | `pending` | — | — | 进入 Phase 2（Capture 双通道 CRC32C 帧队列），按实施顺序于 `main` 逐卡推进 |
+| `RB-06e` | `done` / `remote-verified` | `2c70c03`（`main`） | `0.30.331` | 2026-11-23 02:10 UTC：Stage 1 精确 3/4 文件写集（`src/storage/{mod,cross_store}.rs`、`src/storage/redb/git_store.rs`），实现显式修复入口 `CrossStoreCoordinator::reconcile_pending_intents()` / `cross_store::reconcile_pending_intents()`、共享升序重放引擎 `replay_pending_intents_in_cap_wtx`、孤儿意图守卫 `ensure_no_orphan_cross_store_intents_in_wtx`、已对账意图自动清理 `prune_reconciled_cross_store_intents_in_wtx`（同时接入显式修复与后续跨库写事务双路径，使 `META_CROSS_STORE_INTENT` 严格有界不无限增长），以及 `map_cross_store_join_err` 全路径 Tokio `JoinError` 固定类别脱敏；纯 `storage-redb,storage-queue` `storage::cross_store::` 8/8（含 `explicit_reconcile_idempotent_snapshot_and_intent_pruning` AC1–AC4 与 7 场景失败/回滚/孤儿/双锁取消/panic 脱敏回归）、双特性 8/8（含 `repository_61_source_tables_manifest_complete`）、单特性零告警、fmt、严格 clippy、`compat_version_surface_sync` 全绿；Codex R1 两项 P1 已全部闭环并经 R2 确认，R2 仅余要求在存储库模块内改写进程全局 `std::panic::set_hook` 抑制默认 stderr 之范围外诉求，依用户授权跳过继续推进（**Phase 1 全 19 卡全部闭环**） |
+| `RB-07` | `done` / `remote-pending` | 本提交（`main`） | `0.30.332` | 2026-11-23 02:29 UTC：Stage 1 精确 3 文件写集（`src/storage/mod.rs`、`src/storage/queue/{mod,frame}.rs`），实现 `ADR-RB-05` #2 16 字节自认证帧头（`MAGIC=b"LCE1"` + `FRAME_BODY_LEN` + 覆盖前 8B 的 `HEADER_CRC32C` + 覆盖全帧非校验字段的 `FRAME_CRC32C`）与全量 UTF-8 语义 `dedup_key` 双校验编解码核心（`crc32c_checksum`/`crc32c_append`/`encode_frame`/`encode_postcard_frame`/`decode_frame`/`decode_postcard_payload`），采用显式 `into_storage_error()`（`LBR-IO-001` 脱敏且零 `From` 推导歧义）；`--no-default-features --features storage-redb` `crc32c_rfc3720_vector_and_16b_dual_crc_roundtrip` 1/1（含 RFC 3720 向量 `0xe3069283`、16B 头逐字节校验、无损往返、长 UTF-8 键末字节区分、合法双 CRC 结构非法帧拒收与脱敏转换）、全特性矩阵（`storage-sqlite`/`storage-redb`/`storage-sqlite,storage-queue`）零告警、fmt、严格 clippy、`compat_version_surface_sync` 与 Codex R2 `VERDICT: PASS` 全绿 |
+| `RB-07g`..`RB-34c`（剩余 125 卡） | `pending` | — | — | Phase 2 推进中，按实施顺序于 `main` 逐卡推进 |
 
 ## Codex review log
 
