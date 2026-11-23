@@ -4745,7 +4745,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `done` / `remote-pending`
+**Lifecycle / Acceptance:** `done` / `remote-verified`
 
 **Description:** 100% 在独占目录 `src/storage/**` 内于 `writer.rs`、`highwater.rs` 与 `segment.rs` 实现并同卡验收原子零帧跨段提交后的旧段回收触发路径：当空批事务将库内 `highwater_seg` 推进至 `S + 1` 后，立即按 `writer.lock → capture-queue/append.lock` 锁序触发已排空旧段 `S` 的有序回收——先原子提交双副本 `LTM2` 推进 `MIN_LIVE_SEG = S + 1` 与摘除 `sealed[S]`，再依次执行 `unlink("events-<S>.log")` 与 `fsync_dir(lane_dir)`。
 
@@ -4801,7 +4801,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `remote-pending`
 
 **Description:** 100% 在独占目录 `src/storage/**` 内于 `writer.rs`、`highwater.rs` 与 `segment.rs` 实现并同卡验收 `ADR-RB-05` #4 ② 中消费端观测到 `max_seg > active_seg`（Case D / 嵌套 Case C→D，补齐 `RB-09e` 仅处理同段 `actual_len > committed_len` Case C 的真实生产路径）的恢复委托与跨段消费逻辑：消费者按 `writer.lock → capture-queue/append.lock` 持锁调用 `RB-08k` 共享 Case D 旧段尾恢复与封存例程（持锁期间绝不推进高水位、绝不写库），释放 `append.lock` 后验证 `LTM2.sealed[S]` 并依次将旧段 `S` 积压帧、恢复完整同步尾帧及后继活跃段 `S+1` 帧 100% 落库，高水位最终精确停于活跃段 `(S + 1, committed_len(S+1))`。
 
@@ -4816,17 +4816,17 @@
 | `RB-09e` 仅在 `writer.rs` 中接线同段 Case C 恢复委托；消费者观测到 `max_seg > active_seg`（含嵌套 Case C→D）时须在 `writer.rs` 独立接线 Case D 恢复委托与跨段消费闭环 | `ADR-RB-05` #3 Case D、#4 ② |
 
 **Acceptance criteria:**
-- [ ] **消费端委托 Case D 后校验 `LTM2.sealed[S]` 长度通过：** 消费者检测到嵌套 Case C→D 状态并完成 `append.lock` 内 Case D 恢复委托后，校验 `actual_len(S) == sealed_len(S)` 精确通过。
-- [ ] **消费端校验 `LTM2.sealed[S]` CRC32C 通过：** 上述消费者校验 `crc32c(S[0..sealed_len(S)]) == sealed_crc32c(S)` 精确通过。
-- [ ] **旧段积压帧落库：** 上述消费者将旧段 `S` 全部未消费积压帧 `[hw_offset, committed_len)` 100% 写入 `capture.redb`。
-- [ ] **旧段完整同步尾帧落库：** 上述消费者将旧段 `S` 全部恢复完整同步尾帧 `[committed_len, recovered_valid_end)` 100% 写入 `capture.redb`。
-- [ ] **后继活跃段 `S+1` 帧落库：** 上述消费者将后继活跃段 `S+1` 全部有效帧 100% 写入 `capture.redb`。
-- [ ] **跨段消费后高水位停于活跃 `S+1`：** 承接 AC5，库内 `QUEUE_HIGHWATER_*` 精确停于 `(S + 1, committed_len(S+1))`（绝不跳至 `S + 2`）。
+- [x] **消费端委托 Case D 后校验 `LTM2.sealed[S]` 长度通过：** 消费者检测到嵌套 Case C→D 状态并完成 `append.lock` 内 Case D 恢复委托后，校验 `actual_len(S) == sealed_len(S)` 精确通过。
+- [x] **消费端校验 `LTM2.sealed[S]` CRC32C 通过：** 上述消费者校验 `crc32c(S[0..sealed_len(S)]) == sealed_crc32c(S)` 精确通过。
+- [x] **旧段积压帧落库：** 上述消费者将旧段 `S` 全部未消费积压帧 `[hw_offset, committed_len)` 100% 写入 `capture.redb`。
+- [x] **旧段完整同步尾帧落库：** 上述消费者将旧段 `S` 全部恢复完整同步尾帧 `[committed_len, recovered_valid_end)` 100% 写入 `capture.redb`。
+- [x] **后继活跃段 `S+1` 帧落库：** 上述消费者将后继活跃段 `S+1` 全部有效帧 100% 写入 `capture.redb`。
+- [x] **跨段消费后高水位停于活跃 `S+1`：** 承接 AC5，库内 `QUEUE_HIGHWATER_*` 精确停于 `(S + 1, committed_len(S+1))`（绝不跳至 `S + 2`）。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --no-default-features --features storage-redb --lib -E 'test(=storage::queue::writer::tests::consumer_delegates_nested_case_d_recovery_and_drains_all_frame_classes)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb --lib -E 'test(=storage::queue::writer::tests::consumer_delegates_nested_case_d_recovery_and_drains_all_frame_classes)'`（new，覆盖 AC1–AC6）
-- [ ] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 5 文件实现白名单。
+- [x] `source .env.test && cargo nextest list --no-default-features --features storage-redb --lib -E 'test(=storage::queue::writer::tests::consumer_delegates_nested_case_d_recovery_and_drains_all_frame_classes)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb --lib -E 'test(=storage::queue::writer::tests::consumer_delegates_nested_case_d_recovery_and_drains_all_frame_classes)'`（new，覆盖 AC1–AC6）
+- [x] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 5 文件实现白名单。
 
 **Full-suite trigger:** `none`
 
@@ -10080,8 +10080,9 @@
 | `RB-09g` | `done` / `remote-verified` | `4703a19`（`main`） | `0.30.375` | 2026-11-23 20:58 UTC：Stage 1 精确 5 文件写集内仅改动 `src/storage/queue/writer.rs`，新增 3 项端到端双通道（`normal/` + `priority/`）活跃段不跳段验收测试覆盖 `ADR-RB-05` #4 ② (a) 全部三类保留活跃段 `S == active_seg` 恢复态与后续追加闭环：`--no-default-features --features storage-redb` `VER1` 3/3、`VER2`（`consumer_clean_tail_recovery_multibatch_keeps_active_hw_and_subsequent_append` 3.434s 覆盖 AC1/AC2：`AfterSegmentSyncData` 注入纯已同步尾 190 帧预恢复 + 140 帧直调消费自委托两子场景，每批均停 `(0, batch_end_offset)` 至 `(0, committed_len)` 零跳段零隔离，随后追加 10 帧无缝落库）、`VER3`（`consumer_full_256_table_recovery_multibatch_keeps_active_hw_and_subsequent_append` 17.354s 覆盖 AC3/AC4：`sealed.len() == 256` 含 `seg 255` 130 帧多批封存与活跃 `S=256` 经 Step C1 原地恢复 160 帧，实证 256 封存段逐段末批跨段回收后再多批排空 `S=256` 停于 `(256, committed_len)` 绝不跳 `(257, 0)`，随后追加 5 帧 805 条全字段核验一致）、`VER4`（`consumer_zero_byte_recovery_keeps_active_hw_and_subsequent_append` 1.049s 覆盖 AC5/AC6：`S=0` 全新段与 `S=1` 轮转后段双场景首帧半截崩溃截断至 0B、0 DB 写事务、DB 高水位与镜像严格保持 `(S, 0)`，随后追加 5 帧无缝落库）、`writer::tests` 15/15（36.350s）、四构型 Clippy/check 矩阵 `src/storage/` 零告警、`compat_version_surface_sync` 2/2 全绿；Codex R1 首轮 `VERDICT: PASS`（P0=0、P1=0、P2=0） |
 | `RB-09h` | `done` / `remote-verified` | `1c83089`（`main`） | `0.30.376` | 2026-11-23 21:13 UTC：Stage 1 精确 5 文件写集内仅改动 `src/storage/queue/writer.rs`，在 `open_and_verify_sealed_segment` 中前置 `required_boundary > sealed_entry.sealed_len` 快速 O(1) 越界拒收（确保精确返回 `capture queue DB highwater exceeds LTM2 sealed_len` → `CorruptCommittedFrame` `LBR-IO-001`），扩展 `RecordedBatchCall` 追踪每批 `applied_count`/`deduplicated_count`，并新增双通道端到端验收测试：`--no-default-features --features storage-redb` `VER1` 2/2、`VER2`（`consumer_drained_active_then_rotated_16mib_and_case_c_empty_advance` 1.915s 覆盖 AC1 真实 5×3 MiB + 2 MiB 16 MiB 常规轮转交错与 AC2 Case C Step C2 含非空/空后继两子场景，实证单写事务 `append_capture_batch(&[], (1, 0))` 推进至 `(1, 0)` 且 `item_count=0/applied_count=0/零冗余业务行`）、`VER3`（`consumer_drained_rotated_bitflip_truncation_missing_and_oob_hw_rejected` 0.529s 覆盖 AC3 首/中/末字节位翻转、AC4 `FrameStreamDecoder` 实证完整帧 `CleanEof`/半帧/0B 截断、AC5 删除段文件、AC6 `hw_offset > sealed_len(S)` 越界 `+1/+64` 及 `compute_next_highwater` 单测守卫，全部 fail-closed 返 `LBR-IO-001`、0 DB 写事务、高水位零推进且整树字节快照零改动）、`writer::tests` 17/17（37.411s）、四构型 Clippy/check 矩阵 `src/storage/` 零告警、`compat_version_surface_sync` 2/2 全绿；Codex R1 首轮 `VERDICT: PASS`（P0=0、P1=0、P2=0） |
 | `RB-09j` | `done` / `remote-verified` | `8e768df`（`main`） | `0.30.377` | 2026-11-23 21:29 UTC：Stage 1 精确 5 文件写集内仅改动 `src/storage/queue/writer.rs`，新增严格 `#[cfg(test)]` 零发布开销故障注入点 `WriterCrashPoint::BeforeEmptyAdvanceCommit`（位于 `LTM2.sealed[S]` 认证之后、`append_capture_batch(&[], (S + 1, 0))` 提交之前），并新增两项双通道端到端验收测试：`--no-default-features --features storage-redb` `VER1` 2/2、`VER2`（`consumer_drained_rotated_empty_advance_crash_before_and_after_commit` 2.167s 覆盖 AC1 提交前崩溃 0 DB 写/高水位与镜像停留 `(0, sealed_len)`/重启幂等提交 `(1, 0)` 零冗余行，及 AC2 提交后镜像前崩溃的空 `S+1`（0 额外 DB 写并自愈镜像至 `(1, 0)`）与非空 `S+1`（直起 `(1, 0)` 无重复空批）双子场景）、`VER3`（`consumer_drained_rotated_s1_existing_and_appended_drain` 2.937s 覆盖 AC3–AC5 在 Case C Step C2 与真实 16 MiB 常规轮转双路径下跨段立即消费 `S+1` 全部 4 条既有帧 + 5 条后续新追加帧逐字段核验一致且高水位精确停于 `(1, committed_len(1))` 绝不跳 `(2, 0)`）、`writer::tests` 19/19（39.378s）、四构型 Clippy/check 矩阵 `src/storage/` 零告警、`compat_version_surface_sync` 2/2 全绿；Codex R1 唯一 P2（测试注入点严格 `#[cfg(test)]` 门控）闭环，R2 获 `VERDICT: PASS`（P0=0、P1=0、P2=0） |
-| `RB-09k` | `done` / `remote-pending` | 本提交（`main`） | `0.30.378` | 2026-11-23 21:45 UTC：Stage 1 精确 5 文件写集内仅改动 `src/storage/queue/writer.rs`，新增双通道端到端有序回收验收测试 `consumer_drained_rotated_old_s_safe_reclaim_ordered_actions`：Part 1 经 `AfterReclaimMetaBeforeUnlink` 故障注入在原子零帧跨段提交 `(1, 0)` 后实证 `tail.meta` 与 `tail.meta.bak` 已原子落盘 `MIN_LIVE_SEG = 1`（AC1）并同步摘除 `sealed[0]`（AC2）且 `events-00000000.log` 尚未 `unlink`；Part 2 跨 Case C Step C2（含非零 `S = 0→1` 与 `S = 1→2`）及真实 16 MiB 常规轮转实证 `writer.lock → append.lock` 锁序、双副本 `LTM2` 先落盘再 `unlink`（AC3）且 `FsyncLaneDirAfterReclaim` 紧随 `ReclaimSegmentUnlink` 之后执行（`pos_fsync_reclaim == pos_unlink + 1`，AC4）；`--no-default-features --features storage-redb` `VER1` 1/1、`VER2` 2.264s、`writer::tests` 20/20（40.934s）、四构型 Clippy/check 矩阵 `src/storage/` 零告警、`compat_version_surface_sync` 2/2 全绿；Codex R1 唯一 P1（紧邻索引断言 `pos_fsync_reclaim == pos_unlink + 1`）闭环，R2 获 `VERDICT: PASS`（P0=0、P1=0、P2=0） |
-| `RB-09i`..`RB-34c`（剩余 85 卡） | `pending` | — | — | Phase 2 原子零帧跨段旧段有序回收 `RB-09k` 已落盘，进入 `RB-09i`（消费端 `max_seg > active_seg` Case D / 嵌套 Case C→D 恢复委托与跨段消费路径） |
+| `RB-09k` | `done` / `remote-verified` | `c156520`（`main`） | `0.30.378` | 2026-11-23 21:45 UTC：Stage 1 精确 5 文件写集内仅改动 `src/storage/queue/writer.rs`，新增双通道端到端有序回收验收测试 `consumer_drained_rotated_old_s_safe_reclaim_ordered_actions`：Part 1 经 `AfterReclaimMetaBeforeUnlink` 故障注入在原子零帧跨段提交 `(1, 0)` 后实证 `tail.meta` 与 `tail.meta.bak` 已原子落盘 `MIN_LIVE_SEG = 1`（AC1）并同步摘除 `sealed[0]`（AC2）且 `events-00000000.log` 尚未 `unlink`；Part 2 跨 Case C Step C2（含非零 `S = 0→1` 与 `S = 1→2`）及真实 16 MiB 常规轮转实证 `writer.lock → append.lock` 锁序、双副本 `LTM2` 先落盘再 `unlink`（AC3）且 `FsyncLaneDirAfterReclaim` 紧随 `ReclaimSegmentUnlink` 之后执行（`pos_fsync_reclaim == pos_unlink + 1`，AC4）；`--no-default-features --features storage-redb` `VER1` 1/1、`VER2` 2.264s、`writer::tests` 20/20（40.934s）、四构型 Clippy/check 矩阵 `src/storage/` 零告警、`compat_version_surface_sync` 2/2 全绿；Codex R1 唯一 P1（紧邻索引断言 `pos_fsync_reclaim == pos_unlink + 1`）闭环，R2 获 `VERDICT: PASS`（P0=0、P1=0、P2=0） |
+| `RB-09i` | `done` / `remote-pending` | 本提交（`main`） | `0.30.379` | 2026-11-23 22:17 UTC：Stage 1 精确 5 文件写集内仅改动 `src/storage/queue/segment.rs` 与 `src/storage/queue/writer.rs`，在 `writer.rs::step_lane_once` 中将 `max_live_seg > meta.active_seg` Case D / 嵌套 Case C→D 恢复委托前置于 Branch A（已封存段消费）与 Branch B（活跃段消费）之前（含先验活跃段已提交前缀只读验证），在 `normal/` 50ms 合批窗口刷新时同步核验 `next_seg_ids` 遇后继立即让出待恢复，并在 `segment.rs` Unix (`recover_under_root_fd_unix`) 与 Windows (`recover_at_root_windows`) 持 `append.lock` 释放前新增权威后验收敛校验并增补 `LaneRecoveryReport.orphan_successor_removed`、彻底移除易受 ABA 误伤的无锁 `last_recovery_signature`；`--no-default-features --features storage-redb` `VER1` 1/1、`VER2`（`consumer_delegates_nested_case_d_recovery_and_drains_all_frame_classes` 2.510s 覆盖 7 大场景：双通道洁净嵌套 Case C→D AC1–AC6 + 0 持锁写库/镜像不变 + 双损嵌套 `RB-08v`/`RB-08u` + 损坏前缀 fail-closed `LBR-IO-001` + 旧封存高水位前置委托 + 50ms 窗中后继让出 + 空孤儿后并发重建 + 外部 `recover_lane` ABA 竞态恢复）、`writer::tests` 21/21（41.969s）、四构型 Clippy/check 矩阵 `src/storage/` 零告警、`compat_version_surface_sync` 2/2 全绿；Codex R1（2×P1）、R2（1×P1）、R3（1×P1）全部闭环，R4 获 `VERDICT: PASS`（P0=0、P1=0、P2=0） |
+| `RB-09l`..`RB-34c`（剩余 84 卡） | `pending` | — | — | Phase 2 消费端 Case D / 嵌套 Case C→D 恢复委托与跨段消费 `RB-09i` 已落盘，进入 Phase 2 最终卡 `RB-09l`（满 256 封存表高压逐段即时回收降压与满表 Case C 全量排空） |
 
 ## Codex review log
 

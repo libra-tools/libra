@@ -669,6 +669,7 @@ pub struct LaneRecoveryReport {
     pub cleaned_tmp_files: usize,
     pub cleaned_quarantine_tmp_files: usize,
     pub reclaimed_orphans_removed: usize,
+    pub orphan_successor_removed: bool,
     pub quarantined_artifacts: Vec<QuarantinePublishReport>,
 }
 
@@ -3818,6 +3819,7 @@ mod unix_seg {
         cleaned_tmp_files: usize,
         cleaned_quarantine_tmp_files: usize,
         reclaimed_orphans_removed: usize,
+        orphan_successor_removed: bool,
         quarantined_artifacts: Vec<QuarantinePublishReport>,
         lane_dir_synced: bool,
     }
@@ -3997,6 +3999,7 @@ mod unix_seg {
                     cleaned_tmp_files,
                     cleaned_quarantine_tmp_files,
                     reclaimed_orphans_removed: 0,
+                    orphan_successor_removed: false,
                     quarantined_artifacts: Vec::new(),
                     lane_dir_synced: true,
                 })
@@ -4021,6 +4024,7 @@ mod unix_seg {
                     cleaned_tmp_files,
                     cleaned_quarantine_tmp_files,
                     reclaimed_orphans_removed: 0,
+                    orphan_successor_removed: false,
                     quarantined_artifacts: Vec::new(),
                     lane_dir_synced: mirrored_replica || cleaned_tmp_files > 0,
                 })
@@ -4055,6 +4059,7 @@ mod unix_seg {
                     cleaned_tmp_files,
                     cleaned_quarantine_tmp_files,
                     reclaimed_orphans_removed,
+                    orphan_successor_removed: false,
                     quarantined_artifacts: Vec::new(),
                     lane_dir_synced: mirrored_replica
                         || cleaned_tmp_files > 0
@@ -4106,6 +4111,7 @@ mod unix_seg {
                     cleaned_tmp_files,
                     cleaned_quarantine_tmp_files,
                     reclaimed_orphans_removed,
+                    orphan_successor_removed: false,
                     quarantined_artifacts,
                     lane_dir_synced: true,
                 })
@@ -4199,6 +4205,7 @@ mod unix_seg {
                     cleaned_tmp_files,
                     cleaned_quarantine_tmp_files,
                     reclaimed_orphans_removed,
+                    orphan_successor_removed: false,
                     quarantined_artifacts,
                     lane_dir_synced: true,
                 })
@@ -4282,6 +4289,7 @@ mod unix_seg {
                     cleaned_tmp_files,
                     cleaned_quarantine_tmp_files,
                     reclaimed_orphans_removed,
+                    orphan_successor_removed: true,
                     quarantined_artifacts,
                     lane_dir_synced: true,
                 })
@@ -5766,6 +5774,42 @@ mod unix_seg {
             observer.record_fsync_lane_on_recovery(lane_dir_name(lane));
         }
 
+        // Verify post-Phase-2 convergence authoritatively while STILL holding
+        // `append.lock` so outer consumer loops never rely on ABA-prone unlocked
+        // snapshots to detect non-convergence (`RB-09i`).
+        let post_scan = scan_lane_dir_readonly(&lane_fd)?;
+        if !converged.active_seg_exists {
+            if !post_scan.seg_ids.is_empty() {
+                return Err(StorageBackendError::CorruptCommittedFrame {
+                    detail: "capture queue recovery did not converge empty lane state".to_string(),
+                });
+            }
+        } else {
+            if post_scan
+                .seg_ids
+                .iter()
+                .any(|&seg| seg < converged.meta.min_live_seg)
+            {
+                return Err(StorageBackendError::CorruptCommittedFrame {
+                    detail: "capture queue recovery left reclaimed crash orphan behind".to_string(),
+                });
+            }
+            if post_scan.seg_ids.iter().copied().max() != Some(converged.meta.active_seg) {
+                return Err(StorageBackendError::CorruptCommittedFrame {
+                    detail: "capture queue recovery did not converge successor segment state"
+                        .to_string(),
+                });
+            }
+            let (_post_f, post_len) =
+                open_segment_readonly_nofollow(&lane_fd, converged.meta.active_seg, lane_uid)?;
+            if post_len != converged.meta.committed_len {
+                return Err(StorageBackendError::CorruptCommittedFrame {
+                    detail: "capture queue recovery did not converge active segment tail"
+                        .to_string(),
+                });
+            }
+        }
+
         drop(append_lock);
         observer.record_release_lock();
 
@@ -5778,6 +5822,7 @@ mod unix_seg {
             cleaned_tmp_files: converged.cleaned_tmp_files,
             cleaned_quarantine_tmp_files: converged.cleaned_quarantine_tmp_files,
             reclaimed_orphans_removed: converged.reclaimed_orphans_removed,
+            orphan_successor_removed: converged.orphan_successor_removed,
             quarantined_artifacts: converged.quarantined_artifacts,
         })
     }
@@ -7257,6 +7302,7 @@ mod non_unix_seg {
             cleaned_tmp_files: usize,
             cleaned_quarantine_tmp_files: usize,
             reclaimed_orphans_removed: usize,
+            orphan_successor_removed: bool,
             quarantined_artifacts: Vec<QuarantinePublishReport>,
             lane_dir_synced: bool,
             /// Freshly created active segment handle when Step C2 rotates the
@@ -7447,6 +7493,7 @@ mod non_unix_seg {
                         cleaned_tmp_files: cleaned,
                         cleaned_quarantine_tmp_files,
                         reclaimed_orphans_removed: 0,
+                        orphan_successor_removed: false,
                         quarantined_artifacts: Vec::new(),
                         lane_dir_synced: true,
                         replacement_active_seg: None,
@@ -7493,6 +7540,7 @@ mod non_unix_seg {
                         cleaned_tmp_files: cleaned,
                         cleaned_quarantine_tmp_files,
                         reclaimed_orphans_removed: 0,
+                        orphan_successor_removed: false,
                         quarantined_artifacts: Vec::new(),
                         lane_dir_synced: mirrored || cleaned > 0,
                         replacement_active_seg: None,
@@ -7548,6 +7596,7 @@ mod non_unix_seg {
                         cleaned_tmp_files: cleaned,
                         cleaned_quarantine_tmp_files,
                         reclaimed_orphans_removed: orphans,
+                        orphan_successor_removed: false,
                         quarantined_artifacts: Vec::new(),
                         lane_dir_synced: mirrored || cleaned > 0 || orphans > 0,
                         replacement_active_seg: None,
@@ -7602,6 +7651,7 @@ mod non_unix_seg {
                         cleaned_tmp_files: cleaned,
                         cleaned_quarantine_tmp_files,
                         reclaimed_orphans_removed: orphans,
+                        orphan_successor_removed: false,
                         quarantined_artifacts,
                         lane_dir_synced: true,
                         replacement_active_seg,
@@ -7678,6 +7728,7 @@ mod non_unix_seg {
                         cleaned_tmp_files: cleaned,
                         cleaned_quarantine_tmp_files,
                         reclaimed_orphans_removed: orphans,
+                        orphan_successor_removed: false,
                         quarantined_artifacts,
                         lane_dir_synced: true,
                         replacement_active_seg: None,
@@ -7744,6 +7795,7 @@ mod non_unix_seg {
                         cleaned_tmp_files: cleaned,
                         cleaned_quarantine_tmp_files,
                         reclaimed_orphans_removed: orphans,
+                        orphan_successor_removed: true,
                         quarantined_artifacts,
                         lane_dir_synced: true,
                         replacement_active_seg: None,
@@ -8469,6 +8521,49 @@ mod non_unix_seg {
                 observer.record_fsync_lane_on_recovery(lane_label);
             }
 
+            // Verify post-Phase-2 convergence authoritatively while STILL
+            // holding `append.lock` (`RB-09i`).
+            let (post_seg_ids, _) = scan_lane_dir_windows(&lane_dir)?;
+            if !converged.active_seg_exists {
+                if !post_seg_ids.is_empty() {
+                    return Err(StorageBackendError::CorruptCommittedFrame {
+                        detail: "capture queue recovery did not converge empty lane state"
+                            .to_string(),
+                    });
+                }
+            } else {
+                if post_seg_ids
+                    .iter()
+                    .any(|&seg| seg < converged.meta.min_live_seg)
+                {
+                    return Err(StorageBackendError::CorruptCommittedFrame {
+                        detail: "capture queue recovery left reclaimed crash orphan behind"
+                            .to_string(),
+                    });
+                }
+                if post_seg_ids.iter().copied().max() != Some(converged.meta.active_seg) {
+                    return Err(StorageBackendError::CorruptCommittedFrame {
+                        detail: "capture queue recovery did not converge successor segment state"
+                            .to_string(),
+                    });
+                }
+                let post_seg_path = lane_dir.join(segment_log_file_name(converged.meta.active_seg));
+                let (_post_f, post_len, _) = open_windows_file_nofollow(
+                    &post_seg_path,
+                    GENERIC_READ,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    OPEN_EXISTING,
+                    "capture queue active segment",
+                    "stat capture queue active segment after recovery",
+                )?;
+                if post_len != converged.meta.committed_len {
+                    return Err(StorageBackendError::CorruptCommittedFrame {
+                        detail: "capture queue recovery did not converge active segment tail"
+                            .to_string(),
+                    });
+                }
+            }
+
             drop(append_lock);
             observer.record_release_lock();
 
@@ -8481,6 +8576,7 @@ mod non_unix_seg {
                 cleaned_tmp_files: converged.cleaned_tmp_files,
                 cleaned_quarantine_tmp_files: converged.cleaned_quarantine_tmp_files,
                 reclaimed_orphans_removed: converged.reclaimed_orphans_removed,
+                orphan_successor_removed: converged.orphan_successor_removed,
                 quarantined_artifacts: converged.quarantined_artifacts,
             })
         }
