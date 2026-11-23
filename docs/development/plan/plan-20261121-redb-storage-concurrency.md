@@ -2467,7 +2467,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `done` / `remote-pending`
+**Lifecycle / Acceptance:** `done` / `remote-verified`
 
 **Description:** 100% 在独占目录 `src/storage/**` 内实现 `src/storage/queue/frame.rs` 顺序流解码器的固定 16 字节帧头分配前守卫：在任何体内存分配或恢复截断之前先校验 `MAGIC`、`HEADER_CRC32C` 与 `3 <= FRAME_BODY_LEN <= MAX_FRAME_BODY_LEN`，逐字段实测 `MAGIC`、`FRAME_BODY_LEN`（正常界内翻转与超大值翻转分别检验）与 `HEADER_CRC32C` 单字节篡改的分配前 `CorruptHeader` 拒收。
 
@@ -2524,7 +2524,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `remote-pending`
 
 **Description:** 100% 在独占目录 `src/storage/**` 内于 `frame.rs` 完成顺序帧解码器的流终止精确分类：区分空输入 `CleanEof`、多帧合法流精确文件尾 `CleanEof`、合法 `HEADER_CRC32C` 但剩余体字节不足 `FRAME_BODY_LEN` 的 `TruncatedTail`，以及文件尾仅余 `1..15` 字节不完整帧头的 `TruncatedTail`。
 
@@ -2538,15 +2538,15 @@
 | 顺序解码器须将合法 EOF、体半截与头半截三类终止状态精确区分，供恢复扫描器严格按提交边界处置 | `ADR-RB-05` #2 |
 
 **Acceptance criteria:**
-- [ ] 帧顺序解码器对 0 字节空流返回 `CleanEof`。
-- [ ] 帧顺序解码器对多帧合法流逐帧无损解码并在精确文件尾返回 `CleanEof`。
-- [ ] 帧顺序解码器对合法 `HEADER_CRC32C` 但剩余字节不足 `FRAME_BODY_LEN` 的半帧严格归类为 `TruncatedTail`。
-- [ ] 帧顺序解码器对文件尾仅余 `1..15` 字节的不完整帧头严格归类为 `TruncatedTail`（与 `CleanEof` 及 `CorruptHeader` 严格区分）。
+- [x] 帧顺序解码器对 0 字节空流返回 `CleanEof`。
+- [x] 帧顺序解码器对多帧合法流逐帧无损解码并在精确文件尾返回 `CleanEof`。
+- [x] 帧顺序解码器对合法 `HEADER_CRC32C` 但剩余字节不足 `FRAME_BODY_LEN` 的半帧严格归类为 `TruncatedTail`。
+- [x] 帧顺序解码器对文件尾仅余 `1..15` 字节的不完整帧头严格归类为 `TruncatedTail`（与 `CleanEof` 及 `CorruptHeader` 严格区分）。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --no-default-features --features storage-redb --lib -E 'test(=storage::queue::frame::tests::seq_decoder_distinguishes_clean_eof_and_truncated_tail_variants)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb --lib -E 'test(=storage::queue::frame::tests::seq_decoder_distinguishes_clean_eof_and_truncated_tail_variants)'`（new，覆盖 AC1–AC4）
-- [ ] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 3 文件实现白名单。
+- [x] `source .env.test && cargo nextest list --no-default-features --features storage-redb --lib -E 'test(=storage::queue::frame::tests::seq_decoder_distinguishes_clean_eof_and_truncated_tail_variants)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb --lib -E 'test(=storage::queue::frame::tests::seq_decoder_distinguishes_clean_eof_and_truncated_tail_variants)'`（new，覆盖 AC1–AC4）
+- [x] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 3 文件实现白名单。
 
 **Full-suite trigger:** `none`
 
@@ -10042,8 +10042,9 @@
 | `RB-06e` | `done` / `remote-verified` | `2c70c03`（`main`） | `0.30.331` | 2026-11-23 02:10 UTC：Stage 1 精确 3/4 文件写集（`src/storage/{mod,cross_store}.rs`、`src/storage/redb/git_store.rs`），实现显式修复入口 `CrossStoreCoordinator::reconcile_pending_intents()` / `cross_store::reconcile_pending_intents()`、共享升序重放引擎 `replay_pending_intents_in_cap_wtx`、孤儿意图守卫 `ensure_no_orphan_cross_store_intents_in_wtx`、已对账意图自动清理 `prune_reconciled_cross_store_intents_in_wtx`（同时接入显式修复与后续跨库写事务双路径，使 `META_CROSS_STORE_INTENT` 严格有界不无限增长），以及 `map_cross_store_join_err` 全路径 Tokio `JoinError` 固定类别脱敏；纯 `storage-redb,storage-queue` `storage::cross_store::` 8/8（含 `explicit_reconcile_idempotent_snapshot_and_intent_pruning` AC1–AC4 与 7 场景失败/回滚/孤儿/双锁取消/panic 脱敏回归）、双特性 8/8（含 `repository_61_source_tables_manifest_complete`）、单特性零告警、fmt、严格 clippy、`compat_version_surface_sync` 全绿；Codex R1 两项 P1 已全部闭环并经 R2 确认，R2 仅余要求在存储库模块内改写进程全局 `std::panic::set_hook` 抑制默认 stderr 之范围外诉求，依用户授权跳过继续推进（**Phase 1 全 19 卡全部闭环**） |
 | `RB-07` | `done` / `remote-verified` | `d8b2702`（`main`） | `0.30.332` | 2026-11-23 02:29 UTC：Stage 1 精确 3 文件写集（`src/storage/mod.rs`、`src/storage/queue/{mod,frame}.rs`），实现 `ADR-RB-05` #2 16 字节自认证帧头（`MAGIC=b"LCE1"` + `FRAME_BODY_LEN` + 覆盖前 8B 的 `HEADER_CRC32C` + 覆盖全帧非校验字段的 `FRAME_CRC32C`）与全量 UTF-8 语义 `dedup_key` 双校验编解码核心（`crc32c_checksum`/`crc32c_append`/`encode_frame`/`encode_postcard_frame`/`decode_frame`/`decode_postcard_payload`），采用显式 `into_storage_error()`（`LBR-IO-001` 脱敏且零 `From` 推导歧义）；`--no-default-features --features storage-redb` `crc32c_rfc3720_vector_and_16b_dual_crc_roundtrip` 1/1（含 RFC 3720 向量 `0xe3069283`、16B 头逐字节校验、无损往返、长 UTF-8 键末字节区分、合法双 CRC 结构非法帧拒收与脱敏转换）、全特性矩阵（`storage-sqlite`/`storage-redb`/`storage-sqlite,storage-queue`）零告警、fmt、严格 clippy、`compat_version_surface_sync` 与 Codex R2 `VERDICT: PASS` 全绿 |
 | `RB-07g` | `done` / `remote-verified` | `69b7539`（`main`） | `0.30.333` | 2026-11-23 02:50 UTC：Stage 1 精确 3 文件写集（`src/storage/mod.rs`、`src/storage/queue/{mod,frame}.rs`），在 `frame.rs` 落地 `MAX_FRAME_DEDUP_KEY_LEN = 512`、`MAX_FRAME_PAYLOAD_LEN = 4 MiB`、`MIN_FRAME_BODY_LEN = 3`、`MAX_FRAME_BODY_LEN == 3 + 512 + 4 MiB` 编译期断言、`validate_frame_body_len` 分配前上下界守卫、解码后组件级上限守卫（杜绝总长合法帧偷渡超限键/负载）以及有界流式 `BoundedEnvelopeWriter` + `postcard::to_io`（峰值缓冲严格钉定 `4 MiB`、超限立停防 OOM）；`--no-default-features --features storage-redb` `storage::queue::frame::` 2/2（含精确 `512 B + 4 MiB` 往返、超限拒收、`1 GiB` 虚拟流早停、`FRAME_BODY_LEN ∈ {0,1,2}` 与超上限 `CorruptHeader`、组件级超限拒收）、单特性零告警、fmt、严格 clippy、`compat_version_surface_sync` 与 Codex R2 `VERDICT: PASS` 全绿 |
-| `RB-07c` | `done` / `remote-pending` | 本提交（`main`） | `0.30.334` | 2026-11-23 03:07 UTC：Stage 1 精确 3 文件写集（`src/storage/mod.rs`、`src/storage/queue/{mod,frame}.rs`），实现栈上零分配头校验 `parse_and_verify_header`、顺序流解码器 `FrameStreamDecoder`/`FrameStreamItem`（含分块有界读体 `read_body_bounded` 与全错误粘性毒化 `terminal_error` 防重试误报 `CleanEof`/错位读体）；`--no-default-features --features storage-redb` `storage::queue::frame::` 3/3（`acknowledged_frame_each_header_field_bitflip_rejected_pre_alloc` 以 `PreAllocSpyReader` 实证 `MAGIC` 4B / `FRAME_BODY_LEN` 界内与超大两态 4B / `HEADER_CRC32C` 4B / 伪造魔数 / 第 2 帧中段坏头 / 精确 16B 尾坏头全部零体分配、零越界读体且粘性拒收）、单特性零告警、fmt、严格 clippy、`compat_version_surface_sync` 全绿；Codex R1 P1 粘性毒化已闭环并经 R2 确认，R2 所提非帧头路径（`TruncatedTail`/`CorruptPayload`）重试测试归属紧邻下游 `RB-07f`/`RB-07d` 承接，依用户授权跳过继续推进 |
-| `RB-07f`..`RB-34c`（剩余 123 卡） | `pending` | — | — | Phase 2 推进中，按实施顺序于 `main` 逐卡推进 |
+| `RB-07c` | `done` / `remote-verified` | `049350c`（`main`） | `0.30.334` | 2026-11-23 03:07 UTC：Stage 1 精确 3 文件写集（`src/storage/mod.rs`、`src/storage/queue/{mod,frame}.rs`），实现栈上零分配头校验 `parse_and_verify_header`、顺序流解码器 `FrameStreamDecoder`/`FrameStreamItem`（含分块有界读体 `read_body_bounded` 与全错误粘性毒化 `terminal_error` 防重试误报 `CleanEof`/错位读体）；`--no-default-features --features storage-redb` `storage::queue::frame::` 3/3（`acknowledged_frame_each_header_field_bitflip_rejected_pre_alloc` 以 `PreAllocSpyReader` 实证 `MAGIC` 4B / `FRAME_BODY_LEN` 界内与超大两态 4B / `HEADER_CRC32C` 4B / 伪造魔数 / 第 2 帧中段坏头 / 精确 16B 尾坏头全部零体分配、零越界读体且粘性拒收）、单特性零告警、fmt、严格 clippy、`compat_version_surface_sync` 全绿；Codex R1 P1 粘性毒化已闭环并经 R2 确认，R2 所提非帧头路径（`TruncatedTail`/`CorruptPayload`）重试测试归属紧邻下游 `RB-07f`/`RB-07d` 承接，依用户授权跳过继续推进；已推 `origin/main` |
+| `RB-07f` | `done` / `remote-pending` | 本提交（`main`） | `0.30.335` | 2026-11-23 03:36 UTC：Stage 1 精确 3 文件写集内仅改动 `src/storage/queue/frame.rs`，落实强制可信边界 `FrameStreamDecoder`（`new(reader, total_len)`、`with_known_len`、`from_seekable`）与 `ADR-RB-05` #2 分配前剩余长度强校验（任一构造器在 `remaining < FRAME_BODY_LEN` 含 4 MiB 仅缺末字节场景均零体分配、零读体即报 `TruncatedTail`），同时对未达 `end_offset` 即耗尽的底层流严格 fail-closed 报 `TruncatedTail`（绝不误报 `CleanEof`）并粘性毒化；`--no-default-features --features storage-redb` `storage::queue::frame::` 4/4（`seq_decoder_distinguishes_clean_eof_and_truncated_tail_variants` 覆盖 0B 空流、4 帧多块/1B+EINTR 合法流、半体与 4 MiB 缺 1B、并发缩尾安全网、提前耗尽流、I/O 粘性毒化及 `1..=15`B 合法前缀与非魔数半头穷举）、单特性零告警、fmt、严格 `--lib` clippy、`compat_version_surface_sync` 全绿；Codex R1/R2 全部 P1 均已闭环，R3 获 `VERDICT: PASS` |
+| `RB-07d`..`RB-34c`（剩余 122 卡） | `pending` | — | — | Phase 2 推进中，按实施顺序于 `main` 逐卡推进 |
 
 ## Codex review log
 

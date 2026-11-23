@@ -187,43 +187,57 @@ pub enum FrameStreamItem {
 }
 
 /// Sequential capture queue frame stream decoder over any [`io::Read`] source
-/// (`ADR-RB-05` #2, `RB-07c`).
+/// with a mandatory trusted end boundary (`ADR-RB-05` #2, `RB-07c`, `RB-07f`).
 ///
-/// Strictly authenticates the fixed 16-byte header via
-/// [`parse_and_verify_header`] on the stack *before* reading or allocating any
-/// body buffer, preventing forged or bit-flipped `FRAME_BODY_LEN` headers from
-/// causing OOM allocations or being misclassified as `TruncatedTail`.
+/// Enforces two strict pre-allocation invariants on *every* decode step:
+/// 1. Authenticates the fixed 16-byte header via [`parse_and_verify_header`] on
+///    the stack before reading or allocating any body bytes, preventing forged
+///    or bit-flipped `FRAME_BODY_LEN` headers from triggering OOM or being
+///    misclassified as `TruncatedTail`.
+/// 2. Confirms `end_offset - (frame_start + 16) >= FRAME_BODY_LEN` *before*
+///    allocating any body buffer, guaranteeing zero heap allocation even for a
+///    maximum-length (`~4 MiB`) frame missing only its final byte.
 pub struct FrameStreamDecoder<R> {
     reader: R,
     offset: u64,
+    end_offset: u64,
     terminal_error: Option<FrameDecodeError>,
     #[cfg(test)]
     body_allocations: usize,
+    #[cfg(test)]
+    max_body_capacity: usize,
 }
 
 impl<R: io::Read> FrameStreamDecoder<R> {
-    /// Create a new sequential decoder starting at byte offset `0`.
+    /// Create a new sequential decoder starting at byte offset `0` with trusted
+    /// stream length `total_len` (e.g. file length or slice length).
     #[must_use]
-    pub const fn new(reader: R) -> Self {
-        Self {
-            reader,
-            offset: 0,
-            terminal_error: None,
-            #[cfg(test)]
-            body_allocations: 0,
-        }
+    pub const fn new(reader: R, total_len: u64) -> Self {
+        Self::with_known_len(reader, 0, total_len)
     }
 
-    /// Create a new sequential decoder starting at an explicit stream byte `offset`
-    /// (for resuming from a committed highwater or boundary offset).
+    /// Create a new sequential decoder starting at `offset` with an explicit
+    /// trusted end offset `end_offset` (e.g. file metadata length or committed
+    /// prefix boundary `committed_len`).
+    ///
+    /// Reading never crosses `end_offset`. Frames whose validated
+    /// `FRAME_BODY_LEN` exceeds `end_offset - (frame_start + 16)` fail closed
+    /// immediately with [`FrameDecodeError::TruncatedTail`] before any body
+    /// read or heap allocation occurs (`ADR-RB-05` #2). If the underlying
+    /// reader hits EOF before `end_offset` is reached, the decoder also fails
+    /// closed with [`FrameDecodeError::TruncatedTail`] rather than returning
+    /// [`FrameStreamItem::CleanEof`].
     #[must_use]
-    pub const fn with_offset(reader: R, offset: u64) -> Self {
+    pub const fn with_known_len(reader: R, offset: u64, end_offset: u64) -> Self {
         Self {
             reader,
             offset,
+            end_offset,
             terminal_error: None,
             #[cfg(test)]
             body_allocations: 0,
+            #[cfg(test)]
+            max_body_capacity: 0,
         }
     }
 
@@ -231,6 +245,19 @@ impl<R: io::Read> FrameStreamDecoder<R> {
     #[must_use]
     pub const fn offset(&self) -> u64 {
         self.offset
+    }
+
+    /// Trusted stream end offset enforced by this decoder.
+    #[must_use]
+    pub const fn end_offset(&self) -> u64 {
+        self.end_offset
+    }
+
+    /// Sticky terminal decode error if the decoder has transitioned into a
+    /// fail-closed poisoned state.
+    #[must_use]
+    pub const fn terminal_error(&self) -> Option<&FrameDecodeError> {
+        self.terminal_error.as_ref()
     }
 
     /// Borrow the underlying reader.
@@ -248,6 +275,11 @@ impl<R: io::Read> FrameStreamDecoder<R> {
     #[cfg(test)]
     pub(crate) const fn body_allocations(&self) -> usize {
         self.body_allocations
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn max_body_capacity(&self) -> usize {
+        self.max_body_capacity
     }
 
     /// Read and decode the next frame from the stream.
@@ -272,11 +304,30 @@ impl<R: io::Read> FrameStreamDecoder<R> {
 
     fn next_frame_inner(&mut self) -> Result<FrameStreamItem, FrameDecodeError> {
         let frame_start = self.offset;
-        let mut header = [0u8; FRAME_HEADER_LEN];
-        let hdr_read = read_up_to(&mut self.reader, &mut header)?;
-        if hdr_read == 0 {
+        if frame_start > self.end_offset {
+            return Err(FrameDecodeError::CorruptHeader {
+                detail: "stream offset exceeds known length",
+            });
+        }
+        let remaining = self.end_offset - frame_start;
+        if remaining == 0 {
             return Ok(FrameStreamItem::CleanEof {
                 offset: frame_start,
+            });
+        }
+
+        let hdr_limit =
+            usize::try_from(remaining.min(FRAME_HEADER_LEN as u64)).unwrap_or(FRAME_HEADER_LEN);
+        let mut header = [0u8; FRAME_HEADER_LEN];
+        let hdr_read = read_up_to(&mut self.reader, &mut header[..hdr_limit])?;
+        if hdr_read == 0 {
+            // `remaining > 0` yet underlying reader yielded 0 bytes: the stream
+            // was prematurely truncated short of its trusted `end_offset`!
+            // Never misreport a prematurely exhausted stream as `CleanEof`.
+            let needed = usize::try_from(remaining).unwrap_or(usize::MAX);
+            return Err(FrameDecodeError::TruncatedTail {
+                available: 0,
+                needed,
             });
         }
         if hdr_read < FRAME_HEADER_LEN {
@@ -294,14 +345,45 @@ impl<R: io::Read> FrameStreamDecoder<R> {
             },
         )?;
 
-        // Read body in bounded chunks (<= 64 KiB at a time), growing the body
-        // buffer only up to bytes actually delivered by the reader so even a
-        // truncated tail with a valid 4 MiB header never blindly pre-allocates 4 MiB.
+        // ADR-RB-05 #2 mandatory pre-allocation remaining-length check:
+        // confirm remaining_bytes >= FRAME_BODY_LEN strictly BEFORE allocating
+        // any body buffer or reading body bytes.
+        let body_start = frame_start.checked_add(FRAME_HEADER_LEN as u64).ok_or(
+            FrameDecodeError::CorruptHeader {
+                detail: "stream offset overflow",
+            },
+        )?;
+        let remaining_body_bytes = self.end_offset.saturating_sub(body_start);
+        if remaining_body_bytes < parsed.body_len as u64 {
+            let avail_body = usize::try_from(remaining_body_bytes).unwrap_or(usize::MAX);
+            return Err(FrameDecodeError::TruncatedTail {
+                available: FRAME_HEADER_LEN.saturating_add(avail_body),
+                needed: total_len,
+            });
+        }
+
+        // Read body in bounded chunks (<= 8 KiB initial ceiling) so even if the
+        // underlying file shrinks concurrently below `end_offset`, memory usage
+        // stays bounded and early EOF fails closed as `TruncatedTail`.
+        #[cfg(test)]
+        let mut peak_cap = 0usize;
+        let body = read_body_bounded(
+            &mut self.reader,
+            parsed.body_len,
+            total_len,
+            #[cfg(test)]
+            &mut peak_cap,
+        );
         #[cfg(test)]
         {
-            self.body_allocations += 1;
+            if peak_cap > 0 {
+                self.body_allocations += 1;
+                if peak_cap > self.max_body_capacity {
+                    self.max_body_capacity = peak_cap;
+                }
+            }
         }
-        let body = read_body_bounded(&mut self.reader, parsed.body_len, total_len)?;
+        let body = body?;
         let frame = verify_and_decode_body(&header, &body, parsed.frame_crc)?;
 
         let total_u64 = u64::try_from(total_len).map_err(|_| FrameDecodeError::CorruptHeader {
@@ -322,11 +404,41 @@ impl<R: io::Read> FrameStreamDecoder<R> {
     }
 }
 
+impl<R: io::Read + io::Seek> FrameStreamDecoder<R> {
+    /// Construct a sequential decoder from a seekable source (`File`, `Cursor`,
+    /// etc.), probing its current byte offset and total length so every
+    /// `TruncatedTail` check executes strictly *before* any body buffer
+    /// allocation (`ADR-RB-05` #2).
+    pub fn from_seekable(mut reader: R) -> Result<Self, FrameDecodeError> {
+        let pos = reader
+            .stream_position()
+            .map_err(|err| FrameDecodeError::Io { kind: err.kind() })?;
+        let end = reader
+            .seek(io::SeekFrom::End(0))
+            .map_err(|err| FrameDecodeError::Io { kind: err.kind() })?;
+        reader
+            .seek(io::SeekFrom::Start(pos))
+            .map_err(|err| FrameDecodeError::Io { kind: err.kind() })?;
+        if pos > end {
+            return Err(FrameDecodeError::Io {
+                kind: io::ErrorKind::UnexpectedEof,
+            });
+        }
+        Ok(Self::with_known_len(reader, pos, end))
+    }
+}
+
 fn read_up_to<R: io::Read>(reader: &mut R, buf: &mut [u8]) -> Result<usize, FrameDecodeError> {
     let mut filled = 0usize;
     while filled < buf.len() {
+        let remaining = buf.len() - filled;
         match reader.read(&mut buf[filled..]) {
             Ok(0) => break,
+            Ok(n) if n > remaining => {
+                return Err(FrameDecodeError::Io {
+                    kind: io::ErrorKind::InvalidData,
+                });
+            }
             Ok(n) => filled += n,
             Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
             Err(err) => return Err(FrameDecodeError::Io { kind: err.kind() }),
@@ -339,9 +451,10 @@ fn read_body_bounded<R: io::Read>(
     reader: &mut R,
     body_len: usize,
     total_len: usize,
+    #[cfg(test)] peak_cap: &mut usize,
 ) -> Result<Vec<u8>, FrameDecodeError> {
-    const CHUNK_SIZE: usize = 64 * 1024;
-    let mut body = Vec::with_capacity(body_len.min(CHUNK_SIZE));
+    const INITIAL_CAP_CEILING: usize = 8 * 1024;
+    let mut body: Vec<u8> = Vec::new();
     let mut scratch = [0u8; 8192];
     while body.len() < body_len {
         let want = (body_len - body.len()).min(scratch.len());
@@ -352,15 +465,27 @@ fn read_body_bounded<R: io::Read>(
                     needed: total_len,
                 });
             }
+            Ok(n) if n > want => {
+                return Err(FrameDecodeError::Io {
+                    kind: io::ErrorKind::InvalidData,
+                });
+            }
             Ok(n) => {
                 let next_len = body.len() + n;
-                if next_len > body.capacity() {
+                if body.capacity() == 0 {
+                    let initial_cap = body_len.min(INITIAL_CAP_CEILING).max(next_len);
+                    body.reserve_exact(initial_cap);
+                } else if next_len > body.capacity() {
                     let target_cap = body
                         .capacity()
                         .saturating_mul(2)
                         .max(next_len)
                         .min(body_len);
                     body.reserve_exact(target_cap - body.len());
+                }
+                #[cfg(test)]
+                {
+                    *peak_cap = (*peak_cap).max(body.capacity());
                 }
                 body.extend_from_slice(&scratch[..n]);
             }
@@ -1237,7 +1362,7 @@ mod tests {
                 );
                 // Sequential stream decoder with strict 16-byte read ceiling + zero body allocation proof
                 let spy = PreAllocSpyReader::new(corrupted, FRAME_HEADER_LEN);
-                let mut dec = FrameStreamDecoder::new(spy);
+                let mut dec = FrameStreamDecoder::new(spy, corrupted.len() as u64);
                 assert_eq!(
                     dec.next_frame(),
                     Err(FrameDecodeError::CorruptHeader {
@@ -1372,7 +1497,7 @@ mod tests {
             let mut second_corrupt = two_frames.clone();
             second_corrupt[frame1.len() + 7] ^= 0x80; // huge FRAME_BODY_LEN on frame 2
             let spy = PreAllocSpyReader::new(&second_corrupt, frame1.len() + FRAME_HEADER_LEN);
-            let mut dec = FrameStreamDecoder::new(spy);
+            let mut dec = FrameStreamDecoder::new(spy, second_corrupt.len() as u64);
             let item1 = dec.next_frame().expect("frame 1 decodes cleanly");
             assert!(matches!(
                 item1,
@@ -1415,7 +1540,7 @@ mod tests {
             let mut trailing_bad_hdr = frame1[..FRAME_HEADER_LEN].to_vec();
             trailing_bad_hdr[8] ^= 0x01; // flip HEADER_CRC32C
             let spy = PreAllocSpyReader::new(&trailing_bad_hdr, FRAME_HEADER_LEN);
-            let mut dec = FrameStreamDecoder::new(spy);
+            let mut dec = FrameStreamDecoder::new(spy, trailing_bad_hdr.len() as u64);
             assert_eq!(
                 dec.next_frame(),
                 Err(FrameDecodeError::CorruptHeader {
@@ -1431,6 +1556,768 @@ mod tests {
             );
             assert_eq!(dec.body_allocations(), 0);
             assert_eq!(dec.offset(), 0);
+        }
+    }
+
+    /// `RB-07f` AC1–AC4:
+    /// Exercises sequential frame decoder (`FrameStreamDecoder`) stream-termination
+    /// classification across all EOF and truncation boundaries:
+    /// - AC1: 0-byte empty stream returns `FrameStreamItem::CleanEof`.
+    /// - AC2: Multi-frame valid stream decodes every frame losslessly and returns
+    ///   `CleanEof` at exact EOF (including chunked 1-byte reads + `Interrupted`).
+    /// - AC3: Valid `HEADER_CRC32C` with remaining bytes `< FRAME_BODY_LEN`
+    ///   (0 body bytes, partial body, mid-stream after valid frames, and huge
+    ///   4 MiB valid header with 0/10 body bytes) is strictly classified as
+    ///   `FrameDecodeError::TruncatedTail` (bounded allocation, sticky fail-closed).
+    /// - AC4: Trailing `1..=15` bytes of incomplete header (both valid `LCE1`
+    ///   prefix and arbitrary non-magic bytes, at stream start and after valid
+    ///   frames) are strictly classified as `FrameDecodeError::TruncatedTail`
+    ///   (strictly distinct from `CleanEof` and `CorruptHeader`, sticky fail-closed).
+    #[test]
+    fn seq_decoder_distinguishes_clean_eof_and_truncated_tail_variants() {
+        /// Reader that yields at most `max_chunk` bytes per call and injects
+        /// periodic `ErrorKind::Interrupted` retries before delivering data/EOF.
+        struct ChunkedInterruptedReader<'a> {
+            data: &'a [u8],
+            pos: usize,
+            max_chunk: usize,
+            calls: usize,
+        }
+        impl<'a> ChunkedInterruptedReader<'a> {
+            fn new(data: &'a [u8], max_chunk: usize) -> Self {
+                Self {
+                    data,
+                    pos: 0,
+                    max_chunk,
+                    calls: 0,
+                }
+            }
+        }
+        impl io::Read for ChunkedInterruptedReader<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                self.calls += 1;
+                if self.calls % 3 == 1 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "simulated EINTR",
+                    ));
+                }
+                let avail = self.data.len().saturating_sub(self.pos);
+                let n = buf.len().min(avail).min(self.max_chunk);
+                buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+                self.pos += n;
+                Ok(n)
+            }
+        }
+
+        /// Reader that serves `prefix` bytes and then returns a deterministic
+        /// non-`Interrupted` I/O error (`BrokenPipe`), tracking post-error calls
+        /// to prove sticky error poisoning never reads further.
+        struct FaultInjectingReader<'a> {
+            prefix: &'a [u8],
+            pos: usize,
+            errored: bool,
+            reads_after_error: usize,
+        }
+        impl<'a> FaultInjectingReader<'a> {
+            fn new(prefix: &'a [u8]) -> Self {
+                Self {
+                    prefix,
+                    pos: 0,
+                    errored: false,
+                    reads_after_error: 0,
+                }
+            }
+        }
+        impl io::Read for FaultInjectingReader<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if self.errored {
+                    self.reads_after_error += 1;
+                    return Ok(0);
+                }
+                let avail = self.prefix.len().saturating_sub(self.pos);
+                if avail > 0 {
+                    let n = buf.len().min(avail);
+                    buf[..n].copy_from_slice(&self.prefix[self.pos..self.pos + n]);
+                    self.pos += n;
+                    return Ok(n);
+                }
+                self.errored = true;
+                Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "simulated mid-stream I/O failure",
+                ))
+            }
+        }
+
+        // AC1: 0-byte empty stream -> CleanEof (idempotent on retry, preserves custom base offset,
+        // handles EINTR cleanly, zero body allocations, no terminal error).
+        {
+            let mut dec = FrameStreamDecoder::new(io::Cursor::new(&[][..]), 0);
+            assert_eq!(
+                dec.next_frame(),
+                Ok(FrameStreamItem::CleanEof { offset: 0 }),
+                "AC1: empty stream must return CleanEof at offset 0"
+            );
+            assert_eq!(
+                dec.next_frame(),
+                Ok(FrameStreamItem::CleanEof { offset: 0 }),
+                "AC1: repeated next_frame on empty stream must remain CleanEof"
+            );
+            assert_eq!(dec.offset(), 0);
+            assert_eq!(dec.end_offset(), 0);
+            assert_eq!(dec.body_allocations(), 0);
+            assert_eq!(dec.terminal_error(), None);
+
+            let mut dec_offset = FrameStreamDecoder::with_known_len(
+                ChunkedInterruptedReader::new(&[], 1),
+                4096,
+                4096,
+            );
+            assert_eq!(
+                dec_offset.next_frame(),
+                Ok(FrameStreamItem::CleanEof { offset: 4096 }),
+                "AC1: empty stream with base offset must return CleanEof at base offset"
+            );
+            assert_eq!(dec_offset.offset(), 4096);
+            assert_eq!(dec_offset.terminal_error(), None);
+        }
+
+        // Prepare 4 heterogeneous valid frames (empty payload, small priority, UTF-8 key,
+        // and >16 KiB multi-chunk body exercising bounded buffer growth).
+        let env1 = SampleCaptureEnvelope {
+            session_id: "sess-rb07f-1".to_string(),
+            seq: 1,
+            event_kind: "PromptSubmit".to_string(),
+            body: b"alpha".to_vec(),
+        };
+        let env2 = SampleCaptureEnvelope {
+            session_id: "sess-rb07f-2".to_string(),
+            seq: 2,
+            event_kind: "SessionEnd".to_string(),
+            body: vec![0xde, 0xad, 0xbe, 0xef],
+        };
+        let env3 = SampleCaptureEnvelope {
+            session_id: "sess-rb07f-3".to_string(),
+            seq: 3,
+            event_kind: "ToolOutput".to_string(),
+            body: vec![0x5cu8; 20 * 1024], // > 16 KiB to exercise bounded Vec growth
+        };
+        let f0 = encode_frame(FRAME_FLAG_NONE, "rb07f:empty-payload", &[])
+            .expect("encode f0 empty payload");
+        let f1 = encode_postcard_frame(FRAME_FLAG_NONE, "rb07f:frame-1:正常", 1, &env1)
+            .expect("encode f1");
+        let f2 = encode_postcard_frame(FRAME_FLAG_PRIORITY, "rb07f:frame-2:终态", 1, &env2)
+            .expect("encode f2");
+        let f3 = encode_postcard_frame(FRAME_FLAG_NONE, "rb07f:frame-3:large", 1, &env3)
+            .expect("encode f3");
+
+        let frames = [&f0, &f1, &f2, &f3];
+        let mut full_stream = Vec::new();
+        for f in &frames {
+            full_stream.extend_from_slice(f);
+        }
+
+        // AC2: Multi-frame valid stream lossless decode + exact CleanEof (both Cursor and 1-byte EINTR reader).
+        for (mode, base_offset) in [("cursor", 0u64), ("chunked-1b-eintr", 512u64)] {
+            let end_offset = base_offset + full_stream.len() as u64;
+            let mut cursor_dec;
+            let mut chunked_dec;
+            let decoded_items: Vec<FrameStreamItem>;
+            let final_eof: FrameStreamItem;
+            let repeated_eof: FrameStreamItem;
+            let final_offset: u64;
+            let final_term_err: Option<FrameDecodeError>;
+
+            if mode == "cursor" {
+                cursor_dec = FrameStreamDecoder::with_known_len(
+                    io::Cursor::new(full_stream.as_slice()),
+                    base_offset,
+                    end_offset,
+                );
+                let mut items = Vec::new();
+                for _ in 0..frames.len() {
+                    items.push(cursor_dec.next_frame().expect("AC2 cursor frame"));
+                }
+                final_eof = cursor_dec.next_frame().expect("AC2 cursor CleanEof");
+                repeated_eof = cursor_dec.next_frame().expect("AC2 cursor repeat CleanEof");
+                final_offset = cursor_dec.offset();
+                final_term_err = cursor_dec.terminal_error().cloned();
+                decoded_items = items;
+            } else {
+                chunked_dec = FrameStreamDecoder::with_known_len(
+                    ChunkedInterruptedReader::new(full_stream.as_slice(), 1),
+                    base_offset,
+                    end_offset,
+                );
+                let mut items = Vec::new();
+                for _ in 0..frames.len() {
+                    items.push(chunked_dec.next_frame().expect("AC2 chunked frame"));
+                }
+                final_eof = chunked_dec.next_frame().expect("AC2 chunked CleanEof");
+                repeated_eof = chunked_dec
+                    .next_frame()
+                    .expect("AC2 chunked repeat CleanEof");
+                final_offset = chunked_dec.offset();
+                final_term_err = chunked_dec.terminal_error().cloned();
+                decoded_items = items;
+            }
+
+            let mut expected_off = base_offset;
+            for (idx, item) in decoded_items.iter().enumerate() {
+                match item {
+                    FrameStreamItem::Frame {
+                        offset,
+                        total_len,
+                        frame,
+                    } => {
+                        assert_eq!(*offset, expected_off, "AC2 ({mode}) frame {idx} offset");
+                        assert_eq!(
+                            *total_len,
+                            frames[idx].len(),
+                            "AC2 ({mode}) frame {idx} total_len"
+                        );
+                        let (single_decoded, single_len) =
+                            decode_frame(frames[idx]).expect("single-frame parity");
+                        assert_eq!(single_len, *total_len);
+                        assert_eq!(frame, &single_decoded, "AC2 ({mode}) frame {idx} lossless");
+                        expected_off += *total_len as u64;
+                    }
+                    FrameStreamItem::CleanEof { .. } => {
+                        panic!("AC2 ({mode}) unexpected early CleanEof at frame {idx}");
+                    }
+                }
+            }
+            // Spot-check postcard payloads decoded from stream items.
+            if let FrameStreamItem::Frame { frame, .. } = &decoded_items[1] {
+                assert_eq!(
+                    decode_postcard_payload::<SampleCaptureEnvelope>(frame, 1).expect("env1"),
+                    env1
+                );
+            }
+            if let FrameStreamItem::Frame { frame, .. } = &decoded_items[2] {
+                assert_eq!(frame.flags, FRAME_FLAG_PRIORITY);
+                assert_eq!(
+                    decode_postcard_payload::<SampleCaptureEnvelope>(frame, 1).expect("env2"),
+                    env2
+                );
+            }
+            if let FrameStreamItem::Frame { frame, .. } = &decoded_items[3] {
+                assert_eq!(
+                    decode_postcard_payload::<SampleCaptureEnvelope>(frame, 1).expect("env3"),
+                    env3
+                );
+            }
+            assert_eq!(
+                final_eof,
+                FrameStreamItem::CleanEof {
+                    offset: expected_off
+                },
+                "AC2 ({mode}): exact EOF must return CleanEof at stream end"
+            );
+            assert_eq!(
+                repeated_eof,
+                FrameStreamItem::CleanEof {
+                    offset: expected_off
+                },
+                "AC2 ({mode}): repeated EOF must remain CleanEof"
+            );
+            assert_eq!(final_offset, expected_off);
+            assert_eq!(final_term_err, None);
+        }
+
+        // AC3: Valid HEADER_CRC32C with remaining bytes < FRAME_BODY_LEN -> TruncatedTail.
+        // (3a) Single frame cut at 0 body bytes, 1 body byte, mid-key, mid-payload, and total_len - 1.
+        let body_cuts = [
+            FRAME_HEADER_LEN,           // 0 body bytes remaining
+            FRAME_HEADER_LEN + 1,       // only FLAGS byte
+            FRAME_HEADER_LEN + 3,       // FLAGS + DEDUP_KEY_LEN, 0 key bytes
+            FRAME_HEADER_LEN + 8,       // mid dedup_key
+            f1.len() / 2,               // mid payload
+            f1.len().saturating_sub(1), // 1 byte short of complete frame
+        ];
+        for cut in body_cuts {
+            let truncated = &f1[..cut];
+            let expected_err = FrameDecodeError::TruncatedTail {
+                available: cut,
+                needed: f1.len(),
+            };
+            assert_eq!(
+                decode_frame(truncated),
+                Err(expected_err.clone()),
+                "AC3a cut={cut}: decode_frame must classify short body as TruncatedTail"
+            );
+
+            let mut dec = FrameStreamDecoder::new(
+                ChunkedInterruptedReader::new(truncated, 5),
+                truncated.len() as u64,
+            );
+            assert_eq!(
+                dec.next_frame(),
+                Err(expected_err.clone()),
+                "AC3a cut={cut}: FrameStreamDecoder must classify short body as TruncatedTail"
+            );
+            assert_eq!(dec.offset(), 0, "AC3a cut={cut}: offset must stay 0");
+            assert_eq!(dec.terminal_error(), Some(&expected_err));
+            assert_eq!(
+                dec.body_allocations(),
+                0,
+                "AC3a cut={cut}: zero body heap allocation permitted before confirming remaining >= body_len"
+            );
+            assert_eq!(dec.max_body_capacity(), 0);
+            assert_eq!(
+                dec.get_ref().pos,
+                FRAME_HEADER_LEN,
+                "AC3a cut={cut}: decoder must stop strictly after the 16-byte header"
+            );
+            // Sticky error poison check: retrying MUST keep returning TruncatedTail, NEVER CleanEof!
+            assert_eq!(
+                dec.next_frame(),
+                Err(expected_err.clone()),
+                "AC3a cut={cut}: retry on TruncatedTail must stay poisoned, never CleanEof"
+            );
+            assert_eq!(dec.offset(), 0);
+        }
+
+        // (3b) Multi-frame prefix followed by valid header + truncated body (both 0 and partial body).
+        for tail_cut in [FRAME_HEADER_LEN, FRAME_HEADER_LEN + 9, f2.len() - 1] {
+            let mut stream = f0.clone();
+            stream.extend_from_slice(&f1);
+            let valid_prefix_end = stream.len() as u64;
+            stream.extend_from_slice(&f2[..tail_cut]);
+
+            let mut dec =
+                FrameStreamDecoder::new(io::Cursor::new(stream.as_slice()), stream.len() as u64);
+            assert!(matches!(
+                dec.next_frame(),
+                Ok(FrameStreamItem::Frame { offset: 0, total_len, .. }) if total_len == f0.len()
+            ));
+            assert!(matches!(
+                dec.next_frame(),
+                Ok(FrameStreamItem::Frame { offset, total_len, .. })
+                    if offset == f0.len() as u64 && total_len == f1.len()
+            ));
+            assert_eq!(dec.offset(), valid_prefix_end);
+            assert_eq!(dec.body_allocations(), 2);
+
+            let expected_err = FrameDecodeError::TruncatedTail {
+                available: tail_cut,
+                needed: f2.len(),
+            };
+            assert_eq!(
+                dec.next_frame(),
+                Err(expected_err.clone()),
+                "AC3b tail_cut={tail_cut}: mid-stream short body must return TruncatedTail"
+            );
+            assert_eq!(
+                dec.body_allocations(),
+                2,
+                "AC3b tail_cut={tail_cut}: truncated third frame must perform zero body allocation"
+            );
+            assert_eq!(
+                dec.offset(),
+                valid_prefix_end,
+                "AC3b tail_cut={tail_cut}: offset must stay at last complete frame boundary"
+            );
+            assert_eq!(
+                dec.next_frame(),
+                Err(expected_err),
+                "AC3b tail_cut={tail_cut}: retry must remain TruncatedTail, never CleanEof"
+            );
+            assert_eq!(dec.offset(), valid_prefix_end);
+        }
+
+        // (3c) Valid 16-byte header declaring MAX_FRAME_BODY_LEN (~4 MiB) across ALL
+        // constructors (`new`, `from_seekable`, `with_known_len`) with 0 bytes, 10 bytes,
+        // and `MAX_FRAME_BODY_LEN - 1` bytes remaining -> strictly `TruncatedTail` with
+        // ZERO body allocations and ZERO body bytes read (`ADR-RB-05` #2)!
+        {
+            let mut max_hdr = [0u8; FRAME_HEADER_LEN];
+            max_hdr[0..4].copy_from_slice(&FRAME_MAGIC);
+            max_hdr[4..8].copy_from_slice(&MAX_FRAME_BODY_LEN.to_le_bytes());
+            let hdr_crc = crc32c_checksum(&max_hdr[0..8]);
+            max_hdr[8..12].copy_from_slice(&hdr_crc.to_le_bytes());
+            // FRAME_CRC32C is not checked until full body arrives; keep non-zero sentinel.
+            max_hdr[12..16].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+            let expected_needed = FRAME_HEADER_LEN + MAX_FRAME_BODY_LEN as usize;
+
+            // 0 body bytes via `new` -> zero body allocation!
+            let mut dec0 =
+                FrameStreamDecoder::new(io::Cursor::new(&max_hdr[..]), max_hdr.len() as u64);
+            let err0 = FrameDecodeError::TruncatedTail {
+                available: FRAME_HEADER_LEN,
+                needed: expected_needed,
+            };
+            assert_eq!(dec0.next_frame(), Err(err0.clone()));
+            assert_eq!(dec0.body_allocations(), 0);
+            assert_eq!(dec0.max_body_capacity(), 0);
+            assert_eq!(dec0.next_frame(), Err(err0));
+
+            // 10 body bytes via `new` -> zero body allocation!
+            let mut hdr_plus_10 = max_hdr.to_vec();
+            hdr_plus_10.extend_from_slice(&[0xaa; 10]);
+            let mut dec10 = FrameStreamDecoder::new(
+                io::Cursor::new(hdr_plus_10.as_slice()),
+                hdr_plus_10.len() as u64,
+            );
+            let err10 = FrameDecodeError::TruncatedTail {
+                available: FRAME_HEADER_LEN + 10,
+                needed: expected_needed,
+            };
+            assert_eq!(dec10.next_frame(), Err(err10.clone()));
+            assert_eq!(dec10.body_allocations(), 0);
+            assert_eq!(dec10.max_body_capacity(), 0);
+            assert_eq!(dec10.get_ref().position(), FRAME_HEADER_LEN as u64);
+            assert_eq!(dec10.next_frame(), Err(err10.clone()));
+            assert_eq!(
+                err10.clone().into_storage_error().stable_code_str(),
+                "LBR-IO-001"
+            );
+
+            // Maximum-length (~4 MiB) frame missing ONLY its final 1 byte tested across
+            // `new`, `from_seekable`, and `with_known_len` -> ZERO body allocation!
+            let max_minus_1_len = expected_needed - 1;
+            let mut fake_max_minus_1 = vec![0x5au8; max_minus_1_len];
+            fake_max_minus_1[..FRAME_HEADER_LEN].copy_from_slice(&max_hdr);
+            let err_minus_1 = FrameDecodeError::TruncatedTail {
+                available: max_minus_1_len,
+                needed: expected_needed,
+            };
+
+            let mut dec_new = FrameStreamDecoder::new(
+                io::Cursor::new(fake_max_minus_1.as_slice()),
+                max_minus_1_len as u64,
+            );
+            assert_eq!(dec_new.next_frame(), Err(err_minus_1.clone()));
+            assert_eq!(dec_new.body_allocations(), 0);
+            assert_eq!(dec_new.max_body_capacity(), 0);
+            assert_eq!(dec_new.get_ref().position(), FRAME_HEADER_LEN as u64);
+            assert_eq!(dec_new.next_frame(), Err(err_minus_1.clone()));
+
+            let mut dec_seek =
+                FrameStreamDecoder::from_seekable(io::Cursor::new(fake_max_minus_1.as_slice()))
+                    .expect("from_seekable must succeed");
+            assert_eq!(dec_seek.end_offset(), max_minus_1_len as u64);
+            assert_eq!(
+                dec_seek.next_frame(),
+                Err(err_minus_1.clone()),
+                "from_seekable: 4 MiB frame missing final 1 byte must return TruncatedTail"
+            );
+            assert_eq!(
+                dec_seek.body_allocations(),
+                0,
+                "from_seekable: zero body buffer allocation allowed when remaining < FRAME_BODY_LEN"
+            );
+            assert_eq!(dec_seek.max_body_capacity(), 0);
+            assert_eq!(
+                dec_seek.get_ref().position(),
+                FRAME_HEADER_LEN as u64,
+                "from_seekable: decoder must stop right after the 16-byte header without reading body"
+            );
+            assert_eq!(dec_seek.offset(), 0);
+            assert_eq!(dec_seek.next_frame(), Err(err_minus_1.clone()));
+
+            let mut dec_known = FrameStreamDecoder::with_known_len(
+                ChunkedInterruptedReader::new(fake_max_minus_1.as_slice(), 4),
+                0,
+                max_minus_1_len as u64,
+            );
+            assert_eq!(dec_known.next_frame(), Err(err_minus_1.clone()));
+            assert_eq!(dec_known.body_allocations(), 0);
+            assert_eq!(dec_known.max_body_capacity(), 0);
+            assert_eq!(dec_known.get_ref().pos, FRAME_HEADER_LEN);
+            assert_eq!(dec_known.next_frame(), Err(err_minus_1));
+
+            // Concurrent-shrink safety net: even if the underlying reader yields fewer bytes
+            // than `end_offset` claimed (e.g. concurrent truncation), `read_body_bounded`
+            // caps initial allocation at <= 8 KiB and fails closed as `TruncatedTail`.
+            let mut dec_shrunk_body = FrameStreamDecoder::with_known_len(
+                io::Cursor::new(hdr_plus_10.as_slice()),
+                0,
+                expected_needed as u64,
+            );
+            assert_eq!(dec_shrunk_body.next_frame(), Err(err10.clone()));
+            assert!(
+                dec_shrunk_body.max_body_capacity() <= 8 * 1024,
+                "concurrent-shrink safety net must cap body alloc at <= 8 KiB, got {}",
+                dec_shrunk_body.max_body_capacity()
+            );
+            assert_eq!(dec_shrunk_body.next_frame(), Err(err10));
+
+            // Codex R2 P1 #2: Prematurely exhausted underlying reader before reaching
+            // `end_offset` MUST fail closed as `TruncatedTail` (NEVER `CleanEof`!) and
+            // stay sticky-poisoned on retry (both at offset 0 and after a valid frame).
+            let mut dec_empty_short =
+                FrameStreamDecoder::with_known_len(io::Cursor::new(&[][..]), 0, 100);
+            let err_empty_short = FrameDecodeError::TruncatedTail {
+                available: 0,
+                needed: 100,
+            };
+            assert_eq!(
+                dec_empty_short.next_frame(),
+                Err(err_empty_short.clone()),
+                "empty reader with non-zero end_offset must never report CleanEof"
+            );
+            assert_eq!(dec_empty_short.offset(), 0);
+            assert_eq!(dec_empty_short.body_allocations(), 0);
+            assert_eq!(
+                dec_empty_short.next_frame(),
+                Err(err_empty_short),
+                "retry on prematurely exhausted stream must remain TruncatedTail"
+            );
+
+            let expected_two_len = (f0.len() + f1.len()) as u64;
+            let mut dec_mid_short = FrameStreamDecoder::with_known_len(
+                io::Cursor::new(f0.as_slice()),
+                0,
+                expected_two_len,
+            );
+            assert!(matches!(
+                dec_mid_short.next_frame(),
+                Ok(FrameStreamItem::Frame { offset: 0, total_len, .. }) if total_len == f0.len()
+            ));
+            let err_mid_short = FrameDecodeError::TruncatedTail {
+                available: 0,
+                needed: f1.len(),
+            };
+            assert_eq!(
+                dec_mid_short.next_frame(),
+                Err(err_mid_short.clone()),
+                "stream prematurely exhausted after f0 must fail closed as TruncatedTail, never CleanEof"
+            );
+            assert_eq!(dec_mid_short.offset(), f0.len() as u64);
+            assert_eq!(dec_mid_short.next_frame(), Err(err_mid_short));
+
+            // Invalid bounds (`offset > end_offset` and seekable cursor past EOF) fail closed.
+            let mut dec_bad_bounds =
+                FrameStreamDecoder::with_known_len(io::Cursor::new(&[][..]), 50, 10);
+            assert_eq!(
+                dec_bad_bounds.next_frame(),
+                Err(FrameDecodeError::CorruptHeader {
+                    detail: "stream offset exceeds known length",
+                })
+            );
+            assert_eq!(
+                dec_bad_bounds.next_frame(),
+                Err(FrameDecodeError::CorruptHeader {
+                    detail: "stream offset exceeds known length",
+                })
+            );
+
+            let mut past_eof_cursor = io::Cursor::new(f0.as_slice());
+            past_eof_cursor.set_position((f0.len() + 10) as u64);
+            assert_eq!(
+                FrameStreamDecoder::from_seekable(past_eof_cursor).err(),
+                Some(FrameDecodeError::Io {
+                    kind: io::ErrorKind::UnexpectedEof,
+                })
+            );
+
+            // Also verify `from_seekable` on empty and full multi-frame streams, and
+            // bounded prefix scans (`with_known_len` stopping cleanly at `committed_len`
+            // without reading uncommitted bytes past `committed_len`).
+            let mut dec_seek_empty = FrameStreamDecoder::from_seekable(io::Cursor::new(&[][..]))
+                .expect("from_seekable empty");
+            assert_eq!(
+                dec_seek_empty.next_frame(),
+                Ok(FrameStreamItem::CleanEof { offset: 0 })
+            );
+
+            let mut dec_seek_full =
+                FrameStreamDecoder::from_seekable(io::Cursor::new(full_stream.as_slice()))
+                    .expect("from_seekable full stream");
+            for _ in 0..frames.len() {
+                assert!(matches!(
+                    dec_seek_full.next_frame(),
+                    Ok(FrameStreamItem::Frame { .. })
+                ));
+            }
+            assert_eq!(
+                dec_seek_full.next_frame(),
+                Ok(FrameStreamItem::CleanEof {
+                    offset: full_stream.len() as u64
+                })
+            );
+
+            // Bounded committed_len prefix scan: full_stream has f0+f1+f2+f3, limit to f0+f1.
+            let committed_boundary = (f0.len() + f1.len()) as u64;
+            let mut dec_bounded = FrameStreamDecoder::with_known_len(
+                io::Cursor::new(full_stream.as_slice()),
+                0,
+                committed_boundary,
+            );
+            assert!(matches!(
+                dec_bounded.next_frame(),
+                Ok(FrameStreamItem::Frame { offset: 0, total_len, .. }) if total_len == f0.len()
+            ));
+            assert!(matches!(
+                dec_bounded.next_frame(),
+                Ok(FrameStreamItem::Frame { offset, total_len, .. })
+                    if offset == f0.len() as u64 && total_len == f1.len()
+            ));
+            assert_eq!(
+                dec_bounded.next_frame(),
+                Ok(FrameStreamItem::CleanEof {
+                    offset: committed_boundary
+                })
+            );
+            assert_eq!(
+                dec_bounded.get_ref().position(),
+                committed_boundary,
+                "bounded decoder must never read uncommitted bytes beyond end_offset"
+            );
+
+            // Bounded limit cutting into f2 (both 5-byte partial header and body-minus-1):
+            let cut_hdr = committed_boundary + 5;
+            let mut dec_cut_hdr = FrameStreamDecoder::with_known_len(
+                io::Cursor::new(full_stream.as_slice()),
+                0,
+                cut_hdr,
+            );
+            assert!(dec_cut_hdr.next_frame().is_ok());
+            assert!(dec_cut_hdr.next_frame().is_ok());
+            assert_eq!(
+                dec_cut_hdr.next_frame(),
+                Err(FrameDecodeError::TruncatedTail {
+                    available: 5,
+                    needed: FRAME_HEADER_LEN,
+                })
+            );
+            assert_eq!(dec_cut_hdr.get_ref().position(), cut_hdr);
+
+            let cut_body = committed_boundary + (f2.len() as u64) - 1;
+            let mut dec_cut_body = FrameStreamDecoder::with_known_len(
+                io::Cursor::new(full_stream.as_slice()),
+                0,
+                cut_body,
+            );
+            assert!(dec_cut_body.next_frame().is_ok());
+            assert!(dec_cut_body.next_frame().is_ok());
+            assert_eq!(dec_cut_body.body_allocations(), 2);
+            assert_eq!(
+                dec_cut_body.next_frame(),
+                Err(FrameDecodeError::TruncatedTail {
+                    available: f2.len() - 1,
+                    needed: f2.len(),
+                })
+            );
+            assert_eq!(
+                dec_cut_body.body_allocations(),
+                2,
+                "bounded cut inside f2 body must perform zero additional body allocation"
+            );
+            assert_eq!(
+                dec_cut_body.get_ref().position(),
+                committed_boundary + FRAME_HEADER_LEN as u64
+            );
+        }
+
+        // (3d) Sticky I/O error poisoning (both during header read and mid-body read).
+        for (label, prefix_slice) in [
+            ("mid-header I/O error", &f1[..5]),
+            ("mid-body I/O error", &f1[..FRAME_HEADER_LEN + 4]),
+        ] {
+            let mut dec =
+                FrameStreamDecoder::new(FaultInjectingReader::new(prefix_slice), f1.len() as u64);
+            let expected_io = FrameDecodeError::Io {
+                kind: io::ErrorKind::BrokenPipe,
+            };
+            assert_eq!(dec.next_frame(), Err(expected_io.clone()), "{label}");
+            assert_eq!(dec.offset(), 0, "{label}: offset must stay 0");
+            assert_eq!(
+                dec.next_frame(),
+                Err(expected_io),
+                "{label}: retry must remain Io error, never CleanEof"
+            );
+            assert_eq!(
+                dec.get_ref().reads_after_error,
+                0,
+                "{label}: poisoned decoder must never read underlying reader again"
+            );
+        }
+
+        // AC4: Exhaustively verify EVERY trailing incomplete header length `1..=15` bytes:
+        // must ALWAYS be classified strictly as `TruncatedTail { available: n, needed: 16 }`,
+        // NEVER `CleanEof` and NEVER `CorruptHeader` (even when bytes are non-magic garbage!).
+        let garbage_tail: [u8; 15] = [
+            0xff, 0x00, 0xde, 0xad, 0xbe, 0xef, 0x13, 0x37, 0x99, 0x88, 0x77, 0x66, 0x55, 0x44,
+            0x33,
+        ];
+        for n in 1..FRAME_HEADER_LEN {
+            for (kind, sample) in [
+                ("valid-LCE1-prefix", &f1[..n]),
+                ("non-magic-tail", &garbage_tail[..n]),
+            ] {
+                let expected_err = FrameDecodeError::TruncatedTail {
+                    available: n,
+                    needed: FRAME_HEADER_LEN,
+                };
+
+                // (4a) At stream start (offset 0)
+                assert_eq!(
+                    decode_frame(sample),
+                    Err(expected_err.clone()),
+                    "AC4a ({kind}, n={n}): decode_frame must return TruncatedTail"
+                );
+                let mut dec_start = FrameStreamDecoder::new(
+                    ChunkedInterruptedReader::new(sample, 1),
+                    sample.len() as u64,
+                );
+                let res_start = dec_start.next_frame();
+                assert_eq!(
+                    res_start,
+                    Err(expected_err.clone()),
+                    "AC4a ({kind}, n={n}): stream start must return TruncatedTail, not CleanEof or CorruptHeader"
+                );
+                assert!(!matches!(
+                    res_start,
+                    Err(FrameDecodeError::CorruptHeader { .. })
+                ));
+                assert_eq!(dec_start.offset(), 0);
+                assert_eq!(dec_start.body_allocations(), 0);
+                assert_eq!(
+                    dec_start.next_frame(),
+                    Err(expected_err.clone()),
+                    "AC4a ({kind}, n={n}): retry must remain TruncatedTail, never CleanEof"
+                );
+
+                // (4b) After valid multi-frame prefix (f0 + f1 + sample[..n])
+                let mut stream = f0.clone();
+                stream.extend_from_slice(&f1);
+                let valid_prefix_end = stream.len() as u64;
+                stream.extend_from_slice(sample);
+
+                let mut dec_mid = FrameStreamDecoder::new(
+                    ChunkedInterruptedReader::new(stream.as_slice(), 3),
+                    stream.len() as u64,
+                );
+                assert!(matches!(
+                    dec_mid.next_frame(),
+                    Ok(FrameStreamItem::Frame { offset: 0, total_len, .. }) if total_len == f0.len()
+                ));
+                assert!(matches!(
+                    dec_mid.next_frame(),
+                    Ok(FrameStreamItem::Frame { offset, total_len, .. })
+                        if offset == f0.len() as u64 && total_len == f1.len()
+                ));
+                assert_eq!(dec_mid.offset(), valid_prefix_end);
+                assert_eq!(
+                    dec_mid.next_frame(),
+                    Err(expected_err.clone()),
+                    "AC4b ({kind}, n={n}): trailing partial header after valid frames must return TruncatedTail"
+                );
+                assert_eq!(
+                    dec_mid.offset(),
+                    valid_prefix_end,
+                    "AC4b ({kind}, n={n}): offset must remain at last valid frame end"
+                );
+                assert_eq!(
+                    dec_mid.next_frame(),
+                    Err(expected_err),
+                    "AC4b ({kind}, n={n}): retry after partial header must remain TruncatedTail"
+                );
+                assert_eq!(dec_mid.offset(), valid_prefix_end);
+            }
         }
     }
 }
