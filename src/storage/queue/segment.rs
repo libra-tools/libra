@@ -355,6 +355,21 @@ enum Phase1Plan<T> {
         stale_tmp_names: Vec<T>,
         reclaimed_orphans: Vec<u32>,
     },
+    /// Case D (clean old segment + empty or half-frame-only orphan successor `S + 1`):
+    /// `max_live_seg == active_seg + 1`, old segment `S` satisfies
+    /// `actual_len(S) == committed_len` with `[0, committed_len)` prefix CRC32C
+    /// verified, and `events-<S+1>.log` has `0` complete valid frames (`orphan_non_empty == false`
+    /// for 0-byte empty orphan, `orphan_non_empty == true` for half-frame/damaged-only orphan).
+    /// Phase 2 quarantines non-empty orphan via `RB-08t::quarantine_and_unlink_orphan`,
+    /// unlinks the orphan, `fsync_dir(lane_dir)`, and syncs dual `LTM2` replicas to the
+    /// intact `active_seg` without sealing `S` (`ADR-RB-05` #3 Case D, `RB-08f` AC1–AC8).
+    CaseDCleanOrphanSuccessor {
+        meta: LaneTailMeta,
+        orphan_seg: u32,
+        orphan_non_empty: bool,
+        stale_tmp_names: Vec<T>,
+        reclaimed_orphans: Vec<u32>,
+    },
 }
 
 // ============================================================================
@@ -451,6 +466,9 @@ enum SegmentOpEvent {
         lane: &'static str,
         seg_id: u32,
     },
+    FsyncLaneDirOnRecovery {
+        lane: &'static str,
+    },
     ReleaseAppendLock,
 }
 
@@ -479,6 +497,10 @@ enum SegmentCrashPoint {
     /// and strictly before destructive `truncate` or `unlink`, leaving
     /// `quarantine/<id>.bin` durably persisted (`RB-08t` AC8).
     AfterQuarantineDirFsyncBeforeDestructive,
+    /// Simulate transient `fsync_dir(lane_dir)` failure immediately after
+    /// `unlink(orphan_seg)` succeeded, verifying that retry persists the lane
+    /// directory before returning `Ok` (`RB-08f` AC2/AC5 retry durability).
+    FailLaneDirFsyncAfterOrphanUnlink,
 }
 
 #[cfg(test)]
@@ -684,6 +706,11 @@ impl SegmentObserver {
             .push(SegmentOpEvent::FsyncLaneDirAfterOrphanUnlink { lane, seg_id });
     }
 
+    fn record_fsync_lane_on_recovery(&mut self, lane: &'static str) {
+        self.events
+            .push(SegmentOpEvent::FsyncLaneDirOnRecovery { lane });
+    }
+
     fn record_release_lock(&mut self) {
         self.events.push(SegmentOpEvent::ReleaseAppendLock);
     }
@@ -709,6 +736,7 @@ enum SegmentCrashPoint {
     BeforeBackupMetaRename,
     BeforeQuarantineRename,
     AfterQuarantineDirFsyncBeforeDestructive,
+    FailLaneDirFsyncAfterOrphanUnlink,
 }
 
 #[cfg(not(test))]
@@ -823,6 +851,9 @@ impl SegmentObserver {
 
     #[inline]
     fn record_fsync_lane_after_orphan_unlink(&mut self, _lane: &'static str, _seg_id: u32) {}
+
+    #[inline]
+    fn record_fsync_lane_on_recovery(&mut self, _lane: &'static str) {}
 
     #[inline]
     fn record_release_lock(&mut self) {}
@@ -1112,17 +1143,27 @@ fn scan_successor_segment_readonly(
     })
 }
 
-/// Apply Phase 1 read-only classification rules for Case D valid successor
-/// recovery (`RB-08d` clean successor + `RB-08u` valid successor with trailing
-/// uncommitted half-frame): validates `MAX_SEALED_SEGMENTS` illegal full-table
-/// state first (before any mutation), forbids sealing a 0-byte old segment, and
-/// enforces scope guards for downstream `RB-08k` (nested Case C→D) and `RB-08f`
-/// (empty/half-frame orphan).
-fn classify_case_d_base_readonly(
+/// Phase 1 read-only classification result for a single contiguous Case D
+/// successor `events-<S+1>.log` (`ADR-RB-05` #3 Case D, `RB-08d`/`RB-08u`/`RB-08f`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaseDPhase1Kind {
+    ValidSuccessor { has_damaged_tail: bool },
+    OrphanSuccessor { non_empty: bool },
+}
+
+/// Apply Phase 1 read-only classification rules for Case D (`RB-08d` clean
+/// valid successor, `RB-08u` valid successor with trailing uncommitted
+/// half-frame, and `RB-08f` empty or half-frame-only orphan successor).
+///
+/// Validates `MAX_SEALED_SEGMENTS` illegal full-table state first (before any
+/// mutation), forbids sealing a 0-byte old segment, and enforces the scope
+/// guard for downstream `RB-08k` (nested Case C→D).
+fn classify_case_d_readonly(
     meta: &LaneTailMeta,
     old_actual_len: u64,
+    succ_actual_len: u64,
     succ_scan: &SuccessorSegmentScan,
-) -> StorageResult<()> {
+) -> StorageResult<CaseDPhase1Kind> {
     if succ_scan.frame_count > 0 && meta.sealed.len() >= MAX_SEALED_SEGMENTS {
         return Err(StorageBackendError::CorruptCommittedFrame {
             detail:
@@ -1138,10 +1179,8 @@ fn classify_case_d_base_readonly(
         });
     }
     if succ_scan.frame_count == 0 {
-        return Err(StorageBackendError::CorruptCommittedFrame {
-            detail:
-                "Case D: empty or half-frame orphan successor segment requires RB-08f orphan cleanup"
-                    .to_string(),
+        return Ok(CaseDPhase1Kind::OrphanSuccessor {
+            non_empty: succ_actual_len > 0,
         });
     }
     if meta.committed_len == 0 {
@@ -1151,7 +1190,9 @@ fn classify_case_d_base_readonly(
                     .to_string(),
         });
     }
-    Ok(())
+    Ok(CaseDPhase1Kind::ValidSuccessor {
+        has_damaged_tail: succ_scan.has_damaged_tail,
+    })
 }
 
 /// Build and validate the converged `LTM2` metadata that seals clean old segment
@@ -2093,17 +2134,29 @@ mod unix_seg {
             let (mut succ_file, succ_actual_len) =
                 open_segment_readonly_nofollow(lane_fd, succ_seg, expected_uid)?;
             let succ_scan = scan_successor_segment_readonly(&mut succ_file, succ_actual_len)?;
-            classify_case_d_base_readonly(&meta, actual_len, &succ_scan)?;
-            return Ok(Phase1Plan::CaseDRecoverValidSuccessor {
-                meta,
-                succ_seg,
-                succ_valid_end: succ_scan.valid_end,
-                succ_crc32c: succ_scan.valid_crc32c,
-                succ_frames: succ_scan.frame_count,
-                succ_has_damaged_tail: succ_scan.has_damaged_tail,
-                stale_tmp_names: scan.stale_tmp_names,
-                reclaimed_orphans,
-            });
+            return match classify_case_d_readonly(&meta, actual_len, succ_actual_len, &succ_scan)? {
+                CaseDPhase1Kind::ValidSuccessor { has_damaged_tail } => {
+                    Ok(Phase1Plan::CaseDRecoverValidSuccessor {
+                        meta,
+                        succ_seg,
+                        succ_valid_end: succ_scan.valid_end,
+                        succ_crc32c: succ_scan.valid_crc32c,
+                        succ_frames: succ_scan.frame_count,
+                        succ_has_damaged_tail: has_damaged_tail,
+                        stale_tmp_names: scan.stale_tmp_names,
+                        reclaimed_orphans,
+                    })
+                }
+                CaseDPhase1Kind::OrphanSuccessor { non_empty } => {
+                    Ok(Phase1Plan::CaseDCleanOrphanSuccessor {
+                        meta,
+                        orphan_seg: succ_seg,
+                        orphan_non_empty: non_empty,
+                        stale_tmp_names: scan.stale_tmp_names,
+                        reclaimed_orphans,
+                    })
+                }
+            };
         }
 
         if actual_len == meta.committed_len {
@@ -2454,6 +2507,7 @@ mod unix_seg {
         cleaned_tmp_files: usize,
         reclaimed_orphans_removed: usize,
         quarantined_artifacts: Vec<QuarantinePublishReport>,
+        lane_dir_synced: bool,
     }
 
     struct UnixPhase2Context<'a> {
@@ -2488,6 +2542,7 @@ mod unix_seg {
                     cleaned_tmp_files,
                     reclaimed_orphans_removed: 0,
                     quarantined_artifacts: Vec::new(),
+                    lane_dir_synced: true,
                 })
             }
             Phase1Plan::Case0bPreInitializedEmpty {
@@ -2514,6 +2569,7 @@ mod unix_seg {
                     cleaned_tmp_files,
                     reclaimed_orphans_removed: 0,
                     quarantined_artifacts: Vec::new(),
+                    lane_dir_synced: mirrored_replica || cleaned_tmp_files > 0,
                 })
             }
             Phase1Plan::CaseAClean {
@@ -2543,6 +2599,9 @@ mod unix_seg {
                     cleaned_tmp_files,
                     reclaimed_orphans_removed,
                     quarantined_artifacts: Vec::new(),
+                    lane_dir_synced: mirrored_replica
+                        || cleaned_tmp_files > 0
+                        || reclaimed_orphans_removed > 0,
                 })
             }
             Phase1Plan::CaseCRecoverCleanTail {
@@ -2592,6 +2651,7 @@ mod unix_seg {
                     cleaned_tmp_files,
                     reclaimed_orphans_removed,
                     quarantined_artifacts: Vec::new(),
+                    lane_dir_synced: true,
                 })
             }
             Phase1Plan::CaseDRecoverValidSuccessor {
@@ -2658,9 +2718,154 @@ mod unix_seg {
                     cleaned_tmp_files,
                     reclaimed_orphans_removed,
                     quarantined_artifacts,
+                    lane_dir_synced: true,
+                })
+            }
+            Phase1Plan::CaseDCleanOrphanSuccessor {
+                meta,
+                orphan_seg,
+                orphan_non_empty,
+                stale_tmp_names,
+                reclaimed_orphans,
+            } => {
+                let cleaned_tmp_files =
+                    clean_stale_tmp_files_unix(lane_fd, &stale_tmp_names, expected_uid)?;
+                let reclaimed_orphans_removed =
+                    clean_reclaimed_orphans_unix(lane_fd, &reclaimed_orphans, expected_uid)?;
+                let mut quarantined_artifacts = Vec::new();
+                if orphan_non_empty {
+                    // `RB-08f` AC3–AC5, AC7–AC8: non-empty half-frame orphan MUST
+                    // go through `RB-08t::quarantine_and_unlink_orphan_at_fds` so
+                    // `publish_quarantine_durable` completes `fsync_dir(quarantine_dir)`
+                    // strictly before `unlink(orphan)` + `fsync_dir(lane_dir)`.
+                    let q_dirs = UnixQuarantineDirs {
+                        quarantine_fd: ctx.quarantine_fd,
+                        quarantine_dir: ctx.quarantine_dir,
+                        lane_fd,
+                        owners: ctx.owners,
+                        append_lock: ctx.append_lock,
+                    };
+                    let q_report = quarantine_and_unlink_orphan_at_fds(
+                        &q_dirs, ctx.lane, orphan_seg, observer,
+                    )?;
+                    quarantined_artifacts.push(q_report);
+                } else {
+                    // `RB-08f` AC1–AC2: empty 0-byte orphan -> inode-pinned `unlink`
+                    // + `fsync_dir(lane_dir)` (zero quarantine artifact).
+                    unlink_empty_orphan_at_fd_unix(
+                        lane_fd,
+                        ctx.lane,
+                        orphan_seg,
+                        expected_uid,
+                        observer,
+                    )?;
+                }
+                // `RB-08f` AC6: sync both `tail.meta` and `tail.meta.bak` to intact
+                // `active_seg` without sealing `active_seg`.
+                commit_dual_tail_meta_unix(lane_fd, lane_label, &meta, expected_uid, observer)?;
+                Ok(Phase2ConvergedState {
+                    meta,
+                    active_seg_exists: true,
+                    recovered_frames: 0,
+                    recovered_bytes: 0,
+                    mirrored_replica: true,
+                    cleaned_tmp_files,
+                    reclaimed_orphans_removed,
+                    quarantined_artifacts,
+                    lane_dir_synced: true,
                 })
             }
         }
+    }
+
+    /// Inode-pinned Unix unlink + `fsync_dir(lane_fd)` for a verified 0-byte
+    /// Case D empty orphan successor segment (`ADR-RB-05` #3 Case D, `RB-08f` AC1–AC2).
+    fn unlink_empty_orphan_at_fd_unix(
+        lane_fd: &OwnedFd,
+        lane: CaptureQueueLane,
+        orphan_seg_id: u32,
+        expected_uid: u32,
+        observer: &mut SegmentObserver,
+    ) -> StorageResult<()> {
+        let seg_name = segment_log_file_name(orphan_seg_id);
+        let cname = osstr_to_cstring(OsStr::new(&seg_name), "open empty orphan segment")?;
+        let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
+        // SAFETY: `lane_fd` is valid and `cname` is NUL-terminated.
+        let raw_fd = unsafe { libc::openat(lane_fd.as_raw_fd(), cname.as_ptr(), flags) };
+        if raw_fd < 0 {
+            let err = io::Error::last_os_error();
+            if is_symlink_errno_at(&err, lane_fd, &cname) {
+                return Err(map_queue_symlink_err("capture queue empty orphan segment"));
+            }
+            return Err(StorageBackendError::io("open empty orphan segment", err));
+        }
+        // SAFETY: `raw_fd >= 0` is exclusively owned here and kept open until
+        // after inode-verified `unlinkat`.
+        let orphan_fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+        let st = fstat_fd(&orphan_fd, "stat empty orphan segment")?;
+        if (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
+            return Err(StorageBackendError::CorruptCommittedFrame {
+                detail: "capture queue empty orphan segment is not a regular file".to_string(),
+            });
+        }
+        if st.st_uid != expected_uid {
+            return Err(map_queue_owner_mismatch_err(
+                "capture queue empty orphan segment",
+            ));
+        }
+        if st.st_size != 0 {
+            return Err(StorageBackendError::CorruptCommittedFrame {
+                detail: "expected 0-byte empty orphan segment became non-empty before unlink"
+                    .to_string(),
+            });
+        }
+        let expected_dev = st.st_dev;
+        let expected_ino = st.st_ino;
+
+        let mut cur_st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+        // SAFETY: `lane_fd` is valid and `cname` is NUL-terminated.
+        let stat_rc = unsafe {
+            libc::fstatat(
+                lane_fd.as_raw_fd(),
+                cname.as_ptr(),
+                cur_st.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if stat_rc != 0 {
+            return Err(StorageBackendError::io(
+                "verify empty orphan segment inode before unlink",
+                io::Error::last_os_error(),
+            ));
+        }
+        // SAFETY: `fstatat` succeeded.
+        let cur_st = unsafe { cur_st.assume_init() };
+        if cur_st.st_dev != expected_dev || cur_st.st_ino != expected_ino {
+            return Err(StorageBackendError::CorruptCommittedFrame {
+                detail: "empty orphan segment inode changed before unlink".to_string(),
+            });
+        }
+
+        let lane_label = lane_dir_name(lane);
+        observer.record_orphan_unlink_start(lane_label, orphan_seg_id);
+        // SAFETY: `lane_fd` is valid and `cname` is NUL-terminated.
+        let unlink_rc = unsafe { libc::unlinkat(lane_fd.as_raw_fd(), cname.as_ptr(), 0) };
+        if unlink_rc != 0 {
+            return Err(StorageBackendError::io(
+                "unlink empty capture queue orphan segment",
+                io::Error::last_os_error(),
+            ));
+        }
+        drop(orphan_fd);
+        observer.record_orphan_unlink_complete(lane_label, orphan_seg_id);
+
+        observer.maybe_crash(SegmentCrashPoint::FailLaneDirFsyncAfterOrphanUnlink)?;
+        fsync_fd(
+            lane_fd,
+            "fsync capture queue lane directory after unlinking empty orphan",
+        )?;
+        observer.record_fsync_lane_after_orphan_unlink(lane_label, orphan_seg_id);
+        Ok(())
     }
 
     fn apply_mirror_sync_unix(
@@ -3427,6 +3632,7 @@ mod unix_seg {
         drop(orphan_file);
         observer.record_orphan_unlink_complete(lane_label, orphan_seg_id);
 
+        observer.maybe_crash(SegmentCrashPoint::FailLaneDirFsyncAfterOrphanUnlink)?;
         fsync_fd(
             dirs.lane_fd,
             "fsync capture queue lane directory after unlinking quarantined orphan",
@@ -3658,6 +3864,16 @@ mod unix_seg {
             append_lock: &append_lock,
         };
         let converged = phase2_execute_plan_unix(&phase2_ctx, plan, observer)?;
+        // Guarantee lane directory entry mutations from any prior interrupted
+        // unlink (where `unlink` succeeded but `fsync_dir(lane_dir)` failed) are
+        // durably persisted before `recover_lane` returns `Ok`.
+        if !converged.lane_dir_synced {
+            fsync_fd(
+                &lane_fd,
+                "fsync capture queue lane directory before completing recovery",
+            )?;
+            observer.record_fsync_lane_on_recovery(lane_dir_name(lane));
+        }
 
         drop(append_lock);
         observer.record_release_lock();
@@ -3886,10 +4102,11 @@ mod non_unix_seg {
         use windows_sys::Win32::{
             Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE},
             Storage::FileSystem::{
-                BY_HANDLE_FILE_INFORMATION, CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_DIRECTORY,
-                FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
-                FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-                GetFileInformationByHandle, OPEN_EXISTING,
+                BY_HANDLE_FILE_INFORMATION, CREATE_NEW, CreateFileW, DELETE,
+                FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_INFO,
+                FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
+                FILE_SHARE_READ, FILE_SHARE_WRITE, FileDispositionInfo, GetFileInformationByHandle,
+                OPEN_EXISTING, SetFileInformationByHandle,
             },
         };
 
@@ -3911,6 +4128,30 @@ mod non_unix_seg {
                     CloseHandle(self.0);
                 }
             }
+        }
+
+        /// Atomically mark an already-verified, handle-pinned Windows file
+        /// (opened with `DELETE` access and without `FILE_SHARE_DELETE`) for
+        /// deletion via `SetFileInformationByHandle(FileDispositionInfo)` and
+        /// close it, eliminating any path-reopen TOCTOU replacement window.
+        fn delete_windows_file_by_handle(file: File, context: &'static str) -> StorageResult<()> {
+            let info = FILE_DISPOSITION_INFO { DeleteFile: true };
+            // SAFETY: `file` is a valid open Win32 handle opened with `DELETE`
+            // access and without `FILE_SHARE_DELETE`; `info` matches
+            // `FileDispositionInfo` layout.
+            let ok = unsafe {
+                SetFileInformationByHandle(
+                    file.as_raw_handle() as HANDLE,
+                    FileDispositionInfo,
+                    (&raw const info).cast(),
+                    u32::try_from(std::mem::size_of::<FILE_DISPOSITION_INFO>()).unwrap_or(1),
+                )
+            };
+            if ok == 0 {
+                return Err(StorageBackendError::io(context, io::Error::last_os_error()));
+            }
+            drop(file);
+            Ok(())
         }
 
         fn to_wide_nul(path: &Path) -> Vec<u16> {
@@ -4282,14 +4523,14 @@ mod non_unix_seg {
             }
 
             let seg_path = lane_dir.join(segment_log_file_name(meta.active_seg));
-            let old_desired_access = if open_seg_writable && max_live_seg == meta.active_seg {
+            let desired_access = if open_seg_writable {
                 GENERIC_READ | GENERIC_WRITE
             } else {
                 GENERIC_READ
             };
             let (mut seg_file, actual_len, seg_identity) = match open_windows_file_nofollow(
                 &seg_path,
-                old_desired_access,
+                desired_access,
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 OPEN_EXISTING,
                 "capture queue segment file",
@@ -4318,37 +4559,57 @@ mod non_unix_seg {
             if max_live_seg > meta.active_seg {
                 let succ_seg = validate_single_case_d_successor_id(meta.active_seg, &live_segs)?;
                 let succ_path = lane_dir.join(segment_log_file_name(succ_seg));
-                let succ_desired_access = if open_seg_writable {
-                    GENERIC_READ | GENERIC_WRITE
-                } else {
-                    GENERIC_READ
-                };
                 let (mut succ_file, succ_actual_len, succ_identity) = open_windows_file_nofollow(
                     &succ_path,
-                    succ_desired_access,
+                    desired_access,
                     FILE_SHARE_READ | FILE_SHARE_WRITE,
                     OPEN_EXISTING,
                     "capture queue successor segment file",
                     "open Case D successor capture queue segment",
                 )?;
                 let succ_scan = scan_successor_segment_readonly(&mut succ_file, succ_actual_len)?;
-                classify_case_d_base_readonly(&meta, actual_len, &succ_scan)?;
-                return Ok((
-                    Phase1Plan::CaseDRecoverValidSuccessor {
-                        meta,
-                        succ_seg,
-                        succ_valid_end: succ_scan.valid_end,
-                        succ_crc32c: succ_scan.valid_crc32c,
-                        succ_frames: succ_scan.frame_count,
-                        succ_has_damaged_tail: succ_scan.has_damaged_tail,
-                        stale_tmp_names,
-                        reclaimed_orphans,
-                    },
-                    Some(PinnedWindowsSegment {
-                        file: succ_file,
-                        identity: succ_identity,
-                    }),
-                ));
+                return match classify_case_d_readonly(
+                    &meta,
+                    actual_len,
+                    succ_actual_len,
+                    &succ_scan,
+                )? {
+                    CaseDPhase1Kind::ValidSuccessor { has_damaged_tail } => Ok((
+                        Phase1Plan::CaseDRecoverValidSuccessor {
+                            meta,
+                            succ_seg,
+                            succ_valid_end: succ_scan.valid_end,
+                            succ_crc32c: succ_scan.valid_crc32c,
+                            succ_frames: succ_scan.frame_count,
+                            succ_has_damaged_tail: has_damaged_tail,
+                            stale_tmp_names,
+                            reclaimed_orphans,
+                        },
+                        Some(PinnedWindowsSegment {
+                            file: succ_file,
+                            identity: succ_identity,
+                        }),
+                    )),
+                    CaseDPhase1Kind::OrphanSuccessor { non_empty } => {
+                        // Drop the orphan handle immediately so Phase 2 can unlink it
+                        // without a Windows sharing violation; keep the intact old
+                        // `active_seg` handle pinned for subsequent appends.
+                        drop(succ_file);
+                        Ok((
+                            Phase1Plan::CaseDCleanOrphanSuccessor {
+                                meta,
+                                orphan_seg: succ_seg,
+                                orphan_non_empty: non_empty,
+                                stale_tmp_names,
+                                reclaimed_orphans,
+                            },
+                            Some(PinnedWindowsSegment {
+                                file: seg_file,
+                                identity: seg_identity,
+                            }),
+                        ))
+                    }
+                };
             }
 
             if actual_len == meta.committed_len {
@@ -4561,6 +4822,7 @@ mod non_unix_seg {
             cleaned_tmp_files: usize,
             reclaimed_orphans_removed: usize,
             quarantined_artifacts: Vec<QuarantinePublishReport>,
+            lane_dir_synced: bool,
         }
 
         fn phase2_execute_plan_windows(
@@ -4617,6 +4879,7 @@ mod non_unix_seg {
                         cleaned_tmp_files: cleaned,
                         reclaimed_orphans_removed: 0,
                         quarantined_artifacts: Vec::new(),
+                        lane_dir_synced: true,
                     })
                 }
                 Phase1Plan::Case0bPreInitializedEmpty {
@@ -4663,6 +4926,7 @@ mod non_unix_seg {
                         cleaned_tmp_files: cleaned,
                         reclaimed_orphans_removed: 0,
                         quarantined_artifacts: Vec::new(),
+                        lane_dir_synced: mirrored || cleaned > 0,
                     })
                 }
                 Phase1Plan::CaseAClean {
@@ -4711,6 +4975,7 @@ mod non_unix_seg {
                         cleaned_tmp_files: cleaned,
                         reclaimed_orphans_removed: orphans,
                         quarantined_artifacts: Vec::new(),
+                        lane_dir_synced: mirrored || cleaned > 0 || orphans > 0,
                     })
                 }
                 Phase1Plan::CaseCRecoverCleanTail {
@@ -4752,6 +5017,7 @@ mod non_unix_seg {
                         cleaned_tmp_files: cleaned,
                         reclaimed_orphans_removed: orphans,
                         quarantined_artifacts: Vec::new(),
+                        lane_dir_synced: true,
                     })
                 }
                 Phase1Plan::CaseDRecoverValidSuccessor {
@@ -4802,9 +5068,80 @@ mod non_unix_seg {
                         cleaned_tmp_files: cleaned,
                         reclaimed_orphans_removed: orphans,
                         quarantined_artifacts,
+                        lane_dir_synced: true,
+                    })
+                }
+                Phase1Plan::CaseDCleanOrphanSuccessor {
+                    meta,
+                    orphan_seg,
+                    orphan_non_empty,
+                    stale_tmp_names,
+                    reclaimed_orphans,
+                } => {
+                    let cleaned = clean_tmp(&stale_tmp_names)?;
+                    let orphans = clean_orphans(&reclaimed_orphans)?;
+                    let mut quarantined_artifacts = Vec::new();
+                    if orphan_non_empty {
+                        let q_report = quarantine_and_unlink_orphan_windows_locked(
+                            ctx.quarantine_dir,
+                            lane_dir,
+                            ctx.lane,
+                            orphan_seg,
+                            ctx.append_lock,
+                            observer,
+                        )?;
+                        quarantined_artifacts.push(q_report);
+                    } else {
+                        unlink_empty_orphan_windows(lane_dir, ctx.lane, orphan_seg, observer)?;
+                    }
+                    commit_dual_tail_meta_windows(lane_dir, lane_label, &meta, observer)?;
+                    Ok(WindowsPhase2ConvergedState {
+                        meta,
+                        active_seg_exists: true,
+                        recovered_frames: 0,
+                        recovered_bytes: 0,
+                        mirrored_replica: true,
+                        cleaned_tmp_files: cleaned,
+                        reclaimed_orphans_removed: orphans,
+                        quarantined_artifacts,
+                        lane_dir_synced: true,
                     })
                 }
             }
+        }
+
+        fn unlink_empty_orphan_windows(
+            lane_dir: &Path,
+            lane: CaptureQueueLane,
+            orphan_seg_id: u32,
+            observer: &mut SegmentObserver,
+        ) -> StorageResult<()> {
+            let orphan_path = lane_dir.join(segment_log_file_name(orphan_seg_id));
+            let (orphan_file, actual_len, _) = open_windows_file_nofollow(
+                &orphan_path,
+                GENERIC_READ | DELETE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                OPEN_EXISTING,
+                "capture queue empty orphan segment",
+                "open empty orphan segment",
+            )?;
+            if actual_len != 0 {
+                return Err(StorageBackendError::CorruptCommittedFrame {
+                    detail: "expected 0-byte empty orphan segment became non-empty before unlink"
+                        .to_string(),
+                });
+            }
+            let lane_label = lane_dir_name(lane);
+            observer.record_orphan_unlink_start(lane_label, orphan_seg_id);
+            delete_windows_file_by_handle(
+                orphan_file,
+                "unlink empty capture queue orphan segment",
+            )?;
+            observer.record_orphan_unlink_complete(lane_label, orphan_seg_id);
+            observer.maybe_crash(SegmentCrashPoint::FailLaneDirFsyncAfterOrphanUnlink)?;
+            flush_windows_dir(lane_dir)?;
+            observer.record_fsync_lane_after_orphan_unlink(lane_label, orphan_seg_id);
+            Ok(())
         }
 
         fn clean_lane_quarantine_tmp_files_windows(
@@ -5071,26 +5408,18 @@ mod non_unix_seg {
             )
         }
 
-        pub(super) fn quarantine_and_unlink_orphan_windows(
+        fn quarantine_and_unlink_orphan_windows_locked(
             quarantine_dir: &Path,
             lane_dir: &Path,
             lane: CaptureQueueLane,
             orphan_seg_id: u32,
+            append_lock: &File,
             observer: &mut SegmentObserver,
         ) -> StorageResult<QuarantinePublishReport> {
-            if quarantine_dir.parent() != lane_dir.parent() {
-                return Err(StorageBackendError::BackendInternal {
-                    detail:
-                        "quarantine and lane directories must share the same capture queue root"
-                            .to_string(),
-                });
-            }
-            let (_q_guards, append_lock) = acquire_quarantine_lock_windows(quarantine_dir)?;
-            let _l_guard = pin_windows_dir_nofollow(lane_dir, "capture queue lane directory")?;
             let orphan_path = lane_dir.join(segment_log_file_name(orphan_seg_id));
             let (mut orphan_file, actual_len, _) = open_windows_file_nofollow(
                 &orphan_path,
-                GENERIC_READ,
+                GENERIC_READ | DELETE,
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 OPEN_EXISTING,
                 "capture queue orphan segment file",
@@ -5107,7 +5436,7 @@ mod non_unix_seg {
             let report = publish_quarantine_durable_writer_windows_pinned(
                 quarantine_dir,
                 &id,
-                &append_lock,
+                append_lock,
                 observer,
                 |tmp_file| {
                     let copied_crc =
@@ -5122,20 +5451,43 @@ mod non_unix_seg {
                     Ok((actual_len, copied_crc))
                 },
             )?;
-            drop(orphan_file);
-            let _ = ensure_not_reparse_or_dir_if_exists(
-                &orphan_path,
-                "capture queue orphan segment file",
-            )?;
             let lane_label = lane_dir_name(lane);
             observer.record_orphan_unlink_start(lane_label, orphan_seg_id);
-            fs::remove_file(&orphan_path).map_err(|e| {
-                StorageBackendError::io("unlink quarantined capture queue orphan segment", e)
-            })?;
+            delete_windows_file_by_handle(
+                orphan_file,
+                "unlink quarantined capture queue orphan segment",
+            )?;
             observer.record_orphan_unlink_complete(lane_label, orphan_seg_id);
+            observer.maybe_crash(SegmentCrashPoint::FailLaneDirFsyncAfterOrphanUnlink)?;
             flush_windows_dir(lane_dir)?;
             observer.record_fsync_lane_after_orphan_unlink(lane_label, orphan_seg_id);
             Ok(report)
+        }
+
+        pub(super) fn quarantine_and_unlink_orphan_windows(
+            quarantine_dir: &Path,
+            lane_dir: &Path,
+            lane: CaptureQueueLane,
+            orphan_seg_id: u32,
+            observer: &mut SegmentObserver,
+        ) -> StorageResult<QuarantinePublishReport> {
+            if quarantine_dir.parent() != lane_dir.parent() {
+                return Err(StorageBackendError::BackendInternal {
+                    detail:
+                        "quarantine and lane directories must share the same capture queue root"
+                            .to_string(),
+                });
+            }
+            let (_q_guards, append_lock) = acquire_quarantine_lock_windows(quarantine_dir)?;
+            let _l_guard = pin_windows_dir_nofollow(lane_dir, "capture queue lane directory")?;
+            quarantine_and_unlink_orphan_windows_locked(
+                quarantine_dir,
+                lane_dir,
+                lane,
+                orphan_seg_id,
+                &append_lock,
+                observer,
+            )
         }
 
         pub(super) fn append_in_storage_dir_windows(
@@ -5308,6 +5660,10 @@ mod non_unix_seg {
                 append_lock: &append_lock,
             };
             let converged = phase2_execute_plan_windows(&phase2_ctx, plan, observer)?;
+            if !converged.lane_dir_synced {
+                flush_windows_dir(&lane_dir)?;
+                observer.record_fsync_lane_on_recovery(lane_label);
+            }
 
             drop(append_lock);
             observer.record_release_lock();
@@ -7181,8 +7537,6 @@ mod tests {
         )
         .expect_err("crash after fsync_dir before unlink must fail");
         assert_eq!(err_after_fsync_orphan.stable_code_str(), "LBR-IO-001");
-        #[cfg(unix)]
-        let orphan_bin_ino_before_reopen = inode_key(&orphan_bin_path);
         assert_eq!(
             fs::read(&orphan_bin_path).expect("AC8: read persisted orphan .bin"),
             damaged_orphan
@@ -7193,7 +7547,11 @@ mod tests {
             damaged_orphan
         );
 
-        // Reopen BOTH lanes BEFORE ANY replay can republish any `.bin` artifact.
+        // Reopen BOTH lanes BEFORE any manual replay:
+        // - Normal (untrimmed Case C tail, prior to RB-08m) fails closed while keeping
+        //   both `ac8_direct_bin` and `trunc_bin_path` untouched (exact original inode + bytes).
+        // - Priority (`RB-08f` Case D half-frame orphan recovery) automatically completes
+        //   idempotent orphan quarantine + unlink + dual-replica sync to `out_p1.meta`!
         let pre_replay_reopen_err = recover_lane(repo.path(), CaptureQueueLane::Normal)
             .expect_err("AC8: pre-replay recover_lane on untrimmed half-frame fails closed");
         assert!(
@@ -7203,15 +7561,22 @@ mod tests {
             ),
             "expected BackendInternal before RB-08m, got {pre_replay_reopen_err:?}"
         );
-        let pre_replay_priority_err = recover_lane(repo.path(), CaptureQueueLane::Priority)
-            .expect_err("AC8: pre-replay recover_lane on orphan seg1 fails closed prior to RB-08f");
-        assert!(matches!(
-            pre_replay_priority_err,
-            StorageBackendError::CorruptCommittedFrame { .. }
-        ));
+        let pre_replay_priority_rec = recover_lane(repo.path(), CaptureQueueLane::Priority)
+            .expect("AC8: reopening Priority lane completes RB-08f orphan recovery cleanly");
+        assert_eq!(pre_replay_priority_rec.meta, out_p1.meta);
+        assert_eq!(pre_replay_priority_rec.quarantined_artifacts.len(), 1);
+        assert_eq!(
+            pre_replay_priority_rec.quarantined_artifacts[0].id,
+            expected_orphan_id
+        );
+        assert!(
+            !orphan_path.exists(),
+            "orphan seg1 unlinked during Priority lane reopen"
+        );
 
-        // Verify ALL THREE original `.bin` artifacts keep their exact original
-        // inode and exact bytes across BOTH lane reopens before any replay.
+        // Verify `ac8_direct_bin` and `trunc_bin_path` kept their exact original
+        // inode and bytes across BOTH lane reopens, and `orphan_bin_path` holds
+        // exact `damaged_orphan` bytes.
         #[cfg(unix)]
         {
             assert_eq!(
@@ -7223,11 +7588,6 @@ mod tests {
                 inode_key(&trunc_bin_path),
                 trunc_bin_ino_before_reopen,
                 "AC8: truncate .bin inode must survive both pre-replay lane reopens unchanged"
-            );
-            assert_eq!(
-                inode_key(&orphan_bin_path),
-                orphan_bin_ino_before_reopen,
-                "AC8: orphan .bin inode must survive both pre-replay lane reopens unchanged"
             );
         }
         assert_eq!(
@@ -7255,8 +7615,7 @@ mod tests {
             out_p1.meta.committed_len
         );
 
-        // Idempotent replays complete both interrupted destructive operations
-        // without losing any `.bin` artifact.
+        // Idempotent replay completes the interrupted Normal truncate without losing `.bin`.
         let replay_trunc = quarantine_and_truncate_segment(
             quarantine_dir,
             normal_dir,
@@ -7275,6 +7634,21 @@ mod tests {
             expected_n1_n2
         );
 
+        // Also verify direct idempotent replay of `quarantine_and_unlink_orphan`
+        // on a fresh orphan seg 1 after an `AfterQuarantineDirFsyncBeforeDestructive` crash.
+        let replay_orphan_bytes = b"LCE1\x31\x00\x00\x00direct-replay-orphan";
+        fs::write(&orphan_path, replay_orphan_bytes).expect("write replay orphan seg1");
+        let mut crash_replay_orphan = SegmentObserver::with_crash(
+            SegmentCrashPoint::AfterQuarantineDirFsyncBeforeDestructive,
+        );
+        let _ = quarantine_and_unlink_orphan_inner(
+            quarantine_dir,
+            priority_dir,
+            CaptureQueueLane::Priority,
+            1,
+            &mut crash_replay_orphan,
+        )
+        .expect_err("crash after fsync_dir before direct orphan replay must fail");
         let replay_orphan = quarantine_and_unlink_orphan(
             quarantine_dir,
             priority_dir,
@@ -7282,10 +7656,9 @@ mod tests {
             1,
         )
         .expect("idempotent replay of quarantine_and_unlink_orphan must succeed");
-        assert_eq!(replay_orphan.id, expected_orphan_id);
         assert_eq!(
-            fs::read(&orphan_bin_path).expect("replayed orphan .bin"),
-            damaged_orphan
+            fs::read(&replay_orphan.bin_path).expect("replayed orphan .bin"),
+            replay_orphan_bytes
         );
         assert!(!orphan_path.exists(), "orphan unlinked after replay");
 
@@ -8382,5 +8755,543 @@ mod tests {
         .expect("live append after Case D half-frame recovery must succeed");
         assert_eq!(post.seg_id, 2);
         assert!(post.meta.committed_len > s2_f1.len() as u64);
+    }
+
+    #[test]
+    fn case_d_empty_and_half_frame_orphan_cleanup_quarantine() {
+        #[cfg(unix)]
+        fn write_file_0600(path: &Path, bytes: &[u8]) {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            let mut f = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(path)
+                .expect("create 0600 queue test file");
+            f.write_all(bytes).expect("write queue test file");
+            f.sync_data().expect("sync queue test file");
+        }
+        #[cfg(not(unix))]
+        fn write_file_0600(path: &Path, bytes: &[u8]) {
+            let mut f = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(path)
+                .expect("create queue test file");
+            f.write_all(bytes).expect("write queue test file");
+            f.sync_data().expect("sync queue test file");
+        }
+
+        let repo = tempdir().expect("create RB-08f orphan cleanup repo");
+        let init = init_capture_queue(repo.path()).expect("init RB-08f queue");
+        let normal_dir = &init.paths.normal;
+        let quarantine_dir = &init.paths.quarantine;
+
+        // Commit intact active segment S = 0.
+        let s0_f1 = encode_frame(FRAME_FLAG_NONE, "rb08f:s0:1", b"intact-seg0-frame-1").unwrap();
+        let s0_f2 = encode_frame(FRAME_FLAG_NONE, "rb08f:s0:2", b"intact-seg0-frame-2").unwrap();
+        append_encoded_frame(repo.path(), CaptureQueueLane::Normal, &s0_f1).expect("commit s0 f1");
+        let s0_out = append_encoded_frame(repo.path(), CaptureQueueLane::Normal, &s0_f2)
+            .expect("commit s0 f2");
+        let s0_path = normal_dir.join(segment_log_file_name(0));
+        let s0_bytes_orig = fs::read(&s0_path).expect("read intact seg0");
+        assert_eq!(s0_bytes_orig.len() as u64, s0_out.meta.committed_len);
+
+        // Plant unrelated priority-lane quarantine .tmp to assert cross-lane isolation.
+        let priority_other_tmp = quarantine_dir.join("priority-other-orphan.tmp");
+        write_file_0600(&priority_other_tmp, b"keep-priority-tmp");
+
+        // ------------------------------------------------------------------
+        // Part 1 — AC1, AC2, AC6: Empty 0-byte orphan successor `events-00000001.log`
+        // -> unlink + fsync_dir(lane_dir) + sync both LTM2 replicas to intact S=0
+        // (zero quarantine artifact created; S=0 NOT sealed).
+        // ------------------------------------------------------------------
+        let orphan_path = normal_dir.join(segment_log_file_name(1));
+        write_file_0600(&orphan_path, b"");
+        // Corrupt backup replica (Subcase B1) to verify dual-replica sync repairs it.
+        write_file_0600(&normal_dir.join(QUEUE_TAIL_META_BAK_FILE), b"corrupt-bak");
+
+        let mut empty_obs = SegmentObserver::new();
+        let empty_report =
+            recover_lane_in_storage_dir(repo.path(), CaptureQueueLane::Normal, &mut empty_obs)
+                .expect("AC1-AC2: empty Case D orphan recovery must succeed");
+
+        // AC1: empty orphan unlinked with zero quarantine files created.
+        assert!(
+            !orphan_path.exists(),
+            "AC1 violated: empty orphan events-00000001.log must be unlinked"
+        );
+        assert!(
+            empty_report.quarantined_artifacts.is_empty(),
+            "empty 0-byte orphan must not create a quarantine .bin artifact"
+        );
+        assert_eq!(
+            fs::read(&s0_path).expect("intact seg0 after empty orphan unlink"),
+            s0_bytes_orig
+        );
+        assert!(priority_other_tmp.exists());
+
+        // AC2: `OrphanUnlinkStart < OrphanUnlinkComplete < FsyncLaneDirAfterOrphanUnlink < MetaTmpWriteAndSync`.
+        let empty_unlink_start = empty_obs
+            .events
+            .iter()
+            .position(|e| {
+                *e == SegmentOpEvent::OrphanUnlinkStart {
+                    lane: QUEUE_LANE_NORMAL_DIR,
+                    seg_id: 1,
+                }
+            })
+            .expect("AC1/AC2: empty orphan unlink start");
+        let empty_unlink_done = empty_obs
+            .events
+            .iter()
+            .position(|e| {
+                *e == SegmentOpEvent::OrphanUnlinkComplete {
+                    lane: QUEUE_LANE_NORMAL_DIR,
+                    seg_id: 1,
+                }
+            })
+            .expect("AC1/AC2: empty orphan unlink complete");
+        let empty_lane_fsync = empty_obs
+            .events
+            .iter()
+            .position(|e| {
+                *e == SegmentOpEvent::FsyncLaneDirAfterOrphanUnlink {
+                    lane: QUEUE_LANE_NORMAL_DIR,
+                    seg_id: 1,
+                }
+            })
+            .expect("AC2: empty orphan fsync_dir(lane_dir)");
+        let empty_meta_sync = empty_obs
+            .events
+            .iter()
+            .position(|e| {
+                *e == SegmentOpEvent::MetaTmpWriteAndSync {
+                    lane: QUEUE_LANE_NORMAL_DIR,
+                    tmp_name: QUEUE_TAIL_META_TMP_FILE,
+                    target_name: QUEUE_TAIL_META_FILE,
+                }
+            })
+            .expect("AC6: empty orphan dual-meta sync");
+        assert!(empty_unlink_start < empty_unlink_done);
+        assert!(
+            empty_unlink_done < empty_lane_fsync,
+            "AC2 violated: fsync_dir(lane_dir) must immediately follow empty orphan unlink"
+        );
+        assert!(empty_lane_fsync < empty_meta_sync);
+
+        // Verify both on-disk LTM2 replicas match intact S=0 (sealed remains empty).
+        let empty_primary_raw = fs::read(normal_dir.join(QUEUE_TAIL_META_FILE)).unwrap();
+        let empty_backup_raw = fs::read(normal_dir.join(QUEUE_TAIL_META_BAK_FILE)).unwrap();
+        assert_eq!(empty_primary_raw, empty_backup_raw);
+        let empty_primary = LaneTailMeta::decode(&empty_primary_raw).unwrap();
+        assert_eq!(empty_primary, s0_out.meta);
+        assert!(empty_primary.sealed.is_empty());
+
+        // ------------------------------------------------------------------
+        // Part 2 — AC8: Half-frame-only orphan `events-00000001.log` (genuine
+        // truncated `encode_frame` hitting `FrameDecodeError::TruncatedTail`),
+        // crash strictly BEFORE `rename` -> `events-00000001.log` MUST remain
+        // 100% byte-for-byte identical (zero premature unlink!).
+        // ------------------------------------------------------------------
+        let full_orphan_frame = encode_frame(
+            FRAME_FLAG_NONE,
+            "rb08f:half-orphan:1",
+            &vec![0x3Cu8; 70 * 1024], // > 64 KiB streaming quarantine verification
+        )
+        .unwrap();
+        let half_orphan_bytes = full_orphan_frame[..full_orphan_frame.len() / 2].to_vec();
+        write_file_0600(&orphan_path, &half_orphan_bytes);
+        // Remove backup replica (Subcase B1) so AC6 also proves backup repair!
+        fs::remove_file(normal_dir.join(QUEUE_TAIL_META_BAK_FILE)).expect("remove backup meta");
+
+        let expected_orphan_id =
+            quarantine_artifact_id(CaptureQueueLane::Normal, 1, 0, &half_orphan_bytes);
+        let expected_orphan_tmp = quarantine_dir.join(format!("{expected_orphan_id}.tmp"));
+        let expected_orphan_bin = quarantine_dir.join(format!("{expected_orphan_id}.bin"));
+
+        let mut crash_before_rename =
+            SegmentObserver::with_crash(SegmentCrashPoint::BeforeQuarantineRename);
+        let err_ac8 = recover_lane_in_storage_dir(
+            repo.path(),
+            CaptureQueueLane::Normal,
+            &mut crash_before_rename,
+        )
+        .expect_err("AC8: crash before orphan quarantine rename must fail");
+        assert_eq!(err_ac8.stable_code_str(), "LBR-IO-001");
+        assert_eq!(
+            fs::read(&orphan_path).expect("AC8: orphan must still exist and match exact bytes"),
+            half_orphan_bytes,
+            "AC8 violated: half-frame orphan altered or prematurely unlinked before rename"
+        );
+        assert!(expected_orphan_tmp.exists());
+        assert!(!expected_orphan_bin.exists());
+        assert!(priority_other_tmp.exists());
+
+        // ------------------------------------------------------------------
+        // Part 3 — AC3, AC4, AC5, AC6, AC7: Reopen lane -> cleans AC8 `.tmp`,
+        // publishes `quarantine/<id>.bin` durably BEFORE `unlink(events-00000001.log)`,
+        // runs `fsync_dir(lane_dir)`, and syncs BOTH `tail.meta` and `tail.meta.bak`
+        // to intact `active_seg == 0`!
+        // ------------------------------------------------------------------
+        let mut half_obs = SegmentObserver::new();
+        let half_report =
+            recover_lane_in_storage_dir(repo.path(), CaptureQueueLane::Normal, &mut half_obs)
+                .expect("AC3-AC7: half-frame orphan recovery must succeed");
+        assert_eq!(half_report.cleaned_quarantine_tmp_files, 1);
+        assert!(priority_other_tmp.exists());
+
+        // AC3: exact orphan bytes durably published into `quarantine/<id>.bin` + `LBR-AGENT-050`.
+        assert_eq!(half_report.quarantined_artifacts.len(), 1);
+        let q_art = &half_report.quarantined_artifacts[0];
+        assert_eq!(q_art.id, expected_orphan_id);
+        assert_eq!(q_art.bin_path, expected_orphan_bin);
+        assert_eq!(q_art.quarantined_bytes, half_orphan_bytes.len() as u64);
+        assert_eq!(q_art.crc32c, crc32c_checksum(&half_orphan_bytes));
+        assert_eq!(q_art.diagnostic_code, QUARANTINE_DIAGNOSTIC_CODE);
+        assert_eq!(
+            fs::read(&expected_orphan_bin).expect("AC3: read quarantined half-frame orphan .bin"),
+            half_orphan_bytes
+        );
+        assert!(!expected_orphan_tmp.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = fs::symlink_metadata(&expected_orphan_bin)
+                .expect("stat orphan .bin")
+                .permissions()
+                .mode()
+                & 0o7777;
+            assert_eq!(mode, QUEUE_FILE_MODE, "quarantine .bin must be 0600");
+        }
+
+        // AC4: half-frame orphan unlinked from disk; intact S=0 untouched.
+        assert!(
+            !orphan_path.exists(),
+            "AC4 violated: damaged half-frame orphan events-00000001.log must be unlinked"
+        );
+        assert_eq!(
+            fs::read(&s0_path).expect("intact seg0 after half-frame orphan unlink"),
+            s0_bytes_orig
+        );
+
+        // AC5 & AC7: caller-path strict ordering instrumentation:
+        //   tmp.sync_data complete < rename start
+        //   rename complete < fsync_dir(quarantine_dir) start
+        //   fsync_dir(quarantine_dir) complete < unlink(events-00000001.log) start
+        //   unlink complete < fsync_dir(lane_dir)
+        //   fsync_dir(lane_dir) < dual LTM2 commit (primary & backup)
+        let q_sync_done = half_obs
+            .events
+            .iter()
+            .position(|e| {
+                *e == SegmentOpEvent::QuarantineTmpSyncDataComplete {
+                    id: expected_orphan_id.clone(),
+                }
+            })
+            .expect("AC3/AC7: quarantine tmp sync_data complete");
+        let q_rename_start = half_obs
+            .events
+            .iter()
+            .position(|e| {
+                *e == SegmentOpEvent::QuarantineRenameStart {
+                    id: expected_orphan_id.clone(),
+                }
+            })
+            .expect("AC3/AC7: quarantine rename start");
+        let q_rename_done = half_obs
+            .events
+            .iter()
+            .position(|e| {
+                *e == SegmentOpEvent::QuarantineRenameComplete {
+                    id: expected_orphan_id.clone(),
+                }
+            })
+            .expect("AC3/AC7: quarantine rename complete");
+        let q_fsync_start = half_obs
+            .events
+            .iter()
+            .position(|e| {
+                *e == SegmentOpEvent::QuarantineFsyncDirStart {
+                    id: expected_orphan_id.clone(),
+                }
+            })
+            .expect("AC3/AC7: quarantine fsync_dir start");
+        let q_fsync_done = half_obs
+            .events
+            .iter()
+            .position(|e| {
+                *e == SegmentOpEvent::QuarantineFsyncDirComplete {
+                    id: expected_orphan_id.clone(),
+                }
+            })
+            .expect("AC7: quarantine fsync_dir complete");
+        let half_unlink_start = half_obs
+            .events
+            .iter()
+            .position(|e| {
+                *e == SegmentOpEvent::OrphanUnlinkStart {
+                    lane: QUEUE_LANE_NORMAL_DIR,
+                    seg_id: 1,
+                }
+            })
+            .expect("AC4/AC7: half-frame orphan unlink start");
+        let half_unlink_done = half_obs
+            .events
+            .iter()
+            .position(|e| {
+                *e == SegmentOpEvent::OrphanUnlinkComplete {
+                    lane: QUEUE_LANE_NORMAL_DIR,
+                    seg_id: 1,
+                }
+            })
+            .expect("AC4/AC5: half-frame orphan unlink complete");
+        let half_lane_fsync = half_obs
+            .events
+            .iter()
+            .position(|e| {
+                *e == SegmentOpEvent::FsyncLaneDirAfterOrphanUnlink {
+                    lane: QUEUE_LANE_NORMAL_DIR,
+                    seg_id: 1,
+                }
+            })
+            .expect("AC5: fsync_dir(lane_dir) after half-frame orphan unlink");
+        let half_primary_meta = half_obs
+            .events
+            .iter()
+            .position(|e| {
+                *e == SegmentOpEvent::MetaTmpWriteAndSync {
+                    lane: QUEUE_LANE_NORMAL_DIR,
+                    tmp_name: QUEUE_TAIL_META_TMP_FILE,
+                    target_name: QUEUE_TAIL_META_FILE,
+                }
+            })
+            .expect("AC6: primary tail.meta sync");
+        let half_backup_meta = half_obs
+            .events
+            .iter()
+            .position(|e| {
+                *e == SegmentOpEvent::MetaTmpWriteAndSync {
+                    lane: QUEUE_LANE_NORMAL_DIR,
+                    tmp_name: QUEUE_TAIL_META_BAK_TMP_FILE,
+                    target_name: QUEUE_TAIL_META_BAK_FILE,
+                }
+            })
+            .expect("AC6: backup tail.meta.bak sync");
+
+        assert!(q_sync_done < q_rename_start);
+        assert!(q_rename_done < q_fsync_start);
+        assert!(
+            q_fsync_done < half_unlink_start,
+            "AC7 violated: fsync_dir(quarantine_dir) complete={q_fsync_done} must be < unlink(S+1) start={half_unlink_start}"
+        );
+        assert!(half_unlink_start < half_unlink_done);
+        assert!(
+            half_unlink_done < half_lane_fsync,
+            "AC5 violated: fsync_dir(lane_dir) must immediately follow half-frame orphan unlink"
+        );
+        assert!(half_lane_fsync < half_primary_meta);
+        assert!(half_primary_meta < half_backup_meta);
+
+        // AC6: Both raw on-disk `tail.meta` and `tail.meta.bak` synced identically
+        // to intact `active_seg == 0` (NOT sealed).
+        let primary_raw = fs::read(normal_dir.join(QUEUE_TAIL_META_FILE)).expect("read tail.meta");
+        let backup_raw =
+            fs::read(normal_dir.join(QUEUE_TAIL_META_BAK_FILE)).expect("read tail.meta.bak");
+        assert_eq!(primary_raw, backup_raw);
+        let primary_meta = LaneTailMeta::decode(&primary_raw).expect("decode primary");
+        let backup_meta = LaneTailMeta::decode(&backup_raw).expect("decode backup");
+        assert_eq!(primary_meta, backup_meta);
+        assert_eq!(primary_meta, s0_out.meta);
+        assert_eq!(primary_meta.active_seg, 0);
+        assert!(primary_meta.sealed.is_empty());
+
+        // ------------------------------------------------------------------
+        // Part 4 — Direct `append_validated_frame_in_storage_dir` caller path
+        // cleans half-frame orphan (after an injected dir-fsync crash!) and
+        // appends seamlessly onto intact `events-00000000.log`!
+        // ------------------------------------------------------------------
+        let full_orphan_2 = encode_frame(
+            FRAME_FLAG_NONE,
+            "rb08f:half-orphan:2",
+            b"second-half-frame-orphan-payload",
+        )
+        .unwrap();
+        let half_orphan_2 = full_orphan_2[..full_orphan_2.len() / 2].to_vec();
+        write_file_0600(&orphan_path, &half_orphan_2);
+        let orphan2_id = quarantine_artifact_id(CaptureQueueLane::Normal, 1, 0, &half_orphan_2);
+        let orphan2_bin = quarantine_dir.join(format!("{orphan2_id}.bin"));
+
+        let mut crash_after_fsync = SegmentObserver::with_crash(
+            SegmentCrashPoint::AfterQuarantineDirFsyncBeforeDestructive,
+        );
+        let _ = recover_lane_in_storage_dir(
+            repo.path(),
+            CaptureQueueLane::Normal,
+            &mut crash_after_fsync,
+        )
+        .expect_err("crash after fsync_dir before orphan unlink must fail");
+        assert_eq!(fs::read(&orphan2_bin).unwrap(), half_orphan_2);
+        assert!(orphan_path.exists());
+
+        let new_f = encode_frame(FRAME_FLAG_NONE, "rb08f:s0:3", b"appended-to-intact-s0").unwrap();
+        let mut app_obs = SegmentObserver::new();
+        let app_out = append_validated_frame_in_storage_dir(
+            repo.path(),
+            CaptureQueueLane::Normal,
+            &new_f,
+            &mut app_obs,
+        )
+        .expect("append caller path must quarantine+unlink orphan and append to intact S=0");
+        assert!(!orphan_path.exists());
+        assert_eq!(fs::read(&orphan2_bin).unwrap(), half_orphan_2);
+        assert_eq!(app_out.seg_id, 0);
+        assert_eq!(app_out.frame_offset, s0_out.meta.committed_len);
+        assert_eq!(app_out.meta.active_seg, 0);
+        assert!(app_out.meta.sealed.is_empty());
+
+        let app_q_fsync_done = app_obs
+            .events
+            .iter()
+            .position(|e| {
+                *e == SegmentOpEvent::QuarantineFsyncDirComplete {
+                    id: orphan2_id.clone(),
+                }
+            })
+            .expect("append caller quarantine fsync_dir complete");
+        let app_unlink_start = app_obs
+            .events
+            .iter()
+            .position(|e| {
+                *e == SegmentOpEvent::OrphanUnlinkStart {
+                    lane: QUEUE_LANE_NORMAL_DIR,
+                    seg_id: 1,
+                }
+            })
+            .expect("append caller orphan unlink start");
+        let app_lane_fsync = app_obs
+            .events
+            .iter()
+            .position(|e| {
+                *e == SegmentOpEvent::FsyncLaneDirAfterOrphanUnlink {
+                    lane: QUEUE_LANE_NORMAL_DIR,
+                    seg_id: 1,
+                }
+            })
+            .expect("append caller lane fsync after unlink");
+        let app_write_s0 = app_obs
+            .events
+            .iter()
+            .position(|e| {
+                *e == SegmentOpEvent::SegmentWriteAll {
+                    lane: QUEUE_LANE_NORMAL_DIR,
+                    seg_id: 0,
+                    offset: s0_out.meta.committed_len,
+                    len: new_f.len(),
+                }
+            })
+            .expect("append caller write onto intact seg0");
+        assert!(app_q_fsync_done < app_unlink_start);
+        assert!(app_unlink_start < app_lane_fsync);
+        assert!(app_lane_fsync < app_write_s0);
+
+        // ------------------------------------------------------------------
+        // Part 5 — Retry durability when `unlink(orphan)` succeeds and
+        // `fsync_dir(lane_dir)` fails (`RB-08f` AC2/AC5 retry durability):
+        // retry enters Case A (orphan gone from directory listing), and MUST
+        // still execute `fsync_dir(lane_dir)` before returning `Ok`!
+        // ------------------------------------------------------------------
+        // (a) Empty orphan retry after failed post-unlink `fsync_dir(lane_dir)`
+        write_file_0600(&orphan_path, b"");
+        let mut fail_fsync_empty_obs =
+            SegmentObserver::with_crash(SegmentCrashPoint::FailLaneDirFsyncAfterOrphanUnlink);
+        let err_empty_fsync = recover_lane_in_storage_dir(
+            repo.path(),
+            CaptureQueueLane::Normal,
+            &mut fail_fsync_empty_obs,
+        )
+        .expect_err("injected fsync_dir failure after empty orphan unlink must fail");
+        assert_eq!(err_empty_fsync.stable_code_str(), "LBR-IO-001");
+        assert!(
+            !orphan_path.exists(),
+            "orphan was unlinked before fsync_dir failed"
+        );
+        assert!(
+            fail_fsync_empty_obs
+                .events
+                .contains(&SegmentOpEvent::OrphanUnlinkComplete {
+                    lane: QUEUE_LANE_NORMAL_DIR,
+                    seg_id: 1,
+                })
+        );
+        assert!(!fail_fsync_empty_obs.events.contains(
+            &SegmentOpEvent::FsyncLaneDirAfterOrphanUnlink {
+                lane: QUEUE_LANE_NORMAL_DIR,
+                seg_id: 1,
+            }
+        ));
+        let mut retry_empty_obs = SegmentObserver::new();
+        let retry_empty_rec = recover_lane_in_storage_dir(
+            repo.path(),
+            CaptureQueueLane::Normal,
+            &mut retry_empty_obs,
+        )
+        .expect("retry recover_lane after failed empty-orphan fsync_dir must succeed");
+        assert_eq!(retry_empty_rec.meta, app_out.meta);
+        assert!(
+            retry_empty_obs
+                .events
+                .contains(&SegmentOpEvent::FsyncLaneDirOnRecovery {
+                    lane: QUEUE_LANE_NORMAL_DIR,
+                }),
+            "AC2 retry violated: retry after failed post-unlink fsync_dir MUST flush lane_dir before returning Ok"
+        );
+
+        // (b) Half-frame orphan retry after failed post-unlink `fsync_dir(lane_dir)`
+        write_file_0600(&orphan_path, &half_orphan_2);
+        let mut fail_fsync_half_obs =
+            SegmentObserver::with_crash(SegmentCrashPoint::FailLaneDirFsyncAfterOrphanUnlink);
+        let err_half_fsync = recover_lane_in_storage_dir(
+            repo.path(),
+            CaptureQueueLane::Normal,
+            &mut fail_fsync_half_obs,
+        )
+        .expect_err("injected fsync_dir failure after half-frame orphan unlink must fail");
+        assert_eq!(err_half_fsync.stable_code_str(), "LBR-IO-001");
+        assert!(!orphan_path.exists());
+        assert_eq!(fs::read(&orphan2_bin).unwrap(), half_orphan_2);
+        let mut retry_half_obs = SegmentObserver::new();
+        let retry_half_rec =
+            recover_lane_in_storage_dir(repo.path(), CaptureQueueLane::Normal, &mut retry_half_obs)
+                .expect("retry recover_lane after failed half-frame-orphan fsync_dir must succeed");
+        assert_eq!(retry_half_rec.meta, app_out.meta);
+        assert!(
+            retry_half_obs
+                .events
+                .contains(&SegmentOpEvent::FsyncLaneDirOnRecovery {
+                    lane: QUEUE_LANE_NORMAL_DIR,
+                }),
+            "AC5 retry violated: retry after failed post-unlink fsync_dir MUST flush lane_dir before returning Ok"
+        );
+
+        // ------------------------------------------------------------------
+        // Part 6 — Prior guard: old segment prefix bitflip + orphan MUST still
+        // fail closed with `CorruptCommittedFrame` and ZERO disk mutation!
+        // ------------------------------------------------------------------
+        write_file_0600(&orphan_path, &half_orphan_2);
+        let mut flipped_s0 = fs::read(&s0_path).unwrap();
+        flipped_s0[0] ^= 0x01;
+        write_file_0600(&s0_path, &flipped_s0);
+        let before_corrupt = snapshot_tree(&init.paths.root);
+        let prior_err = recover_lane(repo.path(), CaptureQueueLane::Normal)
+            .expect_err("prefix bitflip on old seg0 must fail closed before touching orphan");
+        assert!(matches!(
+            prior_err,
+            StorageBackendError::CorruptCommittedFrame { .. }
+        ));
+        assert_eq!(prior_err.stable_code_str(), "LBR-IO-001");
+        assert_eq!(snapshot_tree(&init.paths.root), before_corrupt);
     }
 }

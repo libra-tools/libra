@@ -2939,7 +2939,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `done` / `remote-pending`
+**Lifecycle / Acceptance:** `done` / `remote-verified`
 
 **Description:** 100% 在独占目录 `src/storage/**` 内于 `segment.rs` 扩展 Case D 有效后继恢复路径，新增**有效后继段 `events-<S+1>` 含 ≥ 1 条完整合法帧后接未提交半帧尾 `[succ_valid_end, actual_len(S+1))`** 的生产分支：在真实调用路径中显式经 `RB-08t::quarantine_and_truncate_segment` 先完成 `publish_quarantine_durable`（`.tmp → sync_data → rename(.bin) → fsync_dir(quarantine_dir)`）再截断 `events-<S+1>` 至精确 `succ_valid_end` 并 `sync_data()`，随后封存旧段并提交双副本 `LTM2`；同卡验证调用方真实顺序插桩及重命名前/目录刷盘后两处断电崩溃边界。
 
@@ -3000,7 +3000,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `remote-pending`
 
 **Description:** 100% 在独占目录 `src/storage/**` 内于 `segment.rs` 实现 Case D 轮转孤儿后继段（`max_seg > active_seg`）中空孤儿段与半帧孤儿段的全部 6 项独立原子清理动作：空孤儿段 `unlink`、空孤儿段 `fsync_dir`、半帧孤儿残字节移入 `quarantine/`、半帧受损孤儿段 `unlink`、半帧受损孤儿段 `fsync_dir`，以及双副本元数据同步至完好 `active_seg`。
 
@@ -3014,19 +3014,19 @@
 | Case D 空孤儿段与半帧孤儿段的 `unlink`、目录 `fsync_dir`、残片隔离与双副本同步均为可独立失败的子动作，逐项独立验收确保 `G-03` 严格达标 | `ADR-RB-05` #3 Case D |
 
 **Acceptance criteria:**
-- [ ] **Case D 空孤儿段摘除：** 轮转创建空的孤儿后继段 `events-<S+1>` 后崩溃，恢复执行 `unlink` 删除该空孤儿段文件。
-- [ ] **Case D 空孤儿段目录刷盘：** 删除上述空孤儿段后，恢复立即执行 `fsync_dir(lane_dir)` 确保删除持久化。
-- [ ] **Case D 半帧孤儿断电持久隔离：** 轮转创建仅含未提交半帧的孤儿后继段 `events-<S+1>` 后崩溃，恢复经 `RB-08t` `quarantine_and_unlink_orphan` 先调用 `publish_quarantine_durable` 将残字节断电持久发布至 `quarantine/`。
-- [ ] **Case D 半帧孤儿段摘除：** 在上述 `publish_quarantine_durable` 完成 `fsync_dir(quarantine_dir)` 之后，恢复执行 `unlink` 删除受损孤儿段 `events-<S+1>`。
-- [ ] **Case D 半帧孤儿段目录刷盘：** 删除上述受损孤儿段后，恢复立即执行 `fsync_dir(lane_dir)` 确保删除持久化。
-- [ ] **Case D 半帧孤儿后双副本同步：** 摘除上述受损孤儿段并刷盘后，恢复将 `tail.meta` 与 `tail.meta.bak` 原子同步至完好的 `active_seg`。
-- [ ] **Case D 半帧孤儿调用方顺序插桩：** 在半帧孤儿真实恢复调用路径中，顺序插桩钩子断言 `publish_quarantine_durable` 的 `fsync_dir(quarantine_dir)` 完成序号严格小于 `unlink(events-<S+1>)` 的开始序号。
-- [ ] **Case D 半帧孤儿重命名前崩溃零提前删段：** 故障注入崩溃于半帧孤儿隔离 `rename` 之前，断言 `fs::read(events-<S+1>)` 成功读回并与崩溃前字节切片逐字节相等。
+- [x] **Case D 空孤儿段摘除：** 轮转创建空的孤儿后继段 `events-<S+1>` 后崩溃，恢复执行 `unlink` 删除该空孤儿段文件。
+- [x] **Case D 空孤儿段目录刷盘：** 删除上述空孤儿段后，恢复立即执行 `fsync_dir(lane_dir)` 确保删除持久化。
+- [x] **Case D 半帧孤儿断电持久隔离：** 轮转创建仅含未提交半帧的孤儿后继段 `events-<S+1>` 后崩溃，恢复经 `RB-08t` `quarantine_and_unlink_orphan` 先调用 `publish_quarantine_durable` 将残字节断电持久发布至 `quarantine/`。
+- [x] **Case D 半帧孤儿段摘除：** 在上述 `publish_quarantine_durable` 完成 `fsync_dir(quarantine_dir)` 之后，恢复执行 `unlink` 删除受损孤儿段 `events-<S+1>`。
+- [x] **Case D 半帧孤儿段目录刷盘：** 删除上述受损孤儿段后，恢复立即执行 `fsync_dir(lane_dir)` 确保删除持久化。
+- [x] **Case D 半帧孤儿后双副本同步：** 摘除上述受损孤儿段并刷盘后，恢复将 `tail.meta` 与 `tail.meta.bak` 原子同步至完好的 `active_seg`。
+- [x] **Case D 半帧孤儿调用方顺序插桩：** 在半帧孤儿真实恢复调用路径中，顺序插桩钩子断言 `publish_quarantine_durable` 的 `fsync_dir(quarantine_dir)` 完成序号严格小于 `unlink(events-<S+1>)` 的开始序号。
+- [x] **Case D 半帧孤儿重命名前崩溃零提前删段：** 故障注入崩溃于半帧孤儿隔离 `rename` 之前，断言 `fs::read(events-<S+1>)` 成功读回并与崩溃前字节切片逐字节相等。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --no-default-features --features storage-redb --lib -E 'test(=storage::queue::segment::tests::case_d_empty_and_half_frame_orphan_cleanup_quarantine)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb --lib -E 'test(=storage::queue::segment::tests::case_d_empty_and_half_frame_orphan_cleanup_quarantine)'`（new，覆盖 AC1–AC8）
-- [ ] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 3 文件实现白名单。
+- [x] `source .env.test && cargo nextest list --no-default-features --features storage-redb --lib -E 'test(=storage::queue::segment::tests::case_d_empty_and_half_frame_orphan_cleanup_quarantine)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --no-default-features --features storage-redb --lib -E 'test(=storage::queue::segment::tests::case_d_empty_and_half_frame_orphan_cleanup_quarantine)'`（new，覆盖 AC1–AC8）
+- [x] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 3 文件实现白名单。
 
 **Full-suite trigger:** `none`
 
@@ -10050,8 +10050,9 @@
 | `RB-08` | `done` / `remote-verified` | `2b681bd`（`main`） | `0.30.339` | 2026-11-23 05:35 UTC：Stage 1 精确 3 文件写集（`src/storage/mod.rs`、`src/storage/queue/{mod,segment}.rs`），实现 `segment.rs` 并发崩溃安全追加核心：`append_frame`/`append_encoded_frame`/`append_postcard_frame`/`recover_lane`/`read_converged_lane_tail_meta` 在锁外编校验单帧，锁内执行 100% 只读 Phase 1 分类（严格校验 `private/`/`capture-queue/`/`<lane>/` 精确 `0700` 权限、缺失 `append.lock` 先只读分类再独占建锁且失竞态绝不对竞态者宽松锁做 `fchmod`、流式校验 `[0, committed_len)` `prefix_crc32c`、按 `(active_seg, committed_len, min_live_seg)` 严格全序收敛双副本并拒同序不同校验和），Phase 2 清理本通道 `tail.meta*.tmp`、收敛副本与 Case C 同段前向扫描保留 100% 已 `sync_data` 完整帧，随后在 `append.lock` 内单次 `write_all` + `seg.sync_data()` 并依次经 `tail.meta.tmp -> sync_data -> rename -> fsync_dir` 与 `tail.meta.bak.tmp -> sync_data -> rename -> fsync_dir` 落盘双副本后方释锁返回；Windows 同步补齐 `CreateFileW(FILE_FLAG_OPEN_REPARSE_POINT)` 句柄固定（禁 `FILE_SHARE_DELETE` 防锁与活跃段/目录替换）；`--no-default-features --features storage-redb` `storage::queue::` 9/9（`multiprocess_32_producers_zero_interleave_and_dual_tail_meta` 32 真实子进程 × 100 变长帧 64B–64KiB = 3,200 帧 100% CRC32C 通过零交错 + 严格操作序插桩 + 全序收敛，`case_c_same_segment_crash_retains_synced_frames` 覆盖首帧崩溃、多帧已同步尾、备副本滞后、前缀翻转零改动、0755 目录/0644 锁/缺锁竞态整树快照）、三构型矩阵、fmt、严格 `--lib` clippy、`compat_version_surface_sync` 全绿；Codex R1/R2 全部 Unix P1/P2 已闭环并经 R3 确认（R3 仅余 macOS 本机无法编测的 Windows 祖先句柄固定与去 `FILE_SHARE_DELETE` 及 Windows 竞态测试要求，已落地两处 Windows 句柄加固并依用户授权跳过继续推进）；已推 `origin/main` |
 | `RB-08t` | `done` / `remote-verified` | `9081ebe`（`main`） | `0.30.340` | 2026-11-23 06:14 UTC：Stage 1 精确 3 文件写集（`src/storage/mod.rs`、`src/storage/queue/{mod,segment}.rs`），实现断电持久隔离取证发布强约束原语：`QUARANTINE_DIAGNOSTIC_CODE = "LBR-AGENT-050"`、`QuarantinePublishReport`、`quarantine_artifact_id`/`quarantine_artifact_id_from_crc`、`is_lane_quarantine_temp_name`、`publish_quarantine_durable`、`quarantine_and_truncate_segment`、`quarantine_and_unlink_orphan` 与 Phase 2 通道隔离清理 `quarantine/<lane>-*.tmp`；全部公开隔离操作串行于 `queue_root/append.lock`（Unix 以 `AppendLockGuard` 类型级约束 + `O_NOFOLLOW`/`0700` 目录句柄固定 + `0600` 临时文件 + 跨 `renameat` 持 `tmp_file` 校验前后 `(st_dev, st_ino)`；Windows 以目录句柄固定 + `append.lock` + `MoveFileExW(MOVEFILE_WRITE_THROUGH)` + `FlushFileBuffers`）；受损尾与孤儿段采用固定 64 KiB 栈缓冲双遍流式校验与拷贝（零无界堆分配），强保障 `tmp.sync_data() -> rename(.tmp -> .bin) -> fsync_dir(quarantine_dir)` 严格先于 `truncate`/`unlink`；`--no-default-features --features storage-redb` `storage::queue::` 10/10（`publish_quarantine_durable_syncs_renames_fsyncs_before_destructive_ops` 覆盖 AC1–AC5 顺序插桩 + 140 KiB 跨块流式截断/删孤儿 + 8 线程同 ID/异 ID/`recover_lane` 并发竞争 + 路径穿越/符号链接拒收，`publish_quarantine_durable_crash_before_rename_and_after_dir_fsync` 在同一仓双通道覆盖 AC6 同通道重开清理与跨通道 `.tmp` 保留、AC7 重命名前崩溃原段零改动、AC8 三 `.bin` 共存且重放前双通道重开保持原 inode 与精确字节 + 幂等重放 + 重开续写）、三构型矩阵、fmt、严格 `--lib` clippy、`compat_version_surface_sync` 全绿；Codex R1（3×P1 并发锁/流式有界内存/同通道重开）与 R2（AC8 重放前重开）全部闭环，R3 所提 AC8 三 `.bin` 共存先双通道重开再重放亦已完成并实测 2/2 绿灯，依用户授权跳过 R4 继续推进；已推 `origin/main` |
 | `RB-08d` | `done` / `remote-verified` | `4146c06`（`main`） | `0.30.341` | 2026-11-23 06:30 UTC：Stage 1 精确 3 文件写集内仅改动 `src/storage/queue/segment.rs`，实现基础 Case D（洁净旧段 `actual_len(S) == committed_len > 0` + 洁净有效后继段 `events-<S+1>.log`）：Phase 1 100% 只读先验校验旧段长度与 `[0, committed_len)` `prefix_crc32c`（任一失配立即 fail-closed 返回 `CorruptCommittedFrame` `LBR-IO-001` 绝不打开后继段且整盘零改动），再校验唯一连续后继 `S + 1` 并流式只读扫描合法帧、在 Phase 1 先判 `MAX_SEALED_SEGMENTS = 256` 满表破坏态与 0 字节旧段禁封存（均整盘零改动）；Phase 2 100% 保留后继段合法帧、原子封存 `(S, committed_len, prefix_crc32c)` 至 `LTM2.sealed[]` 并通过双副本原子替换协议同步推进 `tail.meta`/`tail.meta.bak` 至 `(ACTIVE_SEG = S + 1, COMMITTED_LEN = succ_len, PREFIX_CRC32C = succ_crc)`（Windows 同步复用固定可写后继句柄免重开 TOCTOU）；`--no-default-features --features storage-redb` `storage::queue::` 11/11（`case_d_old_seg_prefix_guard_and_valid_successor_recovery` 覆盖 AC1 短段/符号链接先验顺序、AC2 位翻转/符号链接先验顺序、AC3–AC7 单次与连续多代 `S=0→1→2` 封存推进 + Subcase B1 + 跨通道 `.tmp` 隔离 + 缺口/多后继/256 满表/0B 旧段整树零改动）、三构型矩阵、fmt、严格 `--lib` clippy、`compat_version_surface_sync` 全绿；Codex R1 首轮 `VERDICT: PASS`（P0=0、P1=0、P2=0）；已推 `origin/main` |
-| `RB-08u` | `done` / `remote-pending` | 本提交（`main`） | `0.30.342` | 2026-11-23 06:48 UTC：Stage 1 精确 3 文件写集内仅改动 `src/storage/queue/segment.rs`，扩展 Case D 有效后继恢复路径以承接含 ≥ 1 完整合法帧后接未提交半帧尾 `[succ_valid_end, actual_len(S+1))`：Phase 2 引入 `UnixPhase2Context`/`WindowsPhase2Context`（`append.lock` 持锁单重入零死锁），显式调用 `RB-08t::quarantine_and_truncate_segment_at_fds` / `quarantine_and_truncate_segment_windows_locked` 强制完成 `.tmp → sync_data → rename(.bin) → fsync_dir(quarantine_dir)` 持久取证屏障后再截断 `events-<S+1>.log` 至精确 `succ_valid_end` + `sync_data()`，随后封存旧段并提交双副本 `LTM2`（`LaneRecoveryReport.quarantined_artifacts` 记录 `LBR-AGENT-050` 取证回执）；`--no-default-features --features storage-redb` `storage::queue::` 13/13（`case_d_valid_successor_trailing_half_frame_durable_quarantine_ordering` 覆盖 `recover_lane` 与 `append_frame` 两条真实调用路径的 AC1–AC3 顺序插桩 `fsync_dir(quarantine_dir) < truncate(S+1) < tail.meta`/`write_all` + >64KiB 合法帧 + 半帧/坏头尾，`case_d_valid_successor_trailing_half_frame_crash_boundaries` 以真实 `encode_frame` 截断半帧覆盖 AC4 重命名前崩溃零提前截断、AC5 目录刷盘后截断前崩溃 `.bin` 持久留存与零重复、AC6–AC7 双副本磁盘落盘收敛及跨通道 `.tmp` 保留）、三构型矩阵、fmt、严格 `--lib` clippy、`compat_version_surface_sync` 全绿；Codex R1 零生产代码缺陷且 2 项测试建议已闭环，R2 获 `VERDICT: PASS`（P0=0、P1=0） |
-| `RB-08f`..`RB-34c`（剩余 115 卡） | `pending` | — | — | Phase 2 推进中，按实施顺序于 `main` 逐卡推进 |
+| `RB-08u` | `done` / `remote-verified` | `7250dc2`（`main`） | `0.30.342` | 2026-11-23 06:48 UTC：Stage 1 精确 3 文件写集内仅改动 `src/storage/queue/segment.rs`，扩展 Case D 有效后继恢复路径以承接含 ≥ 1 完整合法帧后接未提交半帧尾 `[succ_valid_end, actual_len(S+1))`：Phase 2 引入 `UnixPhase2Context`/`WindowsPhase2Context`（`append.lock` 持锁单重入零死锁），显式调用 `RB-08t::quarantine_and_truncate_segment_at_fds` / `quarantine_and_truncate_segment_windows_locked` 强制完成 `.tmp → sync_data → rename(.bin) → fsync_dir(quarantine_dir)` 持久取证屏障后再截断 `events-<S+1>.log` 至精确 `succ_valid_end` + `sync_data()`，随后封存旧段并提交双副本 `LTM2`（`LaneRecoveryReport.quarantined_artifacts` 记录 `LBR-AGENT-050` 取证回执）；`--no-default-features --features storage-redb` `storage::queue::` 13/13（`case_d_valid_successor_trailing_half_frame_durable_quarantine_ordering` 覆盖 `recover_lane` 与 `append_frame` 两条真实调用路径的 AC1–AC3 顺序插桩 `fsync_dir(quarantine_dir) < truncate(S+1) < tail.meta`/`write_all` + >64KiB 合法帧 + 半帧/坏头尾，`case_d_valid_successor_trailing_half_frame_crash_boundaries` 以真实 `encode_frame` 截断半帧覆盖 AC4 重命名前崩溃零提前截断、AC5 目录刷盘后截断前崩溃 `.bin` 持久留存与零重复、AC6–AC7 双副本磁盘落盘收敛及跨通道 `.tmp` 保留）、三构型矩阵、fmt、严格 `--lib` clippy、`compat_version_surface_sync` 全绿；Codex R1 零生产代码缺陷且 2 项测试建议已闭环，R2 获 `VERDICT: PASS`（P0=0、P1=0）；已推 `origin/main` |
+| `RB-08f` | `done` / `remote-pending` | 本提交（`main`） | `0.30.343` | 2026-11-23 07:08 UTC：Stage 1 精确 3 文件写集内仅改动 `src/storage/queue/segment.rs`，实现 Case D 空孤儿段与半帧孤儿段逐动作清理、隔离、目录刷盘与双副本同步：Phase 1 归类 `CaseDCleanOrphanSuccessor`（区分 0 字节空孤儿与非空半帧孤儿）；Phase 2 对空孤儿经 `unlink_empty_orphan_at_fd_unix`（校验 `st_size == 0` + inode 固定 `unlinkat` + `fsync_dir(lane_dir)`），对非空半帧孤儿经 `RB-08t::quarantine_and_unlink_orphan_at_fds` 强保 `fsync_dir(quarantine_dir) < unlink(S+1) < fsync_dir(lane_dir)`，随后无条件经双副本原子替换协议同步 `tail.meta`/`tail.meta.bak` 至完好 `active_seg`（不封存旧段）；`recover_lane` 补齐 `lane_dir_synced` 追踪确保 `unlink` 后 `fsync_dir(lane_dir)` 失败重试前必先刷盘持久；Windows 同步补齐 `SetFileInformationByHandle(FileDispositionInfo)` 按已验证 `GENERIC_READ\|DELETE`（禁 `FILE_SHARE_DELETE`）句柄原子删除消除路径重开替换窗口；`--no-default-features --features storage-redb` `storage::queue::segment::` 7/7 + `storage::queue::` 14/14（`case_d_empty_and_half_frame_orphan_cleanup_quarantine` 覆盖 AC1–AC8、`recover_lane` 与 `append_frame` 双真实调用路径顺序插桩、>64KiB 真实 `encode_frame` 半帧孤儿、重命名前崩溃零提前删段、`unlink` 后 `fsync_dir` 失败重试双场景与旧段先验位翻转零改动）、三构型矩阵、fmt、严格 `--lib` clippy、`compat_version_surface_sync` 全绿；Codex R1 两项 P1（删后目录刷盘失败重试耐久性 + Windows 句柄原子删除）全部闭环，R2 获 `VERDICT: PASS`（P0=0、P1=0） |
+| `RB-08b`..`RB-34c`（剩余 114 卡） | `pending` | — | — | Phase 2 推进中，按实施顺序于 `main` 逐卡推进 |
 
 ## Codex review log
 
