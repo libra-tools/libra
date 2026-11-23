@@ -77,10 +77,19 @@ pub const QUEUE_TAIL_META_BAK_TMP_FILE: &str = "tail.meta.bak.tmp";
 /// bytes are durably published into `quarantine/` (`ADR-RB-05` #3, `RB-08t`).
 pub const QUARANTINE_DIAGNOSTIC_CODE: &str = "LBR-AGENT-050";
 
-/// Hard combined byte cap across unconsumed `priority/` segments, unconsumed
-/// `normal/` segments, `quarantine/` artifacts, and the incoming encoded frame
-/// (`ADR-RB-05` #3, `RB-08b`: `256 MiB`).
+/// Hard combined byte cap across unconsumed `priority/`, unconsumed `normal/`,
+/// `quarantine/` artifacts, and the incoming encoded frame (`ADR-RB-05` #3,
+/// `RB-08b`: `256 MiB`).
 pub const CAPTURE_QUEUE_MAX_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Active segment rotation threshold (`ADR-RB-05` #3 Step ③, `RB-08g`: `16 MiB`).
+///
+/// Whenever a non-empty active segment `S` satisfies
+/// `committed_len + frame_buf.len() > CAPTURE_QUEUE_SEGMENT_ROTATION_BYTES`,
+/// the producer rotates to a fresh `events-<S+1:08>.log` via the internal
+/// lock-guarded `create_segment_file` primitive and atomically seals
+/// `(S, old_committed_len, old_prefix_crc32c)` into `LTM2.sealed[]`.
+pub const CAPTURE_QUEUE_SEGMENT_ROTATION_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Maximum lock wait duration enforced on shared `capture-queue/append.lock`
 /// (`ADR-RB-05` #3, `RB-08b`: `min(hook_deadline, 30s)`).
@@ -115,6 +124,92 @@ const fn opposite_lane(lane: CaptureQueueLane) -> CaptureQueueLane {
     match lane {
         CaptureQueueLane::Priority => CaptureQueueLane::Normal,
         CaptureQueueLane::Normal => CaptureQueueLane::Priority,
+    }
+}
+
+/// Returns `true` iff appending `frame_len` bytes to an active segment at
+/// `committed_len` requires rotating to `active_seg + 1` (`ADR-RB-05` #3 Step ③,
+/// `RB-08g`).
+///
+/// A 0-byte active segment (`committed_len == 0`) is never sealed/rotated.
+fn should_rotate_active_segment(
+    committed_len: u64,
+    frame_len: usize,
+    rotation_threshold_bytes: u64,
+) -> StorageResult<bool> {
+    if committed_len == 0 {
+        return Ok(false);
+    }
+    let frame_len_u64 =
+        u64::try_from(frame_len).map_err(|_| StorageBackendError::BackendInternal {
+            detail: "frame length exceeds u64".to_string(),
+        })?;
+    let projected = committed_len.checked_add(frame_len_u64).ok_or_else(|| {
+        StorageBackendError::BackendInternal {
+            detail: "capture queue segment committed_len overflow".to_string(),
+        }
+    })?;
+    Ok(projected > rotation_threshold_bytes)
+}
+
+/// Build the post-append `LTM2` metadata for either in-place append on
+/// `meta.active_seg` or 16 MiB normal rotation to `meta.active_seg + 1`
+/// (`ADR-RB-05` #3 Step ③–④, `RB-08g`).
+fn build_next_append_meta(
+    prev_meta: LaneTailMeta,
+    frame_buf: &[u8],
+    rotating: bool,
+) -> StorageResult<(u32, u64, LaneTailMeta)> {
+    let frame_len_u64 =
+        u64::try_from(frame_buf.len()).map_err(|_| StorageBackendError::BackendInternal {
+            detail: "frame length exceeds u64".to_string(),
+        })?;
+    if rotating {
+        if prev_meta.committed_len == 0 {
+            return Err(StorageBackendError::BackendInternal {
+                detail: "cannot seal a 0-byte capture queue segment during rotation".to_string(),
+            });
+        }
+        let next_seg = prev_meta.active_seg.checked_add(1).ok_or_else(|| {
+            StorageBackendError::BackendInternal {
+                detail: "capture queue active_seg u32 overflow during rotation".to_string(),
+            }
+        })?;
+        let mut next_sealed = prev_meta.sealed;
+        next_sealed.push(SealedSegmentMeta {
+            seg_id: prev_meta.active_seg,
+            sealed_len: prev_meta.committed_len,
+            sealed_crc32c: prev_meta.prefix_crc32c,
+        });
+        let next_meta = LaneTailMeta {
+            min_live_seg: prev_meta.min_live_seg,
+            active_seg: next_seg,
+            committed_len: frame_len_u64,
+            prefix_crc32c: crc32c_append(0, frame_buf),
+            sealed: next_sealed,
+        };
+        next_meta
+            .validate()
+            .map_err(Ltm2CodecError::into_storage_error)?;
+        Ok((next_seg, 0, next_meta))
+    } else {
+        let frame_offset = prev_meta.committed_len;
+        let next_committed_len = frame_offset.checked_add(frame_len_u64).ok_or_else(|| {
+            StorageBackendError::BackendInternal {
+                detail: "capture queue segment committed_len overflow".to_string(),
+            }
+        })?;
+        let next_meta = LaneTailMeta {
+            min_live_seg: prev_meta.min_live_seg,
+            active_seg: prev_meta.active_seg,
+            committed_len: next_committed_len,
+            prefix_crc32c: crc32c_append(prev_meta.prefix_crc32c, frame_buf),
+            sealed: prev_meta.sealed,
+        };
+        next_meta
+            .validate()
+            .map_err(Ltm2CodecError::into_storage_error)?;
+        Ok((prev_meta.active_seg, frame_offset, next_meta))
     }
 }
 
@@ -2159,7 +2254,7 @@ mod unix_seg {
     /// caller run read-only Phase 1 classification before deciding whether to
     /// create `append.lock` so fail-closed classifications leave disk 100%
     /// unchanged.
-    fn try_acquire_existing_strict_append_lock_unix(
+    pub(super) fn try_acquire_existing_strict_append_lock_unix(
         root_fd: &OwnedFd,
         expected_uid: u32,
         deadline: Instant,
@@ -3378,42 +3473,102 @@ mod unix_seg {
         }
     }
 
-    fn open_or_create_active_segment_unix(
+    /// Shared locked Unix segment-file creation primitive (`ADR-RB-05` #3 Step ③,
+    /// `RB-08g`): exclusively creates `events-<next_seg:08>.log` (`O_CREAT |
+    /// O_EXCL | O_NOFOLLOW`), enforces exact `0600` permissions via `fchmod`,
+    /// verifies `S_IFREG`/UID/`0600`/`st_size == 0`, and immediately calls
+    /// `fsync_fd(lane_fd)`.
+    pub(super) fn create_segment_file_at_fd_unix(
         lane_fd: &OwnedFd,
         lane_label: &'static str,
-        seg_id: u32,
-        create_new: bool,
-        expected_len: u64,
+        next_seg: u32,
         expected_uid: u32,
+        _append_lock: &AppendLockGuard,
         observer: &mut SegmentObserver,
     ) -> StorageResult<File> {
-        let seg_name = segment_log_file_name(seg_id);
-        let cname = osstr_to_cstring(OsStr::new(&seg_name), "open active capture queue segment")?;
-
-        let raw_fd = if create_new {
-            let flags =
-                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-            // SAFETY: `lane_fd` is valid and `cname` is NUL-terminated.
-            unsafe {
-                libc::openat(
-                    lane_fd.as_raw_fd(),
-                    cname.as_ptr(),
-                    flags,
-                    QUEUE_FILE_MODE as libc::c_uint,
-                )
-            }
-        } else {
-            let flags = libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
-            // SAFETY: `lane_fd` is valid and `cname` is NUL-terminated.
-            unsafe { libc::openat(lane_fd.as_raw_fd(), cname.as_ptr(), flags) }
+        let seg_name = segment_log_file_name(next_seg);
+        let cname = osstr_to_cstring(OsStr::new(&seg_name), "create capture queue segment")?;
+        let flags =
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        // SAFETY: `lane_fd` is valid and `cname` is NUL-terminated.
+        let raw_fd = unsafe {
+            libc::openat(
+                lane_fd.as_raw_fd(),
+                cname.as_ptr(),
+                flags,
+                QUEUE_FILE_MODE as libc::c_uint,
+            )
         };
         if raw_fd < 0 {
             let err = io::Error::last_os_error();
             if is_symlink_errno_at(&err, lane_fd, &cname) {
                 return Err(map_queue_symlink_err("capture queue segment file"));
             }
+            return Err(StorageBackendError::io("create capture queue segment", err));
+        }
+        // SAFETY: `raw_fd >= 0` is exclusively owned here.
+        let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+        let mut unlink_guard = TempUnlinkGuard::new(lane_fd, cname);
+
+        let st = fstat_fd(&fd, "stat newly created capture queue segment")?;
+        if (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
+            return Err(StorageBackendError::CorruptCommittedFrame {
+                detail: "newly created capture queue segment is not a regular file".to_string(),
+            });
+        }
+        if st.st_uid != expected_uid {
+            return Err(map_queue_owner_mismatch_err("capture queue segment file"));
+        }
+        fchmod_fd(
+            &fd,
+            QUEUE_FILE_MODE,
+            "enforce 0600 mode on newly created capture queue segment",
+        )?;
+        let verified = fstat_fd(&fd, "verify newly created capture queue segment mode")?;
+        if unix_perm_bits(verified.st_mode) != QUEUE_FILE_MODE {
+            return Err(StorageBackendError::BackendInternal {
+                detail: "capture queue segment permissions failed to settle at 0600".to_string(),
+            });
+        }
+        let actual_len = u64::try_from(verified.st_size).map_err(|_| {
+            StorageBackendError::CorruptCommittedFrame {
+                detail: "newly created capture queue segment has negative size".to_string(),
+            }
+        })?;
+        if actual_len != 0 {
+            return Err(StorageBackendError::CorruptCommittedFrame {
+                detail: "newly created capture queue segment is non-empty".to_string(),
+            });
+        }
+
+        unlink_guard.disarm();
+        observer.record_create_segment(lane_label, next_seg);
+        fsync_fd(
+            lane_fd,
+            "fsync capture queue lane directory after creating segment",
+        )?;
+        observer.record_fsync_lane_after_create_segment(lane_label, next_seg);
+        Ok(File::from(fd))
+    }
+
+    fn open_existing_active_segment_unix(
+        lane_fd: &OwnedFd,
+        seg_id: u32,
+        expected_len: u64,
+        expected_uid: u32,
+    ) -> StorageResult<File> {
+        let seg_name = segment_log_file_name(seg_id);
+        let cname = osstr_to_cstring(OsStr::new(&seg_name), "open active capture queue segment")?;
+        let flags = libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
+        // SAFETY: `lane_fd` is valid and `cname` is NUL-terminated.
+        let raw_fd = unsafe { libc::openat(lane_fd.as_raw_fd(), cname.as_ptr(), flags) };
+        if raw_fd < 0 {
+            let err = io::Error::last_os_error();
+            if is_symlink_errno_at(&err, lane_fd, &cname) {
+                return Err(map_queue_symlink_err("capture queue segment file"));
+            }
             return Err(StorageBackendError::io(
-                "open or create active capture queue segment",
+                "open active capture queue segment",
                 err,
             ));
         }
@@ -3428,7 +3583,7 @@ mod unix_seg {
         if st.st_uid != expected_uid {
             return Err(map_queue_owner_mismatch_err("capture queue segment file"));
         }
-        if create_new || unix_perm_bits(st.st_mode) != QUEUE_FILE_MODE {
+        if unix_perm_bits(st.st_mode) != QUEUE_FILE_MODE {
             fchmod_fd(
                 &fd,
                 QUEUE_FILE_MODE,
@@ -3452,14 +3607,6 @@ mod unix_seg {
                     "active capture queue segment length diverged from committed_len before append"
                         .to_string(),
             });
-        }
-        if create_new {
-            observer.record_create_segment(lane_label, seg_id);
-            fsync_fd(
-                lane_fd,
-                "fsync capture queue lane directory after creating segment",
-            )?;
-            observer.record_fsync_lane_after_create_segment(lane_label, seg_id);
         }
         Ok(File::from(fd))
     }
@@ -4573,17 +4720,35 @@ mod unix_seg {
         observer.record_capacity_checked(occupancy, frame_buf.len(), max_total_bytes);
         let _ = enforce_queue_capacity_limit(occupancy, frame_buf.len(), max_total_bytes)?;
 
-        let seg_id = converged.meta.active_seg;
-        let frame_offset = converged.meta.committed_len;
-        let mut seg_file = open_or_create_active_segment_unix(
-            &lane_fd,
-            lane_label,
-            seg_id,
-            !converged.active_seg_exists,
-            frame_offset,
-            lane_uid,
-            observer,
+        // Step ③ (`ADR-RB-05` #3, `RB-08g`): normal 16 MiB rotation via shared
+        // `create_segment_file` (`0600` + `fsync_dir(lane_dir)`), sealing old
+        // segment `(S, old_committed_len, old_prefix_crc32c)` into `LTM2.sealed[]`
+        // and resetting `PREFIX_CRC32C` from `0` for `S + 1`.
+        let rotating = should_rotate_active_segment(
+            converged.meta.committed_len,
+            frame_buf.len(),
+            CAPTURE_QUEUE_SEGMENT_ROTATION_BYTES,
         )?;
+        let (seg_id, frame_offset, next_meta) =
+            build_next_append_meta(converged.meta, frame_buf, rotating)?;
+        let mut seg_file = if rotating || !converged.active_seg_exists {
+            if frame_offset != 0 {
+                return Err(StorageBackendError::CorruptCommittedFrame {
+                    detail: "cannot create active capture queue segment with non-zero offset"
+                        .to_string(),
+                });
+            }
+            create_segment_file_at_fd_unix(
+                &lane_fd,
+                lane_label,
+                seg_id,
+                lane_uid,
+                &append_lock,
+                observer,
+            )?
+        } else {
+            open_existing_active_segment_unix(&lane_fd, seg_id, frame_offset, lane_uid)?
+        };
 
         seg_file
             .seek(SeekFrom::Start(frame_offset))
@@ -4601,24 +4766,6 @@ mod unix_seg {
         drop(seg_file);
 
         observer.maybe_crash(SegmentCrashPoint::AfterSegmentSyncData)?;
-
-        let frame_len_u64 =
-            u64::try_from(frame_buf.len()).map_err(|_| StorageBackendError::BackendInternal {
-                detail: "frame length exceeds u64".to_string(),
-            })?;
-        let next_committed_len = frame_offset.checked_add(frame_len_u64).ok_or_else(|| {
-            StorageBackendError::BackendInternal {
-                detail: "capture queue segment committed_len overflow".to_string(),
-            }
-        })?;
-        let next_prefix_crc = crc32c_append(converged.meta.prefix_crc32c, frame_buf);
-        let next_meta = LaneTailMeta {
-            min_live_seg: converged.meta.min_live_seg,
-            active_seg: seg_id,
-            committed_len: next_committed_len,
-            prefix_crc32c: next_prefix_crc,
-            sealed: converged.meta.sealed,
-        };
 
         // AC3 + AC4: Commit `tail.meta` and `tail.meta.bak` sequentially with
         // `sync_data -> rename -> fsync_dir(lane_dir)` BEFORE releasing `append.lock`.
@@ -6481,6 +6628,33 @@ mod non_unix_seg {
             CaptureQueueOccupancy::from_parts(priority_bytes, normal_bytes, quarantine_bytes)
         }
 
+        fn create_segment_file_windows_locked(
+            lane_dir: &Path,
+            lane_label: &'static str,
+            next_seg: u32,
+            _append_lock: &File,
+            observer: &mut SegmentObserver,
+        ) -> StorageResult<File> {
+            let seg_path = lane_dir.join(segment_log_file_name(next_seg));
+            let (file, size, _) = open_windows_file_nofollow(
+                &seg_path,
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                CREATE_NEW,
+                "capture queue segment file",
+                "create capture queue segment",
+            )?;
+            if size != 0 {
+                return Err(StorageBackendError::CorruptCommittedFrame {
+                    detail: "newly created capture queue segment is non-empty".to_string(),
+                });
+            }
+            observer.record_create_segment(lane_label, next_seg);
+            flush_windows_dir(lane_dir)?;
+            observer.record_fsync_lane_after_create_segment(lane_label, next_seg);
+            Ok(file)
+        }
+
         pub(super) fn append_in_storage_dir_windows(
             storage_dir: &Path,
             lane: CaptureQueueLane,
@@ -6550,28 +6724,26 @@ mod non_unix_seg {
             observer.record_capacity_checked(occupancy, frame_buf.len(), max_total_bytes);
             let _ = enforce_queue_capacity_limit(occupancy, frame_buf.len(), max_total_bytes)?;
 
-            let seg_id = meta.active_seg;
-            let frame_offset = meta.committed_len;
-            let mut seg_file = if !active_seg_exists {
-                let seg_path = lane_dir.join(segment_log_file_name(seg_id));
-                let (file, size, _) = open_windows_file_nofollow(
-                    &seg_path,
-                    GENERIC_READ | GENERIC_WRITE,
-                    FILE_SHARE_READ | FILE_SHARE_WRITE,
-                    CREATE_NEW,
-                    "capture queue segment file",
-                    "create active capture queue segment",
-                )?;
-                if size != 0 {
-                    return Err(StorageBackendError::CorruptCommittedFrame {
-                        detail: "newly created active capture queue segment is non-empty"
-                            .to_string(),
-                    });
-                }
-                observer.record_create_segment(lane_label, seg_id);
-                flush_windows_dir(&lane_dir)?;
-                observer.record_fsync_lane_after_create_segment(lane_label, seg_id);
-                file
+            // Step ③ (`ADR-RB-05` #3, `RB-08g`): normal 16 MiB rotation via
+            // shared `create_segment_file` (`CREATE_NEW` + `flush_windows_dir`),
+            // sealing old segment `(S, old_committed_len, old_prefix_crc32c)` into
+            // `LTM2.sealed[]` and resetting `PREFIX_CRC32C` from `0` for `S + 1`.
+            let rotating = should_rotate_active_segment(
+                meta.committed_len,
+                frame_buf.len(),
+                CAPTURE_QUEUE_SEGMENT_ROTATION_BYTES,
+            )?;
+            let (seg_id, frame_offset, next_meta) =
+                build_next_append_meta(meta, frame_buf, rotating)?;
+            let mut seg_file = if rotating || !active_seg_exists {
+                drop(pinned_seg);
+                create_segment_file_windows_locked(
+                    &lane_dir,
+                    lane_label,
+                    seg_id,
+                    &append_lock,
+                    observer,
+                )?
             } else {
                 // Reuse the exact pinned handle validated in Phase 1 (zero reopen TOCTOU)
                 // and re-verify handle identity and length before writing.
@@ -6609,24 +6781,6 @@ mod non_unix_seg {
 
             observer.maybe_crash(SegmentCrashPoint::AfterSegmentSyncData)?;
 
-            let frame_len_u64 = u64::try_from(frame_buf.len()).map_err(|_| {
-                StorageBackendError::BackendInternal {
-                    detail: "frame length exceeds u64".to_string(),
-                }
-            })?;
-            let next_committed_len = frame_offset.checked_add(frame_len_u64).ok_or_else(|| {
-                StorageBackendError::BackendInternal {
-                    detail: "capture queue segment committed_len overflow".to_string(),
-                }
-            })?;
-            let next_prefix_crc = crc32c_append(meta.prefix_crc32c, frame_buf);
-            let next_meta = LaneTailMeta {
-                min_live_seg: meta.min_live_seg,
-                active_seg: seg_id,
-                committed_len: next_committed_len,
-                prefix_crc32c: next_prefix_crc,
-                sealed: meta.sealed,
-            };
             commit_dual_tail_meta_windows(&lane_dir, lane_label, &next_meta, observer)?;
 
             drop(append_lock);
@@ -11444,5 +11598,443 @@ mod tests {
             "AC4 violated: Case A PREFIX_CRC32C + cross-lane occupancy median {:?} exceeded 5ms",
             check_median
         );
+    }
+
+    fn decode_all_segment_bytes(seg_bytes: &[u8]) -> Vec<DecodedFrame> {
+        let mut decoder = FrameStreamDecoder::new(seg_bytes, seg_bytes.len() as u64);
+        let mut out = Vec::new();
+        loop {
+            match decoder.next_frame().expect("decode segment frame") {
+                FrameStreamItem::Frame { frame, .. } => out.push(frame),
+                FrameStreamItem::CleanEof { .. } => break,
+            }
+        }
+        out
+    }
+
+    fn make_exact_len_frame(
+        flags: u8,
+        dedup_key: &str,
+        total_len: usize,
+        fill_byte: u8,
+    ) -> (Vec<u8>, Vec<u8>) {
+        let overhead = FRAME_HEADER_LEN + FRAME_BODY_FIXED_OVERHEAD + dedup_key.len();
+        assert!(
+            total_len >= overhead,
+            "requested total_len {total_len} < frame overhead {overhead}"
+        );
+        let payload = vec![fill_byte; total_len - overhead];
+        let encoded = encode_frame(flags, dedup_key, &payload).expect("encode exact-len frame");
+        assert_eq!(encoded.len(), total_len);
+        (payload, encoded)
+    }
+
+    /// `RB-08g` AC1–AC8:
+    /// - AC1: Crossing `CAPTURE_QUEUE_SEGMENT_ROTATION_BYTES` (`16 MiB`) calls
+    ///   shared `create_segment_file` to create `events-<S+1:08>.log` on disk.
+    /// - AC2: Newly created `events-<S+1:08>.log` has exact `0600` Unix mode.
+    /// - AC3: `create_segment_file` immediately executes `fsync_dir(lane_dir)`.
+    /// - AC4: Dual-replica `LTM2` commit atomically records
+    ///   `(S, old_committed_len, old_prefix_crc32c)` into `LTM2.sealed[]`.
+    /// - AC5: Same dual-replica `LTM2` commit advances `ACTIVE_SEG` to `S + 1`.
+    /// - AC6: New segment `PREFIX_CRC32C` resets from `0` for `S + 1` first
+    ///   frame and matches `events-<S+1>[0..committed_len]`.
+    /// - AC7: All old frames in sealed segment `S` decode 100% losslessly.
+    /// - AC8: All new frames in rotated segment `S + 1` decode 100% losslessly.
+    /// Also verifies exact `== 16 MiB` stays in `S`, `< 16 MiB` crossing `16 MiB`
+    /// seals at exact `< 16 MiB` boundary, standalone `create_segment_file`
+    /// invariants, and post-rotation `AfterSegmentSyncData` crash recovery.
+    #[test]
+    fn rotation_16mib_creates_0600_fsync_and_records_ltm2_sealed() {
+        assert_eq!(CAPTURE_QUEUE_SEGMENT_ROTATION_BYTES, 16 * 1024 * 1024);
+
+        // ------------------------------------------------------------------
+        // Part 1 — Exact 16 MiB boundary (== 16 MiB stays in seg 0; next frame
+        // rotates to seg 1 with full AC1–AC8 assertions)
+        // ------------------------------------------------------------------
+        let repo = tempdir().expect("rotation tempdir");
+        let init = init_capture_queue(repo.path()).expect("init capture queue");
+
+        // 4 × (4 MiB - 1024) = 16 MiB - 4096 bytes, then 1 × 4096 bytes = exact 16 MiB.
+        const CHUNK_FRAME_LEN: usize = 4 * 1024 * 1024 - 1024;
+        let mut expected_seg0_keys = Vec::new();
+        let mut expected_seg0_payload_lens = Vec::new();
+        let mut expected_seg0_fill = Vec::new();
+        let mut last_seg0_out = None;
+
+        for idx in 0..4usize {
+            let key = format!("rb08g-s0-big-{idx:02}");
+            let fill = b'A' + (idx as u8);
+            let (payload, encoded) =
+                make_exact_len_frame(FRAME_FLAG_NONE, &key, CHUNK_FRAME_LEN, fill);
+            let out = append_encoded_frame(repo.path(), CaptureQueueLane::Normal, &encoded)
+                .expect("append large seg0 frame");
+            assert_eq!(out.seg_id, 0);
+            assert!(out.meta.sealed.is_empty());
+            expected_seg0_keys.push(key);
+            expected_seg0_payload_lens.push(payload.len());
+            expected_seg0_fill.push(fill);
+            last_seg0_out = Some(out);
+        }
+
+        // Frame 4 lands at EXACT `16 MiB` (`16_777_216`) -> MUST NOT rotate.
+        let exact_key = "rb08g-s0-exact-16mib".to_string();
+        let (exact_payload, exact_encoded) =
+            make_exact_len_frame(FRAME_FLAG_NONE, &exact_key, 4096, b'E');
+        let exact_out = append_encoded_frame(repo.path(), CaptureQueueLane::Normal, &exact_encoded)
+            .expect("exact 16 MiB frame must remain in seg 0");
+        assert_eq!(exact_out.seg_id, 0);
+        assert_eq!(
+            exact_out.meta.committed_len,
+            CAPTURE_QUEUE_SEGMENT_ROTATION_BYTES
+        );
+        assert!(exact_out.meta.sealed.is_empty());
+        assert!(
+            !init.paths.normal.join(segment_log_file_name(1)).exists(),
+            "exact == 16 MiB must NOT create seg 1 prematurely"
+        );
+        expected_seg0_keys.push(exact_key);
+        expected_seg0_payload_lens.push(exact_payload.len());
+        expected_seg0_fill.push(b'E');
+        let _ = last_seg0_out;
+        let old_seg0_len = exact_out.meta.committed_len;
+        let old_seg0_crc = exact_out.meta.prefix_crc32c;
+
+        // Frame 5 crosses 16 MiB -> triggers shared `create_segment_file` rotation!
+        let rot_key_1 = "rb08g-s1-first".to_string();
+        let (rot_payload_1, rot_encoded_1) =
+            make_exact_len_frame(FRAME_FLAG_NONE, &rot_key_1, 512, b'R');
+        let mut rot_obs = SegmentObserver::new();
+        let rot_out = append_validated_frame_in_storage_dir(
+            repo.path(),
+            CaptureQueueLane::Normal,
+            &rot_encoded_1,
+            &mut rot_obs,
+        )
+        .expect("frame crossing 16 MiB must rotate to seg 1");
+
+        // AC1: `events-00000001.log` exists on disk.
+        let seg0_path = init.paths.normal.join(segment_log_file_name(0));
+        let seg1_path = init.paths.normal.join(segment_log_file_name(1));
+        assert!(seg1_path.exists(), "AC1 violated: seg 1 must exist on disk");
+
+        // AC2: exact `0600` permissions on Unix.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = fs::symlink_metadata(&seg1_path)
+                .expect("stat seg 1")
+                .permissions()
+                .mode()
+                & 0o7777;
+            assert_eq!(mode, 0o600, "AC2 violated: seg 1 mode must be exact 0600");
+        }
+
+        // AC3: exact ordering proves `CreateSegment(1) -> FsyncLaneDirAfterCreateSegment(1)`
+        // strictly precedes `SegmentWriteAll(1)` and dual `LTM2` commits.
+        assert_eq!(
+            rot_obs.events,
+            vec![
+                SegmentOpEvent::AcquireAppendLock,
+                SegmentOpEvent::CapacityChecked {
+                    priority_bytes: 0,
+                    normal_bytes: old_seg0_len,
+                    quarantine_bytes: 0,
+                    incoming_bytes: rot_encoded_1.len(),
+                    max_total_bytes: CAPTURE_QUEUE_MAX_TOTAL_BYTES,
+                },
+                SegmentOpEvent::CreateSegment {
+                    lane: QUEUE_LANE_NORMAL_DIR,
+                    seg_id: 1,
+                },
+                SegmentOpEvent::FsyncLaneDirAfterCreateSegment {
+                    lane: QUEUE_LANE_NORMAL_DIR,
+                    seg_id: 1,
+                },
+                SegmentOpEvent::SegmentWriteAll {
+                    lane: QUEUE_LANE_NORMAL_DIR,
+                    seg_id: 1,
+                    offset: 0,
+                    len: rot_encoded_1.len(),
+                },
+                SegmentOpEvent::SegmentSyncData {
+                    lane: QUEUE_LANE_NORMAL_DIR,
+                    seg_id: 1,
+                },
+                SegmentOpEvent::MetaTmpWriteAndSync {
+                    lane: QUEUE_LANE_NORMAL_DIR,
+                    tmp_name: QUEUE_TAIL_META_TMP_FILE,
+                    target_name: QUEUE_TAIL_META_FILE,
+                },
+                SegmentOpEvent::MetaRename {
+                    lane: QUEUE_LANE_NORMAL_DIR,
+                    tmp_name: QUEUE_TAIL_META_TMP_FILE,
+                    target_name: QUEUE_TAIL_META_FILE,
+                },
+                SegmentOpEvent::FsyncLaneDirAfterMeta {
+                    lane: QUEUE_LANE_NORMAL_DIR,
+                    target_name: QUEUE_TAIL_META_FILE,
+                },
+                SegmentOpEvent::MetaTmpWriteAndSync {
+                    lane: QUEUE_LANE_NORMAL_DIR,
+                    tmp_name: QUEUE_TAIL_META_BAK_TMP_FILE,
+                    target_name: QUEUE_TAIL_META_BAK_FILE,
+                },
+                SegmentOpEvent::MetaRename {
+                    lane: QUEUE_LANE_NORMAL_DIR,
+                    tmp_name: QUEUE_TAIL_META_BAK_TMP_FILE,
+                    target_name: QUEUE_TAIL_META_BAK_FILE,
+                },
+                SegmentOpEvent::FsyncLaneDirAfterMeta {
+                    lane: QUEUE_LANE_NORMAL_DIR,
+                    target_name: QUEUE_TAIL_META_BAK_FILE,
+                },
+                SegmentOpEvent::ReleaseAppendLock,
+            ],
+            "AC3 violated: create_segment_file must fsync_dir(lane_dir) immediately before write/meta commit"
+        );
+
+        // AC4, AC5, AC6: verify both on-disk `tail.meta` and `tail.meta.bak`.
+        let raw_meta = fs::read(tail_meta_path(&init.paths.normal)).expect("read tail.meta");
+        let raw_bak = fs::read(tail_meta_bak_path(&init.paths.normal)).expect("read tail.meta.bak");
+        assert_eq!(raw_meta, raw_bak);
+        let decoded_meta = LaneTailMeta::decode(&raw_meta).expect("decode rotated LTM2");
+        assert_eq!(decoded_meta, rot_out.meta);
+        assert_eq!(
+            decoded_meta.sealed,
+            vec![SealedSegmentMeta {
+                seg_id: 0,
+                sealed_len: old_seg0_len,
+                sealed_crc32c: old_seg0_crc,
+            }],
+            "AC4 violated: old seg 0 must be sealed in LTM2.sealed[]"
+        );
+        assert_eq!(
+            decoded_meta.active_seg, 1,
+            "AC5 violated: ACTIVE_SEG must advance to 1"
+        );
+        assert_eq!(rot_out.seg_id, 1);
+        assert_eq!(rot_out.frame_offset, 0);
+        assert_eq!(decoded_meta.committed_len, rot_encoded_1.len() as u64);
+        assert_eq!(
+            decoded_meta.prefix_crc32c,
+            crc32c_checksum(&rot_encoded_1),
+            "AC6 violated: new segment PREFIX_CRC32C must reset from 0"
+        );
+        assert_ne!(
+            decoded_meta.prefix_crc32c,
+            crc32c_append(old_seg0_crc, &rot_encoded_1),
+            "AC6 sanity: new segment CRC must not chain from old segment"
+        );
+        let seg1_disk_after_first = fs::read(&seg1_path).expect("read seg 1 after first frame");
+        assert_eq!(
+            crc32c_checksum(&seg1_disk_after_first),
+            decoded_meta.prefix_crc32c
+        );
+
+        // Append a second frame to rotated segment 1 (verifying subsequent Case A append).
+        let rot_key_2 = "rb08g-s1-second".to_string();
+        let (rot_payload_2, rot_encoded_2) =
+            make_exact_len_frame(FRAME_FLAG_NONE, &rot_key_2, 768, b'S');
+        let rot_out_2 = append_encoded_frame(repo.path(), CaptureQueueLane::Normal, &rot_encoded_2)
+            .expect("second frame on rotated seg 1 must succeed");
+        assert_eq!(rot_out_2.seg_id, 1);
+        assert_eq!(rot_out_2.frame_offset, rot_encoded_1.len() as u64);
+        assert_eq!(rot_out_2.meta.sealed, decoded_meta.sealed);
+        let seg1_bytes = fs::read(&seg1_path).expect("read seg 1 bytes");
+        assert_eq!(seg1_bytes.len() as u64, rot_out_2.meta.committed_len);
+        assert_eq!(crc32c_checksum(&seg1_bytes), rot_out_2.meta.prefix_crc32c);
+
+        // AC7: 100% lossless decode of ALL 5 frames in sealed segment 0.
+        let seg0_bytes = fs::read(&seg0_path).expect("read seg 0 bytes");
+        assert_eq!(seg0_bytes.len() as u64, old_seg0_len);
+        assert_eq!(crc32c_checksum(&seg0_bytes), old_seg0_crc);
+        let decoded_seg0 = decode_all_segment_bytes(&seg0_bytes);
+        assert_eq!(decoded_seg0.len(), expected_seg0_keys.len());
+        for (idx, frame) in decoded_seg0.iter().enumerate() {
+            assert_eq!(frame.flags, FRAME_FLAG_NONE);
+            assert_eq!(frame.dedup_key, expected_seg0_keys[idx]);
+            assert_eq!(frame.payload.len(), expected_seg0_payload_lens[idx]);
+            assert!(frame.payload.iter().all(|&b| b == expected_seg0_fill[idx]));
+        }
+
+        // AC8: 100% lossless decode of ALL 2 frames in rotated segment 1.
+        let decoded_seg1 = decode_all_segment_bytes(&seg1_bytes);
+        assert_eq!(decoded_seg1.len(), 2);
+        assert_eq!(decoded_seg1[0].dedup_key, rot_key_1);
+        assert_eq!(decoded_seg1[0].payload, rot_payload_1);
+        assert_eq!(decoded_seg1[1].dedup_key, rot_key_2);
+        assert_eq!(decoded_seg1[1].payload, rot_payload_2);
+
+        // ------------------------------------------------------------------
+        // Part 2 — `< 16 MiB` crossing `16 MiB` seals at exact `< 16 MiB` len,
+        // plus crash after rotated `seg.sync_data()` recovers cleanly via Case D
+        // ------------------------------------------------------------------
+        let repo2 = tempdir().expect("rotation under-16mib tempdir");
+        let init2 = init_capture_queue(repo2.path()).expect("init capture queue 2");
+        let mut s0_meta = None;
+        for idx in 0..4usize {
+            let key = format!("rb08g-p2-s0-{idx:02}");
+            let (_, encoded) =
+                make_exact_len_frame(FRAME_FLAG_PRIORITY, &key, CHUNK_FRAME_LEN, b'P');
+            s0_meta = Some(
+                append_encoded_frame(repo2.path(), CaptureQueueLane::Priority, &encoded)
+                    .expect("append p2 seg0 frame")
+                    .meta,
+            );
+        }
+        let s0_meta = s0_meta.expect("s0_meta populated");
+        assert_eq!(
+            s0_meta.committed_len,
+            CAPTURE_QUEUE_SEGMENT_ROTATION_BYTES - 4096
+        );
+
+        // Frame of 4097 bytes -> `(16 MiB - 4096) + 4097 == 16 MiB + 1 > 16 MiB` -> rotates!
+        // Inject crash right after `seg.sync_data()` on new seg 1 before `tail.meta` commit.
+        let (_, cross_frame) =
+            make_exact_len_frame(FRAME_FLAG_PRIORITY, "rb08g-p2-cross", 4097, b'C');
+        let mut crash_obs = SegmentObserver::with_crash(SegmentCrashPoint::AfterSegmentSyncData);
+        let crash_err = append_validated_frame_in_storage_dir(
+            repo2.path(),
+            CaptureQueueLane::Priority,
+            &cross_frame,
+            &mut crash_obs,
+        )
+        .expect_err("injected crash after rotated seg1 sync_data must fail");
+        assert_eq!(crash_err.stable_code_str(), "LBR-IO-001");
+        assert!(init2.paths.priority.join(segment_log_file_name(1)).exists());
+
+        // Recovery (Case D valid successor) MUST seal seg 0 at `16 MiB - 4096`
+        // and advance `LTM2` to seg 1 with `cross_frame` 100% preserved.
+        let rec = recover_lane(repo2.path(), CaptureQueueLane::Priority)
+            .expect("recover_lane after rotated seg1 crash must succeed");
+        assert_eq!(rec.meta.active_seg, 1);
+        assert_eq!(rec.meta.committed_len, cross_frame.len() as u64);
+        assert_eq!(rec.meta.prefix_crc32c, crc32c_checksum(&cross_frame));
+        assert_eq!(
+            rec.meta.sealed,
+            vec![SealedSegmentMeta {
+                seg_id: 0,
+                sealed_len: CAPTURE_QUEUE_SEGMENT_ROTATION_BYTES - 4096,
+                sealed_crc32c: s0_meta.prefix_crc32c,
+            }]
+        );
+        let rec_seg1_frames = decode_all_segment_bytes(
+            &fs::read(init2.paths.priority.join(segment_log_file_name(1))).unwrap(),
+        );
+        assert_eq!(rec_seg1_frames.len(), 1);
+        assert_eq!(rec_seg1_frames[0].dedup_key, "rb08g-p2-cross");
+
+        // ------------------------------------------------------------------
+        // Part 3 — Internal locked `create_segment_file` contract checks
+        // (strictly confined inside `append.lock`, never leaking unlocked
+        // handles or arbitrary noncontiguous segments to public callers)
+        // ------------------------------------------------------------------
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let repo3 = tempdir().expect("create_segment_file tempdir");
+            let init3 = init_capture_queue(repo3.path()).expect("init capture queue 3");
+            let _seed = append_frame(
+                repo3.path(),
+                CaptureQueueLane::Normal,
+                FRAME_FLAG_NONE,
+                "rb08g-p3-seed",
+                b"seed-seg0",
+            )
+            .expect("seed seg 0");
+            let owners = UnixExpectedQueueOwners::current_effective();
+            let (root_fd, _) =
+                open_dir_nofollow(&init3.paths.root, owners.root_uid, "test root dir")
+                    .expect("open root_fd");
+            let (lane_fd, _) =
+                open_dir_nofollow(&init3.paths.normal, owners.normal_uid, "test normal dir")
+                    .expect("open lane_fd");
+            let append_lock = unix_seg::try_acquire_existing_strict_append_lock_unix(
+                &root_fd,
+                owners.root_uid,
+                lock_deadline_for_timeout(DEFAULT_QUEUE_APPEND_LOCK_TIMEOUT),
+            )
+            .expect("acquire append.lock")
+            .expect("append.lock must exist after init_capture_queue");
+
+            // Prove `append.lock` is genuinely held exclusively by verifying a
+            // zero-timeout contending append fails closed with `LBR-AGENT-049`.
+            let contended_err = append_frame_with_options(
+                repo3.path(),
+                CaptureQueueLane::Normal,
+                FRAME_FLAG_NONE,
+                "rb08g-p3-contended",
+                b"blocked-by-held-lock",
+                QueueAppendOptions::default().with_lock_timeout(Duration::ZERO),
+            )
+            .expect_err("contending append while lock guard is held must fail with LBR-AGENT-049");
+            assert!(matches!(
+                contended_err,
+                StorageBackendError::QueueBusy { .. }
+            ));
+            assert_eq!(contended_err.stable_code_str(), "LBR-AGENT-049");
+
+            let mut direct_obs = SegmentObserver::new();
+            let created_file = unix_seg::create_segment_file_at_fd_unix(
+                &lane_fd,
+                QUEUE_LANE_NORMAL_DIR,
+                1,
+                owners.normal_uid,
+                &append_lock,
+                &mut direct_obs,
+            )
+            .expect("locked create_segment_file_at_fd_unix for contiguous seg 1 must succeed");
+            drop(created_file);
+
+            let seg1_path3 = init3.paths.normal.join(segment_log_file_name(1));
+            assert!(seg1_path3.exists());
+            assert_eq!(fs::metadata(&seg1_path3).unwrap().len(), 0);
+            let mode = fs::symlink_metadata(&seg1_path3)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777;
+            assert_eq!(mode, 0o600);
+            assert_eq!(
+                direct_obs.events,
+                vec![
+                    SegmentOpEvent::CreateSegment {
+                        lane: QUEUE_LANE_NORMAL_DIR,
+                        seg_id: 1,
+                    },
+                    SegmentOpEvent::FsyncLaneDirAfterCreateSegment {
+                        lane: QUEUE_LANE_NORMAL_DIR,
+                        seg_id: 1,
+                    },
+                ]
+            );
+            // Duplicate `O_CREAT | O_EXCL` on existing seg 1 must fail with AlreadyExists.
+            let mut dup_obs = SegmentObserver::new();
+            let dup_err = unix_seg::create_segment_file_at_fd_unix(
+                &lane_fd,
+                QUEUE_LANE_NORMAL_DIR,
+                1,
+                owners.normal_uid,
+                &append_lock,
+                &mut dup_obs,
+            )
+            .expect_err("duplicate create_segment_file_at_fd_unix must fail with AlreadyExists");
+            assert!(matches!(
+                dup_err,
+                StorageBackendError::Io {
+                    kind: io::ErrorKind::AlreadyExists,
+                    ..
+                }
+            ));
+            drop(append_lock);
+
+            // Empty contiguous successor seg 1 leaves the lane 100% recoverable via Case D.
+            let rec3 = recover_lane(repo3.path(), CaptureQueueLane::Normal)
+                .expect("lane with contiguous empty seg 1 must recover cleanly");
+            assert_eq!(rec3.meta.active_seg, 0);
+            assert!(!seg1_path3.exists());
+        }
     }
 }

@@ -53,17 +53,17 @@ pub use frame::{
     validate_frame_body_len,
 };
 pub use segment::{
-    CAPTURE_QUEUE_MAX_TOTAL_BYTES, CaptureQueueOccupancy, DEFAULT_QUEUE_APPEND_LOCK_TIMEOUT,
-    LaneRecoveryReport, QUARANTINE_DIAGNOSTIC_CODE, QUEUE_TAIL_META_BAK_TMP_FILE,
-    QUEUE_TAIL_META_TMP_FILE, QuarantinePublishReport, QueueAppendOptions, SegmentAppendOutcome,
-    append_encoded_frame, append_encoded_frame_at_root, append_encoded_frame_at_root_with_options,
-    append_encoded_frame_with_options, append_frame, append_frame_at_root,
-    append_frame_at_root_with_options, append_frame_with_options, append_postcard_frame,
-    append_postcard_frame_with_options, is_lane_meta_temp_name, is_lane_quarantine_temp_name,
-    measure_capture_queue_occupancy, measure_capture_queue_occupancy_at_root,
-    parse_segment_log_file_name, publish_quarantine_durable, quarantine_and_truncate_segment,
-    quarantine_and_unlink_orphan, quarantine_artifact_id, read_converged_lane_tail_meta,
-    recover_lane, recover_lane_at_root,
+    CAPTURE_QUEUE_MAX_TOTAL_BYTES, CAPTURE_QUEUE_SEGMENT_ROTATION_BYTES, CaptureQueueOccupancy,
+    DEFAULT_QUEUE_APPEND_LOCK_TIMEOUT, LaneRecoveryReport, QUARANTINE_DIAGNOSTIC_CODE,
+    QUEUE_TAIL_META_BAK_TMP_FILE, QUEUE_TAIL_META_TMP_FILE, QuarantinePublishReport,
+    QueueAppendOptions, SegmentAppendOutcome, append_encoded_frame, append_encoded_frame_at_root,
+    append_encoded_frame_at_root_with_options, append_encoded_frame_with_options, append_frame,
+    append_frame_at_root, append_frame_at_root_with_options, append_frame_with_options,
+    append_postcard_frame, append_postcard_frame_with_options, is_lane_meta_temp_name,
+    is_lane_quarantine_temp_name, measure_capture_queue_occupancy,
+    measure_capture_queue_occupancy_at_root, parse_segment_log_file_name,
+    publish_quarantine_durable, quarantine_and_truncate_segment, quarantine_and_unlink_orphan,
+    quarantine_artifact_id, read_converged_lane_tail_meta, recover_lane, recover_lane_at_root,
 };
 
 /// Subdirectory under `.libra/private/` housing the dual-lane CRC32C capture queue.
