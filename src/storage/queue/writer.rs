@@ -11647,4 +11647,508 @@ mod tests {
             }
         }
     }
+
+    #[tokio::test]
+    async fn consumer_drained_rotated_old_s_safe_reclaim_ordered_actions() {
+        // `RB-09k` AC1–AC4 (`ADR-RB-05` #4 ② (c), ③):
+        // Verify on BOTH `normal/` and `priority/` lanes after an atomic zero-frame
+        // cross-segment advance commits DB `QUEUE_HIGHWATER_* = (S + 1, 0)`:
+        // - Part 1 (Fault-injected mid-reclaim proof via `AfterReclaimMetaBeforeUnlink`):
+        //   * Right after the empty-advance DB tx commits `(1, 0)`, `seg 0` is STILL
+        //     live (`min_live_seg == 0`, `sealed == [0]`) before reclamation starts.
+        //   * Reclamation acquires `append.lock` under `writer.lock` and atomically
+        //     commits BOTH `tail.meta` and `tail.meta.bak` with `MIN_LIVE_SEG = 1`
+        //     (AC1) AND `sealed[0]` removed in that same dual `LTM2` commit (AC2)
+        //     STRICTLY BEFORE `unlink("events-00000000.log")` executes (proven by
+        //     `seg 0` still existing on disk when crashing right after dual `LTM2`).
+        //   * Restart cleans the post-LTM2 crash orphan with 0 quarantine and 0 dups.
+        // - Part 2 (Full ordered-action proof across Case C Step C2, real 16 MiB
+        //   regular rotation, AND non-zero `S = 1 -> 2`):
+        //   * Lock order `writer.lock -> append.lock` proven via `with_before_reclaim_hook`.
+        //   * Exact `SegmentOpEvent` durability order:
+        //     `AcquireAppendLock < MetaRename(tail.meta) < FsyncLaneDirAfterMeta(tail.meta)
+        //      < MetaRename(tail.meta.bak) < FsyncLaneDirAfterMeta(tail.meta.bak)
+        //      < ReclaimSegmentUnlink(S) < FsyncLaneDirAfterReclaim(S) < ReleaseAppendLock`
+        //     proving AC1 (MIN_LIVE_SEG = S + 1 before unlink), AC2 (sealed[S] removed
+        //     in same dual LTM2), AC3 (events-<S>.log unlinked after dual LTM2), and
+        //     AC4 (`fsync_dir(lane_dir)` immediately after unlink).
+        use std::io::Write as _;
+
+        let assert_ordered_reclaim_events =
+            |events: &[SegmentOpEvent], lane_label: &'static str, seg_id: u32, tag: &str| {
+                let pos_lock = events
+                    .iter()
+                    .position(|e| *e == SegmentOpEvent::AcquireAppendLock)
+                    .unwrap_or_else(|| panic!("{tag}: missing AcquireAppendLock"));
+                let pos_meta_primary = events
+                    .iter()
+                    .position(|e| {
+                        *e == SegmentOpEvent::MetaRename {
+                            lane: lane_label,
+                            tmp_name: QUEUE_TAIL_META_TMP_FILE,
+                            target_name: QUEUE_TAIL_META_FILE,
+                        }
+                    })
+                    .unwrap_or_else(|| panic!("{tag}: missing MetaRename(tail.meta)"));
+                let pos_fsync_primary = events
+                    .iter()
+                    .position(|e| {
+                        *e == SegmentOpEvent::FsyncLaneDirAfterMeta {
+                            lane: lane_label,
+                            target_name: QUEUE_TAIL_META_FILE,
+                        }
+                    })
+                    .unwrap_or_else(|| panic!("{tag}: missing FsyncLaneDirAfterMeta(tail.meta)"));
+                let pos_meta_bak = events
+                    .iter()
+                    .position(|e| {
+                        *e == SegmentOpEvent::MetaRename {
+                            lane: lane_label,
+                            tmp_name: QUEUE_TAIL_META_BAK_TMP_FILE,
+                            target_name: QUEUE_TAIL_META_BAK_FILE,
+                        }
+                    })
+                    .unwrap_or_else(|| panic!("{tag}: missing MetaRename(tail.meta.bak)"));
+                let pos_fsync_bak = events
+                    .iter()
+                    .position(|e| {
+                        *e == SegmentOpEvent::FsyncLaneDirAfterMeta {
+                            lane: lane_label,
+                            target_name: QUEUE_TAIL_META_BAK_FILE,
+                        }
+                    })
+                    .unwrap_or_else(|| {
+                        panic!("{tag}: missing FsyncLaneDirAfterMeta(tail.meta.bak)")
+                    });
+                let pos_unlink = events
+                    .iter()
+                    .position(|e| {
+                        *e == SegmentOpEvent::ReclaimSegmentUnlink {
+                            lane: lane_label,
+                            seg_id,
+                        }
+                    })
+                    .unwrap_or_else(|| panic!("{tag}: missing ReclaimSegmentUnlink({seg_id})"));
+                let pos_fsync_reclaim = events
+                    .iter()
+                    .position(|e| {
+                        *e == SegmentOpEvent::FsyncLaneDirAfterReclaim {
+                            lane: lane_label,
+                            seg_id,
+                        }
+                    })
+                    .unwrap_or_else(|| panic!("{tag}: missing FsyncLaneDirAfterReclaim({seg_id})"));
+                let pos_unlock = events
+                    .iter()
+                    .position(|e| *e == SegmentOpEvent::ReleaseAppendLock)
+                    .unwrap_or_else(|| panic!("{tag}: missing ReleaseAppendLock"));
+                assert!(
+                    pos_lock < pos_meta_primary
+                        && pos_meta_primary < pos_fsync_primary
+                        && pos_fsync_primary < pos_meta_bak
+                        && pos_meta_bak < pos_fsync_bak
+                        && pos_fsync_bak < pos_unlink
+                        && pos_fsync_reclaim == pos_unlink + 1
+                        && pos_fsync_reclaim < pos_unlock,
+                    "{tag}: invalid reclaim action order (fsync_dir must immediately follow unlink); events={events:?}"
+                );
+            };
+
+        for lane in [CaptureQueueLane::Normal, CaptureQueueLane::Priority] {
+            let lane_label = lane_subdir_name(lane);
+            let flags = match lane {
+                CaptureQueueLane::Priority => FRAME_FLAG_PRIORITY,
+                CaptureQueueLane::Normal => FRAME_FLAG_NONE,
+            };
+            let sized_payload_for = |tag: &str, seq: i64, pad_bytes: usize| match lane {
+                CaptureQueueLane::Priority => {
+                    let mut rec = match make_session_payload(
+                        tag,
+                        CaptureSessionState::Stopped,
+                        1_700_150_000 + seq,
+                    ) {
+                        CaptureBatchPayload::UpsertSession(r) => r,
+                        _ => unreachable!(),
+                    };
+                    if pad_bytes > 0 {
+                        rec.metadata_json = format!(r#"{{"pad":"{}"}}"#, "k".repeat(pad_bytes));
+                    }
+                    CaptureBatchPayload::UpsertSession(rec)
+                }
+                CaptureQueueLane::Normal => {
+                    let mut rec = match make_audit_payload(
+                        tag,
+                        &format!("2026-11-24T14:00:{:02}Z", seq % 60),
+                    ) {
+                        CaptureBatchPayload::AppendAuditLog(r) => r,
+                        _ => unreachable!(),
+                    };
+                    if pad_bytes > 0 {
+                        rec.justification = Some("k".repeat(pad_bytes));
+                    }
+                    CaptureBatchPayload::AppendAuditLog(rec)
+                }
+            };
+
+            // =================================================================
+            // Part 1: Fault-injected `AfterReclaimMetaBeforeUnlink` right after
+            // empty-advance `(0, sealed_len) -> (1, 0)` proves AC1 & AC2 happen
+            // atomically in dual `LTM2` strictly BEFORE `unlink(events-00000000.log)`.
+            // =================================================================
+            {
+                let repo = tempdir().expect("tempdir");
+                let init = init_capture_queue(repo.path()).expect("init capture queue");
+                let lane_dir = match lane {
+                    CaptureQueueLane::Normal => init.paths.normal.clone(),
+                    CaptureQueueLane::Priority => init.paths.priority.clone(),
+                };
+                let store = RedbCaptureStore::create(
+                    repo.path()
+                        .join(PRIVATE_SUBDIR)
+                        .join("capture.gen-0001.redb"),
+                )
+                .await
+                .expect("create RedbCaptureStore");
+                let setup_spy = SpyCaptureStore::new(store.clone(), init.paths.root.clone());
+
+                for i in 0..2usize {
+                    let _ = append_postcard_frame(
+                        repo.path(),
+                        lane,
+                        flags,
+                        &format!("rb09k:p1:{lane_label}:s0:{i}"),
+                        CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                        &sized_payload_for(&format!("rb09k-p1-{lane_label}-s0-{i}"), i as i64, 0),
+                    )
+                    .unwrap();
+                }
+                let _ = drain_capture_queue(repo.path(), &setup_spy).await.unwrap();
+
+                let half = encode_postcard_frame(
+                    flags,
+                    &format!("rb09k:p1:{lane_label}:half"),
+                    CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                    &sized_payload_for(&format!("rb09k-p1-{lane_label}-half"), 99, 0),
+                )
+                .unwrap();
+                let seg0_path = lane_dir.join(segment_log_file_name(0));
+                {
+                    let mut f = fs::OpenOptions::new()
+                        .append(true)
+                        .open(&seg0_path)
+                        .unwrap();
+                    f.write_all(&half[..half.len() / 2]).unwrap();
+                    f.sync_data().unwrap();
+                }
+                let s1_out = append_postcard_frame(
+                    repo.path(),
+                    lane,
+                    flags,
+                    &format!("rb09k:p1:{lane_label}:s1:0"),
+                    CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                    &sized_payload_for(&format!("rb09k-p1-{lane_label}-s1-0"), 10, 0),
+                )
+                .unwrap();
+                assert_eq!(s1_out.meta.active_seg, 1);
+                assert_eq!(s1_out.meta.sealed.len(), 1);
+
+                let saw_empty_advance_before_reclaim =
+                    Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let flag_hook = Arc::clone(&saw_empty_advance_before_reclaim);
+                let seg0_hook = seg0_path.clone();
+                let lane_dir_hook = lane_dir.clone();
+
+                let lock = try_acquire_writer_lock_at_root(&init.paths.root)
+                    .unwrap()
+                    .unwrap();
+                let mut crash_obs = WriterObserver::with_reclaim_crash_point(
+                    SegmentCrashPoint::AfterReclaimMetaBeforeUnlink,
+                );
+                let spy = SpyCaptureStore::new_with_lock_tracking(
+                    store.clone(),
+                    init.paths.root.clone(),
+                    crash_obs.consumer_holds_append_lock_handle(),
+                    Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                )
+                .with_after_batch_callback(move |call| {
+                    assert_eq!(call.item_count, 0);
+                    assert_eq!(
+                        call.db_highwater_after,
+                        CaptureQueueHighwater {
+                            segment_id: 1,
+                            byte_offset: 0,
+                        }
+                    );
+                    assert!(seg0_hook.exists());
+                    let m = read_converged_lane_tail_meta(&lane_dir_hook).unwrap();
+                    assert_eq!(m.min_live_seg, 0);
+                    assert_eq!(m.sealed.len(), 1);
+                    flag_hook.store(true, std::sync::atomic::Ordering::Release);
+                });
+
+                let err = drain_locked_at_root(
+                    &init.paths.root,
+                    &spy,
+                    QueueWriterOptions::default(),
+                    &lock,
+                    &mut crash_obs,
+                )
+                .await
+                .expect_err("Part 1: must crash after dual LTM2 reclaim commit and before unlink");
+                assert!(matches!(err, StorageBackendError::Io { .. }));
+                drop(lock);
+
+                assert!(
+                    saw_empty_advance_before_reclaim.load(std::sync::atomic::Ordering::Acquire)
+                );
+                // AC1 & AC2 committed atomically to BOTH `tail.meta` and `tail.meta.bak`
+                // while `events-00000000.log` STILL exists on disk!
+                assert!(seg0_path.exists());
+                let raw_primary = fs::read(tail_meta_path(&lane_dir)).unwrap();
+                let raw_bak = fs::read(tail_meta_bak_path(&lane_dir)).unwrap();
+                assert_eq!(raw_primary, raw_bak);
+                let meta_pre_unlink = LaneTailMeta::decode(&raw_primary).unwrap();
+                assert_eq!(meta_pre_unlink.min_live_seg, 1);
+                assert_eq!(meta_pre_unlink.active_seg, 1);
+                assert!(meta_pre_unlink.sealed.is_empty());
+                assert!(!crash_obs.segment_events.iter().any(|e| matches!(
+                    e,
+                    SegmentOpEvent::ReclaimSegmentUnlink { .. }
+                        | SegmentOpEvent::FsyncLaneDirAfterReclaim { .. }
+                )));
+
+                // Clean restart removes post-LTM2 crash orphan and drains `seg 1`.
+                let restart_rep = drain_capture_queue(repo.path(), &setup_spy)
+                    .await
+                    .expect("restart after pre-unlink crash must converge");
+                assert_eq!(restart_rep.applied_frames, 1);
+                assert_eq!(restart_rep.deduplicated_frames, 0);
+                assert!(!seg0_path.exists());
+            }
+
+            // =================================================================
+            // Part 2: Healthy ordered-action reclamation proof across:
+            //   (a) Case C Step C2 rotation (`S = 0 -> 1`, then `S = 1 -> 2` non-zero S!),
+            //   (b) Genuine 16 MiB regular rotation (`S = 0 -> 1`).
+            // =================================================================
+            {
+                let repo = tempdir().expect("tempdir");
+                let init = init_capture_queue(repo.path()).expect("init capture queue");
+                let lane_dir = match lane {
+                    CaptureQueueLane::Normal => init.paths.normal.clone(),
+                    CaptureQueueLane::Priority => init.paths.priority.clone(),
+                };
+                let store = RedbCaptureStore::create(
+                    repo.path()
+                        .join(PRIVATE_SUBDIR)
+                        .join("capture.gen-0001.redb"),
+                )
+                .await
+                .expect("create RedbCaptureStore");
+                let setup_spy = SpyCaptureStore::new(store.clone(), init.paths.root.clone());
+
+                // Run two consecutive drained-then-rotated cycles (`S = 0 -> 1` and `S = 1 -> 2`).
+                for seg_s in [0u32, 1u32] {
+                    let _ = append_postcard_frame(
+                        repo.path(),
+                        lane,
+                        flags,
+                        &format!("rb09k:p2a:{lane_label}:s{seg_s}:0"),
+                        CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                        &sized_payload_for(
+                            &format!("rb09k-p2a-{lane_label}-s{seg_s}-0"),
+                            i64::from(seg_s) * 10,
+                            0,
+                        ),
+                    )
+                    .unwrap();
+                    let _ = drain_capture_queue(repo.path(), &setup_spy).await.unwrap();
+
+                    let half = encode_postcard_frame(
+                        flags,
+                        &format!("rb09k:p2a:{lane_label}:s{seg_s}:half"),
+                        CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                        &sized_payload_for(
+                            &format!("rb09k-p2a-{lane_label}-s{seg_s}-half"),
+                            90 + i64::from(seg_s),
+                            0,
+                        ),
+                    )
+                    .unwrap();
+                    let old_seg_path = lane_dir.join(segment_log_file_name(seg_s));
+                    {
+                        let mut f = fs::OpenOptions::new()
+                            .append(true)
+                            .open(&old_seg_path)
+                            .unwrap();
+                        f.write_all(&half[..half.len() / 2]).unwrap();
+                        f.sync_data().unwrap();
+                    }
+                    let rec = crate::storage::queue::recover_lane(repo.path(), lane).unwrap();
+                    assert_eq!(rec.meta.min_live_seg, seg_s);
+                    assert_eq!(rec.meta.active_seg, seg_s + 1);
+                    assert_eq!(rec.meta.sealed.len(), 1);
+                    assert_eq!(rec.meta.sealed[0].seg_id, seg_s);
+
+                    // Verify `writer.lock -> append.lock` lock ordering right before reclaim.
+                    let root_for_hook = init.paths.root.clone();
+                    let saw_reclaim_hook = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let hook_flag = Arc::clone(&saw_reclaim_hook);
+
+                    let lock = try_acquire_writer_lock_at_root(&init.paths.root)
+                        .unwrap()
+                        .unwrap();
+                    let mut obs = WriterObserver::with_before_reclaim_hook(move |l, s| {
+                        assert_eq!(l, lane);
+                        assert_eq!(s, seg_s);
+                        assert!(is_writer_active_at_root(&root_for_hook).unwrap());
+                        assert!(probe_append_lock_is_free(&root_for_hook));
+                        hook_flag.store(true, std::sync::atomic::Ordering::Release);
+                    });
+                    let spy = SpyCaptureStore::new_with_lock_tracking(
+                        store.clone(),
+                        init.paths.root.clone(),
+                        obs.consumer_holds_append_lock_handle(),
+                        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    );
+
+                    let rep = drain_locked_at_root(
+                        &init.paths.root,
+                        &spy,
+                        QueueWriterOptions::default(),
+                        &lock,
+                        &mut obs,
+                    )
+                    .await
+                    .expect("Part 2a: empty-advance + safe ordered reclaim must succeed");
+                    drop(lock);
+
+                    assert!(saw_reclaim_hook.load(std::sync::atomic::Ordering::Acquire));
+                    assert_eq!(rep.applied_frames, 0);
+                    assert_eq!(rep.reclaimed_segments, 1);
+                    let calls = spy.recorded_calls();
+                    assert_eq!(calls.len(), 1);
+                    assert_eq!(calls[0].item_count, 0);
+                    assert_eq!(
+                        calls[0].db_highwater_after,
+                        CaptureQueueHighwater {
+                            segment_id: seg_s + 1,
+                            byte_offset: 0,
+                        }
+                    );
+
+                    // AC1–AC4 strict ordered action proof + on-disk dual LTM2 & unlink check!
+                    assert_ordered_reclaim_events(
+                        &obs.segment_events,
+                        lane_label,
+                        seg_s,
+                        &format!("RB-09k StepC2 ({lane_label}, S={seg_s})"),
+                    );
+                    assert!(
+                        !old_seg_path.exists(),
+                        "AC3 ({lane_label}, S={seg_s}): events-{seg_s:08}.log must be unlinked"
+                    );
+                    assert!(lane_dir.join(segment_log_file_name(seg_s + 1)).exists());
+                    let raw_p = fs::read(tail_meta_path(&lane_dir)).unwrap();
+                    let raw_b = fs::read(tail_meta_bak_path(&lane_dir)).unwrap();
+                    assert_eq!(raw_p, raw_b);
+                    let final_meta = LaneTailMeta::decode(&raw_p).unwrap();
+                    assert_eq!(final_meta.min_live_seg, seg_s + 1);
+                    assert_eq!(final_meta.active_seg, seg_s + 1);
+                    assert!(final_meta.sealed.is_empty());
+                }
+            }
+
+            // Part 2b: Genuine 16 MiB regular rotation (`S = 0 -> 1`) ordered reclaim proof.
+            {
+                let repo = tempdir().expect("tempdir");
+                let init = init_capture_queue(repo.path()).expect("init capture queue");
+                let lane_dir = match lane {
+                    CaptureQueueLane::Normal => init.paths.normal.clone(),
+                    CaptureQueueLane::Priority => init.paths.priority.clone(),
+                };
+                let store = RedbCaptureStore::create(
+                    repo.path()
+                        .join(PRIVATE_SUBDIR)
+                        .join("capture.gen-0001.redb"),
+                )
+                .await
+                .expect("create RedbCaptureStore");
+                let setup_spy = SpyCaptureStore::new(store.clone(), init.paths.root.clone());
+
+                for i in 0..5usize {
+                    let _ = append_postcard_frame(
+                        repo.path(),
+                        lane,
+                        flags,
+                        &format!("rb09k:p2b:{lane_label}:big:{i}"),
+                        CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                        &sized_payload_for(
+                            &format!("rb09k-p2b-{lane_label}-big-{i}"),
+                            i as i64,
+                            3 * 1024 * 1024,
+                        ),
+                    )
+                    .unwrap();
+                }
+                let _ = drain_capture_queue(repo.path(), &setup_spy).await.unwrap();
+
+                let rot_out = append_postcard_frame(
+                    repo.path(),
+                    lane,
+                    flags,
+                    &format!("rb09k:p2b:{lane_label}:rot:5"),
+                    CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                    &sized_payload_for(
+                        &format!("rb09k-p2b-{lane_label}-rot-5"),
+                        5,
+                        2 * 1024 * 1024,
+                    ),
+                )
+                .unwrap();
+                assert_eq!(rot_out.meta.active_seg, 1);
+
+                let lock = try_acquire_writer_lock_at_root(&init.paths.root)
+                    .unwrap()
+                    .unwrap();
+                let mut obs = WriterObserver::new();
+                let spy = SpyCaptureStore::new_with_lock_tracking(
+                    store.clone(),
+                    init.paths.root.clone(),
+                    obs.consumer_holds_append_lock_handle(),
+                    Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                );
+                let rep = drain_locked_at_root(
+                    &init.paths.root,
+                    &spy,
+                    QueueWriterOptions::default(),
+                    &lock,
+                    &mut obs,
+                )
+                .await
+                .expect("Part 2b: 16 MiB empty-advance + safe ordered reclaim must succeed");
+                drop(lock);
+
+                assert_eq!(rep.applied_frames, 1);
+                assert_eq!(rep.reclaimed_segments, 1);
+                assert_ordered_reclaim_events(
+                    &obs.segment_events,
+                    lane_label,
+                    0,
+                    &format!("RB-09k 16MiB ({lane_label})"),
+                );
+                assert!(!lane_dir.join(segment_log_file_name(0)).exists());
+                assert!(lane_dir.join(segment_log_file_name(1)).exists());
+                let raw_p = fs::read(tail_meta_path(&lane_dir)).unwrap();
+                let raw_b = fs::read(tail_meta_bak_path(&lane_dir)).unwrap();
+                assert_eq!(raw_p, raw_b);
+                let final_meta = LaneTailMeta::decode(&raw_p).unwrap();
+                assert_eq!(final_meta.min_live_seg, 1);
+                assert_eq!(final_meta.active_seg, 1);
+                assert!(final_meta.sealed.is_empty());
+                assert!(probe_append_lock_is_free(&init.paths.root));
+                assert!(!is_writer_active(repo.path()).unwrap());
+            }
+        }
+    }
 }
