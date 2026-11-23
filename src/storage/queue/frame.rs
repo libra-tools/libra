@@ -15,11 +15,13 @@
 //! 19+K    P      POSTCARD_ENVELOPE = versioned postcard payload (P bytes)
 //! ```
 
+use std::io;
+
 use serde::{Serialize, de::DeserializeOwned};
 use thiserror::Error;
 
 use crate::storage::{
-    codec::{decode_versioned, encode_versioned},
+    codec::decode_versioned,
     error::{StorageBackendError, StorageResult},
 };
 
@@ -32,6 +34,27 @@ pub const FRAME_HEADER_LEN: usize = 16;
 
 /// Fixed byte length of the body metadata prefix (`FLAGS: u8` + `DEDUP_KEY_LEN: u16_le`).
 pub const FRAME_BODY_FIXED_OVERHEAD: usize = 3;
+
+/// Maximum UTF-8 byte length of a frame's semantic `dedup_key` (`512 B`,
+/// `ADR-RB-05` #2, `RB-07g`).
+pub const MAX_FRAME_DEDUP_KEY_LEN: usize = 512;
+
+/// Maximum byte length of a single frame's `POSTCARD_ENVELOPE` payload
+/// (`4 MiB`, `ADR-RB-05` #2, `RB-07g`).
+pub const MAX_FRAME_PAYLOAD_LEN: usize = 4 * 1024 * 1024;
+
+/// Minimum legal `FRAME_BODY_LEN` (`3` bytes: `FLAGS` + `DEDUP_KEY_LEN`,
+/// `ADR-RB-05` #2, `RB-07g`).
+pub const MIN_FRAME_BODY_LEN: u32 = FRAME_BODY_FIXED_OVERHEAD as u32;
+
+/// Maximum legal `FRAME_BODY_LEN` (`3 + 512 + 4 MiB`, `ADR-RB-05` #2, `RB-07g`).
+pub const MAX_FRAME_BODY_LEN: u32 =
+    (FRAME_BODY_FIXED_OVERHEAD + MAX_FRAME_DEDUP_KEY_LEN + MAX_FRAME_PAYLOAD_LEN) as u32;
+
+const _: () = assert!(
+    MAX_FRAME_BODY_LEN as usize == 3 + 512 + 4 * 1024 * 1024,
+    "MAX_FRAME_BODY_LEN must equal 3 + 512 + 4 MiB"
+);
 
 /// Default frame flags (ordinary `normal` lane event).
 pub const FRAME_FLAG_NONE: u8 = 0;
@@ -70,8 +93,10 @@ pub enum FrameEncodeError {
     EmptyDedupKey,
     #[error("capture queue frame dedup_key must not contain NUL bytes")]
     DedupKeyContainsNul,
-    #[error("capture queue frame dedup_key length ({len} B) exceeds wire maximum ({max} B)")]
+    #[error("capture queue frame dedup_key length ({len} B) exceeds maximum ({max} B)")]
     DedupKeyTooLong { len: usize, max: usize },
+    #[error("capture queue frame payload length ({len} B) exceeds maximum ({max} B)")]
+    PayloadTooLarge { len: usize, max: usize },
     #[error("capture queue frame body length overflows u32 wire limit")]
     BodyLengthOverflow,
     #[error("capture queue frame postcard serialization failed: {detail}")]
@@ -109,6 +134,46 @@ impl FrameDecodeError {
     }
 }
 
+fn validate_dedup_key_for_encode(dedup_key: &str) -> Result<u16, FrameEncodeError> {
+    if dedup_key.is_empty() {
+        return Err(FrameEncodeError::EmptyDedupKey);
+    }
+    if dedup_key.as_bytes().contains(&0) {
+        return Err(FrameEncodeError::DedupKeyContainsNul);
+    }
+    let dedup_len = dedup_key.len();
+    if dedup_len > MAX_FRAME_DEDUP_KEY_LEN {
+        return Err(FrameEncodeError::DedupKeyTooLong {
+            len: dedup_len,
+            max: MAX_FRAME_DEDUP_KEY_LEN,
+        });
+    }
+    u16::try_from(dedup_len).map_err(|_| FrameEncodeError::DedupKeyTooLong {
+        len: dedup_len,
+        max: MAX_FRAME_DEDUP_KEY_LEN,
+    })
+}
+
+/// Validate a header's `FRAME_BODY_LEN` against the protocol bounds
+/// `MIN_FRAME_BODY_LEN (3) <= body_len <= MAX_FRAME_BODY_LEN (3 + 512 + 4 MiB)`
+/// *before* allocating any body buffer or classifying truncation (`ADR-RB-05` #2,
+/// `RB-07g`).
+pub fn validate_frame_body_len(body_len: u32) -> Result<usize, FrameDecodeError> {
+    if body_len < MIN_FRAME_BODY_LEN {
+        return Err(FrameDecodeError::CorruptHeader {
+            detail: "frame body length below minimum 3 bytes",
+        });
+    }
+    if body_len > MAX_FRAME_BODY_LEN {
+        return Err(FrameDecodeError::CorruptHeader {
+            detail: "frame body length exceeds MAX_FRAME_BODY_LEN",
+        });
+    }
+    usize::try_from(body_len).map_err(|_| FrameDecodeError::CorruptHeader {
+        detail: "frame body length exceeds platform usize",
+    })
+}
+
 /// Encode a capture queue frame into a single contiguous buffer carrying the
 /// fixed 16-byte self-authenticating header (`MAGIC`, `FRAME_BODY_LEN`,
 /// `HEADER_CRC32C`, `FRAME_CRC32C`) followed by `[FLAGS][DEDUP_KEY_LEN]
@@ -118,18 +183,14 @@ pub fn encode_frame(
     dedup_key: &str,
     postcard_envelope: &[u8],
 ) -> Result<Vec<u8>, FrameEncodeError> {
-    if dedup_key.is_empty() {
-        return Err(FrameEncodeError::EmptyDedupKey);
-    }
-    if dedup_key.as_bytes().contains(&0) {
-        return Err(FrameEncodeError::DedupKeyContainsNul);
+    let dedup_len_u16 = validate_dedup_key_for_encode(dedup_key)?;
+    if postcard_envelope.len() > MAX_FRAME_PAYLOAD_LEN {
+        return Err(FrameEncodeError::PayloadTooLarge {
+            len: postcard_envelope.len(),
+            max: MAX_FRAME_PAYLOAD_LEN,
+        });
     }
     let dedup_bytes = dedup_key.as_bytes();
-    let dedup_len_u16 =
-        u16::try_from(dedup_bytes.len()).map_err(|_| FrameEncodeError::DedupKeyTooLong {
-            len: dedup_bytes.len(),
-            max: usize::from(u16::MAX),
-        })?;
 
     let body_len_usize = FRAME_BODY_FIXED_OVERHEAD
         .checked_add(dedup_bytes.len())
@@ -163,19 +224,83 @@ pub fn encode_frame(
     Ok(buf)
 }
 
-/// Serialize `value` with versioned `postcard` framing (`crate::storage::codec`)
-/// and encode it into a dual-CRC32C capture queue frame.
+/// Bounded `std::io::Write` sink for `postcard::to_io` that prepends
+/// `[schema_ver: u16_le]` and aborts immediately once the versioned envelope
+/// would exceed `MAX_FRAME_PAYLOAD_LEN`, clamping buffer growth strictly at
+/// `max_len` so oversized inputs can never exhaust memory (`RB-07g`).
+struct BoundedEnvelopeWriter {
+    buf: Vec<u8>,
+    max_len: usize,
+    exceeded_len: Option<usize>,
+}
+
+impl BoundedEnvelopeWriter {
+    fn new(schema_version: u16, max_len: usize) -> Self {
+        let mut buf = Vec::with_capacity(256.min(max_len));
+        buf.extend_from_slice(&schema_version.to_le_bytes());
+        Self {
+            buf,
+            max_len,
+            exceeded_len: None,
+        }
+    }
+}
+
+impl io::Write for BoundedEnvelopeWriter {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        let next_len = self.buf.len().saturating_add(data.len());
+        if next_len > self.max_len {
+            self.exceeded_len = Some(next_len);
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "postcard envelope exceeds MAX_FRAME_PAYLOAD_LEN",
+            ));
+        }
+        if next_len > self.buf.capacity() {
+            let target_cap = self
+                .buf
+                .capacity()
+                .saturating_mul(2)
+                .max(next_len)
+                .min(self.max_len);
+            self.buf.reserve_exact(target_cap - self.buf.len());
+        }
+        self.buf.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Serialize `value` with bounded versioned `postcard` framing
+/// (`[schema_ver: u16_le][postcard_bytes]`, stopping immediately if the
+/// envelope exceeds [`MAX_FRAME_PAYLOAD_LEN`]) and encode it into a dual-CRC32C
+/// capture queue frame.
 pub fn encode_postcard_frame<T: Serialize>(
     flags: u8,
     dedup_key: &str,
     schema_version: u16,
     value: &T,
 ) -> Result<Vec<u8>, FrameEncodeError> {
-    let envelope =
-        encode_versioned(schema_version, value).map_err(|err| FrameEncodeError::Codec {
-            detail: err.stable_code_str().to_string(),
-        })?;
-    encode_frame(flags, dedup_key, &envelope)
+    let _ = validate_dedup_key_for_encode(dedup_key)?;
+    let mut writer = BoundedEnvelopeWriter::new(schema_version, MAX_FRAME_PAYLOAD_LEN);
+    match postcard::to_io(value, &mut writer) {
+        Ok(_) => encode_frame(flags, dedup_key, &writer.buf),
+        Err(_) => {
+            if let Some(len) = writer.exceeded_len {
+                Err(FrameEncodeError::PayloadTooLarge {
+                    len,
+                    max: MAX_FRAME_PAYLOAD_LEN,
+                })
+            } else {
+                Err(FrameEncodeError::Codec {
+                    detail: "LBR-IO-001".to_string(),
+                })
+            }
+        }
+    }
 }
 
 /// Decode a single dual-CRC32C capture queue frame from the beginning of
@@ -203,9 +328,10 @@ pub fn decode_frame(bytes: &[u8]) -> Result<(DecodedFrame, usize), FrameDecodeEr
         });
     }
 
-    let body_len = usize::try_from(body_len_u32).map_err(|_| FrameDecodeError::CorruptHeader {
-        detail: "frame body length exceeds platform usize",
-    })?;
+    // Enforce `3 <= FRAME_BODY_LEN <= MAX_FRAME_BODY_LEN` BEFORE checking remaining
+    // slice length or allocating any body buffer so illegal lengths fail closed as
+    // `CorruptHeader` rather than `TruncatedTail` or OOM.
+    let body_len = validate_frame_body_len(body_len_u32)?;
     let total_len =
         FRAME_HEADER_LEN
             .checked_add(body_len)
@@ -231,14 +357,18 @@ pub fn decode_frame(bytes: &[u8]) -> Result<(DecodedFrame, usize), FrameDecodeEr
     }
 
     let body = &bytes[FRAME_HEADER_LEN..total_len];
-    if body.len() < FRAME_BODY_FIXED_OVERHEAD {
-        return Err(FrameDecodeError::CorruptHeader {
-            detail: "frame body shorter than fixed metadata prefix",
-        });
-    }
-
     let flags = body[0];
     let dedup_len = usize::from(u16::from_le_bytes([body[1], body[2]]));
+    if dedup_len == 0 {
+        return Err(FrameDecodeError::CorruptPayload {
+            detail: "empty dedup_key in frame body",
+        });
+    }
+    if dedup_len > MAX_FRAME_DEDUP_KEY_LEN {
+        return Err(FrameDecodeError::CorruptPayload {
+            detail: "dedup_key length exceeds MAX_FRAME_DEDUP_KEY_LEN",
+        });
+    }
     let dedup_end = FRAME_BODY_FIXED_OVERHEAD.checked_add(dedup_len).ok_or(
         FrameDecodeError::CorruptPayload {
             detail: "dedup_key length overflow",
@@ -249,9 +379,10 @@ pub fn decode_frame(bytes: &[u8]) -> Result<(DecodedFrame, usize), FrameDecodeEr
             detail: "dedup_key length exceeds frame body length",
         });
     }
-    if dedup_len == 0 {
+    let payload_len = body.len() - dedup_end;
+    if payload_len > MAX_FRAME_PAYLOAD_LEN {
         return Err(FrameDecodeError::CorruptPayload {
-            detail: "empty dedup_key in frame body",
+            detail: "payload length exceeds MAX_FRAME_PAYLOAD_LEN",
         });
     }
 
@@ -291,6 +422,7 @@ mod tests {
     use serde::{Deserialize, Serialize};
 
     use super::*;
+    use crate::storage::codec::encode_versioned;
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     struct SampleCaptureEnvelope {
@@ -544,6 +676,253 @@ mod tests {
         assert!(
             !dec_msg.contains("secret-body-888") && !dec_msg.contains("sec"),
             "decode storage error must not leak raw body or key bytes: {dec_msg}"
+        );
+    }
+
+    /// `RB-07g` AC1–AC4:
+    /// - AC1: Payloads exceeding `4 MiB` fail closed during encoding.
+    /// - AC2: `dedup_key` exceeding `512 B` fails closed during encoding.
+    /// - AC3: `MAX_FRAME_BODY_LEN` equals `3 + 512 + 4 MiB` exactly.
+    /// - AC4: Illegal body-length lower bound (`FRAME_BODY_LEN < 3`) fails
+    ///   closed in the decode guard as `CorruptHeader` (alongside upper bound
+    ///   `> MAX_FRAME_BODY_LEN` and component-level decoded bounds).
+    #[test]
+    fn frame_encode_limits_and_min_max_body_len_guard() {
+        // AC3: Exact protocol constants.
+        assert_eq!(MAX_FRAME_DEDUP_KEY_LEN, 512);
+        assert_eq!(MAX_FRAME_PAYLOAD_LEN, 4 * 1024 * 1024);
+        assert_eq!(MIN_FRAME_BODY_LEN, 3);
+        assert_eq!(
+            MAX_FRAME_BODY_LEN as usize,
+            3 + 512 + 4 * 1024 * 1024,
+            "AC3: MAX_FRAME_BODY_LEN must equal exactly 3 + 512 + 4 MiB"
+        );
+
+        // Exact maximum legal frame: 512 B dedup_key + 4 MiB payload -> body_len == MAX_FRAME_BODY_LEN.
+        let max_key = "k".repeat(MAX_FRAME_DEDUP_KEY_LEN);
+        let max_payload = vec![0x5au8; MAX_FRAME_PAYLOAD_LEN];
+        let max_frame = encode_frame(FRAME_FLAG_PRIORITY, &max_key, &max_payload)
+            .expect("exact 512B dedup_key + 4 MiB payload must encode cleanly");
+        assert_eq!(
+            max_frame.len(),
+            FRAME_HEADER_LEN + MAX_FRAME_BODY_LEN as usize
+        );
+        assert_eq!(
+            u32::from_le_bytes([max_frame[4], max_frame[5], max_frame[6], max_frame[7]]),
+            MAX_FRAME_BODY_LEN
+        );
+        let (max_decoded, max_consumed) =
+            decode_frame(&max_frame).expect("exact MAX_FRAME_BODY_LEN frame must decode cleanly");
+        assert_eq!(max_consumed, max_frame.len());
+        assert_eq!(max_decoded.flags, FRAME_FLAG_PRIORITY);
+        assert_eq!(max_decoded.dedup_key.len(), MAX_FRAME_DEDUP_KEY_LEN);
+        assert_eq!(max_decoded.payload.len(), MAX_FRAME_PAYLOAD_LEN);
+
+        // AC1: Payload > 4 MiB fails closed at encode stage (both raw and postcard APIs).
+        let oversized_payload = vec![0xa5u8; MAX_FRAME_PAYLOAD_LEN + 1];
+        let payload_err = encode_frame(FRAME_FLAG_NONE, "ok-key", &oversized_payload)
+            .expect_err("AC1: payload > 4 MiB must fail closed in encode_frame");
+        assert_eq!(
+            payload_err,
+            FrameEncodeError::PayloadTooLarge {
+                len: MAX_FRAME_PAYLOAD_LEN + 1,
+                max: MAX_FRAME_PAYLOAD_LEN,
+            }
+        );
+        assert_eq!(
+            payload_err.into_storage_error().stable_code_str(),
+            "LBR-IO-001"
+        );
+
+        let oversized_envelope = SampleCaptureEnvelope {
+            session_id: "sess-oversized".to_string(),
+            seq: 1,
+            event_kind: "ToolUse".to_string(),
+            body: vec![0x11u8; MAX_FRAME_PAYLOAD_LEN],
+        };
+        let postcard_payload_err =
+            encode_postcard_frame(FRAME_FLAG_NONE, "ok-key", 1, &oversized_envelope)
+                .expect_err("AC1: serialized postcard envelope > 4 MiB must fail closed");
+        assert!(matches!(
+            postcard_payload_err,
+            FrameEncodeError::PayloadTooLarge {
+                len,
+                max: MAX_FRAME_PAYLOAD_LEN
+            } if len > MAX_FRAME_PAYLOAD_LEN
+        ));
+
+        // AC2: dedup_key > 512 B fails closed at encode stage (both raw and postcard APIs, sanitized).
+        let oversized_key = format!("secret-prefix-{}", "x".repeat(MAX_FRAME_DEDUP_KEY_LEN));
+        assert!(oversized_key.len() > MAX_FRAME_DEDUP_KEY_LEN);
+        let key_err = encode_frame(FRAME_FLAG_NONE, &oversized_key, b"p")
+            .expect_err("AC2: dedup_key > 512 B must fail closed in encode_frame");
+        assert_eq!(
+            key_err,
+            FrameEncodeError::DedupKeyTooLong {
+                len: oversized_key.len(),
+                max: MAX_FRAME_DEDUP_KEY_LEN,
+            }
+        );
+        let key_storage_err = key_err.into_storage_error();
+        assert_eq!(key_storage_err.stable_code_str(), "LBR-IO-001");
+        assert!(
+            !key_storage_err.to_string().contains("secret-prefix"),
+            "dedup_key length error must not leak raw key content"
+        );
+
+        let exact_513_key = "z".repeat(MAX_FRAME_DEDUP_KEY_LEN + 1);
+        assert_eq!(
+            encode_postcard_frame(FRAME_FLAG_NONE, &exact_513_key, 1, &42u64),
+            Err(FrameEncodeError::DedupKeyTooLong {
+                len: MAX_FRAME_DEDUP_KEY_LEN + 1,
+                max: MAX_FRAME_DEDUP_KEY_LEN,
+            })
+        );
+
+        // Helper to craft a raw header+body with valid HEADER_CRC32C and FRAME_CRC32C.
+        let craft_header_only = |declared_body_len: u32| -> [u8; FRAME_HEADER_LEN] {
+            let mut hdr = [0u8; FRAME_HEADER_LEN];
+            hdr[0..4].copy_from_slice(&FRAME_MAGIC);
+            hdr[4..8].copy_from_slice(&declared_body_len.to_le_bytes());
+            let hdr_crc = crc32c_checksum(&hdr[0..8]);
+            hdr[8..12].copy_from_slice(&hdr_crc.to_le_bytes());
+            hdr
+        };
+        let craft_full = |body: &[u8]| -> Vec<u8> {
+            let mut raw = Vec::with_capacity(FRAME_HEADER_LEN + body.len());
+            raw.extend_from_slice(&FRAME_MAGIC);
+            raw.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            let hdr_crc = crc32c_checksum(&raw[0..8]);
+            raw.extend_from_slice(&hdr_crc.to_le_bytes());
+            raw.extend_from_slice(&0u32.to_le_bytes());
+            raw.extend_from_slice(body);
+            let frm_crc = crc32c_append(crc32c_checksum(&raw[0..12]), &raw[FRAME_HEADER_LEN..]);
+            raw[12..16].copy_from_slice(&frm_crc.to_le_bytes());
+            raw
+        };
+
+        // AC4: Illegal body-length lower bound (`FRAME_BODY_LEN < 3`: 0, 1, 2) rejected
+        // fail-closed as `CorruptHeader` by both `validate_frame_body_len` and `decode_frame`
+        // (even when no body bytes follow, never misclassified as `TruncatedTail`).
+        for bad_len in [0u32, 1u32, 2u32] {
+            assert_eq!(
+                validate_frame_body_len(bad_len),
+                Err(FrameDecodeError::CorruptHeader {
+                    detail: "frame body length below minimum 3 bytes",
+                }),
+                "AC4: validate_frame_body_len({bad_len}) must reject < 3"
+            );
+            let hdr_only = craft_header_only(bad_len);
+            assert_eq!(
+                decode_frame(&hdr_only),
+                Err(FrameDecodeError::CorruptHeader {
+                    detail: "frame body length below minimum 3 bytes",
+                }),
+                "AC4: header-only frame with body_len={bad_len} must reject as CorruptHeader"
+            );
+            let full = craft_full(&vec![0u8; bad_len as usize]);
+            assert_eq!(
+                decode_frame(&full),
+                Err(FrameDecodeError::CorruptHeader {
+                    detail: "frame body length below minimum 3 bytes",
+                }),
+                "AC4: full valid-CRC frame with body_len={bad_len} must reject as CorruptHeader"
+            );
+        }
+
+        // Upper-bound pre-allocation guard: `FRAME_BODY_LEN == MAX_FRAME_BODY_LEN + 1`
+        // (and `u32::MAX`) rejected as `CorruptHeader` before inspecting body or allocating.
+        for huge_len in [MAX_FRAME_BODY_LEN + 1, u32::MAX] {
+            assert_eq!(
+                validate_frame_body_len(huge_len),
+                Err(FrameDecodeError::CorruptHeader {
+                    detail: "frame body length exceeds MAX_FRAME_BODY_LEN",
+                })
+            );
+            let hdr_only = craft_header_only(huge_len);
+            assert_eq!(
+                decode_frame(&hdr_only),
+                Err(FrameDecodeError::CorruptHeader {
+                    detail: "frame body length exceeds MAX_FRAME_BODY_LEN",
+                })
+            );
+        }
+
+        // Component-level decoded bounds: valid-CRC frames whose total body_len <= MAX_FRAME_BODY_LEN
+        // still cannot smuggle `dedup_key > 512 B` or `payload > 4 MiB`!
+        let mut smuggled_key_body = Vec::with_capacity(FRAME_BODY_FIXED_OVERHEAD + 513);
+        smuggled_key_body.push(FRAME_FLAG_NONE);
+        smuggled_key_body.extend_from_slice(&513u16.to_le_bytes());
+        smuggled_key_body.extend_from_slice(&vec![b'a'; 513]);
+        assert_eq!(
+            decode_frame(&craft_full(&smuggled_key_body)),
+            Err(FrameDecodeError::CorruptPayload {
+                detail: "dedup_key length exceeds MAX_FRAME_DEDUP_KEY_LEN",
+            })
+        );
+
+        let mut smuggled_payload_body =
+            Vec::with_capacity(FRAME_BODY_FIXED_OVERHEAD + 1 + MAX_FRAME_PAYLOAD_LEN + 1);
+        smuggled_payload_body.push(FRAME_FLAG_NONE);
+        smuggled_payload_body.extend_from_slice(&1u16.to_le_bytes());
+        smuggled_payload_body.push(b'k');
+        smuggled_payload_body.resize(
+            smuggled_payload_body.len() + MAX_FRAME_PAYLOAD_LEN + 1,
+            0x77,
+        );
+        assert_eq!(
+            decode_frame(&craft_full(&smuggled_payload_body)),
+            Err(FrameDecodeError::CorruptPayload {
+                detail: "payload length exceeds MAX_FRAME_PAYLOAD_LEN",
+            })
+        );
+
+        // Codex R1 P1 regression: streaming bounded postcard serialization MUST stop
+        // immediately once the versioned envelope crosses 4 MiB without materializing
+        // a giant virtual input (1 GiB logical payload).
+        struct GiantVirtualStream {
+            total_chunks: usize,
+            emitted_chunks: std::sync::atomic::AtomicUsize,
+        }
+        impl Serialize for GiantVirtualStream {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                use serde::ser::SerializeSeq;
+                let mut seq = serializer.serialize_seq(Some(self.total_chunks))?;
+                let chunk = [0x42u8; 64 * 1024]; // 64 KiB per chunk
+                for _ in 0..self.total_chunks {
+                    let count = self
+                        .emitted_chunks
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                        + 1;
+                    // 4 MiB / 64 KiB = 64 chunks; fail hard if serializer ever kept running past 80 chunks!
+                    assert!(
+                        count <= 80,
+                        "bounded postcard serializer failed to stop early at 4 MiB (emitted {count} chunks)"
+                    );
+                    seq.serialize_element(&chunk.as_slice())?;
+                }
+                seq.end()
+            }
+        }
+        let giant = GiantVirtualStream {
+            total_chunks: 16_384, // 1 GiB logical payload!
+            emitted_chunks: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let giant_err = encode_postcard_frame(FRAME_FLAG_NONE, "bounded-stream-key", 1, &giant)
+            .expect_err("1 GiB virtual stream must fail closed at 4 MiB bound");
+        assert!(matches!(
+            giant_err,
+            FrameEncodeError::PayloadTooLarge {
+                len,
+                max: MAX_FRAME_PAYLOAD_LEN
+            } if len > MAX_FRAME_PAYLOAD_LEN
+        ));
+        let emitted = giant
+            .emitted_chunks
+            .load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            (64..=66).contains(&emitted),
+            "expected bounded serializer to abort right at 4 MiB (~64-65 chunks), emitted {emitted}"
         );
     }
 }
