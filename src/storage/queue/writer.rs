@@ -1013,6 +1013,11 @@ fn open_and_verify_sealed_segment(
         .ok_or_else(|| StorageBackendError::CorruptCommittedFrame {
             detail: "capture queue sealed segment missing from LTM2 sealed table".to_string(),
         })?;
+    if required_boundary.is_some_and(|req| req > sealed_entry.sealed_len) {
+        return Err(StorageBackendError::CorruptCommittedFrame {
+            detail: "capture queue DB highwater exceeds LTM2 sealed_len".to_string(),
+        });
+    }
     let (mut file, actual_len) = open_lane_segment_readonly(queue_root, lane, seg_id)?;
     if actual_len != sealed_entry.sealed_len {
         return Err(StorageBackendError::CorruptCommittedFrame {
@@ -2919,6 +2924,8 @@ mod tests {
     struct RecordedBatchCall {
         lane: CaptureQueueLane,
         item_count: usize,
+        applied_count: usize,
+        deduplicated_count: usize,
         dedup_keys: Vec<String>,
         highwater: CaptureQueueHighwater,
         db_highwater_after: CaptureQueueHighwater,
@@ -3205,6 +3212,8 @@ mod tests {
                 let recorded = RecordedBatchCall {
                     lane,
                     item_count: items.len(),
+                    applied_count: outcome.applied_count,
+                    deduplicated_count: outcome.deduplicated_count,
                     dedup_keys: items.iter().map(|i| i.dedup_key.clone()).collect(),
                     highwater: outcome.highwater.unwrap_or(hw),
                     db_highwater_after,
@@ -10197,6 +10206,736 @@ mod tests {
                         }
                         other => panic!("unexpected payload: {other:?}"),
                     }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn consumer_drained_active_then_rotated_16mib_and_case_c_empty_advance() {
+        // `RB-09h` AC1 & AC2 (`ADR-RB-05` #4 ② (c)):
+        // Verify on BOTH `normal/` and `priority/` lanes:
+        // - AC1 (16 MiB regular rotation interleaving): Consumer drains active
+        //   segment `S = 0` to `(0, committed_len)` (~15 MiB via 5 real ~3 MiB
+        //   frames). Producer then triggers a genuine 16 MiB regular rotation
+        //   (`CAPTURE_QUEUE_SEGMENT_ROTATION_BYTES`) appending a 6th ~2 MiB frame
+        //   into `events-00000001.log` and sealing `seg 0` in `LTM2.sealed[]`.
+        //   Consumer authenticates `LTM2.sealed[0]`, executes a single-tx atomic
+        //   zero-frame `CaptureStore::append_capture_batch(&[], (1, 0))` (0 items,
+        //   0 redundant business rows, `tx_delta == 1`, DB hw == `(1, 0)`), then
+        //   drains `seg 1` cleanly.
+        // - AC2 (Case C Step C2 rotation interleaving): Consumer drains active
+        //   segment `S = 0` to `(0, committed_len)`. A damaged half-frame crash
+        //   tail is appended, and producer recovery (`append_postcard_frame` in
+        //   sub-case 2a and `recover_lane` in sub-case 2b) runs Case C Step C2
+        //   sealing `seg 0` at `sealed_len == old_committed_len` and rotating to
+        //   `S + 1 = 1`. Consumer authenticates `LTM2.sealed[0]` and executes
+        //   single-tx `CaptureStore::append_capture_batch(&[], (1, 0))` with ZERO
+        //   redundant business rows.
+        use std::io::Write as _;
+
+        let row_count_for = |store: RedbCaptureStore, lane: CaptureQueueLane| async move {
+            match lane {
+                CaptureQueueLane::Normal => store
+                    .list_audit_logs_by_checkpoint(TEST_AUDIT_CHECKPOINT_ID)
+                    .await
+                    .unwrap()
+                    .len(),
+                CaptureQueueLane::Priority => {
+                    store.list_sessions_by_started_desc().await.unwrap().len()
+                }
+            }
+        };
+
+        for lane in [CaptureQueueLane::Normal, CaptureQueueLane::Priority] {
+            let lane_label = lane_subdir_name(lane);
+            let flags = match lane {
+                CaptureQueueLane::Priority => FRAME_FLAG_PRIORITY,
+                CaptureQueueLane::Normal => FRAME_FLAG_NONE,
+            };
+            let sized_payload_for = |tag: &str, seq: i64, pad_bytes: usize| match lane {
+                CaptureQueueLane::Priority => {
+                    let mut rec = match make_session_payload(
+                        tag,
+                        CaptureSessionState::Stopped,
+                        1_700_110_000 + seq,
+                    ) {
+                        CaptureBatchPayload::UpsertSession(r) => r,
+                        _ => unreachable!(),
+                    };
+                    if pad_bytes > 0 {
+                        rec.metadata_json = format!(r#"{{"pad":"{}"}}"#, "p".repeat(pad_bytes));
+                    }
+                    CaptureBatchPayload::UpsertSession(rec)
+                }
+                CaptureQueueLane::Normal => {
+                    let mut rec = match make_audit_payload(
+                        tag,
+                        &format!("2026-11-24T10:00:{:02}Z", seq % 60),
+                    ) {
+                        CaptureBatchPayload::AppendAuditLog(r) => r,
+                        _ => unreachable!(),
+                    };
+                    if pad_bytes > 0 {
+                        rec.justification = Some("n".repeat(pad_bytes));
+                    }
+                    CaptureBatchPayload::AppendAuditLog(rec)
+                }
+            };
+
+            // =================================================================
+            // AC1: Drained active `S = 0` -> genuine 16 MiB regular rotation ->
+            // atomic zero-frame `append_capture_batch(&[], (1, 0))` + 0 extra rows.
+            // =================================================================
+            {
+                let repo = tempdir().expect("tempdir");
+                let init = init_capture_queue(repo.path()).expect("init capture queue");
+                let lane_dir = match lane {
+                    CaptureQueueLane::Normal => init.paths.normal.clone(),
+                    CaptureQueueLane::Priority => init.paths.priority.clone(),
+                };
+                let store = RedbCaptureStore::create(
+                    repo.path()
+                        .join(PRIVATE_SUBDIR)
+                        .join("capture.gen-0001.redb"),
+                )
+                .await
+                .expect("create RedbCaptureStore");
+                let setup_spy = SpyCaptureStore::new(store.clone(), init.paths.root.clone());
+
+                // Append 5 × 3 MiB frames (~15 MiB < 16 MiB) staying inside `seg 0`.
+                let mut seg0_committed_len = 0u64;
+                for i in 0..5usize {
+                    let out = append_postcard_frame(
+                        repo.path(),
+                        lane,
+                        flags,
+                        &format!("rb09h:ac1:{lane_label}:big:{i}"),
+                        CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                        &sized_payload_for(
+                            &format!("rb09h-ac1-{lane_label}-big-{i}"),
+                            i as i64,
+                            3 * 1024 * 1024,
+                        ),
+                    )
+                    .expect("enqueue 3 MiB frame inside seg 0");
+                    assert_eq!(out.meta.active_seg, 0);
+                    seg0_committed_len = out.meta.committed_len;
+                }
+                assert!(
+                    seg0_committed_len > 15 * 1024 * 1024
+                        && seg0_committed_len
+                            < crate::storage::queue::CAPTURE_QUEUE_SEGMENT_ROTATION_BYTES,
+                    "seg 0 should sit between 15 MiB and 16 MiB before rotation"
+                );
+
+                // Drain active `seg 0` completely: DB highwater stops at `(0, seg0_committed_len)`.
+                let pre_rep = drain_capture_queue(repo.path(), &setup_spy)
+                    .await
+                    .expect("drain 5 x 3 MiB active seg 0 frames");
+                assert_eq!(pre_rep.applied_frames, 5);
+                assert_eq!(
+                    store.get_queue_highwater(lane).await.unwrap(),
+                    CaptureQueueHighwater {
+                        segment_id: 0,
+                        byte_offset: seg0_committed_len,
+                    }
+                );
+                assert_eq!(row_count_for(store.clone(), lane).await, 5);
+
+                // Producer appends a 6th ~2 MiB frame -> exceeds 16 MiB -> REAL 16 MiB rotation!
+                let rot_payload =
+                    sized_payload_for(&format!("rb09h-ac1-{lane_label}-rot-5"), 5, 2 * 1024 * 1024);
+                let rot_out = append_postcard_frame(
+                    repo.path(),
+                    lane,
+                    flags,
+                    &format!("rb09h:ac1:{lane_label}:rot:5"),
+                    CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                    &rot_payload,
+                )
+                .expect("6th frame crossing 16 MiB must trigger real regular rotation");
+                assert_eq!(rot_out.meta.active_seg, 1);
+                assert_eq!(rot_out.meta.min_live_seg, 0);
+                assert_eq!(rot_out.meta.sealed.len(), 1);
+                assert_eq!(rot_out.meta.sealed[0].seg_id, 0);
+                assert_eq!(rot_out.meta.sealed[0].sealed_len, seg0_committed_len);
+                assert!(lane_dir.join(segment_log_file_name(0)).exists());
+                assert!(lane_dir.join(segment_log_file_name(1)).exists());
+
+                // Run consumer: first tx MUST be `append_capture_batch(&[], (1, 0))`
+                // with 0 items and 0 redundant business rows added!
+                let spy = SpyCaptureStore::new(store.clone(), init.paths.root.clone());
+                let rep = drain_capture_queue(repo.path(), &spy).await.expect(
+                    "AC1: consumer empty-advance + seg 1 drain after 16 MiB rotation must succeed",
+                );
+                assert_eq!(rep.applied_frames, 1);
+                assert_eq!(rep.deduplicated_frames, 0);
+                assert_eq!(rep.reclaimed_segments, 1);
+
+                let calls = spy.recorded_calls();
+                assert_eq!(
+                    calls.len(),
+                    2,
+                    "AC1 ({lane_label}): expected [empty-advance (1,0), seg 1 batch]"
+                );
+                assert_eq!(calls[0].lane, lane);
+                assert_eq!(
+                    calls[0].item_count, 0,
+                    "AC1 ({lane_label}): first batch must be zero-frame empty advance"
+                );
+                assert_eq!(calls[0].applied_count, 0);
+                assert_eq!(calls[0].deduplicated_count, 0);
+                assert!(calls[0].dedup_keys.is_empty());
+                assert_eq!(calls[0].tx_delta, 1);
+                assert!(calls[0].append_lock_was_free);
+                assert_eq!(
+                    calls[0].db_highwater_after,
+                    CaptureQueueHighwater {
+                        segment_id: 1,
+                        byte_offset: 0,
+                    },
+                    "AC1 ({lane_label}): empty-advance tx must atomically advance DB highwater to (1, 0)"
+                );
+
+                assert_eq!(calls[1].lane, lane);
+                assert_eq!(calls[1].item_count, 1);
+                assert_eq!(calls[1].applied_count, 1);
+                assert_eq!(calls[1].deduplicated_count, 0);
+                assert_eq!(calls[1].tx_delta, 1);
+                assert_eq!(
+                    calls[1].db_highwater_after,
+                    CaptureQueueHighwater {
+                        segment_id: 1,
+                        byte_offset: rot_out.meta.committed_len,
+                    }
+                );
+                assert_eq!(
+                    row_count_for(store.clone(), lane).await,
+                    6,
+                    "AC1 ({lane_label}): exact 5 + 1 = 6 business rows (zero redundant rows)"
+                );
+                assert!(!lane_dir.join(segment_log_file_name(0)).exists());
+            }
+
+            // =================================================================
+            // AC2a: Drained active `S = 0` -> producer `append_postcard_frame`
+            // triggers Case C Step C2 sealing `S = 0` and writing `S + 1 = 1`.
+            // =================================================================
+            {
+                let repo = tempdir().expect("tempdir");
+                let init = init_capture_queue(repo.path()).expect("init capture queue");
+                let lane_dir = match lane {
+                    CaptureQueueLane::Normal => init.paths.normal.clone(),
+                    CaptureQueueLane::Priority => init.paths.priority.clone(),
+                };
+                let store = RedbCaptureStore::create(
+                    repo.path()
+                        .join(PRIVATE_SUBDIR)
+                        .join("capture.gen-0001.redb"),
+                )
+                .await
+                .expect("create RedbCaptureStore");
+                let setup_spy = SpyCaptureStore::new(store.clone(), init.paths.root.clone());
+
+                let mut l3 = 0u64;
+                for i in 0..3usize {
+                    let out = append_postcard_frame(
+                        repo.path(),
+                        lane,
+                        flags,
+                        &format!("rb09h:ac2a:{lane_label}:pre:{i}"),
+                        CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                        &sized_payload_for(
+                            &format!("rb09h-ac2a-{lane_label}-pre-{i}"),
+                            i as i64,
+                            0,
+                        ),
+                    )
+                    .unwrap();
+                    l3 = out.meta.committed_len;
+                }
+                let _ = drain_capture_queue(repo.path(), &setup_spy).await.unwrap();
+                assert_eq!(
+                    store.get_queue_highwater(lane).await.unwrap(),
+                    CaptureQueueHighwater {
+                        segment_id: 0,
+                        byte_offset: l3,
+                    }
+                );
+                assert_eq!(row_count_for(store.clone(), lane).await, 3);
+
+                // Inject damaged half-frame tail after drained `l3`.
+                let half = encode_postcard_frame(
+                    flags,
+                    &format!("rb09h:ac2a:{lane_label}:half"),
+                    CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                    &sized_payload_for(&format!("rb09h-ac2a-{lane_label}-half"), 99, 0),
+                )
+                .unwrap();
+                {
+                    let mut f = fs::OpenOptions::new()
+                        .append(true)
+                        .open(lane_dir.join(segment_log_file_name(0)))
+                        .unwrap();
+                    f.write_all(&half[..half.len() / 2]).unwrap();
+                    f.sync_data().unwrap();
+                }
+
+                // Producer appends new frame -> triggers Case C Step C2 sealing `seg 0`
+                // at `l3` and creating `seg 1` with the new frame!
+                let next_out = append_postcard_frame(
+                    repo.path(),
+                    lane,
+                    flags,
+                    &format!("rb09h:ac2a:{lane_label}:s1:0"),
+                    CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                    &sized_payload_for(&format!("rb09h-ac2a-{lane_label}-s1-0"), 10, 0),
+                )
+                .expect("producer append must run Case C Step C2 and rotate to seg 1");
+                assert_eq!(next_out.meta.active_seg, 1);
+                assert_eq!(next_out.meta.sealed.len(), 1);
+                assert_eq!(next_out.meta.sealed[0].seg_id, 0);
+                assert_eq!(next_out.meta.sealed[0].sealed_len, l3);
+
+                let spy = SpyCaptureStore::new(store.clone(), init.paths.root.clone());
+                let rep = drain_capture_queue(repo.path(), &spy).await.expect(
+                    "AC2a: consumer empty-advance + seg 1 drain after Step C2 must succeed",
+                );
+                assert_eq!(rep.applied_frames, 1);
+                assert_eq!(rep.deduplicated_frames, 0);
+                assert_eq!(rep.reclaimed_segments, 1);
+
+                let calls = spy.recorded_calls();
+                assert_eq!(calls.len(), 2);
+                assert_eq!(calls[0].item_count, 0);
+                assert!(calls[0].dedup_keys.is_empty());
+                assert_eq!(calls[0].tx_delta, 1);
+                assert!(calls[0].append_lock_was_free);
+                assert_eq!(
+                    calls[0].db_highwater_after,
+                    CaptureQueueHighwater {
+                        segment_id: 1,
+                        byte_offset: 0,
+                    }
+                );
+                assert_eq!(calls[1].item_count, 1);
+                assert_eq!(
+                    calls[1].db_highwater_after,
+                    CaptureQueueHighwater {
+                        segment_id: 1,
+                        byte_offset: next_out.meta.committed_len,
+                    }
+                );
+                assert_eq!(row_count_for(store.clone(), lane).await, 4);
+            }
+
+            // =================================================================
+            // AC2b: Drained active `S = 0` -> Case C Step C2 leaves empty `S + 1 = 1`
+            // (0 frames in `seg 1`) -> consumer runs EXACTLY ONE zero-frame tx
+            // advancing DB highwater to `(1, 0)` with 0 business rows added!
+            // =================================================================
+            {
+                let repo = tempdir().expect("tempdir");
+                let init = init_capture_queue(repo.path()).expect("init capture queue");
+                let lane_dir = match lane {
+                    CaptureQueueLane::Normal => init.paths.normal.clone(),
+                    CaptureQueueLane::Priority => init.paths.priority.clone(),
+                };
+                let store = RedbCaptureStore::create(
+                    repo.path()
+                        .join(PRIVATE_SUBDIR)
+                        .join("capture.gen-0001.redb"),
+                )
+                .await
+                .expect("create RedbCaptureStore");
+                let setup_spy = SpyCaptureStore::new(store.clone(), init.paths.root.clone());
+
+                let mut l2 = 0u64;
+                for i in 0..2usize {
+                    let out = append_postcard_frame(
+                        repo.path(),
+                        lane,
+                        flags,
+                        &format!("rb09h:ac2b:{lane_label}:pre:{i}"),
+                        CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                        &sized_payload_for(
+                            &format!("rb09h-ac2b-{lane_label}-pre-{i}"),
+                            i as i64,
+                            0,
+                        ),
+                    )
+                    .unwrap();
+                    l2 = out.meta.committed_len;
+                }
+                let _ = drain_capture_queue(repo.path(), &setup_spy).await.unwrap();
+                assert_eq!(row_count_for(store.clone(), lane).await, 2);
+
+                let half = encode_postcard_frame(
+                    flags,
+                    &format!("rb09h:ac2b:{lane_label}:half"),
+                    CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                    &sized_payload_for(&format!("rb09h-ac2b-{lane_label}-half"), 99, 0),
+                )
+                .unwrap();
+                {
+                    let mut f = fs::OpenOptions::new()
+                        .append(true)
+                        .open(lane_dir.join(segment_log_file_name(0)))
+                        .unwrap();
+                    f.write_all(&half[..half.len() / 2]).unwrap();
+                    f.sync_data().unwrap();
+                }
+
+                // Trigger Case C Step C2 via `recover_lane` -> seals `seg 0` at `l2` and creates empty `seg 1`.
+                let rec = crate::storage::queue::recover_lane(repo.path(), lane).unwrap();
+                assert_eq!(rec.meta.active_seg, 1);
+                assert_eq!(rec.meta.committed_len, 0);
+                assert_eq!(rec.meta.sealed.len(), 1);
+                assert_eq!(rec.meta.sealed[0].sealed_len, l2);
+
+                let spy = SpyCaptureStore::new(store.clone(), init.paths.root.clone());
+                let tx_before = store.write_transaction_count();
+                let rep = drain_capture_queue(repo.path(), &spy)
+                    .await
+                    .expect("AC2b: consumer single zero-frame advance to empty seg 1 must succeed");
+                let tx_after = store.write_transaction_count();
+
+                assert_eq!(tx_after - tx_before, 1);
+                assert_eq!(rep.applied_frames, 0);
+                assert_eq!(rep.deduplicated_frames, 0);
+                assert_eq!(rep.reclaimed_segments, 1);
+                let calls = spy.recorded_calls();
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].item_count, 0);
+                assert!(calls[0].dedup_keys.is_empty());
+                assert_eq!(calls[0].tx_delta, 1);
+                assert!(calls[0].append_lock_was_free);
+                assert_eq!(
+                    calls[0].db_highwater_after,
+                    CaptureQueueHighwater {
+                        segment_id: 1,
+                        byte_offset: 0,
+                    }
+                );
+                assert_eq!(
+                    store.get_queue_highwater(lane).await.unwrap(),
+                    CaptureQueueHighwater {
+                        segment_id: 1,
+                        byte_offset: 0,
+                    }
+                );
+                assert_eq!(
+                    read_highwater_mirror(&init.paths.root)
+                        .unwrap()
+                        .unwrap()
+                        .get(lane),
+                    CaptureQueueHighwater {
+                        segment_id: 1,
+                        byte_offset: 0,
+                    }
+                );
+                assert_eq!(
+                    row_count_for(store.clone(), lane).await,
+                    2,
+                    "AC2b ({lane_label}): zero-frame advance must insert ZERO redundant business rows"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn consumer_drained_rotated_bitflip_truncation_missing_and_oob_hw_rejected() {
+        // `RB-09h` AC3–AC6 (`ADR-RB-05` #4 ② (c)):
+        // Verify on BOTH `normal/` and `priority/` lanes that in the drained-then-rotated
+        // state (`S < active_seg && hw_offset == sealed_len(S)`), BEFORE executing any
+        // zero-frame highwater advance:
+        // - AC3: Bitflipping ANY byte (first / middle / last) of `events-<S>.log`
+        //   fails closed with `CorruptCommittedFrame` (`LBR-IO-001`), 0 DB tx, 0 HW advance,
+        //   and 0 disk mutation.
+        // - AC4: Truncating `events-<S>.log` — including exact complete-frame `CleanEof`
+        //   boundary truncation (explicitly verified with `FrameStreamDecoder`), mid-frame
+        //   truncation, and 0-byte truncation — fails closed with `CorruptCommittedFrame`
+        //   (`LBR-IO-001`), 0 DB tx, 0 HW advance, and 0 disk mutation.
+        // - AC5: Deleting `events-<S>.log` fails closed with `CorruptCommittedFrame`
+        //   (`LBR-IO-001`), 0 DB tx, 0 HW advance, and 0 disk mutation.
+        // - AC6: Out-of-bounds DB highwater `hw_offset > LTM2.sealed[S].sealed_len`
+        //   (`+1` and `+64`) immediately fails closed with `CorruptCommittedFrame`
+        //   (`LBR-IO-001`), 0 DB tx, 0 HW advance, and 0 disk mutation (plus direct
+        //   `compute_next_highwater` unit guard).
+        use std::io::Write as _;
+
+        for lane in [CaptureQueueLane::Normal, CaptureQueueLane::Priority] {
+            let lane_label = lane_subdir_name(lane);
+            let flags = match lane {
+                CaptureQueueLane::Priority => FRAME_FLAG_PRIORITY,
+                CaptureQueueLane::Normal => FRAME_FLAG_NONE,
+            };
+            let payload_for = |tag: &str, seq: i64| match lane {
+                CaptureQueueLane::Priority => {
+                    make_session_payload(tag, CaptureSessionState::Stopped, 1_700_120_000 + seq)
+                }
+                CaptureQueueLane::Normal => {
+                    make_audit_payload(tag, &format!("2026-11-24T11:00:{:02}Z", seq % 60))
+                }
+            };
+
+            let repo = tempdir().expect("tempdir");
+            let init = init_capture_queue(repo.path()).expect("init capture queue");
+            bootstrap_writer_lock(&init.paths.root);
+            let lane_dir = match lane {
+                CaptureQueueLane::Normal => init.paths.normal.clone(),
+                CaptureQueueLane::Priority => init.paths.priority.clone(),
+            };
+            let store = RedbCaptureStore::create(
+                repo.path()
+                    .join(PRIVATE_SUBDIR)
+                    .join("capture.gen-0001.redb"),
+            )
+            .await
+            .expect("create RedbCaptureStore");
+            let spy = SpyCaptureStore::new(store.clone(), init.paths.root.clone());
+
+            // Seed 3 frames into `seg 0`, recording exact frame boundaries `[l1, l2, l3]`.
+            let mut offsets = Vec::with_capacity(3);
+            for i in 0..3usize {
+                let out = append_postcard_frame(
+                    repo.path(),
+                    lane,
+                    flags,
+                    &format!("rb09h:guard:{lane_label}:s0:{i}"),
+                    CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                    &payload_for(&format!("rb09h-guard-{lane_label}-s0-{i}"), i as i64),
+                )
+                .unwrap();
+                offsets.push(out.meta.committed_len);
+            }
+            let l2 = offsets[1];
+            let sealed_len = offsets[2];
+
+            // Drain active `seg 0` -> DB `hw` sits at `(0, sealed_len)`.
+            let pre_rep = drain_capture_queue(repo.path(), &spy).await.unwrap();
+            assert_eq!(pre_rep.applied_frames, 3);
+            let hw_drained = CaptureQueueHighwater {
+                segment_id: 0,
+                byte_offset: sealed_len,
+            };
+            assert_eq!(store.get_queue_highwater(lane).await.unwrap(), hw_drained);
+
+            // Trigger Case C Step C2 sealing `seg 0` at `sealed_len` and creating `seg 1` with 1 frame.
+            let half = encode_postcard_frame(
+                flags,
+                &format!("rb09h:guard:{lane_label}:half"),
+                CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                &payload_for(&format!("rb09h-guard-{lane_label}-half"), 99),
+            )
+            .unwrap();
+            let seg0_path = lane_dir.join(segment_log_file_name(0));
+            {
+                let mut f = fs::OpenOptions::new()
+                    .append(true)
+                    .open(&seg0_path)
+                    .unwrap();
+                f.write_all(&half[..half.len() / 2]).unwrap();
+                f.sync_data().unwrap();
+            }
+            let rot_out = append_postcard_frame(
+                repo.path(),
+                lane,
+                flags,
+                &format!("rb09h:guard:{lane_label}:s1:0"),
+                CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                &payload_for(&format!("rb09h-guard-{lane_label}-s1-0"), 10),
+            )
+            .unwrap();
+            assert_eq!(rot_out.meta.active_seg, 1);
+            assert_eq!(rot_out.meta.sealed.len(), 1);
+            assert_eq!(rot_out.meta.sealed[0].sealed_len, sealed_len);
+
+            let orig_seg0 = fs::read(&seg0_path).unwrap();
+            assert_eq!(orig_seg0.len() as u64, sealed_len);
+            let mirror_path = highwater_mirror_path(&init.paths.root);
+            let orig_mirror = fs::read(&mirror_path).unwrap();
+
+            let assert_rejected =
+                |err: StorageBackendError,
+                 label: &str,
+                 tx_before: u64,
+                 calls_before: usize,
+                 expected_hw: CaptureQueueHighwater,
+                 tree_before: &std::collections::BTreeMap<String, Vec<u8>>| {
+                    assert_corrupt_committed_frame(err, label);
+                    assert_eq!(
+                        store.write_transaction_count(),
+                        tx_before,
+                        "{label}: zero DB write transactions allowed on fail-closed reject"
+                    );
+                    assert_eq!(
+                        spy.recorded_calls().len(),
+                        calls_before,
+                        "{label}: zero append_capture_batch calls allowed on fail-closed reject"
+                    );
+                    assert_eq!(
+                        fs::read(&mirror_path).unwrap(),
+                        orig_mirror,
+                        "{label}: external highwater mirror must remain unchanged"
+                    );
+                    assert_eq!(
+                        snapshot_queue_tree_full(&init.paths.root),
+                        *tree_before,
+                        "{label}: entire queue directory tree must remain byte-identical"
+                    );
+                    let _ = expected_hw;
+                };
+
+            // =================================================================
+            // AC3: Bitflip first, middle, and last byte of `events-00000000.log`.
+            // =================================================================
+            for (pos_label, pos) in [
+                ("first-byte", 0usize),
+                ("middle-byte", orig_seg0.len() / 2),
+                ("last-byte", orig_seg0.len() - 1),
+            ] {
+                let mut flipped = orig_seg0.clone();
+                flipped[pos] ^= 0x01;
+                write_bytes_0600(&seg0_path, &flipped);
+                let tree_before = snapshot_queue_tree_full(&init.paths.root);
+                let tx_before = store.write_transaction_count();
+                let calls_before = spy.recorded_calls().len();
+                let err = drain_capture_queue(repo.path(), &spy)
+                    .await
+                    .expect_err("AC3: bitflip in drained sealed seg 0 must fail closed");
+                assert_rejected(
+                    err,
+                    &format!("AC3 ({lane_label}, {pos_label})"),
+                    tx_before,
+                    calls_before,
+                    hw_drained,
+                    &tree_before,
+                );
+                assert_eq!(store.get_queue_highwater(lane).await.unwrap(), hw_drained);
+            }
+
+            // =================================================================
+            // AC4: Truncation — (a) exact complete-frame `CleanEof` boundary `l2`,
+            // (b) mid-frame truncation, (c) 0-byte truncation.
+            // =================================================================
+            {
+                let truncated_clean = orig_seg0[..l2 as usize].to_vec();
+                // Explicitly confirm `FrameStreamDecoder` yields 2 valid frames + `CleanEof(l2)`!
+                let mut cursor = std::io::Cursor::new(&truncated_clean);
+                let mut dec = FrameStreamDecoder::with_known_len(&mut cursor, 0, l2);
+                let mut decoded_count = 0usize;
+                loop {
+                    match dec
+                        .next_frame()
+                        .expect("complete-frame truncation decodes cleanly")
+                    {
+                        FrameStreamItem::Frame { .. } => decoded_count += 1,
+                        FrameStreamItem::CleanEof { offset } => {
+                            assert_eq!(offset, l2);
+                            break;
+                        }
+                    }
+                }
+                assert_eq!(decoded_count, 2);
+
+                for (trunc_label, trunc_len) in [
+                    ("complete-frame-CleanEof", l2 as usize),
+                    ("mid-frame", (l2 as usize) + 10),
+                    ("zero-byte", 0usize),
+                ] {
+                    write_bytes_0600(&seg0_path, &orig_seg0[..trunc_len]);
+                    let tree_before = snapshot_queue_tree_full(&init.paths.root);
+                    let tx_before = store.write_transaction_count();
+                    let calls_before = spy.recorded_calls().len();
+                    let err = drain_capture_queue(repo.path(), &spy)
+                        .await
+                        .expect_err("AC4: truncated drained sealed seg 0 must fail closed");
+                    assert_rejected(
+                        err,
+                        &format!("AC4 ({lane_label}, {trunc_label})"),
+                        tx_before,
+                        calls_before,
+                        hw_drained,
+                        &tree_before,
+                    );
+                    assert_eq!(store.get_queue_highwater(lane).await.unwrap(), hw_drained);
+                }
+            }
+
+            // =================================================================
+            // AC5: Missing `events-00000000.log`.
+            // =================================================================
+            {
+                fs::remove_file(&seg0_path).unwrap();
+                let tree_before = snapshot_queue_tree_full(&init.paths.root);
+                let tx_before = store.write_transaction_count();
+                let calls_before = spy.recorded_calls().len();
+                let err = drain_capture_queue(repo.path(), &spy)
+                    .await
+                    .expect_err("AC5: missing drained sealed seg 0 must fail closed");
+                assert_rejected(
+                    err,
+                    &format!("AC5 ({lane_label}, missing-seg0)"),
+                    tx_before,
+                    calls_before,
+                    hw_drained,
+                    &tree_before,
+                );
+                assert_eq!(store.get_queue_highwater(lane).await.unwrap(), hw_drained);
+            }
+
+            // =================================================================
+            // AC6: Out-of-bounds DB highwater `hw_offset > LTM2.sealed[0].sealed_len`.
+            // =================================================================
+            {
+                write_bytes_0600(&seg0_path, &orig_seg0);
+
+                // Also directly confirm `compute_next_highwater` rejects OOB offsets.
+                let oob_hw_unit = CaptureQueueHighwater {
+                    segment_id: 0,
+                    byte_offset: sealed_len + 1,
+                };
+                let unit_err = compute_next_highwater(oob_hw_unit, &rot_out.meta, sealed_len + 1)
+                    .expect_err("compute_next_highwater must reject hw_offset > sealed_len");
+                assert_corrupt_committed_frame(unit_err, "AC6 compute_next_highwater OOB guard");
+
+                for delta in [1u64, 64u64] {
+                    let oob_hw = CaptureQueueHighwater {
+                        segment_id: 0,
+                        byte_offset: sealed_len + delta,
+                    };
+                    let _ = store
+                        .append_capture_batch(&[], Some((lane, oob_hw)))
+                        .await
+                        .expect("seed OOB DB highwater for AC6");
+                    assert_eq!(store.get_queue_highwater(lane).await.unwrap(), oob_hw);
+
+                    let tree_before = snapshot_queue_tree_full(&init.paths.root);
+                    let tx_before = store.write_transaction_count();
+                    let calls_before = spy.recorded_calls().len();
+                    let err = drain_capture_queue(repo.path(), &spy)
+                        .await
+                        .expect_err("AC6: hw_offset > sealed_len(S) must fail closed");
+                    let err_msg = format!("{err}");
+                    assert!(
+                        err_msg.contains("sealed_len"),
+                        "AC6 ({lane_label}, +{delta}): expected sealed_len diagnostic, got {err_msg}"
+                    );
+                    assert_rejected(
+                        err,
+                        &format!("AC6 ({lane_label}, oob+{delta})"),
+                        tx_before,
+                        calls_before,
+                        oob_hw,
+                        &tree_before,
+                    );
+                    assert_eq!(
+                        store.get_queue_highwater(lane).await.unwrap(),
+                        oob_hw,
+                        "AC6 ({lane_label}, +{delta}): DB highwater must NOT advance past OOB value"
+                    );
                 }
             }
         }
