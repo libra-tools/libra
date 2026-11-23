@@ -270,6 +270,73 @@ impl CaptureQueueWriter {
         drop(lock_guard);
         Ok(report)
     }
+
+    /// Acquire `writer.lock`, validate both lanes read-only against authoritative
+    /// DB `QUEUE_HIGHWATER_*` and `LTM2` (`[0, committed_len)` + `LTM2.sealed[]`),
+    /// and if `lane` has an uncommitted tail (`actual_len > committed_len`),
+    /// Case D successor (`max_live_seg > active_seg`), or post-reclaim crash
+    /// orphan (`seg < min_live_seg`), delegate shared Case C/D recovery strictly
+    /// under `writer.lock -> capture-queue/append.lock` (`ADR-RB-05` #4 ②, `RB-09e`).
+    ///
+    /// Guarantees:
+    /// - NEVER calls [`CaptureStore::append_capture_batch`] (zero DB writes under
+    ///   `append.lock`).
+    /// - NEVER modifies DB `QUEUE_HIGHWATER_*` or the external `highwater` mirror.
+    /// - Returns `Ok(None)` when another consumer holds `writer.lock` or when
+    ///   `lane` has no uncommitted tail / successor / crash orphan to recover.
+    pub async fn recover_lane_uncommitted_tail(
+        &self,
+        lane: CaptureQueueLane,
+        store: &dyn CaptureStore,
+    ) -> StorageResult<Option<LaneRecoveryReport>> {
+        let Some(lock_guard) = try_acquire_writer_lock_at_root(&self.queue_root)? else {
+            return Ok(None);
+        };
+        let mut observer = WriterObserver::new();
+        let report = recover_lane_uncommitted_tail_locked(
+            &self.queue_root,
+            lane,
+            store,
+            &lock_guard,
+            &mut observer,
+        )
+        .await?;
+        drop(lock_guard);
+        Ok(report)
+    }
+}
+
+async fn recover_lane_uncommitted_tail_locked(
+    queue_root: &Path,
+    lane: CaptureQueueLane,
+    store: &dyn CaptureStore,
+    writer_lock: &WriterLockGuard,
+    observer: &mut WriterObserver,
+) -> StorageResult<Option<LaneRecoveryReport>> {
+    let hw_snapshot = load_authoritative_highwater(store).await?;
+    preflight_validate_lane(queue_root, CaptureQueueLane::Priority, hw_snapshot.priority)?;
+    preflight_validate_lane(queue_root, CaptureQueueLane::Normal, hw_snapshot.normal)?;
+
+    let ConsumerLaneSnapshot::Populated { meta, seg_ids } =
+        inspect_lane_readonly(queue_root, lane)?
+    else {
+        return Ok(None);
+    };
+    let has_reclaimed_orphan = seg_ids.iter().any(|&seg| seg < meta.min_live_seg);
+    let max_live_seg = seg_ids
+        .iter()
+        .copied()
+        .filter(|&seg| seg >= meta.min_live_seg)
+        .max()
+        .ok_or_else(|| StorageBackendError::CorruptCommittedFrame {
+            detail: "capture queue lane has no live segment files >= min_live_seg".to_string(),
+        })?;
+    let (_active_file, actual_len) = open_lane_segment_readonly(queue_root, lane, meta.active_seg)?;
+    if actual_len > meta.committed_len || max_live_seg > meta.active_seg || has_reclaimed_orphan {
+        let rec = call_recover_lane(queue_root, lane, writer_lock, observer).await?;
+        return Ok(Some(rec));
+    }
+    Ok(None)
 }
 
 /// Convenience entry point: acquire `writer.lock` and drain `<storage_dir>/private/capture-queue`
@@ -2834,9 +2901,10 @@ mod tests {
         },
         queue::{
             CaptureQueueOccupancy, FRAME_FLAG_NONE, FRAME_FLAG_PRIORITY,
-            QUEUE_TAIL_META_BAK_TMP_FILE, QUEUE_TAIL_META_TMP_FILE, QueueAppendOptions,
-            SealedSegmentMeta, append_postcard_frame, crc32c_checksum, encode_postcard_frame,
-            highwater::read_highwater_mirror,
+            QUARANTINE_DIAGNOSTIC_CODE, QUEUE_TAIL_META_BAK_TMP_FILE, QUEUE_TAIL_META_TMP_FILE,
+            QueueAppendOptions, SealedSegmentMeta, append_postcard_frame, crc32c_checksum,
+            encode_postcard_frame,
+            highwater::{highwater_mirror_path, read_highwater_mirror},
             init_capture_queue, read_converged_lane_tail_meta,
             segment::{
                 append_encoded_frame_in_storage_dir_with_observer, reclaim_sealed_segment_at_root,
@@ -7889,6 +7957,680 @@ mod tests {
                 snapshot_queue_tree_full(&init.paths.root),
                 tree_before_bad_reclaim
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn consumer_tail_recovery_delegates_case_c_without_advancing_hw() {
+        // `RB-09e` AC1, AC2, AC3, AC4 & AC6 (`ADR-RB-05` #4 ②):
+        // - AC1: Under `writer.lock -> capture-queue/append.lock` after verifying
+        //   `[0, committed_len)`, real-crash `actual_len > committed_len` delegates
+        //   to shared two-step Case C recovery: preserves `[committed_len, recovered_valid_end)`
+        //   and quarantines ONLY `[recovered_valid_end, actual_len)` into `quarantine/`.
+        // - AC2: Damaged tail quarantine records exact diagnostic code `LBR-AGENT-050`.
+        // - AC3: When `append.lock` is released after recovery, DB `QUEUE_HIGHWATER_*`
+        //   is strictly unchanged (zero premature highwater advance).
+        // - AC4: When `append.lock` is released after recovery, external `highwater`
+        //   mirror file is strictly byte-identical (zero premature mirror update).
+        // - AC6: Consumer NEVER calls `CaptureStore::append_capture_batch` while
+        //   holding `append.lock`.
+        // Verified on BOTH `normal/` and `priority/` lanes across BOTH:
+        // (1) Real `drain_locked_at_root` flow (probing exact state inside
+        //     `on_after_append_lock_recovery` immediately after `append.lock` release
+        //     and strictly before any DB batch write, then completing ingestion);
+        // (2) `CaptureQueueWriter::recover_lane_uncommitted_tail` with unconsumed
+        //     committed backlog `[hw_offset, committed_len)` + synced tail + half-frame,
+        //     plus fail-closed rejection when `[0, committed_len)` itself is corrupt.
+        use std::io::Write as _;
+
+        for lane in [CaptureQueueLane::Normal, CaptureQueueLane::Priority] {
+            let lane_label = lane_subdir_name(lane);
+            let flags = match lane {
+                CaptureQueueLane::Priority => FRAME_FLAG_PRIORITY,
+                CaptureQueueLane::Normal => FRAME_FLAG_NONE,
+            };
+            let payload_for = |tag: &str, seq: i64| match lane {
+                CaptureQueueLane::Priority => {
+                    make_session_payload(tag, CaptureSessionState::Stopped, 1_700_050_000 + seq)
+                }
+                CaptureQueueLane::Normal => make_audit_payload(tag, "2026-11-24T05:00:00Z"),
+            };
+
+            // =================================================================
+            // Scenario 1: Real `drain_locked_at_root` with drained committed
+            // prefix + real-crash synced frames + damaged half-frame tail.
+            // =================================================================
+            {
+                let repo = tempdir().expect("tempdir");
+                let init = init_capture_queue(repo.path()).expect("init capture queue");
+                let lane_dir = match lane {
+                    CaptureQueueLane::Normal => init.paths.normal.clone(),
+                    CaptureQueueLane::Priority => init.paths.priority.clone(),
+                };
+                let store = RedbCaptureStore::create(
+                    repo.path()
+                        .join(PRIVATE_SUBDIR)
+                        .join("capture.gen-0001.redb"),
+                )
+                .await
+                .expect("create RedbCaptureStore");
+                let spy = SpyCaptureStore::new(store.clone(), init.paths.root.clone());
+
+                // Commit 2 frames and drain them so DB `hw` and external `highwater`
+                // mirror both sit at `(0, l2)`.
+                let mut l2 = 0u64;
+                for i in 0..2u32 {
+                    let out = append_postcard_frame(
+                        repo.path(),
+                        lane,
+                        flags,
+                        &format!("rb09e:s1:{lane_label}:pre:{i}"),
+                        CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                        &payload_for(&format!("rb09e-s1-{lane_label}-pre-{i}"), i64::from(i)),
+                    )
+                    .expect("enqueue pre-crash committed frame");
+                    l2 = out.meta.committed_len;
+                }
+                let pre_rep = drain_capture_queue(repo.path(), &spy)
+                    .await
+                    .expect("drain pre-crash frames");
+                assert_eq!(pre_rep.applied_frames, 2);
+                let hw_before = CaptureQueueHighwater {
+                    segment_id: 0,
+                    byte_offset: l2,
+                };
+                assert_eq!(store.get_queue_highwater(lane).await.unwrap(), hw_before);
+                let mirror_path = highwater_mirror_path(&init.paths.root);
+                let mirror_bytes_before =
+                    fs::read(&mirror_path).expect("external mirror must exist before crash");
+
+                // Inject real producer crash: 2 complete synced frames (`f2`, `f3`)
+                // followed by a truncated partial half-frame (`f4_half`), while
+                // `LTM2` remains at `committed_len == l2`!
+                let f2_dedup = format!("rb09e:s1:{lane_label}:tail:2");
+                let f2_payload = payload_for(&format!("rb09e-s1-{lane_label}-tail-2"), 2);
+                let f2_bytes = encode_postcard_frame(
+                    flags,
+                    &f2_dedup,
+                    CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                    &f2_payload,
+                )
+                .unwrap();
+
+                let f3_dedup = format!("rb09e:s1:{lane_label}:tail:3");
+                let f3_payload = payload_for(&format!("rb09e-s1-{lane_label}-tail-3"), 3);
+                let f3_bytes = encode_postcard_frame(
+                    flags,
+                    &f3_dedup,
+                    CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                    &f3_payload,
+                )
+                .unwrap();
+
+                let f4_full = encode_postcard_frame(
+                    flags,
+                    &format!("rb09e:s1:{lane_label}:half:4"),
+                    CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                    &payload_for(&format!("rb09e-s1-{lane_label}-half-4"), 4),
+                )
+                .unwrap();
+                let damaged_tail = f4_full[..f4_full.len() / 2].to_vec();
+                let valid_end = l2 + f2_bytes.len() as u64 + f3_bytes.len() as u64;
+
+                let seg0_path = lane_dir.join(segment_log_file_name(0));
+                {
+                    let mut f = fs::OpenOptions::new()
+                        .append(true)
+                        .open(&seg0_path)
+                        .expect("open seg 0 for simulated crash tail");
+                    f.write_all(&f2_bytes).unwrap();
+                    f.write_all(&f3_bytes).unwrap();
+                    f.write_all(&damaged_tail).unwrap();
+                    f.sync_data().unwrap();
+                }
+
+                // Run real `drain_locked_at_root` and verify AC1–AC4 + AC6 at the
+                // exact moment `append.lock` is released (strictly before any DB batch write!).
+                let tx_before = store.write_transaction_count();
+                let verified_at_recovery = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let verified_hook = Arc::clone(&verified_at_recovery);
+                let store_hook = store.clone();
+                let tracked_calls = Arc::new(Mutex::new(Vec::<RecordedBatchCall>::new()));
+                let spy_calls_hook = Arc::clone(&tracked_calls);
+                let mirror_path_hook = mirror_path.clone();
+                let mirror_bytes_hook = mirror_bytes_before.clone();
+                let damaged_tail_hook = damaged_tail.clone();
+                let quarantine_dir_hook = init.paths.quarantine.clone();
+
+                let lock = try_acquire_writer_lock_at_root(&init.paths.root)
+                    .unwrap()
+                    .unwrap();
+                let mut obs = WriterObserver::with_recovery_hooks(
+                    move |rec_lane| {
+                        assert_eq!(rec_lane, lane);
+                    },
+                    move |rec| {
+                        // AC1: preserved `[l2, valid_end)` (2 frames) and quarantined ONLY `[valid_end, actual_len)` + sealed `seg 0` -> `seg 1`.
+                        assert_eq!(rec.recovered_frames, 2);
+                        assert_eq!(rec.recovered_bytes, valid_end - l2);
+                        assert_eq!(rec.meta.active_seg, 1);
+                        assert_eq!(rec.meta.sealed.len(), 1);
+                        assert_eq!(rec.meta.sealed[0].seg_id, 0);
+                        assert_eq!(rec.meta.sealed[0].sealed_len, valid_end);
+
+                        // AC2: exact diagnostic code `LBR-AGENT-050` + exact damaged bytes in `quarantine/`.
+                        assert_eq!(rec.quarantined_artifacts.len(), 1);
+                        let qa = &rec.quarantined_artifacts[0];
+                        assert_eq!(
+                            qa.diagnostic_code, QUARANTINE_DIAGNOSTIC_CODE,
+                            "AC2 ({lane_label}): expected LBR-AGENT-050"
+                        );
+                        assert_eq!(qa.diagnostic_code, "LBR-AGENT-050");
+                        assert!(
+                            qa.bin_path.starts_with(&quarantine_dir_hook),
+                            "AC1 ({lane_label}): quarantine artifact must live under quarantine/"
+                        );
+                        let q_bytes =
+                            fs::read(&qa.bin_path).expect("read quarantined damaged tail artifact");
+                        assert_eq!(
+                            q_bytes, damaged_tail_hook,
+                            "AC1 ({lane_label}): quarantine artifact must hold ONLY [recovered_valid_end, actual_len)"
+                        );
+
+                        // AC3 & AC6: 0 DB writes and 0 `append_capture_batch` calls on actual passed store under `append.lock`!
+                        assert_eq!(
+                            store_hook.write_transaction_count(),
+                            tx_before,
+                            "AC3/AC6 ({lane_label}): zero DB write tx allowed during append.lock recovery"
+                        );
+                        assert_eq!(
+                            spy_calls_hook.lock().unwrap().len(),
+                            0,
+                            "AC6 ({lane_label}): append_capture_batch must NEVER be called during append.lock recovery"
+                        );
+
+                        // AC4: external `highwater` mirror file strictly byte-identical on disk!
+                        assert_eq!(
+                            fs::read(&mirror_path_hook).unwrap(),
+                            mirror_bytes_hook,
+                            "AC4 ({lane_label}): external highwater mirror must be unchanged on append.lock release"
+                        );
+
+                        verified_hook.store(true, std::sync::atomic::Ordering::Release);
+                    },
+                );
+                let mut spy_tracked = SpyCaptureStore::new_with_lock_tracking(
+                    store.clone(),
+                    init.paths.root.clone(),
+                    obs.consumer_holds_append_lock_handle(),
+                    Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                );
+                spy_tracked.calls = tracked_calls;
+                let rep = drain_locked_at_root(
+                    &init.paths.root,
+                    &spy_tracked,
+                    QueueWriterOptions::default(),
+                    &lock,
+                    &mut obs,
+                )
+                .await
+                .expect("drain after Case C tail recovery must succeed");
+                drop(lock);
+
+                assert!(
+                    verified_at_recovery.load(std::sync::atomic::Ordering::Acquire),
+                    "recovery hook must have fired and verified AC1–AC4 & AC6"
+                );
+                assert!(
+                    obs.segment_events
+                        .contains(&SegmentOpEvent::Phase1Classified {
+                            lane: lane_label,
+                            kind: "CaseCRecoverTail",
+                        }),
+                    "AC1 ({lane_label}): recovery must classify CaseCRecoverTail"
+                );
+                assert_eq!(rep.recovery_delegations, 1);
+                assert_eq!(rep.applied_frames, 2);
+                assert_eq!(rep.deduplicated_frames, 0);
+                assert_eq!(rep.reclaimed_segments, 1);
+
+                let post_calls = spy_tracked.recorded_calls();
+                assert_eq!(post_calls.len(), 1);
+                assert!(
+                    post_calls[0].append_lock_was_free,
+                    "AC6 ({lane_label}): DB write after recovery must run with append.lock FREE"
+                );
+                assert_eq!(post_calls[0].dedup_keys, vec![f2_dedup, f3_dedup]);
+                assert_eq!(
+                    store.get_queue_highwater(lane).await.unwrap(),
+                    CaptureQueueHighwater {
+                        segment_id: 1,
+                        byte_offset: 0,
+                    }
+                );
+                for expected in [&f2_payload, &f3_payload] {
+                    match expected {
+                        CaptureBatchPayload::AppendAuditLog(rec) => {
+                            let got = store.get_audit_log(&rec.audit_id).await.unwrap().unwrap();
+                            assert_eq!(&got, rec);
+                        }
+                        CaptureBatchPayload::UpsertSession(rec) => {
+                            let got = store.get_session(&rec.session_id).await.unwrap().unwrap();
+                            assert_eq!(&got, rec);
+                        }
+                        other => panic!("unexpected payload: {other:?}"),
+                    }
+                }
+            }
+
+            // =================================================================
+            // Scenario 2: `CaptureQueueWriter::recover_lane_uncommitted_tail`
+            // with unconsumed committed backlog `[hw_offset, committed_len)` +
+            // synced tail + damaged half-frame (direct AC1–AC4 & AC6 proof
+            // with explicit DB highwater query right after `append.lock` release),
+            // plus fail-closed guard when `[0, committed_len)` is corrupt.
+            // =================================================================
+            {
+                let repo = tempdir().expect("tempdir");
+                let init = init_capture_queue(repo.path()).expect("init capture queue");
+                bootstrap_writer_lock(&init.paths.root);
+                let lane_dir = match lane {
+                    CaptureQueueLane::Normal => init.paths.normal.clone(),
+                    CaptureQueueLane::Priority => init.paths.priority.clone(),
+                };
+                let store = RedbCaptureStore::create(
+                    repo.path()
+                        .join(PRIVATE_SUBDIR)
+                        .join("capture.gen-0001.redb"),
+                )
+                .await
+                .expect("create RedbCaptureStore");
+                let spy = SpyCaptureStore::new(store.clone(), init.paths.root.clone());
+
+                // Drain 1 frame -> DB `hw` and mirror sit at `(0, l1)`.
+                let f0_out = append_postcard_frame(
+                    repo.path(),
+                    lane,
+                    flags,
+                    &format!("rb09e:s2:{lane_label}:0"),
+                    CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                    &payload_for(&format!("rb09e-s2-{lane_label}-0"), 0),
+                )
+                .unwrap();
+                let l1 = f0_out.meta.committed_len;
+                let _ = drain_capture_queue(repo.path(), &spy).await.unwrap();
+                let hw_before = CaptureQueueHighwater {
+                    segment_id: 0,
+                    byte_offset: l1,
+                };
+                let mirror_path = highwater_mirror_path(&init.paths.root);
+                let mirror_bytes_before = fs::read(&mirror_path).unwrap();
+
+                // Append 2 committed backlog frames (`[l1, l3)`), NOT drained yet!
+                let mut l3 = l1;
+                for i in 1..=2u32 {
+                    let out = append_postcard_frame(
+                        repo.path(),
+                        lane,
+                        flags,
+                        &format!("rb09e:s2:{lane_label}:{i}"),
+                        CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                        &payload_for(&format!("rb09e-s2-{lane_label}-{i}"), i64::from(i)),
+                    )
+                    .unwrap();
+                    l3 = out.meta.committed_len;
+                }
+
+                // Append 1 valid synced frame + 1 damaged half-frame after `l3`.
+                let f3_bytes = encode_postcard_frame(
+                    flags,
+                    &format!("rb09e:s2:{lane_label}:tail:3"),
+                    CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                    &payload_for(&format!("rb09e-s2-{lane_label}-tail-3"), 3),
+                )
+                .unwrap();
+                let damaged = b"RB09E_PARTIAL_CORRUPT_TAIL".to_vec();
+                let valid_end = l3 + f3_bytes.len() as u64;
+                let seg0_path = lane_dir.join(segment_log_file_name(0));
+                {
+                    let mut f = fs::OpenOptions::new()
+                        .append(true)
+                        .open(&seg0_path)
+                        .unwrap();
+                    f.write_all(&f3_bytes).unwrap();
+                    f.write_all(&damaged).unwrap();
+                    f.sync_data().unwrap();
+                }
+
+                // Negative guard: if committed prefix `[0, l3)` is bitflipped,
+                // `recover_lane_uncommitted_tail` MUST fail closed BEFORE acquiring
+                // `append.lock` or quarantining anything!
+                let saved_seg0 = fs::read(&seg0_path).unwrap();
+                let mut bad_prefix = saved_seg0.clone();
+                bad_prefix[(l1 / 2) as usize] ^= 0x80;
+                write_bytes_0600(&seg0_path, &bad_prefix);
+                let tree_before_bad = snapshot_queue_tree_full(&init.paths.root);
+                let bad_err = CaptureQueueWriter::in_storage_dir(repo.path())
+                    .recover_lane_uncommitted_tail(lane, &spy)
+                    .await
+                    .expect_err("corrupt committed prefix must fail closed before Case C recovery");
+                assert_corrupt_committed_frame(bad_err, "RB-09e corrupt committed prefix guard");
+                assert_eq!(snapshot_queue_tree_full(&init.paths.root), tree_before_bad);
+                assert_eq!(fs::read_dir(&init.paths.quarantine).unwrap().count(), 0);
+                write_bytes_0600(&seg0_path, &saved_seg0);
+
+                // Now invoke real `recover_lane_uncommitted_tail`:
+                let tx_before = store.write_transaction_count();
+                let calls_before = spy.recorded_calls().len();
+                let rec = CaptureQueueWriter::in_storage_dir(repo.path())
+                    .recover_lane_uncommitted_tail(lane, &spy)
+                    .await
+                    .expect("recover_lane_uncommitted_tail must succeed")
+                    .expect("must return Some(LaneRecoveryReport)");
+
+                // AC1 & AC2:
+                assert_eq!(rec.recovered_frames, 1);
+                assert_eq!(rec.recovered_bytes, f3_bytes.len() as u64);
+                assert_eq!(rec.quarantined_artifacts.len(), 1);
+                assert_eq!(
+                    rec.quarantined_artifacts[0].diagnostic_code,
+                    QUARANTINE_DIAGNOSTIC_CODE
+                );
+                assert!(
+                    rec.quarantined_artifacts[0]
+                        .bin_path
+                        .starts_with(&init.paths.quarantine)
+                );
+                assert_eq!(
+                    fs::read(&rec.quarantined_artifacts[0].bin_path).unwrap(),
+                    damaged
+                );
+                assert_eq!(rec.meta.active_seg, 1);
+                assert_eq!(rec.meta.sealed[0].sealed_len, valid_end);
+
+                // AC3: DB `QUEUE_HIGHWATER_*` strictly unchanged at `(0, l1)`!
+                assert_eq!(
+                    store.get_queue_highwater(lane).await.unwrap(),
+                    hw_before,
+                    "AC3 ({lane_label}): DB highwater must remain completely unchanged after recovery"
+                );
+                // AC4: external `highwater` mirror strictly byte-identical!
+                assert_eq!(
+                    fs::read(&mirror_path).unwrap(),
+                    mirror_bytes_before,
+                    "AC4 ({lane_label}): external highwater mirror must remain byte-identical after recovery"
+                );
+                // AC6: zero DB write transactions & zero `append_capture_batch` calls!
+                assert_eq!(store.write_transaction_count(), tx_before);
+                assert_eq!(spy.recorded_calls().len(), calls_before);
+                assert!(probe_append_lock_is_free(&init.paths.root));
+                assert!(!is_writer_active(repo.path()).unwrap());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn consumer_pure_synced_tail_recovery_zero_quarantine_and_no_db_write_under_lock() {
+        // `RB-09e` AC5 & AC6 (`ADR-RB-05` #4 ②):
+        // - AC5: When `actual_len > committed_len` consists 100% of complete
+        //   valid CRC32C frames (`recovered_valid_end == actual_len`), consumer
+        //   recovery under `writer.lock -> append.lock` advances `LTM2`
+        //   `committed_len` in place (keeping `active_seg == S`), leaves
+        //   `quarantine/` 100% empty, and emits ZERO `LBR-AGENT-050`.
+        // - AC6 (+ AC3/AC4): Zero `CaptureStore::append_capture_batch` calls,
+        //   zero DB `QUEUE_HIGHWATER_*` changes, and zero external `highwater`
+        //   mirror mutations occur while holding `append.lock`.
+        // Verified on BOTH `normal/` and `priority/` lanes using REAL producer
+        // `SegmentCrashPoint::AfterSegmentSyncData` crash injection!
+        use std::io::Write as _;
+
+        for lane in [CaptureQueueLane::Normal, CaptureQueueLane::Priority] {
+            let lane_label = lane_subdir_name(lane);
+            let flags = match lane {
+                CaptureQueueLane::Priority => FRAME_FLAG_PRIORITY,
+                CaptureQueueLane::Normal => FRAME_FLAG_NONE,
+            };
+            let payload_for = |tag: &str, seq: i64| match lane {
+                CaptureQueueLane::Priority => {
+                    make_session_payload(tag, CaptureSessionState::Stopped, 1_700_060_000 + seq)
+                }
+                CaptureQueueLane::Normal => make_audit_payload(tag, "2026-11-24T05:10:00Z"),
+            };
+
+            let repo = tempdir().expect("tempdir");
+            let init = init_capture_queue(repo.path()).expect("init capture queue");
+            let lane_dir = match lane {
+                CaptureQueueLane::Normal => init.paths.normal.clone(),
+                CaptureQueueLane::Priority => init.paths.priority.clone(),
+            };
+            let store = RedbCaptureStore::create(
+                repo.path()
+                    .join(PRIVATE_SUBDIR)
+                    .join("capture.gen-0001.redb"),
+            )
+            .await
+            .expect("create RedbCaptureStore");
+            let spy = SpyCaptureStore::new(store.clone(), init.paths.root.clone());
+
+            // Drain initial frame `f0` -> DB `hw` & external mirror sit at `(0, l1)`.
+            let f0_out = append_postcard_frame(
+                repo.path(),
+                lane,
+                flags,
+                &format!("rb09e:ac5:{lane_label}:0"),
+                CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                &payload_for(&format!("rb09e-ac5-{lane_label}-0"), 0),
+            )
+            .unwrap();
+            let l1 = f0_out.meta.committed_len;
+            let _ = drain_capture_queue(repo.path(), &spy).await.unwrap();
+            let mirror_path = highwater_mirror_path(&init.paths.root);
+            let mirror_bytes_before = fs::read(&mirror_path).unwrap();
+
+            // Inject genuine producer crash right after `seg.sync_data()` and
+            // before `LTM2` commit (`SegmentCrashPoint::AfterSegmentSyncData`) for `f1`,
+            // plus a second complete synced frame `f2` (zero damaged bytes!).
+            let f1_dedup = format!("rb09e:ac5:{lane_label}:synced:1");
+            let f1_payload = payload_for(&format!("rb09e-ac5-{lane_label}-synced-1"), 1);
+            let f1_bytes = encode_postcard_frame(
+                flags,
+                &f1_dedup,
+                CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                &f1_payload,
+            )
+            .unwrap();
+            let mut crash_prod_obs =
+                SegmentObserver::with_crash(SegmentCrashPoint::AfterSegmentSyncData);
+            let _ = append_encoded_frame_in_storage_dir_with_observer(
+                repo.path(),
+                lane,
+                &f1_bytes,
+                QueueAppendOptions::default(),
+                &mut crash_prod_obs,
+            )
+            .expect_err("simulated AfterSegmentSyncData producer crash must fail");
+
+            let f2_dedup = format!("rb09e:ac5:{lane_label}:synced:2");
+            let f2_payload = payload_for(&format!("rb09e-ac5-{lane_label}-synced-2"), 2);
+            let f2_bytes = encode_postcard_frame(
+                flags,
+                &f2_dedup,
+                CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                &f2_payload,
+            )
+            .unwrap();
+            let seg0_path = lane_dir.join(segment_log_file_name(0));
+            {
+                let mut f = fs::OpenOptions::new()
+                    .append(true)
+                    .open(&seg0_path)
+                    .unwrap();
+                f.write_all(&f2_bytes).unwrap();
+                f.sync_data().unwrap();
+            }
+            let expected_l3 = l1 + f1_bytes.len() as u64 + f2_bytes.len() as u64;
+            assert_eq!(fs::metadata(&seg0_path).unwrap().len(), expected_l3);
+            assert_eq!(
+                read_converged_lane_tail_meta(&lane_dir)
+                    .unwrap()
+                    .committed_len,
+                l1
+            );
+
+            // Part 1: Run real `drain_locked_at_root` and verify AC5 & AC6 right
+            // upon `append.lock` release (strictly before any DB batch commits!).
+            let tx_before = store.write_transaction_count();
+            let verified_pure = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let verified_pure_hook = Arc::clone(&verified_pure);
+            let store_hook = store.clone();
+            let tracked_calls_p1 = Arc::new(Mutex::new(Vec::<RecordedBatchCall>::new()));
+            let spy_calls_hook_p1 = Arc::clone(&tracked_calls_p1);
+            let mirror_path_hook = mirror_path.clone();
+            let mirror_bytes_hook = mirror_bytes_before.clone();
+            let quarantine_dir_hook = init.paths.quarantine.clone();
+
+            let lock = try_acquire_writer_lock_at_root(&init.paths.root)
+                .unwrap()
+                .unwrap();
+            let mut obs = WriterObserver::with_recovery_hooks(
+                move |rec_lane| {
+                    assert_eq!(rec_lane, lane);
+                },
+                move |rec| {
+                    // AC5: `LTM2.committed_len` advanced in place to `expected_l3`,
+                    // active segment kept at `0`, ZERO quarantine artifacts, ZERO LBR-AGENT-050!
+                    assert_eq!(rec.recovered_frames, 2);
+                    assert_eq!(rec.recovered_bytes, expected_l3 - l1);
+                    assert_eq!(rec.meta.active_seg, 0);
+                    assert_eq!(rec.meta.committed_len, expected_l3);
+                    assert!(rec.meta.sealed.is_empty());
+                    assert!(
+                        rec.quarantined_artifacts.is_empty(),
+                        "AC5 ({lane_label}): pure synced tail must emit zero LBR-AGENT-050 artifacts"
+                    );
+                    assert_eq!(
+                        fs::read_dir(&quarantine_dir_hook).unwrap().count(),
+                        0,
+                        "AC5 ({lane_label}): quarantine/ must remain 100% empty"
+                    );
+                    // AC6 (+ AC3/AC4): zero DB write tx, zero `append_capture_batch` calls on actual passed store, & external mirror byte-identical!
+                    assert_eq!(
+                        store_hook.write_transaction_count(),
+                        tx_before,
+                        "AC6 ({lane_label}): zero DB write tx permitted during append.lock recovery"
+                    );
+                    assert_eq!(
+                        spy_calls_hook_p1.lock().unwrap().len(),
+                        0,
+                        "AC6 ({lane_label}): append_capture_batch must NEVER be called during append.lock recovery"
+                    );
+                    assert_eq!(
+                        fs::read(&mirror_path_hook).unwrap(),
+                        mirror_bytes_hook,
+                        "AC4/AC5 ({lane_label}): external highwater mirror must be unchanged on lock release"
+                    );
+                    verified_pure_hook.store(true, std::sync::atomic::Ordering::Release);
+                },
+            );
+            let mut spy_tracked = SpyCaptureStore::new_with_lock_tracking(
+                store.clone(),
+                init.paths.root.clone(),
+                obs.consumer_holds_append_lock_handle(),
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            );
+            spy_tracked.calls = tracked_calls_p1;
+            let rep = drain_locked_at_root(
+                &init.paths.root,
+                &spy_tracked,
+                QueueWriterOptions::default(),
+                &lock,
+                &mut obs,
+            )
+            .await
+            .expect("drain after pure synced tail recovery must succeed");
+            drop(lock);
+
+            assert!(verified_pure.load(std::sync::atomic::Ordering::Acquire));
+            assert!(
+                obs.segment_events
+                    .contains(&SegmentOpEvent::Phase1Classified {
+                        lane: lane_label,
+                        kind: "CaseCRecoverTail",
+                    })
+            );
+            assert_eq!(rep.recovery_delegations, 1);
+            assert_eq!(rep.applied_frames, 2);
+            assert_eq!(rep.deduplicated_frames, 0);
+            assert_eq!(fs::read_dir(&init.paths.quarantine).unwrap().count(), 0);
+            assert!(!lane_dir.join(segment_log_file_name(1)).exists());
+
+            let calls = spy_tracked.recorded_calls();
+            assert_eq!(calls.len(), 1);
+            assert!(
+                calls[0].append_lock_was_free,
+                "AC6 ({lane_label}): DB write after pure-tail recovery must run with append.lock FREE"
+            );
+            assert_eq!(calls[0].dedup_keys, vec![f1_dedup, f2_dedup]);
+            let hw_after_p1 = CaptureQueueHighwater {
+                segment_id: 0,
+                byte_offset: expected_l3,
+            };
+            assert_eq!(store.get_queue_highwater(lane).await.unwrap(), hw_after_p1);
+            for expected in [&f1_payload, &f2_payload] {
+                match expected {
+                    CaptureBatchPayload::AppendAuditLog(rec) => {
+                        let got = store.get_audit_log(&rec.audit_id).await.unwrap().unwrap();
+                        assert_eq!(&got, rec);
+                    }
+                    CaptureBatchPayload::UpsertSession(rec) => {
+                        let got = store.get_session(&rec.session_id).await.unwrap().unwrap();
+                        assert_eq!(&got, rec);
+                    }
+                    other => panic!("unexpected payload: {other:?}"),
+                }
+            }
+
+            // Part 2: Direct `CaptureQueueWriter::recover_lane_uncommitted_tail` on
+            // another `AfterSegmentSyncData` crash confirms zero DB tx, zero HW
+            // change, zero mirror change, and zero quarantine before drain runs.
+            let mirror_bytes_p2 = fs::read(&mirror_path).unwrap();
+            let f3_bytes = encode_postcard_frame(
+                flags,
+                &format!("rb09e:ac5:{lane_label}:synced:3"),
+                CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                &payload_for(&format!("rb09e-ac5-{lane_label}-synced-3"), 3),
+            )
+            .unwrap();
+            let mut crash_prod_obs2 =
+                SegmentObserver::with_crash(SegmentCrashPoint::AfterSegmentSyncData);
+            let _ = append_encoded_frame_in_storage_dir_with_observer(
+                repo.path(),
+                lane,
+                &f3_bytes,
+                QueueAppendOptions::default(),
+                &mut crash_prod_obs2,
+            )
+            .expect_err("simulated second AfterSegmentSyncData crash must fail");
+            let expected_l4 = expected_l3 + f3_bytes.len() as u64;
+
+            let tx_before_p2 = store.write_transaction_count();
+            let calls_before_p2 = spy.recorded_calls().len();
+            let rec2 = CaptureQueueWriter::in_storage_dir(repo.path())
+                .recover_lane_uncommitted_tail(lane, &spy)
+                .await
+                .expect("direct pure-tail recovery must succeed")
+                .expect("must recover pure synced frame f3");
+            assert_eq!(rec2.recovered_frames, 1);
+            assert_eq!(rec2.meta.active_seg, 0);
+            assert_eq!(rec2.meta.committed_len, expected_l4);
+            assert!(rec2.quarantined_artifacts.is_empty());
+            assert_eq!(fs::read_dir(&init.paths.quarantine).unwrap().count(), 0);
+            assert_eq!(store.write_transaction_count(), tx_before_p2);
+            assert_eq!(spy.recorded_calls().len(), calls_before_p2);
+            assert_eq!(store.get_queue_highwater(lane).await.unwrap(), hw_after_p1);
+            assert_eq!(fs::read(&mirror_path).unwrap(), mirror_bytes_p2);
+            assert!(probe_append_lock_is_free(&init.paths.root));
+            assert!(!is_writer_active(repo.path()).unwrap());
         }
     }
 }
