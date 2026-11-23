@@ -18449,4 +18449,434 @@ mod tests {
             );
         }
     }
+
+    /// `RB-08y` AC1–AC5: Subcase B1 primary replica (`tail.meta`) missing or
+    /// corrupt while backup (`tail.meta.bak`) is intact and authoritative:
+    /// - AC1 & AC2: With `tail.meta` deleted OR corrupted and a single-byte
+    ///   bitflip inside `[0, committed_len)`, Phase 1 returns
+    ///   `CorruptCommittedFrame` (`LBR-IO-001`) with exact byte-for-byte
+    ///   snapshot equality across lane directory & `quarantine/` (ZERO
+    ///   premature mirror repair of `tail.meta`, ZERO `.tmp` deletion).
+    /// - AC3 & AC4: With `tail.meta` deleted OR corrupted and active segment
+    ///   truncated to `actual_len < committed_len` (both clean prior-frame
+    ///   boundary and mid-frame), Phase 1 returns `CorruptCommittedFrame`
+    ///   (`LBR-IO-001`) with exact byte-for-byte snapshot zero mutation.
+    /// - AC5: When active segment prefix is intact, Phase 2 atomically
+    ///   rebuilds `tail.meta` via `tail.meta.tmp -> sync_data -> rename ->
+    ///   fsync_dir` byte-for-byte identical to authoritative `tail.meta.bak`
+    ///   (without overwriting `tail.meta.bak`), and subsequent enqueue works.
+    #[test]
+    fn subcase_b1_single_replica_loss_phase1_reject_and_phase2_mirror_repair() {
+        #[derive(Clone, Copy)]
+        enum PrimaryLossMode {
+            Deleted,
+            CorruptCrc,
+            TruncatedGarbage,
+            Oversized,
+        }
+
+        let apply_primary_loss = |lane_dir: &Path, mode: PrimaryLossMode| {
+            let primary_path = tail_meta_path(lane_dir);
+            match mode {
+                PrimaryLossMode::Deleted => {
+                    fs::remove_file(&primary_path).unwrap();
+                }
+                PrimaryLossMode::CorruptCrc => {
+                    let mut raw = fs::read(&primary_path).unwrap();
+                    let last = raw.len() - 1;
+                    raw[last] ^= 0x55;
+                    write_bytes_0600(&primary_path, &raw);
+                }
+                PrimaryLossMode::TruncatedGarbage => {
+                    write_bytes_0600(&primary_path, b"BAD-LTM2");
+                }
+                PrimaryLossMode::Oversized => {
+                    write_bytes_0600(&primary_path, &vec![0xaau8; LTM2_MAX_LEN + 64]);
+                }
+            }
+        };
+
+        // =====================================================================
+        // Part 1 — AC1 & AC2: Primary `tail.meta` missing/corrupt + committed
+        // prefix bitflip -> Phase 1 `LBR-IO-001` & zero premature mirror repair.
+        // =====================================================================
+        for (label, loss_mode) in [
+            ("b1-primary-deleted-bitflip", PrimaryLossMode::Deleted),
+            (
+                "b1-primary-corrupt-crc-bitflip",
+                PrimaryLossMode::CorruptCrc,
+            ),
+            (
+                "b1-primary-truncated-bitflip",
+                PrimaryLossMode::TruncatedGarbage,
+            ),
+            ("b1-primary-oversized-bitflip", PrimaryLossMode::Oversized),
+        ] {
+            let repo = tempdir().expect("tempdir");
+            let init = init_capture_queue(repo.path()).expect("init capture queue");
+            let normal_dir = &init.paths.normal;
+            let _f1 = append_frame(
+                repo.path(),
+                CaptureQueueLane::Normal,
+                FRAME_FLAG_NONE,
+                "rb08y-bitflip-1",
+                b"first-committed-frame",
+            )
+            .unwrap();
+            let f2 = append_frame(
+                repo.path(),
+                CaptureQueueLane::Normal,
+                FRAME_FLAG_NONE,
+                "rb08y-bitflip-2",
+                b"second-committed-frame",
+            )
+            .unwrap();
+
+            // Damage or delete primary `tail.meta`; keep `tail.meta.bak` intact.
+            apply_primary_loss(normal_dir, loss_mode);
+
+            // Flip 1 byte inside `[0, committed_len)`.
+            let seg0_path = normal_dir.join(segment_log_file_name(0));
+            let mut seg_bytes = fs::read(&seg0_path).unwrap();
+            assert_eq!(seg_bytes.len() as u64, f2.meta.committed_len);
+            let mid = seg_bytes.len() / 2;
+            seg_bytes[mid] ^= 0x04;
+            write_bytes_0600(&seg0_path, &seg_bytes);
+
+            // Plant `.tmp` files in lane & shared `quarantine/`.
+            write_bytes_0600(&normal_dir.join(QUEUE_TAIL_META_TMP_FILE), b"b1-meta-tmp");
+            write_bytes_0600(
+                &normal_dir.join(QUEUE_TAIL_META_BAK_TMP_FILE),
+                b"b1-bak-tmp",
+            );
+            write_bytes_0600(
+                &init.paths.quarantine.join("normal-orphan.tmp"),
+                b"b1-q-normal-tmp",
+            );
+            write_bytes_0600(
+                &init.paths.quarantine.join("priority-orphan.tmp"),
+                b"b1-q-priority-tmp",
+            );
+
+            let lane_before = snapshot_tree(normal_dir);
+            let q_before = snapshot_tree(&init.paths.quarantine);
+
+            let app_err = append_frame(
+                repo.path(),
+                CaptureQueueLane::Normal,
+                FRAME_FLAG_NONE,
+                "rb08y-incoming",
+                b"rejected",
+            )
+            .expect_err("AC1: Subcase B1 primary loss + prefix bitflip must fail closed");
+            assert!(
+                matches!(app_err, StorageBackendError::CorruptCommittedFrame { .. }),
+                "{label}: AC1 violated: expected CorruptCommittedFrame, got {app_err:?}"
+            );
+            assert_eq!(app_err.stable_code_str(), "LBR-IO-001");
+            assert_eq!(
+                snapshot_tree(normal_dir),
+                lane_before,
+                "{label}: AC2 violated — premature mirror repair or .tmp mutation in normal/"
+            );
+            assert_eq!(
+                snapshot_tree(&init.paths.quarantine),
+                q_before,
+                "{label}: AC2 violated — quarantine/ mutated"
+            );
+
+            let rec_err = recover_lane(repo.path(), CaptureQueueLane::Normal)
+                .expect_err("AC1 (recover_lane): Subcase B1 + bitflip must fail closed");
+            assert!(matches!(
+                rec_err,
+                StorageBackendError::CorruptCommittedFrame { .. }
+            ));
+            assert_eq!(rec_err.stable_code_str(), "LBR-IO-001");
+            assert_eq!(snapshot_tree(normal_dir), lane_before);
+            assert_eq!(snapshot_tree(&init.paths.quarantine), q_before);
+        }
+
+        // =====================================================================
+        // Part 2 — AC3 & AC4: Primary `tail.meta` missing/corrupt + short active
+        // segment (`actual_len < committed_len`, both CleanEof boundary & mid-frame
+        // across all 4 primary loss modes) -> Phase 1 `LBR-IO-001` & zero
+        // premature mirror repair.
+        // =====================================================================
+        for (loss_label, loss_mode) in [
+            ("deleted", PrimaryLossMode::Deleted),
+            ("corrupt-crc", PrimaryLossMode::CorruptCrc),
+            ("truncated", PrimaryLossMode::TruncatedGarbage),
+            ("oversized", PrimaryLossMode::Oversized),
+        ] {
+            for (trunc_label, clean_frame_boundary) in [("clean-eof", true), ("mid-frame", false)] {
+                let label = format!("b1-primary-{loss_label}-short-{trunc_label}");
+                let repo = tempdir().expect("tempdir");
+                let init = init_capture_queue(repo.path()).expect("init capture queue");
+                let normal_dir = &init.paths.normal;
+                let f1 = append_frame(
+                    repo.path(),
+                    CaptureQueueLane::Normal,
+                    FRAME_FLAG_NONE,
+                    "rb08y-short-1",
+                    b"frame-1-survives-trunc",
+                )
+                .unwrap();
+                let f2 = append_frame(
+                    repo.path(),
+                    CaptureQueueLane::Normal,
+                    FRAME_FLAG_NONE,
+                    "rb08y-short-2",
+                    b"frame-2-truncated",
+                )
+                .unwrap();
+
+                apply_primary_loss(normal_dir, loss_mode);
+
+                let seg0_path = normal_dir.join(segment_log_file_name(0));
+                let target_len = if clean_frame_boundary {
+                    f1.meta.committed_len
+                } else {
+                    f1.meta.committed_len + (f2.frame_len as u64 / 2)
+                };
+                {
+                    let f = fs::OpenOptions::new().write(true).open(&seg0_path).unwrap();
+                    f.set_len(target_len).unwrap();
+                    f.sync_data().unwrap();
+                }
+
+                write_bytes_0600(
+                    &normal_dir.join(QUEUE_TAIL_META_TMP_FILE),
+                    b"b1-short-meta-tmp",
+                );
+                write_bytes_0600(
+                    &init.paths.quarantine.join("normal-orphan.tmp"),
+                    b"b1-short-q-tmp",
+                );
+
+                let lane_before = snapshot_tree(normal_dir);
+                let q_before = snapshot_tree(&init.paths.quarantine);
+
+                let app_err = append_frame(
+                    repo.path(),
+                    CaptureQueueLane::Normal,
+                    FRAME_FLAG_NONE,
+                    "rb08y-short-incoming",
+                    b"rejected",
+                )
+                .expect_err("AC3: Subcase B1 primary loss + short segment must fail closed");
+                assert!(
+                    matches!(app_err, StorageBackendError::CorruptCommittedFrame { .. }),
+                    "{label}: AC3 violated: expected CorruptCommittedFrame, got {app_err:?}"
+                );
+                assert_eq!(app_err.stable_code_str(), "LBR-IO-001");
+                assert_eq!(
+                    snapshot_tree(normal_dir),
+                    lane_before,
+                    "{label}: AC4 violated — premature mirror repair or .tmp mutation in normal/"
+                );
+                assert_eq!(
+                    snapshot_tree(&init.paths.quarantine),
+                    q_before,
+                    "{label}: AC4 violated — quarantine/ mutated"
+                );
+
+                let rec_err = recover_lane(repo.path(), CaptureQueueLane::Normal)
+                    .expect_err("AC3 (recover_lane): Subcase B1 + short segment must fail closed");
+                assert!(matches!(
+                    rec_err,
+                    StorageBackendError::CorruptCommittedFrame { .. }
+                ));
+                assert_eq!(rec_err.stable_code_str(), "LBR-IO-001");
+                assert_eq!(snapshot_tree(normal_dir), lane_before);
+                assert_eq!(snapshot_tree(&init.paths.quarantine), q_before);
+            }
+        }
+
+        // =====================================================================
+        // Part 3 — AC5: Primary `tail.meta` missing OR corrupt (all 4 loss modes)
+        // + healthy intact segment -> Phase 2 atomically rebuilds `tail.meta`
+        // byte-for-byte equal to authoritative `tail.meta.bak` (both
+        // `recover_lane` and direct `append_frame` paths, even with stale
+        // `tail.meta.tmp` pre-planted).
+        // =====================================================================
+        for (label, loss_mode) in [
+            (
+                "b1-primary-deleted-healthy-repair",
+                PrimaryLossMode::Deleted,
+            ),
+            (
+                "b1-primary-corrupt-crc-healthy-repair",
+                PrimaryLossMode::CorruptCrc,
+            ),
+            (
+                "b1-primary-truncated-healthy-repair",
+                PrimaryLossMode::TruncatedGarbage,
+            ),
+            (
+                "b1-primary-oversized-healthy-repair",
+                PrimaryLossMode::Oversized,
+            ),
+        ] {
+            let repo = tempdir().expect("tempdir");
+            let init = init_capture_queue(repo.path()).expect("init capture queue");
+            let normal_dir = &init.paths.normal;
+            let f1 = append_frame(
+                repo.path(),
+                CaptureQueueLane::Normal,
+                FRAME_FLAG_NONE,
+                "rb08y-healthy-1",
+                b"healthy-committed-payload",
+            )
+            .unwrap();
+            let authoritative_bak = fs::read(tail_meta_bak_path(normal_dir)).unwrap();
+            assert_eq!(LaneTailMeta::decode(&authoritative_bak).unwrap(), f1.meta);
+
+            apply_primary_loss(normal_dir, loss_mode);
+            // Plant stale `tail.meta.tmp` to verify Phase 2 cleans it before
+            // `O_CREAT|O_EXCL` atomic mirror staging.
+            write_bytes_0600(
+                &normal_dir.join(QUEUE_TAIL_META_TMP_FILE),
+                b"stale-tmp-from-prior-crash",
+            );
+
+            let mut obs = SegmentObserver::new();
+            let rec = recover_lane_in_storage_dir(repo.path(), CaptureQueueLane::Normal, &mut obs)
+                .expect("AC5: Subcase B1 healthy primary repair must succeed");
+            assert!(
+                rec.mirrored_replica,
+                "{label}: expected mirrored_replica == true"
+            );
+            assert_eq!(rec.meta, f1.meta);
+
+            let rebuilt_primary = fs::read(tail_meta_path(normal_dir)).unwrap();
+            let post_bak = fs::read(tail_meta_bak_path(normal_dir)).unwrap();
+            assert_eq!(
+                rebuilt_primary, authoritative_bak,
+                "{label}: AC5 violated — rebuilt tail.meta bytes must equal authoritative tail.meta.bak"
+            );
+            assert_eq!(post_bak, authoritative_bak);
+            assert_eq!(LaneTailMeta::decode(&rebuilt_primary).unwrap(), f1.meta);
+            assert_eq!(LaneTailMeta::decode(&post_bak).unwrap(), f1.meta);
+            assert!(!normal_dir.join(QUEUE_TAIL_META_TMP_FILE).exists());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let mode = fs::metadata(tail_meta_path(normal_dir))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777;
+                assert_eq!(mode, 0o600);
+            }
+
+            // Observer verifies atomic mirror sequence strictly targeting primary
+            // `tail.meta` without touching authoritative `tail.meta.bak`.
+            let p_sync = obs
+                .events
+                .iter()
+                .position(|e| {
+                    *e == SegmentOpEvent::MetaTmpWriteAndSync {
+                        lane: QUEUE_LANE_NORMAL_DIR,
+                        tmp_name: QUEUE_TAIL_META_TMP_FILE,
+                        target_name: QUEUE_TAIL_META_FILE,
+                    }
+                })
+                .expect("AC5: primary MetaTmpWriteAndSync");
+            let p_ren = obs
+                .events
+                .iter()
+                .position(|e| {
+                    *e == SegmentOpEvent::MetaRename {
+                        lane: QUEUE_LANE_NORMAL_DIR,
+                        tmp_name: QUEUE_TAIL_META_TMP_FILE,
+                        target_name: QUEUE_TAIL_META_FILE,
+                    }
+                })
+                .expect("AC5: primary MetaRename");
+            let p_fsync = obs
+                .events
+                .iter()
+                .position(|e| {
+                    *e == SegmentOpEvent::FsyncLaneDirAfterMeta {
+                        lane: QUEUE_LANE_NORMAL_DIR,
+                        target_name: QUEUE_TAIL_META_FILE,
+                    }
+                })
+                .expect("AC5: primary FsyncLaneDirAfterMeta");
+            assert!(p_sync < p_ren && p_ren < p_fsync);
+            assert!(
+                !obs.events.iter().any(|e| matches!(
+                    e,
+                    SegmentOpEvent::MetaRename {
+                        target_name: QUEUE_TAIL_META_BAK_FILE,
+                        ..
+                    }
+                )),
+                "{label}: primary mirror repair must not rewrite authoritative tail.meta.bak"
+            );
+
+            // Subsequent append works cleanly and keeps both replicas synced.
+            let f2 = append_frame(
+                repo.path(),
+                CaptureQueueLane::Normal,
+                FRAME_FLAG_NONE,
+                "rb08y-healthy-2",
+                b"post-repair-append",
+            )
+            .expect("append after Subcase B1 primary mirror repair must succeed");
+            assert_eq!(
+                fs::read(tail_meta_path(normal_dir)).unwrap(),
+                fs::read(tail_meta_bak_path(normal_dir)).unwrap()
+            );
+            assert_eq!(read_converged_lane_tail_meta(normal_dir).unwrap(), f2.meta);
+        }
+
+        // Direct `append_frame` on healthy Subcase B1 (all 4 primary loss modes
+        // with pre-planted stale `tail.meta.tmp`) repairs and appends cleanly.
+        for (label, loss_mode) in [
+            ("b1-direct-deleted", PrimaryLossMode::Deleted),
+            ("b1-direct-corrupt-crc", PrimaryLossMode::CorruptCrc),
+            ("b1-direct-truncated", PrimaryLossMode::TruncatedGarbage),
+            ("b1-direct-oversized", PrimaryLossMode::Oversized),
+        ] {
+            let repo = tempdir().expect("tempdir");
+            let init = init_capture_queue(repo.path()).expect("init capture queue");
+            let normal_dir = &init.paths.normal;
+            let _f1 = append_frame(
+                repo.path(),
+                CaptureQueueLane::Normal,
+                FRAME_FLAG_NONE,
+                "rb08y-direct-1",
+                b"direct-1",
+            )
+            .unwrap();
+            apply_primary_loss(normal_dir, loss_mode);
+            write_bytes_0600(
+                &normal_dir.join(QUEUE_TAIL_META_TMP_FILE),
+                b"stale-direct-append-meta-tmp",
+            );
+            let f2 = append_frame(
+                repo.path(),
+                CaptureQueueLane::Normal,
+                FRAME_FLAG_NONE,
+                "rb08y-direct-2",
+                b"direct-2",
+            )
+            .unwrap_or_else(|err| {
+                panic!("{label}: direct append_frame on healthy Subcase B1 must succeed: {err:?}")
+            });
+            assert!(
+                !normal_dir.join(QUEUE_TAIL_META_TMP_FILE).exists(),
+                "{label}: stale tail.meta.tmp must be cleaned on direct append"
+            );
+            let raw_meta = fs::read(tail_meta_path(normal_dir)).unwrap();
+            let raw_bak = fs::read(tail_meta_bak_path(normal_dir)).unwrap();
+            assert_eq!(
+                raw_meta, raw_bak,
+                "{label}: replicas must match byte-for-byte"
+            );
+            assert_eq!(LaneTailMeta::decode(&raw_meta).unwrap(), f2.meta);
+            assert_eq!(LaneTailMeta::decode(&raw_bak).unwrap(), f2.meta);
+        }
+    }
 }
