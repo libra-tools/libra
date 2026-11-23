@@ -1179,6 +1179,52 @@ pub(crate) async fn run_diff_for_service(mut args: DiffArgs) -> Result<DiffOutpu
     Ok(result)
 }
 
+/// Like [`run_diff_for_service`], but also applies `--word-diff`/`--color-words`
+/// rewriting before the prefix transforms. Returns `CliResult` because the word
+/// rewrites report CLI-level errors.
+pub(crate) async fn run_diff_for_service_word_diff(
+    mut args: DiffArgs,
+    color_enabled: bool,
+) -> CliResult<DiffOutput> {
+    if util::require_repo().is_err() {
+        return Err(DiffError::NotInRepo.into());
+    }
+    resolve_positional_revisions(&mut args)
+        .await
+        .map_err(CliError::from)?;
+    let diff_algorithm = resolve_diff_algorithm(&args)?;
+    let pickaxe = parse_diff_pickaxe(&args)?;
+    let word_diff = resolve_word_diff_options(&args)?;
+    let config = resolve_diff_config(&args).await.map_err(CliError::from)?;
+    // `quiet` stays false: `apply_word_diff` skips the rewrite for a quiet
+    // service caller, which would silently drop `--word-diff` from the patch.
+    let output = OutputConfig {
+        // A JSON envelope would make `apply_word_diff` skip the rewrite, so the
+        // service variant renders the plain textual patch.
+        json_format: None,
+        color: if color_enabled {
+            ColorChoice::Always
+        } else {
+            ColorChoice::Never
+        },
+        pager: false,
+        quiet: false,
+        exit_code_on_warning: false,
+        progress: ProgressMode::None,
+        progress_preference: crate::utils::output::ProgressPreference::None,
+    };
+    let mut result = run_diff(&args, &output, &config, pickaxe.as_ref(), &diff_algorithm)
+        .await
+        .map_err(CliError::from)?;
+    if !result.external_diff_applied {
+        if word_diff.mode.is_some() {
+            apply_word_diff(&args, &word_diff, &mut result, &output, false)?;
+        }
+        apply_diff_prefixes(&mut result, &config.prefixes);
+    }
+    Ok(result)
+}
+
 /// Whether `--word-diff` is set to a rendering mode (i.e. not `none`/absent), in
 /// which case the diff body is already fully rendered and must not be re-colored.
 fn word_diff_active(args: &DiffArgs) -> bool {

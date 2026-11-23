@@ -320,6 +320,27 @@ pub struct LogArgs {
     #[clap(long = "dirstat-by-file", value_name = "PARAM", num_args = 0..=1, default_missing_value = "", require_equals = true)]
     pub dirstat_by_file: Option<String>,
 
+    /// Show word-level diffs (`--word-diff[=<mode>]`, default `plain`)
+    #[clap(
+        long = "word-diff",
+        value_name = "MODE",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "plain"
+    )]
+    pub word_diff: Option<String>,
+    /// Treat matches of REGEX as words for `--word-diff`
+    #[clap(long = "word-diff-regex", value_name = "REGEX")]
+    pub word_diff_regex: Option<String>,
+    /// Show colored word diffs, optionally with a custom word regex
+    #[clap(
+        long = "color-words",
+        value_name = "REGEX",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = ""
+    )]
+    pub color_words: Option<String>,
     /// Colour moved lines differently (Git's `--color-moved[=<mode>]`)
     #[clap(
         long = "color-moved",
@@ -3679,7 +3700,12 @@ async fn execute_safe_with_diff_formats(
                     block.push_str("\n\n");
                 }
             }
-            let mut patch_output = if args.unified.is_some()
+            let word_diff_active = args.word_diff.is_some()
+                || args.color_words.is_some()
+                || args.word_diff_regex.is_some();
+            let mut patch_output = if word_diff_active {
+                word_diff_patch(&commit, &args, color_enabled).await?
+            } else if args.unified.is_some()
                 || args.full_index
                 || args.no_prefix
                 || args.src_prefix.is_some()
@@ -6101,6 +6127,42 @@ async fn generate_cc_diff(commit: &Commit, paths: &[PathBuf]) -> CliResult<Strin
         output.push_str(&body);
     }
     Ok(output)
+}
+
+/// Render a commit's patch through the diff engine's word-diff pipeline.
+async fn word_diff_patch(
+    commit: &Commit,
+    args: &LogArgs,
+    color_enabled: bool,
+) -> CliResult<String> {
+    let Some(parent) = commit.parent_commit_ids.first() else {
+        return Ok(String::new());
+    };
+    let mut argv = vec!["diff".to_string()];
+    if let Some(mode) = &args.word_diff {
+        argv.push(format!("--word-diff={mode}"));
+    }
+    if let Some(regex) = &args.word_diff_regex {
+        argv.push(format!("--word-diff-regex={regex}"));
+    }
+    if let Some(regex) = &args.color_words {
+        if regex.is_empty() {
+            argv.push("--color-words".to_string());
+        } else {
+            argv.push(format!("--color-words={regex}"));
+        }
+    }
+    argv.push(parent.to_string());
+    argv.push(commit.id.to_string());
+    let diff_args = crate::command::diff::DiffArgs::try_parse_from(&argv)
+        .map_err(|error| CliError::command_usage(error.to_string()))?;
+    let output =
+        crate::command::diff::run_diff_for_service_word_diff(diff_args, color_enabled).await?;
+    let mut patch = crate::command::diff::render::format_unified_diff(&output);
+    if !patch.is_empty() && !patch.ends_with('\n') {
+        patch.push('\n');
+    }
+    Ok(patch)
 }
 
 /// Validate `--color-moved` / `--color-moved-ws` values before rendering.

@@ -334,6 +334,21 @@ section is separated like Git, and each path/status field is NUL-terminated.
 libra log -z --name-status --format=%s
 ```
 
+### `--word-diff[=<mode>]` / `--word-diff-regex` / `--color-words`
+
+`--word-diff` renders the `-p` body as a word-level diff (`plain` by default, or
+`porcelain`/`color`/`none`); `--word-diff-regex=<re>` chooses the word tokenizer and
+`--color-words[=<re>]` is the coloured shorthand (it wins over `--word-diff=plain`).
+All three reuse the shared `libra diff` word-diff renderer, so the body matches
+`libra diff` with the same options byte for byte; an invalid mode or regex is
+`LBR-CLI-002`.
+
+```bash
+libra log -p -1 --word-diff
+libra log -p -1 --color=always --color-words
+libra log -p -1 --word-diff-regex='[A-Za-z]+'
+```
+
 ### `--color-moved[=<mode>]` / `--color-moved-ws=<modes>`
 
 `--color-moved` colours moved lines (removed side bold magenta, added side bold

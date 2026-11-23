@@ -249,6 +249,16 @@ Git 规则分隔，每个路径/状态字段均以 NUL 终止。
 libra log -z --name-status --format=%s
 ```
 
+### `--word-diff[=<mode>]` / `--word-diff-regex` / `--color-words`
+
+`--word-diff` 把 `-p` 正文渲染为词级 diff（默认 `plain`，另有 `porcelain`/`color`/`none`）；`--word-diff-regex=<re>` 指定分词正则，`--color-words[=<re>]` 是彩色简写（优先于 `--word-diff=plain`）。三者复用共享 `libra diff` 的词级渲染器，正文与同选项的 `libra diff` 逐字节一致；非法模式或正则以 `LBR-CLI-002` 拒绝。
+
+```bash
+libra log -p -1 --word-diff
+libra log -p -1 --color=always --color-words
+libra log -p -1 --word-diff-regex='[A-Za-z]+'
+```
+
 ### `--color-moved[=<mode>]` / `--color-moved-ws=<modes>`
 
 `--color-moved` 在 `-p` 输出中给移动行着色（删除侧粗体洋红、新增侧粗体青）；`--no-color-moved` 关闭，后写者胜出。`--color-moved-ws` 选择匹配移动行时的空白规则（`no`、`ignore-space-at-eol`、`ignore-space-change`、`ignore-all-space`、`allow-indentation-change`，逗号分隔）。两者复用共享 `libra diff` 渲染器，移动行着色与同一变更的 `libra diff` 一致；未知取值以 `LBR-CLI-002` 拒绝。

@@ -160,3 +160,5 @@ flowchart TD
 - 2026-11-23（LS-30 / #967）：新增 `-U<n>`/`--unified=<n>`，转发到 diff 引擎控制 hunk 上下文；非数值 `LBR-CLI-002`。回归：`diff_unified_context_passthrough`（AC1–AC3）。
 
 - 2026-11-23（LS-22 / #970）：新增 `--color-moved[=<mode>]`/`--no-color-moved`/`--color-moved-ws=<modes>`；`-p` 输出在启用颜色时经 `render::maybe_colorize_diff`（`maybe_colorize_diff` 提升为 `pub(crate)`）复用 diff 引擎的移动行着色；`--color-moved=bogus`/`--color-moved-ws=bogus` → `LBR-CLI-002`。回归：`log_color_moved_reuses_diff_engine`（AC1–AC5）。
+
+- 2026-11-23（LS-26 / #966）：新增 `--word-diff[=<mode>]`/`--word-diff-regex`/`--color-words`；新增 `diff::run_diff_for_service_word_diff(args, color)`（`json_format: None` 且 `quiet: false`，否则 `apply_word_diff` 会跳过重写），log 的 `word_diff_patch` 经 clap 构造 `DiffArgs` 调该入口。回归：`word_diff_and_color_words`（AC1–AC8，含 porcelain/color-words/regex/组合优先级与非法值）。

@@ -1967,7 +1967,7 @@ PY
 
 ### Task LS-26: `log` 支持 `--word-diff`、`--word-diff-regex` 与 `--color-words`（#966；拆出 LS-33）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-23：新增 `diff::run_diff_for_service_word_diff(args, color)`——与 service 入口同构但在 `run_diff` 之后调用 `apply_word_diff`（`json_format: None`、`quiet: false`，否则该重写会被跳过）；`LogArgs` 新增 `--word-diff[=<mode>]`/`--word-diff-regex`/`--color-words[=<re>]`，`word_diff_patch` 经 clap 构造 `DiffArgs` 调该入口并按 `color_enabled` 传色。AC1–AC8 由 `command::log_test::word_diff_and_color_words` 覆盖（plain/porcelain/color-words/regex/组合优先级逐字断言 + 两种非法值 `LBR-CLI-002`）。`log_test` 全绿；EN/zh 文档与 `COMPATIBILITY.md` 同步。
 
 **Description:** 为 `LogArgs` 接入 `--word-diff[=<mode>]`、`--word-diff-regex=<regex>` 与 `--color-words[=<regex>]`，按 `ADR-LS-01` 经 `LogDiffOptions` 复用 `src/command/diff/render.rs:61`（`render_word_diff`，提升为 `pub(crate)`）与 `diff.rs` 的词级选项解析。拆出 `LS-33`（`show` 同组选项）。
 
