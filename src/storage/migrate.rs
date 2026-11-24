@@ -1302,14 +1302,44 @@ async fn quiesce_sqlite_connection_only(
 }
 
 #[cfg(test)]
+fn notify_phase1_sqlite_lock_acquired(
+    observer: &mut Option<&mut dyn Phase1TestObserver>,
+    role: DatabaseRole,
+    db_path: &Path,
+) -> StorageResult<()> {
+    let Some(obs) = observer.as_deref_mut() else {
+        return Ok(());
+    };
+    let (point, root) = match role {
+        DatabaseRole::Repository => (
+            Phase1TestPoint::GitDbLockAcquired,
+            db_path.parent().unwrap_or(db_path),
+        ),
+        DatabaseRole::Capture => (
+            Phase1TestPoint::CaptureDbLockAcquired,
+            db_path.parent().and_then(Path::parent).unwrap_or(db_path),
+        ),
+        _ => return Ok(()),
+    };
+    obs.on_point(point, root)
+}
+
+#[cfg(test)]
 async fn quiesce_sqlite_connection_only_with_hooks(
     db_path: &Path,
     role: DatabaseRole,
     expected_meta: &fs::Metadata,
     hooks: &QuiesceTestHooks<'_>,
 ) -> StorageResult<QuiescedSqliteConnection> {
-    let prepared =
-        prepare_sqlite_quiescence_no_mutate_inner(db_path, role, expected_meta, hooks).await?;
+    let mut no_observer: Option<&mut dyn Phase1TestObserver> = None;
+    let prepared = prepare_sqlite_quiescence_no_mutate_inner(
+        db_path,
+        role,
+        expected_meta,
+        hooks,
+        &mut no_observer,
+    )
+    .await?;
     finalize_prepared_sqlite_quiescence_inner(prepared, hooks).await
 }
 
@@ -1330,6 +1360,7 @@ async fn prepare_sqlite_quiescence_no_mutate_inner(
     role: DatabaseRole,
     expected_meta: &fs::Metadata,
     #[cfg(test)] hooks: &QuiesceTestHooks<'_>,
+    #[cfg(test)] observer: &mut Option<&mut dyn Phase1TestObserver>,
 ) -> StorageResult<PreparedSqliteQuiescence> {
     let options = SqliteConnectOptions::new()
         .filename(db_path)
@@ -1349,6 +1380,8 @@ async fn prepare_sqlite_quiescence_no_mutate_inner(
         expected_meta,
         #[cfg(test)]
         hooks,
+        #[cfg(test)]
+        observer,
     )
     .await;
     match action_res {
@@ -1424,6 +1457,7 @@ async fn prepare_with_existing_wal_sidecars(
     shm_path: &Path,
     role: DatabaseRole,
     #[cfg(test)] hooks: &QuiesceTestHooks<'_>,
+    #[cfg(test)] observer: &mut Option<&mut dyn Phase1TestObserver>,
 ) -> StorageResult<PostAcquireAction> {
     // Because `PRAGMA locking_mode = EXCLUSIVE` is already active, SQLite
     // opens any WAL database in `WAL_HEAPMEMORY_MODE` (zero `-shm` access) and
@@ -1439,6 +1473,11 @@ async fn prepare_with_existing_wal_sidecars(
             map_quiesce_sqlite_error(role, SqliteQuiesceStage::InspectJournalMode, &err)
         })?;
     if prior_mode.eq_ignore_ascii_case("wal") {
+        // OS `EXCLUSIVE` lock was just acquired via `pagerOpenWal -> pagerExclusiveLock`;
+        // notify test observers BEFORE any header inspection or identity check.
+        #[cfg(test)]
+        notify_phase1_sqlite_lock_acquired(observer, role, db_path)?;
+
         // Distinguish a genuine WAL database (header format version 2/2) from
         // an already-DELETE database (header 1/1) that merely has a stray `-wal`
         // file on disk (SQLite's `pagerOpenWalIfPresent()` reports `"wal"`
@@ -1469,6 +1508,11 @@ async fn prepare_with_existing_wal_sidecars(
     if let Some(hook) = hooks.after_begin {
         hook(db_path);
     }
+    #[cfg(test)]
+    if let Err(err) = notify_phase1_sqlite_lock_acquired(observer, role, db_path) {
+        let _ = conn.execute("ROLLBACK;").await;
+        return Err(err);
+    }
     conn.execute("ROLLBACK;")
         .await
         .map_err(|err| map_quiesce_sqlite_error(role, SqliteQuiesceStage::RollbackProbe, &err))?;
@@ -1489,6 +1533,7 @@ async fn prepare_open_connection_no_mutate(
     role: DatabaseRole,
     expected_meta: &fs::Metadata,
     #[cfg(test)] hooks: &QuiesceTestHooks<'_>,
+    #[cfg(test)] observer: &mut Option<&mut dyn Phase1TestObserver>,
 ) -> StorageResult<PostAcquireAction> {
     let wal_path = sqlite_sidecar_path(db_path, "-wal");
     let shm_path = sqlite_sidecar_path(db_path, "-shm");
@@ -1542,6 +1587,8 @@ async fn prepare_open_connection_no_mutate(
             role,
             #[cfg(test)]
             hooks,
+            #[cfg(test)]
+            observer,
         )
         .await?
     } else {
@@ -1560,6 +1607,8 @@ async fn prepare_open_connection_no_mutate(
                 role,
                 #[cfg(test)]
                 hooks,
+                #[cfg(test)]
+                observer,
             )
             .await?
         } else {
@@ -1591,6 +1640,11 @@ async fn prepare_open_connection_no_mutate(
             #[cfg(test)]
             if let Some(hook) = hooks.after_begin {
                 hook(db_path);
+            }
+            #[cfg(test)]
+            if let Err(err) = notify_phase1_sqlite_lock_acquired(observer, role, db_path) {
+                let _ = conn.execute("ROLLBACK;").await;
+                return Err(err);
             }
 
             let journal_mode_res: Result<String, sea_orm::sqlx::Error> =
@@ -1877,6 +1931,7 @@ struct PreparedRepositorySqliteSources {
 /// `libra.db` and optional `private/capture.db`.
 async fn prepare_forward_repository_sqlite_sources_no_mutate(
     common_storage: &Path,
+    #[cfg(test)] observer: &mut Option<&mut dyn Phase1TestObserver>,
 ) -> StorageResult<PreparedRepositorySqliteSources> {
     let storage_meta = fs::symlink_metadata(common_storage)
         .map_err(|err| StorageBackendError::io("inspect repository storage directory", err))?;
@@ -1922,6 +1977,7 @@ async fn prepare_forward_repository_sqlite_sources_no_mutate(
         DatabaseRole::Repository,
         &git_meta,
         &default_hooks,
+        observer,
     )
     .await?;
     #[cfg(not(test))]
@@ -1935,6 +1991,7 @@ async fn prepare_forward_repository_sqlite_sources_no_mutate(
             DatabaseRole::Capture,
             &cap_meta,
             &default_hooks,
+            observer,
         )
         .await;
         #[cfg(not(test))]
@@ -1958,6 +2015,8 @@ async fn prepare_forward_repository_sqlite_sources_no_mutate(
 /// Phase B finalization for prepared repository SQLite sources.
 async fn finalize_forward_repository_sqlite_sources(
     prepared: PreparedRepositorySqliteSources,
+    #[cfg(test)] common_storage: &Path,
+    #[cfg(test)] observer: &mut Option<&mut dyn Phase1TestObserver>,
 ) -> StorageResult<QuiescedRepositorySqliteSources> {
     let PreparedRepositorySqliteSources {
         git: git_prepared,
@@ -1987,6 +2046,17 @@ async fn finalize_forward_repository_sqlite_sources(
         }
     };
 
+    #[cfg(test)]
+    if let Some(obs) = observer.as_deref_mut()
+        && let Err(err) = obs.on_point(Phase1TestPoint::GitDbFinalized, common_storage)
+    {
+        if let Some(cap) = cap_prepared {
+            cap.close_quietly().await;
+        }
+        let _ = git.close().await;
+        return Err(err);
+    }
+
     let capture = if let Some(cap_prepared) = cap_prepared {
         #[cfg(test)]
         let res = finalize_prepared_sqlite_quiescence_inner(cap_prepared, &default_hooks).await;
@@ -2002,6 +2072,17 @@ async fn finalize_forward_repository_sqlite_sources(
     } else {
         None
     };
+
+    #[cfg(test)]
+    if let Some(obs) = observer.as_deref_mut()
+        && let Err(err) = obs.on_point(Phase1TestPoint::Quiesced, common_storage)
+    {
+        if let Some(cap) = capture {
+            let _ = cap.close().await;
+        }
+        let _ = git.close().await;
+        return Err(err);
+    }
 
     Ok(QuiescedRepositorySqliteSources { git, capture })
 }
@@ -2022,8 +2103,22 @@ async fn finalize_forward_repository_sqlite_sources(
 pub async fn quiesce_forward_repository_sqlite_sources(
     common_storage: &Path,
 ) -> StorageResult<QuiescedRepositorySqliteSources> {
-    let prepared = prepare_forward_repository_sqlite_sources_no_mutate(common_storage).await?;
-    finalize_forward_repository_sqlite_sources(prepared).await
+    #[cfg(test)]
+    let mut no_observer: Option<&mut dyn Phase1TestObserver> = None;
+    let prepared = prepare_forward_repository_sqlite_sources_no_mutate(
+        common_storage,
+        #[cfg(test)]
+        &mut no_observer,
+    )
+    .await?;
+    finalize_forward_repository_sqlite_sources(
+        prepared,
+        #[cfg(test)]
+        common_storage,
+        #[cfg(test)]
+        &mut no_observer,
+    )
+    .await
 }
 
 /// Validate that `dir` (if present) is a regular non-symlink directory owned by
@@ -2817,9 +2912,11 @@ pub async fn quiesce_forward_repository_phase1(
 ) -> StorageResult<ForwardPhase1QuiesceGuard> {
     #[cfg(test)]
     {
+        let mut no_observer: Option<&mut dyn Phase1TestObserver> = None;
         quiesce_forward_repository_phase1_inner(
             common_storage,
             &Phase1NonSqliteTestHooks::default(),
+            &mut no_observer,
         )
         .await
     }
@@ -2832,6 +2929,7 @@ pub async fn quiesce_forward_repository_phase1(
 async fn quiesce_forward_repository_phase1_inner(
     common_storage: &Path,
     #[cfg(test)] hooks: &Phase1NonSqliteTestHooks<'_>,
+    #[cfg(test)] observer: &mut Option<&mut dyn Phase1TestObserver>,
 ) -> StorageResult<ForwardPhase1QuiesceGuard> {
     if !validate_existing_dir_no_mutate(
         common_storage,
@@ -2911,7 +3009,14 @@ async fn quiesce_forward_repository_phase1_inner(
         || !path_exists_no_open(&capacity_lock_path)?
         || !path_exists_no_open(&append_lock_path)?;
     if any_private_lock_absent {
-        let probe = prepare_forward_repository_sqlite_sources_no_mutate(common_storage).await?;
+        #[cfg(test)]
+        let mut no_observer: Option<&mut dyn Phase1TestObserver> = None;
+        let probe = prepare_forward_repository_sqlite_sources_no_mutate(
+            common_storage,
+            #[cfg(test)]
+            &mut no_observer,
+        )
+        .await?;
         if let Some(cap) = probe.capture {
             cap.close_quietly().await;
         }
@@ -2991,7 +3096,20 @@ async fn quiesce_forward_repository_phase1_inner(
 
     // Phase 2: Single-connection SQLite Phase A + Phase B quiescence on
     // `libra.db` and optional `private/capture.db` under all 6 held locks.
-    let sqlite = quiesce_forward_repository_sqlite_sources(common_storage).await?;
+    let prepared_sqlite = prepare_forward_repository_sqlite_sources_no_mutate(
+        common_storage,
+        #[cfg(test)]
+        observer,
+    )
+    .await?;
+    let sqlite = finalize_forward_repository_sqlite_sources(
+        prepared_sqlite,
+        #[cfg(test)]
+        common_storage,
+        #[cfg(test)]
+        observer,
+    )
+    .await?;
 
     Ok(ForwardPhase1QuiesceGuard { sqlite, locks })
 }
@@ -27330,6 +27448,46 @@ enum Phase1AbortFaultPoint {
 #[cfg(test)]
 type Phase1AbortFaultHook<'a> = (Phase1AbortFaultPoint, &'a mut dyn FnMut(&Path));
 
+/// Test-only deterministic observation points across Forward Migration Phase 1
+/// starting immediately at each database's SQLite lock acquisition (`RB-10l`).
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase1TestPoint {
+    GitDbLockAcquired,
+    CaptureDbLockAcquired,
+    GitDbFinalized,
+    Quiesced,
+    ExportedBeforeVerify,
+    VerifiedBeforePromote,
+    PromotedBeforeBackup,
+    BackedUpBeforeFinalVerify,
+    FinalVerified,
+}
+
+#[cfg(test)]
+trait Phase1TestObserver {
+    fn on_point(&mut self, point: Phase1TestPoint, root: &Path) -> StorageResult<()>;
+}
+
+#[cfg(test)]
+impl<F> Phase1TestObserver for F
+where
+    F: FnMut(Phase1TestPoint, &Path) -> StorageResult<()>,
+{
+    fn on_point(&mut self, point: Phase1TestPoint, root: &Path) -> StorageResult<()> {
+        self(point, root)
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct Phase1TestHooks<'a> {
+    fault: Option<Phase1AbortFaultHook<'a>>,
+    abort_elapsed_out: Option<&'a mut Option<Duration>>,
+    inject_cleanup_dir_fsync_err: bool,
+    observer: Option<&'a mut dyn Phase1TestObserver>,
+}
+
 /// Run complete Forward Migration Phase 1 and preserve a retryable
 /// [`Phase1PendingCleanup`] ownership handle if Phase 1 fails AND automatic
 /// abort cleanup cannot complete cleanly (`ADR-RB-07` #1, `GC-RB-02`, `RB-10j`).
@@ -27343,11 +27501,7 @@ pub async fn prepare_forward_phase1_for_role_with_recovery(
         common_storage,
         generation,
         #[cfg(test)]
-        None,
-        #[cfg(test)]
-        None,
-        #[cfg(test)]
-        false,
+        Phase1TestHooks::default(),
     )
     .await
 }
@@ -27398,6 +27552,34 @@ pub async fn prepare_forward_phase1(
 }
 
 #[cfg(test)]
+async fn prepare_forward_phase1_with_observer(
+    common_storage: &Path,
+    generation: u64,
+    observer: &mut dyn Phase1TestObserver,
+) -> StorageResult<ForwardPhase1Prepared> {
+    match prepare_forward_phase1_inner(
+        DatabaseRole::Repository,
+        common_storage,
+        generation,
+        Phase1TestHooks {
+            observer: Some(observer),
+            ..Phase1TestHooks::default()
+        },
+    )
+    .await
+    {
+        Ok(prepared) => Ok(prepared),
+        Err((err, pending)) => {
+            if let Some(mut p) = pending {
+                p.disarm();
+                let _ = p.close().await;
+            }
+            Err(err)
+        }
+    }
+}
+
+#[cfg(test)]
 async fn prepare_forward_phase1_with_fault(
     role: DatabaseRole,
     common_storage: &Path,
@@ -27410,9 +27592,12 @@ async fn prepare_forward_phase1_with_fault(
         role,
         common_storage,
         generation,
-        Some((fault_point, &mut on_fault as &mut dyn FnMut(&Path))),
-        Some(&mut abort_elapsed),
-        false,
+        Phase1TestHooks {
+            fault: Some((fault_point, &mut on_fault as &mut dyn FnMut(&Path))),
+            abort_elapsed_out: Some(&mut abort_elapsed),
+            inject_cleanup_dir_fsync_err: false,
+            observer: None,
+        },
     )
     .await
     {
@@ -27441,9 +27626,12 @@ async fn prepare_forward_phase1_with_fault_and_recovery(
         role,
         common_storage,
         generation,
-        Some((fault_point, &mut on_fault as &mut dyn FnMut(&Path))),
-        None,
-        inject_cleanup_dir_fsync_err,
+        Phase1TestHooks {
+            fault: Some((fault_point, &mut on_fault as &mut dyn FnMut(&Path))),
+            abort_elapsed_out: None,
+            inject_cleanup_dir_fsync_err,
+            observer: None,
+        },
     )
     .await
 }
@@ -27452,10 +27640,15 @@ async fn prepare_forward_phase1_inner(
     role: DatabaseRole,
     common_storage: &Path,
     generation: u64,
-    #[cfg(test)] mut fault: Option<Phase1AbortFaultHook<'_>>,
-    #[cfg(test)] abort_elapsed_out: Option<&mut Option<Duration>>,
-    #[cfg(test)] inject_cleanup_dir_fsync_err: bool,
+    #[cfg(test)] hooks: Phase1TestHooks<'_>,
 ) -> Result<ForwardPhase1Prepared, (StorageBackendError, Option<Phase1PendingCleanup>)> {
+    #[cfg(test)]
+    let Phase1TestHooks {
+        mut fault,
+        abort_elapsed_out,
+        inject_cleanup_dir_fsync_err,
+        mut observer,
+    } = hooks;
     // Step 0 (`RB-10j` AC4, `GC-RB-02`): Explicit fail-closed role gate BEFORE
     // touching a single path, directory, or lock!
     if let Err(err) = validate_any_migration_role(role) {
@@ -27508,6 +27701,18 @@ async fn prepare_forward_phase1_inner(
     };
 
     // Step 2: Acquire all 6 non-SQLite locks + single-connection `c_mig` quiescence.
+    #[cfg(test)]
+    let mut guard = match quiesce_forward_repository_phase1_inner(
+        common_storage,
+        &Phase1NonSqliteTestHooks::default(),
+        &mut observer,
+    )
+    .await
+    {
+        Ok(g) => g,
+        Err(err) => return Err((err, None)),
+    };
+    #[cfg(not(test))]
     let mut guard = match quiesce_forward_repository_phase1(common_storage).await {
         Ok(g) => g,
         Err(err) => return Err((err, None)),
@@ -27580,6 +27785,10 @@ async fn prepare_forward_phase1_inner(
         if let Some((Phase1AbortFaultPoint::AfterExportBeforeVerify, cb)) = fault.as_mut() {
             cb(common_storage);
         }
+        #[cfg(test)]
+        if let Some(obs) = observer.as_deref_mut() {
+            obs.on_point(Phase1TestPoint::ExportedBeforeVerify, common_storage)?;
+        }
 
         // Step 4: Independent post-export verification against held `c_mig` SQLite sources
         // via descriptor-bound `FileBackend` pinned to the exact staged inodes/FileIDs.
@@ -27597,6 +27806,11 @@ async fn prepare_forward_phase1_inner(
             artifact_guard.capture_file.as_ref().map(|f| f.file_id),
         )
         .await?;
+
+        #[cfg(test)]
+        if let Some(obs) = observer.as_deref_mut() {
+            obs.on_point(Phase1TestPoint::VerifiedBeforePromote, common_storage)?;
+        }
 
         // Step 5: Durable atomic no-replace `.tmp` -> `.gen-<id>.redb` promotion
         // (`fsync` + open-fd inode-bound atomic no-replace rename + `fsync_dir`),
@@ -27696,6 +27910,10 @@ async fn prepare_forward_phase1_inner(
         if let Some((Phase1AbortFaultPoint::AfterPromoteBeforeBackup, cb)) = fault.as_mut() {
             cb(common_storage);
         }
+        #[cfg(test)]
+        if let Some(obs) = observer.as_deref_mut() {
+            obs.on_point(Phase1TestPoint::PromotedBeforeBackup, common_storage)?;
+        }
 
         // Step 6: Lock-safe single-connection `VACUUM INTO` backups + in-place
         // `capture-spool/` backup + queue manifest digest with full `fsync` & `fsync_dir`.
@@ -27729,6 +27947,10 @@ async fn prepare_forward_phase1_inner(
         if let Some((Phase1AbortFaultPoint::AfterBackupBeforeFinalVerify, cb)) = fault.as_mut() {
             cb(common_storage);
         }
+        #[cfg(test)]
+        if let Some(obs) = observer.as_deref_mut() {
+            obs.on_point(Phase1TestPoint::BackedUpBeforeFinalVerify, common_storage)?;
+        }
 
         // Step 7: Final verification of promoted `.gen-<id>.redb`, backup SHA-256s,
         // `StorageFormatManifest` validity, and complete `fsync` / `fsync_dir` audit trail.
@@ -27750,6 +27972,11 @@ async fn prepare_forward_phase1_inner(
             #[cfg(unix)]
             &protected_live_inodes,
         )?;
+
+        #[cfg(test)]
+        if let Some(obs) = observer.as_deref_mut() {
+            obs.on_point(Phase1TestPoint::FinalVerified, common_storage)?;
+        }
 
         Ok((export, verification, backup, durability))
     }
@@ -31916,11 +32143,13 @@ mod tests {
                 fs::write(&raced_tmp, b"{\"raced_inflight\":true}").expect("plant raced tmp file");
             };
 
+            let mut no_observer: Option<&mut dyn Phase1TestObserver> = None;
             let race_err = quiesce_forward_repository_phase1_inner(
                 &storage,
                 &Phase1NonSqliteTestHooks {
                     after_locks_before_tmp_recheck: Some(&spawn_waiting_producer_and_plant_tmp),
                 },
+                &mut no_observer,
             )
             .await
             .expect_err("late raced capture-spool/tmp file must fail closed");
@@ -43065,5 +43294,1603 @@ stderr:
             assert!(count > 0);
             cap_check.close().await.expect("close cap_check");
         }
+    }
+
+    // ========================================================================
+    // RB-10l: Cross-Process OS Read/Write Exclusivity from Phase 1 Lock
+    // Acquisition Through Phase 2 Unlink & Fresh Legacy SQLite Binary Reject
+    // ========================================================================
+
+    const RB10L_CHILD_MODE_ENV: &str = "LIBRA_RB10L_CHILD_MODE";
+    const RB10L_CHILD_STORAGE_ENV: &str = "LIBRA_RB10L_CHILD_STORAGE";
+    const RB10L_CHILD_GIT_DB_ENV: &str = "LIBRA_RB10L_CHILD_GIT_DB";
+    const RB10L_CHILD_CAP_DB_ENV: &str = "LIBRA_RB10L_CHILD_CAP_DB";
+    const RB10L_CHILD_IO_TIMEOUT: Duration = Duration::from_secs(5);
+
+    fn is_strict_sqlite_busy_error(err: &sea_orm::sqlx::Error) -> bool {
+        err.as_database_error()
+            .and_then(|db_err| db_err.code())
+            .and_then(|code| code.parse::<i32>().ok())
+            .is_some_and(|numeric| (numeric & 0xff) == 5)
+    }
+
+    fn is_sqlite_cantopen_error(err: &sea_orm::sqlx::Error) -> bool {
+        err.as_database_error()
+            .and_then(|db_err| db_err.code())
+            .and_then(|code| code.parse::<i32>().ok())
+            .is_some_and(|numeric| (numeric & 0xff) == 14)
+    }
+
+    #[derive(Debug, Default)]
+    struct Rb10lChildStats {
+        git_cont: u64,
+        cap_cont: u64,
+        git_sync: u64,
+        cap_sync: u64,
+        git_fresh: u64,
+        cap_fresh: u64,
+        git_post_unlink: u64,
+        cap_post_unlink: u64,
+        git_cantopen: u64,
+        cap_cantopen: u64,
+        unexpected_ok: u64,
+        unexpected_err: u64,
+        first_failure: Option<String>,
+    }
+
+    impl Rb10lChildStats {
+        fn total_failures(&self) -> u64 {
+            self.unexpected_ok + self.unexpected_err
+        }
+
+        fn record_ok(&mut self, ctx: &str) {
+            self.unexpected_ok += 1;
+            if self.first_failure.is_none() {
+                self.first_failure = Some(format!("unexpected_ok:{ctx}"));
+            }
+        }
+
+        fn record_err(&mut self, ctx: &str, detail: &str) {
+            self.unexpected_err += 1;
+            if self.first_failure.is_none() {
+                let sanitized = detail.replace(['\n', '\r', ' '], "_");
+                self.first_failure = Some(format!("unexpected_err:{ctx}:{sanitized}"));
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct Rb10lProbeSummary {
+        pid: u32,
+        git_cont: u64,
+        cap_cont: u64,
+        git_sync: u64,
+        cap_sync: u64,
+        git_fresh: u64,
+        cap_fresh: u64,
+        git_post_unlink: u64,
+        cap_post_unlink: u64,
+        git_cantopen: u64,
+        cap_cantopen: u64,
+        unexpected_ok: u64,
+        unexpected_err: u64,
+        detail: String,
+    }
+
+    impl Rb10lProbeSummary {
+        fn parse(line: &str) -> Self {
+            let trimmed = line.trim();
+            assert!(
+                trimmed.starts_with("SUMMARY "),
+                "expected SUMMARY line from RB-10l child, got `{trimmed}`"
+            );
+            let mut pid = 0u32;
+            let mut git_cont = 0u64;
+            let mut cap_cont = 0u64;
+            let mut git_sync = 0u64;
+            let mut cap_sync = 0u64;
+            let mut git_fresh = 0u64;
+            let mut cap_fresh = 0u64;
+            let mut git_post_unlink = 0u64;
+            let mut cap_post_unlink = 0u64;
+            let mut git_cantopen = 0u64;
+            let mut cap_cantopen = 0u64;
+            let mut unexpected_ok = 0u64;
+            let mut unexpected_err = 0u64;
+            let mut detail = String::new();
+            for token in trimmed.split_whitespace().skip(1) {
+                if let Some((k, v)) = token.split_once('=') {
+                    match k {
+                        "pid" => pid = v.parse().expect("parse pid"),
+                        "git_cont" => git_cont = v.parse().expect("parse git_cont"),
+                        "cap_cont" => cap_cont = v.parse().expect("parse cap_cont"),
+                        "git_sync" => git_sync = v.parse().expect("parse git_sync"),
+                        "cap_sync" => cap_sync = v.parse().expect("parse cap_sync"),
+                        "git_fresh" => git_fresh = v.parse().expect("parse git_fresh"),
+                        "cap_fresh" => cap_fresh = v.parse().expect("parse cap_fresh"),
+                        "git_post_unlink" => {
+                            git_post_unlink = v.parse().expect("parse git_post_unlink")
+                        }
+                        "cap_post_unlink" => {
+                            cap_post_unlink = v.parse().expect("parse cap_post_unlink")
+                        }
+                        "git_cantopen" => git_cantopen = v.parse().expect("parse git_cantopen"),
+                        "cap_cantopen" => cap_cantopen = v.parse().expect("parse cap_cantopen"),
+                        "ok" => unexpected_ok = v.parse().expect("parse ok"),
+                        "err" => unexpected_err = v.parse().expect("parse err"),
+                        "detail" => detail = v.to_string(),
+                        _ => {}
+                    }
+                }
+            }
+            Self {
+                pid,
+                git_cont,
+                cap_cont,
+                git_sync,
+                cap_sync,
+                git_fresh,
+                cap_fresh,
+                git_post_unlink,
+                cap_post_unlink,
+                git_cantopen,
+                cap_cantopen,
+                unexpected_ok,
+                unexpected_err,
+                detail,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct Rb10lAckCounts {
+        git_cont: u64,
+        cap_cont: u64,
+        fail: u64,
+    }
+
+    fn parse_rb10l_ack(line: &str, expected_tag: &str) -> Rb10lAckCounts {
+        let trimmed = line.trim();
+        let rest = trimmed
+            .strip_prefix(&format!("ACK {expected_tag} "))
+            .unwrap_or_else(|| panic!("expected `ACK {expected_tag} ...`, got `{trimmed}`"));
+        let mut git_cont = 0u64;
+        let mut cap_cont = 0u64;
+        let mut fail = u64::MAX;
+        for token in rest.split_whitespace() {
+            if let Some((k, v)) = token.split_once('=') {
+                match k {
+                    "git_cont" => git_cont = v.parse().expect("parse ack git_cont"),
+                    "cap_cont" => cap_cont = v.parse().expect("parse ack cap_cont"),
+                    "fail" => fail = v.parse().expect("parse ack fail"),
+                    _ => {}
+                }
+            }
+        }
+        Rb10lAckCounts {
+            git_cont,
+            cap_cont,
+            fail,
+        }
+    }
+
+    async fn probe_sqlite_conn_once(
+        conn: &mut SqliteConnection,
+        is_writer: bool,
+        is_git: bool,
+        tick: u64,
+    ) -> Result<(), sea_orm::sqlx::Error> {
+        if is_writer {
+            if tick.is_multiple_of(2) {
+                let res = sea_orm::sqlx::query("BEGIN IMMEDIATE;")
+                    .persistent(false)
+                    .execute(&mut *conn)
+                    .await;
+                if res.is_ok() {
+                    let _ = sea_orm::sqlx::query("ROLLBACK;")
+                        .persistent(false)
+                        .execute(&mut *conn)
+                        .await;
+                }
+                res.map(|_| ())
+            } else if is_git {
+                sea_orm::sqlx::query(
+                    "INSERT INTO reference (name, kind, \"commit\", remote) VALUES ('rb10l-probe', 'Branch', 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef', NULL);",
+                )
+                .persistent(false)
+                .execute(&mut *conn)
+                .await
+                .map(|_| ())
+            } else {
+                sea_orm::sqlx::query(
+                    "INSERT INTO agent_audit_log (audit_id, timestamp, user_id, user_name, action, checkpoint_id, scope, export_path, justification, granted) VALUES ('rb10l-probe', '2026-11-22T00:00:00Z', 'u', 'u', 'export', NULL, 'committed', NULL, 'probe', 1);",
+                )
+                .persistent(false)
+                .execute(&mut *conn)
+                .await
+                .map(|_| ())
+            }
+        } else {
+            let sql = if is_git {
+                if tick.is_multiple_of(2) {
+                    "SELECT count(*) FROM reference;"
+                } else {
+                    "SELECT count(*) FROM sqlite_master;"
+                }
+            } else if tick.is_multiple_of(2) {
+                "SELECT count(*) FROM agent_session;"
+            } else {
+                "SELECT count(*) FROM sqlite_master;"
+            };
+            sea_orm::sqlx::query_scalar::<_, i64>(sql)
+                .persistent(false)
+                .fetch_one(&mut *conn)
+                .await
+                .map(|_| ())
+        }
+    }
+
+    async fn probe_fresh_sqlite_path_busy(
+        db_path: &Path,
+        is_writer: bool,
+        read_only_open: bool,
+        is_git: bool,
+        tick: u64,
+    ) -> Result<(), (bool, String)> {
+        let opts = SqliteConnectOptions::new()
+            .filename(db_path)
+            .create_if_missing(false)
+            .read_only(read_only_open)
+            .busy_timeout(Duration::ZERO);
+        let mut conn = match SqliteConnection::connect_with(&opts).await {
+            Ok(c) => c,
+            Err(err) => {
+                if is_strict_sqlite_busy_error(&err) {
+                    return Ok(());
+                }
+                return Err((false, err.to_string()));
+            }
+        };
+        let probe_res = probe_sqlite_conn_once(&mut conn, is_writer, is_git, tick).await;
+        let _ = conn.close().await;
+        match probe_res {
+            Ok(()) => Err((true, "probe unexpectedly succeeded".to_string())),
+            Err(err) if is_strict_sqlite_busy_error(&err) => Ok(()),
+            Err(err) => Err((false, err.to_string())),
+        }
+    }
+
+    async fn run_rb10l_continuous_prober_child(is_writer: bool) {
+        let git_db = PathBuf::from(
+            std::env::var_os(RB10L_CHILD_GIT_DB_ENV).expect("RB10L child git db env"),
+        );
+        let cap_db = PathBuf::from(
+            std::env::var_os(RB10L_CHILD_CAP_DB_ENV).expect("RB10L child cap db env"),
+        );
+        let role_label = if is_writer { "write" } else { "read" };
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        std::thread::spawn(move || {
+            let stdin = io::stdin();
+            let mut lock = stdin.lock();
+            loop {
+                let mut line = String::new();
+                match lock.read_line(&mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        if tx.send(line.trim().to_string()).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        println!("RB10L_READY pid={}", std::process::id());
+        let _ = io::stdout().flush();
+
+        let mut stats = Rb10lChildStats::default();
+        let mut git_conn: Option<SqliteConnection> = None;
+        let mut cap_conn: Option<SqliteConnection> = None;
+        let mut git_active = false;
+        let mut cap_active = false;
+        let mut git_path_live = false;
+        let mut cap_path_live = false;
+        let mut tick: u64 = 0;
+
+        let mut interval = tokio::time::interval(Duration::from_micros(500));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            tokio::select! {
+                biased;
+                maybe_cmd = rx.recv() => {
+                    let Some(cmd) = maybe_cmd else {
+                        break;
+                    };
+                    if let Some(target) = cmd.strip_prefix("START_TARGET ") {
+                        let open_opts = |p: &Path| {
+                            SqliteConnectOptions::new()
+                                .filename(p)
+                                .create_if_missing(false)
+                                .read_only(!is_writer)
+                                .busy_timeout(Duration::ZERO)
+                        };
+                        match target {
+                            "git" => {
+                                match SqliteConnection::connect_with(&open_opts(&git_db)).await {
+                                    Ok(c) => git_conn = Some(c),
+                                    Err(err) => stats.record_err("start_open_git", &err.to_string()),
+                                }
+                                git_active = git_conn.is_some();
+                                git_path_live = true;
+                                if let Some(c) = git_conn.as_mut() {
+                                    match probe_sqlite_conn_once(c, is_writer, true, 0).await {
+                                        Ok(()) => stats.record_ok("start_git_held"),
+                                        Err(err) if is_strict_sqlite_busy_error(&err) => stats.git_sync += 1,
+                                        Err(err) => stats.record_err("start_git_held", &err.to_string()),
+                                    }
+                                }
+                                for ro in if is_writer { [false, false] } else { [true, false] } {
+                                    let step = if ro { 0 } else { 1 };
+                                    match probe_fresh_sqlite_path_busy(&git_db, is_writer, ro, true, step).await {
+                                        Ok(()) => stats.git_fresh += 1,
+                                        Err((true, _)) => stats.record_ok("start_git_fresh"),
+                                        Err((false, d)) => stats.record_err("start_git_fresh", &d),
+                                    }
+                                }
+                            }
+                            "cap" => {
+                                match SqliteConnection::connect_with(&open_opts(&cap_db)).await {
+                                    Ok(c) => cap_conn = Some(c),
+                                    Err(err) => stats.record_err("start_open_cap", &err.to_string()),
+                                }
+                                cap_active = cap_conn.is_some();
+                                cap_path_live = true;
+                                if let Some(c) = cap_conn.as_mut() {
+                                    match probe_sqlite_conn_once(c, is_writer, false, 0).await {
+                                        Ok(()) => stats.record_ok("start_cap_held"),
+                                        Err(err) if is_strict_sqlite_busy_error(&err) => stats.cap_sync += 1,
+                                        Err(err) => stats.record_err("start_cap_held", &err.to_string()),
+                                    }
+                                }
+                                for ro in if is_writer { [false, false] } else { [true, false] } {
+                                    let step = if ro { 0 } else { 1 };
+                                    match probe_fresh_sqlite_path_busy(&cap_db, is_writer, ro, false, step).await {
+                                        Ok(()) => stats.cap_fresh += 1,
+                                        Err((true, _)) => stats.record_ok("start_cap_fresh"),
+                                        Err((false, d)) => stats.record_err("start_cap_fresh", &d),
+                                    }
+                                }
+                                // Confirm `git` remained locked throughout `capture.db` lock acquisition.
+                                if git_active && let Some(c) = git_conn.as_mut() {
+                                    match probe_sqlite_conn_once(c, is_writer, true, 1).await {
+                                        Ok(()) => stats.record_ok("start_cap_git_recheck"),
+                                        Err(err) if is_strict_sqlite_busy_error(&err) => stats.git_sync += 1,
+                                        Err(err) => stats.record_err("start_cap_git_recheck", &err.to_string()),
+                                    }
+                                }
+                            }
+                            other => stats.record_err("start_target_unknown", other),
+                        }
+                        println!("STARTED_TARGET {target} fail={}", stats.total_failures());
+                        let _ = io::stdout().flush();
+                    } else if let Some(tag) = cmd.strip_prefix("SYNC ") {
+                        tick = tick.wrapping_add(1);
+                        if git_active && let Some(c) = git_conn.as_mut() {
+                            match probe_sqlite_conn_once(c, is_writer, true, tick).await {
+                                Ok(()) => stats.record_ok(&format!("sync_{tag}_git_held")),
+                                Err(err) if is_strict_sqlite_busy_error(&err) => {
+                                    stats.git_sync += 1;
+                                    if !git_path_live {
+                                        stats.git_post_unlink += 1;
+                                    }
+                                }
+                                Err(err) => stats.record_err(&format!("sync_{tag}_git_held"), &err.to_string()),
+                            }
+                            if git_path_live {
+                                match probe_fresh_sqlite_path_busy(&git_db, is_writer, !is_writer, true, tick).await {
+                                    Ok(()) => stats.git_fresh += 1,
+                                    Err((true, _)) => stats.record_ok(&format!("sync_{tag}_git_fresh")),
+                                    Err((false, d)) => stats.record_err(&format!("sync_{tag}_git_fresh"), &d),
+                                }
+                            }
+                        }
+                        if cap_active && let Some(c) = cap_conn.as_mut() {
+                            match probe_sqlite_conn_once(c, is_writer, false, tick).await {
+                                Ok(()) => stats.record_ok(&format!("sync_{tag}_cap_held")),
+                                Err(err) if is_strict_sqlite_busy_error(&err) => {
+                                    stats.cap_sync += 1;
+                                    if !cap_path_live {
+                                        stats.cap_post_unlink += 1;
+                                    }
+                                }
+                                Err(err) => stats.record_err(&format!("sync_{tag}_cap_held"), &err.to_string()),
+                            }
+                            if cap_path_live {
+                                match probe_fresh_sqlite_path_busy(&cap_db, is_writer, !is_writer, false, tick).await {
+                                    Ok(()) => stats.cap_fresh += 1,
+                                    Err((true, _)) => stats.record_ok(&format!("sync_{tag}_cap_fresh")),
+                                    Err((false, d)) => stats.record_err(&format!("sync_{tag}_cap_fresh"), &d),
+                                }
+                            }
+                        }
+                        println!(
+                            "ACK {tag} git_cont={} cap_cont={} fail={}",
+                            stats.git_cont,
+                            stats.cap_cont,
+                            stats.total_failures()
+                        );
+                        let _ = io::stdout().flush();
+                    } else if let Some(target) = cmd.strip_prefix("MARK_UNLINKING ") {
+                        match target {
+                            "git" => git_path_live = false,
+                            "cap" => cap_path_live = false,
+                            other => stats.record_err("mark_unlinking_unknown", other),
+                        }
+                        println!("OK fail={}", stats.total_failures());
+                        let _ = io::stdout().flush();
+                    } else if let Some(target) = cmd.strip_prefix("VERIFY_UNLINKED ") {
+                        let target_path = if target == "git" { &git_db } else { &cap_db };
+                        let opts = SqliteConnectOptions::new()
+                            .filename(target_path)
+                            .create_if_missing(false)
+                            .read_only(!is_writer)
+                            .busy_timeout(Duration::ZERO);
+                        match SqliteConnection::connect_with(&opts).await {
+                            Ok(c) => {
+                                let _ = c.close().await;
+                                stats.record_ok(&format!("verify_unlinked_{target}"));
+                            }
+                            Err(err) if is_sqlite_cantopen_error(&err) => {
+                                if target_path.exists() {
+                                    stats.record_err(&format!("verify_unlinked_recreated_{target}"), "file_recreated");
+                                } else if target == "git" {
+                                    stats.git_cantopen += 1;
+                                } else {
+                                    stats.cap_cantopen += 1;
+                                }
+                            }
+                            Err(err) => stats.record_err(&format!("verify_unlinked_{target}"), &err.to_string()),
+                        }
+                        println!("OK fail={}", stats.total_failures());
+                        let _ = io::stdout().flush();
+                    } else if let Some(target) = cmd.strip_prefix("STOP ") {
+                        tick = tick.wrapping_add(1);
+                        if target == "git" {
+                            if let Some(mut c) = git_conn.take() {
+                                match probe_sqlite_conn_once(&mut c, is_writer, true, tick).await {
+                                    Ok(()) => stats.record_ok("stop_git_held"),
+                                    Err(err) if is_strict_sqlite_busy_error(&err) => {
+                                        stats.git_sync += 1;
+                                        if !git_path_live {
+                                            stats.git_post_unlink += 1;
+                                        }
+                                    }
+                                    Err(err) => stats.record_err("stop_git_held", &err.to_string()),
+                                }
+                                let _ = c.close().await;
+                            }
+                            git_active = false;
+                            git_path_live = false;
+                        } else if target == "cap" {
+                            if let Some(mut c) = cap_conn.take() {
+                                match probe_sqlite_conn_once(&mut c, is_writer, false, tick).await {
+                                    Ok(()) => stats.record_ok("stop_cap_held"),
+                                    Err(err) if is_strict_sqlite_busy_error(&err) => {
+                                        stats.cap_sync += 1;
+                                        if !cap_path_live {
+                                            stats.cap_post_unlink += 1;
+                                        }
+                                    }
+                                    Err(err) => stats.record_err("stop_cap_held", &err.to_string()),
+                                }
+                                let _ = c.close().await;
+                            }
+                            cap_active = false;
+                            cap_path_live = false;
+                        } else {
+                            stats.record_err("stop_unknown", target);
+                        }
+                        println!("STOPPED {target} fail={}", stats.total_failures());
+                        let _ = io::stdout().flush();
+                    } else if cmd == "FINISH" {
+                        if let Some(c) = git_conn.take() {
+                            let _ = c.close().await;
+                        }
+                        if let Some(c) = cap_conn.take() {
+                            let _ = c.close().await;
+                        }
+                        let detail = stats
+                            .first_failure
+                            .as_deref()
+                            .unwrap_or("none");
+                        println!(
+                            "SUMMARY pid={} role={} git_cont={} cap_cont={} git_sync={} cap_sync={} git_fresh={} cap_fresh={} git_post_unlink={} cap_post_unlink={} git_cantopen={} cap_cantopen={} ok={} err={} detail={detail}",
+                            std::process::id(),
+                            role_label,
+                            stats.git_cont,
+                            stats.cap_cont,
+                            stats.git_sync,
+                            stats.cap_sync,
+                            stats.git_fresh,
+                            stats.cap_fresh,
+                            stats.git_post_unlink,
+                            stats.cap_post_unlink,
+                            stats.git_cantopen,
+                            stats.cap_cantopen,
+                            stats.unexpected_ok,
+                            stats.unexpected_err,
+                        );
+                        let _ = io::stdout().flush();
+                        break;
+                    }
+                }
+                _ = interval.tick(), if git_active || cap_active => {
+                    tick = tick.wrapping_add(1);
+                    if git_active && let Some(c) = git_conn.as_mut() {
+                        match probe_sqlite_conn_once(c, is_writer, true, tick).await {
+                            Ok(()) => stats.record_ok("cont_git"),
+                            Err(err) if is_strict_sqlite_busy_error(&err) => stats.git_cont += 1,
+                            Err(err) => stats.record_err("cont_git", &err.to_string()),
+                        }
+                    }
+                    if cap_active && let Some(c) = cap_conn.as_mut() {
+                        match probe_sqlite_conn_once(c, is_writer, false, tick).await {
+                            Ok(()) => stats.record_ok("cont_cap"),
+                            Err(err) if is_strict_sqlite_busy_error(&err) => stats.cap_cont += 1,
+                            Err(err) => stats.record_err("cont_cap", &err.to_string()),
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    async fn run_rb10l_fresh_legacy_reject_child(storage: &Path) {
+        use crate::storage::{
+            SqliteCaptureStore, SqliteConfigStore, SqliteGitStateStore, SqliteGitStore,
+            manifest::detect_storage_authority,
+        };
+
+        let git_db = git_sqlite_db_path(storage);
+        let cap_db = capture_sqlite_db_path(storage);
+        let git_db_str = git_db.to_str().expect("UTF-8 git_db path");
+
+        // 1–4. Genuine unmodified legacy Libra SQLite repository entrypoints
+        // (`src/internal/db.rs` — untouched in Track A per `GC-RB-06`, using
+        // real legacy binary open flags without test-injected overrides).
+        let db_err = crate::internal::db::establish_connection(git_db_str)
+            .await
+            .expect_err("fresh legacy establish_connection must fail closed on missing libra.db");
+        assert_eq!(
+            db_err.kind(),
+            io::ErrorKind::NotFound,
+            "expected NotFound from legacy establish_connection, got {db_err:?}"
+        );
+
+        let pool_err = crate::internal::db::get_db_conn_instance_for_path(&git_db)
+            .await
+            .expect_err(
+                "fresh legacy get_db_conn_instance_for_path must fail closed on missing libra.db",
+            );
+        assert_eq!(
+            pool_err.kind(),
+            io::ErrorKind::NotFound,
+            "expected NotFound from legacy get_db_conn_instance_for_path, got {pool_err:?}"
+        );
+
+        let repo_err = crate::internal::db::open_repository_with_busy_timeout(
+            git_db_str,
+            Duration::from_millis(50),
+        )
+        .await
+        .expect_err(
+            "fresh legacy open_repository_with_busy_timeout must fail closed on missing libra.db",
+        );
+        assert_eq!(
+            repo_err.kind(),
+            io::ErrorKind::NotFound,
+            "expected NotFound from legacy open_repository_with_busy_timeout, got {repo_err:?}"
+        );
+
+        let noschema_err = crate::internal::db::open_connection_without_schema_management(
+            git_db_str,
+            Duration::from_millis(50),
+        )
+        .await
+        .expect_err(
+            "fresh legacy open_connection_without_schema_management must fail closed on missing libra.db",
+        );
+        assert_eq!(
+            noschema_err.kind(),
+            io::ErrorKind::NotFound,
+            "expected NotFound from legacy open_connection_without_schema_management, got {noschema_err:?}"
+        );
+
+        // 5–6. Genuine unmodified legacy capture SQLite entrypoints
+        // (`src/internal/ai/capture/store.rs` — untouched in Track A per `GC-RB-06`).
+        let cap_legacy_ro_err =
+            crate::internal::ai::capture::store::open_readonly(storage, Duration::from_millis(50))
+                .await
+                .expect_err("fresh legacy capture::store::open_readonly must fail closed");
+        assert_eq!(
+            cap_legacy_ro_err.kind(),
+            io::ErrorKind::NotFound,
+            "expected NotFound from legacy capture::store::open_readonly, got {cap_legacy_ro_err:?}"
+        );
+
+        let cap_legacy_rw_err = crate::internal::ai::capture::store::open_existing_writer(
+            storage,
+            Duration::from_millis(50),
+        )
+        .await
+        .expect_err("fresh legacy capture::store::open_existing_writer must fail closed");
+        assert_eq!(
+            cap_legacy_rw_err.kind(),
+            io::ErrorKind::NotFound,
+            "expected NotFound from legacy capture::store::open_existing_writer, got {cap_legacy_rw_err:?}"
+        );
+
+        // 7–10. Raw SQLite driver open (`create_if_missing(false)`) in RW & RO modes on both DBs,
+        // strictly verifying numeric `SQLITE_CANTOPEN` (primary code 14).
+        for (label, target, ro) in [
+            ("git_rw", &git_db, false),
+            ("git_ro", &git_db, true),
+            ("cap_rw", &cap_db, false),
+            ("cap_ro", &cap_db, true),
+        ] {
+            let err = SqliteConnection::connect_with(
+                &SqliteConnectOptions::new()
+                    .filename(target)
+                    .create_if_missing(false)
+                    .read_only(ro)
+                    .busy_timeout(Duration::ZERO),
+            )
+            .await
+            .expect_err(&format!(
+                "raw legacy sqlite open `{label}` must fail closed"
+            ));
+            assert!(
+                is_sqlite_cantopen_error(&err),
+                "raw legacy sqlite open `{label}` must return numeric SQLITE_CANTOPEN (14), got {err:?}"
+            );
+        }
+
+        // 11–16. Legacy SQLite store wrappers for `libra.db` (RW & RO).
+        let git_rw_err = match SqliteGitStore::open(&git_db).await {
+            Ok(_) => panic!("SqliteGitStore::open must fail closed on missing libra.db"),
+            Err(err) => err,
+        };
+        assert_eq!(git_rw_err.stable_code_str(), "LBR-IO-001");
+        let git_ro_err = match SqliteGitStore::open_read_only(&git_db).await {
+            Ok(_) => panic!("SqliteGitStore::open_read_only must fail closed on missing libra.db"),
+            Err(err) => err,
+        };
+        assert_eq!(git_ro_err.stable_code_str(), "LBR-IO-001");
+
+        let cfg_rw_err = match SqliteConfigStore::open(&git_db, DatabaseRole::Repository).await {
+            Ok(_) => panic!("SqliteConfigStore::open must fail closed on missing libra.db"),
+            Err(err) => err,
+        };
+        assert_eq!(cfg_rw_err.stable_code_str(), "LBR-IO-001");
+        let cfg_ro_err =
+            match SqliteConfigStore::open_read_only(&git_db, DatabaseRole::Repository).await {
+                Ok(_) => {
+                    panic!("SqliteConfigStore::open_read_only must fail closed on missing libra.db")
+                }
+                Err(err) => err,
+            };
+        assert_eq!(cfg_ro_err.stable_code_str(), "LBR-IO-001");
+
+        let state_rw_err = match SqliteGitStateStore::open(&git_db).await {
+            Ok(_) => panic!("SqliteGitStateStore::open must fail closed on missing libra.db"),
+            Err(err) => err,
+        };
+        assert_eq!(state_rw_err.stable_code_str(), "LBR-IO-001");
+        let state_ro_err = match SqliteGitStateStore::open_read_only(&git_db).await {
+            Ok(_) => {
+                panic!("SqliteGitStateStore::open_read_only must fail closed on missing libra.db")
+            }
+            Err(err) => err,
+        };
+        assert_eq!(state_ro_err.stable_code_str(), "LBR-IO-001");
+
+        // 17–18. Legacy SQLite capture store wrappers for `private/capture.db` (RW & RO).
+        let cap_rw_err = match SqliteCaptureStore::open_read_write(&cap_db).await {
+            Ok(_) => {
+                panic!("SqliteCaptureStore::open_read_write must fail closed on missing capture.db")
+            }
+            Err(err) => err,
+        };
+        assert!(
+            matches!(cap_rw_err, StorageBackendError::NotFound { .. }),
+            "expected NotFound from SqliteCaptureStore::open_read_write, got {cap_rw_err:?}"
+        );
+        let cap_ro_err = match SqliteCaptureStore::open_read_only(&cap_db).await {
+            Ok(_) => {
+                panic!("SqliteCaptureStore::open_read_only must fail closed on missing capture.db")
+            }
+            Err(err) => err,
+        };
+        assert!(
+            matches!(cap_ro_err, StorageBackendError::NotFound { .. }),
+            "expected NotFound from SqliteCaptureStore::open_read_only, got {cap_ro_err:?}"
+        );
+
+        // 19. Authority detection must fail closed while manifest is `finalized = false`.
+        let auth_err = detect_storage_authority(storage)
+            .expect_err("detect_storage_authority must fail closed while finalized=false");
+        assert_eq!(auth_err.stable_code_str(), "LBR-IO-001");
+
+        // Verify ZERO database or sidecar files were recreated by any legacy open path.
+        for candidate in [
+            git_db.clone(),
+            sqlite_sidecar_path(&git_db, "-wal"),
+            sqlite_sidecar_path(&git_db, "-shm"),
+            sqlite_sidecar_path(&git_db, "-journal"),
+            cap_db.clone(),
+            sqlite_sidecar_path(&cap_db, "-wal"),
+            sqlite_sidecar_path(&cap_db, "-shm"),
+            sqlite_sidecar_path(&cap_db, "-journal"),
+        ] {
+            assert!(
+                !path_exists_no_open(&candidate).expect("check candidate non-existence"),
+                "legacy open attempt must NOT recreate `{}`",
+                candidate.display()
+            );
+        }
+
+        println!(
+            "RB10L_LEGACY_REJECT_OK pid={} checks=19",
+            std::process::id()
+        );
+        let _ = io::stdout().flush();
+    }
+
+    fn wait_child_exit_bounded(
+        child: &mut Child,
+        timeout: Duration,
+    ) -> Result<std::process::ExitStatus, String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => return Ok(status),
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(format!("child timed out after {timeout:?} and was killed"));
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(err) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!("try_wait failed: {err}"));
+                }
+            }
+        }
+    }
+
+    struct Rb10lChildProcess {
+        label: &'static str,
+        child: Option<Child>,
+        stdin: Option<ChildStdin>,
+        stdout_rx: Option<std::sync::mpsc::Receiver<io::Result<String>>>,
+        stderr_rx: Option<std::sync::mpsc::Receiver<String>>,
+        pid: u32,
+    }
+
+    impl Rb10lChildProcess {
+        fn spawn_raw(label: &'static str, mode: &str, git_db: &Path, cap_db: &Path) -> Self {
+            let exe = std::env::current_exe().expect("locate current test executable");
+            let mut child = Command::new(exe)
+                .arg("--exact")
+                .arg(
+                    "storage::migrate::tests::forward_phase2_external_os_exclusivity_and_fresh_legacy_reject",
+                )
+                .arg("--nocapture")
+                .env(RB10L_CHILD_MODE_ENV, mode)
+                .env(RB10L_CHILD_GIT_DB_ENV, git_db)
+                .env(RB10L_CHILD_CAP_DB_ENV, cap_db)
+                .env("LIBRA_TEST", "1")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn RB-10l continuous prober child");
+            let stdin = child.stdin.take().expect("capture child stdin");
+            let stdout = child.stdout.take().expect("capture child stdout");
+            let stderr = child.stderr.take().expect("capture child stderr");
+
+            let (out_tx, out_rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let mut reader = BufReader::new(stdout);
+                loop {
+                    let mut line = String::new();
+                    match reader.read_line(&mut line) {
+                        Ok(0) => break,
+                        Ok(_) => {
+                            if out_tx.send(Ok(line)).is_err() {
+                                break;
+                            }
+                        }
+                        Err(err) => {
+                            let _ = out_tx.send(Err(err));
+                            break;
+                        }
+                    }
+                }
+            });
+
+            let (err_tx, err_rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let mut reader = stderr;
+                let mut buf = String::new();
+                let _ = reader.read_to_string(&mut buf);
+                let _ = err_tx.send(buf);
+            });
+
+            Self {
+                label,
+                child: Some(child),
+                stdin: Some(stdin),
+                stdout_rx: Some(out_rx),
+                stderr_rx: Some(err_rx),
+                pid: 0,
+            }
+        }
+
+        fn kill_and_reap(&mut self) {
+            drop(self.stdin.take());
+            if let Some(child) = self.child.as_mut() {
+                if let Ok(None) = child.try_wait() {
+                    let _ = child.kill();
+                }
+                let _ = child.wait();
+            }
+        }
+
+        fn collect_stderr_bounded(&mut self, timeout: Duration) -> String {
+            self.stderr_rx
+                .take()
+                .and_then(|rx| rx.recv_timeout(timeout).ok())
+                .unwrap_or_default()
+        }
+
+        fn wait_ready(&mut self) {
+            let line = self.read_protocol_line("RB10L_READY ");
+            let pid_str = line
+                .trim()
+                .strip_prefix("RB10L_READY pid=")
+                .expect("parse RB10L_READY pid");
+            self.pid = pid_str.parse().expect("parse child pid integer");
+        }
+
+        fn send_cmd(&mut self, cmd: &str) {
+            let stdin = self.stdin.as_mut().expect("child stdin active");
+            writeln!(stdin, "{cmd}").expect("write child command");
+            stdin.flush().expect("flush child command");
+        }
+
+        fn read_protocol_line(&mut self, prefix: &str) -> String {
+            let deadline = Instant::now() + RB10L_CHILD_IO_TIMEOUT;
+            let mut captured = String::new();
+            loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let recv_res = self
+                    .stdout_rx
+                    .as_ref()
+                    .expect("child stdout receiver active")
+                    .recv_timeout(remaining);
+                match recv_res {
+                    Ok(Ok(line)) => {
+                        captured.push_str(&line);
+                        if line.starts_with(prefix) {
+                            return line;
+                        }
+                    }
+                    Ok(Err(err)) => {
+                        self.kill_and_reap();
+                        let stderr_buf = self.collect_stderr_bounded(Duration::from_millis(200));
+                        panic!(
+                            "RB-10l child `{}` stdout read error while awaiting `{prefix}`: {err}\nstdout:\n{captured}\nstderr:\n{stderr_buf}",
+                            self.label
+                        );
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        self.kill_and_reap();
+                        let stderr_buf = self.collect_stderr_bounded(Duration::from_millis(200));
+                        panic!(
+                            "RB-10l child `{}` timed out after {:?} awaiting `{prefix}`\nstdout:\n{captured}\nstderr:\n{stderr_buf}",
+                            self.label, RB10L_CHILD_IO_TIMEOUT
+                        );
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        let status = self
+                            .child
+                            .as_mut()
+                            .and_then(|c| wait_child_exit_bounded(c, Duration::from_secs(1)).ok());
+                        let stderr_buf = self.collect_stderr_bounded(Duration::from_millis(200));
+                        panic!(
+                            "RB-10l child `{}` exited before emitting `{prefix}` (status={status:?})\nstdout:\n{captured}\nstderr:\n{stderr_buf}",
+                            self.label
+                        );
+                    }
+                }
+            }
+        }
+
+        fn finish_and_collect(mut self) -> Rb10lProbeSummary {
+            let summary_line = self.read_protocol_line("SUMMARY ");
+            drop(self.stdin.take());
+            let mut trailing_stdout = String::new();
+            let drain_deadline = Instant::now() + RB10L_CHILD_IO_TIMEOUT;
+            if let Some(rx) = self.stdout_rx.as_ref() {
+                while let Some(rem) = drain_deadline.checked_duration_since(Instant::now()) {
+                    match rx.recv_timeout(rem) {
+                        Ok(Ok(line)) => trailing_stdout.push_str(&line),
+                        Ok(Err(_)) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            self.kill_and_reap();
+                            panic!(
+                                "RB-10l child `{}` timed out draining stdout on exit",
+                                self.label
+                            );
+                        }
+                    }
+                }
+            }
+            drop(self.stdout_rx.take());
+            let mut child = self.child.take().expect("child process present");
+            let status = wait_child_exit_bounded(&mut child, RB10L_CHILD_IO_TIMEOUT)
+                .unwrap_or_else(|msg| panic!("RB-10l child `{}` wait failed: {msg}", self.label));
+            let stderr_buf = self.collect_stderr_bounded(Duration::from_millis(500));
+            assert!(
+                status.success(),
+                "RB-10l child `{}` exited abnormally ({status:?}):\nstdout:\n{trailing_stdout}\nstderr:\n{stderr_buf}",
+                self.label
+            );
+            let summary = Rb10lProbeSummary::parse(&summary_line);
+            assert_eq!(summary.pid, self.pid);
+            summary
+        }
+    }
+
+    impl Drop for Rb10lChildProcess {
+        fn drop(&mut self) {
+            self.kill_and_reap();
+        }
+    }
+
+    struct Rb10lProberPair {
+        read: Rb10lChildProcess,
+        write: Rb10lChildProcess,
+        probe_elapsed: Duration,
+    }
+
+    impl Rb10lProberPair {
+        fn spawn(git_db: &Path, cap_db: &Path) -> Self {
+            let t0 = Instant::now();
+            // Spawn both independent OS child processes concurrently so dyld &
+            // Tokio initialization overlaps in parallel.
+            let mut read = Rb10lChildProcess::spawn_raw("read", "continuous_read", git_db, cap_db);
+            let mut write =
+                Rb10lChildProcess::spawn_raw("write", "continuous_write", git_db, cap_db);
+            read.wait_ready();
+            write.wait_ready();
+            Self {
+                read,
+                write,
+                probe_elapsed: t0.elapsed(),
+            }
+        }
+
+        fn start_target_both(&mut self, target: &str) {
+            let t0 = Instant::now();
+            let cmd = format!("START_TARGET {target}");
+            self.read.send_cmd(&cmd);
+            self.write.send_cmd(&cmd);
+            let prefix = format!("STARTED_TARGET {target} ");
+            let r = self.read.read_protocol_line(&prefix);
+            let w = self.write.read_protocol_line(&prefix);
+            self.probe_elapsed += t0.elapsed();
+            assert_eq!(
+                r.trim(),
+                format!("STARTED_TARGET {target} fail=0"),
+                "read prober START_TARGET `{target}` failed: {r}"
+            );
+            assert_eq!(
+                w.trim(),
+                format!("STARTED_TARGET {target} fail=0"),
+                "write prober START_TARGET `{target}` failed: {w}"
+            );
+        }
+
+        fn sync_both(&mut self, tag: &str) -> (Rb10lAckCounts, Rb10lAckCounts) {
+            let t0 = Instant::now();
+            let cmd = format!("SYNC {tag}");
+            self.read.send_cmd(&cmd);
+            self.write.send_cmd(&cmd);
+            let expected_prefix = format!("ACK {tag} ");
+            let r = self.read.read_protocol_line(&expected_prefix);
+            let w = self.write.read_protocol_line(&expected_prefix);
+            self.probe_elapsed += t0.elapsed();
+            let r_ack = parse_rb10l_ack(&r, tag);
+            let w_ack = parse_rb10l_ack(&w, tag);
+            assert_eq!(
+                r_ack.fail, 0,
+                "read prober SYNC `{tag}` detected non-BUSY result: {r}"
+            );
+            assert_eq!(
+                w_ack.fail, 0,
+                "write prober SYNC `{tag}` detected non-BUSY result: {w}"
+            );
+            (r_ack, w_ack)
+        }
+
+        #[cfg(unix)]
+        fn mark_unlinking_both(&mut self, target: &str) {
+            let t0 = Instant::now();
+            let cmd = format!("MARK_UNLINKING {target}");
+            self.read.send_cmd(&cmd);
+            self.write.send_cmd(&cmd);
+            let r = self.read.read_protocol_line("OK ");
+            let w = self.write.read_protocol_line("OK ");
+            self.probe_elapsed += t0.elapsed();
+            assert_eq!(r.trim(), "OK fail=0", "read MARK_UNLINKING failed: {r}");
+            assert_eq!(w.trim(), "OK fail=0", "write MARK_UNLINKING failed: {w}");
+        }
+
+        fn verify_unlinked_cantopen_both(&mut self, target: &str) {
+            let t0 = Instant::now();
+            let cmd = format!("VERIFY_UNLINKED {target}");
+            self.read.send_cmd(&cmd);
+            self.write.send_cmd(&cmd);
+            let r = self.read.read_protocol_line("OK ");
+            let w = self.write.read_protocol_line("OK ");
+            self.probe_elapsed += t0.elapsed();
+            assert_eq!(
+                r.trim(),
+                "OK fail=0",
+                "read VERIFY_UNLINKED `{target}` failed: {r}"
+            );
+            assert_eq!(
+                w.trim(),
+                "OK fail=0",
+                "write VERIFY_UNLINKED `{target}` failed: {w}"
+            );
+        }
+
+        fn stop_target_both(&mut self, target: &str) {
+            let t0 = Instant::now();
+            let cmd = format!("STOP {target}");
+            self.read.send_cmd(&cmd);
+            self.write.send_cmd(&cmd);
+            let prefix = format!("STOPPED {target} ");
+            let r = self.read.read_protocol_line(&prefix);
+            let w = self.write.read_protocol_line(&prefix);
+            self.probe_elapsed += t0.elapsed();
+            assert_eq!(
+                r.trim(),
+                format!("STOPPED {target} fail=0"),
+                "read STOP `{target}` failed: {r}"
+            );
+            assert_eq!(
+                w.trim(),
+                format!("STOPPED {target} fail=0"),
+                "write STOP `{target}` failed: {w}"
+            );
+        }
+
+        fn finish(mut self) -> (Rb10lProbeSummary, Rb10lProbeSummary, Duration) {
+            let t0 = Instant::now();
+            self.read.send_cmd("FINISH");
+            self.write.send_cmd("FINISH");
+            let read_summary = self.read.finish_and_collect();
+            let write_summary = self.write.finish_and_collect();
+            self.probe_elapsed += t0.elapsed();
+            (read_summary, write_summary, self.probe_elapsed)
+        }
+    }
+
+    #[tokio::test]
+    async fn forward_phase2_external_os_exclusivity_and_fresh_legacy_reject() {
+        // External OS child process dispatch (`AC1`, `AC2`, `AC3`).
+        if let Some(mode) = std::env::var_os(RB10L_CHILD_MODE_ENV) {
+            match mode.to_string_lossy().as_ref() {
+                "continuous_read" => {
+                    run_rb10l_continuous_prober_child(false).await;
+                    return;
+                }
+                "continuous_write" => {
+                    run_rb10l_continuous_prober_child(true).await;
+                    return;
+                }
+                "fresh_legacy_reject" => {
+                    let storage = PathBuf::from(
+                        std::env::var_os(RB10L_CHILD_STORAGE_ENV).expect("RB10L child storage env"),
+                    );
+                    run_rb10l_fresh_legacy_reject_child(&storage).await;
+                    return;
+                }
+                other => panic!("unexpected RB-10l child mode `{other}`"),
+            }
+        }
+
+        use crate::storage::{
+            FRAME_FLAG_NONE, SqliteCaptureStore, append_postcard_frame, init_capture_queue,
+        };
+
+        let dir = tempdir().expect("create RB-10l tempdir");
+        let storage = dir.path().join(".libra");
+        let git_db = git_sqlite_db_path(&storage);
+        let cap_db = capture_sqlite_db_path(&storage);
+        fs::create_dir_all(&storage).expect("create .libra");
+
+        // Build full Layout C fixture (`libra.db` + `private/capture.db` +
+        // `capture-spool/ready` + `capture-queue/normal`), leaving BOTH SQLite
+        // databases in WAL mode so Phase 1 exercises the full WAL -> checkpoint
+        // -> DELETE -> EXCLUSIVE quiescence path while external OS probes start
+        // at each database's exact lock acquisition!
+        populate_all_61_repository_tables(&git_db).await;
+        detach_inline_capture_tables(&git_db).await;
+        {
+            let _cap_store = SqliteCaptureStore::create(&cap_db)
+                .await
+                .expect("create RB-10l capture.db");
+        }
+        populate_capture_rows_via_sql(&cap_db, 0, None).await;
+        {
+            let mut g = SqliteConnection::connect_with(
+                &SqliteConnectOptions::new()
+                    .filename(&git_db)
+                    .create_if_missing(false),
+            )
+            .await
+            .expect("open git_db to seed WAL frame");
+            let jm: String = sea_orm::sqlx::query_scalar("PRAGMA journal_mode = WAL;")
+                .fetch_one(&mut g)
+                .await
+                .expect("set git_db WAL");
+            assert_eq!(jm.to_ascii_lowercase(), "wal");
+            g.execute("PRAGMA wal_autocheckpoint = 0;")
+                .await
+                .expect("disable git_db autocheckpoint");
+            g.execute(
+                "INSERT INTO reference (name, kind, \"commit\", remote) VALUES ('rb10l-wal-seed', 'Branch', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', NULL);",
+            )
+            .await
+            .expect("seed git_db WAL row");
+            // Disable close-time checkpointing so a genuinely populated `-wal`
+            // sidecar remains on disk when Phase 1 starts!
+            set_wal_checkpoint_on_close(&mut g, DatabaseRole::Repository, true)
+                .await
+                .expect("preserve populated git_db -wal on close");
+            g.close().await.expect("close git_db WAL seed");
+
+            let mut c = SqliteConnection::connect_with(
+                &SqliteConnectOptions::new()
+                    .filename(&cap_db)
+                    .create_if_missing(false),
+            )
+            .await
+            .expect("open cap_db to seed WAL frame");
+            let cjm: String = sea_orm::sqlx::query_scalar("PRAGMA journal_mode = WAL;")
+                .fetch_one(&mut c)
+                .await
+                .expect("set cap_db WAL");
+            assert_eq!(cjm.to_ascii_lowercase(), "wal");
+            c.execute("PRAGMA wal_autocheckpoint = 0;")
+                .await
+                .expect("disable cap_db autocheckpoint");
+            c.execute(
+                "INSERT INTO agent_audit_log (audit_id, timestamp, user_id, user_name, action, checkpoint_id, scope, export_path, justification, granted) VALUES ('aud-rb10l-wal', '2026-11-22T00:05:00Z', 'u1', 'Ada', 'export', 'cp-1', 'committed', NULL, 'wal-seed', 1);",
+            )
+            .await
+            .expect("seed cap_db WAL row");
+            set_wal_checkpoint_on_close(&mut c, DatabaseRole::Capture, true)
+                .await
+                .expect("preserve populated cap_db -wal on close");
+            c.close().await.expect("close cap_db WAL seed");
+        }
+        assert!(
+            fs::metadata(sqlite_sidecar_path(&git_db, "-wal"))
+                .expect("populated git_db -wal must remain before Phase 1")
+                .len()
+                > 0,
+            "git_db must enter Phase 1 with a genuinely populated -wal sidecar"
+        );
+        assert!(
+            fs::metadata(sqlite_sidecar_path(&cap_db, "-wal"))
+                .expect("populated cap_db -wal must remain before Phase 1")
+                .len()
+                > 0,
+            "cap_db must enter Phase 1 with a genuinely populated -wal sidecar"
+        );
+
+        let spool_ready = capture_spool_dir_path(&storage).join(CAPTURE_SPOOL_READY_SUBDIR);
+        fs::create_dir_all(&spool_ready).expect("create spool ready dir");
+        fs::write(
+            spool_ready.join("0001-rb10l.json"),
+            build_spool_envelope_bytes(
+                "codex",
+                "codex",
+                "22222222-2222-4222-8222-222222222295",
+                Some("dedup:rb10l:spool-1"),
+                "prov-rb10l",
+                "/work/rb10l",
+                &storage,
+                "session_start",
+                "2026-11-22T01:00:00Z",
+                "",
+            ),
+        )
+        .expect("write rb10l spool event");
+        let _q_init = init_capture_queue(&storage).expect("init capture queue");
+        append_postcard_frame(
+            &storage,
+            CaptureQueueLane::Normal,
+            FRAME_FLAG_NONE,
+            "dedup:rb10l:q-1",
+            CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+            &CaptureBatchPayload::InsertUsageStats(AgentUsageStatsRecord {
+                id: "usage-rb10l-1".to_string(),
+                session_id: None,
+                thread_id: None,
+                agent_run_id: None,
+                run_id: None,
+                provider: "openai".to_string(),
+                model: "gpt-5".to_string(),
+                request_kind: "chat".to_string(),
+                intent: None,
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                cached_tokens: 0,
+                reasoning_tokens: 0,
+                total_tokens: 15,
+                tool_call_count: 0,
+                wall_clock_ms: 10,
+                provider_latency_ms: Some(8),
+                cost_estimate_micro_dollars: Some(1_000),
+                cost_usd: Some(0.001),
+                usage_estimated: false,
+                started_at: None,
+                finished_at: None,
+                success: true,
+                error_kind: None,
+                schema_version: 1,
+                created_at: "2026-11-22T03:06:00Z".to_string(),
+                agent_name: Some("codex".to_string()),
+                repo_id: Some("repo-1".to_string()),
+                turn_id: Some("turn-rb10l-1".to_string()),
+                event_id: Some("evt-rb10l-1".to_string()),
+            }),
+        )
+        .expect("append rb10l queue frame");
+
+        // Spawn two genuinely separate independent OS child processes (AC1 read
+        // prober + AC2 write prober) ready to start continuous probing the
+        // exact instant each database acquires its Phase 1 SQLite lock!
+        let parent_pid = std::process::id();
+        let mut probers = Rb10lProberPair::spawn(&git_db, &cap_db);
+        assert_ne!(
+            probers.read.pid, parent_pid,
+            "read prober must be a separate OS PID"
+        );
+        assert_ne!(
+            probers.write.pid, parent_pid,
+            "write prober must be a separate OS PID"
+        );
+        assert_ne!(
+            probers.read.pid, probers.write.pid,
+            "read and write probers must be distinct independent OS PIDs"
+        );
+
+        // Run Phase 1 with continuous external OS read + write probing starting
+        // IMMEDIATELY at each database's lock acquisition (`GitDbLockAcquired`
+        // BEFORE `capture.db` locks and BEFORE WAL->DELETE finalization, then
+        // `CaptureDbLockAcquired` BEFORE WAL->DELETE finalization) and synced
+        // across every fd/backup/promote/verify boundary!
+        let mut phase1_points: Vec<Phase1TestPoint> = Vec::new();
+        let mut p1_end_read_cont = (0u64, 0u64);
+        let mut p1_end_write_cont = (0u64, 0u64);
+        let prepared = {
+            let mut p1_observer = |point: Phase1TestPoint, _root: &Path| -> StorageResult<()> {
+                phase1_points.push(point);
+                match point {
+                    Phase1TestPoint::GitDbLockAcquired => {
+                        probers.start_target_both("git");
+                    }
+                    Phase1TestPoint::CaptureDbLockAcquired => {
+                        probers.start_target_both("cap");
+                    }
+                    Phase1TestPoint::GitDbFinalized => {
+                        probers.sync_both("p1_git_finalized");
+                    }
+                    Phase1TestPoint::Quiesced => {
+                        probers.sync_both("p1_quiesced");
+                    }
+                    Phase1TestPoint::ExportedBeforeVerify => {
+                        probers.sync_both("p1_after_export");
+                    }
+                    Phase1TestPoint::VerifiedBeforePromote => {
+                        probers.sync_both("p1_after_verify");
+                    }
+                    Phase1TestPoint::PromotedBeforeBackup => {
+                        probers.sync_both("p1_after_promote");
+                    }
+                    Phase1TestPoint::BackedUpBeforeFinalVerify => {
+                        probers.sync_both("p1_after_backup");
+                    }
+                    Phase1TestPoint::FinalVerified => {
+                        let (r_ack, w_ack) = probers.sync_both("p1_after_final_verify");
+                        p1_end_read_cont = (r_ack.git_cont, r_ack.cap_cont);
+                        p1_end_write_cont = (w_ack.git_cont, w_ack.cap_cont);
+                    }
+                }
+                Ok(())
+            };
+            prepare_forward_phase1_with_observer(&storage, 1, &mut p1_observer)
+                .await
+                .expect("Phase 1 prepare must succeed under continuous OS probing")
+        };
+        assert_eq!(
+            phase1_points.len(),
+            9,
+            "all 9 Phase 1 observation checkpoints must execute"
+        );
+        assert!(
+            p1_end_read_cont.0 >= 2 && p1_end_read_cont.1 >= 2,
+            "continuous read probes must sample both DBs multiple times during Phase 1: {p1_end_read_cont:?}"
+        );
+        assert!(
+            p1_end_write_cont.0 >= 2 && p1_end_write_cont.1 >= 2,
+            "continuous write probes must sample both DBs multiple times during Phase 1: {p1_end_write_cont:?}"
+        );
+
+        // Immediately enter Phase 2 Step 2.1–2.2b while BOTH independent OS
+        // child probers continue probing non-stop across the Phase 1 -> Phase 2
+        // handoff all the way through held-lock `unlink` + `fsync_dir`!
+        let mut phase2_points: Vec<Phase2TestPoint> = Vec::new();
+        let state = {
+            let mut p2_observer = |point: Phase2TestPoint, _root: &Path| -> StorageResult<()> {
+                phase2_points.push(point);
+                match point {
+                    Phase2TestPoint::AfterPublishPendingManifest => {
+                        probers.sync_both("p2_pending_manifest");
+                    }
+                    Phase2TestPoint::BeforeFenceCommit(DatabaseRole::Repository) => {
+                        probers.sync_both("p2_git_before_fence_commit");
+                    }
+                    Phase2TestPoint::AfterFenceCommitBeforePersistReady(
+                        DatabaseRole::Repository,
+                    ) => {
+                        // Hold a brief deterministic window so continuous 500µs
+                        // background probes sample the post-fence pre-unlink
+                        // state multiple times in addition to synchronous ticks.
+                        std::thread::sleep(Duration::from_millis(3));
+                        probers.sync_both("p2_git_after_fence_commit");
+                    }
+                    Phase2TestPoint::AfterPersistReadyBeforeUnlink(DatabaseRole::Repository) => {
+                        probers.sync_both("p2_git_before_unlink");
+                        #[cfg(unix)]
+                        probers.mark_unlinking_both("git");
+                        // On Windows, SQLite's Win32 VFS forbids deleting an
+                        // open database handle without `FILE_SHARE_DELETE`, so
+                        // `unlink_fenced_sqlite_source_and_close` closes `c_mig`
+                        // after committing `__libra_migrated_fence__` while all
+                        // 6 non-SQLite locks remain held, then immediately
+                        // deletes the file via `FileDispositionInfo`.
+                        #[cfg(not(unix))]
+                        probers.stop_target_both("git");
+                    }
+                    Phase2TestPoint::AfterUnlinkBeforeParentDirFsync(DatabaseRole::Repository) => {
+                        #[cfg(unix)]
+                        {
+                            // Even AFTER `unlink(libra.db)`, `c_mig(git)` still
+                            // holds the POSIX `EXCLUSIVE` lock on the unlinked
+                            // inode, while fresh path opens get `SQLITE_CANTOPEN`!
+                            std::thread::sleep(Duration::from_millis(3));
+                            probers.sync_both("p2_git_after_unlink");
+                        }
+                        probers.verify_unlinked_cantopen_both("git");
+                    }
+                    Phase2TestPoint::AfterParentDirFsyncBeforeClose(DatabaseRole::Repository) => {
+                        #[cfg(unix)]
+                        {
+                            probers.sync_both("p2_git_after_dir_fsync");
+                            probers.stop_target_both("git");
+                        }
+                    }
+                    Phase2TestPoint::AfterCloseBeforePersistUnlinked(DatabaseRole::Repository) => {
+                        probers.sync_both("p2_git_closed_cap_still_busy");
+                    }
+                    Phase2TestPoint::AfterPersistUnlinked(DatabaseRole::Repository) => {
+                        probers.sync_both("p2_git_unlinked_cap_still_busy");
+                    }
+                    Phase2TestPoint::BeforeFenceCommit(DatabaseRole::Capture) => {
+                        probers.sync_both("p2_cap_before_fence_commit");
+                    }
+                    Phase2TestPoint::AfterFenceCommitBeforePersistReady(DatabaseRole::Capture) => {
+                        std::thread::sleep(Duration::from_millis(3));
+                        probers.sync_both("p2_cap_after_fence_commit");
+                    }
+                    Phase2TestPoint::AfterPersistReadyBeforeUnlink(DatabaseRole::Capture) => {
+                        probers.sync_both("p2_cap_before_unlink");
+                        #[cfg(unix)]
+                        probers.mark_unlinking_both("cap");
+                        #[cfg(not(unix))]
+                        probers.stop_target_both("cap");
+                    }
+                    Phase2TestPoint::AfterUnlinkBeforeParentDirFsync(DatabaseRole::Capture) => {
+                        #[cfg(unix)]
+                        {
+                            std::thread::sleep(Duration::from_millis(3));
+                            probers.sync_both("p2_cap_after_unlink");
+                        }
+                        probers.verify_unlinked_cantopen_both("cap");
+                    }
+                    Phase2TestPoint::AfterParentDirFsyncBeforeClose(DatabaseRole::Capture) => {
+                        #[cfg(unix)]
+                        {
+                            probers.sync_both("p2_cap_after_dir_fsync");
+                            probers.stop_target_both("cap");
+                        }
+                    }
+                    Phase2TestPoint::AfterCloseBeforePersistUnlinked(DatabaseRole::Capture)
+                    | Phase2TestPoint::AfterPersistUnlinked(DatabaseRole::Capture) => {}
+                    _ => {}
+                }
+                Ok(())
+            };
+            execute_forward_phase2_fence_and_unlink_inner(prepared, Some(&mut p2_observer))
+                .await
+                .expect("Phase 2 Step 2.1–2.2b must succeed under continuous OS probing")
+        };
+        assert_eq!(
+            phase2_points.len(),
+            15,
+            "all 15 Phase 2 observation checkpoints must execute"
+        );
+
+        let (read_summary, write_summary, mut probe_elapsed) = probers.finish();
+
+        // AC1 & AC2 verification: 100% strict numeric `SQLITE_BUSY` (primary
+        // code 5) across BOTH continuous background loops (in BOTH Phase 1 and
+        // Phase 2!) and every synchronized checkpoint, with ZERO successes and
+        // ZERO non-BUSY errors!
+        for (label, summary, p1_cont) in [
+            ("read", &read_summary, p1_end_read_cont),
+            ("write", &write_summary, p1_end_write_cont),
+        ] {
+            assert_eq!(
+                summary.unexpected_ok, 0,
+                "RB-10l {label} prober observed unexpected lock-leak success: {summary:?}"
+            );
+            assert_eq!(
+                summary.unexpected_err, 0,
+                "RB-10l {label} prober observed non-SQLITE_BUSY error: {summary:?}"
+            );
+            assert_eq!(summary.detail, "none", "unexpected detail in {summary:?}");
+            assert!(
+                summary.git_cont > p1_cont.0 && summary.cap_cont > p1_cont.1,
+                "RB-10l {label} prober must continuously sample BOTH Phase 1 ({p1_cont:?}) and Phase 2: {summary:?}"
+            );
+            assert!(
+                summary.git_sync >= 13 && summary.cap_sync >= 17,
+                "RB-10l {label} prober must hit every Phase 1 + Phase 2 sync checkpoint: {summary:?}"
+            );
+            assert!(
+                summary.git_fresh >= 12 && summary.cap_fresh >= 17,
+                "RB-10l {label} prober must block fresh path opens at every pre-unlink checkpoint: {summary:?}"
+            );
+            assert_eq!(
+                summary.git_cantopen, 1,
+                "RB-10l {label} prober must confirm numeric SQLITE_CANTOPEN (14) on unlinked libra.db"
+            );
+            assert_eq!(
+                summary.cap_cantopen, 1,
+                "RB-10l {label} prober must confirm numeric SQLITE_CANTOPEN (14) on unlinked capture.db"
+            );
+            #[cfg(unix)]
+            assert!(
+                summary.git_post_unlink >= 3 && summary.cap_post_unlink >= 3,
+                "RB-10l {label} prober must prove held-inode SQLITE_BUSY persists after unlink+fsync_dir before c_mig.close(): {summary:?}"
+            );
+        }
+
+        // Release all 6 non-SQLite migration locks BEFORE running AC3 so we
+        // prove the fresh legacy SQLite binary fails closed strictly because
+        // `.libra/libra.db` and `.libra/private/capture.db` are missing (not
+        // because migration locks are held).
+        assert_eq!(
+            state.manifest.phase2_progress.git_db,
+            Some(Phase2DbState::Unlinked)
+        );
+        assert_eq!(
+            state.manifest.phase2_progress.capture_db,
+            Some(Phase2DbState::Unlinked)
+        );
+        state.release_locks();
+
+        // AC3: Spawn a brand-new independent OS child process (bounded deadline,
+        // killed & reaped on timeout) exercising genuine unmodified Track A
+        // legacy SQLite binary entrypoints across 19 fail-closed checks with
+        // ZERO file recreation!
+        let legacy_t0 = Instant::now();
+        let exe = std::env::current_exe().expect("locate current test executable");
+        let mut legacy_child = Command::new(exe)
+            .arg("--exact")
+            .arg(
+                "storage::migrate::tests::forward_phase2_external_os_exclusivity_and_fresh_legacy_reject",
+            )
+            .arg("--nocapture")
+            .env(RB10L_CHILD_MODE_ENV, "fresh_legacy_reject")
+            .env(RB10L_CHILD_STORAGE_ENV, &storage)
+            .env("LIBRA_TEST", "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn fresh legacy SQLite reject child");
+        let legacy_out_pipe = legacy_child.stdout.take().expect("legacy child stdout");
+        let legacy_err_pipe = legacy_child.stderr.take().expect("legacy child stderr");
+        let (legacy_out_tx, legacy_out_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut r = legacy_out_pipe;
+            let mut s = String::new();
+            let _ = r.read_to_string(&mut s);
+            let _ = legacy_out_tx.send(s);
+        });
+        let (legacy_err_tx, legacy_err_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut r = legacy_err_pipe;
+            let mut s = String::new();
+            let _ = r.read_to_string(&mut s);
+            let _ = legacy_err_tx.send(s);
+        });
+        let legacy_status = wait_child_exit_bounded(&mut legacy_child, RB10L_CHILD_IO_TIMEOUT)
+            .unwrap_or_else(|msg| panic!("fresh legacy reject child failed bounded wait: {msg}"));
+        let legacy_stdout = legacy_out_rx
+            .recv_timeout(Duration::from_millis(500))
+            .unwrap_or_default();
+        let legacy_stderr = legacy_err_rx
+            .recv_timeout(Duration::from_millis(500))
+            .unwrap_or_default();
+        probe_elapsed += legacy_t0.elapsed();
+
+        assert!(
+            legacy_status.success() && legacy_stdout.contains("RB10L_LEGACY_REJECT_OK "),
+            "fresh legacy reject child failed ({legacy_status:?}):\nstdout:\n{legacy_stdout}\nstderr:\n{legacy_stderr}"
+        );
+        let legacy_pid: u32 = legacy_stdout
+            .lines()
+            .find_map(|l| l.strip_prefix("RB10L_LEGACY_REJECT_OK pid="))
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|p| p.parse().ok())
+            .expect("parse fresh legacy child pid");
+        assert_ne!(
+            legacy_pid, parent_pid,
+            "fresh legacy rejector must run in a distinct OS process"
+        );
+        assert_ne!(legacy_pid, read_summary.pid);
+        assert_ne!(legacy_pid, write_summary.pid);
+
+        // Confirm parent-side state remains completely clean after legacy probes.
+        assert!(!path_exists_no_open(&git_db).expect("check git_db absent"));
+        assert!(!path_exists_no_open(&cap_db).expect("check cap_db absent"));
+        assert!(git_redb_path(&storage, 1).is_file());
+        assert!(capture_redb_path(&storage, 1).is_file());
+        assert!(sqlite_backup_git_db_path(&storage, 1).is_file());
+        assert!(sqlite_backup_capture_db_path(&storage, 1).is_file());
+
+        // Performance budget (`RB-10l`): total cross-process probe detection
+        // overhead <= 500ms!
+        assert!(
+            probe_elapsed <= Duration::from_millis(500),
+            "RB-10l cross-process probe detection budget exceeded: {:?} > 500ms (read={read_summary:?}, write={write_summary:?})",
+            probe_elapsed
+        );
     }
 }
