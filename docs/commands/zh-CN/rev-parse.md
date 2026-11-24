@@ -41,7 +41,7 @@ libra rev-parse --show-ref-storage-format
 | 标志 | 说明 |
 |------|-------------|
 | `--verify` | 断言 `<SPEC>` 恰好解析为一个实际存在的对象；成功时打印对象 ID，失败退出 128（全局 `--quiet` / `-q` 下静默退出 1）。 |
-| `--short` | 打印无歧义的缩写对象 ID。 |
+| `--short[=<n>]` | 打印无歧义的缩写对象 ID：从 `<n>`（默认 7，最小 4）开始逐位加长，直到没有**其它**对象共享该前缀。当前哈希长度的全长对象 ID，即使对象不在库中也接受（Git 同样会缩写）；`--verify --short` 保持该行为，而 `--verify` 不带 `--short` 仍要求对象存在。 |
 | `--sq` | 对解析出的对象名做单引号 shell 引用，便于安全地交给 shell 消费。仅影响解析出的修订输出，不影响 `--show-toplevel` 等查询模式。 |
 | `--abbrev-ref` | 打印符号分支名，而不是提交哈希。 |
 | `--symbolic-full-name` | 将 spec 解析为完整 ref 名（`refs/heads/<分支>`、`refs/tags/<标签>`、`refs/remotes/<远程>/<分支>`，分离 HEAD 时为 `HEAD`）。有效但非 ref 的对象不输出（退出码 0）；不可解析名以退出码 128 失败。 |

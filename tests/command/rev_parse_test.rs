@@ -2535,3 +2535,122 @@ fn describe_suffix_refs_namespaces_accept_non_commit_objects() {
         assert_eq!(resolve(&format!("{prefix}x-1-g{}", &tree[..8])), tree);
     }
 }
+
+/// PM-05: `--short` abbreviates a full-length oid that is not in the object
+/// store, and lengthens until no OTHER object shares the prefix.
+#[test]
+fn rev_parse_short_abbreviates_absent_full_oid() {
+    let repo = tempdir().expect("failed to create repository root");
+    init_repo_via_cli(repo.path());
+    // Two stored blobs share the `1c5a` prefix; U is a blob oid that is absent.
+    for body in [
+        "ambiguity fixture blob 307\n",
+        "ambiguity fixture blob 367\n",
+    ] {
+        let out =
+            run_libra_command_with_stdin(&["hash-object", "-w", "--stdin"], repo.path(), body);
+        assert_cli_success(&out, "write ambiguity blob");
+    }
+    let absent = "d1dac3c4cf349b414147a37961aed67bd3ae0f8c";
+
+    // AC1: the default length is 7.
+    let out = run_libra_command(&["rev-parse", "--short", absent], repo.path());
+    assert_cli_success(&out, "AC1");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "d1dac3c\n", "AC1");
+
+    // AC2: starting at 4 lengthens to 5 because two objects share `1c5a`.
+    let out = run_libra_command(
+        &[
+            "rev-parse",
+            "--short=4",
+            "1c5a000000000000000000000000000000000000",
+        ],
+        repo.path(),
+    );
+    assert_cli_success(&out, "AC2");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1c5a0\n", "AC2");
+
+    // AC3: `--verify --short` accepts the absent full oid too.
+    let out = run_libra_command(&["rev-parse", "--verify", "--short", absent], repo.path());
+    assert_cli_success(&out, "AC3");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "d1dac3c\n", "AC3");
+
+    // AC8: an object that IS present still lengthens past a shared prefix.
+    let out = run_libra_command(
+        &[
+            "rev-parse",
+            "--short=4",
+            "1c5ab359df64c2b76ea748b81060685d892f0add",
+        ],
+        repo.path(),
+    );
+    assert_cli_success(&out, "AC8");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "1c5ab\n", "AC8");
+}
+
+/// PM-05: SHA-256 abbreviations, a 40-hex id in a SHA-256 repo, and the two
+/// rejection paths.
+#[test]
+fn rev_parse_short_rejects_invalid_specs() {
+    // AC4: a 64-hex absent oid abbreviates under SHA-256.
+    let repo = tempdir().expect("failed to create repository root");
+    assert_cli_success(
+        &run_libra_command(&["init", "--object-format", "sha256"], repo.path()),
+        "init sha256",
+    );
+    run_libra_command(&["config", "set", "user.name", "t"], repo.path());
+    run_libra_command(&["config", "set", "user.email", "t@t"], repo.path());
+    let written = run_libra_command_with_stdin(
+        &["hash-object", "-w", "--stdin"],
+        repo.path(),
+        "pre simple\n",
+    );
+    assert_cli_success(&written, "write sha256 blob");
+    let u256 = String::from_utf8_lossy(&written.stdout).trim().to_string();
+    assert!(u256.starts_with("ee9c708"), "fixture oid: {u256}");
+    let loose = repo
+        .path()
+        .join(".libra")
+        .join("objects")
+        .join(&u256[..2])
+        .join(&u256[2..]);
+    std::fs::remove_file(&loose).expect("delete the loose blob");
+    let out = run_libra_command(&["rev-parse", "--short", &u256], repo.path());
+    assert_cli_success(&out, "AC4");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ee9c708\n", "AC4");
+
+    // AC5: a 40-hex id is not a full-length id in a SHA-256 repository.
+    let out = run_libra_command(
+        &[
+            "rev-parse",
+            "--short",
+            "d1dac3c4cf349b414147a37961aed67bd3ae0f8c",
+        ],
+        repo.path(),
+    );
+    assert!(!out.status.success(), "AC5 must fail");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("LBR-CLI-003"),
+        "AC5 code"
+    );
+
+    // AC6/AC7: unresolvable names and ambiguous short prefixes fail.
+    let sha1 = tempdir().expect("failed to create repository root");
+    init_repo_via_cli(sha1.path());
+    for body in [
+        "ambiguity fixture blob 307\n",
+        "ambiguity fixture blob 367\n",
+    ] {
+        let out =
+            run_libra_command_with_stdin(&["hash-object", "-w", "--stdin"], sha1.path(), body);
+        assert_cli_success(&out, "write ambiguity blob");
+    }
+    for spec in ["nosuchref", "1c5a"] {
+        let out = run_libra_command(&["rev-parse", "--short", spec], sha1.path());
+        assert!(!out.status.success(), "{spec} must fail");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("LBR-CLI-003"),
+            "{spec} code"
+        );
+    }
+}

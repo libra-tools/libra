@@ -70,3 +70,5 @@ flowchart TD
 - 改进本命令前，必须先阅读并遵循 [docs/development/commands/_general.md](_general.md)；这是命令设计、实现、测试和文档同步的强制要求。
 - 任何行为变更都要先核对实现源码，再同步 `COMPATIBILITY.md`、`docs/commands/<cmd>.md` 和相关测试。
 - 新增 Git 兼容参数时必须明确 tier、错误码、JSON/机器输出契约和回归测试。
+
+- 2026-11-23（PM-05 / #839）：`--short` 对当前哈希长度的全长十六进制不再要求对象存在（`--verify` 不带 `--short` 的存在性证明不变）；缩写改为 Git `repo_find_unique_abbrev` 语义——从请求长度（默认 7、下限 4、上限哈希长度）起逐位加长直到没有**其它**对象共享前缀，对象在库与否都适用。回归：`rev_parse_short_abbreviates_absent_full_oid`（AC1–AC3/AC8）、`rev_parse_short_rejects_invalid_specs`（AC4–AC7）；`rev_parse_test` 66/66。

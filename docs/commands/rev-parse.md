@@ -83,7 +83,7 @@ suffix). The `refs/`-qualified forms (`refs/tags/`, `refs/heads/`,
 | Flag | Description |
 |------|-------------|
 | `--verify` | Assert that `<SPEC>` resolves to exactly one object; print it, or exit 128 on failure (silent exit 1 under the global `--quiet` / `-q`). |
-| `--short` | Print a non-ambiguous abbreviated object ID. |
+| `--short[=<n>]` | Print a non-ambiguous abbreviated object ID: start at `<n>` (default 7, minimum 4) and lengthen digit by digit until no OTHER object shares the prefix. A full-length object ID of the repository's hash kind is accepted even when the object is absent (Git abbreviates it anyway); `--verify --short` keeps that behaviour, while `--verify` without `--short` still requires the object to exist. |
 | `--sq` | Shell-quote the resolved object name (single-quoted) for safe shell consumption. Only affects the resolved-revision output, not query modes like `--show-toplevel`. |
 | `--abbrev-ref` | Print the symbolic branch name instead of a commit hash. |
 | `--symbolic-full-name` | Resolve the spec to its full ref name (`refs/heads/<branch>`, `refs/tags/<tag>`, `refs/remotes/<remote>/<branch>`, or `HEAD` when detached). A valid object that is not a ref prints nothing (exit 0); an unresolvable name fails with exit 128. |

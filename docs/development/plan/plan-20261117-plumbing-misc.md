@@ -859,7 +859,7 @@ PY
 ### Task PM-05: 修复 `rev-parse --short` 对不在库中的全长 OID 的缩写（#839）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-23：`rev-parse --short` 先以 `parse_repo_oid` 识别当前哈希长度的全长 OID，命中即直接采用（不要求对象存在），否则走既有解析；`--verify` 仅在**不带** `--short` 时保留存在性证明；`resolve_short_commit` 改为 Git `repo_find_unique_abbrev` 语义——起始长度 = max(请求值或 7, 4) 且不超过哈希长度，逐位加长直到匹配集合中只剩自身（对象不在库时集合为空即视为唯一）；AC1–AC3/AC8 由 `command::rev_parse_test::rev_parse_short_abbreviates_absent_full_oid` 覆盖，AC4–AC7 由 `rev_parse_short_rejects_invalid_specs` 覆盖；`rev_parse_test` 66/66；EN/zh/开发文档与 `COMPATIBILITY.md` 的 `rev-parse` 行同步。
 **Description:** 修正 `src/command/rev_parse.rs` 的 `--short` 路径：当 spec 为当前哈希长度的全长十六进制 OID 时不再要求对象存在（`--verify` 不带 `--short` 时的存在性证明保持不变），并把缩写计算改为 Git `repo_find_unique_abbrev` 语义——从请求长度（默认 7，下限 4、上限为哈希长度）起逐位加长，直到库中没有**其它**对象共享该前缀；对象在库与否都适用（AC2 为不在库的全长 OID，AC8 为在库对象）；长度下限 4 与上限的钳制不单独验收。
 **Out of scope:** `--verify <全长 hex>`（不带 `--short`）的存在性证明（保持现状，`COMPATIBILITY.md` 已登记的有意差异）；`--short` 无参数时默认 HEAD、`--short=abc` 报错、`core.abbrev`（尚未排期，重启条件：后续 rev-parse 兼容计划）；`--show-object-format`（`PM-06`）。
 **Current evidence:**

@@ -661,14 +661,22 @@ async fn resolve_rev_parse(spec: &str, args: &RevParseArgs) -> CliResult<RevPars
         });
     }
 
-    let object_id = util::resolve_object_spec_with_auto_merge_typed(spec)
-        .await
-        .map_err(|err| rev_parse_target_error(spec, err))?;
-    let object_id = if args.verify || args.short.is_some() {
-        util::require_object_exists_typed(object_id, spec)
-            .map_err(|err| rev_parse_target_error(spec, err))?
-    } else {
-        object_id
+    // `--short` accepts a full-length object id even when the object is absent
+    // (Git abbreviates it anyway); every other spelling still resolves normally.
+    // `--verify` without `--short` keeps its existence proof.
+    let object_id = match crate::internal::object_format::parse_repo_oid(spec) {
+        Ok(full_oid) if args.short.is_some() => full_oid,
+        _ => {
+            let resolved = util::resolve_object_spec_with_auto_merge_typed(spec)
+                .await
+                .map_err(|err| rev_parse_target_error(spec, err))?;
+            if args.verify && args.short.is_none() {
+                util::require_object_exists_typed(resolved, spec)
+                    .map_err(|err| rev_parse_target_error(spec, err))?
+            } else {
+                resolved
+            }
+        }
     };
     let value = if let Some(short_len) = &args.short {
         let requested_len: usize = short_len.parse().map_err(|_| {
@@ -899,7 +907,14 @@ async fn resolve_short_commit(
     let full = commit.to_string();
     let storage = util::objects_storage()?;
 
-    let min_len = requested_len.unwrap_or(SHORT_HASH_LEN).max(1);
+    // Git's `repo_find_unique_abbrev`: start at the requested length (default 7,
+    // never below 4) and lengthen until no OTHER object shares the prefix. The
+    // object itself need not exist: an absent full id is still abbreviated.
+    const MIN_SHORT_HASH_LEN: usize = 4;
+    let min_len = requested_len
+        .unwrap_or(SHORT_HASH_LEN)
+        .max(MIN_SHORT_HASH_LEN)
+        .min(full.len());
 
     for len in min_len..=full.len() {
         let prefix = &full[..len];
@@ -910,7 +925,7 @@ async fn resolve_short_commit(
             .with_stable_code(StableErrorCode::IoReadFailed)
         })?;
 
-        if matches.len() == 1 && matches[0] == *commit {
+        if matches.iter().all(|candidate| *candidate == *commit) {
             return Ok(prefix.to_string());
         }
     }
