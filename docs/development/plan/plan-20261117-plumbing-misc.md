@@ -1361,7 +1361,7 @@ PY
 ### Task PM-23: 实现 `notes merge --abort` / `--quit`（#989；自 PM-09 拆出；拆出 PM-39）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-23：新增 `notes merge --abort`/`--quit`（互斥、与 `--commit` 互斥）；`notes::abort_merge` 先取 `NOTES_MERGE_LOCK`，再逐路径删除 `NOTES_MERGE_STATE`/`NOTES_MERGE_WORKTREE`/`NOTES_MERGE_COMMITTING`（部分残留同样清理），不改 `notes` 表；无任何残留 → `LBR-REPO-003`，锁已存在 → `LBR-CONFLICT-002`；`--quit` 语义相同（Libra 扩展）。AC1–AC8 由 `command::notes_test::notes_merge_abort_and_quit_discard_state` 覆盖；`notes_test` 84/84；EN/zh/开发文档与 `COMPATIBILITY.md` 的 `notes` 行同步；网站按家族规则只做后端本地签名提交（未推送，推送与部署核验由 `PM-24` 执行）。
 **Description:** 自 `PM-09` 拆出：`libra notes merge --abort` 删除当前工作区的 `NOTES_MERGE_STATE`、`NOTES_MERGE_WORKTREE/` 与 `NOTES_MERGE_COMMITTING`（只有部分残留时同样清理），不改 `notes` 表；`--quit` 为 Libra 扩展（Git 2.56 无此选项），语义与 `--abort` 相同；无任何合并状态时 `--abort`/`--quit` 以 `LBR-REPO-003` 失败。本卡实现的命令形式遵守 ADR-PM-02 的锁规则：所有 `notes merge` 形式在读取或修改合并状态前以排他创建 `NOTES_MERGE_LOCK`（当前工作区 gitdir）取得互斥，结束时（成功或失败）删除；锁已存在即以 `LBR-CONFLICT-002` 失败且不读写任何状态（陈旧锁由用户确认无进程后手工删除，提示给出路径）。（按 G-09 拆出 `PM-39` 承接控制形式与选项互斥。）
 **Out of scope:** 冲突物化（`PM-09`）；`--commit`（`PM-29`、`PM-38`）；控制形式与选项互斥（`PM-39`）；不单独验收的同路径情形：`--quit` 在无合并状态与锁已存在时的失败（与 `--abort` 共用同一状态检查与取锁代码，本卡以 `--abort` 验收）、AC5 之外的其余部分残留组合（同一逐路径清理）。
 **Current evidence:**

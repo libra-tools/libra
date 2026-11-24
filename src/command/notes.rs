@@ -147,6 +147,14 @@ pub enum NotesSubcommand {
         /// Apply a materialized manual merge (`notes merge --commit`)
         #[clap(long)]
         commit: bool,
+
+        /// Discard the current notes merge state (`--abort`)
+        #[clap(long, conflicts_with = "commit")]
+        abort: bool,
+
+        /// Same as `--abort` (Libra extension; Git 2.56 has no --quit)
+        #[clap(long, conflicts_with_all = ["commit", "abort"])]
+        quit: bool,
     },
     /// Remove notes for objects that no longer exist in the object store
     Prune {
@@ -519,7 +527,13 @@ pub async fn execute_safe(
             other_ref,
             strategy,
             commit,
+            abort,
+            quit,
         } => {
+            if abort || quit {
+                notes::abort_merge().await.map_err(NotesCliError::from)?;
+                return Ok(());
+            }
             if commit {
                 let result = notes::commit_merge().await.map_err(NotesCliError::from)?;
                 let out = NotesOutput::Merge {

@@ -2767,3 +2767,146 @@ fn notes_merge_commit_retry_after_crash() {
     );
     let _ = blob(p, "unused");
 }
+
+/// PM-23: `notes merge --abort` / `--quit` discard the merge state without
+/// touching the notes table.
+#[test]
+fn notes_merge_abort_and_quit_discard_state() {
+    use notes_merge_commit_support::rows;
+
+    let build = || {
+        let repo = tempdir().expect("failed to create repository root");
+        init_repo_via_cli(repo.path());
+        configure_identity_via_cli(repo.path());
+        let p = repo.path();
+        std::fs::write(p.join("a.txt"), "a\n").unwrap();
+        assert_cli_success(&run_libra_command(&["add", "a.txt"], p), "add a");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "c1", "--no-verify"], p),
+            "commit c1",
+        );
+        std::fs::write(p.join("b.txt"), "b\n").unwrap();
+        assert_cli_success(&run_libra_command(&["add", "b.txt"], p), "add b");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "c2", "--no-verify"], p),
+            "commit c2",
+        );
+        let c1 = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD~1"], p).stdout)
+            .trim()
+            .to_string();
+        let c2 = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], p).stdout)
+            .trim()
+            .to_string();
+        assert_cli_success(
+            &run_libra_command(&["notes", "add", "-m", "x", &c1], p),
+            "notes add x",
+        );
+        assert_cli_success(
+            &run_libra_command(
+                &["notes", "--ref", "refs/notes/other", "add", "-m", "y", &c1],
+                p,
+            ),
+            "notes other y",
+        );
+        assert_cli_success(
+            &run_libra_command(
+                &[
+                    "notes",
+                    "--ref",
+                    "refs/notes/other",
+                    "add",
+                    "-m",
+                    "only other",
+                    &c2,
+                ],
+                p,
+            ),
+            "notes other c2",
+        );
+        (repo, c1)
+    };
+    let state_absent = |p: &std::path::Path| {
+        for name in [
+            "NOTES_MERGE_STATE",
+            "NOTES_MERGE_WORKTREE",
+            "NOTES_MERGE_COMMITTING",
+        ] {
+            assert!(
+                !p.join(".libra").join(name).exists(),
+                "state {name} removed"
+            );
+        }
+    };
+
+    // AC1/AC2: abort clears everything and leaves the notes table untouched.
+    let (repo, _c1) = build();
+    let p = repo.path();
+    let s0 = rows(p);
+    assert!(
+        !run_libra_command(&["notes", "merge", "refs/notes/other"], p)
+            .status
+            .success()
+    );
+    assert_cli_success(
+        &run_libra_command(&["notes", "merge", "--abort"], p),
+        "AC1 abort",
+    );
+    state_absent(p);
+    assert_eq!(rows(p), s0, "AC2 notes unchanged");
+
+    // AC3/AC4: `--quit` has the same semantics (Libra extension).
+    let (repo, _c1) = build();
+    let p = repo.path();
+    let s0 = rows(p);
+    assert!(
+        !run_libra_command(&["notes", "merge", "refs/notes/other"], p)
+            .status
+            .success()
+    );
+    assert_cli_success(
+        &run_libra_command(&["notes", "merge", "--quit"], p),
+        "AC3 quit",
+    );
+    state_absent(p);
+    assert_eq!(rows(p), s0, "AC4 notes unchanged");
+
+    // AC5/AC6: a partial residue (worktree + marker, no STATE) is cleaned too.
+    let (repo, _c1) = build();
+    let p = repo.path();
+    let s2 = rows(p);
+    std::fs::create_dir_all(p.join(".libra").join("NOTES_MERGE_WORKTREE")).unwrap();
+    std::fs::write(p.join(".libra").join("NOTES_MERGE_COMMITTING"), b"").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["notes", "merge", "--abort"], p),
+        "AC5 abort",
+    );
+    state_absent(p);
+    assert_eq!(rows(p), s2, "AC6 notes unchanged");
+
+    // AC7: no merge state at all.
+    let plain = tempdir().expect("failed to create repository root");
+    init_repo_via_cli(plain.path());
+    configure_identity_via_cli(plain.path());
+    let none = run_libra_command(&["notes", "merge", "--abort"], plain.path());
+    assert!(!none.status.success(), "AC7 must fail");
+    assert!(
+        String::from_utf8_lossy(&none.stderr).contains("LBR-REPO-003"),
+        "AC7 code"
+    );
+
+    // AC8: an existing lock wins over the state check.
+    let (repo, _c1) = build();
+    let p = repo.path();
+    assert!(
+        !run_libra_command(&["notes", "merge", "refs/notes/other"], p)
+            .status
+            .success()
+    );
+    std::fs::write(p.join(".libra").join("NOTES_MERGE_LOCK"), b"").unwrap();
+    let locked = run_libra_command(&["notes", "merge", "--abort"], p);
+    assert!(!locked.status.success(), "AC8 must fail");
+    assert!(
+        String::from_utf8_lossy(&locked.stderr).contains("LBR-CONFLICT-002"),
+        "AC8 code"
+    );
+}

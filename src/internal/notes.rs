@@ -187,6 +187,29 @@ fn conflict_marker_body(
     ))
 }
 
+/// `notes merge --abort` / `--quit`: discard the merge state without touching
+/// the `notes` table. Any subset of the three paths is removed.
+pub async fn abort_merge() -> Result<(), NotesError> {
+    let _lock = NotesMergeLock::acquire()?;
+    let dir = merge_state_dir()?;
+    let paths = [
+        dir.join(NOTES_MERGE_STATE),
+        dir.join(NOTES_MERGE_WORKTREE),
+        dir.join(NOTES_MERGE_COMMITTING),
+    ];
+    if !paths.iter().any(|path| path.exists()) {
+        return Err(NotesError::MergeInProgress);
+    }
+    for path in &paths {
+        if path.is_dir() {
+            let _ = std::fs::remove_dir_all(path);
+        } else {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+    Ok(())
+}
+
 /// Outcome of `notes merge --commit`.
 #[derive(Debug, Clone)]
 pub struct CommitMergeResult {

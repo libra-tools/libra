@@ -21,6 +21,7 @@ libra notes show [<object>]
 libra notes remove [<object>...]
 libra notes merge [-s|--strategy <manual|ours|theirs|union|cat_sort_uniq>] <other-ref>
 libra notes merge --commit
+libra notes merge --abort | --quit
 libra notes prune [-n|--dry-run] [-v]
 libra notes get-ref
 ```
@@ -268,7 +269,15 @@ differing note on both sides is a conflict resolved by `--strategy`:
   target values equal the current ones); otherwise it fails with
   `LBR-CONFLICT-002` and keeps all state, so the only way forward is
   `--abort` and a fresh merge. A missing `NOTES_MERGE_STATE` is still
-  `LBR-REPO-003` (crash while deleting it), regardless of the marker.
+
+
+  `libra notes merge --abort` discards the merge without touching the `notes`
+  table: it removes `NOTES_MERGE_STATE`, `NOTES_MERGE_WORKTREE/` and
+  `NOTES_MERGE_COMMITTING` (a partial residue is cleaned the same way) and fails
+  with `LBR-REPO-003` when no merge state exists. `--quit` is a Libra extension
+  (Git 2.56 has no such option) with identical semantics. Both forms take the
+  `NOTES_MERGE_LOCK` first, so an existing lock fails with
+  `LBR-CONFLICT-002`.
 - `ours` / `theirs`: keep the current note / take the other ref's note.
 - `union`: concatenate both note contents.
 - `cat_sort_uniq`: concatenate, then sort and de-duplicate the combined lines.
