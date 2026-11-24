@@ -72,3 +72,5 @@ flowchart TD
 - 新增 Git 兼容参数时必须明确 tier、错误码、JSON/机器输出契约和回归测试。
 
 - 2026-11-23（LS-23 / #857）：新增 `show --patience`/`--anchored=<text>`，`show_patch` 在置位且无路径过滤时经 clap 构造 `DiffArgs` 调 `run_diff_for_service`，与 `libra diff` 同选项逐字一致。回归：`show_patience_and_anchored_reuse_diff_engine`（AC1/AC2）。
+
+- 2026-11-23（LS-33 / #966）：新增 `show --word-diff[=<mode>]`/`--word-diff-regex`/`--color-words[=<re>]`，`show_patch` 在无路径过滤时经 `run_diff_for_service_word_diff(args, color)` 渲染，与 `libra log -p`/`libra diff` 同选项逐字一致。回归：`show_word_diff_and_color_words`（AC1–AC7）。

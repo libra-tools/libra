@@ -71,6 +71,27 @@ pub(crate) const SHOW_PATHSPEC_SEPARATOR_FLAG: &str = "__libra-show-pathspec-sep
 #[derive(Parser, Debug)]
 #[command(after_help = SHOW_EXAMPLES)]
 pub struct ShowArgs {
+    /// Render the patch body as a word-level diff (`--word-diff[=<mode>]`)
+    #[clap(
+        long = "word-diff",
+        value_name = "MODE",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "plain"
+    )]
+    pub word_diff: Option<String>,
+    /// Treat matches of REGEX as words for `--word-diff`
+    #[clap(long = "word-diff-regex", value_name = "REGEX")]
+    pub word_diff_regex: Option<String>,
+    /// Show colored word diffs, optionally with a custom word regex
+    #[clap(
+        long = "color-words",
+        value_name = "REGEX",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = ""
+    )]
+    pub color_words: Option<String>,
     /// Generate patch hunks with the patience diff algorithm
     #[clap(long = "patience")]
     pub patience: bool,
@@ -641,7 +662,7 @@ async fn show_commit(
             if !diffstat.is_empty() {
                 output.push_str(&diffstat);
             }
-            let diff_output = show_patch(&commit, paths, args).await?;
+            let diff_output = show_patch(&commit, paths, args, color_enabled).await?;
             if !diff_output.is_empty() {
                 output.push('\n');
                 output.push_str(&diff_output);
@@ -655,7 +676,7 @@ async fn show_commit(
         } else if args.summary {
             // Show only the created/deleted-file summary, parsed out of the
             // commit's unified diff (the same text the patch view renders).
-            let diff_output = show_patch(&commit, paths, args).await?;
+            let diff_output = show_patch(&commit, paths, args, color_enabled).await?;
             let summary = format_show_summary(&diff_output);
             if !summary.is_empty() {
                 output.push('\n');
@@ -696,7 +717,7 @@ async fn show_commit(
             }
         } else {
             // Show the full patch.
-            let diff_output = show_patch(&commit, paths, args).await?;
+            let diff_output = show_patch(&commit, paths, args, color_enabled).await?;
             if !diff_output.is_empty() {
                 output.push('\n');
                 output.push_str(&diff_output);
@@ -1222,7 +1243,40 @@ async fn show_patch(
     commit: &Commit,
     paths: Vec<PathBuf>,
     args: &ShowArgs,
+    color_enabled: bool,
 ) -> Result<String, CliError> {
+    if (args.word_diff.is_some() || args.color_words.is_some() || args.word_diff_regex.is_some())
+        && paths.is_empty()
+    {
+        if let Some(parent) = commit.parent_commit_ids.first() {
+            let mut argv = vec!["diff".to_string()];
+            if let Some(mode) = &args.word_diff {
+                argv.push(format!("--word-diff={mode}"));
+            }
+            if let Some(regex) = &args.word_diff_regex {
+                argv.push(format!("--word-diff-regex={regex}"));
+            }
+            if let Some(regex) = &args.color_words {
+                if regex.is_empty() {
+                    argv.push("--color-words".to_string());
+                } else {
+                    argv.push(format!("--color-words={regex}"));
+                }
+            }
+            argv.push(parent.to_string());
+            argv.push(commit.id.to_string());
+            let diff_args = crate::command::diff::DiffArgs::try_parse_from(&argv)
+                .map_err(|error| CliError::command_usage(error.to_string()))?;
+            let output =
+                crate::command::diff::run_diff_for_service_word_diff(diff_args, color_enabled)
+                    .await?;
+            let mut patch = crate::command::diff::render::format_unified_diff(&output);
+            if !patch.is_empty() && !patch.ends_with('\n') {
+                patch.push('\n');
+            }
+            return Ok(patch);
+        }
+    }
     if (args.patience || args.anchored.is_some()) && paths.is_empty() {
         if let Some(parent) = commit.parent_commit_ids.first() {
             let mut argv = vec!["diff".to_string()];

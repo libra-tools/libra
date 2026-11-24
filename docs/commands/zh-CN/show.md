@@ -2,6 +2,15 @@
 
 显示提交、标签、树、blob，或 `REV:path` 引用的 blob。
 
+### `--word-diff[=<mode>]` / `--word-diff-regex` / `--color-words`
+
+`show` 的补丁正文可用与 `libra log -p` 相同的词级 diff 选项：默认 `plain`，另有 `porcelain`/`color`/`none`；`--word-diff-regex=<re>` 指定分词正则，`--color-words[=<re>]` 是彩色简写（优先于 `--word-diff=plain`）。均复用共享 diff 渲染器，字节与 `libra diff` 一致；非法模式以 `LBR-CLI-002` 拒绝。
+
+```bash
+libra show --word-diff HEAD
+libra show --color=always --color-words HEAD
+```
+
 ### `--patience` / `--anchored=<text>`
 
 `--patience` 用 patience 算法渲染补丁；`--anchored=<text>` 以包含 TEXT 的行为锚点。两者转发到共享 `libra diff` 引擎，补丁主体与同一提交的 `libra diff --patience`/`--anchored=<text>` 一致。

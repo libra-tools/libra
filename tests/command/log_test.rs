@@ -9685,3 +9685,86 @@ fn word_diff_and_color_words() {
         );
     }
 }
+
+#[test]
+fn show_word_diff_and_color_words() {
+    use super::{assert_cli_success, run_libra_command};
+
+    let work = tempfile::tempdir().expect("work dir");
+    let repo = work.path().join("r");
+    std::fs::create_dir_all(&repo).expect("mkdir repo");
+    assert_cli_success(&run_libra_command(&["init"], &repo), "init");
+    run_libra_command(&["config", "set", "user.name", "t"], &repo);
+    run_libra_command(&["config", "set", "user.email", "t@t"], &repo);
+    std::fs::write(repo.join("f.txt"), "foo_bar baz qux\n").expect("write base");
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], &repo), "add base");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c1", "--no-verify"], &repo),
+        "commit c1",
+    );
+    std::fs::write(repo.join("f.txt"), "foo_BAR baz QUX\n").expect("write edit");
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], &repo), "add edit");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c2", "--no-verify"], &repo),
+        "commit c2",
+    );
+
+    let body = |args: &[&str]| {
+        let mut argv = vec!["show", "HEAD"];
+        argv.extend_from_slice(args);
+        let result = run_libra_command(&argv, &repo);
+        assert_cli_success(&result, &format!("show {argv:?}"));
+        let text = String::from_utf8_lossy(&result.stdout).to_string();
+        match text.split_once("@@") {
+            Some((_, rest)) => match rest.split_once('\n') {
+                Some((_, body)) => body.to_string(),
+                None => String::new(),
+            },
+            None => String::new(),
+        }
+    };
+
+    // AC1: bare `--word-diff` is `plain`.
+    assert_eq!(
+        body(&["--word-diff"]),
+        "[-foo_bar-]{+foo_BAR+} baz [-qux-]{+QUX+}\n",
+        "AC1"
+    );
+    // AC2: porcelain.
+    assert_eq!(
+        body(&["--word-diff=porcelain"]),
+        "-foo_bar\n+foo_BAR\n  baz \n-qux\n+QUX\n~\n",
+        "AC2"
+    );
+    // AC3: colour-words.
+    assert_eq!(
+        body(&["--color=always", "--color-words"]),
+        "\u{1b}[31mfoo_bar\u{1b}[0m\u{1b}[32mfoo_BAR\u{1b}[0m baz \u{1b}[31mqux\u{1b}[0m\u{1b}[32mQUX\u{1b}[0m\n",
+        "AC3"
+    );
+    // AC4: explicit regex.
+    assert_eq!(
+        body(&["--word-diff-regex=[A-Za-z]+"]),
+        "foo_[-bar-]{+BAR+} baz [-qux-]{+QUX+}\n",
+        "AC4"
+    );
+    // AC5: regex colour-words.
+    assert_eq!(
+        body(&["--color=always", "--color-words=[A-Za-z]+"]),
+        "foo_\u{1b}[31mbar\u{1b}[0m\u{1b}[32mBAR\u{1b}[0m baz \u{1b}[31mqux\u{1b}[0m\u{1b}[32mQUX\u{1b}[0m\n",
+        "AC5"
+    );
+    // AC6: `--color-words` wins over `--word-diff=plain`.
+    assert_eq!(
+        body(&["--color=always", "--color-words", "--word-diff=plain"]),
+        body(&["--color=always", "--color-words"]),
+        "AC6"
+    );
+    // AC7: invalid mode rejected.
+    let bad = run_libra_command(&["show", "HEAD", "--word-diff=bogus"], &repo);
+    assert!(!bad.status.success(), "AC7 must fail");
+    assert!(
+        String::from_utf8_lossy(&bad.stderr).contains("LBR-CLI-002"),
+        "AC7 code"
+    );
+}

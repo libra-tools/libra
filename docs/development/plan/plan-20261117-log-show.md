@@ -2024,7 +2024,7 @@ PY
 
 ### Task LS-33: `show` 支持 `--word-diff`、`--word-diff-regex` 与 `--color-words`（#966；自 LS-26 拆出）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-23：`ShowArgs` 新增 `--word-diff[=<mode>]`/`--word-diff-regex`/`--color-words[=<re>]`；`show_patch` 在无路径过滤时经 `run_diff_for_service_word_diff(args, color_enabled)`（LS-26 已交付）渲染，未改 `src/command/diff/`。AC1–AC7 由 `command::log_test::show_word_diff_and_color_words` 覆盖（plain/porcelain/color-words/regex/组合优先级逐字断言 + 非法模式 `LBR-CLI-002`）；`show_test` 42/42；EN/zh 文档与 `COMPATIBILITY.md` 的 `show` 行同步。
 
 **Description:** 为 `ShowArgs` 接入 `--word-diff[=<mode>]`、`--word-diff-regex=<regex>` 与 `--color-words[=<regex>]`，经 `LS-26` 已扩展的 `LogDiffOptions` 透传，不再修改 `src/command/diff/`。
 

@@ -2,6 +2,19 @@
 
 Show a commit, tag, tree, blob, or the blob referenced by `REV:path`.
 
+### `--word-diff[=<mode>]` / `--word-diff-regex` / `--color-words`
+
+`show` renders its patch body as a word-level diff with the same options as
+`libra log -p`: `plain` by default, `porcelain`/`color`/`none` modes, an explicit
+`--word-diff-regex=<re>`, and the coloured `--color-words[=<re>]` shorthand (which
+wins over `--word-diff=plain`). All reuse the shared diff renderer, so the bytes
+match `libra diff`; an invalid mode is `LBR-CLI-002`.
+
+```bash
+libra show --word-diff HEAD
+libra show --color=always --color-words HEAD
+```
+
 ### `--patience` / `--anchored=<text>`
 
 `--patience` renders the patch with the patience diff algorithm and
