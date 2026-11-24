@@ -2,7 +2,7 @@
 
 ## 命令实现目标
 
-`libra rev-parse` 的目标是解析和规范化 revision 名称、对象 ID 与仓库路径。实现需要支持 `--short`、`--abbrev-ref`、`--show-toplevel` 以及默认 `HEAD` fallback 和错误码，使脚本可以可靠地区分解析失败与使用错误。
+`libra rev-parse` 的目标是解析和规范化 revision 名称、对象 ID 与仓库路径。实现需要支持 `--short`、`--abbrev-ref`、`--show-toplevel`、显式 `--default` 回退和错误码（无参数时与 Git 一样不输出任何内容），使脚本可以可靠地区分解析失败与使用错误。
 
 ## 对比 Git 与兼容性
 
@@ -50,7 +50,7 @@ flowchart TD
 - 公开状态：已公开；模块状态：已导出。
 - 用户文档：`docs/commands/rev-parse.md`。
 - Synopsis：`libra rev-parse [OPTIONS] [SPEC]...`。
-- 公开参数/子命令包括：`--short[=<n>]`、`--abbrev-ref`、`--symbolic-full-name`、`--symbolic`、`--flags`/`--no-flags`/`--revs-only`/`--no-revs`（输出过滤模式）、`--show-toplevel`、`--show-prefix`、`--show-cdup`、`--verify`、`--default <ARG>`、`--sq`、`--is-inside-work-tree`、`--is-inside-git-dir`、`--is-bare-repository`、`--is-shallow-repository`、`--git-dir`、`--absolute-git-dir`、`[SPEC]...`（位置参数，可多个；缺省为 `HEAD`；可用 `@`、数字 reflog、parent/ancestor、typed/recursive peel 和 `REV:path`）。`--symbolic` 与 `--symbolic-full-name`/`--short`/`--abbrev-ref`/仓库查询模式互斥（clap `conflicts_with_all`，冲突映射为退出 129）。`--sq` 仅对 `resolve`/`short` 模式的对象名做整值单引号 shell 引用（嵌入单引号转义为 `'\''`），仓库查询模式不受影响。
+- 公开参数/子命令包括：`--short[=<n>]`、`--abbrev-ref`、`--symbolic-full-name`、`--symbolic`、`--flags`/`--no-flags`/`--revs-only`/`--no-revs`（输出过滤模式）、`--show-toplevel`、`--show-prefix`、`--show-cdup`、`--verify`、`--default <ARG>`、`--sq`、`--is-inside-work-tree`、`--is-inside-git-dir`、`--is-bare-repository`、`--is-shallow-repository`、`--git-dir`、`--absolute-git-dir`、`[SPEC]...`（位置参数，可多个；无 SPEC 且未给 `--default` 时不解析、不输出，与 Git 一致；可用 `@`、数字 reflog、parent/ancestor、typed/recursive peel 和 `REV:path`）。`--symbolic` 与 `--symbolic-full-name`/`--short`/`--abbrev-ref`/仓库查询模式互斥（clap `conflicts_with_all`，冲突映射为退出 129）。`--sq` 仅对 `resolve`/`short` 模式的对象名做整值单引号 shell 引用（嵌入单引号转义为 `'\''`），仓库查询模式不受影响。
 - `--verify`：断言 SPEC 解析为唯一对象，失败退出 128；配合全局 `--quiet`/`-q` 时静默退出 1。`--default <ARG>`：未提供位置 SPEC 时回退到该修订。`--is-inside-work-tree` / `--is-bare-repository` / `--is-shallow-repository` 打印 `true`/`false`；`--is-shallow-repository` 只读 `.libra/shallow`，文件缺失或仅空白行时为 `false`。`--git-dir` 打印 `.libra` 目录路径（Git `$GIT_DIR` 等价；Libra 始终为绝对路径）。`--absolute-git-dir` 复用 `--git-dir` 路径并经 `std::fs::canonicalize` 规范化，保证 Git「canonicalized absolute path」契约（Libra 中两者结果一致）。`--is-inside-git-dir` 在当前目录位于 `.libra` 目录内时打印 `true`，否则 `false`（复用 `util::is_sub_path` 判定 cwd 是否为 `.libra` 的子路径，含相等）。
 
 
@@ -60,7 +60,7 @@ flowchart TD
 |---|---|---|
 | ✅ 已实现（仓库状态查询） | `--show-toplevel`、`--show-prefix`、`--show-cdup`、`--is-inside-work-tree`、`--is-inside-git-dir`、`--is-bare-repository`、`--is-shallow-repository`、`--git-dir`、`--absolute-git-dir` 均已支持。 | `--is-inside-git-dir` 带单元测试与集成测试（worktree→`false`，`.libra` 内→`true`）；`--absolute-git-dir` 带集成测试（绝对路径、以 `.libra` 结尾、与 `--git-dir` 一致、与 `--git-dir` 互斥）；`--is-shallow-repository` 由 `compat_clone_shallow_integrity` 覆盖 false/true。 |
 | ✅ 已实现（symbolic 模式） | `--symbolic-full-name` 展开 ref 名；`--symbolic` 对可解析 spec 原样回显。两者的有效性门控共用严格 resolver，接受 `@`、typed peel、完整 ref 导航、tree/blob/tag 对象和 `REV:path`。 | 不可解析 spec 仍在 stderr 报错并退出 128，而 Git 部分模式会把原始 spec 回显到 stdout；这是既有有意差异。 |
-| ✅ 已实现（输出过滤） | `--flags`/`--no-flags`/`--revs-only`/`--no-revs` 用 `resolve_object_spec_typed` 分类任意类型对象 revision；`--` 后一律为 path，读失败/引用损坏会上抛。 | 已知选项必须位于位置 SPEC 之前；`--verify`/`--short` 与过滤标志组合以 LBR-CLI-002 拒绝；无参数 `--verify`/`--short` 仍默认 HEAD。 |
+| ✅ 已实现（输出过滤） | `--flags`/`--no-flags`/`--revs-only`/`--no-revs` 用 `resolve_object_spec_typed` 分类任意类型对象 revision；`--` 后一律为 path，读失败/引用损坏会上抛。 | 已知选项必须位于位置 SPEC 之前；`--verify`/`--short` 与过滤标志组合以 LBR-CLI-002 拒绝；无参数 `--verify`/`--short` 以 `Needed a single revision` 退出 128。 |
 | revision selector（仍缺口） | 日期 reflog selector、`@{-N}`、`@{upstream}`/`@{push}`、相对 tree path（`./`/`../`）尚未实现。 | 数字 reflog selector、`@`、parent/ancestor、typed/recursive peel、仓库根 `REV:path`、index path（`:<path>`/`:<n>:<path>`）与提交消息搜索（`:/<regex>`/`<rev>^{/<regex>}`）已由 `compat_rev_parse_peel_selectors` 与 `rev_parse_test` 的 M-IDX/M-MSG 矩阵覆盖；`./`/`../` 仅对 index path 相对 cwd 解析，tree path 形态仍拒绝。 |
 | 输出过滤（仍缺口） | Git `--abbrev=<n>` 输出选项与 parseopt 子模式。（`--short[=<n>]`、`--sq`、`--abbrev-ref`、`--symbolic-full-name`、`--symbolic`、`--flags`/`--no-flags`/`--revs-only`/`--no-revs` 已实现，不再列为缺口。） | 后续以新增测试、兼容矩阵或用户命令文档变更为准。 |
 | 参数解析模式 | Git `--parseopt`、`--keep-dashdash`、`--stuck-long`、`--sq-quote` 等 `--parseopt` 子模式；当前未实现。 | 后续以新增测试、兼容矩阵或用户命令文档变更为准。 |

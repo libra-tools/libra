@@ -641,6 +641,30 @@ fn test_rev_parse_default_used_when_no_spec() {
     );
 }
 
+/// Bare `rev-parse` prints nothing and exits 0, matching Git (#1054).
+#[test]
+fn test_rev_parse_no_args_prints_nothing() {
+    let repo = create_committed_repo_via_cli();
+
+    let output = run_libra_command(&["rev-parse"], repo.path());
+    assert_cli_success(&output, "rev-parse (no args)");
+    assert!(
+        output.stdout.is_empty(),
+        "rev-parse with no arguments must print nothing, got: {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    // `--verify` with no revision still fails 128 ("Needed a single
+    // revision"), so the empty-spec path stays single-revision-aware.
+    let output = run_libra_command(&["rev-parse", "--verify"], repo.path());
+    assert_eq!(
+        output.status.code(),
+        Some(128),
+        "rev-parse --verify with no SPEC must fail with exit 128, got: {:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[test]
 fn test_rev_parse_is_inside_work_tree_true() {
     let repo = create_committed_repo_via_cli();
