@@ -62,6 +62,17 @@ Because attributes and pathnames are both positional, they are disambiguated as:
 - Otherwise: the **first** positional is the attribute and the rest are
   pathnames (use `--` for multiple attributes).
 
+`[attr]<name> <assignments>` lines in the root `.gitattributes`/`.libra_attributes`,
+`info/attributes`, or `core.attributesFile` define macros. A `Set` assignment on a
+macro name expands its body in place (macros may reference other macros; expansion
+is iterative so very long chains work); `!macro` blocks the earlier expansion. The
+built-in `binary` macro expands to `-diff -merge -text` at the lowest precedence.
+Same-named macros resolve by source precedence (`info/attributes` > root files >
+`core.attributesFile` > built-in) and the last definition within one file wins.
+Macros defined in subdirectory attribute files are ignored, and for each attribute
+the first assignment found while walking sources from highest to lowest precedence
+wins.
+
 Attribute names are validated before any path or stdin read: a name must be
 non-empty and consist only of `[-A-Za-z0-9_.]`, never starting with `-`.
 An invalid name fails with `<name>: not a valid attribute name` (`LBR-CLI-002`),

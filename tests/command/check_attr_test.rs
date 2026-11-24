@@ -372,3 +372,119 @@ fn check_attr_rejects_invalid_attribute_names() {
     assert!(stderr.contains("LBR-CLI-002"), "AC3 code: {stderr}");
     let _ = std::io::stdout().flush();
 }
+
+/// PM-15: `[attr]` macros, the built-in `binary` macro, and Git's precedence.
+#[test]
+fn check_attr_expands_macros_with_git_precedence() {
+    let repo = tempdir().expect("failed to create repository root");
+    init_repo_via_cli(repo.path());
+    let p = repo.path();
+    std::fs::create_dir_all(p.join("sub")).expect("mkdir sub");
+    std::fs::write(
+        p.join(".gitattributes"),
+        "[attr]mybin -diff -text\n*.dat mybin\n[attr]outer inner -merge\n[attr]inner foo=bar\n*.n outer\n*.b binary\n*.b2 mybin\n*.b2 diff\n*.e mybin\n*.e !mybin\n",
+    )
+    .expect("root gitattributes");
+    std::fs::write(p.join("sub/.gitattributes"), "[attr]subm foo\n*.s subm\n").expect("sub");
+
+    // AC1: a macro expands to its body.
+    let out = run_libra_command(&["check-attr", "diff", "x.dat"], p);
+    assert_cli_success(&out, "AC1");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "x.dat: diff: unset\n",
+        "AC1"
+    );
+
+    // AC3: the built-in `binary` macro.
+    let out = run_libra_command(&["check-attr", "-a", "f.b"], p);
+    assert_cli_success(&out, "AC3");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "f.b: binary: set\nf.b: diff: unset\nf.b: merge: unset\nf.b: text: unset\n",
+        "AC3"
+    );
+
+    // AC4: macros referencing macros.
+    let out = run_libra_command(&["check-attr", "-a", "y.n"], p);
+    assert_cli_success(&out, "AC4");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "y.n: foo: bar\ny.n: inner: set\ny.n: merge: unset\ny.n: outer: set\n",
+        "AC4"
+    );
+
+    // AC5: a later explicit assignment wins over the macro body.
+    let out = run_libra_command(&["check-attr", "-a", "x.b2"], p);
+    assert_cli_success(&out, "AC5");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "x.b2: diff: set\nx.b2: mybin: set\nx.b2: text: unset\n",
+        "AC5"
+    );
+
+    // AC6: `!macro` blocks the earlier expansion.
+    let out = run_libra_command(&["check-attr", "-a", "x.e"], p);
+    assert_cli_success(&out, "AC6");
+    assert!(
+        out.stdout.is_empty(),
+        "AC6: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    // AC7: macros defined in a subdirectory file are ignored.
+    let out = run_libra_command(&["check-attr", "foo", "sub/x.s"], p);
+    assert_cli_success(&out, "AC7");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "sub/x.s: foo: unspecified\n",
+        "AC7"
+    );
+
+    // AC2: info/attributes macro wins; a macro defined only in the global file
+    // is still usable.
+    let repo = tempdir().expect("failed to create repository root");
+    init_repo_via_cli(repo.path());
+    let p = repo.path();
+    let global = p.join("global-attributes");
+    std::fs::write(&global, "[attr]prio foo=global\n[attr]gm bar=g\n").expect("global");
+    assert_cli_success(
+        &run_libra_command(
+            &["config", "core.attributesFile", global.to_str().unwrap()],
+            p,
+        ),
+        "AC2 config",
+    );
+    std::fs::write(
+        p.join(".gitattributes"),
+        "[attr]prio foo=root\n*.p prio gm\n",
+    )
+    .expect("root");
+    std::fs::create_dir_all(p.join(".libra/info")).expect("mkdir info");
+    std::fs::write(p.join(".libra/info/attributes"), "[attr]prio foo=info\n").expect("info");
+    let out = run_libra_command(&["check-attr", "foo", "bar", "--", "z.p"], p);
+    assert_cli_success(&out, "AC2");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "z.p: foo: info\nz.p: bar: g\n",
+        "AC2"
+    );
+
+    // AC8: a 3001-level macro chain is expanded iteratively.
+    let repo = tempdir().expect("failed to create repository root");
+    init_repo_via_cli(repo.path());
+    let p = repo.path();
+    let mut rules = String::from("file a0\n");
+    for index in 0..3000 {
+        rules.push_str(&format!("[attr]a{index} a{}\n", index + 1));
+    }
+    rules.push_str("[attr]a3000 -text\n");
+    std::fs::write(p.join(".gitattributes"), rules).expect("deep chain");
+    let out = run_libra_command(&["check-attr", "text", "file"], p);
+    assert_cli_success(&out, "AC8");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "file: text: unset\n",
+        "AC8"
+    );
+}

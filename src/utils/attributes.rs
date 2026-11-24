@@ -50,6 +50,8 @@ struct AttributeAssignment {
 struct AttributeRule {
     matcher: Gitignore,
     assignments: Vec<AttributeAssignment>,
+    /// `[attr]<name> ...` definitions never match paths; they register a macro.
+    macro_def: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -270,28 +272,113 @@ fn beneath_root_identity(root_path: &Path, root: &fs::File) -> io::Result<Beneat
     }
 }
 
+/// Built-in `binary` macro: `[attr]binary -diff -merge -text`.
+fn builtin_binary_macro() -> Vec<AttributeAssignment> {
+    ["diff", "merge", "text"]
+        .into_iter()
+        .map(|name| AttributeAssignment {
+            name: name.to_string(),
+            state: AttributeState::Unset,
+        })
+        .collect()
+}
+
+/// Apply assignments in order with first-set-wins semantics; a `Set` on a known
+/// macro name expands its body immediately (explicit worklist, so 3000-level
+/// chains cannot overflow the call stack). `!attr` records Unspecified so lower
+/// priorities are blocked.
+fn apply_assignments(
+    assignments: &[AttributeAssignment],
+    macros: &std::collections::HashMap<String, Vec<AttributeAssignment>>,
+    decided: &mut BTreeMap<String, AttributeState>,
+) {
+    let mut pending: Vec<Vec<AttributeAssignment>> = vec![assignments.to_vec()];
+    while let Some(items) = pending.pop() {
+        let mut iter = items.into_iter();
+        while let Some(assignment) = iter.next() {
+            if decided.contains_key(&assignment.name) {
+                continue;
+            }
+            let expands = matches!(assignment.state, AttributeState::Set)
+                && macros.contains_key(&assignment.name);
+            decided.insert(assignment.name.clone(), assignment.state.clone());
+            if expands {
+                let Some(body) = macros.get(&assignment.name) else {
+                    continue;
+                };
+                let rest: Vec<AttributeAssignment> = iter.collect();
+                pending.push(rest);
+                pending.push(body.clone());
+                break;
+            }
+        }
+    }
+}
+
+/// Evaluate every source for `absolute`, returning the decided attributes
+/// (unspecified entries are dropped from the result but still block lower
+/// priorities during evaluation).
+fn evaluate_sources(
+    sources: &[AttributeSource],
+    workdir: &Path,
+    absolute: &Path,
+) -> BTreeMap<String, AttributeState> {
+    let rule_sets: Vec<(PathBuf, Arc<Vec<AttributeRule>>)> = sources
+        .iter()
+        .map(|source| {
+            (
+                source.base.clone(),
+                cached_attribute_file(&source.path, &source.base),
+            )
+        })
+        .collect();
+    evaluate_rule_sets(&rule_sets, workdir, absolute)
+}
+
+/// Evaluate already-compiled rule sets (worktree files, or index/tree contents
+/// for `check-attr --cached`/`--source`), lowest precedence first.
+fn evaluate_rule_sets(
+    rule_sets: &[(PathBuf, Arc<Vec<AttributeRule>>)],
+    workdir: &Path,
+    absolute: &Path,
+) -> BTreeMap<String, AttributeState> {
+    let mut macros = std::collections::HashMap::new();
+    macros.insert("binary".to_string(), builtin_binary_macro());
+    for (base, rules) in rule_sets.iter().rev() {
+        // Macros only come from root-level and global/info files.
+        if base != workdir {
+            continue;
+        }
+        for rule in rules.iter().rev() {
+            if let Some(name) = &rule.macro_def {
+                macros
+                    .entry(name.clone())
+                    .or_insert_with(|| rule.assignments.clone());
+            }
+        }
+    }
+    let mut decided = BTreeMap::new();
+    for (_, rules) in rule_sets.iter().rev() {
+        for rule in rules.iter().rev() {
+            if !attribute_rule_matches(rule, absolute) {
+                continue;
+            }
+            apply_assignments(&rule.assignments, &macros, &mut decided);
+        }
+    }
+    decided.retain(|_, state| !matches!(state, AttributeState::Unspecified));
+    decided
+}
+
 pub fn attribute_state_for_path(attr: &str, path: &Path) -> Option<AttributeState> {
     // Pure merge helpers are also used before a Libra repository is initialized.
     // Outside one there are no repository attribute sources to apply.
     let workdir = util::try_working_dir().ok()?;
     let absolute = absolute_in_workdir(path, &workdir)?;
-    let mut state = None;
-    for source in attribute_sources_for_path(&workdir, &absolute) {
-        for rule in cached_attribute_file(&source.path, &source.base).iter() {
-            if !attribute_rule_matches(rule, &absolute) {
-                continue;
-            }
-            for assignment in &rule.assignments {
-                if assignment.name == attr {
-                    state = Some(assignment.state.clone());
-                }
-            }
-        }
-    }
-    state.and_then(|value| match value {
-        AttributeState::Unspecified => None,
-        other => Some(other),
-    })
+    let sources = attribute_sources_for_path(&workdir, &absolute);
+    evaluate_sources(&sources, &workdir, &absolute)
+        .get(attr)
+        .cloned()
 }
 
 /// Where `check-attr` reads its `.gitattributes`/`.libraattributes` sources
@@ -336,21 +423,15 @@ pub fn all_attribute_states_for_path_from(
     for info_attributes in util::worktree_info_file_paths(&workdir, "attributes") {
         push_attribute_source(&mut sources, info_attributes, workdir.to_path_buf());
     }
-    let mut states = BTreeMap::new();
-    for source in &sources {
-        for rule in cached_attribute_file(&source.path, &source.base).iter() {
-            if !attribute_rule_matches(rule, &absolute) {
-                continue;
-            }
-            for assignment in &rule.assignments {
-                if matches!(assignment.state, AttributeState::Unspecified) {
-                    states.remove(&assignment.name);
-                } else {
-                    states.insert(assignment.name.clone(), assignment.state.clone());
-                }
-            }
-        }
-    }
+    let mut rule_sets: Vec<(PathBuf, Arc<Vec<AttributeRule>>)> = sources
+        .iter()
+        .map(|source| {
+            (
+                source.base.clone(),
+                cached_attribute_file(&source.path, &source.base),
+            )
+        })
+        .collect();
     // Tree/index attribute files, outermost directory first so a deeper file
     // wins (Git's precedence).
     for dir in attribute_dirs(&workdir, &absolute) {
@@ -366,21 +447,13 @@ pub fn all_attribute_states_for_path_from(
             let Some(contents) = read_attribute_source_contents(&key, kind) else {
                 continue;
             };
-            for rule in parse_attribute_contents(&contents, &dir) {
-                if !attribute_rule_matches(&rule, &absolute) {
-                    continue;
-                }
-                for assignment in &rule.assignments {
-                    if matches!(assignment.state, AttributeState::Unspecified) {
-                        states.remove(&assignment.name);
-                    } else {
-                        states.insert(assignment.name.clone(), assignment.state.clone());
-                    }
-                }
-            }
+            rule_sets.push((
+                dir.clone(),
+                Arc::new(parse_attribute_contents(&contents, &dir)),
+            ));
         }
     }
-    states
+    evaluate_rule_sets(&rule_sets, &workdir, &absolute)
 }
 
 /// One attribute file's text from a non-worktree source, or `None` when the
@@ -419,22 +492,8 @@ pub fn all_attribute_states_for_path(path: &Path) -> BTreeMap<String, AttributeS
     let Some(absolute) = absolute_in_workdir(path, &workdir) else {
         return BTreeMap::new();
     };
-    let mut states = BTreeMap::new();
-    for source in attribute_sources_for_path(&workdir, &absolute) {
-        for rule in cached_attribute_file(&source.path, &source.base).iter() {
-            if !attribute_rule_matches(rule, &absolute) {
-                continue;
-            }
-            for assignment in &rule.assignments {
-                if matches!(assignment.state, AttributeState::Unspecified) {
-                    states.remove(&assignment.name);
-                } else {
-                    states.insert(assignment.name.clone(), assignment.state.clone());
-                }
-            }
-        }
-    }
-    states
+    let sources = attribute_sources_for_path(&workdir, &absolute);
+    evaluate_sources(&sources, &workdir, &absolute)
 }
 
 /// Resolve attributes for a blob write without treating a failed source read
@@ -1086,12 +1145,25 @@ fn parse_attribute_contents(contents: &str, base: &Path) -> Vec<AttributeRule> {
         if assignments.is_empty() {
             continue;
         }
-        if let Some(matcher) = compile_attribute_pattern(pattern, base) {
-            rules.push(AttributeRule {
-                matcher,
-                assignments,
-            });
-        }
+        // `[attr]<name> ...` defines a macro. The matcher is never consulted;
+        // a placeholder that cannot match keeps the struct uniform.
+        let macro_def = pattern
+            .strip_prefix("[attr]")
+            .filter(|name| !name.is_empty())
+            .map(str::to_string);
+        let matcher = if macro_def.is_some() {
+            compile_attribute_pattern("\u{0}never-match", base).expect("placeholder macro matcher")
+        } else {
+            match compile_attribute_pattern(pattern, base) {
+                Some(matcher) => matcher,
+                None => continue,
+            }
+        };
+        rules.push(AttributeRule {
+            matcher,
+            assignments,
+            macro_def,
+        });
     }
     rules
 }
@@ -1154,10 +1226,13 @@ fn compile_attribute_pattern(pattern: &str, base: &Path) -> Option<Gitignore> {
 }
 
 fn attribute_rule_matches(rule: &AttributeRule, path: &Path) -> bool {
-    !matches!(rule.matcher.matched(path, path.is_dir()), Match::None)
+    rule.macro_def.is_none() && !matches!(rule.matcher.matched(path, path.is_dir()), Match::None)
 }
 
 fn attribute_rule_matches_file(rule: &AttributeRule, path: &Path) -> bool {
+    if rule.macro_def.is_some() {
+        return false;
+    }
     !matches!(rule.matcher.matched(path, false), Match::None)
 }
 

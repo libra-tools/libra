@@ -38,6 +38,8 @@ libra check-attr [-z] (<attr>... | --all) --stdin
 - `--stdin`：位置参数是属性名，路径从标准输入读取。
 - 否则：**第一个**位置参数是属性，其余是路径（多个属性请用 `--`）。
 
+根 `.gitattributes`/`.libra_attributes`、`info/attributes` 或 `core.attributesFile` 中的 `[attr]<name> <assignments>` 行定义宏。对宏名做 `Set` 赋值时会在原位展开其正文（宏可引用宏；展开用显式工作栈，因此超长链也能处理）；`!macro` 会阻断此前的展开。内置 `binary` 宏在最低优先级展开为 `-diff -merge -text`。同名宏按来源优先级解析（`info/attributes` > 根文件 > `core.attributesFile` > 内置），同一文件内以后一个定义为准。子目录属性文件中的宏定义被忽略；每个属性按来源优先级从高到低首次赋值者胜。
+
 属性名会在读取任何路径或标准输入之前校验：必须非空、只含 `[-A-Za-z0-9_.]` 且不以 `-` 开头。非法名称以 `<name>: not a valid attribute name`（`LBR-CLI-002`）失败；`--all` 与 `--` 之前的属性名同用会报 `Attributes and --all both specified`（`LBR-CLI-002`）。
 
 ## 选项
