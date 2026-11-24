@@ -105,8 +105,8 @@ use crate::{
             redb as redb_git,
         },
         manifest::{
-            LEGACY_SQLITE_DB_FILE, PRIVATE_SUBDIR, REDB_SUBDIR, canonical_capture_redb_rel_path,
-            canonical_git_redb_rel_path,
+            LEGACY_SQLITE_DB_FILE, PRIVATE_SUBDIR, REDB_SUBDIR, SourceDigests,
+            canonical_capture_redb_rel_path, canonical_git_redb_rel_path, format_generation_id,
         },
         meta::{begin_checked_read, init_meta_schema},
         opener::{begin_write_bounded_blocking, open_redb_read_only},
@@ -114,9 +114,9 @@ use crate::{
             CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION, CAPTURE_QUEUE_SUBDIR,
             CAPTURE_SPOOL_CAPACITY_LOCK_FILE, CAPTURE_SPOOL_SUBDIR,
             CAPTURE_SPOOL_TOMBSTONE_SENTINEL, FrameDecodeError, FrameStreamDecoder,
-            FrameStreamItem, LaneTailMeta, QUEUE_APPEND_LOCK_FILE, QUEUE_LANE_NORMAL_DIR,
-            QUEUE_LANE_PRIORITY_DIR, QUEUE_TAIL_META_BAK_FILE, QUEUE_TAIL_META_FILE,
-            QUEUE_WRITER_LOCK_FILE, crc32c_append, decode_postcard_payload,
+            FrameStreamItem, LTM2_MAX_LEN, LaneTailMeta, QUEUE_APPEND_LOCK_FILE,
+            QUEUE_LANE_NORMAL_DIR, QUEUE_LANE_PRIORITY_DIR, QUEUE_TAIL_META_BAK_FILE,
+            QUEUE_TAIL_META_FILE, QUEUE_WRITER_LOCK_FILE, crc32c_append, decode_postcard_payload,
             parse_segment_log_file_name, read_converged_lane_tail_meta, segment_log_file_name,
         },
         redb::{
@@ -3063,8 +3063,11 @@ pub const MIGRATED_SPOOL_RECEIPTS_TABLE: TableDefinition<
 
 /// Subdirectory inside `<common_storage>/private/capture-spool/` holding
 /// confirmed ready-to-consume legacy hook envelopes (`spool.rs:20`).
-#[cfg(any(not(unix), test))]
 const CAPTURE_SPOOL_READY_SUBDIR: &str = "ready";
+
+/// Subdirectory inside `<common_storage>/private/capture-spool/` holding
+/// quarantined legacy hook envelopes (`spool.rs:22`).
+const CAPTURE_SPOOL_QUARANTINE_SUBDIR: &str = "quarantine";
 
 /// Streaming read chunk size (`64 KiB`) used when authenticating committed
 /// capture-queue segment CRC32C checksums without buffering whole segments.
@@ -16048,6 +16051,16 @@ fn list_sorted_dir_names_unix(
     dir_fd: &std::os::unix::io::OwnedFd,
     subject: &'static str,
 ) -> StorageResult<Vec<String>> {
+    list_sorted_dir_names_bounded_unix(dir_fd, usize::MAX, usize::MAX, subject)
+}
+
+#[cfg(unix)]
+fn list_sorted_dir_names_bounded_unix(
+    dir_fd: &std::os::unix::io::OwnedFd,
+    max_entries: usize,
+    max_total_name_bytes: usize,
+    subject: &'static str,
+) -> StorageResult<Vec<String>> {
     use std::os::unix::io::AsRawFd as _;
     // SAFETY: `dir_fd` is valid.
     let dup_raw = unsafe { libc::fcntl(dir_fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
@@ -16084,6 +16097,7 @@ fn list_sorted_dir_names_unix(
     let _dir_guard = DirGuard(dir_ptr);
 
     let mut names = Vec::new();
+    let mut total_name_bytes = 0usize;
     loop {
         #[cfg(target_os = "macos")]
         unsafe {
@@ -16117,6 +16131,16 @@ fn list_sorted_dir_names_unix(
                     "forward migration Phase 1 rejected non-UTF-8 entry name in {subject}"
                 ),
             })?;
+        if names.len() >= max_entries
+            || total_name_bytes.saturating_add(name.len()) > max_total_name_bytes
+        {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "forward migration Phase 1 rejected {subject} exceeding bounded directory listing memory cap"
+                ),
+            });
+        }
+        total_name_bytes = total_name_bytes.saturating_add(name.len());
         names.push(name.to_string());
     }
     names.sort();
@@ -16131,9 +16155,72 @@ fn open_readonly_regular_file_at_unix(
     exact_mode: Option<u32>,
     subject: &'static str,
 ) -> StorageResult<(File, u64)> {
-    use std::os::unix::io::{AsRawFd as _, FromRawFd as _, OwnedFd};
-    // Pass `O_NONBLOCK` so opening a malicious/stray FIFO never blocks while
-    // Phase 1 holds migration locks; verify `S_IFREG` via `fstat` immediately.
+    open_readonly_regular_file_at_unix_protected(
+        dir_fd,
+        name,
+        forbidden_mode_bits,
+        exact_mode,
+        &[],
+        subject,
+    )
+}
+
+/// Safely open a regular file under pinned `dir_fd` while NEVER opening or
+/// closing any hard link or inode listed in `protected_inodes` (preventing
+/// Unix POSIX `fcntl` SQLite lock release via `close(fd)`).
+#[cfg(unix)]
+fn open_readonly_regular_file_at_unix_protected(
+    dir_fd: &std::os::unix::io::OwnedFd,
+    name: &std::ffi::CStr,
+    forbidden_mode_bits: u32,
+    exact_mode: Option<u32>,
+    protected_inodes: &[(u64, u64)],
+    subject: &'static str,
+) -> StorageResult<(File, u64)> {
+    use std::os::unix::io::{AsRawFd as _, FromRawFd as _, IntoRawFd as _, OwnedFd};
+
+    // SAFETY: `geteuid` has no preconditions and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+
+    // Step 1 (ZERO-OPEN PRE-CHECK): Inspect via `fstatat(AT_SYMLINK_NOFOLLOW)`
+    // BEFORE `openat` so any symlink, FIFO, hard link (`st_nlink != 1`), or
+    // alias of a locked live SQLite inode in `protected_inodes` is rejected
+    // without ever opening or closing a file descriptor on that inode.
+    let mut pre_st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: `dir_fd` is valid and `name` is NUL-terminated.
+    if unsafe {
+        libc::fstatat(
+            dir_fd.as_raw_fd(),
+            name.as_ptr(),
+            pre_st.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!("forward migration Phase 1 rejected unreadable or linked {subject}"),
+        });
+    }
+    // SAFETY: `fstatat` succeeded.
+    let pre_st = unsafe { pre_st.assume_init() };
+    let pre_mode_bits = u32::from(pre_st.st_mode) & 0o777;
+    let pre_exact_ok = exact_mode.is_none_or(|expected| pre_mode_bits == expected);
+    let pre_inode = (pre_st.st_dev as u64, pre_st.st_ino);
+    if (pre_st.st_mode & libc::S_IFMT) != libc::S_IFREG
+        || pre_st.st_nlink != 1
+        || pre_st.st_uid != euid
+        || (pre_mode_bits & forbidden_mode_bits) != 0
+        || !pre_exact_ok
+        || protected_inodes.contains(&pre_inode)
+    {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration Phase 1 rejected unsafe regular-file metadata on {subject}"
+            ),
+        });
+    }
+
+    // Step 2: Open with `O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK`.
     // SAFETY: `dir_fd` is valid and `name` is NUL-terminated.
     let raw = unsafe {
         libc::openat(
@@ -16159,11 +16246,23 @@ fn open_readonly_regular_file_at_unix(
     }
     // SAFETY: `fstat` succeeded.
     let st = unsafe { st.assume_init() };
-    // SAFETY: `geteuid` has no preconditions and cannot fail.
-    let euid = unsafe { libc::geteuid() };
+    let post_inode = (st.st_dev as u64, st.st_ino);
+    if protected_inodes.contains(&post_inode) {
+        // Defense-in-depth against a same-UID TOCTOU swap between `fstatat` and
+        // `openat`: NEVER call `close(fd)` on an accidentally opened live SQLite
+        // inode, because POSIX `fcntl` would release SQLite's OS `EXCLUSIVE`
+        // lock held by `c_mig`.
+        let _preserve_posix_lock_fd = file.into_raw_fd();
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration Phase 1 rejected live SQLite inode alias on {subject}"
+            ),
+        });
+    }
     let mode_bits = u32::from(st.st_mode) & 0o777;
     let exact_ok = exact_mode.is_none_or(|expected| mode_bits == expected);
-    if (st.st_mode & libc::S_IFMT) != libc::S_IFREG
+    if post_inode != pre_inode
+        || (st.st_mode & libc::S_IFMT) != libc::S_IFREG
         || st.st_nlink != 1
         || st.st_uid != euid
         || (mode_bits & forbidden_mode_bits) != 0
@@ -16200,12 +16299,23 @@ fn verify_spool_tombstone_file_unix(
     name: &std::ffi::CStr,
     subject: &'static str,
 ) -> StorageResult<()> {
+    verify_spool_tombstone_file_unix_protected(spool_fd, name, &[], subject)
+}
+
+#[cfg(unix)]
+fn verify_spool_tombstone_file_unix_protected(
+    spool_fd: &std::os::unix::io::OwnedFd,
+    name: &std::ffi::CStr,
+    protected_inodes: &[(u64, u64)],
+    subject: &'static str,
+) -> StorageResult<()> {
     use std::io::Read as _;
-    let (file, size) = open_readonly_regular_file_at_unix(
+    let (file, size) = open_readonly_regular_file_at_unix_protected(
         spool_fd,
         name,
         0o377,
         Some(crate::storage::queue::CAPTURE_SPOOL_TOMBSTONE_MODE),
+        protected_inodes,
         subject,
     )?;
     let expected_len = CAPTURE_SPOOL_TOMBSTONE_SENTINEL.len();
@@ -17936,6 +18046,3274 @@ async fn export_forward_phase1_to_redb_tmp_inner(
         }
         Err(err) => Err(err),
     }
+}
+
+// ============================================================================
+// Phase 1 Zero-Fd-Leak Logical Digest, Single-Connection `VACUUM INTO` Backup,
+// In-Place `capture-spool/` Backup & Queue Manifest Digest (`ADR-RB-07` #1, `RB-10f`)
+// ============================================================================
+
+/// Canonical subdirectory under `<common_storage>` storing generation-scoped
+/// SQLite migration backups (`.libra/sqlite-backup/<gen>/`).
+pub const SQLITE_BACKUP_SUBDIR: &str = "sqlite-backup";
+
+/// Fixed streaming I/O buffer size (`64 KiB`) used when hashing verified
+/// backups and copying `capture-spool/{ready,quarantine}/` files in O(1) RAM.
+const BACKUP_STREAM_BUF_BYTES: usize = 64 * 1024;
+
+/// Return the canonical relative backup directory under `<common_storage>`,
+/// e.g. `"sqlite-backup/00000001"`.
+#[must_use]
+pub fn canonical_sqlite_backup_rel_dir(generation: u64) -> String {
+    format!(
+        "{SQLITE_BACKUP_SUBDIR}/{}",
+        format_generation_id(generation)
+    )
+}
+
+/// Return the canonical absolute backup directory
+/// `<common_storage>/sqlite-backup/<gen>`.
+#[must_use]
+pub fn sqlite_backup_dir_path(common_storage: &Path, generation: u64) -> PathBuf {
+    common_storage.join(canonical_sqlite_backup_rel_dir(generation))
+}
+
+/// Return the canonical `VACUUM INTO` backup path for `libra.db`:
+/// `<common_storage>/sqlite-backup/<gen>/libra.db`.
+#[must_use]
+pub fn sqlite_backup_git_db_path(common_storage: &Path, generation: u64) -> PathBuf {
+    sqlite_backup_dir_path(common_storage, generation).join(LEGACY_SQLITE_DB_FILE)
+}
+
+/// Return the canonical `VACUUM INTO` backup path for `capture.db`:
+/// `<common_storage>/sqlite-backup/<gen>/capture.db`.
+#[must_use]
+pub fn sqlite_backup_capture_db_path(common_storage: &Path, generation: u64) -> PathBuf {
+    sqlite_backup_dir_path(common_storage, generation).join("capture.db")
+}
+
+/// Return the canonical in-place spool backup directory:
+/// `<common_storage>/sqlite-backup/<gen>/capture-spool`.
+#[must_use]
+pub fn sqlite_backup_capture_spool_dir_path(common_storage: &Path, generation: u64) -> PathBuf {
+    sqlite_backup_dir_path(common_storage, generation).join(CAPTURE_SPOOL_SUBDIR)
+}
+
+/// Verified receipt produced by single-connection `VACUUM INTO` backup (`RB-10f` AC2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SqliteVacuumBackupReceipt {
+    /// Final durably renamed backup path under `.libra/sqlite-backup/<gen>/`.
+    pub backup_path: PathBuf,
+    /// Lowercase 64-hex SHA-256 computed ONLY over the verified new backup inode.
+    pub backup_sha256: String,
+    /// Verified byte length of the standalone backup SQLite file.
+    pub byte_len: u64,
+}
+
+/// Verified byte-for-byte backup receipt for one `capture-spool` file (`RB-10f` AC3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpoolBackupFileReceipt {
+    /// Subdirectory name (`"ready"` or `"quarantine"`).
+    pub subdir: &'static str,
+    /// Filename within the subdirectory.
+    pub file_name: String,
+    /// Exact verified byte length.
+    pub byte_len: u64,
+    /// Lowercase 64-hex SHA-256 verified by independent read-back of the backup file.
+    pub sha256: String,
+}
+
+/// Summary report returned after copying `.libra/private/capture-spool/{ready,quarantine}/`
+/// in place to `.libra/sqlite-backup/<gen>/capture-spool/` (`RB-10f` AC3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpoolBackupReport {
+    /// Target backup directory `<common_storage>/sqlite-backup/<gen>/capture-spool`.
+    pub backup_spool_dir: PathBuf,
+    /// Verified receipts for every copied file across `ready/` and `quarantine/`.
+    pub files: Vec<SpoolBackupFileReceipt>,
+    /// Deterministic manifest SHA-256 covering `{ready, quarantine}` filenames, sizes, and digests.
+    pub spool_manifest_sha256: String,
+    /// `true` if live `capture-spool/ready` is already a verified `0400` tombstone sentinel.
+    pub ready_fenced: bool,
+    /// `true` if live `capture-spool/quarantine` is already a verified `0400` tombstone sentinel.
+    pub quarantine_fenced: bool,
+}
+
+/// Complete Phase 1 lock-safe backup and source-digest bundle (`RB-10f`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForwardPhase1BackupReport {
+    /// Target migration generation (`>= 1`).
+    pub generation: u64,
+    /// Relative backup directory under `<common_storage>` (e.g. `"sqlite-backup/00000001"`).
+    pub backup_rel_dir: String,
+    /// Absolute backup directory path.
+    pub backup_dir: PathBuf,
+    /// Deterministic logical SHA-256 computed directly over locked `libra.db` `c_mig`.
+    pub git_logical_sha256: String,
+    /// Verified `VACUUM INTO` backup receipt for `libra.db`.
+    pub git_backup: SqliteVacuumBackupReceipt,
+    /// Deterministic logical SHA-256 computed directly over locked `capture.db` `c_mig`
+    /// (`None` for pre-split Layout A repositories).
+    pub capture_logical_sha256: Option<String>,
+    /// Verified `VACUUM INTO` backup receipt for `capture.db` (`None` for Layout A).
+    pub capture_backup: Option<SqliteVacuumBackupReceipt>,
+    /// Verified in-place backup report for `capture-spool/{ready,quarantine}/`.
+    pub spool_backup: SpoolBackupReport,
+    /// Deterministic read-only manifest SHA-256 for `capture-queue/{priority,normal}/`.
+    pub queue_manifest_sha256: String,
+    /// Populated `SourceDigests` ready to persist in Phase 2 `storage-format.json`.
+    pub source_digests: SourceDigests,
+}
+
+/// Cumulative upper bound on `sqlite_master` entries scanned during Phase 1
+/// logical digest computation so schema metadata stays well below the 64 MiB
+/// memory budget (`RB-10f` AC1).
+const MAX_LOGICAL_DIGEST_SCHEMA_ENTRIES: usize = 4_096;
+
+/// Cumulative upper bound (`8 MiB`) on `sqlite_master` DDL SQL bytes streamed
+/// during Phase 1 logical digest computation (`RB-10f` AC1).
+const MAX_LOGICAL_DIGEST_SCHEMA_BYTES: usize = 8 * 1024 * 1024;
+
+/// Maximum columns per SQLite table during logical digest computation (matching
+/// SQLite's default `SQLITE_MAX_COLUMN = 2000` with small headroom).
+const MAX_LOGICAL_DIGEST_COLUMNS_PER_TABLE: usize = 2_048;
+
+/// Cumulative upper bound on files backed up across `capture-spool/{ready,quarantine}/`
+/// so in-memory receipt & filename bookkeeping stays strictly within budget (`RB-10f`).
+const MAX_SPOOL_BACKUP_FILES: usize = 16_384;
+
+/// Cumulative upper bound (`4 MiB`) on UTF-8 entry filenames across
+/// `capture-spool/{ready,quarantine}/` (`RB-10f`).
+const MAX_SPOOL_BACKUP_NAME_BYTES: usize = 4 * 1024 * 1024;
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase1BackupHookStage {
+    GitLogicalDigestStreaming,
+    CapLogicalDigestStreaming,
+    GitBackupIntegrityCheck,
+    GitBackupHashing,
+    CapBackupIntegrityCheck,
+    CapBackupHashing,
+    SpoolBackupCopying,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase1DirFaultPoint {
+    AfterGenMkdirBeforeFsync,
+}
+
+/// Validate that `role` is eligible for logical digest / `VACUUM INTO` backup.
+/// Explicitly rejects `DatabaseRole::Derived` (`GC-RB-02`).
+fn validate_logical_digest_role(role: DatabaseRole) -> StorageResult<()> {
+    match role {
+        DatabaseRole::Repository
+        | DatabaseRole::Capture
+        | DatabaseRole::GlobalConfig
+        | DatabaseRole::SystemConfig => Ok(()),
+        DatabaseRole::Derived => Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration Phase 1 rejected {role}: derived databases cannot be migrated or backed up"
+            ),
+        }),
+    }
+}
+
+fn hash_len_prefixed_bytes(hasher: &mut Sha256, bytes: &[u8]) {
+    let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    hasher.update(len.to_le_bytes());
+    hasher.update(bytes);
+}
+
+fn hash_opt_len_prefixed_str(hasher: &mut Sha256, value: Option<&str>) {
+    match value {
+        None => hasher.update([0u8]),
+        Some(s) => {
+            hasher.update([1u8]);
+            hash_len_prefixed_bytes(hasher, s.as_bytes());
+        }
+    }
+}
+
+/// Escape an arbitrary SQLite identifier for double-quoted SQL usage.
+fn escape_sqlite_ident(ident: &str) -> String {
+    ident.replace('"', "\"\"")
+}
+
+fn hash_sqlite_column_value(
+    hasher: &mut Sha256,
+    row: &sea_orm::sqlx::sqlite::SqliteRow,
+    col_idx: usize,
+    role: DatabaseRole,
+    table: &str,
+    col_name: &str,
+) -> StorageResult<()> {
+    use sea_orm::sqlx::{TypeInfo as _, ValueRef as _};
+    let raw = row
+        .try_get_raw(col_idx)
+        .map_err(|_| StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration Phase 1 logical digest failed for {role} on table `{table}` column `{col_name}`: unable to inspect column value"
+            ),
+        })?;
+    if raw.is_null() {
+        hasher.update([0u8]);
+        return Ok(());
+    }
+    match raw.type_info().name() {
+        "NULL" => {
+            hasher.update([0u8]);
+        }
+        "INTEGER" | "INT" | "INT64" | "BOOLEAN" => {
+            let v: i64 = row
+                .try_get(col_idx)
+                .map_err(|_| StorageBackendError::BackendInternal {
+                    detail: format!(
+                        "forward migration Phase 1 logical digest failed for {role} on table `{table}` column `{col_name}`: integer decode error"
+                    ),
+                })?;
+            hasher.update([1u8]);
+            hasher.update(v.to_le_bytes());
+        }
+        "REAL" | "FLOAT" | "DOUBLE" => {
+            let v: f64 = row
+                .try_get(col_idx)
+                .map_err(|_| StorageBackendError::BackendInternal {
+                    detail: format!(
+                        "forward migration Phase 1 logical digest failed for {role} on table `{table}` column `{col_name}`: real decode error"
+                    ),
+                })?;
+            hasher.update([2u8]);
+            hasher.update(v.to_bits().to_le_bytes());
+        }
+        "TEXT" => {
+            let s: &str = row
+                .try_get(col_idx)
+                .map_err(|_| StorageBackendError::BackendInternal {
+                    detail: format!(
+                        "forward migration Phase 1 logical digest failed for {role} on table `{table}` column `{col_name}`: text decode error"
+                    ),
+                })?;
+            hasher.update([3u8]);
+            hash_len_prefixed_bytes(hasher, s.as_bytes());
+        }
+        "BLOB" => {
+            let b: &[u8] =
+                row.try_get(col_idx)
+                    .map_err(|_| StorageBackendError::BackendInternal {
+                        detail: format!(
+                            "forward migration Phase 1 logical digest failed for {role} on table `{table}` column `{col_name}`: blob decode error"
+                        ),
+                    })?;
+            hasher.update([4u8]);
+            hash_len_prefixed_bytes(hasher, b);
+        }
+        other => {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "forward migration Phase 1 logical digest rejected unsupported sqlite storage class `{other}` for {role} on table `{table}` column `{col_name}`"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+async fn preflight_sqlite_table_max_row_bytes_dyn(
+    conn: &mut SqliteConnection,
+    role: DatabaseRole,
+    table: &str,
+    col_names: &[String],
+) -> StorageResult<usize> {
+    if col_names.is_empty() {
+        return Ok(0);
+    }
+    let table_escaped = escape_sqlite_ident(table);
+    let mut sum_terms = Vec::with_capacity(col_names.len());
+    for col_name in col_names {
+        let escaped = escape_sqlite_ident(col_name);
+        sum_terms.push(format!(
+            "CASE WHEN typeof(\"{escaped}\") IN ('text', 'blob') THEN COALESCE(OCTET_LENGTH(\"{escaped}\"), 0) ELSE 8 END"
+        ));
+    }
+    let max_sql = format!(
+        "SELECT COALESCE(MAX({}), 0) FROM \"{table_escaped}\"",
+        sum_terms.join(" + ")
+    );
+    let max_row_bytes: i64 = sea_orm::sqlx::query_scalar(AssertSqlSafe(max_sql.as_str()))
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(|_| StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration Phase 1 logical digest failed for {role} while sizing rows in `{table}`"
+            ),
+        })?;
+    let max_row_bytes = usize::try_from(max_row_bytes.max(0)).unwrap_or(usize::MAX);
+    if max_row_bytes > FORWARD_MIGRATION_MAX_SINGLE_ROW_BYTES {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration Phase 1 logical digest rejected single SQLite row in `{table}` exceeding {FORWARD_MIGRATION_MAX_SINGLE_ROW_BYTES}-byte memory-budget cap"
+            ),
+        });
+    }
+    Ok(max_row_bytes)
+}
+
+async fn pick_rowid_alias_for_table(
+    conn: &mut SqliteConnection,
+    table_escaped: &str,
+    col_names: &[String],
+) -> Option<&'static str> {
+    for candidate in ["rowid", "_rowid_", "oid"] {
+        if col_names
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(candidate))
+        {
+            continue;
+        }
+        let probe_sql = format!("SELECT {candidate} FROM \"{table_escaped}\" LIMIT 0");
+        if sea_orm::sqlx::query(AssertSqlSafe(probe_sql.as_str()))
+            .fetch_all(&mut *conn)
+            .await
+            .is_ok()
+        {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Stream-compute the deterministic canonical logical digest
+/// (`source_logical_sha256`) directly through the already-locked single
+/// `SqliteConnection` (`c_mig`) with ZERO filesystem `open()`/`close()` calls
+/// on the live `.db` path (`ADR-RB-07` #1, `RB-10f` AC1).
+///
+/// Deterministically covers:
+/// - `role`, `PRAGMA schema_version`, `PRAGMA user_version`, `PRAGMA application_id`
+/// - All streamed ordered `sqlite_master` entries (`type`, `name`, `tbl_name`, `sql`)
+///   subject to explicit cumulative entry & byte bounds
+/// - For every table in sorted `name ASC` order: column metadata from
+///   `PRAGMA table_info`, all rows in deterministic keyset order with exact
+///   SQLite dynamic storage-class tags (`NULL`/`INTEGER`/`REAL`/`TEXT`/`BLOB`),
+///   and exact row count.
+///
+/// Enforces the `FORWARD_MIGRATION_MAX_SINGLE_ROW_BYTES` (`4 MiB`),
+/// `max_safe_query_rows`, and schema metadata bounds so even wide tables stay
+/// strictly inside the `64 MiB` extra-heap budget.
+pub async fn compute_sqlite_source_logical_sha256(
+    conn: &mut SqliteConnection,
+    role: DatabaseRole,
+) -> StorageResult<String> {
+    compute_sqlite_source_logical_sha256_inner(
+        conn,
+        role,
+        #[cfg(test)]
+        None,
+    )
+    .await
+}
+
+async fn compute_sqlite_source_logical_sha256_inner(
+    conn: &mut SqliteConnection,
+    role: DatabaseRole,
+    #[cfg(test)] mut on_during_stream: Option<&mut dyn FnMut()>,
+) -> StorageResult<String> {
+    validate_logical_digest_role(role)?;
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"LIBRA_SQLITE_LOGICAL_SHA256_V1\0");
+    let role_label = role.to_string();
+    hash_len_prefixed_bytes(&mut hasher, role_label.as_bytes());
+
+    let schema_version: i64 = sea_orm::sqlx::query_scalar("PRAGMA schema_version;")
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(|_| StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration Phase 1 logical digest failed to read PRAGMA schema_version for {role}"
+            ),
+        })?;
+    let user_version: i64 = sea_orm::sqlx::query_scalar("PRAGMA user_version;")
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(|_| StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration Phase 1 logical digest failed to read PRAGMA user_version for {role}"
+            ),
+        })?;
+    let application_id: i64 = sea_orm::sqlx::query_scalar("PRAGMA application_id;")
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(|_| StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration Phase 1 logical digest failed to read PRAGMA application_id for {role}"
+            ),
+        })?;
+    hasher.update(schema_version.to_le_bytes());
+    hasher.update(user_version.to_le_bytes());
+    hasher.update(application_id.to_le_bytes());
+
+    // Stream `sqlite_master` row-by-row with strict cumulative entry & byte caps
+    // (never materializing an unbounded `Vec<SqliteRow>` of DDL text in RAM).
+    let mut table_names: Vec<String> = Vec::new();
+    let mut master_count: u64 = 0;
+    let mut master_bytes: usize = 0;
+    hasher.update(b"MASTER\0");
+    {
+        let mut master_stream = sea_orm::sqlx::query(
+            "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type ASC, name ASC, tbl_name ASC",
+        )
+        .fetch(&mut *conn);
+        while let Some(row) = master_stream.try_next().await.map_err(|_| {
+            StorageBackendError::BackendInternal {
+                detail: format!(
+                    "forward migration Phase 1 logical digest failed to stream sqlite_master for {role}"
+                ),
+            }
+        })? {
+            if master_count as usize >= MAX_LOGICAL_DIGEST_SCHEMA_ENTRIES {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: format!(
+                        "forward migration Phase 1 logical digest rejected sqlite_master exceeding {MAX_LOGICAL_DIGEST_SCHEMA_ENTRIES}-entry budget for {role}"
+                    ),
+                });
+            }
+            let obj_type: &str = row.try_get(0).map_err(|_| StorageBackendError::BackendInternal {
+                detail: format!("forward migration Phase 1 logical digest failed to decode sqlite_master.type for {role}"),
+            })?;
+            let obj_name: &str = row.try_get(1).map_err(|_| StorageBackendError::BackendInternal {
+                detail: format!("forward migration Phase 1 logical digest failed to decode sqlite_master.name for {role}"),
+            })?;
+            let tbl_name: &str = row.try_get(2).map_err(|_| StorageBackendError::BackendInternal {
+                detail: format!("forward migration Phase 1 logical digest failed to decode sqlite_master.tbl_name for {role}"),
+            })?;
+            let obj_sql: Option<&str> = row.try_get(3).map_err(|_| StorageBackendError::BackendInternal {
+                detail: format!("forward migration Phase 1 logical digest failed to decode sqlite_master.sql for {role}"),
+            })?;
+
+            let entry_bytes = obj_type
+                .len()
+                .saturating_add(obj_name.len())
+                .saturating_add(tbl_name.len())
+                .saturating_add(obj_sql.map_or(0, str::len));
+            master_bytes = master_bytes.saturating_add(entry_bytes);
+            if master_bytes > MAX_LOGICAL_DIGEST_SCHEMA_BYTES {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: format!(
+                        "forward migration Phase 1 logical digest rejected sqlite_master exceeding {MAX_LOGICAL_DIGEST_SCHEMA_BYTES}-byte schema budget for {role}"
+                    ),
+                });
+            }
+
+            hash_len_prefixed_bytes(&mut hasher, obj_type.as_bytes());
+            hash_len_prefixed_bytes(&mut hasher, obj_name.as_bytes());
+            hash_len_prefixed_bytes(&mut hasher, tbl_name.as_bytes());
+            hash_opt_len_prefixed_str(&mut hasher, obj_sql);
+            master_count = master_count.saturating_add(1);
+
+            if obj_type == "table" {
+                if let Some(sql) = obj_sql
+                    && sql.to_ascii_uppercase().contains("CREATE VIRTUAL TABLE")
+                {
+                    return Err(StorageBackendError::BackendInternal {
+                        detail: format!(
+                            "forward migration Phase 1 logical digest rejected unsupported virtual table `{obj_name}` for {role}"
+                        ),
+                    });
+                }
+                table_names.push(obj_name.to_string());
+            }
+        }
+    }
+    hasher.update(b"END_MASTER\0");
+    hasher.update(master_count.to_le_bytes());
+    table_names.sort();
+
+    hasher.update(b"TABLES\0");
+    hasher.update((table_names.len() as u64).to_le_bytes());
+
+    #[cfg(test)]
+    let mut fired_during_stream_hook = false;
+
+    for table in &table_names {
+        let table_escaped = escape_sqlite_ident(table);
+        let pragma_sql = format!("PRAGMA table_info(\"{table_escaped}\")");
+
+        hasher.update(b"TABLE\0");
+        hash_len_prefixed_bytes(&mut hasher, table.as_bytes());
+
+        let mut col_names: Vec<String> = Vec::new();
+        let mut pk_cols: Vec<(i64, String)> = Vec::new();
+        {
+            let mut info_stream =
+                sea_orm::sqlx::query(AssertSqlSafe(pragma_sql.as_str())).fetch(&mut *conn);
+            while let Some(info_row) = info_stream.try_next().await.map_err(|_| {
+                StorageBackendError::BackendInternal {
+                    detail: format!(
+                        "forward migration Phase 1 logical digest failed to stream columns of `{table}` for {role}"
+                    ),
+                }
+            })? {
+                if col_names.len() >= MAX_LOGICAL_DIGEST_COLUMNS_PER_TABLE {
+                    return Err(StorageBackendError::BackendInternal {
+                        detail: format!(
+                            "forward migration Phase 1 logical digest rejected table `{table}` exceeding {MAX_LOGICAL_DIGEST_COLUMNS_PER_TABLE} columns for {role}"
+                        ),
+                    });
+                }
+                let cid: i64 = info_row.try_get(0).map_err(|_| {
+                    StorageBackendError::BackendInternal {
+                        detail: format!(
+                            "forward migration Phase 1 logical digest failed to decode table_info.cid for `{table}`"
+                        ),
+                    }
+                })?;
+                let col_name: String = info_row.try_get(1).map_err(|_| {
+                    StorageBackendError::BackendInternal {
+                        detail: format!(
+                            "forward migration Phase 1 logical digest failed to decode table_info.name for `{table}`"
+                        ),
+                    }
+                })?;
+                let col_type: &str = info_row.try_get(2).map_err(|_| {
+                    StorageBackendError::BackendInternal {
+                        detail: format!(
+                            "forward migration Phase 1 logical digest failed to decode table_info.type for `{table}`"
+                        ),
+                    }
+                })?;
+                let notnull: i64 = info_row.try_get(3).map_err(|_| {
+                    StorageBackendError::BackendInternal {
+                        detail: format!(
+                            "forward migration Phase 1 logical digest failed to decode table_info.notnull for `{table}`"
+                        ),
+                    }
+                })?;
+                let dflt_val: Option<&str> = info_row.try_get(4).map_err(|_| {
+                    StorageBackendError::BackendInternal {
+                        detail: format!(
+                            "forward migration Phase 1 logical digest failed to decode table_info.dflt_value for `{table}`"
+                        ),
+                    }
+                })?;
+                let pk: i64 = info_row.try_get(5).map_err(|_| {
+                    StorageBackendError::BackendInternal {
+                        detail: format!(
+                            "forward migration Phase 1 logical digest failed to decode table_info.pk for `{table}`"
+                        ),
+                    }
+                })?;
+
+                hasher.update(cid.to_le_bytes());
+                hash_len_prefixed_bytes(&mut hasher, col_name.as_bytes());
+                hash_len_prefixed_bytes(&mut hasher, col_type.as_bytes());
+                hasher.update(notnull.to_le_bytes());
+                hash_opt_len_prefixed_str(&mut hasher, dflt_val);
+                hasher.update(pk.to_le_bytes());
+
+                if pk > 0 {
+                    pk_cols.push((pk, col_name.clone()));
+                }
+                col_names.push(col_name);
+            }
+        }
+        hasher.update(b"END_COLS\0");
+        hasher.update((col_names.len() as u64).to_le_bytes());
+
+        if col_names.is_empty() {
+            hasher.update(0u64.to_le_bytes());
+            hasher.update([0xFFu8]);
+            continue;
+        }
+
+        let max_row_bytes =
+            preflight_sqlite_table_max_row_bytes_dyn(conn, role, table, &col_names).await?;
+        let max_safe_query_rows = FORWARD_MIGRATION_STREAM_BATCH_MAX_BYTES
+            .checked_div(max_row_bytes)
+            .map_or(FORWARD_MIGRATION_STREAM_BATCH_ROWS, |n| {
+                n.clamp(1, FORWARD_MIGRATION_STREAM_BATCH_ROWS)
+            });
+
+        let select_list = col_names
+            .iter()
+            .map(|c| format!("\"{}\"", escape_sqlite_ident(c)))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let mut row_count = 0u64;
+        if let Some(rowid_alias) =
+            pick_rowid_alias_for_table(conn, &table_escaped, &col_names).await
+        {
+            hasher.update([1u8]); // rowid-ordered table
+            let first_sql = format!(
+                "SELECT {rowid_alias}, {select_list} FROM \"{table_escaped}\" ORDER BY {rowid_alias} ASC LIMIT ?"
+            );
+            let next_sql = format!(
+                "SELECT {rowid_alias}, {select_list} FROM \"{table_escaped}\" WHERE {rowid_alias} > ? ORDER BY {rowid_alias} ASC LIMIT ?"
+            );
+            let query_limit = i64::try_from(max_safe_query_rows).unwrap_or(1);
+            let mut last_rowid: Option<i64> = None;
+            loop {
+                let mut fetched = 0usize;
+                {
+                    let mut stream = match last_rowid {
+                        None => sea_orm::sqlx::query(AssertSqlSafe(first_sql.as_str()))
+                            .bind(query_limit)
+                            .fetch(&mut *conn),
+                        Some(cursor) => sea_orm::sqlx::query(AssertSqlSafe(next_sql.as_str()))
+                            .bind(cursor)
+                            .bind(query_limit)
+                            .fetch(&mut *conn),
+                    };
+                    while let Some(row) = stream.try_next().await.map_err(|_| {
+                        StorageBackendError::BackendInternal {
+                            detail: format!(
+                                "forward migration Phase 1 logical digest failed streaming `{table}` for {role}"
+                            ),
+                        }
+                    })? {
+                        let rid: i64 = row.try_get(0).map_err(|_| {
+                            StorageBackendError::BackendInternal {
+                                detail: format!(
+                                    "forward migration Phase 1 logical digest failed to decode rowid in `{table}` for {role}"
+                                ),
+                            }
+                        })?;
+                        hasher.update(rid.to_le_bytes());
+                        for (i, col_name) in col_names.iter().enumerate() {
+                            hash_sqlite_column_value(
+                                &mut hasher,
+                                &row,
+                                i + 1,
+                                role,
+                                table,
+                                col_name,
+                            )?;
+                        }
+                        last_rowid = Some(rid);
+                        fetched = fetched.saturating_add(1);
+                        row_count = row_count.saturating_add(1);
+                        #[cfg(test)]
+                        if !fired_during_stream_hook {
+                            if let Some(cb) = on_during_stream.as_deref_mut() {
+                                cb();
+                            }
+                            fired_during_stream_hook = true;
+                        }
+                    }
+                }
+                if fetched < max_safe_query_rows || last_rowid == Some(i64::MAX) {
+                    break;
+                }
+                if max_row_bytes >= 256 * 1024 {
+                    let _ = conn.execute("PRAGMA shrink_memory;").await;
+                }
+            }
+        } else {
+            // `WITHOUT ROWID` table (primary B-tree is already ordered by PK)
+            // or a table whose user columns shadow all three rowid aliases.
+            hasher.update([2u8]);
+            pk_cols.sort_by_key(|(ord, _)| *ord);
+            let order_list = if !pk_cols.is_empty() {
+                pk_cols
+                    .iter()
+                    .map(|(_, c)| format!("\"{}\" ASC", escape_sqlite_ident(c)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            } else {
+                col_names
+                    .iter()
+                    .map(|c| format!("\"{}\" ASC", escape_sqlite_ident(c)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            if max_row_bytes > 32 * 1024 {
+                // Bound SQLx's background 50-row worker prefetch on wide
+                // `WITHOUT ROWID` tables so peak RAM stays <= 64 MiB.
+                let page_sql = format!(
+                    "SELECT {select_list} FROM \"{table_escaped}\" ORDER BY {order_list} LIMIT ? OFFSET ?"
+                );
+                let query_limit = i64::try_from(max_safe_query_rows).unwrap_or(1);
+                let mut offset: i64 = 0;
+                loop {
+                    let mut fetched = 0usize;
+                    {
+                        let mut stream = sea_orm::sqlx::query(AssertSqlSafe(page_sql.as_str()))
+                            .bind(query_limit)
+                            .bind(offset)
+                            .fetch(&mut *conn);
+                        while let Some(row) = stream.try_next().await.map_err(|_| {
+                            StorageBackendError::BackendInternal {
+                                detail: format!(
+                                    "forward migration Phase 1 logical digest failed streaming wide WITHOUT ROWID table `{table}` for {role}"
+                                ),
+                            }
+                        })? {
+                            for (i, col_name) in col_names.iter().enumerate() {
+                                hash_sqlite_column_value(
+                                    &mut hasher,
+                                    &row,
+                                    i,
+                                    role,
+                                    table,
+                                    col_name,
+                                )?;
+                            }
+                            fetched = fetched.saturating_add(1);
+                            row_count = row_count.saturating_add(1);
+                            #[cfg(test)]
+                            if !fired_during_stream_hook {
+                                if let Some(cb) = on_during_stream.as_deref_mut() {
+                                    cb();
+                                }
+                                fired_during_stream_hook = true;
+                            }
+                        }
+                    }
+                    if fetched < max_safe_query_rows {
+                        break;
+                    }
+                    offset = offset.saturating_add(i64::try_from(fetched).unwrap_or(1));
+                    let _ = conn.execute("PRAGMA shrink_memory;").await;
+                }
+            } else {
+                let full_sql =
+                    format!("SELECT {select_list} FROM \"{table_escaped}\" ORDER BY {order_list}");
+                let mut stream =
+                    sea_orm::sqlx::query(AssertSqlSafe(full_sql.as_str())).fetch(&mut *conn);
+                while let Some(row) = stream.try_next().await.map_err(|_| {
+                    StorageBackendError::BackendInternal {
+                        detail: format!(
+                            "forward migration Phase 1 logical digest failed streaming WITHOUT ROWID table `{table}` for {role}"
+                        ),
+                    }
+                })? {
+                    for (i, col_name) in col_names.iter().enumerate() {
+                        hash_sqlite_column_value(&mut hasher, &row, i, role, table, col_name)?;
+                    }
+                    row_count = row_count.saturating_add(1);
+                    #[cfg(test)]
+                    if !fired_during_stream_hook {
+                        if let Some(cb) = on_during_stream.as_deref_mut() {
+                            cb();
+                        }
+                        fired_during_stream_hook = true;
+                    }
+                }
+            }
+        }
+
+        hasher.update(row_count.to_le_bytes());
+        hasher.update([0xFFu8]);
+        if max_row_bytes >= 256 * 1024 {
+            let _ = conn.execute("PRAGMA shrink_memory;").await;
+        }
+    }
+
+    #[cfg(test)]
+    if !fired_during_stream_hook && let Some(cb) = on_during_stream {
+        cb();
+    }
+
+    Ok(sha256_hex_from_hasher(hasher))
+}
+
+#[cfg(unix)]
+fn fsync_dir_fd_unix(
+    dir_fd: &std::os::unix::io::OwnedFd,
+    subject: &'static str,
+) -> StorageResult<()> {
+    use std::os::unix::io::AsRawFd as _;
+    let _ = subject;
+    // SAFETY: `dir_fd` is a valid open directory file descriptor.
+    if unsafe { libc::fsync(dir_fd.as_raw_fd()) } != 0 {
+        return Err(StorageBackendError::io(
+            "fsync backup directory",
+            io::Error::last_os_error(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_or_create_private_dir_at_unix(
+    parent_fd: &std::os::unix::io::OwnedFd,
+    name: &std::ffi::CStr,
+    require_fresh: bool,
+    subject: &'static str,
+    #[cfg(test)] fail_after_mkdir: bool,
+) -> StorageResult<(std::os::unix::io::OwnedFd, bool)> {
+    use std::os::unix::io::{AsRawFd as _, FromRawFd as _, OwnedFd};
+    // SAFETY: `parent_fd` is valid and `name` is NUL-terminated.
+    let mk_rc =
+        unsafe { libc::mkdirat(parent_fd.as_raw_fd(), name.as_ptr(), 0o700 as libc::mode_t) };
+    let created = if mk_rc == 0 {
+        true
+    } else {
+        let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::AlreadyExists {
+            if require_fresh {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: format!("forward migration Phase 1 rejected pre-existing {subject}"),
+                });
+            }
+            false
+        } else {
+            return Err(StorageBackendError::io("create backup directory", err));
+        }
+    };
+
+    // Immediately arm rollback on the pinned `parent_fd` whenever `mkdirat`
+    // created the directory, so any failure in `openat`, `fstat`, validation,
+    // `fchmod`, or parent `fsync` never leaves an empty generation directory
+    // behind to block retries (`RB-10f`).
+    struct CreatedDirRollback<'a> {
+        parent_fd: &'a OwnedFd,
+        name: &'a std::ffi::CStr,
+        armed: bool,
+    }
+    impl Drop for CreatedDirRollback<'_> {
+        fn drop(&mut self) {
+            if self.armed {
+                // SAFETY: `parent_fd` is pinned and `name` is NUL-terminated.
+                let _ = unsafe {
+                    libc::unlinkat(
+                        self.parent_fd.as_raw_fd(),
+                        self.name.as_ptr(),
+                        libc::AT_REMOVEDIR,
+                    )
+                };
+            }
+        }
+    }
+    let mut rollback = CreatedDirRollback {
+        parent_fd,
+        name,
+        armed: created,
+    };
+
+    // SAFETY: `parent_fd` is valid and `name` is NUL-terminated.
+    let raw = unsafe {
+        libc::openat(
+            parent_fd.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if raw < 0 {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!("forward migration Phase 1 rejected unsafe or symlinked {subject}"),
+        });
+    }
+    // SAFETY: `raw >= 0` is exclusively owned here.
+    let dir_fd = unsafe { OwnedFd::from_raw_fd(raw) };
+
+    let mut st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: `dir_fd` is valid.
+    if unsafe { libc::fstat(dir_fd.as_raw_fd(), st.as_mut_ptr()) } != 0 {
+        return Err(StorageBackendError::io(
+            "stat backup directory",
+            io::Error::last_os_error(),
+        ));
+    }
+    // SAFETY: `fstat` succeeded.
+    let st = unsafe { st.assume_init() };
+    // SAFETY: `geteuid` cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    if (st.st_mode & libc::S_IFMT) != libc::S_IFDIR || st.st_uid != euid {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration Phase 1 rejected {subject} not owned by current user"
+            ),
+        });
+    }
+    if (u32::from(st.st_mode) & 0o022) != 0 {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration Phase 1 rejected group- or world-writable {subject}"
+            ),
+        });
+    }
+    if u32::from(st.st_mode & 0o777) != 0o700 {
+        // Safe to tighten owned non-group/world-writable directory to `0700`.
+        // SAFETY: `dir_fd` is valid and owned by `euid`.
+        if unsafe { libc::fchmod(dir_fd.as_raw_fd(), 0o700 as libc::mode_t) } != 0 {
+            return Err(StorageBackendError::io(
+                "enforce 0700 permissions on backup directory",
+                io::Error::last_os_error(),
+            ));
+        }
+    }
+    #[cfg(test)]
+    if fail_after_mkdir {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "injected failure during {subject} setup before parent directory fsync"
+            ),
+        });
+    }
+    if created {
+        fsync_dir_fd_unix(parent_fd, subject)?;
+    }
+    rollback.armed = false;
+    Ok((dir_fd, created))
+}
+
+/// Recursively remove all entries inside a pinned Unix backup directory fd
+/// without ever following symlinks or traversing unpinned parent paths.
+#[cfg(unix)]
+fn remove_dir_contents_pinned_unix(dir_fd: &std::os::unix::io::OwnedFd) {
+    use std::{
+        ffi::CString,
+        os::unix::io::{AsRawFd as _, FromRawFd as _, OwnedFd},
+    };
+    let Ok(names) = list_sorted_dir_names_bounded_unix(
+        dir_fd,
+        MAX_SPOOL_BACKUP_FILES.saturating_mul(2).saturating_add(64),
+        MAX_SPOOL_BACKUP_NAME_BYTES.saturating_mul(2),
+        "backup cleanup directory",
+    ) else {
+        return;
+    };
+    for name in names {
+        let Ok(c_name) = CString::new(name.as_bytes()) else {
+            continue;
+        };
+        let mut st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+        // SAFETY: `dir_fd` is valid and `c_name` is NUL-terminated.
+        if unsafe {
+            libc::fstatat(
+                dir_fd.as_raw_fd(),
+                c_name.as_ptr(),
+                st.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            continue;
+        }
+        // SAFETY: `fstatat` succeeded.
+        let st = unsafe { st.assume_init() };
+        if (st.st_mode & libc::S_IFMT) == libc::S_IFDIR {
+            // SAFETY: `dir_fd` is valid and `c_name` is NUL-terminated.
+            let raw_sub = unsafe {
+                libc::openat(
+                    dir_fd.as_raw_fd(),
+                    c_name.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if raw_sub >= 0 {
+                // SAFETY: `raw_sub >= 0` is exclusively owned here.
+                let sub_fd = unsafe { OwnedFd::from_raw_fd(raw_sub) };
+                remove_dir_contents_pinned_unix(&sub_fd);
+            }
+            // SAFETY: `dir_fd` is valid and `c_name` is NUL-terminated.
+            let _ =
+                unsafe { libc::unlinkat(dir_fd.as_raw_fd(), c_name.as_ptr(), libc::AT_REMOVEDIR) };
+        } else {
+            // SAFETY: `dir_fd` is valid and `c_name` is NUL-terminated.
+            let _ = unsafe { libc::unlinkat(dir_fd.as_raw_fd(), c_name.as_ptr(), 0) };
+        }
+    }
+}
+
+#[cfg(windows)]
+fn open_or_create_pinned_subdir_windows(
+    parent_path: &Path,
+    pinned_ancestors: &[(&Path, win_tmp_guard::WinFileId, &'static str)],
+    child_name: &str,
+    require_fresh: bool,
+    subject: &'static str,
+) -> StorageResult<(
+    win_tmp_guard::WinHandleGuard,
+    win_tmp_guard::WinFileId,
+    bool,
+)> {
+    win_tmp_guard::verify_pinned_dir_ids(pinned_ancestors)?;
+    let child_path = parent_path.join(child_name);
+    let created = match fs::create_dir(&child_path) {
+        Ok(()) => true,
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+            if require_fresh {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: format!("forward migration Phase 1 rejected pre-existing {subject}"),
+                });
+            }
+            false
+        }
+        Err(err) => return Err(StorageBackendError::io("create backup directory", err)),
+    };
+    struct RollbackDir {
+        path: PathBuf,
+        armed: bool,
+    }
+    impl Drop for RollbackDir {
+        fn drop(&mut self) {
+            if self.armed {
+                let _ = fs::remove_dir(&self.path);
+            }
+        }
+    }
+    let mut rb = RollbackDir {
+        path: child_path.clone(),
+        armed: created,
+    };
+    let (guard, id) = win_tmp_guard::open_pinned_non_reparse_dir(&child_path, subject)?;
+    win_tmp_guard::verify_pinned_dir_ids(pinned_ancestors)?;
+    rb.armed = false;
+    Ok((guard, id, created))
+}
+
+#[cfg(unix)]
+fn open_verified_backup_parent_dir_unix(
+    parent: &Path,
+) -> StorageResult<std::os::unix::io::OwnedFd> {
+    use std::{
+        ffi::CString,
+        os::unix::{
+            ffi::OsStrExt as _,
+            io::{AsRawFd as _, FromRawFd as _, OwnedFd},
+        },
+    };
+    let c_parent = CString::new(parent.as_os_str().as_bytes()).map_err(|_| {
+        StorageBackendError::BackendInternal {
+            detail: "invalid backup parent directory path".to_string(),
+        }
+    })?;
+    // SAFETY: `c_parent` is NUL-terminated.
+    let raw = unsafe {
+        libc::open(
+            c_parent.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if raw < 0 {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "backup parent directory must exist and be a non-symlink directory".to_string(),
+        });
+    }
+    // SAFETY: `raw >= 0` is exclusively owned here.
+    let dir_fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    let mut st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: `dir_fd` is valid.
+    if unsafe { libc::fstat(dir_fd.as_raw_fd(), st.as_mut_ptr()) } != 0 {
+        return Err(StorageBackendError::io(
+            "stat backup parent directory",
+            io::Error::last_os_error(),
+        ));
+    }
+    // SAFETY: `fstat` succeeded.
+    let st = unsafe { st.assume_init() };
+    // SAFETY: `geteuid` cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    if (st.st_mode & libc::S_IFMT) != libc::S_IFDIR || st.st_uid != euid {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "backup parent directory is not owned by the current effective user"
+                .to_string(),
+        });
+    }
+    if (u32::from(st.st_mode) & 0o022) != 0 {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "backup parent directory has unsafe group- or world-writable permissions"
+                .to_string(),
+        });
+    }
+    Ok(dir_fd)
+}
+
+#[cfg(unix)]
+fn verify_entry_inode_at_unix(
+    parent_fd: &std::os::unix::io::OwnedFd,
+    name: &std::ffi::CStr,
+    expected_inode: (u64, u64),
+    forbidden_inode: (u64, u64),
+    role: DatabaseRole,
+) -> StorageResult<()> {
+    use std::os::unix::io::AsRawFd as _;
+    let mut st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: `parent_fd` is pinned and `name` is NUL-terminated.
+    if unsafe {
+        libc::fstatat(
+            parent_fd.as_raw_fd(),
+            name.as_ptr(),
+            st.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration Phase 1 VACUUM INTO backup vanished during verification for {role}"
+            ),
+        });
+    }
+    // SAFETY: `fstatat` succeeded.
+    let st = unsafe { st.assume_init() };
+    // SAFETY: `geteuid` cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    let actual_inode = (st.st_dev as u64, st.st_ino);
+    if (st.st_mode & libc::S_IFMT) != libc::S_IFREG
+        || st.st_nlink != 1
+        || st.st_uid != euid
+        || actual_inode != expected_inode
+        || actual_inode == forbidden_inode
+    {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration Phase 1 VACUUM INTO backup identity drifted during verification for {role}"
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Stream-hash an already-opened read-only file descriptor in fixed `64 KiB`
+/// chunks without allocating whole-file buffers.
+fn stream_hash_file(file: &mut File, subject: &'static str) -> StorageResult<(String, u64)> {
+    stream_hash_file_inner(
+        file,
+        subject,
+        #[cfg(test)]
+        None,
+    )
+}
+
+fn stream_hash_file_inner(
+    file: &mut File,
+    subject: &'static str,
+    #[cfg(test)] mut on_mid_hash: Option<&mut dyn FnMut()>,
+) -> StorageResult<(String, u64)> {
+    use std::io::Read as _;
+    let _ = subject;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; BACKUP_STREAM_BUF_BYTES];
+    let mut total = 0u64;
+    #[cfg(test)]
+    let mut fired_mid_hash = false;
+    loop {
+        let n = file
+            .read(&mut buf)
+            .map_err(|err| StorageBackendError::io("read backup file for sha256", err))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        total = total.saturating_add(n as u64);
+        #[cfg(test)]
+        if !fired_mid_hash {
+            if let Some(cb) = on_mid_hash.as_deref_mut() {
+                cb();
+            }
+            fired_mid_hash = true;
+        }
+    }
+    #[cfg(test)]
+    if !fired_mid_hash && let Some(cb) = on_mid_hash {
+        cb();
+    }
+    Ok((sha256_hex_from_hasher(hasher), total))
+}
+
+/// Execute SQLite native `VACUUM INTO` directly on the already-locked single
+/// migration connection `source` (`c_mig`) to create an independent single-file
+/// backup at `backup_path`, then verify `PRAGMA integrity_check == "ok"`,
+/// `fsync`, and `backup_sha256` ONLY against the independent new backup inode
+/// (`ADR-RB-07` #1, `RB-10f` AC2).
+///
+/// Never opens or closes any additional file descriptor on the live source
+/// `.db` path, preserving POSIX `fcntl` / Windows `EXCLUSIVE` lock ownership
+/// on `source` throughout and after this call.
+pub async fn vacuum_into_lock_safe_backup(
+    source: &mut QuiescedSqliteConnection,
+    backup_path: &Path,
+) -> StorageResult<SqliteVacuumBackupReceipt> {
+    vacuum_into_lock_safe_backup_inner(
+        source,
+        backup_path,
+        #[cfg(test)]
+        None,
+        #[cfg(test)]
+        None,
+    )
+    .await
+}
+
+async fn vacuum_into_lock_safe_backup_inner(
+    source: &mut QuiescedSqliteConnection,
+    backup_path: &Path,
+    #[cfg(test)] mut on_during_integrity_check: Option<&mut dyn FnMut()>,
+    #[cfg(test)] on_during_hash: Option<&mut dyn FnMut()>,
+) -> StorageResult<SqliteVacuumBackupReceipt> {
+    let role = source.role();
+    validate_logical_digest_role(role)?;
+    if source.journal_mode() != "delete" {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration Phase 1 VACUUM INTO backup requires DELETE-mode quiesced connection for {role}"
+            ),
+        });
+    }
+    verify_connection_not_moved(&mut source.conn, role).await?;
+
+    // Inspect live `.db` metadata ONLY via `lstat` (zero OS file descriptor opened!).
+    let live_meta = validate_sqlite_file_metadata(source.path(), role)?;
+    #[cfg(unix)]
+    let live_inode = {
+        use std::os::unix::fs::MetadataExt as _;
+        (live_meta.dev(), live_meta.ino())
+    };
+    #[cfg(not(unix))]
+    let _ = &live_meta;
+
+    let backup_parent =
+        backup_path
+            .parent()
+            .ok_or_else(|| StorageBackendError::BackendInternal {
+                detail: "VACUUM INTO backup target path is missing parent directory".to_string(),
+            })?;
+    let final_name_str = backup_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|n| !n.is_empty() && *n != "." && *n != ".." && !n.contains(['/', '\\', '\0']))
+        .ok_or_else(|| StorageBackendError::BackendInternal {
+            detail: "VACUUM INTO backup target filename is invalid".to_string(),
+        })?;
+    let tmp_name_str = format!("{final_name_str}.tmp");
+    let backup_tmp_path = backup_parent.join(&tmp_name_str);
+    let tmp_path_utf8 = backup_tmp_path
+        .to_str()
+        .filter(|s| !s.contains('\0'))
+        .ok_or_else(|| StorageBackendError::BackendInternal {
+            detail: "VACUUM INTO backup staging path must be valid UTF-8 without NUL".to_string(),
+        })?
+        .to_string();
+
+    #[cfg(unix)]
+    let parent_fd = open_verified_backup_parent_dir_unix(backup_parent)?;
+    #[cfg(windows)]
+    let (_parent_pin, parent_id) =
+        win_tmp_guard::open_pinned_non_reparse_dir(backup_parent, "sqlite backup directory")?;
+
+    // Reject pre-existing final backup, staging `.tmp`, or stray SQLite sidecars.
+    for candidate in [
+        backup_path.to_path_buf(),
+        backup_tmp_path.clone(),
+        sqlite_sidecar_path(backup_path, "-wal"),
+        sqlite_sidecar_path(backup_path, "-shm"),
+        sqlite_sidecar_path(backup_path, "-journal"),
+        sqlite_sidecar_path(&backup_tmp_path, "-wal"),
+        sqlite_sidecar_path(&backup_tmp_path, "-shm"),
+        sqlite_sidecar_path(&backup_tmp_path, "-journal"),
+    ] {
+        if path_exists_no_open(&candidate)? {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "forward migration Phase 1 VACUUM INTO backup target already exists for {role}"
+                ),
+            });
+        }
+    }
+
+    // RAII cleanup guard ensuring `<backup_path>.tmp` is never left behind on error.
+    struct VacuumTmpGuard {
+        path: PathBuf,
+        armed: bool,
+    }
+    impl Drop for VacuumTmpGuard {
+        fn drop(&mut self) {
+            if self.armed {
+                let _ = fs::remove_file(&self.path);
+            }
+        }
+    }
+    let mut tmp_guard = VacuumTmpGuard {
+        path: backup_tmp_path.clone(),
+        armed: true,
+    };
+
+    // Execute native SQLite `VACUUM INTO ?` directly on the already-locked `c_mig`.
+    sea_orm::sqlx::query("VACUUM INTO ?")
+        .bind(&tmp_path_utf8)
+        .execute(&mut source.conn)
+        .await
+        .map_err(|err| StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration Phase 1 VACUUM INTO backup failed for {role} ({})",
+                if is_sqlite_busy_error(&err) {
+                    "SQLITE_BUSY"
+                } else {
+                    "vacuum error"
+                }
+            ),
+        })?;
+    let _ = source.conn.execute("PRAGMA shrink_memory;").await;
+
+    // Step 1: Verify the newly created backup `.tmp` is an independent regular
+    // file (protected against live `.db` inode alias BEFORE `openat`!), enforce
+    // owner-only `0600` mode, and `sync_all()` it BEFORE integrity checks.
+    #[cfg(unix)]
+    let (c_tmp_name, c_final_name, backup_inode) = {
+        use std::{ffi::CString, os::unix::io::AsRawFd as _};
+        let c_tmp = CString::new(tmp_name_str.as_bytes()).map_err(|_| {
+            StorageBackendError::BackendInternal {
+                detail: "invalid VACUUM INTO staging filename".to_string(),
+            }
+        })?;
+        let c_final = CString::new(final_name_str.as_bytes()).map_err(|_| {
+            StorageBackendError::BackendInternal {
+                detail: "invalid VACUUM INTO final filename".to_string(),
+            }
+        })?;
+        let (file, _) = open_readonly_regular_file_at_unix_protected(
+            &parent_fd,
+            &c_tmp,
+            0o000,
+            None,
+            &[live_inode],
+            "VACUUM INTO staging backup",
+        )?;
+        let mut st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+        // SAFETY: `file` is valid.
+        if unsafe { libc::fstat(file.as_raw_fd(), st.as_mut_ptr()) } != 0 {
+            return Err(StorageBackendError::io(
+                "stat VACUUM INTO staging backup",
+                io::Error::last_os_error(),
+            ));
+        }
+        // SAFETY: `fstat` succeeded.
+        let st = unsafe { st.assume_init() };
+        let b_inode = (st.st_dev as u64, st.st_ino);
+        if b_inode == live_inode {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "forward migration Phase 1 VACUUM INTO backup aliased live {role} inode"
+                ),
+            });
+        }
+        // SAFETY: `file` is owned by `euid` (verified by `open_readonly_regular_file_at_unix_protected`).
+        if unsafe { libc::fchmod(file.as_raw_fd(), 0o600 as libc::mode_t) } != 0 {
+            return Err(StorageBackendError::io(
+                "enforce 0600 permissions on VACUUM INTO backup",
+                io::Error::last_os_error(),
+            ));
+        }
+        file.sync_all()
+            .map_err(|err| StorageBackendError::io("fsync VACUUM INTO staging backup", err))?;
+        drop(file);
+        (c_tmp, c_final, b_inode)
+    };
+    #[cfg(windows)]
+    {
+        let pinned = [(backup_parent, parent_id, "sqlite backup directory")];
+        let (file, _) = open_readonly_non_reparse_file_windows(
+            &backup_tmp_path,
+            false,
+            &pinned,
+            "VACUUM INTO staging backup",
+        )?;
+        let live_canon = fs::canonicalize(source.path())
+            .map_err(|err| StorageBackendError::io("canonicalize live sqlite path", err))?;
+        let tmp_canon = fs::canonicalize(&backup_tmp_path)
+            .map_err(|err| StorageBackendError::io("canonicalize backup sqlite path", err))?;
+        if live_canon == tmp_canon {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "forward migration Phase 1 VACUUM INTO backup aliased live {role} path"
+                ),
+            });
+        }
+        file.sync_all()
+            .map_err(|err| StorageBackendError::io("fsync VACUUM INTO staging backup", err))?;
+        drop(file);
+    }
+
+    // Confirm VACUUM INTO produced a clean standalone file with zero sidecars.
+    for sidecar in [
+        sqlite_sidecar_path(&backup_tmp_path, "-wal"),
+        sqlite_sidecar_path(&backup_tmp_path, "-shm"),
+        sqlite_sidecar_path(&backup_tmp_path, "-journal"),
+    ] {
+        if path_exists_no_open(&sidecar)? {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "forward migration Phase 1 VACUUM INTO backup left unexpected SQLite sidecar for {role}"
+                ),
+            });
+        }
+    }
+
+    // Step 2: Independently open ONLY the verified new backup inode read-only,
+    // bind `verify_conn` to `backup_inode` via `fstatat` + `SQLITE_FCNTL_HAS_MOVED`
+    // before AND after `PRAGMA integrity_check == "ok"` so path swaps cannot
+    // divert verification to another file, and NEVER touch the live `.db`!
+    #[cfg(unix)]
+    verify_entry_inode_at_unix(&parent_fd, &c_tmp_name, backup_inode, live_inode, role)?;
+    #[cfg(windows)]
+    win_tmp_guard::verify_pinned_dir_ids(&[(backup_parent, parent_id, "sqlite backup directory")])?;
+
+    let verify_opts = SqliteConnectOptions::new()
+        .filename(&backup_tmp_path)
+        .create_if_missing(false)
+        .read_only(true)
+        .busy_timeout(Duration::ZERO);
+    let mut verify_conn = SqliteConnection::connect_with(&verify_opts)
+        .await
+        .map_err(|_| StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration Phase 1 failed to open VACUUM INTO backup read-only for {role}"
+            ),
+        })?;
+    let integrity_result: StorageResult<()> = async {
+        verify_connection_not_moved(&mut verify_conn, role).await?;
+        #[cfg(unix)]
+        verify_entry_inode_at_unix(&parent_fd, &c_tmp_name, backup_inode, live_inode, role)?;
+        #[cfg(windows)]
+        win_tmp_guard::verify_pinned_dir_ids(&[(
+            backup_parent,
+            parent_id,
+            "sqlite backup directory",
+        )])?;
+
+        #[cfg(test)]
+        if let Some(cb) = on_during_integrity_check.as_deref_mut() {
+            cb();
+        }
+
+        let rows: Vec<String> = sea_orm::sqlx::query_scalar("PRAGMA integrity_check;")
+            .fetch_all(&mut verify_conn)
+            .await
+            .map_err(|_| StorageBackendError::BackendInternal {
+                detail: format!(
+                    "forward migration Phase 1 PRAGMA integrity_check query failed on backup for {role}"
+                ),
+            })?;
+        if rows.len() != 1 || rows[0] != "ok" {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "forward migration Phase 1 backup failed PRAGMA integrity_check for {role}"
+                ),
+            });
+        }
+        verify_connection_not_moved(&mut verify_conn, role).await?;
+        #[cfg(unix)]
+        verify_entry_inode_at_unix(&parent_fd, &c_tmp_name, backup_inode, live_inode, role)?;
+        Ok(())
+    }
+    .await;
+    let close_res = verify_conn.close().await;
+    integrity_result?;
+    if close_res.is_err() {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration Phase 1 failed to close read-only backup verification connection for {role}"
+            ),
+        });
+    }
+
+    // Step 3: Re-open ONLY the verified backup inode (`O_NOFOLLOW`, live inode
+    // protected pre-open), confirm inode identity is unchanged and still !=
+    // live `.db`, stream `backup_sha256` in fixed `64 KiB` chunks, `sync_all()`,
+    // and atomically rename + `fsync_dir`.
+    let (backup_sha256, byte_len) = {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd as _;
+            let (mut file, expected_size) = open_readonly_regular_file_at_unix_protected(
+                &parent_fd,
+                &c_tmp_name,
+                0o177,
+                Some(0o600),
+                &[live_inode],
+                "VACUUM INTO verified backup",
+            )?;
+            let mut st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+            // SAFETY: `file` is valid.
+            if unsafe { libc::fstat(file.as_raw_fd(), st.as_mut_ptr()) } != 0 {
+                return Err(StorageBackendError::io(
+                    "re-stat VACUUM INTO backup",
+                    io::Error::last_os_error(),
+                ));
+            }
+            // SAFETY: `fstat` succeeded.
+            let st = unsafe { st.assume_init() };
+            let recheck_inode = (st.st_dev as u64, st.st_ino);
+            if recheck_inode != backup_inode || recheck_inode == live_inode {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: format!(
+                        "forward migration Phase 1 VACUUM INTO backup inode changed unexpectedly for {role}"
+                    ),
+                });
+            }
+            let (sha, hashed_bytes) = stream_hash_file_inner(
+                &mut file,
+                "VACUUM INTO backup",
+                #[cfg(test)]
+                on_during_hash,
+            )?;
+            if hashed_bytes != expected_size || hashed_bytes == 0 {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: format!(
+                        "forward migration Phase 1 VACUUM INTO backup size mismatch for {role}"
+                    ),
+                });
+            }
+            file.sync_all()
+                .map_err(|err| StorageBackendError::io("fsync verified VACUUM INTO backup", err))?;
+            drop(file);
+
+            // Confirm final destination is still absent, then renameat + fsync_dir.
+            let mut final_st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+            // SAFETY: `parent_fd` is valid and `c_final_name` is NUL-terminated.
+            let exists_rc = unsafe {
+                libc::fstatat(
+                    parent_fd.as_raw_fd(),
+                    c_final_name.as_ptr(),
+                    final_st.as_mut_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            if exists_rc == 0 {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: format!(
+                        "forward migration Phase 1 VACUUM INTO final backup path appeared concurrently for {role}"
+                    ),
+                });
+            }
+            // SAFETY: `parent_fd` is valid and both C-strings are NUL-terminated.
+            if unsafe {
+                libc::renameat(
+                    parent_fd.as_raw_fd(),
+                    c_tmp_name.as_ptr(),
+                    parent_fd.as_raw_fd(),
+                    c_final_name.as_ptr(),
+                )
+            } != 0
+            {
+                return Err(StorageBackendError::io(
+                    "atomically publish VACUUM INTO backup",
+                    io::Error::last_os_error(),
+                ));
+            }
+            fsync_dir_fd_unix(&parent_fd, "sqlite backup directory")?;
+            (sha, hashed_bytes)
+        }
+        #[cfg(windows)]
+        {
+            let pinned = [(backup_parent, parent_id, "sqlite backup directory")];
+            let (mut file, expected_size) = open_readonly_non_reparse_file_windows(
+                &backup_tmp_path,
+                false,
+                &pinned,
+                "VACUUM INTO verified backup",
+            )?;
+            let (sha, hashed_bytes) = stream_hash_file_inner(
+                &mut file,
+                "VACUUM INTO backup",
+                #[cfg(test)]
+                on_during_hash,
+            )?;
+            if hashed_bytes != expected_size || hashed_bytes == 0 {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: format!(
+                        "forward migration Phase 1 VACUUM INTO backup size mismatch for {role}"
+                    ),
+                });
+            }
+            file.sync_all()
+                .map_err(|err| StorageBackendError::io("fsync verified VACUUM INTO backup", err))?;
+            drop(file);
+            win_tmp_guard::verify_pinned_dir_ids(&pinned)?;
+            if path_exists_no_open(backup_path)? {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: format!(
+                        "forward migration Phase 1 VACUUM INTO final backup path appeared concurrently for {role}"
+                    ),
+                });
+            }
+            fs::rename(&backup_tmp_path, backup_path).map_err(|err| {
+                StorageBackendError::io("atomically publish VACUUM INTO backup", err)
+            })?;
+            (sha, hashed_bytes)
+        }
+        #[cfg(all(not(unix), not(windows)))]
+        {
+            let _ = on_during_hash;
+            return Err(StorageBackendError::BackendInternal {
+                detail: "safe VACUUM INTO backup verification is unsupported on this platform"
+                    .to_string(),
+            });
+        }
+    };
+
+    tmp_guard.armed = false;
+    // Confirm live `c_mig` is still bound to the exact live source inode.
+    verify_connection_not_moved(&mut source.conn, role).await?;
+
+    Ok(SqliteVacuumBackupReceipt {
+        backup_path: backup_path.to_path_buf(),
+        backup_sha256,
+        byte_len,
+    })
+}
+
+#[cfg(unix)]
+fn copy_spool_file_verified_unix(
+    src_dir_fd: &std::os::unix::io::OwnedFd,
+    dst_dir_fd: &std::os::unix::io::OwnedFd,
+    file_name: &str,
+    subdir: &'static str,
+    protected_live_inodes: &[(u64, u64)],
+    #[cfg(test)] mut on_during_copy: Option<&mut dyn FnMut()>,
+) -> StorageResult<SpoolBackupFileReceipt> {
+    use std::{
+        ffi::CString,
+        io::{Read as _, Write as _},
+        os::unix::io::{AsRawFd as _, FromRawFd as _, OwnedFd},
+    };
+
+    if file_name.is_empty()
+        || file_name == "."
+        || file_name == ".."
+        || file_name.contains(['/', '\0'])
+    {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration Phase 1 rejected invalid filename in capture-spool/{subdir}"
+            ),
+        });
+    }
+    let c_name =
+        CString::new(file_name.as_bytes()).map_err(|_| StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration Phase 1 rejected invalid filename in capture-spool/{subdir}"
+            ),
+        })?;
+    let tmp_name = format!(".{file_name}.backup.tmp");
+    let c_tmp_name =
+        CString::new(tmp_name.as_bytes()).map_err(|_| StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration Phase 1 failed to format staging name in capture-spool/{subdir}"
+            ),
+        })?;
+
+    // Reject symlinks, FIFOs, hard links (`st_nlink != 1`), and any alias of a
+    // live SQLite inode via `fstatat(AT_SYMLINK_NOFOLLOW)` BEFORE calling `openat`,
+    // so live POSIX SQLite locks can NEVER be released on error!
+    let (mut src_file, expected_len) = open_readonly_regular_file_at_unix_protected(
+        src_dir_fd,
+        &c_name,
+        0o022,
+        None,
+        protected_live_inodes,
+        "capture-spool backup source entry",
+    )?;
+
+    // Create exclusive owner-only `.tmp` target file inside destination subdir.
+    // SAFETY: `dst_dir_fd` is valid and `c_tmp_name` is NUL-terminated.
+    let raw_dst = unsafe {
+        libc::openat(
+            dst_dir_fd.as_raw_fd(),
+            c_tmp_name.as_ptr(),
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600 as libc::mode_t as libc::c_uint,
+        )
+    };
+    if raw_dst < 0 {
+        return Err(StorageBackendError::io(
+            "create capture-spool backup staging file",
+            io::Error::last_os_error(),
+        ));
+    }
+    // SAFETY: `raw_dst >= 0` is exclusively owned here.
+    let mut dst_file = File::from(unsafe { OwnedFd::from_raw_fd(raw_dst) });
+
+    struct DstTmpGuard<'a> {
+        dir_fd: &'a OwnedFd,
+        name: CString,
+        armed: bool,
+    }
+    impl Drop for DstTmpGuard<'_> {
+        fn drop(&mut self) {
+            if self.armed {
+                // SAFETY: `dir_fd` is valid and `name` is NUL-terminated.
+                let _ = unsafe { libc::unlinkat(self.dir_fd.as_raw_fd(), self.name.as_ptr(), 0) };
+            }
+        }
+    }
+    let mut dst_guard = DstTmpGuard {
+        dir_fd: dst_dir_fd,
+        name: c_tmp_name.clone(),
+        armed: true,
+    };
+
+    // SAFETY: `dst_file` is valid and owned by `euid`.
+    if unsafe { libc::fchmod(dst_file.as_raw_fd(), 0o600 as libc::mode_t) } != 0 {
+        return Err(StorageBackendError::io(
+            "enforce 0600 permissions on capture-spool backup file",
+            io::Error::last_os_error(),
+        ));
+    }
+    let mut dst_st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: `dst_file` is valid.
+    if unsafe { libc::fstat(dst_file.as_raw_fd(), dst_st.as_mut_ptr()) } != 0 {
+        return Err(StorageBackendError::io(
+            "stat capture-spool backup staging file",
+            io::Error::last_os_error(),
+        ));
+    }
+    // SAFETY: `fstat` succeeded.
+    let dst_st = unsafe { dst_st.assume_init() };
+    let dst_inode = (dst_st.st_dev as u64, dst_st.st_ino);
+
+    // Stream copy in fixed `64 KiB` chunks while computing source SHA-256.
+    let mut src_hasher = Sha256::new();
+    let mut buf = vec![0u8; BACKUP_STREAM_BUF_BYTES];
+    let mut copied_len = 0u64;
+    #[cfg(test)]
+    let mut fired_copy_hook = false;
+    loop {
+        let n = src_file
+            .read(&mut buf)
+            .map_err(|err| StorageBackendError::io("read capture-spool source file", err))?;
+        if n == 0 {
+            break;
+        }
+        src_hasher.update(&buf[..n]);
+        dst_file
+            .write_all(&buf[..n])
+            .map_err(|err| StorageBackendError::io("write capture-spool backup file", err))?;
+        copied_len = copied_len.saturating_add(n as u64);
+        #[cfg(test)]
+        if !fired_copy_hook {
+            if let Some(cb) = on_during_copy.as_deref_mut() {
+                cb();
+            }
+            fired_copy_hook = true;
+        }
+    }
+    #[cfg(test)]
+    if !fired_copy_hook && let Some(cb) = on_during_copy {
+        cb();
+    }
+    if copied_len != expected_len {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration Phase 1 detected size drift while backing up capture-spool/{subdir}"
+            ),
+        });
+    }
+    let src_sha256 = sha256_hex_from_hasher(src_hasher);
+    dst_file
+        .sync_all()
+        .map_err(|err| StorageBackendError::io("fsync capture-spool backup staging file", err))?;
+    drop(dst_file);
+    drop(src_file);
+
+    // Independent read-back verification of the written backup inode!
+    let (mut verify_file, verify_size) = open_readonly_regular_file_at_unix_protected(
+        dst_dir_fd,
+        &c_tmp_name,
+        0o177,
+        Some(0o600),
+        protected_live_inodes,
+        "capture-spool backup verify file",
+    )?;
+    let mut verify_st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: `verify_file` is valid.
+    if unsafe { libc::fstat(verify_file.as_raw_fd(), verify_st.as_mut_ptr()) } != 0 {
+        return Err(StorageBackendError::io(
+            "re-stat capture-spool backup staging file",
+            io::Error::last_os_error(),
+        ));
+    }
+    // SAFETY: `fstat` succeeded.
+    let verify_st = unsafe { verify_st.assume_init() };
+    if (verify_st.st_dev as u64, verify_st.st_ino) != dst_inode || verify_size != copied_len {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration Phase 1 capture-spool/{subdir} backup inode or length mismatch on read-back"
+            ),
+        });
+    }
+    let (dst_sha256, read_back_len) =
+        stream_hash_file(&mut verify_file, "capture-spool backup read-back")?;
+    drop(verify_file);
+    if read_back_len != copied_len || dst_sha256 != src_sha256 {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration Phase 1 byte-for-byte SHA-256 verification failed for capture-spool/{subdir} backup"
+            ),
+        });
+    }
+
+    // Refuse to overwrite a pre-existing final backup entry.
+    let mut existing_st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: `dst_dir_fd` is valid and `c_name` is NUL-terminated.
+    if unsafe {
+        libc::fstatat(
+            dst_dir_fd.as_raw_fd(),
+            c_name.as_ptr(),
+            existing_st.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } == 0
+    {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration Phase 1 capture-spool/{subdir} backup entry already exists"
+            ),
+        });
+    }
+    // SAFETY: `dst_dir_fd` is valid and both C-strings are NUL-terminated.
+    if unsafe {
+        libc::renameat(
+            dst_dir_fd.as_raw_fd(),
+            c_tmp_name.as_ptr(),
+            dst_dir_fd.as_raw_fd(),
+            c_name.as_ptr(),
+        )
+    } != 0
+    {
+        return Err(StorageBackendError::io(
+            "publish verified capture-spool backup file",
+            io::Error::last_os_error(),
+        ));
+    }
+    dst_guard.armed = false;
+
+    Ok(SpoolBackupFileReceipt {
+        subdir,
+        file_name: file_name.to_string(),
+        byte_len: copied_len,
+        sha256: dst_sha256,
+    })
+}
+
+/// Copy `.libra/private/capture-spool/{ready,quarantine}/` in place into
+/// `backup_spool_dir` and verify byte-for-byte SHA-256 on every backed-up file
+/// while leaving live `capture-spool/` and `capacity.lock` 100% untouched
+/// (`ADR-RB-07` #1, `RB-10f` AC3).
+pub fn backup_capture_spool_inplace(
+    common_storage: &Path,
+    backup_spool_dir: &Path,
+) -> StorageResult<SpoolBackupReport> {
+    #[cfg(unix)]
+    let protected_live_inodes = collect_live_sqlite_inodes_no_open(common_storage);
+    backup_capture_spool_inplace_inner(
+        common_storage,
+        backup_spool_dir,
+        #[cfg(unix)]
+        &protected_live_inodes,
+        #[cfg(test)]
+        None,
+    )
+}
+
+#[cfg(unix)]
+fn collect_live_sqlite_inodes_no_open(common_storage: &Path) -> Vec<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt as _;
+    let mut out = Vec::with_capacity(2);
+    for candidate in [
+        git_sqlite_db_path(common_storage),
+        capture_sqlite_db_path(common_storage),
+    ] {
+        if let Ok(meta) = fs::symlink_metadata(&candidate)
+            && meta.file_type().is_file()
+        {
+            out.push((meta.dev(), meta.ino()));
+        }
+    }
+    out
+}
+
+fn backup_capture_spool_inplace_inner(
+    common_storage: &Path,
+    backup_spool_dir: &Path,
+    #[cfg(unix)] protected_live_inodes: &[(u64, u64)],
+    #[cfg(test)] on_during_copy: Option<&mut dyn FnMut()>,
+) -> StorageResult<SpoolBackupReport> {
+    #[cfg(unix)]
+    {
+        backup_capture_spool_inplace_unix(
+            common_storage,
+            backup_spool_dir,
+            protected_live_inodes,
+            #[cfg(test)]
+            on_during_copy,
+        )
+    }
+    #[cfg(windows)]
+    {
+        backup_capture_spool_inplace_windows(
+            common_storage,
+            backup_spool_dir,
+            #[cfg(test)]
+            on_during_copy,
+        )
+    }
+    #[cfg(all(not(unix), not(windows)))]
+    {
+        let _ = (common_storage, backup_spool_dir);
+        #[cfg(test)]
+        let _ = on_during_copy;
+        Err(StorageBackendError::BackendInternal {
+            detail: "safe in-place capture-spool backup is unsupported on this platform"
+                .to_string(),
+        })
+    }
+}
+
+#[cfg(unix)]
+fn backup_capture_spool_inplace_unix(
+    common_storage: &Path,
+    backup_spool_dir: &Path,
+    protected_live_inodes: &[(u64, u64)],
+    #[cfg(test)] mut on_during_copy: Option<&mut dyn FnMut()>,
+) -> StorageResult<SpoolBackupReport> {
+    use std::{ffi::CString, os::unix::io::AsRawFd as _};
+
+    let root_fd = open_readonly_root_dir_unix(common_storage)?;
+
+    let backup_parent =
+        backup_spool_dir
+            .parent()
+            .ok_or_else(|| StorageBackendError::BackendInternal {
+                detail: "capture-spool backup path is missing parent directory".to_string(),
+            })?;
+    let backup_leaf = backup_spool_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|n| !n.is_empty() && *n != "." && *n != ".." && !n.contains(['/', '\0']))
+        .ok_or_else(|| StorageBackendError::BackendInternal {
+            detail: "capture-spool backup directory name is invalid".to_string(),
+        })?;
+    let c_backup_leaf =
+        CString::new(backup_leaf.as_bytes()).map_err(|_| StorageBackendError::BackendInternal {
+            detail: "capture-spool backup directory name is invalid".to_string(),
+        })?;
+    let backup_parent_fd = open_verified_backup_parent_dir_unix(backup_parent)?;
+    let (dst_spool_fd, _) = open_or_create_private_dir_at_unix(
+        &backup_parent_fd,
+        &c_backup_leaf,
+        false,
+        "capture-spool backup directory",
+        #[cfg(test)]
+        false,
+    )?;
+
+    let mut ready_fenced = false;
+    let mut quarantine_fenced = false;
+    let mut files: Vec<SpoolBackupFileReceipt> = Vec::new();
+    let mut remaining_file_budget = MAX_SPOOL_BACKUP_FILES;
+    let mut remaining_name_bytes = MAX_SPOOL_BACKUP_NAME_BYTES;
+
+    let mut manifest_hasher = Sha256::new();
+    manifest_hasher.update(b"LIBRA_CAPTURE_SPOOL_MANIFEST_SHA256_V1\0");
+
+    let src_spool_opt =
+        match open_readonly_subdir_unix(&root_fd, c"private", 0o022, "private directory")? {
+            Some((private_fd, _)) => open_readonly_subdir_unix(
+                &private_fd,
+                c"capture-spool",
+                0o022,
+                "capture-spool directory",
+            )?,
+            None => None,
+        };
+
+    for (subdir_str, c_subdir, fenced_slot, subject) in [
+        (
+            CAPTURE_SPOOL_READY_SUBDIR,
+            c"ready",
+            &mut ready_fenced,
+            "capture-spool/ready",
+        ),
+        (
+            CAPTURE_SPOOL_QUARANTINE_SUBDIR,
+            c"quarantine",
+            &mut quarantine_fenced,
+            "capture-spool/quarantine",
+        ),
+    ] {
+        hash_len_prefixed_bytes(&mut manifest_hasher, subdir_str.as_bytes());
+        let Some((src_spool_fd, _)) = src_spool_opt.as_ref() else {
+            manifest_hasher.update(0u64.to_le_bytes());
+            continue;
+        };
+
+        let mut st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+        // SAFETY: `src_spool_fd` is valid and `c_subdir` is NUL-terminated.
+        if unsafe {
+            libc::fstatat(
+                src_spool_fd.as_raw_fd(),
+                c_subdir.as_ptr(),
+                st.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::NotFound {
+                manifest_hasher.update(0u64.to_le_bytes());
+                continue;
+            }
+            return Err(StorageBackendError::io(
+                "inspect capture-spool backup metadata",
+                err,
+            ));
+        }
+        // SAFETY: `fstatat` succeeded.
+        let st = unsafe { st.assume_init() };
+        let kind = st.st_mode & libc::S_IFMT;
+        if kind == libc::S_IFREG {
+            verify_spool_tombstone_file_unix_protected(
+                src_spool_fd,
+                c_subdir,
+                protected_live_inodes,
+                subject,
+            )?;
+            *fenced_slot = true;
+            manifest_hasher.update(0u64.to_le_bytes());
+            continue;
+        }
+        if kind != libc::S_IFDIR {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "forward migration Phase 1 rejected non-directory {subject} during spool backup"
+                ),
+            });
+        }
+        let Some((src_sub_fd, _)) =
+            open_readonly_subdir_unix(src_spool_fd, c_subdir, 0o022, subject)?
+        else {
+            manifest_hasher.update(0u64.to_le_bytes());
+            continue;
+        };
+        let (dst_sub_fd, _) = open_or_create_private_dir_at_unix(
+            &dst_spool_fd,
+            c_subdir,
+            false,
+            subject,
+            #[cfg(test)]
+            false,
+        )?;
+        let names = list_sorted_dir_names_bounded_unix(
+            &src_sub_fd,
+            remaining_file_budget,
+            remaining_name_bytes,
+            subject,
+        )?;
+        let used_name_bytes: usize = names.iter().map(String::len).sum();
+        remaining_file_budget = remaining_file_budget.saturating_sub(names.len());
+        remaining_name_bytes = remaining_name_bytes.saturating_sub(used_name_bytes);
+
+        manifest_hasher.update((names.len() as u64).to_le_bytes());
+        for name in names {
+            let receipt = copy_spool_file_verified_unix(
+                &src_sub_fd,
+                &dst_sub_fd,
+                &name,
+                subdir_str,
+                protected_live_inodes,
+                #[cfg(test)]
+                on_during_copy.take(),
+            )?;
+            hash_len_prefixed_bytes(&mut manifest_hasher, receipt.file_name.as_bytes());
+            manifest_hasher.update(receipt.byte_len.to_le_bytes());
+            hash_len_prefixed_bytes(&mut manifest_hasher, receipt.sha256.as_bytes());
+            files.push(receipt);
+        }
+        fsync_dir_fd_unix(&dst_sub_fd, subject)?;
+    }
+
+    #[cfg(test)]
+    if let Some(cb) = on_during_copy.take() {
+        cb();
+    }
+
+    fsync_dir_fd_unix(&dst_spool_fd, "capture-spool backup directory")?;
+    fsync_dir_fd_unix(&backup_parent_fd, "sqlite backup generation directory")?;
+
+    let spool_manifest_sha256 = sha256_hex_from_hasher(manifest_hasher);
+
+    Ok(SpoolBackupReport {
+        backup_spool_dir: backup_spool_dir.to_path_buf(),
+        files,
+        spool_manifest_sha256,
+        ready_fenced,
+        quarantine_fenced,
+    })
+}
+
+#[cfg(windows)]
+fn backup_capture_spool_inplace_windows(
+    common_storage: &Path,
+    backup_spool_dir: &Path,
+    #[cfg(test)] mut on_during_copy: Option<&mut dyn FnMut()>,
+) -> StorageResult<SpoolBackupReport> {
+    use std::io::{Read as _, Write as _};
+
+    let (_root_pin, root_id) =
+        win_tmp_guard::open_pinned_non_reparse_dir(common_storage, "repository storage root")?;
+    let backup_parent =
+        backup_spool_dir
+            .parent()
+            .ok_or_else(|| StorageBackendError::BackendInternal {
+                detail: "capture-spool backup path is missing parent directory".to_string(),
+            })?;
+    let backup_leaf = backup_spool_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|n| !n.is_empty() && *n != "." && *n != ".." && !n.contains(['/', '\\', '\0']))
+        .ok_or_else(|| StorageBackendError::BackendInternal {
+            detail: "capture-spool backup directory name is invalid".to_string(),
+        })?;
+    let (_backup_parent_pin, backup_parent_id) = win_tmp_guard::open_pinned_non_reparse_dir(
+        backup_parent,
+        "sqlite backup generation directory",
+    )?;
+    let parent_ancestors = [(
+        backup_parent,
+        backup_parent_id,
+        "sqlite backup generation directory",
+    )];
+    let (_dst_spool_pin, dst_spool_id, _) = open_or_create_pinned_subdir_windows(
+        backup_parent,
+        &parent_ancestors,
+        backup_leaf,
+        false,
+        "capture-spool backup directory",
+    )?;
+
+    let mut ready_fenced = false;
+    let mut quarantine_fenced = false;
+    let mut files: Vec<SpoolBackupFileReceipt> = Vec::new();
+    let mut remaining_file_budget = MAX_SPOOL_BACKUP_FILES;
+    let mut remaining_name_bytes = MAX_SPOOL_BACKUP_NAME_BYTES;
+
+    let mut manifest_hasher = Sha256::new();
+    manifest_hasher.update(b"LIBRA_CAPTURE_SPOOL_MANIFEST_SHA256_V1\0");
+
+    let private_dir = common_storage.join(PRIVATE_SUBDIR);
+    let private_pin_opt =
+        win_tmp_guard::open_pinned_non_reparse_dir_optional(&private_dir, "private directory")?;
+    let spool_dir = private_dir.join(CAPTURE_SPOOL_SUBDIR);
+    let spool_pin_opt = if private_pin_opt.is_some() {
+        win_tmp_guard::open_pinned_non_reparse_dir_optional(&spool_dir, "capture-spool directory")?
+    } else {
+        None
+    };
+
+    #[cfg(test)]
+    let mut fired_copy_hook = false;
+
+    for (subdir_str, fenced_slot, subject) in [
+        (
+            CAPTURE_SPOOL_READY_SUBDIR,
+            &mut ready_fenced,
+            "capture-spool/ready",
+        ),
+        (
+            CAPTURE_SPOOL_QUARANTINE_SUBDIR,
+            &mut quarantine_fenced,
+            "capture-spool/quarantine",
+        ),
+    ] {
+        hash_len_prefixed_bytes(&mut manifest_hasher, subdir_str.as_bytes());
+        let (Some((_, private_id)), Some((_, spool_id))) =
+            (private_pin_opt.as_ref(), spool_pin_opt.as_ref())
+        else {
+            manifest_hasher.update(0u64.to_le_bytes());
+            continue;
+        };
+        let spool_ancestors = [
+            (common_storage, root_id, "repository storage root"),
+            (private_dir.as_path(), *private_id, "private directory"),
+            (spool_dir.as_path(), *spool_id, "capture-spool directory"),
+        ];
+        let src_sub = spool_dir.join(subdir_str);
+        let meta = match fs::symlink_metadata(&src_sub) {
+            Ok(m) => m,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                manifest_hasher.update(0u64.to_le_bytes());
+                continue;
+            }
+            Err(err) => {
+                return Err(StorageBackendError::io(
+                    "inspect capture-spool backup metadata",
+                    err,
+                ));
+            }
+        };
+        if meta.file_type().is_symlink() {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!("forward migration Phase 1 rejected symlink at {subject}"),
+            });
+        }
+        if meta.file_type().is_file() {
+            let (file, size) =
+                open_readonly_non_reparse_file_windows(&src_sub, true, &spool_ancestors, subject)?;
+            let expected_len = CAPTURE_SPOOL_TOMBSTONE_SENTINEL.len();
+            if size != expected_len as u64 {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: format!(
+                        "forward migration Phase 1 rejected non-tombstone file at {subject}"
+                    ),
+                });
+            }
+            let mut buf = Vec::with_capacity(expected_len + 1);
+            file.take((expected_len + 1) as u64)
+                .read_to_end(&mut buf)
+                .map_err(|_| StorageBackendError::BackendInternal {
+                    detail: format!(
+                        "forward migration Phase 1 failed to read tombstone at {subject}"
+                    ),
+                })?;
+            if buf.as_slice() != CAPTURE_SPOOL_TOMBSTONE_SENTINEL {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: format!(
+                        "forward migration Phase 1 rejected invalid tombstone sentinel at {subject}"
+                    ),
+                });
+            }
+            *fenced_slot = true;
+            manifest_hasher.update(0u64.to_le_bytes());
+            continue;
+        }
+        let Some((_src_sub_pin, src_sub_id)) =
+            win_tmp_guard::open_pinned_non_reparse_dir_optional(&src_sub, subject)?
+        else {
+            manifest_hasher.update(0u64.to_le_bytes());
+            continue;
+        };
+        let src_sub_ancestors = [
+            (common_storage, root_id, "repository storage root"),
+            (private_dir.as_path(), *private_id, "private directory"),
+            (spool_dir.as_path(), *spool_id, "capture-spool directory"),
+            (src_sub.as_path(), src_sub_id, subject),
+        ];
+        let dst_spool_ancestors = [
+            (
+                backup_parent,
+                backup_parent_id,
+                "sqlite backup generation directory",
+            ),
+            (
+                backup_spool_dir,
+                dst_spool_id,
+                "capture-spool backup directory",
+            ),
+        ];
+        let (_dst_sub_pin, dst_sub_id, _) = open_or_create_pinned_subdir_windows(
+            backup_spool_dir,
+            &dst_spool_ancestors,
+            subdir_str,
+            false,
+            subject,
+        )?;
+        let dst_sub = backup_spool_dir.join(subdir_str);
+        let dst_sub_ancestors = [
+            (
+                backup_parent,
+                backup_parent_id,
+                "sqlite backup generation directory",
+            ),
+            (
+                backup_spool_dir,
+                dst_spool_id,
+                "capture-spool backup directory",
+            ),
+            (dst_sub.as_path(), dst_sub_id, subject),
+        ];
+        let mut names = Vec::new();
+        let mut used_name_bytes = 0usize;
+        for entry in fs::read_dir(&src_sub)
+            .map_err(|err| StorageBackendError::io("list capture-spool source subdirectory", err))?
+        {
+            let entry = entry
+                .map_err(|err| StorageBackendError::io("read capture-spool source entry", err))?;
+            let name = entry.file_name().into_string().map_err(|_| {
+                StorageBackendError::BackendInternal {
+                    detail: format!(
+                        "forward migration Phase 1 rejected non-UTF-8 entry name in {subject}"
+                    ),
+                }
+            })?;
+            if names.len() >= remaining_file_budget
+                || used_name_bytes.saturating_add(name.len()) > remaining_name_bytes
+            {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: format!(
+                        "forward migration Phase 1 rejected {subject} exceeding bounded directory listing memory cap"
+                    ),
+                });
+            }
+            used_name_bytes = used_name_bytes.saturating_add(name.len());
+            names.push(name);
+        }
+        names.sort();
+        remaining_file_budget = remaining_file_budget.saturating_sub(names.len());
+        remaining_name_bytes = remaining_name_bytes.saturating_sub(used_name_bytes);
+
+        manifest_hasher.update((names.len() as u64).to_le_bytes());
+        for name in names {
+            let src_entry = src_sub.join(&name);
+            let (mut src_file, expected_len) = open_readonly_non_reparse_file_windows(
+                &src_entry,
+                false,
+                &src_sub_ancestors,
+                "capture-spool backup source entry",
+            )?;
+            let dst_tmp = dst_sub.join(format!(".{name}.backup.tmp"));
+            let dst_final = dst_sub.join(&name);
+            if path_exists_no_open(&dst_final)? || path_exists_no_open(&dst_tmp)? {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: format!(
+                        "forward migration Phase 1 capture-spool/{subdir_str} backup entry already exists"
+                    ),
+                });
+            }
+            let mut dst_file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&dst_tmp)
+                .map_err(|err| {
+                    StorageBackendError::io("create capture-spool backup staging file", err)
+                })?;
+            let mut src_hasher = Sha256::new();
+            let mut buf = vec![0u8; BACKUP_STREAM_BUF_BYTES];
+            let mut copied_len = 0u64;
+            loop {
+                let n = src_file.read(&mut buf).map_err(|err| {
+                    StorageBackendError::io("read capture-spool source file", err)
+                })?;
+                if n == 0 {
+                    break;
+                }
+                src_hasher.update(&buf[..n]);
+                dst_file.write_all(&buf[..n]).map_err(|err| {
+                    StorageBackendError::io("write capture-spool backup file", err)
+                })?;
+                copied_len = copied_len.saturating_add(n as u64);
+                #[cfg(test)]
+                if !fired_copy_hook {
+                    if let Some(cb) = on_during_copy.as_deref_mut() {
+                        cb();
+                    }
+                    fired_copy_hook = true;
+                }
+            }
+            if copied_len != expected_len {
+                let _ = fs::remove_file(&dst_tmp);
+                return Err(StorageBackendError::BackendInternal {
+                    detail: format!(
+                        "forward migration Phase 1 detected size drift while backing up {subject}"
+                    ),
+                });
+            }
+            let src_sha256 = sha256_hex_from_hasher(src_hasher);
+            dst_file.sync_all().map_err(|err| {
+                StorageBackendError::io("fsync capture-spool backup staging file", err)
+            })?;
+            drop(dst_file);
+            drop(src_file);
+
+            let (mut verify_file, verify_len) = open_readonly_non_reparse_file_windows(
+                &dst_tmp,
+                false,
+                &dst_sub_ancestors,
+                "capture-spool backup verify file",
+            )?;
+            let (dst_sha256, read_back_len) =
+                stream_hash_file(&mut verify_file, "capture-spool backup read-back")?;
+            drop(verify_file);
+            if verify_len != copied_len || read_back_len != copied_len || dst_sha256 != src_sha256 {
+                let _ = fs::remove_file(&dst_tmp);
+                return Err(StorageBackendError::BackendInternal {
+                    detail: format!(
+                        "forward migration Phase 1 byte-for-byte SHA-256 verification failed for {subject} backup"
+                    ),
+                });
+            }
+            win_tmp_guard::verify_pinned_dir_ids(&dst_sub_ancestors)?;
+            fs::rename(&dst_tmp, &dst_final).map_err(|err| {
+                let _ = fs::remove_file(&dst_tmp);
+                StorageBackendError::io("publish verified capture-spool backup file", err)
+            })?;
+            hash_len_prefixed_bytes(&mut manifest_hasher, name.as_bytes());
+            manifest_hasher.update(copied_len.to_le_bytes());
+            hash_len_prefixed_bytes(&mut manifest_hasher, dst_sha256.as_bytes());
+            files.push(SpoolBackupFileReceipt {
+                subdir: subdir_str,
+                file_name: name,
+                byte_len: copied_len,
+                sha256: dst_sha256,
+            });
+        }
+    }
+
+    #[cfg(test)]
+    if !fired_copy_hook && let Some(cb) = on_during_copy {
+        cb();
+    }
+
+    let spool_manifest_sha256 = sha256_hex_from_hasher(manifest_hasher);
+
+    Ok(SpoolBackupReport {
+        backup_spool_dir: backup_spool_dir.to_path_buf(),
+        files,
+        spool_manifest_sha256,
+        ready_fenced,
+        quarantine_fenced,
+    })
+}
+
+fn hash_lane_tail_meta(hasher: &mut Sha256, meta: &LaneTailMeta) {
+    hasher.update(meta.min_live_seg.to_le_bytes());
+    hasher.update(meta.active_seg.to_le_bytes());
+    hasher.update(meta.committed_len.to_le_bytes());
+    hasher.update(meta.prefix_crc32c.to_le_bytes());
+    hasher.update((meta.sealed.len() as u64).to_le_bytes());
+    for entry in &meta.sealed {
+        hasher.update(entry.seg_id.to_le_bytes());
+        hasher.update(entry.sealed_len.to_le_bytes());
+        hasher.update(entry.sealed_crc32c.to_le_bytes());
+    }
+}
+
+#[cfg(unix)]
+fn read_converged_lane_tail_meta_unix_protected(
+    lane_fd: &std::os::unix::io::OwnedFd,
+    protected_live_inodes: &[(u64, u64)],
+    lane: CaptureQueueLane,
+) -> StorageResult<LaneTailMeta> {
+    use std::{io::Read as _, os::unix::io::AsRawFd as _};
+
+    enum Replica {
+        Absent,
+        Corrupt,
+        Valid(LaneTailMeta),
+    }
+
+    let read_one = |c_name: &std::ffi::CStr| -> StorageResult<Replica> {
+        // Zero-open `fstatat` check first: distinguishes `ENOENT` cleanly AND
+        // rejects any hard link (`nlink != 1`), symlink, FIFO, or live SQLite
+        // inode alias BEFORE `openat` so live POSIX locks can NEVER be released.
+        let mut st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+        // SAFETY: `lane_fd` is pinned and `c_name` is NUL-terminated.
+        if unsafe {
+            libc::fstatat(
+                lane_fd.as_raw_fd(),
+                c_name.as_ptr(),
+                st.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::NotFound {
+                return Ok(Replica::Absent);
+            }
+            return Err(StorageBackendError::io(
+                "inspect capture-queue tail metadata",
+                err,
+            ));
+        }
+        let (file, size) = open_readonly_regular_file_at_unix_protected(
+            lane_fd,
+            c_name,
+            0o022,
+            None,
+            protected_live_inodes,
+            "capture-queue tail metadata",
+        )?;
+        if size > LTM2_MAX_LEN as u64 {
+            return Ok(Replica::Corrupt);
+        }
+        let cap = usize::try_from(size)
+            .unwrap_or(LTM2_MAX_LEN)
+            .min(LTM2_MAX_LEN)
+            .saturating_add(1);
+        let mut bytes = Vec::with_capacity(cap);
+        file.take((LTM2_MAX_LEN as u64).saturating_add(1))
+            .read_to_end(&mut bytes)
+            .map_err(|err| StorageBackendError::io("read capture-queue tail metadata", err))?;
+        if bytes.len() > LTM2_MAX_LEN {
+            return Ok(Replica::Corrupt);
+        }
+        match LaneTailMeta::decode(&bytes) {
+            Ok(meta) => Ok(Replica::Valid(meta)),
+            Err(_) => Ok(Replica::Corrupt),
+        }
+    };
+
+    let primary = read_one(c"tail.meta")?;
+    let backup = read_one(c"tail.meta.bak")?;
+
+    match (primary, backup) {
+        (Replica::Valid(a), Replica::Valid(b)) => {
+            if (b.active_seg, b.committed_len, b.min_live_seg)
+                > (a.active_seg, a.committed_len, a.min_live_seg)
+            {
+                Ok(b)
+            } else {
+                Ok(a)
+            }
+        }
+        (Replica::Valid(m), Replica::Absent | Replica::Corrupt)
+        | (Replica::Absent | Replica::Corrupt, Replica::Valid(m)) => Ok(m),
+        (Replica::Absent | Replica::Corrupt, Replica::Absent | Replica::Corrupt) => {
+            Err(StorageBackendError::CorruptCommittedFrame {
+                detail: format!(
+                    "capture-queue {} lane has no valid tail.meta or tail.meta.bak replica",
+                    lane.as_str()
+                ),
+            })
+        }
+    }
+}
+
+/// Strictly read-only deterministic manifest SHA-256 of
+/// `<common_storage>/private/capture-queue/{priority,normal}/` covering each
+/// lane's verified `LTM2` committed boundaries (`ADR-RB-07` #1, `SourceDigests`).
+pub fn compute_capture_queue_manifest_sha256_readonly(
+    common_storage: &Path,
+) -> StorageResult<String> {
+    #[cfg(unix)]
+    let protected_live_inodes = collect_live_sqlite_inodes_no_open(common_storage);
+    compute_capture_queue_manifest_sha256_readonly_inner(
+        common_storage,
+        #[cfg(unix)]
+        &protected_live_inodes,
+        MAX_SPOOL_BACKUP_FILES,
+        MAX_SPOOL_BACKUP_NAME_BYTES,
+    )
+}
+
+fn compute_capture_queue_manifest_sha256_readonly_inner(
+    common_storage: &Path,
+    #[cfg(unix)] protected_live_inodes: &[(u64, u64)],
+    max_entries_per_lane: usize,
+    max_name_bytes_per_lane: usize,
+) -> StorageResult<String> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"LIBRA_CAPTURE_QUEUE_MANIFEST_SHA256_V1\0");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd as _;
+        let root_fd = open_readonly_root_dir_unix(common_storage)?;
+        let queue_fd_opt =
+            match open_readonly_subdir_unix(&root_fd, c"private", 0o022, "private directory")? {
+                Some((private_fd, _)) => open_readonly_subdir_unix(
+                    &private_fd,
+                    c"capture-queue",
+                    0o022,
+                    "capture-queue directory",
+                )?,
+                None => None,
+            };
+        for (lane, c_lane) in [
+            (CaptureQueueLane::Priority, c"priority"),
+            (CaptureQueueLane::Normal, c"normal"),
+        ] {
+            hash_len_prefixed_bytes(&mut hasher, lane.as_str().as_bytes());
+            let Some((queue_fd, _)) = queue_fd_opt.as_ref() else {
+                hasher.update([0u8]); // absent
+                continue;
+            };
+            let mut st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+            // SAFETY: `queue_fd` is valid and `c_lane` is NUL-terminated.
+            if unsafe {
+                libc::fstatat(
+                    queue_fd.as_raw_fd(),
+                    c_lane.as_ptr(),
+                    st.as_mut_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            } != 0
+            {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::NotFound {
+                    hasher.update([0u8]);
+                    continue;
+                }
+                return Err(StorageBackendError::io(
+                    "inspect capture-queue lane metadata",
+                    err,
+                ));
+            }
+            // SAFETY: `fstatat` succeeded.
+            let st = unsafe { st.assume_init() };
+            let kind = st.st_mode & libc::S_IFMT;
+            if kind == libc::S_IFREG {
+                verify_spool_tombstone_file_unix_protected(
+                    queue_fd,
+                    c_lane,
+                    protected_live_inodes,
+                    "capture-queue lane",
+                )?;
+                hasher.update([2u8]); // fenced tombstone
+                continue;
+            }
+            if kind != libc::S_IFDIR {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: "forward migration Phase 1 rejected non-directory capture-queue lane"
+                        .to_string(),
+                });
+            }
+            let Some((lane_fd, _)) =
+                open_readonly_subdir_unix(queue_fd, c_lane, 0o022, "capture-queue lane")?
+            else {
+                hasher.update([0u8]);
+                continue;
+            };
+            let names = list_sorted_dir_names_bounded_unix(
+                &lane_fd,
+                max_entries_per_lane,
+                max_name_bytes_per_lane,
+                "capture-queue lane",
+            )?;
+            let mut segments = BTreeSet::new();
+            let mut has_primary = false;
+            let mut has_bak = false;
+            for name in &names {
+                if name == QUEUE_TAIL_META_FILE {
+                    has_primary = true;
+                } else if name == QUEUE_TAIL_META_BAK_FILE {
+                    has_bak = true;
+                } else if let Some(seg_id) = parse_segment_log_file_name(name.as_bytes()) {
+                    segments.insert(seg_id);
+                }
+            }
+            if segments.is_empty() && !has_primary && !has_bak {
+                hasher.update([0u8]);
+                continue;
+            }
+            let meta = read_converged_lane_tail_meta_unix_protected(
+                &lane_fd,
+                protected_live_inodes,
+                lane,
+            )?;
+            validate_queue_lane_meta_against_segments(&meta, &segments, lane)?;
+            hasher.update([1u8]);
+            hash_lane_tail_meta(&mut hasher, &meta);
+        }
+        Ok(sha256_hex_from_hasher(hasher))
+    }
+
+    #[cfg(windows)]
+    {
+        let (_root_pin, root_id) =
+            win_tmp_guard::open_pinned_non_reparse_dir(common_storage, "repository storage root")?;
+        let private_dir = common_storage.join(PRIVATE_SUBDIR);
+        let private_pin_opt =
+            win_tmp_guard::open_pinned_non_reparse_dir_optional(&private_dir, "private directory")?;
+        let queue_root = capture_queue_dir_path(common_storage);
+        let queue_pin_opt = if private_pin_opt.is_some() {
+            win_tmp_guard::open_pinned_non_reparse_dir_optional(
+                &queue_root,
+                "capture-queue directory",
+            )?
+        } else {
+            None
+        };
+        for (lane, lane_dir_name) in [
+            (CaptureQueueLane::Priority, QUEUE_LANE_PRIORITY_DIR),
+            (CaptureQueueLane::Normal, QUEUE_LANE_NORMAL_DIR),
+        ] {
+            hash_len_prefixed_bytes(&mut hasher, lane.as_str().as_bytes());
+            let (Some((_, private_id)), Some((_, queue_id))) =
+                (private_pin_opt.as_ref(), queue_pin_opt.as_ref())
+            else {
+                hasher.update([0u8]);
+                continue;
+            };
+            let lane_dir = queue_root.join(lane_dir_name);
+            let meta_fs = match fs::symlink_metadata(&lane_dir) {
+                Ok(m) => m,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                    hasher.update([0u8]);
+                    continue;
+                }
+                Err(err) => {
+                    return Err(StorageBackendError::io(
+                        "inspect capture-queue lane metadata",
+                        err,
+                    ));
+                }
+            };
+            if meta_fs.file_type().is_symlink() {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: "forward migration Phase 1 rejected symlinked capture-queue lane"
+                        .to_string(),
+                });
+            }
+            if meta_fs.file_type().is_file() {
+                use std::io::Read as _;
+                let queue_ancestors = [
+                    (common_storage, root_id, "repository storage root"),
+                    (private_dir.as_path(), *private_id, "private directory"),
+                    (queue_root.as_path(), *queue_id, "capture-queue directory"),
+                ];
+                let (file, size) = open_readonly_non_reparse_file_windows(
+                    &lane_dir,
+                    true,
+                    &queue_ancestors,
+                    "capture-queue lane",
+                )?;
+                let expected_len = CAPTURE_SPOOL_TOMBSTONE_SENTINEL.len();
+                if size != expected_len as u64 {
+                    return Err(StorageBackendError::BackendInternal {
+                        detail: "forward migration Phase 1 rejected non-tombstone file at capture-queue lane"
+                            .to_string(),
+                    });
+                }
+                let mut buf = Vec::with_capacity(expected_len + 1);
+                file.take((expected_len + 1) as u64)
+                    .read_to_end(&mut buf)
+                    .map_err(|_| StorageBackendError::BackendInternal {
+                        detail: "forward migration Phase 1 failed to read tombstone at capture-queue lane"
+                            .to_string(),
+                    })?;
+                if buf.as_slice() != CAPTURE_SPOOL_TOMBSTONE_SENTINEL {
+                    return Err(StorageBackendError::BackendInternal {
+                        detail: "forward migration Phase 1 rejected invalid tombstone sentinel at capture-queue lane"
+                            .to_string(),
+                    });
+                }
+                hasher.update([2u8]);
+                continue;
+            }
+            let Some((_lane_pin, lane_id)) = win_tmp_guard::open_pinned_non_reparse_dir_optional(
+                &lane_dir,
+                "capture-queue lane",
+            )?
+            else {
+                hasher.update([0u8]);
+                continue;
+            };
+            let lane_ancestors = [
+                (common_storage, root_id, "repository storage root"),
+                (private_dir.as_path(), *private_id, "private directory"),
+                (queue_root.as_path(), *queue_id, "capture-queue directory"),
+                (lane_dir.as_path(), lane_id, "capture-queue lane"),
+            ];
+            let mut segments = BTreeSet::new();
+            let mut has_primary = false;
+            let mut has_bak = false;
+            let mut entry_count = 0usize;
+            let mut total_name_bytes = 0usize;
+            for entry in fs::read_dir(&lane_dir)
+                .map_err(|err| StorageBackendError::io("list capture-queue lane", err))?
+            {
+                let entry = entry
+                    .map_err(|err| StorageBackendError::io("read capture-queue lane entry", err))?;
+                let name = entry.file_name().into_string().map_err(|_| {
+                    StorageBackendError::BackendInternal {
+                        detail: "forward migration Phase 1 rejected non-UTF-8 queue lane entry"
+                            .to_string(),
+                    }
+                })?;
+                if entry_count >= max_entries_per_lane
+                    || total_name_bytes.saturating_add(name.len()) > max_name_bytes_per_lane
+                {
+                    return Err(StorageBackendError::BackendInternal {
+                        detail: "forward migration Phase 1 rejected capture-queue lane exceeding bounded directory listing memory cap"
+                            .to_string(),
+                    });
+                }
+                entry_count = entry_count.saturating_add(1);
+                total_name_bytes = total_name_bytes.saturating_add(name.len());
+                if name == QUEUE_TAIL_META_FILE {
+                    has_primary = true;
+                } else if name == QUEUE_TAIL_META_BAK_FILE {
+                    has_bak = true;
+                } else if let Some(seg_id) = parse_segment_log_file_name(name.as_bytes()) {
+                    segments.insert(seg_id);
+                }
+            }
+            if segments.is_empty() && !has_primary && !has_bak {
+                hasher.update([0u8]);
+                continue;
+            }
+            win_tmp_guard::verify_pinned_dir_ids(&lane_ancestors)?;
+            let meta = read_converged_lane_tail_meta(&lane_dir)?;
+            validate_queue_lane_meta_against_segments(&meta, &segments, lane)?;
+            hasher.update([1u8]);
+            hash_lane_tail_meta(&mut hasher, &meta);
+        }
+        Ok(sha256_hex_from_hasher(hasher))
+    }
+
+    #[cfg(all(not(unix), not(windows)))]
+    {
+        let _ = (
+            common_storage,
+            max_entries_per_lane,
+            max_name_bytes_per_lane,
+        );
+        Err(StorageBackendError::BackendInternal {
+            detail: "safe read-only capture-queue manifest digest is unsupported on this platform"
+                .to_string(),
+        })
+    }
+}
+
+/// Compute single-connection deterministic logical digests (`source_logical_sha256`),
+/// create verified single-connection `VACUUM INTO` backups under
+/// `.libra/sqlite-backup/<gen>/{libra,capture}.db`, copy and SHA-256-verify
+/// `.libra/private/capture-spool/{ready,quarantine}/` in place, and compute
+/// `queue_manifest_sha256` — all while holding `guard`'s 6 non-SQLite locks and
+/// live SQLite `EXCLUSIVE` locks without ever opening an extra fd on live `.db`
+/// paths (`ADR-RB-07` #1, `RB-10f`).
+///
+/// On any failure, removes the newly created `.libra/sqlite-backup/<gen>/`
+/// directory cleanly while leaving all live SQLite, spool, and queue sources
+/// untouched.
+pub async fn create_forward_phase1_lock_safe_backups(
+    guard: &mut ForwardPhase1QuiesceGuard,
+    common_storage: &Path,
+    generation: u64,
+) -> StorageResult<ForwardPhase1BackupReport> {
+    create_forward_phase1_lock_safe_backups_inner(
+        guard,
+        common_storage,
+        generation,
+        #[cfg(test)]
+        None,
+        #[cfg(test)]
+        None,
+    )
+    .await
+}
+
+#[cfg(test)]
+async fn create_forward_phase1_lock_safe_backups_with_hooks(
+    guard: &mut ForwardPhase1QuiesceGuard,
+    common_storage: &Path,
+    generation: u64,
+    hook: Option<&mut dyn FnMut(Phase1BackupHookStage)>,
+    dir_fault: Option<Phase1DirFaultPoint>,
+) -> StorageResult<ForwardPhase1BackupReport> {
+    create_forward_phase1_lock_safe_backups_inner(
+        guard,
+        common_storage,
+        generation,
+        hook,
+        dir_fault,
+    )
+    .await
+}
+
+async fn create_forward_phase1_lock_safe_backups_inner(
+    guard: &mut ForwardPhase1QuiesceGuard,
+    common_storage: &Path,
+    generation: u64,
+    #[cfg(test)] mut stage_hook: Option<&mut dyn FnMut(Phase1BackupHookStage)>,
+    #[cfg(test)] dir_fault: Option<Phase1DirFaultPoint>,
+) -> StorageResult<ForwardPhase1BackupReport> {
+    if generation == 0 {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "forward migration Phase 1 backup requires generation >= 1".to_string(),
+        });
+    }
+    if guard.sqlite.git.role() != DatabaseRole::Repository
+        || guard.sqlite.git.journal_mode() != "delete"
+        || guard.sqlite.git.path() != git_sqlite_db_path(common_storage)
+    {
+        return Err(StorageBackendError::BackendInternal {
+            detail:
+                "forward migration Phase 1 backup requires matching DELETE-mode Repository guard"
+                    .to_string(),
+        });
+    }
+    if let Some(cap) = guard.sqlite.capture.as_ref()
+        && (cap.role() != DatabaseRole::Capture
+            || cap.journal_mode() != "delete"
+            || cap.path() != capture_sqlite_db_path(common_storage))
+    {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "forward migration Phase 1 backup requires matching DELETE-mode Capture guard"
+                .to_string(),
+        });
+    }
+
+    // Collect live SQLite `(dev, ino)` pairs via zero-open `lstat` so spool
+    // backup can NEVER open/close a hard link pointing at a locked live DB.
+    #[cfg(unix)]
+    let protected_live_inodes = {
+        use std::os::unix::fs::MetadataExt as _;
+        let mut live = Vec::with_capacity(2);
+        let g_meta =
+            validate_sqlite_file_metadata(guard.sqlite.git.path(), DatabaseRole::Repository)?;
+        live.push((g_meta.dev(), g_meta.ino()));
+        if let Some(cap) = guard.sqlite.capture.as_ref() {
+            let c_meta = validate_sqlite_file_metadata(cap.path(), DatabaseRole::Capture)?;
+            live.push((c_meta.dev(), c_meta.ino()));
+        }
+        live
+    };
+
+    let backup_rel_dir = canonical_sqlite_backup_rel_dir(generation);
+    let backup_dir = sqlite_backup_dir_path(common_storage, generation);
+    let gen_dir_name = format_generation_id(generation);
+
+    // Step 1: Compute deterministic logical digests directly on held `c_mig`
+    // connections (ZERO extra `open()`/`close()` on live `.db` paths!).
+    let git_logical_sha256 = {
+        #[cfg(test)]
+        let mut git_stream_cb = || {
+            if let Some(cb) = stage_hook.as_deref_mut() {
+                cb(Phase1BackupHookStage::GitLogicalDigestStreaming);
+            }
+        };
+        compute_sqlite_source_logical_sha256_inner(
+            &mut guard.sqlite.git.conn,
+            DatabaseRole::Repository,
+            #[cfg(test)]
+            Some(&mut git_stream_cb),
+        )
+        .await?
+    };
+
+    let capture_logical_sha256 = if let Some(cap) = guard.sqlite.capture.as_mut() {
+        #[cfg(test)]
+        let mut cap_stream_cb = || {
+            if let Some(cb) = stage_hook.as_deref_mut() {
+                cb(Phase1BackupHookStage::CapLogicalDigestStreaming);
+            }
+        };
+        let digest = compute_sqlite_source_logical_sha256_inner(
+            &mut cap.conn,
+            DatabaseRole::Capture,
+            #[cfg(test)]
+            Some(&mut cap_stream_cb),
+        )
+        .await?;
+        Some(digest)
+    } else {
+        None
+    };
+
+    // Step 2: Create fresh `.libra/sqlite-backup/<gen>/` (`0700` on Unix;
+    // step-by-step pinned non-reparse dirs on Windows), armed immediately with
+    // pinned RAII cleanup so no failure can leave a leftover `<gen>` directory!
+    #[cfg(unix)]
+    struct BackupGenDirGuard {
+        backup_root_fd: std::os::unix::io::OwnedFd,
+        gen_name: std::ffi::CString,
+        armed: bool,
+    }
+    #[cfg(unix)]
+    impl Drop for BackupGenDirGuard {
+        fn drop(&mut self) {
+            if !self.armed {
+                return;
+            }
+            use std::os::unix::io::{AsRawFd as _, FromRawFd as _, OwnedFd};
+            // SAFETY: `backup_root_fd` is pinned and `gen_name` is NUL-terminated.
+            let raw_gen = unsafe {
+                libc::openat(
+                    self.backup_root_fd.as_raw_fd(),
+                    self.gen_name.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if raw_gen >= 0 {
+                // SAFETY: `raw_gen >= 0` is exclusively owned here.
+                let gen_fd = unsafe { OwnedFd::from_raw_fd(raw_gen) };
+                remove_dir_contents_pinned_unix(&gen_fd);
+            }
+            // SAFETY: `backup_root_fd` is pinned and `gen_name` is NUL-terminated.
+            let _ = unsafe {
+                libc::unlinkat(
+                    self.backup_root_fd.as_raw_fd(),
+                    self.gen_name.as_ptr(),
+                    libc::AT_REMOVEDIR,
+                )
+            };
+        }
+    }
+
+    #[cfg(windows)]
+    struct BackupGenDirGuard {
+        path: PathBuf,
+        common_storage: PathBuf,
+        root_id: win_tmp_guard::WinFileId,
+        backup_root_path: PathBuf,
+        backup_root_id: win_tmp_guard::WinFileId,
+        gen_pin: Option<win_tmp_guard::WinHandleGuard>,
+        armed: bool,
+    }
+    #[cfg(windows)]
+    impl Drop for BackupGenDirGuard {
+        fn drop(&mut self) {
+            if !self.armed {
+                return;
+            }
+            // Release the `FILE_SHARE_DELETE`-omitting pin on `<gen>` FIRST so
+            // Windows permits removal while keeping ancestor pins alive.
+            drop(self.gen_pin.take());
+            let ancestors = [
+                (
+                    self.common_storage.as_path(),
+                    self.root_id,
+                    "repository storage root",
+                ),
+                (
+                    self.backup_root_path.as_path(),
+                    self.backup_root_id,
+                    "sqlite-backup root directory",
+                ),
+            ];
+            if win_tmp_guard::verify_pinned_dir_ids(&ancestors).is_ok() {
+                let _ = fs::remove_dir_all(&self.path);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    let (sqlite_backup_root_fd, backup_gen_fd, mut gen_guard) = {
+        use std::{
+            ffi::CString,
+            os::unix::io::{AsRawFd as _, FromRawFd as _, OwnedFd},
+        };
+        let root_fd = open_readonly_root_dir_unix(common_storage)?;
+        let (backup_root_fd, _) = open_or_create_private_dir_at_unix(
+            &root_fd,
+            c"sqlite-backup",
+            false,
+            "sqlite-backup root directory",
+            #[cfg(test)]
+            false,
+        )?;
+        let c_gen = CString::new(gen_dir_name.as_bytes()).map_err(|_| {
+            StorageBackendError::BackendInternal {
+                detail: "failed to format backup generation directory name".to_string(),
+            }
+        })?;
+        #[cfg(test)]
+        let fail_gen_setup = dir_fault == Some(Phase1DirFaultPoint::AfterGenMkdirBeforeFsync);
+        let (gen_fd, _) = open_or_create_private_dir_at_unix(
+            &backup_root_fd,
+            &c_gen,
+            true,
+            "sqlite-backup generation directory",
+            #[cfg(test)]
+            fail_gen_setup,
+        )?;
+        // Duplicate `backup_root_fd` for pinned RAII cleanup of `<gen>` on error.
+        // SAFETY: `backup_root_fd` is valid.
+        let dup_raw = unsafe { libc::fcntl(backup_root_fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+        if dup_raw < 0 {
+            let err = io::Error::last_os_error();
+            let _ = unsafe {
+                libc::unlinkat(
+                    backup_root_fd.as_raw_fd(),
+                    c_gen.as_ptr(),
+                    libc::AT_REMOVEDIR,
+                )
+            };
+            return Err(StorageBackendError::io(
+                "duplicate sqlite-backup directory fd",
+                err,
+            ));
+        }
+        // SAFETY: `dup_raw >= 0` is exclusively owned here.
+        let guard_root_fd = unsafe { OwnedFd::from_raw_fd(dup_raw) };
+        let gen_guard = BackupGenDirGuard {
+            backup_root_fd: guard_root_fd,
+            gen_name: c_gen,
+            armed: true,
+        };
+        (backup_root_fd, gen_fd, gen_guard)
+    };
+    #[cfg(windows)]
+    let (_win_root_pin, _win_backup_root_pin, mut gen_guard) = {
+        let (root_pin, root_id) =
+            win_tmp_guard::open_pinned_non_reparse_dir(common_storage, "repository storage root")?;
+        let root_ancestors = [(common_storage, root_id, "repository storage root")];
+        let (backup_root_pin, backup_root_id, _) = open_or_create_pinned_subdir_windows(
+            common_storage,
+            &root_ancestors,
+            SQLITE_BACKUP_SUBDIR,
+            false,
+            "sqlite-backup root directory",
+        )?;
+        let backup_root_path = common_storage.join(SQLITE_BACKUP_SUBDIR);
+        let backup_ancestors = [
+            (common_storage, root_id, "repository storage root"),
+            (
+                backup_root_path.as_path(),
+                backup_root_id,
+                "sqlite-backup root directory",
+            ),
+        ];
+        let (gen_pin, _gen_id, _) = open_or_create_pinned_subdir_windows(
+            &backup_root_path,
+            &backup_ancestors,
+            &gen_dir_name,
+            true,
+            "sqlite-backup generation directory",
+        )?;
+        let gen_guard = BackupGenDirGuard {
+            path: backup_dir.clone(),
+            common_storage: common_storage.to_path_buf(),
+            root_id,
+            backup_root_path,
+            backup_root_id,
+            gen_pin: Some(gen_pin),
+            armed: true,
+        };
+        #[cfg(test)]
+        if dir_fault == Some(Phase1DirFaultPoint::AfterGenMkdirBeforeFsync) {
+            // Exercises post-creation Windows unpin-before-remove cleanup while
+            // ancestor pins remain held!
+            return Err(StorageBackendError::BackendInternal {
+                detail: "injected failure during sqlite-backup generation directory setup"
+                    .to_string(),
+            });
+        }
+        (root_pin, backup_root_pin, gen_guard)
+    };
+    #[cfg(all(not(unix), not(windows)))]
+    let mut gen_guard = {
+        #[cfg(test)]
+        let _ = dir_fault;
+        let _ = &gen_dir_name;
+        return Err(StorageBackendError::BackendInternal {
+            detail: "safe Phase 1 sqlite-backup creation is unsupported on this platform"
+                .to_string(),
+        });
+    };
+
+    // Step 3: Native single-connection `VACUUM INTO` backups (`libra.db` and
+    // optional `capture.db`) verified ONLY on their independent new inodes.
+    let git_backup_path = sqlite_backup_git_db_path(common_storage, generation);
+    let git_backup = {
+        #[cfg(test)]
+        {
+            let hook_ref = std::cell::RefCell::new(stage_hook.as_deref_mut());
+            let mut ic_cb = || {
+                if let Some(cb) = hook_ref.borrow_mut().as_deref_mut() {
+                    cb(Phase1BackupHookStage::GitBackupIntegrityCheck);
+                }
+            };
+            let mut hash_cb = || {
+                if let Some(cb) = hook_ref.borrow_mut().as_deref_mut() {
+                    cb(Phase1BackupHookStage::GitBackupHashing);
+                }
+            };
+            vacuum_into_lock_safe_backup_inner(
+                &mut guard.sqlite.git,
+                &git_backup_path,
+                Some(&mut ic_cb),
+                Some(&mut hash_cb),
+            )
+            .await?
+        }
+        #[cfg(not(test))]
+        {
+            vacuum_into_lock_safe_backup_inner(&mut guard.sqlite.git, &git_backup_path).await?
+        }
+    };
+
+    let capture_backup = if let Some(cap) = guard.sqlite.capture.as_mut() {
+        let cap_backup_path = sqlite_backup_capture_db_path(common_storage, generation);
+        #[cfg(test)]
+        let receipt = {
+            let hook_ref = std::cell::RefCell::new(stage_hook.as_deref_mut());
+            let mut ic_cb = || {
+                if let Some(cb) = hook_ref.borrow_mut().as_deref_mut() {
+                    cb(Phase1BackupHookStage::CapBackupIntegrityCheck);
+                }
+            };
+            let mut hash_cb = || {
+                if let Some(cb) = hook_ref.borrow_mut().as_deref_mut() {
+                    cb(Phase1BackupHookStage::CapBackupHashing);
+                }
+            };
+            vacuum_into_lock_safe_backup_inner(
+                cap,
+                &cap_backup_path,
+                Some(&mut ic_cb),
+                Some(&mut hash_cb),
+            )
+            .await?
+        };
+        #[cfg(not(test))]
+        let receipt = vacuum_into_lock_safe_backup_inner(cap, &cap_backup_path).await?;
+        Some(receipt)
+    } else {
+        None
+    };
+
+    // Step 4: In-place copy + byte-for-byte SHA-256 verification of
+    // `.libra/private/capture-spool/{ready,quarantine}/` (live spool &
+    // `capacity.lock` untouched; live SQLite inodes protected pre-open!).
+    let backup_spool_dir = sqlite_backup_capture_spool_dir_path(common_storage, generation);
+    let spool_backup = {
+        #[cfg(test)]
+        let mut spool_cb = || {
+            if let Some(cb) = stage_hook.as_deref_mut() {
+                cb(Phase1BackupHookStage::SpoolBackupCopying);
+            }
+        };
+        backup_capture_spool_inplace_inner(
+            common_storage,
+            &backup_spool_dir,
+            #[cfg(unix)]
+            &protected_live_inodes,
+            #[cfg(test)]
+            Some(&mut spool_cb),
+        )?
+    };
+
+    // Step 5: Read-only deterministic queue manifest digest.
+    let queue_manifest_sha256 = compute_capture_queue_manifest_sha256_readonly_inner(
+        common_storage,
+        #[cfg(unix)]
+        &protected_live_inodes,
+        MAX_SPOOL_BACKUP_FILES,
+        MAX_SPOOL_BACKUP_NAME_BYTES,
+    )?;
+
+    // Final directory fsyncs for durability (`ADR-RB-07` #1).
+    #[cfg(unix)]
+    {
+        fsync_dir_fd_unix(&backup_gen_fd, "sqlite-backup generation directory")?;
+        fsync_dir_fd_unix(&sqlite_backup_root_fd, "sqlite-backup root directory")?;
+    }
+
+    gen_guard.armed = false;
+
+    let source_digests = SourceDigests {
+        git_logical_sha256: Some(git_logical_sha256.clone()),
+        git_backup_sha256: Some(git_backup.backup_sha256.clone()),
+        cap_logical_sha256: capture_logical_sha256.clone(),
+        cap_backup_sha256: capture_backup.as_ref().map(|b| b.backup_sha256.clone()),
+        git_redb_sha256: None,
+        cap_redb_sha256: None,
+        spool_manifest_sha256: Some(spool_backup.spool_manifest_sha256.clone()),
+        queue_manifest_sha256: Some(queue_manifest_sha256.clone()),
+    };
+
+    Ok(ForwardPhase1BackupReport {
+        generation,
+        backup_rel_dir,
+        backup_dir,
+        git_logical_sha256,
+        git_backup,
+        capture_logical_sha256,
+        capture_backup,
+        spool_backup,
+        queue_manifest_sha256,
+        source_digests,
+    })
 }
 
 #[cfg(test)]
@@ -26894,5 +30272,1541 @@ mod tests {
                 .expect("read last bulk normal queue usage")
                 .is_some()
         );
+    }
+
+    const RB10F_MEM_CHILD_STORAGE_ENV: &str = "LIBRA_RB10F_MEM_CHILD_STORAGE";
+
+    #[tokio::test]
+    async fn forward_phase1_lock_safe_vacuum_backup_and_inplace_spool_backup() {
+        // Isolated child-process mode measuring true OS physical footprint for
+        // `compute_sqlite_source_logical_sha256` + `create_forward_phase1_lock_safe_backups`
+        // on a large wide-row + large-spool fixture (`<= 64 MiB` budget, `RB-10f`).
+        if let Some(storage_os) = std::env::var_os(RB10F_MEM_CHILD_STORAGE_ENV) {
+            let storage = PathBuf::from(storage_os);
+            let mut guard = quiesce_forward_repository_phase1(&storage)
+                .await
+                .expect("mem child quiesce repo");
+            let baseline = measure_process_live_and_peak_heap()
+                .expect("read baseline OS footprint before RB-10f backup");
+            let report = create_forward_phase1_lock_safe_backups(&mut guard, &storage, 1)
+                .await
+                .expect("mem child Phase 1 lock-safe backup");
+            let after =
+                measure_process_live_and_peak_heap().expect("read post-backup OS footprint");
+            let extra_peak = after.1.saturating_sub(baseline.0);
+            assert!(
+                extra_peak <= FORWARD_MIGRATION_EXTRA_HEAP_BUDGET_BYTES,
+                "RB-10f digest + VACUUM INTO + backup hash + spool backup exceeded 64 MiB extra footprint budget: baseline={}B peak={}B extra={}B",
+                baseline.0,
+                after.1,
+                extra_peak
+            );
+            assert_eq!(report.git_logical_sha256.len(), 64);
+            assert_eq!(report.git_backup.backup_sha256.len(), 64);
+            guard.close().await.expect("mem child close guard");
+            println!("RB10F_MEM_CHILD_OK extra_peak={extra_peak}");
+            return;
+        }
+        use crate::storage::{
+            FRAME_FLAG_NONE, FRAME_FLAG_PRIORITY, SqliteCaptureStore,
+            manifest::{Phase2DbState, Phase2Progress, StorageFormatManifest},
+            queue::{
+                CAPTURE_SPOOL_TOMBSTONE_NAMES, append_postcard_frame, init_capture_queue,
+                init_redb_capture_spool_tombstones,
+            },
+        };
+
+        // ------------------------------------------------------------------
+        // Part 1: Full Layout C repo with `libra.db`, `private/capture.db`,
+        // `capture-spool/{ready,quarantine}/`, and `capture-queue/`.
+        // ------------------------------------------------------------------
+        let dir = tempdir().expect("create RB-10f Layout C temp dir");
+        let storage = dir.path().join(".libra");
+        let git_db = git_sqlite_db_path(&storage);
+        let cap_db = capture_sqlite_db_path(&storage);
+        fs::create_dir_all(storage.join(PRIVATE_SUBDIR)).expect("create private dir");
+
+        populate_all_61_repository_tables(&git_db).await;
+        detach_inline_capture_tables(&git_db).await;
+        {
+            let _cap_store = SqliteCaptureStore::create(&cap_db)
+                .await
+                .expect("create Layout C capture.db");
+        }
+        populate_capture_rows_via_sql(&cap_db, 0, None).await;
+        switch_fixture_db_to_delete_mode(&git_db).await;
+        switch_fixture_db_to_delete_mode(&cap_db).await;
+
+        // Seed live `capture-spool/ready/`, `capture-spool/quarantine/`, and
+        // an existing `capacity.lock` inode to prove live spool stays untouched.
+        let spool_dir = capture_spool_dir_path(&storage);
+        let spool_ready = spool_dir.join(CAPTURE_SPOOL_READY_SUBDIR);
+        let spool_quarantine = spool_dir.join(CAPTURE_SPOOL_QUARANTINE_SUBDIR);
+        let spool_tmp = capture_spool_tmp_dir_path(&storage);
+        fs::create_dir_all(&spool_ready).expect("create spool ready");
+        fs::create_dir_all(&spool_quarantine).expect("create spool quarantine");
+        fs::create_dir_all(&spool_tmp).expect("create spool tmp");
+        let cap_lock_path = capture_spool_capacity_lock_path(&storage);
+        fs::write(&cap_lock_path, b"live-capacity-lock-sentinel").expect("seed capacity.lock");
+
+        let ready_env_small = build_spool_envelope_bytes(
+            "codex",
+            "codex",
+            "11111111-1111-4111-8111-111111111f01",
+            Some("dedup:rb10f:ready:1"),
+            "prov-rb10f-ready-1",
+            "/work/rb10f",
+            &storage,
+            "session_start",
+            "2026-11-24T09:00:01.000Z",
+            "small ready spool payload",
+        );
+        let large_text = "L".repeat(160 * 1024);
+        let ready_env_large = build_spool_envelope_bytes(
+            "codex",
+            "codex",
+            "11111111-1111-4111-8111-111111111f02",
+            Some("dedup:rb10f:ready:2"),
+            "prov-rb10f-ready-1",
+            "/work/rb10f",
+            &storage,
+            "turn_end",
+            "2026-11-24T09:00:02.000Z",
+            &large_text,
+        );
+        fs::write(spool_ready.join("0001-small.json"), &ready_env_small)
+            .expect("write ready small");
+        fs::write(spool_ready.join("0002-large.json"), &ready_env_large)
+            .expect("write ready large");
+
+        let quarantine_a = b"quarantined-malformed-event-alpha\n".to_vec();
+        let quarantine_b = vec![0xA5u8; 96 * 1024];
+        fs::write(spool_quarantine.join("q-0001.bin"), &quarantine_a).expect("write quarantine a");
+        fs::write(spool_quarantine.join("q-0002.bin"), &quarantine_b).expect("write quarantine b");
+
+        // Seed `capture-queue/` with valid priority and normal frames.
+        init_capture_queue(&storage).expect("init capture queue");
+        let make_usage = |id: &str| AgentUsageStatsRecord {
+            id: id.to_string(),
+            session_id: Some("sess-1".to_string()),
+            thread_id: None,
+            agent_run_id: None,
+            run_id: None,
+            provider: "openai".to_string(),
+            model: "gpt-5".to_string(),
+            request_kind: "chat".to_string(),
+            intent: Some("rb10f queue payload".to_string()),
+            prompt_tokens: 10,
+            completion_tokens: 20,
+            cached_tokens: 0,
+            reasoning_tokens: 0,
+            total_tokens: 30,
+            tool_call_count: 1,
+            wall_clock_ms: 25,
+            provider_latency_ms: None,
+            cost_estimate_micro_dollars: None,
+            cost_usd: None,
+            usage_estimated: false,
+            started_at: None,
+            finished_at: None,
+            success: true,
+            error_kind: None,
+            schema_version: 1,
+            created_at: "2026-11-24T09:00:05Z".to_string(),
+            agent_name: None,
+            repo_id: None,
+            turn_id: None,
+            event_id: None,
+        };
+        append_postcard_frame(
+            &storage,
+            CaptureQueueLane::Priority,
+            FRAME_FLAG_PRIORITY,
+            "dedup:rb10f:qprio:1",
+            CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+            &CaptureBatchPayload::InsertUsageStats(make_usage("usage-rb10f-prio")),
+        )
+        .expect("append priority queue frame");
+        append_postcard_frame(
+            &storage,
+            CaptureQueueLane::Normal,
+            FRAME_FLAG_NONE,
+            "dedup:rb10f:qnorm:1",
+            CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+            &CaptureBatchPayload::InsertUsageStats(make_usage("usage-rb10f-norm")),
+        )
+        .expect("append normal queue frame");
+
+        // Snapshot pre-migration live files and inodes.
+        let before_git_bytes = fs::read(&git_db).expect("read baseline libra.db");
+        let before_cap_bytes = fs::read(&cap_db).expect("read baseline capture.db");
+        let before_spool_bytes = snapshot_tree_bytes(&spool_dir);
+        #[cfg(unix)]
+        let (before_git_ino, before_cap_ino, before_spool_dir_ino, before_cap_lock_ino) = (
+            file_dev_ino(&git_db),
+            file_dev_ino(&cap_db),
+            file_dev_ino(&spool_dir),
+            file_dev_ino(&cap_lock_path),
+        );
+
+        let mut guard = quiesce_forward_repository_phase1(&storage)
+            .await
+            .expect("quiesce Layout C repo");
+        // Snapshot `capture-queue/` immediately after Phase 1 quiescence
+        // (which creates permanent advisory `writer.lock` per `RB-10n`) so we
+        // verify export + backup make ZERO mutations to queue data or locks.
+        let before_queue_bytes = snapshot_tree_bytes(&capture_queue_dir_path(&storage));
+
+        // AC1: Deterministic single-connection `source_logical_sha256` (zero extra fd!).
+        let git_digest_1 = compute_sqlite_source_logical_sha256(
+            &mut guard.sqlite.git.conn,
+            DatabaseRole::Repository,
+        )
+        .await
+        .expect("compute git logical digest #1");
+        let git_digest_2 = compute_sqlite_source_logical_sha256(
+            &mut guard.sqlite.git.conn,
+            DatabaseRole::Repository,
+        )
+        .await
+        .expect("compute git logical digest #2");
+        assert_eq!(
+            git_digest_1, git_digest_2,
+            "git logical digest must be deterministic"
+        );
+        assert_eq!(git_digest_1.len(), 64);
+        assert!(
+            git_digest_1
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        );
+
+        let cap_digest_1 = compute_sqlite_source_logical_sha256(
+            &mut guard.sqlite.capture.as_mut().expect("capture conn").conn,
+            DatabaseRole::Capture,
+        )
+        .await
+        .expect("compute capture logical digest #1");
+        let cap_digest_2 = compute_sqlite_source_logical_sha256(
+            &mut guard.sqlite.capture.as_mut().expect("capture conn").conn,
+            DatabaseRole::Capture,
+        )
+        .await
+        .expect("compute capture logical digest #2");
+        assert_eq!(
+            cap_digest_1, cap_digest_2,
+            "capture logical digest must be deterministic"
+        );
+        assert_ne!(git_digest_1, cap_digest_1);
+
+        // Run Phase 1 export + lock-safe backups.
+        let _export_report = export_forward_phase1_to_redb_tmp(&mut guard, &storage, 1)
+            .await
+            .expect("export Phase 1 to redb tmp");
+        let backup_report = create_forward_phase1_lock_safe_backups(&mut guard, &storage, 1)
+            .await
+            .expect("create Phase 1 lock-safe backups");
+
+        assert_eq!(backup_report.generation, 1);
+        assert_eq!(backup_report.backup_rel_dir, "sqlite-backup/00000001");
+        assert_eq!(backup_report.git_logical_sha256, git_digest_1);
+        assert_eq!(
+            backup_report.capture_logical_sha256.as_deref(),
+            Some(cap_digest_1.as_str())
+        );
+
+        // Manifest validation proves all `SourceDigests` fields satisfy Phase 2 schema!
+        let manifest = StorageFormatManifest::new_redb_in_progress(
+            1,
+            Some(backup_report.backup_rel_dir.clone()),
+            Phase2Progress {
+                git_db: Some(Phase2DbState::Pending),
+                capture_db: Some(Phase2DbState::Pending),
+                git_redb: None,
+                cap_redb: None,
+                spool_fenced: false,
+                queue_fenced: false,
+            },
+            backup_report.source_digests.clone(),
+        )
+        .expect("Phase 1 SourceDigests must produce a valid Phase 2 in-progress manifest");
+        assert_eq!(manifest.generation, 1);
+
+        // AC2: Verify `.libra/sqlite-backup/00000001/{libra,capture}.db` new inodes,
+        // `PRAGMA integrity_check == "ok"`, exact file SHA-256, permissions, and data.
+        let backup_git = sqlite_backup_git_db_path(&storage, 1);
+        let backup_cap = sqlite_backup_capture_db_path(&storage, 1);
+        assert_eq!(backup_report.git_backup.backup_path, backup_git);
+        let cap_backup_receipt = backup_report
+            .capture_backup
+            .as_ref()
+            .expect("Layout C must produce capture.db backup");
+        assert_eq!(cap_backup_receipt.backup_path, backup_cap);
+        assert!(!sqlite_sidecar_path(&backup_git, ".tmp").exists());
+        assert!(!sqlite_sidecar_path(&backup_cap, ".tmp").exists());
+        assert!(!sqlite_sidecar_path(&backup_git, "-wal").exists());
+        assert!(!sqlite_sidecar_path(&backup_cap, "-wal").exists());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_ne!(
+                file_dev_ino(&backup_git),
+                before_git_ino,
+                "VACUUM INTO backup of libra.db must be an independent new inode"
+            );
+            assert_ne!(
+                file_dev_ino(&backup_cap),
+                before_cap_ino,
+                "VACUUM INTO backup of capture.db must be an independent new inode"
+            );
+            assert_eq!(
+                fs::symlink_metadata(storage.join(SQLITE_BACKUP_SUBDIR))
+                    .expect("stat sqlite-backup")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+            assert_eq!(
+                fs::symlink_metadata(&backup_report.backup_dir)
+                    .expect("stat sqlite-backup/00000001")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+            assert_eq!(
+                fs::symlink_metadata(&backup_git)
+                    .expect("stat backup libra.db")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+            assert_eq!(
+                fs::symlink_metadata(&backup_cap)
+                    .expect("stat backup capture.db")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+
+        let disk_git_backup_bytes = fs::read(&backup_git).expect("read backup libra.db");
+        let disk_cap_backup_bytes = fs::read(&backup_cap).expect("read backup capture.db");
+        assert_eq!(
+            backup_report.git_backup.byte_len,
+            disk_git_backup_bytes.len() as u64
+        );
+        assert_eq!(
+            backup_report.git_backup.backup_sha256,
+            sha256_hex_from_hasher(Sha256::new_with_prefix(&disk_git_backup_bytes))
+        );
+        assert_eq!(
+            cap_backup_receipt.byte_len,
+            disk_cap_backup_bytes.len() as u64
+        );
+        assert_eq!(
+            cap_backup_receipt.backup_sha256,
+            sha256_hex_from_hasher(Sha256::new_with_prefix(&disk_cap_backup_bytes))
+        );
+
+        // Verify standalone integrity & readable rows on both backup SQLite files.
+        for (bpath, check_table) in [(&backup_git, "reference"), (&backup_cap, "agent_session")] {
+            let mut bconn = SqliteConnection::connect_with(
+                &SqliteConnectOptions::new()
+                    .filename(bpath)
+                    .create_if_missing(false)
+                    .read_only(true),
+            )
+            .await
+            .expect("open standalone backup read-only");
+            let ic: Vec<String> = sea_orm::sqlx::query_scalar("PRAGMA integrity_check;")
+                .fetch_all(&mut bconn)
+                .await
+                .expect("run PRAGMA integrity_check on backup");
+            assert_eq!(ic, vec!["ok".to_string()]);
+            let jm: String = sea_orm::sqlx::query_scalar("PRAGMA journal_mode;")
+                .fetch_one(&mut bconn)
+                .await
+                .expect("check backup journal_mode");
+            assert_eq!(jm.to_ascii_lowercase(), "delete");
+            let cnt: i64 = sea_orm::sqlx::query_scalar(AssertSqlSafe(
+                format!("SELECT COUNT(*) FROM \"{check_table}\"").as_str(),
+            ))
+            .fetch_one(&mut bconn)
+            .await
+            .expect("count backup rows");
+            assert!(
+                cnt >= 1,
+                "backup `{check_table}` must contain exported rows"
+            );
+            bconn.close().await.expect("close backup conn");
+        }
+
+        // AC3: Verify `.libra/sqlite-backup/00000001/capture-spool/{ready,quarantine}/`
+        // byte-for-byte matches live spool AND live spool + `capacity.lock` stayed in place!
+        let backup_spool_dir = sqlite_backup_capture_spool_dir_path(&storage, 1);
+        assert_eq!(
+            backup_report.spool_backup.backup_spool_dir,
+            backup_spool_dir
+        );
+        assert!(!backup_report.spool_backup.ready_fenced);
+        assert!(!backup_report.spool_backup.quarantine_fenced);
+        assert_eq!(backup_report.spool_backup.files.len(), 4);
+
+        let expected_spool_files: [(&str, &str, &[u8]); 4] = [
+            ("ready", "0001-small.json", &ready_env_small),
+            ("ready", "0002-large.json", &ready_env_large),
+            ("quarantine", "q-0001.bin", &quarantine_a),
+            ("quarantine", "q-0002.bin", &quarantine_b),
+        ];
+        for (idx, (sub, fname, expected_bytes)) in expected_spool_files.iter().enumerate() {
+            let rec = &backup_report.spool_backup.files[idx];
+            assert_eq!(rec.subdir, *sub);
+            assert_eq!(rec.file_name, *fname);
+            assert_eq!(rec.byte_len, expected_bytes.len() as u64);
+            let expected_sha = sha256_hex_from_hasher(Sha256::new_with_prefix(*expected_bytes));
+            assert_eq!(rec.sha256, expected_sha);
+
+            let dst_file = backup_spool_dir.join(sub).join(fname);
+            let actual_bytes = fs::read(&dst_file).expect("read backed-up spool file");
+            assert_eq!(actual_bytes.as_slice(), *expected_bytes);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                assert_eq!(
+                    fs::symlink_metadata(&dst_file)
+                        .expect("stat backed-up spool file")
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o600
+                );
+            }
+        }
+        assert!(
+            !backup_spool_dir
+                .join(CAPTURE_SPOOL_CAPACITY_LOCK_FILE)
+                .exists(),
+            "capacity.lock must remain in place in live capture-spool and not be moved"
+        );
+
+        // Pre-existing generation directory must fail closed without overwriting.
+        let dup_err = create_forward_phase1_lock_safe_backups(&mut guard, &storage, 1)
+            .await
+            .expect_err("re-using existing backup generation directory must fail closed");
+        assert_eq!(dup_err.stable_code_str(), "LBR-IO-001");
+        assert_eq!(
+            fs::read(&backup_git).expect("existing backup libra.db preserved"),
+            disk_git_backup_bytes
+        );
+
+        guard.close().await.expect("close Layout C quiesce guard");
+
+        // Confirm live `libra.db`, `capture.db`, `capture-spool/` (including `capacity.lock`
+        // inode & bytes), and `capture-queue/` are 100% untouched!
+        assert_eq!(
+            fs::read(&git_db).expect("read post libra.db"),
+            before_git_bytes
+        );
+        assert_eq!(
+            fs::read(&cap_db).expect("read post capture.db"),
+            before_cap_bytes
+        );
+        assert_eq!(snapshot_tree_bytes(&spool_dir), before_spool_bytes);
+        assert_eq!(
+            snapshot_tree_bytes(&capture_queue_dir_path(&storage)),
+            before_queue_bytes
+        );
+        #[cfg(unix)]
+        {
+            assert_eq!(file_dev_ino(&git_db), before_git_ino);
+            assert_eq!(file_dev_ino(&cap_db), before_cap_ino);
+            assert_eq!(file_dev_ino(&spool_dir), before_spool_dir_ino);
+            assert_eq!(file_dev_ino(&cap_lock_path), before_cap_lock_ino);
+        }
+
+        // ------------------------------------------------------------------
+        // Part 2: Logical digest sensitivity (row mutation, SQLite dynamic
+        // storage-class distinctions, WITHOUT ROWID table, and DDL change)
+        // + explicit rejection of `DatabaseRole::Derived`.
+        // ------------------------------------------------------------------
+        {
+            let sens_dir = tempdir().expect("create digest sensitivity tempdir");
+            let db_path = sens_dir.path().join("sens.db");
+            let mut conn = SqliteConnection::connect_with(
+                &SqliteConnectOptions::new()
+                    .filename(&db_path)
+                    .create_if_missing(true)
+                    .read_only(false),
+            )
+            .await
+            .expect("open sensitivity sqlite db");
+            // Use BLOB (NONE) affinity so SQLite stores exact dynamic storage
+            // classes (`INTEGER 1`, `REAL 1.0`, `TEXT '1'`, `BLOB X'31'`, `NULL`)
+            // without NUMERIC affinity coercing `1.0` / `'1'` back to `INTEGER 1`.
+            conn.execute("CREATE TABLE dyn (id INTEGER PRIMARY KEY, val BLOB);")
+                .await
+                .expect("create dyn table");
+            conn.execute("CREATE TABLE kv_wr (k TEXT PRIMARY KEY, v BLOB) WITHOUT ROWID;")
+                .await
+                .expect("create WITHOUT ROWID table");
+            conn.execute("INSERT INTO dyn (id, val) VALUES (1, 1);")
+                .await
+                .expect("insert INTEGER 1");
+            conn.execute("INSERT INTO kv_wr (k, v) VALUES ('alpha', X'0102');")
+                .await
+                .expect("insert WITHOUT ROWID row");
+
+            let derived_err =
+                compute_sqlite_source_logical_sha256(&mut conn, DatabaseRole::Derived)
+                    .await
+                    .expect_err(
+                        "Derived role must be rejected by compute_sqlite_source_logical_sha256",
+                    );
+            assert_eq!(derived_err.stable_code_str(), "LBR-IO-001");
+
+            let d_int = compute_sqlite_source_logical_sha256(&mut conn, DatabaseRole::Repository)
+                .await
+                .expect("digest INTEGER 1");
+
+            conn.execute("UPDATE dyn SET val = 1.0 WHERE id = 1;")
+                .await
+                .expect("update to REAL 1.0");
+            let d_real = compute_sqlite_source_logical_sha256(&mut conn, DatabaseRole::Repository)
+                .await
+                .expect("digest REAL 1.0");
+
+            conn.execute("UPDATE dyn SET val = '1' WHERE id = 1;")
+                .await
+                .expect("update to TEXT '1'");
+            let d_text = compute_sqlite_source_logical_sha256(&mut conn, DatabaseRole::Repository)
+                .await
+                .expect("digest TEXT '1'");
+
+            conn.execute("UPDATE dyn SET val = X'31' WHERE id = 1;")
+                .await
+                .expect("update to BLOB X'31'");
+            let d_blob = compute_sqlite_source_logical_sha256(&mut conn, DatabaseRole::Repository)
+                .await
+                .expect("digest BLOB X'31'");
+
+            conn.execute("UPDATE dyn SET val = NULL WHERE id = 1;")
+                .await
+                .expect("update to NULL");
+            let d_null = compute_sqlite_source_logical_sha256(&mut conn, DatabaseRole::Repository)
+                .await
+                .expect("digest NULL");
+
+            conn.execute("UPDATE kv_wr SET v = X'0103' WHERE k = 'alpha';")
+                .await
+                .expect("update WITHOUT ROWID value");
+            let d_wr = compute_sqlite_source_logical_sha256(&mut conn, DatabaseRole::Repository)
+                .await
+                .expect("digest after WITHOUT ROWID mutation");
+
+            conn.execute("CREATE INDEX idx_dyn_val ON dyn(val);")
+                .await
+                .expect("add DDL index");
+            let d_ddl = compute_sqlite_source_logical_sha256(&mut conn, DatabaseRole::Repository)
+                .await
+                .expect("digest after DDL change");
+
+            let unique: BTreeSet<&str> = [
+                d_int.as_str(),
+                d_real.as_str(),
+                d_text.as_str(),
+                d_blob.as_str(),
+                d_null.as_str(),
+                d_wr.as_str(),
+                d_ddl.as_str(),
+            ]
+            .into_iter()
+            .collect();
+            assert_eq!(
+                unique.len(),
+                7,
+                "every storage-class, WITHOUT ROWID, and DDL mutation must produce a distinct logical digest"
+            );
+            conn.close().await.expect("close sensitivity conn");
+        }
+
+        // ------------------------------------------------------------------
+        // Part 3: Layout A (unsplit `libra.db` only) + fenced `0400` spool
+        // tombstones + fail-closed symlink cleanup on generation 2.
+        // ------------------------------------------------------------------
+        {
+            let dir_a = tempdir().expect("create RB-10f Layout A tempdir");
+            let storage_a = dir_a.path().join(".libra");
+            let git_db_a = git_sqlite_db_path(&storage_a);
+            fs::create_dir_all(&storage_a).expect("create storage_a");
+            populate_all_61_repository_tables(&git_db_a).await;
+            populate_capture_rows_via_sql(&git_db_a, 0, None).await;
+            switch_fixture_db_to_delete_mode(&git_db_a).await;
+            init_redb_capture_spool_tombstones(&storage_a).expect("install 0400 spool tombstones");
+            for name in CAPTURE_SPOOL_TOMBSTONE_NAMES {
+                assert!(
+                    capture_spool_dir_path(&storage_a).join(name).is_file(),
+                    "tombstone {name} must exist"
+                );
+            }
+
+            let mut guard_a = quiesce_forward_repository_phase1(&storage_a)
+                .await
+                .expect("quiesce Layout A repo");
+            let rep_a = create_forward_phase1_lock_safe_backups(&mut guard_a, &storage_a, 1)
+                .await
+                .expect("Layout A backup with fenced spool tombstones must succeed");
+            assert!(rep_a.capture_logical_sha256.is_none());
+            assert!(rep_a.capture_backup.is_none());
+            assert!(!sqlite_backup_capture_db_path(&storage_a, 1).exists());
+            assert!(rep_a.spool_backup.ready_fenced);
+            assert!(rep_a.spool_backup.quarantine_fenced);
+            assert!(rep_a.spool_backup.files.is_empty());
+            let _manifest_a = StorageFormatManifest::new_redb_in_progress(
+                1,
+                Some(rep_a.backup_rel_dir.clone()),
+                Phase2Progress {
+                    git_db: Some(Phase2DbState::Pending),
+                    capture_db: Some(Phase2DbState::Absent),
+                    git_redb: None,
+                    cap_redb: None,
+                    spool_fenced: true,
+                    queue_fenced: false,
+                },
+                rep_a.source_digests.clone(),
+            )
+            .expect("Layout A SourceDigests must validate Phase 2 manifest");
+            guard_a.close().await.expect("close Layout A guard");
+        }
+
+        // Fail-closed symlink in `capture-spool/quarantine/` must abort backup
+        // and leave ZERO partial `.libra/sqlite-backup/00000002/` directory!
+        #[cfg(unix)]
+        {
+            let sym_dir = tempdir().expect("create RB-10f symlink-fail tempdir");
+            let storage_s = sym_dir.path().join(".libra");
+            let git_db_s = git_sqlite_db_path(&storage_s);
+            fs::create_dir_all(capture_spool_dir_path(&storage_s).join("quarantine"))
+                .expect("create spool quarantine");
+            populate_all_61_repository_tables(&git_db_s).await;
+            populate_capture_rows_via_sql(&git_db_s, 0, None).await;
+            switch_fixture_db_to_delete_mode(&git_db_s).await;
+            let secret_target = sym_dir.path().join("outside-secret.txt");
+            fs::write(&secret_target, b"do-not-follow").expect("write outside target");
+            std::os::unix::fs::symlink(
+                &secret_target,
+                capture_spool_dir_path(&storage_s)
+                    .join("quarantine")
+                    .join("evil-link.json"),
+            )
+            .expect("create symlink inside quarantine");
+
+            let mut guard_s = quiesce_forward_repository_phase1(&storage_s)
+                .await
+                .expect("quiesce symlink-fail repo");
+            let err = create_forward_phase1_lock_safe_backups(&mut guard_s, &storage_s, 2)
+                .await
+                .expect_err("symlink inside capture-spool/quarantine must fail closed");
+            assert_eq!(err.stable_code_str(), "LBR-IO-001");
+            assert!(
+                !sqlite_backup_dir_path(&storage_s, 2).exists(),
+                "aborted Phase 1 backup must clean up partial sqlite-backup/00000002 directory"
+            );
+            guard_s.close().await.expect("close symlink-fail guard");
+        }
+
+        // ------------------------------------------------------------------
+        // Part 4: Failed generation directory setup (after `mkdirat`, before
+        // parent `fsync`) rolls back the newly created `<gen>` directory so
+        // an immediate retry with the same generation succeeds cleanly.
+        // ------------------------------------------------------------------
+        {
+            let dir_r = tempdir().expect("create RB-10f dir-rollback tempdir");
+            let storage_r = dir_r.path().join(".libra");
+            let git_db_r = git_sqlite_db_path(&storage_r);
+            fs::create_dir_all(&storage_r).expect("create storage_r");
+            populate_all_61_repository_tables(&git_db_r).await;
+            populate_capture_rows_via_sql(&git_db_r, 0, None).await;
+            switch_fixture_db_to_delete_mode(&git_db_r).await;
+
+            let mut guard_r = quiesce_forward_repository_phase1(&storage_r)
+                .await
+                .expect("quiesce dir-rollback repo");
+            let err = create_forward_phase1_lock_safe_backups_with_hooks(
+                &mut guard_r,
+                &storage_r,
+                3,
+                None,
+                Some(Phase1DirFaultPoint::AfterGenMkdirBeforeFsync),
+            )
+            .await
+            .expect_err("injected failure during generation directory setup must fail");
+            assert_eq!(err.stable_code_str(), "LBR-IO-001");
+            assert!(
+                !sqlite_backup_dir_path(&storage_r, 3).exists(),
+                "failed generation directory setup must roll back sqlite-backup/00000003"
+            );
+
+            // Immediate retry with the same generation must succeed cleanly!
+            let retry_report = create_forward_phase1_lock_safe_backups(&mut guard_r, &storage_r, 3)
+                .await
+                .expect("retry after rolled-back generation directory setup must succeed");
+            assert_eq!(retry_report.generation, 3);
+            assert!(sqlite_backup_git_db_path(&storage_r, 3).is_file());
+            guard_r.close().await.expect("close dir-rollback guard");
+
+            // Verify bounded queue-lane directory listing rejects oversized directories
+            // (after releasing `guard_r` so `init_capture_queue` can acquire `append.lock`).
+            init_capture_queue(&storage_r).expect("init capture queue for bound test");
+            let q_bound_err = compute_capture_queue_manifest_sha256_readonly_inner(
+                &storage_r,
+                #[cfg(unix)]
+                &[],
+                1,
+                MAX_SPOOL_BACKUP_NAME_BYTES,
+            )
+            .expect_err("queue lane exceeding entry cap must fail closed");
+            assert_eq!(q_bound_err.stable_code_str(), "LBR-IO-001");
+
+            // `tail.meta` (9B) and `tail.meta.bak` (13B) are each <= 16B, while
+            // their cumulative total (22B) exceeds 16B — proves cumulative accounting.
+            let q_name_err = compute_capture_queue_manifest_sha256_readonly_inner(
+                &storage_r,
+                #[cfg(unix)]
+                &[],
+                MAX_SPOOL_BACKUP_FILES,
+                16,
+            )
+            .expect_err("queue lane exceeding cumulative name-byte cap must fail closed");
+            assert_eq!(q_name_err.stable_code_str(), "LBR-IO-001");
+
+            // Verify valid vs invalid fenced queue-lane tombstone handling across
+            // both Unix (`0400`) and Windows (`readonly = true`) using a same-length
+            // mutated sentinel to exercise exact byte comparison independently.
+            let q_prio_dir = capture_queue_dir_path(&storage_r).join(QUEUE_LANE_PRIORITY_DIR);
+            fs::remove_dir_all(&q_prio_dir).expect("remove priority lane dir for tombstone test");
+            let mut invalid_sentinel = CAPTURE_SPOOL_TOMBSTONE_SENTINEL.to_vec();
+            invalid_sentinel[0] ^= 0x01;
+            fs::write(&q_prio_dir, &invalid_sentinel).expect("write invalid lane sentinel");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                fs::set_permissions(&q_prio_dir, fs::Permissions::from_mode(0o400))
+                    .expect("chmod invalid lane file 0400");
+            }
+            #[cfg(not(unix))]
+            {
+                let mut perms = fs::metadata(&q_prio_dir)
+                    .expect("stat invalid lane file")
+                    .permissions();
+                perms.set_readonly(true);
+                fs::set_permissions(&q_prio_dir, perms).expect("mark invalid lane file readonly");
+            }
+            let invalid_tomb_err = compute_capture_queue_manifest_sha256_readonly(&storage_r)
+                .expect_err("invalid capture-queue lane tombstone sentinel must fail closed");
+            assert_eq!(invalid_tomb_err.stable_code_str(), "LBR-IO-001");
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                fs::set_permissions(&q_prio_dir, fs::Permissions::from_mode(0o600))
+                    .expect("chmod invalid lane file writable to replace");
+            }
+            #[cfg(not(unix))]
+            {
+                let mut perms = fs::metadata(&q_prio_dir)
+                    .expect("stat invalid lane file")
+                    .permissions();
+                perms.set_readonly(false);
+                fs::set_permissions(&q_prio_dir, perms)
+                    .expect("clear readonly on invalid lane file");
+            }
+            fs::remove_file(&q_prio_dir).expect("remove invalid lane file");
+            fs::write(&q_prio_dir, CAPTURE_SPOOL_TOMBSTONE_SENTINEL)
+                .expect("write valid lane tombstone sentinel");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                fs::set_permissions(&q_prio_dir, fs::Permissions::from_mode(0o400))
+                    .expect("chmod valid lane tombstone 0400");
+            }
+            #[cfg(not(unix))]
+            {
+                let mut perms = fs::metadata(&q_prio_dir)
+                    .expect("stat valid lane tombstone")
+                    .permissions();
+                perms.set_readonly(true);
+                fs::set_permissions(&q_prio_dir, perms)
+                    .expect("mark valid lane tombstone readonly");
+            }
+            let valid_tomb_digest = compute_capture_queue_manifest_sha256_readonly(&storage_r)
+                .expect("valid fenced capture-queue lane tombstone must hash cleanly");
+            assert_eq!(valid_tomb_digest.len(), 64);
+        }
+
+        // ------------------------------------------------------------------
+        // Part 5: Isolated child-process OS physical-footprint budget proof
+        // (`<= 64 MiB`) across full logical digest + VACUUM INTO + integrity
+        // check + backup SHA-256 + large in-place spool backup.
+        // ------------------------------------------------------------------
+        {
+            let mem_dir = tempdir().expect("create RB-10f memory-budget tempdir");
+            let storage_m = mem_dir.path().join(".libra");
+            let git_db_m = git_sqlite_db_path(&storage_m);
+            let cap_db_m = capture_sqlite_db_path(&storage_m);
+            fs::create_dir_all(storage_m.join(PRIVATE_SUBDIR)).expect("create private dir");
+            populate_all_61_repository_tables(&git_db_m).await;
+            detach_inline_capture_tables(&git_db_m).await;
+            {
+                let _cap_store = SqliteCaptureStore::create(&cap_db_m)
+                    .await
+                    .expect("create mem-budget capture.db");
+            }
+            populate_capture_rows_via_sql(&cap_db_m, 0, None).await;
+            {
+                let mut gconn = SqliteConnection::connect_with(
+                    &SqliteConnectOptions::new()
+                        .filename(&git_db_m)
+                        .create_if_missing(false)
+                        .read_only(false),
+                )
+                .await
+                .expect("open mem-budget git_db");
+                let wide_row = "W".repeat(3_584 * 1024);
+                gconn.execute("BEGIN;").await.expect("begin wide seed");
+                for i in 0..6u32 {
+                    sea_orm::sqlx::query(
+                        "INSERT INTO config_kv (key, value, encrypted) VALUES (?, ?, 0)",
+                    )
+                    .bind(format!("rb10f.mem.wide.{i:02}"))
+                    .bind(&wide_row)
+                    .execute(&mut gconn)
+                    .await
+                    .expect("insert 3.5 MiB wide row");
+                }
+                gconn.execute("COMMIT;").await.expect("commit wide seed");
+                gconn.close().await.expect("close mem-budget git_db");
+            }
+            switch_fixture_db_to_delete_mode(&git_db_m).await;
+            switch_fixture_db_to_delete_mode(&cap_db_m).await;
+
+            let ready_m = capture_spool_dir_path(&storage_m).join(CAPTURE_SPOOL_READY_SUBDIR);
+            let quar_m = capture_spool_dir_path(&storage_m).join(CAPTURE_SPOOL_QUARANTINE_SUBDIR);
+            fs::create_dir_all(&ready_m).expect("create mem ready");
+            fs::create_dir_all(&quar_m).expect("create mem quarantine");
+            fs::write(ready_m.join("large-ready.bin"), vec![b'R'; 2 * 1024 * 1024])
+                .expect("write 2 MiB ready");
+            fs::write(quar_m.join("large-quar.bin"), vec![b'Q'; 2 * 1024 * 1024])
+                .expect("write 2 MiB quarantine");
+
+            let exe = std::env::current_exe().expect("locate test exe");
+            let output = Command::new(exe)
+                .arg("--exact")
+                .arg("storage::migrate::tests::forward_phase1_lock_safe_vacuum_backup_and_inplace_spool_backup")
+                .arg("--nocapture")
+                .env(RB10F_MEM_CHILD_STORAGE_ENV, &storage_m)
+                .env("LIBRA_TEST", "1")
+                .output()
+                .expect("spawn RB-10f memory-budget child");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success() && stdout.contains("RB10F_MEM_CHILD_OK"),
+                "RB-10f isolated memory-budget child failed (status={:?}):
+stdout:
+{stdout}
+stderr:
+{stderr}",
+                output.status
+            );
+        }
+    }
+
+    const RB10F_PROBE_MODE_ENV: &str = "LIBRA_RB10F_PROBE_MODE";
+    const RB10F_GIT_DB_ENV: &str = "LIBRA_RB10F_GIT_DB";
+    const RB10F_CAP_DB_ENV: &str = "LIBRA_RB10F_CAP_DB";
+    const RB10F_READY_MARKER: &str = "LIBRA_RB10F_READY";
+    const RB10F_OK_MARKER: &str = "LIBRA_RB10F_PROBE_OK";
+
+    async fn run_rb10f_external_probe_child(mode: &str, git_db: &Path, cap_db: &Path) {
+        let open_conn = |db_path: &Path| {
+            let opts = SqliteConnectOptions::new()
+                .filename(db_path)
+                .create_if_missing(false)
+                .read_only(false)
+                .busy_timeout(Duration::ZERO);
+            async move {
+                SqliteConnection::connect_with(&opts)
+                    .await
+                    .expect("external probe child connect sqlite")
+            }
+        };
+
+        let mut git_conn = open_conn(git_db).await;
+        let mut cap_conn = open_conn(cap_db).await;
+
+        match mode {
+            "single_read_busy" => {
+                let g_err =
+                    sea_orm::sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM reference;")
+                        .fetch_one(&mut git_conn)
+                        .await
+                        .expect_err("external read on live libra.db must hit SQLITE_BUSY");
+                assert!(
+                    is_sqlite_busy_error(&g_err),
+                    "expected SQLITE_BUSY reading live libra.db, got {g_err:?}"
+                );
+                let c_err =
+                    sea_orm::sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM agent_session;")
+                        .fetch_one(&mut cap_conn)
+                        .await
+                        .expect_err("external read on live capture.db must hit SQLITE_BUSY");
+                assert!(
+                    is_sqlite_busy_error(&c_err),
+                    "expected SQLITE_BUSY reading live capture.db, got {c_err:?}"
+                );
+                println!("{RB10F_OK_MARKER}");
+                let _ = io::stdout().flush();
+            }
+            "single_write_busy" => {
+                let g_err = git_conn
+                    .execute("BEGIN IMMEDIATE;")
+                    .await
+                    .expect_err("external write on live libra.db must hit SQLITE_BUSY");
+                assert!(
+                    is_sqlite_busy_error(&g_err),
+                    "expected SQLITE_BUSY writing live libra.db, got {g_err:?}"
+                );
+                let c_err = cap_conn
+                    .execute("BEGIN IMMEDIATE;")
+                    .await
+                    .expect_err("external write on live capture.db must hit SQLITE_BUSY");
+                assert!(
+                    is_sqlite_busy_error(&c_err),
+                    "expected SQLITE_BUSY writing live capture.db, got {c_err:?}"
+                );
+                println!("{RB10F_OK_MARKER}");
+                let _ = io::stdout().flush();
+            }
+            "continuous_read_busy" | "continuous_write_busy" => {
+                use std::sync::{
+                    Arc,
+                    atomic::{AtomicBool, Ordering},
+                };
+                let is_read = mode == "continuous_read_busy";
+                let stop = Arc::new(AtomicBool::new(false));
+                let stop_reader = Arc::clone(&stop);
+                let stdin_wait = std::thread::spawn(move || {
+                    let mut sink = Vec::new();
+                    let _ = io::stdin().read_to_end(&mut sink);
+                    stop_reader.store(true, Ordering::SeqCst);
+                });
+
+                let mut git_busy: u64 = 0;
+                let mut cap_busy: u64 = 0;
+                let mut emitted_ready = false;
+
+                loop {
+                    if is_read {
+                        let g_err = sea_orm::sqlx::query_scalar::<_, i64>(
+                            "SELECT COUNT(*) FROM reference;",
+                        )
+                        .fetch_one(&mut git_conn)
+                        .await
+                        .expect_err(
+                            "continuous external read on live libra.db MUST NEVER succeed while Phase 1 holds lock",
+                        );
+                        assert!(
+                            is_sqlite_busy_error(&g_err),
+                            "continuous external read on libra.db expected SQLITE_BUSY, got {g_err:?}"
+                        );
+                        git_busy = git_busy.saturating_add(1);
+
+                        let c_err = sea_orm::sqlx::query_scalar::<_, i64>(
+                            "SELECT COUNT(*) FROM agent_session;",
+                        )
+                        .fetch_one(&mut cap_conn)
+                        .await
+                        .expect_err(
+                            "continuous external read on live capture.db MUST NEVER succeed while Phase 1 holds lock",
+                        );
+                        assert!(
+                            is_sqlite_busy_error(&c_err),
+                            "continuous external read on capture.db expected SQLITE_BUSY, got {c_err:?}"
+                        );
+                        cap_busy = cap_busy.saturating_add(1);
+                    } else {
+                        let g_err = git_conn
+                            .execute("BEGIN IMMEDIATE;")
+                            .await
+                            .expect_err(
+                                "continuous external write on live libra.db MUST NEVER succeed while Phase 1 holds lock",
+                            );
+                        assert!(
+                            is_sqlite_busy_error(&g_err),
+                            "continuous external write on libra.db expected SQLITE_BUSY, got {g_err:?}"
+                        );
+                        git_busy = git_busy.saturating_add(1);
+
+                        let c_err = cap_conn
+                            .execute("BEGIN IMMEDIATE;")
+                            .await
+                            .expect_err(
+                                "continuous external write on live capture.db MUST NEVER succeed while Phase 1 holds lock",
+                            );
+                        assert!(
+                            is_sqlite_busy_error(&c_err),
+                            "continuous external write on capture.db expected SQLITE_BUSY, got {c_err:?}"
+                        );
+                        cap_busy = cap_busy.saturating_add(1);
+                    }
+
+                    if !emitted_ready {
+                        println!("{RB10F_READY_MARKER}");
+                        let _ = io::stdout().flush();
+                        emitted_ready = true;
+                    }
+                    if stop.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+
+                let _ = stdin_wait.join();
+                println!("RB10F_STATS git={git_busy} cap={cap_busy}");
+                let _ = io::stdout().flush();
+            }
+            "verify_unlocked_rw" => {
+                let g_cnt: i64 = sea_orm::sqlx::query_scalar("SELECT COUNT(*) FROM reference;")
+                    .fetch_one(&mut git_conn)
+                    .await
+                    .expect("post-release external read on libra.db must succeed");
+                assert!(g_cnt >= 1);
+                git_conn
+                    .execute("BEGIN IMMEDIATE;")
+                    .await
+                    .expect("post-release external write on libra.db must succeed");
+                git_conn
+                    .execute("ROLLBACK;")
+                    .await
+                    .expect("rollback libra.db probe");
+
+                let c_cnt: i64 = sea_orm::sqlx::query_scalar("SELECT COUNT(*) FROM agent_session;")
+                    .fetch_one(&mut cap_conn)
+                    .await
+                    .expect("post-release external read on capture.db must succeed");
+                assert!(c_cnt >= 1);
+                cap_conn
+                    .execute("BEGIN IMMEDIATE;")
+                    .await
+                    .expect("post-release external write on capture.db must succeed");
+                cap_conn
+                    .execute("ROLLBACK;")
+                    .await
+                    .expect("rollback capture.db probe");
+
+                println!("{RB10F_OK_MARKER}");
+                let _ = io::stdout().flush();
+            }
+            other => panic!("unknown LIBRA_RB10F_PROBE_MODE: {other}"),
+        }
+
+        git_conn.close().await.expect("close child git conn");
+        cap_conn.close().await.expect("close child cap conn");
+    }
+
+    fn run_rb10f_single_probe(mode: &str, git_db: &Path, cap_db: &Path) {
+        let exe = std::env::current_exe().expect("locate current test executable");
+        let output = Command::new(exe)
+            .arg("--exact")
+            .arg("storage::migrate::tests::forward_phase1_external_os_process_blocked_through_backup_hash")
+            .arg("--nocapture")
+            .env(RB10F_PROBE_MODE_ENV, mode)
+            .env(RB10F_GIT_DB_ENV, git_db)
+            .env(RB10F_CAP_DB_ENV, cap_db)
+            .env("LIBRA_TEST", "1")
+            .output()
+            .expect("spawn external RB-10f probe child");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() && stdout.contains(RB10F_OK_MARKER),
+            "RB-10f external probe `{mode}` failed (status={:?}):\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            output.status
+        );
+    }
+
+    struct ContinuousExternalProber {
+        mode: &'static str,
+        child: Option<Child>,
+        stdin: Option<ChildStdin>,
+        stdout: Option<BufReader<ChildStdout>>,
+    }
+
+    impl ContinuousExternalProber {
+        fn spawn(mode: &'static str, git_db: &Path, cap_db: &Path) -> Self {
+            let exe = std::env::current_exe().expect("locate current test executable");
+            let mut child = Command::new(exe)
+                .arg("--exact")
+                .arg("storage::migrate::tests::forward_phase1_external_os_process_blocked_through_backup_hash")
+                .arg("--nocapture")
+                .env(RB10F_PROBE_MODE_ENV, mode)
+                .env(RB10F_GIT_DB_ENV, git_db)
+                .env(RB10F_CAP_DB_ENV, cap_db)
+                .env("LIBRA_TEST", "1")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn continuous external OS prober");
+            let stdin = child.stdin.take().expect("capture prober stdin");
+            let stdout = child.stdout.take().expect("capture prober stdout");
+            let mut reader = BufReader::new(stdout);
+            let mut saw_ready = false;
+            let mut captured = String::new();
+            loop {
+                let mut line = String::new();
+                let n = reader.read_line(&mut line).expect("read prober stdout");
+                if n == 0 {
+                    break;
+                }
+                captured.push_str(&line);
+                if line.trim() == RB10F_READY_MARKER {
+                    saw_ready = true;
+                    break;
+                }
+            }
+            if !saw_ready {
+                let mut stderr_buf = String::new();
+                if let Some(mut se) = child.stderr.take() {
+                    let _ = se.read_to_string(&mut stderr_buf);
+                }
+                let status = child.wait().expect("wait failed prober");
+                panic!(
+                    "continuous prober `{mode}` failed before READY (status={status:?})\nstdout:\n{captured}\nstderr:\n{stderr_buf}"
+                );
+            }
+            Self {
+                mode,
+                child: Some(child),
+                stdin: Some(stdin),
+                stdout: Some(reader),
+            }
+        }
+
+        fn stop_and_assert_stats(mut self) -> (u64, u64) {
+            drop(self.stdin.take());
+            let mut tail = String::new();
+            if let Some(mut reader) = self.stdout.take() {
+                let _ = reader.read_to_string(&mut tail);
+            }
+            let output = self
+                .child
+                .take()
+                .expect("child present")
+                .wait_with_output()
+                .expect("wait continuous prober");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "continuous prober `{}` exited abnormally ({:?}) — lock leak detected!\nstdout:\n{tail}\nstderr:\n{stderr}",
+                self.mode,
+                output.status
+            );
+            let stats_line = tail
+                .lines()
+                .find(|l| l.starts_with("RB10F_STATS "))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "continuous prober `{}` missing RB10F_STATS line:\nstdout:\n{tail}\nstderr:\n{stderr}",
+                        self.mode
+                    )
+                });
+            let mut git_cnt = 0u64;
+            let mut cap_cnt = 0u64;
+            for tok in stats_line.split_whitespace().skip(1) {
+                if let Some(v) = tok.strip_prefix("git=") {
+                    git_cnt = v.parse::<u64>().expect("parse git probe count");
+                } else if let Some(v) = tok.strip_prefix("cap=") {
+                    cap_cnt = v.parse::<u64>().expect("parse cap probe count");
+                }
+            }
+            (git_cnt, cap_cnt)
+        }
+    }
+
+    impl Drop for ContinuousExternalProber {
+        fn drop(&mut self) {
+            drop(self.stdin.take());
+            drop(self.stdout.take());
+            if let Some(child) = self.child.as_mut()
+                && let Ok(None) = child.try_wait()
+            {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn forward_phase1_external_os_process_blocked_through_backup_hash() {
+        if let Some(mode) = std::env::var_os(RB10F_PROBE_MODE_ENV) {
+            let git_db = PathBuf::from(
+                std::env::var_os(RB10F_GIT_DB_ENV).expect("LIBRA_RB10F_GIT_DB must be set"),
+            );
+            let cap_db = PathBuf::from(
+                std::env::var_os(RB10F_CAP_DB_ENV).expect("LIBRA_RB10F_CAP_DB must be set"),
+            );
+            run_rb10f_external_probe_child(&mode.to_string_lossy(), &git_db, &cap_db).await;
+            return;
+        }
+
+        let dir = tempdir().expect("create RB-10f lock-retention tempdir");
+        let storage = dir.path().join(".libra");
+        let git_db = git_sqlite_db_path(&storage);
+        let cap_db = capture_sqlite_db_path(&storage);
+        fs::create_dir_all(storage.join(PRIVATE_SUBDIR)).expect("create private dir");
+
+        use crate::storage::SqliteCaptureStore;
+        populate_all_61_repository_tables(&git_db).await;
+        detach_inline_capture_tables(&git_db).await;
+        {
+            let _cap_store = SqliteCaptureStore::create(&cap_db)
+                .await
+                .expect("create VER3 Layout C capture.db");
+        }
+        populate_capture_rows_via_sql(&cap_db, 0, None).await;
+
+        // Add non-trivial rows into both `libra.db` and `capture.db` so Phase 1
+        // export, logical digest, `VACUUM INTO`, integrity check, and backup
+        // SHA-256 hashing run for substantial real wall time under continuous
+        // external OS read + write lock probing!
+        {
+            let mut gconn = SqliteConnection::connect_with(
+                &SqliteConnectOptions::new()
+                    .filename(&git_db)
+                    .create_if_missing(false)
+                    .read_only(false),
+            )
+            .await
+            .expect("open git_db for bulk seed");
+            gconn.execute("BEGIN;").await.expect("begin git bulk seed");
+            let pad = "G".repeat(4096);
+            for i in 0..250u32 {
+                sea_orm::sqlx::query(
+                    "INSERT INTO config_kv (key, value, encrypted) VALUES (?, ?, 0)",
+                )
+                .bind(format!("rb10f.lock.k-{i:04}"))
+                .bind(&pad)
+                .execute(&mut gconn)
+                .await
+                .expect("insert bulk git config_kv");
+            }
+            gconn
+                .execute("COMMIT;")
+                .await
+                .expect("commit git bulk seed");
+            gconn.close().await.expect("close git bulk seed");
+        }
+        {
+            let mut cconn = SqliteConnection::connect_with(
+                &SqliteConnectOptions::new()
+                    .filename(&cap_db)
+                    .create_if_missing(false)
+                    .read_only(false),
+            )
+            .await
+            .expect("open cap_db for bulk seed");
+            cconn.execute("BEGIN;").await.expect("begin cap bulk seed");
+            let intent_pad = "U".repeat(2048);
+            for i in 0..250u32 {
+                sea_orm::sqlx::query(
+                    "INSERT INTO agent_usage_stats (id, session_id, provider, model, request_kind, intent, prompt_tokens, completion_tokens, cached_tokens, reasoning_tokens, total_tokens, tool_call_count, wall_clock_ms, usage_estimated, success, schema_version, created_at) VALUES (?, 'sess-1', 'openai', 'gpt-5', 'chat', ?, 10, 20, 0, 0, 30, 1, 50, 0, 1, 1, '2026-11-24T09:10:00Z')",
+                )
+                .bind(format!("usage-rb10f-bulk-{i:04}"))
+                .bind(&intent_pad)
+                .execute(&mut cconn)
+                .await
+                .expect("insert bulk capture usage");
+            }
+            cconn
+                .execute("COMMIT;")
+                .await
+                .expect("commit cap bulk seed");
+            cconn.close().await.expect("close cap bulk seed");
+        }
+        switch_fixture_db_to_delete_mode(&git_db).await;
+        switch_fixture_db_to_delete_mode(&cap_db).await;
+
+        let spool_ready = capture_spool_dir_path(&storage).join(CAPTURE_SPOOL_READY_SUBDIR);
+        let spool_quarantine =
+            capture_spool_dir_path(&storage).join(CAPTURE_SPOOL_QUARANTINE_SUBDIR);
+        fs::create_dir_all(&spool_ready).expect("create spool ready");
+        fs::create_dir_all(&spool_quarantine).expect("create spool quarantine");
+        fs::write(
+            spool_ready.join("0001-locktest.json"),
+            build_spool_envelope_bytes(
+                "codex",
+                "codex",
+                "11111111-1111-4111-8111-111111111f99",
+                Some("dedup:rb10f:lock:1"),
+                "prov-rb10f-lock",
+                "/work/rb10f-lock",
+                &storage,
+                "session_start",
+                "2026-11-24T09:10:00.000Z",
+                "lock test payload",
+            ),
+        )
+        .expect("write spool ready file");
+        fs::write(spool_quarantine.join("q-lock.bin"), vec![0x5Au8; 64 * 1024])
+            .expect("write spool quarantine file");
+
+        let before_git_bytes = fs::read(&git_db).expect("snapshot live libra.db");
+        let before_cap_bytes = fs::read(&cap_db).expect("snapshot live capture.db");
+
+        // Acquire full Phase 1 quiescence (`c_mig` holding OS `EXCLUSIVE` locks).
+        let mut guard = quiesce_forward_repository_phase1(&storage)
+            .await
+            .expect("quiesce repo for cross-process lock proof");
+
+        // AC4 & AC5: Spawn TWO independent continuous OS child processes hammering
+        // BOTH live `libra.db` and `capture.db` with reads AND writes throughout
+        // the ENTIRE Phase 1 export -> logical digest -> VACUUM INTO -> integrity
+        // check -> backup SHA-256 hash -> spool backup pipeline!
+        let read_prober = ContinuousExternalProber::spawn("continuous_read_busy", &git_db, &cap_db);
+        let write_prober =
+            ContinuousExternalProber::spawn("continuous_write_busy", &git_db, &cap_db);
+
+        // Deterministic checkpoint 0: immediately after Phase 1 quiescence.
+        run_rb10f_single_probe("single_read_busy", &git_db, &cap_db);
+        run_rb10f_single_probe("single_write_busy", &git_db, &cap_db);
+
+        // Phase 1 streaming export to redb `.tmp` files — probe BOTH READ and
+        // WRITE from independent OS child processes actively DURING streaming export!
+        let mut export_in_stage_probes = 0usize;
+        let _export = export_forward_phase1_to_redb_tmp_with_observer(
+            &mut guard,
+            &storage,
+            1,
+            &mut |_source, _batch_len| {
+                if export_in_stage_probes < 2 {
+                    run_rb10f_single_probe("single_read_busy", &git_db, &cap_db);
+                    run_rb10f_single_probe("single_write_busy", &git_db, &cap_db);
+                    export_in_stage_probes = export_in_stage_probes.saturating_add(1);
+                }
+            },
+        )
+        .await
+        .expect("Phase 1 export under active external OS probes");
+        assert!(
+            export_in_stage_probes >= 2,
+            "expected >= 2 in-stage external OS read+write probes DURING export"
+        );
+
+        // Phase 1 logical digest + VACUUM INTO + integrity_check + backup_sha256 + spool backup:
+        // coordinate synchronous external OS child READ and WRITE probes actively
+        // DURING every single stage (while each cursor/verify_conn/hash-fd/copy-fd is open)!
+        let mut stages_seen: Vec<Phase1BackupHookStage> = Vec::new();
+        let mut stage_cb = |stage: Phase1BackupHookStage| {
+            run_rb10f_single_probe("single_read_busy", &git_db, &cap_db);
+            run_rb10f_single_probe("single_write_busy", &git_db, &cap_db);
+            stages_seen.push(stage);
+        };
+        let backup_report = create_forward_phase1_lock_safe_backups_with_hooks(
+            &mut guard,
+            &storage,
+            1,
+            Some(&mut stage_cb),
+            None,
+        )
+        .await
+        .expect("Phase 1 lock-safe backup under active external OS probes");
+
+        assert_eq!(
+            stages_seen,
+            vec![
+                Phase1BackupHookStage::GitLogicalDigestStreaming,
+                Phase1BackupHookStage::CapLogicalDigestStreaming,
+                Phase1BackupHookStage::GitBackupIntegrityCheck,
+                Phase1BackupHookStage::GitBackupHashing,
+                Phase1BackupHookStage::CapBackupIntegrityCheck,
+                Phase1BackupHookStage::CapBackupHashing,
+                Phase1BackupHookStage::SpoolBackupCopying,
+            ],
+            "every active Phase 1 backup stage (streaming digests, integrity checks, backup hashing, spool copying) must observe external OS read+write SQLITE_BUSY"
+        );
+
+        // Final deterministic checkpoint after backup_sha256 & spool backup while still locked.
+        run_rb10f_single_probe("single_read_busy", &git_db, &cap_db);
+        run_rb10f_single_probe("single_write_busy", &git_db, &cap_db);
+
+        // Stop continuous external OS probers and verify ZERO lock leaks across
+        // dozens of continuous read & write probes on both databases!
+        let (read_git_busy, read_cap_busy) = read_prober.stop_and_assert_stats();
+        let (write_git_busy, write_cap_busy) = write_prober.stop_and_assert_stats();
+        assert!(
+            read_git_busy >= 10 && read_cap_busy >= 10,
+            "continuous external read prober must exercise >= 10 SQLITE_BUSY probes on each live DB (got git={read_git_busy}, cap={read_cap_busy})"
+        );
+        assert!(
+            write_git_busy >= 10 && write_cap_busy >= 10,
+            "continuous external write prober must exercise >= 10 SQLITE_BUSY probes on each live DB (got git={write_git_busy}, cap={write_cap_busy})"
+        );
+
+        // Release Phase 1 locks and prove an external OS child can NOW read & write both DBs.
+        guard.close().await.expect("release Phase 1 locks");
+        run_rb10f_single_probe("verify_unlocked_rw", &git_db, &cap_db);
+
+        // Confirm live DBs remain byte-identical and both backups exist with valid hashes.
+        assert_eq!(
+            fs::read(&git_db).expect("post live libra.db"),
+            before_git_bytes
+        );
+        assert_eq!(
+            fs::read(&cap_db).expect("post live capture.db"),
+            before_cap_bytes
+        );
+        assert_eq!(backup_report.git_backup.backup_sha256.len(), 64);
+        assert_eq!(
+            backup_report
+                .capture_backup
+                .as_ref()
+                .expect("capture backup")
+                .backup_sha256
+                .len(),
+            64
+        );
+
+        // ------------------------------------------------------------------
+        // Part 2 (Unix POSIX fcntl lock-safety regression): Placing a hard link
+        // to live `libra.db` or `capture.db` inside `capture-spool/{ready,quarantine}/`
+        // must be rejected BEFORE `openat`/`close`, keeping the held OS
+        // `EXCLUSIVE` lock 100% intact for external OS readers & writers!
+        // ------------------------------------------------------------------
+        #[cfg(unix)]
+        for (target_is_git, subdir, link_name) in [
+            (
+                true,
+                CAPTURE_SPOOL_QUARANTINE_SUBDIR,
+                "evil-hardlink-live-git.db",
+            ),
+            (
+                false,
+                CAPTURE_SPOOL_READY_SUBDIR,
+                "evil-hardlink-live-cap.db",
+            ),
+        ] {
+            let hl_dir = tempdir().expect("create hard-link lock-safety tempdir");
+            let hl_storage = hl_dir.path().join(".libra");
+            let hl_git_db = git_sqlite_db_path(&hl_storage);
+            let hl_cap_db = capture_sqlite_db_path(&hl_storage);
+            fs::create_dir_all(hl_storage.join(PRIVATE_SUBDIR)).expect("create hl private dir");
+            populate_all_61_repository_tables(&hl_git_db).await;
+            detach_inline_capture_tables(&hl_git_db).await;
+            {
+                let _cap_store = SqliteCaptureStore::create(&hl_cap_db)
+                    .await
+                    .expect("create hl capture.db");
+            }
+            populate_capture_rows_via_sql(&hl_cap_db, 0, None).await;
+            switch_fixture_db_to_delete_mode(&hl_git_db).await;
+            switch_fixture_db_to_delete_mode(&hl_cap_db).await;
+
+            let hl_sub = capture_spool_dir_path(&hl_storage).join(subdir);
+            fs::create_dir_all(&hl_sub).expect("create hl spool subdir");
+            let live_target = if target_is_git {
+                &hl_git_db
+            } else {
+                &hl_cap_db
+            };
+            fs::hard_link(live_target, hl_sub.join(link_name))
+                .expect("create hard link to live sqlite db in spool");
+
+            let mut hl_guard = quiesce_forward_repository_phase1(&hl_storage)
+                .await
+                .expect("quiesce repo with hard-linked spool entry");
+            let err = create_forward_phase1_lock_safe_backups(&mut hl_guard, &hl_storage, 1)
+                .await
+                .expect_err("hard link to live SQLite DB inside capture-spool must fail closed");
+            assert_eq!(err.stable_code_str(), "LBR-IO-001");
+            assert!(
+                !sqlite_backup_dir_path(&hl_storage, 1).exists(),
+                "failed hard-link backup must clean up sqlite-backup/00000001"
+            );
+
+            // CRITICAL PROOF: While `hl_guard` is STILL held after the rejected
+            // spool entry, external OS read & write probes on BOTH live DBs must
+            // STILL receive 100% SQLITE_BUSY (zero POSIX fcntl lock release!).
+            run_rb10f_single_probe("single_read_busy", &hl_git_db, &hl_cap_db);
+            run_rb10f_single_probe("single_write_busy", &hl_git_db, &hl_cap_db);
+
+            hl_guard.close().await.expect("close hl guard");
+            run_rb10f_single_probe("verify_unlocked_rw", &hl_git_db, &hl_cap_db);
+        }
+
+        // Part 2b (Unix POSIX fcntl lock-safety regression for capture-queue
+        // `tail.meta` and `tail.meta.bak`): hard-linking EITHER metadata replica
+        // to live `libra.db` or `capture.db` must fail closed BEFORE `openat`,
+        // keeping the held OS `EXCLUSIVE` lock 100% intact for external OS
+        // readers & writers!
+        #[cfg(unix)]
+        for (target_is_git, lane_dir_name, meta_file_name) in [
+            (true, QUEUE_LANE_PRIORITY_DIR, QUEUE_TAIL_META_FILE),
+            (false, QUEUE_LANE_NORMAL_DIR, QUEUE_TAIL_META_BAK_FILE),
+        ] {
+            let hl_dir = tempdir().expect("create queue-meta hard-link tempdir");
+            let hl_storage = hl_dir.path().join(".libra");
+            let hl_git_db = git_sqlite_db_path(&hl_storage);
+            let hl_cap_db = capture_sqlite_db_path(&hl_storage);
+            fs::create_dir_all(hl_storage.join(PRIVATE_SUBDIR)).expect("create hl private dir");
+            populate_all_61_repository_tables(&hl_git_db).await;
+            detach_inline_capture_tables(&hl_git_db).await;
+            {
+                let _cap_store = SqliteCaptureStore::create(&hl_cap_db)
+                    .await
+                    .expect("create hl queue-meta capture.db");
+            }
+            populate_capture_rows_via_sql(&hl_cap_db, 0, None).await;
+            switch_fixture_db_to_delete_mode(&hl_git_db).await;
+            switch_fixture_db_to_delete_mode(&hl_cap_db).await;
+
+            crate::storage::queue::init_capture_queue(&hl_storage)
+                .expect("init capture queue for tail.meta hard-link test");
+            let lane_dir = capture_queue_dir_path(&hl_storage).join(lane_dir_name);
+            let meta_path = lane_dir.join(meta_file_name);
+            fs::remove_file(&meta_path).expect("remove original tail.meta replica");
+            let live_target = if target_is_git {
+                &hl_git_db
+            } else {
+                &hl_cap_db
+            };
+            fs::hard_link(live_target, &meta_path)
+                .expect("replace tail.meta replica with hard link to live sqlite db");
+
+            let mut hl_guard = quiesce_forward_repository_phase1(&hl_storage)
+                .await
+                .expect("quiesce repo with hard-linked queue tail metadata");
+            let err = create_forward_phase1_lock_safe_backups(&mut hl_guard, &hl_storage, 1)
+                .await
+                .expect_err("hard-linked queue tail.meta/tail.meta.bak must fail closed");
+            assert_eq!(err.stable_code_str(), "LBR-IO-001");
+            assert!(
+                !sqlite_backup_dir_path(&hl_storage, 1).exists(),
+                "failed queue-meta hard-link backup must clean up sqlite-backup/00000001"
+            );
+
+            // CRITICAL PROOF: While `hl_guard` is STILL held, external OS read
+            // & write probes on BOTH live DBs must STILL receive 100% SQLITE_BUSY!
+            run_rb10f_single_probe("single_read_busy", &hl_git_db, &hl_cap_db);
+            run_rb10f_single_probe("single_write_busy", &hl_git_db, &hl_cap_db);
+
+            hl_guard.close().await.expect("close queue-meta hl guard");
+            run_rb10f_single_probe("verify_unlocked_rw", &hl_git_db, &hl_cap_db);
+        }
     }
 }
