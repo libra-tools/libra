@@ -2597,7 +2597,7 @@ PY
 ### Task PM-31: `libra check-ignore --stdin` 逐行流式处理与 C 引号（#1035；自 PM-17 拆出）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-23：`--stdin` 走新的 `stream_stdin`——逐行/逐 NUL 记录读取，逐条判定并 `write_entry` + `flush`（`--json` 仍缓冲）；新增 `unquote_c_style`（C 引号含 `\a\b\f\n\r\t\v\\\"` 与八进制，非法输入 `LBR-CLI-002`）与 `quote_c_style`（仅需时加引号）；`-z -v` 把 source/line/pattern/path 作为四个 NUL 字段；渲染统一走 `write_entry`。AC1–AC2 由 `command::check_ignore_test::check_ignore_stdin_streams_each_line` 覆盖（stdin 保持打开、10 秒超时逐条读取），AC3–AC7 由 `check_ignore_stdin_c_quoting` 覆盖（解引号/按需加引号、两行 `::`、`"bad` 的 `LBR-CLI-002`、NUL 字段序列、流式首条）；`check_ignore_test` 17/17；`sh tests/NEXTEST_GROUPS.sh` 重跑无差异；EN/zh/开发文档与 `COMPATIBILITY.md` 的 `check-ignore` 行同步。
 **Description:** 自 `PM-17` 拆出：`--stdin` 改为逐行（或 `-z` 时逐 NUL 记录）读取，每读入一条即判定、写出并 flush，不再读到 EOF 才处理；非 `-z` 时以 `"` 开头的输入行按 Git C 引号规则解引号（不合法以 `LBR-CLI-002` 失败），输出路径按 `quote_c_style` 仅在需要时加引号；`-z` 时既不解引号也不加引号。
 **Out of scope:** 路径基准（`PM-17`）；`--quiet` 与 `-z` 规则（`PM-20`）；`check-attr --stdin` 的流式（尚未排期）。
 **Current evidence:**

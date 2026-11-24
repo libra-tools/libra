@@ -421,3 +421,167 @@ fn check_ignore_quiet_and_argument_rules() {
     assert!(out.status.success(), "AC7 exit");
     assert!(out.stdout.is_empty(), "AC7 stdout");
 }
+
+fn stream_repo() -> tempfile::TempDir {
+    let repo = tempdir().expect("failed to create repository root");
+    init_repo_via_cli(repo.path());
+    std::fs::write(repo.path().join(".gitignore"), "one\nignored-*\n").expect("root");
+    std::fs::create_dir_all(repo.path().join("a/b")).expect("mkdir");
+    std::fs::write(repo.path().join("a/.gitignore"), "two*\n*three\n").expect("a");
+    std::fs::write(repo.path().join("a/b/.gitignore"), "!on*\n!two\n").expect("a/b");
+    repo
+}
+
+/// Background reader: forwards each delimited field over a channel so the test
+/// can bound every read with a timeout while stdin stays open.
+fn spawn_field_reader(
+    stdout: std::process::ChildStdout,
+    delimiter: u8,
+) -> std::sync::mpsc::Receiver<Vec<u8>> {
+    use std::io::Read;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut stdout = stdout;
+        loop {
+            let mut field = Vec::new();
+            let mut byte = [0u8; 1];
+            loop {
+                match stdout.read(&mut byte) {
+                    Ok(0) => return,
+                    Ok(_) => {
+                        if byte[0] == delimiter {
+                            break;
+                        }
+                        field.push(byte[0]);
+                    }
+                    Err(_) => return,
+                }
+            }
+            if tx.send(field).is_err() {
+                return;
+            }
+        }
+    });
+    rx
+}
+
+/// PM-31: `--stdin` answers each record as soon as it arrives.
+#[test]
+fn check_ignore_stdin_streams_each_line() {
+    use std::io::Write;
+    use std::process::Stdio;
+    use std::time::Duration;
+
+    let repo = stream_repo();
+    let mut command =
+        super::base_libra_command(&["check-ignore", "-n", "-v", "--stdin"], repo.path());
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().expect("spawn check-ignore");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let fields = spawn_field_reader(child.stdout.take().expect("stdout"), b'\n');
+
+    stdin.write_all(b"one\n").expect("write one");
+    stdin.flush().expect("flush one");
+    let first = fields
+        .recv_timeout(Duration::from_secs(10))
+        .expect("AC1 streamed within 10s");
+    assert_eq!(
+        String::from_utf8_lossy(&first),
+        ".gitignore:1:one\tone",
+        "AC1"
+    );
+
+    stdin.write_all(b"two\n").expect("write two");
+    stdin.flush().expect("flush two");
+    let second = fields
+        .recv_timeout(Duration::from_secs(10))
+        .expect("AC2 streamed within 10s");
+    assert_eq!(String::from_utf8_lossy(&second), "::\ttwo", "AC2");
+
+    drop(stdin);
+    let _ = child.wait();
+}
+
+/// PM-31: C quoting on line input, and NUL fields for `-z -v`.
+#[test]
+fn check_ignore_stdin_c_quoting() {
+    use std::io::Write;
+    use std::process::Stdio;
+    use std::time::Duration;
+
+    let repo = stream_repo();
+    let stdin_text = "one\n\"a/b/one two\"\n\"a/b/one\\\"three\"\nnot-ignored\n\"a/space dir/x\"\n";
+    let out =
+        run_libra_command_with_stdin(&["check-ignore", "-v", "--stdin"], repo.path(), stdin_text);
+    assert_cli_success(&out, "AC3");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        ".gitignore:1:one\tone\n\
+a/b/.gitignore:1:!on*\t\"a/b/one two\"\n\
+a/b/.gitignore:1:!on*\t\"a/b/one\\\"three\"\n",
+        "AC3"
+    );
+
+    let out = run_libra_command_with_stdin(
+        &["check-ignore", "-v", "-n", "--stdin"],
+        repo.path(),
+        stdin_text,
+    );
+    assert_cli_success(&out, "AC4");
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    assert_eq!(text.matches("::\t").count(), 2, "AC4: {text}");
+
+    let out = run_libra_command_with_stdin(&["check-ignore", "--stdin"], repo.path(), "\"bad");
+    assert!(!out.status.success(), "AC5 must fail");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("LBR-CLI-002"),
+        "AC5 code"
+    );
+
+    // AC6: NUL fields, no quoting.
+    let out = run_libra_command_with_stdin(
+        &["check-ignore", "-z", "-v", "--stdin"],
+        repo.path(),
+        "one\0a/b/one\"x\0not-ignored\0",
+    );
+    assert_cli_success(&out, "AC6");
+    assert_eq!(
+        out.stdout,
+        [
+            b".gitignore\0".as_slice(),
+            b"1\0",
+            b"one\0",
+            b"one\0",
+            b"a/b/.gitignore\0",
+            b"1\0",
+            b"!on*\0",
+            b"a/b/one\"x\0",
+        ]
+        .concat(),
+        "AC6"
+    );
+
+    // AC7: the first match is streamed while stdin stays open.
+    let mut command =
+        super::base_libra_command(&["check-ignore", "-z", "-v", "--stdin"], repo.path());
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().expect("spawn");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let fields = spawn_field_reader(child.stdout.take().expect("stdout"), 0);
+    stdin.write_all(b"one\0").expect("write one");
+    stdin.flush().expect("flush one");
+    for expected in [".gitignore", "1", "one", "one"] {
+        let field = fields
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap_or_else(|_| panic!("AC7 field '{expected}' within 10s"));
+        assert_eq!(String::from_utf8_lossy(&field), expected, "AC7");
+    }
+    drop(stdin);
+    let _ = child.wait();
+}

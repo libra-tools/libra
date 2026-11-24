@@ -61,3 +61,5 @@
 - 2026-11-23（PM-17 / #1035）：`classify_path` 的相对路径基准由仓库根改为调用时 `current_dir()`，输出继续回显原始拼写；越界仍 `LBR-CLI-003`。回归：`check_ignore_resolves_paths_from_cwd`（AC1–AC4，cwd 为 `a/`）；`check_ignore_test` 14/14。
 
 - 2026-11-23（PM-20 / #1035）：新增前置校验——`-z` 需 `--stdin`、`--quiet` 多路径或与 `-v` 同用均 `LBR-CLI-002`；退出码在 `-v` 下改为「任一路径有命中规则」（含否定规则，`entry.source.is_some()`），`--quiet` 保持仅按 ignored 判定；既有 `z_uses_nul_delimiters` 改为经 `--stdin` + NUL 输入。回归：`check_ignore_quiet_and_argument_rules`（AC1–AC7）；`check_ignore_test` 15/15。
+
+- 2026-11-23（PM-31 / #1035）：`--stdin` 改为 `stream_stdin` 流式路径（逐行/逐 NUL 记录读取，逐条 `write_entry` + `flush`；`--json` 仍走缓冲路径）；新增 `unquote_c_style`（`\a\b\f\n\r\t\v\\\"` 与八进制，非法输入 `LBR-CLI-002`）与 `quote_c_style`（仅在含空白/引号/反斜杠/控制字符时加引号）；`-z -v` 输出四列各自 NUL 字段；渲染统一走 `write_entry`。回归：`check_ignore_stdin_streams_each_line`（AC1–AC2）、`check_ignore_stdin_c_quoting`（AC3–AC7）；`check_ignore_test` 17/17。

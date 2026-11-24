@@ -157,12 +157,6 @@ pub async fn execute_safe(args: CheckIgnoreArgs, output: &OutputConfig) -> CliRe
         );
     }
 
-    let paths = if args.stdin {
-        read_stdin_paths(args.null)?
-    } else {
-        args.pathspec.clone()
-    };
-
     let index = if args.no_index {
         None
     } else {
@@ -173,6 +167,16 @@ pub async fn execute_safe(args: CheckIgnoreArgs, output: &OutputConfig) -> CliRe
     };
 
     let workdir = util::working_dir();
+
+    if args.stdin && !output.is_json() {
+        return stream_stdin(&args, output, &workdir, index.as_ref());
+    }
+
+    let paths = if args.stdin {
+        read_stdin_paths(args.null)?
+    } else {
+        args.pathspec.clone()
+    };
 
     let mut results = Vec::with_capacity(paths.len());
     for path_str in paths {
@@ -294,6 +298,196 @@ fn display_source(source: &Path, workdir: &Path) -> String {
         .into_owned()
 }
 
+/// Stream `--stdin` records: read one record, classify, write and flush, so a
+/// producer that keeps stdin open sees each answer immediately (Git's
+/// `maybe_flush_or_die` behaviour). `-z` records are NUL-delimited and never
+/// C-(un)quoted; line records starting with `"` are C-unquoted and outputs are
+/// C-quoted only when the path needs it.
+fn stream_stdin(
+    args: &CheckIgnoreArgs,
+    output: &OutputConfig,
+    workdir: &Path,
+    index: Option<&Index>,
+) -> CliResult<()> {
+    use std::io::{BufRead, Write};
+
+    let stdin = io::stdin();
+    let mut reader = stdin.lock();
+    let stdout = io::stdout();
+    let mut writer = stdout.lock();
+    let mut any_match = false;
+
+    loop {
+        let mut buffer = Vec::new();
+        let delimiter = if args.null { 0u8 } else { b'\n' };
+        let read = reader
+            .read_until(delimiter, &mut buffer)
+            .map_err(|error| CliError::io(format!("failed to read stdin: {error}")))?;
+        if read == 0 {
+            break;
+        }
+        if buffer.last() == Some(&delimiter) {
+            buffer.pop();
+        }
+        if !args.null && buffer.last() == Some(&b'\r') {
+            buffer.pop();
+        }
+        if buffer.is_empty() {
+            continue;
+        }
+        let raw = String::from_utf8_lossy(&buffer).into_owned();
+        let path_str = if args.null {
+            raw
+        } else if raw.starts_with('"') {
+            unquote_c_style(&raw)?
+        } else {
+            raw
+        };
+        let entry = classify_path(&path_str, workdir, index)?;
+        if entry.ignored || (args.verbose && entry.source.is_some()) {
+            any_match = true;
+        }
+        if !output.quiet {
+            write_entry(&mut writer, args, &entry, args.null)?;
+            writer
+                .flush()
+                .map_err(|error| CliError::io(format!("failed to flush output: {error}")))?;
+        }
+    }
+
+    if any_match {
+        Ok(())
+    } else {
+        Err(CliError::silent_exit(1))
+    }
+}
+
+/// C-style unquote for a `"..."` record (Git's `unquote_c_style`).
+fn unquote_c_style(input: &str) -> CliResult<String> {
+    let bad = || {
+        CliError::command_usage(format!("line is badly quoted: {input}"))
+            .with_stable_code(StableErrorCode::CliInvalidArguments)
+    };
+    let mut chars = input.char_indices();
+    let Some((_, '"')) = chars.next() else {
+        return Err(bad());
+    };
+    let mut out = String::new();
+    while let Some((index, ch)) = chars.next() {
+        match ch {
+            '"' => {
+                if index + 1 != input.len() {
+                    return Err(bad());
+                }
+                return Ok(out);
+            }
+            '\\' => {
+                let Some((_, escaped)) = chars.next() else {
+                    return Err(bad());
+                };
+                out.push(match escaped {
+                    'a' => '\x07',
+                    'b' => '\x08',
+                    'f' => '\x0c',
+                    'n' => '\n',
+                    'r' => '\r',
+                    't' => '\t',
+                    'v' => '\x0b',
+                    '\\' => '\\',
+                    '"' => '"',
+                    '0'..='7' => {
+                        let mut value = escaped.to_digit(8).unwrap_or(0);
+                        for _ in 0..2 {
+                            let Some((_, digit)) = chars.clone().next() else {
+                                break;
+                            };
+                            let Some(d) = digit.to_digit(8) else { break };
+                            chars.next();
+                            value = value * 8 + d;
+                        }
+                        char::from_u32(value).unwrap_or('\0')
+                    }
+                    _ => return Err(bad()),
+                });
+            }
+            other => out.push(other),
+        }
+    }
+    Err(bad())
+}
+
+/// Quote a path for terminal output only when needed (Git's `quote_c_style`).
+fn quote_c_style(path: &str) -> String {
+    let needs_quotes = path
+        .chars()
+        .any(|ch| ch <= ' ' || ch == '"' || ch == '\\' || ch == '\x7f');
+    if !needs_quotes {
+        return path.to_string();
+    }
+    let mut out = String::with_capacity(path.len() + 2);
+    out.push('"');
+    for ch in path.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\x07' => out.push_str("\\a"),
+            '\x08' => out.push_str("\\b"),
+            '\x0c' => out.push_str("\\f"),
+            '\x0b' => out.push_str("\\v"),
+            other => out.push(other),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn write_entry<W: Write>(
+    writer: &mut W,
+    args: &CheckIgnoreArgs,
+    entry: &CheckIgnoreEntry,
+    null: bool,
+) -> CliResult<()> {
+    let terminator = if null { '\0' } else { '\n' };
+    if args.verbose {
+        let matched = entry.pattern.is_some() || entry.source.is_some() || entry.ignored;
+        if !matched && !args.non_matching {
+            return Ok(());
+        }
+        let quoted = |value: &str| {
+            if null {
+                value.to_string()
+            } else {
+                quote_c_style(value)
+            }
+        };
+        let source = entry.source.as_deref().map(quoted).unwrap_or_default();
+        let line = entry.line.map(|l| l.to_string()).unwrap_or_default();
+        let pattern = entry.pattern.as_deref().map(quoted).unwrap_or_default();
+        let path = quoted(&entry.path);
+        if null {
+            // Git's `-z -v`: the four columns are NUL-terminated fields.
+            write!(writer, "{source}\0{line}\0{pattern}\0{path}\0")
+                .map_err(|error| CliError::io(format!("failed to write output: {error}")))
+        } else {
+            write!(writer, "{source}:{line}:{pattern}\t{path}{terminator}")
+                .map_err(|error| CliError::io(format!("failed to write output: {error}")))
+        }
+    } else if entry.ignored {
+        let path = if null {
+            entry.path.clone()
+        } else {
+            quote_c_style(&entry.path)
+        };
+        write!(writer, "{path}{terminator}")
+            .map_err(|error| CliError::io(format!("failed to write output: {error}")))
+    } else {
+        Ok(())
+    }
+}
+
 /// Upper bound on `--stdin` input (64 MiB). A pathname list this large is
 /// pathological; bounding the read avoids an unbounded-memory DoS on malformed
 /// or hostile input.
@@ -360,53 +554,10 @@ fn render(
 
     let stdout = io::stdout();
     let mut writer = stdout.lock();
-    let terminator = if args.null { '\0' } else { '\n' };
-
     for entry in results {
-        if args.verbose {
-            // Verbose: emit a line for matched paths, and (with -n) also for
-            // non-matching ones with empty source/line/pattern fields.
-            let matched = entry.pattern.is_some() || entry.source.is_some() || entry.ignored;
-            if !matched && !args.non_matching {
-                continue;
-            }
-            write_verbose(&mut writer, entry, args.null, terminator)?;
-        } else {
-            // Default: only the paths that are ignored.
-            if entry.ignored {
-                write!(writer, "{}{terminator}", entry.path)
-                    .map_err(|error| CliError::io(format!("failed to write output: {error}")))?;
-            }
-        }
+        write_entry(&mut writer, args, entry, args.null)?;
     }
     Ok(())
-}
-
-/// Write one `-v` record. Without `-z`: `<source>:<line>:<pattern>\t<path>`.
-/// With `-z`: the four fields separated by NUL and a trailing NUL.
-fn write_verbose(
-    writer: &mut impl Write,
-    entry: &CheckIgnoreEntry,
-    null: bool,
-    terminator: char,
-) -> CliResult<()> {
-    let source = entry.source.as_deref().unwrap_or("");
-    let line = entry.line.map(|n| n.to_string()).unwrap_or_default();
-    let pattern = entry.pattern.as_deref().unwrap_or("");
-    let result = if null {
-        write!(
-            writer,
-            "{source}\0{line}\0{pattern}\0{}{terminator}",
-            entry.path
-        )
-    } else {
-        write!(
-            writer,
-            "{source}:{line}:{pattern}\t{}{terminator}",
-            entry.path
-        )
-    };
-    result.map_err(|error| CliError::io(format!("failed to write output: {error}")))
 }
 
 fn clone_entry(entry: &CheckIgnoreEntry) -> CheckIgnoreEntry {
