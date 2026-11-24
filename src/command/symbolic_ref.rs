@@ -3,6 +3,7 @@
 use std::io::Write;
 
 use clap::Parser;
+use sea_orm::{ConnectionTrait, Statement};
 use serde::Serialize;
 
 use crate::{
@@ -102,6 +103,9 @@ async fn run_symbolic_ref(
     let name = args.name.as_deref().unwrap_or(HEAD_REF);
     if let Some(remote) = remote_head_remote(name) {
         return run_remote_head(args, name, remote).await;
+    }
+    if let Some(branch) = name.strip_prefix(HEADS_PREFIX) {
+        return run_local_symref(args, name, branch).await;
     }
     if args.delete {
         // ADR-PL-08: `-d` is accepted for git parity and never deletes
@@ -223,6 +227,134 @@ async fn run_remote_head(
         short,
         action: "read",
     })
+}
+
+/// Read, write or delete `refs/heads/<branch>` symbolic references stored in
+/// the `symbolic_ref` table (PM-01). Creating one refuses a branch that already
+/// has a local entity row; the migration's triggers are the second line of
+/// defence.
+async fn run_local_symref(
+    args: &SymbolicRefArgs,
+    name: &str,
+    branch: &str,
+) -> CliResult<SymbolicRefOutput> {
+    if !is_valid_git_branch_name(branch) {
+        return Err(CliError::failure(format!(
+            "invalid branch name '{branch}' in symbolic ref '{name}'"
+        ))
+        .with_stable_code(StableErrorCode::CliInvalidTarget));
+    }
+    let db = crate::internal::db::get_db_conn_instance().await;
+    if args.delete {
+        let deleted = db
+            .execute_raw(Statement::from_sql_and_values(
+                db.get_database_backend(),
+                "DELETE FROM symbolic_ref WHERE name = ?",
+                [name.into()],
+            ))
+            .await
+            .map_err(|error| db_error("delete", name, error))?;
+        if deleted.rows_affected() == 0 {
+            // Keep Git's delete wording and exit code for a ref that exists as
+            // an entity branch (or not at all): `Cannot delete <name>, not a
+            // symbolic ref` (128).
+            return Err(
+                CliError::fatal(format!("Cannot delete {name}, not a symbolic ref"))
+                    .with_exit_code(128)
+                    .with_stable_code(StableErrorCode::CliInvalidTarget),
+            );
+        }
+        return Ok(SymbolicRefOutput {
+            name: name.to_string(),
+            target: String::new(),
+            short: None,
+            action: "delete",
+        });
+    }
+    if let Some(target) = args.target.as_deref() {
+        validate_symref_target(target)?;
+        let txn = crate::internal::db::begin_write_transaction(&db)
+            .await
+            .map_err(|error| db_error("write", name, error))?;
+        let entity =
+            crate::internal::branch::Branch::find_branch_result_with_conn(&txn, branch, None)
+                .await
+                .map_err(map_head_error)?;
+        if entity.is_some() {
+            return Err(CliError::failure(format!(
+                "cannot create symbolic ref '{name}': local branch '{branch}' already exists"
+            ))
+            .with_stable_code(StableErrorCode::CliInvalidTarget));
+        }
+        txn.execute_raw(Statement::from_sql_and_values(
+            txn.get_database_backend(),
+            "INSERT INTO symbolic_ref (name, target) VALUES (?, ?) \
+             ON CONFLICT(name) DO UPDATE SET target = excluded.target",
+            [name.into(), target.into()],
+        ))
+        .await
+        .map_err(|error| db_error("write", name, error))?;
+        txn.commit()
+            .await
+            .map_err(|error| db_error("write", name, error))?;
+        return Ok(SymbolicRefOutput {
+            name: name.to_string(),
+            target: target.to_string(),
+            short: Some(branch.to_string()),
+            action: "set",
+        });
+    }
+    let target = query_symref_target(name)
+        .await
+        .map_err(|error| db_error("read", name, error))?
+        .ok_or_else(|| not_symbolic(name))?;
+    Ok(SymbolicRefOutput {
+        name: name.to_string(),
+        target,
+        short: Some(branch.to_string()),
+        action: "read",
+    })
+}
+
+async fn query_symref_target(name: &str) -> Result<Option<String>, sea_orm::DbErr> {
+    let db = crate::internal::db::get_db_conn_instance().await;
+    let row = db
+        .query_one_raw(Statement::from_sql_and_values(
+            db.get_database_backend(),
+            "SELECT target FROM symbolic_ref WHERE name = ? LIMIT 1",
+            [name.into()],
+        ))
+        .await?;
+    Ok(row.and_then(|row| row.try_get::<String>("", "target").ok()))
+}
+
+fn validate_symref_target(target: &str) -> CliResult<()> {
+    let branch = if let Some(branch) = target.strip_prefix(HEADS_PREFIX) {
+        Some(branch)
+    } else {
+        target
+            .strip_prefix(REMOTES_PREFIX)
+            .and_then(|rest| rest.split_once('/'))
+            .filter(|(remote, _)| !remote.is_empty())
+            .map(|(_, branch)| branch)
+    };
+    match branch {
+        Some(branch) if is_valid_git_branch_name(branch) => Ok(()),
+        _ => Err(CliError::failure(format!(
+            "invalid symbolic ref target '{target}': expected refs/heads/<branch> or refs/remotes/<remote>/<branch>"
+        ))
+        .with_stable_code(StableErrorCode::CliInvalidTarget)),
+    }
+}
+
+fn not_symbolic(name: &str) -> CliError {
+    CliError::failure(format!("{name} is not a symbolic ref"))
+        .with_stable_code(StableErrorCode::CliInvalidTarget)
+}
+
+fn db_error(action: &str, name: &str, error: sea_orm::DbErr) -> CliError {
+    CliError::fatal(format!("failed to {action} symbolic ref '{name}': {error}"))
+        .with_stable_code(StableErrorCode::IoWriteFailed)
 }
 
 fn validate_name(name: &str) -> CliResult<()> {

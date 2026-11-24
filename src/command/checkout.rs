@@ -564,7 +564,10 @@ async fn run_checkout(
     }
 
     let target_commit = if let Some(ref branch_name) = args.branch {
-        if let Some(branch) = Branch::find_branch_result(branch_name, None)
+        // PM-21a: a `refs/heads/<name>` symbolic ref resolves to its (one-level)
+        // target's commit; the entity-branch decision below stays unchanged, so
+        // such a name still checks out detached.
+        if let Some(branch) = Branch::find_branch_or_symref_result(branch_name, None)
             .await
             .map_err(|error| map_checkout_branch_store_error("resolve checkout target", error))?
         {

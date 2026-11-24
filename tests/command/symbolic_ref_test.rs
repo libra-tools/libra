@@ -227,6 +227,23 @@ fn symbolic_ref_delete_matrix() {
         );
     }
 
+    // PM-21a: make `main` a real entity branch row before the refused delete,
+    // and prove the reference table is untouched by it.
+    run_libra_command(&["config", "set", "user.name", "t"], root);
+    run_libra_command(&["config", "set", "user.email", "t@t"], root);
+    std::fs::write(root.join("seed.txt"), "seed\n").expect("write seed file");
+    assert_cli_success(&run_libra_command(&["add", "seed.txt"], root), "add seed");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "seed", "--no-verify"], root),
+        "commit seed",
+    );
+    let snapshot = |root: &std::path::Path| -> String {
+        let out = run_libra_command(&["show-ref"], root);
+        assert_cli_success(&out, "show-ref snapshot");
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+    let refs_before = snapshot(root);
+
     // S3: a branch ref name gets the "not a symbolic ref" form (128).
     let branch = run_libra_command(&["symbolic-ref", "-d", "refs/heads/main"], root);
     assert_eq!(branch.status.code(), Some(128));
@@ -235,6 +252,11 @@ fn symbolic_ref_delete_matrix() {
             .contains("Cannot delete refs/heads/main, not a symbolic ref"),
         "branch-name message: {}",
         String::from_utf8_lossy(&branch.stderr)
+    );
+    assert_eq!(
+        snapshot(root),
+        refs_before,
+        "refs unchanged by the refused delete"
     );
 
     // S2: an arbitrary name gets the same form.
@@ -347,4 +369,123 @@ fn symbolic_ref_remote_head_read_write_delete() {
             "{target} code"
         );
     }
+}
+
+#[test]
+fn symbolic_ref_heads_symref_read_write_delete() {
+    let repo = tempdir().expect("failed to create repository root");
+    init_repo_via_cli(repo.path());
+    run_libra_command(&["config", "set", "user.name", "t"], repo.path());
+    run_libra_command(&["config", "set", "user.email", "t@t"], repo.path());
+    std::fs::write(repo.path().join("f.txt"), "a\n").expect("write fixture");
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], repo.path()), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c1", "--no-verify"], repo.path()),
+        "commit",
+    );
+
+    // Set a `refs/heads/*` symbolic ref to a local entity branch.
+    assert_cli_success(
+        &run_libra_command(
+            &["symbolic-ref", "refs/heads/a-branch", "refs/heads/main"],
+            repo.path(),
+        ),
+        "set symref",
+    );
+    let read = run_libra_command(&["symbolic-ref", "refs/heads/a-branch"], repo.path());
+    assert_cli_success(&read, "read symref");
+    assert_eq!(String::from_utf8_lossy(&read.stdout), "refs/heads/main\n");
+    let short = run_libra_command(
+        &["symbolic-ref", "--short", "refs/heads/a-branch"],
+        repo.path(),
+    );
+    assert_cli_success(&short, "short symref");
+    assert_eq!(String::from_utf8_lossy(&short.stdout), "a-branch\n");
+
+    // Updating retargets the row.
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "symbolic-ref",
+                "refs/heads/a-branch",
+                "refs/remotes/origin/branch1",
+            ],
+            repo.path(),
+        ),
+        "retarget symref",
+    );
+    let reread = run_libra_command(&["symbolic-ref", "refs/heads/a-branch"], repo.path());
+    assert_cli_success(&reread, "reread symref");
+    assert_eq!(
+        String::from_utf8_lossy(&reread.stdout),
+        "refs/remotes/origin/branch1\n"
+    );
+
+    // An existing entity branch cannot become a symbolic ref.
+    let collision = run_libra_command(
+        &["symbolic-ref", "refs/heads/main", "refs/heads/main"],
+        repo.path(),
+    );
+    assert!(!collision.status.success(), "entity collision must fail");
+    assert!(
+        String::from_utf8_lossy(&collision.stderr).contains("LBR-CLI-003"),
+        "collision code"
+    );
+
+    // Only refs/heads and refs/remotes targets are accepted.
+    for target in ["refs/tags/v1", "refs/heads/a..b"] {
+        let bad = run_libra_command(&["symbolic-ref", "refs/heads/zz", target], repo.path());
+        assert!(!bad.status.success(), "{target} must fail");
+        assert!(
+            String::from_utf8_lossy(&bad.stderr).contains("LBR-CLI-003"),
+            "{target} code"
+        );
+    }
+
+    // Delete removes the row; a later read fails.
+    assert_cli_success(
+        &run_libra_command(&["symbolic-ref", "-d", "refs/heads/a-branch"], repo.path()),
+        "delete symref",
+    );
+    let after = run_libra_command(&["symbolic-ref", "refs/heads/a-branch"], repo.path());
+    assert!(!after.status.success(), "read after delete must fail");
+    assert!(
+        String::from_utf8_lossy(&after.stderr).contains("LBR-CLI-003"),
+        "read-after-delete code"
+    );
+}
+
+#[test]
+fn checkout_resolves_a_refs_heads_symref_twice() {
+    let repo = tempdir().expect("failed to create repository root");
+    init_repo_via_cli(repo.path());
+    run_libra_command(&["config", "set", "user.name", "t"], repo.path());
+    run_libra_command(&["config", "set", "user.email", "t@t"], repo.path());
+    std::fs::write(repo.path().join("f.txt"), "a\n").expect("write fixture");
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], repo.path()), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c1", "--no-verify"], repo.path()),
+        "commit",
+    );
+    let head =
+        String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], repo.path()).stdout)
+            .trim()
+            .to_string();
+    assert_cli_success(
+        &run_libra_command(
+            &["symbolic-ref", "refs/heads/a-branch", "refs/heads/main"],
+            repo.path(),
+        ),
+        "set symref",
+    );
+
+    for attempt in 1..=2 {
+        let out = run_libra_command(&["checkout", "-f", "a-branch"], repo.path());
+        assert_cli_success(&out, &format!("checkout #{attempt}"));
+        let status = run_libra_command(&["status", "--branch", "--short"], repo.path());
+        let text = String::from_utf8_lossy(&status.stdout).to_string();
+        assert!(text.contains("HEAD (detached"), "attempt {attempt}: {text}");
+    }
+    let resolved = run_libra_command(&["rev-parse", "HEAD"], repo.path());
+    assert_eq!(String::from_utf8_lossy(&resolved.stdout).trim(), head);
 }

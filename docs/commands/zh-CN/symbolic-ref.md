@@ -17,7 +17,9 @@ libra symbolic-ref HEAD refs/heads/<branch>
 
 更新形式成功时不会产生人类可读输出。
 
-`refs/remotes/<remote>/HEAD` 是 Libra 唯一支持的非本地符号引用：读取时打印 `refs/remotes/<remote>/<branch>`（该行不存在时以 `LBR-CLI-003` 失败）；写入只接受**同一远端**下的目标 `refs/remotes/<remote>/<branch>`，其它远端或 `refs/heads/*` 以 `LBR-CLI-003` 拒绝（有意差异——该行存的是分支名而非完整引用）；`-d` 删除该行。
+`refs/heads/<branch>` 形态的名字存于 Repository 的 `symbolic_ref` 表（PM-01）：读取输出完整目标；写入只接受 `refs/heads/<branch>` 或 `refs/remotes/<remote>/<branch>`（目标可为悬空），同名本地实体分支已存在时以 `LBR-CLI-003` 拒绝；`-d` 删除该行；其它命名空间以 `LBR-CLI-003` 拒绝。`libra checkout -f <symref-branch>` 会把 `refs/heads/*` 符号引用解析一层到其目标的提交并以分离 HEAD 检出（Libra 的 `HEAD` 只能附着本地实体分支，属有意差异）；目标本身仍是符号引用时按"分支不存在"处理（链式解析延后）。
+
+`refs/remotes/<remote>/HEAD` 是 Libra 支持的另一类非本地符号引用：读取时打印 `refs/remotes/<remote>/<branch>`（该行不存在时以 `LBR-CLI-003` 失败）；写入只接受**同一远端**下的目标 `refs/remotes/<remote>/<branch>`，其它远端或 `refs/heads/*` 以 `LBR-CLI-003` 拒绝（有意差异——该行存的是分支名而非完整引用）；`-d` 删除该行。
 
 ## 选项
 

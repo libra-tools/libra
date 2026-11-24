@@ -63,3 +63,5 @@ flowchart TD
 - 新增 Git 兼容参数时必须明确 tier、错误码、JSON/机器输出契约和回归测试。
 
 - 2026-11-23（PM-32 / #711）：支持 `refs/remotes/<remote>/HEAD` 的读/写/删除——`remote_head_remote` 解析名称，`run_remote_head` 读（`Head::remote_current_result`）、写（仅同远端 `refs/remotes/<remote>/<branch>`，否则 `LBR-CLI-003`）、删（新增 `Head::delete_remote_head`，事务内 `delete_many`）。回归：`command::symbolic_ref_test::symbolic_ref_remote_head_read_write_delete`（AC1–AC5）。
+
+- 2026-11-23（PM-21a / #711）：`refs/heads/<branch>` 读写删除落在 `symbolic_ref` 表（`run_local_symref`，同一写事务内先查同名实体分支，触发器为第二道防线；目标仅接受 `refs/heads/*` 或 `refs/remotes/<remote>/*`，非法分支名 `LBR-CLI-003`；`-d` 未命中沿用 Git 的 `Cannot delete <name>, not a symbolic ref` + 128）。新增 `Branch::find_branch_or_symref_result[_with_conn]`（只解析一层），`checkout` 的目标解析改用它，`-f <symref-branch>` 连续两次检出一致（分离 HEAD）。回归：`symbolic_ref_heads_symref_read_write_delete`、`checkout_resolves_a_refs_heads_symref_twice`；加强 `symbolic_ref_delete_matrix`（先提交使 `main` 成为实体分支行，`-d refs/heads/main` 前后 `show-ref` 快照相等）。

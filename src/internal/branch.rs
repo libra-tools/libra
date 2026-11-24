@@ -23,7 +23,7 @@ use std::time::Duration;
 use git_internal::hash::ObjectHash;
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, DbErr, EntityTrait,
-    QueryFilter,
+    QueryFilter, Statement,
 };
 use tokio::time::sleep;
 
@@ -250,6 +250,20 @@ fn branch_from_model(model: reference::Model) -> Result<Option<Branch>, BranchSt
 /// - Filters explicitly on `kind = Branch` so tag/HEAD rows cannot be returned.
 /// - When `remote` is `None`, filters on `remote IS NULL` (local branch).
 /// - Returns `Ok(None)` if no row matches.
+async fn query_symbolic_ref_target<C>(db: &C, name: &str) -> Result<Option<String>, sea_orm::DbErr>
+where
+    C: ConnectionTrait,
+{
+    let row = db
+        .query_one_raw(Statement::from_sql_and_values(
+            db.get_database_backend(),
+            "SELECT target FROM symbolic_ref WHERE name = ? LIMIT 1",
+            [name.into()],
+        ))
+        .await?;
+    Ok(row.and_then(|row| row.try_get::<String>("", "target").ok()))
+}
+
 async fn query_reference_with_conn<C>(
     db: &C,
     branch_name: &str,
@@ -441,6 +455,55 @@ impl Branch {
             Some(branch) => branch_from_model(branch),
             None => Ok(None),
         }
+    }
+
+    /// Branch lookup that falls back to a one-level `refs/heads/<name>`
+    /// symbolic reference (`symbolic_ref`), used only by `checkout`.
+    ///
+    /// The symbol's target must be a local entity branch or a remote-tracking
+    /// branch; a target that is itself symbolic is treated as missing (chain
+    /// resolution is deferred to `DEFER-PM-02`).
+    pub async fn find_branch_or_symref_result_with_conn<C>(
+        db: &C,
+        branch_name: &str,
+        remote: Option<&str>,
+    ) -> Result<Option<Self>, BranchStoreError>
+    where
+        C: ConnectionTrait,
+    {
+        if let Some(branch) = Self::find_branch_result_with_conn(db, branch_name, remote).await? {
+            return Ok(Some(branch));
+        }
+        if remote.is_some() {
+            return Ok(None);
+        }
+        let Some(target) = query_symbolic_ref_target(db, &format!("refs/heads/{branch_name}"))
+            .await
+            .map_err(|err| BranchStoreError::Query(err.to_string()))?
+        else {
+            return Ok(None);
+        };
+        if let Some(local) = target.strip_prefix("refs/heads/") {
+            return Self::find_branch_result_with_conn(db, local, None).await;
+        }
+        if let Some(rest) = target.strip_prefix("refs/remotes/") {
+            let Some((target_remote, target_branch)) = rest.split_once('/') else {
+                return Ok(None);
+            };
+            return Self::find_branch_result_with_conn(db, target_branch, Some(target_remote))
+                .await;
+        }
+        Ok(None)
+    }
+
+    /// Pool-acquiring counterpart of
+    /// [`Branch::find_branch_or_symref_result_with_conn`].
+    pub async fn find_branch_or_symref_result(
+        branch_name: &str,
+        remote: Option<&str>,
+    ) -> Result<Option<Self>, BranchStoreError> {
+        let db_conn = get_db_conn_instance().await;
+        Self::find_branch_or_symref_result_with_conn(&db_conn, branch_name, remote).await
     }
 
     /// Pool-acquiring counterpart of [`Branch::find_branch_result_with_conn`].

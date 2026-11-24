@@ -23,7 +23,17 @@ through the normal structured error contract.
 
 The update form is silent in human output when it succeeds.
 
-`refs/remotes/<remote>/HEAD` is the one non-local symbolic ref Libra does support:
+`refs/heads/<branch>` names are stored in the Repository `symbolic_ref` table
+(PM-01). Reading prints the full target; writing accepts only
+`refs/heads/<branch>` or `refs/remotes/<remote>/<branch>` (the target may be
+dangling) and refuses a name that already has a local entity branch with
+`LBR-CLI-003`; `-d` deletes the row. Other namespaces are refused with
+`LBR-CLI-003`. `libra checkout -f <symref-branch>` resolves a `refs/heads/*`
+symbolic ref one level to its target's commit and checks it out detached (Libra
+`HEAD` only attaches to local entity branches — an intentional difference); a
+target that is itself symbolic counts as missing (chain resolution is deferred).
+
+`refs/remotes/<remote>/HEAD` is the other non-local symbolic ref Libra supports:
 reading it prints `refs/remotes/<remote>/<branch>` (or fails with `LBR-CLI-003`
 when the row is absent), writing accepts only a target under the *same* remote
 (`refs/remotes/<remote>/<branch>`) and rejects other remotes or `refs/heads/*`
