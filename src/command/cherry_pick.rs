@@ -693,7 +693,7 @@ pub struct CherryPickArgs {
     /// Resume the in-progress cherry-pick after resolving conflicts
     #[clap(
         long = "continue",
-        conflicts_with_all = ["commits", "skip", "abort", "quit", "no_commit", "keep_redundant_commits"]
+        conflicts_with_all = ["commits", "skip", "abort", "quit", "no_commit", "keep_redundant_commits", "rerere_autoupdate", "no_rerere_autoupdate"]
     )]
     pub continue_pick: bool,
 

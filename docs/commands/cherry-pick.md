@@ -53,6 +53,12 @@ linear history) and is replayed as a sequence. A stop inside the range reports
 the expanded commit, and `--continue` finalizes the resolved index as that
 commit. `A...B` and other revision syntaxes remain unsupported.
 
+`--rerere-autoupdate` / `--no-rerere-autoupdate` select the rerere staging
+policy for every pick, including picks expanded from a range: with
+`rerere.enabled` set, a conflict whose resolution was recorded earlier is
+replayed and (with autoupdate) staged automatically. Neither toggle can be
+combined with `--continue` (`LBR-CLI-002`, naming both options).
+
 ## Options
 
 When `core.sparseCheckout=true` this command fails closed with `LBR-UNSUPPORTED-001`: it would rewrite the working tree (or the index/stash) around the whole tree instead of the sparse view (sparse cone materialisation is not implemented yet).

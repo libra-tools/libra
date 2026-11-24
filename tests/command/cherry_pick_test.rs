@@ -5103,3 +5103,115 @@ fn sequence_current_oid(repo: &std::path::Path) -> Option<String> {
         row.and_then(|row| row.try_get::<String>("", "current_oid").ok())
     })
 }
+
+/// Build the `t3504` rerere fixture and pre-record the `foo` resolution.
+/// Returns (repo, foo_oid, foo_main_oid, bar_main_oid).
+fn rerere_range_fixture() -> (tempfile::TempDir, String, String, String) {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "rerere.enabled", "true"], p),
+        "rerere",
+    );
+    std::fs::write(p.join("foo"), "foo\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "foo"], p), "add foo");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "foo", "--no-verify"], p),
+        "foo",
+    );
+    let foo = cp_rev_parse(p, "HEAD");
+    std::fs::write(p.join("foo"), "foo-main\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "foo"], p), "add foo-main");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "foo-main", "--no-verify"], p),
+        "foo-main",
+    );
+    let foo_main = cp_rev_parse(p, "HEAD");
+    std::fs::write(p.join("bar"), "bar\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "bar"], p), "add bar");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "bar-main", "--no-verify"], p),
+        "bar-main",
+    );
+    let bar_main = cp_rev_parse(p, "HEAD");
+    assert_cli_success(&run_libra_command(&["switch", "-c", "dev", &foo], p), "dev");
+    std::fs::write(p.join("foo"), "foo-dev\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "foo"], p), "add foo-dev");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "foo-dev", "--no-verify"], p),
+        "foo-dev",
+    );
+    std::fs::write(p.join("bar"), "bar-dev\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "bar"], p), "add bar-dev");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "bar-dev", "--no-verify"], p),
+        "bar-dev",
+    );
+    // Pre-record the resolution: conflict on foo-main, resolve, rerere record.
+    let _ = run_libra_command(&["cherry-pick", &foo_main], p);
+    std::fs::write(p.join("foo"), "foo-resolved\n").unwrap();
+    assert_cli_success(&run_libra_command(&["rerere"], p), "rerere record");
+    assert_cli_success(
+        &run_libra_command(&["cherry-pick", "--abort"], p),
+        "abort recording",
+    );
+    (repo, foo, foo_main, bar_main)
+}
+
+/// SA-03 AC1–AC3: `--rerere-autoupdate` applies and stages the recorded
+/// resolution when a range stops on its first conflict.
+#[test]
+fn cherry_pick_range_rerere_autoupdate_stop_tc0429() {
+    let (repo, foo, _foo_main, bar_main) = rerere_range_fixture();
+    let p = repo.path();
+    let range = format!("{foo}..{bar_main}");
+    let out = run_libra_command(&["cherry-pick", "--rerere-autoupdate", &range], p);
+    assert!(!out.status.success(), "AC1 must stop");
+    let (_human, report) = parse_cli_error_stderr(&out.stderr);
+    assert_eq!(report.error_code, "LBR-CONFLICT-001", "AC1 code");
+    assert_eq!(
+        std::fs::read_to_string(p.join("foo")).unwrap(),
+        "foo-resolved\n",
+        "AC2"
+    );
+    let staged = run_libra_command(&["ls-files", "--stage", "--", "foo"], p);
+    assert_cli_success(&staged, "AC3 ls-files");
+    let entry = String::from_utf8_lossy(&staged.stdout).trim().to_string();
+    let fields: Vec<&str> = entry.split_whitespace().collect();
+    assert_eq!(fields.len(), 4, "AC3 one staged entry: {entry}");
+    assert_eq!(fields[2], "0", "AC3 stage");
+    assert_cli_success(
+        &run_libra_command(&["cherry-pick", "--abort"], p),
+        "cleanup",
+    );
+}
+
+/// SA-03 AC4–AC8: `--continue` rejects both rerere toggles by name.
+#[test]
+fn cherry_pick_continue_rejects_rerere_flags_tc0429() {
+    let (repo, foo, _foo_main, bar_main) = rerere_range_fixture();
+    let p = repo.path();
+    let range = format!("{foo}..{bar_main}");
+    let stopped = run_libra_command(&["cherry-pick", "--rerere-autoupdate", &range], p);
+    assert!(!stopped.status.success(), "fixture stop");
+
+    for flag in ["--rerere-autoupdate", "--no-rerere-autoupdate"] {
+        let out = run_libra_command(&["cherry-pick", "--continue", flag], p);
+        assert!(!out.status.success(), "{flag} must be rejected");
+        let (_human, report) = parse_cli_error_stderr(&out.stderr);
+        assert_eq!(report.error_code, "LBR-CLI-002", "{flag} code");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.lines().any(|line| {
+                line.contains("cannot be used with")
+                    && line.contains("'--continue'")
+                    && line.contains(&format!("'{flag}'"))
+            }),
+            "{flag} diagnostic names both options: {stderr}"
+        );
+    }
+    assert_cli_success(
+        &run_libra_command(&["cherry-pick", "--abort"], p),
+        "AC8 abort",
+    );
+}

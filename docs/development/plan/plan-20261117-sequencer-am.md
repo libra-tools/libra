@@ -592,7 +592,7 @@ job 集合以执行当日按模板 ER-04「仓库配置与 CI 展开规则」现
 ### Task SA-03: `--rerere-autoupdate` 在范围冲突上生效且 rerere 标志与 `--continue` 互斥（#726）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-23：`--continue` 的 `conflicts_with_all` 增加 `rerere_autoupdate`/`no_rerere_autoupdate`（clap 冲突 → `LBR-CLI-002`，诊断点名两个选项）；范围 pick 复用同一 `cherry_pick_single_commit` 的 rerere 路径，`--rerere-autoupdate` 在首个冲突处按预录结果改写并暂存 `foo`。AC1–AC3 由 `command::cherry_pick_test::cherry_pick_range_rerere_autoupdate_stop_tc0429` 覆盖（`LBR-CONFLICT-001`、`foo` 字节、stage 0 且 blob 等于预录 `R`），AC4–AC8 由 `cherry_pick_continue_rejects_rerere_flags_tc0429` 覆盖（两个标志的稳定码与点名诊断、之后 `--abort` exit 0）；`cherry_pick_test` 84/84；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计，故未执行计划要求的独立评审门。
 **Description:** 使 `--rerere-autoupdate`/`--no-rerere-autoupdate` 与 `--continue` 同用时按 Git 在参数解析阶段拒绝（`--continue` 的 `conflicts_with_all` 加入这两个标志，`src/command/cherry_pick.rs:689-695`），并在 `SA-02` 的范围上验收 `t3504#7`（`TC-0429`）：`libra cherry-pick --rerere-autoupdate foo..bar-main` 在首个冲突处停止时 rerere 以预录解决结果改写并暂存 `foo`，该停止态可 `--abort`（#726 验收项 2–5）。若范围路径未把 rerere 策略传给每个 pick，在本卡修正（GC-01）。R43 按用户 2026-11-19 05:17:51 UTC 决定收窄到 #726 的验收项：重复与混合标志「最后一个生效」（#727）拆为 `SA-03b`；`t3504#4–#6`（`rerere.autoUpdate` 配置、否定标志的范围模式与跨 `--continue` 的第二冲突恢复）登记 `DEFER-SA-16`。
 **Out of scope:** 范围展开（由 `SA-02` 承接）；重复/混合 rerere 标志（由 `SA-03b` 承接）；`t3504#4–#6` 与跨 `--continue` 的第二冲突恢复（`DEFER-SA-16`）；rerere 标志与 `--skip`/`--abort`/`--quit` 的互斥（`DEFER-SA-06`）；`rerere` 子命令与 `rerere.enabled` 默认值（永久非目标：本卡只消费既有 rerere 集成）。
 

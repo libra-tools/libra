@@ -44,6 +44,8 @@ libra cherry-pick (--continue | --skip | --abort | --quit)
 
 支持提交范围 `<A>..<B>`：展开为从 `B` 可达但 `A` 不可达的提交（由旧到新，线性历史等价于 Git 的 `rev-list --reverse A..B`）并按序列重放；范围内的停止按展开后的提交报告，`--continue` 把解决后的索引落为该提交。`A...B` 与其它修订语法仍不支持。
 
+`--rerere-autoupdate` / `--no-rerere-autoupdate` 为每个 pick（含范围展开的 pick）选择 rerere 暂存策略：设置 `rerere.enabled` 后，先前记录过解决结果的冲突会被重放，并在 autoupdate 下自动暂存。两者都不能与 `--continue` 同用（`LBR-CLI-002`，诊断点名两个选项）。
+
 ## 选项
 
 当 `core.sparseCheckout=true` 时本命令以 `LBR-UNSUPPORTED-001` fail-closed：它会围绕整棵树改写工作区（或索引/stash），而不是稀疏视图（稀疏 cone 物化尚未实现）。
