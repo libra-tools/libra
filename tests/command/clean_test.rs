@@ -1092,9 +1092,9 @@ fn test_clean_dry_run_writes_no_objects() {
 /// PM WC-04: a single force keeps nested repositories (`REMOVE_DIR_KEEP_NESTED_GIT`).
 #[test]
 fn clean_single_force_keeps_nested_repos() {
+    use std::{collections::BTreeMap, path::Path};
+
     use sha2::{Digest, Sha256};
-    use std::collections::BTreeMap;
-    use std::path::Path;
 
     fn sha(path: &Path) -> String {
         let bytes = std::fs::read(path).expect("read for snapshot");
@@ -1217,9 +1217,9 @@ fn clean_single_force_keeps_nested_repos() {
 /// WC-04b: explicit pathspecs also respect the nested-repository protection.
 #[test]
 fn clean_single_force_pathspec_keeps_nested_repos() {
+    use std::{collections::BTreeMap, path::Path};
+
     use sha2::{Digest, Sha256};
-    use std::collections::BTreeMap;
-    use std::path::Path;
 
     fn snapshot(root: &Path, dir: &str) -> BTreeMap<String, String> {
         fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<String, String>) {
