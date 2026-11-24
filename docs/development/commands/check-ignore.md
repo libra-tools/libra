@@ -57,3 +57,5 @@
 - 新增公开 flag 必须明确 tier、退出码、JSON/机器输出契约与回归测试。
 
 - 2026-11-23（PM-18 / #1035）：忽略引擎在 `core.excludesFile` 未配置时回退 `util::xdg_config_home("ignore")`；显式配置抑制 XDG 默认文件；键名大小写不敏感（共用 PM-18 的配置读取回退）。回归：`check_ignore_global_sources_follow_git`（AC6–AC8）。
+
+- 2026-11-23（PM-17 / #1035）：`classify_path` 的相对路径基准由仓库根改为调用时 `current_dir()`，输出继续回显原始拼写；越界仍 `LBR-CLI-003`。回归：`check_ignore_resolves_paths_from_cwd`（AC1–AC4，cwd 为 `a/`）；`check_ignore_test` 14/14。

@@ -192,10 +192,16 @@ fn classify_path(
         pattern: None,
     };
 
+    // Git resolves relative pathnames against the CALLER's current directory,
+    // not the repository root; the original spelling is echoed in the output.
+    let cwd = std::env::current_dir().map_err(|error| {
+        CliError::fatal(format!("failed to resolve the current directory: {error}"))
+            .with_stable_code(StableErrorCode::IoReadFailed)
+    })?;
     let raw = if Path::new(path_str).is_absolute() {
         PathBuf::from(path_str)
     } else {
-        workdir.join(path_str)
+        cwd.join(path_str)
     };
     // Collapse `.`/`..` lexically (no filesystem/symlink resolution — the path
     // need not exist) so containment can be checked safely.

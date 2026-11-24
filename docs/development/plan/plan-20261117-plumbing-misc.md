@@ -2545,7 +2545,7 @@ PY
 ### Task PM-17: `libra check-ignore` 相对当前目录解析路径并原样回显（#1035；拆出 PM-20、PM-31）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-23：`classify_path` 的相对路径基准由仓库根改为调用时 `std::env::current_dir()`，输出继续回显用户原始拼写，`-v` 来源仍相对仓库根；越出仓库根仍 `LBR-CLI-003`。AC1–AC4 由 `command::check_ignore_test::check_ignore_resolves_paths_from_cwd` 覆盖（cwd 为 `a/` 的 F17 夹具、`-v` 命中行、原样回显、`-n` 空来源行、`../../outside` 拒绝）；`check_ignore_test` 14/14；EN/zh/开发文档与 `COMPATIBILITY.md` 的 `check-ignore` 行同步。
 **Description:** `src/command/check_ignore.rs` 的 `classify_path` 把相对路径按**调用时的当前目录**（而非仓库根）解析后再做仓库内规范化，输出时回显用户给出的原始路径（`-v` 的来源仍相对仓库根）；越出仓库根的路径以 `LBR-CLI-003` 失败。（按 G-09 拆出 `PM-20` 承接 `--quiet`/`-z` 规则、`PM-31` 承接 `--stdin` 流式与引号。）
 **Out of scope:** `--stdin` 流式与 C 引号（`PM-31`）；`--quiet`/`-z`/否定匹配退出码（`PM-20`）；全局来源（`PM-18`）；`check-attr` 的子目录路径解析（尚未排期）。
 **Current evidence:**

@@ -308,3 +308,61 @@ fn check_ignore_global_sources_follow_git() {
     assert_eq!(out.status.code(), Some(1), "AC8 exit");
     assert!(out.stdout.is_empty(), "AC8 stdout");
 }
+
+/// PM-17: relative paths resolve from the caller's current directory, and the
+/// original spelling is echoed.
+#[test]
+fn check_ignore_resolves_paths_from_cwd() {
+    let repo = tempdir().expect("failed to create repository root");
+    init_repo_via_cli(repo.path());
+    let p = repo.path();
+    std::fs::write(p.join(".gitignore"), "one\nignored-*\n").expect("root gitignore");
+    std::fs::create_dir_all(p.join("a/b")).expect("mkdir a/b");
+    std::fs::write(p.join("a/.gitignore"), "two*\n*three\n").expect("a gitignore");
+    std::fs::write(p.join("a/b/.gitignore"), "!on*\n!two\n").expect("a/b gitignore");
+    let inside = p.join("a");
+
+    // AC1: `-v` reports the deciding rule with a repo-root-relative source.
+    let out = run_libra_command(
+        &["check-ignore", "--verbose", "3-three", "three-not-this-one"],
+        &inside,
+    );
+    assert_cli_success(&out, "AC1");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "a/.gitignore:2:*three\t3-three\n",
+        "AC1"
+    );
+
+    // AC2: paths are resolved from `a/`, and echoed as typed.
+    let out = run_libra_command(
+        &["check-ignore", "3-three", "../one", "../not-ignored"],
+        &inside,
+    );
+    assert_cli_success(&out, "AC2");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "3-three\n../one\n",
+        "AC2"
+    );
+
+    // AC3: `-n` prints the non-matching path with empty source/pattern fields.
+    let out = run_libra_command(
+        &["check-ignore", "-v", "-n", "3-three", "../not-ignored"],
+        &inside,
+    );
+    assert_cli_success(&out, "AC3");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "a/.gitignore:2:*three\t3-three\n::\t../not-ignored\n",
+        "AC3"
+    );
+
+    // AC4: escaping the repository is an invalid target.
+    let out = run_libra_command(&["check-ignore", "../../outside"], &inside);
+    assert!(!out.status.success(), "AC4 must fail");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("LBR-CLI-003"),
+        "AC4 code"
+    );
+}

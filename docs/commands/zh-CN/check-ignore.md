@@ -2,7 +2,7 @@
 
 报告哪些路径被 Git/Libra ignore 规则忽略（排除）——等价于 `git check-ignore`，同时保留 Libra 扩展文件。
 
-Libra 会读取 Git 标准来源（`.gitignore`、worktree 本地 `info/exclude`、`core.excludesFile`（键名大小写不敏感））以及 Libra 扩展来源（`.libraignore`）。worktree 本地 `info/exclude` 位于**当前 worktree 自己的 gitdir**——`.libra/info/exclude`，Git 布局或双布局树（从 Git 转换、`.git` 与 `.libra` 并存的仓库）还会同时读取 `.git/info/exclude`——按 worktree 独立：每个隔离布局的 linked worktree 只读自己的文件，绝不经 `commondir` 读到其它 worktree 的（与 Git 的仓库级共享有意不同；仓库级共享规则请写在根 `.libraignore`/`.gitignore`）。pre-isolation 的 legacy-symlink worktree 在用 `libra worktree repair --migrate-layout` 迁移前仍与 main 共享 `info/*`。同一目录内 `.libraignore` 优先于 `.gitignore`；更近目录的来源优先于祖先目录；`info/exclude` 和 `core.excludesFile` 是较低优先级 fallback。模式语法使用 Git ignore 语法。未配置 `core.excludesFile` 时全局层回退到 `$XDG_CONFIG_HOME/git/ignore`（`XDG_CONFIG_HOME` 为空时用 `$HOME/.config/git/ignore`）；显式配置会抑制该默认文件。
+Libra 会读取 Git 标准来源（`.gitignore`、worktree 本地 `info/exclude`、`core.excludesFile`（键名大小写不敏感））以及 Libra 扩展来源（`.libraignore`）。worktree 本地 `info/exclude` 位于**当前 worktree 自己的 gitdir**——`.libra/info/exclude`，Git 布局或双布局树（从 Git 转换、`.git` 与 `.libra` 并存的仓库）还会同时读取 `.git/info/exclude`——按 worktree 独立：每个隔离布局的 linked worktree 只读自己的文件，绝不经 `commondir` 读到其它 worktree 的（与 Git 的仓库级共享有意不同；仓库级共享规则请写在根 `.libraignore`/`.gitignore`）。pre-isolation 的 legacy-symlink worktree 在用 `libra worktree repair --migrate-layout` 迁移前仍与 main 共享 `info/*`。同一目录内 `.libraignore` 优先于 `.gitignore`；更近目录的来源优先于祖先目录；`info/exclude` 和 `core.excludesFile` 是较低优先级 fallback。模式语法使用 Git ignore 语法。相对路径按**调用时的当前目录**解析（而非仓库根），输出原样回显用户给出的路径；`-v` 的来源仍相对仓库根显示；越出仓库根的路径以 `LBR-CLI-003` 失败。未配置 `core.excludesFile` 时全局层回退到 `$XDG_CONFIG_HOME/git/ignore`（`XDG_CONFIG_HOME` 为空时用 `$HOME/.config/git/ignore`）；显式配置会抑制该默认文件。
 
 ## 用法
 
