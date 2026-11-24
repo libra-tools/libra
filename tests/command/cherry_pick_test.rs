@@ -5333,3 +5333,158 @@ fn cherry_pick_rerere_autoupdate_repeated_last_wins() {
         "abort 4",
     );
 }
+
+/// SA-04: `--ff` on a root commit that cannot fast-forward creates a normal
+/// cherry-pick commit whose OID matches Git's byte-for-byte.
+#[test]
+fn cherry_pick_ff_root_commit_matches_git_oid_tc0512() {
+    use std::process::Command;
+
+    let libra = env!("CARGO_BIN_EXE_libra");
+    let work = tempdir().expect("work dir");
+    let git_repo = work.path().join("git");
+    std::fs::create_dir_all(&git_repo).unwrap();
+    let envs = [
+        ("GIT_AUTHOR_NAME", "t"),
+        ("GIT_AUTHOR_EMAIL", "t@t"),
+        ("GIT_COMMITTER_NAME", "t"),
+        ("GIT_COMMITTER_EMAIL", "t@t"),
+        ("GIT_AUTHOR_DATE", "1700000000 +0000"),
+        ("GIT_COMMITTER_DATE", "1700000000 +0000"),
+        ("HOME", work.path().to_str().unwrap()),
+    ];
+    let git = |args: &[&str]| {
+        let mut cmd = Command::new("git");
+        cmd.args(args).current_dir(&git_repo);
+        for (key, value) in envs {
+            cmd.env(key, value);
+        }
+        let out = cmd.output().expect("run git");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+        out
+    };
+    git(&["init", "-q", "."]);
+    std::fs::write(git_repo.join("a"), "a\n").unwrap();
+    git(&["add", "a"]);
+    git(&["commit", "-q", "-m", "first"]);
+    git(&["tag", "first"]);
+    git(&["checkout", "-q", "--orphan", "other"]);
+    git(&["rm", "-q", "-rf", "."]);
+    std::fs::write(git_repo.join("b"), "b\n").unwrap();
+    git(&["add", "b"]);
+    git(&["commit", "-q", "-m", "root2"]);
+
+    // Libra copy of the same object store (tags are imported).
+    let libra_repo = work.path().join("libra");
+    std::fs::create_dir_all(&libra_repo).unwrap();
+    fn copy(from: &std::path::Path, to: &std::path::Path) {
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let target = to.join(entry.file_name());
+            if entry.path().is_dir() {
+                std::fs::create_dir_all(&target).unwrap();
+                copy(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), &target).unwrap();
+            }
+        }
+    }
+    copy(&git_repo, &libra_repo);
+    let mut init = Command::new(libra);
+    init.args(["init", "--from-git-repository", "."])
+        .current_dir(&libra_repo);
+    for (key, value) in envs {
+        init.env(key, value);
+    }
+    assert!(init.output().unwrap().status.success(), "libra init");
+
+    // AC1: the created commit equals Git's.
+    git(&["cherry-pick", "--ff", "first"]);
+    let git_oid = String::from_utf8_lossy(&git(&["rev-parse", "HEAD"]).stdout)
+        .trim()
+        .to_string();
+    let mut pick = Command::new(libra);
+    pick.args(["cherry-pick", "--ff", "first"])
+        .current_dir(&libra_repo);
+    for (key, value) in envs {
+        pick.env(key, value);
+    }
+    let out = pick.output().unwrap();
+    assert!(out.status.success(), "libra cherry-pick --ff: {out:?}");
+    let libra_oid = String::from_utf8_lossy(
+        &Command::new(libra)
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&libra_repo)
+            .env("HOME", work.path())
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .trim()
+    .to_string();
+    assert_eq!(libra_oid, git_oid, "AC1 OID parity");
+
+    // AC2: HEAD is the target's direct parent -> a true fast-forward.
+    let work2 = tempdir().expect("work2");
+    let git2 = work2.path().join("git");
+    std::fs::create_dir_all(&git2).unwrap();
+    let git2_cmd = |args: &[&str]| {
+        let mut cmd = Command::new("git");
+        cmd.args(args).current_dir(&git2);
+        for (key, value) in envs {
+            cmd.env(key, value);
+        }
+        cmd.output().expect("git2")
+    };
+    git2_cmd(&["init", "-q", "."]);
+    std::fs::write(git2.join("a"), "a\n").unwrap();
+    git2_cmd(&["add", "a"]);
+    git2_cmd(&["commit", "-q", "-m", "first"]);
+    std::fs::write(git2.join("a"), "a2\n").unwrap();
+    git2_cmd(&["add", "a"]);
+    git2_cmd(&["commit", "-q", "-m", "second"]);
+    let second = String::from_utf8_lossy(&git2_cmd(&["rev-parse", "HEAD"]).stdout)
+        .trim()
+        .to_string();
+    let first = String::from_utf8_lossy(&git2_cmd(&["rev-parse", "HEAD~1"]).stdout)
+        .trim()
+        .to_string();
+    let libra2 = work2.path().join("libra");
+    std::fs::create_dir_all(&libra2).unwrap();
+    copy(&git2, &libra2);
+    let mut init2 = Command::new(libra);
+    init2
+        .args(["init", "--from-git-repository", "."])
+        .current_dir(&libra2);
+    for (key, value) in envs {
+        init2.env(key, value);
+    }
+    assert!(init2.output().unwrap().status.success(), "libra init 2");
+    let reset = Command::new(libra)
+        .args(["reset", "--hard", &first])
+        .current_dir(&libra2)
+        .env("HOME", work2.path())
+        .output()
+        .unwrap();
+    assert!(reset.status.success(), "reset to first: {reset:?}");
+    let mut ff = Command::new(libra);
+    ff.args(["cherry-pick", "--ff", &second])
+        .current_dir(&libra2);
+    for (key, value) in envs {
+        ff.env(key, value);
+    }
+    let out = ff.output().unwrap();
+    assert!(out.status.success(), "AC2 cherry-pick --ff: {out:?}");
+    let head = String::from_utf8_lossy(
+        &Command::new(libra)
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&libra2)
+            .env("HOME", work2.path())
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .trim()
+    .to_string();
+    assert_eq!(head, second, "AC2 fast-forward to target");
+}

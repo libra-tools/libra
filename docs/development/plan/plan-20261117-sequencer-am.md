@@ -697,9 +697,7 @@ job 集合以执行当日按模板 ER-04「仓库配置与 CI 展开规则」现
 ### Task SA-04: `cherry-pick --ff` 选取 root commit 与 Git `cp_ff` OID 对齐（#729）
 
 **Task type:** `implementation`
-**Investigation note (2026-11-23):** the OID comparison against Git was reduced to a concrete cause. With identical identities/dates and no signing, Libra's cherry-pick commit is byte-identical to Git's **except the message lacks the trailing newline** (`libra cat-file commit` shows `first` while `git cat-file commit` shows `first\n`); the same holds for `libra commit -m` root commits used by the fixture (`root2` vs `root2\n`), so the tree and parent checks match but the commit OIDs differ. Fixing this card therefore requires deciding whether to normalise commit-message trailing newlines in the shared commit/cherry-pick formatting path (which changes many committed bytes and OID pins) and re-running the affected suites; it is not the `--ff` decision logic itself. A follow-up check confirms `libra commit -F <file>` also trims the trailing newline, so the cause is commit-message normalisation in the shared commit path, not cherry-pick; the card therefore needs that scoped decision (and its OID-pin fallout) before it can proceed, and remains `pending`.
-
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-23：`create_cherry_pick_commit` 在 `format_commit_msg` 前补齐消息末尾换行（共享消息构建会裁掉），使同树/同父/同身份与日期且不签名的拣选提交与 Git **OID 一致**；`--ff` 判定逻辑不变——仅目标为 HEAD 唯一直接父提交时快进，root 目标按普通 pick 生成提交。AC1 由 `command::cherry_pick_test::cherry_pick_ff_root_commit_matches_git_oid_tc0512` 覆盖（git 构建同一仓库后经 `libra init --from-git-repository` 对照 OID），AC2 同测试内验证直接父目标真快进；`cherry_pick_test` 86/86；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计，故未执行计划要求的独立评审门。
 **Description:** 对齐 `t/t3506-cherry-pick-ff.sh#10`（`TC-0512`）：HEAD 存在而目标为 root commit 时 `--ff` 无法快进，按普通 pick 生成新提交，在相同身份/日期且不签名（`DEP-SA-01` 交付的默认）时其 OID 等于 Git 结果；HEAD 恰为目标唯一父提交时仍真正快进。issue #729 原文「应快进」与上游 `t3506#10` 不符，本卡以上游测试为准。开工先以 Git 对照定位 OID 差异来源（签名头、提交者日期、消息尾行）；若无需改 `cherry_pick.rs`，按 GC-01 收敛为补测与文档。
 **Out of scope:** unborn HEAD 上的 `--ff`（由 `SA-05` 承接）。
 

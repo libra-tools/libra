@@ -2610,7 +2610,13 @@ async fn create_cherry_pick_commit(
     output: &OutputConfig,
     advance: &SequenceAdvance,
 ) -> Result<ObjectHash, CherryPickSingleError> {
-    let message = build_cherry_pick_message(original_commit, args, output).await?;
+    let mut message = build_cherry_pick_message(original_commit, args, output).await?;
+    // Git stores a commit message with its trailing newline; the shared message
+    // builder trims it, so restore it here to keep cherry-pick objects
+    // byte-identical to Git's (same tree/parent/identity => same OID).
+    if !message.ends_with('\n') {
+        message.push('\n');
+    }
 
     if message.trim().is_empty() && !args.allow_empty_message {
         return Err(CherryPickSingleError::EmptyMessage(

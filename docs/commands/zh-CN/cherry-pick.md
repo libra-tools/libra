@@ -46,6 +46,8 @@ libra cherry-pick (--continue | --skip | --abort | --quit)
 
 两个 rerere 标志都可重复传入，**命令行最后一个生效**（`--rerere-autoupdate --no-rerere-autoupdate` 关闭暂存，末尾的肯定标志再开启）。它们为每个 pick（含范围展开的 pick）选择 rerere 暂存策略：设置 `rerere.enabled` 后，先前记录过解决结果的冲突会被重放，并在 autoupdate 下自动暂存。两者都不能与 `--continue` 同用（`LBR-CLI-002`，诊断点名两个选项）。
 
+被拣选的提交以 Git 的"消息末尾换行"形式存储，因此在树、父提交、作者/提交者身份与日期相同且不签名时，拣选提交的对象 id 与 Git 一致。`--ff` 仅在 HEAD 恰为目标唯一直接父提交时快进；目标为 root 提交（或任何非子提交）时按普通 pick 生成新提交。
+
 ## 选项
 
 当 `core.sparseCheckout=true` 时本命令以 `LBR-UNSUPPORTED-001` fail-closed：它会围绕整棵树改写工作区（或索引/stash），而不是稀疏视图（稀疏 cone 物化尚未实现）。
