@@ -22,6 +22,9 @@
 //!   `writer.lock -> append.lock` (commits dual `LTM2` advancing `MIN_LIVE_SEG`
 //!   and removing `sealed[seg]` BEFORE `unlink` + `fsync_dir`).
 
+// libc stat field widths differ across targets, so these conversions are portable.
+#![allow(clippy::useless_conversion)]
+
 use std::{
     fs::File,
     io::{self, Read as _, Seek as _, SeekFrom},
@@ -29,6 +32,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use super::is_eftype_errno;
 #[cfg(test)]
 use crate::storage::queue::segment::{
     SegmentCrashPoint, SegmentObserver, SegmentOpEvent,
@@ -1885,7 +1889,7 @@ mod unix_writer {
         if code == libc::ELOOP {
             return true;
         }
-        if code == libc::EMLINK || code == libc::EFTYPE || code == libc::ENOTDIR {
+        if code == libc::EMLINK || is_eftype_errno(code) || code == libc::ENOTDIR {
             let mut st = std::mem::MaybeUninit::<libc::stat>::zeroed();
             // SAFETY: `dir_fd` is valid and `cname` is NUL-terminated.
             let rc = unsafe {
@@ -1912,7 +1916,7 @@ mod unix_writer {
         if code == libc::ELOOP {
             return true;
         }
-        if code == libc::EMLINK || code == libc::EFTYPE || code == libc::ENOTDIR {
+        if code == libc::EMLINK || is_eftype_errno(code) || code == libc::ENOTDIR {
             return std::fs::symlink_metadata(path)
                 .map(|m| m.file_type().is_symlink())
                 .unwrap_or(false);
