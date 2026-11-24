@@ -2077,13 +2077,122 @@ PY
 
 **Granularity:** `type=implementation; axis=show_--word-diff与--color-words; recovery=immutable-release; complete=yes; self-contained=yes; AC=8/8; VER=4/8; landing=1; prod-files=2; scope=M; deps=LS-26,DEP-LS-01,DEP-LS-03; writeset=序列化于LS-26; release=independent; split-from=LS-26; exception=N/A`
 
+### Task LS-24: `show` 支持 `--color-moved` 与 `--word-diff` 组合（#858）
+
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-23：`ShowArgs` 新增 `--color-moved[=<mode>]`/`--no-color-moved`/`--color-moved-ws`；`show_patch` 在末尾以 `render::maybe_colorize_diff` 后处理并对齐 `libra diff` 的尾部空行，故可与 `--word-diff`/`--color-words` 组合。AC1–AC5 由 `command::log_test::show_color_moved_composes_with_word_diff` 覆盖（组合被接受、组合输出与 `libra diff` 同选项逐字一致、单独 color-moved 一致、`--no-color-moved` 后写者胜出、ws 模式一致）。`show_test` 42/42；EN/zh 文档与 `COMPATIBILITY.md` 同步。
+
+**Description:** 在 `LS-33` 已为 `show` 接入 `--word-diff` 的基础上，在 `ShowArgs` 接入 `--color-moved[=<mode>]`、`--no-color-moved`、`--color-moved-ws` 并启用与 `--word-diff` / `--color-words` 的组合输出（匹配 `libra diff --color-moved --word-diff`）。
+
+**Out of scope:** 独立的 `--word-diff` 实现（`LS-33` 已完成）。
+
+**Current evidence:**
+
+| 事实 | 证据 |
+|---|---|
+| `ShowArgs` 缺少 `color_moved` 字段；`show.rs` 通过 `log::generate_diff` 生成差异 | `src/command/show.rs:25-28,73-187` |
+
+**Acceptance criteria:**
+
+- [ ] **AC1** `libra show --color-moved --word-diff X` 退出码为 0（不再被 CLI 拒绝）。
+- [ ] **AC2** `libra show --color-moved --word-diff X` 的 diff 部分与 `libra diff --color-moved --word-diff B X` 逐字相同。
+- [ ] **AC3** `libra show --color=always --color-moved X` 的 diff 部分与 `libra diff --color=always --color-moved B X` 逐字相同。
+- [ ] **AC4** `libra show --color=always --color-moved --no-color-moved X` 的输出与不带 `--color-moved` 时逐字相同（后写者胜出）。
+- [ ] **AC5** `libra show --color=always --color-moved --color-moved-ws=ignore-all-space X` 的 diff 部分与 `libra diff` 同选项逐字相同。
+- [ ] **AC6** `libra show --color-moved=bogus X` 以 `LBR-CLI-002` 拒绝。
+- [ ] ER-06/ER-06a 同卡强制门：`Docs and compatibility impact` 所列每个文件按「文档与网站验收命令」第 1–7 步逐文件交付并验收（不计入卡特有 AC 分子）。
+
+**AC → 断言映射:**（夹具 F24：基线提交 B 与其子提交 X（X 的父提交为 B）：X 同时原样移动一段 4 行代码块 P、移动另一段 4 行代码块 Q 并在 Q 的每行插入行内空白（Q 只在 `--color-moved-ws=ignore-all-space` 下识别为移动），并在另一行替换单词；每次调用另按「验证执行协议」第 4 项断言只读不变量；本卡期望均为 Libra 自身基准，不涉及 Git 期望取得）
+
+- AC1 → `command::show_test::color_moved_with_word_diff`：期望 exit 0。
+- AC2 → `command::show_test::color_moved_with_word_diff`：期望 两次调用均 exit 0；diff 部分逐字相同。
+- AC3 → `command::show_test::color_moved_with_word_diff`：期望 两次调用均 exit 0；diff 部分逐字相同。
+- AC4 → `command::show_test::color_moved_with_word_diff`：期望 两次调用均 exit 0；stdout 逐字相同。
+- AC5 → `command::show_test::color_moved_with_word_diff`：期望 两次调用均 exit 0；diff 部分逐字相同。
+- AC6 → `command::show_test::color_moved_with_word_diff`：期望 stderr 含 `LBR-CLI-002`。
+- 文档 AC → 「文档与网站验收命令」第 1–7 步（逐文件 SHA-256、关键字命中、网站同步与漂移检查、typecheck/build、Claude Code PASS、精确提交推送、部署核验）。
+
+**Verification:**
+
+- [ ] `source .env.test && cargo nextest run --test command_test -E 'test(=command::show_test::color_moved_with_word_diff)'`（卡特有 `(new)`，`tests/command/show_test.rs` 内新增；覆盖 AC1–AC6；按「验证执行协议」第 1–4 项执行）
+- [ ] `source .env.test && cargo nextest run --test command_test -E 'test(/^command::show_test::/)'`（共享回归组：`command::show_test` 模块族；N 以运行前 list 结果为准（≥1）；按「验证执行协议」第 5 项先以同一过滤 `cargo nextest list` 核对，要求 exit 0、通过 = N、失败 = 0、跳过 = 0；不计为卡特有 AC 证据）
+- [ ] `source .env.test && cargo nextest run --test command_test -E 'test(/^command::diff_test::/)'`（共享回归组：`command::diff_test` 模块族，守护 `src/command/diff/` 共享逻辑；N 以运行前 list 结果为准（≥1）；按「验证执行协议」第 5 项先以同一过滤 `cargo nextest list` 核对，要求 exit 0、通过 = N、失败 = 0、跳过 = 0；不计为卡特有 AC 证据）
+
+**Full-suite trigger:** `T-1: 版本面集合同步修改 install.sh / install.ps1（ER-08 / ER-13 T-1）` | **Dependencies:** `LS-33`, `DEP-LS-01`, `DEP-LS-02`, `DEP-LS-03`
+
+**Implementation write set:** `src/command/show.rs`, `src/command/log.rs`, `src/command/diff.rs`, `src/command/diff/options.rs`, `tests/command/show_test.rs`, `docs/commands/show.md`, `docs/commands/zh-CN/show.md`, `docs/development/commands/show.md`, `COMPATIBILITY.md`, `/Volumes/Data/gitmono/libra-backend/apps/tanstack-app/content/docs/commands/show.en.md`
+
+**Release write set:** `Inherited` | **Files likely touched:** `src/command/show.rs`, `src/command/log.rs`, `src/command/diff.rs`, `src/command/diff/options.rs`, `tests/command/show_test.rs`, `COMPATIBILITY.md`
+
+**Docs and compatibility impact:** 必须同卡更新：`docs/commands/show.md`、`docs/commands/zh-CN/show.md` 与网站页 `/Volumes/Data/gitmono/libra-backend/apps/tanstack-app/content/docs/commands/show.en.md`（由 `--only show` 同步生成；网站 zh-CN 在渲染时镜像 EN，无独立文件）；文档关键字（用于 EN/zh 命令页）：`--color-moved`。逐文件语义核对：`docs/development/commands/show.md` 与 `COMPATIBILITY.md` 的 `| show |` 行（基线第 199 行）——受本卡行为影响即同卡更新（兼容矩阵原地修改，不增删行），否则按第 1 步记录理由与未变 SHA-256。按「文档与网站验收命令」第 1–7 步逐文件交付并验收。`docs/error-codes.md`：N/A（复用既有稳定码）。
+
+**Rollback mode:** `immutable-release` | **Estimated scope:** `M` | **Version increment:** `patch` | **Release boundary:** `independent` | **C/D coverage from:** `self`
+
+**Granularity:** `type=implementation; axis=show_--color-moved与--word-diff组合; recovery=immutable-release; complete=yes; self-contained=yes; AC=6/8; VER=6/8; landing=2; prod-files=4; scope=M; deps=LS-33,DEP-LS-01,DEP-LS-02,DEP-LS-03; writeset=序列化于LS-33; release=independent; split-from=N/A; exception=N/A`
+
 ---
 
-**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-23：`ShowArgs` 新增 `--color-moved[=<mode>]`/`--no-color-moved`/`--color-moved-ws`；`show_patch` 在末尾以 `render::maybe_colorize_diff` 后处理并对齐 `libra diff` 的尾部空行，故可与 `--word-diff`/`--color-words` 组合。AC1–AC5 由 `command::log_test::show_color_moved_composes_with_word_diff` 覆盖（组合被接受、组合输出与 `libra diff` 同选项逐字一致、单独 color-moved 一致、`--no-color-moved` 后写者胜出、ws 模式一致）。`show_test` 42/42；EN/zh 文档与 `COMPATIBILITY.md` 同步。
+---
+
+### Task LS-25: `show` 支持 `--textconv` 与 `--no-textconv`（#862）
+
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-23：`ShowArgs` 新增 `--textconv`/`--no-textconv`（后者胜出）；无路径过滤时 `show_patch` 经 `run_diff_for_service` 以 `--textconv`/`--no-textconv` argv 渲染，默认启用 textconv。AC1–AC5 由 `command::log_test::show_textconv_and_no_textconv` 覆盖（`--textconv` 与 `libra diff --textconv` 逐字一致、默认等同 `--textconv`、`--no-textconv` 与 `libra diff --no-textconv` 一致、过滤器确实运行/未运行以 `XYZ`/`abc` 判定）。`show_test` 42/42；EN/zh 文档与 `COMPATIBILITY.md` 同步。
+
+**Description:** 在 `ShowArgs` 新增 `--textconv`（与 Git 一致，提交 diff 默认启用 `diff.<driver>.textconv`）与 `--no-textconv`，经 `LogDiffOptions` 复用 `src/command/diff.rs:3403` 的 `run_textconv` 执行路径（受信任的仓库/用户配置 `diff.<driver>.textconv` 经临时文件执行外部过滤器，无独立进程沙箱；过滤器非零退出或命令缺失时以 `DiffError::TextconvFailed` fail-closed，经 `diff.rs:761` 映射为 `LBR-IO-001`；默认退出码 128，`LIBRA_FINE_EXIT_CODES` 与显式覆盖按现有错误协议 `src/utils/error.rs:514-545,1068-1076`）。
+
+**Out of scope:** 不改变 `diff.rs:584,590` 内部的 `for_service`（`no_textconv: true`）plumbing 辅助构造函数。
+
+**Current evidence:**
+
+| 事实 | 证据 |
+|---|---|
+| `diff.rs` 已实现 `--textconv`/`--no-textconv` 与 `run_textconv`，`TextconvFailed` 映射 `IoReadFailed`（`LBR-IO-001`）；`ShowArgs` 未暴露 | `src/command/diff.rs:497-511,675-676,761-765,3403`、`src/command/show.rs:25-28,73-187` |
+
+**Acceptance criteria:**
+
+- [ ] **AC1** `libra show --textconv X` 的 diff 部分与 `libra diff --textconv B X` 逐字相同。
+- [ ] **AC2** 未给选项时 `libra show X` 的输出与 `libra show --textconv X` 逐字相同（默认启用 textconv）。
+- [ ] **AC3** `libra show --no-textconv X` 的 diff 部分与 `libra diff --no-textconv B X` 逐字相同。
+- [ ] **AC4** `libra show --textconv X` 调用过滤器（对照：证明测试过滤器与标记文件生效，使 AC5 可判定）。
+- [ ] **AC5** `libra show --no-textconv X` 不调用过滤器。
+- [ ] **AC6** 过滤器以非零码退出时 `libra show X` 以 `LBR-IO-001` fail-closed 失败。
+- [ ] **AC7** 过滤器命令不存在时 `libra show X` 以 `LBR-IO-001` fail-closed 失败。
+- [ ] ER-06/ER-06a 同卡强制门：`Docs and compatibility impact` 所列每个文件按「文档与网站验收命令」第 1–7 步逐文件交付并验收（不计入卡特有 AC 分子）。
+
+**AC → 断言映射:**（夹具 F25：`.libra_attributes` 使 `*.bin` 使用驱动 `hex`，`diff.hex.textconv` 指向测试内脚本，该脚本每次被调用时在仓库工作区之外的测试临时目录写入调用标记文件（每次断言前删除）；基线提交 B 与其子提交 X（X 的父提交为 B）：X 修改 `x.bin`；每次调用另按「验证执行协议」第 4 项断言只读不变量；本卡期望均为 Libra 自身基准，不涉及 Git 期望取得）
+
+- AC1 → `command::show_test::textconv_and_no_textconv`：期望 两次调用均 exit 0；diff 部分逐字相同。
+- AC2 → `command::show_test::textconv_and_no_textconv`：期望 两次调用均 exit 0；stdout 逐字相同。
+- AC3 → `command::show_test::textconv_and_no_textconv`：期望 两次调用均 exit 0；diff 部分逐字相同。
+- AC4 → `command::show_test::textconv_and_no_textconv`：期望 exit 0；调用标记文件存在。
+- AC5 → `command::show_test::textconv_and_no_textconv`：期望 exit 0；调用标记文件不存在。
+- AC6 → `command::show_test::textconv_failure_and_missing_command`：期望 stderr 含 `LBR-IO-001`。
+- AC7 → `command::show_test::textconv_failure_and_missing_command`：期望 stderr 含 `LBR-IO-001`。
+- 文档 AC → 「文档与网站验收命令」第 1–7 步（逐文件 SHA-256、关键字命中、网站同步与漂移检查、typecheck/build、Claude Code PASS、精确提交推送、部署核验）。
+
+**Verification:**
+
+- [ ] `source .env.test && cargo nextest run --test command_test -E 'test(=command::show_test::textconv_and_no_textconv)'`（卡特有 `(new)`，`tests/command/show_test.rs` 内新增；覆盖 AC1–AC5；按「验证执行协议」第 1–4 项执行）
+- [ ] `source .env.test && cargo nextest run --test command_test -E 'test(=command::show_test::textconv_failure_and_missing_command)'`（卡特有 `(new)`，`tests/command/show_test.rs` 内新增；覆盖 AC6–AC7；按「验证执行协议」第 1–4 项执行）
+- [ ] `source .env.test && cargo nextest run --test command_test -E 'test(/^command::show_test::/)'`（共享回归组：`command::show_test` 模块族；N 以运行前 list 结果为准（≥1）；按「验证执行协议」第 5 项先以同一过滤 `cargo nextest list` 核对，要求 exit 0、通过 = N、失败 = 0、跳过 = 0；不计为卡特有 AC 证据）
+- [ ] `source .env.test && cargo nextest run --test command_test -E 'test(/^command::diff_test::/)'`（共享回归组：`command::diff_test` 模块族，守护 `src/command/diff/` 共享逻辑；N 以运行前 list 结果为准（≥1）；按「验证执行协议」第 5 项先以同一过滤 `cargo nextest list` 核对，要求 exit 0、通过 = N、失败 = 0、跳过 = 0；不计为卡特有 AC 证据）
+
+**Full-suite trigger:** `T-1: 版本面集合同步修改 install.sh / install.ps1（ER-08 / ER-13 T-1）` | **Dependencies:** `LS-24`, `DEP-LS-01`, `DEP-LS-02`, `DEP-LS-03`
+
+**Implementation write set:** `src/command/show.rs`, `src/command/log.rs`, `src/command/diff.rs`, `src/command/diff/options.rs`, `tests/command/show_test.rs`, `docs/commands/show.md`, `docs/commands/zh-CN/show.md`, `docs/development/commands/show.md`, `COMPATIBILITY.md`, `/Volumes/Data/gitmono/libra-backend/apps/tanstack-app/content/docs/commands/show.en.md`
+
+**Release write set:** `Inherited` | **Files likely touched:** `src/command/show.rs`, `src/command/log.rs`, `src/command/diff.rs`, `src/command/diff/options.rs`, `tests/command/show_test.rs`, `COMPATIBILITY.md`
+
+**Docs and compatibility impact:** 必须同卡更新：`docs/commands/show.md`、`docs/commands/zh-CN/show.md` 与网站页 `/Volumes/Data/gitmono/libra-backend/apps/tanstack-app/content/docs/commands/show.en.md`（由 `--only show` 同步生成；网站 zh-CN 在渲染时镜像 EN，无独立文件）；文档关键字（用于 EN/zh 命令页）：`--textconv`。逐文件语义核对：`docs/development/commands/show.md` 与 `COMPATIBILITY.md` 的 `| show |` 行（基线第 199 行）——受本卡行为影响即同卡更新（兼容矩阵原地修改，不增删行），否则按第 1 步记录理由与未变 SHA-256。按「文档与网站验收命令」第 1–7 步逐文件交付并验收。`docs/error-codes.md`：N/A（复用既有稳定码）。
+
+**Rollback mode:** `immutable-release` | **Estimated scope:** `M` | **Version increment:** `patch` | **Release boundary:** `independent` | **C/D coverage from:** `self`
+
+**Granularity:** `type=implementation; axis=show_--textconv与--no-textconv; recovery=immutable-release; complete=yes; self-contained=yes; AC=7/8; VER=8/8; landing=2; prod-files=4; scope=M; deps=LS-24,DEP-LS-01,DEP-LS-02,DEP-LS-03; writeset=序列化于LS-24; release=independent; split-from=N/A; exception=N/A`
 
 ---
 
-**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-23：`ShowArgs` 新增 `--textconv`/`--no-textconv`（后者胜出）；无路径过滤时 `show_patch` 经 `run_diff_for_service` 以 `--textconv`/`--no-textconv` argv 渲染，默认启用 textconv。AC1–AC5 由 `command::log_test::show_textconv_and_no_textconv` 覆盖（`--textconv` 与 `libra diff --textconv` 逐字一致、默认等同 `--textconv`、`--no-textconv` 与 `libra diff --no-textconv` 一致、过滤器确实运行/未运行以 `XYZ`/`abc` 判定）。`show_test` 42/42；EN/zh 文档与 `COMPATIBILITY.md` 同步。### Task LS-27: `log` 支持 `--diff-filter`（#973；拆出 LS-34）
+---
+
+### Task LS-27: `log` 支持 `--diff-filter`（#973；拆出 LS-34）
 
 **Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
 
