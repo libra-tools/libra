@@ -6,6 +6,7 @@ Inspect Git objects and Libra AI history objects stored in the repository.
 
 ```
 libra cat-file [OPTIONS] [OBJECT]
+libra cat-file <type> <object>
 ```
 
 ## Description
@@ -21,7 +22,16 @@ entry point for introspecting both version-control objects and AI process
 artifacts.
 
 Exactly one mode flag must be specified. Git modes (`-t`, `-s`, `-p`, `-e`)
-require a positional `OBJECT` argument. AI modes (`--ai`, `--ai-type`,
+require a positional `OBJECT` argument.
+
+Without any mode flag, the two-positional `<type> <object>` form prints the raw
+bytes of an object peeled to `<type>` (`blob`, `tree`, `commit`, or `tag`):
+annotated tags peel through their targets, and a commit peels to its tree when
+`tree` is requested (tree output is the binary tree object, not the `-p`
+listing). An impossible peel is `LBR-CLI-003`; an unknown type is
+`LBR-CLI-002`. Mode flags (`-t`/`-s`/`-p`/`-e`/`--batch*`/`--ai*`) cannot be
+combined with the two-positional form (`LBR-CLI-002`, checked before any mode
+dispatch). AI modes (`--ai`, `--ai-type`,
 `--ai-list`, `--ai-list-types`) ignore `OBJECT` and operate on the AI history
 branch.
 
@@ -67,7 +77,7 @@ merges do not create it. The historical pseudo-refs (`ORIG_HEAD`,
 | `--ai-type <ID>` | | Print the AI object type for the given ID. |
 | `--ai-list <TYPE>` | | List all AI objects of the given type (e.g., `intent`, `patchset`, `event`). |
 | `--ai-list-types` | | List all AI object types present in the history branch. |
-| `<OBJECT>` | | Git object spec: hash/ref, typed peel, numeric reflog selector, or `REV:path`. Required for `-t`/`-s`/`-p`/`-e`; ignored for `--ai*` modes; batch modes read object specs from stdin instead. |
+| `<OBJECT>` | | Git object spec: hash/ref, typed peel, numeric reflog selector, or `REV:path`. Required for `-t`/`-s`/`-p`/`-e`; ignored for `--ai*` modes; batch modes read object specs from stdin instead. In the two-positional form the first value is the type and the second the object. |
 
 ### Examples
 

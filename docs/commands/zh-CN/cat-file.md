@@ -6,6 +6,7 @@
 
 ```
 libra cat-file [OPTIONS] [OBJECT]
+libra cat-file <type> <object>
 ```
 
 ## 说明
@@ -14,7 +15,9 @@ libra cat-file [OPTIONS] [OBJECT]
 
 Libra 用 `--ai*` 标志扩展了经典命令，用于检查存储在 `libra/intent` orphan 分支上的 AI 工作流对象（Intent、Task、Run、Plan、PatchSet、Evidence、Session 等）。这为开发者和代理提供了一个单一入口，用于同时内省版本控制对象和 AI 流程产物。
 
-必须且只能指定一个模式标志。Git 模式（`-t`、`-s`、`-p`、`-e`）需要位置 `OBJECT` 参数。AI 模式（`--ai`、`--ai-type`、`--ai-list`、`--ai-list-types`）忽略 `OBJECT`，并在 AI history 分支上操作。
+必须且只能指定一个模式标志。
+
+未给出任何模式标志时，双位置参数 `<type> <object>` 形式输出剥离到 `<type>`（`blob`/`tree`/`commit`/`tag`）的**原始字节**：附注标签按目标逐层剥离，`tree` 请求会把提交剥离到其 tree（tree 为二进制对象，不是 `-p` 列表）。无法剥离到该类型为 `LBR-CLI-003`，未知类型为 `LBR-CLI-002`；任何模式标志（`-t`/`-s`/`-p`/`-e`/`--batch*`/`--ai*`）与双位置形式同用都以 `LBR-CLI-002` 拒绝（校验先于全部模式分派）。Git 模式（`-t`、`-s`、`-p`、`-e`）需要位置 `OBJECT` 参数。AI 模式（`--ai`、`--ai-type`、`--ai-list`、`--ai-list-types`）忽略 `OBJECT`，并在 AI history 分支上操作。
 
 Git 对象模式与 batch 输入复用 `rev-parse` 的严格 resolver：支持 ref/唯一 OID 前缀、`@`、parent 导航、typed/递归 peel、数字 reflog selector 与 `REV:path`。resolver 必须消费完整输入，因此 `HEAD^{tree}junk` 这类非法后缀会被拒绝，不会只解析一部分。
 

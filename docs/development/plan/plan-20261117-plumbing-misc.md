@@ -2717,7 +2717,7 @@ PY
 ### Task PM-14: 支持 `libra cat-file <type> <object>` 双位置参数形式（#1029）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-23：`CatFileArgs` 新增第二位置参数；无模式且两个位置参数时走 `print_typed_object`——类型必须为 `blob|tree|commit|tag`（否则 `LBR-CLI-002`），按 Git `odb_read_object_peeled` 语义逐层剥附注标签、`tree` 请求把提交剥到其 tree，类型不符 `LBR-CLI-003`，最终写出原始字节（tree 为二进制）；模式标志与双位置同用的互斥校验位于全部模式分派之前（含 `--ai*`）。AC1–AC8 由 `command::cat_file_test::cat_file_type_object_form` 覆盖；`cat_file_test` 35/35；EN/zh/开发文档与 `COMPATIBILITY.md` 的 `cat-file` 行同步。
 **Description:** `CatFileArgs` 接受第二个位置参数：未给出 `-t`/`-s`/`-p`/`-e`/`--batch*`/`--ai*` 且恰有两个位置参数时进入 `<type> <object>` 模式——`<type>` 为 `blob`/`tree`/`commit`/`tag` 之一（其它以 `LBR-CLI-002` 失败），对象按 Git `odb_read_object_peeled` 语义剥离（tag→目标、commit→tree），输出该类型对象的**原始字节**（tree 为二进制格式，不是 `-p` 列表），无法剥离到该类型时以 `LBR-CLI-003` 失败；模式标志（`-t`/`-s`/`-p`/`-e`/`--batch*`/`--ai*`）与两个位置参数同用时，在任何模式分派之前以 `LBR-CLI-002` 失败；只有一个位置参数且无模式时保持现有的 `LBR-CLI-002` 拒绝（`src/command/cat_file.rs:381-390`）。
 **Out of scope:** 不可解析对象名的退出码（Libra 129 对 Git 128，`COMPATIBILITY.md` 既有有意差异，保持）；`cat-file` 尊重 replace（`DEFER-PM-07`）；`--batch` 协议；`-p`/`-t`/`-s`/`-e`/`--batch*` 与其余 `--ai*` 标志与两个位置参数同用（与 AC8 同一位于模式分派之前的互斥校验，不单独验收）；只有一个位置参数且无模式（`libra cat-file HEAD`）的拒绝（现有行为已以 `LBR-CLI-002` 失败且本卡不改，不单独验收）。
 **Current evidence:**

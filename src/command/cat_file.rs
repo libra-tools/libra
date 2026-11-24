@@ -173,6 +173,11 @@ pub struct CatFileArgs {
     /// Git object hash or ref. Required only for -t/-s/-p/-e and ignored for all --ai* modes.
     #[clap(value_name = "OBJECT")]
     pub object: Option<String>,
+
+    /// Second positional: `<type> <object>` form. When present, `object` holds
+    /// the type (`blob`/`tree`/`commit`/`tag`) and this field the object name.
+    #[clap(value_name = "OBJECT")]
+    pub second_object: Option<String>,
 }
 
 /// Known AI object type names stored under the `libra/intent` orphan branch.
@@ -314,6 +319,77 @@ async fn ensure_ai_listable_type(hm: &HistoryManager, type_name: &str) -> CliRes
     .with_stable_code(StableErrorCode::CliInvalidTarget))
 }
 
+/// `cat-file <type> <object>`: peel tags (and a commit to its tree) until the
+/// requested type matches, then write the object's raw bytes (Git's
+/// `odb_read_object_peeled`).
+async fn print_typed_object(type_name: &str, target: &str) {
+    use git_internal::internal::object::{commit::Commit, tag::Tag, types::ObjectType};
+
+    if !matches!(type_name, "blob" | "tree" | "commit" | "tag") {
+        cat_file_exit_error(CliError::command_usage(format!(
+            "invalid object type '{type_name}'; expected blob, tree, commit, or tag"
+        )));
+    }
+    let storage = cat_file_storage();
+    let mut hash = resolve_object(target, &storage).await;
+
+    let mut resolved = None;
+    for _ in 0..64 {
+        let object_type = match storage.get_object_type(&hash) {
+            Ok(object_type) => object_type,
+            Err(_) => cat_file_exit_error(invalid_object_name_error(target)),
+        };
+        if object_type.to_string() == type_name {
+            resolved = Some(hash);
+            break;
+        }
+        match object_type {
+            ObjectType::Tag => {
+                let tag: Tag = match load_object(&hash) {
+                    Ok(tag) => tag,
+                    Err(error) => cat_file_exit_error(CliError::fatal(format!(
+                        "failed to read tag {hash}: {error}"
+                    ))),
+                };
+                hash = tag.object_hash;
+            }
+            ObjectType::Commit if type_name == "tree" => {
+                let commit: Commit = match load_object(&hash) {
+                    Ok(commit) => commit,
+                    Err(error) => cat_file_exit_error(CliError::fatal(format!(
+                        "failed to read commit {hash}: {error}"
+                    ))),
+                };
+                hash = commit.tree_id;
+            }
+            other => {
+                cat_file_exit_error(
+                    CliError::fatal(format!("object {hash} is a {other}, not a {type_name}"))
+                        .with_stable_code(StableErrorCode::CliInvalidTarget),
+                );
+            }
+        }
+    }
+    let Some(hash) = resolved else {
+        cat_file_exit_error(
+            CliError::fatal(format!("could not peel {target} to a {type_name}"))
+                .with_stable_code(StableErrorCode::CliInvalidTarget),
+        );
+    };
+    let data = match storage.get(&hash) {
+        Ok(data) => data,
+        Err(_) => cat_file_exit_error(invalid_object_name_error(target)),
+    };
+    use std::io::Write;
+    let stdout = std::io::stdout();
+    let mut writer = stdout.lock();
+    if let Err(error) = writer.write_all(&data).and_then(|()| writer.flush()) {
+        cat_file_exit_error(CliError::io(format!(
+            "failed to write object data: {error}"
+        )));
+    }
+}
+
 fn cat_file_exit_error(error: CliError) -> ! {
     error.print_stderr();
     std::process::exit(error.exit_code())
@@ -327,6 +403,31 @@ fn cat_file_storage() -> ClientStorage {
 }
 
 pub async fn execute(args: CatFileArgs) {
+    // ── `<type> <object>` form: validated before ANY mode dispatch ──────
+    if args.second_object.is_some() {
+        let mode_active = args.show_type
+            || args.show_size
+            || args.pretty_print
+            || args.check_exist
+            || args.batch.is_some()
+            || args.batch_check.is_some()
+            || args.batch_command.is_some()
+            || args.buffer
+            || args.ai_object.is_some()
+            || args.ai_type.is_some()
+            || args.ai_list.is_some()
+            || args.ai_list_types;
+        if mode_active {
+            cat_file_exit_error(CliError::command_usage(
+                "<type> <object> cannot be combined with -t/-s/-p/-e/--batch*/--ai* flags",
+            ));
+        }
+        let type_name = args.object.as_deref().unwrap_or_default();
+        let target = args.second_object.as_deref().unwrap_or_default();
+        print_typed_object(type_name, target).await;
+        return;
+    }
+
     // ── AI modes (no positional object arg required) ────────────────────
     if args.ai_list_types {
         ai_list_types().await;

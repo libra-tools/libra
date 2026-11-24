@@ -76,3 +76,5 @@ flowchart TD
 
 
 **`--separate-git-dir` 指针布局（2026-11-20，CL-23）：** `<worktree>/.libra` 为 `gitdir: <dir>` 指针文件时，`util::resolve_dot_libra_pointer` 解析真实元数据目录，仓库发现（`try_get_paths_full_with_storage_lookup`）、`info/*` 候选与 `alternates` 的 objects 解析都改读 `<dir>`。会写 ref 的子命令仍由 `CL-28` 默认拒绝。
+
+- 2026-11-23（PM-14 / #1029）：`CatFileArgs` 新增第二位置参数；无模式且两个位置参数时走 `print_typed_object`——校验类型（`blob|tree|commit|tag`，否则 `LBR-CLI-002`），按 Git `odb_read_object_peeled` 语义剥附注标签、`tree` 请求把提交剥到其 tree，类型不符 `LBR-CLI-003`，最终写出原始字节（tree 为二进制）；模式标志与双位置同用的互斥校验先于全部模式分派（含 `--ai*`）。回归：`cat_file_type_object_form`（AC1–AC8）；`cat_file_test` 35/35。

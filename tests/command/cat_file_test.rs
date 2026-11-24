@@ -1719,3 +1719,84 @@ fn test_cat_file_batch_modes_answer_each_line_before_eof() {
         ],
     );
 }
+
+/// PM-14: `cat-file <type> <object>` peels tags/commits and prints raw bytes.
+#[test]
+fn cat_file_type_object_form() {
+    use std::process::Command;
+
+    let repo = tempfile::tempdir().expect("tempdir");
+    let libra = env!("CARGO_BIN_EXE_libra");
+    let run = |args: &[&str]| {
+        Command::new(libra)
+            .args(args)
+            .current_dir(repo.path())
+            .env("HOME", repo.path().join(".home"))
+            .env("LIBRA_TEST", "1")
+            .output()
+            .expect("run libra")
+    };
+    assert!(run(&["init", "--vault", "false"]).status.success());
+    assert!(run(&["config", "user.name", "t"]).status.success());
+    assert!(run(&["config", "user.email", "t@t"]).status.success());
+    std::fs::write(repo.path().join("a.txt"), "hello\n").unwrap();
+    assert!(run(&["add", "a.txt"]).status.success());
+    assert!(run(&["commit", "-m", "c1", "--no-verify"]).status.success());
+    let hello_blob = String::from_utf8_lossy(&run(&["rev-parse", "HEAD:a.txt"]).stdout)
+        .trim()
+        .to_string();
+    assert!(run(&["tag", "-a", "v1", "-m", "tagmsg"]).status.success());
+    // A second commit so HEAD is not the tagged commit.
+    std::fs::write(repo.path().join("a.txt"), "first\n").unwrap();
+    assert!(run(&["add", "a.txt"]).status.success());
+    assert!(run(&["commit", "-m", "c2", "--no-verify"]).status.success());
+
+    // AC1: commit bytes equal `-p`.
+    let raw = run(&["cat-file", "commit", "HEAD"]);
+    assert!(raw.status.success(), "AC1");
+    assert_eq!(raw.stdout, run(&["cat-file", "-p", "HEAD"]).stdout, "AC1");
+
+    // AC2: the earlier blob prints its exact bytes.
+    let blob = run(&["cat-file", "blob", &hello_blob]);
+    assert!(blob.status.success(), "AC2");
+    assert_eq!(blob.stdout, b"hello\n", "AC2");
+
+    // AC3: a commit peels to its raw tree bytes.
+    let tree = run(&["cat-file", "tree", "HEAD"]);
+    assert!(tree.status.success(), "AC3");
+    assert!(tree.stdout.starts_with(b"100644 a.txt"), "AC3: {tree:?}");
+
+    // AC4/AC7: annotated tags print raw tag bytes and peel to their commit.
+    let tag = run(&["cat-file", "tag", "v1"]);
+    assert!(tag.status.success(), "AC4");
+    assert_eq!(tag.stdout, run(&["cat-file", "-p", "v1"]).stdout, "AC4");
+    let peeled = run(&["cat-file", "commit", "v1"]);
+    assert!(peeled.status.success(), "AC7");
+    assert_eq!(
+        peeled.stdout,
+        run(&["cat-file", "-p", "v1^{commit}"]).stdout,
+        "AC7"
+    );
+
+    // AC5/AC6: impossible peels and unknown types.
+    let not_blob = run(&["cat-file", "blob", "HEAD"]);
+    assert!(!not_blob.status.success(), "AC5 must fail");
+    assert!(
+        String::from_utf8_lossy(&not_blob.stderr).contains("LBR-CLI-003"),
+        "AC5 code"
+    );
+    let bogus = run(&["cat-file", "bogus", "HEAD"]);
+    assert!(!bogus.status.success(), "AC6 must fail");
+    assert!(
+        String::from_utf8_lossy(&bogus.stderr).contains("LBR-CLI-002"),
+        "AC6 code"
+    );
+
+    // AC8: mode flags conflict with the two-positional form.
+    let mixed = run(&["cat-file", "--ai-list-types", "commit", "HEAD"]);
+    assert!(!mixed.status.success(), "AC8 must fail");
+    assert!(
+        String::from_utf8_lossy(&mixed.stderr).contains("LBR-CLI-002"),
+        "AC8 code"
+    );
+}
