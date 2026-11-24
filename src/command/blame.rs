@@ -86,6 +86,15 @@ pub struct BlameArgs {
     #[clap(long = "no-abbrev")]
     pub no_abbrev: bool,
 
+    /// Spend extra time to find the minimum-edit-script line mapping (Git's
+    /// `--minimal`). `--no-minimal` cancels it; the last flag wins.
+    #[clap(long = "minimal", overrides_with = "no_minimal")]
+    pub minimal: bool,
+
+    /// Cancel an earlier `--minimal` (Git's `--no-minimal`).
+    #[clap(long = "no-minimal", overrides_with = "minimal")]
+    pub no_minimal: bool,
+
     /// Suppress the author name and timestamp columns from the default output.
     #[clap(short = 's')]
     pub suppress: bool,
@@ -145,6 +154,44 @@ pub struct BlameArgs {
 /// vertical-tab/form-feed/carriage-return only. We deliberately do NOT use
 /// `char::is_whitespace`, which also matches Unicode whitespace (e.g. NBSP), so
 /// a non-ASCII-whitespace edit is still treated as a real change as in Git.
+/// Equal `(parent_line, current_line)` pairs from the bounded Myers diff.
+fn compute_equal_pairs(operations: Vec<git_internal::diff::DiffOperation>) -> Vec<(usize, usize)> {
+    use git_internal::diff::DiffOperation;
+    operations
+        .into_iter()
+        .filter_map(|op| match op {
+            DiffOperation::Equal { old_line, new_line } => Some((old_line, new_line)),
+            DiffOperation::Insert { .. } | DiffOperation::Delete { .. } => None,
+        })
+        .collect()
+}
+
+/// Equal `(parent_line, current_line)` pairs from `similar`'s minimum-edit
+/// RawMyers (`--minimal`).
+fn raw_myers_equal_pairs(parent: &[String], current: &[String]) -> Vec<(usize, usize)> {
+    use similar::{ChangeTag, TextDiff};
+    let parent_refs: Vec<&str> = parent.iter().map(String::as_str).collect();
+    let current_refs: Vec<&str> = current.iter().map(String::as_str).collect();
+    let diff = TextDiff::configure()
+        .algorithm(similar::Algorithm::RawMyers)
+        .diff_slices(&parent_refs, &current_refs);
+    let mut pairs = Vec::new();
+    let mut old_line = 1usize;
+    let mut new_line = 1usize;
+    for change in diff.iter_all_changes() {
+        match change.tag() {
+            ChangeTag::Equal => {
+                pairs.push((old_line, new_line));
+                old_line += 1;
+                new_line += 1;
+            }
+            ChangeTag::Delete => old_line += 1,
+            ChangeTag::Insert => new_line += 1,
+        }
+    }
+    pairs
+}
+
 fn normalize_for_whitespace(line: &str) -> String {
     line.chars()
         .filter(|c| !matches!(c, ' ' | '\t' | '\n' | '\x0b' | '\x0c' | '\r'))
@@ -531,52 +578,57 @@ async fn run_blame(args: &BlameArgs) -> Result<BlameOutput, BlameError> {
             // differs only in whitespace is treated as unchanged and attributed
             // to the parent. The default path diffs the borrowed line vectors
             // directly (no copy); the original lines are always kept for display.
-            let operations = if args.ignore_whitespace {
-                let diff_parent: Vec<String> = parent_lines
-                    .iter()
-                    .map(|l| normalize_for_whitespace(l))
-                    .collect();
-                let diff_current: Vec<String> = current_lines
-                    .iter()
-                    .map(|l| normalize_for_whitespace(l))
-                    .collect();
-                compute_diff(&diff_parent, &diff_current)
+            let (diff_parent, diff_current): (Vec<String>, Vec<String>) = if args.ignore_whitespace
+            {
+                (
+                    parent_lines
+                        .iter()
+                        .map(|l| normalize_for_whitespace(l))
+                        .collect(),
+                    current_lines
+                        .iter()
+                        .map(|l| normalize_for_whitespace(l))
+                        .collect(),
+                )
             } else {
-                compute_diff(&parent_lines, &current_lines)
+                (parent_lines.clone(), current_lines.clone())
             };
-            for op in operations {
-                use git_internal::diff::DiffOperation;
-                match op {
-                    DiffOperation::Insert { .. } | DiffOperation::Delete { .. } => {}
-                    DiffOperation::Equal { old_line, new_line } => {
-                        // Remap the current-commit line number to the final target
-                        // line via this commit's mapping (identity for the target).
-                        let Some(Some(final_idx)) = cur_to_final.get(new_line - 1).copied() else {
-                            continue;
+            // `--minimal` swaps the bounded Myers for `similar`'s minimum-edit
+            // RawMyers; only the equal-line pairs are consumed below.
+            let equal_pairs = if args.minimal {
+                raw_myers_equal_pairs(&diff_parent, &diff_current)
+            } else {
+                compute_equal_pairs(compute_diff(&diff_parent, &diff_current))
+            };
+            for (old_line, new_line) in equal_pairs {
+                {
+                    // Remap the current-commit line number to the final target
+                    // line via this commit's mapping (identity for the target).
+                    let Some(Some(final_idx)) = cur_to_final.get(new_line - 1).copied() else {
+                        continue;
+                    };
+                    if let Some(slot) = parent_to_final.get_mut(old_line - 1) {
+                        *slot = Some(final_idx);
+                    }
+                    if let Some(blame) = blame_lines.get_mut(final_idx)
+                        && blame.commit_id == current_id
+                    {
+                        // Compare the parent line against the blamed line using
+                        // the same normalization the diff used, so `-w` matches
+                        // whitespace-only differences. The default path compares
+                        // borrowed strings directly (no allocation per line).
+                        let parent_line = parent_lines.get(old_line - 1);
+                        let is_match = if args.ignore_whitespace {
+                            let blame_key = normalize_for_whitespace(&blame.content);
+                            parent_line.map(|l| normalize_for_whitespace(l)) == Some(blame_key)
+                        } else {
+                            parent_line == Some(&blame.content)
                         };
-                        if let Some(slot) = parent_to_final.get_mut(old_line - 1) {
-                            *slot = Some(final_idx);
-                        }
-                        if let Some(blame) = blame_lines.get_mut(final_idx)
-                            && blame.commit_id == current_id
-                        {
-                            // Compare the parent line against the blamed line using
-                            // the same normalization the diff used, so `-w` matches
-                            // whitespace-only differences. The default path compares
-                            // borrowed strings directly (no allocation per line).
-                            let parent_line = parent_lines.get(old_line - 1);
-                            let is_match = if args.ignore_whitespace {
-                                let blame_key = normalize_for_whitespace(&blame.content);
-                                parent_line.map(|l| normalize_for_whitespace(l)) == Some(blame_key)
-                            } else {
-                                parent_line == Some(&blame.content)
-                            };
-                            if is_match {
-                                blame.commit_id = *parent_id;
-                                blame.author = parent_commit.author.name.clone();
-                                blame.author_email = parent_commit.author.email.clone();
-                                blame.timestamp = parent_commit.author.timestamp as i64;
-                            }
+                        if is_match {
+                            blame.commit_id = *parent_id;
+                            blame.author = parent_commit.author.name.clone();
+                            blame.author_email = parent_commit.author.email.clone();
+                            blame.timestamp = parent_commit.author.timestamp as i64;
                         }
                     }
                 }

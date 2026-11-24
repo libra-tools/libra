@@ -181,6 +181,7 @@ The commit argument is positional (second argument after the file path) rather t
 | Abbrev length | `--abbrev <N>` | `--abbrev=<N>` | N/A |
 | Don't treat root as boundary | `--root` (no-op; root already shown as normal) | `--root` | N/A |
 | Ignore whitespace | `-w` / `--ignore-whitespace` (ignore-all-whitespace) | `-w` | N/A |
+| Minimal line mapping | `--minimal` / `--no-minimal` (last flag wins; minimum-edit-script mapping via `similar`'s RawMyers) | `--minimal` / `--no-minimal` | N/A |
 | Porcelain format | `-p` / `--porcelain` / `--line-porcelain` (no original line numbers, `boundary`, or `previous` metadata) | `-p` / `--porcelain` / `--line-porcelain` | N/A |
 | Incremental output | `--incremental` (header/metadata/boundary/filename, no content lines) | `--incremental` | N/A |
 | Score threshold | Not supported | `-M` / `-C` (move/copy detection) | N/A |

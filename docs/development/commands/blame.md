@@ -79,3 +79,4 @@ flowchart TD
 
 - 2026-11-13（#478 LG-19，ADR-LG-11）：`-M[<score>]` 扫描父提交同文件行指纹、`-C[<score>]` 扫描父提交其它文件；默认分数 20 个字母数字字符（短行不重新归因），支持自定义分数与 `-w` 规范化；porcelain/incremental 的 `filename` 指向来源文件。实现仍为父树一次性扫描（多重 `-C` 目前共享同一扫描，登记为收窄）。测试：`test_blame_move_copy_detection_matrix`（M1/M2/M5 + porcelain 来源）、`blame_test` 24/24。
 
+- 2026-11-23（PM-07 / #848）：新增可取反的 `--minimal`/`--no-minimal`（`overrides_with` 末次生效）；启用时父子行映射改用 `similar::Algorithm::RawMyers`（`raw_myers_equal_pairs`），默认仍走 `git_internal::diff::compute_diff`（`compute_equal_pairs`，有界 Myers）。`Cargo.toml` 的 `similar` 要求升到 `3.2.0`（`Cargo.lock` 已解析）。回归：`blame_minimal_matches_t8015_and_minimum_edit_scripts`（AC1–AC8，含 1000/1017 行夹具的 SHA-256 自检与 684 vs 683 行判据）；`blame_test` 25/25。

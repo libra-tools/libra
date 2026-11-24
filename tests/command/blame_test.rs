@@ -840,6 +840,8 @@ async fn blame_runs_with_sha1() {
         root: false,
         blank_boundary: false,
         show_name: false,
+        minimal: false,
+        no_minimal: false,
         ignore_whitespace: false,
         detect_moves: None,
         detect_copies: Vec::new(),
@@ -875,6 +877,8 @@ async fn blame_runs_with_sha256() {
         root: false,
         blank_boundary: false,
         show_name: false,
+        minimal: false,
+        no_minimal: false,
         ignore_whitespace: false,
         detect_moves: None,
         detect_copies: Vec::new(),
@@ -992,6 +996,8 @@ async fn blame_root_flag_is_accepted_noop() {
         root: true,
         blank_boundary: false,
         show_name: false,
+        minimal: false,
+        no_minimal: false,
         ignore_whitespace: false,
         detect_moves: None,
         detect_copies: Vec::new(),
@@ -1320,4 +1326,197 @@ fn test_blame_move_copy_detection_matrix() {
     assert_cli_success(&short, "blame -M short");
     let short_text = String::from_utf8_lossy(&short.stdout).into_owned();
     assert!(!short_text.contains(&root_short), "{short_text}");
+}
+
+/// Deterministic xorshift fixture used by PM-07 (`t8015`-style minimal diff).
+struct XorShift(u64);
+
+impl XorShift {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+}
+
+fn minimal_fixture_lines() -> (Vec<String>, Vec<String>) {
+    let mut rng = XorShift(1);
+    let old: Vec<String> = (0..1000)
+        .map(|_| format!("L{}", rng.next() % 200))
+        .collect();
+    let mut new: Vec<String> = old
+        .iter()
+        .filter(|_| rng.next() % 3 != 0)
+        .cloned()
+        .collect();
+    for _ in 0..333 {
+        let position = (rng.next() as usize) % (new.len() + 1);
+        let value = rng.next() % 200;
+        new.insert(position, format!("L{value}"));
+    }
+    (old, new)
+}
+
+fn sha256_hex(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(text.as_bytes());
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn author_count(output: &std::process::Output, author: &str) -> usize {
+    let needle = format!(" ({author} ");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| line.contains(&needle))
+        .count()
+}
+
+/// PM-07: `--minimal` / `--no-minimal` select the minimum-edit-script mapping.
+#[test]
+fn blame_minimal_matches_t8015_and_minimum_edit_scripts() {
+    // t8015-style repository: Commit_1 makes 4 `x` lines, Commit_2 the 11-line
+    // version; the minimum-edit mapping keeps the middle `x` with Commit_1.
+    let repo = tempdir().expect("failed to create repository root");
+    init_repo_via_cli(repo.path());
+    configure_identity_via_cli(repo.path());
+    std::fs::write(repo.path().join("file.txt"), "x\nx\nx\nx\n").expect("write v1");
+    assert_cli_success(
+        &run_libra_command(&["add", "file.txt"], repo.path()),
+        "add v1",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "commit",
+                "-m",
+                "one",
+                "--author",
+                "Commit_1 <c1@x>",
+                "--no-verify",
+            ],
+            repo.path(),
+        ),
+        "commit one",
+    );
+    std::fs::write(
+        repo.path().join("file.txt"),
+        "x\nx\nx\nA\nB\nC\nD\nx\nE\nF\nG\n",
+    )
+    .expect("write v2");
+    assert_cli_success(
+        &run_libra_command(&["add", "file.txt"], repo.path()),
+        "add v2",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "commit",
+                "-m",
+                "two",
+                "--author",
+                "Commit_2 <c2@x>",
+                "--no-verify",
+            ],
+            repo.path(),
+        ),
+        "commit two",
+    );
+
+    let minimal = run_libra_command(&["blame", "--minimal", "file.txt"], repo.path());
+    assert_cli_success(&minimal, "AC1");
+    let authors: Vec<String> = String::from_utf8_lossy(&minimal.stdout)
+        .lines()
+        .map(|line| {
+            let start = line.find(" (").map(|i| i + 2).unwrap_or(0);
+            let rest = &line[start..];
+            rest[..rest.find(' ').unwrap_or(rest.len())].to_string()
+        })
+        .collect();
+    assert_eq!(
+        authors,
+        [
+            "Commit_1", "Commit_1", "Commit_1", "Commit_2", "Commit_2", "Commit_2", "Commit_2",
+            "Commit_1", "Commit_2", "Commit_2", "Commit_2"
+        ],
+        "AC1 author sequence"
+    );
+
+    // AC2: an option after the file is still parsed as an option.
+    let after = run_libra_command(&["blame", "file.txt", "--minimal"], repo.path());
+    assert_cli_success(&after, "AC2");
+    assert_eq!(after.stdout, minimal.stdout, "AC2");
+
+    // AC7: `--minimal` is a boolean flag.
+    let bad = run_libra_command(&["blame", "--minimal=1", "file.txt"], repo.path());
+    assert!(!bad.status.success(), "AC7 must fail");
+    assert!(
+        String::from_utf8_lossy(&bad.stderr).contains("LBR-CLI-002"),
+        "AC7 code"
+    );
+
+    // Separate F07g repository: 1000-line old / 1017-line new, longest common
+    // subsequence 684 lines (the bounded Myers default finds 683).
+    let repo = tempdir().expect("failed to create repository root");
+    init_repo_via_cli(repo.path());
+    configure_identity_via_cli(repo.path());
+    let (old, new) = minimal_fixture_lines();
+    let old_text = format!("{}\n", old.join("\n"));
+    let new_text = format!("{}\n", new.join("\n"));
+    assert_eq!(old.len(), 1000, "fixture old length");
+    assert_eq!(new.len(), 1017, "fixture new length");
+    assert_eq!(
+        sha256_hex(&old_text),
+        "46b9dc84583da4c49605498905318dd3f8963e48a9186997ef4d21d565508c30",
+        "fixture old hash"
+    );
+    assert_eq!(
+        sha256_hex(&new_text),
+        "5c3ffa835f837a33acfa6ab3c4883c94d544d7ba74d11d2540cdd671ae18fbd2",
+        "fixture new hash"
+    );
+    std::fs::write(repo.path().join("g.txt"), &old_text).expect("write g.txt v1");
+    assert_cli_success(
+        &run_libra_command(&["add", "g.txt"], repo.path()),
+        "add g v1",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &["commit", "-m", "P", "--author", "P <p@x>", "--no-verify"],
+            repo.path(),
+        ),
+        "commit P",
+    );
+    std::fs::write(repo.path().join("g.txt"), &new_text).expect("write g.txt v2");
+    assert_cli_success(
+        &run_libra_command(&["add", "g.txt"], repo.path()),
+        "add g v2",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &["commit", "-m", "Q", "--author", "Q <q@x>", "--no-verify"],
+            repo.path(),
+        ),
+        "commit Q",
+    );
+
+    let counts = |args: &[&str]| author_count(&run_libra_command(args, repo.path()), "P");
+    assert_eq!(counts(&["blame", "--minimal", "g.txt"]), 684, "AC3");
+    assert_eq!(counts(&["blame", "g.txt"]), 683, "AC4");
+    assert_eq!(
+        counts(&["blame", "--minimal", "--no-minimal", "g.txt"]),
+        683,
+        "AC5"
+    );
+    assert_eq!(
+        counts(&["blame", "--no-minimal", "--minimal", "g.txt"]),
+        684,
+        "AC6"
+    );
+    assert_eq!(counts(&["blame", "-w", "--minimal", "g.txt"]), 684, "AC8");
 }

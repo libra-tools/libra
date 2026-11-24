@@ -167,6 +167,7 @@ Git 的 blame 默认使用 HEAD，并要求 `git blame --contents <file>` 才能
 | 缩写位数 | `--abbrev <N>` | `--abbrev=<N>` | N/A |
 | 不把 root 当边界 | `--root`（no-op；root 已按普通提交显示） | `--root` | N/A |
 | 忽略空白 | `-w` / `--ignore-whitespace`（ignore-all-whitespace） | `-w` | N/A |
+| 最小行映射 | `--minimal` / `--no-minimal`（后者覆盖前者；经 `similar` 的 RawMyers 求最小编辑脚本） | `--minimal` / `--no-minimal` | N/A |
 | Porcelain 格式 | `-p` / `--porcelain` / `--line-porcelain` | `-p` / `--porcelain` / `--line-porcelain` | N/A |
 | 增量输出 | `--incremental`（头部/元数据/`boundary`/`filename`，无内容行） | `--incremental` | N/A |
 | 评分阈值 | 不支持 | `-M` / `-C`（移动/复制检测） | N/A |

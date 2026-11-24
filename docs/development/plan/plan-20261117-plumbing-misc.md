@@ -984,7 +984,7 @@ PY
 ### Task PM-07: 支持 `libra blame --minimal` / `--no-minimal`（#848）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-23：`BlameArgs` 新增 `--minimal`/`--no-minimal`（`overrides_with` 末次生效）；启用时父子行映射走 `raw_myers_equal_pairs`（`similar::Algorithm::RawMyers`），默认仍用 `compute_equal_pairs(compute_diff(..))`（有界 Myers，行为不变）；`Cargo.toml` 的 `similar` 要求升到 `3.2.0`（`Cargo.lock` 已解析为 3.2.0，未手改）。AC1–AC8 由 `command::blame_test::blame_minimal_matches_t8015_and_minimum_edit_scripts` 覆盖（F07 的 Commit_1/Commit_2 序列；F07g 的 1000/1017 行夹具先断言两版 SHA-256，再验证 684 vs 683 的判据、`--minimal --no-minimal` 与反向组合、`-w` 分支）；`blame_test` 25/25；EN/zh/开发文档与 `COMPATIBILITY.md` 的 `blame` 行同步。
 **Description:** 为 `BlameArgs` 新增可取反的 `--minimal`（`--no-minimal` 取消，后者覆盖前者，与 Git `XDF_NEED_MINIMAL` 的末次生效一致）；启用时 `blame` 的父子行映射改用 `similar::Algorithm::RawMyers`（最小编辑脚本），默认仍走 `git_internal::diff::compute_diff`（`similar` 的有界 Myers）。为使用 `RawMyers` 把 `Cargo.toml` 的 `similar` 版本要求由 `3.1.1` 提到 `3.2.0`（`Cargo.lock` 已解析为 3.2.0，由工具链刷新而非手改）。`Cargo.toml` 同属发布写集，按 G-10 的 I–R 规则只在本卡的串行发布窗口内修改。
 **Out of scope:** `--diff-algorithm` 与 `diff.algorithm` 配置（`t8015` #3–#5、#7，尚未排期，重启条件：后续 blame 兼容计划）；`diff`/`format-patch` 中 `--minimal` 注释所述「后端已保证最短编辑脚本」的陈旧表述（随后续 diff 计划修正，本卡不改 `diff.rs`）。
 **Current evidence:**
