@@ -1066,7 +1066,7 @@ mod tests {
                 .unwrap(),
             SchemaCompatibility::UpgradeRequired {
                 current_version: Some(WORKTREE_LAYOUT_CAPABILITY_VERSION),
-                latest_version: 2026103101,
+                latest_version: 2026111702,
             }
         ));
     }

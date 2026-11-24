@@ -22,7 +22,7 @@ use fixtures::{
 #[test]
 fn combined_registry_keeps_both_original_migrations_and_adds_a_forward_barrier() {
     let migrations = builtin_migrations();
-    assert_eq!(migrations.len(), 73);
+    assert_eq!(migrations.len(), 74);
     let tail: Vec<_> = migrations
         .iter()
         .filter(|migration| migration.version >= OPERATION_V2)
@@ -50,6 +50,7 @@ fn combined_registry_keeps_both_original_migrations_and_adds_a_forward_barrier()
             (2026102201, "agent_session_commit"),
             (2026103001, "agent_kind_hermes"),
             (2026103101, "agent_kind_pi"),
+            (2026111702, "symbolic_ref"),
         ]
     );
     let commit = migrations
@@ -57,7 +58,7 @@ fn combined_registry_keeps_both_original_migrations_and_adds_a_forward_barrier()
         .find(|migration| migration.version == 2026102201)
         .expect("session commit migration");
     assert!(commit.down.is_none(), "CX-11 stays forward-only");
-    assert_eq!(migrations.last().unwrap().version, 2026103101);
+    assert_eq!(migrations.last().unwrap().version, 2026111702);
     assert!(migrations.last().unwrap().down.is_some());
 }
 
@@ -99,6 +100,7 @@ async fn change_identity_prefix_index_repair_replays_after_old_receipt() {
             2026102201,
             2026103001,
             2026103101,
+            2026111702,
         ]
     );
 
@@ -153,7 +155,7 @@ async fn config_branch_ordinary_open_catches_up_operations_without_rewriting_rec
     assert_eq!(rows(&conn, "config").await, config);
     assert_eq!(rows(&conn, "config_kv").await, modern);
     let after = receipts(&conn).await;
-    assert_eq!(after.len(), 73);
+    assert_eq!(after.len(), 74);
     for (version, name) in [
         (OPERATION_V2, "operation_v2"),
         (CONVERGENCE, "operation_v2_branch_convergence"),
@@ -173,6 +175,7 @@ async fn config_branch_ordinary_open_catches_up_operations_without_rewriting_rec
         (2026102201, "agent_session_commit"),
         (2026103001, "agent_kind_hermes"),
         (2026103101, "agent_kind_pi"),
+        (2026111702, "symbolic_ref"),
     ] {
         assert_eq!(after.iter().find(|row| row.0 == version).unwrap().1, name);
     }
@@ -182,7 +185,7 @@ async fn config_branch_ordinary_open_catches_up_operations_without_rewriting_rec
             "changed original receipt {receipt:?}"
         );
     }
-    assert_eq!(after.last().unwrap().0, 2026103101);
+    assert_eq!(after.last().unwrap().0, 2026111702);
     let unchanged = snapshot(&conn).await;
     conn.close().await.unwrap();
     let reopened = db::establish_connection(path.to_str().unwrap())
@@ -238,6 +241,7 @@ async fn operation_v2_branch_keeps_modern_rows_without_recopying() {
             2026102201,
             2026103001,
             2026103101,
+            2026111702,
         ]
     );
     assert_eq!(operation_rows_without_boundary_columns(&conn).await, modern);
@@ -359,7 +363,8 @@ async fn concurrent_config_branch_upgraders_claim_the_copy_and_barrier_once() {
             2026102201,
             2026103001,
             2026103101,
+            2026111702,
         ]
     );
-    assert_eq!(receipts(&left).await.len(), 73);
+    assert_eq!(receipts(&left).await.len(), 74);
 }

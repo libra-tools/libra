@@ -611,6 +611,7 @@ const AGENT_KIND_WITH_HERMES: &[&str] = &[
 /// The previous complete set, including `grok`, `opencode`, and `hermes`,
 /// stays.
 const AGENT_KIND_PI_VERSION: i64 = 2026103101;
+const SYMBOLIC_REF_VERSION: i64 = 2026111702;
 const AGENT_KIND_WITH_PI: &[&str] = &[
     "claude_code",
     "cursor",
@@ -3196,6 +3197,15 @@ pub(crate) fn repository_migrations() -> Vec<Migration> {
             include_str!("../../../sql/migrations/2026103101_agent_kind_pi.sql"),
             include_str!("../../../sql/migrations/2026103101_agent_kind_pi_down.sql"),
         ),
+        // PM-01 / GC-13: symbolic references other than HEAD, guarded in SQL so
+        // a `refs/heads/<branch>` symbolic row and its entity branch row can
+        // never coexist.
+        sql_migration(
+            SYMBOLIC_REF_VERSION,
+            "symbolic_ref",
+            include_str!("../../../sql/migrations/2026111702_symbolic_ref.sql"),
+            include_str!("../../../sql/migrations/2026111702_symbolic_ref_down.sql"),
+        ),
     ]
 }
 
@@ -3657,9 +3667,9 @@ mod tests {
         // `builtin_migrations()` so silent registry regressions surface
         // here in addition to `tests/db_migration_test.rs`.
         let runner = builtin_runner().expect("CEX-12.5 builtin registry must build clean");
-        assert_eq!(runner.len(), 73);
+        assert_eq!(runner.len(), 74);
         assert!(!runner.is_empty());
-        assert_eq!(runner.max_registered_version(), Some(2026103101));
+        assert_eq!(runner.max_registered_version(), Some(2026111702));
     }
 
     #[test]

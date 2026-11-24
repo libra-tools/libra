@@ -372,7 +372,7 @@ async fn worktree_layout_capability_upgrade_is_metadata_only_and_idempotent() {
             .unwrap(),
         SchemaCompatibility::UpgradeRequired {
             current_version: Some(2026101902),
-            latest_version: 2026103101,
+            latest_version: 2026111702,
         }
     ));
 }
@@ -428,7 +428,7 @@ async fn worktree_layout_capability_is_present_in_a_fresh_repository() {
         db::schema::current_schema_version_for_role(&conn, DatabaseRole::Repository)
             .await
             .unwrap(),
-        Some(2026103101)
+        Some(2026111702)
     );
     conn.close().await.unwrap();
     let reopened =
@@ -450,7 +450,7 @@ async fn agent_session_commit_schema_is_repository_only_and_forward_only() {
     assert!(commit.down.is_none(), "CX-11 stays forward-only");
     assert_eq!(
         repository.last().map(|migration| migration.version),
-        Some(2026103101),
+        Some(2026111702),
         "PI-01 is the repository tip after the session-commit barrier"
     );
     for role in [
@@ -485,7 +485,7 @@ async fn agent_session_commit_schema_is_repository_only_and_forward_only() {
         db::schema::current_schema_version_for_role(&conn, DatabaseRole::Repository)
             .await
             .unwrap(),
-        Some(2026103101)
+        Some(2026111702)
     );
     let error = all_builtin_runner()
         .unwrap()
@@ -6370,7 +6370,12 @@ async fn pre_hermes_repository() -> CheckRebuildRepo {
         .rollback_to(&conn, PRE_HERMES_TIP)
         .await
         .expect("take the repository below the hermes CHECK");
-    assert_eq!(rolled_back, vec![PI_CHECK_VERSION, HERMES_CHECK_VERSION]);
+    // PM-01's symbolic_ref migration is newer than the hermes CHECK, so a
+    // rollback below it removes that version first.
+    assert_eq!(
+        rolled_back,
+        vec![2026111702, PI_CHECK_VERSION, HERMES_CHECK_VERSION]
+    );
     for kind in KINDS_BEFORE_HERMES {
         check_rebuild_exec(
             &conn,
@@ -6540,9 +6545,17 @@ async fn assert_check_rebuilt(repo: &CheckRebuildRepo, before: &RepositoryDigest
         assert!(ddl.contains(&format!("'{kind}'")), "{kind} missing: {ddl}");
     }
     let after = repository_digest(repo).await;
+    // Tables created by migrations NEWER than the rollback point (PM-01's
+    // `symbolic_ref`) legitimately appear only after the upgrade, so compare
+    // every table that existed before the rebuild.
+    let before_data = before.data();
+    let after_data: std::collections::BTreeMap<_, _> = after
+        .data()
+        .into_iter()
+        .filter(|(table, _)| before_data.contains_key(table))
+        .collect();
     assert_eq!(
-        after.data(),
-        before.data(),
+        after_data, before_data,
         "every row is kept, value for value"
     );
     let dependents = |digest: &RepositoryDigest| -> Vec<String> {
@@ -6890,11 +6903,16 @@ async fn agent_kind_check_rebuild_records_an_expanded_check_only_when_clean() {
     );
     let (receipt, ddl) = check_rebuild_state(&repo).await;
     assert!(receipt, "the receipt is recorded over a clean database");
-    assert_eq!(
-        repository_digest(&repo).await.data(),
-        rebuilt_before.data(),
-        "nothing else changes"
-    );
+    // `repo.open` also applies migrations newer than the snapshot, so only the
+    // tables captured before are compared.
+    let before_data = rebuilt_before.data();
+    let after_data: std::collections::BTreeMap<_, _> = repository_digest(&repo)
+        .await
+        .data()
+        .into_iter()
+        .filter(|(table, _)| before_data.contains_key(table))
+        .collect();
+    assert_eq!(after_data, before_data, "nothing else changes");
     assert!(ddl.contains("'hermes'"), "{ddl}");
 }
 
@@ -8131,4 +8149,246 @@ async fn capture_db_status_does_not_open_capture_database() {
             .join("capture.db")
             .exists()
     );
+}
+
+// PM-01: the symbolic_ref table and its four exclusivity triggers.
+
+async fn sqlite_snapshot(conn: &DatabaseConnection) -> Vec<String> {
+    let objects = conn
+        .query_all_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Sqlite,
+            "SELECT type, name, sql FROM sqlite_master ORDER BY type, name".to_string(),
+        ))
+        .await
+        .expect("read sqlite_master");
+    let versions = conn
+        .query_all_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Sqlite,
+            "SELECT version, name FROM schema_versions ORDER BY version".to_string(),
+        ))
+        .await
+        .expect("read schema_versions");
+    let mut snapshot: Vec<String> = objects
+        .into_iter()
+        .map(|row| {
+            format!(
+                "{}|{}|{}",
+                row.try_get::<String>("", "type").unwrap_or_default(),
+                row.try_get::<String>("", "name").unwrap_or_default(),
+                row.try_get::<Option<String>>("", "sql")
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default()
+            )
+        })
+        .collect();
+    snapshot.extend(versions.into_iter().map(|row| {
+        format!(
+            "version|{}|{}",
+            row.try_get::<i64>("", "version").unwrap_or_default(),
+            row.try_get::<String>("", "name").unwrap_or_default()
+        )
+    }));
+    snapshot
+}
+
+async fn config_db_snapshot(fixture: &ConfigDbFixture) -> Vec<(String, Vec<u8>)> {
+    let mut files = Vec::new();
+    for path in [fixture.global_db(), fixture.system_db()] {
+        let bytes = std::fs::read(path).unwrap_or_default();
+        files.push((path.display().to_string(), bytes));
+    }
+    files
+}
+
+#[tokio::test]
+#[serial(env)]
+async fn symbolic_ref_migration_upgrade_contract() {
+    let fixture = ConfigDbFixture::new().expect("create config DB fixture");
+    let (_dir, url, _path) = fresh_db_url();
+    let conn = connect(&url).await;
+    let runner = all_builtin_runner().expect("builtin runner");
+    runner
+        .run_pending_up_to(&conn, 2026103101)
+        .await
+        .expect("initialize the prior repository schema");
+
+    // Seed representative rows so AC1 can prove the migration leaves them alone.
+    conn.execute_unprepared(
+        "INSERT INTO reference (name, kind, `commit`, remote) VALUES ('main', 'Branch', 'deadbeef', NULL); \
+         INSERT INTO reference (name, kind, `commit`, remote) VALUES ('v1', 'Tag', 'deadbeef', NULL);",
+    )
+    .await
+    .expect("seed reference rows");
+    let before = reference_rows(&conn).await;
+
+    // Open both configuration roles first so the fixture wiring is already
+    // materialized when the "before" snapshot is taken.
+    for role in [DatabaseRole::GlobalConfig, DatabaseRole::SystemConfig] {
+        let path = match role {
+            DatabaseRole::GlobalConfig => fixture.global_db(),
+            _ => fixture.system_db(),
+        };
+        if !path.exists() {
+            std::fs::File::create(&path).expect("materialize config db file");
+        }
+        let guard = db::establish_connection_for_role(path.to_str().unwrap(), role)
+            .await
+            .expect("open config db");
+        guard.close().await.expect("close config db");
+    }
+    let config_before = config_db_snapshot(&fixture).await;
+
+    assert_eq!(
+        runner.run_pending_up_to(&conn, 2026111702).await.unwrap(),
+        [2026111702]
+    );
+    // AC1: every pre-existing reference row is byte-identical.
+    assert_eq!(reference_rows(&conn).await, before, "AC1 reference rows");
+    // AC7: reopening both configuration databases leaves them byte-identical.
+    for role in [DatabaseRole::GlobalConfig, DatabaseRole::SystemConfig] {
+        let path = match role {
+            DatabaseRole::GlobalConfig => fixture.global_db(),
+            _ => fixture.system_db(),
+        };
+        let guard = db::establish_connection_for_role(path.to_str().unwrap(), role)
+            .await
+            .expect("reopen config db");
+        guard.close().await.expect("close config db");
+    }
+    assert_eq!(
+        config_db_snapshot(&fixture).await,
+        config_before,
+        "AC7 config isolation"
+    );
+    conn.close().await.expect("close repo db");
+
+    // AC8: a pre-existing view named `symbolic_ref` makes the migration fail
+    // atomically — no receipt, no table, no triggers.
+    let (_dir2, url2, _path2) = fresh_db_url();
+    let conn = connect(&url2).await;
+    let runner = all_builtin_runner().expect("builtin runner");
+    runner
+        .run_pending_up_to(&conn, 2026103101)
+        .await
+        .expect("initialize the prior repository schema");
+    conn.execute_unprepared("CREATE VIEW symbolic_ref AS SELECT 1 AS name")
+        .await
+        .expect("seed conflicting view");
+    let snapshot_before = sqlite_snapshot(&conn).await;
+    let error = runner
+        .run_pending_up_to(&conn, 2026111702)
+        .await
+        .expect_err("the conflicting view must fail the migration");
+    assert!(!error.to_string().is_empty(), "AC8 error detail");
+    assert_eq!(
+        sqlite_snapshot(&conn).await,
+        snapshot_before,
+        "AC8 atomic failure"
+    );
+}
+
+async fn reference_rows(conn: &DatabaseConnection) -> Vec<String> {
+    conn.query_all_raw(Statement::from_string(
+        sea_orm::DatabaseBackend::Sqlite,
+        "SELECT id, name, kind, \"commit\", remote FROM reference ORDER BY id".to_string(),
+    ))
+    .await
+    .expect("read reference rows")
+    .into_iter()
+    .map(|row| {
+        format!(
+            "{}|{:?}|{:?}|{:?}|{:?}",
+            row.try_get::<i64>("", "id").unwrap_or_default(),
+            row.try_get::<Option<String>>("", "name").ok().flatten(),
+            row.try_get::<Option<String>>("", "kind").ok().flatten(),
+            row.try_get::<Option<String>>("", "commit").ok().flatten(),
+            row.try_get::<Option<String>>("", "remote").ok().flatten()
+        )
+    })
+    .collect()
+}
+
+#[tokio::test]
+async fn symbolic_ref_triggers_enforce_exclusivity() {
+    let (_dir, url, _path) = fresh_db_url();
+    let conn = connect(&url).await;
+    let runner = all_builtin_runner().expect("builtin runner");
+    runner
+        .run_pending_up_to(&conn, 2026111702)
+        .await
+        .expect("initialize the current repository schema");
+
+    let is_trigger_error = |error: &sea_orm::DbErr| {
+        error
+            .to_string()
+            .contains("symbolic ref conflicts with an existing local branch row")
+            || error
+                .to_string()
+                .contains("local branch row conflicts with an existing symbolic ref")
+    };
+
+    // AC3: an entity branch cannot be inserted under an existing symbolic row.
+    conn.execute_unprepared(
+        "INSERT INTO symbolic_ref (name, target) VALUES ('refs/heads/a', 'refs/heads/main')",
+    )
+    .await
+    .expect("seed symbolic ref");
+    let error = conn
+        .execute_unprepared("INSERT INTO reference (name, kind, `commit`, remote) VALUES ('a', 'Branch', 'deadbeef', NULL)")
+        .await
+        .expect_err("AC3 entity insert must fail");
+    assert!(is_trigger_error(&error), "AC3 error: {error}");
+
+    // AC2: promoting a tag onto a symbolic name via a kind-only UPDATE fails.
+    conn.execute_unprepared(
+        "INSERT INTO reference (name, kind, `commit`, remote) VALUES ('a', 'Tag', 'deadbeef', NULL)",
+    )
+    .await
+    .expect("seed tag row");
+    let error = conn
+        .execute_unprepared("UPDATE reference SET kind = 'Branch' WHERE kind = 'Tag'")
+        .await
+        .expect_err("AC2 kind-only update must fail");
+    assert!(is_trigger_error(&error), "AC2 error: {error}");
+
+    // AC4: a name-only UPDATE onto a symbolic name fails.
+    conn.execute_unprepared(
+        "INSERT INTO reference (name, kind, `commit`, remote) VALUES ('b', 'Branch', 'deadbeef', NULL)",
+    )
+    .await
+    .expect("seed branch b");
+    let error = conn
+        .execute_unprepared("UPDATE reference SET name = 'a' WHERE name = 'b'")
+        .await
+        .expect_err("AC4 rename must fail");
+    assert!(is_trigger_error(&error), "AC4 error: {error}");
+
+    // AC5: a symbolic row cannot be inserted for an existing entity branch.
+    conn.execute_unprepared(
+        "INSERT INTO reference (name, kind, `commit`, remote) VALUES ('main', 'Branch', 'deadbeef', NULL)",
+    )
+    .await
+    .expect("seed branch main");
+    let error = conn
+        .execute_unprepared(
+            "INSERT INTO symbolic_ref (name, target) VALUES ('refs/heads/main', 'refs/heads/main')",
+        )
+        .await
+        .expect_err("AC5 symbolic insert must fail");
+    assert!(is_trigger_error(&error), "AC5 error: {error}");
+
+    // AC6: renaming a symbolic row onto an entity branch fails.
+    conn.execute_unprepared(
+        "INSERT INTO symbolic_ref (name, target) VALUES ('refs/heads/c', 'refs/heads/main')",
+    )
+    .await
+    .expect("seed symbolic c");
+    let error = conn
+        .execute_unprepared(
+            "UPDATE symbolic_ref SET name = 'refs/heads/main' WHERE name = 'refs/heads/c'",
+        )
+        .await
+        .expect_err("AC6 rename must fail");
+    assert!(is_trigger_error(&error), "AC6 error: {error}");
 }

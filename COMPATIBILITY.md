@@ -368,6 +368,10 @@ unsupported. A fatal result stops Libra from publishing merge-driven repository
 state, but direct mutations made by the trusted unsandboxed command are outside
 Libra's rollback boundary.
 
+## Symbolic ref storage (`symbolic_ref`)
+
+Non-`HEAD` symbolic references live in the Repository-only `symbolic_ref(name, target)` table (migration `2026111702`); `HEAD` and `refs/remotes/<remote>/HEAD` remain `reference` rows whose `kind` is `Head`. Four SQLite triggers (`symbolic_ref_entity_insert_guard`, `symbolic_ref_entity_update_guard`, `reference_symbolic_insert_guard`, `reference_symbolic_update_guard`) make a local entity branch row and its `refs/heads/<branch>` symbolic row mutually exclusive at the database layer: the `reference` UPDATE trigger has no `OF` column list, so promoting a tag to `Branch` or renaming a branch onto a symbolic name aborts. The migration is additive, leaves every existing `reference` row untouched, and fails atomically (no receipt, no table, no triggers) when a conflicting object already exists.
+
 ## Git commands intentionally absent from `src/cli.rs`
 
 | Command | Tier | Notes |
