@@ -67,6 +67,13 @@ this command.
 | `--no-long` | Cancel an earlier `--long` (last one wins). | Off |
 | `--dirty[=<mark>]` | Append a dirty mark when tracked content differs from `HEAD`. | Off, default mark `-dirty` when enabled |
 
+`--broken[=<mark>]` (default `-broken`) is accepted alongside `--dirty`: when the
+worktree differs from HEAD the `--dirty` mark (default `-dirty`) is appended, and
+a stat-only change is refreshed away first. `--broken` cannot be combined with a
+`<commit>` argument outside `--contains` (`LBR-CLI-002`) and is ignored by
+`--contains`. Until the failure-mark path lands, a failed worktree check still
+reports `LBR-IO-001`.
+
 `--dirty` cannot be combined with a `<commit>` argument (exit 129,
 `LBR-CLI-002`). `--contains` accepts `--dirty` but ignores it: the worktree is
 never inspected, so a dirty tree or a corrupt index cannot change its output.

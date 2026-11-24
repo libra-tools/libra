@@ -1574,3 +1574,83 @@ fn dirty_scope_with_commit_and_contains() {
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "v1.0^0", "AC7");
     std::fs::write(p.join(".libra/index"), index_backup).unwrap();
 }
+
+/// DESC-08 AC1–AC6: `--broken` composes with `--dirty`, is refused with a
+/// commit-ish, and is ignored by `--contains`.
+#[test]
+fn broken_marks_and_scope() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    std::fs::write(p.join("f.txt"), "A\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], p), "add f");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "A", "--no-verify"], p),
+        "commit",
+    );
+    assert_cli_success(&run_libra_command(&["tag", "-m", "v1.0", "v1.0"], p), "tag");
+
+    // AC1: only the stat changes (same content) -> no suffix after the refresh.
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(p.join("f.txt"))
+        .unwrap();
+    file.set_times(
+        std::fs::FileTimes::new()
+            .set_modified(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1)),
+    )
+    .unwrap();
+    drop(file);
+    let out = run_libra_command(&["describe", "--dirty", "--broken"], p);
+    assert_cli_success(&out, "AC1");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "v1.0", "AC1");
+
+    std::fs::write(p.join("f.txt"), "B\n").unwrap();
+    let out = run_libra_command(&["describe", "--broken"], p);
+    assert_cli_success(&out, "AC2");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "v1.0-dirty",
+        "AC2"
+    );
+
+    let out = run_libra_command(&["describe", "--dirty=-dm", "--broken"], p);
+    assert_cli_success(&out, "AC3");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "v1.0-dm",
+        "AC3"
+    );
+
+    let out = run_libra_command(&["describe", "--broken", "HEAD"], p);
+    assert!(!out.status.success(), "AC4 must fail");
+    let (_human, report) = parse_cli_error_stderr(&out.stderr);
+    assert_eq!(report.error_code, "LBR-CLI-002", "AC4");
+
+    let index = p.join(".libra/index");
+    let backup = std::fs::read(&index).unwrap();
+    std::fs::write(&index, "garbage\n").unwrap();
+    let out = run_libra_command(&["describe", "--contains", "--broken", "HEAD"], p);
+    assert_cli_success(&out, "AC5");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "v1.0^0", "AC5");
+    let out = run_libra_command(&["describe", "--contains", "--broken"], p);
+    assert_cli_success(&out, "AC6");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "v1.0^0", "AC6");
+    std::fs::write(&index, backup).unwrap();
+}
+
+/// DESC-08 AC8 (temporary boundary): a failed check still fails outside
+/// `--contains`; the failure mark arrives with DESC-08a.
+#[test]
+fn broken_check_failure_boundary() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    assert_cli_success(&run_libra_command(&["tag", "-m", "v1.0", "v1.0"], p), "tag");
+    let index = p.join(".libra/index");
+    let backup = std::fs::read(&index).unwrap();
+    std::fs::write(&index, "garbage\n").unwrap();
+    let out = run_libra_command(&["describe", "--broken"], p);
+    assert!(!out.status.success(), "AC8 must fail");
+    let (_human, report) = parse_cli_error_stderr(&out.stderr);
+    assert_eq!(report.error_code, "LBR-IO-001", "AC8");
+    std::fs::write(&index, backup).unwrap();
+}

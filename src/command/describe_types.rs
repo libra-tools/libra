@@ -17,6 +17,13 @@ pub(super) struct DescribeOutput {
     pub(super) dirty_mark: Option<String>,
 }
 
+/// Result of the worktree dirty check, feeding the `--dirty`/`--broken` suffix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum WorktreeCheck {
+    Clean,
+    Dirty,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub(super) enum DescribeError {
     #[error("HEAD does not point to a commit")]

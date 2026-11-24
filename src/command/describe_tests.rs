@@ -129,3 +129,19 @@ fn commitish_incompatible_display_pin() {
         "option '--dirty' and commit-ishes cannot be used together",
     );
 }
+
+/// DESC-08 AC7: the suffix helper defaults a dirty worktree to `-dirty`.
+#[test]
+fn worktree_suffix_defaults_to_dirty_mark() {
+    use super::{WorktreeCheck, worktree_suffix};
+
+    assert_eq!(
+        worktree_suffix(None, WorktreeCheck::Dirty),
+        Some("-dirty".to_string())
+    );
+    assert_eq!(
+        worktree_suffix(Some("-bk"), WorktreeCheck::Dirty),
+        Some("-bk".to_string())
+    );
+    assert_eq!(worktree_suffix(Some("-dirty"), WorktreeCheck::Clean), None);
+}

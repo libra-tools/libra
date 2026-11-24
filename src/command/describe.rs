@@ -30,7 +30,7 @@ mod describe_format;
 #[path = "describe_types.rs"]
 mod describe_types;
 use describe_format::{abbreviate_hash, describe_output};
-use describe_types::{DescribeError, DescribeOutput};
+use describe_types::{DescribeError, DescribeOutput, WorktreeCheck};
 
 const DESCRIBE_EXAMPLES: &str = "\
 EXAMPLES:
@@ -102,6 +102,11 @@ pub struct DescribeArgs {
     /// Append MARK when tracked content differs from HEAD.
     #[clap(long, value_name = "MARK", num_args = 0..=1, require_equals = true, default_missing_value = "-dirty")]
     pub dirty: Option<String>,
+
+    /// Append MARK (default `-broken`) when the worktree check fails (Git's
+    /// `--broken`); the failure-mark path itself is delivered by DESC-08a.
+    #[clap(long = "broken", value_name = "MARK", num_args = 0..=1, require_equals = true, default_missing_value = "-broken")]
+    pub broken: Option<String>,
 
     /// Follow only the first parent of merge commits when walking history.
     #[clap(long = "first-parent")]
@@ -180,6 +185,7 @@ pub(crate) async fn describe_commit_for_atom(
         all: false,
         abbrev,
         no_abbrev: false,
+        broken: None,
         always: false,
         exact_match: false,
         candidates: None,
@@ -209,10 +215,17 @@ pub(crate) async fn describe_commit_for_atom(
 async fn run_describe(args: DescribeArgs) -> Result<DescribeOutput, DescribeError> {
     // ADR-DESC-01/GAP-DESC-01: `--dirty` is only valid without a commit-ish;
     // `--contains` is exempt (Git's contains branch never inspects the worktree).
-    if !args.contains && args.commit.is_some() && args.dirty.is_some() {
-        return Err(DescribeError::CommitishIncompatible {
-            option: "--dirty".to_string(),
-        });
+    if !args.contains && args.commit.is_some() {
+        for (present, option) in [
+            (args.broken.is_some(), "--broken"),
+            (args.dirty.is_some(), "--dirty"),
+        ] {
+            if present {
+                return Err(DescribeError::CommitishIncompatible {
+                    option: option.to_string(),
+                });
+            }
+        }
     }
     let input = args.commit.clone().unwrap_or_else(|| "HEAD".to_string());
     let start_hash = util::get_commit_base_typed(&input)
@@ -238,7 +251,13 @@ async fn run_describe(args: DescribeArgs) -> Result<DescribeOutput, DescribeErro
     // `--exact-match` behavior (Git documents `--candidates 0` this way).
     let exact_match = args.exact_match || args.candidates == Some(0);
     let always = args.always;
-    let dirty_mark = args.dirty;
+    // `--broken` enables the suffix machinery with Git's default `-dirty` mark
+    // when `--dirty` gives no explicit one.
+    let dirty_mark = if args.dirty.is_some() || args.broken.is_some() {
+        Some(args.dirty.clone().unwrap_or_else(|| "-dirty".to_string()))
+    } else {
+        None
+    };
     let first_parent = args.first_parent;
     let shallow = ShallowSet::load()
         .map_err(|error| DescribeError::CorruptReference(format!("{error}; {}", error.hint())))?;
@@ -625,13 +644,27 @@ async fn run_describe_contains(
     })
 }
 
+/// Map a worktree check result to the suffix to append (DESC-08).
+fn worktree_suffix(dirty_mark: Option<&str>, check: WorktreeCheck) -> Option<String> {
+    match check {
+        WorktreeCheck::Clean => None,
+        WorktreeCheck::Dirty => Some(dirty_mark.unwrap_or("-dirty").to_string()),
+    }
+}
+
 async fn apply_dirty_mark(
     mut output: DescribeOutput,
     dirty_mark: Option<String>,
 ) -> Result<DescribeOutput, DescribeError> {
-    if let Some(mark) = dirty_mark
-        && has_tracked_dirty_changes().await?
-    {
+    if dirty_mark.is_none() {
+        return Ok(output);
+    }
+    let check = if has_tracked_dirty_changes().await? {
+        WorktreeCheck::Dirty
+    } else {
+        WorktreeCheck::Clean
+    };
+    if let Some(mark) = worktree_suffix(dirty_mark.as_deref(), check) {
         output.result.push_str(&mark);
         output.dirty = true;
         output.dirty_mark = Some(mark);

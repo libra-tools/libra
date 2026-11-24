@@ -1775,7 +1775,7 @@
 
 ### Task DESC-08: 为 `libra describe` 实现 `--broken[=<mark>]` 的脏标记与适用范围（#803）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空` | **Priority / Selection:** P1；Git CLI 选项兼容 | **Issue:** [#803](https://github.com/libra-tools/libra/issues/803)
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-23：新增 `--broken[=<mark>]`（默认 `-broken`）与 `WorktreeCheck`/纯函数 `worktree_suffix`；脏检查成功且工作区脏时追加 `--dirty` 标记（未给 `--dirty` 时默认 `-dirty`），仅 stat 变化先刷新、不追加；非 `--contains` 与 `<commit>` 共用时按 `CommitishIncompatible`（`LBR-CLI-002`）拒绝，`--contains` 忽略；脏检查失败仍报 `LBR-IO-001`（失败标记由 DESC-08a 交付）。AC1–AC6 由 `describe_test::broken_marks_and_scope` 覆盖，AC7 由 `describe_tests::worktree_suffix_defaults_to_dirty_mark` 覆盖，AC8 由 `describe_test::broken_check_failure_boundary` 覆盖；`describe_test`+`describe_long_test` 45/45、`--lib command::describe` 7/7；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计。
 
 **Description:** 在 `DescribeArgs` 中增加 `--broken[=<mark>]`（默认 `-broken`），对齐 Git `describe.c`：脏检查先刷新 stat（仅 stat 变化、内容未变时不追加标记）；工作区真实脏时追加 `--dirty` 给出的标记（未给 `--dirty` 时默认 `-dirty`），后缀选择集中在新增纯函数 `worktree_suffix`；非 `--contains` 路径与 `<commit>` 共用时复用 `DESC-07` 新增的 `DescribeError::CommitishIncompatible` 变体（`LBR-CLI-002`；消息按 Git 写作 `option '--broken' and commit-ishes cannot be used together`，文案不设判据）；`--contains` 路径（含 `<commit>` 与默认 `HEAD`）接受 `--broken` 且输出不受工作区状态影响。脏检查本身失败时追加 `<mark>` 的行为按 G-09 拆出 `DESC-08a`：本卡期间该情形保持既有 `LBR-IO-001` 失败（临时边界）。
 
