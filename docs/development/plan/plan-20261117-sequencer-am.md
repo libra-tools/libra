@@ -861,7 +861,7 @@ job 集合以执行当日按模板 ER-04「仓库配置与 CI 展开规则」现
 ### Task SA-06: `show --pretty=format:%B` 不追加多余结尾换行（#731）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-23：`show` 自定义格式分支改为 Git 的分隔语义——`format:` 在 `--no-patch` 时不再追加结尾换行（模板结果即全部输出），其后有补丁/统计块时保留分隔换行；`tformat:`、隐式模板与命名预设保持终止换行。AC1–AC3 由 `command::cherry_pick_test::cherry_pick_empty_drop_show_message_matches_git` 覆盖（`cherry-pick --empty=drop` exit 0、HEAD 不变、`show --no-patch --pretty=format:%B` 与同一 fixture 的 Git stdout 字节一致）；`show_test` + `cherry_pick_test` 132/132；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步；#731 之外的格式变体字节对照登记 `DEFER-SA-15`。偏差（记录）：用户已取消独立 Claude/Codex 审计，故未执行计划要求的独立评审门。
 **Description:** #731 的多余空行来自 `show` 自定义格式分支在 `formatter.format` 后无条件 `output.push('\n')`，而非 `cherry-pick --empty=drop` 改写了 HEAD（`--empty=drop` 不改 HEAD）。修复 `show.rs`：`format:` 采用 Git 的分隔语义——其后没有补丁或 `--stat` 输出时不追加结尾换行，其后有补丁或 `--stat` 输出时保留分隔换行（`src/command/show.rs:580-705` 的补丁与统计输出直接接在格式化头之后）；`tformat:`、隐式模板（`--format=%B`）与命名预设保持终止换行。这些 #731 以外的格式变体（`tformat:`、隐式模板、默认 `medium`、`oneline`，以及 `format:` 后接 `--stat`/补丁时的分隔）与 Git 的字节对照按协调者据用户 2026-11-19 05:17:51 UTC 决定的推论（R47）登记 `DEFER-SA-15`，本卡只验收 #731 的 `--empty=drop` 场景；以 `--empty=drop` 端到端验收 `t3505#16`（`TC-0523`，#731 验收项 1–3：冗余提交被丢弃、HEAD 不变、`show --pretty=format:%B` 与 Git 一致）。R44 按用户 2026-11-19 05:17:51 UTC 决定收窄：`--empty=keep` 之后的同一输出（`t3505#17`、`TC-0524`）登记 `DEFER-SA-15`，`--format=format:%B` 为 `--pretty=format:%B` 的别名（`src/command/show.rs:86-94`），不单列验收。
 **Out of scope:** `cherry-pick` 空停止（由 `SA-01` 承接）；`log` 的格式输出（不修改 `log.rs`）；#731 以外的格式变体与 `format:` 后接 `--stat`/补丁时的分隔与 Git 的字节对照（`DEFER-SA-15`）。
 

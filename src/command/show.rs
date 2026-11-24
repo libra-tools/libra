@@ -1235,7 +1235,14 @@ fn display_commit_info(
             notes,
         };
         output.push_str(&formatter.format(commit, &ctx));
-        output.push('\n');
+        // SA-06: `format:` has Git's separator semantics — it only ends with a
+        // newline when a patch/stat block follows; with `--no-patch` the format
+        // output is the whole payload, so no extra blank line is appended.
+        // `tformat:` and the implicit templates keep their terminating newline.
+        let is_format = pretty.as_str().starts_with("format:");
+        if !(is_format && args.no_patch) {
+            output.push('\n');
+        }
         return;
     }
     if args.oneline {

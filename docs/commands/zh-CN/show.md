@@ -79,6 +79,8 @@ libra show HEAD:dir1
 libra show <tree-oid>
 ```
 
+使用 `--pretty=format:<模板>` / `--format=format:<模板>` 时，若其后没有补丁或 `--stat` 输出（`--no-patch`），模板渲染结果即全部输出，不再追加多余空行；其后有补丁或统计块时保留分隔换行。`tformat:` 与命名/隐式模板保持结尾换行。
+
 ## 选项
 
 | 标志 | 短选项 | 说明 |

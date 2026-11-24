@@ -108,6 +108,12 @@ libra show HEAD:dir1
 libra show <tree-oid>
 ```
 
+With `--pretty=format:<template>` / `--format=format:<template>` the rendered
+template is the whole payload when no patch or stat follows (`--no-patch`), so
+no extra blank line is appended; when a patch or `--stat` block follows it, a
+separator newline is kept. `tformat:` and the named/implicit templates keep
+their terminating newline.
+
 ## Options
 
 | Flag | Short | Description |

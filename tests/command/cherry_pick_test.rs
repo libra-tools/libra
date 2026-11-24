@@ -5363,7 +5363,7 @@ fn cherry_pick_ff_root_commit_matches_git_oid_tc0512() {
         assert!(out.status.success(), "git {args:?}: {out:?}");
         out
     };
-    git(&["init", "-q", "."]);
+    git(&["init", "-q", "-b", "main", "."]);
     std::fs::write(git_repo.join("a"), "a\n").unwrap();
     git(&["add", "a"]);
     git(&["commit", "-q", "-m", "first"]);
@@ -5677,5 +5677,85 @@ fn cherry_pick_unborn_ff_refuses_untracked_overwrite() {
             .status
             .success(),
         "AC8 branch stays unborn"
+    );
+}
+
+/// SA-06: `show --pretty=format:%B` after `cherry-pick --empty=drop` matches
+/// Git byte-for-byte (no extra trailing newline).
+#[test]
+fn cherry_pick_empty_drop_show_message_matches_git() {
+    use std::process::Command;
+
+    let libra_repo = tempdir().expect("libra repo");
+    let p = libra_repo.path();
+    init_repo_via_cli(p);
+    configure_identity_via_cli(p);
+    std::fs::write(p.join("tracked.txt"), "base\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "tracked.txt"], p), "add base");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], p),
+        "base commit",
+    );
+    std::fs::write(p.join("tracked.txt"), "changed\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "tracked.txt"], p), "add change");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "main change", "--no-verify"], p),
+        "main change",
+    );
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "fork", "HEAD~1"], p),
+        "fork branch",
+    );
+    std::fs::write(p.join("tracked.txt"), "changed\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "tracked.txt"], p), "add fork");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "fork change", "--no-verify"], p),
+        "fork commit",
+    );
+    let before = cp_rev_parse(p, "HEAD");
+    let out = run_libra_command(&["cherry-pick", "--empty=drop", "main"], p);
+    assert_cli_success(&out, "AC1 cherry-pick --empty=drop");
+    assert_eq!(cp_rev_parse(p, "HEAD"), before, "AC2 HEAD unchanged");
+    let libra_show = run_libra_command(&["show", "--no-patch", "--pretty=format:%B", "HEAD"], p);
+
+    // Git reference fixture built from the same commits/settings.
+    let git_repo = tempdir().expect("git repo");
+    let g = git_repo.path();
+    let envs = [
+        ("GIT_AUTHOR_NAME", "t"),
+        ("GIT_AUTHOR_EMAIL", "t@t"),
+        ("GIT_COMMITTER_NAME", "t"),
+        ("GIT_COMMITTER_EMAIL", "t@t"),
+        ("GIT_AUTHOR_DATE", "1700000000 +0000"),
+        ("GIT_COMMITTER_DATE", "1700000000 +0000"),
+        ("HOME", g.to_str().unwrap()),
+    ];
+    let git = |args: &[&str]| {
+        let mut cmd = Command::new("git");
+        cmd.args(args).current_dir(g);
+        for (key, value) in envs {
+            cmd.env(key, value);
+        }
+        let out = cmd.output().expect("git");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+        out
+    };
+    git(&["init", "-q", "-b", "main", "."]);
+    std::fs::write(g.join("tracked.txt"), "base\n").unwrap();
+    git(&["add", "tracked.txt"]);
+    git(&["commit", "-q", "-m", "base"]);
+    std::fs::write(g.join("tracked.txt"), "changed\n").unwrap();
+    git(&["add", "tracked.txt"]);
+    git(&["commit", "-q", "-m", "main change"]);
+    git(&["checkout", "-q", "-b", "fork", "HEAD~1"]);
+    std::fs::write(g.join("tracked.txt"), "changed\n").unwrap();
+    git(&["add", "tracked.txt"]);
+    git(&["commit", "-q", "-m", "fork change"]);
+    git(&["cherry-pick", "--empty=drop", "main"]);
+    let git_show = git(&["show", "--no-patch", "--pretty=format:%B", "HEAD"]);
+    assert_eq!(
+        String::from_utf8_lossy(&libra_show.stdout),
+        String::from_utf8_lossy(&git_show.stdout),
+        "AC3 show --pretty=format:%B parity"
     );
 }
