@@ -973,6 +973,9 @@ fn test_rev_list_objects_skips_gitlinks() {
         },
     ])
     .expect("build tree");
+    // PM-03: the default `--missing=error` requires the blob to exist, so store
+    // it (the gitlink pointer itself is still deliberately absent).
+    storage.put(&blob_oid, b"x", ObjectType::Blob).unwrap();
     storage
         .put(&tree.id, &tree.to_data().unwrap(), ObjectType::Tree)
         .unwrap();
@@ -1780,4 +1783,180 @@ fn test_rev_list_grep_matches_log_semantics() {
     // Invalid BRE is a 129 usage error.
     let invalid = run_libra_command(&["rev-list", "--grep", r"a\(", "HEAD"], p);
     assert_eq!(invalid.status.code(), Some(129));
+}
+
+/// PM-03: `--missing=<action>` on a repository with locally deleted objects.
+#[test]
+fn rev_list_missing_actions_on_local_missing_objects() {
+    let repo = tempdir().expect("failed to create repository root");
+    init_repo_via_cli(repo.path());
+    run_libra_command(&["config", "set", "user.name", "t"], repo.path());
+    run_libra_command(&["config", "set", "user.email", "t@t"], repo.path());
+    std::fs::write(repo.path().join("one.t"), "one\n").expect("write one");
+    std::fs::write(repo.path().join("two.t"), "two\n").expect("write two");
+    assert_cli_success(
+        &run_libra_command(&["add", "one.t", "two.t"], repo.path()),
+        "add",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c1", "--no-verify"], repo.path()),
+        "commit",
+    );
+    let baseline = run_libra_command(&["rev-list", "--objects", "HEAD"], repo.path());
+    assert_cli_success(&baseline, "baseline");
+    let baseline = String::from_utf8_lossy(&baseline.stdout).to_string();
+    let two = String::from_utf8_lossy(
+        &run_libra_command(&["rev-parse", "HEAD:two.t"], repo.path()).stdout,
+    )
+    .trim()
+    .to_string();
+    assert!(!two.is_empty(), "blob oid");
+    let loose = repo
+        .path()
+        .join(".libra")
+        .join("objects")
+        .join(&two[..2])
+        .join(&two[2..]);
+    std::fs::remove_file(&loose).expect("delete the loose blob");
+    let without_two: String = baseline
+        .lines()
+        .filter(|line| !line.ends_with(" two.t"))
+        .map(|line| format!("{line}\n"))
+        .collect();
+
+    // AC1/AC2: the default action and `error` both fail closed.
+    for args in [
+        vec!["rev-list", "--objects", "HEAD"],
+        vec!["rev-list", "--objects", "--missing=error", "HEAD"],
+    ] {
+        let out = run_libra_command(&args, repo.path());
+        assert!(!out.status.success(), "{args:?} must fail");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("LBR-REPO-002"),
+            "{args:?} code"
+        );
+    }
+
+    // AC3: `allow-any` drops the missing row.
+    let out = run_libra_command(
+        &["rev-list", "--objects", "--missing=allow-any", "HEAD"],
+        repo.path(),
+    );
+    assert_cli_success(&out, "AC3");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), without_two, "AC3");
+
+    // AC4: `print` drops it and appends `?<oid>` after the ordinary rows.
+    let out = run_libra_command(
+        &["rev-list", "--objects", "--missing=print", "HEAD"],
+        repo.path(),
+    );
+    assert_cli_success(&out, "AC4");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("{without_two}?{two}\n"),
+        "AC4"
+    );
+
+    // AC6: no promisor concept, so `allow-promisor` is fail-closed.
+    let out = run_libra_command(
+        &["rev-list", "--objects", "--missing=allow-promisor", "HEAD"],
+        repo.path(),
+    );
+    assert!(!out.status.success(), "AC6 must fail");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("LBR-REPO-002"),
+        "AC6 code"
+    );
+
+    // AC7: unknown actions are usage errors.
+    let out = run_libra_command(
+        &["rev-list", "--objects", "--missing=bogus", "HEAD"],
+        repo.path(),
+    );
+    assert!(!out.status.success(), "AC7 must fail");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("LBR-CLI-002"),
+        "AC7 code"
+    );
+}
+
+/// PM-03 AC5: a missing subtree stops the descent and is printed as `?<tree>`.
+#[test]
+fn rev_list_missing_print_reports_a_missing_subtree() {
+    let repo = tempdir().expect("failed to create repository root");
+    init_repo_via_cli(repo.path());
+    run_libra_command(&["config", "set", "user.name", "t"], repo.path());
+    run_libra_command(&["config", "set", "user.email", "t@t"], repo.path());
+    std::fs::create_dir_all(repo.path().join("sub")).expect("mkdir sub");
+    std::fs::write(repo.path().join("sub/deep.t"), "deep\n").expect("write deep");
+    std::fs::write(repo.path().join("two.t"), "two\n").expect("write two");
+    assert_cli_success(
+        &run_libra_command(&["add", "sub/deep.t", "two.t"], repo.path()),
+        "add",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c1", "--no-verify"], repo.path()),
+        "commit",
+    );
+    let baseline = run_libra_command(&["rev-list", "--objects", "HEAD"], repo.path());
+    assert_cli_success(&baseline, "baseline");
+    let baseline = String::from_utf8_lossy(&baseline.stdout).to_string();
+    let oid_of = |suffix: &str| -> String {
+        baseline
+            .lines()
+            .find(|line| line.ends_with(suffix))
+            .and_then(|line| line.split(' ').next())
+            .unwrap_or_default()
+            .to_string()
+    };
+    let sub_tree = oid_of(" sub");
+    let two = oid_of(" two.t");
+    assert!(!sub_tree.is_empty() && !two.is_empty(), "fixture oids");
+    for oid in [&sub_tree, &two] {
+        let loose = repo
+            .path()
+            .join(".libra")
+            .join("objects")
+            .join(&oid[..2])
+            .join(&oid[2..]);
+        std::fs::remove_file(&loose).expect("delete loose object");
+    }
+    let expected: String = baseline
+        .lines()
+        .filter(|line| {
+            !line.ends_with(" sub") && !line.ends_with(" sub/deep.t") && !line.ends_with(" two.t")
+        })
+        .map(|line| format!("{line}\n"))
+        .collect();
+
+    let out = run_libra_command(
+        &["rev-list", "--objects", "--missing=print", "HEAD"],
+        repo.path(),
+    );
+    assert_cli_success(&out, "AC5");
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    let ordinary: String = text
+        .lines()
+        .filter(|line| !line.starts_with('?'))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    assert_eq!(ordinary, expected, "AC5 dropped rows");
+    let questions: Vec<&str> = text.lines().filter(|line| line.starts_with('?')).collect();
+    assert_eq!(questions.len(), 2, "AC5 markers: {text}");
+    assert!(
+        questions.contains(&format!("?{sub_tree}").as_str()),
+        "AC5 tree"
+    );
+    assert!(questions.contains(&format!("?{two}").as_str()), "AC5 blob");
+    // The `?` lines come after every ordinary row.
+    let first_question = text
+        .lines()
+        .position(|line| line.starts_with('?'))
+        .expect("markers");
+    assert!(
+        text.lines()
+            .skip(first_question)
+            .all(|line| line.starts_with('?')),
+        "AC5 placement: {text}"
+    );
 }

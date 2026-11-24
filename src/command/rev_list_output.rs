@@ -106,6 +106,10 @@ pub(super) struct RevListOutput {
     /// commits, emitted after the commit (and boundary) lines.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(super) objects: Vec<RevListObject>,
+    /// `--missing=print`: oids of objects that could not be found, emitted as
+    /// `?<oid>` lines after every ordinary object line (Git's placement).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(super) missing: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) entries: Option<Vec<RevListEntry>>,
     pub(super) total: usize,
@@ -193,6 +197,7 @@ impl RevListOutput {
                 .iter()
                 .map(|object| format!("{} {}", object.oid, object.path)),
         );
+        lines.extend(self.missing.iter().map(|oid| format!("?{oid}")));
         lines
     }
 }

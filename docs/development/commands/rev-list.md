@@ -84,3 +84,5 @@ flowchart TD
 - 改进本命令前，必须先阅读并遵循 [docs/development/commands/_general.md](_general.md)；这是命令设计、实现、测试和文档同步的强制要求。
 - 任何行为变更都要先核对实现源码，再同步 `COMPATIBILITY.md`、`docs/commands/<cmd>.md` 和相关测试。
 - 新增 Git 兼容参数时必须明确 tier、错误码、JSON/机器输出契约和回归测试。
+
+- 2026-11-23（PM-03 / #747）：新增 `--missing=<error|allow-any|print|allow-promisor>`（`require_equals`，默认 `error`）；`--objects` 行以 `ClientStorage::exist_checked_many` 一次有界批量探测，存储错误按错误上报；`error`/`allow-promisor` 对任何缺失对象 `LBR-REPO-002`，`allow-any` 丢弃，`print` 丢弃并在全部普通行之后追加 `?<oid>`；树加载失败改为停止下探（缺失子树由探测标记），修掉缺失 blob 被当普通行静默输出的问题。回归：`rev_list_missing_actions_on_local_missing_objects`（AC1–AC4/AC6/AC7）、`rev_list_missing_print_reports_a_missing_subtree`（AC5）；`rev_list_test` 82/82。

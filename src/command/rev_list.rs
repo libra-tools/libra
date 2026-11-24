@@ -50,6 +50,20 @@ use rev_list_spec::{
     collect_date_priority_selection, resolve_revision_selection, single_positive_tip_spec,
 };
 
+/// `--missing=<action>` (Git's rev-list missing-object policy).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum MissingAction {
+    /// Fail with `LBR-REPO-002` on the first missing object.
+    Error,
+    /// Skip missing objects.
+    AllowAny,
+    /// Skip missing objects and append `?<oid>` lines.
+    Print,
+    /// Fail closed: Libra has no partial clone, so nothing can be attributed to
+    /// a promisor.
+    AllowPromisor,
+}
+
 #[derive(Parser, Debug)]
 #[command(after_help = REV_LIST_EXAMPLES)]
 pub struct RevListArgs {
@@ -218,6 +232,19 @@ pub struct RevListArgs {
     /// (deduplicated), each as `<oid> <path>` after the commit lines.
     #[clap(long)]
     pub objects: bool,
+
+    /// How to handle `--objects` entries whose object is missing from the
+    /// repository: `error` (default) fails, `allow-any` drops them, `print`
+    /// drops them and appends `?<oid>` lines, `allow-promisor` is fail-closed
+    /// because Libra has no partial clone / promisor concept yet.
+    #[clap(
+        long = "missing",
+        require_equals = true,
+        value_name = "action",
+        value_enum,
+        default_value = "error"
+    )]
+    pub missing: MissingAction,
 
     /// Like `--objects`, and additionally print the excluded boundary commits
     /// (the frontier) prefixed with `-` so a pack builder can treat them as
@@ -437,7 +464,7 @@ async fn resolve_rev_list(args: &RevListArgs) -> CliResult<RevListOutput> {
     // the printed commits, in pre-order (root tree, then each subtree before its
     // contents) matching `git rev-list --objects`. Objects shared with excluded
     // commits are dropped and a `-- <pathspec>` limit prunes the walk.
-    let objects = if want_objects {
+    let mut objects = if want_objects {
         // Normalize pathspecs the same way the commit-level filter does
         // (`util::to_workdir_path`) so the object walk compares git-compatible
         // spellings (e.g. `./src`) against the workdir-relative tree paths.
@@ -454,6 +481,52 @@ async fn resolve_rev_list(args: &RevListArgs) -> CliResult<RevListOutput> {
     } else {
         Vec::new()
     };
+    // `--missing`: probe the enumerated objects in one bounded batch. Storage
+    // errors are reported (never treated as "missing"), matching
+    // `exist_checked_many`'s contract.
+    let mut missing_objects: Vec<String> = Vec::new();
+    if want_objects && !objects.is_empty() {
+        let storage = ClientStorage::try_init(path::objects())?;
+        let hashes: Vec<_> = objects
+            .iter()
+            .filter_map(|object| crate::internal::object_format::parse_repo_oid(&object.oid).ok())
+            .collect();
+        let existence = storage.exist_checked_many(&hashes).map_err(|error| {
+            CliError::fatal(format!("failed to probe rev-list objects: {error}"))
+                .with_stable_code(StableErrorCode::IoReadFailed)
+        })?;
+        let mut present = Vec::with_capacity(objects.len());
+        for object in objects.drain(..) {
+            let exists = crate::internal::object_format::parse_repo_oid(&object.oid)
+                .ok()
+                .and_then(|hash| existence.get(&hash).copied())
+                .unwrap_or(true);
+            if exists {
+                present.push(object);
+            } else {
+                missing_objects.push(object.oid);
+            }
+        }
+        objects = present;
+        if !missing_objects.is_empty()
+            && matches!(
+                args.missing,
+                MissingAction::Error | MissingAction::AllowPromisor
+            )
+        {
+            return Err(CliError::fatal(format!(
+                "rev-list --objects: {} object(s) are missing from the repository (first: {})",
+                missing_objects.len(),
+                missing_objects[0]
+            ))
+            .with_stable_code(StableErrorCode::RepoCorrupt)
+            .with_hint("restore the missing objects or use --missing=allow-any/print"));
+        }
+        if !matches!(args.missing, MissingAction::Print) {
+            missing_objects.clear();
+        }
+    }
+
     // `--reverse` reverses the already-limited selection (Git applies commit
     // limiting first, then reverses for output). Order-independent `--count` is
     // unaffected; boundary row placement is handled in `human_lines`.
@@ -534,6 +607,7 @@ async fn resolve_rev_list(args: &RevListArgs) -> CliResult<RevListOutput> {
         commits,
         boundary,
         objects,
+        missing: missing_objects,
         entries,
         total,
         count_fields,
@@ -735,12 +809,14 @@ fn collect_tree_objects(
             path: prefix.clone(),
         });
     }
-    let tree = load_object::<Tree>(&tree_id).map_err(|error| {
-        CliError::fatal(format!(
-            "failed to load tree object {tree_id} for rev-list --objects: {error}"
-        ))
-        .with_stable_code(StableErrorCode::RepoCorrupt)
-    })?;
+    // A missing tree cannot be expanded; the caller's `--missing` probe decides
+    // whether that is an error, a skipped row, or a `?<oid>` line. The tree
+    // itself was already emitted above, so a missing subtree still shows up in
+    // the probe. (A corrupt-but-present object also stops the descent; the
+    // probe reports it as present, matching Git's "cannot read" behaviour.)
+    let Ok(tree) = load_object::<Tree>(&tree_id) else {
+        return Ok(());
+    };
     for item in &tree.tree_items {
         let path = if prefix.is_empty() {
             item.name.clone()
