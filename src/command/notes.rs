@@ -137,12 +137,16 @@ pub enum NotesSubcommand {
     /// Merge notes from another notes ref into the current notes ref
     Merge {
         /// The notes ref to merge FROM (e.g. `refs/notes/other`)
-        other_ref: String,
+        other_ref: Option<String>,
 
-        /// Conflict-resolution strategy: `manual` (default; aborts on a
-        /// conflicting note), `ours`, `theirs`, `union`, or `cat_sort_uniq`
+        /// Conflict-resolution strategy: `manual` (default; materializes the
+        /// conflict worktree), `ours`, `theirs`, `union`, or `cat_sort_uniq`
         #[clap(short = 's', long)]
         strategy: Option<String>,
+
+        /// Apply a materialized manual merge (`notes merge --commit`)
+        #[clap(long)]
+        commit: bool,
     },
     /// Remove notes for objects that no longer exist in the object store
     Prune {
@@ -514,7 +518,26 @@ pub async fn execute_safe(
         NotesSubcommand::Merge {
             other_ref,
             strategy,
+            commit,
         } => {
+            if commit {
+                let result = notes::commit_merge().await.map_err(NotesCliError::from)?;
+                let out = NotesOutput::Merge {
+                    notes_ref: result.notes_ref,
+                    other_ref: result.source_ref,
+                    merged: result.applied,
+                    skipped: result.skipped,
+                    resolved_conflicts: Vec::new(),
+                };
+                render_output(&out, output)?;
+                return Ok(());
+            }
+            let Some(other_ref) = other_ref else {
+                return Err(CliError::command_usage(
+                    "notes merge needs an <other-ref> (or --commit to finish a merge)",
+                )
+                .with_stable_code(StableErrorCode::CliInvalidArguments));
+            };
             let other_normalized =
                 notes::normalize_notes_ref(&other_ref).map_err(NotesCliError::from)?;
             let strat = notes::NoteMergeStrategy::parse(strategy.as_deref())
@@ -937,6 +960,11 @@ impl From<NotesCliError> for CliError {
                     )),
                 notes::NotesError::MergeStateIo { .. } => CliError::fatal(message)
                     .with_stable_code(StableErrorCode::IoWriteFailed),
+                notes::NotesError::MergeStateCorrupt(_) => CliError::fatal(message)
+                    .with_stable_code(StableErrorCode::RepoCorrupt)
+                    .with_hint(
+                        "delete the corrupt NOTES_MERGE_STATE (after confirming no merge is running) and re-run the merge.",
+                    ),
                 notes::NotesError::MergeRaced { .. } => CliError::failure(message)
                     .with_stable_code(StableErrorCode::ConflictOperationBlocked)
                     .with_hint("another writer changed the notes during the merge; re-run it"),

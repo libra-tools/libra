@@ -20,6 +20,7 @@ libra notes list [<object>]
 libra notes show [<object>]
 libra notes remove [<object>...]
 libra notes merge [-s|--strategy <manual|ours|theirs|union|cat_sort_uniq>] <other-ref>
+libra notes merge --commit
 libra notes prune [-n|--dry-run] [-v]
 libra notes get-ref
 ```
@@ -246,7 +247,19 @@ differing note on both sides is a conflict resolved by `--strategy`:
   `notes merge` form takes an exclusive `NOTES_MERGE_LOCK` first and removes it
   when it finishes; an existing lock fails with `LBR-CONFLICT-002` before any
   state is read or written (a stale lock is removed by hand after confirming no
-  merge is running — the hint prints its path).
+
+
+  After resolving the conflict files, `libra notes merge --commit` reads
+  `NOTES_MERGE_STATE` (missing: `LBR-REPO-003`; unparseable: `LBR-REPO-002`) and
+  takes each `NOTES_MERGE_WORKTREE/<oid>` file as the resolved note (a deleted
+  file keeps the target-side note). It first creates the exclusive
+  `NOTES_MERGE_COMMITTING` marker, then in ONE write transaction verifies every
+  row's current value is either the recorded before-value or the target value
+  before writing anything; a row holding anything else rolls the whole
+  transaction back, removes the marker, keeps the state and fails with
+  `LBR-CONFLICT-002`. Rows already at the target value (including copies) are
+  skipped, not treated as conflicts. After the commit it removes
+  `NOTES_MERGE_STATE`, `NOTES_MERGE_WORKTREE/` and the marker, in that order.
 - `ours` / `theirs`: keep the current note / take the other ref's note.
 - `union`: concatenate both note contents.
 - `cat_sort_uniq`: concatenate, then sort and de-duplicate the combined lines.

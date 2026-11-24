@@ -2222,3 +2222,280 @@ fn notes_merge_manual_conflict_materializes_state() {
         "AC8 code"
     );
 }
+
+/// PM-29: `notes merge --commit` applies the materialized resolutions in one
+/// transaction and cleans up every state file.
+mod notes_merge_commit_support {
+    use sea_orm::{ConnectOptions, ConnectionTrait, Database, Statement};
+
+    use super::*;
+
+    pub(super) fn db_uri(repo: &std::path::Path) -> String {
+        format!(
+            "sqlite://{}",
+            repo.join(".libra").join("libra.db").display()
+        )
+    }
+
+    pub(super) fn rows(repo: &std::path::Path) -> Vec<(i64, String, String, String)> {
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        rt.block_on(async {
+            let mut opts = ConnectOptions::new(db_uri(repo));
+            opts.sqlx_logging(false);
+            let conn = Database::connect(opts).await.expect("connect");
+            let result = conn
+                .query_all_raw(Statement::from_string(
+                    sea_orm::DatabaseBackend::Sqlite,
+                    "SELECT id, notes_ref, object, blob FROM notes ORDER BY id".to_string(),
+                ))
+                .await
+                .expect("read notes rows")
+                .into_iter()
+                .map(|row| {
+                    (
+                        row.try_get::<i64>("", "id").unwrap_or_default(),
+                        row.try_get::<String>("", "notes_ref").unwrap_or_default(),
+                        row.try_get::<String>("", "object").unwrap_or_default(),
+                        row.try_get::<String>("", "blob").unwrap_or_default(),
+                    )
+                })
+                .collect();
+            conn.close().await.expect("close");
+            result
+        })
+    }
+
+    pub(super) fn exec(repo: &std::path::Path, sql: &str) {
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        rt.block_on(async {
+            let mut opts = ConnectOptions::new(db_uri(repo));
+            opts.sqlx_logging(false);
+            let conn = Database::connect(opts).await.expect("connect");
+            conn.execute_unprepared(sql).await.expect("exec");
+            conn.close().await.expect("close");
+        });
+    }
+
+    pub(super) fn blob(repo: &std::path::Path, text: &str) -> String {
+        let out = run_libra_command_with_stdin(&["hash-object", "--stdin"], repo, text);
+        assert_cli_success(&out, "hash-object");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+}
+
+#[test]
+fn notes_merge_commit_applies_resolutions() {
+    use notes_merge_commit_support::{blob, exec, rows};
+
+    let build = || {
+        let repo = tempdir().expect("failed to create repository root");
+        init_repo_via_cli(repo.path());
+        configure_identity_via_cli(repo.path());
+        let p = repo.path();
+        std::fs::write(p.join("a.txt"), "a\n").unwrap();
+        assert_cli_success(&run_libra_command(&["add", "a.txt"], p), "add a");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "c1", "--no-verify"], p),
+            "commit c1",
+        );
+        std::fs::write(p.join("b.txt"), "b\n").unwrap();
+        assert_cli_success(&run_libra_command(&["add", "b.txt"], p), "add b");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "c2", "--no-verify"], p),
+            "commit c2",
+        );
+        let c1 = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD~1"], p).stdout)
+            .trim()
+            .to_string();
+        let c2 = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], p).stdout)
+            .trim()
+            .to_string();
+        assert_cli_success(
+            &run_libra_command(&["notes", "add", "-m", "x", &c1], p),
+            "notes add x",
+        );
+        assert_cli_success(
+            &run_libra_command(
+                &["notes", "--ref", "refs/notes/other", "add", "-m", "y", &c1],
+                p,
+            ),
+            "notes other y",
+        );
+        assert_cli_success(
+            &run_libra_command(
+                &[
+                    "notes",
+                    "--ref",
+                    "refs/notes/other",
+                    "add",
+                    "-m",
+                    "only other",
+                    &c2,
+                ],
+                p,
+            ),
+            "notes other c2",
+        );
+        let started = run_libra_command(&["notes", "merge", "refs/notes/other"], p);
+        assert!(!started.status.success(), "manual merge starts the state");
+        (repo, c1, c2)
+    };
+
+    // AC1/AC2: the resolution replaces the conflict row, the copy is applied,
+    // and every state file disappears.
+    let (repo, c1, c2) = build();
+    let p = repo.path();
+    let before = rows(p);
+    let resolved = blob(p, "resolved\n");
+    std::fs::write(
+        p.join(".libra").join("NOTES_MERGE_WORKTREE").join(&c1),
+        "resolved\n",
+    )
+    .unwrap();
+    assert_cli_success(
+        &run_libra_command(&["notes", "merge", "--commit"], p),
+        "AC1 commit",
+    );
+    let after = rows(p);
+    let old = before
+        .iter()
+        .find(|(_, r, o, _)| r == "refs/notes/commits" && o == &c1)
+        .expect("old row");
+    let new = after
+        .iter()
+        .find(|(_, r, o, _)| r == "refs/notes/commits" && o == &c1)
+        .expect("new row");
+    assert_eq!(new.0, old.0, "AC1 id preserved");
+    assert_eq!(new.3, resolved, "AC1 resolved blob");
+    assert!(
+        after.iter().any(|(id, r, o, b)| {
+            r == "refs/notes/commits" && o == &c2 && b == &blob(p, "only other") && *id > old.0
+        }),
+        "AC1 copied row"
+    );
+    for name in [
+        "NOTES_MERGE_STATE",
+        "NOTES_MERGE_WORKTREE",
+        "NOTES_MERGE_COMMITTING",
+    ] {
+        assert!(!p.join(".libra").join(name).exists(), "AC2 {name} removed");
+    }
+
+    // AC3: a deleted resolution file keeps the target-side note.
+    let (repo, c1, c2) = build();
+    let p = repo.path();
+    let before = rows(p);
+    std::fs::remove_file(p.join(".libra").join("NOTES_MERGE_WORKTREE").join(&c1)).unwrap();
+    assert_cli_success(
+        &run_libra_command(&["notes", "merge", "--commit"], p),
+        "AC3 commit",
+    );
+    let after = rows(p);
+    assert!(
+        after
+            .iter()
+            .any(|(_, r, o, b)| r == "refs/notes/commits" && o == &c1 && b == &blob(p, "x")),
+        "AC3 conflict row keeps its value"
+    );
+    assert!(
+        after.iter().any(|(id, r, o, _)| r == "refs/notes/commits"
+            && o == &c2
+            && !before.iter().any(|(old_id, ..)| old_id == id)),
+        "AC3 copy row"
+    );
+
+    // AC4: a concurrent change is detected BEFORE any write. A probe trigger
+    // turns any notes write into an error, so an implementation that writes
+    // first would fail with the probe error instead of the conflict code.
+    let (repo, c1, _c2) = build();
+    let p = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["notes", "add", "-f", "-m", "changed", &c1], p),
+        "AC4 concurrent add",
+    );
+    exec(
+        p,
+        "CREATE TRIGGER notes_write_probe BEFORE INSERT ON notes BEGIN SELECT RAISE(ABORT, 'probe'); END;",
+    );
+    exec(
+        p,
+        "CREATE TRIGGER notes_write_probe_update BEFORE UPDATE ON notes BEGIN SELECT RAISE(ABORT, 'probe'); END;",
+    );
+    std::fs::write(
+        p.join(".libra").join("NOTES_MERGE_WORKTREE").join(&c1),
+        "resolved\n",
+    )
+    .unwrap();
+    let raced = run_libra_command(&["notes", "merge", "--commit"], p);
+    assert!(!raced.status.success(), "AC4 must fail");
+    assert!(
+        String::from_utf8_lossy(&raced.stderr).contains("LBR-CONFLICT-002"),
+        "AC4 code: {}",
+        String::from_utf8_lossy(&raced.stderr)
+    );
+    assert!(
+        p.join(".libra").join("NOTES_MERGE_STATE").exists(),
+        "AC4 state is kept"
+    );
+
+    // AC5: no merge state.
+    let plain = tempdir().expect("failed to create repository root");
+    init_repo_via_cli(plain.path());
+    configure_identity_via_cli(plain.path());
+    let none = run_libra_command(&["notes", "merge", "--commit"], plain.path());
+    assert!(!none.status.success(), "AC5 must fail");
+    assert!(
+        String::from_utf8_lossy(&none.stderr).contains("LBR-REPO-003"),
+        "AC5 code"
+    );
+
+    // AC6: corrupt state.
+    let (repo, _c1, _c2) = build();
+    let p = repo.path();
+    std::fs::write(p.join(".libra").join("NOTES_MERGE_STATE"), "garbage").unwrap();
+    let corrupt = run_libra_command(&["notes", "merge", "--commit"], p);
+    assert!(!corrupt.status.success(), "AC6 must fail");
+    assert!(
+        String::from_utf8_lossy(&corrupt.stderr).contains("LBR-REPO-002"),
+        "AC6 code"
+    );
+
+    // AC7: an existing lock wins over any state access.
+    let (repo, _c1, _c2) = build();
+    let p = repo.path();
+    std::fs::write(p.join(".libra").join("NOTES_MERGE_LOCK"), b"").unwrap();
+    let locked = run_libra_command(&["notes", "merge", "--commit"], p);
+    assert!(!locked.status.success(), "AC7 must fail");
+    assert!(
+        String::from_utf8_lossy(&locked.stderr).contains("LBR-CONFLICT-002"),
+        "AC7 code"
+    );
+
+    // AC8: a copy row already holding the target value is skipped, not raced.
+    let (repo, c1, c2) = build();
+    let p = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["notes", "add", "-m", "only other", &c2], p),
+        "AC8 pre-copy",
+    );
+    let s8 = rows(p);
+    std::fs::write(
+        p.join(".libra").join("NOTES_MERGE_WORKTREE").join(&c1),
+        "resolved\n",
+    )
+    .unwrap();
+    assert_cli_success(
+        &run_libra_command(&["notes", "merge", "--commit"], p),
+        "AC8 commit",
+    );
+    let after = rows(p);
+    assert_eq!(after.len(), s8.len(), "AC8 no duplicate copy row");
+    assert_eq!(
+        after
+            .iter()
+            .find(|(_, r, o, _)| r == "refs/notes/commits" && o == &c1)
+            .map(|(_, _, _, b)| b.clone()),
+        Some(blob(p, "resolved\n")),
+        "AC8 resolution applied"
+    );
+}

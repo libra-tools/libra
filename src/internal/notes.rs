@@ -187,6 +187,189 @@ fn conflict_marker_body(
     ))
 }
 
+/// Outcome of `notes merge --commit`.
+#[derive(Debug, Clone)]
+pub struct CommitMergeResult {
+    pub notes_ref: String,
+    pub source_ref: String,
+    pub applied: usize,
+    pub skipped: usize,
+}
+
+/// Apply a materialized manual merge (`notes merge --commit`).
+///
+/// All row checks happen before any write inside one transaction, so a
+/// concurrent change leaves the table untouched. Every merge form holds the
+/// worktree-scoped `NOTES_MERGE_LOCK`, and the commit-in-progress marker turns a
+/// crash window into a fail-closed state (retry semantics: `PM-38`).
+pub async fn commit_merge() -> Result<CommitMergeResult, NotesError> {
+    let _lock = NotesMergeLock::acquire()?;
+    let dir = merge_state_dir()?;
+    let state_path = dir.join(NOTES_MERGE_STATE);
+    let bytes = match std::fs::read(&state_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(NotesError::MergeInProgress);
+        }
+        Err(error) => {
+            return Err(NotesError::MergeStateIo {
+                path: state_path.display().to_string(),
+                detail: error.to_string(),
+            });
+        }
+    };
+    let state = NotesMergeState::from_bytes(&bytes)
+        .map_err(|error| NotesError::MergeStateCorrupt(error.to_string()))?;
+    let worktree = dir.join(NOTES_MERGE_WORKTREE);
+
+    // Resolved value per conflict: the worktree file, or the target-side value
+    // when the file was deleted (Git keeps `ours`).
+    let mut targets: Vec<(String, String, String)> = Vec::new(); // (object, before, target)
+    for conflict in &state.conflicts {
+        let path = worktree.join(&conflict.object);
+        let target = match std::fs::read(&path) {
+            Ok(bytes) => {
+                let text = String::from_utf8(bytes).map_err(|error| NotesError::MergeStateIo {
+                    path: path.display().to_string(),
+                    detail: error.to_string(),
+                })?;
+                store_blob_text(&text)?
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => conflict.before.clone(),
+            Err(error) => {
+                return Err(NotesError::MergeStateIo {
+                    path: path.display().to_string(),
+                    detail: error.to_string(),
+                });
+            }
+        };
+        targets.push((conflict.object.clone(), conflict.before.clone(), target));
+    }
+
+    // Exclusive commit-in-progress marker. A pre-existing marker means an
+    // earlier commit crashed; its retry semantics belong to `PM-38`, so this
+    // card fails closed and keeps the state.
+    let marker = dir.join(NOTES_MERGE_COMMITTING);
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&marker)
+    {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(NotesError::MergeInProgress);
+        }
+        Err(error) => {
+            return Err(NotesError::MergeStateIo {
+                path: marker.display().to_string(),
+                detail: error.to_string(),
+            });
+        }
+    }
+
+    let db = get_db_conn_instance().await;
+    let txn = crate::internal::db::begin_write_transaction(&db).await?;
+    let verify = async {
+        for (object, before, target) in &targets {
+            let current = note_blob_with_conn(&txn, &state.target_ref, object).await?;
+            if current.as_deref() != Some(before.as_str())
+                && current.as_deref() != Some(target.as_str())
+            {
+                return Err(NotesError::MergeRaced {
+                    object: object.clone(),
+                });
+            }
+        }
+        for copy in &state.to_copy {
+            let current = note_blob_with_conn(&txn, &state.target_ref, &copy.object).await?;
+            if let Some(current) = current
+                && current != copy.source
+            {
+                return Err(NotesError::MergeRaced {
+                    object: copy.object.clone(),
+                });
+            }
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(error) = verify {
+        txn.rollback().await?;
+        let _ = std::fs::remove_file(&marker);
+        return Err(error);
+    }
+
+    let mut applied = 0usize;
+    let mut skipped = 0usize;
+    for (object, before, target) in &targets {
+        if before == target {
+            skipped += 1;
+            continue;
+        }
+        txn.execute_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Sqlite,
+            "UPDATE notes SET blob = ? WHERE notes_ref = ? AND object = ? AND blob = ?",
+            [
+                target.clone().into(),
+                state.target_ref.clone().into(),
+                object.clone().into(),
+                before.clone().into(),
+            ],
+        ))
+        .await?;
+        applied += 1;
+    }
+    for copy in &state.to_copy {
+        let current = note_blob_with_conn(&txn, &state.target_ref, &copy.object).await?;
+        if current.is_some() {
+            skipped += 1;
+            continue;
+        }
+        txn.execute_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Sqlite,
+            "INSERT INTO notes (notes_ref, object, blob) VALUES (?, ?, ?)",
+            [
+                state.target_ref.clone().into(),
+                copy.object.clone().into(),
+                copy.source.clone().into(),
+            ],
+        ))
+        .await?;
+        applied += 1;
+    }
+    txn.commit().await?;
+
+    // Cleanup order from ADR-PM-02: state, worktree, marker.
+    let _ = std::fs::remove_file(&state_path);
+    let _ = std::fs::remove_dir_all(&worktree);
+    let _ = std::fs::remove_file(&marker);
+
+    Ok(CommitMergeResult {
+        notes_ref: state.target_ref,
+        source_ref: state.source_ref,
+        applied,
+        skipped,
+    })
+}
+
+async fn note_blob_with_conn<C>(
+    conn: &C,
+    notes_ref: &str,
+    object: &str,
+) -> Result<Option<String>, NotesError>
+where
+    C: sea_orm::ConnectionTrait,
+{
+    let row = conn
+        .query_one_raw(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Sqlite,
+            "SELECT blob FROM notes WHERE notes_ref = ? AND object = ? LIMIT 1",
+            [notes_ref.into(), object.into()],
+        ))
+        .await?;
+    Ok(row.and_then(|row| row.try_get::<String>("", "blob").ok()))
+}
+
 /// Normalize a user-supplied notes ref. Short names (e.g. `review`) are
 /// expanded to `refs/notes/<name>` for Git compatibility; refs that already
 /// start with `refs/notes/` pass through unchanged. Any other fully-qualified
@@ -280,6 +463,8 @@ pub enum NotesError {
 
     #[error("failed to access notes merge state at {path}: {detail}")]
     MergeStateIo { path: String, detail: String },
+    #[error("the notes merge state is corrupt: {0}")]
+    MergeStateCorrupt(String),
 }
 
 impl From<std::io::Error> for NotesError {
