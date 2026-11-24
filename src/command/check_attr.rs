@@ -254,8 +254,9 @@ fn attribute_value(
         attributes::attribute_state_for_path(attr, absolute)
     } else {
         attributes::all_attribute_states_for_path_from(absolute, source_kind)
-            .get(attr)
-            .cloned()
+            .into_iter()
+            .find(|(name, _)| name == attr)
+            .map(|(_, state)| state)
     };
     state
         .and_then(|state| match state {

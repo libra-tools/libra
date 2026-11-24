@@ -322,11 +322,12 @@ fn evaluate_sources(
     sources: &[AttributeSource],
     workdir: &Path,
     absolute: &Path,
-) -> BTreeMap<String, AttributeState> {
-    let rule_sets: Vec<(PathBuf, Arc<Vec<AttributeRule>>)> = sources
+) -> Vec<(String, AttributeState)> {
+    let rule_sets: Vec<RuleSet> = sources
         .iter()
         .map(|source| {
             (
+                source.path.clone(),
                 source.base.clone(),
                 cached_attribute_file(&source.path, &source.base),
             )
@@ -335,18 +336,26 @@ fn evaluate_sources(
     evaluate_rule_sets(&rule_sets, workdir, absolute)
 }
 
+/// `(source path, base directory, compiled rules)` in match-precedence order.
+type RuleSet = (PathBuf, PathBuf, Arc<Vec<AttributeRule>>);
+
 /// Evaluate already-compiled rule sets (worktree files, or index/tree contents
 /// for `check-attr --cached`/`--source`), lowest precedence first.
 fn evaluate_rule_sets(
-    rule_sets: &[(PathBuf, Arc<Vec<AttributeRule>>)],
+    rule_sets: &[RuleSet],
     workdir: &Path,
     absolute: &Path,
-) -> BTreeMap<String, AttributeState> {
+) -> Vec<(String, AttributeState)> {
     let mut macros = std::collections::HashMap::new();
     macros.insert("binary".to_string(), builtin_binary_macro());
-    for (base, rules) in rule_sets.iter().rev() {
+    for (path, base, rules) in rule_sets.iter().rev() {
         // Macros only come from root-level and global/info files.
-        if base != workdir {
+        let is_info = path
+            .parent()
+            .and_then(|parent| parent.file_name())
+            .and_then(|name| name.to_str())
+            == Some("info");
+        if base != workdir && !is_info {
             continue;
         }
         for rule in rules.iter().rev() {
@@ -357,8 +366,52 @@ fn evaluate_rule_sets(
             }
         }
     }
+
+    // Registration order follows Git's attribute FILE READ order, which differs
+    // from the match-priority stack: global, root files, info/attributes, then
+    // subdirectories shallow-to-deep. Built-ins are pre-registered.
+    let mut order: Vec<String> = ["binary", "diff", "merge", "text"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    let mut registered: std::collections::HashSet<String> = order.iter().cloned().collect();
+    let mut register = |name: &str| {
+        if registered.insert(name.to_string()) {
+            order.push(name.to_string());
+        }
+    };
+    let classify = |path: &Path, base: &Path| -> u8 {
+        let file = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        let parent = path
+            .parent()
+            .and_then(|parent| parent.file_name())
+            .and_then(|name| name.to_str());
+        if file == "attributes" && parent == Some("info") {
+            2 // info/attributes registers after the root files
+        } else if file == GIT_ATTRIBUTES_FILE || file == LIBRA_ATTRIBUTES_FILE {
+            if base == workdir { 1 } else { 3 }
+        } else {
+            0 // global / configured file
+        }
+    };
+    let mut registration: Vec<&RuleSet> = rule_sets.iter().collect();
+    registration.sort_by_key(|(path, base, _)| classify(path, base));
+    for (_, _, rules) in &registration {
+        for rule in rules.iter() {
+            if let Some(name) = &rule.macro_def {
+                register(name);
+            }
+            for assignment in &rule.assignments {
+                register(&assignment.name);
+            }
+        }
+    }
+
     let mut decided = BTreeMap::new();
-    for (_, rules) in rule_sets.iter().rev() {
+    for (_, _, rules) in rule_sets.iter().rev() {
         for rule in rules.iter().rev() {
             if !attribute_rule_matches(rule, absolute) {
                 continue;
@@ -367,7 +420,19 @@ fn evaluate_rule_sets(
         }
     }
     decided.retain(|_, state| !matches!(state, AttributeState::Unspecified));
-    decided
+
+    let mut ordered: Vec<(String, AttributeState)> = order
+        .into_iter()
+        .filter_map(|name| decided.get(&name).map(|state| (name, state.clone())))
+        .collect();
+    // Any decided attribute that never appeared in a rule (defensive) keeps its
+    // discovery order at the end.
+    for (name, state) in decided {
+        if !ordered.iter().any(|(existing, _)| existing == &name) {
+            ordered.push((name, state));
+        }
+    }
+    ordered
 }
 
 pub fn attribute_state_for_path(attr: &str, path: &Path) -> Option<AttributeState> {
@@ -377,8 +442,9 @@ pub fn attribute_state_for_path(attr: &str, path: &Path) -> Option<AttributeStat
     let absolute = absolute_in_workdir(path, &workdir)?;
     let sources = attribute_sources_for_path(&workdir, &absolute);
     evaluate_sources(&sources, &workdir, &absolute)
-        .get(attr)
-        .cloned()
+        .into_iter()
+        .find(|(name, _)| name == attr)
+        .map(|(_, state)| state)
 }
 
 /// Where `check-attr` reads its `.gitattributes`/`.libraattributes` sources
@@ -399,15 +465,15 @@ pub enum AttributeSourceKind<'a> {
 pub fn all_attribute_states_for_path_from(
     path: &Path,
     kind: AttributeSourceKind<'_>,
-) -> BTreeMap<String, AttributeState> {
+) -> Vec<(String, AttributeState)> {
     if kind == AttributeSourceKind::Worktree {
         return all_attribute_states_for_path(path);
     }
     let Ok(workdir) = util::try_working_dir() else {
-        return BTreeMap::new();
+        return Vec::new();
     };
     let Some(absolute) = absolute_in_workdir(path, &workdir) else {
-        return BTreeMap::new();
+        return Vec::new();
     };
     // `.git/info/attributes` and the configured global file are still read from
     // disk (they are not part of any tree), matching Git's resolution order.
@@ -423,10 +489,11 @@ pub fn all_attribute_states_for_path_from(
     for info_attributes in util::worktree_info_file_paths(&workdir, "attributes") {
         push_attribute_source(&mut sources, info_attributes, workdir.to_path_buf());
     }
-    let mut rule_sets: Vec<(PathBuf, Arc<Vec<AttributeRule>>)> = sources
+    let mut rule_sets: Vec<RuleSet> = sources
         .iter()
         .map(|source| {
             (
+                source.path.clone(),
                 source.base.clone(),
                 cached_attribute_file(&source.path, &source.base),
             )
@@ -448,6 +515,7 @@ pub fn all_attribute_states_for_path_from(
                 continue;
             };
             rule_sets.push((
+                dir.join(name),
                 dir.clone(),
                 Arc::new(parse_attribute_contents(&contents, &dir)),
             ));
@@ -485,12 +553,12 @@ fn read_attribute_source_contents(key: &str, kind: AttributeSourceKind<'_>) -> O
     String::from_utf8(bytes).ok()
 }
 
-pub fn all_attribute_states_for_path(path: &Path) -> BTreeMap<String, AttributeState> {
+pub fn all_attribute_states_for_path(path: &Path) -> Vec<(String, AttributeState)> {
     let Ok(workdir) = util::try_working_dir() else {
-        return BTreeMap::new();
+        return Vec::new();
     };
     let Some(absolute) = absolute_in_workdir(path, &workdir) else {
-        return BTreeMap::new();
+        return Vec::new();
     };
     let sources = attribute_sources_for_path(&workdir, &absolute);
     evaluate_sources(&sources, &workdir, &absolute)

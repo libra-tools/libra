@@ -46,6 +46,13 @@ value. The value is one of:
 - `set` / `unset` — for bare attributes or `-attr` rules.
 - `unspecified` — the attribute is not set on the path.
 
+`--all` lists attributes in Git's registration order rather than
+alphabetically: the built-ins (`binary`, `diff`, `merge`, `text`) first, then the
+remaining names in the order their attribute files are read — global
+(`core.attributesFile`) → root `.gitattributes` then `.libra_attributes` →
+`info/attributes` → subdirectory files from shallow to deep — with the first
+occurrence in a file registering the name.
+
 `--all` reports only the attributes that are actually **set** on each path
 (for example `filter: lfs` or `diff: <driver>`).
 

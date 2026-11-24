@@ -25,6 +25,8 @@ libra check-attr [-z] (<attr>... | --all) --stdin
 - `set` / `unset` —— 裸属性或 `-attr` 规则。
 - `unspecified` —— 该属性未在路径上设置。
 
+`--all` 按 Git 的属性**登记次序**而非字母序列出：内置（`binary`、`diff`、`merge`、`text`）最先，其余按属性文件读取次序首次出现时登记——全局（`core.attributesFile`）→ 根 `.gitattributes` 再 `.libra_attributes` → `info/attributes` → 子目录文件由浅到深。
+
 `--all` 仅报告路径上**已设置**的属性（例如 `filter: lfs` 或 `diff: <driver>`）。
 
 命令成功时总是退出 `0`（即使所有属性都是 `unspecified`）；用法或仓库错误退出 `128`。

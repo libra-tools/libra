@@ -2080,7 +2080,7 @@ PY
 ### Task PM-28: `libra check-attr -a` 按 Git 属性登记次序输出（#1033；自 PM-15 拆出）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-23：`evaluate_rule_sets` 返回保序 `Vec<(String, AttributeState)>`，先登记内置 `binary/diff/merge/text`，再按 Git 文件读取次序（全局 → 根 `.gitattributes`/`.libra_attributes` → `info/attributes` → 子目录浅→深）首次登记宏名与赋值名；`all_attribute_states_for_path`/`_from` 与 `check_attr.rs` 适配为保序结果；PM-15 测试中两处 `-a` 期望同步为登记序。AC1–AC4 由 `command::check_attr_test::check_attr_all_uses_registration_order` 覆盖（3001 层链的 3002 行次序、LFS 的 `filter` 在 built-ins 之后、`root→info→sub` 读取序）；`check_attr_test` 15/15；EN/zh/开发文档与 `COMPATIBILITY.md` 的 `check-attr` 行同步。
 **Description:** 自 `PM-15` 拆出：`-a` 的输出次序由字母序改为 Git 全局属性字典的登记次序——内置 `binary`、`diff`、`merge`、`text` 最先，其余按 Git 读取属性文件的先后及文件内出现次序首次出现时登记——全局（`core.attributesFile`）→ 根目录（`.gitattributes` 后 `.libra_attributes`）→ `info/attributes` → 查询路径上自浅至深的子目录文件；该读取次序不同于 `PM-15` 的匹配优先级栈（`info/attributes` 匹配优先级最高，却先于子目录文件登记）；`src/utils/attributes.rs` 的全量结果改用保序映射。
 **Out of scope:** 单属性查询输出（次序不受影响）；同一次调用查询多个路径时登记表在路径间的累计（沿用 Git 的进程级字典语义，不单独验收）；宏求值（`PM-15`）；全局来源先于根目录登记、根目录内 `.gitattributes` 先于 `.libra_attributes` 登记（与 AC4 同一按读取次序登记的实现，不单独验收）。
 **Current evidence:**

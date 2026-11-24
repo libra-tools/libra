@@ -60,7 +60,7 @@ fn all_reports_only_set_attributes() {
     assert_eq!(tracked.status.code(), Some(0));
     assert_eq!(
         stdout_of(&tracked),
-        "a.bin: diff: lfs\na.bin: filter: lfs\na.bin: merge: lfs\na.bin: text: unset\n"
+        "a.bin: diff: lfs\na.bin: merge: lfs\na.bin: text: unset\na.bin: filter: lfs\n"
     );
     // Untracked path: nothing is set.
     let untracked = run_libra_command(&["check-attr", "--all", "a.txt"], repo.path());
@@ -410,7 +410,7 @@ fn check_attr_expands_macros_with_git_precedence() {
     assert_cli_success(&out, "AC4");
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "y.n: foo: bar\ny.n: inner: set\ny.n: merge: unset\ny.n: outer: set\n",
+        "y.n: merge: unset\ny.n: outer: set\ny.n: inner: set\ny.n: foo: bar\n",
         "AC4"
     );
 
@@ -419,7 +419,7 @@ fn check_attr_expands_macros_with_git_precedence() {
     assert_cli_success(&out, "AC5");
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "x.b2: diff: set\nx.b2: mybin: set\nx.b2: text: unset\n",
+        "x.b2: diff: set\nx.b2: text: unset\nx.b2: mybin: set\n",
         "AC5"
     );
 
@@ -487,4 +487,80 @@ fn check_attr_expands_macros_with_git_precedence() {
         "file: text: unset\n",
         "AC8"
     );
+}
+
+/// PM-28: `-a` follows Git's attribute registration order.
+#[test]
+fn check_attr_all_uses_registration_order() {
+    // AC1: built-ins first, then names in file order; only set attributes.
+    let repo = tempdir().expect("failed to create repository root");
+    init_repo_via_cli(repo.path());
+    let p = repo.path();
+    std::fs::write(
+        p.join(".gitattributes"),
+        "[attr]mybin -diff -text\n*.dat mybin\n[attr]outer inner -merge\n[attr]inner foo=bar\n*.n outer\n",
+    )
+    .expect("root attributes");
+    let out = run_libra_command(&["check-attr", "-a", "x.dat"], p);
+    assert_cli_success(&out, "AC1");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "x.dat: diff: unset\nx.dat: text: unset\nx.dat: mybin: set\n",
+        "AC1"
+    );
+
+    // AC3: an LFS-style `.libra_attributes` puts `filter` after the built-ins.
+    let repo = tempdir().expect("failed to create repository root");
+    init_repo_via_cli(repo.path());
+    let p = repo.path();
+    std::fs::write(
+        p.join(".libra_attributes"),
+        "*.bin filter=lfs diff=lfs merge=lfs -text\n",
+    )
+    .expect("libra attributes");
+    let out = run_libra_command(&["check-attr", "-a", "a.bin"], p);
+    assert_cli_success(&out, "AC3");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "a.bin: diff: lfs\na.bin: merge: lfs\na.bin: text: unset\na.bin: filter: lfs\n",
+        "AC3"
+    );
+
+    // AC4: registration is global → root → info → subdirectory files.
+    let repo = tempdir().expect("failed to create repository root");
+    init_repo_via_cli(repo.path());
+    let p = repo.path();
+    std::fs::create_dir_all(p.join("sub")).expect("mkdir sub");
+    std::fs::create_dir_all(p.join(".libra/info")).expect("mkdir info");
+    std::fs::write(p.join(".gitattributes"), "*.s rootattr\n").expect("root");
+    std::fs::write(p.join(".libra/info/attributes"), "*.s infoattr\n").expect("info");
+    std::fs::write(p.join("sub/.gitattributes"), "*.s subattr\n").expect("sub");
+    let out = run_libra_command(&["check-attr", "-a", "sub/x.s"], p);
+    assert_cli_success(&out, "AC4");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "sub/x.s: rootattr: set\nsub/x.s: infoattr: set\nsub/x.s: subattr: set\n",
+        "AC4"
+    );
+
+    // AC2: a 3001-level macro chain registers `text` first, then a0..a3000.
+    let repo = tempdir().expect("failed to create repository root");
+    init_repo_via_cli(repo.path());
+    let p = repo.path();
+    let mut rules = String::from("file a0\n");
+    for index in 0..3000 {
+        rules.push_str(&format!("[attr]a{index} a{}\n", index + 1));
+    }
+    rules.push_str("[attr]a3000 -text\n");
+    std::fs::write(p.join(".gitattributes"), rules).expect("deep chain");
+    let out = run_libra_command(&["check-attr", "-a", "file"], p);
+    assert_cli_success(&out, "AC2");
+    let lines: Vec<&str> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|line| Box::leak(line.to_string().into_boxed_str()) as &str)
+        .collect();
+    assert_eq!(lines.len(), 3002, "AC2 line count");
+    assert_eq!(lines[0], "file: text: unset", "AC2 first");
+    assert_eq!(lines[1], "file: a0: set", "AC2 second");
+    assert_eq!(lines[3001], "file: a3000: set", "AC2 last");
 }
