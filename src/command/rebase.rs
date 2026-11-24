@@ -5965,14 +5965,17 @@ async fn create_replayed_commit(
         RebaseTodoAction::Amend => {
             let target: Commit = load_object(&new_parent_id)
                 .map_err(|error| ReplayCommitError::ObjectLoad(error.to_string()))?;
+            // The replacement message is unsigned content; the signing exit
+            // decides whether the folded commit gets a fresh signature.
             let message = amend_replacement_message(&original_commit.message);
-            Ok(Commit::new(
-                target.author.clone(),
+            return finalize_replayed_commit(UnsignedReplayContent {
+                author: target.author.clone(),
                 committer,
                 tree_id,
-                target.parent_commit_ids.clone(),
-                &message,
-            ))
+                parents: target.parent_commit_ids.clone(),
+                message,
+            })
+            .await;
         }
         RebaseTodoAction::Reword | RebaseTodoAction::Edit => {
             return finalize_replayed_commit(UnsignedReplayContent {
@@ -5988,13 +5991,14 @@ async fn create_replayed_commit(
             let target: Commit = load_object(&new_parent_id)
                 .map_err(|error| ReplayCommitError::ObjectLoad(error.to_string()))?;
             let (this_clean, _) = parse_commit_msg(&original_commit.message);
-            Ok(Commit::new(
-                target.author.clone(),
+            return finalize_replayed_commit(UnsignedReplayContent {
+                author: target.author.clone(),
                 committer,
                 tree_id,
-                target.parent_commit_ids.clone(),
-                this_clean.trim(),
-            ))
+                parents: target.parent_commit_ids.clone(),
+                message: this_clean.trim().to_string(),
+            })
+            .await;
         }
     }?;
     // `--signoff` adds the trailer to every replayed commit. `append_trailers`
@@ -6023,19 +6027,17 @@ fn rejoin_commit_message(message: &str, gpg: Option<&str>) -> String {
 }
 
 fn amend_replacement_message(message: &str) -> String {
-    let (clean_message, gpg_sig) = parse_commit_msg(message);
+    // Returns UNSIGNED replacement content: any pre-existing `gpgsig` is
+    // dropped here and the signing exit decides on a fresh signature.
+    let (clean_message, _) = parse_commit_msg(message);
     let subject = clean_message.lines().next().unwrap_or("");
     if !subject.starts_with("amend! ") {
-        return message.to_string();
+        return clean_message.to_string();
     }
-    let replacement = clean_message
+    clean_message
         .split_once('\n')
-        .map(|(_, replacement)| replacement.trim_start_matches('\n'))
-        .unwrap_or_default();
-    match gpg_sig {
-        Some(signature) => format_commit_msg(replacement, Some(&format!("gpgsig {signature}"))),
-        None => format_commit_msg(replacement, None),
-    }
+        .map(|(_, replacement)| replacement.trim_start_matches('\n').to_string())
+        .unwrap_or_default()
 }
 
 /// Collect all commits from base (exclusive) to head (inclusive) that need to be replayed

@@ -1206,7 +1206,7 @@ job 集合以执行当日按模板 ER-04「仓库配置与 CI 展开规则」现
 ### Task SA-08m: `rebase` 的 `amend!`、`fixup -C`、`fixup -c` 迁入签名出口（#780 前置）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-23：`amend!`、`fixup -C`、`fixup -c` 三个折叠分支迁入 `finalize_replayed_commit`；`amend_replacement_message` 改为只返回不含旧 `gpgsig` 的替换消息，不再重附签名——至此 8 个 action 都只经签名出口产生提交。AC1–AC3 由 `rebase_replay_amend_fixup_keep_unsigned_strip_stale_gpgsig` 覆盖（`cat-file -p` 无 `gpgsig`），AC4–AC6 由 `rebase_replay_amend_fixup_keep_signs_openpgp` 覆盖（`merge --ff-only --verify-signatures` exit 0）；`rebase_test`+`rebase_interactive_test` 103/103、`compat_noninteractive_history_controls`+`compat_sequencer_message_author` 35/35、`--lib command::rebase` 20/20。偏差（记录）：①用户已取消独立 Claude/Codex 审计；②按用户 2026-11-23 指令提交并推送（发布仍由 `REL-SA-01` 统一）；③本卡 `Version increment: N/A`，未 bump；④网站仅生成本地草稿。
 **Description:** 自 `SA-08b` 拆出（`REL-SA-01` 家族子卡 3/6，只做本地签名+DCO 提交）：把 `create_replayed_commit` 的 `Amend`、`FixupKeep`（`fixup -C`）、`FixupKeepEdit`（`fixup -c`）三个折叠分支迁入 `finalize_replayed_commit`，删除 `amend_replacement_message` 对旧签名的重附；至此 `create_replayed_commit` 的 8 个 action 都只经该出口产生提交。本卡不改变折叠语义，其回归由共享回归组中的既有用例守护（`tests/command/rebase_test.rs:1387` `test_rebase_autosquash_amend_replaces_target_message`，`tests/command/rebase_interactive_test.rs:528` `test_rebase_i_message_commands_matrix` 的 `fixup -C`/`fixup -c` 段 `:632-659`）。
 **Out of scope:** `Pick`、`reword`、`edit`、`fixup`、`squash`（由 `SA-08a`、`SA-08b` 承接）；`gpg.format=ssh`（由 `SA-08g` 承接）；重放后改写（由 `SA-08h` 承接）；签名失败停止与恢复（由 `SA-08j` 承接）。
 

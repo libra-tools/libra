@@ -8094,14 +8094,15 @@ fn run_replay_action(
     use std::os::unix::fs::PermissionsExt;
     let mut all = env.to_vec();
     match action {
-        "reword" | "edit" => {
-            let verb = if action == "reword" { "reword" } else { "edit" };
-            let script = repo.join(format!(".{action}-todo.sh"));
-            std::fs::write(
-                &script,
-                format!("#!/bin/sh\nsed -i 's/^pick /{verb} /' \"$1\"\n"),
-            )
-            .unwrap();
+        "reword" | "edit" | "fixup -C" | "fixup -c" => {
+            let verb = action;
+            let script = repo.join(format!(".{}-todo.sh", action.replace(' ', "_")));
+            let sed = if action.starts_with("fixup") {
+                format!("2s/^pick /{verb} /")
+            } else {
+                format!("s/^pick /{verb} /")
+            };
+            std::fs::write(&script, format!("#!/bin/sh\nsed -i '{sed}' \"$1\"\n")).unwrap();
             std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
             all.push((
                 "GIT_SEQUENCE_EDITOR".to_string(),
@@ -8201,6 +8202,51 @@ fn rebase_replay_fixup_squash_signs_openpgp() {
     let env = rebase_signing_env(home.path());
     for (action, prefix) in [("fixup", "fixup!"), ("squash", "squash!")] {
         let (repo, upstream) = signing_action_repo(&env, Some(prefix));
+        let p = repo.path();
+        assert_cli_success(
+            &run_with_env(p, &["config", "commit.gpgSign", "true"], &env),
+            "on",
+        );
+        run_replay_action(p, action, &upstream, &env);
+        assert!(rebased_has_gpgsig(p, &env), "AC signed {action}");
+        assert_signed_tip(p, &upstream, &env);
+    }
+}
+
+/// SA-08m AC1–AC3: unsigned `amend!`/`fixup -C`/`fixup -c` folds drop stale
+/// signatures.
+#[test]
+fn rebase_replay_amend_fixup_keep_unsigned_strip_stale_gpgsig() {
+    let home = tempdir().expect("home");
+    let env = rebase_signing_env(home.path());
+    for (action, spec) in [
+        ("amend", Some("amend! T\n\nA amended")),
+        ("fixup -C", Some("fixup! T")),
+        ("fixup -c", Some("fixup! T")),
+    ] {
+        let (repo, upstream) = signing_action_repo(&env, spec);
+        let p = repo.path();
+        assert_cli_success(
+            &run_with_env(p, &["config", "commit.gpgSign", "false"], &env),
+            "off",
+        );
+        run_replay_action(p, action, &upstream, &env);
+        assert!(!rebased_has_gpgsig(p, &env), "AC unsigned {action}");
+    }
+}
+
+/// SA-08m AC4–AC6: signed `amend!`/`fixup -C`/`fixup -c` folds carry a valid
+/// signature.
+#[test]
+fn rebase_replay_amend_fixup_keep_signs_openpgp() {
+    let home = tempdir().expect("home");
+    let env = rebase_signing_env(home.path());
+    for (action, spec) in [
+        ("amend", Some("amend! T\n\nA amended")),
+        ("fixup -C", Some("fixup! T")),
+        ("fixup -c", Some("fixup! T")),
+    ] {
+        let (repo, upstream) = signing_action_repo(&env, spec);
         let p = repo.path();
         assert_cli_success(
             &run_with_env(p, &["config", "commit.gpgSign", "true"], &env),
