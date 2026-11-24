@@ -270,6 +270,15 @@ pub struct NotesRemovedEntry {
 async fn resolve_notes_ref(args: &NotesArgs, is_get_ref: bool) -> CliResult<String> {
     let resolved = if let Some(raw) = &args.ref_ {
         notes::normalize_notes_ref(raw).map_err(|e| CliError::from(NotesCliError::from(e)))?
+    } else if let Some(env_ref) = std::env::var("GIT_NOTES_REF")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        // Git precedence: `--ref` > `GIT_NOTES_REF` > `core.notesRef`. The env
+        // value is used verbatim (get-ref echoes it; other subcommands reject a
+        // value outside refs/notes/).
+        env_ref
     } else {
         let configured = crate::internal::config::read_cascaded_config_value_strict(
             crate::internal::config::LocalIdentityTarget::CurrentRepo,

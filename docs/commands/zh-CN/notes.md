@@ -45,7 +45,7 @@ Notes 作为 blob objects 存储在 notes ref 下（默认 `refs/notes/commits`�
 | `-m` | `--message` | `<msg>` | Note message 文本。可重复；消息之间用空行分隔。 |
 | `-F` | `--file` | `<file>` | 从文件读取 note message（`-` 表示 stdin）。 |
 | `-f` | `--force` | | 覆盖现有 note（用于 `add` 和 `copy`）。 |
-| | `--ref` | `<ref>` | 操作指定 notes ref（默认：配置了 `core.notesRef` 时用其值，否则 `refs/notes/commits`）。显式 `--ref` 优先于配置；配置值原样使用，除 `get-ref` 外所有子命令都要求它以 `refs/notes/` 开头（否则 `LBR-CLI-002`），`get-ref` 则原样打印。 |
+| | `--ref` | `<ref>` | 操作指定 notes ref（默认：配置了 `core.notesRef` 时用其值，否则 `refs/notes/commits`）。显式 `--ref` 优先；未给出时依次取非空 `GIT_NOTES_REF` 环境变量、再取 `core.notesRef`（Git 的优先级）。环境变量值原样使用：`get-ref` 原样打印，其余子命令遇到不以 `refs/notes/` 开头的值以 `LBR-CLI-002` 拒绝；配置值原样使用，除 `get-ref` 外所有子命令都要求它以 `refs/notes/` 开头（否则 `LBR-CLI-002`），`get-ref` 则原样打印。 |
 
 ### 子命令
 

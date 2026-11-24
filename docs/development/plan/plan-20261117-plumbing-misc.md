@@ -1115,7 +1115,7 @@ PY
 ### Task PM-34: `libra notes` 默认 notes ref 遵循 `GIT_NOTES_REF` 环境变量（#988；自 PM-08 拆出）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-23：`resolve_notes_ref` 增加 `GIT_NOTES_REF` 层——`--ref`（规范化）> 非空 `GIT_NOTES_REF`（trim 后原样使用）> `core.notesRef`（本地→全局→系统）> `refs/notes/commits`；`get-ref` 原样回显，其余子命令仍以 `validate_notes_ref` 在任何读写前拒绝非 `refs/notes/` 值（`LBR-CLI-002`）。AC1–AC6 由 `command::notes_test::notes_default_ref_follows_env` 覆盖（快照断言 `add` 只在 env ref 新增一行 `(refs/notes/env, C, blob(z))`；显式 `--ref` 优先；`refs/heads/y` 的 add/list 拒绝与 get-ref 回显）；`notes_test` 86/86；EN/zh/开发文档与 `COMPATIBILITY.md` 的 `notes` 行同步；网站按家族规则提交并同步。
 **Description:** 自 `PM-08` 拆出：未给出 `--ref` 时，已设置的 `GIT_NOTES_REF` 环境变量优先于 `core.notesRef` 成为默认 notes ref（Git 优先级 `--ref` > `GIT_NOTES_REF` > `core.notesRef` > `refs/notes/commits`）；取值按原样使用：`notes get-ref` 原样打印，其余子命令遇到不以 `refs/notes/` 开头的值在任何读写前以 `LBR-CLI-002` 拒绝（与 `PM-08` 对配置值的处理一致）。
 **Out of scope:** `core.notesRef` 的级联读取（`PM-08`）；`GIT_NOTES_REF` 为空字符串时的行为（不单独验收；尚未排期，重启条件：后续 notes 计划）；`--ref` 展开与 notes 在 `for-each-ref` 中可见（`DEFER-PM-08`）。
 **Current evidence:**

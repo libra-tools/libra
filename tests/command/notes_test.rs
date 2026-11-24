@@ -2987,3 +2987,99 @@ fn notes_merge_mode_validation() {
         "strategy merge with a positional ref",
     );
 }
+
+/// PM-34: `GIT_NOTES_REF` sits between `--ref` and `core.notesRef`.
+#[test]
+fn notes_default_ref_follows_env() {
+    use notes_merge_commit_support::{blob, rows};
+
+    let repo = tempdir().expect("failed to create repository root");
+    init_repo_via_cli(repo.path());
+    configure_identity_via_cli(repo.path());
+    let p = repo.path();
+    std::fs::write(p.join("f.txt"), "a\n").expect("write fixture");
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], p), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c1", "--no-verify"], p),
+        "commit",
+    );
+    let commit = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], p).stdout)
+        .trim()
+        .to_string();
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "core.notesRef", "refs/notes/custom"], p),
+        "config custom",
+    );
+
+    // AC1: the env var beats the configured ref.
+    let out = run_libra_command_with_env(
+        &["notes", "get-ref"],
+        p,
+        &[("GIT_NOTES_REF", "refs/notes/env")],
+    );
+    assert_cli_success(&out, "AC1");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "refs/notes/env\n",
+        "AC1"
+    );
+
+    // AC2: `add` writes under the env ref only.
+    let before = rows(p);
+    let added = run_libra_command_with_env(
+        &["notes", "add", "-m", "z", &commit],
+        p,
+        &[("GIT_NOTES_REF", "refs/notes/env")],
+    );
+    assert_cli_success(&added, "AC2 add");
+    let after = rows(p);
+    assert_eq!(after.len(), before.len() + 1, "AC2 one new row");
+    let new_rows: Vec<_> = after
+        .iter()
+        .filter(|(id, ..)| !before.iter().any(|(old, ..)| old == id))
+        .collect();
+    assert_eq!(new_rows.len(), 1, "AC2 exactly one added row");
+    let (_, notes_ref, object, note_blob) = new_rows[0];
+    assert_eq!(notes_ref, "refs/notes/env", "AC2 ref");
+    assert_eq!(object, &commit, "AC2 object");
+    assert_eq!(note_blob, &blob(p, "z"), "AC2 blob");
+
+    // AC3: an explicit `--ref` still wins over the env var.
+    let out = run_libra_command_with_env(
+        &["notes", "--ref", "opt", "get-ref"],
+        p,
+        &[("GIT_NOTES_REF", "refs/notes/env")],
+    );
+    assert_cli_success(&out, "AC3");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "refs/notes/opt\n",
+        "AC3"
+    );
+
+    // AC4/AC5: an out-of-namespace env value is rejected by writers/listers.
+    for args in [
+        vec!["notes", "add", "-m", "z", &commit],
+        vec!["notes", "list"],
+    ] {
+        let out = run_libra_command_with_env(&args, p, &[("GIT_NOTES_REF", "refs/heads/y")]);
+        assert!(!out.status.success(), "{args:?} must fail");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("LBR-CLI-002"),
+            "{args:?} code"
+        );
+    }
+
+    // AC6: `get-ref` echoes the env value verbatim.
+    let out = run_libra_command_with_env(
+        &["notes", "get-ref"],
+        p,
+        &[("GIT_NOTES_REF", "refs/heads/y")],
+    );
+    assert_cli_success(&out, "AC6");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "refs/heads/y\n",
+        "AC6"
+    );
+}

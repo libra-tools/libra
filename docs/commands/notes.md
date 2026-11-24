@@ -56,7 +56,7 @@ order. `notes list` prints full 40/64-character object ids.
 | `-m` | `--message` | `<msg>` | Note message text. Repeatable; blank lines separate messages. |
 | `-F` | `--file` | `<file>` | Read note message from file (`-` for stdin). |
 | `-f` | `--force` | | Overwrite an existing note (for `add` and `copy`). |
-| | `--ref` | `<ref>` | Operate on a specific notes ref (default: `core.notesRef` when configured, else `refs/notes/commits`). An explicit `--ref` wins over the configuration. A configured value is used verbatim and must start with `refs/notes/` for every subcommand except `get-ref`, which prints it as-is (`LBR-CLI-002` otherwise). |
+| | `--ref` | `<ref>` | Operate on a specific notes ref (default: `core.notesRef` when configured, else `refs/notes/commits`). An explicit `--ref` wins, then the non-empty `GIT_NOTES_REF` environment variable, then `core.notesRef` (Git's precedence). The environment value is used verbatim: `get-ref` echoes it, other subcommands reject a value outside `refs/notes/` with `LBR-CLI-002`. A configured value is used verbatim and must start with `refs/notes/` for every subcommand except `get-ref`, which prints it as-is (`LBR-CLI-002` otherwise). |
 
 ### Subcommands
 
