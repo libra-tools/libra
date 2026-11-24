@@ -39,6 +39,13 @@ commit. If no exact tag exists, it fails even when `--always` is also present.
 therefore print `v1.2.3-0-gabc1234` instead of `v1.2.3`. Like Git,
 `--long --abbrev=0` is rejected because the long form requires a hash suffix.
 
+A misnamed annotated tag (its embedded `tag_name` differs from the ref that
+points at it) is rendered by the embedded name, and the mismatch is announced
+once on stderr (`warning: tag '<ref>' is externally known as '<name>'`) only
+when that tag is selected; `--all` and `--contains` keep the reference name.
+`--abbrev=0` still renders the forced `<name>-<distance>-g<oid>` suffix, using
+the full object id.
+
 `--dirty[=<mark>]` appends a suffix when tracked content differs from `HEAD`.
 The default suffix is `-dirty`; custom marks are accepted with
 `--dirty=<mark>`. Untracked files are ignored, matching Git's dirty check for

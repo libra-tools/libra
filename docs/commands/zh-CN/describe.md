@@ -21,6 +21,8 @@ libra describe [OPTIONS] [COMMIT]
 - 回退（`--always`）：`abc1234`
 
 默认只考虑附注标签。传递 `--tags` 可同时匹配轻量标签。当多个标签以相同距离可达时，优先选择附注标签；仍相同时按字典序打破平局。
+名称不一致的附注标签（标签对象内部 `tag_name` 与其引用名不同）按内部名渲染，且仅在该标签被选中时向 stderr 打印一次 `warning: tag '<ref>' is externally known as '<name>'`；`--all` 与 `--contains` 保持引用名。`--abbrev=0` 仍输出强制的 `<name>-<distance>-g<oid>` 后缀，并使用完整对象 id。
+
 
 当找不到标签且未使用 `--always` 时，命令会失败，并给出建议使用 `--tags` 或 `--always` 的可操作提示。
 

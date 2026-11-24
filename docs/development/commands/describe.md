@@ -67,3 +67,5 @@ flowchart TD
 `--dirty` 后缀对已跟踪普通文件使用显式 `text`/`eol` clean 比较。仅有等价的 CRLF/LF 字节差异时不附加后缀；真实内容、模式、类型或暂存变化仍会附加。 `text=auto` 同样使用该比较链路，并保留二进制探测和历史 CRLF 索引保护；`--renormalize`、索引读取额度及剩余配置边界见 [add](add.md)。
 
 调用现有共享状态入口并消费 `worktree_conversion` 的显式策略；保留原始快照/物化 API，未将其它命令的 raw blob 读取批量改成 clean。属性版本变化及读取失败不得复用旧的 clean 结论。回归位于既有 `command_test` 对应模块的 `i1062_` 用例（am 为 `worktree_isolation_test`）。
+
+- 2026-11-23（DESC-05 / #799）：`TagInfo` 记录引用名、附注标签内部 `tag_name` 与 `misnamed`；非 `--contains` 路径按内部名渲染，并在最终选中 misnamed tag 时向 stderr 打印一次 `warning: tag '<ref>' is externally known as '<name>'`（未选中的不告警；`--all`/`--contains` 保持引用名）。`--abbrev=0` 不再抑制后缀：`format_describe_result` 在 `distance>0 || long` 时始终输出 `-<distance>-g<oid>`，`abbrev=0` 用完整 OID，且 `abbreviated_commit` 同值。回归：`misnamed_annotated_tag_uses_internal_name`（AC1–AC8）、原 `--abbrev=0` 用例已更新为新语义；`describe_test` 35/35；TC-1045 PASS（`/tmp/libra-testcases/runs/desc-05-20261124T193312Z-2519528`，对照 git `2.56.0.116.g6de20f6092`）。偏差（记录）：用户已取消独立 Claude/Codex 审计；`DEP-DESC-541` 仍未合入，但本卡 TC-1045 已在 pin 上游全档上 PASS。

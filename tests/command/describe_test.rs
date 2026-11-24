@@ -110,7 +110,7 @@ fn test_describe_always_abbrev_zero_returns_full_hash() {
 }
 
 #[test]
-fn test_describe_abbrev_zero_keeps_git_tag_only_output() {
+fn test_describe_abbrev_zero_forces_suffix_with_full_oid() {
     let repo = create_committed_repo_via_cli();
 
     let tag_output = run_libra_command(&["tag", "-m", "Release v1.0", "v1.0"], repo.path());
@@ -123,14 +123,20 @@ fn test_describe_abbrev_zero_keeps_git_tag_only_output() {
     let commit_output = run_libra_command(&["commit", "-m", "next", "--no-verify"], repo.path());
     assert_cli_success(&commit_output, "failed to create second commit");
 
+    let head =
+        String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], repo.path()).stdout)
+            .trim()
+            .to_string();
     let output = run_libra_command(&["describe", "--abbrev=0", "--json"], repo.path());
     assert_cli_success(&output, "describe --abbrev=0 --json should succeed");
 
     let json = parse_json_stdout(&output);
-    assert_eq!(json["data"]["result"], "v1.0");
+    // DESC-05: `--abbrev=0` forces the `-<n>-g<oid>` suffix with the FULL oid
+    // (Git's repo_find_unique_abbrev(oid, 0)) instead of suppressing it.
+    assert_eq!(json["data"]["result"], format!("v1.0-1-g{head}"));
     assert_eq!(json["data"]["tag"], "v1.0");
     assert_eq!(json["data"]["distance"], 1);
-    assert!(json["data"]["abbreviated_commit"].is_null());
+    assert_eq!(json["data"]["abbreviated_commit"], head);
     assert_eq!(json["data"]["used_always"], false);
 }
 
@@ -1309,5 +1315,99 @@ fn test_describe_all_filters_branch_candidates() {
         String::from_utf8_lossy(&out.stderr).contains("LBR-REPO-003"),
         "AC8: {}",
         String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// DESC-05: a misnamed annotated tag renders its internal name, announces the
+/// mismatch once, and `--abbrev=0` still forces the `-<n>-g<oid>` suffix.
+#[test]
+fn misnamed_annotated_tag_uses_internal_name() {
+    let repo = tempdir().expect("repo");
+    let p = repo.path();
+    init_repo_via_cli(p);
+    configure_identity_via_cli(p);
+    std::fs::write(p.join("a"), "a\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "a"], p), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "Ca", "--no-verify"], p),
+        "Ca",
+    );
+    let ca = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], p).stdout)
+        .trim()
+        .to_string();
+    assert_cli_success(
+        &run_libra_command(&["tag", "-a", "A", "-m", "msg", &ca], p),
+        "tag A",
+    );
+    let tag_oid = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "A"], p).stdout)
+        .trim()
+        .to_string();
+    assert_cli_success(&run_libra_command(&["tag", "Q", &tag_oid], p), "tag Q");
+    assert_cli_success(&run_libra_command(&["tag", "-d", "A"], p), "drop A ref");
+    assert_cli_success(
+        &run_libra_command(&["checkout", "--detach", &ca], p),
+        "detach at Ca",
+    );
+    std::fs::write(p.join("a"), "b\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "a"], p), "add c");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "C", "--no-verify"], p),
+        "C",
+    );
+    let c = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], p).stdout)
+        .trim()
+        .to_string();
+    let short = &c[..7];
+
+    let plain = run_libra_command(&["describe", &c], p);
+    assert_cli_success(&plain, "AC1 describe");
+    assert_eq!(
+        String::from_utf8_lossy(&plain.stdout).trim(),
+        format!("A-1-g{short}"),
+        "AC1 internal name"
+    );
+    let warnings: Vec<String> = String::from_utf8_lossy(&plain.stderr)
+        .lines()
+        .filter(|line| line.contains("externally known as"))
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        warnings,
+        vec!["warning: tag 'Q' is externally known as 'A'".to_string()],
+        "AC2 one warning for the selected tag"
+    );
+
+    let abbrev0 = run_libra_command(&["describe", "--abbrev=0", &c], p);
+    assert_cli_success(&abbrev0, "AC3 describe --abbrev=0");
+    assert_eq!(
+        String::from_utf8_lossy(&abbrev0.stdout).trim(),
+        format!("A-1-g{c}"),
+        "AC3 forced suffix with full oid"
+    );
+
+    let json = run_libra_command(&["describe", "--abbrev=0", "--json", &c], p);
+    assert_cli_success(&json, "AC4/AC5 describe --json");
+    let parsed = parse_json_stdout(&json);
+    assert_eq!(parsed["data"]["tag"], "A", "AC4 tag");
+    assert_eq!(parsed["data"]["abbreviated_commit"], c, "AC5 full oid");
+
+    let all = run_libra_command(&["describe", "--all", &c], p);
+    assert_cli_success(&all, "AC6 describe --all");
+    assert_eq!(
+        String::from_utf8_lossy(&all.stdout).trim(),
+        format!("tags/Q-1-g{short}"),
+        "AC6 --all keeps the reference name"
+    );
+
+    let contains = run_libra_command(&["describe", "--contains", &ca], p);
+    assert_cli_success(&contains, "AC7 describe --contains");
+    assert_eq!(
+        String::from_utf8_lossy(&contains.stdout).trim(),
+        "Q^0",
+        "AC7 --contains reference name"
+    );
+    assert!(
+        !String::from_utf8_lossy(&contains.stderr).contains("externally known as"),
+        "AC8 no warning under --contains"
     );
 }

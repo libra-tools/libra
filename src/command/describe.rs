@@ -121,8 +121,13 @@ pub struct DescribeArgs {
 
 // Entry in tag lookup map
 struct TagInfo {
+    /// Name used in the rendered result (internal tag name unless `--all`).
     name: String,
+    /// Reference name the tag is known by (`refs/tags/<ref>` basename).
+    ref_name: String,
     is_annotated: bool,
+    /// The annotated tag object's `tag_name` differs from its ref name.
+    misnamed: bool,
 }
 
 pub async fn execute(args: DescribeArgs) {
@@ -238,10 +243,25 @@ async fn run_describe(args: DescribeArgs) -> Result<DescribeOutput, DescribeErro
             if !tag_passes_filters(&t.name, &matchers, &excluders) {
                 continue;
             }
+            let ref_name = t.name.clone();
+            // `--contains` and `--all` name tags by their reference; the plain
+            // path uses an annotated tag's internal name (Git `append_name`).
+            let mut misnamed = false;
+            let internal_name = match &t.object {
+                TagObject::Tag(tg) => Some(tg.tag_name.clone()),
+                _ => None,
+            };
             let tag_name = if include_all {
-                format!("tags/{}", t.name)
+                format!("tags/{ref_name}")
+            } else if args.contains {
+                ref_name.clone()
+            } else if let Some(internal) = &internal_name {
+                if *internal != ref_name {
+                    misnamed = true;
+                }
+                internal.clone()
             } else {
-                t.name
+                ref_name.clone()
             };
             let target_commit_hash = match t.object {
                 TagObject::Commit(c) => c.id,
@@ -257,7 +277,9 @@ async fn run_describe(args: DescribeArgs) -> Result<DescribeOutput, DescribeErro
                     target_commit_hash,
                     TagInfo {
                         name: tag_name,
+                        ref_name,
                         is_annotated,
+                        misnamed,
                     },
                 );
             }
@@ -286,7 +308,9 @@ async fn run_describe(args: DescribeArgs) -> Result<DescribeOutput, DescribeErro
             }
             tag_map.entry(branch.commit).or_insert_with(|| TagInfo {
                 name: format!("heads/{short}"),
+                ref_name: format!("heads/{short}"),
                 is_annotated: false,
+                misnamed: false,
             });
         }
 
@@ -308,7 +332,9 @@ async fn run_describe(args: DescribeArgs) -> Result<DescribeOutput, DescribeErro
                 }
                 tag_map.entry(branch.commit).or_insert_with(|| TagInfo {
                     name: format!("remotes/{short}"),
+                    ref_name: format!("remotes/{short}"),
                     is_annotated: false,
+                    misnamed: false,
                 });
             }
         }
@@ -341,6 +367,12 @@ async fn run_describe(args: DescribeArgs) -> Result<DescribeOutput, DescribeErro
     while let Some((curr_hash, dist)) = queue.pop_front() {
         // Check if current commit has a matching tag
         if let Some(tag_info) = tag_map.get(&curr_hash) {
+            if tag_info.misnamed && !include_all && !args.contains {
+                eprintln!(
+                    "warning: tag '{}' is externally known as '{}'",
+                    tag_info.ref_name, tag_info.name
+                );
+            }
             let output = describe_output(
                 input.clone(),
                 resolved_commit.clone(),

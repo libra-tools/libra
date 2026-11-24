@@ -1537,7 +1537,7 @@
 
 ### Task DESC-05: 支持 misnamed annotated tag 内部名称与 `--abbrev=0` 强制后缀输出（#799）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空` | **Priority / Selection:** P1；`#799` 修复与 `#798` 前置 | **Issue:** [#799](https://github.com/libra-tools/libra/issues/799)
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-23：`TagInfo` 记录引用名、附注标签内部 `tag_name` 与 `misnamed`；非 `--contains` 路径按内部名渲染，仅最终选中 misnamed tag 时向 stderr 打印一次 `warning: tag '<ref>' is externally known as '<name>'`（`--all`/`--contains` 保持引用名）；`--abbrev=0` 不再抑制后缀，`distance>0 || long` 时始终输出 `-<distance>-g<oid>`，`abbrev=0` 用完整 OID 且 `abbreviated_commit` 同值。AC1–AC8 由 `command::describe_test::misnamed_annotated_tag_uses_internal_name` 覆盖（内部名、单条告警、强制后缀/完整 OID、JSON 字段、`--all`/`--contains` 引用名与无告警）；`describe_test` 35/35；TC-1045 **PASS**（run `/tmp/libra-testcases/runs/desc-05-20261124T193312Z-2519528`，对照 git `2.56.0.116.g6de20f6092`）；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计；`DEP-DESC-541` 仍未合入，但本卡 TC-1045 已在 pin 上游全档上通过，Issue #799 可闭环。
 
 **Description:** 非 `--contains` 路径中，附注 tag 的引用名（如 `refs/tags/Q`）与 tag 对象内部 `tag_name`（如 `A`）不一致时，按 Git `append_name()`（pinned `builtin/describe.c:297` 起）在 `TagInfo` 中记录内部名与 `misnamed = true`，仅对最终选定的名字向 stderr 打印 `warning: tag '<ref>' is externally known as '<tag_name>'`，并在格式输出中强制追加 `-<distance>-g<hash>`（`--abbrev=0` 时为完整 SHA，对齐 Git `repo_find_unique_abbrev(oid, 0)` 返回全长）；`--contains` 路径保持使用引用名。
 

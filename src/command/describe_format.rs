@@ -8,9 +8,10 @@ pub(super) fn describe_output(
     abbrev: usize,
     long_format: bool,
 ) -> DescribeOutput {
-    let abbreviated_commit = (long_format || distance > 0)
-        .then(|| abbreviate_hash(&resolved_commit, abbrev))
-        .filter(|_| abbrev > 0);
+    // `--abbrev=0` still renders the forced `<tag>-<distance>-g<oid>` suffix,
+    // with the full object id (Git's `repo_find_unique_abbrev(oid, 0)`).
+    let abbreviated_commit =
+        (long_format || distance > 0).then(|| abbreviate_hash(&resolved_commit, abbrev));
     DescribeOutput {
         input,
         resolved_commit: resolved_commit.clone(),
@@ -41,7 +42,7 @@ fn format_describe_result(
     abbrev: usize,
     long_format: bool,
 ) -> String {
-    if (distance == 0 && !long_format) || abbrev == 0 {
+    if distance == 0 && !long_format {
         tag_name.to_string()
     } else {
         let short_sha = abbreviate_hash(full_sha, abbrev);
