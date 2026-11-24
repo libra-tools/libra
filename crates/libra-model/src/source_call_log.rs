@@ -3,7 +3,7 @@
 //! OpenAPI call routed through `SourcePool`.
 //!
 //! Migrations land via `sql/migrations/2026052301_source_call_log{,_down}.sql`
-//! and the entity is registered in [`crate::internal::model`].
+//! and the entity is registered in [`crate`].
 //!
 
 //! No live producer remains after retirement of the Code-era source runtime;

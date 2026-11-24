@@ -6547,6 +6547,7 @@ dependencies = [
  "lazy_static",
  "libc",
  "libfuse-fs",
+ "libra-model",
  "libvault",
  "lru-mem",
  "object_store",
@@ -6605,6 +6606,15 @@ dependencies = [
  "windows-sys 0.61.2",
  "zeroize",
  "zip",
+]
+
+[[package]]
+name = "libra-model"
+version = "0.1.0"
+dependencies = [
+ "sea-orm",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

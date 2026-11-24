@@ -279,17 +279,78 @@ pub fn parse_production_file(label: &str, source: &str) -> syn::File {
     file
 }
 
-/// Every production Rust source under `src/`, parsed and pruned, as
-/// `(repo-relative path, ast)`.
+const WORKSPACE_MODEL_ANCHOR: &str = "crates/libra-model/src/reference.rs";
+
+/// Every `.rs` file under `src/` and `crates/*/src/`, sorted deterministically.
+///
+/// Asserts on every call that the normalized repo-relative set contains
+/// `crates/libra-model/src/reference.rs` so workspace members cannot silently
+/// fall out of production architecture guards.
+pub fn collect_workspace_rust_files(repo_root: &Path) -> Vec<std::path::PathBuf> {
+    let mut roots = vec![repo_root.join("src")];
+    let crates_dir = repo_root.join("crates");
+    if crates_dir.is_dir() {
+        let mut crate_srcs = Vec::new();
+        for entry in fs::read_dir(&crates_dir).expect("crates dir must be readable") {
+            let candidate = entry.expect("crates dir entry").path().join("src");
+            if candidate.is_dir() {
+                crate_srcs.push(candidate);
+            }
+        }
+        crate_srcs.sort();
+        roots.extend(crate_srcs);
+    }
+
+    let mut files = Vec::new();
+    while let Some(dir) = roots.pop() {
+        for entry in fs::read_dir(&dir).expect("source dir must be readable") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                roots.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    let has_model_anchor = files.iter().any(|path| {
+        path.strip_prefix(repo_root)
+            .ok()
+            .is_some_and(|rel| rel.to_string_lossy().replace('\\', "/") == WORKSPACE_MODEL_ANCHOR)
+    });
+    assert!(
+        has_model_anchor,
+        "workspace source walk from '{}' must include '{}'",
+        repo_root.display(),
+        WORKSPACE_MODEL_ANCHOR,
+    );
+    files
+}
+
+/// Every production Rust source under `src/` and `crates/*/src/`, parsed and
+/// pruned, as `(repo-relative path, ast)`.
 ///
 /// `extra_excludes` are repo-relative paths the caller has a documented
 /// reason to skip. Whole test-only FILES (`tests.rs`, `tests/…`, `*_test.rs`)
 /// carry no `#[cfg(test)]` marker of their own — their parent declares them
 /// `#[cfg(test)] mod tests;` — so they are excluded by path.
 pub fn production_files(extra_excludes: &[&str]) -> Vec<(String, syn::File)> {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut parsed = Vec::new();
-    collect(&root, &root, extra_excludes, &mut parsed);
+    for path in collect_workspace_rust_files(repo_root) {
+        let relative = path
+            .strip_prefix(repo_root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        if is_test_only_path(&relative) || extra_excludes.contains(&relative.as_str()) {
+            continue;
+        }
+        let source = fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("`{relative}` must be readable: {error}"));
+        let file = parse_production_file(&relative, &source);
+        parsed.push((relative, file));
+    }
     parsed
 }
 
@@ -304,26 +365,6 @@ fn is_test_only_path(relative: &str) -> bool {
         || relative.contains("/tests/")
         || relative.ends_with("_test.rs")
         || relative.ends_with("_tests.rs")
-}
-
-fn collect(dir: &Path, root: &Path, excludes: &[&str], into: &mut Vec<(String, syn::File)>) {
-    for entry in fs::read_dir(dir).expect("source dir must be readable") {
-        let path = entry.expect("dir entry").path();
-        if path.is_dir() {
-            collect(&path, root, excludes, into);
-            continue;
-        }
-        if path.extension().is_none_or(|ext| ext != "rs") {
-            continue;
-        }
-        let relative = path.strip_prefix(root).unwrap_or(&path);
-        let relative = format!("src/{}", relative.display());
-        if is_test_only_path(&relative) || excludes.contains(&relative.as_str()) {
-            continue;
-        }
-        let source = fs::read_to_string(&path).expect("readable source");
-        into.push((relative.clone(), parse_production_file(&relative, &source)));
-    }
 }
 
 /// Every string literal passed to `.join("…")` on a receiver that names a

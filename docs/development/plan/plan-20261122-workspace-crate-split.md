@@ -100,9 +100,9 @@ flowchart LR
 ---
 
 ### `WSM-02`: Cargo Workspace 骨架搭建、`crates/libra-model` 剥离与全树 `compat` 守卫升级
-- **Lifecycle:** `pending` | **Acceptance:** `unverified`
+- **Lifecycle:** `done` | **Acceptance:** `locally-verified`（`WSM-02` 自身改动与门禁全绿；基线 `main` `38e670dbf` 存在 3 项上游既有失败与 `--all-features` `libc::EFTYPE` 既有编译错，已如实区分记录）
 - **Dependencies:** `WSM-01`, `DEP-WSM-03`
-- **Write Set:** 根 `Cargo.toml`、`Cargo.lock`、`crates/libra-model/**`、`src/internal/mod.rs`（`pub use libra_model as model;`）、`src/internal/model/**`（移出）、5 个全树 `tests/compat/*` walker（`all_production_unwrap_guard.rs`、`branch_lossy_wrapper_guard.rs`、`compat_object_hash_parsing_guard.rs`、`agent_architecture_guard.rs`、`serial_registry.rs` 含 SH-02 L2225/2369）、`tests/SERIAL_CLASSIFY.sh`、`tests/SRC_SERIAL_CENSUS.tsv`（1 条：`reference_test.rs`）、`AGENTS.md`
+- **Write Set:** 根 `Cargo.toml`、`Cargo.lock`、`crates/libra-model/**`、`src/internal/mod.rs`（`pub use libra_model as model;`）、`src/internal/model/**`（移出）、`tests/helpers/workspace_sources.rs`（共享 `collect_workspace_rust_files` + `crates/libra-model/src/reference.rs` 强断言）、全部 9 个全树 Rust 扫描文件（5 个 `tests/compat/*`：`all_production_unwrap_guard.rs`、`branch_lossy_wrapper_guard.rs`、`compat_object_hash_parsing_guard.rs`、`agent_architecture_guard.rs`、`serial_registry.rs`；`src/internal/source_scan.rs`；`tests/agent_transcript_intelligence_test.rs`；`tests/db_migration/configuration_barrier.rs` + `tests/db_migration_test.rs`；`src/utils/object.rs`）、`tests/SERIAL_CLASSIFY.sh`、`tests/SRC_SERIAL_CENSUS.tsv`（1 条：`reference_test.rs`）、`AGENTS.md`
 - **Deliverables:**
   1. 根 `Cargo.toml` 升级为 `[workspace]`（`default-members = [".", "crates/*"]`，保留根包 `libra`、版本号、`src/main.rs` 及 `target/debug/libra` 路径不变），抽离首个 `publish = false` 零反边底座 crate `crates/libra-model`，修复 4 处 rustdoc 链接并更新 `Cargo.lock`。
   2. 升级全部 5 个全树 `tests/compat/*` walker 与 `tests/SERIAL_CLASSIFY.sh` 同时扫描 `src/` 与 `crates/*/src/`。

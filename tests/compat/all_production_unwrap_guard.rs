@@ -26,16 +26,18 @@
 //! `.unwrap()` in doc-example code, place it after a `///` or `//!` prefix
 //! on each line.
 
+#[path = "../helpers/workspace_sources.rs"]
+mod workspace_sources;
+
 use std::{
-    fs, io,
+    fs,
     path::{Path, PathBuf},
 };
 
 #[test]
 fn entire_src_tree_has_no_bare_production_unwrap() {
-    let src_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut files = Vec::new();
-    collect_rust_files(&src_dir, &mut files).expect("failed to collect src files");
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let files = workspace_sources::collect_workspace_rust_files(&repo_root);
 
     let mut offenders = Vec::new();
     for path in files {
@@ -78,19 +80,6 @@ fn entire_src_tree_has_no_bare_production_unwrap() {
          instead of bare `.unwrap()`:\n{}",
         offenders.join("\n"),
     );
-}
-
-fn collect_rust_files(dir: &Path, files: &mut Vec<PathBuf>) -> io::Result<()> {
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_dir() {
-            collect_rust_files(&path, files)?;
-        } else if path.extension().is_some_and(|ext| ext == "rs") {
-            files.push(path);
-        }
-    }
-    Ok(())
 }
 
 fn is_test_file(path: &Path) -> bool {
