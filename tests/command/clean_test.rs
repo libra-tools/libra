@@ -1088,3 +1088,128 @@ fn test_clean_dry_run_writes_no_objects() {
     assert_no_objects_written(p, &before, "clean -n");
     assert!(p.join("untracked.txt").exists(), "dry run keeps the file");
 }
+
+/// PM WC-04: a single force keeps nested repositories (`REMOVE_DIR_KEEP_NESTED_GIT`).
+#[test]
+fn clean_single_force_keeps_nested_repos() {
+    use sha2::{Digest, Sha256};
+    use std::collections::BTreeMap;
+    use std::path::Path;
+
+    fn sha(path: &Path) -> String {
+        let bytes = std::fs::read(path).expect("read for snapshot");
+        let digest = Sha256::digest(&bytes);
+        digest.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+    fn snapshot(root: &Path, dirs: &[&str]) -> BTreeMap<String, String> {
+        fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<String, String>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = entry.file_name();
+                // Repository metadata and the isolated test HOME change on every
+                // CLI run; the snapshot is about user-visible worktree files.
+                if name == ".libra" || name == ".git" || name == ".libra-test-home" {
+                    continue;
+                }
+                if path.is_dir() {
+                    walk(root, &path, out);
+                } else if let Ok(relative) = path.strip_prefix(root) {
+                    out.insert(relative.to_string_lossy().replace('\\', "/"), sha(&path));
+                }
+            }
+        }
+        let mut out = BTreeMap::new();
+        for dir in dirs {
+            walk(root, &root.join(dir), &mut out);
+        }
+        out
+    }
+    let build = || {
+        let repo = tempdir().expect("failed to create repository root");
+        init_repo_via_cli(repo.path());
+        let script = |args: &[&str]| {
+            let out = run_libra_command(args, repo.path());
+            assert_cli_success(&out, &format!("{args:?}"));
+        };
+        script(&["config", "user.name", "t"]);
+        script(&["config", "user.email", "t@t"]);
+        std::fs::write(repo.path().join("tracked"), "x\n").unwrap();
+        script(&["add", "tracked"]);
+        script(&["commit", "-m", "base", "--no-verify"]);
+        std::fs::write(repo.path().join(".gitignore"), "*.world\n").unwrap();
+        for (dir, file, body) in [
+            ("foo/.git/objects", "", ""),
+            ("foo/.git/refs", "", ""),
+            ("baz/boo/.git/objects", "", ""),
+            ("baz/boo/.git/refs", "", ""),
+            ("bar", "goodbye.people", ""),
+            ("foo", "hello.world", "hello\n"),
+            ("foo/sub", "extra.world", "extra\n"),
+            ("baz/boo", "deeper.world", "deeper\n"),
+        ] {
+            std::fs::create_dir_all(repo.path().join(dir)).unwrap();
+            if !file.is_empty() {
+                std::fs::write(repo.path().join(dir).join(file), body).unwrap();
+            }
+        }
+        for nested in ["foo", "baz/boo"] {
+            std::fs::write(
+                repo.path().join(nested).join(".git/HEAD"),
+                "ref: refs/heads/main\n",
+            )
+            .unwrap();
+            std::fs::write(repo.path().join(nested).join(".git/index"), "").unwrap();
+        }
+        let lib = run_libra_command(&["init", "lib"], repo.path());
+        assert_cli_success(&lib, "nested libra init");
+        std::fs::write(repo.path().join("lib/notes.txt"), "notes\n").unwrap();
+        std::fs::write(repo.path().join("lib/extra.world"), "extra\n").unwrap();
+        repo
+    };
+    const DIRS: [&str; 3] = ["foo", "baz/boo", "lib"];
+
+    // AC1/AC2: `clean -f -d` keeps every nested repository file.
+    let repo = build();
+    let before = snapshot(repo.path(), &DIRS);
+    let out = run_libra_command(&["clean", "-f", "-d"], repo.path());
+    assert_cli_success(&out, "AC1");
+    assert_eq!(snapshot(repo.path(), &DIRS), before, "AC2");
+
+    // AC3/AC4: `clean -f` (no -d) keeps them too.
+    let repo = build();
+    let before = snapshot(repo.path(), &DIRS);
+    let out = run_libra_command(&["clean", "-f"], repo.path());
+    assert_cli_success(&out, "AC3");
+    assert_eq!(snapshot(repo.path(), &DIRS), before, "AC4");
+
+    // AC5: the preview never lists a nested repository (or its ancestors).
+    let repo = build();
+    let full_before = snapshot(repo.path(), &["."]);
+    let out = run_libra_command(&["clean", "-n", "-d"], repo.path());
+    assert_cli_success(&out, "AC5");
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    for prefix in ["Would remove foo", "Would remove baz", "Would remove lib"] {
+        assert!(
+            !text.lines().any(|line| line.starts_with(prefix)),
+            "AC5: {text}"
+        );
+    }
+    assert_eq!(snapshot(repo.path(), &["."]), full_before, "AC5 snapshot");
+
+    // AC6: `-x` (delete ignored too) still protects nested repositories.
+    let repo = build();
+    let before = snapshot(repo.path(), &DIRS);
+    let out = run_libra_command(&["clean", "-f", "-d", "-x"], repo.path());
+    assert_cli_success(&out, "AC6");
+    assert_eq!(snapshot(repo.path(), &DIRS), before, "AC6");
+
+    // AC7: `-X` (only ignored) still protects nested repositories.
+    let repo = build();
+    let before = snapshot(repo.path(), &DIRS);
+    let out = run_libra_command(&["clean", "-f", "-d", "-X"], repo.path());
+    assert_cli_success(&out, "AC7");
+    assert_eq!(snapshot(repo.path(), &DIRS), before, "AC7");
+}

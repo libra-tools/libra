@@ -63,3 +63,5 @@ flowchart TD
 - 改进本命令前，必须先阅读并遵循 [docs/development/commands/_general.md](_general.md)；这是命令设计、实现、测试和文档同步的强制要求。
 - 任何行为变更都要先核对实现源码，再同步 `COMPATIBILITY.md`、`docs/commands/<cmd>.md` 和相关测试。
 - 新增 Git 兼容参数时必须明确 tier、错误码、JSON/机器输出契约和回归测试。
+
+- 2026-11-23（WC-04 / #735）：`nested_repository_roots` 在主仓库内递归识别直接含 `.git`/`.libra` 的子目录（遇到即停止下探），`run_clean` 在 pathspec 过滤后、预览/删除前剔除嵌套仓库根及其内容，并剔除包含嵌套仓库的祖先目录（`REMOVE_DIR_KEEP_NESTED_GIT`，单 force 生效，`-x`/`-X` 同样保护）。回归：`clean_single_force_keeps_nested_repos`（AC1–AC7）；`clean_test` 34/34。

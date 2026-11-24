@@ -1,6 +1,7 @@
 //! Implements `clean` to remove untracked files from the working tree.
 
 use std::{
+    ffi::OsStr,
     fs,
     path::{Path, PathBuf},
 };
@@ -278,6 +279,20 @@ fn run_clean(args: CleanArgs, pathspecs: Option<PathspecSet>) -> Result<CleanOut
         });
     }
 
+    // WC-04 / REMOVE_DIR_KEEP_NESTED_GIT: a nested repository (a subdirectory
+    // containing `.git` or `.libra`) is protected under a single force, both in
+    // preview and deletion. Neither its contents nor an ancestor directory that
+    // contains it may be removed.
+    let workdir_root = util::working_dir();
+    let nested_roots = nested_repository_roots(&workdir_root);
+    if !nested_roots.is_empty() {
+        untracked.retain(|candidate| {
+            !nested_roots.iter().any(|root| {
+                candidate == root || candidate.starts_with(root) || root.starts_with(candidate)
+            })
+        });
+    }
+
     // PD-07: apply <pathspec>... limiting through the shared engine. The
     // SAME filtered list feeds both the -n preview and the -f deletion pass
     // below, so the preview set is definitionally the deletion set; a
@@ -335,6 +350,35 @@ fn run_clean(args: CleanArgs, pathspecs: Option<PathspecSet>) -> Result<CleanOut
         dry_run: false,
         removed,
     })
+}
+
+/// Roots (workdir-relative) of nested repositories, recognised by a direct
+/// `.git` or `.libra` entry. The walk stops at a nested root.
+fn nested_repository_roots(workdir: &Path) -> Vec<PathBuf> {
+    fn visit(base: &Path, dir: &Path, roots: &mut Vec<PathBuf>) {
+        if dir != base && (dir.join(".git").exists() || dir.join(".libra").exists()) {
+            if let Ok(relative) = dir.strip_prefix(base) {
+                roots.push(relative.to_path_buf());
+            }
+            return;
+        }
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if name == OsStr::new(util::ROOT_DIR) || name == OsStr::new(util::GIT_DIR) {
+                continue;
+            }
+            let path = entry.path();
+            if path.is_dir() {
+                visit(base, &path, roots);
+            }
+        }
+    }
+    let mut roots = Vec::new();
+    visit(workdir, workdir, &mut roots);
+    roots
 }
 
 /// Find untracked directories based on the ignore policy.

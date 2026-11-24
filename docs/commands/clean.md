@@ -37,6 +37,12 @@ construction: candidates are always untracked-only, exclusion magic can only
 narrow the set, the `-n` preview set is exactly the `-f` deletion set, and an
 empty-string pathspec is rejected rather than widening to the whole tree.
 
+A **nested repository** — a subdirectory containing its own `.git` or `.libra`
+entry — is protected under a single `-f`: its files are never candidates, an
+ancestor directory that contains it is not removed, and `-n` never lists it.
+This matches Git's default `REMOVE_DIR_KEEP_NESTED_GIT`, which keeps nested
+worktrees when one force is given.
+
 ## Options
 
 | Flag | Short | Long | Description |

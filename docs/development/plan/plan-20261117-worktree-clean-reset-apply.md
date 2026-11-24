@@ -534,7 +534,7 @@ PY
 ### Task WC-04: 单 force 下全部删除路径的嵌套仓库保护（#735 前置）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-23：新增 `nested_repository_roots`（直接含 `.git`/`.libra` 的子目录即嵌套仓库根，遇到停止下探）与 `run_clean` 的剔除逻辑——在 pathspec 过滤后、预览/删除前排除嵌套根及其内容，并排除包含嵌套根的祖先目录（`REMOVE_DIR_KEEP_NESTED_GIT`，单 force，`-x`/`-X` 同样生效）。AC1–AC7 由 `command::clean_test::clean_single_force_keeps_nested_repos` 覆盖（嵌套 Git 仓库 `foo/`、`baz/boo/`、嵌套 Libra 仓库 `lib/` 的路径+SHA-256 快照、`-n -d` 不列出、`-x`/`-X` 保护）；`clean_test` 34/34；clean 的 EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计，故未执行本计划的独立 Claude PASS 文档门；后端站点按家族规则仅本地签名提交、未推送（由发布点 `WC-04R` 统一推送）；计划中的 `/Volumes/Data` 路径在本机以 `/mnt/data/gitmono/libra-backend` 执行。
 **Description:** 在 `clean` 候选收集阶段识别嵌套仓库根（直接含 `.git` 或 `.libra` 条目的子目录；`src/utils/util.rs:1785-1800` 目前只跳过元数据目录本身，其余文件仍成为候选），在单 force、`-n` 预览以及 `clean.requireForce=false` 的无标志模式下排除嵌套仓库根及其下全部路径，本卡覆盖无 pathspec 的删除路径（有/无 `-d`，含 `-x`/`-X` 忽略策略）与 `-n -d` 预览，显式 pathspec 路径拆出 `WC-04b`，对齐上游默认 `REMOVE_DIR_KEEP_NESTED_GIT`（`git@750f5de7` `builtin/clean.c:927`）。本卡与 `WC-04b` 组成不可拆分的发布家族 `REL-WC-NEST`，由发布点 `WC-04R` 一次发布（两类路径的保护缺一不得对外发布），并先于 `WC-01`、`WC-02`、`WC-03`、`WC-04a` 等其它 clean 卡，使任何对外版本都不会以单 force 删除嵌套仓库内容。拆出 `WC-04a`（双 force）与 `WC-04b`（显式 pathspec 路径的同一保护）。
 **Out of scope:** 显式 pathspec（指向嵌套仓库、其内文件或其父目录）路径的保护（拆出 `WC-04b` 承接，同属 `REL-WC-NEST` 家族，由 `WC-04R` 与本卡一起发布）；`-f -f` 的接受与双 force 删除（拆出 `WC-04a` 承接）；无 `-d` 的目录边界与显式 pathspec 目录递归（`WC-03`）；`clean.requireForce` 配置读取（`WC-05`）。
 
