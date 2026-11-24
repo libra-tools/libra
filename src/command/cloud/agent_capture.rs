@@ -776,6 +776,7 @@ fn cloud_error_text(error: CloudError) -> String {
         | CloudError::RemoteCaptureKindRefused(detail)
         | CloudError::LocalCaptureKindRefused(detail) => detail,
         CloudError::MissingEnv { detail, .. } => detail,
+        other @ CloudError::ObjectFormatMismatch { .. } => other.to_string(),
     }
 }
 

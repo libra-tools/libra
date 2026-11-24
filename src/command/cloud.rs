@@ -793,6 +793,14 @@ pub(crate) enum CloudError {
     /// Cloud catalog lacks authoritative `object_format` (or conflicts with
     /// OID widths). Maps to `LBR-REPO-002` with a re-backup hint (B3-14).
     AmbiguousObjectFormat(String),
+    /// Non-empty local repository has a different `core.objectformat` than
+    /// the cloud backup being restored. Maps to `LBR-REPO-002` with an
+    /// actionable fresh-repo init hint.
+    ObjectFormatMismatch {
+        local: String,
+        remote: String,
+        notes: Vec<String>,
+    },
     /// An existing D1 capture table's `agent_kind` CHECK rejects a kind that
     /// local capture rows use, or cannot be read (PI-18). Raised before any
     /// remote write; maps to `LBR-CONFLICT-002` with the backfill hint.
@@ -930,6 +938,20 @@ impl fmt::Display for CloudError {
                 }
                 Ok(())
             }
+            CloudError::ObjectFormatMismatch {
+                local,
+                remote,
+                notes,
+            } => {
+                write!(
+                    f,
+                    "local repository uses object format '{local}' and already contains data, which is incompatible with cloud backup object format '{remote}'"
+                )?;
+                for note in notes {
+                    write!(f, "; {note}")?;
+                }
+                Ok(())
+            }
             CloudError::NameAlreadyTaken(detail)
             | CloudError::NameNotFound(detail)
             | CloudError::PartialTransfer(detail)
@@ -960,6 +982,18 @@ impl CloudError {
                 CloudError::MissingEnv {
                     detail,
                     missing_keys,
+                    notes,
+                }
+            }
+            CloudError::ObjectFormatMismatch {
+                local,
+                remote,
+                mut notes,
+            } => {
+                notes.push(note.to_string());
+                CloudError::ObjectFormatMismatch {
+                    local,
+                    remote,
                     notes,
                 }
             }
@@ -1025,6 +1059,24 @@ impl CloudError {
             CloudError::AmbiguousObjectFormat(detail) => CliError::fatal(detail)
                 .with_stable_code(StableErrorCode::RepoCorrupt)
                 .with_hint(REBACKUP_HINT),
+            CloudError::ObjectFormatMismatch {
+                local,
+                remote,
+                notes,
+            } => {
+                let message = format!(
+                    "local repository uses object format '{local}' and already contains data, which is incompatible with cloud backup object format '{remote}'"
+                );
+                let hint = format!(
+                    "initialize a fresh repository with `libra init --object-format {remote}` and rerun `libra cloud restore` there"
+                );
+                notes.into_iter().fold(
+                    CliError::fatal(message)
+                        .with_stable_code(StableErrorCode::RepoCorrupt)
+                        .with_hint(hint),
+                    |error, note| error.with_hint(note),
+                )
+            }
             CloudError::RemoteCaptureKindRefused(detail) => CliError::conflict(detail)
                 .with_stable_code(StableErrorCode::ConflictOperationBlocked)
                 .with_hint(REMOTE_CAPTURE_KIND_RECOVERY_HINT),
@@ -8957,6 +9009,25 @@ mod tests {
                 .into_cli_error("sync")
                 .stable_code(),
             StableErrorCode::NetworkUnavailable
+        );
+        let mismatch = CloudError::ObjectFormatMismatch {
+            local: "sha1".to_string(),
+            remote: "sha256".to_string(),
+            notes: Vec::new(),
+        };
+        assert_eq!(
+            mismatch.to_string(),
+            "local repository uses object format 'sha1' and already contains data, which is incompatible with cloud backup object format 'sha256'"
+        );
+        let mismatch_cli = mismatch.into_cli_error("restore");
+        assert_eq!(mismatch_cli.stable_code(), StableErrorCode::RepoCorrupt);
+        assert!(
+            mismatch_cli
+                .hints()
+                .iter()
+                .any(|hint| hint.as_str().contains("libra init --object-format sha256")),
+            "mismatch hint should guide fresh init: {:?}",
+            mismatch_cli.hints()
         );
     }
 

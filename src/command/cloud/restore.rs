@@ -73,6 +73,227 @@ fn validate_remote_repository_id(repo_id: String) -> CloudResult<String> {
     }
 }
 
+/// Ensure the local repository's `core.objectformat` and process `HashKind`
+/// match the authoritative object format resolved from the cloud backup.
+///
+/// A freshly initialized empty repository (for example after `libra init`
+/// followed by `libra cloud restore --name <sha256-repo>`) adopts the backup's
+/// object format automatically. A non-empty local repository with a different
+/// format fails closed before any local rows, objects, or refs are written.
+async fn reconcile_local_object_format(
+    db_conn: &sea_orm::DatabaseConnection,
+    objects_dir: &std::path::Path,
+    index_path: &std::path::Path,
+    target_kind: git_internal::hash::HashKind,
+) -> CloudResult<()> {
+    reconcile_local_object_format_with(
+        db_conn,
+        objects_dir,
+        index_path,
+        git_internal::hash::get_hash_kind(),
+        target_kind,
+        true,
+    )
+    .await
+}
+
+async fn reconcile_local_object_format_with(
+    db_conn: &sea_orm::DatabaseConnection,
+    objects_dir: &std::path::Path,
+    index_path: &std::path::Path,
+    fallback_kind: git_internal::hash::HashKind,
+    target_kind: git_internal::hash::HashKind,
+    apply_process_kind: bool,
+) -> CloudResult<()> {
+    let local_kind = match ConfigKv::get_with_conn(db_conn, "core.objectformat").await {
+        Ok(Some(entry)) => crate::internal::object_format::parse_config_value(&entry.value)
+            .map_err(|_| {
+                CloudError::Generic(format!(
+                    "local repository has an unsupported core.objectformat '{}'",
+                    entry.value
+                ))
+            })?,
+        Ok(None) => fallback_kind,
+        Err(error) => {
+            return Err(CloudError::Generic(format!(
+                "failed to read local core.objectformat before cloud restore: {error}"
+            )));
+        }
+    };
+
+    if local_kind == target_kind {
+        if apply_process_kind {
+            git_internal::hash::set_hash_kind(target_kind);
+        }
+        return Ok(());
+    }
+
+    let local_fmt = crate::internal::object_format::as_str(local_kind);
+    let target_fmt = crate::internal::object_format::as_str(target_kind);
+
+    if !local_repository_is_empty_for_format_switch(db_conn, objects_dir, index_path).await? {
+        return Err(CloudError::ObjectFormatMismatch {
+            local: local_fmt.to_string(),
+            remote: target_fmt.to_string(),
+            notes: Vec::new(),
+        });
+    }
+
+    ConfigKv::set_with_conn(db_conn, "core.objectformat", target_fmt, false)
+        .await
+        .map_err(|error| {
+            CloudError::Generic(format!(
+                "failed to update local core.objectformat to '{target_fmt}': {error}"
+            ))
+        })?;
+
+    if index_path.exists() {
+        std::fs::remove_file(index_path).map_err(|error| {
+            CloudError::Generic(format!(
+                "failed to clear empty pre-restore index file before switching object format: {error}"
+            ))
+        })?;
+    }
+
+    if apply_process_kind {
+        git_internal::hash::set_hash_kind(target_kind);
+    }
+    Ok(())
+}
+
+async fn local_repository_is_empty_for_format_switch(
+    db_conn: &sea_orm::DatabaseConnection,
+    objects_dir: &std::path::Path,
+    index_path: &std::path::Path,
+) -> CloudResult<bool> {
+    use sea_orm::Statement;
+
+    let backend = db_conn.get_database_backend();
+    let has_object_index_table = crate::internal::db::connection_has_table(db_conn, "object_index")
+        .await
+        .map_err(|error| {
+            CloudError::Generic(format!(
+                "failed to probe local object_index table before switching object format: {error}"
+            ))
+        })?;
+    if has_object_index_table {
+        let has_object_index = db_conn
+            .query_one_raw(Statement::from_string(
+                backend,
+                "SELECT 1 FROM object_index LIMIT 1".to_string(),
+            ))
+            .await
+            .map_err(|error| {
+                CloudError::Generic(format!(
+                    "failed to inspect local object_index before switching object format: {error}"
+                ))
+            })?
+            .is_some();
+        if has_object_index {
+            return Ok(false);
+        }
+    }
+
+    let has_reference_table = crate::internal::db::connection_has_table(db_conn, "reference")
+        .await
+        .map_err(|error| {
+            CloudError::Generic(format!(
+                "failed to probe local reference table before switching object format: {error}"
+            ))
+        })?;
+    if has_reference_table {
+        let has_committed_ref = db_conn
+            .query_one_raw(Statement::from_string(
+                backend,
+                "SELECT 1 FROM reference WHERE \"commit\" IS NOT NULL AND TRIM(\"commit\") != '' LIMIT 1"
+                    .to_string(),
+            ))
+            .await
+            .map_err(|error| {
+                CloudError::Generic(format!(
+                    "failed to inspect local references before switching object format: {error}"
+                ))
+            })?
+            .is_some();
+        if has_committed_ref {
+            return Ok(false);
+        }
+    }
+
+    if objects_dir.exists() {
+        let entries = std::fs::read_dir(objects_dir).map_err(|error| {
+            CloudError::Generic(format!(
+                "failed to inspect local objects directory before switching object format: {error}"
+            ))
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                CloudError::Generic(format!(
+                    "failed to read local objects directory entry before switching object format: {error}"
+                ))
+            })?;
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            if name.len() == 2 && name.bytes().all(|b| b.is_ascii_hexdigit()) {
+                let mut shard = std::fs::read_dir(&path).map_err(|error| {
+                    CloudError::Generic(format!(
+                        "failed to inspect local object shard '{name}' before switching object format: {error}"
+                    ))
+                })?;
+                if shard
+                    .next()
+                    .transpose()
+                    .map_err(|error| {
+                        CloudError::Generic(format!(
+                            "failed to read local object shard '{name}' before switching object format: {error}"
+                        ))
+                    })?
+                    .is_some()
+                {
+                    return Ok(false);
+                }
+            } else if name == "pack" {
+                let pack_entries = std::fs::read_dir(&path).map_err(|error| {
+                    CloudError::Generic(format!(
+                        "failed to inspect local pack directory before switching object format: {error}"
+                    ))
+                })?;
+                for pack_entry in pack_entries {
+                    let pack_entry = pack_entry.map_err(|error| {
+                        CloudError::Generic(format!(
+                            "failed to read local pack directory entry before switching object format: {error}"
+                        ))
+                    })?;
+                    let ext = pack_entry
+                        .path()
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .map(str::to_string);
+                    if matches!(ext.as_deref(), Some("pack" | "idx")) {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+    }
+
+    if index_path.exists() {
+        match git_internal::internal::index::Index::load(index_path) {
+            Ok(index) if index.tracked_files().is_empty() => {}
+            // Fail closed on non-empty or unreadable index files so we never
+            // discard local staged state when switching object format.
+            Ok(_) | Err(_) => return Ok(false),
+        }
+    }
+
+    Ok(true)
+}
+
 pub(crate) async fn restore_indexed_objects_from_remote(
     indexes: &[ObjectIndexRow],
     r2_storage: &RemoteStorage,
@@ -225,6 +446,8 @@ pub(crate) async fn run_cloud_restore(args: RestoreArgs) -> CloudResult<CloudRes
     if !args.metadata_only {
         preflight_agent_capture_prune_fences(&db_conn, &d1_client, &repo_id).await?;
     }
+    reconcile_local_object_format(&db_conn, &path::objects(), &path::index(), repository_kind)
+        .await?;
     for idx in &indexes {
         let existing = object_index::Entity::find()
             .filter(object_index::Column::OId.eq(&idx.o_id))
@@ -298,25 +521,26 @@ pub(crate) async fn run_cloud_restore(args: RestoreArgs) -> CloudResult<CloudRes
         )));
     }
 
-    let (metadata, deferred_capture_refs) = match restore_metadata(&db_conn, &r2_storage).await {
-        Ok(deferred_capture_refs) => (
-            CloudRestoreMetadataOutput {
-                status: "restored".to_string(),
-                warning: None,
-            },
-            deferred_capture_refs,
-        ),
-        Err(e) => {
-            emit_warning(format!("failed to restore metadata: {}", e));
-            (
+    let (metadata, deferred_capture_refs) =
+        match restore_metadata_with_output(&db_conn, &r2_storage, false).await {
+            Ok(deferred_capture_refs) => (
                 CloudRestoreMetadataOutput {
-                    status: "warning".to_string(),
-                    warning: Some(e.to_string()),
+                    status: "restored".to_string(),
+                    warning: None,
                 },
-                Vec::new(),
-            )
-        }
-    };
+                deferred_capture_refs,
+            ),
+            Err(e) => {
+                emit_warning(format!("failed to restore metadata: {}", e));
+                (
+                    CloudRestoreMetadataOutput {
+                        status: "warning".to_string(),
+                        warning: Some(e.to_string()),
+                    },
+                    Vec::new(),
+                )
+            }
+        };
 
     let head_commit = Head::current_commit_result()
         .await
@@ -420,6 +644,8 @@ pub(crate) async fn execute_restore(args: RestoreArgs) -> CloudResult<()> {
     if !args.metadata_only {
         preflight_agent_capture_prune_fences(&db_conn, &d1_client, &repo_id).await?;
     }
+    reconcile_local_object_format(&db_conn, &path::objects(), &path::index(), repository_kind)
+        .await?;
 
     for idx in &indexes {
         // Check if exists
@@ -495,13 +721,14 @@ pub(crate) async fn execute_restore(args: RestoreArgs) -> CloudResult<()> {
         )))
     } else {
         // Restore metadata
-        let deferred_capture_refs = match restore_metadata(&db_conn, &r2_storage).await {
-            Ok(deferred) => deferred,
-            Err(e) => {
-                emit_warning(format!("failed to restore metadata: {}", e));
-                Vec::new()
-            }
-        };
+        let deferred_capture_refs =
+            match restore_metadata_with_output(&db_conn, &r2_storage, true).await {
+                Ok(deferred) => deferred,
+                Err(e) => {
+                    emit_warning(format!("failed to restore metadata: {}", e));
+                    Vec::new()
+                }
+            };
 
         // Post-restore: update HEAD and restore worktree if we're in a fresh repo state.
         // We do this BEFORE the agent-capture restore so that a strict
@@ -1837,21 +2064,37 @@ fn agent_capture_restore_failure(error: CloudError) -> CloudError {
     CloudError::D1(format!("agent capture restore failed: {error}"))
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn restore_metadata(
     db_conn: &sea_orm::DatabaseConnection,
     r2_storage: &RemoteStorage,
 ) -> CloudResult<Vec<reference::Model>> {
-    println!("Restoring metadata...");
+    restore_metadata_with_output(db_conn, r2_storage, true).await
+}
+
+pub(crate) async fn restore_metadata_with_output(
+    db_conn: &sea_orm::DatabaseConnection,
+    r2_storage: &RemoteStorage,
+    render_human: bool,
+) -> CloudResult<Vec<reference::Model>> {
+    if render_human {
+        println!("Restoring metadata...");
+    }
 
     let data = match r2_storage.get_metadata().await {
         Ok(data) => data,
         Err(e) => {
-            println!("warning: failed to download metadata: {}", e);
-            return Ok(Vec::new());
+            if render_human {
+                println!("warning: failed to download metadata: {}", e);
+                return Ok(Vec::new());
+            }
+            return Err(CloudError::R2(format!("failed to download metadata: {e}")));
         }
     };
     let deferred_capture_refs = restore_metadata_from_bytes(db_conn, &data).await?;
-    println!("Metadata restored.");
+    if render_human {
+        println!("Metadata restored.");
+    }
     Ok(deferred_capture_refs)
 }
 
@@ -1980,5 +2223,177 @@ mod tests {
         );
         assert!(validate_remote_repository_id(canonical.to_uppercase()).is_err());
         assert!(validate_remote_repository_id(format!(" {canonical}")).is_err());
+    }
+
+    #[tokio::test]
+    async fn reconcile_local_object_format_switches_empty_repo_to_backup_kind() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("libra.db");
+        let objects_dir = dir.path().join("objects");
+        let index_path = dir.path().join("index");
+        std::fs::create_dir_all(objects_dir.join("pack")).expect("create pack dir");
+
+        let conn = crate::internal::db::create_database(db_path.to_str().expect("utf8 db path"))
+            .await
+            .expect("create db");
+        ConfigKv::set_with_conn(&conn, "core.objectformat", "sha1", false)
+            .await
+            .expect("seed sha1 format");
+
+        reconcile_local_object_format_with(
+            &conn,
+            &objects_dir,
+            &index_path,
+            git_internal::hash::HashKind::Sha1,
+            git_internal::hash::HashKind::Sha256,
+            false,
+        )
+        .await
+        .expect("empty fresh repo should adopt backup object format");
+
+        let stored = ConfigKv::get_with_conn(&conn, "core.objectformat")
+            .await
+            .expect("read config")
+            .expect("core.objectformat entry");
+        assert_eq!(stored.value, "sha256");
+    }
+
+    #[tokio::test]
+    async fn reconcile_local_object_format_refuses_non_empty_repo_without_mutating_config() {
+        // Case 1: local object_index row blocks format switch.
+        {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let db_path = dir.path().join("libra.db");
+            let objects_dir = dir.path().join("objects");
+            let index_path = dir.path().join("index");
+            let conn =
+                crate::internal::db::create_database(db_path.to_str().expect("utf8 db path"))
+                    .await
+                    .expect("create db");
+            ConfigKv::set_with_conn(&conn, "core.objectformat", "sha1", false)
+                .await
+                .expect("seed sha1");
+            object_index::ActiveModel {
+                o_id: Set("a".repeat(40)),
+                o_type: Set("blob".to_string()),
+                o_size: Set(5),
+                repo_id: Set("repo".to_string()),
+                created_at: Set(1),
+                is_synced: Set(0),
+                ..Default::default()
+            }
+            .insert(&conn)
+            .await
+            .expect("insert object_index");
+
+            let err = reconcile_local_object_format_with(
+                &conn,
+                &objects_dir,
+                &index_path,
+                git_internal::hash::HashKind::Sha1,
+                git_internal::hash::HashKind::Sha256,
+                false,
+            )
+            .await
+            .expect_err("non-empty object_index must refuse format switch");
+            assert!(matches!(
+                err,
+                CloudError::ObjectFormatMismatch {
+                    ref local,
+                    ref remote,
+                    ..
+                } if local == "sha1" && remote == "sha256"
+            ));
+            let stored = ConfigKv::get_with_conn(&conn, "core.objectformat")
+                .await
+                .expect("read config")
+                .expect("entry");
+            assert_eq!(stored.value, "sha1");
+        }
+
+        // Case 2: local committed reference blocks format switch.
+        {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let db_path = dir.path().join("libra.db");
+            let objects_dir = dir.path().join("objects");
+            let index_path = dir.path().join("index");
+            let conn =
+                crate::internal::db::create_database(db_path.to_str().expect("utf8 db path"))
+                    .await
+                    .expect("create db");
+            ConfigKv::set_with_conn(&conn, "core.objectformat", "sha1", false)
+                .await
+                .expect("seed sha1");
+            reference::ActiveModel {
+                name: Set(Some("main".to_string())),
+                kind: Set(reference::ConfigKind::Branch),
+                commit: Set(Some("b".repeat(40))),
+                remote: Set(None),
+                worktree_id: Set(None),
+                ..Default::default()
+            }
+            .insert(&conn)
+            .await
+            .expect("insert committed ref");
+
+            let err = reconcile_local_object_format_with(
+                &conn,
+                &objects_dir,
+                &index_path,
+                git_internal::hash::HashKind::Sha1,
+                git_internal::hash::HashKind::Sha256,
+                false,
+            )
+            .await
+            .expect_err("committed ref must refuse format switch");
+            assert!(matches!(err, CloudError::ObjectFormatMismatch { .. }));
+        }
+
+        // Case 3: loose object file blocks format switch.
+        {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let db_path = dir.path().join("libra.db");
+            let objects_dir = dir.path().join("objects");
+            let index_path = dir.path().join("index");
+            std::fs::create_dir_all(objects_dir.join("aa")).expect("shard dir");
+            std::fs::write(objects_dir.join("aa").join("bb"), b"obj").expect("loose obj");
+            let conn =
+                crate::internal::db::create_database(db_path.to_str().expect("utf8 db path"))
+                    .await
+                    .expect("create db");
+            ConfigKv::set_with_conn(&conn, "core.objectformat", "sha1", false)
+                .await
+                .expect("seed sha1");
+
+            let err = reconcile_local_object_format_with(
+                &conn,
+                &objects_dir,
+                &index_path,
+                git_internal::hash::HashKind::Sha1,
+                git_internal::hash::HashKind::Sha256,
+                false,
+            )
+            .await
+            .expect_err("loose object must refuse format switch");
+            assert!(matches!(err, CloudError::ObjectFormatMismatch { .. }));
+        }
+    }
+
+    #[tokio::test]
+    async fn restore_metadata_silent_mode_returns_r2_error_on_missing_metadata() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("libra.db");
+        let conn = crate::internal::db::create_database(db_path.to_str().expect("utf8 db path"))
+            .await
+            .expect("create db");
+        let remote = RemoteStorage::new(Arc::new(object_store::memory::InMemory::new()));
+
+        let err = restore_metadata_with_output(&conn, &remote, false)
+            .await
+            .expect_err("silent mode must surface missing metadata instead of printing to stdout");
+        assert!(
+            matches!(err, CloudError::R2(ref detail) if detail.contains("failed to download metadata")),
+            "unexpected error: {err:?}"
+        );
     }
 }

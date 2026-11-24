@@ -1382,9 +1382,10 @@ async fn cloud_full_workflow_end_to_end() {
     let repo_a_path = repo_a_dir.path();
     let repo_b_path = repo_b_dir.path();
 
-    // Generate unique repo IDs for isolation test
-    let repo_id_a = format!("test-repo-a-{}", Uuid::new_v4());
-    let repo_id_b = format!("test-repo-b-{}", Uuid::new_v4());
+    // Generate canonical unique repo IDs for isolation test (name-based restore
+    // requires canonical UUIDs at the remote repository ID trust boundary).
+    let repo_id_a = Uuid::new_v4().to_string();
+    let repo_id_b = Uuid::new_v4().to_string();
 
     let envs = [
         ("LIBRA_D1_ACCOUNT_ID", required_env("LIBRA_D1_ACCOUNT_ID")),

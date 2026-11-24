@@ -2534,7 +2534,13 @@ async fn operation_class_for_command(
         || matches!(
             command,
             Commands::Cloud(command::cloud::CloudArgs {
-                command: command::cloud::CloudCommand::Status(_),
+                // `cloud sync` exports already-indexed local objects and metadata
+                // to Cloudflare without mutating the worktree, index, or refs.
+                // Wrapping it in Operation Log v2 would write 3 fresh unsynced
+                // snapshot blobs into `object_index` on every run, breaking
+                // repeat-sync idempotency and leaking snapshot objects to R2/D1.
+                command: command::cloud::CloudCommand::Status(_)
+                    | command::cloud::CloudCommand::Sync(_),
             })
         )
         || matches!(
@@ -2621,6 +2627,13 @@ fn command_has_existing_operation_boundary(command: &Commands) -> bool {
             | Commands::Agent(_)
             | Commands::Review(_)
             | Commands::Investigate(_)
+            // `cloud restore` replaces `libra.repoid` with the cloud repository's
+            // UUID and may switch `core.objectformat` on a freshly initialized
+            // repository; wrapping it in the central operation boundary would
+            // record pre-restore snapshots under the throwaway init UUID/format.
+            | Commands::Cloud(command::cloud::CloudArgs {
+                command: command::cloud::CloudCommand::Restore(_),
+            })
     ) || matches!(
         command,
         Commands::Worktree(command::worktree::WorktreeArgs {
@@ -4897,6 +4910,12 @@ mod tests {
             (&["libra", "notes", "prune"], MutationClass::RepoMutation),
             // Bare `notes` is the list default in `execute_safe`.
             (&["libra", "notes"], MutationClass::ReadOnly),
+            (&["libra", "cloud", "status"], MutationClass::ReadOnly),
+            (&["libra", "cloud", "sync"], MutationClass::ReadOnly),
+            (
+                &["libra", "cloud", "sync", "--force"],
+                MutationClass::ReadOnly,
+            ),
         ];
 
         for (argv, expected) in cases {
@@ -4906,6 +4925,13 @@ mod tests {
             let got = operation_class_for_command(&cli.command).await;
             assert_eq!(got, *expected, "operation class for {argv:?}");
         }
+
+        let restore_cli = Cli::try_parse_from(["libra", "cloud", "restore", "--name", "demo"])
+            .expect("parse cloud restore");
+        assert!(
+            command_has_existing_operation_boundary(&restore_cli.command),
+            "cloud restore must bypass the central operation boundary"
+        );
     }
 
     /// WT-08 (ADR-WT-06): an omitted `stash` subcommand is rewritten to

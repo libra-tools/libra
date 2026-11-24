@@ -531,14 +531,45 @@ fn test_cloud_sync_zero_batch_rejects_before_index_or_remote_write() {
         status_after["data"]["synced"], 0,
         "rejected sync must not mark any local object as uploaded"
     );
-    // Running CLI commands may capture additional pending Agent objects.
-    assert!(
-        status_after["data"]["pending"]
-            .as_u64()
-            .expect("pending count after rejected sync")
-            >= status_before["data"]["pending"]
-                .as_u64()
-                .expect("pending count before rejected sync")
+    assert_eq!(
+        status_after["data"]["total_objects"], status_before["data"]["total_objects"],
+        "rejected sync must not create operation-log snapshot objects"
+    );
+    assert_eq!(
+        status_after["data"]["pending"], status_before["data"]["pending"],
+        "rejected sync must leave pending object count unchanged"
+    );
+}
+
+/// Regression: `libra cloud sync` must not write Operation Log v2 snapshot
+/// objects into `.libra/objects` / `object_index` before running; otherwise
+/// every repeat `cloud sync` creates new unsynced blobs and can never become
+/// an idempotent no-op.
+#[test]
+fn test_cloud_sync_does_not_create_operation_snapshot_objects() {
+    let repo = create_committed_repo_via_cli();
+
+    let status_before = run_libra_command(&["--json", "cloud", "status"], repo.path());
+    assert_cli_success(&status_before, "cloud status before sync failed");
+    let before = parse_json_stdout(&status_before);
+
+    // Fails at missing-credentials preflight after CLI dispatch + operation
+    // classification, so any central operation-log pre-snapshot would have
+    // already written new blobs into `object_index`.
+    let sync = run_libra_command(&["--json", "cloud", "sync"], repo.path());
+    assert_ne!(sync.status.code(), Some(0));
+
+    let status_after = run_libra_command(&["--json", "cloud", "status"], repo.path());
+    assert_cli_success(&status_after, "cloud status after sync failed");
+    let after = parse_json_stdout(&status_after);
+
+    assert_eq!(
+        after["data"]["total_objects"], before["data"]["total_objects"],
+        "cloud sync must not mint Operation Log snapshot objects: before={before} after={after}"
+    );
+    assert_eq!(
+        after["data"]["pending"], before["data"]["pending"],
+        "cloud sync must not inflate pending object count: before={before} after={after}"
     );
 }
 
