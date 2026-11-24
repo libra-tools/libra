@@ -2194,7 +2194,7 @@ PY
 
 ### Task LS-27: `log` 支持 `--diff-filter`（#973；拆出 LS-34）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-23：`LogArgs` 新增 `--diff-filter`；`diff::parse_diff_filter`/`apply_diff_filter` 提升为 `pub(crate)` 并新增 `DiffFilter::allows`；提交级过滤在遍历后经 `commit_diff_output` 应用（根提交按 `A` 判定），JSON 路径同样生效；非法字母 `LBR-CLI-002`。AC1–AC4 由 `command::log_test::log_diff_filter_selects_commits` 覆盖（`A` 选中 C1/C3、`--name-status` 仅列匹配记录、`a` 只剩 C2、`Q` 被拒）。`log_test` 全绿；EN/zh 文档与 `COMPATIBILITY.md` 同步。
 
 **Description:** 为 `LogArgs` 接入 `--diff-filter=<filter>`，按 `ADR-LS-01` 把 `src/command/diff.rs` 的 `parse_diff_filter` / `apply_diff_filter` 提升为 `pub(crate)` 并复用，过滤提交的变更文件列表与 diff 输出（无匹配变更文件的提交不输出）。拆出 `LS-34`（`show --diff-filter`）。
 

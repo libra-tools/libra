@@ -9934,3 +9934,75 @@ fn show_textconv_and_no_textconv() {
         "AC5 --no-textconv must not run the filter: {raw}"
     );
 }
+
+#[test]
+fn log_diff_filter_selects_commits() {
+    use super::{assert_cli_success, run_libra_command};
+
+    let work = tempfile::tempdir().expect("work dir");
+    let repo = work.path().join("r");
+    std::fs::create_dir_all(&repo).expect("mkdir repo");
+    assert_cli_success(&run_libra_command(&["init"], &repo), "init");
+    run_libra_command(&["config", "set", "user.name", "t"], &repo);
+    run_libra_command(&["config", "set", "user.email", "t@t"], &repo);
+    std::fs::write(repo.join("a.txt"), "a\n").expect("write a");
+    std::fs::write(repo.join("b.txt"), "b\n").expect("write b");
+    assert_cli_success(&run_libra_command(&["add", "."], &repo), "add c1");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c1", "--no-verify"], &repo),
+        "commit c1",
+    );
+    let c1 = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], &repo).stdout)
+        .trim()
+        .to_string();
+    std::fs::write(repo.join("a.txt"), "a\na2\n").expect("write a2");
+    assert_cli_success(&run_libra_command(&["add", "a.txt"], &repo), "add c2");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c2", "--no-verify"], &repo),
+        "commit c2",
+    );
+    let c2 = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], &repo).stdout)
+        .trim()
+        .to_string();
+    std::fs::write(repo.join("c.txt"), "c\n").expect("write c");
+    assert_cli_success(&run_libra_command(&["add", "c.txt"], &repo), "add c3");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c3", "--no-verify"], &repo),
+        "commit c3",
+    );
+    let c3 = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], &repo).stdout)
+        .trim()
+        .to_string();
+
+    let out = |args: &[&str]| {
+        let result = run_libra_command(args, &repo);
+        assert_cli_success(&result, &format!("log {args:?}"));
+        String::from_utf8_lossy(&result.stdout).to_string()
+    };
+
+    // AC1: only commits introducing files survive `--diff-filter=A`.
+    assert_eq!(
+        out(&["log", "--diff-filter=A", "--format=%H"]),
+        format!("{c3}\n{c1}\n"),
+        "AC1 added-only commit set"
+    );
+    // AC2: `--name-status` lists only the matching records.
+    assert_eq!(
+        out(&["log", "--diff-filter=A", "--name-status", "--format=%H"]),
+        format!("{c3}\n\nA\tc.txt\n{c1}\n\nA\ta.txt\nA\tb.txt\n"),
+        "AC2 name-status records"
+    );
+    // AC3: a lowercase letter excludes that status.
+    assert_eq!(
+        out(&["log", "--diff-filter=a", "--format=%H"]),
+        format!("{c2}\n"),
+        "AC3 exclusion set"
+    );
+    // AC4: an unknown filter letter is a usage error.
+    let bad = run_libra_command(&["log", "--diff-filter=Q"], &repo);
+    assert!(!bad.status.success(), "AC4 must fail");
+    assert!(
+        String::from_utf8_lossy(&bad.stderr).contains("LBR-CLI-002"),
+        "AC4 code"
+    );
+}

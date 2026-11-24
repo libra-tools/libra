@@ -386,6 +386,10 @@ pub struct LogArgs {
     /// Ignore changes in the amount of whitespace (Git's `-b`)
     #[clap(short = 'b', long = "ignore-space-change")]
     pub ignore_space_change: bool,
+    /// Only show commits whose changed files match the filter letters
+    /// (`--diff-filter=[ACDMRTUXB*]`, lowercase excludes)
+    #[clap(long = "diff-filter", value_name = "FILTER")]
+    pub diff_filter: Option<String>,
     /// Show raw diff lines (`:<oldmode> <newmode> <oldsha> <newsha> <status>\t<path>`)
     #[clap(long = "raw")]
     pub raw: bool,
@@ -3134,6 +3138,7 @@ async fn execute_safe_with_diff_formats(
     }
 
     validate_color_moved_args(&args)?;
+    let diff_filter = resolve_log_diff_filter(&args)?;
     let name_status = diff_formats.name_status;
     // Check parameter mutual exclusion: if both name flags and --patch are specified, prioritize the name display flags
     let name_only = diff_formats.name_only && !name_status;
@@ -3251,6 +3256,15 @@ async fn execute_safe_with_diff_formats(
     }
     // `--find-object` keeps only commits whose diff touches a target object.
     let mut traversed_commits = apply_find_object_filter(&args, traversed_commits).await?;
+    if let Some(filter) = &diff_filter {
+        let mut kept = Vec::new();
+        for entry in traversed_commits {
+            if commit_passes_diff_filter(&entry.commit, filter).await? {
+                kept.push(entry);
+            }
+        }
+        traversed_commits = kept;
+    }
     if args.reverse {
         traversed_commits.reverse();
     }
@@ -4219,6 +4233,16 @@ async fn run_log(
     }
     // `--find-object` keeps only commits whose diff touches a target object.
     let mut traversed_commits = apply_find_object_filter(args, traversed_commits).await?;
+    let json_diff_filter = resolve_log_diff_filter(args)?;
+    if let Some(filter) = &json_diff_filter {
+        let mut kept = Vec::new();
+        for entry in traversed_commits {
+            if commit_passes_diff_filter(&entry.commit, filter).await? {
+                kept.push(entry);
+            }
+        }
+        traversed_commits = kept;
+    }
     if args.reverse {
         traversed_commits.reverse();
     }
@@ -6182,6 +6206,28 @@ fn validate_color_moved_args(args: &LogArgs) -> CliResult<()> {
         CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::CliInvalidArguments)
     })?;
     Ok(())
+}
+
+/// Parse `--diff-filter` once per run.
+fn resolve_log_diff_filter(args: &LogArgs) -> CliResult<Option<crate::command::diff::DiffFilter>> {
+    crate::command::diff::parse_diff_filter(args.diff_filter.as_deref()).map_err(|error| {
+        CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::CliInvalidArguments)
+    })
+}
+
+/// Whether a commit's changed files pass `--diff-filter`.
+async fn commit_passes_diff_filter(
+    commit: &Commit,
+    filter: &crate::command::diff::DiffFilter,
+) -> CliResult<bool> {
+    match commit_diff_output(commit, &[]).await? {
+        Some(mut output) => {
+            crate::command::diff::apply_diff_filter(&mut output.files, filter);
+            Ok(!output.files.is_empty())
+        }
+        // Root commits introduce files with `A` status.
+        None => Ok(filter.allows('A')),
+    }
 }
 
 /// Build the diff-engine output for a commit against its first parent.

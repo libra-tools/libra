@@ -410,6 +410,19 @@ libra log -p -w -1
 libra log -p -b -1
 ```
 
+### `--diff-filter=[ACDMRTUXB*]`
+
+Only show commits with at least one changed file matching the filter letters; a
+lowercase letter excludes that status (so `--diff-filter=a` keeps commits whose
+changes are not additions), and `*` keeps the whole record once any file matches.
+The filter is applied through the shared diff engine, so it agrees with
+`libra diff --diff-filter`. An unknown letter is `LBR-CLI-002`.
+
+```bash
+libra log --diff-filter=A --name-status --format=%H
+libra log --diff-filter=a --oneline
+```
+
 ### `--raw` / `--numstat`
 
 `--raw` prints Git's raw diff lines (`:<oldmode> <newmode> <oldsha> <newsha>

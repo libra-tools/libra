@@ -303,6 +303,15 @@ libra log -p -w -1
 libra log -p -b -1
 ```
 
+### `--diff-filter=[ACDMRTUXB*]`
+
+只显示至少有一个变更文件匹配过滤字母的提交；小写字母表示排除该状态（`--diff-filter=a` 保留变更中不含新增的提交），`*` 表示只要有一个文件匹配就保留整条记录。过滤经共享 diff 引擎执行，与 `libra diff --diff-filter` 一致；未知字母以 `LBR-CLI-002` 拒绝。
+
+```bash
+libra log --diff-filter=A --name-status --format=%H
+libra log --diff-filter=a --oneline
+```
+
 ### `--raw` / `--numstat`
 
 `--raw` 输出 Git 的原始 diff 行（`:<oldmode> <newmode> <oldsha> <newsha> <status>\t<路径>`），`--numstat` 输出 `<插入>\t<删除>\t<路径>`（重命名显示为 `{old => new}`，二进制为 `-\t-`）。两者与 `libra diff --raw`/`--numstat` 同引擎、字节一致；后出现的 `-s`/`--no-patch` 会清除它们（与 Git 的后者胜出一致）。

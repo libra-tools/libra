@@ -2282,7 +2282,7 @@ pub(crate) struct DiffFilter {
     all_or_none: bool,
 }
 
-fn parse_diff_filter(raw: Option<&str>) -> Result<Option<DiffFilter>, DiffError> {
+pub(crate) fn parse_diff_filter(raw: Option<&str>) -> Result<Option<DiffFilter>, DiffError> {
     let Some(raw) = raw else {
         return Ok(None);
     };
@@ -2319,7 +2319,16 @@ fn parse_diff_filter(raw: Option<&str>) -> Result<Option<DiffFilter>, DiffError>
     }))
 }
 
-fn apply_diff_filter(files: &mut Vec<DiffFileStat>, filter: &DiffFilter) {
+impl DiffFilter {
+    /// Whether one file status passes the filter's include/exclude sets (the
+    /// all-or-none `*` selector is applied by [`apply_diff_filter`]).
+    pub(crate) fn allows(&self, status: char) -> bool {
+        !self.exclude.contains(&status)
+            && (self.include.is_empty() || self.include.contains(&status))
+    }
+}
+
+pub(crate) fn apply_diff_filter(files: &mut Vec<DiffFileStat>, filter: &DiffFilter) {
     let matches = |file: &DiffFileStat| {
         let status = diff_status_code(file);
         !filter.exclude.contains(&status)
