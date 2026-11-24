@@ -268,3 +268,83 @@ fn symbolic_ref_delete_matrix() {
         "HEAD must be unchanged"
     );
 }
+
+#[test]
+fn symbolic_ref_remote_head_read_write_delete() {
+    let repo = tempdir().expect("failed to create repository root");
+    init_repo_via_cli(repo.path());
+    run_libra_command(&["config", "set", "user.name", "t"], repo.path());
+    run_libra_command(&["config", "set", "user.email", "t@t"], repo.path());
+    std::fs::write(repo.path().join("f.txt"), "a\n").expect("write fixture");
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], repo.path()), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c1", "--no-verify"], repo.path()),
+        "commit",
+    );
+
+    // Seed the remote HEAD row.
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/branch1",
+            ],
+            repo.path(),
+        ),
+        "seed remote HEAD",
+    );
+    // AC1: the read prints the same remote's branch ref.
+    let read = run_libra_command(&["symbolic-ref", "refs/remotes/origin/HEAD"], repo.path());
+    assert_cli_success(&read, "read remote HEAD");
+    assert_eq!(
+        String::from_utf8_lossy(&read.stdout).trim(),
+        "refs/remotes/origin/branch1",
+        "AC1"
+    );
+    // AC2: writing another branch of the same remote takes effect.
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+            repo.path(),
+        ),
+        "rewrite remote HEAD",
+    );
+    let reread = run_libra_command(&["symbolic-ref", "refs/remotes/origin/HEAD"], repo.path());
+    assert_cli_success(&reread, "reread remote HEAD");
+    assert_eq!(
+        String::from_utf8_lossy(&reread.stdout).trim(),
+        "refs/remotes/origin/main",
+        "AC2"
+    );
+    // AC3: `-d` removes the row; a later read is a target error.
+    assert_cli_success(
+        &run_libra_command(
+            &["symbolic-ref", "-d", "refs/remotes/origin/HEAD"],
+            repo.path(),
+        ),
+        "delete remote HEAD",
+    );
+    let after = run_libra_command(&["symbolic-ref", "refs/remotes/origin/HEAD"], repo.path());
+    assert!(!after.status.success(), "AC3 read must fail");
+    assert!(
+        String::from_utf8_lossy(&after.stderr).contains("LBR-CLI-003"),
+        "AC3 code"
+    );
+    // AC4/AC5: only the same remote's branch refs are accepted.
+    for target in ["refs/remotes/upstream/x", "refs/heads/main"] {
+        let bad = run_libra_command(
+            &["symbolic-ref", "refs/remotes/origin/HEAD", target],
+            repo.path(),
+        );
+        assert!(!bad.status.success(), "{target} must fail");
+        assert!(
+            String::from_utf8_lossy(&bad.stderr).contains("LBR-CLI-003"),
+            "{target} code"
+        );
+    }
+}

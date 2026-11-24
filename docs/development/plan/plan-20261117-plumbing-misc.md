@@ -560,7 +560,7 @@ PY
 ### Task PM-32: 支持 `symbolic-ref` 读写/删除 `refs/remotes/<remote>/HEAD`（#711；自 PM-21a 拆出）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-23：`symbolic-ref` 支持 `refs/remotes/<remote>/HEAD`——`remote_head_remote` 解析名称，`run_remote_head` 读（`Head::remote_current_result`，缺失/非分支 → `LBR-CLI-003`）、写（仅接受同一远端 `refs/remotes/<remote>/<branch>`，其它远端或 `refs/heads/*` → `LBR-CLI-003`，为有意差异）、删（新增 `Head::delete_remote_head`，事务内 `delete_many` 远端 HEAD 行）；本地 `HEAD` 行为不变。AC1–AC5 由 `command::symbolic_ref_test::symbolic_ref_remote_head_read_write_delete` 覆盖；`symbolic_ref_test` 11/11；EN/zh 文档与 `COMPATIBILITY.md` 的 `symbolic-ref` 行同步。
 **Description:** 自 `PM-21a` 拆出：`src/command/symbolic_ref.rs` 接受 `refs/remotes/<remote>/HEAD`：读取既有 `Head` 远端行并输出 `refs/remotes/<remote>/<branch>`；写入时目标须为 `refs/remotes/<同一 remote>/<branch>`（Libra 远端 HEAD 只存同一远端的分支名，其它目标以 `LBR-CLI-003` 拒绝，有意差异）；`-d` 删除该远端 HEAD 行（必要时在 `src/internal/head.rs` 增加删除远端 HEAD 的 helper）。
 **Out of scope:** `refs/heads/*` 符号引用与 `checkout`（`PM-21a`）；远端 HEAD 指向分离提交时的写入（尚未排期）。
 **Current evidence:**

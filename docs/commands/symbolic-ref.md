@@ -23,6 +23,13 @@ through the normal structured error contract.
 
 The update form is silent in human output when it succeeds.
 
+`refs/remotes/<remote>/HEAD` is the one non-local symbolic ref Libra does support:
+reading it prints `refs/remotes/<remote>/<branch>` (or fails with `LBR-CLI-003`
+when the row is absent), writing accepts only a target under the *same* remote
+(`refs/remotes/<remote>/<branch>`) and rejects other remotes or `refs/heads/*`
+with `LBR-CLI-003` (an intentional difference — the row stores a branch name,
+not a full ref), and `-d` deletes the row.
+
 ## Options
 
 | Option | Description |

@@ -61,3 +61,5 @@ flowchart TD
 - 改进本命令前，必须先阅读并遵循 [docs/development/commands/_general.md](_general.md)；这是命令设计、实现、测试和文档同步的强制要求。
 - 任何行为变更都要先核对实现源码，再同步 `COMPATIBILITY.md`、`docs/commands/<cmd>.md` 和相关测试。
 - 新增 Git 兼容参数时必须明确 tier、错误码、JSON/机器输出契约和回归测试。
+
+- 2026-11-23（PM-32 / #711）：支持 `refs/remotes/<remote>/HEAD` 的读/写/删除——`remote_head_remote` 解析名称，`run_remote_head` 读（`Head::remote_current_result`）、写（仅同远端 `refs/remotes/<remote>/<branch>`，否则 `LBR-CLI-003`）、删（新增 `Head::delete_remote_head`，事务内 `delete_many`）。回归：`command::symbolic_ref_test::symbolic_ref_remote_head_read_write_delete`（AC1–AC5）。

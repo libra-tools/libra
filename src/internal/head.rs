@@ -784,6 +784,23 @@ impl Head {
             .map_err(|e| BranchStoreError::Query(e.to_string()))
     }
 
+    /// Delete the persisted remote HEAD row (`refs/remotes/<remote>/HEAD`).
+    pub async fn delete_remote_head(remote: &str) -> Result<(), BranchStoreError> {
+        let db_conn = get_db_conn_instance().await;
+        let txn = crate::internal::db::begin_write_transaction(&db_conn)
+            .await
+            .map_err(|e| BranchStoreError::Query(e.to_string()))?;
+        reference::Entity::delete_many()
+            .filter(reference::Column::Kind.eq(reference::ConfigKind::Head))
+            .filter(reference::Column::Remote.eq(remote))
+            .exec(&txn)
+            .await
+            .map_err(|e| BranchStoreError::Query(e.to_string()))?;
+        txn.commit()
+            .await
+            .map_err(|e| BranchStoreError::Query(e.to_string()))
+    }
+
     // HEAD is unique, update if exists, insert if not
     pub async fn update(new_head: Self, remote: Option<&str>) {
         // Routed through the transactional form so the infallible entry point

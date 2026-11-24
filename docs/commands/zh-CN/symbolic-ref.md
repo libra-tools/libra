@@ -17,6 +17,8 @@ libra symbolic-ref HEAD refs/heads/<branch>
 
 更新形式成功时不会产生人类可读输出。
 
+`refs/remotes/<remote>/HEAD` 是 Libra 唯一支持的非本地符号引用：读取时打印 `refs/remotes/<remote>/<branch>`（该行不存在时以 `LBR-CLI-003` 失败）；写入只接受**同一远端**下的目标 `refs/remotes/<remote>/<branch>`，其它远端或 `refs/heads/*` 以 `LBR-CLI-003` 拒绝（有意差异——该行存的是分支名而非完整引用）；`-d` 删除该行。
+
 ## 选项
 
 | 选项 | 说明 |

@@ -17,6 +17,7 @@ use crate::{
 
 const HEAD_REF: &str = "HEAD";
 const HEADS_PREFIX: &str = "refs/heads/";
+const REMOTES_PREFIX: &str = "refs/remotes/";
 
 /// `--help` examples shown in `libra symbolic-ref --help` output.
 ///
@@ -99,6 +100,9 @@ async fn run_symbolic_ref(
     quiet_detached_head_is_silent: bool,
 ) -> CliResult<SymbolicRefOutput> {
     let name = args.name.as_deref().unwrap_or(HEAD_REF);
+    if let Some(remote) = remote_head_remote(name) {
+        return run_remote_head(args, name, remote).await;
+    }
     if args.delete {
         // ADR-PL-08: `-d` is accepted for git parity and never deletes
         // anything. The messages match git's `builtin/symbolic-ref.c`; the
@@ -145,6 +149,78 @@ async fn run_symbolic_ref(
         name: name.to_string(),
         target: format!("{HEADS_PREFIX}{branch_name}"),
         short: Some(branch_name),
+        action: "read",
+    })
+}
+
+/// The remote name when `name` is `refs/remotes/<remote>/HEAD`.
+fn remote_head_remote(name: &str) -> Option<&str> {
+    let rest = name.strip_prefix(REMOTES_PREFIX)?;
+    let remote = rest.strip_suffix("/HEAD")?;
+    (!remote.is_empty() && !remote.contains('/')).then_some(remote)
+}
+
+/// Read, write or delete `refs/remotes/<remote>/HEAD`.
+async fn run_remote_head(
+    args: &SymbolicRefArgs,
+    name: &str,
+    remote: &str,
+) -> CliResult<SymbolicRefOutput> {
+    if args.delete {
+        Head::delete_remote_head(remote)
+            .await
+            .map_err(map_head_error)?;
+        return Ok(SymbolicRefOutput {
+            name: name.to_string(),
+            target: String::new(),
+            short: None,
+            action: "delete",
+        });
+    }
+    if let Some(target) = args.target.as_deref() {
+        // Libra stores only the same remote's branch name in a remote HEAD row.
+        let Some(branch) = target
+            .strip_prefix(REMOTES_PREFIX)
+            .and_then(|rest| rest.strip_prefix(remote))
+            .and_then(|rest| rest.strip_prefix('/'))
+            .filter(|branch| !branch.is_empty())
+        else {
+            return Err(CliError::failure(format!(
+                "unsupported target '{target}' for {name}: a remote HEAD can only point at refs/remotes/{remote}/<branch>"
+            ))
+            .with_stable_code(StableErrorCode::CliInvalidTarget));
+        };
+        if !is_valid_git_branch_name(branch) {
+            return Err(
+                CliError::failure(format!("invalid branch name '{branch}' for {name}"))
+                    .with_stable_code(StableErrorCode::CliInvalidTarget),
+            );
+        }
+        Head::update_result(Head::Branch(branch.to_string()), Some(remote))
+            .await
+            .map_err(map_head_error)?;
+        return Ok(SymbolicRefOutput {
+            name: name.to_string(),
+            target: target.to_string(),
+            short: Some(branch.to_string()),
+            action: "set",
+        });
+    }
+    let target = match Head::remote_current_result(remote)
+        .await
+        .map_err(map_head_error)?
+    {
+        Some(Head::Branch(branch)) => format!("{REMOTES_PREFIX}{remote}/{branch}"),
+        _ => {
+            return Err(CliError::failure(format!("{name} is not a symbolic ref"))
+                .with_stable_code(StableErrorCode::CliInvalidTarget));
+        }
+    };
+    let short = target.strip_prefix(REMOTES_PREFIX).map(str::to_string);
+    Ok(SymbolicRefOutput {
+        name: name.to_string(),
+        target,
+        short,
         action: "read",
     })
 }
