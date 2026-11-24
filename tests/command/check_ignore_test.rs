@@ -6,7 +6,10 @@ use std::fs;
 
 use tempfile::tempdir;
 
-use super::{parse_json_stdout, run_libra_command, run_libra_command_with_stdin};
+use super::{
+    assert_cli_success, init_repo_via_cli, parse_json_stdout, run_libra_command,
+    run_libra_command_with_env, run_libra_command_with_stdin,
+};
 
 /// Initialize a repo and write a `.libraignore` with a known rule set:
 /// `*.log` ignored, `keep.log` whitelisted, `build/` ignored.
@@ -245,4 +248,63 @@ fn verbose_reports_the_last_matching_pattern_line() {
         ".libraignore:3:*.log\ta.log\n",
         "verbose reports the deciding (last) matching line"
     );
+}
+
+/// PM-18: global ignore sources follow Git — XDG default, case-insensitive
+/// config keys, and explicit configuration beating XDG.
+#[test]
+fn check_ignore_global_sources_follow_git() {
+    let repo = tempdir().expect("failed to create repository root");
+    init_repo_via_cli(repo.path());
+    let p = repo.path();
+    // Global XDG sources live outside the worktree, so their reported path
+    // stays absolute (Git's behaviour).
+    let xdg_home = tempdir().expect("xdg home");
+    let xdg_git = xdg_home.path().join("git");
+    std::fs::create_dir_all(&xdg_git).expect("mkdir xdg git");
+    std::fs::write(xdg_git.join("ignore"), "xdgignored\n").expect("write xdg ignore");
+    let xdg_env = xdg_home.path().to_str().expect("utf8 xdg").to_string();
+
+    // AC6: the XDG ignore file is reported with its absolute path.
+    let out = run_libra_command_with_env(
+        &["check-ignore", "-v", "xdgignored"],
+        p,
+        &[("XDG_CONFIG_HOME", &xdg_env)],
+    );
+    assert_cli_success(&out, "AC6");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!(
+            "{}:1:xdgignored\txdgignored\n",
+            xdg_git.join("ignore").display()
+        ),
+        "AC6"
+    );
+
+    // AC7: a lowercase `core.excludesfile` spelling is honored.
+    std::fs::write(p.join("global-excludes"), "globalone\n").expect("write global excludes");
+    assert_cli_success(
+        &run_libra_command(&["config", "core.excludesfile", "global-excludes"], p),
+        "AC7 config",
+    );
+    let out = run_libra_command_with_env(
+        &["check-ignore", "-v", "globalone"],
+        p,
+        &[("XDG_CONFIG_HOME", &xdg_env)],
+    );
+    assert_cli_success(&out, "AC7");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "global-excludes:1:globalone\tglobalone\n",
+        "AC7"
+    );
+
+    // AC8: with an explicit excludes file, the XDG default is not consulted.
+    let out = run_libra_command_with_env(
+        &["check-ignore", "xdgignored"],
+        p,
+        &[("XDG_CONFIG_HOME", &xdg_env)],
+    );
+    assert_eq!(out.status.code(), Some(1), "AC8 exit");
+    assert!(out.stdout.is_empty(), "AC8 stdout");
 }

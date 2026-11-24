@@ -10,8 +10,15 @@ analogue of `git check-attr`.
 > attributes, not a filter driver.
 
 Attribute sources are applied from lower to higher precedence:
-`core.attributesFile`, per-directory `.gitattributes` from root to child,
+`core.attributesFile` (the key is matched case-insensitively), per-directory
+`.gitattributes` from root to child,
 same-directory `.libra_attributes`, then the worktree-local
+When `core.attributesFile` is not configured, the global tier falls back to
+Git's XDG default: `$XDG_CONFIG_HOME/git/attributes`, or
+`$HOME/.config/git/attributes` when `XDG_CONFIG_HOME` is empty. An explicitly
+configured file suppresses that default (even when the configured path does not
+exist).
+
 `info/attributes` — `.libra/info/attributes` in the CURRENT worktree's own
 gitdir, plus `.git/info/attributes` in a Git-layout or dual-layout tree (a
 repo converted from Git keeps both consulted). Libra extension files

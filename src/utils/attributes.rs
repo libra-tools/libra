@@ -329,6 +329,9 @@ pub fn all_attribute_states_for_path_from(
         util::optional_cascaded_config_path(CORE_ATTRIBUTES_FILE_KEY, &workdir)
     {
         push_attribute_source(&mut sources, configured, workdir.to_path_buf());
+    } else if let Some(xdg) = util::xdg_config_home("attributes") {
+        // `core.attributesFile` absent: Git reads `$XDG_CONFIG_HOME/git/attributes`.
+        push_attribute_source(&mut sources, xdg, workdir.to_path_buf());
     }
     for info_attributes in util::worktree_info_file_paths(&workdir, "attributes") {
         push_attribute_source(&mut sources, info_attributes, workdir.to_path_buf());
@@ -505,7 +508,7 @@ impl ConversionAttributeContext {
             }
         }
         Ok(Self {
-            configured: util::optional_cascaded_config_path(CORE_ATTRIBUTES_FILE_KEY, workdir),
+            configured: global_attributes_path(workdir),
             info,
         })
     }
@@ -971,10 +974,18 @@ fn absolute_in_workdir(path: &Path, workdir: &Path) -> Option<PathBuf> {
     util::is_sub_path(&absolute, workdir).then_some(absolute)
 }
 
+/// Global attribute file: an explicitly configured `core.attributesFile`, or
+/// Git's XDG default (`$XDG_CONFIG_HOME/git/attributes`, else
+/// `$HOME/.config/git/attributes`). The XDG file is only consulted when no
+/// explicit configuration exists.
+fn global_attributes_path(workdir: &Path) -> Option<PathBuf> {
+    util::optional_cascaded_config_path(CORE_ATTRIBUTES_FILE_KEY, workdir)
+        .or_else(|| util::xdg_config_home("attributes"))
+}
+
 fn attribute_sources_for_path(workdir: &Path, absolute: &Path) -> Vec<AttributeSource> {
     let mut sources = Vec::new();
-    if let Some(configured) = util::optional_cascaded_config_path(CORE_ATTRIBUTES_FILE_KEY, workdir)
-    {
+    if let Some(configured) = global_attributes_path(workdir) {
         push_attribute_source(&mut sources, configured, workdir.to_path_buf());
     }
     for dir in attribute_dirs(workdir, absolute) {

@@ -4,7 +4,7 @@ Report which pathnames are excluded by Git/Libra ignore rules — the equivalent
 of `git check-ignore`, with Libra extension files preserved.
 
 Libra reads standard Git ignore sources (`.gitignore`, the worktree-local
-`info/exclude`, and `core.excludesFile`) as well as Libra extension files
+`info/exclude`, and `core.excludesFile` — matched case-insensitively) as well as Libra extension files
 (`.libraignore`). The worktree-local `info/exclude` lives in the CURRENT
 worktree's own gitdir — `.libra/info/exclude`, plus `.git/info/exclude` in a
 Git-layout or dual-layout tree (a repo converted from Git keeps both
@@ -16,7 +16,7 @@ worktree still shares main's `info/*` until migrated with
 `libra worktree repair --migrate-layout`. Within the same directory,
 `.libraignore` has higher precedence than `.gitignore`; a nearer directory
 source overrides an ancestor; `info/exclude` and `core.excludesFile` are
-lower-precedence fallbacks. Pattern syntax is Git ignore syntax.
+lower-precedence fallbacks. Pattern syntax is Git ignore syntax. When `core.excludesFile` is not configured, the global tier falls back to `$XDG_CONFIG_HOME/git/ignore` (or `$HOME/.config/git/ignore` when `XDG_CONFIG_HOME` is empty); an explicit configuration suppresses that default.
 
 ## Synopsis
 

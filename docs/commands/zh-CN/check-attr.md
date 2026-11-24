@@ -7,7 +7,7 @@
 > 决策 **D5**）：Libra **不**实现 Git `.gitattributes` 的 smudge/clean filter 桥接。
 > `check-attr` 是对 attributes 的只读查询，而非 filter 驱动。
 
-Attributes 来源按从低到高的优先级应用：`core.attributesFile`、从根到子目录的 `.gitattributes`、同目录 `.libra_attributes`、最后是 worktree 本地 `info/attributes`——即**当前 worktree 自己 gitdir** 下的 `.libra/info/attributes`，Git 布局或双布局树（从 Git 转换、`.git` 与 `.libra` 并存）还会同时读取 `.git/info/attributes`。Libra 扩展文件会覆盖同目录 `.gitattributes` 的匹配规则，而 `info/attributes` 保持 Git 的最高优先级工作树本地层级；它按 worktree 独立——每个隔离布局的 linked worktree 只读自己的文件，绝不经 `commondir` 读到其它 worktree 的（与 Git 的仓库级共享有意不同；pre-isolation 的 legacy-symlink worktree 迁移前仍与 main 共享）。
+Attributes 来源按从低到高的优先级应用：`core.attributesFile`（键名大小写不敏感）、从根到子目录的 `.gitattributes`、同目录 `.libra_attributes`、最后是 worktree 本地 `info/attributes`——即**当前 worktree 自己 gitdir** 下的 `.libra/info/attributes`，Git 布局或双布局树（从 Git 转换、`.git` 与 `.libra` 并存）还会同时读取 `.git/info/attributes`。未配置 `core.attributesFile` 时，全局层回退到 Git 的 XDG 默认文件：`$XDG_CONFIG_HOME/git/attributes`，`XDG_CONFIG_HOME` 为空时用 `$HOME/.config/git/attributes`；显式配置会抑制该默认文件（即使配置的路径不存在）。Libra 扩展文件会覆盖同目录 `.gitattributes` 的匹配规则，而 `info/attributes` 保持 Git 的最高优先级工作树本地层级；它按 worktree 独立——每个隔离布局的 linked worktree 只读自己的文件，绝不经 `commondir` 读到其它 worktree 的（与 Git 的仓库级共享有意不同；pre-isolation 的 legacy-symlink worktree 迁移前仍与 main 共享）。
 
 ## 用法
 

@@ -2135,7 +2135,7 @@ PY
 ### Task PM-18: 全局属性与忽略来源：`core.attributesFile`/`core.excludesFile` 键名大小写与 XDG 默认文件（#1033、#1035）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-23：新增 `util::xdg_config_home(file)`；`read_cascaded_config_value_fresh_conn` 的每个 scope 在精确键无行时回退 `LOWER(key)=LOWER(?)`（加密行仍 Unusable），使 `core.attributesfile`/`core.excludesfile` 等拼写生效；属性引擎新增 `global_attributes_path`（显式配置 → XDG）并统一三处来源构造，忽略引擎未配置时回退 `xdg_config_home("ignore")`；显式配置抑制 XDG 默认文件。AC1–AC5 由 `command::check_attr_test::check_attr_global_sources_follow_git` 覆盖，AC6–AC8 由 `check_ignore_test::check_ignore_global_sources_follow_git` 覆盖（XDG 文件放在 worktree 外以保证绝对路径输出，AC7 的仓库内配置文件保持相对路径）；`check_attr_test`+`check_ignore_test` 25/25；EN/zh/开发文档与 `COMPATIBILITY.md` 的 `check-attr`/`check-ignore` 行同步。
 **Description:** 按 Git 统一全局来源解析：在 `src/utils/util.rs` 增加单一 helper 解析 `xdg_config_home(<file>)`（`XDG_CONFIG_HOME` 非空时用 `$XDG_CONFIG_HOME/git/<file>`，否则 `$HOME/.config/git/<file>`，二者皆无则无全局文件）；`optional_cascaded_config_path` 对变量名做大小写不敏感匹配（`core.attributesfile`/`core.excludesfile` 等拼写生效）；`core.attributesFile` 未配置时属性引擎回退读取 `xdg_config_home("attributes")`，`core.excludesFile` 未配置时忽略引擎回退读取 `xdg_config_home("ignore")`；显式配置时不再读取 XDG 默认文件。
 **Out of scope:** 系统属性文件与 `GIT_ATTR_NOSYSTEM`（`DEFER-PM-06`）；宏求值（`PM-15`）；忽略引擎在 `XDG_CONFIG_HOME` 为空时的 HOME 回退（与属性引擎共用本卡新增的同一 `xdg_config_home` helper：其 HOME 分支由 AC2 验收，忽略引擎调用该 helper 由 AC6 验收，不单独验收）；`XDG_CONFIG_HOME` 与 `HOME` 皆无时不读取全局文件（测试 helper 总为子进程设置 HOME，不单独验收）；`check-ignore` 子目录路径、`--stdin`、`--quiet`（`PM-17`、`PM-31`、`PM-20`）。
 **Current evidence:**

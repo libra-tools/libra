@@ -1515,6 +1515,16 @@ pub fn try_working_dir() -> io::Result<PathBuf> {
 /// sources such as `core.excludesFile`: unreadable or absent config is treated
 /// as no configured path so hot-path commands do not fail because an optional
 /// global config DB is unavailable.
+/// Git's per-user config file under the XDG config home: an absolute non-empty
+/// `XDG_CONFIG_HOME` wins (`$XDG_CONFIG_HOME/git/<file>`), otherwise
+/// `$HOME/.config/git/<file>`; with neither set there is no global file.
+pub fn xdg_config_home(file: &str) -> Option<PathBuf> {
+    match std::env::var_os("XDG_CONFIG_HOME") {
+        Some(value) if !value.is_empty() => Some(PathBuf::from(value).join("git").join(file)),
+        _ => dirs::home_dir().map(|home| home.join(".config").join("git").join(file)),
+    }
+}
+
 pub fn optional_cascaded_config_path(key: &str, workdir: &Path) -> Option<PathBuf> {
     let cache_key = ConfigPathCacheKey {
         workdir: workdir.to_path_buf(),
@@ -3708,6 +3718,9 @@ fn ignore_sources_for_target(work_dir: &Path, target_file: &Path) -> Vec<IgnoreS
     }
     if let Some(configured) = optional_cascaded_config_path(CORE_EXCLUDES_FILE_KEY, work_dir) {
         push_ignore_source(&mut sources, configured, work_dir.to_path_buf());
+    } else if let Some(xdg) = xdg_config_home("ignore") {
+        // `core.excludesFile` absent: Git reads `$XDG_CONFIG_HOME/git/ignore`.
+        push_ignore_source(&mut sources, xdg, work_dir.to_path_buf());
     }
     sources
 }

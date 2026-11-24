@@ -55,3 +55,5 @@
 - 改进本命令前先阅读 [docs/development/commands/_general.md](_general.md)。
 - 任何行为变更先核对 `check_ignore.rs` / `util::check_gitignore_match`，再同步 `COMPATIBILITY.md`、`docs/commands/check-ignore.md` 与测试。
 - 新增公开 flag 必须明确 tier、退出码、JSON/机器输出契约与回归测试。
+
+- 2026-11-23（PM-18 / #1035）：忽略引擎在 `core.excludesFile` 未配置时回退 `util::xdg_config_home("ignore")`；显式配置抑制 XDG 默认文件；键名大小写不敏感（共用 PM-18 的配置读取回退）。回归：`check_ignore_global_sources_follow_git`（AC6–AC8）。

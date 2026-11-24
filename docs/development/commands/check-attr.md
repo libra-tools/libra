@@ -52,3 +52,5 @@
 
 - 改进本命令前先阅读 [docs/development/commands/_general.md](_general.md)。
 - 任何行为变更先核对 `check_attr.rs` / `lfs::is_lfs_tracked`，再同步 `COMPATIBILITY.md`、`docs/commands/check-attr.md` 与测试。
+
+- 2026-11-23（PM-18 / #1033、#1035）：新增 `util::xdg_config_home(file)`（非空 `XDG_CONFIG_HOME/git/<file>`，否则 `$HOME/.config/git/<file>`，皆无则 None）；`read_cascaded_config_value_fresh_conn` 的每个 scope 在精确键无行时回退 `LOWER(key)=LOWER(?)` 查询（加密行仍按 Unusable 处理），使 `core.attributesfile`/`core.excludesfile` 等拼写生效；属性引擎以 `global_attributes_path`（显式配置 → XDG）统一三处来源构造，忽略引擎在未配置时回退 `xdg_config_home("ignore")`。回归：`check_attr_global_sources_follow_git`（AC1–AC5）、`check_ignore_global_sources_follow_git`（AC6–AC8）；`check_attr_test`+`check_ignore_test` 25/25。

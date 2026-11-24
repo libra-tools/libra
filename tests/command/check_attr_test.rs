@@ -6,7 +6,10 @@ use std::fs;
 
 use tempfile::tempdir;
 
-use super::{parse_json_stdout, run_libra_command, run_libra_command_with_stdin};
+use super::{
+    assert_cli_success, init_repo_via_cli, parse_json_stdout, run_libra_command,
+    run_libra_command_with_env, run_libra_command_with_stdin,
+};
 
 /// Init a repo whose `.libra_attributes` runs `*.bin` through the LFS filter.
 fn setup_repo() -> tempfile::TempDir {
@@ -224,5 +227,85 @@ fn check_attr_cached_and_source_matrix() {
         String::from_utf8_lossy(&all_cached.stdout).contains("a.txt: diff: csv"),
         "--all --cached must report the staged value: {}",
         String::from_utf8_lossy(&all_cached.stdout)
+    );
+}
+
+/// PM-18: global attribute sources follow Git — XDG default, HOME fallback,
+/// case-insensitive config keys, and explicit configuration beating XDG.
+#[test]
+fn check_attr_global_sources_follow_git() {
+    let repo = tempdir().expect("failed to create repository root");
+    init_repo_via_cli(repo.path());
+    let p = repo.path();
+    let home = p.join(".libra-test-home");
+    let xdg_git = home.join(".config").join("git");
+    std::fs::create_dir_all(&xdg_git).expect("mkdir xdg git");
+    std::fs::write(p.join("f"), "x\n").expect("write f");
+
+    // AC1: the XDG default file is read when nothing is configured.
+    std::fs::write(xdg_git.join("attributes"), "f attr_f=set\n").expect("write xdg attrs");
+    let out = run_libra_command(&["check-attr", "-a", "f"], p);
+    assert_cli_success(&out, "AC1");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "f: attr_f: set\n",
+        "AC1"
+    );
+
+    // AC2: an empty XDG_CONFIG_HOME falls back to $HOME/.config/git.
+    std::fs::write(
+        home.join(".config").join("git").join("attributes"),
+        "f attr_f=home\n",
+    )
+    .expect("write home attrs");
+    let out = run_libra_command_with_env(&["check-attr", "-a", "f"], p, &[("XDG_CONFIG_HOME", "")]);
+    assert_cli_success(&out, "AC2");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "f: attr_f: home\n",
+        "AC2"
+    );
+
+    // AC3: a lowercase `core.attributesfile` spelling is honored.
+    std::fs::write(home.join("my_attrs"), "f attr_f=test\n").expect("write my_attrs");
+    assert_cli_success(
+        &run_libra_command(&["config", "core.attributesfile", "~/my_attrs"], p),
+        "AC3 config",
+    );
+    let out = run_libra_command(&["check-attr", "-a", "f"], p);
+    assert_cli_success(&out, "AC3");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "f: attr_f: test\n",
+        "AC3"
+    );
+
+    // AC4: an explicitly configured (missing) file suppresses the XDG default.
+    let out = run_libra_command(&["config", "core.attributesFile", "/nonexistent/attrs"], p);
+    assert_cli_success(&out, "AC4 config");
+    let out = run_libra_command(&["check-attr", "-a", "f"], p);
+    assert_cli_success(&out, "AC4");
+    assert!(
+        out.stdout.is_empty(),
+        "AC4: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "unset", "core.attributesFile"], p),
+        "AC4 unset",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "unset", "core.attributesfile"], p),
+        "AC4 unset lowercase",
+    );
+
+    // AC5: a repository `.gitattributes` overrides the global file.
+    std::fs::write(p.join(".gitattributes"), "f -attr_f\n").expect("write local attrs");
+    let out = run_libra_command(&["check-attr", "-a", "f"], p);
+    assert_cli_success(&out, "AC5");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "f: attr_f: unset\n",
+        "AC5"
     );
 }

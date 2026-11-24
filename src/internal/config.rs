@@ -2611,6 +2611,29 @@ pub async fn read_cascaded_config_value_fresh_conn(key: &str) -> Option<String> 
     read_cascaded_fresh_conn_at(local_db.as_deref(), global_db.as_deref(), key).await
 }
 
+/// Case-insensitive `config_kv` lookup used by the read-only cascade when the
+/// exact key has no row. Returns `(value, encrypted)` for the newest row.
+async fn config_kv_ci_lookup<C>(
+    conn: &C,
+    key: &str,
+) -> Result<Option<(String, bool)>, sea_orm::DbErr>
+where
+    C: sea_orm::ConnectionTrait,
+{
+    let row = conn
+        .query_one_raw(sea_orm::Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            "SELECT value, encrypted FROM config_kv WHERE LOWER(key) = LOWER(?) ORDER BY id DESC LIMIT 1",
+            [key.into()],
+        ))
+        .await?;
+    Ok(row.and_then(|row| {
+        let value = row.try_get::<String>("", "value").ok()?;
+        let encrypted = row.try_get::<i64>("", "encrypted").unwrap_or(0) != 0;
+        Some((value, encrypted))
+    }))
+}
+
 /// Path-parameterised body of [`read_cascaded_config_value_fresh_conn`] so
 /// the failure-isolation matrix is unit-testable without cwd games.
 async fn read_cascaded_fresh_conn_at(
@@ -2666,7 +2689,21 @@ async fn read_cascaded_fresh_conn_at(
                     ScopeRead::Value(trimmed.to_string())
                 }
             }
-            Ok(None) => ScopeRead::Absent,
+            // Git config keys are case-insensitive; honour any spelling of the
+            // same key (e.g. `core.attributesfile` for `core.attributesFile`).
+            Ok(None) => match config_kv_ci_lookup(&conn, key).await {
+                Ok(Some((_value, true))) => ScopeRead::Unusable,
+                Ok(Some((value, false))) => {
+                    let trimmed = value.trim();
+                    if trimmed.is_empty() {
+                        ScopeRead::Absent
+                    } else {
+                        ScopeRead::Value(trimmed.to_string())
+                    }
+                }
+                Ok(None) => ScopeRead::Absent,
+                Err(_) => ScopeRead::Unusable,
+            },
             Err(_) => ScopeRead::Unusable,
         }
     }
