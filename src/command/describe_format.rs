@@ -11,8 +11,11 @@ pub(super) fn describe_output(
 ) -> DescribeOutput {
     // `--abbrev=0` still renders the forced `<tag>-<distance>-g<oid>` suffix,
     // with the full object id (Git's `repo_find_unique_abbrev(oid, 0)`).
+    // Git's `--abbrev=0` omits the suffix for ordinary tags; a misnamed tag is
+    // the exception (Git forces `<name>-<n>-g<oid>` with the FULL oid).
     let abbreviated_commit = (long_format || distance > 0 || force_suffix)
-        .then(|| abbreviate_hash(&resolved_commit, abbrev));
+        .then(|| abbreviate_hash(&resolved_commit, abbrev))
+        .filter(|_| abbrev > 0 || force_suffix);
     DescribeOutput {
         input,
         resolved_commit: resolved_commit.clone(),
@@ -51,7 +54,7 @@ fn format_describe_result(
     long_format: bool,
     force_suffix: bool,
 ) -> String {
-    if distance == 0 && !long_format && !force_suffix {
+    if !force_suffix && (distance == 0 && !long_format || abbrev == 0) {
         tag_name.to_string()
     } else {
         let short_sha = abbreviate_hash(full_sha, abbrev);

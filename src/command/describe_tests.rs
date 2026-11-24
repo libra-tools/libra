@@ -106,3 +106,14 @@ fn no_long_parse_order() {
     assert!(args.long, "AC4: --long wins when it comes last");
     assert!(!args.no_long);
 }
+
+/// DESC-06 AC5: `--abbrev=N --no-abbrev` leaves `--no-abbrev` in effect.
+#[test]
+fn no_abbrev_parse_order() {
+    use clap::Parser;
+
+    let args = super::DescribeArgs::try_parse_from(["describe", "--abbrev=5", "--no-abbrev"])
+        .expect("both flags parse");
+    assert_eq!(args.abbrev, None, "AC5 abbrev cleared");
+    assert!(args.no_abbrev, "AC5 no_abbrev active");
+}

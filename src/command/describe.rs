@@ -72,8 +72,12 @@ pub struct DescribeArgs {
     pub all: bool,
 
     /// Use N hex digits for the abbreviated commit hash (default: 7)
-    #[clap(long, value_name = "N")]
+    #[clap(long, value_name = "N", overrides_with = "no_abbrev")]
     pub abbrev: Option<usize>,
+
+    /// Show the full commit hash (Git's `--abbrev=0`; last one wins)
+    #[clap(long, overrides_with = "abbrev")]
+    pub no_abbrev: bool,
 
     /// Show an abbreviated commit hash when no tag can describe the target.
     #[clap(long)]
@@ -175,6 +179,7 @@ pub(crate) async fn describe_commit_for_atom(
         tags,
         all: false,
         abbrev,
+        no_abbrev: false,
         always: false,
         exact_match: false,
         candidates: None,
@@ -207,7 +212,11 @@ async fn run_describe(args: DescribeArgs) -> Result<DescribeOutput, DescribeErro
         .await
         .map_err(DescribeError::from)?;
     let resolved_commit = start_hash.to_string();
-    let abbrev = args.abbrev.unwrap_or(7);
+    let abbrev = if args.no_abbrev {
+        0
+    } else {
+        args.abbrev.unwrap_or(7)
+    };
     let long_format = args.long;
     if long_format && abbrev == 0 {
         return Err(DescribeError::LongWithAbbrevZero);

@@ -110,7 +110,7 @@ fn test_describe_always_abbrev_zero_returns_full_hash() {
 }
 
 #[test]
-fn test_describe_abbrev_zero_forces_suffix_with_full_oid() {
+fn test_describe_abbrev_zero_keeps_git_tag_only_output() {
     let repo = create_committed_repo_via_cli();
 
     let tag_output = run_libra_command(&["tag", "-m", "Release v1.0", "v1.0"], repo.path());
@@ -123,20 +123,15 @@ fn test_describe_abbrev_zero_forces_suffix_with_full_oid() {
     let commit_output = run_libra_command(&["commit", "-m", "next", "--no-verify"], repo.path());
     assert_cli_success(&commit_output, "failed to create second commit");
 
-    let head =
-        String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], repo.path()).stdout)
-            .trim()
-            .to_string();
     let output = run_libra_command(&["describe", "--abbrev=0", "--json"], repo.path());
     assert_cli_success(&output, "describe --abbrev=0 --json should succeed");
 
     let json = parse_json_stdout(&output);
-    // DESC-05: `--abbrev=0` forces the `-<n>-g<oid>` suffix with the FULL oid
-    // (Git's repo_find_unique_abbrev(oid, 0)) instead of suppressing it.
-    assert_eq!(json["data"]["result"], format!("v1.0-1-g{head}"));
+    // Git's `--abbrev=0` omits the `-<n>-g<oid>` suffix for an ordinary tag.
+    assert_eq!(json["data"]["result"], "v1.0");
     assert_eq!(json["data"]["tag"], "v1.0");
     assert_eq!(json["data"]["distance"], 1);
-    assert_eq!(json["data"]["abbreviated_commit"], head);
+    assert!(json["data"]["abbreviated_commit"].is_null());
     assert_eq!(json["data"]["used_always"], false);
 }
 
@@ -1436,5 +1431,93 @@ fn misnamed_annotated_tag_no_long_keeps_suffix() {
         String::from_utf8_lossy(&resolved.stdout).trim(),
         ca,
         "AC7 resolves to the tagged commit"
+    );
+}
+
+/// DESC-06 AC1–AC4, AC6, AC7: `--no-abbrev` equals `--abbrev=0`, is last-wins
+/// with `--abbrev`, falls back to the full HEAD hash under `--always`, and is
+/// rejected with `--long`.
+#[test]
+fn no_abbrev_last_wins_and_always() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    std::fs::write(p.join("n.txt"), "n1\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "n.txt"], p), "add n1");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c1", "--no-verify"], p),
+        "c1",
+    );
+    assert_cli_success(&run_libra_command(&["tag", "-m", "v1.0", "v1.0"], p), "tag");
+    std::fs::write(p.join("n.txt"), "n2\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "n.txt"], p), "add n2");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c2", "--no-verify"], p),
+        "c2",
+    );
+    let head = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], p).stdout)
+        .trim()
+        .to_string();
+    // The 5-hex prefix is unique in this fixture (STOP condition from the card).
+    assert_eq!(
+        String::from_utf8_lossy(&run_libra_command(&["rev-parse", &head[..5]], p).stdout).trim(),
+        head,
+        "5-hex prefix is unique"
+    );
+
+    let out = run_libra_command(
+        &["describe", "--no-abbrev", "--always", "--match=no-such-tag"],
+        p,
+    );
+    assert_cli_success(&out, "AC1");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        head,
+        "AC1 full HEAD"
+    );
+
+    let out = run_libra_command(
+        &[
+            "describe",
+            "--no-abbrev",
+            "--always",
+            "--match=no-such-tag",
+            "--json",
+        ],
+        p,
+    );
+    assert_cli_success(&out, "AC2/AC3");
+    let json = parse_json_stdout(&out);
+    assert_eq!(json["data"]["used_always"], true, "AC2");
+    assert_eq!(json["data"]["abbreviated_commit"], head, "AC3");
+
+    let out = run_libra_command(&["describe", "--no-abbrev"], p);
+    assert_cli_success(&out, "AC4");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "v1.0", "AC4");
+
+    let out = run_libra_command(&["describe", "--no-abbrev", "--abbrev=5"], p);
+    assert_cli_success(&out, "AC6");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        format!("v1.0-1-g{}", &head[..5]),
+        "AC6 last-wins"
+    );
+
+    let out = run_libra_command(&["describe", "--long", "--no-abbrev"], p);
+    assert!(!out.status.success(), "AC7 must fail");
+    let (_human, report) = parse_cli_error_stderr(&out.stderr);
+    assert_eq!(report.error_code, "LBR-CLI-002", "AC7 code");
+}
+
+/// DESC-06 AC8: `--no-abbrev` on a misnamed tag keeps the forced full suffix.
+#[test]
+fn misnamed_annotated_tag_no_abbrev_keeps_full_suffix() {
+    let (repo, _ca, c) = misnamed_tag_repo();
+    let p = repo.path();
+    let out = run_libra_command(&["describe", "--no-abbrev", &c], p);
+    assert_cli_success(&out, "AC8 describe --no-abbrev");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        format!("A-1-g{c}"),
+        "AC8 forced full suffix"
     );
 }

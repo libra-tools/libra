@@ -43,8 +43,8 @@ A misnamed annotated tag (its embedded `tag_name` differs from the ref that
 points at it) is rendered by the embedded name, and the mismatch is announced
 once on stderr (`warning: tag '<ref>' is externally known as '<name>'`) only
 when that tag is selected; `--all` and `--contains` keep the reference name.
-`--abbrev=0` still renders the forced `<name>-<distance>-g<oid>` suffix, using
-the full object id.
+For an ordinary tag `--abbrev=0` still omits the suffix (Git); a misnamed tag
+is the exception and forces `<name>-<distance>-g<full oid>`.
 
 `--dirty[=<mark>]` appends a suffix when tracked content differs from `HEAD`.
 The default suffix is `-dirty`; custom marks are accepted with
@@ -59,6 +59,7 @@ this command.
 | `--tags` | Include lightweight tags in the search (not just annotated tags). | Off |
 | `--all` | Consider any ref (local branches, remote-tracking branches, and tags, including lightweight ones), not just tags. Names are shown with their `heads/`, `remotes/`, or `tags/` prefix; at a shared commit tags win, then heads, then remotes. | Off |
 | `--abbrev <N>` | Number of hex digits for the abbreviated commit hash in the output. | `7` |
+| `--no-abbrev` | Git's `--abbrev=0`: omit the `-<n>-g<oid>` suffix for ordinary tags (misnamed tags keep the forced full suffix); last one wins with `--abbrev`. | Off |
 | `--always` | When no tag can describe the target, fall back to the abbreviated commit hash instead of failing. | Off |
 | `--exact-match` | Only succeed when the target commit exactly matches a tag. | Off |
 | `--candidates <N>` | `N=0` requires an exact tag match (equivalent to `--exact-match`); `N>=1` keeps Libra's deterministic nearest-tag search (the positive bound is not enforced). | — |

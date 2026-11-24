@@ -38,6 +38,7 @@ libra describe [OPTIONS] [COMMIT]
 | `--tags` | 在搜索中包含轻量标签（而不只是附注标签）。 | 关闭 |
 | `--all` | 考虑任意 ref（本地分支、远程跟踪分支与标签，含轻量标签），而不仅是标签。名称带 `heads/`、`remotes/` 或 `tags/` 前缀；同一提交上标签优先，其次 heads，再次 remotes。 | 关闭 |
 | `--abbrev <N>` | 输出中缩写提交哈希的十六进制位数。 | `7` |
+| `--no-abbrev` | 等价 `--abbrev=0`：普通 tag 省略 `-<n>-g<oid>` 后缀（misnamed tag 仍强制完整后缀）；与 `--abbrev` 后者生效。 | 关闭 |
 | `--always` | 当没有标签可描述目标时，回退到缩写提交哈希，而不是失败。 | 关闭 |
 | `--exact-match` | 仅在目标提交精确匹配某个标签时成功。 | 关闭 |
 | `--candidates <N>` | `N=0` 仅接受精确标签匹配（等价于 `--exact-match`）；`N≥1` 维持 Libra 确定性的最近-tag BFS（不强制正数上界）。 | — |
