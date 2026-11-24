@@ -70,3 +70,5 @@ flowchart TD
 - 2026-11-23（PM-16 / #1034）：人读渲染改为 Git 格式（`{:>6}\t{key}` 摘要、`{key} (N):` 段头 + 6 空格缩进 + 主题逆序 + 段后空行）；`finalize_shortlog` 增加 `json_mode`：人读按完整键字节序排序、`-n` 计数降序稳定排序，JSON 保留旧的小写名排序与 `--min-count → --reverse → --top` 收尾；stdin 路径同改。回归：`shortlog_output_matches_git_format`（AC1–AC6/AC8）、`shortlog_stdin_output_matches_git_format`（AC7），7 个既有格式用例同卡更新期望；`shortlog_test` 22/22。
 
 - 2026-11-23（PM-30 / #1034）：`--group` 改为可重复的 `Vec<String>` 并新增 `--no-group`；`resolve_group_modes` 按原始 CLI 顺序收集（`--no-group` 清空此前项，`try_parse_from` 回退 `args.group`），空列表回落 `-c`/author；`aggregate_shortlog`/`aggregate_shortlog_stdin` 接收 `&[GroupMode]`，`collect_identities` 对每个提交按最终分组键（`-e` 时含邮箱）去重。回归：`shortlog_group_options_match_git`（AC1–AC4）、`shortlog_group_dedups_within_commit`（AC5–AC6）；`shortlog_test` 24/24。
+
+- 2026-11-23（PM-19 / #1034）：`src/cli.rs` 的 `rewrite_short_number_args_to` 增加 `shortlog` → `--max-count`（`-<n>` 简写，不影响 `-n`）；`ShortlogArgs` 新增 `--max-count`，仓库遍历在作者过滤后、聚合前 `truncate(n)`，stdin 路径对解析出的提交同样截断。回归：`shortlog_max_count_shorthand`（AC1–AC4）；`shortlog_test` 25/25。

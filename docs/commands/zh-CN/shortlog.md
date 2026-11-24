@@ -31,6 +31,7 @@ git log | libra shortlog [-n] [-s] [-e] [--group <TYPE>] [--author <pattern>] [-
 
 | 选项 | 短选项 | 长选项 | 说明 |
 |--------|-------|------|-------------|
+| Max count | `-<n>` | `--max-count <N>` | 在分组前把整个修订遍历限制为 `N` 个提交；`-<n>` 简写（`-1`、`-20`）会重写为 `--max-count`，与 `-n`/`--numbered` 不冲突。 |
 | Numbered | `-n` | `--numbered` | 按每个作者的提交数量降序排序，而不是按字母顺序。 |
 | Summary | `-s` | `--summary` | 抑制提交描述；只显示每个作者的提交数量。 |
 | Email | `-e` | `--email` | 在作者名旁显示 email 地址。启用后，作者按 `name <email>` 对分组。 |

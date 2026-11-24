@@ -1542,3 +1542,130 @@ fn shortlog_group_dedups_within_commit() {
     assert!(out.status.success(), "AC6");
     assert_eq!(out.stdout, b"     1\tAnn\n     2\tSame\n".to_vec(), "AC6");
 }
+
+/// PM-19: the `-<n>` shorthand and `--max-count` limit the whole walk.
+#[test]
+fn shortlog_max_count_shorthand() {
+    use std::process::Command;
+
+    let libra = env!("CARGO_BIN_EXE_libra");
+    let repo = tempdir().unwrap();
+    let p = repo.path();
+    let home = p.join(".home");
+    let run = |args: &[&str], envs: &[(&str, &str)]| {
+        let mut cmd = Command::new(libra);
+        cmd.args(args)
+            .current_dir(p)
+            .env("HOME", &home)
+            .env("LIBRA_TEST", "1")
+            .env("GIT_AUTHOR_DATE", "1112875200 +0000")
+            .env("GIT_COMMITTER_DATE", "1112875200 +0000");
+        for (key, value) in envs {
+            cmd.env(key, value);
+        }
+        cmd.output().unwrap()
+    };
+    assert!(run(&["init", "--vault", "false"], &[]).status.success());
+    assert!(run(&["config", "user.name", "t"], &[]).status.success());
+    assert!(run(&["config", "user.email", "t@t"], &[]).status.success());
+    let commit =
+        |body: &str, author: &str, committer_name: &str, committer_email: &str, ts: &str| {
+            std::fs::write(p.join("f"), format!("{body}\n")).unwrap();
+            assert!(run(&["add", "f"], &[]).status.success());
+            let out = run(
+                &["commit", "-m", body, "--author", author, "--no-verify"],
+                &[
+                    ("GIT_COMMITTER_NAME", committer_name),
+                    ("GIT_COMMITTER_EMAIL", committer_email),
+                    ("GIT_AUTHOR_DATE", ts),
+                    ("GIT_COMMITTER_DATE", ts),
+                ],
+            );
+            assert!(out.status.success(), "{out:?}");
+        };
+    commit(
+        "first",
+        "Alice <alice@example.com>",
+        "Carol",
+        "carol@example.com",
+        "1112875200 +0000",
+    );
+    commit(
+        "second",
+        "Bob <bob@example.com>",
+        "Carol",
+        "carol@example.com",
+        "1146484800 +0000",
+    );
+    commit(
+        "third",
+        "Alice <alice@other.example>",
+        "Dan",
+        "dan@example.com",
+        "1180785600 +0000",
+    );
+
+    // AC1: `-1` keeps only the newest commit.
+    let out = run(&["shortlog", "-s", "-1", "HEAD"], &[]);
+    assert!(out.status.success(), "AC1");
+    assert_eq!(out.stdout, b"     1\tAlice\n".to_vec(), "AC1");
+
+    // AC2: `-2` keeps the two newest commits.
+    let out = run(&["shortlog", "-2", "HEAD"], &[]);
+    assert!(out.status.success(), "AC2");
+    assert_eq!(
+        out.stdout,
+        b"Alice (1):\n      third\n\nBob (1):\n      second\n\n".to_vec(),
+        "AC2"
+    );
+
+    // AC4: the long spelling is equivalent.
+    let out = run(&["shortlog", "-s", "--max-count=1", "HEAD"], &[]);
+    assert!(out.status.success(), "AC4");
+    assert_eq!(out.stdout, b"     1\tAlice\n".to_vec(), "AC4");
+
+    // AC3: `-n` stays `--numbered` next to `-<n>`.
+    let repo = tempdir().unwrap();
+    let p = repo.path();
+    let home = p.join(".home");
+    let run = |args: &[&str], envs: &[(&str, &str)]| {
+        let mut cmd = Command::new(libra);
+        cmd.args(args)
+            .current_dir(p)
+            .env("HOME", &home)
+            .env("LIBRA_TEST", "1")
+            .env("GIT_AUTHOR_DATE", "1000000000 +0000")
+            .env("GIT_COMMITTER_DATE", "1000000000 +0000");
+        for (key, value) in envs {
+            cmd.env(key, value);
+        }
+        cmd.output().unwrap()
+    };
+    assert!(run(&["init", "--vault", "false"], &[]).status.success());
+    assert!(run(&["config", "user.name", "t"], &[]).status.success());
+    assert!(run(&["config", "user.email", "t@t"], &[]).status.success());
+    for (index, author) in [
+        ("1", "Amy <amy@example.com>"),
+        ("2", "Zed <zed@example.com>"),
+        ("3", "bob <bob@example.com>"),
+        ("4", "Zed <zed@example.com>"),
+    ] {
+        std::fs::write(p.join("f"), format!("{index}\n")).unwrap();
+        assert!(run(&["add", "f"], &[]).status.success());
+        assert!(
+            run(
+                &["commit", "-m", index, "--author", author, "--no-verify"],
+                &[]
+            )
+            .status
+            .success()
+        );
+    }
+    let out = run(&["shortlog", "-ns", "-4", "HEAD"], &[]);
+    assert!(out.status.success(), "AC3");
+    assert_eq!(
+        out.stdout,
+        b"     2\tZed\n     1\tAmy\n     1\tbob\n".to_vec(),
+        "AC3"
+    );
+}

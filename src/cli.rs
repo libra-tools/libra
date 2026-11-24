@@ -3775,6 +3775,8 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
     // `format-patch -<n>` is Git's "last n commits" shorthand (the same numeric
     // form `log -<n>` uses); it rewrites to the hidden `--last-n <n>`.
     let argv = rewrite_short_number_args_to(argv, "format-patch", "--last-n");
+    // `shortlog -<n>` is Git's `--max-count=<n>` (the traversal limit).
+    let argv = rewrite_short_number_args_to(argv, "shortlog", "--max-count");
     let argv = rewrite_format_patch_rename_args(argv);
     let argv = rewrite_index_pack_progress_args(argv);
     let argv = rewrite_clone_progress_args(argv);

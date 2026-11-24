@@ -177,6 +177,11 @@ pub struct ShortlogArgs {
     #[clap(long)]
     pub all: bool,
 
+    /// Limit the whole revision walk to N commits (Git's `-<n>` shorthand
+    /// rewrites to this flag).
+    #[clap(long = "max-count", value_name = "N")]
+    pub max_count: Option<usize>,
+
     /// Paths after `--` limiting the summarized commits.
     #[clap(value_name = "PATH", last = true)]
     pub paths: Vec<String>,
@@ -512,7 +517,10 @@ async fn run_shortlog(
         if !buffer.trim().is_empty() {
             let group_modes = resolve_group_modes(args)?;
             let wrap = parse_wrap_spec(args.wrap.as_deref())?;
-            let commits = parse_shortlog_stdin(&buffer);
+            let mut commits = parse_shortlog_stdin(&buffer);
+            if let Some(max) = args.max_count {
+                commits.truncate(max);
+            }
             return Ok(aggregate_shortlog_stdin(
                 args,
                 &group_modes,
@@ -553,6 +561,10 @@ async fn run_shortlog(
         commits.retain(|commit| {
             author_identity_matches(&commit.author.name, &commit.author.email, &needle)
         });
+    }
+
+    if let Some(max) = args.max_count {
+        commits.truncate(max);
     }
 
     let group_modes = resolve_group_modes(args)?;

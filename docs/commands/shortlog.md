@@ -35,6 +35,7 @@ touch the path.
 
 | Option | Short | Long | Description |
 |--------|-------|------|-------------|
+| Max count | `-<n>` | `--max-count <N>` | Limit the whole revision walk to `N` commits before grouping; the `-<n>` shorthand (`-1`, `-20`) rewrites to `--max-count` and does not collide with `-n`/`--numbered`. |
 | Numbered | `-n` | `--numbered` | Sort output by number of commits per author (descending) instead of alphabetically. |
 | Summary | `-s` | `--summary` | Suppress commit descriptions; show only per-author commit counts. |
 | Email | `-e` | `--email` | Show the email address of each author alongside their name. When enabled, authors are grouped by `name <email>` pair. |

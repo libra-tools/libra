@@ -2385,7 +2385,7 @@ PY
 ### Task PM-19: `libra shortlog` 的 `-<n>`/`--max-count`（#1034；自 PM-16 拆出；拆出 PM-40）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-23：`src/cli.rs::rewrite_short_number_args_to` 增加 `shortlog` → `--max-count`（`-<n>` 简写，不影响 `-n`）；`ShortlogArgs` 新增 `--max-count`，仓库遍历在过滤后、聚合前 `truncate(n)`，stdin 路径对解析出的提交同样截断。AC1–AC4 由 `command::shortlog_test::shortlog_max_count_shorthand` 覆盖（`-1`/`-2`/`-ns -4`/`--max-count=1`）；`shortlog_test` 25/25；EN/zh/开发文档与 `COMPATIBILITY.md` 的 `shortlog` 行同步。
 **Description:** 自 `PM-16` 拆出：在 `src/cli.rs` 的 `rewrite_short_number_args` 增加 `shortlog`，把 `-<n>` 重写为新增的 `--max-count=<n>`（不影响 `-n` 即 `--numbered`），`--max-count` 限制整个修订遍历的提交总数。（按 G-01/G-04 拆出 `PM-40` 承接 mailmap 规范化。）
 **Out of scope:** `slog` 别名的 `-<n>` 重写（尚未排期）；mailmap 规范化（`PM-40`）。
 **Current evidence:**
