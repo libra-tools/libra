@@ -2085,3 +2085,146 @@ fn revert_of_a_nested_change_stores_the_rebuilt_directory() {
         "later\n"
     );
 }
+
+fn revert_fixture() -> tempfile::TempDir {
+    let repo = tempdir().expect("repo");
+    init_repo_via_cli(repo.path());
+    configure_identity_via_cli(repo.path());
+    for (name, body) in [("a.txt", "a\n"), ("b.txt", "b\n"), ("notes.txt", "note\n")] {
+        std::fs::write(repo.path().join(name), body).unwrap();
+    }
+    assert_cli_success(
+        &run_libra_command(&["add", "a.txt", "b.txt", "notes.txt"], repo.path()),
+        "add base",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], repo.path()),
+        "base",
+    );
+    std::fs::write(repo.path().join("a.txt"), "a2\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "a.txt"], repo.path()),
+        "add change",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "change", "--no-verify"], repo.path()),
+        "change",
+    );
+    repo
+}
+
+fn revert_copy_tree(from: &std::path::Path, to: &std::path::Path) {
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.path().is_dir() {
+            std::fs::create_dir_all(&target).unwrap();
+            revert_copy_tree(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target).unwrap();
+        }
+    }
+}
+
+fn revert_worktree_hashes(repo: &std::path::Path) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(repo).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name == ".libra" || name == ".libra-test-home" || !entry.path().is_file() {
+            continue;
+        }
+        let oid = String::from_utf8_lossy(&run_libra_command(&["hash-object", &name], repo).stdout)
+            .trim()
+            .to_string();
+        out.push((name, oid));
+    }
+    out.sort();
+    out
+}
+
+/// SA-07a: `revert` refuses staged entries before any write.
+#[test]
+fn revert_staged_changes_refused_without_state() {
+    let repo = revert_fixture();
+    let p = repo.path();
+    std::fs::write(p.join("extra_file"), "extra\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "extra_file"], p), "add extra");
+    let before_index =
+        String::from_utf8_lossy(&run_libra_command(&["ls-files", "--stage"], p).stdout).to_string();
+    let before_files = revert_worktree_hashes(p);
+
+    let out = run_libra_command(&["revert", "HEAD"], p);
+    assert_eq!(out.status.code(), Some(128), "AC1 exit code");
+    let human = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        human.contains("your local changes would be overwritten by revert"),
+        "AC2 human message: {human}"
+    );
+    let (_human, report) = parse_cli_error_stderr(&out.stderr);
+    assert_eq!(report.error_code, "LBR-CONFLICT-001");
+    assert_eq!(report.exit_code, 128);
+
+    // AC3: --json on an independent copy.
+    let json_copy = tempdir().expect("json copy");
+    revert_copy_tree(p, json_copy.path());
+    let json_out = run_libra_command(&["--json", "revert", "HEAD"], json_copy.path());
+    assert_eq!(json_out.status.code(), Some(128), "AC3 status");
+    let parsed: serde_json::Value = serde_json::from_slice(&json_out.stderr).expect("AC3 JSON");
+    assert_eq!(parsed["ok"], serde_json::Value::Bool(false), "AC3 ok");
+    assert_eq!(parsed["error_code"], "LBR-CONFLICT-001", "AC3 code");
+    assert_eq!(parsed["exit_code"], 128, "AC3 exit");
+
+    // AC4: --machine on another independent copy.
+    let machine_copy = tempdir().expect("machine copy");
+    revert_copy_tree(p, machine_copy.path());
+    let machine_out = run_libra_command(&["--machine", "revert", "HEAD"], machine_copy.path());
+    assert_eq!(machine_out.status.code(), Some(128), "AC4 status");
+    let machine_stderr = String::from_utf8_lossy(&machine_out.stderr).to_string();
+    let lines: Vec<&str> = machine_stderr
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            // The line may carry a `@machine ` style prefix; parse the JSON tail.
+            let start = line.find('{').expect("AC4 JSON object");
+            &line[start..]
+        })
+        .collect();
+    assert_eq!(lines.len(), 1, "AC4 one record");
+    let record: serde_json::Value = serde_json::from_str(lines[0]).expect("AC4 JSON");
+    assert_eq!(record["ok"], serde_json::Value::Bool(false), "AC4 ok");
+    assert_eq!(record["error_code"], "LBR-CONFLICT-001", "AC4 code");
+    assert_eq!(record["exit_code"], 128, "AC4 exit");
+
+    assert_eq!(
+        String::from_utf8_lossy(&run_libra_command(&["ls-files", "--stage"], p).stdout),
+        before_index,
+        "AC5 index unchanged"
+    );
+    assert_eq!(
+        revert_worktree_hashes(p),
+        before_files,
+        "AC6 worktree unchanged"
+    );
+    let git_dir =
+        String::from_utf8_lossy(&run_libra_command(&["rev-parse", "--git-dir"], p).stdout)
+            .trim()
+            .to_string();
+    assert!(
+        !std::path::Path::new(&git_dir)
+            .join("revert-state.json")
+            .exists(),
+        "AC7 no revert state"
+    );
+
+    // AC8: a staged modification is refused too.
+    let modified = revert_fixture();
+    std::fs::write(modified.path().join("b.txt"), "b2\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "b.txt"], modified.path()),
+        "stage modify",
+    );
+    let modified_out = run_libra_command(&["revert", "HEAD"], modified.path());
+    let (_human, modified_report) = parse_cli_error_stderr(&modified_out.stderr);
+    assert_eq!(modified_report.error_code, "LBR-CONFLICT-001", "AC8");
+}

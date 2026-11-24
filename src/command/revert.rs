@@ -65,6 +65,10 @@ enum RevertError {
     #[error("you are in a 'detached HEAD' state; reverting is not allowed")]
     DetachedHead,
 
+    /// SA-07a: a revert would check out the reversed tree over staged entries.
+    #[error("your local changes would be overwritten by revert")]
+    LocalChangesWouldBeOverwritten,
+
     #[error("failed to resolve commit reference '{0}'")]
     InvalidCommit(String),
 
@@ -221,6 +225,7 @@ impl RevertError {
         match self {
             Self::NotInRepo => StableErrorCode::RepoNotFound,
             Self::DetachedHead => StableErrorCode::RepoStateInvalid,
+            Self::LocalChangesWouldBeOverwritten => StableErrorCode::ConflictUnresolved,
             Self::InvalidCommit(_) => StableErrorCode::CliInvalidTarget,
             Self::MainlineRequired(_)
             | Self::MainlineForNonMerge(_)
@@ -265,6 +270,9 @@ impl From<RevertError> for CliError {
             RevertError::DetachedHead => CliError::fatal(message)
                 .with_stable_code(stable_code)
                 .with_hint("switch to a branch first with 'libra switch <branch>'"),
+            RevertError::LocalChangesWouldBeOverwritten => CliError::failure(message)
+                .with_stable_code(stable_code)
+                .with_hint("commit or stash the staged changes before reverting"),
             RevertError::InvalidCommit(_) => CliError::fatal(message)
                 .with_stable_code(stable_code)
                 .with_hint("use 'libra log' to find valid commit references"),
@@ -490,6 +498,23 @@ async fn run_revert(args: RevertArgs) -> Result<RevertOutput, RevertError> {
             .await
             .map_err(|_| RevertError::InvalidCommit(spec.clone()))?;
         resolved.push(id);
+    }
+
+    // SA-07a: without `--no-commit` the reversal is committed, so refuse before
+    // any write when the index differs from HEAD's tree (staged add/modify/delete).
+    if !args.no_commit {
+        let index =
+            Index::load(path::index()).map_err(|e| RevertError::IndexLoad(e.to_string()))?;
+        let index_tree = crate::utils::tree::create_tree_from_index(&index)
+            .map_err(|e| RevertError::LoadObject(e.to_string()))?;
+        let head = Head::current_commit()
+            .await
+            .ok_or_else(|| RevertError::InvalidCommit("HEAD".to_string()))?;
+        let head_commit: Commit =
+            load_object(&head).map_err(|e| RevertError::LoadObject(e.to_string()))?;
+        if index_tree.id != head_commit.tree_id {
+            return Err(RevertError::LocalChangesWouldBeOverwritten);
+        }
     }
 
     // Revert each commit in order; each revert is applied relative to (and

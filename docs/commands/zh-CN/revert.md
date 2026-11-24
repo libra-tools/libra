@@ -37,6 +37,8 @@ revert 提交使用当前 author 与 committer 身份/日期，并在创建提�
 
 工作树物化按条目 mode 语义执行（plan issues/470 FM-02）：文件按条目权限位创建（`100755`→`0777`、`100644`→`0666`）并受进程 `umask` 约束，经同目录临时文件原子替换；索引/树条目保留 mode（`100755`/`100644`/`120000`）。
 
+不带 `-n`/`--no-commit` 时，若索引与 `HEAD` 的树不同（已暂存的新增、修改或删除），`revert` 会在任何写入前拒绝：退出码 128、`LBR-CONFLICT-001`，人读信息为 `your local changes would be overwritten by revert`，且不写入 revert 状态。`-n`/`--no-commit` 不受此限制，可从这样的索引开始。
+
 ## 选项
 
 ### `-n`, `--no-commit`

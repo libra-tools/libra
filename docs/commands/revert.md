@@ -50,6 +50,12 @@ A stopped revert does not outlive the working tree it stopped in: a later reset 
 
 Worktree materialization is mode-aware (plan issues/470 FM-02): files are created with the entry mode's permission bits (`100755` -> `0777`, `100644` -> `0666`) under the process `umask`, replaced atomically through a same-directory temp file, and the index/tree entries keep the mode (`100755`/`100644`/`120000`).
 
+Without `-n`/`--no-commit`, `revert` refuses before writing anything when the
+index differs from `HEAD`'s tree (staged additions, modifications or deletions).
+The command then exits 128 with `LBR-CONFLICT-001` and
+`your local changes would be overwritten by revert`; no revert state is written.
+`-n`/`--no-commit` is exempt and may start from such an index.
+
 ## Options
 
 Revert currently stores textual conflicts as stage-0 blobs. A whole-tree reset also checks those staged blobs at the stopped revert's conflict paths: remaining `<<<<<<<` markers or an unreadable blob preserve the revert state and emit a recovery warning. This includes `--soft` even when `ls-files --unmerged` is empty. Resolving and staging the content (or removing the path from the index), or replacing the index with a clean `--mixed`/`--hard` reset, allows conclusion. Markers left only in the working tree do not prevent a mixed reset from concluding the stop. The existing revert conflict representation and `--continue` behavior are unchanged.

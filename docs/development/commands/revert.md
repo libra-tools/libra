@@ -87,3 +87,5 @@ revert 当前把文本冲突保存为 stage-0 blob。整树 reset 收尾前也�
 ## Issue #477 notes
 
 single conflict-label helper
+
+- 2026-11-23（SA-07a / #728）：新增 `LocalChangesWouldBeOverwritten`（`your local changes would be overwritten by revert`，`LBR-CONFLICT-001`，退出码 128）；不带 `-n/--no-commit` 时在目标解析后、任何写入前比较索引树与 HEAD 树（已暂存新增/修改/删除都拒绝），不留 revert 状态；`--no-commit` 路径不变。回归：`revert_staged_changes_refused_without_state`（AC1–AC8）；`revert_test` 42/42、`--lib command::revert` 4/4、`compat_noninteractive_history_controls` 33/33、`compat_error_codes_doc_sync` 2/2。
