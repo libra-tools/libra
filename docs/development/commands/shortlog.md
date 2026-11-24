@@ -72,3 +72,5 @@ flowchart TD
 - 2026-11-23（PM-30 / #1034）：`--group` 改为可重复的 `Vec<String>` 并新增 `--no-group`；`resolve_group_modes` 按原始 CLI 顺序收集（`--no-group` 清空此前项，`try_parse_from` 回退 `args.group`），空列表回落 `-c`/author；`aggregate_shortlog`/`aggregate_shortlog_stdin` 接收 `&[GroupMode]`，`collect_identities` 对每个提交按最终分组键（`-e` 时含邮箱）去重。回归：`shortlog_group_options_match_git`（AC1–AC4）、`shortlog_group_dedups_within_commit`（AC5–AC6）；`shortlog_test` 24/24。
 
 - 2026-11-23（PM-19 / #1034）：`src/cli.rs` 的 `rewrite_short_number_args_to` 增加 `shortlog` → `--max-count`（`-<n>` 简写，不影响 `-n`）；`ShortlogArgs` 新增 `--max-count`，仓库遍历在作者过滤后、聚合前 `truncate(n)`，stdin 路径对解析出的提交同样截断。回归：`shortlog_max_count_shorthand`（AC1–AC4）；`shortlog_test` 25/25。
+
+- 2026-11-23（PM-40 / #1034）：把 `check_mailmap` 的加载/查询提升为 `pub(crate)` 单一事实源——`load_mailmap_from(workdir)` 先读 `.mailmap` 再读 `mailmap.file`（`optional_cascaded_config_path`，后者条目覆盖），`resolve` 改为姓名与邮箱均 ASCII 大小写不敏感且从末尾取首个匹配；`map_identity` 供 shortlog 使用，author/committer 分组键在去重前映射。回归：`shortlog_and_check_mailmap_apply_mailmap`（AC1–AC4）；`shortlog_test` 与 `check_mailmap_test` 合计 33/33。

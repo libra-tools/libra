@@ -42,7 +42,7 @@ struct CheckMailmapOutput {
 /// One parsed `.mailmap` entry. `old_*` is the key to match; `new_*` is what to
 /// emit (an empty `new_name` keeps the looked-up name).
 #[derive(Debug)]
-struct MailmapEntry {
+pub(crate) struct MailmapEntry {
     new_name: String,
     new_email: String,
     old_name: Option<String>,
@@ -112,19 +112,39 @@ pub async fn execute_safe(args: CheckMailmapArgs, output: &OutputConfig) -> CliR
     }
 }
 
-/// Load and parse `.mailmap` from the working tree root (absent → empty).
+/// Load and parse mailmap sources from the working tree: `.mailmap` first, then
+/// `mailmap.file` (whose entries override the worktree file). Absent → empty.
 fn load_mailmap() -> CliResult<Vec<MailmapEntry>> {
-    let path = util::working_dir().join(".mailmap");
-    let text = match fs::read_to_string(&path) {
+    let workdir = util::working_dir();
+    load_mailmap_from(&workdir)
+}
+
+/// Crate-wide mailmap loader (single source of truth for `check-mailmap` and
+/// `shortlog`).
+pub(crate) fn load_mailmap_from(workdir: &std::path::Path) -> CliResult<Vec<MailmapEntry>> {
+    let mut entries = Vec::new();
+    append_mailmap_file(&mut entries, &workdir.join(".mailmap"))?;
+    if let Some(configured) = util::optional_cascaded_config_path("mailmap.file", workdir) {
+        append_mailmap_file(&mut entries, &configured)?;
+    }
+    Ok(entries)
+}
+
+fn append_mailmap_file(entries: &mut Vec<MailmapEntry>, path: &std::path::Path) -> CliResult<()> {
+    let text = match fs::read_to_string(path) {
         Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => {
-            return Err(CliError::fatal(format!("failed to read .mailmap: {error}"))
-                .with_exit_code(128)
-                .with_stable_code(StableErrorCode::IoReadFailed));
+            return Err(CliError::fatal(format!(
+                "failed to read mailmap '{}': {error}",
+                path.display()
+            ))
+            .with_exit_code(128)
+            .with_stable_code(StableErrorCode::IoReadFailed));
         }
     };
-    Ok(text.lines().filter_map(parse_mailmap_line).collect())
+    entries.extend(text.lines().filter_map(parse_mailmap_line));
+    Ok(())
 }
 
 /// Parse a single `.mailmap` line into an entry, skipping comments/blanks and
@@ -172,11 +192,13 @@ fn parse_mailmap_line(line: &str) -> Option<MailmapEntry> {
 fn resolve(mailmap: &[MailmapEntry], name: &str, email: &str) -> (String, String) {
     let email_lc = email.to_ascii_lowercase();
 
+    // Later entries override earlier ones, and names/emails match ASCII
+    // case-insensitively (Git's `strcasecmp`).
     let pick = |with_name: bool| {
-        mailmap.iter().find(|e| {
-            e.old_email.to_ascii_lowercase() == email_lc
+        mailmap.iter().rev().find(|e| {
+            e.old_email.eq_ignore_ascii_case(&email_lc)
                 && match (&e.old_name, with_name) {
-                    (Some(old), true) => old == name,
+                    (Some(old), true) => old.eq_ignore_ascii_case(name),
                     (None, false) => true,
                     _ => false,
                 }
@@ -192,6 +214,12 @@ fn resolve(mailmap: &[MailmapEntry], name: &str, email: &str) -> (String, String
         return (out_name, entry.new_email.clone());
     }
     (name.to_string(), email.to_string())
+}
+
+/// Apply a loaded mailmap to one identity (used by `shortlog`); an empty map is
+/// an identity function.
+pub(crate) fn map_identity(entries: &[MailmapEntry], name: &str, email: &str) -> (String, String) {
+    resolve(entries, name, email)
 }
 
 /// Parse a `Name <email>` contact.

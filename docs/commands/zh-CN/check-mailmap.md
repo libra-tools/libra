@@ -11,7 +11,7 @@ libra check-mailmap --stdin
 
 ## 说明
 
-对每个 `Name <email>` 联系人（作为参数，或带 `--stdin` 时每行一个从 stdin 读取），`check-mailmap` 在工作树的 `.mailmap` 中查找并打印规范的 `Name <email>`。无 `.mailmap` 匹配的联系人原样打印。
+对每个 `Name <email>` 联系人（作为参数，或带 `--stdin` 时每行一个从 stdin 读取），`check-mailmap` 在工作树的 `.mailmap` 中查找并打印规范的 `Name <email>`。无 mailmap 匹配的联系人原样打印。姓名与邮箱按 ASCII 大小写不敏感比较，且 `libra shortlog` 共用同一解析器。
 
 `.mailmap` 行采用常见的 Git 形式：
 

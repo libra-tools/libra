@@ -2437,7 +2437,7 @@ PY
 ### Task PM-40: `libra shortlog` 与 `check-mailmap` 的 mailmap 规范化（#1034；自 PM-19 拆出）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-23：`check_mailmap` 的提升为 crate 内单一事实源——`pub(crate) load_mailmap_from(workdir)` 先读 `.mailmap` 再读 `mailmap.file`（`optional_cascaded_config_path`，后者条目覆盖），`resolve` 改为姓名与邮箱均 ASCII 大小写不敏感并从末尾取首个匹配；`pub(crate) map_identity` 供 `shortlog` 使用，author/committer 分组键在去重前映射（trailer 分组不映射）。AC1–AC4 由 `command::shortlog_test::shortlog_and_check_mailmap_apply_mailmap` 覆盖；`shortlog_test` + `check_mailmap_test` 合计 33/33；check-mailmap 与 shortlog 的 EN/zh 文档、开发文档与 `COMPATIBILITY.md` 对应行同步。
 **Description:** 自 `PM-19` 拆出：把 `src/command/check_mailmap.rs` 的 mailmap 解析与解析结果查询提升为 `pub(crate)` 单一事实源，读取顺序为工作区 `.mailmap` 再 `mailmap.file`（后者覆盖前者），姓名与邮箱都按 ASCII 大小写不敏感匹配，并在 shortlog 分组键（作者/提交者）上应用。
 **Out of scope:** `-<n>`/`--max-count`（`PM-19`）；`mailmap.blob`、`log`/`blame` 的 mailmap 显示（`COMPATIBILITY.md` 既有延后项，保持）；格式分组占位符 `%aN`/`%cN` 的 mailmap 映射（`PM-35`）；shortlog 分组键上的大小写不敏感匹配（与 `check-mailmap` 共用本卡提升的同一查询函数，以 AC3 验收，不单独验收）。
 **Current evidence:**

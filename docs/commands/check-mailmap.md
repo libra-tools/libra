@@ -14,8 +14,9 @@ libra check-mailmap --stdin
 
 For each `Name <email>` contact (given as arguments or, with `--stdin`, one per
 line on stdin), `check-mailmap` looks it up in the worktree's `.mailmap` and
-prints the canonical `Name <email>`. A contact with no `.mailmap` match is
-printed unchanged.
+prints the canonical `Name <email>`. A contact with no mailmap match is
+printed unchanged. Names and emails compare ASCII case-insensitively, and the
+same resolver is used by `libra shortlog`.
 
 `.mailmap` lines take the usual Git forms:
 
@@ -59,7 +60,8 @@ libra check-mailmap 'Old Name <old@example.com>' 'Other <other@example.com>'
 | Resolve a contact | `libra check-mailmap '<c>'` | `git check-mailmap '<c>'` |
 | From stdin | `libra check-mailmap --stdin` | `git check-mailmap --stdin` |
 
-Differences and deferred features: only the worktree `.mailmap` is read
-(`mailmap.file` / `mailmap.blob` config not yet honoured), and the resolver is
-not yet wired into `log` / `blame` author display — that integration is a
-documented follow-up.
+Mailmap sources: the worktree `.mailmap` is read first, then the file named by
+`mailmap.file` (a path relative to the worktree root; entries from it override
+the worktree file). `mailmap.blob` is not yet honoured, and the resolver is not
+yet wired into `log` / `blame` author display — that integration is a documented
+follow-up.

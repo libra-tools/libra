@@ -517,6 +517,7 @@ async fn run_shortlog(
         if !buffer.trim().is_empty() {
             let group_modes = resolve_group_modes(args)?;
             let wrap = parse_wrap_spec(args.wrap.as_deref())?;
+            let mailmap = crate::command::check_mailmap::load_mailmap_from(&util::working_dir())?;
             let mut commits = parse_shortlog_stdin(&buffer);
             if let Some(max) = args.max_count {
                 commits.truncate(max);
@@ -526,7 +527,11 @@ async fn run_shortlog(
                 &group_modes,
                 commits,
                 wrap,
-                json_mode,
+                &AggregateOptions {
+                    color_enabled: false,
+                    json_mode,
+                    mailmap: &mailmap,
+                },
             ));
         }
     }
@@ -569,15 +574,26 @@ async fn run_shortlog(
 
     let group_modes = resolve_group_modes(args)?;
     let wrap = parse_wrap_spec(args.wrap.as_deref())?;
+    let mailmap = crate::command::check_mailmap::load_mailmap_from(&util::working_dir())?;
     Ok(aggregate_shortlog(
         args,
         &group_modes,
         &revision,
         commits,
         wrap,
-        color_enabled,
-        json_mode,
+        &AggregateOptions {
+            color_enabled,
+            json_mode,
+            mailmap: &mailmap,
+        },
     ))
+}
+
+/// Shared aggregation options (keeps the function arity manageable).
+struct AggregateOptions<'a> {
+    color_enabled: bool,
+    json_mode: bool,
+    mailmap: &'a [crate::command::check_mailmap::MailmapEntry],
 }
 
 fn aggregate_shortlog(
@@ -586,9 +602,11 @@ fn aggregate_shortlog(
     revision: &str,
     commits: Vec<Commit>,
     wrap: Option<(usize, usize, usize)>,
-    color_enabled: bool,
-    json_mode: bool,
+    options: &AggregateOptions<'_>,
 ) -> ShortlogOutput {
+    let color_enabled = options.color_enabled;
+    let json_mode = options.json_mode;
+    let mailmap = options.mailmap;
     let total_commits = commits.len();
     let mut author_map: HashMap<String, AuthorStats> = HashMap::new();
 
@@ -604,12 +622,15 @@ fn aggregate_shortlog(
         // Each commit contributes one identity for author/committer grouping,
         // or zero-or-more for trailer grouping (one per matching trailer value).
         let identities = collect_identities(group_modes, args.email, |mode| match mode {
-            GroupMode::Author => {
-                vec![(commit.author.name.clone(), commit.author.email.clone())]
-            }
-            GroupMode::Committer => vec![(
-                commit.committer.name.clone(),
-                commit.committer.email.clone(),
+            GroupMode::Author => vec![crate::command::check_mailmap::map_identity(
+                mailmap,
+                &commit.author.name,
+                &commit.author.email,
+            )],
+            GroupMode::Committer => vec![crate::command::check_mailmap::map_identity(
+                mailmap,
+                &commit.committer.name,
+                &commit.committer.email,
             )],
             GroupMode::Trailer(key) => extract_trailer_identities(&commit.message, key),
         });
@@ -821,8 +842,10 @@ fn aggregate_shortlog_stdin(
     group_modes: &[GroupMode],
     commits: Vec<StdinCommit>,
     wrap: Option<(usize, usize, usize)>,
-    json_mode: bool,
+    options: &AggregateOptions<'_>,
 ) -> ShortlogOutput {
+    let json_mode = options.json_mode;
+    let mailmap = options.mailmap;
     let author_needle = args.author.as_ref().map(|pattern| pattern.to_lowercase());
     let mut author_map: HashMap<String, AuthorStats> = HashMap::new();
     // Count commits that survive the `--author` filter, matching the repo-walk
@@ -844,8 +867,22 @@ fn aggregate_shortlog_stdin(
 
         let subject = commit.message.lines().next().unwrap_or("").to_string();
         let identities = collect_identities(group_modes, args.email, |mode| match mode {
-            GroupMode::Author => commit.author.clone().into_iter().collect(),
-            GroupMode::Committer => commit.committer.clone().into_iter().collect(),
+            GroupMode::Author => commit
+                .author
+                .clone()
+                .map(|(name, email)| {
+                    crate::command::check_mailmap::map_identity(mailmap, &name, &email)
+                })
+                .into_iter()
+                .collect(),
+            GroupMode::Committer => commit
+                .committer
+                .clone()
+                .map(|(name, email)| {
+                    crate::command::check_mailmap::map_identity(mailmap, &name, &email)
+                })
+                .into_iter()
+                .collect(),
             GroupMode::Trailer(key) => extract_trailer_identities(&commit.message, key),
         });
 

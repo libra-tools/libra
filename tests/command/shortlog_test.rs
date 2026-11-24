@@ -1669,3 +1669,129 @@ fn shortlog_max_count_shorthand() {
         "AC3"
     );
 }
+
+/// PM-40: `shortlog` and `check-mailmap` share the mailmap resolver, which
+/// reads `.mailmap` then `mailmap.file` (the latter overriding) and matches
+/// names/emails case-insensitively.
+#[test]
+fn shortlog_and_check_mailmap_apply_mailmap() {
+    use std::process::Command;
+
+    let libra = env!("CARGO_BIN_EXE_libra");
+    let repo = tempdir().unwrap();
+    let p = repo.path();
+    let home = p.join(".home");
+    let run = |args: &[&str], envs: &[(&str, &str)]| {
+        let mut cmd = Command::new(libra);
+        cmd.args(args)
+            .current_dir(p)
+            .env("HOME", &home)
+            .env("LIBRA_TEST", "1")
+            .env("GIT_AUTHOR_DATE", "1112875200 +0000")
+            .env("GIT_COMMITTER_DATE", "1112875200 +0000");
+        for (key, value) in envs {
+            cmd.env(key, value);
+        }
+        cmd.output().unwrap()
+    };
+    assert!(run(&["init", "--vault", "false"], &[]).status.success());
+    assert!(run(&["config", "user.name", "t"], &[]).status.success());
+    assert!(run(&["config", "user.email", "t@t"], &[]).status.success());
+    let commit =
+        |body: &str, author: &str, committer_name: &str, committer_email: &str, ts: &str| {
+            std::fs::write(p.join("f"), format!("{body}\n")).unwrap();
+            assert!(run(&["add", "f"], &[]).status.success());
+            let out = run(
+                &["commit", "-m", body, "--author", author, "--no-verify"],
+                &[
+                    ("GIT_COMMITTER_NAME", committer_name),
+                    ("GIT_COMMITTER_EMAIL", committer_email),
+                    ("GIT_AUTHOR_DATE", ts),
+                    ("GIT_COMMITTER_DATE", ts),
+                ],
+            );
+            assert!(out.status.success(), "{out:?}");
+        };
+    commit(
+        "first",
+        "Alice <alice@example.com>",
+        "Carol",
+        "carol@example.com",
+        "1112875200 +0000",
+    );
+    commit(
+        "second",
+        "Bob <bob@example.com>",
+        "Carol",
+        "carol@example.com",
+        "1146484800 +0000",
+    );
+    commit(
+        "third",
+        "Alice <alice@other.example>",
+        "Dan",
+        "dan@example.com",
+        "1180785600 +0000",
+    );
+
+    // AC1/AC3: the worktree mailmap maps both Alice emails and is case-insensitive.
+    std::fs::write(
+        p.join(".mailmap"),
+        "Alice Proper <alice@proper.example> <alice@other.example>\nAlice Proper <alice@proper.example> Alice <alice@example.com>\n",
+    )
+    .unwrap();
+    let out = run(&["shortlog", "-s", "-e", "HEAD"], &[]);
+    assert!(out.status.success(), "AC1");
+    assert_eq!(
+        out.stdout,
+        b"     2\tAlice Proper <alice@proper.example>\n     1\tBob <bob@example.com>\n".to_vec(),
+        "AC1"
+    );
+    let out = run(&["check-mailmap", "alice <ALICE@EXAMPLE.COM>"], &[]);
+    assert!(out.status.success(), "AC3");
+    assert_eq!(
+        out.stdout,
+        b"Alice Proper <alice@proper.example>\n".to_vec(),
+        "AC3"
+    );
+
+    // AC2: `mailmap.file` is read after `.mailmap` and overrides it.
+    std::fs::write(
+        p.join(".mailmap"),
+        "Robert <robert@x.example> <bob@example.com>\n",
+    )
+    .unwrap();
+    let other = p.join("other.map");
+    std::fs::write(&other, "Bobby <bobby@x.example> <bob@example.com>\n").unwrap();
+    assert!(
+        run(&["config", "mailmap.file", other.to_str().unwrap()], &[])
+            .status
+            .success()
+    );
+    let out = run(&["shortlog", "-s", "-e", "HEAD"], &[]);
+    assert!(out.status.success(), "AC2");
+    assert_eq!(
+        out.stdout,
+        b"     1\tAlice <alice@example.com>\n     1\tAlice <alice@other.example>\n     1\tBobby <bobby@x.example>\n".to_vec(),
+        "AC2"
+    );
+
+    // AC4: committer grouping uses the mapped identity.
+    assert!(
+        run(&["config", "unset", "mailmap.file"], &[])
+            .status
+            .success()
+    );
+    std::fs::write(
+        p.join(".mailmap"),
+        "Caroline <caroline@x.example> <carol@example.com>\n",
+    )
+    .unwrap();
+    let out = run(&["shortlog", "-s", "-e", "-c", "HEAD"], &[]);
+    assert!(out.status.success(), "AC4");
+    assert_eq!(
+        out.stdout,
+        b"     2\tCaroline <caroline@x.example>\n     1\tDan <dan@example.com>\n".to_vec(),
+        "AC4"
+    );
+}
