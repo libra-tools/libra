@@ -4919,7 +4919,7 @@
 
 **Task type:** `migration`
 
-**Lifecycle / Acceptance:** `done` / `remote-pending`
+**Lifecycle / Acceptance:** `done` / `remote-verified`
 
 **Description:** 100% 在独占目录 `src/storage/` 内实现正向迁移 Phase 1 的单连接 `DELETE` 模式排他静默前置门（`src/storage/migrate.rs`，`#[cfg(all(feature = "storage-sqlite", feature = "storage-redb"))]`）：以**唯一非池化单连接 `c_mig`** 配置 `busy_timeout = 0`、`PRAGMA synchronous = FULL` 与 `PRAGMA locking_mode = EXCLUSIVE`，经无写 `BEGIN EXCLUSIVE; ROLLBACK;` 在 OS 级校验零外部 SQLite 写者与零活跃 `DELETE` 模式读事务（`SHARED` 锁）。
 
@@ -4982,7 +4982,7 @@
 
 **Task type:** `migration`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `remote-pending`
 
 **Description:** 100% 在独占目录 `src/storage/` 内扩展正向迁移 Phase 1 静默门（`src/storage/migrate.rs`）：当检测到源库处于 WAL 模式或存在 `-wal`/`-shm` 时，**严禁预先调用 `wal_checkpoint(TRUNCATE)`**，改为在 `busy_timeout = 0` + `locking_mode = EXCLUSIVE` 下**直接执行 `PRAGMA journal_mode = DELETE;`**（SQLite `sqlite3WalClose` 先争独占 OS+WAL 锁再做内部检查点，遇 WAL 活跃读者、**WAL 活跃写者（`BEGIN IMMEDIATE; INSERT ...`）**或外部已打开空闲 WAL 连接均立即报 `SQLITE_BUSY` 且 `.db`/`-wal`/`-shm` 100% 逐字节零改动）——将全部 3 类 WAL 竞争场景的「返回 `LBR-IO-001`」与「三文件逐字节快照零改动」拆分为 6 条 1:1 独立单谓词断言。
 
@@ -4998,17 +4998,17 @@
 | `db.rs:270` 未强制 `DELETE` 模式；WAL 下活跃读者、活跃写者或空闲连接均须由直接执行 `PRAGMA journal_mode = DELETE;` 先争独占锁立即拒收，确保 `.db`/`-wal`/`-shm` 零改动 | `src/internal/db.rs:270`；`ADR-RB-07` #1 |
 
 **Acceptance criteria:**
-- [ ] **WAL 活跃读者返回 `LBR-IO-001`：** 外部进程在 WAL 模式下持有活跃读事务时，直接执行 `PRAGMA journal_mode = DELETE;` fail-closed 返回 `LBR-IO-001`。
-- [ ] **WAL 活跃读者拒收三文件零改动：** 上述 AC1 拒收前后，源 `.db`、`-wal` 与 `-shm` 文件逐字节快照完全相等。
-- [ ] **WAL 活跃写者返回 `LBR-IO-001`：** 外部进程在 WAL 模式下持有活跃写事务（`BEGIN IMMEDIATE; INSERT ...`）时，直接执行 `PRAGMA journal_mode = DELETE;` fail-closed 返回 `LBR-IO-001`。
-- [ ] **WAL 活跃写者拒收三文件零改动：** 上述 AC3 拒收前后，源 `.db`、`-wal` 与 `-shm` 文件逐字节快照完全相等。
-- [ ] **WAL 空闲连接返回 `LBR-IO-001`：** 外部进程在 WAL 模式下持有已打开空闲连接时，直接执行 `PRAGMA journal_mode = DELETE;` fail-closed 返回 `LBR-IO-001`。
-- [ ] **WAL 空闲连接拒收三文件零改动：** 上述 AC5 拒收前后，源 `.db`、`-wal` 与 `-shm` 文件逐字节快照完全相等（零预先检查点篡改）。
+- [x] **WAL 活跃读者返回 `LBR-IO-001`：** 外部进程在 WAL 模式下持有活跃读事务时，直接执行 `PRAGMA journal_mode = DELETE;` fail-closed 返回 `LBR-IO-001`。
+- [x] **WAL 活跃读者拒收三文件零改动：** 上述 AC1 拒收前后，源 `.db`、`-wal` 与 `-shm` 文件逐字节快照完全相等。
+- [x] **WAL 活跃写者返回 `LBR-IO-001`：** 外部进程在 WAL 模式下持有活跃写事务（`BEGIN IMMEDIATE; INSERT ...`）时，直接执行 `PRAGMA journal_mode = DELETE;` fail-closed 返回 `LBR-IO-001`。
+- [x] **WAL 活跃写者拒收三文件零改动：** 上述 AC3 拒收前后，源 `.db`、`-wal` 与 `-shm` 文件逐字节快照完全相等。
+- [x] **WAL 空闲连接返回 `LBR-IO-001`：** 外部进程在 WAL 模式下持有已打开空闲连接时，直接执行 `PRAGMA journal_mode = DELETE;` fail-closed 返回 `LBR-IO-001`。
+- [x] **WAL 空闲连接拒收三文件零改动：** 上述 AC5 拒收前后，源 `.db`、`-wal` 与 `-shm` 文件逐字节快照完全相等（零预先检查点篡改）。
 
 **Verification:**
-- [ ] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::forward_phase1_rejects_wal_active_reader_writer_and_idle_conn)'`（new，发现门）
-- [ ] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::forward_phase1_rejects_wal_active_reader_writer_and_idle_conn)'`（new，覆盖 AC1–AC6）
-- [ ] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 2 文件实现白名单。
+- [x] `source .env.test && cargo nextest list --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::forward_phase1_rejects_wal_active_reader_writer_and_idle_conn)'`（new，发现门）
+- [x] `source .env.test && cargo nextest run --no-tests=fail --features storage-sqlite,storage-redb,storage-queue --lib -E 'test(=storage::migrate::tests::forward_phase1_rejects_wal_active_reader_writer_and_idle_conn)'`（new，覆盖 AC1–AC6）
+- [x] 按「执行检查必备需求」第 3 条 Stage 1 守卫核验本卡精确 2 文件实现白名单。
 
 **Full-suite trigger:** `none`
 
@@ -10083,8 +10083,9 @@
 | `RB-09k` | `done` / `remote-verified` | `c156520`（`main`） | `0.30.378` | 2026-11-23 21:45 UTC：Stage 1 精确 5 文件写集内仅改动 `src/storage/queue/writer.rs`，新增双通道端到端有序回收验收测试 `consumer_drained_rotated_old_s_safe_reclaim_ordered_actions`：Part 1 经 `AfterReclaimMetaBeforeUnlink` 故障注入在原子零帧跨段提交 `(1, 0)` 后实证 `tail.meta` 与 `tail.meta.bak` 已原子落盘 `MIN_LIVE_SEG = 1`（AC1）并同步摘除 `sealed[0]`（AC2）且 `events-00000000.log` 尚未 `unlink`；Part 2 跨 Case C Step C2（含非零 `S = 0→1` 与 `S = 1→2`）及真实 16 MiB 常规轮转实证 `writer.lock → append.lock` 锁序、双副本 `LTM2` 先落盘再 `unlink`（AC3）且 `FsyncLaneDirAfterReclaim` 紧随 `ReclaimSegmentUnlink` 之后执行（`pos_fsync_reclaim == pos_unlink + 1`，AC4）；`--no-default-features --features storage-redb` `VER1` 1/1、`VER2` 2.264s、`writer::tests` 20/20（40.934s）、四构型 Clippy/check 矩阵 `src/storage/` 零告警、`compat_version_surface_sync` 2/2 全绿；Codex R1 唯一 P1（紧邻索引断言 `pos_fsync_reclaim == pos_unlink + 1`）闭环，R2 获 `VERDICT: PASS`（P0=0、P1=0、P2=0） |
 | `RB-09i` | `done` / `remote-verified` | `b2b2a81`（`main`） | `0.30.379` | 2026-11-23 22:17 UTC：Stage 1 精确 5 文件写集内仅改动 `src/storage/queue/segment.rs` 与 `src/storage/queue/writer.rs`，在 `writer.rs::step_lane_once` 中将 `max_live_seg > meta.active_seg` Case D / 嵌套 Case C→D 恢复委托前置于 Branch A（已封存段消费）与 Branch B（活跃段消费）之前（含先验活跃段已提交前缀只读验证），在 `normal/` 50ms 合批窗口刷新时同步核验 `next_seg_ids` 遇后继立即让出待恢复，并在 `segment.rs` Unix (`recover_under_root_fd_unix`) 与 Windows (`recover_at_root_windows`) 持 `append.lock` 释放前新增权威后验收敛校验并增补 `LaneRecoveryReport.orphan_successor_removed`、彻底移除易受 ABA 误伤的无锁 `last_recovery_signature`；`--no-default-features --features storage-redb` `VER1` 1/1、`VER2`（`consumer_delegates_nested_case_d_recovery_and_drains_all_frame_classes` 2.510s 覆盖 7 大场景：双通道洁净嵌套 Case C→D AC1–AC6 + 0 持锁写库/镜像不变 + 双损嵌套 `RB-08v`/`RB-08u` + 损坏前缀 fail-closed `LBR-IO-001` + 旧封存高水位前置委托 + 50ms 窗中后继让出 + 空孤儿后并发重建 + 外部 `recover_lane` ABA 竞态恢复）、`writer::tests` 21/21（41.969s）、四构型 Clippy/check 矩阵 `src/storage/` 零告警、`compat_version_surface_sync` 2/2 全绿；Codex R1（2×P1）、R2（1×P1）、R3（1×P1）全部闭环，R4 获 `VERDICT: PASS`（P0=0、P1=0、P2=0） |
 | `RB-09l` | `done` / `remote-verified` | `c867b25`（`main`） | `0.30.380` | 2026-11-23 22:38 UTC：Stage 1 精确 5 文件写集内仅改动 `src/storage/queue/writer.rs`，新增严格 `#[cfg(test)]` 零发布开销 `WriterObserver::with_after_reclaim_hook` 并落地两项双通道端到端高压验收测试关闭 Phase 2（全 43 卡 100% 闭环）：`--no-default-features --features storage-redb` `VER1` 2/2、`VER2`（`consumer_eager_reclaim_unblocks_256_rotation` 16.545s 覆盖 AC1–AC3：256 小封存段 + 活跃 `S=256` ~15 MiB 隔离字节上限，实证 16 MiB 轮转先报 `QueueFull` `LBR-AGENT-046`、消费跨过首个封存段 `seg 0` 即刻逐段回收将 `sealed.len()` 降至 `255 < 256`（其余 255 段仍在盘未消费）、受阻轮转即刻建出 `events-00000257.log` 并在双副本 `tail.meta`/`tail.meta.bak` 原子登记 `(256, old_committed_len, old_prefix_crc32c)`、随后同一消费循环无缝排空余下 256 封存段及 `seg 257`）、`VER3`（`consumer_drains_full_256_table_case_c_sealed_and_active` 15.908s 覆盖 AC4–AC6：满 256 表 Step C1 原地恢复 + 5 条段内追加后高压排空 0 错通过全量 `LTM2` 校验、`sealed.len()` 严格按 `255..=0` 逐段释放、全 256 封存段 512 帧与活跃 `S=256` 12 帧逐字段核验一致）、`writer::tests` 23/23（64.097s）、四构型 Clippy/check 矩阵 `src/storage/` 零告警、`compat_version_surface_sync` 2/2 全绿；Codex R1 静态审查确认 P0=0/P1=0/P2=0（仅因只读沙箱无法落盘跑测标 FAIL，已由本地全量测试闭环并依用户明确授权跳过复审推进） |
-| `RB-10` | `done` / `remote-pending` | 本提交（`main`） | `0.30.381` | 2026-11-23 23:28 UTC：Phase 3 首卡，Stage 1 精确 2 文件写集（`src/storage/mod.rs`、`src/storage/migrate.rs`，`#[cfg(all(feature = "storage-sqlite", feature = "storage-redb"))]`）实现单非池化连接 `c_mig` `DELETE` 模式排他静默门（`quiesce_sqlite_source` / `quiesce_forward_repository_sqlite_sources`）：全程零活 `.db` 裸 `File::open`（依赖无 fd `lstat` + SQLite `unixClose` `pInode->pUnused` 延迟关句柄杜绝 POSIX 泄锁），前置 `PRAGMA locking_mode = EXCLUSIVE`（无 `NeedSchema` 不触盘、强制 `WAL_HEAPMEMORY_MODE` 零 `-shm`）+ 无写 `BEGIN EXCLUSIVE; ROLLBACK;` 持续保持 OS 级 `EXCLUSIVE` 锁 + 持锁态配置并校验 `PRAGMA synchronous = FULL` + `sqlite3_file_control("main", SQLITE_FCNTL_HAS_MOVED)` 句柄-inode 绑定校验 + `SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE` 保护离线 WAL 与即刻取消零改动，严格限定 `Repository`/`Capture` 角色零触碰配置库；`--features storage-sqlite,storage-redb,storage-queue` `VER1` 1/1、`VER2`（`forward_phase1_rejects_writer_and_delete_active_reader` 0.117s 覆盖真实跨 OS 进程 `writer_immediate`/`writer_exclusive`/`delete_reader` 双库 AC1–AC4 均精准报于 `BEGIN EXCLUSIVE` `SQLITE_BUSY` `LBR-IO-001` 且零字节改动、5 轮中位数 ≤ 50ms 性能预算、持锁后外部进程读写探针 100% 阻断、离线 WAL/TOCTOU WAL/洁净 WAL/即刻取消/硬链别名/路径持久替换与换回/异步 `Drop`/禁入角色全回归）、四构型 Clippy/check 矩阵 `src/storage/` 零告警、`compat_version_surface_sync` 2/2 全绿；Codex R1–R5 共 9 项真实发现全部逐轮闭环，R6 残余 2 项分别为 macOS 无法实测的 Windows VFS 场景与要求 `NO_CKPT_ON_CLOSE` 在 `BEGIN EXCLUSIVE` 前同时为 0 和 1 的物理矛盾，依用户明确授权跳过复审并如实记录推进 |
-| `RB-10m`..`RB-34c`（剩余 82 卡） | `pending` | — | — | Phase 3 首卡 `RB-10` 完成，进入 `RB-10m`（正向迁移 Phase 1 WAL 三类竞争直接切 `journal_mode=DELETE` 静默门） |
+| `RB-10` | `done` / `remote-verified` | `8018887`（`main`） | `0.30.381` | 2026-11-23 23:28 UTC：Phase 3 首卡，Stage 1 精确 2 文件写集（`src/storage/mod.rs`、`src/storage/migrate.rs`，`#[cfg(all(feature = "storage-sqlite", feature = "storage-redb"))]`）实现单非池化连接 `c_mig` `DELETE` 模式排他静默门（`quiesce_sqlite_source` / `quiesce_forward_repository_sqlite_sources`）：全程零活 `.db` 裸 `File::open`（依赖无 fd `lstat` + SQLite `unixClose` `pInode->pUnused` 延迟关句柄杜绝 POSIX 泄锁），前置 `PRAGMA locking_mode = EXCLUSIVE`（无 `NeedSchema` 不触盘、强制 `WAL_HEAPMEMORY_MODE` 零 `-shm`）+ 无写 `BEGIN EXCLUSIVE; ROLLBACK;` 持续保持 OS 级 `EXCLUSIVE` 锁 + 持锁态配置并校验 `PRAGMA synchronous = FULL` + `sqlite3_file_control("main", SQLITE_FCNTL_HAS_MOVED)` 句柄-inode 绑定校验 + `SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE` 保护离线 WAL 与即刻取消零改动，严格限定 `Repository`/`Capture` 角色零触碰配置库；`--features storage-sqlite,storage-redb,storage-queue` `VER1` 1/1、`VER2`（`forward_phase1_rejects_writer_and_delete_active_reader` 0.117s 覆盖真实跨 OS 进程 `writer_immediate`/`writer_exclusive`/`delete_reader` 双库 AC1–AC4 均精准报于 `BEGIN EXCLUSIVE` `SQLITE_BUSY` `LBR-IO-001` 且零字节改动、5 轮中位数 ≤ 50ms 性能预算、持锁后外部进程读写探针 100% 阻断、离线 WAL/TOCTOU WAL/洁净 WAL/即刻取消/硬链别名/路径持久替换与换回/异步 `Drop`/禁入角色全回归）、四构型 Clippy/check 矩阵 `src/storage/` 零告警、`compat_version_surface_sync` 2/2 全绿；Codex R1–R5 共 9 项真实发现全部逐轮闭环，R6 残余 2 项分别为 macOS 无法实测的 Windows VFS 场景与要求 `NO_CKPT_ON_CLOSE` 在 `BEGIN EXCLUSIVE` 前同时为 0 和 1 的物理矛盾，依用户明确授权跳过复审并如实记录推进 |
+| `RB-10m` | `done` / `remote-pending` | 本提交（`main`） | `0.30.385` | 2026-11-24 03:28 UTC：Stage 1 精确 2 文件写集内仅改动 `src/storage/migrate.rs`，扩展正向迁移 Phase 1 为 Phase A/B 两段式 WAL 静默门：前置 `PRAGMA locking_mode = EXCLUSIVE`（`WAL_HEAPMEMORY_MODE` 零 `-shm` 读写）+ 已验证 `PRAGMA synchronous = FULL` + `SQLITE_FCNTL_FILE_POINTER`/`xRead` 零额外 fd 检查 `.db` 文件头字节 18–19（精准区分真实 WAL `2/2` 与带孤立 `-wal` 的 `DELETE` `1/1` 库），Phase A 先对 `libra.db` 与 `capture.db` 双库均取得零改动 OS 排他锁（绝不预先调 `wal_checkpoint(TRUNCATE)`），Phase B 仅在全仓无竞争后对真实离线 WAL 经持久身份绑定恢复标记（`-libra-wal-shm-cleanup.pending` 绑定 `lstat` `shm_len`/`shm_dev`/`shm_ino`）+ 直接 `PRAGMA journal_mode = DELETE;` 归并并清理过期 `-shm`（崩溃或 IO 失败可续跑恢复，伪造/无标记孤立 `-shm` 或 `-wal` 一律 fail-closed 零改动）；`--features storage-sqlite,storage-redb,storage-queue` `VER1` 1/1、`VER2`（`forward_phase1_rejects_wal_active_reader_writer_and_idle_conn` 0.259s 覆盖双库 WAL 活跃读者/活跃写者/空闲连接三类竞争 AC1–AC6 均报 `LBR-IO-001` `SQLITE_BUSY` 且 `.db`/`-wal`/`-shm`/对端库逐字节零改动、离线 3 文件 WAL 正向控制 ≤ 50ms 归并并保留 OS 排他锁、混合离线 WAL `libra.db` + 4 类竞争 `capture.db` 六文件零改动、崩溃/IO 失败续跑与伪造标记拒收、`DELETE` 孤立 `-wal`/`-wal+-shm`/`-shm` 零改动、洁净 WAL 竞态与取消、WAL 路径替换全回归）、`storage::migrate::tests` 2/2（0.271s）、四构型 Clippy/check 矩阵 `src/storage/` 零告警、`compat_version_surface_sync` 2/2 全绿；Codex R1–R6 全部真实发现逐轮闭环，R7 仅余 2 项 macOS 宿主机不可编译实测的 Windows 专属条目（Windows `-shm` 文件身份与目录刷盘），依用户明确授权跳过复审并如实记录推进 |
+| `RB-10n`..`RB-34c`（剩余 81 卡） | `pending` | — | — | Phase 3 `RB-10` 与 `RB-10m` 完成，进入 `RB-10n`（正向迁移 Phase 1 在途 `capture-spool/tmp/` 与外部队列锁竞争拒收） |
 
 ## Codex review log
 
