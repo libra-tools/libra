@@ -5938,13 +5938,14 @@ async fn create_replayed_commit(
         RebaseTodoAction::Fixup => {
             let target: Commit = load_object(&new_parent_id)
                 .map_err(|error| ReplayCommitError::ObjectLoad(error.to_string()))?;
-            Ok(Commit::new(
-                target.author.clone(),
+            return finalize_replayed_commit(UnsignedReplayContent {
+                author: target.author.clone(),
                 committer,
                 tree_id,
-                target.parent_commit_ids.clone(),
-                &target.message,
-            ))
+                parents: target.parent_commit_ids.clone(),
+                message: parse_commit_msg(&target.message).0.to_string(),
+            })
+            .await;
         }
         RebaseTodoAction::Squash => {
             let target: Commit = load_object(&new_parent_id)
@@ -5952,13 +5953,14 @@ async fn create_replayed_commit(
             let (target_clean, _) = parse_commit_msg(&target.message);
             let (this_clean, _) = parse_commit_msg(&original_commit.message);
             let message = format!("{}\n\n{}", target_clean.trim(), this_clean.trim());
-            Ok(Commit::new(
-                target.author.clone(),
+            return finalize_replayed_commit(UnsignedReplayContent {
+                author: target.author.clone(),
                 committer,
                 tree_id,
-                target.parent_commit_ids.clone(),
-                &message,
-            ))
+                parents: target.parent_commit_ids.clone(),
+                message,
+            })
+            .await;
         }
         RebaseTodoAction::Amend => {
             let target: Commit = load_object(&new_parent_id)
@@ -5972,13 +5974,16 @@ async fn create_replayed_commit(
                 &message,
             ))
         }
-        RebaseTodoAction::Reword | RebaseTodoAction::Edit => Ok(Commit::new(
-            original_commit.author.clone(),
-            committer,
-            tree_id,
-            vec![new_parent_id],
-            &original_commit.message,
-        )),
+        RebaseTodoAction::Reword | RebaseTodoAction::Edit => {
+            return finalize_replayed_commit(UnsignedReplayContent {
+                author: original_commit.author.clone(),
+                committer,
+                tree_id,
+                parents: vec![new_parent_id],
+                message: parse_commit_msg(&original_commit.message).0.to_string(),
+            })
+            .await;
+        }
         RebaseTodoAction::FixupKeep | RebaseTodoAction::FixupKeepEdit => {
             let target: Commit = load_object(&new_parent_id)
                 .map_err(|error| ReplayCommitError::ObjectLoad(error.to_string()))?;
