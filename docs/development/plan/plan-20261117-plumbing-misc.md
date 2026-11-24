@@ -2489,7 +2489,7 @@ PY
 ### Task PM-35: `libra shortlog` 格式分组（`format:` 与 DWIM `%`）与 `--date`（#1034；自 PM-30 拆出）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-23：`GroupMode` 新增 `Format(String)`——`format:<fmt>` 与含 `%` 的 DWIM 值；新增 `--date`，经 `CommitFormatter::with_date_mode` 作用于日期占位符；`render_format_group` 先以共享 mailmap 替换 `%aN`/`%cN`（尊重 `%%`）再交给 `CommitFormatter`，stdin 路径以解析出的作者/提交者名与主题做同样替换。AC1–AC3 由 `command::shortlog_test::shortlog_format_groups_and_date` 覆盖，AC4–AC5 由 `shortlog_format_groups_apply_mailmap` 覆盖；`shortlog_test` 28/28；EN/zh/开发文档与 `COMPATIBILITY.md` 的 `shortlog` 行同步。
 **Description:** 自 `PM-30` 拆出：`--group=format:<fmt>` 与不带 `format:` 但含 `%` 的 DWIM 形式按 `CommitFormatter` 渲染分组键，新增 `--date=<mode>` 经 `CommitFormatter::with_date_mode` 作用于其中的日期占位符；`%aN`/`%cN` 在 shortlog 格式分组中经 `PM-40` 的 mailmap 单一事实源映射作者/提交者名（与 Git 一致）。
 **Out of scope:** 多分组与去重（`PM-30`）；`%aE`/`%cE` 等其它 mailmap 感知占位符（尚未排期，重启条件：后续 shortlog/log 格式计划）。
 **Current evidence:**

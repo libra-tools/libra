@@ -182,6 +182,10 @@ pub struct ShortlogArgs {
     #[clap(long = "max-count", value_name = "N")]
     pub max_count: Option<usize>,
 
+    /// Date mode for `format:` groups (`--date=format:%Y`, `iso`, `short`, …).
+    #[clap(long = "date", value_name = "MODE")]
+    pub date: Option<String>,
+
     /// Paths after `--` limiting the summarized commits.
     #[clap(value_name = "PATH", last = true)]
     pub paths: Vec<String>,
@@ -193,6 +197,8 @@ enum GroupMode {
     Committer,
     /// Group by each value of the named commit-message trailer.
     Trailer(String),
+    /// Group by a `CommitFormatter` template (`format:...` or a DWIM `%` value).
+    Format(String),
 }
 
 /// Resolve the grouping mode from `--group` (preferred) or the legacy
@@ -243,6 +249,11 @@ fn parse_group_mode(spec: &str) -> CliResult<GroupMode> {
     match spec {
         "author" => Ok(GroupMode::Author),
         "committer" => Ok(GroupMode::Committer),
+        spec if spec.starts_with("format:") => {
+            Ok(GroupMode::Format(spec["format:".len()..].to_string()))
+        }
+        // Git's DWIM: a value containing `%` is a format group.
+        spec if spec.contains('%') => Ok(GroupMode::Format(spec.to_string())),
         spec if spec.starts_with("trailer:") => {
             let key = spec["trailer:".len()..].trim();
             if key.is_empty() {
@@ -589,6 +600,73 @@ async fn run_shortlog(
     ))
 }
 
+/// Render a `format:` group key: `%aN`/`%cN` are resolved through the shared
+/// mailmap first, then the rest goes through the normal commit formatter (so
+/// `--date` applies to its date placeholders).
+fn render_format_group(
+    template: &str,
+    commit: &Commit,
+    color_enabled: bool,
+    date_mode: Option<&str>,
+    mailmap: &[crate::command::check_mailmap::MailmapEntry],
+    abbrev_len: usize,
+) -> String {
+    let author_name = crate::command::check_mailmap::map_identity(
+        mailmap,
+        &commit.author.name,
+        &commit.author.email,
+    )
+    .0;
+    let committer_name = crate::command::check_mailmap::map_identity(
+        mailmap,
+        &commit.committer.name,
+        &commit.committer.email,
+    )
+    .0;
+
+    let mut expanded = String::new();
+    let mut chars = template.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '%' {
+            expanded.push(ch);
+            continue;
+        }
+        if chars.peek() == Some(&'%') {
+            chars.next();
+            expanded.push_str("%%");
+            continue;
+        }
+        let rest: String = chars.clone().collect();
+        if rest.starts_with("aN") {
+            chars.next();
+            chars.next();
+            expanded.push_str(&author_name);
+        } else if rest.starts_with("cN") {
+            chars.next();
+            chars.next();
+            expanded.push_str(&committer_name);
+        } else {
+            expanded.push('%');
+        }
+    }
+
+    let mut formatter =
+        CommitFormatter::new(FormatType::Custom(expanded)).with_color_enabled(color_enabled);
+    if let Some(mode) = date_mode {
+        formatter = formatter.with_date_mode(mode.to_string());
+    }
+    let ctx = FormatContext {
+        graph_prefix: "",
+        decoration: "",
+        decoration_wrapped: "",
+        commit_color: None,
+        abbrev_len,
+        extra_hashes: "",
+        notes: "",
+    };
+    formatter.format(commit, &ctx)
+}
+
 /// Shared aggregation options (keeps the function arity manageable).
 struct AggregateOptions<'a> {
     color_enabled: bool,
@@ -633,6 +711,17 @@ fn aggregate_shortlog(
                 &commit.committer.email,
             )],
             GroupMode::Trailer(key) => extract_trailer_identities(&commit.message, key),
+            GroupMode::Format(template) => {
+                let rendered = render_format_group(
+                    template,
+                    &commit,
+                    color_enabled,
+                    args.date.as_deref(),
+                    mailmap,
+                    abbrev_len,
+                );
+                vec![(rendered, String::new())]
+            }
         });
 
         let subject = match &formatter {
@@ -884,6 +973,28 @@ fn aggregate_shortlog_stdin(
                 .into_iter()
                 .collect(),
             GroupMode::Trailer(key) => extract_trailer_identities(&commit.message, key),
+            GroupMode::Format(template) => {
+                let subject = commit.message.lines().next().unwrap_or("").to_string();
+                let author = commit
+                    .author
+                    .clone()
+                    .map(|(name, email)| {
+                        crate::command::check_mailmap::map_identity(mailmap, &name, &email).0
+                    })
+                    .unwrap_or_default();
+                let committer = commit
+                    .committer
+                    .clone()
+                    .map(|(name, email)| {
+                        crate::command::check_mailmap::map_identity(mailmap, &name, &email).0
+                    })
+                    .unwrap_or_default();
+                let rendered = template
+                    .replace("%aN", &author)
+                    .replace("%cN", &committer)
+                    .replace("%s", &subject);
+                vec![(rendered, String::new())]
+            }
         });
 
         for (author_name, author_email) in identities {

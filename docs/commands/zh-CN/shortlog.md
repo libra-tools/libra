@@ -31,13 +31,14 @@ git log | libra shortlog [-n] [-s] [-e] [--group <TYPE>] [--author <pattern>] [-
 
 | 选项 | 短选项 | 长选项 | 说明 |
 |--------|-------|------|-------------|
+| Date | | `--date <MODE>` | `format:` 分组的日期模式（`--date=format:%Y`、`iso`、`short` 等），作用于其日期占位符。 |
 | Max count | `-<n>` | `--max-count <N>` | 在分组前把整个修订遍历限制为 `N` 个提交；`-<n>` 简写（`-1`、`-20`）会重写为 `--max-count`，与 `-n`/`--numbered` 不冲突。 |
 | Numbered | `-n` | `--numbered` | 按每个作者的提交数量降序排序，而不是按字母顺序。 |
 | Summary | `-s` | `--summary` | 抑制提交描述；只显示每个作者的提交数量。 |
 | Email | `-e` | `--email` | 在作者名旁显示 email 地址。启用后，作者按 `name <email>` 对分组。 |
 | Committer | `-c` | `--committer` | 按提交者（committer）身份分组，而不是作者。 |
 | No group | | `--no-group` | 清空此前的 `--group` 取值；分组为空时回落到按 author 分组。 |
-| Group | | `--group <TYPE>` | 按 `author`（默认）、`committer` 或 `trailer:<key>`（按指定提交消息 trailer 的每个值分组，例如 `trailer:Co-authored-by`）分组。可重复：每个分组都为每个提交贡献键，同一提交内重复的键（重复的 trailer 值，或两个分组产生的相同名字）只计一次（Git 的 per-commit `strset`）。优先于 `-c`。 |
+| Group | | `--group <TYPE>` | 按 `author`（默认）、`committer` 或 `trailer:<key>`（按指定提交消息 trailer 的每个值分组，例如 `trailer:Co-authored-by`）分组；取值为 `format:<fmt>`（或任何含 `%` 的值，Git 的 DWIM）时用与 `--format` 相同的模板引擎渲染，`%aN`/`%cN` 会经 mailmap 映射，`--date=<mode>` 作用于其日期占位符。可重复：每个分组都为每个提交贡献键，同一提交内重复的键（重复的 trailer 值，或两个分组产生的相同名字）只计一次（Git 的 per-commit `strset`）。优先于 `-c`。 |
 | No merges | | `--no-merges` | 聚合前排除 merge 提交（父提交多于一个）。 |
 | Merges | | `--merges` | 只包含 merge 提交（`--no-merges` 的反向；两者互相覆盖）。 |
 | Top | | `--top <N>` | 只显示排序后的前 N 个身份。 |

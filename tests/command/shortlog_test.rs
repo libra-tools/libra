@@ -1795,3 +1795,126 @@ fn shortlog_and_check_mailmap_apply_mailmap() {
         "AC4"
     );
 }
+
+/// Build the shared F16m fixture (three commits, Carol/Dan as committers).
+fn shortlog_f16m() -> (tempfile::TempDir, impl Fn(&[&str]) -> std::process::Output) {
+    use std::process::Command;
+    let libra = env!("CARGO_BIN_EXE_libra");
+    let repo = tempdir().unwrap();
+    let p = repo.path().to_path_buf();
+    let home = p.join(".home");
+    let run_owned = move |args: &[&str]| {
+        Command::new(libra)
+            .args(args)
+            .current_dir(&p)
+            .env("HOME", &home)
+            .env("LIBRA_TEST", "1")
+            .env("GIT_AUTHOR_DATE", "1112875200 +0000")
+            .env("GIT_COMMITTER_DATE", "1112875200 +0000")
+            .output()
+            .unwrap()
+    };
+    assert!(run_owned(&["init", "--vault", "false"]).status.success());
+    assert!(run_owned(&["config", "user.name", "t"]).status.success());
+    assert!(run_owned(&["config", "user.email", "t@t"]).status.success());
+    let commit =
+        |body: &str, author: &str, committer_name: &str, committer_email: &str, ts: &str| {
+            std::fs::write(repo.path().join("f"), format!("{body}\n")).unwrap();
+            assert!(run_owned(&["add", "f"]).status.success());
+            let out = Command::new(libra)
+                .args(["commit", "-m", body, "--author", author, "--no-verify"])
+                .current_dir(repo.path())
+                .env("HOME", repo.path().join(".home"))
+                .env("LIBRA_TEST", "1")
+                .env("GIT_COMMITTER_NAME", committer_name)
+                .env("GIT_COMMITTER_EMAIL", committer_email)
+                .env("GIT_AUTHOR_DATE", ts)
+                .env("GIT_COMMITTER_DATE", ts)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{out:?}");
+        };
+    commit(
+        "first",
+        "Alice <alice@example.com>",
+        "Carol",
+        "carol@example.com",
+        "1112875200 +0000",
+    );
+    commit(
+        "second",
+        "Bob <bob@example.com>",
+        "Carol",
+        "carol@example.com",
+        "1146484800 +0000",
+    );
+    commit(
+        "third",
+        "Alice <alice@other.example>",
+        "Dan",
+        "dan@example.com",
+        "1180785600 +0000",
+    );
+    (repo, run_owned)
+}
+
+/// PM-35: `format:` groups (plus DWIM `%`) and `--date`.
+#[test]
+fn shortlog_format_groups_and_date() {
+    let (repo, run) = shortlog_f16m();
+    // AC1: `%cN` groups by committer name.
+    let out = run(&["shortlog", "-s", "--group=format:%cN", "HEAD"]);
+    assert!(out.status.success(), "AC1");
+    assert_eq!(out.stdout, b"     2\tCarol\n     1\tDan\n".to_vec(), "AC1");
+
+    // AC2: values containing `%` are DWIM format groups.
+    let out = run(&["shortlog", "-s", "--group=%cn", "--group=%an", "HEAD"]);
+    assert!(out.status.success(), "AC2");
+    assert_eq!(
+        out.stdout,
+        b"     2\tAlice\n     1\tBob\n     2\tCarol\n     1\tDan\n".to_vec(),
+        "AC2"
+    );
+
+    // AC3: `--date` applies to date placeholders in the group format.
+    let out = run(&[
+        "shortlog",
+        "-s",
+        "--date=format:%Y",
+        "--group=format:%cN (%cd)",
+        "HEAD",
+    ]);
+    assert!(out.status.success(), "AC3");
+    assert_eq!(
+        out.stdout,
+        b"     1\tCarol (2005)\n     1\tCarol (2006)\n     1\tDan (2007)\n".to_vec(),
+        "AC3"
+    );
+    drop(repo);
+}
+
+/// PM-35: `%aN`/`%cN` format groups use the shared mailmap.
+#[test]
+fn shortlog_format_groups_apply_mailmap() {
+    let (repo, run) = shortlog_f16m();
+    std::fs::write(
+        repo.path().join(".mailmap"),
+        "Carol Proper <carol@proper.example> <carol@example.com>\nRobert <robert@x.example> <bob@example.com>\n",
+    )
+    .unwrap();
+    let out = run(&["shortlog", "-s", "--group=format:%cN", "HEAD"]);
+    assert!(out.status.success(), "AC4");
+    assert_eq!(
+        out.stdout,
+        b"     2\tCarol Proper\n     1\tDan\n".to_vec(),
+        "AC4"
+    );
+    let out = run(&["shortlog", "-s", "--group=format:%aN", "HEAD"]);
+    assert!(out.status.success(), "AC5");
+    assert_eq!(
+        out.stdout,
+        b"     2\tAlice\n     1\tRobert\n".to_vec(),
+        "AC5"
+    );
+    drop(repo);
+}

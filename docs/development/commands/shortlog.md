@@ -74,3 +74,5 @@ flowchart TD
 - 2026-11-23（PM-19 / #1034）：`src/cli.rs` 的 `rewrite_short_number_args_to` 增加 `shortlog` → `--max-count`（`-<n>` 简写，不影响 `-n`）；`ShortlogArgs` 新增 `--max-count`，仓库遍历在作者过滤后、聚合前 `truncate(n)`，stdin 路径对解析出的提交同样截断。回归：`shortlog_max_count_shorthand`（AC1–AC4）；`shortlog_test` 25/25。
 
 - 2026-11-23（PM-40 / #1034）：把 `check_mailmap` 的加载/查询提升为 `pub(crate)` 单一事实源——`load_mailmap_from(workdir)` 先读 `.mailmap` 再读 `mailmap.file`（`optional_cascaded_config_path`，后者条目覆盖），`resolve` 改为姓名与邮箱均 ASCII 大小写不敏感且从末尾取首个匹配；`map_identity` 供 shortlog 使用，author/committer 分组键在去重前映射。回归：`shortlog_and_check_mailmap_apply_mailmap`（AC1–AC4）；`shortlog_test` 与 `check_mailmap_test` 合计 33/33。
+
+- 2026-11-23（PM-35 / #1034）：`GroupMode` 新增 `Format(String)`——`format:<fmt>` 与含 `%` 的 DWIM 值；新增 `--date` 并经 `CommitFormatter::with_date_mode` 作用于日期占位符；`render_format_group` 先按 `%aN`/`%cN` 用共享 mailmap 替换（尊重 `%%`），再交给 `CommitFormatter` 渲染；stdin 路径以解析出的作者/提交者名与主题做同样替换。回归：`shortlog_format_groups_and_date`（AC1–AC3）、`shortlog_format_groups_apply_mailmap`（AC4–AC5）；`shortlog_test` 28/28。

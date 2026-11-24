@@ -35,13 +35,14 @@ touch the path.
 
 | Option | Short | Long | Description |
 |--------|-------|------|-------------|
+| Date | | `--date <MODE>` | Date mode for `format:` groups (`--date=format:%Y`, `iso`, `short`, …), applied to their date placeholders. |
 | Max count | `-<n>` | `--max-count <N>` | Limit the whole revision walk to `N` commits before grouping; the `-<n>` shorthand (`-1`, `-20`) rewrites to `--max-count` and does not collide with `-n`/`--numbered`. |
 | Numbered | `-n` | `--numbered` | Sort output by number of commits per author (descending) instead of alphabetically. |
 | Summary | `-s` | `--summary` | Suppress commit descriptions; show only per-author commit counts. |
 | Email | `-e` | `--email` | Show the email address of each author alongside their name. When enabled, authors are grouped by `name <email>` pair. |
 | Committer | `-c` | `--committer` | Group commits by committer identity instead of author. |
 | No group | | `--no-group` | Clear the `--group` values given so far; an empty group list falls back to author grouping. |
-| Group | | `--group <TYPE>` | Group by `author` (default), `committer`, or `trailer:<key>` (one group per value of the named commit-message trailer, e.g. `trailer:Co-authored-by`). Repeatable: every group contributes keys for each commit, and a key repeated inside one commit (a repeated trailer value, or the same name from two groups) counts once (Git's per-commit `strset`). Takes precedence over `-c`. |
+| Group | | `--group <TYPE>` | Group by `author` (default), `committer`, or `trailer:<key>` (one group per value of the named commit-message trailer, e.g. `trailer:Co-authored-by`). Repeatable: every group contributes keys for each commit, and a key repeated inside one commit (a repeated trailer value, or the same name from two groups) counts once (Git's per-commit `strset`). Takes precedence over `-c`.. A value of `format:<fmt>` (or any value containing `%`, Git's DWIM) is rendered with the same template engine as `--format`, so `%aN`/`%cN` are mailmap-aware; `--date=<mode>` applies to its date placeholders. |
 | No merges | | `--no-merges` | Exclude merge commits (commits with more than one parent) before aggregation. |
 | Merges | | `--merges` | Include only merge commits (the inverse of `--no-merges`; the two override each other). |
 | Top | | `--top <N>` | Show only the top N identities (after sorting). |
