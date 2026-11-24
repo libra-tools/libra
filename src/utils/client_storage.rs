@@ -2281,9 +2281,16 @@ impl ClientStorage {
     /// - Blocks the calling thread on the storage runtime; safe to call from sync or
     ///   async contexts.
     pub fn get(&self, object_id: &ObjectHash) -> Result<Vec<u8>, GitError> {
+        self.get_typed(object_id).map(|(data, _)| data)
+    }
+
+    pub(crate) fn get_typed(
+        &self,
+        object_id: &ObjectHash,
+    ) -> Result<(Vec<u8>, ObjectType), GitError> {
         let storage = self.ready_storage()?;
         let hash = *object_id;
-        self.block_on_storage(async move { storage.get(&hash).await.map(|(data, _)| data) })
+        self.block_on_storage(async move { storage.get(&hash).await })
     }
 
     /// Read a typed object with a strict load bound, including the durable

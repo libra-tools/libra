@@ -8,6 +8,7 @@ use std::{
 use git_internal::{
     errors::GitError,
     hash::{HashKind, ObjectHash},
+    internal::{object::types::ObjectType, pack::entry::Entry},
 };
 
 use crate::utils::error::{CliError, CliResult, StableErrorCode};
@@ -19,6 +20,28 @@ const COMMIT_EDGE_CHUNK_SIZE: usize = 4096;
 const COMMIT_EDGE_WRITE_BUFFER_BYTES: usize = 64 * 1024;
 const MAX_COMMIT_ID_BYTES: usize = 64 * 1024 * 1024;
 const COMMIT_ID_RESERVE_STEP: usize = 4096;
+
+/// Cloud index metadata from fetch's existing pack decode, including resolved deltas.
+#[derive(Default)]
+pub(crate) struct ReceivedObjects(Mutex<Vec<(ObjectHash, ObjectType, i64)>>);
+
+impl ReceivedObjects {
+    pub(crate) fn record(&self, entry: &Entry) -> Result<(), GitError> {
+        lock_state(&self.0, "received object metadata")?.push((
+            entry.hash,
+            entry.obj_type,
+            entry.data.len() as i64,
+        ));
+        Ok(())
+    }
+
+    pub(crate) fn take_rows(&self) -> Result<Vec<(String, String, i64)>, GitError> {
+        Ok(lock_state(&self.0, "received object metadata")?
+            .drain(..)
+            .map(|(oid, kind, size)| (oid.to_string(), kind.to_string(), size))
+            .collect())
+    }
+}
 
 /// An unnamed temporary file of fixed-width child/parent object-ID pairs.
 /// The file is removed by the OS when its final handle is dropped, including

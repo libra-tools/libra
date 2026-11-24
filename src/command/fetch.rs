@@ -31,7 +31,8 @@ use url::Url;
 
 use crate::{
     command::{
-        index_pack, index_pack_v1, index_pack_v2, load_object,
+        index_pack_support::ReceivedObjects,
+        index_pack_v1, index_pack_v2, load_object,
         remote::{
             RemotePruneEntry, classify_stale_tracking_branches, remote_advertised_branch_names,
         },
@@ -2810,7 +2811,15 @@ pub(crate) async fn lazy_fetch_objects(oids: &[ObjectHash]) -> Result<usize, Fet
     if data.pack_data.is_empty() {
         return Ok(0);
     }
-    let _ = write_pack_and_index(&data.pack_data, hash_kind, &[]).await?;
+    let (_keep, lock, pack_file, _pin) =
+        write_pack_and_index(&data.pack_data, hash_kind, &[]).await?;
+    if let Some(path) = pack_file {
+        set_hash_kind(hash_kind);
+        let received = Arc::new(ReceivedObjects::default());
+        build_received_index(&path, hash_kind, false, Some(received.clone()))?;
+        drop(lock);
+        record_received_objects(&received).await?;
+    }
     // A promisor lazy fetch reports like any other transfer. The global
     // `--progress` setting decides: `text` always draws it, `auto` resolved to
     // `none` when stderr is not a terminal, and `none` stays byte-clean.
@@ -3174,10 +3183,16 @@ async fn fetch_repository_with_result_reusing(
         &remote_client,
         RemoteClient::Http(_) | RemoteClient::Git(_) | RemoteClient::Ssh(_)
     );
+    let received = Arc::new(ReceivedObjects::default());
     let mut commit_edges = pack_file
         .as_deref()
-        .map(|pack_file| {
-            index_received_pack(pack_file, discovery.hash_kind, validate_network_history)
+        .map(|path| {
+            build_received_index(
+                path,
+                discovery.hash_kind,
+                validate_network_history,
+                Some(received.clone()),
+            )
         })
         .transpose()?
         .flatten();
@@ -3300,6 +3315,7 @@ async fn fetch_repository_with_result_reusing(
             discovery.hash_kind,
         )?;
     }
+    record_received_objects(&received).await?;
     if unshallow {
         // `--unshallow` drops the shallow boundary records entirely.
         write_shallow_boundaries(&BTreeSet::new())?;
@@ -4508,10 +4524,41 @@ async fn write_pack_and_index(
     ))
 }
 
+async fn record_received_objects(received: &ReceivedObjects) -> Result<(), FetchError> {
+    let rows = received
+        .take_rows()
+        .map_err(|error| FetchError::LocalState {
+            message: format!("read received object metadata: {error}"),
+        })?;
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let index_error = |error| FetchError::LocalState {
+        message: format!("index received objects for cloud backup: {error}"),
+    };
+    let db = crate::internal::db::get_db_conn_instance().await;
+    let txn = crate::internal::db::begin_write_transaction(&db)
+        .await
+        .map_err(index_error)?;
+    crate::utils::client_storage::upsert_agent_object_index_rows_with_conn(&txn, &rows)
+        .await
+        .map_err(index_error)?;
+    txn.commit().await.map_err(index_error)
+}
+
 fn index_received_pack(
     pack_file: &str,
     hash_kind: HashKind,
     collect_commit_edges: bool,
+) -> Result<Option<crate::command::index_pack_support::PackCommitEdges>, FetchError> {
+    build_received_index(pack_file, hash_kind, collect_commit_edges, None)
+}
+
+fn build_received_index(
+    pack_file: &str,
+    hash_kind: HashKind,
+    collect_commit_edges: bool,
+    received: Option<Arc<ReceivedObjects>>,
 ) -> Result<Option<crate::command::index_pack_support::PackCommitEdges>, FetchError> {
     let index_file = PathBuf::from(pack_file).with_extension("idx");
     // A SHA-1 pack may already have a valid v2 index created by Git or by
@@ -4533,15 +4580,20 @@ fn index_received_pack(
             source,
         })?;
     let temporary_path = temporary_index.path().to_string_lossy().into_owned();
-    let edges = match (use_v2_index, collect_commit_edges) {
-        (false, true) => {
-            index_pack_v1::build_index_v1_with_commit_edges(pack_file, &temporary_path).map(Some)
-        }
-        (false, false) => index_pack::build_index_v1(pack_file, &temporary_path).map(|_| None),
-        (true, true) => {
-            index_pack_v2::build_index_v2_with_commit_edges(pack_file, &temporary_path).map(Some)
-        }
-        (true, false) => index_pack::build_index_v2(pack_file, &temporary_path).map(|_| None),
+    let edges = if use_v2_index {
+        index_pack_v2::build_index_v2_inner(
+            pack_file,
+            &temporary_path,
+            collect_commit_edges,
+            received,
+        )
+    } else {
+        index_pack_v1::build_index_v1_inner(
+            pack_file,
+            &temporary_path,
+            collect_commit_edges,
+            received,
+        )
     }
     .map_err(|source| FetchError::IndexPack {
         path: pack_file.to_string(),

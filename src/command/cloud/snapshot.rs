@@ -103,6 +103,9 @@ pub(super) struct SnapshotTuning {
     /// Use this run directory name instead of a random one.
     #[cfg(test)]
     pub(super) run_name: Option<String>,
+    /// Run after discovering index gaps but before validating them for insertion.
+    #[cfg(test)]
+    pub(super) before_backfill: Option<BetweenPagesHook>,
     /// Run after each object page of the freeze.
     #[cfg(test)]
     pub(super) between_pages: Option<BetweenPagesHook>,
@@ -173,7 +176,7 @@ pub(super) const MAX_FREEZE_ATTEMPTS: usize = 3;
 
 /// `PRAGMA data_version`: changes on this connection exactly when another
 /// connection commits to the database.
-async fn data_version(conn: &sea_orm::DatabaseConnection) -> Result<i64, sea_orm::DbErr> {
+async fn data_version(conn: &impl ConnectionTrait) -> Result<i64, sea_orm::DbErr> {
     let row = conn
         .query_one_raw(sea_orm::Statement::from_string(
             conn.get_database_backend(),
@@ -283,7 +286,7 @@ async fn replaced_connection(
 /// Whether the connection now answering is the one [`mark_freeze_connection`]
 /// marked for `attempt` (a replacement has no such TEMP table).
 async fn same_freeze_connection(
-    conn: &sea_orm::DatabaseConnection,
+    conn: &impl ConnectionTrait,
     attempt: usize,
 ) -> Result<bool, sea_orm::DbErr> {
     let row = match conn
@@ -1077,6 +1080,44 @@ impl SnapshotSpool {
             }
             None => None,
         };
+        // Discover legacy gaps without holding a database lock during the graph walk.
+        // Revalidate the read window inside the insertion transaction so a moved
+        // ref or concurrent prune cannot leave stale candidates in the index.
+        let missing = match super::coverage::missing_rows(conn, repo_id).await {
+            Ok(rows) => rows,
+            Err(error) => {
+                // A concurrent prune can move the ref and remove its objects mid-walk.
+                if data_version(conn).await.map_err(read_failure)? != start
+                    || !same_freeze_connection(conn, attempt)
+                        .await
+                        .map_err(read_failure)?
+                {
+                    return Ok(false);
+                }
+                return Err(error);
+            }
+        };
+        if !missing.is_empty() {
+            #[cfg(test)]
+            if let Some(hook) = &tuning.before_backfill {
+                hook(attempt).await;
+            }
+            let txn = crate::internal::db::begin_write_transaction(conn)
+                .await
+                .map_err(read_failure)?;
+            if data_version(&txn).await.map_err(read_failure)? != start
+                || !same_freeze_connection(&txn, attempt)
+                    .await
+                    .map_err(read_failure)?
+            {
+                txn.rollback().await.map_err(read_failure)?;
+                return Ok(false);
+            }
+            crate::utils::client_storage::upsert_agent_object_index_rows_with_conn(&txn, &missing)
+                .await
+                .map_err(read_failure)?;
+            txn.commit().await.map_err(read_failure)?;
+        }
         let boundary = conn
             .query_one_raw(sea_orm::Statement::from_sql_and_values(
                 conn.get_database_backend(),
