@@ -28,6 +28,8 @@ Name <email> <unix-timestamp> <±hhmm>
 
 `-l` 按 `GIT_COMMITTER_IDENT`、`GIT_AUTHOR_IDENT` 的顺序逐行输出 `NAME=value`，并跳过身份无法解析的变量（与 Git 的 `var -l` 一致）。未知名称、缺少名称或多参数以 `LBR-CLI-002` 失败；身份缺失以 `LBR-AUTH-001` 失败；命令需要仓库（仓库外 `LBR-REPO-001`，与 Git 的有意差异）。
 
+`GIT_EDITOR` 报告 `libra commit` 会启动的编辑器：`GIT_EDITOR` > `core.editor` > `VISUAL` > `EDITOR`。四者都未设置时：`TERM` 可用（已设置且不为 `dumb`）则输出 `vi`，否则以退出码 1 结束且 stdout 为空。`GIT_SEQUENCE_EDITOR` 先走 `rebase -i` 的解析链（`GIT_SEQUENCE_EDITOR` > `sequence.editor`，其后是 `GIT_EDITOR` 的解析结果），回落规则与前者一致。
+
 ## 选项
 
 | 选项 | 说明 |

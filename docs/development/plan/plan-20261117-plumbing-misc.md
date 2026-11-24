@@ -1738,7 +1738,7 @@ PY
 ### Task PM-22: 完善 `libra var` 的 `GIT_EDITOR`（#995；自 PM-10 拆出；拆出 PM-36）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-23：`var` 新增 `GIT_EDITOR`，复用 `editor::resolve_editor`（`GIT_EDITOR` > `core.editor` > `VISUAL` > `EDITOR`）+ Git 终端回落（`TERM` 可用→`vi`，否则退出码 1、stdout 空）；AC1–AC6 由 `command::var_test::var_editor_variable` 覆盖；`var_test` 7/7；EN/zh/开发文档与 `COMPATIBILITY.md` 的 `var` 行同步；与 PM-36 同批提交）
 **Description:** 自 `PM-10` 拆出：`libra var GIT_EDITOR` 复用 `src/command/editor.rs` 的 `resolve_editor`（`GIT_EDITOR` > `core.editor` > `VISUAL` > `EDITOR`）；全部未配置时按 Git：`TERM` 未设置或为 `dumb` 则以退出码 1 结束且 stdout 为空（stderr 不作承诺），否则输出 `vi`。（按 G-09 拆出 `PM-36` 承接 `GIT_SEQUENCE_EDITOR`。）
 **Out of scope:** `GIT_SEQUENCE_EDITOR`（`PM-36`）；`resolve_editor` 链中 AC1–AC3 之外的相对次序（`core.editor` 先于 `VISUAL`、只设 `EDITOR`）——本卡原样复用且不修改该函数（`src/command/editor.rs:38-57`），不单独验收；`TERM=dumb` 时跳过 `VISUAL` 的 Git 规则（有意差异：`var` 报告 `resolve_editor` 的实际结果，`commit`/`tag` 编辑器启动同样不看 `TERM`）；`-l` 中的编辑器行（`PM-25` 的 `-l` 全表）；`GIT_PAGER`（`PM-25`）。
 **Current evidence:**
@@ -1793,7 +1793,7 @@ PY
 ### Task PM-36: 完善 `libra var` 的 `GIT_SEQUENCE_EDITOR`（#995；自 PM-22 拆出）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-23：`var` 新增 `GIT_SEQUENCE_EDITOR`，复用 `editor::resolve_sequence_editor`（`GIT_SEQUENCE_EDITOR` > `sequence.editor` > 编辑器解析）+ 同一终端回落；AC1–AC5 由 `command::var_test::var_sequence_editor_variable` 覆盖；`var -l` 现列出 4 行（身份 2 行 + 编辑器 2 行），全表仍由 PM-25 承接；与 PM-22 同批提交）
 **Description:** 自 `PM-22` 拆出：`libra var GIT_SEQUENCE_EDITOR` 复用 `src/command/editor.rs` 的 `resolve_sequence_editor`（`GIT_SEQUENCE_EDITOR` > `sequence.editor` > `GIT_EDITOR` 的解析结果）；全部未配置时与 `GIT_EDITOR` 的回落规则一致。
 **Out of scope:** `GIT_EDITOR` 本身（`PM-22`）；未配置且 `TERM=dumb` 的回落（与 `TERM` 未设置同一分支，`PM-22` AC6 已覆盖 `GIT_EDITOR` 的该分支，不单独验收）；`-l` 中的序列编辑器行（`PM-25`）。
 **Current evidence:**

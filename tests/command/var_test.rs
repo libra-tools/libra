@@ -185,22 +185,29 @@ fn var_author_ident_uses_author_env() {
 }
 
 #[test]
-fn var_list_reports_both_idents_in_order() {
+fn var_list_orders_supported_variables() {
     let repo = init_identity_repo();
-    // AC3: exactly two NAME=value lines, in Git's order.
+    // The identities stay first and in order; the editor rows follow (they are
+    // skipped when TERM is unusable, so this asserts the prefix, not the count).
     let out = run_libra_command_with_env(&["var", "-l"], repo.path(), &[("TZ", TX)]);
-    assert_cli_success(&out, "AC3 libra var -l");
+    assert_cli_success(&out, "libra var -l");
     let text = String::from_utf8_lossy(&out.stdout).to_string();
     let lines: Vec<&str> = text.lines().collect();
-    assert_eq!(lines.len(), 2, "AC3 line count: {text}");
+    assert!(lines.len() >= 2, "line count: {text}");
     assert!(
         lines[0].starts_with("GIT_COMMITTER_IDENT=C O Mitter <c@d> "),
-        "AC3 first line: {text}"
+        "first line: {text}"
     );
     assert!(
         lines[1].starts_with("GIT_AUTHOR_IDENT=C O Mitter <c@d> "),
-        "AC3 second line: {text}"
+        "second line: {text}"
     );
+    for line in &lines[2..] {
+        assert!(
+            line.starts_with("GIT_EDITOR=") || line.starts_with("GIT_SEQUENCE_EDITOR="),
+            "unexpected listing row: {line}"
+        );
+    }
 }
 
 #[test]
@@ -253,4 +260,94 @@ fn var_json_and_missing_identity() {
         String::from_utf8_lossy(&out.stderr).contains("LBR-AUTH-001"),
         "AC7 code"
     );
+}
+
+#[test]
+fn var_editor_variable() {
+    let repo = init_identity_repo();
+    let set = |key: &str, value: &str| {
+        assert_cli_success(
+            &run_libra_command(&["config", "set", key, value], repo.path()),
+            "config set",
+        );
+    };
+    let unset = |key: &str| {
+        let _ = run_libra_command(&["config", "unset", key], repo.path());
+    };
+    let var = |envs: &[(&'static str, &'static str)]| {
+        run_libra_command_with_env(&["var", "GIT_EDITOR"], repo.path(), envs)
+    };
+
+    // AC1: GIT_EDITOR wins over core.editor.
+    set("core.editor", "emacs");
+    let out = var(&[("GIT_EDITOR", "nano"), ("TERM", "xterm")]);
+    assert_cli_success(&out, "AC1");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "nano\n", "AC1");
+
+    // AC2: core.editor is used when GIT_EDITOR is unset.
+    let out = var(&[("TERM", "xterm")]);
+    assert_cli_success(&out, "AC2");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "emacs\n", "AC2");
+    unset("core.editor");
+
+    // AC3: VISUAL precedes EDITOR.
+    let out = var(&[("TERM", "xterm"), ("VISUAL", "vim"), ("EDITOR", "ed")]);
+    assert_cli_success(&out, "AC3");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "vim\n", "AC3");
+
+    // AC4: with nothing configured, a usable TERM falls back to vi.
+    let out = var(&[("TERM", "xterm")]);
+    assert_cli_success(&out, "AC4");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "vi\n", "AC4");
+
+    // AC5/AC6: an unusable TERM exits 1 with empty stdout.
+    for envs in [&[][..], &[("TERM", "dumb")][..]] {
+        let out = var(envs);
+        assert_eq!(out.status.code(), Some(1), "AC5/6 exit");
+        assert!(out.stdout.is_empty(), "AC5/6 stdout");
+    }
+}
+
+#[test]
+fn var_sequence_editor_variable() {
+    let repo = init_identity_repo();
+    let set = |key: &str, value: &str| {
+        assert_cli_success(
+            &run_libra_command(&["config", "set", key, value], repo.path()),
+            "config set",
+        );
+    };
+    let unset = |key: &str| {
+        let _ = run_libra_command(&["config", "unset", key], repo.path());
+    };
+    let var = |envs: &[(&'static str, &'static str)]| {
+        run_libra_command_with_env(&["var", "GIT_SEQUENCE_EDITOR"], repo.path(), envs)
+    };
+
+    // AC1: GIT_SEQUENCE_EDITOR wins over sequence.editor.
+    set("sequence.editor", "other");
+    let out = var(&[("GIT_SEQUENCE_EDITOR", "seq"), ("TERM", "xterm")]);
+    assert_cli_success(&out, "AC1");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "seq\n", "AC1");
+
+    // AC2: sequence.editor is used when the variable is unset.
+    let out = var(&[("TERM", "xterm")]);
+    assert_cli_success(&out, "AC2");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "other\n", "AC2");
+    unset("sequence.editor");
+
+    // AC3: the sequence chain falls back to the resolved editor.
+    let out = var(&[("GIT_EDITOR", "nano"), ("TERM", "xterm")]);
+    assert_cli_success(&out, "AC3");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "nano\n", "AC3");
+
+    // AC4: neither configured and TERM is usable -> vi.
+    let out = var(&[("TERM", "xterm")]);
+    assert_cli_success(&out, "AC4");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "vi\n", "AC4");
+
+    // AC5: no TERM -> exit 1, no output.
+    let out = var(&[]);
+    assert_eq!(out.status.code(), Some(1), "AC5 exit");
+    assert!(out.stdout.is_empty(), "AC5 stdout");
 }

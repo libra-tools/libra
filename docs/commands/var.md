@@ -49,6 +49,13 @@ and extra arguments are `LBR-CLI-002`; a missing identity is `LBR-AUTH-001`; the
 command needs a repository (`LBR-REPO-001` outside one, an intentional
 difference from Git).
 
+`GIT_EDITOR` reports the editor `libra commit` would launch: `GIT_EDITOR` >
+`core.editor` > `VISUAL` > `EDITOR`. With none of them set, a usable `TERM`
+(`TERM` set and not `dumb`) prints `vi`; otherwise the command exits 1 with no
+stdout. `GIT_SEQUENCE_EDITOR` reports the `rebase -i` chain first
+(`GIT_SEQUENCE_EDITOR` > `sequence.editor`, then the `GIT_EDITOR` resolution) and
+uses the same terminal fallback.
+
 ## Options
 
 | Option | Description |

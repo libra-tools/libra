@@ -26,3 +26,11 @@
 - `command::var_test::var_list_reports_both_idents_in_order` (AC3)
 - `command::var_test::var_rejects_unknown_and_missing_repo` (AC4/AC5)
 - `command::var_test::var_json_and_missing_identity` (AC6/AC7)
+- 2026-11-23 (PM-22 / #995): `GIT_EDITOR` reuses `editor::resolve_editor`
+  (`GIT_EDITOR` > `core.editor` > `VISUAL` > `EDITOR`) plus Git's terminal
+  fallback (`vi` for a usable `TERM`, otherwise exit 1/empty). Tests:
+  `var_editor_variable` (AC1–AC6).
+- 2026-11-23 (PM-36 / #995): `GIT_SEQUENCE_EDITOR` reuses
+  `editor::resolve_sequence_editor` and the same fallback. Tests:
+  `var_sequence_editor_variable` (AC1–AC5). `var -l` now lists four rows; the
+  full Git table is still PM-25.

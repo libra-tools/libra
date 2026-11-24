@@ -36,10 +36,20 @@ struct VarOutput {
     value: String,
 }
 
+#[derive(Clone, Copy)]
+enum VarKind {
+    Author,
+    Committer,
+    Editor,
+    SequenceEditor,
+}
+
 /// Variables this command understands, in Git's `var -l` order.
-const SUPPORTED: [(&str, SignatureType); 2] = [
-    ("GIT_COMMITTER_IDENT", SignatureType::Committer),
-    ("GIT_AUTHOR_IDENT", SignatureType::Author),
+const SUPPORTED: [(&str, VarKind); 4] = [
+    ("GIT_COMMITTER_IDENT", VarKind::Committer),
+    ("GIT_AUTHOR_IDENT", VarKind::Author),
+    ("GIT_EDITOR", VarKind::Editor),
+    ("GIT_SEQUENCE_EDITOR", VarKind::SequenceEditor),
 ];
 
 pub async fn execute(args: VarArgs) -> Result<(), String> {
@@ -56,7 +66,7 @@ pub async fn execute_safe(args: VarArgs, output: &OutputConfig) -> CliResult<()>
         for (name, kind) in SUPPORTED {
             // Git's `var -l` skips variables it cannot resolve; the same applies
             // here so an unset identity does not make the listing fail.
-            if let Ok(value) = ident_value(kind).await {
+            if let Ok(value) = variable_value(kind).await {
                 variables.push(VarOutput {
                     name: name.to_string(),
                     value,
@@ -93,7 +103,7 @@ pub async fn execute_safe(args: VarArgs, output: &OutputConfig) -> CliResult<()>
         ))
         .with_stable_code(StableErrorCode::CliInvalidArguments));
     };
-    let value = ident_value(kind).await?;
+    let value = variable_value(kind).await?;
     let result = VarOutput { name, value };
     if output.is_json() {
         return emit_json_data("var", &result, output);
@@ -101,10 +111,49 @@ pub async fn execute_safe(args: VarArgs, output: &OutputConfig) -> CliResult<()>
     write_var_output(&format!("{}\n", result.value))
 }
 
+/// Resolve one supported variable; the identity kinds reuse the commit
+/// signature resolvers, the editor kinds reuse the editor resolvers.
+async fn variable_value(kind: VarKind) -> CliResult<String> {
+    match kind {
+        VarKind::Author | VarKind::Committer => ident_value(kind).await,
+        VarKind::Editor => editor_value().await,
+        VarKind::SequenceEditor => sequence_editor_value().await,
+    }
+}
+
+/// `GIT_EDITOR`: `GIT_EDITOR` > `core.editor` > `VISUAL` > `EDITOR`, then Git's
+/// fallback (`vi` when `TERM` is usable, otherwise exit 1 with no output).
+async fn editor_value() -> CliResult<String> {
+    if let Some(editor) = crate::command::editor::resolve_editor().await {
+        return Ok(editor);
+    }
+    fallback_editor()
+}
+
+/// `GIT_SEQUENCE_EDITOR`: the `rebase -i` chain (`GIT_SEQUENCE_EDITOR` >
+/// `sequence.editor` > the editor resolution), then Git's terminal fallback.
+async fn sequence_editor_value() -> CliResult<String> {
+    if let Some(editor) = crate::command::editor::resolve_sequence_editor().await {
+        return Ok(editor);
+    }
+    fallback_editor()
+}
+
+fn fallback_editor() -> CliResult<String> {
+    match std::env::var("TERM") {
+        Ok(term) if term != "dumb" => Ok("vi".to_string()),
+        _ => Err(CliError::silent_exit(1)),
+    }
+}
+
 /// Build `Name <email> <unix-ts> <±hhmm>` from the same signature resolvers
 /// `libra commit` uses, so `var` reports exactly what a commit would write.
-async fn ident_value(kind: SignatureType) -> CliResult<String> {
-    let (signature, _) = if matches!(kind, SignatureType::Author) {
+async fn ident_value(kind: VarKind) -> CliResult<String> {
+    let signature_kind = match kind {
+        VarKind::Author => SignatureType::Author,
+        _ => SignatureType::Committer,
+    };
+    let (signature, _) = if matches!(signature_kind, SignatureType::Author) {
         crate::command::commit::create_author_signature().await
     } else {
         crate::command::commit::create_committer_signature().await
