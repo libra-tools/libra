@@ -1077,12 +1077,33 @@ async fn run_cherry_pick(
         return Err(CherryPickError::UnmergedIndex(unmerged));
     }
 
+    // SA-02: expand `<A>..<B>` into the commits reachable from B but not from A,
+    // oldest first (Git's `rev-list --reverse A..B` for linear history). Every
+    // expanded commit carries its own label so a later stop never indexes the
+    // original (shorter) argument list.
     let mut commit_ids = Vec::new();
+    let mut labels: Vec<String> = Vec::new();
     for commit_ref in &args.commits {
-        let id = resolve_commit(commit_ref)
-            .await
-            .map_err(|_| CherryPickError::InvalidCommit(commit_ref.clone()))?;
-        commit_ids.push(id);
+        if let Some((from, to)) = commit_ref.split_once("..")
+            && !commit_ref.contains("...")
+        {
+            let expanded = expand_revision_range(from, to)
+                .await
+                .map_err(|_| CherryPickError::InvalidCommit(commit_ref.clone()))?;
+            for id in expanded {
+                commit_ids.push(id);
+                labels.push(id.to_string());
+            }
+        } else {
+            let id = resolve_commit(commit_ref)
+                .await
+                .map_err(|_| CherryPickError::InvalidCommit(commit_ref.clone()))?;
+            commit_ids.push(id);
+            labels.push(commit_ref.clone());
+        }
+    }
+    if commit_ids.is_empty() {
+        return Err(CherryPickError::InvalidCommit(args.commits.join(" ")));
     }
 
     // Anchors for sequencer persistence if a commit-per-pick conflict occurs.
@@ -1147,7 +1168,7 @@ async fn run_cherry_pick(
                 // Earlier picks already landed (ADR-HF-04 U14). A commit-per-pick
                 // run stops at this commit with its state saved, so `--continue`
                 // re-attempts it once the file is moved.
-                let label = args.commits[i].clone();
+                let label = labels[i].clone();
                 if args.no_commit {
                     return Err(CherryPickError::UntrackedOverwrite {
                         commit: label,
@@ -1203,7 +1224,7 @@ async fn run_cherry_pick(
                 return Err(CherryPickError::RedundantCommit(c));
             }
             Err(CherryPickSingleError::Conflicted(paths)) => {
-                let label = args.commits[i].clone();
+                let label = labels[i].clone();
                 if args.no_commit {
                     // `--no-commit` sequences have no per-step snapshot, so a
                     // conflict is terminal: no resumable state is written.
@@ -1252,7 +1273,7 @@ async fn run_cherry_pick(
                         ))
                     })?;
                 }
-                return Err(map_single_error(other, &args.commits[i]));
+                return Err(map_single_error(other, &labels[i]));
             }
         }
     }
@@ -3058,6 +3079,55 @@ fn path_to_utf8(path: &Path) -> Result<&str, CherryPickSingleError> {
     path.to_str().ok_or_else(|| {
         CherryPickSingleError::LoadObject(format!("invalid path encoding: {}", path.display()))
     })
+}
+
+/// Commits reachable from `to` but not from `from`, oldest first. Linear
+/// histories match `rev-list --reverse <from>..<to>`; merges are walked through
+/// both parents (their own pick then reports the existing merge diagnostic).
+async fn expand_revision_range(
+    from: &str,
+    to: &str,
+) -> Result<Vec<ObjectHash>, CherryPickSingleError> {
+    use std::collections::HashSet;
+
+    let excluded_tip = resolve_commit(from)
+        .await
+        .map_err(CherryPickSingleError::LoadObject)?;
+    let include_tip = resolve_commit(to)
+        .await
+        .map_err(CherryPickSingleError::LoadObject)?;
+
+    let mut excluded = HashSet::new();
+    let mut stack = vec![excluded_tip];
+    while let Some(id) = stack.pop() {
+        if !excluded.insert(id) {
+            continue;
+        }
+        let commit: Commit = load_object(&id).map_err(|error| {
+            CherryPickSingleError::LoadObject(format!("failed to load commit {id}: {error}"))
+        })?;
+        for parent in &commit.parent_commit_ids {
+            stack.push(*parent);
+        }
+    }
+
+    let mut included = Vec::new();
+    let mut seen = HashSet::new();
+    let mut stack = vec![include_tip];
+    while let Some(id) = stack.pop() {
+        if excluded.contains(&id) || !seen.insert(id) {
+            continue;
+        }
+        included.push(id);
+        let commit: Commit = load_object(&id).map_err(|error| {
+            CherryPickSingleError::LoadObject(format!("failed to load commit {id}: {error}"))
+        })?;
+        for parent in &commit.parent_commit_ids {
+            stack.push(*parent);
+        }
+    }
+    included.reverse();
+    Ok(included)
 }
 
 async fn resolve_commit(reference: &str) -> Result<ObjectHash, String> {

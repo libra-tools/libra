@@ -47,6 +47,12 @@ A stopped pick does not outlive the working tree it stopped in: a later reset en
 
 Worktree materialization is mode-aware (plan issues/470 FM-02): files are created with the entry mode's permission bits (`100755` -> `0777`, `100644` -> `0666`) under the process `umask`, replaced atomically through a same-directory temp file, and the index/tree entries keep the mode (`100755`/`100644`/`120000`).
 
+`<A>..<B>` is accepted as a commit range: it expands to the commits reachable
+from `B` but not from `A` (oldest first, Git's `rev-list --reverse A..B` for
+linear history) and is replayed as a sequence. A stop inside the range reports
+the expanded commit, and `--continue` finalizes the resolved index as that
+commit. `A...B` and other revision syntaxes remain unsupported.
+
 ## Options
 
 When `core.sparseCheckout=true` this command fails closed with `LBR-UNSUPPORTED-001`: it would rewrite the working tree (or the index/stash) around the whole tree instead of the sparse view (sparse cone materialisation is not implemented yet).

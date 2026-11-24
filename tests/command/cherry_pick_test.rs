@@ -4953,3 +4953,153 @@ fn cherry_pick_keep_redundant_rejected_with_controls_tc0426() {
         );
     }
 }
+
+/// SA-02: `<A>..<B>` expands to a commit sequence; a mid-range conflict stop
+/// records the expanded commit and `--continue` finalizes it.
+#[test]
+fn cherry_pick_range_conflict_stop_then_continue() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    assert_cli_success(&run_libra_command(&["switch", "-c", "side"], p), "side");
+    std::fs::write(p.join("f"), "1\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "f"], p), "add f");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "A", "--no-verify"], p),
+        "A",
+    );
+    let a = cp_rev_parse(p, "HEAD");
+    std::fs::write(p.join("b"), "b\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "b"], p), "add b");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "B", "--no-verify"], p),
+        "B",
+    );
+    let b = cp_rev_parse(p, "HEAD");
+    std::fs::write(p.join("f"), "2\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "f"], p), "add f2");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "C", "--no-verify"], p),
+        "C",
+    );
+    let c = cp_rev_parse(p, "HEAD");
+    assert_cli_success(&run_libra_command(&["switch", "main"], p), "main");
+    let t = cp_rev_parse(p, "HEAD");
+
+    // AC1: the conflict stop reports normally (no out-of-bounds panic).
+    let range = format!("{a}..{c}");
+    let out = run_libra_command(&["cherry-pick", &range], p);
+    assert!(!out.status.success(), "AC1 must fail");
+    let (_human, report) = parse_cli_error_stderr(&out.stderr);
+    assert_eq!(report.error_code, "LBR-CONFLICT-001", "AC1 code");
+
+    // AC2–AC4: resolve, continue, verify the resolved tree landed as C.
+    std::fs::write(p.join("f"), "2\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "f"], p), "resolve");
+    let resolved_tree = String::from_utf8_lossy(&run_libra_command(&["write-tree"], p).stdout)
+        .trim()
+        .to_string();
+    assert_cli_success(
+        &run_libra_command(&["cherry-pick", "--continue"], p),
+        "AC2 continue",
+    );
+    let head_tree =
+        String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD^{tree}"], p).stdout)
+            .trim()
+            .to_string();
+    assert_eq!(head_tree, resolved_tree, "AC4 resolved tree");
+    let revs = run_libra_command(&["rev-list", "--reverse", &format!("{t}..HEAD")], p);
+    assert_cli_success(&revs, "AC3 rev-list");
+    let mut subjects = Vec::new();
+    for oid in String::from_utf8_lossy(&revs.stdout).lines() {
+        let shown = run_libra_command(&["show", "--no-patch", "--pretty=format:%s", oid], p);
+        assert_cli_success(&shown, "AC3 show");
+        subjects.push(String::from_utf8_lossy(&shown.stdout).trim().to_string());
+    }
+    assert_eq!(
+        subjects,
+        vec!["B".to_string(), "C".to_string()],
+        "AC3 sequence"
+    );
+    let _ = b;
+    // AC5: the sequence state is released.
+    let repo_path = p.to_path_buf();
+    assert!(
+        sequence_current_oid(&repo_path).is_none(),
+        "AC5 state released"
+    );
+}
+
+/// SA-02: a later range commit that overwrites an untracked file stops on the
+/// expanded commit (labels must not index the original argument list).
+#[test]
+fn cherry_pick_range_later_untracked_overwrite_stops_cleanly() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    assert_cli_success(&run_libra_command(&["switch", "-c", "side"], p), "side");
+    std::fs::write(p.join("f"), "1\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "f"], p), "add f");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "A", "--no-verify"], p),
+        "A",
+    );
+    let a = cp_rev_parse(p, "HEAD");
+    std::fs::write(p.join("b"), "b\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "b"], p), "add b");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "B", "--no-verify"], p),
+        "B",
+    );
+    std::fs::write(p.join("u.txt"), "from-c\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "u.txt"], p), "add u");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "C", "--no-verify"], p),
+        "C",
+    );
+    let c = cp_rev_parse(p, "HEAD");
+    assert_cli_success(&run_libra_command(&["switch", "main"], p), "main");
+    std::fs::write(p.join("u.txt"), "local-unique\n").unwrap();
+    let before = String::from_utf8_lossy(&run_libra_command(&["hash-object", "u.txt"], p).stdout)
+        .trim()
+        .to_string();
+
+    let range = format!("{a}..{c}");
+    let out = run_libra_command(&["cherry-pick", &range], p);
+    assert!(!out.status.success(), "AC6 must fail");
+    let (_human, report) = parse_cli_error_stderr(&out.stderr);
+    assert_eq!(report.error_code, "LBR-CONFLICT-001", "AC6 code");
+    let after = String::from_utf8_lossy(&run_libra_command(&["hash-object", "u.txt"], p).stdout)
+        .trim()
+        .to_string();
+    assert_eq!(after, before, "AC7 untracked bytes");
+    let repo_path = p.to_path_buf();
+    assert_eq!(
+        sequence_current_oid(&repo_path).as_deref(),
+        Some(c.as_str()),
+        "AC8 stop at C"
+    );
+}
+
+/// Read `sequence_state.current_oid` for a cherry-pick row (tests only).
+fn sequence_current_oid(repo: &std::path::Path) -> Option<String> {
+    use sea_orm::{ConnectOptions, ConnectionTrait, Database, Statement};
+    let url = format!(
+        "sqlite://{}",
+        repo.join(".libra").join("libra.db").display()
+    );
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    runtime.block_on(async {
+        let mut opts = ConnectOptions::new(url);
+        opts.sqlx_logging(false);
+        let conn = Database::connect(opts).await.expect("connect");
+        let row = conn
+            .query_one_raw(Statement::from_string(
+                sea_orm::DatabaseBackend::Sqlite,
+                "SELECT current_oid FROM sequence_state WHERE kind = 'cherry_pick' LIMIT 1"
+                    .to_string(),
+            ))
+            .await
+            .expect("query sequence_state");
+        conn.close().await.ok();
+        row.and_then(|row| row.try_get::<String>("", "current_oid").ok())
+    })
+}
