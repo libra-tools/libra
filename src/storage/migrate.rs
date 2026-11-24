@@ -27,6 +27,9 @@
 //!     active external writers or `DELETE`-mode readers (`LBR-IO-001` on busy)
 //!   - `PRAGMA synchronous = FULL;` (verified `== 2` while holding `EXCLUSIVE`).
 
+// libc stat field widths differ across targets, so these casts are portable.
+#![allow(clippy::unnecessary_cast, clippy::useless_conversion)]
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsString,

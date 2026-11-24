@@ -234,7 +234,12 @@ fn add_accepts_case_renamed_tracked_directory_alias() {
                 .collect()
         })
         .unwrap_or_default();
-    assert!(!unstaged_new.contains(&"Slides/".to_string()), "{json}");
+    assert!(
+        !unstaged_new
+            .iter()
+            .any(|candidate| candidate.as_str() == "Slides/"),
+        "{json}"
+    );
 }
 
 #[test]

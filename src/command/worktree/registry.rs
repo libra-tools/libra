@@ -1,5 +1,8 @@
 //! Worktree registry schema, parsing, read/write paths, and state invariants.
 
+// Test module placement is kept for readability in this file.
+#![allow(clippy::items_after_test_module)]
+
 use std::{
     fs, io,
     path::{Path, PathBuf},

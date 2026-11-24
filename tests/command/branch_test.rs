@@ -3231,7 +3231,9 @@ async fn test_branch_list_refname_order_and_verbose_alignment_matrix() {
     assert_cli_success(&remotes, "V6 -r");
     let remotes_out = String::from_utf8_lossy(&remotes.stdout);
     assert!(
-        list_plain_names(&remotes_out).contains(&"origin/main".to_string()),
+        list_plain_names(&remotes_out)
+            .iter()
+            .any(|candidate| candidate.as_str() == "origin/main"),
         "V6 -r omits remotes/: {remotes_out}"
     );
     assert!(

@@ -5489,7 +5489,10 @@ fn capture_spool_doctor_reports_queue_counts_in_text_and_json() {
         "envelope bytes leaked: {json_text}"
     );
     assert!(
-        !json_text.contains(&repo.repo.display().to_string()),
+        !{
+            let needle = repo.repo.display().to_string();
+            json_text.contains(&needle)
+        },
         "doctor JSON must not carry an absolute queue path: {json_text}"
     );
 
@@ -5610,7 +5613,10 @@ fn capture_spool_doctor_names_the_capture_database_when_it_cannot_open_it() {
     assert!(damaged_text.contains("damaged"), "{damaged_text}");
     assert!(!damaged_text.contains("newer Libra"), "{damaged_text}");
     assert!(
-        !damaged_text.contains(&repo.repo.display().to_string()),
+        !{
+            let needle = repo.repo.display().to_string();
+            damaged_text.contains(&needle)
+        },
         "{damaged_text}"
     );
 }

@@ -207,11 +207,15 @@ async fn worktree_doctor_reports_scope_diagnostics() {
     // Neither workspace is in the worktree registry (no `worktree add` ran),
     // so both report the missing owner entry — that IS the finding.
     assert!(
-        codes(&healthy_item).contains(&"registry_entry_missing".to_string()),
+        codes(&healthy_item)
+            .iter()
+            .any(|candidate| candidate.as_str() == "registry_entry_missing"),
         "{healthy_item}"
     );
     assert!(
-        !codes(&healthy_item).contains(&"lease_expired".to_string()),
+        !codes(&healthy_item)
+            .iter()
+            .any(|candidate| candidate.as_str() == "lease_expired"),
         "a live lease must not be reported as expired: {healthy_item}"
     );
 
@@ -224,7 +228,7 @@ async fn worktree_doctor_reports_scope_diagnostics() {
         "registry_entry_missing",
     ] {
         assert!(
-            broken_codes.contains(&expected.to_string()),
+            broken_codes.iter().any(|candidate| candidate == expected),
             "missing {expected} in {broken_item}"
         );
     }

@@ -1000,11 +1000,17 @@ fn test_rev_list_objects_skips_gitlinks() {
     assert_cli_success(&out, "rev-list --objects on a tree with a gitlink");
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert!(
-        stdout.contains(&blob_oid.to_string()),
+        {
+            let needle = blob_oid.to_string();
+            stdout.contains(&needle)
+        },
         "the sibling blob is listed: {stdout}"
     );
     assert!(
-        !stdout.contains(&gitlink_oid.to_string()),
+        !{
+            let needle = gitlink_oid.to_string();
+            stdout.contains(&needle)
+        },
         "the gitlink/submodule pointer is omitted: {stdout}"
     );
 }

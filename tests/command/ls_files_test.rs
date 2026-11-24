@@ -764,7 +764,9 @@ fn modified_and_deleted_short_flags_alias_long_forms() {
         "-m must match --modified"
     );
     assert!(
-        stdout_lines(&m_short).contains(&"tracked.txt".to_string()),
+        stdout_lines(&m_short)
+            .iter()
+            .any(|candidate| candidate.as_str() == "tracked.txt"),
         "-m lists the modified file: {:?}",
         stdout_lines(&m_short)
     );
@@ -780,7 +782,9 @@ fn modified_and_deleted_short_flags_alias_long_forms() {
         "-d must match --deleted"
     );
     assert!(
-        stdout_lines(&d_short).contains(&"delete.txt".to_string()),
+        stdout_lines(&d_short)
+            .iter()
+            .any(|candidate| candidate.as_str() == "delete.txt"),
         "-d lists the deleted file: {:?}",
         stdout_lines(&d_short)
     );

@@ -621,8 +621,16 @@ async fn agent_session_commit_dao_is_idempotent_and_rolls_back_failed_batch() {
         .unwrap();
     let remaining = agent_sessions_for_commit(&conn, sha1).await.unwrap();
     assert_eq!(remaining.len(), 62);
-    assert!(remaining.contains(&"codex__one".to_string()));
-    assert!(!remaining.contains(&"codex__two".to_string()));
+    assert!(
+        remaining
+            .iter()
+            .any(|candidate| candidate.as_str() == "codex__one")
+    );
+    assert!(
+        !remaining
+            .iter()
+            .any(|candidate| candidate.as_str() == "codex__two")
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -8230,7 +8238,7 @@ async fn symbolic_ref_migration_upgrade_contract() {
             _ => fixture.system_db(),
         };
         if !path.exists() {
-            std::fs::File::create(&path).expect("materialize config db file");
+            std::fs::File::create(path).expect("materialize config db file");
         }
         let guard = db::establish_connection_for_role(path.to_str().unwrap(), role)
             .await

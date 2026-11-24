@@ -395,7 +395,10 @@ fn grok_updates_oversized_source_is_refused() {
     match error {
         GrokUpdatesError::Refused { reason, .. } => {
             assert!(
-                reason.contains(&TRANSCRIPT_READ_HARD_CAP_BYTES.to_string()),
+                {
+                    let needle = TRANSCRIPT_READ_HARD_CAP_BYTES.to_string();
+                    reason.contains(&needle)
+                },
                 "reason should name the cap, got {reason}"
             );
         }
@@ -1001,9 +1004,21 @@ fn grok_hook_precompact_and_shrink_keep_captured_thoughts() {
     );
     assert!(again.complete);
     let thoughts = stored_thoughts(state.path(), "sess-keep");
-    assert!(thoughts.contains(&"alpha".to_string()));
-    assert!(thoughts.contains(&"gamma".to_string()));
-    assert!(thoughts.contains(&"beta".to_string()));
+    assert!(
+        thoughts
+            .iter()
+            .any(|candidate| candidate.as_str() == "alpha")
+    );
+    assert!(
+        thoughts
+            .iter()
+            .any(|candidate| candidate.as_str() == "gamma")
+    );
+    assert!(
+        thoughts
+            .iter()
+            .any(|candidate| candidate.as_str() == "beta")
+    );
     let before = thoughts.len();
     let mut repeated = fs::read_to_string(&updates).expect("current");
     repeated.push_str(&thought_line("e3", "p", "beta-again", "t"));

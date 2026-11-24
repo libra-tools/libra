@@ -1864,9 +1864,9 @@ mod tests {
             &[],
         );
 
-        assert!(args.contains(&"--unshare-all".to_string()));
-        assert!(args.contains(&"--unshare-net".to_string()));
-        assert!(!args.contains(&"--share-net".to_string()));
+        assert!(args.iter().any(|arg| arg == "--unshare-all"));
+        assert!(args.iter().any(|arg| arg == "--unshare-net"));
+        assert!(!args.iter().any(|arg| arg == "--share-net"));
         assert_option_value(&args, "--tmpfs", "/tmp");
     }
 
@@ -1958,8 +1958,8 @@ mod tests {
             &[],
         );
 
-        assert!(args.contains(&"--share-net".to_string()));
-        assert!(!args.contains(&"--unshare-net".to_string()));
+        assert!(args.iter().any(|arg| arg == "--share-net"));
+        assert!(!args.iter().any(|arg| arg == "--unshare-net"));
     }
 
     #[test]
@@ -1987,8 +1987,8 @@ mod tests {
             &[],
         );
 
-        assert!(args.contains(&"--share-net".to_string()));
-        assert!(!args.contains(&"--unshare-net".to_string()));
+        assert!(args.iter().any(|arg| arg == "--share-net"));
+        assert!(!args.iter().any(|arg| arg == "--unshare-net"));
     }
 
     #[test]
@@ -2003,8 +2003,8 @@ mod tests {
             &[],
         );
 
-        assert!(args.contains(&"--new-session".to_string()));
-        assert!(args.contains(&"--die-with-parent".to_string()));
+        assert!(args.iter().any(|arg| arg == "--new-session"));
+        assert!(args.iter().any(|arg| arg == "--die-with-parent"));
     }
 
     // Linux-only for the same `/tmp`-symlink reason as

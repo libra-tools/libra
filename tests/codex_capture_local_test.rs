@@ -7673,7 +7673,10 @@ fn cx01_doctor_distinguishes_managed_configuration_states_without_writing() {
         assert!(!text.contains("CX01-DOCTOR-HASH-CANARY"));
         assert!(!text.contains("CX01-DOCTOR-COMMAND-CANARY"));
         assert!(!text.contains("sha256:"));
-        assert!(!text.contains(&hooks_path.to_string_lossy().to_string()));
+        assert!(!{
+            let needle = hooks_path.to_string_lossy().to_string();
+            text.contains(&needle)
+        });
         assert_eq!(
             std::fs::read(&hooks_path).unwrap(),
             hooks_bytes,

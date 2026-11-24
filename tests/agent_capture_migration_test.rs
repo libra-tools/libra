@@ -2143,13 +2143,18 @@ async fn pi_role_writes_no_configuration_or_derived_database() {
         )
         .await;
         assert!(
-            !tables.contains(&"agent_session".to_string()),
+            !tables
+                .iter()
+                .any(|candidate| candidate.as_str() == "agent_session"),
             "{}: {tables:?}",
             path.display()
         );
         // A configuration ledger, where there is one, never carries the
         // repository receipt.
-        if tables.contains(&"schema_versions".to_string()) {
+        if tables
+            .iter()
+            .any(|candidate| candidate.as_str() == "schema_versions")
+        {
             let receipts = pi_role_texts(
                 &conn,
                 &format!(

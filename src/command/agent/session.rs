@@ -5,6 +5,9 @@
 //! `--show-redacted-prompt` is not a flag. A dry-run cannot print a prompt
 //! body in human output or JSON, because that subcommand is not restored.
 
+// Test module placement is kept for readability in this file.
+#![allow(clippy::items_after_test_module)]
+
 use std::{
     io::{Read, Write},
     path::Path,

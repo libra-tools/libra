@@ -6,6 +6,9 @@
 //! digest of the canonical serialization, and both are pinned by the
 //! `episode_identity_golden` test so any rule change is an intentional bump.
 
+// The TryFrom<&str> impls are public API and must stay for compatibility.
+#![allow(clippy::try_from_instead_of_from_str)]
+
 use std::fmt;
 
 use serde::{Deserialize, Serialize};

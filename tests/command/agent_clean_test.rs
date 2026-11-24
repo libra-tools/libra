@@ -799,7 +799,10 @@ async fn agent_clean_refuses_while_traces_write_marker_is_live() {
         "refusal must name the blocking marker's session and attempt, stderr: {stderr}"
     );
     assert!(
-        stderr.contains(&AGENT_TRACES_INFLIGHT_TTL_MS.to_string()),
+        {
+            let needle = AGENT_TRACES_INFLIGHT_TTL_MS.to_string();
+            stderr.contains(&needle)
+        },
         "refusal must state the marker TTL, stderr: {stderr}"
     );
 

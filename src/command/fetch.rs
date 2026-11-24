@@ -6917,9 +6917,9 @@ mod tests {
             .into_iter()
             .map(|plan| plan.destination)
             .collect();
-        assert!(dests.contains(&"refs/heads/main".to_string()));
-        assert!(dests.contains(&"refs/mr/1".to_string()));
-        assert!(dests.contains(&"refs/notes/commits".to_string()));
+        assert!(dests.iter().any(|dest| dest == "refs/heads/main"));
+        assert!(dests.iter().any(|dest| dest == "refs/mr/1"));
+        assert!(dests.iter().any(|dest| dest == "refs/notes/commits"));
         assert!(!dests.iter().any(|dest| dest.starts_with("refs/tags/")));
         assert!(!dests.iter().any(|dest| dest == "HEAD"));
     }

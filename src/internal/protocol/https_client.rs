@@ -1010,20 +1010,23 @@ mod tests {
         assert!(
             discovery
                 .capabilities
-                .contains(&"symref=HEAD:refs/heads/main".to_string()),
+                .iter()
+                .any(|cap| cap == "symref=HEAD:refs/heads/main"),
             "derived symref capability: {:?}",
             discovery.capabilities
         );
         assert!(
             discovery
                 .capabilities
-                .contains(&"fetch=shallow wait-for-done".to_string()),
+                .iter()
+                .any(|cap| cap == "fetch=shallow wait-for-done"),
             "advertised capabilities are preserved"
         );
         assert!(
             discovery
                 .capabilities
-                .contains(&"ls-refs=unborn".to_string()),
+                .iter()
+                .any(|cap| cap == "ls-refs=unborn"),
             "advertised capabilities are preserved"
         );
 
@@ -1058,7 +1061,8 @@ mod tests {
         assert!(
             discovery
                 .capabilities
-                .contains(&"symref=HEAD:refs/heads/main".to_string()),
+                .iter()
+                .any(|cap| cap == "symref=HEAD:refs/heads/main"),
             "v0 capabilities stay untouched: {:?}",
             discovery.capabilities
         );

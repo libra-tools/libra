@@ -725,8 +725,14 @@ async fn test_remote_set_url_add_appends_fetch_url() {
         .map(|e| e.value)
         .collect();
     assert_eq!(urls.len(), 2, "should have two fetch urls after --add");
-    assert!(urls.contains(&"https://example.com/repo.git".to_string()));
-    assert!(urls.contains(&"https://mirror.example.com/repo.git".to_string()));
+    assert!(
+        urls.iter()
+            .any(|candidate| candidate.as_str() == "https://example.com/repo.git")
+    );
+    assert!(
+        urls.iter()
+            .any(|candidate| candidate.as_str() == "https://mirror.example.com/repo.git")
+    );
 }
 
 #[tokio::test]
@@ -2067,8 +2073,16 @@ async fn test_remote_set_branches_add_appends() {
 
     let specs = fetch_refspecs().await;
     assert_eq!(specs.len(), 2, "specs: {specs:?}");
-    assert!(specs.contains(&"+refs/heads/main:refs/remotes/origin/main".to_string()));
-    assert!(specs.contains(&"+refs/heads/dev:refs/remotes/origin/dev".to_string()));
+    assert!(
+        specs
+            .iter()
+            .any(|candidate| candidate.as_str() == "+refs/heads/main:refs/remotes/origin/main")
+    );
+    assert!(
+        specs
+            .iter()
+            .any(|candidate| candidate.as_str() == "+refs/heads/dev:refs/remotes/origin/dev")
+    );
 }
 
 #[tokio::test]

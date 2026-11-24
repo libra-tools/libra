@@ -9176,29 +9176,55 @@ fn extraction_oracle_fingerprint(relative_path: &str, oracle: &str) -> (Vec<Stri
             let (label, text) = match item {
                 syn::Item::Fn(function)
                     if function.sig.ident != oracle
-                        && names.contains(&function.sig.ident.to_string()) =>
+                        && names
+                            .iter()
+                            .any(|candidate| candidate == &function.sig.ident.to_string()) =>
                 {
                     (
                         format!("fn {}", function.sig.ident),
                         span_token_text(&source, function.span()),
                     )
                 }
-                syn::Item::Const(constant) if names.contains(&constant.ident.to_string()) => (
-                    format!("const {}", constant.ident),
-                    span_token_text(&source, constant.span()),
-                ),
-                syn::Item::Static(value) if names.contains(&value.ident.to_string()) => (
-                    format!("static {}", value.ident),
-                    span_token_text(&source, value.span()),
-                ),
-                syn::Item::Struct(value) if names.contains(&value.ident.to_string()) => (
-                    format!("struct {}", value.ident),
-                    span_token_text(&source, value.span()),
-                ),
-                syn::Item::Enum(value) if names.contains(&value.ident.to_string()) => (
-                    format!("enum {}", value.ident),
-                    span_token_text(&source, value.span()),
-                ),
+                syn::Item::Const(constant)
+                    if names
+                        .iter()
+                        .any(|candidate| candidate == &constant.ident.to_string()) =>
+                {
+                    (
+                        format!("const {}", constant.ident),
+                        span_token_text(&source, constant.span()),
+                    )
+                }
+                syn::Item::Static(value)
+                    if names
+                        .iter()
+                        .any(|candidate| candidate == &value.ident.to_string()) =>
+                {
+                    (
+                        format!("static {}", value.ident),
+                        span_token_text(&source, value.span()),
+                    )
+                }
+                syn::Item::Struct(value)
+                    if names
+                        .iter()
+                        .any(|candidate| candidate == &value.ident.to_string()) =>
+                {
+                    (
+                        format!("struct {}", value.ident),
+                        span_token_text(&source, value.span()),
+                    )
+                }
+                syn::Item::Enum(value)
+                    if names
+                        .iter()
+                        .any(|candidate| candidate == &value.ident.to_string()) =>
+                {
+                    (
+                        format!("enum {}", value.ident),
+                        span_token_text(&source, value.span()),
+                    )
+                }
                 syn::Item::Impl(implementation) if implementation.trait_.is_none() => {
                     let self_type = match implementation.self_ty.as_ref() {
                         syn::Type::Path(path) => syn_path_text(&path.path),
@@ -10486,7 +10512,8 @@ fn reasoning_import_dto_cannot_mint_opaque() {
     assert!(
         rogue
             .events
-            .contains(&"constructor:NativeReasoningProof".to_string())
+            .iter()
+            .any(|candidate| candidate.as_str() == "constructor:NativeReasoningProof")
     );
 }
 

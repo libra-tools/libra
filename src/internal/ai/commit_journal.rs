@@ -762,7 +762,7 @@ mod tests {
         assert!(
             remaining
                 .iter()
-                .all(|record| !record.session_ids.contains(&"codex_erased".to_string()))
+                .all(|record| !record.session_ids.iter().any(|id| id == "codex_erased"))
         );
         OpenOptions::new()
             .append(true)

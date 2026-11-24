@@ -8,6 +8,9 @@
 //! Castagnoli CRC32C) is strictly a non-authoritative mirror refreshed after
 //! each committed `CaptureStore::append_capture_batch` transaction.
 
+// libc stat field widths differ across targets, so these conversions are portable.
+#![allow(clippy::useless_conversion)]
+
 use std::{
     fs::File,
     io,
@@ -15,6 +18,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use super::is_eftype_errno;
 use crate::storage::{
     capture_store::{CaptureQueueHighwater, CaptureQueueLane, CaptureStore},
     error::{StorageBackendError, StorageResult},
@@ -337,7 +341,7 @@ mod unix_hw {
         if code == libc::ELOOP {
             return true;
         }
-        if code == libc::EMLINK || code == libc::EFTYPE || code == libc::ENOTDIR {
+        if code == libc::EMLINK || is_eftype_errno(code) || code == libc::ENOTDIR {
             let mut st = std::mem::MaybeUninit::<libc::stat>::zeroed();
             // SAFETY: `dir_fd` is valid and `cname` is NUL-terminated.
             let rc = unsafe {
@@ -364,7 +368,7 @@ mod unix_hw {
         if code == libc::ELOOP {
             return true;
         }
-        if code == libc::EMLINK || code == libc::EFTYPE || code == libc::ENOTDIR {
+        if code == libc::EMLINK || is_eftype_errno(code) || code == libc::ENOTDIR {
             return std::fs::symlink_metadata(path)
                 .map(|m| m.file_type().is_symlink())
                 .unwrap_or(false);

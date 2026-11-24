@@ -96,7 +96,10 @@ async fn test_show_ref_lists_branch() {
         "expected refs/heads/main in output, got: {stdout}"
     );
     assert!(
-        stdout.contains(&head_commit.to_string()),
+        {
+            let needle = head_commit.to_string();
+            stdout.contains(&needle)
+        },
         "expected commit hash in output, got: {stdout}"
     );
 }
@@ -403,7 +406,10 @@ async fn test_show_ref_includes_head() {
         "expected HEAD in first line, got: {first_line}"
     );
     assert!(
-        first_line.contains(&head_commit.to_string()),
+        {
+            let needle = head_commit.to_string();
+            first_line.contains(&needle)
+        },
         "expected commit hash in HEAD line, got: {first_line}"
     );
 }
@@ -426,7 +432,10 @@ async fn test_show_ref_hash_only() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains(&head_commit.to_string()),
+        {
+            let needle = head_commit.to_string();
+            stdout.contains(&needle)
+        },
         "expected hash {}, got: {stdout}",
         head_commit
     );

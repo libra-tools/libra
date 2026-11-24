@@ -107,7 +107,7 @@ pub async fn execute_safe(args: VarArgs, output: &OutputConfig) -> CliResult<()>
     let Some(kind) = SUPPORTED
         .iter()
         .find(|(supported, _)| *supported == name)
-        .map(|(_, kind)| kind.clone())
+        .map(|(_, kind)| *kind)
     else {
         return Err(CliError::failure(format!(
             "unknown variable '{name}'; supported variables are GIT_COMMITTER_IDENT and GIT_AUTHOR_IDENT"

@@ -1,3 +1,6 @@
+// Test module placement is kept for readability in this file.
+#![allow(clippy::items_after_test_module)]
+
 use super::*;
 use crate::internal::ai::history::{
     ReasoningArtifactCheckpointProof, ReasoningArtifactCheckpointSpec,

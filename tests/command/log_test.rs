@@ -6269,8 +6269,16 @@ fn test_log_grep_pattern_types_matrix() {
     // G3: `a+` is a literal BRE, so nothing matches; `-E` makes it ERE.
     assert!(subjects(&["log", "--format=%s", "--grep", "a+"]).is_empty());
     let extended = subjects(&["log", "--format=%s", "-E", "--grep", "a+"]);
-    assert!(extended.contains(&"foo.bar aaa".to_string()));
-    assert!(extended.contains(&"fooXbar".to_string()));
+    assert!(
+        extended
+            .iter()
+            .any(|candidate| candidate.as_str() == "foo.bar aaa")
+    );
+    assert!(
+        extended
+            .iter()
+            .any(|candidate| candidate.as_str() == "fooXbar")
+    );
     // G4: fixed strings bypass the regex engine.
     assert_eq!(
         subjects(&["log", "--format=%s", "-F", "--grep", "foo.bar"]),
@@ -6288,8 +6296,16 @@ fn test_log_grep_pattern_types_matrix() {
     );
     // G5: explicit basic dialect and the Perl dialect (LG-14 engine).
     let basic = subjects(&["log", "--format=%s", "--basic-regexp", "--grep", r"a\+"]);
-    assert!(basic.contains(&"foo.bar aaa".to_string()));
-    assert!(basic.contains(&"fooXbar".to_string()));
+    assert!(
+        basic
+            .iter()
+            .any(|candidate| candidate.as_str() == "foo.bar aaa")
+    );
+    assert!(
+        basic
+            .iter()
+            .any(|candidate| candidate.as_str() == "fooXbar")
+    );
     let perl = run_libra_command(&["log", "--grep", "a{2,}", "-P", "--format=%s", "HEAD"], p);
     assert_cli_success(&perl, "log -P --grep");
     let perl_text = String::from_utf8_lossy(&perl.stdout);
@@ -6308,8 +6324,11 @@ fn test_log_grep_pattern_types_matrix() {
         vec!["foo.bar aaa"]
     );
     let any = subjects(&["log", "--format=%s", "--grep", "foo", "--grep", "aaa"]);
-    assert!(any.contains(&"foo.bar aaa".to_string()));
-    assert!(any.contains(&"fooXbar".to_string()));
+    assert!(
+        any.iter()
+            .any(|candidate| candidate.as_str() == "foo.bar aaa")
+    );
+    assert!(any.iter().any(|candidate| candidate.as_str() == "fooXbar"));
     // G10: an invalid BRE is a CLI usage error naming the pattern.
     let invalid = run_libra_command(&["log", "--grep", r"a\(", "HEAD"], p);
     assert_eq!(invalid.status.code(), Some(129));

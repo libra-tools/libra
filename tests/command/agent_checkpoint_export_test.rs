@@ -103,7 +103,13 @@ async fn erased_session_hides_reasoning_refs_and_gc_prevents_export() {
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         );
-        assert!(!wire.contains(&sha) && !wire.contains(&oid.to_string()));
+        assert!(
+            !wire.contains(&sha)
+                && !{
+                    let needle = oid.to_string();
+                    wire.contains(&needle)
+                }
+        );
         assert!(!wire.contains("reasoning/encrypted/"));
         if args[3] != "show" {
             assert!(out.status.success(), "{wire}");

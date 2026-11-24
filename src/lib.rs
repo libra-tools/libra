@@ -14,6 +14,10 @@
 //! particular, `internal` is an implementation detail and is not a stable
 //! external embedding surface.
 
+// The clap derive macro generates large parsers for the CLI arg structs;
+// they are heap-backed and never recurse, so the framed-size heuristic does
+// not indicate a real stack risk.
+#![allow(clippy::large_unopt_stack_frames)]
 // The bridge dispatcher (`command::agent::bridge`) awaits the full VCS service
 // stack inside one async block, whose type layout nests deeper than rustc's
 // default query depth. Raising the limit is a compile-time-only knob.

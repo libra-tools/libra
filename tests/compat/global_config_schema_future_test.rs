@@ -2537,15 +2537,24 @@ fn assert_schema_future_diagnostic(fixture: &CliFixture, stderr: &str) {
         "missing binary version:\n{stderr}"
     );
     assert!(
-        stderr.contains(&fixture.global_db.display().to_string()),
+        {
+            let needle = fixture.global_db.display().to_string();
+            stderr.contains(&needle)
+        },
         "missing global config db path:\n{stderr}"
     );
     assert!(
-        stderr.contains(&fixture.future_schema_version.to_string()),
+        {
+            let needle = fixture.future_schema_version.to_string();
+            stderr.contains(&needle)
+        },
         "missing future schema version:\n{stderr}"
     );
     assert!(
-        stderr.contains(&fixture.latest_schema_version.to_string()),
+        {
+            let needle = fixture.latest_schema_version.to_string();
+            stderr.contains(&needle)
+        },
         "missing latest supported schema version:\n{stderr}"
     );
     assert!(

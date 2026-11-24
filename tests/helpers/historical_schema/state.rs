@@ -95,13 +95,15 @@ pub(crate) async fn assert_history(conn: &DatabaseConnection, tip: i64) {
     assert_eq!(
         columns(conn, "reference")
             .await
-            .contains(&"worktree_id".to_string()),
+            .iter()
+            .any(|candidate| candidate.as_str() == "worktree_id"),
         tip >= 2026070801
     );
     assert_eq!(
         columns(conn, "agent_usage_stats")
             .await
-            .contains(&"agent_name".to_string()),
+            .iter()
+            .any(|candidate| candidate.as_str() == "agent_name"),
         tip >= 2026050801
     );
     assert_eq!(
@@ -113,7 +115,7 @@ pub(crate) async fn assert_history(conn: &DatabaseConnection, tip: i64) {
     let rebase_columns = columns(conn, "rebase_state").await;
     for column in ["autosquash", "todo_actions", "empty_mode", "worktree_id"] {
         assert_eq!(
-            rebase_columns.contains(&column.to_string()),
+            rebase_columns.iter().any(|candidate| candidate == column),
             tip >= 2026072101,
             "historical rebase column {column}"
         );
@@ -121,7 +123,8 @@ pub(crate) async fn assert_history(conn: &DatabaseConnection, tip: i64) {
     assert!(
         !columns(conn, "agent_session")
             .await
-            .contains(&"workspace_id".to_string()),
+            .iter()
+            .any(|candidate| candidate.as_str() == "workspace_id"),
         "the August capture-scope migration must still be pending"
     );
     assert!(
@@ -155,12 +158,14 @@ pub(crate) async fn assert_current(conn: &DatabaseConnection) {
     assert!(
         columns(conn, "operation")
             .await
-            .contains(&"format_version".to_string())
+            .iter()
+            .any(|candidate| candidate.as_str() == "format_version")
     );
     assert!(
         columns(conn, "agent_session")
             .await
-            .contains(&"workspace_id".to_string()),
+            .iter()
+            .any(|candidate| candidate.as_str() == "workspace_id"),
         "the pending capture-scope migration must actually apply"
     );
     for table in ["operation_head", "operation_journal"] {

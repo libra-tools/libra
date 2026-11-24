@@ -12512,11 +12512,10 @@ mod tests {
         )
         .expect("append normal seed");
 
-        let exact_frame =
-            encode_frame(FRAME_FLAG_PRIORITY, "rb08b-ac1-exact-fit", &vec![b'E'; 128])
-                .expect("encode exact-fit frame");
+        let exact_frame = encode_frame(FRAME_FLAG_PRIORITY, "rb08b-ac1-exact-fit", &[b'E'; 128])
+            .expect("encode exact-fit frame");
         let over_by_one_frame =
-            encode_frame(FRAME_FLAG_PRIORITY, "rb08b-ac1-exact-fit", &vec![b'O'; 129])
+            encode_frame(FRAME_FLAG_PRIORITY, "rb08b-ac1-exact-fit", &[b'O'; 129])
                 .expect("encode over-by-one frame");
         assert_eq!(over_by_one_frame.len(), exact_frame.len() + 1);
 
@@ -12871,8 +12870,8 @@ mod tests {
         // with `LBR-AGENT-046` + zero disk mutation when over cap.
         let sib_repo = tempdir().expect("corrupt sibling tempdir");
         let sib_init = init_capture_queue(sib_repo.path()).expect("init corrupt sibling queue");
-        let sib_f0 = encode_frame(FRAME_FLAG_NONE, "sib-s0", &vec![b'A'; 100]).unwrap();
-        let sib_f1 = encode_frame(FRAME_FLAG_NONE, "sib-s1", &vec![b'B'; 140]).unwrap();
+        let sib_f0 = encode_frame(FRAME_FLAG_NONE, "sib-s0", &[b'A'; 100]).unwrap();
+        let sib_f1 = encode_frame(FRAME_FLAG_NONE, "sib-s1", &[b'B'; 140]).unwrap();
         write_bytes_0600(
             &sib_init.paths.normal.join(segment_log_file_name(0)),
             &sib_f0,
@@ -13532,6 +13531,7 @@ mod tests {
     ///   frame and matches `events-<S+1>[0..committed_len]`.
     /// - AC7: All old frames in sealed segment `S` decode 100% losslessly.
     /// - AC8: All new frames in rotated segment `S + 1` decode 100% losslessly.
+    ///
     /// Also verifies exact `== 16 MiB` stays in `S`, `< 16 MiB` crossing `16 MiB`
     /// seals at exact `< 16 MiB` boundary, standalone `create_segment_file`
     /// invariants, and post-rotation `AfterSegmentSyncData` crash recovery.
@@ -20801,6 +20801,7 @@ mod tests {
         };
         let oversized_bytes = vec![0xEEu8; LTM2_MAX_LEN + 64];
 
+        #[allow(clippy::type_complexity)]
         let case_0d_fixtures: [(&str, Option<&[u8]>, Option<&[u8]>, bool); 8] = [
             (
                 "case-0d-primary-bad-crc-backup-absent",

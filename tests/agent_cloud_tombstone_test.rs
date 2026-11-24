@@ -247,7 +247,10 @@ async fn reasoning_artifact_live_scenario(
         );
         anyhow::ensure!(
             !wire.contains(sha)
-                && !wire.contains(&oid.to_string())
+                && !{
+                    let needle = oid.to_string();
+                    wire.contains(&needle)
+                }
                 && !wire.contains("reasoning/encrypted/")
         );
     }

@@ -129,15 +129,21 @@ async fn test_grep_untracked_searches_untracked_non_ignored_files() {
 
     // Tracked AND untracked (non-ignored) are searched; the ignored file is not.
     assert!(
-        paths.contains(&"tracked.txt".to_string()),
+        paths
+            .iter()
+            .any(|candidate| candidate.as_str() == "tracked.txt"),
         "tracked searched: {paths:?}"
     );
     assert!(
-        paths.contains(&"untracked.txt".to_string()),
+        paths
+            .iter()
+            .any(|candidate| candidate.as_str() == "untracked.txt"),
         "untracked non-ignored searched: {paths:?}"
     );
     assert!(
-        !paths.contains(&"ignored.txt".to_string()),
+        !paths
+            .iter()
+            .any(|candidate| candidate.as_str() == "ignored.txt"),
         "ignored file is not searched: {paths:?}"
     );
 

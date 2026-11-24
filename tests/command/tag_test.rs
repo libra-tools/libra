@@ -125,11 +125,11 @@ fn test_tag_list_filters_by_glob_pattern() {
         .map(|entry| entry["name"].as_str().unwrap_or("").to_string())
         .collect();
     assert!(
-        names.contains(&"v1.0".to_string()),
+        names.iter().any(|candidate| candidate.as_str() == "v1.0"),
         "v1.0 should match the glob 'v1*': {names:?}"
     );
     assert!(
-        !names.contains(&"v2.0".to_string()),
+        !names.iter().any(|candidate| candidate.as_str() == "v2.0"),
         "v2.0 should NOT match the glob 'v1*': {names:?}"
     );
 }
@@ -169,11 +169,11 @@ fn test_tag_contains_filter() {
         .map(|entry| entry["name"].as_str().unwrap_or("").to_string())
         .collect();
     assert!(
-        names.contains(&"v2".to_string()),
+        names.iter().any(|candidate| candidate.as_str() == "v2"),
         "v2 should contain c2: {names:?}"
     );
     assert!(
-        !names.contains(&"v1".to_string()),
+        !names.iter().any(|candidate| candidate.as_str() == "v1"),
         "v1 should NOT contain c2: {names:?}"
     );
 }

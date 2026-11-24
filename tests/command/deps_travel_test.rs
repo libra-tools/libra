@@ -106,11 +106,14 @@ fn fetch_notes_travels_from_local_libra_source_and_is_default_off() {
     cli(&["fetch", "origin", "--notes"], &dest);
     let n = neighbors(&dest, "a.txt");
     assert!(
-        n.contains(&"b.txt".to_string()) && n.contains(&"a[1].txt".to_string()),
+        n.iter().any(|candidate| candidate.as_str() == "b.txt")
+            && n.iter().any(|candidate| candidate.as_str() == "a[1].txt"),
         "fetch --notes must import a.txt's edges, got {n:?}"
     );
     assert!(
-        neighbors(&dest, "b.txt").contains(&"c.txt".to_string()),
+        neighbors(&dest, "b.txt")
+            .iter()
+            .any(|candidate| candidate.as_str() == "c.txt"),
         "transitive edge b.txt -> c.txt must travel too"
     );
 }
@@ -135,12 +138,12 @@ fn clone_deps_of_scopes_view_but_keeps_commit_safe_full_checkout() {
     let view = ls_files(&dest);
     for f in ["a.txt", "b.txt", "c.txt", "a[1].txt"] {
         assert!(
-            view.contains(&f.to_string()),
+            view.iter().any(|candidate| candidate == f),
             "{f} must be in view: {view:?}"
         );
     }
     assert!(
-        !view.contains(&"d.txt".to_string()),
+        !view.iter().any(|candidate| candidate.as_str() == "d.txt"),
         "out-of-closure d.txt must be scoped out of the view: {view:?}"
     );
 
@@ -162,7 +165,7 @@ fn clone_deps_of_scopes_view_but_keeps_commit_safe_full_checkout() {
     cli(&["sparse-view", "disable"], &dest);
     let full = ls_files(&dest);
     assert!(
-        full.contains(&"d.txt".to_string()),
+        full.iter().any(|candidate| candidate.as_str() == "d.txt"),
         "commit must preserve the out-of-closure d.txt (no mass-deletion): {full:?}"
     );
 }
@@ -189,14 +192,17 @@ fn clone_deps_of_depth_limit_scopes_direct_dependencies_only() {
     let dest = wp.join("cloned");
     let view = ls_files(&dest);
     // Direct deps of a.txt: b.txt and a[1].txt. c.txt is depth-2 → excluded.
-    assert!(view.contains(&"a.txt".to_string()));
-    assert!(view.contains(&"b.txt".to_string()));
-    assert!(view.contains(&"a[1].txt".to_string()));
+    assert!(view.iter().any(|candidate| candidate.as_str() == "a.txt"));
+    assert!(view.iter().any(|candidate| candidate.as_str() == "b.txt"));
     assert!(
-        !view.contains(&"c.txt".to_string()),
+        view.iter()
+            .any(|candidate| candidate.as_str() == "a[1].txt")
+    );
+    assert!(
+        !view.iter().any(|candidate| candidate.as_str() == "c.txt"),
         "depth-limit 1 must exclude the transitive c.txt: {view:?}"
     );
-    assert!(!view.contains(&"d.txt".to_string()));
+    assert!(!view.iter().any(|candidate| candidate.as_str() == "d.txt"));
 }
 
 #[test]
@@ -237,11 +243,15 @@ fn fetch_notes_union_merges_and_does_not_clobber_local_edges() {
     // Import the source's edges — the local edge must survive (union, not clobber).
     cli(&["fetch", "origin", "--notes"], &dest);
     assert!(
-        neighbors(&dest, "d.txt").contains(&"a.txt".to_string()),
+        neighbors(&dest, "d.txt")
+            .iter()
+            .any(|candidate| candidate.as_str() == "a.txt"),
         "local edge d.txt -> a.txt must survive the import"
     );
     assert!(
-        neighbors(&dest, "a.txt").contains(&"b.txt".to_string()),
+        neighbors(&dest, "a.txt")
+            .iter()
+            .any(|candidate| candidate.as_str() == "b.txt"),
         "imported edge a.txt -> b.txt must be merged in"
     );
 }

@@ -171,6 +171,7 @@ struct ResolvedDiffFormats {
     numstat: bool,
 }
 
+#[allow(clippy::large_unopt_stack_frames)]
 #[derive(Parser, Debug)]
 #[command(after_help = LOG_EXAMPLES)]
 pub struct LogArgs {

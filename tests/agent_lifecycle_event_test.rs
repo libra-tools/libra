@@ -2896,11 +2896,13 @@ async fn session_start_exempt_allows_second_provider_claim_row() {
     );
     let kinds = agent_kinds(&repo.sessions());
     assert!(
-        kinds.contains(&"claude_code".to_string()),
+        kinds
+            .iter()
+            .any(|candidate| candidate.as_str() == "claude_code"),
         "claude_code claim row must survive the exempt codex SessionStart: {kinds:?}"
     );
     assert!(
-        kinds.contains(&"codex".to_string()),
+        kinds.iter().any(|candidate| candidate.as_str() == "codex"),
         "exempt codex SessionStart must create its own row rather than be silently skipped: {kinds:?}"
     );
 
@@ -10302,7 +10304,10 @@ fn capture_spool_hook_queue_full_fails_with_stable_code() {
     assert!(!stderr.contains("newer Libra"), "{stderr}");
     assert!(!stderr.contains(session), "{stderr}");
     assert!(
-        !stderr.contains(&repo.repo.display().to_string()),
+        !{
+            let needle = repo.repo.display().to_string();
+            stderr.contains(&needle)
+        },
         "{stderr}"
     );
     assert!(repo.ready_files().is_empty());

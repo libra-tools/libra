@@ -1317,35 +1317,33 @@ async fn show_patch(
 ) -> Result<String, CliError> {
     if (args.word_diff.is_some() || args.color_words.is_some() || args.word_diff_regex.is_some())
         && paths.is_empty()
+        && let Some(parent) = commit.parent_commit_ids.first()
     {
-        if let Some(parent) = commit.parent_commit_ids.first() {
-            let mut argv = vec!["diff".to_string()];
-            if let Some(mode) = &args.word_diff {
-                argv.push(format!("--word-diff={mode}"));
-            }
-            if let Some(regex) = &args.word_diff_regex {
-                argv.push(format!("--word-diff-regex={regex}"));
-            }
-            if let Some(regex) = &args.color_words {
-                if regex.is_empty() {
-                    argv.push("--color-words".to_string());
-                } else {
-                    argv.push(format!("--color-words={regex}"));
-                }
-            }
-            argv.push(parent.to_string());
-            argv.push(commit.id.to_string());
-            let diff_args = crate::command::diff::DiffArgs::try_parse_from(&argv)
-                .map_err(|error| CliError::command_usage(error.to_string()))?;
-            let output =
-                crate::command::diff::run_diff_for_service_word_diff(diff_args, color_enabled)
-                    .await?;
-            let mut patch = crate::command::diff::render::format_unified_diff(&output);
-            if !patch.is_empty() && !patch.ends_with('\n') {
-                patch.push('\n');
-            }
-            return Ok(patch);
+        let mut argv = vec!["diff".to_string()];
+        if let Some(mode) = &args.word_diff {
+            argv.push(format!("--word-diff={mode}"));
         }
+        if let Some(regex) = &args.word_diff_regex {
+            argv.push(format!("--word-diff-regex={regex}"));
+        }
+        if let Some(regex) = &args.color_words {
+            if regex.is_empty() {
+                argv.push("--color-words".to_string());
+            } else {
+                argv.push(format!("--color-words={regex}"));
+            }
+        }
+        argv.push(parent.to_string());
+        argv.push(commit.id.to_string());
+        let diff_args = crate::command::diff::DiffArgs::try_parse_from(&argv)
+            .map_err(|error| CliError::command_usage(error.to_string()))?;
+        let output =
+            crate::command::diff::run_diff_for_service_word_diff(diff_args, color_enabled).await?;
+        let mut patch = crate::command::diff::render::format_unified_diff(&output);
+        if !patch.is_empty() && !patch.ends_with('\n') {
+            patch.push('\n');
+        }
+        return Ok(patch);
     }
     // Moved-line colouring is a post-processing step over the rendered patch so
     // it composes with `--word-diff`/`--color-words` exactly like `libra diff`.
@@ -1367,49 +1365,50 @@ async fn show_patch(
     };
     // Commit diffs enable textconv by default; `--no-textconv` opts out. Both go
     // through the diff engine so the filters behave exactly like `libra diff`.
-    if paths.is_empty() {
-        if let Some(parent) = commit.parent_commit_ids.first() {
-            let mut argv = vec!["diff".to_string()];
-            argv.push(if args.no_textconv {
-                "--no-textconv".to_string()
-            } else {
-                "--textconv".to_string()
-            });
-            if let Some(filter) = &args.diff_filter {
-                argv.push(format!("--diff-filter={filter}"));
-            }
-            argv.push(parent.to_string());
-            argv.push(commit.id.to_string());
-            let diff_args = crate::command::diff::DiffArgs::try_parse_from(&argv)
-                .map_err(|error| CliError::command_usage(error.to_string()))?;
-            let output = crate::command::diff::run_diff_for_service(diff_args).await?;
-            let mut patch = crate::command::diff::render::format_unified_diff(&output);
-            if !patch.is_empty() && !patch.ends_with('\n') {
-                patch.push('\n');
-            }
-            return Ok(colorize(patch));
+    if paths.is_empty()
+        && let Some(parent) = commit.parent_commit_ids.first()
+    {
+        let mut argv = vec!["diff".to_string()];
+        argv.push(if args.no_textconv {
+            "--no-textconv".to_string()
+        } else {
+            "--textconv".to_string()
+        });
+        if let Some(filter) = &args.diff_filter {
+            argv.push(format!("--diff-filter={filter}"));
         }
+        argv.push(parent.to_string());
+        argv.push(commit.id.to_string());
+        let diff_args = crate::command::diff::DiffArgs::try_parse_from(&argv)
+            .map_err(|error| CliError::command_usage(error.to_string()))?;
+        let output = crate::command::diff::run_diff_for_service(diff_args).await?;
+        let mut patch = crate::command::diff::render::format_unified_diff(&output);
+        if !patch.is_empty() && !patch.ends_with('\n') {
+            patch.push('\n');
+        }
+        return Ok(colorize(patch));
     }
-    if (args.patience || args.anchored.is_some()) && paths.is_empty() {
-        if let Some(parent) = commit.parent_commit_ids.first() {
-            let mut argv = vec!["diff".to_string()];
-            if args.patience {
-                argv.push("--patience".to_string());
-            }
-            if let Some(text) = &args.anchored {
-                argv.push(format!("--anchored={text}"));
-            }
-            argv.push(parent.to_string());
-            argv.push(commit.id.to_string());
-            let diff_args = crate::command::diff::DiffArgs::try_parse_from(&argv)
-                .map_err(|error| CliError::command_usage(error.to_string()))?;
-            let output = crate::command::diff::run_diff_for_service(diff_args).await?;
-            let mut patch = crate::command::diff::render::format_unified_diff(&output);
-            if !patch.is_empty() && !patch.ends_with('\n') {
-                patch.push('\n');
-            }
-            return Ok(colorize(patch));
+    if (args.patience || args.anchored.is_some())
+        && paths.is_empty()
+        && let Some(parent) = commit.parent_commit_ids.first()
+    {
+        let mut argv = vec!["diff".to_string()];
+        if args.patience {
+            argv.push("--patience".to_string());
         }
+        if let Some(text) = &args.anchored {
+            argv.push(format!("--anchored={text}"));
+        }
+        argv.push(parent.to_string());
+        argv.push(commit.id.to_string());
+        let diff_args = crate::command::diff::DiffArgs::try_parse_from(&argv)
+            .map_err(|error| CliError::command_usage(error.to_string()))?;
+        let output = crate::command::diff::run_diff_for_service(diff_args).await?;
+        let mut patch = crate::command::diff::render::format_unified_diff(&output);
+        if !patch.is_empty() && !patch.ends_with('\n') {
+            patch.push('\n');
+        }
+        return Ok(colorize(patch));
     }
     Ok(colorize(generate_diff(commit, paths).await?))
 }

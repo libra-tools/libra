@@ -821,7 +821,12 @@ async fn subagent_scope_row_persists_linkage_and_is_idempotent() {
         .map(|r| r.try_get_by::<String, _>("scope").unwrap())
         .collect::<Vec<_>>();
     assert!(
-        scopes.contains(&"committed".to_string()) && scopes.contains(&"subagent".to_string()),
+        scopes
+            .iter()
+            .any(|candidate| candidate.as_str() == "committed")
+            && scopes
+                .iter()
+                .any(|candidate| candidate.as_str() == "subagent"),
         "both a committed and a subagent scope row must coexist, got {scopes:?}"
     );
 }

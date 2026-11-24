@@ -8179,7 +8179,7 @@ mod tests {
                 .expect("read journal after raced erasure")
                 .0
                 .iter()
-                .all(|record| !record.session_ids.contains(&"codex_race".to_string())),
+                .all(|record| !record.session_ids.iter().any(|id| id == "codex_race")),
             "raced erasure must remove the already-appended identity"
         );
     }

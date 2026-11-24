@@ -133,7 +133,11 @@ async fn fresh_and_legacy_databases_converge_to_the_same_v2_schema() {
     let fresh_signature = schema_signature(&fresh).await;
     assert!(!fresh_signature.contains_key("operation_view"));
     assert_eq!(fresh_signature["operation"][0], "op_id");
-    assert!(fresh_signature["operation"].contains(&"pre_view_oid".to_string()));
+    assert!(
+        fresh_signature["operation"]
+            .iter()
+            .any(|candidate| candidate.as_str() == "pre_view_oid")
+    );
     assert!(fresh_signature.contains_key("operation_head"));
     assert!(fresh_signature.contains_key("operation_journal"));
     assert!(fresh_signature.contains_key("ai_operation_link"));
@@ -283,7 +287,8 @@ async fn operation_v2_migration_is_forward_only_and_versioned() {
     assert!(
         table_columns(&conn, "operation_parent")
             .await
-            .contains(&"ordinal".to_string())
+            .iter()
+            .any(|candidate| candidate.as_str() == "ordinal")
     );
     let operation_columns = table_columns(&conn, "operation").await;
     for column in [

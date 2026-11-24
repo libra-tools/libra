@@ -840,7 +840,7 @@ impl ConfigKv {
             if let Some(rest) = e.key.strip_prefix("remote.")
                 && let Some((name, suffix)) = rest.rsplit_once('.')
                 && suffix == "url"
-                && !remote_names.contains(&name.to_string())
+                && !remote_names.iter().any(|remote| remote == name)
             {
                 remote_names.push(name.to_string());
             }

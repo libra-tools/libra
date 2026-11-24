@@ -5086,7 +5086,10 @@ fn hermes_source_jsonl_rejects_gateway_outside_cwd_and_symlink() {
             status,
             libra::internal::ai::observed_agents::HermesSourceStatus::Unavailable
         ));
-        assert!(!status.to_string().contains(&real.display().to_string()));
+        {
+            let needle = real.display().to_string();
+            assert!(!status.to_string().contains(&needle));
+        }
     }
 }
 
@@ -5216,7 +5219,10 @@ os._exit(0)
     ));
     assert_eq!(std::fs::read(&db).expect("db readonly"), db_before);
     assert_eq!(std::fs::read(&wal).expect("wal readonly"), wal_before);
-    assert!(!status.to_string().contains(&db.display().to_string()));
+    {
+        let needle = db.display().to_string();
+        assert!(!status.to_string().contains(&needle));
+    }
 }
 
 fn status_text_leaks(message: &libra::internal::ai::observed_agents::HermesMessage) -> bool {

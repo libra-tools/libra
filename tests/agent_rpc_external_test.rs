@@ -70,8 +70,10 @@ fn version_mismatch_is_skipped_with_reason() {
     let err = agent.negotiate_info().unwrap_err();
     let message = err.to_string();
     assert!(
-        message.contains("protocol version 99")
-            && message.contains(&RPC_PROTOCOL_VERSION.to_string()),
+        message.contains("protocol version 99") && {
+            let needle = RPC_PROTOCOL_VERSION.to_string();
+            message.contains(&needle)
+        },
         "mismatch reason names both versions: {message}"
     );
 }

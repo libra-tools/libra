@@ -3314,7 +3314,7 @@ mod test {
             out.chmod_rejected
         );
         assert!(
-            out.modified.contains(&"reg".to_string()),
+            out.modified.iter().any(|entry| entry == "reg"),
             "regular entry is updated in the report: {:?}",
             out.modified
         );

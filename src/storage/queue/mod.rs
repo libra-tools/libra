@@ -41,6 +41,34 @@ use crate::storage::{
     manifest::PRIVATE_SUBDIR,
 };
 
+/// Whether `code` is the BSD/macOS `EFTYPE` errno. Linux has no such errno, so
+/// the check compiles to `false` there instead of referencing `libc::EFTYPE`.
+pub(crate) fn is_eftype_errno(code: i32) -> bool {
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    ))]
+    {
+        code == libc::EFTYPE
+    }
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    )))]
+    {
+        let _ = code;
+        false
+    }
+}
+
 pub mod frame;
 pub mod highwater;
 pub mod segment;
