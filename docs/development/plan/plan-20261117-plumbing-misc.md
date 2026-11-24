@@ -1481,6 +1481,8 @@ PY
 ### Task PM-24: `REL-PM-01` 家族发布点（`notes merge` 状态机：PM-09、PM-29、PM-38、PM-23、PM-39）（#989）
 
 **Task type:** `release`
+**Delivery note (2026-11-23):** the family's website documentation commits (PM-09, PM-23, PM-29, PM-38, PM-39) were already pushed to the backend `cf` branch together with the unrelated `ls-files` sync, before this release point ran. This card therefore re-verifies the deployed pages (the final bytes must equal the last locally committed bytes) instead of performing the first push; any mismatch is fixed by a new locally committed sync and a re-deploy. No other part of the release contract changes.
+
 **Lifecycle / Acceptance:** `pending` / `空`
 **Description:** `REL-PM-01` 唯一发布点：不引入新行为，在包含 `PM-09`、`PM-29`、`PM-38`、`PM-23`、`PM-39` 五张子卡最终提交的树上执行 ER-08 `patch + 1`、版本面同步与工具链刷新 `Cargo.lock`、T-2 全量、`cargo build --release`、签名提交、PR、合并与 `gh release create`（以本卡 release note 作为 `--notes-file`），随后按「文档与网站验收命令」第 8 项的家族规则复核子卡已在后端本地提交的 `notes.en.md`、一次推送并做部署核验。
 **Out of scope:** 任何生产代码或测试改动（发现缺陷时回到对应子卡修复并重跑其门，或按 ER-10 建 `FIX-*`）。
