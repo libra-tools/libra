@@ -117,3 +117,15 @@ fn no_abbrev_parse_order() {
     assert_eq!(args.abbrev, None, "AC5 abbrev cleared");
     assert!(args.no_abbrev, "AC5 no_abbrev active");
 }
+
+/// DESC-07 AC2: pin the commit-ish incompatibility message.
+#[test]
+fn commitish_incompatible_display_pin() {
+    assert_eq!(
+        super::DescribeError::CommitishIncompatible {
+            option: "--dirty".to_string(),
+        }
+        .to_string(),
+        "option '--dirty' and commit-ishes cannot be used together",
+    );
+}

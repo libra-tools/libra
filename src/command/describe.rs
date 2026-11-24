@@ -207,7 +207,14 @@ pub(crate) async fn describe_commit_for_atom(
 }
 
 async fn run_describe(args: DescribeArgs) -> Result<DescribeOutput, DescribeError> {
-    let input = args.commit.unwrap_or_else(|| "HEAD".to_string());
+    // ADR-DESC-01/GAP-DESC-01: `--dirty` is only valid without a commit-ish;
+    // `--contains` is exempt (Git's contains branch never inspects the worktree).
+    if !args.contains && args.commit.is_some() && args.dirty.is_some() {
+        return Err(DescribeError::CommitishIncompatible {
+            option: "--dirty".to_string(),
+        });
+    }
+    let input = args.commit.clone().unwrap_or_else(|| "HEAD".to_string());
     let start_hash = util::get_commit_base_typed(&input)
         .await
         .map_err(DescribeError::from)?;
@@ -365,7 +372,6 @@ async fn run_describe(args: DescribeArgs) -> Result<DescribeOutput, DescribeErro
             &tag_map,
             first_parent,
             exact_match,
-            dirty_mark,
         )
         .await;
     }
@@ -472,7 +478,6 @@ async fn run_describe_contains(
     tag_map: &HashMap<ObjectHash, TagInfo>,
     first_parent: bool,
     exact_match_only: bool,
-    dirty_mark: Option<String>,
 ) -> Result<DescribeOutput, DescribeError> {
     // Under `--exact-match`/`--candidates 0` the only acceptable answer is a tag
     // that points directly at the target — a relative `<tag>~N`/`^M` name is not
@@ -506,7 +511,7 @@ async fn run_describe_contains(
                     dirty: false,
                     dirty_mark: None,
                 };
-                apply_dirty_mark(output, dirty_mark).await
+                Ok(output)
             }
             None => Err(DescribeError::NoExactMatch {
                 commit_id: resolved_commit,
@@ -577,7 +582,7 @@ async fn run_describe_contains(
                 dirty: false,
                 dirty_mark: None,
             };
-            return apply_dirty_mark(output, dirty_mark).await;
+            return Ok(output);
         }
 
         let commit_obj =
@@ -751,6 +756,11 @@ fn describe_cli_error(error: DescribeError) -> CliError {
         DescribeError::InvalidArgument(message) => CliError::command_usage(message)
             .with_stable_code(StableErrorCode::CliInvalidArguments)
             .with_hint("check the --match/--exclude glob syntax."),
+        DescribeError::CommitishIncompatible { option } => CliError::command_usage(format!(
+            "option '{option}' and commit-ishes cannot be used together"
+        ))
+        .with_stable_code(StableErrorCode::CliInvalidArguments)
+        .with_hint(format!("omit '{option}' or the commit-ish.")),
         DescribeError::LoadCommit { commit_id, detail } => {
             CliError::fatal(format!("failed to load commit '{commit_id}': {detail}"))
                 .with_stable_code(StableErrorCode::RepoCorrupt)

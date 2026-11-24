@@ -39,6 +39,8 @@ pub(super) enum DescribeError {
     LongWithAbbrevZero,
     #[error("{0}")]
     InvalidArgument(String),
+    #[error("option '{option}' and commit-ishes cannot be used together")]
+    CommitishIncompatible { option: String },
 }
 
 impl From<CommitBaseError> for DescribeError {

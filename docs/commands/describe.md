@@ -66,6 +66,10 @@ this command.
 | `--long` | Force `tag-N-gHASH` output when a tag describes the target, including `tag-0-gHASH` for exact matches. | Off |
 | `--no-long` | Cancel an earlier `--long` (last one wins). | Off |
 | `--dirty[=<mark>]` | Append a dirty mark when tracked content differs from `HEAD`. | Off, default mark `-dirty` when enabled |
+
+`--dirty` cannot be combined with a `<commit>` argument (exit 129,
+`LBR-CLI-002`). `--contains` accepts `--dirty` but ignores it: the worktree is
+never inspected, so a dirty tree or a corrupt index cannot change its output.
 | `--first-parent` | Follow only the first parent of merge commits when walking history. | Off |
 | `--match <pattern>` | Only consider tags whose name matches the glob (repeatable; OR semantics, wax globs ≤256 chars). | None |
 | `--no-match` | Clear every `--match` given so far; a later `--match` still applies and `--exclude` is unaffected. | Off |

@@ -1521,3 +1521,56 @@ fn misnamed_annotated_tag_no_abbrev_keeps_full_suffix() {
         "AC8 forced full suffix"
     );
 }
+
+/// DESC-07: `--dirty` rejects a commit-ish outside `--contains` and is ignored
+/// (never reads the index) under `--contains`.
+#[test]
+fn dirty_scope_with_commit_and_contains() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    std::fs::write(p.join("f.txt"), "A\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], p), "add f");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "C1", "--no-verify"], p),
+        "C1",
+    );
+    assert_cli_success(&run_libra_command(&["tag", "-m", "v1.0", "v1.0"], p), "tag");
+
+    let out = run_libra_command(&["describe", "--dirty", "HEAD"], p);
+    assert!(!out.status.success(), "AC1 must fail");
+    let (_human, report) = parse_cli_error_stderr(&out.stderr);
+    assert_eq!(report.error_code, "LBR-CLI-002", "AC1");
+
+    let out = run_libra_command(&["describe", "--dirty", "HEAD", "--json"], p);
+    assert!(!out.status.success(), "AC3 must fail");
+    let (_human, report) = parse_cli_error_stderr(&out.stderr);
+    assert_eq!(report.error_code, "LBR-CLI-002", "AC3");
+
+    std::fs::write(p.join("f.txt"), "B\n").unwrap();
+    let out = run_libra_command(&["describe", "--contains", "--dirty", "HEAD"], p);
+    assert_cli_success(&out, "AC4");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "v1.0^0", "AC4");
+
+    let out = run_libra_command(&["describe", "--contains", "--dirty"], p);
+    assert_cli_success(&out, "AC5");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "v1.0^0", "AC5");
+
+    let out = run_libra_command(&["describe", "--dirty"], p);
+    assert_cli_success(&out, "AC8");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "v1.0-dirty",
+        "AC8"
+    );
+
+    // AC6/AC7: a corrupt index must not affect the `--contains` path.
+    let index_backup = std::fs::read(p.join(".libra/index")).unwrap();
+    std::fs::write(p.join(".libra/index"), "garbage\n").unwrap();
+    let out = run_libra_command(&["describe", "--contains", "--dirty", "HEAD"], p);
+    assert_cli_success(&out, "AC6");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "v1.0^0", "AC6");
+    let out = run_libra_command(&["describe", "--contains", "--dirty"], p);
+    assert_cli_success(&out, "AC7");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "v1.0^0", "AC7");
+    std::fs::write(p.join(".libra/index"), index_backup).unwrap();
+}

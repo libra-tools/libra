@@ -1715,7 +1715,7 @@
 
 ### Task DESC-07: `--dirty` 的适用范围：非 `--contains` 拒绝与 `<commit>` 共用，`--contains` 忽略（#802）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空` | **Priority / Selection:** P1；Git 参数校验缺陷 | **Issue:** [#802](https://github.com/libra-tools/libra/issues/802)
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-23：非 `--contains` 路径同时给出 `--dirty` 与 `<commit>` 时 fail-closed，新 `CommitishIncompatible` 变体（`option '<option>' and commit-ishes cannot be used together`，`LBR-CLI-002`）；`--contains`（含默认 HEAD）接受 `--dirty` 但忽略——移除其两条 `apply_dirty_mark` 调用后不再读取工作区/索引，脏工作区或损坏索引下仍输出 `<tag>^0`。AC1/AC3–AC8 由 `describe_test::dirty_scope_with_commit_and_contains` 覆盖，AC2 由 `describe_tests::commitish_incompatible_display_pin` 覆盖；`describe_test`+`describe_long_test` 43/43、`--lib command::describe` 6/6；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计。
 
 **Description:** 对齐 Git `describe.c` 的 `--dirty` 适用范围：非 `--contains` 路径同时给出 `--dirty` 与 `<commit>` 时 fail-closed（新增 `DescribeError::CommitishIncompatible { option }` 变体，映射 `LBR-CLI-002`；消息按 Git 写作 `option '<option>' and commit-ishes cannot be used together`、提示不再复用 `--match/--exclude` glob 文案——文案不设验收判据，失败类判据只看稳定错误码；`DESC-08` 复用该变体）；`--contains` 路径（含 `<commit>` 与默认 `HEAD`）接受 `--dirty`，其输出不受工作区状态影响（含脏检查会失败的状态）且不追加标记；实现方式为去掉 `src/command/describe.rs:427, 496` 的 `apply_dirty_mark` 调用，对齐 pinned `builtin/describe.c:665` 起的 `contains` 分支先行返回（实现指引，验收以 AC4–AC7 的可观测输出为准；GAP-DESC-01 后半）。
 

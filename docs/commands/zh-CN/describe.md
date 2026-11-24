@@ -45,6 +45,8 @@ libra describe [OPTIONS] [COMMIT]
 | `--long` | 即使在精确匹配时也强制 `tag-N-gHASH` 输出（精确匹配输出 `tag-0-gHASH`）。 | 关闭 |
 | `--no-long` | 取消先前的 `--long`（后者生效）。 | 关闭 |
 | `--dirty[=<mark>]` | 当跟踪内容偏离 `HEAD` 时追加 dirty 标记。 | 关闭；启用时默认标记为 `-dirty` |
+
+`--dirty` 不能与 `<commit>` 参数同时使用（退出码 129、`LBR-CLI-002`）。`--contains` 接受 `--dirty` 但忽略它：不读取工作区，因此脏工作区或损坏的索引都不会改变其输出。
 | `--first-parent` | 遍历历史时只跟随合并提交的第一个父。 | 关闭 |
 | `--match <pattern>` | 仅考虑名称匹配该 glob 的标签（可重复；OR 语义，wax glob ≤256 字符）。 | 无 |
 | `--no-match` | 清除此前给出的全部 `--match`；其后新给的 `--match` 仍生效，`--exclude` 不受影响。 | 关闭 |
