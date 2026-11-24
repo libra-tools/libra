@@ -151,6 +151,11 @@ pub const RETIRED_REPOSITORY_SOURCE_TABLES: [&str; 7] = [
     "revert_sequence",
 ];
 
+/// SQLite repository table introduced after the redb export schema. Phase 1
+/// checks that it is empty before exporting the supported repository tables.
+#[cfg(any(test, all(feature = "storage-sqlite", feature = "storage-redb")))]
+pub(crate) const SQLITE_ONLY_SYMBOLIC_REF: &str = "symbolic_ref";
+
 /// Exact count of active persistent Repository source tables (`4 + 7 + 21 + 29 = 61`).
 pub const REPOSITORY_ACTIVE_SOURCE_TABLES_COUNT: usize = 61;
 
@@ -5326,37 +5331,16 @@ mod tests {
             );
         }
 
-        // 4. Exact name-for-name equality against repository baseline:
-        //    `MUTABLE_STATE_OWNERSHIP` (minus 24 capture-only tables and 7 retired tables)
-        //    union the 5 zero-authority `memory_*` projection tables = exact 61!
-        let capture_only: BTreeSet<&str> = [
-            "capture_catalog_copy_receipt",
-            "agent_audit_log",
-            "agent_bridge_checkpoint",
-            "agent_bridge_event",
-            "agent_bridge_link",
-            "agent_bridge_operation",
-            "agent_bridge_session",
-            "agent_capture_cloud_base",
-            "agent_capture_incarnation",
-            "agent_checkpoint",
-            "agent_checkpoint_prune_tombstone",
-            "agent_coverage_claim",
-            "agent_coverage_conflict",
-            "agent_coverage_revision",
-            "agent_export_job",
-            "agent_import_identity",
-            "agent_import_tombstone",
-            "agent_session",
-            "agent_session_commit",
-            "agent_subagent_content_claim",
-            "agent_subagent_content_revision",
-            "agent_subagent_link",
-            "agent_usage_stats",
-            "agent_workspace_scope_audit",
-        ]
-        .into_iter()
-        .collect();
+        // 4. The ownership inventory spans both databases. schema_versions is
+        // shared, while capture's queue bookkeeping lives in capture.db only.
+        use crate::storage::capture_store::{
+            CAPTURE_INTERNAL_META_AND_QUEUE_TABLES, CAPTURE_SOURCE_TABLES,
+        };
+        let capture_only: BTreeSet<&str> = CAPTURE_SOURCE_TABLES
+            .into_iter()
+            .filter(|table| *table != "schema_versions")
+            .chain(CAPTURE_INTERNAL_META_AND_QUEUE_TABLES.iter().copied())
+            .collect();
         let retired_set: BTreeSet<&str> = RETIRED_REPOSITORY_SOURCE_TABLES.into_iter().collect();
         let memory_projection_5: BTreeSet<&str> = [
             "memory_episode",
@@ -5372,7 +5356,11 @@ mod tests {
             crate::internal::mutable_state_ownership::MUTABLE_STATE_OWNERSHIP
                 .iter()
                 .map(|s| s.table)
-                .filter(|t| !capture_only.contains(t) && !retired_set.contains(t))
+                .filter(|t| {
+                    !capture_only.contains(t)
+                        && !retired_set.contains(t)
+                        && *t != SQLITE_ONLY_SYMBOLIC_REF
+                })
                 .collect();
         baseline.extend(memory_projection_5);
 

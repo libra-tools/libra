@@ -3965,6 +3965,25 @@ async fn validate_forward_source_table_inventory(
 ) -> StorageResult<()> {
     let git_tables =
         sqlite_list_user_tables_on_conn(&mut sources.git.conn, DatabaseRole::Repository).await?;
+    use crate::storage::git_state_store::SQLITE_ONLY_SYMBOLIC_REF;
+    if git_tables.contains(SQLITE_ONLY_SYMBOLIC_REF)
+        && sea_orm::sqlx::query("SELECT 1 FROM symbolic_ref LIMIT 1")
+            .fetch_optional(&mut sources.git.conn)
+            .await
+            .map_err(|err| {
+                map_export_sqlite_err(
+                    DatabaseRole::Repository,
+                    SQLITE_ONLY_SYMBOLIC_REF,
+                    "check for symbolic refs before export",
+                    &err,
+                )
+            })?
+            .is_some()
+    {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "forward migration cannot preserve nonempty `symbolic_ref`; keep using SQLite until redb supports symbolic refs".to_string(),
+        });
+    }
     for table in repository_active_source_tables() {
         if ON_DEMAND_REPOSITORY_SOURCE_TABLES.contains(&table) {
             continue;
@@ -27167,6 +27186,42 @@ mod tests {
         }
 
         // --------------------------------------------------------------------
+        // Do not stage an export that would drop live symbolic references.
+        {
+            let dir = tempdir().expect("create symbolic-ref fixture");
+            let storage = dir.path().join(".libra");
+            let git_db = git_sqlite_db_path(&storage);
+            populate_all_61_repository_tables(&git_db).await;
+            let mut conn =
+                SqliteConnection::connect_with(&SqliteConnectOptions::new().filename(&git_db))
+                    .await
+                    .expect("open symbolic-ref fixture");
+            conn.execute("INSERT INTO symbolic_ref(name, target) VALUES ('refs/heads/alias', 'refs/heads/main')")
+                .await
+                .expect("seed symbolic ref");
+            conn.close().await.expect("close symbolic-ref fixture");
+            switch_fixture_db_to_delete_mode(&git_db).await;
+            let before = fs::read(&git_db).expect("snapshot symbolic-ref source");
+            let mut guard = quiesce_forward_repository_phase1(&storage)
+                .await
+                .expect("quiesce symbolic-ref fixture");
+            let err =
+                export_forward_phase1_to_redb_tmp(&mut guard, &storage, INITIAL_STORAGE_GENERATION)
+                    .await
+                    .expect_err("unsupported symbolic refs must survive migration refusal");
+            assert!(
+                err.to_string()
+                    .contains("cannot preserve nonempty `symbolic_ref`")
+            );
+            guard.close().await.expect("close symbolic-ref guard");
+            assert_eq!(
+                fs::read(&git_db).expect("re-read symbolic-ref source"),
+                before
+            );
+            assert!(!git_redb_tmp_path(&storage, 1).exists());
+            assert!(!capture_redb_tmp_path(&storage, 1).exists());
+        }
+
         // Fail-closed required source-table inventory checks (Layout A & C)
         // --------------------------------------------------------------------
         for (case_label, is_layout_c, target_is_capture, drop_table) in [

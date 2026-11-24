@@ -314,8 +314,7 @@ fn check_attr_global_sources_follow_git() {
 /// path or stdin read, and `--all` conflicts with named attributes.
 #[test]
 fn check_attr_rejects_invalid_attribute_names() {
-    use std::io::Write;
-    use std::process::Stdio;
+    use std::{io::Write, process::Stdio};
 
     let repo = tempdir().expect("failed to create repository root");
     init_repo_via_cli(repo.path());

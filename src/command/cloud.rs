@@ -44,6 +44,8 @@ use crate::{
     },
 };
 
+// The proof and serializer regions on either side of the tests are hash-pinned.
+#[allow(clippy::items_after_test_module)]
 mod agent_capture;
 mod coverage;
 mod metadata;

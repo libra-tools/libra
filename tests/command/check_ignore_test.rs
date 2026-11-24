@@ -468,9 +468,7 @@ fn spawn_field_reader(
 /// PM-31: `--stdin` answers each record as soon as it arrives.
 #[test]
 fn check_ignore_stdin_streams_each_line() {
-    use std::io::Write;
-    use std::process::Stdio;
-    use std::time::Duration;
+    use std::{io::Write, process::Stdio, time::Duration};
 
     let repo = stream_repo();
     let mut command =
@@ -508,9 +506,7 @@ fn check_ignore_stdin_streams_each_line() {
 /// PM-31: C quoting on line input, and NUL fields for `-z -v`.
 #[test]
 fn check_ignore_stdin_c_quoting() {
-    use std::io::Write;
-    use std::process::Stdio;
-    use std::time::Duration;
+    use std::{io::Write, process::Stdio, time::Duration};
 
     let repo = stream_repo();
     let stdin_text = "one\n\"a/b/one two\"\n\"a/b/one\\\"three\"\nnot-ignored\n\"a/space dir/x\"\n";

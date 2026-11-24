@@ -5119,7 +5119,7 @@ fn rerere_range_fixture() -> (tempfile::TempDir, String, String, String) {
         &run_libra_command(&["commit", "-m", "foo", "--no-verify"], p),
         "foo",
     );
-    let foo = cp_rev_parse(p, "HEAD");
+    let foo_oid = cp_rev_parse(p, "HEAD");
     std::fs::write(p.join("foo"), "foo-main\n").unwrap();
     assert_cli_success(&run_libra_command(&["add", "foo"], p), "add foo-main");
     assert_cli_success(
@@ -5134,7 +5134,10 @@ fn rerere_range_fixture() -> (tempfile::TempDir, String, String, String) {
         "bar-main",
     );
     let bar_main = cp_rev_parse(p, "HEAD");
-    assert_cli_success(&run_libra_command(&["switch", "-c", "dev", &foo], p), "dev");
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "dev", &foo_oid], p),
+        "dev",
+    );
     std::fs::write(p.join("foo"), "foo-dev\n").unwrap();
     assert_cli_success(&run_libra_command(&["add", "foo"], p), "add foo-dev");
     assert_cli_success(
@@ -5155,7 +5158,7 @@ fn rerere_range_fixture() -> (tempfile::TempDir, String, String, String) {
         &run_libra_command(&["cherry-pick", "--abort"], p),
         "abort recording",
     );
-    (repo, foo, foo_main, bar_main)
+    (repo, foo_oid, foo_main, bar_main)
 }
 
 /// SA-03 AC1–AC3: `--rerere-autoupdate` applies and stages the recorded

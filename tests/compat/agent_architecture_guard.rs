@@ -341,6 +341,8 @@ fn private_capture_identity_has_no_source_opener() {
     // serializer region: catalog reads go through `local_capture_catalog`
     // (`capture.db` after the split) and the traces head through the paired
     // `libra.db`; row shapes and the serialized bytes are unchanged.
+    // RG-05 review of c66cbac35: the serializer region now formats the
+    // ObjectFormatMismatch error. Snapshot and proof bytes are unchanged.
     let (_, cloud) = parse_rust_source("src/command/cloud/agent_capture.rs");
     assert!(matches!(&cloud.items[0], syn::Item::Use(item)
         if matches!(&item.tree, syn::UseTree::Path(path) if path.ident == "super")));
@@ -372,7 +374,7 @@ fn private_capture_identity_has_no_source_opener() {
     let remainder = format!("const AGENT_CAPTURE_LOCAL_PAGE_SIZE{remainder}");
     assert_eq!(
         hex::encode(Sha256::digest(remainder.as_bytes())),
-        "fcb3e5bda4018ebf3ca7e1341b1a7754da4c2c88ca44d1048bff49b4abdf75d6",
+        "0affed3032a44437b966804226b0e9db3d6ffcdb117e9edcee9abe871b307b53",
         "RG-05 cloud serializer edit requires scope and Claude review"
     );
 }

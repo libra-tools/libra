@@ -2,16 +2,20 @@
 //! operation-id idempotency, digest conflict, actor binding, scope
 //! (plan-20260818 LB-05).
 
-use libra::internal::{
-    ai::agent_bridge::{
-        ingress::{BridgeContext, dispatch as ingress_dispatch},
-        mutations::dispatch as mutation_dispatch,
-        protocol::{BridgeRequest, parse_request_line},
-        storage::get_operation_status,
+use libra::{
+    internal::{
+        ai::agent_bridge::{
+            ingress::{BridgeContext, dispatch as ingress_dispatch},
+            mutations::dispatch as mutation_dispatch,
+            protocol::{BridgeRequest, parse_request_line},
+            storage::get_operation_status,
+        },
+        db::migration::run_builtin_migrations,
     },
-    db::migration::run_builtin_migrations,
+    utils::test::{ChangeDirGuard, setup_with_new_libra_in},
 };
 use sea_orm::Database;
+use serial_test::serial;
 
 async fn ctx() -> BridgeContext {
     let conn = Database::connect("sqlite::memory:").await.expect("connect");
@@ -51,7 +55,11 @@ async fn mutation_requires_operation_id() {
 }
 
 #[tokio::test]
+#[serial(cwd)]
 async fn checkpoint_create_is_idempotent_by_operation_id() {
+    let repo = tempfile::tempdir().expect("checkpoint repository");
+    setup_with_new_libra_in(repo.path()).await;
+    let _cwd = ChangeDirGuard::new(repo.path());
     let c = ctx().await;
     open_session(&c, "s1").await;
 
@@ -80,7 +88,11 @@ async fn checkpoint_create_is_idempotent_by_operation_id() {
 }
 
 #[tokio::test]
+#[serial(cwd)]
 async fn mutation_digest_conflict_fails_closed() {
+    let repo = tempfile::tempdir().expect("checkpoint repository");
+    setup_with_new_libra_in(repo.path()).await;
+    let _cwd = ChangeDirGuard::new(repo.path());
     let c = ctx().await;
     open_session(&c, "s1").await;
     mutation_dispatch(
