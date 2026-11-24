@@ -2030,15 +2030,19 @@ async fn cherry_pick_single_commit(
     // `--ff`: when the picked commit is a single-parent direct child of HEAD and
     // no commit-rewriting modifier is set, advance HEAD without replaying or
     // rewriting the commit (no hash drift).
+    let head_commit = Head::current_commit().await;
+    let unborn_ff = parent_count == 0 && head_commit.is_none();
+    let child_ff = parent_count == 1
+        && head_commit
+            .as_ref()
+            .is_some_and(|head| commit_to_pick.parent_commit_ids[0] == *head);
     if args.ff
         && !args.no_commit
         && !args.append_source
         && !args.signoff
         && !args.edit
         && args.mainline.is_none()
-        && parent_count == 1
-        && let Some(head) = Head::current_commit().await
-        && commit_to_pick.parent_commit_ids[0] == head
+        && (unborn_ff || child_ff)
     {
         // ADR-HF-04 U11: the fast-forward goes through `reset --hard`, so refuse
         // an untracked overwrite before that reset rewrites anything.
@@ -2065,6 +2069,28 @@ async fn cherry_pick_single_commit(
             sequencer::save(&row)
                 .await
                 .map_err(CherryPickSingleError::SaveFailed)?;
+        }
+        if unborn_ff {
+            // SA-05: an unborn branch has no ref to reset, so create it at the
+            // target first; the hard reset below then checks out the tree.
+            let Head::Branch(name) = Head::current().await else {
+                return Err(CherryPickSingleError::LoadObject(
+                    "unborn HEAD is not attached to a branch".to_string(),
+                ));
+            };
+            let oid = commit_id.to_string();
+            let branch_exists = crate::internal::branch::Branch::exists_result(&name, None)
+                .await
+                .map_err(|e| CherryPickSingleError::SaveFailed(e.to_string()))?;
+            if branch_exists {
+                crate::internal::branch::Branch::update_branch(&name, &oid, None)
+                    .await
+                    .map_err(|e| CherryPickSingleError::SaveFailed(e.to_string()))?;
+            } else {
+                crate::internal::branch::Branch::create_branch_exclusive(&name, &oid, None, None)
+                    .await
+                    .map_err(|e| CherryPickSingleError::SaveFailed(e.to_string()))?;
+            }
         }
         reset_hard(&commit_id.to_string(), output)
             .await

@@ -105,3 +105,5 @@ single conflict-label helper
 - 2026-11-23（SA-04 / #729）：`create_cherry_pick_commit` 在 `format_commit_msg` 前补齐消息末尾换行（共享消息构建会裁掉它），使同树/同父/同身份与日期且不签名的拣选提交与 Git **OID 一致**；`--ff` 判定逻辑不变（仅目标为 HEAD 唯一直接父提交时快进，root 目标走普通 pick）。回归：`cherry_pick_ff_root_commit_matches_git_oid_tc0512`（AC1 与 git 创建的同一仓库对照 OID、AC2 直接父快进）；`cherry_pick_test` 86/86。
 
 - 2026-11-23（SA-05c / #730）：新增 `UnbornFfStaged` 错误变体（消息与 `LBR-CONFLICT-001` 同既有「本地改动会被覆盖」，提示改为 `nothing was written; the index must be empty before 'libra cherry-pick --ff' can fast-forward an unborn branch`）；`run_cherry_pick` 在解析提交前检查 `args.ff && HEAD unborn && index.tracked_files()` 非空并提前拒绝，拒绝时不写 sequencer 状态。回归：`cherry_pick_unborn_ff_refuses_staged_entries`（AC1–AC6）；`cherry_pick_test` 87/87。
+
+- 2026-11-23（SA-05 / #730）：`--ff` 快进条件扩展为「目标单父且父为 HEAD」或「目标无父且 HEAD unborn」；unborn 情形先按目标创建/更新当前分支引用（`Branch::create_branch_exclusive`/`update_branch`），再走既有 `reset --hard` 检出索引与工作区；未跟踪覆盖检查（`ensure_no_untracked_overwrite`）仍在任何写入之前。unborn 上的非快进 pick、冲突暂停与 `--abort` 保持现状（`DEFER-SA-17`）。回归：`cherry_pick_unborn_ff_root_commit_tc0513`（AC1–AC5）、`cherry_pick_unborn_ff_refuses_untracked_overwrite`（AC6–AC8）；`cherry_pick_test` 89/89。

@@ -60,6 +60,10 @@ positive flag re-enables it). They select the rerere staging policy for every pi
 replayed and (with autoupdate) staged automatically. Neither toggle can be
 combined with `--continue` (`LBR-CLI-002`, naming both options).
 
+On an unborn branch, `--ff` with a parentless (root) target fast-forwards the
+branch to that commit: the branch ref is created at the target, HEAD stays a
+symbolic ref to it, and the index/worktree are checked out without creating a
+new commit. Non-fast-forward picks on an unborn branch are still unsupported.
 On an unborn branch, `--ff` refuses while the index still has staged entries:
 nothing is written (no sequencer state, index and worktree unchanged) and the
 command fails with `LBR-CONFLICT-001` plus a hint that the index must be empty

@@ -5582,3 +5582,100 @@ fn cherry_pick_unborn_ff_refuses_staged_entries() {
         "AC6 hint sequence"
     );
 }
+
+fn unborn_ff_fixture() -> (tempfile::TempDir, String) {
+    let repo = tempdir().expect("repo");
+    init_repo_via_cli(repo.path());
+    configure_identity_via_cli(repo.path());
+    std::fs::write(repo.path().join("file1"), "one\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "file1"], repo.path()), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "first", "--no-verify"], repo.path()),
+        "commit",
+    );
+    let first = cp_rev_parse(repo.path(), "HEAD");
+    assert_cli_success(
+        &run_libra_command(&["switch", "--orphan", "unborn"], repo.path()),
+        "orphan",
+    );
+    assert_cli_success(
+        &run_libra_command(&["rm", "--cached", "-r", "."], repo.path()),
+        "unstage",
+    );
+    let _ = std::fs::remove_file(repo.path().join("file1"));
+    (repo, first)
+}
+
+fn worktree_hashes(repo: &std::path::Path) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(repo).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name == ".libra" || name == ".libra-test-home" || !entry.path().is_file() {
+            continue;
+        }
+        let oid = String::from_utf8_lossy(&run_libra_command(&["hash-object", &name], repo).stdout)
+            .trim()
+            .to_string();
+        out.push((name, oid));
+    }
+    out.sort();
+    out
+}
+
+/// SA-05: `--ff` on an unborn branch fast-forwards to a root commit.
+#[test]
+fn cherry_pick_unborn_ff_root_commit_tc0513() {
+    let (repo, first) = unborn_ff_fixture();
+    let p = repo.path();
+    let out = run_libra_command(&["cherry-pick", "--ff", &first], p);
+    assert_cli_success(&out, "AC1 cherry-pick --ff root");
+    assert_eq!(cp_rev_parse(p, "HEAD"), first, "AC2 no new commit");
+    let symbolic = String::from_utf8_lossy(&run_libra_command(&["symbolic-ref", "HEAD"], p).stdout)
+        .trim()
+        .to_string();
+    assert_eq!(symbolic, "refs/heads/unborn", "AC3 attached branch");
+    let stage =
+        String::from_utf8_lossy(&run_libra_command(&["ls-files", "--stage"], p).stdout).to_string();
+    let tree = String::from_utf8_lossy(&run_libra_command(&["ls-tree", "-r", &first], p).stdout)
+        .to_string();
+    let mut expected_stage = String::new();
+    for line in tree.lines() {
+        let (meta, path) = line.split_once('\t').expect("ls-tree entry");
+        let mut fields = meta.split_whitespace();
+        let mode = fields.next().unwrap();
+        let oid = fields.nth(1).unwrap();
+        expected_stage.push_str(&format!("{mode} {oid} 0\t{path}\n"));
+    }
+    assert_eq!(stage, expected_stage, "AC4 index matches first tree");
+    let mut expected_files: Vec<(String, String)> = tree
+        .lines()
+        .map(|line| {
+            let (meta, path) = line.split_once('\t').unwrap();
+            let oid = meta.split_whitespace().nth(2).unwrap().to_string();
+            (path.to_string(), oid)
+        })
+        .collect();
+    expected_files.sort();
+    assert_eq!(worktree_hashes(p), expected_files, "AC5 worktree checkout");
+}
+
+/// SA-05: the unborn fast-forward refuses to overwrite an untracked file.
+#[test]
+fn cherry_pick_unborn_ff_refuses_untracked_overwrite() {
+    let (repo, first) = unborn_ff_fixture();
+    let p = repo.path();
+    std::fs::write(p.join("file1"), "untracked-diff\n").unwrap();
+    let before = worktree_hashes(p);
+    let out = run_libra_command(&["cherry-pick", "--ff", &first], p);
+    assert!(!out.status.success(), "AC6 must reject");
+    let (_human, report) = parse_cli_error_stderr(&out.stderr);
+    assert_eq!(report.error_code, "LBR-CONFLICT-001", "AC6 code");
+    assert_eq!(worktree_hashes(p), before, "AC7 untracked file intact");
+    assert!(
+        !run_libra_command(&["rev-parse", "HEAD"], p)
+            .status
+            .success(),
+        "AC8 branch stays unborn"
+    );
+}
