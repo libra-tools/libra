@@ -45,6 +45,10 @@ Rebase 状态（剩余和已完成提交列表、原始 HEAD 和目标 base）�
 
 工作树物化按条目 mode 语义执行（plan issues/470 FM-02）：文件按条目权限位创建（`100755`→`0777`、`100644`→`0666`）并受进程 `umask` 约束，经同目录临时文件原子替换；索引/树条目保留 mode（`100755`/`100644`/`120000`）。
 
+## 提交签名
+
+重放提交沿用 `libra commit` 的签名策略：显式 `commit.gpgSign` 优先（`true` 强制 vault OpenPGP 签名，`false` 保持不签名），未设置时按 `vault.signing=true` 签名，两者都未配置时不签名。签名失败会在写入任何对象前中止。`--signoff` 与签名相互独立。
+
 ## 选项
 
 当 `core.sparseCheckout=true` 时本命令以 `LBR-UNSUPPORTED-001` fail-closed：它会围绕整棵树改写工作区（或索引/stash），而不是稀疏视图（稀疏 cone 物化尚未实现）。

@@ -4470,6 +4470,7 @@ async fn run_rebase_continue(output: &OutputConfig) -> Result<RebaseOutput, Reba
                 commit: state.current_head.to_string(),
                 detail,
             },
+            ReplayCommitError::Signing(detail) => RebaseError::CommitSave(detail),
         })?;
         save_object(&new_commit, &new_commit.id)
             .map_err(|e| RebaseError::CommitSave(e.to_string()))?;
@@ -5756,6 +5757,9 @@ async fn replay_commit_with_unified_merge(
         Err(ReplayCommitError::Identity(detail)) => {
             return ReplayResult::internal(ReplayErrorKind::IdentityMissing, detail);
         }
+        Err(ReplayCommitError::Signing(detail)) => {
+            return ReplayResult::internal(ReplayErrorKind::CommitSave, detail);
+        }
         Err(error) => {
             return ReplayResult::internal(ReplayErrorKind::CommitLoad, error.into_detail());
         }
@@ -5824,14 +5828,68 @@ fn restore_replay_index_and_workdir(
 enum ReplayCommitError {
     Identity(String),
     ObjectLoad(String),
+    /// SA-08a: the single signing exit failed (e.g. vault has no unseal key).
+    Signing(String),
 }
 
 impl ReplayCommitError {
     fn into_detail(self) -> String {
         match self {
-            ReplayCommitError::Identity(detail) | ReplayCommitError::ObjectLoad(detail) => detail,
+            ReplayCommitError::Identity(detail)
+            | ReplayCommitError::ObjectLoad(detail)
+            | ReplayCommitError::Signing(detail) => detail,
         }
     }
+}
+
+/// Signing input for a replayed commit: the commit's content WITHOUT any
+/// pre-existing `gpgsig` header, so the single signing exit signs exactly the
+/// bytes it emits (SA-08a).
+struct UnsignedReplayContent {
+    author: git_internal::internal::object::signature::Signature,
+    committer: git_internal::internal::object::signature::Signature,
+    tree_id: ObjectHash,
+    parents: Vec<ObjectHash>,
+    message: String,
+}
+
+/// The single signing exit for replayed commits (ADR-SA-03).
+///
+/// Signing follows `libra commit`: `commit.gpgSign` wins, otherwise an explicit
+/// `vault.signing=true` enables signing, and when neither is configured the
+/// commit is unsigned. A signing failure returns an error before any object is
+/// written (callers persist only after this returns `Ok`).
+async fn finalize_replayed_commit(
+    content: UnsignedReplayContent,
+) -> Result<Commit, ReplayCommitError> {
+    use crate::command::history_config::{CommitSigningPolicy, commit_signing_policy};
+
+    let policy = commit_signing_policy(false)
+        .await
+        .map_err(|error| ReplayCommitError::Signing(error.to_string()))?;
+    let force = matches!(policy, CommitSigningPolicy::Force);
+    let attempt = !matches!(policy, CommitSigningPolicy::Disable);
+    let gpgsig = if attempt {
+        crate::command::commit::vault_sign_commit(
+            &content.tree_id,
+            &content.parents,
+            &content.author,
+            &content.committer,
+            &content.message,
+            force,
+        )
+        .await
+        .map_err(|error| ReplayCommitError::Signing(error.to_string()))?
+    } else {
+        None
+    };
+    Ok(Commit::new(
+        content.author,
+        content.committer,
+        content.tree_id,
+        content.parents,
+        &format_commit_msg(&content.message, gpgsig.as_deref()),
+    ))
 }
 
 /// Build the commit that replaces `original_commit` on the new base.
@@ -5858,6 +5916,18 @@ async fn create_replayed_commit(
         .await
         .map_err(|error| ReplayCommitError::Identity(error.to_string()))?;
     let built = match action {
+        // SA-08a: a plain pick goes through the single signing exit. The
+        // `--signoff` path keeps the legacy shape until SA-08h moves it.
+        RebaseTodoAction::Pick if signoff.is_none() => {
+            let content = UnsignedReplayContent {
+                author: original_commit.author.clone(),
+                committer,
+                tree_id,
+                parents: vec![new_parent_id],
+                message: parse_commit_msg(&original_commit.message).0.to_string(),
+            };
+            return finalize_replayed_commit(content).await;
+        }
         RebaseTodoAction::Pick => Ok(Commit::new(
             original_commit.author.clone(),
             committer,
@@ -6312,5 +6382,71 @@ mod rebuild_index_tests {
         let entry = index.get("vendor", 0).expect("gitlink index entry");
         assert_eq!(entry.mode, 0o160000);
         assert_eq!(entry.hash, gitlink);
+    }
+}
+
+#[cfg(test)]
+mod signing_exit_tests {
+    use git_internal::{hash::ObjectHash, internal::object::types::ObjectType};
+    use tempfile::tempdir;
+
+    use super::{UnsignedReplayContent, finalize_replayed_commit};
+    use crate::utils::test::{ChangeDirGuard, setup_with_new_libra_in};
+
+    fn count_object_files() -> usize {
+        fn walk(dir: &std::path::Path, count: &mut usize) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, count);
+                } else {
+                    *count += 1;
+                }
+            }
+        }
+        let mut count = 0;
+        walk(
+            &crate::utils::util::storage_path().join("objects"),
+            &mut count,
+        );
+        count
+    }
+
+    /// SA-08a AC3/AC4: a signing failure is reported and writes no object.
+    #[tokio::test]
+    #[serial_test::serial(cwd, env)]
+    async fn finalize_replayed_commit_without_unseal_key_writes_nothing() {
+        let repo = tempdir().unwrap();
+        setup_with_new_libra_in(repo.path()).await;
+        let _guard = ChangeDirGuard::new(repo.path());
+        crate::internal::config::ConfigKv::set("vault.signing", "true", false)
+            .await
+            .unwrap();
+
+        let (committer, _) = crate::command::commit::create_committer_signature()
+            .await
+            .unwrap();
+        let author = committer.clone();
+        let tree_id = ObjectHash::from_type_and_data(ObjectType::Tree, &[]);
+        let before = count_object_files();
+        let error = finalize_replayed_commit(UnsignedReplayContent {
+            author,
+            committer,
+            tree_id,
+            parents: Vec::new(),
+            message: "signed replay\n".to_string(),
+        })
+        .await
+        .expect_err("signing must fail without an unseal key");
+        assert!(
+            error
+                .into_detail()
+                .contains("vault signing enabled but no unseal key found"),
+            "AC3 error text"
+        );
+        assert_eq!(count_object_files(), before, "AC4 no new objects");
     }
 }
