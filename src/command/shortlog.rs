@@ -305,7 +305,7 @@ struct ShortlogOutput {
 /// quiet modes, use [`execute_safe`].
 pub async fn execute_to(args: ShortlogArgs, writer: &mut impl Write) -> CliResult<()> {
     require_repo().map_err(|_| CliError::repo_not_found())?;
-    let shortlog_output = run_shortlog(&args, false).await?;
+    let shortlog_output = run_shortlog(&args, false, false).await?;
     render_shortlog_output(&shortlog_output, writer)
 }
 
@@ -401,7 +401,8 @@ pub async fn execute(args: ShortlogArgs) {
 /// [`execute_to`] for formatted output.
 pub async fn execute_safe(args: ShortlogArgs, output: &OutputConfig) -> CliResult<()> {
     require_repo().map_err(|_| CliError::repo_not_found())?;
-    let shortlog_output = run_shortlog(&args, color_enabled_for_output(output)).await?;
+    let shortlog_output =
+        run_shortlog(&args, color_enabled_for_output(output), output.is_json()).await?;
 
     if output.is_json() {
         emit_json_data("shortlog", &shortlog_output, output)?;
@@ -421,7 +422,11 @@ fn color_enabled_for_output(output: &OutputConfig) -> bool {
     }
 }
 
-async fn run_shortlog(args: &ShortlogArgs, color_enabled: bool) -> CliResult<ShortlogOutput> {
+async fn run_shortlog(
+    args: &ShortlogArgs,
+    color_enabled: bool,
+    json_mode: bool,
+) -> CliResult<ShortlogOutput> {
     // Pipe-input mode (matching `git log | git shortlog`): with no explicit
     // revision and a non-interactive stdin that carries data, summarise the
     // piped `git log` output instead of walking the repository. An empty /
@@ -439,7 +444,13 @@ async fn run_shortlog(args: &ShortlogArgs, color_enabled: bool) -> CliResult<Sho
             let group_mode = resolve_group_mode(args)?;
             let wrap = parse_wrap_spec(args.wrap.as_deref())?;
             let commits = parse_shortlog_stdin(&buffer);
-            return Ok(aggregate_shortlog_stdin(args, &group_mode, commits, wrap));
+            return Ok(aggregate_shortlog_stdin(
+                args,
+                &group_mode,
+                commits,
+                wrap,
+                json_mode,
+            ));
         }
     }
 
@@ -484,6 +495,7 @@ async fn run_shortlog(args: &ShortlogArgs, color_enabled: bool) -> CliResult<Sho
         commits,
         wrap,
         color_enabled,
+        json_mode,
     ))
 }
 
@@ -494,6 +506,7 @@ fn aggregate_shortlog(
     commits: Vec<Commit>,
     wrap: Option<(usize, usize, usize)>,
     color_enabled: bool,
+    json_mode: bool,
 ) -> ShortlogOutput {
     let total_commits = commits.len();
     let mut author_map: HashMap<String, AuthorStats> = HashMap::new();
@@ -549,7 +562,7 @@ fn aggregate_shortlog(
         }
     }
 
-    finalize_shortlog(args, author_map, revision, total_commits, wrap)
+    finalize_shortlog(args, author_map, revision, total_commits, wrap, json_mode)
 }
 
 /// Shared tail of aggregation (used by both the repository-walk and the
@@ -562,6 +575,7 @@ fn finalize_shortlog(
     revision: &str,
     total_commits: usize,
     wrap: Option<(usize, usize, usize)>,
+    json_mode: bool,
 ) -> ShortlogOutput {
     let mut authors: Vec<ShortlogAuthor> = author_map
         .into_values()
@@ -577,10 +591,31 @@ fn finalize_shortlog(
         })
         .collect();
 
-    if args.numbered {
-        authors.sort_by_key(|stats| (std::cmp::Reverse(stats.count), stats.name.to_lowercase()));
+    // Human output follows Git: groups are ordered by the FULL key (including
+    // the email under `-e`) with a byte-wise `strcmp` comparison, and `-n` is a
+    // stable count-descending sort. The JSON path keeps the previous
+    // case-insensitive ordering so its payload stays byte-compatible.
+    let full_key = |stats: &ShortlogAuthor| -> String {
+        match &stats.email {
+            Some(email) => format!("{} <{}>", stats.name, email),
+            None => stats.name.clone(),
+        }
+    };
+    if json_mode {
+        if args.numbered {
+            authors
+                .sort_by_key(|stats| (std::cmp::Reverse(stats.count), stats.name.to_lowercase()));
+        } else {
+            authors.sort_by_key(|stats| stats.name.to_lowercase());
+        }
+    } else if args.numbered {
+        authors.sort_by(|a, b| {
+            b.count
+                .cmp(&a.count)
+                .then_with(|| full_key(a).cmp(&full_key(b)))
+        });
     } else {
-        authors.sort_by_key(|stats| stats.name.to_lowercase());
+        authors.sort_by_key(full_key);
     }
 
     // `--min-count` drops low-frequency identities, `--reverse` flips the
@@ -705,6 +740,7 @@ fn aggregate_shortlog_stdin(
     group_mode: &GroupMode,
     commits: Vec<StdinCommit>,
     wrap: Option<(usize, usize, usize)>,
+    json_mode: bool,
 ) -> ShortlogOutput {
     let author_needle = args.author.as_ref().map(|pattern| pattern.to_lowercase());
     let mut author_map: HashMap<String, AuthorStats> = HashMap::new();
@@ -745,41 +781,37 @@ fn aggregate_shortlog_stdin(
         }
     }
 
-    finalize_shortlog(args, author_map, "(standard input)", total_commits, wrap)
+    finalize_shortlog(
+        args,
+        author_map,
+        "(standard input)",
+        total_commits,
+        wrap,
+        json_mode,
+    )
 }
 
 fn render_shortlog_output(output: &ShortlogOutput, writer: &mut impl Write) -> CliResult<()> {
-    let max_count = output
-        .authors
-        .iter()
-        .map(|stats| stats.count)
-        .max()
-        .unwrap_or(0);
-    let width = std::cmp::max(4, max_count.to_string().len());
-
     for stats in &output.authors {
-        if output.email {
-            if !write_shortlog_line(
-                writer,
-                format_args!(
-                    "{:>width$}  {} <{}>",
-                    stats.count,
-                    stats.name,
-                    stats.email.as_deref().unwrap_or(""),
-                    width = width
-                ),
-            )? {
+        let key = if output.email {
+            format!("{} <{}>", stats.name, stats.email.as_deref().unwrap_or(""))
+        } else {
+            stats.name.clone()
+        };
+        if output.summary {
+            // Git's `%6d\t%s`.
+            if !write_shortlog_line(writer, format_args!("{:>6}\t{}", stats.count, key))? {
                 return Ok(());
             }
-        } else if !write_shortlog_line(
-            writer,
-            format_args!("{:>width$}  {}", stats.count, stats.name, width = width),
-        )? {
+            continue;
+        }
+        // Git's `%s (%d):` group header, then newest-first subjects indented by
+        // six spaces, then a blank line after the group.
+        if !write_shortlog_line(writer, format_args!("{key} ({}):", stats.count))? {
             return Ok(());
         }
-
-        if !output.summary {
-            for subject in &stats.subjects {
+        {
+            for subject in stats.subjects.iter().rev() {
                 // A `--format` template may render multiple physical lines; each
                 // is indented independently (a plain subject is always one line,
                 // so this is a no-op for the default path).
@@ -799,6 +831,10 @@ fn render_shortlog_output(output: &ShortlogOutput, writer: &mut impl Write) -> C
                         }
                     }
                 }
+            }
+            // Git terminates every group with one blank line.
+            if !write_shortlog_line(writer, format_args!(""))? {
+                return Ok(());
             }
         }
     }

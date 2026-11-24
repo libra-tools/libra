@@ -381,28 +381,33 @@ async fn test_shortlog_basic() {
     let output = String::from_utf8(buf).unwrap();
 
     // expected output
-    let expected = r#"   1  GUXUE
+    let expected = r#"GUXUE (1):
       Commit_7
-   5  LEAVE
-      Commit_12
-      Commit_11
-      Commit_4
-      Commit_2
+
+LEAVE (5):
       Commit_1
-   1  LENGSA
+      Commit_2
+      Commit_4
+      Commit_11
+      Commit_12
+
+LENGSA (1):
       Commit_8
-   1  MMONK
+
+MMONK (1):
       Commit_10
-   2  SHY
-      Commit_13
+
+SHY (2):
       Commit_5
-   2  SunZo
-      Commit_14
+      Commit_13
+
+SunZo (2):
       Commit_9
+      Commit_14
 "#;
 
-    let out_lines: Vec<_> = output.lines().collect();
-    let exp_lines: Vec<_> = expected.lines().collect();
+    let out_lines: Vec<_> = output.trim_end_matches('\n').lines().collect();
+    let exp_lines: Vec<_> = expected.trim_end_matches('\n').lines().collect();
     assert_eq!(out_lines, exp_lines);
 }
 
@@ -420,28 +425,33 @@ async fn test_shortlog_numbered() {
     shortlog::execute_to(args, &mut buf).await.unwrap();
     let output = String::from_utf8(buf).unwrap();
 
-    let expected = r#"   5  LEAVE
-      Commit_12
-      Commit_11
-      Commit_4
-      Commit_2
+    let expected = r#"LEAVE (5):
       Commit_1
-   2  SHY
-      Commit_13
+      Commit_2
+      Commit_4
+      Commit_11
+      Commit_12
+
+SHY (2):
       Commit_5
-   2  SunZo
-      Commit_14
+      Commit_13
+
+SunZo (2):
       Commit_9
-   1  GUXUE
+      Commit_14
+
+GUXUE (1):
       Commit_7
-   1  LENGSA
+
+LENGSA (1):
       Commit_8
-   1  MMONK
+
+MMONK (1):
       Commit_10
 "#;
 
-    let out_lines: Vec<_> = output.lines().collect();
-    let exp_lines: Vec<_> = expected.lines().collect();
+    let out_lines: Vec<_> = output.trim_end_matches('\n').lines().collect();
+    let exp_lines: Vec<_> = expected.trim_end_matches('\n').lines().collect();
     assert_eq!(out_lines, exp_lines);
 }
 
@@ -459,16 +469,16 @@ async fn test_shortlog_summary() {
     shortlog::execute_to(args, &mut buf).await.unwrap();
     let output = String::from_utf8(buf).unwrap();
 
-    let expected = r#"   1  GUXUE
-   5  LEAVE
-   1  LENGSA
-   1  MMONK
-   2  SHY
-   2  SunZo
+    let expected = r#"     1	GUXUE
+     5	LEAVE
+     1	LENGSA
+     1	MMONK
+     2	SHY
+     2	SunZo
 "#;
 
-    let out_lines: Vec<_> = output.lines().collect();
-    let exp_lines: Vec<_> = expected.lines().collect();
+    let out_lines: Vec<_> = output.trim_end_matches('\n').lines().collect();
+    let exp_lines: Vec<_> = expected.trim_end_matches('\n').lines().collect();
     assert_eq!(out_lines, exp_lines);
 }
 
@@ -486,28 +496,33 @@ async fn test_shortlog_email() {
     shortlog::execute_to(args, &mut buf).await.unwrap();
     let output = String::from_utf8(buf).unwrap();
 
-    let expected = r#"   1  GUXUE <guxue@oa.org>
+    let expected = r#"GUXUE <guxue@oa.org> (1):
       Commit_7
-   5  LEAVE <leave@oa.org>
-      Commit_12
-      Commit_11
-      Commit_4
-      Commit_2
+
+LEAVE <leave@oa.org> (5):
       Commit_1
-   1  LENGSA <lengsa@oa.org>
+      Commit_2
+      Commit_4
+      Commit_11
+      Commit_12
+
+LENGSA <lengsa@oa.org> (1):
       Commit_8
-   1  MMONK <mmonk@oa.org>
+
+MMONK <mmonk@oa.org> (1):
       Commit_10
-   2  SHY <shy@oa.org>
-      Commit_13
+
+SHY <shy@oa.org> (2):
       Commit_5
-   2  SunZo <sunzo@oa.org>
-      Commit_14
+      Commit_13
+
+SunZo <sunzo@oa.org> (2):
       Commit_9
+      Commit_14
 "#;
 
-    let out_lines: Vec<_> = output.lines().collect();
-    let exp_lines: Vec<_> = expected.lines().collect();
+    let out_lines: Vec<_> = output.trim_end_matches('\n').lines().collect();
+    let exp_lines: Vec<_> = expected.trim_end_matches('\n').lines().collect();
     assert_eq!(out_lines, exp_lines);
 }
 
@@ -525,16 +540,16 @@ async fn test_shortlog_combined_flags() {
     shortlog::execute_to(args, &mut buf).await.unwrap();
     let output = String::from_utf8(buf).unwrap();
 
-    let expected = r#"   5  LEAVE
-   2  SHY
-   2  SunZo
-   1  GUXUE
-   1  LENGSA
-   1  MMONK
+    let expected = r#"     5	LEAVE
+     2	SHY
+     2	SunZo
+     1	GUXUE
+     1	LENGSA
+     1	MMONK
 "#;
 
-    let out_lines: Vec<_> = output.lines().collect();
-    let exp_lines: Vec<_> = expected.lines().collect();
+    let out_lines: Vec<_> = output.trim_end_matches('\n').lines().collect();
+    let exp_lines: Vec<_> = expected.trim_end_matches('\n').lines().collect();
     assert_eq!(out_lines, exp_lines);
 
     // test shortlog command with -n -e options
@@ -543,28 +558,33 @@ async fn test_shortlog_combined_flags() {
     shortlog::execute_to(args, &mut buf).await.unwrap();
     let output = String::from_utf8(buf).unwrap();
 
-    let expected = r#"   5  LEAVE <leave@oa.org>
-      Commit_12
-      Commit_11
-      Commit_4
-      Commit_2
+    let expected = r#"LEAVE <leave@oa.org> (5):
       Commit_1
-   2  SHY <shy@oa.org>
-      Commit_13
+      Commit_2
+      Commit_4
+      Commit_11
+      Commit_12
+
+SHY <shy@oa.org> (2):
       Commit_5
-   2  SunZo <sunzo@oa.org>
-      Commit_14
+      Commit_13
+
+SunZo <sunzo@oa.org> (2):
       Commit_9
-   1  GUXUE <guxue@oa.org>
+      Commit_14
+
+GUXUE <guxue@oa.org> (1):
       Commit_7
-   1  LENGSA <lengsa@oa.org>
+
+LENGSA <lengsa@oa.org> (1):
       Commit_8
-   1  MMONK <mmonk@oa.org>
+
+MMONK <mmonk@oa.org> (1):
       Commit_10
 "#;
 
-    let out_lines: Vec<_> = output.lines().collect();
-    let exp_lines: Vec<_> = expected.lines().collect();
+    let out_lines: Vec<_> = output.trim_end_matches('\n').lines().collect();
+    let exp_lines: Vec<_> = expected.trim_end_matches('\n').lines().collect();
     assert_eq!(out_lines, exp_lines);
 
     // test shortlog command with -s -e options
@@ -573,16 +593,16 @@ async fn test_shortlog_combined_flags() {
     shortlog::execute_to(args, &mut buf).await.unwrap();
     let output = String::from_utf8(buf).unwrap();
 
-    let expected = r#"   1  GUXUE <guxue@oa.org>
-   5  LEAVE <leave@oa.org>
-   1  LENGSA <lengsa@oa.org>
-   1  MMONK <mmonk@oa.org>
-   2  SHY <shy@oa.org>
-   2  SunZo <sunzo@oa.org>
+    let expected = r#"     1	GUXUE <guxue@oa.org>
+     5	LEAVE <leave@oa.org>
+     1	LENGSA <lengsa@oa.org>
+     1	MMONK <mmonk@oa.org>
+     2	SHY <shy@oa.org>
+     2	SunZo <sunzo@oa.org>
 "#;
 
-    let out_lines: Vec<_> = output.lines().collect();
-    let exp_lines: Vec<_> = expected.lines().collect();
+    let out_lines: Vec<_> = output.trim_end_matches('\n').lines().collect();
+    let exp_lines: Vec<_> = expected.trim_end_matches('\n').lines().collect();
     assert_eq!(out_lines, exp_lines);
 }
 
@@ -600,18 +620,21 @@ async fn test_shortlog_date_filter() {
     shortlog::execute_to(args, &mut buf).await.unwrap();
     let output = String::from_utf8(buf).unwrap();
 
-    let expected = r#"   2  LEAVE
-      Commit_12
+    let expected = r#"LEAVE (2):
       Commit_11
-   1  MMONK
+      Commit_12
+
+MMONK (1):
       Commit_10
-   1  SHY
+
+SHY (1):
       Commit_13
-   1  SunZo
+
+SunZo (1):
       Commit_14
 "#;
-    let out_lines: Vec<_> = output.lines().collect();
-    let exp_lines: Vec<_> = expected.lines().collect();
+    let out_lines: Vec<_> = output.trim_end_matches('\n').lines().collect();
+    let exp_lines: Vec<_> = expected.trim_end_matches('\n').lines().collect();
     assert_eq!(out_lines, exp_lines);
 
     // test shortlog command with --until option
@@ -620,27 +643,32 @@ async fn test_shortlog_date_filter() {
     shortlog::execute_to(args, &mut buf).await.unwrap();
     let output = String::from_utf8(buf).unwrap();
 
-    let expected = r#"   1  GUXUE
+    let expected = r#"GUXUE (1):
       Commit_7
-   5  LEAVE
-      Commit_12
-      Commit_11
-      Commit_4
-      Commit_2
+
+LEAVE (5):
       Commit_1
-   1  LENGSA
+      Commit_2
+      Commit_4
+      Commit_11
+      Commit_12
+
+LENGSA (1):
       Commit_8
-   1  MMONK
+
+MMONK (1):
       Commit_10
-   2  SHY
-      Commit_13
+
+SHY (2):
       Commit_5
-   1  SunZo
+      Commit_13
+
+SunZo (1):
       Commit_9
 "#;
 
-    let out_lines: Vec<_> = output.lines().collect();
-    let exp_lines: Vec<_> = expected.lines().collect();
+    let out_lines: Vec<_> = output.trim_end_matches('\n').lines().collect();
+    let exp_lines: Vec<_> = expected.trim_end_matches('\n').lines().collect();
     assert_eq!(out_lines, exp_lines);
 
     // test shortlog command with comprehensive options
@@ -658,26 +686,31 @@ async fn test_shortlog_date_filter() {
     shortlog::execute_to(args, &mut buf).await.unwrap();
     let output = String::from_utf8(buf).unwrap();
 
-    let expected = r#"   4  LEAVE <leave@oa.org>
-      Commit_12
-      Commit_11
-      Commit_4
+    let expected = r#"LEAVE <leave@oa.org> (4):
       Commit_2
-   2  SHY <shy@oa.org>
-      Commit_13
+      Commit_4
+      Commit_11
+      Commit_12
+
+SHY <shy@oa.org> (2):
       Commit_5
-   1  GUXUE <guxue@oa.org>
+      Commit_13
+
+GUXUE <guxue@oa.org> (1):
       Commit_7
-   1  LENGSA <lengsa@oa.org>
+
+LENGSA <lengsa@oa.org> (1):
       Commit_8
-   1  MMONK <mmonk@oa.org>
+
+MMONK <mmonk@oa.org> (1):
       Commit_10
-   1  SunZo <sunzo@oa.org>
+
+SunZo <sunzo@oa.org> (1):
       Commit_9
 "#;
 
-    let out_lines: Vec<_> = output.lines().collect();
-    let exp_lines: Vec<_> = expected.lines().collect();
+    let out_lines: Vec<_> = output.trim_end_matches('\n').lines().collect();
+    let exp_lines: Vec<_> = expected.trim_end_matches('\n').lines().collect();
     assert_eq!(out_lines, exp_lines);
 }
 
@@ -1046,22 +1079,20 @@ Date:   Fri Jun 26 10:00:01 2026 +0000
     assert_cli_success(&out, "shortlog from stdin");
     let stdout = String::from_utf8_lossy(&out.stdout);
     // Aggregated from stdin (Alice 2, Bob 1), NOT from the repo's single commit.
-    assert!(stdout.contains("2  Alice"), "Alice has 2 commits: {stdout}");
-    assert!(stdout.contains("1  Bob"), "Bob has 1 commit: {stdout}");
-    assert!(
-        stdout.contains("third commit") && stdout.contains("first commit"),
-        "Alice's subjects are listed: {stdout}"
-    );
-    assert!(
-        stdout.contains("second commit subject"),
-        "Bob's subject is listed: {stdout}"
+    assert_eq!(
+        stdout,
+        "Alice (2):\n      first commit\n      third commit\n\nBob (1):\n      second commit subject\n\n",
+        "Git group format from stdin"
     );
 
     // `-s` (summary) suppresses subjects.
     let summary = run_libra_command_with_stdin(&["shortlog", "-s"], p, log);
     assert_cli_success(&summary, "shortlog -s from stdin");
     let summary_out = String::from_utf8_lossy(&summary.stdout);
-    assert!(summary_out.contains("2  Alice") && summary_out.contains("1  Bob"));
+    assert_eq!(
+        summary_out, "     2	Alice\n     1	Bob\n",
+        "Git `%6d` summary from stdin"
+    );
     assert!(
         !summary_out.contains("third commit"),
         "summary omits subjects: {summary_out}"
@@ -1148,4 +1179,161 @@ fn test_shortlog_revision_ranges_matrix() {
     // t4201:203 port: an empty range produces no authors.
     let empty = run(&["shortlog", "-s", "HEAD..HEAD"]);
     assert!(empty.trim().is_empty(), "{empty}");
+}
+
+/// PM-16: human output follows Git's `shortlog` format and ordering.
+#[test]
+fn shortlog_output_matches_git_format() {
+    use std::process::{Command, Stdio};
+
+    let libra = env!("CARGO_BIN_EXE_libra");
+    let init = || {
+        let repo = tempdir().unwrap();
+        let setup = Command::new(libra)
+            .args(["init", "--vault", "false"])
+            .current_dir(repo.path())
+            .env("HOME", repo.path().join(".home"))
+            .env("LIBRA_TEST", "1")
+            .output()
+            .unwrap();
+        assert!(setup.status.success());
+        for (key, value) in [("user.name", "t"), ("user.email", "t@t")] {
+            let out = Command::new(libra)
+                .args(["config", key, value])
+                .current_dir(repo.path())
+                .env("HOME", repo.path().join(".home"))
+                .env("LIBRA_TEST", "1")
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+        }
+        repo
+    };
+    let commit = |repo: &std::path::Path, subject: &str, author: &str| {
+        std::fs::write(repo.join("f"), format!("{subject}\n")).unwrap();
+        for args in [
+            vec!["add", "f"],
+            vec!["commit", "-m", subject, "--author", author, "--no-verify"],
+        ] {
+            let out = Command::new(libra)
+                .args(&args)
+                .current_dir(repo)
+                .env("HOME", repo.join(".home"))
+                .env("LIBRA_TEST", "1")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{args:?}: {out:?}");
+        }
+    };
+    let run = |repo: &std::path::Path, args: &[&str]| {
+        Command::new(libra)
+            .args(args)
+            .current_dir(repo)
+            .env("HOME", repo.join(".home"))
+            .env("LIBRA_TEST", "1")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+    };
+
+    // F16m: Alice(2), Bob(1).
+    let repo = init();
+    commit(repo.path(), "first", "Alice <alice@example.com>");
+    commit(repo.path(), "second", "Bob <bob@example.com>");
+    commit(repo.path(), "third", "Alice <alice@example.com>");
+    let out = run(repo.path(), &["shortlog", "HEAD"]);
+    assert!(out.status.success(), "AC1");
+    assert_eq!(
+        out.stdout,
+        b"Alice (2):\n      first\n      third\n\nBob (1):\n      second\n\n".to_vec(),
+        "AC1"
+    );
+    let out = run(repo.path(), &["shortlog", "-s", "HEAD"]);
+    assert!(out.status.success(), "AC2");
+    assert_eq!(out.stdout, b"     2\tAlice\n     1\tBob\n".to_vec(), "AC2");
+
+    // F16o: byte-order grouping and numbered ordering.
+    let repo = init();
+    commit(repo.path(), "s1", "Amy <amy@example.com>");
+    commit(repo.path(), "s2", "Zed <zed@example.com>");
+    commit(repo.path(), "s3", "bob <bob@example.com>");
+    commit(repo.path(), "s4", "Zed <zed@example.com>");
+    let out = run(repo.path(), &["shortlog", "-s", "HEAD"]);
+    assert!(out.status.success(), "AC3");
+    assert_eq!(
+        out.stdout,
+        b"     1\tAmy\n     2\tZed\n     1\tbob\n".to_vec(),
+        "AC3"
+    );
+    let out = run(repo.path(), &["shortlog", "-n", "-s", "HEAD"]);
+    assert!(out.status.success(), "AC4");
+    assert_eq!(
+        out.stdout,
+        b"     2\tZed\n     1\tAmy\n     1\tbob\n".to_vec(),
+        "AC4"
+    );
+    let out = run(
+        repo.path(),
+        &["shortlog", "-s", "--reverse", "--top", "2", "HEAD"],
+    );
+    assert!(out.status.success(), "AC8");
+    assert_eq!(out.stdout, b"     1\tbob\n     2\tZed\n".to_vec(), "AC8");
+
+    // AC6: the JSON path keeps the previous payload byte-for-byte.
+    let out = run(
+        repo.path(),
+        &[
+            "--json",
+            "shortlog",
+            "-s",
+            "--min-count",
+            "2",
+            "--reverse",
+            "--top",
+            "2",
+            "HEAD",
+        ],
+    );
+    assert!(out.status.success(), "AC6");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "{\n  \"command\": \"shortlog\",\n  \"data\": {\n    \"authors\": [\n      {\n        \"count\": 2,\n        \"email\": null,\n        \"name\": \"Zed\",\n        \"subjects\": []\n      }\n    ],\n    \"email\": false,\n    \"numbered\": false,\n    \"revision\": \"HEAD\",\n    \"summary\": true,\n    \"total_authors\": 1,\n    \"total_commits\": 4\n  },\n  \"ok\": true\n}\n",
+        "AC6"
+    );
+
+    // F16m with two emails for Alice: full-key byte ordering.
+    let repo = init();
+    commit(repo.path(), "e1", "Alice <alice@example.com>");
+    commit(repo.path(), "e2", "Bob <bob@example.com>");
+    commit(repo.path(), "e3", "Alice <alice@other.example>");
+    let out = run(repo.path(), &["shortlog", "-e", "-s", "HEAD"]);
+    assert!(out.status.success(), "AC5");
+    assert_eq!(
+        out.stdout,
+        b"     1\tAlice <alice@example.com>\n     1\tAlice <alice@other.example>\n     1\tBob <bob@example.com>\n".to_vec(),
+        "AC5"
+    );
+}
+
+/// PM-16 AC7: piped `log` input renders the same Git group format, with the
+/// subjects in reverse input order.
+#[test]
+fn shortlog_stdin_output_matches_git_format() {
+    let repo = tempdir().unwrap();
+    let libra = env!("CARGO_BIN_EXE_libra");
+    let _ = Command::new(libra)
+        .args(["init", "--vault", "false"])
+        .current_dir(repo.path())
+        .env("HOME", repo.path().join(".home"))
+        .env("LIBRA_TEST", "1")
+        .output()
+        .unwrap();
+    let log = "commit 1111111111111111111111111111111111111111\nAuthor: Alice <alice@example.com>\nDate:   Fri Jun 26 10:00:01 2026 +0000\n\n    first\n\ncommit 2222222222222222222222222222222222222222\nAuthor: Bob <bob@example.com>\nDate:   Fri Jun 26 10:00:02 2026 +0000\n\n    second\n\ncommit 3333333333333333333333333333333333333333\nAuthor: Alice <alice@example.com>\nDate:   Fri Jun 26 10:00:03 2026 +0000\n\n    third\n";
+    let out = run_libra_command_with_stdin(&["shortlog"], repo.path(), log);
+    assert_cli_success(&out, "AC7");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "Alice (2):\n      third\n      first\n\nBob (1):\n      second\n\n",
+        "AC7"
+    );
 }

@@ -18,7 +18,7 @@ git log | libra shortlog [-n] [-s] [-e] [--group <TYPE>] [--author <pattern>] [-
 
 当未给定修订、且标准输入为带数据的非终端（管道）时，`libra shortlog` 改为汇总管道传入的 `git log` / `libra log` 输出（如 `git log | libra shortlog`），与 Git 的 stdin 模式对等：解析 medium/fuller 日志格式（`Author:` / `Commit:` 身份头与 4 空格缩进的消息），仅作用于分组与显示选项（`-n` / `-s` / `-e` / `--group` / `--author` / `-w` / `--top` / `--min-count` / `--reverse`），walk-only 过滤（`--since` / `--until` / `--merges` / `--no-merges` / `--format`）被忽略。空或终端 stdin 回落到 `HEAD` 默认；管道模式仍需在 Libra 仓库内运行。
 
-默认情况下，作者按姓名字母顺序排序。使用 `-n` 时，按提交数量降序排序。`-s` 标志生成只包含数量的摘要，抑制单个提交主题。`-e` 标志会在输出中包含作者 email 地址。
+人读输出与 Git 的 `shortlog` 格式一致：段头为 `Name (N):`（`-e` 时为 `Name <email> (N):`），每条主题前 6 个空格并按由旧到新列出，每段后空一行；`-s` 输出 Git 的 `%6d` 摘要行（`     2\tName`）。分组按完整键（含 `-e` 的邮箱）以字节序（`strcmp`）排序，因此大写名先于小写名；`-n` 为按计数降序的稳定排序；`--min-count`、`--reverse`、`--top` 在该排序之后依次应用。`--json` 载荷保持原有排序与字段。
 
 通过 `--since` 和 `--until` 的日期过滤会基于 committer 时间戳限制包含哪些提交，支持 `YYYY-MM-DD`、`"N days ago"` 和 Unix 时间戳等格式。
 

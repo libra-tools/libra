@@ -2261,7 +2261,7 @@ PY
 ### Task PM-16: `libra shortlog` 人读输出对齐 Git 格式与排序（#1034；拆出 PM-30、PM-19）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-23：人读渲染改为 Git 格式——`-s` 为 `{:>6}\t{key}`，非 `-s` 为 `{key} (N):` 段头 + 6 空格缩进 + 主题逆序 + 段后空行；`finalize_shortlog` 增加 `json_mode`：人读按完整键（含 `-e` 邮箱）字节序排序、`-n` 计数降序稳定排序，JSON 保留旧的小写名排序与 `--min-count → --reverse → --top` 收尾；stdin 路径同改。AC1–AC6/AC8 由 `command::shortlog_test::shortlog_output_matches_git_format` 覆盖，AC7 由 `shortlog_stdin_output_matches_git_format` 覆盖；7 个既有格式用例同卡更新期望（含两处 `--until`/组合选项块）；`shortlog_test` 22/22；EN/zh/开发文档与 `COMPATIBILITY.md` 的 `shortlog` 行同步。
 **Description:** 按 ADR-PM-04 把 `src/command/shortlog.rs` 的人读输出（含从 stdin 读取 `git log` 输出的模式）改为 Git `shortlog.c` 格式：`-s` 为 `%6d\t<name>`；非 `-s` 为 `<name> (<n>):` 段头、每条主题前 6 个空格、主题按插入的逆序（仓库遍历即由旧到新）、每段后空一行；人读输出的分组按完整键（含 `-e` 的邮箱）以字节序（`strcmp`）排序，`-n` 为按计数降序的稳定排序。人读输出先按上述新规则排序，再依次应用 `--min-count`、`--reverse`、`--top`（次序同 `src/command/shortlog.rs:584-595`）；`--json` 路径保留改动前的收尾实现（同一小写名排序与 `--min-count` → `--reverse` → `--top` 处理，字段不变），即人读与 JSON 各走一条收尾路径；AC6 以同时带这三个选项、且新旧排序在夹具上给出不同结果的 JSON 调用与改动前基线逐字比较。（按 G-09 拆出 `PM-30` 承接多分组与去重，`PM-19` 承接 `-<n>`/`--max-count`（其再拆出 `PM-40` 承接 mailmap）。）
 **Out of scope:** 分组选项（`PM-30`、`PM-35`）；提交数限制（`PM-19`）与 mailmap（`PM-40`）；`-w` 的换行宽度与缩进规则（不变；既有 `shortlog_wrap_wraps_long_subjects` 只断言宽度与缩进，不改并由回归组守护）。
 **Current evidence:**

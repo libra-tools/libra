@@ -67,3 +67,4 @@ flowchart TD
 
 - 2026-11-13（#478 LG-20，ADR-LG-12 第 1 条）：`shortlog` 修订参数改为可重复的 `REVISION...`，支持 `A..B`/`A...B`/`^A`/多个修订，新增 `--all`（branches+tags+HEAD）与 `-- <path>`（`get_changed_files_for_commit` 过滤）；选择统一走 `log::walk_date_priority`；stdin 模式仍为 DEFER-08。测试：`test_shortlog_revision_ranges_matrix`（S1–S3、t4201:203）、`shortlog_test` 20/20。
 
+- 2026-11-23（PM-16 / #1034）：人读渲染改为 Git 格式（`{:>6}\t{key}` 摘要、`{key} (N):` 段头 + 6 空格缩进 + 主题逆序 + 段后空行）；`finalize_shortlog` 增加 `json_mode`：人读按完整键字节序排序、`-n` 计数降序稳定排序，JSON 保留旧的小写名排序与 `--min-count → --reverse → --top` 收尾；stdin 路径同改。回归：`shortlog_output_matches_git_format`（AC1–AC6/AC8）、`shortlog_stdin_output_matches_git_format`（AC7），7 个既有格式用例同卡更新期望；`shortlog_test` 22/22。
