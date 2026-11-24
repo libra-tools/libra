@@ -168,9 +168,15 @@ pub use meta::{
 };
 #[cfg(all(feature = "storage-sqlite", feature = "storage-redb"))]
 pub use migrate::{
-    LEGACY_CAPTURE_SQLITE_REL_PATH, MIGRATION_LOCK_FILE, QuiescedRepositorySqliteSources,
-    QuiescedSqliteConnection, SqliteQuiesceStage, capture_sqlite_db_path, git_sqlite_db_path,
-    quiesce_forward_repository_sqlite_sources, quiesce_sqlite_source,
+    CAPTURE_SPOOL_CONSUMER_LOCK_FILE, CAPTURE_SPOOL_TMP_MAX_AGE, ForwardPhase1Locks,
+    ForwardPhase1QuiesceGuard, ForwardPhase1QuiesceStage, LEGACY_CAPTURE_SQLITE_REL_PATH,
+    MIGRATION_LOCK_FILE, QuiescedRepositorySqliteSources, QuiescedSqliteConnection,
+    SqliteQuiesceStage, capture_queue_append_lock_path, capture_queue_dir_path,
+    capture_queue_writer_lock_path, capture_spool_capacity_lock_path,
+    capture_spool_consumer_lock_path, capture_spool_dir_path, capture_spool_tmp_dir_path,
+    capture_sqlite_db_path, git_sqlite_db_path, migration_lock_path,
+    quiesce_forward_repository_phase1, quiesce_forward_repository_sqlite_sources,
+    quiesce_sqlite_source,
 };
 #[cfg(feature = "storage-redb")]
 pub use opener::{

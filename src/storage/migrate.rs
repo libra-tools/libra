@@ -29,9 +29,10 @@
 
 use std::{
     ffi::OsString,
-    fs, io,
+    fs::{self, File, OpenOptions},
+    io,
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use sea_orm::sqlx::{
@@ -43,11 +44,29 @@ use crate::{
     storage::{
         error::{StorageBackendError, StorageResult},
         manifest::{LEGACY_SQLITE_DB_FILE, PRIVATE_SUBDIR},
+        queue::{
+            CAPTURE_QUEUE_SUBDIR, CAPTURE_SPOOL_CAPACITY_LOCK_FILE, CAPTURE_SPOOL_SUBDIR,
+            CAPTURE_SPOOL_TOMBSTONE_SENTINEL, QUEUE_APPEND_LOCK_FILE, QUEUE_WRITER_LOCK_FILE,
+        },
     },
 };
 
 /// Canonical advisory lock filename for repository storage migrations under `<common_storage>`.
 pub const MIGRATION_LOCK_FILE: &str = "migration.lock";
+
+/// Canonical advisory lock filename for the legacy capture spool consumer under
+/// `<common_storage>/private/` (`src/internal/ai/capture/drain.rs:87`).
+pub const CAPTURE_SPOOL_CONSUMER_LOCK_FILE: &str = "capture-spool-consumer.lock";
+
+/// Maximum age before an abandoned `capture-spool/tmp/` file is considered
+/// expired (`src/internal/ai/capture/spool.rs:28`, 24 hours). Any regular file
+/// with age `<= CAPTURE_SPOOL_TMP_MAX_AGE` (or future mtime) is treated as an
+/// active in-flight publisher between `spool.rs:119` and `spool.rs:145`.
+pub const CAPTURE_SPOOL_TMP_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Subdirectory inside `<common_storage>/private/capture-spool/` holding
+/// in-flight publisher staging files (`spool.rs:21`).
+const CAPTURE_SPOOL_TMP_SUBDIR: &str = "tmp";
 
 /// Canonical relative path under `<common_storage>` for the legacy SQLite Capture database.
 pub const LEGACY_CAPTURE_SQLITE_REL_PATH: &str = "private/capture.db";
@@ -120,6 +139,149 @@ pub fn git_sqlite_db_path(common_storage: &Path) -> PathBuf {
 #[must_use]
 pub fn capture_sqlite_db_path(common_storage: &Path) -> PathBuf {
     common_storage.join(PRIVATE_SUBDIR).join("capture.db")
+}
+
+/// Return the canonical repository migration advisory lock path
+/// `<common_storage>/migration.lock`.
+#[must_use]
+pub fn migration_lock_path(common_storage: &Path) -> PathBuf {
+    common_storage.join(MIGRATION_LOCK_FILE)
+}
+
+/// Return the canonical legacy capture spool directory path
+/// `<common_storage>/private/capture-spool`.
+#[must_use]
+pub fn capture_spool_dir_path(common_storage: &Path) -> PathBuf {
+    common_storage
+        .join(PRIVATE_SUBDIR)
+        .join(CAPTURE_SPOOL_SUBDIR)
+}
+
+/// Return the canonical legacy capture spool staging directory path
+/// `<common_storage>/private/capture-spool/tmp`.
+#[must_use]
+pub fn capture_spool_tmp_dir_path(common_storage: &Path) -> PathBuf {
+    capture_spool_dir_path(common_storage).join(CAPTURE_SPOOL_TMP_SUBDIR)
+}
+
+/// Return the canonical in-place legacy capture spool capacity lock path
+/// `<common_storage>/private/capture-spool/capacity.lock`.
+#[must_use]
+pub fn capture_spool_capacity_lock_path(common_storage: &Path) -> PathBuf {
+    capture_spool_dir_path(common_storage).join(CAPTURE_SPOOL_CAPACITY_LOCK_FILE)
+}
+
+/// Return the canonical legacy capture spool consumer lock path
+/// `<common_storage>/private/capture-spool-consumer.lock`.
+#[must_use]
+pub fn capture_spool_consumer_lock_path(common_storage: &Path) -> PathBuf {
+    common_storage
+        .join(PRIVATE_SUBDIR)
+        .join(CAPTURE_SPOOL_CONSUMER_LOCK_FILE)
+}
+
+/// Return the canonical capture queue root directory path
+/// `<common_storage>/private/capture-queue`.
+#[must_use]
+pub fn capture_queue_dir_path(common_storage: &Path) -> PathBuf {
+    common_storage
+        .join(PRIVATE_SUBDIR)
+        .join(CAPTURE_QUEUE_SUBDIR)
+}
+
+/// Return the canonical in-place capture queue append lock path
+/// `<common_storage>/private/capture-queue/append.lock`.
+#[must_use]
+pub fn capture_queue_append_lock_path(common_storage: &Path) -> PathBuf {
+    capture_queue_dir_path(common_storage).join(QUEUE_APPEND_LOCK_FILE)
+}
+
+/// Return the canonical capture queue consumer writer lock path
+/// `<common_storage>/private/capture-queue/writer.lock`.
+#[must_use]
+pub fn capture_queue_writer_lock_path(common_storage: &Path) -> PathBuf {
+    capture_queue_dir_path(common_storage).join(QUEUE_WRITER_LOCK_FILE)
+}
+
+/// Sanitized stage identifier for full Phase 1 non-SQLite + SQLite forward
+/// migration quiescence (`ADR-RB-07` #1, `RB-10n`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForwardPhase1QuiesceStage {
+    /// Repository storage root validation (`<common_storage>`).
+    StorageRoot,
+    /// Exclusive advisory lock on `<common_storage>/migration.lock`.
+    MigrationLock,
+    /// Exclusive advisory lock on `<common_storage>/maintenance.lock`.
+    MaintenanceLock,
+    /// Exclusive advisory lock on `<common_storage>/private/capture-spool-consumer.lock`.
+    CaptureSpoolConsumerLock,
+    /// Exclusive advisory lock on `<common_storage>/private/capture-queue/writer.lock`.
+    CaptureQueueWriterLock,
+    /// In-place exclusive advisory lock on `<common_storage>/private/capture-spool/capacity.lock`.
+    CaptureSpoolCapacityLock,
+    /// In-place exclusive advisory lock on `<common_storage>/private/capture-queue/append.lock`.
+    CaptureQueueAppendLock,
+    /// Active unexpired staging file check under `<common_storage>/private/capture-spool/tmp/`.
+    CaptureSpoolInFlightTmp,
+    /// Single-connection SQLite Phase 1 quiescence on `libra.db` and optional `capture.db`.
+    SqliteSources,
+}
+
+impl ForwardPhase1QuiesceStage {
+    /// Human-readable sanitized stage label (zero private paths).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::StorageRoot => "storage root validation",
+            Self::MigrationLock => "migration.lock",
+            Self::MaintenanceLock => "maintenance.lock",
+            Self::CaptureSpoolConsumerLock => "capture-spool-consumer.lock",
+            Self::CaptureQueueWriterLock => "capture-queue/writer.lock",
+            Self::CaptureSpoolCapacityLock => "capture-spool/capacity.lock",
+            Self::CaptureQueueAppendLock => "capture-queue/append.lock",
+            Self::CaptureSpoolInFlightTmp => "capture-spool/tmp in-flight publisher check",
+            Self::SqliteSources => "sqlite sources quiescence",
+        }
+    }
+}
+
+/// Exclusive non-SQLite advisory locks held across forward migration Phase 1
+/// and Phase 2 (`ADR-RB-07` #1, `RB-10n`).
+///
+/// Fields are declared in **strict reverse acquisition order** so dropping the
+/// struct always releases inner locks before outer locks:
+/// `append.lock -> capacity.lock -> writer.lock -> capture-spool-consumer.lock -> maintenance.lock -> migration.lock`.
+#[derive(Debug)]
+pub struct ForwardPhase1Locks {
+    _queue_append_lock: File,
+    _spool_capacity_lock: File,
+    _queue_writer_lock: File,
+    _spool_consumer_lock: File,
+    _maintenance_lock: File,
+    _migration_lock: File,
+}
+
+/// Full Phase 1 forward migration quiescence guard holding all 6 non-SQLite
+/// exclusive advisory locks (with `capacity.lock` and `append.lock` pinned
+/// in-place) plus single-connection OS `EXCLUSIVE` SQLite locks on `libra.db`
+/// and optional `private/capture.db` (`ADR-RB-07` #1, `RB-10`, `RB-10m`, `RB-10n`).
+#[derive(Debug)]
+pub struct ForwardPhase1QuiesceGuard {
+    /// Quiesced `DELETE`-mode SQLite source connections (`c_mig`).
+    pub sqlite: QuiescedRepositorySqliteSources,
+    /// Held non-SQLite exclusive advisory locks (released AFTER `sqlite` closes).
+    locks: ForwardPhase1Locks,
+}
+
+impl ForwardPhase1QuiesceGuard {
+    /// Deterministically close held SQLite `c_mig` connections first and then
+    /// release all 6 non-SQLite exclusive advisory locks in strict reverse order.
+    pub async fn close(self) -> StorageResult<()> {
+        let Self { sqlite, locks } = self;
+        let sqlite_res = sqlite.close().await;
+        drop(locks);
+        sqlite_res
+    }
 }
 
 /// Build the SQLite sidecar path by appending `suffix` (e.g. `"-wal"` or `"-shm"`)
@@ -1585,22 +1747,18 @@ fn remove_stale_shm_under_exclusive_lock(
     Ok(())
 }
 
-/// Quiesce the repository's SQLite source databases (`<common_storage>/libra.db`
-/// and, when present, `<common_storage>/private/capture.db`) using single
-/// non-pooled connections (`c_mig`).
-///
-/// Acquires non-mutating OS `EXCLUSIVE` quiescence on **both** sources first
-/// (Phase A) before performing any offline WAL->DELETE transition or stale
-/// `-shm` cleanup (Phase B), so contention on `capture.db` can never mutate or
-/// checkpoint an offline WAL `libra.db` (and vice versa).
-///
-/// Never opens raw `std::fs::File` descriptors on live `.db` paths and rejects
-/// hard-linked `libra.db`/`capture.db` aliases up front via `lstat`. Strictly
-/// scoped to `DatabaseRole::Repository` and `DatabaseRole::Capture`: never
-/// opens, creates, or modifies `GlobalConfig` or `SystemConfig` stores.
-pub async fn quiesce_forward_repository_sqlite_sources(
+/// Pair of non-mutating Phase A prepared SQLite quiescence handles ready for
+/// Phase B finalization once all non-SQLite and SQLite gates have cleared.
+struct PreparedRepositorySqliteSources {
+    git: PreparedSqliteQuiescence,
+    capture: Option<PreparedSqliteQuiescence>,
+}
+
+/// Phase A (100% non-mutating) SQLite quiescence preparation for a repository's
+/// `libra.db` and optional `private/capture.db`.
+async fn prepare_forward_repository_sqlite_sources_no_mutate(
     common_storage: &Path,
-) -> StorageResult<QuiescedRepositorySqliteSources> {
+) -> StorageResult<PreparedRepositorySqliteSources> {
     let storage_meta = fs::symlink_metadata(common_storage)
         .map_err(|err| StorageBackendError::io("inspect repository storage directory", err))?;
     if storage_meta.file_type().is_symlink() || !storage_meta.file_type().is_dir() {
@@ -1637,12 +1795,10 @@ pub async fn quiesce_forward_repository_sqlite_sources(
         }
     };
 
-    // Phase A: acquire non-mutating OS EXCLUSIVE quiescence on BOTH sources
-    // before mutating or transitioning either source.
     #[cfg(test)]
     let default_hooks = QuiesceTestHooks::default();
     #[cfg(test)]
-    let git_prepared = prepare_sqlite_quiescence_no_mutate_inner(
+    let git = prepare_sqlite_quiescence_no_mutate_inner(
         &git_path,
         DatabaseRole::Repository,
         &git_meta,
@@ -1650,10 +1806,10 @@ pub async fn quiesce_forward_repository_sqlite_sources(
     )
     .await?;
     #[cfg(not(test))]
-    let git_prepared =
+    let git =
         prepare_sqlite_quiescence_no_mutate(&git_path, DatabaseRole::Repository, &git_meta).await?;
 
-    let cap_prepared = if let Some(cap_meta) = capture_meta {
+    let capture = if let Some(cap_meta) = capture_meta {
         #[cfg(test)]
         let res = prepare_sqlite_quiescence_no_mutate_inner(
             &capture_path,
@@ -1669,7 +1825,7 @@ pub async fn quiesce_forward_repository_sqlite_sources(
         match res {
             Ok(prepared) => Some(prepared),
             Err(err) => {
-                git_prepared.close_quietly().await;
+                git.close_quietly().await;
                 return Err(err);
             }
         }
@@ -1677,7 +1833,20 @@ pub async fn quiesce_forward_repository_sqlite_sources(
         None
     };
 
-    // Phase B: zero contention across all repository sources -> finalize both.
+    Ok(PreparedRepositorySqliteSources { git, capture })
+}
+
+/// Phase B finalization for prepared repository SQLite sources.
+async fn finalize_forward_repository_sqlite_sources(
+    prepared: PreparedRepositorySqliteSources,
+) -> StorageResult<QuiescedRepositorySqliteSources> {
+    let PreparedRepositorySqliteSources {
+        git: git_prepared,
+        capture: cap_prepared,
+    } = prepared;
+
+    #[cfg(test)]
+    let default_hooks = QuiesceTestHooks::default();
     #[cfg(test)]
     let git = match finalize_prepared_sqlite_quiescence_inner(git_prepared, &default_hooks).await {
         Ok(conn) => conn,
@@ -1718,6 +1887,996 @@ pub async fn quiesce_forward_repository_sqlite_sources(
     Ok(QuiescedRepositorySqliteSources { git, capture })
 }
 
+/// Quiesce the repository's SQLite source databases (`<common_storage>/libra.db`
+/// and, when present, `<common_storage>/private/capture.db`) using single
+/// non-pooled connections (`c_mig`).
+///
+/// Acquires non-mutating OS `EXCLUSIVE` quiescence on **both** sources first
+/// (Phase A) before performing any offline WAL->DELETE transition or stale
+/// `-shm` cleanup (Phase B), so contention on `capture.db` can never mutate or
+/// checkpoint an offline WAL `libra.db` (and vice versa).
+///
+/// Never opens raw `std::fs::File` descriptors on live `.db` paths and rejects
+/// hard-linked `libra.db`/`capture.db` aliases up front via `lstat`. Strictly
+/// scoped to `DatabaseRole::Repository` and `DatabaseRole::Capture`: never
+/// opens, creates, or modifies `GlobalConfig` or `SystemConfig` stores.
+pub async fn quiesce_forward_repository_sqlite_sources(
+    common_storage: &Path,
+) -> StorageResult<QuiescedRepositorySqliteSources> {
+    let prepared = prepare_forward_repository_sqlite_sources_no_mutate(common_storage).await?;
+    finalize_forward_repository_sqlite_sources(prepared).await
+}
+
+/// Validate that `dir` (if present) is a regular non-symlink directory owned by
+/// the effective user on Unix, without modifying permissions or creating files.
+fn validate_existing_dir_no_mutate(
+    dir: &Path,
+    require_owner: bool,
+    stage: ForwardPhase1QuiesceStage,
+) -> StorageResult<bool> {
+    let meta = match fs::symlink_metadata(dir) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => {
+            return Err(StorageBackendError::io(
+                "inspect forward migration quiescence directory",
+                err,
+            ));
+        }
+    };
+    if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration quiescence rejected at {}: path is not a regular non-symlink directory",
+                stage.as_str()
+            ),
+        });
+    }
+    #[cfg(unix)]
+    if require_owner {
+        use std::os::unix::fs::MetadataExt as _;
+        // SAFETY: `geteuid` has no preconditions and cannot fail.
+        if meta.uid() != unsafe { libc::geteuid() } {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "forward migration quiescence rejected at {}: directory owner does not match effective user",
+                    stage.as_str()
+                ),
+            });
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = require_owner;
+    Ok(true)
+}
+
+/// Optional `#[cfg(test)]` hooks for deterministic Phase 1 non-SQLite concurrency tests.
+#[cfg(test)]
+#[derive(Default)]
+struct Phase1NonSqliteTestHooks<'a> {
+    after_locks_before_tmp_recheck: Option<&'a dyn Fn(&Path)>,
+}
+
+/// Ensure a private subdirectory (`0700` on Unix) exists without following
+/// symlinks. Directories created for advisory locks are never unlinked on abort
+/// so live lock inodes remain stable across concurrent participants.
+fn ensure_private_dir_nofollow(dir: &Path, stage: ForwardPhase1QuiesceStage) -> StorageResult<()> {
+    if validate_existing_dir_no_mutate(dir, true, stage)? {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    let created = {
+        use std::os::unix::fs::DirBuilderExt as _;
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o700);
+        builder.create(dir)
+    };
+    #[cfg(not(unix))]
+    let created = fs::create_dir(dir);
+    match created {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(err) => {
+            return Err(StorageBackendError::io(
+                "create private directory for forward migration lock",
+                err,
+            ));
+        }
+    }
+    if !validate_existing_dir_no_mutate(dir, true, stage)? {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration quiescence rejected at {}: private directory vanished after create",
+                stage.as_str()
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Verify that an opened advisory lock file descriptor is a regular single-link
+/// file owned by the effective user on Unix and still matches the inode at
+/// `lock_path`.
+fn verify_lock_fd_identity(
+    lock_path: &Path,
+    file: &File,
+    require_owner: bool,
+    stage: ForwardPhase1QuiesceStage,
+) -> StorageResult<()> {
+    let fd_meta = file.metadata().map_err(|err| {
+        StorageBackendError::io("inspect opened forward migration lock metadata", err)
+    })?;
+    if !fd_meta.is_file() {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration quiescence rejected at {}: lock descriptor is not a regular file",
+                stage.as_str()
+            ),
+        });
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if fd_meta.nlink() != 1 {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "forward migration quiescence rejected at {}: lock file has unexpected hard links",
+                    stage.as_str()
+                ),
+            });
+        }
+        // SAFETY: `geteuid` has no preconditions and cannot fail.
+        if require_owner && fd_meta.uid() != unsafe { libc::geteuid() } {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "forward migration quiescence rejected at {}: lock file owner does not match effective user",
+                    stage.as_str()
+                ),
+            });
+        }
+        let path_meta = fs::symlink_metadata(lock_path).map_err(|err| {
+            StorageBackendError::io("re-verify forward migration lock path metadata", err)
+        })?;
+        if path_meta.file_type().is_symlink()
+            || !path_meta.file_type().is_file()
+            || path_meta.dev() != fd_meta.dev()
+            || path_meta.ino() != fd_meta.ino()
+        {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "forward migration quiescence rejected at {}: lock path identity changed during acquisition",
+                    stage.as_str()
+                ),
+            });
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (lock_path, require_owner);
+    }
+    Ok(())
+}
+
+/// Non-creating, non-holding read-only probe of an already-existing lock file
+/// (rejects symlinks, hard links, owner mismatch, or active contention with
+/// `LBR-IO-001` while creating ZERO files on disk when absent).
+fn probe_existing_lock_uncontended(
+    lock_path: &Path,
+    require_owner: bool,
+    stage: ForwardPhase1QuiesceStage,
+) -> StorageResult<()> {
+    let pre_meta = match fs::symlink_metadata(lock_path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(StorageBackendError::io(
+                "inspect existing forward migration lock file",
+                err,
+            ));
+        }
+    };
+    if pre_meta.file_type().is_symlink() || !pre_meta.file_type().is_file() {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration quiescence rejected at {}: lock path is not a regular non-symlink file",
+                stage.as_str()
+            ),
+        });
+    }
+
+    let mut opts = OpenOptions::new();
+    opts.read(true).write(true).create(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let file = match opts.open(lock_path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(StorageBackendError::io(
+                "open existing forward migration lock file",
+                err,
+            ));
+        }
+    };
+
+    verify_lock_fd_identity(lock_path, &file, require_owner, stage)?;
+    match file.try_lock() {
+        Ok(()) => {
+            verify_lock_fd_identity(lock_path, &file, require_owner, stage)?;
+            drop(file);
+            Ok(())
+        }
+        Err(fs::TryLockError::WouldBlock) => Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration quiescence rejected at {}: lock is currently held by an active external process",
+                stage.as_str()
+            ),
+        }),
+        Err(fs::TryLockError::Error(err)) => Err(StorageBackendError::io(
+            "probe non-blocking exclusive advisory lock",
+            err,
+        )),
+    }
+}
+
+/// Open an existing lock file or create a permanent in-place advisory lock
+/// file (`O_NOFOLLOW | O_CLOEXEC`), verifying single-link (`nlink == 1`),
+/// ownership, and pre/post-lock inode identity.
+///
+/// Once a lock file is created at its canonical path it is **never** unlinked
+/// on error or release, preventing POSIX lock-inode split-brain between waiting
+/// and subsequent producers (`ADR-RB-07` #1).
+fn open_and_try_lock_inplace(
+    lock_path: &Path,
+    mode: u32,
+    require_owner: bool,
+    stage: ForwardPhase1QuiesceStage,
+) -> StorageResult<File> {
+    if let Ok(meta) = fs::symlink_metadata(lock_path)
+        && (meta.file_type().is_symlink() || !meta.file_type().is_file())
+    {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration quiescence rejected at {}: lock path is not a regular non-symlink file",
+                stage.as_str()
+            ),
+        });
+    }
+
+    let mut opts = OpenOptions::new();
+    opts.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(mode)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
+
+    let file = opts.open(lock_path).map_err(|err| {
+        StorageBackendError::io("open or create forward migration lock file", err)
+    })?;
+    verify_lock_fd_identity(lock_path, &file, require_owner, stage)?;
+    match file.try_lock() {
+        Ok(()) => {
+            verify_lock_fd_identity(lock_path, &file, require_owner, stage)?;
+            Ok(file)
+        }
+        Err(fs::TryLockError::WouldBlock) => Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration quiescence rejected at {}: lock is currently held by an active external process",
+                stage.as_str()
+            ),
+        }),
+        Err(fs::TryLockError::Error(err)) => Err(StorageBackendError::io(
+            "acquire non-blocking exclusive advisory lock",
+            err,
+        )),
+    }
+}
+
+/// 100% read-only inspection of `<common_storage>/private/capture-spool/tmp/`
+/// rejecting any unexpired active temporary file (`age <= 24h`, matching
+/// `spool.rs:28, 119-145, 499`), future-mtime entry, symlink, or non-regular
+/// entry with `LBR-IO-001` and ZERO disk mutation (`ADR-RB-07` #1, `RB-10n`).
+///
+/// On Unix, traverses `private -> capture-spool -> tmp` via pinned
+/// `O_DIRECTORY | O_NOFOLLOW` directory descriptors and verifies regular-file
+/// tombstones via `openat(..., O_NOFOLLOW)` + `fstat` (`nlink == 1`,
+/// `uid == geteuid()`, exact `(dev, ino)` match, bounded read).
+/// Strictly expired files (`age > 24h`) are ignored and NEVER deleted here so
+/// Phase 1 abort invariance keeps `capture-spool/` byte-for-byte identical.
+fn verify_no_inflight_spool_tmp_files(common_storage: &Path) -> StorageResult<()> {
+    let stage = ForwardPhase1QuiesceStage::CaptureSpoolInFlightTmp;
+    #[cfg(unix)]
+    {
+        verify_no_inflight_spool_tmp_files_unix(common_storage, stage)
+    }
+    #[cfg(not(unix))]
+    {
+        verify_no_inflight_spool_tmp_files_non_unix(common_storage, stage)
+    }
+}
+
+#[cfg(unix)]
+fn open_verified_dir_at_unix(
+    parent_fd: &std::os::unix::io::OwnedFd,
+    name: &std::ffi::CStr,
+    require_owner: bool,
+    stage: ForwardPhase1QuiesceStage,
+) -> StorageResult<Option<(std::os::unix::io::OwnedFd, libc::stat)>> {
+    use std::os::unix::io::{AsRawFd as _, FromRawFd as _, OwnedFd};
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    // SAFETY: `parent_fd` is a valid open directory fd and `name` is NUL-terminated.
+    let raw_fd = unsafe { libc::openat(parent_fd.as_raw_fd(), name.as_ptr(), flags) };
+    if raw_fd < 0 {
+        let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::NotFound {
+            return Ok(None);
+        }
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration quiescence rejected at {}: unable to open directory safely without following links",
+                stage.as_str()
+            ),
+        });
+    }
+    // SAFETY: `raw_fd >= 0` is exclusively owned here.
+    let dir_fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+    let mut st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: `dir_fd` is valid and `st` is writable.
+    if unsafe { libc::fstat(dir_fd.as_raw_fd(), st.as_mut_ptr()) } != 0 {
+        return Err(StorageBackendError::io(
+            "stat capture-spool directory descriptor",
+            io::Error::last_os_error(),
+        ));
+    }
+    // SAFETY: `fstat` succeeded.
+    let st = unsafe { st.assume_init() };
+    if (st.st_mode & libc::S_IFMT) != libc::S_IFDIR {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration quiescence rejected at {}: path is not a directory",
+                stage.as_str()
+            ),
+        });
+    }
+    // SAFETY: `geteuid` has no preconditions and cannot fail.
+    if require_owner && st.st_uid != unsafe { libc::geteuid() } {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration quiescence rejected at {}: directory owner does not match effective user",
+                stage.as_str()
+            ),
+        });
+    }
+    Ok(Some((dir_fd, st)))
+}
+
+#[cfg(unix)]
+fn verify_no_inflight_spool_tmp_files_unix(
+    common_storage: &Path,
+    stage: ForwardPhase1QuiesceStage,
+) -> StorageResult<()> {
+    use std::{
+        ffi::CString,
+        io::Read as _,
+        os::unix::{
+            ffi::OsStrExt as _,
+            io::{AsRawFd as _, FromRawFd as _, OwnedFd},
+        },
+        time::UNIX_EPOCH,
+    };
+
+    let c_storage = CString::new(common_storage.as_os_str().as_bytes()).map_err(|_| {
+        StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration quiescence rejected at {}: invalid storage path",
+                stage.as_str()
+            ),
+        }
+    })?;
+    // SAFETY: `c_storage` is NUL-terminated.
+    let raw_root = unsafe {
+        libc::open(
+            c_storage.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if raw_root < 0 {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration quiescence rejected at {}: storage root must be a non-symlink directory",
+                stage.as_str()
+            ),
+        });
+    }
+    // SAFETY: `raw_root >= 0` is exclusively owned here.
+    let root_fd = unsafe { OwnedFd::from_raw_fd(raw_root) };
+
+    let Some((private_fd, _)) = open_verified_dir_at_unix(&root_fd, c"private", true, stage)?
+    else {
+        return Ok(());
+    };
+    let Some((spool_fd, _)) =
+        open_verified_dir_at_unix(&private_fd, c"capture-spool", true, stage)?
+    else {
+        return Ok(());
+    };
+
+    let mut tmp_stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: `spool_fd` is valid and `c"tmp"` is NUL-terminated.
+    if unsafe {
+        libc::fstatat(
+            spool_fd.as_raw_fd(),
+            c"tmp".as_ptr(),
+            tmp_stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::NotFound {
+            return Ok(());
+        }
+        return Err(StorageBackendError::io(
+            "inspect capture-spool/tmp metadata",
+            err,
+        ));
+    }
+    // SAFETY: `fstatat` succeeded.
+    let tmp_stat = unsafe { tmp_stat.assume_init() };
+    let tmp_kind = tmp_stat.st_mode & libc::S_IFMT;
+    if tmp_kind == libc::S_IFLNK {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration quiescence rejected at {}: capture-spool/tmp must not be a symlink",
+                stage.as_str()
+            ),
+        });
+    }
+    if tmp_kind == libc::S_IFREG {
+        // Open relative to pinned `spool_fd` with `O_NOFOLLOW | O_CLOEXEC`,
+        // verify `fstat` (`S_IFREG`, `nlink == 1`, owner, exact `(dev, ino)`),
+        // and perform a bounded read of `CAPTURE_SPOOL_TOMBSTONE_SENTINEL.len() + 1` bytes.
+        // SAFETY: `spool_fd` is valid and `c"tmp"` is NUL-terminated.
+        let raw_tomb = unsafe {
+            libc::openat(
+                spool_fd.as_raw_fd(),
+                c"tmp".as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if raw_tomb < 0 {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "forward migration quiescence rejected at {}: unable to open capture-spool/tmp tombstone safely",
+                    stage.as_str()
+                ),
+            });
+        }
+        // SAFETY: `raw_tomb >= 0` is exclusively owned here.
+        let tomb_file = File::from(unsafe { OwnedFd::from_raw_fd(raw_tomb) });
+        let mut fd_st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+        // SAFETY: `tomb_file` is valid.
+        if unsafe { libc::fstat(tomb_file.as_raw_fd(), fd_st.as_mut_ptr()) } != 0 {
+            return Err(StorageBackendError::io(
+                "stat capture-spool/tmp tombstone descriptor",
+                io::Error::last_os_error(),
+            ));
+        }
+        // SAFETY: `fstat` succeeded.
+        let fd_st = unsafe { fd_st.assume_init() };
+        let expected_len = CAPTURE_SPOOL_TOMBSTONE_SENTINEL.len();
+        // SAFETY: `geteuid` has no preconditions and cannot fail.
+        let euid = unsafe { libc::geteuid() };
+        if (fd_st.st_mode & libc::S_IFMT) != libc::S_IFREG
+            || fd_st.st_nlink != 1
+            || fd_st.st_uid != euid
+            || fd_st.st_dev != tmp_stat.st_dev
+            || fd_st.st_ino != tmp_stat.st_ino
+            || fd_st.st_size != expected_len as i64
+        {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "forward migration quiescence rejected at {}: capture-spool/tmp is an unsafe or non-tombstone file",
+                    stage.as_str()
+                ),
+            });
+        }
+        let mut buf = Vec::with_capacity(expected_len + 1);
+        tomb_file
+            .take((expected_len + 1) as u64)
+            .read_to_end(&mut buf)
+            .map_err(|_| StorageBackendError::BackendInternal {
+                detail: format!(
+                    "forward migration quiescence rejected at {}: failed to read capture-spool/tmp tombstone",
+                    stage.as_str()
+                ),
+            })?;
+        if buf.as_slice() != CAPTURE_SPOOL_TOMBSTONE_SENTINEL {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "forward migration quiescence rejected at {}: capture-spool/tmp regular file does not match Redb tombstone sentinel",
+                    stage.as_str()
+                ),
+            });
+        }
+        return Ok(());
+    }
+    if tmp_kind != libc::S_IFDIR {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration quiescence rejected at {}: capture-spool/tmp is neither a directory nor a valid tombstone",
+                stage.as_str()
+            ),
+        });
+    }
+
+    let Some((tmp_fd, _)) = open_verified_dir_at_unix(&spool_fd, c"tmp", true, stage)? else {
+        return Ok(());
+    };
+    // Duplicate `tmp_fd` for `fdopendir` so `tmp_fd` stays valid for `fstatat`.
+    // SAFETY: `tmp_fd` is valid.
+    let dup_raw = unsafe { libc::fcntl(tmp_fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+    if dup_raw < 0 {
+        return Err(StorageBackendError::io(
+            "duplicate capture-spool/tmp directory descriptor",
+            io::Error::last_os_error(),
+        ));
+    }
+    // SAFETY: `dup_raw` is an open directory fd; on success `fdopendir` owns it.
+    let dir_ptr = unsafe { libc::fdopendir(dup_raw) };
+    if dir_ptr.is_null() {
+        let err = io::Error::last_os_error();
+        // SAFETY: `fdopendir` failed, so close `dup_raw`.
+        unsafe {
+            libc::close(dup_raw);
+        }
+        return Err(StorageBackendError::io(
+            "open capture-spool/tmp directory stream",
+            err,
+        ));
+    }
+
+    struct DirGuard(*mut libc::DIR);
+    impl Drop for DirGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: `self.0` was returned by `fdopendir`.
+                unsafe {
+                    libc::closedir(self.0);
+                }
+            }
+        }
+    }
+    let _dir_guard = DirGuard(dir_ptr);
+
+    let now = SystemTime::now();
+    loop {
+        #[cfg(target_os = "macos")]
+        unsafe {
+            *libc::__error() = 0;
+        }
+        #[cfg(target_os = "linux")]
+        unsafe {
+            *libc::__errno_location() = 0;
+        }
+        // SAFETY: `dir_ptr` is open and valid for the lifetime of `_dir_guard`.
+        let entry = unsafe { libc::readdir(dir_ptr) };
+        if entry.is_null() {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error().unwrap_or(0) != 0 {
+                return Err(StorageBackendError::io(
+                    "iterate capture-spool/tmp directory",
+                    err,
+                ));
+            }
+            break;
+        }
+        // SAFETY: `entry` is non-null and `d_name` is NUL-terminated.
+        let name_cstr = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+        let name_bytes = name_cstr.to_bytes();
+        if name_bytes == b"." || name_bytes == b".." {
+            continue;
+        }
+
+        let mut est = std::mem::MaybeUninit::<libc::stat>::zeroed();
+        // SAFETY: `tmp_fd` is valid and `name_cstr` is NUL-terminated.
+        if unsafe {
+            libc::fstatat(
+                tmp_fd.as_raw_fd(),
+                name_cstr.as_ptr(),
+                est.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::NotFound {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: format!(
+                        "forward migration quiescence rejected at {}: concurrent publisher modified capture-spool/tmp during scan",
+                        stage.as_str()
+                    ),
+                });
+            }
+            return Err(StorageBackendError::io(
+                "inspect capture-spool/tmp entry metadata",
+                err,
+            ));
+        }
+        // SAFETY: `fstatat` succeeded.
+        let est = unsafe { est.assume_init() };
+        if (est.st_mode & libc::S_IFMT) != libc::S_IFREG {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "forward migration quiescence rejected at {}: capture-spool/tmp contains a non-regular or symlink entry",
+                    stage.as_str()
+                ),
+            });
+        }
+        let mtime_secs = est.st_mtime;
+        let mtime_nsecs = est.st_mtime_nsec;
+        let modified = if mtime_secs >= 0 && mtime_nsecs >= 0 {
+            UNIX_EPOCH + Duration::new(mtime_secs as u64, mtime_nsecs as u32)
+        } else {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "forward migration quiescence rejected at {}: capture-spool/tmp entry has invalid mtime",
+                    stage.as_str()
+                ),
+            });
+        };
+        let expired = now
+            .duration_since(modified)
+            .is_ok_and(|age| age > CAPTURE_SPOOL_TMP_MAX_AGE);
+        if !expired {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "forward migration quiescence rejected at {}: capture-spool/tmp contains an active unexpired in-flight temporary file",
+                    stage.as_str()
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn verify_no_inflight_spool_tmp_files_non_unix(
+    common_storage: &Path,
+    stage: ForwardPhase1QuiesceStage,
+) -> StorageResult<()> {
+    use std::io::Read as _;
+
+    let private_dir = common_storage.join(PRIVATE_SUBDIR);
+    if !validate_existing_dir_no_mutate(&private_dir, true, stage)? {
+        return Ok(());
+    }
+    let spool_dir = capture_spool_dir_path(common_storage);
+    if !validate_existing_dir_no_mutate(&spool_dir, true, stage)? {
+        return Ok(());
+    }
+    let tmp_path = capture_spool_tmp_dir_path(common_storage);
+    let tmp_meta = match fs::symlink_metadata(&tmp_path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(StorageBackendError::io(
+                "inspect capture-spool/tmp metadata",
+                err,
+            ));
+        }
+    };
+    if tmp_meta.file_type().is_symlink() {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration quiescence rejected at {}: capture-spool/tmp must not be a symlink",
+                stage.as_str()
+            ),
+        });
+    }
+    if tmp_meta.file_type().is_file() {
+        let expected_len = CAPTURE_SPOOL_TOMBSTONE_SENTINEL.len();
+        if tmp_meta.len() != expected_len as u64 {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "forward migration quiescence rejected at {}: capture-spool/tmp is an unexpected non-directory file",
+                    stage.as_str()
+                ),
+            });
+        }
+        let file = File::open(&tmp_path).map_err(|_| StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration quiescence rejected at {}: unable to open capture-spool/tmp tombstone",
+                stage.as_str()
+            ),
+        })?;
+        let mut buf = Vec::with_capacity(expected_len + 1);
+        file.take((expected_len + 1) as u64)
+            .read_to_end(&mut buf)
+            .map_err(|_| StorageBackendError::BackendInternal {
+                detail: format!(
+                    "forward migration quiescence rejected at {}: failed to read capture-spool/tmp tombstone",
+                    stage.as_str()
+                ),
+            })?;
+        if buf.as_slice() == CAPTURE_SPOOL_TOMBSTONE_SENTINEL {
+            return Ok(());
+        }
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration quiescence rejected at {}: capture-spool/tmp is an unexpected non-directory file",
+                stage.as_str()
+            ),
+        });
+    }
+    if !tmp_meta.file_type().is_dir() {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration quiescence rejected at {}: capture-spool/tmp is neither a directory nor a valid tombstone",
+                stage.as_str()
+            ),
+        });
+    }
+    let now = SystemTime::now();
+    let entries = fs::read_dir(&tmp_path)
+        .map_err(|err| StorageBackendError::io("read capture-spool/tmp directory", err))?;
+    for entry_res in entries {
+        let entry = entry_res
+            .map_err(|err| StorageBackendError::io("iterate capture-spool/tmp directory", err))?;
+        let meta = match fs::symlink_metadata(entry.path()) {
+            Ok(meta) => meta,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: format!(
+                        "forward migration quiescence rejected at {}: concurrent publisher modified capture-spool/tmp during scan",
+                        stage.as_str()
+                    ),
+                });
+            }
+            Err(err) => {
+                return Err(StorageBackendError::io(
+                    "inspect capture-spool/tmp entry metadata",
+                    err,
+                ));
+            }
+        };
+        if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "forward migration quiescence rejected at {}: capture-spool/tmp contains a non-regular or symlink entry",
+                    stage.as_str()
+                ),
+            });
+        }
+        let modified = meta.modified().map_err(|_| StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration quiescence rejected at {}: unable to inspect capture-spool/tmp entry mtime",
+                stage.as_str()
+            ),
+        })?;
+        let expired = now
+            .duration_since(modified)
+            .is_ok_and(|age| age > CAPTURE_SPOOL_TMP_MAX_AGE);
+        if !expired {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "forward migration quiescence rejected at {}: capture-spool/tmp contains an active unexpired in-flight temporary file",
+                    stage.as_str()
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Full Phase 1 forward migration quiescence gate (`ADR-RB-07` #1, `RB-10`,
+/// `RB-10m`, `RB-10n`):
+///
+/// Acquires all 6 non-SQLite exclusive advisory locks in **strict canonical
+/// order** (`migration.lock` -> `maintenance.lock` ->
+/// `capture-spool-consumer.lock` -> `capture-queue/writer.lock` -> in-place
+/// `capture-spool/capacity.lock` -> in-place `capture-queue/append.lock`),
+/// rejects any active unexpired `capture-spool/tmp/` publisher
+/// (`spool.rs:119-145`) and any contended external lock holder with
+/// `LBR-IO-001` while keeping all 3 domains (SQLite `.db`/`-wal`/`-shm`,
+/// `capture-spool/`, and `capture-queue/`) 100% byte-for-byte identical on
+/// rejection (rolling back any newly created lock files/dirs if a late race or
+/// SQLite contention fails), and then completes single-connection `c_mig`
+/// SQLite quiescence on `libra.db` and optional `private/capture.db`.
+///
+/// Strictly scoped to repository storage (`Repository` + `Capture`): never
+/// opens, creates, or modifies `GlobalConfig` or `SystemConfig` stores.
+pub async fn quiesce_forward_repository_phase1(
+    common_storage: &Path,
+) -> StorageResult<ForwardPhase1QuiesceGuard> {
+    #[cfg(test)]
+    {
+        quiesce_forward_repository_phase1_inner(
+            common_storage,
+            &Phase1NonSqliteTestHooks::default(),
+        )
+        .await
+    }
+    #[cfg(not(test))]
+    {
+        quiesce_forward_repository_phase1_inner(common_storage).await
+    }
+}
+
+async fn quiesce_forward_repository_phase1_inner(
+    common_storage: &Path,
+    #[cfg(test)] hooks: &Phase1NonSqliteTestHooks<'_>,
+) -> StorageResult<ForwardPhase1QuiesceGuard> {
+    if !validate_existing_dir_no_mutate(
+        common_storage,
+        false,
+        ForwardPhase1QuiesceStage::StorageRoot,
+    )? {
+        return Err(StorageBackendError::NotFound {
+            resource: "repository storage directory".to_string(),
+        });
+    }
+
+    let private_dir = common_storage.join(PRIVATE_SUBDIR);
+    let spool_dir = capture_spool_dir_path(common_storage);
+    let queue_dir = capture_queue_dir_path(common_storage);
+    let mig_lock_path = migration_lock_path(common_storage);
+    let maint_lock_path = common_storage.join("maintenance.lock");
+    let consumer_lock_path = capture_spool_consumer_lock_path(common_storage);
+    let writer_lock_path = capture_queue_writer_lock_path(common_storage);
+    let capacity_lock_path = capture_spool_capacity_lock_path(common_storage);
+    let append_lock_path = capture_queue_append_lock_path(common_storage);
+
+    // Phase 0: 100% non-creating pre-flight validation & contention probes
+    // (creates ZERO files or directories anywhere on disk).
+    let _ = validate_existing_dir_no_mutate(
+        &private_dir,
+        true,
+        ForwardPhase1QuiesceStage::CaptureSpoolConsumerLock,
+    )?;
+    let _ = validate_existing_dir_no_mutate(
+        &spool_dir,
+        true,
+        ForwardPhase1QuiesceStage::CaptureSpoolCapacityLock,
+    )?;
+    let _ = validate_existing_dir_no_mutate(
+        &queue_dir,
+        true,
+        ForwardPhase1QuiesceStage::CaptureQueueAppendLock,
+    )?;
+    probe_existing_lock_uncontended(
+        &mig_lock_path,
+        true,
+        ForwardPhase1QuiesceStage::MigrationLock,
+    )?;
+    probe_existing_lock_uncontended(
+        &maint_lock_path,
+        false,
+        ForwardPhase1QuiesceStage::MaintenanceLock,
+    )?;
+    probe_existing_lock_uncontended(
+        &consumer_lock_path,
+        true,
+        ForwardPhase1QuiesceStage::CaptureSpoolConsumerLock,
+    )?;
+    probe_existing_lock_uncontended(
+        &writer_lock_path,
+        true,
+        ForwardPhase1QuiesceStage::CaptureQueueWriterLock,
+    )?;
+    probe_existing_lock_uncontended(
+        &capacity_lock_path,
+        true,
+        ForwardPhase1QuiesceStage::CaptureSpoolCapacityLock,
+    )?;
+    probe_existing_lock_uncontended(
+        &append_lock_path,
+        true,
+        ForwardPhase1QuiesceStage::CaptureQueueAppendLock,
+    )?;
+    verify_no_inflight_spool_tmp_files(common_storage)?;
+
+    // When any private lock file is not yet materialized on disk, run a
+    // non-mutating SQLite Phase A pre-check BEFORE creating any lock file so
+    // SQLite contention also leaves `capture-spool/` and `capture-queue/`
+    // untouched without ever needing to unlink a published lock inode.
+    let any_private_lock_absent = !path_exists_no_open(&consumer_lock_path)?
+        || !path_exists_no_open(&writer_lock_path)?
+        || !path_exists_no_open(&capacity_lock_path)?
+        || !path_exists_no_open(&append_lock_path)?;
+    if any_private_lock_absent {
+        let probe = prepare_forward_repository_sqlite_sources_no_mutate(common_storage).await?;
+        if let Some(cap) = probe.capture {
+            cap.close_quietly().await;
+        }
+        probe.git.close_quietly().await;
+    }
+
+    // Phase 1: Acquire ALL 6 non-SQLite locks in 100% STRICT CANONICAL ORDER
+    // (`ADR-RB-07` #1). Once published at its canonical path, a lock file is
+    // NEVER unlinked on rejection or drop so concurrent waiting and subsequent
+    // producers always contend on the exact same inode (zero split-brain).
+    let migration_lock = open_and_try_lock_inplace(
+        &mig_lock_path,
+        0o600,
+        true,
+        ForwardPhase1QuiesceStage::MigrationLock,
+    )?;
+    let maintenance_lock = open_and_try_lock_inplace(
+        &maint_lock_path,
+        0o600,
+        false,
+        ForwardPhase1QuiesceStage::MaintenanceLock,
+    )?;
+    ensure_private_dir_nofollow(
+        &private_dir,
+        ForwardPhase1QuiesceStage::CaptureSpoolConsumerLock,
+    )?;
+    let spool_consumer_lock = open_and_try_lock_inplace(
+        &consumer_lock_path,
+        0o600,
+        true,
+        ForwardPhase1QuiesceStage::CaptureSpoolConsumerLock,
+    )?;
+    ensure_private_dir_nofollow(
+        &queue_dir,
+        ForwardPhase1QuiesceStage::CaptureQueueWriterLock,
+    )?;
+    let queue_writer_lock = open_and_try_lock_inplace(
+        &writer_lock_path,
+        0o600,
+        true,
+        ForwardPhase1QuiesceStage::CaptureQueueWriterLock,
+    )?;
+    ensure_private_dir_nofollow(
+        &spool_dir,
+        ForwardPhase1QuiesceStage::CaptureSpoolCapacityLock,
+    )?;
+    let spool_capacity_lock = open_and_try_lock_inplace(
+        &capacity_lock_path,
+        0o600,
+        true,
+        ForwardPhase1QuiesceStage::CaptureSpoolCapacityLock,
+    )?;
+    let queue_append_lock = open_and_try_lock_inplace(
+        &append_lock_path,
+        0o600,
+        true,
+        ForwardPhase1QuiesceStage::CaptureQueueAppendLock,
+    )?;
+
+    let locks = ForwardPhase1Locks {
+        _queue_append_lock: queue_append_lock,
+        _spool_capacity_lock: spool_capacity_lock,
+        _queue_writer_lock: queue_writer_lock,
+        _spool_consumer_lock: spool_consumer_lock,
+        _maintenance_lock: maintenance_lock,
+        _migration_lock: migration_lock,
+    };
+
+    #[cfg(test)]
+    if let Some(hook) = hooks.after_locks_before_tmp_recheck {
+        hook(common_storage);
+    }
+
+    // Authoritative under-lock `capture-spool/tmp/` verification (closes any
+    // TOCTOU race between pre-flight and acquiring `capacity.lock`).
+    verify_no_inflight_spool_tmp_files(common_storage)?;
+
+    // Phase 2: Single-connection SQLite Phase A + Phase B quiescence on
+    // `libra.db` and optional `private/capture.db` under all 6 held locks.
+    let sqlite = quiesce_forward_repository_sqlite_sources(common_storage).await?;
+
+    Ok(ForwardPhase1QuiesceGuard { sqlite, locks })
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1730,6 +2889,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+    use crate::internal::maintenance_lock::MaintenanceLock;
 
     const RB10_CHILD_MODE_ENV: &str = "LIBRA_RB10_CHILD_MODE";
     const RB10_CHILD_DB_ENV: &str = "LIBRA_RB10_CHILD_DB";
@@ -1853,6 +3013,122 @@ mod tests {
     }
 
     async fn run_rb10_child_mode(mode: &str, db_path: &Path) {
+        // Non-SQLite OS lock-holder and busy-probe modes for `RB-10n`.
+        match mode {
+            "hold_flock_exclusive" => {
+                let file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .open(db_path)
+                    .expect("child open flock target");
+                file.try_lock().expect("child acquire exclusive flock");
+                println!("{RB10_READY_MARKER}");
+                let _ = io::stdout().flush();
+                let mut sink = Vec::new();
+                let _ = io::stdin().read_to_end(&mut sink);
+                drop(file);
+                return;
+            }
+            "hold_flock_blocking" => {
+                let file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(false)
+                    .open(db_path)
+                    .expect("child open existing flock target for blocking lock");
+                println!("LIBRA_RB10_OPENED");
+                let _ = io::stdout().flush();
+                file.lock().expect("child acquire blocking exclusive flock");
+                println!("{RB10_READY_MARKER}");
+                let _ = io::stdout().flush();
+                let mut sink = Vec::new();
+                let _ = io::stdin().read_to_end(&mut sink);
+                drop(file);
+                return;
+            }
+            "hold_flock_shared" => {
+                let file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .open(db_path)
+                    .expect("child open shared flock target");
+                file.try_lock_shared().expect("child acquire shared flock");
+                println!("{RB10_READY_MARKER}");
+                let _ = io::stdout().flush();
+                let mut sink = Vec::new();
+                let _ = io::stdin().read_to_end(&mut sink);
+                drop(file);
+                return;
+            }
+            "probe_flock_busy" => {
+                let file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(false)
+                    .open(db_path)
+                    .expect("child open existing flock target");
+                match file.try_lock() {
+                    Err(fs::TryLockError::WouldBlock) => {
+                        println!("{RB10_BUSY_MARKER}");
+                        let _ = io::stdout().flush();
+                    }
+                    Ok(()) => panic!("expected WouldBlock on held flock, acquired lock instead"),
+                    Err(fs::TryLockError::Error(err)) => {
+                        panic!("unexpected flock probe error: {err}")
+                    }
+                }
+                return;
+            }
+            "hold_maintenance_shared" => {
+                let guard = MaintenanceLock::shared(db_path)
+                    .expect("child acquire shared maintenance.lock");
+                println!("{RB10_READY_MARKER}");
+                let _ = io::stdout().flush();
+                let mut sink = Vec::new();
+                let _ = io::stdin().read_to_end(&mut sink);
+                drop(guard);
+                return;
+            }
+            "hold_maintenance_exclusive" => {
+                let guard = MaintenanceLock::try_exclusive(db_path, Duration::ZERO)
+                    .expect("child try_exclusive maintenance.lock")
+                    .expect("child must acquire uncontended maintenance.lock");
+                println!("{RB10_READY_MARKER}");
+                let _ = io::stdout().flush();
+                let mut sink = Vec::new();
+                let _ = io::stdin().read_to_end(&mut sink);
+                drop(guard);
+                return;
+            }
+            "probe_maintenance_shared_busy" => {
+                let lock_path = db_path.join("maintenance.lock");
+                let file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(false)
+                    .open(&lock_path)
+                    .expect("child open existing maintenance.lock");
+                match file.try_lock_shared() {
+                    Err(fs::TryLockError::WouldBlock) => {
+                        println!("{RB10_BUSY_MARKER}");
+                        let _ = io::stdout().flush();
+                    }
+                    Ok(()) => {
+                        panic!(
+                            "expected WouldBlock on shared maintenance.lock probe, acquired lock"
+                        )
+                    }
+                    Err(fs::TryLockError::Error(err)) => {
+                        panic!("unexpected maintenance.lock probe error: {err}")
+                    }
+                }
+                return;
+            }
+            _ => {}
+        }
+
         let opts = SqliteConnectOptions::new()
             .filename(db_path)
             .create_if_missing(false)
@@ -3306,6 +4582,756 @@ mod tests {
                     "{case_label}: stray -shm must remain byte-identical"
                 );
             }
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum SnapshotNode {
+        Dir,
+        File(Vec<u8>),
+        Symlink(PathBuf),
+    }
+
+    fn snapshot_directory_tree(root: &Path) -> std::collections::BTreeMap<PathBuf, SnapshotNode> {
+        let mut out = std::collections::BTreeMap::new();
+        if !root.exists() && fs::symlink_metadata(root).is_err() {
+            return out;
+        }
+        fn walk(
+            base: &Path,
+            dir: &Path,
+            out: &mut std::collections::BTreeMap<PathBuf, SnapshotNode>,
+        ) {
+            let entries = fs::read_dir(dir).expect("read directory for snapshot");
+            for entry in entries {
+                let entry = entry.expect("directory entry for snapshot");
+                let path = entry.path();
+                let rel = path
+                    .strip_prefix(base)
+                    .expect("strip snapshot base")
+                    .to_path_buf();
+                let meta = fs::symlink_metadata(&path).expect("lstat entry for snapshot");
+                if meta.file_type().is_symlink() {
+                    let target = fs::read_link(&path).expect("read symlink target for snapshot");
+                    out.insert(rel, SnapshotNode::Symlink(target));
+                } else if meta.file_type().is_dir() {
+                    out.insert(rel, SnapshotNode::Dir);
+                    walk(base, &path, out);
+                } else {
+                    let bytes = fs::read(&path).expect("read file bytes for snapshot");
+                    out.insert(rel, SnapshotNode::File(bytes));
+                }
+            }
+        }
+        walk(root, root, &mut out);
+        out
+    }
+
+    #[cfg(unix)]
+    fn file_dev_ino(path: &Path) -> (u64, u64) {
+        use std::os::unix::fs::MetadataExt as _;
+        let meta = fs::symlink_metadata(path).expect("lstat path for dev/ino");
+        (meta.dev(), meta.ino())
+    }
+
+    async fn create_full_rb10n_fixture_repo(
+        storage: &Path,
+        create_writer_lock: bool,
+        create_capacity_lock: bool,
+    ) {
+        use crate::storage::{
+            capture_store::CaptureQueueLane,
+            queue::{FRAME_FLAG_NONE, FRAME_FLAG_PRIORITY, append_frame, init_capture_queue},
+        };
+
+        let git_db = git_sqlite_db_path(storage);
+        let capture_db = capture_sqlite_db_path(storage);
+        create_delete_mode_fixture_db(&git_db).await;
+        create_delete_mode_fixture_db(&capture_db).await;
+
+        let private_dir = storage.join(PRIVATE_SUBDIR);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&private_dir, fs::Permissions::from_mode(0o700))
+                .expect("chmod 0700 private");
+        }
+
+        // Populate legacy `capture-spool/` with ready/ and quarantine/ events.
+        let spool_dir = capture_spool_dir_path(storage);
+        let spool_tmp = capture_spool_tmp_dir_path(storage);
+        let spool_ready = spool_dir.join("ready");
+        let spool_quarantine = spool_dir.join("quarantine");
+        for d in [&spool_dir, &spool_tmp, &spool_ready, &spool_quarantine] {
+            fs::create_dir_all(d).expect("create capture-spool subdir");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                fs::set_permissions(d, fs::Permissions::from_mode(0o700))
+                    .expect("chmod 0700 spool subdir");
+            }
+        }
+        fs::write(
+            spool_ready.join("1-0000000000000001-0001~dedup-ready-1"),
+            b"{\"event\":\"ready-1\"}",
+        )
+        .expect("seed spool ready event");
+        fs::write(
+            spool_quarantine.join("1-0000000000000002-0001~dedup-quar-1"),
+            b"{\"event\":\"quarantine-1\"}",
+        )
+        .expect("seed spool quarantine event");
+        if create_capacity_lock {
+            let cap_lock = capture_spool_capacity_lock_path(storage);
+            fs::write(&cap_lock, b"").expect("seed capture-spool/capacity.lock");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                fs::set_permissions(&cap_lock, fs::Permissions::from_mode(0o600))
+                    .expect("chmod 0600 capacity.lock");
+            }
+        }
+
+        // Populate `capture-queue/` with genuine dual-lane LTM2 + committed frames.
+        init_capture_queue(storage).expect("init capture-queue fixture");
+        append_frame(
+            storage,
+            CaptureQueueLane::Priority,
+            FRAME_FLAG_PRIORITY,
+            "rb10n-prio-1",
+            b"priority-payload-bytes",
+        )
+        .expect("append priority frame");
+        append_frame(
+            storage,
+            CaptureQueueLane::Normal,
+            FRAME_FLAG_NONE,
+            "rb10n-norm-1",
+            b"normal-payload-bytes",
+        )
+        .expect("append normal frame");
+        if create_writer_lock {
+            let writer_lock = capture_queue_writer_lock_path(storage);
+            fs::write(&writer_lock, b"").expect("seed capture-queue/writer.lock");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                fs::set_permissions(&writer_lock, fs::Permissions::from_mode(0o600))
+                    .expect("chmod 0600 writer.lock");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn forward_phase1_rejects_inflight_spool_tmp_and_queue_append_lock() {
+        // Test BOTH when optional lock files (`writer.lock`, `capacity.lock`)
+        // already exist AND when they are initially absent so AC3/AC4/AC7/AC8
+        // prove zero file creation or byte mutation in `capture-spool/` and
+        // `capture-queue/` under every realistic repository state.
+        for (create_writer_lock, create_capacity_lock, variant_label) in [
+            (true, true, "all-locks-present"),
+            (false, false, "writer-and-capacity-locks-absent"),
+        ] {
+            // =================================================================
+            // AC1-AC4: Active unexpired `capture-spool/tmp/` in-flight file
+            // (simulating `spool.rs:119-145` after `capacity.lock` is released).
+            // =================================================================
+            {
+                let dir = tempdir().expect("create RB-10n tmp contention dir");
+                let storage = dir.path().join(".libra");
+                create_full_rb10n_fixture_repo(&storage, create_writer_lock, create_capacity_lock)
+                    .await;
+
+                let git_db = git_sqlite_db_path(&storage);
+                let capture_db = capture_sqlite_db_path(&storage);
+                let spool_dir = capture_spool_dir_path(&storage);
+                let queue_dir = capture_queue_dir_path(&storage);
+                let inflight_tmp =
+                    capture_spool_tmp_dir_path(&storage).join("1-0000000000000099-0001~inflight");
+                fs::write(&inflight_tmp, b"{\"partial_envelope\":true}")
+                    .expect("create unexpired in-flight capture-spool/tmp file");
+
+                let before_git = fs::read(&git_db).expect("snapshot libra.db before AC1");
+                let before_cap = fs::read(&capture_db).expect("snapshot capture.db before AC1");
+                let before_spool = snapshot_directory_tree(&spool_dir);
+                let before_queue = snapshot_directory_tree(&queue_dir);
+
+                // AC1: must fail closed with `LBR-IO-001` (and zero path leakage).
+                let err = quiesce_forward_repository_phase1(&storage)
+                    .await
+                    .expect_err("unexpired capture-spool/tmp file must fail closed");
+                assert_eq!(
+                    err.stable_code_str(),
+                    "LBR-IO-001",
+                    "AC1 ({variant_label}): expected LBR-IO-001, got {err}"
+                );
+                let rendered = err.to_string();
+                assert!(
+                    rendered.contains("capture-spool/tmp"),
+                    "AC1 ({variant_label}): diagnostic must mention capture-spool/tmp, got: {rendered}"
+                );
+                assert!(
+                    !rendered.contains(&storage.to_string_lossy().into_owned()),
+                    "AC1 ({variant_label}): error must not leak private storage path: {rendered}"
+                );
+
+                // AC2: source SQLite `.db` files byte-for-byte identical.
+                assert_eq!(
+                    fs::read(&git_db).expect("snapshot libra.db after AC1"),
+                    before_git,
+                    "AC2 ({variant_label}): libra.db must be byte-for-byte unchanged"
+                );
+                assert_eq!(
+                    fs::read(&capture_db).expect("snapshot capture.db after AC1"),
+                    before_cap,
+                    "AC2 ({variant_label}): capture.db must be byte-for-byte unchanged"
+                );
+
+                // AC3: `capture-spool/` full directory tree & file bytes identical.
+                assert_eq!(
+                    snapshot_directory_tree(&spool_dir),
+                    before_spool,
+                    "AC3 ({variant_label}): capture-spool/ must be byte-for-byte unchanged"
+                );
+
+                // AC4: `capture-queue/` full directory tree & file bytes identical.
+                assert_eq!(
+                    snapshot_directory_tree(&queue_dir),
+                    before_queue,
+                    "AC4 ({variant_label}): capture-queue/ must be byte-for-byte unchanged"
+                );
+
+                // Clock-skew regression: a future-timestamped `tmp/` file must
+                // ALSO be treated as unexpired / in-flight and rejected.
+                let future_file = OpenOptions::new()
+                    .write(true)
+                    .open(&inflight_tmp)
+                    .expect("open inflight tmp for future mtime");
+                future_file
+                    .set_modified(SystemTime::now() + Duration::from_secs(3600))
+                    .expect("set future mtime on inflight tmp");
+                drop(future_file);
+                let future_err = quiesce_forward_repository_phase1(&storage)
+                    .await
+                    .expect_err("future-mtime capture-spool/tmp file must fail closed");
+                assert_eq!(future_err.stable_code_str(), "LBR-IO-001");
+                assert_eq!(fs::read(&git_db).expect("git after future"), before_git);
+                assert_eq!(fs::read(&capture_db).expect("cap after future"), before_cap);
+                assert_eq!(snapshot_directory_tree(&spool_dir), before_spool);
+                assert_eq!(snapshot_directory_tree(&queue_dir), before_queue);
+            }
+
+            // =================================================================
+            // AC5-AC8: External OS process holding `capture-queue/append.lock`
+            // (tested with BOTH a shared lock `try_lock_shared()` AND an
+            // exclusive lock `try_lock()` holder!).
+            // =================================================================
+            for (append_mode, lock_kind_label) in [
+                ("hold_flock_shared", "shared-holder"),
+                ("hold_flock_exclusive", "exclusive-holder"),
+            ] {
+                let dir = tempdir().expect("create RB-10n append.lock contention dir");
+                let storage = dir.path().join(".libra");
+                create_full_rb10n_fixture_repo(&storage, create_writer_lock, create_capacity_lock)
+                    .await;
+
+                let git_db = git_sqlite_db_path(&storage);
+                let capture_db = capture_sqlite_db_path(&storage);
+                let spool_dir = capture_spool_dir_path(&storage);
+                let queue_dir = capture_queue_dir_path(&storage);
+                let append_lock = capture_queue_append_lock_path(&storage);
+
+                let holder = ChildLockHolder::spawn(append_mode, &append_lock);
+
+                let before_git = fs::read(&git_db).expect("snapshot libra.db before AC5");
+                let before_cap = fs::read(&capture_db).expect("snapshot capture.db before AC5");
+                let before_queue = snapshot_directory_tree(&queue_dir);
+                let before_spool = snapshot_directory_tree(&spool_dir);
+
+                // AC5: must fail closed with `LBR-IO-001` (and zero path leakage).
+                let err = quiesce_forward_repository_phase1(&storage)
+                    .await
+                    .expect_err("contended capture-queue/append.lock must fail closed");
+                assert_eq!(
+                    err.stable_code_str(),
+                    "LBR-IO-001",
+                    "AC5 ({variant_label}/{lock_kind_label}): expected LBR-IO-001, got {err}"
+                );
+                let rendered = err.to_string();
+                assert!(
+                    rendered.contains("append.lock"),
+                    "AC5 ({variant_label}/{lock_kind_label}): diagnostic must mention append.lock, got: {rendered}"
+                );
+                assert!(
+                    !rendered.contains(&storage.to_string_lossy().into_owned()),
+                    "AC5 ({variant_label}/{lock_kind_label}): error must not leak private storage path: {rendered}"
+                );
+
+                // AC6: source SQLite `.db` files byte-for-byte identical.
+                assert_eq!(
+                    fs::read(&git_db).expect("snapshot libra.db after AC5"),
+                    before_git,
+                    "AC6 ({variant_label}/{lock_kind_label}): libra.db must be byte-for-byte unchanged"
+                );
+                assert_eq!(
+                    fs::read(&capture_db).expect("snapshot capture.db after AC5"),
+                    before_cap,
+                    "AC6 ({variant_label}/{lock_kind_label}): capture.db must be byte-for-byte unchanged"
+                );
+
+                // AC7: `capture-queue/` full directory tree & file bytes identical.
+                assert_eq!(
+                    snapshot_directory_tree(&queue_dir),
+                    before_queue,
+                    "AC7 ({variant_label}/{lock_kind_label}): capture-queue/ must be byte-for-byte unchanged"
+                );
+
+                // AC8: `capture-spool/` full directory tree & file bytes identical.
+                assert_eq!(
+                    snapshot_directory_tree(&spool_dir),
+                    before_spool,
+                    "AC8 ({variant_label}/{lock_kind_label}): capture-spool/ must be byte-for-byte unchanged"
+                );
+
+                holder.release_and_wait();
+            }
+        }
+
+        // =====================================================================
+        // Codex R2 P1 regression: NEVER unlink a newly created lock inode on
+        // late rejection (zero POSIX lock-inode split-brain).
+        //
+        // Start with `capacity.lock` absent; while migration holds the newly
+        // created `capacity.lock` just before a late rejection (`tmp/` race),
+        // spawn waiting Producer 1 (`hold_flock_blocking`) that opens that
+        // exact inode and blocks on `flock(LOCK_EX)`. When migration fails
+        // closed (`LBR-IO-001`) and drops its lock WITHOUT unlinking
+        // `capacity.lock`, Producer 1 acquires the lock on the live canonical
+        // inode, and competing Producer 2 (`probe_flock_busy`) is strictly
+        // blocked (`WouldBlock`) on the exact same inode!
+        // =====================================================================
+        {
+            let dir = tempdir().expect("create RB-10n no-split-brain dir");
+            let storage = dir.path().join(".libra");
+            create_full_rb10n_fixture_repo(&storage, false, false).await;
+
+            let git_db = git_sqlite_db_path(&storage);
+            let capture_db = capture_sqlite_db_path(&storage);
+            let before_git = fs::read(&git_db).expect("snap git before late race");
+            let before_cap = fs::read(&capture_db).expect("snap cap before late race");
+
+            let waiter_child: std::sync::Mutex<
+                Option<(Child, ChildStdin, BufReader<ChildStdout>)>,
+            > = std::sync::Mutex::new(None);
+            let created_ino: std::sync::Mutex<Option<(u64, u64)>> = std::sync::Mutex::new(None);
+
+            let spawn_waiting_producer_and_plant_tmp = |s: &Path| {
+                let cap_lock = capture_spool_capacity_lock_path(s);
+                assert!(
+                    cap_lock.exists(),
+                    "capacity.lock must already be created and locked in canonical order"
+                );
+                #[cfg(unix)]
+                {
+                    *created_ino.lock().expect("lock created_ino") = Some(file_dev_ino(&cap_lock));
+                }
+                // Spawn Producer 1 which opens the exact `capacity.lock` inode,
+                // emits `LIBRA_RB10_OPENED`, and then blocks in `file.lock()`
+                // waiting for migration to release it.
+                let exe = std::env::current_exe().expect("locate test binary");
+                let mut child = Command::new(exe)
+                    .arg("--exact")
+                    .arg("storage::migrate::tests::forward_phase1_rejects_writer_and_delete_active_reader")
+                    .arg("--nocapture")
+                    .env(RB10_CHILD_MODE_ENV, "hold_flock_blocking")
+                    .env(RB10_CHILD_DB_ENV, &cap_lock)
+                    .env("LIBRA_TEST", "1")
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .expect("spawn waiting Producer 1");
+                let stdin = child.stdin.take().expect("capture waiter stdin");
+                let stdout = child.stdout.take().expect("capture waiter stdout");
+                let mut reader = BufReader::new(stdout);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    let n = reader.read_line(&mut line).expect("read waiter stdout");
+                    assert!(n > 0, "waiting Producer 1 exited before LIBRA_RB10_OPENED");
+                    if line.trim() == "LIBRA_RB10_OPENED" {
+                        break;
+                    }
+                }
+                *waiter_child.lock().expect("lock waiter_child") = Some((child, stdin, reader));
+
+                // Trigger late rejection via an unexpired `capture-spool/tmp/` file.
+                let raced_tmp =
+                    capture_spool_tmp_dir_path(s).join("1-0000000000000099-0002~raced-inflight");
+                fs::write(&raced_tmp, b"{\"raced_inflight\":true}").expect("plant raced tmp file");
+            };
+
+            let race_err = quiesce_forward_repository_phase1_inner(
+                &storage,
+                &Phase1NonSqliteTestHooks {
+                    after_locks_before_tmp_recheck: Some(&spawn_waiting_producer_and_plant_tmp),
+                },
+            )
+            .await
+            .expect_err("late raced capture-spool/tmp file must fail closed");
+            assert_eq!(race_err.stable_code_str(), "LBR-IO-001");
+            assert_eq!(fs::read(&git_db).expect("git after late race"), before_git);
+            assert_eq!(
+                fs::read(&capture_db).expect("cap after late race"),
+                before_cap
+            );
+
+            // Migration released `capacity.lock` WITHOUT unlinking it -> waiting
+            // Producer 1 now acquires the exclusive lock on that exact inode.
+            let (mut child, stdin, mut reader) = waiter_child
+                .lock()
+                .expect("lock waiter_child")
+                .take()
+                .expect("waiting Producer 1 handle present");
+            let mut line = String::new();
+            loop {
+                line.clear();
+                let n = reader
+                    .read_line(&mut line)
+                    .expect("read Producer 1 READY marker");
+                assert!(n > 0, "Producer 1 exited before acquiring capacity.lock");
+                if line.trim() == RB10_READY_MARKER {
+                    break;
+                }
+            }
+
+            let cap_lock = capture_spool_capacity_lock_path(&storage);
+            assert!(
+                cap_lock.exists(),
+                "capacity.lock must remain present at its canonical path (never unlinked)"
+            );
+            #[cfg(unix)]
+            assert_eq!(
+                Some(file_dev_ino(&cap_lock)),
+                *created_ino.lock().expect("lock created_ino"),
+                "capacity.lock on disk must be the exact same inode held by Producer 1"
+            );
+
+            // Competing subsequent Producer 2 probing `capacity.lock` MUST be
+            // blocked (`WouldBlock`), proving zero lock-inode split-brain!
+            run_child_busy_probe("probe_flock_busy", &cap_lock);
+
+            // Cleanly release Producer 1.
+            drop(stdin);
+            let mut sink = String::new();
+            let _ = reader.read_to_string(&mut sink);
+            let status = child.wait().expect("wait Producer 1");
+            assert!(status.success(), "Producer 1 exited abnormally: {status:?}");
+        }
+
+        // =====================================================================
+        // Codex R1 Findings 2 & 3 regressions:
+        // - Symlink and hard-linked `maintenance.lock` fail closed `LBR-IO-001`
+        // - Same-process `MaintenanceLock::shared` contention fails closed
+        // - Hard-linked `capture-spool/tmp` regular file (even containing the
+        //   exact tombstone sentinel bytes!) and symlinked `capture-spool/tmp`
+        //   both fail closed `LBR-IO-001` with zero disk mutation.
+        // =====================================================================
+        {
+            let dir = tempdir().expect("create RB-10n link-safety dir");
+            let storage = dir.path().join(".libra");
+            create_full_rb10n_fixture_repo(&storage, true, true).await;
+
+            // Same-process `MaintenanceLock::shared` contention must fail closed.
+            {
+                let shared_guard =
+                    MaintenanceLock::shared(&storage).expect("acquire same-process shared lock");
+                let err = quiesce_forward_repository_phase1(&storage)
+                    .await
+                    .expect_err("same-process shared MaintenanceLock must fail closed");
+                assert_eq!(err.stable_code_str(), "LBR-IO-001");
+                drop(shared_guard);
+            }
+
+            #[cfg(unix)]
+            {
+                let maint_path = storage.join("maintenance.lock");
+                let _ = fs::remove_file(&maint_path);
+                let decoy_target = dir.path().join("maint_decoy");
+                fs::write(&decoy_target, b"decoy").expect("create decoy target");
+
+                // Symlink `maintenance.lock`.
+                std::os::unix::fs::symlink(&decoy_target, &maint_path)
+                    .expect("plant symlink maintenance.lock");
+                let sym_err = quiesce_forward_repository_phase1(&storage)
+                    .await
+                    .expect_err("symlink maintenance.lock must fail closed");
+                assert_eq!(sym_err.stable_code_str(), "LBR-IO-001");
+                fs::remove_file(&maint_path).expect("remove symlink maintenance.lock");
+
+                // Hard-linked `maintenance.lock` (`nlink == 2`).
+                fs::hard_link(&decoy_target, &maint_path)
+                    .expect("plant hard-linked maintenance.lock");
+                let hl_err = quiesce_forward_repository_phase1(&storage)
+                    .await
+                    .expect_err("hard-linked maintenance.lock must fail closed");
+                assert_eq!(hl_err.stable_code_str(), "LBR-IO-001");
+                fs::remove_file(&maint_path).expect("remove hard-linked maintenance.lock");
+
+                // Hard-linked `capture-spool/tmp` tombstone sentinel (`nlink == 2`)
+                // and symlinked `capture-spool/tmp` must both fail closed.
+                let tmp_path = capture_spool_tmp_dir_path(&storage);
+                fs::remove_dir(&tmp_path).expect("remove empty tmp dir for link test");
+                let tomb_src = dir.path().join("tombstone_src");
+                fs::write(&tomb_src, CAPTURE_SPOOL_TOMBSTONE_SENTINEL)
+                    .expect("write tombstone sentinel source");
+
+                fs::hard_link(&tomb_src, &tmp_path).expect("hard-link tombstone to tmp");
+                let hl_tomb_err = quiesce_forward_repository_phase1(&storage)
+                    .await
+                    .expect_err("hard-linked capture-spool/tmp tombstone must fail closed");
+                assert_eq!(hl_tomb_err.stable_code_str(), "LBR-IO-001");
+                fs::remove_file(&tmp_path).expect("remove hard-linked tmp");
+
+                std::os::unix::fs::symlink(&tomb_src, &tmp_path).expect("symlink tombstone to tmp");
+                let sym_tomb_err = quiesce_forward_repository_phase1(&storage)
+                    .await
+                    .expect_err("symlinked capture-spool/tmp must fail closed");
+                assert_eq!(sym_tomb_err.stable_code_str(), "LBR-IO-001");
+                fs::remove_file(&tmp_path).expect("remove symlinked tmp");
+            }
+        }
+
+        // =====================================================================
+        // Additional lock contention regressions across ALL remaining non-SQLite
+        // locks (`migration.lock`, `maintenance.lock` SHARED/EXCLUSIVE,
+        // `capture-spool-consumer.lock`, `capture-queue/writer.lock`,
+        // `capture-spool/capacity.lock`) + SQLite reader contention with absent
+        // `writer.lock` -> ALL fail closed `LBR-IO-001` with 3-domain snapshots
+        // 100% byte-for-byte unchanged.
+        // =====================================================================
+        {
+            let dir = tempdir().expect("create RB-10n all-locks contention dir");
+            let storage = dir.path().join(".libra");
+            create_full_rb10n_fixture_repo(&storage, true, true).await;
+
+            // Pre-create `migration.lock` and `capture-spool-consumer.lock` so
+            // external OS children can lock the exact inodes.
+            let mig_lock = migration_lock_path(&storage);
+            let consumer_lock = capture_spool_consumer_lock_path(&storage);
+            for p in [&mig_lock, &consumer_lock] {
+                fs::write(p, b"").expect("seed lock file");
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    fs::set_permissions(p, fs::Permissions::from_mode(0o600))
+                        .expect("chmod 0600 lock file");
+                }
+            }
+
+            let git_db = git_sqlite_db_path(&storage);
+            let capture_db = capture_sqlite_db_path(&storage);
+            let spool_dir = capture_spool_dir_path(&storage);
+            let queue_dir = capture_queue_dir_path(&storage);
+
+            let lock_cases: Vec<(&str, &str, PathBuf)> = vec![
+                ("migration.lock", "hold_flock_exclusive", mig_lock.clone()),
+                (
+                    "maintenance.lock (SHARED)",
+                    "hold_maintenance_shared",
+                    storage.clone(),
+                ),
+                (
+                    "maintenance.lock (EXCLUSIVE)",
+                    "hold_maintenance_exclusive",
+                    storage.clone(),
+                ),
+                (
+                    "capture-spool-consumer.lock",
+                    "hold_flock_exclusive",
+                    consumer_lock.clone(),
+                ),
+                (
+                    "capture-queue/writer.lock",
+                    "hold_flock_exclusive",
+                    capture_queue_writer_lock_path(&storage),
+                ),
+                (
+                    "capture-spool/capacity.lock",
+                    "hold_flock_exclusive",
+                    capture_spool_capacity_lock_path(&storage),
+                ),
+                ("libra.db (DELETE reader)", "delete_reader", git_db.clone()),
+            ];
+
+            for (label, child_mode, target) in lock_cases {
+                let holder = ChildLockHolder::spawn(child_mode, &target);
+                let before_git = fs::read(&git_db).expect("snap git");
+                let before_cap = fs::read(&capture_db).expect("snap cap");
+                let before_spool = snapshot_directory_tree(&spool_dir);
+                let before_queue = snapshot_directory_tree(&queue_dir);
+
+                let err = quiesce_forward_repository_phase1(&storage)
+                    .await
+                    .expect_err("contended lock must fail closed");
+                assert_eq!(err.stable_code_str(), "LBR-IO-001", "{label}");
+                assert_eq!(fs::read(&git_db).expect("after git"), before_git, "{label}");
+                assert_eq!(
+                    fs::read(&capture_db).expect("after cap"),
+                    before_cap,
+                    "{label}"
+                );
+                assert_eq!(snapshot_directory_tree(&spool_dir), before_spool, "{label}");
+                assert_eq!(snapshot_directory_tree(&queue_dir), before_queue, "{label}");
+                holder.release_and_wait();
+            }
+
+            // Symlink inside `capture-spool/tmp/` must fail closed with zero mutation.
+            #[cfg(unix)]
+            {
+                let sym_entry = capture_spool_tmp_dir_path(&storage).join("symlink-entry");
+                std::os::unix::fs::symlink(&git_db, &sym_entry).expect("create symlink in tmp/");
+                let before_spool = snapshot_directory_tree(&spool_dir);
+                let sym_err = quiesce_forward_repository_phase1(&storage)
+                    .await
+                    .expect_err("symlink inside capture-spool/tmp must fail closed");
+                assert_eq!(sym_err.stable_code_str(), "LBR-IO-001");
+                assert_eq!(snapshot_directory_tree(&spool_dir), before_spool);
+                fs::remove_file(&sym_entry).expect("remove symlink test entry");
+            }
+        }
+
+        // =====================================================================
+        // Positive control:
+        // 1. Strictly expired `capture-spool/tmp/` file (> 24h) does NOT block
+        //    quiescence and is NOT deleted during Phase 1.
+        // 2. Uncontended quiescence median across 5 runs <= 50ms budget.
+        // 3. `capacity.lock` and `append.lock` stay pinned in-place (identical
+        //    inode before, during, and after quiescence — NEVER moved!).
+        // 4. ALL 6 advisory locks + BOTH SQLite OS locks actively block
+        //    independent spawned OS child processes while the guard is held.
+        // =====================================================================
+        {
+            let dir = tempdir().expect("create RB-10n positive control dir");
+            let storage = dir.path().join(".libra");
+            create_full_rb10n_fixture_repo(&storage, true, true).await;
+
+            let expired_tmp =
+                capture_spool_tmp_dir_path(&storage).join("1-0000000000000000-0001~expired");
+            let expired_bytes = b"{\"abandoned\":true}";
+            fs::write(&expired_tmp, expired_bytes).expect("seed expired tmp file");
+            let expired_file = OpenOptions::new()
+                .write(true)
+                .open(&expired_tmp)
+                .expect("open expired tmp file");
+            expired_file
+                .set_modified(SystemTime::now() - Duration::from_secs(25 * 60 * 60))
+                .expect("set mtime > 24h ago");
+            drop(expired_file);
+
+            let git_db = git_sqlite_db_path(&storage);
+            let capture_db = capture_sqlite_db_path(&storage);
+            let capacity_lock = capture_spool_capacity_lock_path(&storage);
+            let append_lock = capture_queue_append_lock_path(&storage);
+            #[cfg(unix)]
+            let cap_ino_before = file_dev_ino(&capacity_lock);
+            #[cfg(unix)]
+            let app_ino_before = file_dev_ino(&append_lock);
+
+            // 5-run median performance budget <= 50ms.
+            let mut samples = Vec::with_capacity(5);
+            for _ in 0..5 {
+                let started = Instant::now();
+                let guard = quiesce_forward_repository_phase1(&storage)
+                    .await
+                    .expect("uncontended Phase 1 quiescence must succeed");
+                samples.push(started.elapsed());
+                guard.close().await.expect("close timed Phase 1 guard");
+            }
+            samples.sort();
+            let median = samples[samples.len() / 2];
+            assert!(
+                median <= Duration::from_millis(50),
+                "RB-10n performance budget exceeded: median {median:?} > 50ms (samples={samples:?})"
+            );
+
+            // Hold guard and verify ALL 6 advisory locks + BOTH SQLite locks
+            // from independent external OS child processes.
+            let guard = quiesce_forward_repository_phase1(&storage)
+                .await
+                .expect("uncontended Phase 1 quiescence must succeed");
+
+            assert_eq!(
+                fs::read(&expired_tmp).expect("expired tmp file must remain untouched in Phase 1"),
+                expired_bytes
+            );
+            #[cfg(unix)]
+            {
+                assert_eq!(
+                    file_dev_ino(&capacity_lock),
+                    cap_ino_before,
+                    "capacity.lock must remain pinned in-place with identical inode"
+                );
+                assert_eq!(
+                    file_dev_ino(&append_lock),
+                    app_ino_before,
+                    "append.lock must remain pinned in-place with identical inode"
+                );
+            }
+
+            run_child_busy_probe("probe_flock_busy", &migration_lock_path(&storage));
+            run_child_busy_probe("probe_maintenance_shared_busy", &storage);
+            run_child_busy_probe(
+                "probe_flock_busy",
+                &capture_spool_consumer_lock_path(&storage),
+            );
+            run_child_busy_probe(
+                "probe_flock_busy",
+                &capture_queue_writer_lock_path(&storage),
+            );
+            run_child_busy_probe("probe_flock_busy", &capacity_lock);
+            run_child_busy_probe("probe_flock_busy", &append_lock);
+            run_child_busy_probe("probe_read_busy", &git_db);
+            run_child_busy_probe("probe_write_busy", &git_db);
+            run_child_busy_probe("probe_read_busy", &capture_db);
+            run_child_busy_probe("probe_write_busy", &capture_db);
+
+            guard.close().await.expect("close held Phase 1 guard");
+
+            // After close, external lock acquisition succeeds again and in-place
+            // lock inodes remain identical.
+            #[cfg(unix)]
+            {
+                assert_eq!(file_dev_ino(&capacity_lock), cap_ino_before);
+                assert_eq!(file_dev_ino(&append_lock), app_ino_before);
+            }
+            let post_holder = ChildLockHolder::spawn("hold_flock_exclusive", &append_lock);
+            post_holder.release_and_wait();
+        }
+
+        // Pre-capture minimal SQLite-only repository (no `capture-spool/` or
+        // `capture-queue/` initially): uncontended quiescence succeeds cleanly
+        // and materializes private lock directories/files at 0700/0600.
+        {
+            let dir = tempdir().expect("create minimal SQLite-only repo dir");
+            let storage = dir.path().join(".libra");
+            create_delete_mode_fixture_db(&git_sqlite_db_path(&storage)).await;
+
+            let guard = quiesce_forward_repository_phase1(&storage)
+                .await
+                .expect("minimal repo Phase 1 quiescence must succeed");
+            run_child_busy_probe(
+                "probe_flock_busy",
+                &capture_spool_capacity_lock_path(&storage),
+            );
+            run_child_busy_probe(
+                "probe_flock_busy",
+                &capture_queue_append_lock_path(&storage),
+            );
+            guard
+                .close()
+                .await
+                .expect("close minimal repo Phase 1 guard");
         }
     }
 }
