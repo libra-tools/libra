@@ -3031,6 +3031,7 @@ mod tests {
         #[cfg(windows)]
         {
             use std::os::windows::io::AsRawHandle as _;
+
             use windows_sys::Win32::{
                 Foundation::{ERROR_LOCK_VIOLATION, HANDLE},
                 Storage::FileSystem::{

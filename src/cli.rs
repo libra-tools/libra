@@ -346,7 +346,11 @@ pub(crate) struct Cli {
 /// subcommand's execute and args are defined in `command` module
 // G-03: the clap derive generates large per-variant parsers; boxing every
 // variant would obscure the CLI definition for no runtime benefit.
-#[allow(clippy::large_enum_variant, clippy::large_unopt_stack_frames)]
+#[allow(
+    unknown_lints,
+    clippy::large_enum_variant,
+    clippy::large_unopt_stack_frames
+)]
 #[derive(Subcommand, Debug)]
 enum Commands {
     // Each variant of the enum represents a subcommand.

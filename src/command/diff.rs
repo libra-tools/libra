@@ -86,7 +86,7 @@ EXAMPLES:
     libra diff -R                           Reverse diff (swap additions and deletions)
     libra --json diff --staged              Structured JSON output for agents";
 
-#[allow(clippy::large_unopt_stack_frames)]
+#[allow(unknown_lints, clippy::large_unopt_stack_frames)]
 #[derive(Parser, Debug, Default, Clone)]
 #[command(after_help = DIFF_EXAMPLES)]
 pub struct DiffArgs {

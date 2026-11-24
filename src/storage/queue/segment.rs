@@ -12770,13 +12770,10 @@ mod tests {
             assert_eq!(seg_bytes.len() as u64, meta.committed_len);
             assert_eq!(crc32c_checksum(&seg_bytes), meta.prefix_crc32c);
             let mut dec = FrameStreamDecoder::new(&seg_bytes[..], meta.committed_len);
-            loop {
-                match dec.next_frame().expect("decode post-race frame") {
-                    FrameStreamItem::Frame { .. } => {
-                        total_decoded_frames += 1;
-                    }
-                    FrameStreamItem::CleanEof { .. } => break,
-                }
+            while let FrameStreamItem::Frame { .. } =
+                dec.next_frame().expect("decode post-race frame")
+            {
+                total_decoded_frames += 1;
             }
         }
         assert_eq!(
@@ -13493,11 +13490,10 @@ mod tests {
     fn decode_all_segment_bytes(seg_bytes: &[u8]) -> Vec<DecodedFrame> {
         let mut decoder = FrameStreamDecoder::new(seg_bytes, seg_bytes.len() as u64);
         let mut out = Vec::new();
-        loop {
-            match decoder.next_frame().expect("decode segment frame") {
-                FrameStreamItem::Frame { frame, .. } => out.push(frame),
-                FrameStreamItem::CleanEof { .. } => break,
-            }
+        while let FrameStreamItem::Frame { frame, .. } =
+            decoder.next_frame().expect("decode segment frame")
+        {
+            out.push(frame);
         }
         out
     }
