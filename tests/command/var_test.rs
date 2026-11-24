@@ -25,28 +25,84 @@ fn ident_regex(prefix: &str) -> Regex {
 }
 
 #[test]
-fn var_committer_ident_ignores_env_until_pm37() {
+fn var_committer_ident_uses_committer_env() {
     let repo = init_identity_repo();
-    // PM-10 AC1: the committer side still reports the configured identity and
-    // "now" (PM-37 rewires it); the author side is covered separately below.
+    let run = |pairs: &[(&'static str, &'static str)]| {
+        let mut envs = vec![("TZ", TX)];
+        envs.extend_from_slice(pairs);
+        let out = run_libra_command_with_env(&["var", "GIT_COMMITTER_IDENT"], repo.path(), &envs);
+        assert_cli_success(&out, "libra var GIT_COMMITTER_IDENT");
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+
+    // AC1: the committer-side name wins over the author side.
+    let text = run(&[
+        ("GIT_COMMITTER_NAME", "C O Mitter"),
+        ("GIT_AUTHOR_NAME", "A U Thor"),
+    ]);
+    assert!(ident_regex("C O Mitter").is_match(&text), "AC1: {text}");
+
+    // AC2: the committer-side email wins over the author side.
+    let text = run(&[("GIT_COMMITTER_EMAIL", "c@d"), ("GIT_AUTHOR_EMAIL", "a@b")]);
+    assert!(
+        Regex::new(r"^C O Mitter <c@d> \d+ \+0800\n$")
+            .expect("AC2 regex")
+            .is_match(&text),
+        "AC2: {text}"
+    );
+
+    // AC3: GIT_COMMITTER_DATE is honored verbatim.
+    let text = run(&[("GIT_COMMITTER_DATE", "1700000000 -0700")]);
+    assert_eq!(text, "C O Mitter <c@d> 1700000000 -0700\n", "AC3");
+
+    // AC4: an invalid committer date is a usage error.
     let out = run_libra_command_with_env(
         &["var", "GIT_COMMITTER_IDENT"],
         repo.path(),
-        &[
-            ("TZ", TX),
-            ("GIT_COMMITTER_NAME", "Env Name"),
-            ("GIT_AUTHOR_NAME", "A U Thor"),
-            ("GIT_COMMITTER_EMAIL", "env@x"),
-            ("GIT_AUTHOR_EMAIL", "a@b"),
-            ("GIT_COMMITTER_DATE", "1700000000 +0000"),
-            ("GIT_AUTHOR_DATE", "1700000000 +0000"),
-        ],
+        &[("TZ", TX), ("GIT_COMMITTER_DATE", "garbage")],
     );
-    assert_cli_success(&out, "PM-10 AC1 libra var GIT_COMMITTER_IDENT");
-    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(!out.status.success(), "AC4 must fail");
     assert!(
-        ident_regex("C O Mitter").is_match(&text),
-        "PM-10 AC1: {text}"
+        String::from_utf8_lossy(&out.stderr).contains("LBR-CLI-002"),
+        "AC4 code"
+    );
+
+    // AC5: only the committer-side date is validated.
+    let text = run(&[
+        ("GIT_COMMITTER_DATE", "1700000000 -0700"),
+        ("GIT_AUTHOR_DATE", "garbage"),
+    ]);
+    assert_eq!(text, "C O Mitter <c@d> 1700000000 -0700\n", "AC5");
+
+    // AC6: Libra's cross-role fallback.
+    let text = run(&[("GIT_AUTHOR_NAME", "A U Thor")]);
+    assert!(ident_regex("A U Thor").is_match(&text), "AC6: {text}");
+
+    // AC7: EMAIL is consulted before the configured email.
+    let text = run(&[("EMAIL", "e@f")]);
+    assert!(
+        Regex::new(r"^C O Mitter <e@f> \d+ \+0800\n$")
+            .expect("AC7 regex")
+            .is_match(&text),
+        "AC7: {text}"
+    );
+
+    // AC8: user.useConfigOnly suppresses only the identity env vars.
+    assert_cli_success(
+        &run_libra_command(
+            &["config", "set", "user.useConfigOnly", "true"],
+            repo.path(),
+        ),
+        "AC8 config",
+    );
+    let text = run(&[
+        ("GIT_COMMITTER_NAME", "C O Mitter"),
+        ("GIT_COMMITTER_DATE", "1700000000 -0700"),
+    ]);
+    assert_eq!(text, "C O Mitter <c@d> 1700000000 -0700\n", "AC8");
+    let _ = run_libra_command(
+        &["config", "set", "user.useConfigOnly", "false"],
+        repo.path(),
     );
 }
 

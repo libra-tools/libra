@@ -1677,7 +1677,7 @@ PY
 ### Task PM-37: `libra var GIT_COMMITTER_IDENT` 接入提交者侧身份与日期环境变量（#995；自 PM-10a 拆出）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-23：`libra var GIT_COMMITTER_IDENT` 改走既有 `pub(crate) commit::create_committer_signature`（提交者身份 + 仅 `GIT_COMMITTER_DATE`），作者侧同理由 `create_author_signature` 提供；`commit` 路径未改（`commit_test` 63/63）。`ident_value` 统一按角色分派并复用 `CommitError → CliError` 映射，未知/缺名仍 `LBR-CLI-002`、身份缺失 `LBR-AUTH-001`。AC1–AC8 由 `command::var_test::var_committer_ident_uses_committer_env` 覆盖；`var_test` 5/5；EN/zh/开发文档与 `COMPATIBILITY.md` 的 `var` 行同步。顺带把 `ResolvedDiffConfig::color_moved_ws` 标为 `#[allow(dead_code)]`（保留其在配置解析期的 `--color-moved-ws` 校验，避免未知模式直到渲染期才报错）。
 **Description:** 自 `PM-10a` 拆出：`libra var GIT_COMMITTER_IDENT` 改用 `commit` 的提交者专用入口 `create_committer_signature`（`src/command/commit.rs:926-937`，只解析提交者身份与 `GIT_COMMITTER_DATE`）：提交者名按 `GIT_COMMITTER_NAME` > `GIT_AUTHOR_NAME` > `LIBRA_COMMITTER_NAME` > `user.name`、邮箱按 `GIT_COMMITTER_EMAIL` > `GIT_AUTHOR_EMAIL` > `EMAIL` > `LIBRA_COMMITTER_EMAIL` > `user.email`（Libra 既有次序与交叉回退，有意差异），`user.useConfigOnly` 为真时只忽略身份（名字与邮箱）环境变量、日期环境变量仍生效（同 `commit`，`src/command/commit.rs:724-794,896-937`）；`GIT_COMMITTER_DATE` 生效、非法时以 `LBR-CLI-002` 失败；非法的 `GIT_AUTHOR_DATE` 不影响 `GIT_COMMITTER_IDENT`。
 **Out of scope:** `GIT_AUTHOR_IDENT`（`PM-10a`）；提交者名链中的 `LIBRA_COMMITTER_NAME` 与提交者邮箱链中的 `GIT_AUTHOR_EMAIL`/`LIBRA_COMMITTER_EMAIL`（`committer_env_identity` 链 `src/command/commit.rs:708-722` 的其余链位；本卡调用既有 `create_committer_signature`、不修改 `src/command/commit.rs`，不单独验收）；`author.*`/`committer.*` 配置与身份自动探测（尚未排期）。
 **Current evidence:**

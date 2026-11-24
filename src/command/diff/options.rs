@@ -24,7 +24,10 @@ pub(crate) struct ResolvedDiffConfig {
     /// `diff.renameComparisonBudget`: total inexact similarity comparisons;
     /// `None` (unset or `0`) keeps diff unlimited (plan-20260714 §B.7).
     pub(super) rename_comparison_budget: Option<u64>,
-    /// Whitespace modes for moved-line detection.
+    /// Validated moved-line whitespace modes. Read by the log/show renderer
+    /// through `parse_color_moved_ws`; keeping it here makes an unknown mode
+    /// fail during config resolution instead of deep in rendering.
+    #[allow(dead_code)]
     pub(super) color_moved_ws: ColorMovedWs,
     pub(super) prefixes: DiffPrefixes,
 }

@@ -22,7 +22,9 @@ Name <email> <unix-timestamp> <±hhmm>
 
 `GIT_AUTHOR_IDENT` 解析的正是 `libra commit` 会写入的**作者**身份：名字按 `GIT_AUTHOR_NAME` > `GIT_COMMITTER_NAME` > `LIBRA_COMMITTER_NAME` > `user.name`，邮箱按 `GIT_AUTHOR_EMAIL` > `GIT_COMMITTER_EMAIL` > `EMAIL` > `LIBRA_COMMITTER_EMAIL` > `user.email`，并生效 `GIT_AUTHOR_DATE`（非法值以 `LBR-CLI-002` 失败）。设置 `user.useConfigOnly` 时忽略身份类环境变量，但日期仍然生效。只校验作者侧日期，因此非法的 `GIT_COMMITTER_DATE` 不影响该变量。
 
-**本版本的有意限制：** `GIT_COMMITTER_IDENT` 仍忽略身份与日期环境变量、始终报告配置身份与"当前时刻"；提交者侧由后续任务卡接入。
+`GIT_COMMITTER_IDENT` 对应提交者侧：名字按 `GIT_COMMITTER_NAME` > `GIT_AUTHOR_NAME` > `LIBRA_COMMITTER_NAME` > `user.name`，邮箱按 `GIT_COMMITTER_EMAIL` > `GIT_AUTHOR_EMAIL` > `EMAIL` > `LIBRA_COMMITTER_EMAIL` > `user.email`，并生效、校验 `GIT_COMMITTER_DATE`。只校验提交者侧日期，因此非法的 `GIT_AUTHOR_DATE` 不影响该变量。
+
+两个变量因此报告的都是 `libra commit` 实际会写入的值；跨角色回退与"环境变量先于配置"的顺序是 Libra 已记录的有意差异。
 
 `-l` 按 `GIT_COMMITTER_IDENT`、`GIT_AUTHOR_IDENT` 的顺序逐行输出 `NAME=value`，并跳过身份无法解析的变量（与 Git 的 `var -l` 一致）。未知名称、缺少名称或多参数以 `LBR-CLI-002` 失败；身份缺失以 `LBR-AUTH-001` 失败；命令需要仓库（仓库外 `LBR-REPO-001`，与 Git 的有意差异）。
 

@@ -1,16 +1,13 @@
 //! Implements `var` for printing Libra's identity variables.
 
 use clap::Parser;
-use git_internal::internal::object::signature::{Signature, SignatureType};
+use git_internal::internal::object::signature::SignatureType;
 use serde::Serialize;
 
-use crate::{
-    internal::config::{LocalIdentityTarget, resolve_user_identity_sources},
-    utils::{
-        error::{CliError, CliResult, StableErrorCode},
-        output::{OutputConfig, emit_json_data},
-        util,
-    },
+use crate::utils::{
+    error::{CliError, CliResult, StableErrorCode},
+    output::{OutputConfig, emit_json_data},
+    util,
 };
 
 /// `--help` examples shown in `libra var --help` output.
@@ -59,7 +56,7 @@ pub async fn execute_safe(args: VarArgs, output: &OutputConfig) -> CliResult<()>
         for (name, kind) in SUPPORTED {
             // Git's `var -l` skips variables it cannot resolve; the same applies
             // here so an unset identity does not make the listing fail.
-            if let Ok(value) = ident_value(name, kind).await {
+            if let Ok(value) = ident_value(kind).await {
                 variables.push(VarOutput {
                     name: name.to_string(),
                     value,
@@ -96,7 +93,7 @@ pub async fn execute_safe(args: VarArgs, output: &OutputConfig) -> CliResult<()>
         ))
         .with_stable_code(StableErrorCode::CliInvalidArguments));
     };
-    let value = ident_value(&name, kind).await?;
+    let value = ident_value(kind).await?;
     let result = VarOutput { name, value };
     if output.is_json() {
         return emit_json_data("var", &result, output);
@@ -104,38 +101,15 @@ pub async fn execute_safe(args: VarArgs, output: &OutputConfig) -> CliResult<()>
     write_var_output(&format!("{}\n", result.value))
 }
 
-/// Build `Name <email> <unix-ts> <±hhmm>` from the configured identity and the
-/// current local time. This card deliberately ignores the identity and date
-/// environment variables; `PM-10a`/`PM-37` rewire the author/committer sides.
-async fn ident_value(name: &str, kind: SignatureType) -> CliResult<String> {
-    if matches!(kind, SignatureType::Author) {
-        let (signature, _) = crate::command::commit::create_author_signature()
-            .await
-            .map_err(CliError::from)?;
-        return Ok(format!(
-            "{} <{}> {} {}",
-            signature.name, signature.email, signature.timestamp, signature.timezone
-        ));
+/// Build `Name <email> <unix-ts> <±hhmm>` from the same signature resolvers
+/// `libra commit` uses, so `var` reports exactly what a commit would write.
+async fn ident_value(kind: SignatureType) -> CliResult<String> {
+    let (signature, _) = if matches!(kind, SignatureType::Author) {
+        crate::command::commit::create_author_signature().await
+    } else {
+        crate::command::commit::create_committer_signature().await
     }
-    let sources = resolve_user_identity_sources(LocalIdentityTarget::CurrentRepo)
-        .await
-        .map_err(|error| {
-            CliError::failure(format!("failed to read the configured identity: {error:#}"))
-                .with_stable_code(StableErrorCode::AuthMissingCredentials)
-        })?;
-    let (Some(config_name), Some(config_email)) = (sources.config_name, sources.config_email)
-    else {
-        return Err(CliError::failure(format!(
-            "{name} is unavailable: author identity unknown: name and email are not configured"
-        ))
-        .with_stable_code(StableErrorCode::AuthMissingCredentials)
-        .with_hint(
-            "run 'libra config user.name \"Your Name\"' and 'libra config user.email \"you@example.com\"'.",
-        ));
-    };
-    let signature = Signature::new(kind, config_name, config_email);
-    // Git's `var` prints one line; `Signature`'s `Display` is the multi-line
-    // object header, so build the ident form from the fields instead.
+    .map_err(CliError::from)?;
     Ok(format!(
         "{} <{}> {} {}",
         signature.name, signature.email, signature.timestamp, signature.timezone

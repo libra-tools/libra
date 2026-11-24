@@ -32,9 +32,15 @@ author: the name follows `GIT_AUTHOR_NAME` > `GIT_COMMITTER_NAME` >
 the date still applies. Only the author-side date is validated, so a broken
 `GIT_COMMITTER_DATE` does not affect this variable.
 
-**Deliberate limitation (this release):** `GIT_COMMITTER_IDENT` still ignores
-the identity and date environment variables and always reports the configured
-identity with "now"; the committer side is rewired by a follow-up card.
+`GIT_COMMITTER_IDENT` mirrors the committer side: name `GIT_COMMITTER_NAME` >
+`GIT_AUTHOR_NAME` > `LIBRA_COMMITTER_NAME` > `user.name`, email
+`GIT_COMMITTER_EMAIL` > `GIT_AUTHOR_EMAIL` > `EMAIL` > `LIBRA_COMMITTER_EMAIL` >
+`user.email`, with `GIT_COMMITTER_DATE` honored and validated. Only the
+committer-side date is checked, so a broken `GIT_AUTHOR_DATE` does not affect it.
+
+Both variables therefore report exactly what `libra commit` would write; the
+cross-role fallbacks and the "environment before config" order are Libra's
+documented, intentional differences from Git.
 
 `-l` lists the supported variables as `NAME=value` lines in the order
 `GIT_COMMITTER_IDENT`, `GIT_AUTHOR_IDENT`, skipping variables whose identity

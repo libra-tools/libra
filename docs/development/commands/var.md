@@ -15,6 +15,10 @@
   `pub(crate) commit::create_author_signature` (same `resolve_author_identity` +
   `GIT_AUTHOR_DATE` + `user.useConfigOnly` path `libra commit` uses); the
   committer side still uses the PM-10 config-only path until PM-37.
+- 2026-11-23 (PM-37 / #995): `GIT_COMMITTER_IDENT` now goes through
+  `commit::create_committer_signature` (committer identity + `GIT_COMMITTER_DATE`),
+  so both variables report `libra commit`'s signatures. Tests:
+  `var_committer_ident_uses_committer_env` (AC1–AC8).
 
 ## Tests
 
