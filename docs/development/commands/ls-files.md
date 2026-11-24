@@ -56,3 +56,5 @@
 - 改进本命令前，必须先阅读并遵循 [docs/development/commands/_general.md](_general.md)。
 - 行为变更必须同步 `COMPATIBILITY.md`、`docs/commands/ls-files.md`、`docs/commands/zh-CN/ls-files.md` 和相关测试。
 - 新增 Git 兼容参数时必须明确 tier、错误码、JSON / machine 输出契约、AI 安全分类和回归测试。
+
+- 2026-11-23（PM-11 / #1017）：`-o`/`-i -o` 的 tracked 集合改为 stage 0..=3 的并集（`index.tracked_entries(stage)` 逐 stage），使未合并冲突路径不再被当作 untracked/ignored（Git `index_name_is_other`）。回归：`ls_files_others_excludes_unmerged_paths`（AC1–AC4）；`ls_files_test` 42/42。

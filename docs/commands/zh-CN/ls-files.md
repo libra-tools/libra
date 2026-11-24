@@ -51,7 +51,7 @@ skip-worktree 条目（见 [`update-index`](update-index.md)）会出现在普�
 | `-v` | 与 `-t` 相同：在每行路径前加状态标签。Git 的 `-v` 会用小写字母标记 assume-unchanged 文件，Libra 不支持该语义，因此 `-v` 输出与 `-t` 相同。 |
 | `-u`, `--unmerged` | 只列出未合并（冲突）条目——索引 stage 1/2/3——以 stage 样式输出。 |
 | `--full-name` | 为 Git 兼容而接受。Libra 始终输出仓库根相对路径（即 `git --full-name` 形式），因此该标志为 no-op。 |
-| `--others`、`-o` | 显示未跟踪的工作区文件。 |
+| `--others`、`-o` | 显示未跟踪的工作区文件。索引中**任一 stage**（含未合并冲突 stage）存在的路径都视为已跟踪、绝不是 "other"（Git 的 `index_name_is_other`），因此冲突路径在合并未解决时也不会列出。 |
 | `--cached`、`-c` | 显示索引中已暂存的文件。 |
 | `-i`、`--ignored` | 只显示被忽略的集合：`-i -o` 列出被忽略的未跟踪文件（`-o` 的反集），`-i -c` 列出匹配 exclude 模式的已跟踪文件。须配合 `-o`/`-c` 且需要 exclude 源——`--exclude-standard` 或显式 `-x`/`-X` pattern（否则退出码 128），与 git 一致。 |
 | `--exclude-standard` | 与 `--others` 一起使用时，遵循标准 Git/Libra ignore 来源（`.gitignore`、worktree 本地 `info/exclude`——`.libra/info/exclude`，Git 或双布局树还包括 `.git/info/exclude`——`core.excludesFile` 和 `.libraignore`）。 |

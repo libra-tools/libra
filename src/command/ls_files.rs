@@ -388,9 +388,11 @@ fn run_ls_files(
     }
 
     if _args.others {
-        let tracked: HashSet<String> = index
-            .tracked_entries(0)
-            .into_iter()
+        // Git's `index_name_is_other`: a path that exists in the index — even as
+        // an unmerged conflict stage — is never "other". Libra's index exposes
+        // entries per stage, so union stages 0..=3.
+        let tracked: HashSet<String> = (0u8..=3)
+            .flat_map(|stage| index.tracked_entries(stage))
             .map(|entry| entry.name.clone())
             .collect();
         // When only the standard exclude is in play (no explicit `-x`/`-X` and not

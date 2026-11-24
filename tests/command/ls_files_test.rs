@@ -1383,3 +1383,118 @@ fn add_refresh_leaves_skip_worktree_stat_untouched() {
         "the sparse entry must stay unstaged"
     );
 }
+
+/// PM-11: `-o` excludes every index path, including unmerged conflict stages.
+#[test]
+fn ls_files_others_excludes_unmerged_paths() {
+    let repo = tempdir().expect("failed to create repository root");
+    init_repo_via_cli(repo.path());
+    configure_identity_via_cli(repo.path());
+    let p = repo.path();
+    std::fs::write(p.join("f"), "base\n").unwrap();
+    std::fs::write(p.join("g.log"), "base\n").unwrap();
+    std::fs::write(p.join("k"), "keep\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "f", "g.log", "k"], p),
+        "add base",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], p),
+        "commit base",
+    );
+    assert_cli_success(&run_libra_command(&["branch", "side"], p), "branch side");
+    assert_cli_success(&run_libra_command(&["switch", "side"], p), "switch side");
+    std::fs::write(p.join("f"), "side\n").unwrap();
+    std::fs::write(p.join("g.log"), "side\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "f", "g.log"], p), "add side");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "side", "--no-verify"], p),
+        "commit side",
+    );
+    assert_cli_success(&run_libra_command(&["switch", "main"], p), "switch main");
+    std::fs::write(p.join("f"), "main\n").unwrap();
+    std::fs::write(p.join("g.log"), "main\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "f", "g.log"], p), "add main");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "main", "--no-verify"], p),
+        "commit main",
+    );
+    // The merge fails with conflicts; the fixture then asserts both are unmerged.
+    let _ = run_libra_command(&["merge", "side"], p);
+    let unmerged = run_libra_command(&["ls-files", "-u"], p);
+    assert_cli_success(&unmerged, "ls-files -u");
+    let merged_paths: std::collections::BTreeSet<String> =
+        String::from_utf8_lossy(&unmerged.stdout)
+            .lines()
+            .filter_map(|line| line.split('\t').nth(1).map(str::to_string))
+            .collect();
+    assert_eq!(
+        merged_paths,
+        ["f".to_string(), "g.log".to_string()]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        "fixture conflict stages"
+    );
+
+    std::fs::write(p.join(".gitignore"), "*.log\n").unwrap();
+    std::fs::write(p.join("u.txt"), "u\n").unwrap();
+    std::fs::write(p.join("ign.log"), "ign\n").unwrap();
+
+    // AC1: untracked files include the conflict paths' neighbours only.
+    let out = run_libra_command(&["ls-files", "-o"], p);
+    assert_cli_success(&out, "AC1");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        ".gitignore\nign.log\nu.txt\n",
+        "AC1"
+    );
+
+    // AC2: the ignored file is filtered by the standard excludes.
+    let out = run_libra_command(&["ls-files", "-o", "--exclude-standard"], p);
+    assert_cli_success(&out, "AC2");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        ".gitignore\nu.txt\n",
+        "AC2"
+    );
+
+    // AC3: `-i -o` lists only the ignored file; the unmerged `g.log` is not untracked.
+    let out = run_libra_command(&["ls-files", "-i", "-o", "--exclude-standard"], p);
+    assert_cli_success(&out, "AC3");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ign.log\n", "AC3");
+
+    // AC4: an add/add conflict in a clean tree lists nothing.
+    let repo = tempdir().expect("failed to create repository root");
+    init_repo_via_cli(repo.path());
+    configure_identity_via_cli(repo.path());
+    let p = repo.path();
+    std::fs::write(p.join("r"), "base\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "r"], p), "add r");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], p),
+        "commit r",
+    );
+    assert_cli_success(&run_libra_command(&["branch", "side"], p), "branch side");
+    assert_cli_success(&run_libra_command(&["switch", "side"], p), "switch side");
+    std::fs::write(p.join("b"), "side\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "b"], p), "add side b");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "side-b", "--no-verify"], p),
+        "commit side b",
+    );
+    assert_cli_success(&run_libra_command(&["switch", "main"], p), "switch main");
+    std::fs::write(p.join("b"), "main\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "b"], p), "add main b");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "main-b", "--no-verify"], p),
+        "commit main b",
+    );
+    let _ = run_libra_command(&["merge", "side"], p);
+    let out = run_libra_command(&["ls-files", "-o"], p);
+    assert_cli_success(&out, "AC4");
+    assert!(
+        out.stdout.is_empty(),
+        "AC4: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}

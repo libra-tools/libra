@@ -1846,7 +1846,7 @@ PY
 ### Task PM-11: 修复 `libra ls-files -o` 排除处于冲突 stage 的索引路径（#1017）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-23：`ls-files -o`/`-i -o` 的 tracked 集合改为 `index.tracked_entries(stage)` 的 stage 0..=3 并集，未合并冲突路径不再被当作 untracked/ignored（Git `index_name_is_other`）；无标志列表的 stage 行仍归 `PM-12`。AC1–AC4 由 `command::ls_files_test::ls_files_others_excludes_unmerged_paths` 覆盖（F11 的三行输出、`--exclude-standard` 两行、`-i -o` 仅 `ign.log`、F11b add/add 冲突时为空）；`ls_files_test` 42/42；EN/zh/开发文档与 `COMPATIBILITY.md` 的 `ls-files` 行同步。
 **Description:** `src/command/ls_files.rs` 中 `-o`（含 `-i -o`）用于剔除已跟踪路径的集合改为包含索引中**任一 stage** 的路径（Git `index_name_is_other`：精确存在或以未合并状态存在都不是 other），使冲突路径不再被当作未跟踪或已忽略文件列出。
 **Out of scope:** 无标志列表的 stage 行（`PM-12`）；`-o` 与 `-u`/`-s`/`-t` 混用时 Libra 的排序与占位格式差异（既有差异，尚未排期，重启条件：后续 ls-files 输出对齐计划）；`--deduplicate`（尚未排期）。
 **Current evidence:**

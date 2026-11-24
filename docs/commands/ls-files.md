@@ -60,7 +60,7 @@ without printing panic/backtrace or `Broken pipe` diagnostics.
 | `-v` | Like `-t`: prefix each path with a status tag. Git's `-v` spells assume-unchanged files in lowercase, which Libra does not support, so `-v` output equals `-t` output. |
 | `-u`, `--unmerged` | Show only unmerged (conflict) entries — index stages 1/2/3 — in stage-style output. |
 | `--full-name` | Accepted for Git compatibility. Libra always prints repo-root-relative paths (the `git --full-name` form), so this is a no-op. |
-| `--others`, `-o` | Show untracked working-tree files. |
+| `--others`, `-o` | Show untracked working-tree files. A path present in the index at **any stage** — including an unmerged conflict stage — is tracked, never "other" (Git's `index_name_is_other`), so conflict paths (`f`, `g.log` above) are excluded even while the merge is unresolved. |
 | `--cached`, `-c` | Show files staged in the index. |
 | `-i`, `--ignored` | Show only the ignored set: `-i -o` lists ignored untracked files (the inverse of `-o`), `-i -c` lists tracked files matching an exclude pattern. Must be combined with `-o`/`-c` and needs an exclude source — `--exclude-standard` or an explicit `-x`/`-X` pattern (exit 128 otherwise), matching Git. |
 | `--exclude-standard` | With `--others`, honor standard Git/Libra ignore sources (`.gitignore`, the worktree-local `info/exclude` — `.libra/info/exclude`, plus `.git/info/exclude` in Git- or dual-layout trees — `core.excludesFile`, and `.libraignore`). |
