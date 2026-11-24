@@ -199,8 +199,8 @@ pub use migrate::{
     quiesce_forward_repository_phase1, quiesce_forward_repository_sqlite_sources,
     quiesce_sqlite_source, read_migrated_spool_receipts_for_session,
     reconstruct_spool_replay_envelope, reconstruct_spool_replay_envelope_lossless,
-    sqlite_backup_capture_db_path, sqlite_backup_capture_spool_dir_path, sqlite_backup_dir_path,
-    sqlite_backup_git_db_path, stream_migrated_spool_envelope_to_writer,
+    resume_forward_phase2, sqlite_backup_capture_db_path, sqlite_backup_capture_spool_dir_path,
+    sqlite_backup_dir_path, sqlite_backup_git_db_path, stream_migrated_spool_envelope_to_writer,
     vacuum_into_lock_safe_backup, validate_any_migration_role, validate_forward_migration_role,
     verify_forward_phase1_redb_tmp,
 };

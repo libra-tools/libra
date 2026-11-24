@@ -28440,6 +28440,7 @@ where
 /// (`RB-10b` AC1).
 async fn verify_phase1_prerequisites_for_phase2(
     prepared: &mut ForwardPhase1Prepared,
+    allow_unfinalized_existing: bool,
 ) -> StorageResult<()> {
     if prepared.generation == 0 {
         return Err(StorageBackendError::BackendInternal {
@@ -28616,13 +28617,28 @@ async fn verify_phase1_prerequisites_for_phase2(
     // generation (re-migrating forward after a completed reverse migration).
     if let Some(existing) = read_storage_manifest(common_storage)? {
         if !existing.finalized {
-            return Err(StorageBackendError::BackendInternal {
-                detail:
-                    "forward migration Phase 2 refused to overwrite an unfinalized storage-format.json (run crash recovery instead)"
-                        .to_string(),
-            });
-        }
-        if existing.backend != StorageBackendKind::Sqlite {
+            if !allow_unfinalized_existing {
+                return Err(StorageBackendError::BackendInternal {
+                    detail:
+                        "forward migration Phase 2 refused to overwrite an unfinalized storage-format.json (run crash recovery instead)"
+                            .to_string(),
+                });
+            }
+            if existing.backend != StorageBackendKind::Redb {
+                return Err(StorageBackendError::BackendInternal {
+                    detail:
+                        "forward migration Phase 2 recovery expected an unfinalized redb manifest"
+                            .to_string(),
+                });
+            }
+            if prepared.generation <= existing.generation {
+                return Err(StorageBackendError::BackendInternal {
+                    detail:
+                        "forward migration Phase 2 recovery requires a target generation strictly greater than the interrupted manifest generation"
+                            .to_string(),
+                });
+            }
+        } else if existing.backend != StorageBackendKind::Sqlite {
             return Err(StorageBackendError::BackendInternal {
                 detail:
                     "forward migration Phase 2 refused because repository manifest is already on redb"
@@ -29866,6 +29882,21 @@ pub async fn execute_forward_phase2_fence_and_unlink(
 ) -> StorageResult<ForwardPhase2FencedState> {
     execute_forward_phase2_fence_and_unlink_inner(
         prepared,
+        false,
+        #[cfg(test)]
+        None,
+    )
+    .await
+}
+
+/// Recovery entry used by [`resume_forward_phase2`] (`RB-10c`): permits
+/// replacing an existing **unfinalized** `redb` manifest from an interrupted run.
+async fn execute_forward_phase2_fence_and_unlink_for_recovery(
+    prepared: ForwardPhase1Prepared,
+) -> StorageResult<ForwardPhase2FencedState> {
+    execute_forward_phase2_fence_and_unlink_inner(
+        prepared,
+        true,
         #[cfg(test)]
         None,
     )
@@ -29874,6 +29905,7 @@ pub async fn execute_forward_phase2_fence_and_unlink(
 
 async fn execute_forward_phase2_fence_and_unlink_inner(
     mut prepared: ForwardPhase1Prepared,
+    allow_unfinalized_existing: bool,
     #[cfg(test)] mut test_hook: Option<&mut dyn Phase2TestObserver>,
 ) -> StorageResult<ForwardPhase2FencedState> {
     let started = Instant::now();
@@ -29881,7 +29913,9 @@ async fn execute_forward_phase2_fence_and_unlink_inner(
     // Step 2.0 (Pre-flight gate): verify every Phase 1 durability & lock
     // prerequisite BEFORE touching `.libra/storage-format.json`. On failure
     // before Step 2.1 atomic rename, cleanly abort Phase 1 artifacts & locks!
-    if let Err(err) = verify_phase1_prerequisites_for_phase2(&mut prepared).await {
+    if let Err(err) =
+        verify_phase1_prerequisites_for_phase2(&mut prepared, allow_unfinalized_existing).await
+    {
         if let Err(abort_err) = prepared.abort().await {
             return Err(StorageBackendError::BackendInternal {
                 detail: format!(
@@ -32796,6 +32830,225 @@ fn install_inplace_spool_tombstones_under_held_lock(
     Err(StorageBackendError::BackendInternal {
         detail: "durable Phase 2 capture-spool tombstones are unsupported on this platform"
             .to_string(),
+    })
+}
+
+/// Report from [`resume_forward_phase2`] (`RB-10c`).
+#[derive(Debug)]
+pub struct ForwardPhase2ResumeReport {
+    /// Interrupted (unfinalized) generation found on disk.
+    pub previous_generation: u64,
+    /// Newly finalized manifest (`generation = previous_generation + 1`).
+    pub manifest: StorageFormatManifest,
+}
+
+/// True when `path` starts with SQLite's 16-byte database header magic.
+fn sqlite_header_is_valid(path: &Path) -> StorageResult<bool> {
+    use std::io::Read as _;
+    let mut file = File::open(path).map_err(|err| StorageBackendError::Io {
+        context: "open SQLite source for header check",
+        kind: err.kind(),
+        raw_os_error: err.raw_os_error(),
+    })?;
+    let mut header = [0u8; 16];
+    let mut read = 0usize;
+    while read < header.len() {
+        match file.read(&mut header[read..]) {
+            Ok(0) => break,
+            Ok(n) => read += n,
+            Err(err) => {
+                return Err(StorageBackendError::Io {
+                    context: "read SQLite source header",
+                    kind: err.kind(),
+                    raw_os_error: err.raw_os_error(),
+                });
+            }
+        }
+    }
+    Ok(read == header.len() && &header == b"SQLite format 3\0")
+}
+
+/// Remove `-journal`/`-wal`/`-shm` sidecars so a restored clean database is
+/// never paired with a stale hot journal from the torn generation.
+fn remove_sqlite_sidecars(db_path: &Path) -> StorageResult<()> {
+    for suffix in ["-journal", "-wal", "-shm"] {
+        let sidecar = PathBuf::from(format!("{}{suffix}", db_path.display()));
+        match fs::remove_file(&sidecar) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(StorageBackendError::Io {
+                    context: "remove stale SQLite sidecar",
+                    kind: err.kind(),
+                    raw_os_error: err.raw_os_error(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Restore one torn SQLite source from the interrupted generation's lock-safe
+/// backup (`RB-10c`), verifying the recorded backup digest first.
+fn restore_torn_sqlite_from_backup(
+    common_storage: &Path,
+    manifest: &StorageFormatManifest,
+    db_path: &Path,
+    backup_file_name: &str,
+    expected_sha256: Option<&str>,
+    label: &'static str,
+) -> StorageResult<bool> {
+    if !db_path.exists() {
+        // Post-unlink recovery belongs to RB-10k.
+        return Ok(false);
+    }
+    if sqlite_header_is_valid(db_path)? {
+        // A valid header means SQLite itself can replay any hot journal.
+        return Ok(false);
+    }
+    let backup_dir_rel =
+        manifest
+            .backup_dir
+            .as_deref()
+            .ok_or_else(|| StorageBackendError::BackendInternal {
+                detail: format!("forward migration Phase 2 recovery of {label} has no backup_dir"),
+            })?;
+    let backup = common_storage.join(backup_dir_rel).join(backup_file_name);
+    if !backup.is_file() {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration Phase 2 recovery of {label} refused: lock-safe backup {} is missing",
+                backup.display()
+            ),
+        });
+    }
+    let mut backup_file = File::open(&backup).map_err(|err| StorageBackendError::Io {
+        context: "open lock-safe SQLite backup for torn-source recovery",
+        kind: err.kind(),
+        raw_os_error: err.raw_os_error(),
+    })?;
+    let (actual, _) = stream_hash_file(&mut backup_file, "torn-source recovery backup")?;
+    if let Some(expected) = expected_sha256
+        && expected != actual
+    {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration Phase 2 recovery of {label} refused: backup digest mismatch"
+            ),
+        });
+    }
+    let tmp = PathBuf::from(format!("{}.recovery.tmp", db_path.display()));
+    fs::copy(&backup, &tmp).map_err(|err| StorageBackendError::Io {
+        context: "copy lock-safe backup over torn SQLite source",
+        kind: err.kind(),
+        raw_os_error: err.raw_os_error(),
+    })?;
+    let restored = File::open(&tmp).map_err(|err| StorageBackendError::Io {
+        context: "open restored SQLite temp",
+        kind: err.kind(),
+        raw_os_error: err.raw_os_error(),
+    })?;
+    restored.sync_all().map_err(|err| StorageBackendError::Io {
+        context: "fsync restored SQLite temp",
+        kind: err.kind(),
+        raw_os_error: err.raw_os_error(),
+    })?;
+    drop(restored);
+    fs::rename(&tmp, db_path).map_err(|err| StorageBackendError::Io {
+        context: "publish restored SQLite source",
+        kind: err.kind(),
+        raw_os_error: err.raw_os_error(),
+    })?;
+    if let Some(parent) = db_path.parent() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd as _;
+            let dir = File::open(parent).map_err(|err| StorageBackendError::Io {
+                context: "open SQLite parent directory for fsync",
+                kind: err.kind(),
+                raw_os_error: err.raw_os_error(),
+            })?;
+            // SAFETY: `dir` is a valid open directory file descriptor.
+            if unsafe { libc::fsync(dir.as_raw_fd()) } != 0 {
+                return Err(StorageBackendError::io(
+                    "fsync restored SQLite parent directory",
+                    io::Error::last_os_error(),
+                ));
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = parent;
+    }
+    remove_sqlite_sidecars(db_path)?;
+    Ok(true)
+}
+
+/// Resume an interrupted Forward Migration Phase 2 (`finalized == false`) from
+/// the live sources (`RB-10c`).
+///
+/// 1. Read the interrupted `redb` manifest (refusing a finalized/SQLite one).
+/// 2. If a source lost its SQLite header (torn page-1 sector), SQLite cannot
+///    replay its hot journal; restore the interrupted generation's verified
+///    lock-safe backup (the pre-fence state) instead. A valid header keeps the
+///    normal SQLite hot-journal replay path inside Phase 1.
+/// 3. Re-run Phase 1 at `generation + 1`, fence/unlink (replacing the unfinalized
+///    manifest), and finalize the spool tombstones + `finalized = true` manifest.
+///
+/// Always re-exporting into `gen+1` also covers pre-fence drift: rows a legacy
+/// connection wrote after the crash are included in the fresh export and its
+/// lock-safe backup. `GC-13` still holds — only `<common_storage>` is touched.
+pub async fn resume_forward_phase2(
+    common_storage: &Path,
+) -> StorageResult<ForwardPhase2ResumeReport> {
+    let existing = read_storage_manifest(common_storage)?.ok_or_else(|| {
+        StorageBackendError::BackendInternal {
+            detail: "forward migration Phase 2 recovery found no storage-format.json".to_string(),
+        }
+    })?;
+    if existing.finalized {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "forward migration Phase 2 recovery refused a finalized storage-format.json"
+                .to_string(),
+        });
+    }
+    if existing.backend != StorageBackendKind::Redb {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "forward migration Phase 2 recovery expected an unfinalized redb manifest"
+                .to_string(),
+        });
+    }
+    restore_torn_sqlite_from_backup(
+        common_storage,
+        &existing,
+        &git_sqlite_db_path(common_storage),
+        "libra.db",
+        existing.source_digests.git_backup_sha256.as_deref(),
+        "repository",
+    )?;
+    let capture_db = capture_sqlite_db_path(common_storage);
+    if capture_db.exists() {
+        restore_torn_sqlite_from_backup(
+            common_storage,
+            &existing,
+            &capture_db,
+            "capture.db",
+            existing.source_digests.cap_backup_sha256.as_deref(),
+            "capture",
+        )?;
+    }
+    let previous_generation = existing.generation;
+    let next_generation =
+        previous_generation
+            .checked_add(1)
+            .ok_or_else(|| StorageBackendError::BackendInternal {
+                detail: "forward migration Phase 2 recovery generation overflow".to_string(),
+            })?;
+    let prepared = prepare_forward_phase1(common_storage, next_generation).await?;
+    let fenced = execute_forward_phase2_fence_and_unlink_for_recovery(prepared).await?;
+    let finalized = finalize_forward_phase2_spool_tombstones_and_manifest(fenced)?;
+    Ok(ForwardPhase2ResumeReport {
+        previous_generation,
+        manifest: finalized.manifest,
     })
 }
 
@@ -45720,9 +45973,10 @@ stderr:
                 Ok(())
             };
 
-            let state = execute_forward_phase2_fence_and_unlink_inner(prepared, Some(&mut hook))
-                .await
-                .expect("Phase 2 Step 2.1–2.2b must succeed on Layout C");
+            let state =
+                execute_forward_phase2_fence_and_unlink_inner(prepared, false, Some(&mut hook))
+                    .await
+                    .expect("Phase 2 Step 2.1–2.2b must succeed on Layout C");
 
             // All 15 deterministic hooks fired in exact order!
             assert_eq!(
@@ -46237,9 +46491,13 @@ stderr:
                 }
                 Ok(())
             };
-            let err = execute_forward_phase2_fence_and_unlink_inner(prepared, Some(&mut fail_hook))
-                .await
-                .expect_err("injected mid-Phase-2 failure must return Err");
+            let err = execute_forward_phase2_fence_and_unlink_inner(
+                prepared,
+                false,
+                Some(&mut fail_hook),
+            )
+            .await
+            .expect_err("injected mid-Phase-2 failure must return Err");
             assert_eq!(err.stable_code_str(), "LBR-IO-001");
 
             // Manifest, promoted redb files, and backups MUST all stay intact!
@@ -47751,7 +48009,7 @@ stderr:
                 }
                 Ok(())
             };
-            execute_forward_phase2_fence_and_unlink_inner(prepared, Some(&mut p2_observer))
+            execute_forward_phase2_fence_and_unlink_inner(prepared, false, Some(&mut p2_observer))
                 .await
                 .expect("Phase 2 Step 2.1–2.2b must succeed under continuous OS probing")
         };
@@ -51655,5 +51913,250 @@ int openat64(int dirfd, const char *path, int oflag, ...) {
                 b"UNTOUCHABLE_SYSTEM_CONFIG_SENTINEL"
             );
         }
+    }
+
+    async fn rb10c_sqlite_connect(path: &Path) -> sea_orm::sqlx::SqliteConnection {
+        use sea_orm::sqlx::{Connection, sqlite::SqliteConnectOptions};
+        let opts = SqliteConnectOptions::new()
+            .filename(path)
+            .create_if_missing(false)
+            .read_only(false)
+            .busy_timeout(Duration::ZERO);
+        sea_orm::sqlx::SqliteConnection::connect_with(&opts)
+            .await
+            .expect("connect sqlite")
+    }
+
+    async fn rb10c_reference_count(conn: &mut sea_orm::sqlx::SqliteConnection) -> i64 {
+        sea_orm::sqlx::query_scalar("SELECT count(*) FROM reference;")
+            .persistent(false)
+            .fetch_one(conn)
+            .await
+            .expect("count reference")
+    }
+
+    fn rb10c_reference_in_redb(path: &Path, name: &str) -> bool {
+        use redb::{ReadableDatabase as _, ReadableTable as _};
+        let db = open_redb_read_only(path, DatabaseRole::Repository).expect("open redb read-only");
+        let txn = db.begin_read().expect("begin redb read");
+        let table = txn
+            .open_table(redb_git::REFERENCE_TABLE)
+            .expect("open reference table");
+        let wanted = crate::storage::git_store::RefKey::LocalBranch {
+            name: name.to_string(),
+        };
+        let key = encode_mig_ref_key(&wanted);
+        table.get(key).expect("read reference key").is_some()
+    }
+
+    const RB10C_ENV_CHILD: &str = "LIBRA_RB10C_ENV_CHILD";
+
+    #[test]
+    fn rb10c_env_child() {
+        if std::env::var_os(RB10C_ENV_CHILD).is_none() {
+            return;
+        }
+        let storage = std::env::var_os("LIBRA_RB10C_STORAGE")
+            .map(std::path::PathBuf::from)
+            .expect("child storage path");
+        let err = crate::storage::StorageBackendKind::resolve(&storage)
+            .expect_err("finalized=false must fail closed before env lookup");
+        assert!(
+            matches!(err, StorageBackendError::ManifestNotFinalized { .. }),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(err.stable_code_str(), "LBR-IO-001");
+    }
+
+    fn rb10c_assert_env_blocked(storage: &Path) {
+        let exe = std::env::current_exe().expect("test executable");
+        for raw in ["redb", "sqlite"] {
+            let output = std::process::Command::new(&exe)
+                .args([
+                    "--exact",
+                    "storage::migrate::tests::rb10c_env_child",
+                    "--nocapture",
+                ])
+                .env(RB10C_ENV_CHILD, "1")
+                .env("LIBRA_RB10C_STORAGE", storage)
+                .env("LIBRA_STORAGE_BACKEND", raw)
+                .output()
+                .expect("spawn env child");
+            assert!(
+                output.status.success(),
+                "env child ({raw}) failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    const RB10C_POWERLOSS_CHILD: &str = "LIBRA_RB10C_POWERLOSS_CHILD";
+
+    /// Child half of the torn-sector test: opens a write transaction, inserts an
+    /// uncommitted row and aborts the process so the hot rollback journal stays
+    /// on disk exactly like a power loss mid-fence.
+    #[tokio::test]
+    async fn rb10c_powerloss_child() {
+        if std::env::var_os(RB10C_POWERLOSS_CHILD).is_none() {
+            return;
+        }
+        let db = std::env::var_os("LIBRA_RB10C_DB")
+            .map(std::path::PathBuf::from)
+            .expect("child db path");
+        let mut conn = rb10c_sqlite_connect(&db).await;
+        conn.execute("BEGIN IMMEDIATE;")
+            .await
+            .expect("child BEGIN IMMEDIATE");
+        conn.execute(
+            "INSERT INTO reference (name, kind, \"commit\") VALUES ('refs/heads/torn', 'Branch', 'deadbeef');",
+        )
+        .await
+        .expect("child insert");
+        // Simulate power loss: never roll back/close.
+        std::process::abort();
+    }
+
+    async fn rb10c_crash_before_fence(storage: &Path) {
+        let prepared = prepare_forward_phase1(storage, 1)
+            .await
+            .expect("Phase 1 prepare");
+        let mut fail_hook = |point: Phase2TestPoint, _root: &Path| -> StorageResult<()> {
+            if matches!(
+                point,
+                Phase2TestPoint::BeforeFenceCommit(DatabaseRole::Repository)
+            ) {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: "RB-10c injected pre-fence crash".to_string(),
+                });
+            }
+            Ok(())
+        };
+        execute_forward_phase2_fence_and_unlink_inner(prepared, false, Some(&mut fail_hook))
+            .await
+            .expect_err("injected pre-fence crash");
+        let manifest = read_storage_manifest(storage)
+            .expect("read manifest")
+            .expect("crashed attempt left an unfinalized manifest");
+        assert!(!manifest.finalized, "manifest must stay unfinalized");
+    }
+
+    /// RB-10c AC1–AC3: a torn page-1 sector with a hot rollback journal is
+    /// recovered from the interrupted generation's verified lock-safe backup and
+    /// the resumed migration finalizes `gen+1` with the pre-fence data intact.
+    #[tokio::test]
+    async fn forward_phase2_powerloss_torn_sector_hot_journal_rollback_and_resume() {
+        let dir = tempdir().expect("rb10c torn tempdir");
+        let storage = dir.path().join(".libra");
+        let db = git_sqlite_db_path(&storage);
+        fs::create_dir_all(&storage).expect("create .libra");
+        populate_all_61_repository_tables(&db).await;
+        switch_fixture_db_to_delete_mode(&db).await;
+        let mut conn = rb10c_sqlite_connect(&db).await;
+        let before = rb10c_reference_count(&mut conn).await;
+        drop(conn);
+
+        rb10c_crash_before_fence(&storage).await;
+        rb10c_assert_env_blocked(&storage);
+
+        // Power loss during a legacy write leaves a hot journal; tear page 1.
+        let exe = std::env::current_exe().expect("test executable");
+        let output = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "storage::migrate::tests::rb10c_powerloss_child",
+                "--nocapture",
+            ])
+            .env(RB10C_POWERLOSS_CHILD, "1")
+            .env("LIBRA_RB10C_DB", &db)
+            .output()
+            .expect("spawn power-loss child");
+        assert!(!output.status.success(), "child must abort");
+        let journal = std::path::PathBuf::from(format!("{}-journal", db.display()));
+        assert!(
+            journal.is_file(),
+            "hot rollback journal must remain on disk"
+        );
+        let mut bytes = fs::read(&db).expect("read torn db");
+        for byte in &mut bytes[..512] {
+            *byte = 0;
+        }
+        fs::write(&db, bytes).expect("write torn page 1");
+
+        let report = resume_forward_phase2(&storage)
+            .await
+            .expect("resume must restore from the lock-safe backup and finalize");
+        assert_eq!(report.previous_generation, 1);
+        assert_eq!(report.manifest.generation, 2);
+        assert!(report.manifest.finalized, "AC3 finalized");
+
+        let backup = sqlite_backup_git_db_path(&storage, 2);
+        let mut check = rb10c_sqlite_connect(&backup).await;
+        let integrity: String = sea_orm::sqlx::query_scalar("PRAGMA integrity_check;")
+            .persistent(false)
+            .fetch_one(&mut check)
+            .await
+            .expect("integrity check");
+        assert_eq!(integrity, "ok", "AC3: backup must be intact");
+        assert_eq!(
+            rb10c_reference_count(&mut check).await,
+            before,
+            "AC3: pre-fence rows preserved"
+        );
+        let torn: i64 = sea_orm::sqlx::query_scalar(
+            "SELECT count(*) FROM reference WHERE name = 'refs/heads/torn';",
+        )
+        .persistent(false)
+        .fetch_one(&mut check)
+        .await
+        .expect("count torn row");
+        assert_eq!(torn, 0, "AC3: uncommitted row must be gone");
+        assert!(git_redb_path(&storage, 2).is_file(), "AC3 gen2 redb");
+    }
+
+    /// RB-10c AC1/AC2/AC4: a pre-fence crash leaves an unfinalized manifest that
+    /// blocks env overrides; rows written afterwards are re-exported into `gen+1`.
+    #[tokio::test]
+    async fn forward_phase2_crash_before_fence_drift_reexports_gen_plus_1() {
+        let dir = tempdir().expect("rb10c drift tempdir");
+        let storage = dir.path().join(".libra");
+        let db = git_sqlite_db_path(&storage);
+        fs::create_dir_all(&storage).expect("create .libra");
+        populate_all_61_repository_tables(&db).await;
+        switch_fixture_db_to_delete_mode(&db).await;
+
+        rb10c_crash_before_fence(&storage).await;
+        rb10c_assert_env_blocked(&storage);
+
+        // A legacy connection writes a new row after the crash.
+        let mut legacy = rb10c_sqlite_connect(&db).await;
+        legacy
+            .execute(
+                "INSERT INTO reference (name, kind, \"commit\") VALUES ('refs/heads/drift', 'Branch', 'deadbeef');",
+            )
+            .await
+            .expect("post-crash legacy insert");
+        drop(legacy);
+
+        let report = resume_forward_phase2(&storage)
+            .await
+            .expect("resume must re-export into gen+1");
+        assert_eq!(report.previous_generation, 1);
+        assert_eq!(report.manifest.generation, 2, "AC4 gen+1");
+        assert!(report.manifest.finalized);
+
+        let backup = sqlite_backup_git_db_path(&storage, 2);
+        let mut check = rb10c_sqlite_connect(&backup).await;
+        let drift: i64 = sea_orm::sqlx::query_scalar(
+            "SELECT count(*) FROM reference WHERE name = 'refs/heads/drift';",
+        )
+        .persistent(false)
+        .fetch_one(&mut check)
+        .await
+        .expect("count drift row in backup");
+        assert_eq!(drift, 1, "AC4 post-crash row preserved in backup");
+        assert!(
+            rb10c_reference_in_redb(&git_redb_path(&storage, 2), "refs/heads/drift"),
+            "AC4 post-crash row re-exported into gen2 redb"
+        );
     }
 }
