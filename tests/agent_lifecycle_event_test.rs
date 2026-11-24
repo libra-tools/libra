@@ -2355,21 +2355,26 @@ struct StaleSchemaFixture {
     stale: Vec<String>,
 }
 
-/// A disposable repository with the two newest reversible migrations (the
-/// `pi` and `hermes` CHECKs) rolled back, both forward-only receipts and their
-/// empty physical state removed, then the next older reversible migration
-/// rolled back. This models an older
+/// A disposable repository with the three newest reversible migrations
+/// (`symbolic_ref`, `agent_kind_pi`, and `agent_kind_hermes`) rolled back,
+/// both forward-only receipts and their empty physical state removed, then the
+/// next older reversible migration rolled back. This models an older
 /// repository without asking the production rollback API to undo a
 /// compatibility barrier.
 async fn stale_hook_repo() -> (HookRepo, StaleSchemaFixture) {
     let repo = HookRepo::init();
     let migrations = builtin_migrations();
-    let reversible = migrations.last().expect("at least one built-in migration");
+    let symbolic_ref = migrations.last().expect("at least one built-in migration");
     assert!(
-        reversible.down.is_some() && reversible.name == "agent_kind_pi",
+        symbolic_ref.down.is_some() && symbolic_ref.name == "symbolic_ref",
         "the disposable fixture must explicitly model the latest reversible migration"
     );
-    let hermes = migrations.iter().rev().nth(1).expect("hermes CHECK");
+    let pi = migrations.iter().rev().nth(1).expect("pi CHECK");
+    assert!(
+        pi.down.is_some() && pi.name == "agent_kind_pi",
+        "the disposable fixture must explicitly model the reversible pi CHECK"
+    );
+    let hermes = migrations.iter().rev().nth(2).expect("hermes CHECK");
     assert!(
         hermes.down.is_some() && hermes.name == "agent_kind_hermes",
         "the disposable fixture must explicitly model the reversible hermes CHECK"
@@ -2377,18 +2382,18 @@ async fn stale_hook_repo() -> (HookRepo, StaleSchemaFixture) {
     let newest = migrations
         .iter()
         .rev()
-        .nth(2)
+        .nth(3)
         .expect("session-commit links");
     assert!(
         newest.down.is_none() && newest.name == "agent_session_commit",
         "the disposable fixture must explicitly model the forward-only session links"
     );
-    let layout = migrations.iter().rev().nth(3).expect("layout barrier");
+    let layout = migrations.iter().rev().nth(4).expect("layout barrier");
     assert!(layout.down.is_none() && layout.name == "worktree_layout_capability");
     let previous = migrations
         .iter()
         .rev()
-        .nth(5)
+        .nth(6)
         .map(|migration| migration.version)
         .expect("an older reversible migration");
     let runner = builtin_runner().expect("built-in migration registry");
@@ -2405,7 +2410,7 @@ async fn stale_hook_repo() -> (HookRepo, StaleSchemaFixture) {
         .rollback_to(&conn, newest.version)
         .await
         .expect("roll the newest reversible migrations back");
-    assert_eq!(reversible.version, latest_repository_schema_version());
+    assert_eq!(symbolic_ref.version, latest_repository_schema_version());
     // This fixture is disposable and has no session-commit links. Remove both
     // forward-only migrations' physical effects and receipts before exercising
     // the older reversible schema migration.

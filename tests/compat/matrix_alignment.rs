@@ -386,6 +386,45 @@ fn lfs_compatibility_docs_use_current_attributes_filename() {
     }
 }
 
+fn contains_standalone_ascii_token(haystack: &str, token: &str) -> bool {
+    let bytes = haystack.as_bytes();
+    haystack.match_indices(token).any(|(start, _)| {
+        let end = start + token.len();
+        let left_ok = start == 0 || !bytes[start - 1].is_ascii_alphanumeric();
+        let right_ok = end == bytes.len() || !bytes[end].is_ascii_alphanumeric();
+        left_ok && right_ok
+    })
+}
+
+#[test]
+fn standalone_ascii_token_matcher_distinguishes_batch_markers_from_ac_ids() {
+    for rejected in [
+        "C7",
+        "C8",
+        "C9",
+        "`C7`",
+        "C7/C8",
+        "C7-C9 后续补录",
+        "prefix AC7 then C7",
+    ] {
+        assert!(
+            ["C7", "C8", "C9"]
+                .iter()
+                .any(|token| contains_standalone_ascii_token(rejected, token)),
+            "expected batch status marker to be rejected in: {rejected}"
+        );
+    }
+
+    for allowed in ["AC7", "AC8", "AC9", "(AC1, AC7, AC8)", "XC7", "C70"] {
+        assert!(
+            !["C7", "C8", "C9"]
+                .iter()
+                .any(|token| contains_standalone_ascii_token(allowed, token)),
+            "expected non-batch identifier to be allowed in: {allowed}"
+        );
+    }
+}
+
 #[test]
 fn compatibility_governance_roadmap_marks_current_surfaces_without_batch_status() {
     let governance = read_repo_file("docs/development/commands/_compatibility.md");
@@ -402,9 +441,16 @@ fn compatibility_governance_roadmap_marks_current_surfaces_without_batch_status(
         );
     }
 
-    for removed in ["批次状态", "C7", "C8", "C9", "C7-C9 后续补录"] {
+    for removed in ["批次状态", "C7-C9 后续补录"] {
         assert!(
             !governance.contains(removed),
+            "governance roadmap must not retain batch status marker: {removed}"
+        );
+    }
+
+    for removed in ["C7", "C8", "C9"] {
+        assert!(
+            !contains_standalone_ascii_token(&governance, removed),
             "governance roadmap must not retain batch status marker: {removed}"
         );
     }

@@ -341,6 +341,13 @@ fn private_capture_identity_has_no_source_opener() {
     // serializer region: catalog reads go through `local_capture_catalog`
     // (`capture.db` after the split) and the traces head through the paired
     // `libra.db`; row shapes and the serialized bytes are unchanged.
+    // Issue #1073 re-pins both regions after:
+    // - `d185054` added `#![allow(clippy::items_after_test_module)]` in the
+    //   prefix region (pure lint allow, no behavioral change);
+    // - `c66cbac` added the exhaustive `CloudError::ObjectFormatMismatch`
+    //   error-rendering arm in `cloud_error_text` in the remainder region
+    //   (catalog queries, row shapes, proof helpers, and serialized bytes
+    //   remain unchanged).
     let (_, cloud) = parse_rust_source("src/command/cloud/agent_capture.rs");
     assert!(matches!(&cloud.items[0], syn::Item::Use(item)
         if matches!(&item.tree, syn::UseTree::Path(path) if path.ident == "super")));
@@ -363,7 +370,7 @@ fn private_capture_identity_has_no_source_opener() {
     let (prefix, _) = source.split_once("\n#[cfg(test)]\nmod tests").unwrap();
     assert_eq!(
         hex::encode(Sha256::digest(prefix.as_bytes())),
-        "1b477e373f2554623a8e7121896e09ed5a806a2174845750b6ebf903d7b03912",
+        "d8a492f01723c8dd20dd544e9dbef7da510e917ca9aaa22ab1f2208852d3ba8d",
         "RG-05 cloud proof helper edit requires scope and Claude review"
     );
     let (_, remainder) = source
@@ -372,7 +379,7 @@ fn private_capture_identity_has_no_source_opener() {
     let remainder = format!("const AGENT_CAPTURE_LOCAL_PAGE_SIZE{remainder}");
     assert_eq!(
         hex::encode(Sha256::digest(remainder.as_bytes())),
-        "fcb3e5bda4018ebf3ca7e1341b1a7754da4c2c88ca44d1048bff49b4abdf75d6",
+        "0affed3032a44437b966804226b0e9db3d6ffcdb117e9edcee9abe871b307b53",
         "RG-05 cloud serializer edit requires scope and Claude review"
     );
 }
