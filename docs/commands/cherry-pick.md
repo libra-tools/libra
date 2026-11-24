@@ -110,7 +110,7 @@ Allow the new commit to be created with an empty message. By default an empty me
 
 ### `--keep-redundant-commits`
 
-Keep a commit that becomes redundant after being replayed (its resulting tree is identical to the current HEAD). By default an empty replay is a RESUMABLE stop (`--empty=stop`): it prints Git's `The previous cherry-pick is now empty` diagnostic, keeps the sequencer state (`current_oid` is the picked commit), and exits 1 with `LBR-CONFLICT-001`; `--abort` restores the original HEAD. Equivalent to `--empty=keep`.
+Keep a commit that becomes redundant after being replayed (its resulting tree is identical to the current HEAD). By default an empty replay is a RESUMABLE stop (`--empty=stop`): it prints Git's `The previous cherry-pick is now empty` diagnostic, keeps the sequencer state (`current_oid` is the picked commit), and exits 1 with `LBR-CONFLICT-001`; `--abort` restores the original HEAD. Equivalent to `--empty=keep`. It conflicts with the control options `--continue`, `--skip`, `--abort` and `--quit` (clap rejects the pair with `cannot be used with`, `LBR-CLI-002`, before the command body runs).
 
 ### `--empty=<mode>`
 

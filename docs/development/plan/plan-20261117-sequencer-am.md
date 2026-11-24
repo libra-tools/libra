@@ -473,7 +473,7 @@ job 集合以执行当日按模板 ER-04「仓库配置与 CI 展开规则」现
 ### Task SA-01b: `--keep-redundant-commits` 与 sequencer 控制选项互斥（#725，`t3505#13`）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-23：四个控制选项的 `conflicts_with_all` 增加 `keep_redundant_commits`；clap 冲突经既有 `classify_parse_error` 映射为 `LBR-CLI-002`，人读诊断行同时点名 `'--keep-redundant-commits'` 与对应控制选项（`cannot be used with`），命令体不执行。AC1–AC8 由 `command::cherry_pick_test::cherry_pick_keep_redundant_rejected_with_controls_tc0426` 覆盖（在空停止态上逐一对 `--continue`/`--skip`/`--abort`/`--quit` 断言稳定码与诊断文本）；`cherry_pick_test` 80/80；cherry-pick EN/zh、开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计，故未执行计划要求的独立评审门。
 **Description:** 自 `SA-01` 拆出：`--keep-redundant-commits` 与 `--continue`、`--skip`、`--abort`、`--quit` 任一同用时，在参数解析阶段以 usage 错误拒绝（clap 冲突约束，稳定错误码 `LBR-CLI-002`，命令体不执行；Git 以 `fatal: cherry-pick: --keep-redundant-commits cannot be used with <op>` 失败）。#725 验收项 3 要求「以对应的 `cannot be used with` 提示失败」，故本卡对每个控制选项分别验收稳定错误码 `LBR-CLI-002` 与点名这两个选项的冲突诊断（clap 参数冲突经 `classify_parse_error` 映射为 `CliError::command_usage`，`src/cli.rs:3176-3221`，属既有错误类，见「错误类清单」）。`--empty` 的同类互斥（`t3505#14`，原 `SA-01c`）已于 R47 撤回并登记 `DEFER-SA-15`。
 **Out of scope:** 空停止本身（由 `SA-01` 承接）；`--empty` 与控制选项互斥（原 `SA-01c`，R47 撤回，`DEFER-SA-15`）；rerere 标志与控制选项互斥（`--continue` 由 `SA-03` 承接，其余见 `DEFER-SA-06`）。
 

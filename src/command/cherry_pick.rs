@@ -693,28 +693,28 @@ pub struct CherryPickArgs {
     /// Resume the in-progress cherry-pick after resolving conflicts
     #[clap(
         long = "continue",
-        conflicts_with_all = ["commits", "skip", "abort", "quit", "no_commit"]
+        conflicts_with_all = ["commits", "skip", "abort", "quit", "no_commit", "keep_redundant_commits"]
     )]
     pub continue_pick: bool,
 
     /// Skip the current conflicted commit and continue the sequence
     #[clap(
         long = "skip",
-        conflicts_with_all = ["commits", "continue_pick", "abort", "quit", "no_commit"]
+        conflicts_with_all = ["commits", "continue_pick", "abort", "quit", "no_commit", "keep_redundant_commits"]
     )]
     pub skip: bool,
 
     /// Abort the in-progress cherry-pick and restore the original HEAD
     #[clap(
         long = "abort",
-        conflicts_with_all = ["commits", "continue_pick", "skip", "quit", "no_commit"]
+        conflicts_with_all = ["commits", "continue_pick", "skip", "quit", "no_commit", "keep_redundant_commits"]
     )]
     pub abort: bool,
 
     /// Forget the in-progress cherry-pick without changing the working tree
     #[clap(
         long = "quit",
-        conflicts_with_all = ["commits", "continue_pick", "skip", "abort", "no_commit"]
+        conflicts_with_all = ["commits", "continue_pick", "skip", "abort", "no_commit", "keep_redundant_commits"]
     )]
     pub quit: bool,
 

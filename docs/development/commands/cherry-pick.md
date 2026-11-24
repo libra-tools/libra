@@ -93,3 +93,5 @@ flowchart TD
 single conflict-label helper
 
 - 2026-11-23（SA-01 / #725）：`--empty=stop`（默认）的空重放由 `LBR-CLI-002`/129 的拒绝改为**可恢复停止**——错误文案改为 Git 的 `The previous cherry-pick is now empty …`，稳定码 `LBR-CONFLICT-001`，命令级退出码 1；`RedundantCommit` 分支在 `save`/`claim_start` 持久化 `CherryPickState`（`current_oid` = 被拣选提交，`todo` 为剩余项），`--abort` 走既有硬重置路径清除状态。既有 `cherry_pick_redundant_blocked_then_kept` 与 `test_cherry_pick_empty_modes` 期望同卡更新（stop 后先 `--abort`）。回归：`cherry_pick_empty_stop_message_exit_and_state`（AC1–AC7，含 `--json`/`--machine` 信封与 `sequence_state` 行）；`cherry_pick_test` 78/78、`--lib cherry_pick` 18/18。
+
+- 2026-11-23（SA-01b / #725）：`--continue`/`--skip`/`--abort`/`--quit` 的 `conflicts_with_all` 增加 `keep_redundant_commits`，clap 冲突经 `classify_parse_error` 映射为 `LBR-CLI-002`，诊断行点名 `'--keep-redundant-commits'` 与对应控制选项（`t3505#13` / `TC-0426`）。回归：`cherry_pick_keep_redundant_rejected_with_controls_tc0426`（AC1–AC8）；`cherry_pick_test` 80/80。

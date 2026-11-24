@@ -4927,3 +4927,29 @@ fn cherry_pick_empty_stop_message_exit_and_state() {
     assert_eq!(json["error_code"], "LBR-CONFLICT-001", "AC4 code");
     assert_eq!(json["exit_code"], 1, "AC4 exit_code");
 }
+
+/// SA-01b: `--keep-redundant-commits` cannot be combined with control options.
+#[test]
+fn cherry_pick_keep_redundant_rejected_with_controls_tc0426() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    // Start from the empty-stop state the control options would act on.
+    let stopped = run_libra_command(&["cherry-pick", "HEAD"], p);
+    assert_eq!(stopped.status.code(), Some(1), "empty stop");
+
+    for control in ["--continue", "--skip", "--abort", "--quit"] {
+        let out = run_libra_command(&["cherry-pick", "--keep-redundant-commits", control], p);
+        assert!(!out.status.success(), "{control} must be rejected");
+        let (_human, report) = parse_cli_error_stderr(&out.stderr);
+        assert_eq!(report.error_code, "LBR-CLI-002", "{control} code");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.lines().any(|line| {
+                line.contains("cannot be used with")
+                    && line.contains("'--keep-redundant-commits'")
+                    && line.contains(&format!("'{control}'"))
+            }),
+            "{control} diagnostic names both options: {stderr}"
+        );
+    }
+}
