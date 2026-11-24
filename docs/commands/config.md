@@ -387,7 +387,7 @@ Retrieve a configuration value. Cascades local → global → system scope, retu
 | `--all` | Return all values for this key (multi-valued keys) |
 | `--reveal` | Show the actual decrypted value for encrypted entries (blocked for internal vault credentials like `vault.roottoken_enc`) |
 | `--regexp` | Treat `<key>` as a regex pattern and return all matching entries |
-| `-d`, `--default <value>` | Return this value if the key is not found (instead of an error) |
+| `-d`, `--default <value>` | Return this value if the key is not found (instead of an error). Without any explicit action, `config --default <value> <key>` is an implicit `--get` (Git-compatible); combining it with `--list`, a write action, `edit`/`path`, or an extra value argument is `LBR-CLI-002` before anything is read or written. `--get-all`/`--get-regexp` keep accepting it (an intentional difference from Git) |
 | `--value <pattern>` | Only return values matching this pattern (regexp unless `--fixed-value`) |
 | `--fixed-value` | Treat the value pattern as a literal byte string instead of a regexp |
 | `--show-origin` | Prefix each record with its origin (`file:<database path>`) |

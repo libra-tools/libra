@@ -298,7 +298,7 @@ libra config set vault.env.GEMINI_API_KEY
 | `--all` | 返回该 key 的所有值（多值 key） |
 | `--reveal` | 对加密条目显示实际解密值（会阻止内部 vault 凭据，如 `vault.roottoken_enc`） |
 | `--regexp` | 将 `<key>` 视为正则表达式，并返回所有匹配条目 |
-| `-d`, `--default <value>` | key 未找到时返回此值（而不是报错） |
+| `-d`, `--default <value>` | key 未找到时返回此值（而不是报错）。未显式给出动作时，`config --default <value> <key>` 等价于隐式 `--get`（与 Git 一致）；与 `--list`、写动作、`edit`/`path` 或多出的值参数同用时，在执行任何读写之前以 `LBR-CLI-002` 拒绝。`--get-all`/`--get-regexp` 仍接受它（与 Git 的有意差异） |
 | `--value <pattern>` | 只返回匹配该模式的值（默认正则；配合 `--fixed-value` 为逐字节比较） |
 | `--fixed-value` | 将 value-pattern 视为字面字节串而非正则 |
 | `--show-origin` | 为每条记录添加来源前缀（`file:<数据库路径>`） |

@@ -1871,6 +1871,60 @@ fn resolve_command_typed(args: &ConfigArgs) -> CliResult<ResolvedCommand> {
     }
 
     // Git-compat flag translation
+
+    // `--default` is a read option. Git treats `config --default <v> <key>` as
+    // an implicit GET and rejects it next to any other action (129). Validate
+    // before dispatching so `--list`/`--remove-section`/writes never run first.
+    if let Some(default) = args.default.as_deref() {
+        let explicit_get = args.get || args.get_all || args.get_regexp;
+        let other_action = args.list
+            || args.remove_section
+            || args.rename_section
+            || args.unset
+            || args.unset_all
+            || args.add
+            || args.replace_all
+            || args.import
+            || args.key.as_deref() == Some("edit")
+            || args.key.as_deref() == Some("path");
+        if other_action {
+            return Err(CliError::failure(
+                "--default is only applicable to --get, --get-all, or --get-regexp",
+            )
+            .with_stable_code(StableErrorCode::CliInvalidArguments));
+        }
+        if !explicit_get {
+            let key = args
+                .key
+                .as_deref()
+                .filter(|key| !key.is_empty())
+                .ok_or_else(|| {
+                    CliError::failure("--default requires a <key>")
+                        .with_stable_code(StableErrorCode::CliInvalidArguments)
+                })?;
+            if args.valuepattern.is_some() {
+                return Err(CliError::failure(
+                    "--default cannot be combined with a value argument",
+                )
+                .with_stable_code(StableErrorCode::CliInvalidArguments));
+            }
+            return Ok(ResolvedCommand::Get {
+                key: key.to_string(),
+                all: false,
+                reveal: false,
+                regexp: false,
+                value_pattern: None,
+                fixed_value: args.fixed_value,
+                show_origin: args.show_origin,
+                show_scope: args.show_scope,
+                default: Some(default.to_string()),
+                null: args.null,
+                value_type,
+                name_only: args.name_only,
+            });
+        }
+    }
+
     if args.list {
         return Ok(ResolvedCommand::List {
             name_only: args.name_only,

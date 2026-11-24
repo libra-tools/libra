@@ -615,7 +615,7 @@ PY
 ### Task PM-02: 支持 `libra config --default` 未显式传 `--get` 时隐式读取（#717）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-23：`resolve_command_typed` 在动作派发前新增 `--default` 前置校验——无 `--get*` 且无任何其他动作、只有单个 `<key>` 时按 Git 隐式 GET 走既有 `ResolvedCommand::Get`（缺键输出默认值）；与 `--list`、`--remove-section`/`--rename-section`、`--unset*`/`--add`/`--replace-all`/`--import`、`edit`/`path`、或多余值参数同用一律 `LBR-CLI-002`，执行任何读写之前拒绝（修复 `--list` 忽略 `--default`、`--remove-section` 仍删除的行为）；`--get-all`/`--get-regexp` 继续接受（有意差异，已记入 `COMPATIBILITY.md`）。AC1–AC7 由 `command::config_test::config_default_implies_get` 覆盖；`config_test` 196/196；EN/zh/开发文档与 `COMPATIBILITY.md` 的 `config` 行同步。
 **Description:** 在 `src/command/config.rs` 的 `resolve_command_typed` 中，当给出 `--default` 且没有任何显式动作（无 `--get*`/`--list`/`--unset*`/`--add`/`--remove-section`/`--rename-section`/`--import`/`edit`/`path`）且只有 `<key>` 一个位置参数时，按 Git `builtin/config.c` 的隐式 GET 走既有 `ResolvedCommand::Get` 路径（键缺失时输出默认值）；`--default` 与任何写动作、`--list` 或额外位置值同用时改为命令用法错误 `LBR-CLI-002`，且在执行任何读写前拒绝（修复当前 `--list` 忽略 `--default`、`--remove-section` 照常删除的行为）。
 **Out of scope:** `--default` 与 `--get-all`/`--get-regexp` 同用（Git 拒绝、Libra 现接受，保持现状并记入 `COMPATIBILITY.md` 有意差异，理由：`test_config_get_all_with_default` 等既有用户行为）；Libra 专有 `-d` 短选项（保持）；`--default` 与 AC5–AC7 之外的其余写动作（`--unset*`、`--add`、`--rename-section`、`--import`、`edit`、`path`）同用（与 AC6、AC7 走同一前置校验分支，不单独验收）；`#717` 的 `checkout --orphan` 与 `HEAD^` 子项（`DEFER-PM-03`）。
 **Current evidence:**

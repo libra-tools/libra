@@ -7482,3 +7482,81 @@ fn test_config_type_bool_or_variants() {
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "1024");
 }
+
+#[test]
+fn config_default_implies_get() {
+    let repo = tempdir().expect("failed to create repository root");
+    init_repo_via_cli(repo.path());
+    assert_cli_success(
+        &run_libra_command(&["config", "core.foo", "present"], repo.path()),
+        "set core.foo",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "--add", "multi.v", "one"], repo.path()),
+        "add one",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "--add", "multi.v", "two"], repo.path()),
+        "add two",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "section.key", "v"], repo.path()),
+        "set section.key",
+    );
+
+    // AC1: a missing key prints the default.
+    let out = run_libra_command(
+        &["config", "--default", "fallback", "missing.key"],
+        repo.path(),
+    );
+    assert_cli_success(&out, "AC1");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "fallback\n", "AC1");
+
+    // AC2: an empty default prints an empty line.
+    let out = run_libra_command(
+        &["config", "--default", "", "branch.gamma.merge"],
+        repo.path(),
+    );
+    assert_cli_success(&out, "AC2");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "\n", "AC2");
+
+    // AC3: an existing value wins over the default.
+    let out = run_libra_command(
+        &["config", "--default", "fallback", "core.foo"],
+        repo.path(),
+    );
+    assert_cli_success(&out, "AC3");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "present\n", "AC3");
+
+    // AC4: multi-valued keys print their last value.
+    let out = run_libra_command(&["config", "--default", "fallback", "multi.v"], repo.path());
+    assert_cli_success(&out, "AC4");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "two\n", "AC4");
+
+    // AC5–AC7: any other action (or an extra value) is a usage error, and no
+    // write happens.
+    for args in [
+        vec!["config", "--default", "fallback", "new.key", "v"],
+        vec![
+            "config",
+            "--default",
+            "fallback",
+            "--remove-section",
+            "section",
+        ],
+        vec!["config", "--default", "fallback", "--list"],
+    ] {
+        let out = run_libra_command(&args, repo.path());
+        assert!(!out.status.success(), "{args:?} must fail");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("LBR-CLI-002"),
+            "{args:?} code: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let after = run_libra_command(&["config", "section.key"], repo.path());
+    assert_cli_success(&after, "section survives AC6");
+    assert_eq!(String::from_utf8_lossy(&after.stdout), "v\n");
+    let missing = run_libra_command(&["config", "new.key"], repo.path());
+    assert!(!missing.status.success(), "AC5 must not write the key");
+}
