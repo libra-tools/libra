@@ -928,6 +928,24 @@ pub(crate) async fn create_commit_signatures(
     Ok((author, committer, committer_identity))
 }
 
+/// Author-side counterpart of [`create_committer_signature`]: resolves the
+/// author identity (including `GIT_AUTHOR_*` environment variables and
+/// `user.useConfigOnly`) and applies only `GIT_AUTHOR_DATE`. `libra var
+/// GIT_AUTHOR_IDENT` uses this so it reports exactly what `libra commit` would
+/// write; the commit path itself is unchanged.
+pub(crate) async fn create_author_signature() -> Result<(Signature, UserIdentity), CommitError> {
+    let author_identity = resolve_author_identity(None).await?;
+    let mut author = Signature::new(
+        SignatureType::Author,
+        author_identity.name.clone(),
+        author_identity.email.clone(),
+    );
+    if let Some(value) = env_date("GIT_AUTHOR_DATE") {
+        apply_signature_date(&mut author, "GIT_AUTHOR_DATE", &value)?;
+    }
+    Ok((author, author_identity))
+}
+
 pub(crate) async fn create_committer_signature() -> Result<(Signature, UserIdentity), CommitError> {
     let committer_identity = resolve_committer_identity().await?;
     let mut committer = Signature::new(

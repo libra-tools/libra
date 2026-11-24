@@ -23,12 +23,18 @@ The identity comes from `user.name` and `user.email` (local config first, then
 global), and the timestamp/timezone come from the current local time, so the
 `TZ` environment variable determines the printed offset.
 
-**Deliberate limitation (this release):** the command ignores every identity and
-date environment variable (`GIT_COMMITTER_NAME`, `GIT_AUTHOR_NAME`,
-`GIT_COMMITTER_EMAIL`, `GIT_AUTHOR_EMAIL`, `EMAIL`, `LIBRA_COMMITTER_*`,
-`GIT_COMMITTER_DATE`, `GIT_AUTHOR_DATE`). It always reports the configured
-identity with "now". The author and committer sides are rewired to the commit
-signature resolvers by the follow-up cards.
+`GIT_AUTHOR_IDENT` resolves exactly what `libra commit` would write as the
+author: the name follows `GIT_AUTHOR_NAME` > `GIT_COMMITTER_NAME` >
+`LIBRA_COMMITTER_NAME` > `user.name`, the email follows `GIT_AUTHOR_EMAIL` >
+`GIT_COMMITTER_EMAIL` > `EMAIL` > `LIBRA_COMMITTER_EMAIL` > `user.email`, and
+`GIT_AUTHOR_DATE` is honored (an invalid value is `LBR-CLI-002`). With
+`user.useConfigOnly` set, the identity environment variables are ignored while
+the date still applies. Only the author-side date is validated, so a broken
+`GIT_COMMITTER_DATE` does not affect this variable.
+
+**Deliberate limitation (this release):** `GIT_COMMITTER_IDENT` still ignores
+the identity and date environment variables and always reports the configured
+identity with "now"; the committer side is rewired by a follow-up card.
 
 `-l` lists the supported variables as `NAME=value` lines in the order
 `GIT_COMMITTER_IDENT`, `GIT_AUTHOR_IDENT`, skipping variables whose identity

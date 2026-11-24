@@ -11,6 +11,10 @@
   `LBR-REPO-001` (outside a repository).
 - 2026-11-23 (PM-10 / #995): initial implementation; identity/date environment
   variables are deliberately ignored (PM-10a/PM-37 rewire them).
+- 2026-11-23 (PM-10a / #995): `GIT_AUTHOR_IDENT` now goes through the new
+  `pub(crate) commit::create_author_signature` (same `resolve_author_identity` +
+  `GIT_AUTHOR_DATE` + `user.useConfigOnly` path `libra commit` uses); the
+  committer side still uses the PM-10 config-only path until PM-37.
 
 ## Tests
 

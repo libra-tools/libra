@@ -108,6 +108,15 @@ pub async fn execute_safe(args: VarArgs, output: &OutputConfig) -> CliResult<()>
 /// current local time. This card deliberately ignores the identity and date
 /// environment variables; `PM-10a`/`PM-37` rewire the author/committer sides.
 async fn ident_value(name: &str, kind: SignatureType) -> CliResult<String> {
+    if matches!(kind, SignatureType::Author) {
+        let (signature, _) = crate::command::commit::create_author_signature()
+            .await
+            .map_err(CliError::from)?;
+        return Ok(format!(
+            "{} <{}> {} {}",
+            signature.name, signature.email, signature.timestamp, signature.timezone
+        ));
+    }
     let sources = resolve_user_identity_sources(LocalIdentityTarget::CurrentRepo)
         .await
         .map_err(|error| {
