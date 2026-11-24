@@ -71,8 +71,9 @@ this command.
 worktree differs from HEAD the `--dirty` mark (default `-dirty`) is appended, and
 a stat-only change is refreshed away first. `--broken` cannot be combined with a
 `<commit>` argument outside `--contains` (`LBR-CLI-002`) and is ignored by
-`--contains`. Until the failure-mark path lands, a failed worktree check still
-reports `LBR-IO-001`.
+`--contains`. If the worktree check itself fails (for example a corrupt
+index), `--broken` appends its mark (default `-broken`, or the `--broken=<mark>`
+value) and exits 0 instead.
 
 `--dirty` cannot be combined with a `<commit>` argument (exit 129,
 `LBR-CLI-002`). `--contains` accepts `--dirty` but ignores it: the worktree is

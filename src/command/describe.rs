@@ -421,7 +421,7 @@ async fn run_describe(args: DescribeArgs) -> Result<DescribeOutput, DescribeErro
                 long_format,
                 tag_info.misnamed && !include_all && !args.contains,
             );
-            return apply_dirty_mark(output, dirty_mark).await;
+            return apply_dirty_mark(output, dirty_mark.clone(), args.broken.clone()).await;
         }
 
         if exact_match {
@@ -472,7 +472,7 @@ async fn run_describe(args: DescribeArgs) -> Result<DescribeOutput, DescribeErro
             dirty: false,
             dirty_mark: None,
         };
-        return apply_dirty_mark(output, dirty_mark).await;
+        return apply_dirty_mark(output, dirty_mark.clone(), args.broken.clone()).await;
     }
 
     Err(DescribeError::NoNamesFound)
@@ -645,26 +645,39 @@ async fn run_describe_contains(
 }
 
 /// Map a worktree check result to the suffix to append (DESC-08).
-fn worktree_suffix(dirty_mark: Option<&str>, check: WorktreeCheck) -> Option<String> {
+fn worktree_suffix(
+    dirty_mark: Option<&str>,
+    broken_mark: Option<&str>,
+    check: WorktreeCheck,
+) -> Option<String> {
     match check {
         WorktreeCheck::Clean => None,
         WorktreeCheck::Dirty => Some(dirty_mark.unwrap_or("-dirty").to_string()),
+        WorktreeCheck::Failed => Some(broken_mark.unwrap_or("-broken").to_string()),
     }
 }
 
 async fn apply_dirty_mark(
     mut output: DescribeOutput,
     dirty_mark: Option<String>,
+    broken_mark: Option<String>,
 ) -> Result<DescribeOutput, DescribeError> {
-    if dirty_mark.is_none() {
+    if dirty_mark.is_none() && broken_mark.is_none() {
         return Ok(output);
     }
-    let check = if has_tracked_dirty_changes().await? {
-        WorktreeCheck::Dirty
-    } else {
-        WorktreeCheck::Clean
+    let check = match has_tracked_dirty_changes().await {
+        Ok(true) => WorktreeCheck::Dirty,
+        Ok(false) => WorktreeCheck::Clean,
+        Err(error) => {
+            // `--broken` turns a failed check into a suffix; without it the
+            // failure is still fatal (Git's `--dirty` alone).
+            if broken_mark.is_none() {
+                return Err(error);
+            }
+            WorktreeCheck::Failed
+        }
     };
-    if let Some(mark) = worktree_suffix(dirty_mark.as_deref(), check) {
+    if let Some(mark) = worktree_suffix(dirty_mark.as_deref(), broken_mark.as_deref(), check) {
         output.result.push_str(&mark);
         output.dirty = true;
         output.dirty_mark = Some(mark);

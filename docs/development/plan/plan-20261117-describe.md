@@ -1835,7 +1835,7 @@
 
 ### Task DESC-08a: `--broken` 在脏检查失败时追加标记（#803）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空` | **Priority / Selection:** P1；Git CLI 选项兼容 | **Issue:** [#803](https://github.com/libra-tools/libra/issues/803)
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-23：`WorktreeCheck` 增加 `Failed`，`worktree_suffix(dirty_mark, broken_mark, check)` 在检查失败且给出 `--broken` 时返回其标记（默认 `-broken`）；`apply_dirty_mark` 在检查失败且无 `--broken` 时仍传播 `LBR-IO-001`，有 `--broken` 时写入 `result` 与 `dirty_mark`；删除 `DESC-08` 的临时边界用例。AC1–AC4 由 `describe_test::broken_check_failure_marks` 覆盖，AC5 由 `describe_tests::worktree_suffix_failed_uses_broken_mark` 覆盖；`describe_test`+`describe_long_test` 45/45、`--lib command::describe` 8/8；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计。
 
 **Description:** 自 `DESC-08` 拆出（G-09）。脏检查本身失败（如 index 损坏）时，`--broken` 不再以 `LBR-IO-001` 失败，而是追加 `--broken` 给出的标记（默认 `-broken`），并与 `--dirty` 一样经 `apply_dirty_mark` 写入 `result` 与 `dirty_mark`（`ADR-DESC-02`）；`worktree_suffix` 增加 `broken_mark` 参数与 `WorktreeCheck::Failed` 分支（`describe_types.rs`）。删除 `DESC-08` 的临时边界用例 `command::describe_test::broken_check_failure_boundary`。
 

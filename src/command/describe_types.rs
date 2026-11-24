@@ -22,6 +22,8 @@ pub(super) struct DescribeOutput {
 pub(super) enum WorktreeCheck {
     Clean,
     Dirty,
+    /// The dirty check itself failed (e.g. a corrupt index).
+    Failed,
 }
 
 #[derive(Debug, thiserror::Error)]

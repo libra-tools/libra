@@ -46,7 +46,7 @@ libra describe [OPTIONS] [COMMIT]
 | `--no-long` | 取消先前的 `--long`（后者生效）。 | 关闭 |
 | `--dirty[=<mark>]` | 当跟踪内容偏离 `HEAD` 时追加 dirty 标记。 | 关闭；启用时默认标记为 `-dirty` |
 
-`--broken[=<mark>]`（默认 `-broken`）可与 `--dirty` 一起使用：工作区与 HEAD 不同时追加 `--dirty` 的标记（默认 `-dirty`），仅 stat 变化会先被刷新。非 `--contains` 路径与 `<commit>` 共用时拒绝（`LBR-CLI-002`），`--contains` 忽略它。检查失败时的标记尚未支持，仍报 `LBR-IO-001`。
+`--broken[=<mark>]`（默认 `-broken`）可与 `--dirty` 一起使用：工作区与 HEAD 不同时追加 `--dirty` 的标记（默认 `-dirty`），仅 stat 变化会先被刷新。非 `--contains` 路径与 `<commit>` 共用时拒绝（`LBR-CLI-002`），`--contains` 忽略它。检查本身失败（例如索引损坏）时，`--broken` 追加其标记（默认 `-broken`，或 `--broken=<mark>` 的值）并退出 0。
 
 `--dirty` 不能与 `<commit>` 参数同时使用（退出码 129、`LBR-CLI-002`）。`--contains` 接受 `--dirty` 但忽略它：不读取工作区，因此脏工作区或损坏的索引都不会改变其输出。
 | `--first-parent` | 遍历历史时只跟随合并提交的第一个父。 | 关闭 |

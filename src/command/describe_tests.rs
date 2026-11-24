@@ -136,12 +136,26 @@ fn worktree_suffix_defaults_to_dirty_mark() {
     use super::{WorktreeCheck, worktree_suffix};
 
     assert_eq!(
-        worktree_suffix(None, WorktreeCheck::Dirty),
+        worktree_suffix(None, None, WorktreeCheck::Dirty),
         Some("-dirty".to_string())
     );
     assert_eq!(
-        worktree_suffix(Some("-bk"), WorktreeCheck::Dirty),
+        worktree_suffix(Some("-bk"), None, WorktreeCheck::Dirty),
         Some("-bk".to_string())
     );
-    assert_eq!(worktree_suffix(Some("-dirty"), WorktreeCheck::Clean), None);
+    assert_eq!(
+        worktree_suffix(Some("-dirty"), None, WorktreeCheck::Clean),
+        None
+    );
+}
+
+/// DESC-08a AC5: a failed check uses the `--broken` mark.
+#[test]
+fn worktree_suffix_failed_uses_broken_mark() {
+    use super::{WorktreeCheck, worktree_suffix};
+
+    assert_eq!(
+        worktree_suffix(None, Some("-bk"), WorktreeCheck::Failed),
+        Some("-bk".to_string())
+    );
 }

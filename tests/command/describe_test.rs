@@ -1638,19 +1638,44 @@ fn broken_marks_and_scope() {
     std::fs::write(&index, backup).unwrap();
 }
 
-/// DESC-08 AC8 (temporary boundary): a failed check still fails outside
-/// `--contains`; the failure mark arrives with DESC-08a.
+/// DESC-08a AC1–AC4: a failed dirty check appends the `--broken` mark.
 #[test]
-fn broken_check_failure_boundary() {
+fn broken_check_failure_marks() {
     let repo = create_committed_repo_via_cli();
     let p = repo.path();
+    std::fs::write(p.join("f.txt"), "A\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], p), "add f");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "A", "--no-verify"], p),
+        "commit",
+    );
     assert_cli_success(&run_libra_command(&["tag", "-m", "v1.0", "v1.0"], p), "tag");
     let index = p.join(".libra/index");
-    let backup = std::fs::read(&index).unwrap();
     std::fs::write(&index, "garbage\n").unwrap();
+
+    // Precondition: `--dirty` alone still fails on the corrupt index.
+    let dirty = run_libra_command(&["describe", "--dirty"], p);
+    assert!(!dirty.status.success(), "precondition: --dirty fails");
+
     let out = run_libra_command(&["describe", "--broken"], p);
-    assert!(!out.status.success(), "AC8 must fail");
-    let (_human, report) = parse_cli_error_stderr(&out.stderr);
-    assert_eq!(report.error_code, "LBR-IO-001", "AC8");
-    std::fs::write(&index, backup).unwrap();
+    assert_cli_success(&out, "AC1");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "v1.0-broken",
+        "AC1"
+    );
+
+    let out = run_libra_command(&["describe", "--broken=-bk"], p);
+    assert_cli_success(&out, "AC2");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "v1.0-bk",
+        "AC2"
+    );
+
+    let out = run_libra_command(&["describe", "--broken", "--json"], p);
+    assert_cli_success(&out, "AC3/AC4");
+    let json = parse_json_stdout(&out);
+    assert_eq!(json["data"]["dirty_mark"], "-broken", "AC3");
+    assert_eq!(json["data"]["result"], "v1.0-broken", "AC4");
 }
