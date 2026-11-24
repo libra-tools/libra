@@ -124,7 +124,9 @@ enum CherryPickError {
     #[error("commit {0} is empty (its change set is empty)")]
     EmptyCommit(String),
 
-    #[error("commit {0} became redundant after replay (no changes to apply)")]
+    #[error(
+        "The previous cherry-pick is now empty, possibly due to conflict resolution (commit {0} became redundant after replay)"
+    )]
     RedundantCommit(String),
 
     #[error("commit {0} has an empty commit message")]
@@ -215,7 +217,7 @@ impl CherryPickError {
             Self::InvalidEmpty(_) => StableErrorCode::CliInvalidArguments,
             Self::Unsupported(_) | Self::GitlinkUnsupported(_) => StableErrorCode::Unsupported,
             Self::EmptyCommit(_) => StableErrorCode::CliInvalidArguments,
-            Self::RedundantCommit(_) => StableErrorCode::CliInvalidArguments,
+            Self::RedundantCommit(_) => StableErrorCode::ConflictUnresolved,
             Self::EmptyMessage(_) => StableErrorCode::CliInvalidArguments,
             Self::Conflict { .. } => StableErrorCode::ConflictUnresolved,
             Self::UnmergedIndex(_)
@@ -271,9 +273,10 @@ impl From<CherryPickError> for CliError {
             CherryPickError::EmptyCommit(_) => CliError::fatal(message)
                 .with_stable_code(stable_code)
                 .with_hint("use --allow-empty to cherry-pick an empty commit"),
-            CherryPickError::RedundantCommit(_) => CliError::fatal(message)
+            CherryPickError::RedundantCommit(_) => CliError::failure(message)
                 .with_stable_code(stable_code)
-                .with_hint("use --keep-redundant-commits to keep the redundant commit"),
+                .with_exit_code(1)
+                .with_hint("use --keep-redundant-commits to keep the redundant commit, or 'libra cherry-pick --skip'"),
             CherryPickError::EmptyMessage(_) => CliError::fatal(message)
                 .with_stable_code(stable_code)
                 .with_hint("use --allow-empty-message to cherry-pick with an empty message"),
@@ -1174,6 +1177,30 @@ async fn run_cherry_pick(
                     path,
                     stop: UntrackedStop::SequenceStopped,
                 });
+            }
+            Err(CherryPickSingleError::RedundantCommit(c)) => {
+                // ADR-SA-01: an empty replay under `--empty=stop` is a RESUMABLE
+                // stop: persist the sequencer row (current_oid = this commit) so
+                // `--abort` restores HEAD, then report Git's diagnostic with
+                // LBR-CONFLICT-001 and command-level exit code 1.
+                let head_orig = head_orig.ok_or_else(|| {
+                    CherryPickError::LoadObject("failed to resolve original HEAD".to_string())
+                })?;
+                let state = CherryPickState {
+                    head_name: head_name.clone(),
+                    head_orig,
+                    current_oid: *commit_id,
+                    stop_concluded: false,
+                    todo: commit_ids[i + 1..].iter().copied().collect(),
+                    opts_json: opts_json_with_conflict_flag(&opts_json, false),
+                };
+                let persisted = if row_exists {
+                    state.save().await
+                } else {
+                    state.claim_start().await
+                };
+                persisted.map_err(CherryPickError::SaveFailed)?;
+                return Err(CherryPickError::RedundantCommit(c));
             }
             Err(CherryPickSingleError::Conflicted(paths)) => {
                 let label = args.commits[i].clone();
@@ -3318,7 +3345,7 @@ mod tests {
         );
         assert_eq!(
             CherryPickError::RedundantCommit("abc123".to_string()).to_string(),
-            "commit abc123 became redundant after replay (no changes to apply)",
+            "The previous cherry-pick is now empty, possibly due to conflict resolution (commit abc123 became redundant after replay)",
         );
         assert_eq!(
             CherryPickError::EmptyMessage("abc123".to_string()).to_string(),
@@ -3440,7 +3467,7 @@ mod tests {
         );
         assert_eq!(
             CherryPickError::RedundantCommit("abc123".to_string()).stable_code(),
-            StableErrorCode::CliInvalidArguments,
+            StableErrorCode::ConflictUnresolved,
         );
         assert_eq!(
             CherryPickError::EmptyMessage("abc123".to_string()).stable_code(),

@@ -1622,15 +1622,25 @@ fn cherry_pick_redundant_blocked_then_kept() {
     );
     let head_before = cp_rev_parse(p, "HEAD");
 
-    // default: redundant → blocked, HEAD unchanged.
+    // ADR-SA-01: default (`--empty=stop`) keeps a RESUMABLE stop instead of a
+    // bare usage error: Git's diagnostic, LBR-CONFLICT-001, exit code 1, and the
+    // sequencer row records the picked commit.
     let blocked = run_libra_command(&["cherry-pick", &feat], p);
-    assert_eq!(blocked.status.code(), Some(129), "redundant blocked");
+    assert_eq!(blocked.status.code(), Some(1), "empty stop exits 1");
     let (_h, report) = parse_cli_error_stderr(&blocked.stderr);
-    assert_eq!(report.error_code, "LBR-CLI-002");
+    assert_eq!(report.error_code, "LBR-CONFLICT-001");
+    assert!(
+        String::from_utf8_lossy(&blocked.stderr).contains("The previous cherry-pick is now empty"),
+        "Git's diagnostic"
+    );
     assert_eq!(
         cp_rev_parse(p, "HEAD"),
         head_before,
-        "HEAD unchanged on block"
+        "HEAD unchanged on empty stop"
+    );
+    assert_cli_success(
+        &run_libra_command(&["cherry-pick", "--abort"], p),
+        "abort the empty stop",
     );
 
     // --keep-redundant-commits: kept.
@@ -2764,12 +2774,16 @@ async fn test_cherry_pick_empty_modes() {
         "--empty=drop reports the dropped commit: {drop_out}"
     );
 
-    // --empty=stop (the default) halts with a "redundant" error.
+    // --empty=stop (the default) halts as a resumable stop (ADR-SA-01).
     let stop = run_libra_command(&["cherry-pick", "--empty=stop", &feature_commit], p);
-    assert_ne!(stop.status.code(), Some(0), "--empty=stop halts");
+    assert_eq!(stop.status.code(), Some(1), "--empty=stop exits 1");
     assert!(
-        String::from_utf8_lossy(&stop.stderr).contains("redundant"),
-        "--empty=stop explains the redundancy"
+        String::from_utf8_lossy(&stop.stderr).contains("The previous cherry-pick is now empty"),
+        "--empty=stop explains the emptiness"
+    );
+    assert_cli_success(
+        &run_libra_command(&["cherry-pick", "--abort"], p),
+        "--abort clears the empty stop",
     );
 
     // --empty=keep: record the empty commit; HEAD advances.
@@ -4835,4 +4849,81 @@ fn cherry_pick_quit_is_idempotent() {
     // The sequence is gone: --continue now reports "no cherry-pick in progress".
     let cont = run_libra_command(&["cherry-pick", "--continue"], root);
     assert!(!cont.status.success(), "--continue must find no sequence");
+}
+
+/// SA-01: an empty replay under the default `--empty=stop` is a resumable stop.
+#[test]
+fn cherry_pick_empty_stop_message_exit_and_state() {
+    use sea_orm::{ConnectOptions, ConnectionTrait, Database, Statement};
+
+    fn current_oid(repo: &std::path::Path) -> Option<String> {
+        let url = format!(
+            "sqlite://{}",
+            repo.join(".libra").join("libra.db").display()
+        );
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let mut opts = ConnectOptions::new(url);
+            opts.sqlx_logging(false);
+            let conn = Database::connect(opts).await.expect("connect");
+            let row = conn
+                .query_one_raw(Statement::from_string(
+                    sea_orm::DatabaseBackend::Sqlite,
+                    "SELECT current_oid FROM sequence_state WHERE kind = 'cherry_pick' LIMIT 1"
+                        .to_string(),
+                ))
+                .await
+                .expect("query sequence_state");
+            conn.close().await.ok();
+            row.and_then(|row| row.try_get::<String>("", "current_oid").ok())
+        })
+    }
+
+    // AC1/AC2/AC5: human message, exit code 1, and the stop row.
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    let picked = cp_rev_parse(p, "HEAD");
+    let out = run_libra_command(&["cherry-pick", "HEAD"], p);
+    assert_eq!(out.status.code(), Some(1), "AC2");
+    let (_human, report) = parse_cli_error_stderr(&out.stderr);
+    assert_eq!(report.error_code, "LBR-CONFLICT-001");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("The previous cherry-pick is now empty"),
+        "AC1"
+    );
+    assert_eq!(current_oid(p).as_deref(), Some(picked.as_str()), "AC5");
+    // AC6/AC7: abort succeeds and clears the row.
+    assert_cli_success(&run_libra_command(&["cherry-pick", "--abort"], p), "AC6");
+    assert_eq!(current_oid(p), None, "AC7");
+
+    // AC3: `--json` reports the same error on a fresh copy.
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    let out = run_libra_command(&["--json", "cherry-pick", "HEAD"], p);
+    assert_eq!(out.status.code(), Some(1), "AC3 exit");
+    let json: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap_or_else(|_| {
+        panic!(
+            "stderr must be one JSON object: {}",
+            String::from_utf8_lossy(&out.stderr)
+        )
+    });
+    assert_eq!(json["ok"], false, "AC3 ok");
+    assert_eq!(json["error_code"], "LBR-CONFLICT-001", "AC3 code");
+    assert_eq!(json["exit_code"], 1, "AC3 exit_code");
+
+    // AC4: `--machine` emits exactly one matching JSON line.
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    let out = run_libra_command(&["--machine", "cherry-pick", "HEAD"], p);
+    assert_eq!(out.status.code(), Some(1), "AC4 exit");
+    let lines: Vec<&str> = String::from_utf8_lossy(&out.stderr)
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| Box::leak(line.to_string().into_boxed_str()) as &str)
+        .collect();
+    assert_eq!(lines.len(), 1, "AC4 line count");
+    let json: serde_json::Value = serde_json::from_str(lines[0]).expect("AC4 JSON line");
+    assert_eq!(json["ok"], false, "AC4 ok");
+    assert_eq!(json["error_code"], "LBR-CONFLICT-001", "AC4 code");
+    assert_eq!(json["exit_code"], 1, "AC4 exit_code");
 }

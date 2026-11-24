@@ -110,11 +110,11 @@ Allow the new commit to be created with an empty message. By default an empty me
 
 ### `--keep-redundant-commits`
 
-Keep a commit that becomes redundant after being replayed (its resulting tree is identical to the current HEAD). By default such redundant commits are rejected (`LBR-CLI-002`). Equivalent to `--empty=keep`.
+Keep a commit that becomes redundant after being replayed (its resulting tree is identical to the current HEAD). By default an empty replay is a RESUMABLE stop (`--empty=stop`): it prints Git's `The previous cherry-pick is now empty` diagnostic, keeps the sequencer state (`current_oid` is the picked commit), and exits 1 with `LBR-CONFLICT-001`; `--abort` restores the original HEAD. Equivalent to `--empty=keep`.
 
 ### `--empty=<mode>`
 
-How to handle a pick whose change set becomes redundant against HEAD after replay. `<mode>` is `stop` (default — halt so you can decide), `drop` (skip the commit; HEAD does not advance and a `dropping <sha> <subject> -- patch contents already upstream` notice is printed), or `keep` (record the now-empty commit; same as `--keep-redundant-commits`). An invalid mode is a usage error (`LBR-CLI-002`, exit 129), validated before any commit (and before `--continue`/`--skip`/`--abort`/`--quit`).
+How to handle a pick whose change set becomes redundant against HEAD after replay. `<mode>` is `stop` (default — a resumable stop with the Git diagnostic, `LBR-CONFLICT-001` and exit code 1), `drop` (skip the commit; HEAD does not advance and a `dropping <sha> <subject> -- patch contents already upstream` notice is printed), or `keep` (record the now-empty commit; same as `--keep-redundant-commits`). An invalid mode is a usage error (`LBR-CLI-002`, exit 129), validated before any commit (and before `--continue`/`--skip`/`--abort`/`--quit`).
 
 ### `--cleanup=<mode>`
 

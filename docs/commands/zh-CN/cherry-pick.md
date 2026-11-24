@@ -105,7 +105,7 @@ libra cherry-pick -m 1 <merge-commit>
 
 ### `--keep-redundant-commits`
 
-保留重放后变得冗余（结果树与当前 HEAD 相同）的提交。默认这类冗余提交被拒绝（`LBR-CLI-002`）。等价于 `--empty=keep`。
+保留重放后变得重放后变为冗余（结果树与当前 HEAD 相同）的提交在 `--keep-redundant-commits` 下保留。默认的空重放是**可恢复停止**（`--empty=stop`）：打印 Git 的 `The previous cherry-pick is now empty` 诊断、保留 sequencer 状态（`current_oid` 指向被拣选提交）并以 `LBR-CONFLICT-001`、退出码 1 结束；`--abort` 会恢复原始 HEAD。等价于 `--empty=keep`。
 
 ### `--empty=<mode>`
 
