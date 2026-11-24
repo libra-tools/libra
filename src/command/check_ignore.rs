@@ -130,6 +130,25 @@ pub async fn execute_safe(args: CheckIgnoreArgs, output: &OutputConfig) -> CliRe
                 .with_exit_code(128),
         );
     }
+    if output.quiet && args.verbose {
+        return Err(
+            CliError::command_usage("--quiet cannot be combined with -v/--verbose")
+                .with_stable_code(StableErrorCode::CliInvalidArguments)
+                .with_exit_code(128),
+        );
+    }
+    if output.quiet && !args.stdin && args.pathspec.len() > 1 {
+        return Err(
+            CliError::command_usage("--quiet accepts at most one pathname")
+                .with_stable_code(StableErrorCode::CliInvalidArguments)
+                .with_exit_code(128),
+        );
+    }
+    if args.null && !args.stdin {
+        return Err(CliError::command_usage("-z/--null requires --stdin")
+            .with_stable_code(StableErrorCode::CliInvalidArguments)
+            .with_exit_code(128));
+    }
     if !args.stdin && args.pathspec.is_empty() {
         return Err(
             CliError::command_usage("no pathnames specified; use --stdin or pass paths")
@@ -161,10 +180,18 @@ pub async fn execute_safe(args: CheckIgnoreArgs, output: &OutputConfig) -> CliRe
     }
 
     let any_ignored = results.iter().any(|entry| entry.ignored);
+    // `-v` counts a matching NEGATED rule (`!pattern`) as a match too: the
+    // deciding rule is recorded even though the path is not ignored.
+    let any_match = results.iter().any(|entry| entry.source.is_some());
 
     render(&args, &results, output)?;
 
-    if any_ignored {
+    let matched = if args.verbose && !output.quiet {
+        any_match
+    } else {
+        any_ignored
+    };
+    if matched {
         Ok(())
     } else {
         // Exit 1 with no further output: "none of the paths are ignored".

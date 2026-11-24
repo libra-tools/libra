@@ -2657,7 +2657,7 @@ PY
 ### Task PM-20: `libra check-ignore --quiet`、`-z` 参数规则与 `-v` 否定匹配退出码（#1035；自 PM-17 拆出）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-23：新增前置校验——`-z` 需 `--stdin`、`--quiet` 多路径或与 `-v` 同用均 `LBR-CLI-002`；退出码在 `-v` 下改为「任一路径有命中规则」（`entry.source.is_some()`，含否定规则），`--quiet` 仍按 ignored 判定且 stdout 为空；既有 `z_uses_nul_delimiters` 改为经 `--stdin` + NUL 输入并保留原断言。AC1–AC7 由 `command::check_ignore_test::check_ignore_quiet_and_argument_rules` 覆盖；`check_ignore_test` 15/15；EN/zh/开发文档与 `COMPATIBILITY.md` 的 `check-ignore` 行同步。
 **Description:** 自 `PM-17` 拆出：按 Git 次序在任何判定前校验——`-z` 不带 `--stdin`、`--quiet` 带多个路径、`--quiet` 与 `--verbose` 同用均以 `LBR-CLI-002` 失败（`--quiet` 消费 `src/cli.rs` 的全局 `-q/--quiet`，不新增本地标志；与 `--stdin` 同用合法）；`--quiet` 单路径时 stdout 为空（stderr 不作承诺）、忽略退出 0、未忽略退出 1；`-v` 下命中否定规则（`!pattern`）也计为「有匹配」并退出 0。
 **Out of scope:** 路径基准（`PM-17`）；`--stdin` 流式（`PM-31`）；多个参数错误同时出现时的校验先后（均以同一稳定码 `LBR-CLI-002` 失败，不可观测，不单独验收）；Git `fatal:` 措辞（Libra 保持 `LBR-CLI-002` 与 `error:` 前缀，有意差异）。
 **Current evidence:**

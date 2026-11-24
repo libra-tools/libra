@@ -16,7 +16,7 @@ worktree still shares main's `info/*` until migrated with
 `libra worktree repair --migrate-layout`. Within the same directory,
 `.libraignore` has higher precedence than `.gitignore`; a nearer directory
 source overrides an ancestor; `info/exclude` and `core.excludesFile` are
-lower-precedence fallbacks. Pattern syntax is Git ignore syntax. Relative pathnames are resolved against the caller's CURRENT directory (not the repository root) and are echoed exactly as typed; `-v` still prints the deciding source relative to the repository root, and a path that escapes the repository fails with `LBR-CLI-003`. When `core.excludesFile` is not configured, the global tier falls back to `$XDG_CONFIG_HOME/git/ignore` (or `$HOME/.config/git/ignore` when `XDG_CONFIG_HOME` is empty); an explicit configuration suppresses that default.
+lower-precedence fallbacks. Pattern syntax is Git ignore syntax. `-z`/`--null` requires `--stdin`; `--quiet` accepts at most one pathname and cannot be combined with `-v`; all three misuses are `LBR-CLI-002` before any matching. With `--quiet`, stdout stays empty and the exit code is 0 (ignored) or 1 (not ignored). Under `-v`, a matching NEGATED rule (`!pattern`) also counts as a match and exits 0. Relative pathnames are resolved against the caller's CURRENT directory (not the repository root) and are echoed exactly as typed; `-v` still prints the deciding source relative to the repository root, and a path that escapes the repository fails with `LBR-CLI-003`. When `core.excludesFile` is not configured, the global tier falls back to `$XDG_CONFIG_HOME/git/ignore` (or `$HOME/.config/git/ignore` when `XDG_CONFIG_HOME` is empty); an explicit configuration suppresses that default.
 
 ## Synopsis
 

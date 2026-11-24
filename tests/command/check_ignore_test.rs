@@ -128,7 +128,12 @@ fn stdin_reads_pathnames() {
 fn z_uses_nul_delimiters() {
     let repo = setup_repo();
     // Both *.log files are ignored; -z NUL-terminates each output path.
-    let out = run_libra_command(&["check-ignore", "-z", "a.log", "b.log"], repo.path());
+    // PM-20: `-z` requires `--stdin`, so feed the two paths on stdin.
+    let out = run_libra_command_with_stdin(
+        &["check-ignore", "-z", "--stdin"],
+        repo.path(),
+        "a.log\0b.log\0",
+    );
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(stdout_of(&out), "a.log\0b.log\0");
 }
@@ -365,4 +370,54 @@ fn check_ignore_resolves_paths_from_cwd() {
         String::from_utf8_lossy(&out.stderr).contains("LBR-CLI-003"),
         "AC4 code"
     );
+}
+
+/// PM-20: `--quiet`/`-z` argument rules and negated `-v` matches.
+#[test]
+fn check_ignore_quiet_and_argument_rules() {
+    let repo = tempdir().expect("failed to create repository root");
+    init_repo_via_cli(repo.path());
+    let p = repo.path();
+    std::fs::write(p.join(".gitignore"), "one\nignored-*\n").expect("root gitignore");
+    std::fs::create_dir_all(p.join("a/b")).expect("mkdir a/b");
+    std::fs::write(p.join("a/.gitignore"), "two*\n*three\n").expect("a gitignore");
+    std::fs::write(p.join("a/b/.gitignore"), "!on*\n!two\n").expect("a/b gitignore");
+
+    // AC1: quiet + ignored path -> exit 0, no stdout.
+    let out = run_libra_command(&["check-ignore", "--quiet", "one"], p);
+    assert!(out.status.success(), "AC1 exit");
+    assert!(out.stdout.is_empty(), "AC1 stdout");
+
+    // AC2: quiet + not ignored -> exit 1, no stdout.
+    let out = run_libra_command(&["check-ignore", "--quiet", "not-ignored"], p);
+    assert_eq!(out.status.code(), Some(1), "AC2 exit");
+    assert!(out.stdout.is_empty(), "AC2 stdout");
+
+    // AC3/AC4/AC5: invalid combinations are usage errors.
+    for args in [
+        vec!["check-ignore", "--quiet", "one", "two"],
+        vec!["check-ignore", "--quiet", "-v", "one"],
+        vec!["check-ignore", "-z", "one"],
+    ] {
+        let out = run_libra_command(&args, p);
+        assert!(!out.status.success(), "{args:?} must fail");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("LBR-CLI-002"),
+            "{args:?} code"
+        );
+    }
+
+    // AC6: a negated rule still counts as a match under `-v`.
+    let out = run_libra_command(&["check-ignore", "-v", "a/b/one"], p);
+    assert!(out.status.success(), "AC6 exit");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "a/b/.gitignore:1:!on*\ta/b/one\n",
+        "AC6"
+    );
+
+    // AC7: `--quiet --stdin` is legal and silent.
+    let out = run_libra_command_with_stdin(&["check-ignore", "--quiet", "--stdin"], p, "one\n");
+    assert!(out.status.success(), "AC7 exit");
+    assert!(out.stdout.is_empty(), "AC7 stdout");
 }
