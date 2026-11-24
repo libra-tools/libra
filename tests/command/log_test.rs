@@ -9768,3 +9768,85 @@ fn show_word_diff_and_color_words() {
         "AC7 code"
     );
 }
+
+#[test]
+fn show_color_moved_composes_with_word_diff() {
+    use super::{assert_cli_success, run_libra_command};
+
+    let work = tempfile::tempdir().expect("work dir");
+    let repo = work.path().join("r");
+    std::fs::create_dir_all(&repo).expect("mkdir repo");
+    assert_cli_success(&run_libra_command(&["init"], &repo), "init");
+    run_libra_command(&["config", "set", "user.name", "t"], &repo);
+    run_libra_command(&["config", "set", "user.email", "t@t"], &repo);
+    std::fs::write(repo.join("f.txt"), "aaa\nkeep\nkeep2\nkeep3\nkeep4\n").expect("write base");
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], &repo), "add base");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c1", "--no-verify"], &repo),
+        "commit c1",
+    );
+    std::fs::write(repo.join("f.txt"), "keep\nkeep2\nkeep3\nkeep4\naaa\n").expect("write move");
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], &repo), "add move");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c2", "--no-verify"], &repo),
+        "commit c2",
+    );
+
+    let section = |text: &str| -> String {
+        match text.find("diff --git") {
+            Some(index) => text[index..].to_string(),
+            None => String::new(),
+        }
+    };
+    let show_out = |args: &[&str]| {
+        let mut argv = vec!["show", "HEAD"];
+        argv.extend_from_slice(args);
+        let result = run_libra_command(&argv, &repo);
+        assert_cli_success(&result, &format!("show {argv:?}"));
+        String::from_utf8_lossy(&result.stdout).to_string()
+    };
+    let diff_out = |args: &[&str]| {
+        let mut argv = vec!["diff"];
+        argv.extend_from_slice(args);
+        argv.push("HEAD~1");
+        argv.push("HEAD");
+        let result = run_libra_command(&argv, &repo);
+        assert_cli_success(&result, &format!("diff {argv:?}"));
+        String::from_utf8_lossy(&result.stdout).to_string()
+    };
+
+    // AC1/AC2: the combination is accepted and matches `libra diff` byte for byte.
+    let combined = show_out(&["--color=always", "--color-moved", "--word-diff"]);
+    let engine = diff_out(&["--color=always", "--color-moved", "--word-diff"]);
+    assert_eq!(
+        section(&combined),
+        section(&engine),
+        "AC2 color-moved + word-diff parity"
+    );
+    // AC3: color-moved alone matches the engine.
+    assert_eq!(
+        section(&show_out(&["--color=always", "--color-moved"])),
+        section(&diff_out(&["--color=always", "--color-moved"])),
+        "AC3 color-moved parity"
+    );
+    // AC4: a later `--no-color-moved` wins.
+    assert_eq!(
+        show_out(&["--color=always", "--color-moved", "--no-color-moved"]),
+        show_out(&["--color=always"]),
+        "AC4 last one wins"
+    );
+    // AC5: whitespace mode reaches the engine.
+    assert_eq!(
+        section(&show_out(&[
+            "--color=always",
+            "--color-moved",
+            "--color-moved-ws=ignore-all-space",
+        ])),
+        section(&diff_out(&[
+            "--color=always",
+            "--color-moved",
+            "--color-moved-ws=ignore-all-space",
+        ])),
+        "AC5 moved-ws parity"
+    );
+}

@@ -71,6 +71,22 @@ pub(crate) const SHOW_PATHSPEC_SEPARATOR_FLAG: &str = "__libra-show-pathspec-sep
 #[derive(Parser, Debug)]
 #[command(after_help = SHOW_EXAMPLES)]
 pub struct ShowArgs {
+    /// Colour moved lines differently (Git's `--color-moved[=<mode>]`)
+    #[clap(
+        long = "color-moved",
+        value_name = "mode",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "default",
+        overrides_with = "no_color_moved"
+    )]
+    pub color_moved: Option<String>,
+    /// Do not colour moved lines (last of `--color-moved`/`--no-color-moved` wins)
+    #[clap(long = "no-color-moved", overrides_with = "color_moved")]
+    pub no_color_moved: bool,
+    /// Whitespace rules for moved-line matching (`--color-moved-ws=<modes>`)
+    #[clap(long = "color-moved-ws", value_name = "modes", value_delimiter = ',')]
+    pub color_moved_ws: Vec<String>,
     /// Render the patch body as a word-level diff (`--word-diff[=<mode>]`)
     #[clap(
         long = "word-diff",
@@ -1277,6 +1293,24 @@ async fn show_patch(
             return Ok(patch);
         }
     }
+    // Moved-line colouring is a post-processing step over the rendered patch so
+    // it composes with `--word-diff`/`--color-words` exactly like `libra diff`.
+    let moved_active = args.color_moved.as_deref().is_some_and(|mode| mode != "no");
+    let colorize = |patch: String| -> String {
+        if moved_active && color_enabled && !patch.is_empty() {
+            let ws = crate::command::diff::options::parse_color_moved_ws(&args.color_moved_ws)
+                .unwrap_or_default();
+            let mut colored =
+                crate::command::diff::render::maybe_colorize_diff(&patch, true, true, ws);
+            // `libra diff` terminates the patch block with a blank line; match it
+            // so the diff section is byte-identical.
+            if !colored.ends_with("\n\n") {
+                colored.push('\n');
+            }
+            return colored;
+        }
+        patch
+    };
     if (args.patience || args.anchored.is_some()) && paths.is_empty() {
         if let Some(parent) = commit.parent_commit_ids.first() {
             let mut argv = vec!["diff".to_string()];
@@ -1295,10 +1329,10 @@ async fn show_patch(
             if !patch.is_empty() && !patch.ends_with('\n') {
                 patch.push('\n');
             }
-            return Ok(patch);
+            return Ok(colorize(patch));
         }
     }
-    generate_diff(commit, paths).await
+    Ok(colorize(generate_diff(commit, paths).await?))
 }
 
 async fn show_diffstat(commit: &Commit, paths: Vec<PathBuf>) -> CliResult<String> {

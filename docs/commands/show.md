@@ -2,6 +2,20 @@
 
 Show a commit, tag, tree, blob, or the blob referenced by `REV:path`.
 
+### `--color-moved[=<mode>]` / `--color-moved-ws=<modes>`
+
+`show` colours moved lines like `libra diff --color-moved` (removed side bold
+magenta, added side bold cyan); `--no-color-moved` countermands an earlier flag and
+the later one wins, and `--color-moved-ws` selects the whitespace rules used while
+matching moved lines. Colouring is a post-processing step, so it composes with
+`--word-diff`/`--color-words` and the diff section stays byte-identical to
+`libra diff` with the same options.
+
+```bash
+libra show --color=always --color-moved HEAD
+libra show --color=always --color-moved --word-diff HEAD
+```
+
 ### `--word-diff[=<mode>]` / `--word-diff-regex` / `--color-words`
 
 `show` renders its patch body as a word-level diff with the same options as

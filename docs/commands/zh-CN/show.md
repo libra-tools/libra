@@ -2,6 +2,15 @@
 
 显示提交、标签、树、blob，或 `REV:path` 引用的 blob。
 
+### `--color-moved[=<mode>]` / `--color-moved-ws=<modes>`
+
+`show` 与 `libra diff --color-moved` 一致地为移动行着色（删除侧粗体洋红、新增侧粗体青）；`--no-color-moved` 取消先前标志（后写者胜出），`--color-moved-ws` 选择匹配移动行的空白规则。着色是后处理步骤，可与 `--word-diff`/`--color-words` 组合，且 diff 段与同选项的 `libra diff` 逐字节一致。
+
+```bash
+libra show --color=always --color-moved HEAD
+libra show --color=always --color-moved --word-diff HEAD
+```
+
 ### `--word-diff[=<mode>]` / `--word-diff-regex` / `--color-words`
 
 `show` 的补丁正文可用与 `libra log -p` 相同的词级 diff 选项：默认 `plain`，另有 `porcelain`/`color`/`none`；`--word-diff-regex=<re>` 指定分词正则，`--color-words[=<re>]` 是彩色简写（优先于 `--word-diff=plain`）。均复用共享 diff 渲染器，字节与 `libra diff` 一致；非法模式以 `LBR-CLI-002` 拒绝。
