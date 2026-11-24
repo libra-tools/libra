@@ -158,6 +158,11 @@ enum CherryPickError {
         stop: UntrackedStop,
     },
 
+    /// SA-05c: an unborn branch cannot `--ff` while the index still has staged
+    /// entries (the fast-forward would overwrite or delete them).
+    #[error("your local changes would be overwritten by cherry-pick")]
+    UnbornFfStaged,
+
     /// #477 HF-31: an interrupted `--skip`/`--abort` left its phase marker;
     /// the same verb must finish before the sequence can continue.
     #[error("an interrupted 'libra cherry-pick --{0}' has not finished")]
@@ -223,7 +228,8 @@ impl CherryPickError {
             Self::UnmergedIndex(_)
             | Self::NoCommitConflict { .. }
             | Self::UntrackedOverwrite { .. }
-            | Self::LocalChangesWouldBeOverwritten => StableErrorCode::ConflictUnresolved,
+            | Self::LocalChangesWouldBeOverwritten
+            | Self::UnbornFfStaged => StableErrorCode::ConflictUnresolved,
             Self::InProgress => StableErrorCode::ConflictOperationBlocked,
             Self::NoCherryPickInProgress => StableErrorCode::RepoStateInvalid,
             Self::CorruptState(_) => StableErrorCode::RepoCorrupt,
@@ -321,6 +327,11 @@ impl From<CherryPickError> for CliError {
                 .with_stable_code(stable_code)
                 .with_hint("cancel the sequence with 'libra cherry-pick --abort'")
                 .with_hint("or forget it with 'libra cherry-pick --quit'"),
+            CherryPickError::UnbornFfStaged => CliError::failure(message)
+                .with_stable_code(stable_code)
+                .with_hint(
+                    "nothing was written; the index must be empty before 'libra cherry-pick --ff' can fast-forward an unborn branch",
+                ),
             CherryPickError::LocalChangesWouldBeOverwritten => CliError::failure(message)
                 .with_stable_code(stable_code)
                 .with_hint("commit or stash the staged changes before continuing")
@@ -1087,6 +1098,17 @@ async fn run_cherry_pick(
     // oldest first (Git's `rev-list --reverse A..B` for linear history). Every
     // expanded commit carries its own label so a later stop never indexes the
     // original (shorter) argument list.
+    // SA-05c: an unborn `--ff` fast-forward would check out the target tree and
+    // silently discard staged entries; refuse before any write.
+    if args.ff && Head::current_commit().await.is_none() {
+        let index = Index::load(path::index()).map_err(|error| {
+            CherryPickError::LoadObject(format!("failed to load index: {error}"))
+        })?;
+        if !index.tracked_files().is_empty() {
+            return Err(CherryPickError::UnbornFfStaged);
+        }
+    }
+
     let mut commit_ids = Vec::new();
     let mut labels: Vec<String> = Vec::new();
     for commit_ref in &args.commits {

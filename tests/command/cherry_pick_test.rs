@@ -5488,3 +5488,97 @@ fn cherry_pick_ff_root_commit_matches_git_oid_tc0512() {
     .to_string();
     assert_eq!(head, second, "AC2 fast-forward to target");
 }
+
+/// SA-05c: an unborn `--ff` refuses while the index still has staged entries.
+#[test]
+fn cherry_pick_unborn_ff_refuses_staged_entries() {
+    use sha2::{Digest, Sha256};
+
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    let first = cp_rev_parse(p, "HEAD");
+    assert_cli_success(
+        &run_libra_command(&["switch", "--orphan", "unborn"], p),
+        "switch --orphan",
+    );
+    assert_cli_success(
+        &run_libra_command(&["rm", "--cached", "-r", "."], p),
+        "unstage",
+    );
+    let _ = std::fs::remove_file(p.join("tracked.txt"));
+    std::fs::write(p.join("s.txt"), "staged-unique\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "s.txt"], p), "add s.txt");
+
+    let before_stage =
+        String::from_utf8_lossy(&run_libra_command(&["ls-files", "--stage"], p).stdout).to_string();
+    let mut before_files = Vec::new();
+    for entry in std::fs::read_dir(p).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name == ".libra" || name == ".libra-test-home" {
+            continue;
+        }
+        if entry.path().is_file() {
+            let digest = Sha256::digest(std::fs::read(entry.path()).unwrap());
+            before_files.push((
+                name,
+                digest
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>(),
+            ));
+        }
+    }
+    before_files.sort();
+
+    let out = run_libra_command(&["cherry-pick", "--ff", &first], p);
+    assert!(!out.status.success(), "AC1 must fail");
+    let (_human, report) = parse_cli_error_stderr(&out.stderr);
+    assert_eq!(report.error_code, "LBR-CONFLICT-001", "AC1 code");
+    assert_eq!(
+        String::from_utf8_lossy(&run_libra_command(&["ls-files", "--stage"], p).stdout),
+        before_stage,
+        "AC2 index snapshot"
+    );
+    let mut after_files = Vec::new();
+    for entry in std::fs::read_dir(p).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name == ".libra" || name == ".libra-test-home" {
+            continue;
+        }
+        if entry.path().is_file() {
+            let digest = Sha256::digest(std::fs::read(entry.path()).unwrap());
+            after_files.push((
+                name,
+                digest
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>(),
+            ));
+        }
+    }
+    after_files.sort();
+    assert_eq!(after_files, before_files, "AC3 worktree snapshot");
+    assert!(
+        !run_libra_command(&["rev-parse", "HEAD"], p)
+            .status
+            .success(),
+        "AC4 HEAD stays unborn"
+    );
+    let state_rows = run_libra_command(&["cherry-pick", "--continue"], p);
+    assert!(
+        !String::from_utf8_lossy(&state_rows.stderr).contains("already in progress"),
+        "AC5 no sequencer state"
+    );
+    let hints: Vec<String> = String::from_utf8_lossy(&out.stderr)
+        .lines()
+        .filter(|line| line.starts_with("Hint: "))
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        hints,
+        vec!["Hint: nothing was written; the index must be empty before 'libra cherry-pick --ff' can fast-forward an unborn branch".to_string()],
+        "AC6 hint sequence"
+    );
+}

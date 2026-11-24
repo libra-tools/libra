@@ -103,3 +103,5 @@ single conflict-label helper
 - 2026-11-23（SA-03b / #727）：两个 rerere 标志的 clap 定义改为 `overrides_with_all = [rerere_autoupdate, no_rerere_autoupdate]`（含自身），因此可重复且最后一个生效；`t3504#8`/`TC-0468` 三段断言（重复肯定、肯定—否定—肯定、重复否定覆盖 `rerere.autoUpdate`）由 `cherry_pick_rerere_autoupdate_repeated_last_wins` 覆盖；`cherry_pick_test` 85/85。
 
 - 2026-11-23（SA-04 / #729）：`create_cherry_pick_commit` 在 `format_commit_msg` 前补齐消息末尾换行（共享消息构建会裁掉它），使同树/同父/同身份与日期且不签名的拣选提交与 Git **OID 一致**；`--ff` 判定逻辑不变（仅目标为 HEAD 唯一直接父提交时快进，root 目标走普通 pick）。回归：`cherry_pick_ff_root_commit_matches_git_oid_tc0512`（AC1 与 git 创建的同一仓库对照 OID、AC2 直接父快进）；`cherry_pick_test` 86/86。
+
+- 2026-11-23（SA-05c / #730）：新增 `UnbornFfStaged` 错误变体（消息与 `LBR-CONFLICT-001` 同既有「本地改动会被覆盖」，提示改为 `nothing was written; the index must be empty before 'libra cherry-pick --ff' can fast-forward an unborn branch`）；`run_cherry_pick` 在解析提交前检查 `args.ff && HEAD unborn && index.tracked_files()` 非空并提前拒绝，拒绝时不写 sequencer 状态。回归：`cherry_pick_unborn_ff_refuses_staged_entries`（AC1–AC6）；`cherry_pick_test` 87/87。
