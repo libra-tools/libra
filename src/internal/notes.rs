@@ -246,10 +246,44 @@ pub async fn commit_merge() -> Result<CommitMergeResult, NotesError> {
         targets.push((conflict.object.clone(), conflict.before.clone(), target));
     }
 
-    // Exclusive commit-in-progress marker. A pre-existing marker means an
-    // earlier commit crashed; its retry semantics belong to `PM-38`, so this
-    // card fails closed and keeps the state.
     let marker = dir.join(NOTES_MERGE_COMMITTING);
+    let db = get_db_conn_instance().await;
+
+    // A pre-existing marker means the previous commit crashed before or after
+    // its transaction. We cannot distinguish those cases, so retry CONFIRMS
+    // only (never replays): every row must already hold its target value, in
+    // which case the three state paths are cleaned up; otherwise fail closed
+    // and keep everything so the user can `--abort` and merge again.
+    if marker.exists() {
+        for (object, before, target) in &targets {
+            let current = note_blob_with_conn(&db, &state.target_ref, object).await?;
+            let _ = before;
+            if current.as_deref() != Some(target.as_str()) {
+                return Err(NotesError::MergeRaced {
+                    object: object.clone(),
+                });
+            }
+        }
+        for copy in &state.to_copy {
+            let current = note_blob_with_conn(&db, &state.target_ref, &copy.object).await?;
+            if current.as_deref() != Some(copy.source.as_str()) {
+                return Err(NotesError::MergeRaced {
+                    object: copy.object.clone(),
+                });
+            }
+        }
+        let skipped = targets.len() + state.to_copy.len();
+        let _ = std::fs::remove_file(&state_path);
+        let _ = std::fs::remove_dir_all(&worktree);
+        let _ = std::fs::remove_file(&marker);
+        return Ok(CommitMergeResult {
+            notes_ref: state.target_ref,
+            source_ref: state.source_ref,
+            applied: 0,
+            skipped,
+        });
+    }
+
     match std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -267,7 +301,6 @@ pub async fn commit_merge() -> Result<CommitMergeResult, NotesError> {
         }
     }
 
-    let db = get_db_conn_instance().await;
     let txn = crate::internal::db::begin_write_transaction(&db).await?;
     let verify = async {
         for (object, before, target) in &targets {

@@ -1298,7 +1298,7 @@ PY
 ### Task PM-38: `notes merge --commit` 的崩溃后重试：提交开始标记下只确认、不重放（#989；自 PM-29 拆出）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-23：`commit_merge` 在 `NOTES_MERGE_COMMITTING` 已存在时只确认、不重放——冲突条目当前值须等于目标值（解决文件缺失时目标=前值），待复制条目须已等于来源值；全部通过按 STATE→WORKTREE→标记 清理并返回 `applied=0`，否则 `MergeRaced`（`LBR-CONFLICT-002`）失败并保留全部状态；`STATE` 缺失仍先报 `LBR-REPO-003`（与标记无关）。AC1–AC8 由 `command::notes_test::notes_merge_commit_retry_after_crash` 覆盖（「提交后崩溃」用保存/恢复状态模拟、改回原值与删除复制条目的 fail-closed、F38b 的只清理成功 + 写入探针、缺失 STATE 的报错）；`notes_test` 83/83；EN/zh/开发文档与 `COMPATIBILITY.md` 的 `notes` 行同步；网站按家族规则只做后端本地签名提交（未推送，推送与部署核验由 `PM-24` 执行）。
 **Description:** 自 `PM-29` 拆出：`libra notes merge --commit` 先按 `PM-29` 读取 `NOTES_MERGE_STATE`（缺失以 `LBR-REPO-003`、不可解析以 `LBR-REPO-002` 失败，与标记是否存在无关；此时残留按 ADR-PM-02 由 `--abort` 清理）；`STATE` 可解析且 `NOTES_MERGE_COMMITTING` 已存在时（上次提交在事务前后崩溃，无法区分「未提交」与「已提交后又被他人改回」），不再写入任何行，只核对：全部冲突条目与待复制条目的当前值都已等于目标值时按 `PM-29` 的次序清理三个状态路径并成功（包括「事务前崩溃」而各行目标值恰等于当前值的情形，例如只有冲突条目且解决文件被删除）；否则以 `LBR-CONFLICT-002` 失败且保留全部状态，用户以 `--abort` 放弃后重新合并（fail-closed，杜绝覆盖崩溃后他人的写入）。
 **Out of scope:** 首次提交的 CAS 与清理（`PM-29`）；标记存在而 `NOTES_MERGE_STATE` 不可解析时以 `LBR-REPO-002` 失败（`STATE` 的读取与解析先于标记检查，与 `PM-29` AC6 为同一解析调用，不单独验收）；`--abort`/`--quit` 对标记的清理（`PM-23`）；自动区分「未提交」与「已提交后被改回」（需要与 notes 写入同事务的持久回执，属后续存储模型改造，尚未排期）。
 **Current evidence:**

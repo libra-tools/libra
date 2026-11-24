@@ -212,7 +212,9 @@ libra notes --json show                         # 结构化 JSON 输出
 
 - `manual`（默认）：出现 note 冲突时不修改 `notes` 表，而是在工作区 gitdir 下物化冲突：`NOTES_MERGE_WORKTREE/<oid>` 存放 Git 风格的冲突标记（`<<<<<<< <目标 ref>` … `=======` … `>>>>>>> <来源 ref>`，每侧保证以换行结尾），`NOTES_MERGE_STATE`（版本 1 JSON）记录目标 ref、来源 ref、待复制条目与每个冲突条目的前值/来源 blob id；命令仍以 `LBR-CONFLICT-002` 失败。未完结合并残留的 `NOTES_MERGE_WORKTREE`/`NOTES_MERGE_STATE`/`NOTES_MERGE_COMMITTING` 会让新的 merge 以 `LBR-REPO-003` 失败。所有 `notes merge` 形式先排他创建 `NOTES_MERGE_LOCK`、结束时删除；锁已存在时在读写任何状态前以 `LBR-CONFLICT-002` 失败
 
-  解决冲突文件后执行 `libra notes merge --commit`：读取 `NOTES_MERGE_STATE`（缺失 `LBR-REPO-003`、不可解析 `LBR-REPO-002`），把每个 `NOTES_MERGE_WORKTREE/<oid>` 文件的字节作为解决后的 note（文件被删除则保留目标侧原值）。先排他创建 `NOTES_MERGE_COMMITTING` 标记，再在**单个写事务**内先核对每一行的当前值 ∈ {记录的前值, 目标值}，全部通过后才写入；任一行是其它值时整事务回滚、删除标记、保留状态并以 `LBR-CONFLICT-002` 失败。已是目标值的行（含待复制条目）跳过而不判为冲突。提交成功后依次删除 `NOTES_MERGE_STATE`、`NOTES_MERGE_WORKTREE/` 与标记。
+  解决冲突文件后执行 `libra notes merge --commit`：读取 `NOTES_MERGE_STATE`（缺失 `LBR-REPO-003`、不可解析 `LBR-REPO-002`），把每个 `NOTES_MERGE_WORKTREE/<oid>` 文件的字节作为解决后的 note（文件被删除则保留目标侧原值）。先排他创建 `NOTES_MERGE_COMMITTING` 标记，再在**单个写事务**内先核对每一行的当前值 ∈ {记录的前值, 目标值}，全部通过后才写入；任一行是其它值时整事务回滚、删除标记、保留状态并以 `LBR-CONFLICT-002` 失败。已是目标值的行（含待复制条目）跳过而不判为冲突。
+
+  若 `NOTES_MERGE_COMMITTING` 已存在（上次 `--commit` 崩溃），重试只**确认**、绝不重放：当所有冲突条目与待复制条目都已等于目标值时，仅删除三个状态路径并成功（包括「事务前崩溃」而目标值恰等于当前值的情形）；否则以 `LBR-CONFLICT-002` 失败并保留全部状态，用户只能 `--abort` 后重新合并。`NOTES_MERGE_STATE` 缺失时（删除它之后崩溃）无论标记是否存在都以 `LBR-REPO-003` 失败。
 - `ours` / `theirs`：保留当前 note / 采用 other ref 的 note。
 - `union`：连接两个 note contents。
 - `cat_sort_uniq`：连接后排序并去重合并行。

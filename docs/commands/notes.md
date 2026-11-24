@@ -259,7 +259,16 @@ differing note on both sides is a conflict resolved by `--strategy`:
   transaction back, removes the marker, keeps the state and fails with
   `LBR-CONFLICT-002`. Rows already at the target value (including copies) are
   skipped, not treated as conflicts. After the commit it removes
-  `NOTES_MERGE_STATE`, `NOTES_MERGE_WORKTREE/` and the marker, in that order.
+
+
+  If `NOTES_MERGE_COMMITTING` already exists (a previous `--commit` crashed),
+  the retry only CONFIRMS — it never replays: when every conflict entry and
+  copied entry already holds its target value it just removes the three state
+  paths and succeeds (including the crash-before-transaction case where the
+  target values equal the current ones); otherwise it fails with
+  `LBR-CONFLICT-002` and keeps all state, so the only way forward is
+  `--abort` and a fresh merge. A missing `NOTES_MERGE_STATE` is still
+  `LBR-REPO-003` (crash while deleting it), regardless of the marker.
 - `ours` / `theirs`: keep the current note / take the other ref's note.
 - `union`: concatenate both note contents.
 - `cat_sort_uniq`: concatenate, then sort and de-duplicate the combined lines.

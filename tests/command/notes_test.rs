@@ -2499,3 +2499,271 @@ fn notes_merge_commit_applies_resolutions() {
         "AC8 resolution applied"
     );
 }
+
+/// PM-38: retrying `notes merge --commit` after a crash under the
+/// `NOTES_MERGE_COMMITTING` marker only confirms, never replays.
+#[test]
+fn notes_merge_commit_retry_after_crash() {
+    use notes_merge_commit_support::{blob, exec, rows};
+
+    let build = || {
+        let repo = tempdir().expect("failed to create repository root");
+        init_repo_via_cli(repo.path());
+        configure_identity_via_cli(repo.path());
+        let p = repo.path();
+        std::fs::write(p.join("a.txt"), "a\n").unwrap();
+        assert_cli_success(&run_libra_command(&["add", "a.txt"], p), "add a");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "c1", "--no-verify"], p),
+            "commit c1",
+        );
+        std::fs::write(p.join("b.txt"), "b\n").unwrap();
+        assert_cli_success(&run_libra_command(&["add", "b.txt"], p), "add b");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", "c2", "--no-verify"], p),
+            "commit c2",
+        );
+        let c1 = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD~1"], p).stdout)
+            .trim()
+            .to_string();
+        let c2 = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], p).stdout)
+            .trim()
+            .to_string();
+        assert_cli_success(
+            &run_libra_command(&["notes", "add", "-m", "x", &c1], p),
+            "notes add x",
+        );
+        assert_cli_success(
+            &run_libra_command(
+                &["notes", "--ref", "refs/notes/other", "add", "-m", "y", &c1],
+                p,
+            ),
+            "notes other y",
+        );
+        assert_cli_success(
+            &run_libra_command(
+                &[
+                    "notes",
+                    "--ref",
+                    "refs/notes/other",
+                    "add",
+                    "-m",
+                    "only other",
+                    &c2,
+                ],
+                p,
+            ),
+            "notes other c2",
+        );
+        let started = run_libra_command(&["notes", "merge", "refs/notes/other"], p);
+        assert!(!started.status.success(), "manual merge starts the state");
+        (repo, c1, c2)
+    };
+
+    // Simulate "crashed after the transaction committed but before cleanup" by
+    // replaying the state we saved before a real commit.
+    let save_state = |p: &std::path::Path, dir: &std::path::Path| {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::copy(
+            p.join(".libra").join("NOTES_MERGE_STATE"),
+            dir.join("NOTES_MERGE_STATE"),
+        )
+        .expect("save NOTES_MERGE_STATE");
+        let worktree = p.join(".libra").join("NOTES_MERGE_WORKTREE");
+        let saved = dir.join("NOTES_MERGE_WORKTREE");
+        std::fs::create_dir_all(&saved).unwrap();
+        for entry in std::fs::read_dir(&worktree).expect("worktree") {
+            let entry = entry.unwrap();
+            std::fs::copy(entry.path(), saved.join(entry.file_name())).unwrap();
+        }
+    };
+    let restore_state = |p: &std::path::Path, dir: &std::path::Path, with_marker: bool| {
+        let _ = std::fs::remove_dir_all(p.join(".libra").join("NOTES_MERGE_WORKTREE"));
+        eprintln!(
+            "restore from {:?} => {:?}",
+            dir.join("NOTES_MERGE_STATE"),
+            p.join(".libra")
+        );
+        eprintln!("saved exists: {}", dir.join("NOTES_MERGE_STATE").exists());
+        std::fs::copy(
+            dir.join("NOTES_MERGE_STATE"),
+            p.join(".libra").join("NOTES_MERGE_STATE"),
+        )
+        .unwrap();
+        let saved = dir.join("NOTES_MERGE_WORKTREE");
+        let worktree = p.join(".libra").join("NOTES_MERGE_WORKTREE");
+        std::fs::create_dir_all(&worktree).unwrap();
+        for entry in std::fs::read_dir(&saved).unwrap() {
+            let entry = entry.unwrap();
+            std::fs::copy(entry.path(), worktree.join(entry.file_name())).unwrap();
+        }
+        if with_marker {
+            std::fs::write(p.join(".libra").join("NOTES_MERGE_COMMITTING"), b"").unwrap();
+        }
+    };
+
+    // AC1/AC2: post-commit crash, probe in place -> confirm-only success.
+    let (repo, c1, _c2) = build();
+    let p = repo.path();
+    let saved = tempdir().expect("saved state");
+    std::fs::write(
+        p.join(".libra").join("NOTES_MERGE_WORKTREE").join(&c1),
+        "resolved\n",
+    )
+    .unwrap();
+    save_state(p, saved.path());
+    assert_cli_success(
+        &run_libra_command(&["notes", "merge", "--commit"], p),
+        "real commit",
+    );
+    let s1 = rows(p);
+    restore_state(p, saved.path(), true);
+    exec(
+        p,
+        "CREATE TRIGGER notes_write_probe BEFORE INSERT ON notes BEGIN SELECT RAISE(ABORT, 'probe'); END;",
+    );
+    exec(
+        p,
+        "CREATE TRIGGER notes_write_probe_update BEFORE UPDATE ON notes BEGIN SELECT RAISE(ABORT, 'probe'); END;",
+    );
+    let retry = run_libra_command(&["notes", "merge", "--commit"], p);
+    assert_cli_success(&retry, "AC1 retry");
+    assert_eq!(rows(p), s1, "AC1 no rows written");
+    for name in [
+        "NOTES_MERGE_STATE",
+        "NOTES_MERGE_WORKTREE",
+        "NOTES_MERGE_COMMITTING",
+    ] {
+        assert!(!p.join(".libra").join(name).exists(), "AC2 {name} removed");
+    }
+
+    // AC3: a value changed back to the pre-merge value must fail closed.
+    let (repo, c1, _c2) = build();
+    let p = repo.path();
+    let saved = tempdir().expect("saved state");
+    std::fs::write(
+        p.join(".libra").join("NOTES_MERGE_WORKTREE").join(&c1),
+        "resolved\n",
+    )
+    .unwrap();
+    save_state(p, saved.path());
+    assert_cli_success(
+        &run_libra_command(&["notes", "merge", "--commit"], p),
+        "commit",
+    );
+    restore_state(p, saved.path(), true);
+    assert_cli_success(
+        &run_libra_command(&["notes", "add", "-f", "-m", "x note", &c1], p),
+        "AC3 revert",
+    );
+    let failed = run_libra_command(&["notes", "merge", "--commit"], p);
+    assert!(!failed.status.success(), "AC3 must fail");
+    assert!(
+        String::from_utf8_lossy(&failed.stderr).contains("LBR-CONFLICT-002"),
+        "AC3 code"
+    );
+
+    // AC4: deleting the already-copied entry must also fail closed.
+    let (repo, _c1, c2) = build();
+    let p = repo.path();
+    let saved = tempdir().expect("saved state");
+    save_state(p, saved.path());
+    assert_cli_success(
+        &run_libra_command(&["notes", "merge", "--commit"], p),
+        "commit",
+    );
+    restore_state(p, saved.path(), true);
+    assert_cli_success(
+        &run_libra_command(&["notes", "remove", &c2], p),
+        "AC4 remove copy",
+    );
+    let failed = run_libra_command(&["notes", "merge", "--commit"], p);
+    assert!(!failed.status.success(), "AC4 must fail");
+    assert!(
+        String::from_utf8_lossy(&failed.stderr).contains("LBR-CONFLICT-002"),
+        "AC4 code"
+    );
+
+    // AC5: a pre-transaction crash (rows not at their targets) fails closed.
+    let (repo, _c1, _c2) = build();
+    let p = repo.path();
+    std::fs::write(p.join(".libra").join("NOTES_MERGE_COMMITTING"), b"").unwrap();
+    let failed = run_libra_command(&["notes", "merge", "--commit"], p);
+    assert!(!failed.status.success(), "AC5 must fail");
+    assert!(
+        String::from_utf8_lossy(&failed.stderr).contains("LBR-CONFLICT-002"),
+        "AC5 code"
+    );
+
+    // AC6/AC7: F38b — a merge with a single conflict entry and no copied
+    // entries; the deleted resolution file keeps `ours`, so every target value
+    // already equals the current value and the retry only cleans up.
+    let repo = tempdir().expect("failed to create repository root");
+    init_repo_via_cli(repo.path());
+    configure_identity_via_cli(repo.path());
+    let p = repo.path();
+    std::fs::write(
+        p.join("a.txt"),
+        "a
+",
+    )
+    .unwrap();
+    assert_cli_success(&run_libra_command(&["add", "a.txt"], p), "add a");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c1", "--no-verify"], p),
+        "commit c1",
+    );
+    let c1 = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], p).stdout)
+        .trim()
+        .to_string();
+    assert_cli_success(
+        &run_libra_command(&["notes", "add", "-m", "x", &c1], p),
+        "note x",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &["notes", "--ref", "refs/notes/other", "add", "-m", "y", &c1],
+            p,
+        ),
+        "note y",
+    );
+    assert!(
+        !run_libra_command(&["notes", "merge", "refs/notes/other"], p)
+            .status
+            .success()
+    );
+    std::fs::remove_file(p.join(".libra").join("NOTES_MERGE_WORKTREE").join(&c1)).unwrap();
+    std::fs::write(p.join(".libra").join("NOTES_MERGE_COMMITTING"), b"").unwrap();
+    let s3 = rows(p);
+    exec(
+        p,
+        "CREATE TRIGGER notes_write_probe BEFORE INSERT ON notes BEGIN SELECT RAISE(ABORT, 'probe'); END;",
+    );
+    exec(
+        p,
+        "CREATE TRIGGER notes_write_probe_update BEFORE UPDATE ON notes BEGIN SELECT RAISE(ABORT, 'probe'); END;",
+    );
+    let cleaned = run_libra_command(&["notes", "merge", "--commit"], p);
+    assert_cli_success(&cleaned, "AC6 cleanup");
+    for name in [
+        "NOTES_MERGE_STATE",
+        "NOTES_MERGE_WORKTREE",
+        "NOTES_MERGE_COMMITTING",
+    ] {
+        assert!(!p.join(".libra").join(name).exists(), "AC6 {name} removed");
+    }
+    assert_eq!(rows(p), s3, "AC7 no rows written");
+
+    // AC8: a missing STATE (crash while deleting it) is a state error.
+    let (repo, _c1, _c2) = build();
+    let p = repo.path();
+    std::fs::remove_file(p.join(".libra").join("NOTES_MERGE_STATE")).unwrap();
+    std::fs::write(p.join(".libra").join("NOTES_MERGE_COMMITTING"), b"").unwrap();
+    let failed = run_libra_command(&["notes", "merge", "--commit"], p);
+    assert!(!failed.status.success(), "AC8 must fail");
+    assert!(
+        String::from_utf8_lossy(&failed.stderr).contains("LBR-REPO-003"),
+        "AC8 code"
+    );
+    let _ = blob(p, "unused");
+}
