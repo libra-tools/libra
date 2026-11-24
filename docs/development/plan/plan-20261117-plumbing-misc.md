@@ -2023,7 +2023,7 @@ PY
 ### Task PM-27: `libra check-attr` 属性名合法性校验与 `--all` 冲突检查（#1033；自 PM-15 拆出）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-23：新增 `attr_name_valid`（非空、只含 `[-A-Za-z0-9_.]`、不以 `-` 开头），在读取任何路径或 stdin 之前校验每个属性名（`<name>: not a valid attribute name` → `LBR-CLI-002`）；`--all` 与 `--` 之前的属性名同用 → `Attributes and --all both specified`（`LBR-CLI-002`）。AC1–AC6 由 `command::check_attr_test::check_attr_rejects_invalid_attribute_names` 覆盖（AC3 以 `base_libra_command` 启动、stdin 保持打开并 10 秒超时断言）；`check_attr_test` 13/13；EN/zh/开发文档与 `COMPATIBILITY.md` 的 `check-attr` 行同步。
 **Description:** 自 `PM-15` 拆出：`src/command/check_attr.rs` 在读取任何路径或 stdin 之前校验每个属性名符合 Git `attr_name_valid`（非空、只含 `[-A-Za-z0-9_.]`、不以 `-` 开头），不合法以 `LBR-CLI-002` 失败；`--all` 与 `--` 之前的属性名同用（Git：`Attributes and --all both specified`）同样以 `LBR-CLI-002` 失败。
 **Out of scope:** 宏求值（`PM-15`）；以 `-` 开头的属性名（在命令行上先被 clap 当作未知选项、以同一稳定码 `LBR-CLI-002` 拒绝，Git 同样无法经命令行把它作为属性名传入，不单独验收）；Git 的退出码 255（有意差异：Libra 用法错误为 `LBR-CLI-002`）；子目录下相对路径解析（既有差异，尚未排期，重启条件：后续 check-attr 计划）。
 **Current evidence:**

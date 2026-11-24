@@ -62,6 +62,12 @@ Because attributes and pathnames are both positional, they are disambiguated as:
 - Otherwise: the **first** positional is the attribute and the rest are
   pathnames (use `--` for multiple attributes).
 
+Attribute names are validated before any path or stdin read: a name must be
+non-empty and consist only of `[-A-Za-z0-9_.]`, never starting with `-`.
+An invalid name fails with `<name>: not a valid attribute name` (`LBR-CLI-002`),
+and `--all` combined with attributes before `--` fails with
+`Attributes and --all both specified` (`LBR-CLI-002`).
+
 ## Options
 
 | Option | Description | Example |

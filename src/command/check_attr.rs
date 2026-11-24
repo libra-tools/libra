@@ -79,6 +79,16 @@ pub struct CheckAttrArgs {
     pub source: Option<String>,
 }
 
+/// Git's `attr_name_valid`: non-empty, only `[-A-Za-z0-9_.]`, and not starting
+/// with `-`.
+fn attr_name_valid(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('-')
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+}
+
 /// One `(path, attr, value)` triple of structured output.
 #[derive(Debug, Clone, Serialize)]
 pub struct CheckAttrEntry {
@@ -134,6 +144,19 @@ pub async fn execute_safe(args: CheckAttrArgs, output: &OutputConfig) -> CliResu
         let attr = positionals.remove(0);
         (vec![attr], positionals)
     };
+
+    // Attribute names are validated BEFORE any path or stdin read, matching
+    // Git's `attr_name_valid`: non-empty, only `[-A-Za-z0-9_.]`, not starting
+    // with `-`. `--all` combined with attributes before `--` is also a usage
+    // error.
+    if args.all && !args.attrs.is_empty() && !args.paths.is_empty() {
+        return Err(usage("Attributes and --all both specified"));
+    }
+    for name in &attr_names {
+        if !attr_name_valid(name) {
+            return Err(usage(&format!("{name}: not a valid attribute name")));
+        }
+    }
 
     let paths = if args.stdin {
         if !cli_paths.is_empty() {

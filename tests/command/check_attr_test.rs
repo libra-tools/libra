@@ -309,3 +309,66 @@ fn check_attr_global_sources_follow_git() {
         "AC5"
     );
 }
+
+/// PM-27: attribute names are validated (Git's `attr_name_valid`) before any
+/// path or stdin read, and `--all` conflicts with named attributes.
+#[test]
+fn check_attr_rejects_invalid_attribute_names() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let repo = tempdir().expect("failed to create repository root");
+    init_repo_via_cli(repo.path());
+    std::fs::write(repo.path().join("x"), "x\n").expect("write x");
+    std::fs::write(repo.path().join("x.dat"), "x\n").expect("write x.dat");
+
+    for args in [
+        vec!["check-attr", "", "x"],
+        vec!["check-attr", "", "--", "x"],
+        vec!["check-attr", "a b", "--", "x"],
+        vec!["check-attr", "a!", "x"],
+        vec!["check-attr", "--all", "diff", "--", "x.dat"],
+    ] {
+        let out = run_libra_command(&args, repo.path());
+        assert!(!out.status.success(), "{args:?} must fail");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("LBR-CLI-002"),
+            "{args:?} code"
+        );
+    }
+
+    // AC3: validation runs before stdin is read, so a producer that keeps stdin
+    // open still gets an immediate usage error.
+    let mut command = super::base_libra_command(&["check-attr", "--stdin", ""], repo.path());
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().expect("spawn check-attr");
+    let _stdin = child.stdin.take().expect("stdin");
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait().expect("wait") {
+            Some(status) => {
+                assert!(
+                    start.elapsed() < std::time::Duration::from_secs(10),
+                    "AC3 timeout"
+                );
+                assert!(!status.success(), "AC3 exit");
+                break;
+            }
+            None if start.elapsed() > std::time::Duration::from_secs(10) => {
+                let _ = child.kill();
+                panic!("AC3 must fail before reading stdin");
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(20)),
+        }
+    }
+    let mut stderr = String::new();
+    use std::io::Read;
+    if let Some(mut handle) = child.stderr.take() {
+        handle.read_to_string(&mut stderr).expect("read stderr");
+    }
+    assert!(stderr.contains("LBR-CLI-002"), "AC3 code: {stderr}");
+    let _ = std::io::stdout().flush();
+}

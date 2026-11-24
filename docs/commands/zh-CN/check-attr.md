@@ -38,6 +38,8 @@ libra check-attr [-z] (<attr>... | --all) --stdin
 - `--stdin`：位置参数是属性名，路径从标准输入读取。
 - 否则：**第一个**位置参数是属性，其余是路径（多个属性请用 `--`）。
 
+属性名会在读取任何路径或标准输入之前校验：必须非空、只含 `[-A-Za-z0-9_.]` 且不以 `-` 开头。非法名称以 `<name>: not a valid attribute name`（`LBR-CLI-002`）失败；`--all` 与 `--` 之前的属性名同用会报 `Attributes and --all both specified`（`LBR-CLI-002`）。
+
 ## 选项
 
 | 选项 | 说明 | 示例 |

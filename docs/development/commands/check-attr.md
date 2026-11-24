@@ -54,3 +54,5 @@
 - 任何行为变更先核对 `check_attr.rs` / `lfs::is_lfs_tracked`，再同步 `COMPATIBILITY.md`、`docs/commands/check-attr.md` 与测试。
 
 - 2026-11-23（PM-18 / #1033、#1035）：新增 `util::xdg_config_home(file)`（非空 `XDG_CONFIG_HOME/git/<file>`，否则 `$HOME/.config/git/<file>`，皆无则 None）；`read_cascaded_config_value_fresh_conn` 的每个 scope 在精确键无行时回退 `LOWER(key)=LOWER(?)` 查询（加密行仍按 Unusable 处理），使 `core.attributesfile`/`core.excludesfile` 等拼写生效；属性引擎以 `global_attributes_path`（显式配置 → XDG）统一三处来源构造，忽略引擎在未配置时回退 `xdg_config_home("ignore")`。回归：`check_attr_global_sources_follow_git`（AC1–AC5）、`check_ignore_global_sources_follow_git`（AC6–AC8）；`check_attr_test`+`check_ignore_test` 25/25。
+
+- 2026-11-23（PM-27 / #1033）：新增 `attr_name_valid`（非空、只含 `[-A-Za-z0-9_.]`、不以 `-` 开头），在读取任何路径或 stdin 之前逐个校验属性名（`<name>: not a valid attribute name` → `LBR-CLI-002`）；`--all` 与 `--` 之前的属性名同用 → `Attributes and --all both specified`（`LBR-CLI-002`）。回归：`check_attr_rejects_invalid_attribute_names`（AC1–AC6，含 stdin 保持打开的超时断言）；`check_attr_test` 13/13。
