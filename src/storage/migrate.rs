@@ -36,6 +36,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant, SystemTime},
 };
 
@@ -56,6 +57,7 @@ use sha2::{Digest as _, Sha256};
 use crate::{
     internal::db::schema::{CAPTURE_SCHEMA_NAME, CAPTURE_SCHEMA_VERSION, DatabaseRole},
     storage::{
+        backend::StorageBackendKind,
         capture_store::{
             AgentAuditLogRecord, AgentBridgeCheckpointRecord, AgentBridgeEventRecord,
             AgentBridgeLinkRecord, AgentBridgeOperationRecord, AgentBridgeSessionRecord,
@@ -78,7 +80,7 @@ use crate::{
             validate_capture_dedup_key,
         },
         codec::{decode_versioned, encode_versioned},
-        config_store::LegacyConfigEntry,
+        config_store::{LegacyConfigEntry, SQLITE_MIGRATED_FENCE_SQL, SQLITE_MIGRATED_FENCE_TABLE},
         error::{StorageBackendError, StorageResult},
         git_state_store::{
             AiDecisionProposalRecord, AiFinalDecisionRecord, AiIndexIntentContextFrameRecord,
@@ -107,8 +109,9 @@ use crate::{
         },
         manifest::{
             LEGACY_SQLITE_DB_FILE, PRIVATE_SUBDIR, Phase2DbState, Phase2Progress, REDB_SUBDIR,
-            SourceDigests, StorageFormatManifest, canonical_capture_redb_rel_path,
-            canonical_git_redb_rel_path, format_generation_id,
+            STORAGE_FORMAT_MANIFEST_FILE, SourceDigests, StorageFormatManifest,
+            canonical_capture_redb_rel_path, canonical_git_redb_rel_path, format_generation_id,
+            read_storage_manifest,
         },
         meta::{begin_checked_read, init_meta_schema},
         opener::{begin_write_bounded_blocking, open_redb_read_only},
@@ -742,6 +745,8 @@ pub struct QuiescedSqliteConnection {
     role: DatabaseRole,
     path: PathBuf,
     journal_mode: String,
+    #[cfg(unix)]
+    source_inode: (u64, u64),
 }
 
 impl std::fmt::Debug for QuiescedSqliteConnection {
@@ -1746,6 +1751,11 @@ async fn finalize_prepared_sqlite_quiescence_inner(
             role: prepared.role,
             path: prepared.path,
             journal_mode: "delete".to_string(),
+            #[cfg(unix)]
+            source_inode: {
+                use std::os::unix::fs::MetadataExt as _;
+                (prepared.expected_meta.dev(), prepared.expected_meta.ino())
+            },
         }),
         Err(err) => {
             let _ = prepared.conn.close().await;
@@ -19648,6 +19658,14 @@ impl Phase1DurabilityReceipt {
             .any(|op| op.kind == Phase1DurabilityOpKind::DirFsync && op.target == target)
     }
 
+    /// Return `true` if `target` completed a durable atomic publish (`rename`).
+    #[must_use]
+    pub fn has_atomic_publish(&self, target: &str) -> bool {
+        self.ops
+            .iter()
+            .any(|op| op.kind == Phase1DurabilityOpKind::AtomicPublish && op.target == target)
+    }
+
     /// Return `true` if `file_target` completed `FileFsync` strictly BEFORE
     /// `AtomicPublish`, which in turn occurred strictly BEFORE `DirFsync` of
     /// `dir_target` (`RB-10j` AC1 crash-durability ordering invariant).
@@ -27186,6 +27204,9 @@ pub struct ForwardPhase1Prepared {
     // under an armed `artifact_guard`; Phase 2 takes ownership atomically via
     // `into_phase2_handoff()`.
     guard: ForwardPhase1QuiesceGuard,
+    // Validated `<common_storage>` root captured during Phase 1 so Phase 2
+    // always operates on the exact directory whose locks are held.
+    common_storage: PathBuf,
     /// Target generation ID (`>= 1`).
     pub generation: u64,
     /// Promoted, `fsync`'d `.libra/redb/git.gen-<id>.redb`.
@@ -27738,6 +27759,7 @@ async fn prepare_forward_phase1_inner(
         Ok((export, verification, backup, durability)) => Ok(ForwardPhase1Prepared {
             artifact_guard,
             guard,
+            common_storage: common_storage.to_path_buf(),
             generation,
             git_redb_path: git_final,
             capture_redb_path: cap_final,
@@ -27787,6 +27809,2012 @@ async fn prepare_forward_phase1_inner(
                         Some(pending),
                     ))
                 }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// RB-10b: Forward Migration Phase 2 (100% SQLite Rollback-Journal Atomic Fence
+// & Post-Unlink Progress Persistence, ADR-RB-07 #1 Step 2.1–2.2b)
+// ============================================================================
+
+/// Monotonic per-process counter for collision-free Phase 2 atomic manifest
+/// staging filenames under `<common_storage>`.
+static PHASE2_MANIFEST_TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Ordered durability and state-machine operation kinds recorded during Forward
+/// Migration Phase 2 (`ADR-RB-07` #1 Step 2.1–2.2b, `RB-10b`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phase2DurabilityOpKind {
+    /// Temp `.libra/storage-format.json.*.tmp` flushed via `sync_all()`.
+    ManifestFileFsync,
+    /// Atomic `renameat` / write-through `MoveFileExW` replacing `.libra/storage-format.json`.
+    ManifestAtomicPublish,
+    /// Step 2.1: `.libra/storage-format.json` (`backend="redb", finalized=false, pending`) published.
+    PublishManifestPending,
+    /// Step 2.2b(i): `.libra/storage-format.json` updated with `phase2_progress.<db> = "fenced_ready_to_unlink"`.
+    PublishManifestFencedReadyToUnlink,
+    /// Step 2.2b(iii): `.libra/storage-format.json` updated with `phase2_progress.<db> = "unlinked"`.
+    PublishManifestUnlinked,
+    /// Parent directory `fsync_dir(.libra/)` completed after manifest atomic publish.
+    ManifestDirFsync,
+    /// Step 2.2a: 100% SQLite `synchronous = FULL` rollback-journal `__libra_migrated_fence__` `COMMIT`.
+    FenceCommit,
+    /// Step 2.2b(ii): source SQLite database file unlinked under held migration locks.
+    UnlinkSource,
+    /// Step 2.2b(ii): parent directory `fsync_dir` completed immediately after `unlink`.
+    ParentDirFsyncAfterUnlink,
+    /// Step 2.2b(ii): single-connection `c_mig` deterministically closed.
+    CloseMigrationConn,
+}
+
+/// One recorded Phase 2 durability or state-machine operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Phase2DurabilityOp {
+    /// Operation category.
+    pub kind: Phase2DurabilityOpKind,
+    /// Optional database role associated with this step (`None` for Step 2.1 initial manifest).
+    pub role: Option<DatabaseRole>,
+    /// Sanitized relative target label (zero private absolute paths).
+    pub rel_target: String,
+}
+
+/// Complete ordered durability & progress audit trail for Forward Migration Phase 2 (`RB-10b`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Phase2DurabilityReceipt {
+    /// Ordered durability/state transitions observed during Phase 2.
+    pub ops: Vec<Phase2DurabilityOp>,
+}
+
+impl Phase2DurabilityReceipt {
+    fn new() -> Self {
+        Self { ops: Vec::new() }
+    }
+
+    fn record(
+        &mut self,
+        kind: Phase2DurabilityOpKind,
+        role: Option<DatabaseRole>,
+        rel_target: impl Into<String>,
+    ) {
+        self.ops.push(Phase2DurabilityOp {
+            kind,
+            role,
+            rel_target: rel_target.into(),
+        });
+    }
+
+    /// Return the first index matching `(kind, role)` in the ordered Phase 2 log.
+    #[must_use]
+    pub fn position_of(
+        &self,
+        kind: Phase2DurabilityOpKind,
+        role: Option<DatabaseRole>,
+    ) -> Option<usize> {
+        self.ops
+            .iter()
+            .position(|op| op.kind == kind && op.role == role)
+    }
+
+    /// Return `true` when at least one operation matches `(kind, role)`.
+    #[must_use]
+    pub fn has_op(&self, kind: Phase2DurabilityOpKind, role: Option<DatabaseRole>) -> bool {
+        self.position_of(kind, role).is_some()
+    }
+}
+
+/// Receipt proving a source SQLite database completed the 100% SQLite
+/// `synchronous = FULL` rollback-journal atomic fence transaction (`RB-10b`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SqliteFenceReceipt {
+    /// Fenced source database role (`Repository` or `Capture`).
+    pub role: DatabaseRole,
+    /// `PRAGMA schema_version` observed immediately before the fence transaction.
+    pub schema_version_before: i32,
+    /// `PRAGMA schema_version` durably committed inside the fence transaction.
+    pub schema_version_after: i32,
+    /// Whether the fenced source database path has been unlinked and its parent fsynced.
+    pub unlinked: bool,
+    /// Elapsed wall-clock time for the fence transaction.
+    pub elapsed: Duration,
+}
+
+/// Continuously locked post-Step-2.2b Forward Migration Phase 2 state returned
+/// by [`execute_forward_phase2_fence_and_unlink`] (`ADR-RB-07` #1, `RB-10b`).
+///
+/// All 6 non-SQLite exclusive advisory locks (including unmoved
+/// `capture-spool/capacity.lock` and `capture-queue/append.lock`) remain
+/// continuously held so Step 2.3 (in-place `capture-spool` tombstones) and
+/// Step 2.4 (`finalized = true` manifest publication, `RB-10g`) execute with
+/// zero lock gap.
+#[derive(Debug)]
+pub struct ForwardPhase2FencedState {
+    common_storage: PathBuf,
+    locks: ForwardPhase1Locks,
+    /// Target generation ID (`>= 1`).
+    pub generation: u64,
+    /// Promoted, `fsync`'d `.libra/redb/git.gen-<id>.redb`.
+    pub git_redb_path: PathBuf,
+    /// Promoted, `fsync`'d `.libra/private/capture.gen-<id>.redb`.
+    pub capture_redb_path: PathBuf,
+    /// Latest durably published `.libra/storage-format.json` (`finalized = false`,
+    /// `git_db = Unlinked`, `capture_db = Unlinked | Absent`, `spool_fenced = false`).
+    pub manifest: StorageFormatManifest,
+    /// Rollback-journal atomic fence & post-unlink receipt for `.libra/libra.db`.
+    pub git_fence: SqliteFenceReceipt,
+    /// Rollback-journal atomic fence & post-unlink receipt for `.libra/private/capture.db` (if present).
+    pub capture_fence: Option<SqliteFenceReceipt>,
+    /// Complete ordered Phase 2 durability and state-machine log.
+    pub durability: Phase2DurabilityReceipt,
+    /// Total elapsed wall-clock duration for Phase 2 Step 2.1–2.2b.
+    pub elapsed: Duration,
+}
+
+impl ForwardPhase2FencedState {
+    /// Explicitly release all 6 continuously held non-SQLite exclusive advisory
+    /// locks in strict reverse acquisition order.
+    pub fn release_locks(self) {
+        let Self { locks, .. } = self;
+        drop(locks);
+    }
+
+    /// Hand off the validated storage root, continuously held locks, manifest,
+    /// and durability receipt into Step 2.3–2.4 (`RB-10g`).
+    #[allow(dead_code)]
+    pub(crate) fn into_step2_3_parts(
+        self,
+    ) -> (
+        PathBuf,
+        ForwardPhase1Locks,
+        StorageFormatManifest,
+        Phase2DurabilityReceipt,
+    ) {
+        (
+            self.common_storage,
+            self.locks,
+            self.manifest,
+            self.durability,
+        )
+    }
+}
+
+/// Test-only deterministic observation / fault-injection points across Forward
+/// Migration Phase 2 Step 2.1–2.2b (`RB-10b`, `RB-10l`, `RB-10e`, `RB-10c`, `RB-10k`).
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase2TestPoint {
+    AfterPublishPendingManifest,
+    BeforeFenceCommit(DatabaseRole),
+    AfterFenceCommitBeforePersistReady(DatabaseRole),
+    AfterPersistReadyBeforeUnlink(DatabaseRole),
+    AfterUnlinkBeforeParentDirFsync(DatabaseRole),
+    AfterParentDirFsyncBeforeClose(DatabaseRole),
+    AfterCloseBeforePersistUnlinked(DatabaseRole),
+    AfterPersistUnlinked(DatabaseRole),
+}
+
+#[cfg(test)]
+trait Phase2TestObserver {
+    fn on_point(&mut self, point: Phase2TestPoint, root: &Path) -> StorageResult<()>;
+}
+
+#[cfg(test)]
+impl<F> Phase2TestObserver for F
+where
+    F: FnMut(Phase2TestPoint, &Path) -> StorageResult<()>,
+{
+    fn on_point(&mut self, point: Phase2TestPoint, root: &Path) -> StorageResult<()> {
+        self(point, root)
+    }
+}
+
+/// Verify all Phase 1 durability, artifact, manifest, and locked `c_mig`
+/// prerequisites BEFORE Step 2.1 publishes `.libra/storage-format.json(finalized=false)`
+/// (`RB-10b` AC1).
+async fn verify_phase1_prerequisites_for_phase2(
+    prepared: &mut ForwardPhase1Prepared,
+) -> StorageResult<()> {
+    if prepared.generation == 0 {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "forward migration Phase 2 requires generation >= 1".to_string(),
+        });
+    }
+
+    let common_storage = &prepared.common_storage;
+    let expected_git_redb = git_redb_path(common_storage, prepared.generation);
+    let expected_cap_redb = capture_redb_path(common_storage, prepared.generation);
+    if prepared.git_redb_path != expected_git_redb
+        || prepared.capture_redb_path != expected_cap_redb
+    {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "forward migration Phase 2 target redb paths do not match canonical generation layout"
+                .to_string(),
+        });
+    }
+
+    // Build single-pass O(M) indexes of Phase 1 durability receipts so preflight
+    // scales linearly with large `capture-spool/` backups inside the 500ms budget.
+    let mut file_fsyncs: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut atomic_publishes: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut dir_fsyncs: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for op in &prepared.durability.ops {
+        match op.kind {
+            Phase1DurabilityOpKind::FileFsync => {
+                file_fsyncs.insert(op.target.as_str());
+            }
+            Phase1DurabilityOpKind::AtomicPublish => {
+                atomic_publishes.insert(op.target.as_str());
+            }
+            Phase1DurabilityOpKind::DirFsync => {
+                dir_fsyncs.insert(op.target.as_str());
+            }
+        }
+    }
+
+    // Re-confirm promoted target `.gen-<id>.redb` files exist and were durably
+    // fsynced, atomically published, and parent-dir fsynced in Phase 1.
+    let git_rel = canonical_git_redb_rel_path(prepared.generation);
+    let cap_rel = canonical_capture_redb_rel_path(prepared.generation);
+    for (path, rel, label) in [
+        (&expected_git_redb, git_rel.as_str(), "target git redb"),
+        (&expected_cap_redb, cap_rel.as_str(), "target capture redb"),
+    ] {
+        let meta = fs::symlink_metadata(path)
+            .map_err(|err| StorageBackendError::io("stat Phase 1 promoted target redb", err))?;
+        if meta.file_type().is_symlink() || !meta.file_type().is_file() || meta.len() == 0 {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "forward migration Phase 2 rejected invalid or missing {label} artifact"
+                ),
+            });
+        }
+        if !file_fsyncs.contains(rel) || !atomic_publishes.contains(rel) {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "forward migration Phase 2 refused to publish manifest before {label} completed fsync and atomic publish"
+                ),
+            });
+        }
+    }
+    if !dir_fsyncs.contains(REDB_SUBDIR) || !dir_fsyncs.contains(PRIVATE_SUBDIR) {
+        return Err(StorageBackendError::BackendInternal {
+            detail:
+                "forward migration Phase 2 refused to publish manifest before redb/private directory fsync_dir"
+                    .to_string(),
+        });
+    }
+
+    // Re-confirm `VACUUM INTO` backups and `capture-spool/` backup exist and
+    // completed `fsync` + atomic publish + parent `fsync_dir` in Phase 1.
+    let expected_backup_rel = canonical_sqlite_backup_rel_dir(prepared.generation);
+    if prepared.backup.backup_rel_dir != expected_backup_rel {
+        return Err(StorageBackendError::BackendInternal {
+            detail:
+                "forward migration Phase 2 backup directory does not match canonical generation path"
+                    .to_string(),
+        });
+    }
+    let git_bk_rel = format!("{expected_backup_rel}/{LEGACY_SQLITE_DB_FILE}");
+    let git_bk_meta = fs::symlink_metadata(&prepared.backup.git_backup.backup_path)
+        .map_err(|err| StorageBackendError::io("stat Phase 1 git VACUUM INTO backup", err))?;
+    if git_bk_meta.file_type().is_symlink()
+        || !git_bk_meta.file_type().is_file()
+        || git_bk_meta.len() == 0
+        || git_bk_meta.len() != prepared.backup.git_backup.byte_len
+    {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "forward migration Phase 2 rejected missing or altered git VACUUM INTO backup"
+                .to_string(),
+        });
+    }
+    if !file_fsyncs.contains(git_bk_rel.as_str()) || !atomic_publishes.contains(git_bk_rel.as_str())
+    {
+        return Err(StorageBackendError::BackendInternal {
+            detail:
+                "forward migration Phase 2 refused to publish manifest before git VACUUM INTO backup completed fsync"
+                    .to_string(),
+        });
+    }
+
+    let has_capture_source = prepared.guard.sqlite.capture.is_some();
+    match (has_capture_source, prepared.backup.capture_backup.as_ref()) {
+        (true, Some(cap_bk)) => {
+            let cap_bk_rel = format!("{expected_backup_rel}/capture.db");
+            let cap_bk_meta = fs::symlink_metadata(&cap_bk.backup_path).map_err(|err| {
+                StorageBackendError::io("stat Phase 1 capture VACUUM INTO backup", err)
+            })?;
+            if cap_bk_meta.file_type().is_symlink()
+                || !cap_bk_meta.file_type().is_file()
+                || cap_bk_meta.len() == 0
+                || cap_bk_meta.len() != cap_bk.byte_len
+            {
+                return Err(StorageBackendError::BackendInternal {
+                    detail:
+                        "forward migration Phase 2 rejected missing or altered capture VACUUM INTO backup"
+                            .to_string(),
+                });
+            }
+            if !file_fsyncs.contains(cap_bk_rel.as_str())
+                || !atomic_publishes.contains(cap_bk_rel.as_str())
+            {
+                return Err(StorageBackendError::BackendInternal {
+                    detail:
+                        "forward migration Phase 2 refused to publish manifest before capture VACUUM INTO backup completed fsync"
+                            .to_string(),
+                });
+            }
+        }
+        (false, None) => {}
+        _ => {
+            return Err(StorageBackendError::BackendInternal {
+                detail:
+                    "forward migration Phase 2 detected mismatch between locked capture source and capture backup receipt"
+                        .to_string(),
+            });
+        }
+    }
+
+    let spool_bk_rel = format!("{expected_backup_rel}/{CAPTURE_SPOOL_SUBDIR}");
+    for file_rcpt in &prepared.backup.spool_backup.files {
+        let rel = format!(
+            "{spool_bk_rel}/{}/{}",
+            file_rcpt.subdir, file_rcpt.file_name
+        );
+        if !file_fsyncs.contains(rel.as_str()) || !atomic_publishes.contains(rel.as_str()) {
+            return Err(StorageBackendError::BackendInternal {
+                detail:
+                    "forward migration Phase 2 refused to publish manifest before capture-spool backup files completed fsync"
+                        .to_string(),
+            });
+        }
+    }
+    if !dir_fsyncs.contains(spool_bk_rel.as_str())
+        || !dir_fsyncs.contains(expected_backup_rel.as_str())
+        || !dir_fsyncs.contains(SQLITE_BACKUP_SUBDIR)
+    {
+        return Err(StorageBackendError::BackendInternal {
+            detail:
+                "forward migration Phase 2 refused to publish manifest before sqlite-backup directory fsync_dir"
+                    .to_string(),
+        });
+    }
+
+    // Validate pre-existing `.libra/storage-format.json` (if any): allow absent
+    // (legacy SQLite repo) or finalized `sqlite` manifest with strictly smaller
+    // generation (re-migrating forward after a completed reverse migration).
+    if let Some(existing) = read_storage_manifest(common_storage)? {
+        if !existing.finalized {
+            return Err(StorageBackendError::BackendInternal {
+                detail:
+                    "forward migration Phase 2 refused to overwrite an unfinalized storage-format.json (run crash recovery instead)"
+                        .to_string(),
+            });
+        }
+        if existing.backend != StorageBackendKind::Sqlite {
+            return Err(StorageBackendError::BackendInternal {
+                detail:
+                    "forward migration Phase 2 refused because repository manifest is already on redb"
+                        .to_string(),
+            });
+        }
+        if prepared.generation <= existing.generation {
+            return Err(StorageBackendError::BackendInternal {
+                detail:
+                    "forward migration Phase 2 requires target generation strictly greater than existing manifest generation"
+                        .to_string(),
+            });
+        }
+    }
+
+    // Verify both continuously held `c_mig` handles remain unmoved, in `DELETE`
+    // journal mode, `locking_mode = EXCLUSIVE`, `synchronous = FULL`, and not
+    // already fenced.
+    verify_quiesced_connection_ready_for_fence(&mut prepared.guard.sqlite.git).await?;
+    if let Some(cap) = prepared.guard.sqlite.capture.as_mut() {
+        verify_quiesced_connection_ready_for_fence(cap).await?;
+    }
+
+    Ok(())
+}
+
+/// Verify that a quiesced single `SqliteConnection` (`c_mig`) satisfies every
+/// prerequisite for the 100% SQLite `synchronous = FULL` rollback-journal
+/// atomic fence (`ADR-RB-07` #1 Step 2.2a, `RB-10b`).
+async fn verify_quiesced_connection_ready_for_fence(
+    source: &mut QuiescedSqliteConnection,
+) -> StorageResult<()> {
+    let role = source.role;
+    validate_repository_forward_role(role)?;
+    verify_connection_not_moved(&mut source.conn, role).await?;
+
+    let wal_path = sqlite_sidecar_path(&source.path, "-wal");
+    let shm_path = sqlite_sidecar_path(&source.path, "-shm");
+    if path_exists_no_open(&wal_path)? || path_exists_no_open(&shm_path)? {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration Phase 2 fence rejected for {role}: unexpected WAL sidecar present"
+            ),
+        });
+    }
+
+    let locking_mode: String = sea_orm::sqlx::query_scalar("PRAGMA locking_mode;")
+        .persistent(false)
+        .fetch_one(&mut source.conn)
+        .await
+        .map_err(|_| StorageBackendError::BackendInternal {
+            detail: format!("forward migration Phase 2 failed verifying locking_mode for {role}"),
+        })?;
+    if !locking_mode.eq_ignore_ascii_case("exclusive") {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration Phase 2 fence rejected for {role}: expected locking_mode=exclusive, got `{locking_mode}`"
+            ),
+        });
+    }
+
+    let journal_mode: String = sea_orm::sqlx::query_scalar("PRAGMA journal_mode;")
+        .persistent(false)
+        .fetch_one(&mut source.conn)
+        .await
+        .map_err(|_| StorageBackendError::BackendInternal {
+            detail: format!("forward migration Phase 2 failed verifying journal_mode for {role}"),
+        })?;
+    if !journal_mode.eq_ignore_ascii_case("delete") {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration Phase 2 fence rejected for {role}: expected journal_mode=delete, got `{journal_mode}`"
+            ),
+        });
+    }
+
+    let sync_level: i64 = sea_orm::sqlx::query_scalar("PRAGMA synchronous;")
+        .persistent(false)
+        .fetch_one(&mut source.conn)
+        .await
+        .map_err(|_| StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration Phase 2 failed verifying synchronous=FULL for {role}"
+            ),
+        })?;
+    if sync_level != 2 {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration Phase 2 fence rejected for {role}: expected synchronous=FULL (2), got {sync_level}"
+            ),
+        });
+    }
+
+    let already_fenced: Option<i64> = sea_orm::sqlx::query_scalar(AssertSqlSafe(format!(
+        "SELECT 1 FROM sqlite_master WHERE name = '{SQLITE_MIGRATED_FENCE_TABLE}' LIMIT 1;"
+    )))
+    .persistent(false)
+    .fetch_optional(&mut source.conn)
+    .await
+    .map_err(|_| StorageBackendError::BackendInternal {
+        detail: format!(
+            "forward migration Phase 2 failed inspecting sqlite_master before fence for {role}"
+        ),
+    })?;
+    if already_fenced.is_some() {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration Phase 2 fence rejected for {role}: `{SQLITE_MIGRATED_FENCE_TABLE}` already exists"
+            ),
+        });
+    }
+
+    Ok(())
+}
+
+/// Test-only helper invoking the private rollback-journal fence primitive
+/// directly to inspect persisted SQLite header counters and `sqlite_master`
+/// sentinel bytes prior to `unlink`. Production callers MUST enter exclusively
+/// through [`execute_forward_phase2_fence_and_unlink`], which enforces all
+/// Phase 1 `fsync` prerequisites and Step 2.1 `storage-format.json(finalized=false)`
+/// publication before fencing any database (`RB-10b`).
+#[cfg(test)]
+async fn fence_sqlite_connection_journaled(
+    source: &mut QuiescedSqliteConnection,
+) -> StorageResult<SqliteFenceReceipt> {
+    let mut no_hook: Option<&mut dyn Phase2TestObserver> = None;
+    fence_sqlite_connection_journaled_inner(source, &mut no_hook).await
+}
+
+async fn fence_sqlite_connection_journaled_inner(
+    source: &mut QuiescedSqliteConnection,
+    #[cfg(test)] before_commit_hook: &mut Option<&mut dyn Phase2TestObserver>,
+) -> StorageResult<SqliteFenceReceipt> {
+    let started = Instant::now();
+    verify_quiesced_connection_ready_for_fence(source).await?;
+
+    let role = source.role;
+    let sv_before_i64: i64 = sea_orm::sqlx::query_scalar("PRAGMA schema_version;")
+        .persistent(false)
+        .fetch_one(&mut source.conn)
+        .await
+        .map_err(|_| StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration Phase 2 failed reading schema_version before fence for {role}"
+            ),
+        })?;
+    let sv_before = sv_before_i64 as i32;
+
+    // Begin single atomic rollback-journaled write transaction (`synchronous=FULL`,
+    // `journal_mode=DELETE`, `locking_mode=EXCLUSIVE`).
+    sea_orm::sqlx::query("BEGIN EXCLUSIVE;")
+        .persistent(false)
+        .execute(&mut source.conn)
+        .await
+        .map_err(|err| StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration Phase 2 failed BEGIN EXCLUSIVE fence transaction for {role} ({})",
+                if is_sqlite_busy_error(&err) {
+                    "SQLITE_BUSY"
+                } else {
+                    "sqlite error"
+                }
+            ),
+        })?;
+
+    let tx_res: StorageResult<i32> = async {
+        // 1. Create the canonical sentinel table inside the journaled transaction.
+        sea_orm::sqlx::query(AssertSqlSafe(format!(
+            "CREATE TABLE {SQLITE_MIGRATED_FENCE_TABLE} (x INTEGER);"
+        )))
+        .persistent(false)
+        .execute(&mut source.conn)
+        .await
+        .map_err(|_| StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration Phase 2 failed creating `{SQLITE_MIGRATED_FENCE_TABLE}` for {role}"
+            ),
+        })?;
+
+        // 2. Capture post-CREATE `schema_version` while schema is still valid.
+        let sv_after_create_i64: i64 = sea_orm::sqlx::query_scalar("PRAGMA schema_version;")
+            .persistent(false)
+            .fetch_one(&mut source.conn)
+            .await
+            .map_err(|_| StorageBackendError::BackendInternal {
+                detail: format!(
+                    "forward migration Phase 2 failed reading post-CREATE schema_version for {role}"
+                ),
+            })?;
+        let sv_after_create = sv_after_create_i64 as i32;
+        let mut next_sv = sv_after_create.wrapping_add(1);
+        if next_sv == sv_before {
+            next_sv = next_sv.wrapping_add(1);
+        }
+
+        // 3. Enable `writable_schema = ON` strictly inside this atomic transaction
+        //    and rewrite ONLY the sentinel row's SQL to the deterministic syntax
+        //    error body (`ADR-RB-07` #1 Step 2.2a).
+        sea_orm::sqlx::query("PRAGMA writable_schema = ON;")
+            .persistent(false)
+            .execute(&mut source.conn)
+            .await
+            .map_err(|_| StorageBackendError::BackendInternal {
+                detail: format!(
+                    "forward migration Phase 2 failed enabling writable_schema for {role}"
+                ),
+            })?;
+
+        let updated = sea_orm::sqlx::query(AssertSqlSafe(format!(
+            "UPDATE sqlite_master SET sql = '{SQLITE_MIGRATED_FENCE_SQL}' WHERE type = 'table' AND name = '{SQLITE_MIGRATED_FENCE_TABLE}';"
+        )))
+        .persistent(false)
+        .execute(&mut source.conn)
+        .await
+        .map_err(|_| StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration Phase 2 failed updating sqlite_master fence sentinel for {role}"
+            ),
+        })?;
+        if updated.rows_affected() != 1 {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "forward migration Phase 2 fence sentinel update affected {} rows (expected 1) for {role}",
+                    updated.rows_affected()
+                ),
+            });
+        }
+
+        // 4. Explicitly advance `schema_version` so every pre-opened connection's
+        //    cached schema cookie is invalidated on its very next schema check.
+        sea_orm::sqlx::query(AssertSqlSafe(format!("PRAGMA schema_version = {next_sv};")))
+            .persistent(false)
+            .execute(&mut source.conn)
+            .await
+            .map_err(|_| StorageBackendError::BackendInternal {
+                detail: format!(
+                    "forward migration Phase 2 failed advancing schema_version for {role}"
+                ),
+            })?;
+
+        let observed_sv_i64: i64 = sea_orm::sqlx::query_scalar("PRAGMA schema_version;")
+            .persistent(false)
+            .fetch_one(&mut source.conn)
+            .await
+            .map_err(|_| StorageBackendError::BackendInternal {
+                detail: format!(
+                    "forward migration Phase 2 failed verifying advanced schema_version for {role}"
+                ),
+            })?;
+        if observed_sv_i64 as i32 != next_sv {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "forward migration Phase 2 schema_version verification mismatch for {role}"
+                ),
+            });
+        }
+
+        // 5. Restore `writable_schema = OFF` before committing via rollback journal.
+        sea_orm::sqlx::query("PRAGMA writable_schema = OFF;")
+            .persistent(false)
+            .execute(&mut source.conn)
+            .await
+            .map_err(|_| StorageBackendError::BackendInternal {
+                detail: format!(
+                    "forward migration Phase 2 failed disabling writable_schema for {role}"
+                ),
+            })?;
+
+        #[cfg(test)]
+        if let Some(cb) = before_commit_hook.as_deref_mut() {
+            let root = if role == DatabaseRole::Capture {
+                source.path.parent().and_then(Path::parent)
+            } else {
+                source.path.parent()
+            }
+            .unwrap_or_else(|| Path::new("."));
+            cb.on_point(Phase2TestPoint::BeforeFenceCommit(role), root)?;
+        }
+
+        // 6. Atomic `synchronous = FULL` rollback-journal `COMMIT`.
+        sea_orm::sqlx::query("COMMIT;")
+            .persistent(false)
+            .execute(&mut source.conn)
+            .await
+            .map_err(|_| StorageBackendError::BackendInternal {
+                detail: format!(
+                    "forward migration Phase 2 failed committing rollback-journal fence transaction for {role}"
+                ),
+            })?;
+
+        Ok(next_sv)
+    }
+    .await;
+
+    let sv_after = match tx_res {
+        Ok(sv) => sv,
+        Err(err) => {
+            let _ = sea_orm::sqlx::query("PRAGMA writable_schema = OFF;")
+                .persistent(false)
+                .execute(&mut source.conn)
+                .await;
+            let _ = sea_orm::sqlx::query("ROLLBACK;")
+                .persistent(false)
+                .execute(&mut source.conn)
+                .await;
+            return Err(err);
+        }
+    };
+
+    // Confirm `c_mig` remains bound to the exact unmoved source inode (zero
+    // extra fd opened!). Note: under SQLite `PRAGMA locking_mode = EXCLUSIVE` +
+    // `journal_mode = DELETE`, `COMMIT` zeroes the rollback-journal header in
+    // place (making it cold/inactive) and retains the journal file until
+    // `c_mig.close()` unlinks it; post-close absence is verified in
+    // `unlink_fenced_sqlite_source_and_close`.
+    verify_connection_not_moved(&mut source.conn, role).await?;
+
+    Ok(SqliteFenceReceipt {
+        role,
+        schema_version_before: sv_before,
+        schema_version_after: sv_after,
+        unlinked: false,
+        elapsed: started.elapsed(),
+    })
+}
+
+/// Atomically publish `<common_storage>/storage-format.json` during Phase 2
+/// (`.tmp` -> `fsync` -> atomic `rename` -> `fsync_dir(.libra/)`), invoking
+/// `on_after_rename_before_dir_fsync` immediately upon successful atomic rename
+/// and BEFORE `fsync_dir` (used on Step 2.1 to disarm `Phase1ArtifactGuard`
+/// atomically at the exact point of publication).
+#[cfg(unix)]
+fn publish_phase2_storage_manifest_durable(
+    common_storage: &Path,
+    manifest: &StorageFormatManifest,
+    durability: &mut Phase2DurabilityReceipt,
+    stage_kind: Phase2DurabilityOpKind,
+    stage_role: Option<DatabaseRole>,
+    on_after_rename_before_dir_fsync: Option<&mut dyn FnMut()>,
+) -> StorageResult<()> {
+    use std::{
+        ffi::CString,
+        io::Write as _,
+        os::unix::{
+            ffi::OsStrExt as _,
+            io::{AsRawFd as _, FromRawFd as _, OwnedFd},
+        },
+    };
+
+    manifest.validate()?;
+    let mut payload = serde_json::to_vec_pretty(manifest).map_err(|err| {
+        StorageBackendError::BackendInternal {
+            detail: format!(
+                "failed to serialize Phase 2 storage-format.json ({:?})",
+                err.classify()
+            ),
+        }
+    })?;
+    payload.push(b'\n');
+
+    // SAFETY: `geteuid` has no preconditions and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    let c_storage = CString::new(common_storage.as_os_str().as_bytes()).map_err(|_| {
+        StorageBackendError::BackendInternal {
+            detail: "invalid repository storage root path".to_string(),
+        }
+    })?;
+    // SAFETY: `c_storage` is NUL-terminated.
+    let raw_root = unsafe {
+        libc::open(
+            c_storage.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if raw_root < 0 {
+        return Err(StorageBackendError::io(
+            "open repository storage root for Phase 2 manifest publish",
+            io::Error::last_os_error(),
+        ));
+    }
+    // SAFETY: `raw_root >= 0` is exclusively owned here.
+    let root_fd = unsafe { OwnedFd::from_raw_fd(raw_root) };
+
+    let mut root_st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: `root_fd` is valid.
+    if unsafe { libc::fstat(root_fd.as_raw_fd(), root_st.as_mut_ptr()) } != 0 {
+        return Err(StorageBackendError::io(
+            "stat repository storage root for Phase 2 manifest publish",
+            io::Error::last_os_error(),
+        ));
+    }
+    // SAFETY: `fstat` succeeded.
+    let root_st = unsafe { root_st.assume_init() };
+    if (root_st.st_mode & libc::S_IFMT) != libc::S_IFDIR || root_st.st_uid != euid {
+        return Err(StorageBackendError::BackendInternal {
+            detail:
+                "repository storage root is not a directory owned by the current effective user"
+                    .to_string(),
+        });
+    }
+    if (u32::from(root_st.st_mode) & 0o022) != 0 {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "repository storage root has unsafe group- or world-writable permissions"
+                .to_string(),
+        });
+    }
+
+    let c_final = CString::new(STORAGE_FORMAT_MANIFEST_FILE).map_err(|_| {
+        StorageBackendError::BackendInternal {
+            detail: "invalid storage-format.json filename".to_string(),
+        }
+    })?;
+    let mut existing_st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: `root_fd` is valid and `c_final` is NUL-terminated.
+    if unsafe {
+        libc::fstatat(
+            root_fd.as_raw_fd(),
+            c_final.as_ptr(),
+            existing_st.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } == 0
+    {
+        // SAFETY: `fstatat` succeeded.
+        let st = unsafe { existing_st.assume_init() };
+        if (st.st_mode & libc::S_IFMT) != libc::S_IFREG || st.st_uid != euid {
+            return Err(StorageBackendError::BackendInternal {
+                detail:
+                    "refusing to overwrite non-regular or foreign-owned storage-format.json target"
+                        .to_string(),
+            });
+        }
+    } else {
+        let err = io::Error::last_os_error();
+        if err.kind() != io::ErrorKind::NotFound {
+            return Err(StorageBackendError::io(
+                "stat existing storage-format.json before Phase 2 publish",
+                err,
+            ));
+        }
+    }
+
+    let mut created: Option<(CString, File)> = None;
+    for _ in 0..64 {
+        let seq = PHASE2_MANIFEST_TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp_name = format!(
+            "{STORAGE_FORMAT_MANIFEST_FILE}.{}.{}.tmp",
+            std::process::id(),
+            seq
+        );
+        let c_tmp = CString::new(tmp_name).map_err(|_| StorageBackendError::BackendInternal {
+            detail: "invalid Phase 2 manifest temp filename".to_string(),
+        })?;
+        // SAFETY: `root_fd` is valid and `c_tmp` is NUL-terminated.
+        let raw_tmp = unsafe {
+            libc::openat(
+                root_fd.as_raw_fd(),
+                c_tmp.as_ptr(),
+                libc::O_CREAT | libc::O_EXCL | libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o644 as libc::mode_t as libc::c_uint,
+            )
+        };
+        if raw_tmp >= 0 {
+            // SAFETY: `raw_tmp >= 0` is exclusively owned here.
+            let file = unsafe { File::from_raw_fd(raw_tmp) };
+            created = Some((c_tmp, file));
+            break;
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::AlreadyExists {
+            continue;
+        }
+        return Err(StorageBackendError::io(
+            "create Phase 2 storage-format.json temp file",
+            err,
+        ));
+    }
+    let (c_tmp, mut tmp_file) = created.ok_or_else(|| StorageBackendError::BackendInternal {
+        detail:
+            "exhausted temporary filename attempts while publishing Phase 2 storage-format.json"
+                .to_string(),
+    })?;
+
+    let mut tmp_st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: `tmp_file` is valid.
+    let tmp_inode = if unsafe { libc::fstat(tmp_file.as_raw_fd(), tmp_st.as_mut_ptr()) } == 0 {
+        // SAFETY: `fstat` succeeded.
+        let st = unsafe { tmp_st.assume_init() };
+        Some((st.st_dev as u64, st.st_ino))
+    } else {
+        None
+    };
+
+    struct ManifestTmpGuardUnix<'a> {
+        root_fd: &'a OwnedFd,
+        c_tmp: &'a CString,
+        inode: Option<(u64, u64)>,
+        armed: bool,
+    }
+    impl Drop for ManifestTmpGuardUnix<'_> {
+        fn drop(&mut self) {
+            if !self.armed {
+                return;
+            }
+            let Some(expected_inode) = self.inode else {
+                return;
+            };
+            let mut st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+            // SAFETY: `root_fd` is valid and `c_tmp` is NUL-terminated.
+            if unsafe {
+                libc::fstatat(
+                    self.root_fd.as_raw_fd(),
+                    self.c_tmp.as_ptr(),
+                    st.as_mut_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            } == 0
+            {
+                // SAFETY: `fstatat` succeeded.
+                let st = unsafe { st.assume_init() };
+                if (st.st_mode & libc::S_IFMT) == libc::S_IFREG
+                    && (st.st_dev as u64, st.st_ino) == expected_inode
+                {
+                    // SAFETY: `root_fd` is valid and `c_tmp` is NUL-terminated.
+                    let _ =
+                        unsafe { libc::unlinkat(self.root_fd.as_raw_fd(), self.c_tmp.as_ptr(), 0) };
+                }
+            }
+        }
+    }
+
+    let mut tmp_guard = ManifestTmpGuardUnix {
+        root_fd: &root_fd,
+        c_tmp: &c_tmp,
+        inode: tmp_inode,
+        armed: true,
+    };
+
+    if tmp_inode.is_none() {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "failed to stat newly created Phase 2 storage-format.json temp file"
+                .to_string(),
+        });
+    }
+
+    tmp_file.write_all(&payload).map_err(|err| {
+        StorageBackendError::io("write Phase 2 storage-format.json temp file", err)
+    })?;
+    tmp_file.sync_all().map_err(|err| {
+        StorageBackendError::io("fsync Phase 2 storage-format.json temp file", err)
+    })?;
+    durability.record(
+        Phase2DurabilityOpKind::ManifestFileFsync,
+        stage_role,
+        STORAGE_FORMAT_MANIFEST_FILE,
+    );
+    drop(tmp_file);
+
+    // SAFETY: `root_fd` is valid and both C-strings are NUL-terminated.
+    if unsafe {
+        libc::renameat(
+            root_fd.as_raw_fd(),
+            c_tmp.as_ptr(),
+            root_fd.as_raw_fd(),
+            c_final.as_ptr(),
+        )
+    } != 0
+    {
+        return Err(StorageBackendError::io(
+            "atomically publish Phase 2 storage-format.json",
+            io::Error::last_os_error(),
+        ));
+    }
+
+    tmp_guard.armed = false;
+    if let Some(cb) = on_after_rename_before_dir_fsync {
+        cb();
+    }
+    durability.record(
+        Phase2DurabilityOpKind::ManifestAtomicPublish,
+        stage_role,
+        STORAGE_FORMAT_MANIFEST_FILE,
+    );
+    durability.record(stage_kind, stage_role, STORAGE_FORMAT_MANIFEST_FILE);
+
+    fsync_dir_fd_unix(&root_fd, "repository storage root")?;
+    durability.record(
+        Phase2DurabilityOpKind::ManifestDirFsync,
+        stage_role,
+        ".libra",
+    );
+
+    Ok(())
+}
+
+#[cfg(windows)]
+fn durable_rename_replace_windows(
+    src_path: &Path,
+    dst_path: &Path,
+    context: &'static str,
+) -> StorageResult<()> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+    let src_wide = win_tmp_guard::encode_wide_nul(src_path);
+    let dst_wide = win_tmp_guard::encode_wide_nul(dst_path);
+    // SAFETY: both UTF-16 buffers are NUL-terminated and live for the syscall.
+    let ok = unsafe {
+        MoveFileExW(
+            src_wide.as_ptr(),
+            dst_wide.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if ok == 0 {
+        return Err(StorageBackendError::io(context, io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn publish_phase2_storage_manifest_durable(
+    common_storage: &Path,
+    manifest: &StorageFormatManifest,
+    durability: &mut Phase2DurabilityReceipt,
+    stage_kind: Phase2DurabilityOpKind,
+    stage_role: Option<DatabaseRole>,
+    on_after_rename_before_dir_fsync: Option<&mut dyn FnMut()>,
+) -> StorageResult<()> {
+    use std::io::Write as _;
+
+    manifest.validate()?;
+    let mut payload = serde_json::to_vec_pretty(manifest).map_err(|err| {
+        StorageBackendError::BackendInternal {
+            detail: format!(
+                "failed to serialize Phase 2 storage-format.json ({:?})",
+                err.classify()
+            ),
+        }
+    })?;
+    payload.push(b'\n');
+
+    let (_root_pin, root_id) =
+        win_tmp_guard::open_pinned_non_reparse_dir(common_storage, "repository storage root")?;
+    let pinned = [(common_storage, root_id, "repository storage root")];
+    let final_path = common_storage.join(STORAGE_FORMAT_MANIFEST_FILE);
+    if let Ok(meta) = fs::symlink_metadata(&final_path)
+        && (meta.file_type().is_symlink() || !meta.file_type().is_file())
+    {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "refusing to overwrite non-regular storage-format.json target".to_string(),
+        });
+    }
+
+    let mut created = None;
+    for _ in 0..64 {
+        let seq = PHASE2_MANIFEST_TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp_name = format!(
+            "{STORAGE_FORMAT_MANIFEST_FILE}.{}.{}.tmp",
+            std::process::id(),
+            seq
+        );
+        let candidate = common_storage.join(tmp_name);
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(f) => {
+                created = Some((candidate, f));
+                break;
+            }
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(StorageBackendError::io(
+                    "create Phase 2 storage-format.json temp file",
+                    err,
+                ));
+            }
+        }
+    }
+    let (tmp_path, mut tmp_file) = created.ok_or_else(|| StorageBackendError::BackendInternal {
+        detail:
+            "exhausted temporary filename attempts while publishing Phase 2 storage-format.json"
+                .to_string(),
+    })?;
+
+    struct ManifestTmpGuardWin<'a> {
+        path: &'a Path,
+        armed: bool,
+    }
+    impl Drop for ManifestTmpGuardWin<'_> {
+        fn drop(&mut self) {
+            if self.armed {
+                let _ = fs::remove_file(self.path);
+            }
+        }
+    }
+    let mut tmp_guard = ManifestTmpGuardWin {
+        path: &tmp_path,
+        armed: true,
+    };
+
+    tmp_file.write_all(&payload).map_err(|err| {
+        StorageBackendError::io("write Phase 2 storage-format.json temp file", err)
+    })?;
+    tmp_file.sync_all().map_err(|err| {
+        StorageBackendError::io("fsync Phase 2 storage-format.json temp file", err)
+    })?;
+    durability.record(
+        Phase2DurabilityOpKind::ManifestFileFsync,
+        stage_role,
+        STORAGE_FORMAT_MANIFEST_FILE,
+    );
+    drop(tmp_file);
+
+    win_tmp_guard::verify_pinned_dir_ids(&pinned)?;
+    durable_rename_replace_windows(
+        &tmp_path,
+        &final_path,
+        "atomically publish Phase 2 storage-format.json",
+    )?;
+    tmp_guard.armed = false;
+    if let Some(cb) = on_after_rename_before_dir_fsync {
+        cb();
+    }
+    durability.record(
+        Phase2DurabilityOpKind::ManifestAtomicPublish,
+        stage_role,
+        STORAGE_FORMAT_MANIFEST_FILE,
+    );
+    durability.record(stage_kind, stage_role, STORAGE_FORMAT_MANIFEST_FILE);
+
+    fsync_dir_durable_windows(common_storage, &pinned, "fsync repository storage root")?;
+    durability.record(
+        Phase2DurabilityOpKind::ManifestDirFsync,
+        stage_role,
+        ".libra",
+    );
+
+    Ok(())
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn publish_phase2_storage_manifest_durable(
+    _common_storage: &Path,
+    _manifest: &StorageFormatManifest,
+    _durability: &mut Phase2DurabilityReceipt,
+    _stage_kind: Phase2DurabilityOpKind,
+    _stage_role: Option<DatabaseRole>,
+    _on_after_rename_before_dir_fsync: Option<&mut dyn FnMut()>,
+) -> StorageResult<()> {
+    Err(StorageBackendError::BackendInternal {
+        detail: "durable Phase 2 storage-format.json publication is unsupported on this platform"
+            .to_string(),
+    })
+}
+
+/// Unlink a fenced SQLite source database under held migration locks, flush its
+/// parent directory (`fsync_dir`), and close `c_mig` (`ADR-RB-07` #1 Step 2.2b,
+/// `RB-10b`).
+///
+/// - **Unix:** performs `unlinkat` AND `fsync_dir` WHILE `c_mig` remains open
+///   and holding the OS `EXCLUSIVE` lock (zero extra fd opened on `.db`!), then
+///   closes `c_mig`.
+/// - **Windows:** verifies `c_mig` is unmoved and captures its `WinFileId` via
+///   `FILE_READ_ATTRIBUTES`, closes `c_mig` (under all 6 held non-SQLite locks),
+///   verifies exact `WinFileId` and deletes via `FileDispositionInfo`, then
+///   flushes volume/directory metadata via `fsync_dir_durable_windows`.
+async fn unlink_fenced_sqlite_source_and_close(
+    common_storage: &Path,
+    mut source: QuiescedSqliteConnection,
+    durability: &mut Phase2DurabilityReceipt,
+    #[cfg(test)] test_hook: &mut Option<&mut dyn Phase2TestObserver>,
+) -> StorageResult<()> {
+    let role = source.role;
+    validate_repository_forward_role(role)?;
+
+    let (expected_path, rel_file, rel_parent, file_name) = match role {
+        DatabaseRole::Repository => (
+            git_sqlite_db_path(common_storage),
+            LEGACY_SQLITE_DB_FILE,
+            ".libra",
+            LEGACY_SQLITE_DB_FILE,
+        ),
+        DatabaseRole::Capture => (
+            capture_sqlite_db_path(common_storage),
+            LEGACY_CAPTURE_SQLITE_REL_PATH,
+            PRIVATE_SUBDIR,
+            "capture.db",
+        ),
+        _ => {
+            let _ = source.close().await;
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!("forward migration Phase 2 unlink rejected role {role}"),
+            });
+        }
+    };
+
+    if source.path != expected_path {
+        let _ = source.close().await;
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!("forward migration Phase 2 unlink path mismatch for {role}"),
+        });
+    }
+
+    #[cfg(unix)]
+    {
+        use std::{
+            ffi::CString,
+            os::unix::{
+                ffi::OsStrExt as _,
+                io::{AsRawFd as _, FromRawFd as _, OwnedFd},
+            },
+        };
+
+        let unlink_and_sync: StorageResult<OwnedFd> = async {
+            verify_connection_not_moved(&mut source.conn, role).await?;
+
+            // SAFETY: `geteuid` has no preconditions and cannot fail.
+            let euid = unsafe { libc::geteuid() };
+            let c_storage = CString::new(common_storage.as_os_str().as_bytes()).map_err(|_| {
+                StorageBackendError::BackendInternal {
+                    detail: "invalid repository storage root path".to_string(),
+                }
+            })?;
+            // SAFETY: `c_storage` is NUL-terminated.
+            let raw_root = unsafe {
+                libc::open(
+                    c_storage.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if raw_root < 0 {
+                return Err(StorageBackendError::io(
+                    "open repository storage root for Phase 2 unlink",
+                    io::Error::last_os_error(),
+                ));
+            }
+            // SAFETY: `raw_root >= 0` is exclusively owned here.
+            let root_fd = unsafe { OwnedFd::from_raw_fd(raw_root) };
+
+            let mut root_st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+            // SAFETY: `root_fd` is valid.
+            if unsafe { libc::fstat(root_fd.as_raw_fd(), root_st.as_mut_ptr()) } != 0 {
+                return Err(StorageBackendError::io(
+                    "stat repository storage root for Phase 2 unlink",
+                    io::Error::last_os_error(),
+                ));
+            }
+            // SAFETY: `fstat` succeeded.
+            let root_st = unsafe { root_st.assume_init() };
+            if (root_st.st_mode & libc::S_IFMT) != libc::S_IFDIR || root_st.st_uid != euid {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: "repository storage root is not owned by the current effective user"
+                        .to_string(),
+                });
+            }
+
+            let parent_fd = if role == DatabaseRole::Capture {
+                let c_private = CString::new(PRIVATE_SUBDIR).map_err(|_| {
+                    StorageBackendError::BackendInternal {
+                        detail: "invalid private directory name".to_string(),
+                    }
+                })?;
+                // SAFETY: `root_fd` is valid and `c_private` is NUL-terminated.
+                let raw_priv = unsafe {
+                    libc::openat(
+                        root_fd.as_raw_fd(),
+                        c_private.as_ptr(),
+                        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    )
+                };
+                if raw_priv < 0 {
+                    return Err(StorageBackendError::io(
+                        "open private directory for Phase 2 capture.db unlink",
+                        io::Error::last_os_error(),
+                    ));
+                }
+                // SAFETY: `raw_priv >= 0` is exclusively owned here.
+                let priv_fd = unsafe { OwnedFd::from_raw_fd(raw_priv) };
+                let mut priv_st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+                // SAFETY: `priv_fd` is valid.
+                if unsafe { libc::fstat(priv_fd.as_raw_fd(), priv_st.as_mut_ptr()) } != 0 {
+                    return Err(StorageBackendError::io(
+                        "stat private directory for Phase 2 capture.db unlink",
+                        io::Error::last_os_error(),
+                    ));
+                }
+                // SAFETY: `fstat` succeeded.
+                let priv_st = unsafe { priv_st.assume_init() };
+                if (priv_st.st_mode & libc::S_IFMT) != libc::S_IFDIR || priv_st.st_uid != euid {
+                    return Err(StorageBackendError::BackendInternal {
+                        detail: "private directory is not owned by the current effective user"
+                            .to_string(),
+                    });
+                }
+                priv_fd
+            } else {
+                root_fd
+            };
+
+            let c_name =
+                CString::new(file_name).map_err(|_| StorageBackendError::BackendInternal {
+                    detail: "invalid source sqlite filename".to_string(),
+                })?;
+            let mut st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+            // SAFETY: `parent_fd` is valid and `c_name` is NUL-terminated.
+            if unsafe {
+                libc::fstatat(
+                    parent_fd.as_raw_fd(),
+                    c_name.as_ptr(),
+                    st.as_mut_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            } != 0
+            {
+                return Err(StorageBackendError::io(
+                    "stat fenced sqlite source before unlink",
+                    io::Error::last_os_error(),
+                ));
+            }
+            // SAFETY: `fstatat` succeeded.
+            let st = unsafe { st.assume_init() };
+            if (st.st_mode & libc::S_IFMT) != libc::S_IFREG
+                || (st.st_dev as u64, st.st_ino) != source.source_inode
+            {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: format!(
+                        "forward migration Phase 2 refused to unlink {role}: source inode changed"
+                    ),
+                });
+            }
+
+            // Unlink WHILE `c_mig` is STILL open and holding SQLite's OS
+            // `EXCLUSIVE` lock (zero extra fd opened on `.db`!).
+            // SAFETY: `parent_fd` is valid and `c_name` is NUL-terminated.
+            if unsafe { libc::unlinkat(parent_fd.as_raw_fd(), c_name.as_ptr(), 0) } != 0 {
+                return Err(StorageBackendError::io(
+                    "unlink fenced sqlite source under held lock",
+                    io::Error::last_os_error(),
+                ));
+            }
+            durability.record(Phase2DurabilityOpKind::UnlinkSource, Some(role), rel_file);
+
+            #[cfg(test)]
+            if let Some(cb) = test_hook.as_deref_mut() {
+                cb.on_point(
+                    Phase2TestPoint::AfterUnlinkBeforeParentDirFsync(role),
+                    common_storage,
+                )?;
+            }
+
+            // Immediately `fsync_dir` on parent directory WHILE `c_mig` STILL
+            // holds the OS `EXCLUSIVE` lock!
+            fsync_dir_fd_unix(&parent_fd, "fenced sqlite source parent directory")?;
+            durability.record(
+                Phase2DurabilityOpKind::ParentDirFsyncAfterUnlink,
+                Some(role),
+                rel_parent,
+            );
+
+            #[cfg(test)]
+            if let Some(cb) = test_hook.as_deref_mut() {
+                cb.on_point(
+                    Phase2TestPoint::AfterParentDirFsyncBeforeClose(role),
+                    common_storage,
+                )?;
+            }
+
+            Ok(parent_fd)
+        }
+        .await;
+
+        let close_res = source.close().await;
+        let parent_fd = match unlink_and_sync {
+            Ok(fd) => fd,
+            Err(primary) => {
+                if let Err(close_err) = close_res {
+                    return Err(StorageBackendError::BackendInternal {
+                        detail: format!(
+                            "{primary}; additionally failed closing fenced sqlite connection ({close_err})"
+                        ),
+                    });
+                }
+                return Err(primary);
+            }
+        };
+        close_res?;
+        durability.record(
+            Phase2DurabilityOpKind::CloseMigrationConn,
+            Some(role),
+            rel_file,
+        );
+        // Under `locking_mode = EXCLUSIVE`, SQLite unlinks the zeroed
+        // `-journal` sidecar when `c_mig.close()` runs; verify absence and
+        // flush parent directory metadata once more before persisting
+        // `unlinked`.
+        let journal_path = sqlite_sidecar_path(&expected_path, "-journal");
+        if path_exists_no_open(&journal_path)? {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "forward migration Phase 2 detected lingering rollback journal after closing {role} connection"
+                ),
+            });
+        }
+        fsync_dir_fd_unix(
+            &parent_fd,
+            "fenced sqlite source parent directory after close",
+        )?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::FromRawHandle as _;
+
+        use windows_sys::Win32::{
+            Foundation::{HANDLE, INVALID_HANDLE_VALUE},
+            Storage::FileSystem::{
+                CreateFileW, DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+                FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
+                FILE_SHARE_READ, FILE_SHARE_WRITE, FileDispositionInfo, OPEN_EXISTING,
+                SetFileInformationByHandle,
+            },
+        };
+
+        let _ = file_name;
+        let (_root_pin, root_id) =
+            win_tmp_guard::open_pinned_non_reparse_dir(common_storage, "repository storage root")?;
+        let private_dir = common_storage.join(PRIVATE_SUBDIR);
+        let priv_pin_and_id = if role == DatabaseRole::Capture {
+            Some(win_tmp_guard::open_pinned_non_reparse_dir(
+                &private_dir,
+                "private directory",
+            )?)
+        } else {
+            None
+        };
+
+        // Capture `WinFileId` via `FILE_READ_ATTRIBUTES` while `c_mig` still
+        // holds the exclusive lock and verify `SQLITE_FCNTL_HAS_MOVED == 0`.
+        let capture_id_res: StorageResult<win_tmp_guard::WinFileId> = async {
+            verify_connection_not_moved(&mut source.conn, role).await?;
+            let wide = win_tmp_guard::encode_wide_nul(&expected_path);
+            // SAFETY: `wide` is NUL-terminated UTF-16.
+            let raw = unsafe {
+                CreateFileW(
+                    wide.as_ptr(),
+                    FILE_READ_ATTRIBUTES,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    std::ptr::null(),
+                    OPEN_EXISTING,
+                    FILE_FLAG_OPEN_REPARSE_POINT,
+                    std::ptr::null_mut(),
+                )
+            };
+            if raw == INVALID_HANDLE_VALUE {
+                return Err(StorageBackendError::io(
+                    "inspect fenced sqlite source identity before close",
+                    io::Error::last_os_error(),
+                ));
+            }
+            // SAFETY: `raw` is a valid exclusively owned Win32 handle.
+            let attr_file = unsafe { File::from_raw_handle(raw as *mut std::ffi::c_void) };
+            let info = win_tmp_guard::file_info(
+                std::os::windows::io::AsRawHandle::as_raw_handle(&attr_file) as HANDLE,
+                "stat fenced sqlite source before close",
+            )?;
+            if (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+                || (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0
+            {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: format!(
+                        "forward migration Phase 2 refused to unlink non-regular {role} source"
+                    ),
+                });
+            }
+            Ok(win_tmp_guard::id_from_info(&info))
+        }
+        .await;
+
+        let expected_file_id = match capture_id_res {
+            Ok(id) => id,
+            Err(primary) => {
+                let _ = source.close().await;
+                return Err(primary);
+            }
+        };
+
+        // Windows requires closing `c_mig` before marking deletion; all 6
+        // non-SQLite exclusive locks remain continuously held and the file is
+        // already durably fenced with `__libra_migrated_fence__`.
+        source.close().await?;
+        durability.record(
+            Phase2DurabilityOpKind::CloseMigrationConn,
+            Some(role),
+            rel_file,
+        );
+
+        let mut pinned = vec![(common_storage, root_id, "repository storage root")];
+        if let Some((_, priv_id)) = priv_pin_and_id.as_ref() {
+            pinned.push((private_dir.as_path(), *priv_id, "private directory"));
+        }
+        win_tmp_guard::verify_pinned_dir_ids(&pinned)?;
+
+        let wide = win_tmp_guard::encode_wide_nul(&expected_path);
+        // SAFETY: `wide` is NUL-terminated UTF-16.
+        let raw_del = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                FILE_READ_ATTRIBUTES | DELETE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_OPEN_REPARSE_POINT,
+                std::ptr::null_mut(),
+            )
+        };
+        if raw_del == INVALID_HANDLE_VALUE {
+            return Err(StorageBackendError::io(
+                "open fenced sqlite source for deletion",
+                io::Error::last_os_error(),
+            ));
+        }
+        // SAFETY: `raw_del` is a valid exclusively owned Win32 handle.
+        let del_file = unsafe { File::from_raw_handle(raw_del as *mut std::ffi::c_void) };
+        let del_handle = std::os::windows::io::AsRawHandle::as_raw_handle(&del_file) as HANDLE;
+        let del_info =
+            win_tmp_guard::file_info(del_handle, "verify fenced sqlite source before delete")?;
+        if (del_info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+            || (del_info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0
+            || win_tmp_guard::id_from_info(&del_info) != expected_file_id
+        {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "forward migration Phase 2 refused to unlink {role}: source identity changed"
+                ),
+            });
+        }
+        #[repr(C)]
+        struct FileDispositionInfoRaw {
+            delete_file: u8,
+        }
+        let disp = FileDispositionInfoRaw { delete_file: 1 };
+        // SAFETY: `del_handle` is opened with `DELETE` access and `disp` matches `FILE_DISPOSITION_INFO`.
+        if unsafe {
+            SetFileInformationByHandle(
+                del_handle,
+                FileDispositionInfo,
+                (&disp as *const FileDispositionInfoRaw).cast(),
+                std::mem::size_of::<FileDispositionInfoRaw>() as u32,
+            )
+        } == 0
+        {
+            return Err(StorageBackendError::io(
+                "unlink fenced sqlite source via FileDispositionInfo",
+                io::Error::last_os_error(),
+            ));
+        }
+        drop(del_file);
+        durability.record(Phase2DurabilityOpKind::UnlinkSource, Some(role), rel_file);
+
+        #[cfg(test)]
+        if let Some(cb) = test_hook.as_deref_mut() {
+            cb.on_point(
+                Phase2TestPoint::AfterUnlinkBeforeParentDirFsync(role),
+                common_storage,
+            )?;
+        }
+
+        let journal_path = sqlite_sidecar_path(&expected_path, "-journal");
+        if path_exists_no_open(&journal_path)? {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "forward migration Phase 2 detected lingering rollback journal after closing {role} connection"
+                ),
+            });
+        }
+        let parent_dir = if role == DatabaseRole::Capture {
+            private_dir.as_path()
+        } else {
+            common_storage
+        };
+        fsync_dir_durable_windows(
+            parent_dir,
+            &pinned,
+            "fsync fenced sqlite source parent directory",
+        )?;
+        durability.record(
+            Phase2DurabilityOpKind::ParentDirFsyncAfterUnlink,
+            Some(role),
+            rel_parent,
+        );
+
+        #[cfg(test)]
+        if let Some(cb) = test_hook.as_deref_mut() {
+            cb.on_point(
+                Phase2TestPoint::AfterParentDirFsyncBeforeClose(role),
+                common_storage,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    #[cfg(all(not(unix), not(windows)))]
+    {
+        let _ = (expected_path, rel_file, rel_parent, file_name, durability);
+        #[cfg(test)]
+        let _ = test_hook;
+        let _ = source.close().await;
+        Err(StorageBackendError::BackendInternal {
+            detail: "durable Phase 2 sqlite unlink is unsupported on this platform".to_string(),
+        })
+    }
+}
+
+/// Execute Forward Migration Phase 2 Step 2.1 through Step 2.2b on a verified,
+/// continuously locked [`ForwardPhase1Prepared`] bundle (`ADR-RB-07` #1, `RB-10b`):
+///
+/// 1. Verify all Phase 1 `fsync` + `fsync_dir` prerequisites, promoted redb
+///    artifacts, `VACUUM INTO` backups, manifest preconditions, and locked
+///    `c_mig` handles (`AC1`).
+/// 2. Atomically publish `.libra/storage-format.json` (`backend="redb"`,
+///    `finalized=false`, per-source `phase2_progress = "pending"` / `"absent"`,
+///    and full `source_digests`) + `fsync(.libra/)` while disarming Phase 1
+///    rollback cleanup at the exact instant of atomic manifest rename (`AC1`).
+/// 3. For each present source SQLite database (`libra.db`, then optional
+///    `private/capture.db`) on its continuously locked single connection `c_mig`:
+///    - Commit the 100% SQLite `synchronous = FULL` rollback-journal atomic
+///      fence (`__libra_migrated_fence__` + incremented `schema_version`, `AC2`).
+///    - Atomically persist `phase2_progress.<db> = "fenced_ready_to_unlink"` +
+///      `fsync(.libra/)` (`AC3`).
+///    - Execute held-lock `unlink` + parent `fsync_dir` and close `c_mig` (`AC4`).
+///    - Atomically persist `phase2_progress.<db> = "unlinked"` + `fsync(.libra/)` (`AC5`).
+/// 4. Return [`ForwardPhase2FencedState`] still holding all 6 non-SQLite
+///    exclusive locks for Step 2.3–2.4 (`RB-10g`).
+pub async fn execute_forward_phase2_fence_and_unlink(
+    prepared: ForwardPhase1Prepared,
+) -> StorageResult<ForwardPhase2FencedState> {
+    execute_forward_phase2_fence_and_unlink_inner(
+        prepared,
+        #[cfg(test)]
+        None,
+    )
+    .await
+}
+
+async fn execute_forward_phase2_fence_and_unlink_inner(
+    mut prepared: ForwardPhase1Prepared,
+    #[cfg(test)] mut test_hook: Option<&mut dyn Phase2TestObserver>,
+) -> StorageResult<ForwardPhase2FencedState> {
+    let started = Instant::now();
+
+    // Step 2.0 (Pre-flight gate): verify every Phase 1 durability & lock
+    // prerequisite BEFORE touching `.libra/storage-format.json`. On failure
+    // before Step 2.1 atomic rename, cleanly abort Phase 1 artifacts & locks!
+    if let Err(err) = verify_phase1_prerequisites_for_phase2(&mut prepared).await {
+        if let Err(abort_err) = prepared.abort().await {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "{err}; additionally Phase 1 abort cleanup failed before Phase 2 ({abort_err})"
+                ),
+            });
+        }
+        return Err(err);
+    }
+
+    let has_capture_source = prepared.guard.sqlite.capture.is_some();
+    let initial_progress = Phase2Progress {
+        git_db: Some(Phase2DbState::Pending),
+        capture_db: Some(if has_capture_source {
+            Phase2DbState::Pending
+        } else {
+            Phase2DbState::Absent
+        }),
+        git_redb: None,
+        cap_redb: None,
+        spool_fenced: false,
+        queue_fenced: false,
+    };
+
+    let mut manifest = match StorageFormatManifest::new_redb_in_progress(
+        prepared.generation,
+        Some(prepared.backup.backup_rel_dir.clone()),
+        initial_progress,
+        prepared.backup.source_digests.clone(),
+    ) {
+        Ok(m) => m,
+        Err(err) => {
+            if let Err(abort_err) = prepared.abort().await {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: format!(
+                        "{err}; additionally Phase 1 abort cleanup failed before Phase 2 ({abort_err})"
+                    ),
+                });
+            }
+            return Err(err);
+        }
+    };
+
+    let mut durability = Phase2DurabilityReceipt::new();
+
+    // Step 2.1: Atomically publish `.libra/storage-format.json(finalized=false)`
+    // + `fsync(.libra/)`. Disarm `artifact_guard` IMMEDIATELY on atomic rename
+    // success (before `fsync_dir`) so promoted `.gen-<id>.redb` and backups are
+    // NEVER deleted once `storage-format.json(finalized=false)` is live on disk!
+    let mut published_manifest_rename = false;
+    let publish_step2_1_res = {
+        let mut on_renamed = || {
+            published_manifest_rename = true;
+            prepared.artifact_guard.disarm();
+        };
+        publish_phase2_storage_manifest_durable(
+            &prepared.common_storage,
+            &manifest,
+            &mut durability,
+            Phase2DurabilityOpKind::PublishManifestPending,
+            None,
+            Some(&mut on_renamed),
+        )
+    };
+    if let Err(err) = publish_step2_1_res {
+        if !published_manifest_rename {
+            if let Err(abort_err) = prepared.abort().await {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: format!(
+                        "{err}; additionally Phase 1 abort cleanup failed before Phase 2 ({abort_err})"
+                    ),
+                });
+            }
+            return Err(err);
+        }
+        // `storage-format.json(finalized=false)` was already renamed on disk
+        // (`artifact_guard` disarmed): close `c_mig` & locks cleanly while
+        // preserving Phase 1 redb & backup artifacts for Phase 2 recovery.
+        let guard = prepared.into_phase2_handoff();
+        if let Err(close_err) = guard.close().await {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "{err}; additionally failed to close Phase 2 quiescence guard ({close_err})"
+                ),
+            });
+        }
+        return Err(err);
+    }
+
+    // Transfer ownership out of `ForwardPhase1Prepared` now that Step 2.1 is
+    // live and `artifact_guard` is disarmed.
+    let ForwardPhase1Prepared {
+        mut artifact_guard,
+        guard,
+        common_storage,
+        generation,
+        git_redb_path,
+        capture_redb_path,
+        ..
+    } = prepared;
+    artifact_guard.disarm();
+    drop(artifact_guard);
+
+    let ForwardPhase1QuiesceGuard { sqlite, locks } = guard;
+    let QuiescedRepositorySqliteSources {
+        git: git_conn,
+        capture: cap_conn,
+    } = sqlite;
+
+    let mut git_conn_opt = Some(git_conn);
+    let mut cap_conn_opt = cap_conn;
+
+    let phase2_res: StorageResult<(SqliteFenceReceipt, Option<SqliteFenceReceipt>)> = async {
+        #[cfg(test)]
+        if let Some(cb) = test_hook.as_deref_mut() {
+            cb.on_point(
+                Phase2TestPoint::AfterPublishPendingManifest,
+                &common_storage,
+            )?;
+        }
+
+        // Step 2.2a + 2.2b for `.libra/libra.db` (`DatabaseRole::Repository`).
+        let mut git_c_mig =
+            git_conn_opt
+                .take()
+                .ok_or_else(|| StorageBackendError::BackendInternal {
+                    detail: "missing locked repository sqlite connection in Phase 2".to_string(),
+                })?;
+
+        let git_fence_res = fence_sqlite_connection_journaled_inner(
+            &mut git_c_mig,
+            #[cfg(test)]
+            &mut test_hook,
+        )
+        .await;
+        let mut git_fence = match git_fence_res {
+            Ok(r) => r,
+            Err(err) => {
+                git_conn_opt = Some(git_c_mig);
+                return Err(err);
+            }
+        };
+        durability.record(
+            Phase2DurabilityOpKind::FenceCommit,
+            Some(DatabaseRole::Repository),
+            LEGACY_SQLITE_DB_FILE,
+        );
+
+        #[cfg(test)]
+        if let Some(cb) = test_hook.as_deref_mut()
+            && let Err(err) = cb.on_point(
+                Phase2TestPoint::AfterFenceCommitBeforePersistReady(DatabaseRole::Repository),
+                &common_storage,
+            )
+        {
+            git_conn_opt = Some(git_c_mig);
+            return Err(err);
+        }
+
+        // Step 2.2b(i): persist `git_db = "fenced_ready_to_unlink"` + `fsync(.libra/)`.
+        manifest.phase2_progress.git_db = Some(Phase2DbState::FencedReadyToUnlink);
+        if let Err(err) = publish_phase2_storage_manifest_durable(
+            &common_storage,
+            &manifest,
+            &mut durability,
+            Phase2DurabilityOpKind::PublishManifestFencedReadyToUnlink,
+            Some(DatabaseRole::Repository),
+            None,
+        ) {
+            git_conn_opt = Some(git_c_mig);
+            return Err(err);
+        }
+
+        #[cfg(test)]
+        if let Some(cb) = test_hook.as_deref_mut()
+            && let Err(err) = cb.on_point(
+                Phase2TestPoint::AfterPersistReadyBeforeUnlink(DatabaseRole::Repository),
+                &common_storage,
+            )
+        {
+            git_conn_opt = Some(git_c_mig);
+            return Err(err);
+        }
+
+        // Step 2.2b(ii): held-lock `unlink` + `fsync_dir` + deterministic close.
+        unlink_fenced_sqlite_source_and_close(
+            &common_storage,
+            git_c_mig,
+            &mut durability,
+            #[cfg(test)]
+            &mut test_hook,
+        )
+        .await?;
+        git_fence.unlinked = true;
+
+        #[cfg(test)]
+        if let Some(cb) = test_hook.as_deref_mut() {
+            cb.on_point(
+                Phase2TestPoint::AfterCloseBeforePersistUnlinked(DatabaseRole::Repository),
+                &common_storage,
+            )?;
+        }
+
+        // Step 2.2b(iii): persist `git_db = "unlinked"` + `fsync(.libra/)`.
+        manifest.phase2_progress.git_db = Some(Phase2DbState::Unlinked);
+        publish_phase2_storage_manifest_durable(
+            &common_storage,
+            &manifest,
+            &mut durability,
+            Phase2DurabilityOpKind::PublishManifestUnlinked,
+            Some(DatabaseRole::Repository),
+            None,
+        )?;
+
+        #[cfg(test)]
+        if let Some(cb) = test_hook.as_deref_mut() {
+            cb.on_point(
+                Phase2TestPoint::AfterPersistUnlinked(DatabaseRole::Repository),
+                &common_storage,
+            )?;
+        }
+
+        // Step 2.2a + 2.2b for optional `.libra/private/capture.db` (`DatabaseRole::Capture`).
+        let capture_fence = if let Some(mut cap_c_mig) = cap_conn_opt.take() {
+            let cap_fence_res = fence_sqlite_connection_journaled_inner(
+                &mut cap_c_mig,
+                #[cfg(test)]
+                &mut test_hook,
+            )
+            .await;
+            let mut cap_fence = match cap_fence_res {
+                Ok(r) => r,
+                Err(err) => {
+                    cap_conn_opt = Some(cap_c_mig);
+                    return Err(err);
+                }
+            };
+            durability.record(
+                Phase2DurabilityOpKind::FenceCommit,
+                Some(DatabaseRole::Capture),
+                LEGACY_CAPTURE_SQLITE_REL_PATH,
+            );
+
+            #[cfg(test)]
+            if let Some(cb) = test_hook.as_deref_mut()
+                && let Err(err) = cb.on_point(
+                    Phase2TestPoint::AfterFenceCommitBeforePersistReady(DatabaseRole::Capture),
+                    &common_storage,
+                )
+            {
+                cap_conn_opt = Some(cap_c_mig);
+                return Err(err);
+            }
+
+            // Step 2.2b(i): persist `capture_db = "fenced_ready_to_unlink"` + `fsync(.libra/)`.
+            manifest.phase2_progress.capture_db = Some(Phase2DbState::FencedReadyToUnlink);
+            if let Err(err) = publish_phase2_storage_manifest_durable(
+                &common_storage,
+                &manifest,
+                &mut durability,
+                Phase2DurabilityOpKind::PublishManifestFencedReadyToUnlink,
+                Some(DatabaseRole::Capture),
+                None,
+            ) {
+                cap_conn_opt = Some(cap_c_mig);
+                return Err(err);
+            }
+
+            #[cfg(test)]
+            if let Some(cb) = test_hook.as_deref_mut()
+                && let Err(err) = cb.on_point(
+                    Phase2TestPoint::AfterPersistReadyBeforeUnlink(DatabaseRole::Capture),
+                    &common_storage,
+                )
+            {
+                cap_conn_opt = Some(cap_c_mig);
+                return Err(err);
+            }
+
+            // Step 2.2b(ii): held-lock `unlink` + `fsync_dir` + deterministic close.
+            unlink_fenced_sqlite_source_and_close(
+                &common_storage,
+                cap_c_mig,
+                &mut durability,
+                #[cfg(test)]
+                &mut test_hook,
+            )
+            .await?;
+            cap_fence.unlinked = true;
+
+            #[cfg(test)]
+            if let Some(cb) = test_hook.as_deref_mut() {
+                cb.on_point(
+                    Phase2TestPoint::AfterCloseBeforePersistUnlinked(DatabaseRole::Capture),
+                    &common_storage,
+                )?;
+            }
+
+            // Step 2.2b(iii): persist `capture_db = "unlinked"` + `fsync(.libra/)`.
+            manifest.phase2_progress.capture_db = Some(Phase2DbState::Unlinked);
+            publish_phase2_storage_manifest_durable(
+                &common_storage,
+                &manifest,
+                &mut durability,
+                Phase2DurabilityOpKind::PublishManifestUnlinked,
+                Some(DatabaseRole::Capture),
+                None,
+            )?;
+
+            #[cfg(test)]
+            if let Some(cb) = test_hook {
+                cb.on_point(
+                    Phase2TestPoint::AfterPersistUnlinked(DatabaseRole::Capture),
+                    &common_storage,
+                )?;
+            }
+
+            Some(cap_fence)
+        } else {
+            None
+        };
+
+        Ok((git_fence, capture_fence))
+    }
+    .await;
+
+    match phase2_res {
+        Ok((git_fence, capture_fence)) => Ok(ForwardPhase2FencedState {
+            common_storage,
+            locks,
+            generation,
+            git_redb_path,
+            capture_redb_path,
+            manifest,
+            git_fence,
+            capture_fence,
+            durability,
+            elapsed: started.elapsed(),
+        }),
+        Err(err) => {
+            // Deterministically close any remaining open `c_mig` handles BEFORE
+            // releasing the 6 non-SQLite locks, leaving `storage-format.json(finalized=false)`
+            // and all Phase 1 redb/backup artifacts intact for crash recovery.
+            let mut close_errs = Vec::new();
+            if let Some(cap) = cap_conn_opt.take()
+                && let Err(e) = cap.close().await
+            {
+                close_errs.push(e.to_string());
+            }
+            if let Some(git) = git_conn_opt.take()
+                && let Err(e) = git.close().await
+            {
+                close_errs.push(e.to_string());
+            }
+            drop(locks);
+            if close_errs.is_empty() {
+                Err(err)
+            } else {
+                Err(StorageBackendError::BackendInternal {
+                    detail: format!(
+                        "{err}; additionally failed closing remaining Phase 2 connections ({})",
+                        close_errs.join("; ")
+                    ),
+                })
             }
         }
     }
@@ -40181,5 +42209,861 @@ stderr:
             tree_before,
             "Derived rejections must leave repository directory 100% untouched"
         );
+    }
+
+    /// Read SQLite's 4-byte big-endian `file_change_counter` (offset 24..28)
+    /// and `schema_version` cookie (offset 40..44) directly from page 1 of a
+    /// closed database file (never called while an active `c_mig` holds POSIX
+    /// locks in this process!).
+    fn read_closed_sqlite_header_counters(db_path: &Path) -> (u32, i32) {
+        let mut f = File::open(db_path).expect("open closed sqlite file for header inspection");
+        let mut hdr = [0u8; 100];
+        f.read_exact(&mut hdr).expect("read 100B sqlite header");
+        assert_eq!(&hdr[0..16], b"SQLite format 3\0", "valid sqlite3 header");
+        let change_counter = u32::from_be_bytes([hdr[24], hdr[25], hdr[26], hdr[27]]);
+        let schema_version = i32::from_be_bytes([hdr[40], hdr[41], hdr[42], hdr[43]]);
+        (change_counter, schema_version)
+    }
+
+    #[tokio::test]
+    async fn forward_phase2_journaled_fence_and_post_unlink_progress() {
+        use crate::storage::{
+            FRAME_FLAG_NONE, SqliteCaptureStore, append_postcard_frame, init_capture_queue,
+            manifest::{
+                ManifestOrigin, detect_storage_authority, publish_storage_manifest,
+                storage_manifest_path,
+            },
+        };
+
+        // --------------------------------------------------------------------
+        // Scenario 1 (AC1–AC5): Full Layout C (`libra.db` +
+        // `private/capture.db` + `capture-spool/ready` + `capture-queue/normal`)
+        // observing EVERY on-disk manifest state, source-file presence, and OS
+        // exclusive lock transition from Step 2.1 through Step 2.2b!
+        // --------------------------------------------------------------------
+        {
+            let dir = tempdir().expect("create RB-10b Scenario 1 tempdir");
+            let storage = dir.path().join(".libra");
+            let git_db = git_sqlite_db_path(&storage);
+            let cap_db = capture_sqlite_db_path(&storage);
+            fs::create_dir_all(&storage).expect("create .libra");
+            populate_all_61_repository_tables(&git_db).await;
+            detach_inline_capture_tables(&git_db).await;
+            {
+                let _cap_store = SqliteCaptureStore::create(&cap_db)
+                    .await
+                    .expect("create Scenario 1 capture.db");
+            }
+            populate_capture_rows_via_sql(&cap_db, 0, None).await;
+            switch_fixture_db_to_delete_mode(&git_db).await;
+            switch_fixture_db_to_delete_mode(&cap_db).await;
+
+            // Seed a real capture-spool/ready event and a real capture-queue frame.
+            let spool_ready = capture_spool_dir_path(&storage).join(CAPTURE_SPOOL_READY_SUBDIR);
+            fs::create_dir_all(&spool_ready).expect("create spool ready dir");
+            let spool_file = spool_ready.join("0001-rb10b.json");
+            fs::write(
+                &spool_file,
+                build_spool_envelope_bytes(
+                    "codex",
+                    "codex",
+                    "22222222-2222-4222-8222-222222222291",
+                    Some("dedup:rb10b:spool-1"),
+                    "prov-rb10b",
+                    "/work/rb10b",
+                    &storage,
+                    "session_start",
+                    "2026-11-22T01:00:00Z",
+                    "",
+                ),
+            )
+            .expect("write rb10b spool event");
+            let _q_init = init_capture_queue(&storage).expect("init capture queue");
+            let q_usage = AgentUsageStatsRecord {
+                id: "usage-rb10b-1".to_string(),
+                session_id: None,
+                thread_id: None,
+                agent_run_id: None,
+                run_id: None,
+                provider: "openai".to_string(),
+                model: "gpt-5".to_string(),
+                request_kind: "chat".to_string(),
+                intent: None,
+                prompt_tokens: 100,
+                completion_tokens: 50,
+                cached_tokens: 0,
+                reasoning_tokens: 0,
+                total_tokens: 150,
+                tool_call_count: 1,
+                wall_clock_ms: 80,
+                provider_latency_ms: Some(60),
+                cost_estimate_micro_dollars: Some(10_000),
+                cost_usd: Some(0.01),
+                usage_estimated: false,
+                started_at: None,
+                finished_at: None,
+                success: true,
+                error_kind: None,
+                schema_version: 1,
+                created_at: "2026-11-22T03:06:00Z".to_string(),
+                agent_name: Some("codex".to_string()),
+                repo_id: Some("repo-1".to_string()),
+                turn_id: Some("turn-rb10b-1".to_string()),
+                event_id: Some("evt-rb10b-1".to_string()),
+            };
+            append_postcard_frame(
+                &storage,
+                CaptureQueueLane::Normal,
+                FRAME_FLAG_NONE,
+                "dedup:rb10b:q-1",
+                CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                &CaptureBatchPayload::InsertUsageStats(q_usage),
+            )
+            .expect("append rb10b queue frame");
+
+            let (_git_cc_before, git_sv_before) = read_closed_sqlite_header_counters(&git_db);
+            let (_cap_cc_before, cap_sv_before) = read_closed_sqlite_header_counters(&cap_db);
+
+            let prepared = prepare_forward_phase1(&storage, 1)
+                .await
+                .expect("Phase 1 prepare must succeed on Layout C");
+            assert!(
+                !storage_manifest_path(&storage).exists(),
+                "Phase 1 must NOT publish storage-format.json before Phase 2"
+            );
+            let expected_digests = prepared.backup.source_digests.clone();
+
+            let mut observed_points: Vec<Phase2TestPoint> = Vec::new();
+            let mut hook = |point: Phase2TestPoint, root: &Path| -> StorageResult<()> {
+                observed_points.push(point);
+                let m = read_storage_manifest(root)?
+                    .expect("storage-format.json must exist at every Phase 2 hook");
+                assert_eq!(m.backend, StorageBackendKind::Redb);
+                assert_eq!(m.origin, ManifestOrigin::Migration);
+                assert!(
+                    !m.finalized,
+                    "manifest must stay finalized=false during Step 2.1–2.2b"
+                );
+                assert_eq!(m.generation, 1);
+                assert_eq!(m.backup_dir.as_deref(), Some("sqlite-backup/00000001"));
+                assert_eq!(m.source_digests, expected_digests);
+                assert!(
+                    !m.phase2_progress.spool_fenced && !m.phase2_progress.queue_fenced,
+                    "spool/queue fences belong to Step 2.3"
+                );
+                // Normal readers must fail-closed on `finalized=false` (`LBR-IO-001`).
+                let auth_err = detect_storage_authority(root)
+                    .expect_err("detect_storage_authority must fail closed while finalized=false");
+                assert_eq!(auth_err.stable_code_str(), "LBR-IO-001");
+
+                // All 6 non-SQLite locks remain held continuously across Phase 2.
+                assert!(
+                    MaintenanceLock::try_exclusive(root, Duration::ZERO)
+                        .expect("probe maintenance.lock")
+                        .is_none(),
+                    "maintenance.lock must remain held at {point:?}"
+                );
+
+                match point {
+                    Phase2TestPoint::AfterPublishPendingManifest => {
+                        assert_eq!(m.phase2_progress.git_db, Some(Phase2DbState::Pending));
+                        assert_eq!(m.phase2_progress.capture_db, Some(Phase2DbState::Pending));
+                        assert!(path_exists_no_open(&git_db)?);
+                        assert!(path_exists_no_open(&cap_db)?);
+                    }
+                    Phase2TestPoint::BeforeFenceCommit(DatabaseRole::Repository) => {
+                        assert_eq!(m.phase2_progress.git_db, Some(Phase2DbState::Pending));
+                        // During the uncommitted transaction in `DELETE` mode, SQLite's
+                        // rollback journal (`libra.db-journal`) must be active on disk!
+                        assert!(
+                            path_exists_no_open(&sqlite_sidecar_path(&git_db, "-journal"))?,
+                            "rollback journal must exist before COMMIT (100% SQLite journaled fence)"
+                        );
+                    }
+                    Phase2TestPoint::AfterFenceCommitBeforePersistReady(
+                        DatabaseRole::Repository,
+                    ) => {
+                        assert_eq!(m.phase2_progress.git_db, Some(Phase2DbState::Pending));
+                        assert!(path_exists_no_open(&git_db)?);
+                        // Verify external OS process is STILL blocked with SQLITE_BUSY!
+                        run_child_busy_probe("probe_read_busy", &git_db);
+                    }
+                    Phase2TestPoint::AfterPersistReadyBeforeUnlink(DatabaseRole::Repository) => {
+                        assert_eq!(
+                            m.phase2_progress.git_db,
+                            Some(Phase2DbState::FencedReadyToUnlink)
+                        );
+                        assert_eq!(m.phase2_progress.capture_db, Some(Phase2DbState::Pending));
+                        assert!(
+                            path_exists_no_open(&git_db)?,
+                            "libra.db must still exist when fenced_ready_to_unlink is persisted"
+                        );
+                        run_child_busy_probe("probe_write_busy", &git_db);
+                    }
+                    Phase2TestPoint::AfterUnlinkBeforeParentDirFsync(DatabaseRole::Repository)
+                    | Phase2TestPoint::AfterParentDirFsyncBeforeClose(DatabaseRole::Repository)
+                    | Phase2TestPoint::AfterCloseBeforePersistUnlinked(DatabaseRole::Repository) => {
+                        assert!(
+                            !path_exists_no_open(&git_db)?,
+                            "libra.db must be unlinked at {point:?}"
+                        );
+                        if point
+                            == Phase2TestPoint::AfterCloseBeforePersistUnlinked(
+                                DatabaseRole::Repository,
+                            )
+                        {
+                            assert!(
+                                !path_exists_no_open(&sqlite_sidecar_path(&git_db, "-journal"))?,
+                                "libra.db-journal must be gone after c_mig.close()"
+                            );
+                        }
+                        assert_eq!(
+                            m.phase2_progress.git_db,
+                            Some(Phase2DbState::FencedReadyToUnlink),
+                            "manifest must not advance to unlinked before unlink+fsync_dir+close"
+                        );
+                    }
+                    Phase2TestPoint::AfterPersistUnlinked(DatabaseRole::Repository) => {
+                        assert!(!path_exists_no_open(&git_db)?);
+                        assert!(!path_exists_no_open(&sqlite_sidecar_path(
+                            &git_db, "-journal"
+                        ))?);
+                        assert_eq!(m.phase2_progress.git_db, Some(Phase2DbState::Unlinked));
+                        assert_eq!(m.phase2_progress.capture_db, Some(Phase2DbState::Pending));
+                        assert!(path_exists_no_open(&cap_db)?);
+                    }
+                    Phase2TestPoint::BeforeFenceCommit(DatabaseRole::Capture) => {
+                        assert_eq!(m.phase2_progress.git_db, Some(Phase2DbState::Unlinked));
+                        assert_eq!(m.phase2_progress.capture_db, Some(Phase2DbState::Pending));
+                        assert!(
+                            path_exists_no_open(&sqlite_sidecar_path(&cap_db, "-journal"))?,
+                            "capture.db rollback journal must exist before COMMIT"
+                        );
+                    }
+                    Phase2TestPoint::AfterFenceCommitBeforePersistReady(DatabaseRole::Capture) => {
+                        assert_eq!(m.phase2_progress.capture_db, Some(Phase2DbState::Pending));
+                        assert!(path_exists_no_open(&cap_db)?);
+                        run_child_busy_probe("probe_read_busy", &cap_db);
+                    }
+                    Phase2TestPoint::AfterPersistReadyBeforeUnlink(DatabaseRole::Capture) => {
+                        assert_eq!(
+                            m.phase2_progress.capture_db,
+                            Some(Phase2DbState::FencedReadyToUnlink)
+                        );
+                        assert!(path_exists_no_open(&cap_db)?);
+                        run_child_busy_probe("probe_write_busy", &cap_db);
+                    }
+                    Phase2TestPoint::AfterUnlinkBeforeParentDirFsync(DatabaseRole::Capture)
+                    | Phase2TestPoint::AfterParentDirFsyncBeforeClose(DatabaseRole::Capture)
+                    | Phase2TestPoint::AfterCloseBeforePersistUnlinked(DatabaseRole::Capture) => {
+                        assert!(!path_exists_no_open(&cap_db)?);
+                        if point
+                            == Phase2TestPoint::AfterCloseBeforePersistUnlinked(
+                                DatabaseRole::Capture,
+                            )
+                        {
+                            assert!(
+                                !path_exists_no_open(&sqlite_sidecar_path(&cap_db, "-journal"))?,
+                                "capture.db-journal must be gone after c_mig.close()"
+                            );
+                        }
+                        assert_eq!(
+                            m.phase2_progress.capture_db,
+                            Some(Phase2DbState::FencedReadyToUnlink)
+                        );
+                    }
+                    Phase2TestPoint::AfterPersistUnlinked(DatabaseRole::Capture) => {
+                        assert!(!path_exists_no_open(&cap_db)?);
+                        assert!(!path_exists_no_open(&sqlite_sidecar_path(
+                            &cap_db, "-journal"
+                        ))?);
+                        assert_eq!(m.phase2_progress.git_db, Some(Phase2DbState::Unlinked));
+                        assert_eq!(m.phase2_progress.capture_db, Some(Phase2DbState::Unlinked));
+                    }
+                    _ => {}
+                }
+                Ok(())
+            };
+
+            let state = execute_forward_phase2_fence_and_unlink_inner(prepared, Some(&mut hook))
+                .await
+                .expect("Phase 2 Step 2.1–2.2b must succeed on Layout C");
+
+            // All 15 deterministic hooks fired in exact order!
+            assert_eq!(
+                observed_points.len(),
+                15,
+                "all 15 Phase 2 checkpoints must execute"
+            );
+            assert_eq!(
+                state.git_fence.schema_version_before, git_sv_before,
+                "git schema_version_before must match header"
+            );
+            assert!(
+                state.git_fence.schema_version_after > state.git_fence.schema_version_before,
+                "git schema_version must strictly increment"
+            );
+            assert!(state.git_fence.unlinked);
+            let cap_fence = state
+                .capture_fence
+                .as_ref()
+                .expect("capture fence receipt must exist on Layout C");
+            assert_eq!(cap_fence.schema_version_before, cap_sv_before);
+            assert!(cap_fence.schema_version_after > cap_fence.schema_version_before);
+            assert!(cap_fence.unlinked);
+
+            // Verify strict causal durability ordering across AC1–AC5!
+            let d = &state.durability;
+            let p_pending = d
+                .position_of(Phase2DurabilityOpKind::PublishManifestPending, None)
+                .expect("PublishManifestPending");
+            let p_pending_dir = d
+                .position_of(Phase2DurabilityOpKind::ManifestDirFsync, None)
+                .expect("ManifestDirFsync(pending)");
+            let p_git_fence = d
+                .position_of(
+                    Phase2DurabilityOpKind::FenceCommit,
+                    Some(DatabaseRole::Repository),
+                )
+                .expect("FenceCommit(Repo)");
+            let p_git_ready = d
+                .position_of(
+                    Phase2DurabilityOpKind::PublishManifestFencedReadyToUnlink,
+                    Some(DatabaseRole::Repository),
+                )
+                .expect("PublishManifestFencedReadyToUnlink(Repo)");
+            let p_git_unlink = d
+                .position_of(
+                    Phase2DurabilityOpKind::UnlinkSource,
+                    Some(DatabaseRole::Repository),
+                )
+                .expect("UnlinkSource(Repo)");
+            let p_git_dir = d
+                .position_of(
+                    Phase2DurabilityOpKind::ParentDirFsyncAfterUnlink,
+                    Some(DatabaseRole::Repository),
+                )
+                .expect("ParentDirFsyncAfterUnlink(Repo)");
+            let p_git_close = d
+                .position_of(
+                    Phase2DurabilityOpKind::CloseMigrationConn,
+                    Some(DatabaseRole::Repository),
+                )
+                .expect("CloseMigrationConn(Repo)");
+            let p_git_unlinked = d
+                .position_of(
+                    Phase2DurabilityOpKind::PublishManifestUnlinked,
+                    Some(DatabaseRole::Repository),
+                )
+                .expect("PublishManifestUnlinked(Repo)");
+            let p_cap_fence = d
+                .position_of(
+                    Phase2DurabilityOpKind::FenceCommit,
+                    Some(DatabaseRole::Capture),
+                )
+                .expect("FenceCommit(Capture)");
+            let p_cap_ready = d
+                .position_of(
+                    Phase2DurabilityOpKind::PublishManifestFencedReadyToUnlink,
+                    Some(DatabaseRole::Capture),
+                )
+                .expect("PublishManifestFencedReadyToUnlink(Capture)");
+            let p_cap_unlink = d
+                .position_of(
+                    Phase2DurabilityOpKind::UnlinkSource,
+                    Some(DatabaseRole::Capture),
+                )
+                .expect("UnlinkSource(Capture)");
+            let p_cap_dir = d
+                .position_of(
+                    Phase2DurabilityOpKind::ParentDirFsyncAfterUnlink,
+                    Some(DatabaseRole::Capture),
+                )
+                .expect("ParentDirFsyncAfterUnlink(Capture)");
+            let p_cap_unlinked = d
+                .position_of(
+                    Phase2DurabilityOpKind::PublishManifestUnlinked,
+                    Some(DatabaseRole::Capture),
+                )
+                .expect("PublishManifestUnlinked(Capture)");
+
+            assert!(p_pending < p_pending_dir);
+            assert!(p_pending_dir < p_git_fence);
+            assert!(p_git_fence < p_git_ready);
+            assert!(p_git_ready < p_git_unlink);
+            assert!(p_git_unlink < p_git_dir);
+            #[cfg(unix)]
+            assert!(
+                p_git_dir < p_git_close && p_git_close < p_git_unlinked,
+                "Unix must unlink + fsync_dir BEFORE closing c_mig and BEFORE persisting unlinked"
+            );
+            #[cfg(not(unix))]
+            assert!(p_git_close < p_git_unlink && p_git_dir < p_git_unlinked);
+            assert!(p_git_unlinked < p_cap_fence);
+            assert!(p_cap_fence < p_cap_ready);
+            assert!(p_cap_ready < p_cap_unlink);
+            assert!(p_cap_unlink < p_cap_dir);
+            assert!(p_cap_dir < p_cap_unlinked);
+
+            // Promoted redb targets & backups remain intact on disk; sources unlinked.
+            assert!(!git_db.exists());
+            assert!(!cap_db.exists());
+            assert!(state.git_redb_path.is_file());
+            assert!(state.capture_redb_path.is_file());
+            assert!(sqlite_backup_git_db_path(&storage, 1).is_file());
+            assert!(sqlite_backup_capture_db_path(&storage, 1).is_file());
+            assert!(
+                sqlite_backup_capture_spool_dir_path(&storage, 1)
+                    .join("ready/0001-rb10b.json")
+                    .is_file()
+            );
+
+            // Locks still held inside `ForwardPhase2FencedState` until released.
+            assert!(
+                MaintenanceLock::try_exclusive(&storage, Duration::ZERO)
+                    .expect("probe maintenance.lock before release")
+                    .is_none()
+            );
+            state.release_locks();
+            assert!(
+                MaintenanceLock::try_exclusive(&storage, Duration::ZERO)
+                    .expect("probe maintenance.lock after release")
+                    .is_some()
+            );
+        }
+
+        // --------------------------------------------------------------------
+        // Scenario 2 (Performance budget <= 500ms without external child spawns
+        // inside hooks + Layout A pre-split repo without `capture.db`):
+        // --------------------------------------------------------------------
+        {
+            let dir = tempdir().expect("create RB-10b Layout A + budget tempdir");
+            let storage = dir.path().join(".libra");
+            let git_db = git_sqlite_db_path(&storage);
+            fs::create_dir_all(&storage).expect("create .libra");
+            populate_all_61_repository_tables(&git_db).await;
+            switch_fixture_db_to_delete_mode(&git_db).await;
+
+            let prepared = prepare_forward_phase1(&storage, 1)
+                .await
+                .expect("Phase 1 prepare must succeed on Layout A");
+            let state = execute_forward_phase2_fence_and_unlink(prepared)
+                .await
+                .expect("Phase 2 Step 2.1–2.2b must succeed on Layout A");
+
+            assert!(
+                state.elapsed <= Duration::from_millis(500),
+                "Phase 2 cutover exceeded 500ms SSD budget: {:?}",
+                state.elapsed
+            );
+            assert_eq!(
+                state.manifest.phase2_progress.git_db,
+                Some(Phase2DbState::Unlinked)
+            );
+            assert_eq!(
+                state.manifest.phase2_progress.capture_db,
+                Some(Phase2DbState::Absent)
+            );
+            assert!(state.capture_fence.is_none());
+            assert!(!git_db.exists());
+            let persisted = read_storage_manifest(&storage)
+                .expect("read Layout A manifest")
+                .expect("Layout A manifest exists");
+            assert_eq!(persisted, state.manifest);
+            state.release_locks();
+        }
+
+        // --------------------------------------------------------------------
+        // Scenario 2b (Performance budget <= 500ms with populated 64-file
+        // capture-spool + Layout C dual SQLite sources, proving linear O(N+M)
+        // preflight scales cleanly inside the 500ms SSD cutover budget):
+        // --------------------------------------------------------------------
+        {
+            let dir = tempdir().expect("create RB-10b populated-spool budget tempdir");
+            let storage = dir.path().join(".libra");
+            let git_db = git_sqlite_db_path(&storage);
+            let cap_db = capture_sqlite_db_path(&storage);
+            fs::create_dir_all(&storage).expect("create .libra");
+            populate_all_61_repository_tables(&git_db).await;
+            detach_inline_capture_tables(&git_db).await;
+            {
+                let _cap_store = SqliteCaptureStore::create(&cap_db)
+                    .await
+                    .expect("create populated-spool budget capture.db");
+            }
+            populate_capture_rows_via_sql(&cap_db, 0, None).await;
+            switch_fixture_db_to_delete_mode(&git_db).await;
+            switch_fixture_db_to_delete_mode(&cap_db).await;
+
+            let spool_ready = capture_spool_dir_path(&storage).join(CAPTURE_SPOOL_READY_SUBDIR);
+            fs::create_dir_all(&spool_ready).expect("create spool ready dir");
+            for idx in 0..64u32 {
+                let dedup = format!("dedup:rb10b:budget:{idx:04}");
+                let prov = format!("prov-rb10b-budget-{idx:04}");
+                let sid = format!("22222222-2222-4222-8222-{idx:012}");
+                let bytes = build_spool_envelope_bytes(
+                    "codex",
+                    "codex",
+                    &sid,
+                    Some(&dedup),
+                    &prov,
+                    "/work/rb10b-budget",
+                    &storage,
+                    "session_start",
+                    "2026-11-22T01:00:00Z",
+                    "",
+                );
+                fs::write(spool_ready.join(format!("{idx:04}-budget.json")), bytes)
+                    .expect("write budget spool event");
+            }
+
+            let prepared = prepare_forward_phase1(&storage, 1)
+                .await
+                .expect("Phase 1 prepare with 64 spool files");
+            assert_eq!(prepared.backup.spool_backup.files.len(), 64);
+            let state = execute_forward_phase2_fence_and_unlink(prepared)
+                .await
+                .expect("Phase 2 cutover with 64 spool files must succeed");
+            assert!(
+                state.elapsed <= Duration::from_millis(500),
+                "Phase 2 cutover with 64 spool files exceeded 500ms SSD budget: {:?}",
+                state.elapsed
+            );
+            assert_eq!(
+                state.manifest.phase2_progress.git_db,
+                Some(Phase2DbState::Unlinked)
+            );
+            assert_eq!(
+                state.manifest.phase2_progress.capture_db,
+                Some(Phase2DbState::Unlinked)
+            );
+            state.release_locks();
+        }
+
+        // --------------------------------------------------------------------
+        // Scenario 3 (AC2 deep proof): Direct rollback-journal fence header
+        // increment (`schema_version` + `file_change_counter`), exact sentinel
+        // row via `PRAGMA writable_schema = ON`, and `SQLITE_CORRUPT` rejection
+        // on normal SQLite queries!
+        // --------------------------------------------------------------------
+        {
+            let dir = tempdir().expect("create RB-10b Scenario 3 tempdir");
+            let storage = dir.path().join(".libra");
+            let git_db = git_sqlite_db_path(&storage);
+            fs::create_dir_all(&storage).expect("create .libra");
+            populate_all_61_repository_tables(&git_db).await;
+            switch_fixture_db_to_delete_mode(&git_db).await;
+
+            let (cc_before, sv_before) = read_closed_sqlite_header_counters(&git_db);
+            let mut c_mig = quiesce_sqlite_source(&git_db, DatabaseRole::Repository)
+                .await
+                .expect("quiesce git_db");
+            let rcpt = fence_sqlite_connection_journaled(&mut c_mig)
+                .await
+                .expect("journaled fence must succeed");
+            assert_eq!(rcpt.role, DatabaseRole::Repository);
+            assert_eq!(rcpt.schema_version_before, sv_before);
+            assert!(rcpt.schema_version_after > sv_before);
+            assert!(!rcpt.unlinked);
+            // Calling fence a second time on an already-fenced connection fails closed.
+            let second_err = fence_sqlite_connection_journaled(&mut c_mig)
+                .await
+                .expect_err("re-fencing already-fenced sqlite connection must fail closed");
+            assert_eq!(second_err.stable_code_str(), "LBR-IO-001");
+            c_mig.close().await.expect("close fenced c_mig");
+
+            // Confirm persisted header counters strictly incremented and no `-journal`.
+            assert!(!sqlite_sidecar_path(&git_db, "-journal").exists());
+            let (cc_after, sv_after) = read_closed_sqlite_header_counters(&git_db);
+            assert!(
+                cc_after > cc_before,
+                "file_change_counter must increment ({cc_before} -> {cc_after})"
+            );
+            assert_eq!(
+                sv_after, rcpt.schema_version_after,
+                "persisted header schema_version must match fence receipt"
+            );
+
+            // Normal query on the fenced DB immediately fails with `SQLITE_CORRUPT`.
+            let mut reader = SqliteConnection::connect_with(
+                &SqliteConnectOptions::new()
+                    .filename(&git_db)
+                    .create_if_missing(false),
+            )
+            .await
+            .expect("open fenced db");
+            let err = sea_orm::sqlx::query("SELECT * FROM reference;")
+                .persistent(false)
+                .fetch_all(&mut reader)
+                .await
+                .expect_err("normal SELECT on fenced DB must fail closed with SQLITE_CORRUPT");
+            let msg = err.to_string().to_ascii_lowercase();
+            assert!(
+                msg.contains("malformed database schema")
+                    && msg.contains(SQLITE_MIGRATED_FENCE_TABLE),
+                "expected malformed database schema (__libra_migrated_fence__), got: {err}"
+            );
+            reader.close().await.expect("close reader");
+
+            // `PRAGMA writable_schema = ON` confirms exact sentinel row in `sqlite_master`.
+            let mut inspector = SqliteConnection::connect_with(
+                &SqliteConnectOptions::new()
+                    .filename(&git_db)
+                    .create_if_missing(false)
+                    .read_only(true),
+            )
+            .await
+            .expect("open fenced db read-only for sentinel inspection");
+            sea_orm::sqlx::query("PRAGMA writable_schema = ON;")
+                .persistent(false)
+                .execute(&mut inspector)
+                .await
+                .expect("enable writable_schema for sentinel check");
+            let row: (String, String, String) = sea_orm::sqlx::query_as(
+                "SELECT type, name, sql FROM sqlite_master WHERE name = ?1;",
+            )
+            .bind(SQLITE_MIGRATED_FENCE_TABLE)
+            .persistent(false)
+            .fetch_one(&mut inspector)
+            .await
+            .expect("sentinel row must exist in sqlite_master");
+            assert_eq!(row.0, "table");
+            assert_eq!(row.1, SQLITE_MIGRATED_FENCE_TABLE);
+            assert_eq!(row.2, SQLITE_MIGRATED_FENCE_SQL);
+            inspector.close().await.expect("close inspector");
+        }
+
+        // --------------------------------------------------------------------
+        // Scenario 4 (AC1 negative guards + reverse-migrated sqlite re-entry):
+        // Phase 2 MUST refuse to publish `storage-format.json` if target redb
+        // or `VACUUM INTO` backup `fsync` is missing, or if an incompatible
+        // manifest exists; it MUST allow advancing generation > prev_gen from a
+        // finalized `sqlite` manifest.
+        // --------------------------------------------------------------------
+        {
+            // (a) Missing target redb FileFsync -> fail closed before manifest!
+            let dir = tempdir().expect("create RB-10b neg-redb-fsync tempdir");
+            let storage = dir.path().join(".libra");
+            let git_db = git_sqlite_db_path(&storage);
+            fs::create_dir_all(&storage).expect("create .libra");
+            populate_all_61_repository_tables(&git_db).await;
+            switch_fixture_db_to_delete_mode(&git_db).await;
+            let bytes_before = fs::read(&git_db).expect("snapshot git_db");
+
+            let mut prepared = prepare_forward_phase1(&storage, 1)
+                .await
+                .expect("Phase 1 prepare");
+            let git_rel = canonical_git_redb_rel_path(1);
+            prepared.durability.ops.retain(|op| {
+                !(op.kind == Phase1DurabilityOpKind::FileFsync && op.target == git_rel)
+            });
+            let err = execute_forward_phase2_fence_and_unlink(prepared)
+                .await
+                .expect_err("Phase 2 must refuse missing target redb fsync");
+            assert_eq!(err.stable_code_str(), "LBR-IO-001");
+            assert!(!storage_manifest_path(&storage).exists());
+            assert_eq!(
+                fs::read(&git_db).expect("re-read git_db"),
+                bytes_before,
+                "source git_db must remain byte-for-byte untouched on AC1 pre-flight rejection"
+            );
+            assert!(
+                !git_redb_path(&storage, 1).exists()
+                    && !sqlite_backup_dir_path(&storage, 1).exists(),
+                "Phase 1 artifacts must be cleaned up on pre-Step-2.1 failure"
+            );
+        }
+
+        {
+            // (b) Missing VACUUM INTO backup FileFsync -> fail closed before manifest!
+            let dir = tempdir().expect("create RB-10b neg-backup-fsync tempdir");
+            let storage = dir.path().join(".libra");
+            let git_db = git_sqlite_db_path(&storage);
+            fs::create_dir_all(&storage).expect("create .libra");
+            populate_all_61_repository_tables(&git_db).await;
+            switch_fixture_db_to_delete_mode(&git_db).await;
+            let bytes_before = fs::read(&git_db).expect("snapshot git_db");
+
+            let mut prepared = prepare_forward_phase1(&storage, 1)
+                .await
+                .expect("Phase 1 prepare");
+            let bk_rel = format!(
+                "{}/{LEGACY_SQLITE_DB_FILE}",
+                canonical_sqlite_backup_rel_dir(1)
+            );
+            prepared.durability.ops.retain(|op| {
+                !(op.kind == Phase1DurabilityOpKind::FileFsync && op.target == bk_rel)
+            });
+            let err = execute_forward_phase2_fence_and_unlink(prepared)
+                .await
+                .expect_err("Phase 2 must refuse missing VACUUM INTO backup fsync");
+            assert_eq!(err.stable_code_str(), "LBR-IO-001");
+            assert!(!storage_manifest_path(&storage).exists());
+            assert_eq!(fs::read(&git_db).expect("re-read git_db"), bytes_before);
+        }
+
+        {
+            // (c) Finalized `sqlite` manifest gen=1 -> gen=1 rejected, gen=2 accepted!
+            let dir = tempdir().expect("create RB-10b sqlite-reentry tempdir");
+            let storage = dir.path().join(".libra");
+            let git_db = git_sqlite_db_path(&storage);
+            fs::create_dir_all(&storage).expect("create .libra");
+            populate_all_61_repository_tables(&git_db).await;
+            switch_fixture_db_to_delete_mode(&git_db).await;
+
+            let prev_sqlite_manifest = StorageFormatManifest {
+                schema_version: 1,
+                origin: ManifestOrigin::Migration,
+                backend: StorageBackendKind::Sqlite,
+                finalized: true,
+                generation: 1,
+                git_path: Some("libra.db".to_string()),
+                capture_path: Some("private/capture.db".to_string()),
+                backup_dir: Some("redb-backup/00000001".to_string()),
+                phase2_progress: Phase2Progress {
+                    git_db: None,
+                    capture_db: None,
+                    git_redb: Some(Phase2DbState::Unlinked),
+                    cap_redb: Some(Phase2DbState::Unlinked),
+                    spool_fenced: true,
+                    queue_fenced: true,
+                },
+                targets_staged_for_rename: true,
+                target_migration_tag: Some(0x1234_5678),
+                spool_unfenced: true,
+                source_digests: SourceDigests::default(),
+            };
+            publish_storage_manifest(&storage, &prev_sqlite_manifest)
+                .expect("publish finalized sqlite gen=1 manifest");
+
+            // Same generation `1` must be rejected cleanly.
+            let prep_same = prepare_forward_phase1(&storage, 1)
+                .await
+                .expect("prepare gen=1");
+            let err_same = execute_forward_phase2_fence_and_unlink(prep_same)
+                .await
+                .expect_err("non-monotonic generation must be rejected");
+            assert_eq!(err_same.stable_code_str(), "LBR-IO-001");
+            assert_eq!(
+                read_storage_manifest(&storage).expect("read manifest"),
+                Some(prev_sqlite_manifest)
+            );
+
+            // Strictly higher generation `2` succeeds!
+            let prep_next = prepare_forward_phase1(&storage, 2)
+                .await
+                .expect("prepare gen=2");
+            let state = execute_forward_phase2_fence_and_unlink(prep_next)
+                .await
+                .expect("forward Phase 2 gen=2 from finalized sqlite gen=1 must succeed");
+            assert_eq!(state.generation, 2);
+            assert_eq!(state.manifest.generation, 2);
+            assert_eq!(state.manifest.backend, StorageBackendKind::Redb);
+            assert!(!state.manifest.finalized);
+            assert_eq!(
+                state.manifest.phase2_progress.git_db,
+                Some(Phase2DbState::Unlinked)
+            );
+            state.release_locks();
+        }
+
+        // --------------------------------------------------------------------
+        // Scenario 5 (Mid-Phase-2 fault): Failure AFTER Step 2.1 manifest
+        // publish MUST preserve promoted redb + sqlite-backup artifacts (never
+        // run Phase 1 cleanup!) and cleanly close all `c_mig` + locks!
+        // --------------------------------------------------------------------
+        {
+            let dir = tempdir().expect("create RB-10b mid-phase2 fault tempdir");
+            let storage = dir.path().join(".libra");
+            let git_db = git_sqlite_db_path(&storage);
+            let cap_db = capture_sqlite_db_path(&storage);
+            fs::create_dir_all(&storage).expect("create .libra");
+            populate_all_61_repository_tables(&git_db).await;
+            detach_inline_capture_tables(&git_db).await;
+            {
+                let _cap_store = SqliteCaptureStore::create(&cap_db)
+                    .await
+                    .expect("create Scenario 5 capture.db");
+            }
+            populate_capture_rows_via_sql(&cap_db, 0, None).await;
+            switch_fixture_db_to_delete_mode(&git_db).await;
+            switch_fixture_db_to_delete_mode(&cap_db).await;
+
+            let prepared = prepare_forward_phase1(&storage, 1)
+                .await
+                .expect("Phase 1 prepare");
+            let mut fail_hook = |point: Phase2TestPoint, _root: &Path| -> StorageResult<()> {
+                if point == Phase2TestPoint::AfterPersistReadyBeforeUnlink(DatabaseRole::Repository)
+                {
+                    return Err(StorageBackendError::BackendInternal {
+                        detail: "injected mid-Phase-2 crash after fenced_ready_to_unlink"
+                            .to_string(),
+                    });
+                }
+                Ok(())
+            };
+            let err = execute_forward_phase2_fence_and_unlink_inner(prepared, Some(&mut fail_hook))
+                .await
+                .expect_err("injected mid-Phase-2 failure must return Err");
+            assert_eq!(err.stable_code_str(), "LBR-IO-001");
+
+            // Manifest, promoted redb files, and backups MUST all stay intact!
+            let m = read_storage_manifest(&storage)
+                .expect("read manifest after mid-Phase-2 fault")
+                .expect("manifest must remain on disk");
+            assert!(!m.finalized);
+            assert_eq!(
+                m.phase2_progress.git_db,
+                Some(Phase2DbState::FencedReadyToUnlink)
+            );
+            assert_eq!(m.phase2_progress.capture_db, Some(Phase2DbState::Pending));
+            assert!(git_redb_path(&storage, 1).is_file());
+            assert!(capture_redb_path(&storage, 1).is_file());
+            assert!(sqlite_backup_git_db_path(&storage, 1).is_file());
+            assert!(sqlite_backup_capture_db_path(&storage, 1).is_file());
+
+            // All locks & connections cleanly released: `maintenance.lock` free,
+            // `libra.db` returns `SQLITE_CORRUPT` (not `SQLITE_BUSY`), `capture.db`
+            // still readable!
+            assert!(
+                MaintenanceLock::try_exclusive(&storage, Duration::ZERO)
+                    .expect("probe maintenance.lock after mid-Phase-2 fault")
+                    .is_some()
+            );
+            let mut git_check = SqliteConnection::connect_with(
+                &SqliteConnectOptions::new()
+                    .filename(&git_db)
+                    .create_if_missing(false),
+            )
+            .await
+            .expect("open fenced git_db after mid-Phase-2 failure");
+            let g_err = sea_orm::sqlx::query("SELECT * FROM reference;")
+                .persistent(false)
+                .fetch_all(&mut git_check)
+                .await
+                .expect_err("fenced git_db must fail with SQLITE_CORRUPT");
+            assert!(
+                g_err
+                    .to_string()
+                    .to_ascii_lowercase()
+                    .contains("malformed database schema")
+            );
+            git_check.close().await.expect("close git_check");
+
+            let mut cap_check = SqliteConnection::connect_with(
+                &SqliteConnectOptions::new()
+                    .filename(&cap_db)
+                    .create_if_missing(false),
+            )
+            .await
+            .expect("open unfenced capture.db after mid-Phase-2 failure");
+            let count: i64 = sea_orm::sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master;")
+                .persistent(false)
+                .fetch_one(&mut cap_check)
+                .await
+                .expect("unfenced capture.db must remain cleanly readable");
+            assert!(count > 0);
+            cap_check.close().await.expect("close cap_check");
+        }
     }
 }
