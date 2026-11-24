@@ -44893,4 +44893,1192 @@ stderr:
             probe_elapsed
         );
     }
+
+    // ========================================================================
+    // RB-10e: Forward Migration Phase 2 Pre-Opened SQLite Handle Per-Statement
+    // Rejection (`SQLITE_CORRUPT` across all 8 statement classes: cold SELECT,
+    // warm SELECT, sqlite_master SELECT, INSERT, UPDATE, DELETE,
+    // CREATE TABLE IF NOT EXISTS agent_bridge_publication(...), VACUUM)
+    // ========================================================================
+
+    #[cfg(unix)]
+    const RB10E_CHILD_MODE_ENV: &str = "LIBRA_RB10E_CHILD_MODE";
+    #[cfg(unix)]
+    const RB10E_CHILD_GIT_DB_ENV: &str = "LIBRA_RB10E_CHILD_GIT_DB";
+    #[cfg(unix)]
+    const RB10E_CHILD_CAP_DB_ENV: &str = "LIBRA_RB10E_CHILD_CAP_DB";
+    #[cfg(unix)]
+    const RB10E_CHILD_IO_TIMEOUT: Duration = Duration::from_secs(5);
+
+    /// Verbatim DDL from `src/internal/ai/agent_bridge/publication.rs:22`.
+    const RB10E_AGENT_BRIDGE_PUBLICATION_DDL: &str = "CREATE TABLE IF NOT EXISTS agent_bridge_publication ( operation_id TEXT PRIMARY KEY, commit_oid TEXT NOT NULL, phase TEXT NOT NULL DEFAULT 'published' )";
+    /// Verbatim DDL from `src/internal/ai/agent_bridge/publication.rs:36`.
+    const RB10E_AGENT_BRIDGE_INDEX_PUBLICATION_DDL: &str = "CREATE TABLE IF NOT EXISTS agent_bridge_index_publication ( operation_id TEXT PRIMARY KEY, index_digest TEXT NOT NULL, phase TEXT NOT NULL DEFAULT 'prepared' )";
+
+    fn assert_strict_sqlite_corrupt(
+        err: &sea_orm::sqlx::Error,
+        ctx: &str,
+        require_malformed_schema: bool,
+    ) {
+        let db_err = err
+            .as_database_error()
+            .unwrap_or_else(|| panic!("{ctx}: expected SQLite database error, got {err:?}"));
+        let numeric = db_err
+            .code()
+            .and_then(|c| c.parse::<i32>().ok())
+            .unwrap_or_else(|| {
+                panic!(
+                    "{ctx}: expected numeric SQLITE_CORRUPT (11) code, got code={:?} msg={:?}",
+                    db_err.code(),
+                    db_err.message()
+                )
+            });
+        assert_eq!(
+            numeric,
+            11,
+            "{ctx}: expected exact numeric SQLite error code 11 (SQLITE_CORRUPT), got {numeric} (msg={:?})",
+            db_err.message()
+        );
+        let msg_lower = db_err.message().to_ascii_lowercase();
+        if require_malformed_schema {
+            assert!(
+                msg_lower.contains("malformed database schema"),
+                "{ctx}: expected `malformed database schema` in SQLITE_CORRUPT message, got {:?}",
+                db_err.message()
+            );
+        } else {
+            assert!(
+                msg_lower.contains("malformed database schema")
+                    || msg_lower.contains("database disk image is malformed"),
+                "{ctx}: expected SQLITE_CORRUPT malformed message, got {:?}",
+                db_err.message()
+            );
+        }
+    }
+
+    fn sha256_file_bytes_for_test(path: &Path) -> String {
+        use sha2::{Digest as _, Sha256};
+        let bytes = fs::read(path).expect("read sqlite file bytes for immutability check");
+        format!("{:x}", Sha256::digest(&bytes))
+    }
+
+    async fn setup_rb10e_delete_mode_fixture(
+        storage: &Path,
+        drop_bridge_publication_tables: bool,
+    ) -> (PathBuf, PathBuf) {
+        use crate::storage::SqliteCaptureStore;
+
+        let git_db = git_sqlite_db_path(storage);
+        let cap_db = capture_sqlite_db_path(storage);
+        fs::create_dir_all(storage).expect("create .libra");
+        populate_all_61_repository_tables(&git_db).await;
+        detach_inline_capture_tables(&git_db).await;
+        if drop_bridge_publication_tables {
+            let mut conn = SqliteConnection::connect_with(
+                &SqliteConnectOptions::new()
+                    .filename(&git_db)
+                    .create_if_missing(false),
+            )
+            .await
+            .expect("open git_db to drop bridge publication tables");
+            conn.execute("DROP TABLE IF EXISTS agent_bridge_publication;")
+                .await
+                .expect("drop agent_bridge_publication");
+            conn.execute("DROP TABLE IF EXISTS agent_bridge_index_publication;")
+                .await
+                .expect("drop agent_bridge_index_publication");
+            conn.close().await.expect("close git_db");
+        }
+        {
+            let _cap = SqliteCaptureStore::create(&cap_db)
+                .await
+                .expect("create RB-10e capture.db");
+        }
+        populate_capture_rows_via_sql(&cap_db, 0, None).await;
+        switch_fixture_db_to_delete_mode(&git_db).await;
+        switch_fixture_db_to_delete_mode(&cap_db).await;
+        (git_db, cap_db)
+    }
+
+    async fn open_idle_legacy_conn(db_path: &Path) -> SqliteConnection {
+        let opts = SqliteConnectOptions::new()
+            .filename(db_path)
+            .create_if_missing(false)
+            .read_only(false)
+            .busy_timeout(Duration::ZERO);
+        SqliteConnection::connect_with(&opts)
+            .await
+            .expect("open pre-migration legacy sqlite connection")
+    }
+
+    async fn warm_git_read_and_schema_cache(conn: &mut SqliteConnection) {
+        let ref_rows = sea_orm::sqlx::query("SELECT * FROM reference;")
+            .persistent(true)
+            .fetch_all(&mut *conn)
+            .await
+            .expect("warm SELECT * FROM reference before fence");
+        assert!(
+            !ref_rows.is_empty(),
+            "fixture reference table must have seeded rows"
+        );
+        let master_rows = sea_orm::sqlx::query("SELECT name, sql FROM sqlite_master;")
+            .persistent(true)
+            .fetch_all(&mut *conn)
+            .await
+            .expect("warm SELECT name, sql FROM sqlite_master before fence");
+        assert!(
+            !master_rows.is_empty(),
+            "fixture sqlite_master must have schema rows"
+        );
+    }
+
+    async fn warm_cap_read_and_schema_cache(conn: &mut SqliteConnection) {
+        let rows = sea_orm::sqlx::query("SELECT * FROM agent_session;")
+            .persistent(true)
+            .fetch_all(&mut *conn)
+            .await
+            .expect("warm SELECT * FROM agent_session before fence");
+        assert!(
+            !rows.is_empty(),
+            "fixture agent_session table must have seeded rows"
+        );
+        let master_rows = sea_orm::sqlx::query("SELECT name, sql FROM sqlite_master;")
+            .persistent(true)
+            .fetch_all(&mut *conn)
+            .await
+            .expect("warm capture sqlite_master before fence");
+        assert!(!master_rows.is_empty());
+    }
+
+    async fn warm_dml_prepared_statement(conn: &mut SqliteConnection, sql: &'static str) {
+        // Execute inside a rolled-back transaction with `.persistent(true)` so
+        // BOTH SQLite's page/schema caches AND `sqlx`'s compiled `sqlite3_stmt`
+        // cache are warmed without modifying a single committed row!
+        sea_orm::sqlx::query("BEGIN IMMEDIATE;")
+            .persistent(false)
+            .execute(&mut *conn)
+            .await
+            .expect("begin rollback-only DML warmup");
+        sea_orm::sqlx::query(sql)
+            .persistent(true)
+            .execute(&mut *conn)
+            .await
+            .expect("warm compiled DML prepared statement before fence");
+        sea_orm::sqlx::query("ROLLBACK;")
+            .persistent(false)
+            .execute(&mut *conn)
+            .await
+            .expect("rollback DML warmup");
+    }
+
+    #[cfg(unix)]
+    struct Rb10ePreOpenedChild {
+        child: Option<Child>,
+        stdin: Option<ChildStdin>,
+        stdout_rx: Option<std::sync::mpsc::Receiver<io::Result<String>>>,
+        stderr_rx: Option<std::sync::mpsc::Receiver<String>>,
+        pid: u32,
+    }
+
+    #[cfg(unix)]
+    impl Rb10ePreOpenedChild {
+        fn spawn(test_name: &str, mode: &str, git_db: &Path, cap_db: &Path) -> Self {
+            let exe = std::env::current_exe().expect("locate current test executable");
+            let mut child = Command::new(exe)
+                .arg("--exact")
+                .arg(test_name)
+                .arg("--nocapture")
+                .env(RB10E_CHILD_MODE_ENV, mode)
+                .env(RB10E_CHILD_GIT_DB_ENV, git_db)
+                .env(RB10E_CHILD_CAP_DB_ENV, cap_db)
+                .env("LIBRA_TEST", "1")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn RB-10e pre-opened handle child");
+            let stdin = child.stdin.take().expect("RB-10e child stdin");
+            let stdout = child.stdout.take().expect("RB-10e child stdout");
+            let stderr = child.stderr.take().expect("RB-10e child stderr");
+
+            let (out_tx, out_rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let mut reader = BufReader::new(stdout);
+                loop {
+                    let mut line = String::new();
+                    match reader.read_line(&mut line) {
+                        Ok(0) => break,
+                        Ok(_) => {
+                            if out_tx.send(Ok(line)).is_err() {
+                                break;
+                            }
+                        }
+                        Err(err) => {
+                            let _ = out_tx.send(Err(err));
+                            break;
+                        }
+                    }
+                }
+            });
+
+            let (err_tx, err_rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let mut reader = stderr;
+                let mut buf = String::new();
+                let _ = reader.read_to_string(&mut buf);
+                let _ = err_tx.send(buf);
+            });
+
+            let mut me = Self {
+                child: Some(child),
+                stdin: Some(stdin),
+                stdout_rx: Some(out_rx),
+                stderr_rx: Some(err_rx),
+                pid: 0,
+            };
+            let ready = me.read_line_with_prefix("RB10E_READY ");
+            me.pid = ready
+                .trim()
+                .strip_prefix("RB10E_READY pid=")
+                .expect("parse RB10E_READY pid")
+                .parse()
+                .expect("parse RB10E child pid");
+            me
+        }
+
+        fn kill_and_reap(&mut self) {
+            drop(self.stdin.take());
+            if let Some(child) = self.child.as_mut() {
+                if let Ok(None) = child.try_wait() {
+                    let _ = child.kill();
+                }
+                let _ = child.wait();
+            }
+        }
+
+        fn collect_stderr(&mut self) -> String {
+            self.stderr_rx
+                .take()
+                .and_then(|rx| rx.recv_timeout(Duration::from_millis(300)).ok())
+                .unwrap_or_default()
+        }
+
+        fn read_line_with_prefix(&mut self, prefix: &str) -> String {
+            let deadline = Instant::now() + RB10E_CHILD_IO_TIMEOUT;
+            let mut captured = String::new();
+            loop {
+                let rem = deadline.saturating_duration_since(Instant::now());
+                match self
+                    .stdout_rx
+                    .as_ref()
+                    .expect("RB-10e child stdout rx")
+                    .recv_timeout(rem)
+                {
+                    Ok(Ok(line)) => {
+                        captured.push_str(&line);
+                        if line.starts_with(prefix) {
+                            return line;
+                        }
+                    }
+                    Ok(Err(err)) => {
+                        self.kill_and_reap();
+                        let stderr_buf = self.collect_stderr();
+                        panic!(
+                            "RB-10e child stdout error awaiting `{prefix}`: {err}\nstdout:\n{captured}\nstderr:\n{stderr_buf}"
+                        );
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        self.kill_and_reap();
+                        let stderr_buf = self.collect_stderr();
+                        panic!(
+                            "RB-10e child timed out after {RB10E_CHILD_IO_TIMEOUT:?} awaiting `{prefix}`\nstdout:\n{captured}\nstderr:\n{stderr_buf}"
+                        );
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        let status = self
+                            .child
+                            .as_mut()
+                            .and_then(|c| wait_child_exit_bounded(c, Duration::from_secs(1)).ok());
+                        let stderr_buf = self.collect_stderr();
+                        panic!(
+                            "RB-10e child exited before `{prefix}` (status={status:?})\nstdout:\n{captured}\nstderr:\n{stderr_buf}"
+                        );
+                    }
+                }
+            }
+        }
+
+        fn run_verify_and_finish(mut self) -> Duration {
+            let stdin = self.stdin.as_mut().expect("RB-10e child stdin");
+            writeln!(stdin, "VERIFY").expect("send VERIFY to RB-10e child");
+            stdin.flush().expect("flush VERIFY");
+            let ok_line = self.read_line_with_prefix("RB10E_OK ");
+            let elapsed_us: u64 = ok_line
+                .split_whitespace()
+                .find_map(|tok| tok.strip_prefix("elapsed_us="))
+                .and_then(|v| v.parse().ok())
+                .unwrap_or_else(|| panic!("parse elapsed_us from `{ok_line}`"));
+            drop(self.stdin.take());
+            let drain_deadline = Instant::now() + RB10E_CHILD_IO_TIMEOUT;
+            if let Some(rx) = self.stdout_rx.as_ref() {
+                while let Some(rem) = drain_deadline.checked_duration_since(Instant::now()) {
+                    match rx.recv_timeout(rem) {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(_)) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            self.kill_and_reap();
+                            panic!("RB-10e child timed out draining stdout");
+                        }
+                    }
+                }
+            }
+            drop(self.stdout_rx.take());
+            let mut child = self.child.take().expect("RB-10e child present");
+            let status = wait_child_exit_bounded(&mut child, RB10E_CHILD_IO_TIMEOUT)
+                .unwrap_or_else(|msg| panic!("RB-10e child wait failed: {msg}"));
+            let stderr_buf = self.collect_stderr();
+            assert!(
+                status.success(),
+                "RB-10e child exited abnormally ({status:?}):\nstderr:\n{stderr_buf}"
+            );
+            Duration::from_micros(elapsed_us)
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for Rb10ePreOpenedChild {
+        fn drop(&mut self) {
+            self.kill_and_reap();
+        }
+    }
+
+    struct Rb10eReadHandles {
+        cold_git: SqliteConnection,
+        warm_git_cached: SqliteConnection,
+        warm_git_uncached: SqliteConnection,
+        cold_master_git: SqliteConnection,
+        warm_master_git: SqliteConnection,
+        cold_cap: SqliteConnection,
+        warm_cap: SqliteConnection,
+        warm_master_cap: SqliteConnection,
+    }
+
+    impl Rb10eReadHandles {
+        async fn open_and_warm(git_db: &Path, cap_db: &Path) -> Self {
+            let cold_git = open_idle_legacy_conn(git_db).await;
+            let mut warm_git_cached = open_idle_legacy_conn(git_db).await;
+            let mut warm_git_uncached = open_idle_legacy_conn(git_db).await;
+            let cold_master_git = open_idle_legacy_conn(git_db).await;
+            let mut warm_master_git = open_idle_legacy_conn(git_db).await;
+            let cold_cap = open_idle_legacy_conn(cap_db).await;
+            let mut warm_cap = open_idle_legacy_conn(cap_db).await;
+            let mut warm_master_cap = open_idle_legacy_conn(cap_db).await;
+
+            // Warm page cache + schema cache + sqlx prepared statement cache
+            // on the warm handles ONLY (leaving cold handles untouched!).
+            warm_git_read_and_schema_cache(&mut warm_git_cached).await;
+            warm_git_read_and_schema_cache(&mut warm_git_uncached).await;
+            warm_git_read_and_schema_cache(&mut warm_master_git).await;
+            warm_cap_read_and_schema_cache(&mut warm_cap).await;
+            warm_cap_read_and_schema_cache(&mut warm_master_cap).await;
+
+            Self {
+                cold_git,
+                warm_git_cached,
+                warm_git_uncached,
+                cold_master_git,
+                warm_master_git,
+                cold_cap,
+                warm_cap,
+                warm_master_cap,
+            }
+        }
+
+        async fn verify_all_rejected(&mut self) {
+            // AC1: Cold pre-opened connection -> `SELECT * FROM reference` (and
+            // `agent_session` on capture.db) as the VERY FIRST operation.
+            let err = sea_orm::sqlx::query("SELECT * FROM reference;")
+                .persistent(false)
+                .fetch_all(&mut self.cold_git)
+                .await
+                .expect_err("AC1 cold connection SELECT * FROM reference must fail closed");
+            assert_strict_sqlite_corrupt(&err, "AC1 cold git SELECT * FROM reference", true);
+
+            let cap_cold_err = sea_orm::sqlx::query("SELECT * FROM agent_session;")
+                .persistent(false)
+                .fetch_all(&mut self.cold_cap)
+                .await
+                .expect_err(
+                    "AC1 cold capture connection SELECT * FROM agent_session must fail closed",
+                );
+            assert_strict_sqlite_corrupt(
+                &cap_cold_err,
+                "AC1 cold cap SELECT * FROM agent_session",
+                true,
+            );
+
+            // AC2: Dedicated warm page-cache + cached prepared-statement connections
+            // (testing cached `.persistent(true)` and uncached `.persistent(false)`
+            // each as the first post-fence operation on its own handle).
+            let warm_cached_err = sea_orm::sqlx::query("SELECT * FROM reference;")
+                .persistent(true)
+                .fetch_all(&mut self.warm_git_cached)
+                .await
+                .expect_err("AC2 warm cached SELECT * FROM reference must fail closed");
+            assert_strict_sqlite_corrupt(&warm_cached_err, "AC2 warm cached git SELECT", true);
+
+            let warm_uncached_err = sea_orm::sqlx::query("SELECT * FROM reference;")
+                .persistent(false)
+                .fetch_all(&mut self.warm_git_uncached)
+                .await
+                .expect_err("AC2 warm uncached SELECT * FROM reference must fail closed");
+            assert_strict_sqlite_corrupt(&warm_uncached_err, "AC2 warm uncached git SELECT", true);
+
+            let cap_warm_err = sea_orm::sqlx::query("SELECT * FROM agent_session;")
+                .persistent(true)
+                .fetch_all(&mut self.warm_cap)
+                .await
+                .expect_err("AC2 warm capture cached SELECT must fail closed");
+            assert_strict_sqlite_corrupt(&cap_warm_err, "AC2 warm cached cap SELECT", true);
+
+            // AC3: Dedicated cold and warm pre-opened connections -> `SELECT name, sql FROM sqlite_master`.
+            let cold_master_err = sea_orm::sqlx::query("SELECT name, sql FROM sqlite_master;")
+                .persistent(false)
+                .fetch_all(&mut self.cold_master_git)
+                .await
+                .expect_err("AC3 cold sqlite_master SELECT must fail closed");
+            assert_strict_sqlite_corrupt(
+                &cold_master_err,
+                "AC3 cold git sqlite_master SELECT",
+                true,
+            );
+
+            let warm_master_cached_err =
+                sea_orm::sqlx::query("SELECT name, sql FROM sqlite_master;")
+                    .persistent(true)
+                    .fetch_all(&mut self.warm_master_git)
+                    .await
+                    .expect_err("AC3 warm cached sqlite_master SELECT must fail closed");
+            assert_strict_sqlite_corrupt(
+                &warm_master_cached_err,
+                "AC3 warm cached git sqlite_master SELECT",
+                true,
+            );
+
+            let cap_master_err = sea_orm::sqlx::query("SELECT name, sql FROM sqlite_master;")
+                .persistent(true)
+                .fetch_all(&mut self.warm_master_cap)
+                .await
+                .expect_err("AC3 warm capture sqlite_master SELECT must fail closed");
+            assert_strict_sqlite_corrupt(
+                &cap_master_err,
+                "AC3 warm cap sqlite_master SELECT",
+                true,
+            );
+        }
+
+        async fn close_all(self) {
+            for c in [
+                self.cold_git,
+                self.warm_git_cached,
+                self.warm_git_uncached,
+                self.cold_master_git,
+                self.warm_master_git,
+                self.cold_cap,
+                self.warm_cap,
+                self.warm_master_cap,
+            ] {
+                let _ = c.close().await;
+            }
+        }
+    }
+
+    struct Rb10eWriteHandles {
+        insert_git_cached: SqliteConnection,
+        insert_git_uncached: SqliteConnection,
+        update_git_cached: SqliteConnection,
+        update_git_uncached: SqliteConnection,
+        delete_git_cached: SqliteConnection,
+        delete_git_uncached: SqliteConnection,
+        ddl_pub_git: SqliteConnection,
+        ddl_idx_git: SqliteConnection,
+        vacuum_git: SqliteConnection,
+        insert_cap: SqliteConnection,
+        update_cap: SqliteConnection,
+        delete_cap: SqliteConnection,
+        vacuum_cap: SqliteConnection,
+    }
+
+    impl Rb10eWriteHandles {
+        const INSERT_GIT_SQL: &'static str = "INSERT INTO reference (name, kind, \"commit\", remote) VALUES ('rb10e-post-fence', 'Branch', 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', NULL);";
+        const UPDATE_GIT_SQL: &'static str = "UPDATE reference SET \"commit\" = 'cccccccccccccccccccccccccccccccccccccccc' WHERE kind = 'Branch';";
+        const DELETE_GIT_SQL: &'static str = "DELETE FROM reference WHERE kind = 'Branch';";
+
+        async fn open_and_warm(git_db: &Path, cap_db: &Path) -> Self {
+            let mut insert_git_cached = open_idle_legacy_conn(git_db).await;
+            let mut insert_git_uncached = open_idle_legacy_conn(git_db).await;
+            let mut update_git_cached = open_idle_legacy_conn(git_db).await;
+            let mut update_git_uncached = open_idle_legacy_conn(git_db).await;
+            let mut delete_git_cached = open_idle_legacy_conn(git_db).await;
+            let mut delete_git_uncached = open_idle_legacy_conn(git_db).await;
+            let mut ddl_pub_git = open_idle_legacy_conn(git_db).await;
+            let mut ddl_idx_git = open_idle_legacy_conn(git_db).await;
+            let mut vacuum_git = open_idle_legacy_conn(git_db).await;
+            let mut insert_cap = open_idle_legacy_conn(cap_db).await;
+            let mut update_cap = open_idle_legacy_conn(cap_db).await;
+            let mut delete_cap = open_idle_legacy_conn(cap_db).await;
+            let mut vacuum_cap = open_idle_legacy_conn(cap_db).await;
+
+            // Pre-warm page caches & compiled DML prepared statements via
+            // rolled-back transactions before migration begins!
+            warm_dml_prepared_statement(&mut insert_git_cached, Self::INSERT_GIT_SQL).await;
+            warm_git_read_and_schema_cache(&mut insert_git_uncached).await;
+            warm_dml_prepared_statement(&mut update_git_cached, Self::UPDATE_GIT_SQL).await;
+            warm_git_read_and_schema_cache(&mut update_git_uncached).await;
+            warm_dml_prepared_statement(&mut delete_git_cached, Self::DELETE_GIT_SQL).await;
+            warm_git_read_and_schema_cache(&mut delete_git_uncached).await;
+            warm_git_read_and_schema_cache(&mut ddl_pub_git).await;
+            warm_git_read_and_schema_cache(&mut ddl_idx_git).await;
+            warm_git_read_and_schema_cache(&mut vacuum_git).await;
+            warm_cap_read_and_schema_cache(&mut insert_cap).await;
+            warm_cap_read_and_schema_cache(&mut update_cap).await;
+            warm_cap_read_and_schema_cache(&mut delete_cap).await;
+            warm_cap_read_and_schema_cache(&mut vacuum_cap).await;
+
+            Self {
+                insert_git_cached,
+                insert_git_uncached,
+                update_git_cached,
+                update_git_uncached,
+                delete_git_cached,
+                delete_git_uncached,
+                ddl_pub_git,
+                ddl_idx_git,
+                vacuum_git,
+                insert_cap,
+                update_cap,
+                delete_cap,
+                vacuum_cap,
+            }
+        }
+
+        async fn verify_all_rejected(&mut self) {
+            // Every single DML, DDL, and VACUUM statement executes as the VERY
+            // FIRST post-fence operation on its own dedicated pre-opened handle!
+
+            // AC4: `INSERT` (cached & uncached on libra.db + capture.db).
+            let ins_cached_err = sea_orm::sqlx::query(Self::INSERT_GIT_SQL)
+                .persistent(true)
+                .execute(&mut self.insert_git_cached)
+                .await
+                .expect_err("AC4 cached INSERT must fail closed");
+            assert_strict_sqlite_corrupt(&ins_cached_err, "AC4 git cached INSERT", true);
+
+            let ins_uncached_err = sea_orm::sqlx::query(Self::INSERT_GIT_SQL)
+                .persistent(false)
+                .execute(&mut self.insert_git_uncached)
+                .await
+                .expect_err("AC4 uncached INSERT must fail closed");
+            assert_strict_sqlite_corrupt(&ins_uncached_err, "AC4 git uncached INSERT", true);
+
+            let ins_cap_err = sea_orm::sqlx::query(
+                "INSERT INTO agent_audit_log (audit_id, timestamp, user_id, user_name, action, checkpoint_id, scope, export_path, justification, granted) VALUES ('rb10e-ins', '2026-11-22T00:05:00Z', 'u1', 'Ada', 'export', NULL, 'committed', NULL, 'rb10e', 1);",
+            )
+            .persistent(false)
+            .execute(&mut self.insert_cap)
+            .await
+            .expect_err("AC4 capture INSERT must fail closed");
+            assert_strict_sqlite_corrupt(&ins_cap_err, "AC4 capture INSERT", true);
+
+            // AC5: `UPDATE` (cached & uncached on libra.db + capture.db).
+            let upd_cached_err = sea_orm::sqlx::query(Self::UPDATE_GIT_SQL)
+                .persistent(true)
+                .execute(&mut self.update_git_cached)
+                .await
+                .expect_err("AC5 cached UPDATE must fail closed");
+            assert_strict_sqlite_corrupt(&upd_cached_err, "AC5 git cached UPDATE", true);
+
+            let upd_uncached_err = sea_orm::sqlx::query(Self::UPDATE_GIT_SQL)
+                .persistent(false)
+                .execute(&mut self.update_git_uncached)
+                .await
+                .expect_err("AC5 uncached UPDATE must fail closed");
+            assert_strict_sqlite_corrupt(&upd_uncached_err, "AC5 git uncached UPDATE", true);
+
+            let upd_cap_err = sea_orm::sqlx::query("UPDATE agent_session SET state = 'stopped';")
+                .persistent(false)
+                .execute(&mut self.update_cap)
+                .await
+                .expect_err("AC5 capture UPDATE must fail closed");
+            assert_strict_sqlite_corrupt(&upd_cap_err, "AC5 capture UPDATE", true);
+
+            // AC6: `DELETE` (cached & uncached on libra.db + capture.db).
+            let del_cached_err = sea_orm::sqlx::query(Self::DELETE_GIT_SQL)
+                .persistent(true)
+                .execute(&mut self.delete_git_cached)
+                .await
+                .expect_err("AC6 cached DELETE must fail closed");
+            assert_strict_sqlite_corrupt(&del_cached_err, "AC6 git cached DELETE", true);
+
+            let del_uncached_err = sea_orm::sqlx::query(Self::DELETE_GIT_SQL)
+                .persistent(false)
+                .execute(&mut self.delete_git_uncached)
+                .await
+                .expect_err("AC6 uncached DELETE must fail closed");
+            assert_strict_sqlite_corrupt(&del_uncached_err, "AC6 git uncached DELETE", true);
+
+            let del_cap_err = sea_orm::sqlx::query("DELETE FROM agent_audit_log;")
+                .persistent(false)
+                .execute(&mut self.delete_cap)
+                .await
+                .expect_err("AC6 capture DELETE must fail closed");
+            assert_strict_sqlite_corrupt(&del_cap_err, "AC6 capture DELETE", true);
+
+            // AC7: Verbatim `CREATE TABLE IF NOT EXISTS agent_bridge_publication(...)`
+            // and `agent_bridge_index_publication(...)` (`publication.rs:22,36`),
+            // each on its own dedicated pre-opened connection!
+            let ddl_pub_err = sea_orm::sqlx::query(RB10E_AGENT_BRIDGE_PUBLICATION_DDL)
+                .persistent(false)
+                .execute(&mut self.ddl_pub_git)
+                .await
+                .expect_err(
+                    "AC7 CREATE TABLE IF NOT EXISTS agent_bridge_publication must fail closed",
+                );
+            assert_strict_sqlite_corrupt(
+                &ddl_pub_err,
+                "AC7 CREATE TABLE IF NOT EXISTS agent_bridge_publication",
+                true,
+            );
+
+            let ddl_idx_err = sea_orm::sqlx::query(RB10E_AGENT_BRIDGE_INDEX_PUBLICATION_DDL)
+                .persistent(false)
+                .execute(&mut self.ddl_idx_git)
+                .await
+                .expect_err(
+                    "AC7 CREATE TABLE IF NOT EXISTS agent_bridge_index_publication must fail closed",
+                );
+            assert_strict_sqlite_corrupt(
+                &ddl_idx_err,
+                "AC7 CREATE TABLE IF NOT EXISTS agent_bridge_index_publication",
+                true,
+            );
+
+            // AC8: `VACUUM` on both `libra.db` and `capture.db`, each on its own handle!
+            let vac_git_err = sea_orm::sqlx::query("VACUUM;")
+                .persistent(false)
+                .execute(&mut self.vacuum_git)
+                .await
+                .expect_err("AC8 git VACUUM must fail closed");
+            assert_strict_sqlite_corrupt(&vac_git_err, "AC8 git VACUUM", false);
+
+            let vac_cap_err = sea_orm::sqlx::query("VACUUM;")
+                .persistent(false)
+                .execute(&mut self.vacuum_cap)
+                .await
+                .expect_err("AC8 capture VACUUM must fail closed");
+            assert_strict_sqlite_corrupt(&vac_cap_err, "AC8 capture VACUUM", false);
+        }
+
+        async fn close_all(self) {
+            for c in [
+                self.insert_git_cached,
+                self.insert_git_uncached,
+                self.update_git_cached,
+                self.update_git_uncached,
+                self.delete_git_cached,
+                self.delete_git_uncached,
+                self.ddl_pub_git,
+                self.ddl_idx_git,
+                self.vacuum_git,
+                self.insert_cap,
+                self.update_cap,
+                self.delete_cap,
+                self.vacuum_cap,
+            ] {
+                let _ = c.close().await;
+            }
+        }
+    }
+
+    struct Rb10eExistingDdlHandles {
+        ddl_pub_existing_cold: SqliteConnection,
+        ddl_pub_existing_warm: SqliteConnection,
+        ddl_idx_existing_cold: SqliteConnection,
+        ddl_idx_existing_warm: SqliteConnection,
+    }
+
+    impl Rb10eExistingDdlHandles {
+        async fn open_and_verify_tables_exist(git_db: &Path) -> Self {
+            let ddl_pub_existing_cold = open_idle_legacy_conn(git_db).await;
+            let mut ddl_pub_existing_warm = open_idle_legacy_conn(git_db).await;
+            let ddl_idx_existing_cold = open_idle_legacy_conn(git_db).await;
+            let mut ddl_idx_existing_warm = open_idle_legacy_conn(git_db).await;
+
+            // Explicitly confirm BOTH publication tables ALREADY exist in
+            // `sqlite_master` AND run `CREATE TABLE IF NOT EXISTS ...` once on
+            // each warm handle before fencing so the no-op path is pre-warmed!
+            let existing_count: i64 = sea_orm::sqlx::query_scalar(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('agent_bridge_publication', 'agent_bridge_index_publication');",
+            )
+            .persistent(false)
+            .fetch_one(&mut ddl_pub_existing_warm)
+            .await
+            .expect("verify existing bridge publication tables");
+            assert_eq!(
+                existing_count, 2,
+                "both agent_bridge_publication and agent_bridge_index_publication must already exist"
+            );
+            sea_orm::sqlx::query(RB10E_AGENT_BRIDGE_PUBLICATION_DDL)
+                .persistent(true)
+                .execute(&mut ddl_pub_existing_warm)
+                .await
+                .expect("pre-fence no-op CREATE TABLE IF NOT EXISTS agent_bridge_publication");
+            sea_orm::sqlx::query(RB10E_AGENT_BRIDGE_INDEX_PUBLICATION_DDL)
+                .persistent(true)
+                .execute(&mut ddl_idx_existing_warm)
+                .await
+                .expect(
+                    "pre-fence no-op CREATE TABLE IF NOT EXISTS agent_bridge_index_publication",
+                );
+
+            Self {
+                ddl_pub_existing_cold,
+                ddl_pub_existing_warm,
+                ddl_idx_existing_cold,
+                ddl_idx_existing_warm,
+            }
+        }
+
+        async fn verify_all_rejected(&mut self) {
+            let e1 = sea_orm::sqlx::query(RB10E_AGENT_BRIDGE_PUBLICATION_DDL)
+                .persistent(false)
+                .execute(&mut self.ddl_pub_existing_cold)
+                .await
+                .expect_err(
+                    "AC7 cold existing-table agent_bridge_publication DDL must fail closed",
+                );
+            assert_strict_sqlite_corrupt(
+                &e1,
+                "AC7 cold existing agent_bridge_publication DDL",
+                true,
+            );
+
+            let e2 = sea_orm::sqlx::query(RB10E_AGENT_BRIDGE_PUBLICATION_DDL)
+                .persistent(true)
+                .execute(&mut self.ddl_pub_existing_warm)
+                .await
+                .expect_err(
+                    "AC7 warm existing-table agent_bridge_publication DDL must fail closed",
+                );
+            assert_strict_sqlite_corrupt(
+                &e2,
+                "AC7 warm existing agent_bridge_publication DDL",
+                true,
+            );
+
+            let e3 = sea_orm::sqlx::query(RB10E_AGENT_BRIDGE_INDEX_PUBLICATION_DDL)
+                .persistent(false)
+                .execute(&mut self.ddl_idx_existing_cold)
+                .await
+                .expect_err(
+                    "AC7 cold existing-table agent_bridge_index_publication DDL must fail closed",
+                );
+            assert_strict_sqlite_corrupt(
+                &e3,
+                "AC7 cold existing agent_bridge_index_publication DDL",
+                true,
+            );
+
+            let e4 = sea_orm::sqlx::query(RB10E_AGENT_BRIDGE_INDEX_PUBLICATION_DDL)
+                .persistent(true)
+                .execute(&mut self.ddl_idx_existing_warm)
+                .await
+                .expect_err(
+                    "AC7 warm existing-table agent_bridge_index_publication DDL must fail closed",
+                );
+            assert_strict_sqlite_corrupt(
+                &e4,
+                "AC7 warm existing agent_bridge_index_publication DDL",
+                true,
+            );
+        }
+
+        async fn close_all(self) {
+            for c in [
+                self.ddl_pub_existing_cold,
+                self.ddl_pub_existing_warm,
+                self.ddl_idx_existing_cold,
+                self.ddl_idx_existing_warm,
+            ] {
+                let _ = c.close().await;
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    async fn run_rb10e_child(mode: &str) {
+        let git_db = PathBuf::from(
+            std::env::var_os(RB10E_CHILD_GIT_DB_ENV).expect("RB10E child git db env"),
+        );
+        let cap_db = PathBuf::from(
+            std::env::var_os(RB10E_CHILD_CAP_DB_ENV).expect("RB10E child cap db env"),
+        );
+
+        match mode {
+            "read_handles" => {
+                let mut handles = Rb10eReadHandles::open_and_warm(&git_db, &cap_db).await;
+                println!("RB10E_READY pid={}", std::process::id());
+                let _ = io::stdout().flush();
+
+                let cmd = tokio::task::spawn_blocking(|| {
+                    let mut line = String::new();
+                    let _ = io::stdin().read_line(&mut line);
+                    line
+                })
+                .await
+                .expect("read RB10E command");
+                assert_eq!(cmd.trim(), "VERIFY");
+
+                let t0 = Instant::now();
+                handles.verify_all_rejected().await;
+                let elapsed = t0.elapsed();
+                handles.close_all().await;
+
+                println!(
+                    "RB10E_OK pid={} elapsed_us={}",
+                    std::process::id(),
+                    elapsed.as_micros()
+                );
+                let _ = io::stdout().flush();
+            }
+            "dml_ddl_vacuum_handles" => {
+                let mut handles = Rb10eWriteHandles::open_and_warm(&git_db, &cap_db).await;
+                println!("RB10E_READY pid={}", std::process::id());
+                let _ = io::stdout().flush();
+
+                let cmd = tokio::task::spawn_blocking(|| {
+                    let mut line = String::new();
+                    let _ = io::stdin().read_line(&mut line);
+                    line
+                })
+                .await
+                .expect("read RB10E command");
+                assert_eq!(cmd.trim(), "VERIFY");
+
+                let t0 = Instant::now();
+                handles.verify_all_rejected().await;
+                let elapsed = t0.elapsed();
+                handles.close_all().await;
+
+                println!(
+                    "RB10E_OK pid={} elapsed_us={}",
+                    std::process::id(),
+                    elapsed.as_micros()
+                );
+                let _ = io::stdout().flush();
+            }
+            "existing_ddl_handles" => {
+                let mut handles =
+                    Rb10eExistingDdlHandles::open_and_verify_tables_exist(&git_db).await;
+                println!("RB10E_READY pid={}", std::process::id());
+                let _ = io::stdout().flush();
+
+                let cmd = tokio::task::spawn_blocking(|| {
+                    let mut line = String::new();
+                    let _ = io::stdin().read_line(&mut line);
+                    line
+                })
+                .await
+                .expect("read RB10E command");
+                assert_eq!(cmd.trim(), "VERIFY");
+
+                let t0 = Instant::now();
+                handles.verify_all_rejected().await;
+                let elapsed = t0.elapsed();
+                handles.close_all().await;
+
+                println!(
+                    "RB10E_OK pid={} elapsed_us={}",
+                    std::process::id(),
+                    elapsed.as_micros()
+                );
+                let _ = io::stdout().flush();
+            }
+            other => panic!("unexpected RB-10e child mode `{other}`"),
+        }
+    }
+
+    #[tokio::test]
+    async fn forward_phase2_fence_blocks_cold_warm_table_select_and_sqlite_master() {
+        #[cfg(unix)]
+        if let Some(mode) = std::env::var_os(RB10E_CHILD_MODE_ENV) {
+            run_rb10e_child(&mode.to_string_lossy()).await;
+            return;
+        }
+
+        // --------------------------------------------------------------------
+        // Scenario 1 (Unix cross-process full Phase 1 -> Phase 2 -> unlink ->
+        // release_locks): Independent OS child holds dedicated cold SELECT,
+        // warm cached & uncached SELECT, and cold+warm sqlite_master
+        // connections opened BEFORE migration across full Phase 2 unlink!
+        // --------------------------------------------------------------------
+        #[cfg(unix)]
+        {
+            let dir = tempdir().expect("create RB-10e read Scenario 1 tempdir");
+            let storage = dir.path().join(".libra");
+            let (git_db, cap_db) = setup_rb10e_delete_mode_fixture(&storage, false).await;
+
+            let child = Rb10ePreOpenedChild::spawn(
+                "storage::migrate::tests::forward_phase2_fence_blocks_cold_warm_table_select_and_sqlite_master",
+                "read_handles",
+                &git_db,
+                &cap_db,
+            );
+            assert_ne!(child.pid, std::process::id());
+
+            let prepared = prepare_forward_phase1(&storage, 1)
+                .await
+                .expect("Phase 1 must succeed with idle pre-opened DELETE-mode handles");
+            let state = execute_forward_phase2_fence_and_unlink(prepared)
+                .await
+                .expect("Phase 2 fence + unlink must succeed");
+            assert!(!path_exists_no_open(&git_db).expect("git_db unlinked"));
+            assert!(!path_exists_no_open(&cap_db).expect("cap_db unlinked"));
+            state.release_locks();
+
+            let reject_elapsed = child.run_verify_and_finish();
+            assert!(
+                reject_elapsed <= Duration::from_millis(200),
+                "post-unlink pre-opened read rejection exceeded 200ms: {reject_elapsed:?}"
+            );
+            assert!(!path_exists_no_open(&git_db).expect("git_db still absent"));
+            assert!(!path_exists_no_open(&cap_db).expect("cap_db still absent"));
+        }
+
+        // --------------------------------------------------------------------
+        // Scenario 2 (Post-fence pre-unlink / cross-platform + single fence +
+        // pre-opened read rejection <= 200ms performance budget):
+        // Dedicated pre-opened cold/warm/sqlite_master handles tested
+        // immediately after fence commit while fenced files remain on disk.
+        // --------------------------------------------------------------------
+        {
+            let dir = tempdir().expect("create RB-10e read Scenario 2 tempdir");
+            let storage = dir.path().join(".libra");
+            let (git_db, cap_db) = setup_rb10e_delete_mode_fixture(&storage, false).await;
+
+            let mut handles = Rb10eReadHandles::open_and_warm(&git_db, &cap_db).await;
+
+            // Fence both `libra.db` and `capture.db` via the real rollback-journal
+            // fence primitive while timing single fence + all pre-opened handle
+            // rejection checks against the <= 200ms budget!
+            let mut git_q = quiesce_sqlite_source(&git_db, DatabaseRole::Repository)
+                .await
+                .expect("quiesce git_db");
+            let mut cap_q = quiesce_sqlite_source(&cap_db, DatabaseRole::Capture)
+                .await
+                .expect("quiesce cap_db");
+
+            let budget_t0 = Instant::now();
+            let git_receipt = fence_sqlite_connection_journaled(&mut git_q)
+                .await
+                .expect("fence git_db");
+            assert!(git_receipt.schema_version_after > git_receipt.schema_version_before);
+            git_q.close().await.expect("close git_q");
+
+            let cap_receipt = fence_sqlite_connection_journaled(&mut cap_q)
+                .await
+                .expect("fence cap_db");
+            assert!(cap_receipt.schema_version_after > cap_receipt.schema_version_before);
+            cap_q.close().await.expect("close cap_q");
+
+            handles.verify_all_rejected().await;
+            let budget_elapsed = budget_t0.elapsed();
+            handles.close_all().await;
+
+            assert!(
+                budget_elapsed <= Duration::from_millis(200),
+                "RB-10e fence + pre-opened read rejection budget exceeded: {budget_elapsed:?} > 200ms"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn forward_phase2_fence_blocks_open_handle_dml_ddl_and_vacuum() {
+        #[cfg(unix)]
+        if let Some(mode) = std::env::var_os(RB10E_CHILD_MODE_ENV) {
+            run_rb10e_child(&mode.to_string_lossy()).await;
+            return;
+        }
+
+        // --------------------------------------------------------------------
+        // Scenario 1 (Unix cross-process full Phase 1 -> Phase 2 -> unlink ->
+        // release_locks): Independent OS child holds dedicated pre-opened
+        // INSERT, UPDATE, DELETE (with warmed prepared statements!),
+        // CREATE TABLE IF NOT EXISTS agent_bridge_publication(...),
+        // CREATE TABLE IF NOT EXISTS agent_bridge_index_publication(...), and
+        // VACUUM connections across full Phase 2 fence + unlink!
+        // --------------------------------------------------------------------
+        #[cfg(unix)]
+        {
+            let dir = tempdir().expect("create RB-10e DML/DDL/VACUUM Scenario 1 tempdir");
+            let storage = dir.path().join(".libra");
+            // Drop `agent_bridge_publication` & `agent_bridge_index_publication`
+            // beforehand so `CREATE TABLE IF NOT EXISTS` would genuinely mutate
+            // `sqlite_master` if the fence did not intercept it!
+            let (git_db, cap_db) = setup_rb10e_delete_mode_fixture(&storage, true).await;
+
+            let child = Rb10ePreOpenedChild::spawn(
+                "storage::migrate::tests::forward_phase2_fence_blocks_open_handle_dml_ddl_and_vacuum",
+                "dml_ddl_vacuum_handles",
+                &git_db,
+                &cap_db,
+            );
+            assert_ne!(child.pid, std::process::id());
+
+            let prepared = prepare_forward_phase1(&storage, 1)
+                .await
+                .expect("Phase 1 must succeed with idle pre-opened DML/DDL/VACUUM handles");
+            let state = execute_forward_phase2_fence_and_unlink(prepared)
+                .await
+                .expect("Phase 2 fence + unlink must succeed");
+            assert!(!path_exists_no_open(&git_db).expect("git_db unlinked"));
+            assert!(!path_exists_no_open(&cap_db).expect("cap_db unlinked"));
+            state.release_locks();
+
+            let reject_elapsed = child.run_verify_and_finish();
+            assert!(
+                reject_elapsed <= Duration::from_millis(200),
+                "post-unlink pre-opened DML/DDL/VACUUM rejection exceeded 200ms: {reject_elapsed:?}"
+            );
+            assert!(!path_exists_no_open(&git_db).expect("git_db still absent"));
+            assert!(!path_exists_no_open(&cap_db).expect("cap_db still absent"));
+        }
+
+        // --------------------------------------------------------------------
+        // Scenario 2 (Post-fence pre-unlink / cross-platform + byte-for-byte
+        // on-disk immutability + <= 200ms single fence & rejection budget):
+        // Verify AC4–AC8 reject with exact numeric `SQLITE_CORRUPT` (11) AND
+        // leave the fenced `.db` files 100% byte-for-byte immutable!
+        // --------------------------------------------------------------------
+        {
+            let dir = tempdir().expect("create RB-10e DML/DDL/VACUUM Scenario 2 tempdir");
+            let storage = dir.path().join(".libra");
+            let (git_db, cap_db) = setup_rb10e_delete_mode_fixture(&storage, true).await;
+
+            let mut handles = Rb10eWriteHandles::open_and_warm(&git_db, &cap_db).await;
+
+            let mut git_q = quiesce_sqlite_source(&git_db, DatabaseRole::Repository)
+                .await
+                .expect("quiesce git_db");
+            let mut cap_q = quiesce_sqlite_source(&cap_db, DatabaseRole::Capture)
+                .await
+                .expect("quiesce cap_db");
+
+            let budget_t0 = Instant::now();
+            let git_receipt = fence_sqlite_connection_journaled(&mut git_q)
+                .await
+                .expect("fence git_db");
+            assert!(git_receipt.schema_version_after > git_receipt.schema_version_before);
+            git_q.close().await.expect("close git_q");
+
+            let cap_receipt = fence_sqlite_connection_journaled(&mut cap_q)
+                .await
+                .expect("fence cap_db");
+            assert!(cap_receipt.schema_version_after > cap_receipt.schema_version_before);
+            cap_q.close().await.expect("close cap_q");
+
+            let git_sha_after_fence = sha256_file_bytes_for_test(&git_db);
+            let cap_sha_after_fence = sha256_file_bytes_for_test(&cap_db);
+
+            handles.verify_all_rejected().await;
+            let budget_elapsed = budget_t0.elapsed();
+            handles.close_all().await;
+
+            // Confirm ZERO bytes changed on disk across all rejected DML/DDL/VACUUM attempts!
+            assert_eq!(
+                sha256_file_bytes_for_test(&git_db),
+                git_sha_after_fence,
+                "rejected DML/DDL/VACUUM must not mutate a single byte of fenced libra.db"
+            );
+            assert_eq!(
+                sha256_file_bytes_for_test(&cap_db),
+                cap_sha_after_fence,
+                "rejected DML/VACUUM must not mutate a single byte of fenced capture.db"
+            );
+            assert!(
+                budget_elapsed <= Duration::from_millis(200),
+                "RB-10e fence + pre-opened DML/DDL/VACUUM rejection budget exceeded: {budget_elapsed:?} > 200ms"
+            );
+        }
+
+        // --------------------------------------------------------------------
+        // Scenario 3 (AC7 existing-tables no-op DDL path — both cross-process
+        // post-unlink on Unix AND post-fence pre-unlink cross-platform):
+        // Confirm `CREATE TABLE IF NOT EXISTS agent_bridge_publication(...)`
+        // and `agent_bridge_index_publication(...)` reject with exact numeric
+        // `SQLITE_CORRUPT` (11) even when BOTH tables ALREADY EXIST before
+        // migration (cold & pre-warmed dedicated handles)!
+        // --------------------------------------------------------------------
+        #[cfg(unix)]
+        {
+            let dir = tempdir().expect("create RB-10e existing-DDL post-unlink tempdir");
+            let storage = dir.path().join(".libra");
+            let (git_db, cap_db) = setup_rb10e_delete_mode_fixture(&storage, false).await;
+
+            let child = Rb10ePreOpenedChild::spawn(
+                "storage::migrate::tests::forward_phase2_fence_blocks_open_handle_dml_ddl_and_vacuum",
+                "existing_ddl_handles",
+                &git_db,
+                &cap_db,
+            );
+            assert_ne!(child.pid, std::process::id());
+
+            let prepared = prepare_forward_phase1(&storage, 1)
+                .await
+                .expect("Phase 1 must succeed with idle existing-DDL handles");
+            let state = execute_forward_phase2_fence_and_unlink(prepared)
+                .await
+                .expect("Phase 2 fence + unlink must succeed");
+            state.release_locks();
+
+            let reject_elapsed = child.run_verify_and_finish();
+            assert!(
+                reject_elapsed <= Duration::from_millis(200),
+                "post-unlink existing-DDL rejection exceeded 200ms: {reject_elapsed:?}"
+            );
+        }
+
+        {
+            let dir = tempdir().expect("create RB-10e existing-DDL pre-unlink tempdir");
+            let storage = dir.path().join(".libra");
+            let (git_db, _cap_db) = setup_rb10e_delete_mode_fixture(&storage, false).await;
+
+            let mut handles = Rb10eExistingDdlHandles::open_and_verify_tables_exist(&git_db).await;
+            let mut git_q = quiesce_sqlite_source(&git_db, DatabaseRole::Repository)
+                .await
+                .expect("quiesce git_db");
+
+            let budget_t0 = Instant::now();
+            let receipt = fence_sqlite_connection_journaled(&mut git_q)
+                .await
+                .expect("fence git_db");
+            assert!(receipt.schema_version_after > receipt.schema_version_before);
+            git_q.close().await.expect("close git_q");
+
+            let git_sha_after_fence = sha256_file_bytes_for_test(&git_db);
+            handles.verify_all_rejected().await;
+            let budget_elapsed = budget_t0.elapsed();
+            handles.close_all().await;
+
+            assert_eq!(
+                sha256_file_bytes_for_test(&git_db),
+                git_sha_after_fence,
+                "rejected existing-table DDL must not mutate fenced libra.db"
+            );
+            assert!(
+                budget_elapsed <= Duration::from_millis(200),
+                "RB-10e existing-table DDL fence + rejection budget exceeded: {budget_elapsed:?} > 200ms"
+            );
+        }
+    }
 }
