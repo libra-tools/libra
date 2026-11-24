@@ -149,11 +149,11 @@ pub enum NotesSubcommand {
         commit: bool,
 
         /// Discard the current notes merge state (`--abort`)
-        #[clap(long, conflicts_with = "commit")]
+        #[clap(long)]
         abort: bool,
 
         /// Same as `--abort` (Libra extension; Git 2.56 has no --quit)
-        #[clap(long, conflicts_with_all = ["commit", "abort"])]
+        #[clap(long)]
         quit: bool,
     },
     /// Remove notes for objects that no longer exist in the object store
@@ -289,6 +289,33 @@ async fn resolve_notes_ref(args: &NotesArgs, is_get_ref: bool) -> CliResult<Stri
         notes::validate_notes_ref(&resolved).map_err(|e| CliError::from(NotesCliError::from(e)))?;
     }
     Ok(resolved)
+}
+
+/// Reject mixed `notes merge` control forms and arguments (`LBR-CLI-002`).
+fn validate_merge_modes(
+    other_ref: Option<&str>,
+    strategy: Option<&str>,
+    commit: bool,
+    abort: bool,
+    quit: bool,
+) -> CliResult<()> {
+    let controls = [commit, abort, quit]
+        .into_iter()
+        .filter(|flag| *flag)
+        .count();
+    if controls > 1 || (controls == 1 && strategy.is_some()) {
+        return Err(
+            CliError::failure("cannot mix --commit, --abort, --quit or -s/--strategy")
+                .with_stable_code(StableErrorCode::CliInvalidArguments),
+        );
+    }
+    if controls == 1 && other_ref.is_some() {
+        return Err(
+            CliError::failure("too many arguments for a notes merge control form")
+                .with_stable_code(StableErrorCode::CliInvalidArguments),
+        );
+    }
+    Ok(())
 }
 
 fn default_notes_subcommand() -> NotesSubcommand {
@@ -530,6 +557,16 @@ pub async fn execute_safe(
             abort,
             quit,
         } => {
+            // Mode validation happens BEFORE any lock acquisition, so a bad
+            // combination never touches the merge state (Git rejects these
+            // before reading refs too).
+            validate_merge_modes(
+                other_ref.as_deref(),
+                strategy.as_deref(),
+                commit,
+                abort,
+                quit,
+            )?;
             if abort || quit {
                 notes::abort_merge().await.map_err(NotesCliError::from)?;
                 return Ok(());

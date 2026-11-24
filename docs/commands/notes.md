@@ -274,8 +274,12 @@ differing note on both sides is a conflict resolved by `--strategy`:
   `libra notes merge --abort` discards the merge without touching the `notes`
   table: it removes `NOTES_MERGE_STATE`, `NOTES_MERGE_WORKTREE/` and
   `NOTES_MERGE_COMMITTING` (a partial residue is cleaned the same way) and fails
-  with `LBR-REPO-003` when no merge state exists. `--quit` is a Libra extension
-  (Git 2.56 has no such option) with identical semantics. Both forms take the
+  with `LBR-REPO-003` when no merge state exists. 
+
+  The three control forms are mutually exclusive and none of them accepts a
+  `-s/--strategy` or a positional notes ref: mixing them is a usage error
+  (`LBR-CLI-002`) rejected before the lock is taken, while
+  `-s/--strategy <ref>` remains the ordinary strategy merge. Both forms take the
   `NOTES_MERGE_LOCK` first, so an existing lock fails with
   `LBR-CONFLICT-002`.
 - `ours` / `theirs`: keep the current note / take the other ref's note.

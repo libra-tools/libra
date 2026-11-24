@@ -2910,3 +2910,80 @@ fn notes_merge_abort_and_quit_discard_state() {
         "AC8 code"
     );
 }
+
+/// PM-39: the `notes merge` control forms are validated before any lock or
+/// state access.
+#[test]
+fn notes_merge_mode_validation() {
+    let repo = tempdir().expect("failed to create repository root");
+    init_repo_via_cli(repo.path());
+    configure_identity_via_cli(repo.path());
+    let p = repo.path();
+
+    // AC1: the combination check wins over an existing lock.
+    std::fs::write(p.join(".libra").join("NOTES_MERGE_LOCK"), b"").unwrap();
+    let locked_controls = run_libra_command(&["notes", "merge", "--commit", "--abort"], p);
+    assert!(!locked_controls.status.success(), "AC1 must fail");
+    assert!(
+        String::from_utf8_lossy(&locked_controls.stderr).contains("LBR-CLI-002"),
+        "AC1 code: {}",
+        String::from_utf8_lossy(&locked_controls.stderr)
+    );
+    std::fs::remove_file(p.join(".libra").join("NOTES_MERGE_LOCK")).unwrap();
+
+    for args in [
+        // AC2: two control forms.
+        vec!["notes", "merge", "--abort", "--quit"],
+        // AC3/AC7/AC8: a control form with a strategy.
+        vec!["notes", "merge", "-s", "ours", "--commit"],
+        vec!["notes", "merge", "-s", "ours", "--abort"],
+        vec!["notes", "merge", "-s", "ours", "--quit"],
+        // AC4/AC5: a control form with a positional ref.
+        vec!["notes", "merge", "--abort", "refs/notes/other"],
+        vec!["notes", "merge", "--commit", "refs/notes/other"],
+        // AC6: commit + quit.
+        vec!["notes", "merge", "--commit", "--quit"],
+    ] {
+        let out = run_libra_command(&args, p);
+        assert!(!out.status.success(), "{args:?} must fail");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("LBR-CLI-002"),
+            "{args:?} code: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // A strategy merge with a positional ref stays valid.
+    std::fs::write(p.join("a.txt"), "a\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "a.txt"], p), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c1", "--no-verify"], p),
+        "commit",
+    );
+    let commit = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], p).stdout)
+        .trim()
+        .to_string();
+    assert_cli_success(
+        &run_libra_command(&["notes", "add", "-m", "x", &commit], p),
+        "note x",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "notes",
+                "--ref",
+                "refs/notes/other",
+                "add",
+                "-m",
+                "y",
+                &commit,
+            ],
+            p,
+        ),
+        "note y",
+    );
+    assert_cli_success(
+        &run_libra_command(&["notes", "merge", "-s", "ours", "refs/notes/other"], p),
+        "strategy merge with a positional ref",
+    );
+}

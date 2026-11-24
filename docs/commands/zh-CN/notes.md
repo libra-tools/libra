@@ -217,7 +217,9 @@ libra notes --json show                         # 结构化 JSON 输出
 
   若 `NOTES_MERGE_COMMITTING` 已存在（上次 `--commit` 崩溃），重试只**确认**、绝不重放：当所有冲突条目与待复制条目都已等于目标值时，仅删除三个状态路径并成功（包括「事务前崩溃」而目标值恰等于当前值的情形）；否则以 `LBR-CONFLICT-002` 失败并保留全部状态，用户只能 `--abort` 后重新合并。
 
-  `libra notes merge --abort` 在不改动 `notes` 表的前提下放弃合并：删除 `NOTES_MERGE_STATE`、`NOTES_MERGE_WORKTREE/` 与 `NOTES_MERGE_COMMITTING`（部分残留同样逐路径清理）；没有任何合并状态时以 `LBR-REPO-003` 失败。`--quit` 为 Libra 扩展（Git 2.56 无此选项），语义相同。两种形式都先取 `NOTES_MERGE_LOCK`，锁已存在时以 `LBR-CONFLICT-002` 失败。
+  `libra notes merge --abort` 在不改动 `notes` 表的前提下放弃合并：删除 `NOTES_MERGE_STATE`、`NOTES_MERGE_WORKTREE/` 与 `NOTES_MERGE_COMMITTING`（部分残留同样逐路径清理）；没有任何合并状态时以 `LBR-REPO-003` 失败。
+
+  三种控制形式两两互斥，且都不得与 `-s/--strategy` 或位置 ref 同用：混用属于用法错误（`LBR-CLI-002`），在取锁之前拒绝；`-s/--strategy <ref>` 仍是普通策略合并。两种形式都先取 `NOTES_MERGE_LOCK`，锁已存在时以 `LBR-CONFLICT-002` 失败。
 - `ours` / `theirs`：保留当前 note / 采用 other ref 的 note。
 - `union`：连接两个 note contents。
 - `cat_sort_uniq`：连接后排序并去重合并行。

@@ -81,3 +81,5 @@ flowchart TD
 - 2026-11-23（PM-38 / #989）：`commit_merge` 在 `NOTES_MERGE_COMMITTING` 已存在时改为**只确认不重放**——冲突条目当前值须等于算出的目标值（文件缺失时目标=前值），待复制条目须已等于来源值；全部通过则按 STATE→WORKTREE→标记 顺序清理并返回 `applied=0`，任一不符以 `MergeRaced`（`LBR-CONFLICT-002`）失败并保留状态。`STATE` 读取/解析仍在标记检查之前。回归：`notes_merge_commit_retry_after_crash`（AC1–AC8，含「提交后崩溃」恢复、改回原值/删除复制条目的 fail-closed、F38b 的只清理成功与写入探针）；`notes_test` 83/83。
 
 - 2026-11-23（PM-23 / #989）：新增 `notes merge --abort`/`--quit`（互斥、与 `--commit` 互斥），`notes::abort_merge` 取锁后逐路径删除 `NOTES_MERGE_STATE`/`NOTES_MERGE_WORKTREE`/`NOTES_MERGE_COMMITTING`，不改 `notes` 表；无任何残留 → `MergeInProgress`（`LBR-REPO-003`），锁已存在 → `MergeLocked`（`LBR-CONFLICT-002`）。回归：`notes_merge_abort_and_quit_discard_state`（AC1–AC8）；`notes_test` 84/84。
+
+- 2026-11-23（PM-39 / #989）：新增 `validate_merge_modes`，在 `Merge` 分派与取锁之前拒绝：多个控制形式、控制形式配 `-s/--strategy`（`cannot mix --commit, --abort, --quit or -s/--strategy`）、控制形式带位置 ref（`too many arguments...`），均 `LBR-CLI-002`；移除 clap 层 `conflicts_with`（其错误不含稳定码）。回归：`notes_merge_mode_validation`（AC1–AC8，含既有锁存在时仍报 CLI-002）；`notes_test` 85/85。

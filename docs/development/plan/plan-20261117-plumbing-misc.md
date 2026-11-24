@@ -1421,7 +1421,7 @@ PY
 ### Task PM-39: `notes merge` 控制形式与选项互斥（#989；自 PM-23 拆出）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-23：新增 `validate_merge_modes`，在 `Merge` 分支与取锁之前拒绝——多个控制形式、控制形式配 `-s/--strategy`、控制形式带位置 ref，全部 `LBR-CLI-002`（Git 文案 `cannot mix ...`/`too many arguments` 语义）；移除 clap 层 `conflicts_with`（clap 冲突错误不含稳定码）；`-s/--strategy <ref>` 仍是普通策略合并。AC1–AC8 由 `command::notes_test::notes_merge_mode_validation` 覆盖（AC1 以既有 `NOTES_MERGE_LOCK` 证明校验先于取锁）；`notes_test` 85/85；EN/zh/开发文档与 `COMPATIBILITY.md` 的 `notes` 行同步；网站按家族规则只做后端本地签名提交（未推送，推送与部署核验由 `PM-24` 执行）。
 **Description:** 自 `PM-23` 拆出：`--commit`、`--abort`、`--quit` 三种控制形式两两互斥，且都不得与 `-s/--strategy` 或 `<notes-ref>` 位置参数同用，违者在取锁之前（因而先于任何状态读写——状态读写都在持锁之后进行）以 `LBR-CLI-002` 拒绝（Git：`cannot mix --commit, --abort or -s/--strategy` 与 `too many arguments`）；`-s/--strategy` 与 `<notes-ref>` 同用仍是正常的策略合并，行为不变（既有 `--strategy=theirs refs/notes/other` 用例由 `notes_test` 回归组守护）。
 **Out of scope:** 三种控制形式各自的语义（`PM-29`、`PM-38`、`PM-23`）；`--quit` 与 Git 选项集合的其它组合（`--quit` 为 Libra 扩展，只按本卡规则互斥）；`--quit refs/notes/other`（与 AC4、AC5 共用同一「控制形式不得带位置参数」校验，不单独验收）。
 **Current evidence:**
