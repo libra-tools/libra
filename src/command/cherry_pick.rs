@@ -872,6 +872,19 @@ pub async fn execute_safe(args: CherryPickArgs, output: &OutputConfig) -> CliRes
     if !(args.continue_pick || args.skip || args.abort || args.quit) {
         sequencer::ensure_none_in_progress(SequenceKind::CherryPick).await?;
     }
+    let mut args = args;
+    // SA-07c: Git rewrites only the FIRST revision argument when it is `-` to
+    // the previous checkout target (`@{-1}`); other positions stay literal.
+    if args.commits.first().is_some_and(|first| first == "-") {
+        let target = crate::command::switch::resolve_previous_checkout_target()
+            .await
+            .map_err(CliError::from)?;
+        let commit = match target {
+            crate::command::switch::PreviousCheckoutTarget::Branch { commit, .. } => commit,
+            crate::command::switch::PreviousCheckoutTarget::Detached { commit } => commit,
+        };
+        args.commits[0] = commit.to_string();
+    }
     let result = run_cherry_pick(args, output)
         .await
         .map_err(CliError::from)?;

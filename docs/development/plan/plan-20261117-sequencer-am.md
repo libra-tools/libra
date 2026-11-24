@@ -1044,7 +1044,7 @@ job 集合以执行当日按模板 ER-04「仓库配置与 CI 展开规则」现
 ### Task SA-07c: `libra cherry-pick -` 与 `-s -`（#728 验收项 4、5 的核心断言，`t3501#12` 形态）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-23：仅当第一个修订位置参数恰为 `-` 时改写为上一次检出目标（复用 `switch::resolve_previous_checkout_target` 并直接取其 commit），其余位置仍按普通修订解析；`-s -` 组合生效；导航记录错误原样透传（不可用 `LBR-CLI-003`、读取失败 `LBR-IO-001`、损坏 `LBR-REPO-002`，后两者登记 `DEFER-SA-23`）。AC1–AC3/AC6 由 `cherry_pick_previous_branch_shorthand` 覆盖（`-` 与具名分支同树、无导航记录 `LBR-CLI-003`、非首位 `-` `LBR-CLI-003`）；AC4–AC5 由 `cherry_pick_t3501_12_signoff_dash_tc0484` 覆盖（`checkout -b` 成功、`-s -` 结果与 Git 一致含签名尾注）；`cherry_pick_test` 92/92、`compat_noninteractive_history_controls` 33/33；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计，故未执行计划要求的独立评审门。
 **Description:** 自 `SA-07` 拆出：`cherry-pick` 只把**第一个**修订位置参数恰为 `-` 时解析为上一次检出目标（与 Git 一致：`builtin/revert.c` 的 `parse_args` 只把选项之后的 `argv[1]` 的 `-` 改写为 `@{-1}`；复用 `switch.rs` 的 `resolve_previous_checkout_target`，不复制 reflog 逻辑），其余位置的 `-` 按普通修订解析；`-s`/`--signoff` 在前时同样生效；以 `t3501#12`（`TC-0484`）形态的端到端用例验收 #728 验收项 4、5 的核心断言（`checkout -b side-branch` 成功、`cherry-pick -s -` 的结果与 Git 对照一致）；#728 验收项 6（上游 `t3501#12` 全量与 `TC-0484` 通过）登记 `DEFER-SA-13`。`resolve_previous_checkout_target` 返回的错误原样透传（不得折叠为 `LBR-CLI-003`）：上一检出导航记录读取失败为 `LBR-IO-001`（`previous_checkout_read_error`，`src/command/switch.rs:445-454`），记录损坏或目标无效为 `LBR-REPO-002`（`previous_checkout_invalid_error`，`src/command/switch.rs:456-465`），两条路径的专项验收（需构造不可读或损坏的导航记录）登记 `DEFER-SA-23`。
 **Out of scope:** `revert -`（Git 经同一 `parse_args` 支持，#728 只要求 `cherry-pick -`，登记 `DEFER-SA-10`）；`A..B` 中的 `-`（永久非目标：Git 不接受）；上一检出导航记录不可读或损坏时的错误透传专项验收（`DEFER-SA-23`）。
 

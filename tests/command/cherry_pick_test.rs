@@ -5759,3 +5759,142 @@ fn cherry_pick_empty_drop_show_message_matches_git() {
         "AC3 show --pretty=format:%B parity"
     );
 }
+
+/// SA-07c: `cherry-pick -` resolves the previous checkout target.
+#[test]
+fn cherry_pick_previous_branch_shorthand() {
+    let repo = tempdir().expect("repo");
+    let p = repo.path();
+    init_repo_via_cli(p);
+    configure_identity_via_cli(p);
+    std::fs::write(p.join("base.txt"), "base\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "base.txt"], p), "add base");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], p),
+        "commit base",
+    );
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "side"], p),
+        "branch side",
+    );
+    std::fs::write(p.join("side.txt"), "side\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "side.txt"], p), "add side");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "side change", "--no-verify"], p),
+        "commit side",
+    );
+    assert_cli_success(&run_libra_command(&["switch", "main"], p), "back to main");
+    std::fs::write(p.join("main.txt"), "main\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "main.txt"], p), "add main");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "main change", "--no-verify"], p),
+        "commit main",
+    );
+    let mine = cp_rev_parse(p, "HEAD");
+
+    // AC1: `-` (previous checkout = side) produces the same tree as naming side.
+    let picked = run_libra_command(&["cherry-pick", "-"], p);
+    assert_cli_success(&picked, "AC1 cherry-pick -");
+    let dash_tree = cp_rev_parse(p, "HEAD^{tree}");
+    assert_cli_success(
+        &run_libra_command(&["reset", "--hard", &mine], p),
+        "reset to main",
+    );
+    let named = run_libra_command(&["cherry-pick", "side"], p);
+    assert_cli_success(&named, "AC1 cherry-pick side");
+    assert_eq!(cp_rev_parse(p, "HEAD^{tree}"), dash_tree, "AC1 tree parity");
+    assert_cli_success(
+        &run_libra_command(&["reset", "--hard", &mine], p),
+        "reset again",
+    );
+
+    // AC6: a non-first `-` is an ordinary (invalid) revision.
+    let late = run_libra_command(&["cherry-pick", "side", "-"], p);
+    assert!(!late.status.success(), "AC6 must fail");
+    let (_human, report) = parse_cli_error_stderr(&late.stderr);
+    assert_eq!(report.error_code, "LBR-CLI-003", "AC6 code");
+
+    // AC3: no previous checkout navigation record.
+    let fresh = tempdir().expect("fresh");
+    init_repo_via_cli(fresh.path());
+    configure_identity_via_cli(fresh.path());
+    std::fs::write(fresh.path().join("only.txt"), "only\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "only.txt"], fresh.path()),
+        "add only",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "only", "--no-verify"], fresh.path()),
+        "commit only",
+    );
+    let missing = run_libra_command(&["cherry-pick", "-"], fresh.path());
+    assert!(!missing.status.success(), "AC3 must fail");
+    let (_human, report) = parse_cli_error_stderr(&missing.stderr);
+    assert_eq!(report.error_code, "LBR-CLI-003", "AC3 code");
+}
+
+/// SA-07c: `cherry-pick -s -` after `checkout -b` matches Git (t3501#12).
+#[test]
+fn cherry_pick_t3501_12_signoff_dash_tc0484() {
+    use std::process::Command;
+
+    let script = |libra: bool, root: &std::path::Path| -> (String, String) {
+        let run = |args: &[&str]| {
+            let out = if libra {
+                let mut cmd = Command::new(env!("CARGO_BIN_EXE_libra"));
+                cmd.args(args).current_dir(root);
+                cmd.env("GIT_AUTHOR_NAME", "t")
+                    .env("GIT_AUTHOR_EMAIL", "t@t")
+                    .env("GIT_COMMITTER_NAME", "t")
+                    .env("GIT_COMMITTER_EMAIL", "t@t");
+                cmd.output().expect("libra")
+            } else {
+                let mut cmd = Command::new("git");
+                cmd.args(args).current_dir(root);
+                cmd.env("GIT_AUTHOR_NAME", "t")
+                    .env("GIT_AUTHOR_EMAIL", "t@t")
+                    .env("GIT_COMMITTER_NAME", "t")
+                    .env("GIT_COMMITTER_EMAIL", "t@t")
+                    .env("HOME", root);
+                cmd.output().expect("git")
+            };
+            assert!(out.status.success(), "{args:?}: {out:?}");
+            out
+        };
+        run(&["init", "-q", "-b", "main", "."]);
+        run(&["config", "user.name", "t"]);
+        run(&["config", "user.email", "t@t"]);
+        std::fs::write(root.join("f"), "1\n").unwrap();
+        run(&["add", "f"]);
+        run(&["commit", "-q", "-m", "base"]);
+        run(&["switch", "-q", "-c", "side"]);
+        std::fs::write(root.join("s.txt"), "side\n").unwrap();
+        run(&["add", "s.txt"]);
+        run(&["commit", "-q", "-m", "side change"]);
+        run(&["switch", "-q", "main"]);
+        std::fs::write(root.join("f"), "2\n").unwrap();
+        run(&["add", "f"]);
+        run(&["commit", "-q", "-m", "main change"]);
+        run(&["switch", "-q", "side"]);
+        // AC4: creating the branch must succeed. Branch from the commit before
+        // side's change so picking the previous checkout (side) is non-empty.
+        run(&["checkout", "-b", "side-branch", "HEAD~1"]);
+        run(&["cherry-pick", "-s", "-"]);
+        let file = String::from_utf8_lossy(&std::fs::read(root.join("f")).unwrap()).to_string();
+        let message =
+            String::from_utf8_lossy(&run(&["show", "--no-patch", "--pretty=%B", "HEAD"]).stdout)
+                .to_string();
+        (file, message)
+    };
+
+    let libra_root = tempdir().expect("libra root");
+    let (libra_file, libra_message) = script(true, libra_root.path());
+    let git_root = tempdir().expect("git root");
+    let (git_file, git_message) = script(false, git_root.path());
+    assert_eq!(
+        libra_message, git_message,
+        "AC5 signoff message matches Git"
+    );
+    assert_eq!(libra_file, git_file, "AC5 result file matches Git");
+    assert_eq!(libra_file, "1\n", "AC5 base content preserved");
+}
