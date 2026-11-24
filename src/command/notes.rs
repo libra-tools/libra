@@ -925,6 +925,18 @@ impl From<NotesCliError> for CliError {
                 notes::NotesError::UnsupportedStrategy(_) => CliError::command_usage(message)
                     .with_stable_code(StableErrorCode::CliInvalidArguments)
                     .with_hint("valid strategies: manual, ours, theirs, union, cat_sort_uniq"),
+                notes::NotesError::MergeInProgress => CliError::fatal(message)
+                    .with_stable_code(StableErrorCode::RepoStateInvalid)
+                    .with_hint(
+                        "another notes merge is unfinished; resolve it or run 'libra notes merge --abort'.",
+                    ),
+                notes::NotesError::MergeLocked(path) => CliError::fatal(message)
+                    .with_stable_code(StableErrorCode::ConflictOperationBlocked)
+                    .with_hint(format!(
+                        "confirm no notes merge is running, then delete '{path}'."
+                    )),
+                notes::NotesError::MergeStateIo { .. } => CliError::fatal(message)
+                    .with_stable_code(StableErrorCode::IoWriteFailed),
                 notes::NotesError::MergeRaced { .. } => CliError::failure(message)
                     .with_stable_code(StableErrorCode::ConflictOperationBlocked)
                     .with_hint("another writer changed the notes during the merge; re-run it"),

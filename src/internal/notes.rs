@@ -12,6 +12,181 @@ use crate::{internal::db::get_db_conn_instance, utils::util};
 /// Default notes ref namespace.
 pub const DEFAULT_NOTES_REF: &str = "refs/notes/commits";
 
+/// Merge bookkeeping lives beside the worktree gitdir, like Git's
+/// `NOTES_MERGE_*` files.
+pub const NOTES_MERGE_WORKTREE: &str = "NOTES_MERGE_WORKTREE";
+pub const NOTES_MERGE_STATE: &str = "NOTES_MERGE_STATE";
+pub const NOTES_MERGE_LOCK: &str = "NOTES_MERGE_LOCK";
+pub const NOTES_MERGE_COMMITTING: &str = "NOTES_MERGE_COMMITTING";
+
+/// One conflict entry: the target-side value before the merge and the source
+/// value the merge wanted to apply (both blob ids).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct NotesMergeConflictEntry {
+    pub object: String,
+    pub before: String,
+    pub source: String,
+}
+
+/// One entry that is copied because the target ref has no note for the object.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct NotesMergeCopyEntry {
+    pub object: String,
+    pub source: String,
+}
+
+/// Versioned `NOTES_MERGE_STATE` payload.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct NotesMergeState {
+    pub version: u32,
+    pub target_ref: String,
+    pub source_ref: String,
+    pub to_copy: Vec<NotesMergeCopyEntry>,
+    pub conflicts: Vec<NotesMergeConflictEntry>,
+}
+
+impl NotesMergeState {
+    pub const VERSION: u32 = 1;
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>, NotesError> {
+        serde_json::to_vec_pretty(self).map_err(|error| NotesError::MergeStateIo {
+            path: NOTES_MERGE_STATE.to_string(),
+            detail: error.to_string(),
+        })
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, NotesError> {
+        serde_json::from_slice(bytes).map_err(|error| NotesError::MergeStateIo {
+            path: NOTES_MERGE_STATE.to_string(),
+            detail: error.to_string(),
+        })
+    }
+}
+
+/// Exclusive `NOTES_MERGE_LOCK`; removed on drop, including error paths.
+pub struct NotesMergeLock {
+    path: std::path::PathBuf,
+}
+
+impl NotesMergeLock {
+    pub fn acquire() -> Result<Self, NotesError> {
+        let path = merge_state_dir()?.join(NOTES_MERGE_LOCK);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(_) => Ok(Self { path }),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                Err(NotesError::MergeLocked(path.display().to_string()))
+            }
+            Err(error) => Err(NotesError::MergeStateIo {
+                path: path.display().to_string(),
+                detail: error.to_string(),
+            }),
+        }
+    }
+}
+
+impl Drop for NotesMergeLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn merge_state_dir() -> Result<std::path::PathBuf, NotesError> {
+    util::request_worktree_gitdir().map_err(|error| NotesError::MergeStateIo {
+        path: "<worktree gitdir>".to_string(),
+        detail: error.to_string(),
+    })
+}
+
+/// Any leftover merge file blocks a new merge (Git's "in progress" contract).
+pub fn ensure_no_merge_in_progress() -> Result<(), NotesError> {
+    let dir = merge_state_dir()?;
+    for name in [
+        NOTES_MERGE_STATE,
+        NOTES_MERGE_WORKTREE,
+        NOTES_MERGE_COMMITTING,
+    ] {
+        if dir.join(name).exists() {
+            return Err(NotesError::MergeInProgress);
+        }
+    }
+    Ok(())
+}
+
+/// Materialize a manual conflict: the conflict worktree (exclusive), one
+/// `<oid>` file per conflict, then the atomic versioned state file.
+fn write_manual_conflict_state(
+    target_ref: &str,
+    source_ref: &str,
+    to_copy: &[(String, String)],
+    conflicts: &[(String, String, String)],
+) -> Result<(), NotesError> {
+    let dir = merge_state_dir()?;
+    let worktree = dir.join(NOTES_MERGE_WORKTREE);
+    std::fs::create_dir(&worktree).map_err(|error| NotesError::MergeStateIo {
+        path: worktree.display().to_string(),
+        detail: error.to_string(),
+    })?;
+    for (object, before, source) in conflicts {
+        let body = conflict_marker_body(target_ref, before, source_ref, source)?;
+        let path = worktree.join(object);
+        std::fs::write(&path, body).map_err(|error| NotesError::MergeStateIo {
+            path: path.display().to_string(),
+            detail: error.to_string(),
+        })?;
+    }
+    let state = NotesMergeState {
+        version: NotesMergeState::VERSION,
+        target_ref: target_ref.to_string(),
+        source_ref: source_ref.to_string(),
+        to_copy: to_copy
+            .iter()
+            .map(|(object, source)| NotesMergeCopyEntry {
+                object: object.clone(),
+                source: source.clone(),
+            })
+            .collect(),
+        conflicts: conflicts
+            .iter()
+            .map(|(object, before, source)| NotesMergeConflictEntry {
+                object: object.clone(),
+                before: before.clone(),
+                source: source.clone(),
+            })
+            .collect(),
+    };
+    let path = dir.join(NOTES_MERGE_STATE);
+    crate::utils::atomic_write::write_atomic(&path, &state.to_bytes()?, true).map_err(|error| {
+        NotesError::MergeStateIo {
+            path: path.display().to_string(),
+            detail: error.to_string(),
+        }
+    })
+}
+
+fn conflict_marker_body(
+    target_ref: &str,
+    before_blob: &str,
+    source_ref: &str,
+    source_blob: &str,
+) -> Result<String, NotesError> {
+    let ensure_newline = |text: String| {
+        if text.ends_with('\n') {
+            text
+        } else {
+            format!("{text}\n")
+        }
+    };
+    let before = ensure_newline(load_blob_text(before_blob)?);
+    let source = ensure_newline(load_blob_text(source_blob)?);
+    Ok(format!(
+        "<<<<<<< {target_ref}\n{before}=======\n{source}>>>>>>> {source_ref}\n"
+    ))
+}
+
 /// Normalize a user-supplied notes ref. Short names (e.g. `review`) are
 /// expanded to `refs/notes/<name>` for Git compatibility; refs that already
 /// start with `refs/notes/` pass through unchanged. Any other fully-qualified
@@ -93,6 +268,18 @@ pub enum NotesError {
 
     #[error("note for '{object}' changed concurrently during merge; re-run the merge")]
     MergeRaced { object: String },
+    #[error(
+        "a notes merge is already in progress; resolve it or run 'libra notes merge --abort' first"
+    )]
+    MergeInProgress,
+
+    #[error(
+        "another notes merge holds the lock at {0}; confirm no notes merge is running and delete that file"
+    )]
+    MergeLocked(String),
+
+    #[error("failed to access notes merge state at {path}: {detail}")]
+    MergeStateIo { path: String, detail: String },
 }
 
 impl From<std::io::Error> for NotesError {
@@ -489,6 +676,9 @@ pub async fn merge(
 ) -> Result<MergeNotesResult, NotesError> {
     validate_notes_ref(notes_ref)?;
     validate_notes_ref(other_ref)?;
+    // All merge forms take the same worktree-scoped lock before touching state.
+    let _lock = NotesMergeLock::acquire()?;
+    ensure_no_merge_in_progress()?;
     let db = get_db_conn_instance().await;
 
     let other_rows = db
@@ -513,11 +703,14 @@ pub async fn merge(
         }
     }
 
-    // `Manual` aborts (changing nothing) when any conflict remains.
+    // `Manual` leaves the `notes` table untouched and materializes the conflict
+    // worktree plus the versioned state file for hand resolution.
     if strategy == NoteMergeStrategy::Manual && !conflicts.is_empty() {
+        write_manual_conflict_state(notes_ref, other_ref, &to_copy, &conflicts)?;
+        let objects = conflicts.into_iter().map(|(object, ..)| object).collect();
         return Err(NotesError::MergeConflict {
             notes_ref: notes_ref.to_string(),
-            objects: conflicts.into_iter().map(|(object, ..)| object).collect(),
+            objects,
         });
     }
 

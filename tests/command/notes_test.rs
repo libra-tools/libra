@@ -1378,6 +1378,15 @@ fn notes_edit_sets_and_replaces_note() {
     assert!(!shown.contains("first"), "old note text is gone: {shown:?}");
 }
 
+/// PM-09: a manual conflict now leaves `NOTES_MERGE_*` state; these legacy
+/// strategy tests clean it up so the later merges in the same test can run.
+fn clear_notes_merge_state(repo: &std::path::Path) {
+    let dir = repo.join(".libra");
+    let _ = std::fs::remove_dir_all(dir.join("NOTES_MERGE_WORKTREE"));
+    let _ = std::fs::remove_file(dir.join("NOTES_MERGE_STATE"));
+    let _ = std::fs::remove_file(dir.join("NOTES_MERGE_COMMITTING"));
+}
+
 #[test]
 fn test_notes_merge_strategies_copy_and_manual_conflict() {
     // `notes merge <other-ref>` is a 2-way merge of the flat notes rows: copy
@@ -1454,6 +1463,7 @@ fn test_notes_merge_strategies_copy_and_manual_conflict() {
             .success(),
         "manual abort applies nothing, including the copy"
     );
+    clear_notes_merge_state(p);
 
     // --strategy=theirs: HEAD takes the other note, HEAD~1 is copied.
     assert_cli_success(
@@ -1561,6 +1571,7 @@ fn test_notes_merge_ours_cat_sort_uniq_and_manual_code() {
         report.error_code, "LBR-CONFLICT-002",
         "manual notes conflict should carry the conflict-blocked stable code"
     );
+    clear_notes_merge_state(p);
 
     // --strategy=cat_sort_uniq combines, sorts, and de-duplicates the lines.
     std::fs::write(p.join("cur.txt"), "banana\napple\n").unwrap();
@@ -2069,4 +2080,145 @@ fn notes_default_ref_follows_config_scopes() {
     set(&["--system"], "refs/notes/sys");
     assert_eq!(get_ref(), "refs/notes/sys\n", "AC5");
     unset(&["--system"]);
+}
+
+/// PM-09: a manual conflict materializes `NOTES_MERGE_WORKTREE/<oid>` and the
+/// versioned `NOTES_MERGE_STATE`, and every leftover blocks a new merge.
+#[test]
+fn notes_merge_manual_conflict_materializes_state() {
+    let repo = tempdir().expect("failed to create repository root");
+    init_repo_via_cli(repo.path());
+    configure_identity_via_cli(repo.path());
+    let p = repo.path();
+    std::fs::write(p.join("a.txt"), "a\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "a.txt"], p), "add a");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c1", "--no-verify"], p),
+        "commit c1",
+    );
+    std::fs::write(p.join("b.txt"), "b\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "b.txt"], p), "add b");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c2", "--no-verify"], p),
+        "commit c2",
+    );
+    let c1 = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD~1"], p).stdout)
+        .trim()
+        .to_string();
+    let c2 = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], p).stdout)
+        .trim()
+        .to_string();
+    assert_cli_success(
+        &run_libra_command(&["notes", "add", "-m", "x", &c1], p),
+        "notes add x",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &["notes", "--ref", "refs/notes/other", "add", "-m", "y", &c1],
+            p,
+        ),
+        "notes other y",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "notes",
+                "--ref",
+                "refs/notes/other",
+                "add",
+                "-m",
+                "only other",
+                &c2,
+            ],
+            p,
+        ),
+        "notes other c2",
+    );
+    let blob = |text: &str| {
+        let out = run_libra_command_with_stdin(&["hash-object", "--stdin"], p, text);
+        assert_cli_success(&out, "hash-object");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let blob_x = blob("x");
+    let blob_y = blob("y");
+    let blob_only = blob("only other");
+    let gitdir = p.join(".libra");
+
+    // AC1: the stable conflict code is unchanged.
+    let merge = run_libra_command(&["notes", "merge", "refs/notes/other"], p);
+    assert!(!merge.status.success(), "AC1 must fail");
+    assert!(
+        String::from_utf8_lossy(&merge.stderr).contains("LBR-CONFLICT-002"),
+        "AC1 code"
+    );
+
+    // AC2: the conflict file carries Git's marker format.
+    let conflict = std::fs::read_to_string(gitdir.join("NOTES_MERGE_WORKTREE").join(&c1))
+        .expect("AC2 conflict file");
+    assert_eq!(
+        conflict, "<<<<<<< refs/notes/commits\nx\n=======\ny\n>>>>>>> refs/notes/other\n",
+        "AC2"
+    );
+
+    // AC3: the target ref is untouched (no conflict write, no copied entry).
+    let shown = run_libra_command(&["notes", "--ref", "refs/notes/commits", "show", &c1], p);
+    assert_cli_success(&shown, "AC3 existing note");
+    assert_eq!(String::from_utf8_lossy(&shown.stdout), "x", "AC3 note body");
+    let copied = run_libra_command(&["notes", "--ref", "refs/notes/commits", "show", &c2], p);
+    assert!(!copied.status.success(), "AC3 nothing copied");
+
+    // AC4: the versioned state records both sides exactly.
+    let state_text =
+        std::fs::read_to_string(gitdir.join("NOTES_MERGE_STATE")).expect("AC4 state file");
+    let state: serde_json::Value = serde_json::from_str(&state_text).expect("AC4 JSON");
+    assert_eq!(state["version"], 1, "AC4 version");
+    assert_eq!(state["target_ref"], "refs/notes/commits", "AC4 target");
+    assert_eq!(state["source_ref"], "refs/notes/other", "AC4 source");
+    assert_eq!(
+        state["conflicts"],
+        serde_json::json!([{"object": c1, "before": blob_x, "source": blob_y}]),
+        "AC4 conflicts"
+    );
+    assert_eq!(
+        state["to_copy"],
+        serde_json::json!([{"object": c2, "source": blob_only}]),
+        "AC4 copies"
+    );
+
+    // AC5: any state blocks a new merge.
+    let again = run_libra_command(&["notes", "merge", "refs/notes/other"], p);
+    assert!(!again.status.success(), "AC5 must fail");
+    assert!(
+        String::from_utf8_lossy(&again.stderr).contains("LBR-REPO-003"),
+        "AC5 code"
+    );
+
+    // AC6: only the worktree (a crash before STATE) still blocks.
+    std::fs::remove_file(gitdir.join("NOTES_MERGE_STATE")).unwrap();
+    let orphan = run_libra_command(&["notes", "merge", "refs/notes/other"], p);
+    assert!(!orphan.status.success(), "AC6 must fail");
+    assert!(
+        String::from_utf8_lossy(&orphan.stderr).contains("LBR-REPO-003"),
+        "AC6 code"
+    );
+    std::fs::remove_dir_all(gitdir.join("NOTES_MERGE_WORKTREE")).unwrap();
+
+    // AC7: an existing lock refuses before touching any state.
+    std::fs::write(gitdir.join("NOTES_MERGE_LOCK"), b"").unwrap();
+    let locked = run_libra_command(&["notes", "merge", "refs/notes/other"], p);
+    assert!(!locked.status.success(), "AC7 must fail");
+    assert!(
+        String::from_utf8_lossy(&locked.stderr).contains("LBR-CONFLICT-002"),
+        "AC7 code"
+    );
+    std::fs::remove_file(gitdir.join("NOTES_MERGE_LOCK")).unwrap();
+
+    // AC8: a lone commit-in-progress marker also blocks a new merge.
+    std::fs::write(gitdir.join("NOTES_MERGE_COMMITTING"), b"").unwrap();
+    let committing = run_libra_command(&["notes", "merge", "refs/notes/other"], p);
+    assert!(!committing.status.success(), "AC8 must fail");
+    assert!(
+        String::from_utf8_lossy(&committing.stderr).contains("LBR-REPO-003"),
+        "AC8 code"
+    );
 }

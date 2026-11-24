@@ -234,8 +234,19 @@ to do Git's true 3-way merge — this is a 2-way merge: objects annotated only i
 the other ref are copied, identical notes are skipped, and an object with a
 differing note on both sides is a conflict resolved by `--strategy`:
 
-- `manual` (default): abort the whole merge if any note conflicts (Libra has no
-  NOTES_MERGE worktree for hand resolution).
+- `manual` (default): when any note conflicts, the `notes` table is left
+  untouched and the conflict is materialized under the worktree gitdir:
+  `NOTES_MERGE_WORKTREE/<oid>` holds Git-style conflict markers
+  (`<<<<<<< <target-ref>` … `=======` … `>>>>>>> <source-ref>`, each side
+  terminated with a newline) and `NOTES_MERGE_STATE` (version 1 JSON) records the
+  target ref, source ref, the entries to copy and the per-conflict before/source
+  blob ids. The command still fails with `LBR-CONFLICT-002`.
+  `NOTES_MERGE_WORKTREE`/`NOTES_MERGE_STATE`/`NOTES_MERGE_COMMITTING` left over
+  from an unfinished merge make a new merge fail with `LBR-REPO-003`. Every
+  `notes merge` form takes an exclusive `NOTES_MERGE_LOCK` first and removes it
+  when it finishes; an existing lock fails with `LBR-CONFLICT-002` before any
+  state is read or written (a stale lock is removed by hand after confirming no
+  merge is running — the hint prints its path).
 - `ours` / `theirs`: keep the current note / take the other ref's note.
 - `union`: concatenate both note contents.
 - `cat_sort_uniq`: concatenate, then sort and de-duplicate the combined lines.
