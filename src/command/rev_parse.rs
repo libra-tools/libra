@@ -89,6 +89,19 @@ pub struct RevParseArgs {
     #[clap(long = "show-toplevel", conflicts_with_all = ["abbrev_ref", "short", "spec"])]
     pub show_toplevel: bool,
 
+    /// Print the repository's object format (`storage`, `input`, `output` all
+    /// report `core.objectformat`); `compat` prints an empty line because Libra
+    /// has no compatibility hash.
+    #[clap(
+        long = "show-object-format",
+        value_name = "mode",
+        require_equals = true,
+        num_args = 0..=1,
+        default_missing_value = "storage",
+        conflicts_with_all = ["show_toplevel", "spec"]
+    )]
+    pub show_object_format: Option<String>,
+
     /// Verify that the revision resolves to exactly one object; fail (exit 128) otherwise.
     /// With the global `-q`/`--quiet`, failure is silent with exit code 1.
     #[clap(long, conflicts_with_all = ["show_toplevel", "abbrev_ref", "is_inside_work_tree", "is_inside_git_dir", "is_bare_repository", "git_dir", "absolute_git_dir"])]
@@ -520,6 +533,29 @@ fn write_rev_parse_output<W: Write>(writer: &mut W, value: &str) -> CliResult<()
 }
 
 async fn resolve_rev_parse(spec: &str, args: &RevParseArgs) -> CliResult<RevParseOutput> {
+    if let Some(mode) = &args.show_object_format {
+        let value = match mode.as_str() {
+            // Libra has one storage/input/output hash, so all three report it.
+            "storage" | "input" | "output" => {
+                crate::internal::object_format::as_str(git_internal::hash::get_hash_kind())
+                    .to_string()
+            }
+            // Git prints nothing for `compat` when no compatibility hash exists.
+            "compat" => String::new(),
+            other => {
+                return Err(CliError::command_usage(format!(
+                    "unknown --show-object-format mode '{other}': expected storage, input, output, or compat"
+                ))
+                .with_stable_code(StableErrorCode::CliInvalidArguments));
+            }
+        };
+        return Ok(RevParseOutput {
+            mode: "show_object_format",
+            input: None,
+            value,
+        });
+    }
+
     if args.show_toplevel {
         let workdir = resolve_show_toplevel_path().await?;
         return Ok(RevParseOutput {

@@ -921,7 +921,7 @@ PY
 ### Task PM-06: 支持 `rev-parse --show-object-format[=storage|input|output|compat]`（#947）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-23：`RevParseArgs` 新增 `--show-object-format`（`require_equals`、`num_args=0..=1`、`default_missing_value=storage`、与 `spec`/`--show-toplevel` 互斥），`resolve_rev_parse` 首部分派：`storage`/`input`/`output` 输出 `object_format::as_str(get_hash_kind())`，`compat` 输出空行，其它取值 `LBR-CLI-002`；`--json` 沿用 `{mode,input,value}`（`mode=show_object_format`）。AC1–AC8 由 `command::rev_parse_test::rev_parse_show_object_format_modes` 覆盖；EN/zh/开发文档与 `COMPATIBILITY.md` 的 `rev-parse` 行同步。
 **Description:** 为 `RevParseArgs` 新增查询模式 `--show-object-format[=<mode>]`（`require_equals`，与 `spec` 互斥，同其它查询模式一样不解析修订）：`storage`（默认）、`input`、`output` 输出当前仓库 `core.objectformat`，`compat` 输出空行（Libra 无兼容哈希），其它取值以 `LBR-CLI-002` 拒绝；`--json` 输出 `mode` 为 `show_object_format` 的既有查询信封。
 **Out of scope:** `--show-ref-format`/`--show-ref-storage-format`（`plan-20261117-clone.md` 的 `CL-14`）；`blake3` 仓库（Libra 扩展，同样原样输出 `core.objectformat`，不单独验收）、子目录执行（沿用查询模式既有的仓库发现）、空取值 `--show-object-format=` 与和修订参数同用时的 clap 互斥（Git 会按参数顺序交错输出，有意差异），均不单独验收；全局 `-C`（尚未排期，重启条件：#686 立项）。
 **Current evidence:**

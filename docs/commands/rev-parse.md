@@ -83,6 +83,7 @@ suffix). The `refs/`-qualified forms (`refs/tags/`, `refs/heads/`,
 | Flag | Description |
 |------|-------------|
 | `--verify` | Assert that `<SPEC>` resolves to exactly one object; print it, or exit 128 on failure (silent exit 1 under the global `--quiet` / `-q`). |
+| `--show-object-format[=<mode>]` | Print the repository's object format (`sha1`, `sha256`, or Libra's `blake3`). `storage` (the default), `input`, and `output` all report `core.objectformat`; `compat` prints an empty line because Libra has no compatibility hash. Other modes are `LBR-CLI-002`. Mutually exclusive with a SPEC. |
 | `--short[=<n>]` | Print a non-ambiguous abbreviated object ID: start at `<n>` (default 7, minimum 4) and lengthen digit by digit until no OTHER object shares the prefix. A full-length object ID of the repository's hash kind is accepted even when the object is absent (Git abbreviates it anyway); `--verify --short` keeps that behaviour, while `--verify` without `--short` still requires the object to exist. |
 | `--sq` | Shell-quote the resolved object name (single-quoted) for safe shell consumption. Only affects the resolved-revision output, not query modes like `--show-toplevel`. |
 | `--abbrev-ref` | Print the symbolic branch name instead of a commit hash. |

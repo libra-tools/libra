@@ -41,6 +41,7 @@ libra rev-parse --show-ref-storage-format
 | 标志 | 说明 |
 |------|-------------|
 | `--verify` | 断言 `<SPEC>` 恰好解析为一个实际存在的对象；成功时打印对象 ID，失败退出 128（全局 `--quiet` / `-q` 下静默退出 1）。 |
+| `--show-object-format[=<mode>]` | 打印仓库的对象格式（`sha1`、`sha256`，或 Libra 的 `blake3`）。`storage`（默认）、`input`、`output` 均报告 `core.objectformat`；`compat` 输出一个空行（Libra 没有兼容哈希）；其它取值以 `LBR-CLI-002` 拒绝。与 SPEC 互斥。 |
 | `--short[=<n>]` | 打印无歧义的缩写对象 ID：从 `<n>`（默认 7，最小 4）开始逐位加长，直到没有**其它**对象共享该前缀。当前哈希长度的全长对象 ID，即使对象不在库中也接受（Git 同样会缩写）；`--verify --short` 保持该行为，而 `--verify` 不带 `--short` 仍要求对象存在。 |
 | `--sq` | 对解析出的对象名做单引号 shell 引用，便于安全地交给 shell 消费。仅影响解析出的修订输出，不影响 `--show-toplevel` 等查询模式。 |
 | `--abbrev-ref` | 打印符号分支名，而不是提交哈希。 |

@@ -72,3 +72,5 @@ flowchart TD
 - 新增 Git 兼容参数时必须明确 tier、错误码、JSON/机器输出契约和回归测试。
 
 - 2026-11-23（PM-05 / #839）：`--short` 对当前哈希长度的全长十六进制不再要求对象存在（`--verify` 不带 `--short` 的存在性证明不变）；缩写改为 Git `repo_find_unique_abbrev` 语义——从请求长度（默认 7、下限 4、上限哈希长度）起逐位加长直到没有**其它**对象共享前缀，对象在库与否都适用。回归：`rev_parse_short_abbreviates_absent_full_oid`（AC1–AC3/AC8）、`rev_parse_short_rejects_invalid_specs`（AC4–AC7）；`rev_parse_test` 66/66。
+
+- 2026-11-23（PM-06 / #947）：新增查询模式 `--show-object-format[=storage|input|output|compat]`（`require_equals`、默认 `storage`、与 SPEC/`--show-toplevel` 互斥），前三种模式输出 `object_format::as_str(get_hash_kind())`，`compat` 输出空行，其它取值 `LBR-CLI-002`；`--json` 沿用 `{mode,input,value}` 信封（`mode=show_object_format`）。回归：`rev_parse_show_object_format_modes`（AC1–AC8）。

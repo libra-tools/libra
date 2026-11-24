@@ -2654,3 +2654,57 @@ fn rev_parse_short_rejects_invalid_specs() {
         );
     }
 }
+
+/// PM-06: `--show-object-format[=<mode>]`.
+#[test]
+fn rev_parse_show_object_format_modes() {
+    let sha1 = tempdir().expect("failed to create repository root");
+    init_repo_via_cli(sha1.path());
+    // AC1: the default mode reports the storage hash.
+    let out = run_libra_command(&["rev-parse", "--show-object-format"], sha1.path());
+    assert_cli_success(&out, "AC1");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "sha1\n", "AC1");
+
+    // AC6: `compat` prints a single empty line.
+    let out = run_libra_command(&["rev-parse", "--show-object-format=compat"], sha1.path());
+    assert_cli_success(&out, "AC6");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "\n", "AC6");
+
+    // AC7: unknown modes are usage errors.
+    let out = run_libra_command(&["rev-parse", "--show-object-format=bogus"], sha1.path());
+    assert!(!out.status.success(), "AC7 must fail");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("LBR-CLI-002"),
+        "AC7 code"
+    );
+
+    // AC8: the JSON envelope carries exactly {mode, input, value}.
+    let out = run_libra_command(
+        &["--json", "rev-parse", "--show-object-format"],
+        sha1.path(),
+    );
+    assert_cli_success(&out, "AC8");
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).expect("AC8 JSON");
+    assert_eq!(
+        json["data"],
+        serde_json::json!({"mode": "show_object_format", "input": null, "value": "sha1"}),
+        "AC8 data"
+    );
+
+    // AC2–AC5: a SHA-256 repository reports its format in every mode.
+    let sha256 = tempdir().expect("failed to create repository root");
+    assert_cli_success(
+        &run_libra_command(&["init", "--object-format", "sha256"], sha256.path()),
+        "init sha256",
+    );
+    for args in [
+        vec!["rev-parse", "--show-object-format"],
+        vec!["rev-parse", "--show-object-format=storage"],
+        vec!["rev-parse", "--show-object-format=input"],
+        vec!["rev-parse", "--show-object-format=output"],
+    ] {
+        let out = run_libra_command(&args, sha256.path());
+        assert_cli_success(&out, &format!("{args:?}"));
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "sha256\n", "{args:?}");
+    }
+}
