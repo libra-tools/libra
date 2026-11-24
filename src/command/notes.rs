@@ -34,9 +34,10 @@ pub struct NotesArgs {
     #[command(subcommand)]
     pub subcommand: Option<NotesSubcommand>,
 
-    /// Operate on a specific notes ref (default: refs/notes/commits)
-    #[clap(long, default_value = DEFAULT_NOTES_REF)]
-    pub ref_: String,
+    /// Operate on a specific notes ref (default: `core.notesRef`, else
+    /// `refs/notes/commits`).
+    #[clap(long)]
+    pub ref_: Option<String>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -250,6 +251,34 @@ pub struct NotesRemovedEntry {
 
 /// Bare `libra notes` lists notes. [`execute_safe`] and the census share this
 /// default; a missing subcommand is not a usage error.
+/// Resolve the effective notes ref: explicit `--ref` (normalized) wins, then
+/// `core.notesRef` (local → global → system, case-insensitive), then the
+/// default. A configured value is used verbatim, so every subcommand except
+/// `get-ref` rejects a value outside `refs/notes/` before any I/O.
+async fn resolve_notes_ref(args: &NotesArgs, is_get_ref: bool) -> CliResult<String> {
+    let resolved = if let Some(raw) = &args.ref_ {
+        notes::normalize_notes_ref(raw).map_err(|e| CliError::from(NotesCliError::from(e)))?
+    } else {
+        let configured = crate::internal::config::read_cascaded_config_value_strict(
+            crate::internal::config::LocalIdentityTarget::CurrentRepo,
+            "core.notesRef",
+        )
+        .await
+        .map_err(|error| {
+            CliError::fatal(format!("failed to read core.notesRef: {error:#}"))
+                .with_stable_code(StableErrorCode::IoReadFailed)
+        })?;
+        configured
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| DEFAULT_NOTES_REF.to_string())
+    };
+    if !is_get_ref {
+        notes::validate_notes_ref(&resolved).map_err(|e| CliError::from(NotesCliError::from(e)))?;
+    }
+    Ok(resolved)
+}
+
 fn default_notes_subcommand() -> NotesSubcommand {
     NotesSubcommand::List { object: None }
 }
@@ -300,9 +329,8 @@ pub async fn execute_safe(
     output: &OutputConfig,
     argv: &[String],
 ) -> CliResult<()> {
-    let notes_ref = &notes::normalize_notes_ref(&args.ref_)
-        .map_err(|e| CliError::from(NotesCliError::from(e)))?;
-
+    let is_get_ref = matches!(args.subcommand, Some(NotesSubcommand::GetRef));
+    let notes_ref = &resolve_notes_ref(&args, is_get_ref).await?;
     let subcommand = args.subcommand.unwrap_or_else(default_notes_subcommand);
 
     match subcommand {

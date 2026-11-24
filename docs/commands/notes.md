@@ -32,7 +32,7 @@ original commit hash stays unchanged. This makes them useful for post-hoc
 metadata such as code-review results, CI status, or deploy tracking.
 
 Notes are stored as blob objects under a notes ref (default
-`refs/notes/commits`). Use `--ref <ref>` to operate on a different namespace
+`refs/notes/commits`, or `core.notesRef` when set). Use `--ref <ref>` to operate on a different namespace
 (e.g., `refs/notes/review`).
 
 Omitting a subcommand defaults to `list`.
@@ -54,7 +54,7 @@ order. `notes list` prints full 40/64-character object ids.
 | `-m` | `--message` | `<msg>` | Note message text. Repeatable; blank lines separate messages. |
 | `-F` | `--file` | `<file>` | Read note message from file (`-` for stdin). |
 | `-f` | `--force` | | Overwrite an existing note (for `add` and `copy`). |
-| | `--ref` | `<ref>` | Operate on a specific notes ref (default: `refs/notes/commits`). |
+| | `--ref` | `<ref>` | Operate on a specific notes ref (default: `core.notesRef` when configured, else `refs/notes/commits`). An explicit `--ref` wins over the configuration. A configured value is used verbatim and must start with `refs/notes/` for every subcommand except `get-ref`, which prints it as-is (`LBR-CLI-002` otherwise). |
 
 ### Subcommands
 
@@ -69,7 +69,7 @@ order. `notes list` prints full 40/64-character object ids.
 | `remove` | Remove notes for one or more objects. |
 | `merge` | Merge another notes ref (`<other-ref>`) into the current `--ref`. A 2-way merge of the flat note rows: copies notes new to the current ref, skips identical ones, and resolves a differing note per `-s`/`--strategy` (`manual` default, `ours`, `theirs`, `union`, `cat_sort_uniq`). |
 | `prune` | Remove notes whose annotated object no longer exists in the object store. Silent by default; `-n`/`--dry-run` reports what would be pruned, `-v` prints each pruned object id. |
-| `get-ref` | Print the notes ref operations act on (honors `--ref`; default `refs/notes/commits`). |
+| `get-ref` | Print the notes ref operations act on (honors `--ref`, then `core.notesRef`; default `refs/notes/commits`). It echoes an out-of-namespace configured value verbatim. |
 
 ### Flag examples
 

@@ -72,3 +72,4 @@ flowchart TD
 
 - 2026-11-13（#478 LG-21，ADR-LG-12 第 2 条）：`notes add`/`append` 新增 `-C/--reuse-message`（读取对象 blob 字节作为 note）与 `-c/--reedit-message`（blob 预填编辑器，经 `compose_note_via_editor`）；`ordered_content_parts` 识别 `-C`/`-c` 并按 argv 顺序与 `-m`/`-F` 拼接；`notes list`（含 `notes list <object>`）改为完整对象 id。测试：`test_notes_blob_reuse_and_list_output`（C1–C4）、`notes_test` 79/79。
 
+- 2026-11-23（PM-08 / #988）：`NotesArgs.ref_` 改为 `Option<String>`；新增 `resolve_notes_ref`——`--ref` 优先（沿用 `normalize_notes_ref` 短名展开），否则 `read_cascaded_config_value_strict("core.notesRef")`（本地 → 全局 → 系统，大小写不敏感，配置值原样使用），未配置回落 `DEFAULT_NOTES_REF`；除 `get-ref` 外以 `notes::validate_notes_ref` 在任何读写前拒绝非 `refs/notes/` 值（`LBR-CLI-002`）。回归：`notes_default_ref_follows_config_scopes`（AC1–AC8）；`notes_test` 80/80。

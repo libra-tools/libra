@@ -23,7 +23,7 @@ libra notes get-ref
 
 `libra notes` 管理附着到 commit 对象的 annotations。与 commit message 不同，notes 可在 commit 创建后添加或移除 — 原始 commit hash 保持不变。这使它们适合存储事后 metadata，例如 code-review 结果、CI 状态或部署跟踪。
 
-Notes 作为 blob objects 存储在 notes ref 下（默认 `refs/notes/commits`）。使用 `--ref <ref>` 可操作不同 namespace（例如 `refs/notes/review`）。
+Notes 作为 blob objects 存储在 notes ref 下（默认 `refs/notes/commits`，配置了 `core.notesRef` 时以其为准）。使用 `--ref <ref>` 可操作不同 namespace（例如 `refs/notes/review`）。
 
 省略子命令时默认是 `list`。
 
@@ -43,7 +43,7 @@ Notes 作为 blob objects 存储在 notes ref 下（默认 `refs/notes/commits`�
 | `-m` | `--message` | `<msg>` | Note message 文本。可重复；消息之间用空行分隔。 |
 | `-F` | `--file` | `<file>` | 从文件读取 note message（`-` 表示 stdin）。 |
 | `-f` | `--force` | | 覆盖现有 note（用于 `add` 和 `copy`）。 |
-| | `--ref` | `<ref>` | 操作指定 notes ref（默认：`refs/notes/commits`）。 |
+| | `--ref` | `<ref>` | 操作指定 notes ref（默认：配置了 `core.notesRef` 时用其值，否则 `refs/notes/commits`）。显式 `--ref` 优先于配置；配置值原样使用，除 `get-ref` 外所有子命令都要求它以 `refs/notes/` 开头（否则 `LBR-CLI-002`），`get-ref` 则原样打印。 |
 
 ### 子命令
 
@@ -58,7 +58,7 @@ Notes 作为 blob objects 存储在 notes ref 下（默认 `refs/notes/commits`�
 | `remove` | 删除一个或多个对象的 notes。 |
 | `merge` | 将另一个 notes ref（`<other-ref>`）合并到当前 `--ref`。这是 flat note rows 的 2-way merge：复制当前 ref 中不存在的新 notes、跳过相同 notes，并按 `-s`/`--strategy`（默认 `manual`，也可为 `ours`、`theirs`、`union`、`cat_sort_uniq`）解决差异 note。 |
 | `prune` | 删除被 annotate 的对象已不在对象库中的 notes。默认静默；`-n`/`--dry-run` 报告将会 prune 什么，`-v` 打印每个 pruned object id。 |
-| `get-ref` | 打印操作作用的 notes ref（遵守 `--ref`；默认 `refs/notes/commits`）。 |
+| `get-ref` | 打印操作作用的 notes ref（`--ref` 优先，其次 `core.notesRef`；默认 `refs/notes/commits`）。配置值不在 `refs/notes/` 下时原样打印。 |
 
 ### 标志示例
 

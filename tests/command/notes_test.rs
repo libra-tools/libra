@@ -1980,3 +1980,93 @@ fn test_notes_blob_reuse_and_list_output() {
     assert_cli_success(&scoped, "notes list HEAD");
     assert_eq!(String::from_utf8_lossy(&scoped.stdout).trim().len(), 40);
 }
+
+/// PM-08: the default notes ref follows `core.notesRef` (local → global →
+/// system); an explicit `--ref` wins, and a configured value outside
+/// `refs/notes/` is rejected by every subcommand except `get-ref`.
+#[test]
+fn notes_default_ref_follows_config_scopes() {
+    let repo = tempdir().expect("failed to create repository root");
+    init_repo_via_cli(repo.path());
+    configure_identity_via_cli(repo.path());
+    std::fs::write(repo.path().join("f.txt"), "a\n").expect("write fixture");
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], repo.path()), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c1", "--no-verify"], repo.path()),
+        "commit",
+    );
+    let commit =
+        String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], repo.path()).stdout)
+            .trim()
+            .to_string();
+    let set = |scope: &[&str], value: &str| {
+        let mut args = vec!["config"];
+        args.extend_from_slice(scope);
+        args.extend_from_slice(&["set", "core.notesRef", value]);
+        assert_cli_success(&run_libra_command(&args, repo.path()), "config set");
+    };
+    let unset = |scope: &[&str]| {
+        let mut args = vec!["config"];
+        args.extend_from_slice(scope);
+        args.extend_from_slice(&["unset", "core.notesRef"]);
+        let _ = run_libra_command(&args, repo.path());
+    };
+    let get_ref = || {
+        let out = run_libra_command(&["notes", "get-ref"], repo.path());
+        assert_cli_success(&out, "notes get-ref");
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+
+    // AC1/AC2: a local value is used, and `add` writes under that ref.
+    set(&[], "refs/notes/custom");
+    assert_eq!(get_ref(), "refs/notes/custom\n", "AC1");
+    assert_cli_success(
+        &run_libra_command(&["notes", "add", "-m", "x", &commit], repo.path()),
+        "AC2 add",
+    );
+    let shown = run_libra_command(
+        &["notes", "--ref", "refs/notes/custom", "show", &commit],
+        repo.path(),
+    );
+    assert_cli_success(&shown, "AC2 show custom");
+    assert_eq!(String::from_utf8_lossy(&shown.stdout), "x", "AC2 note body");
+    let other = run_libra_command(
+        &["notes", "--ref", "refs/notes/commits", "show", &commit],
+        repo.path(),
+    );
+    assert!(!other.status.success(), "AC2 the default ref stays empty");
+
+    // AC6: an explicit `--ref` wins over the configuration.
+    let explicit = run_libra_command(&["notes", "--ref", "opt", "get-ref"], repo.path());
+    assert_cli_success(&explicit, "AC6");
+    assert_eq!(
+        String::from_utf8_lossy(&explicit.stdout),
+        "refs/notes/opt\n",
+        "AC6"
+    );
+
+    // AC8/AC7: `get-ref` echoes an out-of-namespace value verbatim, but `add`
+    // rejects it before writing.
+    set(&[], "refs/heads/x");
+    assert_eq!(get_ref(), "refs/heads/x\n", "AC8");
+    let rejected = run_libra_command(&["notes", "add", "-m", "y", &commit], repo.path());
+    assert!(!rejected.status.success(), "AC7 must fail");
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("LBR-CLI-002"),
+        "AC7 code"
+    );
+    unset(&[]);
+
+    // AC3/AC4: global applies when local is absent, and local wins when both are.
+    set(&["--global"], "refs/notes/glob");
+    assert_eq!(get_ref(), "refs/notes/glob\n", "AC3");
+    set(&[], "refs/notes/custom");
+    assert_eq!(get_ref(), "refs/notes/custom\n", "AC4");
+    unset(&[]);
+    unset(&["--global"]);
+
+    // AC5: the system scope participates in the cascade too.
+    set(&["--system"], "refs/notes/sys");
+    assert_eq!(get_ref(), "refs/notes/sys\n", "AC5");
+    unset(&["--system"]);
+}

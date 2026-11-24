@@ -1050,7 +1050,7 @@ PY
 ### Task PM-08: `libra notes` 默认 notes ref 遵循 `core.notesRef`（#988；拆出 PM-34）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-23：`NotesArgs.ref_` 改为 `Option<String>`，新增 `resolve_notes_ref`——显式 `--ref` 优先（沿用 `normalize_notes_ref` 短名展开），否则 `read_cascaded_config_value_strict("core.notesRef")`（本地→全局→系统、大小写不敏感、原样使用），未配置回落 `DEFAULT_NOTES_REF`；除 `get-ref` 外以 `validate_notes_ref` 在任何读写前拒绝非 `refs/notes/` 值（`LBR-CLI-002`），`get-ref` 原样回显。AC1–AC8 由 `command::notes_test::notes_default_ref_follows_config_scopes` 覆盖（含 `add` 只写入配置 ref、显式 `--ref` 覆盖、`refs/heads/x` 的 get-ref 回显与 add 拒绝）；`notes_test` 80/80；EN/zh/开发文档与 `COMPATIBILITY.md` 的 `notes` 行同步。
 **Description:** 把 `NotesArgs.ref_` 改为可选，未给出 `--ref` 时以 `core.notesRef` 作为默认 notes ref（复用 `log` 的级联读取 `read_cascaded_config_value_strict`：本地 → 全局 → 系统，变量名大小写不敏感），未配置时为 `refs/notes/commits`；配置值按原样使用（不做 `--ref` 的短名展开）：`notes get-ref` 原样打印，其余子命令遇到不以 `refs/notes/` 开头的值在任何读写前以 `LBR-CLI-002` 拒绝（Git：`refusing to … notes in <ref> (outside of refs/notes/)`）。显式 `--ref` 优先于配置，其规范化保持现状。（按 G-09 拆出 `PM-34` 承接 `GIT_NOTES_REF` 环境变量。）
 **Out of scope:** `GIT_NOTES_REF` 环境变量（`PM-34`）；全局 `-c <key>=<value>` 选项（Libra 无此全局 flag，测试改用 `libra config` 写入；尚未排期，重启条件：全局 `-c` 立项）；`--ref=refs/heads/x` 展开为 `refs/notes/refs/heads/x` 的 Git 行为（TC-2062）与 notes 在 `for-each-ref` 中可见（Libra notes 存于 SQLite `notes` 表）（`DEFER-PM-08`）；`notes merge` 状态机（`REL-PM-01`）；配置值不以 `refs/notes/` 开头时 `add` 之外的其余读写子命令（`list`、`show`、`remove` 等）的拒绝（与 AC7 共用唯一选取点 `src/command/notes.rs:303` 之后的同一校验，不单独验收）；`core.notesRef` 变量名大小写不敏感（复用的 `read_cascaded_config_value_strict` 既有语义，由 `log` 的既有用例守护，不单独验收）。
 **Current evidence:**
