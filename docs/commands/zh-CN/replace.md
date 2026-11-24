@@ -16,7 +16,7 @@ libra replace [-l] [<pattern>]
 
 - **创建**（`libra replace <object> <replacement>`）—— 记录替换。两个对象都必须存在；类型必须一致，除非用 `-f`。已存在的替换只有 `-f` 才覆盖。对象不能替换自己。
 - **删除**（`-d <object>...`）—— 删除替换；删除不存在的替换是错误。
-- **列出**（`-l [<pattern>]`，无创建参数时为默认）—— 每行打印一个被替换对象的 id（Git 的默认短格式），可按子串过滤。（`--format=medium/long`（同时显示替换 oid）与 glob `<pattern>` 匹配延后。）
+- **列出**（`-l [<pattern>]`）—— 每行打印一个被替换对象的 id（Git 的默认短格式），可按 `wildmatch` 模式过滤，模式对整个对象 id 做整名匹配（`*`、`?`、`[...]` 为通配符，默认模式为 `*`）。`--format=medium/long` 同时显示替换 oid 与类型；`-l` 最多接受一个模式。
 
 替换以松散 ref 存于 `.libra/refs/replace/<oid>`（Git 的 `refs/replace/` 命名空间）。
 
@@ -54,4 +54,4 @@ libra replace -d <old-commit>    # 停止替换
 | 删除 | `libra replace -d <o>` | `git replace -d <o>` |
 | 列出 | `libra replace -l` | `git replace -l` |
 
-差异与延后项：替换以松散 ref 存于 `.libra/refs/replace/` 而非 SQLite reference 表，故 `show-ref` / `for-each-ref` 暂不列出；`-l` 仅打印对象 id（Git 默认短格式）且按子串而非 glob 过滤；`--format`、`--edit`、`--graft`、`--convert-graft-file` 未实现。
+差异与延后项：替换以松散 ref 存于 `.libra/refs/replace/` 而非 SQLite reference 表，故 `show-ref` / `for-each-ref` 暂不列出；`-l` 仅打印对象 id（Git 默认短格式）且按整名 `wildmatch` 过滤；`--format`、`--edit`、`--graft`、`--convert-graft-file` 未实现。

@@ -24,10 +24,11 @@ through it — `log`, `show`, `rev-parse` peeling, and so on — not just one co
   itself.
 - **delete** (`-d <object>...`) — remove the replacement(s); deleting a
   replacement that does not exist is an error.
-- **list** (`-l [<pattern>]`, the default with no create arguments) — print the
-  ids of replaced objects, one per line (Git's default `short` format),
-  optionally filtered by a substring. `--format=medium/long` also shows the
-  replacement oid with its type. Glob `<pattern>` matching is deferred.)
+- **list** (`-l [<pattern>]`) — print the ids of replaced objects, one per line
+  (Git's default `short` format), optionally filtered by a `wildmatch` pattern
+  matched against the WHOLE object id (`*`, `?` and `[...]` are wildcards; the
+  default pattern is `*`). `--format=medium/long` also shows the replacement oid
+  with its type. `-l` accepts at most one pattern.
 
 Replacements are stored as loose refs under `.libra/refs/replace/<oid>` (Git's
 `refs/replace/` namespace).
@@ -42,7 +43,7 @@ Replacements are stored as loose refs under `.libra/refs/replace/<oid>` (Git's
 | `--graft` | Create a replacement commit with the given parents: `replace --graft <commit> [<parent>...]` (none = parentless) | `libra replace --graft HEAD` |
 | `--edit` | Accepted for Git parity: behaves like `--graft` when parents are given, otherwise a no-op (Libra never opens an editor) | `libra replace --edit HEAD` |
 | `--convert-graft-file` | Convert `.libra/info/grafts` into replace refs and remove the file | `libra replace --convert-graft-file` |
-| `-l`, `--list` | List replaced object ids (optionally filtered by `<pattern>`). |
+| `-l`, `--list` | List replaced object ids, optionally filtered by a wildmatch `<pattern>` matched against the whole object id. |
 
 ## Exit codes
 
@@ -73,5 +74,9 @@ libra replace -d <old-commit>    # stop replacing it
 Differences and deferred features: replacements are stored as loose refs under
 `.libra/refs/replace/` rather than in the SQLite reference table, so `show-ref` /
 `for-each-ref` do not list them yet; `-l` prints object ids only (Git's default
-short format) and filters by substring rather than glob; `--format`, `--edit`,
-`--graft`, and `--convert-graft-file` are not implemented.
+short format) and filters by whole-name `wildmatch`; `--format`, `--edit`,
+`--graft`, and `--convert-graft-file` are not implemented. Mode validation
+matches Git: `-d` with `-l`, `--format` without `-l`, `-f` outside a write
+mode, more than one `-l` pattern, and a create with anything other than exactly
+two positional arguments are all usage errors (`LBR-CLI-002`) rejected before
+any ref is read or written.

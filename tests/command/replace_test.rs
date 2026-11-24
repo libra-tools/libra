@@ -228,3 +228,74 @@ fn replace_formats_graft_and_convert_graft_file() {
         "--graft registered a replacement: {medium}"
     );
 }
+
+#[test]
+fn replace_list_uses_wildmatch() {
+    let repo = two_commit_repo();
+    let head = stdout(&run_libra_command(&["rev-parse", "HEAD"], repo.path()))
+        .trim()
+        .to_string();
+    let base = stdout(&run_libra_command(&["rev-parse", "HEAD~1"], repo.path()))
+        .trim()
+        .to_string();
+    assert_cli_success(
+        &run_libra_command(&["replace", &head, &base], repo.path()),
+        "create replacement",
+    );
+
+    // AC1: `?` matches one character; the trailing `*` covers the rest — the
+    // wildmatch is applied to the whole object name.
+    let pattern = format!("{}?*", &head[..4]);
+    let listed = run_libra_command(&["replace", "-l", &pattern], repo.path());
+    assert_cli_success(&listed, "AC1");
+    assert_eq!(stdout(&listed), format!("{head}\n"), "AC1");
+
+    // AC2: a pattern that only matches a substring of the name lists nothing.
+    let listed = run_libra_command(&["replace", "-l", "zzzz"], repo.path());
+    assert_cli_success(&listed, "AC2");
+    assert!(stdout(&listed).is_empty(), "AC2");
+}
+
+#[test]
+fn replace_rejects_invalid_mode_combinations() {
+    let repo = two_commit_repo();
+    let head = stdout(&run_libra_command(&["rev-parse", "HEAD"], repo.path()))
+        .trim()
+        .to_string();
+    let base = stdout(&run_libra_command(&["rev-parse", "HEAD~1"], repo.path()))
+        .trim()
+        .to_string();
+    assert_cli_success(
+        &run_libra_command(&["replace", &head, &base], repo.path()),
+        "create replacement",
+    );
+    let snapshot = stdout(&run_libra_command(&["replace", "-l"], repo.path()));
+    assert!(snapshot.contains(&head), "pre-state lists the replacement");
+
+    let cases: Vec<Vec<&str>> = vec![
+        // AC3: at most one `-l` pattern.
+        vec!["replace", "-l", "a", "b"],
+        // AC4: a create needs exactly two positional arguments.
+        vec!["replace", &head],
+        // AC5: `-d` and `-l` are incompatible.
+        vec!["replace", "-l", "-d", &base],
+        // AC6: `--format` is a list-only option.
+        vec!["replace", "--format=medium", "-d", &head],
+        // AC7: `-f` only makes sense when writing.
+        vec!["replace", "-f"],
+        // AC8: `-f` is invalid for delete too.
+        vec!["replace", "-f", "-d", &head],
+    ];
+    for args in cases {
+        let out = run_libra_command(&args, repo.path());
+        assert!(!out.status.success(), "{args:?} must fail");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("LBR-CLI-002"),
+            "{args:?} code: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    // Failure-path invariant: the replace namespace is untouched.
+    let after = stdout(&run_libra_command(&["replace", "-l"], repo.path()));
+    assert_eq!(after, snapshot, "replace refs unchanged");
+}

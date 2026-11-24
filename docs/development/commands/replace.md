@@ -42,3 +42,5 @@
 
 - 改进本命令前先阅读 [docs/development/commands/_general.md](_general.md)。
 - ⚠️ `resolve` 在 **hot** 的 load_object 路径上——任何改动必须保持「无替换时近零成本」且 sync（不得引入 async/DB 调用）。
+
+- 2026-11-23（PM-04 / #758）：`-l` 的 `<pattern>` 改用 `command::log::decorate_filter::wildmatch` 整名匹配（默认 `*`），取代子串过滤；`validate_modes` 在任何读写前拒绝 Git 的全部误用——`-d`+`-l`、非列表的 `--format`、非写入的 `-f`、多个 `-l` 模式、以及创建模式位置参数≠2（移除「无参数/单参数即列表」的隐式行为）；各错误均 `LBR-CLI-002`。回归：`replace_list_uses_wildmatch`（AC1–AC2）、`replace_rejects_invalid_mode_combinations`（AC3–AC8）。

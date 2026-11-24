@@ -164,7 +164,8 @@ pub struct ReplaceArgs {
     #[clap(short = 'd', long)]
     pub delete: bool,
 
-    /// List replaced object ids (optionally filtered by a substring).
+    /// List replaced object ids, optionally filtered by a wildmatch PATTERN
+    /// matched against the whole object id (`*`, `?` and `[...]` are wildcards).
     #[clap(short = 'l', long)]
     pub list: bool,
 
@@ -330,24 +331,42 @@ async fn run(args: ReplaceArgs) -> CliResult<()> {
         let parents = args.args[1..].to_vec();
         return create_graft(&object, &parents, args.force).await;
     }
+    validate_modes(&args)?;
     if args.delete {
         if args.args.is_empty() {
             return Err(usage("`replace -d` needs at least one object"));
         }
         return delete(&args.args).await;
     }
-    if args.list || args.args.len() <= 1 {
+    if args.list {
         return list(
             args.args.first().map(String::as_str),
             args.format.as_deref(),
         );
     }
-    if args.args.len() == 2 {
-        return create(&args.args[0], &args.args[1], args.force).await;
+    create(&args.args[0], &args.args[1], args.force).await
+}
+
+/// Git's `replace` mode validation (`builtin/replace.c`): every misuse is a
+/// usage error rejected before any reference is read or written.
+fn validate_modes(args: &ReplaceArgs) -> CliResult<()> {
+    let writing = args.graft || args.edit || (!args.list && !args.delete);
+    if args.list && args.delete {
+        return Err(usage("-d and -l are incompatible"));
     }
-    Err(usage(
-        "too many arguments: use `replace <object> <replacement>`, `-d <object>...`, or `-l`",
-    ))
+    if args.format.is_some() && !args.list {
+        return Err(usage("--format cannot be used when not listing"));
+    }
+    if args.force && !writing {
+        return Err(usage("-f only makes sense when writing a replacement"));
+    }
+    if args.list && args.args.len() > 1 {
+        return Err(usage("only one pattern can be given with -l"));
+    }
+    if !args.list && !args.delete && !args.graft && !args.edit && args.args.len() != 2 {
+        return Err(usage("bad number of arguments"));
+    }
+    Ok(())
 }
 
 async fn create(object: &str, replacement: &str, force: bool) -> CliResult<()> {
@@ -504,7 +523,7 @@ fn list(pattern: Option<&str>, format: Option<&str>) -> CliResult<()> {
         let entry = entry.map_err(read_err)?;
         if let Some(name) = entry.file_name().to_str()
             && crate::internal::object_format::parse_repo_oid(name).is_ok()
-            && pattern.is_none_or(|p| name.contains(p))
+            && pattern.is_none_or(|p| crate::command::log::decorate_filter::wildmatch(p, name))
         {
             names.push(name.to_string());
         }

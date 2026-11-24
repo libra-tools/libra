@@ -1,7 +1,7 @@
 //! Log command rendering commit history with optional decorations, filtering, and custom formatting utilities.
 
 pub(crate) mod config;
-mod decorate_filter;
+pub(crate) mod decorate_filter;
 
 use std::{
     cell::RefCell,

@@ -736,7 +736,7 @@ PY
 ### Task PM-04: 修复 `libra replace` 列表 glob 与模式/参数校验（#758；拆出 PM-26）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-23：`replace.rs` 新增 `validate_modes`，在任何 ref 读写前拒绝 Git 的全部误用——`-d`+`-l`、非列表的 `--format`、非写入的 `-f`、多个 `-l` 模式、创建模式位置参数≠2（移除「单参数即列表」隐式行为），全部 `LBR-CLI-002`；`-l [<pattern>]` 改用 `command::log::decorate_filter::wildmatch`（该模块升为 `pub(crate)`）对**整名**匹配，默认 `*`，取代 `contains` 子串过滤；`-l` 帮助文本改为描述 wildmatch。AC1–AC2 由 `command::replace_test::replace_list_uses_wildmatch` 覆盖，AC3–AC8 由 `replace_rejects_invalid_mode_combinations` 覆盖（含失败路径不变量：replace 列表前后一致）；`replace_test` 10/10；EN/zh/开发文档与 `COMPATIBILITY.md` 的 `replace` 行同步。
 **Description:** 按 Git `builtin/replace.c` 修正 `src/command/replace.rs` 的列表与模式判定：`-l [<pattern>]` 以 wildmatch 整名匹配（默认 `*`），取代子串过滤，并同步把 `ReplaceArgs` 中 `-l` 的帮助文本由「optionally filtered by a substring」改为描述整名 wildmatch（`src/command/replace.rs:155-170`）；`-l` 只允许一个 pattern；无模式且恰一个位置参数、`-l` 与 `-d` 同用、`--format` 用于非列表模式、`-f` 用于非写入模式均在任何读写前以 `LBR-CLI-002` 拒绝。（按 G-09 拆出 `PM-26` 承接 `-d` 删除语义。）
 **Out of scope:** `-d` 的解析、逐项继续与错误语义（`PM-26`）；`update-ref refs/replace/*`、`cat-file` 尊重 replace、`--no-replace-objects` 等 `t6050` 其余阻断项（`DEFER-PM-07`）；`-l` 帮助文本的措辞（随实现同卡修改，由 ER-05 代码评审与文档门核对，不单独验收）；`-l` 不带模式时列出全部替换引用（实现以默认模式 `*` 走与 AC1 相同的 wildmatch 过滤，`*` 匹配任意名字，不单独验收；既有 `replace_list_shows_the_replaced_object` 只守护单个引用的列出）；`-f -l` 等其余 `-f` 误用组合（同一校验分支，不单独验收）；`--format=bogus` 的 Git 退出码 255（Libra 保持 clap 用法错误 `LBR-CLI-002`）。
 **Current evidence:**
