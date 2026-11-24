@@ -2,6 +2,15 @@
 
 显示提交、标签、树、blob，或 `REV:path` 引用的 blob。
 
+### `--textconv` / `--no-textconv`
+
+提交 diff 默认执行 `diff.<driver>.textconv` 过滤器（驱动来自 `.gitattributes`），因此 `show` 与 Git 一样显示转换后的内容。`--textconv` 显式声明该默认，`--no-textconv` 关闭（后写者胜出）；两者都委派给共享 diff 引擎，正文与同选项的 `libra diff` 一致。过滤器失败或缺失时以 `LBR-IO-001` fail-closed。
+
+```bash
+libra show --textconv HEAD
+libra show --no-textconv HEAD
+```
+
 ### `--color-moved[=<mode>]` / `--color-moved-ws=<modes>`
 
 `show` 与 `libra diff --color-moved` 一致地为移动行着色（删除侧粗体洋红、新增侧粗体青）；`--no-color-moved` 取消先前标志（后写者胜出），`--color-moved-ws` 选择匹配移动行的空白规则。着色是后处理步骤，可与 `--word-diff`/`--color-words` 组合，且 diff 段与同选项的 `libra diff` 逐字节一致。

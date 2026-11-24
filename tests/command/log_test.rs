@@ -9850,3 +9850,87 @@ fn show_color_moved_composes_with_word_diff() {
         "AC5 moved-ws parity"
     );
 }
+
+#[test]
+fn show_textconv_and_no_textconv() {
+    use super::{assert_cli_success, run_libra_command};
+
+    let work = tempfile::tempdir().expect("work dir");
+    let repo = work.path().join("r");
+    std::fs::create_dir_all(&repo).expect("mkdir repo");
+    assert_cli_success(&run_libra_command(&["init"], &repo), "init");
+    run_libra_command(&["config", "set", "user.name", "t"], &repo);
+    run_libra_command(&["config", "set", "user.email", "t@t"], &repo);
+    // A textconv driver rewrites `abc` to `XYZ` for `*.txt`.
+    std::fs::write(repo.join(".gitattributes"), "*.txt diff=myconv\n").expect("write attributes");
+    assert_cli_success(
+        &run_libra_command(&["add", ".gitattributes"], &repo),
+        "add attributes",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &["config", "set", "diff.myconv.textconv", "sed s/abc/XYZ/g"],
+            &repo,
+        ),
+        "config textconv",
+    );
+    std::fs::write(repo.join("f.txt"), "abc\n").expect("write base");
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], &repo), "add base");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c1", "--no-verify"], &repo),
+        "commit c1",
+    );
+    std::fs::write(repo.join("f.txt"), "abc\nabc\n").expect("write edit");
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], &repo), "add edit");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c2", "--no-verify"], &repo),
+        "commit c2",
+    );
+
+    let section = |text: &str| -> String {
+        match text.find("@@") {
+            Some(index) => text[index..].to_string(),
+            None => String::new(),
+        }
+    };
+    let show_out = |args: &[&str]| {
+        let mut argv = vec!["show"];
+        argv.extend_from_slice(args);
+        let result = run_libra_command(&argv, &repo);
+        assert_cli_success(&result, &format!("show {argv:?}"));
+        String::from_utf8_lossy(&result.stdout).to_string()
+    };
+    let diff_out = |args: &[&str]| {
+        let mut argv = vec!["diff"];
+        argv.extend_from_slice(args);
+        argv.push("HEAD~1");
+        argv.push("HEAD");
+        let result = run_libra_command(&argv, &repo);
+        assert_cli_success(&result, &format!("diff {argv:?}"));
+        String::from_utf8_lossy(&result.stdout).to_string()
+    };
+
+    // AC1: `--textconv` matches `libra diff --textconv`.
+    let converted = show_out(&["--textconv"]);
+    assert_eq!(
+        section(&converted),
+        section(&diff_out(&["--textconv"])),
+        "AC1 textconv parity"
+    );
+    // AC2: textconv is on by default.
+    assert_eq!(converted, show_out(&[]), "AC2 default enables textconv");
+    // AC3: `--no-textconv` matches `libra diff --no-textconv`.
+    let raw = show_out(&["--no-textconv"]);
+    assert_eq!(
+        section(&raw),
+        section(&diff_out(&["--no-textconv"])),
+        "AC3 no-textconv parity"
+    );
+    // AC4/AC5: the filter actually ran (and only when enabled).
+    assert!(converted.contains("XYZ"), "AC4 filter output: {converted}");
+    assert!(raw.contains("abc"), "AC5 raw content: {raw}");
+    assert!(
+        !raw.contains("XYZ"),
+        "AC5 --no-textconv must not run the filter: {raw}"
+    );
+}

@@ -308,6 +308,8 @@ async fn test_show_non_quiet_uses_forced_pager() {
     let _pager = ScopedEnvVar::set(LIBRA_PAGER_ENV, "always");
 
     let args = ShowArgs {
+        textconv: false,
+        no_textconv: false,
         color_moved: None,
         no_color_moved: false,
         color_moved_ws: Vec::new(),
@@ -382,6 +384,8 @@ async fn test_show_quiet_still_validates_patch_generation() {
 
     let _guard = ChangeDirGuard::new(repo.path());
     let args = ShowArgs {
+        textconv: false,
+        no_textconv: false,
         color_moved: None,
         no_color_moved: false,
         color_moved_ws: Vec::new(),
@@ -457,6 +461,8 @@ async fn test_show_quiet_stat_succeeds_with_missing_blob_like_human_path() {
 
     let _guard = ChangeDirGuard::new(repo.path());
     let args = ShowArgs {
+        textconv: false,
+        no_textconv: false,
         color_moved: None,
         no_color_moved: false,
         color_moved_ws: Vec::new(),
@@ -944,6 +950,8 @@ async fn test_show_execute_safe_bad_ref_returns_cli_error() {
     let _guard = ChangeDirGuard::new(temp.path());
 
     let args = ShowArgs {
+        textconv: false,
+        no_textconv: false,
         color_moved: None,
         no_color_moved: false,
         color_moved_ws: Vec::new(),
@@ -1009,6 +1017,8 @@ async fn test_show_execute_safe_bad_rev_path_returns_cli_error() {
     let _guard = ChangeDirGuard::new(temp.path());
 
     let args = ShowArgs {
+        textconv: false,
+        no_textconv: false,
         color_moved: None,
         no_color_moved: false,
         color_moved_ws: Vec::new(),

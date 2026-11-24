@@ -71,6 +71,12 @@ pub(crate) const SHOW_PATHSPEC_SEPARATOR_FLAG: &str = "__libra-show-pathspec-sep
 #[derive(Parser, Debug)]
 #[command(after_help = SHOW_EXAMPLES)]
 pub struct ShowArgs {
+    /// Apply `diff.<driver>.textconv` filters (the default for commit diffs)
+    #[clap(long = "textconv", overrides_with = "no_textconv")]
+    pub textconv: bool,
+    /// Do not run `diff.<driver>.textconv` filters
+    #[clap(long = "no-textconv", overrides_with = "textconv")]
+    pub no_textconv: bool,
     /// Colour moved lines differently (Git's `--color-moved[=<mode>]`)
     #[clap(
         long = "color-moved",
@@ -1311,6 +1317,28 @@ async fn show_patch(
         }
         patch
     };
+    // Commit diffs enable textconv by default; `--no-textconv` opts out. Both go
+    // through the diff engine so the filters behave exactly like `libra diff`.
+    if paths.is_empty() {
+        if let Some(parent) = commit.parent_commit_ids.first() {
+            let mut argv = vec!["diff".to_string()];
+            argv.push(if args.no_textconv {
+                "--no-textconv".to_string()
+            } else {
+                "--textconv".to_string()
+            });
+            argv.push(parent.to_string());
+            argv.push(commit.id.to_string());
+            let diff_args = crate::command::diff::DiffArgs::try_parse_from(&argv)
+                .map_err(|error| CliError::command_usage(error.to_string()))?;
+            let output = crate::command::diff::run_diff_for_service(diff_args).await?;
+            let mut patch = crate::command::diff::render::format_unified_diff(&output);
+            if !patch.is_empty() && !patch.ends_with('\n') {
+                patch.push('\n');
+            }
+            return Ok(colorize(patch));
+        }
+    }
     if (args.patience || args.anchored.is_some()) && paths.is_empty() {
         if let Some(parent) = commit.parent_commit_ids.first() {
             let mut argv = vec!["diff".to_string()];

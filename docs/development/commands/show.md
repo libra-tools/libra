@@ -76,3 +76,5 @@ flowchart TD
 - 2026-11-23（LS-33 / #966）：新增 `show --word-diff[=<mode>]`/`--word-diff-regex`/`--color-words[=<re>]`，`show_patch` 在无路径过滤时经 `run_diff_for_service_word_diff(args, color)` 渲染，与 `libra log -p`/`libra diff` 同选项逐字一致。回归：`show_word_diff_and_color_words`（AC1–AC7）。
 
 - 2026-11-23（LS-24 / #858）：新增 `--color-moved[=<mode>]`/`--no-color-moved`/`--color-moved-ws`；`show_patch` 在渲染末尾以 `render::maybe_colorize_diff` 后处理（并对齐 `libra diff` 的尾部空行），可与 `--word-diff`/`--color-words` 组合。回归：`show_color_moved_composes_with_word_diff`（AC1–AC5）。
+
+- 2026-11-23（LS-25 / #862）：新增 `show --textconv`/`--no-textconv`（默认启用 textconv）；无路径过滤时经 `run_diff_for_service`（argv 带 `--textconv`/`--no-textconv`）渲染，正文与 `libra diff` 同选项一致。回归：`show_textconv_and_no_textconv`（AC1–AC5）。

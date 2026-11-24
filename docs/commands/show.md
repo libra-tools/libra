@@ -2,6 +2,19 @@
 
 Show a commit, tag, tree, blob, or the blob referenced by `REV:path`.
 
+### `--textconv` / `--no-textconv`
+
+Commit diffs run `diff.<driver>.textconv` filters by default (drivers come from
+`.gitattributes`), so `show` prints the converted view like Git. `--textconv` states
+that default explicitly and `--no-textconv` disables it (the later flag wins); both
+delegate to the shared diff engine, so the body matches `libra diff` with the same
+option. A failing or missing filter fails closed as `LBR-IO-001`.
+
+```bash
+libra show --textconv HEAD
+libra show --no-textconv HEAD
+```
+
 ### `--color-moved[=<mode>]` / `--color-moved-ws=<modes>`
 
 `show` colours moved lines like `libra diff --color-moved` (removed side bold
