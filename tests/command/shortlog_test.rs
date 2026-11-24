@@ -1337,3 +1337,208 @@ fn shortlog_stdin_output_matches_git_format() {
         "AC7"
     );
 }
+
+/// PM-30: repeatable `--group`, `--no-group`, and per-commit key de-duplication.
+#[test]
+fn shortlog_group_options_match_git() {
+    use std::process::Command;
+
+    let libra = env!("CARGO_BIN_EXE_libra");
+    let repo = tempdir().unwrap();
+    let p = repo.path();
+    let home = p.join(".home");
+    let run = |args: &[&str], envs: &[(&str, &str)]| {
+        let mut cmd = Command::new(libra);
+        cmd.args(args)
+            .current_dir(p)
+            .env("HOME", &home)
+            .env("LIBRA_TEST", "1")
+            .env("GIT_AUTHOR_DATE", "1112875200 +0000")
+            .env("GIT_COMMITTER_DATE", "1112875200 +0000");
+        for (key, value) in envs {
+            cmd.env(key, value);
+        }
+        cmd.output().unwrap()
+    };
+    assert!(run(&["init", "--vault", "false"], &[]).status.success());
+    assert!(run(&["config", "user.name", "t"], &[]).status.success());
+    assert!(run(&["config", "user.email", "t@t"], &[]).status.success());
+    let commit = |body: &str, author: &str, committer_name: &str, committer_email: &str| {
+        std::fs::write(p.join("f"), format!("{body}\n")).unwrap();
+        assert!(run(&["add", "f"], &[]).status.success());
+        let out = run(
+            &["commit", "-m", body, "--author", author, "--no-verify"],
+            &[
+                ("GIT_COMMITTER_NAME", committer_name),
+                ("GIT_COMMITTER_EMAIL", committer_email),
+            ],
+        );
+        assert!(out.status.success(), "{out:?}");
+    };
+    commit(
+        "first",
+        "Alice <alice@example.com>",
+        "Carol",
+        "carol@example.com",
+    );
+    commit(
+        "second\n\nCo-authored-by: Alice <alice@example.com>\nCo-authored-by: Dave <dave@example.com>",
+        "Bob <bob@example.com>",
+        "Carol",
+        "carol@example.com",
+    );
+    commit(
+        "third",
+        "Alice <alice@other.example>",
+        "Dan",
+        "dan@example.com",
+    );
+
+    // AC1: both groups contribute keys for every commit.
+    let out = run(
+        &[
+            "shortlog",
+            "-s",
+            "--group=author",
+            "--group=committer",
+            "HEAD",
+        ],
+        &[],
+    );
+    assert!(out.status.success(), "AC1");
+    assert_eq!(
+        out.stdout,
+        b"     2\tAlice\n     1\tBob\n     2\tCarol\n     1\tDan\n".to_vec(),
+        "AC1"
+    );
+
+    // AC2: `--no-group` clears earlier groups; only committer remains.
+    let out = run(
+        &[
+            "shortlog",
+            "-s",
+            "--group=author",
+            "--no-group",
+            "--group=committer",
+            "HEAD",
+        ],
+        &[],
+    );
+    assert!(out.status.success(), "AC2");
+    assert_eq!(out.stdout, b"     2\tCarol\n     1\tDan\n".to_vec(), "AC2");
+
+    // AC3: an empty group list falls back to author.
+    let out = run(&["shortlog", "-s", "--no-group", "HEAD"], &[]);
+    assert!(out.status.success(), "AC3");
+    assert_eq!(out.stdout, b"     2\tAlice\n     1\tBob\n".to_vec(), "AC3");
+
+    // AC4: unknown group types are usage errors.
+    let out = run(&["shortlog", "-s", "--group=bogus", "HEAD"], &[]);
+    assert!(!out.status.success(), "AC4 must fail");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("LBR-CLI-002"),
+        "AC4 code"
+    );
+}
+
+/// PM-30 AC5/AC6: repeated keys inside one commit count once.
+#[test]
+fn shortlog_group_dedups_within_commit() {
+    use std::process::Command;
+
+    let libra = env!("CARGO_BIN_EXE_libra");
+    let repo = tempdir().unwrap();
+    let p = repo.path();
+    let home = p.join(".home");
+    let run = |args: &[&str], envs: &[(&str, &str)]| {
+        let mut cmd = Command::new(libra);
+        cmd.args(args)
+            .current_dir(p)
+            .env("HOME", &home)
+            .env("LIBRA_TEST", "1")
+            .env("GIT_AUTHOR_DATE", "1000000000 +0000")
+            .env("GIT_COMMITTER_DATE", "1000000000 +0000");
+        for (key, value) in envs {
+            cmd.env(key, value);
+        }
+        cmd.output().unwrap()
+    };
+    assert!(run(&["init", "--vault", "false"], &[]).status.success());
+    assert!(run(&["config", "user.name", "t"], &[]).status.success());
+    assert!(run(&["config", "user.email", "t@t"], &[]).status.success());
+
+    // AC5 fixture: repeated trailer values.
+    std::fs::write(p.join("f"), "root\n").unwrap();
+    assert!(run(&["add", "f"], &[]).status.success());
+    assert!(
+        run(&["commit", "-m", "root", "--no-verify"], &[])
+            .status
+            .success()
+    );
+    for (body, author) in [
+        ("a\n\nRepeated: Foo\nRepeated: Foo", "A <a@x>"),
+        ("b\n\nRepeated: Foo\nRepeated: Bar", "B <b@x>"),
+    ] {
+        std::fs::write(p.join("f"), format!("{body}\n")).unwrap();
+        assert!(run(&["add", "f"], &[]).status.success());
+        assert!(
+            run(
+                &["commit", "-m", body, "--author", author, "--no-verify"],
+                &[]
+            )
+            .status
+            .success()
+        );
+    }
+    let out = run(&["shortlog", "-s", "--group=trailer:repeated", "HEAD"], &[]);
+    assert!(out.status.success(), "AC5");
+    assert_eq!(out.stdout, b"     1\tBar\n     2\tFoo\n".to_vec(), "AC5");
+
+    // AC6 fixture: the same name from author and committer groups.
+    let repo = tempdir().unwrap();
+    let p = repo.path();
+    let home = p.join(".home");
+    let run = |args: &[&str], envs: &[(&str, &str)]| {
+        let mut cmd = Command::new(libra);
+        cmd.args(args)
+            .current_dir(p)
+            .env("HOME", &home)
+            .env("LIBRA_TEST", "1")
+            .env("GIT_AUTHOR_DATE", "1000000000 +0000")
+            .env("GIT_COMMITTER_DATE", "1000000000 +0000");
+        for (key, value) in envs {
+            cmd.env(key, value);
+        }
+        cmd.output().unwrap()
+    };
+    assert!(run(&["init", "--vault", "false"], &[]).status.success());
+    assert!(run(&["config", "user.name", "t"], &[]).status.success());
+    assert!(run(&["config", "user.email", "t@t"], &[]).status.success());
+    for (body, author) in [("c1", "Same <s@x>"), ("c2", "Ann <a@x>")] {
+        std::fs::write(p.join("f"), format!("{body}\n")).unwrap();
+        assert!(run(&["add", "f"], &[]).status.success());
+        assert!(
+            run(
+                &["commit", "-m", body, "--author", author, "--no-verify"],
+                &[
+                    ("GIT_COMMITTER_NAME", "Same"),
+                    ("GIT_COMMITTER_EMAIL", "s@x")
+                ],
+            )
+            .status
+            .success()
+        );
+    }
+    let out = run(
+        &[
+            "shortlog",
+            "-s",
+            "--group=author",
+            "--group=committer",
+            "HEAD",
+        ],
+        &[],
+    );
+    assert!(out.status.success(), "AC6");
+    assert_eq!(out.stdout, b"     1\tAnn\n     2\tSame\n".to_vec(), "AC6");
+}

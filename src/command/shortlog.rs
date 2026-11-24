@@ -152,9 +152,14 @@ pub struct ShortlogArgs {
 
     /// Group commits by `author` (default), `committer`, or `trailer:<key>`
     /// (group by each value of the given commit-message trailer, e.g.
-    /// `trailer:Co-authored-by`). Takes precedence over `-c`/`--committer`.
-    #[clap(long = "group", value_name = "TYPE")]
-    pub group: Option<String>,
+    /// `trailer:Co-authored-by`). Repeatable; duplicates within one commit
+    /// count once. Takes precedence over `-c`/`--committer`.
+    #[clap(long = "group", value_name = "TYPE", action = clap::ArgAction::Append)]
+    pub group: Vec<String>,
+
+    /// Clear the groups given so far; an empty list falls back to author.
+    #[clap(long = "no-group")]
+    pub no_group: bool,
 
     /// Render each commit under its author header with a custom format string
     /// (the same `%`-placeholders as `libra log --format`, including `%b`,
@@ -187,16 +192,53 @@ enum GroupMode {
 
 /// Resolve the grouping mode from `--group` (preferred) or the legacy
 /// `-c`/`--committer` flag. Returns a usage error for an unknown `--group`.
-fn resolve_group_mode(args: &ShortlogArgs) -> CliResult<GroupMode> {
-    match args.group.as_deref() {
-        None => Ok(if args.committer {
+fn resolve_group_modes(args: &ShortlogArgs) -> CliResult<Vec<GroupMode>> {
+    let specs = cli_group_specs(args);
+    if specs.is_empty() {
+        return Ok(vec![if args.committer {
             GroupMode::Committer
         } else {
             GroupMode::Author
-        }),
-        Some("author") => Ok(GroupMode::Author),
-        Some("committer") => Ok(GroupMode::Committer),
-        Some(spec) if spec.starts_with("trailer:") => {
+        }]);
+    }
+    let mut modes = Vec::with_capacity(specs.len());
+    for spec in &specs {
+        modes.push(parse_group_mode(spec)?);
+    }
+    Ok(modes)
+}
+
+/// Groups in raw CLI order: `--no-group` clears everything declared before it.
+/// `try_parse_from` callers fall back to `args.group`.
+fn cli_group_specs(args: &ShortlogArgs) -> Vec<String> {
+    let argv: Vec<String> = std::env::args_os()
+        .filter_map(|arg| arg.into_string().ok())
+        .collect();
+    let mut specs = Vec::new();
+    let mut saw_flag = false;
+    let mut iter = argv.iter().skip(1);
+    while let Some(arg) = iter.next() {
+        if arg == "--no-group" {
+            specs.clear();
+            saw_flag = true;
+        } else if let Some(value) = arg.strip_prefix("--group=") {
+            specs.push(value.to_string());
+            saw_flag = true;
+        } else if arg == "--group"
+            && let Some(value) = iter.next()
+        {
+            specs.push(value.clone());
+            saw_flag = true;
+        }
+    }
+    if saw_flag { specs } else { args.group.clone() }
+}
+
+fn parse_group_mode(spec: &str) -> CliResult<GroupMode> {
+    match spec {
+        "author" => Ok(GroupMode::Author),
+        "committer" => Ok(GroupMode::Committer),
+        spec if spec.starts_with("trailer:") => {
             let key = spec["trailer:".len()..].trim();
             if key.is_empty() {
                 return Err(
@@ -207,7 +249,7 @@ fn resolve_group_mode(args: &ShortlogArgs) -> CliResult<GroupMode> {
             }
             Ok(GroupMode::Trailer(key.to_string()))
         }
-        Some(other) => Err(CliError::fatal(format!("unknown --group type '{other}'"))
+        other => Err(CliError::fatal(format!("unknown --group type '{other}'"))
             .with_stable_code(StableErrorCode::CliInvalidArguments)
             .with_hint("expected: author, committer, or trailer:<key>")),
     }
@@ -246,6 +288,33 @@ fn extract_trailer_identities(message: &str, key: &str) -> Vec<(String, String)>
             identities.push((name, email));
         } else {
             identities.push((value.to_string(), String::new()));
+        }
+    }
+    identities
+}
+
+/// Identities contributed by every group for ONE commit, de-duplicated by the
+/// rendered grouping key (Git's per-commit `strset`).
+fn collect_identities<F>(
+    group_modes: &[GroupMode],
+    email: bool,
+    mut per_mode: F,
+) -> Vec<(String, String)>
+where
+    F: FnMut(&GroupMode) -> Vec<(String, String)>,
+{
+    let mut seen = std::collections::HashSet::new();
+    let mut identities = Vec::new();
+    for mode in group_modes {
+        for identity in per_mode(mode) {
+            let key = if email {
+                format!("{} <{}>", identity.0, identity.1)
+            } else {
+                identity.0.clone()
+            };
+            if seen.insert(key) {
+                identities.push(identity);
+            }
         }
     }
     identities
@@ -441,12 +510,12 @@ async fn run_shortlog(
                 .with_stable_code(StableErrorCode::IoReadFailed)
         })?;
         if !buffer.trim().is_empty() {
-            let group_mode = resolve_group_mode(args)?;
+            let group_modes = resolve_group_modes(args)?;
             let wrap = parse_wrap_spec(args.wrap.as_deref())?;
             let commits = parse_shortlog_stdin(&buffer);
             return Ok(aggregate_shortlog_stdin(
                 args,
-                &group_mode,
+                &group_modes,
                 commits,
                 wrap,
                 json_mode,
@@ -486,11 +555,11 @@ async fn run_shortlog(
         });
     }
 
-    let group_mode = resolve_group_mode(args)?;
+    let group_modes = resolve_group_modes(args)?;
     let wrap = parse_wrap_spec(args.wrap.as_deref())?;
     Ok(aggregate_shortlog(
         args,
-        &group_mode,
+        &group_modes,
         &revision,
         commits,
         wrap,
@@ -501,7 +570,7 @@ async fn run_shortlog(
 
 fn aggregate_shortlog(
     args: &ShortlogArgs,
-    group_mode: &GroupMode,
+    group_modes: &[GroupMode],
     revision: &str,
     commits: Vec<Commit>,
     wrap: Option<(usize, usize, usize)>,
@@ -522,16 +591,16 @@ fn aggregate_shortlog(
     for commit in commits {
         // Each commit contributes one identity for author/committer grouping,
         // or zero-or-more for trailer grouping (one per matching trailer value).
-        let identities: Vec<(String, String)> = match group_mode {
-            GroupMode::Author => vec![(commit.author.name.clone(), commit.author.email.clone())],
-            GroupMode::Committer => {
-                vec![(
-                    commit.committer.name.clone(),
-                    commit.committer.email.clone(),
-                )]
+        let identities = collect_identities(group_modes, args.email, |mode| match mode {
+            GroupMode::Author => {
+                vec![(commit.author.name.clone(), commit.author.email.clone())]
             }
+            GroupMode::Committer => vec![(
+                commit.committer.name.clone(),
+                commit.committer.email.clone(),
+            )],
             GroupMode::Trailer(key) => extract_trailer_identities(&commit.message, key),
-        };
+        });
 
         let subject = match &formatter {
             Some(formatter) => {
@@ -737,7 +806,7 @@ fn parse_shortlog_stdin(input: &str) -> Vec<StdinCommit> {
 /// when grouping by committer.
 fn aggregate_shortlog_stdin(
     args: &ShortlogArgs,
-    group_mode: &GroupMode,
+    group_modes: &[GroupMode],
     commits: Vec<StdinCommit>,
     wrap: Option<(usize, usize, usize)>,
     json_mode: bool,
@@ -762,11 +831,11 @@ fn aggregate_shortlog_stdin(
         total_commits += 1;
 
         let subject = commit.message.lines().next().unwrap_or("").to_string();
-        let identities: Vec<(String, String)> = match group_mode {
-            GroupMode::Author => commit.author.into_iter().collect(),
-            GroupMode::Committer => commit.committer.into_iter().collect(),
+        let identities = collect_identities(group_modes, args.email, |mode| match mode {
+            GroupMode::Author => commit.author.clone().into_iter().collect(),
+            GroupMode::Committer => commit.committer.clone().into_iter().collect(),
             GroupMode::Trailer(key) => extract_trailer_identities(&commit.message, key),
-        };
+        });
 
         for (author_name, author_email) in identities {
             let key = if args.email {

@@ -2326,7 +2326,7 @@ PY
 ### Task PM-30: `libra shortlog` 多重 `--group`、`--no-group` 与提交内去重（#1034；自 PM-16 拆出；拆出 PM-35）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-23：`--group` 改为可重复 `Vec<String>` 并新增 `--no-group`；`resolve_group_modes` 按原始 CLI 顺序收集（`--no-group` 清空此前项，`try_parse_from` 回退 `args.group`），空列表回落 `-c`/author；聚合函数接收 `&[GroupMode]`，`collect_identities` 对每个提交按最终分组键（`-e` 时含邮箱）去重（Git per-commit `strset`）。AC1–AC4 由 `command::shortlog_test::shortlog_group_options_match_git` 覆盖，AC5–AC6 由 `shortlog_group_dedups_within_commit` 覆盖；`shortlog_test` 24/24；EN/zh/开发文档与 `COMPATIBILITY.md` 的 `shortlog` 行同步。
 **Description:** 自 `PM-16` 拆出：`--group` 可重复，各分组对每个提交产生的键合并后计数，且同一提交内重复的键（同一 trailer 重复值，或不同分组产生的相同名字）只计一次（Git `strset` 去重）；`--no-group` 清空此前的分组，分组为空时回落到 `author`；未知分组类型以 `LBR-CLI-002` 失败。（按 G-09 拆出 `PM-35` 承接 `format:`/DWIM 格式分组与 `--date`。）
 **Out of scope:** 格式分组与 `--date`（`PM-35`）；`--group` 类型名大小写不敏感与 `-c` 与 `--group` 取并集（尚未排期，重启条件：后续 shortlog 计划）；`-<n>`（`PM-19`）与 mailmap（`PM-40`）。
 **Current evidence:**

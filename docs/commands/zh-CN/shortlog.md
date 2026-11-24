@@ -35,7 +35,8 @@ git log | libra shortlog [-n] [-s] [-e] [--group <TYPE>] [--author <pattern>] [-
 | Summary | `-s` | `--summary` | 抑制提交描述；只显示每个作者的提交数量。 |
 | Email | `-e` | `--email` | 在作者名旁显示 email 地址。启用后，作者按 `name <email>` 对分组。 |
 | Committer | `-c` | `--committer` | 按提交者（committer）身份分组，而不是作者。 |
-| Group | | `--group <TYPE>` | 按 `author`（默认）、`committer` 或 `trailer:<key>`（按指定提交消息 trailer 的每个值分组，例如 `trailer:Co-authored-by`）分组。优先于 `-c`。 |
+| No group | | `--no-group` | 清空此前的 `--group` 取值；分组为空时回落到按 author 分组。 |
+| Group | | `--group <TYPE>` | 按 `author`（默认）、`committer` 或 `trailer:<key>`（按指定提交消息 trailer 的每个值分组，例如 `trailer:Co-authored-by`）分组。可重复：每个分组都为每个提交贡献键，同一提交内重复的键（重复的 trailer 值，或两个分组产生的相同名字）只计一次（Git 的 per-commit `strset`）。优先于 `-c`。 |
 | No merges | | `--no-merges` | 聚合前排除 merge 提交（父提交多于一个）。 |
 | Merges | | `--merges` | 只包含 merge 提交（`--no-merges` 的反向；两者互相覆盖）。 |
 | Top | | `--top <N>` | 只显示排序后的前 N 个身份。 |
