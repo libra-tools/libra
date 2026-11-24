@@ -40,15 +40,17 @@ use std::{
 };
 
 use chrono::Utc;
+use futures::TryStreamExt as _;
 use redb::{
-    Builder as RedbBuilder, ConcurrencyMode, Database as RedbDatabase, WriteTransaction,
-    backends::FileBackend,
+    Builder as RedbBuilder, ConcurrencyMode, Database as RedbDatabase, ReadableTable,
+    TableDefinition, TableHandle, WriteTransaction, backends::FileBackend,
 };
 use sea_orm::sqlx::{
     AssertSqlSafe, Connection as _, Executor as _, Row as _, SqliteConnection,
     sqlite::SqliteConnectOptions,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 
 use crate::{
     internal::db::schema::{CAPTURE_SCHEMA_NAME, CAPTURE_SCHEMA_VERSION, DatabaseRole},
@@ -64,14 +66,17 @@ use crate::{
             AgentSubagentContentRevisionRecord, AgentSubagentLinkRecord, AgentUsageStatsRecord,
             AgentWorkspaceScopeAuditRecord, BridgeLinkSourceType, BridgeOperationStatus,
             BridgeSessionState, CAPTURE_SOURCE_TABLES, CAPTURE_SOURCE_TABLES_COUNT,
-            CaptureAgentKind, CaptureCatalogCopyReceiptRecord, CaptureCheckpointScope,
-            CaptureCompleteness, CaptureCoverageClaimState, CaptureExportJobState, CaptureHashKind,
-            CaptureImportIdentityState, CaptureSchemaVersionRecord, CaptureScopeState,
-            CaptureSessionState, CaptureSourceChannel, CaptureSubagentClaimState,
-            CaptureSubagentLinkState, CaptureSubagentSourceChannel, invert_capture_timestamp,
-            redb_capture_store as redb_cap,
+            CaptureAgentKind, CaptureBatchItem, CaptureBatchPayload,
+            CaptureCatalogCopyReceiptRecord, CaptureCheckpointScope, CaptureCompleteness,
+            CaptureCoverageClaimState, CaptureExportJobState, CaptureHashKind,
+            CaptureImportIdentityState, CaptureQueueHighwater, CaptureQueueLane,
+            CaptureSchemaVersionRecord, CaptureScopeState, CaptureSessionState,
+            CaptureSourceChannel, CaptureSubagentClaimState, CaptureSubagentLinkState,
+            CaptureSubagentSourceChannel, RedbCaptureStore, invert_capture_timestamp,
+            redb_capture_store as redb_cap, validate_capture_batch_item,
+            validate_capture_dedup_key,
         },
-        codec::encode_versioned,
+        codec::{decode_versioned, encode_versioned},
         config_store::LegacyConfigEntry,
         error::{StorageBackendError, StorageResult},
         git_state_store::{
@@ -103,11 +108,16 @@ use crate::{
             LEGACY_SQLITE_DB_FILE, PRIVATE_SUBDIR, REDB_SUBDIR, canonical_capture_redb_rel_path,
             canonical_git_redb_rel_path,
         },
-        meta::init_meta_schema,
-        opener::{CACHE_SIZE_STANDARD_WRITE, begin_write_bounded_blocking},
+        meta::{begin_checked_read, init_meta_schema},
+        opener::{begin_write_bounded_blocking, open_redb_read_only},
         queue::{
-            CAPTURE_QUEUE_SUBDIR, CAPTURE_SPOOL_CAPACITY_LOCK_FILE, CAPTURE_SPOOL_SUBDIR,
-            CAPTURE_SPOOL_TOMBSTONE_SENTINEL, QUEUE_APPEND_LOCK_FILE, QUEUE_WRITER_LOCK_FILE,
+            CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION, CAPTURE_QUEUE_SUBDIR,
+            CAPTURE_SPOOL_CAPACITY_LOCK_FILE, CAPTURE_SPOOL_SUBDIR,
+            CAPTURE_SPOOL_TOMBSTONE_SENTINEL, FrameDecodeError, FrameStreamDecoder,
+            FrameStreamItem, LaneTailMeta, QUEUE_APPEND_LOCK_FILE, QUEUE_LANE_NORMAL_DIR,
+            QUEUE_LANE_PRIORITY_DIR, QUEUE_TAIL_META_BAK_FILE, QUEUE_TAIL_META_FILE,
+            QUEUE_WRITER_LOCK_FILE, crc32c_append, decode_postcard_payload,
+            parse_segment_log_file_name, read_converged_lane_tail_meta, segment_log_file_name,
         },
         redb::{
             config_store as redb_cfg, map_redb_commit_err, map_redb_database_err,
@@ -2956,6 +2966,110 @@ async fn quiesce_forward_repository_phase1_inner(
 /// streaming migration batch (`ADR-RB-07` #1, `RB-10a`, `RB-10i`).
 pub const FORWARD_MIGRATION_STREAM_BATCH_ROWS: usize = 500;
 
+/// Maximum cumulative decoded row payload bytes buffered inside one SQLite
+/// streaming export batch before committing (`2 MiB`), preventing wide-row
+/// tables from exceeding the `64 MiB` extra heap budget even below 500 rows
+/// (`RB-10i`).
+pub const FORWARD_MIGRATION_STREAM_BATCH_MAX_BYTES: usize = 2 * 1024 * 1024;
+
+/// Maximum permitted payload byte size for any single SQLite source row during
+/// Forward Phase 1 streaming export (`4 MiB`, matching `MAX_FRAME_BODY_LEN`),
+/// enforced fail-closed via `OCTET_LENGTH` preflight BEFORE SQLite loads
+/// overflow pages so single or consecutive near-cap rows can never exceed the
+/// `64 MiB` extra heap budget (`RB-10i`).
+pub const FORWARD_MIGRATION_MAX_SINGLE_ROW_BYTES: usize = 4 * 1024 * 1024;
+
+/// Per-database redb page cache budget during Phase 1 streaming export
+/// (`2 MiB` per staged database; `git` handle is closed before `capture` opens),
+/// keeping peak extra heap strictly within [`FORWARD_MIGRATION_EXTRA_HEAP_BUDGET_BYTES`]
+/// (`RB-10i`).
+pub const FORWARD_MIGRATION_REDB_CACHE_BYTES: usize = 2 * 1024 * 1024;
+
+/// Maximum allowed extra heap peak during Phase 1 streaming migration
+/// (`64 MiB`, `ADR-RB-07` #1, `RB-10i`).
+pub const FORWARD_MIGRATION_EXTRA_HEAP_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+
+/// Maximum number of spool events or capture-queue frames committed in a single
+/// direct-ingest write transaction (`128 <= 500`, `RB-10i`).
+pub const FORWARD_MIGRATION_QUEUE_INGEST_BATCH_ITEMS: usize = 128;
+
+/// Maximum cumulative decoded payload bytes buffered inside one direct-ingest
+/// batch before committing (`4 MiB`), matching `MAX_FRAME_BODY_LEN` and bounding
+/// peak heap even for large frames.
+const FORWARD_MIGRATION_INGEST_BATCH_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+/// Maximum accepted byte size of a single `capture-spool/ready/` JSON envelope
+/// (`256 MiB`, matching `spool.rs:25` total spool capacity; parsed via a true
+/// O(1)-heap streaming RFC 8259 scanner without buffering large strings or raw
+/// files into RAM).
+const MAX_SPOOL_ENVELOPE_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Maximum retained UTF-8 bytes per free-form text replay field (`prompt`,
+/// `assistant_message`) in [`SpoolDirectIngestEventReceipt`] (`16 KiB`).
+/// Longer values are streamed in O(1) RAM while preserving exact byte length,
+/// SHA-256 digest, and a deterministic UTF-8 prefix (`RB-10i`).
+pub const MAX_SPOOL_RETAINED_TEXT_BYTES: usize = 16 * 1024;
+
+/// Maximum retained compact JSON bytes per structured replay payload field
+/// (`tool_input`, `tool_response`) in [`SpoolDirectIngestEventReceipt`] (`16 KiB`).
+pub const MAX_SPOOL_RETAINED_JSON_BYTES: usize = 16 * 1024;
+
+/// Maximum retained UTF-8 bytes per bounded metadata/identifier/path field
+/// (`session_ref`, `tool_name`, `model`, `source`, `tool_link.*`,
+/// `child_hints.*`, `context.*`, `event.session_id`) in
+/// [`SpoolDirectIngestEventReceipt`] (`4 KiB`).
+pub const MAX_SPOOL_RETAINED_META_STR_BYTES: usize = 4 * 1024;
+
+/// Maximum retained [`RedactionMatch`] sample entries per migrated spool event;
+/// any additional matches are folded into `dropped_matches` in O(1) RAM.
+const MAX_SPOOL_REDACTION_MATCHES: usize = 256;
+
+/// Maximum JSON nesting depth accepted by the streaming spool JSON scanner,
+/// matching `serde_json::from_slice`'s default `128`-level recursion limit
+/// used by `live_pipeline.rs`.
+const MAX_SPOOL_JSON_DEPTH: usize = 128;
+
+/// Companion chunked raw-envelope table inside `capture.gen-<id>.redb` storing
+/// 100% lossless, fixed-size (`64 KiB`) raw UTF-8 JSON chunks for any migrated
+/// `capture-spool/ready/` event whose fields exceeded the inline receipt
+/// retention caps OR whose `redaction.matches` exceeded 256 entries (`RB-10i`).
+///
+/// Keyed by `(dedup_key, chunk_index: u32)` -> `&[u8]` (each chunk `<= 64 KiB`)
+/// and streamed directly from the read-only source file in bounded `2 MiB`
+/// transactions so even `256 MiB` envelopes remain 100% lossless in O(1) heap.
+pub const MIGRATED_SPOOL_ENVELOPE_CHUNKS_TABLE: TableDefinition<'static, (&str, u32), &[u8]> =
+    TableDefinition::new("migrated_spool_envelope_chunks");
+
+/// Chunk size (`64 KiB`) for lossless chunked raw spool envelope persistence.
+const SPOOL_ENVELOPE_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Maximum number of `64 KiB` raw spool chunks committed per write transaction
+/// (`32 × 64 KiB = 2 MiB`, strictly `<= 128 <= 500` items/batch).
+const SPOOL_ENVELOPE_CHUNKS_PER_TX: usize = 32;
+
+/// Dedicated internal redb table inside `capture.gen-<id>.redb` storing
+/// durable, bounded, nanosecond-ordered spool replay receipts produced by
+/// Forward Phase 1 read-only direct ingest (`RB-10i`).
+///
+/// Keyed by `(session_id, event_ts_secs, event_ts_nanos, is_terminal_u8, dedup_key)`
+/// so per-event writes are O(1) regardless of how many spool events belong to
+/// a single session, and reading back any session yields exact deterministic
+/// chronological order independent of spool file arrival order (`0-*` vs `1-*`).
+pub const MIGRATED_SPOOL_RECEIPTS_TABLE: TableDefinition<
+    'static,
+    (&str, i64, u32, u8, &str),
+    &[u8],
+> = TableDefinition::new("migrated_spool_receipts");
+
+/// Subdirectory inside `<common_storage>/private/capture-spool/` holding
+/// confirmed ready-to-consume legacy hook envelopes (`spool.rs:20`).
+#[cfg(any(not(unix), test))]
+const CAPTURE_SPOOL_READY_SUBDIR: &str = "ready";
+
+/// Streaming read chunk size (`64 KiB`) used when authenticating committed
+/// capture-queue segment CRC32C checksums without buffering whole segments.
+const QUEUE_CRC_READ_BUF_BYTES: usize = 64 * 1024;
+
 /// Sub-chunk size for Layout B primary-key coverage probes against `capture.db`
 /// so composite-key `WHERE` predicates stay strictly below SQLite's bind-variable
 /// and expression-depth limits.
@@ -3014,8 +3128,48 @@ pub enum LegacyRepositoryLayout {
     LayoutC,
 }
 
+/// Summary of read-only direct ingestion from
+/// `<common_storage>/private/capture-spool/ready/` into
+/// `capture.gen-<id>.redb.tmp` during forward migration Phase 1 (`RB-10i`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SpoolDirectIngestReport {
+    /// Total regular event files read from `capture-spool/ready/`.
+    pub files_read: u64,
+    /// Pending spool events newly applied into `capture.gen-<id>.redb.tmp`.
+    pub applied_events: u64,
+    /// Pending spool events skipped via `capture_dedup_keys` idempotency.
+    pub deduplicated_events: u64,
+    /// Number of bounded write transactions committed during spool ingest.
+    pub batches_committed: u64,
+    /// `true` when `capture-spool/ready` is already a fenced `0400` tombstone sentinel.
+    pub already_fenced: bool,
+}
+
+/// Summary of read-only direct ingestion from
+/// `<common_storage>/private/capture-queue/` into `capture.gen-<id>.redb.tmp`
+/// during forward migration Phase 1 (`RB-10i`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QueueDirectIngestReport {
+    /// Total valid frames decoded from the `priority/` lane.
+    pub priority_frames_read: u64,
+    /// Total valid frames decoded from the `normal/` lane.
+    pub normal_frames_read: u64,
+    /// Queue frames newly applied into `capture.gen-<id>.redb.tmp`.
+    pub applied_frames: u64,
+    /// Queue frames skipped as duplicates (`capture_dedup_keys` or identical audit replay).
+    pub deduplicated_frames: u64,
+    /// Authoritative priority-lane highwater persisted in `capture.gen-<id>.redb.tmp`
+    /// (capped at on-disk `LTM2` `(active_seg, committed_len)`).
+    pub priority_highwater: CaptureQueueHighwater,
+    /// Authoritative normal-lane highwater persisted in `capture.gen-<id>.redb.tmp`
+    /// (capped at on-disk `LTM2` `(active_seg, committed_len)`).
+    pub normal_highwater: CaptureQueueHighwater,
+    /// Number of bounded write transactions committed during queue ingest.
+    pub batches_committed: u64,
+}
+
 /// Summary report returned after forward Phase 1 streaming export into `.tmp`
-/// redb files (`RB-10a`).
+/// redb files (`RB-10a`, `RB-10i`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForwardPhase1ExportReport {
     /// Detected and verified legacy SQLite layout.
@@ -3030,8 +3184,15 @@ pub struct ForwardPhase1ExportReport {
     pub git_table_counts: BTreeMap<&'static str, u64>,
     /// Exported row count for every one of the 25 capture catalog source tables.
     pub capture_table_counts: BTreeMap<&'static str, u64>,
-    /// Peak row count observed in any single streaming batch (`<= 500`).
+    /// Peak row/item count observed in any single streaming batch (`<= 500`).
     pub max_batch_rows: usize,
+    /// Total streaming batches committed across SQLite table exports, spool
+    /// direct ingest, and queue direct ingest (`RB-10i`).
+    pub total_streaming_batches: u64,
+    /// Read-only direct ingest summary for `capture-spool/ready/` (`RB-10i`).
+    pub spool_ingest: SpoolDirectIngestReport,
+    /// Read-only direct ingest summary for `capture-queue/` (`RB-10i`).
+    pub queue_ingest: QueueDirectIngestReport,
 }
 
 /// Return the canonical Phase 1 staged Git redb temporary path
@@ -4103,7 +4264,7 @@ mod win_tmp_guard {
 
     use super::*;
 
-    type WinFileId = (u32, u32, u32);
+    pub(super) type WinFileId = (u32, u32, u32);
 
     pub(super) struct WinHandleGuard(HANDLE);
 
@@ -4145,7 +4306,7 @@ mod win_tmp_guard {
         )
     }
 
-    fn open_pinned_non_reparse_dir(
+    pub(super) fn open_pinned_non_reparse_dir(
         dir_path: &Path,
         subject: &'static str,
     ) -> StorageResult<(WinHandleGuard, WinFileId)> {
@@ -4177,6 +4338,62 @@ mod win_tmp_guard {
             });
         }
         Ok((guard, id_from_info(&info)))
+    }
+
+    pub(super) fn open_pinned_non_reparse_dir_optional(
+        dir_path: &Path,
+        subject: &'static str,
+    ) -> StorageResult<Option<(WinHandleGuard, WinFileId)>> {
+        let wide = encode_wide_nul(dir_path);
+        // Omit `FILE_SHARE_DELETE` so the directory stays pinned against
+        // rename/junction replacement for the full lifetime of `WinHandleGuard`.
+        // SAFETY: `wide` is NUL-terminated UTF-16.
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::NotFound {
+                return Ok(None);
+            }
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!("forward migration Phase 1 rejected unsafe {subject}"),
+            });
+        }
+        let guard = WinHandleGuard(handle);
+        let info = file_info(guard.0, subject)?;
+        if (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+            || (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0
+        {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!("forward migration Phase 1 rejected unsafe {subject}"),
+            });
+        }
+        Ok(Some((guard, id_from_info(&info))))
+    }
+
+    pub(super) fn verify_pinned_dir_ids(
+        pinned: &[(&Path, WinFileId, &'static str)],
+    ) -> StorageResult<()> {
+        for &(dir_path, expected_id, subject) in pinned {
+            let (_check_guard, current_id) = open_pinned_non_reparse_dir(dir_path, subject)?;
+            if current_id != expected_id {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: format!(
+                        "forward migration Phase 1 detected directory identity drift on {subject}"
+                    ),
+                });
+            }
+        }
+        Ok(())
     }
 
     pub(super) struct TmpRedbFileGuard {
@@ -4371,7 +4588,7 @@ mod win_tmp_guard {
         let mut builder = RedbBuilder::new();
         builder
             .set_concurrency_mode(ConcurrencyMode::MultiWriter)
-            .set_cache_size(CACHE_SIZE_STANDARD_WRITE);
+            .set_cache_size(FORWARD_MIGRATION_REDB_CACHE_BYTES);
         let db = builder
             .create_with_backend(FileBackend::new(file))
             .map_err(|err| {
@@ -4618,7 +4835,7 @@ fn create_redb_tmp_database(
     let mut builder = RedbBuilder::new();
     builder
         .set_concurrency_mode(ConcurrencyMode::MultiWriter)
-        .set_cache_size(CACHE_SIZE_STANDARD_WRITE);
+        .set_cache_size(FORWARD_MIGRATION_REDB_CACHE_BYTES);
     let db = builder
         .create_with_backend(FileBackend::new(file))
         .map_err(|err| map_redb_database_err(err, role, "create staged redb temporary database"))?;
@@ -5099,13 +5316,138 @@ struct StreamTableSpec<'a> {
     rowid_expr: &'a str,
 }
 
+/// Tracks streaming batch metrics (`<= 500` rows/items per commit) across all
+/// SQLite table exports, spool direct ingest, and queue direct ingest (`RB-10i`).
+struct ExportStreamTelemetry<'a> {
+    max_batch_rows: usize,
+    total_batches: u64,
+    #[cfg(test)]
+    on_batch_committed: Option<&'a mut dyn FnMut(&'static str, usize)>,
+    #[cfg(not(test))]
+    _marker: std::marker::PhantomData<&'a ()>,
+}
+
+impl<'a> ExportStreamTelemetry<'a> {
+    fn new() -> Self {
+        Self {
+            max_batch_rows: 0,
+            total_batches: 0,
+            #[cfg(test)]
+            on_batch_committed: None,
+            #[cfg(not(test))]
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_observer(observer: &'a mut dyn FnMut(&'static str, usize)) -> Self {
+        Self {
+            max_batch_rows: 0,
+            total_batches: 0,
+            on_batch_committed: Some(observer),
+        }
+    }
+
+    fn record_batch(&mut self, source: &'static str, batch_len: usize) -> StorageResult<()> {
+        if batch_len == 0 || batch_len > FORWARD_MIGRATION_STREAM_BATCH_ROWS {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "streaming export batch on `{source}` size {batch_len} outside 1..={FORWARD_MIGRATION_STREAM_BATCH_ROWS}"
+                ),
+            });
+        }
+        if batch_len > self.max_batch_rows {
+            self.max_batch_rows = batch_len;
+        }
+        self.total_batches = self.total_batches.saturating_add(1);
+        #[cfg(test)]
+        if let Some(cb) = self.on_batch_committed.as_deref_mut() {
+            cb(source, batch_len);
+        }
+        Ok(())
+    }
+}
+
+/// Estimate the decoded payload byte footprint of one `SqliteRow` using
+/// zero-copy column borrows (`&str` / `&[u8]`) so streaming batch flushes stay
+/// strictly bounded by BOTH row count (`<= 500`) AND byte budget (`<= 4 MiB`).
+fn estimate_sqlite_row_bytes(row: &sea_orm::sqlx::sqlite::SqliteRow) -> usize {
+    use sea_orm::sqlx::{TypeInfo as _, ValueRef as _};
+    let mut total = 64usize;
+    for idx in 0..row.len() {
+        let Ok(raw) = row.try_get_raw(idx) else {
+            total = total.saturating_add(16);
+            continue;
+        };
+        if raw.is_null() {
+            continue;
+        }
+        match raw.type_info().name() {
+            "TEXT" => {
+                if let Ok(s) = row.try_get::<&str, _>(idx) {
+                    total = total.saturating_add(s.len());
+                }
+            }
+            "BLOB" => {
+                if let Ok(b) = row.try_get::<&[u8], _>(idx) {
+                    total = total.saturating_add(b.len());
+                }
+            }
+            _ => {
+                total = total.saturating_add(16);
+            }
+        }
+    }
+    total
+}
+
+async fn preflight_sqlite_table_max_row_bytes(
+    conn: &mut SqliteConnection,
+    source_role: DatabaseRole,
+    table: &'static str,
+) -> StorageResult<usize> {
+    let pragma_sql = format!("PRAGMA table_info(\"{table}\")");
+    let info_rows = sea_orm::sqlx::query(AssertSqlSafe(pragma_sql.as_str()))
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|err| map_export_sqlite_err(source_role, table, "inspect columns", &err))?;
+    if info_rows.is_empty() {
+        return Ok(0);
+    }
+    let mut sum_terms = Vec::with_capacity(info_rows.len());
+    for info_row in &info_rows {
+        let col_name: String = col_get(info_row, 1, source_role, table, "table_info.name")?;
+        let escaped = col_name.replace('"', "\"\"");
+        sum_terms.push(format!(
+            "CASE WHEN typeof(\"{escaped}\") IN ('text', 'blob') THEN COALESCE(OCTET_LENGTH(\"{escaped}\"), 0) ELSE 8 END"
+        ));
+    }
+    let max_sql = format!(
+        "SELECT COALESCE(MAX({}), 0) FROM \"{table}\"",
+        sum_terms.join(" + ")
+    );
+    let max_row_bytes: i64 = sea_orm::sqlx::query_scalar(AssertSqlSafe(max_sql.as_str()))
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(|err| map_export_sqlite_err(source_role, table, "preflight row size", &err))?;
+    let max_row_bytes = usize::try_from(max_row_bytes.max(0)).unwrap_or(usize::MAX);
+    if max_row_bytes > FORWARD_MIGRATION_MAX_SINGLE_ROW_BYTES {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration Phase 1 rejected single SQLite row in `{table}` exceeding {FORWARD_MIGRATION_MAX_SINGLE_ROW_BYTES}-byte memory-budget cap"
+            ),
+        });
+    }
+    Ok(max_row_bytes)
+}
+
 async fn stream_sqlite_table_to_redb<RowItem, FDecode, FWrite>(
     conn: &mut SqliteConnection,
     db: &RedbDatabase,
     spec: StreamTableSpec<'_>,
     mut decode_row: FDecode,
     mut write_batch: FWrite,
-    max_batch_rows: &mut usize,
+    max_batch_rows: &mut ExportStreamTelemetry<'_>,
 ) -> StorageResult<u64>
 where
     FDecode: FnMut(&sea_orm::sqlx::sqlite::SqliteRow) -> StorageResult<RowItem>,
@@ -5118,34 +5460,101 @@ where
         select_cols,
         rowid_expr,
     } = spec;
+    // Fail closed BEFORE SQLite fetches overflow pages if any single row
+    // exceeds `FORWARD_MIGRATION_MAX_SINGLE_ROW_BYTES` (`4 MiB`), AND derive
+    // `max_safe_query_rows` from the table's actual widest row so SQLx's
+    // background worker channel (default 50-row prefetch) can NEVER buffer
+    // multiple consecutive wide/near-cap rows above our memory budget!
+    let max_row_bytes = preflight_sqlite_table_max_row_bytes(conn, source_role, table).await?;
+    let max_safe_query_rows = FORWARD_MIGRATION_STREAM_BATCH_MAX_BYTES
+        .checked_div(max_row_bytes)
+        .map_or(FORWARD_MIGRATION_STREAM_BATCH_ROWS, |n| {
+            n.clamp(1, FORWARD_MIGRATION_STREAM_BATCH_ROWS)
+        });
     let first_sql = format!(
         "SELECT {rowid_expr}, {select_cols} FROM \"{table}\" ORDER BY {rowid_expr} ASC LIMIT ?"
     );
     let next_sql = format!(
         "SELECT {rowid_expr}, {select_cols} FROM \"{table}\" WHERE {rowid_expr} > ? ORDER BY {rowid_expr} ASC LIMIT ?"
     );
-    let batch_limit = i64::try_from(FORWARD_MIGRATION_STREAM_BATCH_ROWS).unwrap_or(500);
     let mut last_rowid: Option<i64> = None;
+    let mut carry: Option<(i64, usize, RowItem)> = None;
+    let mut table_exhausted = false;
     let mut total_exported = 0u64;
 
     loop {
-        let rows = match last_rowid {
-            None => sea_orm::sqlx::query(AssertSqlSafe(first_sql.as_str()))
-                .bind(batch_limit)
-                .fetch_all(&mut *conn)
-                .await
-                .map_err(|err| map_export_sqlite_err(source_role, table, "select batch", &err))?,
-            Some(cursor) => sea_orm::sqlx::query(AssertSqlSafe(next_sql.as_str()))
-                .bind(cursor)
-                .bind(batch_limit)
-                .fetch_all(&mut *conn)
-                .await
-                .map_err(|err| map_export_sqlite_err(source_role, table, "select batch", &err))?,
-        };
-        if rows.is_empty() {
+        let mut decoded: Vec<RowItem> = Vec::new();
+        let mut batch_bytes = 0usize;
+
+        if let Some((cid, cbytes, citem)) = carry.take() {
+            last_rowid = Some(cid);
+            batch_bytes = cbytes;
+            decoded.push(citem);
+        }
+
+        while !table_exhausted
+            && decoded.len() < FORWARD_MIGRATION_STREAM_BATCH_ROWS
+            && batch_bytes < FORWARD_MIGRATION_STREAM_BATCH_MAX_BYTES
+        {
+            let remaining_rows = FORWARD_MIGRATION_STREAM_BATCH_ROWS.saturating_sub(decoded.len());
+            let effective_limit = remaining_rows.min(max_safe_query_rows);
+            let query_limit = i64::try_from(effective_limit).unwrap_or(1);
+            let mut fetched_from_query = 0usize;
+            let mut stopped_early_for_bytes = false;
+
+            {
+                let mut stream = match last_rowid {
+                    None => sea_orm::sqlx::query(AssertSqlSafe(first_sql.as_str()))
+                        .bind(query_limit)
+                        .fetch(&mut *conn),
+                    Some(cursor) => sea_orm::sqlx::query(AssertSqlSafe(next_sql.as_str()))
+                        .bind(cursor)
+                        .bind(query_limit)
+                        .fetch(&mut *conn),
+                };
+                while let Some(row) = stream.try_next().await.map_err(|err| {
+                    map_export_sqlite_err(source_role, table, "select batch", &err)
+                })? {
+                    fetched_from_query = fetched_from_query.saturating_add(1);
+                    let rowid: i64 = col_get(&row, 0, source_role, table, "rowid")?;
+                    let row_bytes = estimate_sqlite_row_bytes(&row);
+                    if row_bytes > FORWARD_MIGRATION_MAX_SINGLE_ROW_BYTES {
+                        return Err(StorageBackendError::BackendInternal {
+                            detail: format!(
+                                "forward migration Phase 1 rejected single SQLite row in `{table}` exceeding {FORWARD_MIGRATION_MAX_SINGLE_ROW_BYTES}-byte memory-budget cap"
+                            ),
+                        });
+                    }
+                    let item = decode_row(&row)?;
+                    // `row` drops immediately at the end of this iteration so we
+                    // never retain both `Vec<SqliteRow>` and `Vec<RowItem>`.
+                    if !decoded.is_empty()
+                        && batch_bytes.saturating_add(row_bytes)
+                            > FORWARD_MIGRATION_STREAM_BATCH_MAX_BYTES
+                    {
+                        carry = Some((rowid, row_bytes, item));
+                        stopped_early_for_bytes = true;
+                        break;
+                    }
+                    last_rowid = Some(rowid);
+                    batch_bytes = batch_bytes.saturating_add(row_bytes);
+                    decoded.push(item);
+                }
+            }
+
+            if stopped_early_for_bytes {
+                break;
+            }
+            if fetched_from_query < effective_limit {
+                table_exhausted = true;
+                break;
+            }
+        }
+
+        if decoded.is_empty() {
             break;
         }
-        let batch_len = rows.len();
+        let batch_len = decoded.len();
         if batch_len > FORWARD_MIGRATION_STREAM_BATCH_ROWS {
             return Err(StorageBackendError::BackendInternal {
                 detail: format!(
@@ -5153,26 +5562,20 @@ where
                 ),
             });
         }
-        if batch_len > *max_batch_rows {
-            *max_batch_rows = batch_len;
-        }
-
-        let mut decoded = Vec::with_capacity(batch_len);
-        for row in &rows {
-            let rowid: i64 = col_get(row, 0, source_role, table, "rowid")?;
-            last_rowid = Some(rowid);
-            decoded.push(decode_row(row)?);
-        }
 
         let wtx = begin_write_bounded_blocking(db, target_role, EXPORT_TMP_REDB_WRITE_TIMEOUT)?;
         write_batch(&wtx, &decoded)?;
+        // Drop decoded Rust rows BEFORE `wtx.commit()` flushes redb dirty pages
+        // so decoded batch buffers and commit I/O buffers never overlap at peak.
+        drop(decoded);
         wtx.commit()
             .map_err(|err| map_redb_commit_err(err, "commit streaming migration batch"))?;
+        if batch_bytes >= 1024 * 1024 {
+            let _ = conn.execute("PRAGMA shrink_memory;").await;
+        }
+        max_batch_rows.record_batch(table, batch_len)?;
 
         total_exported = total_exported.saturating_add(batch_len as u64);
-        if batch_len < FORWARD_MIGRATION_STREAM_BATCH_ROWS {
-            break;
-        }
     }
 
     Ok(total_exported)
@@ -5303,7 +5706,7 @@ async fn export_repository_tables_to_redb(
     conn: &mut SqliteConnection,
     db: &RedbDatabase,
     counts: &mut BTreeMap<&'static str, u64>,
-    max_batch_rows: &mut usize,
+    max_batch_rows: &mut ExportStreamTelemetry<'_>,
 ) -> StorageResult<()> {
     let r = DatabaseRole::Repository;
 
@@ -6145,7 +6548,7 @@ async fn export_rb05_state_tables_to_redb(
     conn: &mut SqliteConnection,
     db: &RedbDatabase,
     counts: &mut BTreeMap<&'static str, u64>,
-    max_batch_rows: &mut usize,
+    max_batch_rows: &mut ExportStreamTelemetry<'_>,
 ) -> StorageResult<()> {
     let r = DatabaseRole::Repository;
     let cv = redb_state::GIT_STATE_CODEC_VERSION;
@@ -7511,7 +7914,7 @@ async fn export_rb05b_state_tables_to_redb(
     conn: &mut SqliteConnection,
     db: &RedbDatabase,
     counts: &mut BTreeMap<&'static str, u64>,
-    max_batch_rows: &mut usize,
+    max_batch_rows: &mut ExportStreamTelemetry<'_>,
 ) -> StorageResult<()> {
     let r = DatabaseRole::Repository;
     let cv = redb_state::GIT_STATE_CODEC_VERSION;
@@ -9533,7 +9936,7 @@ async fn export_capture_tables_to_redb(
     opts: CaptureExportOptions,
     db: &RedbDatabase,
     counts: &mut BTreeMap<&'static str, u64>,
-    max_batch_rows: &mut usize,
+    max_batch_rows: &mut ExportStreamTelemetry<'_>,
 ) -> StorageResult<()> {
     let CaptureExportOptions {
         source_role,
@@ -12710,6 +13113,4508 @@ async fn export_capture_tables_to_redb(
     Ok(())
 }
 
+// ============================================================================
+// Phase 1 Read-Only Direct Ingest: `capture-spool/ready/` & `capture-queue/`
+// ============================================================================
+
+/// Check whether a recorded spool `context.storage_path` refers to the same
+/// repository storage root as `expected_storage`, matching `live_pipeline.rs:383`.
+fn same_storage_root(recorded: &Path, expected: &Path) -> bool {
+    match (recorded.canonicalize(), expected.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => recorded == expected,
+    }
+}
+
+/// Returns `true` when `kind` is one of the exact 14 snake_case
+/// `LifecycleEventKind` wire values emitted by `encode_spool_envelope`
+/// (`live_pipeline.rs:2273-2291`).
+fn is_valid_spool_lifecycle_event_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "session_start"
+            | "turn_start"
+            | "tool_use"
+            | "model_update"
+            | "compaction"
+            | "compaction_completed"
+            | "permission_request"
+            | "source_enabled"
+            | "source_disabled"
+            | "turn_end"
+            | "session_end"
+            | "subagent_start"
+            | "subagent_end"
+            | "turn_interrupted"
+    )
+}
+
+/// Returns `true` when `cmd` is one of the exact 11 `ProviderHookCommand` wire
+/// strings accepted by `live_pipeline.rs:2256-2271`.
+fn is_valid_spool_hook_command(cmd: &str) -> bool {
+    matches!(
+        cmd,
+        "session-start"
+            | "prompt"
+            | "tool-use"
+            | "permission-request"
+            | "model-update"
+            | "compaction"
+            | "stop"
+            | "session-end"
+            | "subagent-start"
+            | "subagent-end"
+            | "observe"
+    )
+}
+
+/// Returns `true` when `scheme` is one of the exact 4 `LifecycleIdentityScheme`
+/// wire strings accepted by `live_pipeline.rs:2293-2301`.
+fn is_valid_spool_identity_scheme(scheme: &str) -> bool {
+    matches!(
+        scheme,
+        "native_replay_hmac_v2"
+            | "fallback_action_hmac_v1"
+            | "generic_lifecycle_uuid_v5"
+            | "import_uuid_v5"
+    )
+}
+
+fn validate_spool_text_field(
+    value: &str,
+    field: &'static str,
+    allow_empty: bool,
+) -> StorageResult<()> {
+    if (!allow_empty && value.is_empty()) || value.contains('\0') {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration Phase 1 rejected invalid capture-spool envelope field `{field}`"
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn sha256_hex_from_hasher(hasher: Sha256) -> String {
+    use std::fmt::Write as _;
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(64);
+    for byte in digest {
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
+}
+
+/// Bounded UTF-8 text field captured from a legacy `capture-spool/ready/`
+/// envelope in O(1) heap (`RB-10i`).
+///
+/// Values within the field's retention cap are preserved 100% losslessly
+/// (`truncated == false`); arbitrarily large values (up to the `256 MiB` spool
+/// envelope cap) are streamed without buffering while preserving exact
+/// `original_bytes`, full-payload `sha256_hex`, and a deterministic UTF-8
+/// prefix.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BoundedSpoolText {
+    /// Full lossless value when `!truncated`, or deterministic UTF-8 prefix
+    /// capped at the field's byte budget when `truncated == true`.
+    pub value: String,
+    /// Exact original UTF-8 byte length observed in the spool JSON.
+    pub original_bytes: u64,
+    /// `true` when the original value exceeded the bounded retention cap.
+    pub truncated: bool,
+    /// Lowercase SHA-256 hex digest of the full original UTF-8 bytes.
+    pub sha256_hex: String,
+}
+
+impl BoundedSpoolText {
+    /// Return the full lossless string if the field was not truncated.
+    #[must_use]
+    pub fn full_str(&self) -> Option<&str> {
+        (!self.truncated).then_some(self.value.as_str())
+    }
+
+    /// Estimate retained heap bytes owned by this field.
+    #[must_use]
+    pub fn retained_bytes(&self) -> usize {
+        self.value
+            .len()
+            .saturating_add(self.sha256_hex.len())
+            .saturating_add(48)
+    }
+}
+
+/// Bounded canonical JSON payload captured from a legacy `capture-spool/ready/`
+/// envelope (`model`, `source`, `tool_input`, `tool_response`) in O(1) heap
+/// (`RB-10i`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BoundedSpoolJson {
+    /// Compact canonical JSON text (100% valid lossless JSON when `!truncated`,
+    /// or bounded UTF-8 prefix when `truncated == true`).
+    pub json_text: String,
+    /// Exact byte length of the compact canonical streamed JSON representation.
+    pub original_bytes: u64,
+    /// `true` when the canonical JSON representation exceeded the retention cap.
+    pub truncated: bool,
+    /// Lowercase SHA-256 hex digest of the full compact canonical JSON stream.
+    pub sha256_hex: String,
+}
+
+impl BoundedSpoolJson {
+    /// Parse back the exact lossless `serde_json::Value` when `!truncated`.
+    #[must_use]
+    pub fn to_lossless_value(&self) -> Option<serde_json::Value> {
+        if self.truncated {
+            return None;
+        }
+        serde_json::from_str(&self.json_text).ok()
+    }
+
+    /// Estimate retained heap bytes owned by this field.
+    #[must_use]
+    pub fn retained_bytes(&self) -> usize {
+        self.json_text
+            .len()
+            .saturating_add(self.sha256_hex.len())
+            .saturating_add(48)
+    }
+}
+
+/// Bounded `tool_link` metadata preserved in [`SpoolDirectIngestEventReceipt`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SpoolToolLinkReceipt {
+    pub tool: BoundedSpoolText,
+    pub parent: Option<BoundedSpoolText>,
+}
+
+impl SpoolToolLinkReceipt {
+    fn retained_bytes(&self) -> usize {
+        self.tool.retained_bytes().saturating_add(
+            self.parent
+                .as_ref()
+                .map_or(0, BoundedSpoolText::retained_bytes),
+        )
+    }
+}
+
+/// Bounded subagent `child_hints` metadata preserved in
+/// [`SpoolDirectIngestEventReceipt`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SpoolChildHintsReceipt {
+    pub kind: String,
+    pub role: Option<String>,
+    pub current_or_parent_path: Option<BoundedSpoolText>,
+    pub child_path: Option<BoundedSpoolText>,
+    pub child_id: Option<BoundedSpoolText>,
+    pub turn_id: Option<BoundedSpoolText>,
+}
+
+impl SpoolChildHintsReceipt {
+    fn retained_bytes(&self) -> usize {
+        self.kind
+            .len()
+            .saturating_add(self.role.as_ref().map_or(0, String::len))
+            .saturating_add(
+                self.current_or_parent_path
+                    .as_ref()
+                    .map_or(0, BoundedSpoolText::retained_bytes),
+            )
+            .saturating_add(
+                self.child_path
+                    .as_ref()
+                    .map_or(0, BoundedSpoolText::retained_bytes),
+            )
+            .saturating_add(
+                self.child_id
+                    .as_ref()
+                    .map_or(0, BoundedSpoolText::retained_bytes),
+            )
+            .saturating_add(
+                self.turn_id
+                    .as_ref()
+                    .map_or(0, BoundedSpoolText::retained_bytes),
+            )
+            .saturating_add(64)
+    }
+}
+
+struct RawSpoolContext {
+    provider_session_id: String,
+    working_dir: String,
+    storage_path: String,
+    worktree_root: String,
+}
+
+struct RawSpoolEvent {
+    kind: String,
+    session_id: String,
+    session_ref: Option<BoundedSpoolText>,
+    prompt: Option<BoundedSpoolText>,
+    model: Option<BoundedSpoolJson>,
+    source: Option<BoundedSpoolJson>,
+    tool_name: Option<BoundedSpoolText>,
+    tool_input: Option<BoundedSpoolJson>,
+    tool_response: Option<BoundedSpoolJson>,
+    assistant_message: Option<BoundedSpoolText>,
+    timestamp: String,
+}
+
+struct RawSpoolEnvelope {
+    version: u64,
+    agent_kind: String,
+    hook_name: String,
+    hook_command: String,
+    provider_kind: String,
+    provider_source: String,
+    frame_bytes: u64,
+    event_id: String,
+    identity_scheme: String,
+    dedup_key: Option<String>,
+    hook_deadline: bool,
+    display_batch_limit: Option<u32>,
+    tool_link: Option<SpoolToolLinkReceipt>,
+    child_hints: Option<SpoolChildHintsReceipt>,
+    context: RawSpoolContext,
+    event: RawSpoolEvent,
+    redaction: crate::internal::ai::observed_agents::RedactionReport,
+    redaction_matches_overflow: bool,
+}
+
+/// Durable, bounded, per-event spool replay receipt stored in
+/// [`MIGRATED_SPOOL_RECEIPTS_TABLE`] inside `capture.gen-<id>.redb` (`RB-10i`).
+///
+/// Preserves all replay inputs needed by Track B (`RB-26`/`RB-28`) to
+/// materialize pending `turn_end`, `session_end`, `subagent_start`, and
+/// `subagent_end` checkpoints — including `prompt`, `assistant_message`,
+/// `model`, `source`, `tool_name`, `tool_input`, `tool_response`,
+/// `session_ref`, `tool_link`, `child_hints`, per-event `redaction_report_json`,
+/// and full nanosecond RFC 3339 timestamp — even after Phase 2 fences
+/// `capture-spool/ready/` into a `0400` tombstone.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SpoolDirectIngestEventReceipt {
+    pub session_id: String,
+    pub event_id: String,
+    pub dedup_key: String,
+    pub agent_kind: String,
+    pub event_kind: String,
+    pub hook_name: String,
+    pub hook_command: String,
+    pub provider_kind: String,
+    pub provider_source: String,
+    pub identity_scheme: String,
+    pub frame_bytes: u64,
+    pub hook_deadline: bool,
+    pub display_batch_limit: Option<u32>,
+    pub provider_session_id: String,
+    pub event_session_id: String,
+    pub working_dir: String,
+    pub worktree_root: String,
+    pub event_ts: i64,
+    pub event_ts_nanos: u32,
+    pub timestamp_rfc3339: String,
+    pub is_terminal: bool,
+    pub needs_checkpoint_materialization: bool,
+    pub session_ref: Option<BoundedSpoolText>,
+    pub prompt: Option<BoundedSpoolText>,
+    pub model: Option<BoundedSpoolJson>,
+    pub source: Option<BoundedSpoolJson>,
+    pub tool_name: Option<BoundedSpoolText>,
+    pub tool_input: Option<BoundedSpoolJson>,
+    pub tool_response: Option<BoundedSpoolJson>,
+    pub assistant_message: Option<BoundedSpoolText>,
+    pub tool_link: Option<SpoolToolLinkReceipt>,
+    pub child_hints: Option<SpoolChildHintsReceipt>,
+    pub redaction_report_json: String,
+    /// `true` when any field exceeded inline retention caps or `redaction.matches`
+    /// exceeded 256 entries, so the 100% lossless raw UTF-8 JSON envelope is
+    /// persisted in `64 KiB` chunks inside [`MIGRATED_SPOOL_ENVELOPE_CHUNKS_TABLE`].
+    pub has_chunked_raw_envelope: bool,
+    /// Exact raw UTF-8 byte length of the source spool JSON envelope.
+    pub raw_envelope_bytes: u64,
+    /// Lowercase SHA-256 hex digest of the full raw source spool JSON envelope.
+    pub raw_envelope_sha256_hex: String,
+}
+
+impl SpoolDirectIngestEventReceipt {
+    /// Estimate total heap bytes retained across every field of this receipt.
+    #[must_use]
+    pub fn retained_bytes(&self) -> usize {
+        self.session_id
+            .len()
+            .saturating_add(self.event_id.len())
+            .saturating_add(self.dedup_key.len())
+            .saturating_add(self.agent_kind.len())
+            .saturating_add(self.event_kind.len())
+            .saturating_add(self.hook_name.len())
+            .saturating_add(self.hook_command.len())
+            .saturating_add(self.provider_kind.len())
+            .saturating_add(self.provider_source.len())
+            .saturating_add(self.identity_scheme.len())
+            .saturating_add(self.provider_session_id.len())
+            .saturating_add(self.event_session_id.len())
+            .saturating_add(self.working_dir.len())
+            .saturating_add(self.worktree_root.len())
+            .saturating_add(self.timestamp_rfc3339.len())
+            .saturating_add(self.redaction_report_json.len())
+            .saturating_add(self.raw_envelope_sha256_hex.len())
+            .saturating_add(
+                self.session_ref
+                    .as_ref()
+                    .map_or(0, BoundedSpoolText::retained_bytes),
+            )
+            .saturating_add(
+                self.prompt
+                    .as_ref()
+                    .map_or(0, BoundedSpoolText::retained_bytes),
+            )
+            .saturating_add(
+                self.model
+                    .as_ref()
+                    .map_or(0, BoundedSpoolJson::retained_bytes),
+            )
+            .saturating_add(
+                self.source
+                    .as_ref()
+                    .map_or(0, BoundedSpoolJson::retained_bytes),
+            )
+            .saturating_add(
+                self.tool_name
+                    .as_ref()
+                    .map_or(0, BoundedSpoolText::retained_bytes),
+            )
+            .saturating_add(
+                self.tool_input
+                    .as_ref()
+                    .map_or(0, BoundedSpoolJson::retained_bytes),
+            )
+            .saturating_add(
+                self.tool_response
+                    .as_ref()
+                    .map_or(0, BoundedSpoolJson::retained_bytes),
+            )
+            .saturating_add(
+                self.assistant_message
+                    .as_ref()
+                    .map_or(0, BoundedSpoolText::retained_bytes),
+            )
+            .saturating_add(
+                self.tool_link
+                    .as_ref()
+                    .map_or(0, SpoolToolLinkReceipt::retained_bytes),
+            )
+            .saturating_add(
+                self.child_hints
+                    .as_ref()
+                    .map_or(0, SpoolChildHintsReceipt::retained_bytes),
+            )
+            .saturating_add(512)
+    }
+}
+
+/// Reconstructed replay envelope produced from a durable
+/// [`SpoolDirectIngestEventReceipt`] after `capture-spool/ready/` has been
+/// fenced (`RB-10i` -> Track B `RB-26`/`RB-28`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReconstructedSpoolEnvelope {
+    /// Exact `encode_spool_envelope` v1 JSON structure ready for Track B
+    /// checkpoint materialization.
+    pub envelope: serde_json::Value,
+    /// Names of any fields that exceeded the streaming retention cap and
+    /// therefore carry a bounded UTF-8 prefix + SHA-256 metadata.
+    pub truncated_fields: Vec<&'static str>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct SpoolDirectIngestCursor {
+    ts: i64,
+    #[serde(default)]
+    ts_nanos: u32,
+    is_terminal: bool,
+    dedup_key: String,
+}
+
+/// Validated pending event decoded strictly read-only from one file in
+/// `<common_storage>/private/capture-spool/ready/` (`RB-10i` AC1).
+#[derive(Debug, Clone)]
+struct DecodedSpoolReadyEvent {
+    dedup_key: String,
+    agent_kind: CaptureAgentKind,
+    hook_name: String,
+    provider_session_id: String,
+    event_session_id: String,
+    working_dir: String,
+    is_session_end: bool,
+    event_ts: i64,
+    event_ts_nanos: u32,
+    redaction_report: String,
+    receipt: SpoolDirectIngestEventReceipt,
+    decoded_mem_bytes: usize,
+}
+
+// ============================================================================
+// True O(1)-Heap Streaming RFC 8259 JSON Scanner for `capture-spool/ready/`
+// ============================================================================
+
+struct BoundedJsonSink {
+    out: String,
+    cap: usize,
+    original_bytes: u64,
+    truncated: bool,
+    hasher: Sha256,
+}
+
+impl BoundedJsonSink {
+    fn new(cap: usize) -> Self {
+        Self {
+            out: String::new(),
+            cap,
+            original_bytes: 0,
+            truncated: false,
+            hasher: Sha256::new(),
+        }
+    }
+
+    fn push_ascii_slice(&mut self, bytes: &[u8]) {
+        self.hasher.update(bytes);
+        self.original_bytes = self.original_bytes.saturating_add(bytes.len() as u64);
+        if !self.truncated {
+            let rem = self.cap.saturating_sub(self.out.len());
+            if bytes.len() <= rem {
+                if let Ok(s) = std::str::from_utf8(bytes) {
+                    self.out.push_str(s);
+                }
+            } else {
+                if rem > 0
+                    && let Ok(s) = std::str::from_utf8(&bytes[..rem])
+                {
+                    self.out.push_str(s);
+                }
+                self.truncated = true;
+            }
+        }
+    }
+
+    fn push_str(&mut self, s: &str) {
+        self.hasher.update(s.as_bytes());
+        self.original_bytes = self.original_bytes.saturating_add(s.len() as u64);
+        if !self.truncated {
+            if self.out.len().saturating_add(s.len()) <= self.cap {
+                self.out.push_str(s);
+            } else {
+                for ch in s.chars() {
+                    if self.out.len().saturating_add(ch.len_utf8()) <= self.cap {
+                        self.out.push(ch);
+                    } else {
+                        break;
+                    }
+                }
+                self.truncated = true;
+            }
+        }
+    }
+
+    fn push_json_escaped_char(&mut self, ch: char) {
+        match ch {
+            '"' => self.push_str("\\\""),
+            '\\' => self.push_str("\\\\"),
+            '\u{0008}' => self.push_str("\\b"),
+            '\u{000C}' => self.push_str("\\f"),
+            '\n' => self.push_str("\\n"),
+            '\r' => self.push_str("\\r"),
+            '\t' => self.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                use std::fmt::Write as _;
+                let mut esc = String::with_capacity(6);
+                let _ = write!(&mut esc, "\\u{:04x}", c as u32);
+                self.push_str(&esc);
+            }
+            c => {
+                let mut buf = [0u8; 4];
+                self.push_str(c.encode_utf8(&mut buf));
+            }
+        }
+    }
+
+    fn finish(self) -> BoundedSpoolJson {
+        BoundedSpoolJson {
+            json_text: self.out,
+            original_bytes: self.original_bytes,
+            truncated: self.truncated,
+            sha256_hex: sha256_hex_from_hasher(self.hasher),
+        }
+    }
+}
+
+struct StreamingJsonReader<R> {
+    reader: R,
+    bytes_read: u64,
+}
+
+impl<R: std::io::BufRead> StreamingJsonReader<R> {
+    fn new(reader: R) -> Self {
+        Self {
+            reader,
+            bytes_read: 0,
+        }
+    }
+
+    fn malformed(msg: &'static str) -> StorageBackendError {
+        StorageBackendError::BackendInternal {
+            detail: format!("forward migration Phase 1 rejected {msg}"),
+        }
+    }
+
+    fn consume_checked(&mut self, n: usize) -> StorageResult<()> {
+        self.reader.consume(n);
+        self.bytes_read = self.bytes_read.saturating_add(n as u64);
+        if self.bytes_read > MAX_SPOOL_ENVELOPE_BYTES {
+            return Err(Self::malformed("oversized capture-spool envelope"));
+        }
+        Ok(())
+    }
+
+    fn peek_byte(&mut self) -> StorageResult<Option<u8>> {
+        let buf = self
+            .reader
+            .fill_buf()
+            .map_err(|_| Self::malformed("unreadable capture-spool envelope"))?;
+        Ok(buf.first().copied())
+    }
+
+    fn next_byte(&mut self) -> StorageResult<Option<u8>> {
+        let b = self.peek_byte()?;
+        if b.is_some() {
+            self.consume_checked(1)?;
+        }
+        Ok(b)
+    }
+
+    fn skip_ws(&mut self) -> StorageResult<()> {
+        loop {
+            let ws_len = {
+                let buf = self
+                    .reader
+                    .fill_buf()
+                    .map_err(|_| Self::malformed("unreadable capture-spool envelope"))?;
+                if buf.is_empty() {
+                    return Ok(());
+                }
+                buf.iter()
+                    .take_while(|&&b| matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
+                    .count()
+            };
+            if ws_len == 0 {
+                return Ok(());
+            }
+            self.consume_checked(ws_len)?;
+        }
+    }
+
+    fn expect_byte(&mut self, expected: u8) -> StorageResult<()> {
+        self.skip_ws()?;
+        match self.next_byte()? {
+            Some(b) if b == expected => Ok(()),
+            _ => Err(Self::malformed(
+                "malformed or incomplete capture-spool envelope",
+            )),
+        }
+    }
+
+    fn expect_literal(&mut self, lit: &[u8]) -> StorageResult<()> {
+        self.skip_ws()?;
+        for &want in lit {
+            match self.next_byte()? {
+                Some(b) if b == want => {}
+                _ => {
+                    return Err(Self::malformed(
+                        "malformed or incomplete capture-spool envelope",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn expect_eof(&mut self) -> StorageResult<()> {
+        self.skip_ws()?;
+        if self.peek_byte()?.is_some() {
+            return Err(Self::malformed(
+                "capture-spool envelope with trailing garbage",
+            ));
+        }
+        Ok(())
+    }
+
+    fn read_hex4(&mut self) -> StorageResult<u16> {
+        let mut val = 0u16;
+        for _ in 0..4 {
+            let b = self
+                .next_byte()?
+                .ok_or_else(|| Self::malformed("incomplete unicode escape in capture-spool"))?;
+            let digit = match b {
+                b'0'..=b'9' => u16::from(b - b'0'),
+                b'a'..=b'f' => u16::from(b - b'a' + 10),
+                b'A'..=b'F' => u16::from(b - b'A' + 10),
+                _ => return Err(Self::malformed("invalid unicode escape in capture-spool")),
+            };
+            val = (val << 4) | digit;
+        }
+        Ok(val)
+    }
+
+    fn decode_non_ascii_utf8(&mut self, first: u8) -> StorageResult<char> {
+        let seq_len = if (first & 0xE0) == 0xC0 {
+            2usize
+        } else if (first & 0xF0) == 0xE0 {
+            3usize
+        } else if (first & 0xF8) == 0xF0 {
+            4usize
+        } else {
+            return Err(Self::malformed("invalid UTF-8 in capture-spool string"));
+        };
+        let mut buf = [0u8; 4];
+        buf[0] = first;
+        for slot in buf.iter_mut().take(seq_len).skip(1) {
+            *slot = self
+                .next_byte()?
+                .ok_or_else(|| Self::malformed("truncated UTF-8 in capture-spool string"))?;
+        }
+        let s = std::str::from_utf8(&buf[..seq_len])
+            .map_err(|_| Self::malformed("invalid UTF-8 in capture-spool string"))?;
+        s.chars()
+            .next()
+            .ok_or_else(|| Self::malformed("invalid UTF-8 in capture-spool string"))
+    }
+
+    fn decode_escaped_char(&mut self) -> StorageResult<char> {
+        let esc = self
+            .next_byte()?
+            .ok_or_else(|| Self::malformed("truncated escape in capture-spool string"))?;
+        match esc {
+            b'"' => Ok('"'),
+            b'\\' => Ok('\\'),
+            b'/' => Ok('/'),
+            b'b' => Ok('\u{0008}'),
+            b'f' => Ok('\u{000C}'),
+            b'n' => Ok('\n'),
+            b'r' => Ok('\r'),
+            b't' => Ok('\t'),
+            b'u' => {
+                let u1 = self.read_hex4()?;
+                if (0xD800..=0xDBFF).contains(&u1) {
+                    if self.next_byte()? != Some(b'\\') || self.next_byte()? != Some(b'u') {
+                        return Err(Self::malformed(
+                            "unpaired high surrogate in capture-spool string",
+                        ));
+                    }
+                    let u2 = self.read_hex4()?;
+                    if !(0xDC00..=0xDFFF).contains(&u2) {
+                        return Err(Self::malformed(
+                            "invalid low surrogate in capture-spool string",
+                        ));
+                    }
+                    let cp = 0x10000 + ((u32::from(u1) - 0xD800) << 10) + (u32::from(u2) - 0xDC00);
+                    char::from_u32(cp)
+                        .ok_or_else(|| Self::malformed("invalid unicode scalar in capture-spool"))
+                } else if (0xDC00..=0xDFFF).contains(&u1) {
+                    Err(Self::malformed(
+                        "unpaired low surrogate in capture-spool string",
+                    ))
+                } else {
+                    char::from_u32(u32::from(u1))
+                        .ok_or_else(|| Self::malformed("invalid unicode scalar in capture-spool"))
+                }
+            }
+            _ => Err(Self::malformed("invalid escape sequence in capture-spool")),
+        }
+    }
+
+    /// Stream one JSON string directly from the underlying `BufReader` in O(1)
+    /// heap. Fast-paths contiguous ASCII runs directly out of the read buffer.
+    fn read_bounded_string(
+        &mut self,
+        cap: usize,
+        reject_nul: bool,
+        reject_if_truncated: bool,
+    ) -> StorageResult<BoundedSpoolText> {
+        self.expect_byte(b'"')?;
+        let mut out = String::new();
+        let mut hasher = Sha256::new();
+        let mut original_bytes = 0u64;
+        let mut truncated = false;
+
+        loop {
+            let ascii_len = {
+                let buf = self
+                    .reader
+                    .fill_buf()
+                    .map_err(|_| Self::malformed("unreadable capture-spool envelope"))?;
+                if buf.is_empty() {
+                    return Err(Self::malformed("unterminated capture-spool JSON string"));
+                }
+                let n = buf
+                    .iter()
+                    .take_while(|&&b| (0x20..0x80).contains(&b) && b != b'"' && b != b'\\')
+                    .count();
+                if n > 0 {
+                    let chunk = &buf[..n];
+                    hasher.update(chunk);
+                    original_bytes = original_bytes.saturating_add(n as u64);
+                    if !truncated {
+                        let rem = cap.saturating_sub(out.len());
+                        if n <= rem {
+                            if let Ok(s) = std::str::from_utf8(chunk) {
+                                out.push_str(s);
+                            }
+                        } else {
+                            if reject_if_truncated {
+                                return Err(Self::malformed(
+                                    "oversized control field in capture-spool envelope",
+                                ));
+                            }
+                            if rem > 0
+                                && let Ok(s) = std::str::from_utf8(&chunk[..rem])
+                            {
+                                out.push_str(s);
+                            }
+                            truncated = true;
+                        }
+                    }
+                }
+                n
+            };
+            if ascii_len > 0 {
+                self.consume_checked(ascii_len)?;
+                continue;
+            }
+
+            let b = self
+                .next_byte()?
+                .ok_or_else(|| Self::malformed("unterminated capture-spool JSON string"))?;
+            if b == b'"' {
+                break;
+            }
+            let ch = if b == b'\\' {
+                self.decode_escaped_char()?
+            } else if b < 0x20 {
+                return Err(Self::malformed(
+                    "unescaped control byte in capture-spool string",
+                ));
+            } else {
+                self.decode_non_ascii_utf8(b)?
+            };
+            if reject_nul && ch == '\0' {
+                return Err(Self::malformed("NUL byte in capture-spool string"));
+            }
+            let mut utf8 = [0u8; 4];
+            let encoded = ch.encode_utf8(&mut utf8);
+            hasher.update(encoded.as_bytes());
+            original_bytes = original_bytes.saturating_add(encoded.len() as u64);
+            if !truncated {
+                if out.len().saturating_add(encoded.len()) <= cap {
+                    out.push(ch);
+                } else {
+                    if reject_if_truncated {
+                        return Err(Self::malformed(
+                            "oversized control field in capture-spool envelope",
+                        ));
+                    }
+                    truncated = true;
+                }
+            }
+        }
+
+        Ok(BoundedSpoolText {
+            value: out,
+            original_bytes,
+            truncated,
+            sha256_hex: sha256_hex_from_hasher(hasher),
+        })
+    }
+
+    fn read_exact_string(&mut self, cap: usize) -> StorageResult<String> {
+        Ok(self.read_bounded_string(cap, true, true)?.value)
+    }
+
+    fn read_opt_exact_string(&mut self, cap: usize) -> StorageResult<Option<String>> {
+        self.skip_ws()?;
+        if self.peek_byte()? == Some(b'n') {
+            self.expect_literal(b"null")?;
+            return Ok(None);
+        }
+        Ok(Some(self.read_exact_string(cap)?))
+    }
+
+    fn read_opt_bounded_string(&mut self, cap: usize) -> StorageResult<Option<BoundedSpoolText>> {
+        self.skip_ws()?;
+        if self.peek_byte()? == Some(b'n') {
+            self.expect_literal(b"null")?;
+            return Ok(None);
+        }
+        // Replay text fields (`prompt`, `assistant_message`, `tool_name`,
+        // `session_ref`, `tool_link`, `child_hints`) preserve valid JSON
+        // escaped `\u0000` scalars matching `live_pipeline.rs` serde_json.
+        Ok(Some(self.read_bounded_string(cap, false, false)?))
+    }
+
+    fn read_u64(&mut self) -> StorageResult<u64> {
+        self.skip_ws()?;
+        let first = self
+            .next_byte()?
+            .ok_or_else(|| Self::malformed("expected integer in capture-spool envelope"))?;
+        if !first.is_ascii_digit() {
+            return Err(Self::malformed(
+                "expected unsigned integer in capture-spool envelope",
+            ));
+        }
+        let mut val = u64::from(first - b'0');
+        if first == b'0' {
+            if matches!(self.peek_byte()?, Some(b'0'..=b'9' | b'.' | b'e' | b'E')) {
+                return Err(Self::malformed(
+                    "invalid integer token in capture-spool envelope",
+                ));
+            }
+            return Ok(0);
+        }
+        while let Some(b) = self.peek_byte()? {
+            if b.is_ascii_digit() {
+                self.consume_checked(1)?;
+                val = val
+                    .checked_mul(10)
+                    .and_then(|v| v.checked_add(u64::from(b - b'0')))
+                    .ok_or_else(|| Self::malformed("integer overflow in capture-spool envelope"))?;
+            } else if matches!(b, b'.' | b'e' | b'E') {
+                return Err(Self::malformed(
+                    "non-integer number where integer required in capture-spool",
+                ));
+            } else {
+                break;
+            }
+        }
+        Ok(val)
+    }
+
+    fn read_usize(&mut self) -> StorageResult<usize> {
+        let v = self.read_u64()?;
+        usize::try_from(v).map_err(|_| Self::malformed("usize overflow in capture-spool envelope"))
+    }
+
+    fn read_opt_u32(&mut self) -> StorageResult<Option<u32>> {
+        self.skip_ws()?;
+        if self.peek_byte()? == Some(b'n') {
+            self.expect_literal(b"null")?;
+            return Ok(None);
+        }
+        let v = self.read_u64()?;
+        let u = u32::try_from(v)
+            .map_err(|_| Self::malformed("u32 overflow in capture-spool envelope"))?;
+        Ok(Some(u))
+    }
+
+    fn read_bool(&mut self) -> StorageResult<bool> {
+        self.skip_ws()?;
+        match self.peek_byte()? {
+            Some(b't') => {
+                self.expect_literal(b"true")?;
+                Ok(true)
+            }
+            Some(b'f') => {
+                self.expect_literal(b"false")?;
+                Ok(false)
+            }
+            _ => Err(Self::malformed(
+                "expected boolean in capture-spool envelope",
+            )),
+        }
+    }
+
+    fn stream_number_into(&mut self, mut sink: Option<&mut BoundedJsonSink>) -> StorageResult<()> {
+        let mut emit = |b: u8| {
+            if let Some(s) = sink.as_deref_mut() {
+                s.push_ascii_slice(&[b]);
+            }
+        };
+        if self.peek_byte()? == Some(b'-') {
+            self.consume_checked(1)?;
+            emit(b'-');
+        }
+        let first = self
+            .next_byte()?
+            .ok_or_else(|| Self::malformed("malformed JSON number in capture-spool"))?;
+        match first {
+            b'0' => emit(b'0'),
+            b'1'..=b'9' => {
+                emit(first);
+                while let Some(b) = self.peek_byte()? {
+                    if b.is_ascii_digit() {
+                        self.consume_checked(1)?;
+                        emit(b);
+                    } else {
+                        break;
+                    }
+                }
+            }
+            _ => return Err(Self::malformed("malformed JSON number in capture-spool")),
+        }
+        if self.peek_byte()? == Some(b'.') {
+            self.consume_checked(1)?;
+            emit(b'.');
+            let mut saw_frac = false;
+            while let Some(b) = self.peek_byte()? {
+                if b.is_ascii_digit() {
+                    self.consume_checked(1)?;
+                    emit(b);
+                    saw_frac = true;
+                } else {
+                    break;
+                }
+            }
+            if !saw_frac {
+                return Err(Self::malformed(
+                    "malformed fractional JSON number in capture-spool",
+                ));
+            }
+        }
+        if matches!(self.peek_byte()?, Some(b'e' | b'E')) {
+            let e = self.next_byte()?.unwrap_or(b'e');
+            emit(e);
+            if matches!(self.peek_byte()?, Some(b'+' | b'-')) {
+                let sign = self.next_byte()?.unwrap_or(b'+');
+                emit(sign);
+            }
+            let mut saw_exp = false;
+            while let Some(b) = self.peek_byte()? {
+                if b.is_ascii_digit() {
+                    self.consume_checked(1)?;
+                    emit(b);
+                    saw_exp = true;
+                } else {
+                    break;
+                }
+            }
+            if !saw_exp {
+                return Err(Self::malformed(
+                    "malformed exponent JSON number in capture-spool",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn stream_string_into(
+        &mut self,
+        mut sink: Option<&mut BoundedJsonSink>,
+        reject_nul: bool,
+    ) -> StorageResult<()> {
+        self.expect_byte(b'"')?;
+        if let Some(s) = sink.as_deref_mut() {
+            s.push_ascii_slice(b"\"");
+        }
+        loop {
+            let ascii_len = {
+                let buf = self
+                    .reader
+                    .fill_buf()
+                    .map_err(|_| Self::malformed("unreadable capture-spool envelope"))?;
+                if buf.is_empty() {
+                    return Err(Self::malformed("unterminated capture-spool JSON string"));
+                }
+                let n = buf
+                    .iter()
+                    .take_while(|&&b| (0x20..0x80).contains(&b) && b != b'"' && b != b'\\')
+                    .count();
+                if n > 0
+                    && let Some(s) = sink.as_deref_mut()
+                {
+                    s.push_ascii_slice(&buf[..n]);
+                }
+                n
+            };
+            if ascii_len > 0 {
+                self.consume_checked(ascii_len)?;
+                continue;
+            }
+            let b = self
+                .next_byte()?
+                .ok_or_else(|| Self::malformed("unterminated capture-spool JSON string"))?;
+            if b == b'"' {
+                if let Some(s) = sink.as_deref_mut() {
+                    s.push_ascii_slice(b"\"");
+                }
+                return Ok(());
+            }
+            let ch = if b == b'\\' {
+                self.decode_escaped_char()?
+            } else if b < 0x20 {
+                return Err(Self::malformed(
+                    "unescaped control byte in capture-spool string",
+                ));
+            } else {
+                self.decode_non_ascii_utf8(b)?
+            };
+            if reject_nul && ch == '\0' {
+                return Err(Self::malformed("NUL byte in capture-spool JSON value"));
+            }
+            if let Some(s) = sink.as_deref_mut() {
+                s.push_json_escaped_char(ch);
+            }
+        }
+    }
+
+    fn stream_any_value(
+        &mut self,
+        mut sink: Option<&mut BoundedJsonSink>,
+        depth: usize,
+        reject_nul: bool,
+    ) -> StorageResult<()> {
+        if depth > MAX_SPOOL_JSON_DEPTH {
+            return Err(Self::malformed(
+                "capture-spool JSON nesting depth exceeded limit",
+            ));
+        }
+        self.skip_ws()?;
+        let next = self
+            .peek_byte()?
+            .ok_or_else(|| Self::malformed("unexpected EOF in capture-spool JSON"))?;
+        match next {
+            b'"' => self.stream_string_into(sink, reject_nul),
+            b'{' => {
+                self.consume_checked(1)?;
+                if let Some(s) = sink.as_deref_mut() {
+                    s.push_ascii_slice(b"{");
+                }
+                self.skip_ws()?;
+                if self.peek_byte()? == Some(b'}') {
+                    self.consume_checked(1)?;
+                    if let Some(s) = sink.as_deref_mut() {
+                        s.push_ascii_slice(b"}");
+                    }
+                    return Ok(());
+                }
+                let mut first = true;
+                loop {
+                    if !first && let Some(s) = sink.as_deref_mut() {
+                        s.push_ascii_slice(b",");
+                    }
+                    first = false;
+                    self.stream_string_into(sink.as_deref_mut(), reject_nul)?;
+                    self.expect_byte(b':')?;
+                    if let Some(s) = sink.as_deref_mut() {
+                        s.push_ascii_slice(b":");
+                    }
+                    self.stream_any_value(sink.as_deref_mut(), depth + 1, reject_nul)?;
+                    self.skip_ws()?;
+                    match self.next_byte()? {
+                        Some(b',') => continue,
+                        Some(b'}') => {
+                            if let Some(s) = sink.as_deref_mut() {
+                                s.push_ascii_slice(b"}");
+                            }
+                            return Ok(());
+                        }
+                        _ => {
+                            return Err(Self::malformed(
+                                "malformed JSON object in capture-spool envelope",
+                            ));
+                        }
+                    }
+                }
+            }
+            b'[' => {
+                self.consume_checked(1)?;
+                if let Some(s) = sink.as_deref_mut() {
+                    s.push_ascii_slice(b"[");
+                }
+                self.skip_ws()?;
+                if self.peek_byte()? == Some(b']') {
+                    self.consume_checked(1)?;
+                    if let Some(s) = sink.as_deref_mut() {
+                        s.push_ascii_slice(b"]");
+                    }
+                    return Ok(());
+                }
+                let mut first = true;
+                loop {
+                    if !first && let Some(s) = sink.as_deref_mut() {
+                        s.push_ascii_slice(b",");
+                    }
+                    first = false;
+                    self.stream_any_value(sink.as_deref_mut(), depth + 1, reject_nul)?;
+                    self.skip_ws()?;
+                    match self.next_byte()? {
+                        Some(b',') => continue,
+                        Some(b']') => {
+                            if let Some(s) = sink.as_deref_mut() {
+                                s.push_ascii_slice(b"]");
+                            }
+                            return Ok(());
+                        }
+                        _ => {
+                            return Err(Self::malformed(
+                                "malformed JSON array in capture-spool envelope",
+                            ));
+                        }
+                    }
+                }
+            }
+            b't' => {
+                self.expect_literal(b"true")?;
+                if let Some(s) = sink.as_deref_mut() {
+                    s.push_ascii_slice(b"true");
+                }
+                Ok(())
+            }
+            b'f' => {
+                self.expect_literal(b"false")?;
+                if let Some(s) = sink.as_deref_mut() {
+                    s.push_ascii_slice(b"false");
+                }
+                Ok(())
+            }
+            b'n' => {
+                self.expect_literal(b"null")?;
+                if let Some(s) = sink.as_deref_mut() {
+                    s.push_ascii_slice(b"null");
+                }
+                Ok(())
+            }
+            b'-' | b'0'..=b'9' => self.stream_number_into(sink),
+            _ => Err(Self::malformed(
+                "unexpected JSON token in capture-spool envelope",
+            )),
+        }
+    }
+
+    fn skip_json_value(&mut self) -> StorageResult<()> {
+        self.stream_any_value(None, 0, false)
+    }
+
+    fn read_opt_bounded_json(&mut self, cap: usize) -> StorageResult<Option<BoundedSpoolJson>> {
+        self.skip_ws()?;
+        if self.peek_byte()? == Some(b'n') {
+            self.expect_literal(b"null")?;
+            return Ok(None);
+        }
+        let mut sink = BoundedJsonSink::new(cap);
+        // Structured replay payloads (`model`, `source`, `tool_input`,
+        // `tool_response`) preserve valid JSON escaped `\u0000` scalars.
+        self.stream_any_value(Some(&mut sink), 0, false)?;
+        Ok(Some(sink.finish()))
+    }
+
+    fn read_object<F>(&mut self, mut on_field: F) -> StorageResult<()>
+    where
+        F: FnMut(&mut Self, &str) -> StorageResult<()>,
+    {
+        self.expect_byte(b'{')?;
+        self.skip_ws()?;
+        if self.peek_byte()? == Some(b'}') {
+            self.consume_checked(1)?;
+            return Ok(());
+        }
+        loop {
+            let key = self.read_bounded_string(128, false, false)?;
+            self.expect_byte(b':')?;
+            if key.truncated {
+                self.skip_json_value()?;
+            } else {
+                on_field(self, &key.value)?;
+            }
+            self.skip_ws()?;
+            match self.next_byte()? {
+                Some(b',') => continue,
+                Some(b'}') => return Ok(()),
+                _ => {
+                    return Err(Self::malformed(
+                        "malformed JSON object in capture-spool envelope",
+                    ));
+                }
+            }
+        }
+    }
+
+    fn read_tool_link(&mut self) -> StorageResult<Option<SpoolToolLinkReceipt>> {
+        self.skip_ws()?;
+        if self.peek_byte()? == Some(b'n') {
+            self.expect_literal(b"null")?;
+            return Ok(None);
+        }
+        let mut tool: Option<BoundedSpoolText> = None;
+        let mut parent: Option<BoundedSpoolText> = None;
+        self.read_object(|r, key| match key {
+            "tool" => {
+                tool =
+                    Some(r.read_bounded_string(MAX_SPOOL_RETAINED_META_STR_BYTES, false, false)?);
+                Ok(())
+            }
+            "parent" => {
+                parent = r.read_opt_bounded_string(MAX_SPOOL_RETAINED_META_STR_BYTES)?;
+                Ok(())
+            }
+            _ => r.skip_json_value(),
+        })?;
+        let tool = tool.ok_or_else(|| {
+            Self::malformed("capture-spool tool_link missing required `tool` field")
+        })?;
+        Ok(Some(SpoolToolLinkReceipt { tool, parent }))
+    }
+
+    fn read_child_hints(&mut self) -> StorageResult<Option<SpoolChildHintsReceipt>> {
+        self.skip_ws()?;
+        if self.peek_byte()? == Some(b'n') {
+            self.expect_literal(b"null")?;
+            return Ok(None);
+        }
+        let mut kind: Option<String> = None;
+        let mut role: Option<String> = None;
+        let mut current_or_parent_path: Option<BoundedSpoolText> = None;
+        let mut child_path: Option<BoundedSpoolText> = None;
+        let mut child_id: Option<BoundedSpoolText> = None;
+        let mut turn_id: Option<BoundedSpoolText> = None;
+        self.read_object(|r, key| match key {
+            "kind" => {
+                kind = Some(r.read_exact_string(64)?);
+                Ok(())
+            }
+            "role" => {
+                role = r.read_opt_exact_string(64)?;
+                Ok(())
+            }
+            "current_or_parent_path" => {
+                current_or_parent_path =
+                    r.read_opt_bounded_string(MAX_SPOOL_RETAINED_META_STR_BYTES)?;
+                Ok(())
+            }
+            "child_path" => {
+                child_path = r.read_opt_bounded_string(MAX_SPOOL_RETAINED_META_STR_BYTES)?;
+                Ok(())
+            }
+            "child_id" => {
+                child_id = r.read_opt_bounded_string(MAX_SPOOL_RETAINED_META_STR_BYTES)?;
+                Ok(())
+            }
+            "turn_id" => {
+                turn_id = r.read_opt_bounded_string(MAX_SPOOL_RETAINED_META_STR_BYTES)?;
+                Ok(())
+            }
+            _ => r.skip_json_value(),
+        })?;
+        let kind = kind.ok_or_else(|| {
+            Self::malformed("capture-spool child_hints missing required `kind` field")
+        })?;
+        Ok(Some(SpoolChildHintsReceipt {
+            kind,
+            role,
+            current_or_parent_path,
+            child_path,
+            child_id,
+            turn_id,
+        }))
+    }
+
+    fn read_context(&mut self) -> StorageResult<RawSpoolContext> {
+        let mut provider_session_id: Option<String> = None;
+        let mut working_dir: Option<String> = None;
+        let mut storage_path: Option<String> = None;
+        let mut worktree_root: Option<String> = None;
+        self.read_object(|r, key| match key {
+            "provider_session_id" => {
+                provider_session_id = Some(r.read_exact_string(MAX_SPOOL_RETAINED_META_STR_BYTES)?);
+                Ok(())
+            }
+            "working_dir" => {
+                working_dir = Some(r.read_exact_string(MAX_SPOOL_RETAINED_META_STR_BYTES)?);
+                Ok(())
+            }
+            "storage_path" => {
+                storage_path = Some(r.read_exact_string(MAX_SPOOL_RETAINED_META_STR_BYTES)?);
+                Ok(())
+            }
+            "worktree_root" => {
+                worktree_root = Some(r.read_exact_string(MAX_SPOOL_RETAINED_META_STR_BYTES)?);
+                Ok(())
+            }
+            _ => r.skip_json_value(),
+        })?;
+        Ok(RawSpoolContext {
+            provider_session_id: provider_session_id.ok_or_else(|| {
+                Self::malformed("capture-spool context missing `provider_session_id`")
+            })?,
+            working_dir: working_dir
+                .ok_or_else(|| Self::malformed("capture-spool context missing `working_dir`"))?,
+            storage_path: storage_path
+                .ok_or_else(|| Self::malformed("capture-spool context missing `storage_path`"))?,
+            worktree_root: worktree_root
+                .ok_or_else(|| Self::malformed("capture-spool context missing `worktree_root`"))?,
+        })
+    }
+
+    fn read_event(&mut self) -> StorageResult<RawSpoolEvent> {
+        let mut kind: Option<String> = None;
+        let mut session_id: Option<String> = None;
+        let mut session_ref: Option<BoundedSpoolText> = None;
+        let mut prompt: Option<BoundedSpoolText> = None;
+        let mut model: Option<BoundedSpoolJson> = None;
+        let mut source: Option<BoundedSpoolJson> = None;
+        let mut tool_name: Option<BoundedSpoolText> = None;
+        let mut tool_input: Option<BoundedSpoolJson> = None;
+        let mut tool_response: Option<BoundedSpoolJson> = None;
+        let mut assistant_message: Option<BoundedSpoolText> = None;
+        let mut timestamp: Option<String> = None;
+
+        self.read_object(|r, key| match key {
+            "kind" => {
+                kind = Some(r.read_exact_string(64)?);
+                Ok(())
+            }
+            "session_id" => {
+                session_id = Some(r.read_exact_string(MAX_SPOOL_RETAINED_META_STR_BYTES)?);
+                Ok(())
+            }
+            "session_ref" => {
+                session_ref = r.read_opt_bounded_string(MAX_SPOOL_RETAINED_META_STR_BYTES)?;
+                Ok(())
+            }
+            "prompt" => {
+                prompt = r.read_opt_bounded_string(MAX_SPOOL_RETAINED_TEXT_BYTES)?;
+                Ok(())
+            }
+            "model" => {
+                model = r.read_opt_bounded_json(MAX_SPOOL_RETAINED_META_STR_BYTES)?;
+                Ok(())
+            }
+            "source" => {
+                source = r.read_opt_bounded_json(MAX_SPOOL_RETAINED_META_STR_BYTES)?;
+                Ok(())
+            }
+            "tool_name" => {
+                tool_name = r.read_opt_bounded_string(MAX_SPOOL_RETAINED_META_STR_BYTES)?;
+                Ok(())
+            }
+            "tool_input" => {
+                tool_input = r.read_opt_bounded_json(MAX_SPOOL_RETAINED_JSON_BYTES)?;
+                Ok(())
+            }
+            "tool_response" => {
+                tool_response = r.read_opt_bounded_json(MAX_SPOOL_RETAINED_JSON_BYTES)?;
+                Ok(())
+            }
+            "assistant_message" => {
+                assistant_message = r.read_opt_bounded_string(MAX_SPOOL_RETAINED_TEXT_BYTES)?;
+                Ok(())
+            }
+            "timestamp" => {
+                timestamp = Some(r.read_exact_string(128)?);
+                Ok(())
+            }
+            _ => r.skip_json_value(),
+        })?;
+
+        Ok(RawSpoolEvent {
+            kind: kind.ok_or_else(|| Self::malformed("capture-spool event missing `kind`"))?,
+            session_id: session_id
+                .ok_or_else(|| Self::malformed("capture-spool event missing `session_id`"))?,
+            session_ref,
+            prompt,
+            model,
+            source,
+            tool_name,
+            tool_input,
+            tool_response,
+            assistant_message,
+            timestamp: timestamp
+                .ok_or_else(|| Self::malformed("capture-spool event missing `timestamp`"))?,
+        })
+    }
+
+    fn read_redaction_report(
+        &mut self,
+    ) -> StorageResult<(crate::internal::ai::observed_agents::RedactionReport, bool)> {
+        use crate::internal::ai::observed_agents::{RedactionMatch, RedactionReport};
+
+        let mut matches_opt: Option<Vec<RedactionMatch>> = None;
+        let mut extra_dropped = 0usize;
+        let mut dropped_matches = 0usize;
+        let mut bytes_scanned: Option<usize> = None;
+        let mut bytes_redacted: Option<usize> = None;
+
+        self.read_object(|r, key| match key {
+            "matches" => {
+                r.expect_byte(b'[')?;
+                r.skip_ws()?;
+                let mut list = Vec::new();
+                extra_dropped = 0;
+                if r.peek_byte()? == Some(b']') {
+                    r.consume_checked(1)?;
+                    matches_opt = Some(list);
+                    return Ok(());
+                }
+                loop {
+                    let mut rule_id: Option<String> = None;
+                    let mut start: Option<usize> = None;
+                    let mut end: Option<usize> = None;
+                    r.read_object(|inner, mkey| match mkey {
+                        "rule_id" => {
+                            rule_id = Some(inner.read_bounded_string(512, false, true)?.value);
+                            Ok(())
+                        }
+                        "start" => {
+                            start = Some(inner.read_usize()?);
+                            Ok(())
+                        }
+                        "end" => {
+                            end = Some(inner.read_usize()?);
+                            Ok(())
+                        }
+                        _ => inner.skip_json_value(),
+                    })?;
+                    let item = RedactionMatch {
+                        rule_id: rule_id.ok_or_else(|| {
+                            Self::malformed("capture-spool redaction match missing `rule_id`")
+                        })?,
+                        start: start.ok_or_else(|| {
+                            Self::malformed("capture-spool redaction match missing `start`")
+                        })?,
+                        end: end.ok_or_else(|| {
+                            Self::malformed("capture-spool redaction match missing `end`")
+                        })?,
+                    };
+                    if list.len() < MAX_SPOOL_REDACTION_MATCHES {
+                        list.push(item);
+                    } else {
+                        extra_dropped = extra_dropped.saturating_add(1);
+                    }
+                    r.skip_ws()?;
+                    match r.next_byte()? {
+                        Some(b',') => continue,
+                        Some(b']') => break,
+                        _ => {
+                            return Err(Self::malformed(
+                                "malformed redaction.matches array in capture-spool",
+                            ));
+                        }
+                    }
+                }
+                matches_opt = Some(list);
+                Ok(())
+            }
+            "dropped_matches" => {
+                dropped_matches = r.read_usize()?;
+                Ok(())
+            }
+            "bytes_scanned" => {
+                bytes_scanned = Some(r.read_usize()?);
+                Ok(())
+            }
+            "bytes_redacted" => {
+                bytes_redacted = Some(r.read_usize()?);
+                Ok(())
+            }
+            _ => r.skip_json_value(),
+        })?;
+
+        Ok((
+            RedactionReport {
+                matches: matches_opt
+                    .ok_or_else(|| Self::malformed("capture-spool redaction missing `matches`"))?,
+                dropped_matches: dropped_matches.saturating_add(extra_dropped),
+                bytes_scanned: bytes_scanned.ok_or_else(|| {
+                    Self::malformed("capture-spool redaction missing `bytes_scanned`")
+                })?,
+                bytes_redacted: bytes_redacted.ok_or_else(|| {
+                    Self::malformed("capture-spool redaction missing `bytes_redacted`")
+                })?,
+            },
+            extra_dropped > 0,
+        ))
+    }
+
+    fn read_spool_envelope(&mut self) -> StorageResult<RawSpoolEnvelope> {
+        let mut version: Option<u64> = None;
+        let mut agent_kind: Option<String> = None;
+        let mut hook_name: Option<String> = None;
+        let mut hook_command: Option<String> = None;
+        let mut provider_kind: Option<String> = None;
+        let mut provider_source: Option<String> = None;
+        let mut frame_bytes = 0u64;
+        let mut event_id: Option<String> = None;
+        let mut identity_scheme: Option<String> = None;
+        let mut dedup_key: Option<String> = None;
+        let mut hook_deadline = true;
+        let mut display_batch_limit: Option<u32> = None;
+        let mut tool_link: Option<SpoolToolLinkReceipt> = None;
+        let mut child_hints: Option<SpoolChildHintsReceipt> = None;
+        let mut context: Option<RawSpoolContext> = None;
+        let mut event: Option<RawSpoolEvent> = None;
+        let mut redaction: Option<(crate::internal::ai::observed_agents::RedactionReport, bool)> =
+            None;
+
+        self.read_object(|r, key| match key {
+            "version" => {
+                version = Some(r.read_u64()?);
+                Ok(())
+            }
+            "agent_kind" => {
+                agent_kind = Some(r.read_exact_string(64)?);
+                Ok(())
+            }
+            "hook_name" => {
+                hook_name = Some(r.read_exact_string(64)?);
+                Ok(())
+            }
+            "hook_command" => {
+                hook_command = Some(r.read_exact_string(64)?);
+                Ok(())
+            }
+            "provider_kind" => {
+                provider_kind = Some(r.read_exact_string(64)?);
+                Ok(())
+            }
+            "provider_source" => {
+                provider_source = Some(r.read_exact_string(64)?);
+                Ok(())
+            }
+            "frame_bytes" => {
+                frame_bytes = r.read_u64()?;
+                Ok(())
+            }
+            "event_id" => {
+                event_id = Some(r.read_exact_string(64)?);
+                Ok(())
+            }
+            "identity_scheme" => {
+                identity_scheme = Some(r.read_exact_string(64)?);
+                Ok(())
+            }
+            "dedup_key" => {
+                dedup_key = r.read_opt_exact_string(
+                    crate::storage::capture_store::MAX_CAPTURE_DEDUP_KEY_BYTES,
+                )?;
+                Ok(())
+            }
+            "hook_deadline" => {
+                hook_deadline = r.read_bool()?;
+                Ok(())
+            }
+            "display_batch_limit" => {
+                display_batch_limit = r.read_opt_u32()?;
+                Ok(())
+            }
+            "tool_link" => {
+                tool_link = r.read_tool_link()?;
+                Ok(())
+            }
+            "child_hints" => {
+                child_hints = r.read_child_hints()?;
+                Ok(())
+            }
+            "context" => {
+                context = Some(r.read_context()?);
+                Ok(())
+            }
+            "event" => {
+                event = Some(r.read_event()?);
+                Ok(())
+            }
+            "redaction" => {
+                redaction = Some(r.read_redaction_report()?);
+                Ok(())
+            }
+            _ => r.skip_json_value(),
+        })?;
+        self.expect_eof()?;
+        let (redaction, redaction_matches_overflow) = redaction
+            .ok_or_else(|| Self::malformed("capture-spool envelope missing `redaction`"))?;
+
+        Ok(RawSpoolEnvelope {
+            version: version
+                .ok_or_else(|| Self::malformed("capture-spool envelope missing `version`"))?,
+            agent_kind: agent_kind
+                .ok_or_else(|| Self::malformed("capture-spool envelope missing `agent_kind`"))?,
+            hook_name: hook_name
+                .ok_or_else(|| Self::malformed("capture-spool envelope missing `hook_name`"))?,
+            hook_command: hook_command
+                .ok_or_else(|| Self::malformed("capture-spool envelope missing `hook_command`"))?,
+            provider_kind: provider_kind
+                .ok_or_else(|| Self::malformed("capture-spool envelope missing `provider_kind`"))?,
+            provider_source: provider_source.ok_or_else(|| {
+                Self::malformed("capture-spool envelope missing `provider_source`")
+            })?,
+            frame_bytes,
+            event_id: event_id
+                .ok_or_else(|| Self::malformed("capture-spool envelope missing `event_id`"))?,
+            identity_scheme: identity_scheme.ok_or_else(|| {
+                Self::malformed("capture-spool envelope missing `identity_scheme`")
+            })?,
+            dedup_key,
+            hook_deadline,
+            display_batch_limit,
+            tool_link,
+            child_hints,
+            context: context
+                .ok_or_else(|| Self::malformed("capture-spool envelope missing `context`"))?,
+            event: event
+                .ok_or_else(|| Self::malformed("capture-spool envelope missing `event`"))?,
+            redaction,
+            redaction_matches_overflow,
+        })
+    }
+}
+
+struct HashingReader<R> {
+    inner: R,
+    hasher: Sha256,
+    bytes_read: u64,
+}
+
+impl<R> HashingReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            hasher: Sha256::new(),
+            bytes_read: 0,
+        }
+    }
+
+    fn finish(self) -> (u64, String) {
+        (self.bytes_read, sha256_hex_from_hasher(self.hasher))
+    }
+}
+
+impl<R: std::io::Read> std::io::Read for HashingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n > 0 {
+            self.hasher.update(&buf[..n]);
+            self.bytes_read = self.bytes_read.saturating_add(n as u64);
+        }
+        Ok(n)
+    }
+}
+
+fn validate_spool_child_hints(hints: &SpoolChildHintsReceipt) -> StorageResult<()> {
+    match hints.kind.as_str() {
+        "absent" | "unavailable" => Ok(()),
+        "candidate" => {
+            if !matches!(hints.role.as_deref(), Some("current" | "boundary")) {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: "forward migration Phase 1 rejected capture-spool candidate child_hints with invalid role"
+                        .to_string(),
+                });
+            }
+            Ok(())
+        }
+        _ => Err(StorageBackendError::BackendInternal {
+            detail: "forward migration Phase 1 rejected capture-spool envelope with unknown child_hints kind"
+                .to_string(),
+        }),
+    }
+}
+
+/// Stream-parse and strictly validate one `capture-spool/ready/` JSON envelope
+/// directly from `file` in strict O(1) heap (even for `256 MiB` envelopes with
+/// multi-megabyte `prompt`, `session_ref`, `tool_link`, `child_hints`,
+/// `tool_input`, or `redaction.matches` fields!) against the exact production
+/// `spool_replay_provider` binding table (`live_pipeline.rs:2062-2172`).
+fn decode_spool_ready_envelope_reader(
+    file: &mut File,
+    file_size: u64,
+    expected_storage: &Path,
+) -> StorageResult<DecodedSpoolReadyEvent> {
+    use std::io::{BufReader, Read as _};
+
+    if file_size == 0 || file_size > MAX_SPOOL_ENVELOPE_BYTES {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "forward migration Phase 1 rejected empty or oversized capture-spool envelope"
+                .to_string(),
+        });
+    }
+    let limited = file.take(MAX_SPOOL_ENVELOPE_BYTES.saturating_add(1));
+    let hashing = HashingReader::new(limited);
+    let reader = BufReader::with_capacity(64 * 1024, hashing);
+    let mut parser = StreamingJsonReader::new(reader);
+    let raw = parser.read_spool_envelope()?;
+    let (raw_envelope_bytes, raw_envelope_sha256_hex) = parser.reader.into_inner().finish();
+    if raw_envelope_bytes != file_size {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "forward migration Phase 1 rejected capture-spool envelope whose size changed during read"
+                .to_string(),
+        });
+    }
+
+    if raw.version != 1 {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "forward migration Phase 1 rejected unsupported capture-spool envelope version"
+                .to_string(),
+        });
+    }
+
+    validate_spool_text_field(&raw.hook_name, "hook_name", false)?;
+    let replay = crate::command::hooks::spool_replay_provider(&raw.hook_name).ok_or_else(|| {
+        StorageBackendError::BackendInternal {
+            detail:
+                "forward migration Phase 1 rejected capture-spool envelope naming an unknown hook"
+                    .to_string(),
+        }
+    })?;
+    if raw.provider_kind != replay.provider_kind {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "forward migration Phase 1 rejected capture-spool envelope with mismatched provider_kind"
+                .to_string(),
+        });
+    }
+    if raw.provider_source != replay.provider_source {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "forward migration Phase 1 rejected capture-spool envelope with mismatched provider_source"
+                .to_string(),
+        });
+    }
+    if raw.agent_kind != replay.binding.agent_kind_db() {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "forward migration Phase 1 rejected capture-spool envelope with mismatched agent_kind"
+                .to_string(),
+        });
+    }
+    let agent_kind = CaptureAgentKind::parse(&raw.agent_kind)?;
+
+    if !is_valid_spool_hook_command(&raw.hook_command) {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "forward migration Phase 1 rejected capture-spool envelope with unknown hook_command"
+                .to_string(),
+        });
+    }
+    if !is_valid_spool_identity_scheme(&raw.identity_scheme) {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "forward migration Phase 1 rejected capture-spool envelope with unknown identity_scheme"
+                .to_string(),
+        });
+    }
+
+    let parsed_event_id =
+        uuid::Uuid::parse_str(&raw.event_id).map_err(|_| StorageBackendError::BackendInternal {
+            detail:
+                "forward migration Phase 1 rejected capture-spool envelope with invalid event_id"
+                    .to_string(),
+        })?;
+    let event_id = parsed_event_id.to_string();
+
+    let dedup_key = match raw.dedup_key {
+        None => event_id.clone(),
+        Some(s) => {
+            validate_capture_dedup_key(&s)?;
+            s
+        }
+    };
+    validate_capture_dedup_key(&dedup_key)?;
+
+    validate_spool_text_field(
+        &raw.context.provider_session_id,
+        "context.provider_session_id",
+        false,
+    )?;
+    validate_spool_text_field(&raw.context.working_dir, "context.working_dir", true)?;
+    validate_spool_text_field(&raw.context.storage_path, "context.storage_path", false)?;
+    validate_spool_text_field(&raw.context.worktree_root, "context.worktree_root", true)?;
+    if !same_storage_root(Path::new(&raw.context.storage_path), expected_storage) {
+        return Err(StorageBackendError::BackendInternal {
+            detail:
+                "forward migration Phase 1 rejected capture-spool entry belonging to another repository"
+                    .to_string(),
+        });
+    }
+
+    if !is_valid_spool_lifecycle_event_kind(&raw.event.kind) {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "forward migration Phase 1 rejected capture-spool envelope with unknown lifecycle event kind"
+                .to_string(),
+        });
+    }
+    validate_spool_text_field(&raw.event.session_id, "event.session_id", false)?;
+    let parsed_ts = chrono::DateTime::parse_from_rfc3339(&raw.event.timestamp)
+        .map_err(|_| StorageBackendError::BackendInternal {
+            detail:
+                "forward migration Phase 1 rejected capture-spool envelope with invalid timestamp"
+                    .to_string(),
+        })?
+        .with_timezone(&Utc);
+    let event_ts = parsed_ts.timestamp();
+    let event_ts_nanos = parsed_ts.timestamp_subsec_nanos();
+    let timestamp_rfc3339 = parsed_ts.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true);
+
+    if let Some(link) = raw.tool_link.as_ref()
+        && link.tool.value.is_empty()
+    {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "forward migration Phase 1 rejected invalid capture-spool envelope field `tool_link.tool`"
+                .to_string(),
+        });
+    }
+    if let Some(hints) = raw.child_hints.as_ref() {
+        validate_spool_child_hints(hints)?;
+    }
+
+    let redaction_report = serde_json::to_string(&raw.redaction).map_err(|_| {
+        StorageBackendError::BackendInternal {
+            detail: "forward migration Phase 1 failed to serialize capture-spool redaction"
+                .to_string(),
+        }
+    })?;
+    validate_spool_text_field(&redaction_report, "redaction", true)?;
+
+    let has_chunked_raw_envelope = raw.redaction_matches_overflow
+        || raw.event.session_ref.as_ref().is_some_and(|b| b.truncated)
+        || raw.event.prompt.as_ref().is_some_and(|b| b.truncated)
+        || raw.event.model.as_ref().is_some_and(|b| b.truncated)
+        || raw.event.source.as_ref().is_some_and(|b| b.truncated)
+        || raw.event.tool_name.as_ref().is_some_and(|b| b.truncated)
+        || raw.event.tool_input.as_ref().is_some_and(|b| b.truncated)
+        || raw
+            .event
+            .tool_response
+            .as_ref()
+            .is_some_and(|b| b.truncated)
+        || raw
+            .event
+            .assistant_message
+            .as_ref()
+            .is_some_and(|b| b.truncated)
+        || raw
+            .tool_link
+            .as_ref()
+            .is_some_and(|l| l.tool.truncated || l.parent.as_ref().is_some_and(|p| p.truncated))
+        || raw.child_hints.as_ref().is_some_and(|h| {
+            h.current_or_parent_path
+                .as_ref()
+                .is_some_and(|b| b.truncated)
+                || h.child_path.as_ref().is_some_and(|b| b.truncated)
+                || h.child_id.as_ref().is_some_and(|b| b.truncated)
+                || h.turn_id.as_ref().is_some_and(|b| b.truncated)
+        });
+
+    let is_session_end = raw.event.kind == "session_end";
+    let needs_checkpoint_materialization = matches!(
+        raw.event.kind.as_str(),
+        "turn_end" | "session_end" | "subagent_start" | "subagent_end"
+    );
+    let receipt = SpoolDirectIngestEventReceipt {
+        session_id: String::new(),
+        event_id,
+        dedup_key: dedup_key.clone(),
+        agent_kind: raw.agent_kind,
+        event_kind: raw.event.kind,
+        hook_name: raw.hook_name.clone(),
+        hook_command: raw.hook_command,
+        provider_kind: raw.provider_kind,
+        provider_source: raw.provider_source,
+        identity_scheme: raw.identity_scheme,
+        frame_bytes: raw.frame_bytes,
+        hook_deadline: raw.hook_deadline,
+        display_batch_limit: raw.display_batch_limit,
+        provider_session_id: raw.context.provider_session_id.clone(),
+        event_session_id: raw.event.session_id.clone(),
+        working_dir: raw.context.working_dir.clone(),
+        worktree_root: raw.context.worktree_root,
+        event_ts,
+        event_ts_nanos,
+        timestamp_rfc3339,
+        is_terminal: is_session_end,
+        needs_checkpoint_materialization,
+        session_ref: raw.event.session_ref,
+        prompt: raw.event.prompt,
+        model: raw.event.model,
+        source: raw.event.source,
+        tool_name: raw.event.tool_name,
+        tool_input: raw.event.tool_input,
+        tool_response: raw.event.tool_response,
+        assistant_message: raw.event.assistant_message,
+        tool_link: raw.tool_link,
+        child_hints: raw.child_hints,
+        redaction_report_json: redaction_report.clone(),
+        has_chunked_raw_envelope,
+        raw_envelope_bytes,
+        raw_envelope_sha256_hex,
+    };
+    let decoded_mem_bytes = receipt
+        .retained_bytes()
+        .saturating_add(dedup_key.len())
+        .saturating_add(raw.hook_name.len())
+        .saturating_add(raw.context.provider_session_id.len())
+        .saturating_add(raw.event.session_id.len())
+        .saturating_add(raw.context.working_dir.len())
+        .saturating_add(redaction_report.len())
+        .saturating_add(256);
+
+    Ok(DecodedSpoolReadyEvent {
+        dedup_key,
+        agent_kind,
+        hook_name: raw.hook_name,
+        provider_session_id: raw.context.provider_session_id,
+        event_session_id: raw.event.session_id,
+        working_dir: raw.context.working_dir,
+        is_session_end,
+        event_ts,
+        event_ts_nanos,
+        redaction_report,
+        receipt,
+        decoded_mem_bytes,
+    })
+}
+
+/// Read all durable spool replay receipts persisted in
+/// [`MIGRATED_SPOOL_RECEIPTS_TABLE`] for `session_id`, returned in exact
+/// deterministic nanosecond chronological order
+/// `(event_ts, event_ts_nanos, is_terminal, dedup_key)`.
+pub fn read_migrated_spool_receipts_for_session(
+    capture_redb_path: &Path,
+    session_id: &str,
+) -> StorageResult<Vec<SpoolDirectIngestEventReceipt>> {
+    validate_spool_text_field(session_id, "session_id", false)?;
+    let db = open_redb_read_only(capture_redb_path, DatabaseRole::Capture)?;
+    let rtx = begin_checked_read(&db, DatabaseRole::Capture)?;
+    let tbl = match rtx.open_table(MIGRATED_SPOOL_RECEIPTS_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+        Err(e) => return Err(map_redb_table_err(e, "open migrated_spool_receipts")),
+    };
+    let mut out = Vec::new();
+    for entry in tbl
+        .range((session_id, i64::MIN, 0u32, 0u8, "")..)
+        .map_err(|e| map_redb_storage_err(e, "range-scan migrated_spool_receipts"))?
+    {
+        let (k, v) =
+            entry.map_err(|e| map_redb_storage_err(e, "read migrated_spool_receipts entry"))?;
+        if k.value().0 != session_id {
+            break;
+        }
+        let rec: SpoolDirectIngestEventReceipt =
+            decode_versioned(v.value(), redb_cap::CAPTURE_CODEC_VERSION)?;
+        out.push(rec);
+    }
+    Ok(out)
+}
+
+/// List all durable spool replay receipts requiring post-cutover checkpoint
+/// materialization (`turn_end`, `session_end`, `subagent_start`,
+/// `subagent_end`), sorted deterministically by
+/// `(event_ts, event_ts_nanos, is_terminal, session_id, dedup_key)`.
+pub fn list_pending_checkpoint_spool_receipts(
+    capture_redb_path: &Path,
+) -> StorageResult<Vec<SpoolDirectIngestEventReceipt>> {
+    let db = open_redb_read_only(capture_redb_path, DatabaseRole::Capture)?;
+    let rtx = begin_checked_read(&db, DatabaseRole::Capture)?;
+    let tbl = match rtx.open_table(MIGRATED_SPOOL_RECEIPTS_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+        Err(e) => return Err(map_redb_table_err(e, "open migrated_spool_receipts")),
+    };
+    let mut out = Vec::new();
+    for entry in tbl
+        .iter()
+        .map_err(|e| map_redb_storage_err(e, "iterate migrated_spool_receipts"))?
+    {
+        let (_, v) =
+            entry.map_err(|e| map_redb_storage_err(e, "read migrated_spool_receipts entry"))?;
+        let rec: SpoolDirectIngestEventReceipt =
+            decode_versioned(v.value(), redb_cap::CAPTURE_CODEC_VERSION)?;
+        if rec.needs_checkpoint_materialization {
+            out.push(rec);
+        }
+    }
+    out.sort_by(|a, b| {
+        a.event_ts
+            .cmp(&b.event_ts)
+            .then_with(|| a.event_ts_nanos.cmp(&b.event_ts_nanos))
+            .then_with(|| a.is_terminal.cmp(&b.is_terminal))
+            .then_with(|| a.session_id.cmp(&b.session_id))
+            .then_with(|| a.dedup_key.cmp(&b.dedup_key))
+    });
+    Ok(out)
+}
+
+/// Reconstruct an `encode_spool_envelope` v1 JSON replay payload directly from
+/// a durable [`SpoolDirectIngestEventReceipt`] stored inside
+/// `capture.gen-<id>.redb`, without requiring the fenced source
+/// `capture-spool/ready/` directory to remain readable (`RB-10i` -> Track B).
+pub fn reconstruct_spool_replay_envelope(
+    receipt: &SpoolDirectIngestEventReceipt,
+    storage_path: &Path,
+) -> StorageResult<ReconstructedSpoolEnvelope> {
+    fn text_val(
+        opt: Option<&BoundedSpoolText>,
+        field: &'static str,
+        truncated_fields: &mut Vec<&'static str>,
+    ) -> serde_json::Value {
+        match opt {
+            None => serde_json::Value::Null,
+            Some(b) => {
+                if b.truncated {
+                    truncated_fields.push(field);
+                }
+                serde_json::Value::String(b.value.clone())
+            }
+        }
+    }
+    fn json_val(
+        opt: Option<&BoundedSpoolJson>,
+        field: &'static str,
+        truncated_fields: &mut Vec<&'static str>,
+    ) -> StorageResult<serde_json::Value> {
+        match opt {
+            None => Ok(serde_json::Value::Null),
+            Some(b) if !b.truncated => serde_json::from_str(&b.json_text).map_err(|_| {
+                StorageBackendError::BackendInternal {
+                    detail: format!(
+                        "migrated spool receipt contains invalid retained JSON for `{field}`"
+                    ),
+                }
+            }),
+            Some(b) => {
+                truncated_fields.push(field);
+                Ok(serde_json::json!({
+                    "_libra_truncated": true,
+                    "original_bytes": b.original_bytes,
+                    "sha256_hex": b.sha256_hex,
+                    "preview": b.json_text,
+                }))
+            }
+        }
+    }
+
+    let mut truncated_fields: Vec<&'static str> = Vec::new();
+    let tool_link_json = match receipt.tool_link.as_ref() {
+        None => serde_json::Value::Null,
+        Some(link) => {
+            if link.tool.truncated {
+                truncated_fields.push("tool_link.tool");
+            }
+            let parent_val = text_val(
+                link.parent.as_ref(),
+                "tool_link.parent",
+                &mut truncated_fields,
+            );
+            serde_json::json!({
+                "tool": link.tool.value,
+                "parent": parent_val,
+            })
+        }
+    };
+    let child_hints_json = match receipt.child_hints.as_ref() {
+        None => serde_json::json!({ "kind": "absent" }),
+        Some(h) if h.kind == "candidate" => {
+            let cop = text_val(
+                h.current_or_parent_path.as_ref(),
+                "child_hints.current_or_parent_path",
+                &mut truncated_fields,
+            );
+            let cp = text_val(
+                h.child_path.as_ref(),
+                "child_hints.child_path",
+                &mut truncated_fields,
+            );
+            let cid = text_val(
+                h.child_id.as_ref(),
+                "child_hints.child_id",
+                &mut truncated_fields,
+            );
+            let tid = text_val(
+                h.turn_id.as_ref(),
+                "child_hints.turn_id",
+                &mut truncated_fields,
+            );
+            serde_json::json!({
+                "kind": h.kind,
+                "role": h.role,
+                "current_or_parent_path": cop,
+                "child_path": cp,
+                "child_id": cid,
+                "turn_id": tid,
+            })
+        }
+        Some(h) => serde_json::json!({ "kind": h.kind }),
+    };
+
+    let redaction_json: serde_json::Value = serde_json::from_str(&receipt.redaction_report_json)
+        .map_err(|_| StorageBackendError::BackendInternal {
+            detail: "migrated spool receipt contains invalid redaction report JSON".to_string(),
+        })?;
+
+    let session_ref_json = text_val(
+        receipt.session_ref.as_ref(),
+        "event.session_ref",
+        &mut truncated_fields,
+    );
+    let prompt_json = text_val(
+        receipt.prompt.as_ref(),
+        "event.prompt",
+        &mut truncated_fields,
+    );
+    let model_json = json_val(receipt.model.as_ref(), "event.model", &mut truncated_fields)?;
+    let source_json = json_val(
+        receipt.source.as_ref(),
+        "event.source",
+        &mut truncated_fields,
+    )?;
+    let tool_name_json = text_val(
+        receipt.tool_name.as_ref(),
+        "event.tool_name",
+        &mut truncated_fields,
+    );
+    let tool_input_json = json_val(
+        receipt.tool_input.as_ref(),
+        "event.tool_input",
+        &mut truncated_fields,
+    )?;
+    let tool_response_json = json_val(
+        receipt.tool_response.as_ref(),
+        "event.tool_response",
+        &mut truncated_fields,
+    )?;
+    let assistant_msg_json = text_val(
+        receipt.assistant_message.as_ref(),
+        "event.assistant_message",
+        &mut truncated_fields,
+    );
+
+    let envelope = serde_json::json!({
+        "version": 1,
+        "agent_kind": receipt.agent_kind,
+        "hook_name": receipt.hook_name,
+        "hook_command": receipt.hook_command,
+        "provider_kind": receipt.provider_kind,
+        "provider_source": receipt.provider_source,
+        "frame_bytes": receipt.frame_bytes,
+        "event_id": receipt.event_id,
+        "identity_scheme": receipt.identity_scheme,
+        "dedup_key": receipt.dedup_key,
+        "hook_deadline": receipt.hook_deadline,
+        "display_batch_limit": receipt.display_batch_limit,
+        "tool_link": tool_link_json,
+        "child_hints": child_hints_json,
+        "context": {
+            "provider_session_id": receipt.provider_session_id,
+            "working_dir": receipt.working_dir,
+            "storage_path": storage_path.display().to_string(),
+            "worktree_root": receipt.worktree_root,
+        },
+        "event": {
+            "kind": receipt.event_kind,
+            "session_id": receipt.event_session_id,
+            "session_ref": session_ref_json,
+            "prompt": prompt_json,
+            "model": model_json,
+            "source": source_json,
+            "tool_name": tool_name_json,
+            "tool_input": tool_input_json,
+            "tool_response": tool_response_json,
+            "assistant_message": assistant_msg_json,
+            "timestamp": receipt.timestamp_rfc3339,
+        },
+        "redaction": redaction_json,
+    });
+    Ok(ReconstructedSpoolEnvelope {
+        envelope,
+        truncated_fields,
+    })
+}
+
+/// Stream a 100% lossless `encode_spool_envelope` v1 UTF-8 JSON replay payload
+/// for `receipt` directly to `out` in O(1) heap (`RB-10i` -> Track B).
+///
+/// - When `!receipt.has_chunked_raw_envelope`, serializes the already-lossless
+///   inline [`SpoolDirectIngestEventReceipt`] fields directly.
+/// - When `receipt.has_chunked_raw_envelope` (oversized replay fields or `> 256`
+///   redaction matches), streams all verified `64 KiB` raw chunks from
+///   [`MIGRATED_SPOOL_ENVELOPE_CHUNKS_TABLE`] inside `capture_redb_path`,
+///   verifying contiguous chunk numbering, exact `raw_envelope_bytes`, and exact
+///   `raw_envelope_sha256_hex` fail-closed.
+pub fn stream_migrated_spool_envelope_to_writer<W: std::io::Write>(
+    capture_redb_path: &Path,
+    receipt: &SpoolDirectIngestEventReceipt,
+    storage_path: &Path,
+    out: &mut W,
+) -> StorageResult<u64> {
+    if !receipt.has_chunked_raw_envelope {
+        let recon = reconstruct_spool_replay_envelope(receipt, storage_path)?;
+        if !recon.truncated_fields.is_empty() {
+            return Err(StorageBackendError::BackendInternal {
+                detail: "migrated spool receipt marked inline-lossless had truncated fields"
+                    .to_string(),
+            });
+        }
+        let encoded = serde_json::to_vec(&recon.envelope).map_err(|_| {
+            StorageBackendError::BackendInternal {
+                detail: "failed to encode reconstructed inline spool replay envelope".to_string(),
+            }
+        })?;
+        out.write_all(&encoded)
+            .map_err(|err| StorageBackendError::io("write reconstructed spool envelope", err))?;
+        return Ok(encoded.len() as u64);
+    }
+
+    let db = open_redb_read_only(capture_redb_path, DatabaseRole::Capture)?;
+    let rtx = begin_checked_read(&db, DatabaseRole::Capture)?;
+    let tbl = rtx
+        .open_table(MIGRATED_SPOOL_ENVELOPE_CHUNKS_TABLE)
+        .map_err(|e| map_redb_table_err(e, "open migrated_spool_envelope_chunks"))?;
+
+    // Pass 1 (under immutable MVCC snapshot `rtx`): authenticate contiguous
+    // chunk numbering, exact `raw_envelope_bytes`, and exact SHA-256 BEFORE
+    // emitting a single byte to `out` so an irreversible sink never receives
+    // corrupted or truncated data.
+    let mut expected_idx = 0u32;
+    let mut total_bytes = 0u64;
+    let mut hasher = Sha256::new();
+    for entry in tbl
+        .range((receipt.dedup_key.as_str(), 0u32)..)
+        .map_err(|e| map_redb_storage_err(e, "range-scan migrated_spool_envelope_chunks"))?
+    {
+        let (k, v) = entry
+            .map_err(|e| map_redb_storage_err(e, "read migrated_spool_envelope_chunks entry"))?;
+        let (key_dedup, chunk_idx) = k.value();
+        if key_dedup != receipt.dedup_key.as_str() {
+            break;
+        }
+        if chunk_idx != expected_idx {
+            return Err(StorageBackendError::BackendInternal {
+                detail: "migrated spool raw envelope chunks have non-contiguous sequence"
+                    .to_string(),
+            });
+        }
+        let bytes = v.value();
+        hasher.update(bytes);
+        total_bytes = total_bytes.saturating_add(bytes.len() as u64);
+        expected_idx =
+            expected_idx
+                .checked_add(1)
+                .ok_or_else(|| StorageBackendError::BackendInternal {
+                    detail: "migrated spool chunk index overflow".to_string(),
+                })?;
+    }
+    let actual_sha = sha256_hex_from_hasher(hasher);
+    if total_bytes != receipt.raw_envelope_bytes || actual_sha != receipt.raw_envelope_sha256_hex {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "migrated spool raw envelope chunks failed size or SHA-256 verification"
+                .to_string(),
+        });
+    }
+
+    // Pass 2 (under the exact same immutable `rtx` snapshot): stream verified
+    // `64 KiB` chunks directly to `out`.
+    for entry in tbl
+        .range((receipt.dedup_key.as_str(), 0u32)..)
+        .map_err(|e| {
+            map_redb_storage_err(e, "range-scan verified migrated_spool_envelope_chunks")
+        })?
+    {
+        let (k, v) = entry.map_err(|e| {
+            map_redb_storage_err(e, "read verified migrated_spool_envelope_chunks entry")
+        })?;
+        if k.value().0 != receipt.dedup_key.as_str() {
+            break;
+        }
+        out.write_all(v.value())
+            .map_err(|err| StorageBackendError::io("write streamed spool envelope chunk", err))?;
+    }
+    Ok(total_bytes)
+}
+
+/// Reconstruct the 100% lossless `encode_spool_envelope` v1 JSON value from
+/// `capture_redb_path` for `receipt`, seamlessly reading inline fields or
+/// verified raw chunks from [`MIGRATED_SPOOL_ENVELOPE_CHUNKS_TABLE`] (`RB-10i`).
+pub fn reconstruct_spool_replay_envelope_lossless(
+    capture_redb_path: &Path,
+    receipt: &SpoolDirectIngestEventReceipt,
+    storage_path: &Path,
+) -> StorageResult<serde_json::Value> {
+    if !receipt.has_chunked_raw_envelope {
+        let recon = reconstruct_spool_replay_envelope(receipt, storage_path)?;
+        if !recon.truncated_fields.is_empty() {
+            return Err(StorageBackendError::BackendInternal {
+                detail: "migrated spool receipt marked inline-lossless had truncated fields"
+                    .to_string(),
+            });
+        }
+        return Ok(recon.envelope);
+    }
+    let mut raw = Vec::new();
+    let _ = stream_migrated_spool_envelope_to_writer(
+        capture_redb_path,
+        receipt,
+        storage_path,
+        &mut raw,
+    )?;
+    serde_json::from_slice(&raw).map_err(|_| StorageBackendError::BackendInternal {
+        detail: "migrated spool chunked raw envelope failed JSON decode".to_string(),
+    })
+}
+
+/// Stream a validated oversized (or `> 256` redaction match) `capture-spool/ready/`
+/// file directly into [`MIGRATED_SPOOL_ENVELOPE_CHUNKS_TABLE`] in `64 KiB`
+/// chunks committed every `32` chunks (`2 MiB`) so 100% lossless replay data is
+/// persisted in strict O(1) RAM without ever buffering the envelope.
+fn stream_spool_envelope_chunks_to_redb(
+    cap_db: &RedbDatabase,
+    file: &mut File,
+    dedup_key: &str,
+    expected_bytes: u64,
+    expected_sha256_hex: &str,
+    telemetry: &mut ExportStreamTelemetry<'_>,
+) -> StorageResult<()> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+
+    // Skip chunk persistence if this `dedup_key` was already committed.
+    let already_deduped = {
+        let rtx = begin_checked_read(cap_db, DatabaseRole::Capture)?;
+        let dedup = rtx
+            .open_table(redb_cap::CAPTURE_DEDUP_KEYS_TABLE)
+            .map_err(|e| map_redb_table_err(e, "open capture_dedup_keys before spool chunking"))?;
+        dedup
+            .get(dedup_key)
+            .map_err(|e| map_redb_storage_err(e, "check capture_dedup_keys before spool chunking"))?
+            .is_some()
+    };
+    if already_deduped {
+        return Ok(());
+    }
+
+    file.seek(SeekFrom::Start(0))
+        .map_err(|err| StorageBackendError::io("rewind capture-spool file for chunking", err))?;
+
+    let mut buf = vec![0u8; SPOOL_ENVELOPE_CHUNK_BYTES];
+    let mut chunk_idx = 0u32;
+    let mut total_bytes = 0u64;
+    let mut hasher = Sha256::new();
+    let mut eof = false;
+
+    while !eof {
+        let wtx = begin_write_bounded_blocking(
+            cap_db,
+            DatabaseRole::Capture,
+            EXPORT_TMP_REDB_WRITE_TIMEOUT,
+        )?;
+        let mut tx_chunks = 0usize;
+        {
+            let mut tbl = wtx
+                .open_table(MIGRATED_SPOOL_ENVELOPE_CHUNKS_TABLE)
+                .map_err(|e| map_redb_table_err(e, "open migrated_spool_envelope_chunks"))?;
+            while tx_chunks < SPOOL_ENVELOPE_CHUNKS_PER_TX {
+                let mut filled = 0usize;
+                while filled < buf.len() {
+                    let n = file.read(&mut buf[filled..]).map_err(|err| {
+                        StorageBackendError::io("read capture-spool file chunk", err)
+                    })?;
+                    if n == 0 {
+                        eof = true;
+                        break;
+                    }
+                    filled = filled.saturating_add(n);
+                }
+                if filled == 0 {
+                    break;
+                }
+                let slice = &buf[..filled];
+                hasher.update(slice);
+                total_bytes = total_bytes.saturating_add(filled as u64);
+                if total_bytes > expected_bytes {
+                    return Err(StorageBackendError::BackendInternal {
+                        detail: "forward migration Phase 1 detected capture-spool file growth during chunked persistence"
+                            .to_string(),
+                    });
+                }
+                tbl.insert((dedup_key, chunk_idx), slice).map_err(|e| {
+                    map_redb_storage_err(e, "insert migrated_spool_envelope_chunks")
+                })?;
+                chunk_idx = chunk_idx.checked_add(1).ok_or_else(|| {
+                    StorageBackendError::BackendInternal {
+                        detail: "capture-spool raw chunk index overflow".to_string(),
+                    }
+                })?;
+                tx_chunks = tx_chunks.saturating_add(1);
+                if eof {
+                    break;
+                }
+            }
+        }
+        if tx_chunks > 0 {
+            wtx.commit().map_err(|err| {
+                map_redb_commit_err(err, "commit capture-spool lossless chunk batch")
+            })?;
+            telemetry.record_batch("capture_spool_ready", tx_chunks)?;
+        }
+    }
+
+    let actual_sha = sha256_hex_from_hasher(hasher);
+    if total_bytes != expected_bytes || actual_sha != expected_sha256_hex {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "forward migration Phase 1 detected capture-spool content change during lossless chunk persistence"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Shared Unix/Windows handler for one validated `capture-spool/ready/` event:
+/// flushes bounded batches, persists lossless raw chunks in O(1) RAM whenever
+/// `ev.receipt.has_chunked_raw_envelope` is true, and queues `ev` for commit.
+fn process_decoded_spool_event(
+    cap_db: &RedbDatabase,
+    file: &mut File,
+    ev: DecodedSpoolReadyEvent,
+    batch: &mut Vec<DecodedSpoolReadyEvent>,
+    batch_bytes: &mut usize,
+    report: &mut SpoolDirectIngestReport,
+    telemetry: &mut ExportStreamTelemetry<'_>,
+) -> StorageResult<()> {
+    report.files_read = report.files_read.saturating_add(1);
+
+    // Flush pending batch BEFORE streaming lossless chunks for an oversized
+    // envelope so `CAPTURE_DEDUP_KEYS_TABLE` is up-to-date and peak RAM stays minimal.
+    let must_flush = !batch.is_empty()
+        && (ev.receipt.has_chunked_raw_envelope
+            || batch.len() >= FORWARD_MIGRATION_QUEUE_INGEST_BATCH_ITEMS
+            || batch_bytes.saturating_add(ev.decoded_mem_bytes)
+                > FORWARD_MIGRATION_INGEST_BATCH_MAX_BYTES);
+    if must_flush {
+        let (applied, deduped) = commit_spool_events_batch(cap_db, batch, telemetry)?;
+        report.applied_events = report.applied_events.saturating_add(applied);
+        report.deduplicated_events = report.deduplicated_events.saturating_add(deduped);
+        report.batches_committed = report.batches_committed.saturating_add(1);
+        batch.clear();
+        *batch_bytes = 0;
+    }
+
+    if ev.receipt.has_chunked_raw_envelope {
+        stream_spool_envelope_chunks_to_redb(
+            cap_db,
+            file,
+            &ev.dedup_key,
+            ev.receipt.raw_envelope_bytes,
+            &ev.receipt.raw_envelope_sha256_hex,
+            telemetry,
+        )?;
+    }
+
+    *batch_bytes = batch_bytes.saturating_add(ev.decoded_mem_bytes);
+    batch.push(ev);
+    Ok(())
+}
+
+/// Deterministically merge one applied spool event into O(1)-sized
+/// `agent_session.metadata_json` and return `(merged_metadata_json, incoming_is_latest)`.
+///
+/// Uses full nanosecond precision `(ts, ts_nanos, is_terminal, dedup_key)` so
+/// two events within the same whole second are strictly ordered by exact
+/// timestamp, AND never stores a growing receipt list inside `metadata_json`
+/// (all full per-event replay receipts live O(1)-keyed in
+/// [`MIGRATED_SPOOL_RECEIPTS_TABLE`]), keeping single-session memory and work
+/// strictly O(1) even across thousands of pending spool events.
+fn merge_spool_session_metadata(
+    existing_json: &str,
+    existing_last_event_at: Option<i64>,
+    ev: &DecodedSpoolReadyEvent,
+) -> (String, bool) {
+    let mut map = match serde_json::from_str::<serde_json::Value>(existing_json) {
+        Ok(serde_json::Value::Object(m)) => m,
+        _ => serde_json::Map::new(),
+    };
+
+    let incoming_cursor = SpoolDirectIngestCursor {
+        ts: ev.event_ts,
+        ts_nanos: ev.event_ts_nanos,
+        is_terminal: ev.is_session_end,
+        dedup_key: ev.dedup_key.clone(),
+    };
+    let incoming_key = (
+        incoming_cursor.ts,
+        incoming_cursor.ts_nanos,
+        incoming_cursor.is_terminal,
+        incoming_cursor.dedup_key.as_str(),
+    );
+
+    let incoming_is_latest = match map
+        .get("spool_direct_ingest_cursor")
+        .and_then(|v| serde_json::from_value::<SpoolDirectIngestCursor>(v.clone()).ok())
+    {
+        Some(prev) => {
+            incoming_key
+                > (
+                    prev.ts,
+                    prev.ts_nanos,
+                    prev.is_terminal,
+                    prev.dedup_key.as_str(),
+                )
+        }
+        None => match existing_last_event_at {
+            Some(prev_ts) => ev.event_ts >= prev_ts,
+            None => true,
+        },
+    };
+
+    // Maintain strictly O(1), 100% commutative summary counters in
+    // `agent_session.metadata_json`; full per-event replay receipts are stored
+    // independently in `MIGRATED_SPOOL_RECEIPTS_TABLE`.
+    let next_receipt_count = map
+        .get("spool_direct_ingest_receipt_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0)
+        .saturating_add(1);
+    map.insert(
+        "spool_direct_ingest_receipt_count".to_string(),
+        serde_json::Value::Number(next_receipt_count.into()),
+    );
+    let prev_pending_cp = map
+        .get("spool_direct_ingest_pending_checkpoint_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let next_pending_cp = if ev.receipt.needs_checkpoint_materialization {
+        prev_pending_cp.saturating_add(1)
+    } else {
+        prev_pending_cp
+    };
+    map.insert(
+        "spool_direct_ingest_pending_checkpoint_count".to_string(),
+        serde_json::Value::Number(next_pending_cp.into()),
+    );
+    map.insert(
+        "spool_direct_ingest_receipts_table".to_string(),
+        serde_json::Value::String(MIGRATED_SPOOL_RECEIPTS_TABLE.name().to_string()),
+    );
+
+    if incoming_is_latest {
+        if let Ok(cursor_val) = serde_json::to_value(&incoming_cursor) {
+            map.insert("spool_direct_ingest_cursor".to_string(), cursor_val);
+        }
+        map.insert(
+            "last_spool_event_id".to_string(),
+            serde_json::Value::String(ev.receipt.event_id.clone()),
+        );
+        map.insert(
+            "last_spool_event_kind".to_string(),
+            serde_json::Value::String(ev.receipt.event_kind.clone()),
+        );
+        map.insert(
+            "last_spool_event_timestamp".to_string(),
+            serde_json::Value::String(ev.receipt.timestamp_rfc3339.clone()),
+        );
+        map.insert(
+            "hook_name".to_string(),
+            serde_json::Value::String(ev.receipt.hook_name.clone()),
+        );
+        map.insert(
+            "hook_command".to_string(),
+            serde_json::Value::String(ev.receipt.hook_command.clone()),
+        );
+        map.insert(
+            "provider_kind".to_string(),
+            serde_json::Value::String(ev.receipt.provider_kind.clone()),
+        );
+    }
+
+    let serialized = serde_json::to_string(&serde_json::Value::Object(map))
+        .ok()
+        .filter(|s| !s.contains('\0'))
+        .unwrap_or_else(|| {
+            if !existing_json.is_empty() && !existing_json.contains('\0') {
+                existing_json.to_string()
+            } else {
+                "{}".to_string()
+            }
+        });
+    (serialized, incoming_is_latest)
+}
+
+fn resolve_new_spool_session_id(ev: &DecodedSpoolReadyEvent) -> String {
+    if !ev.event_session_id.contains("__") {
+        return format!("{}__{}", ev.hook_name, ev.provider_session_id);
+    }
+    if ev.event_session_id != ev.provider_session_id {
+        return ev.event_session_id.clone();
+    }
+    format!("{}__{}", ev.agent_kind.as_str(), ev.provider_session_id)
+}
+
+/// Apply one bounded batch of decoded `capture-spool/ready/` events inside a
+/// single `capture.gen-<id>.redb.tmp` write transaction with order-independent
+/// monotonic session merging (`0-*` `session_end` before `1-*` `session_start`)
+/// and O(1) per-event durable receipt writes to [`MIGRATED_SPOOL_RECEIPTS_TABLE`].
+fn commit_spool_events_batch(
+    cap_db: &RedbDatabase,
+    batch: &[DecodedSpoolReadyEvent],
+    telemetry: &mut ExportStreamTelemetry<'_>,
+) -> StorageResult<(u64, u64)> {
+    if batch.is_empty() {
+        return Ok((0, 0));
+    }
+    let wtx =
+        begin_write_bounded_blocking(cap_db, DatabaseRole::Capture, EXPORT_TMP_REDB_WRITE_TIMEOUT)?;
+    let mut applied = 0u64;
+    let mut deduplicated = 0u64;
+
+    for ev in batch {
+        let already_deduped = {
+            let dedup = wtx
+                .open_table(redb_cap::CAPTURE_DEDUP_KEYS_TABLE)
+                .map_err(|e| map_redb_table_err(e, "open capture_dedup_keys for spool ingest"))?;
+            dedup
+                .get(ev.dedup_key.as_str())
+                .map_err(|e| map_redb_storage_err(e, "lookup capture_dedup_keys for spool ingest"))?
+                .is_some()
+        };
+        if already_deduped {
+            deduplicated = deduplicated.saturating_add(1);
+            continue;
+        }
+
+        // First look up by `(agent_kind, provider_session_id)` so pending spool
+        // events seamlessly merge into any existing SQLite-exported session row.
+        let existing_by_provider_sid: Option<String> = {
+            let by_provider = wtx
+                .open_table(redb_cap::SESSIONS_BY_PROVIDER_TABLE)
+                .map_err(|e| map_redb_table_err(e, "open sessions_by_provider for spool ingest"))?;
+            match by_provider
+                .get((ev.agent_kind.as_str(), ev.provider_session_id.as_str()))
+                .map_err(|e| {
+                    map_redb_storage_err(e, "lookup sessions_by_provider for spool ingest")
+                })? {
+                Some(raw) => {
+                    let entry: MigSessionProviderIndexEntry =
+                        decode_versioned(raw.value(), redb_cap::CAPTURE_CODEC_VERSION)?;
+                    Some(entry.session_id)
+                }
+                None => None,
+            }
+        };
+
+        let target_session_id = existing_by_provider_sid
+            .clone()
+            .unwrap_or_else(|| resolve_new_spool_session_id(ev));
+
+        let existing_session: Option<AgentSessionRecord> = {
+            let sessions = wtx
+                .open_table(redb_cap::AGENT_SESSION_TABLE)
+                .map_err(|e| map_redb_table_err(e, "open agent_session for spool ingest"))?;
+            match sessions
+                .get(target_session_id.as_str())
+                .map_err(|e| map_redb_storage_err(e, "read agent_session for spool ingest"))?
+            {
+                Some(raw) => Some(decode_versioned(
+                    raw.value(),
+                    redb_cap::CAPTURE_CODEC_VERSION,
+                )?),
+                None => None,
+            }
+        };
+
+        if let Some(existing) = existing_session.as_ref()
+            && (existing.agent_kind != ev.agent_kind
+                || existing.provider_session_id != ev.provider_session_id)
+        {
+            return Err(StorageBackendError::BackendInternal {
+                detail: "forward migration Phase 1 rejected capture-spool event whose session_id collides with a different provider session"
+                    .to_string(),
+            });
+        }
+
+        let merged = match existing_session {
+            Some(existing) => {
+                let state = if existing.state == CaptureSessionState::Stopped || ev.is_session_end {
+                    CaptureSessionState::Stopped
+                } else {
+                    existing.state
+                };
+                let stopped_at = if ev.is_session_end {
+                    Some(
+                        existing
+                            .stopped_at
+                            .map_or(ev.event_ts, |prev| prev.max(ev.event_ts)),
+                    )
+                } else {
+                    existing.stopped_at
+                };
+                let working_dir = if existing.working_dir.is_empty() {
+                    ev.working_dir.clone()
+                } else {
+                    existing.working_dir.clone()
+                };
+                let (metadata_json, incoming_is_latest) = merge_spool_session_metadata(
+                    &existing.metadata_json,
+                    Some(existing.last_event_at),
+                    ev,
+                );
+                let redaction_report = if incoming_is_latest {
+                    ev.redaction_report.clone()
+                } else {
+                    existing.redaction_report.clone()
+                };
+                AgentSessionRecord {
+                    session_id: existing.session_id,
+                    agent_kind: existing.agent_kind,
+                    provider_session_id: existing.provider_session_id,
+                    thread_id: existing.thread_id,
+                    state,
+                    working_dir,
+                    worktree_id: existing.worktree_id,
+                    parent_commit: existing.parent_commit,
+                    parent_session_id: existing.parent_session_id,
+                    metadata_json,
+                    redaction_report,
+                    started_at: existing.started_at.min(ev.event_ts),
+                    last_event_at: existing.last_event_at.max(ev.event_ts),
+                    stopped_at,
+                    schema_version: existing.schema_version,
+                    sync_revision: existing.sync_revision.saturating_add(1),
+                    repo_id: existing.repo_id,
+                    workspace_id: existing.workspace_id,
+                    workspace_fence: existing.workspace_fence,
+                    scope_state: existing.scope_state,
+                }
+            }
+            None => {
+                let (metadata_json, _) = merge_spool_session_metadata("{}", None, ev);
+                AgentSessionRecord {
+                    session_id: target_session_id.clone(),
+                    agent_kind: ev.agent_kind,
+                    provider_session_id: ev.provider_session_id.clone(),
+                    thread_id: None,
+                    state: if ev.is_session_end {
+                        CaptureSessionState::Stopped
+                    } else {
+                        CaptureSessionState::Active
+                    },
+                    working_dir: ev.working_dir.clone(),
+                    worktree_id: None,
+                    parent_commit: None,
+                    parent_session_id: None,
+                    metadata_json,
+                    redaction_report: ev.redaction_report.clone(),
+                    started_at: ev.event_ts,
+                    last_event_at: ev.event_ts,
+                    stopped_at: if ev.is_session_end {
+                        Some(ev.event_ts)
+                    } else {
+                        None
+                    },
+                    schema_version: 1,
+                    sync_revision: 1,
+                    repo_id: None,
+                    workspace_id: None,
+                    workspace_fence: None,
+                    scope_state: CaptureScopeState::LegacyUnknown,
+                }
+            }
+        };
+
+        let resolved_sid = merged.session_id.clone();
+        let item = CaptureBatchItem {
+            dedup_key: ev.dedup_key.clone(),
+            payload: CaptureBatchPayload::UpsertSession(merged),
+        };
+        validate_capture_batch_item(&item)?;
+        let (a, d) =
+            RedbCaptureStore::apply_capture_batch_items_in_wtx(&wtx, std::slice::from_ref(&item))?;
+        if a > 0 {
+            let mut receipt = ev.receipt.clone();
+            receipt.session_id = resolved_sid;
+            let receipt_bytes = encode_versioned(redb_cap::CAPTURE_CODEC_VERSION, &receipt)?;
+            let mut receipt_tbl = wtx
+                .open_table(MIGRATED_SPOOL_RECEIPTS_TABLE)
+                .map_err(|e| map_redb_table_err(e, "open migrated_spool_receipts for write"))?;
+            receipt_tbl
+                .insert(
+                    (
+                        receipt.session_id.as_str(),
+                        receipt.event_ts,
+                        receipt.event_ts_nanos,
+                        u8::from(receipt.is_terminal),
+                        receipt.dedup_key.as_str(),
+                    ),
+                    receipt_bytes.as_slice(),
+                )
+                .map_err(|e| map_redb_storage_err(e, "insert migrated_spool_receipts"))?;
+        }
+        applied = applied.saturating_add(a as u64);
+        deduplicated = deduplicated.saturating_add(d as u64);
+    }
+
+    wtx.commit()
+        .map_err(|err| map_redb_commit_err(err, "commit capture-spool direct-ingest batch"))?;
+    telemetry.record_batch("capture_spool_ready", batch.len())?;
+    Ok((applied, deduplicated))
+}
+
+#[cfg(unix)]
+fn open_readonly_root_dir_unix(common_storage: &Path) -> StorageResult<std::os::unix::io::OwnedFd> {
+    use std::{
+        ffi::CString,
+        os::unix::{
+            ffi::OsStrExt as _,
+            io::{AsRawFd as _, FromRawFd as _, OwnedFd},
+        },
+    };
+    let c_storage = CString::new(common_storage.as_os_str().as_bytes()).map_err(|_| {
+        StorageBackendError::BackendInternal {
+            detail: "invalid repository storage root path".to_string(),
+        }
+    })?;
+    // SAFETY: `c_storage` is NUL-terminated.
+    let raw_root = unsafe {
+        libc::open(
+            c_storage.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if raw_root < 0 {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "repository storage root must be a non-symlink directory".to_string(),
+        });
+    }
+    // SAFETY: `raw_root >= 0` is exclusively owned here.
+    let root_fd = unsafe { OwnedFd::from_raw_fd(raw_root) };
+    let mut st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: `root_fd` is valid.
+    if unsafe { libc::fstat(root_fd.as_raw_fd(), st.as_mut_ptr()) } != 0 {
+        return Err(StorageBackendError::io(
+            "stat repository storage root",
+            io::Error::last_os_error(),
+        ));
+    }
+    // SAFETY: `fstat` succeeded.
+    let st = unsafe { st.assume_init() };
+    // SAFETY: `geteuid` has no preconditions and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    if (st.st_mode & libc::S_IFMT) != libc::S_IFDIR || st.st_uid != euid {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "repository storage root is not owned by the current effective user"
+                .to_string(),
+        });
+    }
+    if (u32::from(st.st_mode) & 0o022) != 0 {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "repository storage root has unsafe group- or world-writable permissions"
+                .to_string(),
+        });
+    }
+    Ok(root_fd)
+}
+
+#[cfg(unix)]
+fn open_readonly_subdir_unix(
+    parent_fd: &std::os::unix::io::OwnedFd,
+    name: &std::ffi::CStr,
+    forbidden_mode_bits: u32,
+    subject: &'static str,
+) -> StorageResult<Option<(std::os::unix::io::OwnedFd, libc::stat)>> {
+    use std::os::unix::io::{AsRawFd as _, FromRawFd as _, OwnedFd};
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    // SAFETY: `parent_fd` is valid and `name` is NUL-terminated.
+    let raw_fd = unsafe { libc::openat(parent_fd.as_raw_fd(), name.as_ptr(), flags) };
+    if raw_fd < 0 {
+        let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::NotFound {
+            return Ok(None);
+        }
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!("forward migration Phase 1 rejected unsafe {subject}"),
+        });
+    }
+    // SAFETY: `raw_fd >= 0` is exclusively owned here.
+    let dir_fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+    let mut st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: `dir_fd` is valid.
+    if unsafe { libc::fstat(dir_fd.as_raw_fd(), st.as_mut_ptr()) } != 0 {
+        return Err(StorageBackendError::io(
+            "stat capture ingest directory",
+            io::Error::last_os_error(),
+        ));
+    }
+    // SAFETY: `fstat` succeeded.
+    let st = unsafe { st.assume_init() };
+    // SAFETY: `geteuid` has no preconditions and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    if (st.st_mode & libc::S_IFMT) != libc::S_IFDIR || st.st_uid != euid {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!("forward migration Phase 1 rejected {subject} ownership or file type"),
+        });
+    }
+    if (u32::from(st.st_mode) & forbidden_mode_bits) != 0 {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!("forward migration Phase 1 rejected unsafe permissions on {subject}"),
+        });
+    }
+    Ok(Some((dir_fd, st)))
+}
+
+#[cfg(unix)]
+fn list_sorted_dir_names_unix(
+    dir_fd: &std::os::unix::io::OwnedFd,
+    subject: &'static str,
+) -> StorageResult<Vec<String>> {
+    use std::os::unix::io::AsRawFd as _;
+    // SAFETY: `dir_fd` is valid.
+    let dup_raw = unsafe { libc::fcntl(dir_fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+    if dup_raw < 0 {
+        return Err(StorageBackendError::io(
+            "duplicate directory descriptor for read-only listing",
+            io::Error::last_os_error(),
+        ));
+    }
+    // SAFETY: `dup_raw` is an open directory fd; on success `fdopendir` takes ownership.
+    let dir_ptr = unsafe { libc::fdopendir(dup_raw) };
+    if dir_ptr.is_null() {
+        let err = io::Error::last_os_error();
+        // SAFETY: `fdopendir` failed, so close `dup_raw`.
+        unsafe {
+            libc::close(dup_raw);
+        }
+        return Err(StorageBackendError::io(
+            "open directory stream for read-only listing",
+            err,
+        ));
+    }
+    struct DirGuard(*mut libc::DIR);
+    impl Drop for DirGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: `self.0` was returned by `fdopendir`.
+                unsafe {
+                    libc::closedir(self.0);
+                }
+            }
+        }
+    }
+    let _dir_guard = DirGuard(dir_ptr);
+
+    let mut names = Vec::new();
+    loop {
+        #[cfg(target_os = "macos")]
+        unsafe {
+            *libc::__error() = 0;
+        }
+        #[cfg(target_os = "linux")]
+        unsafe {
+            *libc::__errno_location() = 0;
+        }
+        // SAFETY: `dir_ptr` is valid for the lifetime of `_dir_guard`.
+        let entry = unsafe { libc::readdir(dir_ptr) };
+        if entry.is_null() {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error().unwrap_or(0) != 0 {
+                return Err(StorageBackendError::io(
+                    "iterate read-only ingest directory",
+                    err,
+                ));
+            }
+            break;
+        }
+        // SAFETY: `entry` is non-null and `d_name` is NUL-terminated.
+        let cstr = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+        let bytes = cstr.to_bytes();
+        if bytes == b"." || bytes == b".." {
+            continue;
+        }
+        let name =
+            std::str::from_utf8(bytes).map_err(|_| StorageBackendError::BackendInternal {
+                detail: format!(
+                    "forward migration Phase 1 rejected non-UTF-8 entry name in {subject}"
+                ),
+            })?;
+        names.push(name.to_string());
+    }
+    names.sort();
+    Ok(names)
+}
+
+#[cfg(unix)]
+fn open_readonly_regular_file_at_unix(
+    dir_fd: &std::os::unix::io::OwnedFd,
+    name: &std::ffi::CStr,
+    forbidden_mode_bits: u32,
+    exact_mode: Option<u32>,
+    subject: &'static str,
+) -> StorageResult<(File, u64)> {
+    use std::os::unix::io::{AsRawFd as _, FromRawFd as _, OwnedFd};
+    // Pass `O_NONBLOCK` so opening a malicious/stray FIFO never blocks while
+    // Phase 1 holds migration locks; verify `S_IFREG` via `fstat` immediately.
+    // SAFETY: `dir_fd` is valid and `name` is NUL-terminated.
+    let raw = unsafe {
+        libc::openat(
+            dir_fd.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+        )
+    };
+    if raw < 0 {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!("forward migration Phase 1 rejected unreadable or linked {subject}"),
+        });
+    }
+    // SAFETY: `raw >= 0` is exclusively owned here.
+    let file = File::from(unsafe { OwnedFd::from_raw_fd(raw) });
+    let mut st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: `file` is valid.
+    if unsafe { libc::fstat(file.as_raw_fd(), st.as_mut_ptr()) } != 0 {
+        return Err(StorageBackendError::io(
+            "stat read-only capture ingest file",
+            io::Error::last_os_error(),
+        ));
+    }
+    // SAFETY: `fstat` succeeded.
+    let st = unsafe { st.assume_init() };
+    // SAFETY: `geteuid` has no preconditions and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    let mode_bits = u32::from(st.st_mode) & 0o777;
+    let exact_ok = exact_mode.is_none_or(|expected| mode_bits == expected);
+    if (st.st_mode & libc::S_IFMT) != libc::S_IFREG
+        || st.st_nlink != 1
+        || st.st_uid != euid
+        || (mode_bits & forbidden_mode_bits) != 0
+        || !exact_ok
+    {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration Phase 1 rejected unsafe regular-file metadata on {subject}"
+            ),
+        });
+    }
+    // Restore blocking I/O semantics on the verified regular file descriptor.
+    // SAFETY: `file` is a valid open regular file descriptor.
+    let cur_flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+    if cur_flags >= 0 && (cur_flags & libc::O_NONBLOCK) != 0 {
+        // SAFETY: `file` is valid and clearing `O_NONBLOCK` is safe on regular files.
+        let _ = unsafe {
+            libc::fcntl(
+                file.as_raw_fd(),
+                libc::F_SETFL,
+                cur_flags & !libc::O_NONBLOCK,
+            )
+        };
+    }
+    let size = u64::try_from(st.st_size).map_err(|_| StorageBackendError::BackendInternal {
+        detail: format!("forward migration Phase 1 rejected negative file size on {subject}"),
+    })?;
+    Ok((file, size))
+}
+
+#[cfg(unix)]
+fn verify_spool_tombstone_file_unix(
+    spool_fd: &std::os::unix::io::OwnedFd,
+    name: &std::ffi::CStr,
+    subject: &'static str,
+) -> StorageResult<()> {
+    use std::io::Read as _;
+    let (file, size) = open_readonly_regular_file_at_unix(
+        spool_fd,
+        name,
+        0o377,
+        Some(crate::storage::queue::CAPTURE_SPOOL_TOMBSTONE_MODE),
+        subject,
+    )?;
+    let expected_len = CAPTURE_SPOOL_TOMBSTONE_SENTINEL.len();
+    if size != expected_len as u64 {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!("forward migration Phase 1 rejected non-tombstone file at {subject}"),
+        });
+    }
+    let mut buf = Vec::with_capacity(expected_len + 1);
+    file.take((expected_len + 1) as u64)
+        .read_to_end(&mut buf)
+        .map_err(|_| StorageBackendError::BackendInternal {
+            detail: format!("forward migration Phase 1 failed to read tombstone at {subject}"),
+        })?;
+    if buf.as_slice() != CAPTURE_SPOOL_TOMBSTONE_SENTINEL {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration Phase 1 rejected invalid tombstone sentinel at {subject}"
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Strictly read-only direct ingestion of all pending events in
+/// `<common_storage>/private/capture-spool/ready/` into
+/// `capture.gen-<id>.redb.tmp` (`ADR-RB-07` #1, `RB-10i` AC1).
+///
+/// Never creates, writes, truncates, renames, or unlinks any file or directory
+/// under `capture-spool/`.
+fn ingest_capture_spool_ready_readonly(
+    common_storage: &Path,
+    cap_db: &RedbDatabase,
+    telemetry: &mut ExportStreamTelemetry<'_>,
+) -> StorageResult<SpoolDirectIngestReport> {
+    #[cfg(unix)]
+    {
+        ingest_capture_spool_ready_readonly_unix(common_storage, cap_db, telemetry)
+    }
+    #[cfg(windows)]
+    {
+        ingest_capture_spool_ready_readonly_windows(common_storage, cap_db, telemetry)
+    }
+    #[cfg(all(not(unix), not(windows)))]
+    {
+        let ready_path = capture_spool_dir_path(common_storage).join(CAPTURE_SPOOL_READY_SUBDIR);
+        if fs::symlink_metadata(&ready_path).is_err() {
+            return Ok(SpoolDirectIngestReport::default());
+        }
+        let _ = (cap_db, telemetry);
+        Err(StorageBackendError::BackendInternal {
+            detail: "safe read-only capture-spool direct ingest is unsupported on this platform"
+                .to_string(),
+        })
+    }
+}
+
+#[cfg(unix)]
+fn ingest_capture_spool_ready_readonly_unix(
+    common_storage: &Path,
+    cap_db: &RedbDatabase,
+    telemetry: &mut ExportStreamTelemetry<'_>,
+) -> StorageResult<SpoolDirectIngestReport> {
+    use std::{ffi::CString, os::unix::io::AsRawFd as _};
+
+    let root_fd = open_readonly_root_dir_unix(common_storage)?;
+    let Some((private_fd, _)) =
+        open_readonly_subdir_unix(&root_fd, c"private", 0o022, "private directory")?
+    else {
+        return Ok(SpoolDirectIngestReport::default());
+    };
+    let Some((spool_fd, _)) = open_readonly_subdir_unix(
+        &private_fd,
+        c"capture-spool",
+        0o022,
+        "capture-spool directory",
+    )?
+    else {
+        return Ok(SpoolDirectIngestReport::default());
+    };
+
+    let mut ready_st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: `spool_fd` is valid and `c"ready"` is NUL-terminated.
+    if unsafe {
+        libc::fstatat(
+            spool_fd.as_raw_fd(),
+            c"ready".as_ptr(),
+            ready_st.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::NotFound {
+            return Ok(SpoolDirectIngestReport::default());
+        }
+        return Err(StorageBackendError::io(
+            "inspect capture-spool/ready metadata",
+            err,
+        ));
+    }
+    // SAFETY: `fstatat` succeeded.
+    let ready_st = unsafe { ready_st.assume_init() };
+    let ready_kind = ready_st.st_mode & libc::S_IFMT;
+    if ready_kind == libc::S_IFREG {
+        verify_spool_tombstone_file_unix(&spool_fd, c"ready", "capture-spool/ready")?;
+        return Ok(SpoolDirectIngestReport {
+            already_fenced: true,
+            ..Default::default()
+        });
+    }
+    if ready_kind != libc::S_IFDIR {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "forward migration Phase 1 rejected non-directory capture-spool/ready"
+                .to_string(),
+        });
+    }
+
+    let Some((ready_fd, _)) =
+        open_readonly_subdir_unix(&spool_fd, c"ready", 0o022, "capture-spool/ready")?
+    else {
+        return Ok(SpoolDirectIngestReport::default());
+    };
+    let names = list_sorted_dir_names_unix(&ready_fd, "capture-spool/ready")?;
+    if names.is_empty() {
+        return Ok(SpoolDirectIngestReport::default());
+    }
+
+    let mut report = SpoolDirectIngestReport::default();
+    let mut batch: Vec<DecodedSpoolReadyEvent> = Vec::new();
+    let mut batch_bytes = 0usize;
+
+    for name in names {
+        let c_name =
+            CString::new(name.as_bytes()).map_err(|_| StorageBackendError::BackendInternal {
+                detail:
+                    "forward migration Phase 1 rejected invalid filename in capture-spool/ready"
+                        .to_string(),
+            })?;
+        let (mut file, size) = open_readonly_regular_file_at_unix(
+            &ready_fd,
+            &c_name,
+            0o022,
+            None,
+            "capture-spool/ready entry",
+        )?;
+        let ev = decode_spool_ready_envelope_reader(&mut file, size, common_storage)?;
+        process_decoded_spool_event(
+            cap_db,
+            &mut file,
+            ev,
+            &mut batch,
+            &mut batch_bytes,
+            &mut report,
+            telemetry,
+        )?;
+    }
+
+    if !batch.is_empty() {
+        let (applied, deduped) = commit_spool_events_batch(cap_db, &batch, telemetry)?;
+        report.applied_events = report.applied_events.saturating_add(applied);
+        report.deduplicated_events = report.deduplicated_events.saturating_add(deduped);
+        report.batches_committed = report.batches_committed.saturating_add(1);
+    }
+    Ok(report)
+}
+
+#[cfg(windows)]
+fn open_readonly_non_reparse_file_windows(
+    path: &Path,
+    require_readonly_attr: bool,
+    pinned_dirs: &[(&Path, win_tmp_guard::WinFileId, &'static str)],
+    subject: &'static str,
+) -> StorageResult<(File, u64)> {
+    use std::{
+        os::windows::{ffi::OsStrExt as _, io::FromRawHandle as _},
+        ptr,
+    };
+
+    use windows_sys::Win32::{
+        Foundation::{GENERIC_READ, INVALID_HANDLE_VALUE},
+        Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_DIRECTORY,
+            FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
+            FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle, OPEN_EXISTING,
+        },
+    };
+    win_tmp_guard::verify_pinned_dir_ids(pinned_dirs)?;
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    wide.push(0);
+    // Omit `FILE_SHARE_DELETE` while opening so the file stays pinned against
+    // deletion/replacement while verified, and reject reparse points via
+    // `FILE_FLAG_OPEN_REPARSE_POINT`.
+    // SAFETY: `wide` is NUL-terminated UTF-16.
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+            ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!("forward migration Phase 1 rejected unreadable or linked {subject}"),
+        });
+    }
+    // SAFETY: `handle` is an exclusively owned valid Win32 handle.
+    let file = unsafe { File::from_raw_handle(handle as *mut std::ffi::c_void) };
+    let mut info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+    // SAFETY: `handle` is valid and `info` is writable.
+    if unsafe { GetFileInformationByHandle(handle, info.as_mut_ptr()) } == 0 {
+        return Err(StorageBackendError::io(
+            "stat read-only capture ingest file",
+            io::Error::last_os_error(),
+        ));
+    }
+    // SAFETY: `GetFileInformationByHandle` succeeded.
+    let info = unsafe { info.assume_init() };
+    let readonly_ok =
+        !require_readonly_attr || (info.dwFileAttributes & FILE_ATTRIBUTE_READONLY) != 0;
+    if (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+        || (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0
+        || info.nNumberOfLinks != 1
+        || !readonly_ok
+    {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration Phase 1 rejected unsafe regular-file metadata on {subject}"
+            ),
+        });
+    }
+    // Re-verify every pinned ancestor directory identity AFTER opening the file.
+    win_tmp_guard::verify_pinned_dir_ids(pinned_dirs)?;
+    let size = (u64::from(info.nFileSizeHigh) << 32) | u64::from(info.nFileSizeLow);
+    Ok((file, size))
+}
+
+#[cfg(windows)]
+fn ingest_capture_spool_ready_readonly_windows(
+    common_storage: &Path,
+    cap_db: &RedbDatabase,
+    telemetry: &mut ExportStreamTelemetry<'_>,
+) -> StorageResult<SpoolDirectIngestReport> {
+    use std::io::Read as _;
+    let (_root_pin, root_id) =
+        win_tmp_guard::open_pinned_non_reparse_dir(common_storage, "repository storage root")?;
+    let private_dir = common_storage.join(PRIVATE_SUBDIR);
+    let Some((_private_pin, private_id)) =
+        win_tmp_guard::open_pinned_non_reparse_dir_optional(&private_dir, "private directory")?
+    else {
+        return Ok(SpoolDirectIngestReport::default());
+    };
+    let spool_dir = private_dir.join(CAPTURE_SPOOL_SUBDIR);
+    let Some((_spool_pin, spool_id)) =
+        win_tmp_guard::open_pinned_non_reparse_dir_optional(&spool_dir, "capture-spool directory")?
+    else {
+        return Ok(SpoolDirectIngestReport::default());
+    };
+    let spool_ancestors = [
+        (common_storage, root_id, "repository storage root"),
+        (private_dir.as_path(), private_id, "private directory"),
+        (spool_dir.as_path(), spool_id, "capture-spool directory"),
+    ];
+    let ready_path = spool_dir.join(CAPTURE_SPOOL_READY_SUBDIR);
+    let meta = match fs::symlink_metadata(&ready_path) {
+        Ok(m) => m,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            return Ok(SpoolDirectIngestReport::default());
+        }
+        Err(err) => {
+            return Err(StorageBackendError::io(
+                "inspect capture-spool/ready metadata",
+                err,
+            ));
+        }
+    };
+    if meta.file_type().is_symlink() {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "forward migration Phase 1 rejected symlink at capture-spool/ready".to_string(),
+        });
+    }
+    if meta.file_type().is_file() {
+        let (file, size) = open_readonly_non_reparse_file_windows(
+            &ready_path,
+            true,
+            &spool_ancestors,
+            "capture-spool/ready",
+        )?;
+        let expected_len = CAPTURE_SPOOL_TOMBSTONE_SENTINEL.len();
+        if size != expected_len as u64 {
+            return Err(StorageBackendError::BackendInternal {
+                detail:
+                    "forward migration Phase 1 rejected non-tombstone file at capture-spool/ready"
+                        .to_string(),
+            });
+        }
+        let mut buf = Vec::with_capacity(expected_len + 1);
+        file.take((expected_len + 1) as u64)
+            .read_to_end(&mut buf)
+            .map_err(|_| StorageBackendError::BackendInternal {
+                detail: "forward migration Phase 1 failed to read tombstone at capture-spool/ready"
+                    .to_string(),
+            })?;
+        if buf.as_slice() != CAPTURE_SPOOL_TOMBSTONE_SENTINEL {
+            return Err(StorageBackendError::BackendInternal {
+                detail: "forward migration Phase 1 rejected invalid tombstone sentinel at capture-spool/ready"
+                    .to_string(),
+            });
+        }
+        return Ok(SpoolDirectIngestReport {
+            already_fenced: true,
+            ..Default::default()
+        });
+    }
+    let Some((_ready_pin, ready_id)) =
+        win_tmp_guard::open_pinned_non_reparse_dir_optional(&ready_path, "capture-spool/ready")?
+    else {
+        return Ok(SpoolDirectIngestReport::default());
+    };
+    let ready_ancestors = [
+        (common_storage, root_id, "repository storage root"),
+        (private_dir.as_path(), private_id, "private directory"),
+        (spool_dir.as_path(), spool_id, "capture-spool directory"),
+        (ready_path.as_path(), ready_id, "capture-spool/ready"),
+    ];
+    let mut names = Vec::new();
+    for entry in fs::read_dir(&ready_path)
+        .map_err(|err| StorageBackendError::io("list capture-spool/ready", err))?
+    {
+        let entry =
+            entry.map_err(|err| StorageBackendError::io("read capture-spool/ready entry", err))?;
+        let name =
+            entry
+                .file_name()
+                .into_string()
+                .map_err(|_| {
+                    StorageBackendError::BackendInternal {
+                detail:
+                    "forward migration Phase 1 rejected non-UTF-8 entry name in capture-spool/ready"
+                        .to_string(),
+            }
+                })?;
+        names.push(name);
+    }
+    names.sort();
+
+    let mut report = SpoolDirectIngestReport::default();
+    let mut batch: Vec<DecodedSpoolReadyEvent> = Vec::new();
+    let mut batch_bytes = 0usize;
+    for name in names {
+        let entry_path = ready_path.join(&name);
+        let (mut file, size) = open_readonly_non_reparse_file_windows(
+            &entry_path,
+            false,
+            &ready_ancestors,
+            "capture-spool/ready entry",
+        )?;
+        let ev = decode_spool_ready_envelope_reader(&mut file, size, common_storage)?;
+        process_decoded_spool_event(
+            cap_db,
+            &mut file,
+            ev,
+            &mut batch,
+            &mut batch_bytes,
+            &mut report,
+            telemetry,
+        )?;
+    }
+    if !batch.is_empty() {
+        let (applied, deduped) = commit_spool_events_batch(cap_db, &batch, telemetry)?;
+        report.applied_events = report.applied_events.saturating_add(applied);
+        report.deduplicated_events = report.deduplicated_events.saturating_add(deduped);
+        report.batches_committed = report.batches_committed.saturating_add(1);
+    }
+    Ok(report)
+}
+
+/// Compute streaming CRC32C over the first `len` bytes of `file` using a fixed
+/// `64 KiB` stack/heap buffer (never loading the segment into RAM).
+fn compute_file_prefix_crc32c(file: &mut File, len: u64) -> StorageResult<u32> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    file.seek(SeekFrom::Start(0))
+        .map_err(|err| StorageBackendError::io("seek capture-queue segment for CRC32C", err))?;
+    let mut crc = 0u32;
+    let mut remaining = len;
+    let mut buf = vec![0u8; QUEUE_CRC_READ_BUF_BYTES];
+    while remaining > 0 {
+        let want = usize::try_from(remaining.min(buf.len() as u64)).unwrap_or(buf.len());
+        let n = file
+            .read(&mut buf[..want])
+            .map_err(|err| StorageBackendError::io("read capture-queue segment for CRC32C", err))?;
+        if n == 0 {
+            return Err(StorageBackendError::CorruptCommittedFrame {
+                detail: "capture-queue segment truncated before LTM2 committed length".to_string(),
+            });
+        }
+        crc = crc32c_append(crc, &buf[..n]);
+        remaining = remaining.saturating_sub(n as u64);
+    }
+    file.seek(SeekFrom::Start(0))
+        .map_err(|err| StorageBackendError::io("rewind capture-queue segment after CRC32C", err))?;
+    Ok(crc)
+}
+
+fn read_capture_highwater_in_wtx(
+    wtx: &WriteTransaction,
+    lane: CaptureQueueLane,
+) -> StorageResult<CaptureQueueHighwater> {
+    let def = match lane {
+        CaptureQueueLane::Priority => redb_cap::QUEUE_HIGHWATER_PRIORITY_TABLE,
+        CaptureQueueLane::Normal => redb_cap::QUEUE_HIGHWATER_NORMAL_TABLE,
+    };
+    let tbl = wtx
+        .open_table(def)
+        .map_err(|e| map_redb_table_err(e, "open queue_highwater table"))?;
+    match tbl
+        .get(MIG_CAPTURE_SINGLETON_KEY)
+        .map_err(|e| map_redb_storage_err(e, "read queue_highwater"))?
+    {
+        Some(raw) => decode_versioned(raw.value(), redb_cap::CAPTURE_CODEC_VERSION),
+        None => Ok(CaptureQueueHighwater::default()),
+    }
+}
+
+fn write_capture_highwater_in_wtx(
+    wtx: &WriteTransaction,
+    lane: CaptureQueueLane,
+    next_hw: CaptureQueueHighwater,
+) -> StorageResult<()> {
+    let current = read_capture_highwater_in_wtx(wtx, lane)?;
+    if next_hw < current {
+        return Err(StorageBackendError::CorruptCommittedFrame {
+            detail: format!(
+                "capture queue highwater regression on {} lane during Phase 1 ingest",
+                lane.as_str()
+            ),
+        });
+    }
+    let def = match lane {
+        CaptureQueueLane::Priority => redb_cap::QUEUE_HIGHWATER_PRIORITY_TABLE,
+        CaptureQueueLane::Normal => redb_cap::QUEUE_HIGHWATER_NORMAL_TABLE,
+    };
+    let mut tbl = wtx
+        .open_table(def)
+        .map_err(|e| map_redb_table_err(e, "open queue_highwater for write"))?;
+    let bytes = encode_versioned(redb_cap::CAPTURE_CODEC_VERSION, &next_hw)?;
+    tbl.insert(MIG_CAPTURE_SINGLETON_KEY, bytes.as_slice())
+        .map_err(|e| map_redb_storage_err(e, "write queue_highwater"))?;
+    Ok(())
+}
+
+/// Apply one queue batch item inside `wtx`, handling idempotent replay of
+/// append-only audit rows already exported from SQLite (which lacks
+/// `capture_dedup_keys`). Any conflicting overwrite still fails closed.
+fn apply_queue_item_in_wtx(
+    wtx: &WriteTransaction,
+    item: &CaptureBatchItem,
+) -> StorageResult<(u64, u64)> {
+    validate_capture_batch_item(item)?;
+    let already_deduped = {
+        let dedup = wtx
+            .open_table(redb_cap::CAPTURE_DEDUP_KEYS_TABLE)
+            .map_err(|e| map_redb_table_err(e, "open capture_dedup_keys for queue ingest"))?;
+        dedup
+            .get(item.dedup_key.as_str())
+            .map_err(|e| map_redb_storage_err(e, "lookup capture_dedup_keys for queue ingest"))?
+            .is_some()
+    };
+    if already_deduped {
+        return Ok((0, 1));
+    }
+
+    let identical_existing_audit = match &item.payload {
+        CaptureBatchPayload::AppendAuditLog(rec) => {
+            let tbl = wtx
+                .open_table(redb_cap::AGENT_AUDIT_LOG_TABLE)
+                .map_err(|e| {
+                    map_redb_table_err(e, "open agent_audit_log for queue replay check")
+                })?;
+            match tbl.get(rec.audit_id.as_str()).map_err(|e| {
+                map_redb_storage_err(e, "read agent_audit_log for queue replay check")
+            })? {
+                Some(raw) => {
+                    let existing: AgentAuditLogRecord =
+                        decode_versioned(raw.value(), redb_cap::CAPTURE_CODEC_VERSION)?;
+                    existing == *rec
+                }
+                None => false,
+            }
+        }
+        CaptureBatchPayload::AppendWorkspaceScopeAudit(rec) => {
+            let tbl = wtx
+                .open_table(redb_cap::AGENT_WORKSPACE_SCOPE_AUDIT_TABLE)
+                .map_err(|e| {
+                    map_redb_table_err(e, "open agent_workspace_scope_audit for queue replay check")
+                })?;
+            match tbl.get(rec.audit_id.as_str()).map_err(|e| {
+                map_redb_storage_err(e, "read agent_workspace_scope_audit for queue replay check")
+            })? {
+                Some(raw) => {
+                    let existing: AgentWorkspaceScopeAuditRecord =
+                        decode_versioned(raw.value(), redb_cap::CAPTURE_CODEC_VERSION)?;
+                    existing == *rec
+                }
+                None => false,
+            }
+        }
+        _ => false,
+    };
+
+    if identical_existing_audit {
+        let mut dedup = wtx
+            .open_table(redb_cap::CAPTURE_DEDUP_KEYS_TABLE)
+            .map_err(|e| map_redb_table_err(e, "open capture_dedup_keys for audit replay mark"))?;
+        let marker = encode_versioned(redb_cap::CAPTURE_CODEC_VERSION, &MigCaptureMarkerValue)?;
+        dedup
+            .insert(item.dedup_key.as_str(), marker.as_slice())
+            .map_err(|e| {
+                map_redb_storage_err(e, "insert capture_dedup_keys for audit replay mark")
+            })?;
+        return Ok((0, 1));
+    }
+
+    let (applied, deduped) =
+        RedbCaptureStore::apply_capture_batch_items_in_wtx(wtx, std::slice::from_ref(item))?;
+    Ok((applied as u64, deduped as u64))
+}
+
+fn commit_queue_items_batch(
+    cap_db: &RedbDatabase,
+    lane: CaptureQueueLane,
+    batch: &[CaptureBatchItem],
+    highwater_opt: Option<CaptureQueueHighwater>,
+    telemetry: &mut ExportStreamTelemetry<'_>,
+) -> StorageResult<(u64, u64)> {
+    let wtx =
+        begin_write_bounded_blocking(cap_db, DatabaseRole::Capture, EXPORT_TMP_REDB_WRITE_TIMEOUT)?;
+    let mut applied = 0u64;
+    let mut deduped = 0u64;
+    for item in batch {
+        let (a, d) = apply_queue_item_in_wtx(&wtx, item)?;
+        applied = applied.saturating_add(a);
+        deduped = deduped.saturating_add(d);
+    }
+    if let Some(hw) = highwater_opt {
+        write_capture_highwater_in_wtx(&wtx, lane, hw)?;
+    }
+    wtx.commit()
+        .map_err(|err| map_redb_commit_err(err, "commit capture-queue direct-ingest batch"))?;
+    if !batch.is_empty() {
+        let label = match lane {
+            CaptureQueueLane::Priority => "capture_queue_priority",
+            CaptureQueueLane::Normal => "capture_queue_normal",
+        };
+        telemetry.record_batch(label, batch.len())?;
+    }
+    Ok((applied, deduped))
+}
+
+#[derive(Default)]
+struct LaneIngestOutcome {
+    frames_read: u64,
+    applied_frames: u64,
+    deduplicated_frames: u64,
+    highwater: CaptureQueueHighwater,
+    batches_committed: u64,
+}
+
+#[derive(Clone, Copy)]
+struct QueueSegmentSlice {
+    lane: CaptureQueueLane,
+    start_offset: u64,
+    end_offset: u64,
+    committed_seg_hw: Option<(u32, CaptureQueueHighwater)>,
+}
+
+/// Stream frames from an opened read-only capture-queue segment over
+/// `[slice.start_offset, slice.end_offset)` in bounded `<= 128` item /
+/// `<= 8 MiB` batches.
+///
+/// - When `slice.committed_seg_hw` is `Some((seg_id, end_hw))`: every byte up
+///   to `end_offset` is LTM2-committed, so ANY `FrameDecodeError` or offset
+///   mismatch fails closed with `CorruptCommittedFrame`, and DB highwater
+///   advances atomically up to `end_hw`.
+/// - When `slice.committed_seg_hw` is `None`: scanning uncommitted synced tail
+///   bytes beyond `LTM2.committed_len` (or Case D orphan `active_seg + 1`);
+///   complete valid dual-CRC32C frames are ingested with `highwater_opt = None`,
+///   and the first `FrameDecodeError` stops cleanly without failing or mutating
+///   disk.
+fn stream_queue_segment_range(
+    file: File,
+    slice: QueueSegmentSlice,
+    cap_db: &RedbDatabase,
+    telemetry: &mut ExportStreamTelemetry<'_>,
+    outcome: &mut LaneIngestOutcome,
+) -> StorageResult<File> {
+    use std::io::{BufReader, Seek as _, SeekFrom};
+    let QueueSegmentSlice {
+        lane,
+        start_offset,
+        end_offset,
+        committed_seg_hw,
+    } = slice;
+    let mut reader = BufReader::new(file);
+    reader
+        .seek(SeekFrom::Start(start_offset))
+        .map_err(|err| StorageBackendError::io("seek capture-queue segment for decode", err))?;
+    let mut decoder = FrameStreamDecoder::with_known_len(reader, start_offset, end_offset);
+
+    let mut batch: Vec<CaptureBatchItem> = Vec::new();
+    let mut batch_bytes = 0usize;
+
+    loop {
+        match decoder.next_frame() {
+            Ok(FrameStreamItem::Frame { offset, frame, .. }) => {
+                let frame_bytes = frame.dedup_key.len().saturating_add(frame.payload.len());
+                let payload: CaptureBatchPayload =
+                    decode_postcard_payload(&frame, CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION)?;
+                let item = CaptureBatchItem {
+                    dedup_key: frame.dedup_key,
+                    payload,
+                };
+                validate_capture_batch_item(&item)?;
+                outcome.frames_read = outcome.frames_read.saturating_add(1);
+
+                // Flush BEFORE pushing if the incoming frame would exceed
+                // either the 128-item or 8 MiB batch bound; `offset` is the
+                // exact end byte of the preceding frame already in `batch`.
+                if !batch.is_empty()
+                    && (batch.len() >= FORWARD_MIGRATION_QUEUE_INGEST_BATCH_ITEMS
+                        || batch_bytes.saturating_add(frame_bytes)
+                            > FORWARD_MIGRATION_INGEST_BATCH_MAX_BYTES)
+                {
+                    let mid_hw = committed_seg_hw.map(|(segment_id, _)| CaptureQueueHighwater {
+                        segment_id,
+                        byte_offset: offset,
+                    });
+                    let (a, d) = commit_queue_items_batch(cap_db, lane, &batch, mid_hw, telemetry)?;
+                    outcome.applied_frames = outcome.applied_frames.saturating_add(a);
+                    outcome.deduplicated_frames = outcome.deduplicated_frames.saturating_add(d);
+                    outcome.batches_committed = outcome.batches_committed.saturating_add(1);
+                    if let Some(hw) = mid_hw {
+                        outcome.highwater = hw;
+                    }
+                    batch.clear();
+                    batch_bytes = 0;
+                }
+
+                batch_bytes = batch_bytes.saturating_add(frame_bytes);
+                batch.push(item);
+            }
+            Ok(FrameStreamItem::CleanEof { offset }) => {
+                if committed_seg_hw.is_some() && offset != end_offset {
+                    return Err(StorageBackendError::CorruptCommittedFrame {
+                        detail: "committed capture-queue segment ended before LTM2 boundary"
+                            .to_string(),
+                    });
+                }
+                break;
+            }
+            Err(decode_err) => {
+                if committed_seg_hw.is_some() {
+                    return Err(decode_err.into_storage_error());
+                }
+                match decode_err {
+                    // Transient or persistent I/O failures MUST fail closed
+                    // even beyond `LTM2.committed_len` so valid synced frames
+                    // are never silently omitted (`segment.rs:1830`).
+                    FrameDecodeError::Io { .. } => {
+                        return Err(decode_err.into_storage_error());
+                    }
+                    // Uncommitted torn/corrupt suffix beyond `LTM2.committed_len`:
+                    // preserve all complete valid dual-CRC32C frames decoded prior
+                    // to the torn suffix without advancing DB highwater or mutating disk.
+                    FrameDecodeError::CorruptHeader { .. }
+                    | FrameDecodeError::CorruptPayload { .. }
+                    | FrameDecodeError::TruncatedTail { .. } => break,
+                }
+            }
+        }
+    }
+
+    if !batch.is_empty() {
+        let final_hw = committed_seg_hw.map(|(_, end_hw)| end_hw);
+        let (a, d) = commit_queue_items_batch(cap_db, lane, &batch, final_hw, telemetry)?;
+        outcome.applied_frames = outcome.applied_frames.saturating_add(a);
+        outcome.deduplicated_frames = outcome.deduplicated_frames.saturating_add(d);
+        outcome.batches_committed = outcome.batches_committed.saturating_add(1);
+        if let Some(hw) = final_hw {
+            outcome.highwater = hw;
+        }
+    } else if let Some((_, end_hw)) = committed_seg_hw
+        && outcome.highwater < end_hw
+    {
+        commit_queue_items_batch(cap_db, lane, &[], Some(end_hw), telemetry)?;
+        outcome.highwater = end_hw;
+    }
+
+    Ok(decoder.into_inner().into_inner())
+}
+
+/// Strictly read-only direct ingestion of all pending frames in
+/// `<common_storage>/private/capture-queue/` (`priority/` first, then
+/// `normal/`) into `capture.gen-<id>.redb.tmp` (`ADR-RB-07` #1, `RB-10i` AC2).
+///
+/// Never creates, writes, truncates, quarantines, unlinks, or updates
+/// `highwater.mirror` inside `capture-queue/`.
+fn ingest_capture_queue_readonly(
+    common_storage: &Path,
+    cap_db: &RedbDatabase,
+    telemetry: &mut ExportStreamTelemetry<'_>,
+) -> StorageResult<QueueDirectIngestReport> {
+    #[cfg(unix)]
+    {
+        ingest_capture_queue_readonly_unix(common_storage, cap_db, telemetry)
+    }
+    #[cfg(windows)]
+    {
+        ingest_capture_queue_readonly_windows(common_storage, cap_db, telemetry)
+    }
+    #[cfg(all(not(unix), not(windows)))]
+    {
+        let queue_path = capture_queue_dir_path(common_storage);
+        if fs::symlink_metadata(&queue_path).is_err() {
+            return Ok(QueueDirectIngestReport::default());
+        }
+        let _ = (cap_db, telemetry);
+        Err(StorageBackendError::BackendInternal {
+            detail: "safe read-only capture-queue direct ingest is unsupported on this platform"
+                .to_string(),
+        })
+    }
+}
+
+fn validate_queue_lane_meta_against_segments(
+    meta: &LaneTailMeta,
+    segments: &BTreeSet<u32>,
+    lane: CaptureQueueLane,
+) -> StorageResult<()> {
+    meta.validate().map_err(|err| err.into_storage_error())?;
+    if meta.is_initial_empty() {
+        if segments.iter().any(|&seg_id| seg_id > 0) {
+            return Err(StorageBackendError::CorruptCommittedFrame {
+                detail: format!(
+                    "capture-queue {} lane has non-zero segments with initial empty LTM2",
+                    lane.as_str()
+                ),
+            });
+        }
+        return Ok(());
+    }
+    if segments.is_empty() {
+        return Err(StorageBackendError::CorruptCommittedFrame {
+            detail: format!(
+                "capture-queue {} lane has non-empty LTM2 with zero segment files (Case 0c)",
+                lane.as_str()
+            ),
+        });
+    }
+    let expected_sealed = (meta.active_seg - meta.min_live_seg) as usize;
+    if meta.sealed.len() != expected_sealed {
+        return Err(StorageBackendError::CorruptCommittedFrame {
+            detail: format!(
+                "capture-queue {} lane LTM2 sealed entry count mismatch",
+                lane.as_str()
+            ),
+        });
+    }
+    for (idx, sealed) in meta.sealed.iter().enumerate() {
+        let expected_id = meta.min_live_seg.saturating_add(idx as u32);
+        if sealed.seg_id != expected_id || !segments.contains(&expected_id) {
+            return Err(StorageBackendError::CorruptCommittedFrame {
+                detail: format!(
+                    "capture-queue {} lane missing sealed segment {expected_id:08x}",
+                    lane.as_str()
+                ),
+            });
+        }
+    }
+    if !segments.contains(&meta.active_seg) {
+        return Err(StorageBackendError::CorruptCommittedFrame {
+            detail: format!(
+                "capture-queue {} lane missing active segment {:08x}",
+                lane.as_str(),
+                meta.active_seg
+            ),
+        });
+    }
+    if segments
+        .iter()
+        .any(|&seg_id| seg_id > meta.active_seg.saturating_add(1))
+    {
+        return Err(StorageBackendError::CorruptCommittedFrame {
+            detail: format!(
+                "capture-queue {} lane contains unexpected segment beyond active_seg + 1",
+                lane.as_str()
+            ),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn ingest_capture_queue_lane_readonly_unix(
+    queue_fd: &std::os::unix::io::OwnedFd,
+    lane_dir_path: &Path,
+    lane: CaptureQueueLane,
+    cap_db: &RedbDatabase,
+    telemetry: &mut ExportStreamTelemetry<'_>,
+) -> StorageResult<LaneIngestOutcome> {
+    use std::{ffi::CString, os::unix::io::AsRawFd as _};
+    let lane_cstr = match lane {
+        CaptureQueueLane::Priority => c"priority",
+        CaptureQueueLane::Normal => c"normal",
+    };
+
+    let mut lane_st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: `queue_fd` is valid and `lane_cstr` is NUL-terminated.
+    if unsafe {
+        libc::fstatat(
+            queue_fd.as_raw_fd(),
+            lane_cstr.as_ptr(),
+            lane_st.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::NotFound {
+            return Ok(LaneIngestOutcome::default());
+        }
+        return Err(StorageBackendError::io(
+            "inspect capture-queue lane metadata",
+            err,
+        ));
+    }
+    // SAFETY: `fstatat` succeeded.
+    let lane_st = unsafe { lane_st.assume_init() };
+    if (lane_st.st_mode & libc::S_IFMT) != libc::S_IFDIR {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration Phase 1 rejected non-directory capture-queue {} lane",
+                lane.as_str()
+            ),
+        });
+    }
+
+    let Some((lane_fd, _)) =
+        open_readonly_subdir_unix(queue_fd, lane_cstr, 0o077, "capture-queue lane directory")?
+    else {
+        return Ok(LaneIngestOutcome::default());
+    };
+    let names = list_sorted_dir_names_unix(&lane_fd, "capture-queue lane directory")?;
+
+    let mut segments = BTreeSet::new();
+    let mut has_meta_replica = false;
+    for name in &names {
+        if name == QUEUE_TAIL_META_FILE || name == QUEUE_TAIL_META_BAK_FILE {
+            has_meta_replica = true;
+            continue;
+        }
+        if let Some(seg_id) = parse_segment_log_file_name(name.as_bytes()) {
+            let c_name = CString::new(name.as_bytes()).map_err(|_| {
+                StorageBackendError::BackendInternal {
+                    detail: "invalid capture-queue segment filename".to_string(),
+                }
+            })?;
+            let _ = open_readonly_regular_file_at_unix(
+                &lane_fd,
+                &c_name,
+                0o022,
+                None,
+                "capture-queue segment file",
+            )?;
+            segments.insert(seg_id);
+        }
+    }
+
+    // Case 0a: brand-new/empty lane with zero segments and zero LTM2 replicas.
+    if segments.is_empty() && !has_meta_replica {
+        return Ok(LaneIngestOutcome::default());
+    }
+
+    let meta = read_converged_lane_tail_meta(lane_dir_path)?;
+    validate_queue_lane_meta_against_segments(&meta, &segments, lane)?;
+
+    let mut outcome = LaneIngestOutcome::default();
+
+    if meta.is_initial_empty() {
+        // Optional Case D / pre-first-LTM2 synced frames on `seg-00000000.log`:
+        // ingest read-only without advancing DB highwater past `(0, 0)`.
+        if segments.contains(&0) {
+            let seg_name = segment_log_file_name(0);
+            let c_name = CString::new(seg_name.as_bytes()).map_err(|_| {
+                StorageBackendError::BackendInternal {
+                    detail: "invalid capture-queue segment 0 filename".to_string(),
+                }
+            })?;
+            let (file, actual_len) = open_readonly_regular_file_at_unix(
+                &lane_fd,
+                &c_name,
+                0o022,
+                None,
+                "capture-queue initial segment",
+            )?;
+            if actual_len > 0 {
+                let _ = stream_queue_segment_range(
+                    file,
+                    QueueSegmentSlice {
+                        lane,
+                        start_offset: 0,
+                        end_offset: actual_len,
+                        committed_seg_hw: None,
+                    },
+                    cap_db,
+                    telemetry,
+                    &mut outcome,
+                )?;
+            }
+        }
+        return Ok(outcome);
+    }
+
+    // Phase Q1: Authenticate and stream every sealed segment `min_live_seg..active_seg`.
+    for sealed in &meta.sealed {
+        let seg_name = segment_log_file_name(sealed.seg_id);
+        let c_name = CString::new(seg_name.as_bytes()).map_err(|_| {
+            StorageBackendError::BackendInternal {
+                detail: "invalid capture-queue sealed segment filename".to_string(),
+            }
+        })?;
+        let (mut file, actual_len) = open_readonly_regular_file_at_unix(
+            &lane_fd,
+            &c_name,
+            0o022,
+            None,
+            "capture-queue sealed segment",
+        )?;
+        if actual_len != sealed.sealed_len {
+            return Err(StorageBackendError::CorruptCommittedFrame {
+                detail: format!(
+                    "capture-queue {} sealed segment {:08x} length mismatch",
+                    lane.as_str(),
+                    sealed.seg_id
+                ),
+            });
+        }
+        let crc = compute_file_prefix_crc32c(&mut file, sealed.sealed_len)?;
+        if crc != sealed.sealed_crc32c {
+            return Err(StorageBackendError::CorruptCommittedFrame {
+                detail: format!(
+                    "capture-queue {} sealed segment {:08x} CRC32C mismatch",
+                    lane.as_str(),
+                    sealed.seg_id
+                ),
+            });
+        }
+        let end_hw = CaptureQueueHighwater {
+            segment_id: sealed.seg_id.saturating_add(1),
+            byte_offset: 0,
+        };
+        let _ = stream_queue_segment_range(
+            file,
+            QueueSegmentSlice {
+                lane,
+                start_offset: 0,
+                end_offset: sealed.sealed_len,
+                committed_seg_hw: Some((sealed.seg_id, end_hw)),
+            },
+            cap_db,
+            telemetry,
+            &mut outcome,
+        )?;
+    }
+
+    // Phase Q2: Authenticate and stream active segment committed prefix `[0, committed_len)`.
+    {
+        let active_name = segment_log_file_name(meta.active_seg);
+        let c_name = CString::new(active_name.as_bytes()).map_err(|_| {
+            StorageBackendError::BackendInternal {
+                detail: "invalid capture-queue active segment filename".to_string(),
+            }
+        })?;
+        let (mut file, actual_len) = open_readonly_regular_file_at_unix(
+            &lane_fd,
+            &c_name,
+            0o022,
+            None,
+            "capture-queue active segment",
+        )?;
+        if actual_len < meta.committed_len {
+            return Err(StorageBackendError::CorruptCommittedFrame {
+                detail: format!(
+                    "capture-queue {} active segment {:08x} shorter than LTM2 committed_len",
+                    lane.as_str(),
+                    meta.active_seg
+                ),
+            });
+        }
+        let crc = compute_file_prefix_crc32c(&mut file, meta.committed_len)?;
+        if crc != meta.prefix_crc32c {
+            return Err(StorageBackendError::CorruptCommittedFrame {
+                detail: format!(
+                    "capture-queue {} active segment {:08x} prefix CRC32C mismatch",
+                    lane.as_str(),
+                    meta.active_seg
+                ),
+            });
+        }
+        let committed_hw = CaptureQueueHighwater {
+            segment_id: meta.active_seg,
+            byte_offset: meta.committed_len,
+        };
+        let file = stream_queue_segment_range(
+            file,
+            QueueSegmentSlice {
+                lane,
+                start_offset: 0,
+                end_offset: meta.committed_len,
+                committed_seg_hw: Some((meta.active_seg, committed_hw)),
+            },
+            cap_db,
+            telemetry,
+            &mut outcome,
+        )?;
+
+        // Phase Q3a: Read-only scan of uncommitted synced tail `[committed_len, actual_len)`
+        // without advancing DB highwater past on-disk `LTM2`.
+        if actual_len > meta.committed_len {
+            let _ = stream_queue_segment_range(
+                file,
+                QueueSegmentSlice {
+                    lane,
+                    start_offset: meta.committed_len,
+                    end_offset: actual_len,
+                    committed_seg_hw: None,
+                },
+                cap_db,
+                telemetry,
+                &mut outcome,
+            )?;
+        }
+    }
+
+    // Phase Q3b: Optional Case D orphan successor `active_seg + 1` (read-only, no HW advance).
+    let orphan_seg = meta.active_seg.saturating_add(1);
+    if segments.contains(&orphan_seg) {
+        let orphan_name = segment_log_file_name(orphan_seg);
+        let c_name = CString::new(orphan_name.as_bytes()).map_err(|_| {
+            StorageBackendError::BackendInternal {
+                detail: "invalid capture-queue orphan segment filename".to_string(),
+            }
+        })?;
+        let (file, actual_len) = open_readonly_regular_file_at_unix(
+            &lane_fd,
+            &c_name,
+            0o022,
+            None,
+            "capture-queue orphan successor segment",
+        )?;
+        if actual_len > 0 {
+            let _ = stream_queue_segment_range(
+                file,
+                QueueSegmentSlice {
+                    lane,
+                    start_offset: 0,
+                    end_offset: actual_len,
+                    committed_seg_hw: None,
+                },
+                cap_db,
+                telemetry,
+                &mut outcome,
+            )?;
+        }
+    }
+
+    Ok(outcome)
+}
+
+#[cfg(unix)]
+fn ingest_capture_queue_readonly_unix(
+    common_storage: &Path,
+    cap_db: &RedbDatabase,
+    telemetry: &mut ExportStreamTelemetry<'_>,
+) -> StorageResult<QueueDirectIngestReport> {
+    let root_fd = open_readonly_root_dir_unix(common_storage)?;
+    let Some((private_fd, _)) =
+        open_readonly_subdir_unix(&root_fd, c"private", 0o022, "private directory")?
+    else {
+        return Ok(QueueDirectIngestReport::default());
+    };
+    let Some((queue_fd, _)) = open_readonly_subdir_unix(
+        &private_fd,
+        c"capture-queue",
+        0o022,
+        "capture-queue directory",
+    )?
+    else {
+        return Ok(QueueDirectIngestReport::default());
+    };
+
+    let queue_root = capture_queue_dir_path(common_storage);
+    // Strict priority-first ordering (`ADR-RB-05`): `priority/` BEFORE `normal/`.
+    let priority = ingest_capture_queue_lane_readonly_unix(
+        &queue_fd,
+        &queue_root.join(QUEUE_LANE_PRIORITY_DIR),
+        CaptureQueueLane::Priority,
+        cap_db,
+        telemetry,
+    )?;
+    let normal = ingest_capture_queue_lane_readonly_unix(
+        &queue_fd,
+        &queue_root.join(QUEUE_LANE_NORMAL_DIR),
+        CaptureQueueLane::Normal,
+        cap_db,
+        telemetry,
+    )?;
+
+    Ok(QueueDirectIngestReport {
+        priority_frames_read: priority.frames_read,
+        normal_frames_read: normal.frames_read,
+        applied_frames: priority
+            .applied_frames
+            .saturating_add(normal.applied_frames),
+        deduplicated_frames: priority
+            .deduplicated_frames
+            .saturating_add(normal.deduplicated_frames),
+        priority_highwater: priority.highwater,
+        normal_highwater: normal.highwater,
+        batches_committed: priority
+            .batches_committed
+            .saturating_add(normal.batches_committed),
+    })
+}
+
+#[cfg(windows)]
+fn ingest_capture_queue_lane_readonly_windows(
+    lane_dir: &Path,
+    parent_pinned: &[(&Path, win_tmp_guard::WinFileId, &'static str)],
+    lane: CaptureQueueLane,
+    cap_db: &RedbDatabase,
+    telemetry: &mut ExportStreamTelemetry<'_>,
+) -> StorageResult<LaneIngestOutcome> {
+    let Some((_lane_pin, lane_id)) = win_tmp_guard::open_pinned_non_reparse_dir_optional(
+        lane_dir,
+        "capture-queue lane directory",
+    )?
+    else {
+        return Ok(LaneIngestOutcome::default());
+    };
+    let mut lane_pinned = parent_pinned.to_vec();
+    lane_pinned.push((lane_dir, lane_id, "capture-queue lane directory"));
+    let mut segments = BTreeSet::new();
+    let mut has_meta_replica = false;
+    for entry in fs::read_dir(lane_dir)
+        .map_err(|err| StorageBackendError::io("list capture-queue lane", err))?
+    {
+        let entry =
+            entry.map_err(|err| StorageBackendError::io("read capture-queue lane entry", err))?;
+        let name =
+            entry
+                .file_name()
+                .into_string()
+                .map_err(|_| StorageBackendError::BackendInternal {
+                    detail: "non-UTF-8 entry in capture-queue lane".to_string(),
+                })?;
+        if name == QUEUE_TAIL_META_FILE || name == QUEUE_TAIL_META_BAK_FILE {
+            has_meta_replica = true;
+            continue;
+        }
+        if let Some(seg_id) = parse_segment_log_file_name(name.as_bytes()) {
+            let seg_path = lane_dir.join(&name);
+            let _ = open_readonly_non_reparse_file_windows(
+                &seg_path,
+                false,
+                &lane_pinned,
+                "capture-queue segment file",
+            )?;
+            segments.insert(seg_id);
+        }
+    }
+    if segments.is_empty() && !has_meta_replica {
+        return Ok(LaneIngestOutcome::default());
+    }
+    win_tmp_guard::verify_pinned_dir_ids(&lane_pinned)?;
+    let meta = read_converged_lane_tail_meta(lane_dir)?;
+    validate_queue_lane_meta_against_segments(&meta, &segments, lane)?;
+
+    let mut outcome = LaneIngestOutcome::default();
+    if meta.is_initial_empty() {
+        if segments.contains(&0) {
+            let seg_path = lane_dir.join(segment_log_file_name(0));
+            let (file, actual_len) = open_readonly_non_reparse_file_windows(
+                &seg_path,
+                false,
+                &lane_pinned,
+                "capture-queue initial segment",
+            )?;
+            if actual_len > 0 {
+                let _ = stream_queue_segment_range(
+                    file,
+                    QueueSegmentSlice {
+                        lane,
+                        start_offset: 0,
+                        end_offset: actual_len,
+                        committed_seg_hw: None,
+                    },
+                    cap_db,
+                    telemetry,
+                    &mut outcome,
+                )?;
+            }
+        }
+        return Ok(outcome);
+    }
+
+    for sealed in &meta.sealed {
+        let seg_path = lane_dir.join(segment_log_file_name(sealed.seg_id));
+        let (mut file, actual_len) = open_readonly_non_reparse_file_windows(
+            &seg_path,
+            false,
+            &lane_pinned,
+            "capture-queue sealed segment",
+        )?;
+        if actual_len != sealed.sealed_len {
+            return Err(StorageBackendError::CorruptCommittedFrame {
+                detail: format!(
+                    "capture-queue {} sealed segment {:08x} length mismatch",
+                    lane.as_str(),
+                    sealed.seg_id
+                ),
+            });
+        }
+        let crc = compute_file_prefix_crc32c(&mut file, sealed.sealed_len)?;
+        if crc != sealed.sealed_crc32c {
+            return Err(StorageBackendError::CorruptCommittedFrame {
+                detail: format!(
+                    "capture-queue {} sealed segment {:08x} CRC32C mismatch",
+                    lane.as_str(),
+                    sealed.seg_id
+                ),
+            });
+        }
+        let end_hw = CaptureQueueHighwater {
+            segment_id: sealed.seg_id.saturating_add(1),
+            byte_offset: 0,
+        };
+        let _ = stream_queue_segment_range(
+            file,
+            QueueSegmentSlice {
+                lane,
+                start_offset: 0,
+                end_offset: sealed.sealed_len,
+                committed_seg_hw: Some((sealed.seg_id, end_hw)),
+            },
+            cap_db,
+            telemetry,
+            &mut outcome,
+        )?;
+    }
+
+    {
+        let active_path = lane_dir.join(segment_log_file_name(meta.active_seg));
+        let (mut file, actual_len) = open_readonly_non_reparse_file_windows(
+            &active_path,
+            false,
+            &lane_pinned,
+            "capture-queue active segment",
+        )?;
+        if actual_len < meta.committed_len {
+            return Err(StorageBackendError::CorruptCommittedFrame {
+                detail: format!(
+                    "capture-queue {} active segment {:08x} shorter than LTM2 committed_len",
+                    lane.as_str(),
+                    meta.active_seg
+                ),
+            });
+        }
+        let crc = compute_file_prefix_crc32c(&mut file, meta.committed_len)?;
+        if crc != meta.prefix_crc32c {
+            return Err(StorageBackendError::CorruptCommittedFrame {
+                detail: format!(
+                    "capture-queue {} active segment {:08x} prefix CRC32C mismatch",
+                    lane.as_str(),
+                    meta.active_seg
+                ),
+            });
+        }
+        let committed_hw = CaptureQueueHighwater {
+            segment_id: meta.active_seg,
+            byte_offset: meta.committed_len,
+        };
+        let file = stream_queue_segment_range(
+            file,
+            QueueSegmentSlice {
+                lane,
+                start_offset: 0,
+                end_offset: meta.committed_len,
+                committed_seg_hw: Some((meta.active_seg, committed_hw)),
+            },
+            cap_db,
+            telemetry,
+            &mut outcome,
+        )?;
+        if actual_len > meta.committed_len {
+            let _ = stream_queue_segment_range(
+                file,
+                QueueSegmentSlice {
+                    lane,
+                    start_offset: meta.committed_len,
+                    end_offset: actual_len,
+                    committed_seg_hw: None,
+                },
+                cap_db,
+                telemetry,
+                &mut outcome,
+            )?;
+        }
+    }
+
+    let orphan_seg = meta.active_seg.saturating_add(1);
+    if segments.contains(&orphan_seg) {
+        let orphan_path = lane_dir.join(segment_log_file_name(orphan_seg));
+        let (file, actual_len) = open_readonly_non_reparse_file_windows(
+            &orphan_path,
+            false,
+            &lane_pinned,
+            "capture-queue orphan successor segment",
+        )?;
+        if actual_len > 0 {
+            let _ = stream_queue_segment_range(
+                file,
+                QueueSegmentSlice {
+                    lane,
+                    start_offset: 0,
+                    end_offset: actual_len,
+                    committed_seg_hw: None,
+                },
+                cap_db,
+                telemetry,
+                &mut outcome,
+            )?;
+        }
+    }
+    Ok(outcome)
+}
+
+#[cfg(windows)]
+fn ingest_capture_queue_readonly_windows(
+    common_storage: &Path,
+    cap_db: &RedbDatabase,
+    telemetry: &mut ExportStreamTelemetry<'_>,
+) -> StorageResult<QueueDirectIngestReport> {
+    let (_root_pin, root_id) =
+        win_tmp_guard::open_pinned_non_reparse_dir(common_storage, "repository storage root")?;
+    let private_dir = common_storage.join(PRIVATE_SUBDIR);
+    let Some((_private_pin, private_id)) =
+        win_tmp_guard::open_pinned_non_reparse_dir_optional(&private_dir, "private directory")?
+    else {
+        return Ok(QueueDirectIngestReport::default());
+    };
+    let queue_root = private_dir.join(CAPTURE_QUEUE_SUBDIR);
+    let Some((_queue_pin, queue_id)) = win_tmp_guard::open_pinned_non_reparse_dir_optional(
+        &queue_root,
+        "capture-queue directory",
+    )?
+    else {
+        return Ok(QueueDirectIngestReport::default());
+    };
+    let queue_pinned = [
+        (common_storage, root_id, "repository storage root"),
+        (private_dir.as_path(), private_id, "private directory"),
+        (queue_root.as_path(), queue_id, "capture-queue directory"),
+    ];
+    let priority = ingest_capture_queue_lane_readonly_windows(
+        &queue_root.join(QUEUE_LANE_PRIORITY_DIR),
+        &queue_pinned,
+        CaptureQueueLane::Priority,
+        cap_db,
+        telemetry,
+    )?;
+    let normal = ingest_capture_queue_lane_readonly_windows(
+        &queue_root.join(QUEUE_LANE_NORMAL_DIR),
+        &queue_pinned,
+        CaptureQueueLane::Normal,
+        cap_db,
+        telemetry,
+    )?;
+    Ok(QueueDirectIngestReport {
+        priority_frames_read: priority.frames_read,
+        normal_frames_read: normal.frames_read,
+        applied_frames: priority
+            .applied_frames
+            .saturating_add(normal.applied_frames),
+        deduplicated_frames: priority
+            .deduplicated_frames
+            .saturating_add(normal.deduplicated_frames),
+        priority_highwater: priority.highwater,
+        normal_highwater: normal.highwater,
+        batches_committed: priority
+            .batches_committed
+            .saturating_add(normal.batches_committed),
+    })
+}
+
 /// Owns a staged `.tmp` redb handle alongside its cleanup guard with strict
 /// drop-order guarantee: `db` is declared BEFORE `guard` so Rust unconditionally
 /// closes the underlying file handle BEFORE `guard`'s `Drop` attempts cleanup
@@ -12736,6 +17641,13 @@ impl StagedRedbTmp {
             })
     }
 
+    /// Release the open `RedbDatabase` handle (freeing its page cache and write
+    /// buffers) while keeping `guard` armed so any subsequent Phase 1 failure
+    /// still unlinks the exact staged `.tmp` inode.
+    fn close_db(&mut self) {
+        drop(self.db.take());
+    }
+
     fn close_and_verify_disarm(mut self, returned_path: &Path) -> StorageResult<()> {
         drop(self.db.take());
         self.guard.verify_still_bound(returned_path)?;
@@ -12745,29 +17657,56 @@ impl StagedRedbTmp {
 }
 
 /// Forward migration Phase 1 streaming export from the quiesced single-connection
-/// `c_mig` SQLite source(s) to staged `.libra/redb/git.gen-<id>.redb.tmp` and
-/// `.libra/private/capture.gen-<id>.redb.tmp` (`ADR-RB-07` #1, `RB-10a`).
+/// `c_mig` SQLite source(s), plus read-only direct ingestion of pending
+/// `capture-spool/ready/` envelopes and `capture-queue/` frames, into staged
+/// `.libra/redb/git.gen-<id>.redb.tmp` and `.libra/private/capture.gen-<id>.redb.tmp`
+/// (`ADR-RB-07` #1, `RB-10a`, `RB-10i`).
 ///
 /// Guarantees:
-/// - **Zero extra live `.db` file descriptors:** all reads execute strictly over
-///   the already quiesced `guard.sqlite.git` (and optional `guard.sqlite.capture`)
-///   `c_mig` connections, preserving SQLite's OS `EXCLUSIVE` locks continuously.
+/// - **Zero extra live `.db` file descriptors:** all SQLite reads execute
+///   strictly over the already quiesced `guard.sqlite.git` (and optional
+///   `guard.sqlite.capture`) `c_mig` connections, preserving SQLite's OS
+///   `EXCLUSIVE` locks continuously.
 /// - **Read-only 3-layout detection & fail-closed Layout B guard:** classifies
 ///   Layout A (unsplit `libra.db` 61+23), Layout B (dual DBs with inline tables
 ///   verified against `capture_catalog_copy_receipt` + 100% PK coverage), and
 ///   Layout C (detached `libra.db` 61 + `capture.db` 25) BEFORE creating any
 ///   `.tmp` file or staging directory.
-/// - **Bounded streaming batches (`<= 500` rows/commit):** never loads full
-///   tables into memory and keeps every secondary index and monotonic sequence
-///   counter wire-compatible with `RedbConfigStore`, `RedbGitStore`,
-///   `RedbGitStateStore`, and `RedbCaptureStore`.
+/// - **Strictly read-only spool & queue direct ingest:** consumes pending
+///   `capture-spool/ready/` envelopes (`0-*` before `1-*`, monotonic session
+///   merge) and `capture-queue/` frames (`priority/` before `normal/`, full
+///   LTM2 CRC32C verification, bounded highwater) with ZERO source mutations.
+/// - **Bounded streaming batches (`<= 500` rows/commit) & `<= 64 MiB` extra heap
+///   budget:** never loads full tables, spools, or queue segments into memory
+///   and configures each staged redb DB with a `4 MiB` cache (`8 MiB` total).
 /// - **Atomic `.tmp` cleanup on failure:** drops redb handles and unlinks only
-///   the exact created `.tmp` inodes if any step fails, leaving source SQLite
-///   files untouched.
+///   the exact created `.tmp` inodes if any step fails, leaving source SQLite,
+///   spool, and queue files untouched.
 pub async fn export_forward_phase1_to_redb_tmp(
     guard: &mut ForwardPhase1QuiesceGuard,
     common_storage: &Path,
     generation: u64,
+) -> StorageResult<ForwardPhase1ExportReport> {
+    let mut telemetry = ExportStreamTelemetry::new();
+    export_forward_phase1_to_redb_tmp_inner(guard, common_storage, generation, &mut telemetry).await
+}
+
+#[cfg(test)]
+async fn export_forward_phase1_to_redb_tmp_with_observer(
+    guard: &mut ForwardPhase1QuiesceGuard,
+    common_storage: &Path,
+    generation: u64,
+    observer: &mut dyn FnMut(&'static str, usize),
+) -> StorageResult<ForwardPhase1ExportReport> {
+    let mut telemetry = ExportStreamTelemetry::with_observer(observer);
+    export_forward_phase1_to_redb_tmp_inner(guard, common_storage, generation, &mut telemetry).await
+}
+
+async fn export_forward_phase1_to_redb_tmp_inner(
+    guard: &mut ForwardPhase1QuiesceGuard,
+    common_storage: &Path,
+    generation: u64,
+    telemetry: &mut ExportStreamTelemetry<'_>,
 ) -> StorageResult<ForwardPhase1ExportReport> {
     if generation == 0 {
         return Err(StorageBackendError::BackendInternal {
@@ -12822,9 +17761,11 @@ pub async fn export_forward_phase1_to_redb_tmp(
             detail: "failed to format staged capture redb filename".to_string(),
         })?;
 
-    // Step 2: Create both staged `.tmp` redb files wrapped in `StagedRedbTmp`
-    // owners that guarantee `db` drops BEFORE `guard` on EVERY exit path
-    // (second-file creation `?`, export error, panic, or async cancellation).
+    // Step 2: Create staged Git `.tmp` redb file wrapped in `StagedRedbTmp`
+    // (guaranteeing `db` drops BEFORE `guard` on every exit path). We stream
+    // Git tables first and release `git_staged`'s `RedbDatabase` handle
+    // (keeping its cleanup guard armed!) BEFORE opening Capture `.tmp` so peak
+    // redb page cache and COW write buffers never overlap across both stores.
     let (git_db, git_tmp_guard) = create_redb_tmp_database(
         common_storage,
         REDB_SUBDIR,
@@ -12834,7 +17775,34 @@ pub async fn export_forward_phase1_to_redb_tmp(
         false,
         DatabaseRole::Repository,
     )?;
-    let git_staged = StagedRedbTmp::new(git_db, git_tmp_guard);
+    let mut git_staged = StagedRedbTmp::new(git_db, git_tmp_guard);
+
+    let mut git_table_counts = BTreeMap::new();
+    {
+        let git_db_ref = git_staged.db()?;
+        initialize_git_export_redb_schema(git_db_ref)?;
+        // Step 3: Stream-export all 61 active repository tables from `libra.db`.
+        export_repository_tables_to_redb(
+            &mut guard.sqlite.git.conn,
+            git_db_ref,
+            &mut git_table_counts,
+            telemetry,
+        )
+        .await?;
+    }
+    if git_table_counts.len() != REPOSITORY_ACTIVE_SOURCE_TABLES_COUNT {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration Phase 1 exported {} repository tables, expected {REPOSITORY_ACTIVE_SOURCE_TABLES_COUNT}",
+                git_table_counts.len()
+            ),
+        });
+    }
+    // Release Git redb page cache and trim SQLite pager cache while keeping
+    // `git_staged.guard` armed for atomic cleanup on any Capture error.
+    git_staged.close_db();
+    let _ = guard.sqlite.git.conn.execute("PRAGMA shrink_memory;").await;
+
     let (cap_db, cap_tmp_guard) = create_redb_tmp_database(
         common_storage,
         PRIVATE_SUBDIR,
@@ -12847,28 +17815,15 @@ pub async fn export_forward_phase1_to_redb_tmp(
     let cap_staged = StagedRedbTmp::new(cap_db, cap_tmp_guard);
 
     let export_result = async {
-        let git_db_ref = git_staged.db()?;
         let cap_db_ref = cap_staged.db()?;
-        initialize_git_export_redb_schema(git_db_ref)?;
         let seeded_cap_sv = initialize_capture_export_redb_schema(
             cap_db_ref,
             layout == LegacyRepositoryLayout::LayoutA,
         )?;
 
-        let mut git_table_counts = BTreeMap::new();
         let mut capture_table_counts = BTreeMap::new();
-        let mut max_batch_rows = 0usize;
 
-        // Export all 61 active repository tables from `libra.db`.
-        export_repository_tables_to_redb(
-            &mut guard.sqlite.git.conn,
-            git_db_ref,
-            &mut git_table_counts,
-            &mut max_batch_rows,
-        )
-        .await?;
-
-        // Export capture tables according to verified layout:
+        // Step 4: Stream-export capture tables according to verified layout:
         // - Layout A: 23 inline `agent_*` tables from `libra.db` (+ seeded capture schema receipt).
         // - Layouts B & C: all 25 tables from authoritative `private/capture.db`.
         match layout {
@@ -12884,7 +17839,7 @@ pub async fn export_forward_phase1_to_redb_tmp(
                     },
                     cap_db_ref,
                     &mut capture_table_counts,
-                    &mut max_batch_rows,
+                    telemetry,
                 )
                 .await?;
             }
@@ -12928,20 +17883,13 @@ pub async fn export_forward_phase1_to_redb_tmp(
                     },
                     cap_db_ref,
                     &mut capture_table_counts,
-                    &mut max_batch_rows,
+                    telemetry,
                 )
                 .await?;
+                let _ = cap_conn.conn.execute("PRAGMA shrink_memory;").await;
             }
         }
 
-        if git_table_counts.len() != REPOSITORY_ACTIVE_SOURCE_TABLES_COUNT {
-            return Err(StorageBackendError::BackendInternal {
-                detail: format!(
-                    "forward migration Phase 1 exported {} repository tables, expected {REPOSITORY_ACTIVE_SOURCE_TABLES_COUNT}",
-                    git_table_counts.len()
-                ),
-            });
-        }
         if capture_table_counts.len() != CAPTURE_SOURCE_TABLES_COUNT {
             return Err(StorageBackendError::BackendInternal {
                 detail: format!(
@@ -12951,6 +17899,17 @@ pub async fn export_forward_phase1_to_redb_tmp(
             });
         }
 
+        // Step 5 (RB-10i AC1): Strictly read-only direct ingest of pending
+        // `capture-spool/ready/` envelopes into `capture.gen-<id>.redb.tmp`.
+        let spool_ingest =
+            ingest_capture_spool_ready_readonly(common_storage, cap_db_ref, telemetry)?;
+
+        // Step 6 (RB-10i AC2): Strictly read-only direct ingest of pending
+        // `capture-queue/` frames (`priority/` then `normal/`) into
+        // `capture.gen-<id>.redb.tmp`.
+        let queue_ingest =
+            ingest_capture_queue_readonly(common_storage, cap_db_ref, telemetry)?;
+
         Ok(ForwardPhase1ExportReport {
             layout,
             generation,
@@ -12958,7 +17917,10 @@ pub async fn export_forward_phase1_to_redb_tmp(
             capture_tmp_path,
             git_table_counts,
             capture_table_counts,
-            max_batch_rows,
+            max_batch_rows: telemetry.max_batch_rows,
+            total_streaming_batches: telemetry.total_batches,
+            spool_ingest,
+            queue_ingest,
         })
     }
     .await;
@@ -19255,5 +24217,2682 @@ mod tests {
             )
             .await;
         }
+    }
+
+    async fn detach_inline_capture_tables(git_db: &Path) {
+        let mut conn = SqliteConnection::connect_with(
+            &SqliteConnectOptions::new()
+                .filename(git_db)
+                .create_if_missing(false),
+        )
+        .await
+        .expect("open git_db to detach inline capture tables");
+        conn.execute("PRAGMA foreign_keys = OFF;")
+            .await
+            .expect("disable fk");
+        for tbl in LEGACY_INLINE_CAPTURE_TABLES {
+            conn.execute(AssertSqlSafe(format!("DROP TABLE IF EXISTS \"{tbl}\"")))
+                .await
+                .expect("drop inline capture table");
+        }
+        conn.close().await.expect("close detach conn");
+    }
+
+    fn snapshot_dir_files_recursive(
+        base: &Path,
+        current: &Path,
+        out: &mut BTreeMap<PathBuf, Vec<u8>>,
+    ) {
+        let Ok(rd) = fs::read_dir(current) else {
+            return;
+        };
+        for entry in rd {
+            let entry = entry.expect("read snapshot dir entry");
+            let p = entry.path();
+            let rel = p
+                .strip_prefix(base)
+                .expect("strip snapshot prefix")
+                .to_path_buf();
+            let meta = fs::symlink_metadata(&p).expect("stat snapshot entry");
+            if meta.file_type().is_dir() {
+                snapshot_dir_files_recursive(base, &p, out);
+            } else if meta.file_type().is_file() {
+                out.insert(rel, fs::read(&p).expect("read snapshot file"));
+            }
+        }
+    }
+
+    fn snapshot_tree_bytes(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        let mut out = BTreeMap::new();
+        if root.exists() {
+            snapshot_dir_files_recursive(root, root, &mut out);
+        }
+        out
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_spool_envelope_bytes_ex(
+        agent_kind: &str,
+        hook_name: &str,
+        hook_command: &str,
+        event_id: &str,
+        dedup_key: Option<&str>,
+        provider_session_id: &str,
+        working_dir: &str,
+        storage_path: &Path,
+        event_kind: &str,
+        timestamp_rfc3339: &str,
+        bytes_scanned: usize,
+        child_hints: serde_json::Value,
+        extra_padding: &str,
+    ) -> Vec<u8> {
+        let provider_source = match hook_name {
+            "claude" => "claude_code_hook",
+            "codex" => "codex_hook",
+            "grok" => "grok_hook",
+            "opencode" => "opencode_hook",
+            "hermes" => "hermes_hook",
+            "pi" => "pi_hook",
+            _ => "unknown_hook",
+        };
+        let body = serde_json::json!({
+            "version": 1,
+            "agent_kind": agent_kind,
+            "hook_name": hook_name,
+            "hook_command": hook_command,
+            "provider_kind": hook_name,
+            "provider_source": provider_source,
+            "frame_bytes": 128 + extra_padding.len(),
+            "event_id": event_id,
+            "identity_scheme": "generic_lifecycle_uuid_v5",
+            "dedup_key": dedup_key,
+            "hook_deadline": false,
+            "display_batch_limit": null,
+            "tool_link": null,
+            "child_hints": child_hints,
+            "context": {
+                "provider_session_id": provider_session_id,
+                "working_dir": working_dir,
+                "storage_path": storage_path.display().to_string(),
+                "worktree_root": working_dir,
+            },
+            "event": {
+                "kind": event_kind,
+                "session_id": provider_session_id,
+                "session_ref": null,
+                "prompt": extra_padding,
+                "model": null,
+                "source": null,
+                "tool_name": null,
+                "tool_input": null,
+                "tool_response": null,
+                "assistant_message": null,
+                "timestamp": timestamp_rfc3339,
+            },
+            "redaction": {
+                "matches": [],
+                "bytes_scanned": bytes_scanned,
+                "bytes_redacted": 0,
+            },
+        });
+        serde_json::to_vec(&body).expect("serialize spool envelope JSON")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_spool_envelope_bytes(
+        agent_kind: &str,
+        hook_name: &str,
+        event_id: &str,
+        dedup_key: Option<&str>,
+        provider_session_id: &str,
+        working_dir: &str,
+        storage_path: &Path,
+        event_kind: &str,
+        timestamp_rfc3339: &str,
+        extra_padding: &str,
+    ) -> Vec<u8> {
+        build_spool_envelope_bytes_ex(
+            agent_kind,
+            hook_name,
+            "observe",
+            event_id,
+            dedup_key,
+            provider_session_id,
+            working_dir,
+            storage_path,
+            event_kind,
+            timestamp_rfc3339,
+            128,
+            serde_json::json!({ "kind": "absent" }),
+            extra_padding,
+        )
+    }
+
+    /// `RB-10i` AC1 & AC2:
+    /// - AC1: Forward Phase 1 strictly read-only ingests all pending events in
+    ///   `capture-spool/ready/` (`0-*` terminal before `1-*` non-terminal with
+    ///   monotonic session convergence, merge into existing SQLite sessions,
+    ///   dedup via `capture_dedup_keys`, and fenced `0400` tombstone handling)
+    ///   with ZERO mutations to source spool files.
+    /// - AC2: Forward Phase 1 strictly read-only ingests all pending frames in
+    ///   `capture-queue/` (`priority/` before `normal/`, rotated sealed +
+    ///   active segments, all 6 `CaptureBatchPayload` variants, identical
+    ///   append-only audit replay idempotency, synced tail preservation capped
+    ///   at LTM2 highwater, and fail-closed committed corruption rejection)
+    ///   with ZERO mutations to source queue files.
+    #[tokio::test]
+    async fn forward_phase1_readonly_spool_and_queue_direct_ingest() {
+        use crate::storage::{
+            CAPTURE_APPEND_ONLY_ERROR_PREFIX, CAPTURE_SPOOL_TOMBSTONE_SENTINEL, CaptureStore,
+            FRAME_FLAG_NONE, FRAME_FLAG_PRIORITY, SealedSegmentMeta, SqliteCaptureStore,
+            WORKSPACE_SCOPE_AUDIT_ACTION, append_postcard_frame, crc32c_checksum,
+            encode_postcard_frame, init_capture_queue, manifest::INITIAL_STORAGE_GENERATION,
+            tail_meta_bak_path, tail_meta_path,
+        };
+
+        // ------------------------------------------------------------------
+        // Part 1: Full Layout C repo with pending `capture-spool/ready/` and
+        // rotated `capture-queue/{priority,normal}/` + synced tail + garbage
+        // ------------------------------------------------------------------
+        {
+            let dir = tempdir().expect("create RB-10i part 1 tempdir");
+            let storage = dir.path().join(".libra");
+            let git_db = git_sqlite_db_path(&storage);
+            let cap_db = capture_sqlite_db_path(&storage);
+
+            populate_all_61_repository_tables(&git_db).await;
+            detach_inline_capture_tables(&git_db).await;
+            {
+                let _cap_store = SqliteCaptureStore::create(&cap_db)
+                    .await
+                    .expect("create Layout C capture.db");
+            }
+            populate_capture_rows_via_sql(&cap_db, 0, None).await;
+            switch_fixture_db_to_delete_mode(&git_db).await;
+            switch_fixture_db_to_delete_mode(&cap_db).await;
+
+            // Seed `capture-spool/ready/` with 5 envelopes exercising:
+            // - `0-*` session_end sorting BEFORE `1-*` session_start
+            // - duplicate `dedup_key` deduplication
+            // - merging into existing SQLite-exported Scoped session `("codex", "prov-sess-1")`
+            // - new active session
+            let spool_ready = capture_spool_dir_path(&storage).join(CAPTURE_SPOOL_READY_SUBDIR);
+            fs::create_dir_all(&spool_ready).expect("create capture-spool/ready");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                fs::set_permissions(
+                    storage.join(PRIVATE_SUBDIR),
+                    fs::Permissions::from_mode(0o700),
+                )
+                .expect("chmod private 0700");
+                fs::set_permissions(
+                    capture_spool_dir_path(&storage),
+                    fs::Permissions::from_mode(0o700),
+                )
+                .expect("chmod capture-spool 0700");
+                fs::set_permissions(&spool_ready, fs::Permissions::from_mode(0o700))
+                    .expect("chmod capture-spool/ready 0700");
+            }
+
+            let ts_start = "2026-11-22T01:00:00.125Z";
+            let ts_end = "2026-11-22T01:05:00.875Z";
+            let ts_existing = "2026-11-24T02:00:00.500Z";
+            let ts_active = "2026-11-22T01:10:00.250Z";
+            let expected_ts_start = chrono::DateTime::parse_from_rfc3339(ts_start)
+                .expect("parse ts_start")
+                .timestamp();
+            let expected_ts_end = chrono::DateTime::parse_from_rfc3339(ts_end)
+                .expect("parse ts_end")
+                .timestamp();
+            let expected_ts_existing = chrono::DateTime::parse_from_rfc3339(ts_existing)
+                .expect("parse ts_existing")
+                .timestamp();
+            let expected_ts_active = chrono::DateTime::parse_from_rfc3339(ts_active)
+                .expect("parse ts_active")
+                .timestamp();
+
+            // Build a 96-level nested JSON payload (`64 < 96 <= 128`, matching
+            // `serde_json::from_slice` nesting support in `live_pipeline.rs`)
+            // inside `tool_input` to verify deep structured replay payloads.
+            let mut deep_tool_nested = serde_json::json!("deep-leaf-96");
+            for _ in 0..96usize {
+                deep_tool_nested = serde_json::json!({ "n": deep_tool_nested });
+            }
+
+            // Rich terminal spool envelope preserving prompt fallback, model,
+            // source, tool fields (including 96-level nesting & escaped `\u0000`),
+            // assistant message, session_ref, tool_link, subagent child_hints,
+            // per-event redaction matches, and subsecond timestamp.
+            let rich_end_envelope = serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "agent_kind": "claude_code",
+                "hook_name": "claude",
+                "hook_command": "session-end",
+                "provider_kind": "claude",
+                "provider_source": "claude_code_hook",
+                "frame_bytes": 4096,
+                "event_id": "11111111-1111-4111-8111-111111111101",
+                "identity_scheme": "generic_lifecycle_uuid_v5",
+                "dedup_key": "dedup:spool:new:end",
+                "hook_deadline": true,
+                "display_batch_limit": 25,
+                "tool_link": {
+                    "tool": "claude-code",
+                    "parent": "parent-tool-1",
+                },
+                "child_hints": {
+                    "kind": "candidate",
+                    "role": "boundary",
+                    "current_or_parent_path": "/provider/parent.jsonl",
+                    "child_path": "/provider/child-1.jsonl",
+                    "child_id": "sub-child-1",
+                    "turn_id": "turn-boundary-1",
+                },
+                "context": {
+                    "provider_session_id": "prov-spool-new-1",
+                    "working_dir": "/work/spool-new",
+                    "storage_path": storage.display().to_string(),
+                    "worktree_root": "/work/spool-new",
+                },
+                "event": {
+                    "kind": "session_end",
+                    "session_id": "prov-spool-new-1",
+                    "session_ref": "transcript://claude/session-1",
+                    "prompt": "Fix redb\0migration spool replay with [REDACTED] token",
+                    "model": { "provider": "anthropic", "name": "claude-opus-4" },
+                    "source": { "channel": "hook", "version": 2 },
+                    "tool_name": "bash",
+                    "tool_input": {
+                        "command": "cargo\0test",
+                        "timeout_ms": 30000,
+                        "deep": deep_tool_nested.clone(),
+                    },
+                    "tool_response": { "exit_code": 0, "ok": true, "out": "pass\0ok" },
+                    "assistant_message": "Completed\0migration verification cleanly.",
+                    "timestamp": ts_end,
+                },
+                "redaction": {
+                    "matches": [
+                        { "rule_id": "secret-token", "start": 37, "end": 47 }
+                    ],
+                    "bytes_scanned": 999,
+                    "bytes_redacted": 10,
+                },
+            }))
+            .expect("encode rich terminal spool envelope");
+            // Confirm standard `serde_json::from_slice` (production spool decoder)
+            // accepts the exact same 96-level nested envelope.
+            let _: serde_json::Value =
+                serde_json::from_slice(&rich_end_envelope).expect("serde_json accepts 96-deep");
+
+            let many_redaction_matches: Vec<serde_json::Value> = (0..300usize)
+                .map(|idx| {
+                    serde_json::json!({
+                        "rule_id": format!("rule-{idx:03}"),
+                        "start": idx * 10,
+                        "end": idx * 10 + 5,
+                    })
+                })
+                .collect();
+            let redaction_overflow_envelope = serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "agent_kind": "codex",
+                "hook_name": "codex",
+                "hook_command": "stop",
+                "provider_kind": "codex",
+                "provider_source": "codex_hook",
+                "frame_bytes": 16384,
+                "event_id": "11111111-1111-4111-8111-111111111106",
+                "identity_scheme": "generic_lifecycle_uuid_v5",
+                "dedup_key": "dedup:spool:redaction:300",
+                "hook_deadline": false,
+                "display_batch_limit": null,
+                "tool_link": null,
+                "child_hints": { "kind": "absent" },
+                "context": {
+                    "provider_session_id": "prov-spool-redaction-300",
+                    "working_dir": "/work/redaction",
+                    "storage_path": storage.display().to_string(),
+                    "worktree_root": "/work/redaction",
+                },
+                "event": {
+                    "kind": "turn_end",
+                    "session_id": "prov-spool-redaction-300",
+                    "session_ref": null,
+                    "prompt": "Prompt with 300 redaction matches",
+                    "model": null,
+                    "source": null,
+                    "tool_name": null,
+                    "tool_input": null,
+                    "tool_response": null,
+                    "assistant_message": "Assistant reply with 300 redaction matches",
+                    "timestamp": "2026-11-22T01:15:00.750Z",
+                },
+                "redaction": {
+                    "matches": many_redaction_matches,
+                    "bytes_scanned": 50000,
+                    "bytes_redacted": 1500,
+                },
+            }))
+            .expect("encode 300-match redaction overflow spool envelope");
+
+            let spool_files: [(&str, Vec<u8>); 6] = [
+                ("0-0001~spool-end-new", rich_end_envelope),
+                (
+                    "1-0001~spool-start-new",
+                    build_spool_envelope_bytes_ex(
+                        "claude_code",
+                        "claude",
+                        "session-start",
+                        "11111111-1111-4111-8111-111111111102",
+                        Some("dedup:spool:new:start"),
+                        "prov-spool-new-1",
+                        "/work/spool-new",
+                        &storage,
+                        "session_start",
+                        ts_start,
+                        111,
+                        serde_json::json!({ "kind": "absent" }),
+                        "Initial session prompt",
+                    ),
+                ),
+                (
+                    "1-0002~spool-start-new-dup",
+                    build_spool_envelope_bytes(
+                        "claude_code",
+                        "claude",
+                        "11111111-1111-4111-8111-111111111103",
+                        Some("dedup:spool:new:start"),
+                        "prov-spool-new-1",
+                        "/work/spool-new",
+                        &storage,
+                        "turn_start",
+                        "2026-11-22T01:02:00Z",
+                        "",
+                    ),
+                ),
+                (
+                    "1-0003~spool-existing-update",
+                    build_spool_envelope_bytes(
+                        "codex",
+                        "codex",
+                        "11111111-1111-4111-8111-111111111104",
+                        None,
+                        "prov-sess-1",
+                        "/work/repo",
+                        &storage,
+                        "turn_end",
+                        ts_existing,
+                        "Follow-up turn prompt",
+                    ),
+                ),
+                (
+                    "1-0004~spool-active-2",
+                    build_spool_envelope_bytes_ex(
+                        "codex",
+                        "codex",
+                        "subagent-end",
+                        "11111111-1111-4111-8111-111111111105",
+                        Some("dedup:spool:active:2"),
+                        "prov-spool-active-2",
+                        "/work/spool-active",
+                        &storage,
+                        "subagent_end",
+                        ts_active,
+                        222,
+                        serde_json::json!({
+                            "kind": "candidate",
+                            "role": "boundary",
+                            "child_id": "sub-boundary-2",
+                        }),
+                        "Subagent boundary prompt",
+                    ),
+                ),
+                ("1-0005~spool-redaction-300", redaction_overflow_envelope),
+            ];
+            for (name, bytes) in &spool_files {
+                let p = spool_ready.join(name);
+                fs::write(&p, bytes).expect("write spool ready file");
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    fs::set_permissions(&p, fs::Permissions::from_mode(0o600))
+                        .expect("chmod spool file 0600");
+                }
+            }
+
+            // Initialize real `capture-queue/` and populate BOTH lanes:
+            // - `priority/`: manually rotated sealed `seg-00000000.log` + active
+            //   `seg-00000001.log` (with committed prefix + valid synced tail
+            //   frame + trailing torn garbage) + dual valid `LTM2` replicas.
+            // - `normal/`: real `append_postcard_frame` calls referencing the
+            //   session created in `priority/` (proving priority-first ordering)
+            //   plus a cross-lane duplicate `dedup_key`.
+            let _q_init = init_capture_queue(&storage).expect("init capture queue");
+            let queue_root = capture_queue_dir_path(&storage);
+            let prio_dir = queue_root.join(QUEUE_LANE_PRIORITY_DIR);
+
+            let queue_sess_rec = AgentSessionRecord {
+                session_id: "queue-sess-1".to_string(),
+                agent_kind: CaptureAgentKind::Codex,
+                provider_session_id: "prov-queue-1".to_string(),
+                thread_id: None,
+                state: CaptureSessionState::Active,
+                working_dir: "/work/queue".to_string(),
+                worktree_id: None,
+                parent_commit: None,
+                parent_session_id: None,
+                metadata_json: "{\"origin\":\"priority_sealed\"}".to_string(),
+                redaction_report: "{}".to_string(),
+                started_at: 1_795_510_000,
+                last_event_at: 1_795_510_010,
+                stopped_at: None,
+                schema_version: 1,
+                sync_revision: 1,
+                repo_id: None,
+                workspace_id: None,
+                workspace_fence: None,
+                scope_state: CaptureScopeState::LegacyUnknown,
+            };
+            let identical_sqlite_audit = AgentAuditLogRecord {
+                audit_id: "aud-1".to_string(),
+                timestamp: "2026-11-21T00:05:00Z".to_string(),
+                user_id: Some("u1".to_string()),
+                user_name: Some("Ada".to_string()),
+                action: "export".to_string(),
+                checkpoint_id: "cp-1".to_string(),
+                scope: "committed".to_string(),
+                export_path: None,
+                justification: Some("audit".to_string()),
+                granted: true,
+            };
+            let new_queue_audit = AgentAuditLogRecord {
+                audit_id: "aud-queue-1".to_string(),
+                timestamp: "2026-11-22T03:00:00Z".to_string(),
+                user_id: Some("u2".to_string()),
+                user_name: Some("Grace".to_string()),
+                action: "export".to_string(),
+                checkpoint_id: "cp-queue-1".to_string(),
+                scope: "committed".to_string(),
+                export_path: None,
+                justification: Some("queue-direct".to_string()),
+                granted: true,
+            };
+            let new_queue_wsa = AgentWorkspaceScopeAuditRecord {
+                audit_id: "wsa-queue-1".to_string(),
+                agent_kind: "codex".to_string(),
+                provider_session_id: "prov-queue-1".to_string(),
+                action: WORKSPACE_SCOPE_AUDIT_ACTION.to_string(),
+                repo_id: "repo-1".to_string(),
+                worktree_id: "wt-1".to_string(),
+                workspace_id: Some("ws-1".to_string()),
+                workspace_fence: Some(2),
+                actor: Some("migrate-test".to_string()),
+                created_at: 1_795_510_020,
+            };
+            let tail_usage = AgentUsageStatsRecord {
+                id: "usage-prio-tail-1".to_string(),
+                session_id: Some("queue-sess-1".to_string()),
+                thread_id: None,
+                agent_run_id: None,
+                run_id: None,
+                provider: "openai".to_string(),
+                model: "gpt-5".to_string(),
+                request_kind: "chat".to_string(),
+                intent: None,
+                prompt_tokens: 100,
+                completion_tokens: 50,
+                cached_tokens: 0,
+                reasoning_tokens: 0,
+                total_tokens: 150,
+                tool_call_count: 1,
+                wall_clock_ms: 120,
+                provider_latency_ms: Some(100),
+                cost_estimate_micro_dollars: Some(10_000),
+                cost_usd: Some(0.01),
+                usage_estimated: false,
+                started_at: None,
+                finished_at: None,
+                success: true,
+                error_kind: None,
+                schema_version: 1,
+                created_at: "2026-11-22T03:05:00Z".to_string(),
+                agent_name: Some("codex".to_string()),
+                repo_id: Some("repo-1".to_string()),
+                turn_id: Some("turn-tail-1".to_string()),
+                event_id: Some("evt-tail-1".to_string()),
+            };
+
+            let mut seg0_bytes = Vec::new();
+            seg0_bytes.extend_from_slice(
+                &encode_postcard_frame(
+                    FRAME_FLAG_PRIORITY,
+                    "dedup:queue:prio:sess-1",
+                    CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                    &CaptureBatchPayload::UpsertSession(queue_sess_rec.clone()),
+                )
+                .expect("encode prio seg0 session frame"),
+            );
+            seg0_bytes.extend_from_slice(
+                &encode_postcard_frame(
+                    FRAME_FLAG_PRIORITY,
+                    "dedup:queue:prio:audit-replay-1",
+                    CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                    &CaptureBatchPayload::AppendAuditLog(identical_sqlite_audit),
+                )
+                .expect("encode prio seg0 audit replay frame"),
+            );
+            let seg0_crc = crc32c_checksum(&seg0_bytes);
+
+            let mut seg1_committed = Vec::new();
+            seg1_committed.extend_from_slice(
+                &encode_postcard_frame(
+                    FRAME_FLAG_PRIORITY,
+                    "dedup:queue:prio:audit-new-1",
+                    CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                    &CaptureBatchPayload::AppendAuditLog(new_queue_audit.clone()),
+                )
+                .expect("encode prio seg1 audit frame"),
+            );
+            seg1_committed.extend_from_slice(
+                &encode_postcard_frame(
+                    FRAME_FLAG_PRIORITY,
+                    "dedup:queue:prio:wsa-1",
+                    CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                    &CaptureBatchPayload::AppendWorkspaceScopeAudit(new_queue_wsa.clone()),
+                )
+                .expect("encode prio seg1 wsa frame"),
+            );
+            let seg1_committed_len = seg1_committed.len() as u64;
+            let seg1_prefix_crc = crc32c_checksum(&seg1_committed);
+
+            let mut seg1_full = seg1_committed;
+            seg1_full.extend_from_slice(
+                &encode_postcard_frame(
+                    FRAME_FLAG_PRIORITY,
+                    "dedup:queue:prio:usage-tail-1",
+                    CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                    &CaptureBatchPayload::InsertUsageStats(tail_usage.clone()),
+                )
+                .expect("encode prio synced tail frame"),
+            );
+            // Append 19 bytes of torn uncommitted garbage after the valid synced tail frame.
+            seg1_full.extend_from_slice(b"LCE1\x00\x00\x00\x09TORN_TAIL!!");
+
+            let seg0_path = prio_dir.join(segment_log_file_name(0));
+            let seg1_path = prio_dir.join(segment_log_file_name(1));
+            fs::write(&seg0_path, &seg0_bytes).expect("write priority seg 0");
+            fs::write(&seg1_path, &seg1_full).expect("write priority seg 1");
+            let prio_meta = LaneTailMeta {
+                active_seg: 1,
+                committed_len: seg1_committed_len,
+                prefix_crc32c: seg1_prefix_crc,
+                min_live_seg: 0,
+                sealed: vec![SealedSegmentMeta {
+                    seg_id: 0,
+                    sealed_len: seg0_bytes.len() as u64,
+                    sealed_crc32c: seg0_crc,
+                }],
+            };
+            let prio_meta_bytes = prio_meta.encode().expect("encode priority LTM2");
+            fs::write(tail_meta_path(&prio_dir), &prio_meta_bytes).expect("write prio tail.meta");
+            fs::write(tail_meta_bak_path(&prio_dir), &prio_meta_bytes)
+                .expect("write prio tail.meta.bak");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                for p in [
+                    &seg0_path,
+                    &seg1_path,
+                    &tail_meta_path(&prio_dir),
+                    &tail_meta_bak_path(&prio_dir),
+                ] {
+                    fs::set_permissions(p, fs::Permissions::from_mode(0o600))
+                        .expect("chmod prio queue file 0600");
+                }
+            }
+
+            // Populate `normal/` via real `append_postcard_frame` (covering
+            // UpsertCheckpoint referencing `queue-sess-1`, UpsertSessionCommit,
+            // InsertUsageStats, plus cross-lane duplicate `dedup:queue:prio:sess-1`).
+            let norm_cp = AgentCheckpointRecord {
+                checkpoint_id: "cp-queue-1".to_string(),
+                session_id: "queue-sess-1".to_string(),
+                parent_checkpoint_id: None,
+                scope: CaptureCheckpointScope::Committed,
+                parent_commit: None,
+                tree_oid: "3333333333333333333333333333333333333333".to_string(),
+                metadata_blob_oid: "4444444444444444444444444444444444444444".to_string(),
+                traces_commit: "5555555555555555555555555555555555555555".to_string(),
+                tool_use_id: None,
+                subagent_session_id: None,
+                description: Some("queued checkpoint".to_string()),
+                created_at: 1_795_510_030,
+                sync_revision: 1,
+            };
+            let norm_commit = AgentSessionCommitRecord {
+                session_id: "queue-sess-1".to_string(),
+                hash_kind: CaptureHashKind::Sha1,
+                commit_oid: "6666666666666666666666666666666666666666".to_string(),
+            };
+            let norm_usage = AgentUsageStatsRecord {
+                id: "usage-norm-1".to_string(),
+                session_id: Some("queue-sess-1".to_string()),
+                thread_id: None,
+                agent_run_id: None,
+                run_id: None,
+                provider: "openai".to_string(),
+                model: "gpt-5".to_string(),
+                request_kind: "chat".to_string(),
+                intent: None,
+                prompt_tokens: 200,
+                completion_tokens: 75,
+                cached_tokens: 10,
+                reasoning_tokens: 25,
+                total_tokens: 275,
+                tool_call_count: 2,
+                wall_clock_ms: 180,
+                provider_latency_ms: Some(150),
+                cost_estimate_micro_dollars: Some(20_000),
+                cost_usd: Some(0.02),
+                usage_estimated: false,
+                started_at: None,
+                finished_at: None,
+                success: true,
+                error_kind: None,
+                schema_version: 1,
+                created_at: "2026-11-22T03:06:00Z".to_string(),
+                agent_name: Some("codex".to_string()),
+                repo_id: Some("repo-1".to_string()),
+                turn_id: Some("turn-norm-1".to_string()),
+                event_id: Some("evt-norm-1".to_string()),
+            };
+            append_postcard_frame(
+                &storage,
+                CaptureQueueLane::Normal,
+                FRAME_FLAG_NONE,
+                "dedup:queue:norm:cp-1",
+                CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                &CaptureBatchPayload::UpsertCheckpoint(norm_cp.clone()),
+            )
+            .expect("append normal checkpoint frame");
+            append_postcard_frame(
+                &storage,
+                CaptureQueueLane::Normal,
+                FRAME_FLAG_NONE,
+                "dedup:queue:norm:commit-1",
+                CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                &CaptureBatchPayload::UpsertSessionCommit(norm_commit.clone()),
+            )
+            .expect("append normal session commit frame");
+            append_postcard_frame(
+                &storage,
+                CaptureQueueLane::Normal,
+                FRAME_FLAG_NONE,
+                "dedup:queue:norm:usage-1",
+                CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                &CaptureBatchPayload::InsertUsageStats(norm_usage.clone()),
+            )
+            .expect("append normal usage frame");
+            let norm_final = append_postcard_frame(
+                &storage,
+                CaptureQueueLane::Normal,
+                FRAME_FLAG_NONE,
+                "dedup:queue:prio:sess-1",
+                CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                &CaptureBatchPayload::UpsertSession(queue_sess_rec.clone()),
+            )
+            .expect("append normal cross-lane dup frame");
+
+            // Snapshot EVERY byte of SQLite DBs, `capture-spool/`, and `capture-queue/` BEFORE export.
+            let git_db_before = fs::read(&git_db).expect("snapshot libra.db");
+            let cap_db_before = fs::read(&cap_db).expect("snapshot capture.db");
+            let spool_before = snapshot_tree_bytes(&capture_spool_dir_path(&storage));
+            let queue_before = snapshot_tree_bytes(&queue_root);
+
+            let mut guard = quiesce_forward_repository_phase1(&storage)
+                .await
+                .expect("quiesce RB-10i fixture");
+            let report =
+                export_forward_phase1_to_redb_tmp(&mut guard, &storage, INITIAL_STORAGE_GENERATION)
+                    .await
+                    .expect("export RB-10i fixture with spool & queue direct ingest");
+            guard.close().await.expect("close RB-10i guard");
+
+            // Verify ZERO mutations to source SQLite, spool, and queue trees!
+            assert_eq!(
+                fs::read(&git_db).expect("re-read libra.db"),
+                git_db_before,
+                "Phase 1 must not modify libra.db"
+            );
+            assert_eq!(
+                fs::read(&cap_db).expect("re-read capture.db"),
+                cap_db_before,
+                "Phase 1 must not modify capture.db"
+            );
+            // Ignore empty lock files potentially touched on open; verify every
+            // data file under `capture-spool/ready/` and `capture-queue/{priority,normal}/`
+            // is 100% byte-for-byte identical and no new files appeared.
+            let spool_after = snapshot_tree_bytes(&capture_spool_dir_path(&storage));
+            let queue_after = snapshot_tree_bytes(&queue_root);
+            assert_eq!(
+                spool_after
+                    .iter()
+                    .filter(|(k, _)| !k.ends_with(CAPTURE_SPOOL_CAPACITY_LOCK_FILE))
+                    .collect::<BTreeMap<_, _>>(),
+                spool_before
+                    .iter()
+                    .filter(|(k, _)| !k.ends_with(CAPTURE_SPOOL_CAPACITY_LOCK_FILE))
+                    .collect::<BTreeMap<_, _>>(),
+                "Phase 1 must NOT modify or remove any file in capture-spool/"
+            );
+            assert_eq!(
+                queue_after
+                    .iter()
+                    .filter(|(k, _)| {
+                        !k.ends_with(QUEUE_APPEND_LOCK_FILE) && !k.ends_with(QUEUE_WRITER_LOCK_FILE)
+                    })
+                    .collect::<BTreeMap<_, _>>(),
+                queue_before
+                    .iter()
+                    .filter(|(k, _)| {
+                        !k.ends_with(QUEUE_APPEND_LOCK_FILE) && !k.ends_with(QUEUE_WRITER_LOCK_FILE)
+                    })
+                    .collect::<BTreeMap<_, _>>(),
+                "Phase 1 must NOT modify, truncate, quarantine, or mirror any file in capture-queue/"
+            );
+
+            // Assert exact report counters
+            assert!(!report.spool_ingest.already_fenced);
+            assert_eq!(report.spool_ingest.files_read, 6);
+            assert_eq!(report.spool_ingest.applied_events, 5);
+            assert_eq!(report.spool_ingest.deduplicated_events, 1);
+            assert_eq!(report.spool_ingest.batches_committed, 2);
+
+            assert_eq!(report.queue_ingest.priority_frames_read, 5);
+            assert_eq!(report.queue_ingest.normal_frames_read, 4);
+            // 9 frames total: 2 deduplicated (`aud-1` SQLite replay + cross-lane `sess-1` dup) -> 7 applied!
+            assert_eq!(report.queue_ingest.applied_frames, 7);
+            assert_eq!(report.queue_ingest.deduplicated_frames, 2);
+            assert_eq!(
+                report.queue_ingest.priority_highwater,
+                CaptureQueueHighwater {
+                    segment_id: 1,
+                    byte_offset: seg1_committed_len,
+                },
+                "priority highwater must stay strictly capped at on-disk LTM2 committed_len"
+            );
+            assert_eq!(
+                report.queue_ingest.normal_highwater,
+                CaptureQueueHighwater {
+                    segment_id: norm_final.seg_id,
+                    byte_offset: norm_final.meta.committed_len,
+                }
+            );
+
+            // Verify every direct-ingested record through `RedbCaptureStore::open_read_only`
+            let cap = RedbCaptureStore::open_read_only(&report.capture_tmp_path)
+                .await
+                .expect("open staged capture redb read-only");
+
+            // AC1 checks: monotonic `0-*` before `1-*` convergence + order-independent
+            // latest-timestamp metadata/redaction + lossless replay receipt preservation
+            let new_stopped = cap
+                .get_session("claude__prov-spool-new-1")
+                .await
+                .expect("read spool-ingested stopped session")
+                .expect("spool-ingested stopped session must exist");
+            assert_eq!(new_stopped.agent_kind, CaptureAgentKind::ClaudeCode);
+            assert_eq!(new_stopped.provider_session_id, "prov-spool-new-1");
+            assert_eq!(new_stopped.state, CaptureSessionState::Stopped);
+            assert_eq!(new_stopped.started_at, expected_ts_start);
+            assert_eq!(new_stopped.last_event_at, expected_ts_end);
+            assert_eq!(new_stopped.stopped_at, Some(expected_ts_end));
+            assert_eq!(new_stopped.sync_revision, 2);
+            // Newer terminal event's redaction_report (`bytes_scanned = 999`) MUST NOT
+            // be overwritten by older `1-start` (`bytes_scanned = 111`).
+            let redaction_val: serde_json::Value =
+                serde_json::from_str(&new_stopped.redaction_report)
+                    .expect("parse converged redaction_report");
+            assert_eq!(
+                redaction_val.get("bytes_scanned").and_then(|v| v.as_u64()),
+                Some(999),
+                "older start event must not overwrite newer terminal redaction_report"
+            );
+            let meta_val: serde_json::Value =
+                serde_json::from_str(&new_stopped.metadata_json).expect("parse metadata_json");
+            assert_eq!(
+                meta_val
+                    .get("last_spool_event_kind")
+                    .and_then(|v| v.as_str()),
+                Some("session_end"),
+                "older start event must not overwrite newer terminal metadata cursor"
+            );
+            assert_eq!(
+                meta_val
+                    .get("last_spool_event_timestamp")
+                    .and_then(|v| v.as_str()),
+                Some(ts_end),
+                "session metadata must preserve full subsecond RFC 3339 timestamp"
+            );
+            assert_eq!(
+                meta_val
+                    .get("spool_direct_ingest_receipt_count")
+                    .and_then(|v| v.as_u64()),
+                Some(2)
+            );
+            assert_eq!(
+                meta_val
+                    .get("spool_direct_ingest_pending_checkpoint_count")
+                    .and_then(|v| v.as_u64()),
+                Some(1)
+            );
+            assert_eq!(
+                meta_val
+                    .get("spool_direct_ingest_receipts_table")
+                    .and_then(|v| v.as_str()),
+                Some(MIGRATED_SPOOL_RECEIPTS_TABLE.name())
+            );
+            assert!(
+                meta_val.get("spool_direct_ingest_events").is_none(),
+                "session metadata must stay O(1) and store per-event receipts in MIGRATED_SPOOL_RECEIPTS_TABLE"
+            );
+
+            // Simulate post-Phase-2 spool fencing: completely remove source
+            // `capture-spool/ready/` directory and replace it with a `0400`
+            // tombstone so the original spool files are unavailable, then
+            // verify Track B can losslessly reconstruct every replay input
+            // directly from `capture.gen-<id>.redb.tmp`!
+            fs::remove_dir_all(&spool_ready).expect("remove source spool ready dir post-Phase-1");
+            fs::write(&spool_ready, CAPTURE_SPOOL_TOMBSTONE_SENTINEL)
+                .expect("write post-Phase-2 fenced tombstone");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                fs::set_permissions(&spool_ready, fs::Permissions::from_mode(0o400))
+                    .expect("chmod fenced tombstone 0400");
+            }
+            assert!(
+                spool_ready.is_file(),
+                "source spool ready directory must be unavailable/fenced during materialization check"
+            );
+
+            let session_receipts = read_migrated_spool_receipts_for_session(
+                &report.capture_tmp_path,
+                "claude__prov-spool-new-1",
+            )
+            .expect("read migrated spool receipts after spool fenced");
+            assert_eq!(session_receipts.len(), 2);
+            assert_eq!(session_receipts[0].event_kind, "session_start");
+            assert_eq!(session_receipts[0].timestamp_rfc3339, ts_start);
+            assert_eq!(session_receipts[1].event_kind, "session_end");
+            assert_eq!(session_receipts[1].timestamp_rfc3339, ts_end);
+            assert!(session_receipts[1].needs_checkpoint_materialization);
+
+            let pending_checkpoints =
+                list_pending_checkpoint_spool_receipts(&report.capture_tmp_path)
+                    .expect("list pending checkpoint receipts after spool fenced");
+            assert_eq!(
+                pending_checkpoints.len(),
+                4,
+                "session_end + subagent_end + redaction-300 turn_end + sess-1 turn_end must all be queued for Track B checkpoint materialization"
+            );
+            assert_eq!(pending_checkpoints[0].event_kind, "session_end");
+            assert_eq!(pending_checkpoints[1].event_kind, "subagent_end");
+            assert_eq!(pending_checkpoints[2].event_kind, "turn_end");
+            assert_eq!(
+                pending_checkpoints[2].session_id,
+                "codex__prov-spool-redaction-300"
+            );
+            assert!(
+                pending_checkpoints[2].has_chunked_raw_envelope,
+                "300-match redaction report (>256) must persist lossless raw chunks"
+            );
+            assert_eq!(pending_checkpoints[3].event_kind, "turn_end");
+            assert_eq!(pending_checkpoints[3].session_id, "sess-1");
+
+            // Verify 100% lossless recovery of ALL 300 redaction matches AFTER
+            // the source `capture-spool/ready/` directory is fenced!
+            let lossless_redaction_300 = reconstruct_spool_replay_envelope_lossless(
+                &report.capture_tmp_path,
+                &pending_checkpoints[2],
+                &storage,
+            )
+            .expect("losslessly reconstruct 300-match redaction envelope after spool fenced");
+            let recovered_matches = lossless_redaction_300["redaction"]["matches"]
+                .as_array()
+                .expect("recovered redaction.matches array");
+            assert_eq!(
+                recovered_matches.len(),
+                300,
+                "all 300 redaction matches must survive post-fence lossless reconstruction"
+            );
+            assert_eq!(
+                recovered_matches[299]["rule_id"],
+                serde_json::json!("rule-299")
+            );
+            assert_eq!(recovered_matches[299]["start"], serde_json::json!(2990));
+            assert_eq!(recovered_matches[299]["end"], serde_json::json!(2995));
+
+            // Reconstruct the full replay envelope (including valid escaped
+            // `\u0000` NUL bytes in `prompt`, `tool_input`, `tool_response`,
+            // and `assistant_message`) from the durable receipt with zero
+            // access to the fenced source spool!
+            assert!(!session_receipts[1].has_chunked_raw_envelope);
+            let env = reconstruct_spool_replay_envelope_lossless(
+                &report.capture_tmp_path,
+                &session_receipts[1],
+                &storage,
+            )
+            .expect("reconstruct lossless replay envelope from durable receipt");
+            assert_eq!(env["version"], serde_json::json!(1));
+            assert_eq!(env["hook_name"], serde_json::json!("claude"));
+            assert_eq!(env["hook_command"], serde_json::json!("session-end"));
+            assert_eq!(env["frame_bytes"], serde_json::json!(4096));
+            assert_eq!(env["hook_deadline"], serde_json::json!(true));
+            assert_eq!(env["display_batch_limit"], serde_json::json!(25));
+            assert_eq!(env["tool_link"]["tool"], serde_json::json!("claude-code"));
+            assert_eq!(
+                env["tool_link"]["parent"],
+                serde_json::json!("parent-tool-1")
+            );
+            assert_eq!(env["child_hints"]["kind"], serde_json::json!("candidate"));
+            assert_eq!(env["child_hints"]["role"], serde_json::json!("boundary"));
+            assert_eq!(
+                env["child_hints"]["current_or_parent_path"],
+                serde_json::json!("/provider/parent.jsonl")
+            );
+            assert_eq!(
+                env["child_hints"]["child_path"],
+                serde_json::json!("/provider/child-1.jsonl")
+            );
+            assert_eq!(
+                env["child_hints"]["child_id"],
+                serde_json::json!("sub-child-1")
+            );
+            assert_eq!(
+                env["child_hints"]["turn_id"],
+                serde_json::json!("turn-boundary-1")
+            );
+            assert_eq!(
+                env["event"]["session_ref"],
+                serde_json::json!("transcript://claude/session-1")
+            );
+            assert_eq!(
+                env["event"]["prompt"],
+                serde_json::json!("Fix redb\0migration spool replay with [REDACTED] token")
+            );
+            assert_eq!(
+                env["event"]["model"],
+                serde_json::json!({ "provider": "anthropic", "name": "claude-opus-4" })
+            );
+            assert_eq!(
+                env["event"]["source"],
+                serde_json::json!({ "channel": "hook", "version": 2 })
+            );
+            assert_eq!(env["event"]["tool_name"], serde_json::json!("bash"));
+            assert_eq!(
+                env["event"]["tool_input"],
+                serde_json::json!({
+                    "command": "cargo\0test",
+                    "timeout_ms": 30000,
+                    "deep": deep_tool_nested,
+                })
+            );
+            assert_eq!(
+                env["event"]["tool_response"],
+                serde_json::json!({ "exit_code": 0, "ok": true, "out": "pass\0ok" })
+            );
+            assert_eq!(
+                env["event"]["assistant_message"],
+                serde_json::json!("Completed\0migration verification cleanly.")
+            );
+            assert_eq!(env["event"]["timestamp"], serde_json::json!(ts_end));
+            assert_eq!(env["redaction"]["bytes_scanned"], serde_json::json!(999));
+            assert_eq!(env["redaction"]["bytes_redacted"], serde_json::json!(10));
+            assert_eq!(
+                env["redaction"]["matches"][0]["rule_id"],
+                serde_json::json!("secret-token")
+            );
+
+            // AC1 checks: merge into existing SQLite-exported Scoped session `sess-1`
+            let merged_existing = cap
+                .get_session("sess-1")
+                .await
+                .expect("read merged SQLite session")
+                .expect("sess-1 must exist");
+            assert_eq!(merged_existing.scope_state, CaptureScopeState::Scoped);
+            assert_eq!(merged_existing.repo_id.as_deref(), Some("repo-1"));
+            assert_eq!(merged_existing.last_event_at, expected_ts_existing);
+            assert!(merged_existing.sync_revision >= 2);
+
+            // AC1 checks: new active spool session
+            let active_spool = cap
+                .get_session("codex__prov-spool-active-2")
+                .await
+                .expect("read active spool session")
+                .expect("active spool session must exist");
+            assert_eq!(active_spool.state, CaptureSessionState::Active);
+            assert_eq!(active_spool.started_at, expected_ts_active);
+            assert_eq!(active_spool.stopped_at, None);
+
+            // AC2 checks: all 6 payload variants + synced tail + highwaters
+            assert_eq!(
+                cap.get_session("queue-sess-1")
+                    .await
+                    .expect("read queue-sess-1"),
+                Some(queue_sess_rec)
+            );
+            assert_eq!(
+                cap.get_checkpoint("cp-queue-1")
+                    .await
+                    .expect("read cp-queue-1"),
+                Some(norm_cp)
+            );
+            assert_eq!(
+                cap.list_session_commits("queue-sess-1")
+                    .await
+                    .expect("list queue-sess-1 commits"),
+                vec![norm_commit]
+            );
+            assert_eq!(
+                cap.get_usage_stats("usage-norm-1")
+                    .await
+                    .expect("read usage-norm-1"),
+                Some(norm_usage)
+            );
+            assert_eq!(
+                cap.get_usage_stats("usage-prio-tail-1")
+                    .await
+                    .expect("read synced-tail usage-prio-tail-1"),
+                Some(tail_usage)
+            );
+            assert_eq!(
+                cap.get_audit_log("aud-queue-1")
+                    .await
+                    .expect("read aud-queue-1"),
+                Some(new_queue_audit)
+            );
+            assert_eq!(
+                cap.list_workspace_scope_audits("codex", "prov-queue-1")
+                    .await
+                    .expect("list wsa-queue-1"),
+                vec![new_queue_wsa]
+            );
+            assert_eq!(
+                cap.get_queue_highwater(CaptureQueueLane::Priority)
+                    .await
+                    .expect("read priority highwater"),
+                CaptureQueueHighwater {
+                    segment_id: 1,
+                    byte_offset: seg1_committed_len,
+                }
+            );
+            assert_eq!(
+                cap.get_queue_highwater(CaptureQueueLane::Normal)
+                    .await
+                    .expect("read normal highwater"),
+                CaptureQueueHighwater {
+                    segment_id: norm_final.seg_id,
+                    byte_offset: norm_final.meta.committed_len,
+                }
+            );
+        }
+
+        // ------------------------------------------------------------------
+        // Part 1b: Exact order-independence (`0-end, 1-start` == `0-start, 1-end`),
+        // `> 8 MiB` streaming spool envelope (`10 MiB`), and pre-push `8 MiB`
+        // queue batch boundary enforcement (3 × 3.2 MiB frames -> 2 batches)
+        // ------------------------------------------------------------------
+        {
+            let run_order_case = |end_first: bool, include_large_spool_and_queue: bool| async move {
+                let dir = tempdir().expect("create order-independence tempdir");
+                let storage = dir.path().join(".libra");
+                let git_db = git_sqlite_db_path(&storage);
+                let cap_db = capture_sqlite_db_path(&storage);
+                populate_all_61_repository_tables(&git_db).await;
+                detach_inline_capture_tables(&git_db).await;
+                {
+                    let _cap = SqliteCaptureStore::create(&cap_db)
+                        .await
+                        .expect("create capture.db");
+                }
+                populate_capture_rows_via_sql(&cap_db, 0, None).await;
+                switch_fixture_db_to_delete_mode(&git_db).await;
+                switch_fixture_db_to_delete_mode(&cap_db).await;
+
+                let spool_ready = capture_spool_dir_path(&storage).join(CAPTURE_SPOOL_READY_SUBDIR);
+                fs::create_dir_all(&spool_ready).expect("create spool ready");
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    fs::set_permissions(
+                        storage.join(PRIVATE_SUBDIR),
+                        fs::Permissions::from_mode(0o700),
+                    )
+                    .expect("chmod private 0700");
+                    fs::set_permissions(
+                        capture_spool_dir_path(&storage),
+                        fs::Permissions::from_mode(0o700),
+                    )
+                    .expect("chmod spool 0700");
+                    fs::set_permissions(&spool_ready, fs::Permissions::from_mode(0o700))
+                        .expect("chmod spool ready 0700");
+                }
+
+                // Two events in the EXACT SAME WHOLE SECOND with distinct
+                // fractional timestamps:
+                // - Older `.100Z` is `session_end` (`is_terminal = true`) AND
+                //   has lexicographically larger `dedup_key` `"dedup:commute:z-older"`.
+                // - Newer `.900Z` is `turn_start` (`is_terminal = false`) AND
+                //   has lexicographically smaller `dedup_key` `"dedup:commute:a-newer"`.
+                // Subsecond nanosecond ordering MUST make `.900Z` win latest
+                // metadata/redaction in BOTH file orderings!
+                let older_bytes = build_spool_envelope_bytes_ex(
+                    "claude_code",
+                    "claude",
+                    "session-end",
+                    "44444444-4444-4444-8444-444444444401",
+                    Some("dedup:commute:z-older"),
+                    "prov-commute-1",
+                    "/work/commute",
+                    &storage,
+                    "session_end",
+                    "2026-11-22T01:00:00.100Z",
+                    123,
+                    serde_json::json!({ "kind": "unavailable" }),
+                    "older same-second terminal",
+                );
+                let newer_bytes = build_spool_envelope_bytes_ex(
+                    "claude_code",
+                    "claude",
+                    "prompt",
+                    "44444444-4444-4444-8444-444444444402",
+                    Some("dedup:commute:a-newer"),
+                    "prov-commute-1",
+                    "/work/commute",
+                    &storage,
+                    "turn_start",
+                    "2026-11-22T01:00:00.900Z",
+                    888,
+                    serde_json::json!({ "kind": "absent" }),
+                    "newer same-second turn_start",
+                );
+                if end_first {
+                    fs::write(spool_ready.join("0-0001~older"), &older_bytes)
+                        .expect("write 0-older");
+                    fs::write(spool_ready.join("1-0001~newer"), &newer_bytes)
+                        .expect("write 1-newer");
+                } else {
+                    fs::write(spool_ready.join("0-0001~newer"), &newer_bytes)
+                        .expect("write 0-newer");
+                    fs::write(spool_ready.join("1-0001~older"), &older_bytes)
+                        .expect("write 1-older");
+                }
+
+                if include_large_spool_and_queue {
+                    // Valid > 10 MiB spool envelope exercising huge retained
+                    // fields (`prompt` 10 MiB, `session_ref` 2 MiB,
+                    // `tool_link.tool` 2 MiB, `child_hints.child_path` 2 MiB,
+                    // `tool_input` 2 MiB) — streamed in O(1) heap!
+                    let large_prompt = "L".repeat(10 * 1024 * 1024);
+                    let large_sref = "R".repeat(2 * 1024 * 1024);
+                    let large_tool = "T".repeat(2 * 1024 * 1024);
+                    let large_child_path = "C".repeat(2 * 1024 * 1024);
+                    let large_tool_input = "I".repeat(2 * 1024 * 1024);
+                    let large_spool = serde_json::to_vec(&serde_json::json!({
+                        "version": 1,
+                        "agent_kind": "codex",
+                        "hook_name": "codex",
+                        "hook_command": "prompt",
+                        "provider_kind": "codex",
+                        "provider_source": "codex_hook",
+                        "frame_bytes": 18 * 1024 * 1024,
+                        "event_id": "44444444-4444-4444-8444-444444444403",
+                        "identity_scheme": "generic_lifecycle_uuid_v5",
+                        "dedup_key": "dedup:spool:large10m",
+                        "hook_deadline": false,
+                        "display_batch_limit": null,
+                        "tool_link": { "tool": large_tool, "parent": null },
+                        "child_hints": {
+                            "kind": "candidate",
+                            "role": "boundary",
+                            "child_path": large_child_path,
+                            "child_id": "child-huge",
+                        },
+                        "context": {
+                            "provider_session_id": "prov-large-10m",
+                            "working_dir": "/work/large",
+                            "storage_path": storage.display().to_string(),
+                            "worktree_root": "/work/large",
+                        },
+                        "event": {
+                            "kind": "turn_start",
+                            "session_id": "prov-large-10m",
+                            "session_ref": large_sref,
+                            "prompt": large_prompt,
+                            "model": null,
+                            "source": null,
+                            "tool_name": null,
+                            "tool_input": { "blob": large_tool_input },
+                            "tool_response": null,
+                            "assistant_message": null,
+                            "timestamp": "2026-11-22T01:20:00Z",
+                        },
+                        "redaction": {
+                            "matches": [],
+                            "bytes_scanned": 18 * 1024 * 1024,
+                            "bytes_redacted": 0,
+                        },
+                    }))
+                    .expect("encode large retained-field spool JSON");
+                    assert!(large_spool.len() > 18 * 1024 * 1024);
+                    fs::write(spool_ready.join("1-0002~large10m"), large_spool)
+                        .expect("write >18MiB spool file");
+
+                    // 3 × 1.6 MiB queue frames in `normal/`: pre-push 4 MiB flush MUST
+                    // split into 2 batches (2 frames = 3.2 MiB, then 1 frame = 1.6 MiB),
+                    // NEVER committing a single 4.8 MiB batch!
+                    let _ = init_capture_queue(&storage).expect("init boundary queue");
+                    let big_intent = "B".repeat(1_600 * 1024);
+                    for idx in 0..3usize {
+                        let rec = AgentUsageStatsRecord {
+                            id: format!("usage-big3m-{idx}"),
+                            session_id: Some("sess-1".to_string()),
+                            thread_id: None,
+                            agent_run_id: None,
+                            run_id: None,
+                            provider: "openai".to_string(),
+                            model: "gpt-5".to_string(),
+                            request_kind: "chat".to_string(),
+                            intent: Some(big_intent.clone()),
+                            prompt_tokens: 1,
+                            completion_tokens: 1,
+                            cached_tokens: 0,
+                            reasoning_tokens: 0,
+                            total_tokens: 2,
+                            tool_call_count: 0,
+                            wall_clock_ms: 10,
+                            provider_latency_ms: None,
+                            cost_estimate_micro_dollars: None,
+                            cost_usd: None,
+                            usage_estimated: false,
+                            started_at: None,
+                            finished_at: None,
+                            success: true,
+                            error_kind: None,
+                            schema_version: 1,
+                            created_at: "2026-11-22T01:30:00Z".to_string(),
+                            agent_name: None,
+                            repo_id: None,
+                            turn_id: None,
+                            event_id: None,
+                        };
+                        append_postcard_frame(
+                            &storage,
+                            CaptureQueueLane::Normal,
+                            FRAME_FLAG_NONE,
+                            &format!("dedup:big3m:{idx}"),
+                            CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                            &CaptureBatchPayload::InsertUsageStats(rec),
+                        )
+                        .expect("append 3.2 MiB queue frame");
+                    }
+                }
+
+                let mut guard = quiesce_forward_repository_phase1(&storage)
+                    .await
+                    .expect("quiesce commute repo");
+                let report = export_forward_phase1_to_redb_tmp(
+                    &mut guard,
+                    &storage,
+                    INITIAL_STORAGE_GENERATION,
+                )
+                .await
+                .expect("export commute repo");
+                guard.close().await.expect("close commute guard");
+
+                let cap = RedbCaptureStore::open_read_only(&report.capture_tmp_path)
+                    .await
+                    .expect("open commute capture redb");
+                let sess = cap
+                    .get_session("claude__prov-commute-1")
+                    .await
+                    .expect("get commute session")
+                    .expect("commute session present");
+                let commute_receipts = read_migrated_spool_receipts_for_session(
+                    &report.capture_tmp_path,
+                    "claude__prov-commute-1",
+                )
+                .expect("read commute receipts");
+                if include_large_spool_and_queue {
+                    assert!(
+                        cap.get_session("codex__prov-large-10m")
+                            .await
+                            .expect("get >18MiB spool session")
+                            .is_some(),
+                        "> 18 MiB valid spool envelope with huge retained fields must migrate cleanly"
+                    );
+                    let large_receipts = read_migrated_spool_receipts_for_session(
+                        &report.capture_tmp_path,
+                        "codex__prov-large-10m",
+                    )
+                    .expect("read large spool receipts");
+                    assert_eq!(large_receipts.len(), 1);
+                    let lr = &large_receipts[0];
+                    let lp = lr.prompt.as_ref().expect("bounded prompt");
+                    assert!(lp.truncated);
+                    assert_eq!(lp.original_bytes, 10 * 1024 * 1024);
+                    assert_eq!(lp.value.len(), MAX_SPOOL_RETAINED_TEXT_BYTES);
+                    let ls = lr.session_ref.as_ref().expect("bounded session_ref");
+                    assert!(ls.truncated);
+                    assert_eq!(ls.original_bytes, 2 * 1024 * 1024);
+                    assert_eq!(ls.value.len(), MAX_SPOOL_RETAINED_META_STR_BYTES);
+                    let lt = lr.tool_link.as_ref().expect("bounded tool_link");
+                    assert!(lt.tool.truncated);
+                    assert_eq!(lt.tool.original_bytes, 2 * 1024 * 1024);
+                    assert_eq!(lt.tool.value.len(), MAX_SPOOL_RETAINED_META_STR_BYTES);
+                    let lch = lr
+                        .child_hints
+                        .as_ref()
+                        .and_then(|h| h.child_path.as_ref())
+                        .expect("bounded child_hints.child_path");
+                    assert!(lch.truncated);
+                    assert_eq!(lch.original_bytes, 2 * 1024 * 1024);
+                    assert_eq!(lch.value.len(), MAX_SPOOL_RETAINED_META_STR_BYTES);
+                    let lti = lr.tool_input.as_ref().expect("bounded tool_input");
+                    assert!(lti.truncated);
+                    assert!(lti.original_bytes > 2 * 1024 * 1024);
+                    assert_eq!(lti.json_text.len(), MAX_SPOOL_RETAINED_JSON_BYTES);
+                    assert!(lr.has_chunked_raw_envelope);
+                    let recon = reconstruct_spool_replay_envelope(lr, &storage)
+                        .expect("reconstruct bounded large envelope summary");
+                    assert!(recon.truncated_fields.contains(&"event.prompt"));
+                    assert!(recon.truncated_fields.contains(&"event.session_ref"));
+                    assert!(recon.truncated_fields.contains(&"tool_link.tool"));
+                    assert!(recon.truncated_fields.contains(&"child_hints.child_path"));
+                    assert!(recon.truncated_fields.contains(&"event.tool_input"));
+
+                    // Fence/remove the source spool directory completely, then
+                    // verify 100% BIT-FOR-BIT LOSSLESS recovery of the entire
+                    // > 18 MiB envelope (10 MiB prompt, 2 MiB session_ref,
+                    // 2 MiB tool_link.tool, 2 MiB child_hints.child_path,
+                    // 2 MiB tool_input) from `MIGRATED_SPOOL_ENVELOPE_CHUNKS_TABLE`!
+                    fs::remove_dir_all(&spool_ready)
+                        .expect("remove source spool before lossless chunk check");
+                    fs::write(&spool_ready, CAPTURE_SPOOL_TOMBSTONE_SENTINEL)
+                        .expect("write fenced tombstone before lossless chunk check");
+                    let full_recovered = reconstruct_spool_replay_envelope_lossless(
+                        &report.capture_tmp_path,
+                        lr,
+                        &storage,
+                    )
+                    .expect("100% lossless chunked reconstruction of >18MiB spool envelope");
+                    assert_eq!(
+                        full_recovered["event"]["prompt"].as_str().map(str::len),
+                        Some(10 * 1024 * 1024)
+                    );
+                    assert_eq!(
+                        full_recovered["event"]["session_ref"]
+                            .as_str()
+                            .map(str::len),
+                        Some(2 * 1024 * 1024)
+                    );
+                    assert_eq!(
+                        full_recovered["tool_link"]["tool"].as_str().map(str::len),
+                        Some(2 * 1024 * 1024)
+                    );
+                    assert_eq!(
+                        full_recovered["child_hints"]["child_path"]
+                            .as_str()
+                            .map(str::len),
+                        Some(2 * 1024 * 1024)
+                    );
+                    assert_eq!(
+                        full_recovered["event"]["tool_input"]["blob"]
+                            .as_str()
+                            .map(str::len),
+                        Some(2 * 1024 * 1024)
+                    );
+                    // Verify 2-pass verify-before-write guarantee: if chunk
+                    // authentication fails (digest mismatch), `stream_migrated_spool_envelope_to_writer`
+                    // MUST emit ZERO bytes to the caller's writer!
+                    let mut tampered_receipt = lr.clone();
+                    tampered_receipt.raw_envelope_sha256_hex = "0".repeat(64);
+                    let mut sink = Vec::new();
+                    let err = stream_migrated_spool_envelope_to_writer(
+                        &report.capture_tmp_path,
+                        &tampered_receipt,
+                        &storage,
+                        &mut sink,
+                    )
+                    .expect_err("corrupt chunk digest must fail verification");
+                    assert_eq!(err.stable_code_str(), "LBR-IO-001");
+                    assert!(
+                        sink.is_empty(),
+                        "verify-before-write must emit 0 bytes to writer on verification failure; got {} bytes",
+                        sink.len()
+                    );
+
+                    assert_eq!(
+                        report.queue_ingest.batches_committed, 2,
+                        "3 × 1.6 MiB queue frames must flush BEFORE exceeding 4 MiB (2 + 1 = 2 batches)"
+                    );
+                    for idx in 0..3usize {
+                        assert!(
+                            cap.get_usage_stats(&format!("usage-big3m-{idx}"))
+                                .await
+                                .expect("get big3m usage")
+                                .is_some()
+                        );
+                    }
+                }
+                (sess, commute_receipts)
+            };
+
+            let (sess_older_first, mut receipts_older_first) = run_order_case(true, false).await;
+            let (sess_newer_first, mut receipts_newer_first) = run_order_case(false, true).await;
+            assert_eq!(
+                sess_older_first, sess_newer_first,
+                "same-second subsecond spool session convergence must be 100% order-independent"
+            );
+            // The two runs execute in distinct `tempdir()` paths, so raw JSON
+            // `context.storage_path` (and therefore raw envelope SHA-256) differs
+            // solely by tempdir name; verify valid digests and compare every semantic field.
+            for r in receipts_older_first
+                .iter_mut()
+                .chain(receipts_newer_first.iter_mut())
+            {
+                assert!(r.raw_envelope_bytes > 0);
+                assert_eq!(r.raw_envelope_sha256_hex.len(), 64);
+                r.raw_envelope_bytes = 0;
+                r.raw_envelope_sha256_hex.clear();
+            }
+            assert_eq!(
+                receipts_older_first, receipts_newer_first,
+                "durable migrated_spool_receipts order must be 100% order-independent"
+            );
+            // Verify `.900Z` (`turn_start`, `bytes_scanned = 888`) won over
+            // `.100Z` (`session_end`, `bytes_scanned = 123`) despite `.100Z`
+            // having `is_terminal = true` and a larger `dedup_key`!
+            let redaction_val: serde_json::Value =
+                serde_json::from_str(&sess_older_first.redaction_report)
+                    .expect("parse same-second redaction");
+            assert_eq!(
+                redaction_val.get("bytes_scanned").and_then(|v| v.as_u64()),
+                Some(888),
+                "newer subsecond `.900Z` event must win redaction_report over older `.100Z` event"
+            );
+            let meta_val: serde_json::Value = serde_json::from_str(&sess_older_first.metadata_json)
+                .expect("parse same-second metadata");
+            assert_eq!(
+                meta_val
+                    .get("last_spool_event_kind")
+                    .and_then(|v| v.as_str()),
+                Some("turn_start"),
+                "newer subsecond `.900Z` event must win latest cursor over older `.100Z` terminal event"
+            );
+            assert_eq!(
+                meta_val
+                    .get("last_spool_event_timestamp")
+                    .and_then(|v| v.as_str()),
+                Some("2026-11-22T01:00:00.900Z")
+            );
+            assert_eq!(receipts_older_first.len(), 2);
+            assert_eq!(
+                receipts_older_first[0].timestamp_rfc3339,
+                "2026-11-22T01:00:00.100Z"
+            );
+            assert_eq!(
+                receipts_older_first[1].timestamp_rfc3339,
+                "2026-11-22T01:00:00.900Z"
+            );
+        }
+
+        // ------------------------------------------------------------------
+        // Part 2: Layout A with fenced `0400` spool tombstone sentinel
+        // ------------------------------------------------------------------
+        {
+            let dir = tempdir().expect("create fenced tombstone tempdir");
+            let storage = dir.path().join(".libra");
+            let git_db = git_sqlite_db_path(&storage);
+            populate_all_61_repository_tables(&git_db).await;
+            populate_capture_rows_via_sql(&git_db, 0, None).await;
+            switch_fixture_db_to_delete_mode(&git_db).await;
+
+            let spool_dir = capture_spool_dir_path(&storage);
+            fs::create_dir_all(&spool_dir).expect("create spool dir");
+            let ready_tomb = spool_dir.join(CAPTURE_SPOOL_READY_SUBDIR);
+            fs::write(&ready_tomb, CAPTURE_SPOOL_TOMBSTONE_SENTINEL)
+                .expect("write ready tombstone");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                fs::set_permissions(
+                    storage.join(PRIVATE_SUBDIR),
+                    fs::Permissions::from_mode(0o700),
+                )
+                .expect("chmod private 0700");
+                fs::set_permissions(&spool_dir, fs::Permissions::from_mode(0o700))
+                    .expect("chmod spool 0700");
+                fs::set_permissions(&ready_tomb, fs::Permissions::from_mode(0o400))
+                    .expect("chmod ready tombstone 0400");
+            }
+
+            let mut guard = quiesce_forward_repository_phase1(&storage)
+                .await
+                .expect("quiesce fenced spool Layout A");
+            let report =
+                export_forward_phase1_to_redb_tmp(&mut guard, &storage, INITIAL_STORAGE_GENERATION)
+                    .await
+                    .expect("export Layout A with fenced spool tombstone");
+            guard.close().await.expect("close guard");
+
+            assert_eq!(report.layout, LegacyRepositoryLayout::LayoutA);
+            assert!(report.spool_ingest.already_fenced);
+            assert_eq!(report.spool_ingest.files_read, 0);
+            assert_eq!(
+                fs::read(&ready_tomb).expect("read ready tombstone"),
+                CAPTURE_SPOOL_TOMBSTONE_SENTINEL
+            );
+        }
+
+        // ------------------------------------------------------------------
+        // Part 3: Fail-closed negative cases (zero `.tmp` leftovers, zero source mutation)
+        // ------------------------------------------------------------------
+        let mut negative_cases = vec![
+            "malformed_spool_json",
+            "trailing_garbage_spool_json",
+            "lone_surrogate_spool_json",
+            "oversized_spool_context_storage_path",
+            "oversized_sqlite_single_row",
+            "unsupported_spool_version",
+            "missing_spool_hook_name",
+            "mismatched_spool_provider_binding",
+            "unknown_spool_hook_command",
+            "unknown_spool_identity_scheme",
+            "cross_repo_spool_storage_path",
+            "writable_spool_tombstone",
+            "corrupt_committed_queue_frame",
+            "conflicting_audit_overwrite",
+        ];
+        #[cfg(unix)]
+        negative_cases.push("fifo_in_spool_ready");
+
+        for case_name in negative_cases {
+            let dir = tempdir().expect("create negative case tempdir");
+            let storage = dir.path().join(".libra");
+            let git_db = git_sqlite_db_path(&storage);
+            let cap_db = capture_sqlite_db_path(&storage);
+            populate_all_61_repository_tables(&git_db).await;
+            detach_inline_capture_tables(&git_db).await;
+            {
+                let _cap_store = SqliteCaptureStore::create(&cap_db)
+                    .await
+                    .expect("create negative case capture.db");
+            }
+            populate_capture_rows_via_sql(&cap_db, 0, None).await;
+            switch_fixture_db_to_delete_mode(&git_db).await;
+            switch_fixture_db_to_delete_mode(&cap_db).await;
+
+            match case_name {
+                "malformed_spool_json" => {
+                    let ready = capture_spool_dir_path(&storage).join(CAPTURE_SPOOL_READY_SUBDIR);
+                    fs::create_dir_all(&ready).expect("create spool ready");
+                    fs::write(ready.join("1-0001~bad"), b"{not valid json")
+                        .expect("write malformed json");
+                }
+                "trailing_garbage_spool_json" => {
+                    let ready = capture_spool_dir_path(&storage).join(CAPTURE_SPOOL_READY_SUBDIR);
+                    fs::create_dir_all(&ready).expect("create spool ready");
+                    let mut bytes = build_spool_envelope_bytes(
+                        "codex",
+                        "codex",
+                        "22222222-2222-4222-8222-222222222206",
+                        Some("dedup:trailing"),
+                        "prov-trailing",
+                        "/work/trailing",
+                        &storage,
+                        "session_start",
+                        "2026-11-22T01:00:00Z",
+                        "",
+                    );
+                    bytes.extend_from_slice(b" {\"extra\":1}");
+                    fs::write(ready.join("1-0001~trailing"), bytes)
+                        .expect("write trailing garbage spool");
+                }
+                "lone_surrogate_spool_json" => {
+                    let ready = capture_spool_dir_path(&storage).join(CAPTURE_SPOOL_READY_SUBDIR);
+                    fs::create_dir_all(&ready).expect("create spool ready");
+                    let raw = br#"{"version":1,"hook_name":"\uD800"}"#;
+                    fs::write(ready.join("1-0001~surrogate"), raw)
+                        .expect("write lone surrogate spool");
+                }
+                "oversized_spool_context_storage_path" => {
+                    let ready = capture_spool_dir_path(&storage).join(CAPTURE_SPOOL_READY_SUBDIR);
+                    fs::create_dir_all(&ready).expect("create spool ready");
+                    let mut val: serde_json::Value =
+                        serde_json::from_slice(&build_spool_envelope_bytes(
+                            "codex",
+                            "codex",
+                            "22222222-2222-4222-8222-222222222207",
+                            Some("dedup:bigpath"),
+                            "prov-bigpath",
+                            "/work/bigpath",
+                            &storage,
+                            "session_start",
+                            "2026-11-22T01:00:00Z",
+                            "",
+                        ))
+                        .expect("parse base spool");
+                    val["context"]["storage_path"] = serde_json::json!(
+                        "/".to_string() + &"x".repeat(MAX_SPOOL_RETAINED_META_STR_BYTES + 64)
+                    );
+                    fs::write(
+                        ready.join("1-0001~bigpath"),
+                        serde_json::to_vec(&val).expect("encode bigpath"),
+                    )
+                    .expect("write bigpath");
+                }
+                "oversized_sqlite_single_row" => {
+                    let mut gconn = SqliteConnection::connect_with(
+                        &SqliteConnectOptions::new().filename(&git_db),
+                    )
+                    .await
+                    .expect("open git_db for oversized row");
+                    let too_big = "Z".repeat(FORWARD_MIGRATION_MAX_SINGLE_ROW_BYTES + 1024);
+                    sea_orm::sqlx::query(
+                        "INSERT INTO config_kv (key, value, encrypted) VALUES ('oversized.single.row', ?, 0)",
+                    )
+                    .bind(&too_big)
+                    .execute(&mut gconn)
+                    .await
+                    .expect("insert oversized config_kv row");
+                    gconn.close().await.expect("close oversized row conn");
+                    switch_fixture_db_to_delete_mode(&git_db).await;
+                }
+                "unsupported_spool_version" => {
+                    let ready = capture_spool_dir_path(&storage).join(CAPTURE_SPOOL_READY_SUBDIR);
+                    fs::create_dir_all(&ready).expect("create spool ready");
+                    let bad = serde_json::json!({ "version": 2 });
+                    fs::write(
+                        ready.join("1-0001~v2"),
+                        serde_json::to_vec(&bad).expect("encode bad v2"),
+                    )
+                    .expect("write bad v2");
+                }
+                "missing_spool_hook_name" => {
+                    let ready = capture_spool_dir_path(&storage).join(CAPTURE_SPOOL_READY_SUBDIR);
+                    fs::create_dir_all(&ready).expect("create spool ready");
+                    let mut val: serde_json::Value =
+                        serde_json::from_slice(&build_spool_envelope_bytes(
+                            "codex",
+                            "codex",
+                            "22222222-2222-4222-8222-222222222202",
+                            Some("dedup:nohook"),
+                            "prov-nohook",
+                            "/work/nohook",
+                            &storage,
+                            "session_start",
+                            "2026-11-22T01:00:00Z",
+                            "",
+                        ))
+                        .expect("parse base spool");
+                    val.as_object_mut().expect("obj").remove("hook_name");
+                    fs::write(
+                        ready.join("1-0001~nohook"),
+                        serde_json::to_vec(&val).expect("encode nohook"),
+                    )
+                    .expect("write nohook");
+                }
+                "mismatched_spool_provider_binding" => {
+                    let ready = capture_spool_dir_path(&storage).join(CAPTURE_SPOOL_READY_SUBDIR);
+                    fs::create_dir_all(&ready).expect("create spool ready");
+                    let mut val: serde_json::Value =
+                        serde_json::from_slice(&build_spool_envelope_bytes(
+                            "codex",
+                            "codex",
+                            "22222222-2222-4222-8222-222222222203",
+                            Some("dedup:mismatch"),
+                            "prov-mismatch",
+                            "/work/mismatch",
+                            &storage,
+                            "session_start",
+                            "2026-11-22T01:00:00Z",
+                            "",
+                        ))
+                        .expect("parse base spool");
+                    val.as_object_mut()
+                        .expect("obj")
+                        .insert("agent_kind".to_string(), serde_json::json!("claude_code"));
+                    fs::write(
+                        ready.join("1-0001~mismatch"),
+                        serde_json::to_vec(&val).expect("encode mismatch"),
+                    )
+                    .expect("write mismatch");
+                }
+                "unknown_spool_hook_command" => {
+                    let ready = capture_spool_dir_path(&storage).join(CAPTURE_SPOOL_READY_SUBDIR);
+                    fs::create_dir_all(&ready).expect("create spool ready");
+                    let bytes = build_spool_envelope_bytes_ex(
+                        "codex",
+                        "codex",
+                        "bogus-command",
+                        "22222222-2222-4222-8222-222222222204",
+                        Some("dedup:badcmd"),
+                        "prov-badcmd",
+                        "/work/badcmd",
+                        &storage,
+                        "session_start",
+                        "2026-11-22T01:00:00Z",
+                        64,
+                        serde_json::json!({ "kind": "absent" }),
+                        "",
+                    );
+                    fs::write(ready.join("1-0001~badcmd"), bytes).expect("write badcmd");
+                }
+                "unknown_spool_identity_scheme" => {
+                    let ready = capture_spool_dir_path(&storage).join(CAPTURE_SPOOL_READY_SUBDIR);
+                    fs::create_dir_all(&ready).expect("create spool ready");
+                    let mut val: serde_json::Value =
+                        serde_json::from_slice(&build_spool_envelope_bytes(
+                            "codex",
+                            "codex",
+                            "22222222-2222-4222-8222-222222222205",
+                            Some("dedup:badscheme"),
+                            "prov-badscheme",
+                            "/work/badscheme",
+                            &storage,
+                            "session_start",
+                            "2026-11-22T01:00:00Z",
+                            "",
+                        ))
+                        .expect("parse base spool");
+                    val.as_object_mut().expect("obj").insert(
+                        "identity_scheme".to_string(),
+                        serde_json::json!("forged_scheme_v99"),
+                    );
+                    fs::write(
+                        ready.join("1-0001~badscheme"),
+                        serde_json::to_vec(&val).expect("encode badscheme"),
+                    )
+                    .expect("write badscheme");
+                }
+                "cross_repo_spool_storage_path" => {
+                    let other_dir = tempdir().expect("create foreign repo dir");
+                    let ready = capture_spool_dir_path(&storage).join(CAPTURE_SPOOL_READY_SUBDIR);
+                    fs::create_dir_all(&ready).expect("create spool ready");
+                    let bytes = build_spool_envelope_bytes(
+                        "codex",
+                        "codex",
+                        "22222222-2222-4222-8222-222222222201",
+                        Some("dedup:foreign"),
+                        "prov-foreign",
+                        "/work/foreign",
+                        &other_dir.path().join(".libra"),
+                        "session_start",
+                        "2026-11-22T01:00:00Z",
+                        "",
+                    );
+                    fs::write(ready.join("1-0001~foreign"), bytes).expect("write foreign spool");
+                }
+                "writable_spool_tombstone" => {
+                    let spool_dir = capture_spool_dir_path(&storage);
+                    fs::create_dir_all(&spool_dir).expect("create spool dir");
+                    let ready_tomb = spool_dir.join(CAPTURE_SPOOL_READY_SUBDIR);
+                    fs::write(&ready_tomb, CAPTURE_SPOOL_TOMBSTONE_SENTINEL)
+                        .expect("write writable sentinel");
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt as _;
+                        fs::set_permissions(&ready_tomb, fs::Permissions::from_mode(0o600))
+                            .expect("chmod writable 0600");
+                    }
+                }
+                #[cfg(unix)]
+                "fifo_in_spool_ready" => {
+                    use std::{ffi::CString, os::unix::ffi::OsStrExt as _};
+                    let ready = capture_spool_dir_path(&storage).join(CAPTURE_SPOOL_READY_SUBDIR);
+                    fs::create_dir_all(&ready).expect("create spool ready");
+                    let fifo_path = ready.join("1-0001~malicious-fifo");
+                    let c_fifo = CString::new(fifo_path.as_os_str().as_bytes()).expect("cstr fifo");
+                    // SAFETY: `c_fifo` is NUL-terminated.
+                    let rc = unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) };
+                    assert_eq!(rc, 0, "mkfifo must succeed");
+                }
+                "corrupt_committed_queue_frame" => {
+                    let _ = init_capture_queue(&storage).expect("init queue");
+                    append_postcard_frame(
+                        &storage,
+                        CaptureQueueLane::Normal,
+                        FRAME_FLAG_NONE,
+                        "dedup:corrupt:1",
+                        CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                        &CaptureBatchPayload::AppendAuditLog(AgentAuditLogRecord {
+                            audit_id: "aud-corrupt".to_string(),
+                            timestamp: "2026-11-22T04:00:00Z".to_string(),
+                            user_id: None,
+                            user_name: None,
+                            action: "export".to_string(),
+                            checkpoint_id: "cp-1".to_string(),
+                            scope: "committed".to_string(),
+                            export_path: None,
+                            justification: None,
+                            granted: true,
+                        }),
+                    )
+                    .expect("append valid frame");
+                    // Flip a byte inside committed segment `seg-00000000.log` without touching LTM2.
+                    let seg_path = capture_queue_dir_path(&storage)
+                        .join(QUEUE_LANE_NORMAL_DIR)
+                        .join(segment_log_file_name(0));
+                    let mut raw = fs::read(&seg_path).expect("read seg 0");
+                    raw[16] ^= 0xff;
+                    fs::write(&seg_path, raw).expect("corrupt seg 0");
+                }
+                "conflicting_audit_overwrite" => {
+                    let _ = init_capture_queue(&storage).expect("init queue");
+                    append_postcard_frame(
+                        &storage,
+                        CaptureQueueLane::Priority,
+                        FRAME_FLAG_PRIORITY,
+                        "dedup:conflict:audit:1",
+                        CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                        &CaptureBatchPayload::AppendAuditLog(AgentAuditLogRecord {
+                            audit_id: "aud-1".to_string(),
+                            timestamp: "2026-11-21T00:05:00Z".to_string(),
+                            user_id: Some("u1".to_string()),
+                            user_name: Some("Ada".to_string()),
+                            action: "export".to_string(),
+                            checkpoint_id: "cp-1".to_string(),
+                            scope: "committed".to_string(),
+                            export_path: None,
+                            justification: Some("TAMPERED_AUDIT_OVERWRITE".to_string()),
+                            granted: true,
+                        }),
+                    )
+                    .expect("append conflicting audit frame");
+                }
+                _ => unreachable!(),
+            }
+
+            let spool_snap = snapshot_tree_bytes(&capture_spool_dir_path(&storage));
+            let queue_snap = snapshot_tree_bytes(&capture_queue_dir_path(&storage));
+
+            let mut guard = quiesce_forward_repository_phase1(&storage)
+                .await
+                .expect("quiesce negative case");
+            let err =
+                export_forward_phase1_to_redb_tmp(&mut guard, &storage, INITIAL_STORAGE_GENERATION)
+                    .await
+                    .expect_err(&format!("negative case `{case_name}` must fail closed"));
+            guard.close().await.expect("close negative case guard");
+
+            assert_eq!(
+                err.stable_code_str(),
+                "LBR-IO-001",
+                "case `{case_name}` must return LBR-IO-001, got {err:?}"
+            );
+            if case_name == "conflicting_audit_overwrite" {
+                assert!(
+                    err.to_string().contains(CAPTURE_APPEND_ONLY_ERROR_PREFIX),
+                    "conflicting audit overwrite must surface append-only error, got {err}"
+                );
+            }
+            assert!(
+                !err.to_string().contains(storage.to_string_lossy().as_ref()),
+                "case `{case_name}` leaked raw storage path: {err}"
+            );
+            assert!(
+                !git_redb_tmp_path(&storage, INITIAL_STORAGE_GENERATION).exists(),
+                "case `{case_name}` must clean up git .tmp on failure"
+            );
+            assert!(
+                !capture_redb_tmp_path(&storage, INITIAL_STORAGE_GENERATION).exists(),
+                "case `{case_name}` must clean up capture .tmp on failure"
+            );
+            assert_eq!(
+                snapshot_tree_bytes(&capture_spool_dir_path(&storage))
+                    .into_iter()
+                    .filter(|(k, _)| !k.ends_with(CAPTURE_SPOOL_CAPACITY_LOCK_FILE))
+                    .collect::<BTreeMap<_, _>>(),
+                spool_snap
+                    .into_iter()
+                    .filter(|(k, _)| !k.ends_with(CAPTURE_SPOOL_CAPACITY_LOCK_FILE))
+                    .collect::<BTreeMap<_, _>>(),
+                "case `{case_name}` must not mutate capture-spool/"
+            );
+            assert_eq!(
+                snapshot_tree_bytes(&capture_queue_dir_path(&storage))
+                    .into_iter()
+                    .filter(|(k, _)| {
+                        !k.ends_with(QUEUE_APPEND_LOCK_FILE) && !k.ends_with(QUEUE_WRITER_LOCK_FILE)
+                    })
+                    .collect::<BTreeMap<_, _>>(),
+                queue_snap
+                    .into_iter()
+                    .filter(|(k, _)| {
+                        !k.ends_with(QUEUE_APPEND_LOCK_FILE) && !k.ends_with(QUEUE_WRITER_LOCK_FILE)
+                    })
+                    .collect::<BTreeMap<_, _>>(),
+                "case `{case_name}` must not mutate capture-queue/"
+            );
+        }
+    }
+
+    const RB10I_BUDGET_CHILD_STORAGE_ENV: &str = "LIBRA_RB10I_BUDGET_CHILD_STORAGE";
+    const RB10I_BUDGET_CHILD_OK_MARKER: &str = "RB10I_BUDGET_CHILD_OK";
+
+    /// Fail-closed OS kernel/process memory measurement returning
+    /// `(current_live_bytes, process_peak_bytes)` for `RB-10i` AC4.
+    ///
+    /// Never silently returns `0` on failure:
+    /// - macOS: `libc::proc_pid_rusage(..., RUSAGE_INFO_V4)` returns
+    ///   `(ri_phys_footprint, ri_lifetime_max_phys_footprint)` — exact XNU
+    ///   kernel-tracked physical memory footprint and lifetime peak across
+    ///   every single allocation/page fault with zero sampling blind spots.
+    /// - Linux: `/proc/self/status` (`VmRSS`, `VmHWM`) captures kernel-tracked
+    ///   peak resident memory across the entire child process.
+    /// - Windows: `K32GetProcessMemoryInfo` (`pagefile_usage`, `peak_pagefile_usage`)
+    ///   captures kernel-tracked peak private commit.
+    fn measure_process_live_and_peak_heap() -> Result<(usize, usize), String> {
+        #[cfg(target_os = "macos")]
+        {
+            let mut ri = std::mem::MaybeUninit::<libc::rusage_info_v4>::zeroed();
+            // SAFETY: `ri` is a zeroed `libc::rusage_info_v4` buffer matching
+            // `libc::RUSAGE_INFO_V4` for the current process PID.
+            let rc = unsafe {
+                libc::proc_pid_rusage(libc::getpid(), libc::RUSAGE_INFO_V4, ri.as_mut_ptr().cast())
+            };
+            if rc != 0 {
+                return Err(format!(
+                    "proc_pid_rusage(RUSAGE_INFO_V4) failed: {}",
+                    io::Error::last_os_error()
+                ));
+            }
+            // SAFETY: `proc_pid_rusage` succeeded and initialized `ri`.
+            let ri = unsafe { ri.assume_init() };
+            let live = usize::try_from(ri.ri_phys_footprint)
+                .map_err(|_| "ri_phys_footprint overflowed usize".to_string())?;
+            let peak = usize::try_from(ri.ri_lifetime_max_phys_footprint)
+                .map_err(|_| "ri_lifetime_max_phys_footprint overflowed usize".to_string())?;
+            if live == 0 || peak == 0 {
+                return Err("proc_pid_rusage returned zero footprint metrics".to_string());
+            }
+            Ok((live, peak))
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let status = fs::read_to_string("/proc/self/status")
+                .map_err(|e| format!("failed to read /proc/self/status: {e}"))?;
+            let parse_kb = |key: &str| -> Option<usize> {
+                status.lines().find_map(|line| {
+                    let rest = line.strip_prefix(key)?;
+                    let kb = rest.split_whitespace().next()?.parse::<usize>().ok()?;
+                    Some(kb.saturating_mul(1024))
+                })
+            };
+            let live = parse_kb("VmRSS:")
+                .or_else(|| parse_kb("RssAnon:"))
+                .ok_or_else(|| "missing VmRSS/RssAnon in /proc/self/status".to_string())?;
+            let peak = parse_kb("VmHWM:")
+                .ok_or_else(|| "missing VmHWM in /proc/self/status".to_string())?;
+            if live == 0 || peak == 0 {
+                return Err("Linux /proc/self/status returned zero memory metrics".to_string());
+            }
+            Ok((live, peak))
+        }
+        #[cfg(windows)]
+        {
+            #[repr(C)]
+            #[derive(Default)]
+            struct ProcessMemoryCounters {
+                cb: u32,
+                page_fault_count: u32,
+                peak_working_set_size: usize,
+                working_set_size: usize,
+                quota_peak_paged_pool_usage: usize,
+                quota_paged_pool_usage: usize,
+                quota_peak_non_paged_pool_usage: usize,
+                quota_non_paged_pool_usage: usize,
+                pagefile_usage: usize,
+                peak_pagefile_usage: usize,
+            }
+            #[link(name = "kernel32")]
+            unsafe extern "system" {
+                fn GetCurrentProcess() -> *mut std::ffi::c_void;
+                fn K32GetProcessMemoryInfo(
+                    process: *mut std::ffi::c_void,
+                    ppsmem_counters: *mut ProcessMemoryCounters,
+                    cb: u32,
+                ) -> i32;
+            }
+            let mut counters = ProcessMemoryCounters {
+                cb: std::mem::size_of::<ProcessMemoryCounters>() as u32,
+                ..Default::default()
+            };
+            // SAFETY: `counters` is properly sized and valid for the current process handle.
+            let ok =
+                unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) };
+            if ok == 0 || counters.pagefile_usage == 0 || counters.peak_pagefile_usage == 0 {
+                return Err("K32GetProcessMemoryInfo failed or returned zero".to_string());
+            }
+            Ok((counters.pagefile_usage, counters.peak_pagefile_usage))
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+        {
+            Err("process peak memory measurement is unsupported on this platform".to_string())
+        }
+    }
+
+    /// `RB-10i` AC3 & AC4:
+    /// - AC3: Every single committed streaming batch across SQLite table
+    ///   exports, spool direct ingest, and queue direct ingest is strictly
+    ///   `<= 500` rows/items (`max_batch_rows == 500`), AND wide-row SQLite
+    ///   tables (`256 KiB` rows) are byte-bounded (`<= 4 MiB` / `<= 16` rows).
+    /// - AC4: Streaming export of a genuine `> 90 MiB` large-repo fixture
+    ///   (including `256 KiB` wide SQLite rows, a `10 MiB` spool envelope, and
+    ///   `3.2 MiB` near-limit queue frames) executed inside an **isolated fresh
+    ///   child subprocess** keeps fail-closed OS/allocator peak extra heap
+    ///   strictly `<= 64 MiB` (`FORWARD_MIGRATION_EXTRA_HEAP_BUDGET_BYTES`).
+    #[tokio::test]
+    async fn forward_phase1_streaming_batch_memory_budget() {
+        use crate::storage::{
+            CaptureStore, ConfigStore, FRAME_FLAG_NONE, FRAME_FLAG_PRIORITY, GitStateStore,
+            RedbConfigStore, RedbGitStateStore, SqliteCaptureStore, append_postcard_frame,
+            init_capture_queue, manifest::INITIAL_STORAGE_GENERATION,
+        };
+
+        // Isolated fresh child subprocess entry point: never allocated the
+        // 90+ MiB test fixture, so OS/allocator peak counters capture EVERY
+        // microsecond of migration heap activity with zero sampling blind spots.
+        if let Some(child_storage_os) = std::env::var_os(RB10I_BUDGET_CHILD_STORAGE_ENV) {
+            let storage = PathBuf::from(child_storage_os);
+            let (baseline_live, _baseline_peak) = measure_process_live_and_peak_heap()
+                .expect("fail-closed baseline memory measurement in child process");
+
+            let mut observed_batches: Vec<(&'static str, usize)> = Vec::new();
+            let mut observer = |source: &'static str, batch_len: usize| {
+                observed_batches.push((source, batch_len));
+            };
+
+            let mut guard = quiesce_forward_repository_phase1(&storage)
+                .await
+                .expect("child quiesce large-repo fixture");
+            let report = export_forward_phase1_to_redb_tmp_with_observer(
+                &mut guard,
+                &storage,
+                INITIAL_STORAGE_GENERATION,
+                &mut observer,
+            )
+            .await
+            .expect("child stream-export large-repo fixture within budget");
+            guard.close().await.expect("child close large-repo guard");
+
+            let (_end_live, process_peak) = measure_process_live_and_peak_heap()
+                .expect("fail-closed peak memory measurement in child process");
+            assert!(
+                process_peak > baseline_live,
+                "fail-closed peak measurement must reflect genuine allocation activity (baseline={baseline_live}, peak={process_peak})"
+            );
+            let extra_heap_peak = process_peak.saturating_sub(baseline_live);
+
+            // AC3: Every single committed batch is strictly `1..=500`, 500-row
+            // batches were exercised, AND wide-row `config_kv` (`256 KiB` rows)
+            // was byte-bounded strictly below 500 rows/batch.
+            assert_eq!(
+                observed_batches.len() as u64,
+                report.total_streaming_batches,
+                "observer must see every committed streaming batch"
+            );
+            assert!(
+                report.total_streaming_batches >= 35,
+                "expected >= 35 streaming batches across wide/bulk tables + spool + queue, got {}",
+                report.total_streaming_batches
+            );
+            assert_eq!(
+                report.max_batch_rows, FORWARD_MIGRATION_STREAM_BATCH_ROWS,
+                "multi-thousand-row tables must hit and strictly cap at 500 rows/batch"
+            );
+            let mut config_kv_batches: Vec<usize> = Vec::new();
+            for &(source, batch_len) in &observed_batches {
+                assert!(
+                    (1..=FORWARD_MIGRATION_STREAM_BATCH_ROWS).contains(&batch_len),
+                    "AC3 violation: batch on `{source}` had {batch_len} rows (> {FORWARD_MIGRATION_STREAM_BATCH_ROWS})"
+                );
+                if source == "config_kv" {
+                    config_kv_batches.push(batch_len);
+                }
+                if matches!(
+                    source,
+                    "capture_spool_ready" | "capture_queue_priority" | "capture_queue_normal"
+                ) {
+                    assert!(
+                        batch_len <= FORWARD_MIGRATION_QUEUE_INGEST_BATCH_ITEMS,
+                        "direct-ingest batch on `{source}` had {batch_len} items (> {FORWARD_MIGRATION_QUEUE_INGEST_BATCH_ITEMS})"
+                    );
+                }
+            }
+            // Without 2 MiB byte-bounded batching, 525 tiny baseline rows + 220 wide
+            // 256 KiB rows = 745 rows would produce only 2 batches (500 + 245). With
+            // byte-bounded streaming, the 220 wide rows MUST split into >= 25 batches
+            // of <= 8 rows each (`total >= 28` batches).
+            let wide_small_batches = config_kv_batches.iter().filter(|&&n| n <= 8).count();
+            assert!(
+                config_kv_batches.len() >= 28 && wide_small_batches >= 25,
+                "wide 256 KiB config_kv rows must trigger 2 MiB byte-bounded splitting (<= 8 rows/batch), got batches={config_kv_batches:?}"
+            );
+            assert_eq!(report.spool_ingest.files_read, 300);
+            assert_eq!(report.spool_ingest.applied_events, 300);
+            assert_eq!(report.queue_ingest.priority_frames_read, 163);
+            assert_eq!(report.queue_ingest.normal_frames_read, 300);
+            assert_eq!(report.queue_ingest.applied_frames, 463);
+
+            // AC4: Peak extra heap strictly `<= 64 MiB`.
+            assert!(
+                extra_heap_peak <= FORWARD_MIGRATION_EXTRA_HEAP_BUDGET_BYTES,
+                "AC4 violation: extra heap peak {extra_heap_peak} bytes ({:.2} MiB) exceeded 64 MiB budget (baseline={baseline_live}, peak={process_peak})",
+                extra_heap_peak as f64 / (1024.0 * 1024.0)
+            );
+            println!(
+                "{RB10I_BUDGET_CHILD_OK_MARKER} baseline={baseline_live} peak={process_peak} extra={extra_heap_peak} max_batch={} total_batches={}",
+                report.max_batch_rows, report.total_streaming_batches
+            );
+            return;
+        }
+
+        let dir = tempdir().expect("create RB-10i large-repo budget tempdir");
+        let storage = dir.path().join(".libra");
+        let git_db = git_sqlite_db_path(&storage);
+        let cap_db = capture_sqlite_db_path(&storage);
+
+        // Build base Layout C schema + baseline rows.
+        populate_all_61_repository_tables(&git_db).await;
+        detach_inline_capture_tables(&git_db).await;
+        {
+            let _cap_store = SqliteCaptureStore::create(&cap_db)
+                .await
+                .expect("create large-repo capture.db");
+        }
+        populate_capture_rows_via_sql(&cap_db, 0, None).await;
+
+        // Bulk-seed > 70 MiB of repository SQLite rows:
+        // - `config_kv`: 220 wide rows * 256 KiB (~56.3 MiB) -> tests 4 MiB byte-bounded SQLite batching!
+        // - `memory_episode`: 1,600 rows * 8 KiB (~13.1 MiB) -> tests multi-batch streaming!
+        // - `reflog`: 1,150 rows -> hits exact 500 rows/batch (`500, 500, 150`)!
+        {
+            let mut gconn =
+                SqliteConnection::connect_with(&SqliteConnectOptions::new().filename(&git_db))
+                    .await
+                    .expect("open git_db for bulk seed");
+            let payload_256k = "W".repeat(256 * 1024);
+            let payload_8k = "X".repeat(8 * 1024);
+            gconn
+                .execute("BEGIN IMMEDIATE")
+                .await
+                .expect("begin git bulk");
+            for i in 0..220usize {
+                sea_orm::sqlx::query(
+                    "INSERT INTO config_kv (key, value, encrypted) VALUES (?, ?, 0)",
+                )
+                .bind(format!("bulk.budget.key.{i:05}"))
+                .bind(&payload_256k)
+                .execute(&mut gconn)
+                .await
+                .expect("insert wide config_kv");
+            }
+            // Seed 16 CONSECUTIVE near-cap `3.5 MiB` wide SQLite rows (`56 MiB`
+            // total, `87.5%` of `FORWARD_MIGRATION_MAX_SINGLE_ROW_BYTES`) —
+            // without `max_safe_query_rows` bounding SQLx's default 50-row
+            // worker prefetch channel, 16 × 3.5 MiB rows would buffer 56 MiB
+            // inside SQLx alone plus decoded/redb copies and exceed the 64 MiB
+            // kernel physical footprint budget!
+            let payload_near_cap = "V".repeat(3_584 * 1024);
+            for w in 0..16usize {
+                sea_orm::sqlx::query(
+                    "INSERT INTO config_kv (key, value, encrypted) VALUES (?, ?, 0)",
+                )
+                .bind(format!("bulk.budget.near_cap_3_5m.{w:02}"))
+                .bind(&payload_near_cap)
+                .execute(&mut gconn)
+                .await
+                .expect("insert consecutive near-cap 3.5 MiB wide config_kv");
+            }
+            drop(payload_near_cap);
+            for i in 0..1_600usize {
+                sea_orm::sqlx::query(
+                    "INSERT INTO memory_episode (episode_id, repo_id, source_kind, source_key, outcome, actor, started_at, ended_at, anchor_commit, change_id, title, body, content_digest, producer, rules_version) VALUES (?, 'repo-1', 'commit', ?, 'succeeded', 'ada', ?, ?, NULL, NULL, ?, ?, ?, 'test', 1)",
+                )
+                .bind(format!("ep-bulk-{i:05}"))
+                .bind(format!("src-bulk-{i:05}"))
+                .bind(1_795_600_000i64 + i as i64)
+                .bind(1_795_600_001i64 + i as i64)
+                .bind(format!("Bulk Episode {i}"))
+                .bind(&payload_8k)
+                .bind(format!("sha256:bulk-{i:05}"))
+                .execute(&mut gconn)
+                .await
+                .expect("insert bulk memory_episode");
+            }
+            for i in 0..1_150usize {
+                sea_orm::sqlx::query(
+                    "INSERT INTO reflog (ref_name, old_oid, new_oid, committer_name, committer_email, timestamp, action, message) VALUES ('HEAD', '1111111111111111111111111111111111111111', '2222222222222222222222222222222222222222', 'Ada', 'ada@example.com', ?, 'commit', ?)",
+                )
+                .bind(1_795_610_000i64 + i as i64)
+                .bind(format!("bulk reflog entry #{i:04}"))
+                .execute(&mut gconn)
+                .await
+                .expect("insert bulk reflog");
+            }
+            gconn.execute("COMMIT").await.expect("commit git bulk");
+            gconn.close().await.expect("close git bulk conn");
+        }
+
+        // Bulk-seed `capture.db`:
+        // - `agent_session_commit`: 1,100 rows -> hits exact 500 rows/batch
+        // - `agent_usage_stats`: 650 rows * 12 KiB (~7.8 MiB)
+        {
+            let mut cconn =
+                SqliteConnection::connect_with(&SqliteConnectOptions::new().filename(&cap_db))
+                    .await
+                    .expect("open cap_db for bulk seed");
+            let intent_12k = "Y".repeat(12 * 1024);
+            cconn
+                .execute("BEGIN IMMEDIATE")
+                .await
+                .expect("begin cap bulk");
+            for i in 0..1_100usize {
+                let oid = format!("{i:040x}");
+                sea_orm::sqlx::query(
+                    "INSERT INTO agent_session_commit (session_id, hash_kind, commit_oid) VALUES ('sess-1', 'sha1', ?)",
+                )
+                .bind(oid)
+                .execute(&mut cconn)
+                .await
+                .expect("insert bulk agent_session_commit");
+            }
+            for i in 0..650usize {
+                sea_orm::sqlx::query(
+                    "INSERT INTO agent_usage_stats (id, session_id, provider, model, request_kind, intent, prompt_tokens, completion_tokens, cached_tokens, reasoning_tokens, total_tokens, tool_call_count, wall_clock_ms, usage_estimated, success, schema_version, created_at) VALUES (?, 'sess-1', 'openai', 'gpt-5', 'chat', ?, 10, 20, 0, 0, 30, 1, 50, 0, 1, 1, '2026-11-22T05:00:00Z')",
+                )
+                .bind(format!("usage-bulk-{i:04}"))
+                .bind(&intent_12k)
+                .execute(&mut cconn)
+                .await
+                .expect("insert bulk agent_usage_stats");
+            }
+            cconn.execute("COMMIT").await.expect("commit cap bulk");
+            cconn.close().await.expect("close cap bulk conn");
+        }
+
+        switch_fixture_db_to_delete_mode(&git_db).await;
+        switch_fixture_db_to_delete_mode(&cap_db).await;
+
+        // Seed 300 pending `capture-spool/ready/` files exercising BOTH:
+        // - Envelope 0: huge retained fields (`10 MiB` prompt + `2 MiB` session_ref
+        //   + `2 MiB` tool_link.tool + `2 MiB` child_hints.child_path + `2 MiB`
+        //   tool_input = `> 18 MiB` single JSON envelope!)
+        // - Envelopes 1..251: **250 events all targeting ONE single session**
+        //   (`prov-bulk-single-session`) with rich replay fields + subsecond
+        //   timestamps, proving single-session receipt ingestion stays O(1) RAM!
+        // - Envelopes 251..300: 49 distinct sessions (`prov-bulk-spool-{i:04}`).
+        let spool_ready = capture_spool_dir_path(&storage).join(CAPTURE_SPOOL_READY_SUBDIR);
+        fs::create_dir_all(&spool_ready).expect("create bulk spool ready dir");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(
+                storage.join(PRIVATE_SUBDIR),
+                fs::Permissions::from_mode(0o700),
+            )
+            .expect("chmod private 0700");
+            fs::set_permissions(
+                capture_spool_dir_path(&storage),
+                fs::Permissions::from_mode(0o700),
+            )
+            .expect("chmod spool 0700");
+            fs::set_permissions(&spool_ready, fs::Permissions::from_mode(0o700))
+                .expect("chmod spool ready 0700");
+        }
+        {
+            let spool_pad_10m = "M".repeat(10 * 1024 * 1024);
+            let huge_field_2m = "H".repeat(2 * 1024 * 1024);
+            let huge_envelope = serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "agent_kind": "codex",
+                "hook_name": "codex",
+                "hook_command": "prompt",
+                "provider_kind": "codex",
+                "provider_source": "codex_hook",
+                "frame_bytes": 18 * 1024 * 1024,
+                "event_id": "33333333-3333-4333-8333-000000000000",
+                "identity_scheme": "generic_lifecycle_uuid_v5",
+                "dedup_key": "dedup:bulk:spool:0000",
+                "hook_deadline": false,
+                "display_batch_limit": null,
+                "tool_link": { "tool": &huge_field_2m, "parent": null },
+                "child_hints": {
+                    "kind": "candidate",
+                    "role": "boundary",
+                    "child_path": &huge_field_2m,
+                    "child_id": "bulk-huge-child",
+                },
+                "context": {
+                    "provider_session_id": "prov-bulk-spool-0000",
+                    "working_dir": "/work/bulk",
+                    "storage_path": storage.display().to_string(),
+                    "worktree_root": "/work/bulk",
+                },
+                "event": {
+                    "kind": "turn_start",
+                    "session_id": "prov-bulk-spool-0000",
+                    "session_ref": &huge_field_2m,
+                    "prompt": &spool_pad_10m,
+                    "model": null,
+                    "source": null,
+                    "tool_name": null,
+                    "tool_input": { "blob": &huge_field_2m },
+                    "tool_response": null,
+                    "assistant_message": null,
+                    "timestamp": "2026-11-22T06:00:00Z",
+                },
+                "redaction": {
+                    "matches": [],
+                    "bytes_scanned": 18 * 1024 * 1024,
+                    "bytes_redacted": 0,
+                },
+            }))
+            .expect("encode huge retained-field bulk spool envelope");
+            fs::write(spool_ready.join("1-000000~bulk-spool-0000"), huge_envelope)
+                .expect("write huge bulk spool file");
+        }
+        let spool_pad = "S".repeat(8 * 1024);
+        for i in 1..300usize {
+            let uuid = format!("33333333-3333-4333-8333-{i:012}");
+            let (prov_sid, ts_str, kind) = if i <= 250 {
+                (
+                    "prov-bulk-single-session".to_string(),
+                    format!("2026-11-22T06:00:01.{:03}Z", i * 3),
+                    if i == 250 {
+                        "session_end"
+                    } else {
+                        "turn_start"
+                    },
+                )
+            } else {
+                (
+                    format!("prov-bulk-spool-{i:04}"),
+                    "2026-11-22T06:00:02Z".to_string(),
+                    "turn_start",
+                )
+            };
+            let bytes = build_spool_envelope_bytes_ex(
+                "codex",
+                "codex",
+                if kind == "session_end" {
+                    "session-end"
+                } else {
+                    "observe"
+                },
+                &uuid,
+                Some(&format!("dedup:bulk:spool:{i:04}")),
+                &prov_sid,
+                "/work/bulk",
+                &storage,
+                kind,
+                &ts_str,
+                8 * 1024 + i,
+                serde_json::json!({
+                    "kind": "candidate",
+                    "role": "current",
+                    "child_id": format!("bulk-child-{i:04}"),
+                }),
+                &spool_pad,
+            );
+            let p = spool_ready.join(format!("1-{i:06}~bulk-spool-{i:04}"));
+            fs::write(&p, bytes).expect("write bulk spool file");
+        }
+
+        // Seed 463 pending `capture-queue/` frames:
+        // - 3 × 3.2 MiB near-limit frames + 160 × 8 KiB frames in `priority/`
+        // - 300 × 8 KiB frames in `normal/`
+        let _ = init_capture_queue(&storage).expect("init bulk capture queue");
+        let queue_pad_3m = "P".repeat(3_200 * 1024);
+        let queue_pad = "Q".repeat(8 * 1024);
+        for i in 0..163usize {
+            let intent_pad = if i < 3 {
+                queue_pad_3m.clone()
+            } else {
+                queue_pad.clone()
+            };
+            let rec = AgentUsageStatsRecord {
+                id: format!("usage-qprio-{i:04}"),
+                session_id: Some("sess-1".to_string()),
+                thread_id: None,
+                agent_run_id: None,
+                run_id: None,
+                provider: "openai".to_string(),
+                model: "gpt-5".to_string(),
+                request_kind: "chat".to_string(),
+                intent: Some(intent_pad),
+                prompt_tokens: 1,
+                completion_tokens: 2,
+                cached_tokens: 0,
+                reasoning_tokens: 0,
+                total_tokens: 3,
+                tool_call_count: 0,
+                wall_clock_ms: 10,
+                provider_latency_ms: None,
+                cost_estimate_micro_dollars: None,
+                cost_usd: None,
+                usage_estimated: false,
+                started_at: None,
+                finished_at: None,
+                success: true,
+                error_kind: None,
+                schema_version: 1,
+                created_at: "2026-11-22T06:10:00Z".to_string(),
+                agent_name: None,
+                repo_id: None,
+                turn_id: None,
+                event_id: None,
+            };
+            append_postcard_frame(
+                &storage,
+                CaptureQueueLane::Priority,
+                FRAME_FLAG_PRIORITY,
+                &format!("dedup:bulk:qprio:{i:04}"),
+                CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                &CaptureBatchPayload::InsertUsageStats(rec),
+            )
+            .expect("append bulk priority queue frame");
+        }
+        for i in 0..300usize {
+            let rec = AgentUsageStatsRecord {
+                id: format!("usage-qnorm-{i:04}"),
+                session_id: Some("sess-1".to_string()),
+                thread_id: None,
+                agent_run_id: None,
+                run_id: None,
+                provider: "openai".to_string(),
+                model: "gpt-5".to_string(),
+                request_kind: "chat".to_string(),
+                intent: Some(queue_pad.clone()),
+                prompt_tokens: 1,
+                completion_tokens: 2,
+                cached_tokens: 0,
+                reasoning_tokens: 0,
+                total_tokens: 3,
+                tool_call_count: 0,
+                wall_clock_ms: 10,
+                provider_latency_ms: None,
+                cost_estimate_micro_dollars: None,
+                cost_usd: None,
+                usage_estimated: false,
+                started_at: None,
+                finished_at: None,
+                success: true,
+                error_kind: None,
+                schema_version: 1,
+                created_at: "2026-11-22T06:20:00Z".to_string(),
+                agent_name: None,
+                repo_id: None,
+                turn_id: None,
+                event_id: None,
+            };
+            append_postcard_frame(
+                &storage,
+                CaptureQueueLane::Normal,
+                FRAME_FLAG_NONE,
+                &format!("dedup:bulk:qnorm:{i:04}"),
+                CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                &CaptureBatchPayload::InsertUsageStats(rec),
+            )
+            .expect("append bulk normal queue frame");
+        }
+        drop(spool_pad);
+        drop(queue_pad_3m);
+        drop(queue_pad);
+
+        // Confirm the source fixture genuinely exceeds 90 MiB on disk (> 64 MiB heap budget!).
+        let mut total_source_bytes = fs::metadata(&git_db)
+            .expect("stat git_db")
+            .len()
+            .saturating_add(fs::metadata(&cap_db).expect("stat cap_db").len());
+        for (_, b) in snapshot_tree_bytes(&capture_spool_dir_path(&storage)) {
+            total_source_bytes = total_source_bytes.saturating_add(b.len() as u64);
+        }
+        for (_, b) in snapshot_tree_bytes(&capture_queue_dir_path(&storage)) {
+            total_source_bytes = total_source_bytes.saturating_add(b.len() as u64);
+        }
+        assert!(
+            total_source_bytes > 90 * 1024 * 1024,
+            "large-repo streaming fixture must exceed 90 MiB on disk to test wide-row + near-limit budgets; got {total_source_bytes} bytes"
+        );
+
+        // Spawn an isolated fresh child test process to run the entire migration
+        // and measure fail-closed OS/allocator peak heap without fixture bias.
+        let exe = std::env::current_exe().expect("locate current test executable");
+        let output = Command::new(exe)
+            .arg("--exact")
+            .arg("storage::migrate::tests::forward_phase1_streaming_batch_memory_budget")
+            .arg("--nocapture")
+            .env(RB10I_BUDGET_CHILD_STORAGE_ENV, &storage)
+            .env("LIBRA_TEST", "1")
+            .output()
+            .expect("spawn isolated RB-10i budget child process");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success()
+                && stdout.contains(RB10I_BUDGET_CHILD_OK_MARKER)
+                && stdout.contains("1 passed; 0 failed"),
+            "isolated RB-10i budget child failed (status={:?}):\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            output.status
+        );
+
+        // Spot-check lossless streaming export across both staged `.tmp` redb targets.
+        let git_tmp_path = git_redb_tmp_path(&storage, INITIAL_STORAGE_GENERATION);
+        let capture_tmp_path = capture_redb_tmp_path(&storage, INITIAL_STORAGE_GENERATION);
+        let cfg = RedbConfigStore::open_read_only(&git_tmp_path, DatabaseRole::Repository)
+            .expect("open large-repo git redb config store");
+        assert!(
+            cfg.get("bulk.budget.key.00000")
+                .await
+                .expect("read first wide config_kv")
+                .is_some_and(|e| e.value.len() == 256 * 1024)
+        );
+        assert!(
+            cfg.get("bulk.budget.key.00219")
+                .await
+                .expect("read last wide config_kv")
+                .is_some_and(|e| e.value.len() == 256 * 1024)
+        );
+        for w in [0usize, 15usize] {
+            assert!(
+                cfg.get(&format!("bulk.budget.near_cap_3_5m.{w:02}"))
+                    .await
+                    .expect("read consecutive near-cap 3.5 MiB wide config_kv")
+                    .is_some_and(|e| e.value.len() == 3_584 * 1024)
+            );
+        }
+        let st = RedbGitStateStore::open_read_only(&git_tmp_path)
+            .expect("open large-repo git state store");
+        assert!(
+            st.get_memory_episode("ep-bulk-01599")
+                .await
+                .expect("read last bulk memory_episode")
+                .is_some_and(|ep| ep.body.len() == 8 * 1024)
+        );
+        let cap = RedbCaptureStore::open_read_only(&capture_tmp_path)
+            .await
+            .expect("open large-repo capture store");
+        assert!(
+            cap.get_usage_stats("usage-bulk-0649")
+                .await
+                .expect("read last bulk sqlite usage")
+                .is_some()
+        );
+        assert!(
+            cap.get_session("codex__prov-bulk-spool-0000")
+                .await
+                .expect("read >18MiB retained-field spool session")
+                .is_some()
+        );
+        let single_session = cap
+            .get_session("codex__prov-bulk-single-session")
+            .await
+            .expect("read 250-event single spool session")
+            .expect("250-event single spool session must exist");
+        assert_eq!(single_session.state, CaptureSessionState::Stopped);
+        assert!(
+            single_session.metadata_json.len() < 1024,
+            "single-session metadata_json must remain O(1) (< 1024 bytes) across 250 spool events; got {} bytes",
+            single_session.metadata_json.len()
+        );
+        let single_receipts = read_migrated_spool_receipts_for_session(
+            &capture_tmp_path,
+            "codex__prov-bulk-single-session",
+        )
+        .expect("read 250 single-session spool receipts");
+        assert_eq!(
+            single_receipts.len(),
+            250,
+            "all 250 single-session spool receipts must be durably stored in MIGRATED_SPOOL_RECEIPTS_TABLE"
+        );
+        assert_eq!(
+            single_receipts[0].timestamp_rfc3339,
+            "2026-11-22T06:00:01.003Z"
+        );
+        assert_eq!(
+            single_receipts[249].timestamp_rfc3339,
+            "2026-11-22T06:00:01.750Z"
+        );
+        assert!(single_receipts[249].needs_checkpoint_materialization);
+        assert!(
+            cap.get_session("codex__prov-bulk-spool-0299")
+                .await
+                .expect("read last bulk spool session")
+                .is_some()
+        );
+        assert!(
+            cap.get_usage_stats("usage-qprio-0002")
+                .await
+                .expect("read 3.2 MiB priority queue usage")
+                .is_some()
+        );
+        assert!(
+            cap.get_usage_stats("usage-qprio-0162")
+                .await
+                .expect("read last bulk priority queue usage")
+                .is_some()
+        );
+        assert!(
+            cap.get_usage_stats("usage-qnorm-0299")
+                .await
+                .expect("read last bulk normal queue usage")
+                .is_some()
+        );
     }
 }

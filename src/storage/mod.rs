@@ -168,17 +168,27 @@ pub use meta::{
 };
 #[cfg(all(feature = "storage-sqlite", feature = "storage-redb"))]
 pub use migrate::{
-    CAPTURE_SPOOL_CONSUMER_LOCK_FILE, CAPTURE_SPOOL_TMP_MAX_AGE,
+    BoundedSpoolJson, BoundedSpoolText, CAPTURE_SPOOL_CONSUMER_LOCK_FILE,
+    CAPTURE_SPOOL_TMP_MAX_AGE, FORWARD_MIGRATION_EXTRA_HEAP_BUDGET_BYTES,
+    FORWARD_MIGRATION_MAX_SINGLE_ROW_BYTES, FORWARD_MIGRATION_QUEUE_INGEST_BATCH_ITEMS,
+    FORWARD_MIGRATION_REDB_CACHE_BYTES, FORWARD_MIGRATION_STREAM_BATCH_MAX_BYTES,
     FORWARD_MIGRATION_STREAM_BATCH_ROWS, ForwardPhase1ExportReport, ForwardPhase1Locks,
     ForwardPhase1QuiesceGuard, ForwardPhase1QuiesceStage, LEGACY_CAPTURE_SQLITE_REL_PATH,
-    LEGACY_INLINE_CAPTURE_TABLES, LegacyRepositoryLayout, MIGRATION_LOCK_FILE,
-    QuiescedRepositorySqliteSources, QuiescedSqliteConnection, SqliteQuiesceStage,
+    LEGACY_INLINE_CAPTURE_TABLES, LegacyRepositoryLayout, MAX_SPOOL_RETAINED_JSON_BYTES,
+    MAX_SPOOL_RETAINED_META_STR_BYTES, MAX_SPOOL_RETAINED_TEXT_BYTES,
+    MIGRATED_SPOOL_ENVELOPE_CHUNKS_TABLE, MIGRATED_SPOOL_RECEIPTS_TABLE, MIGRATION_LOCK_FILE,
+    QueueDirectIngestReport, QuiescedRepositorySqliteSources, QuiescedSqliteConnection,
+    ReconstructedSpoolEnvelope, SpoolChildHintsReceipt, SpoolDirectIngestEventReceipt,
+    SpoolDirectIngestReport, SpoolToolLinkReceipt, SqliteQuiesceStage,
     capture_queue_append_lock_path, capture_queue_dir_path, capture_queue_writer_lock_path,
     capture_redb_tmp_path, capture_spool_capacity_lock_path, capture_spool_consumer_lock_path,
     capture_spool_dir_path, capture_spool_tmp_dir_path, capture_sqlite_db_path,
     export_forward_phase1_to_redb_tmp, git_redb_tmp_path, git_sqlite_db_path,
-    inspect_legacy_repository_layout, migration_lock_path, quiesce_forward_repository_phase1,
-    quiesce_forward_repository_sqlite_sources, quiesce_sqlite_source,
+    inspect_legacy_repository_layout, list_pending_checkpoint_spool_receipts, migration_lock_path,
+    quiesce_forward_repository_phase1, quiesce_forward_repository_sqlite_sources,
+    quiesce_sqlite_source, read_migrated_spool_receipts_for_session,
+    reconstruct_spool_replay_envelope, reconstruct_spool_replay_envelope_lossless,
+    stream_migrated_spool_envelope_to_writer,
 };
 #[cfg(feature = "storage-redb")]
 pub use opener::{
