@@ -89,3 +89,5 @@ revert 当前把文本冲突保存为 stage-0 blob。整树 reset 收尾前也�
 single conflict-label helper
 
 - 2026-11-23（SA-07a / #728）：新增 `LocalChangesWouldBeOverwritten`（`your local changes would be overwritten by revert`，`LBR-CONFLICT-001`，退出码 128）；不带 `-n/--no-commit` 时在目标解析后、任何写入前比较索引树与 HEAD 树（已暂存新增/修改/删除都拒绝），不留 revert 状态；`--no-commit` 路径不变。回归：`revert_staged_changes_refused_without_state`（AC1–AC8）；`revert_test` 42/42、`--lib command::revert` 4/4、`compat_noninteractive_history_controls` 33/33、`compat_error_codes_doc_sync` 2/2。
+
+- 2026-11-23（SA-07 / #728）：移除 detached HEAD 拒绝（`RevertError::DetachedHead` 变体及其映射/单测一并删除）；`update_head` 在 `Head::Detached` 时用 `Head::update_result(Head::Detached(oid))` 提交到 detached 引用，分支路径不变；冲突后的 `--continue`/`--abort` 沿用既有 `restore_to_orig_head`（detached 专项验收登记 `DEFER-SA-12`）。回归：`revert_detached_head_no_edit_tc2634`（AC1–AC4）、`revert_detached_staged_changes_refused_for_local_changes`（AC5–AC6）、`revert_t3501_orphan_detach_leaves_no_state`（AC7–AC8）；`revert_test`+`cherry_pick_test` 135/135、`--lib command::revert` 4/4、`compat_noninteractive_history_controls` 33/33。

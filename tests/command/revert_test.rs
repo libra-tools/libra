@@ -2228,3 +2228,139 @@ fn revert_staged_changes_refused_without_state() {
     let (_human, modified_report) = parse_cli_error_stderr(&modified_out.stderr);
     assert_eq!(modified_report.error_code, "LBR-CONFLICT-001", "AC8");
 }
+
+fn detached_revert_repo() -> (tempfile::TempDir, String) {
+    let repo = tempdir().expect("repo");
+    init_repo_via_cli(repo.path());
+    configure_identity_via_cli(repo.path());
+    std::fs::write(repo.path().join("f"), "a\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "f"], repo.path()), "add one");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "one", "--no-verify"], repo.path()),
+        "commit one",
+    );
+    std::fs::write(repo.path().join("f"), "b\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "f"], repo.path()), "add two");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "two", "--no-verify"], repo.path()),
+        "commit two",
+    );
+    let head =
+        String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], repo.path()).stdout)
+            .trim()
+            .to_string();
+    assert_cli_success(
+        &run_libra_command(&["checkout", "--detach", &head], repo.path()),
+        "detach",
+    );
+    (repo, head)
+}
+
+/// SA-07: `revert --no-edit` commits onto a detached HEAD.
+#[test]
+fn revert_detached_head_no_edit_tc2634() {
+    use std::process::Command;
+
+    let (repo, orig) = detached_revert_repo();
+    let p = repo.path();
+    let out = run_libra_command(&["revert", "--no-edit", "HEAD"], p);
+    assert_cli_success(&out, "AC1 revert on detached HEAD");
+    assert_eq!(
+        String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD^"], p).stdout).trim(),
+        orig,
+        "AC2 parent is the original HEAD"
+    );
+    let libra_tree =
+        String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD^{tree}"], p).stdout)
+            .trim()
+            .to_string();
+
+    // Git reference: same history, detached at the same commit, `git revert`.
+    let git_repo = tempdir().expect("git repo");
+    let g = git_repo.path();
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(g)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .env("HOME", g)
+            .output()
+            .expect("git");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+        out
+    };
+    git(&["init", "-q", "-b", "main", "."]);
+    std::fs::write(g.join("f"), "a\n").unwrap();
+    git(&["add", "f"]);
+    git(&["commit", "-q", "-m", "one"]);
+    std::fs::write(g.join("f"), "b\n").unwrap();
+    git(&["add", "f"]);
+    git(&["commit", "-q", "-m", "two"]);
+    git(&["checkout", "-q", "--detach", "HEAD"]);
+    git(&["revert", "--no-edit", "HEAD"]);
+    let git_tree = String::from_utf8_lossy(&git(&["rev-parse", "HEAD^{tree}"]).stdout)
+        .trim()
+        .to_string();
+    assert_eq!(libra_tree, git_tree, "AC3 tree parity with Git");
+    assert_eq!(
+        String::from_utf8_lossy(
+            &run_libra_command(&["rev-parse", "--abbrev-ref", "HEAD"], p).stdout
+        )
+        .trim(),
+        "HEAD",
+        "AC4 still detached"
+    );
+}
+
+/// SA-07: on a detached HEAD, a staged index is refused for local changes.
+#[test]
+fn revert_detached_staged_changes_refused_for_local_changes() {
+    let (repo, _orig) = detached_revert_repo();
+    let p = repo.path();
+    std::fs::write(p.join("extra_file"), "extra\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "extra_file"], p), "stage extra");
+    let out = run_libra_command(&["revert", "HEAD"], p);
+    assert!(!out.status.success(), "AC5 must refuse");
+    let (_human, report) = parse_cli_error_stderr(&out.stderr);
+    assert_eq!(report.error_code, "LBR-CONFLICT-001", "AC5 code");
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("your local changes would be overwritten by revert"),
+        "AC6 local-changes message"
+    );
+}
+
+/// SA-07: the t3501 revert/detach/orphan sequence leaves no revert state.
+#[test]
+fn revert_t3501_orphan_detach_leaves_no_state() {
+    let (repo, _orig) = detached_revert_repo();
+    let p = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["revert", "--no-edit", "HEAD"], p),
+        "first revert",
+    );
+    std::fs::write(p.join("extra_file"), "extra\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "extra_file"], p), "stage extra");
+    let refused = run_libra_command(&["revert", "HEAD"], p);
+    assert!(!refused.status.success(), "second revert refused");
+    assert_cli_success(
+        &run_libra_command(&["rm", "--cached", "extra_file"], p),
+        "unstage extra",
+    );
+    let _ = std::fs::remove_file(p.join("extra_file"));
+    let orphan = run_libra_command(&["switch", "--orphan", "unborn"], p);
+    assert_cli_success(&orphan, "AC7 switch --orphan");
+    let git_dir =
+        String::from_utf8_lossy(&run_libra_command(&["rev-parse", "--git-dir"], p).stdout)
+            .trim()
+            .to_string();
+    assert!(
+        !std::path::Path::new(&git_dir)
+            .join("revert-state.json")
+            .exists(),
+        "AC8 no revert state"
+    );
+}
