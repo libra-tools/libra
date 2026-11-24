@@ -5215,3 +5215,121 @@ fn cherry_pick_continue_rejects_rerere_flags_tc0429() {
         "AC8 abort",
     );
 }
+
+/// SA-03b: both rerere toggles are repeatable and the last one wins.
+#[test]
+fn cherry_pick_rerere_autoupdate_repeated_last_wins() {
+    let (repo, foo, _foo_main, bar_main) = rerere_range_fixture();
+    let p = repo.path();
+    let range = format!("{foo}..{bar_main}");
+    let expected_blob = String::from_utf8_lossy(
+        &run_libra_command_with_stdin(&["hash-object", "--stdin"], p, "foo-resolved\n").stdout,
+    )
+    .trim()
+    .to_string();
+    let staged_blob = || {
+        let out = run_libra_command(&["ls-files", "--stage", "--", "foo"], p);
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+
+    // AC1/AC2: repeating the positive flag is accepted and autostages.
+    let out = run_libra_command(
+        &[
+            "cherry-pick",
+            "--rerere-autoupdate",
+            "--rerere-autoupdate",
+            &range,
+        ],
+        p,
+    );
+    let (_human, report) = parse_cli_error_stderr(&out.stderr);
+    assert_eq!(report.error_code, "LBR-CONFLICT-001", "AC1");
+    let entries = staged_blob();
+    assert_eq!(entries.len(), 1, "AC2 one entry: {entries:?}");
+    assert!(entries[0].contains(" 0\tfoo"), "AC2 stage 0");
+    assert!(entries[0].contains(&expected_blob), "AC2 recorded blob");
+    assert_cli_success(
+        &run_libra_command(&["cherry-pick", "--abort"], p),
+        "abort 1",
+    );
+
+    // AC3/AC4: last-wins with an interleaved negative flag.
+    let out = run_libra_command(
+        &[
+            "cherry-pick",
+            "--rerere-autoupdate",
+            "--no-rerere-autoupdate",
+            "--rerere-autoupdate",
+            &range,
+        ],
+        p,
+    );
+    let (_human, report) = parse_cli_error_stderr(&out.stderr);
+    assert_eq!(report.error_code, "LBR-CONFLICT-001", "AC3");
+    let entries = staged_blob();
+    assert_eq!(entries.len(), 1, "AC4 one entry: {entries:?}");
+    assert!(entries[0].contains(" 0\tfoo"), "AC4 stage 0");
+    assert_cli_success(
+        &run_libra_command(&["cherry-pick", "--abort"], p),
+        "abort 2",
+    );
+
+    // AC5/AC6: a trailing negative flag disables staging.
+    let out = run_libra_command(
+        &[
+            "cherry-pick",
+            "--rerere-autoupdate",
+            "--no-rerere-autoupdate",
+            &range,
+        ],
+        p,
+    );
+    let (_human, report) = parse_cli_error_stderr(&out.stderr);
+    assert_eq!(report.error_code, "LBR-CONFLICT-001", "AC5");
+    let entries = staged_blob();
+    assert!(
+        !entries.iter().any(|line| line.contains(" 0\tfoo")),
+        "AC6 no stage 0: {entries:?}"
+    );
+    assert!(
+        entries.iter().any(|line| line.contains(" 1\tfoo")),
+        "AC6 conflict stages: {entries:?}"
+    );
+    assert_cli_success(
+        &run_libra_command(&["cherry-pick", "--abort"], p),
+        "abort 3",
+    );
+
+    // AC7/AC8: repeated negatives override `rerere.autoUpdate=true`.
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "rerere.autoUpdate", "true"], p),
+        "rerere.autoUpdate",
+    );
+    let out = run_libra_command(
+        &[
+            "cherry-pick",
+            "--no-rerere-autoupdate",
+            "--no-rerere-autoupdate",
+            &range,
+        ],
+        p,
+    );
+    let (_human, report) = parse_cli_error_stderr(&out.stderr);
+    assert_eq!(report.error_code, "LBR-CONFLICT-001", "AC7");
+    let entries = staged_blob();
+    assert!(
+        !entries.iter().any(|line| line.contains(" 0\tfoo")),
+        "AC8 no stage 0: {entries:?}"
+    );
+    assert!(
+        entries.iter().any(|line| line.contains(" 1\tfoo")),
+        "AC8 conflict stages: {entries:?}"
+    );
+    assert_cli_success(
+        &run_libra_command(&["cherry-pick", "--abort"], p),
+        "abort 4",
+    );
+}

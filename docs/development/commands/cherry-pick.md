@@ -99,3 +99,5 @@ single conflict-label helper
 - 2026-11-23（SA-02 / #726）：提交解析支持 `<A>..<B>`——`expand_revision_range` 先收集 `A` 的全部祖先（含 `A`），再从 `B` 沿父链收集不在排除集合中的提交并反转（线性历史等价 `rev-list --reverse`）；展开后的提交各自携带标签（`labels`），三处原 `args.commits[i]` 取标签改为 `labels[i]`，范围中途停止不再越界。回归：`cherry_pick_range_conflict_stop_then_continue`（AC1–AC5）、`cherry_pick_range_later_untracked_overwrite_stops_cleanly`（AC6–AC8）；`cherry_pick_test` 82/82。
 
 - 2026-11-23（SA-03 / #726）：`--continue` 的 `conflicts_with_all` 增加 `rerere_autoupdate`/`no_rerere_autoupdate`（clap 冲突 → `LBR-CLI-002`，诊断点名 `'--continue'` 与对应标志）；范围 pick 复用同一 `cherry_pick_single_commit` 的 rerere 路径，`--rerere-autoupdate` 在首个冲突处按预录结果改写并暂存 `foo`（AC1–AC3 验证）。回归：`cherry_pick_range_rerere_autoupdate_stop_tc0429`（AC1–AC3）、`cherry_pick_continue_rejects_rerere_flags_tc0429`（AC4–AC8）；`cherry_pick_test` 84/84。
+
+- 2026-11-23（SA-03b / #727）：两个 rerere 标志的 clap 定义改为 `overrides_with_all = [rerere_autoupdate, no_rerere_autoupdate]`（含自身），因此可重复且最后一个生效；`t3504#8`/`TC-0468` 三段断言（重复肯定、肯定—否定—肯定、重复否定覆盖 `rerere.autoUpdate`）由 `cherry_pick_rerere_autoupdate_repeated_last_wins` 覆盖；`cherry_pick_test` 85/85。

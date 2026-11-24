@@ -646,7 +646,7 @@ job 集合以执行当日按模板 ER-04「仓库配置与 CI 展开规则」现
 ### Task SA-03b: `--rerere-autoupdate`/`--no-rerere-autoupdate` 可重复且最后一个生效（#727）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-23：两个 rerere 标志的 clap 定义改为 `overrides_with_all = [rerere_autoupdate, no_rerere_autoupdate]`（含自身），从而可重复传入且命令行最后一个生效（Git `t3504#8` / `TC-0468`）。AC1–AC8 由 `command::cherry_pick_test::cherry_pick_rerere_autoupdate_repeated_last_wins` 覆盖（重复肯定、肯定—否定—肯定、肯定—否定、以及 `rerere.autoUpdate=true` 时重复否定覆盖配置，均以 staged blob 与冲突 stage 断言）；`cherry_pick_test` 85/85；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计，故未执行计划要求的独立评审门。
 **Description:** 使两个 rerere 标志都可重复传入、按命令行顺序最后一个生效（Git 的 `--rerere-autoupdate` 为可重复的布尔选项）：现有 clap 定义只互相 `overrides_with`（`src/command/cherry_pick.rs:820-825`），重复同一标志被拒（`the argument '--rerere-autoupdate' cannot be used multiple times`，`LBR-CLI-002`）；改为各自同时覆盖自身与对方。以与 `SA-03` 相同形态的 `t3504` fixture 验收 `t3504#8`（`TC-0468`，#727 验收项 1–4）。R43 按用户 2026-11-19 05:17:51 UTC 决定自原 `SA-03` 拆出（#727 与 #726 是两处独立的参数定义改动）。
 **Out of scope:** rerere 标志与 `--continue` 互斥及范围上的 autoupdate（由 `SA-03` 承接）；`t3504#4–#6`（`DEFER-SA-16`）；`rerere` 子命令与 `rerere.enabled` 默认值（永久非目标）。
 

@@ -820,11 +820,17 @@ pub struct CherryPickArgs {
     pub strategy: Option<String>,
     /// Auto-stage a rerere-replayed resolution for this pick, overriding
     /// `rerere.autoUpdate`. The last rerere toggle wins.
-    #[clap(long = "rerere-autoupdate", overrides_with = "no_rerere_autoupdate")]
+    #[clap(
+        long = "rerere-autoupdate",
+        overrides_with_all = ["rerere_autoupdate", "no_rerere_autoupdate"]
+    )]
     pub rerere_autoupdate: bool,
     /// Do not auto-stage a rerere-replayed resolution for this pick, overriding
     /// `rerere.autoUpdate`. The last rerere toggle wins.
-    #[clap(long = "no-rerere-autoupdate", overrides_with = "rerere_autoupdate")]
+    #[clap(
+        long = "no-rerere-autoupdate",
+        overrides_with_all = ["rerere_autoupdate", "no_rerere_autoupdate"]
+    )]
     pub no_rerere_autoupdate: bool,
     #[clap(long = "commit", hide = true)]
     pub commit: bool,
