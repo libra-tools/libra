@@ -130,6 +130,7 @@ pub mod tag;
 pub(crate) mod unmerged;
 pub mod update_index;
 pub mod update_ref;
+pub mod var;
 pub mod verify_pack;
 mod verify_pack_decode;
 mod verify_pack_index;

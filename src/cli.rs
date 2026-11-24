@@ -62,7 +62,7 @@ Command Groups:
   Commit And Branching    commit, branch, switch, checkout, tag, merge, mergetool, rebase, reset, cherry-pick, revert, am, rerere, metadata
   Remote And Cloud        remote, fetch, pull, push, open, cloud, cache, credential, bundle, auth, login, logout, whoami, mega2
   AI And Automation       automation, memory, sandbox, agent, review, investigate, service
-  Maintenance And Plumbing fsck, gc, maintenance, repack, logfile, upgrade, cat-file, hash-object, write-tree, read-tree, update-index, update-ref, merge-file, merge-base, apply, mailinfo, diff-tree, diff-index, diff-files, fast-export, fast-import, replace, verify-pack, count-objects, rev-parse, rev-list, symbolic-ref, reflog, bisect, for-each-ref, commit-tree, file, alternates, deps
+  Maintenance And Plumbing fsck, gc, maintenance, repack, logfile, upgrade, cat-file, hash-object, write-tree, read-tree, update-index, update-ref, merge-file, merge-base, apply, mailinfo, diff-tree, diff-index, diff-files, fast-export, fast-import, replace, verify-pack, count-objects, rev-parse, rev-list, symbolic-ref, var, reflog, bisect, for-each-ref, commit-tree, file, alternates, deps
   Desktop                 ui
 
 Help Topics:
@@ -526,6 +526,11 @@ enum Commands {
     LsTree(command::ls_tree::LsTreeArgs),
     #[command(about = "Read or update the symbolic HEAD ref")]
     SymbolicRef(command::symbolic_ref::SymbolicRefArgs),
+    #[command(
+        about = "Print Libra's identity variables",
+        after_help = command::var::VAR_EXAMPLES
+    )]
+    Var(command::var::VarArgs),
     #[command(about = "Parse and normalize revision names and repository paths")]
     RevParse(command::rev_parse::RevParseArgs),
     #[command(about = "List commit objects reachable from a revision")]
@@ -2303,6 +2308,8 @@ fn command_scope(command: &Commands) -> CommandScope {
                 Worktree
             }
         }
+        // Identity variables are pure reads.
+        Commands::Var(_) => ReadOnly,
         // The write form moves this worktree's HEAD directly.
         Commands::SymbolicRef(args) => {
             if args.target.is_some() {
@@ -4233,6 +4240,7 @@ async fn parse_async_scoped(argv: Vec<std::ffi::OsString>) -> CliResult<()> {
             Commands::SymbolicRef(cmd_args) => {
                 command::symbolic_ref::execute_safe(cmd_args, &output).await?
             }
+            Commands::Var(cmd_args) => command::var::execute_safe(cmd_args, &output).await?,
             Commands::Branch(cmd_args) => command::branch::execute_safe(cmd_args, &output).await?,
             Commands::Tag(cmd_args) => command::tag::execute_safe(cmd_args, &output).await?,
             Commands::Commit(cmd_args) => command::commit::execute_safe(cmd_args, &output).await?,

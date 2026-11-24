@@ -167,6 +167,7 @@ Every Libra command accepts the following global flags:
 | `libra write-tree` | | Write the current index out as a tree object | [write-tree.md](write-tree.md) |
 | `libra read-tree` | | Read a tree object into the index (index-only) | [read-tree.md](read-tree.md) |
 | `libra update-index` | | Modify the index directly (add/remove/cacheinfo) | [update-index.md](update-index.md) |
+| `libra var` | | Print `GIT_AUTHOR_IDENT` / `GIT_COMMITTER_IDENT` | [var.md](var.md) |
 | `libra update-ref` | | Safely update, create, or delete a `refs/heads/<branch>` ref | [update-ref.md](update-ref.md) |
 | `libra verify-pack` | | Validate pack index files against their pack archives | [verify-pack.md](verify-pack.md) |
 | `libra count-objects` | | Count unpacked objects and their disk consumption (`-v`, `-H`) | [count-objects.md](count-objects.md) |

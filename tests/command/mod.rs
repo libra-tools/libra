@@ -1155,6 +1155,7 @@ mod ui_test;
 mod update_index_test;
 mod update_ref_test;
 mod upgrade_cmd_test;
+mod var_test;
 mod verify_pack_stat_test;
 mod verify_pack_test;
 mod worktree_doctor_test;
