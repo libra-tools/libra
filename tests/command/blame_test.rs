@@ -1347,7 +1347,7 @@ fn minimal_fixture_lines() -> (Vec<String>, Vec<String>) {
         .collect();
     let mut new: Vec<String> = old
         .iter()
-        .filter(|_| rng.next() % 3 != 0)
+        .filter(|_| !rng.next().is_multiple_of(3))
         .cloned()
         .collect();
     for _ in 0..333 {

@@ -171,7 +171,7 @@ struct ResolvedDiffFormats {
     numstat: bool,
 }
 
-#[allow(clippy::large_unopt_stack_frames)]
+#[allow(unknown_lints, clippy::large_unopt_stack_frames)]
 #[derive(Parser, Debug)]
 #[command(after_help = LOG_EXAMPLES)]
 pub struct LogArgs {
@@ -6160,7 +6160,7 @@ async fn word_diff_patch(
     args: &LogArgs,
     color_enabled: bool,
 ) -> CliResult<String> {
-    let Some(parent) = commit.parent_commit_ids.first() else {
+    let Some(parent) = first_history_parent(commit)? else {
         return Ok(String::new());
     };
     let mut argv = vec!["diff".to_string()];
@@ -6236,7 +6236,7 @@ async fn commit_diff_output(
     commit: &Commit,
     extra_flags: &[&str],
 ) -> Result<Option<crate::command::diff::DiffOutput>, CliError> {
-    let Some(parent) = commit.parent_commit_ids.first() else {
+    let Some(parent) = first_history_parent(commit)? else {
         return Ok(None);
     };
     let mut argv = vec!["diff".to_string()];

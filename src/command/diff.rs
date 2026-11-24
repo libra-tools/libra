@@ -86,7 +86,7 @@ EXAMPLES:
     libra diff -R                           Reverse diff (swap additions and deletions)
     libra --json diff --staged              Structured JSON output for agents";
 
-#[allow(clippy::large_unopt_stack_frames)]
+#[allow(unknown_lints, clippy::large_unopt_stack_frames)]
 #[derive(Parser, Debug, Default, Clone)]
 #[command(after_help = DIFF_EXAMPLES)]
 pub struct DiffArgs {
@@ -6836,7 +6836,7 @@ mod test {
     }
 
     #[test]
-    #[serial(env)]
+    #[serial(cwd, env)]
     fn test_maybe_colorize_diff_respects_flag() {
         let diff = "diff --git a/file.txt b/file.txt\n--- /dev/null\n+++ b/file.txt\n+line\n";
         let _guard = ColorOverrideReset;

@@ -493,6 +493,26 @@ pub const MUTABLE_STATE_OWNERSHIP: &[MutableStateSurface] = &[
         owner: StateOwner::Repository,
         rationale: "operation-log companions (the log itself is the Composite row above)",
     },
+    MutableStateSurface {
+        table: "capture_dedup_keys",
+        owner: StateOwner::Repository,
+        rationale: "capture-store deduplication keys are repository-wide in capture.db",
+    },
+    MutableStateSurface {
+        table: "queue_highwater_priority",
+        owner: StateOwner::Repository,
+        rationale: "priority capture queue highwater cursor is repository-wide in capture.db",
+    },
+    MutableStateSurface {
+        table: "queue_highwater_normal",
+        owner: StateOwner::Repository,
+        rationale: "normal capture queue highwater cursor is repository-wide in capture.db",
+    },
+    MutableStateSurface {
+        table: "symbolic_ref",
+        owner: StateOwner::Repository,
+        rationale: "repository-level symbolic refs (HEAD remains per-worktree in reference)",
+    },
 ];
 
 /// Tables a SINGLE migration creates and drops within its own transaction —
