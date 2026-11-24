@@ -71,6 +71,9 @@ pub(crate) const SHOW_PATHSPEC_SEPARATOR_FLAG: &str = "__libra-show-pathspec-sep
 #[derive(Parser, Debug)]
 #[command(after_help = SHOW_EXAMPLES)]
 pub struct ShowArgs {
+    /// Only show files matching the diff-filter letters (lowercase excludes)
+    #[clap(long = "diff-filter", value_name = "FILTER")]
+    pub diff_filter: Option<String>,
     /// Apply `diff.<driver>.textconv` filters (the default for commit diffs)
     #[clap(long = "textconv", overrides_with = "no_textconv")]
     pub textconv: bool,
@@ -635,6 +638,20 @@ async fn show_commit(
     let commit =
         load_object::<Commit>(commit_hash).map_err(|e| show_object_load_error(commit_hash, e))?;
 
+    let diff_filter = crate::command::diff::parse_diff_filter(args.diff_filter.as_deref())
+        .map_err(|error| {
+            CliError::fatal(error.to_string())
+                .with_stable_code(StableErrorCode::CliInvalidArguments)
+        })?;
+    if let Some(filter) = &diff_filter
+        && let Some(mut engine) = commit_diff_output_for_show(&commit, args).await?
+    {
+        crate::command::diff::apply_diff_filter(&mut engine.files, filter);
+        if engine.files.is_empty() {
+            // Nothing matches: `show` prints nothing for this commit.
+            return Ok(String::new());
+        }
+    }
     let mut output = String::new();
     let note_blocks = show_note_blocks(&commit, args).await;
     let notes = note_blocks
@@ -717,6 +734,11 @@ async fn show_commit(
                         ChangeType::Modified => "M",
                         ChangeType::Deleted => "D",
                     };
+                    if let Some(filter) = &diff_filter
+                        && !filter.allows(status.chars().next().unwrap_or('M'))
+                    {
+                        continue;
+                    }
                     output.push_str(&format!("{}\t{}\n", status, file.path.display()));
                 }
             }
@@ -1261,6 +1283,32 @@ fn display_commit_info(
 /// Renders a simple diffstat summary.
 /// Render a commit's patch, honouring `--patience`/`--anchored` through the
 /// shared diff engine (path-limited patches keep the log renderer).
+/// Diff-engine output for a commit (helper for `--diff-filter` checks).
+async fn commit_diff_output_for_show(
+    commit: &Commit,
+    args: &ShowArgs,
+) -> CliResult<Option<crate::command::diff::DiffOutput>> {
+    let Some(parent) = commit.parent_commit_ids.first() else {
+        return Ok(None);
+    };
+    let mut argv = vec!["diff".to_string()];
+    if args.no_textconv {
+        argv.push("--no-textconv".to_string());
+    } else {
+        argv.push("--textconv".to_string());
+    }
+    if let Some(filter) = &args.diff_filter {
+        argv.push(format!("--diff-filter={filter}"));
+    }
+    argv.push(parent.to_string());
+    argv.push(commit.id.to_string());
+    let diff_args = crate::command::diff::DiffArgs::try_parse_from(&argv)
+        .map_err(|error| CliError::command_usage(error.to_string()))?;
+    Ok(Some(
+        crate::command::diff::run_diff_for_service(diff_args).await?,
+    ))
+}
+
 async fn show_patch(
     commit: &Commit,
     paths: Vec<PathBuf>,
@@ -1327,6 +1375,9 @@ async fn show_patch(
             } else {
                 "--textconv".to_string()
             });
+            if let Some(filter) = &args.diff_filter {
+                argv.push(format!("--diff-filter={filter}"));
+            }
             argv.push(parent.to_string());
             argv.push(commit.id.to_string());
             let diff_args = crate::command::diff::DiffArgs::try_parse_from(&argv)

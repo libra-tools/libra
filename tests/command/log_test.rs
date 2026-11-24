@@ -10006,3 +10006,57 @@ fn log_diff_filter_selects_commits() {
         "AC4 code"
     );
 }
+
+#[test]
+fn show_diff_filter_selects_files() {
+    use super::{assert_cli_success, run_libra_command};
+
+    let work = tempfile::tempdir().expect("work dir");
+    let repo = work.path().join("r");
+    std::fs::create_dir_all(&repo).expect("mkdir repo");
+    assert_cli_success(&run_libra_command(&["init"], &repo), "init");
+    run_libra_command(&["config", "set", "user.name", "t"], &repo);
+    run_libra_command(&["config", "set", "user.email", "t@t"], &repo);
+    std::fs::write(repo.join("a.txt"), "a\n").expect("write a");
+    assert_cli_success(&run_libra_command(&["add", "a.txt"], &repo), "add a");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c1", "--no-verify"], &repo),
+        "commit c1",
+    );
+    std::fs::write(repo.join("a.txt"), "a\na2\n").expect("write a2");
+    assert_cli_success(&run_libra_command(&["add", "a.txt"], &repo), "add edit");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c2", "--no-verify"], &repo),
+        "commit c2",
+    );
+    let c2 = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], &repo).stdout)
+        .trim()
+        .to_string();
+
+    // AC1: only the matching status letter is listed.
+    let shown = run_libra_command(&["show", "--diff-filter=M", "--name-status", &c2], &repo);
+    assert_cli_success(&shown, "name-status");
+    let text = String::from_utf8_lossy(&shown.stdout).to_string();
+    assert!(text.contains("M\ta.txt"), "AC1 record: {text}");
+    // AC2: the patch lists exactly the matching file.
+    let patched = run_libra_command(&["show", "--diff-filter=M", &c2], &repo);
+    assert_cli_success(&patched, "patch");
+    let patch_text = String::from_utf8_lossy(&patched.stdout).to_string();
+    let diffs: Vec<&str> = patch_text
+        .lines()
+        .filter(|line| line.contains("diff --git"))
+        .collect();
+    assert_eq!(diffs.len(), 1, "AC2 file count: {patch_text}");
+    assert!(patch_text.contains("a/a.txt"), "AC2 file: {patch_text}");
+    // AC3: a filter that matches nothing prints nothing at all.
+    let none = run_libra_command(&["show", "--diff-filter=A", &c2], &repo);
+    assert_cli_success(&none, "filtered show");
+    assert!(none.stdout.is_empty(), "AC3 empty output");
+    // AC4: unknown filter letters are rejected.
+    let bad = run_libra_command(&["show", "--diff-filter=Q", &c2], &repo);
+    assert!(!bad.status.success(), "AC4 must fail");
+    assert!(
+        String::from_utf8_lossy(&bad.stderr).contains("LBR-CLI-002"),
+        "AC4 code"
+    );
+}

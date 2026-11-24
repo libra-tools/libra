@@ -2,6 +2,18 @@
 
 Show a commit, tag, tree, blob, or the blob referenced by `REV:path`.
 
+### `--diff-filter=[ACDMRTUXB*]`
+
+Restrict the shown files to those whose status matches the filter letters; a lowercase
+letter excludes that status, and a commit whose files all fail the filter prints
+nothing (no header, no patch). The filter is applied through the shared diff engine,
+so it agrees with `libra diff --diff-filter`, and an unknown letter is `LBR-CLI-002`.
+
+```bash
+libra show --diff-filter=M --name-status HEAD
+libra show --diff-filter=A HEAD
+```
+
 ### `--textconv` / `--no-textconv`
 
 Commit diffs run `diff.<driver>.textconv` filters by default (drivers come from

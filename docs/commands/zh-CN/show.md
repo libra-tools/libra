@@ -2,6 +2,15 @@
 
 显示提交、标签、树、blob，或 `REV:path` 引用的 blob。
 
+### `--diff-filter=[ACDMRTUXB*]`
+
+只显示状态匹配过滤字母的文件；小写字母表示排除该状态，若某提交的所有文件都被过滤掉则完全不输出（无提交头、无补丁）。过滤经共享 diff 引擎执行，与 `libra diff --diff-filter` 一致；未知字母以 `LBR-CLI-002` 拒绝。
+
+```bash
+libra show --diff-filter=M --name-status HEAD
+libra show --diff-filter=A HEAD
+```
+
 ### `--textconv` / `--no-textconv`
 
 提交 diff 默认执行 `diff.<driver>.textconv` 过滤器（驱动来自 `.gitattributes`），因此 `show` 与 Git 一样显示转换后的内容。`--textconv` 显式声明该默认，`--no-textconv` 关闭（后写者胜出）；两者都委派给共享 diff 引擎，正文与同选项的 `libra diff` 一致。过滤器失败或缺失时以 `LBR-IO-001` fail-closed。
