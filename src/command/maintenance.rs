@@ -30,7 +30,13 @@ use std::{
 use clap::{Parser, Subcommand, ValueEnum};
 use git_internal::{
     hash::{HashKind, ObjectHash},
-    internal::object::{commit::Commit, tag::Tag as GitTag, tree::Tree, types::ObjectType},
+    internal::object::{
+        ObjectTrait,
+        commit::Commit,
+        tag::Tag as GitTag,
+        tree::{Tree, TreeItemMode},
+        types::ObjectType,
+    },
 };
 use sea_orm::EntityTrait;
 use serde::Serialize;
@@ -40,7 +46,7 @@ use sha1::Digest;
 use sha2::Digest as _;
 
 use crate::{
-    command::{fetch::fetch_repository_safe, load_object_raw, log::get_reachable_commits},
+    command::{fetch::fetch_repository_safe, log::get_reachable_commits},
     internal::{
         branch::Branch,
         config::ConfigKv,
@@ -4374,7 +4380,7 @@ fn shallow_boundaries(storage_root: &Path) -> CliResult<HashSet<ObjectHash>> {
         .collect()
 }
 
-/// Walk object references recursively, adding all transitive dependencies.
+/// Walk raw object references, adding all transitive dependencies.
 ///
 /// `boundaries` is the shallow stop-list (see [`shallow_boundaries`]): a
 /// commit listed there is itself preserved, but the walk does not descend
@@ -4385,64 +4391,55 @@ fn walk_reachable(
     boundaries: &HashSet<ObjectHash>,
     reachable: &mut HashSet<ObjectHash>,
 ) -> CliResult<()> {
-    if !reachable.insert(*hash) {
-        return Ok(()); // Already visited
-    }
-
-    let obj_type = storage.get_object_type(hash).map_err(|error| {
-        CliError::fatal(format!(
-            "reachable object {hash} cannot be read while computing GC roots: {error}"
-        ))
-        .with_stable_code(StableErrorCode::RepoCorrupt)
-    })?;
-
-    match obj_type {
-        ObjectType::Commit => {
-            let commit = load_object_raw::<Commit>(hash).map_err(|error| {
-                CliError::fatal(format!(
-                    "reachable commit {hash} is corrupt while computing GC roots: {error}"
-                ))
+    let mut stack = vec![*hash];
+    while let Some(oid) = stack.pop() {
+        if !reachable.insert(oid) {
+            continue;
+        }
+        let unreadable = |error| {
+            CliError::fatal(format!("reachable object {oid} cannot be read: {error}"))
                 .with_stable_code(StableErrorCode::RepoCorrupt)
-            })?;
-            walk_reachable(&commit.tree_id, storage, boundaries, reachable)?;
-            // §C.4.3 Boundary: STOP here on a shallow graft. The commit
-            // itself stays reachable (it is in `reachable` already); its
-            // parents are not in this clone and must not be demanded.
-            if !boundaries.contains(hash) {
-                for parent in &commit.parent_commit_ids {
-                    walk_reachable(parent, storage, boundaries, reachable)?;
-                }
+        };
+        let (data, kind) = storage.get_typed(&oid).map_err(unreadable)?;
+        extend_object_references(oid, kind, &data, boundaries.contains(&oid), &mut stack)
+            .map_err(unreadable)?;
+    }
+    Ok(())
+}
+
+/// Append raw Git graph edges. A gitlink belongs to its submodule repository.
+pub(crate) fn extend_object_references(
+    oid: ObjectHash,
+    kind: ObjectType,
+    data: &[u8],
+    shallow: bool,
+    stack: &mut Vec<ObjectHash>,
+) -> Result<(), git_internal::errors::GitError> {
+    match kind {
+        ObjectType::Commit => {
+            let commit = Commit::from_bytes(data, oid)?;
+            stack.push(commit.tree_id);
+            if !shallow {
+                stack.extend(commit.parent_commit_ids);
             }
         }
         ObjectType::Tree => {
-            let tree = load_object_raw::<Tree>(hash).map_err(|error| {
-                CliError::fatal(format!(
-                    "reachable tree {hash} is corrupt while computing GC roots: {error}"
-                ))
-                .with_stable_code(StableErrorCode::RepoCorrupt)
-            })?;
-            for item in &tree.tree_items {
-                walk_reachable(&item.id, storage, boundaries, reachable)?;
-            }
+            let tree = Tree::from_bytes(data, oid)?;
+            stack.extend(
+                tree.tree_items
+                    .into_iter()
+                    .filter(|item| item.mode != TreeItemMode::Commit)
+                    .map(|item| item.id),
+            );
         }
-        ObjectType::Tag => {
-            let tag = load_object_raw::<GitTag>(hash).map_err(|error| {
-                CliError::fatal(format!(
-                    "reachable tag {hash} is corrupt while computing GC roots: {error}"
-                ))
-                .with_stable_code(StableErrorCode::RepoCorrupt)
-            })?;
-            walk_reachable(&tag.object_hash, storage, boundaries, reachable)?;
-        }
+        ObjectType::Tag => stack.push(GitTag::from_bytes(data, oid)?.object_hash),
         ObjectType::Blob => {}
         other => {
-            return Err(CliError::fatal(format!(
-                "reachable object {hash} has unsupported stored type {other:?}"
-            ))
-            .with_stable_code(StableErrorCode::RepoCorrupt));
+            return Err(git_internal::errors::GitError::InvalidObjectInfo(format!(
+                "unsupported reachable object type {other}"
+            )));
         }
     }
-
     Ok(())
 }
 

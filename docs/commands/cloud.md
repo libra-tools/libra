@@ -16,6 +16,8 @@ libra cloud status [--verbose]
 
 The sync workflow tracks which objects have been uploaded via an `is_synced` flag in the local `object_index` table. A default sync selects only the indexed objects whose local flag is still unsynced (`is_synced = 0`), which keeps repeated syncs efficient. It does not compare against D1, so after pointing `LIBRA_D1_DATABASE_ID` at a new or replaced D1 database, run `libra cloud sync --force`: the `--force` flag re-syncs every indexed local object and is also the recovery path for R2 bucket-side data loss. After objects are synced, repository metadata (references/branches) is serialized to JSON and uploaded to R2, with a content hash check to avoid unnecessary uploads.
 
+Clone and fetch index objects received in packs. For older repositories with gaps, `cloud status` counts missing index entries as pending. Both sync modes walk the history of every backed-up reference, including remote-tracking branches and tags, and add missing reachable objects to the index before selecting uploads. Existing semantic object types and sync flags are preserved. If a reachable object is missing locally, for example a parent outside a shallow clone or a promised blob in a partial clone, fetch the full history or hydrate the missing objects before syncing.
+
 Each repository is identified by a UUID (`libra.repoid` config key) and optionally a human-readable project name (`cloud.name` config key or directory name). The project name is registered in a D1 `repositories` table for lookup during restore.
 
 Restore can target a repository by UUID (`--repo-id`) or project name (`--name`). It downloads the object index from D1, optionally downloads objects from R2, restores metadata (references), and populates the working directory from HEAD.

@@ -349,6 +349,216 @@ fn test_cloud_status_json_output_empty_repo() {
     assert!(json["data"].get("unsynced_objects").is_none());
 }
 
+#[tokio::test]
+async fn packed_clone_fetch_and_divergent_commit_have_complete_cloud_coverage() {
+    use std::collections::BTreeSet;
+
+    use libra::internal::model::object_index;
+    use sea_orm::{ColumnTrait, Database, EntityTrait, QueryFilter};
+
+    let (origin, _) = create_linear_git_repo(1);
+    let work = tempdir().unwrap();
+    let repo = work.path().join("clone");
+    let url = url::Url::from_directory_path(origin.path()).unwrap();
+    assert_cli_success(
+        &run_libra_command(&["clone", "--no-local", url.as_str(), "clone"], work.path()),
+        "packed clone",
+    );
+    let db = Database::connect(format!(
+        "sqlite://{}",
+        repo.join(".libra/libra.db").display()
+    ))
+    .await
+    .unwrap();
+    let indexed = || async {
+        object_index::Entity::find()
+            .all(&db)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.o_id)
+            .collect::<BTreeSet<_>>()
+    };
+    let origin_objects = || {
+        let output = git_output(origin.path(), &["rev-list", "--objects", "--all"]);
+        assert!(output.status.success());
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| line.split_whitespace().next().unwrap().to_owned())
+            .collect::<BTreeSet<_>>()
+    };
+    let cloned = origin_objects();
+    assert_eq!(cloned.len(), 3);
+    let clone_rows = indexed().await;
+    fs::write(origin.path().join("second"), b"remote\n").unwrap();
+    git_success(origin.path(), &["add", "second"]);
+    git_success(origin.path(), &["commit", "-m", "second"]);
+    assert_cli_success(
+        &run_libra_command(&["fetch", "origin"], &repo),
+        "fetch second commit",
+    );
+    let fetched = origin_objects();
+    assert_eq!(fetched.len(), 6);
+    let fetch_rows = indexed().await;
+    for oid in &fetched {
+        assert_cli_success(
+            &run_libra_command(&["cat-file", "-t", oid], &repo),
+            "read packed object",
+        );
+    }
+    let markers = repo.join(".libra/object-index-repair");
+    assert!(!markers.exists() || fs::read_dir(markers).unwrap().next().is_none());
+    fs::write(repo.join("local"), b"local\n").unwrap();
+    for args in [
+        &["config", "user.name", "Tester"][..],
+        &["config", "user.email", "tester@example.org"],
+        &["add", "local"],
+        &["commit", "--no-gpg-sign", "-m", "divergent"],
+    ] {
+        assert_cli_success(
+            &run_libra_command(args, &repo),
+            "create divergent local commit",
+        );
+    }
+    let local_rows = indexed().await;
+    let head = run_libra_command(&["rev-parse", "HEAD"], &repo);
+    let head = String::from_utf8(head.stdout).unwrap().trim().to_owned();
+    let commit = run_libra_command(&["cat-file", "-p", &head], &repo);
+    let commit = String::from_utf8(commit.stdout).unwrap();
+    let tree = commit
+        .lines()
+        .next()
+        .unwrap()
+        .strip_prefix("tree ")
+        .unwrap();
+    let listing = run_libra_command(&["ls-tree", tree], &repo);
+    let listing = String::from_utf8(listing.stdout).unwrap();
+    let local_blob = listing
+        .lines()
+        .find(|line| line.ends_with("\tlocal"))
+        .unwrap()
+        .split_whitespace()
+        .nth(2)
+        .unwrap();
+    let inherited = git_rev_parse(origin.path(), "HEAD:f.txt");
+    assert!(listing.contains(&inherited));
+    for oid in [&head, tree, local_blob] {
+        assert!(local_rows.contains(oid), "missing locally written {oid}");
+    }
+    // Recreate a legacy gap underneath the already indexed local tree and on origin/main.
+    object_index::Entity::delete_many()
+        .filter(object_index::Column::OId.is_in(fetched.iter().cloned()))
+        .exec(&db)
+        .await
+        .unwrap();
+    let expected_pending = indexed().await.len() + 6;
+    let status = run_libra_command(&["--json", "cloud", "status"], &repo);
+    assert_cli_success(&status, "cloud status");
+    let pending = parse_json_stdout(&status)["data"]["pending"]
+        .as_u64()
+        .unwrap();
+    assert_eq!(
+        (
+            cloned.intersection(&clone_rows).count(),
+            fetched.intersection(&fetch_rows).count(),
+            local_rows.contains(&inherited),
+            pending as usize == expected_pending
+        ),
+        (3, 6, true, true),
+        "cloud coverage after clone, fetch and divergent commit ({} locally indexed, {pending} pending)",
+        local_rows.len()
+    );
+}
+
+#[tokio::test]
+async fn cloud_coverage_uses_repository_hash_and_requires_missing_blobs() {
+    use libra::internal::model::object_index;
+    use sea_orm::{ColumnTrait, Database, EntityTrait, QueryFilter};
+
+    for format in ["sha1", "sha256", "blake3"] {
+        let repo = create_committed_repo_with_format(format);
+        let repo = repo.path();
+        let status = || {
+            let out = run_libra_command(&["--json", "cloud", "status"], repo);
+            assert_cli_success(&out, "cloud status");
+            parse_json_stdout(&out)["data"].clone()
+        };
+        let before = status();
+        let tree = run_libra_command(&["ls-tree", "HEAD"], repo);
+        assert_cli_success(&tree, "list committed tree");
+        let tree = String::from_utf8(tree.stdout).unwrap();
+        let blob = tree.split_whitespace().nth(2).unwrap();
+        let db = Database::connect(format!(
+            "sqlite://{}",
+            repo.join(".libra/libra.db").display()
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            object_index::Entity::delete_many()
+                .filter(object_index::Column::OId.eq(blob))
+                .exec(&db)
+                .await
+                .unwrap()
+                .rows_affected,
+            1
+        );
+        assert_eq!(
+            status(),
+            before,
+            "{format} missing row still counts as pending"
+        );
+        fs::remove_file(
+            repo.join(".libra/objects")
+                .join(&blob[..2])
+                .join(&blob[2..]),
+        )
+        .unwrap();
+        let out = run_libra_command(&["cloud", "status"], repo);
+        assert!(!out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr).contains(blob));
+    }
+}
+
+#[test]
+fn cloud_coverage_requires_the_parent_beyond_a_shallow_boundary() {
+    let (origin, _) = create_linear_git_repo(2);
+    let parent = git_rev_parse(origin.path(), "HEAD^");
+    let work = tempdir().unwrap();
+    let url = url::Url::from_directory_path(origin.path()).unwrap();
+    let out = run_libra_command(
+        &["clone", "--depth=1", url.as_str(), "shallow"],
+        work.path(),
+    );
+    assert_cli_success(&out, "create shallow clone");
+    let out = run_libra_command(&["cloud", "status"], &work.path().join("shallow"));
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains(&parent));
+}
+
+#[test]
+fn cloud_coverage_requires_hydration_of_promised_blobs() {
+    let origin = create_committed_repo_via_cli();
+    let work = tempdir().unwrap();
+    let url = url::Url::from_directory_path(origin.path()).unwrap();
+    let out = run_libra_command(
+        &[
+            "clone",
+            "--bare",
+            "--filter=blob:none",
+            url.as_str(),
+            "partial",
+        ],
+        work.path(),
+    );
+    assert_cli_success(&out, "create partial clone");
+    let repo = work.path().join("partial");
+    let out = run_libra_command(&["cloud", "status"], &repo);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("hydrate missing objects"));
+}
+
 /// `--machine` emits the same status envelope as one NDJSON record.
 #[test]
 fn test_cloud_status_machine_output_empty_repo() {
