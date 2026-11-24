@@ -90,3 +90,19 @@ fn compile_globs_rejects_overlong_and_invalid() {
         Err(DescribeError::InvalidArgument(_))
     ));
 }
+
+/// DESC-04 AC8: `--long` / `--no-long` are last-wins at the parser layer.
+#[test]
+fn no_long_parse_order() {
+    use clap::Parser;
+
+    let args = super::DescribeArgs::try_parse_from(["describe", "--long", "--no-long"])
+        .expect("both flags parse");
+    assert!(!args.long, "AC8: --no-long wins when it comes last");
+    assert!(args.no_long);
+
+    let args = super::DescribeArgs::try_parse_from(["describe", "--no-long", "--long"])
+        .expect("both flags parse");
+    assert!(args.long, "AC4: --long wins when it comes last");
+    assert!(!args.no_long);
+}

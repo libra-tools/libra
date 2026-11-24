@@ -42,6 +42,7 @@ libra describe [OPTIONS] [COMMIT]
 | `--exact-match` | 仅在目标提交精确匹配某个标签时成功。 | 关闭 |
 | `--candidates <N>` | `N=0` 仅接受精确标签匹配（等价于 `--exact-match`）；`N≥1` 维持 Libra 确定性的最近-tag BFS（不强制正数上界）。 | — |
 | `--long` | 即使在精确匹配时也强制 `tag-N-gHASH` 输出（精确匹配输出 `tag-0-gHASH`）。 | 关闭 |
+| `--no-long` | 取消先前的 `--long`（后者生效）。 | 关闭 |
 | `--dirty[=<mark>]` | 当跟踪内容偏离 `HEAD` 时追加 dirty 标记。 | 关闭；启用时默认标记为 `-dirty` |
 | `--first-parent` | 遍历历史时只跟随合并提交的第一个父。 | 关闭 |
 | `--match <pattern>` | 仅考虑名称匹配该 glob 的标签（可重复；OR 语义，wax glob ≤256 字符）。 | 无 |

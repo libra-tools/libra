@@ -1318,10 +1318,9 @@ fn test_describe_all_filters_branch_candidates() {
     );
 }
 
-/// DESC-05: a misnamed annotated tag renders its internal name, announces the
-/// mismatch once, and `--abbrev=0` still forces the `-<n>-g<oid>` suffix.
-#[test]
-fn misnamed_annotated_tag_uses_internal_name() {
+/// Shared FX-DESC-MN fixture: an annotated tag object whose internal name is
+/// `A`, published only as `refs/tags/Q`, plus one detached child commit `c`.
+fn misnamed_tag_repo() -> (tempfile::TempDir, String, String) {
     let repo = tempdir().expect("repo");
     let p = repo.path();
     init_repo_via_cli(p);
@@ -1357,6 +1356,15 @@ fn misnamed_annotated_tag_uses_internal_name() {
     let c = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], p).stdout)
         .trim()
         .to_string();
+    (repo, ca, c)
+}
+
+/// DESC-05: a misnamed annotated tag renders its internal name, announces the
+/// mismatch once, and `--abbrev=0` still forces the `-<n>-g<oid>` suffix.
+#[test]
+fn misnamed_annotated_tag_uses_internal_name() {
+    let (repo, ca, c) = misnamed_tag_repo();
+    let p = repo.path();
     let short = &c[..7];
 
     let plain = run_libra_command(&["describe", &c], p);
@@ -1409,5 +1417,24 @@ fn misnamed_annotated_tag_uses_internal_name() {
     assert!(
         !String::from_utf8_lossy(&contains.stderr).contains("externally known as"),
         "AC8 no warning under --contains"
+    );
+}
+
+/// DESC-04 AC6/AC7: `--no-long` on a misnamed tag keeps the forced suffix, and
+/// the rendered name resolves back to the tagged commit.
+#[test]
+fn misnamed_annotated_tag_no_long_keeps_suffix() {
+    let (repo, ca, _c) = misnamed_tag_repo();
+    let p = repo.path();
+    let out = run_libra_command(&["describe", "--no-long", &ca], p);
+    assert_cli_success(&out, "AC6 describe --no-long");
+    let rendered = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert_eq!(rendered, format!("A-0-g{}", &ca[..7]), "AC6 forced suffix");
+    let resolved = run_libra_command(&["rev-parse", &rendered], p);
+    assert_cli_success(&resolved, "AC7 rev-parse");
+    assert_eq!(
+        String::from_utf8_lossy(&resolved.stdout).trim(),
+        ca,
+        "AC7 resolves to the tagged commit"
     );
 }

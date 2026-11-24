@@ -63,6 +63,7 @@ this command.
 | `--exact-match` | Only succeed when the target commit exactly matches a tag. | Off |
 | `--candidates <N>` | `N=0` requires an exact tag match (equivalent to `--exact-match`); `N>=1` keeps Libra's deterministic nearest-tag search (the positive bound is not enforced). | — |
 | `--long` | Force `tag-N-gHASH` output when a tag describes the target, including `tag-0-gHASH` for exact matches. | Off |
+| `--no-long` | Cancel an earlier `--long` (last one wins). | Off |
 | `--dirty[=<mark>]` | Append a dirty mark when tracked content differs from `HEAD`. | Off, default mark `-dirty` when enabled |
 | `--first-parent` | Follow only the first parent of merge commits when walking history. | Off |
 | `--match <pattern>` | Only consider tags whose name matches the glob (repeatable; OR semantics, wax globs ≤256 chars). | None |

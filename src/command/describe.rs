@@ -88,8 +88,12 @@ pub struct DescribeArgs {
     pub candidates: Option<usize>,
 
     /// Always output the long format when a tag describes the target.
-    #[clap(long)]
+    #[clap(long, overrides_with = "no_long")]
     pub long: bool,
+
+    /// Cancel an earlier `--long` (last one wins, like Git).
+    #[clap(long, overrides_with = "long")]
+    pub no_long: bool,
 
     /// Append MARK when tracked content differs from HEAD.
     #[clap(long, value_name = "MARK", num_args = 0..=1, require_equals = true, default_missing_value = "-dirty")]
@@ -175,6 +179,7 @@ pub(crate) async fn describe_commit_for_atom(
         exact_match: false,
         candidates: None,
         long: false,
+        no_long: false,
         dirty: None,
         first_parent: false,
         match_patterns,
@@ -380,6 +385,7 @@ async fn run_describe(args: DescribeArgs) -> Result<DescribeOutput, DescribeErro
                 dist,
                 abbrev,
                 long_format,
+                tag_info.misnamed && !include_all && !args.contains,
             );
             return apply_dirty_mark(output, dirty_mark).await;
         }

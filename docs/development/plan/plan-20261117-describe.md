@@ -1597,7 +1597,7 @@
 
 ### Task DESC-04: 为 `libra describe` 增加 `--no-long` 并支持 last-wins 覆盖（#798）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空` | **Priority / Selection:** P1；Git CLI 选项兼容 | **Issue:** [#798](https://github.com/libra-tools/libra/issues/798)
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-23：新增 `--no-long`，与 `--long` 以 clap `overrides_with` 实现命令行顺序 last-wins（`--long --no-long` 短格式、`--no-long --long` 长格式、`--long --no-long --abbrev=0` 不触发 `LongWithAbbrevZero`）；misnamed 标签在 `--no-long` 下仍强制 `<name>-<distance>-g<oid>`（`describe_output` 新增 `force_suffix`），`A-0-g<hash>` 可由 `rev-parse` 解析回目标提交。AC1–AC5 由 `describe_long_test::test_describe_no_long_last_wins` 覆盖，AC6/AC7 由 `describe_test::misnamed_annotated_tag_no_long_keeps_suffix` 覆盖，AC8 由 `describe::tests::no_long_parse_order` 覆盖；`describe_test`+`describe_long_test` 40/40、`--lib command::describe` 4/4；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计。
 
 **Description:** 在 `DescribeArgs` 中增加 `--no-long`，按 `ADR-DESC-01` 使 `--long` 与 `--no-long` 按命令行顺序 last-wins，并确认 misnamed tag（`DESC-05`）在 `--no-long` 下仍输出 `A-0-g<hash>` 且可由 `libra rev-parse` 解析回目标提交（`t6120#30`）。
 
