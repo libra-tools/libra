@@ -48,7 +48,7 @@ skip-worktree 条目（见 [`update-index`](update-index.md)）会出现在普�
 | `-s` | stage 样式输出的短别名：`<mode> <object> <stage>\t<path>`。 |
 | `--abbrev[=<n>]` | 在 `-s`/`--stage` 输出里把对象名截断为 `<n>` 位 hex。bare `--abbrev` 即 7；`--abbrev=<n>` 指定长度（取值必须用 `=` 形式，故 bare `--abbrev` 不会吞掉后续 pathspec）。Libra 定长截断而非计算最短唯一前缀。 |
 | `-t` | 在每行路径前加状态标签：`H`（cached）、`R`（removed/deleted）、`C`（modified/changed）、`?`（other/untracked）、`M`（unmerged）、`S`（skip-worktree）。未合并路径不会被隐藏；stage 1/2/3 每个条目都会按 `M <path>` 输出，与 Git 的冲突可见性一致。skip-worktree 条目始终标 `S`，且永远不会被报为 deleted/modified。 |
-| `-v` | 与 `-t` 相同：在每行路径前加状态标签。Git 的 `-v` 会用小写字母标记 assume-unchanged 文件，Libra 不支持该语义，因此 `-v` 输出与 `-t` 相同。 |
+| `-v` | 与 `-t` 相同：在每行路径前加状态标签。Git 的 `-v` 会用小写字母标记 assume-unchanged 文件，Libra 不支持该语义，因此 `-v` 输出与 `-t` 相同。  无标志 `ls-files`、`-c`、`-z` 与 `--json` 都遍历全部索引 stage，未合并路径按每个冲突 stage（1/2/3）各输出一行（与 Git `show_files` 一致）；`-v` 对这些行标 `M`。 |
 | `-u`, `--unmerged` | 只列出未合并（冲突）条目——索引 stage 1/2/3——以 stage 样式输出。 |
 | `--full-name` | 为 Git 兼容而接受。Libra 始终输出仓库根相对路径（即 `git --full-name` 形式），因此该标志为 no-op。 |
 | `--others`、`-o` | 显示未跟踪的工作区文件。索引中**任一 stage**（含未合并冲突 stage）存在的路径都视为已跟踪、绝不是 "other"（Git 的 `index_name_is_other`），因此冲突路径在合并未解决时也不会列出。 |

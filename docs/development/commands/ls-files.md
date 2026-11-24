@@ -58,3 +58,5 @@
 - 新增 Git 兼容参数时必须明确 tier、错误码、JSON / machine 输出契约、AI 安全分类和回归测试。
 
 - 2026-11-23（PM-11 / #1017）：`-o`/`-i -o` 的 tracked 集合改为 stage 0..=3 的并集（`index.tracked_entries(stage)` 逐 stage），使未合并冲突路径不再被当作 untracked/ignored（Git `index_name_is_other`）。回归：`ls_files_others_excludes_unmerged_paths`（AC1–AC4）；`ls_files_test` 42/42。
+
+- 2026-11-23（PM-12 / #1022）：stage 选择改为——`-u` 仍只列 1/2/3；其余缓存列表（无标志、`-c`、`-z`、`--json`）与 `-v` 一律遍历 0/1/2/3，未合并路径逐 stage 输出一行，`-v` 标 `M`（Git `show_files`）。回归：`ls_files_lists_each_unmerged_stage`（AC1–AC6）；`ls_files_test` 43/43。

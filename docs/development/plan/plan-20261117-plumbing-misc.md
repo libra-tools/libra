@@ -1901,7 +1901,7 @@ PY
 ### Task PM-12: 修复无标志 `libra ls-files` 与 `-v` 对冲突条目逐 stage 输出（#1022）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-23：stage 选择改为——`-u` 仍只列 1/2/3；其余缓存列表（无标志、`-c`、`-z`、`--json`）与 `-v` 一律遍历 0/1/2/3，未合并路径逐 stage 各输出一行，`-v` 标 `M`（Git `show_files`）。AC1–AC6 由 `command::ls_files_test::ls_files_lists_each_unmerged_stage` 覆盖（`f\nf\nf\nk`、`-c` 相同、`-z` 的 `f\0f\0f\0k\0`、add/add 冲突 `b\nb\nk`、`-v` 的 `M f`×3 + `H k`、JSON 的 (path,stage) 多重集合）；`ls_files_test` 43/43；EN/zh/开发文档与 `COMPATIBILITY.md` 的 `ls-files` 行同步。
 **Description:** `src/command/ls_files.rs` 的 stage 选择改为：除 `-u` 只列 1/2/3 外，缓存列表（无标志、`-c`、`-z`、`--json`）与 `-v` 都遍历 0/1/2/3 全部 stage，使冲突路径按 Git 每个 stage 输出一行；`-v` 与 `-t` 一致标记 `M`。
 **Out of scope:** `-d`/`-m` 的逐 stage 比较、`--error-unmatch <冲突路径>` 只打印一次的 Git 怪癖、`--deduplicate`（尚未排期，重启条件：后续 ls-files 计划）；`-o` 排除（`PM-11`）。
 **Current evidence:**

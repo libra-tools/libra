@@ -1498,3 +1498,126 @@ fn ls_files_others_excludes_unmerged_paths() {
         String::from_utf8_lossy(&out.stdout)
     );
 }
+
+/// PM-12: every cached listing (plain, `-c`, `-z`, `--json`, `-v`) walks all
+/// index stages, so an unmerged path prints one line per stage.
+#[test]
+fn ls_files_lists_each_unmerged_stage() {
+    let build = || {
+        let repo = tempdir().expect("failed to create repository root");
+        init_repo_via_cli(repo.path());
+        configure_identity_via_cli(repo.path());
+        (repo,)
+    };
+    let (repo,) = build();
+    let p = repo.path();
+    std::fs::write(p.join("f"), "base\n").unwrap();
+    std::fs::write(p.join("k"), "keep\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "f", "k"], p), "add base");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], p),
+        "commit base",
+    );
+    assert_cli_success(&run_libra_command(&["branch", "side"], p), "branch side");
+    assert_cli_success(&run_libra_command(&["switch", "side"], p), "switch side");
+    std::fs::write(p.join("f"), "side\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "f"], p), "add side");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "side", "--no-verify"], p),
+        "commit side",
+    );
+    assert_cli_success(&run_libra_command(&["switch", "main"], p), "switch main");
+    std::fs::write(p.join("f"), "main\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "f"], p), "add main");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "main", "--no-verify"], p),
+        "commit main",
+    );
+    let _ = run_libra_command(&["merge", "side"], p);
+    let unmerged = run_libra_command(&["ls-files", "-u"], p);
+    assert_cli_success(&unmerged, "fixture -u");
+    assert_eq!(String::from_utf8_lossy(&unmerged.stdout).lines().count(), 3);
+
+    // AC1/AC2: plain and `-c` both list one line per stage.
+    for args in [vec!["ls-files"], vec!["ls-files", "-c"]] {
+        let out = run_libra_command(&args, p);
+        assert_cli_success(&out, &format!("{args:?}"));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "f\nf\nf\nk\n",
+            "{args:?}"
+        );
+    }
+
+    // AC3: NUL-delimited output keeps the same rows.
+    let out = run_libra_command(&["ls-files", "-z"], p);
+    assert_cli_success(&out, "AC3");
+    assert_eq!(out.stdout, b"f\0f\0f\0k\0", "AC3");
+
+    // AC5: `-v` tags unmerged stages `M` and the stage-0 entry `H`.
+    let out = run_libra_command(&["ls-files", "-v"], p);
+    assert_cli_success(&out, "AC5");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "M f\nM f\nM f\nH k\n",
+        "AC5"
+    );
+
+    // AC6: the JSON array carries the same (path, stage) multiset.
+    let out = run_libra_command(&["--json", "ls-files"], p);
+    assert_cli_success(&out, "AC6");
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).expect("AC6 JSON");
+    let mut pairs: Vec<(String, u64)> = json["data"]
+        .as_array()
+        .expect("AC6 data array")
+        .iter()
+        .map(|entry| {
+            (
+                entry["path"].as_str().unwrap_or_default().to_string(),
+                entry["stage"].as_u64().unwrap_or(u64::MAX),
+            )
+        })
+        .collect();
+    pairs.sort();
+    assert_eq!(
+        pairs,
+        vec![
+            ("f".to_string(), 1),
+            ("f".to_string(), 2),
+            ("f".to_string(), 3),
+            ("k".to_string(), 0)
+        ],
+        "AC6"
+    );
+
+    // AC4: an add/add conflict prints both stages (2/3) plus the clean entry.
+    let repo = tempdir().expect("failed to create repository root");
+    init_repo_via_cli(repo.path());
+    configure_identity_via_cli(repo.path());
+    let p = repo.path();
+    std::fs::write(p.join("k"), "keep\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "k"], p), "add k");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], p),
+        "commit base",
+    );
+    assert_cli_success(&run_libra_command(&["branch", "side"], p), "branch side");
+    assert_cli_success(&run_libra_command(&["switch", "side"], p), "switch side");
+    std::fs::write(p.join("b"), "side\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "b"], p), "add side b");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "side-b", "--no-verify"], p),
+        "commit side b",
+    );
+    assert_cli_success(&run_libra_command(&["switch", "main"], p), "switch main");
+    std::fs::write(p.join("b"), "main\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "b"], p), "add main b");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "main-b", "--no-verify"], p),
+        "commit main b",
+    );
+    let _ = run_libra_command(&["merge", "side"], p);
+    let out = run_libra_command(&["ls-files"], p);
+    assert_cli_success(&out, "AC4");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "b\nb\nk\n", "AC4");
+}

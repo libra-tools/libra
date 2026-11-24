@@ -312,12 +312,13 @@ fn run_ls_files(
 
     if run_cached_block {
         // `-u`/`--unmerged` restricts the listing to conflict stages 1/2/3.
+        // Every other cached listing (plain, `-c`, `-z`, `--json`, `-v`) walks
+        // stages 0/1/2/3, so an unmerged path prints one line per stage, like
+        // Git's `show_files`.
         let stages: &[u8] = if _args.unmerged {
             &[1, 2, 3]
-        } else if _args.stage || _args.short || _args.tag {
-            &[0, 1, 2, 3]
         } else {
-            &[0]
+            &[0, 1, 2, 3]
         };
         // Worktree state is only needed to *filter* (`-d`/`-m`), to *label* (`-t`),
         // or to fill the `status` field the JSON shape always carries. Plain
