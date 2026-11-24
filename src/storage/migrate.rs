@@ -117,12 +117,13 @@ use crate::{
         opener::{begin_write_bounded_blocking, open_redb_read_only},
         queue::{
             CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION, CAPTURE_QUEUE_SUBDIR,
-            CAPTURE_SPOOL_CAPACITY_LOCK_FILE, CAPTURE_SPOOL_SUBDIR,
-            CAPTURE_SPOOL_TOMBSTONE_SENTINEL, FrameDecodeError, FrameStreamDecoder,
-            FrameStreamItem, LTM2_MAX_LEN, LaneTailMeta, QUEUE_APPEND_LOCK_FILE,
-            QUEUE_LANE_NORMAL_DIR, QUEUE_LANE_PRIORITY_DIR, QUEUE_TAIL_META_BAK_FILE,
-            QUEUE_TAIL_META_FILE, QUEUE_WRITER_LOCK_FILE, crc32c_append, decode_postcard_payload,
-            parse_segment_log_file_name, read_converged_lane_tail_meta, segment_log_file_name,
+            CAPTURE_SPOOL_CAPACITY_LOCK_FILE, CAPTURE_SPOOL_SUBDIR, CAPTURE_SPOOL_TOMBSTONE_NAMES,
+            CAPTURE_SPOOL_TOMBSTONE_SENTINEL, CaptureSpoolTombstonePaths, FrameDecodeError,
+            FrameStreamDecoder, FrameStreamItem, LTM2_MAX_LEN, LaneTailMeta,
+            QUEUE_APPEND_LOCK_FILE, QUEUE_LANE_NORMAL_DIR, QUEUE_LANE_PRIORITY_DIR,
+            QUEUE_TAIL_META_BAK_FILE, QUEUE_TAIL_META_FILE, QUEUE_WRITER_LOCK_FILE, crc32c_append,
+            decode_postcard_payload, parse_segment_log_file_name, read_converged_lane_tail_meta,
+            segment_log_file_name,
         },
         redb::{
             config_store as redb_cfg, map_redb_commit_err, map_redb_database_err,
@@ -4521,6 +4522,27 @@ mod win_tmp_guard {
             info.nFileIndexHigh,
             info.nFileIndexLow,
         )
+    }
+
+    pub(super) fn file_change_time(handle: HANDLE, ctx: &'static str) -> StorageResult<i64> {
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_BASIC_INFO, FileBasicInfo, GetFileInformationByHandleEx,
+        };
+        let mut basic = std::mem::MaybeUninit::<FILE_BASIC_INFO>::zeroed();
+        // SAFETY: `handle` is valid and `basic` is sized to `FILE_BASIC_INFO`.
+        let ok = unsafe {
+            GetFileInformationByHandleEx(
+                handle,
+                FileBasicInfo,
+                basic.as_mut_ptr().cast(),
+                std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+            )
+        };
+        if ok == 0 {
+            return Err(StorageBackendError::io(ctx, io::Error::last_os_error()));
+        }
+        // SAFETY: `GetFileInformationByHandleEx` succeeded.
+        Ok(unsafe { basic.assume_init() }.ChangeTime)
     }
 
     pub(super) fn open_pinned_non_reparse_dir(
@@ -19682,6 +19704,41 @@ pub struct SpoolBackupFileReceipt {
     pub sha256: String,
 }
 
+/// Private verified live+backup file identity captured during Phase 1's
+/// SHA-256-verified `capture-spool` backup while `capacity.lock` is continuously
+/// held (`RB-10g` Step 2.3 O(1) identity verification within the `<= 200ms`
+/// performance budget).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VerifiedSpoolFileIdentity {
+    subdir: &'static str,
+    file_name: String,
+    byte_len: u64,
+    #[cfg(unix)]
+    live_inode: (u64, u64),
+    #[cfg(unix)]
+    live_mtime: (i64, i64),
+    #[cfg(unix)]
+    live_ctime: (i64, i64),
+    #[cfg(unix)]
+    backup_inode: (u64, u64),
+    #[cfg(unix)]
+    backup_mtime: (i64, i64),
+    #[cfg(unix)]
+    backup_ctime: (i64, i64),
+    #[cfg(windows)]
+    live_id: win_tmp_guard::WinFileId,
+    #[cfg(windows)]
+    live_mtime: (u32, u32),
+    #[cfg(windows)]
+    live_change_time: i64,
+    #[cfg(windows)]
+    backup_id: win_tmp_guard::WinFileId,
+    #[cfg(windows)]
+    backup_mtime: (u32, u32),
+    #[cfg(windows)]
+    backup_change_time: i64,
+}
+
 /// Summary report returned after copying `.libra/private/capture-spool/{ready,quarantine}/`
 /// in place to `.libra/sqlite-backup/<gen>/capture-spool/` (`RB-10f` AC3).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19696,6 +19753,7 @@ pub struct SpoolBackupReport {
     pub ready_fenced: bool,
     /// `true` if live `capture-spool/quarantine` is already a verified `0400` tombstone sentinel.
     pub quarantine_fenced: bool,
+    verified_identities: Vec<VerifiedSpoolFileIdentity>,
 }
 
 /// Ordered durability operation category recorded strictly AFTER the
@@ -21743,7 +21801,7 @@ fn copy_spool_file_verified_unix(
     protected_live_inodes: &[(u64, u64)],
     mut durability: Option<&mut Phase1DurabilityReceipt>,
     #[cfg(test)] mut on_during_copy: Option<&mut dyn FnMut()>,
-) -> StorageResult<SpoolBackupFileReceipt> {
+) -> StorageResult<(SpoolBackupFileReceipt, VerifiedSpoolFileIdentity)> {
     use std::{
         ffi::CString,
         io::{Read as _, Write as _},
@@ -21786,6 +21844,19 @@ fn copy_spool_file_verified_unix(
         protected_live_inodes,
         "capture-spool backup source entry",
     )?;
+    let mut src_st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: `src_file` is valid.
+    if unsafe { libc::fstat(src_file.as_raw_fd(), src_st.as_mut_ptr()) } != 0 {
+        return Err(StorageBackendError::io(
+            "stat capture-spool backup source file",
+            io::Error::last_os_error(),
+        ));
+    }
+    // SAFETY: `fstat` succeeded.
+    let src_st = unsafe { src_st.assume_init() };
+    let live_inode = (src_st.st_dev as u64, src_st.st_ino as u64);
+    let live_mtime = (src_st.st_mtime as i64, src_st.st_mtime_nsec as i64);
+    let live_ctime = (src_st.st_ctime as i64, src_st.st_ctime_nsec as i64);
 
     // Create exclusive owner-only `.tmp` target file inside destination subdir.
     // SAFETY: `dst_dir_fd` is valid and `c_tmp_name` is NUL-terminated.
@@ -21965,12 +22036,62 @@ fn copy_spool_file_verified_unix(
     }
     dst_guard.armed = false;
 
-    Ok(SpoolBackupFileReceipt {
+    // Capture post-rename backup stat (including post-rename `st_ctime`) on the
+    // pinned `dst_dir_fd` so Phase 2 Step 2.3 can O(1)-verify that neither the
+    // live file nor the backup copy changed since Phase 1's SHA-256 verification.
+    let mut final_dst_st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: `dst_dir_fd` is valid and `c_name` is NUL-terminated.
+    if unsafe {
+        libc::fstatat(
+            dst_dir_fd.as_raw_fd(),
+            c_name.as_ptr(),
+            final_dst_st.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(StorageBackendError::io(
+            "stat published capture-spool backup file",
+            io::Error::last_os_error(),
+        ));
+    }
+    // SAFETY: `fstatat` succeeded.
+    let final_dst_st = unsafe { final_dst_st.assume_init() };
+    let backup_inode = (final_dst_st.st_dev as u64, final_dst_st.st_ino as u64);
+    if backup_inode != dst_inode || final_dst_st.st_size as u64 != copied_len {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration Phase 1 published capture-spool/{subdir} backup identity mismatch"
+            ),
+        });
+    }
+    let identity = VerifiedSpoolFileIdentity {
         subdir,
         file_name: file_name.to_string(),
         byte_len: copied_len,
-        sha256: dst_sha256,
-    })
+        live_inode,
+        live_mtime,
+        live_ctime,
+        backup_inode,
+        backup_mtime: (
+            final_dst_st.st_mtime as i64,
+            final_dst_st.st_mtime_nsec as i64,
+        ),
+        backup_ctime: (
+            final_dst_st.st_ctime as i64,
+            final_dst_st.st_ctime_nsec as i64,
+        ),
+    };
+
+    Ok((
+        SpoolBackupFileReceipt {
+            subdir,
+            file_name: file_name.to_string(),
+            byte_len: copied_len,
+            sha256: dst_sha256,
+        },
+        identity,
+    ))
 }
 
 /// Copy `.libra/private/capture-spool/{ready,quarantine}/` in place into
@@ -22112,6 +22233,7 @@ fn backup_capture_spool_inplace_unix(
     let mut ready_fenced = false;
     let mut quarantine_fenced = false;
     let mut files: Vec<SpoolBackupFileReceipt> = Vec::new();
+    let mut verified_identities: Vec<VerifiedSpoolFileIdentity> = Vec::new();
     let mut remaining_file_budget = MAX_SPOOL_BACKUP_FILES;
     let mut remaining_name_bytes = MAX_SPOOL_BACKUP_NAME_BYTES;
 
@@ -22220,7 +22342,7 @@ fn backup_capture_spool_inplace_unix(
         let rel_sub_dir = format!("{rel_spool_dir}/{subdir_str}");
         for name in names {
             let rel_file = format!("{rel_sub_dir}/{name}");
-            let receipt = copy_spool_file_verified_unix(
+            let (receipt, identity) = copy_spool_file_verified_unix(
                 &src_sub_fd,
                 &dst_sub_fd,
                 &name,
@@ -22235,6 +22357,7 @@ fn backup_capture_spool_inplace_unix(
             manifest_hasher.update(receipt.byte_len.to_le_bytes());
             hash_len_prefixed_bytes(&mut manifest_hasher, receipt.sha256.as_bytes());
             files.push(receipt);
+            verified_identities.push(identity);
         }
         fsync_dir_fd_unix(&dst_sub_fd, subject)?;
         if let Some(log) = durability.as_deref_mut() {
@@ -22264,6 +22387,7 @@ fn backup_capture_spool_inplace_unix(
         spool_manifest_sha256,
         ready_fenced,
         quarantine_fenced,
+        verified_identities,
     })
 }
 
@@ -22317,6 +22441,7 @@ fn backup_capture_spool_inplace_windows(
     let mut ready_fenced = false;
     let mut quarantine_fenced = false;
     let mut files: Vec<SpoolBackupFileReceipt> = Vec::new();
+    let mut verified_identities: Vec<VerifiedSpoolFileIdentity> = Vec::new();
     let mut remaining_file_budget = MAX_SPOOL_BACKUP_FILES;
     let mut remaining_name_bytes = MAX_SPOOL_BACKUP_NAME_BYTES;
 
@@ -22497,6 +22622,19 @@ fn backup_capture_spool_inplace_windows(
                 &src_sub_ancestors,
                 "capture-spool backup source entry",
             )?;
+            let src_handle = std::os::windows::io::AsRawHandle::as_raw_handle(&src_file)
+                as windows_sys::Win32::Foundation::HANDLE;
+            let src_info =
+                win_tmp_guard::file_info(src_handle, "stat capture-spool backup source entry")?;
+            let live_id = win_tmp_guard::id_from_info(&src_info);
+            let live_mtime = (
+                src_info.ftLastWriteTime.dwHighDateTime,
+                src_info.ftLastWriteTime.dwLowDateTime,
+            );
+            let live_change_time = win_tmp_guard::file_change_time(
+                src_handle,
+                "read capture-spool backup source change time",
+            )?;
             let dst_tmp = dst_sub.join(format!(".{name}.backup.tmp"));
             let dst_final = dst_sub.join(&name);
             if path_exists_no_open(&dst_final)? || path_exists_no_open(&dst_tmp)? {
@@ -22563,6 +22701,12 @@ fn backup_capture_spool_inplace_windows(
                 &dst_sub_ancestors,
                 "capture-spool backup verify file",
             )?;
+            let verify_info = win_tmp_guard::file_info(
+                std::os::windows::io::AsRawHandle::as_raw_handle(&verify_file)
+                    as windows_sys::Win32::Foundation::HANDLE,
+                "stat capture-spool backup verify file",
+            )?;
+            let backup_id = win_tmp_guard::id_from_info(&verify_info);
             let (dst_sha256, read_back_len) =
                 stream_hash_file(&mut verify_file, "capture-spool backup read-back")?;
             drop(verify_file);
@@ -22586,9 +22730,48 @@ fn backup_capture_spool_inplace_windows(
             if let Some(log) = durability.as_deref_mut() {
                 log.record(Phase1DurabilityOpKind::AtomicPublish, rel_file);
             }
+            let (post_bk_file, _) = open_readonly_non_reparse_file_windows(
+                &dst_final,
+                false,
+                &dst_sub_ancestors,
+                "stat published capture-spool backup file",
+            )?;
+            let post_bk_handle = std::os::windows::io::AsRawHandle::as_raw_handle(&post_bk_file)
+                as windows_sys::Win32::Foundation::HANDLE;
+            let post_bk_info = win_tmp_guard::file_info(
+                post_bk_handle,
+                "stat published capture-spool backup identity",
+            )?;
+            let backup_change_time = win_tmp_guard::file_change_time(
+                post_bk_handle,
+                "read published capture-spool backup change time",
+            )?;
+            let final_backup_mtime = (
+                post_bk_info.ftLastWriteTime.dwHighDateTime,
+                post_bk_info.ftLastWriteTime.dwLowDateTime,
+            );
+            if win_tmp_guard::id_from_info(&post_bk_info) != backup_id {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: format!(
+                        "forward migration Phase 1 published capture-spool/{subdir_str} backup identity mismatch"
+                    ),
+                });
+            }
+            drop(post_bk_file);
             hash_len_prefixed_bytes(&mut manifest_hasher, name.as_bytes());
             manifest_hasher.update(copied_len.to_le_bytes());
             hash_len_prefixed_bytes(&mut manifest_hasher, dst_sha256.as_bytes());
+            verified_identities.push(VerifiedSpoolFileIdentity {
+                subdir: subdir_str,
+                file_name: name.clone(),
+                byte_len: copied_len,
+                live_id,
+                live_mtime,
+                live_change_time,
+                backup_id,
+                backup_mtime: final_backup_mtime,
+                backup_change_time,
+            });
             files.push(SpoolBackupFileReceipt {
                 subdir: subdir_str,
                 file_name: name,
@@ -22647,6 +22830,7 @@ fn backup_capture_spool_inplace_windows(
         spool_manifest_sha256,
         ready_fenced,
         quarantine_fenced,
+        verified_identities,
     })
 }
 
@@ -28074,6 +28258,20 @@ pub enum Phase2DurabilityOpKind {
     ParentDirFsyncAfterUnlink,
     /// Step 2.2b(ii): single-connection `c_mig` deterministically closed.
     CloseMigrationConn,
+    /// Step 2.3: backed-up spool files cleared under unmoved `capacity.lock`.
+    SpoolBackupFilesCleared,
+    /// Step 2.3: staged `0400` regular file tombstone flushed via `sync_all()`.
+    SpoolTombstoneFileFsync,
+    /// Step 2.3: `0400` tombstone atomically published in place under unmoved `capacity.lock`.
+    SpoolTombstoneAtomicPublish,
+    /// Step 2.3: `fsync_dir(.libra/private/capture-spool)` completed after all 3 tombstones.
+    SpoolDirFsync,
+    /// Step 2.3: `.libra/storage-format.json` (`finalized=false, spool_fenced=true`) published.
+    PublishManifestSpoolFenced,
+    /// Step 2.4: `.libra/storage-format.json` (`backend="redb", finalized=true`) published.
+    PublishManifestFinalized,
+    /// Step 2.4: all 6 non-SQLite exclusive locks released after `finalized=true` + `fsync_dir(.libra/)`.
+    ReleaseLocks,
 }
 
 /// One recorded Phase 2 durability or state-machine operation.
@@ -28159,6 +28357,7 @@ pub struct SqliteFenceReceipt {
 pub struct ForwardPhase2FencedState {
     common_storage: PathBuf,
     locks: ForwardPhase1Locks,
+    verified_spool_identities: Vec<VerifiedSpoolFileIdentity>,
     /// Target generation ID (`>= 1`).
     pub generation: u64,
     /// Promoted, `fsync`'d `.libra/redb/git.gen-<id>.redb`.
@@ -28249,6 +28448,11 @@ async fn verify_phase1_prerequisites_for_phase2(
     }
 
     let common_storage = &prepared.common_storage;
+    // Re-confirm ZERO unexpired in-flight `capture-spool/tmp/` files exist
+    // BEFORE Step 2.1 publishes `storage-format.json` or Step 2.2 unlinks any
+    // legacy SQLite database (`ADR-RB-07` #1, `RB-10g`).
+    verify_no_inflight_spool_tmp_files(common_storage)?;
+
     let expected_git_redb = git_redb_path(common_storage, prepared.generation);
     let expected_cap_redb = capture_redb_path(common_storage, prepared.generation);
     if prepared.git_redb_path != expected_git_redb
@@ -29776,8 +29980,10 @@ async fn execute_forward_phase2_fence_and_unlink_inner(
         generation,
         git_redb_path,
         capture_redb_path,
+        backup,
         ..
     } = prepared;
+    let verified_spool_identities = backup.spool_backup.verified_identities;
     artifact_guard.disarm();
     drop(artifact_guard);
 
@@ -30008,6 +30214,7 @@ async fn execute_forward_phase2_fence_and_unlink_inner(
         Ok((git_fence, capture_fence)) => Ok(ForwardPhase2FencedState {
             common_storage,
             locks,
+            verified_spool_identities,
             generation,
             git_redb_path,
             capture_redb_path,
@@ -30045,6 +30252,2805 @@ async fn execute_forward_phase2_fence_and_unlink_inner(
             }
         }
     }
+}
+
+// ============================================================================
+// RB-10g: Forward Migration Phase 2 Step 2.3–2.4 (In-Place Unmoved-Lock
+// `capture-spool` 0400 Tombstones, Finalized `storage-format.json` Publication,
+// Lock Release, & `GC-13` Global/System Config Isolation)
+// ============================================================================
+
+/// Monotonic per-process counter for collision-free Phase 2 Step 2.3 tombstone
+/// staging filenames inside `.libra/private/capture-spool/`.
+static PHASE2_SPOOL_TOMBSTONE_TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Maximum retries when a concurrent legacy hook calling `spool.rs:105`
+/// `ensure_spool` recreates an empty `capture-spool/{tmp,ready,quarantine}`
+/// directory between `rmdir` and non-replacing tombstone publication while our
+/// process still holds the unmoved `capacity.lock` (`ADR-RB-07` #1 Step 2.3).
+const MAX_SPOOL_TOMBSTONE_RACE_RETRIES: usize = 32;
+
+/// Receipt proving `.libra/private/capture-spool/{tmp,ready,quarantine}` were
+/// cleared of verified backed-up files and replaced in place with `0400` regular
+/// file tombstones + `fsync_dir` under the unmoved `capacity.lock` (`RB-10g`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForwardPhase2SpoolFenceReceipt {
+    /// Number of verified backed-up regular files cleared from `capture-spool/ready/`.
+    pub cleared_ready_files: usize,
+    /// Number of verified backed-up regular files cleared from `capture-spool/quarantine/`.
+    pub cleared_quarantine_files: usize,
+    /// Number of expired (`>= 24h`) orphan regular files cleared from `capture-spool/tmp/`.
+    pub cleared_tmp_files: usize,
+    /// Canonical paths of the installed `capture-spool` tombstones and unmoved `capacity.lock`.
+    pub tombstones: CaptureSpoolTombstonePaths,
+    /// Number of `ensure_spool` (`spool.rs:105`) empty-directory race retries absorbed under held `capacity.lock`.
+    pub ensure_spool_race_retries: usize,
+    /// Elapsed wall-clock duration for Step 2.3 tombstone replacement and `fsync_dir`.
+    pub elapsed: Duration,
+}
+
+/// Complete report returned once Forward Migration Phase 2 (`ADR-RB-07` #1
+/// Step 2.1–2.4) has durably finalized `.libra/storage-format.json(finalized = true)`
+/// and released all 6 non-SQLite exclusive locks (`RB-10g`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForwardPhase2FinalizedReport {
+    /// Active migrated `redb` generation (`>= 1`).
+    pub generation: u64,
+    /// Promoted, `fsync`'d `.libra/redb/git.gen-<id>.redb`.
+    pub git_redb_path: PathBuf,
+    /// Promoted, `fsync`'d `.libra/private/capture.gen-<id>.redb`.
+    pub capture_redb_path: PathBuf,
+    /// Finalized `.libra/storage-format.json` (`backend="redb"`, `finalized=true`, `spool_fenced=true`).
+    pub manifest: StorageFormatManifest,
+    /// Step 2.2 rollback-journal atomic fence & post-unlink receipt for `.libra/libra.db`.
+    pub git_fence: SqliteFenceReceipt,
+    /// Step 2.2 rollback-journal atomic fence & post-unlink receipt for `.libra/private/capture.db` (if present).
+    pub capture_fence: Option<SqliteFenceReceipt>,
+    /// Step 2.3 in-place `capture-spool` tombstone replacement receipt.
+    pub spool_fence: ForwardPhase2SpoolFenceReceipt,
+    /// Complete ordered Phase 2 Step 2.1–2.4 durability and lock-release audit trail.
+    pub durability: Phase2DurabilityReceipt,
+    /// Wall-clock duration of Step 2.3 (`capture-spool` tombstones) through Step 2.4 (`finalized=true` + lock release).
+    pub step2_3_to_2_4_elapsed: Duration,
+    /// Cumulative wall-clock duration of Phase 2 Step 2.1 through Step 2.4.
+    pub total_phase2_elapsed: Duration,
+}
+
+/// Test-only deterministic observation / race-injection points for Forward
+/// Migration Phase 2 Step 2.3–2.4 (`RB-10g`, `RB-10h`).
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase2FinalizeTestPoint {
+    BeforeUnlinkVerifiedSpoolEntry(&'static str),
+    AfterFinalIdentityCheckBeforeIsolate(&'static str),
+    AfterRmdirBeforeLinkTombstone(&'static str),
+    AfterSpoolTombstonesBeforePersistSpoolFenced,
+    AfterPersistSpoolFencedBeforeFinalized,
+    AfterFinalizedBeforeUnlock,
+}
+
+#[cfg(test)]
+trait Phase2FinalizeTestObserver {
+    fn on_point(&mut self, point: Phase2FinalizeTestPoint, root: &Path) -> StorageResult<()>;
+}
+
+#[cfg(test)]
+impl<F> Phase2FinalizeTestObserver for F
+where
+    F: FnMut(Phase2FinalizeTestPoint, &Path) -> StorageResult<()>,
+{
+    fn on_point(&mut self, point: Phase2FinalizeTestPoint, root: &Path) -> StorageResult<()> {
+        self(point, root)
+    }
+}
+
+/// Compute streaming SHA-256 hex digest over an already-opened regular file
+/// without ever following paths again (`64 KiB` bounded buffer).
+fn stream_sha256_of_file(file: &mut File, label: &'static str) -> StorageResult<String> {
+    use std::io::Read as _;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .map_err(|err| StorageBackendError::io(label, err))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UnixSpoolEntryIdentity {
+    inode: (u64, u64),
+    byte_len: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+
+#[cfg(unix)]
+impl UnixSpoolEntryIdentity {
+    fn from_stat(st: &libc::stat) -> Self {
+        Self {
+            inode: (st.st_dev as u64, st.st_ino as u64),
+            byte_len: u64::try_from(st.st_size).unwrap_or(0),
+            mtime: (st.st_mtime as i64, st.st_mtime_nsec as i64),
+            ctime: (st.st_ctime as i64, st.st_ctime_nsec as i64),
+        }
+    }
+}
+
+/// Enumerate entry filenames directly from a pinned Unix directory descriptor
+/// (`F_DUPFD_CLOEXEC` + `fdopendir` + `readdir`, zero path-based TOCTOU).
+#[cfg(unix)]
+fn list_sorted_cstr_names_unix(
+    dir_fd: &std::os::unix::io::OwnedFd,
+    label: &str,
+) -> StorageResult<Vec<std::ffi::CString>> {
+    use std::{ffi::CString, os::unix::io::AsRawFd as _};
+
+    // SAFETY: `dir_fd` is valid.
+    let dup_raw = unsafe { libc::fcntl(dir_fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+    if dup_raw < 0 {
+        return Err(StorageBackendError::io(
+            "duplicate capture-spool directory descriptor",
+            io::Error::last_os_error(),
+        ));
+    }
+    // SAFETY: `dup_raw` is an open directory fd; on success `fdopendir` takes ownership.
+    let dir_ptr = unsafe { libc::fdopendir(dup_raw) };
+    if dir_ptr.is_null() {
+        let err = io::Error::last_os_error();
+        // SAFETY: `fdopendir` failed, so close `dup_raw`.
+        unsafe {
+            libc::close(dup_raw);
+        }
+        return Err(StorageBackendError::io(
+            "open capture-spool directory stream",
+            err,
+        ));
+    }
+    struct DirGuard(*mut libc::DIR);
+    impl Drop for DirGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: `self.0` was returned by `fdopendir`.
+                unsafe {
+                    libc::closedir(self.0);
+                }
+            }
+        }
+    }
+    let _dir_guard = DirGuard(dir_ptr);
+
+    let mut names: Vec<CString> = Vec::new();
+    let mut total_bytes: usize = 0;
+    loop {
+        #[cfg(target_os = "macos")]
+        unsafe {
+            *libc::__error() = 0;
+        }
+        #[cfg(target_os = "linux")]
+        unsafe {
+            *libc::__errno_location() = 0;
+        }
+        // SAFETY: `dir_ptr` is valid for the lifetime of `_dir_guard`.
+        let entry = unsafe { libc::readdir(dir_ptr) };
+        if entry.is_null() {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error().unwrap_or(0) != 0 {
+                return Err(StorageBackendError::io(
+                    "iterate capture-spool directory",
+                    err,
+                ));
+            }
+            break;
+        }
+        // SAFETY: `entry` is non-null and `d_name` is NUL-terminated.
+        let cstr = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+        let bytes = cstr.to_bytes();
+        if bytes == b"." || bytes == b".." {
+            continue;
+        }
+        if names.len() >= MAX_SPOOL_BACKUP_FILES
+            || total_bytes.saturating_add(bytes.len()) > MAX_SPOOL_BACKUP_NAME_BYTES
+        {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "forward migration Step 2.3 rejected {label} exceeding bounded directory listing cap"
+                ),
+            });
+        }
+        total_bytes = total_bytes.saturating_add(bytes.len());
+        names.push(cstr.to_owned());
+    }
+    names.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    Ok(names)
+}
+
+/// Verify that a candidate regular file inside `capture-spool/{ready,quarantine}/`
+/// has an exact byte-for-byte SHA-256 match inside `<backup_dir>/capture-spool/<slot>/<name>`
+/// and verify the opened live file still matches `expected_live_id` before Phase 2
+/// Step 2.3 unlinks the live spool file.
+#[cfg(unix)]
+fn verify_spool_file_backed_up_unix(
+    live_sub_fd: &std::os::unix::io::OwnedFd,
+    backup_sub_fd: &std::os::unix::io::OwnedFd,
+    c_name: &std::ffi::CString,
+    euid: libc::uid_t,
+    slot: &str,
+    expected_live_id: UnixSpoolEntryIdentity,
+) -> StorageResult<()> {
+    use std::os::unix::io::{AsRawFd as _, FromRawFd as _};
+
+    let open_reg = |dir_fd: &std::os::unix::io::OwnedFd,
+                    kind: &str|
+     -> StorageResult<(File, UnixSpoolEntryIdentity)> {
+        // SAFETY: `dir_fd` is valid and `c_name` is NUL-terminated.
+        let raw = unsafe {
+            libc::openat(
+                dir_fd.as_raw_fd(),
+                c_name.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if raw < 0 {
+            return Err(StorageBackendError::io(
+                "open capture-spool entry for SHA-256 verification",
+                io::Error::last_os_error(),
+            ));
+        }
+        // SAFETY: `raw >= 0` is exclusively owned.
+        let file = unsafe { File::from_raw_fd(raw) };
+        let mut st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+        // SAFETY: `file` is valid.
+        if unsafe { libc::fstat(file.as_raw_fd(), st.as_mut_ptr()) } != 0 {
+            return Err(StorageBackendError::io(
+                "stat capture-spool entry for SHA-256 verification",
+                io::Error::last_os_error(),
+            ));
+        }
+        // SAFETY: `fstat` succeeded.
+        let st = unsafe { st.assume_init() };
+        if (st.st_mode & libc::S_IFMT) != libc::S_IFREG || st.st_uid != euid || st.st_nlink != 1 {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "forward migration Step 2.3 rejected non-regular, hardlinked, or foreign-owned {kind} entry in capture-spool/{slot}"
+                ),
+            });
+        }
+        Ok((file, UnixSpoolEntryIdentity::from_stat(&st)))
+    };
+
+    let (mut live_file, live_id) = open_reg(live_sub_fd, "live")?;
+    if live_id != expected_live_id {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration Step 2.3 detected concurrent replacement while verifying capture-spool/{slot}"
+            ),
+        });
+    }
+    let (mut backup_file, _backup_id) = open_reg(backup_sub_fd, "backup")?;
+    let live_sha = stream_sha256_of_file(&mut live_file, "live capture-spool entry")?;
+    let backup_sha = stream_sha256_of_file(&mut backup_file, "backup capture-spool entry")?;
+    if live_sha != backup_sha {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration Step 2.3 refused to delete live capture-spool/{slot} file: backup SHA-256 mismatch"
+            ),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+struct SpoolTombstoneTmpGuardUnix<'a> {
+    spool_fd: &'a std::os::unix::io::OwnedFd,
+    c_tmp: &'a std::ffi::CString,
+    inode: (u64, u64),
+    armed: bool,
+}
+
+#[cfg(unix)]
+impl Drop for SpoolTombstoneTmpGuardUnix<'_> {
+    fn drop(&mut self) {
+        use std::os::unix::io::AsRawFd as _;
+        if !self.armed {
+            return;
+        }
+        let mut st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+        // SAFETY: `spool_fd` is valid and `c_tmp` is NUL-terminated.
+        if unsafe {
+            libc::fstatat(
+                self.spool_fd.as_raw_fd(),
+                self.c_tmp.as_ptr(),
+                st.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } == 0
+        {
+            // SAFETY: `fstatat` succeeded.
+            let st = unsafe { st.assume_init() };
+            if (st.st_mode & libc::S_IFMT) == libc::S_IFREG
+                && (st.st_dev as u64, st.st_ino as u64) == self.inode
+            {
+                // SAFETY: `spool_fd` is valid and `c_tmp` matches our exact temp inode.
+                let _ =
+                    unsafe { libc::unlinkat(self.spool_fd.as_raw_fd(), self.c_tmp.as_ptr(), 0) };
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn open_dir_fd_unix_step2_3(path: &Path, label: &str) -> StorageResult<std::os::unix::io::OwnedFd> {
+    use std::{
+        ffi::CString,
+        os::unix::{
+            ffi::OsStrExt as _,
+            io::{FromRawFd as _, OwnedFd},
+        },
+    };
+    let c_path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        StorageBackendError::BackendInternal {
+            detail: format!("invalid path for {label}"),
+        }
+    })?;
+    // SAFETY: `c_path` is NUL-terminated.
+    let raw = unsafe {
+        libc::open(
+            c_path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if raw < 0 {
+        return Err(StorageBackendError::io(
+            "open Step 2.3 directory descriptor",
+            io::Error::last_os_error(),
+        ));
+    }
+    // SAFETY: `raw >= 0` is exclusively owned.
+    Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+}
+
+#[cfg(unix)]
+fn open_subdir_fd_unix_step2_3(
+    parent_fd: &std::os::unix::io::OwnedFd,
+    name: &str,
+    label: &str,
+    euid: libc::uid_t,
+    require_owner: bool,
+) -> StorageResult<(std::os::unix::io::OwnedFd, (u64, u64))> {
+    use std::{
+        ffi::CString,
+        os::unix::io::{AsRawFd as _, FromRawFd as _, OwnedFd},
+    };
+    let c_name = CString::new(name).map_err(|_| StorageBackendError::BackendInternal {
+        detail: format!("invalid directory name for {label}"),
+    })?;
+    // SAFETY: `parent_fd` is valid and `c_name` is NUL-terminated.
+    let raw = unsafe {
+        libc::openat(
+            parent_fd.as_raw_fd(),
+            c_name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if raw < 0 {
+        return Err(StorageBackendError::io(
+            "open Step 2.3 subdirectory descriptor",
+            io::Error::last_os_error(),
+        ));
+    }
+    // SAFETY: `raw >= 0` is exclusively owned.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    let mut st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: `fd` is valid.
+    if unsafe { libc::fstat(fd.as_raw_fd(), st.as_mut_ptr()) } != 0 {
+        return Err(StorageBackendError::io(
+            "stat Step 2.3 subdirectory descriptor",
+            io::Error::last_os_error(),
+        ));
+    }
+    // SAFETY: `fstat` succeeded.
+    let st = unsafe { st.assume_init() };
+    if (st.st_mode & libc::S_IFMT) != libc::S_IFDIR || (require_owner && st.st_uid != euid) {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration Step 2.3 rejected non-directory or foreign-owned {label}"
+            ),
+        });
+    }
+    Ok((fd, (st.st_dev as u64, st.st_ino as u64)))
+}
+
+#[cfg(unix)]
+fn verify_held_capacity_lock_unmoved_unix(
+    spool_fd: &std::os::unix::io::OwnedFd,
+    held_capacity_lock: &File,
+    euid: libc::uid_t,
+) -> StorageResult<()> {
+    use std::{ffi::CString, os::unix::io::AsRawFd as _};
+    let mut held_st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: `held_capacity_lock` is an open valid file handle.
+    if unsafe { libc::fstat(held_capacity_lock.as_raw_fd(), held_st.as_mut_ptr()) } != 0 {
+        return Err(StorageBackendError::io(
+            "stat held capture-spool/capacity.lock",
+            io::Error::last_os_error(),
+        ));
+    }
+    // SAFETY: `fstat` succeeded.
+    let held_st = unsafe { held_st.assume_init() };
+    let c_lock = CString::new(CAPTURE_SPOOL_CAPACITY_LOCK_FILE).map_err(|_| {
+        StorageBackendError::BackendInternal {
+            detail: "invalid capacity.lock filename".to_string(),
+        }
+    })?;
+    let mut live_st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: `spool_fd` is valid and `c_lock` is NUL-terminated.
+    if unsafe {
+        libc::fstatat(
+            spool_fd.as_raw_fd(),
+            c_lock.as_ptr(),
+            live_st.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(StorageBackendError::io(
+            "stat live capture-spool/capacity.lock",
+            io::Error::last_os_error(),
+        ));
+    }
+    // SAFETY: `fstatat` succeeded.
+    let live_st = unsafe { live_st.assume_init() };
+    if (live_st.st_mode & libc::S_IFMT) != libc::S_IFREG
+        || live_st.st_uid != euid
+        || (live_st.st_dev, live_st.st_ino) != (held_st.st_dev, held_st.st_ino)
+    {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "forward migration Step 2.3 detected moved or replaced capture-spool/capacity.lock inode"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Atomically install (or tighten to `0400`) one `capture-spool` slot tombstone
+/// on Unix while `capacity.lock` is held (`ADR-RB-07` #1 Step 2.3).
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn install_single_spool_tombstone_unix(
+    common_storage: &Path,
+    spool_fd: &std::os::unix::io::OwnedFd,
+    slot: &'static str,
+    already_fenced: bool,
+    euid: libc::uid_t,
+    mut durability: Option<&mut Phase2DurabilityReceipt>,
+    ensure_spool_race_retries: &mut usize,
+    #[cfg(test)] observer: &mut Option<&mut dyn Phase2FinalizeTestObserver>,
+) -> StorageResult<()> {
+    use std::{
+        ffi::CString,
+        io::Write as _,
+        os::unix::io::{AsRawFd as _, FromRawFd as _},
+    };
+
+    #[cfg(not(test))]
+    let _ = common_storage;
+
+    let rel_slot = format!("{PRIVATE_SUBDIR}/{CAPTURE_SPOOL_SUBDIR}/{slot}");
+    let c_slot = CString::new(slot).map_err(|_| StorageBackendError::BackendInternal {
+        detail: format!("invalid capture-spool slot name `{slot}`"),
+    })?;
+    if already_fenced {
+        // SAFETY: `spool_fd` is valid and `c_slot` is NUL-terminated.
+        let raw = unsafe {
+            libc::openat(
+                spool_fd.as_raw_fd(),
+                c_slot.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if raw < 0 {
+            return Err(StorageBackendError::io(
+                "re-open existing capture-spool tombstone",
+                io::Error::last_os_error(),
+            ));
+        }
+        // SAFETY: `raw >= 0` is exclusively owned.
+        let file = unsafe { File::from_raw_fd(raw) };
+        let mut st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+        // SAFETY: `file` is valid.
+        if unsafe { libc::fstat(file.as_raw_fd(), st.as_mut_ptr()) } != 0 {
+            return Err(StorageBackendError::io(
+                "stat existing capture-spool tombstone",
+                io::Error::last_os_error(),
+            ));
+        }
+        // SAFETY: `fstat` succeeded.
+        let st = unsafe { st.assume_init() };
+        if (u32::from(st.st_mode) & 0o7777) != 0o400 {
+            // SAFETY: `file` is valid.
+            if unsafe { libc::fchmod(file.as_raw_fd(), 0o400 as libc::mode_t) } != 0 {
+                return Err(StorageBackendError::io(
+                    "tighten existing capture-spool tombstone mode to 0400",
+                    io::Error::last_os_error(),
+                ));
+            }
+            file.sync_all().map_err(|err| {
+                StorageBackendError::io("fsync tightened capture-spool tombstone", err)
+            })?;
+        }
+        if let Some(d) = durability {
+            d.record(
+                Phase2DurabilityOpKind::SpoolTombstoneAtomicPublish,
+                None,
+                rel_slot,
+            );
+        }
+        return Ok(());
+    }
+
+    // Stage a private `0400` regular file tombstone inside `capture-spool/`
+    // and `fsync` it BEFORE removing the directory slot so the tombstone is
+    // immediately durable upon atomic `linkat` publication.
+    let mut staged: Option<(CString, File)> = None;
+    for _ in 0..64 {
+        let seq = PHASE2_SPOOL_TOMBSTONE_TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp_name = format!(".tombstone.{slot}.{}.{}.tmp", std::process::id(), seq);
+        let c_tmp = CString::new(tmp_name).map_err(|_| StorageBackendError::BackendInternal {
+            detail: "invalid capture-spool tombstone temp filename".to_string(),
+        })?;
+        // SAFETY: `spool_fd` is valid and `c_tmp` is NUL-terminated.
+        let raw_tmp = unsafe {
+            libc::openat(
+                spool_fd.as_raw_fd(),
+                c_tmp.as_ptr(),
+                libc::O_CREAT | libc::O_EXCL | libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600 as libc::mode_t as libc::c_uint,
+            )
+        };
+        if raw_tmp >= 0 {
+            // SAFETY: `raw_tmp >= 0` is exclusively owned.
+            staged = Some((c_tmp, unsafe { File::from_raw_fd(raw_tmp) }));
+            break;
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::AlreadyExists {
+            continue;
+        }
+        return Err(StorageBackendError::io(
+            "create temp capture-spool tombstone",
+            err,
+        ));
+    }
+    let (c_tmp, mut tmp_file) = staged.ok_or_else(|| StorageBackendError::BackendInternal {
+        detail: format!("exhausted temp tombstone filenames for {rel_slot}"),
+    })?;
+    let mut tmp_st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: `tmp_file` is valid.
+    if unsafe { libc::fstat(tmp_file.as_raw_fd(), tmp_st.as_mut_ptr()) } != 0 {
+        return Err(StorageBackendError::io(
+            "stat temp capture-spool tombstone",
+            io::Error::last_os_error(),
+        ));
+    }
+    // SAFETY: `fstat` succeeded.
+    let tmp_st = unsafe { tmp_st.assume_init() };
+    let tmp_inode = (tmp_st.st_dev as u64, tmp_st.st_ino as u64);
+    let mut tmp_guard = SpoolTombstoneTmpGuardUnix {
+        spool_fd,
+        c_tmp: &c_tmp,
+        inode: tmp_inode,
+        armed: true,
+    };
+
+    tmp_file
+        .write_all(CAPTURE_SPOOL_TOMBSTONE_SENTINEL)
+        .map_err(|err| StorageBackendError::io("write capture-spool tombstone sentinel", err))?;
+    // SAFETY: `tmp_file` is valid.
+    if unsafe { libc::fchmod(tmp_file.as_raw_fd(), 0o400 as libc::mode_t) } != 0 {
+        return Err(StorageBackendError::io(
+            "chmod 0400 temp capture-spool tombstone",
+            io::Error::last_os_error(),
+        ));
+    }
+    let mut post_chmod_st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: `tmp_file` is valid.
+    if unsafe { libc::fstat(tmp_file.as_raw_fd(), post_chmod_st.as_mut_ptr()) } != 0 {
+        return Err(StorageBackendError::io(
+            "verify chmod 0400 temp capture-spool tombstone",
+            io::Error::last_os_error(),
+        ));
+    }
+    // SAFETY: `fstat` succeeded.
+    let post_chmod_st = unsafe { post_chmod_st.assume_init() };
+    if (u32::from(post_chmod_st.st_mode) & 0o7777) != 0o400 {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!("capture-spool tombstone mode failed to settle at 0400 for {rel_slot}"),
+        });
+    }
+    tmp_file
+        .sync_all()
+        .map_err(|err| StorageBackendError::io("fsync temp capture-spool tombstone", err))?;
+    drop(tmp_file);
+    if let Some(d) = durability.as_deref_mut() {
+        d.record(
+            Phase2DurabilityOpKind::SpoolTombstoneFileFsync,
+            None,
+            rel_slot.clone(),
+        );
+    }
+
+    // Replace empty directory with the `0400` regular file tombstone using
+    // non-replacing `linkat`, retrying cleanly if a concurrent `spool.rs:105`
+    // `ensure_spool` recreates an empty directory in between `rmdir` and `linkat`
+    // (while our process continuously holds `capacity.lock` so zero files can
+    // be written into that directory!).
+    let mut published = false;
+    for attempt in 0..=MAX_SPOOL_TOMBSTONE_RACE_RETRIES {
+        // SAFETY: `spool_fd` is valid and `c_slot` is NUL-terminated.
+        if unsafe { libc::unlinkat(spool_fd.as_raw_fd(), c_slot.as_ptr(), libc::AT_REMOVEDIR) } != 0
+        {
+            let err = io::Error::last_os_error();
+            if err.kind() != io::ErrorKind::NotFound {
+                return Err(StorageBackendError::io(
+                    "remove empty capture-spool directory before tombstone publish",
+                    err,
+                ));
+            }
+        }
+
+        #[cfg(test)]
+        if attempt == 0
+            && let Some(obs) = observer.as_deref_mut()
+        {
+            obs.on_point(
+                Phase2FinalizeTestPoint::AfterRmdirBeforeLinkTombstone(slot),
+                common_storage,
+            )?;
+        }
+
+        // SAFETY: `spool_fd`, `c_tmp`, `c_slot` are valid and NUL-terminated.
+        if unsafe {
+            libc::linkat(
+                spool_fd.as_raw_fd(),
+                c_tmp.as_ptr(),
+                spool_fd.as_raw_fd(),
+                c_slot.as_ptr(),
+                0,
+            )
+        } == 0
+        {
+            // Verify published slot resolves to our exact `0400` staged inode,
+            // then unlink the staging temp name.
+            let mut pub_st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+            // SAFETY: `spool_fd` is valid and `c_slot` is NUL-terminated.
+            if unsafe {
+                libc::fstatat(
+                    spool_fd.as_raw_fd(),
+                    c_slot.as_ptr(),
+                    pub_st.as_mut_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            } != 0
+            {
+                return Err(StorageBackendError::io(
+                    "verify published capture-spool tombstone",
+                    io::Error::last_os_error(),
+                ));
+            }
+            // SAFETY: `fstatat` succeeded.
+            let pub_st = unsafe { pub_st.assume_init() };
+            if (pub_st.st_mode & libc::S_IFMT) != libc::S_IFREG
+                || pub_st.st_uid != euid
+                || (u32::from(pub_st.st_mode) & 0o7777) != 0o400
+                || (pub_st.st_dev as u64, pub_st.st_ino as u64) != tmp_inode
+            {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: format!(
+                        "forward migration Step 2.3 published tombstone identity mismatch at {rel_slot}"
+                    ),
+                });
+            }
+            // SAFETY: `spool_fd` is valid and `c_tmp` is our temp name.
+            if unsafe { libc::unlinkat(spool_fd.as_raw_fd(), c_tmp.as_ptr(), 0) } != 0 {
+                return Err(StorageBackendError::io(
+                    "remove temp capture-spool tombstone name",
+                    io::Error::last_os_error(),
+                ));
+            }
+            tmp_guard.armed = false;
+            published = true;
+            break;
+        }
+
+        let link_err = io::Error::last_os_error();
+        if link_err.kind() == io::ErrorKind::AlreadyExists
+            && attempt < MAX_SPOOL_TOMBSTONE_RACE_RETRIES
+        {
+            let mut race_st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+            // SAFETY: `spool_fd` is valid and `c_slot` is NUL-terminated.
+            if unsafe {
+                libc::fstatat(
+                    spool_fd.as_raw_fd(),
+                    c_slot.as_ptr(),
+                    race_st.as_mut_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            } == 0
+            {
+                // SAFETY: `fstatat` succeeded.
+                let race_st = unsafe { race_st.assume_init() };
+                if (race_st.st_mode & libc::S_IFMT) == libc::S_IFDIR && race_st.st_uid == euid {
+                    *ensure_spool_race_retries += 1;
+                    continue;
+                }
+            }
+        }
+        return Err(StorageBackendError::io(
+            "publish 0400 capture-spool tombstone",
+            link_err,
+        ));
+    }
+
+    if !published {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration Step 2.3 exhausted ensure_spool race retries publishing {rel_slot}"
+            ),
+        });
+    }
+    if let Some(d) = durability {
+        d.record(
+            Phase2DurabilityOpKind::SpoolTombstoneAtomicPublish,
+            None,
+            rel_slot,
+        );
+    }
+    Ok(())
+}
+
+/// Strict atomic non-replacing rename within a single pinned Unix directory
+/// descriptor (`renameatx_np(RENAME_EXCL)` on macOS, `SYS_renameat2(RENAME_NOREPLACE)`
+/// on Linux). Unlike [`rename_noreplace_at_unix`], NEVER falls back to
+/// non-atomic `linkat` + `unlinkat` so a concurrent replacement of `c_src`
+/// cannot be deleted prior to post-isolation verification (`RB-10g`).
+#[cfg(unix)]
+fn strict_atomic_rename_noreplace_at_unix(
+    dir_fd: &std::os::unix::io::OwnedFd,
+    c_src: &std::ffi::CStr,
+    c_dst: &std::ffi::CStr,
+) -> Result<(), UnixNoReplaceError> {
+    use std::os::unix::io::AsRawFd as _;
+    let dfd = dir_fd.as_raw_fd();
+
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        // SAFETY: `dfd` is a valid pinned directory fd and both C-strings are NUL-terminated.
+        if unsafe {
+            libc::renameatx_np(dfd, c_src.as_ptr(), dfd, c_dst.as_ptr(), libc::RENAME_EXCL)
+        } == 0
+        {
+            return Ok(());
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::AlreadyExists {
+            Err(UnixNoReplaceError::AlreadyExists)
+        } else {
+            Err(UnixNoReplaceError::NotPublished(err))
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: `SYS_renameat2` takes `(olddirfd, oldpath, newdirfd, newpath, flags)`.
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                dfd,
+                c_src.as_ptr(),
+                dfd,
+                c_dst.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        if rc == 0 {
+            return Ok(());
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::AlreadyExists {
+            Err(UnixNoReplaceError::AlreadyExists)
+        } else {
+            // Fail closed when `renameat2(RENAME_NOREPLACE)` is unavailable:
+            // NEVER fall back to non-atomic `linkat` + `unlinkat`!
+            Err(UnixNoReplaceError::NotPublished(err))
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "linux")))]
+    {
+        let _ = (dfd, c_src, c_dst);
+        Err(UnixNoReplaceError::NotPublished(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "atomic non-replacing renameat is unsupported on this Unix target",
+        )))
+    }
+}
+
+/// Atomically isolate a verified `capture-spool` entry under a unique hidden
+/// unpredictable name inside the pinned directory (`strict_atomic_rename_noreplace_at_unix`),
+/// re-verify the isolated inode's exact `(dev, ino)`, size, and mtime AFTER
+/// isolation, and ONLY then `unlinkat` the isolated name. If a concurrent
+/// replacement occurred even AFTER the final pre-check and BEFORE isolation,
+/// atomically restore the unbacked replacement file via strict non-replacing
+/// rename and fail closed (`LBR-IO-001`) with zero data loss (`RB-10g`).
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn atomic_isolate_verify_and_unlink_unix(
+    common_storage: &Path,
+    sub_fd: &std::os::unix::io::OwnedFd,
+    c_name: &std::ffi::CString,
+    expected_id: UnixSpoolEntryIdentity,
+    euid: libc::uid_t,
+    slot: &'static str,
+    rel_slot: &str,
+    #[cfg(test)] observer: &mut Option<&mut dyn Phase2FinalizeTestObserver>,
+) -> StorageResult<()> {
+    use std::{
+        collections::hash_map::RandomState, ffi::CString, hash::BuildHasher as _,
+        os::unix::io::AsRawFd as _,
+    };
+
+    #[cfg(not(test))]
+    let _ = (common_storage, slot);
+
+    // Pre-check exact `(dev, ino, size, mtime, ctime, nlink)` on pinned `sub_fd`.
+    let mut pre_st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: `sub_fd` is valid and `c_name` is NUL-terminated.
+    if unsafe {
+        libc::fstatat(
+            sub_fd.as_raw_fd(),
+            c_name.as_ptr(),
+            pre_st.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(StorageBackendError::io(
+            "re-stat verified capture-spool entry before atomic isolation",
+            io::Error::last_os_error(),
+        ));
+    }
+    // SAFETY: `fstatat` succeeded.
+    let pre_st = unsafe { pre_st.assume_init() };
+    if (pre_st.st_mode & libc::S_IFMT) != libc::S_IFREG
+        || pre_st.st_uid != euid
+        || pre_st.st_nlink != 1
+        || UnixSpoolEntryIdentity::from_stat(&pre_st) != expected_id
+    {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration Step 2.3 refused to delete replaced or modified entry in {rel_slot}"
+            ),
+        });
+    }
+
+    #[cfg(test)]
+    if let Some(obs) = observer.as_deref_mut() {
+        obs.on_point(
+            Phase2FinalizeTestPoint::AfterFinalIdentityCheckBeforeIsolate(slot),
+            common_storage,
+        )?;
+    }
+
+    // Atomically isolate the entry to a unique, OS-seeded random hidden staging
+    // name inside `sub_fd` via strict atomic non-replacing rename (ZERO
+    // non-atomic `linkat+unlinkat` fallback; zero bytes deleted prior to
+    // post-isolation inode verification!).
+    let mut c_isolated: Option<CString> = None;
+    for _ in 0..64 {
+        let seq = PHASE2_SPOOL_TOMBSTONE_TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let nonce_a = RandomState::new().hash_one(seq);
+        let nonce_b = RandomState::new().hash_one((std::process::id(), seq));
+        let iso_name = format!(".rb10g-del.{nonce_a:016x}{nonce_b:016x}.{seq}.tmp");
+        let candidate =
+            CString::new(iso_name).map_err(|_| StorageBackendError::BackendInternal {
+                detail: "invalid spool isolation staging filename".to_string(),
+            })?;
+        match strict_atomic_rename_noreplace_at_unix(sub_fd, c_name, &candidate) {
+            Ok(()) => {
+                c_isolated = Some(candidate);
+                break;
+            }
+            Err(UnixNoReplaceError::AlreadyExists) => continue,
+            Err(UnixNoReplaceError::NotPublished(err)) => {
+                return Err(StorageBackendError::io(
+                    "atomically isolate verified capture-spool entry",
+                    err,
+                ));
+            }
+            Err(UnixNoReplaceError::PublishedWithStaleSource(err)) => {
+                return Err(StorageBackendError::io(
+                    "atomically isolate verified capture-spool entry (stale source)",
+                    err,
+                ));
+            }
+        }
+    }
+    let c_isolated = c_isolated.ok_or_else(|| StorageBackendError::BackendInternal {
+        detail: format!("exhausted isolation staging filenames inside {rel_slot}"),
+    })?;
+
+    // Verify the NOW-ISOLATED inode's exact `(dev, ino)`, size, mtime, owner,
+    // regular type, and link count (`renameat` bumps `st_ctime` on POSIX, while
+    // `(dev, ino)`, `byte_len`, and `mtime` remain invariant for the verified inode).
+    let mut iso_st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: `sub_fd` is valid and `c_isolated` is NUL-terminated.
+    if unsafe {
+        libc::fstatat(
+            sub_fd.as_raw_fd(),
+            c_isolated.as_ptr(),
+            iso_st.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        let err = io::Error::last_os_error();
+        let _ = strict_atomic_rename_noreplace_at_unix(sub_fd, &c_isolated, c_name);
+        return Err(StorageBackendError::io(
+            "stat atomically isolated capture-spool entry",
+            err,
+        ));
+    }
+    // SAFETY: `fstatat` succeeded.
+    let iso_st = unsafe { iso_st.assume_init() };
+    let iso_id = UnixSpoolEntryIdentity::from_stat(&iso_st);
+    if (iso_st.st_mode & libc::S_IFMT) != libc::S_IFREG
+        || iso_st.st_uid != euid
+        || iso_st.st_nlink != 1
+        || iso_id.inode != expected_id.inode
+        || iso_id.byte_len != expected_id.byte_len
+        || iso_id.mtime != expected_id.mtime
+    {
+        // A concurrent replacement occurred AFTER our pre-check and BEFORE
+        // isolation! Atomically restore the replacement file without overwriting
+        // any newer file at `c_name`, and fail closed!
+        let _ = strict_atomic_rename_noreplace_at_unix(sub_fd, &c_isolated, c_name);
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration Step 2.3 detected post-check replacement in {rel_slot} and restored isolated file"
+            ),
+        });
+    }
+
+    // SAFETY: `sub_fd` is pinned and `c_isolated` is exclusively verified to be `expected_id`.
+    if unsafe { libc::unlinkat(sub_fd.as_raw_fd(), c_isolated.as_ptr(), 0) } != 0 {
+        return Err(StorageBackendError::io(
+            "unlink atomically isolated verified capture-spool entry",
+            io::Error::last_os_error(),
+        ));
+    }
+    Ok(())
+}
+
+/// Defensive error-path fence executed BEFORE releasing `capacity.lock` when
+/// Step 2.3 fails after Step 2.2 has already unlinked legacy SQLite databases:
+/// tries in priority order `[tmp, quarantine, ready]` and atomically replaces
+/// the FIRST slot that can be fenced WITHOUT deleting any unexpired `tmp/` file
+/// or any unbacked `ready/`/`quarantine/` file:
+/// - Fencing `tmp` blocks waiting hooks at `spool.rs:113` (`delete_expired_tmp`)
+///   and fresh hooks at `spool.rs:105` (`ensure_spool`) while preserving all
+///   `ready/` & `quarantine/` data.
+/// - If `tmp` itself holds an unexpired in-flight file, falling back to fencing
+///   empty/absent `quarantine` (or `ready`) blocks BOTH an in-flight publisher
+///   resuming `spool.rs:149`/`146` (`publish_tmp` `combined_usage`/`ready_has_key`)
+///   AND fresh hooks at `spool.rs:105` while preserving the in-flight `tmp/` file!
+#[cfg(unix)]
+fn fence_tmp_slot_defensively_under_held_lock(
+    common_storage: &Path,
+    held_capacity_lock: &File,
+) -> StorageResult<()> {
+    use std::{
+        ffi::CString,
+        io::Read as _,
+        os::unix::io::{AsRawFd as _, FromRawFd as _},
+    };
+
+    // SAFETY: `geteuid` has no preconditions and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    let root_fd = open_dir_fd_unix_step2_3(common_storage, "repository storage root")?;
+    let (private_fd, _) =
+        open_subdir_fd_unix_step2_3(&root_fd, PRIVATE_SUBDIR, "private directory", euid, true)?;
+    let (spool_fd, _) = open_subdir_fd_unix_step2_3(
+        &private_fd,
+        CAPTURE_SPOOL_SUBDIR,
+        "capture-spool directory",
+        euid,
+        true,
+    )?;
+    verify_held_capacity_lock_unmoved_unix(&spool_fd, held_capacity_lock, euid)?;
+
+    let try_fence_slot = |slot: &'static str, allow_expired_tmp_clear: bool| -> StorageResult<()> {
+        let rel_slot = format!("{PRIVATE_SUBDIR}/{CAPTURE_SPOOL_SUBDIR}/{slot}");
+        let c_slot = CString::new(slot).map_err(|_| StorageBackendError::BackendInternal {
+            detail: format!("invalid {slot} slot name"),
+        })?;
+        let mut existing_st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+        // SAFETY: `spool_fd` is valid and `c_slot` is NUL-terminated.
+        let stat_rc = unsafe {
+            libc::fstatat(
+                spool_fd.as_raw_fd(),
+                c_slot.as_ptr(),
+                existing_st.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        let mut already_fenced = false;
+        if stat_rc == 0 {
+            // SAFETY: `fstatat` succeeded.
+            let st = unsafe { existing_st.assume_init() };
+            match st.st_mode & libc::S_IFMT {
+                libc::S_IFREG => {
+                    if st.st_uid != euid {
+                        return Err(StorageBackendError::BackendInternal {
+                            detail: format!(
+                                "defensive Step 2.3 fence rejected foreign-owned file at {rel_slot}"
+                            ),
+                        });
+                    }
+                    // SAFETY: `spool_fd` is valid and `c_slot` is NUL-terminated.
+                    let raw = unsafe {
+                        libc::openat(
+                            spool_fd.as_raw_fd(),
+                            c_slot.as_ptr(),
+                            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                        )
+                    };
+                    if raw < 0 {
+                        return Err(StorageBackendError::io(
+                            "open existing tombstone during defensive fence",
+                            io::Error::last_os_error(),
+                        ));
+                    }
+                    // SAFETY: `raw >= 0` is exclusively owned.
+                    let mut file = unsafe { File::from_raw_fd(raw) };
+                    let mut buf = Vec::with_capacity(CAPTURE_SPOOL_TOMBSTONE_SENTINEL.len() + 1);
+                    std::io::Read::by_ref(&mut file)
+                        .take((CAPTURE_SPOOL_TOMBSTONE_SENTINEL.len() + 1) as u64)
+                        .read_to_end(&mut buf)
+                        .map_err(|err| {
+                            StorageBackendError::io(
+                                "read existing tombstone during defensive fence",
+                                err,
+                            )
+                        })?;
+                    if buf.as_slice() != CAPTURE_SPOOL_TOMBSTONE_SENTINEL {
+                        return Err(StorageBackendError::BackendInternal {
+                            detail: format!(
+                                "defensive Step 2.3 fence rejected non-tombstone file at {rel_slot}"
+                            ),
+                        });
+                    }
+                    already_fenced = true;
+                }
+                libc::S_IFDIR => {
+                    let (sub_fd, sub_inode) =
+                        open_subdir_fd_unix_step2_3(&spool_fd, slot, &rel_slot, euid, true)?;
+                    let names = list_sorted_cstr_names_unix(&sub_fd, &rel_slot)?;
+                    if !names.is_empty() {
+                        if !allow_expired_tmp_clear {
+                            return Err(StorageBackendError::BackendInternal {
+                                detail: format!(
+                                    "defensive Step 2.3 fence skipped non-empty {rel_slot} to preserve data"
+                                ),
+                            });
+                        }
+                        let now = SystemTime::now();
+                        let mut verified: Vec<(CString, UnixSpoolEntryIdentity)> =
+                            Vec::with_capacity(names.len());
+                        for c_name in names {
+                            let mut est = std::mem::MaybeUninit::<libc::stat>::zeroed();
+                            // SAFETY: `sub_fd` is valid and `c_name` is NUL-terminated.
+                            if unsafe {
+                                libc::fstatat(
+                                    sub_fd.as_raw_fd(),
+                                    c_name.as_ptr(),
+                                    est.as_mut_ptr(),
+                                    libc::AT_SYMLINK_NOFOLLOW,
+                                )
+                            } != 0
+                            {
+                                return Err(StorageBackendError::io(
+                                    "stat tmp entry during defensive fence",
+                                    io::Error::last_os_error(),
+                                ));
+                            }
+                            // SAFETY: `fstatat` succeeded.
+                            let est = unsafe { est.assume_init() };
+                            if (est.st_mode & libc::S_IFMT) != libc::S_IFREG
+                                || est.st_uid != euid
+                                || est.st_nlink != 1
+                            {
+                                return Err(StorageBackendError::BackendInternal {
+                                    detail: format!(
+                                        "defensive Step 2.3 fence refused non-regular entry in {rel_slot}"
+                                    ),
+                                });
+                            }
+                            let mtime_secs = u64::try_from(est.st_mtime).unwrap_or(0);
+                            let mtime = std::time::UNIX_EPOCH + Duration::from_secs(mtime_secs);
+                            let is_expired = now
+                                .duration_since(mtime)
+                                .is_ok_and(|age| age >= CAPTURE_SPOOL_TMP_MAX_AGE);
+                            if !is_expired {
+                                return Err(StorageBackendError::BackendInternal {
+                                    detail: "defensive Step 2.3 fence refused to remove unexpired in-flight capture-spool/tmp file"
+                                        .to_string(),
+                                });
+                            }
+                            verified.push((c_name, UnixSpoolEntryIdentity::from_stat(&est)));
+                        }
+                        let mut dir_check = std::mem::MaybeUninit::<libc::stat>::zeroed();
+                        // SAFETY: `spool_fd` is valid and `c_slot` is NUL-terminated.
+                        if unsafe {
+                            libc::fstatat(
+                                spool_fd.as_raw_fd(),
+                                c_slot.as_ptr(),
+                                dir_check.as_mut_ptr(),
+                                libc::AT_SYMLINK_NOFOLLOW,
+                            )
+                        } != 0
+                        {
+                            return Err(StorageBackendError::io(
+                                "re-verify tmp directory before defensive cleanup",
+                                io::Error::last_os_error(),
+                            ));
+                        }
+                        // SAFETY: `fstatat` succeeded.
+                        let dir_check = unsafe { dir_check.assume_init() };
+                        if (dir_check.st_mode & libc::S_IFMT) != libc::S_IFDIR
+                            || (dir_check.st_dev as u64, dir_check.st_ino as u64) != sub_inode
+                        {
+                            return Err(StorageBackendError::BackendInternal {
+                                detail: "defensive Step 2.3 fence detected replaced capture-spool/tmp directory"
+                                    .to_string(),
+                            });
+                        }
+                        for (c_name, expected_id) in verified {
+                            atomic_isolate_verify_and_unlink_unix(
+                                common_storage,
+                                &sub_fd,
+                                &c_name,
+                                expected_id,
+                                euid,
+                                slot,
+                                &rel_slot,
+                                #[cfg(test)]
+                                &mut None,
+                            )?;
+                        }
+                        fsync_dir_fd_unix(
+                            &sub_fd,
+                            "cleared capture-spool/tmp during defensive fence",
+                        )?;
+                    }
+                }
+                _ => {
+                    return Err(StorageBackendError::BackendInternal {
+                        detail: format!(
+                            "defensive Step 2.3 fence rejected symlink or special file at {rel_slot}"
+                        ),
+                    });
+                }
+            }
+        } else {
+            let err = io::Error::last_os_error();
+            if err.kind() != io::ErrorKind::NotFound {
+                return Err(StorageBackendError::io(
+                    "inspect capture-spool slot during defensive fence",
+                    err,
+                ));
+            }
+        }
+
+        let mut retries = 0usize;
+        install_single_spool_tombstone_unix(
+            common_storage,
+            &spool_fd,
+            slot,
+            already_fenced,
+            euid,
+            None,
+            &mut retries,
+            #[cfg(test)]
+            &mut None,
+        )?;
+        fsync_dir_fd_unix(
+            &spool_fd,
+            "capture-spool directory after defensive slot fence",
+        )?;
+        fsync_dir_fd_unix(&private_fd, "private directory after defensive slot fence")?;
+        Ok(())
+    };
+
+    let mut last_err: Option<StorageBackendError> = None;
+    for (slot, allow_tmp_clear) in [
+        (CAPTURE_SPOOL_TMP_SUBDIR, true),
+        (CAPTURE_SPOOL_QUARANTINE_SUBDIR, false),
+        (CAPTURE_SPOOL_READY_SUBDIR, false),
+    ] {
+        match try_fence_slot(slot, allow_tmp_clear) {
+            Ok(()) => return Ok(()),
+            Err(err) => last_err = Some(err),
+        }
+    }
+    Err(
+        last_err.unwrap_or_else(|| StorageBackendError::BackendInternal {
+            detail: "defensive Step 2.3 fence could not fence any capture-spool slot without deleting unbacked data"
+                .to_string(),
+        }),
+    )
+}
+
+/// Clear backed-up spool files and atomically install `0400` regular file
+/// tombstones for `{tmp, ready, quarantine}` in place under the continuously
+/// held, unmoved `.libra/private/capture-spool/capacity.lock` (`ADR-RB-07` #1
+/// Step 2.3, `RB-10g`).
+#[cfg(unix)]
+fn install_inplace_spool_tombstones_under_held_lock(
+    common_storage: &Path,
+    backup_rel_dir: &str,
+    held_capacity_lock: &File,
+    verified_spool_identities: &[VerifiedSpoolFileIdentity],
+    durability: &mut Phase2DurabilityReceipt,
+    #[cfg(test)] observer: &mut Option<&mut dyn Phase2FinalizeTestObserver>,
+) -> StorageResult<ForwardPhase2SpoolFenceReceipt> {
+    use std::{
+        collections::HashMap,
+        ffi::CString,
+        io::Read as _,
+        os::unix::io::{AsRawFd as _, FromRawFd as _, OwnedFd},
+    };
+
+    let started = Instant::now();
+    // SAFETY: `geteuid` has no preconditions and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+
+    let root_fd = open_dir_fd_unix_step2_3(common_storage, "repository storage root")?;
+    let (private_fd, _) =
+        open_subdir_fd_unix_step2_3(&root_fd, PRIVATE_SUBDIR, "private directory", euid, true)?;
+    let (spool_fd, _) = open_subdir_fd_unix_step2_3(
+        &private_fd,
+        CAPTURE_SPOOL_SUBDIR,
+        "capture-spool directory",
+        euid,
+        true,
+    )?;
+    // Enforce strict `0700` mode on `capture-spool/` while holding the unmoved lock.
+    {
+        let mut st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+        // SAFETY: `spool_fd` is valid.
+        if unsafe { libc::fstat(spool_fd.as_raw_fd(), st.as_mut_ptr()) } != 0 {
+            return Err(StorageBackendError::io(
+                "stat capture-spool directory",
+                io::Error::last_os_error(),
+            ));
+        }
+        // SAFETY: `fstat` succeeded.
+        let st = unsafe { st.assume_init() };
+        if (u32::from(st.st_mode) & 0o7777) != 0o700 {
+            // SAFETY: `spool_fd` is a valid owned directory fd.
+            if unsafe { libc::fchmod(spool_fd.as_raw_fd(), 0o700 as libc::mode_t) } != 0 {
+                return Err(StorageBackendError::io(
+                    "tighten capture-spool directory mode to 0700",
+                    io::Error::last_os_error(),
+                ));
+            }
+        }
+    }
+    verify_held_capacity_lock_unmoved_unix(&spool_fd, held_capacity_lock, euid)?;
+
+    let backup_spool_root = common_storage
+        .join(backup_rel_dir)
+        .join(CAPTURE_SPOOL_SUBDIR);
+    let backup_spool_fd =
+        match open_dir_fd_unix_step2_3(&backup_spool_root, "backup capture-spool directory") {
+            Ok(fd) => Some(fd),
+            Err(StorageBackendError::Io {
+                kind: io::ErrorKind::NotFound,
+                ..
+            }) => None,
+            Err(err) => return Err(err),
+        };
+
+    // Index Phase 1's SHA-256-verified `(live_identity, backup_identity)` inventory
+    // captured under this same continuously held `capacity.lock` so unchanged
+    // files verify in O(1) syscalls while any unindexed or modified file falls
+    // back to full streaming SHA-256 verification.
+    let mut verified_map: HashMap<(&'static str, &[u8]), &VerifiedSpoolFileIdentity> =
+        HashMap::with_capacity(verified_spool_identities.len());
+    for item in verified_spool_identities {
+        verified_map.insert((item.subdir, item.file_name.as_bytes()), item);
+    }
+
+    let mut cleared_ready_files = 0usize;
+    let mut cleared_quarantine_files = 0usize;
+    let mut cleared_tmp_files = 0usize;
+    let mut ensure_spool_race_retries = 0usize;
+
+    // Pass 1 (Zero-mutation pre-validation across ALL 3 slots using pinned
+    // directory descriptors and `fdopendir`, zero path-based enumeration):
+    // reject symlinks, hardlinks, foreign ownership, unexpired in-flight `tmp/`
+    // files, or any `ready/`/`quarantine/` file missing a matching backup copy
+    // with zero on-disk changes!
+    struct ValidatedSlotClearUnix {
+        slot: &'static str,
+        c_slot: CString,
+        sub_fd: OwnedFd,
+        sub_inode: (u64, u64),
+        entries: Vec<(CString, UnixSpoolEntryIdentity)>,
+    }
+    let mut validated_slots_to_clear: Vec<ValidatedSlotClearUnix> = Vec::new();
+    let mut already_fenced_slots: [bool; 3] = [false; 3];
+    let now = SystemTime::now();
+    for (idx, &slot) in CAPTURE_SPOOL_TOMBSTONE_NAMES.iter().enumerate() {
+        let rel_slot = format!("{PRIVATE_SUBDIR}/{CAPTURE_SPOOL_SUBDIR}/{slot}");
+        let c_slot = CString::new(slot).map_err(|_| StorageBackendError::BackendInternal {
+            detail: format!("invalid capture-spool slot name `{slot}`"),
+        })?;
+        let mut existing_st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+        // SAFETY: `spool_fd` is valid and `c_slot` is NUL-terminated.
+        let stat_rc = unsafe {
+            libc::fstatat(
+                spool_fd.as_raw_fd(),
+                c_slot.as_ptr(),
+                existing_st.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if stat_rc != 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::NotFound {
+                continue;
+            }
+            return Err(StorageBackendError::io(
+                "inspect capture-spool slot before tombstone install",
+                err,
+            ));
+        }
+        // SAFETY: `fstatat` succeeded.
+        let st = unsafe { existing_st.assume_init() };
+        match st.st_mode & libc::S_IFMT {
+            libc::S_IFREG => {
+                if st.st_uid != euid {
+                    return Err(StorageBackendError::BackendInternal {
+                        detail: format!(
+                            "forward migration Step 2.3 rejected foreign-owned tombstone at {rel_slot}"
+                        ),
+                    });
+                }
+                // SAFETY: `spool_fd` is valid and `c_slot` is NUL-terminated.
+                let raw = unsafe {
+                    libc::openat(
+                        spool_fd.as_raw_fd(),
+                        c_slot.as_ptr(),
+                        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    )
+                };
+                if raw < 0 {
+                    return Err(StorageBackendError::io(
+                        "open existing capture-spool tombstone",
+                        io::Error::last_os_error(),
+                    ));
+                }
+                // SAFETY: `raw >= 0` is exclusively owned.
+                let mut file = unsafe { File::from_raw_fd(raw) };
+                let mut buf = Vec::with_capacity(CAPTURE_SPOOL_TOMBSTONE_SENTINEL.len() + 1);
+                std::io::Read::by_ref(&mut file)
+                    .take((CAPTURE_SPOOL_TOMBSTONE_SENTINEL.len() + 1) as u64)
+                    .read_to_end(&mut buf)
+                    .map_err(|err| {
+                        StorageBackendError::io("read existing capture-spool tombstone", err)
+                    })?;
+                if buf.as_slice() != CAPTURE_SPOOL_TOMBSTONE_SENTINEL {
+                    return Err(StorageBackendError::BackendInternal {
+                        detail: format!(
+                            "forward migration Step 2.3 rejected invalid regular file content at {rel_slot}"
+                        ),
+                    });
+                }
+                already_fenced_slots[idx] = true;
+            }
+            libc::S_IFDIR => {
+                let (sub_fd, sub_inode) =
+                    open_subdir_fd_unix_step2_3(&spool_fd, slot, &rel_slot, euid, true)?;
+                let entry_names = list_sorted_cstr_names_unix(&sub_fd, &rel_slot)?;
+
+                if !entry_names.is_empty() {
+                    let backup_sub_fd = if slot == CAPTURE_SPOOL_TMP_SUBDIR {
+                        None
+                    } else {
+                        let b_root = backup_spool_fd.as_ref().ok_or_else(|| {
+                            StorageBackendError::BackendInternal {
+                                detail: format!(
+                                    "forward migration Step 2.3 refused to clear non-empty {rel_slot}: backup capture-spool directory missing"
+                                ),
+                            }
+                        })?;
+                        let (b_fd, _) = open_subdir_fd_unix_step2_3(
+                            b_root,
+                            slot,
+                            &format!("backup {rel_slot}"),
+                            euid,
+                            true,
+                        )?;
+                        Some(b_fd)
+                    };
+
+                    let mut verified_entries: Vec<(CString, UnixSpoolEntryIdentity)> =
+                        Vec::with_capacity(entry_names.len());
+                    for c_name in entry_names {
+                        let mut entry_st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+                        // SAFETY: `sub_fd` is valid and `c_name` is NUL-terminated.
+                        if unsafe {
+                            libc::fstatat(
+                                sub_fd.as_raw_fd(),
+                                c_name.as_ptr(),
+                                entry_st.as_mut_ptr(),
+                                libc::AT_SYMLINK_NOFOLLOW,
+                            )
+                        } != 0
+                        {
+                            return Err(StorageBackendError::io(
+                                "stat capture-spool entry before tombstone install",
+                                io::Error::last_os_error(),
+                            ));
+                        }
+                        // SAFETY: `fstatat` succeeded.
+                        let entry_st = unsafe { entry_st.assume_init() };
+                        if (entry_st.st_mode & libc::S_IFMT) != libc::S_IFREG
+                            || entry_st.st_uid != euid
+                            || entry_st.st_nlink != 1
+                        {
+                            return Err(StorageBackendError::BackendInternal {
+                                detail: format!(
+                                    "forward migration Step 2.3 rejected non-regular, hardlinked, or foreign-owned entry inside {rel_slot}"
+                                ),
+                            });
+                        }
+                        let live_id = UnixSpoolEntryIdentity::from_stat(&entry_st);
+                        if slot == CAPTURE_SPOOL_TMP_SUBDIR {
+                            let mtime_secs = u64::try_from(entry_st.st_mtime).unwrap_or(0);
+                            let mtime = std::time::UNIX_EPOCH + Duration::from_secs(mtime_secs);
+                            let is_expired = now
+                                .duration_since(mtime)
+                                .is_ok_and(|age| age >= CAPTURE_SPOOL_TMP_MAX_AGE);
+                            if !is_expired {
+                                return Err(StorageBackendError::BackendInternal {
+                                    detail: "forward migration Step 2.3 refused to remove unexpired in-flight capture-spool/tmp file"
+                                        .to_string(),
+                                });
+                            }
+                        } else if let Some(b_sub_fd) = backup_sub_fd.as_ref() {
+                            // Fast O(1) identity path when Phase 1 already
+                            // verified exact SHA-256 of BOTH live and backup
+                            // inodes under this continuously held `capacity.lock`
+                            // and neither inode's `(dev, ino, size, mtime, ctime, nlink)`
+                            // has changed since Phase 1!
+                            let mut fast_verified = false;
+                            if let Some(expected) = verified_map.get(&(slot, c_name.as_bytes()))
+                                && live_id.inode == expected.live_inode
+                                && live_id.byte_len == expected.byte_len
+                                && live_id.mtime == expected.live_mtime
+                                && live_id.ctime == expected.live_ctime
+                            {
+                                let mut b_st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+                                // SAFETY: `b_sub_fd` is valid and `c_name` is NUL-terminated.
+                                if unsafe {
+                                    libc::fstatat(
+                                        b_sub_fd.as_raw_fd(),
+                                        c_name.as_ptr(),
+                                        b_st.as_mut_ptr(),
+                                        libc::AT_SYMLINK_NOFOLLOW,
+                                    )
+                                } == 0
+                                {
+                                    // SAFETY: `fstatat` succeeded.
+                                    let b_st = unsafe { b_st.assume_init() };
+                                    let b_id = UnixSpoolEntryIdentity::from_stat(&b_st);
+                                    if (b_st.st_mode & libc::S_IFMT) == libc::S_IFREG
+                                        && b_st.st_uid == euid
+                                        && b_st.st_nlink == 1
+                                        && b_id.inode == expected.backup_inode
+                                        && b_id.byte_len == expected.byte_len
+                                        && b_id.mtime == expected.backup_mtime
+                                        && b_id.ctime == expected.backup_ctime
+                                    {
+                                        fast_verified = true;
+                                    }
+                                }
+                            }
+                            if !fast_verified {
+                                verify_spool_file_backed_up_unix(
+                                    &sub_fd, b_sub_fd, &c_name, euid, slot, live_id,
+                                )?;
+                            }
+                        }
+                        verified_entries.push((c_name, live_id));
+                    }
+                    validated_slots_to_clear.push(ValidatedSlotClearUnix {
+                        slot,
+                        c_slot,
+                        sub_fd,
+                        sub_inode,
+                        entries: verified_entries,
+                    });
+                }
+            }
+            _ => {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: format!(
+                        "forward migration Step 2.3 rejected symlink or special file at {rel_slot}"
+                    ),
+                });
+            }
+        }
+    }
+
+    // Pass 2 (Pinned-descriptor, identity-re-verified deletion BEFORE
+    // installing tombstones so causal durability ordering is exact and a
+    // replaced slot or file can NEVER be blindly deleted).
+    for validated in validated_slots_to_clear {
+        let slot = validated.slot;
+        let rel_slot = format!("{PRIVATE_SUBDIR}/{CAPTURE_SPOOL_SUBDIR}/{slot}");
+        // Verify the pinned `sub_fd` is STILL the live directory bound at `slot`!
+        let mut slot_check = std::mem::MaybeUninit::<libc::stat>::zeroed();
+        // SAFETY: `spool_fd` is valid and `c_slot` is NUL-terminated.
+        if unsafe {
+            libc::fstatat(
+                spool_fd.as_raw_fd(),
+                validated.c_slot.as_ptr(),
+                slot_check.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            return Err(StorageBackendError::io(
+                "re-verify pinned capture-spool slot directory before unlink",
+                io::Error::last_os_error(),
+            ));
+        }
+        // SAFETY: `fstatat` succeeded.
+        let slot_check = unsafe { slot_check.assume_init() };
+        if (slot_check.st_mode & libc::S_IFMT) != libc::S_IFDIR
+            || slot_check.st_uid != euid
+            || (slot_check.st_dev as u64, slot_check.st_ino as u64) != validated.sub_inode
+        {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "forward migration Step 2.3 detected replaced directory at {rel_slot} before deletion"
+                ),
+            });
+        }
+
+        for (c_name, expected_id) in &validated.entries {
+            #[cfg(test)]
+            if let Some(obs) = observer.as_deref_mut() {
+                obs.on_point(
+                    Phase2FinalizeTestPoint::BeforeUnlinkVerifiedSpoolEntry(slot),
+                    common_storage,
+                )?;
+            }
+
+            atomic_isolate_verify_and_unlink_unix(
+                common_storage,
+                &validated.sub_fd,
+                c_name,
+                *expected_id,
+                euid,
+                slot,
+                &rel_slot,
+                #[cfg(test)]
+                observer,
+            )?;
+            match slot {
+                CAPTURE_SPOOL_READY_SUBDIR => cleared_ready_files += 1,
+                CAPTURE_SPOOL_QUARANTINE_SUBDIR => cleared_quarantine_files += 1,
+                _ => cleared_tmp_files += 1,
+            }
+        }
+        fsync_dir_fd_unix(&validated.sub_fd, "cleared capture-spool slot directory")?;
+        drop(validated.sub_fd);
+    }
+    if cleared_ready_files + cleared_quarantine_files + cleared_tmp_files > 0 {
+        durability.record(
+            Phase2DurabilityOpKind::SpoolBackupFilesCleared,
+            None,
+            format!("{PRIVATE_SUBDIR}/{CAPTURE_SPOOL_SUBDIR}"),
+        );
+    }
+
+    // Pass 3 (Tighten already-fenced tombstones or atomically replace each
+    // empty/absent slot with a `0400` regular file tombstone under held `capacity.lock`).
+    for (idx, &slot) in CAPTURE_SPOOL_TOMBSTONE_NAMES.iter().enumerate() {
+        install_single_spool_tombstone_unix(
+            common_storage,
+            &spool_fd,
+            slot,
+            already_fenced_slots[idx],
+            euid,
+            Some(durability),
+            &mut ensure_spool_race_retries,
+            #[cfg(test)]
+            observer,
+        )?;
+    }
+
+    // Re-confirm `capacity.lock` was NEVER moved or replaced, then fsync BOTH
+    // `capture-spool/` and `private/` before returning!
+    verify_held_capacity_lock_unmoved_unix(&spool_fd, held_capacity_lock, euid)?;
+    fsync_dir_fd_unix(&spool_fd, "capture-spool directory after tombstone install")?;
+    durability.record(
+        Phase2DurabilityOpKind::SpoolDirFsync,
+        None,
+        format!("{PRIVATE_SUBDIR}/{CAPTURE_SPOOL_SUBDIR}"),
+    );
+    fsync_dir_fd_unix(
+        &private_fd,
+        "private directory after capture-spool tombstone install",
+    )?;
+
+    Ok(ForwardPhase2SpoolFenceReceipt {
+        cleared_ready_files,
+        cleared_quarantine_files,
+        cleared_tmp_files,
+        tombstones: CaptureSpoolTombstonePaths::from_storage_dir(common_storage),
+        ensure_spool_race_retries,
+        elapsed: started.elapsed(),
+    })
+}
+
+#[cfg(windows)]
+fn delete_verified_spool_entry_windows(
+    entry_path: &Path,
+    expected_id: win_tmp_guard::WinFileId,
+    expected_len: u64,
+    expected_mtime: (u32, u32),
+    rel_slot: &str,
+) -> StorageResult<()> {
+    use windows_sys::Win32::{
+        Foundation::INVALID_HANDLE_VALUE,
+        Storage::FileSystem::{
+            CreateFileW, DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+            FILE_DISPOSITION_INFO, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileDispositionInfo,
+            OPEN_EXISTING, SetFileInformationByHandle,
+        },
+    };
+
+    let wide = win_tmp_guard::encode_wide_nul(entry_path);
+    // SAFETY: `wide` is NUL-terminated UTF-16.
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            DELETE | FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(StorageBackendError::io(
+            "open verified capture-spool entry for deletion",
+            io::Error::last_os_error(),
+        ));
+    }
+    let guard = win_tmp_guard::WinHandleGuard(handle);
+    let info = win_tmp_guard::file_info(guard.0, "stat spool entry handle before deletion")?;
+    let actual_len = (u64::from(info.nFileSizeHigh) << 32) | u64::from(info.nFileSizeLow);
+    let actual_mtime = (
+        info.ftLastWriteTime.dwHighDateTime,
+        info.ftLastWriteTime.dwLowDateTime,
+    );
+    if (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+        || (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0
+        || info.nNumberOfLinks != 1
+        || win_tmp_guard::id_from_info(&info) != expected_id
+        || actual_len != expected_len
+        || actual_mtime != expected_mtime
+    {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration Step 2.3 refused to delete replaced or modified entry in {rel_slot}"
+            ),
+        });
+    }
+    let disp = FILE_DISPOSITION_INFO { DeleteFile: 1 };
+    // SAFETY: `guard.0` is an exclusively verified regular file handle with `DELETE` access.
+    let ok = unsafe {
+        SetFileInformationByHandle(
+            guard.0,
+            FileDispositionInfo,
+            (&raw const disp).cast(),
+            std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+        )
+    };
+    if ok == 0 {
+        return Err(StorageBackendError::io(
+            "mark verified capture-spool entry for deletion",
+            io::Error::last_os_error(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn install_single_spool_tombstone_windows(
+    common_storage: &Path,
+    spool_dir: &Path,
+    pinned_dirs: &[(&Path, win_tmp_guard::WinFileId, &'static str)],
+    slot: &'static str,
+    already_fenced: bool,
+    mut durability: Option<&mut Phase2DurabilityReceipt>,
+    ensure_spool_race_retries: &mut usize,
+    #[cfg(test)] observer: &mut Option<&mut dyn Phase2FinalizeTestObserver>,
+) -> StorageResult<()> {
+    use std::{io::Write as _, os::windows::io::AsRawHandle as _};
+
+    use windows_sys::Win32::{
+        Foundation::HANDLE,
+        Storage::FileSystem::{
+            FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_REPARSE_POINT,
+        },
+    };
+
+    struct WinSpoolTombstoneTmpGuard {
+        path: PathBuf,
+        armed: bool,
+    }
+    impl Drop for WinSpoolTombstoneTmpGuard {
+        fn drop(&mut self) {
+            if !self.armed {
+                return;
+            }
+            if let Ok(meta) = fs::symlink_metadata(&self.path) {
+                let mut perms = meta.permissions();
+                if perms.readonly() {
+                    perms.set_readonly(false);
+                    let _ = fs::set_permissions(&self.path, perms);
+                }
+            }
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+
+    #[cfg(not(test))]
+    let _ = common_storage;
+
+    let rel_slot = format!("{PRIVATE_SUBDIR}/{CAPTURE_SPOOL_SUBDIR}/{slot}");
+    let slot_path = spool_dir.join(slot);
+    if already_fenced {
+        let meta = fs::symlink_metadata(&slot_path)
+            .map_err(|err| StorageBackendError::io("stat existing capture-spool tombstone", err))?;
+        let mut perms = meta.permissions();
+        if !perms.readonly() {
+            let f = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&slot_path)
+                .map_err(|err| {
+                    StorageBackendError::io("open writable existing capture-spool tombstone", err)
+                })?;
+            perms.set_readonly(true);
+            fs::set_permissions(&slot_path, perms).map_err(|err| {
+                StorageBackendError::io("mark existing capture-spool tombstone readonly", err)
+            })?;
+            f.sync_all().map_err(|err| {
+                StorageBackendError::io("fsync readonly existing capture-spool tombstone", err)
+            })?;
+            let info = win_tmp_guard::file_info(
+                f.as_raw_handle() as HANDLE,
+                "verify readonly existing tombstone attributes",
+            )?;
+            if (info.dwFileAttributes & FILE_ATTRIBUTE_READONLY) == 0 {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: format!(
+                        "capture-spool tombstone readonly attribute failed to settle for {rel_slot}"
+                    ),
+                });
+            }
+        }
+        if let Some(d) = durability {
+            d.record(
+                Phase2DurabilityOpKind::SpoolTombstoneAtomicPublish,
+                None,
+                rel_slot,
+            );
+        }
+        return Ok(());
+    }
+
+    let seq = PHASE2_SPOOL_TOMBSTONE_TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp_path = spool_dir.join(format!(
+        ".tombstone.{slot}.{}.{}.tmp",
+        std::process::id(),
+        seq
+    ));
+    let mut tmp_file = OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .open(&tmp_path)
+        .map_err(|err| StorageBackendError::io("create temp capture-spool tombstone", err))?;
+    let mut tmp_guard = WinSpoolTombstoneTmpGuard {
+        path: tmp_path.clone(),
+        armed: true,
+    };
+    let tmp_info = win_tmp_guard::file_info(
+        tmp_file.as_raw_handle() as HANDLE,
+        "stat staged capture-spool tombstone",
+    )?;
+    let tmp_id = win_tmp_guard::id_from_info(&tmp_info);
+
+    tmp_file
+        .write_all(CAPTURE_SPOOL_TOMBSTONE_SENTINEL)
+        .map_err(|err| StorageBackendError::io("write capture-spool tombstone sentinel", err))?;
+    // Set `FILE_ATTRIBUTE_READONLY` BEFORE `sync_all()` and BEFORE publication
+    // so both file contents and the read-only attribute are durably persisted
+    // prior to atomic non-replacing publication!
+    let mut perms = tmp_file
+        .metadata()
+        .map_err(|err| StorageBackendError::io("stat staged capture-spool tombstone", err))?
+        .permissions();
+    perms.set_readonly(true);
+    fs::set_permissions(&tmp_path, perms).map_err(|err| {
+        StorageBackendError::io("mark staged capture-spool tombstone readonly", err)
+    })?;
+    let ro_info = win_tmp_guard::file_info(
+        tmp_file.as_raw_handle() as HANDLE,
+        "verify staged tombstone readonly attribute",
+    )?;
+    if (ro_info.dwFileAttributes & FILE_ATTRIBUTE_READONLY) == 0 {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "staged capture-spool tombstone readonly attribute failed to settle for {rel_slot}"
+            ),
+        });
+    }
+    tmp_file.sync_all().map_err(|err| {
+        StorageBackendError::io("fsync readonly temp capture-spool tombstone", err)
+    })?;
+    drop(tmp_file);
+    if let Some(d) = durability.as_deref_mut() {
+        d.record(
+            Phase2DurabilityOpKind::SpoolTombstoneFileFsync,
+            None,
+            rel_slot.clone(),
+        );
+    }
+
+    let mut published = false;
+    for attempt in 0..=MAX_SPOOL_TOMBSTONE_RACE_RETRIES {
+        win_tmp_guard::verify_pinned_dir_ids(pinned_dirs)?;
+        if let Err(err) = fs::remove_dir(&slot_path)
+            && err.kind() != io::ErrorKind::NotFound
+        {
+            return Err(StorageBackendError::io(
+                "remove empty capture-spool directory before tombstone publish",
+                err,
+            ));
+        }
+        #[cfg(test)]
+        if attempt == 0
+            && let Some(obs) = observer.as_deref_mut()
+        {
+            obs.on_point(
+                Phase2FinalizeTestPoint::AfterRmdirBeforeLinkTombstone(slot),
+                common_storage,
+            )?;
+        }
+        match durable_rename_new_windows(
+            &tmp_path,
+            &slot_path,
+            "publish readonly capture-spool tombstone",
+        ) {
+            Ok(()) => {
+                tmp_guard.armed = false;
+                let pub_file = OpenOptions::new()
+                    .read(true)
+                    .open(&slot_path)
+                    .map_err(|err| {
+                        StorageBackendError::io(
+                            "open published capture-spool tombstone for verification",
+                            err,
+                        )
+                    })?;
+                let pub_info = win_tmp_guard::file_info(
+                    pub_file.as_raw_handle() as HANDLE,
+                    "verify published tombstone identity and readonly attribute",
+                )?;
+                if (pub_info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+                    || (pub_info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0
+                    || (pub_info.dwFileAttributes & FILE_ATTRIBUTE_READONLY) == 0
+                    || win_tmp_guard::id_from_info(&pub_info) != tmp_id
+                {
+                    return Err(StorageBackendError::BackendInternal {
+                        detail: format!(
+                            "forward migration Step 2.3 published tombstone identity or readonly mismatch at {rel_slot}"
+                        ),
+                    });
+                }
+                published = true;
+                break;
+            }
+            Err(StorageBackendError::Io {
+                kind: io::ErrorKind::AlreadyExists,
+                ..
+            }) if attempt < MAX_SPOOL_TOMBSTONE_RACE_RETRIES
+                && fs::symlink_metadata(&slot_path)
+                    .is_ok_and(|m| !m.file_type().is_symlink() && m.file_type().is_dir()) =>
+            {
+                *ensure_spool_race_retries += 1;
+                continue;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    if !published {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "forward migration Step 2.3 exhausted ensure_spool race retries publishing {rel_slot}"
+            ),
+        });
+    }
+    if let Some(d) = durability {
+        d.record(
+            Phase2DurabilityOpKind::SpoolTombstoneAtomicPublish,
+            None,
+            rel_slot,
+        );
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn fence_tmp_slot_defensively_under_held_lock(
+    common_storage: &Path,
+    held_capacity_lock: &File,
+) -> StorageResult<()> {
+    use std::{io::Read as _, os::windows::io::AsRawHandle as _};
+
+    use windows_sys::Win32::Foundation::HANDLE;
+
+    let (_root_pin, root_id) =
+        win_tmp_guard::open_pinned_non_reparse_dir(common_storage, "repository storage root")?;
+    let private_dir = common_storage.join(PRIVATE_SUBDIR);
+    let (_priv_pin, priv_id) =
+        win_tmp_guard::open_pinned_non_reparse_dir(&private_dir, "private directory")?;
+    let spool_dir = capture_spool_dir_path(common_storage);
+    let (_spool_pin, spool_id) =
+        win_tmp_guard::open_pinned_non_reparse_dir(&spool_dir, "capture-spool directory")?;
+    let pinned_dirs = [
+        (common_storage, root_id, "repository storage root"),
+        (private_dir.as_path(), priv_id, "private directory"),
+        (spool_dir.as_path(), spool_id, "capture-spool directory"),
+    ];
+    win_tmp_guard::verify_pinned_dir_ids(&pinned_dirs)?;
+
+    let held_lock_info = win_tmp_guard::file_info(
+        held_capacity_lock.as_raw_handle() as HANDLE,
+        "stat held capture-spool/capacity.lock",
+    )?;
+    let held_lock_id = win_tmp_guard::id_from_info(&held_lock_info);
+    let live_lock_file = OpenOptions::new()
+        .read(true)
+        .open(capture_spool_capacity_lock_path(common_storage))
+        .map_err(|err| StorageBackendError::io("open live capture-spool/capacity.lock", err))?;
+    let live_lock_info = win_tmp_guard::file_info(
+        live_lock_file.as_raw_handle() as HANDLE,
+        "stat live capture-spool/capacity.lock",
+    )?;
+    drop(live_lock_file);
+    if win_tmp_guard::id_from_info(&live_lock_info) != held_lock_id {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "defensive Step 2.3 fence detected moved capture-spool/capacity.lock"
+                .to_string(),
+        });
+    }
+
+    let try_fence_slot = |slot: &'static str, allow_expired_tmp_clear: bool| -> StorageResult<()> {
+        let rel_slot = format!("{PRIVATE_SUBDIR}/{CAPTURE_SPOOL_SUBDIR}/{slot}");
+        let slot_path = spool_dir.join(slot);
+        let mut already_fenced = false;
+        match fs::symlink_metadata(&slot_path) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    return Err(StorageBackendError::BackendInternal {
+                        detail: format!("defensive Step 2.3 fence rejected symlink at {rel_slot}"),
+                    });
+                }
+                if meta.file_type().is_file() {
+                    let mut f = File::open(&slot_path).map_err(|err| {
+                        StorageBackendError::io(
+                            "open existing tombstone during defensive fence",
+                            err,
+                        )
+                    })?;
+                    let mut buf = Vec::with_capacity(CAPTURE_SPOOL_TOMBSTONE_SENTINEL.len() + 1);
+                    std::io::Read::by_ref(&mut f)
+                        .take((CAPTURE_SPOOL_TOMBSTONE_SENTINEL.len() + 1) as u64)
+                        .read_to_end(&mut buf)
+                        .map_err(|err| {
+                            StorageBackendError::io(
+                                "read existing tombstone during defensive fence",
+                                err,
+                            )
+                        })?;
+                    if buf.as_slice() != CAPTURE_SPOOL_TOMBSTONE_SENTINEL {
+                        return Err(StorageBackendError::BackendInternal {
+                            detail: format!(
+                                "defensive Step 2.3 fence rejected invalid regular file at {rel_slot}"
+                            ),
+                        });
+                    }
+                    already_fenced = true;
+                } else if meta.file_type().is_dir() {
+                    let (_slot_pin, slot_id) = win_tmp_guard::open_pinned_non_reparse_dir(
+                        &slot_path,
+                        "capture-spool slot directory",
+                    )?;
+                    let now = SystemTime::now();
+                    let mut to_clear: Vec<(PathBuf, win_tmp_guard::WinFileId, u64, (u32, u32))> =
+                        Vec::new();
+                    for entry in fs::read_dir(&slot_path).map_err(|err| {
+                        StorageBackendError::io(
+                            "read capture-spool slot during defensive fence",
+                            err,
+                        )
+                    })? {
+                        let entry = entry.map_err(|err| {
+                            StorageBackendError::io(
+                                "iterate capture-spool slot during defensive fence",
+                                err,
+                            )
+                        })?;
+                        if !allow_expired_tmp_clear {
+                            return Err(StorageBackendError::BackendInternal {
+                                detail: format!(
+                                    "defensive Step 2.3 fence skipped non-empty {rel_slot} to preserve data"
+                                ),
+                            });
+                        }
+                        let ep = entry.path();
+                        let em = fs::symlink_metadata(&ep).map_err(|err| {
+                            StorageBackendError::io("stat tmp entry during defensive fence", err)
+                        })?;
+                        if em.file_type().is_symlink() || !em.file_type().is_file() {
+                            return Err(StorageBackendError::BackendInternal {
+                                detail: "defensive Step 2.3 fence rejected non-regular tmp entry"
+                                    .to_string(),
+                            });
+                        }
+                        let is_expired = em
+                            .modified()
+                            .ok()
+                            .and_then(|m| now.duration_since(m).ok())
+                            .is_some_and(|age| age >= CAPTURE_SPOOL_TMP_MAX_AGE);
+                        if !is_expired {
+                            return Err(StorageBackendError::BackendInternal {
+                                detail:
+                                    "defensive Step 2.3 fence refused unexpired capture-spool/tmp file"
+                                        .to_string(),
+                            });
+                        }
+                        let f = File::open(&ep).map_err(|err| {
+                            StorageBackendError::io(
+                                "open expired tmp entry during defensive fence",
+                                err,
+                            )
+                        })?;
+                        let info = win_tmp_guard::file_info(
+                            f.as_raw_handle() as HANDLE,
+                            "stat expired tmp entry during defensive fence",
+                        )?;
+                        let len =
+                            (u64::from(info.nFileSizeHigh) << 32) | u64::from(info.nFileSizeLow);
+                        let mtime = (
+                            info.ftLastWriteTime.dwHighDateTime,
+                            info.ftLastWriteTime.dwLowDateTime,
+                        );
+                        to_clear.push((ep, win_tmp_guard::id_from_info(&info), len, mtime));
+                    }
+                    let slot_pinned = [
+                        (common_storage, root_id, "repository storage root"),
+                        (private_dir.as_path(), priv_id, "private directory"),
+                        (spool_dir.as_path(), spool_id, "capture-spool directory"),
+                        (slot_path.as_path(), slot_id, "capture-spool slot directory"),
+                    ];
+                    for (ep, fid, len, mtime) in to_clear {
+                        win_tmp_guard::verify_pinned_dir_ids(&slot_pinned)?;
+                        delete_verified_spool_entry_windows(&ep, fid, len, mtime, &rel_slot)?;
+                    }
+                    drop(_slot_pin);
+                } else {
+                    return Err(StorageBackendError::BackendInternal {
+                        detail: format!(
+                            "defensive Step 2.3 fence rejected special entry at {rel_slot}"
+                        ),
+                    });
+                }
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(StorageBackendError::io(
+                    "inspect capture-spool slot during defensive fence",
+                    err,
+                ));
+            }
+        }
+
+        let mut retries = 0usize;
+        install_single_spool_tombstone_windows(
+            common_storage,
+            &spool_dir,
+            &pinned_dirs,
+            slot,
+            already_fenced,
+            None,
+            &mut retries,
+            #[cfg(test)]
+            &mut None,
+        )?;
+        fsync_dir_durable_windows(
+            &spool_dir,
+            &pinned_dirs,
+            "fsync capture-spool directory after defensive slot fence",
+        )?;
+        fsync_dir_durable_windows(
+            &private_dir,
+            &pinned_dirs[..2],
+            "fsync private directory after defensive slot fence",
+        )?;
+        Ok(())
+    };
+
+    let mut last_err: Option<StorageBackendError> = None;
+    for (slot, allow_tmp_clear) in [
+        (CAPTURE_SPOOL_TMP_SUBDIR, true),
+        (CAPTURE_SPOOL_QUARANTINE_SUBDIR, false),
+        (CAPTURE_SPOOL_READY_SUBDIR, false),
+    ] {
+        match try_fence_slot(slot, allow_tmp_clear) {
+            Ok(()) => return Ok(()),
+            Err(err) => last_err = Some(err),
+        }
+    }
+    Err(
+        last_err.unwrap_or_else(|| StorageBackendError::BackendInternal {
+            detail: "defensive Step 2.3 fence could not fence any capture-spool slot without deleting unbacked data"
+                .to_string(),
+        }),
+    )
+}
+
+#[cfg(windows)]
+fn install_inplace_spool_tombstones_under_held_lock(
+    common_storage: &Path,
+    backup_rel_dir: &str,
+    held_capacity_lock: &File,
+    verified_spool_identities: &[VerifiedSpoolFileIdentity],
+    durability: &mut Phase2DurabilityReceipt,
+    #[cfg(test)] observer: &mut Option<&mut dyn Phase2FinalizeTestObserver>,
+) -> StorageResult<ForwardPhase2SpoolFenceReceipt> {
+    use std::{collections::HashMap, io::Read as _, os::windows::io::AsRawHandle as _};
+
+    use windows_sys::Win32::Foundation::HANDLE;
+
+    let started = Instant::now();
+    let (_root_pin, root_id) =
+        win_tmp_guard::open_pinned_non_reparse_dir(common_storage, "repository storage root")?;
+    let private_dir = common_storage.join(PRIVATE_SUBDIR);
+    let (_priv_pin, priv_id) =
+        win_tmp_guard::open_pinned_non_reparse_dir(&private_dir, "private directory")?;
+    let spool_dir = capture_spool_dir_path(common_storage);
+    let (_spool_pin, spool_id) =
+        win_tmp_guard::open_pinned_non_reparse_dir(&spool_dir, "capture-spool directory")?;
+    let pinned_dirs = [
+        (common_storage, root_id, "repository storage root"),
+        (private_dir.as_path(), priv_id, "private directory"),
+        (spool_dir.as_path(), spool_id, "capture-spool directory"),
+    ];
+    win_tmp_guard::verify_pinned_dir_ids(&pinned_dirs)?;
+
+    let held_lock_info = win_tmp_guard::file_info(
+        held_capacity_lock.as_raw_handle() as HANDLE,
+        "stat held capture-spool/capacity.lock",
+    )?;
+    let held_lock_id = win_tmp_guard::id_from_info(&held_lock_info);
+    let live_lock_path = capture_spool_capacity_lock_path(common_storage);
+    let live_lock_file = OpenOptions::new()
+        .read(true)
+        .open(&live_lock_path)
+        .map_err(|err| StorageBackendError::io("open live capture-spool/capacity.lock", err))?;
+    let live_lock_info = win_tmp_guard::file_info(
+        live_lock_file.as_raw_handle() as HANDLE,
+        "stat live capture-spool/capacity.lock",
+    )?;
+    drop(live_lock_file);
+    if win_tmp_guard::id_from_info(&live_lock_info) != held_lock_id {
+        return Err(StorageBackendError::BackendInternal {
+            detail:
+                "forward migration Step 2.3 detected moved or replaced capture-spool/capacity.lock"
+                    .to_string(),
+        });
+    }
+
+    let backup_spool_root = common_storage
+        .join(backup_rel_dir)
+        .join(CAPTURE_SPOOL_SUBDIR);
+    let mut verified_map: HashMap<(&'static str, &str), &VerifiedSpoolFileIdentity> =
+        HashMap::with_capacity(verified_spool_identities.len());
+    for item in verified_spool_identities {
+        verified_map.insert((item.subdir, item.file_name.as_str()), item);
+    }
+
+    let mut cleared_ready_files = 0usize;
+    let mut cleared_quarantine_files = 0usize;
+    let mut cleared_tmp_files = 0usize;
+    let mut ensure_spool_race_retries = 0usize;
+
+    struct ValidatedSlotClearWin {
+        slot: &'static str,
+        slot_path: PathBuf,
+        _slot_pin: win_tmp_guard::WinHandleGuard,
+        slot_id: win_tmp_guard::WinFileId,
+        entries: Vec<(PathBuf, win_tmp_guard::WinFileId, u64, (u32, u32))>,
+    }
+
+    // Pass 1 (Zero-mutation pre-validation across all 3 slots with pinned
+    // directory handles and FileId capture).
+    let mut validated_slots_to_clear: Vec<ValidatedSlotClearWin> = Vec::new();
+    let mut already_fenced_slots: [bool; 3] = [false; 3];
+    let now = SystemTime::now();
+    for (idx, &slot) in CAPTURE_SPOOL_TOMBSTONE_NAMES.iter().enumerate() {
+        let rel_slot = format!("{PRIVATE_SUBDIR}/{CAPTURE_SPOOL_SUBDIR}/{slot}");
+        let slot_path = spool_dir.join(slot);
+        match fs::symlink_metadata(&slot_path) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    return Err(StorageBackendError::BackendInternal {
+                        detail: format!(
+                            "forward migration Step 2.3 rejected symlink at {rel_slot}"
+                        ),
+                    });
+                }
+                if meta.file_type().is_file() {
+                    let mut f = File::open(&slot_path).map_err(|err| {
+                        StorageBackendError::io("open existing capture-spool tombstone", err)
+                    })?;
+                    let mut buf = Vec::with_capacity(CAPTURE_SPOOL_TOMBSTONE_SENTINEL.len() + 1);
+                    std::io::Read::by_ref(&mut f)
+                        .take((CAPTURE_SPOOL_TOMBSTONE_SENTINEL.len() + 1) as u64)
+                        .read_to_end(&mut buf)
+                        .map_err(|err| {
+                            StorageBackendError::io("read existing capture-spool tombstone", err)
+                        })?;
+                    if buf.as_slice() != CAPTURE_SPOOL_TOMBSTONE_SENTINEL {
+                        return Err(StorageBackendError::BackendInternal {
+                            detail: format!(
+                                "forward migration Step 2.3 rejected invalid regular file content at {rel_slot}"
+                            ),
+                        });
+                    }
+                    already_fenced_slots[idx] = true;
+                } else if meta.file_type().is_dir() {
+                    let (slot_pin, slot_id) = win_tmp_guard::open_pinned_non_reparse_dir(
+                        &slot_path,
+                        "capture-spool slot directory",
+                    )?;
+                    let mut entries = Vec::new();
+                    for entry in fs::read_dir(&slot_path).map_err(|err| {
+                        StorageBackendError::io("read capture-spool slot directory", err)
+                    })? {
+                        let entry = entry.map_err(|err| {
+                            StorageBackendError::io("iterate capture-spool slot directory", err)
+                        })?;
+                        let entry_path = entry.path();
+                        let e_meta = fs::symlink_metadata(&entry_path).map_err(|err| {
+                            StorageBackendError::io("stat capture-spool slot entry", err)
+                        })?;
+                        if e_meta.file_type().is_symlink() || !e_meta.file_type().is_file() {
+                            return Err(StorageBackendError::BackendInternal {
+                                detail: format!(
+                                    "forward migration Step 2.3 rejected non-regular entry in {rel_slot}"
+                                ),
+                            });
+                        }
+                        let mut lf = File::open(&entry_path).map_err(|err| {
+                            StorageBackendError::io("open live capture-spool entry", err)
+                        })?;
+                        let l_handle = lf.as_raw_handle() as HANDLE;
+                        let l_info = win_tmp_guard::file_info(l_handle, "stat live spool entry")?;
+                        let live_id = win_tmp_guard::id_from_info(&l_info);
+                        let live_len = (u64::from(l_info.nFileSizeHigh) << 32)
+                            | u64::from(l_info.nFileSizeLow);
+                        let live_mtime = (
+                            l_info.ftLastWriteTime.dwHighDateTime,
+                            l_info.ftLastWriteTime.dwLowDateTime,
+                        );
+                        let live_change_time = win_tmp_guard::file_change_time(
+                            l_handle,
+                            "read live spool entry change time",
+                        )?;
+                        if slot == CAPTURE_SPOOL_TMP_SUBDIR {
+                            let is_expired = e_meta
+                                .modified()
+                                .ok()
+                                .and_then(|m| now.duration_since(m).ok())
+                                .is_some_and(|age| age >= CAPTURE_SPOOL_TMP_MAX_AGE);
+                            if !is_expired {
+                                return Err(StorageBackendError::BackendInternal {
+                                    detail: "forward migration Step 2.3 refused to remove unexpired in-flight capture-spool/tmp file"
+                                        .to_string(),
+                                });
+                            }
+                        } else {
+                            let backup_entry = backup_spool_root.join(slot).join(entry.file_name());
+                            let b_meta = fs::symlink_metadata(&backup_entry).map_err(|err| {
+                                StorageBackendError::io("stat backup capture-spool entry", err)
+                            })?;
+                            if b_meta.file_type().is_symlink() || !b_meta.file_type().is_file() {
+                                return Err(StorageBackendError::BackendInternal {
+                                    detail: format!(
+                                        "forward migration Step 2.3 rejected invalid backup spool file for {rel_slot}"
+                                    ),
+                                });
+                            }
+                            let mut bf = File::open(&backup_entry).map_err(|err| {
+                                StorageBackendError::io("open backup capture-spool entry", err)
+                            })?;
+                            let b_handle = bf.as_raw_handle() as HANDLE;
+                            let b_info =
+                                win_tmp_guard::file_info(b_handle, "stat backup spool entry")?;
+                            let b_id = win_tmp_guard::id_from_info(&b_info);
+                            let b_len = (u64::from(b_info.nFileSizeHigh) << 32)
+                                | u64::from(b_info.nFileSizeLow);
+                            let b_mtime = (
+                                b_info.ftLastWriteTime.dwHighDateTime,
+                                b_info.ftLastWriteTime.dwLowDateTime,
+                            );
+                            let b_change_time = win_tmp_guard::file_change_time(
+                                b_handle,
+                                "read backup spool entry change time",
+                            )?;
+                            let fast_verified = entry
+                                .file_name()
+                                .to_str()
+                                .and_then(|n| verified_map.get(&(slot, n)))
+                                .is_some_and(|exp| {
+                                    live_id == exp.live_id
+                                        && live_len == exp.byte_len
+                                        && live_mtime == exp.live_mtime
+                                        && live_change_time == exp.live_change_time
+                                        && b_id == exp.backup_id
+                                        && b_len == exp.byte_len
+                                        && b_mtime == exp.backup_mtime
+                                        && b_change_time == exp.backup_change_time
+                                });
+                            if !fast_verified
+                                && stream_sha256_of_file(&mut lf, "live spool entry")?
+                                    != stream_sha256_of_file(&mut bf, "backup spool entry")?
+                            {
+                                return Err(StorageBackendError::BackendInternal {
+                                    detail: format!(
+                                        "forward migration Step 2.3 refused to delete live {rel_slot} file: backup SHA-256 mismatch"
+                                    ),
+                                });
+                            }
+                        }
+                        entries.push((entry_path, live_id, live_len, live_mtime));
+                    }
+                    if !entries.is_empty() {
+                        validated_slots_to_clear.push(ValidatedSlotClearWin {
+                            slot,
+                            slot_path,
+                            _slot_pin: slot_pin,
+                            slot_id,
+                            entries,
+                        });
+                    }
+                } else {
+                    return Err(StorageBackendError::BackendInternal {
+                        detail: format!(
+                            "forward migration Step 2.3 rejected non-regular entry at {rel_slot}"
+                        ),
+                    });
+                }
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(StorageBackendError::io(
+                    "inspect capture-spool slot before tombstone install",
+                    err,
+                ));
+            }
+        }
+    }
+
+    // Pass 2 (Handle-verified deletion on pinned directories).
+    for validated in validated_slots_to_clear {
+        let slot = validated.slot;
+        let rel_slot = format!("{PRIVATE_SUBDIR}/{CAPTURE_SPOOL_SUBDIR}/{slot}");
+        let slot_pinned = [
+            (common_storage, root_id, "repository storage root"),
+            (private_dir.as_path(), priv_id, "private directory"),
+            (spool_dir.as_path(), spool_id, "capture-spool directory"),
+            (
+                validated.slot_path.as_path(),
+                validated.slot_id,
+                "capture-spool slot directory",
+            ),
+        ];
+        for (entry_path, expected_id, expected_len, expected_mtime) in validated.entries {
+            #[cfg(test)]
+            if let Some(obs) = observer.as_deref_mut() {
+                obs.on_point(
+                    Phase2FinalizeTestPoint::BeforeUnlinkVerifiedSpoolEntry(slot),
+                    common_storage,
+                )?;
+            }
+            win_tmp_guard::verify_pinned_dir_ids(&slot_pinned)?;
+            delete_verified_spool_entry_windows(
+                &entry_path,
+                expected_id,
+                expected_len,
+                expected_mtime,
+                &rel_slot,
+            )?;
+            match slot {
+                CAPTURE_SPOOL_READY_SUBDIR => cleared_ready_files += 1,
+                CAPTURE_SPOOL_QUARANTINE_SUBDIR => cleared_quarantine_files += 1,
+                _ => cleared_tmp_files += 1,
+            }
+        }
+        drop(validated._slot_pin);
+    }
+    if cleared_ready_files + cleared_quarantine_files + cleared_tmp_files > 0 {
+        durability.record(
+            Phase2DurabilityOpKind::SpoolBackupFilesCleared,
+            None,
+            format!("{PRIVATE_SUBDIR}/{CAPTURE_SPOOL_SUBDIR}"),
+        );
+    }
+
+    // Pass 3 (Tighten existing tombstones or atomically replace each slot with
+    // a pre-flushed read-only tombstone via write-through `MoveFileExW`).
+    for (idx, &slot) in CAPTURE_SPOOL_TOMBSTONE_NAMES.iter().enumerate() {
+        install_single_spool_tombstone_windows(
+            common_storage,
+            &spool_dir,
+            &pinned_dirs,
+            slot,
+            already_fenced_slots[idx],
+            Some(durability),
+            &mut ensure_spool_race_retries,
+            #[cfg(test)]
+            observer,
+        )?;
+    }
+
+    fsync_dir_durable_windows(
+        &spool_dir,
+        &pinned_dirs,
+        "fsync capture-spool directory after tombstone install",
+    )?;
+    durability.record(
+        Phase2DurabilityOpKind::SpoolDirFsync,
+        None,
+        format!("{PRIVATE_SUBDIR}/{CAPTURE_SPOOL_SUBDIR}"),
+    );
+    fsync_dir_durable_windows(
+        &private_dir,
+        &pinned_dirs[..2],
+        "fsync private directory after capture-spool tombstone install",
+    )?;
+
+    Ok(ForwardPhase2SpoolFenceReceipt {
+        cleared_ready_files,
+        cleared_quarantine_files,
+        cleared_tmp_files,
+        tombstones: CaptureSpoolTombstonePaths::from_storage_dir(common_storage),
+        ensure_spool_race_retries,
+        elapsed: started.elapsed(),
+    })
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn fence_tmp_slot_defensively_under_held_lock(
+    _common_storage: &Path,
+    _held_capacity_lock: &File,
+) -> StorageResult<()> {
+    Err(StorageBackendError::BackendInternal {
+        detail: "durable Phase 2 capture-spool tombstones are unsupported on this platform"
+            .to_string(),
+    })
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn install_inplace_spool_tombstones_under_held_lock(
+    _common_storage: &Path,
+    _backup_rel_dir: &str,
+    _held_capacity_lock: &File,
+    _verified_spool_identities: &[VerifiedSpoolFileIdentity],
+    _durability: &mut Phase2DurabilityReceipt,
+    #[cfg(test)] _observer: &mut Option<&mut dyn Phase2FinalizeTestObserver>,
+) -> StorageResult<ForwardPhase2SpoolFenceReceipt> {
+    Err(StorageBackendError::BackendInternal {
+        detail: "durable Phase 2 capture-spool tombstones are unsupported on this platform"
+            .to_string(),
+    })
+}
+
+/// Complete Forward Migration Phase 2 Step 2.3 through Step 2.4 on a
+/// continuously locked [`ForwardPhase2FencedState`] (`ADR-RB-07` #1, `RB-10g`):
+///
+/// 1. Verify preconditions (`git_db = "unlinked"`, `capture_db ∈ {"unlinked", "absent"}`,
+///    promoted target redb files & backup dir intact, unmoved `capacity.lock` held).
+/// 2. Step 2.3: Under the continuously held, unmoved `.libra/private/capture-spool/capacity.lock`,
+///    clear verified backed-up files in `capture-spool/{ready,quarantine}/` (and
+///    only expired `>= 24h` orphan files in `tmp/`, failing closed on any unexpired
+///    in-flight `tmp/` file), replace `capture-spool/{tmp,ready,quarantine}` in place
+///    with `0400` regular file tombstones (`LIBRA_CAPTURE_SPOOL_FENCED_REDB\n`) with
+///    `ensure_spool` race retry + `fsync_dir(.libra/private/capture-spool)`, and
+///    persist `phase2_progress.spool_fenced = true` + `fsync(.libra/)`.
+///    On any Step 2.3 error after Step 2.2 has unlinked legacy SQLite databases,
+///    defensively installs the durable `0400` `capture-spool/tmp` tombstone before
+///    releasing `capacity.lock` (while preserving `ready/` and `quarantine/` intact)
+///    so waiting or newly started legacy hooks fail closed instead of publishing
+///    unmigrated events.
+/// 3. Step 2.4: Atomically publish `.libra/storage-format.json` (`backend = "redb"`,
+///    `finalized = true`, `spool_fenced = true`) + `fsync_dir(.libra/)`, then
+///    release all 6 non-SQLite exclusive locks in strict reverse acquisition order.
+///
+/// Strictly repository-scoped (`GC-13`): never opens, creates, reads, or modifies
+/// `LIBRA_CONFIG_GLOBAL_DB` or `LIBRA_CONFIG_SYSTEM_DB`.
+pub fn finalize_forward_phase2_spool_tombstones_and_manifest(
+    fenced: ForwardPhase2FencedState,
+) -> StorageResult<ForwardPhase2FinalizedReport> {
+    finalize_forward_phase2_spool_tombstones_and_manifest_inner(
+        fenced,
+        #[cfg(test)]
+        None,
+    )
+}
+
+fn finalize_forward_phase2_spool_tombstones_and_manifest_inner(
+    fenced: ForwardPhase2FencedState,
+    #[cfg(test)] mut observer: Option<&mut dyn Phase2FinalizeTestObserver>,
+) -> StorageResult<ForwardPhase2FinalizedReport> {
+    let step_started = Instant::now();
+    let ForwardPhase2FencedState {
+        common_storage,
+        locks,
+        verified_spool_identities,
+        generation,
+        git_redb_path,
+        capture_redb_path,
+        mut manifest,
+        git_fence,
+        capture_fence,
+        mut durability,
+        elapsed: step2_1_to_2_2_elapsed,
+    } = fenced;
+
+    let fail_with_defensive_tmp_fence = |err: StorageBackendError| -> StorageBackendError {
+        // Because Step 2.2 has already fenced and unlinked the legacy SQLite
+        // databases, NEVER release `capacity.lock` while `capture-spool/tmp` is
+        // still a writable directory: install the durable `0400` `tmp` tombstone
+        // first (without touching `ready/` or `quarantine/`) so any waiting or
+        // newly spawned legacy hook fails closed immediately on lock release!
+        match fence_tmp_slot_defensively_under_held_lock(
+            &common_storage,
+            &locks._spool_capacity_lock,
+        ) {
+            Ok(()) => err,
+            Err(fence_err) => StorageBackendError::BackendInternal {
+                detail: format!(
+                    "{err}; additionally defensive capture-spool/tmp fencing failed ({fence_err})"
+                ),
+            },
+        }
+    };
+
+    // Step 2.3 pre-flight invariants.
+    if manifest.backend != StorageBackendKind::Redb
+        || manifest.finalized
+        || manifest.generation != generation
+        || generation == 0
+    {
+        return Err(fail_with_defensive_tmp_fence(
+            StorageBackendError::BackendInternal {
+                detail:
+                    "forward migration Step 2.3 requires unfinalized redb manifest matching generation"
+                        .to_string(),
+            },
+        ));
+    }
+    if manifest.phase2_progress.git_db != Some(Phase2DbState::Unlinked)
+        || !matches!(
+            manifest.phase2_progress.capture_db,
+            Some(Phase2DbState::Unlinked | Phase2DbState::Absent)
+        )
+    {
+        return Err(fail_with_defensive_tmp_fence(
+            StorageBackendError::BackendInternal {
+                detail:
+                    "forward migration Step 2.3 requires git_db=unlinked and capture_db=unlinked|absent"
+                        .to_string(),
+            },
+        ));
+    }
+    let backup_rel_dir = match manifest.backup_dir.clone() {
+        Some(dir) => dir,
+        None => {
+            return Err(fail_with_defensive_tmp_fence(
+                StorageBackendError::BackendInternal {
+                    detail: "forward migration Step 2.3 requires manifest.backup_dir".to_string(),
+                },
+            ));
+        }
+    };
+    for target in [&git_redb_path, &capture_redb_path] {
+        let meta = match fs::symlink_metadata(target) {
+            Ok(meta) => meta,
+            Err(err) => {
+                return Err(fail_with_defensive_tmp_fence(StorageBackendError::io(
+                    "verify promoted redb target before Step 2.3 finalization",
+                    err,
+                )));
+            }
+        };
+        if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+            return Err(fail_with_defensive_tmp_fence(
+                StorageBackendError::BackendInternal {
+                    detail:
+                        "forward migration Step 2.3 rejected missing or non-regular redb target"
+                            .to_string(),
+                },
+            ));
+        }
+    }
+
+    // Step 2.3(a): Clear verified backed-up spool files and replace
+    // `capture-spool/{tmp,ready,quarantine}` with `0400` regular file tombstones
+    // + `fsync_dir` under the continuously held, unmoved `capacity.lock`.
+    let spool_fence = match install_inplace_spool_tombstones_under_held_lock(
+        &common_storage,
+        &backup_rel_dir,
+        &locks._spool_capacity_lock,
+        &verified_spool_identities,
+        &mut durability,
+        #[cfg(test)]
+        &mut observer,
+    ) {
+        Ok(receipt) => receipt,
+        Err(err) => return Err(fail_with_defensive_tmp_fence(err)),
+    };
+
+    #[cfg(test)]
+    if let Some(obs) = observer.as_deref_mut() {
+        obs.on_point(
+            Phase2FinalizeTestPoint::AfterSpoolTombstonesBeforePersistSpoolFenced,
+            &common_storage,
+        )?;
+    }
+
+    // Step 2.3(b): Atomically persist `phase2_progress.spool_fenced = true`
+    // (still `finalized = false`) + `fsync_dir(.libra/)`.
+    manifest.phase2_progress.spool_fenced = true;
+    publish_phase2_storage_manifest_durable(
+        &common_storage,
+        &manifest,
+        &mut durability,
+        Phase2DurabilityOpKind::PublishManifestSpoolFenced,
+        None,
+        None,
+    )?;
+
+    #[cfg(test)]
+    if let Some(obs) = observer.as_deref_mut() {
+        obs.on_point(
+            Phase2FinalizeTestPoint::AfterPersistSpoolFencedBeforeFinalized,
+            &common_storage,
+        )?;
+    }
+
+    // Step 2.4(a): Transition manifest to `finalized = true` and atomically
+    // publish `.libra/storage-format.json` + `fsync_dir(.libra/)` while ALL 6
+    // non-SQLite exclusive locks remain continuously held.
+    let finalized_manifest = manifest.into_finalized()?;
+    publish_phase2_storage_manifest_durable(
+        &common_storage,
+        &finalized_manifest,
+        &mut durability,
+        Phase2DurabilityOpKind::PublishManifestFinalized,
+        None,
+        None,
+    )?;
+
+    #[cfg(test)]
+    if let Some(obs) = observer {
+        obs.on_point(
+            Phase2FinalizeTestPoint::AfterFinalizedBeforeUnlock,
+            &common_storage,
+        )?;
+    }
+
+    // Step 2.4(b): Release all 6 non-SQLite exclusive advisory locks in strict
+    // reverse acquisition order ONLY AFTER `finalized = true` + `fsync_dir(.libra/)`.
+    drop(locks);
+    durability.record(
+        Phase2DurabilityOpKind::ReleaseLocks,
+        None,
+        STORAGE_FORMAT_MANIFEST_FILE,
+    );
+
+    let step2_3_to_2_4_elapsed = step_started.elapsed();
+    Ok(ForwardPhase2FinalizedReport {
+        generation,
+        git_redb_path,
+        capture_redb_path,
+        manifest: finalized_manifest,
+        git_fence,
+        capture_fence,
+        spool_fence,
+        durability,
+        step2_3_to_2_4_elapsed,
+        total_phase2_elapsed: step2_1_to_2_2_elapsed + step2_3_to_2_4_elapsed,
+    })
+}
+
+/// Execute complete end-to-end repository Forward Migration (`SQLite -> redb`,
+/// Phase 1 + Phase 2 Step 2.1–2.4) with explicit role gate (`GC-RB-02`, `GC-13`,
+/// `ADR-RB-07` #1, `RB-10g`).
+///
+/// Rejects `DatabaseRole::Derived`, `DatabaseRole::GlobalConfig`, and
+/// `DatabaseRole::SystemConfig` fail-closed before touching the filesystem, and
+/// strictly isolates repository migration from `LIBRA_CONFIG_GLOBAL_DB` and
+/// `LIBRA_CONFIG_SYSTEM_DB`.
+pub async fn execute_forward_migration_for_role(
+    role: DatabaseRole,
+    common_storage: &Path,
+    generation: u64,
+) -> StorageResult<ForwardPhase2FinalizedReport> {
+    validate_any_migration_role(role)?;
+    if role != DatabaseRole::Repository {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "repository forward migration rejected {role}: expected DatabaseRole::Repository"
+            ),
+        });
+    }
+    let prepared = prepare_forward_phase1_for_role(role, common_storage, generation).await?;
+    let fenced = execute_forward_phase2_fence_and_unlink(prepared).await?;
+    finalize_forward_phase2_spool_tombstones_and_manifest(fenced)
+}
+
+/// Convenience entrypoint for end-to-end repository (`DatabaseRole::Repository`)
+/// Forward Migration (`SQLite -> redb`, `RB-10g`).
+pub async fn execute_forward_migration(
+    common_storage: &Path,
+    generation: u64,
+) -> StorageResult<ForwardPhase2FinalizedReport> {
+    execute_forward_migration_for_role(DatabaseRole::Repository, common_storage, generation).await
 }
 
 #[cfg(test)]
@@ -46078,6 +49084,2575 @@ stderr:
             assert!(
                 budget_elapsed <= Duration::from_millis(200),
                 "RB-10e existing-table DDL fence + rejection budget exceeded: {budget_elapsed:?} > 200ms"
+            );
+        }
+    }
+
+    // ========================================================================
+    // RB-10g: Forward Migration Phase 2 Step 2.3–2.4 (In-Place Unmoved-Lock
+    // `capture-spool` 0400 Tombstones, Finalized `storage-format.json`
+    // Publication & Lock Release, and `GC-13` Global/System Config Isolation)
+    // ========================================================================
+
+    const RB10G_CHILD_MODE_ENV: &str = "LIBRA_RB10G_CHILD_MODE";
+    const RB10G_CHILD_STORAGE_ENV: &str = "LIBRA_RB10G_CHILD_STORAGE";
+    const RB10G_CHILD_IO_TIMEOUT: Duration = Duration::from_secs(10);
+
+    #[cfg(target_os = "macos")]
+    fn rb10g_child_holds_inode_fd(pid: u32, target: (u64, u64)) -> bool {
+        #[repr(C)]
+        struct MacVnodeFdInfo {
+            pfi: [u8; 24],
+            pvi: libc::vnode_info,
+        }
+        const PROC_PIDFDVNODEINFO: libc::c_int = 1;
+        let pid_i32 = pid as libc::c_int;
+        // SAFETY: Querying buffer size for our own child PID via public libproc API.
+        let buf_bytes = unsafe {
+            libc::proc_pidinfo(pid_i32, libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0)
+        };
+        if buf_bytes <= 0 {
+            return false;
+        }
+        let fd_sz = std::mem::size_of::<libc::proc_fdinfo>();
+        let cap = (buf_bytes as usize) / fd_sz + 8;
+        let mut fds: Vec<libc::proc_fdinfo> = vec![
+            libc::proc_fdinfo {
+                proc_fd: 0,
+                proc_fdtype: 0,
+            };
+            cap
+        ];
+        // SAFETY: `fds` buffer has capacity `cap * fd_sz` bytes.
+        let got = unsafe {
+            libc::proc_pidinfo(
+                pid_i32,
+                libc::PROC_PIDLISTFDS,
+                0,
+                fds.as_mut_ptr().cast(),
+                (cap * fd_sz) as libc::c_int,
+            )
+        };
+        if got <= 0 {
+            return false;
+        }
+        let count = (got as usize) / fd_sz;
+        for entry in &fds[..count] {
+            if entry.proc_fdtype == libc::PROX_FDTYPE_VNODE as u32 {
+                let mut vfi = std::mem::MaybeUninit::<MacVnodeFdInfo>::zeroed();
+                let expected_sz = std::mem::size_of::<MacVnodeFdInfo>() as libc::c_int;
+                // SAFETY: `vfi` is writable and sized to `sizeof(struct vnode_fdinfo)`.
+                let r = unsafe {
+                    libc::proc_pidfdinfo(
+                        pid_i32,
+                        entry.proc_fd,
+                        PROC_PIDFDVNODEINFO,
+                        vfi.as_mut_ptr().cast(),
+                        expected_sz,
+                    )
+                };
+                if r == expected_sz {
+                    // SAFETY: `proc_pidfdinfo` populated the full `MacVnodeFdInfo` struct.
+                    let vfi = unsafe { vfi.assume_init() };
+                    let dev = vfi.pvi.vi_stat.vst_dev as u64;
+                    let ino = vfi.pvi.vi_stat.vst_ino;
+                    if (dev, ino) == target {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    #[cfg(target_os = "linux")]
+    fn rb10g_child_holds_inode_fd(pid: u32, target: (u64, u64)) -> bool {
+        use std::os::unix::fs::MetadataExt as _;
+        let Ok(entries) = fs::read_dir(format!("/proc/{pid}/fd")) else {
+            return false;
+        };
+        for entry in entries.flatten() {
+            if let Ok(meta) = fs::metadata(entry.path())
+                && (meta.dev(), meta.ino()) == target
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    #[cfg(unix)]
+    fn rb10g_wait_child_blocked_on_capacity_lock(
+        child: &mut Child,
+        cap_lock_inode: (u64, u64),
+        timeout: Duration,
+    ) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(status) = child.try_wait().expect("poll blocked hook child") {
+                panic!(
+                    "blocked legacy hook child exited prematurely before blocking on capacity.lock: {status:?}"
+                );
+            }
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            if rb10g_child_holds_inode_fd(child.id(), cap_lock_inode) {
+                // Give one extra 2ms tick so the child enters `try_lock()`
+                // after `open()` on `capacity.lock`, then re-confirm still alive.
+                std::thread::sleep(Duration::from_millis(2));
+                assert!(
+                    child
+                        .try_wait()
+                        .expect("re-poll blocked hook child")
+                        .is_none(),
+                    "legacy hook child exited immediately after opening capacity.lock"
+                );
+                return;
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+            {
+                let _ = cap_lock_inode;
+                std::thread::sleep(Duration::from_millis(50));
+                assert!(
+                    child
+                        .try_wait()
+                        .expect("re-poll blocked hook child")
+                        .is_none(),
+                    "legacy hook child exited while capacity.lock was held"
+                );
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for unmodified spool::publish child pid={} to pass ensure_spool and open capacity.lock inode {:?}",
+                child.id(),
+                cap_lock_inode
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn rb10g_build_gc13_fs_interposer(build_dir: &Path) -> PathBuf {
+        let src_path = build_dir.join("gc13_interpose.c");
+        #[cfg(target_os = "macos")]
+        let lib_path = build_dir.join("libgc13_interpose.dylib");
+        #[cfg(target_os = "linux")]
+        let lib_path = build_dir.join("libgc13_interpose.so");
+
+        #[cfg(target_os = "macos")]
+        let c_source = r#"
+#include <fcntl.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+static _Thread_local int in_hook = 0;
+
+static void write_log_line(const char *fn, const char *p) {
+    const char *logp = getenv("LIBRA_RB10G_INTERPOSE_LOG");
+    if (!logp || !p) return;
+    int fd = open(logp, O_WRONLY | O_CREAT | O_APPEND, 0600);
+    if (fd >= 0) {
+        char buf[2048];
+        int n = snprintf(buf, sizeof(buf), "%s:%s\n", fn, p);
+        if (n > 0) {
+            (void)write(fd, buf, (size_t)n);
+        }
+        close(fd);
+    }
+}
+
+static int path_matches_watched(const char *p) {
+    if (!p) return 0;
+    const char *w1 = getenv("LIBRA_RB10G_WATCH_GLOBAL");
+    const char *w2 = getenv("LIBRA_RB10G_WATCH_SYSTEM");
+    if (w1 && w1[0] && strstr(p, w1)) return 1;
+    if (w2 && w2[0] && strstr(p, w2)) return 1;
+    return 0;
+}
+
+static void check_path(const char *fn, const char *p) {
+    if (in_hook || !p) return;
+    in_hook = 1;
+    if (path_matches_watched(p)) {
+        write_log_line(fn, p);
+    }
+    in_hook = 0;
+}
+
+static void check_dirfd_path(const char *fn, int dirfd, const char *p) {
+    if (in_hook || !p) return;
+    in_hook = 1;
+    if (path_matches_watched(p)) {
+        write_log_line(fn, p);
+    } else if (dirfd != AT_FDCWD && p[0] != '/') {
+        char dirbuf[1024];
+        if (fcntl(dirfd, F_GETPATH, dirbuf) == 0) {
+            char joined[2048];
+            snprintf(joined, sizeof(joined), "%s/%s", dirbuf, p);
+            if (path_matches_watched(joined)) {
+                write_log_line(fn, joined);
+            }
+        }
+    }
+    in_hook = 0;
+}
+
+__attribute__((constructor))
+static void gc13_interpose_init(void) {
+    in_hook = 1;
+    write_log_line("INIT", "LOADED");
+    in_hook = 0;
+}
+
+static int hook_open(const char *path, int oflag, ...) {
+    mode_t mode = 0;
+    if (oflag & O_CREAT) {
+        va_list ap;
+        va_start(ap, oflag);
+        mode = (mode_t)va_arg(ap, int);
+        va_end(ap);
+    }
+    check_path("open", path);
+    return (oflag & O_CREAT) ? open(path, oflag, mode) : open(path, oflag);
+}
+
+static int hook_openat(int dirfd, const char *path, int oflag, ...) {
+    mode_t mode = 0;
+    if (oflag & O_CREAT) {
+        va_list ap;
+        va_start(ap, oflag);
+        mode = (mode_t)va_arg(ap, int);
+        va_end(ap);
+    }
+    check_dirfd_path("openat", dirfd, path);
+    return (oflag & O_CREAT) ? openat(dirfd, path, oflag, mode) : openat(dirfd, path, oflag);
+}
+
+static int hook_stat(const char *path, struct stat *buf) {
+    check_path("stat", path);
+    return stat(path, buf);
+}
+
+static int hook_lstat(const char *path, struct stat *buf) {
+    check_path("lstat", path);
+    return lstat(path, buf);
+}
+
+static int hook_fstatat(int dirfd, const char *path, struct stat *buf, int flag) {
+    check_dirfd_path("fstatat", dirfd, path);
+    return fstatat(dirfd, path, buf, flag);
+}
+
+static int hook_access(const char *path, int mode) {
+    check_path("access", path);
+    return access(path, mode);
+}
+
+static int hook_faccessat(int dirfd, const char *path, int mode, int flag) {
+    check_dirfd_path("faccessat", dirfd, path);
+    return faccessat(dirfd, path, mode, flag);
+}
+
+static int hook_mkdir(const char *path, mode_t mode) {
+    check_path("mkdir", path);
+    return mkdir(path, mode);
+}
+
+static int hook_unlink(const char *path) {
+    check_path("unlink", path);
+    return unlink(path);
+}
+
+static int hook_rename(const char *oldp, const char *newp) {
+    check_path("rename_old", oldp);
+    check_path("rename_new", newp);
+    return rename(oldp, newp);
+}
+
+__attribute__((used, section("__DATA,__interpose")))
+static struct { const void *rep; const void *orig; } gc13_interposers[] = {
+    { (const void *)hook_open, (const void *)open },
+    { (const void *)hook_openat, (const void *)openat },
+    { (const void *)hook_stat, (const void *)stat },
+    { (const void *)hook_lstat, (const void *)lstat },
+    { (const void *)hook_fstatat, (const void *)fstatat },
+    { (const void *)hook_access, (const void *)access },
+    { (const void *)hook_faccessat, (const void *)faccessat },
+    { (const void *)hook_mkdir, (const void *)mkdir },
+    { (const void *)hook_unlink, (const void *)unlink },
+    { (const void *)hook_rename, (const void *)rename },
+};
+"#;
+
+        #[cfg(target_os = "linux")]
+        let c_source = r#"
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <fcntl.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+static _Thread_local int in_hook = 0;
+
+static void write_log_line(const char *fn, const char *p) {
+    const char *logp = getenv("LIBRA_RB10G_INTERPOSE_LOG");
+    if (!logp || !p) return;
+    int fd = (int)syscall(SYS_openat, AT_FDCWD, logp, O_WRONLY | O_CREAT | O_APPEND, 0600);
+    if (fd >= 0) {
+        char buf[2048];
+        int n = snprintf(buf, sizeof(buf), "%s:%s\n", fn, p);
+        if (n > 0) {
+            (void)write(fd, buf, (size_t)n);
+        }
+        close(fd);
+    }
+}
+
+static int path_matches_watched(const char *p) {
+    if (!p) return 0;
+    const char *w1 = getenv("LIBRA_RB10G_WATCH_GLOBAL");
+    const char *w2 = getenv("LIBRA_RB10G_WATCH_SYSTEM");
+    if (w1 && w1[0] && strstr(p, w1)) return 1;
+    if (w2 && w2[0] && strstr(p, w2)) return 1;
+    return 0;
+}
+
+static void check_path(const char *fn, const char *p) {
+    if (in_hook || !p) return;
+    in_hook = 1;
+    if (path_matches_watched(p)) {
+        write_log_line(fn, p);
+    }
+    in_hook = 0;
+}
+
+static void check_dirfd_path(const char *fn, int dirfd, const char *p) {
+    if (in_hook || !p) return;
+    in_hook = 1;
+    if (path_matches_watched(p)) {
+        write_log_line(fn, p);
+    } else if (dirfd != AT_FDCWD && p[0] != '/') {
+        char proc_link[64];
+        char dirbuf[1024];
+        snprintf(proc_link, sizeof(proc_link), "/proc/self/fd/%d", dirfd);
+        ssize_t r = readlink(proc_link, dirbuf, sizeof(dirbuf) - 1);
+        if (r > 0) {
+            dirbuf[r] = '\0';
+            char joined[2048];
+            snprintf(joined, sizeof(joined), "%s/%s", dirbuf, p);
+            if (path_matches_watched(joined)) {
+                write_log_line(fn, joined);
+            }
+        }
+    }
+    in_hook = 0;
+}
+
+__attribute__((constructor))
+static void gc13_interpose_init(void) {
+    in_hook = 1;
+    write_log_line("INIT", "LOADED");
+    in_hook = 0;
+}
+
+int open(const char *path, int oflag, ...) {
+    static int (*real_open)(const char *, int, ...) = NULL;
+    if (!real_open) real_open = dlsym(RTLD_NEXT, "open");
+    mode_t mode = 0;
+    if (oflag & O_CREAT) {
+        va_list ap;
+        va_start(ap, oflag);
+        mode = (mode_t)va_arg(ap, int);
+        va_end(ap);
+    }
+    check_path("open", path);
+    return (oflag & O_CREAT) ? real_open(path, oflag, mode) : real_open(path, oflag);
+}
+
+int open64(const char *path, int oflag, ...) {
+    static int (*real_open64)(const char *, int, ...) = NULL;
+    if (!real_open64) real_open64 = dlsym(RTLD_NEXT, "open64");
+    mode_t mode = 0;
+    if (oflag & O_CREAT) {
+        va_list ap;
+        va_start(ap, oflag);
+        mode = (mode_t)va_arg(ap, int);
+        va_end(ap);
+    }
+    check_path("open64", path);
+    return (oflag & O_CREAT) ? real_open64(path, oflag, mode) : real_open64(path, oflag);
+}
+
+int openat(int dirfd, const char *path, int oflag, ...) {
+    static int (*real_openat)(int, const char *, int, ...) = NULL;
+    if (!real_openat) real_openat = dlsym(RTLD_NEXT, "openat");
+    mode_t mode = 0;
+    if (oflag & O_CREAT) {
+        va_list ap;
+        va_start(ap, oflag);
+        mode = (mode_t)va_arg(ap, int);
+        va_end(ap);
+    }
+    check_dirfd_path("openat", dirfd, path);
+    return (oflag & O_CREAT) ? real_openat(dirfd, path, oflag, mode) : real_openat(dirfd, path, oflag);
+}
+
+int openat64(int dirfd, const char *path, int oflag, ...) {
+    static int (*real_openat64)(int, const char *, int, ...) = NULL;
+    if (!real_openat64) real_openat64 = dlsym(RTLD_NEXT, "openat64");
+    mode_t mode = 0;
+    if (oflag & O_CREAT) {
+        va_list ap;
+        va_start(ap, oflag);
+        mode = (mode_t)va_arg(ap, int);
+        va_end(ap);
+    }
+    check_dirfd_path("openat64", dirfd, path);
+    return (oflag & O_CREAT) ? real_openat64(dirfd, path, oflag, mode) : real_openat64(dirfd, path, oflag);
+}
+
+int stat(const char *path, struct stat *buf) {
+    static int (*real_stat)(const char *, struct stat *) = NULL;
+    if (!real_stat) real_stat = dlsym(RTLD_NEXT, "stat");
+    check_path("stat", path);
+    return real_stat(path, buf);
+}
+
+int stat64(const char *path, struct stat64 *buf) {
+    static int (*real_stat64)(const char *, struct stat64 *) = NULL;
+    if (!real_stat64) real_stat64 = dlsym(RTLD_NEXT, "stat64");
+    check_path("stat64", path);
+    return real_stat64(path, buf);
+}
+
+int __xstat(int ver, const char *path, struct stat *buf) {
+    static int (*real_xstat)(int, const char *, struct stat *) = NULL;
+    if (!real_xstat) real_xstat = dlsym(RTLD_NEXT, "__xstat");
+    check_path("__xstat", path);
+    return real_xstat(ver, path, buf);
+}
+
+int __xstat64(int ver, const char *path, struct stat64 *buf) {
+    static int (*real_xstat64)(int, const char *, struct stat64 *) = NULL;
+    if (!real_xstat64) real_xstat64 = dlsym(RTLD_NEXT, "__xstat64");
+    check_path("__xstat64", path);
+    return real_xstat64(ver, path, buf);
+}
+
+int lstat(const char *path, struct stat *buf) {
+    static int (*real_lstat)(const char *, struct stat *) = NULL;
+    if (!real_lstat) real_lstat = dlsym(RTLD_NEXT, "lstat");
+    check_path("lstat", path);
+    return real_lstat(path, buf);
+}
+
+int lstat64(const char *path, struct stat64 *buf) {
+    static int (*real_lstat64)(const char *, struct stat64 *) = NULL;
+    if (!real_lstat64) real_lstat64 = dlsym(RTLD_NEXT, "lstat64");
+    check_path("lstat64", path);
+    return real_lstat64(path, buf);
+}
+
+int __lxstat(int ver, const char *path, struct stat *buf) {
+    static int (*real_lxstat)(int, const char *, struct stat *) = NULL;
+    if (!real_lxstat) real_lxstat = dlsym(RTLD_NEXT, "__lxstat");
+    check_path("__lxstat", path);
+    return real_lxstat(ver, path, buf);
+}
+
+int __lxstat64(int ver, const char *path, struct stat64 *buf) {
+    static int (*real_lxstat64)(int, const char *, struct stat64 *) = NULL;
+    if (!real_lxstat64) real_lxstat64 = dlsym(RTLD_NEXT, "__lxstat64");
+    check_path("__lxstat64", path);
+    return real_lxstat64(ver, path, buf);
+}
+
+int fstatat(int dirfd, const char *path, struct stat *buf, int flags) {
+    static int (*real_fstatat)(int, const char *, struct stat *, int) = NULL;
+    if (!real_fstatat) real_fstatat = dlsym(RTLD_NEXT, "fstatat");
+    check_dirfd_path("fstatat", dirfd, path);
+    return real_fstatat(dirfd, path, buf, flags);
+}
+
+int fstatat64(int dirfd, const char *path, struct stat64 *buf, int flags) {
+    static int (*real_fstatat64)(int, const char *, struct stat64 *, int) = NULL;
+    if (!real_fstatat64) real_fstatat64 = dlsym(RTLD_NEXT, "fstatat64");
+    check_dirfd_path("fstatat64", dirfd, path);
+    return real_fstatat64(dirfd, path, buf, flags);
+}
+
+int __fxstatat(int ver, int dirfd, const char *path, struct stat *buf, int flags) {
+    static int (*real_fxstatat)(int, int, const char *, struct stat *, int) = NULL;
+    if (!real_fxstatat) real_fxstatat = dlsym(RTLD_NEXT, "__fxstatat");
+    check_dirfd_path("__fxstatat", dirfd, path);
+    return real_fxstatat(ver, dirfd, path, buf, flags);
+}
+
+int __fxstatat64(int ver, int dirfd, const char *path, struct stat64 *buf, int flags) {
+    static int (*real_fxstatat64)(int, int, const char *, struct stat64 *, int) = NULL;
+    if (!real_fxstatat64) real_fxstatat64 = dlsym(RTLD_NEXT, "__fxstatat64");
+    check_dirfd_path("__fxstatat64", dirfd, path);
+    return real_fxstatat64(ver, dirfd, path, buf, flags);
+}
+
+int statx(int dirfd, const char *path, int flags, unsigned int mask, struct statx *statxbuf) {
+    static int (*real_statx)(int, const char *, int, unsigned int, struct statx *) = NULL;
+    if (!real_statx) real_statx = dlsym(RTLD_NEXT, "statx");
+    check_dirfd_path("statx", dirfd, path);
+    return real_statx(dirfd, path, flags, mask, statxbuf);
+}
+
+int access(const char *path, int mode) {
+    static int (*real_access)(const char *, int) = NULL;
+    if (!real_access) real_access = dlsym(RTLD_NEXT, "access");
+    check_path("access", path);
+    return real_access(path, mode);
+}
+
+int faccessat(int dirfd, const char *path, int mode, int flags) {
+    static int (*real_faccessat)(int, const char *, int, int) = NULL;
+    if (!real_faccessat) real_faccessat = dlsym(RTLD_NEXT, "faccessat");
+    check_dirfd_path("faccessat", dirfd, path);
+    return real_faccessat(dirfd, path, mode, flags);
+}
+
+int mkdir(const char *path, mode_t mode) {
+    static int (*real_mkdir)(const char *, mode_t) = NULL;
+    if (!real_mkdir) real_mkdir = dlsym(RTLD_NEXT, "mkdir");
+    check_path("mkdir", path);
+    return real_mkdir(path, mode);
+}
+
+int unlink(const char *path) {
+    static int (*real_unlink)(const char *) = NULL;
+    if (!real_unlink) real_unlink = dlsym(RTLD_NEXT, "unlink");
+    check_path("unlink", path);
+    return real_unlink(path);
+}
+
+int unlinkat(int dirfd, const char *path, int flags) {
+    static int (*real_unlinkat)(int, const char *, int) = NULL;
+    if (!real_unlinkat) real_unlinkat = dlsym(RTLD_NEXT, "unlinkat");
+    check_dirfd_path("unlinkat", dirfd, path);
+    return real_unlinkat(dirfd, path, flags);
+}
+
+int rename(const char *oldp, const char *newp) {
+    static int (*real_rename)(const char *, const char *) = NULL;
+    if (!real_rename) real_rename = dlsym(RTLD_NEXT, "rename");
+    check_path("rename_old", oldp);
+    check_path("rename_new", newp);
+    return real_rename(oldp, newp);
+}
+
+int renameat(int olddirfd, const char *oldp, int newdirfd, const char *newp) {
+    static int (*real_renameat)(int, const char *, int, const char *) = NULL;
+    if (!real_renameat) real_renameat = dlsym(RTLD_NEXT, "renameat");
+    check_dirfd_path("renameat_old", olddirfd, oldp);
+    check_dirfd_path("renameat_new", newdirfd, newp);
+    return real_renameat(olddirfd, oldp, newdirfd, newp);
+}
+"#;
+
+        fs::write(&src_path, c_source).expect("write GC-13 syscall interposer C source");
+        let mut cmd = Command::new("cc");
+        #[cfg(target_os = "macos")]
+        cmd.args(["-dynamiclib", "-O2", "-o"])
+            .arg(&lib_path)
+            .arg(&src_path);
+        #[cfg(target_os = "linux")]
+        cmd.args(["-shared", "-fPIC", "-O2", "-o"])
+            .arg(&lib_path)
+            .arg(&src_path)
+            .arg("-ldl");
+        let out = cmd
+            .output()
+            .expect("compile GC-13 OS filesystem syscall interposer with cc");
+        assert!(
+            out.status.success(),
+            "failed to compile GC-13 syscall interposer ({:?}):\nstdout: {}\nstderr: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        lib_path
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn rb10g_build_spool_pause_shim(build_dir: &Path) -> PathBuf {
+        let src_path = build_dir.join("spool_pause_shim.c");
+        #[cfg(target_os = "macos")]
+        let lib_path = build_dir.join("libspool_pause_shim.dylib");
+        #[cfg(target_os = "linux")]
+        let lib_path = build_dir.join("libspool_pause_shim.so");
+
+        #[cfg(target_os = "macos")]
+        let c_source = r#"
+#include <fcntl.h>
+#include <stdarg.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+static void maybe_pause(const char *path, int oflag) {
+    // Intercept ONLY `spool.rs:139` `write_fsync(&tmp_path, body)` which opens
+    // the already-created file inside `capture-spool/tmp/` WITHOUT `O_CREAT`
+    // right after `create_exclusive` (L118) released `capacity.lock` (L119) and
+    // before `publish_tmp` (L145) re-acquires `capacity.lock`!
+    if (!path || (oflag & O_CREAT) != 0) return;
+    if (!strstr(path, "/capture-spool/tmp/")) return;
+    const char *paused_marker = getenv("LIBRA_RB10G_PAUSE_MARKER");
+    const char *release_marker = getenv("LIBRA_RB10G_RELEASE_MARKER");
+    if (!paused_marker || !release_marker) return;
+    int fd = open(paused_marker, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd >= 0) {
+        (void)write(fd, "PAUSED\n", 7);
+        close(fd);
+    }
+    for (int i = 0; i < 10000; i++) {
+        if (access(release_marker, F_OK) == 0) break;
+        usleep(1000);
+    }
+}
+
+static int hook_open(const char *path, int oflag, ...) {
+    mode_t mode = 0;
+    if (oflag & O_CREAT) {
+        va_list ap;
+        va_start(ap, oflag);
+        mode = (mode_t)va_arg(ap, int);
+        va_end(ap);
+    }
+    maybe_pause(path, oflag);
+    return (oflag & O_CREAT) ? open(path, oflag, mode) : open(path, oflag);
+}
+
+static int hook_openat(int dirfd, const char *path, int oflag, ...) {
+    mode_t mode = 0;
+    if (oflag & O_CREAT) {
+        va_list ap;
+        va_start(ap, oflag);
+        mode = (mode_t)va_arg(ap, int);
+        va_end(ap);
+    }
+    maybe_pause(path, oflag);
+    return (oflag & O_CREAT) ? openat(dirfd, path, oflag, mode) : openat(dirfd, path, oflag);
+}
+
+__attribute__((used, section("__DATA,__interpose")))
+static struct { const void *rep; const void *orig; } pause_interposers[] = {
+    { (const void *)hook_open, (const void *)open },
+    { (const void *)hook_openat, (const void *)openat },
+};
+"#;
+
+        #[cfg(target_os = "linux")]
+        let c_source = r#"
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <fcntl.h>
+#include <stdarg.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+static void maybe_pause(const char *path, int oflag) {
+    if (!path || (oflag & O_CREAT) != 0) return;
+    if (!strstr(path, "/capture-spool/tmp/")) return;
+    const char *paused_marker = getenv("LIBRA_RB10G_PAUSE_MARKER");
+    const char *release_marker = getenv("LIBRA_RB10G_RELEASE_MARKER");
+    if (!paused_marker || !release_marker) return;
+    int fd = (int)syscall(SYS_openat, AT_FDCWD, paused_marker, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd >= 0) {
+        (void)write(fd, "PAUSED\n", 7);
+        close(fd);
+    }
+    for (int i = 0; i < 10000; i++) {
+        if (access(release_marker, F_OK) == 0) break;
+        usleep(1000);
+    }
+}
+
+int open(const char *path, int oflag, ...) {
+    static int (*real_open)(const char *, int, ...) = NULL;
+    if (!real_open) real_open = dlsym(RTLD_NEXT, "open");
+    mode_t mode = 0;
+    if (oflag & O_CREAT) {
+        va_list ap;
+        va_start(ap, oflag);
+        mode = (mode_t)va_arg(ap, int);
+        va_end(ap);
+    }
+    maybe_pause(path, oflag);
+    return (oflag & O_CREAT) ? real_open(path, oflag, mode) : real_open(path, oflag);
+}
+
+int open64(const char *path, int oflag, ...) {
+    static int (*real_open64)(const char *, int, ...) = NULL;
+    if (!real_open64) real_open64 = dlsym(RTLD_NEXT, "open64");
+    mode_t mode = 0;
+    if (oflag & O_CREAT) {
+        va_list ap;
+        va_start(ap, oflag);
+        mode = (mode_t)va_arg(ap, int);
+        va_end(ap);
+    }
+    maybe_pause(path, oflag);
+    return (oflag & O_CREAT) ? real_open64(path, oflag, mode) : real_open64(path, oflag);
+}
+
+int openat(int dirfd, const char *path, int oflag, ...) {
+    static int (*real_openat)(int, const char *, int, ...) = NULL;
+    if (!real_openat) real_openat = dlsym(RTLD_NEXT, "openat");
+    mode_t mode = 0;
+    if (oflag & O_CREAT) {
+        va_list ap;
+        va_start(ap, oflag);
+        mode = (mode_t)va_arg(ap, int);
+        va_end(ap);
+    }
+    maybe_pause(path, oflag);
+    return (oflag & O_CREAT) ? real_openat(dirfd, path, oflag, mode) : real_openat(dirfd, path, oflag);
+}
+
+int openat64(int dirfd, const char *path, int oflag, ...) {
+    static int (*real_openat64)(int, const char *, int, ...) = NULL;
+    if (!real_openat64) real_openat64 = dlsym(RTLD_NEXT, "openat64");
+    mode_t mode = 0;
+    if (oflag & O_CREAT) {
+        va_list ap;
+        va_start(ap, oflag);
+        mode = (mode_t)va_arg(ap, int);
+        va_end(ap);
+    }
+    maybe_pause(path, oflag);
+    return (oflag & O_CREAT) ? real_openat64(dirfd, path, oflag, mode) : real_openat64(dirfd, path, oflag);
+}
+"#;
+
+        fs::write(&src_path, c_source).expect("write spool pause shim C source");
+        let mut cmd = Command::new("cc");
+        #[cfg(target_os = "macos")]
+        cmd.args(["-dynamiclib", "-O2", "-o"])
+            .arg(&lib_path)
+            .arg(&src_path);
+        #[cfg(target_os = "linux")]
+        cmd.args(["-shared", "-fPIC", "-O2", "-o"])
+            .arg(&lib_path)
+            .arg(&src_path)
+            .arg("-ldl");
+        let out = cmd
+            .output()
+            .expect("compile RB-10g spool pause shim with cc");
+        assert!(
+            out.status.success(),
+            "failed to compile spool pause shim ({:?}):\nstdout: {}\nstderr: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        lib_path
+    }
+
+    fn run_rb10g_hook_child(mode: &str, storage: &Path) {
+        use crate::internal::ai::capture::spool;
+        let payload = build_spool_envelope_bytes(
+            "codex",
+            "codex",
+            "33333333-3333-4333-8333-333333333301",
+            Some(match mode {
+                "blocked_l112" => "dedup:rb10g:blocked-l112",
+                "paused_inflight_l139_ok" => "dedup:rb10g:paused-l139-ok",
+                "paused_inflight_l139_fail" => "dedup:rb10g:paused-l139-fail",
+                _ => "dedup:rb10g:fresh-l105",
+            }),
+            "prov-rb10g-hook",
+            "/work/rb10g",
+            storage,
+            "session_start",
+            "2026-11-22T02:00:00Z",
+            "",
+        );
+        match mode {
+            "paused_inflight_l139_ok" => {
+                let outcome = spool::publish(
+                    storage,
+                    false,
+                    "dedup:rb10g:paused-l139-ok",
+                    &payload,
+                    Some(Instant::now() + Duration::from_secs(8)),
+                )
+                .expect("paused in-flight publisher must succeed after migration fails closed before unlink");
+                assert_eq!(outcome, spool::PublishOutcome::Published);
+                println!("RB10G_PAUSED_L139_PUBLISHED_OK pid={}", std::process::id());
+                let _ = io::stdout().flush();
+            }
+            "paused_inflight_l139_fail" => {
+                let err = spool::publish(
+                    storage,
+                    false,
+                    "dedup:rb10g:paused-l139-fail",
+                    &payload,
+                    Some(Instant::now() + Duration::from_secs(8)),
+                )
+                .expect_err("paused in-flight publisher must fail closed when defensive quarantine tombstone is installed");
+                assert!(err.downcast_ref::<spool::CaptureQueueBusy>().is_none());
+                let rendered = format!("{err:#}");
+                assert!(
+                    rendered.contains("capture queue directory could not be read"),
+                    "paused in-flight publisher must hit spool.rs:149 combined_usage ENOTDIR on defensive quarantine tombstone, got: {rendered}"
+                );
+                println!(
+                    "RB10G_PAUSED_L139_FAIL_CLOSED_OK pid={} err={}",
+                    std::process::id(),
+                    rendered.replace('\n', " ")
+                );
+                let _ = io::stdout().flush();
+            }
+            "blocked_l112" => {
+                // Signal parent BEFORE entering `spool::publish` (which passes
+                // `spool.rs:105` `ensure_spool` while `{tmp,ready,quarantine}`
+                // are still directories and blocks in `spool.rs:112`
+                // `lock_capacity` on the unmoved `capacity.lock` inode!).
+                println!("RB10G_ENTERING_PUBLISH pid={}", std::process::id());
+                let _ = io::stdout().flush();
+
+                let t0 = Instant::now();
+                let res = spool::publish(
+                    storage,
+                    false,
+                    "dedup:rb10g:blocked-l112",
+                    &payload,
+                    Some(Instant::now() + Duration::from_secs(8)),
+                );
+                let elapsed = t0.elapsed();
+                let err = res.expect_err(
+                    "AC1 legacy hook blocked at spool.rs:112 must fail closed after acquiring capacity.lock",
+                );
+                assert!(
+                    err.downcast_ref::<spool::CaptureQueueBusy>().is_none(),
+                    "AC1 legacy hook must acquire released capacity.lock and hit tombstone error, NOT CaptureQueueBusy timeout: {err:?} (elapsed={elapsed:?})"
+                );
+                let rendered = format!("{err:#}");
+                assert!(
+                    rendered.contains("capture queue directory could not be read"),
+                    "AC1 blocked hook must wake from spool.rs:112 lock_capacity and fail at spool.rs:113 delete_expired_tmp on 0400 tmp tombstone, got: {rendered}"
+                );
+                assert!(
+                    !rendered.contains("capture queue directory is not a private directory"),
+                    "AC1 blocked hook must NOT fail early at spool.rs:105 ensure_spool, got: {rendered}"
+                );
+                println!(
+                    "RB10G_L112_FAIL_CLOSED_OK pid={} elapsed_ms={} err={}",
+                    std::process::id(),
+                    elapsed.as_millis(),
+                    rendered.replace('\n', " ")
+                );
+                let _ = io::stdout().flush();
+            }
+            "fresh_l105" => {
+                let t0 = Instant::now();
+                let res = spool::publish(
+                    storage,
+                    false,
+                    "dedup:rb10g:fresh-l105",
+                    &payload,
+                    Some(Instant::now() + Duration::from_secs(5)),
+                );
+                let elapsed = t0.elapsed();
+                let err = res.expect_err(
+                    "AC2 fresh legacy hook at spool.rs:105 must fail closed on 0400 tombstones",
+                );
+                assert!(
+                    err.downcast_ref::<spool::CaptureQueueBusy>().is_none(),
+                    "AC2 fresh hook must fail at ensure_spool (!is_dir), NOT lock timeout: {err:?}"
+                );
+                let rendered = format!("{err:#}");
+                assert!(
+                    rendered.contains("capture queue directory is not a private directory"),
+                    "AC2 fresh hook must hit ensure_spool !is_dir() rejection, got: {rendered}"
+                );
+                println!(
+                    "RB10G_L105_FAIL_CLOSED_OK pid={} elapsed_ms={}",
+                    std::process::id(),
+                    elapsed.as_millis()
+                );
+                let _ = io::stdout().flush();
+            }
+            other => panic!("unexpected RB-10g hook child mode `{other}`"),
+        }
+    }
+
+    async fn run_rb10g_gc13_child(storage: &Path) {
+        let report = execute_forward_migration(storage, 1)
+            .await
+            .expect("GC-13 isolated forward repository migration must succeed");
+        assert!(report.manifest.finalized);
+        assert_eq!(report.manifest.backend, StorageBackendKind::Redb);
+        assert!(report.manifest.phase2_progress.spool_fenced);
+        assert!(
+            report.step2_3_to_2_4_elapsed <= Duration::from_millis(200),
+            "GC-13 Step 2.3–2.4 budget exceeded: {:?}",
+            report.step2_3_to_2_4_elapsed
+        );
+        println!(
+            "RB10G_GC13_MIGRATION_OK pid={} step_us={}",
+            std::process::id(),
+            report.step2_3_to_2_4_elapsed.as_micros()
+        );
+        let _ = io::stdout().flush();
+    }
+
+    #[tokio::test]
+    async fn forward_phase2_unmoved_lock_inplace_spool_tombstones_block_concurrent_hooks() {
+        if let Some(mode) = std::env::var_os(RB10G_CHILD_MODE_ENV) {
+            let storage = PathBuf::from(
+                std::env::var_os(RB10G_CHILD_STORAGE_ENV).expect("RB10G child storage env"),
+            );
+            run_rb10g_hook_child(&mode.to_string_lossy(), &storage);
+            return;
+        }
+
+        use crate::{
+            internal::ai::capture::spool,
+            storage::{
+                FRAME_FLAG_NONE, SqliteCaptureStore, append_postcard_frame, init_capture_queue,
+                manifest::{ManifestOrigin, StorageAuthority, detect_storage_authority},
+            },
+        };
+
+        let exe = std::env::current_exe().expect("locate current test executable");
+
+        let spawn_blocked_hook = |storage: &Path| {
+            let mut child = Command::new(&exe)
+                .arg("--exact")
+                .arg(
+                    "storage::migrate::tests::forward_phase2_unmoved_lock_inplace_spool_tombstones_block_concurrent_hooks",
+                )
+                .arg("--nocapture")
+                .env(RB10G_CHILD_MODE_ENV, "blocked_l112")
+                .env(RB10G_CHILD_STORAGE_ENV, storage)
+                .env("LIBRA_TEST", "1")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn blocked spool.rs:112 legacy hook child");
+            let child_stdout = child.stdout.take().expect("blocked child stdout");
+            let child_stderr = child.stderr.take().expect("blocked child stderr");
+            let (out_tx, out_rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let mut reader = BufReader::new(child_stdout);
+                loop {
+                    let mut line = String::new();
+                    match reader.read_line(&mut line) {
+                        Ok(0) => break,
+                        Ok(_) => {
+                            if out_tx.send(line).is_err() {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+            let (err_tx, err_rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let mut r = child_stderr;
+                let mut s = String::new();
+                let _ = r.read_to_string(&mut s);
+                let _ = err_tx.send(s);
+            });
+            let enter_deadline = Instant::now() + RB10G_CHILD_IO_TIMEOUT;
+            let mut saw_enter = false;
+            while let Some(rem) = enter_deadline.checked_duration_since(Instant::now()) {
+                match out_rx.recv_timeout(rem) {
+                    Ok(line) if line.starts_with("RB10G_ENTERING_PUBLISH ") => {
+                        saw_enter = true;
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+            assert!(
+                saw_enter,
+                "blocked hook child failed to emit RB10G_ENTERING_PUBLISH"
+            );
+            (child, out_rx, err_rx)
+        };
+
+        let run_fresh_l105_hook = |storage: &Path| {
+            let mut fresh_child = Command::new(&exe)
+                .arg("--exact")
+                .arg(
+                    "storage::migrate::tests::forward_phase2_unmoved_lock_inplace_spool_tombstones_block_concurrent_hooks",
+                )
+                .arg("--nocapture")
+                .env(RB10G_CHILD_MODE_ENV, "fresh_l105")
+                .env(RB10G_CHILD_STORAGE_ENV, storage)
+                .env("LIBRA_TEST", "1")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn fresh spool.rs:105 legacy hook child");
+            let f_out_pipe = fresh_child.stdout.take().expect("fresh child stdout");
+            let f_err_pipe = fresh_child.stderr.take().expect("fresh child stderr");
+            let (f_out_tx, f_out_rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let mut r = f_out_pipe;
+                let mut s = String::new();
+                let _ = r.read_to_string(&mut s);
+                let _ = f_out_tx.send(s);
+            });
+            let (f_err_tx, f_err_rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let mut r = f_err_pipe;
+                let mut s = String::new();
+                let _ = r.read_to_string(&mut s);
+                let _ = f_err_tx.send(s);
+            });
+            let fresh_status = wait_child_exit_bounded(&mut fresh_child, RB10G_CHILD_IO_TIMEOUT)
+                .unwrap_or_else(|msg| panic!("fresh hook child wait failed: {msg}"));
+            let fresh_out = f_out_rx
+                .recv_timeout(Duration::from_millis(500))
+                .unwrap_or_default();
+            let fresh_err = f_err_rx
+                .recv_timeout(Duration::from_millis(500))
+                .unwrap_or_default();
+            assert!(
+                fresh_status.success() && fresh_out.contains("RB10G_L105_FAIL_CLOSED_OK "),
+                "AC2 fresh hook child did not fail closed at ensure_spool ({fresh_status:?}):\nstdout:\n{fresh_out}\nstderr:\n{fresh_err}"
+            );
+        };
+
+        // --------------------------------------------------------------------
+        // Scenario 1 (AC1–AC3): Real Layout C repository with pre-migration
+        // `spool::publish` event + `quarantine` file, unmoved `capacity.lock`
+        // inode, concurrent OS child proven via kernel FD inspection to have
+        // passed `ensure_spool` and blocked on `capacity.lock` at `spool.rs:112`,
+        // simulated `ensure_spool` (`spool.rs:105`) empty-dir race retry, fresh
+        // OS child rejected at `spool.rs:105`, `finalized = true` manifest +
+        // `fsync_dir`, all 6 locks released, and strict causal durability order!
+        // --------------------------------------------------------------------
+        {
+            let dir = tempdir().expect("create RB-10g Scenario 1 tempdir");
+            let storage = dir.path().join(".libra");
+            let git_db = git_sqlite_db_path(&storage);
+            let cap_db = capture_sqlite_db_path(&storage);
+            fs::create_dir_all(&storage).expect("create .libra");
+            populate_all_61_repository_tables(&git_db).await;
+            detach_inline_capture_tables(&git_db).await;
+            {
+                let _cap = SqliteCaptureStore::create(&cap_db)
+                    .await
+                    .expect("create RB-10g capture.db");
+            }
+            populate_capture_rows_via_sql(&cap_db, 0, None).await;
+            switch_fixture_db_to_delete_mode(&git_db).await;
+            switch_fixture_db_to_delete_mode(&cap_db).await;
+
+            // Publish one real pre-migration event through the unmodified
+            // legacy `spool::publish` path so `capture-spool/{tmp,ready,quarantine}`
+            // and `capture-spool/capacity.lock` exist with exact production layout.
+            let pre_body = build_spool_envelope_bytes(
+                "codex",
+                "codex",
+                "33333333-3333-4333-8333-333333333310",
+                Some("dedup:rb10g:pre-mig-1"),
+                "prov-rb10g-pre",
+                "/work/rb10g",
+                &storage,
+                "session_start",
+                "2026-11-22T01:00:00Z",
+                "",
+            );
+            let pre_outcome = spool::publish(
+                &storage,
+                false,
+                "dedup:rb10g:pre-mig-1",
+                &pre_body,
+                Some(Instant::now() + Duration::from_secs(5)),
+            )
+            .expect("pre-migration legacy spool::publish must succeed");
+            assert_eq!(pre_outcome, spool::PublishOutcome::Published);
+
+            // Also seed one quarantine file and one queue frame.
+            let quar_dir = capture_spool_dir_path(&storage).join(CAPTURE_SPOOL_QUARANTINE_SUBDIR);
+            fs::write(
+                quar_dir.join("0002-rb10g-quar.json"),
+                b"{\"quarantined\":true}",
+            )
+            .expect("write quarantine file");
+            let _q_init = init_capture_queue(&storage).expect("init capture queue");
+            append_postcard_frame(
+                &storage,
+                CaptureQueueLane::Normal,
+                FRAME_FLAG_NONE,
+                "dedup:rb10g:q-1",
+                CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION,
+                &CaptureBatchPayload::InsertUsageStats(AgentUsageStatsRecord {
+                    id: "usage-rb10g-1".to_string(),
+                    session_id: None,
+                    thread_id: None,
+                    agent_run_id: None,
+                    run_id: None,
+                    provider: "openai".to_string(),
+                    model: "gpt-5".to_string(),
+                    request_kind: "chat".to_string(),
+                    intent: None,
+                    prompt_tokens: 10,
+                    completion_tokens: 5,
+                    cached_tokens: 0,
+                    reasoning_tokens: 0,
+                    total_tokens: 15,
+                    tool_call_count: 0,
+                    wall_clock_ms: 10,
+                    provider_latency_ms: Some(8),
+                    cost_estimate_micro_dollars: Some(1_000),
+                    cost_usd: Some(0.001),
+                    usage_estimated: false,
+                    started_at: None,
+                    finished_at: None,
+                    success: true,
+                    error_kind: None,
+                    schema_version: 1,
+                    created_at: "2026-11-22T03:06:00Z".to_string(),
+                    agent_name: Some("codex".to_string()),
+                    repo_id: Some("repo-1".to_string()),
+                    turn_id: Some("turn-rb10g-1".to_string()),
+                    event_id: Some("evt-rb10g-1".to_string()),
+                }),
+            )
+            .expect("append rb10g queue frame");
+
+            let cap_lock_path = capture_spool_capacity_lock_path(&storage);
+            #[cfg(unix)]
+            let cap_lock_inode_before = {
+                use std::os::unix::fs::MetadataExt as _;
+                let m = fs::symlink_metadata(&cap_lock_path).expect("stat capacity.lock before");
+                (m.dev(), m.ino())
+            };
+            #[cfg(unix)]
+            let spool_dir_inode_before = {
+                use std::os::unix::fs::MetadataExt as _;
+                let m = fs::symlink_metadata(capture_spool_dir_path(&storage))
+                    .expect("stat capture-spool dir before");
+                (m.dev(), m.ino())
+            };
+
+            let prepared = prepare_forward_phase1(&storage, 1)
+                .await
+                .expect("Phase 1 prepare");
+            let fenced = execute_forward_phase2_fence_and_unlink(prepared)
+                .await
+                .expect("Phase 2 Step 2.1–2.2b fence + unlink");
+
+            // AC1: Spawn independent OS child calling unmodified `spool::publish`
+            // and prove at the OS kernel FD level that it ALREADY passed
+            // `spool.rs:105` (`ensure_spool`) and opened `capacity.lock` at
+            // `spool.rs:112` (`lock_capacity`) BEFORE Step 2.3 installs tombstones!
+            let (mut blocked_child, out_rx, err_rx) = spawn_blocked_hook(&storage);
+            #[cfg(unix)]
+            rb10g_wait_child_blocked_on_capacity_lock(
+                &mut blocked_child,
+                cap_lock_inode_before,
+                Duration::from_secs(5),
+            );
+
+            // Execute Step 2.3–2.4 with deterministic observation hooks:
+            let mut injected_race = false;
+            let mut observed_points: Vec<Phase2FinalizeTestPoint> = Vec::new();
+            let mut hook = |point: Phase2FinalizeTestPoint, root: &Path| -> StorageResult<()> {
+                observed_points.push(point);
+                match point {
+                    Phase2FinalizeTestPoint::AfterRmdirBeforeLinkTombstone("tmp")
+                        if !injected_race =>
+                    {
+                        injected_race = true;
+                        let tmp_dir = capture_spool_dir_path(root).join(CAPTURE_SPOOL_TMP_SUBDIR);
+                        fs::create_dir(&tmp_dir).map_err(|err| {
+                            StorageBackendError::io("simulate ensure_spool empty tmp dir race", err)
+                        })?;
+                    }
+                    Phase2FinalizeTestPoint::AfterPersistSpoolFencedBeforeFinalized => {
+                        let m = read_storage_manifest(root)?.expect("manifest exists");
+                        assert!(
+                            !m.finalized,
+                            "must still be finalized=false before Step 2.4"
+                        );
+                        assert!(
+                            m.phase2_progress.spool_fenced,
+                            "spool_fenced=true must be durably persisted before finalized=true"
+                        );
+                    }
+                    Phase2FinalizeTestPoint::AfterFinalizedBeforeUnlock => {
+                        let m = read_storage_manifest(root)?.expect("finalized manifest exists");
+                        assert!(m.finalized);
+                        assert_eq!(m.backend, StorageBackendKind::Redb);
+                        assert!(m.phase2_progress.spool_fenced);
+                        assert!(
+                            blocked_child
+                                .try_wait()
+                                .expect("poll blocked child before unlock")
+                                .is_none(),
+                            "blocked hook must remain blocked on capacity.lock until AFTER finalized=true + fsync_dir(.libra/)"
+                        );
+                    }
+                    _ => {}
+                }
+                Ok(())
+            };
+
+            let report = finalize_forward_phase2_spool_tombstones_and_manifest_inner(
+                fenced,
+                Some(&mut hook),
+            )
+            .expect("Phase 2 Step 2.3–2.4 must succeed");
+
+            // Collect the woken `spool.rs:112` child (AC1) with bounded wait!
+            let blocked_status =
+                wait_child_exit_bounded(&mut blocked_child, RB10G_CHILD_IO_TIMEOUT)
+                    .unwrap_or_else(|msg| panic!("blocked hook child wait failed: {msg}"));
+            let mut blocked_out = String::new();
+            while let Ok(line) = out_rx.recv_timeout(Duration::from_millis(200)) {
+                blocked_out.push_str(&line);
+            }
+            let blocked_err = err_rx
+                .recv_timeout(Duration::from_millis(200))
+                .unwrap_or_default();
+            assert!(
+                blocked_status.success() && blocked_out.contains("RB10G_L112_FAIL_CLOSED_OK "),
+                "AC1 blocked hook child did not fail closed cleanly ({blocked_status:?}):\nstdout:\n{blocked_out}\nstderr:\n{blocked_err}"
+            );
+
+            // Verify Step 2.3 receipt & unmoved `capture-spool/` + `capacity.lock` inodes!
+            assert_eq!(report.spool_fence.cleared_ready_files, 1);
+            assert_eq!(report.spool_fence.cleared_quarantine_files, 1);
+            assert_eq!(report.spool_fence.cleared_tmp_files, 0);
+            assert_eq!(
+                report.spool_fence.ensure_spool_race_retries, 1,
+                "Step 2.3 must absorb simulated ensure_spool race retry under held capacity.lock"
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+                let lock_after =
+                    fs::symlink_metadata(&cap_lock_path).expect("stat capacity.lock after");
+                assert_eq!(
+                    (lock_after.dev(), lock_after.ino()),
+                    cap_lock_inode_before,
+                    "capacity.lock MUST NOT be moved or replaced across Step 2.3"
+                );
+                let dir_after = fs::symlink_metadata(capture_spool_dir_path(&storage))
+                    .expect("stat capture-spool dir after");
+                assert_eq!(
+                    (dir_after.dev(), dir_after.ino()),
+                    spool_dir_inode_before,
+                    "capture-spool directory MUST NOT be moved or renamed across Step 2.3"
+                );
+                for slot in CAPTURE_SPOOL_TOMBSTONE_NAMES {
+                    let p = capture_spool_dir_path(&storage).join(slot);
+                    let m = fs::symlink_metadata(&p).expect("stat 0400 tombstone");
+                    assert!(
+                        m.file_type().is_file(),
+                        "{slot} must be regular file tombstone"
+                    );
+                    assert_eq!(
+                        m.permissions().mode() & 0o7777,
+                        0o400,
+                        "{slot} must be 0400"
+                    );
+                    assert_eq!(
+                        fs::read(&p).expect("read tombstone bytes").as_slice(),
+                        CAPTURE_SPOOL_TOMBSTONE_SENTINEL
+                    );
+                }
+            }
+
+            // AC2: Freshly started independent OS child process calling
+            // unmodified legacy `spool::publish` hits `spool.rs:105`
+            // `ensure_spool` (`!is_dir()`) and immediately fails closed!
+            run_fresh_l105_hook(&storage);
+
+            // AC3: Verify finalized manifest, authority resolution, strict
+            // causal durability order, and ALL 6 locks released!
+            assert_eq!(report.manifest.backend, StorageBackendKind::Redb);
+            assert!(report.manifest.finalized);
+            assert_eq!(report.manifest.origin, ManifestOrigin::Migration);
+            assert!(report.manifest.phase2_progress.spool_fenced);
+            let auth = detect_storage_authority(&storage)
+                .expect("detect_storage_authority must succeed after finalized=true");
+            match auth {
+                StorageAuthority::Manifest(layout) => {
+                    assert_eq!(layout.backend, StorageBackendKind::Redb);
+                    assert_eq!(layout.generation, 1);
+                    assert_eq!(layout.git_db_path, report.git_redb_path);
+                    assert_eq!(layout.capture_db_path, report.capture_redb_path);
+                }
+                other => panic!("expected finalized redb Manifest authority, got {other:?}"),
+            }
+
+            let d = &report.durability;
+            let p_clear = d
+                .position_of(Phase2DurabilityOpKind::SpoolBackupFilesCleared, None)
+                .expect("SpoolBackupFilesCleared");
+            let p_tomb_fsync = d
+                .position_of(Phase2DurabilityOpKind::SpoolTombstoneFileFsync, None)
+                .expect("SpoolTombstoneFileFsync");
+            let p_tomb_pub = d
+                .position_of(Phase2DurabilityOpKind::SpoolTombstoneAtomicPublish, None)
+                .expect("SpoolTombstoneAtomicPublish");
+            let p_spool_dir = d
+                .position_of(Phase2DurabilityOpKind::SpoolDirFsync, None)
+                .expect("SpoolDirFsync");
+            let p_spool_fenced = d
+                .position_of(Phase2DurabilityOpKind::PublishManifestSpoolFenced, None)
+                .expect("PublishManifestSpoolFenced");
+            let p_finalized = d
+                .position_of(Phase2DurabilityOpKind::PublishManifestFinalized, None)
+                .expect("PublishManifestFinalized");
+            let p_release = d
+                .position_of(Phase2DurabilityOpKind::ReleaseLocks, None)
+                .expect("ReleaseLocks");
+            assert!(p_clear < p_tomb_fsync);
+            assert!(p_tomb_fsync < p_tomb_pub);
+            assert!(p_tomb_pub < p_spool_dir);
+            assert!(p_spool_dir < p_spool_fenced);
+            assert!(p_spool_fenced < p_finalized);
+            assert!(p_finalized < p_release);
+            assert!(
+                d.ops[p_finalized + 1..p_release]
+                    .iter()
+                    .any(|op| op.kind == Phase2DurabilityOpKind::ManifestDirFsync),
+                "fsync_dir(.libra/) must complete AFTER finalized=true rename and BEFORE releasing locks"
+            );
+
+            // Confirm ALL 6 non-SQLite locks are now released and acquirable!
+            for lock_path in [
+                migration_lock_path(&storage),
+                storage.join("maintenance.lock"),
+                capture_spool_consumer_lock_path(&storage),
+                capture_queue_writer_lock_path(&storage),
+                capture_spool_capacity_lock_path(&storage),
+                capture_queue_append_lock_path(&storage),
+            ] {
+                let f = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&lock_path)
+                    .unwrap_or_else(|e| panic!("open released lock {}: {e}", lock_path.display()));
+                f.try_lock().unwrap_or_else(|e| {
+                    panic!(
+                        "lock {} must be released after finalized=true: {e}",
+                        lock_path.display()
+                    )
+                });
+            }
+
+            assert!(
+                report.step2_3_to_2_4_elapsed <= Duration::from_millis(200),
+                "RB-10g Step 2.3–2.4 budget exceeded: {:?} > 200ms",
+                report.step2_3_to_2_4_elapsed
+            );
+            assert!(
+                sqlite_backup_capture_spool_dir_path(&storage, 1)
+                    .join("quarantine/0002-rb10g-quar.json")
+                    .is_file()
+            );
+            assert!(
+                fs::read_dir(sqlite_backup_capture_spool_dir_path(&storage, 1).join("ready"))
+                    .expect("read backup ready dir")
+                    .count()
+                    == 1
+            );
+        }
+
+        // --------------------------------------------------------------------
+        // Scenario 2 (Error-path defensive fencing with REAL waiting hook):
+        // Unbacked-up file planted inside `capture-spool/ready/` before Step 2.3
+        // MUST fail closed WITHOUT deleting `ready/9999-unbacked.json` AND MUST
+        // defensively fence `capture-spool/tmp` (`0400` tombstone) BEFORE
+        // dropping `capacity.lock` so a REAL waiting publisher blocked at
+        // `spool.rs:112` (and any fresh publisher at `spool.rs:105`) IMMEDIATELY
+        // fails closed instead of publishing unmigrated events!
+        // --------------------------------------------------------------------
+        {
+            let dir = tempdir().expect("create RB-10g negative backup-guard tempdir");
+            let storage = dir.path().join(".libra");
+            let git_db = git_sqlite_db_path(&storage);
+            fs::create_dir_all(&storage).expect("create .libra");
+            populate_all_61_repository_tables(&git_db).await;
+            switch_fixture_db_to_delete_mode(&git_db).await;
+
+            // Create real spool layout via unmodified `spool::publish`.
+            let pre_body = build_spool_envelope_bytes(
+                "codex",
+                "codex",
+                "33333333-3333-4333-8333-333333333320",
+                Some("dedup:rb10g:neg-seed"),
+                "prov-rb10g-neg",
+                "/work/rb10g-neg",
+                &storage,
+                "session_start",
+                "2026-11-22T01:10:00Z",
+                "",
+            );
+            assert_eq!(
+                spool::publish(
+                    &storage,
+                    false,
+                    "dedup:rb10g:neg-seed",
+                    &pre_body,
+                    Some(Instant::now() + Duration::from_secs(5)),
+                )
+                .expect("seed spool for Scenario 2"),
+                spool::PublishOutcome::Published
+            );
+            let ready_dir = capture_spool_dir_path(&storage).join(CAPTURE_SPOOL_READY_SUBDIR);
+            #[cfg(unix)]
+            let cap_lock_inode = {
+                use std::os::unix::fs::MetadataExt as _;
+                let m = fs::symlink_metadata(capture_spool_capacity_lock_path(&storage))
+                    .expect("stat capacity.lock");
+                (m.dev(), m.ino())
+            };
+
+            let prepared = prepare_forward_phase1(&storage, 1)
+                .await
+                .expect("Phase 1 prepare");
+            let fenced = execute_forward_phase2_fence_and_unlink(prepared)
+                .await
+                .expect("Phase 2 fence + unlink");
+
+            // Spawn a REAL waiting legacy hook blocked at `spool.rs:112`!
+            let (mut waiting_child, w_out_rx, w_err_rx) = spawn_blocked_hook(&storage);
+            #[cfg(unix)]
+            rb10g_wait_child_blocked_on_capacity_lock(
+                &mut waiting_child,
+                cap_lock_inode,
+                Duration::from_secs(5),
+            );
+
+            // Plant an unbacked-up file into `ready/`.
+            let rogue = ready_dir.join("9999-unbacked.json");
+            fs::write(&rogue, b"{\"unbacked\":true}").expect("plant unbacked file");
+
+            let err = finalize_forward_phase2_spool_tombstones_and_manifest(fenced)
+                .expect_err("Step 2.3 must refuse to delete unbacked-up spool file");
+            assert_eq!(err.stable_code_str(), "LBR-IO-001");
+
+            // Waiting publisher MUST wake up and IMMEDIATELY fail closed on the
+            // defensively installed `0400` `capture-spool/tmp` tombstone!
+            let waiting_status =
+                wait_child_exit_bounded(&mut waiting_child, RB10G_CHILD_IO_TIMEOUT).unwrap_or_else(
+                    |msg| panic!("Scenario 2 waiting hook child wait failed: {msg}"),
+                );
+            let mut waiting_out = String::new();
+            while let Ok(line) = w_out_rx.recv_timeout(Duration::from_millis(200)) {
+                waiting_out.push_str(&line);
+            }
+            let waiting_err = w_err_rx
+                .recv_timeout(Duration::from_millis(200))
+                .unwrap_or_default();
+            assert!(
+                waiting_status.success() && waiting_out.contains("RB10G_L112_FAIL_CLOSED_OK "),
+                "waiting hook MUST fail closed on Step 2.3 error release ({waiting_status:?}):\nstdout:\n{waiting_out}\nstderr:\n{waiting_err}"
+            );
+            // Fresh publisher MUST also fail closed at `spool.rs:105`!
+            run_fresh_l105_hook(&storage);
+
+            // Unbacked file & `ready/` directory MUST be 100% preserved, with
+            // ZERO newly accepted files from the waiting hook!
+            assert!(rogue.is_file(), "unbacked file must NOT be deleted");
+            assert!(ready_dir.is_dir(), "ready/ must remain an intact directory");
+            assert_eq!(
+                fs::read_dir(&ready_dir).expect("read ready dir").count(),
+                2,
+                "ready/ must contain ONLY the seeded file + rogue file (zero new events from waiting hook)"
+            );
+            let tmp_tomb = capture_spool_dir_path(&storage).join(CAPTURE_SPOOL_TMP_SUBDIR);
+            assert!(
+                fs::symlink_metadata(&tmp_tomb)
+                    .expect("stat defensive tmp tombstone")
+                    .file_type()
+                    .is_file(),
+                "capture-spool/tmp must be defensively fenced as a 0400 tombstone on Step 2.3 error"
+            );
+            let m = read_storage_manifest(&storage)
+                .expect("read manifest")
+                .expect("manifest exists");
+            assert!(
+                !m.finalized,
+                "manifest must stay finalized=false on failure"
+            );
+            assert!(!m.phase2_progress.spool_fenced);
+        }
+
+        // --------------------------------------------------------------------
+        // Scenario 3 (Deterministic replacement-race guard):
+        // Replacing a verified `capture-spool/ready/` file with a new unbacked
+        // inode between Pass 1 verification and Pass 2 `unlinkat` MUST fail
+        // closed WITHOUT deleting the replacement file AND MUST defensively
+        // fence `capture-spool/tmp`!
+        // --------------------------------------------------------------------
+        {
+            let dir = tempdir().expect("create RB-10g replacement-race tempdir");
+            let storage = dir.path().join(".libra");
+            let git_db = git_sqlite_db_path(&storage);
+            fs::create_dir_all(&storage).expect("create .libra");
+            populate_all_61_repository_tables(&git_db).await;
+            switch_fixture_db_to_delete_mode(&git_db).await;
+
+            let pre_body = build_spool_envelope_bytes(
+                "codex",
+                "codex",
+                "33333333-3333-4333-8333-333333333330",
+                Some("dedup:rb10g:replace-race"),
+                "prov-rb10g-race",
+                "/work/rb10g-race",
+                &storage,
+                "session_start",
+                "2026-11-22T01:20:00Z",
+                "",
+            );
+            assert_eq!(
+                spool::publish(
+                    &storage,
+                    false,
+                    "dedup:rb10g:replace-race",
+                    &pre_body,
+                    Some(Instant::now() + Duration::from_secs(5)),
+                )
+                .expect("seed spool for Scenario 3"),
+                spool::PublishOutcome::Published
+            );
+            let ready_dir = capture_spool_dir_path(&storage).join(CAPTURE_SPOOL_READY_SUBDIR);
+            let verified_entry_path = fs::read_dir(&ready_dir)
+                .expect("list ready dir")
+                .next()
+                .expect("one seeded file")
+                .expect("dir entry")
+                .path();
+
+            let prepared = prepare_forward_phase1(&storage, 1)
+                .await
+                .expect("Phase 1 prepare");
+            let fenced = execute_forward_phase2_fence_and_unlink(prepared)
+                .await
+                .expect("Phase 2 fence + unlink");
+
+            let replacement_bytes = b"{\"replaced_between_pass1_and_pass2\":true}";
+            let mut replaced_once = false;
+            let mut hook = |point: Phase2FinalizeTestPoint, _root: &Path| -> StorageResult<()> {
+                if point == Phase2FinalizeTestPoint::BeforeUnlinkVerifiedSpoolEntry("ready")
+                    && !replaced_once
+                {
+                    replaced_once = true;
+                    let swap_tmp = ready_dir.join(".race-swap.tmp");
+                    fs::write(&swap_tmp, replacement_bytes)
+                        .map_err(|e| StorageBackendError::io("write replacement race file", e))?;
+                    fs::rename(&swap_tmp, &verified_entry_path).map_err(|e| {
+                        StorageBackendError::io("atomically swap verified spool entry", e)
+                    })?;
+                }
+                Ok(())
+            };
+
+            let err = finalize_forward_phase2_spool_tombstones_and_manifest_inner(
+                fenced,
+                Some(&mut hook),
+            )
+            .expect_err("Step 2.3 MUST refuse to delete concurrently replaced spool file");
+            assert_eq!(err.stable_code_str(), "LBR-IO-001");
+            assert!(replaced_once);
+            assert_eq!(
+                fs::read(&verified_entry_path)
+                    .expect("replacement file must remain intact on disk")
+                    .as_slice(),
+                replacement_bytes,
+                "Step 2.3 must NOT delete an unbacked replacement file swapped after Pass 1"
+            );
+            assert!(
+                fs::symlink_metadata(
+                    capture_spool_dir_path(&storage).join(CAPTURE_SPOOL_TMP_SUBDIR)
+                )
+                .expect("stat defensive tmp tombstone")
+                .file_type()
+                .is_file()
+            );
+        }
+
+        // --------------------------------------------------------------------
+        // Scenario 3B (Post-check replacement race AFTER final `fstatat` check
+        // and RIGHT BEFORE atomic isolation `renameat`):
+        // Proves `atomic_isolate_verify_and_unlink_unix` catches a replacement
+        // injected AFTER the final identity pre-check, atomically restores the
+        // unbacked replacement file to its original path with exact bytes
+        // intact, fails closed with `LBR-IO-001`, and defensively fences `tmp`!
+        // --------------------------------------------------------------------
+        #[cfg(unix)]
+        {
+            let dir = tempdir().expect("create RB-10g post-check replacement-race tempdir");
+            let storage = dir.path().join(".libra");
+            let git_db = git_sqlite_db_path(&storage);
+            fs::create_dir_all(&storage).expect("create .libra");
+            populate_all_61_repository_tables(&git_db).await;
+            switch_fixture_db_to_delete_mode(&git_db).await;
+
+            let pre_body = build_spool_envelope_bytes(
+                "codex",
+                "codex",
+                "33333333-3333-4333-8333-333333333331",
+                Some("dedup:rb10g:post-check-race"),
+                "prov-rb10g-post-race",
+                "/work/rb10g-post-race",
+                &storage,
+                "session_start",
+                "2026-11-22T01:25:00Z",
+                "",
+            );
+            assert_eq!(
+                spool::publish(
+                    &storage,
+                    false,
+                    "dedup:rb10g:post-check-race",
+                    &pre_body,
+                    Some(Instant::now() + Duration::from_secs(5)),
+                )
+                .expect("seed spool for Scenario 3B"),
+                spool::PublishOutcome::Published
+            );
+            let ready_dir = capture_spool_dir_path(&storage).join(CAPTURE_SPOOL_READY_SUBDIR);
+            let verified_entry_path = fs::read_dir(&ready_dir)
+                .expect("list ready dir")
+                .next()
+                .expect("one seeded file")
+                .expect("dir entry")
+                .path();
+
+            let prepared = prepare_forward_phase1(&storage, 1)
+                .await
+                .expect("Phase 1 prepare");
+            let fenced = execute_forward_phase2_fence_and_unlink(prepared)
+                .await
+                .expect("Phase 2 fence + unlink");
+
+            let post_check_replacement = b"{\"swapped_after_final_fstatat_before_isolate\":true}";
+            let mut swapped_after_check = false;
+            let mut hook = |point: Phase2FinalizeTestPoint, _root: &Path| -> StorageResult<()> {
+                if point == Phase2FinalizeTestPoint::AfterFinalIdentityCheckBeforeIsolate("ready")
+                    && !swapped_after_check
+                {
+                    swapped_after_check = true;
+                    let swap_tmp = ready_dir.join(".post-check-swap.tmp");
+                    fs::write(&swap_tmp, post_check_replacement)
+                        .map_err(|e| StorageBackendError::io("write post-check swap file", e))?;
+                    fs::rename(&swap_tmp, &verified_entry_path).map_err(|e| {
+                        StorageBackendError::io("atomically swap after final check", e)
+                    })?;
+                }
+                Ok(())
+            };
+
+            let err = finalize_forward_phase2_spool_tombstones_and_manifest_inner(
+                fenced,
+                Some(&mut hook),
+            )
+            .expect_err("Step 2.3 MUST catch post-check replacement during atomic isolation");
+            assert_eq!(err.stable_code_str(), "LBR-IO-001");
+            assert!(swapped_after_check);
+            assert_eq!(
+                fs::read(&verified_entry_path)
+                    .expect("restored post-check replacement file must exist at original path")
+                    .as_slice(),
+                post_check_replacement,
+                "atomic isolation must restore replacement file untouched when inode mismatches after isolation"
+            );
+            assert!(
+                fs::symlink_metadata(
+                    capture_spool_dir_path(&storage).join(CAPTURE_SPOOL_TMP_SUBDIR)
+                )
+                .expect("stat defensive tmp tombstone")
+                .file_type()
+                .is_file()
+            );
+        }
+
+        // --------------------------------------------------------------------
+        // Scenario 4 (Representative near-limit populated spool <= 200ms budget):
+        // Populate the full `READY_FILE_LIMIT` = 1,024 spool files (~58 MiB
+        // across 128 valid JSON envelopes in `ready/` + 896 × 64 KiB payloads
+        // in `quarantine/`) and prove Step 2.3–2.4 completes strictly <= 200ms
+        // on local SSD via Phase 1's verified `(live, backup)` identity snapshot!
+        // --------------------------------------------------------------------
+        {
+            let dir = tempdir().expect("create RB-10g near-limit budget tempdir");
+            let storage = dir.path().join(".libra");
+            let git_db = git_sqlite_db_path(&storage);
+            let cap_db = capture_sqlite_db_path(&storage);
+            fs::create_dir_all(&storage).expect("create .libra");
+            populate_all_61_repository_tables(&git_db).await;
+            detach_inline_capture_tables(&git_db).await;
+            {
+                let _cap = SqliteCaptureStore::create(&cap_db)
+                    .await
+                    .expect("create budget capture.db");
+            }
+            populate_capture_rows_via_sql(&cap_db, 0, None).await;
+            switch_fixture_db_to_delete_mode(&git_db).await;
+            switch_fixture_db_to_delete_mode(&cap_db).await;
+
+            // Create spool layout via one real `spool::publish`, then seed up to
+            // 128 ready files + 896 × 64 KiB quarantine files = 1,024 files (~58 MiB).
+            let ready_dir = capture_spool_dir_path(&storage).join(CAPTURE_SPOOL_READY_SUBDIR);
+            let quar_dir = capture_spool_dir_path(&storage).join(CAPTURE_SPOOL_QUARANTINE_SUBDIR);
+            let first_body = build_spool_envelope_bytes(
+                "codex",
+                "codex",
+                "33333333-3333-4333-8333-333333333400",
+                Some("dedup:rb10g:scale-ready-0"),
+                "prov-rb10g-scale",
+                "/work/rb10g-scale",
+                &storage,
+                "session_start",
+                "2026-11-22T02:00:00Z",
+                "",
+            );
+            assert_eq!(
+                spool::publish(
+                    &storage,
+                    false,
+                    "dedup:rb10g:scale-ready-0",
+                    &first_body,
+                    Some(Instant::now() + Duration::from_secs(5)),
+                )
+                .expect("seed spool layout for scale test"),
+                spool::PublishOutcome::Published
+            );
+            for i in 1..128usize {
+                let body = build_spool_envelope_bytes(
+                    "codex",
+                    "codex",
+                    "33333333-3333-4333-8333-333333333400",
+                    Some(&format!("dedup:rb10g:scale-ready-{i}")),
+                    "prov-rb10g-scale",
+                    "/work/rb10g-scale",
+                    &storage,
+                    "session_start",
+                    "2026-11-22T02:00:00Z",
+                    "",
+                );
+                fs::write(ready_dir.join(format!("1-{i:06}~scale_ready_{i}")), &body)
+                    .expect("write scale ready file");
+            }
+            let quar_payload = vec![b'q'; 64 * 1024];
+            for i in 0..896usize {
+                fs::write(quar_dir.join(format!("q-{i:06}.bin")), &quar_payload)
+                    .expect("write scale quarantine 64KiB file");
+            }
+
+            let prepared = prepare_forward_phase1(&storage, 1)
+                .await
+                .expect("Phase 1 prepare on 1,024-file (~58 MiB) populated spool");
+            let fenced = execute_forward_phase2_fence_and_unlink(prepared)
+                .await
+                .expect("Phase 2 Step 2.1–2.2b on 1,024-file spool");
+            let report = finalize_forward_phase2_spool_tombstones_and_manifest(fenced)
+                .expect("Phase 2 Step 2.3–2.4 on 1,024-file spool must succeed");
+
+            assert_eq!(report.spool_fence.cleared_ready_files, 128);
+            assert_eq!(report.spool_fence.cleared_quarantine_files, 896);
+            assert_eq!(
+                report.spool_fence.cleared_ready_files
+                    + report.spool_fence.cleared_quarantine_files,
+                1_024
+            );
+            assert!(report.manifest.finalized);
+            assert!(
+                report.step2_3_to_2_4_elapsed <= Duration::from_millis(200),
+                "RB-10g near-limit 1,024-file (~58 MiB) spool Step 2.3–2.4 budget exceeded: {:?} > 200ms",
+                report.step2_3_to_2_4_elapsed
+            );
+        }
+
+        // --------------------------------------------------------------------
+        // Scenario 5 (Real paused in-flight `spool::publish` publisher between
+        // `spool.rs:118` `create_exclusive` / L119 unlock and L145 relock):
+        // - 5A: Real unmodified `spool::publish` OS child paused right at
+        //   `spool.rs:139` (`write_fsync`, holding an unexpired `tmp/` file
+        //   while `capacity.lock` is released) -> `execute_forward_migration`
+        //   rejects fail-closed (`LBR-IO-001`) BEFORE irreversible SQLite
+        //   unlink, leaving `libra.db` & `capture.db` 100% intact; once
+        //   released, the paused publisher finishes `Published` with zero loss!
+        // - 5B: Even if an unexpired `tmp/` file appears between Phase 1 and
+        //   `execute_forward_phase2_fence_and_unlink`, Phase 2 pre-flight
+        //   rejects fail-closed (`LBR-IO-001`) BEFORE Step 2.1 manifest publish
+        //   and BEFORE Step 2.2 SQLite unlink!
+        // - 5C: Even in the extreme defensive case where an unexpired `tmp/`
+        //   file exists AFTER Step 2.2 (with `quarantine/` empty), Step 2.3
+        //   preserves the `tmp/` file untouched AND defensively installs the
+        //   `0400` `capture-spool/quarantine` tombstone BEFORE dropping
+        //   `capacity.lock`, blocking both `publish_tmp` (`spool.rs:149`) and
+        //   fresh hooks (`spool.rs:105`)!
+        // --------------------------------------------------------------------
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            let shim_dir = tempdir().expect("create spool pause shim tempdir");
+            let pause_shim = rb10g_build_spool_pause_shim(shim_dir.path());
+
+            // 5A: Real unmodified `spool::publish` child paused at `spool.rs:139`.
+            {
+                let dir = tempdir().expect("create RB-10g Scenario 5A tempdir");
+                let storage = dir.path().join(".libra");
+                let git_db = git_sqlite_db_path(&storage);
+                let cap_db = capture_sqlite_db_path(&storage);
+                fs::create_dir_all(&storage).expect("create .libra");
+                populate_all_61_repository_tables(&git_db).await;
+                detach_inline_capture_tables(&git_db).await;
+                {
+                    let _cap = SqliteCaptureStore::create(&cap_db)
+                        .await
+                        .expect("create 5A capture.db");
+                }
+                populate_capture_rows_via_sql(&cap_db, 0, None).await;
+                switch_fixture_db_to_delete_mode(&git_db).await;
+                switch_fixture_db_to_delete_mode(&cap_db).await;
+
+                let git_bytes_before = fs::read(&git_db).expect("read libra.db before");
+                let cap_bytes_before = fs::read(&cap_db).expect("read capture.db before");
+
+                let paused_marker = dir.path().join("publisher.paused");
+                let release_marker = dir.path().join("publisher.release");
+                let mut cmd = Command::new(&exe);
+                cmd.arg("--exact")
+                    .arg("storage::migrate::tests::forward_phase2_unmoved_lock_inplace_spool_tombstones_block_concurrent_hooks")
+                    .arg("--nocapture")
+                    .env(RB10G_CHILD_MODE_ENV, "paused_inflight_l139_ok")
+                    .env(RB10G_CHILD_STORAGE_ENV, &storage)
+                    .env("LIBRA_RB10G_PAUSE_MARKER", &paused_marker)
+                    .env("LIBRA_RB10G_RELEASE_MARKER", &release_marker)
+                    .env("LIBRA_TEST", "1")
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+                #[cfg(target_os = "macos")]
+                cmd.env("DYLD_INSERT_LIBRARIES", &pause_shim);
+                #[cfg(target_os = "linux")]
+                cmd.env("LD_PRELOAD", &pause_shim);
+
+                let mut pub_child = cmd.spawn().expect("spawn paused spool::publish child");
+                let pub_out_pipe = pub_child.stdout.take().expect("paused child stdout");
+                let pub_err_pipe = pub_child.stderr.take().expect("paused child stderr");
+                let (p_out_tx, p_out_rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let mut r = pub_out_pipe;
+                    let mut s = String::new();
+                    let _ = r.read_to_string(&mut s);
+                    let _ = p_out_tx.send(s);
+                });
+                let (p_err_tx, p_err_rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let mut r = pub_err_pipe;
+                    let mut s = String::new();
+                    let _ = r.read_to_string(&mut s);
+                    let _ = p_err_tx.send(s);
+                });
+
+                // Wait until the real publisher has created its `tmp/` file at
+                // L118, released `capacity.lock` at L119, and paused at L139!
+                let wait_deadline = Instant::now() + Duration::from_secs(5);
+                while !paused_marker.exists() {
+                    assert!(
+                        pub_child.try_wait().expect("poll paused child").is_none(),
+                        "paused publisher exited before reaching spool.rs:139"
+                    );
+                    assert!(
+                        Instant::now() < wait_deadline,
+                        "timed out waiting for paused publisher to reach spool.rs:139"
+                    );
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                assert!(
+                    fs::read_dir(capture_spool_tmp_dir_path(&storage))
+                        .expect("read tmp dir")
+                        .count()
+                        >= 1,
+                    "paused publisher must have created a real in-flight tmp/ file"
+                );
+
+                // Full forward migration MUST fail closed BEFORE unlinking SQLite!
+                let err = execute_forward_migration(&storage, 1)
+                    .await
+                    .expect_err("migration must fail closed when real publisher is paused in tmp/");
+                assert_eq!(err.stable_code_str(), "LBR-IO-001");
+                assert_eq!(
+                    fs::read(&git_db).expect("libra.db must remain intact"),
+                    git_bytes_before
+                );
+                assert_eq!(
+                    fs::read(&cap_db).expect("capture.db must remain intact"),
+                    cap_bytes_before
+                );
+                assert!(
+                    read_storage_manifest(&storage)
+                        .expect("read manifest")
+                        .is_none()
+                );
+
+                // Release the paused publisher -> completes `Published` cleanly!
+                fs::write(&release_marker, b"GO").expect("write release marker");
+                let pub_status = wait_child_exit_bounded(&mut pub_child, RB10G_CHILD_IO_TIMEOUT)
+                    .unwrap_or_else(|msg| panic!("Scenario 5A child wait failed: {msg}"));
+                let pub_out = p_out_rx
+                    .recv_timeout(Duration::from_millis(500))
+                    .unwrap_or_default();
+                let pub_err = p_err_rx
+                    .recv_timeout(Duration::from_millis(500))
+                    .unwrap_or_default();
+                assert!(
+                    pub_status.success() && pub_out.contains("RB10G_PAUSED_L139_PUBLISHED_OK "),
+                    "Scenario 5A paused publisher did not finish cleanly ({pub_status:?}):\nstdout:\n{pub_out}\nstderr:\n{pub_err}"
+                );
+                assert_eq!(
+                    fs::read_dir(capture_spool_dir_path(&storage).join(CAPTURE_SPOOL_READY_SUBDIR))
+                        .expect("read ready dir")
+                        .count(),
+                    1
+                );
+            }
+
+            // 5B: Unexpired `tmp/` file present before `execute_forward_phase2_fence_and_unlink`
+            // is rejected by Phase 2 pre-flight BEFORE Step 2.1/2.2 SQLite unlink!
+            {
+                let dir = tempdir().expect("create RB-10g Scenario 5B tempdir");
+                let storage = dir.path().join(".libra");
+                let git_db = git_sqlite_db_path(&storage);
+                fs::create_dir_all(&storage).expect("create .libra");
+                populate_all_61_repository_tables(&git_db).await;
+                switch_fixture_db_to_delete_mode(&git_db).await;
+                let git_bytes_before = fs::read(&git_db).expect("read libra.db before");
+
+                let prepared = prepare_forward_phase1(&storage, 1)
+                    .await
+                    .expect("Phase 1 prepare");
+                let tmp_dir = capture_spool_tmp_dir_path(&storage);
+                fs::create_dir_all(&tmp_dir).expect("ensure tmp dir");
+                let inflight_file = tmp_dir.join("1-999999~inflight_before_phase2");
+                fs::write(&inflight_file, b"{\"inflight\":true}").expect("plant inflight tmp");
+
+                let err = execute_forward_phase2_fence_and_unlink(prepared)
+                    .await
+                    .expect_err(
+                        "Phase 2 pre-flight must reject unexpired tmp/ before SQLite unlink",
+                    );
+                assert_eq!(err.stable_code_str(), "LBR-IO-001");
+                assert_eq!(
+                    fs::read(&git_db).expect("libra.db must remain intact on pre-flight reject"),
+                    git_bytes_before
+                );
+                assert!(inflight_file.is_file());
+                assert!(
+                    read_storage_manifest(&storage)
+                        .expect("read manifest")
+                        .is_none()
+                );
+            }
+
+            // 5C: Even if an unexpired `tmp/` file appears AFTER Step 2.2 while
+            // `quarantine/` is empty, Step 2.3 preserves the `tmp/` file AND
+            // defensively installs the `0400` `capture-spool/quarantine` tombstone
+            // before dropping `capacity.lock` so `publish_tmp` (L149) and fresh
+            // hooks (L105) BOTH fail closed immediately!
+            {
+                let dir = tempdir().expect("create RB-10g Scenario 5C tempdir");
+                let storage = dir.path().join(".libra");
+                let git_db = git_sqlite_db_path(&storage);
+                fs::create_dir_all(&storage).expect("create .libra");
+                populate_all_61_repository_tables(&git_db).await;
+                switch_fixture_db_to_delete_mode(&git_db).await;
+
+                let seed_body = build_spool_envelope_bytes(
+                    "codex",
+                    "codex",
+                    "33333333-3333-4333-8333-333333333355",
+                    Some("dedup:rb10g:5c-seed"),
+                    "prov-rb10g-5c",
+                    "/work/rb10g-5c",
+                    &storage,
+                    "session_start",
+                    "2026-11-22T01:55:00Z",
+                    "",
+                );
+                assert_eq!(
+                    spool::publish(
+                        &storage,
+                        false,
+                        "dedup:rb10g:5c-seed",
+                        &seed_body,
+                        Some(Instant::now() + Duration::from_secs(5)),
+                    )
+                    .expect("seed spool for Scenario 5C"),
+                    spool::PublishOutcome::Published
+                );
+
+                let prepared = prepare_forward_phase1(&storage, 1)
+                    .await
+                    .expect("Phase 1 prepare");
+                let fenced = execute_forward_phase2_fence_and_unlink(prepared)
+                    .await
+                    .expect("Phase 2 fence + unlink");
+
+                let inflight_file =
+                    capture_spool_tmp_dir_path(&storage).join("1-999999~inflight_post_step2_2");
+                fs::write(&inflight_file, b"{\"inflight_post_step2_2\":true}")
+                    .expect("plant unexpired tmp file");
+
+                let err = finalize_forward_phase2_spool_tombstones_and_manifest(fenced)
+                    .expect_err("Step 2.3 must reject unexpired tmp file");
+                assert_eq!(err.stable_code_str(), "LBR-IO-001");
+                assert!(
+                    inflight_file.is_file(),
+                    "unexpired tmp file must be preserved untouched"
+                );
+                let quar_tomb =
+                    capture_spool_dir_path(&storage).join(CAPTURE_SPOOL_QUARANTINE_SUBDIR);
+                assert!(
+                    fs::symlink_metadata(&quar_tomb)
+                        .expect("stat defensive quarantine tombstone")
+                        .file_type()
+                        .is_file(),
+                    "defensive fence must fall back to 0400 quarantine tombstone when tmp has unexpired file"
+                );
+                // Fresh publisher MUST fail closed at `spool.rs:105` on the
+                // defensive `quarantine` tombstone!
+                run_fresh_l105_hook(&storage);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn forward_phase2_gc13_config_isolation() {
+        if let Some(mode) = std::env::var_os(RB10G_CHILD_MODE_ENV) {
+            let mode_str = mode.to_string_lossy();
+            if mode_str == "gc13_migrate" {
+                let storage = PathBuf::from(
+                    std::env::var_os(RB10G_CHILD_STORAGE_ENV)
+                        .expect("RB10G GC-13 child storage env"),
+                );
+                run_rb10g_gc13_child(&storage).await;
+                return;
+            }
+            if mode_str == "gc13_probe_control" {
+                // Deliberately attempt filesystem operations (even failing ones!)
+                // on both fixture env paths to verify the OS syscall interposer
+                // genuinely intercepts both successful and failed open/stat attempts!
+                let g = PathBuf::from(
+                    std::env::var_os(crate::storage::config_store::LIBRA_CONFIG_GLOBAL_DB_ENV)
+                        .expect("global env"),
+                );
+                let s = PathBuf::from(
+                    std::env::var_os(crate::storage::config_store::LIBRA_CONFIG_SYSTEM_DB_ENV)
+                        .expect("system env"),
+                );
+                let _ = File::open(&g);
+                let _ = fs::symlink_metadata(&g);
+                let _ = fs::metadata(&s);
+                println!("RB10G_GC13_PROBE_DONE");
+                let _ = io::stdout().flush();
+                return;
+            }
+        }
+
+        use crate::storage::{
+            SqliteCaptureStore, SqliteConfigStore,
+            config_store::{
+                CONFIG_FORMAT_MANIFEST_FILE, CONFIG_MIGRATION_LOCK_FILE, CONFIG_REDB_FILE_NAME,
+                ConfigStore as _, LIBRA_CONFIG_GLOBAL_DB_ENV, LIBRA_CONFIG_SYSTEM_DB_ENV,
+            },
+        };
+
+        // Explicit role gate: repository forward migration MUST reject
+        // `GlobalConfig`, `SystemConfig`, and `Derived` before touching disk.
+        {
+            let dir = tempdir().expect("create RB-10g role-gate tempdir");
+            let nonexistent = dir.path().join("must-not-be-created");
+            for role in [
+                DatabaseRole::GlobalConfig,
+                DatabaseRole::SystemConfig,
+                DatabaseRole::Derived,
+            ] {
+                let err = execute_forward_migration_for_role(role, &nonexistent, 1)
+                    .await
+                    .expect_err("repository forward migration must reject non-Repository role");
+                assert_eq!(err.stable_code_str(), "LBR-IO-001");
+                assert!(!nonexistent.exists());
+            }
+        }
+
+        let exe = std::env::current_exe().expect("locate current test executable");
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        let interposer_build_dir = tempdir().expect("create GC-13 interposer tempdir");
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        let interposer_lib = rb10g_build_gc13_fs_interposer(interposer_build_dir.path());
+
+        let run_interposed_child = |mode: &str,
+                                    storage: &Path,
+                                    global_db: &Path,
+                                    system_db: &Path,
+                                    global_watch: &Path,
+                                    system_watch: &Path,
+                                    log_path: &Path|
+         -> (std::process::ExitStatus, String, String, String) {
+            let mut cmd = Command::new(&exe);
+            cmd.arg("--exact")
+                .arg("storage::migrate::tests::forward_phase2_gc13_config_isolation")
+                .arg("--nocapture")
+                .env(RB10G_CHILD_MODE_ENV, mode)
+                .env(RB10G_CHILD_STORAGE_ENV, storage)
+                .env(LIBRA_CONFIG_GLOBAL_DB_ENV, global_db)
+                .env(LIBRA_CONFIG_SYSTEM_DB_ENV, system_db)
+                .env("LIBRA_RB10G_INTERPOSE_LOG", log_path)
+                .env("LIBRA_RB10G_WATCH_GLOBAL", global_watch)
+                .env("LIBRA_RB10G_WATCH_SYSTEM", system_watch)
+                .env("LIBRA_TEST", "1")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            #[cfg(target_os = "macos")]
+            cmd.env("DYLD_INSERT_LIBRARIES", &interposer_lib);
+            #[cfg(target_os = "linux")]
+            cmd.env("LD_PRELOAD", &interposer_lib);
+
+            let mut child = cmd.spawn().expect("spawn GC-13 child");
+            let out_pipe = child.stdout.take().expect("gc13 child stdout");
+            let err_pipe = child.stderr.take().expect("gc13 child stderr");
+            let (out_tx, out_rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let mut r = out_pipe;
+                let mut s = String::new();
+                let _ = r.read_to_string(&mut s);
+                let _ = out_tx.send(s);
+            });
+            let (err_tx, err_rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let mut r = err_pipe;
+                let mut s = String::new();
+                let _ = r.read_to_string(&mut s);
+                let _ = err_tx.send(s);
+            });
+            let status = wait_child_exit_bounded(&mut child, RB10G_CHILD_IO_TIMEOUT)
+                .unwrap_or_else(|msg| panic!("GC-13 child ({mode}) wait failed: {msg}"));
+            let stdout = out_rx
+                .recv_timeout(Duration::from_millis(500))
+                .unwrap_or_default();
+            let stderr = err_rx
+                .recv_timeout(Duration::from_millis(500))
+                .unwrap_or_default();
+            let interpose_log = fs::read_to_string(log_path).unwrap_or_default();
+            (status, stdout, stderr, interpose_log)
+        };
+
+        // Positive control: prove the OS filesystem syscall interposer is truly
+        // loaded and intercepts EVEN FAILED `open()` / `stat()` attempts on both
+        // `LIBRA_CONFIG_GLOBAL_DB` and `LIBRA_CONFIG_SYSTEM_DB`!
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            let ctrl_dir = tempdir().expect("create interposer control tempdir");
+            let g_watch = ctrl_dir.path().join("ctrl-global-watch");
+            let s_watch = ctrl_dir.path().join("ctrl-system-watch");
+            let g_db = g_watch.join("config.db");
+            let s_db = s_watch.join("config.db");
+            let log_path = ctrl_dir.path().join("ctrl.log");
+            let (status, stdout, stderr, log) = run_interposed_child(
+                "gc13_probe_control",
+                ctrl_dir.path(),
+                &g_db,
+                &s_db,
+                &g_watch,
+                &s_watch,
+                &log_path,
+            );
+            assert!(
+                status.success() && stdout.contains("RB10G_GC13_PROBE_DONE"),
+                "positive control failed ({status:?}):\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            );
+            assert!(
+                log.contains("INIT:LOADED"),
+                "GC-13 syscall interposer did not load into child process:\n{log}"
+            );
+            assert!(
+                log.lines()
+                    .any(|l| l.starts_with("open") && l.contains("ctrl-global-watch")),
+                "GC-13 syscall interposer failed to catch failed open() on global fixture:\n{log}"
+            );
+            assert!(
+                log.lines().any(|l| {
+                    (l.starts_with("lstat")
+                        || l.starts_with("__lxstat")
+                        || l.starts_with("fstatat")
+                        || l.starts_with("__fxstatat")
+                        || l.starts_with("statx"))
+                        && l.contains("ctrl-global-watch")
+                }),
+                "GC-13 syscall interposer failed to catch failed lstat/symlink_metadata() on global fixture:\n{log}"
+            );
+            assert!(
+                log.lines().any(|l| {
+                    (l.starts_with("stat")
+                        || l.starts_with("__xstat")
+                        || l.starts_with("fstatat")
+                        || l.starts_with("__fxstatat"))
+                        && l.contains("ctrl-system-watch")
+                }),
+                "GC-13 syscall interposer failed to catch failed stat/metadata() on system fixture:\n{log}"
+            );
+        }
+
+        // --------------------------------------------------------------------
+        // Sub-case A (AC4 + AC5 — existing populated `LIBRA_CONFIG_GLOBAL_DB`
+        // and `LIBRA_CONFIG_SYSTEM_DB`):
+        // Hold active `BEGIN EXCLUSIVE` SQLite locks AND exclusive `flock` on
+        // both scopes' `config-migration.lock` files AND attach OS syscall
+        // interposer WHILE running full end-to-end `execute_forward_migration`
+        // in an isolated OS child -> proves ZERO opens, stats, locks, creations,
+        // or modifications to either global or system config DB!
+        // --------------------------------------------------------------------
+        {
+            let dir = tempdir().expect("create RB-10g GC-13 existing-db tempdir");
+            let storage = dir.path().join("repo/.libra");
+            let git_db = git_sqlite_db_path(&storage);
+            let cap_db = capture_sqlite_db_path(&storage);
+            fs::create_dir_all(&storage).expect("create repo .libra");
+            populate_all_61_repository_tables(&git_db).await;
+            detach_inline_capture_tables(&git_db).await;
+            {
+                let _cap = SqliteCaptureStore::create(&cap_db)
+                    .await
+                    .expect("create GC-13 capture.db");
+            }
+            populate_capture_rows_via_sql(&cap_db, 0, None).await;
+            switch_fixture_db_to_delete_mode(&git_db).await;
+            switch_fixture_db_to_delete_mode(&cap_db).await;
+
+            let global_dir = dir.path().join("isolated-global");
+            let system_dir = dir.path().join("isolated-system");
+            fs::create_dir_all(&global_dir).expect("create isolated global dir");
+            fs::create_dir_all(&system_dir).expect("create isolated system dir");
+            let global_db = global_dir.join("config.db");
+            let system_db = system_dir.join("config.db");
+
+            {
+                let g_store = SqliteConfigStore::create(&global_db, DatabaseRole::GlobalConfig)
+                    .await
+                    .expect("create isolated global config.db");
+                g_store
+                    .set("user.name", "Global Isolated User", false)
+                    .await
+                    .expect("seed global config");
+                drop(g_store);
+                switch_fixture_db_to_delete_mode(&global_db).await;
+
+                let s_store = SqliteConfigStore::create(&system_db, DatabaseRole::SystemConfig)
+                    .await
+                    .expect("create isolated system config.db");
+                s_store
+                    .set("core.editor", "system-isolated-ed", false)
+                    .await
+                    .expect("seed system config");
+                drop(s_store);
+                switch_fixture_db_to_delete_mode(&system_db).await;
+            }
+
+            let global_bytes_before = fs::read(&global_db).expect("read global config.db before");
+            let system_bytes_before = fs::read(&system_db).expect("read system config.db before");
+            let global_mtime_before = fs::metadata(&global_db)
+                .expect("stat global before")
+                .modified()
+                .expect("global mtime before");
+            let system_mtime_before = fs::metadata(&system_db)
+                .expect("stat system before")
+                .modified()
+                .expect("system mtime before");
+
+            let mut global_excl = SqliteConnection::connect_with(
+                &SqliteConnectOptions::new()
+                    .filename(&global_db)
+                    .create_if_missing(false),
+            )
+            .await
+            .expect("open global exclusive lock holder");
+            global_excl
+                .execute("BEGIN EXCLUSIVE;")
+                .await
+                .expect("acquire global BEGIN EXCLUSIVE");
+
+            let mut system_excl = SqliteConnection::connect_with(
+                &SqliteConnectOptions::new()
+                    .filename(&system_db)
+                    .create_if_missing(false),
+            )
+            .await
+            .expect("open system exclusive lock holder");
+            system_excl
+                .execute("BEGIN EXCLUSIVE;")
+                .await
+                .expect("acquire system BEGIN EXCLUSIVE");
+
+            let g_mig_lock = OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(false)
+                .open(global_dir.join(CONFIG_MIGRATION_LOCK_FILE))
+                .expect("open global config-migration.lock");
+            g_mig_lock
+                .try_lock()
+                .expect("lock global config-migration.lock");
+            let s_mig_lock = OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(false)
+                .open(system_dir.join(CONFIG_MIGRATION_LOCK_FILE))
+                .expect("open system config-migration.lock");
+            s_mig_lock
+                .try_lock()
+                .expect("lock system config-migration.lock");
+
+            let log_path = dir.path().join("subcase_a.log");
+            let (status, stdout, stderr, interpose_log) = run_interposed_child(
+                "gc13_migrate",
+                &storage,
+                &global_db,
+                &system_db,
+                &global_dir,
+                &system_dir,
+                &log_path,
+            );
+            assert!(
+                status.success() && stdout.contains("RB10G_GC13_MIGRATION_OK "),
+                "GC-13 Sub-case A child failed ({status:?}):\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            );
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            {
+                let non_init_hits: Vec<&str> = interpose_log
+                    .lines()
+                    .filter(|l| !l.trim().is_empty() && *l != "INIT:LOADED")
+                    .collect();
+                assert!(
+                    interpose_log.contains("INIT:LOADED"),
+                    "Sub-case A interposer was not active"
+                );
+                assert!(
+                    non_init_hits.is_empty(),
+                    "AC4/AC5 VIOLATION: repository migration issued filesystem syscall(s) against isolated config fixtures: {non_init_hits:?}"
+                );
+            }
+
+            global_excl
+                .execute("ROLLBACK;")
+                .await
+                .expect("rollback global");
+            global_excl.close().await.expect("close global");
+            system_excl
+                .execute("ROLLBACK;")
+                .await
+                .expect("rollback system");
+            system_excl.close().await.expect("close system");
+            drop(g_mig_lock);
+            drop(s_mig_lock);
+
+            assert_eq!(
+                fs::read(&global_db).expect("read global after"),
+                global_bytes_before,
+                "AC4: LIBRA_CONFIG_GLOBAL_DB bytes must remain 100% unchanged"
+            );
+            assert_eq!(
+                fs::read(&system_db).expect("read system after"),
+                system_bytes_before,
+                "AC5: LIBRA_CONFIG_SYSTEM_DB bytes must remain 100% unchanged"
+            );
+            assert_eq!(
+                fs::metadata(&global_db)
+                    .expect("stat global after")
+                    .modified()
+                    .expect("global mtime after"),
+                global_mtime_before,
+                "AC4: LIBRA_CONFIG_GLOBAL_DB mtime must remain unchanged"
+            );
+            assert_eq!(
+                fs::metadata(&system_db)
+                    .expect("stat system after")
+                    .modified()
+                    .expect("system mtime after"),
+                system_mtime_before,
+                "AC5: LIBRA_CONFIG_SYSTEM_DB mtime must remain unchanged"
+            );
+            for scope_dir in [&global_dir, &system_dir] {
+                assert!(!scope_dir.join(CONFIG_REDB_FILE_NAME).exists());
+                assert!(!scope_dir.join(CONFIG_FORMAT_MANIFEST_FILE).exists());
+                assert!(!scope_dir.join("config.db-wal").exists());
+                assert!(!scope_dir.join("config.db-shm").exists());
+                assert!(!scope_dir.join("config.db-journal").exists());
+            }
+        }
+
+        // --------------------------------------------------------------------
+        // Sub-case B (AC4 + AC5 — missing `LIBRA_CONFIG_GLOBAL_DB` and
+        // `LIBRA_CONFIG_SYSTEM_DB` paths + OS syscall interposer):
+        // --------------------------------------------------------------------
+        {
+            let dir = tempdir().expect("create RB-10g GC-13 missing-db tempdir");
+            let storage = dir.path().join("repo/.libra");
+            let git_db = git_sqlite_db_path(&storage);
+            fs::create_dir_all(&storage).expect("create repo .libra");
+            populate_all_61_repository_tables(&git_db).await;
+            switch_fixture_db_to_delete_mode(&git_db).await;
+
+            let missing_global_dir = dir.path().join("nonexistent-global");
+            let missing_system_dir = dir.path().join("nonexistent-system");
+            let missing_global_db = missing_global_dir.join("config.db");
+            let missing_system_db = missing_system_dir.join("config.db");
+
+            let log_path = dir.path().join("subcase_b.log");
+            let (status, stdout, stderr, interpose_log) = run_interposed_child(
+                "gc13_migrate",
+                &storage,
+                &missing_global_db,
+                &missing_system_db,
+                &missing_global_dir,
+                &missing_system_dir,
+                &log_path,
+            );
+            assert!(
+                status.success() && stdout.contains("RB10G_GC13_MIGRATION_OK "),
+                "GC-13 Sub-case B child failed ({status:?}):\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            );
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            {
+                let non_init_hits: Vec<&str> = interpose_log
+                    .lines()
+                    .filter(|l| !l.trim().is_empty() && *l != "INIT:LOADED")
+                    .collect();
+                assert!(
+                    interpose_log.contains("INIT:LOADED"),
+                    "Sub-case B interposer was not active"
+                );
+                assert!(
+                    non_init_hits.is_empty(),
+                    "AC4/AC5 VIOLATION: repository migration attempted filesystem call(s) on nonexistent config fixtures: {non_init_hits:?}"
+                );
+            }
+            assert!(
+                !missing_global_dir.exists() && !missing_global_db.exists(),
+                "AC4: repository migration must NEVER create LIBRA_CONFIG_GLOBAL_DB"
+            );
+            assert!(
+                !missing_system_dir.exists() && !missing_system_db.exists(),
+                "AC5: repository migration must NEVER create LIBRA_CONFIG_SYSTEM_DB"
+            );
+        }
+
+        // --------------------------------------------------------------------
+        // Sub-case C (Unix `0000` unreadable/unwritable isolated global &
+        // system config DBs + parent dirs + OS syscall interposer catching even
+        // ignored `EACCES` attempts or privileged runs):
+        // --------------------------------------------------------------------
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let dir = tempdir().expect("create RB-10g GC-13 chmod-0000 tempdir");
+            let storage = dir.path().join("repo/.libra");
+            let git_db = git_sqlite_db_path(&storage);
+            fs::create_dir_all(&storage).expect("create repo .libra");
+            populate_all_61_repository_tables(&git_db).await;
+            switch_fixture_db_to_delete_mode(&git_db).await;
+
+            let locked_global_dir = dir.path().join("chmod0-global");
+            let locked_system_dir = dir.path().join("chmod0-system");
+            fs::create_dir_all(&locked_global_dir).expect("create chmod0-global");
+            fs::create_dir_all(&locked_system_dir).expect("create chmod0-system");
+            let locked_global_db = locked_global_dir.join("config.db");
+            let locked_system_db = locked_system_dir.join("config.db");
+            fs::write(&locked_global_db, b"UNTOUCHABLE_GLOBAL_CONFIG_SENTINEL")
+                .expect("write global sentinel");
+            fs::write(&locked_system_db, b"UNTOUCHABLE_SYSTEM_CONFIG_SENTINEL")
+                .expect("write system sentinel");
+
+            fs::set_permissions(&locked_global_db, fs::Permissions::from_mode(0o000))
+                .expect("chmod 0000 global db");
+            fs::set_permissions(&locked_system_db, fs::Permissions::from_mode(0o000))
+                .expect("chmod 0000 system db");
+            fs::set_permissions(&locked_global_dir, fs::Permissions::from_mode(0o000))
+                .expect("chmod 0000 global dir");
+            fs::set_permissions(&locked_system_dir, fs::Permissions::from_mode(0o000))
+                .expect("chmod 0000 system dir");
+
+            struct RestorePerms<'a> {
+                dirs: [&'a Path; 2],
+                files: [&'a Path; 2],
+            }
+            impl Drop for RestorePerms<'_> {
+                fn drop(&mut self) {
+                    for d in self.dirs {
+                        let _ = fs::set_permissions(d, fs::Permissions::from_mode(0o700));
+                    }
+                    for f in self.files {
+                        let _ = fs::set_permissions(f, fs::Permissions::from_mode(0o600));
+                    }
+                }
+            }
+            let _restore = RestorePerms {
+                dirs: [&locked_global_dir, &locked_system_dir],
+                files: [&locked_global_db, &locked_system_db],
+            };
+
+            let log_path = dir.path().join("subcase_c.log");
+            let (status, stdout, stderr, interpose_log) = run_interposed_child(
+                "gc13_migrate",
+                &storage,
+                &locked_global_db,
+                &locked_system_db,
+                &locked_global_dir,
+                &locked_system_dir,
+                &log_path,
+            );
+            assert!(
+                status.success() && stdout.contains("RB10G_GC13_MIGRATION_OK "),
+                "GC-13 Sub-case C child failed ({status:?}):\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            );
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            {
+                let non_init_hits: Vec<&str> = interpose_log
+                    .lines()
+                    .filter(|l| !l.trim().is_empty() && *l != "INIT:LOADED")
+                    .collect();
+                assert!(
+                    interpose_log.contains("INIT:LOADED"),
+                    "Sub-case C interposer was not active"
+                );
+                assert!(
+                    non_init_hits.is_empty(),
+                    "AC4/AC5 VIOLATION: repository migration attempted filesystem call(s) on chmod-0000 config fixtures: {non_init_hits:?}"
+                );
+            }
+            drop(_restore);
+            assert_eq!(
+                fs::read(&locked_global_db).expect("read global sentinel after"),
+                b"UNTOUCHABLE_GLOBAL_CONFIG_SENTINEL"
+            );
+            assert_eq!(
+                fs::read(&locked_system_db).expect("read system sentinel after"),
+                b"UNTOUCHABLE_SYSTEM_CONFIG_SENTINEL"
             );
         }
     }
