@@ -56,6 +56,15 @@ stdout. `GIT_SEQUENCE_EDITOR` reports the `rebase -i` chain first
 (`GIT_SEQUENCE_EDITOR` > `sequence.editor`, then the `GIT_EDITOR` resolution) and
 uses the same terminal fallback.
 
+`GIT_PAGER` reports the pager command Libra would spawn (`less -R -F`, or `cat`
+when `LIBRA_PAGER=never`); Libra deliberately ignores `GIT_PAGER`, `core.pager`
+and `PAGER`. `GIT_DEFAULT_BRANCH` reports `init.defaultBranch` when set and
+`main` otherwise. `GIT_ATTR_GLOBAL` reports the expanded `core.attributesFile`
+or the XDG/HOME default (`<XDG_CONFIG_HOME or ~/.config>/git/attributes`), and
+`GIT_ATTR_SYSTEM` is always unavailable (exit 1, empty stdout) because Libra has
+no system attributes file. `var -l` prints every resolvable variable in Git's
+order and skips the ones that cannot be resolved.
+
 ## Options
 
 | Option | Description |

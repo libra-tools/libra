@@ -30,6 +30,8 @@ Name <email> <unix-timestamp> <±hhmm>
 
 `GIT_EDITOR` 报告 `libra commit` 会启动的编辑器：`GIT_EDITOR` > `core.editor` > `VISUAL` > `EDITOR`。四者都未设置时：`TERM` 可用（已设置且不为 `dumb`）则输出 `vi`，否则以退出码 1 结束且 stdout 为空。`GIT_SEQUENCE_EDITOR` 先走 `rebase -i` 的解析链（`GIT_SEQUENCE_EDITOR` > `sequence.editor`，其后是 `GIT_EDITOR` 的解析结果），回落规则与前者一致。
 
+`GIT_PAGER` 报告 Libra 会启动的分页命令（`less -R -F`；`LIBRA_PAGER=never` 时为 `cat`），有意忽略 `GIT_PAGER`/`core.pager`/`PAGER`。`GIT_DEFAULT_BRANCH` 报告 `init.defaultBranch`，未配置时为 `main`。`GIT_ATTR_GLOBAL` 报告展开后的 `core.attributesFile`，否则为 XDG/HOME 默认路径（`<XDG_CONFIG_HOME 或 ~/.config>/git/attributes`）；`GIT_ATTR_SYSTEM` 恒不可用（退出码 1、stdout 为空），因为 Libra 没有系统属性文件。`var -l` 按 Git 的次序输出全部可解析变量，无法解析的变量跳过。
+
 ## 选项
 
 | 选项 | 说明 |

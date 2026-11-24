@@ -204,7 +204,15 @@ fn var_list_orders_supported_variables() {
     );
     for line in &lines[2..] {
         assert!(
-            line.starts_with("GIT_EDITOR=") || line.starts_with("GIT_SEQUENCE_EDITOR="),
+            [
+                "GIT_EDITOR=",
+                "GIT_SEQUENCE_EDITOR=",
+                "GIT_PAGER=",
+                "GIT_DEFAULT_BRANCH=",
+                "GIT_ATTR_GLOBAL="
+            ]
+            .iter()
+            .any(|prefix| line.starts_with(prefix)),
             "unexpected listing row: {line}"
         );
     }
@@ -350,4 +358,109 @@ fn var_sequence_editor_variable() {
     let out = var(&[]);
     assert_eq!(out.status.code(), Some(1), "AC5 exit");
     assert!(out.stdout.is_empty(), "AC5 stdout");
+}
+
+#[test]
+fn var_misc_variables_and_list_order() {
+    let repo = init_identity_repo();
+    let home = repo.path().join(".libra-test-home");
+    let set = |key: &str, value: &str| {
+        assert_cli_success(
+            &run_libra_command(&["config", "set", key, value], repo.path()),
+            "config set",
+        );
+    };
+
+    // AC1: Git's pager variables are deliberately ignored.
+    let out = run_libra_command_with_env(
+        &["var", "GIT_PAGER"],
+        repo.path(),
+        &[("TZ", TX), ("GIT_PAGER", "most"), ("PAGER", "more")],
+    );
+    assert_cli_success(&out, "AC1");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "less -R -F\n", "AC1");
+
+    // AC2: paging disabled reports cat.
+    let out = run_libra_command_with_env(
+        &["var", "GIT_PAGER"],
+        repo.path(),
+        &[("TZ", TX), ("LIBRA_PAGER", "never")],
+    );
+    assert_cli_success(&out, "AC2");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "cat\n", "AC2");
+
+    // AC3/AC4: init.defaultBranch is honored, else main.
+    let out = run_libra_command(&["var", "GIT_DEFAULT_BRANCH"], repo.path());
+    assert_cli_success(&out, "AC3");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "main\n", "AC3");
+    set("init.defaultBranch", "trunk");
+    let out = run_libra_command(&["var", "GIT_DEFAULT_BRANCH"], repo.path());
+    assert_cli_success(&out, "AC4");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "trunk\n", "AC4");
+    let _ = run_libra_command(&["config", "unset", "init.defaultBranch"], repo.path());
+
+    // AC5: core.attributesFile is expanded against HOME.
+    set("core.attributesFile", "~/my_attrs");
+    let out = run_libra_command(&["var", "GIT_ATTR_GLOBAL"], repo.path());
+    assert_cli_success(&out, "AC5");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        home.join("my_attrs").display().to_string(),
+        "AC5"
+    );
+    let _ = run_libra_command(&["config", "unset", "core.attributesFile"], repo.path());
+
+    // AC6: without configuration the XDG default path is reported.
+    let xdg = repo.path().join("xdg");
+    let out = run_libra_command_with_env(
+        &["var", "GIT_ATTR_GLOBAL"],
+        repo.path(),
+        &[("XDG_CONFIG_HOME", xdg.to_str().expect("utf8 xdg path"))],
+    );
+    assert_cli_success(&out, "AC6");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        xdg.join("git").join("attributes").display().to_string(),
+        "AC6"
+    );
+
+    // AC7: there is no system attributes file, so the variable is unavailable.
+    let out = run_libra_command(&["var", "GIT_ATTR_SYSTEM"], repo.path());
+    assert_eq!(out.status.code(), Some(1), "AC7 exit");
+    assert!(out.stdout.is_empty(), "AC7 stdout");
+
+    // AC8: `-l` lists every resolvable variable in Git's order. Pin the dates so
+    // the two ident rows are stable.
+    let out = run_libra_command_with_env(
+        &["var", "-l"],
+        repo.path(),
+        &[
+            ("TZ", TX),
+            ("TERM", "xterm"),
+            ("GIT_AUTHOR_DATE", "1700000000 +0000"),
+            ("GIT_COMMITTER_DATE", "1700000000 +0000"),
+        ],
+    );
+    assert_cli_success(&out, "AC8");
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    assert_eq!(
+        text,
+        "GIT_COMMITTER_IDENT=C O Mitter <c@d> 1700000000 +0000\n\
+GIT_AUTHOR_IDENT=C O Mitter <c@d> 1700000000 +0000\n\
+GIT_EDITOR=vi\n\
+GIT_SEQUENCE_EDITOR=vi\n\
+GIT_PAGER=less -R -F\n\
+GIT_DEFAULT_BRANCH=main\n\
+GIT_ATTR_GLOBAL=<HOME>\n"
+            .replace(
+                "<HOME>",
+                &home
+                    .join(".config")
+                    .join("git")
+                    .join("attributes")
+                    .display()
+                    .to_string()
+            ),
+        "AC8 listing"
+    );
 }

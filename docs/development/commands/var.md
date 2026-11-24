@@ -34,3 +34,10 @@
   `editor::resolve_sequence_editor` and the same fallback. Tests:
   `var_sequence_editor_variable` (AC1–AC5). `var -l` now lists four rows; the
   full Git table is still PM-25.
+- 2026-11-23 (PM-25 / #995): `GIT_PAGER` (pager.rs policy: `less -R -F`, `cat`
+  for `LIBRA_PAGER=never`; Git's pager env is deliberately ignored, DEFER-PM-05),
+  `GIT_DEFAULT_BRANCH` (`init.defaultBranch` else `main`), `GIT_ATTR_GLOBAL`
+  (`util::optional_cascaded_config_path("core.attributesFile")` else
+  XDG/HOME `git/attributes`), `GIT_ATTR_SYSTEM` (always exit 1, empty; no system
+  attributes file, DEFER-PM-06). `-l` covers all eight rows in Git's order and
+  skips unresolvable ones. Tests: `var_misc_variables_and_list_order` (AC1–AC8).

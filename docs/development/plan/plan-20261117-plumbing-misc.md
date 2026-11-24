@@ -2197,7 +2197,7 @@ PY
 ### Task PM-25: 完善 `libra var` 的 `GIT_PAGER`、`GIT_DEFAULT_BRANCH`、`GIT_ATTR_*` 与 `-l` 全表（#995；自 PM-22 拆出）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-23：`var` 新增 `GIT_PAGER`（复用 `pager.rs` 的 `LIBRA_PAGER` 策略：`less -R -F`，`never` 时 `cat`；有意不读 Git 分页变量，`DEFER-PM-05`）、`GIT_DEFAULT_BRANCH`（`init.defaultBranch` → `main`）、`GIT_ATTR_GLOBAL`（`util::optional_cascaded_config_path("core.attributesFile")` → XDG/HOME `git/attributes`，皆无则退出 1）、`GIT_ATTR_SYSTEM`（恒退出 1、stdout 空，`DEFER-PM-06`）；`-l` 按 Git 次序覆盖 8 行并跳过不可解析项。AC1–AC8 由 `command::var_test::var_misc_variables_and_list_order` 覆盖；`var_test` 8/8；EN/zh/开发文档与 `COMPATIBILITY.md` 的 `var` 行同步。
 **Description:** 自 `PM-22` 拆出：`GIT_PAGER` 报告 Libra 启用分页时会启动的分页命令（与 Git `var` 以 `git_pager(…, 1)` 假定输出到终端一致，不判断当前 stdout 是否为终端、`LIBRA_TEST` 或启动失败回退；`src/utils/pager.rs`：`LIBRA_PAGER=never` 时 `cat`，否则 `less -R -F`；不读取 `GIT_PAGER`/`core.pager`/`PAGER`，有意差异，`DEFER-PM-05`）；`GIT_DEFAULT_BRANCH` 报告 `libra init` 实际采用的值（`init.defaultBranch`，否则 Libra 默认 `main`，有意差异）；`GIT_ATTR_GLOBAL` 复用 `PM-18` 的全局属性来源解析（`core.attributesFile` 展开后的路径，否则 XDG/HOME 默认路径，皆无则退出 1）；`GIT_ATTR_SYSTEM` 因 Libra 无系统属性文件恒以退出码 1 结束且 stdout 为空（stderr 不作承诺，`DEFER-PM-06`）；`-l` 按 Git 变量表次序输出全部可解析变量。
 **Out of scope:** `GIT_SHELL_PATH`、`GIT_CONFIG_SYSTEM`/`GIT_CONFIG_GLOBAL`（尚未排期，重启条件：#995 后续需要）；Libra 分页器遵循 Git 分页器变量（`DEFER-PM-05`）；`GIT_ATTR_GLOBAL` 在既无 `core.attributesFile` 又无 HOME/`XDG_CONFIG_HOME` 时以退出码 1 结束（测试 helper 总为子进程设置 HOME，与 AC7 同一「无值即退出 1、stdout 为空」输出路径，不单独验收）。
 **Current evidence:**
