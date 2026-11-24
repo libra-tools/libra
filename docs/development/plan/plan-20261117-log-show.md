@@ -2243,7 +2243,7 @@ PY
 
 ### Task LS-34: `show` 支持 `--diff-filter`（#973；自 LS-27 拆出）
 
-**Task type:** `implementation` | **Lifecycle / Acceptance:** `pending` / `空`
+**Task type:** `implementation` | **Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-23：`ShowArgs` 新增 `--diff-filter`，复用 `diff::parse_diff_filter`/`apply_diff_filter` 与 `DiffFilter::allows`（未改 `src/command/diff/`）；patch 经 `run_diff_for_service`（argv 带 `--diff-filter`）过滤，全部文件被过滤时 `show` 输出为空；name-status 逐条按状态过滤；未知字母 `LBR-CLI-002`。AC1–AC4 由 `command::log_test::show_diff_filter_selects_files` 覆盖；`show_test` 42/42；EN/zh 文档与 `COMPATIBILITY.md` 同步。
 
 **Description:** 为 `ShowArgs` 接入 `--diff-filter=<filter>`，复用 `LS-27` 已提升为 `pub(crate)` 的 `parse_diff_filter` / `apply_diff_filter`（不再修改 `src/command/diff/`）。
 
