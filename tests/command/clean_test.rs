@@ -1213,3 +1213,86 @@ fn clean_single_force_keeps_nested_repos() {
     assert_cli_success(&out, "AC7");
     assert_eq!(snapshot(repo.path(), &DIRS), before, "AC7");
 }
+
+/// WC-04b: explicit pathspecs also respect the nested-repository protection.
+#[test]
+fn clean_single_force_pathspec_keeps_nested_repos() {
+    use sha2::{Digest, Sha256};
+    use std::collections::BTreeMap;
+    use std::path::Path;
+
+    fn snapshot(root: &Path, dir: &str) -> BTreeMap<String, String> {
+        fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<String, String>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(root, &path, out);
+                } else if let Ok(relative) = path.strip_prefix(root) {
+                    let digest = Sha256::digest(std::fs::read(&path).expect("read"));
+                    out.insert(
+                        relative.to_string_lossy().replace('\\', "/"),
+                        digest.iter().map(|byte| format!("{byte:02x}")).collect(),
+                    );
+                }
+            }
+        }
+        let mut out = BTreeMap::new();
+        walk(root, &root.join(dir), &mut out);
+        out
+    }
+    let repo = tempdir().expect("failed to create repository root");
+    init_repo_via_cli(repo.path());
+    let script = |args: &[&str]| {
+        let out = run_libra_command(args, repo.path());
+        assert_cli_success(&out, &format!("{args:?}"));
+    };
+    script(&["config", "user.name", "t"]);
+    script(&["config", "user.email", "t@t"]);
+    std::fs::write(repo.path().join("tracked"), "x\n").unwrap();
+    script(&["add", "tracked"]);
+    script(&["commit", "-m", "base", "--no-verify"]);
+    for dir in [
+        "foo/.git/objects",
+        "foo/.git/refs",
+        "baz/boo/.git/objects",
+        "baz/boo/.git/refs",
+    ] {
+        std::fs::create_dir_all(repo.path().join(dir)).unwrap();
+    }
+    for nested in ["foo", "baz/boo"] {
+        std::fs::write(
+            repo.path().join(nested).join(".git/HEAD"),
+            "ref: refs/heads/main\n",
+        )
+        .unwrap();
+        std::fs::write(repo.path().join(nested).join(".git/index"), "").unwrap();
+    }
+    std::fs::write(repo.path().join("foo/hello.world"), "hello\n").unwrap();
+    std::fs::write(repo.path().join("baz/boo/deeper.world"), "deeper\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["init", "lib"], repo.path()),
+        "nested libra init",
+    );
+    std::fs::write(repo.path().join("lib/notes.txt"), "notes\n").unwrap();
+    std::fs::write(repo.path().join(".gitignore"), "*.world\n").unwrap();
+
+    for (pathspec, dir) in [
+        ("foo/", "foo"),
+        ("lib/", "lib"),
+        ("foo/hello.world", "foo"),
+        ("lib/notes.txt", "lib"),
+        ("baz/", "baz/boo"),
+    ] {
+        let before = snapshot(repo.path(), dir);
+        let out = run_libra_command(&["clean", "-f", pathspec], repo.path());
+        assert_cli_success(&out, pathspec);
+        assert_eq!(
+            snapshot(repo.path(), dir),
+            before,
+            "pathspec {pathspec} must keep nested repository {dir}"
+        );
+    }
+}

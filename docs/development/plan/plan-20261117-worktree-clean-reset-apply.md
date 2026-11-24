@@ -641,7 +641,7 @@ PY
 ### Task WC-04b: 显式 pathspec 路径的单 force 嵌套仓库保护（#735 前置）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-23：显式 pathspec 路径复用 WC-04 的嵌套仓库剔除谓词（`candidate == root || candidate.starts_with(root) || root.starts_with(candidate)`），指向嵌套仓库目录、其内文件或包含它的父目录的单 force 均不删除嵌套文件；该谓词在 pathspec 过滤之后、预览/删除之前执行。AC1–AC5 由 `command::clean_test::clean_single_force_pathspec_keeps_nested_repos` 覆盖（`foo/`、`lib/`、`foo/hello.world`、`lib/notes.txt`、`baz/` 五条 pathspec 的路径+SHA-256 快照）；`clean_test` 35/35；clean EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计，故未执行独立 Claude PASS 文档门；后端站点按家族规则仅本地签名提交、未推送（由发布点 `WC-04R` 统一推送）；计划中的 `/Volumes/Data` 路径以本机 `/mnt/data/gitmono/libra-backend` 执行。
 **Description:** 自 `WC-04` 拆出：显式 pathspec 指向嵌套仓库目录、嵌套仓库内文件或包含嵌套仓库的父目录时，单 force 同样不删除嵌套仓库内任何文件，父目录不得被整体删除（对齐上游默认 `REMOVE_DIR_KEEP_NESTED_GIT`，`git@750f5de7` `builtin/clean.c:927`；上游 `t7300#38` 指定嵌套工作树内路径不删除）。本卡与 `WC-04` 同属 `REL-WC-NEST` 家族，由 `WC-04R` 一次发布，先于 `WC-01`..`WC-05a` 中其它 clean 卡；`WC-03` 引入目录候选后，本卡测试作为共享回归防止父目录被整体 `remove_dir_all`。
 **Out of scope:** 无 pathspec 路径与预览（`WC-04`）；双 force 删除（`WC-04a`）；显式 pathspec 的目录递归语义本身（`WC-03`）。
 

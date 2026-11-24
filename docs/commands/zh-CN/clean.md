@@ -17,7 +17,7 @@ libra clean -f [-d] [-x | -X] [-e <pattern> | --exclude <pattern>]... [--json] [
 
 可选 pathspec 通过共享 pathspec 引擎限制 clean 候选——与 `ls-files`/`status` 及写命令（`add`/`rm`/`restore`）同一 matcher：glob、`:(exclude)`、`:(top)`、`:(icase)`、`:(literal)`、`:(glob)` 与子目录相对语义。删除面按构造保持安全：候选恒为 untracked-only，exclusion magic 只能收窄集合，`-n` 预览集与 `-f` 实删集完全相同，空字符串 pathspec 被拒绝而不会扩大为全树。
 
-**嵌套仓库**（子目录中自带 `.git` 或 `.libra` 条目）在单 `-f` 下受保护：其文件不会被列为候选，包含它的父目录不会被删除，`-n` 也不会列出它。这对应 Git 默认的 `REMOVE_DIR_KEEP_NESTED_GIT`（单 force 时保留嵌套工作树）。
+**嵌套仓库**（子目录中自带 `.git` 或 `.libra` 条目）在单 `-f` 下受保护：其文件不会被列为候选，包含它的父目录不会被删除，`-n` 也不会列出它。显式 pathspec 同样受保护：`clean -f foo/`、`clean -f foo/file` 以及包含嵌套仓库的 `clean -f parent/` 都会保留嵌套仓库内的全部文件。这对应 Git 默认的 `REMOVE_DIR_KEEP_NESTED_GIT`（单 force 时保留嵌套工作树）。
 
 ## 选项
 

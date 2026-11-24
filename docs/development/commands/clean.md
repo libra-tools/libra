@@ -65,3 +65,5 @@ flowchart TD
 - 新增 Git 兼容参数时必须明确 tier、错误码、JSON/机器输出契约和回归测试。
 
 - 2026-11-23（WC-04 / #735）：`nested_repository_roots` 在主仓库内递归识别直接含 `.git`/`.libra` 的子目录（遇到即停止下探），`run_clean` 在 pathspec 过滤后、预览/删除前剔除嵌套仓库根及其内容，并剔除包含嵌套仓库的祖先目录（`REMOVE_DIR_KEEP_NESTED_GIT`，单 force 生效，`-x`/`-X` 同样保护）。回归：`clean_single_force_keeps_nested_repos`（AC1–AC7）；`clean_test` 34/34。
+
+- 2026-11-23（WC-04b / #735）：显式 pathspec 路径复用 WC-04 的嵌套仓库剔除谓词（`candidate == root || candidate.starts_with(root) || root.starts_with(candidate)`），因此指向嵌套仓库目录、其内文件或包含它的父目录的单 force 都不会删除嵌套文件。回归：`clean_single_force_pathspec_keeps_nested_repos`（AC1–AC5）；`clean_test` 35/35。

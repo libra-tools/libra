@@ -39,7 +39,7 @@ empty-string pathspec is rejected rather than widening to the whole tree.
 
 A **nested repository** — a subdirectory containing its own `.git` or `.libra`
 entry — is protected under a single `-f`: its files are never candidates, an
-ancestor directory that contains it is not removed, and `-n` never lists it.
+ancestor directory that contains it is not removed, and `-n` never lists it. The same protection applies to an explicit pathspec: `clean -f foo/`, `clean -f foo/file` and `clean -f parent/` (where `parent/` contains a nested repository) keep every nested file.
 This matches Git's default `REMOVE_DIR_KEEP_NESTED_GIT`, which keeps nested
 worktrees when one force is given.
 
