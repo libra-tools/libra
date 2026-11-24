@@ -407,21 +407,52 @@ async fn create(object: &str, replacement: &str, force: bool) -> CliResult<()> {
 
 async fn delete(objects: &[String]) -> CliResult<()> {
     let dir = replace_dir().ok_or_else(CliError::repo_not_found)?;
-    // No cache invalidation is needed: `replace_map` reads `refs/replace`
-    // fresh on every call, so removals — even from a partially-failed
-    // batch — are visible to the next resolve in every process.
+    // Git's `for_each_replace_name`: every item is processed, failures are
+    // collected and reported together (Git exits 1; Libra reports the stable
+    // `LBR-CLI-003` with `fatal()`'s 128). No cache invalidation is needed:
+    // `replace_map` re-reads `refs/replace` on every call, so removals from a
+    // partially-failed batch are visible to the next resolve.
+    let mut failures: Vec<String> = Vec::new();
     for spec in objects {
-        let obj = resolve_any(spec).await?;
+        let obj = match resolve_delete_oid(spec).await {
+            Ok(obj) => obj,
+            Err(message) => {
+                failures.push(message);
+                continue;
+            }
+        };
         let path = dir.join(obj.to_string());
         match fs::remove_file(&path) {
             Ok(()) => println!("Deleted replace ref '{obj}'"),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Err(fatal(format!("no replacement for {obj}")));
+                failures.push(format!("replace ref '{obj}' not found"));
             }
             Err(error) => return Err(write_err(error)),
         }
     }
-    Ok(())
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(CliError::fatal(failures.join("\n"))
+            .with_stable_code(StableErrorCode::CliInvalidTarget)
+            .with_exit_code(128))
+    }
+}
+
+/// Resolve one `replace -d` operand without peeling: a full-length object id is
+/// accepted even when the object is absent (its replacement ref may still
+/// exist), any other spelling goes through the shared non-peeling object-spec
+/// resolver so short ids of any object type work.
+async fn resolve_delete_oid(spec: &str) -> Result<ObjectHash, String> {
+    let full_length_hex =
+        matches!(spec.len(), 40 | 64) && spec.bytes().all(|b| b.is_ascii_hexdigit());
+    if full_length_hex {
+        return crate::internal::object_format::parse_repo_oid(spec)
+            .map_err(|error| format!("failed to resolve '{spec}': {error}"));
+    }
+    crate::utils::util::resolve_object_spec_typed(spec)
+        .await
+        .map_err(|error| format!("failed to resolve '{spec}': {error}"))
 }
 
 /// `replace --graft <commit> [<parent>...]`: build a replacement commit with

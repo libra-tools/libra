@@ -799,7 +799,7 @@ PY
 ### Task PM-26: 修复 `libra replace -d` 删除语义（任意对象短 OID、逐项继续）（#758；自 PM-04 拆出）
 
 **Task type:** `implementation`
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-23：`replace -d` 改为逐项处理——`resolve_delete_oid` 做不 peel 解析（全长 40/64 hex 即使对象缺失也接受，其余走 `util::resolve_object_spec_typed`，任意类型短 OID 可用）；每项成功输出 `Deleted replace ref '<oid>'`，失败项收集后继续，最终以 `LBR-CLI-003` + 退出码 128 报告（Git 退出 1，有意差异，已记入 `COMPATIBILITY.md`）；AC1/AC2/AC6 由 `command::replace_test::replace_delete_resolves_any_object_short_oid` 覆盖，AC3–AC5/AC7 由 `replace_delete_continues_and_reports_errors` 覆盖；`replace_test` 12/12；EN/zh/开发文档与 `COMPATIBILITY.md` 的 `replace` 行同步。
 **Description:** 自 `PM-04` 拆出：`replace -d <object>...` 按 Git `for_each_replace_name` 逐项处理——以不 peel 的通用对象解析（任意类型短 OID；全长 40/64 位十六进制不要求对象存在）得到 OID，删除 `refs/replace/<oid>` 并输出 `Deleted replace ref '<oid>'`；某项无法解析或无替换时记录错误并继续处理后续项，全部处理后以 `LBR-CLI-003` 失败（退出码沿用 `fatal()` 的 128）。
 **Out of scope:** 列表与模式校验（`PM-04`）；Git 对部分失败的退出码 1（有意差异：Libra 以稳定码 `LBR-CLI-003`、退出码 128 报告，见 `COMPATIBILITY.md`）；`t6050` 其余阻断项（`DEFER-PM-07`）；SHA-256 仓库的 64 位全长 OID 与 tree/commit/tag 短 OID（与 AC1 的 blob 短 OID、AC6 的 40 位全长 OID 走同一不 peel 解析，不单独验收）。
 **Current evidence:**

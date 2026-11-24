@@ -22,8 +22,14 @@ through it — `log`, `show`, `rev-parse` peeling, and so on — not just one co
   Both objects must exist; their types must match unless `-f` is given. An
   existing replacement is only overwritten with `-f`. An object cannot replace
   itself.
-- **delete** (`-d <object>...`) — remove the replacement(s); deleting a
-  replacement that does not exist is an error.
+- **delete** (`-d <object>...`) — remove the replacement(s) one item at a time.
+  Each `<object>` is resolved without peeling: a short id of ANY object type
+  works, and a full-length 40/64-hex id is accepted even when the object is
+  absent, so a replacement ref can still be removed. Every success prints
+  `Deleted replace ref '<oid>'`; an unresolvable item or one without a
+  replacement is reported and the remaining items still run, after which the
+  command fails with `LBR-CLI-003` and exit code 128 (Git exits 1 here — an
+  intentional difference).
 - **list** (`-l [<pattern>]`) — print the ids of replaced objects, one per line
   (Git's default `short` format), optionally filtered by a `wildmatch` pattern
   matched against the WHOLE object id (`*`, `?` and `[...]` are wildcards; the

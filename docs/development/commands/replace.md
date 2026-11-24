@@ -44,3 +44,5 @@
 - ⚠️ `resolve` 在 **hot** 的 load_object 路径上——任何改动必须保持「无替换时近零成本」且 sync（不得引入 async/DB 调用）。
 
 - 2026-11-23（PM-04 / #758）：`-l` 的 `<pattern>` 改用 `command::log::decorate_filter::wildmatch` 整名匹配（默认 `*`），取代子串过滤；`validate_modes` 在任何读写前拒绝 Git 的全部误用——`-d`+`-l`、非列表的 `--format`、非写入的 `-f`、多个 `-l` 模式、以及创建模式位置参数≠2（移除「无参数/单参数即列表」的隐式行为）；各错误均 `LBR-CLI-002`。回归：`replace_list_uses_wildmatch`（AC1–AC2）、`replace_rejects_invalid_mode_combinations`（AC3–AC8）。
+
+- 2026-11-23（PM-26 / #758）：`replace -d` 改为逐项处理并以 `resolve_delete_oid` 做不 peel 解析（全长 40/64 hex 允许对象缺失，其余走 `util::resolve_object_spec_typed`，支持任意类型短 OID）；每项成功输出 `Deleted replace ref '<oid>'`，失败项收集后继续，最终以 `LBR-CLI-003` + 退出码 128 报告（Git 为 1，有意差异，已记入 `COMPATIBILITY.md`）。回归：`replace_delete_resolves_any_object_short_oid`（AC1/AC2/AC6）、`replace_delete_continues_and_reports_errors`（AC3–AC5/AC7）；`replace_test` 12/12。

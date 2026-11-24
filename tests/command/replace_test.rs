@@ -299,3 +299,132 @@ fn replace_rejects_invalid_mode_combinations() {
     let after = stdout(&run_libra_command(&["replace", "-l"], repo.path()));
     assert_eq!(after, snapshot, "replace refs unchanged");
 }
+
+/// Three commits plus a blob replacement: `replace -d` must accept a short oid
+/// of ANY object type and a full-length id whose object is absent.
+#[test]
+fn replace_delete_resolves_any_object_short_oid() {
+    let repo = create_committed_repo_via_cli();
+    for (name, body, message) in [("f1.txt", "one\n", "c2"), ("f2.txt", "two\n", "c3")] {
+        fs::write(repo.path().join(name), body).unwrap();
+        assert_cli_success(
+            &run_libra_command(&["add", name], repo.path()),
+            "stage file",
+        );
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", message, "--no-verify"], repo.path()),
+            "commit",
+        );
+    }
+    let c1 = stdout(&run_libra_command(&["rev-parse", "HEAD~2"], repo.path()))
+        .trim()
+        .to_string();
+    let c2 = stdout(&run_libra_command(&["rev-parse", "HEAD~1"], repo.path()))
+        .trim()
+        .to_string();
+    let c3 = stdout(&run_libra_command(&["rev-parse", "HEAD"], repo.path()))
+        .trim()
+        .to_string();
+
+    // AC2: both deletes are reported, in argument order.
+    for (object, replacement) in [(&c1, &c3), (&c2, &c3)] {
+        assert_cli_success(
+            &run_libra_command(&["replace", object, replacement], repo.path()),
+            "create replacement",
+        );
+    }
+    let deleted = run_libra_command(&["replace", "-d", &c1, &c2], repo.path());
+    assert_cli_success(&deleted, "AC2");
+    assert_eq!(
+        stdout(&deleted),
+        format!("Deleted replace ref '{c1}'\nDeleted replace ref '{c2}'\n"),
+        "AC2"
+    );
+
+    // AC1: a SHORT oid of a blob (not a commit) resolves without peeling.
+    let blob = stdout(&run_libra_command(
+        &["rev-parse", "HEAD:f1.txt"],
+        repo.path(),
+    ))
+    .trim()
+    .to_string();
+    let other_blob = stdout(&run_libra_command(
+        &["rev-parse", "HEAD:f2.txt"],
+        repo.path(),
+    ))
+    .trim()
+    .to_string();
+    assert_cli_success(
+        &run_libra_command(&["replace", &blob, &other_blob], repo.path()),
+        "create blob replacement",
+    );
+    let short = &blob[..8];
+    let deleted = run_libra_command(&["replace", "-d", short], repo.path());
+    assert_cli_success(&deleted, "AC1");
+    assert!(
+        !repo.path().join(".libra/refs/replace").join(&blob).exists(),
+        "AC1 ref removed"
+    );
+
+    // AC6: a full-length id whose object does not exist is still accepted when a
+    // replacement ref exists for it.
+    let absent = "1111111111111111111111111111111111111111";
+    let dir = repo.path().join(".libra/refs/replace");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join(absent), format!("{c3}\n")).unwrap();
+    let deleted = run_libra_command(&["replace", "-d", absent], repo.path());
+    assert_cli_success(&deleted, "AC6");
+    assert!(!dir.join(absent).exists(), "AC6 ref removed");
+}
+
+/// Failures are collected per item, later items still run, and the command ends
+/// with `LBR-CLI-003`/128.
+#[test]
+fn replace_delete_continues_and_reports_errors() {
+    let repo = create_committed_repo_via_cli();
+    fs::write(repo.path().join("f1.txt"), "one\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "f1.txt"], repo.path()), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c2", "--no-verify"], repo.path()),
+        "commit",
+    );
+    let c1 = stdout(&run_libra_command(&["rev-parse", "HEAD~1"], repo.path()))
+        .trim()
+        .to_string();
+    let c3 = stdout(&run_libra_command(&["rev-parse", "HEAD"], repo.path()))
+        .trim()
+        .to_string();
+    assert_cli_success(
+        &run_libra_command(&["replace", &c1, &c3], repo.path()),
+        "create replacement",
+    );
+
+    // AC3/AC4: the failing item does not stop the batch.
+    let out = run_libra_command(&["replace", "-d", &c3, &c1], repo.path());
+    assert!(!out.status.success(), "AC3 must fail");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("LBR-CLI-003"),
+        "AC3 code"
+    );
+    assert_eq!(out.status.code(), Some(128), "Libra's documented exit code");
+    assert!(
+        !repo.path().join(".libra/refs/replace").join(&c1).exists(),
+        "AC4 later item still deleted"
+    );
+
+    // AC5: an unresolvable name is a stable target error.
+    let out = run_libra_command(&["replace", "-d", "nosuchref"], repo.path());
+    assert!(!out.status.success(), "AC5 must fail");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("LBR-CLI-003"),
+        "AC5 code"
+    );
+
+    // AC7: no operands is a usage error.
+    let out = run_libra_command(&["replace", "-d"], repo.path());
+    assert!(!out.status.success(), "AC7 must fail");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("LBR-CLI-002"),
+        "AC7 code"
+    );
+}

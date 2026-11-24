@@ -15,7 +15,7 @@ libra replace [-l] [<pattern>]
 一条替换记录表示：当要读取 `<object>` 时，改为返回 `<replacement>`。替换发生在对象加载层（`load_object`），因此经由它的所有读取者 —— `log`、`show`、`rev-parse` 的 peel 等 —— 都透明地遵守，而不只是某一个调用点。
 
 - **创建**（`libra replace <object> <replacement>`）—— 记录替换。两个对象都必须存在；类型必须一致，除非用 `-f`。已存在的替换只有 `-f` 才覆盖。对象不能替换自己。
-- **删除**（`-d <object>...`）—— 删除替换；删除不存在的替换是错误。
+- **删除**（`-d <object>...`）—— 逐项删除替换。每个 `<object>` 都不做 peel 解析：任意对象类型的短 OID 均可，全长 40/64 位十六进制即使对象不存在也接受（以便删除仍存在的替换引用）。每成功一项输出 `Deleted replace ref '<oid>'`；无法解析或没有替换的项会被记录，后续项继续处理，全部处理完后以 `LBR-CLI-003`、退出码 128 失败（Git 此处退出码为 1，属有意差异）。
 - **列出**（`-l [<pattern>]`）—— 每行打印一个被替换对象的 id（Git 的默认短格式），可按 `wildmatch` 模式过滤，模式对整个对象 id 做整名匹配（`*`、`?`、`[...]` 为通配符，默认模式为 `*`）。`--format=medium/long` 同时显示替换 oid 与类型；`-l` 最多接受一个模式。
 
 替换以松散 ref 存于 `.libra/refs/replace/<oid>`（Git 的 `refs/replace/` 命名空间）。
