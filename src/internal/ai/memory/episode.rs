@@ -7,7 +7,7 @@
 //! `episode_identity_golden` test so any rule change is an intentional bump.
 
 // The TryFrom<&str> impls are public API and must stay for compatibility.
-#![allow(clippy::try_from_instead_of_from_str)]
+#![allow(unknown_lints, clippy::try_from_instead_of_from_str)]
 
 use std::fmt;
 

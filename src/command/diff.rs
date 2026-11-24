@@ -6836,7 +6836,7 @@ mod test {
     }
 
     #[test]
-    #[serial(env)]
+    #[serial(cwd, env)]
     fn test_maybe_colorize_diff_respects_flag() {
         let diff = "diff --git a/file.txt b/file.txt\n--- /dev/null\n+++ b/file.txt\n+line\n";
         let _guard = ColorOverrideReset;
