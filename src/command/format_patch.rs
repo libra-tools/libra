@@ -1462,11 +1462,11 @@ fn push_threading_headers(
         return;
     };
     let is_first = patch_num == start_num;
-    let message_id = if is_first {
-        threading.series_id.clone()
-    } else {
-        format!("{}-p{patch_num}", threading.series_id)
-    };
+    // Every patch ID carries a fixed-width numeric suffix, and the cover uses
+    // `-cover`, so no generated value is a substring of another (the old bare
+    // series id was a prefix of `-p2`/`-cover`).
+    let message_id = format!("{}-p{patch_num:08}", threading.series_id);
+    let first_id = format!("{}-p{start_num:08}", threading.series_id);
     out.push_str(&format!("Message-ID: <{message_id}>\n"));
 
     let cover_id = format!("{}-cover", threading.series_id);
@@ -1475,7 +1475,7 @@ fn push_threading_headers(
     } else if let Some(external) = threading.external_reply_to.as_deref() {
         Some(external)
     } else if total > 1 && !is_first {
-        Some(threading.series_id.as_str())
+        Some(first_id.as_str())
     } else {
         None
     };

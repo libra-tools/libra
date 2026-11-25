@@ -4758,7 +4758,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：Message-ID 改为系列 ID + 固定 8 位补丁序号（封面 `-cover`），任意两封互不为子串；无封面时后继补丁回复首补丁实际 ID，有封面时全部回复封面信。仅改 ID 生成，未改 `--thread` 默认值与 deep 链式结构。AC1–AC4 由 `format_patch_test::message_id_no_substring` 覆盖（3 封与 12 封两两无子串、封面回复关系、归一化父索引结构与 Git 一致）；`format_patch_test` 151/151、`compat_format_patch_mail_roundtrip` 15/15、`compat_format_patch_flag_surface` 通过；开发文档已记录核对结论。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试。
 
 **Description:** 自 `FPG-23` 拆出的独立轴：修改 `build_thread_id` / `push_threading_headers` 的 Message-ID 生成格式，使同系列任意两封邮件（含封面信与首个补丁）的 Message-ID 值（去掉尖括号后）互不为对方子串；当前首补丁值 `X` 是 `X-p2`、`X-cover` 的子串。 本卡先于 `FPG-35`、`FPG-23` 执行，使其后的 `check_threading` 式黄金比较在 ID 互不为子串的前提下成立；deep 链式结构由 `FPG-35` 验收。 线程头的位置（信封行之后、`From:` 之前）由自本卡拆出、先于本卡执行的 `FPG-63` 承接。
 

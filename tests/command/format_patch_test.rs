@@ -4869,3 +4869,153 @@ fn thread_headers_follow_envelope() {
         );
     }
 }
+
+/// FPG-28: generated Message-IDs are pairwise non-substrings and the threading
+/// structure matches Git (#916).
+#[test]
+fn message_id_no_substring() {
+    use std::process::Command;
+
+    fn seed(root: &std::path::Path, libra: bool, commits: usize) {
+        let run = |args: &[&str]| {
+            let out = if libra {
+                run_libra_command(args, root)
+            } else {
+                Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .env("HOME", root)
+                    .output()
+                    .expect("git")
+            };
+            assert!(out.status.success(), "{args:?}: {out:?}");
+        };
+        if libra {
+            run(&["init", "."]);
+            run(&["config", "set", "user.name", "T"]);
+            run(&["config", "set", "user.email", "t@t"]);
+        } else {
+            run(&["init", "-q", "-b", "main", "."]);
+            run(&["config", "user.name", "T"]);
+            run(&["config", "user.email", "t@t"]);
+        }
+        for i in 1..=commits {
+            fs::write(root.join(format!("f{i}")), format!("x{i}\n")).unwrap();
+            run(&["add", &format!("f{i}")]);
+            run(&["commit", "-m", &format!("subject {i}")]);
+        }
+    }
+    let messages = |stdout: &[u8]| -> Vec<(String, Option<String>)> {
+        let text = format!("\n{}", String::from_utf8_lossy(stdout));
+        text.split("\nFrom ")
+            .skip(1)
+            .map(|segment| {
+                let headers = segment
+                    .split_once("\n\n")
+                    .map(|(headers, _)| headers)
+                    .unwrap_or(segment);
+                let mut id = String::new();
+                let mut parent = None;
+                for line in headers.lines() {
+                    if let Some(value) = line.strip_prefix("Message-ID: ") {
+                        id = value.trim().trim_matches(['<', '>']).to_string();
+                    } else if let Some(value) = line.strip_prefix("In-Reply-To: ") {
+                        parent = Some(value.trim().trim_matches(['<', '>']).to_string());
+                    }
+                }
+                (id, parent)
+            })
+            .collect()
+    };
+    let assert_pairwise = |ids: &[String]| {
+        for (i, a) in ids.iter().enumerate() {
+            for (j, b) in ids.iter().enumerate() {
+                if i != j {
+                    assert!(!a.contains(b), "{a:?} must not contain {b:?}");
+                    assert!(!b.contains(a), "{b:?} must not contain {a:?}");
+                }
+            }
+        }
+    };
+
+    // AC1: three patches without a cover.
+    let repo = tempdir().expect("libra");
+    let lp = repo.path();
+    seed(lp, true, 3);
+    let out = run_libra_command(
+        &[
+            "format-patch",
+            "--thread",
+            "-3",
+            "--stdout",
+            "--no-signature",
+        ],
+        lp,
+    );
+    assert_cli_success(&out, "AC1");
+    let ac1 = messages(&out.stdout);
+    assert_eq!(ac1.len(), 3);
+    assert_pairwise(&ac1.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>());
+
+    // AC2/AC3: a 12-message series (cover + 11 patches).
+    let big = tempdir().expect("big");
+    let bp = big.path();
+    seed(bp, true, 12);
+    let big_out = run_libra_command(
+        &[
+            "format-patch",
+            "--thread",
+            "--cover-letter",
+            "-11",
+            "--stdout",
+            "--no-signature",
+        ],
+        bp,
+    );
+    assert_cli_success(&big_out, "AC2");
+    let big_messages = messages(&big_out.stdout);
+    assert_eq!(big_messages.len(), 12);
+    assert_pairwise(
+        &big_messages
+            .iter()
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>(),
+    );
+    let cover_id = &big_messages[0].0;
+    for (id, parent) in &big_messages[1..] {
+        assert_eq!(parent.as_deref(), Some(cover_id.as_str()), "AC3 {id}");
+    }
+
+    // AC4: normalized parent indices match Git's shallow threading.
+    let git_repo = tempdir().expect("git");
+    let gp = git_repo.path();
+    seed(gp, false, 3);
+    let git_out = Command::new("git")
+        .args([
+            "format-patch",
+            "--thread",
+            "-3",
+            "--stdout",
+            "--no-signature",
+        ])
+        .current_dir(gp)
+        .env("HOME", gp)
+        .output()
+        .expect("git");
+    assert!(git_out.status.success(), "{git_out:?}");
+    let structure = |msgs: &[(String, Option<String>)]| -> Vec<Option<usize>> {
+        let ids: Vec<&str> = msgs.iter().map(|(id, _)| id.as_str()).collect();
+        msgs.iter()
+            .map(|(_, parent)| {
+                parent
+                    .as_deref()
+                    .and_then(|parent| ids.iter().position(|id| *id == parent))
+            })
+            .collect()
+    };
+    assert_eq!(
+        structure(&messages(&out.stdout)),
+        structure(&messages(&git_out.stdout)),
+        "AC4 threading structure"
+    );
+}
