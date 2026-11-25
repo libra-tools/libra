@@ -5676,7 +5676,7 @@
 
 **Task type:** `migration`
 
-**Lifecycle / Acceptance:** `pending` / 空
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-23：在既有 `resume_forward_migration` 状态机上补齐围栏后/缺席态恢复——当源库已提交围栏（`__libra_migrated_fence__` 哨兵、schema 故意 malformed）时，跳过会失败的 Phase A PRAGMA 配置，改用无 PRAGMA 的普通锁连接交给状态探测分类为 `FencedPreUnlink`（若存在热 `-journal` 则不提前探测，保留 SQLite 热日志回滚路径）；恢复据此校验哨兵 `sql == SQLITE_MIGRATED_FENCE_SQL` 与该代 `backup_sha256`+`integrity_check`，`unlink`+父目录 `fsync`，持久化 `phase2_progress.<db>=unlinked`；源已缺席且进度为 `fenced_ready_to_unlink|unlinked` 时同样校验备份并补持久化，随后复用 Step 2.3 墓碑/Step 2.4 终态发布。AC1/AC2 由 `forward_phase2_crash_after_fence_before_unlink` 覆盖（`AfterFenceCommitBeforePersistReady` 崩溃后完成围栏、摘除源与 finalize），AC3 由 `forward_phase2_crash_immediately_after_libra_db_unlink` 覆盖，AC4 由 `forward_phase2_crash_immediately_after_capture_db_unlink` 覆盖（`AfterParentDirFsyncBeforeClose` 后双源缺席的幂等收敛与备份校验）。门禁：发现门精确列出上述 3 条；3 条 3/3 PASS，与既有 RB-10c 两条恢复用例合并 5/5 PASS；`--no-default-features --features storage-sqlite --lib -E 'test(/^storage::/)'` 11/11；`--features storage-sqlite,storage-redb,storage-queue --lib -E 'test(/^storage::migrate::/)'` 22/23（仅既有 `forward_phase1_streaming_batch_memory_budget` 本机 RSS 预算失败）；`cargo +stable fmt --all --check` 与 `cargo +nightly clippy --all-targets --all-features -- -D warnings` 均 exit 0。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试；仅改 `src/storage/migrate.rs`（卡面白名单内）。
 
 **Description:** 100% 在独占目录 `src/storage/` 内于 `migrate.rs` 实现正向迁移 Phase 2 的围栏后与双源独立 `unlink` 崩溃续跑：覆盖围栏 `COMMIT` 后 `unlink` 前通过 `PRAGMA writable_schema = ON` 精确核验 `__libra_migrated_fence__` 哨兵与备份 `backup_sha256` 后 `unlink` + `fsync_dir`，以及紧接 `unlink(libra.db)+fsync_dir` 后与紧接 `unlink(capture.db)+fsync_dir` 后两类独立合法缺席态备份认证收敛。
 

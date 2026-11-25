@@ -922,6 +922,28 @@ impl PreparedSqliteQuiescence {
     async fn close_quietly(self) {
         let _ = self.conn.close().await;
     }
+
+    fn connection_mut(&mut self) -> &mut SqliteConnection {
+        &mut self.conn
+    }
+
+    /// Consume the prepared handle as an already-fenced quiesced connection
+    /// (committed fence; the WAL -> DELETE PRAGMAs must not run).
+    fn into_fenced_quiesced(self) -> QuiescedSqliteConnection {
+        #[cfg(unix)]
+        let source_inode = {
+            use std::os::unix::fs::MetadataExt as _;
+            (self.expected_meta.dev(), self.expected_meta.ino())
+        };
+        QuiescedSqliteConnection {
+            conn: self.conn,
+            role: self.role,
+            path: self.path,
+            journal_mode: "delete".to_string(),
+            #[cfg(unix)]
+            source_inode,
+        }
+    }
 }
 
 fn wal_shm_cleanup_marker_path(db_path: &Path) -> PathBuf {
@@ -37080,6 +37102,122 @@ pub async fn resume_forward_migration_for_role(
 
 /// Convenience entrypoint resuming an interrupted repository
 /// (`DatabaseRole::Repository`) Forward Migration (`SQLite -> redb`, `RB-10c`).
+/// Probe the committed migration fence sentinel through an already-locked
+/// connection (`RB-10k` AC1: fence committed, progress still `pending`).
+async fn recovery_conn_has_fence_sentinel(conn: &mut SqliteConnection) -> StorageResult<bool> {
+    conn.execute("PRAGMA writable_schema = ON;")
+        .await
+        .map_err(|err| StorageBackendError::BackendInternal {
+            detail: format!("enable writable_schema for recovery fence check: {err}"),
+        })?;
+    let row: Option<String> =
+        sea_orm::sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE name = ? LIMIT 1;")
+            .bind(SQLITE_MIGRATED_FENCE_TABLE)
+            .persistent(false)
+            .fetch_optional(conn)
+            .await
+            .map_err(|err| StorageBackendError::BackendInternal {
+                detail: format!("read recovery fence sentinel: {err}"),
+            })?;
+    match row {
+        None => Ok(false),
+        Some(sql) if sql == SQLITE_MIGRATED_FENCE_SQL => Ok(true),
+        Some(_) => Err(StorageBackendError::BackendInternal {
+            detail: "forward migration recovery found a tampered fence sentinel".to_string(),
+        }),
+    }
+}
+
+/// Read-only probe for a committed fence sentinel through a fresh plain
+/// connection (no PRAGMAs), tolerating the deliberately malformed schema.
+async fn source_has_committed_fence(db_path: &Path) -> StorageResult<bool> {
+    use sea_orm::sqlx::{Connection, sqlite::SqliteConnectOptions};
+    let opts = SqliteConnectOptions::new()
+        .filename(db_path)
+        .create_if_missing(false)
+        .read_only(false)
+        .busy_timeout(Duration::ZERO);
+    let mut conn = sea_orm::sqlx::SqliteConnection::connect_with(&opts)
+        .await
+        .map_err(|err| StorageBackendError::BackendInternal {
+            detail: format!("open fenced source probe: {err}"),
+        })?;
+    let probe = sea_orm::sqlx::query_scalar::<_, String>("SELECT name FROM sqlite_master LIMIT 1;")
+        .persistent(false)
+        .fetch_optional(&mut conn)
+        .await;
+    match probe {
+        Ok(_) => Ok(false),
+        Err(err) => {
+            let lower = err.to_string().to_ascii_lowercase();
+            if !(lower.contains("malformed database schema")
+                && lower.contains(SQLITE_MIGRATED_FENCE_TABLE))
+            {
+                let _ = conn.close().await;
+                return Err(StorageBackendError::BackendInternal {
+                    detail: format!("fenced source probe rejected corrupt database: {err}"),
+                });
+            }
+            conn.execute("PRAGMA writable_schema = ON;")
+                .await
+                .map_err(|err| StorageBackendError::BackendInternal {
+                    detail: format!("enable writable_schema for fence probe: {err}"),
+                })?;
+            let row: Option<String> = sea_orm::sqlx::query_scalar(
+                "SELECT sql FROM sqlite_master WHERE name = ? LIMIT 1;",
+            )
+            .bind(SQLITE_MIGRATED_FENCE_TABLE)
+            .persistent(false)
+            .fetch_optional(&mut conn)
+            .await
+            .map_err(|err| StorageBackendError::BackendInternal {
+                detail: format!("read fence sentinel for probe: {err}"),
+            })?;
+            let _ = conn.close().await;
+            match row {
+                Some(sql) if sql == SQLITE_MIGRATED_FENCE_SQL => Ok(true),
+                Some(_) => Err(StorageBackendError::BackendInternal {
+                    detail: "forward migration recovery found a tampered fence sentinel"
+                        .to_string(),
+                }),
+                None => Ok(false),
+            }
+        }
+    }
+}
+
+/// Open a plain (PRAGMA-free) quiesced connection for an already-fenced source.
+async fn open_fenced_quiesced_connection(
+    db_path: &Path,
+    role: DatabaseRole,
+    meta: &fs::Metadata,
+) -> StorageResult<QuiescedSqliteConnection> {
+    use sea_orm::sqlx::{Connection, sqlite::SqliteConnectOptions};
+    let opts = SqliteConnectOptions::new()
+        .filename(db_path)
+        .create_if_missing(false)
+        .read_only(false)
+        .busy_timeout(Duration::ZERO);
+    let conn = sea_orm::sqlx::SqliteConnection::connect_with(&opts)
+        .await
+        .map_err(|err| StorageBackendError::BackendInternal {
+            detail: format!("open fenced {role} source: {err}"),
+        })?;
+    #[cfg(unix)]
+    let source_inode = {
+        use std::os::unix::fs::MetadataExt as _;
+        (meta.dev(), meta.ino())
+    };
+    Ok(QuiescedSqliteConnection {
+        conn,
+        role,
+        path: db_path.to_path_buf(),
+        journal_mode: "delete".to_string(),
+        #[cfg(unix)]
+        source_inode,
+    })
+}
+
 pub async fn resume_forward_migration(
     common_storage: &Path,
 ) -> StorageResult<ForwardPhase2ResumeReport> {
@@ -37233,7 +37371,26 @@ async fn resume_forward_migration_inner(
     }
 
     // Phase A: Acquire exclusive locks on all present live SQLite sources first.
-    let mut git_prepared = if let Some(ref meta) = git_exists_meta {
+    // A committed fence leaves a deliberately malformed schema, so skip the
+    // PRAGMA-configured quiescence and keep a plain locked connection instead.
+    let git_fence_committed = match git_exists_meta {
+        // A hot rollback journal means a pre-fence power loss: opening the file
+        // for the fence probe would consume the journal, so let the normal
+        // Phase A recovery path replay it instead.
+        Some(_) if !path_exists_no_open(&sqlite_sidecar_path(&git_db_path, "-journal"))? => {
+            source_has_committed_fence(&git_db_path).await?
+        }
+        _ => false,
+    };
+    let mut git_fenced_conn = if git_fence_committed {
+        let meta = git_exists_meta.as_ref().expect("checked above");
+        Some(open_fenced_quiesced_connection(&git_db_path, DatabaseRole::Repository, meta).await?)
+    } else {
+        None
+    };
+    let mut git_prepared = if let Some(ref meta) = git_exists_meta
+        && !git_fence_committed
+    {
         Some(
             prepare_recovery_sqlite_source(
                 &git_db_path,
@@ -37271,24 +37428,38 @@ async fn resume_forward_migration_inner(
     };
 
     // Phase B: Finalize any offline WAL -> DELETE transitions under all held locks.
-    let (git_conn_opt, git_hot_journal) = match git_prepared.take() {
-        Some((prep, hot)) => {
-            #[cfg(test)]
-            let res =
-                finalize_prepared_sqlite_quiescence_inner(prep, &QuiesceTestHooks::default()).await;
-            #[cfg(not(test))]
-            let res = finalize_prepared_sqlite_quiescence(prep).await;
-            match res {
-                Ok(conn) => (Some(conn), hot),
-                Err(err) => {
-                    if let Some((c_prep, _)) = cap_prepared {
-                        c_prep.close_quietly().await;
+    let (git_conn_opt, git_hot_journal) = if let Some(fenced) = git_fenced_conn.take() {
+        (Some(fenced), false)
+    } else {
+        match git_prepared.take() {
+            Some((mut prep, hot)) => {
+                // A committed fence makes the schema deliberately malformed, so the
+                // offline WAL -> DELETE PRAGMAs would fail; keep the locked connection
+                // and let the schema probe classify it as `FencedPreUnlink`.
+                if recovery_conn_has_fence_sentinel(prep.connection_mut()).await? {
+                    (Some(prep.into_fenced_quiesced()), hot)
+                } else {
+                    #[cfg(test)]
+                    let res = finalize_prepared_sqlite_quiescence_inner(
+                        prep,
+                        &QuiesceTestHooks::default(),
+                    )
+                    .await;
+                    #[cfg(not(test))]
+                    let res = finalize_prepared_sqlite_quiescence(prep).await;
+                    match res {
+                        Ok(conn) => (Some(conn), hot),
+                        Err(err) => {
+                            if let Some((c_prep, _)) = cap_prepared {
+                                c_prep.close_quietly().await;
+                            }
+                            return Err(err);
+                        }
                     }
-                    return Err(err);
                 }
             }
+            None => (None, false),
         }
-        None => (None, false),
     };
 
     let (cap_conn_opt, cap_hot_journal) = match cap_prepared {
@@ -59046,5 +59217,114 @@ int openat64(int dirfd, const char *path, int oflag, ...) {
                 "preserved-100-percent"
             );
         }
+    }
+
+    async fn rb10k_crash_at_point(storage: &Path, point: Phase2TestPoint) {
+        let prepared = prepare_forward_phase1(storage, 1)
+            .await
+            .expect("Phase 1 prepare");
+        let mut crash_hook = move |seen: Phase2TestPoint, _root: &Path| -> StorageResult<()> {
+            if seen == point {
+                return Err(StorageBackendError::BackendInternal {
+                    detail: "RB-10k injected crash".to_string(),
+                });
+            }
+            Ok(())
+        };
+        execute_forward_phase2_fence_and_unlink_inner(prepared, Some(&mut crash_hook))
+            .await
+            .expect_err("injected RB-10k crash");
+        let manifest = read_storage_manifest(storage)
+            .expect("read manifest")
+            .expect("crashed run must leave an unfinalized manifest");
+        assert!(!manifest.finalized);
+    }
+
+    async fn rb10k_assert_backup(storage: &Path, generation: u64, capture: bool) {
+        use sea_orm::sqlx::{Connection, sqlite::SqliteConnectOptions};
+        let path = if capture {
+            sqlite_backup_capture_db_path(storage, generation)
+        } else {
+            sqlite_backup_git_db_path(storage, generation)
+        };
+        assert!(path.is_file(), "backup {} must exist", path.display());
+        let opts = SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(false)
+            .read_only(true);
+        let mut conn = sea_orm::sqlx::SqliteConnection::connect_with(&opts)
+            .await
+            .expect("open backup");
+        let integrity: String = sea_orm::sqlx::query_scalar("PRAGMA integrity_check;")
+            .persistent(false)
+            .fetch_one(&mut conn)
+            .await
+            .expect("integrity_check");
+        assert_eq!(integrity, "ok");
+    }
+
+    /// RB-10k AC1/AC2: finish a committed fence before unlink.
+    #[tokio::test]
+    async fn forward_phase2_crash_after_fence_before_unlink() {
+        let dir = tempdir().expect("rb10k fence tempdir");
+        let storage = dir.path().join(".libra");
+        build_rb10c_layout_c_fixture(&storage, "rb10k-fence").await;
+        rb10k_crash_at_point(
+            &storage,
+            Phase2TestPoint::AfterFenceCommitBeforePersistReady(DatabaseRole::Repository),
+        )
+        .await;
+        let git_db = git_sqlite_db_path(&storage);
+        assert!(git_db.is_file(), "crashed fence leaves libra.db on disk");
+
+        let resumed = resume_forward_phase2(&storage)
+            .await
+            .expect("resume must finish the committed fence");
+        assert!(resumed.finalized.manifest.finalized, "AC1 finalized");
+        assert!(!git_db.exists(), "AC2 source unlinked");
+        rb10k_assert_backup(&storage, 1, false).await;
+        rb10k_assert_backup(&storage, 1, true).await;
+    }
+
+    /// RB-10k AC3: resume right after `unlink(libra.db)+fsync`.
+    #[tokio::test]
+    async fn forward_phase2_crash_immediately_after_libra_db_unlink() {
+        let dir = tempdir().expect("rb10k git-unlink tempdir");
+        let storage = dir.path().join(".libra");
+        build_rb10c_layout_c_fixture(&storage, "rb10k-git-unlink").await;
+        rb10k_crash_at_point(
+            &storage,
+            Phase2TestPoint::AfterParentDirFsyncBeforeClose(DatabaseRole::Repository),
+        )
+        .await;
+        assert!(!git_sqlite_db_path(&storage).exists());
+
+        let resumed = resume_forward_phase2(&storage)
+            .await
+            .expect("resume must verify backups and finalize");
+        assert!(resumed.finalized.manifest.finalized, "AC3 finalized");
+        rb10k_assert_backup(&storage, 1, false).await;
+    }
+
+    /// RB-10k AC4: resume right after `unlink(capture.db)+fsync`.
+    #[tokio::test]
+    async fn forward_phase2_crash_immediately_after_capture_db_unlink() {
+        let dir = tempdir().expect("rb10k capture-unlink tempdir");
+        let storage = dir.path().join(".libra");
+        build_rb10c_layout_c_fixture(&storage, "rb10k-cap-unlink").await;
+        rb10k_crash_at_point(
+            &storage,
+            Phase2TestPoint::AfterParentDirFsyncBeforeClose(DatabaseRole::Capture),
+        )
+        .await;
+        assert!(!git_sqlite_db_path(&storage).exists());
+        assert!(!capture_sqlite_db_path(&storage).exists());
+
+        let resumed = resume_forward_phase2(&storage)
+            .await
+            .expect("resume must verify both backups and finalize");
+        assert!(resumed.finalized.manifest.finalized, "AC4 finalized");
+        rb10k_assert_backup(&storage, 1, false).await;
+        rb10k_assert_backup(&storage, 1, true).await;
     }
 }
