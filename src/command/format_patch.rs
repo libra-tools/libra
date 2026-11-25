@@ -539,7 +539,17 @@ pub async fn execute_safe(mut args: FormatPatchArgs, output: &OutputConfig) -> C
         );
     }
 
+    let from_from_cli = args.from.is_some();
     resolve_format_config(&mut args).await?;
+    if !from_from_cli
+        && let Some(Some(ident)) = args.from.as_ref()
+        && !ident.trim().is_empty()
+        && parse_from_ident(ident).is_err()
+    {
+        return Err(CliError::from(FormatPatchError::InvalidFromIdent(
+            ident.clone(),
+        )));
+    }
 
     // `--signature-file` reads the footer text from a file; resolve it into the
     // same slot `--signature` uses (the two are mutually exclusive). Trailing
@@ -2031,6 +2041,22 @@ async fn resolve_format_config(args: &mut FormatPatchArgs) -> Result<(), FormatP
                 expected: "a Git boolean",
             },
         )?;
+    }
+    // `format.from` is applied only when no command-line `--from` was given:
+    // `true` uses the committer identity, `false` leaves the author untouched,
+    // and any other value is used as an ident line (validated after this
+    // resolve pass, so a CLI override wins over an invalid config value).
+    if args.from.is_none()
+        && let Some(value) = read_format_config("format.from").await?
+    {
+        let trimmed = value.trim();
+        if let Some(enabled) = crate::internal::config::parse_git_config_bool(trimmed) {
+            if enabled {
+                args.from = Some(None);
+            }
+        } else if !trimmed.is_empty() {
+            args.from = Some(Some(trimmed.to_string()));
+        }
     }
     Ok(())
 }

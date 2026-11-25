@@ -3547,3 +3547,152 @@ fn from_invalid_ident_rejected() {
         "AC6 From: Name <>"
     );
 }
+
+/// FPG-31: `format.from` accepts true/false/an ident line; invalid values are
+/// rejected with the same stable code as `--from` (unless overridden).
+#[test]
+fn format_from_and_no_from() {
+    use std::process::Command;
+
+    let repo = create_committed_repo_via_cli();
+    let lp = repo.path();
+    fs::write(lp.join("f.txt"), "f\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], lp), "add");
+    let author_env = [
+        ("GIT_AUTHOR_NAME", "Bob"),
+        ("GIT_AUTHOR_EMAIL", "bob@example.com"),
+        ("GIT_COMMITTER_NAME", "Bob"),
+        ("GIT_COMMITTER_EMAIL", "bob@example.com"),
+    ];
+    assert_cli_success(
+        &run_libra_command_with_env(&["commit", "-m", "subject", "--no-verify"], lp, &author_env),
+        "commit",
+    );
+
+    let git_repo = tempdir().expect("git");
+    let gp = git_repo.path();
+    let git = |args: &[&str], extra: &[(&str, &str)]| {
+        let mut cmd = Command::new("git");
+        cmd.args(args)
+            .current_dir(gp)
+            .env("GIT_AUTHOR_NAME", "Bob")
+            .env("GIT_AUTHOR_EMAIL", "bob@example.com")
+            .env("GIT_COMMITTER_NAME", "Bob")
+            .env("GIT_COMMITTER_EMAIL", "bob@example.com")
+            .env("HOME", gp);
+        for (k, v) in extra {
+            cmd.env(k, v);
+        }
+        let out = cmd.output().expect("git");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+        out
+    };
+    git(&["init", "-q", "-b", "main", "."], &[]);
+    fs::write(gp.join("f.txt"), "f\n").unwrap();
+    git(&["add", "f.txt"], &[]);
+    git(&["commit", "-q", "-m", "subject"], &[]);
+
+    let committer_env = [
+        ("GIT_COMMITTER_NAME", "C O Mitter"),
+        ("GIT_COMMITTER_EMAIL", "committer@example.com"),
+    ];
+    let from_header = |stdout: &str| -> String {
+        stdout
+            .lines()
+            .find(|line| line.starts_with("From: "))
+            .unwrap_or_default()
+            .to_string()
+    };
+    let libra_patch = |extra: &[(&str, &str)]| -> String {
+        String::from_utf8_lossy(
+            &run_libra_command_with_env(
+                &[
+                    "format-patch",
+                    "-1",
+                    "--stdout",
+                    "--no-thread",
+                    "--no-signature",
+                ],
+                lp,
+                extra,
+            )
+            .stdout,
+        )
+        .to_string()
+    };
+    let git_patch = |extra: &[(&str, &str)]| -> String {
+        String::from_utf8_lossy(
+            &git(
+                &[
+                    "format-patch",
+                    "-1",
+                    "--stdout",
+                    "--no-thread",
+                    "--no-signature",
+                ],
+                extra,
+            )
+            .stdout,
+        )
+        .to_string()
+    };
+
+    // AC1: format.from=true uses the execution committer identity.
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "format.from", "true"], lp),
+        "config true",
+    );
+    git(&["config", "format.from", "true"], &[]);
+    assert_eq!(
+        from_header(&libra_patch(&committer_env)),
+        from_header(&git_patch(&committer_env)),
+        "AC1 true"
+    );
+
+    // AC2: format.from=false keeps the author.
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "format.from", "false"], lp),
+        "config false",
+    );
+    git(&["config", "format.from", "false"], &[]);
+    assert_eq!(
+        from_header(&libra_patch(&committer_env)),
+        from_header(&git_patch(&committer_env)),
+        "AC2 false"
+    );
+
+    // AC3: an ident value is used verbatim.
+    assert_cli_success(
+        &run_libra_command(
+            &["config", "set", "format.from", "F R Om <from@example.com>"],
+            lp,
+        ),
+        "config ident",
+    );
+    assert_eq!(
+        from_header(&libra_patch(&[])),
+        "From: F R Om <from@example.com>",
+        "AC3 ident"
+    );
+
+    // AC4: an invalid config ident is rejected with the --from stable code.
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "format.from", "foo"], lp),
+        "config invalid",
+    );
+    let out = run_libra_command(
+        &[
+            "format-patch",
+            "-1",
+            "--stdout",
+            "--no-thread",
+            "--no-signature",
+        ],
+        lp,
+    );
+    assert!(!out.status.success(), "AC4 invalid config");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.lines().any(|line| line == "Error-Code: LBR-CLI-002"));
+    assert!(stderr.contains("invalid ident line"), "{stderr}");
+    assert!(out.stdout.is_empty());
+}

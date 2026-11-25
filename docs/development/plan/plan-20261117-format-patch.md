@@ -2191,7 +2191,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：`resolve_format_config` 读取 `format.from`——`true` 使用执行时提交者身份，`false`/空保持作者，其它值作为 ident 行；配置值仅在没有命令行 `--from` 时生效，非法配置值在解析后按 `FPG-10` 的 ident 校验以 `invalid ident line` + `LBR-CLI-002` 拒绝。AC1–AC4 由 `format_patch_test::format_from_and_no_from` 覆盖（true/false 与 Git 黄金 `From:` 逐字、ident 原样、非法值稳定码）；`format_patch_test` 141/141、`compat_format_patch_mail_roundtrip` 15/15；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试；`--no-from` 与命令行覆盖由 `FPG-46` 承接，本卡未新增该 flag。
 
 **Description:** 自 `FPG-10` 拆出的独立轴：读取 `format.from`（`true` 改写为提交者身份、`false` 不改写、`Name <email>` 使用该身份），非法取值不在读取时校验，而在命令行覆盖之后按 `FPG-10` 的 ident 校验以 `LBR-CLI-002` 拒绝（被 `--from`/`--no-from` 覆盖时不报错，`git show 6de20f6092:builtin/log.c` 第 1078–1086、2195–2198 行；覆盖场景由 `FPG-46` 验收）。`--no-from` 与命令行覆盖由自本卡拆出的 `FPG-46` 承接。
 
