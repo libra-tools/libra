@@ -257,7 +257,7 @@ pub struct FormatPatchArgs {
         value_name = "N",
         help = "Mark the patch series as version N (changes \"[PATCH]\" to \"[PATCH vN]\")"
     )]
-    pub reroll_count: Option<usize>,
+    pub reroll_count: Option<String>,
 
     /// Append a Signed-off-by trailer to each commit message.
     #[arg(short = 's', long = "signoff")]
@@ -1134,6 +1134,7 @@ async fn format_patch_body(
 
     let version = args
         .reroll_count
+        .as_deref()
         .map(|v| format!(" v{v}"))
         .unwrap_or_default();
     // `--rfc[=<text>]` prepends the RFC marker to the subject prefix
@@ -1269,7 +1270,7 @@ async fn format_patch_body(
             suffix: suffix(args),
             numbered_files: args.numbered_files,
             max_length: args.filename_max_length,
-            reroll: args.reroll_count,
+            reroll: args.reroll_count.clone(),
         });
         out.push_str("This is a multi-part message in MIME format.\n");
         out.push_str(&format!("--{boundary}\n"));
@@ -1948,7 +1949,11 @@ async fn interdiff_block(
         .map_err(|error| CliError::command_usage(error.to_string()))?;
     let output = crate::command::diff::run_diff_for_service(diff_args).await?;
     let patch = crate::command::diff::render::format_unified_diff(&output);
-    let title = match args.reroll_count {
+    let title = match args
+        .reroll_count
+        .as_deref()
+        .and_then(|version| version.parse::<usize>().ok())
+    {
         Some(version) if version > 1 => format!("Interdiff against v{}:", version - 1),
         _ => "Interdiff:".to_string(),
     };
@@ -2039,6 +2044,7 @@ fn format_cover_letter(
 
     let version = args
         .reroll_count
+        .as_deref()
         .map(|v| format!(" v{v}"))
         .unwrap_or_default();
     let prefix = format!("{}{}", sanitize_header_value(subject_prefix(args)), version);
@@ -2448,22 +2454,53 @@ struct FilenameSpec<'a> {
     suffix: &'a str,
     numbered_files: bool,
     max_length: Option<usize>,
-    reroll: Option<usize>,
+    reroll: Option<String>,
+}
+
+/// Git's reroll filename prefix sanitizer: keep alphanumerics, collapse dot
+/// runs to one dot, collapse every other run to one dash, trim trailing dots /
+/// dashes, then append the stem separator.
+fn sanitize_reroll(value: &str) -> String {
+    let mut out = String::new();
+    let mut last_dot = false;
+    let mut last_dash = false;
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch);
+            last_dot = false;
+            last_dash = false;
+        } else if ch == '.' {
+            if !last_dot {
+                out.push('.');
+            }
+            last_dot = true;
+            last_dash = false;
+        } else {
+            if !last_dash {
+                out.push('-');
+            }
+            last_dash = true;
+            last_dot = false;
+        }
+    }
+    while out.ends_with('-') || out.ends_with('.') {
+        out.pop();
+    }
+    out
 }
 
 fn patch_filename(spec: &FilenameSpec<'_>) -> String {
-    let FilenameSpec {
-        patch_num,
-        total,
-        start_num,
-        slug,
-        suffix,
-        numbered_files,
-        max_length,
-        reroll,
-    } = *spec;
-    let version_prefix = reroll
-        .map(|version| format!("v{version}-"))
+    let patch_num = spec.patch_num;
+    let total = spec.total;
+    let start_num = spec.start_num;
+    let slug = spec.slug;
+    let suffix = spec.suffix;
+    let numbered_files = spec.numbered_files;
+    let max_length = spec.max_length;
+    let version_prefix = spec
+        .reroll
+        .as_deref()
+        .map(|version| format!("v{}-", sanitize_reroll(version)))
         .unwrap_or_default();
     if numbered_files {
         // `--numbered-files`: bare sequence number, no slug and no suffix
@@ -2583,7 +2620,7 @@ fn write_patch_file(
             suffix: suffix(args),
             numbered_files: args.numbered_files,
             max_length: args.filename_max_length,
-            reroll: args.reroll_count,
+            reroll: args.reroll_count.clone(),
         });
         let path = out_dir.join(&filename);
         atomic_write::write_atomic(&path, body.as_bytes(), atomic_write::sync_data_enabled())

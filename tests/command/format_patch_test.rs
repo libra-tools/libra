@@ -8240,3 +8240,127 @@ fn generated_paths_on_stdout() {
         .collect();
     assert_eq!(lines(&res.stdout), expected, "AC6 absolute paths");
 }
+
+/// FPG-26: non-integer and non-numeric reroll values sanitize the file prefix
+/// the way Git does (#903).
+#[test]
+fn reroll_non_integer() {
+    use std::collections::BTreeSet;
+    use std::process::Command;
+
+    fn seed(root: &std::path::Path, libra: bool) {
+        let run = |args: &[&str]| {
+            let out = if libra {
+                run_libra_command(args, root)
+            } else {
+                Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .env("HOME", root)
+                    .output()
+                    .expect("git")
+            };
+            assert!(out.status.success(), "{args:?}: {out:?}");
+        };
+        if libra {
+            run(&["init", "."]);
+            run(&["config", "set", "user.name", "T"]);
+            run(&["config", "set", "user.email", "t@t"]);
+        } else {
+            run(&["init", "-q", "-b", "main", "."]);
+            run(&["config", "user.name", "T"]);
+            run(&["config", "user.email", "t@t"]);
+        }
+        fs::write(root.join("f"), "base\n").unwrap();
+        run(&["add", "f"]);
+        run(&["commit", "-m", "base"]);
+        fs::write(root.join("f"), "base\nsecond\n").unwrap();
+        run(&["add", "f"]);
+        run(&["commit", "-m", "second"]);
+    }
+    let names = |dir: &std::path::Path| -> BTreeSet<String> {
+        fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .collect()
+    };
+
+    let libra_repo = tempdir().unwrap();
+    let lp = libra_repo.path();
+    seed(lp, true);
+    let git_repo = tempdir().unwrap();
+    let gp = git_repo.path();
+    seed(gp, false);
+
+    let cover = run_libra_command(
+        &[
+            "format-patch",
+            "-o",
+            "p",
+            "--cover-letter",
+            "--reroll-count=4.4",
+            "-1",
+            "--no-thread",
+            "--no-signature",
+        ],
+        lp,
+    );
+    assert_cli_success(&cover, "AC1");
+    let names1 = names(&lp.join("p"));
+    assert!(names1.contains("v4.4-0000-cover-letter.patch"));
+    assert!(names1.iter().any(|name| name.starts_with("v4.4-0001-")));
+
+    let rev2 = run_libra_command(
+        &[
+            "format-patch",
+            "-o",
+            "p2",
+            "-v4rev2",
+            "-1",
+            "--no-thread",
+            "--no-signature",
+        ],
+        lp,
+    );
+    assert_cli_success(&rev2, "AC2");
+    let names2 = names(&lp.join("p2"));
+    assert_eq!(names2.len(), 1);
+    assert!(names2.iter().next().unwrap().starts_with("v4rev2-0001-"));
+
+    // AC3: the pathological value sanitizes to `v4-.-.-.-1-.2-`.
+    let weird = "4---..././../--1/.2//";
+    let libra = run_libra_command(
+        &[
+            "format-patch",
+            "-o",
+            "p3",
+            &format!("--reroll-count={weird}"),
+            "-1",
+            "--no-thread",
+            "--no-signature",
+        ],
+        lp,
+    );
+    assert_cli_success(&libra, "AC3 libra");
+    let git = Command::new("git")
+        .args([
+            "format-patch",
+            "-o",
+            "p3",
+            &format!("--reroll-count={weird}"),
+            "-1",
+            "--no-thread",
+            "--no-signature",
+        ])
+        .current_dir(gp)
+        .env("HOME", gp)
+        .output()
+        .unwrap();
+    assert!(git.status.success(), "{git:?}");
+    assert_eq!(names(&lp.join("p3")), names(&gp.join("p3")), "AC3");
+    assert!(
+        names(&lp.join("p3"))
+            .iter()
+            .all(|name| name.starts_with("v4-.-.-.-1-.2-"))
+    );
+}

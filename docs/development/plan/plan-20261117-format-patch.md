@@ -4038,7 +4038,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：`reroll_count` 改为字符串，非整数/非常规值按 Git 清洗文件名前缀（4.4、4rev2、异常分隔符），始终写输出目录；Subject 原样与 interdiff 标题由 `FPG-52` 承接。AC1–AC3 由 `format_patch_test::reroll_non_integer` 覆盖（4.4 封面集合、4rev2、异常值与 Git 文件名集合逐项相等）；`format_patch_test` 173/173、`compat_format_patch_mail_roundtrip` 15/15、`compat_format_patch_flag_surface` 通过；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试。
 
 **Description:** 自 `FPG-20` 拆出的独立轴：将 `FormatPatchArgs::reroll_count` 从 `Option<usize>` 改为字符串，按 Git 接受小数与非数字 reroll 标记（`--reroll-count=4.4`、`-v4rev2`、`-v4---..././../--1/.2//`），文件名前缀使用 Git 的清洗结果（路径分隔符等被替换，文件始终写在输出目录内）。`Subject:` 原样字符串与 interdiff 标题由自本卡拆出的 `FPG-52` 承接。
 
