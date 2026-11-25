@@ -1821,7 +1821,14 @@ fn clean_subject(subject: &str, keep: bool) -> String {
 /// * `--commit-list-format=modern`: `[i/N] subject` per commit.
 /// * anything else: a pretty-format string over a small placeholder set.
 fn render_commit_list(args: &FormatPatchArgs, commits: &[Commit]) -> String {
-    let format = args.commit_list_format.as_deref().unwrap_or("short");
+    let raw_format = args.commit_list_format.as_deref().unwrap_or("short");
+    // Git recognizes `log:` first and treats the remainder as a pretty-format
+    // string; `shortlog`/`modern` are keywords, and any other value must look
+    // like a format (contain `%`) or is rejected.
+    let (format, has_log_prefix) = match raw_format.strip_prefix("log:") {
+        Some(rest) => (rest, true),
+        None => (raw_format, false),
+    };
     let mut out = String::new();
     match format {
         "short" | "shortlog" => {
@@ -1855,12 +1862,17 @@ fn render_commit_list(args: &FormatPatchArgs, commits: &[Commit]) -> String {
             }
         }
         custom => {
-            for commit in commits {
-                match render_pretty_format_commit(custom, commit) {
+            if !has_log_prefix && !custom.contains('%') {
+                return format!("\u{0}invalid:{raw_format}");
+            }
+            let total = commits.len();
+            let width = total.to_string().len();
+            for (index, commit) in commits.iter().enumerate() {
+                match render_pretty_format_commit(custom, commit, index + 1, total, width) {
                     Some(rendered) => out.push_str(&rendered),
                     // Git reports an unusable format string as a fatal error
                     // (`fatal: '<fmt>' is not a valid format string`).
-                    None => return format!("\u{0}invalid:{custom}"),
+                    None => return format!("\u{0}invalid:{raw_format}"),
                 }
                 out.push('\n');
             }
@@ -1906,7 +1918,13 @@ fn wrap_shortlog_subject(subject: &str) -> String {
 /// Expand a small `git log --format` subset for `--commit-list-format`.
 /// Unsupported conversions yield `None`, which the caller reports as a
 /// Git-style `fatal: ... is not a valid format string` error.
-fn render_pretty_format_commit(format: &str, commit: &Commit) -> Option<String> {
+fn render_pretty_format_commit(
+    format: &str,
+    commit: &Commit,
+    count: usize,
+    total: usize,
+    width: usize,
+) -> Option<String> {
     let mut out = String::new();
     let mut chars = format.chars().peekable();
     while let Some(c) = chars.next() {
@@ -1915,6 +1933,20 @@ fn render_pretty_format_commit(format: &str, commit: &Commit) -> Option<String> 
             continue;
         }
         match chars.next()? {
+            '(' => {
+                let mut atom = String::new();
+                loop {
+                    match chars.next()? {
+                        ')' => break,
+                        c => atom.push(c),
+                    }
+                }
+                match atom.as_str() {
+                    "count" => out.push_str(&format!("{count:0width$}")),
+                    "total" => out.push_str(&total.to_string()),
+                    _ => return None,
+                }
+            }
             'h' => out.push_str(&commit.id.to_string()[..7.min(commit.id.to_string().len())]),
             'H' => out.push_str(&commit.id.to_string()),
             's' => out.push_str(&commit_subject_line(commit)),

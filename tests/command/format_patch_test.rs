@@ -5628,3 +5628,156 @@ fn thread_cli_overrides_config() {
 
     let _ = run_libra_command(&["config", "unset", "format.thread"], lp);
 }
+
+/// FPG-14: `%(count)`/`%(total)` atoms, padding, and the `log:` prefix match
+/// Git; a literal format without `%` is rejected (#899).
+#[test]
+fn commit_list_format_git_atoms() {
+    use std::process::Command;
+
+    fn seed(root: &std::path::Path, libra: bool) {
+        let run = |args: &[&str]| {
+            let out = if libra {
+                run_libra_command(args, root)
+            } else {
+                Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .env("HOME", root)
+                    .output()
+                    .expect("git")
+            };
+            assert!(out.status.success(), "{args:?}: {out:?}");
+        };
+        if libra {
+            run(&["init", "."]);
+            run(&["config", "set", "user.name", "A U Thor"]);
+            run(&["config", "set", "user.email", "author@example.com"]);
+        } else {
+            run(&["init", "-q", "-b", "main", "."]);
+            run(&["config", "user.name", "A U Thor"]);
+            run(&["config", "user.email", "author@example.com"]);
+        }
+        for i in 1..=11 {
+            fs::write(root.join(format!("f{i}")), format!("x{i}\n")).unwrap();
+            run(&["add", &format!("f{i}")]);
+            run(&["commit", "-m", &format!("This is a subject {i}")]);
+        }
+    }
+    let segment = |text: &str| -> String {
+        let start = text.find("*** BLURB HERE ***").expect("blurb");
+        let tail = &text[start..];
+        let end = tail
+            .lines()
+            .scan(0usize, |offset, line| {
+                let line_start = *offset;
+                *offset += line.len() + 1;
+                Some((line_start, line))
+            })
+            .find(|(_, line)| line.contains(" | ") && line.starts_with(' '))
+            .map(|(offset, _)| offset)
+            .unwrap_or(tail.len());
+        tail[..end].trim_end().to_string()
+    };
+
+    let libra_repo = tempdir().expect("libra");
+    let lp = libra_repo.path();
+    seed(lp, true);
+    let git_repo = tempdir().expect("git");
+    let gp = git_repo.path();
+    seed(gp, false);
+
+    let libra_run = |flags: &[&str]| -> std::process::Output {
+        let mut args = vec!["format-patch"];
+        args.extend_from_slice(flags);
+        args.extend_from_slice(&["--stdout", "--no-thread", "--no-signature"]);
+        let out = run_libra_command(&args, lp);
+        assert_cli_success(&out, "libra format-patch");
+        out
+    };
+    let git_run = |flags: &[&str]| -> String {
+        let mut cmd = Command::new("git");
+        cmd.args(["format-patch"])
+            .args(flags)
+            .args(["--stdout", "--no-thread", "--no-signature"])
+            .current_dir(gp)
+            .env("HOME", gp);
+        let out = cmd.output().expect("git");
+        assert!(out.status.success(), "git {flags:?}: {out:?}");
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+    let compare = |label: &str, format: &str, extra: &[&str]| {
+        let format_flag = format!("--commit-list-format={format}");
+        let mut flags = vec!["--cover-letter", format_flag.as_str()];
+        flags.extend_from_slice(extra);
+        let libra = libra_run(&flags);
+        let git = git_run(&flags);
+        assert_eq!(
+            segment(&String::from_utf8_lossy(&libra.stdout)),
+            segment(&git),
+            "{label}"
+        );
+    };
+
+    compare("AC1 count", "[%(count)] %s", &["-2"]);
+    compare("AC2 total", "[%(total)] %s", &["-2"]);
+    compare("AC3 combined", "[%(count)/%(total)] %s (%an)", &["-2"]);
+    compare("AC6 padded count", "[%(count)/%(total)] %s", &["-10"]);
+    compare(
+        "AC7 start number",
+        "[%(count)/%(total)] %s",
+        &["--start-number=5", "-2"],
+    );
+
+    // AC4: the `log:` prefix is stripped before rendering.
+    let git_files = Command::new("git")
+        .args([
+            "format-patch",
+            "--commit-list-format=log:[%(count)/%(total)] %s (%an)",
+            "-o",
+            "patches",
+            "HEAD~1",
+            "--no-thread",
+            "--no-signature",
+        ])
+        .current_dir(gp)
+        .env("HOME", gp)
+        .output()
+        .expect("git");
+    assert!(git_files.status.success(), "{git_files:?}");
+    let libra_files = run_libra_command(
+        &[
+            "format-patch",
+            "--commit-list-format=log:[%(count)/%(total)] %s (%an)",
+            "-o",
+            "patches",
+            "HEAD~1",
+            "--no-thread",
+            "--no-signature",
+        ],
+        lp,
+    );
+    assert_cli_success(&libra_files, "AC4");
+    assert_eq!(
+        segment(&fs::read_to_string(lp.join("patches/0000-cover-letter.patch")).unwrap()),
+        segment(&fs::read_to_string(gp.join("patches/0000-cover-letter.patch")).unwrap()),
+        "AC4 log: prefix"
+    );
+
+    // AC5: a literal without `%` is rejected as an invalid format string.
+    let invalid = run_libra_command(
+        &[
+            "format-patch",
+            "--cover-letter",
+            "--commit-list-format=this should fail",
+            "-1",
+            "--stdout",
+        ],
+        lp,
+    );
+    assert!(!invalid.status.success(), "AC5");
+    let stderr = String::from_utf8_lossy(&invalid.stderr);
+    assert!(stderr.lines().any(|line| line == "Error-Code: LBR-CLI-002"));
+    assert!(stderr.contains("is not a valid format string"), "{stderr}");
+    assert!(invalid.stdout.is_empty());
+}

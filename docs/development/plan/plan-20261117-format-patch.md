@@ -2704,7 +2704,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：`--commit-list-format` 支持 `%(count)`/`%(total)`（count 按总数位宽补零、自 1 起且不受 `--start-number` 影响）与 `log:` 前缀；识别顺序 `log:` → `shortlog`/`modern` → 其余必须含 `%`，否则 `'<fmt>' is not a valid format string` + `LBR-CLI-002`。AC1–AC7 由 `format_patch_test::commit_list_format_git_atoms` 覆盖（count/total/组合、`log:`、非法字面量、10 补丁补零、start-number 均与 Git 列表段逐字一致）；`format_patch_test` 156/156、`compat_format_patch_mail_roundtrip` 15/15、`compat_format_patch_flag_surface` 通过；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试；`format.commitListFormat`/`full` 由 `FPG-49` 承接。
 
 **Description:** 让 `render_pretty_format_commit` 接受 Git `--commit-list-format` 的 `%(count)`、`%(total)` 原子（与既有 `%s`/`%an` 等组合）与 `log:` 前缀，并按 Git 判据（依次识别 `log:` 前缀、`shortlog`、`modern`，其余串含 `%` 才接受，否则拒绝，`git show 6de20f6092:builtin/log.c` 第 1443–1453 行）拒绝如 `this should fail` 的串（`log:` 前缀后的字面量按 Git 接受）。`%(count)` 按总数位宽补零，计数自 1 起且不随 `--start-number` 变化（`git show 6de20f6092:pretty.c` 第 1551–1557 行、`builtin/log.c` 第 1368–1386 行）。Libra 保留的 `short` 别名见 `DEFER-FPG-04`。`log:` 按 Git 上游行为去掉前缀后渲染（`git@6de20f6092` `builtin/log.c` 与 t4014「cover letter with subject, author and count」期望 `[1/1] This is a subject (A U Thor)`）；#899 第 2 项文字称输出保留字面 `log:`，与上游不符，本计划以上游为准，并在关闭 #899 时于 issue 中说明。`format.commitListFormat`、`full` 取值（Git 基线无此关键字）与无封面信场景由自本卡拆出的 `FPG-49` 承接。本卡全部夹具不配置分支描述（列表段按「验证执行协议」第 3 项自 `*** BLURB HERE ***` 之后提取）。
 
