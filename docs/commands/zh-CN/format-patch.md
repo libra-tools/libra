@@ -135,7 +135,7 @@ libra format-patch --ignore-if-in-upstream --src-prefix=old/ --dst-prefix=new/ o
 ```
 From <commit-oid> <unix-mbox-date>
 From: Author Name <email>
-Date: <RFC 2822 date>
+Date: <RFC 2822 作者时间与作者时区>
 Subject: [PATCH n/m] commit subject
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

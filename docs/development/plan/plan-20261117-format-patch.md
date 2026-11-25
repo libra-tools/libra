@@ -3008,7 +3008,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：补丁 `Date:` 改为作者时间+作者时区（RFC 2822；封面信仍为当前时间）；`libra am` 与 `git am` 均保留作者时间/偏移。AC1–AC3 由 `format_patch_test::patch_date_uses_author_time_and_zone` 覆盖（Date 行与 Git 逐字 `Thu, 7 Apr 2005 15:13:13 +0800`；两种 am 后 `%at %ai` 均为 `1112857993 2005-04-07 15:13:13 +0800`）；`format_patch_test` 157/157、`compat_format_patch_mail_roundtrip` 15/15、`compat_format_patch_flag_surface` 通过；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试；libra am 对多封 mbox 的现有多邮件解析问题不在本卡范围，测试按单封应用同一 mbox 内容。
 
 **Description:** 自 `FPG-16` 拆出的独立轴：按 #893 第 3 项把补丁 `Date:` 头改为 Git 的作者时间与作者时区（Git 以 `DATE_RFC2822` 渲染作者签名）；现行 `timestamp_from_commit` 取提交者时间并以 UTC 渲染（`src/command/format_patch.rs:828-829,1837-1840`）；`libra am` 已保留 `Date:` 的时区（`src/command/mailinfo.rs:747-759`）。夹具：两补丁系列，两个提交的作者时间均为 `2005-04-07 15:13:13 +0800`、提交者时间均为 `2006-01-02 03:04:05 +0000`（作者 ≠ 提交者、作者时区非 UTC）；AC2、AC3 对 AC1 的同一 `-2 --stdout` mbox 分别在独立的临时接收仓库中应用。
 

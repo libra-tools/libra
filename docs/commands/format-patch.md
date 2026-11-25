@@ -155,7 +155,7 @@ Each patch file is an mbox message:
 ```
 From <commit-oid> <unix-mbox-date>
 From: Author Name <email>
-Date: <RFC 2822 date>
+Date: <RFC 2822 author date with the author timezone>
 Subject: [PATCH n/m] commit subject
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

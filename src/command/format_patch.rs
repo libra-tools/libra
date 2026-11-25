@@ -917,7 +917,6 @@ async fn format_patch_body(
     let mut out = String::new();
 
     // ---- "From " mbox envelope ----
-    let ts = timestamp_from_commit(commit);
     // Git's fixed mbox separator timestamp (`builtin/log.c`).
     const MBOX_FIXED_DATE: &str = "Mon Sep 17 00:00:00 2001";
     // `--zero-commit` zeroes only this envelope hash (matching its hex length),
@@ -959,7 +958,7 @@ async fn format_patch_body(
     out.push_str(&format!("From: {header_name_enc} <{header_email}>\n"));
 
     // ---- Date: (RFC 2822) ----
-    out.push_str(&format!("Date: {}\n", ts.to_rfc2822()));
+    out.push_str(&format!("Date: {}\n", patch_date_header(commit)));
 
     // ---- Subject: ----
     let (raw_msg, _sig) = parse_commit_msg(&commit.message);
@@ -2159,9 +2158,38 @@ fn write_patch_file(
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-/// Convert a commit's committer timestamp to a `DateTime<Utc>`.
-fn timestamp_from_commit(commit: &Commit) -> DateTime<Utc> {
-    DateTime::from_timestamp(commit.committer.timestamp as i64, 0).unwrap_or(DateTime::UNIX_EPOCH)
+/// Render the patch `Date:` from the AUTHOR timestamp and timezone, like Git's
+/// `DATE_RFC2822` (the committer time is only used by the mbox envelope's fixed
+/// separator, which is not this header).
+fn patch_date_header(commit: &Commit) -> String {
+    let timestamp = commit.author.timestamp as i64;
+    let Some(utc) = DateTime::from_timestamp(timestamp, 0) else {
+        return DateTime::UNIX_EPOCH.to_rfc2822();
+    };
+    let offset_seconds = parse_signature_timezone(&commit.author.timezone).unwrap_or(0);
+    let Some(offset) = chrono::FixedOffset::east_opt(offset_seconds) else {
+        return utc.to_rfc2822();
+    };
+    utc.with_timezone(&offset)
+        .format("%a, %-d %b %Y %H:%M:%S %z")
+        .to_string()
+}
+
+fn parse_signature_timezone(timezone: &str) -> Option<i32> {
+    let bytes = timezone.as_bytes();
+    if bytes.len() != 5 || !matches!(bytes[0], b'+' | b'-') {
+        return None;
+    }
+    if !bytes[1..].iter().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let hours = i32::from(bytes[1] - b'0') * 10 + i32::from(bytes[2] - b'0');
+    let minutes = i32::from(bytes[3] - b'0') * 10 + i32::from(bytes[4] - b'0');
+    if hours > 23 || minutes > 59 {
+        return None;
+    }
+    let seconds = hours * 3600 + minutes * 60;
+    Some(if bytes[0] == b'-' { -seconds } else { seconds })
 }
 
 fn subject_prefix(args: &FormatPatchArgs) -> &str {

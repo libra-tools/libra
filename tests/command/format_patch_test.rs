@@ -5781,3 +5781,207 @@ fn commit_list_format_git_atoms() {
     assert!(stderr.contains("is not a valid format string"), "{stderr}");
     assert!(invalid.stdout.is_empty());
 }
+
+/// FPG-59: the patch `Date:` header uses the author time and timezone, and both
+/// `libra am` and `git am` preserve it (#893).
+#[test]
+fn patch_date_uses_author_time_and_zone() {
+    use std::process::Command;
+
+    let author_env = [
+        ("GIT_AUTHOR_DATE", "2005-04-07 15:13:13 +0800"),
+        ("GIT_COMMITTER_DATE", "2006-01-02 03:04:05 +0000"),
+    ];
+    let libra_repo = tempdir().expect("libra");
+    let lp = libra_repo.path();
+    assert_cli_success(&run_libra_command(&["init", "."], lp), "init");
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "user.name", "T"], lp),
+        "name",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "user.email", "t@t"], lp),
+        "email",
+    );
+    fs::write(lp.join("file"), "0\nbase\n2\n3\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "file"], lp), "add base");
+    assert_cli_success(
+        &run_libra_command_with_env(&["commit", "-m", "base", "--no-verify"], lp, &author_env),
+        "commit base",
+    );
+    for i in 1..=2 {
+        fs::write(lp.join("file"), format!("0\n{i}\n2\n3\n")).unwrap();
+        assert_cli_success(&run_libra_command(&["add", "file"], lp), "add");
+        assert_cli_success(
+            &run_libra_command_with_env(
+                &["commit", "-m", &format!("subject {i}"), "--no-verify"],
+                lp,
+                &author_env,
+            ),
+            "commit",
+        );
+    }
+    let git_repo = tempdir().expect("git");
+    let gp = git_repo.path();
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(gp)
+            .env("HOME", gp)
+            .env("GIT_AUTHOR_NAME", "T")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "T")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .env("GIT_AUTHOR_DATE", "2005-04-07 15:13:13 +0800")
+            .env("GIT_COMMITTER_DATE", "2006-01-02 03:04:05 +0000")
+            .output()
+            .expect("git");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+        out
+    };
+    git(&["init", "-q", "-b", "main", "."]);
+    git(&["config", "user.name", "T"]);
+    git(&["config", "user.email", "t@t"]);
+    fs::write(gp.join("file"), "0\nbase\n2\n3\n").unwrap();
+    git(&["add", "file"]);
+    git(&["commit", "-q", "-m", "base"]);
+    for i in 1..=2 {
+        fs::write(gp.join("file"), format!("0\n{i}\n2\n3\n")).unwrap();
+        git(&["add", "file"]);
+        git(&["commit", "-q", "-m", &format!("subject {i}")]);
+    }
+
+    let libra_mbox = run_libra_command(
+        &[
+            "format-patch",
+            "-2",
+            "--stdout",
+            "--no-thread",
+            "--no-signature",
+        ],
+        lp,
+    );
+    assert_cli_success(&libra_mbox, "libra format-patch");
+    let git_mbox = git(&[
+        "format-patch",
+        "-2",
+        "--stdout",
+        "--no-thread",
+        "--no-signature",
+    ]);
+    let dates = |bytes: &[u8]| -> Vec<String> {
+        String::from_utf8_lossy(bytes)
+            .lines()
+            .filter(|line| line.starts_with("Date: "))
+            .map(str::to_string)
+            .collect()
+    };
+    assert_eq!(
+        dates(&libra_mbox.stdout),
+        dates(&git_mbox.stdout),
+        "AC1 Date headers"
+    );
+    assert_eq!(
+        dates(&libra_mbox.stdout),
+        vec![
+            "Date: Thu, 7 Apr 2005 15:13:13 +0800".to_string(),
+            "Date: Thu, 7 Apr 2005 15:13:13 +0800".to_string(),
+        ],
+        "AC1 author date"
+    );
+
+    let mbox = String::from_utf8_lossy(&libra_mbox.stdout).to_string();
+    // AC2: libra am preserves the author timestamp and zone.
+    let recv = tempdir().expect("recv");
+    let rp = recv.path();
+    assert_cli_success(&run_libra_command(&["init", "."], rp), "recv init");
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "user.name", "R"], rp),
+        "recv name",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "user.email", "r@r"], rp),
+        "recv email",
+    );
+    fs::write(rp.join("file"), "0\nbase\n2\n3\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "file"], rp), "recv add base");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], rp),
+        "recv base commit",
+    );
+    // `libra am` consumes one mail per invocation here; the two mbox entries
+    // still carry the same Date headers and author identities.
+    let split_at = mbox.find("\nFrom ").expect("second mail");
+    let first_mail = &mbox[..split_at];
+    let second_mail = &mbox[split_at + 1..];
+    for (index, mail) in [first_mail, second_mail].iter().enumerate() {
+        let path = format!("mail{index}.mbox");
+        fs::write(rp.join(&path), mail).unwrap();
+        let am = run_libra_command(&["am", &path], rp);
+        assert_cli_success(&am, "AC2 libra am");
+    }
+    let log = run_libra_command(&["log", "-2", "--format=%at %ai"], rp);
+    assert_cli_success(&log, "AC2 log");
+    let log_text = String::from_utf8_lossy(&log.stdout).to_string();
+    let lines: Vec<&str> = log_text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    assert_eq!(lines, ["1112857993 2005-04-07 15:13:13 +0800"; 2], "AC2");
+
+    // AC3: git am preserves the same author identity.
+    let grecv = tempdir().expect("git recv");
+    let grp = grecv.path();
+    let init = Command::new("git")
+        .args(["init", "-q", "-b", "main", "."])
+        .current_dir(grp)
+        .env("HOME", grp)
+        .status()
+        .unwrap();
+    assert!(init.success());
+    for (key, value) in [("user.name", "R"), ("user.email", "r@r")] {
+        Command::new("git")
+            .args(["config", key, value])
+            .current_dir(grp)
+            .status()
+            .unwrap();
+    }
+    fs::write(grp.join("file"), "0\nbase\n2\n3\n").unwrap();
+    Command::new("git")
+        .args(["add", "file"])
+        .current_dir(grp)
+        .status()
+        .unwrap();
+    let base = Command::new("git")
+        .args(["commit", "-q", "-m", "base"])
+        .current_dir(grp)
+        .env("HOME", grp)
+        .env("GIT_AUTHOR_NAME", "R")
+        .env("GIT_AUTHOR_EMAIL", "r@r")
+        .env("GIT_COMMITTER_NAME", "R")
+        .env("GIT_COMMITTER_EMAIL", "r@r")
+        .status()
+        .unwrap();
+    assert!(base.success());
+    fs::write(grp.join("series.mbox"), &mbox).unwrap();
+    let out = Command::new("git")
+        .args(["am", "series.mbox"])
+        .current_dir(grp)
+        .env("HOME", grp)
+        .output()
+        .expect("git am");
+    assert!(out.status.success(), "AC3 git am: {out:?}");
+    let log = Command::new("git")
+        .args(["log", "-2", "--format=%at %ai"])
+        .current_dir(grp)
+        .env("HOME", grp)
+        .output()
+        .expect("git log");
+    assert!(log.status.success());
+    let log_text = String::from_utf8_lossy(&log.stdout).to_string();
+    let lines: Vec<&str> = log_text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    assert_eq!(lines, ["1112857993 2005-04-07 15:13:13 +0800"; 2], "AC3");
+}
