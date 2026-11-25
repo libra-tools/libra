@@ -46,6 +46,7 @@ Merge commits 默认跳过。当 revision range 解析为零个提交时，命�
 | `--cc <ADDRESS>` | | 添加 `Cc:` header（可重复；像 git 一样折叠） | 无 |
 | `--no-to` / `--no-cc` | | 抑制 `To:` / `Cc:` headers（Libra 没有可重置的 `format.to`/`format.cc` config） | false |
 | `--from[=<IDENT>]` | | 在 `From:` header 中使用 `<IDENT>` 而不是 commit author（裸 `--from` 使用 committer 配置身份）。当它不同于 author 时，原 author 会作为正文内 `From:` 行保留，便于 `git am` 还原 | author  `<IDENT>` 必须是合法 ident 行（`<` 与其后的 `>` 成对；`Name <>` 合法），并在 revision 解析前校验，因此空范围下 `--from=foo` 仍失败；裸 `--from` 使用执行时提交者身份（含 `GIT_COMMITTER_NAME`/`GIT_COMMITTER_EMAIL`）。 未给 CLI flag 时由 `format.from` 提供同值（`true`=提交者身份，`false`=保持作者，其它值=ident 行）。 |
+| `--no-from` | | 不改写 `From:` 头；覆盖 `format.from`。`--from` 与 `--no-from` 同时出现时以最后者为准 | 作者 |
 | `--reroll-count <N>` | `-v` | 标记为版本 `N`（把 `[PATCH]` 改为 `[PATCH vN]`） | 无 |
 | `--signoff` | `-s` | 向每个 commit message 追加 `Signed-off-by` trailer | false |
 | `--no-signoff` | | 禁用 signoff，并覆盖 `format.signOff` | false |

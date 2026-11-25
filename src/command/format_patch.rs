@@ -213,8 +213,19 @@ pub struct FormatPatchArgs {
     /// value, the committer's configured identity is used. When the identity
     /// differs from the commit author, the original author is preserved as an
     /// in-body `From:` line so `git am` can restore it.
-    #[arg(long = "from", value_name = "IDENT", num_args = 0..=1, require_equals = true)]
+    #[arg(
+        long = "from",
+        value_name = "IDENT",
+        num_args = 0..=1,
+        require_equals = true,
+        overrides_with = "no_from"
+    )]
     pub from: Option<Option<String>>,
+
+    /// Do not rewrite the `From:` header (overrides `format.from`; last of
+    /// `--from`/`--no-from` wins).
+    #[arg(long = "no-from", overrides_with = "from")]
+    pub no_from: bool,
 
     /// Mark the patch series as version N (changes `[PATCH]` to `[PATCH vN]`).
     #[arg(
@@ -539,7 +550,7 @@ pub async fn execute_safe(mut args: FormatPatchArgs, output: &OutputConfig) -> C
         );
     }
 
-    let from_from_cli = args.from.is_some();
+    let from_from_cli = args.from.is_some() || args.no_from;
     resolve_format_config(&mut args).await?;
     if !from_from_cli
         && let Some(Some(ident)) = args.from.as_ref()
@@ -2047,6 +2058,7 @@ async fn resolve_format_config(args: &mut FormatPatchArgs) -> Result<(), FormatP
     // and any other value is used as an ident line (validated after this
     // resolve pass, so a CLI override wins over an invalid config value).
     if args.from.is_none()
+        && !args.no_from
         && let Some(value) = read_format_config("format.from").await?
     {
         let trimmed = value.trim();

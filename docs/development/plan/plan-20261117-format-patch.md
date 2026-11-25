@@ -2261,7 +2261,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：新增 `--no-from`，与 `--from` 通过 clap `overrides_with` 双向最后者胜出；`--no-from` 使配置解析跳过 `format.from`，并使非法配置 ident 在命令行覆盖时不校验。AC1–AC7 由 `format_patch_test::from_and_no_from_override_config` 覆盖（`--no-from` 与 Git 黄金一致、显式 `--from` 覆盖、裸 `--from` 提交者身份、双向 last-wins、非法 `format.from` 被 `--no-from`/`--from` 覆盖后成功）；`format_patch_test` 142/142、`compat_format_patch_mail_roundtrip` 15/15；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试。
 
 **Description:** 自 `FPG-31` 拆出的独立轴：新增 `--no-from`，`--from[=<ident>]`/`--no-from` 按最后出现者生效并覆盖 `format.from`；裸 `--from` 始终使用提交者身份。 #915 Expected behavior 第 1 项与验收标准第 1 条称 `--no-from` 后 `From:` 为提交者身份；Git `from_callback` 在 `--no-from` 时清空发件人覆盖，`From:` 回到作者身份（`git show 6de20f6092:builtin/log.c` 第 1664–1677 行），t4014「--no-from overrides format.from」只断言不再是 `format.from`。本计划以上游为准（夹具中作者与提交者身份不同以区分），并在关闭 #915 时于 issue 中说明。
 

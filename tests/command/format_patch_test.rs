@@ -3696,3 +3696,158 @@ fn format_from_and_no_from() {
     assert!(stderr.contains("invalid ident line"), "{stderr}");
     assert!(out.stdout.is_empty());
 }
+
+/// FPG-46: `--no-from` suppresses config-driven rewriting; the last of
+/// `--from`/`--no-from` wins and a CLI flag skips config validation.
+#[test]
+fn from_and_no_from_override_config() {
+    use std::process::Command;
+
+    let repo = create_committed_repo_via_cli();
+    let lp = repo.path();
+    fs::write(lp.join("f.txt"), "f\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], lp), "add");
+    assert_cli_success(
+        &run_libra_command_with_env(
+            &["commit", "-m", "subject", "--no-verify"],
+            lp,
+            &[
+                ("GIT_AUTHOR_NAME", "Bob"),
+                ("GIT_AUTHOR_EMAIL", "bob@example.com"),
+                ("GIT_COMMITTER_NAME", "Bob"),
+                ("GIT_COMMITTER_EMAIL", "bob@example.com"),
+            ],
+        ),
+        "commit",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &["config", "set", "format.from", "F R Om <from@example.com>"],
+            lp,
+        ),
+        "config from",
+    );
+
+    let git_repo = tempdir().expect("git");
+    let gp = git_repo.path();
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(gp)
+            .env("GIT_AUTHOR_NAME", "Bob")
+            .env("GIT_AUTHOR_EMAIL", "bob@example.com")
+            .env("GIT_COMMITTER_NAME", "Bob")
+            .env("GIT_COMMITTER_EMAIL", "bob@example.com")
+            .env("HOME", gp)
+            .output()
+            .expect("git");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+        out
+    };
+    git(&["init", "-q", "-b", "main", "."]);
+    fs::write(gp.join("f.txt"), "f\n").unwrap();
+    git(&["add", "f.txt"]);
+    git(&["commit", "-q", "-m", "subject"]);
+    git(&["config", "format.from", "F R Om <from@example.com>"]);
+
+    let committer_env = [
+        ("GIT_COMMITTER_NAME", "C O Mitter"),
+        ("GIT_COMMITTER_EMAIL", "committer@example.com"),
+    ];
+    let from_header = |stdout: &str| -> String {
+        stdout
+            .lines()
+            .find(|line| line.starts_with("From: "))
+            .unwrap_or_default()
+            .to_string()
+    };
+    let libra = |flags: &[&str], env: &[(&str, &str)]| -> String {
+        let mut args = vec![
+            "format-patch",
+            "-1",
+            "--stdout",
+            "--no-thread",
+            "--no-signature",
+        ];
+        args.extend_from_slice(flags);
+        String::from_utf8_lossy(&run_libra_command_with_env(&args, lp, env).stdout).to_string()
+    };
+    let git_out = |flags: &[&str], env: &[(&str, &str)]| -> String {
+        let mut cmd = Command::new("git");
+        cmd.args([
+            "format-patch",
+            "-1",
+            "--stdout",
+            "--no-thread",
+            "--no-signature",
+        ])
+        .args(flags)
+        .current_dir(gp)
+        .env("HOME", gp)
+        .env("GIT_AUTHOR_NAME", "Bob")
+        .env("GIT_AUTHOR_EMAIL", "bob@example.com")
+        .env("GIT_COMMITTER_NAME", "Bob")
+        .env("GIT_COMMITTER_EMAIL", "bob@example.com");
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let out = cmd.output().expect("git");
+        assert!(out.status.success(), "git {flags:?}: {out:?}");
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+
+    // AC1: --no-from ignores format.from and matches Git.
+    assert_eq!(
+        from_header(&libra(&["--no-from"], &committer_env)),
+        from_header(&git_out(&["--no-from"], &committer_env)),
+        "AC1 no-from"
+    );
+    // AC2: an explicit --from overrides the config.
+    assert_eq!(
+        from_header(&libra(&["--from=Cli <cli@example.com>"], &committer_env)),
+        "From: Cli <cli@example.com>",
+        "AC2 cli override"
+    );
+    // AC3: bare --from uses the execution committer identity.
+    assert_eq!(
+        from_header(&libra(&["--from"], &committer_env)),
+        from_header(&git_out(&["--from"], &committer_env)),
+        "AC3 bare from"
+    );
+    // AC4/AC5: last occurrence wins.
+    assert_eq!(
+        from_header(&libra(
+            &["--no-from", "--from=Cli <cli@example.com>"],
+            &committer_env
+        )),
+        "From: Cli <cli@example.com>",
+        "AC4 no-from then from"
+    );
+    assert_eq!(
+        from_header(&libra(
+            &["--from=Cli <cli@example.com>", "--no-from"],
+            &committer_env
+        )),
+        from_header(&git_out(
+            &["--from=Cli <cli@example.com>", "--no-from"],
+            &committer_env
+        )),
+        "AC5 from then no-from"
+    );
+
+    // AC6/AC7: an invalid config value is not validated when overridden.
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "format.from", "foo"], lp),
+        "config invalid",
+    );
+    assert_eq!(
+        from_header(&libra(&["--no-from"], &committer_env)),
+        from_header(&git_out(&["--no-from"], &committer_env)),
+        "AC6 invalid config + no-from"
+    );
+    assert_eq!(
+        from_header(&libra(&["--from=Cli <cli@example.com>"], &committer_env)),
+        "From: Cli <cli@example.com>",
+        "AC7 invalid config + --from"
+    );
+}
