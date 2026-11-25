@@ -2434,21 +2434,7 @@ fn patch_slug(commit: &Commit, _args: &FormatPatchArgs) -> String {
     while out.ends_with('.') || out.ends_with('-') {
         out.pop();
     }
-    truncate_slug(&out)
-}
-
-/// Truncate a slug to at most `MAX_CHARS` characters without splitting a
-/// word segment.  Uses [`char`] iteration to stay on UTF-8 boundaries so
-/// non-ASCII subjects never panic on a mid-codepoint slice.
-fn truncate_slug(slug: &str) -> String {
-    const MAX_CHARS: usize = 52;
-    let prefix: String = slug.chars().take(MAX_CHARS).collect();
-    if prefix.len() == slug.len() {
-        return slug.to_string();
-    }
-    // Walk back from the end of `prefix` to the last `-`.
-    let end = prefix.rfind('-').unwrap_or(prefix.len());
-    prefix[..end].to_string()
+    out
 }
 
 /// Build the output file path for a single patch.
@@ -2530,7 +2516,7 @@ fn patch_filename(spec: &FilenameSpec<'_>) -> String {
         // may collapse to just the sequence number.
         let stem = match max_length {
             Some(limit) => {
-                let budget = limit.saturating_sub(suffix.len() + 1);
+                let budget = limit.saturating_sub(suffix.len() + 1 + version_prefix.len());
                 if budget < number.len() {
                     number
                 } else {
@@ -2893,6 +2879,23 @@ async fn resolve_format_config(args: &mut FormatPatchArgs) -> Result<(), FormatP
                 .await?
                 .unwrap_or_else(|| DEFAULT_SUFFIX.to_string()),
         );
+    }
+    if args.filename_max_length.is_none() {
+        args.filename_max_length = match read_format_config("format.filenameMaxLength").await? {
+            Some(value) => {
+                let trimmed = value.trim();
+                Some(
+                    trimmed
+                        .parse::<usize>()
+                        .map_err(|_| FormatPatchError::InvalidConfig {
+                            key: "format.filenameMaxLength",
+                            value,
+                            expected: "a non-negative integer",
+                        })?,
+                )
+            }
+            None => Some(64),
+        };
     }
     if !args.signoff
         && !args.no_signoff

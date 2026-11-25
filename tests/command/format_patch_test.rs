@@ -8609,3 +8609,110 @@ fn filename_git_sanitized_slug() {
         );
     }
 }
+
+/// FPG-40: `--filename-max-length`/`format.filenameMaxLength` match Git's
+/// whole-file truncation (default 64, reroll prefix included) (#910).
+#[test]
+fn filename_max_length_git_parity() {
+    use std::process::Command;
+
+    fn seed(root: &std::path::Path, libra: bool) {
+        let run = |args: &[&str]| {
+            let out = if libra {
+                run_libra_command(args, root)
+            } else {
+                Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .env("HOME", root)
+                    .output()
+                    .expect("git")
+            };
+            assert!(out.status.success(), "{args:?}: {out:?}");
+        };
+        if libra {
+            run(&["init", "."]);
+            run(&["config", "set", "user.name", "T"]);
+            run(&["config", "set", "user.email", "t@t"]);
+        } else {
+            run(&["init", "-q", "-b", "main", "."]);
+            run(&["config", "user.name", "T"]);
+            run(&["config", "user.email", "t@t"]);
+        }
+        for subject in [
+            "first",
+            "second",
+            "third",
+            "This is an excessively long subject line for a message",
+        ] {
+            fs::write(root.join("f"), format!("{subject}\n")).unwrap();
+            run(&["add", "f"]);
+            run(&["commit", "-m", subject]);
+        }
+    }
+    let fourth = |dir: &std::path::Path| -> String {
+        fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .find(|name| name.starts_with("0004-") || name.starts_with("v4-0004-"))
+            .expect("fourth file")
+    };
+
+    let libra_repo = tempdir().unwrap();
+    let lp = libra_repo.path();
+    seed(lp, true);
+    let git_repo = tempdir().unwrap();
+    let gp = git_repo.path();
+    seed(gp, false);
+
+    let run = |label: &str, flags: &[&str], dir: &str| -> String {
+        let mut args = vec!["format-patch", "-4"];
+        args.extend_from_slice(flags);
+        args.extend_from_slice(&["-o", dir, "--no-thread", "--no-signature"]);
+        let libra = run_libra_command(&args, lp);
+        assert_cli_success(&libra, label);
+        let git = Command::new("git")
+            .args(&args)
+            .current_dir(gp)
+            .env("HOME", gp)
+            .output()
+            .unwrap();
+        assert!(git.status.success(), "{label}: {git:?}");
+        fourth(&lp.join(dir))
+    };
+    let compare = |label: &str, flags: &[&str], dir: &str| -> String {
+        let name = run(label, flags, dir);
+        let mut args = vec!["format-patch", "-4"];
+        args.extend_from_slice(flags);
+        args.extend_from_slice(&["-o", dir, "--no-thread", "--no-signature"]);
+        // Re-run Git only to read its own output directory.
+        let name_git = fourth(&gp.join(dir));
+        assert_eq!(name, name_git, "{label}");
+        name
+    };
+
+    compare("AC1 100", &["--filename-max-length=100"], "o100");
+    assert_eq!(
+        run("AC2 default", &[], "odef"),
+        "0004-This-is-an-excessively-long-subject-line-for-a-messa.patch"
+    );
+    assert_eq!(
+        compare("AC3 64", &["--filename-max-length=64"], "o64"),
+        "0004-This-is-an-excessively-long-subject-line-for-a-messa.patch"
+    );
+    compare("AC4 15", &["--filename-max-length=15"], "o15");
+    compare("AC5 25", &["--filename-max-length=25"], "o25");
+    compare("AC6 35", &["--filename-max-length=35"], "o35");
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "format.filenameMaxLength", "40"], lp),
+        "config",
+    );
+    let configured = run("AC7 config", &[], "o40cfg");
+    let cli = run("AC7 cli", &["--filename-max-length=40"], "o40cli");
+    assert_eq!(configured, cli, "AC7 config vs CLI");
+    let _ = run_libra_command(&["config", "unset", "format.filenameMaxLength"], lp);
+    assert_eq!(
+        run("AC8 v4", &["-v4"], "ov4"),
+        "v4-0004-This-is-an-excessively-long-subject-line-for-a-me.patch"
+    );
+}

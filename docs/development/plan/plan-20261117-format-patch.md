@@ -4253,7 +4253,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：移除 slug 52 字符硬截断，整文件名默认 64 字节预算（含编号/slug/后缀/`vN-` 前缀）；`--filename-max-length` 与 `format.filenameMaxLength` 按 Git 截断，flag 优先。AC1–AC8 由 `format_patch_test::filename_max_length_git_parity` 覆盖（100/default/64/15/25/35 与 Git 逐字、配置 40=CLI、-v4 前缀计入预算）；`format_patch_test` 176/176、`compat_format_patch_mail_roundtrip` 15/15、`compat_format_patch_flag_surface` 通过；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试。
 
 **Description:** 自 `FPG-21` 拆出的独立轴：移除 `truncate_slug` 的 52 字符硬编码截断，使默认上限（Git 64）、显式 `--filename-max-length` 与 `format.filenameMaxLength` 按 Git 规则截断整个文件名。
 
