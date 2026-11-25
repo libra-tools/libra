@@ -45,6 +45,7 @@ fn format_patch_help_lists_expected_flags() {
         "--start-number",
         "--subject-prefix",
         "--cover-letter",
+        "--cover-from-description",
         "--thread",
         "--no-thread",
         "--in-reply-to",

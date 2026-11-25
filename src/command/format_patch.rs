@@ -183,6 +183,10 @@ pub struct FormatPatchArgs {
     #[arg(long = "no-cover-letter", overrides_with = "cover_letter")]
     pub no_cover_letter: bool,
 
+    /// Cover-letter description mode: default, none, message, subject, or auto.
+    #[arg(long = "cover-from-description", value_name = "MODE")]
+    pub cover_from_description: Option<String>,
+
     /// Thread the series: bare `--thread` (or `--thread=shallow`) makes every
     /// patch a reply to the cover letter/first patch; `--thread=deep` chains
     /// each patch as a reply to its predecessor.
@@ -516,6 +520,15 @@ pub async fn execute(args: FormatPatchArgs) {
 
 /// Reject CLI-only conflicts before repository preflight can write repair state.
 pub(crate) fn validate_cli_args(args: &FormatPatchArgs) -> CliResult<()> {
+    if let Some(mode) = args.cover_from_description.as_deref()
+        && !matches!(mode, "default" | "none" | "message" | "subject" | "auto")
+    {
+        return Err(
+            CliError::failure(format!("invalid cover from description mode '{mode}'"))
+                .with_stable_code(StableErrorCode::CliInvalidArguments),
+        );
+    }
+
     // Check CLI-only conflicts before config fills subject_prefix. A configured
     // prefix is harmless under -k; an explicit (even empty) CLI prefix is not.
     if args.keep_subject {
@@ -678,6 +691,7 @@ pub async fn execute_safe(mut args: FormatPatchArgs, output: &OutputConfig) -> C
     if args.cover_letter {
         let series_stat = cover_letter_series_stat(&args, &commits).await?;
         let description = cover_letter_description(&args).await?;
+        let description_mode = args.cover_from_description.as_deref().unwrap_or("default");
         // Git's cover letter defaults `From:` to the execution-time committer
         // identity when no `--from`/`format.from` overrides it; patches keep
         // their author.
@@ -697,6 +711,7 @@ pub async fn execute_safe(mut args: FormatPatchArgs, output: &OutputConfig) -> C
             cover_from,
             base_block.as_deref(),
             series_stat.as_deref(),
+            description_mode,
             description.as_deref(),
         )?;
         rendered.push(RenderedPatch {
@@ -1846,8 +1861,44 @@ async fn cover_letter_description(args: &FormatPatchArgs) -> Result<Option<Strin
     }
 }
 
+/// Split a branch description into Git's cover `Subject:` text and remaining
+/// body according to `--cover-from-description`.
+fn cover_text(mode: &str, description: Option<&str>) -> (String, String) {
+    const SUBJECT: &str = "*** SUBJECT HERE ***";
+    const BLURB: &str = "*** BLURB HERE ***";
+    let Some(description) = description.filter(|text| !text.trim().is_empty()) else {
+        return (SUBJECT.to_string(), BLURB.to_string());
+    };
+    let formatted_subject = description
+        .split_once("\n\n")
+        .map_or(description, |(first, _)| first)
+        .lines()
+        .map(str::trim)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let subject_mode = match mode {
+        "subject" => true,
+        // Git compares the formatted subject's byte length to 100 and uses
+        // `subject` only when it does not exceed the limit.
+        "auto" => formatted_subject.len() <= 100,
+        _ => false,
+    };
+    if subject_mode {
+        let remainder = description
+            .split_once("\n\n")
+            .map(|(_, rest)| rest.trim_start_matches('\n').trim_end().to_string())
+            .unwrap_or_default();
+        (formatted_subject, remainder)
+    } else if mode == "none" {
+        (SUBJECT.to_string(), BLURB.to_string())
+    } else {
+        (SUBJECT.to_string(), description.trim_end().to_string())
+    }
+}
+
 /// Generate a cover-letter template (named `0000-cover-letter<suffix>`, or `0`
 /// under `--numbered-files`).
+#[allow(clippy::too_many_arguments)]
 fn format_cover_letter(
     args: &FormatPatchArgs,
     commits: &[Commit],
@@ -1855,6 +1906,7 @@ fn format_cover_letter(
     from_identity: Option<&(String, String)>,
     base_block: Option<&str>,
     series_stat: Option<&str>,
+    description_mode: &str,
     description: Option<&str>,
 ) -> Result<String, CliError> {
     let now = Utc::now();
@@ -1912,9 +1964,8 @@ fn format_cover_letter(
         let width = subject_counter_width(displayed_total);
         format!(" {:0width$}/{displayed_total}", 0)
     };
-    out.push_str(&format!(
-        "Subject: [{prefix}{counter}] *** SUBJECT HERE ***\n"
-    ));
+    let (subject_text, body_text) = cover_text(description_mode, description);
+    out.push_str(&format!("Subject: [{prefix}{counter}] {subject_text}\n"));
     // Git's `make_cover_letter` emits MIME headers only when any commit's raw
     // object buffer (headers + message) contains non-ASCII bytes.
     if commits.iter().any(|commit| {
@@ -1933,7 +1984,7 @@ fn format_cover_letter(
     // Git's `prepare_cover_text` writes the subject placeholder only into the
     // `Subject:` header; the body starts with the branch description when one
     // is configured, otherwise the blurb placeholder.
-    out.push_str(description.unwrap_or("*** BLURB HERE ***"));
+    out.push_str(&body_text);
     out.push_str("\n\n");
 
     // Commit list. Git's default is a shortlog grouped by author

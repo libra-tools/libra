@@ -51,6 +51,7 @@ body, and series metadata.
 | `--no-base` | | Do not emit the `base-commit:` trailer, overriding `--base` (Libra has no `format.useAutoBase` config to reset) | off |
 | `--start-number <N>` | | Start numbering at `N` | 1 |
 | `--subject-prefix <PREFIX>` | | Use `PREFIX` instead of `PATCH` in the Subject: line | `PATCH` |
+| `--cover-from-description <MODE>` | | How `branch.<name>.description` feeds the cover letter: `default`/`message` put the whole description in the body, `subject` puts the first paragraph (joined with spaces) in `Subject:` and the rest in the body, `none` keeps the placeholders, and `auto` uses subject mode only when the formatted first paragraph is at most 100 bytes. An invalid mode is rejected even without `--cover-letter` | `default` |
 | `--cover-letter` | | Generate a cover-letter template (`0000-cover-letter<suffix>`, or `0` under `--numbered-files`). Overrides `format.coverLetter=false` | false |
 | `--no-cover-letter` | | Do not generate a cover letter; overrides `format.coverLetter` and the implicit cover letter requested by `--commit-list-format` (last of `--cover-letter`/`--no-cover-letter` wins) | — |
 | `--thread[=<STYLE>]` | | Add generated `Message-ID`/`In-Reply-To`/`References` headers (default off). Bare `--thread` or `--thread=shallow` makes every patch reply to the cover letter/first patch; `--thread=deep` chains each patch as a reply to its predecessor, with `References` pointing at the thread root | false |

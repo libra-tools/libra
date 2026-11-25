@@ -3435,7 +3435,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：新增 `--cover-from-description` 五模式（空格/= 均可）：default/message 全描述入正文、none 占位符、subject 首段入标题余段入正文、auto 仅格式化首段 ≤100 字节用 subject；非法值无论是否启用封面信均 `invalid cover from description mode` + `LBR-CLI-002`。AC1–AC8 由 `format_patch_test::cover_from_description` 覆盖（Git 三模式逐字、default=message、空格形式、100/120 字节边界、无封面非法值）；`format_patch_test` 165/165、`compat_format_patch_mail_roundtrip` 15/15、`compat_format_patch_flag_surface` 通过（含新 flag 必列）；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试；`format.coverFromDescription` 由 `FPG-33` 承接。
 
 **Description:** 自 `FPG-13` 拆出的独立轴：新增 `--cover-from-description=<mode>`（仅接受 `default`/`none`/`message`/`subject`/`auto`），按模式决定分支描述写入封面信标题还是正文；非法 CLI 值不论是否启用封面信均拒绝并报 `invalid cover from description mode`（`LBR-CLI-002`；由本卡的模式校验产生，不得在 clap 取值枚举阶段拒绝；Git `fatal:`/128 的差异见 `DEFER-FPG-04`）。`format.coverFromDescription` 由自本卡拆出的 `FPG-33` 承接。
 

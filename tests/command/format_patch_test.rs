@@ -7239,3 +7239,174 @@ fn cover_letter_default_from_identity() {
         "AC2 config identity"
     );
 }
+
+/// FPG-25: `--cover-from-description` modes and CLI validation (#906).
+#[test]
+fn cover_from_description() {
+    use std::process::Command;
+
+    fn seed(root: &std::path::Path, libra: bool, description: &str) {
+        let run = |args: &[&str]| {
+            let out = if libra {
+                run_libra_command(args, root)
+            } else {
+                Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .env("HOME", root)
+                    .output()
+                    .expect("git")
+            };
+            assert!(out.status.success(), "{args:?}: {out:?}");
+        };
+        if libra {
+            run(&["init", "."]);
+            run(&["config", "set", "user.name", "T"]);
+            run(&["config", "set", "user.email", "t@t"]);
+        } else {
+            run(&["init", "-q", "-b", "main", "."]);
+            run(&["config", "user.name", "T"]);
+            run(&["config", "user.email", "t@t"]);
+        }
+        for i in 1..=3 {
+            fs::write(root.join(format!("f{i}")), format!("x{i}\n")).unwrap();
+            run(&["add", &format!("f{i}")]);
+            run(&["commit", "-m", &format!("subject {i}")]);
+        }
+        if libra {
+            let _ = run_libra_command(
+                &["config", "set", "branch.main.description", description],
+                root,
+            );
+        } else {
+            let _ = Command::new("git")
+                .args(["config", "branch.main.description", description])
+                .current_dir(root)
+                .status();
+        }
+    }
+    let segment = |stdout: &[u8]| -> String {
+        let text = String::from_utf8_lossy(stdout).to_string();
+        let cover = text
+            .split_once("\nFrom ")
+            .map(|(cover, _)| cover)
+            .unwrap_or(&text);
+        let start = cover.find("Subject:").expect("subject");
+        let tail = &cover[start..];
+        let end = tail
+            .find("\nT (")
+            .or_else(|| tail.find("\n\nT ("))
+            .unwrap_or(tail.len());
+        tail[..end].trim_end().to_string()
+    };
+
+    let desc = "First line one\nfirst line two\n\nSecond paragraph\nmore second\n\nThird";
+    let libra_repo = tempdir().expect("libra");
+    let lp = libra_repo.path();
+    seed(lp, true, desc);
+    let git_repo = tempdir().expect("git");
+    let gp = git_repo.path();
+    seed(gp, false, desc);
+
+    let libra_run = |flags: &[&str]| -> String {
+        let mut args = vec!["format-patch"];
+        args.extend_from_slice(flags);
+        args.extend_from_slice(&[
+            "--cover-letter",
+            "-2",
+            "--stdout",
+            "--no-thread",
+            "--no-signature",
+        ]);
+        let out = run_libra_command(&args, lp);
+        assert_cli_success(&out, "libra");
+        segment(&out.stdout)
+    };
+    let git_run = |flags: &[&str]| -> String {
+        let mut cmd = Command::new("git");
+        cmd.args(["format-patch"])
+            .args(flags)
+            .args([
+                "--cover-letter",
+                "-2",
+                "--stdout",
+                "--no-thread",
+                "--no-signature",
+            ])
+            .current_dir(gp)
+            .env("HOME", gp);
+        let out = cmd.output().expect("git");
+        assert!(out.status.success(), "{flags:?}: {out:?}");
+        segment(&out.stdout)
+    };
+
+    assert_eq!(
+        libra_run(&["--cover-from-description=none"]),
+        git_run(&["--cover-from-description=none"]),
+        "AC1 none"
+    );
+    let message = libra_run(&["--cover-from-description=message"]);
+    assert_eq!(
+        message,
+        git_run(&["--cover-from-description=message"]),
+        "AC2 message"
+    );
+    assert_eq!(
+        libra_run(&["--cover-from-description=default"]),
+        message,
+        "AC3 default"
+    );
+    let subject = libra_run(&["--cover-from-description=subject"]);
+    assert_eq!(
+        subject,
+        git_run(&["--cover-from-description=subject"]),
+        "AC4 subject"
+    );
+    assert_eq!(
+        libra_run(&["--cover-from-description", "subject"]),
+        subject,
+        "AC7 space form"
+    );
+
+    // AC5: exactly 100 bytes stays in subject mode.
+    let set_libra_desc = |text: &str| {
+        assert_cli_success(
+            &run_libra_command(&["config", "set", "branch.main.description", text], lp),
+            "set desc",
+        );
+    };
+    set_libra_desc(&"a".repeat(100));
+    assert_eq!(
+        libra_run(&["--cover-from-description=auto"]),
+        libra_run(&["--cover-from-description=subject"]),
+        "AC5 auto boundary"
+    );
+    // AC6: 60 non-ASCII chars are 120 bytes, so auto falls back to message.
+    let wide = "é".repeat(60);
+    set_libra_desc(&wide);
+    assert_eq!(
+        libra_run(&["--cover-from-description=auto"]),
+        libra_run(&["--cover-from-description=message"]),
+        "AC6 byte boundary"
+    );
+
+    // AC8: an invalid mode is rejected even without a cover letter.
+    let invalid = run_libra_command(
+        &[
+            "format-patch",
+            "--cover-from-description",
+            "garbage",
+            "-1",
+            "--stdout",
+        ],
+        lp,
+    );
+    assert!(!invalid.status.success(), "AC8");
+    let stderr = String::from_utf8_lossy(&invalid.stderr);
+    assert!(stderr.lines().any(|line| line == "Error-Code: LBR-CLI-002"));
+    assert!(
+        stderr.contains("invalid cover from description mode"),
+        "{stderr}"
+    );
+    assert!(invalid.stdout.is_empty());
+}
