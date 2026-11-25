@@ -3078,7 +3078,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：base 区块只放在第一封邮件——有封面信在封面信、否则第一封补丁（Git `print_bases` 只输出一次），不再放最后一封。AC1/AC2 由 `format_patch_test::base_block_rides_on_first_mail` 覆盖（无封面首补丁含 base-commit+prerequisite、次补丁为空；封面含区块且两补丁为空；逐封与 Git 黄金比较，独立夹具 OID 归一化）；`format_patch_test` 158/158、`compat_format_patch_mail_roundtrip` 15/15、`compat_format_patch_flag_surface` 通过；EN/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试；`--base=auto` 由 `FPG-17` 承接。
 
 **Description:** 自 `FPG-17` 拆出的独立轴（先于 `FPG-17` 执行，`--base=auto` 直接继承该位置）：按 Git 把 base 区块（`base-commit:` 与 `prerequisite-patch-id:`）只放在第一封邮件——有封面信时在封面信，否则在第一封补丁（`git show 6de20f6092:builtin/log.c` 第 1894–1913、2534 行 `print_bases` 只输出一次）；现行无封面信时放在最后一封补丁（`src/command/format_patch.rs:532-533,569-574`）。既有显式 `--base` 用例均为单补丁，不受影响（#894 第 4 项）。
 

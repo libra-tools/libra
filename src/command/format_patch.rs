@@ -692,7 +692,9 @@ pub async fn execute_safe(mut args: FormatPatchArgs, output: &OutputConfig) -> C
     for (idx, commit) in commits.iter().enumerate() {
         let patch_num = start_num + idx;
         // Without a cover letter, the base trailer rides on the last patch.
-        let patch_base_block = if !args.cover_letter && idx == total - 1 {
+        // Git's `print_bases` emits the base block once, on the first mail
+        // (the first patch when there is no cover letter).
+        let patch_base_block = if !args.cover_letter && idx == 0 {
             base_block.as_deref()
         } else {
             None

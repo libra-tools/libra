@@ -5985,3 +5985,123 @@ fn patch_date_uses_author_time_and_zone() {
         .collect();
     assert_eq!(lines, ["1112857993 2005-04-07 15:13:13 +0800"; 2], "AC3");
 }
+
+/// FPG-64: the base block rides on the first mail (cover letter or first patch)
+/// exactly once (#894).
+#[test]
+fn base_block_rides_on_first_mail() {
+    use std::process::Command;
+
+    fn seed(root: &std::path::Path, libra: bool) {
+        let run = |args: &[&str]| {
+            let out = if libra {
+                run_libra_command(args, root)
+            } else {
+                Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .env("HOME", root)
+                    .output()
+                    .expect("git")
+            };
+            assert!(out.status.success(), "{args:?}: {out:?}");
+        };
+        if libra {
+            run(&["init", "."]);
+            run(&["config", "set", "user.name", "T"]);
+            run(&["config", "set", "user.email", "t@t"]);
+        } else {
+            run(&["init", "-q", "-b", "main", "."]);
+            run(&["config", "user.name", "T"]);
+            run(&["config", "user.email", "t@t"]);
+        }
+        for i in 1..=5 {
+            fs::write(root.join(format!("f{i}")), format!("x{i}\n")).unwrap();
+            run(&["add", &format!("f{i}")]);
+            if libra {
+                let out = run_libra_command_with_env(
+                    &["commit", "-m", &format!("subject {i}")],
+                    root,
+                    &[
+                        ("GIT_AUTHOR_DATE", "2005-04-07 15:13:13 +0800"),
+                        ("GIT_COMMITTER_DATE", "2005-04-07 15:13:13 +0800"),
+                    ],
+                );
+                assert!(out.status.success(), "{out:?}");
+            } else {
+                let out = Command::new("git")
+                    .args(["commit", "-m", &format!("subject {i}")])
+                    .current_dir(root)
+                    .env("HOME", root)
+                    .env("GIT_AUTHOR_DATE", "2005-04-07 15:13:13 +0800")
+                    .env("GIT_COMMITTER_DATE", "2005-04-07 15:13:13 +0800")
+                    .output()
+                    .expect("git");
+                assert!(out.status.success(), "{out:?}");
+            }
+        }
+    }
+    let mail_blocks = |stdout: &[u8]| -> Vec<Vec<String>> {
+        let text = format!("\n{}", String::from_utf8_lossy(stdout));
+        text.split("\nFrom ")
+            .skip(1)
+            .map(|segment| {
+                segment
+                    .lines()
+                    .filter(|line| {
+                        line.starts_with("base-commit:")
+                            || line.starts_with("prerequisite-patch-id:")
+                    })
+                    // The fixtures are independent repositories, so compare the
+                    // base line's placement/kind rather than its object id.
+                    .map(|line| {
+                        if line.starts_with("base-commit:") {
+                            "base-commit: <oid>".to_string()
+                        } else {
+                            line.to_string()
+                        }
+                    })
+                    .collect()
+            })
+            .collect()
+    };
+
+    let libra_repo = tempdir().expect("libra");
+    let lp = libra_repo.path();
+    seed(lp, true);
+    let git_repo = tempdir().expect("git");
+    let gp = git_repo.path();
+    seed(gp, false);
+
+    let compare = |label: &str, extra: &[&str]| {
+        let mut args = vec!["format-patch", "--base=HEAD~3", "-2"];
+        args.extend_from_slice(extra);
+        args.extend_from_slice(&["--stdout", "--no-thread", "--no-signature"]);
+        let libra = run_libra_command(&args, lp);
+        assert_cli_success(&libra, label);
+        let git = Command::new("git")
+            .args(&args)
+            .current_dir(gp)
+            .env("HOME", gp)
+            .output()
+            .expect("git");
+        assert!(git.status.success(), "{label}: {git:?}");
+        assert_eq!(
+            mail_blocks(&libra.stdout),
+            mail_blocks(&git.stdout),
+            "{label}"
+        );
+        mail_blocks(&libra.stdout)
+    };
+
+    // AC1: without a cover the first patch carries the block.
+    let blocks = compare("AC1", &[]);
+    assert_eq!(blocks.len(), 2);
+    assert!(!blocks[0].is_empty(), "AC1 first patch has base block");
+    assert!(blocks[1].is_empty(), "AC1 second patch has none");
+    // AC2: with a cover the cover letter carries it and patches are empty.
+    let blocks = compare("AC2", &["--cover-letter"]);
+    assert_eq!(blocks.len(), 3);
+    assert!(!blocks[0].is_empty(), "AC2 cover has base block");
+    assert!(blocks[1].is_empty() && blocks[2].is_empty(), "AC2 patches");
+}
