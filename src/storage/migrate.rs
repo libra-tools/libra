@@ -113,7 +113,7 @@ use crate::{
             canonical_capture_redb_rel_path, canonical_git_redb_rel_path, format_generation_id,
             read_storage_manifest,
         },
-        meta::{begin_checked_read, init_meta_schema},
+        meta::{begin_checked_read, begin_checked_write_blocking, init_meta_schema},
         opener::{begin_write_bounded_blocking, open_redb_read_only},
         queue::{
             CAPTURE_QUEUE_PAYLOAD_SCHEMA_VERSION, CAPTURE_QUEUE_SUBDIR,
@@ -40936,6 +40936,1368 @@ async fn resume_forward_migration_inner(
     })
 }
 
+// ============================================================================
+// RB-11: Reverse Migration Phase 1 Redb Writer Quiescence & Global Lock Order
+// ============================================================================
+
+/// Sanitized stage identifier for symmetric reverse migration (`redb -> SQLite`)
+/// Phase 1 quiescence (`ADR-RB-07` #2, `RB-11`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReversePhase1QuiesceStage {
+    /// Repository storage root validation (`<common_storage>`).
+    StorageRoot,
+    /// Finalized Redb `storage-format.json` manifest validation.
+    StorageManifest,
+    /// Exclusive advisory lock on `<common_storage>/migration.lock`.
+    MigrationLock,
+    /// Exclusive advisory lock on `<common_storage>/maintenance.lock`.
+    MaintenanceLock,
+    /// Exclusive advisory lock on `<common_storage>/private/capture-spool-consumer.lock`.
+    CaptureSpoolConsumerLock,
+    /// Exclusive advisory lock on `<common_storage>/private/capture-queue/writer.lock`.
+    CaptureQueueWriterLock,
+    /// In-place exclusive advisory lock on `<common_storage>/private/capture-queue/append.lock`.
+    CaptureQueueAppendLock,
+    /// In-place exclusive advisory lock on `<common_storage>/private/capture-spool/capacity.lock`.
+    CaptureSpoolCapacityLock,
+    /// Exclusive uncommitted redb `WriteTransaction` on `redb/git.gen-<id>.redb`.
+    GitRedbWriteTransaction,
+    /// Exclusive uncommitted redb `WriteTransaction` on `private/capture.gen-<id>.redb`.
+    CaptureRedbWriteTransaction,
+}
+
+impl ReversePhase1QuiesceStage {
+    /// Human-readable sanitized stage label (zero private paths).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::StorageRoot => "storage root validation",
+            Self::StorageManifest => "storage-format.json manifest validation",
+            Self::MigrationLock => "migration.lock",
+            Self::MaintenanceLock => "maintenance.lock",
+            Self::CaptureSpoolConsumerLock => "capture-spool-consumer.lock",
+            Self::CaptureQueueWriterLock => "capture-queue/writer.lock",
+            Self::CaptureQueueAppendLock => "capture-queue/append.lock",
+            Self::CaptureSpoolCapacityLock => "capture-spool/capacity.lock",
+            Self::GitRedbWriteTransaction => "git.redb WriteTransaction",
+            Self::CaptureRedbWriteTransaction => "capture.redb WriteTransaction",
+        }
+    }
+}
+
+/// Exclusive non-redb advisory locks held across reverse migration Phase 1 and
+/// Phase 2 (`ADR-RB-07` #2, `RB-11`).
+///
+/// Fields are declared in **strict reverse acquisition order** so dropping the
+/// struct always releases inner locks before outer locks:
+/// `capacity.lock -> append.lock -> writer.lock -> capture-spool-consumer.lock -> maintenance.lock -> migration.lock`.
+#[derive(Debug)]
+pub struct ReversePhase1Locks {
+    _spool_capacity_lock: File,
+    _queue_append_lock: File,
+    _queue_writer_lock: File,
+    _spool_consumer_lock: File,
+    _maintenance_lock: File,
+    _migration_lock: File,
+}
+
+/// Quiesced source `redb` databases (`git.gen-<id>.redb` and
+/// `capture.gen-<id>.redb`) holding live uncommitted `WriteTransaction`s
+/// acquired in strict `Git -> Capture` order (`ADR-RB-07` #2, `RB-11`).
+///
+/// Field declaration order guarantees `capture_wtx` drops before `git_wtx`, and
+/// both transactions drop before their backing `RedbDatabase` handles, ensuring
+/// zero committed mutations if Phase 1 aborts.
+pub struct QuiescedRepositoryRedbSources {
+    generation: u64,
+    git_redb_path: PathBuf,
+    capture_redb_path: PathBuf,
+    capture_wtx: redb::WriteTransaction,
+    git_wtx: redb::WriteTransaction,
+    capture_db: RedbDatabase,
+    git_db: RedbDatabase,
+    #[cfg(any(unix, windows))]
+    #[allow(dead_code)] // Used by `RB-11d` Phase 2 fence commit transition.
+    capture_backend_ctrl: std::sync::Arc<ReverseNonBlockingFileBackendInner>,
+    #[cfg(any(unix, windows))]
+    #[allow(dead_code)] // Used by `RB-11d` Phase 2 fence commit transition.
+    git_backend_ctrl: std::sync::Arc<ReverseNonBlockingFileBackendInner>,
+}
+
+impl std::fmt::Debug for QuiescedRepositoryRedbSources {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QuiescedRepositoryRedbSources")
+            .field("generation", &self.generation)
+            .field("git_redb_path", &self.git_redb_path)
+            .field("capture_redb_path", &self.capture_redb_path)
+            .finish_non_exhaustive()
+    }
+}
+
+impl QuiescedRepositoryRedbSources {
+    /// Active source redb generation read from `storage-format.json`.
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Canonical source `git.gen-<id>.redb` path.
+    #[must_use]
+    pub fn git_redb_path(&self) -> &Path {
+        &self.git_redb_path
+    }
+
+    /// Canonical source `capture.gen-<id>.redb` path.
+    #[must_use]
+    pub fn capture_redb_path(&self) -> &Path {
+        &self.capture_redb_path
+    }
+
+    /// Borrow the held uncommitted `git.redb` write transaction (strictly
+    /// read-only during Phase 1; NEVER committed in Phase 1).
+    #[must_use]
+    pub fn git_wtx(&self) -> &redb::WriteTransaction {
+        &self.git_wtx
+    }
+
+    /// Borrow the held uncommitted `capture.redb` write transaction (strictly
+    /// read-only during Phase 1; NEVER committed in Phase 1).
+    #[must_use]
+    pub fn capture_wtx(&self) -> &redb::WriteTransaction {
+        &self.capture_wtx
+    }
+
+    /// Explicitly abort both uncommitted write transactions in strict reverse
+    /// order (`capture_wtx` then `git_wtx`) and close both database handles
+    /// without modifying a single byte of either source `.redb` file.
+    pub fn abort_and_close(self) -> StorageResult<()> {
+        let Self {
+            capture_wtx,
+            git_wtx,
+            capture_db,
+            git_db,
+            ..
+        } = self;
+        let cap_abort = capture_wtx
+            .abort()
+            .map_err(|err| StorageBackendError::BackendInternal {
+                detail: format!("reverse migration failed aborting capture.redb write tx: {err}"),
+            });
+        let git_abort = git_wtx
+            .abort()
+            .map_err(|err| StorageBackendError::BackendInternal {
+                detail: format!("reverse migration failed aborting git.redb write tx: {err}"),
+            });
+        drop(capture_db);
+        drop(git_db);
+        cap_abort?;
+        git_abort?;
+        Ok(())
+    }
+}
+
+/// Full Phase 1 reverse migration quiescence guard holding all 6 non-redb
+/// advisory locks in strict `ADR-RB-07` #2 order plus live uncommitted
+/// `(git_wtx, cap_wtx)` write transactions on the finalized source redb stores
+/// (`RB-11`).
+///
+/// Dropping or calling [`Self::abort_and_release`] always aborts `(cap_wtx, git_wtx)`
+/// and closes both `RedbDatabase` handles BEFORE releasing `ReversePhase1Locks`.
+#[derive(Debug)]
+pub struct ReversePhase1QuiesceGuard {
+    /// Quiesced source `git.redb` and `capture.redb` write transactions.
+    /// Kept private so callers cannot move `redb` out and drop `locks` while
+    /// `(git_wtx, cap_wtx)` remain live (`ADR-RB-07` #2, `RB-11` AC5).
+    redb: QuiescedRepositoryRedbSources,
+    /// Held non-redb exclusive advisory locks (dropped AFTER `redb` closes).
+    locks: ReversePhase1Locks,
+}
+
+impl ReversePhase1QuiesceGuard {
+    /// Borrow the quiesced source redb handles and uncommitted write
+    /// transactions for the lifetime of this guard.
+    #[must_use]
+    pub fn redb(&self) -> &QuiescedRepositoryRedbSources {
+        &self.redb
+    }
+
+    /// Abort both uncommitted redb write transactions, close both redb handles,
+    /// and release all 6 advisory locks in strict reverse acquisition order.
+    pub fn abort_and_release(self) -> StorageResult<()> {
+        let Self { redb, locks } = self;
+        let res = redb.abort_and_close();
+        drop(locks);
+        res
+    }
+}
+
+#[cfg(test)]
+trait ReversePhase1LockObserver {
+    fn on_stage_acquired(&mut self, stage: ReversePhase1QuiesceStage);
+    /// Deterministic test hook invoked after `git.redb` opens and drops its
+    /// open-time `WRITER_BYTE`, immediately before `git_wtx` is acquired.
+    fn on_after_git_db_open_before_git_wtx(&mut self) {}
+}
+
+#[cfg(unix)]
+type ReverseRedbFileIdentity = (u64, u64);
+
+#[cfg(windows)]
+type ReverseRedbFileIdentity = win_tmp_guard::WinFileId;
+
+#[cfg(all(not(unix), not(windows)))]
+type ReverseRedbFileIdentity = ();
+
+/// `redb 5.0` multi-process byte-range lock offset for the exclusive writer
+/// lock (`LOCK_BASE = 1 << 62`, held across every `MultiWriter` `WriteTransaction`
+/// and during `Database::new` header/repair opens; `redb-5.0.0/src/db.rs:190`).
+#[cfg(any(unix, windows))]
+const REDB_WRITER_LOCK_BYTE: u64 = 1u64 << 62;
+
+/// Upper bound on brief retry for sub-millisecond header-lock (`0..512`)
+/// contention against concurrent read-only header reads during reverse Phase 1.
+#[cfg(any(unix, windows))]
+const REDB_HEADER_LOCK_RETRY_BUDGET: Duration = Duration::from_millis(20);
+
+/// Page granularity for the Phase 1 in-memory copy-on-write overlay that keeps
+/// source `git.redb` and `capture.redb` 100% byte-for-byte untouched on disk
+/// throughout reverse migration Phase 1 (`RB-11`, `RB-11p`).
+#[cfg(any(unix, windows))]
+const REVERSE_PHASE1_COW_PAGE_SIZE: usize = 4096;
+
+/// Hard cap on Phase 1 in-memory CoW overlay size (`4 MiB`). Normal Phase 1
+/// open/abort touches only ~8–16 KiB (header + abort metadata).
+#[cfg(any(unix, windows))]
+const REVERSE_PHASE1_COW_MAX_PAGES: usize = 1024;
+
+#[cfg(any(unix, windows))]
+#[derive(Debug, Default)]
+struct ReversePhase1OverlayState {
+    allow_disk_writes: bool,
+    virtual_len: Option<u64>,
+    dirty_pages: BTreeMap<u64, [u8; REVERSE_PHASE1_COW_PAGE_SIZE]>,
+}
+
+#[cfg(any(unix, windows))]
+#[derive(Debug)]
+struct ReverseNonBlockingFileBackendInner {
+    backend: FileBackend,
+    overlay: std::sync::Mutex<ReversePhase1OverlayState>,
+}
+
+#[cfg(any(unix, windows))]
+impl ReverseNonBlockingFileBackendInner {
+    fn new(file: File) -> Self {
+        Self {
+            backend: FileBackend::new(file),
+            overlay: std::sync::Mutex::new(ReversePhase1OverlayState::default()),
+        }
+    }
+
+    fn lock_overlay(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, ReversePhase1OverlayState>, BackendError> {
+        self.overlay.lock().map_err(|_| {
+            BackendError::Io(io::Error::other(
+                "reverse migration Phase 1 redb CoW overlay lock poisoned",
+            ))
+        })
+    }
+
+    /// Flush buffered Phase 1 header writes to disk and enable direct disk
+    /// writes for Phase 2 (`META_SCHEMA u32::MAX` fencing in `RB-11d`).
+    #[allow(dead_code)]
+    fn enable_phase2_writes_and_flush(&self) -> StorageResult<()> {
+        let mut state =
+            self.lock_overlay()
+                .map_err(|err| StorageBackendError::BackendInternal {
+                    detail: format!("reverse migration Phase 2 failed locking overlay: {err}"),
+                })?;
+        if state.allow_disk_writes {
+            return Ok(());
+        }
+        let disk_len = self
+            .backend
+            .len()
+            .map_err(|err| StorageBackendError::BackendInternal {
+                detail: format!("reverse migration Phase 2 failed reading redb length: {err}"),
+            })?;
+        if let Some(vlen) = state.virtual_len
+            && vlen != disk_len
+        {
+            self.backend
+                .set_len(vlen)
+                .map_err(|err| StorageBackendError::BackendInternal {
+                    detail: format!(
+                        "reverse migration Phase 2 failed setting redb length before fence: {err}"
+                    ),
+                })?;
+        }
+        let target_len = state.virtual_len.unwrap_or(disk_len);
+        let page_sz = REVERSE_PHASE1_COW_PAGE_SIZE as u64;
+        for (&page_idx, page) in &state.dirty_pages {
+            let base = page_idx.saturating_mul(page_sz);
+            if base < target_len {
+                let write_len = ((target_len - base).min(page_sz)) as usize;
+                self.backend
+                    .write(base, &page[..write_len])
+                    .map_err(|err| StorageBackendError::BackendInternal {
+                        detail: format!(
+                            "reverse migration Phase 2 failed flushing redb overlay page: {err}"
+                        ),
+                    })?;
+            }
+        }
+        self.backend
+            .sync_data()
+            .map_err(|err| StorageBackendError::BackendInternal {
+                detail: format!(
+                    "reverse migration Phase 2 failed syncing flushed redb overlay: {err}"
+                ),
+            })?;
+        state.dirty_pages.clear();
+        state.virtual_len = None;
+        state.allow_disk_writes = true;
+        Ok(())
+    }
+}
+
+/// Non-blocking, Phase-1 zero-disk-write `StorageBackend` wrapper over
+/// `redb::backends::FileBackend` for reverse migration (`RB-11`, `RB-11p`).
+///
+/// 1. `redb 5.0` `MultiWriter` `Database::new()` calls the blocking
+///    `StorageBackend::lock_range(WRITER_BYTE)` during open. Delegating
+///    `lock_range` / `lock_shared_range` through `try_lock_range` /
+///    `try_lock_shared_range` guarantees that an active external `git.redb` or
+///    `capture.redb` writer fails closed immediately (`WouldBlock` -> `LBR-IO-001`)
+///    with zero blocking and zero disk writes, while tolerating transient
+///    microsecond header-lock reads (`start < REDB_WRITER_LOCK_BYTE`) within
+///    [`REDB_HEADER_LOCK_RETRY_BUDGET`].
+/// 2. `redb 5.0` `Database::new()` writes `recovery_required = true` to the
+///    512-byte header on open and `Database::drop()` writes allocator/shutdown
+///    metadata on close even when no transaction is committed. Buffering all
+///    Phase 1 writes inside an in-memory copy-on-write overlay ensures source
+///    `git.redb` and `capture.redb` remain 100% clean and byte-for-byte
+///    unchanged on disk throughout Phase 1 (both during backup and on abort),
+///    while preserving real OS kernel byte-range locks on the underlying file.
+#[cfg(any(unix, windows))]
+#[derive(Debug, Clone)]
+struct ReverseNonBlockingFileBackend(std::sync::Arc<ReverseNonBlockingFileBackendInner>);
+
+#[cfg(any(unix, windows))]
+impl ReverseNonBlockingFileBackend {
+    fn new(file: File) -> Self {
+        Self(std::sync::Arc::new(
+            ReverseNonBlockingFileBackendInner::new(file),
+        ))
+    }
+
+    fn controller(&self) -> std::sync::Arc<ReverseNonBlockingFileBackendInner> {
+        std::sync::Arc::clone(&self.0)
+    }
+
+    fn is_header_lock_range(start: std::ops::Bound<u64>, end: std::ops::Bound<u64>) -> bool {
+        let starts_low = matches!(
+            start,
+            std::ops::Bound::Included(s) | std::ops::Bound::Excluded(s) if s < REDB_WRITER_LOCK_BYTE
+        );
+        let ends_low = matches!(
+            end,
+            std::ops::Bound::Included(e) | std::ops::Bound::Excluded(e) if e < REDB_WRITER_LOCK_BYTE
+        );
+        starts_low && ends_low
+    }
+
+    /// Non-mutating check that no external OS process holds `redb`'s writer
+    /// lock byte (`WRITER_BYTE`), failing closed with `LBR-IO-001` before
+    /// `redb::Builder` ever opens the database (`RB-11` AC1–AC4).
+    fn ensure_writer_byte_uncontended(
+        &self,
+        stage: ReversePhase1QuiesceStage,
+    ) -> StorageResult<()> {
+        let writer_bound = std::ops::Bound::Included(REDB_WRITER_LOCK_BYTE);
+        let busy = self
+            .0
+            .backend
+            .query_lock_range(writer_bound, writer_bound)
+            .map_err(|err| StorageBackendError::BackendInternal {
+                detail: format!(
+                    "reverse migration quiescence failed querying redb writer lock at {}: {err}",
+                    stage.as_str()
+                ),
+            })?;
+        if busy {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "reverse migration quiescence rejected at {}: an active external redb writer holds the write lock",
+                    stage.as_str()
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
+#[cfg(any(unix, windows))]
+impl StorageBackend for ReverseNonBlockingFileBackend {
+    fn len(&self) -> Result<u64, BackendError> {
+        let state = self.0.lock_overlay()?;
+        if !state.allow_disk_writes
+            && let Some(vlen) = state.virtual_len
+        {
+            return Ok(vlen);
+        }
+        self.0.backend.len()
+    }
+
+    fn read(&self, offset: u64, out: &mut [u8]) -> Result<(), BackendError> {
+        let state = self.0.lock_overlay()?;
+        if state.allow_disk_writes || (state.dirty_pages.is_empty() && state.virtual_len.is_none())
+        {
+            return self.0.backend.read(offset, out);
+        }
+        let disk_len = self.0.backend.len()?;
+        let vlen = state.virtual_len.unwrap_or(disk_len);
+        let end = offset
+            .checked_add(out.len() as u64)
+            .ok_or_else(|| BackendError::Io(io::Error::from(io::ErrorKind::InvalidInput)))?;
+        if end > vlen {
+            return Err(BackendError::Io(io::Error::from(
+                io::ErrorKind::UnexpectedEof,
+            )));
+        }
+        if out.is_empty() {
+            return Ok(());
+        }
+        if offset < disk_len {
+            let disk_read_len = out.len().min((disk_len - offset) as usize);
+            self.0.backend.read(offset, &mut out[..disk_read_len])?;
+            out[disk_read_len..].fill(0);
+        } else {
+            out.fill(0);
+        }
+        let page_sz = REVERSE_PHASE1_COW_PAGE_SIZE as u64;
+        let first_page = offset / page_sz;
+        let last_page = (end - 1) / page_sz;
+        for page_idx in first_page..=last_page {
+            if let Some(page) = state.dirty_pages.get(&page_idx) {
+                let page_start = page_idx * page_sz;
+                let page_end = page_start + page_sz;
+                let copy_start = offset.max(page_start);
+                let copy_end = end.min(page_end);
+                let src_off = (copy_start - page_start) as usize;
+                let dst_off = (copy_start - offset) as usize;
+                let copy_len = (copy_end - copy_start) as usize;
+                out[dst_off..dst_off + copy_len]
+                    .copy_from_slice(&page[src_off..src_off + copy_len]);
+            }
+        }
+        Ok(())
+    }
+
+    fn set_len(&self, len: u64) -> Result<(), BackendError> {
+        let mut state = self.0.lock_overlay()?;
+        if state.allow_disk_writes {
+            return self.0.backend.set_len(len);
+        }
+        let page_sz = REVERSE_PHASE1_COW_PAGE_SIZE as u64;
+        let keep_pages = len.div_ceil(page_sz);
+        state.dirty_pages.retain(|&idx, _| idx < keep_pages);
+        if !len.is_multiple_of(page_sz) {
+            let tail_page_idx = len / page_sz;
+            let tail_off = (len % page_sz) as usize;
+            if let Some(page) = state.dirty_pages.get_mut(&tail_page_idx) {
+                page[tail_off..].fill(0);
+            }
+        }
+        state.virtual_len = Some(len);
+        Ok(())
+    }
+
+    fn sync_data(&self) -> Result<(), BackendError> {
+        let state = self.0.lock_overlay()?;
+        if state.allow_disk_writes {
+            return self.0.backend.sync_data();
+        }
+        // Phase 1 writes stay exclusively in-memory; never touch disk.
+        Ok(())
+    }
+
+    fn write(&self, offset: u64, data: &[u8]) -> Result<(), BackendError> {
+        let mut state = self.0.lock_overlay()?;
+        if state.allow_disk_writes {
+            return self.0.backend.write(offset, data);
+        }
+        if data.is_empty() {
+            return Ok(());
+        }
+        let end = offset
+            .checked_add(data.len() as u64)
+            .ok_or_else(|| BackendError::Io(io::Error::from(io::ErrorKind::InvalidInput)))?;
+        let disk_len = self.0.backend.len()?;
+        let cur_len = state.virtual_len.unwrap_or(disk_len);
+        let page_sz = REVERSE_PHASE1_COW_PAGE_SIZE as u64;
+        let first_page = offset / page_sz;
+        let last_page = (end - 1) / page_sz;
+        for page_idx in first_page..=last_page {
+            if !state.dirty_pages.contains_key(&page_idx) {
+                if state.dirty_pages.len() >= REVERSE_PHASE1_COW_MAX_PAGES {
+                    return Err(BackendError::Io(io::Error::other(
+                        "reverse migration Phase 1 CoW overlay exceeded bounded page budget",
+                    )));
+                }
+                let mut buf = [0u8; REVERSE_PHASE1_COW_PAGE_SIZE];
+                let page_start = page_idx * page_sz;
+                if page_start < disk_len {
+                    let read_len = ((disk_len - page_start).min(page_sz)) as usize;
+                    self.0.backend.read(page_start, &mut buf[..read_len])?;
+                }
+                state.dirty_pages.insert(page_idx, buf);
+            }
+            if let Some(page) = state.dirty_pages.get_mut(&page_idx) {
+                let page_start = page_idx * page_sz;
+                let page_end = page_start + page_sz;
+                let copy_start = offset.max(page_start);
+                let copy_end = end.min(page_end);
+                let dst_off = (copy_start - page_start) as usize;
+                let src_off = (copy_start - offset) as usize;
+                let copy_len = (copy_end - copy_start) as usize;
+                page[dst_off..dst_off + copy_len]
+                    .copy_from_slice(&data[src_off..src_off + copy_len]);
+            }
+        }
+        state.virtual_len = Some(cur_len.max(end));
+        Ok(())
+    }
+
+    fn close(&self) -> Result<(), BackendError> {
+        self.0.backend.close()
+    }
+
+    fn try_lock_range(
+        &self,
+        start: std::ops::Bound<u64>,
+        end: std::ops::Bound<u64>,
+    ) -> Result<bool, BackendError> {
+        self.0.backend.try_lock_range(start, end)
+    }
+
+    fn try_lock_shared_range(
+        &self,
+        start: std::ops::Bound<u64>,
+        end: std::ops::Bound<u64>,
+    ) -> Result<bool, BackendError> {
+        self.0.backend.try_lock_shared_range(start, end)
+    }
+
+    fn lock_range(
+        &self,
+        start: std::ops::Bound<u64>,
+        end: std::ops::Bound<u64>,
+    ) -> Result<(), BackendError> {
+        if self.0.backend.try_lock_range(start, end)? {
+            return Ok(());
+        }
+        if Self::is_header_lock_range(start, end) {
+            let deadline = Instant::now() + REDB_HEADER_LOCK_RETRY_BUDGET;
+            while Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+                if self.0.backend.try_lock_range(start, end)? {
+                    return Ok(());
+                }
+            }
+        }
+        Err(BackendError::Io(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "redb exclusive byte-range lock is held by an active external process",
+        )))
+    }
+
+    fn lock_shared_range(
+        &self,
+        start: std::ops::Bound<u64>,
+        end: std::ops::Bound<u64>,
+    ) -> Result<(), BackendError> {
+        if self.0.backend.try_lock_shared_range(start, end)? {
+            return Ok(());
+        }
+        if Self::is_header_lock_range(start, end) {
+            let deadline = Instant::now() + REDB_HEADER_LOCK_RETRY_BUDGET;
+            while Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+                if self.0.backend.try_lock_shared_range(start, end)? {
+                    return Ok(());
+                }
+            }
+        }
+        Err(BackendError::Io(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "redb shared byte-range lock is held by an active external process",
+        )))
+    }
+
+    fn unlock_range(
+        &self,
+        start: std::ops::Bound<u64>,
+        end: std::ops::Bound<u64>,
+    ) -> Result<(), BackendError> {
+        let is_writer_byte = start == std::ops::Bound::Included(REDB_WRITER_LOCK_BYTE)
+            && end == std::ops::Bound::Included(REDB_WRITER_LOCK_BYTE);
+        if is_writer_byte {
+            // While Phase 1 disk writes are suppressed (`allow_disk_writes == false`),
+            // releasing `WRITER_BYTE` (e.g. at the end of `Database::new()`) allows
+            // pre-opened peer writers to commit before our `WriteTransaction` begins.
+            // Discard buffered Phase 1 overlay pages BEFORE releasing `WRITER_BYTE`
+            // so `redb::sync_to_latest_commit()` reads the real latest on-disk header
+            // and never serves a stale overlaid header page (`RB-11`).
+            let mut state = self.0.lock_overlay()?;
+            if !state.allow_disk_writes {
+                state.dirty_pages.clear();
+                state.virtual_len = None;
+            }
+        }
+        self.0.backend.unlock_range(start, end)
+    }
+
+    fn query_lock_range(
+        &self,
+        start: std::ops::Bound<u64>,
+        end: std::ops::Bound<u64>,
+    ) -> Result<bool, BackendError> {
+        self.0.backend.query_lock_range(start, end)
+    }
+}
+
+/// Validate and open an existing reverse-migration source `.redb` file
+/// descriptor (`O_RDWR | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC` on Unix;
+/// `FILE_FLAG_OPEN_REPARSE_POINT` on Windows) without invoking `redb` yet so
+/// both source descriptors can be validated and writer-lock-probed BEFORE any
+/// `redb` open touches disk (`RB-11`).
+#[cfg(any(unix, windows))]
+fn open_verified_existing_redb_backend_for_reverse(
+    common_storage: &Path,
+    parent_subdir: &'static str,
+    file_name: &str,
+    role: DatabaseRole,
+) -> StorageResult<(ReverseNonBlockingFileBackend, ReverseRedbFileIdentity)> {
+    let stage = match role {
+        DatabaseRole::Repository => ReversePhase1QuiesceStage::GitRedbWriteTransaction,
+        DatabaseRole::Capture => ReversePhase1QuiesceStage::CaptureRedbWriteTransaction,
+        _ => {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!("invalid role {role} for reverse migration source redb open"),
+            });
+        }
+    };
+    let require_private = role == DatabaseRole::Capture;
+
+    #[cfg(unix)]
+    let (file, file_id) = {
+        use std::{
+            ffi::CString,
+            os::unix::io::{AsRawFd as _, FromRawFd as _, OwnedFd},
+        };
+        let root_fd = open_readonly_root_dir_unix(common_storage)?;
+        let c_subdir = CString::new(parent_subdir.as_bytes()).map_err(|_| {
+            StorageBackendError::BackendInternal {
+                detail: format!("invalid parent subdir for {role} reverse source"),
+            }
+        })?;
+        let forbidden_dir_bits = if require_private { 0o077 } else { 0o022 };
+        let Some((parent_fd, _)) =
+            open_readonly_subdir_unix(&root_fd, &c_subdir, forbidden_dir_bits, stage.as_str())?
+        else {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "reverse migration quiescence rejected at {}: missing source directory",
+                    stage.as_str()
+                ),
+            });
+        };
+        let c_name = CString::new(file_name.as_bytes()).map_err(|_| {
+            StorageBackendError::BackendInternal {
+                detail: format!("invalid filename for {role} reverse source"),
+            }
+        })?;
+        // SAFETY: `parent_fd` is a valid pinned directory fd and `c_name` is NUL-terminated.
+        let raw = unsafe {
+            libc::openat(
+                parent_fd.as_raw_fd(),
+                c_name.as_ptr(),
+                libc::O_RDWR | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
+        };
+        if raw < 0 {
+            let err = io::Error::last_os_error();
+            return Err(StorageBackendError::io(
+                "open source redb writable for reverse migration",
+                err,
+            ));
+        }
+        // SAFETY: `raw >= 0` is exclusively owned here.
+        let file = File::from(unsafe { OwnedFd::from_raw_fd(raw) });
+        let mut st = std::mem::MaybeUninit::<libc::stat>::zeroed();
+        // SAFETY: `file` is valid.
+        if unsafe { libc::fstat(file.as_raw_fd(), st.as_mut_ptr()) } != 0 {
+            return Err(StorageBackendError::io(
+                "stat source redb for reverse migration",
+                io::Error::last_os_error(),
+            ));
+        }
+        // SAFETY: `fstat` succeeded.
+        let st = unsafe { st.assume_init() };
+        // SAFETY: `geteuid` has no preconditions.
+        let euid = unsafe { libc::geteuid() };
+        let mode = (st.st_mode as u32) & 0o777;
+        let forbidden_file_bits = if require_private { 0o077 } else { 0o022 };
+        if (st.st_mode & libc::S_IFMT) != libc::S_IFREG
+            || st.st_uid != euid
+            || st.st_nlink != 1
+            || st.st_size <= 0
+            || (mode & forbidden_file_bits) != 0
+        {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "reverse migration quiescence rejected unsafe, empty, foreign, or hard-linked source redb at {}",
+                    stage.as_str()
+                ),
+            });
+        }
+        (file, (st.st_dev as u64, st.st_ino as u64))
+    };
+
+    #[cfg(windows)]
+    let (file, file_id) = {
+        use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
+
+        use windows_sys::Win32::{
+            Foundation::{GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE},
+            Storage::FileSystem::{
+                CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+                FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+            },
+        };
+
+        let (_root_pin, root_id) =
+            win_tmp_guard::open_pinned_non_reparse_dir(common_storage, "repository storage root")?;
+        let parent_path = common_storage.join(parent_subdir);
+        let (_parent_pin, parent_id) =
+            win_tmp_guard::open_pinned_non_reparse_dir(&parent_path, stage.as_str())?;
+        let ancestors = [
+            (common_storage, root_id, "repository storage root"),
+            (parent_path.as_path(), parent_id, stage.as_str()),
+        ];
+        win_tmp_guard::verify_pinned_dir_ids(&ancestors)?;
+        let target_path = parent_path.join(file_name);
+        let wide = win_tmp_guard::encode_wide_nul(&target_path);
+        // SAFETY: `wide` is NUL-terminated UTF-16.
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_OPEN_REPARSE_POINT,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(StorageBackendError::io(
+                "open source redb writable for reverse migration",
+                io::Error::last_os_error(),
+            ));
+        }
+        // SAFETY: `handle` is a valid exclusively owned Win32 handle.
+        let file = unsafe { File::from_raw_handle(handle as std::os::windows::io::RawHandle) };
+        win_tmp_guard::verify_pinned_dir_ids(&ancestors)?;
+        let raw = file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+        let info = win_tmp_guard::file_info(raw, stage.as_str())?;
+        let size = (u64::from(info.nFileSizeHigh) << 32) | u64::from(info.nFileSizeLow);
+        if (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+            || (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0
+            || info.nNumberOfLinks != 1
+            || size == 0
+        {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "reverse migration quiescence rejected unsafe, empty, reparse, or hard-linked source redb at {}",
+                    stage.as_str()
+                ),
+            });
+        }
+        let fid = win_tmp_guard::WinFileId {
+            volume_serial: info.dwVolumeSerialNumber,
+            index_high: info.nFileIndexHigh,
+            index_low: info.nFileIndexLow,
+        };
+        (file, fid)
+    };
+
+    Ok((ReverseNonBlockingFileBackend::new(file), file_id))
+}
+
+/// Validate and pre-check BOTH source redb descriptors (`git.redb` and
+/// `capture.redb`), rejecting inode aliasing and active external writers
+/// (`WRITER_BYTE`) BEFORE invoking `redb::Builder` on either file (`RB-11`).
+#[cfg(any(unix, windows))]
+fn prepare_verified_redb_backends_for_reverse(
+    common_storage: &Path,
+    git_file_name: &str,
+    cap_file_name: &str,
+) -> StorageResult<(ReverseNonBlockingFileBackend, ReverseNonBlockingFileBackend)> {
+    let (git_backend, git_id) = open_verified_existing_redb_backend_for_reverse(
+        common_storage,
+        REDB_SUBDIR,
+        git_file_name,
+        DatabaseRole::Repository,
+    )?;
+    let (cap_backend, cap_id) = open_verified_existing_redb_backend_for_reverse(
+        common_storage,
+        PRIVATE_SUBDIR,
+        cap_file_name,
+        DatabaseRole::Capture,
+    )?;
+    if git_id == cap_id {
+        return Err(StorageBackendError::BackendInternal {
+            detail:
+                "reverse migration quiescence rejected aliased git.redb and capture.redb inodes"
+                    .to_string(),
+        });
+    }
+    git_backend
+        .ensure_writer_byte_uncontended(ReversePhase1QuiesceStage::GitRedbWriteTransaction)?;
+    cap_backend
+        .ensure_writer_byte_uncontended(ReversePhase1QuiesceStage::CaptureRedbWriteTransaction)?;
+    Ok((git_backend, cap_backend))
+}
+
+#[cfg(any(unix, windows))]
+fn open_reverse_redb_with_backend(
+    backend: ReverseNonBlockingFileBackend,
+    role: DatabaseRole,
+) -> StorageResult<(
+    RedbDatabase,
+    std::sync::Arc<ReverseNonBlockingFileBackendInner>,
+)> {
+    let ctrl = backend.controller();
+    let mut builder = redb::Builder::new();
+    builder
+        .set_concurrency_mode(redb::ConcurrencyMode::MultiWriter)
+        .set_cache_size(FORWARD_MIGRATION_REDB_CACHE_BYTES)
+        // Phase 1 quiescence MUST NOT mutate a single byte of source `.redb`
+        // files on disk; abort immediately if crash recovery is required.
+        .set_repair_callback(|session| session.abort());
+    let db = builder.create_with_backend(backend).map_err(|err| {
+        StorageBackendError::BackendInternal {
+            detail: format!(
+                "reverse migration quiescence failed opening {role} redb writable: {err}"
+            ),
+        }
+    })?;
+    Ok((db, ctrl))
+}
+
+/// Begin an immediate non-blocking (`Duration::ZERO`), `META_SCHEMA`-checked
+/// `WriteTransaction` on a source redb store for reverse migration Phase 1,
+/// normalizing active writer contention on BOTH `Repository` and `Capture` to
+/// fail-closed `LBR-IO-001` (`RB-11` AC1 & AC3).
+fn try_begin_reverse_source_write_tx(
+    db: &RedbDatabase,
+    role: DatabaseRole,
+) -> StorageResult<redb::WriteTransaction> {
+    let stage = match role {
+        DatabaseRole::Repository => ReversePhase1QuiesceStage::GitRedbWriteTransaction,
+        DatabaseRole::Capture => ReversePhase1QuiesceStage::CaptureRedbWriteTransaction,
+        _ => {
+            return Err(StorageBackendError::BackendInternal {
+                detail: format!("invalid role {role} for reverse migration write transaction"),
+            });
+        }
+    };
+    match begin_checked_write_blocking(db, role, Duration::ZERO) {
+        Ok(wtx) => Ok(wtx),
+        Err(StorageBackendError::WriteLockBusy { .. }) => {
+            Err(StorageBackendError::BackendInternal {
+                detail: format!(
+                    "reverse migration quiescence rejected at {}: an active external redb writer holds the write lock",
+                    stage.as_str()
+                ),
+            })
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// Strictly non-mutating pre-flight validation of both source `.redb` files and
+/// their `WRITER_BYTE` lock availability used ONLY before creating any absent
+/// advisory lock file so contention on `git.redb` or `capture.redb` never
+/// creates stray lock files and never writes a single byte to either `.redb`
+/// (`RB-11` AC1–AC4).
+fn probe_reverse_redb_sources_uncontended(
+    common_storage: &Path,
+    git_file_name: &str,
+    cap_file_name: &str,
+) -> StorageResult<()> {
+    #[cfg(any(unix, windows))]
+    {
+        let (git_backend, git_id) = open_verified_existing_redb_backend_for_reverse(
+            common_storage,
+            REDB_SUBDIR,
+            git_file_name,
+            DatabaseRole::Repository,
+        )?;
+        let (cap_backend, cap_id) = open_verified_existing_redb_backend_for_reverse(
+            common_storage,
+            PRIVATE_SUBDIR,
+            cap_file_name,
+            DatabaseRole::Capture,
+        )?;
+        if git_id == cap_id {
+            return Err(StorageBackendError::BackendInternal {
+                detail:
+                    "reverse migration quiescence rejected aliased git.redb and capture.redb inodes"
+                        .to_string(),
+            });
+        }
+        git_backend
+            .ensure_writer_byte_uncontended(ReversePhase1QuiesceStage::GitRedbWriteTransaction)?;
+        cap_backend.ensure_writer_byte_uncontended(
+            ReversePhase1QuiesceStage::CaptureRedbWriteTransaction,
+        )?;
+        Ok(())
+    }
+    #[cfg(all(not(unix), not(windows)))]
+    {
+        let _ = (common_storage, git_file_name, cap_file_name);
+        Err(StorageBackendError::BackendInternal {
+            detail: "reverse migration source redb open is unsupported on this platform"
+                .to_string(),
+        })
+    }
+}
+
+/// Read and validate the finalized `Redb` `storage-format.json` manifest and
+/// return `(generation, git_redb_path, capture_redb_path, git_file_name, cap_file_name)`
+/// for reverse migration Phase 1 (`RB-11`).
+fn resolve_finalized_redb_sources_for_reverse(
+    common_storage: &Path,
+) -> StorageResult<(u64, PathBuf, PathBuf, String, String)> {
+    let manifest = read_storage_manifest(common_storage)?.ok_or_else(|| {
+        StorageBackendError::BackendInternal {
+            detail: format!(
+                "reverse migration quiescence rejected at {}: missing finalized redb storage-format.json",
+                ReversePhase1QuiesceStage::StorageManifest.as_str()
+            ),
+        }
+    })?;
+    if !manifest.finalized {
+        return Err(StorageBackendError::ManifestNotFinalized {
+            detail: format!(
+                "reverse migration quiescence rejected at {}: storage-format.json is not finalized (backend={:?}, generation={})",
+                ReversePhase1QuiesceStage::StorageManifest.as_str(),
+                manifest.backend,
+                manifest.generation
+            ),
+        });
+    }
+    if manifest.backend != StorageBackendKind::Redb {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "reverse migration quiescence rejected at {}: repository backend is {:?}, expected Redb",
+                ReversePhase1QuiesceStage::StorageManifest.as_str(),
+                manifest.backend
+            ),
+        });
+    }
+    let expected_git_rel = canonical_git_redb_rel_path(manifest.generation);
+    let expected_cap_rel = canonical_capture_redb_rel_path(manifest.generation);
+    if manifest.git_path.as_deref() != Some(expected_git_rel.as_str())
+        || manifest.capture_path.as_deref() != Some(expected_cap_rel.as_str())
+    {
+        return Err(StorageBackendError::BackendInternal {
+            detail: format!(
+                "reverse migration quiescence rejected at {}: non-canonical redb paths in manifest",
+                ReversePhase1QuiesceStage::StorageManifest.as_str()
+            ),
+        });
+    }
+    let git_db = git_redb_path(common_storage, manifest.generation);
+    let capture_db = capture_redb_path(common_storage, manifest.generation);
+    let git_name = git_db
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| StorageBackendError::BackendInternal {
+            detail: "invalid git redb filename in manifest".to_string(),
+        })?
+        .to_string();
+    let cap_name = capture_db
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| StorageBackendError::BackendInternal {
+            detail: "invalid capture redb filename in manifest".to_string(),
+        })?
+        .to_string();
+    Ok((manifest.generation, git_db, capture_db, git_name, cap_name))
+}
+
+/// Full Phase 1 symmetric reverse migration (`redb -> SQLite`) quiescence gate
+/// enforcing strict `ADR-RB-07` #2 global lock order (`RB-11`):
+///
+/// `migration.lock` -> `maintenance.lock` -> `capture-spool-consumer.lock` ->
+/// `capture-queue/writer.lock` -> in-place `capture-queue/append.lock` ->
+/// in-place `capture-spool/capacity.lock` -> `(git_wtx, cap_wtx)`.
+///
+/// Immediately fails closed (`LBR-IO-001`) if any external writer holds
+/// `git.redb` or `capture.redb` (or any advisory migration/queue/spool lock),
+/// leaving source `git.redb` and `capture.redb` 100% byte-for-byte unchanged.
+pub fn quiesce_reverse_repository_phase1(
+    common_storage: &Path,
+) -> StorageResult<ReversePhase1QuiesceGuard> {
+    quiesce_reverse_repository_phase1_inner(
+        common_storage,
+        #[cfg(test)]
+        None,
+    )
+}
+
+/// Role-validated variant of [`quiesce_reverse_repository_phase1`] enforcing
+/// `GC-13` isolation (rejects `GlobalConfig`, `SystemConfig`, and `Derived`).
+pub fn quiesce_reverse_repository_phase1_for_role(
+    common_storage: &Path,
+    role: DatabaseRole,
+) -> StorageResult<ReversePhase1QuiesceGuard> {
+    validate_forward_migration_role(role).map_err(normalize_reverse_quiesce_err)?;
+    quiesce_reverse_repository_phase1(common_storage)
+}
+
+fn normalize_reverse_quiesce_err(err: StorageBackendError) -> StorageBackendError {
+    match err {
+        StorageBackendError::BackendInternal { detail }
+            if detail.starts_with("forward migration quiescence") =>
+        {
+            StorageBackendError::BackendInternal {
+                detail: detail.replacen(
+                    "forward migration quiescence",
+                    "reverse migration quiescence",
+                    1,
+                ),
+            }
+        }
+        other => other,
+    }
+}
+
+fn quiesce_reverse_repository_phase1_inner(
+    common_storage: &Path,
+    #[cfg(test)] mut observer: Option<&mut dyn ReversePhase1LockObserver>,
+) -> StorageResult<ReversePhase1QuiesceGuard> {
+    if !validate_existing_dir_no_mutate(
+        common_storage,
+        false,
+        ForwardPhase1QuiesceStage::StorageRoot,
+    )
+    .map_err(normalize_reverse_quiesce_err)?
+    {
+        return Err(StorageBackendError::NotFound {
+            resource: "repository storage directory".to_string(),
+        });
+    }
+
+    let (
+        _preflight_generation,
+        _preflight_git_path,
+        _preflight_cap_path,
+        preflight_git_name,
+        preflight_cap_name,
+    ) = resolve_finalized_redb_sources_for_reverse(common_storage)?;
+
+    let redb_dir = common_storage.join(REDB_SUBDIR);
+    let private_dir = common_storage.join(PRIVATE_SUBDIR);
+    let queue_dir = capture_queue_dir_path(common_storage);
+    let spool_dir = capture_spool_dir_path(common_storage);
+    let mig_lock_path = migration_lock_path(common_storage);
+    let maint_lock_path = common_storage.join("maintenance.lock");
+    let consumer_lock_path = capture_spool_consumer_lock_path(common_storage);
+    let writer_lock_path = capture_queue_writer_lock_path(common_storage);
+    let append_lock_path = capture_queue_append_lock_path(common_storage);
+    let capacity_lock_path = capture_spool_capacity_lock_path(common_storage);
+
+    // Phase 0: 100% non-creating pre-flight validation and contention probes
+    // (creates ZERO files or directories anywhere on disk).
+    if !validate_existing_dir_no_mutate(&redb_dir, false, ForwardPhase1QuiesceStage::StorageRoot)
+        .map_err(normalize_reverse_quiesce_err)?
+    {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "reverse migration quiescence rejected: missing .libra/redb directory"
+                .to_string(),
+        });
+    }
+    if !validate_existing_dir_no_mutate(
+        &private_dir,
+        true,
+        ForwardPhase1QuiesceStage::CaptureSpoolConsumerLock,
+    )
+    .map_err(normalize_reverse_quiesce_err)?
+    {
+        return Err(StorageBackendError::BackendInternal {
+            detail: "reverse migration quiescence rejected: missing .libra/private directory"
+                .to_string(),
+        });
+    }
+    let _ = validate_existing_dir_no_mutate(
+        &queue_dir,
+        true,
+        ForwardPhase1QuiesceStage::CaptureQueueAppendLock,
+    )
+    .map_err(normalize_reverse_quiesce_err)?;
+    let _ = validate_existing_dir_no_mutate(
+        &spool_dir,
+        true,
+        ForwardPhase1QuiesceStage::CaptureSpoolCapacityLock,
+    )
+    .map_err(normalize_reverse_quiesce_err)?;
+
+    // Probe all 6 existing lock files in strict reverse order without creating any file.
+    probe_existing_lock_uncontended(
+        &mig_lock_path,
+        true,
+        ForwardPhase1QuiesceStage::MigrationLock,
+    )
+    .map_err(normalize_reverse_quiesce_err)?;
+    probe_existing_lock_uncontended(
+        &maint_lock_path,
+        false,
+        ForwardPhase1QuiesceStage::MaintenanceLock,
+    )
+    .map_err(normalize_reverse_quiesce_err)?;
+    probe_existing_lock_uncontended(
+        &consumer_lock_path,
+        true,
+        ForwardPhase1QuiesceStage::CaptureSpoolConsumerLock,
+    )
+    .map_err(normalize_reverse_quiesce_err)?;
+    probe_existing_lock_uncontended(
+        &writer_lock_path,
+        true,
+        ForwardPhase1QuiesceStage::CaptureQueueWriterLock,
+    )
+    .map_err(normalize_reverse_quiesce_err)?;
+    probe_existing_lock_uncontended(
+        &append_lock_path,
+        true,
+        ForwardPhase1QuiesceStage::CaptureQueueAppendLock,
+    )
+    .map_err(normalize_reverse_quiesce_err)?;
+    probe_existing_lock_uncontended(
+        &capacity_lock_path,
+        true,
+        ForwardPhase1QuiesceStage::CaptureSpoolCapacityLock,
+    )
+    .map_err(normalize_reverse_quiesce_err)?;
+
+    // If any of the 6 lock files is not yet materialized on disk, run a
+    // non-creating redb writer contention probe BEFORE materializing any
+    // missing lock file so active redb writer rejection leaves disk 100%
+    // untouched.
+    let any_lock_absent = !path_exists_no_open(&mig_lock_path)?
+        || !path_exists_no_open(&maint_lock_path)?
+        || !path_exists_no_open(&consumer_lock_path)?
+        || !path_exists_no_open(&writer_lock_path)?
+        || !path_exists_no_open(&append_lock_path)?
+        || !path_exists_no_open(&capacity_lock_path)?;
+    if any_lock_absent {
+        probe_reverse_redb_sources_uncontended(
+            common_storage,
+            &preflight_git_name,
+            &preflight_cap_name,
+        )?;
+    }
+
+    // Phase 1: Acquire ALL 8 locks in 100% STRICT CANONICAL `ADR-RB-07` #2 ORDER:
+    // 1. migration.lock
+    // 2. maintenance.lock
+    // 3. capture-spool-consumer.lock
+    // 4. capture-queue/writer.lock
+    // 5. capture-queue/append.lock  (BEFORE capacity.lock!)
+    // 6. capture-spool/capacity.lock
+    // 7. git.redb WriteTransaction
+    // 8. capture.redb WriteTransaction
+    let migration_lock = open_and_try_lock_inplace(
+        &mig_lock_path,
+        0o600,
+        true,
+        ForwardPhase1QuiesceStage::MigrationLock,
+    )
+    .map_err(normalize_reverse_quiesce_err)?;
+    #[cfg(test)]
+    if let Some(obs) = observer.as_deref_mut() {
+        obs.on_stage_acquired(ReversePhase1QuiesceStage::MigrationLock);
+    }
+
+    let maintenance_lock = open_and_try_lock_inplace(
+        &maint_lock_path,
+        0o600,
+        false,
+        ForwardPhase1QuiesceStage::MaintenanceLock,
+    )
+    .map_err(normalize_reverse_quiesce_err)?;
+    #[cfg(test)]
+    if let Some(obs) = observer.as_deref_mut() {
+        obs.on_stage_acquired(ReversePhase1QuiesceStage::MaintenanceLock);
+    }
+
+    ensure_private_dir_nofollow(
+        &private_dir,
+        ForwardPhase1QuiesceStage::CaptureSpoolConsumerLock,
+    )
+    .map_err(normalize_reverse_quiesce_err)?;
+    let spool_consumer_lock = open_and_try_lock_inplace(
+        &consumer_lock_path,
+        0o600,
+        true,
+        ForwardPhase1QuiesceStage::CaptureSpoolConsumerLock,
+    )
+    .map_err(normalize_reverse_quiesce_err)?;
+    #[cfg(test)]
+    if let Some(obs) = observer.as_deref_mut() {
+        obs.on_stage_acquired(ReversePhase1QuiesceStage::CaptureSpoolConsumerLock);
+    }
+
+    ensure_private_dir_nofollow(
+        &queue_dir,
+        ForwardPhase1QuiesceStage::CaptureQueueWriterLock,
+    )
+    .map_err(normalize_reverse_quiesce_err)?;
+    let queue_writer_lock = open_and_try_lock_inplace(
+        &writer_lock_path,
+        0o600,
+        true,
+        ForwardPhase1QuiesceStage::CaptureQueueWriterLock,
+    )
+    .map_err(normalize_reverse_quiesce_err)?;
+    #[cfg(test)]
+    if let Some(obs) = observer.as_deref_mut() {
+        obs.on_stage_acquired(ReversePhase1QuiesceStage::CaptureQueueWriterLock);
+    }
+
+    let queue_append_lock = open_and_try_lock_inplace(
+        &append_lock_path,
+        0o600,
+        true,
+        ForwardPhase1QuiesceStage::CaptureQueueAppendLock,
+    )
+    .map_err(normalize_reverse_quiesce_err)?;
+    #[cfg(test)]
+    if let Some(obs) = observer.as_deref_mut() {
+        obs.on_stage_acquired(ReversePhase1QuiesceStage::CaptureQueueAppendLock);
+    }
+
+    ensure_private_dir_nofollow(
+        &spool_dir,
+        ForwardPhase1QuiesceStage::CaptureSpoolCapacityLock,
+    )
+    .map_err(normalize_reverse_quiesce_err)?;
+    let spool_capacity_lock = open_and_try_lock_inplace(
+        &capacity_lock_path,
+        0o600,
+        true,
+        ForwardPhase1QuiesceStage::CaptureSpoolCapacityLock,
+    )
+    .map_err(normalize_reverse_quiesce_err)?;
+    #[cfg(test)]
+    if let Some(obs) = observer.as_deref_mut() {
+        obs.on_stage_acquired(ReversePhase1QuiesceStage::CaptureSpoolCapacityLock);
+    }
+
+    let locks = ReversePhase1Locks {
+        _spool_capacity_lock: spool_capacity_lock,
+        _queue_append_lock: queue_append_lock,
+        _queue_writer_lock: queue_writer_lock,
+        _spool_consumer_lock: spool_consumer_lock,
+        _maintenance_lock: maintenance_lock,
+        _migration_lock: migration_lock,
+    };
+
+    // Re-read and verify `storage-format.json` strictly AFTER holding
+    // `migration.lock .. capacity.lock` to close any pre-lock manifest TOCTOU.
+    let (generation, git_path, cap_path, git_file_name, cap_file_name) =
+        resolve_finalized_redb_sources_for_reverse(common_storage)?;
+
+    // Validate both source redb descriptors and pre-check `WRITER_BYTE`
+    // uncontended BEFORE opening either `RedbDatabase`, then acquire
+    // `git_db -> git_wtx` followed strictly by `cap_db -> cap_wtx` (`ADR-RB-07` #2).
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (
+            generation,
+            git_path,
+            cap_path,
+            git_file_name,
+            cap_file_name,
+            locks,
+        );
+        return Err(StorageBackendError::BackendInternal {
+            detail: "reverse migration source redb open is unsupported on this platform"
+                .to_string(),
+        });
+    }
+
+    #[cfg(any(unix, windows))]
+    {
+        let (git_backend, cap_backend) = prepare_verified_redb_backends_for_reverse(
+            common_storage,
+            &git_file_name,
+            &cap_file_name,
+        )?;
+        let (git_db, git_backend_ctrl) =
+            open_reverse_redb_with_backend(git_backend, DatabaseRole::Repository)?;
+        #[cfg(test)]
+        if let Some(obs) = observer.as_deref_mut() {
+            obs.on_after_git_db_open_before_git_wtx();
+        }
+        let git_wtx = try_begin_reverse_source_write_tx(&git_db, DatabaseRole::Repository)?;
+        #[cfg(test)]
+        if let Some(obs) = observer.as_deref_mut() {
+            obs.on_stage_acquired(ReversePhase1QuiesceStage::GitRedbWriteTransaction);
+        }
+
+        let (cap_db, capture_backend_ctrl) =
+            match open_reverse_redb_with_backend(cap_backend, DatabaseRole::Capture) {
+                Ok(pair) => pair,
+                Err(err) => {
+                    let _ = git_wtx.abort();
+                    return Err(err);
+                }
+            };
+        let capture_wtx = match try_begin_reverse_source_write_tx(&cap_db, DatabaseRole::Capture) {
+            Ok(wtx) => wtx,
+            Err(err) => {
+                let _ = git_wtx.abort();
+                return Err(err);
+            }
+        };
+        #[cfg(test)]
+        if let Some(obs) = observer {
+            obs.on_stage_acquired(ReversePhase1QuiesceStage::CaptureRedbWriteTransaction);
+        }
+
+        let redb = QuiescedRepositoryRedbSources {
+            generation,
+            git_redb_path: git_path,
+            capture_redb_path: cap_path,
+            capture_wtx,
+            git_wtx,
+            capture_db: cap_db,
+            git_db,
+            capture_backend_ctrl,
+            git_backend_ctrl,
+        };
+
+        Ok(ReversePhase1QuiesceGuard { redb, locks })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -41183,6 +42545,150 @@ mod tests {
                     }
                     Err(fs::TryLockError::Error(err)) => {
                         panic!("unexpected maintenance.lock probe error: {err}")
+                    }
+                }
+                return;
+            }
+            "hold_redb_git_write_tx" => {
+                use crate::storage::RedbGitStore;
+                let store = RedbGitStore::open_read_write(db_path)
+                    .expect("child open RedbGitStore writable")
+                    .with_write_timeout(Duration::ZERO);
+                let wtx = store
+                    .begin_checked_write_tx()
+                    .expect("child acquire RedbGitStore write tx");
+                println!("{RB10_READY_MARKER}");
+                let _ = io::stdout().flush();
+                let mut sink = Vec::new();
+                let _ = io::stdin().read_to_end(&mut sink);
+                let _ = wtx.abort();
+                drop(store);
+                return;
+            }
+            "hold_redb_capture_write_tx" => {
+                use crate::storage::{RedbCaptureStore, RedbRepairContext};
+                let store =
+                    RedbCaptureStore::open_read_write(db_path, RedbRepairContext::WriteCommand)
+                        .await
+                        .expect("child open RedbCaptureStore writable")
+                        .with_write_timeout(Duration::ZERO);
+                let wtx = store
+                    .begin_checked_write_tx()
+                    .expect("child acquire RedbCaptureStore write tx");
+                println!("{RB10_READY_MARKER}");
+                let _ = io::stdout().flush();
+                let mut sink = Vec::new();
+                let _ = io::stdin().read_to_end(&mut sink);
+                let _ = wtx.abort();
+                drop(store);
+                return;
+            }
+            "preopen_redb_git_then_commit_mid_open" => {
+                use crate::storage::RedbGitStore;
+                let store = RedbGitStore::open_read_write(db_path)
+                    .expect("child pre-open RedbGitStore for mid-open commit")
+                    .with_write_timeout(Duration::from_secs(2));
+                println!("{RB10_READY_MARKER}");
+                let _ = io::stdout().flush();
+                let mut sink = Vec::new();
+                let _ = io::stdin().read_to_end(&mut sink);
+                let wtx = store
+                    .begin_checked_write_tx()
+                    .expect("child begin checked write tx in mid-open window");
+                {
+                    let mut refs = wtx
+                        .open_table(redb_git::REFERENCE_TABLE)
+                        .expect("child open REFERENCE_TABLE");
+                    refs.insert(
+                        (0u8, "refs/heads/rb11-mid-open-commit", ""),
+                        b"rb11-committed-mid-open".as_slice(),
+                    )
+                    .expect("child insert mid-open ref");
+                }
+                wtx.commit().expect("child commit mid-open ref");
+                drop(store);
+                return;
+            }
+            "preopen_redb_git_then_probe_busy" => {
+                use crate::storage::RedbGitStore;
+                let store = RedbGitStore::open_read_write(db_path)
+                    .expect("child pre-open RedbGitStore writable")
+                    .with_write_timeout(Duration::ZERO);
+                println!("{RB10_READY_MARKER}");
+                let _ = io::stdout().flush();
+                let mut sink = Vec::new();
+                let _ = io::stdin().read_to_end(&mut sink);
+                match store.begin_checked_write_tx() {
+                    Err(StorageBackendError::WriteLockBusy {
+                        role: DatabaseRole::Repository,
+                        ..
+                    }) => {
+                        println!("{RB10_BUSY_MARKER}");
+                        let _ = io::stdout().flush();
+                    }
+                    Ok(wtx) => {
+                        let _ = wtx.abort();
+                        panic!("expected WriteLockBusy on held git.redb write tx");
+                    }
+                    Err(other) => {
+                        panic!("unexpected git.redb busy probe error: {other:?}");
+                    }
+                }
+                drop(store);
+                return;
+            }
+            "preopen_redb_capture_then_probe_busy" => {
+                use crate::storage::{RedbCaptureStore, RedbRepairContext};
+                let store =
+                    RedbCaptureStore::open_read_write(db_path, RedbRepairContext::WriteCommand)
+                        .await
+                        .expect("child pre-open RedbCaptureStore writable")
+                        .with_write_timeout(Duration::ZERO);
+                println!("{RB10_READY_MARKER}");
+                let _ = io::stdout().flush();
+                let mut sink = Vec::new();
+                let _ = io::stdin().read_to_end(&mut sink);
+                match store.begin_checked_write_tx() {
+                    Err(StorageBackendError::WriteLockBusy {
+                        role: DatabaseRole::Capture,
+                        ..
+                    }) => {
+                        println!("{RB10_BUSY_MARKER}");
+                        let _ = io::stdout().flush();
+                    }
+                    Ok(wtx) => {
+                        let _ = wtx.abort();
+                        panic!("expected WriteLockBusy on held capture.redb write tx");
+                    }
+                    Err(other) => {
+                        panic!("unexpected capture.redb busy probe error: {other:?}");
+                    }
+                }
+                drop(store);
+                return;
+            }
+            "probe_redb_git_write_busy" | "probe_redb_capture_write_busy" => {
+                let file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(db_path)
+                    .expect("child open redb for non-blocking writer-byte probe");
+                let backend = ReverseNonBlockingFileBackend::new(file);
+                let stage = if mode == "probe_redb_git_write_busy" {
+                    ReversePhase1QuiesceStage::GitRedbWriteTransaction
+                } else {
+                    ReversePhase1QuiesceStage::CaptureRedbWriteTransaction
+                };
+                match backend.ensure_writer_byte_uncontended(stage) {
+                    Err(err) if err.stable_code_str() == "LBR-IO-001" => {
+                        println!("{RB10_BUSY_MARKER}");
+                        let _ = io::stdout().flush();
+                    }
+                    Ok(()) => {
+                        panic!("expected WRITER_BYTE busy for `{mode}`, got uncontended");
+                    }
+                    Err(other) => {
+                        panic!("unexpected `{mode}` probe error: {other:?}");
                     }
                 }
                 return;
@@ -64068,5 +65574,429 @@ int openat64(int dirfd, const char *path, int oflag, ...) {
             .expect_err("deleted snapshot quarantine file must fail closed during union backup");
             assert_eq!(union_q_err.stable_code_str(), "LBR-IO-001");
         }
+    }
+
+    /// Build a finalized Redb repository fixture (`storage-format.json` with
+    /// `backend = "redb", finalized = true, generation = 1`, `git.gen-00000001.redb`,
+    /// `capture.gen-00000001.redb`, initialized `capture-queue/`, and `capture-spool/`
+    /// tombstones) for reverse migration Phase 1/2 tests (`RB-11`+).
+    async fn build_rb11_finalized_redb_repo_fixture(storage: &Path) -> (PathBuf, PathBuf) {
+        use crate::storage::{
+            RedbCaptureStore, RedbGitStore, StorageFormatManifest, init_capture_queue,
+            init_redb_capture_spool_tombstones, publish_storage_manifest,
+        };
+
+        fs::create_dir_all(storage.join(REDB_SUBDIR)).expect("create .libra/redb");
+        fs::create_dir_all(storage.join(PRIVATE_SUBDIR)).expect("create .libra/private");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(
+                storage.join(PRIVATE_SUBDIR),
+                fs::Permissions::from_mode(0o700),
+            )
+            .expect("chmod 0700 private");
+        }
+
+        let git_path = git_redb_path(storage, 1);
+        let cap_path = capture_redb_path(storage, 1);
+        let git_store = RedbGitStore::create(&git_path).expect("create git.gen-00000001.redb");
+        drop(git_store);
+        let cap_store = RedbCaptureStore::create(&cap_path)
+            .await
+            .expect("create capture.gen-00000001.redb");
+        drop(cap_store);
+        let _q = init_capture_queue(storage).expect("init capture-queue");
+        let _tomb = init_redb_capture_spool_tombstones(storage)
+            .expect("init fresh redb capture-spool tombstones");
+
+        let manifest =
+            StorageFormatManifest::new_redb_finalized(1).expect("new finalized redb manifest");
+        publish_storage_manifest(storage, &manifest).expect("publish finalized redb manifest");
+        (git_path, cap_path)
+    }
+
+    /// `RB-11` AC1–AC5: symmetric reverse migration Phase 1 redb writer
+    /// quiescence gate and strict `ADR-RB-07` #2 global lock order:
+    /// - AC1 + AC2: external OS-process `git.redb` writer -> fail-closed
+    ///   `LBR-IO-001` with exact byte-for-byte unchanged `git.redb` & `capture.redb`.
+    /// - AC3 + AC4: external OS-process `capture.redb` writer -> fail-closed
+    ///   `LBR-IO-001` with exact byte-for-byte unchanged `git.redb` & `capture.redb`.
+    /// - AC5: strict 8-step canonical global lock order
+    ///   `migration.lock -> maintenance.lock -> capture-spool-consumer.lock ->
+    ///    writer.lock -> capture-queue/append.lock -> capture-spool/capacity.lock ->
+    ///    (git_wtx, cap_wtx)`, verified via observer + live OS-child busy probes
+    ///   on all 8 locks + uncontended latency budget `<= 50ms` + `GC-13` role
+    ///   rejection + unfinalized/SQLite manifest rejection.
+    #[tokio::test]
+    async fn reverse_phase1_quiescence_rejects_redb_writers_and_enforces_lock_order() {
+        struct RecordingReverseObserver {
+            stages: Vec<ReversePhase1QuiesceStage>,
+        }
+        impl ReversePhase1LockObserver for RecordingReverseObserver {
+            fn on_stage_acquired(&mut self, stage: ReversePhase1QuiesceStage) {
+                self.stages.push(stage);
+            }
+        }
+
+        let dir = tempdir().expect("rb11 tempdir");
+        let storage = dir.path().join(".libra");
+        let (git_path, cap_path) = build_rb11_finalized_redb_repo_fixture(&storage).await;
+
+        let cap_bytes_initial = fs::read(&cap_path).expect("snapshot initial capture.redb");
+
+        // --------------------------------------------------------------------
+        // AC1 + AC2: External OS-process `git.redb` writer returns `LBR-IO-001`
+        // AND preserves BOTH `git.redb` and `capture.redb` byte-for-byte!
+        // --------------------------------------------------------------------
+        {
+            let holder = ChildLockHolder::spawn("hold_redb_git_write_tx", &git_path);
+            let git_bytes_before = fs::read(&git_path).expect("snapshot git.redb before AC1");
+            let cap_bytes_before = fs::read(&cap_path).expect("snapshot capture.redb before AC1");
+            let err = quiesce_reverse_repository_phase1(&storage)
+                .expect_err("AC1: active external git.redb writer must fail closed");
+            assert_eq!(
+                err.stable_code_str(),
+                "LBR-IO-001",
+                "AC1: external git.redb writer must return LBR-IO-001, got: {err}"
+            );
+            assert_eq!(
+                fs::read(&git_path).expect("read git.redb after AC1"),
+                git_bytes_before,
+                "AC2: git.redb must remain byte-for-byte identical across AC1 rejection"
+            );
+            assert_eq!(
+                fs::read(&cap_path).expect("read capture.redb after AC1"),
+                cap_bytes_before,
+                "AC2: capture.redb must remain byte-for-byte identical across AC1 rejection"
+            );
+            assert_eq!(
+                cap_bytes_before, cap_bytes_initial,
+                "AC2: uncontended capture.redb must match initial clean snapshot"
+            );
+            // Also verify preflight created ZERO stray `migration.lock` on rejection!
+            assert!(
+                !migration_lock_path(&storage).exists(),
+                "AC2: rejected preflight must not create migration.lock"
+            );
+            holder.release_and_wait();
+        }
+
+        // Refresh clean resting snapshots after external git child exited cleanly
+        // (redb's own `Database::drop()` on the child commits allocator state).
+        let git_bytes_resting = fs::read(&git_path).expect("snapshot resting git.redb");
+        let cap_bytes_resting = fs::read(&cap_path).expect("snapshot resting capture.redb");
+        assert_eq!(
+            cap_bytes_resting, cap_bytes_initial,
+            "AC2: uncontended capture.redb must stay unchanged after external git writer exits"
+        );
+
+        // --------------------------------------------------------------------
+        // AC3 + AC4: External OS-process `capture.redb` writer returns
+        // `LBR-IO-001` AND preserves BOTH `git.redb` and `capture.redb`
+        // byte-for-byte!
+        // --------------------------------------------------------------------
+        {
+            let holder = ChildLockHolder::spawn("hold_redb_capture_write_tx", &cap_path);
+            let git_bytes_before = fs::read(&git_path).expect("snapshot git.redb before AC3");
+            let cap_bytes_before = fs::read(&cap_path).expect("snapshot capture.redb before AC3");
+            let err = quiesce_reverse_repository_phase1(&storage)
+                .expect_err("AC3: active external capture.redb writer must fail closed");
+            assert_eq!(
+                err.stable_code_str(),
+                "LBR-IO-001",
+                "AC3: external capture.redb writer must return LBR-IO-001, got: {err}"
+            );
+            assert_eq!(
+                fs::read(&git_path).expect("read git.redb after AC3"),
+                git_bytes_before,
+                "AC4: git.redb must remain byte-for-byte identical across AC3 rejection"
+            );
+            assert_eq!(
+                git_bytes_before, git_bytes_resting,
+                "AC4: uncontended git.redb must match resting snapshot"
+            );
+            assert_eq!(
+                fs::read(&cap_path).expect("read capture.redb after AC3"),
+                cap_bytes_before,
+                "AC4: capture.redb must remain byte-for-byte identical across AC3 rejection"
+            );
+            assert!(
+                !migration_lock_path(&storage).exists(),
+                "AC4: rejected preflight must not create migration.lock"
+            );
+            holder.release_and_wait();
+        }
+
+        let git_bytes_clean = fs::read(&git_path).expect("snapshot clean git.redb before AC5");
+        let cap_bytes_clean = fs::read(&cap_path).expect("snapshot clean capture.redb before AC5");
+        assert_eq!(
+            git_bytes_clean, git_bytes_resting,
+            "AC4: uncontended git.redb must stay unchanged after external capture writer exits"
+        );
+
+        // --------------------------------------------------------------------
+        // AC5: Strict global lock order + live OS-process mutual exclusion on
+        // ALL 8 locks + zero-byte-touch Phase 1 CoW + `<= 50ms` uncontended
+        // performance budget!
+        // --------------------------------------------------------------------
+        {
+            // First verify full acquire + hold + abort writes ZERO bytes to
+            // EITHER `git.redb` or `capture.redb` on disk (both while held AND
+            // after `abort_and_release()`)!
+            let mut recorder = RecordingReverseObserver { stages: Vec::new() };
+            let guard = quiesce_reverse_repository_phase1_inner(&storage, Some(&mut recorder))
+                .expect("AC5: uncontended reverse quiescence must succeed");
+            assert_eq!(
+                recorder.stages,
+                vec![
+                    ReversePhase1QuiesceStage::MigrationLock,
+                    ReversePhase1QuiesceStage::MaintenanceLock,
+                    ReversePhase1QuiesceStage::CaptureSpoolConsumerLock,
+                    ReversePhase1QuiesceStage::CaptureQueueWriterLock,
+                    ReversePhase1QuiesceStage::CaptureQueueAppendLock,
+                    ReversePhase1QuiesceStage::CaptureSpoolCapacityLock,
+                    ReversePhase1QuiesceStage::GitRedbWriteTransaction,
+                    ReversePhase1QuiesceStage::CaptureRedbWriteTransaction,
+                ],
+                "AC5: reverse migration MUST acquire all 8 locks in exact ADR-RB-07 #2 order"
+            );
+            assert_eq!(guard.redb().generation(), 1);
+            assert_eq!(guard.redb().git_redb_path(), git_path.as_path());
+            assert_eq!(guard.redb().capture_redb_path(), cap_path.as_path());
+
+            // Even WHILE `(git_wtx, cap_wtx)` are held, disk bytes stay 100%
+            // clean and byte-for-byte identical to pre-quiescence snapshots!
+            assert_eq!(
+                fs::read(&git_path).expect("read git.redb while quiesced"),
+                git_bytes_clean,
+                "Phase 1 CoW overlay must leave git.redb byte-identical while quiesced"
+            );
+            assert_eq!(
+                fs::read(&cap_path).expect("read capture.redb while quiesced"),
+                cap_bytes_clean,
+                "Phase 1 CoW overlay must leave capture.redb byte-identical while quiesced"
+            );
+
+            // Confirm via real OS child processes that ALL 8 locks are held!
+            run_child_busy_probe("probe_flock_busy", &migration_lock_path(&storage));
+            run_child_busy_probe("probe_maintenance_shared_busy", &storage);
+            run_child_busy_probe(
+                "probe_flock_busy",
+                &capture_spool_consumer_lock_path(&storage),
+            );
+            run_child_busy_probe(
+                "probe_flock_busy",
+                &capture_queue_writer_lock_path(&storage),
+            );
+            run_child_busy_probe(
+                "probe_flock_busy",
+                &capture_queue_append_lock_path(&storage),
+            );
+            run_child_busy_probe(
+                "probe_flock_busy",
+                &capture_spool_capacity_lock_path(&storage),
+            );
+            run_child_busy_probe("probe_redb_git_write_busy", &git_path);
+            run_child_busy_probe("probe_redb_capture_write_busy", &cap_path);
+
+            guard
+                .abort_and_release()
+                .expect("abort and release reverse quiesce guard");
+            assert_eq!(
+                fs::read(&git_path).expect("read git.redb after abort"),
+                git_bytes_clean,
+                "abort_and_release must leave git.redb byte-identical"
+            );
+            assert_eq!(
+                fs::read(&cap_path).expect("read capture.redb after abort"),
+                cap_bytes_clean,
+                "abort_and_release must leave capture.redb byte-identical"
+            );
+
+            // Second warm uncontended run (all 6 lock files materialized):
+            // verify `<= 50ms` uncontended performance budget!
+            let mut recorder2 = RecordingReverseObserver { stages: Vec::new() };
+            let started = Instant::now();
+            let guard2 = quiesce_reverse_repository_phase1_inner(&storage, Some(&mut recorder2))
+                .expect("warm uncontended reverse quiescence must succeed");
+            let elapsed = started.elapsed();
+            guard2
+                .abort_and_release()
+                .expect("release warm reverse quiesce guard");
+            assert!(
+                elapsed <= Duration::from_millis(50),
+                "RB-11 uncontended quiescence budget exceeded: {elapsed:?} > 50ms"
+            );
+            assert_eq!(recorder2.stages.len(), 8);
+            assert_eq!(fs::read(&git_path).expect("warm git"), git_bytes_clean);
+            assert_eq!(fs::read(&cap_path).expect("warm cap"), cap_bytes_clean);
+
+            // Pre-open real OS child `RedbGitStore` and `RedbCaptureStore`
+            // handles BEFORE quiescence and verify BOTH immediately receive
+            // `StorageBackendError::WriteLockBusy { role }` while `guard` holds
+            // `(git_wtx, cap_wtx)`!
+            let preopen_git = ChildLockHolder::spawn("preopen_redb_git_then_probe_busy", &git_path);
+            let preopen_cap =
+                ChildLockHolder::spawn("preopen_redb_capture_then_probe_busy", &cap_path);
+            let guard3 = quiesce_reverse_repository_phase1(&storage)
+                .expect("quiescence with idle pre-opened external handles must succeed");
+            preopen_git.release_and_wait();
+            preopen_cap.release_and_wait();
+            guard3
+                .abort_and_release()
+                .expect("release guard3 after pre-opened probes");
+
+            // Deterministic regression test for Phase 1 CoW overlay vs peer
+            // commit between `git.redb` open and `git_wtx` acquisition:
+            // a pre-opened external `RedbGitStore` commits a new ref right
+            // after `git_db` opens and drops its open-time `WRITER_BYTE`,
+            // immediately before `try_begin_reverse_source_write_tx(&git_db)`.
+            // The resulting `guard.redb().git_wtx()` MUST see the newly
+            // committed row (never a stale overlaid header snapshot)!
+            {
+                struct MidOpenPeerCommitObserver {
+                    peer: Option<ChildLockHolder>,
+                    fired: bool,
+                }
+                impl ReversePhase1LockObserver for MidOpenPeerCommitObserver {
+                    fn on_stage_acquired(&mut self, _stage: ReversePhase1QuiesceStage) {}
+
+                    fn on_after_git_db_open_before_git_wtx(&mut self) {
+                        if let Some(peer) = self.peer.take() {
+                            peer.release_and_wait();
+                            self.fired = true;
+                        }
+                    }
+                }
+                let peer =
+                    ChildLockHolder::spawn("preopen_redb_git_then_commit_mid_open", &git_path);
+                let mut mid_obs = MidOpenPeerCommitObserver {
+                    peer: Some(peer),
+                    fired: false,
+                };
+                let guard_mid =
+                    quiesce_reverse_repository_phase1_inner(&storage, Some(&mut mid_obs))
+                        .expect("quiescence must reconcile mid-open peer commit");
+                assert!(mid_obs.fired, "mid-open peer commit hook must have fired");
+                {
+                    let refs = guard_mid
+                        .redb()
+                        .git_wtx()
+                        .open_table(redb_git::REFERENCE_TABLE)
+                        .expect("open REFERENCE_TABLE in quiesced git_wtx");
+                    let got = refs
+                        .get((0u8, "refs/heads/rb11-mid-open-commit", ""))
+                        .expect("read mid-open committed ref")
+                        .expect("quiesced git_wtx MUST observe peer commit made between open and write_tx");
+                    assert_eq!(got.value(), b"rb11-committed-mid-open");
+                }
+                guard_mid
+                    .abort_and_release()
+                    .expect("release guard_mid after verifying mid-open peer commit");
+            }
+
+            // Re-verify AC1–AC4 when all 6 lock files already exist (exercises
+            // Phase 1 lock acquisition + zero-write rejection with zero residual
+            // lock held after rejection!).
+            for (mode, target_path, label) in [
+                ("hold_redb_git_write_tx", &git_path, "git.redb post-lock"),
+                (
+                    "hold_redb_capture_write_tx",
+                    &cap_path,
+                    "capture.redb post-lock",
+                ),
+            ] {
+                let holder = ChildLockHolder::spawn(mode, target_path);
+                let git_snap = fs::read(&git_path).expect("git snap before post-lock reject");
+                let cap_snap = fs::read(&cap_path).expect("cap snap before post-lock reject");
+                let err = quiesce_reverse_repository_phase1(&storage)
+                    .expect_err(&format!("{label} writer must fail closed"));
+                assert_eq!(err.stable_code_str(), "LBR-IO-001");
+                assert_eq!(fs::read(&git_path).expect("git bytes"), git_snap);
+                assert_eq!(fs::read(&cap_path).expect("cap bytes"), cap_snap);
+                holder.release_and_wait();
+            }
+        }
+
+        // --------------------------------------------------------------------
+        // GC-13 role isolation & manifest authority checks:
+        // --------------------------------------------------------------------
+        for forbidden_role in [
+            DatabaseRole::GlobalConfig,
+            DatabaseRole::SystemConfig,
+            DatabaseRole::Derived,
+        ] {
+            let err = quiesce_reverse_repository_phase1_for_role(&storage, forbidden_role)
+                .expect_err("GC-13 must reject non-repository role");
+            assert_eq!(err.stable_code_str(), "LBR-IO-001");
+        }
+
+        // Unfinalized manifest MUST fail closed `LBR-IO-001`.
+        let dummy_sha = "0".repeat(64);
+        let unfinalized = StorageFormatManifest::new_redb_in_progress(
+            1,
+            Some("sqlite-backup/00000001".to_string()),
+            Phase2Progress {
+                git_db: Some(Phase2DbState::FencedReadyToUnlink),
+                capture_db: Some(Phase2DbState::FencedReadyToUnlink),
+                spool_fenced: false,
+                git_redb: None,
+                cap_redb: None,
+                queue_fenced: false,
+            },
+            SourceDigests {
+                git_logical_sha256: Some(dummy_sha.clone()),
+                git_backup_sha256: Some(dummy_sha.clone()),
+                cap_logical_sha256: Some(dummy_sha.clone()),
+                cap_backup_sha256: Some(dummy_sha.clone()),
+                spool_manifest_sha256: Some(dummy_sha.clone()),
+                queue_manifest_sha256: Some(dummy_sha.clone()),
+                git_redb_sha256: None,
+                cap_redb_sha256: None,
+            },
+        )
+        .expect("build unfinalized redb manifest");
+        crate::storage::publish_storage_manifest(&storage, &unfinalized)
+            .expect("write unfinalized manifest");
+        let unfin_err = quiesce_reverse_repository_phase1(&storage)
+            .expect_err("unfinalized manifest must fail closed");
+        assert_eq!(unfin_err.stable_code_str(), "LBR-IO-001");
+
+        // Finalized SQLite manifest MUST fail closed `LBR-IO-001`.
+        let mut sqlite_manifest = StorageFormatManifest::new_sqlite_in_progress(
+            2,
+            0x1234_5678,
+            Some("redb-backup/00000001".to_string()),
+            Phase2Progress {
+                git_redb: Some(Phase2DbState::Unlinked),
+                cap_redb: Some(Phase2DbState::Unlinked),
+                queue_fenced: true,
+                spool_fenced: true,
+                git_db: None,
+                capture_db: None,
+            },
+            SourceDigests {
+                git_redb_sha256: Some(dummy_sha.clone()),
+                cap_redb_sha256: Some(dummy_sha.clone()),
+                queue_manifest_sha256: Some(dummy_sha.clone()),
+                spool_manifest_sha256: Some(dummy_sha),
+                git_logical_sha256: None,
+                git_backup_sha256: None,
+                cap_logical_sha256: None,
+                cap_backup_sha256: None,
+            },
+        )
+        .expect("build reverse sqlite manifest");
+        sqlite_manifest.targets_staged_for_rename = true;
+        let mut sqlite_finalized = sqlite_manifest
+            .into_finalized()
+            .expect("finalize reverse sqlite manifest");
+        sqlite_finalized.spool_unfenced = true;
+        crate::storage::publish_storage_manifest(&storage, &sqlite_finalized)
+            .expect("write finalized sqlite manifest");
+        let sqlite_err = quiesce_reverse_repository_phase1(&storage)
+            .expect_err("sqlite manifest must fail closed for reverse migration");
+        assert_eq!(sqlite_err.stable_code_str(), "LBR-IO-001");
     }
 }
