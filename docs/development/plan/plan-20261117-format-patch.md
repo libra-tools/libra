@@ -4550,7 +4550,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：核实 `-M`/`--find-renames`/`--no-renames` 双向 last-wins；封面信系列 diffstat 继承补丁重命名选项；`--no-renames --cover-letter` 正常写出封面信与补丁，diff 段与 Git 一致（hunk 头按 `DEFER-FP-01`、rename summary 行按 `DEFER-FPG-03` 不在本卡范围）。AC1–AC7 由 `format_patch_test::rename_options_and_cover_inherit` 覆盖；`format_patch_test` 148/148（含 14 个 `fp06_*` 门）、`compat_format_patch_mail_roundtrip` 15/15、`compat_format_patch_flag_surface` 通过；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试；封面信写入失败由 `FPG-62` 承接。
 
 **Description:** 自 `FPG-27` 拆出的独立轴：按 GC-01 核实 `issues/529#FP-06` 交付的 `-M`/`--find-renames`/`--no-renames` 与 Git 一致，并闭环 #904 重命名相关验收项：`--no-renames --cover-letter` 在可写路径成功、封面信继承 diff 选项；`0000-cover-letter.patch` 被目录占用时的写入失败与不留部分输出（#904 第 2 项）由自本卡拆出的 `FPG-62` 承接。 `issues/529#FP-06` 的 `fp06_*` 门族在本卡共享回归组中运行（不计本卡 AC）。
 

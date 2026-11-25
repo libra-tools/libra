@@ -185,7 +185,7 @@ The cover letter emits `MIME-Version`/`Content-Type`/`Content-Transfer-Encoding`
 headers only when at least one commit's raw object buffer contains non-ASCII
 bytes (Git's `make_cover_letter` rule); an all-ASCII series has no MIME headers.
 
-`format.coverLetter=true|false|auto` supplies the default (`auto` = only for series with more than one patch); `--cover-letter`/`--no-cover-letter` override it, and `--commit-list-format` implies a cover letter unless `--no-cover-letter` is given. The cover letter also carries the series diffstat (the tree difference from the unique boundary commit — the oldest patch's parent — to the last patch). `--no-stat`/`-p` only suppress the per-patch diffstat, and a series that starts at a root commit (no unique boundary) omits the cover diffstat. When `--cover-letter` is set, the list includes the cover letter as record
+`format.coverLetter=true|false|auto` supplies the default (`auto` = only for series with more than one patch); `--cover-letter`/`--no-cover-letter` override it, and `--commit-list-format` implies a cover letter unless `--no-cover-letter` is given. The cover letter also carries the series diffstat (the tree difference from the unique boundary commit — the oldest patch's parent — to the last patch). `--no-stat`/`-p` only suppress the per-patch diffstat, and a series that starts at a root commit (no unique boundary) omits the cover diffstat. The cover diffstat inherits the patch rename options (`-M`/`--find-renames`/`--no-renames`, last one wins). When `--cover-letter` is set, the list includes the cover letter as record
 number `0` before the commit patch records. Its filename is
 `0000-cover-letter` with the configured suffix (default `.patch`), or just `0`
 under `--numbered-files`.

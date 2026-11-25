@@ -4501,3 +4501,195 @@ fn cover_letter_includes_diffstat() {
         cover_body(&rename_cover.stdout)
     );
 }
+
+/// FPG-39: rename options follow last-one-wins and the cover diffstat inherits
+/// them; `--no-renames` emits delete+add and still writes a cover letter.
+#[test]
+fn rename_options_and_cover_inherit() {
+    use std::collections::BTreeSet;
+    use std::process::Command;
+
+    fn seed(root: &std::path::Path, libra: bool) {
+        let run = |args: &[&str]| {
+            let out = if libra {
+                run_libra_command(args, root)
+            } else {
+                Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .env("HOME", root)
+                    .output()
+                    .expect("git")
+            };
+            assert!(out.status.success(), "{args:?}: {out:?}");
+            out
+        };
+        if libra {
+            run(&["init", "."]);
+            run(&["config", "set", "user.name", "T"]);
+            run(&["config", "set", "user.email", "t@t"]);
+        } else {
+            run(&["init", "-q", "-b", "main", "."]);
+            run(&["config", "user.name", "T"]);
+            run(&["config", "user.email", "t@t"]);
+        }
+        fs::write(root.join("file"), "1\n2\n3\n4\n5\n").unwrap();
+        run(&["add", "file"]);
+        run(&["commit", "-m", "base"]);
+        run(&["mv", "file", "foo"]);
+        run(&["commit", "-m", "rename"]);
+    }
+
+    let libra_repo = tempdir().expect("libra");
+    let lp = libra_repo.path();
+    seed(lp, true);
+    let git_repo = tempdir().expect("git");
+    let gp = git_repo.path();
+    seed(gp, false);
+
+    let libra_run = |flags: &[&str]| -> String {
+        let mut args = vec!["format-patch"];
+        args.extend_from_slice(flags);
+        args.extend_from_slice(&["--stdout", "--no-thread", "--no-signature"]);
+        let out = run_libra_command(&args, lp);
+        assert_cli_success(&out, "libra format-patch");
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+    let git_run = |flags: &[&str]| -> String {
+        let mut cmd = Command::new("git");
+        cmd.args(["format-patch"])
+            .args(flags)
+            .args(["--stdout", "--no-thread", "--no-signature"])
+            .current_dir(gp)
+            .env("HOME", gp);
+        let out = cmd.output().expect("git");
+        assert!(out.status.success(), "git {flags:?}: {out:?}");
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+    let diff_segment = |text: &str| -> String {
+        // Compare the unified diff itself: Git's rename summary line
+        // (`rename file => foo (100%)`) is covered by DEFER-FPG-03.
+        text.find("diff --git ")
+            .map(|start| text[start..].to_string())
+            .unwrap_or_else(|| text.to_string())
+    };
+    let without_hunk_headers = |text: &str| -> String {
+        text.lines()
+            .filter(|line| !line.starts_with("@@"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    // AC1/AC2: a later -M re-enables rename detection.
+    let ac1 = diff_segment(&libra_run(&["--no-renames", "-M", "-1"]));
+    assert_eq!(
+        ac1,
+        diff_segment(&git_run(&["--no-renames", "-M", "-1"])),
+        "AC1 -M last wins"
+    );
+    assert_eq!(
+        diff_segment(&libra_run(&["--no-renames", "--find-renames", "-1"])),
+        ac1,
+        "AC2 --find-renames"
+    );
+    // AC3: --no-renames emits delete + add.
+    assert_eq!(
+        without_hunk_headers(&diff_segment(&libra_run(&["--no-renames", "-1"]))),
+        without_hunk_headers(&diff_segment(&git_run(&["--no-renames", "-1"]))),
+        "AC3 no-renames"
+    );
+
+    // AC4/AC5: cover letter + patch file on disk match Git.
+    let libra_files = run_libra_command(
+        &[
+            "format-patch",
+            "--no-renames",
+            "--cover-letter",
+            "-1",
+            "-o",
+            "d",
+            "--no-thread",
+            "--no-signature",
+        ],
+        lp,
+    );
+    assert_cli_success(&libra_files, "AC4 libra files");
+    let git_files = Command::new("git")
+        .args([
+            "format-patch",
+            "--no-renames",
+            "--cover-letter",
+            "-1",
+            "-o",
+            "d",
+            "--no-thread",
+            "--no-signature",
+        ])
+        .current_dir(gp)
+        .env("HOME", gp)
+        .output()
+        .expect("git");
+    assert!(git_files.status.success(), "{git_files:?}");
+    let names = |root: &std::path::Path| -> BTreeSet<String> {
+        fs::read_dir(root.join("d"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .collect()
+    };
+    assert_eq!(names(lp), names(gp), "AC4 file names");
+    let patch_name = names(lp)
+        .into_iter()
+        .find(|name| name.starts_with("0001-"))
+        .expect("patch file");
+    assert_eq!(
+        without_hunk_headers(&diff_segment(
+            &fs::read_to_string(lp.join("d").join(&patch_name)).unwrap()
+        )),
+        without_hunk_headers(&diff_segment(
+            &fs::read_to_string(gp.join("d").join(&patch_name)).unwrap()
+        )),
+        "AC5 patch diff"
+    );
+
+    // AC6/AC7: cover diffstat paths inherit -M / --no-renames.
+    let cover_stat_paths = |stdout: &[u8]| -> BTreeSet<String> {
+        let text = String::from_utf8_lossy(stdout).to_string();
+        let start = text.find("*** BLURB HERE ***").expect("blurb");
+        let tail = &text[start..];
+        let end = tail[1..]
+            .find("\nFrom ")
+            .map(|i| i + 1)
+            .unwrap_or(tail.len());
+        tail[..end]
+            .lines()
+            .filter_map(|line| {
+                line.split_once(" | ")
+                    .map(|(path, _)| path.trim().to_string())
+            })
+            .collect()
+    };
+    let libra_cover = |flags: &[&str]| -> String {
+        let mut args = vec!["format-patch"];
+        args.extend_from_slice(flags);
+        args.extend_from_slice(&[
+            "--cover-letter",
+            "-1",
+            "--stdout",
+            "--no-thread",
+            "--no-signature",
+        ]);
+        let out = run_libra_command(&args, lp);
+        assert_cli_success(&out, "cover");
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+    assert_eq!(
+        cover_stat_paths(libra_cover(&["--no-renames", "-M"]).as_bytes()),
+        BTreeSet::from(["file => foo".to_string()]),
+        "AC6 cover inherits -M"
+    );
+    assert_eq!(
+        cover_stat_paths(libra_cover(&["--no-renames"]).as_bytes()),
+        BTreeSet::from(["file".to_string(), "foo".to_string()]),
+        "AC7 cover inherits --no-renames"
+    );
+}

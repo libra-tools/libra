@@ -661,7 +661,7 @@ pub async fn execute_safe(mut args: FormatPatchArgs, output: &OutputConfig) -> C
     // object/config error therefore cannot leave a partially generated series.
     let mut rendered = Vec::with_capacity(total + usize::from(args.cover_letter));
     if args.cover_letter {
-        let series_stat = cover_letter_series_stat(&commits).await?;
+        let series_stat = cover_letter_series_stat(&args, &commits).await?;
         let cover_body = format_cover_letter(
             &args,
             &commits,
@@ -1613,7 +1613,10 @@ fn format_cover_letter(
 /// Series diffstat for the cover letter: the tree difference from the unique
 /// boundary commit (the oldest patch's parent) to the last patch. Git omits it
 /// when the series starts at a root commit (no boundary) or has no unique one.
-async fn cover_letter_series_stat(commits: &[Commit]) -> Result<Option<String>, CliError> {
+async fn cover_letter_series_stat(
+    args: &FormatPatchArgs,
+    commits: &[Commit],
+) -> Result<Option<String>, CliError> {
     let Some(first) = commits.first() else {
         return Ok(None);
     };
@@ -1626,12 +1629,16 @@ async fn cover_letter_series_stat(commits: &[Commit]) -> Result<Option<String>, 
     if commits.iter().any(|commit| commit.id == *origin) {
         return Ok(None);
     }
-    let argv: Vec<String> = vec![
-        "diff".to_string(),
-        "--stat".to_string(),
-        origin.to_string(),
-        last.id.to_string(),
-    ];
+    let mut argv: Vec<String> = vec!["diff".to_string(), "--stat".to_string()];
+    // The cover diffstat inherits the patch rename options (t4014 "cover-letter
+    // inherits diff options").
+    if args.no_renames {
+        argv.push("--no-renames".to_string());
+    } else if let Some(score) = &args.find_renames {
+        argv.push(format!("--find-renames={score}"));
+    }
+    argv.push(origin.to_string());
+    argv.push(last.id.to_string());
     let diff_args = crate::command::diff::DiffArgs::try_parse_from(&argv)
         .map_err(|error| CliError::command_usage(error.to_string()))?;
     let output = crate::command::diff::run_diff_for_service(diff_args).await?;
