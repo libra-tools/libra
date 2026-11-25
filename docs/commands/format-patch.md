@@ -50,8 +50,8 @@ body, and series metadata.
 | `--subject-prefix <PREFIX>` | | Use `PREFIX` instead of `PATCH` in the Subject: line | `PATCH` |
 | `--cover-letter` | | Generate a cover-letter template (`0000-cover-letter<suffix>`, or `0` under `--numbered-files`). Overrides `format.coverLetter=false` | false |
 | `--no-cover-letter` | | Do not generate a cover letter; overrides `format.coverLetter` and the implicit cover letter requested by `--commit-list-format` (last of `--cover-letter`/`--no-cover-letter` wins) | — |
-| `--thread` | | Add `In-Reply-To` and `References` headers (default on) | true |
-| `--no-thread` | | Disable threading headers | false |
+| `--thread[=<STYLE>]` | | Add `In-Reply-To` and `References` headers (default on). Bare `--thread` or `--thread=shallow` makes every patch reply to the cover letter/first patch; `--thread=deep` chains each patch as a reply to its predecessor, with `References` pointing at the thread root | true |
+| `--no-thread` | | Disable generated threading headers; an explicit `--in-reply-to` still adds the external parent to every mail | false |
 | `--in-reply-to <MESSAGE_ID>` | | Make the first mail a reply to the given Message-ID | none |
 | `--to <ADDRESS>` | | Add a `To:` header (repeatable; multiple addresses fold like git). Placed after the MIME headers, on each patch and the cover letter | none |
 | `--cc <ADDRESS>` | | Add a `Cc:` header (repeatable; folds like git) | none |

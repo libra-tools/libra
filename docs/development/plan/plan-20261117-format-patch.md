@@ -4828,7 +4828,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：`--thread` 支持 `shallow`/`deep` 可选值（`require_equals`，裸 `--thread`=shallow）；deep 逐封回复前一封、References 保持线程根；`--no-thread --in-reply-to` 为每封邮件保留外部父头但不生成 Message-ID。未改 `--thread` 默认值（由 `FPG-23` 承接）。AC1–AC7 由 `format_patch_test::thread_shallow_and_deep` 覆盖（7 个场景归一化线程结构与 Git 逐封一致，外部 ID 保留）；`format_patch_test` 152/152、`compat_format_patch_mail_roundtrip` 15/15、`compat_format_patch_flag_surface` 通过；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试。
 
 **Description:** 自 `FPG-23` 拆出的独立轴：`--thread` 接受可选值 `shallow`/`deep`（无值即 `shallow`），`deep` 时每封邮件回复上一封且 `References:` 依序列出外部父邮件、封面信与全部祖先；显式 `--no-thread` 时 `--in-reply-to` 按 Git 为每封邮件添加外部父邮件头（默认关闭由 `FPG-23` 承接，本卡以显式 `--no-thread` 验收）。默认值与 `format.thread` 由 `FPG-23` 承接。 浅线程在有封面信与 `--in-reply-to` 时，补丁 `References:` 依次列出外部父邮件与封面信（现行 `push_threading_headers` 只列外部父邮件，`src/command/format_patch.rs:1350`）。`--thread` 的值须以 `=` 紧贴（可选值参数），裸 `--thread` 之后的参数按修订解析。
 

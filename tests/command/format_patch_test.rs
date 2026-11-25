@@ -5019,3 +5019,156 @@ fn message_id_no_substring() {
         "AC4 threading structure"
     );
 }
+
+/// FPG-35: `--thread=shallow|deep` and `--no-thread --in-reply-to` produce the
+/// same normalized threading structure as Git (#916).
+#[test]
+fn thread_shallow_and_deep() {
+    use std::process::Command;
+
+    fn seed(root: &std::path::Path, libra: bool) {
+        let run = |args: &[&str]| {
+            let out = if libra {
+                run_libra_command(args, root)
+            } else {
+                Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .env("HOME", root)
+                    .output()
+                    .expect("git")
+            };
+            assert!(out.status.success(), "{args:?}: {out:?}");
+        };
+        if libra {
+            run(&["init", "."]);
+            run(&["config", "set", "user.name", "T"]);
+            run(&["config", "set", "user.email", "t@t"]);
+        } else {
+            run(&["init", "-q", "-b", "main", "."]);
+            run(&["config", "user.name", "T"]);
+            run(&["config", "user.email", "t@t"]);
+        }
+        for i in 1..=3 {
+            fs::write(root.join(format!("f{i}")), format!("x{i}\n")).unwrap();
+            run(&["add", &format!("f{i}")]);
+            run(&["commit", "-m", &format!("subject {i}")]);
+        }
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct Msg {
+        id: Option<usize>,
+        reply: Option<String>,
+        references: Vec<String>,
+    }
+    let parse = |stdout: &[u8]| -> Vec<(Option<String>, Option<String>, Vec<String>)> {
+        let text = format!("\n{}", String::from_utf8_lossy(stdout));
+        text.split("\nFrom ")
+            .skip(1)
+            .map(|segment| {
+                let headers = segment
+                    .split_once("\n\n")
+                    .map(|(headers, _)| headers)
+                    .unwrap_or(segment);
+                let mut id = None;
+                let mut reply = None;
+                let mut refs = Vec::new();
+                for line in headers.lines() {
+                    if let Some(value) = line.strip_prefix("Message-ID: ") {
+                        id = Some(value.trim().trim_matches(['<', '>']).to_string());
+                    } else if let Some(value) = line.strip_prefix("In-Reply-To: ") {
+                        reply = Some(value.trim().trim_matches(['<', '>']).to_string());
+                    } else if let Some(value) = line.strip_prefix("References: ") {
+                        refs = value
+                            .split_whitespace()
+                            .map(|value| value.trim_matches(['<', '>']).to_string())
+                            .collect();
+                    }
+                }
+                (id, reply, refs)
+            })
+            .collect()
+    };
+    let normalize = |stdout: &[u8]| -> Vec<Msg> {
+        let messages = parse(stdout);
+        let ids: Vec<&str> = messages
+            .iter()
+            .filter_map(|(id, _, _)| id.as_deref())
+            .collect();
+        let map = |value: &str| -> String {
+            ids.iter()
+                .position(|id| *id == value)
+                .map(|index| format!("#{index}"))
+                .unwrap_or_else(|| value.to_string())
+        };
+        messages
+            .iter()
+            .map(|(id, reply, refs)| Msg {
+                id: id
+                    .as_deref()
+                    .and_then(|id| ids.iter().position(|known| *known == id)),
+                reply: reply.as_deref().map(map),
+                references: refs.iter().map(|value| map(value)).collect(),
+            })
+            .collect()
+    };
+
+    let libra_repo = tempdir().expect("libra");
+    let lp = libra_repo.path();
+    seed(lp, true);
+    let git_repo = tempdir().expect("git");
+    let gp = git_repo.path();
+    seed(gp, false);
+
+    let cases: &[(&str, &[&str])] = &[
+        (
+            "AC1 shallow cover external",
+            &[
+                "--thread=shallow",
+                "--cover-letter",
+                "--in-reply-to=<test.message>",
+                "-3",
+            ],
+        ),
+        ("AC2 deep", &["--thread=deep", "-3"]),
+        (
+            "AC3 deep external",
+            &["--thread=deep", "--in-reply-to=<test.message>", "-3"],
+        ),
+        ("AC4 deep cover", &["--thread=deep", "--cover-letter", "-3"]),
+        (
+            "AC5 deep cover external",
+            &[
+                "--thread=deep",
+                "--cover-letter",
+                "--in-reply-to=<test.message>",
+                "-3",
+            ],
+        ),
+        (
+            "AC6 no-thread external",
+            &["--no-thread", "--in-reply-to=<test.message>", "-3"],
+        ),
+        ("AC7 bare thread", &["--thread", "-3"]),
+    ];
+    for (label, args) in cases {
+        let mut libra_args = vec!["format-patch"];
+        libra_args.extend_from_slice(args);
+        libra_args.extend_from_slice(&["--stdout", "--no-signature"]);
+        let libra_out = run_libra_command(&libra_args, lp);
+        assert_cli_success(&libra_out, label);
+        let git_out = Command::new("git")
+            .args(&libra_args)
+            .current_dir(gp)
+            .env("HOME", gp)
+            .output()
+            .expect("git");
+        assert!(git_out.status.success(), "{label}: {git_out:?}");
+        assert_eq!(
+            normalize(&libra_out.stdout),
+            normalize(&git_out.stdout),
+            "{label}"
+        );
+    }
+}

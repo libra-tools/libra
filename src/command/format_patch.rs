@@ -183,12 +183,21 @@ pub struct FormatPatchArgs {
     #[arg(long = "no-cover-letter", overrides_with = "cover_letter")]
     pub no_cover_letter: bool,
 
-    /// Add In-Reply-To and References headers so mailers thread the series
-    /// (default on).
-    #[arg(long = "thread", default_value_t = true)]
-    pub thread: bool,
+    /// Thread the series: bare `--thread` (or `--thread=shallow`) makes every
+    /// patch a reply to the cover letter/first patch; `--thread=deep` chains
+    /// each patch as a reply to its predecessor.
+    #[arg(
+        long = "thread",
+        value_name = "STYLE",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "shallow",
+        overrides_with = "no_thread"
+    )]
+    pub thread: Option<String>,
 
-    /// Disable threading headers.
+    /// Disable generated threading headers (an explicit `--in-reply-to` still
+    /// adds the external parent to every mail).
     #[arg(long = "no-thread", overrides_with = "thread")]
     pub no_thread: bool,
 
@@ -648,7 +657,7 @@ pub async fn execute_safe(mut args: FormatPatchArgs, output: &OutputConfig) -> C
     let base_block = build_base_block(&args, &commits).await?;
 
     // 3. Build thread Message-ID (used for --thread / --in-reply-to)
-    let thread_id = build_thread_id(&args, &commits);
+    let thread_id = build_thread_id(&args, &commits)?;
 
     // Resolve the `--from` identity once (shared across all patches).
     let from_identity = resolve_from_identity(&args).await?;
@@ -1415,30 +1424,57 @@ async fn build_base_block(
 // Threading helpers
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ThreadMode {
+    /// No generated Message-ID/threading; only an external parent may be added.
+    None,
+    Shallow,
+    Deep,
+}
+
 #[derive(Clone, Debug)]
 struct Threading {
     series_id: String,
     external_reply_to: Option<String>,
+    mode: ThreadMode,
 }
 
 /// Build deterministic message IDs for the series and retain an optional
 /// external parent separately. `--in-reply-to` is never reused as a generated
 /// Message-ID, which avoids duplicate IDs and accidental `<<id>>` headers.
-fn build_thread_id(args: &FormatPatchArgs, commits: &[Commit]) -> Option<Threading> {
-    if !args.thread || args.no_thread {
-        return None;
+fn build_thread_id(
+    args: &FormatPatchArgs,
+    commits: &[Commit],
+) -> Result<Option<Threading>, CliError> {
+    let mode = if args.no_thread {
+        ThreadMode::None
+    } else {
+        match args.thread.as_deref() {
+            None | Some("shallow") => ThreadMode::Shallow,
+            Some("deep") => ThreadMode::Deep,
+            Some(other) => {
+                return Err(CliError::failure(format!(
+                    "invalid --thread value '{other}' (expected shallow or deep)"
+                ))
+                .with_stable_code(StableErrorCode::CliInvalidArguments));
+            }
+        }
+    };
+    let external_reply_to = args.in_reply_to.as_deref().map(normalize_message_id);
+    if mode == ThreadMode::None && external_reply_to.is_none() {
+        return Ok(None);
     }
-    commits.first().map(|c| {
+    Ok(commits.first().map(|c| {
         let ts = c.committer.timestamp;
         let id = c.id.to_string();
         let short = &id[..8.min(id.len())];
         let series_id = format!("{short}-{ts}@libra");
-        let external_reply_to = args.in_reply_to.as_deref().map(normalize_message_id);
         Threading {
             series_id,
             external_reply_to,
+            mode,
         }
-    })
+    }))
 }
 
 fn normalize_message_id(value: &str) -> String {
@@ -1461,6 +1497,14 @@ fn push_threading_headers(
     let Some(threading) = threading else {
         return;
     };
+    if threading.mode == ThreadMode::None {
+        // `--no-thread` keeps only the external parent, on every mail.
+        if let Some(external) = threading.external_reply_to.as_deref() {
+            out.push_str(&format!("In-Reply-To: <{external}>\n"));
+            out.push_str(&format!("References: <{external}>\n"));
+        }
+        return;
+    }
     let is_first = patch_num == start_num;
     // Every patch ID carries a fixed-width numeric suffix, and the cover uses
     // `-cover`, so no generated value is a substring of another (the old bare
@@ -1470,19 +1514,54 @@ fn push_threading_headers(
     out.push_str(&format!("Message-ID: <{message_id}>\n"));
 
     let cover_id = format!("{}-cover", threading.series_id);
-    let reply_to = if has_cover_letter {
-        Some(cover_id.as_str())
-    } else if let Some(external) = threading.external_reply_to.as_deref() {
-        Some(external)
-    } else if total > 1 && !is_first {
-        Some(first_id.as_str())
-    } else {
-        None
+    let external = threading.external_reply_to.as_deref();
+    let (reply_to, reference) = match threading.mode {
+        ThreadMode::None => (None, None),
+        ThreadMode::Shallow => {
+            let reply_to = if has_cover_letter {
+                Some(cover_id.clone())
+            } else if let Some(external) = external {
+                Some(external.to_string())
+            } else if total > 1 && !is_first {
+                Some(first_id.clone())
+            } else {
+                None
+            };
+            let reference = external
+                .map(str::to_string)
+                .or(if has_cover_letter {
+                    Some(cover_id.clone())
+                } else {
+                    None
+                })
+                .or_else(|| reply_to.clone());
+            (reply_to, reference)
+        }
+        ThreadMode::Deep => {
+            let reply_to = if patch_num == start_num {
+                if has_cover_letter {
+                    Some(cover_id.clone())
+                } else {
+                    external.map(str::to_string)
+                }
+            } else {
+                Some(format!("{}-p{:08}", threading.series_id, patch_num - 1))
+            };
+            // Git's deep mode chains In-Reply-To but keeps References at the
+            // thread root (external parent, cover, or first patch).
+            let root = external.map(str::to_string).or(if has_cover_letter {
+                Some(cover_id)
+            } else {
+                Some(first_id)
+            });
+            (reply_to, root)
+        }
     };
     if let Some(reply_to) = reply_to {
         out.push_str(&format!("In-Reply-To: <{reply_to}>\n"));
-        let reference = threading.external_reply_to.as_deref().unwrap_or(reply_to);
-        out.push_str(&format!("References: <{reference}>\n"));
+        if let Some(reference) = reference {
+            out.push_str(&format!("References: <{reference}>\n"));
+        }
     }
 }
 
