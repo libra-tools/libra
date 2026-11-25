@@ -3225,7 +3225,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：读取 `format.useAutoBase`——`true`=`--base=auto`、`false` 关闭、`whenAble` 自动基线失败时静默省略；`--no-base`/显式 `--base` 覆盖配置；本地覆盖全局。AC1–AC7 由 `format_patch_test::format_use_auto_base` 覆盖（base 区块与同源 Git 逐字、无上游 true 失败、whenAble 静默且 stderr 无额外诊断、--no-base、本地 false 覆盖全局 true）；`format_patch_test` 162/162、`compat_format_patch_mail_roundtrip` 15/15、`compat_format_patch_flag_surface` 通过；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试。
 
 **Description:** 自 `FPG-17` 拆出的独立轴：经 `read_format_config` 读取 `format.useAutoBase`（`false`/`true`/`whenAble`），`true` 等价 `--base=auto`，`whenAble` 无法确定基线时静默省略，`--no-base` 覆盖配置。
 

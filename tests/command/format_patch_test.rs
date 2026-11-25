@@ -6771,3 +6771,270 @@ fn base_auto_cli() {
     assert!(!out.status.success(), "AC7 should fail: {out:?}");
     stderr_error("AC7", &out, "shouldn't be in revision list");
 }
+
+/// FPG-43: `format.useAutoBase` (true/false/whenAble) and `--no-base` override.
+#[test]
+fn format_use_auto_base() {
+    use std::process::Command;
+
+    fn git(dir: &std::path::Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("HOME", dir)
+            .env("GIT_AUTHOR_NAME", "T")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "T")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .expect("git");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+    fn setup_upstream() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        std::path::PathBuf,
+        String,
+    ) {
+        let g = tempdir().unwrap();
+        let gp = g.path();
+        git(gp, &["init", "-q", "-b", "main", "."]);
+        git(gp, &["config", "user.name", "T"]);
+        git(gp, &["config", "user.email", "t@t"]);
+        fs::write(gp.join("f"), "base\n").unwrap();
+        git(gp, &["add", "f"]);
+        git(gp, &["commit", "-q", "-m", "base"]);
+        git(gp, &["branch", "upstream"]);
+        fs::write(gp.join("f"), "prereq\n").unwrap();
+        git(gp, &["add", "f"]);
+        git(gp, &["commit", "-q", "-m", "prereq"]);
+        for subject in ["m1", "m2"] {
+            fs::write(gp.join("f"), format!("{subject}\n")).unwrap();
+            git(gp, &["add", "f"]);
+            git(gp, &["commit", "-q", "-m", subject]);
+        }
+        git(gp, &["checkout", "-q", "upstream"]);
+        fs::write(gp.join("u"), "u2\n").unwrap();
+        git(gp, &["add", "u"]);
+        git(gp, &["commit", "-q", "-m", "u2"]);
+        let upstream = git(gp, &["rev-parse", "HEAD"]);
+        git(gp, &["checkout", "-q", "main"]);
+        git(gp, &["config", "branch.main.remote", "."]);
+        git(gp, &["config", "branch.main.merge", "refs/heads/upstream"]);
+        let parent = tempdir().unwrap();
+        let lp = parent.path().join("libra");
+        fs::create_dir_all(&lp).unwrap();
+        assert_cli_success(
+            &run_libra_command(
+                &["init", "--from-git-repository", gp.to_str().unwrap(), "."],
+                &lp,
+            ),
+            "import",
+        );
+        let branch = String::from_utf8_lossy(
+            &run_libra_command(&["rev-parse", "--abbrev-ref", "HEAD"], &lp).stdout,
+        )
+        .trim()
+        .to_string();
+        assert_cli_success(
+            &run_libra_command(&["branch", "upstream", &upstream], &lp),
+            "upstream branch",
+        );
+        assert_cli_success(
+            &run_libra_command(
+                &["config", "set", &format!("branch.{branch}.remote"), "."],
+                &lp,
+            ),
+            "remote",
+        );
+        assert_cli_success(
+            &run_libra_command(
+                &[
+                    "config",
+                    "set",
+                    &format!("branch.{branch}.merge"),
+                    "refs/heads/upstream",
+                ],
+                &lp,
+            ),
+            "merge",
+        );
+        (g, parent, lp, upstream)
+    }
+    let base_block = |stdout: &[u8]| -> Vec<String> {
+        String::from_utf8_lossy(stdout)
+            .lines()
+            .filter(|line| {
+                line.starts_with("base-commit:") || line.starts_with("prerequisite-patch-id:")
+            })
+            .map(str::to_string)
+            .collect()
+    };
+    let config = |lp: &std::path::Path, value: &str| {
+        assert_cli_success(
+            &run_libra_command(&["config", "set", "format.useAutoBase", value], lp),
+            "config",
+        );
+    };
+
+    let (g1, _parent, lp, _) = setup_upstream();
+    let gp = g1.path();
+    // AC1: true behaves like --base=auto.
+    config(&lp, "true");
+    assert!(
+        Command::new("git")
+            .args(["config", "format.useAutoBase", "true"])
+            .current_dir(gp)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let libra = run_libra_command(
+        &[
+            "format-patch",
+            "-2",
+            "--stdout",
+            "--no-thread",
+            "--no-signature",
+        ],
+        &lp,
+    );
+    assert_cli_success(&libra, "AC1");
+    let git_out = Command::new("git")
+        .args([
+            "format-patch",
+            "-2",
+            "--stdout",
+            "--no-thread",
+            "--no-signature",
+        ])
+        .current_dir(gp)
+        .env("HOME", gp)
+        .output()
+        .unwrap();
+    assert!(git_out.status.success(), "{git_out:?}");
+    assert_eq!(
+        base_block(&libra.stdout),
+        base_block(&git_out.stdout),
+        "AC1"
+    );
+    // AC6: whenAble also emits the block when the upstream exists.
+    config(&lp, "whenAble");
+    let whenable = run_libra_command(
+        &[
+            "format-patch",
+            "-2",
+            "--stdout",
+            "--no-thread",
+            "--no-signature",
+        ],
+        &lp,
+    );
+    assert_cli_success(&whenable, "AC6");
+    assert_eq!(
+        base_block(&whenable.stdout),
+        base_block(&git_out.stdout),
+        "AC6 whenAble"
+    );
+    // AC5: --no-base wins over the config.
+    config(&lp, "true");
+    let no_base = run_libra_command(
+        &[
+            "format-patch",
+            "-2",
+            "--no-base",
+            "--stdout",
+            "--no-thread",
+            "--no-signature",
+        ],
+        &lp,
+    );
+    assert_cli_success(&no_base, "AC5");
+    assert!(base_block(&no_base.stdout).is_empty(), "AC5 --no-base");
+    // AC7: local false overrides global true.
+    assert_cli_success(
+        &run_libra_command(
+            &["config", "--global", "set", "format.useAutoBase", "true"],
+            &lp,
+        ),
+        "global true",
+    );
+    config(&lp, "false");
+    let local_false = run_libra_command(
+        &[
+            "format-patch",
+            "-2",
+            "--stdout",
+            "--no-thread",
+            "--no-signature",
+        ],
+        &lp,
+    );
+    assert_cli_success(&local_false, "AC7");
+    assert!(
+        base_block(&local_false.stdout).is_empty(),
+        "AC7 local false"
+    );
+    let _ = run_libra_command(&["config", "--global", "unset", "format.useAutoBase"], &lp);
+
+    // AC2/AC3/AC4: no upstream.
+    let no_up = tempdir().unwrap();
+    let np = no_up.path();
+    assert_cli_success(&run_libra_command(&["init", "."], np), "init");
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "user.name", "T"], np),
+        "name",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "user.email", "t@t"], np),
+        "email",
+    );
+    fs::write(np.join("f"), "x\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "f"], np), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "one", "--no-verify"], np),
+        "commit",
+    );
+    let baseline = run_libra_command(
+        &[
+            "format-patch",
+            "-1",
+            "--stdout",
+            "--no-thread",
+            "--no-signature",
+        ],
+        np,
+    );
+    assert_cli_success(&baseline, "baseline");
+    config(np, "whenAble");
+    let whenable = run_libra_command(
+        &[
+            "format-patch",
+            "-1",
+            "--stdout",
+            "--no-thread",
+            "--no-signature",
+        ],
+        np,
+    );
+    assert_cli_success(&whenable, "AC3");
+    assert!(base_block(&whenable.stdout).is_empty(), "AC3 omitted");
+    assert_eq!(whenable.stderr, baseline.stderr, "AC4 no extra diagnostics");
+    config(np, "true");
+    let true_no_up = run_libra_command(
+        &[
+            "format-patch",
+            "-1",
+            "--stdout",
+            "--no-thread",
+            "--no-signature",
+        ],
+        np,
+    );
+    assert!(!true_no_up.status.success(), "AC2");
+    let stderr = String::from_utf8_lossy(&true_no_up.stderr);
+    assert!(stderr.lines().any(|line| line == "Error-Code: LBR-CLI-003"));
+    assert!(stderr.contains("failed to get upstream"), "{stderr}");
+    assert!(true_no_up.stdout.is_empty());
+}

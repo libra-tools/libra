@@ -271,6 +271,11 @@ pub struct FormatPatchArgs {
     #[arg(long = "base", value_name = "COMMIT")]
     pub base: Option<String>,
 
+    /// Internal: `format.useAutoBase=whenAble` (not a CLI flag). Auto-base
+    /// failures are silently ignored instead of aborting.
+    #[arg(skip)]
+    pub base_when_able: bool,
+
     /// Create multipart/mixed messages with the commit log in the body and the
     /// patch itself as a separate `attachment` part.
     #[arg(long = "attach", conflicts_with = "inline")]
@@ -1573,7 +1578,11 @@ async fn build_base_block(
     };
 
     let base = if base_spec == "auto" {
-        auto_base_commit(args, commits).await?
+        match auto_base_commit(args, commits).await {
+            Ok(base) => base,
+            Err(_) if args.base_when_able => return Ok(None),
+            Err(error) => return Err(error),
+        }
     } else {
         resolve_single_rev(base_spec).await?
     };
@@ -2626,6 +2635,29 @@ async fn resolve_format_config(args: &mut FormatPatchArgs) -> Result<(), FormatP
     // `format.commitListFormat` supplies the default list format; only the
     // command-line option implies a cover letter (Git's `cover_letter == -1`
     // check), so this config value must not force one.
+    let base_cli = args.base.is_some() || args.no_base;
+    if !base_cli
+        && args.base.is_none()
+        && !args.no_base
+        && let Some(value) = read_format_config("format.useAutoBase").await?
+    {
+        let trimmed = value.trim();
+        if trimmed.eq_ignore_ascii_case("whenAble") {
+            args.base = Some("auto".to_string());
+            args.base_when_able = true;
+        } else {
+            let enabled = crate::internal::config::parse_git_config_bool(trimmed).ok_or(
+                FormatPatchError::InvalidConfig {
+                    key: "format.useAutoBase",
+                    value,
+                    expected: "true, false, or whenAble",
+                },
+            )?;
+            if enabled {
+                args.base = Some("auto".to_string());
+            }
+        }
+    }
     if args.commit_list_format.is_none()
         && let Some(value) = read_format_config("format.commitListFormat").await?
     {

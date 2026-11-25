@@ -44,6 +44,7 @@ Merge commits 默认跳过。当 revision range 解析为零个提交时，命�
 | `--no-cover-letter` | | 不生成封面信；覆盖 `format.coverLetter` 以及 `--commit-list-format` 隐含的封面信（与 `--cover-letter` 以最后者为准） | — |
 | `--thread[=<STYLE>]` | | 添加生成的 `Message-ID`/`In-Reply-To`/`References` headers（默认关闭）。裸 `--thread` 或 `--thread=shallow` 使每封补丁回复封面信/首补丁；`--thread=deep` 使每封补丁回复前一封，`References` 指向线程根 | false |
 | `--no-thread` | | 禁用生成的 threading headers；显式 `--in-reply-to` 仍会为每封邮件添加外部父邮件头 | false |
+| `format.useAutoBase`（配置） | | `true` 等价 `--base=auto`；`whenAble` 仅在能确定唯一上游 merge base 时自动取基线、否则静默省略 base 区块；`false` 关闭。`--no-base` 与显式 `--base` 覆盖配置 | — |
 | `format.commitListFormat`（配置） | | 封面信列表默认格式（语法同 `--commit-list-format`，含 `log:`/原子）；命令行选项优先，且与命令行不同，配置本身不隐含封面信；`full` 按无效格式串拒绝 | — |
 | `format.thread`（配置） | | `true`/`shallow`（不区分大小写）为浅线程，`deep` 为深线程，`false`/空值关闭；本地层覆盖全局层，同层后写者生效；命令行 flag 覆盖配置，且 `--thread`/`--thread=<style>`/`--no-thread` 以最后者为准 | — |
 | `--in-reply-to <MESSAGE_ID>` | | 让第一封邮件回复给定 Message-ID | 无 |
