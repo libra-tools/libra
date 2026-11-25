@@ -2562,7 +2562,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：封面信正文对齐 Git `prepare_cover_text`——标题占位符只写入 `Subject:` 头，正文以 `*** BLURB HERE ***` 开头。AC1/AC2 由 `format_patch_test::cover_letter_body_template_matches_git` 覆盖（正文以 BLURB 开头且不含标题占位符；Subject 行逐字 `[PATCH 0/2] *** SUBJECT HERE ***`）；`format_patch_test` 146/146、`compat_format_patch_mail_roundtrip` 15/15、`compat_format_patch_flag_surface` 通过；开发文档已记录核对结论（EN/zh 文档与 `COMPATIBILITY.md` 本卡无新增标记，核对无改动）。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试；封面信 diffstat 仍由 `FPG-13` 承接。
 
 **Description:** 自 `FPG-13` 拆出的独立轴（先于 `FPG-13` 执行）：把封面信正文模板改为 Git `prepare_cover_text` 的形式——标题占位符 `*** SUBJECT HERE ***` 只写入 `Subject:` 头，正文以 `*** BLURB HERE ***` 开头（`git show 6de20f6092:builtin/log.c` 第 1288–1323 行）；现行 `format_cover_letter` 在正文先多写一行 `*** SUBJECT HERE ***`（`src/command/format_patch.rs:1422-1423`），使之后各卡的封面信正文、描述段黄金比较不受该差异影响。
 

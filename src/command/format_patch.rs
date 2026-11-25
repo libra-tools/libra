@@ -1568,7 +1568,8 @@ fn format_cover_letter(
     push_recipient_headers(&mut out, &to, &cc);
     out.push('\n');
 
-    out.push_str("*** SUBJECT HERE ***\n\n");
+    // Git's `prepare_cover_text` writes the subject placeholder only into the
+    // `Subject:` header; the body starts with the blurb placeholder.
     out.push_str("*** BLURB HERE ***\n\n");
 
     // Commit list. Git's default is a shortlog grouped by author

@@ -4305,3 +4305,52 @@ fn format_cover_letter_auto_config() {
         "AC6 shortlog cover list"
     );
 }
+
+/// FPG-58: the cover-letter body starts with `*** BLURB HERE ***`; the subject
+/// placeholder stays in the `Subject:` header only (#905).
+#[test]
+fn cover_letter_body_template_matches_git() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    fs::write(p.join("second.txt"), "second\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "second.txt"], p), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "second", "--no-verify"], p),
+        "commit",
+    );
+
+    let out = run_libra_command(
+        &[
+            "format-patch",
+            "--cover-letter",
+            "-2",
+            "--stdout",
+            "--no-thread",
+            "--no-signature",
+        ],
+        p,
+    );
+    assert_cli_success(&out, "cover letter");
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    let cover = text
+        .split_once("\nFrom ")
+        .map(|(cover, _)| cover)
+        .unwrap_or(&text);
+    let mut lines = cover.lines();
+    let subject = lines
+        .find(|line| line.starts_with("Subject: "))
+        .unwrap_or_default();
+    assert_eq!(
+        subject, "Subject: [PATCH 0/2] *** SUBJECT HERE ***",
+        "AC2 subject header"
+    );
+    let (_, body) = cover.split_once("\n\n").expect("header/body separator");
+    assert!(
+        body.starts_with("*** BLURB HERE ***\n"),
+        "AC1 body starts with the blurb placeholder: {body:?}"
+    );
+    assert!(
+        !body.contains("*** SUBJECT HERE ***"),
+        "AC1 subject placeholder is not repeated in the body: {body:?}"
+    );
+}
