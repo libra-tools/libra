@@ -4332,7 +4332,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：新增 `-U<n>`/`--unified=<n>`；`FormatPatchArgs.unified` 经 `CommitDiffOptions.context_lines`（默认 3）与父提交路径的 `DiffArgs --unified=<n>` 透传到共享 diff 渲染引擎；`CommitDiffOptions::default()` 的 histogram/full_index/prefix 字段不变。AC1/AC2 由 `format_patch_test::unified_context_lines` 覆盖（`-U1`、`--unified=5` 与 Git 黄金 diff 段逐字且两两不同），AC3–AC7 由 `log::commit_diff_options_tests::defaults_keep_three_context_lines_and_prefixes` 覆盖；`format_patch_test` 134/134。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试。
 
 **Description:** 在 `FormatPatchArgs` 新增 `-U<n>`/`--unified=<n>`，经 `log::CommitDiffOptions` 透传到 `src/command/diff/` 渲染引擎控制上下文行数。自本卡拆出 `FPG-27` 处理 `--diff-filter` 与重命名核验、`FPG-61` 处理 `--full-diff`。
 

@@ -3043,3 +3043,114 @@ fn numstat_lives_in_the_attach_text_part() {
         "numstat must stay in the text/plain part"
     );
 }
+
+/// I957/FPG-22: `-U<n>` and `--unified=<n>` control hunk context like Git.
+#[test]
+fn unified_context_lines() {
+    use std::process::Command;
+
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    let body: String = (1..=20).map(|n| format!("{n}\n")).collect();
+    fs::write(p.join("f.txt"), &body).unwrap();
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], p), "add base");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], p),
+        "base",
+    );
+    let changed = body.replace("\n10\n", "\nten\n");
+    fs::write(p.join("f.txt"), changed).unwrap();
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], p), "add change");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "change", "--no-verify"], p),
+        "change",
+    );
+
+    let diff_section = |stdout: &str| -> String {
+        let start = stdout.find("diff --git").unwrap_or(0);
+        stdout[start..].to_string()
+    };
+    let libra_u1 = String::from_utf8_lossy(
+        &run_libra_command(
+            &[
+                "format-patch",
+                "-1",
+                "--stdout",
+                "-U1",
+                "--no-thread",
+                "--no-signature",
+            ],
+            p,
+        )
+        .stdout,
+    )
+    .to_string();
+    let libra_u5 = String::from_utf8_lossy(
+        &run_libra_command(
+            &[
+                "format-patch",
+                "-1",
+                "--stdout",
+                "--unified=5",
+                "--no-thread",
+                "--no-signature",
+            ],
+            p,
+        )
+        .stdout,
+    )
+    .to_string();
+    assert!(
+        diff_section(&libra_u1).contains("@@ -9,3 +9,3 @@"),
+        "AC1 U1 header"
+    );
+    assert!(
+        diff_section(&libra_u5).contains("@@ -5,11 +5,11 @@"),
+        "AC2 U5 header"
+    );
+    assert_ne!(diff_section(&libra_u1), diff_section(&libra_u5));
+
+    // Git golden diff sections (same fixture, deterministic dates).
+    let git_dir = tempdir().expect("git dir");
+    let g = git_dir.path();
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(g)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .env("HOME", g)
+            .output()
+            .expect("git");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+        out
+    };
+    git(&["init", "-q", "-b", "main", "."]);
+    fs::write(g.join("f.txt"), &body).unwrap();
+    git(&["add", "f.txt"]);
+    git(&["commit", "-q", "-m", "base"]);
+    fs::write(g.join("f.txt"), body.replace("\n10\n", "\nten\n")).unwrap();
+    git(&["add", "f.txt"]);
+    git(&["commit", "-q", "-m", "change"]);
+    for (flag, libra) in [("-U1", &libra_u1), ("--unified=5", &libra_u5)] {
+        let git_patch = String::from_utf8_lossy(
+            &git(&[
+                "format-patch",
+                "-1",
+                "--stdout",
+                flag,
+                "--no-thread",
+                "--no-signature",
+            ])
+            .stdout,
+        )
+        .to_string();
+        assert_eq!(
+            diff_section(libra).trim_end(),
+            diff_section(&git_patch).trim_end(),
+            "FPG-22 {flag} diff section must match Git"
+        );
+    }
+}

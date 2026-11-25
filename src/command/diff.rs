@@ -4331,7 +4331,7 @@ fn raw_mode(mode: Option<u32>) -> String {
 /// context lines while keeping git_internal's header (`diff --git` / mode /
 /// `index` / `---` / `+++`). A diff with no hunk line (binary marker or
 /// identical content) is returned unchanged.
-fn rewrite_unified_diff_context(
+pub(crate) fn rewrite_unified_diff_context(
     raw_diff: &str,
     old_text: &str,
     new_text: &str,

@@ -64,6 +64,7 @@ body, and series metadata.
 | `--inline` | | Like `--attach`, but the patch part uses `Content-Disposition: inline` | off |
 | `--base <COMMIT>` | | Record a `base-commit:` trailer (and a `prerequisite-patch-id:` line for each non-merge commit between the base and the series, oldest-first) so `git am --base` can verify the series applies. The trailer rides on the last patch, or the cover letter under `--cover-letter`. The base must be an ancestor of the series (otherwise exit 128). `--base=auto` is not supported (exit 129). Patch-ids match `git patch-id --stable` for text diffs; **binary-file prerequisites are not guaranteed to match Git** | off |
 | `--full-index` | | Show full object IDs in diff index header lines | false |
+| `-U <N>`, `--unified=<N>` | | Generate hunks with `N` lines of context (Git's `-U<n>` / `--unified=<n>`); default 3 | 3 |
 | `--minimal` | | Request the smallest Myers edit script; Libra's default Myers backend already guarantees this, so output is equivalent to the default | false |
 | `--histogram` | | Generate text hunks with the Histogram diff algorithm | false |
 | `--ignore-if-in-upstream` | | Suppress commits whose stable patch-id already appears on the excluded side of the range | false |

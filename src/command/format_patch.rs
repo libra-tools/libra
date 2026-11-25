@@ -259,6 +259,10 @@ pub struct FormatPatchArgs {
     #[arg(long = "full-index")]
     pub full_index: bool,
 
+    /// Generate hunks with N lines of context (Git's `-U<n>` / `--unified=<n>`).
+    #[arg(short = 'U', long = "unified", value_name = "N")]
+    pub unified: Option<usize>,
+
     /// Spend extra time finding the smallest Myers diff. Libra's default Myers
     /// backend already guarantees a shortest edit script, so this is output-
     /// equivalent to the default.
@@ -1899,6 +1903,9 @@ async fn diff_engine_patch_parts(
         if args.full_index {
             argv.push("--full-index".to_string());
         }
+        if let Some(context) = args.unified {
+            argv.push(format!("--unified={context}"));
+        }
         if args.no_renames {
             argv.push("--no-renames".to_string());
         } else if let Some(score) = &args.find_renames {
@@ -1937,6 +1944,7 @@ fn commit_diff_options(args: &FormatPatchArgs) -> log::CommitDiffOptions {
         full_index: args.full_index,
         source_prefix: args.src_prefix.clone().unwrap_or_else(|| "a/".to_string()),
         destination_prefix: args.dst_prefix.clone().unwrap_or_else(|| "b/".to_string()),
+        context_lines: args.unified.unwrap_or(3),
     }
 }
 

@@ -6264,6 +6264,7 @@ pub(crate) struct CommitDiffOptions {
     pub(crate) full_index: bool,
     pub(crate) source_prefix: String,
     pub(crate) destination_prefix: String,
+    pub(crate) context_lines: usize,
 }
 
 impl Default for CommitDiffOptions {
@@ -6273,7 +6274,23 @@ impl Default for CommitDiffOptions {
             full_index: false,
             source_prefix: "a/".to_string(),
             destination_prefix: "b/".to_string(),
+            context_lines: 3,
         }
+    }
+}
+
+#[cfg(test)]
+mod commit_diff_options_tests {
+    use super::CommitDiffOptions;
+
+    #[test]
+    fn defaults_keep_three_context_lines_and_prefixes() {
+        let options = CommitDiffOptions::default();
+        assert_eq!(options.context_lines, 3);
+        assert!(!options.histogram);
+        assert!(!options.full_index);
+        assert_eq!(options.source_prefix, "a/");
+        assert_eq!(options.destination_prefix, "b/");
     }
 }
 
@@ -6308,6 +6325,27 @@ pub(crate) async fn generate_diff_with_options(
     let mut diffs = build_commit_diff_items(old_blobs, new_blobs, paths)?;
     for item in &mut diffs {
         let path = PathBuf::from(&item.path);
+        if options.context_lines != 3 && item.data.contains("\n@@ ") {
+            let old_text = old_map
+                .get(&path)
+                .map(load_commit_blob_content)
+                .transpose()?
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                .unwrap_or_default();
+            let new_text = new_map
+                .get(&path)
+                .map(load_commit_blob_content)
+                .transpose()?
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                .unwrap_or_default();
+            item.data = diff::rewrite_unified_diff_context(
+                &item.data,
+                &old_text,
+                &new_text,
+                options.context_lines,
+                &diff::DiffAlgorithm::Myers,
+            );
+        }
         if options.histogram && item.data.contains("\n@@ ") {
             let old_text = old_map
                 .get(&path)
