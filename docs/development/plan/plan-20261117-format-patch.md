@@ -2781,7 +2781,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：读取 `format.commitListFormat` 作为默认列表格式，命令行优先；仅命令行格式选项隐含封面信，配置不隐含；`full` 按 Git 基线以无效格式串拒绝；`--no-cover-letter` 与 CLI 格式组合成功且不写封面信。AC1–AC7 由 `format_patch_test::commit_list_format_config_and_full` 覆盖（配置 log/atoms、modern、shortlog、CLI 覆盖、配置不隐含封面、no-cover-letter 组合，列表段与 Git 逐字；`full` 稳定错误码）；`format_patch_test` 159/159、`compat_format_patch_mail_roundtrip` 15/15、`compat_format_patch_flag_surface` 通过；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试。
 
 **Description:** 自 `FPG-14` 拆出的独立轴：读取 `format.commitListFormat`（取值语法同命令行；命令行 `--commit-list-format` 优先；按 Git 只有命令行格式选项隐含封面信，配置不隐含），并保证 `--no-cover-letter` 与格式选项同用时成功且不写封面信。#899 第 4 项与 #909 第 4 项所称 `full` 关键字及上游「cover letter full format」用例在 `git@6de20f6092` 中不存在（`builtin/log.c` 只接受 `log:` 前缀、`shortlog`、`modern` 与含 `%` 的串，其余 `die`；该 revision 的 t4014 无此用例）；本计划以上游为准，`full` 按无效格式串拒绝（与 `FPG-14` 无原子字面量同一错误契约），并在关闭 #899、#909 时于 issue 中说明。
 

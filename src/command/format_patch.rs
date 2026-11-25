@@ -558,6 +558,7 @@ pub async fn execute_safe(mut args: FormatPatchArgs, output: &OutputConfig) -> C
     // implicit cover letter requested by `--commit-list-format`.
     let cover_cli = args.cover_letter;
     let no_cover_cli = args.no_cover_letter;
+    let commit_list_cli = args.commit_list_format.is_some();
     // Git validates `--from=<ident>` before revision parsing and the empty-series
     // check, so a malformed identity wins over an empty range.
     if let Some(Some(ident)) = args.from.as_ref()
@@ -623,7 +624,7 @@ pub async fn execute_safe(mut args: FormatPatchArgs, output: &OutputConfig) -> C
             )?
         };
     }
-    if !no_cover_cli && args.commit_list_format.is_some() {
+    if !no_cover_cli && commit_list_cli {
         // `--commit-list-format` implies a cover letter (Git's `#909`).
         args.cover_letter = true;
     }
@@ -2423,6 +2424,14 @@ async fn resolve_format_config(args: &mut FormatPatchArgs) -> Result<(), FormatP
     // Each value fully determines the style; the strict cascade already gives
     // local-over-global and last-write-wins at the same layer.
     let thread_cli = args.thread.is_some() || args.no_thread;
+    // `format.commitListFormat` supplies the default list format; only the
+    // command-line option implies a cover letter (Git's `cover_letter == -1`
+    // check), so this config value must not force one.
+    if args.commit_list_format.is_none()
+        && let Some(value) = read_format_config("format.commitListFormat").await?
+    {
+        args.commit_list_format = Some(value);
+    }
     if !thread_cli && let Some(value) = read_format_config("format.thread").await? {
         let trimmed = value.trim();
         args.thread = if trimmed.is_empty() {

@@ -6105,3 +6105,177 @@ fn base_block_rides_on_first_mail() {
     assert!(!blocks[0].is_empty(), "AC2 cover has base block");
     assert!(blocks[1].is_empty() && blocks[2].is_empty(), "AC2 patches");
 }
+
+/// FPG-49: `format.commitListFormat` supplies only the default format (it does
+/// not imply a cover letter); `full` is rejected and `--no-cover-letter`
+/// combines with a CLI format (#899, #900, #909).
+#[test]
+fn commit_list_format_config_and_full() {
+    use std::collections::BTreeSet;
+    use std::process::Command;
+
+    fn seed(root: &std::path::Path, libra: bool) {
+        let run = |args: &[&str]| {
+            let out = if libra {
+                run_libra_command(args, root)
+            } else {
+                Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .env("HOME", root)
+                    .output()
+                    .expect("git")
+            };
+            assert!(out.status.success(), "{args:?}: {out:?}");
+        };
+        if libra {
+            run(&["init", "."]);
+            run(&["config", "set", "user.name", "A U Thor"]);
+            run(&["config", "set", "user.email", "author@example.com"]);
+        } else {
+            run(&["init", "-q", "-b", "main", "."]);
+            run(&["config", "user.name", "A U Thor"]);
+            run(&["config", "user.email", "author@example.com"]);
+        }
+        for i in 1..=3 {
+            fs::write(root.join(format!("f{i}")), format!("x{i}\n")).unwrap();
+            run(&["add", &format!("f{i}")]);
+            run(&["commit", "-m", &format!("This is a subject {i}")]);
+        }
+    }
+    let segment = |text: &str| -> String {
+        let start = text.find("*** BLURB HERE ***").expect("blurb");
+        let tail = &text[start..];
+        let end = tail
+            .lines()
+            .scan(0usize, |offset, line| {
+                let start = *offset;
+                *offset += line.len() + 1;
+                Some((start, line))
+            })
+            .find(|(_, line)| line.contains(" | ") && line.starts_with(' '))
+            .map(|(offset, _)| offset)
+            .unwrap_or(tail.len());
+        tail[..end].trim_end().to_string()
+    };
+
+    let libra_repo = tempdir().expect("libra");
+    let lp = libra_repo.path();
+    seed(lp, true);
+    let git_repo = tempdir().expect("git");
+    let gp = git_repo.path();
+    seed(gp, false);
+
+    let set_both = |key: &str, value: &str| {
+        assert_cli_success(
+            &run_libra_command(&["config", "set", key, value], lp),
+            "libra config",
+        );
+        assert!(
+            Command::new("git")
+                .args(["config", key, value])
+                .current_dir(gp)
+                .status()
+                .unwrap()
+                .success()
+        );
+    };
+    let unset_both = |key: &str| {
+        let _ = run_libra_command(&["config", "unset", key], lp);
+        let _ = Command::new("git")
+            .args(["config", "--unset", key])
+            .current_dir(gp)
+            .status();
+    };
+    let run_both = |label: &str, flags: &[&str]| -> (std::path::PathBuf, std::path::PathBuf) {
+        let _ = fs::remove_dir_all(lp.join("patches"));
+        let _ = fs::remove_dir_all(gp.join("patches"));
+        let mut libra_args = vec!["format-patch"];
+        libra_args.extend_from_slice(flags);
+        libra_args.extend_from_slice(&["--no-thread", "--no-signature"]);
+        let libra = run_libra_command(&libra_args, lp);
+        assert_cli_success(&libra, label);
+        let mut cmd = Command::new("git");
+        cmd.args(&libra_args).current_dir(gp).env("HOME", gp);
+        let git = cmd.output().expect("git");
+        assert!(git.status.success(), "{label}: {git:?}");
+        (lp.join("patches"), gp.join("patches"))
+    };
+    let compare_cover = |label: &str, flags: &[&str]| {
+        let (lpatches, gpatches) = run_both(label, flags);
+        let libra = fs::read_to_string(lpatches.join("0000-cover-letter.patch")).unwrap();
+        let git = fs::read_to_string(gpatches.join("0000-cover-letter.patch")).unwrap();
+        assert_eq!(segment(&libra), segment(&git), "{label}");
+    };
+    let names = |dir: &std::path::Path| -> BTreeSet<String> {
+        fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .collect()
+    };
+
+    // AC1: `full` is not a valid Git format string.
+    let invalid = run_libra_command(
+        &[
+            "format-patch",
+            "--cover-letter",
+            "--commit-list-format=full",
+            "-2",
+            "--stdout",
+        ],
+        lp,
+    );
+    assert!(!invalid.status.success(), "AC1");
+    let stderr = String::from_utf8_lossy(&invalid.stderr);
+    assert!(stderr.lines().any(|line| line == "Error-Code: LBR-CLI-002"));
+    assert!(stderr.contains("is not a valid format string"), "{stderr}");
+    assert!(invalid.stdout.is_empty());
+
+    // AC2: log: atoms via config.
+    set_both("format.coverLetter", "true");
+    set_both(
+        "format.commitListFormat",
+        "log:[%(count)/%(total)] %s (%an)",
+    );
+    compare_cover("AC2 config log atoms", &["-o", "patches", "HEAD~2"]);
+    // AC3/AC4: modern/shortlog keywords via config.
+    set_both("format.commitListFormat", "modern");
+    compare_cover("AC3 config modern", &["-o", "patches", "HEAD~2"]);
+    set_both("format.commitListFormat", "shortlog");
+    compare_cover("AC4 config shortlog", &["-o", "patches", "HEAD~2"]);
+    // AC5: CLI format wins over the config.
+    set_both("format.commitListFormat", "modern");
+    compare_cover(
+        "AC5 CLI wins",
+        &[
+            "--commit-list-format=[%(count)] %s",
+            "-o",
+            "patches",
+            "HEAD~2",
+        ],
+    );
+
+    // AC6: config format alone does not force a cover letter.
+    unset_both("format.coverLetter");
+    set_both("format.commitListFormat", "[%(count)] %s");
+    let (lpatches, _) = run_both("AC6 no implicit cover", &["-o", "patches", "HEAD~1"]);
+    let names6 = names(&lpatches);
+    assert_eq!(names6.len(), 1, "AC6 files: {names6:?}");
+    assert!(names6.iter().all(|name| name.starts_with("0001-")));
+
+    // AC7: --no-cover-letter with a CLI format succeeds without writing one.
+    let (lpatches, _) = run_both(
+        "AC7 no cover with format",
+        &[
+            "--no-cover-letter",
+            "--commit-list-format=[%(count)] %s",
+            "-o",
+            "patches",
+            "HEAD~1",
+        ],
+    );
+    let names7 = names(&lpatches);
+    assert_eq!(names7.len(), 1, "AC7 files: {names7:?}");
+    assert!(names7.iter().all(|name| name.starts_with("0001-")));
+    unset_both("format.commitListFormat");
+}
