@@ -4476,7 +4476,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：新增 `--diff-filter=<FILTER>`；父提交路径经 `DiffArgs --diff-filter=<FILTER>` 与 `CommitDiffOptions.diff_filter` 透传到共享 diff 引擎，同时过滤补丁与 diffstat；非法字母由共享引擎以 `LBR-CLI-002` 拒绝且 stdout 为空；`CommitDiffOptions::default().diff_filter` 为空，log/show/stash 行为不变。AC1–AC3 由 `format_patch_test::diff_filter` 覆盖（同一提交新增/修改/删除，仅输出新增路径的补丁与统计；非法 `Q` 带 `Error-Code: LBR-CLI-002` 且 stderr 含 `diff-filter`），AC4 由 `log::tests::commit_diff_options_default_has_no_diff_filter` 覆盖；`format_patch_test` 139/139、`compat_format_patch_mail_roundtrip` 15/15、`compat_format_patch_flag_surface` 全绿；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试；root 提交路径仍走 `log::generate_diff_with_options`（其 diff_filter 字段已存在但本卡仅父提交路径接入共享引擎，root 全部为新增，卡内无需过滤场景）。
 
 **Description:** 自 `FPG-22` 拆出的独立轴：在 `FormatPatchArgs` 新增 `--diff-filter=<filter>`，经 `CommitDiffOptions` 透传到 `src/command/diff/`，同时过滤补丁 diff 与 diffstat；重命名选项核验与 #904 封面信相关验收由自本卡拆出的 `FPG-39` 承接。 AC1、AC2 夹具中新增与删除的文件内容互不相似（避免默认重命名检测把二者配对）。
 

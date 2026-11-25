@@ -268,6 +268,11 @@ pub struct FormatPatchArgs {
     #[arg(long = "full-diff")]
     pub full_diff: bool,
 
+    /// Only include changed paths matching this diff-filter (Git's
+    /// `--diff-filter=<letters>`, e.g. `A` for added paths).
+    #[arg(long = "diff-filter", value_name = "FILTER")]
+    pub diff_filter: Option<String>,
+
     /// Spend extra time finding the smallest Myers diff. Libra's default Myers
     /// backend already guarantees a shortest edit script, so this is output-
     /// equivalent to the default.
@@ -1926,6 +1931,9 @@ async fn diff_engine_patch_parts(
         if let Some(context) = args.unified {
             argv.push(format!("--unified={context}"));
         }
+        if let Some(filter) = &args.diff_filter {
+            argv.push(format!("--diff-filter={filter}"));
+        }
         if args.no_renames {
             argv.push("--no-renames".to_string());
         } else if let Some(score) = &args.find_renames {
@@ -1965,6 +1973,7 @@ fn commit_diff_options(args: &FormatPatchArgs) -> log::CommitDiffOptions {
         source_prefix: args.src_prefix.clone().unwrap_or_else(|| "a/".to_string()),
         destination_prefix: args.dst_prefix.clone().unwrap_or_else(|| "b/".to_string()),
         context_lines: args.unified.unwrap_or(3),
+        diff_filter: args.diff_filter.clone().unwrap_or_default(),
     }
 }
 

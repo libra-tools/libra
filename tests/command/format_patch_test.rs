@@ -3376,3 +3376,65 @@ fn mbox_envelope_fixed_2001_timestamp() {
         "AC4 applied subjects"
     );
 }
+
+/// FPG-27: `--diff-filter=A` filters both the patch and the diffstat; an
+/// invalid filter is refused with `LBR-CLI-002` and no stdout.
+#[test]
+fn diff_filter() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    for (name, body) in [("a.txt", "a\n"), ("b.txt", "b\n"), ("c.txt", "c\n")] {
+        fs::write(p.join(name), body).unwrap();
+    }
+    assert_cli_success(&run_libra_command(&["add", "."], p), "add base");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], p),
+        "base",
+    );
+    fs::write(p.join("b.txt"), "b2\n").unwrap();
+    fs::remove_file(p.join("c.txt")).unwrap();
+    fs::write(p.join("d.txt"), "d\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "-A"], p), "change");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "change", "--no-verify"], p),
+        "change commit",
+    );
+
+    let out = run_libra_command(
+        &[
+            "format-patch",
+            "-1",
+            "--stdout",
+            "--diff-filter=A",
+            "--no-thread",
+            "--no-signature",
+        ],
+        p,
+    );
+    assert_cli_success(&out, "AC1 --diff-filter=A");
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let diff_paths: Vec<&str> = stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix("diff --git a/"))
+        .map(|rest| rest.split(" b/").next().unwrap_or(rest))
+        .collect();
+    assert_eq!(diff_paths, ["d.txt"], "AC1 patch paths");
+    let stat_paths: Vec<String> = stdout
+        .lines()
+        .filter(|line| line.starts_with(' ') && line.contains('|'))
+        .filter_map(|line| line.split('|').next())
+        .map(|path| path.trim().trim_end_matches(" => ").to_string())
+        .filter(|path| !path.is_empty() && !path.contains("file changed"))
+        .collect();
+    assert_eq!(stat_paths, ["d.txt"], "AC2 diffstat paths");
+
+    let invalid = run_libra_command(&["format-patch", "-1", "--stdout", "--diff-filter=Q"], p);
+    assert!(!invalid.status.success(), "AC3 invalid filter");
+    let stderr = String::from_utf8_lossy(&invalid.stderr);
+    assert!(
+        stderr.lines().any(|line| line == "Error-Code: LBR-CLI-002"),
+        "AC3 stable code line: {stderr}"
+    );
+    assert!(stderr.contains("diff-filter"), "AC3 phrase: {stderr}");
+    assert!(invalid.stdout.is_empty(), "AC3 stdout empty");
+}
