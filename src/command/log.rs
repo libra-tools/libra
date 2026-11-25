@@ -6268,6 +6268,9 @@ pub(crate) struct CommitDiffOptions {
     /// Git-style `--diff-filter` letters for the rendered patch; empty means no
     /// filtering (the shared default for log/show/stash).
     pub(crate) diff_filter: String,
+    /// Repository-root-relative directory prefix to keep and strip, or `None`
+    /// to render every path repository-relative.
+    pub(crate) relative: Option<String>,
 }
 
 impl Default for CommitDiffOptions {
@@ -6279,6 +6282,7 @@ impl Default for CommitDiffOptions {
             destination_prefix: "b/".to_string(),
             context_lines: 3,
             diff_filter: String::new(),
+            relative: None,
         }
     }
 }
@@ -6328,6 +6332,19 @@ pub(crate) async fn generate_diff_with_options(
     let old_map: HashMap<PathBuf, ObjectHash> = old_blobs.iter().cloned().collect();
     let new_map: HashMap<PathBuf, ObjectHash> = new_blobs.iter().cloned().collect();
     let mut diffs = build_commit_diff_items(old_blobs, new_blobs, paths)?;
+    if let Some(prefix) = options.relative.as_deref() {
+        let strip = format!("{prefix}/");
+        diffs.retain(|item| item.path.starts_with(&strip));
+        for item in &mut diffs {
+            if let Some(rest) = item.path.strip_prefix(&strip) {
+                let full = item.path.clone();
+                let replacement = rest.to_string();
+                item.data =
+                    diff::strip_relative_prefix_in_diff(&item.data, &strip, &full, &replacement);
+                item.path = replacement;
+            }
+        }
+    }
     if !options.diff_filter.is_empty() {
         diffs.retain(|item| {
             let path = PathBuf::from(&item.path);
@@ -6412,9 +6429,7 @@ fn diff_filter_allows(filter: &str, status: char) -> bool {
         .chars()
         .filter(|ch| ch.is_ascii_lowercase())
         .collect();
-    let excludes_status = excludes
-        .iter()
-        .any(|ch| ch.to_ascii_uppercase() == status);
+    let excludes_status = excludes.iter().any(|ch| ch.to_ascii_uppercase() == status);
     if excludes_status {
         return false;
     }

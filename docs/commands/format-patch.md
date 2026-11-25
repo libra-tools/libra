@@ -43,7 +43,7 @@ body, and series metadata.
 | `--no-rfc` | | Cancel a preceding `--rfc` (last flag wins) | off |
 | `--filename-max-length <N>` | | Truncate output filenames to at most `N` bytes, counting the `0001-` prefix and the suffix; the stem may collapse to just the sequence number, matching Git's cut points | unlimited |
 | `--commit-list-format <FMT>` | | Cover-letter commit list. Default (or `short`) is Git's author-grouped shortlog (`Name (N):` + subjects wrapped at 72 columns); `modern` renders `[i/N] subject`; any other value is a pretty-format string supporting `%h`, `%H`, `%s`, `%an`, `%ae`, `%n` and `%%` (unsupported conversions fail with `'<fmt>' is not a valid format string`) | `short` |
-| `--relative[=<path>]` (unsupported) | | Accepted only to name the gap: Libra has no per-command relative-path filter for exported patches, so the command exits 128 with `LBR-UNSUPPORTED-001` | — |
+| `--relative[=<path>]` | | Restrict the series to a directory and strip that prefix from diffstat and patch paths. With a value, `<path>` is resolved from the repository root (unlike `libra diff --relative`, which resolves from the current directory); bare `--relative` uses the current directory. `diff.relative=true` applies the same view when the flag is absent; `--no-relative` restores repository-relative paths (last of `--relative`/`--no-relative` wins) | off |
 | `--all` (unsupported) | | Accepted only to name the gap: Libra's revision grammar has no all-refs selector; name branches explicitly (`main..topic`) | — |
 | `--no-base` | | Do not emit the `base-commit:` trailer, overriding `--base` (Libra has no `format.useAutoBase` config to reset) | off |
 | `--start-number <N>` | | Start numbering at `N` | 1 |
@@ -220,7 +220,7 @@ stdout follows Libra's normal quiet BrokenPipe behavior.
 | `-k` with `-n`, non-empty `--rfc`, or explicit `--subject-prefix` | `LBR-CLI-002` (exit 129; Git exits 128). The diagnostic names the options that cannot be used together; no patches are written |
 | `--base` is not an ancestor of the series | `LBR-CLI-003` (exit 128) |
 | `--base=auto` (unsupported) | `LBR-CLI-002` (exit 129) |
-| `--relative`, `--all` (unsupported) | `LBR-UNSUPPORTED-001` (exit 128) |
+| `--all` (unsupported) | `LBR-UNSUPPORTED-001` (exit 128) |
 | Output file write failure | `LBR-IO-002` |
 | Output directory creation failure | `LBR-IO-002` |
 | Config read failure | `LBR-IO-001` |

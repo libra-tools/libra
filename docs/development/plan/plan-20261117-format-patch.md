@@ -2337,7 +2337,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：实现 `--relative[=<path>]`、`diff.relative` 与 `--no-relative`（最后者胜出）；`<path>` 相对仓库根解析，裸 `--relative` 用当前目录；父提交经共享 diff 引擎（`run_diff_for_service` 新增 relative 剥离），根提交经 `CommitDiffOptions.relative` 过滤/重写；同时修正 diffstat 与 diff 之间、以及 `--stdout` 末补丁后的多余换行，与 Git 逐字一致。AC1–AC6 由 `format_patch_test::diff_relative_filters_paths` 覆盖（AC1/AC4/AC5 与 Git 黄金逐字，AC2/AC3/AC6 与 AC1 逐字节）；`format_patch_test` 143/143、`compat_format_patch_mail_roundtrip` 15/15、`compat_format_patch_flag_surface` 通过；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步，`--relative` 不再列为 unsupported。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试。
 
 **Description:** 取消 `--relative` 的 `Unsupported` 拒绝，支持 `--relative[=<path>]`、`--no-relative` 与 `diff.relative` 配置：无值时以当前工作目录为前缀，`<path>` 按 Git 以仓库根为基准（不随当前目录解析，与 `libra diff --relative` 现行按当前目录解析不同），过滤变更并输出相对路径的 diffstat 与 diff。夹具（#890 最小复现改写为差异隔离夹具）：base 提交含 `sub/` 外的 `top/dir/file` 与 `sub/dir/file`（两路径等长，满足差异隔离；#890 原复现的根目录 `file` 改名以免 diffstat 对齐差异）；被测提交同时修改两者（各含新增与删除行）；各 AC 命令均为 `format-patch --stdout -1 --no-thread --no-signature`。
 

@@ -33,7 +33,7 @@ Merge commits 默认跳过。当 revision range 解析为零个提交时，命�
 | `--no-rfc` | | 取消此前的 `--rfc`（后写者生效） | 关闭 |
 | `--filename-max-length <N>` | | 将输出文件名截断到最多 `N` 字节（包含 `0001-` 前缀与后缀）；必要时可只保留序号，截断点与 Git 一致 | 不限制 |
 | `--commit-list-format <FMT>` | | 封面信的提交列表。默认（或 `short`）为 Git 的按作者分组 shortlog（`Name (N):` 加 72 列换行的主题）；`modern` 渲染 `[i/N] subject`；其他值按 pretty-format 解析，支持 `%h`、`%H`、`%s`、`%an`、`%ae`、`%n`、`%%`（不支持的转换会报 `'<fmt>' is not a valid format string`） | `short` |
-| `--relative[=<path>]`（不支持） | | 仅为明确缺口而接受：Libra 没有针对导出补丁的相对路径过滤，命令以 128 退出并返回 `LBR-UNSUPPORTED-001` | — |
+| `--relative[=<path>]` | | 将系列限制到某个目录，并从 diffstat 与补丁路径中剥离该前缀。带值时 `<path>` 相对仓库根解析（与 `libra diff --relative` 相对当前目录不同）；裸 `--relative` 使用当前目录。未给 flag 时 `diff.relative=true` 同样生效；`--no-relative` 恢复仓库相对路径（两者以最后者为准） | 关闭 |
 | `--all`（不支持） | | 仅为明确缺口而接受：Libra 的版本语法没有 all-refs 选择器，请显式写分支范围（如 `main..topic`） | — |
 | `--no-base` | | 不输出 `base-commit:` 尾注，覆盖 `--base`（Libra 没有 `format.useAutoBase` 配置可重置） | 关闭 |
 | `--start-number <N>` | | 从 `N` 开始编号 | 1 |

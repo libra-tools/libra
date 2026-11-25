@@ -71,6 +71,9 @@ fn format_patch_help_lists_expected_flags() {
         "--no-to",
         "--no-cc",
         "--from",
+        "--no-from",
+        "--relative",
+        "--no-relative",
         "--base",
         "revision-range",
     ] {

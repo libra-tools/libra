@@ -2359,27 +2359,18 @@ fn unsupported_git_options_are_classified() {
         "-p suppresses the diffstat"
     );
 
-    // `--relative` and `--all` are named refusals, not typos.
-    for (args, needle) in [
-        (
-            vec!["format-patch", "--relative=sub", "-1", "--stdout"],
-            "--relative is not supported",
-        ),
-        (
-            vec!["format-patch", "--all", "--stdout"],
-            "--all is not supported",
-        ),
-    ] {
-        let output = run_libra_command(&args, repo.path());
-        assert_eq!(output.status.code(), Some(128), "{args:?}");
-        let (_h, report) = parse_cli_error_stderr(&output.stderr);
-        assert_eq!(report.error_code, "LBR-UNSUPPORTED-001", "{args:?}");
-        assert!(
-            report.message.contains(needle),
-            "{args:?}: {}",
-            report.message
-        );
-    }
+    // `--all` remains a named refusal, not a typo; `--relative` is now
+    // implemented and covered by `diff_relative_filters_paths`.
+    let args = ["format-patch", "--all", "--stdout"];
+    let output = run_libra_command(&args, repo.path());
+    assert_eq!(output.status.code(), Some(128), "{args:?}");
+    let (_h, report) = parse_cli_error_stderr(&output.stderr);
+    assert_eq!(report.error_code, "LBR-UNSUPPORTED-001", "{args:?}");
+    assert!(
+        report.message.contains("--all is not supported"),
+        "{args:?}: {}",
+        report.message
+    );
 }
 
 // Each refusal gate is independently selectable; the plan also checks the
@@ -3849,5 +3840,144 @@ fn from_and_no_from_override_config() {
         from_header(&libra(&["--from=Cli <cli@example.com>"], &committer_env)),
         "From: Cli <cli@example.com>",
         "AC7 invalid config + --from"
+    );
+}
+
+/// FPG-11: `--relative` / `diff.relative` filter the exported series and strip
+/// the directory prefix; `<path>` is resolved from the repository root.
+#[test]
+fn diff_relative_filters_paths() {
+    use std::process::Command;
+
+    fn seed(root: &std::path::Path, libra: bool) {
+        let run = |dir: &std::path::Path, args: &[&str]| {
+            let out = if libra {
+                run_libra_command(args, dir)
+            } else {
+                Command::new("git")
+                    .args(args)
+                    .current_dir(dir)
+                    .env("HOME", root)
+                    .output()
+                    .expect("git")
+            };
+            assert!(out.status.success(), "{args:?}: {out:?}");
+            out
+        };
+        if libra {
+            run(root, &["init", "."]);
+            run(root, &["config", "set", "user.name", "T"]);
+            run(root, &["config", "set", "user.email", "t@t"]);
+        } else {
+            run(root, &["init", "-q", "-b", "main", "."]);
+            run(root, &["config", "user.name", "T"]);
+            run(root, &["config", "user.email", "t@t"]);
+        }
+        fs::create_dir_all(root.join("top/dir")).unwrap();
+        fs::create_dir_all(root.join("sub/dir")).unwrap();
+        fs::write(root.join("top/dir/file"), "a\nb\nc\n").unwrap();
+        fs::write(root.join("sub/dir/file"), "a\nb\nc\n").unwrap();
+        run(root, &["add", "top/dir/file", "sub/dir/file"]);
+        run(root, &["commit", "-m", "base"]);
+        fs::write(root.join("top/dir/file"), "a\nB\nc\nD\n").unwrap();
+        fs::write(root.join("sub/dir/file"), "a\nB\nc\nD\n").unwrap();
+        run(root, &["add", "top/dir/file", "sub/dir/file"]);
+        run(root, &["commit", "-m", "change"]);
+    }
+
+    let libra_repo = tempdir().expect("libra");
+    let lp = libra_repo.path();
+    seed(lp, true);
+    let git_repo = tempdir().expect("git");
+    let gp = git_repo.path();
+    seed(gp, false);
+
+    let change = |stdout: &[u8]| -> String {
+        let text = String::from_utf8_lossy(stdout).to_string();
+        text.split_once("\n---\n")
+            .map(|(_, body)| body.to_string())
+            .unwrap_or(text)
+    };
+    let libra_run = |dir: &std::path::Path, flags: &[&str]| -> String {
+        let mut args = vec![
+            "format-patch",
+            "-1",
+            "--stdout",
+            "--no-thread",
+            "--no-signature",
+        ];
+        args.extend_from_slice(flags);
+        change(&run_libra_command(&args, dir).stdout)
+    };
+    let git_run = |dir: &std::path::Path, flags: &[&str]| -> String {
+        let mut cmd = Command::new("git");
+        cmd.args([
+            "format-patch",
+            "-1",
+            "--stdout",
+            "--no-thread",
+            "--no-signature",
+        ])
+        .args(flags)
+        .current_dir(dir)
+        .env("HOME", gp);
+        let out = cmd.output().expect("git");
+        assert!(out.status.success(), "git {flags:?}: {out:?}");
+        change(&out.stdout)
+    };
+
+    let set_config = |key: &str, value: &str| {
+        assert_cli_success(
+            &run_libra_command(&["config", "set", key, value], lp),
+            "config",
+        );
+        assert!(
+            Command::new("git")
+                .args(["config", key, value])
+                .current_dir(gp)
+                .status()
+                .unwrap()
+                .success()
+        );
+    };
+    let unset_config = |key: &str| {
+        let _ = run_libra_command(&["config", "unset", key], lp);
+        let _ = Command::new("git")
+            .args(["config", "--unset", key])
+            .current_dir(gp)
+            .status();
+    };
+
+    // AC1: config-driven relative from sub/.
+    set_config("diff.relative", "true");
+    let ac1 = libra_run(&lp.join("sub"), &[]);
+    assert_eq!(ac1, git_run(&gp.join("sub"), &[]), "AC1 config relative");
+    // AC2: bare --relative with no config.
+    unset_config("diff.relative");
+    assert_eq!(libra_run(&lp.join("sub"), &["--relative"]), ac1, "AC2 bare");
+    // AC3: explicit root-relative path from the repository root.
+    assert_eq!(
+        libra_run(lp, &["--relative=sub"]),
+        ac1,
+        "AC3 explicit from root"
+    );
+    // AC4: no config, no flag keeps repository-relative paths.
+    assert_eq!(
+        libra_run(&lp.join("sub"), &[]),
+        git_run(&gp.join("sub"), &[]),
+        "AC4 repository relative"
+    );
+    // AC5: --no-relative wins over diff.relative.
+    set_config("diff.relative", "true");
+    assert_eq!(
+        libra_run(&lp.join("sub"), &["--no-relative"]),
+        git_run(&gp.join("sub"), &["--no-relative"]),
+        "AC5 no-relative"
+    );
+    // AC6: explicit `<path>` is root-relative even from sub/.
+    assert_eq!(
+        libra_run(&lp.join("sub"), &["--relative=sub"]),
+        ac1,
+        "AC6 explicit from sub"
     );
 }

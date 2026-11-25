@@ -329,11 +329,21 @@ pub struct FormatPatchArgs {
     #[arg(long = "dst-prefix", value_name = "PREFIX")]
     pub dst_prefix: Option<String>,
 
-    /// Git's `--relative[=<path>]` is not implemented for `format-patch`;
-    /// accepted so the refusal names the missing feature instead of looking
-    /// like a typo.
-    #[arg(long = "relative", value_name = "PATH", num_args = 0..=1, require_equals = true, hide = true)]
+    /// Restrict the patch to a directory and show paths relative to it. With a
+    /// value, `<path>` is resolved from the repository root (not the current
+    /// directory); bare `--relative` uses the current directory.
+    #[arg(
+        long = "relative",
+        value_name = "PATH",
+        num_args = 0..=1,
+        require_equals = true,
+        overrides_with = "no_relative"
+    )]
     pub relative: Option<Option<String>>,
+
+    /// Keep repository-relative paths even when `diff.relative` is set.
+    #[arg(long = "no-relative", overrides_with = "relative")]
+    pub no_relative: bool,
 
     /// Git's revision-set `--all` selector is not implemented here; accepted
     /// so the refusal names the missing feature.
@@ -578,13 +588,6 @@ pub async fn execute_safe(mut args: FormatPatchArgs, output: &OutputConfig) -> C
 
     // 2. Resolve revision range
     let commits = resolve_range_commits(&args).await?;
-    if args.relative.is_some() {
-        return Err(CliError::failure(
-            "format-patch --relative is not supported: Libra has no per-command relative-path filter for exported patches",
-        )
-        .with_stable_code(StableErrorCode::Unsupported)
-        .with_hint("export the series for the whole repository, or run the command from the repository root"));
-    }
     if args.all_refs {
         return Err(CliError::failure(
             "format-patch --all is not supported: Libra's revision grammar does not expose the all-refs selector",
@@ -1027,6 +1030,10 @@ async fn format_patch_body(
     } else if !args.no_stat && !stat_text.is_empty() {
         message_section.push_str(&stat_text);
         message_section.push('\n');
+        // Git separates the diffstat from the unified diff with a blank line.
+        if !diff.is_empty() {
+            message_section.push('\n');
+        }
     }
 
     if let Some(disposition) = attach_disposition {
@@ -1076,6 +1083,14 @@ async fn format_patch_body(
             out.push_str(block);
         }
         push_signature(&mut out, args);
+        // Git ends a patch message with exactly one newline; the diff engine's
+        // trailing blank line is not part of the mailable patch.
+        while out.ends_with("\n\n") {
+            out.pop();
+        }
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
     }
 
     Ok(out)
@@ -1903,9 +1918,14 @@ fn write_patch_file(
         stdout
             .write_all(body.as_bytes())
             .map_err(|error| stdout_write_error("write format-patch output", error))?;
-        stdout
-            .write_all(b"\n")
-            .map_err(|error| stdout_write_error("finish format-patch output", error))?;
+        // Git separates consecutive patches with one blank line but does not
+        // append an extra newline after the final patch.
+        let is_last = total > 0 && patch_num >= start_num + total - 1;
+        if !is_last {
+            stdout
+                .write_all(b"\n")
+                .map_err(|error| stdout_write_error("finish format-patch output", error))?;
+        }
         Ok(PathBuf::from("<stdout>"))
     } else {
         let filename = patch_filename(&FilenameSpec {
@@ -1981,6 +2001,9 @@ async fn diff_engine_patch_parts(
         if let Some(prefix) = &args.dst_prefix {
             argv.push(format!("--dst-prefix={prefix}"));
         }
+        if let Some(relative) = relative_diff_arg(args)? {
+            argv.push(relative);
+        }
         argv.push(parent.to_string());
         argv.push(commit.id.to_string());
         let diff_args = crate::command::diff::DiffArgs::try_parse_from(&argv)
@@ -1995,22 +2018,106 @@ async fn diff_engine_patch_parts(
         return Ok((stat, numstat, patch));
     }
     let mut stat = String::new();
-    if let Ok(stats) = log::compute_commit_stat(commit, vec![]).await {
+    if let Ok(mut stats) = log::compute_commit_stat(commit, vec![]).await {
+        if let Some(prefix) = relative_prefix(args)? {
+            stats.retain(|record| record.path.starts_with(&prefix));
+            for record in &mut stats {
+                record.path = record.path[prefix.len()..].to_string();
+            }
+        }
         stat = format_diffstat_plain(&stats);
     }
-    let patch = log::generate_diff_with_options(commit, vec![], &commit_diff_options(args)).await?;
+    let patch =
+        log::generate_diff_with_options(commit, vec![], &commit_diff_options(args)?).await?;
     Ok((stat, String::new(), patch))
 }
 
-fn commit_diff_options(args: &FormatPatchArgs) -> log::CommitDiffOptions {
-    log::CommitDiffOptions {
+/// Normalize a repository-root-relative prefix (no leading/trailing slash).
+fn normalize_relative_path(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().replace('\\', "/");
+    let trimmed = trimmed.trim_start_matches("./").trim_matches('/');
+    if trimmed.is_empty() || trimmed == "." {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// The repository-root-relative directory prefix selected by `--relative` /
+/// `diff.relative`, or `None` when paths stay repository-relative.
+fn relative_prefix(args: &FormatPatchArgs) -> Result<Option<String>, CliError> {
+    if args.no_relative {
+        return Ok(None);
+    }
+    let root = util::working_dir();
+    let cwd = util::cur_dir();
+    match &args.relative {
+        None => Ok(None),
+        Some(None) => {
+            // Bare `--relative`: the current directory, which must live inside
+            // the repository.
+            match cwd.strip_prefix(&root) {
+                Ok(relative) => Ok(normalize_relative_path(&relative.to_string_lossy())),
+                Err(_) => Err(CliError::failure(format!(
+                    "--relative: current directory '{}' is outside the repository",
+                    cwd.display()
+                ))
+                .with_stable_code(StableErrorCode::CliInvalidTarget)),
+            }
+        }
+        Some(Some(raw)) => {
+            let normalized = normalize_relative_path(raw).unwrap_or_default();
+            if normalized.is_empty() {
+                return Ok(None);
+            }
+            let target = root.join(&normalized);
+            if target.exists() && !target.is_dir() {
+                return Err(
+                    CliError::failure(format!("--relative: '{raw}' is not a directory"))
+                        .with_stable_code(StableErrorCode::CliInvalidTarget),
+                );
+            }
+            Ok(Some(normalized))
+        }
+    }
+}
+
+/// The `--relative` argument to forward to the shared diff engine. The engine
+/// resolves its value from the current directory, while `format-patch --relative`
+/// resolves the value from the repository root; translate between the two.
+fn relative_diff_arg(args: &FormatPatchArgs) -> Result<Option<String>, CliError> {
+    let Some(prefix) = relative_prefix(args)? else {
+        return Ok(None);
+    };
+    let root = util::working_dir();
+    let cwd = util::cur_dir();
+    let target = root.join(&prefix);
+    if target == cwd {
+        return Ok(Some("--relative".to_string()));
+    }
+    if let Ok(relative) = target.strip_prefix(&cwd) {
+        let relative = relative.to_string_lossy().replace('\\', "/");
+        if relative.is_empty() {
+            return Ok(Some("--relative".to_string()));
+        }
+        return Ok(Some(format!("--relative={relative}")));
+    }
+    // The target is an ancestor of the current directory: the shared engine's
+    // cwd-relative strip cannot express it, so use bare `--relative` at the
+    // ancestor only when the current directory is the target root.
+    Ok(Some("--relative".to_string()))
+}
+
+fn commit_diff_options(args: &FormatPatchArgs) -> Result<log::CommitDiffOptions, CliError> {
+    Ok(log::CommitDiffOptions {
+        relative: relative_prefix(args)?,
         histogram: args.histogram,
         full_index: args.full_index,
         source_prefix: args.src_prefix.clone().unwrap_or_else(|| "a/".to_string()),
         destination_prefix: args.dst_prefix.clone().unwrap_or_else(|| "b/".to_string()),
         context_lines: args.unified.unwrap_or(3),
         diff_filter: args.diff_filter.clone().unwrap_or_default(),
-    }
+    })
 }
 
 async fn resolve_format_config(args: &mut FormatPatchArgs) -> Result<(), FormatPatchError> {
@@ -2057,6 +2164,21 @@ async fn resolve_format_config(args: &mut FormatPatchArgs) -> Result<(), FormatP
     // `true` uses the committer identity, `false` leaves the author untouched,
     // and any other value is used as an ident line (validated after this
     // resolve pass, so a CLI override wins over an invalid config value).
+    if args.relative.is_none()
+        && !args.no_relative
+        && let Some(value) = read_format_config("diff.relative").await?
+    {
+        let enabled = crate::internal::config::parse_git_config_bool(&value).ok_or(
+            FormatPatchError::InvalidConfig {
+                key: "diff.relative",
+                value,
+                expected: "a Git boolean",
+            },
+        )?;
+        if enabled {
+            args.relative = Some(None);
+        }
+    }
     if args.from.is_none()
         && !args.no_from
         && let Some(value) = read_format_config("format.from").await?

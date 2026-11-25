@@ -1170,6 +1170,9 @@ pub(crate) async fn run_diff_for_service(mut args: DiffArgs) -> Result<DiffOutpu
     // The CLI applies these after `run_diff`; service callers need the same
     // rewriting so `--src-prefix`/`--dst-prefix` reach the rendered patch.
     if !result.external_diff_applied {
+        // Service callers (format-patch) need the same `--relative` strip as
+        // the CLI before prefix rendering.
+        apply_relative_filter(&args, &mut result);
         apply_diff_prefixes(&mut result, &config.prefixes);
     }
     // Same read-only sparse-view scoping as the CLI: only the pure-browsing
@@ -1907,7 +1910,7 @@ fn regex_word_changes(old: &str, new: &str, regex: &regex::Regex) -> Vec<(Change
 /// space and a `b/` fragment is not corrupted. `rename`/`copy from|to` lines (Libra's
 /// diff does not currently emit them, since it reports no renames) carry a single
 /// path, so a prefix strip is unambiguous.
-fn strip_relative_prefix_in_diff(
+pub(crate) fn strip_relative_prefix_in_diff(
     raw_diff: &str,
     strip: &str,
     full: &str,
