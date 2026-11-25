@@ -1014,24 +1014,31 @@ async fn format_patch_body(
         let (name, email) = resolve_signoff_identity().await?;
         message_section.push_str(&format!("Signed-off-by: {name} <{email}>\n"));
     }
-    message_section.push_str("---\n");
-    if let Some(block) = render_notes_block(&args.notes, &commit.id.to_string()).await? {
-        message_section.push_str(&block);
-    }
+    let notes_block = render_notes_block(&args.notes, &commit.id.to_string()).await?;
     // The body and diffstat come from the shared `libra diff` engine so rename
     // detection (and `diff.renames`) applies by default (ADR-FP-03).
     let (stat_text, numstat_text, diff) = diff_engine_patch_parts(commit, args).await?;
-    if args.numstat && !numstat_text.is_empty() {
+    let has_numstat = args.numstat && !numstat_text.is_empty();
+    let has_stat = !args.no_stat && !stat_text.is_empty();
+    let has_diff = !diff.is_empty();
+    // Git emits the `---` separator only when there is something after it; an
+    // empty view (`--relative` with no matching files) ends after the message.
+    if notes_block.is_some() || (!has_numstat && (has_stat || has_diff)) {
+        message_section.push_str("---\n");
+        if let Some(block) = notes_block {
+            message_section.push_str(&block);
+        }
+    }
+    if has_numstat {
         // `--numstat` replaces the stat block, drops the `---` separator, and is
         // not suppressed by `-p`/`--no-stat` (its own flag is the only switch).
-        message_section = message_section.trim_end_matches("---\n").to_string();
         message_section.push_str(&numstat_text);
         message_section.push('\n');
-    } else if !args.no_stat && !stat_text.is_empty() {
+    } else if has_stat {
         message_section.push_str(&stat_text);
         message_section.push('\n');
         // Git separates the diffstat from the unified diff with a blank line.
-        if !diff.is_empty() {
+        if has_diff {
             message_section.push('\n');
         }
     }
@@ -1974,6 +1981,11 @@ async fn diff_engine_patch_parts(
     commit: &Commit,
     args: &FormatPatchArgs,
 ) -> Result<(String, String, String), CliError> {
+    if relative_prefix(args)?.as_deref() == Some(RELATIVE_OUTSIDE) {
+        // A prefix outside the repository has an empty view; do not run the
+        // diff engine (which would otherwise render the whole commit).
+        return Ok((String::new(), String::new(), String::new()));
+    }
     if let Some(parent) = commit.parent_commit_ids.first() {
         // `DiffArgs` keeps private bookkeeping fields, so build it through its
         // clap definition like the CLI does.
@@ -2032,6 +2044,11 @@ async fn diff_engine_patch_parts(
     Ok((stat, String::new(), patch))
 }
 
+/// Internal marker for a `--relative` prefix that escapes the repository. Such a
+/// view never matches a tracked path, so no diff is rendered (Git exits 0 with
+/// an empty patch body).
+const RELATIVE_OUTSIDE: &str = "\u{0}";
+
 /// Normalize a repository-root-relative prefix (no leading/trailing slash).
 fn normalize_relative_path(raw: &str) -> Option<String> {
     let trimmed = raw.trim().replace('\\', "/");
@@ -2070,6 +2087,12 @@ fn relative_prefix(args: &FormatPatchArgs) -> Result<Option<String>, CliError> {
             if normalized.is_empty() {
                 return Ok(None);
             }
+            let escapes = normalized == ".."
+                || normalized.starts_with("../")
+                || std::path::Path::new(&normalized).is_absolute();
+            if escapes {
+                return Ok(Some(RELATIVE_OUTSIDE.to_string()));
+            }
             let target = root.join(&normalized);
             if target.exists() && !target.is_dir() {
                 return Err(
@@ -2089,6 +2112,11 @@ fn relative_diff_arg(args: &FormatPatchArgs) -> Result<Option<String>, CliError>
     let Some(prefix) = relative_prefix(args)? else {
         return Ok(None);
     };
+    if prefix == RELATIVE_OUTSIDE {
+        // Do not forward a cwd-relative `--relative`: the outside view matches
+        // nothing and must not strip the current directory instead.
+        return Ok(None);
+    }
     let root = util::working_dir();
     let cwd = util::cur_dir();
     let target = root.join(&prefix);

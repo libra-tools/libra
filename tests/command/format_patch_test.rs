@@ -3981,3 +3981,135 @@ fn diff_relative_filters_paths() {
         "AC6 explicit from sub"
     );
 }
+
+/// FPG-48: a `--relative` prefix outside the repository or missing from it
+/// yields Git's empty patch body, writes nothing outside the repo, and never
+/// leaks the outside absolute path.
+#[test]
+fn relative_outside_and_missing_prefix() {
+    use std::process::Command;
+
+    let libra_repo = tempdir().expect("libra");
+    let lp = libra_repo.path();
+    assert_cli_success(&run_libra_command(&["init", "."], lp), "init");
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "user.name", "T"], lp),
+        "name",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "user.email", "t@t"], lp),
+        "email",
+    );
+    fs::create_dir_all(lp.join("dir")).unwrap();
+    fs::write(lp.join("dir/file"), "a\nb\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "dir/file"], lp), "add");
+    assert_cli_success(&run_libra_command(&["commit", "-m", "变更"], lp), "commit");
+
+    let git_repo = tempdir().expect("git");
+    let gp = git_repo.path();
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(gp)
+            .env("HOME", gp)
+            .output()
+            .expect("git");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+        out
+    };
+    git(&["init", "-q", "-b", "main", "."]);
+    git(&["config", "user.name", "T"]);
+    git(&["config", "user.email", "t@t"]);
+    fs::create_dir_all(gp.join("dir")).unwrap();
+    fs::write(gp.join("dir/file"), "a\nb\n").unwrap();
+    git(&["add", "dir/file"]);
+    git(&["commit", "-q", "-m", "change"]);
+
+    // Compare the mail BODY (after the blank line that ends the headers): the
+    // object id, date, and MIME header policy differ between fixtures, while an
+    // empty `--relative` view must produce the same body — nothing after the
+    // headers, with no `---` separator, diffstat, or diff.
+    let mail = |stdout: &[u8]| -> String {
+        let text = String::from_utf8_lossy(stdout).to_string();
+        text.split_once("\n\n")
+            .map(|(_, body)| body.to_string())
+            .unwrap_or_default()
+    };
+    let libra_mail = |prefix: &str| -> String {
+        mail(
+            &run_libra_command(
+                &[
+                    "format-patch",
+                    "-1",
+                    "--stdout",
+                    "--no-thread",
+                    "--no-signature",
+                    &format!("--relative={prefix}"),
+                ],
+                lp,
+            )
+            .stdout,
+        )
+    };
+    let git_mail = |prefix: &str| -> String {
+        mail(
+            &git(&[
+                "format-patch",
+                "-1",
+                "--stdout",
+                "--no-thread",
+                "--no-signature",
+                &format!("--relative={prefix}"),
+            ])
+            .stdout,
+        )
+    };
+
+    // AC1: outside the repository.
+    let outside = tempdir().expect("outside");
+    let outside_path = outside.path().to_path_buf();
+    let sentinel = outside_path.join("sentinel.txt");
+    fs::write(&sentinel, "keep\n").unwrap();
+    let before = (
+        fs::read(&sentinel).unwrap(),
+        fs::metadata(&sentinel).unwrap().modified().unwrap(),
+    );
+    let libra_out = run_libra_command(
+        &[
+            "format-patch",
+            "-1",
+            "--stdout",
+            "--no-thread",
+            "--no-signature",
+            "--relative=../outside-sentinel",
+        ],
+        lp,
+    );
+    assert_cli_success(&libra_out, "AC1 outside");
+    assert_eq!(
+        mail(&libra_out.stdout),
+        git_mail("../outside-sentinel"),
+        "AC1 outside matches Git"
+    );
+    let outside_body = String::from_utf8_lossy(&libra_out.stdout).to_string();
+    assert!(!outside_body.contains("\n---\n"), "no separator");
+    assert!(!outside_body.contains("diff --git "), "no diff");
+    // AC3: the outside directory is untouched (the sentinel lives beside the
+    // repository and the prefix escapes it).
+    let after = (
+        fs::read(&sentinel).unwrap(),
+        fs::metadata(&sentinel).unwrap().modified().unwrap(),
+    );
+    assert_eq!(before, after, "AC3 outside files untouched");
+    // AC4: neither stream exposes the outside absolute path.
+    let outside_str = outside_path.to_string_lossy().to_string();
+    assert!(!String::from_utf8_lossy(&libra_out.stdout).contains(&outside_str));
+    assert!(!String::from_utf8_lossy(&libra_out.stderr).contains(&outside_str));
+
+    // AC2: a prefix missing inside the repository.
+    assert_eq!(
+        libra_mail("nonexistent"),
+        git_mail("nonexistent"),
+        "AC2 missing prefix"
+    );
+}

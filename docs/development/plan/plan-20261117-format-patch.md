@@ -2413,7 +2413,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：`--relative` 前缀缺失或逃逸仓库时输出空补丁正文（无 `---`/diffstat/diff），逃逸前缀以内部哨兵拒绝调用 diff 引擎，不写任何文件且不打印仓库外路径；`---` 分隔符改为仅在确有 notes/stat/diff 且非 `--numstat` 时输出。AC1–AC4 由 `format_patch_test::relative_outside_and_missing_prefix` 覆盖（AC1/AC2 与 Git 空正文一致、AC3 仓库外哨兵文件内容与 mtime 不变、AC4 stdout/stderr 均无哨兵绝对路径）；`format_patch_test` 144/144、`compat_format_patch_mail_roundtrip` 15/15、`compat_format_patch_flag_surface` 通过；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试。
 
 **Description:** 自 `FPG-11` 拆出的独立轴：`--relative=<prefix>` 的前缀在仓库外或不存在时按 Git 行为输出（本机 Git 2.54 探针均 exit 0 且不输出 diff 段，开工时以 `git@6de20f6092` 重新生成黄金值为准），并保证不写入仓库外文件、不在输出中暴露仓库外绝对路径（GC-07）。
 
