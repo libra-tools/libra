@@ -8499,3 +8499,113 @@ fn reroll_non_integer_subjects() {
         );
     }
 }
+
+/// FPG-21: filenames use Git's `format_sanitized_subject` rules (#908).
+#[test]
+fn filename_git_sanitized_slug() {
+    use std::process::Command;
+
+    fn seed(root: &std::path::Path, libra: bool) -> Vec<(String, String)> {
+        let run = |args: &[&str]| -> String {
+            let out = if libra {
+                run_libra_command(args, root)
+            } else {
+                Command::new("git")
+                    .args(args)
+                    .current_dir(root)
+                    .env("HOME", root)
+                    .output()
+                    .expect("git")
+            };
+            assert!(out.status.success(), "{args:?}: {out:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        if libra {
+            run(&["init", "."]);
+            run(&["config", "set", "user.name", "T"]);
+            run(&["config", "set", "user.email", "t@t"]);
+        } else {
+            run(&["init", "-q", "-b", "main", "."]);
+            run(&["config", "user.name", "T"]);
+            run(&["config", "user.email", "t@t"]);
+        }
+        let subjects = [
+            "Side changes #1",
+            "Mixed CASE Subject",
+            "ALL CAPS",
+            "Update README..md v1.2_x.",
+            "Fix café crash",
+        ];
+        let mut hashes = Vec::new();
+        for subject in subjects {
+            fs::write(root.join("f"), format!("{subject}\n")).unwrap();
+            run(&["add", "f"]);
+            run(&["commit", "-m", subject]);
+            hashes.push((subject.to_string(), run(&["rev-parse", "HEAD"])));
+        }
+        hashes
+    }
+    let filename = |dir: &std::path::Path| -> String {
+        fs::read_dir(dir)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .to_string()
+    };
+
+    let libra_repo = tempdir().unwrap();
+    let lp = libra_repo.path();
+    let libra_hashes = seed(lp, true);
+    let git_repo = tempdir().unwrap();
+    let gp = git_repo.path();
+    let git_hashes = seed(gp, false);
+    let expected = [
+        "0001-Side-changes-1.patch",
+        "0001-Mixed-CASE-Subject.patch",
+        "0001-ALL-CAPS.patch",
+        "0001-Update-README.md-v1.2_x.patch",
+        "0001-Fix-caf-crash.patch",
+    ];
+    for (index, expected_name) in expected.iter().enumerate() {
+        let libra_dir = lp.join(format!("l{index}"));
+        let res = run_libra_command(
+            &[
+                "format-patch",
+                "-1",
+                &libra_hashes[index].1,
+                "-o",
+                libra_dir.to_str().unwrap(),
+                "--no-thread",
+                "--no-signature",
+            ],
+            lp,
+        );
+        assert_cli_success(&res, expected_name);
+        let git_dir = gp.join(format!("g{index}"));
+        let git = Command::new("git")
+            .args([
+                "format-patch",
+                "-1",
+                &git_hashes[index].1,
+                "-o",
+                git_dir.to_str().unwrap(),
+                "--no-thread",
+                "--no-signature",
+            ])
+            .current_dir(gp)
+            .env("HOME", gp)
+            .output()
+            .unwrap();
+        assert!(git.status.success());
+        assert_eq!(filename(&libra_dir), *expected_name, "AC{}", index + 1);
+        assert_eq!(
+            filename(&libra_dir),
+            filename(&git_dir),
+            "AC{} git",
+            index + 1
+        );
+    }
+}

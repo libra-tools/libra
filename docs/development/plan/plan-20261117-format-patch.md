@@ -4181,7 +4181,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：文件名 slug 改为 Git `format_sanitized_subject`——保留大小写、仅 ASCII 字母数字与 `.`/`_`、连续点压缩、其它连续字符转单个 `-`、去尾部 `.`/`-`、丢弃非 ASCII；长度上限仍由 `FPG-40` 承接。AC1–AC5 由 `format_patch_test::filename_git_sanitized_slug` 覆盖（Side changes #1、Mixed CASE、ALL CAPS、README..md/v1.2_x、café，均与同源 Git 文件名逐字）；`format_patch_test` 175/175、`compat_format_patch_mail_roundtrip` 15/15、`compat_format_patch_flag_surface` 通过；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试。
 
 **Description:** 按 Git `format_sanitized_subject`（`git show 6de20f6092:pretty.c` 第 941–975 行）生成文件名 slug：保留大小写，只保留 ASCII 字母数字与 `.`、`_`（连续 `.` 压缩为一个），其余字符（含非 ASCII）视为分隔并以单个 `-` 连接，去掉首尾分隔与末尾 `.`/`-`；现行 `patch_slug` 转小写、把 `.`/`_` 换成 `-` 且保留 Unicode 字母数字（`src/command/format_patch.rs:1646-1667`）。#908 正文称「其余清洗一致」，与上游清洗规则不符，本计划以上游为准并在关闭 #908 时说明。文件名长度上限由自本卡拆出的 `FPG-40` 承接。
 

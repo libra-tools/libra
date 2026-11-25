@@ -2404,26 +2404,37 @@ fn render_pretty_format_commit(
 }
 
 fn patch_slug(commit: &Commit, _args: &FormatPatchArgs) -> String {
-    let slug = commit_subject_line(commit)
-        .to_lowercase()
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '-' {
-                c
+    // Git's `format_sanitized_subject`: preserve case, keep ASCII alphanumerics
+    // plus `.`/`_`, collapse dot runs, turn every other run into one `-`, and
+    // trim trailing dots/dashes.
+    let subject = commit_subject_line(commit);
+    let mut out = String::new();
+    let mut pending_dash = false;
+    let mut last_dot = false;
+    for ch in subject.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '.' {
+            if ch == '.' {
+                if last_dot {
+                    continue;
+                }
+                last_dot = true;
             } else {
-                '-'
+                last_dot = false;
             }
-        })
-        .collect::<String>();
-
-    // Collapse consecutive dashes
-    let slug = slug
-        .split('-')
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join("-");
-
-    truncate_slug(&slug)
+            if pending_dash && !out.is_empty() {
+                out.push('-');
+            }
+            pending_dash = false;
+            out.push(ch);
+        } else {
+            pending_dash = true;
+            last_dot = false;
+        }
+    }
+    while out.ends_with('.') || out.ends_with('-') {
+        out.pop();
+    }
+    truncate_slug(&out)
 }
 
 /// Truncate a slug to at most `MAX_CHARS` characters without splitting a
