@@ -1258,6 +1258,7 @@ async fn format_patch_body(
             suffix: suffix(args),
             numbered_files: args.numbered_files,
             max_length: args.filename_max_length,
+            reroll: args.reroll_count,
         });
         out.push_str("This is a multi-part message in MIME format.\n");
         out.push_str(&format!("--{boundary}\n"));
@@ -2436,6 +2437,7 @@ struct FilenameSpec<'a> {
     suffix: &'a str,
     numbered_files: bool,
     max_length: Option<usize>,
+    reroll: Option<usize>,
 }
 
 fn patch_filename(spec: &FilenameSpec<'_>) -> String {
@@ -2447,15 +2449,19 @@ fn patch_filename(spec: &FilenameSpec<'_>) -> String {
         suffix,
         numbered_files,
         max_length,
+        reroll,
     } = *spec;
+    let version_prefix = reroll
+        .map(|version| format!("v{version}-"))
+        .unwrap_or_default();
     if numbered_files {
         // `--numbered-files`: bare sequence number, no slug and no suffix
         // (the cover letter, with patch_num 0, becomes "0"), matching Git.
-        return patch_num.to_string();
+        return format!("{version_prefix}{patch_num}");
     }
     if slug.is_empty() {
         // Cover letter (only the cover-letter code path passes an empty slug)
-        format!("0000-cover-letter{suffix}")
+        format!("{version_prefix}0000-cover-letter{suffix}")
     } else {
         let width = number_width(total + start_num - 1);
         let number = format!("{patch_num:0width$}");
@@ -2474,7 +2480,7 @@ fn patch_filename(spec: &FilenameSpec<'_>) -> String {
             }
             None => stem,
         };
-        format!("{stem}{suffix}")
+        format!("{version_prefix}{stem}{suffix}")
     }
 }
 
@@ -2566,6 +2572,7 @@ fn write_patch_file(
             suffix: suffix(args),
             numbered_files: args.numbered_files,
             max_length: args.filename_max_length,
+            reroll: args.reroll_count,
         });
         let path = out_dir.join(&filename);
         atomic_write::write_atomic(&path, body.as_bytes(), atomic_write::sync_data_enabled())

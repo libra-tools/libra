@@ -7952,3 +7952,172 @@ fn interdiff_single_patch_placement() {
         "{text}"
     );
 }
+
+/// FPG-20: reroll version prefixes file names and matches Subject versions;
+/// file output carries the interdiff block (#901).
+#[test]
+fn reroll_filename_prefix() {
+    use std::collections::BTreeSet;
+    use std::process::Command;
+
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    for i in 1..=2 {
+        fs::write(p.join(format!("extra{i}")), format!("x{i}\n")).unwrap();
+        assert_cli_success(&run_libra_command(&["add", &format!("extra{i}")], p), "add");
+        assert_cli_success(
+            &run_libra_command(&["commit", "-m", &format!("subject {i}"), "--no-verify"], p),
+            "commit",
+        );
+    }
+    let out1 = p.join("out1");
+    let res = run_libra_command(
+        &[
+            "format-patch",
+            "-v",
+            "4",
+            "-2",
+            "-o",
+            out1.to_str().unwrap(),
+            "--no-thread",
+            "--no-signature",
+        ],
+        p,
+    );
+    assert_cli_success(&res, "AC1");
+    let names: BTreeSet<String> = fs::read_dir(&out1)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+        .collect();
+    assert_eq!(names.len(), 2);
+    assert!(names.iter().any(|name| name.starts_with("v4-0001-")));
+    assert!(names.iter().any(|name| name.starts_with("v4-0002-")));
+
+    let out2 = p.join("out2");
+    let res = run_libra_command(
+        &[
+            "format-patch",
+            "-v",
+            "4",
+            "--cover-letter",
+            "-2",
+            "-o",
+            out2.to_str().unwrap(),
+            "--no-thread",
+            "--no-signature",
+        ],
+        p,
+    );
+    assert_cli_success(&res, "AC2");
+    let cover = fs::read_to_string(out2.join("v4-0000-cover-letter.patch")).unwrap();
+    assert!(
+        cover.contains("Subject: [PATCH v4 0/2] "),
+        "AC3 cover subject"
+    );
+    for (index, version) in [("0001", "1"), ("0002", "2")] {
+        let name = fs::read_dir(&out2)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .find(|name| name.starts_with(&format!("v4-{index}-")))
+            .expect("patch file");
+        let text = fs::read_to_string(out2.join(name)).unwrap();
+        assert!(
+            text.contains(&format!("Subject: [PATCH v4 {version}/2] ")),
+            "AC{version} patch subject"
+        );
+    }
+
+    // AC6: file output carries the full interdiff block.
+    let g = tempdir().unwrap();
+    let gp = g.path();
+    let git = |args: &[&str]| -> String {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(gp)
+            .env("HOME", gp)
+            .env("GIT_AUTHOR_NAME", "T")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "T")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .expect("git");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    git(&["init", "-q", "-b", "main", "."]);
+    git(&["config", "user.name", "T"]);
+    git(&["config", "user.email", "t@t"]);
+    fs::write(gp.join("f"), "a1\nold\n").unwrap();
+    git(&["add", "f"]);
+    git(&["commit", "-q", "-m", "base"]);
+    fs::write(gp.join("f"), "a1\na2\n").unwrap();
+    git(&["commit", "-qam", "m1"]);
+    let v1 = git(&["rev-parse", "HEAD"]);
+    git(&["branch", "v1"]);
+    fs::write(gp.join("f"), "a1\na2\na3\n").unwrap();
+    git(&["commit", "-qam", "m2"]);
+    let parent = tempdir().unwrap();
+    let lp = parent.path().join("libra");
+    fs::create_dir_all(&lp).unwrap();
+    assert_cli_success(
+        &run_libra_command(
+            &["init", "--from-git-repository", gp.to_str().unwrap(), "."],
+            &lp,
+        ),
+        "import",
+    );
+    assert_cli_success(&run_libra_command(&["branch", "v1", &v1], &lp), "v1 branch");
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "user.name", "T"], &lp),
+        "name",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "set", "user.email", "t@t"], &lp),
+        "email",
+    );
+    let lout = lp.join("out");
+    let res = run_libra_command(
+        &[
+            "format-patch",
+            "--interdiff=v1",
+            "-2",
+            "-v",
+            "23",
+            "-o",
+            lout.to_str().unwrap(),
+            "--no-thread",
+            "--no-signature",
+        ],
+        &lp,
+    );
+    assert_cli_success(&res, "AC6 libra");
+    let gout = gp.join("gout");
+    let git_out = Command::new("git")
+        .args([
+            "format-patch",
+            "--interdiff=v1",
+            "-2",
+            "-v",
+            "23",
+            "-o",
+            gout.to_str().unwrap(),
+            "--no-thread",
+            "--no-signature",
+        ])
+        .current_dir(gp)
+        .env("HOME", gp)
+        .output()
+        .unwrap();
+    assert!(git_out.status.success(), "{git_out:?}");
+    let tail = |text: &str| -> String {
+        let start = text
+            .lines()
+            .position(|line| line.contains("file changed"))
+            .map(|index| text.lines().take(index).map(|line| line.len() + 1).sum())
+            .unwrap_or(0);
+        text[start..].trim_end().to_string()
+    };
+    let libra_cover = fs::read_to_string(lout.join("v23-0000-cover-letter.patch")).unwrap();
+    let git_cover = fs::read_to_string(gout.join("v23-0000-cover-letter.patch")).unwrap();
+    assert_eq!(tail(&libra_cover), tail(&git_cover), "AC6 interdiff file");
+}

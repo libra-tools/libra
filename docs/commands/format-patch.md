@@ -19,7 +19,7 @@ commits reachable from `<rev>`, and `A..B` excludes `A` while including `B`
 produces one patch file per non-merge commit (named with the `--suffix`,
 default `.patch`, unless `--numbered-files` is set, which uses bare sequence
 numbers). Filenames include a zero-padded sequence prefix regardless of `-n`
-or `-N`. Each patch is formatted as an mbox message with RFC 2822 headers, a
+or `-N`; under `-v <N>` every generated file also gets a `v<N>-` prefix (`v4-0000-cover-letter.patch`, `v4-0001-…`). Each patch is formatted as an mbox message with RFC 2822 headers, a
 plain-text diffstat, and a unified diff. The output is compatible with `git am`.
 
 Merge commits are skipped by default. When the revision range resolves to zero

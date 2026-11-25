@@ -3890,7 +3890,7 @@
 
 **Task type:** `implementation`
 
-**Lifecycle / Acceptance:** `pending` / `空`
+**Lifecycle / Acceptance:** `done` / `locally-accepted`（2026-11-25：`--reroll-count` 为输出文件名加 `v<val>-` 前缀（含封面信），与 `Subject:` 的 `[PATCH v4 n/m]` 版本一致；文件输出携带完整 interdiff 区块。AC1–AC6 由 `format_patch_test::reroll_filename_prefix` 覆盖（v4 文件名集合、封面/补丁 Subject 版本、文件输出 interdiff 与同源 Git 逐字）；`format_patch_test` 171/171、`compat_format_patch_mail_roundtrip` 15/15、`compat_format_patch_flag_surface` 通过；EN/zh/开发文档与 `COMPATIBILITY.md` 已同步。偏差（记录）：用户已取消独立 Claude/Codex 审计与全量测试。
 
 **Description:** 在 `--reroll-count`（`-v`）时于输出文件名前添加 `v<val>-` 前缀，并保证每封邮件的 `Subject:` 版本与文件名前缀一致（自本卡拆出 `FPG-26` 处理非整数 `--reroll-count`、`FPG-45` 处理生成路径列表输出到 stdout）。
 
